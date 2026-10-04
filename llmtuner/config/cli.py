@@ -56,6 +56,7 @@ PROGRAMMATIC_ONLY: dict[type, frozenset[str]] = {
     ModelConfig: frozenset({"arch_overrides"}),
     OptimizerConfig: frozenset({"param_groups"}),
     CheckpointConfig: frozenset({"purge_exempt"}),
+    TrainingConfig: frozenset({"ema_config", "validation_config"}),
 }
 
 

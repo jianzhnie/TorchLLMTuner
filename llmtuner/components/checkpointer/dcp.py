@@ -148,8 +148,9 @@ class CheckpointManager(BaseCheckpointManager):
         folder: absolute directory the checkpoints live in. Already joined with
             the run's dump folder by the caller.
         sd_adapter: converts model state dicts between the native layout and
-            another format (HF safetensors). Required for the HF export paths.
-            llmtuner ships none yet, so those paths reject at construction.
+            another format (HF safetensors). ``builder`` always passes
+            ``HFTransformerStateDictAdapter``; passing none rejects the HF
+            export paths at construction.
     """
 
     def __init__(

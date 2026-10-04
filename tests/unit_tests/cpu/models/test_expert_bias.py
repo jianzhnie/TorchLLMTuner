@@ -249,6 +249,31 @@ def test_a_dense_layer_among_sparse_ones_is_skipped() -> None:
     assert iter_moe_layers(model) == [sparse]
 
 
+def test_wrapped_layers_are_unwrapped() -> None:
+    """AC wraps each layer in CheckpointWrapper; the lookup must see through.
+
+    Older torch versions do not forward attribute reads through the wrapper,
+    so without the explicit unwrap ``iter_moe_layers`` returns [] and every
+    downstream consumer (bias hooks, padding-mask staging, compile's MoE
+    detection) silently no-ops.
+    """
+    sparse = _moe()
+
+    class _FakeCheckpointWrapper(torch.nn.Module):
+        """torch's CheckpointWrapper shape: inner module, no __getattr__."""
+
+        def __init__(self, inner: torch.nn.Module) -> None:
+            super().__init__()
+            self._checkpoint_wrapped_module = inner
+
+    holder = torch.nn.Module()
+    holder.layers = torch.nn.ModuleList(
+        [_FakeCheckpointWrapper(_Layer(sparse))]
+    )
+
+    assert iter_moe_layers(holder) == [sparse]
+
+
 def test_the_hook_updates_a_real_swapped_model() -> None:
     """End to end against the object graph the swap actually produces.
 

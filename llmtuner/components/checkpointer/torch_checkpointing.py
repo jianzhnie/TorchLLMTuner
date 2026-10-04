@@ -64,7 +64,7 @@ from .base import (
     BaseCheckpointManager,
     purge_thread,
 )
-from .checkpoint_keys import MODEL, OPTIMIZER
+from .checkpoint_keys import EMA, MODEL, OPTIMIZER
 
 logger = get_logger(__name__)
 
@@ -455,6 +455,11 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                     f"Cannot restore non-Stateful checkpoint state {key!r} of type "
                     f"{type(target).__name__}"
                 )
+        # Same EMA contract as the DCP backend: if the model was restored but
+        # the EMA was excluded, cold-start it from the loaded weights instead
+        # of resuming with its construction-time values.
+        if MODEL in states and EMA in self.states and EMA not in states:
+            self.states[EMA].load_state_dict({})
 
     @staticmethod
     def _is_stateful(obj: Any) -> bool:

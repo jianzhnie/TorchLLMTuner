@@ -70,10 +70,12 @@ What the migration added, and why each earned its place:
   comparable. Opt-in via ``training.validation_config``; when it is ``None``
   the loop below is bit-identical to not having the feature. The pass updates
   no parameters and touches no checkpoint state. Zero batches and zero valid
-  tokens are loud errors, not a silently skipped report, and the two
-  configurations that cannot terminate cleanly (``steps=-1`` with DP > 1, and
-  pipeline parallelism, whose schedule llmtuner drives through a train-shaped
-  seam) are rejected at build time rather than hanging mid-pass.
+  tokens are loud errors, not a silently skipped report, the configurations
+  that cannot terminate cleanly (``steps=-1`` with DP > 1 or with the
+  infinite random corpus) are rejected at build time, and chunked loss x
+  validation is refused because the pass scores full logits. Under pipeline
+  parallelism the pass drives the schedule's eval driver
+  (``trainer/validate.py::validate_body_pp``).
 
 ``train_step``'s execution order follows torchtitan's and is load-bearing:
 zero the gradients, snapshot the learning rate, read *every* batch the step
@@ -920,15 +922,17 @@ class Trainer:
         *,
         dp_world_size: int,
         training_dataset: str,
+        chunked_loss_num_chunks: int = 1,
     ) -> None:
         """Reject the validation configurations that cannot terminate cleanly.
 
-        The body lives in ``validation.py``; see there for the rationale.
+        The body lives in ``validate.py``; see there for the rationale.
         """
         validation_pass.check_validation_feasibility(
             validation,
             dp_world_size=dp_world_size,
             training_dataset=training_dataset,
+            chunked_loss_num_chunks=chunked_loss_num_chunks,
         )
 
     def should_validate(self, step: int) -> bool:

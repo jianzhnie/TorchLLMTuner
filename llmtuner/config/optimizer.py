@@ -156,10 +156,9 @@ class OptimizerConfig:
 
     def __post_init__(self) -> None:
         # ``list`` is what the parser can build from two CLI values, but the
-        # optimizer wants a tuple and the field must not be mutable: a reused
-        # ``HfArgumentParser`` hands every instance the SAME default list (the
-        # factory runs once, not per instance), so an in-place edit would leak
-        # across runs. Normalizing here makes that unreachable, and the length
+        # optimizer wants a tuple and the field must not be mutable: an
+        # in-place edit to a shared list would leak across instances.
+        # Normalizing here makes that unreachable, and the length
         # check is what turns a typo like ``--betas 0.9`` into an error rather
         # than a one-element betas that torch rejects deep in a step.
         betas = tuple(self.betas)

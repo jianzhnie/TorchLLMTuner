@@ -9,12 +9,12 @@ next to this one: the routers in ``router.py``, the expert weights in
 What changed from upstream:
 
 * the nested ``Config`` dataclass is gone; the block is constructed directly.
-* the auxiliary-loss-free bias is updated by ``MoE.update_expert_bias``, which
-  the *trainer* calls once per optimizer step (torchtitan reaches the same state
-  through an optimizer hook; llmtuner has no hook registry, and the trainer
-  already owns the step boundary). The rule is the same sign-based, mean-centred
-  nudge, and the counter is drained there; the reduction over the axes that
-  shard a token stream is ``balancing.py``.
+* the auxiliary-loss-free bias is updated by ``MoE.update_expert_bias``,
+  registered as an optimizer step pre-hook (``balancing.py``, wired by the
+  trainer builder) -- torchtitan reaches the same state through its own hook.
+  The rule is the same sign-based, mean-centred nudge, and the counter is
+  drained there; the reduction over the axes that shard a token stream is
+  ``balancing.py``.
 * the block is balancing-scheme-agnostic: a quantile router is driven by
   ``balancing.py``'s quantile hook instead, and the bias buffer is registered
   for it here (upstream needs a ``KimiLatentMoE`` subclass to do that). The two
@@ -261,6 +261,12 @@ def iter_moe_layers(model_part: nn.Module) -> list[MoE]:
         return []
     found: list[MoE] = []
     for layer in layers:
+        # Activation checkpointing wraps each layer in torch's
+        # CheckpointWrapper; older torch versions don't forward attribute
+        # reads through it, so unwrap explicitly rather than relying on
+        # __getattr__ passthrough (the wrapper inserts a
+        # ``_checkpoint_wrapped_module`` FQN segment, cf. canonical_fqn).
+        layer = getattr(layer, "_checkpoint_wrapped_module", layer)
         for attr in MOE_LAYER_ATTRS:
             block = getattr(layer, attr, None)
             if isinstance(block, MoE):

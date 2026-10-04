@@ -99,6 +99,7 @@ from llmtuner.config import (
 )
 
 from ..accelerator.capabilities import has
+from ..errors import EnvironmentUnsupportedError
 from ..utils.logger_utils import get_logger
 from .remat_regions import (
     region_names,
@@ -377,7 +378,7 @@ def apply_memory_budget(cfg: MemoryBudgetACConfig) -> None:
     cannot honour mutates nothing.
     """
     if not has("functorch_activation_memory_budget"):
-        raise NotImplementedError(
+        raise EnvironmentUnsupportedError(
             "mode='memory_budget' needs "
             "torch._functorch.config.activation_memory_budget, which this "
             f"torch ({torch.__version__}) does not have; the budget would be "

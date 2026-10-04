@@ -63,6 +63,7 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             raise StopIteration
 
         input_parts: list[np.ndarray] = []
+        mask_parts: list[np.ndarray] = []
         label_parts: list[np.ndarray] = []
         position_parts: list[np.ndarray] = []
         num_tokens = 0
@@ -108,6 +109,12 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             input_parts.append(np.asarray(sequence.input_ids[token_slice]))
             label_parts.append(np.asarray(sequence.labels[token_slice]))
             position_parts.append(np.arange(num_segment_tokens, dtype=np.int64))
+            source_mask = getattr(sequence, "padding_mask", None)
+            mask_parts.append(
+                np.zeros(num_segment_tokens, dtype=np.bool_)
+                if source_mask is None
+                else np.asarray(source_mask[token_slice])
+            )
             num_tokens += num_segment_tokens
             self._remainder_offset += num_segment_tokens
             if self._remainder_offset == len(sequence.input_ids):
@@ -121,7 +128,7 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
         input_ids = np.concatenate(input_parts)
         labels = np.concatenate(label_parts)
         positions = np.concatenate(position_parts)
-        padding_mask = np.zeros(num_tokens, dtype=np.bool_)
+        padding_mask = np.concatenate(mask_parts)
         pad_len = self._num_tokens_per_row - num_tokens
         if pad_len:
             padding_positions = (
@@ -160,7 +167,16 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
         self._finished = state["finished"]
         if state["has_remainder"]:
             self._remainder_parent_state = state["parent"]
-            self._remainder = next(self._parent)
+            try:
+                self._remainder = next(self._parent)
+            except StopIteration:
+                # The recorded remainder came from the parent's last element:
+                # the state restored above is already past it, so there is no
+                # remainder to rebuild -- the next __next__ simply raises.
+                self._remainder = None
+                self._remainder_parent_state = None
+                self._finished = True
+                return
             self._remainder_offset = state["remainder_offset"]
 
 

@@ -29,6 +29,7 @@ def check_validation_feasibility(
     *,
     dp_world_size: int,
     training_dataset: str,
+    chunked_loss_num_chunks: int = 1,
 ) -> None:
     """Reject the validation configurations that cannot terminate cleanly.
 
@@ -44,6 +45,8 @@ def check_validation_feasibility(
         * ``steps=-1`` against the synthetic corpus has no exhaustion at all:
           the random source is infinite, so "one finite pass" never ends.
         """
+    if chunked_loss_num_chunks > 1:
+        matrix.chunked_loss_validation(chunked_loss_num_chunks)
     if validation.steps != -1:
         return
     if dp_world_size > 1:

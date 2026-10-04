@@ -79,8 +79,8 @@ def parallelize_hf_transformers(
 ) -> nn.Module | PipelineParallelSetup:
     """Apply every parallelism dimension the config asks for, in order.
 
-    ``compile``, ``activation_checkpoint``, ``selective_ac``,
-    ``global_batch_size`` and ``dataset`` are training-side values, passed
+    ``compile``, ``activation_checkpoint``, ``selective_ac`` and
+    ``global_batch_size`` are training-side values, passed
     explicitly rather than read off a run-wide config: this layer's contract is
     ``ParallelConfig`` plus the handful of scalars the guards actually need.
     ``compile_config`` tunes the compile step (per-block, backend, async TP);

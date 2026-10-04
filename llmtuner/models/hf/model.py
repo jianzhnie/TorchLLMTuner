@@ -40,6 +40,8 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.modeling_utils import AttentionInterface
 
+from llmtuner.errors import UnsupportedCombinationError
+
 from ...accelerator import dist_utils
 from ...components.loss import next_token_targets
 from ...datasets.types import Batch
@@ -557,9 +559,10 @@ class HFTransformerModel(nn.Module):
         # Built before the CP shard, always from the FULL-length positions --
         # which is exactly why this lives here and not in the loop: after the
         # shard below, no rank holds a positions vector that can describe the
-        # document structure. When the mask is built there is no need to hand
-        # it to the forward: ``_apply_attention`` builds one from ``positions``
-        # anyway, so passing it would be a second copy rather than a saving.
+        # document structure. The prebuilt mask is then handed to the forward
+        # below where the kernel can consume it (the CP/ulysses path keys its
+        # dispatch off its Q length); otherwise ``_apply_attention`` rebuilds
+        # one from ``positions``.
         cp_mesh = (
             None if parallel_dims is None else parallel_dims.get_optional_mesh("cp")
         )
@@ -706,7 +709,7 @@ class HFTransformerModel(nn.Module):
             # would mean slicing Q and keeping KV full by hand -- unverified,
             # and silently wrong if the load balancer permutes the shard, so it
             # is refused rather than guessed at.
-            raise NotImplementedError(
+            raise UnsupportedCombinationError(
                 "Context parallel with a DSA (dense-mask) model is not "
                 "implemented: the CP mask path shards a flex BlockMask, and a "
                 "dense additive mask has to be sliced by hand. Unlock by "
