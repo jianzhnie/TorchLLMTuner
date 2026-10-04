@@ -85,15 +85,15 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `datasets/text/processors.py` | `hf_datasets/text_datasets.py` | 0.767 | 路径与 processor 构造契约已适配 |
 | `datasets/types.py` | `components/data/types.py` | 0.506 | 去 Configurable 后重塑 build context 与 iteration policy |
 | `models/common/aux_loss.py` | `models/common/aux_loss.py` | 0.682 | |
-| `models/common/async_linear.py`（2026-09-26 文件名对齐上游，原 dist_gemm.py） | `models/common/async_linear.py` | 0.527 | |
-| `models/common/feed_forward.py` | `models/common/feed_forward.py` | 0.560 | **曾写完又被退**，不要在没有明确指令时重新引入 |
-| `models/common/linear.py` | `models/common/linear.py` | 0.620 | |
+| `models/common/async_linear.py`（2026-09-26 文件名对齐上游，原 dist_gemm.py） | `models/common/async_linear.py` | 0.527 | **parity 保留**（2026-10-04 用户决定）：DistGEMM* 模块层依赖 QKV/FFN  vendored 部件，唯一接线方式是替换 HF 自带部件（违反五部件契约），无生产消费者；不删，作为上游对照参考 |
+| `models/common/feed_forward.py` | `models/common/feed_forward.py` | 0.560 | **曾写完又被退**，不要在没有明确指令时重新引入；parity 保留（2026-10-04，HF 自带 FFN，无生产消费者） |
+| `models/common/linear.py` | `models/common/linear.py` | 0.620 | `PartialBiasRowwiseLinear` 仅测试引用（上游已删除该类），parity 保留（2026-10-04） |
 | `models/common/attention/masks.py` | `models/common/attention.py` | 0.380 | 拆出了 mask 部分 |
 | `models/common/moe/`（`block`/`router`/`experts`/`dispatcher`/`load_balance`/`balancing` 六文件） | `models/common/moe.py` + `models/common/token_dispatcher.py` | 0.155 | 2026-09-28 十七次增量拆成子包 |
-| `models/common/multimodal.py` | `models/common/multimodal.py` | 0.888 | 保留算法来源，但加入同步规避与更严格的 span/run 校验 |
+| `models/common/multimodal.py` | `models/common/multimodal.py` | 0.888 | 保留算法来源，但加入同步规避与更严格的 span/run 校验；parity 保留（2026-10-04，VLM 融合在 HF 复合模型内部完成，无生产消费者） |
 | ~~`models/common/param_init.py`~~ | — | — | **2026-09-25 移除**：torchtitan parity 的 vendored 死代码（llmtuner 走 HF 模型自带 `_init_weights`，全仓零引用） |
-| `models/common/attention/qkv.py` | `models/common/attention.py` | 0.242 | |
-| `models/common/rope.py` | `models/common/rope.py` | 0.616 | 上游持续重构后结构已分叉；同步公式与边界修复，不同步 Module/缓存形状 |
+| `models/common/attention/qkv.py` | `models/common/attention.py` | 0.242 | parity 保留（2026-10-04，HF 自带 attention 投影，无生产消费者） |
+| `models/common/rope.py` | `models/common/rope.py` | 0.616 | 上游持续重构后结构已分叉；同步公式与边界修复，不同步 Module/缓存形状；parity 保留（2026-10-04，wrapper 的 rotary_emb 是 HF 自带的） |
 | `models/common/scatter_add.py` | `ops/scatter_add.py` | 0.711 | |
 | `models/common/moe/dispatcher.py` | `models/common/token_dispatcher.py` | 0.441 | 2026-09-25 起含 `TorchAOTokenDispatcher` 可选导入适配层（torchao `permute_and_pad` 委托，未装 loud-raise）；DeepEP/HybridEP 保持登记缺口，见 D 表 |
 | `parallel/activation_checkpoint.py` | `distributed/activation_checkpoint.py` | 0.374 | **FullAC + SelectiveAC + MemoryBudgetAC 已移植**（后者按上游语义设 `torch._functorch.config.activation_memory_budget`，需 compile，torch 无该 knob 时 loud-raise）；RegionAC 已接入（2026-09-29 二十五次增量：`region_ac` + `parallel/remat_regions.py`，声明通道以 HF block 的 `nn.Linear` FQN 结构等价替代上游 `Module.configure_remat_regions`，受限项只有上游自带的 torch_remat 需 torch ≥ 2.10，apply 期 loud-raise） |
@@ -140,7 +140,7 @@ A2 分类（见上表），mesh 构建这一段记在该行的"改写点"里，�
 | `components/checkpointer/checkpoint_keys.py` | 上游无 |
 | `accelerator/device.py` | 上游无（0.382 是噪音，命中实验目录）；2026-09-24 从 `utils/` 迁入 `accelerator/` |
 | `models/common/activation.py` | 与上游同名但不同源；公式由 llmtuner 自持，不能按 A 类覆盖 |
-| `models/common/embedding.py` | 与上游同名但不同源；包含 llmtuner 的 vocab-shard 契约 |
+| `models/common/embedding.py` | 与上游同名但不同源；包含 llmtuner 的 vocab-shard 契约；Embedding 类 parity 保留（2026-10-04，HF 自带 tok_embeddings；vocab-shard 公式由 components/loss.py 自持） |
 | `datasets/random_data.py` | 合成语料，上游无 |
 | `datasets/build.py` | 工厂；上游把 `build()` 放在 config 上 |
 | `accelerator/dist.py` + `accelerator/dist_utils.py` | 2026-09-24 加入：vendored 自 OpenMMLab `mmengine.dist`（**不是 torchtitan 来源**），已去 mmengine 化，设备谓词与后端表统一由同包的 `accelerator/device.py` 提供；不进 trainer 装配路径。2026-09-28 复核（十次增量）：只按「能力缺口」对照上游 `distributed/utils.py`，结论是**无缺口**——上游的 `dist_sum`/`dist_max`/`dist_mean`/`dist_sum_tensor` 在 llmtuner 侧是 `all_reduce`（调用点 clone + in-place），`set_pg_timeouts`/`clip_grad_norm_` 已迁入 `accelerator/collectives.py`，仅有的 `init_distributed`/fake 后端差异已单列于 D 表 |
