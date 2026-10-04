@@ -144,6 +144,38 @@ def chunked_loss_pp(chunks: int, pp: int) -> None:
     )
 
 
+def chunked_loss_validation(chunks: int) -> None:
+    """The validation pass scores full logits (it never looks at the chunked
+    loss path), so a model that only fits with chunked training would OOM on
+    its first eval. Run validation with chunked_loss_num_chunks=1.
+    """
+    raise UnsupportedCombinationError(
+        f"chunked_loss_num_chunks={chunks} with validation is not "
+        "supported: the validation pass scores full logits and never "
+        "takes the chunked path, so a model that only fits with chunked "
+        "training would OOM on its first eval pass. Run validation with "
+        "chunked_loss_num_chunks=1."
+    )
+
+
+def ep_hf_initial_load(ep: int) -> None:
+    """The HF checkpoint carries the pre-swap expert layout
+    (``gate_up_proj``/``down_proj``); the swapped model holds
+    ``w1_EFD``/``w2_EDF`` stacks, and the HF adapter does not convert expert
+    layouts. A load would leave the experts at uninitialized memory under
+    strict=False. Unlock: run the swap's per-expert conversion on the HF
+    checkpoint stream.
+    """
+    raise UnsupportedCombinationError(
+        f"expert_parallel_size={ep} with checkpoint.initial_load_in_hf is "
+        "not supported: the HF checkpoint carries the pre-swap expert "
+        "layout (gate_up_proj/down_proj) while the swapped model holds "
+        "stacked expert weights, and the HF adapter does not convert "
+        "expert layouts -- the experts would silently keep uninitialized "
+        "values. Train from scratch, or load a llmtuner checkpoint."
+    )
+
+
 
 def pp_weight_tying() -> None:
     """The split puts the embedding on the first stage and the head on the last, and
@@ -332,6 +364,10 @@ ENTRIES: tuple[Row, ...] = (
         'trainer/validate.py::check_validation_feasibility'),
     Row(chunked_loss_pp, "assembly", UnsupportedCombinationError,
         'trainer/trainer.py::Trainer.__init__'),
+    Row(ep_hf_initial_load, "assembly", UnsupportedCombinationError,
+        'trainer/builder.py::build_trainer_state'),
+    Row(chunked_loss_validation, "assembly", UnsupportedCombinationError,
+        'trainer/validate.py::check_validation_feasibility'),
     Row(pp_weight_tying, "assembly", UnsupportedCombinationError,
         'parallel/pipeline_parallel/apply.py::apply_pp'),
     Row(shared_expert_tp, "assembly", UnsupportedCombinationError,

@@ -35,7 +35,7 @@ Weight layout: HF stores each projection as ``(out, in)`` and applies it as
 (``w1_EFD``/``w3_EFD`` are ``(F, D)``, ``w2_EDF`` is ``(D, F)``) and applies it
 with the same ``F.linear``. Moving a weight is therefore elementwise -- no
 transpose, no regrouping -- except for the one split of ``gate_up_proj`` into
-its gate and up halves. ``tests/unit_tests/cpu/distributed/test_ep_swap.py``
+its gate and up halves. ``tests/unit_tests/cpu/parallel/test_ep_swap.py``
 pins both halves of that claim against the HF block being replaced.
 
 Routing parity with the HF block: Qwen3Moe and Mixtral score with a softmax over
@@ -70,7 +70,10 @@ from __future__ import annotations
 
 import torch.nn as nn
 
-from llmtuner.errors import EnvironmentUnsupportedError
+from llmtuner.errors import (
+    EnvironmentUnsupportedError,
+    UnsupportedCombinationError,
+)
 
 from ...models.common.moe.dispatcher import EP_DISPATCHER_BACKENDS
 from ...utils.logger_utils import get_logger
@@ -141,7 +144,7 @@ def swap_hf_moe_blocks(
     """
     layers = getattr(model, "layers", None)
     if layers is None:
-        raise TypeError(
+        raise UnsupportedCombinationError(
             f"swap_hf_moe_blocks expects a model with .layers; got "
             f"{type(model).__name__}."
         )
@@ -215,7 +218,7 @@ def swap_hf_moe_blocks(
         swapped += 1
 
     if swapped == 0:
-        raise TypeError(
+        raise UnsupportedCombinationError(
             f"no HF MoE block found on {type(model).__name__} "
             f"({type(getattr(model, 'model', model)).__name__}): no layer's "
             "``mlp`` has the router-gate + fused gate_up_proj/down_proj shape "

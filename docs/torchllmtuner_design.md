@@ -627,6 +627,9 @@ torch≥2.12 多卡复跑。）
    （`tests/integration_tests/pp_validation_equivalence.py` 待 torch≥2.12 复跑）；
    PP × 真实语料同日解锁（positions 随 microbatch 穿管，
    `pp_real_corpus_equivalence.py` 同样待复跑）。
+   chunked loss × validation 拒绝（validation 只走全量 logits，训练能活的配置会在
+   首次 eval OOM）；EP × `initial_load_in_hf` 拒绝（HF checkpoint 是 swap 前的专家
+   布局，adapter 不做专家布局转换，加载会静默留垃圾权重——2026-10-04 起 loud-raise）。
 2. ptrr load balancer 未实现；Ulysses 不与 load balancer 组合（packed/varlen 自
    2026-09-25 起支持，文档 mask 全长透传，见 §CP 与
    `tests/integration_tests/cp_ulysses_varlen_equivalence.py`）。

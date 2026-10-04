@@ -7,7 +7,9 @@ the assembly order, which is a contract:
    (``build_parallel_dims``) -- the PP seed offset below needs this rank's
    stage coordinate;
 2. combination guards -- the support matrix (``llmtuner/parallel/matrix.py``)
-   fires here: validation feasibility, EP x checkpoint, chunked-loss x PP;
+   fires here: validation feasibility, chunked-loss x PP, EP x HF-initial-load
+   (EP x checkpoint itself is supported since 2026-10, see
+   ``parallel/expert_parallel/ckpt.py``);
 3. deterministic seeding (before any model build);
 4. the mesh (``build_mesh`` -- see ``llmtuner/parallel/parallel_dims.py``);
 5. the model, then parallelism in stage-table order
@@ -80,6 +82,7 @@ def build_trainer_state(self, cfg) -> None:
                 if self.parallel_dims is None
                 else self.parallel_dims.dp_replicate * self.parallel_dims.dp_shard
             ),
+            chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
             training_dataset=cfg.dataloader.dataset,
         )
 
@@ -141,6 +144,14 @@ def build_trainer_state(self, cfg) -> None:
         and cfg.checkpoint.initial_load_in_hf
         and cfg.checkpoint.initial_load_path
     )
+    # EP swap rewrites the expert layout, which the HF checkpoint does not
+    # carry -- refuse loudly instead of loading garbage into the experts.
+    if (
+        load_hf_weights
+        and self.parallel_dims is not None
+        and self.parallel_dims.ep_enabled
+    ):
+        matrix.ep_hf_initial_load(self.parallel_dims.ep)
     if load_hf_weights:
         with torch.device("meta"):
             model = HFTransformerModel(hf_model_config)

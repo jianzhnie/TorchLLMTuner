@@ -98,14 +98,23 @@ def _matched_entries(
     sd: dict[str, Any],
     shard_map: dict[str, dist.ProcessGroup],
     params: dict[str, torch.Tensor],
+    *,
+    direction: str,
 ):
-    """Yield ``(key, group, live_param)`` for entries holding an expert slice.
+    """Yield ``(key, group, live_param)`` for entries holding expert state.
 
     An entry matches when its key is the expert FQN itself (model dicts) or a
-    nested state entry under it (``state.{fqn}.{name}``, optimizer/EMA dicts)
-    AND its tensor has the live parameter's shape -- which is what keeps
-    replicated scalars (``state.{fqn}.step``) and unrelated state out of the
-    transform.
+    nested state entry under it (``state.{fqn}.{name}``, optimizer/EMA dicts).
+    The shape gate is direction-aware:
+
+    * ``direction="save"``: the live value is the local slice, so it must
+      have the live parameter's shape. This keeps replicated scalars
+      (``state.{fqn}.step``) and unrelated state out of the transform.
+    * ``direction="load"``: the stored value is the *full* tensor, so the
+      local-shape gate would match nothing. Match on rank instead: same
+      ndim, same trailing dims; the leading-dim check (full vs
+      ``num_local * world``) is the explicit ValueError in
+      ``load_expert_state``. Scalars fall out on ndim.
     """
     for key, value in sd.items():
         for fqn, group in shard_map.items():
@@ -114,7 +123,12 @@ def _matched_entries(
             param = params.get(fqn)
             if param is None or not isinstance(value, torch.Tensor):
                 continue
-            if value.shape != param.shape:
+            if direction == "save":
+                if value.shape != param.shape:
+                    continue
+            elif not (
+                value.ndim == param.ndim and value.shape[1:] == param.shape[1:]
+            ):
                 continue
             yield key, group, param
             break
@@ -135,9 +149,9 @@ def gather_expert_state(
         return sd
     params = _named_params(model_parts)
     out = dict(sd)
-    for key, group, _ in _matched_entries(sd, shard_map, params):
+    for key, group, _ in _matched_entries(sd, shard_map, params, direction="save"):
         value = out[key]
-        if isinstance(value, DTensor):
+        if DTensor is not None and isinstance(value, DTensor):
             # Per-EP-rank materialization of the efsdp-sharded weight.
             value = value.full_tensor()
         world = dist_utils.get_world_size(group)
@@ -164,7 +178,7 @@ def load_expert_state(
         return sd
     params = _named_params(model_parts)
     out = dict(sd)
-    for key, group, param in _matched_entries(sd, shard_map, params):
+    for key, group, param in _matched_entries(sd, shard_map, params, direction="load"):
         full = out[key]
         world = dist_utils.get_world_size(group)
         rank = dist_utils.get_rank(group)
@@ -177,7 +191,7 @@ def load_expert_state(
                 "different expert layout."
             )
         local = full.narrow(0, rank * num_local, num_local)
-        if isinstance(param, DTensor):
+        if DTensor is not None and isinstance(param, DTensor):
             local = distribute_tensor(
                 local.contiguous(), param.device_mesh, param.placements
             )

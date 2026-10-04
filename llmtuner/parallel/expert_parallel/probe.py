@@ -6,16 +6,9 @@ identified through, shared by the swap and by ``tensor_parallel/apply.py``
 (``is_hf_moe_block``).
 
 Every sparse decoder layer of a transformers 5.x MoE model holds the same block
-under ``layer.mlp``: a router, plus two stacked expert parameters. Expert
-parallelism needs those weights in grouped-GEMM form with a token dispatcher in
-front -- the stack in ``models/common/`` (``GroupedExperts`` /
-``TokenChoiceTopKRouter`` / ``MoE``). This module is the bridge: it detects the
-HF block, moves the weights into the llmtuner layout, and replaces ``layer.mlp``.
-It also flags the layer for the FSDP MoE branch (``layer.moe_enabled = True``
-plus a non-registered ``layer.moe`` alias, as upstream's swap does), without
-which the expert weights would be sharded as dense parameters over the dense
-DP mesh. The swap is in place and dtype-preserving, so it must run before FSDP
-wraps the model and after the weights are loaded.
+under ``layer.mlp``: a router, plus two stacked expert parameters. This module
+only *detects* that layout and reads its dimensions -- the weight move into the
+grouped-GEMM stack lives in ``convert.py``, the orchestration in ``swap.py``.
 
 Both halves of the block vary by family, and the probe is duck-typed against
 structures rather than class names, which are not stable across transformers

@@ -53,34 +53,34 @@ __all__ = [
 class Color:
     """ANSI escapes, by name. Frozen so a field cannot be reassigned."""
 
-    black = "\033[30m"
-    red = "\033[31m"
-    green = "\033[32m"
-    yellow = "\033[33m"
-    blue = "\033[34m"
-    magenta = "\033[35m"
-    cyan = "\033[36m"
-    white = "\033[37m"
-    reset = "\033[39m"
-    orange = "\033[38;2;180;60;0m"
-    turquoise = "\033[38;2;54;234;195m"
+    black: str = "\033[30m"
+    red: str = "\033[31m"
+    green: str = "\033[32m"
+    yellow: str = "\033[33m"
+    blue: str = "\033[34m"
+    magenta: str = "\033[35m"
+    cyan: str = "\033[36m"
+    white: str = "\033[37m"
+    reset: str = "\033[39m"
+    orange: str = "\033[38;2;180;60;0m"
+    turquoise: str = "\033[38;2;54;234;195m"
 
 
 @dataclass(frozen=True)
 class NoColor:
     """The same fields, all empty -- so callers format one way, always."""
 
-    black = ""
-    red = ""
-    green = ""
-    yellow = ""
-    blue = ""
-    magenta = ""
-    cyan = ""
-    white = ""
-    reset = ""
-    orange = ""
-    turquoise = ""
+    black: str = ""
+    red: str = ""
+    green: str = ""
+    yellow: str = ""
+    blue: str = ""
+    magenta: str = ""
+    cyan: str = ""
+    white: str = ""
+    reset: str = ""
+    orange: str = ""
+    turquoise: str = ""
 
 
 # If the two ever drift, a caller that formats with ``color.orange`` (say) works

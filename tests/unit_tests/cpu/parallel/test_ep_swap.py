@@ -26,6 +26,7 @@ which is what makes a bitwise assertion meaningful rather than merely close.
 
 from __future__ import annotations
 
+from llmtuner.errors import UnsupportedCombinationError
 from tests.caps import require_env
 
 require_env('spmd_types')
@@ -238,12 +239,12 @@ def test_swap_rejects_a_dense_model() -> None:
         max_position_embeddings=256,
     )
     model = _model(config)
-    with pytest.raises(TypeError, match="no HF MoE block"):
+    with pytest.raises(UnsupportedCombinationError, match="no HF MoE block"):
         swap_hf_moe_blocks(model)
 
 
 def test_swap_rejects_a_model_without_layers() -> None:
-    with pytest.raises(TypeError, match=r"\.layers"):
+    with pytest.raises(UnsupportedCombinationError, match=r"\.layers"):
         swap_hf_moe_blocks(torch.nn.Linear(4, 4))
 
 

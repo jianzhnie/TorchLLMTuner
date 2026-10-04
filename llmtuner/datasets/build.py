@@ -235,6 +235,7 @@ def build_dataloader(
         max_context_length=max_context_length,
         num_tokens_per_batch=num_tokens_per_batch,
         collator=collator,
+        repeat=repeat,
         num_prefetch_batches=dataloader_config.num_prefetch_batches,
         max_num_documents=dataloader_config.max_num_documents,
     )
