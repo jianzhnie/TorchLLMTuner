@@ -279,6 +279,10 @@ class TPMoeSequenceBoundary:
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
         gathered = all_gather_along(hidden_states, -2, self._tp_seq_group)
         out = super().forward(gathered, *args, **kwargs)
+        # This probe sits between the two collectives; it is only safe because
+        # the block's output TYPE is structural -- identical on every rank of
+        # the TP group -- so either all ranks raise here or none do. Never let
+        # a data-dependent type reach this check.
         if not isinstance(out, torch.Tensor):
             from .. import matrix
 

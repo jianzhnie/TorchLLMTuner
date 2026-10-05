@@ -150,15 +150,15 @@ def pp_weight_tying() -> None:
 def shared_expert_tp(module_path: str, block: object) -> None:
     """A shared expert whose layout is not the gate/up/down MLP cannot be
     feature-sharded by ``shard_shared_expert_for_tp`` -- e.g. Qwen2Moe's
-    multiplicative shared_expert_gate. Use tp=1, or ep>1 (the EP swap handles
-    shared experts).
+    multiplicative shared_expert_gate. ep>1 is not a way out either: the
+    swap rejects the same gated layout.
     """
     raise UnsupportedCombinationError(
         f"TP over {module_path} ({type(block).__name__}): the block "
         "has a shared expert whose layout is not the gate_proj/up_proj/"
         "down_proj MLP this sharding knows (e.g. a multiplicative "
-        "shared_expert_gate). Use tp=1, or ep > 1 (the EP swap handles "
-        "shared experts)."
+        "shared_expert_gate). Use tp=1 (ep > 1 is not a way out for this "
+        "block: the swap rejects the same gated layout)."
     )
 
 
@@ -297,16 +297,16 @@ def shared_expert_gate(block: object) -> None:
 
 
 def shared_expert_tp_ep(block: object) -> None:
-    """tp x ep over a shared-expert block: the TP plan shards it with the dense
-    realizers, and composing those with the swapped MoE's sequence-sharded
-    dispatch layout is unverified.
+    """tp x ep over a shared-expert block: TP leaves the shared expert alone
+    (MoE internals are excluded from the dense path), but the EP swap under a
+    TP-sharded dense trunk is unverified for it.
     """
     raise UnsupportedCombinationError(
         f"tp x ep over {type(block).__name__}: the block has a shared "
-        "expert, which the TP plan shards with the dense colwise/rowwise "
-        "realizers. Composing those with the swapped MoE's sequence-"
-        "sharded dispatch layout is unverified; run shared-expert models "
-        "with tp=1 (EP handles the shared expert) or ep=1."
+        "expert. The TP side leaves it alone (MoE-block internals are "
+        "excluded from the dense realizer path), but the EP swap's "
+        "shared-expert handling under a TP-sharded dense trunk is "
+        "unverified; run shared-expert models with tp=1 or ep=1."
     )
 
 

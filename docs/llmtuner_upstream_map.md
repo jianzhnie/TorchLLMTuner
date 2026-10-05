@@ -201,8 +201,7 @@ sequence-parallel 布局，无边界 collective);trainer 的排除判定抽为�
 `tp_sharded_param_ids`（三类：dense TP realizer、MoE-under-TP 的 F 分片、EP 的
 `GroupedExperts` E 切片；EP 专家梯度按 rank 完备，跨 TP 求和会混不同专家的梯度）。
 组合矩阵终态（config 期校验在各 config `__post_init__`，跨层裁决单一来源 `parallel/matrix.py`；2026-09-26 收窄）：tp>1×ep>1（cp=1）放行；tp>1×ep>1×cp>1 在
-`ParallelConfig.__post_init__` fail-fast（未验证）;shared-expert 块 ×tp 两条路径均
-loud-raise(ep=1 边界处、tp×ep 的 swap `convert_block` 处）;plan 声明 MoE 规格但
+`ParallelConfig.__post_init__` fail-fast（未验证）;shared-expert 块 ×tp:gate/up/down 布局放行（2026-10-02，`shard_shared_expert_for_tp` F 维分片，边界内无 collective；非标准布局如 Qwen2Moe 门控仍 loud-raise)；tp×ep×shared 在 swap `convert_block` 处 loud-raise。2026-10-06 修复：dense realizer 路径曾把 HF plan 声明的 `shared_experts.*_proj` 再包一层 ColumnParallelLinear/RowParallelLinear，造成 F/tp² 双重切分（静默错值）；现 MoE 块内部一律排除出 dense targets;plan 声明 MoE 规格但
 探针找不到块（ep=1）loud-raise;GPT-OSS 布局 loud-raise。aux loss / padding-mask
 LB / quantile hook 的归约轴此前已按 ep_enabled 含 tp 书写，放行后不重复计数、无需
 改动。测试
