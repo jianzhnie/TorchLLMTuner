@@ -134,6 +134,21 @@ def ep_hf_initial_load(ep: int) -> None:
 
 
 
+def dsa_pp() -> None:
+    """A DSA (dense-mask) model builds its additive mask from
+    ``tok_embeddings.weight.dtype`` on every forward; on non-first PP stages
+    the embedding is an ``nn.Identity``, so the mask build crashes. Unlock:
+    take the dtype from the config and re-validate on multiple ranks.
+    """
+    raise UnsupportedCombinationError(
+        "DSA models (dense additive mask, index_topk) with "
+        "pipeline_parallel_size > 1 are not supported: the mask build "
+        "reads tok_embeddings.weight.dtype, and non-first stages hold an "
+        "nn.Identity there. Unlock by sourcing the dtype from the config "
+        "and re-validating DSA x PP numerics on multiple ranks."
+    )
+
+
 def pp_weight_tying() -> None:
     """The split puts the embedding on the first stage and the head on the last, and
     each stage's deep copy would train an independent copy of the shared weight.
@@ -326,6 +341,8 @@ ENTRIES: tuple[Row, ...] = (
     Row(chunked_loss_validation, "assembly", UnsupportedCombinationError,
         'trainer/validate.py::check_validation_feasibility'),
     Row(pp_weight_tying, "assembly", UnsupportedCombinationError,
+        'parallel/pipeline_parallel/apply.py::apply_pp'),
+    Row(dsa_pp, "assembly", UnsupportedCombinationError,
         'parallel/pipeline_parallel/apply.py::apply_pp'),
     Row(shared_expert_tp, "assembly", UnsupportedCombinationError,
         'parallel/tensor_parallel/apply.py::apply_tp'),
