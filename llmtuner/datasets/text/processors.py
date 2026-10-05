@@ -20,6 +20,8 @@ from typing import Any
 
 import numpy as np
 
+from llmtuner.errors import ConfigError
+
 from ...components.loss import IGNORE_INDEX
 from ...utils.logger_utils import get_logger
 from ..dataset import SampleProcessor, SingleDataset, TextSequence, is_not_none
@@ -208,6 +210,11 @@ class ChatProcessor(SampleProcessor):
         # Strip extra newline and ensure the sequence ends with EOS without duplicates
         full_text = full_text.rstrip("\n")
         full_tokens = self._tokenizer.encode(full_text, add_bos=True, add_eos=False)
+        if not full_tokens:
+            raise ConfigError(
+                "chat template rendered to zero tokens; check the template "
+                "and the messages field"
+            )
         if full_tokens[-1] != self._eos_id:
             full_tokens.append(self._eos_id)
 

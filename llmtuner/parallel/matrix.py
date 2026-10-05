@@ -56,49 +56,6 @@ class Row:
     def reason(self) -> str:
         return (self.fn.__doc__ or "").strip()
 
-
-# == config phase: ParallelConfig ========================================
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# == config phase: TrainingConfig ========================================
-
-
-
-
-
-
-
-
-# == config phase: LLMTunerConfig cross-group =======================
-
-
-
-
-
-
-
-
-
-
-
 # == assembly phase: verdicts called from the guard sites =================
 
 

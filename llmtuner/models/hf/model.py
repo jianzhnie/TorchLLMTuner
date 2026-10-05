@@ -780,11 +780,10 @@ class HFTransformerModel(nn.Module):
             # hidden states, so the embedding lookup is skipped by feeding the
             # decoder ``inputs_embeds`` directly. PP does not shard the
             # sequence, so the local ``arange`` positions default stays right.
-            local_seq_len = input_ids.shape[0]
             decoder_input = {"inputs_embeds": input_ids.unsqueeze(0)}
         else:
-            local_seq_len = input_ids.shape[0]
             decoder_input = {"input_ids": input_ids.unsqueeze(0)}
+        local_seq_len = input_ids.shape[0]
         if positions is None:
             positions = torch.arange(local_seq_len, device=input_ids.device)
 
@@ -792,7 +791,8 @@ class HFTransformerModel(nn.Module):
 
         # Stage the padding mask on every MoE block -- including ``None``, so
         # a mask from a previous microbatch can never survive into this one.
-        # Each block consumes its staged mask on its forward, once.
+        # The staged mask then persists until this line re-stages it, so an
+        # activation-checkpointing recompute sees the same mask.
         for moe in iter_moe_layers(self):
             moe.set_padding_mask(padding_mask)
 

@@ -180,7 +180,6 @@ def convert_block(
         # HF keeps all E experts in two stacked parameters; each rank keeps its
         # own slice of them. ``gate_EFD``/``up_EFD`` are the two halves of
         # ``gate_up_proj`` split along its output dim -- see ``fused_experts_of``.
-        lo = ep_rank * num_local
         grouped.w1_EFD.copy_(experts.gate_EFD[lo : lo + num_local])
         grouped.w3_EFD.copy_(experts.up_EFD[lo : lo + num_local])
         grouped.w2_EDF.copy_(experts.down_EDF[lo : lo + num_local])
