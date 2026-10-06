@@ -751,3 +751,29 @@ def test_selective_ac_matches_uncheckpointed_bitwise_on_moe() -> None:
         assert p.grad is not None, f"{name} got no gradient under selective AC"
         ref_name = name.replace("._checkpoint_wrapped_module", "")
         assert torch.equal(p.grad, ref_grads[ref_name]), f"{name} grad differs"
+
+
+def test_full_ac_matches_uncheckpointed_bitwise_on_moe() -> None:
+    """FullAC replays the MoE block's dispatch/combine in backward -- that
+    replay must be numerically identical to the forward.
+
+    llmtuner's supported dispatchers (local reorder, all_to_all_single with
+    fixed split sizes) are deterministic, so a replayed dispatch reproduces
+    the forward's token order and the gradients route to the right tokens.
+    This is the property upstream had to re-establish for DeepEP by saving its
+    dispatch/combine instead of replaying them; llmtuner refuses those
+    backends at config time, so the replay path pinned here is the only one
+    FullAC can hit.
+    """
+    ref = _moe_model()
+    ref_logits = _moe_loss_and_backward(ref)
+    ref_grads = {n: p.grad.clone() for n, p in ref.named_parameters()}
+
+    model = apply_ac(_moe_model(), "full")
+    logits = _moe_loss_and_backward(model)
+
+    assert torch.equal(logits, ref_logits)
+    for name, p in model.named_parameters():
+        assert p.grad is not None, f"{name} got no gradient under full AC"
+        ref_name = name.replace("._checkpoint_wrapped_module", "")
+        assert torch.equal(p.grad, ref_grads[ref_name]), f"{name} grad differs"
