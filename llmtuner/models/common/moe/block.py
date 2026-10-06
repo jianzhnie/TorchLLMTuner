@@ -124,7 +124,7 @@ class MoE(nn.Module):
             torch.zeros(num_experts, dtype=torch.float32),
             persistent=False,
         )
-        # Staged padding mask for the next forward (see ``set_padding_mask``).
+        # Staged padding mask, held until re-staged (see ``set_padding_mask``).
         # A plain attribute, not a buffer: it is per-microbatch input, never
         # module state, and must stay out of the state_dict.
         self._pending_padding_mask: torch.Tensor | None = None
@@ -163,13 +163,14 @@ class MoE(nn.Module):
         The HF decoder layer calls its MoE as ``self.mlp(hidden_states)`` --
         its fixed signature has no slot for a mask, so the wrapper
         (``HFTransformerModel.forward``) stages the microbatch's mask on every
-        swapped MoE block just before the decoder runs. The mask is consumed
-        by the next ``forward`` and cleared, so a stale mask can never leak
-        into a later microbatch that carried none: a forward entered without
-        any staging is exactly the no-mask path.
+        swapped MoE block just before the decoder runs. The staged mask stays
+        in effect until the next staging (the wrapper stages every
+        microbatch, ``None`` included), so an activation-checkpointing
+        recompute of the same microbatch sees the same mask and the
+        load-balancing statistics are filtered identically on both passes.
 
         An explicit ``padding_mask`` passed to ``forward`` takes precedence
-        over (and still consumes) a staged one.
+        over the staged one for that call (the staged one is kept).
         """
         self._pending_padding_mask = padding_mask
 
@@ -190,8 +191,11 @@ class MoE(nn.Module):
         staged via ``set_padding_mask``.
         """
         if padding_mask is None:
+            # Staged masks persist until re-staged (the wrapper stages every
+            # microbatch, None included), so an activation-checkpointing
+            # recompute of this same microbatch sees the same mask and the
+            # statistics stay filtered identically on both passes.
             padding_mask = self._pending_padding_mask
-        self._pending_padding_mask = None
         if x.dim() > 2:
             lead = x.shape[:-1]
             out = self._forward_tokens(
@@ -221,8 +225,10 @@ class MoE(nn.Module):
         if self.training:
             with torch.no_grad():
                 # NOTE: activation checkpointing runs the forward twice, so this
-                # counts a token twice on recompute. The bias update uses
-                # sign(), so the doubled count does not change its direction.
+                # counts a token twice on recompute (the mask is stable across
+                # the replay, so both passes filter identically). The bias
+                # update uses sign() and the quantile histogram is uniformly
+                # scaled, so the doubled count changes neither.
                 # The padding-filtered map is what is counted: padding tokens
                 # are dispatched and computed, but they carry no loss, so they
                 # must not steer the bias.

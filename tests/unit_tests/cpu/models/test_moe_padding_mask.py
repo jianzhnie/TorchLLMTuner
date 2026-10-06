@@ -8,8 +8,10 @@ Pinned here, mirroring the upstream semantics:
 * **statistics skip padding** -- ``tokens_per_expert_E``, the aux loss's f/p
   terms and the quantile histogram count valid tokens only, and the no-mask
   path is unchanged (an all-valid mask is bitwise the same as no mask);
-* the **staged channel** -- ``set_padding_mask`` feeds the next forward
-  exactly once, so a stale mask cannot leak into a maskless microbatch.
+* the **staged channel** -- ``set_padding_mask`` holds the mask until
+  re-staged (the wrapper stages every microbatch, ``None`` included), so an
+  activation-checkpointing recompute sees the same mask and a stale mask can
+  never leak into a maskless microbatch.
 """
 
 from __future__ import annotations
@@ -293,10 +295,12 @@ def test_quantile_router_observes_valid_tokens_only() -> None:
 # -- the staged channel ----------------------------------------------------------
 
 
-def test_set_padding_mask_is_consumed_once() -> None:
+def test_the_staged_mask_persists_until_re_staged() -> None:
     """The wrapper stages the mask because the HF layer's fixed
-    ``self.mlp(hidden_states)`` call cannot thread it. Consumption is
-    one-shot: the next forward runs the maskless path again."""
+    ``self.mlp(hidden_states)`` call cannot thread it. The staged mask
+    persists until re-staged, so an activation-checkpointing recompute of
+    the same microbatch filters identically -- and re-staging ``None``
+    (what the wrapper does for a maskless microbatch) clears it."""
     moe = _moe()
     x_TD = _tokens()
     mask = _padding_mask()
@@ -307,9 +311,15 @@ def test_set_padding_mask_is_consumed_once() -> None:
     masked_counts = moe.tokens_per_expert_E.clone()
     assert masked_counts.sum().item() == (~mask).sum().item() * _TOP_K
 
-    # Consumed: a second forward with no staging counts every token.
+    # Recompute without re-staging (the AC replay): still filtered.
     moe(x_TD)
-    total = moe.tokens_per_expert_E - masked_counts
+    replay = moe.tokens_per_expert_E - masked_counts
+    assert replay.sum().item() == (~mask).sum().item() * _TOP_K
+
+    # Re-staging None (the maskless microbatch) clears it.
+    moe.set_padding_mask(None)
+    moe(x_TD)
+    total = moe.tokens_per_expert_E - masked_counts - replay
     assert total.sum().item() == _NUM_TOKENS * _TOP_K
 
 
@@ -321,7 +331,8 @@ def test_explicit_mask_takes_precedence_over_a_staged_one() -> None:
     moe.set_padding_mask(_padding_mask())
     moe(x_TD, padding_mask=torch.zeros(_NUM_TOKENS, dtype=torch.bool))
     assert moe.tokens_per_expert_E.sum().item() == _NUM_TOKENS * _TOP_K
-    # The staged mask was consumed, not queued behind the explicit one.
+    # The explicit mask won that call; the staged one is kept, not cleared.
+    moe.set_padding_mask(None)
     moe(x_TD)
     assert (
         moe.tokens_per_expert_E.sum().item() == 2 * _NUM_TOKENS * _TOP_K

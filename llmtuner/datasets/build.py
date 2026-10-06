@@ -141,7 +141,9 @@ def build_dataloader(
     torchtitan's ``num_tokens_per_microbatch_per_dp_rank``. The Grain loader
     divides every dataset's rows among ``dp_world_size`` ranks and hands each
     one exactly that many tokens, so the DP slice the trainer used to perform
-    no longer exists on this path.
+    no longer exists on this path. (The synthetic ``random`` corpus is the
+    exception: it is generated per rank from ``global_batch_size`` and does
+    not read ``num_tokens_per_batch``.)
 
     ``repeat=False`` builds a finite, single-pass loader -- the validation
     loop's shape: a bounded pass sets it so exhaustion (not a step count) ends

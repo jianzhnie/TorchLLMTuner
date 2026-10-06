@@ -33,18 +33,20 @@ def check_validation_feasibility(
 ) -> None:
     """Reject the validation configurations that cannot terminate cleanly.
 
-        Runs at trainer build time, where the real parallel degrees are known
-        (config-level ``__post_init__`` cannot see them: ``dp_shard`` defaults
-        to the derive-me marker ``-1``). Each rejected combination would
-        otherwise fail later and worse:
+    Runs at trainer build time, where the real parallel degrees are known
+    (config-level ``__post_init__`` cannot see them: ``dp_shard`` defaults
+    to the derive-me marker ``-1``). Each rejected combination would
+    otherwise fail later and worse (chunked loss x validation refuses first:
+    the pass scores full logits, so a model that only fits with chunked
+    training would OOM on its first eval):
 
-        * ``steps=-1`` consumes the finite dataset once, so every rank stops
-          when its own shard is exhausted. With DP > 1 the ranks can exhaust at
-          different iterations and hang on the pass's collectives (the token
-          and loss reductions every rank must enter together).
-        * ``steps=-1`` against the synthetic corpus has no exhaustion at all:
-          the random source is infinite, so "one finite pass" never ends.
-        """
+    * ``steps=-1`` consumes the finite dataset once, so every rank stops
+      when its own shard is exhausted. With DP > 1 the ranks can exhaust at
+      different iterations and hang on the pass's collectives (the token
+      and loss reductions every rank must enter together).
+    * ``steps=-1`` against the synthetic corpus has no exhaustion at all:
+      the random source is infinite, so "one finite pass" never ends.
+    """
     if chunked_loss_num_chunks > 1:
         matrix.chunked_loss_validation(chunked_loss_num_chunks)
     if validation.steps != -1:
@@ -60,10 +62,10 @@ def check_validation_feasibility(
 def should_validate(self, step: int) -> bool:
     """Whether a validation pass runs at the end of ``step``.
 
-        Step 1 always validates (a run sees its first eval number immediately,
-        which is the cheap sanity check that the eval path works at all);
-        after that, every ``validation.freq`` steps.
-        """
+    Step 1 always validates (a run sees its first eval number immediately,
+    which is the cheap sanity check that the eval path works at all);
+    after that, every ``validation.freq`` steps.
+    """
     validation = self.cfg.validation
     return validation is not None and (
         step == 1 or step % validation.freq == 0

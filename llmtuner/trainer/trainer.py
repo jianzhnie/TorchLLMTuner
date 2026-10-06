@@ -1109,5 +1109,9 @@ class Trainer:
             # raises against an already-torn-down state.
             self.dataloader.close()
 
+        # Tears down the process group the trainer bootstrapped. A
+        # programmatic caller that initialized torch.distributed itself
+        # loses its group here -- keep trainer lifecycle and external PG
+        # usage separate.
         if dist.is_initialized():
             dist.destroy_process_group()
