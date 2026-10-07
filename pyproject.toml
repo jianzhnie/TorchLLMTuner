@@ -33,7 +33,13 @@ dependencies = [
     "colorama>=0.4",
     # Used by the SPMD type-checker and by the mesh helpers in
     # accelerator/spmd_context.py.
-    # Pinned exactly the way torchtitan pins it -- the API is still moving.
+    # Pinned exactly -- the API is still moving. Upstream moved to a main-commit
+    # pin for torch_remat-under-TP fixes (metadata queries no longer type
+    # checked, assert_type_like overrides replace per group); llmtuner stays on
+    # the release pin because its only spmd_types surface is assert_type in the
+    # TP linears, and the upgraded semantics matter only under activation
+    # checkpointing that needs torch_remat (region mode x TP) -- revisit when
+    # that combination is first exercised. See docs/llmtuner_upstream_map.md.
     "spmd_types==0.2.5",
     # The dataset graph in datasets/ is built on Grain. Pinned exactly, the way
     # torchtitan pins it: packing and multimodal use six nodes out of

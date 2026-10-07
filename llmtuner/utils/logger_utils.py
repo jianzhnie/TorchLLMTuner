@@ -12,6 +12,7 @@ rank-0 configuration.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from logging import Formatter, LogRecord
 from typing import ClassVar
@@ -19,6 +20,23 @@ from typing import ClassVar
 from colorama import Fore, Style
 
 logger_initialized: dict[str, bool] = {}
+
+
+def env_log_level() -> int:
+    """The console log level, from the ``LLMTUNER_LOG_LEVEL`` env var.
+
+    Defaults to ``INFO``; setting it to ``DEBUG`` unlocks the debug lines the
+    default silently drops. An unrecognized name is a loud error, not a silent
+    fallback -- a typo'd level should not look like "no debug output".
+    """
+    level_name = os.environ.get("LLMTUNER_LOG_LEVEL", "INFO").upper()
+    level_names = logging.getLevelNamesMapping()
+    if level_name not in level_names:
+        raise ValueError(
+            f"Invalid LLMTUNER_LOG_LEVEL={level_name!r}; "
+            f"expected one of {sorted(level_names)}"
+        )
+    return level_names[level_name]
 
 
 class ColorfulFormatter(Formatter):
@@ -61,7 +79,7 @@ class MainProcessFilter(logging.Filter):
         return record.levelno >= logging.ERROR or get_distributed_rank() == 0
 
 
-def get_logger(name: str, log_level: int = logging.INFO) -> logging.Logger:
+def get_logger(name: str, log_level: int | None = None) -> logging.Logger:
     """Create or retrieve a module logger with a rank-aware stdout handler.
 
     Below ERROR, only the rank-0 process prints; ERROR and above print on
@@ -69,7 +87,12 @@ def get_logger(name: str, log_level: int = logging.INFO) -> logging.Logger:
     so the logger can be created at module import time, before the process
     group exists. The handler is attached once per ``name``; repeat calls
     return the same logger untouched.
+
+    ``log_level`` defaults to the ``LLMTUNER_LOG_LEVEL`` env var (itself
+    defaulting to ``INFO``); an explicit argument wins over the env var.
     """
+    if log_level is None:
+        log_level = env_log_level()
     logger = logging.getLogger(name)
     if name in logger_initialized:
         return logger

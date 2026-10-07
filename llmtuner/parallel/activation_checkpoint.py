@@ -447,7 +447,7 @@ def wrap_region(
     """
     remat = require_torch_remat()
     regions = region_names(block)
-    policy = region_policy(regions, cfg.save_regions)
+    policy = region_policy(regions, cfg.save_regions, cfg.recompute_regions)
     for name, module in block.named_modules():
         if name in policy:
             module.forward = remat.region(
@@ -467,6 +467,14 @@ def wrap_region(
             "RegionAC save_regions matched nothing in %s: %s (available: %s)",
             base_fqn,
             ", ".join(unmatched),
+            ", ".join(sorted(regions)) or "none",
+        )
+    unmatched_recompute = unmatched_save_patterns(regions, cfg.recompute_regions)
+    if unmatched_recompute:
+        logger.warning(
+            "RegionAC recompute_regions matched nothing in %s: %s (available: %s)",
+            base_fqn,
+            ", ".join(unmatched_recompute),
             ", ".join(sorted(regions)) or "none",
         )
     block.forward = remat.checkpoint(

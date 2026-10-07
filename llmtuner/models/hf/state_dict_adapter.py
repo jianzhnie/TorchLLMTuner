@@ -76,8 +76,15 @@ class HFTransformerStateDictAdapter:
         return {f"model.{key}": value for key, value in hf_state_dict.items()}
 
     def get_hf_storage_reader(
-        self, path: str, from_quantized: bool = False
+        self,
+        path: str,
+        from_quantized: bool = False,
+        *,
+        thread_count: int | None = None,
     ) -> HuggingFaceStorageReader:
         if from_quantized:
             raise NotImplementedError("Quantized HF checkpoints are not supported")
-        return HuggingFaceStorageReader(path)
+        if thread_count is None:
+            # Two workers overlap shard reads without heavy storage pressure.
+            thread_count = 2
+        return HuggingFaceStorageReader(path, thread_count=thread_count)

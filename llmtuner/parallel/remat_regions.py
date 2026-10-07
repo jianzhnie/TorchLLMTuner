@@ -65,16 +65,24 @@ def region_names(block: nn.Module) -> tuple[str, ...]:
     )
 
 
-def should_recompute(region: str, save_patterns: Sequence[str]) -> bool:
+def should_recompute(
+    region: str,
+    save_patterns: Sequence[str],
+    recompute_patterns: Sequence[str] = (),
+) -> bool:
     """Whether ``region`` is recomputed during backward instead of retained.
 
     Upstream's ``Module.remat_should_recompute``: a region is saved when any
-    pattern matches its qualified name, recomputed otherwise. ``fnmatch`` rather
-    than ``fnmatchcase`` for the same reason upstream uses it -- on the POSIX
-    ranks llmtuner targets the two are identical, and matching upstream keeps a
-    cross-platform run from silently changing policy.
+    save pattern matches its qualified name, recomputed otherwise -- and a
+    recompute pattern wins over a save pattern, so ``save_regions=["*"]`` plus a
+    short ``recompute_regions`` list spells "start from no AC and recompute just
+    these". ``fnmatch`` rather than ``fnmatchcase`` for the same reason upstream
+    uses it -- on the POSIX ranks llmtuner targets the two are identical, and
+    matching upstream keeps a cross-platform run from silently changing policy.
     """
-    return not any(fnmatch.fnmatch(region, pattern) for pattern in save_patterns)
+    return not any(
+        fnmatch.fnmatch(region, pattern) for pattern in save_patterns
+    ) or any(fnmatch.fnmatch(region, pattern) for pattern in recompute_patterns)
 
 
 def unmatched_save_patterns(
@@ -95,7 +103,9 @@ def unmatched_save_patterns(
 
 
 def region_policy(
-    regions: Sequence[str], save_patterns: Sequence[str]
+    regions: Sequence[str],
+    save_patterns: Sequence[str],
+    recompute_patterns: Sequence[str] = (),
 ) -> dict[str, bool]:
     """Map each region to its recompute decision (the applied policy).
 
@@ -103,5 +113,6 @@ def region_policy(
     the policy actually handed to torch_remat and not a re-derivation of it.
     """
     return {
-        region: should_recompute(region, save_patterns) for region in regions
+        region: should_recompute(region, save_patterns, recompute_patterns)
+        for region in regions
     }
