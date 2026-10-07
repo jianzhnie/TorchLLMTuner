@@ -313,6 +313,43 @@ def test_shared_expert_shards_featurewise_and_partials_sum() -> None:
     assert partials and partials[0].shape == x.shape
 
 
+def test_shared_expert_is_not_double_sharded_by_the_dense_plan() -> None:
+    """HF plans (e.g. DeepSeek-V3) declare shared_experts.*_proj as
+    colwise/rowwise dense targets. The MoE path already shards them
+    featurewise; the dense wrap loop must not wrap them again (that was the
+    F/tp**2 double-shard bug)."""
+    plan = dict(MOE_PLAN)
+    plan.update(
+        {
+            "layers.*.mlp.shared_experts.gate_proj": "colwise",
+            "layers.*.mlp.shared_experts.up_proj": "colwise",
+            "layers.*.mlp.shared_experts.down_proj": "rowwise",
+        }
+    )
+    model = _MoeModel()
+    model._tp_plan = plan
+    block = model.layers[0]["mlp"]
+    block.shared_experts = _SharedMLP()
+    cfg = ParallelConfig(tensor_parallel_size=2)
+
+    apply_tp(model, mesh=_FakeMesh(2, 0), cfg=cfg)
+
+    from llmtuner.parallel.tensor_parallel.tp import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+    )
+
+    shared = block.shared_experts
+    # Exactly one feature shard, no realizer wrap on top of it.
+    assert type(shared.gate_proj) is nn.Linear
+    assert type(shared.up_proj) is nn.Linear
+    assert type(shared.down_proj) is nn.Linear
+    assert shared.gate_proj.weight.shape[0] == 32 // 2
+    assert shared.down_proj.weight.shape[1] == 32 // 2
+    for proj in (shared.gate_proj, shared.up_proj, shared.down_proj):
+        assert not isinstance(proj, (ColumnParallelLinear, RowParallelLinear))
+
+
 def test_apply_tp_raises_on_a_shared_expert_block() -> None:
     model = _MoeModel()
     block = model.layers[0]["mlp"]

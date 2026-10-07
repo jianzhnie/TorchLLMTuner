@@ -118,6 +118,17 @@ def apply_tp(
                 moe_blocks.append((module_path, module))
         if not moe_blocks and not already_bracketed:
             matrix.tp_moe_specs_without_block(cfg.tp, model)
+    if moe_blocks:
+        # MoE-block internals never take the dense realizer path: the routed
+        # experts are stacked parameters (no nn.Linear to match), and the
+        # shared expert is sharded featurewise by ``shard_shared_expert_for_tp``
+        # below, collective-free inside the sequence boundary. HF plans like
+        # DeepSeek-V3's still declare ``shared_experts.*_proj: colwise`` --
+        # wrapping those in ColumnParallelLinear on top of the feature shard
+        # would double-shard the weight (F/tp**2 at the wrong offset) and
+        # double-gather the sequence, silently computing the wrong values.
+        moe_prefixes = tuple(f"{p}." for p, _ in moe_blocks)
+        targets = [t for t in targets if not t[0].startswith(moe_prefixes)]
     nothing_sharded = not targets and not moe_blocks and not already_bracketed
     if nothing_sharded and not moe_deferred_to_ep:
         raise ValueError(
