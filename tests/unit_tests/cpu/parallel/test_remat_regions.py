@@ -142,6 +142,28 @@ def test_unmatched_patterns_are_reported() -> None:
     assert unmatched_save_patterns(_REGIONS, ["self_attn.*"]) == ()
 
 
+# -- the recompute rule --------------------------------------------------------
+
+
+def test_a_recompute_pattern_wins_over_a_save_pattern() -> None:
+    """Upstream's precedence: recompute beats save, so save-all-except is
+    expressible."""
+    assert should_recompute("mlp.gate_proj", ["*"], ["mlp.gate_proj"])
+    assert not should_recompute("mlp.down_proj", ["*"], ["mlp.gate_proj"])
+
+
+def test_save_all_except_is_the_save_star_spelling() -> None:
+    policy = region_policy(_REGIONS, ["*"], ["mlp.*"])
+    assert [region for region, recompute in policy.items() if not recompute] == [
+        region for region in _REGIONS if region.startswith("self_attn.")
+    ]
+
+
+def test_no_recompute_patterns_keeps_the_save_only_rule() -> None:
+    """The default is the old behaviour, bit for bit."""
+    assert region_policy(_REGIONS, ["mlp.*"], []) == region_policy(_REGIONS, ["mlp.*"])
+
+
 # -- config --------------------------------------------------------------------
 
 
@@ -155,6 +177,7 @@ def test_region_is_an_accepted_mode_with_its_own_config() -> None:
 def test_the_default_config_retains_nothing_and_keeps_upstream_defaults() -> None:
     cfg = RegionACConfig()
     assert cfg.save_regions == []
+    assert cfg.recompute_regions == []
     assert cfg.preserve_rng_state is False
 
 

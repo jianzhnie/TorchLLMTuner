@@ -403,8 +403,9 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
 - **审计基线锚点**（详细验证记录在独立审计文件，不在当前工作区）：
   - 最近一次完整人工审计：llmtuner `11002c1` × TorchTitan `b64103072`（2026-09-23）。
   - 后续增量基线：TorchTitan `9e159aed7`（2026-09-26）、`c8a3e7666` 与
-    `f35966713`（2026-09-27）；早前基线：llmtuner `528dc9d` × TorchTitan `c6e416bbd`。
-  - 检查后续漂移：`git -C <torchtitan> log f35966713..HEAD -- torchtitan/`。
+    `f35966713`（2026-09-27）、`c6e71f452`（2026-10-08）；早前基线：llmtuner
+    `528dc9d` × TorchTitan `c6e416bbd`。
+  - 检查后续漂移：`git -C <torchtitan> log c6e71f452..HEAD -- torchtitan/`。
 - 各轮增量审计落在当前代码里的结论已并入上文 A/B/C/D 表与附录；其中仍以"上游提交
   → 当前处理"形式保留的要点：
   - 上游 `9e159aed7` TP projection 后端重构（#4704）：**语义已对齐，无代码动作**。
@@ -453,6 +454,66 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
     `test_document_capped_nested_packing_keeps_inner_padding` 落到
     `tests/unit_tests/cpu/datasets/test_data_pipeline.py`（本机被 grain 门禁 skip，
     已用最小 stub 冒烟验证两档 cap 的 mask/positions 语义）。
+  - 上游 `1e1aca668` SelectiveAC 迁移到 torch_remat（#4893）：**实现载体变更，
+    部分跟进**。上游的 SelectiveAC 不再是逐 op 策略，而是 RegionAC 的固定预设
+    （save `["*"]`、recompute `["*routed_experts.w13.*"]`，w2 仍 save——其输入
+    本就是 replay 重建的激活，重算只费时不出内存）；逐 op save 集合与
+    `force_recompute_mm_shapes_by_fqns` 在上游删除（graph_trainer 自带一份副本）。
+    llmtuner 既定不引入 torch_remat 作为 selective 的载体，**保留逐 op SAC 实现
+    不变**，自此与上游 selective 语义有意分叉（上游不再有"每隔一个 mm 重算"
+    刻度与 topk 保存，llmtuner 保留旧语义）。跟进的只有 RegionAC 一侧新增的
+    通用能力：`configure_remat_regions` 的 recompute 维度——已移植为
+    `RegionACConfig.recompute_regions` +
+    `remat_regions.should_recompute/region_policy` 的"recompute 优先于 save"
+     precedence（与上游 `remat_should_recompute` 同式），wrap_region 对未命中
+    的 recompute pattern 同样告警，默认空列表逐位不变。注意 llmtuner 的 region
+    词表是 `nn.Linear`，packed `GroupedExperts` 不在其中，上游预设里的
+    `*routed_experts.w13.*` 拼写在 llmtuner 无对应 region（要重算专家 GEMM 需
+    另设通道，与 D 表 DeepEP 一项同性质）。另登记：上游 aux_loss 文档明确
+    torch_remat 政策下注入只计一次、FullAC 下重复计数；llmtuner 的 aux-loss
+    累积不是 region（词表只有 Linear），region 模式下与 FullAC 一样会被重放
+    重复计数——与现状文档口径一致，非新增漂移。
+  - 上游 `2cc8cd065` RegionAC 每块 saved-tensor hooks seam（#5090）：**登记，
+    不移植**。上游给 RegionAC 加可覆写的 `get_saved_tensors_hooks(module, *,
+    base_fqn)`（默认 `None`，行为不变），服务 activation offloading 一类需求。
+    llmtuner 的 region 包装是自由函数 `wrap_region`，没有 subclass seam，也
+    没有 offloading 消费者；将来需要时给 `RegionACConfig`/`wrap_region` 加
+    一个 hooks 参数即可，语义入口已明确。
+  - 上游 `dd4d4830c` spmd_types 升到 main 提交（#5131）：**登记，不跟进**。
+    升级动机是 torch_remat 在 TP 下需要的修复（`stride()`/`storage_offset()`
+    等元数据查询不再被类型检查、按进程组的 `assert_type_like` 覆写改为替换
+    语义）与一条 aux-loss 注入的新类型检查规则。llmtuner 的 spmd_types 曲面
+    只有 TP linear 里的 `assert_type`（aux_loss 的 spmd 钩子本已裁掉），这些
+    修复只在 region 模式 × TP（torch_remat，环境门禁内、未验证）下才可能
+    触及；保持 `spmd_types==0.2.5` 不动，解锁条件：首次在 torch≥2.10 +
+    torch_remat 上跑 region×TP 时评估升级到上游所钉提交。
+  - 上游 `948d65c86` gated activation 在编译区域内 unbind（#5086）：**不适用**。
+    改动落在上游原生模型的 `BinaryActivationFn`/`FusedSwiGLU` Triton 核与
+    `local_compile_regions` 词表（`swiglu`/`situglu` 改名
+    `fused_binary_activation`）；llmtuner 跑 HF decoder 代码、无
+    `local_compile_regions` 面，`models/common/activation.py` 是 C 类同名
+    不同源。上游自述数值逐位不变，纯性能。
+  - 上游 `7b9c3d1d6` HF checkpoint 加载并行化（#5087）：**已移植**。
+    `HFTransformerStateDictAdapter.get_hf_storage_reader` 增加
+    `thread_count` 关键字参数，默认 2 个 worker 重叠分片读取（量化 reader
+    的拒绝路径不变）；上游对 deepseek_v3/gpt_oss adapter 的同步修改在
+    llmtuner 无对应物（`from_quantized` 本就 loud-raise）。本机 torch 2.2.2
+    无 `HuggingFaceStorageReader`，属环境门禁面，静态核对。
+  - 上游 `d83ea687a` `TITAN_LOG_LEVEL` 环境变量（#5089）：**已移植为
+    `LLMTUNER_LOG_LEVEL`**（`utils/logger_utils.py::env_log_level`，默认
+    INFO、非法值 loud-raise，显式 `log_level` 实参优先于环境变量）。
+  - 上游 `6a875910c` FFN 深度缩放初始化目标修正（#5111）：**不适用**。
+    改的是上游原生模型的 from-scratch 初始化（depth-scale 只打 `w2`）；
+    llmtuner 用 HF 自带 `_init_weights`，不持有该初始化面。
+  - 一批裁剪面/实验目录提交，快速确认后登记 **N/A**：`c110a1b70`（Paged
+    Stash CUDA-graphable MoE，graph_trainer + deepep wrapper）、`4b1f9cea1`
+    （NVFP4 MoE 量化，quantization 裁剪面）、`7a5bedba3`（LoRA 按 FQN 选择
+    目标模块，`models/common/lora.py` 裁剪面，llmtuner 的 LoRA 由 HF/peft
+    承担）、`7a8f01139`（按梯度累积组重放 CUDA graph，CUDA-graph 面随
+    D10 裁剪）、`e06ff0485`/`98e7b9501`/`ee1c2eaae`/`6113f19ea`（rl/
+    目录；其中 `ee1c2eaae` 新增的 `distributed/offloading.py` NUMA 绑定
+    helper 的消费者全在 rl/ 与 graph_trainer，llmtuner 无 offloading 面）、
+    `bf81602e1`/`1472b0714`/`0024eaeff`（graph_trainer 实验目录及其测试）。
   - 上游 `GroupedLinear`（`num_linears` 投影轴）与 FSDP 专家放置
     `Shard(weight.ndim-2)`：**无需动作（表示等价）**——llmtuner 的专家是
     packed 3-D（`gate_up_proj (E,2F,D)`、`down_proj (E,D,F)`），`Shard(ndim-2)`
@@ -731,7 +792,7 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 | `split_model_into_stages` | 同文件 stage split | 删除模块用 `Identity`，每 stage 保留 rotary，兼容 Torch 2.10 `PipelineStage`，**通过（适配）** |
 | `apply_pp`, `build_pipeline_schedule` | `distributed/pipeline_parallel.py` | llmtuner 直接消费 HF 五部件契约；pp×ep / pp×cp 放行，**通过（适配）** |
 | `apply_pp(first_stage_module_fqns=...)`, `prepend_first_stage_modules` | 同文件 `pipeline_with_first_stage_modules` | 额外顶层模块并入 stage 0：仅作用自动切分，存在的 FQN 按序前插，已占有/重复 FQN raise、缺失跳过，显式 `module_fqns_per_model_part` 给定时忽略并告警（同上游委托语义）；`split_model_into_stages` 配套把 wrapper `named_children()` 不呈现的额外顶层模块在非属主 stage 置 `Identity`（上游 "pruned on other stages" 语义），装五部件的容器经"包含已呈现部件"判定跳过。stage FQN 稳定、默认 None 逐位不变，**通过（适配）** |
-| `apply_ac`, selective helpers, `apply_memory_budget`, `disable_dynamo_lru_cache` | `distributed/activation_checkpoint.py` | FullAC/SelectiveAC 已移植，**通过**；FullAC 的对齐同时含策略这一层：上游 `FullAC._wrap_block` 不是裸 wrapper，而是把恒 `PREFER_RECOMPUTE` 的 `_full_ac_policy` 经 `create_selective_checkpoint_contexts` 传入，让 torch 对「输出不可重算/带注册副作用」的算子仍落 SAVE；llmtuner 已按同形补上 `full_policy` + `wrap_full`（`determinism_check`/`debug` 仍走 torch 默认值——实测 torch 默认即 `default`/`False`，与上游 config 默认相同，故行为一致，只是不可配）；两处 `early_stop` 已跟随上游 #4836 为 `True`。MemoryBudgetAC 已移植为 `mode='memory_budget'` + `MemoryBudgetACConfig`（设 `torch._functorch.config.activation_memory_budget`，需 compile，torch 无 knob 时 loud-raise），见 §9.1；RegionAC 已接入（`region_ac` + `parallel/remat_regions.py`，以 HF block 的 `nn.Linear` FQN 作 region 名，替代上游 `Module.configure_remat_regions` 声明通道；`preserve_rng_state=True` 配置期即拒，torch_remat 需 torch ≥ 2.10，apply 期 loud-raise）。`disable_dynamo_lru_cache` 亦已移植（上游在每个 policy 的 `apply` 开头调用），并经 `has("dynamo_lru_cache")` 能力门：torch 2.2.2 有 `torch._C._dynamo.eval_frame` 而无 `_set_lru_cache`，此时记 info 后继续。AC 也跑在 PP 路径上（`stages.py` 的 `ac` 行 `on_pp=True`，逐 chunk 折层，与上游把 `ac_config` 交给每个 model part 的 `parallelize` 同构）。FullAC 的 `determinism_check`/`debug` 旋钮未暴露（固定默认值），登记于此 |
+| `apply_ac`, selective helpers, `apply_memory_budget`, `disable_dynamo_lru_cache` | `distributed/activation_checkpoint.py` | FullAC/SelectiveAC 已移植，**通过**；FullAC 的对齐同时含策略这一层：上游 `FullAC._wrap_block` 不是裸 wrapper，而是把恒 `PREFER_RECOMPUTE` 的 `_full_ac_policy` 经 `create_selective_checkpoint_contexts` 传入，让 torch 对「输出不可重算/带注册副作用」的算子仍落 SAVE；llmtuner 已按同形补上 `full_policy` + `wrap_full`（`determinism_check`/`debug` 仍走 torch 默认值——实测 torch 默认即 `default`/`False`，与上游 config 默认相同，故行为一致，只是不可配）；两处 `early_stop` 已跟随上游 #4836 为 `True`。MemoryBudgetAC 已移植为 `mode='memory_budget'` + `MemoryBudgetACConfig`（设 `torch._functorch.config.activation_memory_budget`，需 compile，torch 无 knob 时 loud-raise），见 §9.1；RegionAC 已接入（`region_ac` + `parallel/remat_regions.py`，以 HF block 的 `nn.Linear` FQN 作 region 名，替代上游 `Module.configure_remat_regions` 声明通道；`recompute_regions` 与上游同语义——recompute pattern 优先于 save pattern，默认空逐位不变；`preserve_rng_state=True` 配置期即拒，torch_remat 需 torch ≥ 2.10，apply 期 loud-raise）。`disable_dynamo_lru_cache` 亦已移植（上游在每个 policy 的 `apply` 开头调用），并经 `has("dynamo_lru_cache")` 能力门：torch 2.2.2 有 `torch._C._dynamo.eval_frame` 而无 `_set_lru_cache`，此时记 info 后继续。AC 也跑在 PP 路径上（`stages.py` 的 `ac` 行 `on_pp=True`，逐 chunk 折层，与上游把 `ac_config` 交给每个 model part 的 `parallelize` 同构）。FullAC 的 `determinism_check`/`debug` 旋钮未暴露（固定默认值），登记于此 |
 | `apply_compile`, `maybe_enable_async_tp`, `maybe_regional_inductor_backend`, `maybe_regional_inductor` | `distributed/compile.py` 同名函数 | 四件全移植为 `parallel/compile.py` + `CompileConfig`（`training.compile_config`，默认全关 = 旧整体 compile 逐位不变）：逐 block compile 用 `Module.compile` 就地（`per_block=True`）；async TP 设 `_micro_pipeline_tp` + symm-mem 注册（按 group 名去重），配置期拒无 compile/tp=1，装配期对无 mesh/旧 torch loud-raise；regional_inductor 仅 `aot_eager`×flex 触发（wrapper `uses_flex_attention` 判定，annotation 在 `flex_attention_hf`，inductor_configs 传空），flex×其他 backend `ValueError`、torch 无该模块 `NotImplementedError`；`capture_scalar_outputs` 按上游条件（`iter_moe_layers` 非空）设置，dense 不动。上游的 `skip_fwd_side_effects_in_bwd_under_checkpoint` 与 FakeTensorMode monkeypatch 未移植（登记于 upstream map），**通过（适配）** |
 
 `VALID_AC_MODES` 声明在 `config/training.py`，紧挨它约束的
@@ -811,7 +872,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 | `accelerator.device.*` | 无可靠同源 | C 类，统一 NPU/CUDA/MLU/MUSA/CPU 设备信息与 backend 选择 |
 | `accelerator.monitoring.*` | 部分意图见 `tools/utils.py` | C 类，包含 peak FLOPS（含 MI350X）和 memory snapshot |
 | `utils.gc.GarbageCollection` | `tools/utils.py` GC helper | 去 structured logger，**通过（适配）** |
-| `utils.logger_utils.*` | 无单一对应 | C 类日志格式与 rank helper；全仓模块 logger 统一经 `get_logger`（发射时 rank 过滤） |
+| `utils.logger_utils.*` | 无单一对应 | C 类日志格式与 rank helper；全仓模块 logger 统一经 `get_logger`（发射时 rank 过滤），级别由 `LLMTUNER_LOG_LEVEL` 环境变量控制（上游 `TITAN_LOG_LEVEL` 同源） |
 | `components/checkpointer/checkpoint_keys.py` | 无文件对应 | C 类，checkpoint state key 常量的单一来源 |
 
 ### 9. 缺口与禁止误判项
@@ -1014,7 +1075,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `accelerator/device.py` | 设备发现、backend 选择、pin-memory 判定、NPU 谓词（`is_npu_available`，`accelerator/dist.py` 在用）；无消费者的 mmengine 厂商谓词面已删 | C |
 | `components/checkpointer/filesystem.py` | path/storage helpers | A1，`tools/filesystem.py` |
 | `utils/gc.py` | `GarbageCollection` | B，`tools/utils.py` |
-| `utils/logger_utils.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤）、`get_distributed_rank` | C |
+| `utils/logger_utils.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤）、`env_log_level`（`LLMTUNER_LOG_LEVEL`，默认 INFO、非法名 loud-raise，显式实参优先）、`get_distributed_rank` | C |
 | `utils/lazy_exports.py` | `export_names` / `resolve_export`：各包索引共用的 PEP 562 懒加载实现 | C |
 | `accelerator/monitoring.py` | device/memory/FLOPS helpers | C；部分意图可参考 `tools/utils.py` |
 | `accelerator/spmd_context.py` | SPMD mesh 上下文 | C，pip `spmd_types` 适配 |

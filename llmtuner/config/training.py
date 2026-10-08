@@ -253,12 +253,13 @@ class MemoryBudgetACConfig:
 class RegionACConfig:
     """Settings for ``activation_checkpoint_mode='region'``.
 
-    Ported from torchtitan's ``RegionAC.Config``: ``save_regions`` is the same
-    knob with the same semantics -- shell globs relative to a transformer block,
-    so one policy covers every block -- and ``determinism_check`` keeps
-    upstream's default. What differs is where the region *names* come from.
-    Upstream's own model code names them at ``torch_remat.region`` call sites
-    (``attention.qkv``, ``feed_forward.w13``, ...) and
+    Ported from torchtitan's ``RegionAC.Config``: ``save_regions`` and
+    ``recompute_regions`` are the same knobs with the same semantics -- shell
+    globs relative to a transformer block, so one policy covers every block, and
+    a recompute pattern wins over a save pattern -- and ``determinism_check``
+    keeps upstream's default. What differs is where the region *names* come
+    from. Upstream's own model code names them at ``torch_remat.region`` call
+    sites (``attention.qkv``, ``feed_forward.w13``, ...) and
     ``Module.configure_remat_regions`` hands the patterns down. llmtuner runs HF
     models and does not own their decoder code, so the vocabulary is structural:
     every ``nn.Linear`` in a block is a region, named by its FQN relative to the
@@ -293,6 +294,18 @@ class RegionACConfig:
             "retains nothing and behaves like full checkpointing. Region names "
             "are the block's nn.Linear FQNs; the set is logged at apply time "
             "and listed in parallel/remat_regions.py."
+        },
+    )
+    recompute_regions: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": "Shell-style glob patterns, relative to a decoder block, "
+            "naming regions that are recomputed even when save_regions also "
+            "matches them -- recompute wins over save. With "
+            "save_regions=['*'] this spells 'retain everything except these', "
+            "suited to starting from no checkpointing and recomputing just "
+            "enough to fit a memory budget. Empty (the default) leaves the "
+            "save_regions-only behaviour unchanged."
         },
     )
     determinism_check: str = field(
