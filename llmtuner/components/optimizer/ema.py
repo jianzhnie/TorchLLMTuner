@@ -53,7 +53,7 @@ import torch.nn as nn
 from torch.optim import Optimizer
 
 from ...utils.logger_utils import get_logger
-from ..checkpointer.utils import canonical_fqn
+from ..checkpointer.checkpoint_keys import canonical_fqn
 from .optimizer import OptimizersContainer
 
 __all__ = ["EMA"]
