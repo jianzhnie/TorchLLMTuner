@@ -58,7 +58,22 @@ class MainProcessFilter(logging.Filter):
     """
 
     def filter(self, record: LogRecord) -> bool:
-        return record.levelno >= logging.ERROR or get_distributed_rank() == 0
+        return (
+            record.levelno >= logging.ERROR
+            or get_distributed_rank() in _LOG_RANKS
+        )
+
+
+# The ranks whose regular (below-ERROR) lines reach the console. Settable via
+# ``set_log_ranks`` (wired from ``MetricsConfig.log_ranks``); a module-level
+# explicit API rather than an environment variable.
+_LOG_RANKS: frozenset[int] = frozenset({0})
+
+
+def set_log_ranks(ranks) -> None:
+    """Set which ranks print below-ERROR lines (default: rank 0 only)."""
+    global _LOG_RANKS
+    _LOG_RANKS = frozenset(int(r) for r in ranks)
 
 
 def get_logger(name: str, log_level: int = logging.INFO) -> logging.Logger:

@@ -36,6 +36,11 @@ class MetricsConfig:
     save_for_all_ranks: bool = False
     """Whether every rank logs, rather than only the metrics rank."""
 
+    log_ranks: list[int] = field(default_factory=lambda: [0])
+    """Ranks whose below-ERROR lines reach the console. Under pipeline
+    parallelism the loss lives on the last stage's first rank; add it here
+    (``--log_ranks 0 7``) to see its lines. Default: rank 0 only."""
+
     enable_wandb: bool = False
     """Whether to stream metrics to Weights & Biases."""
 
@@ -46,6 +51,8 @@ class MetricsConfig:
     def __post_init__(self) -> None:
         if self.log_freq <= 0:
             raise ConfigError("metrics.log_freq must be greater than 0.")
+        if any(r < 0 for r in self.log_ranks):
+            raise ConfigError(f"log_ranks must be non-negative, got {self.log_ranks}")
 
 
 @dataclass(kw_only=True)
