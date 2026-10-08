@@ -92,7 +92,6 @@ calls into, not loop logic, and llmtuner has no counterparts to call.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable, Iterator
 from contextlib import nullcontext
 from datetime import timedelta
@@ -106,10 +105,6 @@ from torch.distributed.tensor import DTensor
 from llmtuner.config import LLMTunerConfig, ValidationConfig
 
 from ..accelerator.collectives import clip_grad_norm_, set_pg_timeouts
-from ..accelerator.device import (
-    device_module,
-    device_type,
-)
 from ..accelerator.dist import all_reduce
 from ..accelerator.spmd_context import spmd_context
 from ..components.checkpointer import CheckpointManager
@@ -141,6 +136,7 @@ from ..utils.gc import GarbageCollection
 from ..utils.logger_utils import get_logger
 from . import batch as batch_mod
 from . import builder, pp_steps
+from . import seed as seed_mod
 from . import validate as validation_pass
 
 # Rank-aware: the helper attaches a handler whose filter passes below-ERROR
@@ -240,41 +236,10 @@ class Trainer:
     def seed_everything(
         seed: int, *, deterministic: bool, detect_anomaly: bool = False
     ) -> None:
-        torch.manual_seed(seed)
-        # Hash randomization is not observable in this process (PYTHONHASHSEED is
-        # read at interpreter start), but dataloader workers are spawned later and
-        # do read it, so upstream sets it here for them. Same spelling.
-        os.environ["PYTHONHASHSEED"] = str(seed % 2**32)
-        if device_type != "cpu":
-            device_module.manual_seed_all(seed)
-        if deterministic:
-            # torchtitan's ``set_determinism``, minus the parts that only exist
-            # for its own stack (the DTensor mesh-aware RNG tracker, the
-            # flex-attention kernels) and plus this one spelled out:
-            # ``use_deterministic_algorithms(True)`` turns on
-            # ``fill_uninitialized_memory``, whose fill kernel races with side
-            # streams and is what made HF's RoPE init observe NaN, so upstream
-            # turns it back off for the same reason.
-            #
-            # ``warn_only=False`` is llmtuner's fixed, stricter setting;
-            # upstream reads it from ``debug.deterministic_warn_only``.
-            torch.use_deterministic_algorithms(True, warn_only=False)
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-            torch.utils.deterministic.fill_uninitialized_memory = False
-            # Deterministic cuBLAS needs a workspace split, not the default one.
-            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
-        if detect_anomaly:
-            logger.warning(
-                "Anomaly detection enabled. This incurs significant overhead and "
-                "is for debugging only."
-            )
-            # ``check_nan=False``: the NaN/Inf gradient check calls
-            # ``aten._is_any_true``, which has no DTensor sharding strategy and
-            # would crash on sharded parameters. Stack-trace recording -- the
-            # useful half -- stays on. Same setting as upstream's.
-            torch.autograd.set_detect_anomaly(True, check_nan=False)
+        """Seed every generator; the body lives in ``seed.py``."""
+        seed_mod.seed_everything(
+            seed, deterministic=deterministic, detect_anomaly=detect_anomaly
+        )
 
     # -- batch handling (bodies live in batch.py) -------------------------------
 
@@ -307,7 +272,6 @@ class Trainer:
         Body in ``batch.py``.
         """
         return batch_mod.count_valid_tokens(batch)
-
 
     # -- the step, one function per level --------------------------------------
 
@@ -344,7 +308,6 @@ class Trainer:
         Body in ``batch.py``.
         """
         return batch_mod.preprocess(self, microbatch)
-
 
     def forward_backward_step(
         self,
@@ -703,7 +666,7 @@ class Trainer:
         # main loss, so their scale is independent of parallelism degrees.
         # Set once, before any forward: every micro-batch of the step divides
         # by the same number.
-        if AuxLoss._group_counts:
+        if AuxLoss.has_pending_counts():
             AuxLoss.set_step_denominator(global_valid_tokens)
 
         # Process each group, then free it. Loss values are retained only on a
@@ -889,7 +852,7 @@ class Trainer:
         # above; this reduces them for logging. Single-process runs skip the
         # collection (there is no mesh to reduce over and no second rank's
         # contribution); the injection itself is unaffected.
-        if AuxLoss._group_counts and self.parallel_dims is not None:
+        if AuxLoss.has_pending_counts() and self.parallel_dims is not None:
             metrics.update(collect_aux_loss_metrics(self.parallel_dims))
         return metrics
 
@@ -954,7 +917,6 @@ class Trainer:
     def validate_body(self, validation: ValidationConfig, step: int) -> None:
         """The pass itself; the body lives in ``validate.py``."""
         validation_pass.validate_body(self, validation, step)
-
 
     # -- step cadence ------------------------------------------------------------
 
