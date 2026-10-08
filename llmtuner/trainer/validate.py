@@ -17,7 +17,7 @@ from llmtuner.accelerator.capabilities import require
 from llmtuner.config import ValidationConfig
 from llmtuner.parallel import matrix
 
-from ..accelerator.dist import all_reduce
+from ..accelerator.collectives import all_reduce
 from ..accelerator.spmd_context import spmd_context
 from ..datasets import build_dataloader
 from ..datasets.random_data import DataLoaderExhausted

@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 from transformers import AutoConfig
 
-from llmtuner.accelerator.dist import all_reduce
+from llmtuner.accelerator.collectives import all_reduce
 from llmtuner.accelerator.spmd_context import spmd_context
 from llmtuner.models.common.moe.block import MoE
 from llmtuner.models.hf.model import HFTransformerModel

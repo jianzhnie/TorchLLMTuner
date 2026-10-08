@@ -7,7 +7,7 @@ from typing import Literal
 
 import torch
 
-from llmtuner.config.validate import require_at_least
+from llmtuner.config.field_checks import require_at_least
 from llmtuner.errors import (
     ConfigError,
     EnvironmentUnsupportedError,

@@ -140,7 +140,7 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `models/common/embedding.py` | 与上游同名但不同源；包含 llmtuner 的 vocab-shard 契约；Embedding 类 parity 保留（HF 自带 tok_embeddings；vocab-shard 公式由 components/loss.py 自持） |
 | `datasets/random_data.py` | 合成语料，上游无 |
 | `datasets/build.py` | 工厂；上游把 `build()` 放在 config 上 |
-| `accelerator/dist.py` + `accelerator/dist_utils.py` | vendored 自 OpenMMLab `mmengine.dist`（**不是 torchtitan 来源**），已去 mmengine 化，设备谓词与后端表统一由同包的 `accelerator/device.py` 提供；不进 trainer 装配路径。按「能力缺口」对照上游 `distributed/utils.py` 的结论是**无缺口**——上游的 `dist_sum`/`dist_max`/`dist_mean`/`dist_sum_tensor` 在 llmtuner 侧是 `all_reduce`（调用点 clone + in-place），`set_pg_timeouts`/`clip_grad_norm_` 在 `accelerator/collectives.py`，仅有的 `init_distributed`/fake 后端差异单列于 D 表 |
+| `accelerator/dist_utils.py` | vendored 自 OpenMMLab `mmengine.dist`（**不是 torchtitan 来源**），已去 mmengine 化，设备谓词与后端表统一由同包的 `accelerator/device.py` 提供；不进 trainer 装配路径。按「能力缺口」对照上游 `distributed/utils.py` 的结论是**无缺口**——上游的 `dist_sum`/`dist_max`/`dist_mean`/`dist_sum_tensor` 在 llmtuner 侧是 `accelerator/collectives.py::all_reduce`（调用点 clone + in-place），`set_pg_timeouts`/`clip_grad_norm_` 同文件，仅有的 `init_distributed`/fake 后端差异单列于 D 表 |
 | `trainer/seed.py` | 上游 `distributed/utils.py::set_determinism` 的 distinct-seed 派生公式的纯函数提取（仅该项，非全文件移植）；DTensor RNG tracker 不移植。`Trainer.seed_everything` 还含 `PYTHONHASHSEED = str(seed % 2**32)`（为后续 spawn 的 dataloader worker 而设）与 `detect_anomaly`（`torch.autograd.set_detect_anomaly(True, check_nan=False)` + 上游同文告警），落点为 `TrainingConfig.detect_anomaly`；不移植的仍是只服务上游自有栈的两件（DTensor mesh-aware RNG tracker、flex-attention 确定性内核调优） |
 
 ## D —— 真正缺失
@@ -759,8 +759,8 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 | `get_all_one_dimensional_meshes` | 同名上游方法 | 已排除 fake-backed axes，**通过** |
 | 分布式初始化（`accelerator/dist_utils.py`） | `distributed/utils.py` 的 `init_distributed` + `DistributedTopology`（`comm.backend` 的 `fake` / `real_pp_fake_spmd` 两种逻辑世界） | **未移植（登记）**：上游可在单进程内用 torch 的 `backend="fake"`（+ 真实 PP 组）模拟整个多卡拓扑，llmtuner 只有"`world_size == 1` → `parallel_dims is None`"与真多卡两条路，单机并行验证走 gloo + torchrun 集成测试。解锁条件：torch 提供 `backend="fake"`（本机 2.2.2 无）+ 决定给初始化加一条 debug 后端；见 `torchllmtuner_design.md` §8 的验证边界 |
 | `collectives.set_pg_timeouts` | 上游 trainer/comm timeout | llmtuner 独立实现，**通过（适配）** |
-| 归约调用（train_step 的 loss/token 归约） | 上游 scattered reductions | 收敛为 `accelerator.dist.all_reduce` 在调用点直接使用（clone + in-place collective），不重建 `dist_sum`/`dist_max`/`dist_sum_tensor` 薄封装；`reduce_equivalence.py` 验证 all_reduce 语义与 clone 调用惯例（trainer 的内联 clone 由 review 保证），**通过** |
-| `clip_grad_norm_` | 上游 distributed grad clipping | llmtuner 额外按本地 expert/dense 参数分组并跨 EP 归约，支持 DP/TP/PP/EP，**通过（适配）**。dense-only 路径与上游逐行同构（含 DTensor 先 `full_tensor()` 再跨 PP 归约的 `p` 次幂技巧），EP 分支免去上游「每个参数都必须是带 `"ep"` 轴的 DTensor」断言；上游的 `dist_sum`/`dist_max`/`dist_mean` 薄封装**不重建**——llmtuner 对应物是 `accelerator/dist.all_reduce` 在调用点（trainer/validator）使用，`components/metrics.py` 不做任何 `torch.distributed` 调用 |
+| 归约调用（train_step 的 loss/token 归约） | 上游 scattered reductions | 收敛为 `accelerator.collectives.all_reduce` 在调用点直接使用（clone + in-place collective），不重建 `dist_sum`/`dist_max`/`dist_sum_tensor` 薄封装；`reduce_equivalence.py` 验证 all_reduce 语义与 clone 调用惯例（trainer 的内联 clone 由 review 保证），**通过** |
+| `clip_grad_norm_` | 上游 distributed grad clipping | llmtuner 额外按本地 expert/dense 参数分组并跨 EP 归约，支持 DP/TP/PP/EP，**通过（适配）**。dense-only 路径与上游逐行同构（含 DTensor 先 `full_tensor()` 再跨 PP 归约的 `p` 次幂技巧），EP 分支免去上游「每个参数都必须是带 `"ep"` 轴的 DTensor」断言；上游的 `dist_sum`/`dist_max`/`dist_mean` 薄封装**不重建**——llmtuner 对应物是 `accelerator/collectives.all_reduce` 在调用点（trainer/validator）使用，`components/metrics.py` 不做任何 `torch.distributed` 调用 |
 | 种子与确定性（`Trainer.seed_everything`、`trainer/seed.py`） | `distributed/utils.py::set_determinism` | 含四项确定性开关（`use_deterministic_algorithms`、`cudnn.deterministic/benchmark`、`fill_uninitialized_memory=False`、`CUBLAS_WORKSPACE_CONFIG`）以及 `PYTHONHASHSEED = str(seed % 2**32)`（为之后 spawn 的 dataloader worker）与 `TrainingConfig.detect_anomaly`（`set_detect_anomaly(True, check_nan=False)` + 上游同文告警，`check_nan=False` 因 NaN/Inf 检查走 `aten._is_any_true` 无 DTensor 策略）；PP 的 distinct-seed 派生（`trainer/builder.py`）对应上游同函数公式。不移植两件：DTensor mesh-aware RNG tracker（上游用于分片参数初始化，llmtuner 走 HF 自身初始化）与 `warn_only` 开关（llmtuner 固定 `False`，更严）。**通过（适配）** |
 
 #### 5.2 TP
@@ -1055,12 +1055,11 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `models/hf/state_dict_adapter.py` | HF↔llmtuner state-dict 键转换与 safetensors index 严格校验 | B，`experiments/.../state_dict_adapter.py` |
 | `parallel/activation_checkpoint.py` | full/selective AC | A2，distributed AC |
 | `parallel/compile.py` | `apply_compile`（逐 block compile / async TP / regional_inductor / capture_scalar_outputs） | A2，`distributed/compile.py` |
-| `accelerator/collectives.py` | reductions、timeouts、grad norm | A2（部分），`distributed/utils.py` 的两个 vendored 符号 |
+| `accelerator/collectives.py` | reductions、timeouts、grad norm | A2（部分），`distributed/utils.py` 的两个 vendored 符号；外加 mmengine 来源的 in-place `all_reduce`（原 `accelerator/dist.py`，已并入） |
 | `parallel/context_parallel/apply.py` | `apply_cp` | C，独立 HF 编排层 |
 | `parallel/context_parallel/cp_kernel.py` | `CPFlexKernel` 与 seq/head autograd | C，CP flex attention 组合实现 |
 | `parallel/context_parallel/input_shard.py` | CP/TP batch 和 mask sharding | C，独立输入分片层 |
-| `accelerator/dist.py` | object collectives、all_reduce/gather、collect_results | C，vendored 自 OpenMMLab `mmengine.dist`（非 torchtitan 来源），已去 mmengine 化 |
-| `accelerator/dist_utils.py` | init_dist 多 launcher（后端字符串由 `device.py` 单源驱动）、rank/group 查询、`cast_data_device` | C，同上 |
+| `accelerator/dist_utils.py` | init_dist 多 launcher（后端字符串由 `device.py` 单源驱动）、rank/group 查询、`cast_data_device` | C，vendored 自 OpenMMLab `mmengine.dist`（非 torchtitan 来源），已去 mmengine 化；原同包 `dist.py` 的无消费者面（object collectives、gather/broadcast、collect_results 等）已删，唯一在用的 `all_reduce` 并入 `collectives.py` |
 | `parallel/expert_parallel/apply.py` | `apply_ep` | B，模型 EP parallelize |
 | `parallel/expert_parallel/swap.py`（编排）+ `probe.py`（探测）+ `convert.py`（转换） | HF MoE 探测、权重搬运与 swap | B，transformers backend `moe_replacement.py` |
 | `parallel/fully_shard/fsdp.py` | FSDP engine、mesh 与 placement | A2，`distributed/fsdp.py` |
@@ -1078,7 +1077,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `trainer/train.py` | parse/main | B，根 `train.py` |
 | `trainer/trainer.py` + `builder.py`（装配段与播种）/ `validate.py` / `batch.py` | 完整训练生命周期 | B，根 `trainer.py` + `training_engine.py` |
 | `components/checkpointer/checkpoint_keys.py` | checkpoint state key 常量 | C |
-| `accelerator/device.py` | 设备发现、backend 选择、pin-memory 判定、NPU 谓词（`is_npu_available`，`accelerator/dist.py` 在用）；无消费者的 mmengine 厂商谓词面已删 | C |
+| `accelerator/device.py` | 设备发现、backend 选择、pin-memory 判定；无消费者的 mmengine 厂商谓词面（`is_cuda_available`/`is_npu_available`/full-precision 探针/peak-memory 查询等）已删 | C |
 | `components/checkpointer/filesystem.py` | path/storage helpers | A1，`tools/filesystem.py` |
 | `utils/gc.py` | `GarbageCollection` | B，`tools/utils.py` |
 | `utils/logger_utils.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤，默认 INFO）、`set_log_ranks`（控制台打印 rank 集合，由 `MetricsConfig.log_ranks` 接线）、`get_distributed_rank` | C |
@@ -1101,11 +1100,9 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
   `NotImplementedError`）、`EnvironmentUnsupportedError`（依赖缺失、文案带解锁条件，
   兼 `NotImplementedError`）；可选包缺失保持 `ImportError`。
 - **命名与私有面**：模块级 helper / 数据类**默认公开**（本仓是学习/参考实现，读者应当能直接
-  import 任何一层；模块级私有名一旦被跨模块或测试引用就是在说谎）。前导 `_` 只保留三种：
+  import 任何一层；模块级私有名一旦被跨模块或测试引用就是在说谎）。前导 `_` 只保留两种：
   ① 框架协议要求的名字（`scatter_add.py` 的 `_backward`/`_setup_context` 是
-  `torch.library.custom_op` + autograd 的契约）；② 与"公开包装"配对的低层核心——
-  `accelerator/dist.py` 的 `_broadcast_object_list`/`_all_gather_object`/`_gather_object`
-  同名公开版返回 list、私有版收 out-list，去前缀会重名；③ 类内 protected 方法（子类或同包
+  `torch.library.custom_op` + autograd 的契约）；② 类内 protected 方法（子类或同包
   协作者用的 template-method 钩子，如 `checkpointer/base.py` 的 `_should_save` 族与
   `optimizer.py::_post_init`/`_validate_params`）。类内 `self._x` 属性属于封装，不在本条范围。
   **与上游同名的 helper 名字不同**（llmtuner 无前缀、上游带 `_`），

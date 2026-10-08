@@ -1,4 +1,4 @@
-"""Semantics of ``accelerator.dist.all_reduce`` and its call convention.
+"""Semantics of ``accelerator.collectives.all_reduce`` and its call convention.
 
 The historical regression: ``train_step`` reduces the local token count, then
 divides the loss by *that same tensor* to get the per-rank average. With an
@@ -28,7 +28,7 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from llmtuner.accelerator.dist import all_reduce
+from llmtuner.accelerator.collectives import all_reduce
 
 # Rank r holds 2 + r, so the SUM is 5 and the MAX is 3 on both ranks. A wrong
 # answer is then attributable to a specific rank rather than to "the sum is off".

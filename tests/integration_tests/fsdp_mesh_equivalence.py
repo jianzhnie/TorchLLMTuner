@@ -50,7 +50,7 @@ import torch.nn.functional as F
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 
-from llmtuner.accelerator.dist import all_reduce
+from llmtuner.accelerator.collectives import all_reduce
 from llmtuner.parallel.fully_shard.apply import apply_fsdp
 from llmtuner.parallel.parallel_dims import ParallelDims
 from llmtuner.trainer import ParallelConfig

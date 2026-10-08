@@ -32,7 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
-from llmtuner.accelerator.dist import all_reduce
+from llmtuner.accelerator.collectives import all_reduce
 from llmtuner.config import SelectiveACConfig
 from llmtuner.parallel.activation_checkpoint import apply_ac
 from llmtuner.parallel.fully_shard.apply import apply_fsdp
