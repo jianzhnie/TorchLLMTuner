@@ -65,7 +65,7 @@ torchrun --nproc_per_node=2 -m llmtuner --data_parallel_shard_size 2
 （`docs/FRAMEWORK_DESIGN.md` 是**立项前的评估稿，已归档**，其中的 `hftrain/`
 目录骨架未落地，读之前先看它的抬头）。
 优化器 checkpoint 的磁盘格式在 `32410ac` 变更过（改为扁平 FQN keying），
-旧 checkpoint 不再能加载，见 `docs/optimizer_checkpoint_format.md`。
+旧 checkpoint 不再能加载，格式契约见 `docs/torchllmtuner_design.md` 附录。
 
 NPU 上可用 [`examples/train_qwen3_8b_npu.sh`](examples/train_qwen3_8b_npu.sh) 运行本地
 Qwen3-8B 预训练权重的多卡 FSDP 训练。HF safetensors 通过 DCP 严格映射并直接加载到
