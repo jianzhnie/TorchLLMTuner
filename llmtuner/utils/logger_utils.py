@@ -34,16 +34,13 @@ class ColorfulFormatter(Formatter):
 
     def format(self, record: LogRecord) -> str:
         # Add rank information to the record
-        record.rank = self._get_rank()
+        record.rank = get_distributed_rank()
 
         # Format the log message
         log_message = super().format(record)
 
         # Add color based on log level
         return self.COLORS.get(record.levelname, "") + log_message + Fore.RESET
-
-    def _get_rank(self) -> int:
-        return get_distributed_rank()
 
 
 class MainProcessFilter(logging.Filter):
