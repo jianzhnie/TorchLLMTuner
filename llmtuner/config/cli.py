@@ -1,16 +1,22 @@
 """The config groups as the CLI parser sees them.
 
-``HfArgumentParser`` turns every ``init=True`` dataclass field into a flag, and
-three llmtuner fields cannot survive that round trip -- the parser rejects every
-value they are given (``invalid dict value``, ``invalid ParamGroupConfig
-value``, ``invalid Callable value``):
+``HfArgumentParser`` turns every ``init=True`` dataclass field into a flag.
+Two field shapes cannot survive that round trip, and both join
+``PROGRAMMATIC_ONLY`` instead of becoming flags that reject every value:
 
-* ``ModelConfig.arch_overrides`` -- ``dict[str, Any]``;
-* ``OptimizerConfig.param_groups`` -- ``list[ParamGroupConfig]``;
-* ``CheckpointConfig.purge_exempt`` -- ``Callable[[int], bool] | None``.
+* value types the parser cannot parse (``dict`` / ``list[dataclass]`` /
+  ``Callable``): ``ModelConfig.arch_overrides``,
+  ``OptimizerConfig.param_groups``, ``CheckpointConfig.purge_exempt``;
+* nested dataclasses, which the parser does not recurse into -- each collapses
+  to one opaque flag that rejects every value: ``TrainingConfig``'s
+  ``ema_config`` / ``validation_config``, the four graft targets
+  (``checkpoint_config`` / ``dataloader_config`` / ``metrics_config`` /
+  ``profiler_config``) and the AC/compile sub-configs (``compile_config`` /
+  ``selective_ac`` / ``memory_budget_ac`` / ``region_ac``). These are parsed
+  as their own top-level groups and grafted back by
+  ``LLMTunerConfig.from_groups``.
 
-All three are configured programmatically (see each field's own docstring), and
-a flag that exists only to reject its values is worse than no flag: it shows up
+A flag that exists only to reject its values is worse than no flag: it shows up
 in ``--help`` looking usable. ``init=False`` is the one hook
 ``HfArgumentParser`` honours -- it skips those fields -- so the CLI is handed a
 generated *view* of each group instead: a subclass of the real one whose
@@ -56,7 +62,21 @@ PROGRAMMATIC_ONLY: dict[type, frozenset[str]] = {
     ModelConfig: frozenset({"arch_overrides"}),
     OptimizerConfig: frozenset({"param_groups"}),
     CheckpointConfig: frozenset({"purge_exempt"}),
-    TrainingConfig: frozenset({"ema_config", "validation_config"}),
+    TrainingConfig: frozenset({
+        "ema_config",
+        "validation_config",
+        # Nested dataclasses become single-value flags that reject every value
+        # (HfArgumentParser does not recurse into them) -- hide them; they are
+        # grafted from their own parser groups in HybridMeshConfig.from_groups.
+        "checkpoint_config",
+        "dataloader_config",
+        "metrics_config",
+        "profiler_config",
+        "compile_config",
+        "selective_ac",
+        "memory_budget_ac",
+        "region_ac",
+    }),
 }
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from transformers import AutoConfig
@@ -72,11 +72,16 @@ class LLMTunerConfig:
         a run halve one without touching the other. Each group's own
         ``__post_init__`` already ran during parsing.
         """
-        optimizer.lr_scheduler_config = lr_scheduler
-        training.checkpoint_config = checkpoint
-        training.dataloader_config = dataloader
-        training.metrics_config = metrics
-        training.profiler_config = profiler
+        # replace(), not in-place grafting: the caller's group instances stay
+        # untouched (configs are read-only once built).
+        optimizer = replace(optimizer, lr_scheduler_config=lr_scheduler)
+        training = replace(
+            training,
+            checkpoint_config=checkpoint,
+            dataloader_config=dataloader,
+            metrics_config=metrics,
+            profiler_config=profiler,
+        )
         return cls(
             model=model, parallel=parallel, optimizer=optimizer, training=training
         )
@@ -87,6 +92,12 @@ class LLMTunerConfig:
             raise ConfigError(
                 f"max_seq_len ({self.training.max_seq_len}) must be divisible by "
                 f"cp ({self.parallel.cp})"
+            )
+        # TP splits the same stream one level down; same ragged-split refusal.
+        if self.training.max_seq_len % self.parallel.tp != 0:
+            raise ConfigError(
+                f"max_seq_len ({self.training.max_seq_len}) must be divisible by "
+                f"tp ({self.parallel.tp})"
             )
         # Async TP is a compiled-TP optimization: without compile there is no
         # inductor pass to pipeline the collectives, and without TP there are

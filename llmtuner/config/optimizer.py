@@ -119,7 +119,9 @@ class OptimizerConfig:
 
     learning_rate: float = field(default=3e-4, metadata={"help": "Learning rate"})
     weight_decay: float = field(default=0.0, metadata={"help": "Weight decay"})
-    betas: list[float] = field(
+    # Annotated as the CLI's input shape; __post_init__ normalizes to the
+    # tuple the optimizer actually consumes (root's flat view reads that one).
+    betas: list[float] | tuple[float, float] = field(
         default_factory=lambda: [0.9, 0.999],
         metadata={
             "help": "AdamW (beta1, beta2). Pass as two values: "
@@ -170,6 +172,13 @@ class OptimizerConfig:
         if not all(0.0 <= beta < 1.0 for beta in betas):
             raise ConfigError(f"betas must each be in [0, 1), got {betas}")
         self.betas = betas
+
+        if self.learning_rate < 0:
+            raise ConfigError(f"learning_rate must be >= 0, got {self.learning_rate}")
+        if self.weight_decay < 0:
+            raise ConfigError(f"weight_decay must be >= 0, got {self.weight_decay}")
+        if self.eps <= 0:
+            raise ConfigError(f"eps must be > 0, got {self.eps}")
 
         # The degenerate grouping: no explicit param_groups means one catch-all
         # group over every trainable parameter, built from the flat scalars.

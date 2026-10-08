@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from llmtuner.errors import ConfigError
+
 
 @dataclass
 class ModelConfig:
@@ -70,3 +72,49 @@ class ModelConfig:
         },
     )
 
+    def __post_init__(self) -> None:
+        # Architecture numbers must be sane before any model build: an invalid
+        # value here used to surface deep inside HF's for_model or the
+        # wrapper's forward, long after the config was accepted.
+        for name in (
+            "vocab_size",
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+        ):
+            if getattr(self, name) < 1:
+                raise ConfigError(
+                    f"model.{name} must be >= 1, got {getattr(self, name)}"
+                )
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ConfigError(
+                f"model.hidden_size ({self.hidden_size}) must be divisible by "
+                f"num_attention_heads ({self.num_attention_heads})"
+            )
+        if self.num_key_value_heads > self.num_attention_heads:
+            raise ConfigError(
+                f"model.num_key_value_heads ({self.num_key_value_heads}) cannot "
+                f"exceed num_attention_heads ({self.num_attention_heads})"
+            )
+        if self.compute_dtype is not None and self.compute_dtype not in (
+            "float32",
+            "float16",
+            "bfloat16",
+        ):
+            raise ConfigError(
+                f"model.compute_dtype must be one of float32/float16/bfloat16, "
+                f"got {self.compute_dtype!r}"
+            )
+        if self.experts_implementation not in (
+            "native",
+            "grouped_mm",
+            "batched_mm",
+            "eager",
+        ):
+            raise ConfigError(
+                f"model.experts_implementation must be one of "
+                f"native/grouped_mm/batched_mm/eager, got "
+                f"{self.experts_implementation!r}"
+            )

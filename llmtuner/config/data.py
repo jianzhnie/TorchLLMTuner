@@ -159,6 +159,15 @@ class DataloaderConfig:
         # would import the datasets package into the config layer.
         if self.max_num_documents is not None and self.max_num_documents <= 0:
             raise ConfigError("max_num_documents must be positive")
+        if self.streaming_shuffle_buffer_size < 1:
+            raise ConfigError(
+                "streaming_shuffle_buffer_size must be >= 1, got "
+                f"{self.streaming_shuffle_buffer_size}"
+            )
+        if self.num_prefetch_batches < 1:
+            raise ConfigError(
+                f"num_prefetch_batches must be >= 1, got {self.num_prefetch_batches}"
+            )
         # Validated here even though only 'first_fit' reads it: the field is
         # always parsed, so a bad value would otherwise be accepted silently
         # under the default recipe and only fail after switching to first_fit.
