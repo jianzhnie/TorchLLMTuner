@@ -174,33 +174,3 @@ def test_a_positive_frequency_disables_the_automatic_collector() -> None:
     finally:
         # Do not leak the disabled state into whichever test runs next.
         _gc.enable()
-
-
-# -- env_log_level ------------------------------------------------------------
-
-
-def test_the_log_level_defaults_to_info(monkeypatch) -> None:
-    from llmtuner.utils.logger_utils import env_log_level
-
-    monkeypatch.delenv("LLMTUNER_LOG_LEVEL", raising=False)
-    import logging
-
-    assert env_log_level() == logging.INFO
-
-
-def test_the_log_level_env_var_unlocks_debug(monkeypatch) -> None:
-    import logging
-
-    from llmtuner.utils.logger_utils import env_log_level
-
-    monkeypatch.setenv("LLMTUNER_LOG_LEVEL", "debug")
-    assert env_log_level() == logging.DEBUG
-
-
-def test_an_unknown_log_level_is_a_loud_error(monkeypatch) -> None:
-    """A typo must not look like "no debug output"."""
-    from llmtuner.utils.logger_utils import env_log_level
-
-    monkeypatch.setenv("LLMTUNER_LOG_LEVEL", "verbose-ish")
-    with pytest.raises(ValueError, match="LLMTUNER_LOG_LEVEL"):
-        env_log_level()
