@@ -132,7 +132,7 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `parallel/context_parallel/apply.py` | 0.058；CP 的编排层，上游无对应文件 |
 | `parallel/context_parallel/cp_kernel.py` | 0.051；llmtuner 独有的 CP flex kernel |
 | `parallel/context_parallel/input_shard.py` | 0.078 |
-| `utils/logger_utils.py` | 0.070，上游无对应；全仓模块 logger 统一经 `get_logger`（handler 挂模块 logger，rank 过滤在发射时判定） |
+| `utils/logger_utils.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤，默认 INFO）、`get_distributed_rank` | C |
 | `accelerator/monitoring.py` | 与 `tools/utils.py` 0.107，独立实现（含 `get_peak_flops`） |
 | `components/checkpointer/checkpoint_keys.py` | 上游无 |
 | `accelerator/device.py` | 上游无（0.382 是噪音，命中实验目录） |
@@ -499,9 +499,10 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
     的拒绝路径不变）；上游对 deepseek_v3/gpt_oss adapter 的同步修改在
     llmtuner 无对应物（`from_quantized` 本就 loud-raise）。本机 torch 2.2.2
     无 `HuggingFaceStorageReader`，属环境门禁面，静态核对。
-  - 上游 `d83ea687a` `TITAN_LOG_LEVEL` 环境变量（#5089）：**已移植为
-    `LLMTUNER_LOG_LEVEL`**（`utils/logger_utils.py::env_log_level`，默认
-    INFO、非法值 loud-raise，显式 `log_level` 实参优先于环境变量）。
+  - 上游 `d83ea687a` `TITAN_LOG_LEVEL` 环境变量（#5089）：**不移植**。
+    llmtuner 的既定约定是不引入项目级环境变量（HPMESH_DEVICE /
+    HPMESH_DIST_BACKEND 同样不收）；日志级别保持在 `get_logger` 的显式
+    参数上（默认 INFO）。
   - 上游 `6a875910c` FFN 深度缩放初始化目标修正（#5111）：**不适用**。
     改的是上游原生模型的 from-scratch 初始化（depth-scale 只打 `w2`）；
     llmtuner 用 HF 自带 `_init_weights`，不持有该初始化面。
@@ -872,7 +873,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 | `accelerator.device.*` | 无可靠同源 | C 类，统一 NPU/CUDA/MLU/MUSA/CPU 设备信息与 backend 选择 |
 | `accelerator.monitoring.*` | 部分意图见 `tools/utils.py` | C 类，包含 peak FLOPS（含 MI350X）和 memory snapshot |
 | `utils.gc.GarbageCollection` | `tools/utils.py` GC helper | 去 structured logger，**通过（适配）** |
-| `utils.logger_utils.*` | 无单一对应 | C 类日志格式与 rank helper；全仓模块 logger 统一经 `get_logger`（发射时 rank 过滤），级别由 `LLMTUNER_LOG_LEVEL` 环境变量控制（上游 `TITAN_LOG_LEVEL` 同源） |
+| `utils.logger_utils.*` | 无单一对应 | C 类日志格式与 rank helper；全仓模块 logger 统一经 `get_logger`（发射时 rank 过滤），级别默认 INFO（上游 `TITAN_LOG_LEVEL` 未移植：不引入项目级环境变量） |
 | `components/checkpointer/checkpoint_keys.py` | 无文件对应 | C 类，checkpoint state key 常量的单一来源 |
 
 ### 9. 缺口与禁止误判项
