@@ -62,21 +62,23 @@ PROGRAMMATIC_ONLY: dict[type, frozenset[str]] = {
     ModelConfig: frozenset({"arch_overrides"}),
     OptimizerConfig: frozenset({"param_groups"}),
     CheckpointConfig: frozenset({"purge_exempt"}),
-    TrainingConfig: frozenset({
-        "ema_config",
-        "validation_config",
-        # Nested dataclasses become single-value flags that reject every value
-        # (HfArgumentParser does not recurse into them) -- hide them; they are
-        # grafted from their own parser groups in HybridMeshConfig.from_groups.
-        "checkpoint_config",
-        "dataloader_config",
-        "metrics_config",
-        "profiler_config",
-        "compile_config",
-        "selective_ac",
-        "memory_budget_ac",
-        "region_ac",
-    }),
+    TrainingConfig: frozenset(
+        {
+            "ema_config",
+            "validation_config",
+            # Nested dataclasses become single-value flags that reject every value
+            # (HfArgumentParser does not recurse into them) -- hide them; they are
+            # grafted from their own parser groups in LLMTunerConfig.from_groups.
+            "checkpoint_config",
+            "dataloader_config",
+            "metrics_config",
+            "profiler_config",
+            "compile_config",
+            "selective_ac",
+            "memory_budget_ac",
+            "region_ac",
+        }
+    ),
 }
 
 

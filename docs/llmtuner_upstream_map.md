@@ -212,7 +212,7 @@ Ulysses 拒绝（per-head sinks 只走 TP 分片）不适用：llmtuner 尚无 G
 
 **已从 D 移除**：`distributed/compile.py`——四件互相独立的
 能力全部落 `llmtuner/parallel/compile.py::apply_compile`，由
-`config/training.py::CompileConfig`（`training.compile_config`，默认全关）驱动，
+`config/compile.py::CompileConfig`（`training.compile_config`，默认全关）驱动，
 装配顺序不变（AC 之后、FSDP 之前；PP 下每 chunk 由
 `parallel/parallelize.py::parallelize_hf_transformers` 过同一函数）：
 
@@ -264,7 +264,7 @@ stage 0；已被切分占有的 FQN 与重复 FQN loud-raise，缺失模块跳�
 `components/validate.py::Validator` 落 `trainer/validate.py`
 （`Trainer.validate`/`should_validate`/`check_validation_feasibility` 的
 薄委托背后）+
-`config/training.py::ValidationConfig`（`training.validation_config`，默认
+`config/validation.py::ValidationConfig`（`training.validation_config`，默认
 None 关闭，关闭时训练循环逐位不变；programmatic-only，同 `ema_config`）。
 语义对齐：eval 模式 + `no_grad`、结束恢复 train；loss 按全局有效 token 数
 归一化，token 计数走 dp mesh、loss 和走 dp×cp×tp loss mesh（与训练 loss 同一
@@ -801,7 +801,7 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 | `apply_ac`, selective helpers, `apply_memory_budget`, `disable_dynamo_lru_cache` | `distributed/activation_checkpoint.py` | FullAC/SelectiveAC 已移植，**通过**；FullAC 的对齐同时含策略这一层：上游 `FullAC._wrap_block` 不是裸 wrapper，而是把恒 `PREFER_RECOMPUTE` 的 `_full_ac_policy` 经 `create_selective_checkpoint_contexts` 传入，让 torch 对「输出不可重算/带注册副作用」的算子仍落 SAVE；llmtuner 已按同形补上 `full_policy` + `wrap_full`（`determinism_check`/`debug` 仍走 torch 默认值——实测 torch 默认即 `default`/`False`，与上游 config 默认相同，故行为一致，只是不可配）；两处 `early_stop` 已跟随上游 #4836 为 `True`。MemoryBudgetAC 已移植为 `mode='memory_budget'` + `MemoryBudgetACConfig`（设 `torch._functorch.config.activation_memory_budget`，需 compile，torch 无 knob 时 loud-raise），见 §9.1；RegionAC 已接入（`region_ac` + `parallel/remat_regions.py`，以 HF block 的 `nn.Linear` FQN 作 region 名，替代上游 `Module.configure_remat_regions` 声明通道；`recompute_regions` 与上游同语义——recompute pattern 优先于 save pattern，默认空逐位不变；`preserve_rng_state=True` 配置期即拒，torch_remat 需 torch ≥ 2.10，apply 期 loud-raise）。`disable_dynamo_lru_cache` 亦已移植（上游在每个 policy 的 `apply` 开头调用），并经 `has("dynamo_lru_cache")` 能力门：torch 2.2.2 有 `torch._C._dynamo.eval_frame` 而无 `_set_lru_cache`，此时记 info 后继续。AC 也跑在 PP 路径上（`stages.py` 的 `ac` 行 `on_pp=True`，逐 chunk 折层，与上游把 `ac_config` 交给每个 model part 的 `parallelize` 同构）。FullAC 的 `determinism_check`/`debug` 旋钮未暴露（固定默认值），登记于此 |
 | `apply_compile`, `maybe_enable_async_tp`, `maybe_regional_inductor_backend`, `maybe_regional_inductor` | `distributed/compile.py` 同名函数 | 四件全移植为 `parallel/compile.py` + `CompileConfig`（`training.compile_config`，默认全关 = 旧整体 compile 逐位不变）：逐 block compile 用 `Module.compile` 就地（`per_block=True`）；async TP 设 `_micro_pipeline_tp` + symm-mem 注册（按 group 名去重），配置期拒无 compile/tp=1，装配期对无 mesh/旧 torch loud-raise；regional_inductor 仅 `aot_eager`×flex 触发（wrapper `uses_flex_attention` 判定，annotation 在 `flex_attention_hf`，inductor_configs 传空），flex×其他 backend `ValueError`、torch 无该模块 `NotImplementedError`；`capture_scalar_outputs` 按上游条件（`iter_moe_layers` 非空）设置，dense 不动。上游的 `skip_fwd_side_effects_in_bwd_under_checkpoint` 与 FakeTensorMode monkeypatch 未移植（登记于 upstream map），**通过（适配）** |
 
-`VALID_AC_MODES` 声明在 `config/training.py`，紧挨它约束的
+`VALID_AC_MODES` 声明在 `config/activation_checkpoint.py`，紧挨它约束的
 `TrainingConfig.activation_checkpoint_mode`；`parallel/activation_checkpoint.py` 从这里
 import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac` 的成员
 检查不会各自漂移）。`config/training.py` 的 `global_batch_size` / `max_seq_len` /
@@ -1074,7 +1074,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `parallel/pipeline_parallel/apply.py` | metadata、apply、schedule build | B，`distributed/pipeline_parallel.py` |
 | `parallel/tensor_parallel/linear.py` | fused/fallback collective GEMM | A2，`models/common/async_linear.py`（上游 `distributed/linear.py` 的后继） |
 | `parallel/tensor_parallel/tp.py` + `apply.py` | HF plan realizer 与 `apply_tp` 入口 | B，各模型 TP plan（上游 `distributed/tensor_parallel.py` 于 `7e7f271e0` 删除，后继为 `protocols/sharding.py` + `hf_sharding.py` / `decoder_sharding.py` 的声明面） |
-| `config/`（`model/parallel/optimizer/checkpoint/data/training/root.py` + `cli.py`） | 全部配置 dataclass，逐组 `__post_init__` 校验；`cli.py` 是解析面的视图（`PARSER_GROUPS` + `cli_groups`），把 CLI 载不动的字段摘出 `--help` | B，`config/configs.py` + 嵌套 Config |
+| `config/`（`model/parallel/optimizer/checkpoint/data/observability/activation_checkpoint/compile/validation/training/root.py` + `cli.py`） | 全部配置 dataclass，逐组 `__post_init__` 校验；`cli.py` 是解析面的视图（`PARSER_GROUPS` + `cli_groups`），把 CLI 载不动的字段摘出 `--help` | B，`config/configs.py` + 嵌套 Config |
 | `trainer/train.py` | parse/main | B，根 `train.py` |
 | `trainer/trainer.py` + `builder.py`（装配段）/ `validate.py` / `pp_steps.py` / `batch.py` / `seed.py` | 完整训练生命周期 | B，根 `trainer.py` + `training_engine.py` |
 | `components/checkpointer/checkpoint_keys.py` | checkpoint state key 常量 | C |

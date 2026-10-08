@@ -104,26 +104,34 @@ class CheckpointConfig:
 
     def __post_init__(self) -> None:
         if not self.folder.strip():
-            raise ConfigError("The 'folder' field cannot be empty.")
+            raise ConfigError("checkpoint.folder must not be empty.")
         if self.interval < 1:
-            raise ConfigError("Checkpoint interval needs to be at least 1 step.")
+            raise ConfigError(f"checkpoint.interval must be >= 1, got {self.interval}")
         if self.load_step < -1:
-            raise ConfigError("load_step must be -1 or non-negative.")
+            raise ConfigError(
+                f"checkpoint.load_step must be >= -1, got {self.load_step}"
+            )
         if self.keep_latest_k < 0:
-            raise ConfigError("keep_latest_k cannot be negative.")
+            raise ConfigError(
+                f"checkpoint.keep_latest_k must be >= 0, got {self.keep_latest_k}"
+            )
         if self.keep_latest_k == 1:
             raise ConfigError(
-                "We need to maintain at least 2 checkpoint replicas, "
-                "as the last one may be in the process of being saved."
+                "checkpoint.keep_latest_k must not be 1: at least 2 replicas "
+                "are kept, as the latest may still be in the process of being "
+                "saved."
             )
         if MODEL in self.exclude_from_loading:
-            raise ConfigError(f"{MODEL} key shouldn't be in exclude_from_loading.")
+            raise ConfigError(
+                f"checkpoint.exclude_from_loading must not contain {MODEL!r}."
+            )
         if (
             OPTIMIZER in self.exclude_from_loading
             and LR_SCHEDULER not in self.exclude_from_loading
         ):
             raise ConfigError(
-                f"{LR_SCHEDULER} must be excluded when {OPTIMIZER} is excluded."
+                f"checkpoint.exclude_from_loading: {LR_SCHEDULER} must be "
+                f"excluded when {OPTIMIZER} is excluded."
             )
 
         if self.initial_load_path:
@@ -133,24 +141,31 @@ class CheckpointConfig:
                 or filesystem.is_remote(self.initial_load_path)
             ):
                 raise ConfigError(
-                    "initial_load_path must be an absolute path or a remote "
-                    f"URI (e.g. gs://...): {self.initial_load_path}"
+                    "checkpoint.initial_load_path must be an absolute path or "
+                    f"a remote URI (e.g. gs://...), got {self.initial_load_path}"
                 )
         if self.initial_load_in_hf and not self.initial_load_model_only:
-            raise ConfigError("initial_load_in_hf requires initial_load_model_only.")
+            raise ConfigError(
+                "checkpoint.initial_load_in_hf requires initial_load_model_only."
+            )
         if self.initial_load_in_hf_quantized and not (
             self.initial_load_in_hf and self.initial_load_path
         ):
             raise ConfigError(
-                "initial_load_in_hf_quantized requires initial_load_in_hf "
-                "and initial_load_path."
+                "checkpoint.initial_load_in_hf_quantized requires "
+                "initial_load_in_hf and initial_load_path."
             )
         if self.last_save_in_hf and not self.last_save_model_only:
-            raise ConfigError("last_save_in_hf requires last_save_model_only=True.")
+            raise ConfigError(
+                "checkpoint.last_save_in_hf requires last_save_model_only=True."
+            )
 
         async_lowered = self.async_mode.lower()
         if async_lowered not in ("disabled", "async", "async_with_pinned_mem"):
-            raise ConfigError(f"Invalid async_mode: {async_lowered}")
+            raise ConfigError(
+                "checkpoint.async_mode must be one of "
+                f"disabled/async/async_with_pinned_mem, got {async_lowered!r}"
+            )
         self.async_mode = async_lowered
 
         # Remote (fsspec) checkpoint IO supports only the native DCP format. HF
@@ -158,8 +173,8 @@ class CheckpointConfig:
         # the combination up front instead of failing deep inside DCP.
         if self.last_save_in_hf and filesystem.is_remote(self.folder):
             raise ConfigError(
-                "last_save_in_hf is not supported with a remote "
-                f"checkpoint.folder: {self.folder}"
+                "checkpoint.last_save_in_hf is not supported with a remote "
+                f"checkpoint.folder, got {self.folder}"
             )
         if (
             self.initial_load_in_hf
@@ -167,8 +182,8 @@ class CheckpointConfig:
             and filesystem.is_remote(self.initial_load_path)
         ):
             raise ConfigError(
-                "initial_load_in_hf is not supported with a remote "
-                f"initial_load_path: {self.initial_load_path}"
+                "checkpoint.initial_load_in_hf is not supported with a remote "
+                f"initial_load_path, got {self.initial_load_path}"
             )
 
         if self.load_only and self.enable_first_step_checkpoint:

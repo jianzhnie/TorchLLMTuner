@@ -189,7 +189,7 @@ def test_symmetric_memory_is_rejected_off_a_supported_device() -> None:
 def test_an_unknown_pipeline_schedule_is_rejected() -> None:
     """``get_schedule_class`` is the authority; the error names the bad value."""
     with pytest.raises(
-        ValueError, match="Invalid parallelism.pipeline_parallel_schedule"
+        ValueError, match="Invalid parallel.pipeline_parallel_schedule"
     ):
         ParallelConfig(pipeline_parallel_schedule="NotASchedule")
 
@@ -229,18 +229,18 @@ def test_min_lr_factor_is_half_open_at_one() -> None:
 
 
 def test_a_whitespace_folder_is_not_a_folder() -> None:
-    with pytest.raises(ValueError, match="'folder' field cannot be empty"):
+    with pytest.raises(ValueError, match="checkpoint.folder must not be empty"):
         CheckpointConfig(folder="   ")
 
 
 def test_load_step_is_either_derive_or_non_negative() -> None:
     assert CheckpointConfig(load_step=-1).load_step == -1
-    with pytest.raises(ValueError, match="load_step must be -1 or non-negative"):
+    with pytest.raises(ValueError, match="load_step must be >= -1"):
         CheckpointConfig(load_step=-2)
 
 
 def test_negative_retention_is_rejected() -> None:
-    with pytest.raises(ValueError, match="keep_latest_k cannot be negative"):
+    with pytest.raises(ValueError, match="keep_latest_k must be >= 0"):
         CheckpointConfig(keep_latest_k=-1)
 
 
@@ -249,7 +249,7 @@ def test_the_model_can_never_be_excluded_from_a_load() -> None:
     """Loading everything *except* the weights is never what a user means."""
     from llmtuner.components.checkpointer import MODEL
 
-    with pytest.raises(ValueError, match="shouldn't be in exclude_from_loading"):
+    with pytest.raises(ValueError, match="exclude_from_loading must not contain"):
         CheckpointConfig(exclude_from_loading=[MODEL])
 
 
@@ -296,7 +296,7 @@ def test_hf_load_modes_imply_each_other() -> None:
 
 
 def test_an_unknown_async_mode_is_rejected_and_the_valid_one_is_lowered() -> None:
-    with pytest.raises(ValueError, match="Invalid async_mode"):
+    with pytest.raises(ValueError, match="checkpoint.async_mode must be one of"):
         CheckpointConfig(async_mode="Threaded")
     # The field is normalized in place, so a mixed-case spelling still works.
     assert CheckpointConfig(async_mode="ASYNC").async_mode == "async"
@@ -348,7 +348,7 @@ def test_memory_budget_is_a_fraction() -> None:
     assert MemoryBudgetACConfig(memory_budget=0.0).memory_budget == 0.0
     assert MemoryBudgetACConfig(memory_budget=1.0).memory_budget == 1.0
     for bad in (-0.1, 1.5):
-        with pytest.raises(ValueError, match="memory_budget must be finite"):
+        with pytest.raises(ValueError, match="memory_budget must be between"):
             MemoryBudgetACConfig(memory_budget=bad)
 
 
@@ -357,7 +357,7 @@ def test_memory_budget_is_a_fraction() -> None:
 
 def test_a_non_positive_log_freq_is_rejected() -> None:
     """A zero-length window would divide by zero on the first log."""
-    with pytest.raises(ValueError, match="metrics.log_freq must be greater than 0"):
+    with pytest.raises(ValueError, match=r"metrics.log_freq must be >= 1"):
         MetricsConfig(log_freq=0)
     assert MetricsConfig(log_freq=1).log_freq == 1
 
@@ -366,7 +366,7 @@ def test_profiling_must_fit_one_cycle_into_the_interval() -> None:
     """A cycle is ``profiler_warmup + profiler_active``; a shorter interval
     would never reach the active iterations it exists to capture."""
     assert ProfilerConfig(enable_profiling=True, profile_freq=4).profile_freq == 4
-    with pytest.raises(ValueError, match="profiler.profile_freq must be greater"):
+    with pytest.raises(ValueError, match="profiler.profile_freq must be >="):
         ProfilerConfig(enable_profiling=True, profile_freq=3)
     # Off is off: the interval is not read, so a small value is not an error.
     assert ProfilerConfig(profile_freq=1).profile_freq == 1

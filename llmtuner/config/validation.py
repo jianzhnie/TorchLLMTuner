@@ -38,9 +38,7 @@ class ValidationConfig:
     corpus."""
 
     def __post_init__(self) -> None:
-        if self.freq <= 0:
-            raise ConfigError(f"validation.freq must be positive, got {self.freq}")
-        if not (self.steps > 0 or self.steps == -1):
-            raise ConfigError(
-                f"validation.steps must be positive or -1, got {self.steps}"
-            )
+        if self.freq < 1:
+            raise ConfigError(f"validation.freq must be >= 1, got {self.freq}")
+        if not (self.steps >= 1 or self.steps == -1):
+            raise ConfigError(f"validation.steps must be >= 1 or -1, got {self.steps}")

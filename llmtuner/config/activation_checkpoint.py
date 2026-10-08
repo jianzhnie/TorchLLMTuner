@@ -87,13 +87,6 @@ class SelectiveACConfig:
             "have no data-invariant structure; 'none' disables."
         },
     )
-    def __post_init__(self) -> None:
-        if self.determinism_check not in ("default", "none"):
-            raise ConfigError(
-                f"determinism_check must be 'default' or 'none', got "
-                f"{self.determinism_check!r}"
-            )
-
     debug: bool = field(
         default=False,
         metadata={
@@ -102,6 +95,12 @@ class SelectiveACConfig:
         },
     )
 
+    def __post_init__(self) -> None:
+        if self.determinism_check not in ("default", "none"):
+            raise ConfigError(
+                "selective_ac.determinism_check must be 'default' or 'none', "
+                f"got {self.determinism_check!r}"
+            )
 
 
 @dataclass(kw_only=True)
@@ -132,10 +131,9 @@ class MemoryBudgetACConfig:
     def __post_init__(self) -> None:
         if not 0 <= self.memory_budget <= 1:
             raise ConfigError(
-                "memory_budget must be finite and between 0 and 1, got "
+                "memory_budget_ac.memory_budget must be between 0 and 1, got "
                 f"{self.memory_budget}"
             )
-
 
 
 @dataclass(kw_only=True)
@@ -218,15 +216,16 @@ class RegionACConfig:
     def __post_init__(self) -> None:
         if self.determinism_check not in ("default", "none"):
             raise ConfigError(
-                f"determinism_check must be 'default' or 'none', got "
+                "region_ac.determinism_check must be 'default' or 'none', got "
                 f"{self.determinism_check!r}"
             )
         if self.preserve_rng_state:
             raise ConfigError(
-                "region activation checkpointing does not support "
-                "preserve_rng_state=True: torch_remat.checkpoint refuses it "
-                "because a generator drawn inside a skipped save region would "
-                "desync the recompute, and boundary-only stashing would hide "
-                "that rather than fix it. Register a RecomputeStateHook for the "
-                "random state your retained regions use, or leave it false."
+                "region_ac.preserve_rng_state must stay False: region "
+                "activation checkpointing does not support it -- "
+                "torch_remat.checkpoint refuses True because a generator drawn "
+                "inside a skipped save region would desync the recompute, and "
+                "boundary-only stashing would hide that rather than fix it. "
+                "Register a RecomputeStateHook for the random state your "
+                "retained regions use, or leave it false."
             )

@@ -63,14 +63,21 @@ class LRSchedulerConfig:
 
     def __post_init__(self) -> None:
         if self.warmup_steps < 0:
-            raise ConfigError(f"warmup_steps must be >= 0, got {self.warmup_steps}")
+            raise ConfigError(
+                f"lr_scheduler.warmup_steps must be >= 0, got {self.warmup_steps}"
+            )
         if self.total_steps is not None and self.total_steps < 1:
-            raise ConfigError(f"total_steps must be >= 1, got {self.total_steps}")
+            raise ConfigError(
+                f"lr_scheduler.total_steps must be >= 1, got {self.total_steps}"
+            )
         if not 0.0 <= self.decay_ratio <= 1.0:
-            raise ConfigError(f"decay_ratio must be in [0, 1], got {self.decay_ratio}")
+            raise ConfigError(
+                f"lr_scheduler.decay_ratio must be in [0, 1], got {self.decay_ratio}"
+            )
         if not 0.0 <= self.min_lr_factor < 1.0:
             raise ConfigError(
-                f"min_lr_factor must be in [0, 1), got {self.min_lr_factor}"
+                "lr_scheduler.min_lr_factor must be in [0, 1), got "
+                f"{self.min_lr_factor}"
             )
 
 
@@ -166,19 +173,23 @@ class OptimizerConfig:
         betas = tuple(self.betas)
         if len(betas) != 2:
             raise ConfigError(
-                f"betas must have exactly 2 entries (beta1, beta2), got "
-                f"{len(betas)}: {betas}. Pass both: --betas 0.9 0.95."
+                f"optimizer.betas must have exactly 2 entries (beta1, beta2), "
+                f"got {len(betas)}: {betas}. Pass both: --betas 0.9 0.95."
             )
         if not all(0.0 <= beta < 1.0 for beta in betas):
-            raise ConfigError(f"betas must each be in [0, 1), got {betas}")
+            raise ConfigError(f"optimizer.betas must each be in [0, 1), got {betas}")
         self.betas = betas
 
         if self.learning_rate < 0:
-            raise ConfigError(f"learning_rate must be >= 0, got {self.learning_rate}")
+            raise ConfigError(
+                f"optimizer.learning_rate must be >= 0, got {self.learning_rate}"
+            )
         if self.weight_decay < 0:
-            raise ConfigError(f"weight_decay must be >= 0, got {self.weight_decay}")
+            raise ConfigError(
+                f"optimizer.weight_decay must be >= 0, got {self.weight_decay}"
+            )
         if self.eps <= 0:
-            raise ConfigError(f"eps must be > 0, got {self.eps}")
+            raise ConfigError(f"optimizer.eps must be > 0, got {self.eps}")
 
         # The degenerate grouping: no explicit param_groups means one catch-all
         # group over every trainable parameter, built from the flat scalars.
@@ -250,21 +261,28 @@ class EMAConfig:
 
     def __post_init__(self) -> None:
         if self.update_every_n_steps < 1:
-            raise ConfigError("ema.update_every_n_steps must be greater than 0.")
+            raise ConfigError(
+                f"ema.update_every_n_steps must be >= 1, got "
+                f"{self.update_every_n_steps}"
+            )
         if not math.isfinite(self.half_life_fraction):
-            raise ConfigError("ema.half_life_fraction must be finite.")
+            raise ConfigError(
+                f"ema.half_life_fraction must be finite, got {self.half_life_fraction}"
+            )
         if self.half_life_fraction <= 0:
-            raise ConfigError("ema.half_life_fraction must be greater than 0.")
+            raise ConfigError(
+                f"ema.half_life_fraction must be > 0, got {self.half_life_fraction}"
+            )
         if self.step_bias < 0:
             raise ConfigError(
-                "ema.step_bias must not be negative; it is added to the firing "
-                "count, and a non-positive count has no decay."
+                f"ema.step_bias must be >= 0, got {self.step_bias}: it is added "
+                "to the firing count, and a non-positive count has no decay."
             )
         if self.decay is not None and not (
             math.isfinite(self.decay) and 0 <= self.decay < 1
         ):
             raise ConfigError(
-                "ema.decay must be finite and in [0, 1); "
+                f"ema.decay must be finite and in [0, 1), got {self.decay}: "
                 "decay=1 never updates the EMA."
             )
         # A fixed decay replaces the half-life schedule outright, so a
