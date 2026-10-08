@@ -117,6 +117,19 @@ class ProfilerConfig:
                 "profiler.profile_freq must be greater than or equal to "
                 "profiler_warmup + profiler_active."
             )
+        if self.profiler_active < 1:
+            raise ConfigError(
+                f"profiler.profiler_active must be >= 1, got {self.profiler_active}"
+            )
+        if self.profiler_warmup < 0:
+            raise ConfigError(
+                f"profiler.profiler_warmup must be >= 0, got {self.profiler_warmup}"
+            )
+        if self.memory_snapshot_max_entries < 1:
+            raise ConfigError(
+                "profiler.memory_snapshot_max_entries must be >= 1, got "
+                f"{self.memory_snapshot_max_entries}"
+            )
 
 
 # HfArgumentParser cannot turn a nested dataclass into a set of flags -- it
@@ -214,6 +227,13 @@ class SelectiveACConfig:
             "have no data-invariant structure; 'none' disables."
         },
     )
+    def __post_init__(self) -> None:
+        if self.determinism_check not in ("default", "none"):
+            raise ConfigError(
+                f"determinism_check must be 'default' or 'none', got "
+                f"{self.determinism_check!r}"
+            )
+
     debug: bool = field(
         default=False,
         metadata={
@@ -334,6 +354,11 @@ class RegionACConfig:
     )
 
     def __post_init__(self) -> None:
+        if self.determinism_check not in ("default", "none"):
+            raise ConfigError(
+                f"determinism_check must be 'default' or 'none', got "
+                f"{self.determinism_check!r}"
+            )
         if self.preserve_rng_state:
             raise ConfigError(
                 "region activation checkpointing does not support "
@@ -644,6 +669,7 @@ class TrainingConfig:
             "max_seq_len",
             "steps",
             "gradient_accumulation_steps",
+            "gc_freq",
         ):
             if getattr(self, name) < 1:
                 raise ConfigError(f"{name} must be >= 1, got {getattr(self, name)}")

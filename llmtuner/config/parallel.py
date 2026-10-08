@@ -342,6 +342,7 @@ class ParallelConfig:
             "pipeline_parallel_size",
             "context_parallel_size",
             "expert_parallel_size",
+            "num_pp_microbatches",
         ):
             if getattr(self, name) < 1:
                 raise ConfigError(f"{name} must be >= 1, got {getattr(self, name)}")

@@ -40,10 +40,12 @@ from llmtuner.config import (
     OptimizerConfig,
     ParallelConfig,
     ProfilerConfig,
+    RegionACConfig,
+    SelectiveACConfig,
     TrainingConfig,
 )
 from llmtuner.config.cli import PARSER_GROUPS, cli_groups
-from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.errors import ConfigError, UnsupportedCombinationError
 
 # -- ParallelConfig ----------------------------------------------------------
 
@@ -399,6 +401,123 @@ def test_cp_must_divide_seq_len() -> None:
         )
 
 
+def test_tp_must_divide_seq_len() -> None:
+    """TP splits the CP shard one level down; same ragged-split refusal."""
+    with pytest.raises(ValueError):
+        LLMTunerConfig(
+            parallel=ParallelConfig(tensor_parallel_size=3),
+            training=TrainingConfig(max_seq_len=64),
+        )
+
+
+def test_model_config_validates_architecture_numbers() -> None:
+    """Illegal architecture values must die in the config, not in for_model."""
+    for overrides in (
+        {"vocab_size": 0},
+        {"hidden_size": 0},
+        {"num_attention_heads": 0},
+        {"num_key_value_heads": 0},
+        {"num_hidden_layers": -1},
+        {"hidden_size": 65},  # 65 % 4 != 0
+        {"num_attention_heads": 4, "num_key_value_heads": 8},
+        {"compute_dtype": "float8"},
+        {"experts_implementation": "bogus"},
+    ):
+        with pytest.raises(ConfigError, match="model"):
+            ModelConfig(**overrides)
+    # The valid GQA corner: kv == q heads.
+    ModelConfig(num_attention_heads=4, num_key_value_heads=4)
+
+
+def test_optimizer_scalar_ranges() -> None:
+    with pytest.raises(ConfigError, match="learning_rate"):
+        OptimizerConfig(learning_rate=-1.0)
+    with pytest.raises(ConfigError, match="weight_decay"):
+        OptimizerConfig(weight_decay=-0.1)
+    with pytest.raises(ConfigError, match="eps"):
+        OptimizerConfig(eps=0.0)
+    OptimizerConfig(learning_rate=0.0)  # legal: a frozen run is a choice
+
+
+def test_num_pp_microbatches_and_gc_freq_have_floors() -> None:
+    with pytest.raises(ConfigError, match="num_pp_microbatches"):
+        ParallelConfig(num_pp_microbatches=0)
+    with pytest.raises(ConfigError, match="gc_freq"):
+        TrainingConfig(gc_freq=0)
+
+
+def test_profiler_and_dataloader_scalars_have_floors() -> None:
+    with pytest.raises(ConfigError, match="profiler_active"):
+        ProfilerConfig(profiler_active=0)
+    with pytest.raises(ConfigError, match="profiler_warmup"):
+        ProfilerConfig(profiler_warmup=-1)
+    ProfilerConfig(profiler_warmup=0)  # zero warmup is a legal choice
+    with pytest.raises(ConfigError, match="memory_snapshot_max_entries"):
+        ProfilerConfig(memory_snapshot_max_entries=0)
+    with pytest.raises(ConfigError, match="streaming_shuffle_buffer_size"):
+        DataloaderConfig(streaming_shuffle_buffer_size=0)
+    with pytest.raises(ConfigError, match="num_prefetch_batches"):
+        DataloaderConfig(num_prefetch_batches=0)
+
+
+def test_ac_determinism_check_is_an_enum() -> None:
+    for cls in (SelectiveACConfig, RegionACConfig):
+        with pytest.raises(ConfigError, match="determinism_check"):
+            cls(determinism_check="bogus")
+        cls(determinism_check="none")
+
+
+def test_from_groups_does_not_mutate_the_parsed_groups() -> None:
+    """Grafting goes through ``replace``: the caller's group instances keep
+    their own values (configs are read-only once built)."""
+    optimizer = OptimizerConfig()
+    training = TrainingConfig()
+    cfg = LLMTunerConfig.from_groups(
+        model=ModelConfig(),
+        parallel=ParallelConfig(),
+        optimizer=optimizer,
+        lr_scheduler=LRSchedulerConfig(warmup_steps=11),
+        training=training,
+        checkpoint=CheckpointConfig(enable=True),
+        dataloader=DataloaderConfig(),
+        metrics=MetricsConfig(),
+        profiler=ProfilerConfig(),
+    )
+    assert not training.checkpoint_config.enable  # the caller's copy is intact
+    assert cfg.training.checkpoint_config.enable  # the graft took
+    assert cfg.optimizer.lr_scheduler_config.warmup_steps == 11
+
+
+def test_every_training_scalar_reaches_the_flat_view_or_is_nested() -> None:
+    """A new TrainingConfig scalar without a flat-view property dies at the
+    first train step with AttributeError; pin the contract instead."""
+    import dataclasses
+
+    nested = {
+        "checkpoint_config",
+        "dataloader_config",
+        "metrics_config",
+        "profiler_config",
+        "ema_config",
+        "validation_config",
+        "compile_config",
+        "selective_ac",
+        "memory_budget_ac",
+        "region_ac",
+    }
+    props = {
+        name
+        for name, value in vars(LLMTunerConfig).items()
+        if isinstance(value, property)
+    }
+    missing = [
+        f.name
+        for f in dataclasses.fields(TrainingConfig)
+        if f.name not in nested and f.name not in props
+    ]
+    assert not missing, f"TrainingConfig fields missing a flat view: {missing}"
+
+
 # -- the CLI view -------------------------------------------------------------
 
 
@@ -418,7 +537,23 @@ def test_the_fields_the_cli_cannot_carry_are_not_offered_as_flags() -> None:
     parser = HfArgumentParser(list(cli_groups(PARSER_GROUPS)))
     help_text = parser.format_help()
 
-    for hidden in ("arch_overrides", "param_groups", "purge_exempt"):
+    for hidden in (
+        "arch_overrides",
+        "param_groups",
+        "purge_exempt",
+        # Nested dataclasses collapse to single-value flags that reject every
+        # value; they are grafted from their own parser groups instead.
+        "ema_config",
+        "validation_config",
+        "checkpoint_config",
+        "dataloader_config",
+        "metrics_config",
+        "profiler_config",
+        "compile_config",
+        "selective_ac",
+        "memory_budget_ac",
+        "region_ac",
+    ):
         assert not re.search(rf"^\s+--{hidden}\b", help_text, re.M), hidden
     for kept in ("tensor_parallel_size", "learning_rate", "steps"):
         assert re.search(rf"^\s+--{kept}\b", help_text, re.M), kept
