@@ -606,38 +606,41 @@ def test_metrics_rank_is_zero_for_a_v_block_schedule() -> None:
     assert get_metrics_rank(parallel_dims=dims, pp_schedule="ZBVZeroBubble") == 0
 
 
-def test_ensure_pp_loss_visible_warns_when_log_rank_misses_the_loss(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("LOG_RANK", "0")
+def test_ensure_pp_loss_visible_warns_when_log_rank_misses_the_loss() -> None:
     dims = _FakeParallelDims(pp=4, world_size=16)
 
     with _capturing() as capture:
-        ensure_pp_loss_visible(parallel_dims=dims, pp_schedule="1F1B", color=NoColor())
+        ensure_pp_loss_visible(
+            parallel_dims=dims,
+            pp_schedule="1F1B",
+            log_ranks=[0],
+            color=NoColor(),
+        )
 
     assert any("loss is not visible" in m for m in capture.messages())
 
 
-def test_ensure_pp_loss_visible_is_silent_when_the_rank_is_watched(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("LOG_RANK", "0,12")
+def test_ensure_pp_loss_visible_is_silent_when_the_rank_is_watched() -> None:
     dims = _FakeParallelDims(pp=4, world_size=16)
 
     with _capturing() as capture:
-        ensure_pp_loss_visible(parallel_dims=dims, pp_schedule="1F1B", color=NoColor())
+        ensure_pp_loss_visible(
+            parallel_dims=dims,
+            pp_schedule="1F1B",
+            log_ranks=[0, 12],
+            color=NoColor(),
+        )
 
     assert not any("loss is not visible" in m for m in capture.messages())
 
 
-def test_ensure_pp_loss_visible_says_nothing_without_pipeline_parallelism(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("LOG_RANK", "0")
-
+def test_ensure_pp_loss_visible_says_nothing_without_pipeline_parallelism() -> None:
     with _capturing() as capture:
         ensure_pp_loss_visible(
-            parallel_dims=_FakeParallelDims(), pp_schedule="1F1B", color=NoColor()
+            parallel_dims=_FakeParallelDims(),
+            pp_schedule="1F1B",
+            log_ranks=[0],
+            color=NoColor(),
         )
 
     assert capture.messages() == []
@@ -752,13 +755,12 @@ def test_the_processor_method_forwards_the_visibility_check(monkeypatch) -> None
     """``MetricsProcessor.ensure_pp_loss_visible`` must reach the function.
 
     The standalone function was tested and correct, and nothing called it: a PP
-    run whose ``LOG_RANK`` missed the loss rank trained fine and printed nothing,
+    run whose ``log_ranks`` missed the loss rank trained fine and printed nothing,
     which reads exactly like a hang. This pins the wiring -- and, just as
     importantly, that the call site does not have to build its own ``Color``:
     the processor forwards its own, so the warning cannot print in a different
     color scheme than the metrics beside it.
     """
-    monkeypatch.setenv("LOG_RANK", "0")
     processor = MetricsProcessor(
         Config(),
         parallel_dims=_FakeParallelDims(pp=4, world_size=16),
@@ -771,22 +773,17 @@ def test_the_processor_method_forwards_the_visibility_check(monkeypatch) -> None
     assert any("loss is not visible" in m for m in capture.messages())
 
 
-def test_the_processor_method_is_silent_when_there_is_nothing_to_say(
-    monkeypatch,
-) -> None:
+def test_the_processor_method_is_silent_when_there_is_nothing_to_say() -> None:
     """No parallel dims (single process) and a watched rank are both no-ops."""
-    monkeypatch.setenv("LOG_RANK", "0")
-
     with _capturing() as capture:
         MetricsProcessor(Config(), parallel_dims=None).ensure_pp_loss_visible()
     assert capture.messages() == []
 
     watched = MetricsProcessor(
-        Config(),
+        Config(log_ranks=[0, 12]),
         parallel_dims=_FakeParallelDims(pp=4, world_size=16),
         pp_schedule="1F1B",
     )
-    monkeypatch.setenv("LOG_RANK", "0,12")
     with _capturing() as capture:
         watched.ensure_pp_loss_visible()
     assert not any("loss is not visible" in m for m in capture.messages())

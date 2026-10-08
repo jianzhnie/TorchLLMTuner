@@ -324,13 +324,18 @@ def get_metrics_rank(*, parallel_dims: ParallelDims, pp_schedule: str) -> int:
 
 
 def ensure_pp_loss_visible(
-    *, parallel_dims: ParallelDims, pp_schedule: str, color: Color | NoColor
+    *,
+    parallel_dims: ParallelDims,
+    pp_schedule: str,
+    log_ranks,
+    color: Color | NoColor,
 ) -> None:
     """Warn when the loss will be computed on a rank nobody is watching.
 
-    Under pipeline parallelism the loss lives on one rank, and ``LOG_RANK``
-    decides which ranks print. Getting that wrong produces a run that trains
-    correctly and reports nothing -- which reads exactly like a hang.
+    Under pipeline parallelism the loss lives on one rank, and
+    ``MetricsConfig.log_ranks`` decides which ranks print. Getting that wrong
+    produces a run that trains correctly and reports nothing -- which reads
+    exactly like a hang.
     """
     if not parallel_dims.pp_enabled:
         return
@@ -340,11 +345,10 @@ def ensure_pp_loss_visible(
     loss_visible_rank = get_metrics_rank(
         parallel_dims=parallel_dims, pp_schedule=pp_schedule
     )
-    env_logged_ranks = [r for r in os.environ.get("LOG_RANK", "").split(",") if r]
-    if str(loss_visible_rank) not in env_logged_ranks:
+    if loss_visible_rank not in set(log_ranks):
         logger.warning(
             "%sPipeline Parallel loss is not visible. Please add %srank %d%s to "
-            "the LOG_RANK environment variable in the launcher.%s",
+            "metrics.log_ranks.%s",
             color.red,
             color.yellow,
             loss_visible_rank,
@@ -435,6 +439,7 @@ class MetricsProcessor:
         ensure_pp_loss_visible(
             parallel_dims=self.parallel_dims,
             pp_schedule=self._pp_schedule,
+            log_ranks=self.config.log_ranks,
             color=self.color,
         )
 

@@ -502,7 +502,12 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
   - 上游 `d83ea687a` `TITAN_LOG_LEVEL` 环境变量（#5089）：**不移植**。
     llmtuner 的既定约定是不引入项目级环境变量（HPMESH_DEVICE /
     HPMESH_DIST_BACKEND 同样不收）；日志级别保持在 `get_logger` 的显式
-    参数上（默认 INFO）。
+    参数上（默认 INFO）。同约定 2026-10-08 清掉最后两个项目级旋钮：
+    `LOG_RANK`（上游 logger 的 rank 白名单）迁移为 `MetricsConfig.log_ranks`
+    配置字段（经 `logger_utils.set_log_ranks` 接线 console 过滤）；
+    `HF_BACKEND_LOGIT_DUMP` 改为 wrapper 上的显式 `logit_dump_dir` 属性
+    （调试钩子，非配置面）。第三方/启动器变量（RANK/WORLD_SIZE/MASTER_*、
+    SLURM_*/OMPI_*、WANDB_*、NO_COLOR/TERM 等）是生态接口，不在此列。
   - 上游 `6a875910c` FFN 深度缩放初始化目标修正（#5111）：**不适用**。
     改的是上游原生模型的 from-scratch 初始化（depth-scale 只打 `w2`）；
     llmtuner 用 HF 自带 `_init_weights`，不持有该初始化面。
@@ -1076,7 +1081,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `accelerator/device.py` | 设备发现、backend 选择、pin-memory 判定、NPU 谓词（`is_npu_available`，`accelerator/dist.py` 在用）；无消费者的 mmengine 厂商谓词面已删 | C |
 | `components/checkpointer/filesystem.py` | path/storage helpers | A1，`tools/filesystem.py` |
 | `utils/gc.py` | `GarbageCollection` | B，`tools/utils.py` |
-| `utils/logger_utils.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤）、`env_log_level`（`LLMTUNER_LOG_LEVEL`，默认 INFO、非法名 loud-raise，显式实参优先）、`get_distributed_rank` | C |
+| `utils/logger_utils.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤，默认 INFO）、`set_log_ranks`（控制台打印 rank 集合，由 `MetricsConfig.log_ranks` 接线）、`get_distributed_rank` | C |
 | `utils/lazy_exports.py` | `export_names` / `resolve_export`：各包索引共用的 PEP 562 懒加载实现 | C |
 | `accelerator/monitoring.py` | device/memory/FLOPS helpers | C；部分意图可参考 `tools/utils.py` |
 | `accelerator/spmd_context.py` | SPMD mesh 上下文 | C，pip `spmd_types` 适配 |

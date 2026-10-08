@@ -820,9 +820,11 @@ class HFTransformerModel(nn.Module):
             # one code path -- the clone is one T*H copy per forward.
             logits = hidden_states.clone()
 
-        _dump_dir = os.environ.get("HF_BACKEND_LOGIT_DUMP")
-        if _dump_dir is not None:
-            self._maybe_dump_logits(_dump_dir, logits)
+        # Debug hook, off by default: set ``model.logit_dump_dir`` to a
+        # directory to dump this rank's logits on every forward (used by
+        # numerical comparison harnesses; not a config surface).
+        if getattr(self, "logit_dump_dir", None) is not None:
+            self._maybe_dump_logits(self.logit_dump_dir, logits)
 
         return logits
 

@@ -53,6 +53,7 @@ from ..models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 from ..parallel import matrix
 from ..parallel.parallel_dims import build_mesh, build_parallel_dims
 from ..parallel.pipeline_parallel import PipelineParallelSetup
+from ..utils import logger_utils
 from .seed import derive_distinct_seed
 
 
@@ -325,8 +326,9 @@ def build_trainer_state(self, cfg) -> None:
         num_flops_per_token=num_flops_per_token(cfg),
         tag=cfg.metrics.tag,
     )
-    # Under PP the loss exists on one rank and ``LOG_RANK`` decides which
-    # ranks print, so a mismatched pair trains correctly and reports
-    # nothing -- which reads exactly like a hang. Warn now, rather than
-    # leave the user to work it out at step 1.
+    # Under PP the loss exists on one rank and ``metrics.log_ranks`` decides
+    # which ranks print, so a mismatched pair trains correctly and reports
+    # nothing -- which reads exactly like a hang. Wire the console filter and
+    # warn now, rather than leave the user to work it out at step 1.
+    logger_utils.set_log_ranks(cfg.metrics.log_ranks)
     self.metrics.ensure_pp_loss_visible()
