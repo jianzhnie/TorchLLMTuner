@@ -143,8 +143,9 @@ from . import batch as batch_mod
 from . import builder, pp_steps
 from . import validate as validation_pass
 
-# Rank-aware: the helper installs a handler on rank 0 only, so a torchrun run
-# logs one line per step instead of one per rank.
+# Rank-aware: the helper attaches a handler whose filter passes below-ERROR
+# lines only on the log ranks (rank 0 by default), so a torchrun run logs one
+# line per step instead of one per rank.
 logger = get_logger(__name__)
 
 __all__ = ["Trainer"]
@@ -914,7 +915,7 @@ class Trainer:
             "would be garbage.",
         )
 
-    # -- validation (bodies live in validation.py) ------------------------------
+    # -- validation (bodies live in validate.py) --------------------------------
 
     @staticmethod
     def check_validation_feasibility(
@@ -938,24 +939,24 @@ class Trainer:
     def should_validate(self, step: int) -> bool:
         """Whether a validation pass runs at the end of ``step``.
 
-        The body lives in ``validation.py``; see there for the gating rule.
+        The body lives in ``validate.py``; see there for the gating rule.
         """
         return validation_pass.should_validate(self, step)
 
     def validate(self, step: int) -> None:
         """Run one eval-mode, gradient-free pass and log its loss.
 
-        The body lives in ``validation.py`` (gradient-free via its own
+        The body lives in ``validate.py`` (gradient-free via its own
         ``torch.no_grad``); see there for the reporting contract.
         """
         validation_pass.validate(self, step)
 
     def validate_body(self, validation: ValidationConfig, step: int) -> None:
-        """The pass itself; the body lives in ``validation.py``."""
+        """The pass itself; the body lives in ``validate.py``."""
         validation_pass.validate_body(self, validation, step)
 
 
-    # -- the loop ---------------------------------------------------------------
+    # -- step cadence ------------------------------------------------------------
 
     def should_log(self) -> bool:
         # Delegated rather than reimplemented: the metrics processor also

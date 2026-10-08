@@ -1,3 +1,10 @@
+"""The packing entry points and the row-length policy they share.
+
+``build_concat_then_split_packing`` and ``build_first_fit_packing`` turn a
+dataset recipe into a Grain graph that emits fixed-length rows; both fill every
+token feature to ``context.num_tokens_per_batch``, and ``row_lengths`` is the
+one place that length is spelled out.
+"""
 
 from __future__ import annotations
 

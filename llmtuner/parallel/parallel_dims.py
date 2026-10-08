@@ -1,3 +1,14 @@
+"""``ParallelDims``: the resolved parallel degrees and every DeviceMesh built
+from them.
+
+Config says how many ways to split (``config/parallel.py``); this module turns
+that into the actual process topology: the dense mesh (dp_shard x dp_replicate
+x cp x tp, x pp) and, under EP, the sparse mesh (pp x dp_replicate x efsdp x
+ep). It also owns the module-level ``build_parallel_dims`` / ``build_mesh``
+entry points and the loss/dataloading sub-mesh derivations the trainer
+reduces over.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

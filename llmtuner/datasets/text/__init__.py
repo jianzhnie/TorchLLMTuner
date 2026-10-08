@@ -1,6 +1,6 @@
 """Text dataset recipes.
 
-Deliberately empty of imports. ``text.py`` loads the recipe modules themselves,
+Deliberately empty of imports. ``processors.py`` defines the recipes themselves,
 and re-exporting it here would make ``import llmtuner.datasets.text`` alone pull
 in ``datasets``/``tokenizers``/``jinja2`` -- the assets the parent package keeps
 off its own surface. Callers import the concrete module

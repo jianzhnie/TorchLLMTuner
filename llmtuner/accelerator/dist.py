@@ -1,3 +1,10 @@
+"""Vendored collective-communication toolbox (origin: OpenMMLab mmengine).
+
+De-mmengined: device predicates and the backend table come from
+``accelerator/device.py``. Only a subset is exercised by llmtuner itself; the
+rest is kept as the vendored compatibility surface.
+"""
+
 # Copyright (c) OpenMMLab. All rights reserved.
 import os
 import os.path as osp

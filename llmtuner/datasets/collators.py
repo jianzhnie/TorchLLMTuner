@@ -2,9 +2,9 @@
 
 Vendored from torchtitan ``components/data/collators.py``. A collator is
 constructed directly with the build context and reads what it needs from there.
-The padding rules are unchanged: padded
-positions are `arange % max_context_length`, not zeros, so a padded row looks
-like a fresh document rather than a continuation of the previous one.
+The padding rules are unchanged: padded positions are
+``arange % max_context_length``, not zeros, so a padded row looks like a fresh
+document rather than a continuation of the previous one.
 """
 
 from __future__ import annotations

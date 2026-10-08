@@ -101,7 +101,8 @@ def apply_cp(
             )
         # TP shards heads first, so what ulysses must divide evenly is each
         # rank's local head count -- equivalently, the global count must divide
-        # tp * cp (upstream's head_shard_degree in config/validation.py).
+        # tp * cp (upstream torchtitan's head_shard_degree in its
+        # config/validation.py).
         require_heads_divisible_by(
             model,
             size=cfg.tp * cp_mesh.size(),

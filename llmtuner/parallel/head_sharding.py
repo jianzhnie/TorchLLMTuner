@@ -2,7 +2,8 @@
 
 torchtitan checks ``num_attention_heads % (tensor_parallel_degree *
 context_parallel_degree) == 0`` once, when it parses the run config
-(``config/validation.py``, ``validate_context_parallel``), because it builds the
+(upstream torchtitan ``config/validation.py``'s
+ ``validate_context_parallel``), because it builds the
 model from its own config and so has the head counts before the model exists.
 llmtuner builds the model from the checkpoint first and reads the counts off its
 HF config, so the same invariant is checked at the wire-up seam instead:
