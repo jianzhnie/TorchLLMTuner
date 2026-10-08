@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from llmtuner.config.validate import require_at_least
 from llmtuner.errors import ConfigError
 
 
@@ -76,27 +77,25 @@ class ModelConfig:
         # Architecture numbers must be sane before any model build: an invalid
         # value here used to surface deep inside HF's for_model or the
         # wrapper's forward, long after the config was accepted.
-        for name in (
+        require_at_least(
+            self,
             "vocab_size",
             "hidden_size",
             "intermediate_size",
             "num_hidden_layers",
             "num_attention_heads",
             "num_key_value_heads",
-        ):
-            if getattr(self, name) < 1:
-                raise ConfigError(
-                    f"model.{name} must be >= 1, got {getattr(self, name)}"
-                )
+            group="model",
+        )
         if self.hidden_size % self.num_attention_heads != 0:
             raise ConfigError(
-                f"model.hidden_size ({self.hidden_size}) must be divisible by "
-                f"num_attention_heads ({self.num_attention_heads})"
+                "model.hidden_size must be divisible by num_attention_heads, "
+                f"got {self.hidden_size} and {self.num_attention_heads}"
             )
         if self.num_key_value_heads > self.num_attention_heads:
             raise ConfigError(
-                f"model.num_key_value_heads ({self.num_key_value_heads}) cannot "
-                f"exceed num_attention_heads ({self.num_attention_heads})"
+                "model.num_key_value_heads must be <= num_attention_heads "
+                f"({self.num_attention_heads}), got {self.num_key_value_heads}"
             )
         if self.compute_dtype is not None and self.compute_dtype not in (
             "float32",

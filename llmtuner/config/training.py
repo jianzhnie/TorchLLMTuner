@@ -17,6 +17,7 @@ from llmtuner.config.compile import CompileConfig
 from llmtuner.config.data import DataloaderConfig
 from llmtuner.config.observability import MetricsConfig, ProfilerConfig
 from llmtuner.config.optimizer import EMAConfig
+from llmtuner.config.validate import require_at_least
 from llmtuner.config.validation import ValidationConfig
 from llmtuner.errors import ConfigError
 
@@ -144,8 +145,8 @@ class TrainingConfig:
             "TensorBoard and profiling folders are resolved against it."
         },
     )
-# A plain `checkpoint` field would be nicer to read, but a dataclass field and
-# the class it types cannot share a name.
+    # A plain `checkpoint` field would be nicer to read, but a dataclass field
+    # and the class it types cannot share a name.
     checkpoint_config: CheckpointConfig = field(
         default_factory=CheckpointConfig,
         metadata={"help": "Checkpointing (see components/checkpointer)."},
@@ -225,33 +226,30 @@ class TrainingConfig:
         return self.validation_config
 
     def __post_init__(self) -> None:
-        # One loop, not four copies: these fields share the check and the
-        # wording, and the same shape guards parallel_dims.py's degrees. The
-        # text is the contract -- test_config.py pins ``f"{field} must be >= 1"``
-        # for each of these names.
-        for name in (
+        # One check, not five copies: these fields share the floor and the
+        # wording, and the same shape guards ParallelConfig's degrees. The
+        # text is the contract -- test_config.py pins
+        # ``f"{field} must be >= 1"`` for each of these names.
+        require_at_least(
+            self,
             "global_batch_size",
             "max_seq_len",
             "steps",
             "gradient_accumulation_steps",
             "gc_freq",
-        ):
-            if getattr(self, name) < 1:
-                raise ConfigError(f"{name} must be >= 1, got {getattr(self, name)}")
+            group="training",
+        )
         if self.chunked_loss_num_chunks < 1:
             raise ConfigError(
-                "chunked_loss_num_chunks must be >= 1 (1 disables chunking), "
-                f"got {self.chunked_loss_num_chunks}"
+                "training.chunked_loss_num_chunks must be >= 1, got "
+                f"{self.chunked_loss_num_chunks} (1 disables chunking)"
             )
         if self.activation_checkpoint_mode not in VALID_AC_MODES:
             raise ConfigError(
                 "training.activation_checkpoint_mode must be one of: "
                 f"{VALID_AC_MODES} (got {self.activation_checkpoint_mode!r})"
             )
-        if (
-            self.activation_checkpoint_mode == "memory_budget"
-            and not self.compile
-        ):
+        if self.activation_checkpoint_mode == "memory_budget" and not self.compile:
             raise ConfigError(
                 "training.activation_checkpoint_mode='memory_budget' requires "
                 "training.compile=True: the budget is consumed by the compile "

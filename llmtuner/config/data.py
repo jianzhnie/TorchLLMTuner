@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from llmtuner.config.validate import require_at_least
 from llmtuner.errors import ConfigError
 
 
@@ -134,42 +135,48 @@ class DataloaderConfig:
     def __post_init__(self) -> None:
         if self.dataset != "random" and not self.tokenizer_path:
             raise ConfigError(
-                f"tokenizer_path is required for dataset '{self.dataset}'. "
-                "Only 'random' runs without a tokenizer."
+                f"dataloader.tokenizer_path is required for dataset "
+                f"{self.dataset!r}; only 'random' runs without a tokenizer."
             )
         if self.dataset in {"local_jsonl", "local_jsonl_sft"} and not self.dataset_path:
-            raise ConfigError(f"dataset_path is required for dataset {self.dataset!r}")
+            raise ConfigError(
+                f"dataloader.dataset_path is required for dataset {self.dataset!r}"
+            )
         if self.dataset == "local_jsonl_sft" and (
             not self.prompt_field.strip() or not self.response_field.strip()
         ):
-            raise ConfigError("local_jsonl_sft field names cannot be empty")
+            raise ConfigError(
+                "dataloader.prompt_field/response_field cannot be empty for "
+                "dataset='local_jsonl_sft'"
+            )
         if self.chat_renderer is not None:
             if self.dataset != "local_jsonl_sft":
                 raise ConfigError(
-                    f"chat_renderer requires dataset='local_jsonl_sft', got "
-                    f"{self.dataset!r}"
+                    f"dataloader.chat_renderer requires "
+                    f"dataset='local_jsonl_sft', got {self.dataset!r}"
                 )
             if not self.messages_field.strip():
                 raise ConfigError(
-                    "messages_field cannot be empty when chat_renderer is set"
+                    "dataloader.messages_field cannot be empty when "
+                    "chat_renderer is set"
                 )
         # Membership in ``datasets.text.processors.DATASETS`` /
         # ``datasets.multimodal.datasets.MM_DATASETS`` is checked by
         # ``datasets/build.py`` at build time, not here: reading the registries
         # would import the datasets package into the config layer.
-        if self.max_num_documents is not None and self.max_num_documents <= 0:
-            raise ConfigError("max_num_documents must be positive")
-        if self.streaming_shuffle_buffer_size < 1:
+        if self.max_num_documents is not None and self.max_num_documents < 1:
             raise ConfigError(
-                "streaming_shuffle_buffer_size must be >= 1, got "
-                f"{self.streaming_shuffle_buffer_size}"
+                f"dataloader.max_num_documents must be >= 1, got "
+                f"{self.max_num_documents}"
             )
-        if self.num_prefetch_batches < 1:
-            raise ConfigError(
-                f"num_prefetch_batches must be >= 1, got {self.num_prefetch_batches}"
-            )
-        # Validated here even though only 'first_fit' reads it: the field is
-        # always parsed, so a bad value would otherwise be accepted silently
-        # under the default recipe and only fail after switching to first_fit.
-        if self.num_packing_bins <= 0:
-            raise ConfigError("num_packing_bins must be positive")
+        require_at_least(
+            self,
+            "streaming_shuffle_buffer_size",
+            "num_prefetch_batches",
+            "num_packing_bins",
+            group="dataloader",
+        )
+        # num_packing_bins is validated here even though only 'first_fit' reads
+        # it: the field is always parsed, so a bad value would otherwise be
+        # accepted silently under the default recipe and only fail after
+        # switching to first_fit.

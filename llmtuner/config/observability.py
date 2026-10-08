@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from llmtuner.config.validate import require_at_least
 from llmtuner.errors import ConfigError
 
 
@@ -51,10 +52,12 @@ class MetricsConfig:
     line is not prefixed: it is read live, never merged."""
 
     def __post_init__(self) -> None:
-        if self.log_freq <= 0:
-            raise ConfigError("metrics.log_freq must be greater than 0.")
+        if self.log_freq < 1:
+            raise ConfigError(f"metrics.log_freq must be >= 1, got {self.log_freq}")
         if any(r < 0 for r in self.log_ranks):
-            raise ConfigError(f"log_ranks must be non-negative, got {self.log_ranks}")
+            raise ConfigError(
+                f"metrics.log_ranks entries must be >= 0, got {self.log_ranks}"
+            )
 
 
 @dataclass(kw_only=True)
@@ -112,26 +115,16 @@ class ProfilerConfig:
     """
 
     def __post_init__(self) -> None:
-        if self.enable_profiling and self.profile_freq < (
-            self.profiler_warmup + self.profiler_active
-        ):
+        cycle = self.profiler_warmup + self.profiler_active
+        if self.enable_profiling and self.profile_freq < cycle:
             raise ConfigError(
-                "profiler.profile_freq must be greater than or equal to "
-                "profiler_warmup + profiler_active."
+                "profiler.profile_freq must be >= profiler_warmup + "
+                f"profiler_active ({cycle}), got {self.profile_freq}"
             )
-        if self.profiler_active < 1:
-            raise ConfigError(
-                f"profiler.profiler_active must be >= 1, got {self.profiler_active}"
-            )
-        if self.profiler_warmup < 0:
-            raise ConfigError(
-                f"profiler.profiler_warmup must be >= 0, got {self.profiler_warmup}"
-            )
-        if self.memory_snapshot_max_entries < 1:
-            raise ConfigError(
-                "profiler.memory_snapshot_max_entries must be >= 1, got "
-                f"{self.memory_snapshot_max_entries}"
-            )
+        require_at_least(
+            self, "profiler_active", "memory_snapshot_max_entries", group="profiler"
+        )
+        require_at_least(self, "profiler_warmup", group="profiler", minimum=0)
 
 
 # HfArgumentParser cannot turn a nested dataclass into a set of flags -- it

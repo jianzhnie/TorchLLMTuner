@@ -7,6 +7,7 @@ from typing import Literal
 
 import torch
 
+from llmtuner.config.validate import require_at_least
 from llmtuner.errors import (
     ConfigError,
     EnvironmentUnsupportedError,
@@ -277,6 +278,20 @@ class ParallelConfig:
     other backends.
     """
 
+    train_timeout_seconds: int = 100
+    """Timeout, in seconds, applied to every process group once training starts.
+
+    The process groups are created with a deliberately long timeout, because
+    startup -- model build, the first collective, compile -- is what actually
+    takes minutes on a large run. Left at that value, a later hang is
+    indistinguishable from a slow start: the job waits out the startup timeout,
+    which can be half an hour. The trainer therefore lowers every group's
+    timeout to this after the first completed train step, at which point the
+    startup work is known to be behind it.
+
+    Default matches torchtitan's ``comm.train_timeout_seconds``.
+    """
+
     def non_dp_sizes(self) -> int:
         """Product of fixed world-mesh degrees: dp_replicate*tp*pp*cp.
 
@@ -316,39 +331,26 @@ class ParallelConfig:
             )
         return dp_shard
 
-    train_timeout_seconds: int = 100
-    """Timeout, in seconds, applied to every process group once training starts.
-
-    The process groups are created with a deliberately long timeout, because
-    startup -- model build, the first collective, compile -- is what actually
-    takes minutes on a large run. Left at that value, a later hang is
-    indistinguishable from a slow start: the job waits out the startup timeout,
-    which can be half an hour. The trainer therefore lowers every group's
-    timeout to this after the first completed train step, at which point the
-    startup work is known to be behind it.
-
-    Default matches torchtitan's ``comm.train_timeout_seconds``.
-    """
-
     def __post_init__(self):
-        if self.train_timeout_seconds <= 0:
+        if self.train_timeout_seconds < 1:
             raise ConfigError(
-                "train_timeout_seconds must be greater than 0, got "
+                "parallel.train_timeout_seconds must be >= 1, got "
                 f"{self.train_timeout_seconds}"
             )
-        for name in (
+        require_at_least(
+            self,
             "data_parallel_replicate_size",
             "tensor_parallel_size",
             "pipeline_parallel_size",
             "context_parallel_size",
             "expert_parallel_size",
             "num_pp_microbatches",
-        ):
-            if getattr(self, name) < 1:
-                raise ConfigError(f"{name} must be >= 1, got {getattr(self, name)}")
+            "ep_torchao_pad_multiple",
+            group="parallel",
+        )
         if not self.enable_sequence_parallel:
             raise UnsupportedCombinationError(
-                "parallelism.enable_sequence_parallel=false is not supported: "
+                "parallel.enable_sequence_parallel=False is not supported: "
                 "llmtuner's tensor parallelism is sequence-parallel by "
                 "construction (the fused TP GEMMs gather/scatter the sequence "
                 "and the batch is sharded T/tp). There is no "
@@ -358,18 +360,19 @@ class ParallelConfig:
             )
         if self.data_parallel_shard_size < 1 and self.data_parallel_shard_size != -1:
             raise ConfigError(
-                "data_parallel_shard_size must be >= 1 or -1 (derive), got "
-                f"{self.data_parallel_shard_size}"
+                "parallel.data_parallel_shard_size must be >= 1 or -1 "
+                f"(derive), got {self.data_parallel_shard_size}"
             )
         allowed_dispatchers = ("alltoall", "torchao", "deepep", "hybridep")
         if self.ep_token_dispatcher not in allowed_dispatchers:
             raise ConfigError(
-                "parallelism.ep_token_dispatcher must be one of: "
-                f"{allowed_dispatchers} (got {self.ep_token_dispatcher!r})"
+                "parallel.ep_token_dispatcher must be one of "
+                f"{'/'.join(allowed_dispatchers)}, got "
+                f"{self.ep_token_dispatcher!r}"
             )
         if self.ep_token_dispatcher in ("deepep", "hybridep"):
             raise EnvironmentUnsupportedError(
-                f"ep_token_dispatcher={self.ep_token_dispatcher!r} is a "
+                f"parallel.ep_token_dispatcher={self.ep_token_dispatcher!r} is a "
                 "registered gap, not a supported backend: it is CUDA-only and "
                 "requires the deep_ep/hybridep kernels plus torchtitan's "
                 "distributed/deepep/ wrappers, which llmtuner does not vendor "
@@ -380,31 +383,26 @@ class ParallelConfig:
             )
         if self.ep_token_dispatcher != "alltoall" and self.expert_parallel_size == 1:
             raise UnsupportedCombinationError(
-                f"ep_token_dispatcher={self.ep_token_dispatcher!r} has no "
+                f"parallel.ep_token_dispatcher={self.ep_token_dispatcher!r} has no "
                 "effect at expert_parallel_size=1: the EP swap is the only "
                 "place a token dispatcher is installed and it does not run at "
                 "ep=1. Set expert_parallel_size > 1, or keep 'alltoall'."
             )
-        if self.ep_torchao_pad_multiple < 1:
-            raise ConfigError(
-                "ep_torchao_pad_multiple must be >= 1, got "
-                f"{self.ep_torchao_pad_multiple}"
-            )
         if self.context_parallel_load_balancer == "":
             raise ConfigError(
-                "context_parallel_load_balancer cannot be an empty string. "
-                "Use None to disable load balancing."
+                "parallel.context_parallel_load_balancer cannot be an empty "
+                "string; use None to disable load balancing."
             )
         allowed = frozenset({None, "headtail", "ptrr"})
         if self.context_parallel_load_balancer not in allowed:
             raise ConfigError(
-                "parallelism.context_parallel_load_balancer must be one of: "
-                f"None, 'headtail', 'ptrr' "
-                f"(got {self.context_parallel_load_balancer!r})"
+                "parallel.context_parallel_load_balancer must be one of "
+                f"None/'headtail'/'ptrr', got "
+                f"{self.context_parallel_load_balancer!r}"
             )
         if self.context_parallel_load_balancer == "ptrr":
             raise UnsupportedCombinationError(
-                "parallelism.context_parallel_load_balancer='ptrr' is not "
+                "parallel.context_parallel_load_balancer='ptrr' is not "
                 "implemented in llmtuner: it derives its schedule from a "
                 "BlockMask, which llmtuner's CP kernel does not consume. Use "
                 "'headtail' or None."
@@ -412,16 +410,16 @@ class ParallelConfig:
         allowed_strategies = frozenset({"kv_allgather", "ulysses"})
         if self.context_parallel_strategy not in allowed_strategies:
             raise ConfigError(
-                "parallelism.context_parallel_strategy must be one of: "
-                f"'kv_allgather', 'ulysses' "
-                f"(got {self.context_parallel_strategy!r})"
+                "parallel.context_parallel_strategy must be one of "
+                f"'kv_allgather'/'ulysses', got "
+                f"{self.context_parallel_strategy!r}"
             )
         if (
             self.context_parallel_strategy == "ulysses"
             and self.context_parallel_load_balancer is not None
         ):
             raise UnsupportedCombinationError(
-                "parallelism.context_parallel_strategy='ulysses' requires "
+                "parallel.context_parallel_strategy='ulysses' requires "
                 "context_parallel_load_balancer=None: every rank attends the "
                 "full sequence in whatever order the all-to-all delivers, and "
                 "a load balancer's rearrangement would make that a permuted "
@@ -438,23 +436,23 @@ class ParallelConfig:
             )
         ):
             raise ConfigError(
-                "For NVIDIA GPUs, parallelism.enable_fsdp_symm_mem is only supported "
-                "for compute capability 9.0 or newer."
+                "parallel.enable_fsdp_symm_mem is only supported on NVIDIA "
+                "GPUs with compute capability 9.0 or newer."
             )
         if self.fsdp_symm_mem_scope not in ("all", "dense"):
             raise ConfigError(
-                "parallelism.fsdp_symm_mem_scope must be one of: 'all', 'dense' "
-                f"(got {self.fsdp_symm_mem_scope!r})"
+                "parallel.fsdp_symm_mem_scope must be one of 'all'/'dense', "
+                f"got {self.fsdp_symm_mem_scope!r}"
             )
 
-        # Import lazily so loading configs.py does not pull in pipelining.
+        # Import lazily so loading this module does not pull in pipelining.
         from torch.distributed.pipelining.schedules import get_schedule_class
 
         try:
             get_schedule_class(self.pipeline_parallel_schedule)
         except ValueError as e:
             raise ConfigError(
-                "Invalid parallelism.pipeline_parallel_schedule "
+                "Invalid parallel.pipeline_parallel_schedule "
                 f"{self.pipeline_parallel_schedule!r}: {e}"
             ) from e
 
