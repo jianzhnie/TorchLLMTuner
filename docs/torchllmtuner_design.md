@@ -181,10 +181,12 @@ import trainer 或读取全局 run config；跨 models/parallel 的依赖必须�
 llmtuner/
   __init__.py / __main__.py / errors.py
                                 包面 + CLI 入口（python -m llmtuner）+ 三类异常
-  config/       9 模块          model/parallel/optimizer/checkpoint/data/
-                                training/root.py + cli.py（CLI 视图，把
-                                CLI 载不动的字段挡在 --help 之外）
-                                + __init__(全量再导出)
+  config/       12 模块         model/parallel/optimizer/checkpoint/data/
+                                training/root.py（聚合根 + from_groups 嫁接）
+                                observability/activation_checkpoint/compile/
+                                validation（按域拆分的嵌套配置）
+                                + cli.py（CLI 视图，把 CLI 载不动的字段挡在
+                                --help 之外）+ __init__(全量再导出)
   trainer/      8 模块          trainer.py / train.py / builder.py（装配段，
                                 顺序契约见模块 docstring）/ validate.py /
                                 pp_steps.py / batch.py / seed.py
@@ -269,8 +271,8 @@ device.py 本身就是设备注册表）；DTensor/flex_attention/spmd_types 是
 分工：**config 期能判的组合校验住在各 config 的
 `__post_init__`**（`config/parallel.py` 的 deepep/hybridep、
 dispatcher@ep=1、ptrr、ulysses×load balancer、sequence_parallel；
-`config/training.py` 的 region AC（`preserve_rng_state=True` 即拒）、
-memory_budget×compile；`config/root.py` 的
+`config/activation_checkpoint.py` 的 region AC（`preserve_rng_state=True`
+即拒）、memory_budget×compile；`config/root.py` 的
 cp 整除 seq_len、async_tp×{compile,tp}），与其余字段校验同处、同序触发——
 这些判定只需要配置本身，不应绕道 parallel 层。
 
