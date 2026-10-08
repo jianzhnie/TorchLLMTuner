@@ -574,6 +574,65 @@ def test_document_aware_packing_keeps_each_row_to_one_document(tokenizer, corpus
     assert flat_packed == flat_source
 
 
+class _SequenceIterDataset(grain.IterDataset):
+    """Feed pre-built TextSequences into a packing node, no tokenizer needed."""
+
+    def __init__(self, sequences: list[TextSequence]) -> None:
+        super().__init__()
+        self._sequences = sequences
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return grain.MapDataset.source(self._sequences).to_iter_dataset().__iter__()
+
+
+@pytest.mark.parametrize(
+    "max_num_documents, expected_masks",
+    [
+        # Both documents plus the inner padding fit in one row; the inner
+        # padding must stay marked instead of being relabelled as real.
+        (4, [[False] * 5 + [True]]),
+        # The cap ends the first row after two documents, so the inner padding
+        # segment is carried into a second row through the remainder slice.
+        (2, [[False] * 5 + [True], [True] * 6]),
+    ],
+)
+def test_document_capped_nested_packing_keeps_inner_padding(
+    max_num_documents, expected_masks
+):
+    """Nested packing: inner padding survives the document-capped outer packer.
+
+    First-fit padding inside a sequence is marked in its ``padding_mask``; the
+    document-aware concat-then-split iterator copies ids/labels/positions per
+    slice, so the mask must be sliced along with them. Rebuilding it as all
+    ``False`` would feed padding tokens to ``routing_token_counts`` and to the
+    varlen metadata as if they were real documents.
+    """
+    from llmtuner.datasets.packing.iterators import (
+        DocumentAwareConcatThenSplitIterDataset,
+    )
+
+    # A first-fit row: documents [1, 2] and [3, 4, 5], then one padding token.
+    inner_row = TextSequence(
+        input_ids=np.asarray([1, 2, 3, 4, 5, 0]),
+        labels=np.asarray([2, 3, 4, 5, 0, IGNORE_INDEX]),
+        positions=np.asarray([0, 1, 0, 1, 2, 0]),
+        padding_mask=np.asarray([False] * 5 + [True]),
+    )
+    graph = DocumentAwareConcatThenSplitIterDataset(
+        _SequenceIterDataset([inner_row]),
+        max_num_documents_per_row=max_num_documents,
+        max_context_length=9,
+        num_tokens_per_row=6,
+    )
+
+    rows = list(iter(graph))
+
+    assert [row.padding_mask.tolist() for row in rows] == expected_masks
+    # Positions restart per segment; padding positions wrap within the window.
+    assert rows[0].positions.tolist() == [0, 1, 0, 1, 2, 0]
+    assert rows[0].input_ids.tolist() == [1, 2, 3, 4, 5, 0]
+
+
 # --------------------------------------------------------------------------
 # Mix
 # --------------------------------------------------------------------------

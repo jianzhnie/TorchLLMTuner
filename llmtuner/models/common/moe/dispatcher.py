@@ -15,7 +15,12 @@ Vendored from torchtitan ``models/common/token_dispatcher.py``. The ``Local`` an
   CUDA-only ``deep_ep``/``hybridep`` packages; the dispatch/combine surface
   cannot be expressed faithfully without vendoring those wrappers, so selecting
   either backend is refused at config time (``ParallelConfig``) with the unlock
-  conditions spelled out.
+  conditions spelled out. Any future vendoring must also carry the wrappers'
+  checkpoint-effect registration: DeepEP assigns receive slots with atomics, so
+  an activation-checkpoint recompute that replays dispatch can reorder tokens
+  while backward routes gradients by the forward's handle -- upstream saves
+  dispatch/combine instead, and without that, FullAC/RegionAC + DeepEP computes
+  wrong gradients.
 
 None of that is a functional gap: none of the backends changes the routing
 contract, only how the tokens cross ranks. The dispatch/combine/metadata

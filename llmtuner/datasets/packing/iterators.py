@@ -109,11 +109,14 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             input_parts.append(np.asarray(sequence.input_ids[token_slice]))
             label_parts.append(np.asarray(sequence.labels[token_slice]))
             position_parts.append(np.arange(num_segment_tokens, dtype=np.int64))
+            # Padding from an upstream packer (e.g. first-fit inside
+            # concat-then-split) must stay marked as padding; only a source
+            # without a mask is treated as all real tokens.
             source_mask = getattr(sequence, "padding_mask", None)
             mask_parts.append(
                 np.zeros(num_segment_tokens, dtype=np.bool_)
                 if source_mask is None
-                else np.asarray(source_mask[token_slice])
+                else np.asarray(source_mask[token_slice], dtype=np.bool_)
             )
             num_tokens += num_segment_tokens
             self._remainder_offset += num_segment_tokens

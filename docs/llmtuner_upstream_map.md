@@ -429,6 +429,30 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
   - 上游 #4836 把 FullAC/SelectiveAC 的 `early_stop` 从 `False` 翻为 `True`
     （性能：recompute 产出全部所需张量后即停；上游 8×H100 实测数值不变）：
     **已同步**，`parallel/activation_checkpoint.py` 两处均为 `early_stop=True`。
+  - 上游 `0167526a9` DeepEP 在 FullAC 下梯度错误修复（#5123）：**llmtuner 不受影响，
+    无代码动作**。上游的病根是 DeepEP 用 atomics 分配接收槽，FullAC 在 backward
+    重放 dispatch 会得到不同的 token 序，而梯度仍按 forward 的 handle 路由；修法是
+    给 `deepep::dispatch`/`combine` 注册 ORDERED effect 让 checkpoint 恒 SAVE。
+    该 effect 注册落在上游 `distributed/deepep/` wrappers 里，llmtuner 刻意不
+    vendor 这部分（`deepep`/`hybridep` 在 `config/parallel.py` 与
+    `expert_parallel/swap.py` 配置期即拒绝，D 表登记），没有可挂 effect 的 op。
+    llmtuner 唯一的通信 dispatcher（AllToAll）用的是 `all_to_all_single` + 固定
+    split，接收序确定，FullAC 重放数值安全——与上游对 HybridEP（接收序确定）不动
+    的判断同构。selective AC 的 save set 已含 deepep/hybridep op（resolve-or-skip，
+    `activation_checkpoint.py` 的 `comm_ops`）。新增
+    `test_full_ac_matches_uncheckpointed_bitwise_on_moe` 钉住"FullAC 重放 MoE
+    dispatch/combine 与无 AC 逐位一致"这一性质（本机被门禁 skip，待 torch≥2.12
+    复跑）。**后续若 vendor DeepEP wrappers，必须把 effect 注册一并移植**，否则
+    FullAC/RegionAC + DeepEP 会静默算错梯度。
+  - 上游 `c6e71f452` document-capped concat-then-split packer 保留上游 padding
+    （#5116）：**语义已对齐，移植一处加固 + 回归测试**。llmtuner 的
+    `DocumentAwareConcatThenSplitIterator`（`datasets/packing/iterators.py`）此前
+    已按源行 mask 切片传递；上游此提交相对我们的唯一增量是
+    `np.asarray(..., dtype=np.bool_)` 归一化（源 mask 非 bool 时保持输出为 bool），
+    已移植。上游的回归场景（first-fit 内层 padding 经 document cap 切到第二行）以
+    `test_document_capped_nested_packing_keeps_inner_padding` 落到
+    `tests/unit_tests/cpu/datasets/test_data_pipeline.py`（本机被 grain 门禁 skip，
+    已用最小 stub 冒烟验证两档 cap 的 mask/positions 语义）。
   - 上游 `GroupedLinear`（`num_linears` 投影轴）与 FSDP 专家放置
     `Shard(weight.ndim-2)`：**无需动作（表示等价）**——llmtuner 的专家是
     packed 3-D（`gate_up_proj (E,2F,D)`、`down_proj (E,D,F)`），`Shard(ndim-2)`
