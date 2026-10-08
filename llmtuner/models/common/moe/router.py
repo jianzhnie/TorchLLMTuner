@@ -480,10 +480,18 @@ class QuantileBalancer(nn.Module):
         counts_before_E = (
             cumulative_counts_EB.gather(-1, target_bin_E1).squeeze(-1) - counts_in_bin_E
         )
-        fraction_E = (
-            target_count_E - counts_before_E.float()
-        ) / counts_in_bin_E.float()
-
         bin_width = (expert_bias_E.max() - expert_bias_E.min() + 2.0) / self.num_bins
+        # counts_in_bin_E == 0 happens when the expert saw no observations at
+        # all (an all-padding step is the reachable case); hold that expert at
+        # its current bias rather than writing a NaN into the persistent
+        # buffer.
+        safe_counts = counts_in_bin_E.float().clamp(min=1.0)
+        fraction_E = (target_count_E - counts_before_E.float()) / safe_counts
         quantile_position_E = target_bin_E.float() + fraction_E
+        if (counts_E == 0).any():
+            bias_min = expert_bias_E.min() - 1.0
+            current_position_E = (expert_bias_E - bias_min) / bin_width
+            quantile_position_E = torch.where(
+                counts_E == 0, current_position_E, quantile_position_E
+            )
         return (quantile_position_E - quantile_position_E.mean()) * bin_width

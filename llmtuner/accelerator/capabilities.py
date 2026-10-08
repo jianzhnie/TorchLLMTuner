@@ -79,12 +79,28 @@ def dynamo_lru_cache_knob() -> bool:
 
 
 def _pipelining_has_eval() -> bool:
-    """Whether torch's pipeline schedules carry the eval-only driver."""
+    """Whether torch's pipeline schedules carry the microbatch eval driver.
+
+    Attribute presence is not enough: torch 2.9 shipped ``eval(*args, target,
+    losses, **kwargs)`` -- the microbatch keyword form (``arg_mbs`` /
+    ``kwarg_mbs`` / ``target_mbs``) would be swallowed by ``**kwargs`` and
+    misrouted into the model kwargs. Probe the signature instead. The training
+    seam's ``_step_microbatches(..., return_outputs=...)`` arrived in the same
+    window, so both are checked.
+    """
     if not importable("torch.distributed.pipelining.schedules", "_PipelineSchedule")():
         return False
+    import inspect
+
     import torch.distributed.pipelining.schedules as schedules
 
-    return hasattr(schedules._PipelineSchedule, "eval")
+    eval_params = inspect.signature(schedules._PipelineSchedule.eval).parameters
+    if "arg_mbs" not in eval_params:
+        return False
+    step = getattr(schedules._PipelineSchedule, "_step_microbatches", None)
+    if step is None:
+        return False
+    return "return_outputs" in inspect.signature(step).parameters
 
 
 def grouped_mm_runs() -> bool:
@@ -186,8 +202,10 @@ CAPABILITIES: dict[str, Capability] = {
     # -- pipeline eval driver (consumer: trainer/validate.py) ----------------
     "pipelining_schedule_eval": Capability(
         _pipelining_has_eval,
-        what="torch.distributed.pipelining _PipelineSchedule.eval",
-        since="torch 2.9 (eval-only pipeline driver)",
+        what="torch.distributed.pipelining _PipelineSchedule.eval microbatch form",
+        since="torch main/2.10+ (eval(arg_mbs=...) and "
+        "_step_microbatches(return_outputs=...); 2.9's eval swallows the "
+        "microbatch kwargs)",
         hint="Upgrade torch, or run validation with pipeline_parallel_size=1.",
         consumers="trainer/validate.py (validation pass under PP)",
     ),

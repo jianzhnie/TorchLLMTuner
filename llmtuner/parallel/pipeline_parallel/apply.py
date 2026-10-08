@@ -317,6 +317,11 @@ def apply_pp(
     """
     if getattr(model, "enable_weight_tying", False):
         matrix.pp_weight_tying()
+    # A DSA model builds its dense mask from tok_embeddings.weight.dtype on
+    # every forward; non-first stages hold an nn.Identity there (crashes on
+    # the first forward), so refuse at assembly time.
+    if getattr(model, "uses_dsa", False):
+        matrix.dsa_pp()
     parallelism = cfg
     pp_mesh = parallel_dims.get_mesh("pp")
     validate_microbatches(parallel_dims, cfg, global_batch_size)
@@ -350,6 +355,21 @@ def apply_pp(
                 f"module_fqns_per_model_part defines {num_stages} stages, "
                 f"which is not divisible by the pipeline parallel degree "
                 f"({parallel_dims.pp})"
+            )
+        # Same schedule-kind constraint as the generated path: single-stage
+        # schedules (GPipe, 1F1B) drive exactly one stage per rank -- an
+        # explicit split with more would have its extra chunks silently
+        # dropped by the PipelineScheduleSingle branch.
+        schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
+        if issubclass(schedule_class, PipelineScheduleSingle) and (
+            num_stages != parallel_dims.pp
+        ):
+            raise ValueError(
+                f"module_fqns_per_model_part defines {num_stages} stages "
+                f"({num_stages // parallel_dims.pp} per rank), but schedule "
+                f"{parallelism.pipeline_parallel_schedule!r} drives exactly "
+                "one stage per rank. Use a looped schedule (e.g. "
+                "interleaved_1f1b) or one stage per rank."
             )
 
     stages, model_parts = split_model_into_stages(

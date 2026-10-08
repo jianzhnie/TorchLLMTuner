@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 
+from ..accelerator.capabilities import has as capability
 from ..accelerator.spmd_context import spmd_context
 from ..datasets.loader import TrainerBatch
 from ..datasets.types import Batch
@@ -115,7 +116,10 @@ def pp_forward_backward_body(
         # schedule before either runs, and ``loss_kwargs`` wins when the public
         # path supplies it.
         self.pp_schedule._llmtuner_global_valid_tokens = global_valid_tokens
-        if hasattr(self.pp_schedule, "_step_microbatches"):
+        if capability("pipelining_schedule_eval"):
+            # Signature-level probe (not hasattr): torch 2.9's driver exists
+            # but lacks return_outputs, and its eval() would swallow the
+            # microbatch kwargs.
             self.pp_schedule._step_microbatches(
                 arg_mbs if self.pp_has_first_stage else None,
                 kwarg_mbs,

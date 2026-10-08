@@ -359,6 +359,11 @@ def read_expert_groups(
         num_groups = read_int_attr(block, router, "num_group")
     if num_groups is None:
         return None, None
+    if num_groups == 0:
+        raise ValueError(
+            f"{type(block).__name__} declares n_group=0, which cannot "
+            "partition the experts; check the model config."
+        )
 
     # ``topk_method`` sits on the block in transformers 5.x (it was on
     # DeepSeek-V2's router in 4.x), so both are read.

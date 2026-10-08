@@ -64,6 +64,7 @@ def test_rows_reject_with_their_entry_type() -> None:
         (matrix.ep_hf_initial_load, (2,), "initial_load_in_hf"),
         (matrix.chunked_loss_validation, (2,), "chunked_loss_num_chunks=2"),
         (matrix.pp_weight_tying, (), "tied word embeddings"),
+        (matrix.dsa_pp, (), "DSA"),
         (matrix.shared_expert_tp, ("layers.0.mlp", _Block()), "shared expert"),
         (matrix.tp_moe_specs_without_block, (2, _Block()), "no HF MoE block"),
         (matrix.tp_moe_non_tensor_output, (_Block(), _Block()), "not a bare"),
