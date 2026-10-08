@@ -40,9 +40,17 @@ The classes live one domain per file under this package
 ``from llmtuner.config import X`` resolves for every public name.
 """
 
+from llmtuner.config.activation_checkpoint import (
+    VALID_AC_MODES,
+    MemoryBudgetACConfig,
+    RegionACConfig,
+    SelectiveACConfig,
+)
 from llmtuner.config.checkpoint import CheckpointConfig
+from llmtuner.config.compile import CompileConfig
 from llmtuner.config.data import DataloaderConfig
 from llmtuner.config.model import ModelConfig
+from llmtuner.config.observability import MetricsConfig, ProfilerConfig
 from llmtuner.config.optimizer import (
     EMAConfig,
     LRSchedulerConfig,
@@ -51,17 +59,8 @@ from llmtuner.config.optimizer import (
 )
 from llmtuner.config.parallel import ParallelConfig
 from llmtuner.config.root import LLMTunerConfig
-from llmtuner.config.training import (
-    VALID_AC_MODES,
-    CompileConfig,
-    MemoryBudgetACConfig,
-    MetricsConfig,
-    ProfilerConfig,
-    RegionACConfig,
-    SelectiveACConfig,
-    TrainingConfig,
-    ValidationConfig,
-)
+from llmtuner.config.training import TrainingConfig
+from llmtuner.config.validation import ValidationConfig
 
 __all__ = [
     "CheckpointConfig",
