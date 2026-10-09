@@ -5,22 +5,23 @@ CUDA and other torch accelerators that provide distributed collectives. MPS is
 intentionally excluded: it has no distributed backend and cannot host a
 ``DeviceMesh`` even when torch reports it as available.
 
-``is_device_type_available`` and ``should_use_pin_memory`` derive from
-OpenMMLab's ``mmengine.device`` conventions, merged here so nothing needs the
-mmengine dependency. The rest of that file's surface was not carried over: its
-import-time ``DEVICE`` constant and ``get_device()`` duplicate this module's
-``device_type`` / ``get_device_type()``, its ``torch.npu.set_compile_mode``
-call mutates global torch state at import time, and its per-vendor predicates
-(``is_cuda_available`` / ``is_npu_available`` / ...), NPU full-precision probe
-and peak-memory queries had no caller -- the `mmengine`-style surface is not
-kept for its own sake, the same way the other vendored-but-unused files were
-dropped.
+``is_npu_available``, ``is_device_type_available`` and ``should_use_pin_memory``
+derive from OpenMMLab's ``mmengine.device`` conventions, merged here so nothing
+needs the mmengine dependency. Not carried over: its import-time ``DEVICE``
+constant and ``get_device()`` duplicate this module's ``device_type`` /
+``get_device_type()``, and its ``torch.npu.set_compile_mode`` call mutates
+global torch state at import time. The vendor predicates
+(``is_cuda_available`` / ``is_npu_available`` /
+``is_npu_support_full_precision``) and ``get_max_cuda_memory`` are retained as
+a small device-capability surface for downstream scripts, even though llmtuner
+itself does not call them.
 """
 
 from __future__ import annotations
 
 import importlib
 import os
+from typing import Any
 
 import torch
 
@@ -38,6 +39,11 @@ for _ext in ("torch_mlu", "torch_musa"):
     except ImportError:
         pass
 del _ext
+
+try:
+    from torch_npu.npu import utils as _npu_utils
+except ImportError:
+    _npu_utils = None
 
 ACCELERATOR_TYPES = frozenset(("npu", "cuda", "xpu", "mlu", "musa"))
 DEVICE_PRIORITY = ("npu", "cuda", "musa", "mlu", "xpu")
@@ -76,6 +82,12 @@ def get_device_type() -> str:
     return next(
         (kind for kind in DEVICE_PRIORITY if is_device_type_available(kind)), "cpu"
     )
+
+
+def get_device_info() -> tuple[str, Any]:
+    """Return ``(device type, torch device module)`` for training."""
+    kind = get_device_type()
+    return kind, torch if kind == "cpu" else getattr(torch, kind)
 
 
 def get_env_dist_info() -> tuple[int, int, int]:
@@ -118,11 +130,47 @@ def set_device(device: torch.device) -> None:
         raise RuntimeError(f"Failed to set device {device}: {exc}") from exc
 
 
+def is_device_available(device: torch.device) -> bool:
+    """Return whether a concrete device index is accessible."""
+    if not is_device_type_available(device.type):
+        return False
+    if device.type == "cpu" or device.index is None:
+        return True
+    return device.index < getattr(torch, device.type).device_count()
+
+
 def should_use_pin_memory(device: torch.device | None = None) -> bool:
     """Return whether asynchronous pinned-memory copies are useful."""
     device = get_current_device() if device is None else device
     return device.type in ACCELERATOR_TYPES
 
+def is_cuda_available() -> bool:
+    """Return whether CUDA devices exist."""
+    return is_device_type_available("cuda")
 
-device_type = get_device_type()
-device_module = torch if device_type == "cpu" else getattr(torch, device_type)
+
+def is_npu_available() -> bool:
+    """Return whether Ascend PyTorch and NPU devices exist."""
+    return is_device_type_available("npu")
+
+
+def is_npu_support_full_precision() -> bool:
+    """Return whether the NPU SoC supports full-precision training."""
+    if not is_npu_available() or _npu_utils is None:
+        return False
+    version_of_support_full_precision = 220
+    return _npu_utils.get_soc_version() >= version_of_support_full_precision
+
+
+def get_max_cuda_memory(device: torch.device | None = None) -> int:
+    """Peak CUDA memory occupied by tensors, in MB, and reset the peak.
+
+    With ``device=None`` the current device is reported. Note the side
+    effect: the peak counter is reset, so consecutive calls measure the
+    interval between calls, not the program maximum.
+    """
+    mem = torch.cuda.max_memory_allocated(device=device)
+    torch.cuda.reset_peak_memory_stats()
+    return int(mem) // (1024 * 1024)
+
+device_type, device_module = get_device_info()
