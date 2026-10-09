@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="/home/jianzhnie/llmtuner/llm/TorchLLMTuner"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-# Project-local Ascend environment. Override the model/run knobs below without
-# editing the Python example.
-if [[ "${LLMTUNER_SKIP_SET_ENV:-0}" != "1" ]]; then
+# Project-local Ascend environment (only present on the training host).
+# Override the model/run knobs below without editing the Python example.
+if [[ -f "$repo_root/set_env.sh" ]]; then
   source "$repo_root/set_env.sh"
+else
+  echo "note: $repo_root/set_env.sh not found; assuming the environment is already set up" >&2
 fi
 
 export LLMTUNER_QWEN3_8B_PATH="${LLMTUNER_QWEN3_8B_PATH:-/home/jianzhnie/llmtuner/hfhub/models/Qwen/Qwen3-8B}"

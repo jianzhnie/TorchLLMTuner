@@ -254,7 +254,7 @@ def test_the_timeout_applies_to_every_one_dimensional_group_and_the_default(
     """
     from datetime import timedelta
 
-    from llmtuner.parallel import collectives
+    from llmtuner.accelerator import collectives
 
     lowered: list[tuple[timedelta, object]] = []
 
@@ -290,7 +290,7 @@ def test_timeout_uses_torch_210_compatibility_api(monkeypatch) -> None:
     """Torch 2.10 keeps runtime timeout adjustment in distributed_c10d."""
     from datetime import timedelta
 
-    from llmtuner.parallel import collectives
+    from llmtuner.accelerator import collectives
 
     lowered = []
 
@@ -315,7 +315,7 @@ def test_timeout_adjustment_is_skipped_for_hccl(monkeypatch) -> None:
     """HCCL does not implement c10d's runtime timeout adjustment."""
     from datetime import timedelta
 
-    from llmtuner.parallel import collectives
+    from llmtuner.accelerator import collectives
 
     class _Dims:
         def get_all_one_dimensional_meshes(self):

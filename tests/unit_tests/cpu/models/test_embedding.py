@@ -6,9 +6,9 @@ not hand it to the local ``F.embedding`` -- doing so either crashes (the id is
 beyond the shard's row count) or silently zeroes the gradient of an unrelated
 row. Only the owning shard passes ``padding_idx - offset``.
 
-Single-rank harness: the TP path only needs ``dist.get_world_size`` /
-``dist.get_rank`` on a process-group handle, so a 1-rank fake pg plus patched
-counts stands in for a real TP group.
+Single-rank harness: the TP path only needs ``dist_utils.get_world_size`` /
+``dist_utils.get_rank`` on a process-group handle, so a 1-rank fake pg plus
+patched counts stands in for a real TP group.
 """
 
 from tests.caps import require_env
@@ -36,8 +36,8 @@ def test_owning_shard_freezes_only_its_local_padding_row(monkeypatch):
         monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: group)
         # tp group of size 1: offset 0, the shard owns every row, so a global
         # padding_idx of 7 maps to local row 7.
-        monkeypatch.setattr(embedding_mod.dist, "get_world_size", lambda g: 1)
-        monkeypatch.setattr(embedding_mod.dist, "get_rank", lambda g: 0)
+        monkeypatch.setattr(embedding_mod.dist_utils, "get_world_size", lambda g: 1)
+        monkeypatch.setattr(embedding_mod.dist_utils, "get_rank", lambda g: 0)
 
         emb = Embedding(num_embeddings=8, embedding_dim=4, padding_idx=7)
         emb.weight = torch.nn.Parameter(
@@ -62,8 +62,8 @@ def test_non_owning_shard_passes_no_local_padding_idx(monkeypatch):
         monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: group)
         # tp group of size 2, this rank is 1: vocab 8 -> chunk 4, offset 4,
         # local rows [4, 8). Global padding_idx 3 lives on rank 0.
-        monkeypatch.setattr(embedding_mod.dist, "get_world_size", lambda g: 2)
-        monkeypatch.setattr(embedding_mod.dist, "get_rank", lambda g: 1)
+        monkeypatch.setattr(embedding_mod.dist_utils, "get_world_size", lambda g: 2)
+        monkeypatch.setattr(embedding_mod.dist_utils, "get_rank", lambda g: 1)
 
         emb = Embedding(num_embeddings=8, embedding_dim=4, padding_idx=3)
         emb.weight = torch.nn.Parameter(

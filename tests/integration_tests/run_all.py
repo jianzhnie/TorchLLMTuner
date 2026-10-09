@@ -32,9 +32,6 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 
-# Helpers, not runnable scripts: no ``__main__`` driver, imported by hand.
-_HELPERS = {"full_precision_equivalence.py"}
-
 _TORCHRUN_RE = re.compile(r"torchrun\s+(--nproc_per_node=\d+)[\s\\]+(\S+)")
 
 
@@ -57,7 +54,7 @@ def discover() -> list[Path]:
     return sorted(
         p
         for p in SCRIPT_DIR.glob("*.py")
-        if p.name not in ("__init__.py", "run_all.py") and p.name not in _HELPERS
+        if p.name not in ("__init__.py", "run_all.py")
     )
 
 

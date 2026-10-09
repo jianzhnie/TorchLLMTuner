@@ -223,8 +223,8 @@ llmtuner/
 
 tests/unit_tests/cpu/ 镜像包结构：accelerator/ components/(含 checkpointer/、
 optimizer/) datasets/ models/ parallel/ utils/，目录名 = 被测包名；
-tests/integration_tests/ 下 30 个 torchrun 脚本由 run_all.py 统一驱动（另 1 个
-`full_precision_equivalence.py` 是共享 helper，不单独驱动）。
+tests/integration_tests/ 下 30 个 torchrun 脚本由 run_all.py 统一驱动（目录 glob
+自动发现，无清单）。
 ```
 
 ## 3.1 异常约定（llmtuner/errors.py）
