@@ -374,6 +374,37 @@ class BaseCheckpointManager(ABC):
         if not getattr(self, "_initialized", False) or not self.enable:
             return False
 
+        resolved = self._resolve_load_source(step)
+        if resolved is None:
+            return False
+        checkpoint_id, model_only, from_hf, from_quantized = resolved
+
+        logger.info("Loading the checkpoint from %s.", checkpoint_id)
+        begin = time.monotonic()
+        self._load_checkpoint(
+            self._states_to_load(model_only),
+            checkpoint_id,
+            from_hf=from_hf,
+            from_quantized=from_quantized,
+        )
+        GarbageCollection.collect("GC collection for checkpoint loading.")
+        logger.info(
+            "Finished loading the checkpoint in %.2f seconds.",
+            time.monotonic() - begin,
+        )
+        return True
+
+    def _resolve_load_source(
+        self, step: int
+    ) -> tuple[str, bool, bool, bool] | None:
+        """Pick the checkpoint directory this load reads.
+
+        Returns ``(checkpoint_id, model_only, from_hf, from_quantized)``, or
+        ``None`` for a fresh start (nothing on disk and no initial weights
+        configured). The resolution order is the fault-tolerance contract: an
+        existing ``checkpoint.folder`` wins over the ``initial_*`` options, so
+        the same job args can be reused across restarts.
+        """
         model_only = False
         from_hf = False
         from_quantized = False
@@ -431,7 +462,7 @@ class BaseCheckpointManager(ABC):
                 )
             else:
                 logger.info("No checkpoint was provided, this is a fresh start.")
-                return False
+                return None
         else:
             step = load_step
             # Step 0 is a seed checkpoint, which holds model state only.
@@ -458,20 +489,7 @@ class BaseCheckpointManager(ABC):
                     step,
                 )
 
-        logger.info("Loading the checkpoint from %s.", checkpoint_id)
-        begin = time.monotonic()
-        self._load_checkpoint(
-            self._states_to_load(model_only),
-            checkpoint_id,
-            from_hf=from_hf,
-            from_quantized=from_quantized,
-        )
-        GarbageCollection.collect("GC collection for checkpoint loading.")
-        logger.info(
-            "Finished loading the checkpoint in %.2f seconds.",
-            time.monotonic() - begin,
-        )
-        return True
+        return checkpoint_id, model_only, from_hf, from_quantized
 
     @torch.no_grad()
     def save(self, curr_step: int, last_step: bool = False) -> bool:
