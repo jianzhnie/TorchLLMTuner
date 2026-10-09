@@ -152,6 +152,18 @@ def test_config_rejects_a_non_positive_log_freq() -> None:
 # -- should_log ---------------------------------------------------------------
 
 
+def test_should_log_anchors_the_window_even_when_it_returns_false() -> None:
+    """After a resume, the anchor lands on the first call, not the first log.
+
+    Otherwise ``time_end_to_end`` divides a multi-step wall span by a one-step
+    step span (upstream anchors in should_log for the same reason).
+    """
+    processor = _processor()
+    assert processor.step_last_log is None
+    assert processor.should_log(101) is False  # 101 % log_freq != 0
+    assert processor.step_last_log == 100
+
+
 def test_should_log_fires_on_the_first_step_and_then_on_the_interval() -> None:
     """Step 1 always reports: a long run whose first line never arrives is
     indistinguishable from a hang."""

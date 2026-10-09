@@ -115,7 +115,17 @@ def cross_entropy_loss(
     exactly when the logits hold fewer than ``global_vocab_size`` classes, which
     is what a sharded lm_head produces and nothing else does. A flag could
     disagree with the tensors; ``pred.shape[-1]`` cannot.
+
+    ``tp_group`` and ``global_vocab_size`` must be provided together: with only
+    one of them the shape test cannot be evaluated, and a sharded lm_head would
+    silently score against the LOCAL softmax denominator.
     """
+    if (tp_group is None) != (global_vocab_size is None):
+        raise ValueError(
+            "tp_group and global_vocab_size must be provided together: with "
+            f"tp_group={tp_group} and global_vocab_size={global_vocab_size}, a "
+            "vocab-sharded lm_head cannot be told from a replicated one."
+        )
     if tp_group is not None and global_vocab_size is not None:
         if pred.shape[-1] != global_vocab_size:
             return LossParallelCrossEntropy.apply(
@@ -256,6 +266,12 @@ class LossParallelCrossEntropy(torch.autograd.Function):
         ctx.reduction = reduction
         if reduction == "none":
             return result
+        if reduction != "sum":
+            raise ValueError(
+                f"reduction must be 'sum' or 'none', got {reduction!r}: the "
+                "vocab-parallel sums are token-summed, and 'mean' here would "
+                "divide by the wrong count."
+            )
         return result.sum()
 
     @staticmethod
@@ -309,6 +325,12 @@ def chunked_lm_head_cross_entropy(
     on one piece at a time, so the peak logits memory is ``T * V / num_chunks``
     (the accumulated gradients are ``T * H`` and ``V * H`` -- independent of
     the chunking).
+
+    FSDP note: upstream wraps this loop with lm_head reshard/grad-sync
+    management; llmtuner deliberately does not, so with an FSDP-sharded
+    lm_head each chunk pays an extra all-gather/reduce-scatter round --
+    a memory/latency cost, never a numerics difference. Merging that
+    reshard management is a standalone performance item, not a gap.
 
     The function runs the backward ITSELF and returns the detached summed loss
     (un-normalized, the same sum reduction ``cross_entropy_loss`` uses). The
@@ -443,7 +465,15 @@ def compute_logprobs(
     no gradient and must not extend the autograd graph over the logits softmax.
 
     Returns ``logprobs``, or ``(logprobs, entropy)`` when ``return_entropy``.
+
+    ``tp_group`` and ``global_vocab_size`` must be provided together (see
+    ``cross_entropy_loss``): half a pair makes the vocab-parallel shape test
+    unevaluable and would silently score against the local softmax.
     """
+    if (tp_group is None) != (global_vocab_size is None):
+        raise ValueError(
+            "tp_group and global_vocab_size must be provided together."
+        )
     if (
         tp_group is not None
         and global_vocab_size is not None

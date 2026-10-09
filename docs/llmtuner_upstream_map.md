@@ -422,6 +422,21 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
   - 组合矩阵：world_size=1 下 tp/pp/cp/ep/dp_replicate>1 由静默忽略改为
     ConfigError;config 期 `max_seq_len % cp`、`% tp` 两查合并为真实的联合不变量
     `% (cp*tp)`。
+- 2026-10-09 components 复审（loss/optimizer/checkpointer/metrics/profiler/tokenizer）落码修复项：
+  - loss:`cross_entropy_loss`/`compute_logprobs` 的 `tp_group` 与 `global_vocab_size`
+    改为必须成对提供（半个对会让 shape 分派不可测、分片 lm_head 静默走本地 softmax);
+    `LossParallelCrossEntropy` 补 reduction 校验（`mean` 曾静默按 sum 处理）。
+  - optimizer:`LRSchedulersContainer.get_metrics` 移植上游 Counter 消歧——PP>1 时同型
+    scheduler 的 `lr/AdamW` 键曾互相覆盖，只剩末 stage 的 lr 被上报。
+  - checkpointer:torch_checkpointing backend 的 `item_specs()` 补 EMA 项（原落到无
+    resharder 的 default spec，跨度数 resume 会与 OPTIMIZER 行为不一致）。
+  - metrics:`should_log` 恢复上游的锚定语义（resume 后首个窗口的 time_end_to_end
+    曾把多步墙钟除以 1 步）；`WANDB_RUN_TAGS` 按逗号拆分（对齐上游）;
+    DeviceMemoryMonitor 初始化补 `empty_cache()`（对齐上游，清启动残留）。
+  - pyproject:torch floor 由名义 `>=2` 修正为 `>=2.12`（注释本就如此声明；覆盖
+    DCP async-staging 符号）。
+  - 确认有意分歧保留：chunked loss 不做上游的 FSDP reshard 合并（docstring 已声明为
+    性能项）;validation 吞吐窗口口径（docstring 声明有意）。
   - CP:ulysses kernel 新增 packed 标记，Q 切分/缺失 mask 到达 packed 语料时 raise
     （堵绕过 wrapper 的静默退化）；上游原生模型 kv_allgather backward 的 fp32
     归约旋钮分歧登记待设备验证（见 CP 行）。

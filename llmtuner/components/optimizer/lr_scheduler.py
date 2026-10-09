@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import functools
 import math
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -141,19 +142,33 @@ class LRSchedulersContainer(Stateful):
     def get_metrics(self) -> dict[str, float]:
         """The current lr of each optimizer, keyed so several cannot collide.
 
-        The key keeps upstream's shape: a run with several schedulers, or a
-        param-group split, shows up as ``lr/AdamW/1`` rather than silently
-        overwriting ``lr/AdamW``.
+        Upstream's keying: ``lr/<OptName>`` when there is only one scheduler of
+        that optimizer type; a per-type index disambiguates several (PP gives
+        every pipeline stage its own optimizer of the same class), and a
+        param-group index goes last when one optimizer has several groups.
         """
         metrics: dict[str, float] = {}
+        optimizer_counts = Counter(
+            type(scheduler.optimizer).__name__ for scheduler in self.schedulers
+        )
+        optimizer_indices: defaultdict[str, int] = defaultdict(int)
         for scheduler in self.schedulers:
             optimizer_name = type(scheduler.optimizer).__name__
+            optimizer_index = optimizer_indices[optimizer_name]
+            optimizer_indices[optimizer_name] += 1
             last_lrs = scheduler.get_last_lr()
-            if len(last_lrs) == 1:
-                metrics[f"lr/{optimizer_name}"] = float(last_lrs[0])
-                continue
-            for index, value in enumerate(last_lrs):
-                metrics[f"lr/{optimizer_name}/{index}"] = float(value)
+            for group_index, value in enumerate(last_lrs):
+                if optimizer_counts[optimizer_name] > 1:
+                    key = f"lr/{optimizer_name}/{optimizer_index}"
+                    if len(last_lrs) > 1:
+                        key = f"{key}/{group_index}"
+                else:
+                    key = (
+                        f"lr/{optimizer_name}"
+                        if len(last_lrs) == 1
+                        else f"lr/{optimizer_name}/{group_index}"
+                    )
+                metrics[key] = float(value)
         return metrics
 
     def state_dict(self) -> dict[str, Any]:

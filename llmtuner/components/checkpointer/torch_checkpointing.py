@@ -266,6 +266,14 @@ def item_specs(backend: BackendConfig) -> dict[str, Any]:
             resharder=resharder,
             required=False,
         ),
+        # EMA rides the same flat-FQN mechanism as OPTIMIZER, so it needs the
+        # same resharder: without its own item it would fall back to the
+        # default spec (no resharder) and break cross-degree resumes.
+        EMA: backend.ItemSpec(
+            requires_copy=True,
+            resharder=resharder,
+            required=False,
+        ),
     }
 
 
