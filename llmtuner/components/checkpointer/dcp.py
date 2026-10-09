@@ -448,9 +448,12 @@ class CheckpointManager(BaseCheckpointManager):
         states = self._flattened_model_states_sd()
         async_save_started_at: float | None = None
 
-        if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
+        if self.async_mode in (AsyncMode.ASYNC_WITH_PINNED_MEM, AsyncMode.ASYNC):
             GarbageCollection.collect("GC collection invoked by checkpointer.")
-            if self.stager is None:
+            if (
+                self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM
+                and self.stager is None
+            ):
                 self.stager = DefaultStager(
                     StagingOptions(
                         use_pinned_memory=True,
@@ -466,29 +469,22 @@ class CheckpointManager(BaseCheckpointManager):
                 checkpoint_id=checkpoint_id,
                 async_mode=self.async_mode,
             )
-            # No GC needed on this path: the staging buffers are reused.
-            if not isinstance(result, AsyncSaveResponse):
-                raise TypeError(
-                    "ASYNC_WITH_PINNED_MEM save must return an AsyncSaveResponse, "
-                    f"got {type(result).__name__}"
-                )
-            self.staging_future = result.staging_completion
-            self.save_future = result.upload_completion
-
-        elif self.async_mode == AsyncMode.ASYNC:
-            GarbageCollection.collect("GC collection invoked by checkpointer.")
-            async_save_started_at = time.monotonic()
-            result = self.dcp_save(
-                states,
-                checkpoint_id=checkpoint_id,
-                async_mode=self.async_mode,
-            )
-            GarbageCollection.collect("GC collection invoked by checkpointer.")
-            if not isinstance(result, Future):
-                raise TypeError(
-                    f"ASYNC save must return a Future, got {type(result).__name__}"
-                )
-            self.save_future = result
+            if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
+                # No GC needed on this path: the staging buffers are reused.
+                if not isinstance(result, AsyncSaveResponse):
+                    raise TypeError(
+                        "ASYNC_WITH_PINNED_MEM save must return an "
+                        f"AsyncSaveResponse, got {type(result).__name__}"
+                    )
+                self.staging_future = result.staging_completion
+                self.save_future = result.upload_completion
+            else:
+                GarbageCollection.collect("GC collection invoked by checkpointer.")
+                if not isinstance(result, Future):
+                    raise TypeError(
+                        f"ASYNC save must return a Future, got {type(result).__name__}"
+                    )
+                self.save_future = result
 
         else:
             self.dcp_save(
