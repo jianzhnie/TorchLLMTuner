@@ -175,48 +175,49 @@ import trainer 或读取全局 run config；跨 models/parallel 的依赖必须�
 引擎层（TP/CP fused kernel、FSDP、`spmd_context`、checkpoint 的 PG 生命周期）直连
 `torch.distributed` 与 `_functional_collectives` 等私有 API。
 
-目录结构（126 个 Python 模块，约 30.7k 行）：
+目录结构（127 个 Python 文件，约 30.1k 行）：
 
 ```
 llmtuner/
   __init__.py / __main__.py / errors.py
                                 包面 + CLI 入口（python -m llmtuner）+ 三类异常
-  config/       12 模块         model/parallel/optimizer/checkpoint/data/
+  config/       14 文件         model/parallel/optimizer/checkpoint/data/
                                 training/root.py（聚合根 + from_groups 嫁接）
                                 observability/activation_checkpoint/compile/
                                 validation（按域拆分的嵌套配置）
+                                + field_checks.py（各组共用的字段下限校验）
                                 + cli.py（CLI 视图，把 CLI 载不动的字段挡在
                                 --help 之外）+ __init__(全量再导出)
-  trainer/      8 模块          trainer.py / train.py / builder.py（装配段，
+  trainer/      6 文件          trainer.py / train.py / builder.py（装配段，
                                 顺序契约见模块 docstring）/ validate.py /
                                 batch.py
-  models/      27 模块          hf/{model,factory,flops,state_dict_adapter}.py（HF 适配：
+  models/      23 文件          hf/{model,factory,flops,state_dict_adapter}.py（HF 适配：
                                 包装/构造/FLOPs/checkpoint 键）
                                 + common/{rope,activation,linear,feed_forward,
                                 embedding,cast_linear,multimodal,scatter_add,
                                 aux_loss,async_linear}.py + attention/（qkv+masks）
                                 + moe/（block/router/experts/dispatcher/
                                 load_balance/balancing）
-  parallel/    29 模块          tensor_parallel/(tp+apply+linear)
+  parallel/    24 文件          tensor_parallel/(tp+apply+linear)
                                 fully_shard/ pipeline_parallel/ context_parallel/
                                 expert_parallel/(swap+probe+convert+ckpt)
                                 activation_checkpoint.py compile.py matrix.py
                                 stages.py（装配 stage 表）head_sharding.py
                                 remat_regions.py
                                 parallel_dims.py parallelize.py
-  accelerator/  8 模块          device.py（设备发现/backend 选择）
+  accelerator/  7 文件          device.py（设备发现/backend 选择）
                                 capabilities.py（能力注册表）
                                 collectives.py（归约/超时/grad norm）
                                 monitoring.py（显存监控/peak FLOPS）
                                 spmd_context.py（SPMD mesh 作用域 + 轴查询, 最底层）
                                 + dist_utils.py（vendored mmengine.dist 引导/查询面；collective 在 collectives.py）
                                 （mesh 构建在 parallel/parallel_dims.py，单轨）
-  components/  17 模块          loss / checkpointer(DCP; 含 checkpoint_keys
+  components/  14 文件          loss / checkpointer(DCP; 含 checkpoint_keys
                                 与 filesystem) / metrics / profiler / tokenizer
                                 / optimizer
-  datasets/    21 模块          Grain 数据图 + random_data + types.py(Batch)
+  datasets/    18 文件          Grain 数据图 + random_data + types.py(Batch)
                                 + packing/ + {text(含 renderer),multimodal}
-  utils/        4 模块          logger_utils / gc / lazy_exports
+  utils/        4 文件          logger_utils / gc / lazy_exports
                                 （filesystem 与 checkpoint_keys 归
                                 components/checkpointer/；seed 归 trainer/）
 
