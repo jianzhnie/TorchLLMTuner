@@ -133,6 +133,8 @@ def apply_cp(
             f"apply_cp expects a HFTransformerModel (with .layers); got "
             f"{type(model).__name__}."
         )
+    model_config = getattr(getattr(model, "model", None), "config", None)
+    packed = getattr(model_config, "attn_mask_type", "causal") == "block_causal"
     for idx, layer in enumerate(layers):
         for name in _ATTN_MODULE_NAMES:
             if hasattr(layer, name):
@@ -144,7 +146,9 @@ def apply_cp(
                 f"under any of {_ATTN_MODULE_NAMES}. Add the model's spelling "
                 "to the probe in apply_cp."
             )
-        attn_mod._titan_flex_kernel = CPFlexKernel(cp_mesh=cp_mesh, strategy=strategy)
+        attn_mod._titan_flex_kernel = CPFlexKernel(
+            cp_mesh=cp_mesh, strategy=strategy, packed=packed
+        )
 
     model.set_cp_mesh(cp_mesh, load_balancer=load_balancer, strategy=strategy)
     logger.info("Applied CP (%s) with degree %d", strategy, cfg.cp)

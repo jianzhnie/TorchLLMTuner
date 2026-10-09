@@ -211,9 +211,19 @@ class CPFlexKernel(nn.Module):
         strategy: ``"kv_allgather"`` (all-gather K/V, Q stays token-sharded) or
             ``"ulysses"`` (all-to-all onto the head axis, attention runs
             full-length with ``heads / cp`` heads per rank).
+        packed: whether the corpus carries document structure
+            (``attn_mask_type == "block_causal"``). Under ulysses a packed mask
+            is valid only full-length; the length-based rebuild branch cannot
+            recover document structure, so it refuses when this is set.
     """
 
-    def __init__(self, *, cp_mesh: DeviceMesh, strategy: str = "kv_allgather") -> None:
+    def __init__(
+        self,
+        *,
+        cp_mesh: DeviceMesh,
+        strategy: str = "kv_allgather",
+        packed: bool = False,
+    ) -> None:
         super().__init__()
         if strategy not in _KNOWN_STRATEGIES:
             raise NotImplementedError(
@@ -221,6 +231,7 @@ class CPFlexKernel(nn.Module):
                 f"are {_KNOWN_STRATEGIES}."
             )
         self.strategy = strategy
+        self.packed = packed
         self._cp_group = cp_mesh.get_group()
         if strategy == "kv_allgather":
             try:
@@ -291,6 +302,14 @@ class CPFlexKernel(nn.Module):
         k = SeqToHead.apply(key.contiguous(), self._cp_group)
         v = SeqToHead.apply(value.contiguous(), self._cp_group)
         if block_mask is None or block_mask.seq_lengths[0] != q.shape[_SEQ_DIM]:
+            if self.packed:
+                raise ValueError(
+                    "ulysses CP received a Q-sharded (or no) mask for a packed "
+                    "corpus: the document structure cannot be recovered from a "
+                    "length alone. The wrapper prebuilds the packed mask "
+                    "full-length; this raise means the mask was replaced or "
+                    "dropped between the wrapper and the kernel."
+                )
             block_mask = self._full_length_causal_mask(q)
         out = run_flex(module, q, k, v, block_mask, kwargs)
         out = HeadToSeq.apply(out.contiguous(), self._cp_group)

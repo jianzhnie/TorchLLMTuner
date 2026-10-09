@@ -410,6 +410,24 @@ def test_tp_must_divide_seq_len() -> None:
         )
 
 
+def test_cp_tp_joint_seq_len_divisibility() -> None:
+    """Each divisor passing alone is not enough: the CP shard must divide by tp.
+
+    T=6, cp=2, tp=2 passes both single-axis checks but leaves a length-3
+    shard for tp=2; the joint check catches it at config time.
+    """
+    with pytest.raises(ValueError, match="cp \* tp"):
+        LLMTunerConfig(
+            parallel=ParallelConfig(context_parallel_size=2, tensor_parallel_size=2),
+            training=TrainingConfig(max_seq_len=6),
+        )
+    # And the valid case still passes.
+    LLMTunerConfig(
+        parallel=ParallelConfig(context_parallel_size=2, tensor_parallel_size=2),
+        training=TrainingConfig(max_seq_len=8),
+    )
+
+
 def test_model_config_validates_architecture_numbers() -> None:
     """Illegal architecture values must die in the config, not in for_model."""
     for overrides in (

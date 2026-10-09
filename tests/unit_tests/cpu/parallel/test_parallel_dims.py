@@ -268,6 +268,17 @@ def test_build_parallel_dims_resolves_against_world_size() -> None:
     assert (pd.tp, pd.dp_shard) == (2, 4)
 
 
+def test_build_parallel_dims_rejects_parallel_degrees_at_world_size_1() -> None:
+    """No torchrun + tp>1 must fail, not silently train a replicated model."""
+    cfg = _config(tensor_parallel_size=2)
+    with pytest.raises(ValueError, match="world_size=1"):
+        build_parallel_dims(cfg, world_size=1)
+
+    cfg = _config(pipeline_parallel_size=2)
+    with pytest.raises(ValueError, match="world_size=1"):
+        build_parallel_dims(cfg, world_size=1)
+
+
 def test_derive_dp_matches_parallel_dims_resolution() -> None:
     """The config helper and the torchtitan-shaped class must agree.
 
