@@ -135,6 +135,11 @@ class AuxLoss(nn.Module):
         )
         AuxLoss._group_counts[(self.reduce_mesh, self.metric_name)] += 1
 
+    @classmethod
+    def has_pending_counts(cls) -> bool:
+        """Whether any aux-loss group is registered (any MoE model built)."""
+        return bool(cls._group_counts)
+
     @property
     def metric_name(self) -> str:
         """The class name in snake_case, e.g. ``MicrobatchWiseLoadBalanceLoss``
