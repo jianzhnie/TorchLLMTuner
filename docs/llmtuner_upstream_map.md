@@ -1077,7 +1077,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `trainer/train.py` | parse/main | B，根 `train.py` |
 | `trainer/trainer.py` + `builder.py`（装配段与播种）/ `validate.py` / `batch.py` | 完整训练生命周期 | B，根 `trainer.py` + `training_engine.py` |
 | `components/checkpointer/checkpoint_keys.py` | checkpoint state key 常量 | C |
-| `accelerator/device.py` | 设备发现、backend 选择、pin-memory 判定；无消费者的 mmengine 厂商谓词面（`is_cuda_available`/`is_npu_available`/full-precision 探针/peak-memory 查询等）已删 | C |
+| `accelerator/device.py` | 设备发现、backend 选择、pin-memory 判定；mmengine 厂商谓词面（`is_cuda_available`/`is_npu_available`/full-precision 探针/`get_max_cuda_memory`）作为设备能力小面保留给下游脚本，llmtuner 自身不调用 | C |
 | `components/checkpointer/filesystem.py` | path/storage helpers | A1，`tools/filesystem.py` |
 | `utils/gc.py` | `GarbageCollection` | B，`tools/utils.py` |
 | `utils/logger_utils.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤，默认 INFO）、`set_log_ranks`（控制台打印 rank 集合，由 `MetricsConfig.log_ranks` 接线）、`get_distributed_rank` | C |
