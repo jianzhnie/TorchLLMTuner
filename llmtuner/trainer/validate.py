@@ -24,6 +24,113 @@ from ..datasets.loader import DataloaderExhaustedError
 from ..datasets.types import Batch
 
 
+def loss_reporting_meshes(parallel_dims):
+    """``(dp_mesh, loss_mesh)`` for a pass's reductions.
+
+    The same mesh split as ``train_step``: the token count is taken from the
+    unsharded batch, so it is summed over the dp axis alone; the loss is summed
+    over each rank's own slice of the batch, so it is reduced over the
+    dp*cp*tp ``loss`` view when the sequence is sharded at all.
+    """
+    dp_mesh = (
+        None if parallel_dims is None else parallel_dims.get_optional_mesh("dp")
+    )
+    loss_sharded = parallel_dims is not None and (
+        parallel_dims.dp_cp_enabled or parallel_dims.tp_enabled
+    )
+    loss_mesh = (
+        None
+        if parallel_dims is None
+        else (
+            parallel_dims.get_optional_mesh("loss") if loss_sharded else dp_mesh
+        )
+    )
+    return dp_mesh, loss_mesh
+
+
+def build_validation_dataloader(self, validation: ValidationConfig):
+    """The pass's temporary loader: fresh per pass, closed when the pass ends.
+
+    ``steps=-1`` reads it to exhaustion (built with repeat=False); a positive
+    ``steps`` bounds the pass (built repeating, so the bound is reachable).
+    """
+    dp_rank, dp_world_size = self.dp_rank_world_size()
+    batch_size_per_rank = self.batch_size_per_rank(dp_world_size)
+    return build_dataloader(
+        self.cfg,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        num_tokens_per_batch=batch_size_per_rank * self.cfg.max_seq_len,
+        repeat=validation.steps != -1,
+        dataset=validation.dataset,
+    )
+
+
+def count_batch_tokens(self, batch, dp_mesh) -> torch.Tensor:
+    """Throughput accounting plus the dp-reduced global valid-token count.
+
+    The throughput number counts every label the loader produced, whether or
+    not it is predictable; ``ntokens_seen`` is deliberately not touched -- it
+    is the checkpointed *training* counter. The valid-token count is taken
+    from the unsharded batch, exactly as in training, so the dp-axis reduction
+    counts the whole batch once even when CP later slices the sequence.
+    """
+    labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
+    self.metrics.add_tokens(labels.numel())
+    local_valid_tokens = self.count_valid_tokens(batch)
+    global_valid_tokens = torch.tensor(
+        local_valid_tokens, dtype=torch.int64, device=self.device
+    )
+    if dp_mesh is not None:
+        all_reduce(global_valid_tokens, group=dp_mesh.get_group())
+    return global_valid_tokens
+
+
+def finish_validation(
+    self,
+    *,
+    num_steps: int,
+    accumulated_loss: torch.Tensor | None,
+    total_global_valid_tokens: torch.Tensor,
+    loss_mesh,
+    step: int,
+) -> None:
+    """Reduce the pass's sums and report the average, with loud empty-pass errors.
+
+    Two outcomes are loud errors rather than a silently skipped report: a pass
+    that read zero batches (the dataset supplied less than one batch of tokens
+    on this rank, which concat-then-split packing turns into no rows at all),
+    and a pass over zero valid tokens (every label masked), which has no
+    average to report. Under PP only the last stage holds losses; other stages
+    run the identical loop and return without reporting.
+    """
+    if num_steps == 0:
+        raise ValueError(
+            "Validation ran zero batches on this rank. This happens when "
+            "the validation dataset supplies fewer than one batch of "
+            "tokens on this rank, because concat-then-split packing drops "
+            "partially filled batches. Decrease the per-rank batch size or "
+            "use a larger validation dataset."
+        )
+    num_global_valid_tokens = int(total_global_valid_tokens.item())
+    if num_global_valid_tokens == 0:
+        raise ValueError(
+            "Validation ran on zero valid tokens; cannot compute an "
+            "average validation loss. Ensure the validation batches "
+            "contain unmasked labels."
+        )
+    if accumulated_loss is None:
+        # A PP stage that is not the last one holds no losses.
+        return
+    if loss_mesh is not None:
+        global_loss_sum = accumulated_loss.clone()
+        all_reduce(global_loss_sum, group=loss_mesh.get_group())
+    else:
+        global_loss_sum = accumulated_loss
+    global_avg_loss = float(global_loss_sum) / num_global_valid_tokens
+    self.metrics.log_validation(loss=global_avg_loss, step=step)
+
+
 def check_validation_feasibility(
     validation: ValidationConfig,
     *,
@@ -114,34 +221,8 @@ def validate_body(self, validation: ValidationConfig, step: int) -> None:
     if parallel_dims is not None and parallel_dims.pp_enabled:
         validate_body_pp(self, validation, step)
         return
-    # The same mesh split as ``train_step``: the token count is taken from
-    # the unsharded batch, so it is summed over the dp axis alone; the loss
-    # is summed over each rank's own slice of the batch, so it is reduced
-    # over the dp*cp*tp ``loss`` view when the sequence is sharded at all.
-    dp_mesh = (
-        None if parallel_dims is None else parallel_dims.get_optional_mesh("dp")
-    )
-    loss_sharded = parallel_dims is not None and (
-        parallel_dims.dp_cp_enabled or parallel_dims.tp_enabled
-    )
-    loss_mesh = (
-        None
-        if parallel_dims is None
-        else (
-            parallel_dims.get_optional_mesh("loss") if loss_sharded else dp_mesh
-        )
-    )
-
-    dp_rank, dp_world_size = self.dp_rank_world_size()
-    batch_size_per_rank = self.batch_size_per_rank(dp_world_size)
-    validation_dataloader = build_dataloader(
-        self.cfg,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        num_tokens_per_batch=batch_size_per_rank * self.cfg.max_seq_len,
-        repeat=validation.steps != -1,
-        dataset=validation.dataset,
-    )
+    dp_mesh, loss_mesh = loss_reporting_meshes(parallel_dims)
+    validation_dataloader = build_validation_dataloader(self, validation)
 
     accumulated_loss: torch.Tensor | None = None
     total_global_valid_tokens = torch.zeros(
@@ -155,21 +236,7 @@ def validate_body(self, validation: ValidationConfig, step: int) -> None:
                 batch = next(data_iterator)
             except (DataloaderExhaustedError, StopIteration):
                 break
-            labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
-            # Throughput accounting only, mirroring ``batch_generator``:
-            # every label the loader produced counts, whether or not it is
-            # predictable. ``ntokens_seen`` is deliberately not touched --
-            # it is the checkpointed *training* counter.
-            self.metrics.add_tokens(labels.numel())
-            # Counted from the unsharded batch, exactly as in training, so
-            # the dp-axis reduction below counts the whole batch once even
-            # when CP later slices the sequence.
-            local_valid_tokens = self.count_valid_tokens(batch)
-            global_valid_tokens = torch.tensor(
-                local_valid_tokens, dtype=torch.int64, device=self.device
-            )
-            if dp_mesh is not None:
-                all_reduce(global_valid_tokens, group=dp_mesh.get_group())
+            global_valid_tokens = count_batch_tokens(self, batch, dp_mesh)
             if isinstance(batch, dict):
                 # ``num_valid_tokens`` is the trainer's bookkeeping; a
                 # plain int among tensors would be splatted into the model
@@ -195,28 +262,14 @@ def validate_body(self, validation: ValidationConfig, step: int) -> None:
         # one. The loader is temporary, so nothing else holds it open.
         validation_dataloader.close()
 
-    if accumulated_loss is None:
-        raise ValueError(
-            "Validation ran zero batches on this rank. This happens when "
-            "the validation dataset supplies fewer than one batch of "
-            "tokens on this rank, because concat-then-split packing drops "
-            "partially filled batches. Decrease the per-rank batch size or "
-            "use a larger validation dataset."
-        )
-    num_global_valid_tokens = int(total_global_valid_tokens.item())
-    if num_global_valid_tokens == 0:
-        raise ValueError(
-            "Validation ran on zero valid tokens; cannot compute an "
-            "average validation loss. Ensure the validation batches "
-            "contain unmasked labels."
-        )
-    if loss_mesh is not None:
-        global_loss_sum = accumulated_loss.clone()
-        all_reduce(global_loss_sum, group=loss_mesh.get_group())
-    else:
-        global_loss_sum = accumulated_loss
-    global_avg_loss = float(global_loss_sum) / num_global_valid_tokens
-    self.metrics.log_validation(loss=global_avg_loss, step=step)
+    finish_validation(
+        self,
+        num_steps=num_steps,
+        accumulated_loss=accumulated_loss,
+        total_global_valid_tokens=total_global_valid_tokens,
+        loss_mesh=loss_mesh,
+        step=step,
+    )
 
 
 def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
@@ -242,21 +295,8 @@ def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
     """
     require("pipelining_schedule_eval", feature="validation with pipeline parallelism")
 
-    parallel_dims = self.parallel_dims
-    dp_mesh = parallel_dims.get_optional_mesh("dp")
-    loss_sharded = parallel_dims.dp_cp_enabled or parallel_dims.tp_enabled
-    loss_mesh = parallel_dims.get_optional_mesh("loss") if loss_sharded else dp_mesh
-
-    dp_rank, dp_world_size = self.dp_rank_world_size()
-    batch_size_per_rank = self.batch_size_per_rank(dp_world_size)
-    validation_dataloader = build_dataloader(
-        self.cfg,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        num_tokens_per_batch=batch_size_per_rank * self.cfg.max_seq_len,
-        repeat=validation.steps != -1,
-        dataset=validation.dataset,
-    )
+    dp_mesh, loss_mesh = loss_reporting_meshes(self.parallel_dims)
+    validation_dataloader = build_validation_dataloader(self, validation)
 
     accumulated_loss: torch.Tensor | None = None
     total_global_valid_tokens = torch.zeros(
@@ -270,14 +310,7 @@ def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
                 batch = next(data_iterator)
             except (DataloaderExhaustedError, StopIteration):
                 break
-            labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
-            self.metrics.add_tokens(labels.numel())
-            local_valid_tokens = self.count_valid_tokens(batch)
-            global_valid_tokens = torch.tensor(
-                local_valid_tokens, dtype=torch.int64, device=self.device
-            )
-            if dp_mesh is not None:
-                all_reduce(global_valid_tokens, group=dp_mesh.get_group())
+            global_valid_tokens = count_batch_tokens(self, batch, dp_mesh)
 
             arg_mbs: list[tuple[torch.Tensor, ...]] = []
             kwarg_mbs: list[dict] = []
@@ -315,28 +348,13 @@ def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
     finally:
         validation_dataloader.close()
 
-    if num_steps == 0:
-        raise ValueError(
-            "Validation ran zero batches on this rank. This happens when "
-            "the validation dataset supplies fewer than one batch of "
-            "tokens on this rank, because concat-then-split packing drops "
-            "partially filled batches. Decrease the per-rank batch size or "
-            "use a larger validation dataset."
-        )
-    num_global_valid_tokens = int(total_global_valid_tokens.item())
-    if num_global_valid_tokens == 0:
-        raise ValueError(
-            "Validation ran on zero valid tokens; cannot compute an "
-            "average validation loss. Ensure the validation batches "
-            "contain unmasked labels."
-        )
-    if not self.pp_has_last_stage:
-        return
-    assert accumulated_loss is not None
-    if loss_mesh is not None:
-        global_loss_sum = accumulated_loss.clone()
-        all_reduce(global_loss_sum, group=loss_mesh.get_group())
-    else:
-        global_loss_sum = accumulated_loss
-    global_avg_loss = float(global_loss_sum) / num_global_valid_tokens
-    self.metrics.log_validation(loss=global_avg_loss, step=step)
+    finish_validation(
+        self,
+        num_steps=num_steps,
+        accumulated_loss=(
+            accumulated_loss if self.pp_has_last_stage else None
+        ),
+        total_global_valid_tokens=total_global_valid_tokens,
+        loss_mesh=loss_mesh,
+        step=step,
+    )

@@ -61,6 +61,204 @@ from ..utils.logger_utils import get_logger
 logger = get_logger(__name__)
 
 
+def _build_model(self, cfg):
+    """Steps 2-3a: the HF model, its config, and the HF-initial-load decision.
+
+    Returns ``(model, hf_model_config, load_hf_weights)``; the model is on
+    meta device when HF weights will be loaded (they are materialized after
+    parallelism is applied, so the load sees the sharded layout).
+    """
+    #
+    # Chunked loss + PP is rejected up front: under PP the last stage's
+    # loss is computed inside the schedule
+    # (``pipeline_parallel/apply.py:scalar_loss_fn``), which receives logits
+    # from the stage forward. Rewiring that seam for hidden states plus a
+    # per-chunk backward is a PP-side change, so the combination loud-raises
+    # here rather than training on a silently un-chunked (or wrong) loss.
+    self._chunked_loss_num_chunks = cfg.training.chunked_loss_num_chunks
+    if (
+        self._chunked_loss_num_chunks > 1
+        and self.parallel_dims is not None
+        and self.parallel_dims.pp_enabled
+    ):
+        matrix.chunked_loss_pp(
+            self._chunked_loss_num_chunks, self.parallel_dims.pp
+        )
+    hf_model_config = build_model_config_for(cfg)
+    load_hf_weights = bool(
+        cfg.checkpoint.enable
+        and cfg.checkpoint.initial_load_in_hf
+        and cfg.checkpoint.initial_load_path
+    )
+    # EP swap rewrites the expert layout, which the HF checkpoint does not
+    # carry -- refuse loudly instead of loading garbage into the experts.
+    if (
+        load_hf_weights
+        and self.parallel_dims is not None
+        and self.parallel_dims.ep_enabled
+    ):
+        matrix.ep_hf_initial_load(self.parallel_dims.ep)
+    if load_hf_weights:
+        with torch.device("meta"):
+            model = HFTransformerModel(hf_model_config)
+    else:
+        model = HFTransformerModel(hf_model_config).to(self.device)
+    return model, hf_model_config, load_hf_weights
+
+
+def _apply_parallelism(self, cfg, model, load_hf_weights: bool) -> None:
+    """Step 3: apply every parallelism dimension, then materialize.
+
+    Titan's order: tp/pp/cp/ep declared first, fsdp last (outer wraps
+    inner). Each is a no-op when its degree is 1.
+    """
+    # 3. parallelism, in Titan's order: tp/pp/cp/ep declared first, fsdp last
+    #    (outer wraps inner). Each is a no-op when its degree is 1. The
+    #    parallel layer's contract is ParallelConfig plus explicit scalars,
+    #    so the training-side values it needs are unpacked here.
+    orchestration = parallel.parallelize_hf_transformers(
+        model,
+        cfg=cfg.parallel,
+        mesh=self.mesh,
+        parallel_dims=self.parallel_dims,
+        device=self.device,
+        compile=cfg.training.compile,
+        compile_config=cfg.training.compile_config,
+        activation_checkpoint=cfg.training.activation_checkpoint_mode,
+        selective_ac=cfg.training.selective_ac,
+        memory_budget_ac=cfg.training.memory_budget_ac,
+        region_ac=cfg.training.region_ac,
+        global_batch_size=cfg.training.global_batch_size,
+    )
+    if isinstance(orchestration, PipelineParallelSetup):
+        # pp > 1: no single model survives the split -- this rank holds its
+        # stages' chunks only, and the schedule drives them in
+        # ``pp_forward_backward_body``.
+        self.model = None
+        self.model_parts = orchestration.model_parts
+        self.pp_schedule = orchestration.schedule
+        self.pp_has_first_stage = orchestration.has_first_stage
+        self.pp_has_last_stage = orchestration.has_last_stage
+        # The loss exists only on the last stage; every other stage reports
+        # this sentinel, which is finite (the finiteness check runs on every
+        # rank) and never logged (the metrics rank is a last-stage rank).
+        self._pp_loss_sentinel = torch.full((1,), -1.0, device=self.device)
+    else:
+        self.model = orchestration
+        self.model_parts = [orchestration]
+
+    if load_hf_weights:
+        for model_part in self.model_parts:
+            materialize_meta_model(model_part, self.device)
+
+
+def _build_optimizer_stack(self, cfg) -> None:
+    """Optimizer, lr schedule, EMA, and the MoE/aux-loss optimizer pre-hooks."""
+    self.optimizer = OptimizersContainer(
+        cfg.optimizer, model_parts=self.model_parts
+    )
+
+    # The lr schedule. Built regardless of whether the knobs were touched:
+    # the default is warmup_steps=0 with no decay, so the factor is a
+    # constant 1.0 and step 1 runs at exactly ``cfg.lr``. That costs one
+    # multiply per step and removes the branch that would otherwise decide
+    # whether the lr is scheduled -- a branch whose two sides would have to
+    # be kept numerically identical forever.
+    #
+    # Handed the *inner* optimizers, not the container: a LambdaLR reads
+    # ``lr`` off its optimizer's param groups, and the container's own
+    # groups carry none (they are the merged parameter view). This is why
+    # the scheduler is a container too.
+    self.lr_scheduler = build_lr_scheduler(
+        cfg.lr_scheduler_config,
+        optimizers=list(self.optimizer),
+        training_steps=cfg.steps,
+    )
+
+    # The weight EMA, a sibling of the optimizer rather than part of it:
+    # stepped explicitly in ``train_step`` after the real update, and
+    # registered with the checkpointer under its own ``ema`` key. Built
+    # only when configured -- None costs nothing.
+    ema_config = cfg.training.ema
+    self.ema = (
+        EMA(
+            model_parts=self.model_parts,
+            decay=ema_config.decay,
+            half_life_fraction=ema_config.half_life_fraction,
+            start_step=ema_config.start_step,
+            step_bias=ema_config.step_bias,
+            update_every_n_steps=ema_config.update_every_n_steps,
+            buffer_patterns=ema_config.buffer_patterns,
+        )
+        if ema_config is not None
+        else None
+    )
+
+    # Aux losses (the MoE load-balance loss a swapped-in MoE carries)
+    # accumulate per forward; this pre-hook rolls the per-instance sums
+    # into the step registers at each optimizer step. Harmless when no
+    # aux loss exists.
+    #
+    # Registered on the container, so it fires once per step() call --
+    # not once per inner optimizer, which is what a loop over the inner
+    # optimizers would give under pipeline parallelism.
+    register_aux_loss_zero_hook(
+        self.optimizer, self.model_parts, self.parallel_dims
+    )
+    # A second pre-hook on the same container, same granularity. No-op for
+    # a model without MoE layers, which is every model except a swapped-in
+    # one (the swap is what installs ``load_balance_coeff``).
+    register_moe_load_balancing_hook(
+        self.optimizer, self.model_parts, self.parallel_dims
+    )
+    # The quantile counterpart, registered alongside: the two schemes are
+    # mutually exclusive per model, so exactly one of the two hooks ever
+    # fires -- this one no-ops unless the swap installed quantile routers
+    # (``moe_quantile_balancing``).
+    register_moe_quantile_balancing_hook(
+        self.optimizer, self.model_parts, self.parallel_dims
+    )
+
+
+def _build_checkpointer(self, cfg, hf_model_config) -> None:
+    # 5. checkpointing, last because it needs the model and optimizer it is
+    #    going to serialize, and because a checkpoint is meaningless until
+    #    there is something shaped like a training state to save.
+    #
+    #    ``self`` rides along as TRAIN_STATE: the manager saves ``states``
+    #    wholesale, and the step/token counters are not reachable from either
+    #    the model or the optimizer, so a resumed run would otherwise restart
+    #    its schedule from zero with weights that are already trained.
+    #
+    #    A loadable dataloader rides along too: resuming without its read
+    #    position would resume the weights and restart the data, silently
+    #    training a second pass over the beginning of the corpus.
+    #
+    #    The schedule rides along for one integer, ``last_epoch``, that
+    #    nothing else in the checkpoint carries. The optimizer restores its
+    #    ``base_lrs`` -- so the *current* lr comes back right -- but
+    #    ``last_epoch`` is the scheduler's own counter, and a resumed run's
+    #    fresh scheduler starts it at 0. Without it the curve restarts from
+    #    the beginning on the step after a resume: silent whenever warmup
+    #    and decay are both off (the lr is then constant and the mistake
+    #    invisible), and wrong for the rest of the run once either is set.
+    states: dict[str, Any] = {TRAIN_STATE: self}
+    if self.dataloader is not None:
+        states[DATALOADER] = self.dataloader
+    self.checkpointer = CheckpointManager(
+        cfg.checkpoint,
+        model_parts=self.model_parts,
+        optimizer=self.optimizer,
+        lr_scheduler=self.lr_scheduler,
+        ema=self.ema,
+        states=states,
+        folder=cfg.dump_folder,
+        sd_adapter=HFTransformerStateDictAdapter(
+            hf_model_config, cfg.checkpoint.initial_load_path or cfg.hf_model
+        ),
+    )
+
+
 def build_trainer_state(self, cfg) -> None:
     self.cfg = cfg
     if (
@@ -127,186 +325,15 @@ def build_trainer_state(self, cfg) -> None:
         self.mesh = build_mesh(self.parallel_dims)
 
     # 2. the model -- HF's own initialization, wrapped for this loop
-    #
-    # Chunked loss + PP is rejected up front: under PP the last stage's
-    # loss is computed inside the schedule
-    # (``pipeline_parallel/apply.py:scalar_loss_fn``), which receives logits
-    # from the stage forward. Rewiring that seam for hidden states plus a
-    # per-chunk backward is a PP-side change, so the combination loud-raises
-    # here rather than training on a silently un-chunked (or wrong) loss.
-    self._chunked_loss_num_chunks = cfg.training.chunked_loss_num_chunks
-    if (
-        self._chunked_loss_num_chunks > 1
-        and self.parallel_dims is not None
-        and self.parallel_dims.pp_enabled
-    ):
-        matrix.chunked_loss_pp(
-            self._chunked_loss_num_chunks, self.parallel_dims.pp
-        )
-    hf_model_config = build_model_config_for(cfg)
-    load_hf_weights = bool(
-        cfg.checkpoint.enable
-        and cfg.checkpoint.initial_load_in_hf
-        and cfg.checkpoint.initial_load_path
-    )
-    # EP swap rewrites the expert layout, which the HF checkpoint does not
-    # carry -- refuse loudly instead of loading garbage into the experts.
-    if (
-        load_hf_weights
-        and self.parallel_dims is not None
-        and self.parallel_dims.ep_enabled
-    ):
-        matrix.ep_hf_initial_load(self.parallel_dims.ep)
-    if load_hf_weights:
-        with torch.device("meta"):
-            model = HFTransformerModel(hf_model_config)
-    else:
-        model = HFTransformerModel(hf_model_config).to(self.device)
-
-    # 3. parallelism, in Titan's order: tp/pp/cp/ep declared first, fsdp last
-    #    (outer wraps inner). Each is a no-op when its degree is 1. The
-    #    parallel layer's contract is ParallelConfig plus explicit scalars,
-    #    so the training-side values it needs are unpacked here.
-    orchestration = parallel.parallelize_hf_transformers(
-        model,
-        cfg=cfg.parallel,
-        mesh=self.mesh,
-        parallel_dims=self.parallel_dims,
-        device=self.device,
-        compile=cfg.training.compile,
-        compile_config=cfg.training.compile_config,
-        activation_checkpoint=cfg.training.activation_checkpoint_mode,
-        selective_ac=cfg.training.selective_ac,
-        memory_budget_ac=cfg.training.memory_budget_ac,
-        region_ac=cfg.training.region_ac,
-        global_batch_size=cfg.training.global_batch_size,
-    )
-    if isinstance(orchestration, PipelineParallelSetup):
-        # pp > 1: no single model survives the split -- this rank holds its
-        # stages' chunks only, and the schedule drives them in
-        # ``pp_forward_backward_body``.
-        self.model = None
-        self.model_parts = orchestration.model_parts
-        self.pp_schedule = orchestration.schedule
-        self.pp_has_first_stage = orchestration.has_first_stage
-        self.pp_has_last_stage = orchestration.has_last_stage
-        # The loss exists only on the last stage; every other stage reports
-        # this sentinel, which is finite (the finiteness check runs on every
-        # rank) and never logged (the metrics rank is a last-stage rank).
-        self._pp_loss_sentinel = torch.full((1,), -1.0, device=self.device)
-    else:
-        self.model = orchestration
-        self.model_parts = [orchestration]
-
-    if load_hf_weights:
-        for model_part in self.model_parts:
-            materialize_meta_model(model_part, self.device)
-
-    self.optimizer = OptimizersContainer(
-        cfg.optimizer, model_parts=self.model_parts
-    )
-
-    # The lr schedule. Built regardless of whether the knobs were touched:
-    # the default is warmup_steps=0 with no decay, so the factor is a
-    # constant 1.0 and step 1 runs at exactly ``cfg.lr``. That costs one
-    # multiply per step and removes the branch that would otherwise decide
-    # whether the lr is scheduled -- a branch whose two sides would have to
-    # be kept numerically identical forever.
-    #
-    # Handed the *inner* optimizers, not the container: a LambdaLR reads
-    # ``lr`` off its optimizer's param groups, and the container's own
-    # groups carry none (they are the merged parameter view). This is why
-    # the scheduler is a container too.
-    self.lr_scheduler = build_lr_scheduler(
-        cfg.lr_scheduler_config,
-        optimizers=list(self.optimizer),
-        training_steps=cfg.steps,
-    )
-
-    # The weight EMA, a sibling of the optimizer rather than part of it:
-    # stepped explicitly in ``train_step`` after the real update, and
-    # registered with the checkpointer under its own ``ema`` key. Built
-    # only when configured -- None costs nothing.
-    ema_config = cfg.training.ema
-    self.ema = (
-        EMA(
-            model_parts=self.model_parts,
-            decay=ema_config.decay,
-            half_life_fraction=ema_config.half_life_fraction,
-            start_step=ema_config.start_step,
-            step_bias=ema_config.step_bias,
-            update_every_n_steps=ema_config.update_every_n_steps,
-            buffer_patterns=ema_config.buffer_patterns,
-        )
-        if ema_config is not None
-        else None
-    )
-
-    # Aux losses (the MoE load-balance loss a swapped-in MoE carries)
-    # accumulate per forward; this pre-hook rolls the per-instance sums
-    # into the step registers at each optimizer step. Harmless when no
-    # aux loss exists.
-    #
-    # Registered on the container, so it fires once per step() call --
-    # not once per inner optimizer, which is what a loop over the inner
-    # optimizers would give under pipeline parallelism.
-    register_aux_loss_zero_hook(
-        self.optimizer, self.model_parts, self.parallel_dims
-    )
-    # A second pre-hook on the same container, same granularity. No-op for
-    # a model without MoE layers, which is every model except a swapped-in
-    # one (the swap is what installs ``load_balance_coeff``).
-    register_moe_load_balancing_hook(
-        self.optimizer, self.model_parts, self.parallel_dims
-    )
-    # The quantile counterpart, registered alongside: the two schemes are
-    # mutually exclusive per model, so exactly one of the two hooks ever
-    # fires -- this one no-ops unless the swap installed quantile routers
-    # (``moe_quantile_balancing``).
-    register_moe_quantile_balancing_hook(
-        self.optimizer, self.model_parts, self.parallel_dims
-    )
+    model, hf_model_config, load_hf_weights = _build_model(self, cfg)
+    _apply_parallelism(self, cfg, model, load_hf_weights)
+    _build_optimizer_stack(self, cfg)
 
     # 4. the micro-batch source. Built before the checkpointer, which
     #    serializes its read position alongside the model.
     self.dataloader = self.build_dataloader()
 
-    # 5. checkpointing, last because it needs the model and optimizer it is
-    #    going to serialize, and because a checkpoint is meaningless until
-    #    there is something shaped like a training state to save.
-    #
-    #    ``self`` rides along as TRAIN_STATE: the manager saves ``states``
-    #    wholesale, and the step/token counters are not reachable from either
-    #    the model or the optimizer, so a resumed run would otherwise restart
-    #    its schedule from zero with weights that are already trained.
-    #
-    #    A loadable dataloader rides along too: resuming without its read
-    #    position would resume the weights and restart the data, silently
-    #    training a second pass over the beginning of the corpus.
-    #
-    #    The schedule rides along for one integer, ``last_epoch``, that
-    #    nothing else in the checkpoint carries. The optimizer restores its
-    #    ``base_lrs`` -- so the *current* lr comes back right -- but
-    #    ``last_epoch`` is the scheduler's own counter, and a resumed run's
-    #    fresh scheduler starts it at 0. Without it the curve restarts from
-    #    the beginning on the step after a resume: silent whenever warmup
-    #    and decay are both off (the lr is then constant and the mistake
-    #    invisible), and wrong for the rest of the run once either is set.
-    states: dict[str, Any] = {TRAIN_STATE: self}
-    if self.dataloader is not None:
-        states[DATALOADER] = self.dataloader
-    self.checkpointer = CheckpointManager(
-        cfg.checkpoint,
-        model_parts=self.model_parts,
-        optimizer=self.optimizer,
-        lr_scheduler=self.lr_scheduler,
-        ema=self.ema,
-        states=states,
-        folder=cfg.dump_folder,
-        sd_adapter=HFTransformerStateDictAdapter(
-            hf_model_config, cfg.checkpoint.initial_load_path or cfg.hf_model
-        ),
-    )
+    _build_checkpointer(self, cfg, hf_model_config)
 
     # Counters the checkpoint carries. Kept as plain ints so a resumed run
     # can log "step 61 (resumed at 60)" without re-deriving them.
