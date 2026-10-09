@@ -79,58 +79,15 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             num_tokens < self._num_tokens_per_row
             and len(position_parts) < self._max_num_documents_per_row
         ):
-            if self._remainder is None:
-                parent_state = self._parent.get_state()
-                try:
-                    sequence = next(self._parent)
-                except StopIteration:
-                    self._finished = True
-                    break
-                if len(sequence.input_ids) == 0:
-                    continue
-                self._remainder = sequence
-                self._remainder_parent_state = parent_state
-                self._remainder_offset = 0
-
-            sequence = self._remainder
-            assert sequence is not None
-            source_positions = (
-                None if sequence.positions is None else np.asarray(sequence.positions)
-            )
-            segment_end = next_document_chunk_end(
-                num_tokens=len(sequence.input_ids),
-                positions=source_positions,
-                start=self._remainder_offset,
-                max_context_length=self._max_context_length,
-            )
-            available_tokens = self._num_tokens_per_row - num_tokens
-            num_segment_tokens = min(
-                segment_end - self._remainder_offset,
-                available_tokens,
-            )
-
-            token_slice = slice(
-                self._remainder_offset,
-                self._remainder_offset + num_segment_tokens,
-            )
-            input_parts.append(np.asarray(sequence.input_ids[token_slice]))
-            label_parts.append(np.asarray(sequence.labels[token_slice]))
-            position_parts.append(np.arange(num_segment_tokens, dtype=np.int64))
-            # Padding from an upstream packer (e.g. first-fit inside
-            # concat-then-split) must stay marked as padding; only a source
-            # without a mask is treated as all real tokens.
-            source_mask = getattr(sequence, "padding_mask", None)
-            mask_parts.append(
-                np.zeros(num_segment_tokens, dtype=np.bool_)
-                if source_mask is None
-                else np.asarray(source_mask[token_slice], dtype=np.bool_)
-            )
-            num_tokens += num_segment_tokens
-            self._remainder_offset += num_segment_tokens
-            if self._remainder_offset == len(sequence.input_ids):
-                self._remainder = None
-                self._remainder_parent_state = None
-                self._remainder_offset = 0
+            segment = self._take_segment(self._num_tokens_per_row - num_tokens)
+            if segment is None:
+                break
+            input_seg, label_seg, position_seg, mask_seg = segment
+            input_parts.append(input_seg)
+            label_parts.append(label_seg)
+            position_parts.append(position_seg)
+            mask_parts.append(mask_seg)
+            num_tokens += len(input_seg)
 
         if not input_parts:
             raise StopIteration
@@ -154,6 +111,68 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             labels=labels,
             positions=positions,
             padding_mask=padding_mask,
+        )
+
+    def _take_segment(
+        self, available_tokens: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        """Cut the next document-bounded segment off the remainder stream.
+
+        Returns ``(input_ids, labels, positions, padding_mask)`` for the
+        segment, or ``None`` when the parent iterator is exhausted
+        (``self._finished`` set). Empty sequences are skipped internally.
+        """
+        while self._remainder is None:
+            parent_state = self._parent.get_state()
+            try:
+                sequence = next(self._parent)
+            except StopIteration:
+                self._finished = True
+                return None
+            if len(sequence.input_ids) == 0:
+                continue
+            self._remainder = sequence
+            self._remainder_parent_state = parent_state
+            self._remainder_offset = 0
+
+        sequence = self._remainder
+        source_positions = (
+            None if sequence.positions is None else np.asarray(sequence.positions)
+        )
+        segment_end = next_document_chunk_end(
+            num_tokens=len(sequence.input_ids),
+            positions=source_positions,
+            start=self._remainder_offset,
+            max_context_length=self._max_context_length,
+        )
+        num_segment_tokens = min(
+            segment_end - self._remainder_offset,
+            available_tokens,
+        )
+
+        token_slice = slice(
+            self._remainder_offset,
+            self._remainder_offset + num_segment_tokens,
+        )
+        # Padding from an upstream packer (e.g. first-fit inside
+        # concat-then-split) must stay marked as padding; only a source
+        # without a mask is treated as all real tokens.
+        source_mask = getattr(sequence, "padding_mask", None)
+        mask_seg = (
+            np.zeros(num_segment_tokens, dtype=np.bool_)
+            if source_mask is None
+            else np.asarray(source_mask[token_slice], dtype=np.bool_)
+        )
+        self._remainder_offset += num_segment_tokens
+        if self._remainder_offset == len(sequence.input_ids):
+            self._remainder = None
+            self._remainder_parent_state = None
+            self._remainder_offset = 0
+        return (
+            np.asarray(sequence.input_ids[token_slice]),
+            np.asarray(sequence.labels[token_slice]),
+            np.arange(num_segment_tokens, dtype=np.int64),
+            mask_seg,
         )
 
     def get_state(self) -> dict[str, Any]:

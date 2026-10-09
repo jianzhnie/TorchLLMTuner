@@ -27,6 +27,25 @@ from .image import vision_to_patches
 __all__ = ["MultiModalCollator"]
 
 
+def text_positions(text_len: int, offset: int) -> torch.Tensor:
+    """Sequential positions for a text run, identical on all 3 MRoPE axes."""
+    return torch.arange(text_len).view(1, -1).expand(3, -1) + offset
+
+
+def vision_grid_positions(
+    t: int, h: int, w: int, cache: dict[tuple[int, int, int], torch.Tensor]
+) -> torch.Tensor:
+    """The (3, t*h*w) 3D grid coordinates for a vision run, cached by shape."""
+    key = (t, h, w)
+    if key not in cache:
+        hw = h * w
+        t_index = torch.arange(t).view(-1, 1).expand(-1, hw).flatten()
+        h_index = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
+        w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
+        cache[key] = torch.stack([t_index, h_index, w_index])
+    return cache[key]
+
+
 class MultiModalCollator(Collator):
     """Multimodal collator for VLM training.
 
@@ -291,52 +310,31 @@ class MultiModalCollator(Collator):
                     text_len = vision_start - pair_cursor
 
                     pos_id_offset = (
-                        doc_pos_ids_list[-1].max() + 1
-                        if len(doc_pos_ids_list) > 0
+                        int(doc_pos_ids_list[-1].max()) + 1
+                        if doc_pos_ids_list
                         else 0
                     )
                     # [text tokens] -- sequential positions, identical on all 3 axes.
-                    doc_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + pos_id_offset
-                    )
+                    doc_pos_ids_list.append(text_positions(text_len, pos_id_offset))
                     # [vision tokens] -- 3D grid positions (T, H, W).
-                    grid_key = (llm_grid_t, llm_grid_h, llm_grid_w)
-                    if grid_key not in grid_cache:
-                        hw = llm_grid_h * llm_grid_w
-                        t_index = (
-                            torch.arange(llm_grid_t)
-                            .view(-1, 1)
-                            .expand(-1, hw)
-                            .flatten()
-                        )
-                        h_index = (
-                            torch.arange(llm_grid_h)
-                            .view(1, -1, 1)
-                            .expand(llm_grid_t, -1, llm_grid_w)
-                            .flatten()
-                        )
-                        w_index = (
-                            torch.arange(llm_grid_w)
-                            .view(1, 1, -1)
-                            .expand(llm_grid_t, llm_grid_h, -1)
-                            .flatten()
-                        )
-                        grid_cache[grid_key] = torch.stack([t_index, h_index, w_index])
                     doc_pos_ids_list.append(
-                        grid_cache[grid_key] + text_len + pos_id_offset
+                        vision_grid_positions(
+                            llm_grid_t, llm_grid_h, llm_grid_w, grid_cache
+                        )
+                        + text_len
+                        + pos_id_offset
                     )
                     pair_cursor = vision_end
 
                 # Trailing [text tokens] after the last text/vision pair.
                 if pair_cursor < doc_end:
                     pos_id_offset = (
-                        doc_pos_ids_list[-1].max() + 1
-                        if len(doc_pos_ids_list) > 0
+                        int(doc_pos_ids_list[-1].max()) + 1
+                        if doc_pos_ids_list
                         else 0
                     )
-                    text_len = doc_end - pair_cursor
                     doc_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + pos_id_offset
+                        text_positions(doc_end - pair_cursor, pos_id_offset)
                     )
 
                 llm_pos_ids_list.extend(doc_pos_ids_list)
