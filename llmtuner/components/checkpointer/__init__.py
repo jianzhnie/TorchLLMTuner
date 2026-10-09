@@ -16,7 +16,7 @@ Ported from torchtitan's ``components/checkpointer/``. Three layers:
   the third of torchtitan's backends, and installing the package is the only
   step needed to use it.
 
-``utils`` holds ``canonical_fqn``, which strips the activation-checkpoint
+``checkpoint_keys`` also holds ``canonical_fqn``, which strips the activation-checkpoint
 wrapper segment from an FQN.
 
 State keys. A checkpoint is keyed by the top-level names in ``base``: ``model``,
@@ -73,7 +73,7 @@ _EXPORT_SOURCES = {
     "TRAIN_STATE": "checkpoint_keys",
     "AsyncMode": "dcp",
     "CheckpointManager": "dcp",
-    "canonical_fqn": "utils",
+    "canonical_fqn": "checkpoint_keys",
 }
 
 __all__ = export_names(_EXPORT_SOURCES)
