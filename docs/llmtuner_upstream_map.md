@@ -403,11 +403,29 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
 - **审计基线锚点**（详细验证记录在独立审计文件，不在当前工作区）：
   - 最近一次完整人工审计：llmtuner `11002c1` × TorchTitan `b64103072`（2026-09-23）。
   - 后续增量基线：TorchTitan `9e159aed7`（2026-09-26）、`c8a3e7666` 与
-    `f35966713`（2026-09-27）、`c6e71f452`（2026-10-08）；早前基线：llmtuner
-    `528dc9d` × TorchTitan `c6e416bbd`。
-  - 检查后续漂移：`git -C <torchtitan> log c6e71f452..HEAD -- torchtitan/`。
+    `f35966713`（2026-09-27）、`c6e71f452`（2026-10-08）、`c799ae807`
+    （2026-10-09）；早前基线：llmtuner `528dc9d` × TorchTitan `c6e416bbd`。
+  - 检查后续漂移：`git -C <torchtitan> log c799ae807..HEAD -- torchtitan/`。
 - 各轮增量审计落在当前代码里的结论已并入上文 A/B/C/D 表与附录；其中仍以"上游提交
   → 当前处理"形式保留的要点：
+  - `c6e71f452..c799ae807` 漂移（13 提交，2026-10-09 审计）：
+    - **已移植**：`c799ae807`（#4277，torch_checkpointing 原生加载 HF safetensors
+      初始权重）——llmtuner 的 `TorchCheckpointingManager._load_checkpoint` 原先对
+      `from_hf` 显式 raise，现移植上游实现：临时 model-only manager +
+      `HuggingFaceSafetensorsDistributedMetadataFormat` + `to_hf`/`from_hf` 适配器往返，
+      量化 HF 加载保持拒绝；`_is_valid_checkpoint` 改用 `_is_hf_checkpoint` 探测
+      （index 模板或单文件），`_HF_INDEX_FILE_NAME` 常量删除。`fb45f5e87` 的
+      `METADATA_FILE_NAME` 搬迁（→ `metadata_serialization`）以"新位置优先、旧位置
+      回退"移植，同时兼容新旧 torch_checkpointing。本机无 torch_checkpointing 包，
+      两条路径均**未经运行验证**（该 backend 全模块本就处于 faithful-transcription
+      状态，见其模块 docstring）。
+    - **不适用（DeepEP 栈，llmtuner 无）**：`70ad4c997`（DeepEP dispatch 在 AC 重放下
+      行序不确定导致 MoE 梯度静默错误）——llmtuner 的 EP dispatcher 是 all-to-all
+      布局，行序由 rank 拓扑决定、重放逐位一致，无此失效模式；
+      `286578760`/`e7143a98a`/`2154d68a9`（dist_moe runtime/gpt_oss）同属该栈。
+    - **范围外**：`980f83a43`（rl）、`e0fbc7f9b`/`2986cfbac`/`b85920053`/`f4ce10595`
+      （graph_trainer）、`4c7af9b89`（TorchFT）、`08f7c391b`（kimi K3）——llmtuner
+      裁剪面，不跟踪。
   - 上游 `9e159aed7` TP projection 后端重构（#4704）：**语义已对齐，无代码动作**。
     通信角色不变量在 llmtuner 已成立：column 拥有 input collective
     （`ColumnParallelLinear` 融合 all-gather）、row 拥有 output collective

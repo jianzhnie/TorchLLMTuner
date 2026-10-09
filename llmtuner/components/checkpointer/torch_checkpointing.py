@@ -73,9 +73,10 @@ DEFAULT_TORCH_CHECKPOINTING_BARRIER_TCPSTORE_PORT = 43001
 _DEFAULT_BARRIER_INIT_TIMEOUT_SEC = 60
 _DEFAULT_BARRIER_TIMEOUT_SEC = 600
 
-# Index the HF consolidation writes at the root of a final export; the backend
-# names it after the checkpoint item it consolidated.
-_HF_INDEX_FILE_NAME = f"{MODEL}.safetensors.index.json"
+# Sentinel for default_backend_config's ``default`` argument: the plain
+# ItemSpec(requires_copy=False). A sentinel because None is meaningful -- the
+# HF-load manager is built with no default item spec.
+_DEFAULT_ITEM_SPEC = object()
 
 # Logger the backend emits its checkpoint events and metrics on.
 CHECKPOINTING_LOGGER_NAME = "torch_checkpointing"
@@ -112,12 +113,28 @@ def require_torch_checkpointing():
             SyncCheckpointSaverConfig,
         )
         from torch_checkpointing.default_resharder import DefaultResharder
-        from torch_checkpointing.distributed_metadata import (
-            METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,
-        )
+        try:
+            from torch_checkpointing.metadata_serialization import (
+                METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,
+            )
+        except ImportError:
+            # Older torch_checkpointing keeps the name in distributed_metadata.
+            from torch_checkpointing.distributed_metadata import (
+                METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,
+            )
         from torch_checkpointing.hf.consolidation import (
             consolidate_hf_safetensors_checkpoint,
         )
+        try:
+            from torch_checkpointing.hf.metadata import (
+                HF_SAFETENSORS_INDEX_FILE_TEMPLATE,
+                HuggingFaceSafetensorsDistributedMetadataFormat,
+            )
+        except ImportError:
+            # Older torch_checkpointing has no hf.metadata module; the HF-load
+            # path checks for None and reports the feature as unavailable.
+            HF_SAFETENSORS_INDEX_FILE_TEMPLATE = None
+            HuggingFaceSafetensorsDistributedMetadataFormat = None
         from torch_checkpointing.logging_utils import (
             EventLogger,
             checkpoint_logging_context,
@@ -146,6 +163,8 @@ def require_torch_checkpointing():
         DefaultResharder=DefaultResharder,
         METADATA_FILE_NAME=TORCH_CHECKPOINTING_METADATA_FILE_NAME,
         consolidate_hf_safetensors_checkpoint=consolidate_hf_safetensors_checkpoint,
+        HF_SAFETENSORS_INDEX_FILE_TEMPLATE=HF_SAFETENSORS_INDEX_FILE_TEMPLATE,
+        HuggingFaceSafetensorsDistributedMetadataFormat=HuggingFaceSafetensorsDistributedMetadataFormat,
         checkpoint_logging_context=checkpoint_logging_context,
         EventLogger=EventLogger,
         ItemSpec=ItemSpec,
@@ -175,6 +194,8 @@ class BackendConfig:
     DefaultResharder: Any
     METADATA_FILE_NAME: str
     consolidate_hf_safetensors_checkpoint: Any
+    HF_SAFETENSORS_INDEX_FILE_TEMPLATE: Any
+    HuggingFaceSafetensorsDistributedMetadataFormat: Any
     checkpoint_logging_context: Any
     EventLogger: Any
     ItemSpec: Any
@@ -285,6 +306,7 @@ def default_backend_config(
     *,
     storage_config=None,
     items: dict[str, Any] | None = None,
+    default: Any = _DEFAULT_ITEM_SPEC,
     subprocess_init_fn: Callable[..., None] | None = None,
     subprocess_init_args: tuple[Any, ...] = (),
     pre_finalize_callback: Callable[[str, Any], None] | None = None,
@@ -301,9 +323,11 @@ def default_backend_config(
     if isinstance(save_config, backend.AsyncCheckpointSaverConfig):
         subprocess_init_args = (subprocess_init_fn, subprocess_init_args)
         subprocess_init_fn = init_subprocess_logging
+    if default is _DEFAULT_ITEM_SPEC:
+        default = backend.ItemSpec(requires_copy=False)
     return backend.BackendCheckpointManager.Config(
         items=item_specs(backend) if items is None else items,
-        default=backend.ItemSpec(requires_copy=False),
+        default=default,
         save=save_config,
         storage_config=storage_config,
         subprocess_init_fn=subprocess_init_fn,
@@ -426,14 +450,34 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         from_hf: bool,
         from_quantized: bool,
     ) -> None:
-        if from_hf:
+        if from_quantized:
             raise ValueError(
-                "TorchCheckpointingManager does not yet support loading "
-                "Hugging Face checkpoints."
+                "TorchCheckpointingManager does not support loading "
+                "quantized Hugging Face checkpoints."
             )
-        if not self._is_valid_checkpoint(checkpoint_id):
+        if from_hf and self.sd_adapter is None:
             raise ValueError(
-                f"Checkpoint {checkpoint_id!r} is not a native "
+                "checkpoint.initial_load_in_hf is True, but sd_adapter "
+                "is not provided."
+            )
+        hf_metadata_format = (
+            self._backend.HuggingFaceSafetensorsDistributedMetadataFormat
+        )
+        if from_hf and hf_metadata_format is None:
+            raise ValueError(
+                "Loading Hugging Face checkpoints needs a torch_checkpointing "
+                "build with hf.metadata; upgrade torch_checkpointing or use "
+                "the DCP checkpoint manager."
+            )
+
+        is_valid_checkpoint = (
+            self._is_hf_checkpoint(checkpoint_id, MODEL)
+            if from_hf
+            else self._is_resumable_checkpoint(checkpoint_id)
+        )
+        if not is_valid_checkpoint:
+            raise ValueError(
+                f"Checkpoint {checkpoint_id!r} is not a supported "
                 "torch_checkpointing checkpoint."
             )
         # strict: the backend skips by default anything the checkpoint does not
@@ -442,19 +486,57 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # exclude_from_loading is applied by _states_to_load, so anything still
         # in ``states`` here is genuinely required.
         state_dict = self._stateful_to_state_dict(states)
-        loaded = self._manager.load(
-            checkpoint_id,
-            into=state_dict,
-            strict=True,
-        )
-        for key, target in states.items():
-            if self._is_stateful(target):
-                target.load_state_dict(state_dict[key])
-            elif loaded[key] is not target:
-                raise TypeError(
-                    f"Cannot restore non-Stateful checkpoint state {key!r} of type "
-                    f"{type(target).__name__}"
+        if from_hf:
+            assert self.sd_adapter is not None
+            # The export is read through a temporary, model-only manager whose
+            # metadata format names safetensors (an export carries no native
+            # metadata). The item keeps the model's resharder, so every
+            # safetensors source is resharded into the model's DTensors.
+            hf_state = self.sd_adapter.to_hf(state_dict[MODEL])
+            model_spec = self._manager_config.items[MODEL]
+            backend = self._backend
+            hf_config = default_backend_config(
+                backend,
+                sync_save_config(backend, use_barrier=False),
+                storage_config=self._manager_config.storage_config,
+                items={
+                    MODEL: backend.ItemSpec(
+                        requires_copy=model_spec.requires_copy,
+                        layout=model_spec.layout,
+                        resharder=model_spec.resharder,
+                        required=model_spec.required,
+                    )
+                },
+                default=None,
+            )
+            hf_manager = hf_config.build()
+            try:
+                hf_manager.load(
+                    checkpoint_id,
+                    into={MODEL: hf_state},
+                    # Covers only the weights to_hf maps. Parameters an export
+                    # does not carry, such as new LoRA adapters, are not in
+                    # hf_state and keep their initialized values.
+                    strict=True,
+                    metadata_format=hf_metadata_format,
                 )
+            finally:
+                hf_manager.close()
+            states[MODEL].load_state_dict(self.sd_adapter.from_hf(hf_state))
+        else:
+            loaded = self._manager.load(
+                checkpoint_id,
+                into=state_dict,
+                strict=True,
+            )
+            for key, target in states.items():
+                if self._is_stateful(target):
+                    target.load_state_dict(state_dict[key])
+                elif loaded[key] is not target:
+                    raise TypeError(
+                        f"Cannot restore non-Stateful checkpoint state {key!r} of type "
+                        f"{type(target).__name__}"
+                    )
         # Same EMA contract as the DCP backend: if the model was restored but
         # the EMA was excluded, cold-start it from the loaded weights instead
         # of resuming with its construction-time values.
@@ -513,11 +595,21 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         """Whether automatic loading may select ``checkpoint_dir``.
 
         Unlike ``_is_valid_checkpoint``, this excludes final Hugging Face
-        exports: HF loading has not landed in torch_checkpointing, so automatic
-        loading cannot select those exports.
+        exports: an export is loadable (model-only) but carries no optimizer
+        state, so automatic resume must not select it.
         """
         return self._storage.isfile(
             filesystem.join(checkpoint_dir, self._backend.METADATA_FILE_NAME)
+        )
+
+    def _is_hf_checkpoint(self, checkpoint_dir: str, item_key: str) -> bool:
+        """Whether ``checkpoint_dir`` looks like an HF safetensors export."""
+        template = self._backend.HF_SAFETENSORS_INDEX_FILE_TEMPLATE
+        return template is not None and any(
+            self._storage.isfile(
+                filesystem.join(checkpoint_dir, name.format(item_key=item_key))
+            )
+            for name in (template, "{item_key}.safetensors")
         )
 
     def _is_valid_checkpoint(self, checkpoint_dir: str) -> bool:
@@ -533,9 +625,10 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         #                                   +-- model_1.safetensors
         #
         # Without the HF shape, a finished export looks abandoned and retention
-        # deletes it on the next run.
-        return self._is_resumable_checkpoint(checkpoint_dir) or self._storage.isfile(
-            filesystem.join(checkpoint_dir, _HF_INDEX_FILE_NAME)
+        # deletes it on the next run. Exports this checkpointer writes are named
+        # after MODEL.
+        return self._is_resumable_checkpoint(checkpoint_dir) or self._is_hf_checkpoint(
+            checkpoint_dir, MODEL
         )
 
     def _maybe_wait_for_staging(self) -> None:
