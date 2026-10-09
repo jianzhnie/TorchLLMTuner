@@ -40,6 +40,7 @@ from torch.distributed.pipelining.schedules import (
 
 from llmtuner.config import ParallelConfig
 
+from ...accelerator.capabilities import require
 from ...components.loss import cross_entropy_loss
 from ...utils.logger_utils import get_logger
 from .. import matrix
@@ -322,6 +323,14 @@ def apply_pp(
     # the first forward), so refuse at assembly time.
     if getattr(model, "uses_dsa", False):
         matrix.dsa_pp()
+    # The training and eval drivers both need the microbatch-form schedule
+    # API; refuse at assembly time rather than dying with a TypeError on the
+    # first train step (the public ``step`` fallback takes the same kwargs,
+    # so there is no older-torch path to fall back to).
+    require(
+        "pipelining_microbatch_drivers",
+        feature="pipeline-parallel training and validation",
+    )
     parallelism = cfg
     pp_mesh = parallel_dims.get_mesh("pp")
     validate_microbatches(parallel_dims, cfg, global_batch_size)

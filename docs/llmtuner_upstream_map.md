@@ -172,13 +172,14 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 gate/up 两半各自切 dim 1,router 不动）+ `TPMoeSequenceBoundary`（`__class__` swap
 安装块边界 sequence all-gather / reduce-scatter，与 dense TP 同一对偶契约，序列维
 -2)。梯度语义：边界 collective 的注册反向互为对偶；router 权重 Replicate，梯度由
-`_allreduce_replicated_tp_grads` 求和；被切专家参数经块上 `tp_sharded_param_ids`
-从该归约排除。state_dict FQN 不变、tp=1 逐位不变。**tp×ep**：按上游
+`_allreduce_replicated_tp_grads` 求和；被切专家参数经块上 `tp_sharded_param_names`
+（参数名而非对象 id——FSDP 装配会替换 Parameter 对象，冻结 id 会静默失效导致专家
+梯度被错误跨 TP 求和；2026-10-09 审查修复，使用期解析）从该归约排除。state_dict FQN 不变、tp=1 逐位不变。**tp×ep**：按上游
 语义放行——TP 只切 dense,routed 专家由 EP 独占沿专家维 E 切，router Replicate;
 `apply_tp` 在 `cfg.ep > 1` 时跳过 MoE 块扫描/分片/边界安装（块留给 `apply_ep`
 swap,swap 后的原生 MoE 直接消费/产出 T/tp 序列分片，即上游 ep+sp 的
 sequence-parallel 布局，无边界 collective);trainer 的排除判定抽为模块级
-`tp_sharded_param_ids`（三类：dense TP realizer、MoE-under-TP 的 F 分片、EP 的
+`tp_sharded_param_ids`（三类：dense TP realizer、MoE-under-TP 的 F 分片（按名解析）、EP 的
 `GroupedExperts` E 切片；EP 专家梯度按 rank 完备，跨 TP 求和会混不同专家的梯度）。
 组合矩阵终态（config 期校验在各 config `__post_init__`，跨层裁决单一来源 `parallel/matrix.py`）：tp>1×ep>1（cp=1）放行；tp>1×ep>1×cp>1 在
 `ParallelConfig.__post_init__` fail-fast（未验证）;shared-expert 块 ×tp:gate/up/down 布局放行（`shard_shared_expert_for_tp` F 维分片，边界内无 collective；非标准布局如 Qwen2Moe 门控仍 loud-raise)；tp×ep×shared 在 swap `convert_block` 处 loud-raise。MoE 块内部一律排除出 dense realizer 的 targets（避免 shared_experts 投影被再包一层 ColumnParallelLinear/RowParallelLinear 造成 F/tp² 双重切分）;plan 声明 MoE 规格但
@@ -406,6 +407,24 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
     `f35966713`（2026-09-27）、`c6e71f452`（2026-10-08）、`c799ae807`
     （2026-10-09）；早前基线：llmtuner `528dc9d` × TorchTitan `c6e416bbd`。
   - 检查后续漂移：`git -C <torchtitan> log c799ae807..HEAD -- torchtitan/`。
+- 2026-10-09 六维并行复审（TP/CP/EP/PP/FSDP/组合矩阵）落码修复项：
+  - TP：realizer 增加 B>1 输入 loud-raise（rank 序 fold 仅在 B=1 正确）;
+    MoE-under-TP 的梯度排除改按参数名解析（FSDP 替换 Parameter 后 id 失效的
+    静默错误，修复待 torch≥2.12 多卡 tp+moe(ep=1)+fsdp 梯度等价复跑确认）。
+  - EP:aux loss 分母补 `clamp_min(1)`（对齐上游，防全 padding step 注入 inf);
+    swap 探针拒绝非 SiLU 的专家激活（防未来 HF 家族静默换激活）。
+  - PP:metrics rank 的 V 调度判定改为类判定（`is_v_schedule`,DualPipeV 原被漏判，
+    会在默认 log rank 打印 sentinel 垃圾 loss）;`apply_pp` 装配期新增
+    `pipelining_microbatch_drivers` 能力门槛（原训练路径在老 torch 上首个 step 才
+    TypeError);packed（一维）语料 + pp>1 + num_pp_microbatches>1 改为 fail-fast
+    （按 token 硬切会切断文档，正确修法是上游式 per-microbatch 打包，登记为缺口；
+    合成/多模态的行批路径不受影响）。
+  - 组合矩阵：world_size=1 下 tp/pp/cp/ep/dp_replicate>1 由静默忽略改为
+    ConfigError;config 期 `max_seq_len % cp`、`% tp` 两查合并为真实的联合不变量
+    `% (cp*tp)`。
+  - CP:ulysses kernel 新增 packed 标记，Q 切分/缺失 mask 到达 packed 语料时 raise
+    （堵绕过 wrapper 的静默退化）；上游原生模型 kv_allgather backward 的 fp32
+    归约旋钮分歧登记待设备验证（见 CP 行）。
 - 各轮增量审计落在当前代码里的结论已并入上文 A/B/C/D 表与附录；其中仍以"上游提交
   → 当前处理"形式保留的要点：
   - `c6e71f452..c799ae807` 漂移（13 提交，2026-10-09 审计）：

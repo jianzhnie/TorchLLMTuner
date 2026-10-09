@@ -77,6 +77,7 @@ def test_rows_reject_with_their_entry_type() -> None:
         (matrix.quantile_no_group_limit, (_Block(),), "group-limited"),
         (matrix.shared_expert_gate, (_Block(),), "shared_expert_gate"),
         (matrix.shared_expert_tp_ep, (_Block(),), "tp x ep"),
+        (matrix.pp_packed_microbatch_split, (2,), "packed"),
     ]
     assert len(cases) == len(matrix.ENTRIES)
     for fn, args, match in cases:

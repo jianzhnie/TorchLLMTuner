@@ -305,6 +305,25 @@ class LoggerContainer(BaseLogger):
             logger_instance.close()
 
 
+def is_v_schedule(pp_schedule: str) -> bool:
+    """V schedules put the last stage, which computes the loss, on pp rank 0.
+
+    Class-based like upstream (``_is_v_schedule``), not a string check: both
+    ScheduleZBVZeroBubble and ScheduleDualPipeV pair stage 0 with stage N-1 on
+    rank 0, and a string test would miss the second.
+    """
+    from torch.distributed.pipelining.schedules import (
+        ScheduleDualPipeV,
+        ScheduleZBVZeroBubble,
+        get_schedule_class,
+    )
+
+    return get_schedule_class(pp_schedule) in (
+        ScheduleZBVZeroBubble,
+        ScheduleDualPipeV,
+    )
+
+
 def get_metrics_rank(*, parallel_dims: ParallelDims, pp_schedule: str) -> int:
     """The rank whose loss is the reportable one.
 
@@ -314,7 +333,7 @@ def get_metrics_rank(*, parallel_dims: ParallelDims, pp_schedule: str) -> int:
     """
     if not parallel_dims.pp_enabled:
         return 0
-    if pp_schedule == "ZBVZeroBubble":
+    if is_v_schedule(pp_schedule):
         return 0
     # First rank of the last pipeline stage. Ranks are laid out
     # [dp_replicate, dp_shard, cp, tp] within a stage, so this is the first
@@ -339,7 +358,7 @@ def ensure_pp_loss_visible(
     """
     if not parallel_dims.pp_enabled:
         return
-    if pp_schedule == "ZBVZeroBubble":
+    if is_v_schedule(pp_schedule):
         return
 
     loss_visible_rank = get_metrics_rank(

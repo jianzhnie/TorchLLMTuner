@@ -244,9 +244,15 @@ def test_apply_tp_shards_the_block_and_keeps_state_dict_fqns() -> None:
     assert torch.equal(block.gate.weight, router_before)
     # The boundary mixin and the grad-allreduce exclusion marker are installed.
     assert block._tp_seq_group is not None or hasattr(block, "_tp_seq_group")
-    assert block.tp_sharded_param_ids == frozenset(
-        {id(block.experts.gate_up_proj), id(block.experts.down_proj)}
+    assert block.tp_sharded_param_names == frozenset(
+        {"experts.gate_up_proj", "experts.down_proj"}
     )
+    # Names resolve to the CURRENT parameter objects (FSDP replaces them after
+    # apply_tp; the trainer resolves ids at use time for exactly that reason).
+    assert {id(block.get_parameter(n)) for n in block.tp_sharded_param_names} == {
+        id(block.experts.gate_up_proj),
+        id(block.experts.down_proj),
+    }
 
 
 def test_apply_tp_is_idempotent_on_a_moe_block() -> None:
@@ -396,7 +402,7 @@ def test_apply_tp_defers_the_moe_blocks_to_ep_when_ep_is_on() -> None:
     # No F-sharding, no boundary mixin, no exclusion marker.
     assert block.experts.gate_up_proj.shape == (4, 16, 16)
     assert block.experts.down_proj.shape == (4, 16, 8)
-    assert not hasattr(block, "tp_sharded_param_ids")
+    assert not hasattr(block, "tp_sharded_param_names")
     assert "_tp_moe_boundary" not in block.__dict__
     assert not type(block).__name__.startswith("TPMoe")
     for k, v in model.state_dict().items():

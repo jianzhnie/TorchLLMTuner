@@ -125,6 +125,7 @@ from ..models.common.aux_loss import (
     collect_aux_loss_metrics,
 )
 from ..models.common.moe.block import MoE
+from ..parallel import matrix
 from ..parallel.parallel_dims import ParallelDims
 from ..parallel.tensor_parallel.tp import tp_sharded_param_ids
 from ..utils.gc import GarbageCollection
@@ -429,10 +430,13 @@ class Trainer:
     def pp_microbatches(self, batch: Batch | TrainerBatch) -> list[dict[str, Any]]:
         """Split the rank's batch into the schedule's micro-batches.
 
-            Rows are split, never tokens: each micro-batch is collapsed with the
-            same semantics as the non-PP body, so every micro-batch holds whole
-            documents and its loss is the same summed CE. Divisibility is enforced
-            at setup (``apply_pp``), so ``chunk`` never leaves a short final piece.
+            Rows are split, never tokens: row-batched corpora (synthetic rows,
+            multimodal rows) chunk whole rows; a packed flat stream
+            (``raw.ndim == 1``) has no row boundaries and is rejected for
+            num_pp_microbatches > 1 (see matrix.pp_packed_microbatch_split).
+            Each surviving micro-batch's loss is the same summed CE.
+            Divisibility is enforced at setup (``apply_pp``), so ``chunk``
+            never leaves a short final piece.
 
             The split happens here rather than inside ``preprocess_inputs``, which
             is a deliberate divergence from the reference: torchtitan's protocol
@@ -445,6 +449,10 @@ class Trainer:
         raw = batch.labels if isinstance(batch, Batch) else batch["labels"]
         num_microbatches = self.cfg.parallel.num_pp_microbatches
         if isinstance(batch, dict):
+            if raw.ndim == 1 and num_microbatches > 1:
+                # A packed corpus batch is a flat token stream: splitting it
+                # would cut documents at the token level.
+                matrix.pp_packed_microbatch_split(num_microbatches)
             total_rows = raw.shape[0]
             rows_per_mb = total_rows // num_microbatches
             mbs = []
@@ -522,7 +530,7 @@ class Trainer:
             # schedule before either runs, and ``loss_kwargs`` wins when the public
             # path supplies it.
             self.pp_schedule._llmtuner_global_valid_tokens = global_valid_tokens
-            if capability("pipelining_schedule_eval"):
+            if capability("pipelining_microbatch_drivers"):
                 # Signature-level probe (not hasattr): torch 2.9's driver exists
                 # but lacks return_outputs, and its eval() would swallow the
                 # microbatch kwargs.
@@ -568,7 +576,8 @@ class Trainer:
         tokens. No collective inside the TP modules covers them (the fused
         GEMMs reduce only their own sharded weights' gradients), so without
         this all-reduce the copies train on ``1/tp`` of the tokens and drift
-        apart. The sharded weights are identified by ``tp_sharded_param_ids``:
+        apart. The sharded weights are identified by ``tp_sharded_param_ids``
+        (which resolves the blocks' recorded parameter names to current ids):
         the dense TP realizer classes, MoE-under-TP's in-place-sharded expert
         parameters (ep=1), and EP's per-rank expert slices (tp x ep);
         everything else in the model is replicated.
