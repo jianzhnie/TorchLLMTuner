@@ -433,3 +433,198 @@ def test_an_enabled_manager_registers_the_lr_scheduler(monkeypatch) -> None:
             folder="/tmp/unused",
         )
     assert states[LR_SCHEDULER] is sentinel
+
+
+# -- TorchCheckpointingManager HF initial load --------------------------------
+# The backend package is absent here, so these run the manager's logic against
+# fakes: ``__new__`` plus attribute stuffing, the same way the Trainer tests
+# build theirs. What they pin is llmtuner's half of the port -- the guards, the
+# probe, and the adapter round-trip wiring -- not the backend's.
+
+
+class _FakeStorage:
+    def __init__(self, files: set[str]) -> None:
+        self._files = files
+
+    def isfile(self, path: str) -> bool:
+        return path in self._files
+
+
+class _FakeAdapter:
+    def __init__(self) -> None:
+        self.to_hf_calls = 0
+
+    def to_hf(self, state):
+        self.to_hf_calls += 1
+        return {"hf": state}
+
+    def from_hf(self, state):
+        return {"back": state["hf"]}
+
+
+class _RecordingModelState:
+    def __init__(self) -> None:
+        self.loaded = None
+
+    def load_state_dict(self, state) -> None:
+        self.loaded = state
+
+
+_HF_METADATA = object()
+
+
+def _hf_manager_stub(tmp_path, monkeypatch, *, files=(), hf_metadata=_HF_METADATA):
+    import types
+
+    from llmtuner.components.checkpointer import torch_checkpointing as tc
+    from llmtuner.components.checkpointer.checkpoint_keys import MODEL
+
+    calls: dict[str, object] = {}
+    fake_hf_manager = types.SimpleNamespace(
+        load=lambda *a, **kw: calls.update(load_args=a, load_kwargs=kw),
+        close=lambda: calls.update(closed=True),
+    )
+    backend = types.SimpleNamespace(
+        HuggingFaceSafetensorsDistributedMetadataFormat=hf_metadata,
+        HF_SAFETENSORS_INDEX_FILE_TEMPLATE="{item_key}.safetensors.index.json",
+        ItemSpec=lambda **kw: types.SimpleNamespace(**kw),
+        METADATA_FILE_NAME="metadata.pkl",
+    )
+    manager = tc.TorchCheckpointingManager.__new__(tc.TorchCheckpointingManager)
+    manager.sd_adapter = _FakeAdapter()
+    manager._backend = backend
+    manager._storage = _FakeStorage(set(files))
+    manager._manager_config = types.SimpleNamespace(
+        items={MODEL: types.SimpleNamespace(
+            requires_copy=True, layout=None, resharder=None, required=False
+        )},
+        storage_config=None,
+    )
+    manager._manager = types.SimpleNamespace(
+        load=lambda *a, **kw: calls.update(native_load=(a, kw))
+    )
+    monkeypatch.setattr(
+        tc.TorchCheckpointingManager,
+        "_stateful_to_state_dict",
+        staticmethod(lambda states: states),
+    )
+    monkeypatch.setattr(tc, "sync_save_config", lambda backend, **kw: object())
+    monkeypatch.setattr(
+        tc,
+        "default_backend_config",
+        lambda *a, **kw: types.SimpleNamespace(build=lambda: fake_hf_manager),
+    )
+    return manager, calls, MODEL
+
+
+def test_hf_load_rejects_quantized_exports(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    manager, _, MODEL = _hf_manager_stub(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="quantized"):
+        manager._load_checkpoint(
+            {MODEL: object()}, str(tmp_path), from_hf=True, from_quantized=True
+        )
+
+
+def test_hf_load_requires_a_state_dict_adapter(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    manager, _, MODEL = _hf_manager_stub(tmp_path, monkeypatch)
+    manager.sd_adapter = None
+    with pytest.raises(ValueError, match="sd_adapter"):
+        manager._load_checkpoint(
+            {MODEL: object()}, str(tmp_path), from_hf=True, from_quantized=False
+        )
+
+
+def test_hf_load_reports_a_backend_without_hf_metadata(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    manager, _, MODEL = _hf_manager_stub(tmp_path, monkeypatch, hf_metadata=None)
+    with pytest.raises(ValueError, match="hf.metadata"):
+        manager._load_checkpoint(
+            {MODEL: object()}, str(tmp_path), from_hf=True, from_quantized=False
+        )
+
+
+def test_hf_load_rejects_a_directory_with_no_export(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    manager, _, MODEL = _hf_manager_stub(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="not a supported"):
+        manager._load_checkpoint(
+            {MODEL: object()}, str(tmp_path), from_hf=True, from_quantized=False
+        )
+
+
+def test_hf_load_round_trips_through_the_adapter(tmp_path, monkeypatch) -> None:
+    manager, calls, MODEL = _hf_manager_stub(
+        tmp_path,
+        monkeypatch,
+        files={f"{tmp_path}/model.safetensors.index.json"},
+    )
+    model_state = _RecordingModelState()
+    manager._load_checkpoint(
+        {MODEL: model_state}, str(tmp_path), from_hf=True, from_quantized=False
+    )
+
+    assert manager.sd_adapter.to_hf_calls == 1
+    # strict, and the load names the export's safetensors metadata format.
+    assert calls["load_kwargs"]["strict"] is True
+    assert calls["load_kwargs"]["metadata_format"] is (
+        manager._backend.HuggingFaceSafetensorsDistributedMetadataFormat
+    )
+    # The temporary manager is always closed, and the native manager unused.
+    assert calls["closed"] is True
+    assert "native_load" not in calls
+    # from_hf's output lands on the live model state.
+    assert model_state.loaded == {"back": model_state}
+
+
+def test_native_load_restores_stateful_and_rejects_foreign_objects(
+    tmp_path, monkeypatch
+) -> None:
+    import pytest
+    from torch.distributed.checkpoint.stateful import Stateful
+
+    from llmtuner.components.checkpointer import torch_checkpointing as tc
+
+    manager, calls, MODEL = _hf_manager_stub(
+        tmp_path, monkeypatch, files={f"{tmp_path}/metadata.pkl"}
+    )
+    # The real helper maps Stateful -> state_dict(); mirror that so the restore
+    # below reads a plain dict, like production.
+    monkeypatch.setattr(
+        tc.TorchCheckpointingManager,
+        "_stateful_to_state_dict",
+        staticmethod(
+            lambda states: {
+                k: v.state_dict() if isinstance(v, Stateful) else v
+                for k, v in states.items()
+            }
+        ),
+    )
+
+    class _StatefulThing(Stateful):
+        def state_dict(self):
+            return {"w": 1}
+
+        def load_state_dict(self, state) -> None:
+            self.loaded = state
+
+    target = _StatefulThing()
+    manager._load_checkpoint(
+        {MODEL: target}, str(tmp_path), from_hf=False, from_quantized=False
+    )
+    assert target.loaded == {"w": 1}  # restored via load_state_dict
+    assert calls["native_load"][1]["strict"] is True
+
+    # A plain object the backend did not restore in place must fail loudly.
+    manager._manager = type(manager._manager)(
+        load=lambda *a, **kw: {MODEL: object()}
+    )
+    with pytest.raises(TypeError, match="non-Stateful"):
+        manager._load_checkpoint(
+            {MODEL: object()}, str(tmp_path), from_hf=False, from_quantized=False
+        )
