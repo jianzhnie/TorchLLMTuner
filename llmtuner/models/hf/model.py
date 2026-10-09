@@ -449,6 +449,116 @@ class HFTransformerModel(nn.Module):
         if self.rotary_emb is not None:
             yield "rotary_emb", self.rotary_emb
 
+    def _shard_for_cp(
+        self,
+        cp_mesh,
+        *,
+        packed: bool,
+        inputs: torch.Tensor,
+        labels: torch.Tensor,
+        positions: torch.Tensor | None,
+        padding_mask: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Steps 3-4 of ``preprocess_inputs``: mask full-length, then CP-shard.
+
+        Returns ``(inputs, labels, positions, padding_mask, attention_masks)``;
+        the last is ``None`` when no mask was built (CP on but not packed, or
+        the attention backend consumes masks on its own).
+        """
+        if cp_mesh is None:
+            attention_masks = None
+            if positions is not None:
+                mask = self.get_attention_masks(positions=positions)
+                if self.model.config._attn_implementation == _ATTN_IMPLEMENTATION:
+                    attention_masks = mask
+            return inputs, labels, positions, padding_mask, attention_masks
+
+        if positions is None:
+            # The forward's own ``arange`` default would restart at 0 on
+            # every rank; the shard needs positions that describe the whole
+            # sequence.
+            positions = torch.arange(inputs.numel(), device=inputs.device)
+        # A causal-only mask (a single document) can be rebuilt from this
+        # rank's positions shard, which is what ``_get_cp_attention_masks``
+        # does. Packed cannot: ``positions`` is about to be sharded and the
+        # document structure is not recoverable from a shard of it, so the
+        # full-length mask is built first. What happens to it next depends
+        # on the strategy: kv_allgather attends gathered full-length K/V
+        # against local queries, so the mask is Q-sharded to match (the GQA
+        # head count still divides by cp -- sharding Q does not change how
+        # many Q heads a rank owns); ulysses all-to-all's the FULL sequence
+        # onto every rank before attention, so the document mask stays
+        # full-length and unsharded -- the varlen semantics, where the
+        # document structure is global metadata that the token shard must
+        # not cut. Both decisions are config-keyed, hence rank-symmetric.
+        attention_masks = None
+        if packed:
+            attention_masks = self.get_attention_masks(positions=positions)
+            if self._cp_strategy != "ulysses":
+                attention_masks = shard_attention_mask_for_cp(
+                    attention_masks,
+                    cp_mesh,
+                    self._cp_load_balancer,
+                )
+            if self.model.config._attn_implementation != _ATTN_IMPLEMENTATION:
+                attention_masks = None
+        inputs, labels, positions = shard_batch_for_cp(
+            inputs,
+            labels,
+            positions,
+            cp_mesh,
+            load_balancer=self._cp_load_balancer,
+        )
+        if padding_mask is not None:
+            # The mask describes the same token stream, so it takes the
+            # same shard (load-balancer rearrangement included).
+            padding_mask = shard_padding_mask_for_cp(
+                padding_mask, cp_mesh, self._cp_load_balancer
+            )
+        return inputs, labels, positions, padding_mask, attention_masks
+
+    def _shard_for_tp(
+        self,
+        tp_mesh,
+        *,
+        inputs: torch.Tensor,
+        labels: torch.Tensor,
+        positions: torch.Tensor | None,
+        padding_mask: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None
+    ]:
+        """Step 4b of ``preprocess_inputs``: the TP (sequence-parallel) shard.
+
+        Only the token-carrying tensors are cut; positions keep the CP-shard
+        (or, with CP off, full) length because attention and RoPE see the
+        sequence after the in-projection all-gather.
+        """
+        if tp_mesh is None:
+            return inputs, labels, positions, padding_mask
+        # Sequence parallelism premise (step 4b): cut the token-carrying
+        # tensors along the TP axis. Positions are NOT cut -- after the
+        # in-projection all-gather, RoPE and attention see the assembled
+        # sequence, so they keep the CP-shard (or, with CP off, full) length.
+        # Synthesize them full-length when the batch did not carry any: the
+        # forward's own ``arange`` default would be sized to the TP-sharded
+        # input and restart at 0 on every rank.
+        if positions is None:
+            positions = torch.arange(inputs.numel(), device=inputs.device)
+        if padding_mask is not None:
+            # Cut BEFORE the batch tensors: the mask's length still matches
+            # the pre-shard ``inputs``, which is what the divisibility
+            # check must measure.
+            padding_mask = shard_padding_mask_for_tp(padding_mask, tp_mesh)
+        inputs, labels = shard_batch_for_tp(inputs, labels, tp_mesh)
+        return inputs, labels, positions, padding_mask
+
     def preprocess_inputs(
         self,
         input_dict: dict[str, torch.Tensor],
@@ -566,73 +676,29 @@ class HFTransformerModel(nn.Module):
         cp_mesh = (
             None if parallel_dims is None else parallel_dims.get_optional_mesh("cp")
         )
-        if cp_mesh is None and positions is not None:
-            mask = self.get_attention_masks(positions=positions)
-            if self.model.config._attn_implementation == _ATTN_IMPLEMENTATION:
-                extra_kwargs["attention_masks"] = mask
-
-        if cp_mesh is not None:
-            if positions is None:
-                # The forward's own ``arange`` default would restart at 0 on
-                # every rank; the shard needs positions that describe the whole
-                # sequence.
-                positions = torch.arange(inputs.numel(), device=inputs.device)
-            # A causal-only mask (a single document) can be rebuilt from this
-            # rank's positions shard, which is what ``_get_cp_attention_masks``
-            # does. Packed cannot: ``positions`` is about to be sharded and the
-            # document structure is not recoverable from a shard of it, so the
-            # full-length mask is built first. What happens to it next depends
-            # on the strategy: kv_allgather attends gathered full-length K/V
-            # against local queries, so the mask is Q-sharded to match (the GQA
-            # head count still divides by cp -- sharding Q does not change how
-            # many Q heads a rank owns); ulysses all-to-all's the FULL sequence
-            # onto every rank before attention, so the document mask stays
-            # full-length and unsharded -- the varlen semantics, where the
-            # document structure is global metadata that the token shard must
-            # not cut. Both decisions are config-keyed, hence rank-symmetric.
-            if packed:
-                attention_masks = self.get_attention_masks(positions=positions)
-                if self._cp_strategy != "ulysses":
-                    attention_masks = shard_attention_mask_for_cp(
-                        attention_masks,
-                        cp_mesh,
-                        self._cp_load_balancer,
-                    )
-                if self.model.config._attn_implementation == _ATTN_IMPLEMENTATION:
-                    extra_kwargs["attention_masks"] = attention_masks
-            inputs, labels, positions = shard_batch_for_cp(
-                inputs,
-                labels,
-                positions,
+        inputs, labels, positions, padding_mask, attention_masks = (
+            self._shard_for_cp(
                 cp_mesh,
-                load_balancer=self._cp_load_balancer,
+                packed=packed,
+                inputs=inputs,
+                labels=labels,
+                positions=positions,
+                padding_mask=padding_mask,
             )
-            if padding_mask is not None:
-                # The mask describes the same token stream, so it takes the
-                # same shard (load-balancer rearrangement included).
-                padding_mask = shard_padding_mask_for_cp(
-                    padding_mask, cp_mesh, self._cp_load_balancer
-                )
+        )
+        if attention_masks is not None:
+            extra_kwargs["attention_masks"] = attention_masks
 
         tp_mesh = (
             None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
         )
-        if tp_mesh is not None:
-            # Sequence parallelism premise (step 4b above): cut the token-
-            # carrying tensors along the TP axis. Positions are NOT cut --
-            # after the in-projection all-gather, RoPE and attention see the
-            # assembled sequence, so they keep the CP-shard (or, with CP off,
-            # full) length. Synthesize them full-length when the batch did not
-            # carry any: the forward's own ``arange`` default would be sized to
-            # the TP-sharded input and restart at 0 on every rank.
-            if positions is None:
-                positions = torch.arange(inputs.numel(), device=inputs.device)
-            if padding_mask is not None:
-                # Cut BEFORE the batch tensors: the mask's length still matches
-                # the pre-shard ``inputs``, which is what the divisibility
-                # check must measure.
-                padding_mask = shard_padding_mask_for_tp(padding_mask, tp_mesh)
-            inputs, labels = shard_batch_for_tp(inputs, labels, tp_mesh)
+        inputs, labels, positions, padding_mask = self._shard_for_tp(
+            tp_mesh,
+            inputs=inputs,
+            labels=labels,
+            positions=positions,
+            padding_mask=padding_mask,
+        )
 
         if positions is not None:
             extra_kwargs["positions"] = positions

@@ -105,7 +105,7 @@ def apply_fsdp(
         pp_enabled=parallel_dims.pp_enabled,
         cpu_offload=False,
         reshard_after_forward_policy=cfg.fsdp_reshard_after_forward,
-        ep_size=parallel_dims.ep,
+        ep_degree=parallel_dims.ep,
         edp_mesh=edp_mesh,
         symm_mem_scope=(
             cfg.fsdp_symm_mem_scope if cfg.enable_fsdp_symm_mem else None
