@@ -33,7 +33,6 @@ from llmtuner.datasets import (
     IndexedJsonlSource,
     SingleDataset,
     build_dataset,
-    build_source,
 )
 from llmtuner.datasets.multimodal.collator import MultiModalCollator
 from llmtuner.datasets.multimodal.datasets import (
@@ -55,8 +54,10 @@ from llmtuner.datasets.multimodal.text import insert_vision_placeholders
 from llmtuner.datasets.multimodal.video import load_video, process_video
 from tests.data_fixtures import (  # noqa: F401
     VOCAB,
+    Base64JsonlSource,
     make_context,
     make_policy,
+    png_bytes,
     write_tokenizer,
 )
 
@@ -94,25 +95,9 @@ def mm_tokenizer(tmp_path_factory) -> MultiModalTokenizer:
     )
 
 
-def _png_bytes(height: int, width: int) -> bytes:
-    """Encode a real PNG so ``decode_image`` takes its bytes path.
-
-    A real encode/decode round trip rather than a fabricated tensor, so a
-    regression in the decode path (channel order, RGB conversion) fails a test.
-    """
-    import io
-
-    from PIL import Image
-
-    array = np.arange(height * width * 3, dtype=np.uint8).reshape(height, width, 3)
-    buffer = io.BytesIO()
-    Image.fromarray(array, mode="RGB").save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
 @pytest.fixture(scope="module")
 def image_bytes() -> bytes:
-    return _png_bytes(64, 64)
+    return png_bytes(64, 64)
 
 
 MM_KWARGS = dict(
@@ -417,30 +402,6 @@ def test_multimodal_processor_passes_short_samples_through(mm_tokenizer, image_b
     assert "pixel_values" in result
 
 
-class _Base64JsonlSource:
-    """A JSONL source that decodes a base64 ``jpg`` field back to bytes.
-
-    The file holds base64 rather than raw bytes so it stays valid JSON; this
-    unwraps it before the sample processor sees it, which is what a real CC12M
-    reader does with its tar members.
-    """
-
-    def __init__(self, *, patterns):
-        self._patterns = patterns
-
-    def _index(self):
-        return build_source(
-            IndexedJsonlSource(patterns=self._patterns), dataset_iteration_policy=None
-        )
-
-    def __len__(self):
-        return len(self._index())
-
-    def __getitem__(self, index):
-        row = dict(self._index()[index])
-        row["jpg"] = base64.b64decode(row["jpg"]["bytes"])
-        return row
-
 
 def test_multimodal_processor_runs_over_a_jsonl_corpus(
     mm_tokenizer, image_bytes, tmp_path
@@ -463,7 +424,7 @@ def test_multimodal_processor_runs_over_a_jsonl_corpus(
             )
 
     config = SingleDataset(
-        source=_Base64JsonlSource(patterns=(path,)),
+        source=Base64JsonlSource(patterns=(path,)),
         # A class, not a `partial` fixing a different context: `build_map_dataset`
         # calls `processor(context=...)`, and a partial's bound keyword would be
         # silently overridden by that call-site keyword.

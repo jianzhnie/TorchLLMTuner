@@ -8,11 +8,14 @@ import ``test_data_pipeline`` to reach them.
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 from typing import Any
 
 import grain.python as grain
+import numpy as np
 import pytest
 from tokenizers import Tokenizer, models, pre_tokenizers
 
@@ -22,6 +25,7 @@ from llmtuner.datasets import (
     DatasetIterationPolicy,
     IndexedJsonlSource,
     SingleDataset,
+    build_source,
 )
 from llmtuner.datasets.text.processors import TextProcessor
 
@@ -139,8 +143,6 @@ def make_context(
     max_context_length=32,
     max_num_documents=None,
 ):
-    import grain.python as grain
-
     return DatasetBuildContext(
         tokenizer=tokenizer,
         max_context_length=max_context_length,
@@ -196,3 +198,42 @@ def streaming_text_dataset_from_texts(texts: list[str]) -> SingleDataset:
         processor=TextProcessor,
         post_filters=(lambda sample: sample is not None,),
     )
+
+
+def png_bytes(height: int, width: int) -> bytes:
+    """Encode a real PNG so ``decode_image`` takes its bytes path.
+
+    A real encode/decode round trip rather than a fabricated tensor, so a
+    regression in the decode path (channel order, RGB conversion) fails a test.
+    """
+    from PIL import Image
+
+    array = np.arange(height * width * 3, dtype=np.uint8).reshape(height, width, 3)
+    buffer = io.BytesIO()
+    Image.fromarray(array, mode="RGB").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+class Base64JsonlSource:
+    """A JSONL source that decodes a base64 ``jpg`` field back to bytes.
+
+    The file holds base64 rather than raw bytes so it stays valid JSON; this
+    unwraps it before the sample processor sees it, which is what a real CC12M
+    reader does with its tar members.
+    """
+
+    def __init__(self, *, patterns):
+        self._patterns = patterns
+
+    def _index(self):
+        return build_source(
+            IndexedJsonlSource(patterns=self._patterns), dataset_iteration_policy=None
+        )
+
+    def __len__(self):
+        return len(self._index())
+
+    def __getitem__(self, index):
+        row = dict(self._index()[index])
+        row["jpg"] = base64.b64decode(row["jpg"]["bytes"])
+        return row

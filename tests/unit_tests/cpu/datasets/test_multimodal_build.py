@@ -19,7 +19,6 @@ require_env('grain')
 
 
 import base64
-import io
 import json
 import os
 import pathlib
@@ -27,7 +26,6 @@ import subprocess
 import sys
 from functools import partial
 
-import numpy as np
 import pytest
 
 from llmtuner.config import (
@@ -37,13 +35,11 @@ from llmtuner.config import (
     TrainingConfig,
 )
 from llmtuner.datasets import (
-    IndexedJsonlSource,
     SingleDataset,
     build_dataloader,
-    build_source,
 )
 from llmtuner.datasets.text.processors import DATASETS as TEXT_DATASETS
-from tests.data_fixtures import VOCAB, write_tokenizer
+from tests.data_fixtures import VOCAB, Base64JsonlSource, png_bytes, write_tokenizer
 
 IMAGE_TOKEN = "<|image_pad|>"
 VIDEO_TOKEN = "<|video_pad|>"
@@ -90,35 +86,6 @@ def _mm_tokenizer_path(tmp_path) -> str:
     )
 
 
-def _png_bytes(height: int, width: int) -> bytes:
-    from PIL import Image
-
-    array = np.arange(height * width * 3, dtype=np.uint8).reshape(height, width, 3)
-    buffer = io.BytesIO()
-    Image.fromarray(array, mode="RGB").save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-class _Base64JsonlSource:
-    """A JSONL source that decodes a base64 ``jpg`` field back to bytes."""
-
-    def __init__(self, *, patterns):
-        self._patterns = patterns
-
-    def _index(self):
-        return build_source(
-            IndexedJsonlSource(patterns=self._patterns), dataset_iteration_policy=None
-        )
-
-    def __len__(self):
-        return len(self._index())
-
-    def __getitem__(self, index):
-        row = dict(self._index()[index])
-        row["jpg"] = base64.b64decode(row["jpg"]["bytes"])
-        return row
-
-
 def _build(config: DataloaderConfig, *, max_context_length=256, num_tokens=64):
     return build_dataloader(
         LLMTunerConfig(
@@ -147,7 +114,7 @@ def test_build_dataloader_names_a_multimodal_recipe(tmp_path, monkeypatch):
     )
 
     corpus = str(tmp_path / "pairs.jsonl")
-    encoded = base64.b64encode(_png_bytes(64, 64)).decode()
+    encoded = base64.b64encode(png_bytes(64, 64)).decode()
     with open(corpus, "w") as handle:
         for i in range(8):
             handle.write(
@@ -160,7 +127,7 @@ def test_build_dataloader_names_a_multimodal_recipe(tmp_path, monkeypatch):
         MM_DATASETS,
         "cc12m-test",
         SingleDataset(
-            source=_Base64JsonlSource(patterns=(corpus,)),
+            source=Base64JsonlSource(patterns=(corpus,)),
             processor=partial(
                 MultiModalProcessor, sample_processor=process_cc12_wd_sample
             ),
