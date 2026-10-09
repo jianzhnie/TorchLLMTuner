@@ -20,7 +20,6 @@ from colorama import Fore, Style
 
 logger_initialized: dict[str, bool] = {}
 
-
 class ColorfulFormatter(Formatter):
     """Formatter that adds ANSI color codes and rank information to log messages."""
 
@@ -33,15 +32,11 @@ class ColorfulFormatter(Formatter):
     }
 
     def format(self, record: LogRecord) -> str:
-        # Add rank information to the record
         record.rank = get_distributed_rank()
 
-        # Format the log message
         log_message = super().format(record)
 
-        # Add color based on log level
         return self.COLORS.get(record.levelname, "") + log_message + Fore.RESET
-
 
 class MainProcessFilter(logging.Filter):
     """Decide per record, at emit time, whether it reaches the console.
@@ -60,18 +55,15 @@ class MainProcessFilter(logging.Filter):
             or get_distributed_rank() in _LOG_RANKS
         )
 
-
 # The ranks whose regular (below-ERROR) lines reach the console. Settable via
 # ``set_log_ranks`` (wired from ``MetricsConfig.log_ranks``); a module-level
 # explicit API rather than an environment variable.
 _LOG_RANKS: frozenset[int] = frozenset({0})
 
-
 def set_log_ranks(ranks) -> None:
     """Set which ranks print below-ERROR lines (default: rank 0 only)."""
     global _LOG_RANKS
     _LOG_RANKS = frozenset(int(r) for r in ranks)
-
 
 def get_logger(name: str, log_level: int = logging.INFO) -> logging.Logger:
     """Create or retrieve a module logger with a rank-aware stdout handler.
@@ -101,7 +93,6 @@ def get_logger(name: str, log_level: int = logging.INFO) -> logging.Logger:
 
     logger_initialized[name] = True
     return logger
-
 
 def get_distributed_rank() -> int:
     """Return the current distributed rank, falling back to the RANK env var or 0.

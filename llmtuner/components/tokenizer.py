@@ -26,7 +26,6 @@ logger = get_logger(__name__)
 
 __all__ = ["BaseTokenizer", "HuggingFaceTokenizer", "MultiModalTokenizer"]
 
-
 class BaseTokenizer(ABC):
     """Interface every tokenizer in the data pipeline satisfies.
 
@@ -100,7 +99,6 @@ class BaseTokenizer(ABC):
             raise ValueError("No chat template set. Call set_chat_template() first.")
         return self._chat_template.render(messages=messages, **kwargs)
 
-
 class HuggingFaceTokenizer(BaseTokenizer):
     """A tokenizer wrapper that handles BOS/EOS token inference and encoding.
 
@@ -124,16 +122,13 @@ class HuggingFaceTokenizer(BaseTokenizer):
         super().__init__()
         self.tokenizer_path = tokenizer_path
 
-        # Initialize BOS/EOS token attributes (frequently used)
         self.bos_id = None
         self.eos_id = None
         self.bos_token = None
         self.eos_token = None
 
-        # Load the underlying tokenizer
         self.tokenizer = self._load_tokenizer_from_path(tokenizer_path)
 
-        # Load configuration files
         self._hf_config = self._load_config(
             os.path.join(tokenizer_path, "tokenizer_config.json")
         )
@@ -168,11 +163,9 @@ class HuggingFaceTokenizer(BaseTokenizer):
         return None
 
     def _load_tokenizer_from_path(self, tokenizer_path: str) -> Tokenizer:
-        """Load tokenizer from various file formats."""
         if not os.path.exists(tokenizer_path):
             raise FileNotFoundError(f"Tokenizer path '{tokenizer_path}' does not exist")
 
-        # Define paths for different tokenizer file types
         tokenizer_json_path = os.path.join(tokenizer_path, "tokenizer.json")
         vocab_txt_path = os.path.join(tokenizer_path, "vocab.txt")
         vocab_json_path = os.path.join(tokenizer_path, "vocab.json")
@@ -184,7 +177,6 @@ class HuggingFaceTokenizer(BaseTokenizer):
             return Tokenizer.from_file(tokenizer_json_path)
         # Strategy 2: Load from vocab files (with or without merges.txt)
         elif os.path.exists(vocab_json_path) or os.path.exists(vocab_txt_path):
-            # Load vocabulary
             if os.path.exists(vocab_json_path):
                 logger.info("Loading vocabulary from vocab.json")
                 with open(vocab_json_path) as f:
@@ -206,7 +198,6 @@ class HuggingFaceTokenizer(BaseTokenizer):
                 from tokenizers import decoders, pre_tokenizers, processors
                 from tokenizers.models import BPE
 
-                # Load merges from file and convert to tuples
                 merges = []
                 with open(merges_txt_path) as f:
                     for line in f:
@@ -218,7 +209,6 @@ class HuggingFaceTokenizer(BaseTokenizer):
                             if len(parts) >= 2:
                                 merges.append((parts[0], parts[1]))
 
-                # Create BPE model
                 bpe_model = BPE(vocab=vocab, merges=merges)
                 tokenizer = Tokenizer(bpe_model)
 
@@ -284,7 +274,6 @@ class HuggingFaceTokenizer(BaseTokenizer):
         Returns:
             AddedToken object to be added to the tokenizer
         """
-        # Get reference BOS/EOS tokens from config for comparison
         config_bos_token = (
             self._get_token_from_config(self._hf_config, "bos_token")
             if self._hf_config
@@ -296,7 +285,6 @@ class HuggingFaceTokenizer(BaseTokenizer):
             else None
         )
 
-        # Store BOS/EOS tokens as class attributes if they match
         if token_str == config_bos_token:
             self.bos_token = token_str
             self.bos_id = (
@@ -312,7 +300,6 @@ class HuggingFaceTokenizer(BaseTokenizer):
                 else self.tokenizer.token_to_id(token_str)
             )
 
-        # Create AddedToken object based on config format
         if isinstance(token_config, dict):
             if token_config.get("__type") == "AddedToken" or "content" in token_config:
                 # Handle both AddedToken format and added_tokens_decoder format
@@ -373,7 +360,6 @@ class HuggingFaceTokenizer(BaseTokenizer):
                 )
                 added_tokens_to_add.append(added_token)
 
-        # Update the underlying tokenizer with special tokens
         if added_tokens_to_add:
             self.tokenizer.add_special_tokens(added_tokens_to_add)
 
@@ -424,7 +410,6 @@ class HuggingFaceTokenizer(BaseTokenizer):
         Returns:
             list[int]: List of token IDs
         """
-        # Extract arguments
         if len(args) >= 1:
             text = args[0]
         else:
@@ -433,14 +418,11 @@ class HuggingFaceTokenizer(BaseTokenizer):
         add_bos = kwargs.get("add_bos", self.default_add_bos or self.hf_adds_bos)
         add_eos = kwargs.get("add_eos", self.default_add_eos or self.hf_adds_eos)
 
-        # Get base token IDs from the underlying tokenizer
         token_ids = self.tokenizer.encode(text, add_special_tokens=False).ids
 
-        # Add BOS token if requested
         if add_bos and self.bos_id is not None:
             token_ids.insert(0, self.bos_id)
 
-        # Add EOS token if requested
         if add_eos and self.eos_id is not None:
             token_ids.append(self.eos_id)
 
@@ -459,36 +441,15 @@ class HuggingFaceTokenizer(BaseTokenizer):
         Returns:
             str: Decoded text
         """
-        # Extract token_ids from arguments
         if len(args) >= 1:
             token_ids = args[0]
-            # Pass through remaining kwargs
             return self.tokenizer.decode(token_ids, **kwargs)
         else:
             token_ids = kwargs.pop("token_ids", [])
-            # Pass through remaining kwargs after removing token_ids
             return self.tokenizer.decode(token_ids, **kwargs)
 
-    @property
-    def vocab_size(self) -> int:
-        """Get the vocabulary size."""
-        return self.tokenizer.get_vocab_size()
-
-    def get_vocab_size(self) -> int:
-        """Get the vocabulary size."""
-        return self.tokenizer.get_vocab_size()
-
-    def get_vocab(self) -> dict[str, int]:
-        """Get the vocabulary as a dictionary."""
-        return self.tokenizer.get_vocab()
-
     def token_to_id(self, token: str) -> int | None:
-        """Convert token to ID."""
         return self.tokenizer.token_to_id(token)
-
-    def id_to_token(self, token_id: int) -> str | None:
-        """Convert ID to token."""
-        return self.tokenizer.id_to_token(token_id)
 
     def apply_chat_template(
         self, messages: Sequence[Mapping[str, Any]], **kwargs
@@ -507,7 +468,6 @@ class HuggingFaceTokenizer(BaseTokenizer):
         kwargs.setdefault("eos_token", self.eos_token or "")
         kwargs.setdefault("add_generation_prompt", True)
         return super().apply_chat_template(messages, **kwargs)
-
 
 class MultiModalTokenizer(HuggingFaceTokenizer):
     """Single source of truth for multimodal special tokens.

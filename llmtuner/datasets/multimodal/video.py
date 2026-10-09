@@ -19,7 +19,6 @@ logger = get_logger(__name__)
 
 __all__ = ["load_video", "process_video"]
 
-
 def load_video(
     path: str,
     fps: float = 2.0,
@@ -75,7 +74,6 @@ def load_video(
             nframes = max(min_frames, min(nframes, max_frames))
             nframes = min(nframes, total_frames)
 
-            # Compute which frame indices to keep
             indices = set(
                 np.linspace(0, total_frames - 1, nframes).astype(int).tolist()
             )
@@ -97,7 +95,6 @@ def load_video(
     except Exception as e:
         logger.warning(f"Error loading video {path}: {e}")
         return None
-
 
 def process_video(
     video: torch.Tensor,
