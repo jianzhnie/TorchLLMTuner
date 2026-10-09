@@ -44,6 +44,7 @@ usual), no fused QKV (HF keeps q/k/v as separate projections), no FP8.
 from __future__ import annotations
 
 import fnmatch
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -52,6 +53,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from ...accelerator.capabilities import has
+from ...models.common.moe.experts import GroupedExperts
 from .linear import (
     AllGatherLinear,
     LinearReduceScatter,
@@ -567,3 +569,44 @@ def enable_symm_mem(group) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         enable_symm_mem_for_group(group.group_name)
+
+
+def tp_sharded_param_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
+    """Ids of parameters whose gradients must NOT be summed over the TP group.
+
+    Everything not in this set is treated as TP-replicated by
+    ``Trainer._allreduce_replicated_tp_grads`` and summed (each rank's copy
+    earns a token-partial gradient over its T/tp sequence shard). Three kinds
+    of parameters are instead complete on their own rank, and summing them
+    across TP would corrupt them:
+
+    * the dense TP realizers' ``weight`` (``ColumnParallelLinear`` /
+      ``RowParallelLinear`` / ``ColwiseLinearNoGather``) -- each rank owns a
+      feature shard;
+    * MoE-under-TP expert weights (ep=1): stacked parameters on the HF
+      experts module, F-sharded in place by ``apply_tp``, which records their
+      ids on the block as ``tp_sharded_param_ids``;
+    * EP expert weights (tp x ep): ``GroupedExperts``'s ``w1/w3/w2``. Each EP
+      rank owns a different slice of the expert COUNT, and its gradient is
+      complete for those experts (the all-to-all dispatch feeds it every
+      token routed to them); summing across TP would mix gradients of
+      different experts. The MoE block's router weight is deliberately NOT
+      excluded: replicated, its token-partial gradient is summed like any
+      other replicated parameter.
+    """
+    sharded_ids = {
+        id(module.weight)
+        for part in model_parts
+        for module in part.modules()
+        if isinstance(
+            module, ColumnParallelLinear | RowParallelLinear | ColwiseLinearNoGather
+        )
+    }
+    for part in model_parts:
+        for module in part.modules():
+            extra = getattr(module, "tp_sharded_param_ids", None)
+            if extra:
+                sharded_ids.update(extra)
+            if isinstance(module, GroupedExperts):
+                sharded_ids.update(id(p) for p in module.parameters(recurse=False))
+    return sharded_ids

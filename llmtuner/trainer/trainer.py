@@ -125,13 +125,8 @@ from ..models.common.aux_loss import (
     collect_aux_loss_metrics,
 )
 from ..models.common.moe.block import MoE
-from ..models.common.moe.experts import GroupedExperts
 from ..parallel.parallel_dims import ParallelDims
-from ..parallel.tensor_parallel.tp import (
-    ColumnParallelLinear,
-    ColwiseLinearNoGather,
-    RowParallelLinear,
-)
+from ..parallel.tensor_parallel.tp import tp_sharded_param_ids
 from ..utils.gc import GarbageCollection
 from ..utils.logger_utils import get_logger
 from . import batch as batch_mod
@@ -145,46 +140,6 @@ logger = get_logger(__name__)
 
 __all__ = ["Trainer"]
 
-
-def tp_sharded_param_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
-    """Ids of parameters whose gradients must NOT be summed over the TP group.
-
-    Everything not in this set is treated as TP-replicated by
-    ``Trainer._allreduce_replicated_tp_grads`` and summed (each rank's copy
-    earns a token-partial gradient over its T/tp sequence shard). Three kinds
-    of parameters are instead complete on their own rank, and summing them
-    across TP would corrupt them:
-
-    * the dense TP realizers' ``weight`` (``ColumnParallelLinear`` /
-      ``RowParallelLinear`` / ``ColwiseLinearNoGather``) -- each rank owns a
-      feature shard;
-    * MoE-under-TP expert weights (ep=1): stacked parameters on the HF
-      experts module, F-sharded in place by ``apply_tp``, which records their
-      ids on the block as ``tp_sharded_param_ids``;
-    * EP expert weights (tp x ep): ``GroupedExperts``'s ``w1/w3/w2``. Each EP
-      rank owns a different slice of the expert COUNT, and its gradient is
-      complete for those experts (the all-to-all dispatch feeds it every
-      token routed to them); summing across TP would mix gradients of
-      different experts. The MoE block's router weight is deliberately NOT
-      excluded: replicated, its token-partial gradient is summed like any
-      other replicated parameter.
-    """
-    sharded_ids = {
-        id(module.weight)
-        for part in model_parts
-        for module in part.modules()
-        if isinstance(
-            module, ColumnParallelLinear | RowParallelLinear | ColwiseLinearNoGather
-        )
-    }
-    for part in model_parts:
-        for module in part.modules():
-            extra = getattr(module, "tp_sharded_param_ids", None)
-            if extra:
-                sharded_ids.update(extra)
-            if isinstance(module, GroupedExperts):
-                sharded_ids.update(id(p) for p in module.parameters(recurse=False))
-    return sharded_ids
 
 
 class Trainer:
@@ -819,6 +774,60 @@ class Trainer:
         # TP hold token-partial gradients that nothing else reduces.
         self._allreduce_replicated_tp_grads()
 
+        grad_norm = self._clip_and_check_finite(
+            pp_mesh=pp_mesh, loss_mesh=loss_mesh, loss_is_finite=loss_is_finite
+        )
+
+        # Before the optimizer update: a background checkpoint save may still be
+        # staging, and letting it overlap the update would have two writers
+        # touching the model's state dict at once. A no-op when the backend does
+        # not stage.
+        self.checkpointer.maybe_wait_for_staging()
+
+        self.optimizer.step()
+        # After the update, so the lr the optimizer just applied is the one this
+        # schedule produced for the previous step -- which is what makes step 1
+        # run at ``lambda(0)`` rather than ``lambda(1)``. The snapshot taken at
+        # the top of this function is the value handed to the optimizer.
+        self.lr_scheduler.step()
+        if self.ema is not None:
+            # ``self.step`` is the step just optimized, which is what the EMA
+            # schedule's start_step/update_every_n_steps are defined against.
+            self.ema.step(self.step)
+
+        if not should_log:
+            return None
+
+        assert accumulated_loss is not None
+
+        # Summed over tokens, divided by the global count: the loss is then
+        # independent of how the batch was split across DP ranks or across
+        # accumulation groups. Division by a tensor keeps it on device. Above
+        # ``accumulation_steps == 1`` this lands near the per-batch value but
+        # not on it -- the denominator is the whole window's token count while
+        # only part of the window has contributed -- so early steps of a long
+        # accumulation read slightly low. That is the value consistent with the
+        # gradients the optimizer just applied.
+        return self._step_metrics(
+            accumulated_loss=accumulated_loss,
+            global_valid_tokens=global_valid_tokens,
+            local_valid_tokens=local_valid_tokens,
+            local_valid_tokens_tensor=local_valid_tokens_tensor,
+            loss_mesh=loss_mesh,
+            grad_norm=grad_norm,
+            lr_metrics=lr_metrics,
+        )
+
+    def _clip_and_check_finite(
+        self, *, pp_mesh, loss_mesh, loss_is_finite: torch.Tensor
+    ) -> torch.Tensor:
+        """Clip gradients, then fold loss and grad-norm finiteness into one flag.
+
+        The finiteness reductions are entered by EVERY rank -- gating them on
+        a local predicate would hang the peers -- which is why this block runs
+        before the optimizer step and returns only ``grad_norm`` (already
+        world-reduced by ``clip_grad_norm_``).
+        """
         parameters = [p for part in self.model_parts for p in part.parameters()]
         expert_parameters = [
             p
@@ -869,37 +878,24 @@ class Trainer:
         step_is_finite.logical_and_(torch.isfinite(grad_norm).all())
 
         self._check_finite(step_is_finite)
+        return grad_norm
 
-        # Before the optimizer update: a background checkpoint save may still be
-        # staging, and letting it overlap the update would have two writers
-        # touching the model's state dict at once. A no-op when the backend does
-        # not stage.
-        self.checkpointer.maybe_wait_for_staging()
+    def _step_metrics(
+        self,
+        *,
+        accumulated_loss: torch.Tensor,
+        global_valid_tokens: torch.Tensor,
+        local_valid_tokens: int,
+        local_valid_tokens_tensor: torch.Tensor,
+        loss_mesh,
+        grad_norm: torch.Tensor,
+        lr_metrics: dict[str, float],
+    ) -> dict[str, float]:
+        """Assemble the logging step's metrics dict.
 
-        self.optimizer.step()
-        # After the update, so the lr the optimizer just applied is the one this
-        # schedule produced for the previous step -- which is what makes step 1
-        # run at ``lambda(0)`` rather than ``lambda(1)``. The snapshot taken at
-        # the top of this function is the value handed to the optimizer.
-        self.lr_scheduler.step()
-        if self.ema is not None:
-            # ``self.step`` is the step just optimized, which is what the EMA
-            # schedule's start_step/update_every_n_steps are defined against.
-            self.ema.step(self.step)
-
-        if not should_log:
-            return None
-
-        assert accumulated_loss is not None
-
-        # Summed over tokens, divided by the global count: the loss is then
-        # independent of how the batch was split across DP ranks or across
-        # accumulation groups. Division by a tensor keeps it on device. Above
-        # ``accumulation_steps == 1`` this lands near the per-batch value but
-        # not on it -- the denominator is the whole window's token count while
-        # only part of the window has contributed -- so early steps of a long
-        # accumulation read slightly low. That is the value consistent with the
-        # gradients the optimizer just applied.
+        Every collective here is unconditional (see the comment at the loss
+        reduction): ranks enter them regardless of what their own shard saw.
+        """
         loss = accumulated_loss / global_valid_tokens
 
         if loss_mesh is not None:

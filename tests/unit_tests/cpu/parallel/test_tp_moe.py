@@ -414,8 +414,10 @@ def test_swap_refuses_a_shared_expert_block_under_tp_x_ep() -> None:
 
 def test_tp_sharded_param_ids_covers_dense_tp_and_ep_experts_not_router() -> None:
     from llmtuner.models.common.moe.experts import GroupedExperts
-    from llmtuner.parallel.tensor_parallel.tp import ColumnParallelLinear
-    from llmtuner.trainer.trainer import tp_sharded_param_ids
+    from llmtuner.parallel.tensor_parallel.tp import (
+        ColumnParallelLinear,
+        tp_sharded_param_ids,
+    )
 
     grouped = GroupedExperts(dim=8, hidden_dim=4, num_experts=2)
     router = nn.Linear(8, 2, bias=False)

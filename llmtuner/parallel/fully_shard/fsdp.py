@@ -220,7 +220,7 @@ def apply_fsdp_to_decoder(
     pp_enabled: bool,
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
-    ep_size: int = 1,
+    ep_degree: int = 1,
     edp_mesh: DeviceMesh | None = None,
     symm_mem_scope: str | None = None,
 ):
@@ -229,7 +229,7 @@ def apply_fsdp_to_decoder(
 
     Shared by all dense and MoE decoders (llama3, qwen3, deepseek_v3,
     gpt_oss, qwen3_vl, ...). The MoE handling is a strict superset of the dense
-    case: a dense model leaves ``ep_size=1`` / ``edp_mesh=None`` and has no
+    case: a dense model leaves ``ep_degree=1`` / ``edp_mesh=None`` and has no
     ``moe_enabled`` blocks, so every transformer block is sharded as a single
     FSDP unit and the expert-parallel prefetching below is skipped.
 
@@ -248,10 +248,10 @@ def apply_fsdp_to_decoder(
               "smart defaults" for known optimal scenarios.
             - "always" enables ``reshard_after_forward`` for all forward passes.
             - "never" disables ``reshard_after_forward`` for all forward passes.
-        ep_size (int, optional): Expert-parallel degree. Defaults to 1 (no EP),
+        ep_degree (int, optional): Expert-parallel degree. Defaults to 1 (no EP),
             in which case the MoE-specific sharding and prefetching are no-ops.
         edp_mesh (DeviceMesh | None, optional): The FSDP mesh for routed experts
-            when EP > 1. Required (non-None) iff ``ep_size > 1``.
+            when EP > 1. Required (non-None) iff ``ep_degree > 1``.
         symm_mem_scope (str | None): Symmetric-memory scope passed to
             ``enable_fsdp_symm_mem``: ``None`` disables it, ``"all"`` covers
             every FSDP module, ``"dense"`` skips MoE (sparse) blocks.
@@ -336,9 +336,9 @@ def apply_fsdp_to_decoder(
             # both sides compare ``efsdp * ep`` against the same total.
             num_experts = transformer_block.moe.router.num_experts
 
-            if ep_size > 1:
+            if ep_degree > 1:
                 assert edp_mesh is not None
-                efsdp_ep_size = edp_mesh["efsdp"].size() * ep_size
+                efsdp_ep_size = edp_mesh["efsdp"].size() * ep_degree
             else:
                 efsdp_ep_size = fsdp_shard_size(dp_mesh)
 
@@ -347,16 +347,16 @@ def apply_fsdp_to_decoder(
             else:
                 expert_shard_placement = Shard(0)
 
-            # When ep_size == 1 and no Shard(1) override needed, skip
+            # When ep_degree == 1 and no Shard(1) override needed, skip
             # shard_placement_fn entirely for simplicity
-            if ep_size == 1 and expert_shard_placement == Shard(0):
+            if ep_degree == 1 and expert_shard_placement == Shard(0):
                 fully_shard(
                     transformer_block,
                     **fsdp_config,
                     reshard_after_forward=reshard_after_forward,
                 )
-            elif ep_size == 1:
-                # ep_size == 1, but sharding the expert axis would pad, so
+            elif ep_degree == 1:
+                # ep_degree == 1, but sharding the expert axis would pad, so
                 # place the expert weights on their output-feature dim instead.
                 # ``Shard(1)`` is that dim for every packed weight here --
                 # ``w1``/``w3`` are (E, F, D) and ``w2`` is (E, D, F) -- i.e.
@@ -376,7 +376,7 @@ def apply_fsdp_to_decoder(
                     shard_placement_fn=_experts_shard_placement_fn,
                 )
             else:
-                # ep_size > 1: per-param mesh
+                # ep_degree > 1: per-param mesh
                 from torch.distributed.fsdp._fully_shard._fsdp_common import (
                     FSDPMeshInfo,
                     ShardPlacementResult,
@@ -443,7 +443,7 @@ def apply_fsdp_to_decoder(
 
     # NOTE: set up explicit prefetching when EP is enabled, as D2H syncs
     # in EP could interfere with implicit prefetching in FSDP
-    if ep_size == 1:
+    if ep_degree == 1:
         return
 
     # set up explicit prefetching when EP is enabled for forward
