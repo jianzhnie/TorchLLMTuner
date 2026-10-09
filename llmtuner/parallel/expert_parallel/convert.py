@@ -57,6 +57,15 @@ def restore_fp32_state_buffers(module: nn.Module) -> None:
             buffer.data = buffer.data.to(torch.float32)
 
 
+def build_aux_loss(aux_loss_coeff: float | None):
+    """The per-microbatch load-balance loss a router carries, or none."""
+    return (
+        MicrobatchWiseLoadBalanceLoss(coeff=aux_loss_coeff)
+        if aux_loss_coeff
+        else None
+    )
+
+
 def convert_block(
     block: nn.Module,
     *,
@@ -109,11 +118,7 @@ def convert_block(
             top_k,
             route_norm=read_route_norm(block, router_gate),
             route_scale=read_route_scale(block, router_gate),
-            aux_loss=(
-                MicrobatchWiseLoadBalanceLoss(coeff=aux_loss_coeff)
-                if aux_loss_coeff
-                else None
-            ),
+            aux_loss=build_aux_loss(aux_loss_coeff),
         )
         # The quantile update owns expert_bias_E; the sign-based update is
         # off (MoE registers the buffer for a quantile router regardless).
@@ -128,11 +133,7 @@ def convert_block(
             route_scale=read_route_scale(block, router_gate),
             num_expert_groups=num_expert_groups,
             num_limited_groups=num_limited_groups,
-            aux_loss=(
-                MicrobatchWiseLoadBalanceLoss(coeff=aux_loss_coeff)
-                if aux_loss_coeff
-                else None
-            ),
+            aux_loss=build_aux_loss(aux_loss_coeff),
         )
     if token_dispatcher == "torchao":
         # Optional-import adapter: the constructor raises ImportError with an

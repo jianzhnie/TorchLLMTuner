@@ -35,42 +35,16 @@ from .tp import (
 __all__ = ["apply_tp"]
 
 
-def apply_tp(
-    model: nn.Module,
-    mesh: DeviceMesh | None,
-    cfg: ParallelConfig,
-    plan=None,
-) -> nn.Module:
-    """Tensor-parallelize ``model`` in place. No-op when ``tp == 1``.
+def resolve_tp_targets(model: nn.Module, cfg: ParallelConfig, plan):
+    """Validate the TP plan and split its matches into dense and MoE targets.
 
-    ``plan`` defaults to the model's HF ``tp_plan`` (HF ships one for Qwen3,
-    Llama, ...). Pass an explicit ``{path_pattern: ShardingConfig}`` to override
-    it -- e.g. to leave a projection replicated or to use a different realizer.
+    Returns ``(sharding_plan, targets, moe_blocks, moe_deferred_to_ep)`` where
+    ``targets`` are ``(module_path, nn.Linear, ShardingConfig)`` triples and
+    ``moe_blocks`` are the HF MoE blocks to realize in place. A plan that
+    resolves to nothing, or that matches no module, used to leave the model
+    fully replicated while the run reported a healthy TP setup -- both are
+    loud errors here, raised before any process-group access.
     """
-    if mesh is None or cfg.tp <= 1:
-        return model
-
-    # A head count that does not divide ``tp`` has no valid local head split,
-    # and no downstream guard catches it: the projection-level check in
-    # ``shard_weight`` only sees the feature dim, which 8 KV heads at
-    # head_dim=128 (1024 features) satisfy at tp=16. Upstream rejects this at
-    # config parse (upstream torchtitan ``config/validation.py``'s
-    # ``head_shard_degree``); here the
-    # model's own config is the first place the counts exist.
-    require_heads_divisible_by(
-        model,
-        size=cfg.tp,
-        axis="tp",
-        why=(
-            "tensor parallelism shards attention heads across the TP group, so "
-            "each rank must hold a whole number of heads"
-        ),
-    )
-
-    # Validate the plan before touching the mesh: a plan that resolves to
-    # nothing, or that matches no module, used to leave the model fully
-    # replicated while the run reported a healthy TP setup. Both are loud
-    # errors now, and both fire before any process-group access.
     sharding_plan = resolve_plan(model, plan)
     if not sharding_plan:
         raise ValueError(
@@ -140,14 +114,17 @@ def apply_tp(
             "`model.` prefix) rather than training a replicated model by "
             "mistake."
         )
+    return sharding_plan, targets, moe_blocks, moe_deferred_to_ep
 
-    group = mesh["tp"].get_group()
-    tp_size = mesh["tp"].size()
-    tp_rank = mesh["tp"].get_local_rank()
-    use_symm_mem = supports_symm_mem(mesh["tp"])
-    if use_symm_mem:
-        enable_symm_mem(group)
+def realize_moe_blocks_tp(moe_blocks, *, tp_size: int, tp_rank: int, group) -> None:
+    """Shard each HF MoE block's experts and shared expert in place, and give
+    the block the TP sequence-boundary class.
 
+    MoE-block internals never take the dense realizer path: the routed experts
+    are stacked parameters (no nn.Linear to match), and the shared expert is
+    sharded featurewise by ``shard_shared_expert_for_tp``, collective-free
+    inside the sequence boundary.
+    """
     for module_path, block in moe_blocks:
         shared = getattr(block, "shared_expert", None) or getattr(
             block, "shared_experts", None
@@ -180,6 +157,55 @@ def apply_tp(
             (TPMoeSequenceBoundary, type(block)),
             {},
         )
+
+def apply_tp(
+    model: nn.Module,
+    mesh: DeviceMesh | None,
+    cfg: ParallelConfig,
+    plan=None,
+) -> nn.Module:
+    """Tensor-parallelize ``model`` in place. No-op when ``tp == 1``.
+
+    ``plan`` defaults to the model's HF ``tp_plan`` (HF ships one for Qwen3,
+    Llama, ...). Pass an explicit ``{path_pattern: ShardingConfig}`` to override
+    it -- e.g. to leave a projection replicated or to use a different realizer.
+    """
+    if mesh is None or cfg.tp <= 1:
+        return model
+
+    # A head count that does not divide ``tp`` has no valid local head split,
+    # and no downstream guard catches it: the projection-level check in
+    # ``shard_weight`` only sees the feature dim, which 8 KV heads at
+    # head_dim=128 (1024 features) satisfy at tp=16. Upstream rejects this at
+    # config parse (upstream torchtitan ``config/validation.py``'s
+    # ``head_shard_degree``); here the
+    # model's own config is the first place the counts exist.
+    require_heads_divisible_by(
+        model,
+        size=cfg.tp,
+        axis="tp",
+        why=(
+            "tensor parallelism shards attention heads across the TP group, so "
+            "each rank must hold a whole number of heads"
+        ),
+    )
+
+    # Validate the plan before touching the mesh: a plan that resolves to
+    # nothing, or that matches no module, used to leave the model fully
+    # replicated while the run reported a healthy TP setup. Both are loud
+    # errors now, and both fire before any process-group access.
+    sharding_plan, targets, moe_blocks, moe_deferred_to_ep = resolve_tp_targets(
+        model, cfg, plan
+    )
+
+    group = mesh["tp"].get_group()
+    tp_size = mesh["tp"].size()
+    tp_rank = mesh["tp"].get_local_rank()
+    use_symm_mem = supports_symm_mem(mesh["tp"])
+    if use_symm_mem:
+        enable_symm_mem(group)
+
+    realize_moe_blocks_tp(moe_blocks, tp_size=tp_size, tp_rank=tp_rank, group=group)
 
     # Deepest paths first, so replacing a module never hides an inner target.
     attention_parents: dict[str, nn.Module] = {}
