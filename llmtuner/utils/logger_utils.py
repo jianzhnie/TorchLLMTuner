@@ -77,7 +77,7 @@ def get_logger(name: str, log_level: int = logging.INFO) -> logging.Logger:
     """Create or retrieve a module logger with a rank-aware stdout handler.
 
     Below ERROR, only the rank-0 process prints; ERROR and above print on
-    every rank. The decision is made by ``_MainProcessFilter`` at emit time,
+    every rank. The decision is made by ``MainProcessFilter`` at emit time,
     so the logger can be created at module import time, before the process
     group exists. The handler is attached once per ``name``; repeat calls
     return the same logger untouched.

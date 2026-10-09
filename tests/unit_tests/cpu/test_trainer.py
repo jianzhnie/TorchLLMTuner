@@ -58,8 +58,8 @@ from llmtuner.config import (
     ParamGroupConfig,
     TrainingConfig,
 )
+from llmtuner.datasets.loader import DataloaderExhaustedError
 from llmtuner.datasets.random_data import (
-    DataLoaderExhausted,
     RandomTokenDataLoader,
     RandomTokenSource,
     batch_iterator,
@@ -472,9 +472,9 @@ def test_iterator_rejects_an_empty_source() -> None:
     it = batch_iterator([])
     try:
         next(it)
-    except DataLoaderExhausted:
+    except DataloaderExhaustedError:
         return
-    raise AssertionError("an empty source should raise DataLoaderExhausted")
+    raise AssertionError("an empty source should raise DataloaderExhaustedError")
 
 
 # -- checkpointing ------------------------------------------------------------

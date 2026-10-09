@@ -12,7 +12,6 @@ reduces over.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
 
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
@@ -26,34 +25,10 @@ logger = get_logger(__name__)
 
 __all__ = [
     "MESH_AXES",
-    "MeshAxisName",
     "ParallelDims",
     "build_mesh",
     "build_parallel_dims",
 ]
-
-
-class MeshAxisName(StrEnum):
-    """Names for axes of a ``DeviceMesh``.
-
-    Naming convention: throughout torchtitan code, comments, and docstrings
-    we say ``axis`` for a ``DeviceMesh`` axis and ``dim`` for a tensor
-    dimension. This avoids the ambiguity of ``dim`` referring to both.
-
-    Note that PyTorch upstream's ``DeviceMesh`` API still uses the older
-    ``mesh_dim_names`` attribute and ``mesh_dim`` parameter names; we keep
-    those exact spellings when calling into PyTorch APIs (we cannot rename
-    upstream surface), but use ``axis`` for any name we own.
-    """
-
-    DP = "dp"
-    DP_REPLICATE = "dp_replicate"
-    DP_SHARD = "dp_shard"
-    TP = "tp"
-    CP = "cp"
-    PP = "pp"
-    EP = "ep"
-    EFSDP = "efsdp"
 
 
 @dataclass
