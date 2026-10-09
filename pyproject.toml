@@ -61,8 +61,8 @@ dependencies = [
     "einops",
     "torchvision",
     "requests",
-    # Direct import in datasets/ (dataset, packing, text, multimodal) and
-    # accelerator/dist.py -- previously pulled in only transitively.
+    # Direct import in datasets/ (dataset, packing, text, multimodal) --
+    # previously pulled in only transitively.
     "numpy",
 ]
 

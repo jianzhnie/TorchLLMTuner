@@ -25,7 +25,7 @@ from llmtuner.models import common
 def test_every_exported_name_has_a_leaf() -> None:
     """``__all__`` is written out by hand (so linters see the re-exports), which
     means it can drift from the lazy table. This is the pin."""
-    assert set(common.__all__) == set(common._EXPORTS)
+    assert set(common.__all__) == set(common._EXPORT_SOURCES)
     # Case-insensitive, matching how the linter orders the re-exports it reads.
     assert common.__all__ == sorted(common.__all__, key=str.casefold)
 

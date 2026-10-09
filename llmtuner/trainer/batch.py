@@ -20,7 +20,7 @@ import torch
 from ..components.loss import IGNORE_INDEX, next_token_targets
 from ..datasets import build_dataloader as build_dataset_dataloader
 from ..datasets.loader import BaseDataLoader, DataloaderExhaustedError, TrainerBatch
-from ..datasets.random_data import DataLoaderExhausted, RandomTokenDataLoader
+from ..datasets.random_data import RandomTokenDataLoader
 from ..datasets.types import Batch
 
 
@@ -145,10 +145,9 @@ def batch_generator(
         data_load_start = perf_counter()
         try:
             batch = next(data_iterator)
-        except (DataLoaderExhausted, StopIteration) as ex:
-            # Two spellings of one event -- the synthetic source raises its
-            # own type, a real loader just stops -- mapped to the one the
-            # loop catches.
+        except (DataloaderExhaustedError, StopIteration) as ex:
+            # A real loader signals exhaustion by stopping; the loop catches
+            # one type either way.
             raise DataloaderExhaustedError() from ex
         labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
         self.metrics.add_tokens(labels.numel())

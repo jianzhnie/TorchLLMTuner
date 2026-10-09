@@ -4,7 +4,8 @@ Vendored in shape from torchtitan ``trainer.py:batch_generator``, and from the
 ``components/data`` contract it satisfies. What is kept is the *contract*, not
 the data source:
 
-* :class:`DataLoaderExhausted` is raised, not swallowed. Running out of data
+* :class:`~llmtuner.datasets.loader.DataloaderExhaustedError` is raised, not
+  swallowed. Running out of data
   mid-step cancels the whole step rather than training on a partial batch, so
   the training loop can catch it and stop cleanly.
 * The iterator is infinite from the loop's point of view: a finite source is
@@ -24,24 +25,15 @@ from typing import Any
 
 import torch
 
-from .loader import BaseDataLoader, require_same_dp_degree
+from .loader import BaseDataLoader, DataloaderExhaustedError, require_same_dp_degree
 from .types import Batch, require_positive
 
 __all__ = [
     "Batch",
-    "DataLoaderExhausted",
     "RandomTokenDataLoader",
     "RandomTokenSource",
     "batch_iterator",
 ]
-
-
-class DataLoaderExhausted(Exception):
-    """The source ran out of data part-way through an optimizer step.
-
-    Raised by :func:`batch_iterator` so the trainer can abandon the step. Named
-    after torchtitan's ``DataloaderExhaustedError``, minus the redundant suffix.
-    """
 
 
 def batch_iterator(source: Iterable[Batch]) -> Iterator[Batch]:
@@ -58,7 +50,7 @@ def batch_iterator(source: Iterable[Batch]) -> Iterator[Batch]:
             yield batch
         if exhausted:
             # Without this, an empty source would spin here forever.
-            raise DataLoaderExhausted(
+            raise DataloaderExhaustedError(
                 "The data source yielded nothing; there is no batch to train on."
             )
 

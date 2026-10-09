@@ -52,7 +52,7 @@ if TYPE_CHECKING:
     from .rope import ComplexRoPE, CosSinRoPE, RoPE, RoPEConfig
 
 #: Public name -> the leaf module that defines it.
-_EXPORTS = {
+_EXPORT_SOURCES = {
     "ActivationFn": "activation",
     "AuxLoss": "aux_loss",
     "collect_aux_loss_metrics": "aux_loss",
@@ -74,7 +74,7 @@ _EXPORTS = {
     "SwiGLU": "activation",
 }
 
-# Written out (rather than ``sorted(_EXPORTS)``) so that the type-only imports
+# Written out (rather than ``sorted(_EXPORT_SOURCES)``) so that the type-only imports
 # above read as re-exports to linters; a test pins the two lists together.
 __all__ = [
     "ActivationFn",
@@ -100,8 +100,8 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    return resolve_export(__name__, _EXPORTS, name)
+    return resolve_export(__name__, _EXPORT_SOURCES, name)
 
 
 def __dir__() -> list[str]:
-    return export_names(_EXPORTS)
+    return export_names(_EXPORT_SOURCES)

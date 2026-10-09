@@ -20,7 +20,7 @@ from llmtuner.parallel import matrix
 from ..accelerator.collectives import all_reduce
 from ..accelerator.spmd_context import spmd_context
 from ..datasets import build_dataloader
-from ..datasets.random_data import DataLoaderExhausted
+from ..datasets.loader import DataloaderExhaustedError
 from ..datasets.types import Batch
 
 
@@ -153,7 +153,7 @@ def validate_body(self, validation: ValidationConfig, step: int) -> None:
         while validation.steps == -1 or num_steps < validation.steps:
             try:
                 batch = next(data_iterator)
-            except (DataLoaderExhausted, StopIteration):
+            except (DataloaderExhaustedError, StopIteration):
                 break
             labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
             # Throughput accounting only, mirroring ``batch_generator``:
@@ -268,7 +268,7 @@ def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
         while validation.steps == -1 or num_steps < validation.steps:
             try:
                 batch = next(data_iterator)
-            except (DataLoaderExhausted, StopIteration):
+            except (DataloaderExhaustedError, StopIteration):
                 break
             labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
             self.metrics.add_tokens(labels.numel())
