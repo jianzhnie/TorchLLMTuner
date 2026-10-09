@@ -45,6 +45,7 @@ __all__ = [
 
 
 def read_text(sample: dict[str, Any]) -> str:
+    """The default ``text_fn``: read the sample's ``"text"`` field."""
     return sample["text"]
 
 
@@ -193,11 +194,11 @@ class ChatProcessor(SampleProcessor):
     def _tokenize_sample(self, sample: dict[str, Any]) -> TextSequence | None:
         """Tokenize a single-turn sample and mask prompt labels.
 
-        Returns None if the sample exceeds `seq_len`, avoiding
-        training on truncated responses.
+        Returns None if the rendered sample exceeds ``max_context_length``,
+        avoiding training on truncated responses.
 
-        Uses incremental prefix re-tokenization to find the prompt/response
-        token boundary, avoiding BPE merge errors.
+        Uses prefix re-tokenization to find the prompt/response token
+        boundary, avoiding BPE merge errors.
         """
         messages = self._messages_fn(sample)
         self._validate_messages(messages)

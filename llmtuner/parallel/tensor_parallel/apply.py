@@ -54,7 +54,8 @@ def apply_tp(
     # and no downstream guard catches it: the projection-level check in
     # ``shard_weight`` only sees the feature dim, which 8 KV heads at
     # head_dim=128 (1024 features) satisfy at tp=16. Upstream rejects this at
-    # config parse (``head_shard_degree``, config/validation.py); here the
+    # config parse (upstream torchtitan ``config/validation.py``'s
+    # ``head_shard_degree``); here the
     # model's own config is the first place the counts exist.
     require_heads_divisible_by(
         model,

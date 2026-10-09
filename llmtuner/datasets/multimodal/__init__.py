@@ -10,7 +10,7 @@ into install guidance instead of a bare ``ModuleNotFoundError``.
 
 Whether this module imports eagerly is not itself load-bearing: the text path
 never reaches the multimodal package object, so nothing here runs for it either
-way. What the guard in ``tests/unit_tests/cpu/components/data/
+way. What the guard in ``tests/unit_tests/cpu/datasets/
 test_multimodal_build.py`` pins down is the property that matters -- a
 text-only run leaves the media stack out of ``sys.modules`` and installable-free.
 """

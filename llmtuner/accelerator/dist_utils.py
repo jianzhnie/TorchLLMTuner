@@ -1,3 +1,10 @@
+"""Process-group bootstrap and rank/world queries (vendored, de-mmengined).
+
+``init_dist_pytorch`` is the trainer's PG entry point; the slurm/mpi variants
+serve standalone scripts. Rank queries read the environment first (before any
+process group exists) and the live group afterwards.
+"""
+
 # Copyright (c) OpenMMLab. All rights reserved.
 import datetime
 import functools

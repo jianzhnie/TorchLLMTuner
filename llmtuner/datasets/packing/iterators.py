@@ -1,3 +1,10 @@
+"""Grain iterators that splice documents across fixed-length row boundaries.
+
+``DocumentAwareConcatThenSplitIterDataset`` fills rows while capping the number
+of document segments per row, carrying a checkpointable remainder; the flat-map
+transform and ``next_document_chunk_end`` cut documents at context-sized or
+document boundaries.
+"""
 
 from __future__ import annotations
 

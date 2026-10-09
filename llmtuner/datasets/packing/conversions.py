@@ -1,3 +1,7 @@
+"""Conversions between a ``TextSequence`` and the dicts the Grain packers emit.
+
+Pure per-row transforms: no state, no RNG, so both text packers share them.
+"""
 
 from __future__ import annotations
 

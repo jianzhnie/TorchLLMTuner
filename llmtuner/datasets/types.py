@@ -39,7 +39,7 @@ def require_positive(name: str, value: int) -> None:
     between the two entry points for the same value.
     """
     if value <= 0:
-        raise ValueError(f"{name} must be positive")
+        raise ValueError(f"{name} must be positive, got {value}")
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -76,8 +76,9 @@ class DatasetIterationPolicy:
             raise ValueError(
                 f"dp_rank must be in [0, {self.dp_world_size}), got {self.dp_rank}"
             )
-        if self.streaming_shuffle_buffer_size <= 0:
-            raise ValueError("streaming_shuffle_buffer_size must be positive")
+        require_positive(
+            "streaming_shuffle_buffer_size", self.streaming_shuffle_buffer_size
+        )
 
 
 @dataclass

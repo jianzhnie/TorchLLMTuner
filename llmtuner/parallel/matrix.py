@@ -12,7 +12,8 @@ site; the verdict lives here, so the site cannot quietly disagree.
 Config-phase combination checks are NOT here: they live in the owning
 config's ``__post_init__`` (``config/parallel.py``, ``config/training.py``,
 ``config/root.py``), alongside every other field validation. The division of
-labor is documented in docs/torchllmtuner_design.md (support-boundary section).
+labor is documented in docs/torchllmtuner_design.md (§3.3, the
+combination-verdict section).
 
 This is deliberately not a rules engine: plain functions, plus one flat
 table. Field-level validation (sizes, allowed values) is not combination
@@ -353,7 +354,7 @@ ENTRIES: tuple[Row, ...] = (
     Row(quantile_requires_ep, "assembly", UnsupportedCombinationError,
         'parallel/expert_parallel/apply.py::apply_ep'),
     Row(ptrr_load_balancer_backstop, "assembly", UnsupportedCombinationError,
-        'parallel/context_parallel/input_shard.py::_cp_load_balancer'),
+        'parallel/context_parallel/input_shard.py::resolve_load_balancer'),
     Row(gpt_oss_layout, "probe", UnsupportedCombinationError,
         'parallel/expert_parallel/probe.py::fused_experts_of'),
     Row(group_limited_greedy, "probe", UnsupportedCombinationError,

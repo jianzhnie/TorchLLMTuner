@@ -61,7 +61,9 @@ def require_same_dp_degree(saved_dp_world_size: int, dp_world_size: int) -> None
     """
     if saved_dp_world_size != dp_world_size:
         raise ValueError(
-            "cannot resume after changing the effective data-parallel degree"
+            "cannot resume after changing the effective data-parallel degree, "
+            f"checkpoint has dp_world_size={saved_dp_world_size}, "
+            f"current run has dp_world_size={dp_world_size}"
         )
 
 

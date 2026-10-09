@@ -25,28 +25,27 @@ Workflow overview::
     |       masked to ignore_id (-100)                      |
     +-------------------------------------------------------+
             |
-            v  (optional, if a packing step is configured)
+            v  (packing: whole documents, first-fit into bins)
     +-------------------------------------------------------+
     |  Sample Packer                                        |
-    |  Bin-pack short samples into seq_len-token sequences  |
-    |  to reduce padding waste                              |
+    |  Bin-pack short samples into num_tokens_per_batch-    |
+    |  token rows to reduce padding waste                   |
     +-------------------------------------------------------+
             |
-            v  GrainDataLoader batches samples (batch_size)
+            v  GrainDataLoader batches rows (num_tokens_per_batch tokens)
     +-------------------------------------------------------+
     |  Collator  (MultiModalCollator)                       |
     |                                                       |
     |  1. collate_images: for each image Tensor(T,H,W,C),   |
-    |     reshape into patches (num_patches, patch_dim),    |
-    |     pad all images to same num_patches                |
-    |     -> pixel_values: (N, max_patches, patch_dim)      |
+    |     reshape into patches, then concatenate            |
+    |     -> pixel_values: (total_patches, patch_dim)       |
     |     -> grid_thw: (N, 3) per-image [T, H', W'] dims    |
     |     (same for videos)                                 |
     |                                                       |
-    |  2. collate_text: pad text fields to seq_len and      |
-    |     pad to the target batch size                      |
-    |     -> input_ids: (batch_size, seq_len)               |
-    |     -> labels: (batch_size, seq_len)                  |
+    |  2. collate_text: concatenate whole samples and pad   |
+    |     the tail to the token batch                       |
+    |     -> input_ids: (num_tokens_per_batch,)             |
+    |     -> labels: (num_tokens_per_batch,)                |
     +-------------------------------------------------------+
             |
             v
@@ -119,15 +118,27 @@ def process_mm_sample(
         images: List of image bytes with None for text positions
         tokenizer: Tokenizer for text processing
         patch_size: Size of image patches
+        temporal_patch_size: Temporal patch size (frames per temporal patch)
         spatial_merge_size: merge 2D image patches to reduce LLM's sequence length.
             - if 1 (default): no merge, effectively NoOp
             - if 2: 2x2=4 image patches will be reduced to 1 LLM visual token
+        min_pixels: Lower spatial-pixel budget per frame
+        max_pixels: Upper spatial-pixel budget per frame
+        image_mean: Per-channel mean for normalization
+        image_std: Per-channel std for normalization
+        resize_fn: Resize strategy; see ``process_image``
+        max_patches: Pre-padding patch budget (``resize_to_navit_patch_grid``)
+        max_patches_per_side: Pre-padding per-side patch limit
+            (``resize_to_navit_patch_grid``)
 
     Returns:
         Dict with:
             - input_ids: Tensor of token IDs
-            - labels: Tensor of label IDs
+            - labels: Tensor of label IDs, vision placeholders masked out
+            - positions: Tensor of per-token positions
             - pixel_values: List of processed image tensors
+        or None if the sample is unusable (no texts, undecodable images,
+        or fewer than two tokens).
 
     Example:
         Interleaved format:
@@ -349,7 +360,9 @@ class MultiModalProcessor(SampleProcessor):
             processed is not None
             and processed["input_ids"].shape[0] > self._max_context_length
         ):
-            logger.warning(
+            # Routine per-sample filtering, same as ChatProcessor's overflow
+            # drop: debug, not a warning, or every long sample spams the log.
+            logger.debug(
                 f"Sample length {processed['input_ids'].shape[0]} > training "
                 f"max_context_length={self._max_context_length}. Skip"
             )
@@ -406,8 +419,8 @@ def build_mm_sample_packing(
 ) -> grain.IterDataset[dict[str, Any]]:
     """Pack whole multimodal documents into fixed-length rows.
 
-    Lives here rather than in ``packing.py`` beside the text recipes: this node
-    packs media arrays, and naming it from the text module would make the
+    Lives here rather than in ``packing/build.py`` beside the text recipes: this
+    node packs media arrays, and naming it from the text module would make the
     text-only path import all of this.
 
     ``num_packing_bins`` is how many candidate rows are kept open; more bins can

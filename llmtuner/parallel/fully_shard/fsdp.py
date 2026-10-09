@@ -1,3 +1,13 @@
+"""FSDP2 wrapping: ``fully_shard`` applied with llmtuner's mesh conventions.
+
+Dense parameters shard over the dp mesh (cp folded into the shard axis -- CP
+gradients are partial and must be reduced, not replicated); EP expert weights
+shard over the sparse (efsdp) mesh instead. Mixed precision, reshard policy
+and CPU offload are read from the config; the function also decides the
+per-module wrap policy (MoE blocks get the sparse treatment by their
+``moe_enabled`` flag).
+"""
+
 from collections.abc import Iterator
 from typing import Any
 

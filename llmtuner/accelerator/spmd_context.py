@@ -9,9 +9,6 @@ dependency on the parallel layer. The trainer enters ``spmd_context`` once
 per run; every other consumer reads the ambient state through the helpers
 here.
 
-The split also removes a name collision: the old home of this code,
-``llmtuner/parallel/spmd_types.py``, shadowed the PyPI ``spmd_types`` package
-inside the package's own namespace.
 """
 
 from __future__ import annotations
