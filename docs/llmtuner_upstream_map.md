@@ -300,7 +300,7 @@ DTensor unwrap/rewrap 与 CUDA `torch._foreach_lerp_` 专项未移植（llmtuner
 变换，落 `models/common/cast_linear.py`（`nn.Linear` 子类，state-dict FQN 不变），
 经 `ModelConfig.compute_dtype` 启用，默认关闭；router `_debug_force_load_balance`
 ——落 `TokenChoiceTopKRouter` 同名构造参数，round-robin 语义与上游逐字一致；
-PP per-stage seed——`trainer/seed.py` 的 `derive_distinct_seed`（上游
+PP per-stage seed——`trainer/builder.py` 的 `derive_distinct_seed`（上游
 `distinct_seed_mesh_dims=["pp"]` 同公式），trainer 在 `pp_enabled` 时按 stage rank
 偏移，pp=1 逐位不变；DTensor RNG tracker 不移植（初始化走 materialize 路径）。
 
@@ -761,7 +761,7 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 | `collectives.set_pg_timeouts` | 上游 trainer/comm timeout | llmtuner 独立实现，**通过（适配）** |
 | 归约调用（train_step 的 loss/token 归约） | 上游 scattered reductions | 收敛为 `accelerator.dist.all_reduce` 在调用点直接使用（clone + in-place collective），不重建 `dist_sum`/`dist_max`/`dist_sum_tensor` 薄封装；`reduce_equivalence.py` 验证 all_reduce 语义与 clone 调用惯例（trainer 的内联 clone 由 review 保证），**通过** |
 | `clip_grad_norm_` | 上游 distributed grad clipping | llmtuner 额外按本地 expert/dense 参数分组并跨 EP 归约，支持 DP/TP/PP/EP，**通过（适配）**。dense-only 路径与上游逐行同构（含 DTensor 先 `full_tensor()` 再跨 PP 归约的 `p` 次幂技巧），EP 分支免去上游「每个参数都必须是带 `"ep"` 轴的 DTensor」断言；上游的 `dist_sum`/`dist_max`/`dist_mean` 薄封装**不重建**——llmtuner 对应物是 `accelerator/dist.all_reduce` 在调用点（trainer/validator）使用，`components/metrics.py` 不做任何 `torch.distributed` 调用 |
-| 种子与确定性（`Trainer.seed_everything`、`trainer/seed.py`） | `distributed/utils.py::set_determinism` | 含四项确定性开关（`use_deterministic_algorithms`、`cudnn.deterministic/benchmark`、`fill_uninitialized_memory=False`、`CUBLAS_WORKSPACE_CONFIG`）以及 `PYTHONHASHSEED = str(seed % 2**32)`（为之后 spawn 的 dataloader worker）与 `TrainingConfig.detect_anomaly`（`set_detect_anomaly(True, check_nan=False)` + 上游同文告警，`check_nan=False` 因 NaN/Inf 检查走 `aten._is_any_true` 无 DTensor 策略）；PP 的 distinct-seed 派生（`trainer/seed.py`）对应上游同函数公式。不移植两件：DTensor mesh-aware RNG tracker（上游用于分片参数初始化，llmtuner 走 HF 自身初始化）与 `warn_only` 开关（llmtuner 固定 `False`，更严）。**通过（适配）** |
+| 种子与确定性（`Trainer.seed_everything`、`trainer/seed.py`） | `distributed/utils.py::set_determinism` | 含四项确定性开关（`use_deterministic_algorithms`、`cudnn.deterministic/benchmark`、`fill_uninitialized_memory=False`、`CUBLAS_WORKSPACE_CONFIG`）以及 `PYTHONHASHSEED = str(seed % 2**32)`（为之后 spawn 的 dataloader worker）与 `TrainingConfig.detect_anomaly`（`set_detect_anomaly(True, check_nan=False)` + 上游同文告警，`check_nan=False` 因 NaN/Inf 检查走 `aten._is_any_true` 无 DTensor 策略）；PP 的 distinct-seed 派生（`trainer/builder.py`）对应上游同函数公式。不移植两件：DTensor mesh-aware RNG tracker（上游用于分片参数初始化，llmtuner 走 HF 自身初始化）与 `warn_only` 开关（llmtuner 固定 `False`，更严）。**通过（适配）** |
 
 #### 5.2 TP
 
@@ -971,7 +971,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
   padding 契约），解锁条件：CUDA 目标设备装 torchao 复跑。
 - router `_debug_force_load_balance`：**已移植**（`TokenChoiceTopKRouter`
   同名构造参数，round-robin 语义逐字一致，见 §4.3）。
-- PP per-stage seed：**已移植**（`trainer/seed.py::derive_distinct_seed` +
+- PP per-stage seed：**已移植**（`trainer/builder.py::derive_distinct_seed` +
   trainer 接线；DTensor RNG tracker 不移植）。
 - `pipeline_with_first_stage_modules`：**已移植**（`apply_pp` 的
   `first_stage_module_fqns` 参数 + `prepend_first_stage_modules`；
@@ -1076,7 +1076,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `parallel/tensor_parallel/tp.py` + `apply.py` | HF plan realizer 与 `apply_tp` 入口 | B，各模型 TP plan（上游 `distributed/tensor_parallel.py` 于 `7e7f271e0` 删除，后继为 `protocols/sharding.py` + `hf_sharding.py` / `decoder_sharding.py` 的声明面） |
 | `config/`（`model/parallel/optimizer/checkpoint/data/observability/activation_checkpoint/compile/validation/training/root.py` + `cli.py`） | 全部配置 dataclass，逐组 `__post_init__` 校验；`cli.py` 是解析面的视图（`PARSER_GROUPS` + `cli_groups`），把 CLI 载不动的字段摘出 `--help` | B，`config/configs.py` + 嵌套 Config |
 | `trainer/train.py` | parse/main | B，根 `train.py` |
-| `trainer/trainer.py` + `builder.py`（装配段）/ `validate.py` / `pp_steps.py` / `batch.py` / `seed.py` | 完整训练生命周期 | B，根 `trainer.py` + `training_engine.py` |
+| `trainer/trainer.py` + `builder.py`（装配段与播种）/ `validate.py` / `batch.py` | 完整训练生命周期 | B，根 `trainer.py` + `training_engine.py` |
 | `components/checkpointer/checkpoint_keys.py` | checkpoint state key 常量 | C |
 | `accelerator/device.py` | 设备发现、backend 选择、pin-memory 判定、NPU 谓词（`is_npu_available`，`accelerator/dist.py` 在用）；无消费者的 mmengine 厂商谓词面已删 | C |
 | `components/checkpointer/filesystem.py` | path/storage helpers | A1，`tools/filesystem.py` |

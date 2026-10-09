@@ -189,7 +189,7 @@ llmtuner/
                                 --help 之外）+ __init__(全量再导出)
   trainer/      8 模块          trainer.py / train.py / builder.py（装配段，
                                 顺序契约见模块 docstring）/ validate.py /
-                                pp_steps.py / batch.py / seed.py
+                                batch.py
   models/      27 模块          hf/{model,factory,flops,state_dict_adapter}.py（HF 适配：
                                 包装/构造/FLOPs/checkpoint 键）
                                 + common/{rope,activation,linear,feed_forward,

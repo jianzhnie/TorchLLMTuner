@@ -1,4 +1,4 @@
-"""PP per-stage seed derivation (llmtuner.trainer.seed).
+"""PP per-stage seed derivation (llmtuner.trainer.builder).
 
 trainer.py is not importable in a minimal CPU environment, so the derivation
 lives in a dependency-free helper; these tests pin the seed semantics the
@@ -6,9 +6,15 @@ trainer relies on: distinct RNG streams per PP stage, reproducible per stage,
 and bit-identical behavior when pp == 1.
 """
 
+from tests.caps import require_env
+
+# The derivation moved into trainer/builder.py, whose import chain needs the
+# DCP stack.
+require_env("dcp")
+
 import torch
 
-from llmtuner.trainer.seed import derive_distinct_seed
+from llmtuner.trainer.builder import derive_distinct_seed
 
 
 def _rng_snapshot(seed: int) -> torch.Tensor:
