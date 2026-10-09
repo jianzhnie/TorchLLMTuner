@@ -165,14 +165,11 @@ def build_dataloader(
         )
 
     # A name that is neither a text recipe nor ``local_jsonl`` is tried against
-    # the multimodal registry -- resolved before the tokenizer is built, so a
-    # bad name fails fast without loading tokenizer assets.
+    # the multimodal registry.
     is_multimodal = (
         dataset_name not in {"local_jsonl", "local_jsonl_sft"}
         and dataset_name not in DATASETS
     )
-    if is_multimodal:
-        MM_DATASETS, collator, build_packing = multimodal_registry(dataset_name)
 
     # Imported here, not at module scope: building the tokenizer pulls in
     # ``tokenizers``/``jinja2``, and a random-token run should not have to
@@ -180,8 +177,11 @@ def build_dataloader(
     from llmtuner.components.tokenizer import HuggingFaceTokenizer
 
     if is_multimodal:
+        # Resolved before the tokenizer is constructed, so a bad name fails
+        # fast without loading tokenizer assets.
         from llmtuner.components.tokenizer import MultiModalTokenizer
 
+        MM_DATASETS, collator, build_packing = multimodal_registry(dataset_name)
         tokenizer = MultiModalTokenizer(
             tokenizer_path=dataloader_config.tokenizer_path,
             image_token=dataloader_config.mm_image_token,

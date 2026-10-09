@@ -21,6 +21,60 @@ __all__ = ["apply_cp"]
 _ATTN_MODULE_NAMES = ("self_attn", "attn", "attention")
 
 
+def require_ulysses_compatible(model: nn.Module, cfg: ParallelConfig, cp_mesh) -> None:
+    """Reject the ulysses combinations that would train a silently wrong model.
+
+    The all-to-all is an even split of an evenly-sharded tensor, and every
+    rank ends up attending the full sequence in whatever order the shards
+    arrived in -- so a load balancer (which rearranges that order) and a head
+    count that does not divide tp*cp are both configuration errors, raised
+    here rather than discovered from the loss curve.
+    """
+    model_config = getattr(getattr(model, "model", None), "config", None)
+    load_balancer = cfg.context_parallel_load_balancer
+    if load_balancer is not None:
+        raise ValueError(
+            "Ulysses CP requires context_parallel_load_balancer=None: the "
+            "all-to-all is an even split of an evenly-sharded tensor, and "
+            "every rank ends up attending the full sequence in whatever "
+            "order the shards arrived in. A load balancer rearranges the "
+            "sequence into head and tail chunks, so that order is no "
+            "longer the original one and -- unlike the seq_len x seq_len "
+            "causal mask, a function of tokens -- flex only takes a mask "
+            "built over the attended order. The kernel therefore attends "
+            "the rearranged corpus, a permuted model that trains and "
+            "produces plausible numbers with nothing raised. "
+            "strategy='kv_allgather' is what supports this: it gathers the "
+            "rearranged shards back into the very order the mask was "
+            "sharded in, so the rearrangement lands in the mask and cancels."
+        )
+    if getattr(model_config, "attn_mask_type", "causal") == "block_causal":
+        # Packed sequences ARE supported: the all-to-all reassembles the
+        # full token stream on every rank before attention, so the
+        # full-length document mask applies unsharded (upstream's varlen
+        # ulysses semantics). What makes it work is the wrapper passing
+        # that mask FULL-LENGTH rather than Q-sharded -- latched through
+        # ``set_cp_mesh`` below, and consumed in the kernel by mask length.
+        logger.info(
+            "Ulysses CP with packed sequences: the document mask is passed "
+            "full-length (unsharded) to every rank."
+        )
+    # TP shards heads first, so what ulysses must divide evenly is each
+    # rank's local head count -- equivalently, the global count must divide
+    # tp * cp (upstream torchtitan's head_shard_degree in its
+    # config/validation.py).
+    require_heads_divisible_by(
+        model,
+        size=cfg.tp * cp_mesh.size(),
+        axis="tp*cp",
+        why=(
+            f"ulysses splits each TP rank's local heads across the CP group "
+            f"(tp={cfg.tp}, cp={cp_mesh.size()}), so the global count must "
+            "divide tp*cp"
+        ),
+    )
+
+
 def apply_cp(
     model: nn.Module,
     mesh: DeviceMesh | None,
@@ -71,48 +125,7 @@ def apply_cp(
     strategy = cfg.context_parallel_strategy
     load_balancer = cfg.context_parallel_load_balancer
     if strategy == "ulysses":
-        model_config = getattr(getattr(model, "model", None), "config", None)
-        if load_balancer is not None:
-            raise ValueError(
-                "Ulysses CP requires context_parallel_load_balancer=None: the "
-                "all-to-all is an even split of an evenly-sharded tensor, and "
-                "every rank ends up attending the full sequence in whatever "
-                "order the shards arrived in. A load balancer rearranges the "
-                "sequence into head and tail chunks, so that order is no "
-                "longer the original one and -- unlike the seq_len x seq_len "
-                "causal mask, a function of tokens -- flex only takes a mask "
-                "built over the attended order. The kernel therefore attends "
-                "the rearranged corpus, a permuted model that trains and "
-                "produces plausible numbers with nothing raised. "
-                "strategy='kv_allgather' is what supports this: it gathers the "
-                "rearranged shards back into the very order the mask was "
-                "sharded in, so the rearrangement lands in the mask and cancels."
-            )
-        if getattr(model_config, "attn_mask_type", "causal") == "block_causal":
-            # Packed sequences ARE supported: the all-to-all reassembles the
-            # full token stream on every rank before attention, so the
-            # full-length document mask applies unsharded (upstream's varlen
-            # ulysses semantics). What makes it work is the wrapper passing
-            # that mask FULL-LENGTH rather than Q-sharded -- latched through
-            # ``set_cp_mesh`` below, and consumed in the kernel by mask length.
-            logger.info(
-                "Ulysses CP with packed sequences: the document mask is passed "
-                "full-length (unsharded) to every rank."
-            )
-        # TP shards heads first, so what ulysses must divide evenly is each
-        # rank's local head count -- equivalently, the global count must divide
-        # tp * cp (upstream torchtitan's head_shard_degree in its
-        # config/validation.py).
-        require_heads_divisible_by(
-            model,
-            size=cfg.tp * cp_mesh.size(),
-            axis="tp*cp",
-            why=(
-                f"ulysses splits each TP rank's local heads across the CP group "
-                f"(tp={cfg.tp}, cp={cp_mesh.size()}), so the global count must "
-                "divide tp*cp"
-            ),
-        )
+        require_ulysses_compatible(model, cfg, cp_mesh)
 
     layers = getattr(model, "layers", None)
     if layers is None:
