@@ -5,22 +5,23 @@ Members:
 
 * ``device.py`` -- llmtuner's backend-neutral device module (NPU/CUDA/MLU/MUSA
   discovery, distributed-backend selection, per-vendor predicates).
-* ``collectives.py`` -- PG timeouts (``set_pg_timeouts``) and EP-aware
+* ``collectives.py`` -- PG timeouts (``set_pg_timeouts``), the in-place
+  ``all_reduce`` used for loss/token denominators, and EP-aware
   ``clip_grad_norm_``.
 * ``monitoring.py`` -- device memory monitors/snapshots and ``get_peak_flops``.
 * ``spmd_context.py`` -- the ambient SPMD mesh context (TLS mesh stack and
   by-name process-group queries) that trainer and ``models/common`` read.
-* ``dist.py`` + ``dist_utils.py`` -- vendored from OpenMMLab's ``mmengine.dist``,
-  de-mmengine'd to depend only on torch and ``.device``; a standalone toolbox
-  (multi-launcher ``init_dist``, object collectives, ``cast_data_device``).
+* ``dist_utils.py`` -- process-group bootstrap and rank/world queries, vendored
+  from OpenMMLab's ``mmengine.dist`` and de-mmengine'd to depend only on torch
+  and ``.device`` (multi-launcher ``init_dist``, ``cast_data_device``).
 
-The vendored toolbox is re-exported here lazily (PEP 562): importing this
-package or a sibling submodule (``llmtuner.accelerator.device`` ...) does not pay
-for ``dist.py`` unless a toolbox name is actually touched. ``collectives`` /
-``monitoring`` / ``spmd_context`` are imported as submodules -- re-exporting
-them would make ``import llmtuner.accelerator`` pull in the parallel and
-trainer layers and close an import cycle. Topology construction
-(``build_parallel_dims`` / ``build_mesh``) lives with ``ParallelDims`` in
+``dist_utils`` is re-exported here lazily (PEP 562): importing this package or
+a sibling submodule (``llmtuner.accelerator.device`` ...) does not pay for it
+unless a toolbox name is actually touched. ``collectives`` / ``monitoring`` /
+``spmd_context`` are imported as submodules -- re-exporting them would make
+``import llmtuner.accelerator`` pull in the parallel and trainer layers and
+close an import cycle. Topology construction (``build_parallel_dims`` /
+``build_mesh``) lives with ``ParallelDims`` in
 ``llmtuner/parallel/parallel_dims.py``; the trainer bootstraps its PG via
 ``dist_utils.init_dist_pytorch``.
 """
@@ -30,21 +31,6 @@ from __future__ import annotations
 from ..utils.lazy_exports import export_names, resolve_export
 
 _EXPORT_SOURCES = {
-    # dist.py
-    "all_gather": "dist",
-    "all_gather_object": "dist",
-    "all_reduce": "dist",
-    "all_reduce_dict": "dist",
-    "all_reduce_params": "dist",
-    "broadcast": "dist",
-    "broadcast_object_list": "dist",
-    "collect_results": "dist",
-    "collect_results_cpu": "dist",
-    "collect_results_gpu": "dist",
-    "gather": "dist",
-    "gather_object": "dist",
-    "sync_random_seed": "dist",
-    # dist_utils.py
     "barrier": "dist_utils",
     "cast_data_device": "dist_utils",
     "get_backend": "dist_utils",

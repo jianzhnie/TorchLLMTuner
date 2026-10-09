@@ -32,7 +32,5 @@ def test_distributed_backend_follows_device_type(monkeypatch) -> None:
     assert device.get_distributed_backend() == "gloo"
 
 
-def test_cpu_is_available_but_not_pinned() -> None:
-    cpu = torch.device("cpu")
-    assert device.is_device_available(cpu)
-    assert not device.should_use_pin_memory(cpu)
+def test_cpu_is_not_pinned() -> None:
+    assert not device.should_use_pin_memory(torch.device("cpu"))

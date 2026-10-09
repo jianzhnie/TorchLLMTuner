@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from llmtuner.accelerator.dist import all_reduce
+from llmtuner.accelerator.collectives import all_reduce
 
 from .block import MoE, iter_moe_layers
 from .router import QuantileBalancedTopKRouter

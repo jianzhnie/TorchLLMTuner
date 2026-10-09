@@ -1,6 +1,7 @@
-"""Mesh-aware reductions, and gradient-norm clipping that respects them.
+"""Collective operations, and gradient-norm clipping that respects the meshes.
 
-Vendored from torchtitan ``distributed/utils.py``. What changed:
+The reductions and ``clip_grad_norm_`` are vendored from torchtitan
+``distributed/utils.py``. What changed:
 
 * The ``extra_pg`` argument is gone. torchtitan threads an extra process group
   through every reduction to reach ranks a mesh does not model (its odd-sized TP
@@ -13,10 +14,11 @@ Vendored from torchtitan ``distributed/utils.py``. What changed:
   DTensor carrying an explicit ``"ep"`` mesh axis.
 * ``dist_sum`` / ``dist_max`` / ``dist_mean`` / ``dist_sum_tensor`` are not
   re-created. Upstream they are one-line ``funcol.all_reduce`` wrappers naming
-  a reduction and its mesh; llmtuner's counterpart is
-  ``accelerator/dist.all_reduce`` (clone + in-place c10d collective), called at
-  the site. ``trainer/trainer.py`` and ``trainer/validate.py`` reduce their
-  loss/token denominators over ``dp_mesh`` / ``loss_mesh`` there, and
+  a reduction and its mesh; llmtuner's counterpart is this module's
+  ``all_reduce`` (cast to the comm device + in-place c10d collective, vendored
+  from mmengine's ``dist.all_reduce``), called at the site.
+  ``trainer/trainer.py`` and ``trainer/validate.py`` reduce their loss/token
+  denominators over ``dp_mesh`` / ``loss_mesh`` with it, and
   ``components/metrics.py`` reduces nothing at all (see its docstring), so
   there is no caller that would read better with a named helper. This also
   covers upstream's ``all_gather_entries`` and friends, which exist for
@@ -38,10 +40,18 @@ from torch.distributed.tensor import DTensor
 
 from ..utils.logger_utils import get_logger
 from .device import device_module
+from .dist_utils import (
+    cast_data_device,
+    get_comm_device,
+    get_data_device,
+    get_default_group,
+    get_world_size,
+)
 
 logger = get_logger(__name__)
 
 __all__ = [
+    "all_reduce",
     "clip_grad_norm_",
     "set_pg_timeouts",
 ]
@@ -233,3 +243,49 @@ def clip_grad_norm_(
     if max_norm > 0:
         torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
     return total_norm
+
+
+_REDUCE_OPS = {
+    "sum": dist.ReduceOp.SUM,
+    "product": dist.ReduceOp.PRODUCT,
+    "min": dist.ReduceOp.MIN,
+    "max": dist.ReduceOp.MAX,
+    "band": dist.ReduceOp.BAND,
+    "bor": dist.ReduceOp.BOR,
+    "bxor": dist.ReduceOp.BXOR,
+}
+
+
+def all_reduce(
+    data: torch.Tensor, op: str = "sum", group: dist.ProcessGroup | None = None
+) -> None:
+    """In-place all-reduce; a no-op outside a distributed environment.
+
+    Vendored from mmengine's ``dist.all_reduce``. Unlike the raw c10d call it
+    casts the tensor to the group's comm device first and copies the result
+    back, so a CPU tensor reduces correctly over an NCCL/HCCL group (the
+    trainer's loss/token denominators are CPU scalars). ``op="mean"`` is
+    emulated as sum + divide because c10d has no mean reduction.
+    """
+    world_size = get_world_size(group)
+    if world_size <= 1:
+        return
+    if group is None:
+        group = get_default_group()
+
+    input_device = get_data_device(data)
+    backend_device = get_comm_device(group)
+    data_on_device = cast_data_device(data, backend_device)
+
+    if op.lower() == "mean":
+        dist.all_reduce(data_on_device, _REDUCE_OPS["sum"], group)
+        # true_divide because int64 tensors reject in-place true division.
+        data_on_device = torch.true_divide(data_on_device, world_size)
+    elif op.lower() in _REDUCE_OPS:
+        dist.all_reduce(data_on_device, _REDUCE_OPS[op.lower()], group)
+    else:
+        raise ValueError(
+            f"reduce op should be one of {list(_REDUCE_OPS)} or 'mean', but got {op}"
+        )
+
+    cast_data_device(data_on_device, input_device, out=data)

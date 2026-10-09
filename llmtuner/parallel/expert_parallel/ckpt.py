@@ -86,7 +86,7 @@ def expert_shard_map(
     return shard_map
 
 
-def _named_params(model_parts: list[nn.Module]) -> dict[str, torch.Tensor]:
+def named_params(model_parts: list[nn.Module]) -> dict[str, torch.Tensor]:
     return {
         fqn: param
         for model in model_parts
@@ -94,7 +94,7 @@ def _named_params(model_parts: list[nn.Module]) -> dict[str, torch.Tensor]:
     }
 
 
-def _matched_entries(
+def matched_entries(
     sd: dict[str, Any],
     shard_map: dict[str, dist.ProcessGroup],
     params: dict[str, torch.Tensor],
@@ -147,9 +147,9 @@ def gather_expert_state(
     """
     if not shard_map:
         return sd
-    params = _named_params(model_parts)
+    params = named_params(model_parts)
     out = dict(sd)
-    for key, group, _ in _matched_entries(sd, shard_map, params, direction="save"):
+    for key, group, _ in matched_entries(sd, shard_map, params, direction="save"):
         value = out[key]
         if DTensor is not None and isinstance(value, DTensor):
             # Per-EP-rank materialization of the efsdp-sharded weight.
@@ -176,9 +176,9 @@ def load_expert_state(
     """
     if not shard_map:
         return sd
-    params = _named_params(model_parts)
+    params = named_params(model_parts)
     out = dict(sd)
-    for key, group, param in _matched_entries(sd, shard_map, params, direction="load"):
+    for key, group, param in matched_entries(sd, shard_map, params, direction="load"):
         full = out[key]
         world = dist_utils.get_world_size(group)
         rank = dist_utils.get_rank(group)

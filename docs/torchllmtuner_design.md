@@ -209,7 +209,7 @@ llmtuner/
                                 collectives.py（归约/超时/grad norm）
                                 monitoring.py（显存监控/peak FLOPS）
                                 spmd_context.py（SPMD mesh 作用域 + 轴查询, 最底层）
-                                + dist.py/dist_utils.py（vendored mmengine.dist 工具箱）
+                                + dist_utils.py（vendored mmengine.dist 引导/查询面；collective 在 collectives.py）
                                 （mesh 构建在 parallel/parallel_dims.py，单轨）
   components/  17 模块          loss / checkpointer(DCP; 含 checkpoint_keys
                                 与 filesystem) / metrics / profiler / tokenizer

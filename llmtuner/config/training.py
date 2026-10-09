@@ -15,9 +15,9 @@ from llmtuner.config.activation_checkpoint import (
 from llmtuner.config.checkpoint import CheckpointConfig
 from llmtuner.config.compile import CompileConfig
 from llmtuner.config.data import DataloaderConfig
+from llmtuner.config.field_checks import require_at_least
 from llmtuner.config.observability import MetricsConfig, ProfilerConfig
 from llmtuner.config.optimizer import EMAConfig
-from llmtuner.config.validate import require_at_least
 from llmtuner.config.validation import ValidationConfig
 from llmtuner.errors import ConfigError
 

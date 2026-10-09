@@ -105,8 +105,7 @@ from torch.distributed.tensor import DTensor
 from llmtuner.config import LLMTunerConfig, ValidationConfig
 
 from ..accelerator.capabilities import has as capability
-from ..accelerator.collectives import clip_grad_norm_, set_pg_timeouts
-from ..accelerator.dist import all_reduce
+from ..accelerator.collectives import all_reduce, clip_grad_norm_, set_pg_timeouts
 from ..accelerator.spmd_context import spmd_context
 from ..components.checkpointer import CheckpointManager
 from ..components.loss import (
