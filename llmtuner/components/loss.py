@@ -28,9 +28,6 @@ Three entry points, and the difference between them is worth stating plainly:
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import TypeAlias
-
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
@@ -40,7 +37,6 @@ from ..accelerator import dist_utils
 
 __all__ = [
     "IGNORE_INDEX",
-    "LossFunction",
     "chunked_lm_head_cross_entropy",
     "compute_logprobs",
     "cross_entropy_loss",
@@ -51,8 +47,6 @@ __all__ = [
 
 # PyTorch's default ignore index for cross-entropy loss.
 IGNORE_INDEX = -100
-
-LossFunction: TypeAlias = Callable[..., torch.Tensor]
 
 
 def vocab_shard_bounds(
