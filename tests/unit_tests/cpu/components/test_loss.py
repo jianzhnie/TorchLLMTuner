@@ -159,3 +159,16 @@ def test_mse_detaches_its_labels() -> None:
 
     assert pred.grad is not None, "the prediction is what we train"
     assert target.grad is None, "the target must be cut from the graph"
+
+
+def test_tp_group_and_global_vocab_size_are_required_together() -> None:
+    """Half the pair makes the vocab-parallel shape test unevaluable."""
+    import pytest
+
+    logits, labels = _logits_and_labels()
+    with pytest.raises(ValueError, match="together"):
+        cross_entropy_loss(logits, labels, tp_group=object())
+    with pytest.raises(ValueError, match="together"):
+        cross_entropy_loss(logits, labels, global_vocab_size=logits.shape[-1])
+    with pytest.raises(ValueError, match="together"):
+        compute_logprobs(logits, labels, tp_group=object())

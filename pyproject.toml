@@ -14,15 +14,17 @@ keywords = ["distributed-training", "pytorch", "fsdp", "tensor-parallel", "pipel
 dependencies = [
     # The floor is set by `torch.distributed.fsdp.DataParallelMeshDims`, which
     # parallel/fully_shard/fsdp.py imports at module scope and which first
-    # shipped in 2.12.
-    # 2.11 has no `dp_mesh_dims` argument on `fully_shard` at all, so there is
-    # no shim that would let the package run on it.
+    # shipped in 2.12 -- and by the DCP async-staging symbols
+    # (DefaultStager/StagingOptions/AsyncSaveResponse) that
+    # components/checkpointer/dcp.py imports at module scope. 2.11 has no
+    # `dp_mesh_dims` argument on `fully_shard` at all, so there is no shim that
+    # would let the package run on it.
     # Caveat this line cannot express: `GroupedExperts(use_grouped_mm=True)`
     # reaches for `torch._grouped_mm`, which is wrong on CPU builds before 2.14
     # (large shapes return ~1e35 or NaN). It defaults to False and falls back to
     # a per-expert loop, so a <2.14 install still runs correctly -- just without
     # the fused kernel.
-    "torch>=2",
+    "torch>=2.12",
     # Pinned to one minor: the MoE expert layout this code probes
     # (`gate_up_proj` / `down_proj`) is a 5.x shape, and the pin matches
     # torchtitan's transformers_modeling_backend experiment, which this

@@ -124,6 +124,12 @@ class DeviceMemoryMonitor:
         self.device_capacity = get_device_capacity_bytes()
         self.device_capacity_gib = self._to_gib(self.device_capacity)
         self.reset_peak_stats()
+        if device_type != "cpu":
+            # Clear startup residue from the caching allocator so the first
+            # window's max_reserved baseline is the training loop's own.
+            from ..accelerator.device import device_module
+
+            device_module.empty_cache()
 
     @staticmethod
     def _to_gib(memory_in_bytes: float) -> float:
@@ -256,7 +262,12 @@ class WandBLogger(BaseLogger):
             name=os.getenv("WANDB_RUN_NAME"),
             id=os.getenv("WANDB_RUN_ID"),
             notes=os.getenv("WANDB_RUN_NOTES"),
-            tags=os.getenv("WANDB_RUN_TAGS"),
+            tags=[
+                tag.strip()
+                for tag in os.getenv("WANDB_RUN_TAGS", "").split(",")
+                if tag.strip()
+            ]
+            or None,
             group=os.getenv("WANDB_RUN_GROUP"),
             job_type=os.getenv("WANDB_RUN_JOB_TYPE"),
             resume_from=os.getenv("WANDB_RESUME_FROM"),
@@ -474,7 +485,15 @@ class MetricsProcessor:
         return self.parallel_dims.non_data_parallel_size
 
     def should_log(self, step: int) -> bool:
-        """Whether ``step`` is a logging step. The first step always is."""
+        """Whether ``step`` is a logging step. The first step always is.
+
+        Anchors ``step_last_log`` on the FIRST call after a fresh start or a
+        resume -- even when this step does not log: ``time_end_to_end`` divides
+        the measured wall time by ``step - step_last_log``, and anchoring late
+        (at the first logging step) would divide a multi-step span by 1.
+        """
+        if self.step_last_log is None:
+            self.step_last_log = step - 1
         return step == 1 or step % self.config.log_freq == 0
 
     def add_data_loading_time(self, seconds: float) -> None:
@@ -621,9 +640,8 @@ class MetricsProcessor:
             extra_metrics: additional numbers the caller wants recorded.
         """
         if self.step_last_log is None:
-            # The first log has no previous step to measure against. Anchoring
-            # here rather than in should_log keeps the two entry points
-            # (should_log then log) order-independent.
+            # Defensive: should_log anchors on its first call; a caller that
+            # went straight to log() gets the same anchor here.
             self.step_last_log = step - 1
 
         derived = self._derive(step)

@@ -223,6 +223,16 @@ def test_lr_metric_is_keyed_by_the_optimizer_name() -> None:
     assert scheduler.get_metrics() == {"lr/AdamW": 1.0}
 
 
+def test_lr_metrics_disambiguate_two_same_type_schedulers() -> None:
+    """PP gives every stage its own AdamW; the keys must not overwrite."""
+    scheduler = build_lr_scheduler(
+        LRSchedulerConfig(),
+        optimizers=[_optimizer(), _optimizer()],
+        training_steps=4,
+    )
+    assert scheduler.get_metrics() == {"lr/AdamW/0": 1.0, "lr/AdamW/1": 1.0}
+
+
 def test_state_dict_is_just_the_epoch() -> None:
     scheduler = build_lr_scheduler(
         LRSchedulerConfig(), optimizers=[_optimizer()], training_steps=8
