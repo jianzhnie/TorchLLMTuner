@@ -712,6 +712,21 @@ class Trainer:
             if pp_mesh is None and not loss_sharded
             else parallel_dims.get_optional_mesh("loss")
         )
+        # CP/TP ranks hold disjoint token slices of the same DP batch.  Their
+        # loss pieces must be summed back together before computing the
+        # worst per-DP-rank average; reducing local shard averages directly
+        # makes ``max_loss`` smaller by the sequence sharding degree.
+        sequence_dims = []
+        if parallel_dims is not None:
+            if parallel_dims.cp_enabled:
+                sequence_dims.append("cp")
+            if parallel_dims.tp_enabled:
+                sequence_dims.append("tp")
+        sequence_mesh = (
+            parallel_dims.get_optional_mesh(sequence_dims)
+            if sequence_dims
+            else None
+        )
 
         # Read the whole step's data up front. The denominator must be known
         # before the first forward (the loss divides by it there), so every
@@ -838,6 +853,9 @@ class Trainer:
             local_valid_tokens=local_valid_tokens,
             local_valid_tokens_tensor=local_valid_tokens_tensor,
             loss_mesh=loss_mesh,
+            pp_mesh=pp_mesh,
+            dp_mesh=dp_mesh,
+            sequence_mesh=sequence_mesh,
             grad_norm=grad_norm,
             lr_metrics=lr_metrics,
         )
@@ -924,6 +942,9 @@ class Trainer:
         local_valid_tokens: int,
         local_valid_tokens_tensor: torch.Tensor,
         loss_mesh,
+        pp_mesh,
+        dp_mesh,
+        sequence_mesh,
         grad_norm: torch.Tensor,
         lr_metrics: dict[str, float],
     ) -> dict[str, float]:
@@ -932,6 +953,10 @@ class Trainer:
         Every collective here is unconditional (see the comment at the loss
         reduction): ranks enter them regardless of what their own shard saw.
         """
+        # Only the last stage computes CE. Other stages carry a finite
+        # sentinel for the step check; it must not enter reported metrics.
+        if pp_mesh is not None and not self.pp_has_last_stage:
+            accumulated_loss = torch.zeros_like(accumulated_loss)
         loss = accumulated_loss / global_valid_tokens
 
         if loss_mesh is not None:
@@ -940,17 +965,23 @@ class Trainer:
             # let that rank skip a reduction the others enter, hanging the
             # step. Only the per-rank division needs the guard -- a rank with
             # no valid tokens contributes 0 to the max.
+            local_loss_sum = accumulated_loss.clone()
+            if sequence_mesh is not None:
+                all_reduce(local_loss_sum, group=sequence_mesh.get_group())
             local_avg = (
-                accumulated_loss / local_valid_tokens_tensor
+                local_loss_sum / local_valid_tokens_tensor
                 if local_valid_tokens > 0
                 else torch.zeros_like(accumulated_loss)
             )
             loss_sum = loss.clone()
             local_max = local_avg.clone()
             all_reduce(loss_sum, group=loss_mesh.get_group())
-            all_reduce(local_max, op="max", group=loss_mesh.get_group())
-            global_avg_loss = float(loss_sum)
-            global_max_loss = float(local_max)
+            # The sequence axes were summed above, so each sequence group now
+            # holds one complete local-DP loss.  The maximum is over DP ranks
+            # only, matching torchtitan's definition and avoiding counting
+            # sequence shards as separate examples.
+            if dp_mesh is not None:
+                all_reduce(local_max, op="max", group=dp_mesh.get_group())
             # Cumulative tokens seen, summed over the ranks holding *distinct*
             # tokens: ``ntokens_seen`` is a count of labels this rank actually
             # fed a step, and CP and TP each take their own slice of that
@@ -974,10 +1005,16 @@ class Trainer:
             all_reduce(ntokens_seen_tensor, group=loss_mesh.get_group())
             global_ntokens_seen = float(ntokens_seen_tensor)
         else:
-            # Single rank: the two reported losses are the same number by
-            # construction.
-            global_avg_loss = global_max_loss = float(loss)
+            loss_sum = local_max = loss
             global_ntokens_seen = float(self.ntokens_seen)
+        if pp_mesh is not None:
+            # Each PP group contains one rank from every stage at the same
+            # DP/CP/TP coordinate. Send the last stage's loss to its peers so
+            # callers can inspect correct metrics on every rank.
+            all_reduce(loss_sum, group=pp_mesh.get_group())
+            all_reduce(local_max, group=pp_mesh.get_group())
+        global_avg_loss = float(loss_sum)
+        global_max_loss = float(local_max)
         metrics = {
             "loss": global_avg_loss,
             "max_loss": global_max_loss,
@@ -1213,10 +1250,3 @@ class Trainer:
             # only collected at interpreter shutdown, where its ``__del__``
             # raises against an already-torn-down state.
             self.dataloader.close()
-
-        # Tears down the process group the trainer bootstrapped. A
-        # programmatic caller that initialized torch.distributed itself
-        # loses its group here -- keep trainer lifecycle and external PG
-        # usage separate.
-        if dist.is_initialized():
-            dist.destroy_process_group()
