@@ -534,6 +534,16 @@ class Trainer:
                 # Signature-level probe (not hasattr): torch 2.9's driver exists
                 # but lacks return_outputs, and its eval() would swallow the
                 # microbatch kwargs.
+                # Calling the private driver bypasses step()'s setup. In
+                # particular, PipelineStage.has_backward defaults to False;
+                # without this, every backward is silently skipped and PP
+                # performs optimizer steps with no gradients.
+                stages = getattr(self.pp_schedule, "_stages", None)
+                if stages is None:
+                    stages = [self.pp_schedule._stage]
+                for stage in stages:
+                    stage.has_backward = self.pp_schedule._has_backward
+                    stage.clear_runtime_states()
                 self.pp_schedule._step_microbatches(
                     arg_mbs if self.pp_has_first_stage else None,
                     kwarg_mbs,
@@ -855,6 +865,12 @@ class Trainer:
             if self.parallel_dims is not None and self.parallel_dims.ep_enabled
             else None
         )
+        tp_mesh = (
+            self.parallel_dims.get_optional_mesh("tp")
+            if self.parallel_dims is not None and self.parallel_dims.tp_enabled
+            else None
+        )
+        tp_sharded_ids = tp_sharded_param_ids(self.model_parts) if tp_mesh else set()
         grad_norm = clip_grad_norm_(
             parameters,
             max_norm=self.cfg.max_norm,
@@ -862,6 +878,12 @@ class Trainer:
             pp_mesh=pp_mesh,
             ep_mesh=ep_mesh,
             expert_parameters=expert_parameters if ep_mesh is not None else None,
+            tp_mesh=tp_mesh,
+            tp_sharded_parameters=(
+                [p for p in parameters if id(p) in tp_sharded_ids]
+                if tp_mesh is not None
+                else None
+            ),
         )
 
         # Finiteness is reduced to ONE flag before it is asserted, and every

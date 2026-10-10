@@ -143,13 +143,15 @@ def clip_grad_norm_(
     pp_mesh=None,
     ep_mesh=None,
     expert_parameters: Iterable[torch.Tensor] | None = None,
+    tp_mesh=None,
+    tp_sharded_parameters: Iterable[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Clip the gradient norm of an iterable of parameters, over the whole model.
 
-    ``torch.nn.utils.clip_grad_norm_`` computes the norm only along the axes its
-    own sharding knows about. Under pipeline parallelism the stages hold disjoint
-    parameter sets, so no single rank can see the full norm and each would clip
-    against a different number. The PP norm is therefore reduced here first.
+    ``torch.nn.utils.clip_grad_norm_`` handles DTensor/FSDP sharding, but this
+    project's TP weights are local tensors. Their squared norms must be summed
+    over TP, while TP-replicated parameters are counted only once. PP stages
+    hold disjoint parameters, so the assembled norm is reduced over PP too.
 
     Args:
         parameters: an iterable of tensors (or one tensor) to normalize.
@@ -165,6 +167,9 @@ def clip_grad_norm_(
             from ``expert_parameters`` is reduced over this mesh.
         expert_parameters: parameters physically partitioned across EP ranks.
             Required exactly when ``ep_mesh`` is provided.
+        tp_mesh: tensor-parallel mesh for local TP weight shards.
+        tp_sharded_parameters: parameters physically sharded across TP ranks.
+            Required exactly when ``tp_mesh`` is provided.
 
     Returns:
         The total norm of the parameter gradients (viewed as one vector).
@@ -181,48 +186,81 @@ def clip_grad_norm_(
         raise ValueError(
             "ep_mesh and expert_parameters must either both be provided or both be None"
         )
+    if (tp_mesh is None) != (tp_sharded_parameters is None):
+        raise ValueError(
+            "tp_mesh and tp_sharded_parameters must either both be provided "
+            "or both be None"
+        )
 
-    if ep_mesh is None:
-        grads = [p.grad for p in parameters if p.grad is not None]
-        total_norm = torch.nn.utils.get_total_norm(
+    # Preserve the plain single-device path. Under TP, separate the local
+    # weight shards from replicated parameters before any norm calculation.
+    # An EP expert is handled by the EP reduction, even if its id also appears
+    # in the TP-sharded set (EP can consume ranks along the dense TP axis).
+    tp_ids = set() if tp_mesh is None else {id(p) for p in tp_sharded_parameters}
+    expert_ids = set() if ep_mesh is None else {id(p) for p in expert_parameters}
+    tp_grads = [
+        p.grad
+        for p in parameters
+        if id(p) in tp_ids and id(p) not in expert_ids and p.grad is not None
+    ]
+    dense_grads = [
+        p.grad
+        for p in parameters
+        if id(p) not in tp_ids and id(p) not in expert_ids and p.grad is not None
+    ]
+    expert_grads = [
+        p.grad for p in parameters if id(p) in expert_ids and p.grad is not None
+    ]
+
+    def _local_norm(grads: list[torch.Tensor]) -> torch.Tensor:
+        norm = torch.nn.utils.get_total_norm(
             grads, norm_type, error_if_nonfinite, foreach
         )
-    else:
-        expert_ids = {id(p) for p in expert_parameters}
-        expert_grads = [
-            p.grad for p in parameters if id(p) in expert_ids and p.grad is not None
-        ]
-        dense_grads = [
-            p.grad for p in parameters if id(p) not in expert_ids and p.grad is not None
-        ]
-        expert_norm = torch.nn.utils.get_total_norm(
-            expert_grads, norm_type, error_if_nonfinite, foreach
+        if isinstance(norm, DTensor):
+            norm = norm.full_tensor()
+        return norm
+
+    if tp_mesh is not None or ep_mesh is not None:
+        dense_norm = _local_norm(dense_grads)
+        tp_norm = _local_norm(tp_grads)
+        expert_norm = _local_norm(expert_grads)
+        # get_total_norm([]) returns a CPU zero. Every rank still joins the
+        # collective, including a PP stage with no expert or TP weight grads.
+        device = next(
+            (p.grad.device for p in parameters if p.grad is not None),
+            parameters[0].device if parameters else dense_norm.device,
         )
-        dense_norm = torch.nn.utils.get_total_norm(
-            dense_grads, norm_type, error_if_nonfinite, foreach
-        )
-        if isinstance(expert_norm, DTensor):
-            expert_norm = expert_norm.full_tensor()
-        if isinstance(dense_norm, DTensor):
-            dense_norm = dense_norm.full_tensor()
-        if expert_norm.device != dense_norm.device:
-            # An empty expert_grads list yields a CPU zero from
-            # get_total_norm; the reduce below needs it on the comm device.
-            expert_norm = expert_norm.to(dense_norm.device)
+        dense_norm = dense_norm.to(device)
+        tp_norm = tp_norm.to(device)
+        expert_norm = expert_norm.to(device)
 
         if math.isinf(norm_type):
-            dist.all_reduce(
-                expert_norm, op=dist.ReduceOp.MAX, group=ep_mesh.get_group()
-            )
-            total_norm = torch.maximum(dense_norm, expert_norm)
+            if tp_mesh is not None:
+                dist.all_reduce(
+                    tp_norm, op=dist.ReduceOp.MAX, group=tp_mesh.get_group()
+                )
+            if ep_mesh is not None:
+                dist.all_reduce(
+                    expert_norm, op=dist.ReduceOp.MAX, group=ep_mesh.get_group()
+                )
+            total_norm = torch.maximum(torch.maximum(dense_norm, tp_norm), expert_norm)
         else:
-            expert_norm = expert_norm.pow(norm_type)
-            dist.all_reduce(
-                expert_norm, op=dist.ReduceOp.SUM, group=ep_mesh.get_group()
-            )
-            total_norm = (dense_norm.pow(norm_type) + expert_norm).pow(
-                1.0 / norm_type
-            )
+            tp_power = tp_norm.pow(norm_type)
+            expert_power = expert_norm.pow(norm_type)
+            if tp_mesh is not None:
+                dist.all_reduce(
+                    tp_power, op=dist.ReduceOp.SUM, group=tp_mesh.get_group()
+                )
+            if ep_mesh is not None:
+                dist.all_reduce(
+                    expert_power, op=dist.ReduceOp.SUM, group=ep_mesh.get_group()
+                )
+            total_norm = (
+                dense_norm.pow(norm_type) + tp_power + expert_power
+            ).pow(1.0 / norm_type)
+
+    else:
+        total_norm = _local_norm(dense_grads)
 
     # Under FSDP/TP the norm comes back as a DTensor with a partial (sum)
     # placement: it must be materialized both to be correct along those axes and
