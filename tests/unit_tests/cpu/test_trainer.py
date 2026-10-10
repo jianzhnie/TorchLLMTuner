@@ -73,7 +73,7 @@ from llmtuner.trainer.trainer import Trainer
 def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
     """The PP schedule's reporting losses must not retain completed graphs."""
     monkeypatch.setattr(
-        "llmtuner.trainer.trainer.capability",
+        "llmtuner.trainer.pipeline_step.capability",
         lambda name: False if name == "pipelining_microbatch_drivers" else True,
     )
     activation_refs: list[weakref.ReferenceType[torch.Tensor]] = []
