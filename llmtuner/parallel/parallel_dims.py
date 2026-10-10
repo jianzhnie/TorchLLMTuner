@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from llmtuner.config import LLMTunerConfig, ParallelConfig
+from llmtuner.errors import ConfigError
 
 from ..accelerator.device import device_type
 from ..utils.logger_utils import get_logger
@@ -487,8 +488,32 @@ def build_parallel_dims(cfg: LLMTunerConfig, world_size: int) -> ParallelDims | 
 
     Single-process (step 0, no torchrun) -> ``None``: no process group, no
     parallelism, so downstream code guards on ``parallel_dims is None``.
+    Any non-1 degree in that case is a config error, not a silent no-op:
+    upstream validates the degree product against every world size, and a
+    single-process run that asked for tp/pp/... must not train a fully
+    replicated model while logging the configured degrees.
     """
     if world_size == 1:
+        par = cfg.parallel
+        requested = {
+            field: value
+            for field, value in (
+                ("tensor_parallel_size", par.tensor_parallel_size),
+                ("pipeline_parallel_size", par.pipeline_parallel_size),
+                ("context_parallel_size", par.context_parallel_size),
+                ("expert_parallel_size", par.expert_parallel_size),
+                ("data_parallel_replicate_size", par.data_parallel_replicate_size),
+            )
+            if value != 1
+        }
+        if par.data_parallel_shard_size not in (-1, 1):
+            requested["data_parallel_shard_size"] = par.data_parallel_shard_size
+        if requested:
+            raise ConfigError(
+                "world_size=1 (no torchrun) cannot satisfy the configured "
+                f"parallel degrees: {requested}. Either launch with torchrun "
+                "at the matching world size or set them back to 1."
+            )
         return None
     return ParallelDims.from_config(cfg.parallel, world_size)
 

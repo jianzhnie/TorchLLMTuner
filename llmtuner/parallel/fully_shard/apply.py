@@ -91,8 +91,20 @@ def apply_fsdp(
     # Preserve the dtype selected at model construction. Hard-coding float32
     # here silently makes FSDP all-gather BF16 parameters as FP32, doubling the
     # transient parameter and operator footprint in mixed-precision runs.
+    # A single dtype is asserted rather than assumed: with mixed-dtype
+    # parameters FSDP would all-gather the minority dtype AS the first
+    # parameter's dtype, silently downcasting them (upstream has a
+    # param_dtype_override_fn hook for this; llmtuner refuses instead).
+    param_dtypes = {p.dtype for p in model.parameters()}
+    if len(param_dtypes) > 1:
+        raise ValueError(
+            "FSDP requires a single parameter dtype, got "
+            f"{sorted(map(str, param_dtypes))}. "
+            "A model with deliberately fp32 parameters needs per-parameter "
+            "dtype overrides, which llmtuner does not wire."
+        )
     try:
-        param_dtype = next(model.parameters()).dtype
+        param_dtype = next(iter(param_dtypes))
     except StopIteration:
         param_dtype = torch.get_default_dtype()
     reduce_dtype = torch.float32

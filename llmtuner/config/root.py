@@ -87,17 +87,16 @@ class LLMTunerConfig:
         )
 
     def __post_init__(self) -> None:
-        # Cross-group check: CP must divide the sequence length.
-        if self.training.max_seq_len % self.parallel.cp != 0:
+        # Cross-group check: the sequence is sharded CP first, TP second, so
+        # the real invariant is (T/cp) % tp == 0 -- which, for the contiguous
+        # splits both sharders perform, is exactly max_seq_len % (cp * tp) == 0.
+        # Two separate modulo checks would miss ragged cases (e.g. T=6, cp=2,
+        # tp=2 passes both but leaves a length-3 shard for tp=2).
+        joint = self.parallel.cp * self.parallel.tp
+        if self.training.max_seq_len % joint != 0:
             raise ConfigError(
                 f"max_seq_len ({self.training.max_seq_len}) must be divisible by "
-                f"cp ({self.parallel.cp})"
-            )
-        # TP splits the same stream one level down; same ragged-split refusal.
-        if self.training.max_seq_len % self.parallel.tp != 0:
-            raise ConfigError(
-                f"max_seq_len ({self.training.max_seq_len}) must be divisible by "
-                f"tp ({self.parallel.tp})"
+                f"cp * tp ({self.parallel.cp} * {self.parallel.tp})"
             )
         # Async TP is a compiled-TP optimization: without compile there is no
         # inductor pass to pipeline the collectives, and without TP there are
