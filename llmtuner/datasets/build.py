@@ -45,8 +45,8 @@ if TYPE_CHECKING:
 __all__ = ["build_dataloader"]
 
 
-def multimodal_registry(dataset_name: str):
-    """The multimodal recipe table, collator and packer, imported lazily.
+def _resolve_multimodal_recipe(dataset_name: str):
+    """Find one multimodal recipe and its collator and packer, imported lazily.
 
     The import stays inside the call: the multimodal subtree pulls in
     torchvision (and a video backend behind it), and a text-only run must not
@@ -72,11 +72,11 @@ def multimodal_registry(dataset_name: str):
             f"'local_jsonl', a text recipe {sorted(DATASETS)}, or a "
             f"multimodal recipe {sorted(MM_DATASETS)}"
         )
-    return MM_DATASETS, MultiModalCollator, build_mm_sample_packing
+    return MM_DATASETS[dataset_name], MultiModalCollator, build_mm_sample_packing
 
 
-def text_recipe(dataloader_config, *, dataset_name: str, tokenizer):
-    """The text recipe plus how to pack and collate it.
+def _resolve_text_recipe(dataloader_config, *, dataset_name: str, tokenizer):
+    """Find one text recipe and its packing and collation policy.
 
     Both recipes are built the same way and differ only in kind: the
     discriminating work is in the packing node, never in the collator, which is
@@ -181,7 +181,7 @@ def build_dataloader(
         # fast without loading tokenizer assets.
         from llmtuner.components.tokenizer import MultiModalTokenizer
 
-        MM_DATASETS, collator, build_packing = multimodal_registry(dataset_name)
+        recipe, collator, build_packing = _resolve_multimodal_recipe(dataset_name)
         tokenizer = MultiModalTokenizer(
             tokenizer_path=dataloader_config.tokenizer_path,
             image_token=dataloader_config.mm_image_token,
@@ -190,7 +190,6 @@ def build_dataloader(
             vision_end_token=dataloader_config.mm_vision_end_token,
             pad_token=dataloader_config.mm_pad_token,
         )
-        recipe = MM_DATASETS[dataset_name]
         # Multimodal samples carry media lists alongside their token fields,
         # so they pack by whole documents (FirstFit) rather than concat-then-
         # split, and the collator reshapes the media into patches. This is not
@@ -201,7 +200,7 @@ def build_dataloader(
         tokenizer = HuggingFaceTokenizer(
             tokenizer_path=dataloader_config.tokenizer_path
         )
-        recipe, build_packing, packing_kwargs, collator = text_recipe(
+        recipe, build_packing, packing_kwargs, collator = _resolve_text_recipe(
             dataloader_config, dataset_name=dataset_name, tokenizer=tokenizer
         )
     context = DatasetBuildContext(

@@ -16,15 +16,14 @@ Non-vacuity: the model is actually split (each rank holds half the layers),
 each MoE block holds only this stage's half of the experts, and the reference
 is computed independently rather than copied from the pipeline run.
 
-Environment note: needs torch >= 2.12 (the pipelining/spmd surface). Written
-2026-10-02 with the PP x EP unlock; environment not covered on the
-development host -- awaiting a multi-rank run on the target torch.
+Environment note: needs torch >= 2.12 for the pipelining/SPMD surface.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
@@ -33,6 +32,7 @@ from llmtuner.datasets.random_data import RandomTokenSource, batch_iterator
 from llmtuner.models.common.moe.block import MoE
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.parallel.expert_parallel import swap_hf_moe_blocks
 from llmtuner.trainer import (
     LLMTunerConfig,
     ModelConfig,
@@ -95,11 +95,29 @@ def _cfg() -> LLMTunerConfig:
     )
 
 
-def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
-    """The same steps in one process: no pipeline, no EP (ep=1 == HF numerics,
-    pinned by ep_wiring_equivalence.py)."""
+def _reference_trajectory(
+    cfg: LLMTunerConfig, initial_states: list[dict[str, torch.Tensor]]
+) -> list[float]:
+    """Run the same steps on one process from the pipeline's initial state.
+
+    PP intentionally derives a distinct initialization seed per stage and EP
+    stores only a local expert slice. Rebuild the EP=1 swapped model and merge
+    those actual stage states before training the oracle; constructing a fresh
+    model from ``cfg.seed`` would compare different parameters.
+    """
     torch.manual_seed(cfg.seed)
     model = HFTransformerModel(build_model_config_for(cfg))
+    swap_hf_moe_blocks(model)
+    merged: dict[str, torch.Tensor] = {}
+    for key in {key for state in initial_states for key in state}:
+        values = [state[key] for state in initial_states if key in state]
+        if key.endswith(("w1_EFD", "w3_EFD", "w2_EDF")):
+            # Each PP stage appears on EP ranks consecutively in the mesh; the
+            # local expert shards therefore concatenate in rank order.
+            merged[key] = torch.cat(values, dim=0)
+        else:
+            merged[key] = values[0]
+    model.load_state_dict(merged, strict=True)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr,
@@ -107,7 +125,9 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
         fused=cfg.optimizer.implementation == "fused",
         foreach=cfg.optimizer.implementation == "foreach",
     )
-    rows_per_mb = cfg.global_batch_size // MICROBATCHES
+    # DP splits the global batch across EP ranks before PP forms its local
+    # microbatches. Attention sees one row per forward on each rank here.
+    rows_per_mb = cfg.global_batch_size // (MICROBATCHES * EP)
     batches = batch_iterator(
         RandomTokenSource(
             seed=cfg.seed,
@@ -125,7 +145,7 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
         )
         num_valid = int((targets != IGNORE_INDEX).sum())
         loss_sum = None
-        for mb in range(MICROBATCHES):
+        for mb in range(MICROBATCHES * EP):
             row = slice(mb * rows_per_mb, (mb + 1) * rows_per_mb)
             logits = model(batch.input_ids[row].reshape(-1))
             loss = cross_entropy_loss(logits, targets[row].reshape(-1))
@@ -169,6 +189,21 @@ def main() -> None:
                     f"{held} experts, want {num_local} -- EP did not shard"
                 )
 
+    # Capture the actual PP initialization before the first optimizer step.
+    # Ranks 0/1 hold stage 0's complementary expert shards; ranks 2/3 hold
+    # stage 1's. Dense weights are replicated inside each stage.
+    local_initial_state = {}
+    for part in trainer.model_parts:
+        for key, value in part.state_dict().items():
+            # FSDP state_dict values are DTensors. Materialize each dense
+            # stage's weights collectively before object gathering; pickling
+            # the DTensor itself retains its process mesh and can hang.
+            if isinstance(value, DTensor):
+                value = value.full_tensor()
+            local_initial_state[key] = value.detach().cpu().clone()
+    initial_states = [None] * trainer.world_size
+    dist.all_gather_object(initial_states, local_initial_state)
+
     # -- the trajectory ------------------------------------------------------
     data_iterator = trainer.data_iterator()
     pp_ep_losses = []
@@ -179,7 +214,7 @@ def main() -> None:
         pp_ep_losses.append(metrics["loss"])
     trainer.close()
 
-    reference = _reference_trajectory(cfg)
+    reference = _reference_trajectory(cfg, initial_states)
     for step, (got, want) in enumerate(zip(pp_ep_losses, reference, strict=True)):
         if abs(got - want) > TOL:
             failures.append(f"rank {rank} step {step + 1}: loss {got} vs {want}")

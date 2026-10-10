@@ -191,6 +191,16 @@ def test_a_multi_axis_request_returns_one_mesh_from_the_cache(
     assert first is second
 
 
+def test_build_mesh_reuses_the_same_world_and_submesh(single_rank_group) -> None:
+    """Repeated setup must not mix cached views from separate world meshes."""
+    dims = _dims(world_size=1, dp_shard=1)
+    world_mesh = dims.build_mesh()
+    dp_shard_mesh = dims.get_optional_mesh("dp_shard")
+
+    assert dims.build_mesh() is world_mesh
+    assert dims.get_optional_mesh("dp_shard") is dp_shard_mesh
+
+
 def test_the_loss_mesh_spans_tp_as_well_as_dp_and_cp() -> None:
     """llmtuner's one mesh divergence from upstream, pinned without a group.
 
