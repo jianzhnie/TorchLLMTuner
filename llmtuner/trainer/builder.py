@@ -139,10 +139,9 @@ def _apply_parallelism(self, cfg, model, load_hf_weights: bool) -> None:
         self.pp_schedule = orchestration.schedule
         self.pp_has_first_stage = orchestration.has_first_stage
         self.pp_has_last_stage = orchestration.has_last_stage
-        # The loss exists only on the last stage; every other stage reports
-        # this sentinel, which is finite (the finiteness check runs on every
-        # rank) and never logged (the metrics rank is a last-stage rank).
-        self._pp_loss_sentinel = torch.full((1,), -1.0, device=self.device)
+        # Only the last stage computes CE. Other stages return a finite zero
+        # for the step check and contribute nothing to the PP loss reduction.
+        self._pp_loss_sentinel = torch.zeros((1,), device=self.device)
     else:
         self.model = orchestration
         self.model_parts = [orchestration]
@@ -357,12 +356,8 @@ def build_trainer_state(self, cfg) -> None:
         num_flops_per_token=num_flops_per_token(cfg),
         tag=cfg.metrics.tag,
     )
-    # Under PP the loss exists on one rank and ``metrics.log_ranks`` decides
-    # which ranks print, so a mismatched pair trains correctly and reports
-    # nothing -- which reads exactly like a hang. Wire the console filter and
-    # warn now, rather than leave the user to work it out at step 1.
+    # The trainer synchronizes PP loss metrics to every stage before logging.
     logger_utils.set_log_ranks(cfg.metrics.log_ranks)
-    self.metrics.ensure_pp_loss_visible()
 
 
 # -- seeding ------------------------------------------------------------------

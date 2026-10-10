@@ -1,93 +1,16 @@
-"""Trainer -- the single training loop, shared by every learning step.
+"""Training loop and stable Trainer interface.
 
-Shape vendored from torchtitan ``trainer.py``: ``train`` -> ``train_step`` ->
-``forward_backward_step`` -> ``_forward_backward_body``, one function per level
-of the step, so each can be read and tested on its own. The distributed
-complexity still lives in ``parallel/``; the loop is meant to read end to end.
+``builder`` assembles the model and runtime state, ``batch`` prepares inputs,
+``pipeline_step`` drives PP schedules, and ``validate`` runs evaluation. This
+module owns the optimizer step, gradient checks, loss reductions, checkpoint
+counters, and the outer training loop.
 
-What the migration added, and why each earned its place:
-
-* **Token-normalized loss.** The loss is a SUM over predicted tokens divided by
-  the token count reduced across DP. That makes the reported number independent
-  of how the batch was split across ranks, and it is the precondition for
-  gradient accumulation to sum correctly.
-* **The denominator is a whole-batch property.** It counts the tokens of the
-  *unsharded* batch -- before context parallelism slices it and before pipeline
-  parallelism cuts it into micro-batches -- so it is the same number on every
-  rank of the workload and for every micro-batch of a step, and it is reduced
-  over the DP axis alone. Sharding the sequence must not change the reported
-  loss, which is why the *loss* reduce-group is chosen differently: it follows
-  the sequence, so it spans dp * cp whenever either is enabled.
-* **Gradient accumulation.** ``gradient_accumulation_steps`` runs the
-  forward/backward once per group and advances the optimizer once. The division
-  happens *inside* each group's backward -- the group's summed loss over every
-  group's token counts -- but the effective step length is the token count of
-  the *whole* accumulation window. At ``gradient_accumulation_steps == 1`` the
-  two coincide and every reading is the familiar per-batch one. Above 1 the
-  gradients are consistent with a batch G times longer, so the reported loss
-  converges to the true per-token loss while the window is still filling up.
-  See ``train_step`` for the ordering.
-* **Gradient clipping + ``grad_norm`` reporting.** ``clip_grad_norm_`` reduces
-  the norm across PP stages before clipping, which ``torch.nn.utils`` cannot do
-  because each stage holds disjoint parameters. The reported norm is therefore
-  the norm of the *normalized* gradient, matching the reference: a config
-  reporting 281 un-normalized reports ~0.56 once the loss is divided by the
-  token count before backward.
-* **A finiteness check**, reduced to one global flag across the loss and PP
-  meshes. A NaN loss or gradient looked exactly like a healthy step: training
-  continued and every later number was garbage. This stops at the first bad step
-  instead, and does it with an on-device check so it neither synchronizes (unlike
-  ``.item()``) nor becomes a CUDA-graph break.
-* **Garbage collection on the training loop's schedule.** The cyclic collector
-  is disabled process-wide and run at a step boundary instead, so it cannot fire
-  mid-forward -- see ``utils/gc``.
-* **Checkpoints**, so a run can be resumed rather than restarted. The loop only
-  drives the manager (``components/checkpointer``) -- it decides *when* to save
-  and load; the manager owns *how*, including the interval and retention
-  policies. ``Trainer.state_dict``/``load_state_dict`` are what make the step
-  and token counters part of the checkpoint.
-* **Metrics**, reported through ``components/metrics`` rather than a bare
-  ``logger.info``: the same loss and grad_norm, plus throughput, MFU and device
-  memory, to stdout and optionally TensorBoard or WandB. The processor also owns
-  the reporting frequency and the token/data-loading accounting, so the loop
-  only has to call ``add_tokens`` and ``log``. ``n_tokens_seen`` -- the
-  checkpointed cumulative count -- is logged alongside them, summed over the
-  same group the loss average spans so it counts each token once.
-* **A lowered process-group timeout once training is under way.** The groups
-  are created with the long startup timeout, because that is what model build
-  and the first collective genuinely need; ``train`` drops every one of them
-  (plus the world group) to ``parallel.train_timeout_seconds`` after this
-  process's first completed step, so a later hang is reported in seconds rather
-  than mistaken for a slow launch -- see ``accelerator.collectives.set_pg_timeouts``.
-* **Profiling**, through ``components/profiler``: ``Profiler`` is entered once
-  around the loop and stepped once per iteration, so Kineto traces land on a
-  schedule and allocator memory snapshots are written periodically -- plus one
-  more if the run dies of an OOM, which is the one that is usually wanted.
-* **Periodic validation**, ported from torchtitan's validator: an eval-mode,
-  gradient-free pass over a fresh dataloader every ``validation.freq`` steps,
-  reporting the summed loss over the *global* valid-token count reduced across
-  DP -- the same normalization the training loss uses, so the two numbers are
-  comparable. Opt-in via ``training.validation_config``; when it is ``None``
-  the loop below is bit-identical to not having the feature. The pass updates
-  no parameters and touches no checkpoint state. Zero batches and zero valid
-  tokens are loud errors, not a silently skipped report, the configurations
-  that cannot terminate cleanly (``steps=-1`` with DP > 1 or with the
-  infinite random corpus) are rejected at build time, and chunked loss x
-  validation is refused because the pass scores full logits. Under pipeline
-  parallelism the pass drives the schedule's eval driver
-  (``trainer/validate.py::validate_body_pp``).
-
-``train_step``'s execution order follows torchtitan's and is load-bearing:
-zero the gradients, snapshot the learning rate, read *every* batch the step
-consumes, reduce the token count, run the forward/backward groups, clip, check
-finiteness, wait for any in-flight checkpoint staging, step the optimizer and
-then the scheduler, and only then normalize the loss for reporting. Steps whose
-value must be identical across all the batches of a step -- the denominator and
-the reported lr -- are taken before any of them is consumed.
-
-What was NOT ported: torchtitan's component system (``model_spec``,
-``sdc_replayer``, CUDA graphs). Those are infrastructure the loop
-calls into, not loop logic, and llmtuner has no counterparts to call.
+Step order matters: read every accumulation batch, reduce the whole-batch
+valid-token count over DP, run forward/backward with that denominator, clip
+and check gradients, update the optimizer and scheduler, then report metrics.
+CP and TP partition tokens within a DP batch, so their loss sums are reduced
+across the sequence axes before reporting. PP stage losses are synchronized to
+all stages. The process group belongs to the entry point, not ``Trainer.close``.
 """
 
 from __future__ import annotations
@@ -104,7 +27,6 @@ from torch.distributed.tensor import DTensor
 
 from llmtuner.config import LLMTunerConfig, ValidationConfig
 
-from ..accelerator.capabilities import has as capability
 from ..accelerator.collectives import all_reduce, clip_grad_norm_, set_pg_timeouts
 from ..accelerator.spmd_context import spmd_context
 from ..components.checkpointer import CheckpointManager
@@ -125,13 +47,12 @@ from ..models.common.aux_loss import (
     collect_aux_loss_metrics,
 )
 from ..models.common.moe.block import MoE
-from ..parallel import matrix
 from ..parallel.parallel_dims import ParallelDims
 from ..parallel.tensor_parallel.tp import tp_sharded_param_ids
 from ..utils.gc import GarbageCollection
 from ..utils.logger_utils import get_logger
 from . import batch as batch_mod
-from . import builder
+from . import builder, pipeline_step
 from . import validate as validation_pass
 
 # Rank-aware: the helper attaches a handler whose filter passes below-ERROR
@@ -140,7 +61,6 @@ from . import validate as validation_pass
 logger = get_logger(__name__)
 
 __all__ = ["Trainer"]
-
 
 
 class Trainer:
@@ -427,52 +347,11 @@ class Trainer:
 
     # -- pipeline-parallel steps ----------------------------------------------
 
-    def pp_microbatches(self, batch: Batch | TrainerBatch) -> list[dict[str, Any]]:
-        """Split the rank's batch into the schedule's micro-batches.
-
-            Rows are split, never tokens: row-batched corpora (synthetic rows,
-            multimodal rows) chunk whole rows; a packed flat stream
-            (``raw.ndim == 1``) has no row boundaries and is rejected for
-            num_pp_microbatches > 1 (see matrix.pp_packed_microbatch_split).
-            Each surviving micro-batch's loss is the same summed CE.
-            Divisibility is enforced at setup (``apply_pp``), so ``chunk``
-            never leaves a short final piece.
-
-            The split happens here rather than inside ``preprocess_inputs``, which
-            is a deliberate divergence from the reference: torchtitan's protocol
-            returns a *list* of micro-batches, but llmtuner's PP path row-chunks one
-            batch after the model has already collapsed it, and splitting inside the
-            model would make every other caller of that method carry a batch dim it
-            does not want. Keeping the loop holding rows also means the model's
-            seam has exactly one shape contract.
-            """
-        raw = batch.labels if isinstance(batch, Batch) else batch["labels"]
-        num_microbatches = self.cfg.parallel.num_pp_microbatches
-        if isinstance(batch, dict):
-            if raw.ndim == 1 and num_microbatches > 1:
-                # A packed corpus batch is a flat token stream: splitting it
-                # would cut documents at the token level.
-                matrix.pp_packed_microbatch_split(num_microbatches)
-            total_rows = raw.shape[0]
-            rows_per_mb = total_rows // num_microbatches
-            mbs = []
-            for index in range(num_microbatches):
-                chunk = {
-                    key: (
-                        value[index * rows_per_mb : (index + 1) * rows_per_mb]
-                        if isinstance(value, torch.Tensor) and value.ndim > 0
-                        else value
-                    )
-                    for key, value in batch.items()
-                }
-                mbs.append(chunk)
-            return mbs
-        input_chunks = batch.input_ids.chunk(num_microbatches, dim=0)
-        label_chunks = batch.labels.chunk(num_microbatches, dim=0)
-        return [
-            Batch(input_ids=ids, labels=labels)
-            for ids, labels in zip(input_chunks, label_chunks, strict=True)
-        ]
+    def pp_microbatches(
+        self, batch: Batch | TrainerBatch
+    ) -> list[Batch | TrainerBatch]:
+        """Split this rank's batch into whole-row pipeline microbatches."""
+        return pipeline_step.split_pipeline_microbatches(self, batch)
 
     def pp_forward_backward_body(
         self,
@@ -480,101 +359,10 @@ class Trainer:
         *,
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """The pipeline-parallel body: drive the schedule instead of the model.
-
-            Only the first stage is handed the inputs (``arg_mbs``) and only the
-            last the labels (``target_mbs``); intermediate stages receive the
-            previous stage's activations over the schedule's p2p channel. Every
-            stage preprocesses its own micro-batches, because a non-first stage's
-            chunk holds hidden states rather than token ids and only the model knows
-            which of the two it is looking at.
-
-            The schedule's loss is the same summed next-token CE the non-PP body
-            computes (``pipeline_parallel/apply.py:scalar_loss_fn``), so the return
-            keeps the caller's normalization unchanged: the sum over the last
-            stage's micro-batches. That sum is over the last stage's *own* shard of
-            the sequence, which is why the caller's denominator -- counted before
-            the sequence was cut up -- is the right one.
-
-            ``global_valid_tokens`` reaches the loss function before the
-            schedule's backward -- through ``loss_kwargs`` on the public ``step``,
-            or the ``_llmtuner_global_valid_tokens`` schedule attribute on the
-            private pre-split driver -- and it divides there. The losses the
-            schedule reports are therefore sum/G, and they are multiplied back by
-            G here so the caller keeps receiving the raw sum it normalizes and
-            reports.
-
-            The token count is not taken here: the caller needs it before the
-            micro-batches are cut, and a stage's count would be over its own slice.
-            """
-        arg_mbs: list[tuple[torch.Tensor, ...]] = []
-        kwarg_mbs: list[dict[str, Any]] = []
-        target_mbs: list[torch.Tensor] | None = [] if self.pp_has_last_stage else None
-        for mb in self.pp_microbatches(batch):
-            inputs, labels, extra_kwargs = self.preprocess({"batch": mb})
-            if self.pp_has_first_stage:
-                arg_mbs.append((inputs,))
-            kwarg_mbs.append(extra_kwargs)
-            if target_mbs is not None:
-                target_mbs.append(labels)
-
-        losses: list[torch.Tensor] | None = [] if self.pp_has_last_stage else None
-        with self.param_context(), spmd_context(self.parallel_dims):
-            # ``_step_microbatches`` is the pre-split driver behind torch's public
-            # ``step``, and it is used directly when present: the wrapper re-splits
-            # the arguments it is handed, which is wrong for lists llmtuner already
-            # cut (the sequence was CP/TP-sharded before PP). The public call --
-            # upstream torchtitan's exact call -- stays as the fallback for builds
-            # whose private driver is absent. Both read the same loss function;
-            # only the denominator's route in differs, so it is published on the
-            # schedule before either runs, and ``loss_kwargs`` wins when the public
-            # path supplies it.
-            self.pp_schedule._llmtuner_global_valid_tokens = global_valid_tokens
-            if capability("pipelining_microbatch_drivers"):
-                # Signature-level probe (not hasattr): torch 2.9's driver exists
-                # but lacks return_outputs, and its eval() would swallow the
-                # microbatch kwargs.
-                # Calling the private driver bypasses step()'s setup. In
-                # particular, PipelineStage.has_backward defaults to False;
-                # without this, every backward is silently skipped and PP
-                # performs optimizer steps with no gradients.
-                stages = getattr(self.pp_schedule, "_stages", None)
-                if stages is None:
-                    stages = [self.pp_schedule._stage]
-                for stage in stages:
-                    stage.has_backward = self.pp_schedule._has_backward
-                    stage.clear_runtime_states()
-                self.pp_schedule._step_microbatches(
-                    arg_mbs if self.pp_has_first_stage else None,
-                    kwarg_mbs,
-                    target_mbs,
-                    losses,
-                    return_outputs=False,
-                )
-            else:
-                self.pp_schedule.step(
-                    arg_mbs=arg_mbs if self.pp_has_first_stage else None,
-                    kwarg_mbs=kwarg_mbs,
-                    target_mbs=target_mbs,
-                    losses=losses,
-                    loss_kwargs={"global_valid_tokens": global_valid_tokens},
-                    return_outputs=False,
-                )
-
-        if self.pp_has_last_stage:
-            assert losses is not None
-            assert global_valid_tokens is not None
-            # Backward has consumed these losses. Report detached views, then
-            # release the originals and their autograd graphs.
-            detached_losses = [loss.detach() for loss in losses]
-            losses.clear()
-            return torch.sum(torch.stack(detached_losses)) * global_valid_tokens
-        # Not the last stage: there is no loss here, and the caller's own loss
-        # sum must stay a real sum on every rank so the finiteness reduction --
-        # which every rank joins -- sees the same shape everywhere. Finite by
-        # construction, and never logged, because the metrics rank is a
-        # last-stage rank.
-        return self._pp_loss_sentinel
+        """Drive the pipeline schedule for one accumulation group."""
+        return pipeline_step.forward_backward_pipeline(
+            self, batch, global_valid_tokens=global_valid_tokens
+        )
 
     def _allreduce_replicated_tp_grads(self) -> None:
         """Sum the gradients of TP-*replicated* parameters across the TP group.
@@ -1005,7 +793,10 @@ class Trainer:
             all_reduce(ntokens_seen_tensor, group=loss_mesh.get_group())
             global_ntokens_seen = float(ntokens_seen_tensor)
         else:
-            loss_sum = local_max = loss
+            # Both tensors are reduced across PP below. They must not alias:
+            # the second all-reduce would otherwise sum the first result again.
+            loss_sum = loss
+            local_max = loss.clone()
             global_ntokens_seen = float(self.ntokens_seen)
         if pp_mesh is not None:
             # Each PP group contains one rank from every stage at the same

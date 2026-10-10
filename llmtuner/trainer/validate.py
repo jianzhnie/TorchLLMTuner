@@ -278,7 +278,7 @@ def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
     Upstream torchtitan's ``Validator`` seam: the pipeline schedule carries an
     eval-only driver, so a validation pass runs the same stages forward-only.
     The microbatch plumbing mirrors the training body
-    (``Trainer.pp_forward_backward_body``): first
+    (``pipeline_step.forward_backward_pipeline``): first
     stage gets the inputs, last stage the labels, and every stage gets the
     per-microbatch kwargs (positions, masks).
 

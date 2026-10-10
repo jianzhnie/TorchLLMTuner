@@ -175,7 +175,7 @@ import trainer 或读取全局 run config；跨 models/parallel 的依赖必须�
 引擎层（TP/CP fused kernel、FSDP、`spmd_context`、checkpoint 的 PG 生命周期）直连
 `torch.distributed` 与 `_functional_collectives` 等私有 API。
 
-目录结构（127 个 Python 文件，约 30.1k 行）：
+目录结构（128 个 Python 文件）：
 
 ```
 llmtuner/
@@ -188,9 +188,10 @@ llmtuner/
                                 + field_checks.py（各组共用的字段下限校验）
                                 + cli.py（CLI 视图，把 CLI 载不动的字段挡在
                                 --help 之外）+ __init__(全量再导出)
-  trainer/      6 文件          trainer.py / train.py / builder.py（装配段，
-                                顺序契约见模块 docstring）/ validate.py /
-                                batch.py
+  trainer/      7 文件          trainer.py（训练循环与稳定接口）/ train.py（CLI）/
+                                builder.py（装配顺序）/ batch.py（输入与计数）/
+                                pipeline_step.py（PP 分批与调度执行）/
+                                validate.py（验证流程）
   models/      23 文件          hf/{model,factory,flops,state_dict_adapter}.py（HF 适配：
                                 包装/构造/FLOPs/checkpoint 键）
                                 + common/{rope,activation,linear,feed_forward,
@@ -258,7 +259,7 @@ torch 版本/环境探测（`hasattr` 私有 knob、守卫 import）集中于单
 | `functorch_activation_memory_budget` | hasattr `torch._functorch.config` | torch 2.6 | activation_checkpoint.py（memory_budget） |
 | `dynamo_lru_cache` | `torch._C._dynamo.eval_frame._set_lru_cache` | 私有 knob（2.2.2 缺失） | activation_checkpoint.py（SAC+PP workaround） |
 | `torch_grouped_mm` | 实跑探测（bf16 哑调用） | torch 2.7 | moe/experts.py |
-| `pipelining_microbatch_drivers` | pipelining schedule 的微批驱动形态（eval + _step_microbatches） | torch main/2.10+ | pipeline_parallel/apply.py（装配期门槛）、trainer/{trainer,validate}.py（PP 训练/eval 驱动） |
+| `pipelining_microbatch_drivers` | pipelining schedule 的微批驱动形态（eval + _step_microbatches） | torch main/2.10+ | pipeline_parallel/apply.py（装配期门槛）、trainer/{pipeline_step,validate}.py（PP 训练/eval 驱动） |
 
 不纳入的：可选**包**（renderers/torchao/torchvision）保持本站 `ImportError`
 惯例；`device.py` 的设备发现是"缺席即静默"的可用性探测（另一种语义，且
