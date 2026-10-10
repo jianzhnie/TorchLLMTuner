@@ -48,6 +48,8 @@ from __future__ import annotations
 
 import os
 
+import torch.distributed as dist
+
 from transformers import HfArgumentParser
 
 from llmtuner.config import (
@@ -94,28 +96,37 @@ def parse_config() -> LLMTunerConfig:
 
 def main() -> None:
     cfg = parse_config()
-    trainer = Trainer(cfg)
-    if cfg.checkpoint.create_seed_checkpoint:
-        # Mirrors torchtitan ``train.py``: a seed checkpoint is the unsharded
-        # step-0 model, so it must be written from a single process (any
-        # sharding would bake one rank's shard layout into the artifact), and
-        # loading treats step-0 as model-only (see ``checkpointer/base.py``).
-        if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-            raise ConfigError(
-                "Must create a seed checkpoint using a single device, to "
-                "disable sharding."
-            )
-        if not cfg.checkpoint.enable:
-            raise ConfigError(
-                "Must enable checkpointing when creating a seed checkpoint."
-            )
-        try:
+    trainer = None
+    try:
+        trainer = Trainer(cfg)
+        if cfg.checkpoint.create_seed_checkpoint:
+            # Mirrors torchtitan ``train.py``: a seed checkpoint is the unsharded
+            # step-0 model, so it must be written from a single process (any
+            # sharding would bake one rank's shard layout into the artifact), and
+            # loading treats step-0 as model-only (see ``checkpointer/base.py``).
+            if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+                raise ConfigError(
+                    "Must create a seed checkpoint using a single device, to "
+                    "disable sharding."
+                )
+            if not cfg.checkpoint.enable:
+                raise ConfigError(
+                    "Must enable checkpointing when creating a seed checkpoint."
+                )
             if trainer.checkpointer.save(curr_step=0, last_step=True):
                 print("Created seed checkpoint at step 0")
-        finally:
+        else:
+            trainer.train()
+    finally:
+        # Trainer.close releases model-side resources but deliberately leaves
+        # the process group alive for callers that run another collective (for
+        # example validation or post-run aggregation).  The console entrypoint
+        # owns the process-group lifetime and tears it down here, matching
+        # torchtitan's train.py lifecycle.
+        if trainer is not None:
             trainer.close()
-        return
-    trainer.train()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

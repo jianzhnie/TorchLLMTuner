@@ -156,12 +156,10 @@ class ParallelDims:
             ["pp", "dp", "cp", "tp"]  # fwd/bwd dense mesh
             ["pp", "dp_replicate", "efsdp", "ep"]  # sparse_mesh
 
-        Note: DeviceMesh currently recreates the process group for each dimension.
-        It should share the process group for the same dim group to avoid unnecessary
-        process group creation. We can also use Fake to achieve a similar goal.
-        However, using Fake to avoid redundancy messing up the code. We only use Fake
-        when it is necessary. For now, we just let DeviceMesh create redundant process
-        group and wait for DeviceMesh to fix the issue.
+        DeviceMesh currently recreates process groups for each view. Use its
+        default backend for every axis, including inactive axes: PyTorch's
+        ``fake`` backend is not usable by all supported c10d builds. Inactive
+        axes are still hidden by ``get_optional_mesh``.
         """
 
         def unflatten_mesh(
@@ -171,19 +169,13 @@ class ParallelDims:
         ):
             """Unflatten the world mesh to create the required mesh dimensions.
 
-            Uses fake backend for dimensions with degree 1 or for 'batch' dimension
-            to avoid unnecessary process group creation.
+            Keep all axes backed by usable process groups so mesh slicing works
+            consistently across PyTorch versions and parallel combinations.
             """
-            backend_override = {}
-            for name, size in zip(dim_names, dim_sizes, strict=True):
-                if not self._mesh_exist(name, size):
-                    backend_override[name] = "fake"
-
             return world_mesh._unflatten(
                 0,
                 dim_sizes,
                 dim_names,
-                backend_override=backend_override,
             )
 
         logger.info(
@@ -408,18 +400,16 @@ class ParallelDims:
         access their process groups.
 
         Note:
-            Axes that ``build_mesh`` created with the Fake backend are excluded,
-            because their process groups cannot carry collectives. For example,
-            ``efsdp`` when EP is disabled: its size is ``dp_shard * cp * tp``,
-            but ``_mesh_exist`` marks it nonexistent so it is unflattened with a
-            fake backend.
+            Logically inactive axes are excluded by ``_mesh_exist``. For
+            example, ``efsdp`` is hidden when EP is disabled, even though the
+            underlying DeviceMesh has a usable process group for that view.
 
         Returns:
             dict[str, DeviceMesh]: A dictionary mapping mesh dimension names to their
                 corresponding DeviceMesh objects. Only includes meshes where:
                 - ndim == 1 (one-dimensional)
                 - parallelism is enabled (size > 1)
-                - the axis exists, i.e. it is not backed by the Fake backend
+                - the axis is logically active
 
         Example:
             >>> parallel_dims = ParallelDims(
