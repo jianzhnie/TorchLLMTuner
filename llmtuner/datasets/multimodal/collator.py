@@ -26,11 +26,9 @@ from .image import vision_to_patches
 
 __all__ = ["MultiModalCollator"]
 
-
 def text_positions(text_len: int, offset: int) -> torch.Tensor:
     """Sequential positions for a text run, identical on all 3 MRoPE axes."""
     return torch.arange(text_len).view(1, -1).expand(3, -1) + offset
-
 
 def vision_grid_positions(
     t: int, h: int, w: int, cache: dict[tuple[int, int, int], torch.Tensor]
@@ -44,7 +42,6 @@ def vision_grid_positions(
         w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
         cache[key] = torch.stack([t_index, h_index, w_index])
     return cache[key]
-
 
 class MultiModalCollator(Collator):
     """Multimodal collator for VLM training.
@@ -401,7 +398,6 @@ class MultiModalCollator(Collator):
             "num_valid_tokens": int((labels != IGNORE_INDEX).sum()),
         }
 
-        # Build multimodal RoPE positions.
         if self.build_mrope_positions and (
             grids is not None or video_grids is not None
         ):
