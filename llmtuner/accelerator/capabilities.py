@@ -208,7 +208,7 @@ CAPABILITIES: dict[str, Capability] = {
         since="torch main/2.10+ (2.9's eval swallows the microbatch kwargs)",
         hint="Upgrade torch, or run with pipeline_parallel_size=1.",
         consumers="pipeline_parallel/apply.py (PP assembly), "
-        "trainer/trainer.py + trainer/validate.py (PP train/eval drivers)",
+        "trainer/pipeline_step.py + trainer/validate.py (PP train/eval drivers)",
     ),
     # -- model kernels (consumer: models/common/moe/experts.py) ----------------
     "torch_grouped_mm": Capability(

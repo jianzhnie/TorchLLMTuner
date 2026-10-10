@@ -91,7 +91,6 @@ __all__ = [
     "TensorBoardLogger",
     "WandBLogger",
     "build_device_memory_monitor",
-    "ensure_pp_loss_visible",
     "get_metrics_rank",
 ]
 
@@ -336,11 +335,11 @@ def is_v_schedule(pp_schedule: str) -> bool:
 
 
 def get_metrics_rank(*, parallel_dims: ParallelDims, pp_schedule: str) -> int:
-    """The rank whose loss is the reportable one.
+    """Choose one rank for external metric writers.
 
-    Rank 0, except under pipeline parallelism, where the loss exists only on the
-    last stage. A V-block schedule is the exception twice over: it returns loss
-    on rank 0 like an ordinary run.
+    Trainer metrics are synchronized across PP stages; selecting the last
+    stage for ordinary schedules preserves the established writer location.
+    V schedules select rank 0, which owns their last virtual stage.
     """
     if not parallel_dims.pp_enabled:
         return 0
@@ -351,40 +350,6 @@ def get_metrics_rank(*, parallel_dims: ParallelDims, pp_schedule: str) -> int:
     # rank of the final stage block.
     pp_size = parallel_dims.pp
     return (parallel_dims.world_size // pp_size) * (pp_size - 1)
-
-
-def ensure_pp_loss_visible(
-    *,
-    parallel_dims: ParallelDims,
-    pp_schedule: str,
-    log_ranks,
-    color: Color | NoColor,
-) -> None:
-    """Warn when the loss will be computed on a rank nobody is watching.
-
-    Under pipeline parallelism the loss lives on one rank, and
-    ``MetricsConfig.log_ranks`` decides which ranks print. Getting that wrong
-    produces a run that trains correctly and reports nothing -- which reads
-    exactly like a hang.
-    """
-    if not parallel_dims.pp_enabled:
-        return
-    if is_v_schedule(pp_schedule):
-        return
-
-    loss_visible_rank = get_metrics_rank(
-        parallel_dims=parallel_dims, pp_schedule=pp_schedule
-    )
-    if loss_visible_rank not in set(log_ranks):
-        logger.warning(
-            "%sPipeline Parallel loss is not visible. Please add %srank %d%s to "
-            "metrics.log_ranks.%s",
-            color.red,
-            color.yellow,
-            loss_visible_rank,
-            color.red,
-            color.reset,
-        )
 
 
 @dataclass(kw_only=True, slots=True)
@@ -454,24 +419,6 @@ class MetricsProcessor:
         self.time_last_log = time.perf_counter()
         self.step_last_log: int | None = None
         self.device_memory_monitor.reset_peak_stats()
-
-    def ensure_pp_loss_visible(self) -> None:
-        """Run :func:`ensure_pp_loss_visible` with this processor's settings.
-
-        The standalone function needs three arguments, two of which the
-        processor already holds -- the resolved parallel dims and the schedule.
-        Exposing it as a method keeps the call site one line and keeps the
-        color policy in the one place that owns it, so a warning emitted from
-        here cannot disagree with the colors the metrics themselves print in.
-        """
-        if self.parallel_dims is None:
-            return
-        ensure_pp_loss_visible(
-            parallel_dims=self.parallel_dims,
-            pp_schedule=self._pp_schedule,
-            log_ranks=self.config.log_ranks,
-            color=self.color,
-        )
 
     @property
     def _non_data_parallel_size(self) -> int:
