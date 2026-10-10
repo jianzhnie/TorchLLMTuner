@@ -119,7 +119,9 @@ def _cfg(schedule: str) -> LLMTunerConfig:
     )
 
 
-def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
+def _reference_trajectory(
+    cfg: LLMTunerConfig, initial_state: dict[str, torch.Tensor]
+) -> tuple[list[float], list[float]]:
     """The same training step with no pipeline: same chunks, one process.
 
     Mirrors the trainer's step arithmetic exactly -- the same per-row target
@@ -129,6 +131,10 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
     """
     torch.manual_seed(cfg.seed)
     model = HFTransformerModel(build_model_config_for(cfg))
+    # PP deliberately derives a different initialization seed per stage.
+    # Rebuild the single-process oracle from those actual initial weights;
+    # otherwise even the first forward compares different models.
+    model.load_state_dict(initial_state)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr,
@@ -147,6 +153,7 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
         )
     )
     losses = []
+    norms = []
     for _ in range(cfg.steps):
         optimizer.zero_grad(set_to_none=True)
         batch = next(batches)
@@ -173,10 +180,11 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
             (loss / num_valid).backward()
             loss_sum = loss.detach() if loss_sum is None else loss_sum + loss.detach()
 
-        clip_grad_norm_(model.parameters(), max_norm=cfg.max_norm, foreach=True)
+        norm = clip_grad_norm_(model.parameters(), max_norm=cfg.max_norm, foreach=True)
+        norms.append(float(norm))
         optimizer.step()
         losses.append(float(loss_sum / num_valid))
-    return losses
+    return losses, norms
 
 
 def main() -> None:
@@ -247,13 +255,33 @@ def main() -> None:
             f"the whole model has {reference_numel}"
         )
 
+    local_initial_state = {
+        key: value.detach().cpu().clone()
+        for part in trainer.model_parts
+        for key, value in part.state_dict().items()
+    }
+    stage_states = [None] * trainer.world_size
+    dist.all_gather_object(stage_states, local_initial_state)
+    initial_state = {
+        key: value for stage_state in stage_states for key, value in stage_state.items()
+    }
+
     # -- the trajectory ------------------------------------------------------
     data_iterator = trainer.data_iterator()
     pp_losses = []
+    pp_norms = []
     for step in range(STEPS):
         trainer.step += 1
         metrics = trainer.train_step(data_iterator)
         assert metrics is not None  # log_freq=1: every step reports
+        if step == 0:
+            active_grads = sum(
+                p.grad is not None
+                for part in trainer.model_parts
+                for p in part.parameters()
+            )
+            if active_grads == 0:
+                failures.append(f"rank {rank}: PP backward produced no gradients")
         # Every rank must report the same cumulative token count. It describes
         # the data the step read, not the layer slice this stage holds, so a
         # count taken from a stage's own (sharded, micro-batched) slice would
@@ -272,8 +300,9 @@ def main() -> None:
             # sentinel, which is never logged (the metrics rank is the
             # last-stage rank -- rank 1, or rank 0 for a V layout).
             pp_losses.append(metrics["loss"])
+            pp_norms.append(metrics["grad_norm"])
 
-    reference = _reference_trajectory(cfg)
+    reference, reference_norms = _reference_trajectory(cfg, initial_state)
 
     # The real losses live on the rank holding the last stage; collect them on
     # rank 0 for the report. That rank is the last one for single-stage and
@@ -286,6 +315,9 @@ def main() -> None:
     gathered = [pp_losses]
     dist.broadcast_object_list(gathered, src=metrics_rank)
     pp_losses = gathered[0]
+    gathered_norms = [pp_norms]
+    dist.broadcast_object_list(gathered_norms, src=metrics_rank)
+    pp_norms = gathered_norms[0]
 
     # Every rank has both series now (the reference is computed locally and
     # identically on each), so every rank runs the comparison.
@@ -297,6 +329,14 @@ def main() -> None:
             failures.append(
                 f"rank {rank}: step {step} loss {got:.6f} vs reference "
                 f"{want:.6f} (diff {diff:.3e})"
+            )
+    for step, (got, want) in enumerate(
+        zip(pp_norms, reference_norms, strict=True), 1
+    ):
+        if not torch.isclose(torch.tensor(got), torch.tensor(want), rtol=TOL, atol=TOL):
+            failures.append(
+                f"rank {rank}: step {step} grad norm {got:.6f} vs "
+                f"reference {want:.6f}"
             )
 
     # Every rank must agree that every check passed, not just report its own.
@@ -310,6 +350,8 @@ def main() -> None:
         )
         print(f"reference losses = {[f'{x:.6f}' for x in reference]}")
         print(f"pp losses        = {[f'{x:.6f}' for x in pp_losses]}")
+        print(f"reference norms  = {[f'{x:.6f}' for x in reference_norms]}")
+        print(f"pp norms         = {[f'{x:.6f}' for x in pp_norms]}")
         print(f"max abs diff     = {max_diff:.3e}")
         print(f"failed ranks     = {int(local_ok.item())}")
         for f in failures:

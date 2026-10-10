@@ -53,8 +53,15 @@ def functional_collectives():
     variants explicitly: the non-autograd collectives would silently break TP
     weight/input gradients.
     """
-    from torch.distributed import functional_collectives as funcol
+    try:
+        from torch.distributed import functional_collectives as funcol
+    except ImportError:
+        # PyTorch 2.14 exposes the autograd collectives under the private
+        # module name only; the public alias existed in older releases.
+        from torch.distributed import _functional_collectives as funcol
 
+    if hasattr(funcol, "all_gather_single_autograd"):
+        return funcol.all_gather_single_autograd, funcol.reduce_scatter_single_autograd
     if hasattr(funcol, "all_gather_tensor_autograd"):
         return funcol.all_gather_tensor_autograd, funcol.reduce_scatter_tensor_autograd
     if hasattr(funcol, "all_gather_single"):

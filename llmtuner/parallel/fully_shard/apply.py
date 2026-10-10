@@ -83,10 +83,11 @@ def apply_fsdp(
         return model
 
     storage_mesh = resolve_fsdp_mesh(parallel_dims)
-    if storage_mesh.size() == 1:
-        return model
-
     edp_mesh = resolve_sparse_fsdp_mesh(parallel_dims)
+    # EP borrows ranks from the dense TP/CP/DP shard region. Dense DP can be
+    # size 1 while the remaining expert-FSDP (efsdp) axis is still multi-rank.
+    if storage_mesh.size() == 1 and (edp_mesh is None or edp_mesh.size() == 1):
+        return model
 
     # Preserve the dtype selected at model construction. Hard-coding float32
     # here silently makes FSDP all-gather BF16 parameters as FP32, doubling the

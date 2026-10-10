@@ -555,7 +555,7 @@ HFTransformerModel.forward       -> tok_embeddings -> layers -> norm -> lm_head
             CP 选择 K/V all-gather 或 Ulysses token↔head all-to-all
             EP 的 all-to-all dispatcher 在 MoE 前后换位
 PP 时: schedule.step(arg_mbs / target_mbs) 驱动各 stage，末 stage 出 loss
-loss (sum 归约, loss mesh) -> backward -> clip_grad_norm_ (跨 PP 归约) -> AdamW.step
+loss (sum 归约, loss mesh) -> backward -> clip_grad_norm_ (TP/EP/PP 范数归约) -> AdamW.step
 ```
 
 ## 7. 正确性验证策略

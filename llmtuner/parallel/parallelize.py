@@ -174,7 +174,9 @@ def parallelize_hf_transformers(
                 stages,
                 cfg=cfg,
                 tp_group=None if tp_mesh is None else tp_mesh.get_group(),
-                global_vocab_size=getattr(model, "vocab_size", None),
+                global_vocab_size=(
+                    None if tp_mesh is None else getattr(model, "vocab_size", None)
+                ),
             ),
             stages=stages,
             model_parts=model_parts,
