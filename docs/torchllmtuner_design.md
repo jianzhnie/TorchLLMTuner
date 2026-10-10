@@ -205,10 +205,9 @@ llmtuner/
                                 stages.py（装配 stage 表）head_sharding.py
                                 remat_regions.py
                                 parallel_dims.py parallelize.py
-  accelerator/  7 文件          device.py（设备发现/backend 选择）
+  accelerator/  6 文件          device.py（设备发现/backend 选择）
                                 capabilities.py（能力注册表）
                                 collectives.py（归约/超时/grad norm）
-                                monitoring.py（显存监控/peak FLOPS）
                                 spmd_context.py（SPMD mesh 作用域 + 轴查询, 最底层）
                                 + dist_utils.py（vendored mmengine.dist 引导/查询面；collective 在 collectives.py）
                                 （mesh 构建在 parallel/parallel_dims.py，单轨）
@@ -217,7 +216,7 @@ llmtuner/
                                 / optimizer
   datasets/    18 文件          Grain 数据图 + random_data + types.py(Batch)
                                 + packing/ + {text(含 renderer),multimodal}
-  utils/        4 文件          logger_utils / gc / lazy_exports
+  utils/        5 文件          logger_utils / gc / lazy_exports / monitoring
                                 （filesystem 与 checkpoint_keys 归
                                 components/checkpointer/；seed 归 trainer/）
 

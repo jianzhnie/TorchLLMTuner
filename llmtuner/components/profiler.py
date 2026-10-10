@@ -37,7 +37,7 @@ Departures from torchtitan, each a subtraction or a device-portability fix:
   describes the device the run is actually on.
 
 * **Memory history is recorded through the device module, not ``torch``.** See
-  ``accelerator/monitoring.record_memory_history`` -- torchtitan's non-CUDA
+  ``utils/monitoring.record_memory_history`` -- torchtitan's non-CUDA
   branch calls ``torch.memory``, which does not exist.
 
 One addition: the rank comes from ``utils/logger_utils``, so a single-process
@@ -57,8 +57,8 @@ if TYPE_CHECKING:
     from ..config import ProfilerConfig
 
 from ..accelerator.device import device_type
-from ..accelerator.monitoring import read_memory_snapshot, record_memory_history
 from ..utils.logger_utils import get_distributed_rank, get_logger
+from ..utils.monitoring import read_memory_snapshot, record_memory_history
 
 logger = get_logger(__name__)
 

@@ -8,7 +8,6 @@ Members:
 * ``collectives.py`` -- PG timeouts (``set_pg_timeouts``), the in-place
   ``all_reduce`` used for loss/token denominators, and EP-aware
   ``clip_grad_norm_``.
-* ``monitoring.py`` -- device memory monitors/snapshots and ``get_peak_flops``.
 * ``spmd_context.py`` -- the ambient SPMD mesh context (TLS mesh stack and
   by-name process-group queries) that trainer and ``models/common`` read.
 * ``dist_utils.py`` -- process-group bootstrap and rank/world queries, vendored
@@ -17,7 +16,7 @@ Members:
 
 ``dist_utils`` is re-exported here lazily (PEP 562): importing this package or
 a sibling submodule (``llmtuner.accelerator.device`` ...) does not pay for it
-unless a toolbox name is actually touched. ``collectives`` / ``monitoring`` /
+unless a toolbox name is actually touched. ``collectives`` /
 ``spmd_context`` are imported as submodules -- re-exporting them would make
 ``import llmtuner.accelerator`` pull in the parallel and trainer layers and
 close an import cycle. Topology construction (``build_parallel_dims`` /
