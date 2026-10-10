@@ -133,7 +133,7 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `parallel/context_parallel/cp_kernel.py` | 0.051；llmtuner 独有的 CP flex kernel |
 | `parallel/context_parallel/input_shard.py` | 0.078 |
 | `utils/logger_utils.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤，默认 INFO）、`get_distributed_rank` | C |
-| `accelerator/monitoring.py` | 与 `tools/utils.py` 0.107，独立实现（含 `get_peak_flops`） |
+| `utils/monitoring.py` | 与 `tools/utils.py` 0.107，独立实现（含 `get_peak_flops`） |
 | `components/checkpointer/checkpoint_keys.py` | 上游无 |
 | `accelerator/device.py` | 上游无（0.382 是噪音，命中实验目录） |
 | `models/common/activation.py` | 与上游同名但不同源；公式由 llmtuner 自持，不能按 A 类覆盖 |
@@ -917,7 +917,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 | logger 类与 `LoggerContainer` | 同文件 | optional TensorBoard/W&B 延迟导入，**通过**；镜像需安装对应包。`WandBLogger.log` 带 `commit=True`（上游 e0e35fe5a），防显式 step 被合并 |
 | `MetricsProcessor` | 同名上游类 | 去 Configurable；按真实 step window 算吞吐/MFU，log frequency 构造时校验，**通过（适配）**。训练/校验两条日志的 key 集合与 `tps`/`tflops`/`time_metrics`/`memory` 公式与上游一致；差异为形状——上游自由函数 `compute_training_performance_metrics` 的载荷内联进 `_derive`/`DerivedMetrics`，MFU 抑制条件由 `has_quantization` 换成 `gpu_peak_flops == 0 or num_flops_per_token == 0`（无量化路径的等价替代，见模块 docstring），`_build_metric_logger` 去掉 `ft_*` 并只吞 ImportError；`should_log` 不写 `step_last_log`（无副作用，容忍先 log 后 should_log）。模块全程不碰 `torch.distributed` |
 | `get_metrics_rank`, `ensure_pp_loss_visible` | 上游 `_get_metrics_rank` / PP warning | llmtuner 明确 PP schedule 可见性：rank 查询去私有化为 `get_metrics_rank`，`ensure_pp_loss_visible` 增加 `not pp_enabled` 提前返回（上游无该守卫，只靠唯一调用点门控，语义等价），**通过** |
-| `Profiler`, `MemoryProfiler` | `observability/profiler.py` | 去 Configurable，schedule 与 OOM 处理保留；`caused_by_oom` 与上游 773e16e75 语义等价（含防环与隐式链）。activity 列表按 resolved device：CUDA 可用加 CUDA，否则 XPU 可用加 XPU（其余设备仍 CPU-only，与上游一致），用例 `test_the_trace_activity_follows_the_resolved_device` 钉住 cpu/cuda/xpu 三态。裁剪登记：`leaf_folder`（只服务上游 torchft 的 per-replica 子目录）、CUDA-graph annotations（随 D10 无图路径）、`structured_logger` span、`active()` builder；memory history 经 `accelerator/monitoring` 的 device 探针（上游非 CUDA 分支调不存在的 `torch.memory`），**通过（适配）** |
+| `Profiler`, `MemoryProfiler` | `observability/profiler.py` | 去 Configurable，schedule 与 OOM 处理保留；`caused_by_oom` 与上游 773e16e75 语义等价（含防环与隐式链）。activity 列表按 resolved device：CUDA 可用加 CUDA，否则 XPU 可用加 XPU（其余设备仍 CPU-only，与上游一致），用例 `test_the_trace_activity_follows_the_resolved_device` 钉住 cpu/cuda/xpu 三态。裁剪登记：`leaf_folder`（只服务上游 torchft 的 per-replica 子目录）、CUDA-graph annotations（随 D10 无图路径）、`structured_logger` span、`active()` builder；memory history 经 `utils/monitoring` 的 device 探针（上游非 CUDA 分支调不存在的 `torch.memory`），**通过（适配）** |
 | `BaseTokenizer`, `HuggingFaceTokenizer` | `components/tokenizer.py` | A1；encode 强制 `add_special_tokens=False` 后自行处理 BOS/EOS。`apply_chat_template` 接受 `Sequence[Mapping]`（上游 4a0d8dab3 多轮 SFT 配套），**通过**。`apply_chat_template` 自动注入 `bos_token`/`eos_token` kwargs 与默认 `add_generation_prompt=True`（上游 backend tokenizer 同源）；SFT 全量渲染在 `datasets/text/processors.py` 显式传 `add_generation_prompt=False` |
 | `MultiModalTokenizer` | 同文件多模态 tokenizer | 组合 text/vision token 契约，**通过** |
 
@@ -928,7 +928,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 | `components/checkpointer/filesystem.py` | `tools/filesystem.py` | A1，去 docstring 后 AST 等价，**通过** |
 | `accelerator.spmd_context.*` | 意图接近 `distributed/spmd_types.py`，实际基于 pip `spmd_types` | C 类活代码；不要替换成上游 module protocol |
 | `accelerator.device.*` | 无可靠同源 | C 类，统一 NPU/CUDA/MLU/MUSA/CPU 设备信息与 backend 选择 |
-| `accelerator.monitoring.*` | 部分意图见 `tools/utils.py` | C 类，包含 peak FLOPS（含 MI350X）和 memory snapshot |
+| `utils.monitoring.*` | 部分意图见 `tools/utils.py` | C 类，包含 peak FLOPS（含 MI350X）和 memory snapshot |
 | `utils.gc.GarbageCollection` | `tools/utils.py` GC helper | 去 structured logger，**通过（适配）** |
 | `utils.logger_utils.*` | 无单一对应 | C 类日志格式与 rank helper；全仓模块 logger 统一经 `get_logger`（发射时 rank 过滤），级别默认 INFO（上游 `TITAN_LOG_LEVEL` 未移植：不引入项目级环境变量） |
 | `components/checkpointer/checkpoint_keys.py` | 无文件对应 | C 类，checkpoint state key 常量的单一来源 |
@@ -1134,7 +1134,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `utils/gc.py` | `GarbageCollection` | B，`tools/utils.py` |
 | `utils/logger_utils.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤，默认 INFO）、`set_log_ranks`（控制台打印 rank 集合，由 `MetricsConfig.log_ranks` 接线）、`get_distributed_rank` | C |
 | `utils/lazy_exports.py` | `export_names` / `resolve_export`：各包索引共用的 PEP 562 懒加载实现 | C |
-| `accelerator/monitoring.py` | device/memory/FLOPS helpers | C；部分意图可参考 `tools/utils.py` |
+| `utils/monitoring.py` | device/memory/FLOPS helpers | C；部分意图可参考 `tools/utils.py` |
 | `accelerator/spmd_context.py` | SPMD mesh 上下文 | C，pip `spmd_types` 适配 |
 
 五条横切约定，适用于上表所有模块：

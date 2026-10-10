@@ -1,4 +1,4 @@
-"""Small dependency-free helpers: no torch, no llmtuner imports above this line.
+"""Shared helper modules. Importing this package itself has no torch dependency.
 
 Members:
 
@@ -8,8 +8,10 @@ Members:
   at emit time) and ``get_distributed_rank``.
 * ``lazy_exports.py`` -- the one implementation of the PEP 562 lazy package
   index that the package indexes here share.
+* ``monitoring.py`` -- hardware probes and allocator memory snapshots; import
+  this torch-backed submodule only where device monitoring is needed.
 
-The layer is a leaf on purpose: ``logger_utils`` reads the environment, and
-``lazy_exports`` imports only the standard library, so anything can import them
-without a cycle -- including ``llmtuner/__init__.py`` itself.
+The package is a leaf on purpose. Its light-weight helpers can be imported
+without a cycle -- including from ``llmtuner/__init__.py`` -- while
+``monitoring`` is imported only explicitly by its users.
 """

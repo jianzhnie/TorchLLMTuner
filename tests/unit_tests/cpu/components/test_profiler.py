@@ -16,7 +16,6 @@ import pickle
 import pytest
 import torch
 
-from llmtuner.accelerator.monitoring import record_memory_history
 from llmtuner.components import profiler as profiler_module
 from llmtuner.components.profiler import (
     MEMORY_EXIT_DIR,
@@ -27,6 +26,7 @@ from llmtuner.components.profiler import (
     caused_by_oom,
 )
 from llmtuner.config import ProfilerConfig as Config
+from llmtuner.utils.monitoring import record_memory_history
 
 # -- config -------------------------------------------------------------------
 

@@ -31,7 +31,7 @@ Departures from torchtitan, all subtractions:
   set to is a branch nothing can exercise.
 
 * **Colour is vetoed by the terminal, not only by the config.** See
-  ``accelerator/monitoring.colors_enabled``.
+  ``utils/monitoring.colors_enabled``.
 
 * **MFU is suppressed when the device is unknown**, rather than assuming A100
   peak. A ratio measured against the wrong denominator is worse than no ratio,
@@ -60,7 +60,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from ..accelerator.monitoring import (
+from ..utils.logger_utils import get_distributed_rank, get_logger
+from ..utils.monitoring import (
     Color,
     NoColor,
     colors_enabled,
@@ -68,7 +69,6 @@ from ..accelerator.monitoring import (
     get_device_name,
     get_peak_flops,
 )
-from ..utils.logger_utils import get_distributed_rank, get_logger
 
 if TYPE_CHECKING:
     # Annotation-only. ``parallel_dims`` imports the training config, which
