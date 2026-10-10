@@ -1112,7 +1112,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `parallel/context_parallel/apply.py` | `apply_cp` | C，独立 HF 编排层 |
 | `parallel/context_parallel/cp_kernel.py` | `CPFlexKernel` 与 seq/head autograd | C，CP flex attention 组合实现 |
 | `parallel/context_parallel/input_shard.py` | CP/TP batch 和 mask sharding | C，独立输入分片层 |
-| `accelerator/dist_utils.py` | init_dist 多 launcher（后端字符串由 `device.py` 单源驱动）、rank/group 查询、`cast_data_device` | C，vendored 自 OpenMMLab `mmengine.dist`（非 torchtitan 来源），已去 mmengine 化；原同包 `dist.py` 的无消费者面（object collectives、gather/broadcast、collect_results 等）已删，唯一在用的 `all_reduce` 并入 `collectives.py` |
+| `accelerator/dist_utils.py`、`accelerator/tensor_transfer.py` | 前者负责 init_dist 多 launcher 与 rank/group 查询；后者负责嵌套张量设备搬运，旧导入路径继续可用 | C，vendored 自 OpenMMLab `mmengine.dist`（非 torchtitan 来源），已去 mmengine 化；原同包 `dist.py` 的无消费者面（object collectives、gather/broadcast、collect_results 等）已删，唯一在用的 `all_reduce` 并入 `collectives.py` |
 | `parallel/expert_parallel/apply.py` | `apply_ep` | B，模型 EP parallelize |
 | `parallel/expert_parallel/swap.py`（编排）+ `probe.py`（探测）+ `convert.py`（转换） | HF MoE 探测、权重搬运与 swap | B，transformers backend `moe_replacement.py` |
 | `parallel/fully_shard/fsdp.py` | FSDP engine、mesh 与 placement | A2，`distributed/fsdp.py` |

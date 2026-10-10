@@ -11,8 +11,8 @@ Members:
 * ``spmd_context.py`` -- the ambient SPMD mesh context (TLS mesh stack and
   by-name process-group queries) that trainer and ``models/common`` read.
 * ``dist_utils.py`` -- process-group bootstrap and rank/world queries, vendored
-  from OpenMMLab's ``mmengine.dist`` and de-mmengine'd to depend only on torch
-  and ``.device`` (multi-launcher ``init_dist``, ``cast_data_device``).
+  from OpenMMLab's ``mmengine.dist`` and de-mmengine'd to depend only on torch.
+* ``tensor_transfer.py`` -- nested tensor device inspection and movement.
 
 ``dist_utils`` is re-exported here lazily (PEP 562): importing this package or
 a sibling submodule (``llmtuner.accelerator.device`` ...) does not pay for it
@@ -31,10 +31,10 @@ from ..utils.lazy_exports import export_names, resolve_export
 
 _EXPORT_SOURCES = {
     "barrier": "dist_utils",
-    "cast_data_device": "dist_utils",
+    "cast_data_device": "tensor_transfer",
     "get_backend": "dist_utils",
     "get_comm_device": "dist_utils",
-    "get_data_device": "dist_utils",
+    "get_data_device": "tensor_transfer",
     "get_dist_info": "dist_utils",
     "get_rank": "dist_utils",
     "get_world_size": "dist_utils",
