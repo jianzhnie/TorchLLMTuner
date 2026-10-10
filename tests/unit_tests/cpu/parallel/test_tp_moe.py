@@ -169,10 +169,10 @@ def test_expert_shards_reconstruct_the_full_weights() -> None:
         torch.manual_seed(0)
         b = _MoeBlock(num_experts=4, dim=16, hidden=8, top_k=2)
         ids = shard_experts_for_tp(b, tp_size=2, tp_rank=rank)
-        assert id(b.experts.gate_up_proj) in ids
-        assert id(b.experts.down_proj) in ids
+        assert "experts.gate_up_proj" in ids
+        assert "experts.down_proj" in ids
         # The router is never sharded.
-        assert id(b.gate.weight) not in ids
+        assert "gate.weight" not in ids
         shards.append(
             (b.experts.gate_up_proj.detach(), b.experts.down_proj.detach())
         )

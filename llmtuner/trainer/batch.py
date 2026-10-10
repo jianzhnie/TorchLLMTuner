@@ -186,6 +186,16 @@ def count_valid_tokens(batch: Batch | TrainerBatch) -> int:
     return num_valid_tokens
 
 
+def count_routing_tokens(batch: Batch | TrainerBatch) -> int:
+    """Count tokens seen by the router, including prompt labels but not padding."""
+    if isinstance(batch, Batch):
+        return batch.input_ids.numel()
+    padding_mask = batch.get("padding_mask")
+    if padding_mask is not None:
+        return int((~padding_mask.to(torch.bool)).sum())
+    return batch["input"].numel()
+
+
 def microbatch(self, batch: Batch | TrainerBatch) -> dict[str, Any]:
     """Everything one accumulation group's forward/backward needs.
 
@@ -223,11 +233,17 @@ def microbatch(self, batch: Batch | TrainerBatch) -> dict[str, Any]:
     self.ntokens_seen += labels.numel() // sequence_shards
     num_valid_tokens = self.count_valid_tokens(batch)
 
+    num_routing_tokens = count_routing_tokens(batch)
+
     if isinstance(batch, dict):
         # ``num_valid_tokens`` is the model's to ignore, and a plain int
         # among tensors would be splatted into the forward as a kwarg.
         batch.pop("num_valid_tokens", None)
-    return {"batch": batch, "num_valid_tokens": num_valid_tokens}
+    return {
+        "batch": batch,
+        "num_valid_tokens": num_valid_tokens,
+        "num_routing_tokens": num_routing_tokens,
+    }
 
 def to_device(self, batch: Batch | TrainerBatch) -> Batch | TrainerBatch:
     """Move one consumption group's tensors to the training device.

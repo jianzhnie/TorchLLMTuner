@@ -5,14 +5,9 @@ Vendored from torchtitan ``models/common/aux_loss.py``. What changed:
 * The ``Module`` protocol and its ``Config`` carrier are gone; ``AuxLoss``
   takes its coefficients as keyword args, and ``_init_self_buffers`` (a
   meta-device build hook) is dropped.
-* ``torch_remat`` is gone. Upstream wraps the accumulation in a
-  ``remat.region(..., recompute=False)`` so ``torch_remat``'s activation
-  checkpointing retains the region instead of replaying the side effect. llmtuner
-  does not depend on ``torch_remat``, so the accumulation is simply inline. The
-  injected gradient is unaffected; what changes is that under *any* activation
-  checkpointing the forward is replayed and the logged metric counts the
-  microbatch once per replay. Treat the logged value as a relative signal under
-  checkpointing, not an absolute one.
+* ``torch_remat`` is optional. Region AC marks the accumulation and injection
+  as a retained region; full/selective AC suppress the replayed metric write
+  through their checkpoint recompute context.
 * The ``spmd_types`` blocks are gone. ``spmd_assert_type`` on the injection's
   output described a placement the framework already inferred.
 * ``OptimizersContainer`` becomes a plain ``torch.optim.Optimizer`` (llmtuner's
@@ -20,10 +15,10 @@ Vendored from torchtitan ``models/common/aux_loss.py``. What changed:
 
 Design, unchanged from upstream:
 
-Normalization: every auxiliary loss is scaled by the step's global valid-token
-count (``set_step_denominator``), the same denominator the main loss uses, so
-contributions stay comparable across parallelism degrees. The per-step metric
-is the mean over loss instances (layers) of that scaled value, summed over
+Normalization: every auxiliary loss is scaled by the step's global routed-token
+count (``set_step_denominator``), including masked prompt tokens but excluding
+padding. The per-step metric is the mean over loss instances (layers) of that
+scaled value, summed over
 data-parallel ranks and pipeline stages.
 
 The metric accumulates during the model forward. A step pre-hook rolls the
@@ -36,6 +31,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from collections.abc import Sequence
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -57,6 +53,13 @@ __all__ = [
     "collect_aux_loss_metrics",
     "register_aux_loss_zero_hook",
 ]
+
+# Non-reentrant activation checkpointing replays the forward during backward.
+# Its recompute context suppresses metric side effects, while the injection
+# remains in the graph so the router gradient is still computed.
+in_checkpoint_recompute: ContextVar[bool] = ContextVar(
+    "in_checkpoint_recompute", default=False
+)
 
 
 class AuxLossInjection(torch.autograd.Function):
@@ -96,7 +99,7 @@ class AuxLoss(nn.Module):
             per-token-additive losses whose rank-local values add up across
             coordinates.
 
-    Normalization: ``denominator`` is the step's global valid-token count, set
+    Normalization: ``denominator`` is the step's global routed-token count, set
     by the trainer via ``set_step_denominator`` before the first forward.
     """
 
@@ -108,10 +111,8 @@ class AuxLoss(nn.Module):
     # over all layers of the model.
     _group_counts: ClassVar[dict[tuple[str, str], int]] = defaultdict(int)
 
-    # Global valid-token count of the current step, set by the trainer before
-    # the first forward. Shared by all instances: the framework normalizes
-    # every auxiliary loss by the same per-step count, matching the main loss,
-    # so contributions are comparable across parallelism degrees.
+    # Global routed-token count of the current step, set before the first
+    # forward. Unlike CE's denominator, this includes masked prompt tokens.
     _step_denominator: ClassVar[torch.Tensor | None] = None
 
     # Per metric group (``(reduce_mesh, metric_name)``): this rank's total value
@@ -152,11 +153,10 @@ class AuxLoss(nn.Module):
 
     @classmethod
     def set_step_denominator(cls, denominator: torch.Tensor) -> None:
-        """Set the current step's global valid-token count.
+        """Set the current step's global routed-token count.
 
-        The trainer calls this once per step with the same dp-summed token count
-        the main loss normalizes by, so auxiliary losses stay on the same scale
-        as the main loss and independent of parallelism degrees.
+        The trainer calls this once per step with the DP-summed count of
+        non-padding input tokens that pass through the router.
         """
         cls._step_denominator = denominator
 
@@ -177,18 +177,37 @@ class AuxLoss(nn.Module):
         if AuxLoss._step_denominator is None:
             raise ValueError(
                 "AuxLoss.set_step_denominator() must be called with the "
-                "step's global valid-token count before the first forward."
+                "step's global routed-token count before the first forward."
             )
         denominator = AuxLoss._step_denominator
-        # clamp_min(1): an all-padding step has zero valid tokens, and inf
+        # clamp_min(1): an all-padding step has zero routed tokens, and inf
         # here would poison the router gradients it is injected into
         # (upstream's guard, same line).
+        metric_region = getattr(self, "_metric_region_fn", None)
+        if metric_region is not None:
+            result = metric_region(raw_sum, carrier=carrier, denominator=denominator)
+            needs_tensor = getattr(self, "_metric_region_needs_tensor", None)
+            if needs_tensor is not None:
+                needs_tensor(result)
+            return result
+        return self._accumulate_and_inject(
+            raw_sum, carrier=carrier, denominator=denominator
+        )
+
+    def _accumulate_and_inject(
+        self,
+        raw_sum: torch.Tensor,
+        *,
+        carrier: torch.Tensor,
+        denominator: torch.Tensor,
+    ) -> torch.Tensor:
         scale = 1.0 / denominator.clamp_min(1)
         injected = raw_sum * (self.coeff * scale)
         # Accumulate the metric in the forward. The no_grad mask keeps the
         # buffer out of the autograd graph.
-        with torch.no_grad():
-            self.instance_acc.add_(raw_sum * scale)
+        if not in_checkpoint_recompute.get():
+            with torch.no_grad():
+                self.instance_acc.add_(raw_sum * scale)
         return AuxLossInjection.apply(carrier, injected)
 
 

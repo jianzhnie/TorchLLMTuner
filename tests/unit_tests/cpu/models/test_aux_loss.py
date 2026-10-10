@@ -24,6 +24,8 @@ depend on the carrier, ``_TraceableLoss`` does not return it downstream.
 
 from __future__ import annotations
 
+import sys
+
 from tests.caps import require_env
 
 require_env('spmd_types')
@@ -32,13 +34,20 @@ require_env('spmd_types')
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
+from llmtuner.config import RegionACConfig, SelectiveACConfig
 from llmtuner.models.common.aux_loss import (
     AuxLoss,
     collect_aux_loss_metrics,
     zero_aux_losses,
 )
 from llmtuner.models.common.moe.load_balance import MicrobatchWiseLoadBalanceLoss
+from llmtuner.parallel.activation_checkpoint import (
+    wrap_full,
+    wrap_region,
+    wrap_selective,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -83,6 +92,76 @@ class _NoMeshes:
 
     def get_optional_mesh(self, dims, **kwargs):
         return None
+
+
+@pytest.mark.parametrize("mode", ["full", "selective"])
+def test_checkpoint_recompute_keeps_router_gradient_without_double_metric(mode):
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(3, 3)
+            self.aux = _TraceableLoss(coeff=0.3)
+            self.forward_calls = 0
+
+        def forward(self, x):
+            self.forward_calls += 1
+            y = self.linear(x)
+            return self.aux(y, carrier=y)
+
+    torch.manual_seed(7)
+    block = Block()
+    x = torch.randn(2, 3, requires_grad=True)
+    expected_metric = float((2 * block.linear(x).sum() / 6).detach())
+    AuxLoss.set_step_denominator(torch.tensor(6.0))
+    wrapped = (
+        wrap_full(block)
+        if mode == "full"
+        else wrap_selective(block, SelectiveACConfig())
+    )
+
+    wrapped(x).square().sum().backward()
+
+    assert block.forward_calls == 2
+    assert float(block.aux.instance_acc) == pytest.approx(expected_metric)
+    assert block.linear.weight.grad is not None
+    assert torch.isfinite(block.linear.weight.grad).all()
+
+
+def test_region_checkpoint_retains_aux_metric_region(monkeypatch):
+    class FakeRemat:
+        def __init__(self):
+            self.regions = []
+            self.tensor_marked = False
+
+        def region(self, fn, name, *, recompute):
+            self.regions.append((name, recompute))
+            return fn
+
+        def checkpoint(self, **kwargs):
+            return lambda fn: fn
+
+        def recompute_needs_tensor(self, out):
+            self.tensor_marked = True
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(2, 2)
+            self.aux = _TraceableLoss(coeff=0.2)
+
+        def forward(self, x):
+            y = self.linear(x)
+            return self.aux(y, carrier=y)
+
+    remat = FakeRemat()
+    monkeypatch.setitem(sys.modules, "torch_remat", remat)
+    block = wrap_region(Block(), RegionACConfig(), base_fqn="layers.0")
+    AuxLoss.set_step_denominator(torch.tensor(2.0))
+    block(torch.ones(1, 2)).sum().backward()
+
+    assert ("layers.0.aux.aux_loss", False) in remat.regions
+    assert remat.tensor_marked
+    assert block.linear.weight.grad is not None
 
 
 # -- naming and registration -------------------------------------------------

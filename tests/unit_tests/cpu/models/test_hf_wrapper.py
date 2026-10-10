@@ -567,13 +567,16 @@ def test_an_unsettable_experts_implementation_is_rejected() -> None:
 
 def test_native_experts_implementation_is_the_default_and_builds() -> None:
     """The default leaves the HF model's own experts kernel untouched."""
+    from llmtuner.models.hf.factory import resolve_model_class
+    from llmtuner.models.hf.model import resolve_experts_implementation
+
     config = _qwen3_config()
     assert getattr(config, "experts_implementation", "native") == "native"
+    resolve_experts_implementation(resolve_model_class(config), config)
+    assert getattr(config, "_experts_implementation", None) is None
 
     model = HFTransformerModel(config).eval()
-
-    # llmtuner never rewrites the kernel choice on the native path.
-    assert getattr(model.model.config, "_experts_implementation", None) is None
+    assert model.model is not None
 
 
 def test_tp_plan_reads_the_inner_attribute_and_falls_back_to_the_property() -> None:

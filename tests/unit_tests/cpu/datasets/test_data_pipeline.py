@@ -1161,7 +1161,7 @@ def test_num_packing_bins_must_be_positive() -> None:
     The field is always parsed, so a bad value accepted here would only
     surface after switching ``--packing`` to first_fit.
     """
-    with pytest.raises(ValueError, match="num_packing_bins must be positive"):
+    with pytest.raises(ValueError, match=r"num_packing_bins must be >= 1"):
         DataloaderConfig(num_packing_bins=0)
 
 

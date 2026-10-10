@@ -240,8 +240,8 @@ def validate_body(self, validation: ValidationConfig, step: int) -> None:
             if isinstance(batch, dict):
                 # ``num_valid_tokens`` is the trainer's bookkeeping; a
                 # plain int among tensors would be splatted into the model
-                # forward as a kwarg.
-                batch.pop("num_valid_tokens", None)
+                # forward as a kwarg. Keep the loader-owned batch intact.
+                batch = {k: v for k, v in batch.items() if k != "num_valid_tokens"}
             inputs, labels, extra_kwargs = self.example_model.preprocess_inputs(
                 self.to_device(batch),
                 parallel_dims=self.parallel_dims,

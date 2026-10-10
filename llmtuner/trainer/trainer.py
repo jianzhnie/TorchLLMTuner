@@ -713,6 +713,7 @@ class Trainer:
         # accumulation window.
         microbatches: list[dict[str, Any]] = []
         local_valid_tokens = 0
+        local_routing_tokens = 0
         for _ in range(self.cfg.gradient_accumulation_steps):
             # ``microbatch`` owns the split of responsibility: it takes the
             # count (the denominator) and the accounting off the loader's own
@@ -723,6 +724,7 @@ class Trainer:
             microbatch = self.microbatch(next(data_iterator))
             microbatches.append(microbatch)
             local_valid_tokens += microbatch["num_valid_tokens"]
+            local_routing_tokens += microbatch["num_routing_tokens"]
 
         # Keep the count on device so normalizing the loss adds no device sync
         # to the training path.
@@ -736,12 +738,15 @@ class Trainer:
             global_valid_tokens = global_valid_tokens.clone()
             all_reduce(global_valid_tokens, group=dp_mesh.get_group())
 
-        # Auxiliary losses normalize by the same per-step token count as the
-        # main loss, so their scale is independent of parallelism degrees.
-        # Set once, before any forward: every micro-batch of the step divides
-        # by the same number.
+        # Router losses cover every non-padding input token, including SFT
+        # prompts whose labels are masked from the main cross-entropy loss.
         if AuxLoss.has_pending_counts():
-            AuxLoss.set_step_denominator(global_valid_tokens)
+            global_routing_tokens = torch.tensor(
+                local_routing_tokens, dtype=torch.int64, device=self.device
+            )
+            if dp_mesh is not None:
+                all_reduce(global_routing_tokens, group=dp_mesh.get_group())
+            AuxLoss.set_step_denominator(global_routing_tokens)
 
         # Process each group, then free it. Loss values are retained only on a
         # logging step: backward has already consumed them, and non-logging

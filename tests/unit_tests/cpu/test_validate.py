@@ -11,6 +11,7 @@ loss's meshes and need a real cluster to verify.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -61,13 +62,13 @@ class _EchoModel(torch.nn.Module):
         if "num_valid_tokens" in batch:
             self.saw_num_valid_tokens_kwarg = True
         labels = batch["labels"]
-        return batch["input_ids"], labels, {}
+        return batch["input_ids"].reshape(-1), labels.reshape(-1), {}
 
     def forward(self, inputs, **kwargs):
         self.saw_eval_mode = not self.training
-        logits = torch.zeros(inputs.shape[0], inputs.shape[1], VOCAB)
-        logits[..., 0] = 1.0
-        logits[..., 1] = 0.5
+        logits = torch.zeros(inputs.numel(), VOCAB)
+        logits[:, 0] = 1.0
+        logits[:, 1] = 0.5
         return logits
 
 
@@ -111,7 +112,11 @@ def _make_trainer(
 
 def _expected_loss(batches: list[dict[str, Any]]) -> float:
     loss_sum = sum(
-        float(_trainer_cls().loss_sum(_EchoModel()(b["input_ids"]), b["labels"]))
+        float(
+            _trainer_cls().loss_sum(
+                _EchoModel()(b["input_ids"]), b["labels"].reshape(-1)
+            )
+        )
         for b in batches
     )
     valid = sum(b["num_valid_tokens"] for b in batches)
@@ -278,10 +283,13 @@ def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
         dp_cp_enabled = False
         tp_enabled = False
 
-        def get_optional_mesh(self, name):
+        def get_optional_mesh(self, name, **kwargs):
+            if name == "batch":
+                return SimpleNamespace(get_local_rank=lambda: 0, size=lambda: 1)
             return None
 
     trainer.parallel_dims = _Dims()
+    trainer.model = None
     trainer.model_parts = [_EchoModel()]
     trainer.pp_has_first_stage = True
     trainer.pp_has_last_stage = True
@@ -292,6 +300,7 @@ def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
         log_validation=lambda loss, step: logged.update(loss=loss, step=step),
     )
     monkeypatch.setattr(validate_mod, "build_dataloader", lambda *a, **k: loader)
+    monkeypatch.setattr(validate_mod, "spmd_context", lambda dims: nullcontext())
 
     trainer.validate(step=3)
 

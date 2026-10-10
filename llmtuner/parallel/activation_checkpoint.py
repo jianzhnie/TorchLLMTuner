@@ -78,6 +78,7 @@ passing a mode string (the extension point its config already documents).
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 
 import torch
 import torch._functorch.config
@@ -100,6 +101,7 @@ from llmtuner.config import (
 
 from ..accelerator.capabilities import has
 from ..errors import EnvironmentUnsupportedError
+from ..models.common.aux_loss import AuxLoss, in_checkpoint_recompute
 from ..utils.logger_utils import get_logger
 from .remat_regions import (
     region_names,
@@ -297,7 +299,7 @@ def wrap_selective(
     policy = selective_policy(save_ops, mm_shapes)
     return ptd_checkpoint_wrapper(
         module,
-        context_fn=lambda: create_selective_checkpoint_contexts(policy),
+        context_fn=lambda: checkpoint_contexts(policy),
         preserve_rng_state=cfg.preserve_rng_state,
         determinism_check=cfg.determinism_check,
         early_stop=True,
@@ -318,6 +320,27 @@ def full_policy(_ctx, _op, *_args, **_kwargs) -> CheckpointPolicy:
     return CheckpointPolicy.PREFER_RECOMPUTE
 
 
+@contextmanager
+def _recompute_aux_context():
+    token = in_checkpoint_recompute.set(True)
+    try:
+        yield
+    finally:
+        in_checkpoint_recompute.reset(token)
+
+
+def checkpoint_contexts(policy: Callable):
+    """Keep checkpoint's op policy while marking its backward-time replay."""
+    forward_context, recompute_context = create_selective_checkpoint_contexts(policy)
+
+    @contextmanager
+    def marked_recompute():
+        with _recompute_aux_context(), recompute_context:
+            yield
+
+    return forward_context, marked_recompute()
+
+
 def wrap_full(module: nn.Module, *, preserve_rng_state: bool = True) -> nn.Module:
     """Wrap one block with the full policy (upstream's ``FullAC._wrap_block``).
 
@@ -332,7 +355,7 @@ def wrap_full(module: nn.Module, *, preserve_rng_state: bool = True) -> nn.Modul
     """
     return ptd_checkpoint_wrapper(
         module,
-        context_fn=lambda: create_selective_checkpoint_contexts(full_policy),
+        context_fn=lambda: checkpoint_contexts(full_policy),
         preserve_rng_state=preserve_rng_state,
         early_stop=True,
     )
@@ -452,6 +475,15 @@ def wrap_region(
         if name in policy:
             module.forward = remat.region(
                 module.forward, f"{base_fqn}.{name}", recompute=policy[name]
+            )
+        if isinstance(module, AuxLoss):
+            module._metric_region_fn = remat.region(
+                module._accumulate_and_inject,
+                f"{base_fqn}.{name}.aux_loss",
+                recompute=False,
+            )
+            module._metric_region_needs_tensor = getattr(
+                remat, "recompute_needs_tensor", None
             )
     retained = sum(1 for recompute in policy.values() if not recompute)
     logger.info(

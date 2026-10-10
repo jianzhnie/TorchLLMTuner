@@ -160,7 +160,11 @@ def fused_experts_of(block: nn.Module) -> FusedExperts | None:
     # silu today, but the probe must say so rather than let a future HF family
     # with a different gated activation be swapped in silently.
     act_fn = getattr(experts, "act_fn", None)
-    if act_fn is not None and not isinstance(act_fn, nn.SiLU):
+    # transformers 5.x exposes its own SiLUActivation module rather than
+    # torch.nn.SiLU. It computes the same torch.nn.functional.silu operation.
+    from transformers.activations import SiLUActivation
+
+    if act_fn is not None and not isinstance(act_fn, (nn.SiLU, SiLUActivation)):
         raise NotImplementedError(
             f"Expert activation {type(act_fn).__name__} is not SiLU; the swap "
             "would silently change the experts' nonlinearity. Wire the "

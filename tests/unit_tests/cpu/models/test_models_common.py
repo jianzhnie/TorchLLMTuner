@@ -449,7 +449,10 @@ def test_the_grouped_mm_probe_follows_the_op(monkeypatch) -> None:
     op works even if the probe is hard-wired to ``True`` -- which is precisely
     the bug that would send every model down a branch that raises elsewhere.
     """
+    from llmtuner.accelerator.capabilities import probe
     from llmtuner.models.common.moe import experts as ge
+
+    probe.cache_clear()
 
     def _works(*args, **kwargs):
         return torch.zeros(8, 8, dtype=torch.bfloat16)
@@ -461,11 +464,14 @@ def test_the_grouped_mm_probe_follows_the_op(monkeypatch) -> None:
     assert ge.grouped_mm_available() is True
 
     monkeypatch.setattr(torch, "_grouped_mm", _raises, raising=False)
+    probe.cache_clear()
     assert ge.grouped_mm_available() is False
 
     # An op that is simply absent counts as unavailable, not as an error.
     monkeypatch.delattr(torch, "_grouped_mm", raising=False)
+    probe.cache_clear()
     assert ge.grouped_mm_available() is False
+    probe.cache_clear()
 
 
 def test_the_grouped_mm_probe_agrees_with_the_real_op_here() -> None:

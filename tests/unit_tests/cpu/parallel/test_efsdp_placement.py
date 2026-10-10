@@ -133,7 +133,7 @@ def _expert_placement(
         torch.float32,
         torch.float32,
         pp_enabled=False,
-        ep_size=ep_size,
+        ep_degree=ep_size,
         edp_mesh=edp_mesh,
     )
 

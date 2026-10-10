@@ -96,7 +96,7 @@ def test_tp_cp_ep_sparse_region_must_still_divide() -> None:
     """The same divisibility guard fires when cp/tp join the sparse region."""
     # dp_shard * cp * tp = 3, which ep=2 cannot tile.
     with pytest.raises(ValueError, match=r"must divide"):
-        _dims(world_size=6, dp_shard=3, cp=1, tp=1, ep=2)
+        _dims(world_size=3, dp_shard=3, cp=1, tp=1, ep=2)
         _dims(world_size=3, dp_shard=1, cp=3, tp=1, ep=2)
 
 
@@ -231,9 +231,9 @@ def test_derive_dp_rejects_inconsistent_sizes() -> None:
 
 
 def test_derive_dp_rejects_indivisible_world() -> None:
-    cfg = _config(data_parallel_shard_size=-1, tensor_parallel_size=3)
+    cfg = _config(data_parallel_shard_size=-1, tensor_parallel_size=2)
     with pytest.raises(ValueError):
-        cfg.derive_dp(world_size=8)  # 8 % 3 != 0
+        cfg.derive_dp(world_size=7)  # 7 % 2 != 0
 
 
 def test_derive_dp_narrows_by_the_non_dp_sizes() -> None:
