@@ -451,6 +451,10 @@ class HuggingFaceTokenizer(BaseTokenizer):
     def token_to_id(self, token: str) -> int | None:
         return self.tokenizer.token_to_id(token)
 
+    def get_vocab_size(self) -> int:
+        """Return the underlying tokenizer's vocabulary size."""
+        return self.tokenizer.get_vocab_size()
+
     def apply_chat_template(
         self, messages: Sequence[Mapping[str, Any]], **kwargs
     ) -> str:

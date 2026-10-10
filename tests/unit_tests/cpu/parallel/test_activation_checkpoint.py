@@ -492,6 +492,9 @@ def test_memory_budget_refuses_a_torch_without_the_knob(monkeypatch) -> None:
     monkeypatch.delattr(
         torch._functorch.config, "activation_memory_budget", raising=False
     )
+    from llmtuner.accelerator.capabilities import probe
+
+    probe.cache_clear()
     with pytest.raises(NotImplementedError, match="activation_memory_budget"):
         apply_ac(
             _model(),
@@ -554,7 +557,7 @@ def _forward_counts(model: HFTransformerModel) -> list[int]:
     counts = [0] * len(model.layers)
 
     def make_hook(idx: int):
-        def hook(module, args, output) -> None:
+        def hook(module, args) -> None:
             counts[idx] += 1
 
         return hook
@@ -564,7 +567,8 @@ def _forward_counts(model: HFTransformerModel) -> list[int]:
         # Reach through the checkpoint wrapper to the layer itself, so the
         # backward-time recompute (which calls the inner forward) is counted.
         inner = getattr(layer, "_checkpoint_wrapped_module", layer)
-        handles.append(inner.register_forward_hook(make_hook(idx)))
+        # Early-stop checkpointing can stop before post-forward hooks run.
+        handles.append(inner.register_forward_pre_hook(make_hook(idx)))
     try:
         _loss_and_backward(model)
     finally:

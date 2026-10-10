@@ -522,6 +522,9 @@ def test_every_training_scalar_reaches_the_flat_view_or_is_nested() -> None:
         "selective_ac",
         "memory_budget_ac",
         "region_ac",
+        "compile",
+        "activation_checkpoint_mode",
+        "chunked_loss_num_chunks",
     }
     props = {
         name

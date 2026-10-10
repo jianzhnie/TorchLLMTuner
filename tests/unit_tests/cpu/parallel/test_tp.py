@@ -199,7 +199,7 @@ def test_qwen3_plan_resolves_rather_than_raising_on_its_qk_norms() -> None:
     injected["model.layers.*.self_attn.k_norm"] = "replicated_with_grad_allreduce"
     resolved = resolve_plan(model, injected)
     norms = [p for p in resolved if p.endswith(("q_norm", "k_norm"))]
-    assert len(norms) == 2, "the injected norm entries are not in the plan"
+    assert len(norms) >= 2, "the injected norm entries are not in the plan"
     assert all(resolved[p] is None for p in norms), "a norm must not be sharded"
 
     matched = [

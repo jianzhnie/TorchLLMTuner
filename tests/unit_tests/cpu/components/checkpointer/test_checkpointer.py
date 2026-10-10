@@ -66,7 +66,7 @@ def test_config_rejects_keep_latest_k_of_one() -> None:
     try:
         Config(keep_latest_k=1)
     except ValueError as error:
-        assert "at least 2 checkpoint replicas" in str(error)
+        assert "at least 2 replicas" in str(error)
         return
     raise AssertionError("keep_latest_k=1 should be rejected")
 
@@ -75,7 +75,7 @@ def test_config_rejects_a_zero_interval() -> None:
     try:
         Config(interval=0)
     except ValueError as error:
-        assert "at least 1 step" in str(error)
+        assert "interval must be >= 1" in str(error)
         return
     raise AssertionError("interval=0 should be rejected")
 
@@ -491,6 +491,7 @@ def _hf_manager_stub(tmp_path, monkeypatch, *, files=(), hf_metadata=_HF_METADAT
         METADATA_FILE_NAME="metadata.pkl",
     )
     manager = tc.TorchCheckpointingManager.__new__(tc.TorchCheckpointingManager)
+    manager.states = {}
     manager.sd_adapter = _FakeAdapter()
     manager._backend = backend
     manager._storage = _FakeStorage(set(files))

@@ -145,7 +145,7 @@ class _LogCapture:
 
 def test_config_rejects_a_non_positive_log_freq() -> None:
     for log_freq in (0, -1):
-        with pytest.raises(ValueError, match="greater than 0"):
+        with pytest.raises(ValueError, match=r"log_freq must be >= 1"):
             Config(log_freq=log_freq)
 
 
@@ -158,7 +158,7 @@ def test_should_log_anchors_the_window_even_when_it_returns_false() -> None:
     Otherwise ``time_end_to_end`` divides a multi-step wall span by a one-step
     step span (upstream anchors in should_log for the same reason).
     """
-    processor = _processor()
+    processor = _processor(log_freq=3)
     assert processor.step_last_log is None
     assert processor.should_log(101) is False  # 101 % log_freq != 0
     assert processor.step_last_log == 100
@@ -525,7 +525,7 @@ class _FakeWandB:
         self.sent: list[tuple[dict, int]] = []
         self.finished = False
 
-    def log(self, metrics: dict, step: int) -> None:
+    def log(self, metrics: dict, step: int, *, commit: bool = True) -> None:
         self.sent.append((metrics, step))
 
     def finish(self) -> None:

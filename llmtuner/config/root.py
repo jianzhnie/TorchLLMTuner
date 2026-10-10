@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 from transformers import AutoConfig
@@ -72,16 +72,23 @@ class LLMTunerConfig:
         a run halve one without touching the other. Each group's own
         ``__post_init__`` already ran during parsing.
         """
-        # replace(), not in-place grafting: the caller's group instances stay
-        # untouched (configs are read-only once built).
+        # The CLI's TrainingConfig view marks nested fields init=False, so
+        # dataclasses.replace(view, checkpoint_config=...) would raise. Build
+        # the base class from its init fields and overlay the parsed groups.
+        # This also leaves the caller's parsed instance untouched.
         optimizer = replace(optimizer, lr_scheduler_config=lr_scheduler)
-        training = replace(
-            training,
+        training_fields = {
+            item.name: getattr(training, item.name)
+            for item in fields(TrainingConfig)
+            if item.init
+        }
+        training_fields.update(
             checkpoint_config=checkpoint,
             dataloader_config=dataloader,
             metrics_config=metrics,
             profiler_config=profiler,
         )
+        training = TrainingConfig(**training_fields)
         return cls(
             model=model, parallel=parallel, optimizer=optimizer, training=training
         )

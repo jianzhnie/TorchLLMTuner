@@ -70,8 +70,12 @@ from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
 
 
-def test_pp_forward_backward_releases_consumed_loss_graphs() -> None:
+def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
     """The PP schedule's reporting losses must not retain completed graphs."""
+    monkeypatch.setattr(
+        "llmtuner.trainer.trainer.capability",
+        lambda name: False if name == "pipelining_microbatch_drivers" else True,
+    )
     activation_refs: list[weakref.ReferenceType[torch.Tensor]] = []
     loss_refs: list[weakref.ReferenceType[torch.Tensor]] = []
     loss_containers: list[list[torch.Tensor]] = []
@@ -322,7 +326,9 @@ def test_timeout_adjustment_is_skipped_for_hccl(monkeypatch) -> None:
             raise AssertionError("groups must not be visited for HCCL")
 
     monkeypatch.setattr(collectives.dist, "barrier", lambda **_: None)
-    monkeypatch.setattr(collectives.device_module, "synchronize", lambda *_: None)
+    monkeypatch.setattr(
+        collectives.device_module, "synchronize", lambda *_: None, raising=False
+    )
     monkeypatch.setattr(
         collectives.dist.distributed_c10d,
         "_set_pg_timeout",
@@ -330,13 +336,13 @@ def test_timeout_adjustment_is_skipped_for_hccl(monkeypatch) -> None:
     )
 
     collectives.set_pg_timeouts(
-        timedelta(seconds=11), _Dims(), device=torch.device("npu:0")
+        timedelta(seconds=11), _Dims(), device=SimpleNamespace(type="npu", index=0)
     )
 
 
 def test_a_non_positive_train_timeout_is_rejected() -> None:
     """A zero timeout is a typo for "no limit", and breaks every collective."""
-    with pytest.raises(ValueError, match="train_timeout_seconds must be greater"):
+    with pytest.raises(ValueError, match=r"train_timeout_seconds must be >= 1"):
         ParallelConfig(train_timeout_seconds=0)
     assert ParallelConfig().train_timeout_seconds == 100
 
@@ -887,6 +893,25 @@ def test_count_valid_tokens_prefers_the_collators_count() -> None:
     assert Trainer.count_valid_tokens(counted) == 5
 
 
+def test_microbatch_counts_masked_prompts_for_router_but_not_padding() -> None:
+    """SFT prompt tokens route through MoE even when CE ignores their labels."""
+    trainer = _bare_trainer(_cfg_with_batch())
+    trainer.ntokens_seen = 0
+    batch = {
+        "input": torch.arange(6),
+        "labels": torch.tensor([IGNORE_INDEX, IGNORE_INDEX, 3, 4,
+                                IGNORE_INDEX, IGNORE_INDEX]),
+        "padding_mask": torch.tensor([False, False, False, False, True, True]),
+        "num_valid_tokens": 2,
+    }
+
+    microbatch = trainer.microbatch(batch)
+
+    assert microbatch["num_valid_tokens"] == 2
+    assert microbatch["num_routing_tokens"] == 4
+    assert "num_valid_tokens" not in microbatch["batch"]
+
+
 def test_count_valid_tokens_reports_the_row_final_mask_the_loss_skips() -> None:
     """The two halves of "the count is not the loss's business".
 
@@ -949,13 +974,8 @@ def test_preprocess_inputs_reads_the_grain_batch_without_consuming_it() -> None:
     assert set(grain_batch) == {"input", "labels", "positions"}
 
 
-def test_preprocess_inputs_drops_a_padding_mask_the_forward_would_reject() -> None:
-    """Anything left in the dict is splatted into ``forward`` as a kwarg.
-
-    The wrapper takes exactly two of them, so an unclaimed ``padding_mask``
-    would reach the decoder as ``padding_mask=...`` and raise. Dropping it here
-    is the whole reason the return value is a dict rather than the batch.
-    """
+def test_preprocess_inputs_passes_padding_mask_to_moe() -> None:
+    """The MoE router sees padding positions separately from masked labels."""
     grain_batch = {
         "input": torch.arange(4),
         "labels": torch.arange(4),
@@ -965,7 +985,7 @@ def test_preprocess_inputs_drops_a_padding_mask_the_forward_would_reject() -> No
 
     _, _, extra_kwargs = _wrapper().preprocess_inputs(grain_batch, parallel_dims=None)
 
-    assert set(extra_kwargs) == {"positions"}
+    assert set(extra_kwargs) == {"positions", "padding_mask"}
 
 
 def test_loss_vocab_kwargs_need_a_tp_axis_and_a_named_vocabulary() -> None:

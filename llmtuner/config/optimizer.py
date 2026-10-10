@@ -128,7 +128,7 @@ class OptimizerConfig:
     weight_decay: float = field(default=0.0, metadata={"help": "Weight decay"})
     # Annotated as the CLI's input shape; __post_init__ normalizes to the
     # tuple the optimizer actually consumes (root's flat view reads that one).
-    betas: list[float] | tuple[float, float] = field(
+    betas: list[float] = field(
         default_factory=lambda: [0.9, 0.999],
         metadata={
             "help": "AdamW (beta1, beta2). Pass as two values: "
