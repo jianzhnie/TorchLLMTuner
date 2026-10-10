@@ -70,6 +70,28 @@ from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
 
 
+def test_train_step_rejects_a_fully_masked_window_before_forward() -> None:
+    """A zero denominator must fail before any model or optimizer update."""
+    trainer = Trainer.__new__(Trainer)
+    trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1)
+    trainer.parallel_dims = None
+    trainer.device = torch.device("cpu")
+    trainer.optimizer = SimpleNamespace(zero_grad=lambda **kwargs: None)
+    trainer.lr_scheduler = SimpleNamespace(get_metrics=lambda: {})
+    trainer.should_log = lambda: False
+    trainer.microbatch = lambda batch: {
+        "batch": batch,
+        "num_valid_tokens": 0,
+        "num_routing_tokens": 0,
+    }
+    trainer.forward_backward_step = lambda *args, **kwargs: pytest.fail(
+        "forward/backward must not run with zero valid tokens"
+    )
+
+    with pytest.raises(RuntimeError, match="zero valid tokens"):
+        trainer.train_step(iter([object()]))
+
+
 def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
     """The PP schedule's reporting losses must not retain completed graphs."""
     monkeypatch.setattr(

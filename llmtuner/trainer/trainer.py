@@ -54,6 +54,7 @@ from ..utils.logger_utils import get_logger
 from . import batch as batch_mod
 from . import builder, pipeline_step
 from . import validate as validation_pass
+from .reduction_meshes import training_reduction_meshes
 
 # Rank-aware: the helper attaches a handler whose filter passes below-ERROR
 # lines only on the log ranks (rank 0 by default), so a torchrun run logs one
@@ -486,35 +487,15 @@ class Trainer:
         # gates on (``dp_cp_enabled``) extended by tp for the sequence-parallel
         # loss shard upstream does not have.
         parallel_dims = self.parallel_dims
-        dp_mesh = (
-            None if parallel_dims is None else parallel_dims.get_optional_mesh("dp")
-        )
-        pp_mesh = (
-            None if parallel_dims is None else parallel_dims.get_optional_mesh("pp")
-        )
-        loss_sharded = parallel_dims is not None and (
-            parallel_dims.dp_cp_enabled or parallel_dims.tp_enabled
-        )
-        loss_mesh = (
-            dp_mesh
-            if pp_mesh is None and not loss_sharded
-            else parallel_dims.get_optional_mesh("loss")
-        )
+        reduction_meshes = training_reduction_meshes(parallel_dims)
+        dp_mesh = reduction_meshes.dp
+        pp_mesh = reduction_meshes.pp
+        loss_mesh = reduction_meshes.loss
         # CP/TP ranks hold disjoint token slices of the same DP batch.  Their
         # loss pieces must be summed back together before computing the
         # worst per-DP-rank average; reducing local shard averages directly
         # makes ``max_loss`` smaller by the sequence sharding degree.
-        sequence_dims = []
-        if parallel_dims is not None:
-            if parallel_dims.cp_enabled:
-                sequence_dims.append("cp")
-            if parallel_dims.tp_enabled:
-                sequence_dims.append("tp")
-        sequence_mesh = (
-            parallel_dims.get_optional_mesh(sequence_dims)
-            if sequence_dims
-            else None
-        )
+        sequence_mesh = reduction_meshes.sequence
 
         # Read the whole step's data up front. The denominator must be known
         # before the first forward (the loss divides by it there), so every
@@ -550,6 +531,15 @@ class Trainer:
             # again below for this rank's own per-rank average.
             global_valid_tokens = global_valid_tokens.clone()
             all_reduce(global_valid_tokens, group=dp_mesh.get_group())
+
+        # A fully masked accumulation window has no average loss. Assert the
+        # DP-reduced count on every rank before entering forward/backward, so
+        # no stage updates on an undefined (zero-divided) gradient. The device
+        # assertion avoids a host synchronization on ordinary steps.
+        torch._assert_async(
+            global_valid_tokens > 0,
+            "Training step has zero valid tokens; cannot normalize the loss.",
+        )
 
         # Router losses cover every non-padding input token, including SFT
         # prompts whose labels are masked from the main cross-entropy loss.
@@ -627,14 +617,10 @@ class Trainer:
 
         assert accumulated_loss is not None
 
-        # Summed over tokens, divided by the global count: the loss is then
-        # independent of how the batch was split across DP ranks or across
-        # accumulation groups. Division by a tensor keeps it on device. Above
-        # ``accumulation_steps == 1`` this lands near the per-batch value but
-        # not on it -- the denominator is the whole window's token count while
-        # only part of the window has contributed -- so early steps of a long
-        # accumulation read slightly low. That is the value consistent with the
-        # gradients the optimizer just applied.
+        # All accumulation groups have contributed their raw token loss here.
+        # Dividing by the step's global valid-token count reports the same
+        # average that normalized the gradients, independent of DP rank and
+        # accumulation boundaries.
         return self._step_metrics(
             accumulated_loss=accumulated_loss,
             global_valid_tokens=global_valid_tokens,
