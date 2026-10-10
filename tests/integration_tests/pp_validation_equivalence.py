@@ -12,7 +12,7 @@ on both ranks without hanging, the logged validation loss is finite and
 positive, and the model returns to train mode afterwards.
 
 Environment note: needs torch >= 2.12 (the pipelining surface; the eval
-driver is gated by the ``pipelining_schedule_eval`` capability). Written
+driver is gated by the ``pipelining_microbatch_drivers`` capability). Written
 2026-10-02 with the PP x validation unlock; environment not covered on the
 development host -- awaiting a multi-rank run on the target torch.
 """

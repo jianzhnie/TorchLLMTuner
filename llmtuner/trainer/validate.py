@@ -293,7 +293,10 @@ def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
     the same loop (same loader reads, same token counting, same eval calls)
     and simply do not report.
     """
-    require("pipelining_schedule_eval", feature="validation with pipeline parallelism")
+    require(
+        "pipelining_microbatch_drivers",
+        feature="validation with pipeline parallelism",
+    )
 
     dp_mesh, loss_mesh = loss_reporting_meshes(self.parallel_dims)
     validation_dataloader = build_validation_dataloader(self, validation)

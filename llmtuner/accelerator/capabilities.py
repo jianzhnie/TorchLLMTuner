@@ -200,14 +200,15 @@ CAPABILITIES: dict[str, Capability] = {
         consumers="parallel/activation_checkpoint.py (disable_dynamo_lru_cache)",
     ),
     # -- pipeline eval driver (consumer: trainer/validate.py) ----------------
-    "pipelining_schedule_eval": Capability(
+    "pipelining_microbatch_drivers": Capability(
         _pipelining_has_eval,
-        what="torch.distributed.pipelining _PipelineSchedule.eval microbatch form",
-        since="torch main/2.10+ (eval(arg_mbs=...) and "
-        "_step_microbatches(return_outputs=...); 2.9's eval swallows the "
-        "microbatch kwargs)",
-        hint="Upgrade torch, or run validation with pipeline_parallel_size=1.",
-        consumers="trainer/validate.py (validation pass under PP)",
+        what="torch.distributed.pipelining microbatch drivers "
+        "(_PipelineSchedule.eval(arg_mbs=...) and "
+        "_step_microbatches(return_outputs=...))",
+        since="torch main/2.10+ (2.9's eval swallows the microbatch kwargs)",
+        hint="Upgrade torch, or run with pipeline_parallel_size=1.",
+        consumers="pipeline_parallel/apply.py (PP assembly), "
+        "trainer/trainer.py + trainer/validate.py (PP train/eval drivers)",
     ),
     # -- model kernels (consumer: models/common/moe/experts.py) ----------------
     "torch_grouped_mm": Capability(

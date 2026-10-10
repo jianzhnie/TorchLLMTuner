@@ -150,6 +150,21 @@ def dsa_pp() -> None:
     )
 
 
+def pp_packed_microbatch_split(num_microbatches: int) -> None:
+    """A packed (1-D) corpus batch cannot be split into PP microbatches: the
+    split would cut documents at the token level, silently truncating their
+    context. Row-batched corpora (synthetic rows, multimodal rows) split by
+    rows and are unaffected.
+    """
+    raise UnsupportedCombinationError(
+        f"pp > 1 with num_pp_microbatches={num_microbatches} > 1 over a packed "
+        "corpus is not supported: the batch is a flat token stream and the "
+        "microbatch split would cut documents mid-context (upstream packs "
+        "per-microbatch at the loader; llmtuner's loader packs per batch). "
+        "Set num_pp_microbatches=1 or use a row-batched corpus."
+    )
+
+
 def pp_weight_tying() -> None:
     """The split puts the embedding on the first stage and the head on the last, and
     each stage's deep copy would train an independent copy of the shared weight.
@@ -345,6 +360,8 @@ ENTRIES: tuple[Row, ...] = (
         'parallel/pipeline_parallel/apply.py::apply_pp'),
     Row(dsa_pp, "assembly", UnsupportedCombinationError,
         'parallel/pipeline_parallel/apply.py::apply_pp'),
+    Row(pp_packed_microbatch_split, "assembly", UnsupportedCombinationError,
+        'trainer/trainer.py::Trainer.pp_microbatches'),
     Row(shared_expert_tp, "assembly", UnsupportedCombinationError,
         'parallel/tensor_parallel/apply.py::apply_tp'),
     Row(tp_moe_specs_without_block, "assembly", UnsupportedCombinationError,

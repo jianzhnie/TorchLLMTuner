@@ -144,10 +144,11 @@ def realize_moe_blocks_tp(moe_blocks, *, tp_size: int, tp_rank: int, group) -> N
                 block, tp_size=tp_size, tp_rank=tp_rank
             )
         # The sharded expert parameters are excluded from the trainer's
-        # replicated-gradient all-reduce through this id set: each rank's
+        # replicated-gradient all-reduce through this NAME set: each rank's
         # F-shard gradient is complete, and summing it with a different
-        # shard's gradient would corrupt it.
-        block.tp_sharded_param_ids = (
+        # shard's gradient would corrupt it. Names, not ids -- FSDP runs after
+        # this and replaces the Parameter objects.
+        block.tp_sharded_param_names = (
             shard_experts_for_tp(block, tp_size=tp_size, tp_rank=tp_rank) | shared_ids
         )
         block._tp_seq_group = group

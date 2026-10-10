@@ -259,7 +259,7 @@ torch 版本/环境探测（`hasattr` 私有 knob、守卫 import）集中于单
 | `functorch_activation_memory_budget` | hasattr `torch._functorch.config` | torch 2.6 | activation_checkpoint.py（memory_budget） |
 | `dynamo_lru_cache` | `torch._C._dynamo.eval_frame._set_lru_cache` | 私有 knob（2.2.2 缺失） | activation_checkpoint.py（SAC+PP workaround） |
 | `torch_grouped_mm` | 实跑探测（bf16 哑调用） | torch 2.7 | moe/experts.py |
-| `pipelining_schedule_eval` | hasattr pipelining schedule 的 eval 微批形态 | torch main/2.10+ | trainer/validate.py（PP 下 validation） |
+| `pipelining_microbatch_drivers` | pipelining schedule 的微批驱动形态（eval + _step_microbatches） | torch main/2.10+ | pipeline_parallel/apply.py（装配期门槛）、trainer/{trainer,validate}.py（PP 训练/eval 驱动） |
 
 不纳入的：可选**包**（renderers/torchao/torchvision）保持本站 `ImportError`
 惯例；`device.py` 的设备发现是"缺席即静默"的可用性探测（另一种语义，且
@@ -421,7 +421,7 @@ eval 模式 + `no_grad` 跑一次临时 dataloader，loss 按全局有效 token 
 同一对归约 mesh），不更新参数、不进 checkpoint、不动 `ntokens_seen`；零 batch /
 零有效 token 与 dp>1 的 `steps=-1` 均 loud-raise；PP 下由
 `trainer/validate.py::validate_body_pp` 复用 schedule 的 eval 驱动（需
-pipelining schedule 支持 eval 微批形态，见 §3.2 的 `pipelining_schedule_eval`）。
+pipelining schedule 的微批驱动形态，见 §3.2 的 `pipelining_microbatch_drivers`）。
 
 ### 5.2 mesh 与 ParallelDims
 

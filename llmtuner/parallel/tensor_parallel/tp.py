@@ -121,6 +121,13 @@ class ColumnParallelLinear(nn.Module):
         # the HF decoder feeds [B, T, K] hidden states: fold the leading dims
         # and restore them after, with the row count multiplied by tp_size --
         # that is the all-gathered sequence length.
+        if x.ndim > 2 and x.shape[0] != 1:
+            raise ValueError(
+                "TP realizers gather/reduce rows in rank order; a batched "
+                f"[B, T, K] input with B={x.shape[0]} would interleave batches "
+                "across ranks after the fold. Flatten to [T, K] or keep B=1 "
+                "(the HF wrapper always runs B=1)."
+            )
         lead = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
         if self.use_symm_mem:
@@ -166,6 +173,13 @@ class RowParallelLinear(nn.Module):
         # Mirror of ColumnParallelLinear.forward: fold to 2D for the collective, then
         # restore the leading dims with the row count divided by tp_size --
         # that is the reduce-scattered sequence shard.
+        if x.ndim > 2 and x.shape[0] != 1:
+            raise ValueError(
+                "TP realizers gather/reduce rows in rank order; a batched "
+                f"[B, T, K] input with B={x.shape[0]} would interleave batches "
+                "across ranks after the fold. Flatten to [T, K] or keep B=1 "
+                "(the HF wrapper always runs B=1)."
+            )
         lead = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
         if self.use_symm_mem:
@@ -294,7 +308,7 @@ class TPMoeSequenceBoundary:
 
 def shard_shared_expert_for_tp(
     block: nn.Module, *, tp_size: int, tp_rank: int
-) -> set[int]:
+) -> set[str]:
     """Feature-shard a shared expert's dense MLP -- no collectives involved.
 
     Inside the MoE sequence boundary the token stream is already gathered
@@ -307,15 +321,18 @@ def shard_shared_expert_for_tp(
     until the boundary's single reduction).
 
     Only the gate/up/down layout is known; anything else keeps the refusal at
-    the call site. Returns the sharded parameters' ids so the trainer's
-    replicated-gradient all-reduce excludes them (their gradients are complete
-    per shard, exactly like the routed experts').
+    the call site. Returns the sharded parameters' block-relative NAMES (not
+    object ids: FSDP replaces the Parameter objects after this runs, and an id
+    recorded now would never match again) so the trainer's replicated-gradient
+    all-reduce excludes them (their gradients are complete per shard, exactly
+    like the routed experts').
     """
-    shared = getattr(block, "shared_expert", None) or getattr(
-        block, "shared_experts", None
+    shared_name = (
+        "shared_expert" if hasattr(block, "shared_expert") else "shared_experts"
     )
+    shared = getattr(block, shared_name, None)
     assert shared is not None  # the caller checked
-    ids: set[int] = set()
+    names: set[str] = set()
     for name, dim in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
         proj = getattr(shared, name, None)
         if proj is None or not isinstance(proj, nn.Linear):
@@ -327,13 +344,13 @@ def shard_shared_expert_for_tp(
             proj.out_features = proj.weight.shape[0]
         else:
             proj.in_features = proj.weight.shape[1]
-        ids.add(id(proj.weight))
-    return ids
+        names.add(f"{shared_name}.{name}.weight")
+    return names
 
 
 def shard_experts_for_tp(
     block: nn.Module, *, tp_size: int, tp_rank: int
-) -> frozenset[int]:
+) -> frozenset[str]:
     """Shard a HF MoE block's fused expert weights on the F dim, in place.
 
     Cuts ``experts.gate_up_proj (E, 2F, D)`` and ``experts.down_proj (E, D, F)``
@@ -386,7 +403,7 @@ def shard_experts_for_tp(
             torch.cat([gate_shard, up_shard], dim=1).contiguous()
         )
         experts.down_proj = nn.Parameter(_shard(down, 2))
-    return frozenset({id(experts.gate_up_proj), id(experts.down_proj)})
+    return frozenset({"experts.gate_up_proj", "experts.down_proj"})
 
 
 @dataclass(frozen=True)
@@ -585,7 +602,8 @@ def tp_sharded_param_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
       feature shard;
     * MoE-under-TP expert weights (ep=1): stacked parameters on the HF
       experts module, F-sharded in place by ``apply_tp``, which records their
-      ids on the block as ``tp_sharded_param_ids``;
+      names on the block as ``tp_sharded_param_names`` (resolved to ids here,
+      AFTER FSDP may have replaced the Parameter objects);
     * EP expert weights (tp x ep): ``GroupedExperts``'s ``w1/w3/w2``. Each EP
       rank owns a different slice of the expert COUNT, and its gradient is
       complete for those experts (the all-to-all dispatch feeds it every
@@ -604,9 +622,15 @@ def tp_sharded_param_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
     }
     for part in model_parts:
         for module in part.modules():
-            extra = getattr(module, "tp_sharded_param_ids", None)
-            if extra:
-                sharded_ids.update(extra)
+            extra_names = getattr(module, "tp_sharded_param_names", None)
+            if extra_names:
+                # Names, resolved NOW: apply_tp records them before FSDP runs,
+                # and FSDP replaces the Parameter objects, so ids captured at
+                # apply time would never match again (the failure mode is a
+                # silently wrong replicated-gradient all-reduce).
+                sharded_ids.update(
+                    id(module.get_parameter(name)) for name in extra_names
+                )
             if isinstance(module, GroupedExperts):
                 sharded_ids.update(id(p) for p in module.parameters(recurse=False))
     return sharded_ids

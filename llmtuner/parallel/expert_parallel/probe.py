@@ -156,6 +156,16 @@ def fused_experts_of(block: nn.Module) -> FusedExperts | None:
         return None
     if gate_up.shape[0] != down.shape[0]:
         return None
+    # GroupedExperts hard-codes SwiGLU; every supported family activates with
+    # silu today, but the probe must say so rather than let a future HF family
+    # with a different gated activation be swapped in silently.
+    act_fn = getattr(experts, "act_fn", None)
+    if act_fn is not None and not isinstance(act_fn, nn.SiLU):
+        raise NotImplementedError(
+            f"Expert activation {type(act_fn).__name__} is not SiLU; the swap "
+            "would silently change the experts' nonlinearity. Wire the "
+            "activation through GroupedExperts first."
+        )
     if hasattr(experts, "gate_up_proj_bias") or hasattr(experts, "down_proj_bias"):
         matrix.gpt_oss_layout(experts)
     num_experts, double_hidden, dim = gate_up.shape

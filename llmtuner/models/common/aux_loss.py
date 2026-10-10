@@ -180,7 +180,10 @@ class AuxLoss(nn.Module):
                 "step's global valid-token count before the first forward."
             )
         denominator = AuxLoss._step_denominator
-        scale = 1.0 / denominator
+        # clamp_min(1): an all-padding step has zero valid tokens, and inf
+        # here would poison the router gradients it is injected into
+        # (upstream's guard, same line).
+        scale = 1.0 / denominator.clamp_min(1)
         injected = raw_sum * (self.coeff * scale)
         # Accumulate the metric in the forward. The no_grad mask keeps the
         # buffer out of the autograd graph.
