@@ -22,30 +22,7 @@ from ..accelerator.spmd_context import spmd_context
 from ..datasets import build_dataloader
 from ..datasets.loader import DataloaderExhaustedError
 from ..datasets.types import Batch
-
-
-def loss_reporting_meshes(parallel_dims):
-    """``(dp_mesh, loss_mesh)`` for a pass's reductions.
-
-    The same mesh split as ``train_step``: the token count is taken from the
-    unsharded batch, so it is summed over the dp axis alone; the loss is summed
-    over each rank's own slice of the batch, so it is reduced over the
-    dp*cp*tp ``loss`` view when the sequence is sharded at all.
-    """
-    dp_mesh = (
-        None if parallel_dims is None else parallel_dims.get_optional_mesh("dp")
-    )
-    loss_sharded = parallel_dims is not None and (
-        parallel_dims.dp_cp_enabled or parallel_dims.tp_enabled
-    )
-    loss_mesh = (
-        None
-        if parallel_dims is None
-        else (
-            parallel_dims.get_optional_mesh("loss") if loss_sharded else dp_mesh
-        )
-    )
-    return dp_mesh, loss_mesh
+from .reduction_meshes import loss_reporting_meshes
 
 
 def build_validation_dataloader(self, validation: ValidationConfig):
