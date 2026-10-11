@@ -41,16 +41,6 @@ Scope: this is the mechanism. No meta-init (weights come from the HF model as
 usual), no fused QKV (HF keeps q/k/v as separate projections), no FP8.
 """
 
-__all__ = [
-    "ColumnParallelLinear",
-    "ColwiseLinearNoGather",
-    "RowParallelLinear",
-    "ShardingConfig",
-    "apply_tp",
-    "colwise",
-    "rowwise",
-]
-
 from __future__ import annotations
 
 import fnmatch
@@ -62,8 +52,12 @@ import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
+from llmtuner.config import ParallelConfig
+
 from ...accelerator.capabilities import has
 from ...models.common.moe.experts import GroupedExperts
+from .. import matrix
+from ..head_sharding import require_heads_divisible_by
 from .linear import (
     AllGatherLinear,
     LinearReduceScatter,
@@ -72,6 +66,16 @@ from .linear import (
     linear_reduce_scatter,
     reduce_scatter_along,
 )
+
+__all__ = [
+    "ColumnParallelLinear",
+    "ColwiseLinearNoGather",
+    "RowParallelLinear",
+    "ShardingConfig",
+    "apply_tp",
+    "colwise",
+    "rowwise",
+]
 
 ShardKind = Literal["colwise", "rowwise"]
 

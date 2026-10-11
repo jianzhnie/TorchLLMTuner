@@ -48,7 +48,7 @@ from ..models.common.aux_loss import (
 )
 from ..models.common.moe.block import MoE
 from ..parallel.parallel_dims import ParallelDims
-from ..parallel.tensor_parallel.tp import tp_sharded_param_ids
+from ..parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 from ..utils.gc import GarbageCollection
 from ..utils.logger_utils import get_logger
 from . import batch as batch_mod

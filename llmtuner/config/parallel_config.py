@@ -7,7 +7,12 @@ from typing import Literal
 
 import torch
 
-from llmtuner.config.field_checks import require_at_least
+from llmtuner.config.context_parallel_config import validate_context_parallel_config
+from llmtuner.config.expert_parallel_config import validate_expert_parallel_config
+from llmtuner.config.utils import require_at_least
+from llmtuner.config.fsdp_config import validate_fsdp_config
+from llmtuner.config.pipeline_parallel_config import validate_pipeline_parallel_config
+from llmtuner.config.tensor_parallel_config import validate_tensor_parallel_config
 from llmtuner.errors import (
     ConfigError,
     EnvironmentUnsupportedError,
@@ -39,7 +44,8 @@ class ParallelConfig:
     """
 
     data_parallel_shard_size: int = -1
-    """
+    """Data-parallel sharding degree; ``-1`` derives the leftover degree.
+
     The `data_parallel_shard_size` argument specifies the degree of data
     parallelism for weight sharding. When this value is greater than 1, weights
     will be sharded across `data_parallel_shard_size` ranks. If
@@ -51,37 +57,13 @@ class ParallelConfig:
     """
 
     fsdp_reshard_after_forward: Literal["default", "always", "never"] = "default"
-    """
-    `reshard_after_forward` specifies the policy for applying
-    `reshard_after_forward` within an FSDP setup. `reshard_after_forward`
-    controls parameter behavior after forward, trading off memory and
-    communication. See torch's `fully_shard` API for more documentation on
-    `reshard_after_forward`.
-
-    The supported policies include "default", "always" and "never":
-
-    - "default" applies default resharding behavior, implementing "smart
-      defaults" for known optimal scenarios.
-    - "always" will enable `reshard_after_forward` for all forward passes.
-    - "never" will disable `reshard_after_forward` for all forward passes.
-    """
+    """FSDP2 parameter resharding policy after forward."""
 
     enable_fsdp_symm_mem: bool = False
-    """
-    Whether to enable FSDP2 symmetric-memory communication optimizations for
-    FSDP modules after `fully_shard` has been applied.
-    """
+    """Enable FSDP2 symmetric-memory communication when supported."""
 
     fsdp_symm_mem_scope: Literal["all", "dense"] = "all"
-    """
-    Which FSDP modules get symmetric-memory comms when
-    ``enable_fsdp_symm_mem`` is on: "all" covers every FSDP module; "dense"
-    skips modules flagged ``moe_enabled`` (an MoE transformer block is one
-    FSDP module, so its attention parameters are skipped along with its
-    experts). Symmetric memory is not always beneficial for the expert
-    (sparse) FSDP modules, hence the narrower option. Ignored when
-    ``enable_fsdp_symm_mem`` is False.
-    """
+    """Apply symmetric-memory communication to all or dense FSDP modules."""
 
     tensor_parallel_size: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
@@ -332,6 +314,11 @@ class ParallelConfig:
         return dp_shard
 
     def __post_init__(self):
+        validate_fsdp_config(self)
+        validate_tensor_parallel_config(self)
+        validate_pipeline_parallel_config(self)
+        validate_context_parallel_config(self)
+        validate_expert_parallel_config(self)
         if self.train_timeout_seconds < 1:
             raise ConfigError(
                 "parallel.train_timeout_seconds must be >= 1, got "

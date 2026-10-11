@@ -63,7 +63,7 @@ from llmtuner.config import (
     ProfilerConfig,
     TrainingConfig,
 )
-from llmtuner.config.cli import PARSER_GROUPS, cli_groups
+from llmtuner.config.cli_config import PARSER_GROUPS, cli_groups
 from llmtuner.errors import ConfigError
 
 from .trainer import Trainer
