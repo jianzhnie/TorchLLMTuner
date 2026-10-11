@@ -162,6 +162,12 @@ class ParallelDims:
         axes are still hidden by ``get_optional_mesh``.
         """
 
+        # Mesh views and their cached submeshes must always belong to the same
+        # world mesh. Rebuilding here would leave cached multi-axis views tied
+        # to the old process groups while replacing all single-axis views.
+        if self._world_mesh is not None:
+            return self._world_mesh
+
         def unflatten_mesh(
             world_mesh: DeviceMesh,
             dim_names: tuple[str, ...],

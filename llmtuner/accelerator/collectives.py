@@ -279,7 +279,28 @@ def clip_grad_norm_(
             total_norm **= 1.0 / norm_type
 
     if max_norm > 0:
-        torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
+        # torch's foreach clip batches DTensor grads together by device and
+        # dtype, but a model can have dense and expert FSDP parameters on
+        # different meshes. DTensor cannot multiply such a mixed list in one
+        # foreach op. Group by mesh while using the same global clipping norm.
+        clip_groups: dict[int | None, list[torch.Tensor]] = {}
+        for parameter in parameters:
+            grad = parameter.grad
+            if grad is None:
+                continue
+            mesh_key = id(grad.device_mesh) if isinstance(grad, DTensor) else None
+            clip_groups.setdefault(mesh_key, []).append(parameter)
+        for group_parameters in clip_groups.values():
+            torch.nn.utils.clip_grads_with_norm_(
+                group_parameters,
+                max_norm,
+                total_norm,
+                # A scalar DTensor norm can still be paired with a different
+                # mesh by foreach's fused dispatcher. The scalar loop has the
+                # same clipping arithmetic and accepts the already-materialized
+                # global norm for every mesh group.
+                False if len(clip_groups) > 1 else foreach,
+            )
     return total_norm
 
 

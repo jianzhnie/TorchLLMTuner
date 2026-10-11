@@ -120,6 +120,50 @@ def parallelize_hf_transformers(
             compile_enabled=compile,
         )
 
+    def apply_stages(
+        part: nn.Module,
+        dense_mesh,
+        stage_order: tuple[str, ...],
+        *,
+        ep_group,
+        tp_mesh,
+    ) -> nn.Module:
+        """Apply the same transforms to a whole model or one PP stage."""
+        runners = {
+            "tp": lambda m: apply_tp(m, dense_mesh, cfg),
+            "ep": lambda m: apply_ep(m, cfg, ep_group=ep_group),
+            "cp": lambda m: apply_cp(m, dense_mesh, cfg),
+            "ac": _apply_ac,
+            "compile": lambda m: apply_compile(
+                m, compile_config=compile_config, tp_mesh=tp_mesh
+            ),
+            "fsdp": lambda m: apply_fsdp(m, cfg, parallel_dims),
+        }
+        for name in stage_order:
+            if stage_enabled(name, compile=compile):
+                part = runners[name](part)
+        return part
+
+    # EP groups come from the sparse mesh in both assembly paths. Under PP
+    # this slice contains only ranks in the current pipeline stage.
+    ep_group = None
+    if cfg.ep > 1:
+        if parallel_dims is None:
+            raise ValueError(
+                f"ep={cfg.ep} needs a process group, but this run is "
+                "single-process (parallel_dims is None). EP requires "
+                "world_size > 1."
+            )
+        ep_mesh = parallel_dims.get_optional_mesh("ep")
+        if ep_mesh is None:
+            raise ValueError(
+                f"ep={cfg.ep} but parallel_dims has no multi-rank 'ep' axis."
+            )
+        ep_group = ep_mesh.get_group()
+    tp_mesh = (
+        None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
+    )
+
     if parallel_dims is not None and parallel_dims.pp_enabled:
         if global_batch_size is None:
             raise ValueError(
@@ -142,28 +186,12 @@ def parallelize_hf_transformers(
             global_batch_size=global_batch_size,
         )
         dense_mesh = parallel_dims.spmd_dense_mesh()
-        tp_mesh = parallel_dims.get_optional_mesh("tp")
-        # The EP group under PP is per-stage: the sparse mesh carries the pp
-        # axis, so this rank's "ep" slice is its own stage's group.
-        ep_mesh = parallel_dims.get_optional_mesh("ep")
-        ep_group = None if ep_mesh is None else ep_mesh.get_group()
-        pp_runners = {
-            "tp": lambda m: apply_tp(m, dense_mesh, cfg),
-            "ep": lambda m: apply_ep(m, cfg, ep_group=ep_group),
-            "cp": lambda m: apply_cp(m, dense_mesh, cfg),
-            "ac": _apply_ac,
-            "compile": lambda m: apply_compile(
-                m, compile_config=compile_config, tp_mesh=tp_mesh
-            ),
-            "fsdp": lambda m: apply_fsdp(m, cfg, parallel_dims),
-        }
         for i, part in enumerate(model_parts):
-            for name in PP_STAGE_ORDER:
-                if stage_enabled(name, compile=compile):
-                    part = pp_runners[name](part)
-            model_parts[i] = part
+            model_parts[i] = apply_stages(
+                part, dense_mesh, PP_STAGE_ORDER, ep_group=ep_group, tp_mesh=tp_mesh
+            )
             # Rebind the stage's submodule in case a transform replaced the chunk.
-            stages[i].submod = part
+            stages[i].submod = model_parts[i]
         return PipelineParallelSetup(
             # The schedule's loss runs on the last stage's logits, so it needs
             # the same vocab-parallel arguments the trainer's loss does. They
@@ -184,45 +212,4 @@ def parallelize_hf_transformers(
             has_last_stage=has_last_stage,
         )
 
-    # The EP group lives on the sparse mesh, not the dense (dp, cp, tp) mesh
-    # the apply_* functions are handed, so it is resolved here from
-    # parallel_dims and passed down explicitly.
-    ep_group = None
-    if cfg.ep > 1:
-        if parallel_dims is None:
-            raise ValueError(
-                f"ep={cfg.ep} needs a process group, but this run is "
-                "single-process (parallel_dims is None). EP requires "
-                "world_size > 1."
-            )
-        ep_mesh = parallel_dims.get_optional_mesh("ep")
-        if ep_mesh is None:
-            raise ValueError(
-                f"ep={cfg.ep} but parallel_dims has no multi-rank 'ep' axis."
-            )
-        ep_group = ep_mesh.get_group()
-
-    runners = {
-        "tp": lambda m: apply_tp(m, mesh, cfg),
-        "ep": lambda m: apply_ep(m, cfg, ep_group=ep_group),
-        "cp": lambda m: apply_cp(m, mesh, cfg),
-        "ac": _apply_ac,
-        # ``parallel/compile.py``: whole-model compile by default (the
-        # historical behavior), per-block compile and the three compile-side
-        # toggles (async TP, regional_inductor, capture_scalar_outputs)
-        # behind ``compile_config``'s switches.
-        "compile": lambda m: apply_compile(
-            m,
-            compile_config=compile_config,
-            tp_mesh=(
-                None
-                if parallel_dims is None
-                else parallel_dims.get_optional_mesh("tp")
-            ),
-        ),
-        "fsdp": lambda m: apply_fsdp(m, cfg, parallel_dims),
-    }
-    for name in STAGE_ORDER:
-        if stage_enabled(name, compile=compile):
-            model = runners[name](model)
-    return model
+    return apply_stages(model, mesh, STAGE_ORDER, ep_group=ep_group, tp_mesh=tp_mesh)
