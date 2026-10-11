@@ -60,9 +60,7 @@ def restore_fp32_state_buffers(module: nn.Module) -> None:
 def build_aux_loss(aux_loss_coeff: float | None):
     """The per-microbatch load-balance loss a router carries, or none."""
     return (
-        MicrobatchWiseLoadBalanceLoss(coeff=aux_loss_coeff)
-        if aux_loss_coeff
-        else None
+        MicrobatchWiseLoadBalanceLoss(coeff=aux_loss_coeff) if aux_loss_coeff else None
     )
 
 

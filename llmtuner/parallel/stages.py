@@ -20,6 +20,7 @@ __all__ = [
     "stage_enabled",
 ]
 
+
 # The order IS the contract (see parallelize.py's docstring).
 @dataclass(frozen=True)
 class Stage:
@@ -65,8 +66,7 @@ STAGES: tuple[Stage, ...] = (
     Stage(
         "compile",
         True,
-        "After AC, before FSDP; runs only when the caller passes "
-        "compile=True.",
+        "After AC, before FSDP; runs only when the caller passes compile=True.",
     ),
     Stage(
         "fsdp",

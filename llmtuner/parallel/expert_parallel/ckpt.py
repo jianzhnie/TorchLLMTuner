@@ -88,9 +88,7 @@ def expert_shard_map(
 
 def named_params(model_parts: list[nn.Module]) -> dict[str, torch.Tensor]:
     return {
-        fqn: param
-        for model in model_parts
-        for fqn, param in model.named_parameters()
+        fqn: param for model in model_parts for fqn, param in model.named_parameters()
     }
 
 
@@ -126,9 +124,7 @@ def matched_entries(
             if direction == "save":
                 if value.shape != param.shape:
                     continue
-            elif not (
-                value.ndim == param.ndim and value.shape[1:] == param.shape[1:]
-            ):
+            elif not (value.ndim == param.ndim and value.shape[1:] == param.shape[1:]):
                 continue
             yield key, group, param
             break

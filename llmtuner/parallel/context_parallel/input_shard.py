@@ -71,9 +71,7 @@ def require_torch_cp() -> None:
         )
 
 
-def resolve_load_balancer(
-    load_balancer: str | None, seq_len: int, cp_mesh: DeviceMesh
-):
+def resolve_load_balancer(load_balancer: str | None, seq_len: int, cp_mesh: DeviceMesh):
     """Instantiate the named load balancer for one sequence length.
 
     The balancers are deterministic in ``(seq_len, cp_size, device)``, so the
@@ -179,7 +177,6 @@ def shard_padding_mask_for_tp(
         seq_dims=[0],
         load_balancer=None,
     )[0]
-
 
 
 def shard_batch_for_tp(

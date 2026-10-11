@@ -164,9 +164,7 @@ def maybe_enable_async_tp(compile_config: CompileConfig, tp_mesh) -> None:
     logger.info("Async TP is enabled")
 
 
-def maybe_regional_inductor_backend(
-    model: nn.Module, backend: str
-) -> str | Callable:
+def maybe_regional_inductor_backend(model: nn.Module, backend: str) -> str | Callable:
     """Wrap ``aot_eager`` so the flex regions are scooped into inductor.
 
     ``regional_inductor`` lowers just the regions annotated with

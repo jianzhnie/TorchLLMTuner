@@ -241,9 +241,7 @@ def prepend_first_stage_modules(
                 "two stages a live copy of the same parameter."
             )
         if fqn in seen:
-            raise ValueError(
-                f"first-stage module {fqn!r} is listed more than once."
-            )
+            raise ValueError(f"first-stage module {fqn!r} is listed more than once.")
         seen.add(fqn)
         present.append(fqn)
     module_names_per_stage[0][:0] = present
