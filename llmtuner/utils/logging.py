@@ -105,10 +105,10 @@ def get_distributed_rank() -> int:
     separate things, and it needs the first to decide the second.
     """
     try:
-        from ..accelerator import dist_utils
+        from ..accelerator import distributed
 
-        if dist_utils.is_distributed():
-            return dist_utils.get_rank()
+        if distributed.is_distributed():
+            return distributed.get_rank()
     except Exception:
         import logging as _logging
 

@@ -28,7 +28,7 @@ from torch.distributed.tensor import DTensor
 from llmtuner.config import LLMTunerConfig, ValidationConfig
 
 from ..accelerator.collectives import all_reduce, clip_grad_norm_, set_pg_timeouts
-from ..accelerator.spmd_context import spmd_context
+from ..accelerator.spmd import spmd_context
 from ..components.checkpointer import CheckpointManager
 from ..components.loss import (
     chunked_lm_head_cross_entropy,
@@ -104,7 +104,7 @@ class Trainer:
     def __init__(self, cfg: LLMTunerConfig):
         """Assemble the trainer. The whole body lives in ``runtime/assembly.py`` --
         the assembly order there is a contract (see its docstring)."""
-        assembly.build_trainer_state(self, cfg)
+        assembly.assemble_trainer_runtime(self, cfg)
 
     # -- setup helpers ---------------------------------------------------------
 
@@ -361,7 +361,7 @@ class Trainer:
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Drive the pipeline schedule for one accumulation group."""
-        return pipeline.forward_backward_pipeline(
+        return pipeline.run_pipeline_step(
             self, batch, global_valid_tokens=global_valid_tokens
         )
 
@@ -870,7 +870,7 @@ class Trainer:
 
     def validate_body(self, validation: ValidationConfig, step: int) -> None:
         """The pass itself; the body lives in ``validate.py``."""
-        validation_runtime.validate_body(self, validation, step)
+        validation_runtime.run_validation_loop(self, validation, step)
 
     # -- step cadence ------------------------------------------------------------
 

@@ -94,7 +94,7 @@ def get_env_dist_info() -> tuple[int, int, int]:
     """Return ``(rank, world size, local rank)`` from torchrun's environment.
 
     Named ``get_env_dist_info`` to stay distinct from
-    ``dist_utils.get_dist_info(group)``, which queries the live process
+    ``distributed.get_dist_info(group)``, which queries the live process
     group and returns only ``(rank, world size)``.
     """
     return (

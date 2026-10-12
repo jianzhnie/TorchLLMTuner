@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ...accelerator import dist_utils
+from ...accelerator import distributed
 from ...models.common.moe.block import MoE
 from ...models.common.moe.dispatcher import (
     AllToAllTokenDispatcher,
@@ -80,8 +80,8 @@ def convert_block(
     tp_enabled: bool = False,
 ) -> MoE:
     """Build the llmtuner MoE for one HF block and move its weights over."""
-    ep_size = 1 if ep_group is None else dist_utils.get_world_size(ep_group)
-    ep_rank = 0 if ep_group is None else dist_utils.get_rank(ep_group)
+    ep_size = 1 if ep_group is None else distributed.get_world_size(ep_group)
+    ep_rank = 0 if ep_group is None else distributed.get_rank(ep_group)
 
     router_gate = router_of(block)
     assert router_gate is not None  # the probe established this

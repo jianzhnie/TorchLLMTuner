@@ -18,7 +18,7 @@ from llmtuner.config import ValidationConfig
 from llmtuner.parallel import compatibility
 
 from ...accelerator.collectives import all_reduce
-from ...accelerator.spmd_context import spmd_context
+from ...accelerator.spmd import spmd_context
 from ...datasets import build_dataloader
 from ...datasets.contracts import Batch
 from ...datasets.dataloader import DataloaderExhaustedError
@@ -43,7 +43,7 @@ def build_validation_dataloader(self, validation: ValidationConfig):
     )
 
 
-def count_batch_tokens(self, batch, dp_mesh) -> torch.Tensor:
+def count_validation_batch_tokens(self, batch, dp_mesh) -> torch.Tensor:
     """Throughput accounting plus the dp-reduced global valid-token count.
 
     The throughput number counts every label the loader produced, whether or
@@ -63,7 +63,7 @@ def count_batch_tokens(self, batch, dp_mesh) -> torch.Tensor:
     return global_valid_tokens
 
 
-def finish_validation(
+def finalize_validation(
     self,
     *,
     num_steps: int,
@@ -192,10 +192,10 @@ def validate(self, step: int) -> None:
             part.train()
 
 
-def validate_body(self, validation: ValidationConfig, step: int) -> None:
+def run_validation_loop(self, validation: ValidationConfig, step: int) -> None:
     parallel_dims = self.parallel_dims
     if parallel_dims is not None and parallel_dims.pp_enabled:
-        validate_body_pp(self, validation, step)
+        run_pipeline_validation_loop(self, validation, step)
         return
     dp_mesh, loss_mesh = loss_reporting_meshes(parallel_dims)
     validation_dataloader = build_validation_dataloader(self, validation)
@@ -210,7 +210,7 @@ def validate_body(self, validation: ValidationConfig, step: int) -> None:
                 batch = next(data_iterator)
             except (DataloaderExhaustedError, StopIteration):
                 break
-            global_valid_tokens = count_batch_tokens(self, batch, dp_mesh)
+            global_valid_tokens = count_validation_batch_tokens(self, batch, dp_mesh)
             if isinstance(batch, dict):
                 # ``num_valid_tokens`` is the trainer's bookkeeping; a
                 # plain int among tensors would be splatted into the model
@@ -236,7 +236,7 @@ def validate_body(self, validation: ValidationConfig, step: int) -> None:
         # one. The loader is temporary, so nothing else holds it open.
         validation_dataloader.close()
 
-    finish_validation(
+    finalize_validation(
         self,
         num_steps=num_steps,
         accumulated_loss=accumulated_loss,
@@ -246,13 +246,13 @@ def validate_body(self, validation: ValidationConfig, step: int) -> None:
     )
 
 
-def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
+def run_pipeline_validation_loop(self, validation: ValidationConfig, step: int) -> None:
     """The PP validation pass: drive the schedule's ``eval`` per step.
 
     Upstream torchtitan's ``Validator`` seam: the pipeline schedule carries an
     eval-only driver, so a validation pass runs the same stages forward-only.
     The microbatch plumbing mirrors the training body
-    (``pipeline.forward_backward_pipeline``): first
+    (``pipeline.run_pipeline_step``): first
     stage gets the inputs, last stage the labels, and every stage gets the
     per-microbatch kwargs (positions, masks).
 
@@ -285,7 +285,7 @@ def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
                 batch = next(data_iterator)
             except (DataloaderExhaustedError, StopIteration):
                 break
-            global_valid_tokens = count_batch_tokens(self, batch, dp_mesh)
+            global_valid_tokens = count_validation_batch_tokens(self, batch, dp_mesh)
 
             arg_mbs: list[tuple[torch.Tensor, ...]] = []
             kwarg_mbs: list[dict] = []
@@ -323,7 +323,7 @@ def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
     finally:
         validation_dataloader.close()
 
-    finish_validation(
+    finalize_validation(
         self,
         num_steps=num_steps,
         accumulated_loss=(accumulated_loss if self.pp_has_last_stage else None),

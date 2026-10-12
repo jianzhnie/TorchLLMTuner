@@ -353,7 +353,7 @@ ENTRIES: tuple[Row, ...] = (
         ep_hf_initial_load,
         "assembly",
         UnsupportedCombinationError,
-        "trainer/runtime/assembly.py::build_trainer_state",
+        "trainer/runtime/assembly.py::assemble_trainer_runtime",
     ),
     Row(
         chunked_loss_validation,
@@ -377,7 +377,7 @@ ENTRIES: tuple[Row, ...] = (
         pp_packed_microbatch_split,
         "assembly",
         UnsupportedCombinationError,
-        "trainer/pipeline.py::split_pipeline_microbatches",
+        "trainer/runtime/pipeline.py::split_pipeline_microbatches",
     ),
     Row(
         shared_expert_tp,

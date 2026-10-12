@@ -8,21 +8,21 @@ Members:
 * ``collectives.py`` -- PG timeouts (``set_pg_timeouts``), the in-place
   ``all_reduce`` used for loss/token denominators, and EP-aware
   ``clip_grad_norm_``.
-* ``spmd_context.py`` -- the ambient SPMD mesh context (TLS mesh stack and
+* ``spmd.py`` -- the ambient SPMD mesh context (TLS mesh stack and
   by-name process-group queries) that trainer and ``models/common`` read.
-* ``dist_utils.py`` -- process-group bootstrap and rank/world queries, vendored
+* ``distributed.py`` -- process-group bootstrap and rank/world queries, vendored
   from OpenMMLab's ``mmengine.dist`` and de-mmengine'd to depend only on torch.
-* ``tensor_transfer.py`` -- nested tensor device inspection and movement.
+* ``tensors.py`` -- nested tensor device inspection and movement.
 
-``dist_utils`` is re-exported here lazily (PEP 562): importing this package or
+``distributed`` is re-exported here lazily (PEP 562): importing this package or
 a sibling submodule (``llmtuner.accelerator.device`` ...) does not pay for it
 unless a toolbox name is actually touched. ``collectives`` /
-``spmd_context`` are imported as submodules -- re-exporting them would make
+``spmd`` is imported as a submodule -- re-exporting it would make
 ``import llmtuner.accelerator`` pull in the parallel and trainer layers and
 close an import cycle. Topology construction (``build_parallel_topology`` /
 ``build_mesh``) lives with ``ParallelTopology`` in
 ``llmtuner/parallel/topology.py``; the trainer bootstraps its PG via
-``dist_utils.init_dist_pytorch``.
+``distributed.init_dist_pytorch``.
 """
 
 from __future__ import annotations
@@ -30,19 +30,19 @@ from __future__ import annotations
 from ..utils.lazy_exports import export_names, resolve_export
 
 _EXPORT_SOURCES = {
-    "barrier": "dist_utils",
-    "cast_data_device": "tensor_transfer",
-    "get_backend": "dist_utils",
-    "get_comm_device": "dist_utils",
-    "get_data_device": "tensor_transfer",
-    "get_dist_info": "dist_utils",
-    "get_rank": "dist_utils",
-    "get_world_size": "dist_utils",
-    "infer_launcher": "dist_utils",
-    "init_dist": "dist_utils",
-    "is_distributed": "dist_utils",
-    "is_main_process": "dist_utils",
-    "master_only": "dist_utils",
+    "barrier": "distributed",
+    "cast_data_device": "tensors",
+    "get_backend": "distributed",
+    "get_comm_device": "distributed",
+    "get_data_device": "tensors",
+    "get_dist_info": "distributed",
+    "get_rank": "distributed",
+    "get_world_size": "distributed",
+    "infer_launcher": "distributed",
+    "init_dist": "distributed",
+    "is_distributed": "distributed",
+    "is_main_process": "distributed",
+    "master_only": "distributed",
 }
 
 __all__ = export_names(_EXPORT_SOURCES)

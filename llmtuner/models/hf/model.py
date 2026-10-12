@@ -42,7 +42,7 @@ from transformers.modeling_utils import AttentionInterface
 
 from llmtuner.errors import UnsupportedCombinationError
 
-from ...accelerator import dist_utils
+from ...accelerator import distributed
 from ...components.loss import next_token_targets
 from ...datasets.contracts import Batch
 from ...parallel.context_parallel import (
@@ -956,7 +956,7 @@ class HFTransformerModel(nn.Module):
 
     def _maybe_dump_logits(self, dump_dir: str, logits: torch.Tensor) -> None:
         """Append this rank's logits (one entry per forward) for numerical tests."""
-        rank = dist_utils.get_rank()
+        rank = distributed.get_rank()
         cp_coord = self.cp_mesh.get_local_rank() if self.cp_mesh is not None else 0
         recs = getattr(self, "_logit_dump_recs", None)
         if recs is None:

@@ -1,7 +1,7 @@
 """Factory functions that turn configuration into a built object.
 
 These sit one level above the modules whose classes they assemble, and that is
-what they are for: ``loader.py`` and ``lr_scheduler.py`` hold one implementation
+what they are for: ``dataloader.py`` and ``lr_scheduler.py`` hold one implementation
 each and must not depend on their siblings, while a factory has to know all of
 them. Building a dataloader means reading the recipe registry, constructing the
 tokenizer, deriving the iteration policy and packing the graph -- four modules
@@ -31,7 +31,7 @@ from .collators import TextCollator
 from .contracts import DatasetBuildContext, DatasetIterationPolicy
 from .dataloader import BaseDataLoader, GrainDataLoader
 from .packing import build_concat_then_split_packing, build_first_fit_packing
-from .random_data import RandomTokenDataLoader
+from .synthetic import RandomTokenDataLoader
 from .text.processors import (
     DATASETS,
     make_local_jsonl,

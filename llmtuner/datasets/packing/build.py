@@ -14,7 +14,7 @@ import grain.python as grain
 
 from ...components.loss import IGNORE_INDEX
 from ..contracts import DatasetBuildContext, DatasetIterationPolicy, require_positive
-from ..dataset import (
+from ..graph import (
     DatasetConcat,
     DatasetMix,
     SingleDataset,

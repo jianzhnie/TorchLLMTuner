@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from ...accelerator.capabilities import has as capability
-from ...accelerator.spmd_context import spmd_context
+from ...accelerator.spmd import spmd_context
 from ...datasets.contracts import Batch
 from ...datasets.dataloader import TrainerBatch
 from ...parallel import compatibility
@@ -54,7 +54,7 @@ def split_pipeline_microbatches(
     ]
 
 
-def forward_backward_pipeline(
+def run_pipeline_step(
     trainer: Trainer,
     batch: Batch | TrainerBatch,
     *,

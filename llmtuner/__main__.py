@@ -1,6 +1,6 @@
 """Allow `python -m llmtuner` to run the training entry point."""
 
-from .trainer.train import main
+from .trainer.cli import main
 
 if __name__ == "__main__":
     main()

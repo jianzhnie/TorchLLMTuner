@@ -73,7 +73,7 @@ from ...components.loss import IGNORE_INDEX
 from ...components.tokenizer import MultiModalTokenizer
 from ...utils.logging import get_logger
 from ..contracts import DatasetBuildContext, DatasetIterationPolicy, require_positive
-from ..dataset import (
+from ..graph import (
     DatasetConcat,
     DatasetMix,
     SampleProcessor,
@@ -84,7 +84,7 @@ from ..dataset import (
 )
 from ..sources import HuggingFaceStreamingSource
 from .image import calculate_vision_tokens, process_image, resize_to_pixel_budget
-from .text import insert_vision_placeholders
+from .placeholders import insert_vision_placeholders
 
 logger = get_logger(__name__)
 
