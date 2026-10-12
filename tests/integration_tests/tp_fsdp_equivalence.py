@@ -46,7 +46,7 @@ from llmtuner.datasets.types import Batch
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.parallel_dims import ParallelDims
-from llmtuner.parallel.tensor_parallel.tp import (
+from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     ColumnParallelLinear,
     ColwiseLinearNoGather,
     RowParallelLinear,

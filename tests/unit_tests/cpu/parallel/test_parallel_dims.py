@@ -336,7 +336,7 @@ def test_cp_only_still_needs_a_loss_reduction() -> None:
 
 def test_sharding_a_weight_that_does_not_divide_is_rejected() -> None:
     """A ragged split would silently give ranks different-size shards."""
-    from llmtuner.parallel.tensor_parallel.tp import shard_weight
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import shard_weight
 
     with pytest.raises(ValueError, match="not divisible by"):
         shard_weight(torch.zeros(5, 4), 0, tp_size=2, tp_rank=0)
@@ -344,7 +344,7 @@ def test_sharding_a_weight_that_does_not_divide_is_rejected() -> None:
 
 def test_sharding_a_weight_keeps_only_this_ranks_slice() -> None:
     """The non-vacuity check: rank 1 of 2 gets the second half along dim 0."""
-    from llmtuner.parallel.tensor_parallel.tp import shard_weight
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import shard_weight
 
     weight = torch.arange(8).reshape(4, 2)
     assert shard_weight(weight, 0, tp_size=2, tp_rank=1).tolist() == [[4, 5], [6, 7]]
@@ -354,7 +354,7 @@ def test_an_unknown_shard_kind_is_rejected() -> None:
     """``kind`` selects the collective the wrapper installs; a typo is fatal."""
     import torch.nn as nn
 
-    from llmtuner.parallel.tensor_parallel.tp import ShardingConfig
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import ShardingConfig
 
     with pytest.raises(ValueError, match="Unknown shard kind"):
         ShardingConfig(kind="diagonal", implementation=nn.Linear)

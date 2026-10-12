@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 from llmtuner.parallel.tensor_parallel import apply_tp
-from llmtuner.parallel.tensor_parallel.tp import (
+from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     ColumnParallelLinear,
     ColwiseLinearNoGather,
     RowParallelLinear,

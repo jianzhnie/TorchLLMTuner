@@ -30,8 +30,8 @@ from torch.nn import ModuleDict, ModuleList
 
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.fully_shard import apply
-from llmtuner.parallel.fully_shard.fsdp import iter_transformer_layers
+from llmtuner.parallel.fully_shard_parallel import apply
+from llmtuner.parallel.fully_shard_parallel.fsdp import iter_transformer_layers
 
 _VOCAB = 32
 _HIDDEN = 8
