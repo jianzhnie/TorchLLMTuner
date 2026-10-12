@@ -53,8 +53,6 @@ from llmtuner.config import (
     SelectiveACConfig,
     TrainingConfig,
 )
-from llmtuner.models.hf.factory import build_model_config
-from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.memory import activation_checkpoint as ac_mod
 from llmtuner.memory.activation_checkpoint import (
     VALID_AC_MODES,
@@ -63,8 +61,10 @@ from llmtuner.memory.activation_checkpoint import (
     mm_recompute_shapes,
     selective_policy,
 )
-from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.memory.remat_regions import region_names
+from llmtuner.models.hf.factory import build_model_config
+from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.parallel.parallelize import parallelize_hf_transformers
 
 _VOCAB = 32
 _HIDDEN = 16
@@ -310,8 +310,8 @@ def test_parallelize_hf_transformers_threads_selective_ac() -> None:
 # -- the pp path --------------------------------------------------------------
 
 
-class _FakeParallelDims:
-    """Just enough of ``ParallelDims`` for the pp branch to be entered.
+class _FakeParallelTopology:
+    """Just enough of ``ParallelTopology`` for the pp branch to be entered.
 
     The branch reads ``pp_enabled``, asks for the dense and tp meshes (both
     ``None``: this test's tp is 1) and hands ``parallel_dims`` to
@@ -355,7 +355,7 @@ def test_the_pp_path_checkpoints_every_stage_chunk(monkeypatch) -> None:
         _model(),
         cfg=ParallelConfig(),
         mesh=None,
-        parallel_dims=_FakeParallelDims(),
+        parallel_dims=_FakeParallelTopology(),
         activation_checkpoint="full",
         global_batch_size=2,
     )
@@ -387,7 +387,7 @@ def test_the_pp_path_is_a_no_op_when_ac_is_off(monkeypatch) -> None:
         _model(),
         cfg=ParallelConfig(),
         mesh=None,
-        parallel_dims=_FakeParallelDims(),
+        parallel_dims=_FakeParallelTopology(),
         global_batch_size=2,
     )
 

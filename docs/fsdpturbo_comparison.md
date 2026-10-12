@@ -102,7 +102,7 @@ Quantization → TP → CP → Module Patch → EP/EFSDP
 ```mermaid
 flowchart TD
     CLI[CLI / Config] --> TRAINER[Trainer builder]
-    TRAINER --> DIST[ProcessGroup / ParallelDims / DeviceMesh]
+    TRAINER --> DIST[ProcessGroup / ParallelTopology / DeviceMesh]
     DIST --> HF[HFTransformerModel]
     HF --> PP{PP enabled?}
     PP -->|是| SPLIT[切分 stage]
@@ -126,7 +126,7 @@ TP → EP → CP → Activation Checkpoint → Compile → FSDP
 
 - `Trainer` 拥有从配置到训练结束的整个生命周期；
 - PP 会先切分模型，再为各 stage 应用同一套变换顺序；
-- `parallel/matrix.py` 是不支持组合的统一裁决入口；
+- `parallel/compatibility.py` 是不支持组合的统一裁决入口；
 - HF wrapper 定义 embedding、layers、norm、head、attention 和 MoE 的适配契约；
 - 训练与验证共享 batch、loss、归约、指标和 checkpoint 语义；
 - 更强调模块职责、组合正确性和数值等价性测试。
@@ -135,7 +135,7 @@ TP → EP → CP → Activation Checkpoint → Compile → FSDP
 
 | 能力 | FSDPTurbo | TorchLLMTuner |
 |---|---|---|
-| FSDP2 | **集成**：原生 FSDP2；按模块通配符选择；支持 prefetch、CPU offload，并提供 custom FSDP 路径 | **集成**：composable FSDP2/HSDP；按 decoder 层与根模块包装；支持 reshard、混合精度和 EP 稀疏网格 |
+| FSDP2 | **集成**：原生 FSDP2；按模块通配符选择；支持 prefetch、CPU offload，并提供 custom FSDP 路径 | **集成**：composable FSDP2/HSDP；按 decoder 层与根模块包装；支持 reshard、混合精度、CPU offload 和 EP 稀疏网格 |
 | DP replicate | **集成**：独立 `data_parallel_size`，与 FSDP 组成二维 HSDP mesh | **集成**：`data_parallel_replicate_size` 与 `data_parallel_shard_size` 组成 HSDP |
 | TP | **集成**：用户显式提供 colwise、rowwise、sequence parallel 模块模式 | **集成**：从 HF 模型 TP plan 推导，并对 attention、MLP、embedding、head 和已支持 MoE 进行语义校验 |
 | PP | **缺口**：未发现 pipeline runtime、模型切分或 schedule | **集成**：`torch.distributed.pipelining`、stage 切分、已注册 schedule 和 microbatch |
@@ -143,7 +143,7 @@ TP → EP → CP → Activation Checkpoint → Compile → FSDP
 | EP | **集成**：`eager`、`fused`、`mc2`、`domino` dispatcher；独立 EP/EDP/EFSDP；按模块 plan 注入 | **集成**：将已识别 HF MoE 转为公共 MoE 栈；默认 `alltoall`，可选 `torchao`；EP checkpoint 与负载均衡 |
 | EFSDP | **集成**：显式 `expert_fully_shard_parallel_size` 和模块列表 | **集成**：从 `dp_shard × cp × tp / ep` 推导 `efsdp`，由 sparse mesh 管理 |
 | Compile | **缺口**：未见统一 `torch.compile` 装配阶段 | **集成**：全模型/逐 block compile、backend 配置和 async TP 开关 |
-| 组合矩阵 | **部分集成**：由 mesh 形状、配置校验和各变换执行时检查 | **集成**：`ParallelConfig`、`ParallelDims`、`matrix.py`、模型 probe 四层检查 |
+| 组合矩阵 | **部分集成**：由 mesh 形状、配置校验和各变换执行时检查 | **集成**：`ParallelConfig`、`ParallelTopology`、`compatibility.py`、模型 probe 四层检查 |
 
 ### 5.1 世界规模表达
 
@@ -178,7 +178,7 @@ efsdp = (dp_shard × cp × tp) / ep
 | Chunk loss | **底层实现**：公共函数存在，当前主要由 Kimi 模型路径调用，未进入 `MemoryConfig` | **集成**：Trainer 内置 chunked LM head cross entropy，并校验 PP/validation 组合 |
 | Activation swap | **集成**：按模块卸载保存的激活到 host | **缺口** |
 | Optimizer swap | **可选集成**：`AdamWSwap` 通过 optimizer factory 选择 | **缺口** |
-| FSDP CPU offload | **集成**：`FSDPPlanConfig.cpu_offload` | **底层实现**：FSDP 函数有参数，`ParallelConfig` 和 Trainer 当前未暴露 |
+| FSDP CPU offload | **集成**：`FSDPPlanConfig.cpu_offload` | **集成**：`fsdp_cpu_offload` 与 `fsdp_cpu_offload_pin_memory` 已贯通 FSDP2 policy |
 | MXFP8 | **可选集成**：MX 格式、MXLinear、MXGMM 和 converter | **缺口** |
 | W8A16 QAT | **可选集成**：Linear 与 GMM converter | **缺口** |
 | 低精度 AllGather | **可选集成**：由 quantization plan 控制 | **缺口** |
@@ -305,11 +305,11 @@ TorchLLMTuner 对一次训练任务的状态和步骤拥有更强控制，因此
 
 | 职责 | FSDPTurbo | TorchLLMTuner |
 |---|---|---|
-| 根入口 | `fsdp_turbo/fsdp_turbo.py` | `llmtuner/trainer/train.py`、`trainer/trainer.py` |
+| 根入口 | `fsdp_turbo/fsdp_turbo.py` | `llmtuner/trainer/cli.py`、`trainer/trainer.py` |
 | 配置 | `fsdp_turbo/fsdp_turbo_config.py` | `llmtuner/config/` |
-| 并行状态 | `distributed/parallel_state.py` | `parallel/parallel_dims.py` |
+| 并行状态 | `distributed/parallel_state.py` | `parallel/topology.py` |
 | 混合并行编排 | `FSDPTurbo.__init__` | `parallel/parallelize.py`、`parallel/stages.py` |
-| 组合限制 | 各配置校验和 apply 函数 | `parallel/matrix.py` 与各配置/probe |
+| 组合限制 | 各配置校验和 apply 函数 | `parallel/compatibility.py` 与各配置/probe |
 | FSDP | `distributed/fully_shard_parallel/`、`fine_grained_fully_shard/` | `parallel/fully_shard_parallel/` |
 | TP | `distributed/tensor_parallel/` | `parallel/tensor_parallel/` |
 | CP | `distributed/context_parallel/` | `parallel/context_parallel/` |
@@ -451,14 +451,14 @@ FSDPTurbo：
 
 TorchLLMTuner：
 
-- `llmtuner/trainer/train.py`
+- `llmtuner/trainer/cli.py`
 - `llmtuner/trainer/trainer.py`
-- `llmtuner/trainer/builder.py`
+- `llmtuner/trainer/runtime/assembly.py`
 - `llmtuner/config/`
 - `llmtuner/parallel/parallelize.py`
 - `llmtuner/parallel/stages.py`
-- `llmtuner/parallel/matrix.py`
-- `llmtuner/parallel/parallel_dims.py`
+- `llmtuner/parallel/compatibility.py`
+- `llmtuner/parallel/topology.py`
 - `llmtuner/components/`
 - `llmtuner/memory/`
 - `llmtuner/datasets/`

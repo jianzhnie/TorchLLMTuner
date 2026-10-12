@@ -33,12 +33,12 @@ from torch.distributed.tensor import DTensor
 from transformers import AutoConfig
 
 from llmtuner.accelerator.collectives import all_reduce
-from llmtuner.accelerator.spmd_context import spmd_context
-from llmtuner.models.common.moe.block import MoE
+from llmtuner.accelerator.spmd import spmd_context
+from llmtuner.config import ParallelConfig
+from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.parallel_dims import ParallelDims
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
-from llmtuner.trainer import ParallelConfig
+from llmtuner.parallel.topology import ParallelTopology
 
 NUM_EXPERTS = 8
 TOP_K = 2
@@ -50,7 +50,7 @@ TOL = 1e-4
 
 def _config() -> AutoConfig:
     # experts_implementation="eager": transformers 5.x defaults to grouped_mm,
-    # which is bf16-only and undispatchable on CPU (see test_ep_swap.py).
+    # which is bf16-only and undispatchable on CPU (see test_ep_model_replacement.py).
     return AutoConfig.for_model(
         "qwen3_moe",
         vocab_size=128,
@@ -107,7 +107,7 @@ def main() -> None:
     assert world == 4, f"this check assumes 4 ranks, got {world}"
 
     cfg = ParallelConfig(data_parallel_shard_size=4, expert_parallel_size=2)
-    parallel_dims = ParallelDims.from_config(cfg, world)
+    parallel_dims = ParallelTopology.from_config(cfg, world)
     parallel_dims.build_mesh()
     loss_mesh = parallel_dims.get_mesh("loss")
 

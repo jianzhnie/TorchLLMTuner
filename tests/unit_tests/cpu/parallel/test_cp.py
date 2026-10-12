@@ -25,11 +25,12 @@ require_env("spmd_types")
 import pytest
 import torch
 
+from llmtuner.config import ParallelConfig
+from llmtuner.errors import ConfigError
 from llmtuner.parallel.context_parallel import (
     CPFlexKernel,
     apply_cp,
 )
-from llmtuner.trainer import ParallelConfig
 
 
 def test_apply_cp_is_a_no_op_when_cp_is_off() -> None:
@@ -105,6 +106,33 @@ def test_the_default_strategy_is_kv_allgather(fake_cp_mesh) -> None:
     both defaults gets whichever the other object happened to pick."""
     assert ParallelConfig().context_parallel_strategy == "kv_allgather"
     assert CPFlexKernel(cp_mesh=fake_cp_mesh).strategy == "kv_allgather"
+
+
+def test_dual_cp_axes_derive_total_degree() -> None:
+    cfg = ParallelConfig(
+        context_parallel_kv_allgather_size=2,
+        context_parallel_ulysses_size=4,
+    )
+
+    assert cfg.cp == 8
+    assert cfg.non_dp_sizes() == 8
+
+
+def test_dual_cp_axes_cannot_mix_with_legacy_degree() -> None:
+    with pytest.raises(ConfigError, match="cannot be combined"):
+        ParallelConfig(
+            context_parallel_size=2,
+            context_parallel_kv_allgather_size=2,
+        )
+
+
+def test_kcp_rejects_tensor_parallelism() -> None:
+    with pytest.raises(Exception, match="KCP requires tensor_parallel_size=1"):
+        ParallelConfig(
+            context_parallel_size=2,
+            context_parallel_strategy="kcp",
+            tensor_parallel_size=2,
+        )
 
 
 # -- ulysses head divisibility -------------------------------------------------

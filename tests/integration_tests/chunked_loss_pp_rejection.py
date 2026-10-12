@@ -6,7 +6,7 @@ Run under torchrun with 2 ranks:
         tests/integration_tests/chunked_loss_pp_rejection.py
 
 Under PP the last stage's loss is computed inside the schedule
-(``pipeline_parallel/apply.py:scalar_loss_fn``) on materialized logits; the
+(``pipeline_parallel/pipeline_parallel.py:scalar_loss_fn``) on materialized logits; the
 chunked path needs hidden states plus a per-chunk backward, which that seam
 does not carry. Building a Trainer with both must raise NotImplementedError
 before the model is built, rather than run an un-chunked (or wrong) loss.
@@ -17,7 +17,7 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from llmtuner.trainer import (
+from llmtuner.config import (
     LLMTunerConfig,
     ModelConfig,
     ParallelConfig,

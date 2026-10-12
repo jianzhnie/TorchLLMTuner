@@ -58,13 +58,13 @@ from llmtuner.config import (
     ParamGroupConfig,
     TrainingConfig,
 )
-from llmtuner.datasets.loader import DataloaderExhaustedError
-from llmtuner.datasets.random_data import (
+from llmtuner.datasets.contracts import Batch
+from llmtuner.datasets.dataloader import DataloaderExhaustedError
+from llmtuner.datasets.synthetic import (
     RandomTokenDataLoader,
     RandomTokenSource,
     batch_iterator,
 )
-from llmtuner.datasets.types import Batch
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
@@ -95,7 +95,7 @@ def test_train_step_rejects_a_fully_masked_window_before_forward() -> None:
 def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
     """The PP schedule's reporting losses must not retain completed graphs."""
     monkeypatch.setattr(
-        "llmtuner.trainer.pipeline_step.capability",
+        "llmtuner.trainer.runtime.pipeline.capability",
         lambda name: False if name == "pipelining_microbatch_drivers" else True,
     )
     activation_refs: list[weakref.ReferenceType[torch.Tensor]] = []

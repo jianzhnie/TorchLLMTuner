@@ -27,7 +27,8 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from llmtuner.models.common.moe.block import MoE
+from llmtuner.config import LLMTunerConfig, ModelConfig, ParallelConfig, TrainingConfig
+from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.context_parallel import (
@@ -36,9 +37,8 @@ from llmtuner.parallel.context_parallel import (
     shard_batch_for_tp,
 )
 from llmtuner.parallel.expert_parallel import apply_ep
-from llmtuner.parallel.parallel_dims import ParallelDims
 from llmtuner.parallel.tensor_parallel import apply_tp
-from llmtuner.trainer import LLMTunerConfig, ModelConfig, ParallelConfig, TrainingConfig
+from llmtuner.parallel.topology import ParallelTopology
 
 SEQ = 256  # torch's CP BlockMask path requires Q_LEN % (cp * 128) == 0
 VOCAB = 128
@@ -128,7 +128,7 @@ def main() -> None:
     assert world == WORLD, f"this check assumes {WORLD} ranks, got {world}"
 
     cfg = _cfg()
-    parallel_dims = ParallelDims.from_config(cfg.parallel, world)
+    parallel_dims = ParallelTopology.from_config(cfg.parallel, world)
     cp_mesh = parallel_dims.get_mesh("cp")
     tp_mesh = parallel_dims.get_mesh("tp")
     ep_mesh = parallel_dims.get_mesh("ep")

@@ -47,7 +47,7 @@ from llmtuner.models.common.aux_loss import (
     collect_aux_loss_metrics,
     zero_aux_losses,
 )
-from llmtuner.models.common.moe.load_balance import MicrobatchWiseLoadBalanceLoss
+from llmtuner.models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
 
 
 @pytest.fixture(autouse=True)
@@ -88,7 +88,7 @@ class _TraceableLoss(AuxLoss):
 
 
 class _NoMeshes:
-    """Stand-in for ParallelDims with every parallelism axis disabled."""
+    """Stand-in for ParallelTopology with every parallelism axis disabled."""
 
     def get_optional_mesh(self, dims, **kwargs):
         return None

@@ -106,7 +106,7 @@ def _make_trainer(
         log_validation=lambda loss, step: logged.update(loss=loss, step=step),
     )
     monkeypatch.setattr(
-        "llmtuner.trainer.validate.build_dataloader", lambda *a, **k: loader
+        "llmtuner.trainer.runtime.validation.build_dataloader", lambda *a, **k: loader
     )
     return trainer, logged
 
@@ -152,7 +152,7 @@ def test_validation_defaults_to_off() -> None:
 
 def test_feasibility_accepts_pipeline_parallelism() -> None:
     """PP x validation composes since 2026-10-02: the schedule's eval driver
-    (upstream Validator's seam) drives the pass; see validate_body_pp."""
+    (upstream Validator's seam) drives the pass; see run_pipeline_validation_loop."""
     Trainer = _trainer_cls()
     Trainer.check_validation_feasibility(
         ValidationConfig(),
@@ -276,7 +276,7 @@ def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
     """Under PP the pass runs the schedule's eval driver, with the loss
     denominator pinned to 1 so the division happens once at the end."""
     Trainer = _trainer_cls()
-    import llmtuner.trainer.validate as validate_mod
+    import llmtuner.trainer.runtime.validation as validate_mod
 
     batches = [_batch(2), _batch(2)]
     loader = _ListLoader(batches)

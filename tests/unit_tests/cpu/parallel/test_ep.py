@@ -1,7 +1,8 @@
 """Expert-parallel wiring: the single-rank guards.
 
-The swap and the multi-rank all-to-all live in ``tests/test_ep_swap.py`` and
-``tests/ep_wiring_equivalence.py``. What can be checked without a mesh is the
+The swap and multi-rank all-to-all live in
+``tests/test_ep_model_replacement.py`` and ``tests/ep_wiring_equivalence.py``.
+What can be checked without a mesh is the
 refusal path: EP is wired, so without the sparse mesh's EP group it must refuse
 loudly rather than silently swap to a replicated (local) dispatcher -- and with
 EP off it must leave the model untouched.
@@ -17,8 +18,8 @@ require_env("spmd_types")
 import pytest
 import torch
 
+from llmtuner.config import ParallelConfig
 from llmtuner.parallel.expert_parallel import apply_ep
-from llmtuner.trainer import ParallelConfig
 
 
 def test_apply_ep_is_a_no_op_when_ep_is_off() -> None:

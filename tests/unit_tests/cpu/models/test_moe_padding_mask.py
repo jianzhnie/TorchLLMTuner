@@ -26,14 +26,14 @@ import torch
 import torch.nn.functional as F
 
 from llmtuner.models.common.aux_loss import AuxLoss
-from llmtuner.models.common.moe.block import MoE
-from llmtuner.models.common.moe.dispatcher import LocalTokenDispatcher
+from llmtuner.models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
-from llmtuner.models.common.moe.load_balance import MicrobatchWiseLoadBalanceLoss
-from llmtuner.models.common.moe.router import (
+from llmtuner.models.common.moe.layer import MoE
+from llmtuner.models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
+from llmtuner.models.common.moe.token_dispatch import LocalTokenDispatcher
 
 _NUM_EXPERTS = 4
 _DIM = 8

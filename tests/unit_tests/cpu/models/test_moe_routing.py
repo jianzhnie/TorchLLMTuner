@@ -17,7 +17,7 @@ Pinned here, mirroring the upstream semantics:
   step, and drains both the histogram and the token counter.
 
 The collectives are exercised with a size-1 gloo group, as in
-``test_expert_bias.py``: the reduction is a no-op arithmetically but the code
+``test_moe_bias_update.py``: the reduction is a no-op arithmetically but the code
 path still runs.
 """
 
@@ -32,17 +32,17 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from llmtuner.models.common.moe.balancing import (
+from llmtuner.models.common.moe.bias_update import (
     register_moe_quantile_balancing_hook,
     update_quantile_expert_bias,
 )
-from llmtuner.models.common.moe.block import MoE
-from llmtuner.models.common.moe.dispatcher import LocalTokenDispatcher
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
-from llmtuner.models.common.moe.router import (
+from llmtuner.models.common.moe.layer import MoE
+from llmtuner.models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
+from llmtuner.models.common.moe.token_dispatch import LocalTokenDispatcher
 
 _NUM_EXPERTS = 4
 _DIM = 8

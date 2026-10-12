@@ -20,7 +20,7 @@ injection (a forward-time accumulation plus a backward-time gradient) is
 exercised on the EP=1 swap, where the backward is plain local compute.
 
 Everything runs in float64; routing is fp32 in both implementations (see
-tests/test_ep_swap.py), so the tolerance sits above the fp32 routing noise.
+tests/test_ep_model_replacement.py), so the tolerance sits above the fp32 routing noise.
 """
 
 from __future__ import annotations
@@ -30,11 +30,11 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoConfig
 
+from llmtuner.config import ParallelConfig
 from llmtuner.models.common.aux_loss import AuxLoss
-from llmtuner.models.common.moe.block import MoE
+from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.expert_parallel import apply_ep, swap_hf_moe_blocks
-from llmtuner.trainer import ParallelConfig
 
 NUM_EXPERTS = 8
 TOKENS = 40

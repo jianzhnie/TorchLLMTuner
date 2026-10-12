@@ -19,9 +19,9 @@ import torch
 import torch.distributed as dist
 
 from llmtuner.components.loss import IGNORE_INDEX
-from llmtuner.config import MetricsConfig
-from llmtuner.trainer import (
+from llmtuner.config import (
     LLMTunerConfig,
+    MetricsConfig,
     ModelConfig,
     OptimizerConfig,
     ParallelConfig,

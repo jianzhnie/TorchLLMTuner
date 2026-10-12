@@ -4,10 +4,10 @@ import pytest
 import torch
 
 from llmtuner.accelerator import cast_data_device, get_data_device
-from llmtuner.accelerator.dist_utils import (
+from llmtuner.accelerator.distributed import (
     cast_data_device as legacy_cast_data_device,
 )
-from llmtuner.accelerator.tensor_transfer import (
+from llmtuner.accelerator.tensors import (
     cast_data_device as transfer_cast_data_device,
 )
 

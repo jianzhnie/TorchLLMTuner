@@ -33,17 +33,18 @@ import torch.distributed as dist
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
-from llmtuner.config import DataloaderConfig, MetricsConfig
-from llmtuner.datasets.build import build_dataloader
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.trainer import (
+from llmtuner.config import (
+    DataloaderConfig,
     LLMTunerConfig,
+    MetricsConfig,
     ModelConfig,
     OptimizerConfig,
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.datasets.factory import build_dataloader
+from llmtuner.models.hf.factory import build_model_config_for
+from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
 from tests.data_fixtures import write_tokenizer
 

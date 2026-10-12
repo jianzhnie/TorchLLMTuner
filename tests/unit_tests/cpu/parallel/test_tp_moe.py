@@ -24,6 +24,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from llmtuner.config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
@@ -31,7 +32,6 @@ from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     resolve_plan,
     shard_experts_for_tp,
 )
-from llmtuner.trainer import ParallelConfig
 
 MOE_PLAN = {
     "layers.*.mlp.experts.gate_up_proj": "packed_colwise",
@@ -414,7 +414,7 @@ def test_apply_tp_defers_the_moe_blocks_to_ep_when_ep_is_on() -> None:
 
 
 def test_swap_refuses_a_shared_expert_block_under_tp_x_ep() -> None:
-    from llmtuner.parallel.expert_parallel.swap import swap_hf_moe_blocks
+    from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
 
     model = _MoeModel()
     model.layers[0]["mlp"].shared_expert = nn.Linear(16, 16)

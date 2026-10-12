@@ -1,8 +1,8 @@
-"""``ParallelDims`` and the config layer that resolves it: guards, not happy path.
+"""``ParallelTopology`` and the config layer that resolves it: guards, not happy path.
 
 Two things live here. The first is the derivation chain a config walks before a
-process group exists -- ``ParallelConfig.derive_dp`` -> ``build_parallel_dims``
--> ``ParallelDims`` -- where a mis-sized launch has to fail with a config-level
+process group exists -- ``ParallelConfig.derive_dp`` -> ``build_parallel_topology``
+-> ``ParallelTopology`` -- where a mis-sized launch has to fail with a config-level
 message rather than deep inside mesh construction. The second is the part a
 successful run never executes: the assignment guards that reject an inconsistent
 size, and the two mesh lookups that fail *because* an axis is disabled. Those are
@@ -25,8 +25,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
-from llmtuner.parallel.parallel_dims import ParallelDims, build_parallel_dims
-from llmtuner.trainer import LLMTunerConfig, ParallelConfig
+from llmtuner.config import LLMTunerConfig, ParallelConfig
+from llmtuner.parallel.topology import ParallelTopology, build_parallel_topology
 
 
 def _config(**parallel_kw) -> LLMTunerConfig:
@@ -45,7 +45,7 @@ def single_rank_group(tmp_path_factory):
         dist.destroy_process_group()
 
 
-def _dims(world_size: int = 8, **overrides) -> ParallelDims:
+def _dims(world_size: int = 8, **overrides) -> ParallelTopology:
     fields = {
         "dp_replicate": 1,
         "dp_shard": 8,
@@ -56,7 +56,7 @@ def _dims(world_size: int = 8, **overrides) -> ParallelDims:
         "world_size": world_size,
         **overrides,
     }
-    return ParallelDims(**fields)
+    return ParallelTopology(**fields)
 
 
 # -- assignment guards -------------------------------------------------------
@@ -210,7 +210,7 @@ def test_the_loss_mesh_spans_tp_as_well_as_dp_and_cp() -> None:
     only its ``T / tp`` token shard and the reduce group has to span tp too --
     which is exactly what the trainer gates on (``dp_cp_enabled or tp_enabled``
     picks ``"loss"`` over ``"dp"``). Reading the size contract off a
-    ``ParallelDims`` that never built a mesh is the point: the mesh-level test
+    ``ParallelTopology`` that never built a mesh is the point: the mesh-level test
     of the same thing needs a process group, and this is the claim a future
     refactor would silently flip to upstream's.
     """
@@ -223,7 +223,7 @@ def test_the_loss_mesh_spans_tp_as_well_as_dp_and_cp() -> None:
     assert sizes["loss"] == sizes["batch"] * sizes["cp"] * sizes["tp"] == 8
 
 
-# -- config resolution: derive_dp and build_parallel_dims ---------------------
+# -- config resolution: derive_dp and build_parallel_topology ---------------------
 
 
 def test_derive_dp_derives_from_world_size() -> None:
@@ -255,7 +255,7 @@ def test_derive_dp_narrows_by_the_non_dp_sizes() -> None:
 def test_derive_dp_does_not_count_ep_as_an_extra_world_axis() -> None:
     """EP tiles the dense sparse-region ranks; it does not consume more ranks."""
     cfg = _config(data_parallel_shard_size=-1, expert_parallel_size=4)
-    pd = build_parallel_dims(cfg, world_size=8)
+    pd = build_parallel_topology(cfg, world_size=8)
 
     assert cfg.derive_dp(world_size=8) == 8
     assert pd is not None
@@ -263,42 +263,42 @@ def test_derive_dp_does_not_count_ep_as_an_extra_world_axis() -> None:
     assert pd.ep == 4
 
 
-def test_build_parallel_dims_resolves_against_world_size() -> None:
-    """Single process -> no process group, so there is no ``ParallelDims`` at all.
+def test_build_parallel_topology_resolves_against_world_size() -> None:
+    """Single process -> no process group, so there is no ``ParallelTopology`` at all.
 
     ``None`` is the sentinel every downstream ``parallel_dims is None`` guard
     keys on, so returning a degenerate object here would make them all dead.
     """
-    assert build_parallel_dims(LLMTunerConfig(), world_size=1) is None
+    assert build_parallel_topology(LLMTunerConfig(), world_size=1) is None
 
     cfg = _config(data_parallel_shard_size=-1, tensor_parallel_size=2)
-    pd = build_parallel_dims(cfg, world_size=8)
-    assert isinstance(pd, ParallelDims)
+    pd = build_parallel_topology(cfg, world_size=8)
+    assert isinstance(pd, ParallelTopology)
     # tp=2 over 8 ranks leaves 4 for data parallelism; dp_shard=-1 resolves here.
     assert (pd.tp, pd.dp_shard) == (2, 4)
 
 
-def test_build_parallel_dims_rejects_parallel_degrees_at_world_size_1() -> None:
+def test_build_parallel_topology_rejects_parallel_degrees_at_world_size_1() -> None:
     """No torchrun + tp>1 must fail, not silently train a replicated model."""
     cfg = _config(tensor_parallel_size=2)
     with pytest.raises(ValueError, match="world_size=1"):
-        build_parallel_dims(cfg, world_size=1)
+        build_parallel_topology(cfg, world_size=1)
 
     cfg = _config(pipeline_parallel_size=2)
     with pytest.raises(ValueError, match="world_size=1"):
-        build_parallel_dims(cfg, world_size=1)
+        build_parallel_topology(cfg, world_size=1)
 
 
 def test_derive_dp_matches_parallel_dims_resolution() -> None:
     """The config helper and the torchtitan-shaped class must agree.
 
     They compute the same number by different routes -- the config by dividing
-    world_size itself, ``ParallelDims`` inside ``_validate`` -- so a drift
+    world_size itself, ``ParallelTopology`` inside ``_validate`` -- so a drift
     between them would make the trainer and the mesh disagree about how many
     ranks go to data parallelism, silently.
     """
     cfg = _config(data_parallel_shard_size=-1, tensor_parallel_size=2)
-    pd = build_parallel_dims(cfg, world_size=8)
+    pd = build_parallel_topology(cfg, world_size=8)
     assert cfg.derive_dp(world_size=8) == pd.dp_shard
 
 
@@ -313,7 +313,7 @@ def test_cp_only_still_needs_a_loss_reduction() -> None:
 
     Only the flags are asserted here -- the group sizes they select need a live
     process group (``get_optional_mesh`` builds meshes). The sizes themselves
-    are pinned by the ``expected_sizes`` table in ``parallel_dims.py``, which
+    are pinned by the ``expected_sizes`` table in ``topology.py``, which
     is what makes the property sufficient: ``loss`` is defined there as
     ``dp_replicate * dp_shard * cp * tp``, so choosing it is choosing a group
     that spans both the cp and the tp axis. The end-to-end version runs under
@@ -321,8 +321,8 @@ def test_cp_only_still_needs_a_loss_reduction() -> None:
     ``tests/integration_tests/cp_wiring_equivalence.py``.
     """
     cfg = _config(data_parallel_shard_size=1, context_parallel_size=2)
-    pd = build_parallel_dims(cfg, world_size=2)
-    assert isinstance(pd, ParallelDims)
+    pd = build_parallel_topology(cfg, world_size=2)
+    assert isinstance(pd, ParallelTopology)
 
     assert pd.cp_enabled
     assert not pd.dp_enabled

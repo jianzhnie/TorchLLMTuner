@@ -24,9 +24,9 @@ import torch
 import torch.distributed as dist
 from transformers import AutoConfig
 
+from llmtuner.config import ParallelConfig
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.tensor_parallel import apply_tp
-from llmtuner.trainer import ParallelConfig
 
 VOCAB = 128
 TOKENS = 64
