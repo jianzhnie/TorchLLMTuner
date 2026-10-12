@@ -1411,3 +1411,79 @@ def test_create_seed_checkpoint_writes_a_step_0_checkpoint_and_exits(tmp_path) -
     assert "Created seed checkpoint" in result.stdout
     assert (tmp_path / "checkpoint" / "step-0" / ".metadata").is_file()
     assert not (tmp_path / "checkpoint" / "step-5").exists()
+
+
+def test_close_releases_all_resources_even_when_one_fails() -> None:
+    trainer = Trainer.__new__(Trainer)
+    calls = []
+
+    def fail():
+        calls.append("checkpointer")
+        raise RuntimeError("save failed")
+
+    trainer.checkpointer = SimpleNamespace(close=fail)
+    for name in ("metrics", "dataloader", "gc_handler"):
+        setattr(
+            trainer, name, SimpleNamespace(close=lambda name=name: calls.append(name))
+        )
+    with pytest.raises(RuntimeError, match="save failed"):
+        trainer.close()
+    assert calls == ["checkpointer", "metrics", "dataloader", "gc_handler"]
+    trainer.close()
+    assert len(calls) == 4
+
+
+def test_close_accepts_a_partially_initialized_trainer() -> None:
+    Trainer.__new__(Trainer).close()
+
+
+def test_training_error_survives_cleanup_error() -> None:
+    trainer = Trainer.__new__(Trainer)
+    trainer.cfg = SimpleNamespace(checkpoint=SimpleNamespace(load_step=-1))
+
+    def load(step):
+        raise ValueError("training failed")
+
+    def close():
+        raise RuntimeError("cleanup failed")
+
+    trainer.checkpointer = SimpleNamespace(load=load, close=close)
+    with pytest.raises(ValueError, match="training failed"):
+        trainer.train()
+
+
+@pytest.mark.parametrize("training_fails", [False, True])
+def test_cli_destroys_process_group_when_close_fails(monkeypatch, training_fails):
+    from llmtuner.trainer import cli
+
+    calls = []
+
+    class FakeTrainer:
+        def __init__(self, cfg):
+            pass
+
+        def train(self):
+            if training_fails:
+                raise ValueError("training failed")
+
+        def close(self):
+            raise RuntimeError("close failed")
+
+    monkeypatch.setattr(
+        cli,
+        "parse_config",
+        lambda: SimpleNamespace(
+            checkpoint=SimpleNamespace(create_seed_checkpoint=False)
+        ),
+    )
+    monkeypatch.setattr(cli, "Trainer", FakeTrainer)
+    monkeypatch.setattr(cli.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        cli.dist, "destroy_process_group", lambda: calls.append("destroy")
+    )
+    error = ValueError if training_fails else RuntimeError
+    with pytest.raises(
+        error, match="training failed" if training_fails else "close failed"
+    ):
+        cli.main()
+    assert calls == ["destroy"]

@@ -367,3 +367,32 @@ def test_validate_raises_on_zero_valid_tokens(
         trainer.validate(step=1)
 
     assert loader.closed
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_validate_restores_mixed_module_modes(monkeypatch, fail) -> None:
+    model = _EchoModel()
+    model.add_module("frozen", torch.nn.Dropout())
+    model.train()
+    model.frozen.eval()
+    trainer, _ = _make_trainer(
+        monkeypatch,
+        validation=ValidationConfig(steps=1),
+        loader=_ListLoader([_batch(2)]),
+        model=model,
+    )
+
+    def validate_body(validation, step):
+        assert not model.training
+        assert not model.frozen.training
+        if fail:
+            raise RuntimeError("validation failed")
+
+    trainer.validate_body = validate_body
+    if fail:
+        with pytest.raises(RuntimeError, match="validation failed"):
+            trainer.validate(step=1)
+    else:
+        trainer.validate(step=1)
+    assert model.training
+    assert not model.frozen.training

@@ -174,3 +174,77 @@ def test_a_positive_frequency_disables_the_automatic_collector() -> None:
     finally:
         # Do not leak the disabled state into whichever test runs next.
         _gc.enable()
+
+
+@pytest.mark.parametrize("initially_enabled", [True, False])
+def test_collection_close_restores_initial_gc_state(initially_enabled) -> None:
+    import gc
+
+    original = gc.isenabled()
+    try:
+        (gc.enable if initially_enabled else gc.disable)()
+        collector = GarbageCollection()
+        assert not gc.isenabled()
+        collector.close()
+        assert gc.isenabled() == initially_enabled
+        collector.close()
+        assert gc.isenabled() == initially_enabled
+    finally:
+        (gc.enable if original else gc.disable)()
+
+
+@pytest.mark.parametrize("seq_len", [0, -1])
+def test_target_shift_rejects_nonpositive_sequence_length(seq_len):
+    with pytest.raises(ValueError, match="seq_len must be >= 1"):
+        next_token_targets(torch.tensor([1, 2]), seq_len=seq_len)
+
+
+def test_target_shift_accepts_noncontiguous_labels():
+    labels = torch.arange(12).reshape(3, 4).t()
+    targets = next_token_targets(labels, seq_len=3)
+    expected = torch.full_like(labels, IGNORE_INDEX)
+    expected[:, :-1] = labels[:, 1:]
+    torch.testing.assert_close(targets, expected)
+
+
+@pytest.mark.parametrize("seed", [2**32, 2**64 - 1, -1])
+def test_seeding_supports_pytorch_seed_range(seed):
+    import random
+
+    import numpy as np
+
+    from llmtuner.utils.seeding import seed_everything
+
+    seed_everything(seed, deterministic=False)
+    first = (random.random(), np.random.random(), torch.rand(3))
+    seed_everything(seed, deterministic=False)
+    second = (random.random(), np.random.random(), torch.rand(3))
+    assert first[:2] == second[:2]
+    torch.testing.assert_close(first[2], second[2])
+
+
+def test_gc_initialization_failure_restores_automatic_collection(monkeypatch):
+    import gc
+
+    original = gc.isenabled()
+
+    def fail(reason):
+        raise RuntimeError("collection failed")
+
+    monkeypatch.setattr(GarbageCollection, "collect", staticmethod(fail))
+    try:
+        gc.enable()
+        with pytest.raises(RuntimeError, match="collection failed"):
+            GarbageCollection()
+        assert gc.isenabled()
+    finally:
+        (gc.enable if original else gc.disable)()
+
+
+def test_set_seed_uses_the_available_device_api():
+    from llmtuner.utils.seeding import set_seed
+
+    set_seed(2**32)
+    expected = torch.rand(3)
+    set_seed(2**32)
+    torch.testing.assert_close(torch.rand(3), expected)

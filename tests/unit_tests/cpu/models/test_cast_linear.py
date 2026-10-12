@@ -164,3 +164,14 @@ def test_default_off_is_unchanged() -> None:
 
 def test_dtype_map_spelling_matches_the_config_field() -> None:
     assert sorted(TORCH_DTYPE_MAP) == ["bfloat16", "float16", "float32"]
+
+
+def test_cast_conversion_preserves_rng_and_module_mode():
+    linear = nn.Linear(4, 8).eval()
+    rng = torch.random.get_rng_state().clone()
+    cast = to_cast_linear(linear, torch.float32)
+    assert not cast.training
+    assert cast.weight is linear.weight
+    assert cast.bias is linear.bias
+    assert cast.weight.device == linear.weight.device
+    torch.testing.assert_close(torch.random.get_rng_state(), rng)

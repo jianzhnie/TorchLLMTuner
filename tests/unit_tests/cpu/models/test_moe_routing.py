@@ -382,3 +382,23 @@ def test_every_layer_of_every_part_is_updated() -> None:
     for moe in (a, b, c):
         assert int(moe.router.quantile_balancer.required_bias_histogram_EB.sum()) == 0
         assert float(moe.tokens_per_expert_E.sum()) == 0.0
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"num_experts": 0}, "must be positive"),
+        ({"dim": 0}, "must be positive"),
+        ({"top_k": 0}, "top_k must"),
+        ({"top_k": 9}, "top_k must"),
+        ({"num_expert_groups": 0}, "num_expert_groups must"),
+        ({"num_limited_groups": 1}, "requires num_expert_groups"),
+        ({"num_expert_groups": 2, "num_limited_groups": 0}, "must be positive"),
+        ({"num_expert_groups": 2, "num_limited_groups": 1, "top_k": 5}, "capacity"),
+    ],
+)
+def test_router_rejects_invalid_expert_capacity(kwargs, match):
+    from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
+
+    with pytest.raises(ValueError, match=match):
+        TokenChoiceTopKRouter(**({"num_experts": 8, "dim": 4} | kwargs))

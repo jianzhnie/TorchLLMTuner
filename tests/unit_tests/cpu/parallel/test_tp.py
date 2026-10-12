@@ -331,3 +331,12 @@ def test_an_unknown_plan_spec_still_raises_with_the_same_advice() -> None:
     """A typo must not be mistaken for a style this engine can honor."""
     with pytest.raises(ValueError, match="not_a_style"):
         resolve_plan(nn.Linear(4, 4), {"layers.*.q_proj": "not_a_style"})
+
+
+@pytest.mark.parametrize(
+    "cls", [ColumnParallelLinear, ColwiseLinearNoGather, RowParallelLinear]
+)
+def test_tp_linear_preserves_frozen_parameters(cls):
+    weight = nn.Parameter(torch.randn(8, 8), requires_grad=False)
+    module = cls(weight, tp_size=2, tp_rank=0, group=None)
+    assert not module.weight.requires_grad
