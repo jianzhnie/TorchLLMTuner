@@ -62,7 +62,7 @@ from ..common.attention.masks import (
     get_document_mask_mod,
 )
 from ..common.cast_linear import TORCH_DTYPE_MAP, to_cast_linear
-from ..common.moe.block import iter_moe_layers
+from ..common.moe.layer import iter_moe_layers
 from .factory import _ATTN_IMPLEMENTATION, resolve_model_class, unwrap_text_config
 
 logger = get_logger(__name__)

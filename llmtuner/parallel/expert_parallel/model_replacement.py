@@ -35,7 +35,7 @@ Weight layout: HF stores each projection as ``(out, in)`` and applies it as
 (``w1_EFD``/``w3_EFD`` are ``(F, D)``, ``w2_EDF`` is ``(D, F)``) and applies it
 with the same ``F.linear``. Moving a weight is therefore elementwise -- no
 transpose, no regrouping -- except for the one split of ``gate_up_proj`` into
-its gate and up halves. ``tests/unit_tests/cpu/parallel/test_ep_swap.py``
+its gate and up halves. ``tests/unit_tests/cpu/parallel/test_ep_model_replacement.py``
 pins both halves of that claim against the HF block being replaced.
 
 Routing parity with the HF block: Qwen3Moe and Mixtral score with a softmax over
@@ -75,19 +75,14 @@ from llmtuner.errors import (
     UnsupportedCombinationError,
 )
 
-from ...models.common.moe.dispatcher import EP_DISPATCHER_BACKENDS
+from ...models.common.moe.token_dispatch import EP_DISPATCHER_BACKENDS
 from ...utils.logging import get_logger
-from .conversion import convert_block, restore_fp32_state_buffers
-from .hf_layout import is_hf_moe_block, moe_block_of, router_of
+from .block_conversion import convert_block
+from .hf_inspection import is_hf_moe_block, moe_block_of, router_of
 
 logger = get_logger(__name__)
 
 __all__ = ["swap_hf_moe_blocks"]
-
-# Re-exported for callers that reached the probe/convert helpers through this
-# module before the three-way split (the TP entry and swap tests).
-is_hf_moe_block = is_hf_moe_block
-restore_fp32_state_buffers = restore_fp32_state_buffers
 
 
 def swap_hf_moe_blocks(
@@ -228,7 +223,7 @@ def swap_hf_moe_blocks(
             f"({type(getattr(model, 'model', model)).__name__}): no layer's "
             "``mlp`` has the router-gate + fused gate_up_proj/down_proj shape "
             "this swap recognizes. Add the model family's layout to the probe "
-            "in parallel/expert_parallel/model_conversion.py."
+            "in parallel/expert_parallel/model_replacement.py."
         )
     logger.info("Swapped %d HF MoE blocks for llmtuner MoE blocks", swapped)
     return swapped

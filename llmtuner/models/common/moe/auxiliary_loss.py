@@ -4,7 +4,7 @@ One node of the ``moe`` package: ``MicrobatchWiseLoadBalanceLoss`` is the
 DeepSeek-V3 sequence-wise auxiliary loss, run by a router on each training
 forward through its ``aux_loss`` slot (the router owns the slot; this file owns
 the loss). Corpus-level balance is the separate auxiliary-loss-free path in
-``block.py``.
+``layer.py``.
 
 Vendored from torchtitan ``models/common/moe.py``. What changed: the
 ``spmd_types`` blocks are gone (no runtime effect), and the Partial -> Invariant

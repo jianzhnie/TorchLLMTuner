@@ -46,7 +46,7 @@ from ..models.common.aux_loss import (
     AuxLoss,
     collect_aux_loss_metrics,
 )
-from ..models.common.moe.block import MoE
+from ..models.common.moe.layer import MoE
 from ..parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection

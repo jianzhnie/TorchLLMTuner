@@ -31,7 +31,7 @@ oversight:
   data in the model registry instead (see docs/torchllmtuner_design.md, SEAM 1).
 * **Swapping in a native MoE.** No longer true: ``apply_ep`` swaps HF MoE
   blocks for the ``models/common`` MoE stack when ``ep > 1`` (see
-  ``parallel/expert_parallel/model_conversion.py``). The conversion moves weights
+  ``parallel/expert_parallel/model_replacement.py``). The conversion moves weights
   re-initializing them, so the model still trains from HF's initialization.
 """
 

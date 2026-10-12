@@ -4,8 +4,8 @@ One node of the ``moe`` package: the sign-based bias update
 (``register_moe_load_balancing_hook``) and the quantile-histogram update
 (``register_moe_quantile_balancing_hook``), plus their reduction helpers.
 Both are optimizer step pre-hooks over the MoE blocks ``iter_moe_layers``
-finds; the blocks themselves live in ``block.py`` and the routers in
-``router.py``.
+finds; the blocks themselves live in ``layer.py`` and the routers in
+``routing.py``.
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ import torch.nn as nn
 
 from llmtuner.accelerator.collectives import all_reduce
 
-from .block import MoE, iter_moe_layers
-from .router import QuantileBalancedTopKRouter
+from .layer import MoE, iter_moe_layers
+from .routing import QuantileBalancedTopKRouter
 
 if TYPE_CHECKING:
     from ....parallel.topology import ParallelTopology

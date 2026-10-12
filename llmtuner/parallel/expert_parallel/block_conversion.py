@@ -13,25 +13,25 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ...accelerator import distributed
-from ...models.common.moe.block import MoE
-from ...models.common.moe.dispatcher import (
-    AllToAllTokenDispatcher,
-    LocalTokenDispatcher,
-    TorchAOTokenDispatcher,
-)
+from ...models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
 from ...models.common.moe.experts import (
     DominoRoutedExperts,
     GroupedExperts,
     RoutedExperts,
 )
-from ...models.common.moe.load_balance import MicrobatchWiseLoadBalanceLoss
-from ...models.common.moe.router import (
+from ...models.common.moe.layer import MoE
+from ...models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
+from ...models.common.moe.token_dispatch import (
+    AllToAllTokenDispatcher,
+    LocalTokenDispatcher,
+    TorchAOTokenDispatcher,
+)
 from .. import compatibility
-from .checkpoint import mark_experts_ep_sharded
-from .hf_layout import (
+from .checkpointing import mark_experts_ep_sharded
+from .hf_inspection import (
     fused_experts_of,
     read_expert_groups,
     read_route_norm,
@@ -150,7 +150,7 @@ def convert_block(
         dispatcher.wire_meshes(ep_group=ep_group)
         # Flag the stacked expert weights as expert-dim-sharded over the EP
         # group so the checkpointer can all-gather them on save and slice
-        # them back on load (see expert_parallel/checkpoint.py).
+        # them back on load (see expert_parallel/checkpointing.py).
         mark_experts_ep_sharded(grouped, ep_group)
 
     shared = getattr(block, "shared_expert", None) or getattr(

@@ -47,7 +47,7 @@ from llmtuner.config import CompileConfig
 from llmtuner.errors import EnvironmentUnsupportedError
 
 from ..accelerator.capabilities import has
-from ..models.common.moe.block import iter_moe_layers
+from ..models.common.moe.layer import iter_moe_layers
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
