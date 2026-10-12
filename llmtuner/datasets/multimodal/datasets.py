@@ -71,7 +71,8 @@ import torch
 
 from ...components.loss import IGNORE_INDEX
 from ...components.tokenizer import MultiModalTokenizer
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
+from ..contracts import DatasetBuildContext, DatasetIterationPolicy, require_positive
 from ..dataset import (
     DatasetConcat,
     DatasetMix,
@@ -82,7 +83,6 @@ from ..dataset import (
     is_not_none,
 )
 from ..sources import HuggingFaceStreamingSource
-from ..types import DatasetBuildContext, DatasetIterationPolicy, require_positive
 from .image import calculate_vision_tokens, process_image, resize_to_pixel_budget
 from .text import insert_vision_placeholders
 

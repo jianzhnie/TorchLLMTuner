@@ -16,7 +16,7 @@ from __future__ import annotations
 import gc
 import time
 
-from .logger_utils import get_logger
+from .logging import get_logger
 
 # ``get_logger``, not a bare ``logging.getLogger``: without the handler this
 # module's installer attaches, the collection notices are emitted and then

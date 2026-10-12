@@ -22,8 +22,8 @@ from torch.nn import ModuleDict
 from llmtuner.config import ParallelConfig
 
 from ...accelerator import dist_utils
-from ...utils.logger_utils import get_logger
-from ..parallel_dims import ParallelDims
+from ...utils.logging import get_logger
+from ..topology import ParallelTopology
 from .plan import apply_fsdp_by_pattern, set_fsdp_prefetch_windows
 
 logger = get_logger(__name__)
@@ -56,7 +56,7 @@ def iter_transformer_layers(layers: nn.Module) -> Iterator[tuple[Any, nn.Module]
     return iter(enumerate(layers))
 
 
-def resolve_fsdp_mesh(parallel_dims: ParallelDims) -> DeviceMesh:
+def resolve_fsdp_mesh(parallel_dims: ParallelTopology) -> DeviceMesh:
     """Build the dense FSDP-only submesh.
 
     llmtuner's HF models hold plain tensors, so ``fully_shard`` cannot take an
@@ -111,7 +111,7 @@ def resolve_fsdp_mesh(parallel_dims: ParallelDims) -> DeviceMesh:
     )
 
 
-def resolve_sparse_fsdp_mesh(parallel_dims: ParallelDims) -> DeviceMesh | None:
+def resolve_sparse_fsdp_mesh(parallel_dims: ParallelTopology) -> DeviceMesh | None:
     """Sparse counterpart of ``resolve_fsdp_mesh`` for routed experts.
 
     Returns ``None`` when EP is disabled. Otherwise rebuilds the FSDP-only
@@ -498,7 +498,7 @@ def force_sum_grad_reduction(model: torch.nn.Module) -> None:
 def apply_fsdp(
     model: torch.nn.Module,
     cfg: ParallelConfig,
-    parallel_dims: ParallelDims | None = None,
+    parallel_dims: ParallelTopology | None = None,
 ) -> torch.nn.Module:
     """Fully-shard ``model`` (FSDP2). No-op when no DP/CP axis is active.
 

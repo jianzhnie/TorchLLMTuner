@@ -53,13 +53,13 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ...utils.gc import GarbageCollection
+from ...utils.garbage_collection import GarbageCollection
 from . import filesystem
 
 if TYPE_CHECKING:
     from ...config import CheckpointConfig
 
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
 from .base import (
     BaseCheckpointManager,
     purge_thread,

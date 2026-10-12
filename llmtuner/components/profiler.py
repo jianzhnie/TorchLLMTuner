@@ -40,7 +40,7 @@ Departures from torchtitan, each a subtraction or a device-portability fix:
   ``utils/monitoring.record_memory_history`` -- torchtitan's non-CUDA
   branch calls ``torch.memory``, which does not exist.
 
-One addition: the rank comes from ``utils/logger_utils``, so a single-process
+One addition: the rank comes from ``utils/logging``, so a single-process
 run has a rank without a process group, the same way metrics does it.
 """
 
@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from ..config import ProfilerConfig
 
 from ..accelerator.device import device_type
-from ..utils.logger_utils import get_distributed_rank, get_logger
+from ..utils.logging import get_distributed_rank, get_logger
 from ..utils.monitoring import read_memory_snapshot, record_memory_history
 
 logger = get_logger(__name__)

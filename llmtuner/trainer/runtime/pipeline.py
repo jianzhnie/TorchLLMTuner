@@ -10,14 +10,14 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ..accelerator.capabilities import has as capability
-from ..accelerator.spmd_context import spmd_context
-from ..datasets.loader import TrainerBatch
-from ..datasets.types import Batch
-from ..parallel import compatibility
+from ...accelerator.capabilities import has as capability
+from ...accelerator.spmd_context import spmd_context
+from ...datasets.contracts import Batch
+from ...datasets.dataloader import TrainerBatch
+from ...parallel import compatibility
 
 if TYPE_CHECKING:
-    from .trainer import Trainer
+    from ..trainer import Trainer
 
 
 def split_pipeline_microbatches(

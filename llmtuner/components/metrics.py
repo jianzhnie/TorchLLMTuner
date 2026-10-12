@@ -47,7 +47,7 @@ One addition: ``MetricsProcessor.log`` never calls into ``torch.distributed``.
 torchtitan's ``_get_metrics_rank`` returns rank 0 unconditionally outside the
 PP case, and its logger construction calls ``torch.distributed.get_rank()``
 regardless -- so every rank of a gloo-rendezvoused CPU run builds the same
-logger. llmtuner reads the rank from ``utils/logger_utils``, which already has to
+logger. llmtuner reads the rank from ``utils/logging``, which already has to
 answer "which rank am I" for the log prefix and handles the single-process case.
 """
 
@@ -60,7 +60,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from ..utils.logger_utils import get_distributed_rank, get_logger
+from ..utils.logging import get_distributed_rank, get_logger
 from ..utils.monitoring import (
     Color,
     NoColor,
@@ -75,7 +75,7 @@ if TYPE_CHECKING:
     # imports the checkpointer, so importing it for real here would close a
     # cycle back into the components package that only exists to name a type.
     from ..config import MetricsConfig
-    from ..parallel.parallel_dims import ParallelDims
+    from ..parallel.topology import ParallelTopology
 
 # llmtuner configures handlers per module, rather than on the root logger the
 # way torchtitan does, so this has to be get_logger for the metrics lines to
@@ -334,7 +334,7 @@ def is_v_schedule(pp_schedule: str) -> bool:
     )
 
 
-def get_metrics_rank(*, parallel_dims: ParallelDims, pp_schedule: str) -> int:
+def get_metrics_rank(*, parallel_dims: ParallelTopology, pp_schedule: str) -> int:
     """Choose one rank for external metric writers.
 
     Trainer metrics are synchronized across PP stages; selecting the last
@@ -387,7 +387,7 @@ class MetricsProcessor:
         self,
         config: MetricsConfig,
         *,
-        parallel_dims: ParallelDims | None,
+        parallel_dims: ParallelTopology | None,
         dump_folder: str = "./outputs",
         pp_schedule: str = "1F1B",
         num_flops_per_token: int = 0,
@@ -455,7 +455,7 @@ class MetricsProcessor:
         self,
         *,
         config: MetricsConfig,
-        parallel_dims: ParallelDims | None,
+        parallel_dims: ParallelTopology | None,
         dump_folder: str,
         pp_schedule: str,
         config_dict: dict[str, Any] | None = None,

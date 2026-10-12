@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torchvision.transforms.v2.functional as TVF
 
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
 from .image import smart_resize
 
 logger = get_logger(__name__)

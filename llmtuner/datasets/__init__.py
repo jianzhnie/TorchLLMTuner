@@ -9,8 +9,9 @@ to install. Neither subpackage's ``__init__`` imports its children, for the same
 reason; ``build_dataloader`` is the only entry point that decides.
 """
 
-from .build import build_dataloader
 from .collators import HAS_PIN_MEMORY, Collator, TextCollator, TrainerBatch
+from .contracts import DatasetBuildContext, DatasetIterationPolicy
+from .dataloader import BaseDataLoader, DataloaderExhaustedError, GrainDataLoader
 from .dataset import (
     DatasetConcat,
     DatasetMix,
@@ -21,7 +22,7 @@ from .dataset import (
     WeightedDataset,
     build_dataset,
 )
-from .loader import BaseDataLoader, DataloaderExhaustedError, GrainDataLoader
+from .factory import build_dataloader
 from .packing import (
     build_concat_then_split_packing,
     build_first_fit_packing,
@@ -33,7 +34,6 @@ from .sources import (
     RandomAccessDataSource,
     build_source,
 )
-from .types import DatasetBuildContext, DatasetIterationPolicy
 
 __all__ = [
     "BaseDataLoader",

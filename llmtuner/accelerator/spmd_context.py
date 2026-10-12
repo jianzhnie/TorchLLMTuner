@@ -136,7 +136,7 @@ def spmd_context(parallel_dims: Any) -> Iterator[None]:
     from here rather than receiving a mesh through its arguments, which is what
     keeps a ``DeviceMesh`` from having to thread through every model component.
 
-    ``parallel_dims`` is a ``llmtuner.parallel.parallel_dims.ParallelDims``,
+    ``parallel_dims`` is a ``llmtuner.parallel.topology.ParallelTopology``,
     duck-typed here as ``Any`` so this bottom layer never imports the parallel
     layer it serves.
 

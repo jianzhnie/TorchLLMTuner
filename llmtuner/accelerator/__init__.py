@@ -19,9 +19,9 @@ a sibling submodule (``llmtuner.accelerator.device`` ...) does not pay for it
 unless a toolbox name is actually touched. ``collectives`` /
 ``spmd_context`` are imported as submodules -- re-exporting them would make
 ``import llmtuner.accelerator`` pull in the parallel and trainer layers and
-close an import cycle. Topology construction (``build_parallel_dims`` /
-``build_mesh``) lives with ``ParallelDims`` in
-``llmtuner/parallel/parallel_dims.py``; the trainer bootstraps its PG via
+close an import cycle. Topology construction (``build_parallel_topology`` /
+``build_mesh``) lives with ``ParallelTopology`` in
+``llmtuner/parallel/topology.py``; the trainer bootstraps its PG via
 ``dist_utils.init_dist_pytorch``.
 """
 

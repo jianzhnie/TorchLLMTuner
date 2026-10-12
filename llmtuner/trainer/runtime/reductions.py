@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from torch.distributed.device_mesh import DeviceMesh
 
 if TYPE_CHECKING:
-    from ..parallel.parallel_dims import ParallelDims
+    from ...parallel.topology import ParallelTopology
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +25,7 @@ class TrainingReductionMeshes:
 
 
 def loss_reporting_meshes(
-    parallel_dims: ParallelDims | None,
+    parallel_dims: ParallelTopology | None,
 ) -> tuple[DeviceMesh | None, DeviceMesh | None]:
     """Return the DP token-count mesh and the loss-sum mesh."""
     if parallel_dims is None:
@@ -37,7 +37,7 @@ def loss_reporting_meshes(
 
 
 def training_reduction_meshes(
-    parallel_dims: ParallelDims | None,
+    parallel_dims: ParallelTopology | None,
 ) -> TrainingReductionMeshes:
     """Resolve the four meshes used by one training step."""
     dp_mesh, loss_mesh = loss_reporting_meshes(parallel_dims)

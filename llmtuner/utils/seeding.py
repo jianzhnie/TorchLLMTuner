@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from ..accelerator.device import device_module, device_type
-from .logger_utils import get_logger
+from .logging import get_logger
 
 logger = get_logger(__name__)
 

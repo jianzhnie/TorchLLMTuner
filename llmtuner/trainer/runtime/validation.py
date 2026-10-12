@@ -17,12 +17,12 @@ from llmtuner.accelerator.capabilities import require
 from llmtuner.config import ValidationConfig
 from llmtuner.parallel import compatibility
 
-from ..accelerator.collectives import all_reduce
-from ..accelerator.spmd_context import spmd_context
-from ..datasets import build_dataloader
-from ..datasets.loader import DataloaderExhaustedError
-from ..datasets.types import Batch
-from .reduction_meshes import loss_reporting_meshes
+from ...accelerator.collectives import all_reduce
+from ...accelerator.spmd_context import spmd_context
+from ...datasets import build_dataloader
+from ...datasets.contracts import Batch
+from ...datasets.dataloader import DataloaderExhaustedError
+from .reductions import loss_reporting_meshes
 
 
 def build_validation_dataloader(self, validation: ValidationConfig):
@@ -252,7 +252,7 @@ def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
     Upstream torchtitan's ``Validator`` seam: the pipeline schedule carries an
     eval-only driver, so a validation pass runs the same stages forward-only.
     The microbatch plumbing mirrors the training body
-    (``pipeline_step.forward_backward_pipeline``): first
+    (``pipeline.forward_backward_pipeline``): first
     stage gets the inputs, last stage the labels, and every stage gets the
     per-microbatch kwargs (positions, masks).
 

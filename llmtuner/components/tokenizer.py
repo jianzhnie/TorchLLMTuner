@@ -20,7 +20,7 @@ from typing import Any
 
 from tokenizers import AddedToken, Tokenizer
 
-from ..utils.logger_utils import get_logger
+from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
 

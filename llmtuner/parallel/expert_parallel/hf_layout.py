@@ -73,7 +73,7 @@ import torch
 import torch.nn as nn
 
 from ...models.common.moe.block import MOE_LAYER_ATTRS
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
 from .. import compatibility
 
 logger = get_logger(__name__)

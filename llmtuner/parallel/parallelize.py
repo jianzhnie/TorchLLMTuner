@@ -49,7 +49,7 @@ from llmtuner.config import (
 )
 
 from ..memory import apply_ac
-from ..utils.logger_utils import get_logger
+from ..utils.logging import get_logger
 from .context_parallel import apply_cp
 from .expert_parallel import apply_ep
 from .fully_shard_parallel import apply_fsdp

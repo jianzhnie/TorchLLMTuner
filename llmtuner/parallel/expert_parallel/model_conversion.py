@@ -76,7 +76,7 @@ from llmtuner.errors import (
 )
 
 from ...models.common.moe.dispatcher import EP_DISPATCHER_BACKENDS
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
 from .conversion import convert_block, restore_fp32_state_buffers
 from .hf_layout import is_hf_moe_block, moe_block_of, router_of
 

@@ -42,9 +42,9 @@ from llmtuner.config import ParallelConfig
 
 from ...accelerator.capabilities import require
 from ...components.loss import cross_entropy_loss
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
 from .. import compatibility
-from ..parallel_dims import ParallelDims
+from ..topology import ParallelTopology
 from .partition import generate_llm_fqn_per_model_part, split_model_into_stages
 
 logger = get_logger(__name__)
@@ -151,7 +151,7 @@ def make_schedule_loss_fn(
 
 
 def get_pipeline_metadata(
-    parallel_dims: ParallelDims,
+    parallel_dims: ParallelTopology,
     parallelism: ParallelConfig,
     num_layers: int,
 ) -> tuple[int, int, int]:
@@ -248,7 +248,7 @@ def prepend_first_stage_modules(
 
 
 def validate_microbatches(
-    parallel_dims: ParallelDims, cfg: ParallelConfig, global_batch_size: int
+    parallel_dims: ParallelTopology, cfg: ParallelConfig, global_batch_size: int
 ) -> None:
     """Fail at setup, not mid-step, on a batch that cannot be microbatched.
 
@@ -282,7 +282,7 @@ def validate_microbatches(
 def apply_pp(
     model: nn.Module,
     *,
-    parallel_dims: ParallelDims,
+    parallel_dims: ParallelTopology,
     cfg: ParallelConfig,
     device: torch.device,
     global_batch_size: int,

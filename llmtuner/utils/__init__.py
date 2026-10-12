@@ -4,7 +4,7 @@ Members:
 
 * ``gc.py`` -- ``GarbageCollection``: the collect/disable pair the trainer wraps
   around the phases where allocator churn would otherwise show up as time.
-* ``logger_utils.py`` -- ``get_logger`` (a colour formatter that filters by rank
+* ``logging.py`` -- ``get_logger`` (a colour formatter that filters by rank
   at emit time) and ``get_distributed_rank``.
 * ``lazy_exports.py`` -- the one implementation of the PEP 562 lazy package
   index that the package indexes here share.

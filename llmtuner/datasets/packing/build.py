@@ -13,6 +13,7 @@ from functools import partial
 import grain.python as grain
 
 from ...components.loss import IGNORE_INDEX
+from ..contracts import DatasetBuildContext, DatasetIterationPolicy, require_positive
 from ..dataset import (
     DatasetConcat,
     DatasetMix,
@@ -20,7 +21,6 @@ from ..dataset import (
     as_iter_dataset,
     build_dataset,
 )
-from ..types import DatasetBuildContext, DatasetIterationPolicy, require_positive
 from .conversions import (
     packing_output_is_full,
     packing_output_to_text_sequence,

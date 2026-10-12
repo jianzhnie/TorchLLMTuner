@@ -5,7 +5,7 @@ Vendored from torchtitan ``models/common/async_linear.py`` (renamed from
 These are drop-in
 replacements for the stock QKV, output and SwiGLU projections: they move the TP
 collective inside the GEMM, over the autograd Functions in
-``llmtuner/parallel/tensor_parallel/linear.py`` (which holds the collective+GEMM
+``llmtuner/parallel/tensor_parallel/linear_ops.py`` (which holds the collective+GEMM
 math itself; this file is only the wiring and the fallbacks).
 
 What changed from upstream:
@@ -45,7 +45,7 @@ from llmtuner.parallel.tensor_parallel.linear_ops import (
     LinearReduceScatter,
 )
 
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
 
 logger = get_logger(__name__)
 

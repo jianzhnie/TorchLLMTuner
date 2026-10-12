@@ -19,7 +19,7 @@ from llmtuner.config.training_config import (
     ValidationConfig,
 )
 from llmtuner.errors import ConfigError
-from llmtuner.utils.logger_utils import get_logger
+from llmtuner.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
