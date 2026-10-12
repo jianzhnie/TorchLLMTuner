@@ -5,7 +5,7 @@ from __future__ import annotations
 from .huggingface import HuggingFaceTokenizer
 
 
-class MultiModalTokenizer(HuggingFaceTokenizer):
+class MultimodalTokenizer(HuggingFaceTokenizer):
     """Single source of truth for multimodal special tokens.
 
     Requires 5 token strings, validates them against the vocabulary at init, and

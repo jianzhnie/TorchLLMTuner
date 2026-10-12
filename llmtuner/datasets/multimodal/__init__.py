@@ -2,7 +2,7 @@
 
 Deliberately empty of imports. Importing a module *from* here pulls in
 torchvision (and, for ``video``, a video backend), so a re-export would make
-``import llmtuner.datasets.multimodal.datasets`` -- or anything that walks this
+``import llmtuner.datasets.multimodal.processors`` -- or anything that walks this
 package -- drag the whole media stack along. ``build_dataloader`` imports the
 two modules it needs inside the branch that has already decided the recipe name
 is multimodal, so a missing torchvision surfaces there, where it can be turned

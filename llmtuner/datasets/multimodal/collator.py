@@ -19,12 +19,12 @@ from typing import Any, Literal, cast
 import torch
 
 from ...components.loss import IGNORE_INDEX
-from ...components.tokenizer import MultiModalTokenizer
+from ...components.tokenizer import MultimodalTokenizer
 from ..collators import Collator, TrainerBatch
 from ..contracts import DatasetBuildContext
 from .image import vision_to_patches
 
-__all__ = ["MultiModalCollator"]
+__all__ = ["MultimodalCollator"]
 
 
 def text_positions(text_len: int, offset: int) -> torch.Tensor:
@@ -46,7 +46,7 @@ def vision_grid_positions(
     return cache[key]
 
 
-class MultiModalCollator(Collator):
+class MultimodalCollator(Collator):
     """Multimodal collator for VLM training.
 
     Handles both image and text data, converting images to patches
@@ -70,7 +70,7 @@ class MultiModalCollator(Collator):
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
-        self.tokenizer = cast(MultiModalTokenizer, context.tokenizer)
+        self.tokenizer = cast(MultimodalTokenizer, context.tokenizer)
         self.build_mrope_positions = build_mrope_positions
         self.patch_order = patch_order
 
