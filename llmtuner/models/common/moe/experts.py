@@ -33,7 +33,7 @@ from ....accelerator.capabilities import has
 from ..activation import SwiGLU
 
 if TYPE_CHECKING:
-    from .token_dispatch import LocalTokenDispatcher
+    from ....parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
 __all__ = [
     "DominoRoutedExperts",
