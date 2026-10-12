@@ -34,11 +34,19 @@ def insert_vision_placeholders(
     Returns:
         Text with vision placeholders expanded.
     """
+    num_placeholders = sum(part is None for part in input_parts)
+    if num_placeholders != len(num_vision_tokens):
+        raise ValueError(
+            f"Expected one vision token count per placeholder: got "
+            f"{num_placeholders} placeholders and {len(num_vision_tokens)} counts"
+        )
+    if any(count < 0 for count in num_vision_tokens):
+        raise ValueError("Vision token counts must be nonnegative")
     output_parts: list[str] = []
     vision_idx = 0
 
     for part in input_parts:
-        if part is None and vision_idx < len(num_vision_tokens):
+        if part is None:
             output_parts.extend(
                 [
                     vision_start_token,

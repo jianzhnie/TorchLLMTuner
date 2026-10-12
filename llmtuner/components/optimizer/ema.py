@@ -266,8 +266,15 @@ class EMA(OptimizersContainer):
         decay: float,
     ) -> None:
         """Shared lerp/decay body for one model part's params or buffers."""
-        if not tensors:
-            return
+        if tensors:
+            torch._foreach_lerp_(
+                self._tracked_averages(ema_opt, tensors), tensors, 1.0 - decay
+            )
+
+    def _tracked_averages(
+        self, ema_opt: EMAParamOptimizer, tensors: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        """Resolve fixed-identity EMA state without inserting missing entries."""
         # State is keyed by tensor identity and the tracked set is fixed at
         # construction (see the TODO on _update), so a tensor that appeared or
         # was replaced since then has no entry. state is a defaultdict, so
@@ -284,8 +291,7 @@ class EMA(OptimizersContainer):
                 "model after the EMA is constructed is not supported. Build "
                 "the EMA after the model is final."
             )
-        ema_params = [ema_opt.state[t]["ema_params"] for t in tensors]
-        torch._foreach_lerp_(ema_params, tensors, 1.0 - decay)
+        return [ema_opt.state[t]["ema_params"] for t in tensors]
 
     # -- checkpointing ----------------------------------------------------------
 
@@ -312,20 +318,26 @@ class EMA(OptimizersContainer):
         # The checkpoint had no EMA data (excluded via exclude_from_loading,
         # or predates this feature) -- cold-start from the just-loaded model
         # weights (and buffers, if buffer_patterns is set).
+        # Resolve every group before copying: a stale model identity must not
+        # partially overwrite the restored averages or insert empty states.
+        groups: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
         for ema_opt, model in zip(
             self._param_optimizers, self.model_parts, strict=True
         ):
-            for p in (p for p in model.parameters() if p.requires_grad):
-                ema_opt.state[p]["ema_params"].copy_(p.detach())
+            tensors = [p for p in model.parameters() if p.requires_grad]
+            groups.append((self._tracked_averages(ema_opt, tensors), tensors))
         for ema_opt, model in zip(
-            # Empty when buffer_patterns is unset: shorter than model_parts.
-            self._buffer_optimizers,
-            self.model_parts,
-            strict=False,
+            self._buffer_optimizers, self.model_parts, strict=False
         ):
-            for name, b in model.named_buffers():
-                if any(p.search(name) for p in self._buffer_patterns):
-                    ema_opt.state[b]["ema_params"].copy_(b.detach())
+            tensors = [
+                b
+                for name, b in model.named_buffers()
+                if any(pattern.search(name) for pattern in self._buffer_patterns)
+            ]
+            groups.append((self._tracked_averages(ema_opt, tensors), tensors))
+        for averages, tensors in groups:
+            for average, tensor in zip(averages, tensors, strict=True):
+                average.copy_(tensor.detach())
         logger.warning(
             "EMA state was not restored; cold-starting it from the loaded "
             "model weights, which discards all EMA history. Expected the "

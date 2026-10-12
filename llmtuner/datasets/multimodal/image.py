@@ -41,9 +41,10 @@ def decode_image(image: str | bytes | Image.Image) -> torch.Tensor:
     Uses torchvision.io.decode_image for bytes/paths (faster SIMD decode),
     falls back to TVF.pil_to_tensor for PIL Image inputs.
     """
-    if isinstance(image, str) and image.startswith("http"):
-        response = requests.get(image, timeout=10)
-        image = response.content
+    if isinstance(image, str) and image.startswith(("http://", "https://")):
+        with requests.get(image, timeout=10) as response:
+            response.raise_for_status()
+            image = response.content
     if isinstance(image, bytes):
         raw = torch.frombuffer(bytearray(image), dtype=torch.uint8)
         return torchvision.io.decode_image(raw, mode=torchvision.io.ImageReadMode.RGB)
@@ -78,6 +79,12 @@ def smart_resize(
     Returns:
         (resized_height, resized_width)
     """
+    if height < 1 or width < 1 or factor < 1:
+        raise ValueError("height, width and factor must be positive")
+    if not 0 < min_pixels <= max_pixels:
+        raise ValueError("pixel budgets must satisfy 0 < min_pixels <= max_pixels")
+    if max_pixels < factor * factor:
+        raise ValueError("max_pixels must fit at least one factor-sized patch grid")
     if max(height, width) / min(height, width) > 200:
         raise ValueError(
             f"Absolute aspect ratio must be smaller than 200, "
