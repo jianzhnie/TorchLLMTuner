@@ -53,7 +53,7 @@ from .activation_checkpoint import apply_ac
 from .compile import apply_compile
 from .context_parallel import apply_cp
 from .expert_parallel import apply_ep
-from .fully_shard import apply_fsdp
+from .fully_shard_parallel import apply_fsdp
 from .pipeline_parallel import PipelineParallelSetup, apply_pp, build_pipeline_schedule
 from .stages import PP_STAGE_ORDER, STAGE_ORDER, stage_enabled
 from .tensor_parallel import apply_tp
@@ -61,6 +61,7 @@ from .tensor_parallel import apply_tp
 logger = get_logger(__name__)
 
 __all__ = ["PipelineParallelSetup", "parallelize_hf_transformers"]
+
 
 def parallelize_hf_transformers(
     model: nn.Module,
@@ -160,9 +161,7 @@ def parallelize_hf_transformers(
                 f"ep={cfg.ep} but parallel_dims has no multi-rank 'ep' axis."
             )
         ep_group = ep_mesh.get_group()
-    tp_mesh = (
-        None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
-    )
+    tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
 
     if parallel_dims is not None and parallel_dims.pp_enabled:
         if global_batch_size is None:

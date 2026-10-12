@@ -429,7 +429,7 @@ def require_torch_remat():
         raise ImportError(
             "activation_checkpoint_mode='region' needs the optional "
             "`torch_remat` package, which is not installed. It also requires "
-            "torch >= 2.10. Install it with: pip install \"torch_remat @ "
+            'torch >= 2.10. Install it with: pip install "torch_remat @ '
             'git+https://github.com/meta-pytorch/remat.git" -- or use '
             "activation_checkpoint_mode='full'/'selective'."
         ) from error

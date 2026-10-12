@@ -9,11 +9,11 @@ from llmtuner.config import ParallelConfig
 
 from ...utils.logger_utils import get_logger
 from .. import matrix
-from .swap import swap_hf_moe_blocks
+from .swap import restore_fp32_state_buffers, swap_hf_moe_blocks
 
 logger = get_logger(__name__)
 
-__all__ = ["apply_ep"]
+__all__ = ["apply_ep", "restore_fp32_state_buffers", "swap_hf_moe_blocks"]
 
 
 def apply_ep(

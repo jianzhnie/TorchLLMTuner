@@ -6,7 +6,7 @@ actually runs inside HF attention. ``input_shard.py`` holds the batch and mask
 sharding; ``apply.py`` wires the kernel onto a model.
 """
 
-from .apply import apply_cp
+from .context_parallel import apply_cp
 from .cp_kernel import CPFlexKernel
 from .input_shard import (
     shard_attention_mask_for_cp,

@@ -57,6 +57,7 @@ class Row:
     def reason(self) -> str:
         return (self.fn.__doc__ or "").strip()
 
+
 # == assembly phase: verdicts called from the guard sites =================
 
 
@@ -74,7 +75,6 @@ def validation_once_requires_dp1(dp_world_size: int) -> None:
     )
 
 
-
 def validation_once_requires_finite_corpus() -> None:
     """steps=-1 against the synthetic corpus has no exhaustion at all: the random source
     is infinite, so 'one finite pass' never ends.
@@ -85,7 +85,6 @@ def validation_once_requires_finite_corpus() -> None:
         "exhausts. Set validation.steps to a positive count, or name a "
         "finite validation dataset."
     )
-
 
 
 def chunked_loss_pp(chunks: int, pp: int) -> None:
@@ -134,7 +133,6 @@ def ep_hf_initial_load(ep: int) -> None:
     )
 
 
-
 def dsa_pp() -> None:
     """A DSA (dense-mask) model builds its additive mask from
     ``tok_embeddings.weight.dtype`` on every forward; on non-first PP stages
@@ -177,7 +175,6 @@ def pp_weight_tying() -> None:
     )
 
 
-
 def shared_expert_tp(module_path: str, block: object) -> None:
     """A shared expert whose layout is not the gate/up/down MLP cannot be
     feature-sharded by ``shard_shared_expert_for_tp`` -- e.g. Qwen2Moe's
@@ -193,7 +190,6 @@ def shared_expert_tp(module_path: str, block: object) -> None:
     )
 
 
-
 def tp_moe_specs_without_block(tp: int, model: object) -> None:
     """The plan declares MoE TP specs but no HF MoE block was found; running TP with the
     experts silently replicated is refused.
@@ -204,7 +200,6 @@ def tp_moe_specs_without_block(tp: int, model: object) -> None:
         f"{type(model).__name__}. Refusing to run TP with the experts "
         "silently replicated."
     )
-
 
 
 def tp_moe_non_tensor_output(boundary: object, out: object) -> None:
@@ -219,7 +214,6 @@ def tp_moe_non_tensor_output(boundary: object, out: object) -> None:
     )
 
 
-
 def quantile_requires_ep() -> None:
     """Quantile balancing is installed by the EP swap, which ep=1 never runs -- there is
     no llmtuner MoE to balance.
@@ -231,7 +225,6 @@ def quantile_requires_ep() -> None:
     )
 
 
-
 def ptrr_load_balancer_backstop() -> None:
     """Assembly-time backstop for the config-phase 'ptrr_load_balancer' row: a caller
     that bypasses the config still hits the same refusal.
@@ -240,7 +233,6 @@ def ptrr_load_balancer_backstop() -> None:
         "'ptrr' load balancing builds its schedule from a BlockMask and is "
         "not wired in llmtuner yet; use 'headtail' or None."
     )
-
 
 
 # == probe phase: verdicts called from the EP swap's layout probes =======
@@ -261,7 +253,6 @@ def gpt_oss_layout(experts: object) -> None:
     )
 
 
-
 def group_limited_greedy() -> None:
     """DeepSeek-V2's group_limited_greedy scores a group by its single best expert
     (max); the implemented rule sums the group's top-2 (DeepSeek-V3/GLM4), and
@@ -277,7 +268,6 @@ def group_limited_greedy() -> None:
     )
 
 
-
 def router_bias(router_gate: object) -> None:
     """RouterGateLinear has no slot for a router bias. Every supported family is bias-
     free, so this fires only on a family the probe does not know.
@@ -290,7 +280,6 @@ def router_bias(router_gate: object) -> None:
     )
 
 
-
 def quantile_requires_sigmoid(score_func: str, block: object) -> None:
     """The quantile scheme is defined over sigmoid scores (the histogram range derives
     from their [0, 1] bound).
@@ -299,7 +288,6 @@ def quantile_requires_sigmoid(score_func: str, block: object) -> None:
         f"quantile-balanced routing requires sigmoid router scores, "
         f"got {score_func!r} for {type(block).__name__}."
     )
-
 
 
 def quantile_no_group_limit(block: object) -> None:
@@ -315,16 +303,13 @@ def quantile_no_group_limit(block: object) -> None:
     )
 
 
-
 def shared_expert_gate(block: object) -> None:
-    """Qwen2Moe's shared_expert_gate multiplies where MoE.shared_experts only adds.
-    """
+    """Qwen2Moe's shared_expert_gate multiplies where MoE.shared_experts only adds."""
     raise UnsupportedCombinationError(
         f"{type(block).__name__} gates its shared expert "
         "(shared_expert_gate); MoE's shared_experts is additive only. "
         "Qwen3Moe has no shared expert, so this is unreachable there."
     )
-
 
 
 def shared_expert_tp_ep(block: object) -> None:
@@ -341,49 +326,128 @@ def shared_expert_tp_ep(block: object) -> None:
     )
 
 
-
 # == the table ====================================================================
 
 
 ENTRIES: tuple[Row, ...] = (
-    Row(validation_once_requires_dp1, "assembly", ConfigError,
-        'trainer/validate.py::check_validation_feasibility'),
-    Row(validation_once_requires_finite_corpus, "assembly", ConfigError,
-        'trainer/validate.py::check_validation_feasibility'),
-    Row(chunked_loss_pp, "assembly", UnsupportedCombinationError,
-        'trainer/trainer.py::Trainer.__init__'),
-    Row(ep_hf_initial_load, "assembly", UnsupportedCombinationError,
-        'trainer/builder.py::build_trainer_state'),
-    Row(chunked_loss_validation, "assembly", UnsupportedCombinationError,
-        'trainer/validate.py::check_validation_feasibility'),
-    Row(pp_weight_tying, "assembly", UnsupportedCombinationError,
-        'parallel/pipeline_parallel/apply.py::apply_pp'),
-    Row(dsa_pp, "assembly", UnsupportedCombinationError,
-        'parallel/pipeline_parallel/apply.py::apply_pp'),
-    Row(pp_packed_microbatch_split, "assembly", UnsupportedCombinationError,
-        'trainer/pipeline_step.py::split_pipeline_microbatches'),
-    Row(shared_expert_tp, "assembly", UnsupportedCombinationError,
-        'parallel/tensor_parallel/apply.py::apply_tp'),
-    Row(tp_moe_specs_without_block, "assembly", UnsupportedCombinationError,
-        'parallel/tensor_parallel/apply.py::apply_tp'),
-    Row(tp_moe_non_tensor_output, "assembly", UnsupportedCombinationError,
-        'parallel/tensor_parallel/tp.py::TPMoeSequenceBoundary.forward'),
-    Row(quantile_requires_ep, "assembly", UnsupportedCombinationError,
-        'parallel/expert_parallel/apply.py::apply_ep'),
-    Row(ptrr_load_balancer_backstop, "assembly", UnsupportedCombinationError,
-        'parallel/context_parallel/input_shard.py::resolve_load_balancer'),
-    Row(gpt_oss_layout, "probe", UnsupportedCombinationError,
-        'parallel/expert_parallel/probe.py::fused_experts_of'),
-    Row(group_limited_greedy, "probe", UnsupportedCombinationError,
-        'parallel/expert_parallel/probe.py::read_expert_groups'),
-    Row(router_bias, "probe", UnsupportedCombinationError,
-        'parallel/expert_parallel/convert.py::convert_block'),
-    Row(quantile_requires_sigmoid, "probe", UnsupportedCombinationError,
-        'parallel/expert_parallel/convert.py::convert_block'),
-    Row(quantile_no_group_limit, "probe", UnsupportedCombinationError,
-        'parallel/expert_parallel/convert.py::convert_block'),
-    Row(shared_expert_gate, "probe", UnsupportedCombinationError,
-        'parallel/expert_parallel/convert.py::convert_block'),
-    Row(shared_expert_tp_ep, "probe", UnsupportedCombinationError,
-        'parallel/expert_parallel/convert.py::convert_block'),
+    Row(
+        validation_once_requires_dp1,
+        "assembly",
+        ConfigError,
+        "trainer/validate.py::check_validation_feasibility",
+    ),
+    Row(
+        validation_once_requires_finite_corpus,
+        "assembly",
+        ConfigError,
+        "trainer/validate.py::check_validation_feasibility",
+    ),
+    Row(
+        chunked_loss_pp,
+        "assembly",
+        UnsupportedCombinationError,
+        "trainer/trainer.py::Trainer.__init__",
+    ),
+    Row(
+        ep_hf_initial_load,
+        "assembly",
+        UnsupportedCombinationError,
+        "trainer/builder.py::build_trainer_state",
+    ),
+    Row(
+        chunked_loss_validation,
+        "assembly",
+        UnsupportedCombinationError,
+        "trainer/validate.py::check_validation_feasibility",
+    ),
+    Row(
+        pp_weight_tying,
+        "assembly",
+        UnsupportedCombinationError,
+        "parallel/pipeline_parallel/apply.py::apply_pp",
+    ),
+    Row(
+        dsa_pp,
+        "assembly",
+        UnsupportedCombinationError,
+        "parallel/pipeline_parallel/apply.py::apply_pp",
+    ),
+    Row(
+        pp_packed_microbatch_split,
+        "assembly",
+        UnsupportedCombinationError,
+        "trainer/pipeline_step.py::split_pipeline_microbatches",
+    ),
+    Row(
+        shared_expert_tp,
+        "assembly",
+        UnsupportedCombinationError,
+        "parallel/tensor_parallel/apply.py::apply_tp",
+    ),
+    Row(
+        tp_moe_specs_without_block,
+        "assembly",
+        UnsupportedCombinationError,
+        "parallel/tensor_parallel/apply.py::apply_tp",
+    ),
+    Row(
+        tp_moe_non_tensor_output,
+        "assembly",
+        UnsupportedCombinationError,
+        "parallel/tensor_parallel/tp.py::TPMoeSequenceBoundary.forward",
+    ),
+    Row(
+        quantile_requires_ep,
+        "assembly",
+        UnsupportedCombinationError,
+        "parallel/expert_parallel/apply.py::apply_ep",
+    ),
+    Row(
+        ptrr_load_balancer_backstop,
+        "assembly",
+        UnsupportedCombinationError,
+        "parallel/context_parallel/input_shard.py::resolve_load_balancer",
+    ),
+    Row(
+        gpt_oss_layout,
+        "probe",
+        UnsupportedCombinationError,
+        "parallel/expert_parallel/probe.py::fused_experts_of",
+    ),
+    Row(
+        group_limited_greedy,
+        "probe",
+        UnsupportedCombinationError,
+        "parallel/expert_parallel/probe.py::read_expert_groups",
+    ),
+    Row(
+        router_bias,
+        "probe",
+        UnsupportedCombinationError,
+        "parallel/expert_parallel/convert.py::convert_block",
+    ),
+    Row(
+        quantile_requires_sigmoid,
+        "probe",
+        UnsupportedCombinationError,
+        "parallel/expert_parallel/convert.py::convert_block",
+    ),
+    Row(
+        quantile_no_group_limit,
+        "probe",
+        UnsupportedCombinationError,
+        "parallel/expert_parallel/convert.py::convert_block",
+    ),
+    Row(
+        shared_expert_gate,
+        "probe",
+        UnsupportedCombinationError,
+        "parallel/expert_parallel/convert.py::convert_block",
+    ),
+    Row(
+        shared_expert_tp_ep,
+        "probe",
+        UnsupportedCombinationError,
+        "parallel/expert_parallel/convert.py::convert_block",
+    ),
 )

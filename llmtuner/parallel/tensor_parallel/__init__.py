@@ -2,22 +2,5 @@
 ``apply_tp`` entry point (``apply``), re-exported at the package seam like
 every other parallelism family."""
 
-from .apply import apply_tp
-from .tp import (
-    ColumnParallelLinear,
-    ColwiseLinearNoGather,
-    RowParallelLinear,
-    ShardingConfig,
-    colwise,
-    rowwise,
-)
-
-__all__ = [
-    "ColumnParallelLinear",
-    "ColwiseLinearNoGather",
-    "RowParallelLinear",
-    "ShardingConfig",
-    "apply_tp",
-    "colwise",
-    "rowwise",
-]
+from .tensor_parallel import *  # noqa: F401,F403
+from .tensor_parallel import __all__ as __all__

@@ -1,5 +1,4 @@
-"""Fully-sharded data parallelism: the ``apply_fsdp`` entry point."""
+"""Compatibility imports for the renamed FSDP package."""
 
-from .apply import apply_fsdp
-
-__all__ = ["apply_fsdp"]
+from ..fully_shard_parallel import *  # noqa: F401,F403
+from ..fully_shard_parallel import __all__ as __all__
