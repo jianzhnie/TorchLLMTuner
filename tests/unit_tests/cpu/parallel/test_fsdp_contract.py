@@ -28,10 +28,12 @@ import torch
 import torch.nn as nn
 from torch.nn import ModuleDict, ModuleList
 
+import llmtuner.parallel.fully_shard_parallel.fully_shard_parallel as apply
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.fully_shard_parallel import apply
-from llmtuner.parallel.fully_shard_parallel.fsdp import iter_transformer_layers
+from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
+    iter_transformer_layers,
+)
 
 _VOCAB = 32
 _HIDDEN = 8

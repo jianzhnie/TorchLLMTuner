@@ -48,8 +48,8 @@ from llmtuner.config import (
     SelectiveACConfig,
 )
 
+from ..memory import apply_ac
 from ..utils.logger_utils import get_logger
-from .activation_checkpoint import apply_ac
 from .compile import apply_compile
 from .context_parallel import apply_cp
 from .expert_parallel import apply_ep

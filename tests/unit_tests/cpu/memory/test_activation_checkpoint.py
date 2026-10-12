@@ -55,8 +55,8 @@ from llmtuner.config import (
 )
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel import activation_checkpoint as ac_mod
-from llmtuner.parallel.activation_checkpoint import (
+from llmtuner.memory import activation_checkpoint as ac_mod
+from llmtuner.memory.activation_checkpoint import (
     VALID_AC_MODES,
     apply_ac,
     get_default_save_ops,
@@ -64,7 +64,7 @@ from llmtuner.parallel.activation_checkpoint import (
     selective_policy,
 )
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
-from llmtuner.parallel.remat_regions import region_names
+from llmtuner.memory.remat_regions import region_names
 
 _VOCAB = 32
 _HIDDEN = 16
