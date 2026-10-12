@@ -19,6 +19,9 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully
 from torch.distributed.tensor import Shard
 from torch.nn import ModuleDict
 
+from llmtuner.config import ParallelConfig
+
+from ...accelerator import dist_utils
 from ...utils.logger_utils import get_logger
 from ..parallel_dims import ParallelDims
 

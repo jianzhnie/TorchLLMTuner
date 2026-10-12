@@ -7,12 +7,12 @@ from typing import Any
 
 from transformers import AutoConfig
 
-from llmtuner.config.checkpoint import CheckpointConfig
-from llmtuner.config.data import DataloaderConfig
-from llmtuner.config.model import ModelConfig
-from llmtuner.config.optimizer import LRSchedulerConfig, OptimizerConfig
-from llmtuner.config.parallel import ParallelConfig
-from llmtuner.config.training import (
+from llmtuner.config.checkpoint_config import CheckpointConfig
+from llmtuner.config.data_config import DataloaderConfig
+from llmtuner.config.model_config import ModelConfig
+from llmtuner.config.optimizer_config import LRSchedulerConfig, OptimizerConfig
+from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.config.training_config import (
     MetricsConfig,
     ProfilerConfig,
     TrainingConfig,

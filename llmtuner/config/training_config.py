@@ -6,19 +6,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from llmtuner.config.activation_checkpoint import (
+from llmtuner.config.activation_checkpoint_config import (
     VALID_AC_MODES,
     MemoryBudgetACConfig,
     RegionACConfig,
     SelectiveACConfig,
 )
-from llmtuner.config.checkpoint import CheckpointConfig
-from llmtuner.config.compile import CompileConfig
-from llmtuner.config.data import DataloaderConfig
-from llmtuner.config.field_checks import require_at_least
-from llmtuner.config.observability import MetricsConfig, ProfilerConfig
-from llmtuner.config.optimizer import EMAConfig
-from llmtuner.config.validation import ValidationConfig
+from llmtuner.config.checkpoint_config import CheckpointConfig
+from llmtuner.config.compile_config import CompileConfig
+from llmtuner.config.data_config import DataloaderConfig
+from llmtuner.config.utils import require_at_least
+from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
+from llmtuner.config.optimizer_config import EMAConfig
+from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.errors import ConfigError
 
 

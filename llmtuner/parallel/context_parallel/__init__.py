@@ -1,9 +1,8 @@
 """Context parallelism: the CP flex kernel, input sharding, and wiring.
 
-``cp_kernel.py`` holds the attention redistribution itself -- both strategies
-(KV all-gather and Ulysses all-to-all) live in ``CPFlexKernel``, which is what
-actually runs inside HF attention. ``input_shard.py`` holds the batch and mask
-sharding; ``apply.py`` wires the kernel onto a model.
+``context_parallel.py`` is the public entry and wires CP onto a model.
+``cp_kernel.py`` holds the attention redistribution itself, while
+``input_shard.py`` owns batch and mask sharding.
 """
 
 from .context_parallel import apply_cp

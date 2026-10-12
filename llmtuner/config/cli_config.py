@@ -31,12 +31,12 @@ from __future__ import annotations
 import dataclasses
 import typing
 
-from .checkpoint import CheckpointConfig
-from .data import DataloaderConfig
-from .model import ModelConfig
-from .optimizer import LRSchedulerConfig, OptimizerConfig
-from .parallel import ParallelConfig
-from .training import MetricsConfig, ProfilerConfig, TrainingConfig
+from .checkpoint_config import CheckpointConfig
+from .data_config import DataloaderConfig
+from .model_config import ModelConfig
+from .optimizer_config import LRSchedulerConfig, OptimizerConfig
+from .parallel_config import ParallelConfig
+from .training_config import MetricsConfig, ProfilerConfig, TrainingConfig
 
 # The groups the CLI parses, in the order ``LLMTunerConfig.from_groups`` takes
 # them. Parser order is significant: ``parse_args_into_dataclasses`` returns one
