@@ -4,8 +4,8 @@ Vendored from torchtitan ``models/common/``: the pieces an HF text model is put
 together from, with nothing in here knowing which family it belongs to. The two
 families big enough to need more than one file are subpackages -- ``attention/``
 (the fused QKV projection, the mask builders) and ``moe/`` (router, experts,
-dispatcher, block, balance loss, balancing hooks) -- and the rest are one node
-per file: ``activation``, ``async_linear`` (TP-overlapped GEMMs), ``aux_loss``
+layer, auxiliary loss, bias-update hooks) -- and the rest are one node
+per file: ``activation``, ``tp_projections`` (TP-overlapped GEMMs), ``aux_loss``
 (the gradient carrier), ``cast_linear``, ``embedding``, ``feed_forward``,
 ``linear``, ``multimodal``, ``rope``, ``scatter_add``.
 

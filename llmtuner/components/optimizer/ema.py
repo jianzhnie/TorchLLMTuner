@@ -66,7 +66,7 @@ class EMAParamOptimizer(Optimizer):
     one model part.
 
     Never step()-ed; reuses ``Optimizer``'s per-tensor state dict plus the
-    FQN-flattening DCP machinery in ``optimizer/utils.py`` instead of a
+    FQN-flattening DCP machinery in ``optimizer/state_dict.py`` instead of a
     bespoke state-dict format. Also used for buffer EMA (e.g. MoE's
     ``expert_bias_E``), which is why tensors need not be ``nn.Parameter``s.
     """
