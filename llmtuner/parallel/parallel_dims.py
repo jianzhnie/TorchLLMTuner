@@ -1,7 +1,7 @@
 """``ParallelDims``: the resolved parallel degrees and every DeviceMesh built
 from them.
 
-Config says how many ways to split (``config/parallel.py``); this module turns
+Config says how many ways to split (``config/parallel_config.py``); this module turns
 that into the actual process topology: the dense mesh (dp_shard x dp_replicate
 x cp x tp, x pp) and, under EP, the sparse mesh (pp x dp_replicate x efsdp x
 ep). It also owns the module-level ``build_parallel_dims`` / ``build_mesh``
@@ -496,7 +496,7 @@ class ParallelDims:
 # These are the axes of the dense mesh the parallel layer is handed; ``pp`` is
 # not among them because pipeline stages live on disjoint rank sets -- the PP
 # path resolves its own views off ParallelDims instead (see
-# parallel/pipeline_parallel/apply.py).
+# parallel/pipeline_parallel/pipeline_parallel.py).
 MESH_AXES = ("dp", "cp", "tp")
 
 

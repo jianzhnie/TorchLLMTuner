@@ -2,7 +2,7 @@
 
 The entry point is ``swap.py`` (``swap_hf_moe_blocks``); the conversion is
 ``convert.py``. This module is the duck-typed detector every HF family is
-identified through, shared by the swap and by ``tensor_parallel/apply.py``
+identified through, shared by the swap and by ``tensor_parallel.py``
 (``is_hf_moe_block``).
 
 Every sparse decoder layer of a transformers 5.x MoE model holds the same block
@@ -74,7 +74,7 @@ import torch.nn as nn
 
 from ...models.common.moe.block import MOE_LAYER_ATTRS
 from ...utils.logger_utils import get_logger
-from .. import matrix
+from .. import compatibility
 
 logger = get_logger(__name__)
 
@@ -171,7 +171,7 @@ def fused_experts_of(block: nn.Module) -> FusedExperts | None:
             "activation through GroupedExperts first."
         )
     if hasattr(experts, "gate_up_proj_bias") or hasattr(experts, "down_proj_bias"):
-        matrix.gpt_oss_layout(experts)
+        compatibility.gpt_oss_layout(experts)
     num_experts, double_hidden, dim = gate_up.shape
     # down_proj is (E, D, F) with the *same* D: the token dim must agree on both
     # sides. Its trailing dim is F, which equals ``double_hidden / 2`` only for
@@ -387,7 +387,7 @@ def read_expert_groups(
     if topk_method == "greedy":
         return None, None
     if ignores_norm_topk_prob(block, router):
-        matrix.group_limited_greedy()
+        compatibility.group_limited_greedy()
     return num_groups, read_int_attr(block, router, "topk_group")
 
 

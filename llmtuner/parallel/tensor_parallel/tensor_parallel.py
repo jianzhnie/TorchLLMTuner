@@ -55,10 +55,10 @@ from llmtuner.config import ParallelConfig
 
 from ...accelerator.capabilities import has
 from ...models.common.moe.experts import GroupedExperts
-from .. import matrix
-from ..head_sharding import require_heads_divisible_by
-from ..patterns import module_name_matches
-from .linear import (
+from .. import compatibility
+from ..attention_heads import require_heads_divisible_by
+from ..module_patterns import module_name_matches
+from .linear_ops import (
     AllGatherLinear,
     LinearReduceScatter,
     all_gather_along,
@@ -314,9 +314,9 @@ class TPMoeSequenceBoundary:
         # the TP group -- so either all ranks raise here or none do. Never let
         # a data-dependent type reach this check.
         if not isinstance(out, torch.Tensor):
-            from .. import matrix
+            from .. import compatibility
 
-            matrix.tp_moe_non_tensor_output(self, out)
+            compatibility.tp_moe_non_tensor_output(self, out)
         return reduce_scatter_along(out, -2, self._tp_seq_group)
 
 
@@ -694,7 +694,7 @@ def resolve_tp_targets(model: nn.Module, cfg: ParallelConfig, plan):
     moe_blocks: list[tuple[str, nn.Module]] = []
     already_bracketed = False
     if plan_declares_moe and not moe_deferred_to_ep:
-        from ..expert_parallel.swap import is_hf_moe_block
+        from ..expert_parallel.model_conversion import is_hf_moe_block
 
         for module_path, module in model.named_modules():
             if getattr(module, "_tp_moe_boundary", False):
@@ -707,7 +707,7 @@ def resolve_tp_targets(model: nn.Module, cfg: ParallelConfig, plan):
             if is_hf_moe_block(module):
                 moe_blocks.append((module_path, module))
         if not moe_blocks and not already_bracketed:
-            matrix.tp_moe_specs_without_block(cfg.tp, model)
+            compatibility.tp_moe_specs_without_block(cfg.tp, model)
     if moe_blocks:
         # MoE-block internals never take the dense realizer path: the routed
         # experts are stacked parameters (no nn.Linear to match), and the
@@ -755,7 +755,7 @@ def realize_moe_blocks_tp(moe_blocks, *, tp_size: int, tp_rank: int, group) -> N
                 isinstance(getattr(shared, n, None), nn.Linear)
                 for n in ("gate_proj", "up_proj", "down_proj")
             ):
-                matrix.shared_expert_tp(module_path, block)
+                compatibility.shared_expert_tp(module_path, block)
             shared_ids = shard_shared_expert_for_tp(
                 block, tp_size=tp_size, tp_rank=tp_rank
             )

@@ -15,7 +15,7 @@ import torch
 
 from llmtuner.accelerator.capabilities import require
 from llmtuner.config import ValidationConfig
-from llmtuner.parallel import matrix
+from llmtuner.parallel import compatibility
 
 from ..accelerator.collectives import all_reduce
 from ..accelerator.spmd_context import spmd_context
@@ -132,14 +132,14 @@ def check_validation_feasibility(
       the random source is infinite, so "one finite pass" never ends.
     """
     if chunked_loss_num_chunks > 1:
-        matrix.chunked_loss_validation(chunked_loss_num_chunks)
+        compatibility.chunked_loss_validation(chunked_loss_num_chunks)
     if validation.steps != -1:
         return
     if dp_world_size > 1:
-        matrix.validation_once_requires_dp1(dp_world_size)
+        compatibility.validation_once_requires_dp1(dp_world_size)
     dataset = training_dataset if validation.dataset is None else validation.dataset
     if dataset == "random":
-        matrix.validation_once_requires_finite_corpus()
+        compatibility.validation_once_requires_finite_corpus()
 
 
 def should_validate(self, step: int) -> bool:

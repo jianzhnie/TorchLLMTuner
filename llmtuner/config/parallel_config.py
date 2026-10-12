@@ -212,7 +212,7 @@ class ParallelConfig:
     - "headtail": Use HeadTailLoadBalancer for SDPA
     - "ptrr": accepted for config compatibility, but NOT implemented -- it is
       rejected with NotImplementedError when the CP mesh is built
-      (``parallel/context_parallel/input_shard.py``), because it needs a
+      (``parallel/context_parallel/input_sharding.py``), because it needs a
       BlockMask to derive its schedule from and llmtuner's kernel does not
       consume one. Use "headtail" or None.
     - None (default): contiguous input sharding, upstream's own default. The

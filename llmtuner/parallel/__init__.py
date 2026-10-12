@@ -1,11 +1,9 @@
 """Parallelism: one ``apply_*`` per dimension, composed by one entry point.
 
-Each dimension gets its own module or subpackage: ``tensor_parallel/{tp,linear}``
-(the declaration and the fused GEMMs it realizes into), ``fully_shard/{fsdp,
-apply}`` (torchtitan's vendored sharding logic behind a thin driver),
-``context_parallel/`` (CP redistribution primitives, flex kernel, input
-sharding, ``apply_cp``) and ``expert_parallel/`` (the HF MoE swap and
-``apply_ep``).
+Each family has one same-named public entry module. Supporting modules contain
+mechanisms only: TP linear kernels, FSDP plans, CP kernels and input sharding,
+EP model conversion, and PP stage splitting. Callers import the family package
+instead of reaching into those implementation files.
 
 Every ``apply_*`` is a no-op when its degree is 1. That is what lets the same
 trainer code run from step 0 (single device) through step 4 (full hybrid
@@ -13,7 +11,7 @@ parallelism) without an ``if degree > 1`` at any call site -- and it is why
 ``parallelize_hf_transformers`` can apply all of them unconditionally.
 
 Pipeline parallelism lives in ``pipeline_parallel/``: ``pipeline.py`` computes
-the stage split and ``apply.py`` builds the schedule over this rank's stages.
+the stage split and ``pipeline_parallel.py`` builds this rank's schedule.
 ``parallelize_hf_transformers`` dispatches to it when ``pp > 1`` and returns a
 ``PipelineParallelSetup`` instead of a model.
 """

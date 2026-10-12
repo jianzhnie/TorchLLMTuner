@@ -67,7 +67,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
 
 from ...accelerator.device import device_type
-from ...parallel.expert_parallel.ckpt import (
+from ...parallel.expert_parallel.checkpoint import (
     expert_shard_map,
     gather_expert_state,
     load_expert_state,
@@ -368,7 +368,7 @@ class OptimizersContainer(Optimizer, Stateful):
             result.update(get_flat_optim_state_dict(optimizer))
         # Expert optimizer states are rank-heterogeneous like the expert
         # weights themselves; gather them to the full tensors the checkpoint
-        # stores (parallel/expert_parallel/ckpt.py).
+        # stores (parallel/expert_parallel/checkpoint.py).
         return gather_expert_state(result, self._ep_shards(), self.model_parts)
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:

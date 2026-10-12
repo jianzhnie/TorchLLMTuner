@@ -10,7 +10,8 @@ phase and the guard's location. The trigger condition stays at the guard
 site; the verdict lives here, so the site cannot quietly disagree.
 
 Config-phase combination checks are NOT here: they live in the owning
-config's ``__post_init__`` (``config/parallel.py``, ``config/training.py``,
+config's ``__post_init__`` (``config/parallel_config.py``,
+``config/training_config.py``,
 ``config/root.py``), alongside every other field validation. The division of
 labor is documented in docs/torchllmtuner_design.md (§3.3, the
 combination-verdict section).

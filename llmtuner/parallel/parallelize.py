@@ -31,7 +31,7 @@ oversight:
   data in the model registry instead (see docs/torchllmtuner_design.md, SEAM 1).
 * **Swapping in a native MoE.** No longer true: ``apply_ep`` swaps HF MoE
   blocks for the ``models/common`` MoE stack when ``ep > 1`` (see
-  ``parallel/expert_parallel/swap.py``). The swap moves weights rather than
+  ``parallel/expert_parallel/model_conversion.py``). The conversion moves weights
   re-initializing them, so the model still trains from HF's initialization.
 """
 
@@ -50,12 +50,12 @@ from llmtuner.config import (
 
 from ..memory import apply_ac
 from ..utils.logger_utils import get_logger
-from .compile import apply_compile
 from .context_parallel import apply_cp
 from .expert_parallel import apply_ep
 from .fully_shard_parallel import apply_fsdp
+from .model_compile import apply_compile
 from .pipeline_parallel import PipelineParallelSetup, apply_pp, build_pipeline_schedule
-from .stages import PP_STAGE_ORDER, STAGE_ORDER, stage_enabled
+from .stages import PP_STAGE_ORDER, STAGE_ORDER, StageName, stage_enabled
 from .tensor_parallel import apply_tp
 
 logger = get_logger(__name__)
@@ -124,7 +124,7 @@ def parallelize_hf_transformers(
     def apply_stages(
         part: nn.Module,
         dense_mesh,
-        stage_order: tuple[str, ...],
+        stage_order: tuple[StageName, ...],
         *,
         ep_group,
         tp_mesh,
