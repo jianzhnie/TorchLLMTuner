@@ -48,7 +48,7 @@ from llmtuner.models.common.attention.masks import (
     get_causal_mask_mod,
 )
 
-__all__ = ["CPFlexKernel"]
+__all__ = ["CPFlexKernel", "DualCPFlexKernel"]
 
 # q/k/v arrive HF-shaped: (batch, heads, seq, dim). The sequence axis the CP
 # input sharding split is dim 2 of this layout.
@@ -350,3 +350,34 @@ class CPFlexKernel(nn.Module):
             )
             self._full_masks[key] = mask
         return mask
+
+
+class DualCPFlexKernel(nn.Module):
+    """Compose independent KV-AllGather and Ulysses process groups.
+
+    Q is redistributed only across Ulysses. K/V first gather their sequence
+    shards across the KV axis and then exchange sequence for heads across the
+    Ulysses axis. Attention consequently sees ``S / kv`` queries and full-S
+    keys while retaining the total ``kv * ulysses`` input/output token shard.
+    """
+
+    def __init__(self, *, kv_mesh: DeviceMesh, ulysses_mesh: DeviceMesh) -> None:
+        super().__init__()
+        from torch.distributed.tensor.experimental._context_parallel._cp_custom_ops import (  # noqa: E501
+            flex_cp_allgather,
+        )
+
+        self._flex_cp_allgather = flex_cp_allgather
+        self._kv_pg_name = c10d._get_process_group_name(kv_mesh.get_group())
+        self._ulysses_group = ulysses_mesh.get_group()
+
+    def forward(self, query, key, value, *, module, block_mask=None, **kwargs):
+        key, value = self._flex_cp_allgather(
+            key.contiguous(), value.contiguous(), _SEQ_DIM, self._kv_pg_name
+        )
+        q = SeqToHead.apply(query.contiguous(), self._ulysses_group)
+        k = SeqToHead.apply(key.contiguous(), self._ulysses_group)
+        v = SeqToHead.apply(value.contiguous(), self._ulysses_group)
+        out = run_flex(module, q, k, v, block_mask, kwargs)
+        out = HeadToSeq.apply(out.contiguous(), self._ulysses_group)
+        return out.transpose(1, 2)

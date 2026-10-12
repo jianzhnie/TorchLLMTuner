@@ -41,6 +41,8 @@ class ParallelDims:
     pp: int
     ep: int
     world_size: int
+    cp_kv: int = 1
+    cp_ulysses: int = 1
     # Cache by axis name(s); DeviceMesh equality is by identity, so reuse the
     # same object instead of re-slicing a submesh on every lookup.
     _single_axis_meshes: dict[str, DeviceMesh] = field(default_factory=dict)
@@ -54,11 +56,13 @@ class ParallelDims:
         return cls(
             dp_replicate=parallelism_config.data_parallel_replicate_size,
             dp_shard=parallelism_config.data_parallel_shard_size,
-            cp=parallelism_config.context_parallel_size,
+            cp=parallelism_config.cp,
             tp=parallelism_config.tensor_parallel_size,
             pp=parallelism_config.pipeline_parallel_size,
             ep=parallelism_config.expert_parallel_size,
             world_size=world_size,
+            cp_kv=parallelism_config.context_parallel_kv_allgather_size,
+            cp_ulysses=parallelism_config.context_parallel_ulysses_size,
         )
 
     def __post_init__(self):
@@ -79,10 +83,16 @@ class ParallelDims:
             "tp": tp,
             "pp": pp,
             "ep": ep,
+            "cp_kv": self.cp_kv,
+            "cp_ulysses": self.cp_ulysses,
         }
         for name, degree in named_degrees.items():
             if degree < 1:
                 raise ValueError(f"{name} must be >= 1, got {degree}")
+        if self.cp_kv * self.cp_ulysses not in (1, cp):
+            raise ValueError(
+                "cp_kv * cp_ulysses must equal cp when explicit CP axes are used"
+            )
         if dp_shard != -1 and dp_shard < 1:
             raise ValueError(f"dp_shard must be -1 or >= 1, got {dp_shard}")
         if self.world_size < 1:
@@ -248,6 +258,14 @@ class ParallelDims:
             "ep": full_sparse_mesh["ep"],
             "efsdp": full_sparse_mesh["efsdp"],
         }
+        if self.cp_kv * self.cp_ulysses == self.cp and self.cp > 1:
+            cp_axes_mesh = unflatten_mesh(
+                self._world_mesh,
+                ("pp", "batch", "cp_kv", "cp_ulysses", "tp"),
+                (self.pp, batch, self.cp_kv, self.cp_ulysses, self.tp),
+            )
+            self._single_axis_meshes["cp_kv"] = cp_axes_mesh["cp_kv"]
+            self._single_axis_meshes["cp_ulysses"] = cp_axes_mesh["cp_ulysses"]
         self._single_axis_meshes["dp"] = spmd_dense_mesh_for_fwdbwd["dp"]
         self._single_axis_meshes["dp_shard"] = full_dense_mesh_for_fsdp["dp_shard"]
 
@@ -284,6 +302,9 @@ class ParallelDims:
         }
         sizes["dp"] = self.dp_replicate * self.dp_shard
         sizes["dp_shard"] = self.dp_shard
+        if self.cp_kv * self.cp_ulysses == self.cp and self.cp > 1:
+            sizes["cp_kv"] = self.cp_kv
+            sizes["cp_ulysses"] = self.cp_ulysses
         return sizes
 
     def _validate_meshes(self) -> None:
@@ -497,6 +518,11 @@ def build_parallel_dims(cfg: LLMTunerConfig, world_size: int) -> ParallelDims | 
                 ("tensor_parallel_size", par.tensor_parallel_size),
                 ("pipeline_parallel_size", par.pipeline_parallel_size),
                 ("context_parallel_size", par.context_parallel_size),
+                (
+                    "context_parallel_kv_allgather_size",
+                    par.context_parallel_kv_allgather_size,
+                ),
+                ("context_parallel_ulysses_size", par.context_parallel_ulysses_size),
                 ("expert_parallel_size", par.expert_parallel_size),
                 ("data_parallel_replicate_size", par.data_parallel_replicate_size),
             )

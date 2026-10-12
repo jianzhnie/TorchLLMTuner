@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import torch
 
@@ -65,6 +65,21 @@ class ParallelConfig:
     fsdp_cpu_offload_pin_memory: bool = True
     """Use pinned host memory for FSDP2 CPU offload transfers."""
 
+    fsdp_forward_prefetch_count: int = 0
+    """Number of later FSDP units explicitly prefetched during forward."""
+
+    fsdp_backward_prefetch_count: int = 0
+    """Number of earlier FSDP units explicitly prefetched during backward."""
+
+    fsdp_apply_modules: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """Optional module patterns and per-unit ``fully_shard`` overrides."""
+
+    fsdp_ignored_modules: list[str] = field(default_factory=list)
+    """Module patterns excluded from FSDP parameter management."""
+
+    fsdp_implementation: Literal["native", "custom"] = "native"
+    """FSDP engine. ``custom`` selects the fine-grained implementation."""
+
     enable_fsdp_symm_mem: bool = False
     """Enable FSDP2 symmetric-memory communication when supported."""
 
@@ -87,6 +102,11 @@ class ParallelConfig:
     Unlike the other fields here this one is llmtuner's own: it is not forwarded
     to any upstream API, so it is not a name this config has to keep in step.
     """
+
+    tp_colwise_modules: list[str] = field(default_factory=list)
+    tp_rowwise_modules: list[str] = field(default_factory=list)
+    tp_sequence_modules: list[str] = field(default_factory=list)
+    """Optional pattern overrides layered on top of the model TP plan."""
 
     pipeline_parallel_size: int = 1
     """
@@ -168,6 +188,12 @@ class ParallelConfig:
     context_parallel_size: int = 1
     """Context parallelism degree. 1 means disabled."""
 
+    context_parallel_kv_allgather_size: int = 1
+    """Independent KV AllGather CP axis degree."""
+
+    context_parallel_ulysses_size: int = 1
+    """Independent Ulysses CP axis degree."""
+
     context_parallel_strategy: str = "kv_allgather"
     """
     CP attention redistribution strategy. Options:
@@ -238,6 +264,9 @@ class ParallelConfig:
     group-limited routing, and ep > 1 (the swap is what installs the router).
     """
 
+    fixed_router: bool = False
+    """Debug-only deterministic round-robin routing."""
+
     ep_token_dispatcher: str = "alltoall"
     """
     EP dispatch backend the MoE swap installs. Options:
@@ -291,7 +320,7 @@ class ParallelConfig:
             self.data_parallel_replicate_size
             * self.tensor_parallel_size
             * self.pipeline_parallel_size
-            * self.context_parallel_size
+            * self.cp
         )
 
     def derive_dp(self, world_size: int) -> int:
@@ -336,11 +365,27 @@ class ParallelConfig:
             "tensor_parallel_size",
             "pipeline_parallel_size",
             "context_parallel_size",
+            "context_parallel_kv_allgather_size",
+            "context_parallel_ulysses_size",
             "expert_parallel_size",
             "num_pp_microbatches",
             "ep_torchao_pad_multiple",
             group="parallel",
         )
+        if (
+            self.fsdp_forward_prefetch_count < 0
+            or self.fsdp_backward_prefetch_count < 0
+        ):
+            raise ConfigError("FSDP prefetch counts must be nonnegative")
+        if self.fsdp_implementation not in ("native", "custom"):
+            raise ConfigError(
+                "parallel.fsdp_implementation must be 'native' or 'custom'"
+            )
+        if self.fixed_router and self.moe_quantile_balancing:
+            raise UnsupportedCombinationError(
+                "parallel.fixed_router cannot be combined with "
+                "moe_quantile_balancing because fixed routing bypasses its choice"
+            )
         if not self.enable_sequence_parallel:
             raise UnsupportedCombinationError(
                 "parallel.enable_sequence_parallel=False is not supported: "
@@ -385,6 +430,14 @@ class ParallelConfig:
             raise ConfigError(
                 "parallel.context_parallel_load_balancer cannot be an empty "
                 "string; use None to disable load balancing."
+            )
+        if self.context_parallel_size != 1 and (
+            self.context_parallel_kv_allgather_size != 1
+            or self.context_parallel_ulysses_size != 1
+        ):
+            raise ConfigError(
+                "context_parallel_size is the legacy single-axis setting and "
+                "cannot be combined with the explicit KV/Ulysses axis sizes"
             )
         allowed = frozenset({None, "headtail", "ptrr"})
         if self.context_parallel_load_balancer not in allowed:
@@ -464,7 +517,11 @@ class ParallelConfig:
 
     @property
     def cp(self) -> int:
-        return self.context_parallel_size
+        if self.context_parallel_size != 1:
+            return self.context_parallel_size
+        return (
+            self.context_parallel_kv_allgather_size * self.context_parallel_ulysses_size
+        )
 
     @property
     def ep(self) -> int:

@@ -96,6 +96,7 @@ def swap_hf_moe_blocks(
     ep_group=None,
     router_aux_loss_coef: float | None = None,
     quantile_balancing: bool = False,
+    fixed_router: bool = False,
     token_dispatcher: str = "alltoall",
     torchao_pad_multiple: int = 16,
     tp_enabled: bool = False,
@@ -200,6 +201,10 @@ def swap_hf_moe_blocks(
             torchao_pad_multiple=torchao_pad_multiple,
             tp_enabled=tp_enabled,
         )
+        # The router already owns the deterministic balanced selection used by
+        # equivalence/debug runs; expose the FSDPTurbo plan flag without
+        # duplicating routing logic in each dispatcher.
+        moe.router._debug_force_load_balance = fixed_router
         # Replace in the slot the block was actually found in. Writing to a
         # different attribute would leave the original block in place and route
         # around the swap entirely.

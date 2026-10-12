@@ -9,7 +9,7 @@ from llmtuner.config import ParallelConfig
 
 from ...utils.logger_utils import get_logger
 from ..head_sharding import require_heads_divisible_by
-from .cp_kernel import CPFlexKernel
+from .cp_kernel import CPFlexKernel, DualCPFlexKernel
 from .input_shard import (
     shard_attention_mask_for_cp,
     shard_batch_for_cp,
@@ -94,6 +94,7 @@ def apply_cp(
     model: nn.Module,
     mesh: DeviceMesh | None,
     cfg: ParallelConfig,
+    parallel_dims=None,
 ) -> nn.Module:
     """Attach a CP flex kernel to every decoder layer's attention module.
 
@@ -139,7 +140,20 @@ def apply_cp(
 
     strategy = cfg.context_parallel_strategy
     load_balancer = cfg.context_parallel_load_balancer
-    if strategy == "ulysses":
+    dual_axes = (
+        cfg.context_parallel_kv_allgather_size > 1
+        and cfg.context_parallel_ulysses_size > 1
+    )
+    kv_mesh = ulysses_mesh = None
+    if dual_axes:
+        if parallel_dims is None:
+            raise ValueError("dual CP axes require ParallelDims")
+        kv_mesh = parallel_dims.get_optional_mesh("cp_kv")
+        ulysses_mesh = parallel_dims.get_optional_mesh("cp_ulysses")
+        if kv_mesh is None or ulysses_mesh is None:
+            raise ValueError("dual CP axis meshes were not constructed")
+        require_ulysses_compatible(model, cfg, ulysses_mesh)
+    elif strategy == "ulysses":
         require_ulysses_compatible(model, cfg, cp_mesh)
 
     layers = getattr(model, "layers", None)
@@ -161,10 +175,19 @@ def apply_cp(
                 f"under any of {_ATTN_MODULE_NAMES}. Add the model's spelling "
                 "to the probe in apply_cp."
             )
-        attn_mod._titan_flex_kernel = CPFlexKernel(
-            cp_mesh=cp_mesh, strategy=strategy, packed=packed
-        )
+        if dual_axes:
+            attn_mod._titan_flex_kernel = DualCPFlexKernel(
+                kv_mesh=kv_mesh, ulysses_mesh=ulysses_mesh
+            )
+        else:
+            attn_mod._titan_flex_kernel = CPFlexKernel(
+                cp_mesh=cp_mesh, strategy=strategy, packed=packed
+            )
 
     model.set_cp_mesh(cp_mesh, load_balancer=load_balancer, strategy=strategy)
-    logger.info("Applied CP (%s) with degree %d", strategy, cfg.cp)
+    logger.info(
+        "Applied CP (%s) with degree %d",
+        "kv_allgather*ulysses" if dual_axes else strategy,
+        cfg.cp,
+    )
     return model

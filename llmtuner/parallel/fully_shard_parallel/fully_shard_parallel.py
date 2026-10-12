@@ -24,21 +24,109 @@ from llmtuner.config import ParallelConfig
 from ...accelerator import dist_utils
 from ...utils.logger_utils import get_logger
 from ..parallel_dims import ParallelDims
+from ..patterns import module_name_matches
 
 logger = get_logger(__name__)
 
 __all__ = [
     "apply_fsdp",
     "apply_fsdp_to_decoder",
+    "apply_fsdp_by_pattern",
     "disable_fsdp_gradient_division",
     "enable_fsdp_symm_mem",
     "fsdp_shard_size",
     "get_fsdp_reshard_after_forward_policy",
     "iter_fsdp_modules",
     "iter_transformer_layers",
+    "set_fsdp_prefetch_windows",
     "resolve_fsdp_mesh",
     "resolve_sparse_fsdp_mesh",
 ]
+
+
+def apply_fsdp_by_pattern(
+    model: nn.Module,
+    *,
+    dp_mesh: DeviceMesh,
+    cfg: ParallelConfig,
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+) -> None:
+    """Apply native FSDP2 units selected by extended module patterns."""
+    if cfg.fsdp_implementation != "native":
+        raise RuntimeError(
+            "custom fine-grained FSDP requires its multi-stream state engine; "
+            "the native pattern path cannot emulate it"
+        )
+    named = dict(model.named_modules())
+    ignored_names = {
+        name
+        for name in named
+        if any(
+            module_name_matches(pattern, name) for pattern in cfg.fsdp_ignored_modules
+        )
+    }
+    for pattern in cfg.fsdp_ignored_modules:
+        if not any(module_name_matches(pattern, name) for name in named):
+            raise ValueError(f"FSDP ignored pattern {pattern!r} matched no module")
+    ignored_params = {
+        parameter
+        for name in ignored_names
+        for parameter in named[name].parameters(recurse=True)
+    }
+    selected: dict[str, dict[str, Any]] = {}
+    for pattern, overrides in cfg.fsdp_apply_modules.items():
+        matches = [
+            name
+            for name in named
+            if name and name not in ignored_names and module_name_matches(pattern, name)
+        ]
+        if not matches:
+            raise ValueError(f"FSDP apply pattern {pattern!r} matched no module")
+        for name in matches:
+            selected.setdefault(name, {}).update(overrides)
+    if not selected:
+        raise ValueError("fsdp_apply_modules selected no FSDP unit")
+
+    common: dict[str, Any] = {
+        "mesh": dp_mesh,
+        "mp_policy": MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            cast_forward_inputs=False,
+        ),
+        "ignored_params": ignored_params,
+    }
+    if cfg.fsdp_cpu_offload:
+        common["offload_policy"] = CPUOffloadPolicy(
+            pin_memory=cfg.fsdp_cpu_offload_pin_memory
+        )
+    ordered_names = sorted(selected, key=lambda name: name.count("."), reverse=True)
+    for name in ordered_names:
+        fully_shard(named[name], **common, **selected[name])
+    fully_shard(model, **common)
+    units = [module for name, module in named.items() if name in selected]
+    set_fsdp_prefetch_windows(
+        units,
+        forward_count=cfg.fsdp_forward_prefetch_count,
+        backward_count=cfg.fsdp_backward_prefetch_count,
+    )
+    disable_fsdp_gradient_division(model)
+
+
+def set_fsdp_prefetch_windows(
+    modules: list[nn.Module], *, forward_count: int, backward_count: int
+) -> None:
+    """Configure exact forward/backward prefetch windows in execution order."""
+    if forward_count < 0 or backward_count < 0:
+        raise ValueError("FSDP prefetch counts must be nonnegative")
+    for index, module in enumerate(modules):
+        forward = modules[index + 1 : index + 1 + forward_count]
+        if forward:
+            module.set_modules_to_forward_prefetch(forward)  # type: ignore[attr-defined]
+        backward = list(reversed(modules[max(0, index - backward_count) : index]))
+        if backward:
+            module.set_modules_to_backward_prefetch(backward)  # type: ignore[attr-defined]
 
 
 def iter_transformer_layers(layers: nn.Module) -> Iterator[tuple[Any, nn.Module]]:
@@ -228,6 +316,8 @@ def apply_fsdp_to_decoder(
     ep_degree: int = 1,
     edp_mesh: DeviceMesh | None = None,
     symm_mem_scope: str | None = None,
+    forward_prefetch_count: int = 0,
+    backward_prefetch_count: int = 0,
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -450,47 +540,26 @@ def apply_fsdp_to_decoder(
     if cpu_offload:
         logger.info("Applied CPU Offloading to the model")
 
-    # NOTE: set up explicit prefetching when EP is enabled, as D2H syncs
-    # in EP could interfere with implicit prefetching in FSDP
-    if ep_degree == 1:
-        return
-
-    # set up explicit prefetching when EP is enabled for forward
-    transformer_blocks = [block for _, block in iter_transformer_layers(model.layers)]
-    next_transformer_blocks = transformer_blocks[1:] + [None]
-
-    if model.tok_embeddings is not None and transformer_blocks:
-        model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
-
-    for transformer_block, next_transformer_block in zip(
-        transformer_blocks, next_transformer_blocks, strict=False
-    ):
-        if next_transformer_block is not None:
-            # pyrefly: ignore [not-callable]
-            transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
-        elif model.norm is not None and model.lm_head is not None:
-            # pyrefly: ignore [not-callable]
-            transformer_block.set_modules_to_forward_prefetch(
-                [model.norm, model.lm_head]
+    # EP keeps its historical one-unit explicit prefetch by default because
+    # device/host synchronization in dispatch can disrupt implicit prefetch.
+    forward_window = forward_prefetch_count or (1 if ep_degree > 1 else 0)
+    backward_window = backward_prefetch_count or (1 if ep_degree > 1 else 0)
+    if forward_window or backward_window:
+        execution_order = [
+            module
+            for module in (
+                model.tok_embeddings,
+                *[block for _, block in iter_transformer_layers(model.layers)],
+                model.norm,
+                model.lm_head,
             )
-
-    # set up explicit prefetching when EP is enabled for backward
-    # pyrefly: ignore [no-matching-overload]
-    reversed_transformer_blocks = list(reversed(transformer_blocks))
-    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
-
-    if model.norm is not None and model.lm_head is not None and transformer_blocks:
-        model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
-
-    for transformer_block, prev_transformer_block in zip(
-        reversed_transformer_blocks, prev_transformer_blocks, strict=False
-    ):
-        if prev_transformer_block is not None:
-            # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
-        elif model.tok_embeddings is not None:
-            # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
+            if isinstance(module, FSDPModule)
+        ]
+        set_fsdp_prefetch_windows(
+            execution_order,
+            forward_count=forward_window,
+            backward_count=backward_window,
+        )
 
 
 def force_sum_grad_reduction(model: torch.nn.Module) -> None:
@@ -537,6 +606,12 @@ def apply_fsdp(
     """
     if parallel_dims is None:
         return model
+    if getattr(cfg, "fsdp_implementation", "native") == "custom":
+        raise RuntimeError(
+            "fsdp_implementation='custom' is not available until the "
+            "fine-grained multi-stream state engine is installed; refusing "
+            "to silently run native FSDP"
+        )
 
     storage_mesh = resolve_fsdp_mesh(parallel_dims)
     edp_mesh = resolve_sparse_fsdp_mesh(parallel_dims)
@@ -566,6 +641,18 @@ def apply_fsdp(
         param_dtype = torch.get_default_dtype()
     reduce_dtype = torch.float32
 
+    if getattr(cfg, "fsdp_apply_modules", None):
+        apply_fsdp_by_pattern(
+            model,
+            dp_mesh=storage_mesh,
+            cfg=cfg,
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+        )
+        if dist_utils.is_distributed() and dist_utils.get_backend() != "nccl":
+            force_sum_grad_reduction(model)
+        return model
+
     apply_fsdp_to_decoder(
         model,
         storage_mesh,
@@ -578,6 +665,8 @@ def apply_fsdp(
         ep_degree=parallel_dims.ep,
         edp_mesh=edp_mesh,
         symm_mem_scope=(cfg.fsdp_symm_mem_scope if cfg.enable_fsdp_symm_mem else None),
+        forward_prefetch_count=getattr(cfg, "fsdp_forward_prefetch_count", 0),
+        backward_prefetch_count=getattr(cfg, "fsdp_backward_prefetch_count", 0),
     )
     # ``apply_fsdp_to_decoder`` already calls ``disable_fsdp_gradient_division``
     # and, when asked, ``enable_fsdp_symm_mem``; do not repeat them here.

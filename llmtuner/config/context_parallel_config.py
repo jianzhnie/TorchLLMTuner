@@ -7,6 +7,14 @@ CP_LOAD_BALANCERS = frozenset({None, "headtail", "ptrr"})
 
 
 def validate_context_parallel_config(cfg) -> None:
+    if cfg.context_parallel_size != 1 and (
+        cfg.context_parallel_kv_allgather_size != 1
+        or cfg.context_parallel_ulysses_size != 1
+    ):
+        raise ConfigError(
+            "context_parallel_size cannot be combined with explicit "
+            "context_parallel_kv_allgather_size/context_parallel_ulysses_size"
+        )
     if cfg.context_parallel_load_balancer == "":
         raise ConfigError(
             "parallel.context_parallel_load_balancer cannot be an empty "
@@ -36,6 +44,13 @@ def validate_context_parallel_config(cfg) -> None:
         raise UnsupportedCombinationError(
             "parallel.context_parallel_strategy='ulysses' requires "
             "context_parallel_load_balancer=None."
+        )
+    if (
+        cfg.context_parallel_ulysses_size > 1
+        and cfg.context_parallel_load_balancer is not None
+    ):
+        raise UnsupportedCombinationError(
+            "the Ulysses CP axis requires context_parallel_load_balancer=None"
         )
 
 

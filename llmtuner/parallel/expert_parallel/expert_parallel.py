@@ -49,6 +49,7 @@ def apply_ep(
         ep_group=ep_group,
         router_aux_loss_coef=cfg.router_aux_loss_coef,
         quantile_balancing=cfg.moe_quantile_balancing,
+        fixed_router=getattr(cfg, "fixed_router", False),
         token_dispatcher=cfg.ep_token_dispatcher,
         torchao_pad_multiple=cfg.ep_torchao_pad_multiple,
         tp_enabled=cfg.tp > 1,
