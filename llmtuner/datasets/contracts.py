@@ -1,29 +1,28 @@
-"""Shared data-pipeline types.
+"""Shared data contracts: build context, iteration policy, samples, and batches.
 
-Vendored from torchtitan ``components/data/types.py``. Both dataclasses are
-frozen values passed down the build, never mutated, so ``slots=True`` is safe
-here -- nothing subclasses them.
-
-``Batch`` (the synthetic path's micro-batch container) also lives here rather
-than in ``synthetic.py``: consumers of the *type* -- the model wrapper's
-``preprocess_inputs``, the trainer's batch handling -- must not have to import
-the synthetic source itself. A models-layer file importing a data source was
-the dependency inversion that placement caused.
+Processors, collators, and loaders import these types without depending on the
+recipe composition or loader assembly modules. Runtime context and iteration
+policy are adapted from torchtitan ``components/data/types.py``.
 """
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 import grain.python as grain
+import numpy as np
 import torch
 
-from ..components.tokenizer import BaseTokenizer
+from ..components.tokenizer.base import BaseTokenizer
 
 __all__ = [
     "Batch",
     "DatasetBuildContext",
     "DatasetIterationPolicy",
+    "SampleProcessor",
+    "TextSequence",
     "require_positive",
 ]
 
@@ -87,3 +86,52 @@ class Batch:
 
     input_ids: torch.Tensor
     labels: torch.Tensor
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class TextSequence:
+    """Next-token-aligned text preserved through composition and packing.
+
+    NOTE: It is the dataset's processor responsibility to shift tokens into
+    aligned input and label pairs. The trainer does not do it.
+    """
+
+    input_ids: np.ndarray
+    """Tokens provided to the model."""
+    labels: np.ndarray
+    """Target for each input token, with `IGNORE_INDEX` where loss is disabled."""
+    positions: np.ndarray | None = None
+    """Per-token positions; `None` until packing or collation materializes them."""
+    padding_mask: np.ndarray | None = None
+    """Per-token mask that is true for padding; `None` before padding."""
+
+    def __post_init__(self) -> None:
+        lengths = [len(self.input_ids), len(self.labels)]
+        if self.positions is not None:
+            lengths.append(len(self.positions))
+        if self.padding_mask is not None:
+            lengths.append(len(self.padding_mask))
+        if len(set(lengths)) != 1:
+            raise ValueError(
+                f"TextSequence fields must have equal lengths, got {lengths}"
+            )
+
+
+class SampleProcessor(ABC):
+    """Row processor using Grain-provided deterministic randomness.
+
+    A subclass takes whatever it needs from ``context`` -- the tokenizer, the
+    context length -- and encodes it in ``__init__``; ``__call__`` is the
+    per-row transform. Both halves run in the data pipeline, so anything read
+    here must already be set up by the time :func:`build_dataset` runs.
+    """
+
+    def __init__(self, *, context: DatasetBuildContext) -> None:
+        del context
+
+    @abstractmethod
+    def __call__(
+        self,
+        sample: Any,
+        rng: np.random.Generator,
+    ) -> Any: ...

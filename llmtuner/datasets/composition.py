@@ -27,15 +27,13 @@ different numbers of surviving rows, and the loader's even-step assumption
 from __future__ import annotations
 
 import math
-from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, TypeAlias, cast
 
 import grain.python as grain
-import numpy as np
 
-from .contracts import DatasetBuildContext, DatasetIterationPolicy
+from .contracts import DatasetBuildContext, DatasetIterationPolicy, SampleProcessor
 from .sources import (
     HuggingFaceRandomAccessSource,
     HuggingFaceStreamingSource,
@@ -48,9 +46,7 @@ __all__ = [
     "DatasetConcat",
     "DatasetMix",
     "GrainDataset",
-    "SampleProcessor",
     "SingleDataset",
-    "TextSequence",
     "WeightedDataset",
     "as_iter_dataset",
     "build_dataset",
@@ -58,55 +54,6 @@ __all__ = [
 ]
 
 GrainDataset: TypeAlias = grain.MapDataset | grain.IterDataset
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class TextSequence:
-    """Next-token-aligned text preserved through composition and packing.
-
-    NOTE: It is the dataset's processor responsibility to shift tokens into
-    aligned input and label pairs. The trainer does not do it.
-    """
-
-    input_ids: np.ndarray
-    """Tokens provided to the model."""
-    labels: np.ndarray
-    """Target for each input token, with `IGNORE_INDEX` where loss is disabled."""
-    positions: np.ndarray | None = None
-    """Per-token positions; `None` until packing or collation materializes them."""
-    padding_mask: np.ndarray | None = None
-    """Per-token mask that is true for padding; `None` before padding."""
-
-    def __post_init__(self) -> None:
-        lengths = [len(self.input_ids), len(self.labels)]
-        if self.positions is not None:
-            lengths.append(len(self.positions))
-        if self.padding_mask is not None:
-            lengths.append(len(self.padding_mask))
-        if len(set(lengths)) != 1:
-            raise ValueError(
-                f"TextSequence fields must have equal lengths, got {lengths}"
-            )
-
-
-class SampleProcessor(ABC):
-    """Row processor using Grain-provided deterministic randomness.
-
-    A subclass takes whatever it needs from ``context`` -- the tokenizer, the
-    context length -- and encodes it in ``__init__``; ``__call__`` is the
-    per-row transform. Both halves run in the data pipeline, so anything read
-    here must already be set up by the time :func:`build_dataset` runs.
-    """
-
-    def __init__(self, *, context: DatasetBuildContext) -> None:
-        del context
-
-    @abstractmethod
-    def __call__(
-        self,
-        sample: Any,
-        rng: np.random.Generator,
-    ) -> Any: ...
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)

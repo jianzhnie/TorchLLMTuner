@@ -43,7 +43,7 @@ import llmtuner.parallel.fully_shard_parallel.fully_shard_parallel as fsdp_modul
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
 from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
-from llmtuner.models.common.moe.token_dispatch import LocalTokenDispatcher
+from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp_to_decoder,
     enable_fsdp_symm_mem,

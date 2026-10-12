@@ -14,9 +14,7 @@ import grain.python as grain
 import numpy as np
 
 from ...components.loss import IGNORE_INDEX
-from ..graph import (
-    TextSequence,
-)
+from ..contracts import TextSequence
 
 
 class DocumentAwareConcatThenSplitIterDataset(grain.IterDataset):

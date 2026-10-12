@@ -12,7 +12,7 @@ Members:
   by-name process-group queries) that trainer and ``models/common`` read.
 * ``distributed.py`` -- process-group bootstrap and rank/world queries, vendored
   from OpenMMLab's ``mmengine.dist`` and de-mmengine'd to depend only on torch.
-* ``tensors.py`` -- nested tensor device inspection and movement.
+* ``tensor_tree.py`` -- nested tensor device inspection and movement.
 
 ``distributed`` is re-exported here lazily (PEP 562): importing this package or
 a sibling submodule (``llmtuner.accelerator.device`` ...) does not pay for it
@@ -31,10 +31,10 @@ from ..utils.lazy_exports import export_names, resolve_export
 
 _EXPORT_SOURCES = {
     "barrier": "distributed",
-    "cast_data_device": "tensors",
+    "move_tensor_tree": "tensor_tree",
     "get_backend": "distributed",
     "get_comm_device": "distributed",
-    "get_data_device": "tensors",
+    "get_tensor_tree_device": "tensor_tree",
     "get_dist_info": "distributed",
     "get_rank": "distributed",
     "get_world_size": "distributed",

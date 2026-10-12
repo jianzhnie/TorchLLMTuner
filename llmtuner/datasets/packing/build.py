@@ -13,14 +13,14 @@ from functools import partial
 import grain.python as grain
 
 from ...components.loss import IGNORE_INDEX
-from ..contracts import DatasetBuildContext, DatasetIterationPolicy, require_positive
-from ..graph import (
+from ..composition import (
     DatasetConcat,
     DatasetMix,
     SingleDataset,
     as_iter_dataset,
     build_dataset,
 )
+from ..contracts import DatasetBuildContext, DatasetIterationPolicy, require_positive
 from .conversions import (
     packing_output_is_full,
     packing_output_to_text_sequence,

@@ -5,7 +5,7 @@ from llmtuner.models.common.moe.experts import (
     GroupedExperts,
     RoutedExperts,
 )
-from llmtuner.models.common.moe.token_dispatch import LocalTokenDispatcher
+from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
 
 def test_domino_two_slice_execution_matches_unsliced_experts() -> None:

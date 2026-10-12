@@ -18,8 +18,8 @@ from torch import distributed as torch_dist
 from torch.distributed import ProcessGroup
 
 from .device import device_type, get_distributed_backend, set_device
-from .tensors import cast_data_device as cast_data_device
-from .tensors import get_data_device as get_data_device
+from .tensor_tree import get_tensor_tree_device as get_tensor_tree_device
+from .tensor_tree import move_tensor_tree as move_tensor_tree
 
 
 def is_distributed() -> bool:

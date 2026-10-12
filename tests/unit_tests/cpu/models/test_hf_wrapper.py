@@ -289,8 +289,8 @@ def test_the_mask_type_follows_the_corpus_rather_than_being_configured() -> None
 
     ``build_model_config_for`` derives ``attn_mask_type`` from the dataset
     selector because the two cannot be set independently without one of them
-    being wrong: every non-random corpus is packed by ``datasets/factory.py``, and
-    nothing in the config names packing separately. Setting it by hand -- which
+    being wrong: every non-random corpus is packed by the loader builder,
+    and nothing in the config names packing separately. Setting it by hand -- which
     is what the equivalence tests used to do -- is the drift this prevents.
     """
     from dataclasses import replace

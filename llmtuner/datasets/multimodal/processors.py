@@ -71,12 +71,8 @@ import torch
 from ...components.loss import IGNORE_INDEX
 from ...components.tokenizer import MultimodalTokenizer
 from ...utils.logging import get_logger
-from ..contracts import DatasetBuildContext
-from ..graph import (
-    SampleProcessor,
-    SingleDataset,
-    is_not_none,
-)
+from ..composition import SingleDataset, is_not_none
+from ..contracts import DatasetBuildContext, SampleProcessor
 from ..sources import HuggingFaceStreamingSource
 from .image import calculate_vision_tokens, process_image, resize_to_pixel_budget
 from .placeholders import insert_vision_placeholders

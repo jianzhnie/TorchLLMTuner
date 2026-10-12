@@ -14,7 +14,7 @@
 | `llmtuner/accelerator/device.py` | 已阅读 | 设备发现、环境 rank、后端映射及设备设置。 |
 | `llmtuner/accelerator/distributed.py` | 已阅读 | 三类 launcher、PG 查询和通信设备；修复 MPI LOCAL_RANK 缺失。 |
 | `llmtuner/accelerator/spmd.py` | 已阅读 | 线程局部 mesh 栈、dense/sparse 注册、嵌套上下文恢复。 |
-| `llmtuner/accelerator/tensors.py` | 已阅读 | 嵌套张量转换、设备查询；泛 Iterable/Mapping 构造行为需深入核对。 |
+| `llmtuner/accelerator/tensor_tree.py` | 已阅读 | 统一张量树遍历、容器重建和 out 结构预校验；覆盖 namedtuple/defaultdict、键顺序、混合设备与失败前无写入。 |
 | `llmtuner/components/__init__.py` | 已阅读 | 包入口及公开导出；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/checkpointer/__init__.py` | 已阅读 | __getattr__、__dir__；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/checkpointer/base.py` | 已阅读 | purge_thread、shares_storage、ModelWrapper、CheckpointStorage、BaseCheckpointManager；检查训练服务状态、错误路径、持久化及资源生命周期。 |
@@ -28,7 +28,7 @@
 | `llmtuner/components/optimizer/ema.py` | 已阅读 | EMAParamOptimizer、EMA；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/optimizer/lr_scheduler.py` | 已阅读 | wsd_factor、LRSchedulersContainer、build_lr_scheduler；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/optimizer/optimizer.py` | 已阅读 | fused_kernel_device_types、OptimizersContainer；检查训练服务状态、错误路径、持久化及资源生命周期。 |
-| `llmtuner/components/optimizer/utils.py` | 已阅读 | init_optim_state、get_flat_optim_state_dict、load_flat_optim_state_dict、optim_state_dict_to_fqn_keys、unflatten_optim_state_dict；检查训练服务状态、错误路径、持久化及资源生命周期。 |
+| `llmtuner/components/optimizer/state_dict.py` | 已阅读 | init_optim_state、get_flat_optim_state_dict、load_flat_optim_state_dict、optim_state_dict_to_fqn_keys、unflatten_optim_state_dict；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/profiler.py` | 已阅读 | MemoryProfiler、Profiler、caused_by_oom；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/tokenizer/__init__.py` | 已阅读 | 包入口及公开导出；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/tokenizer/base.py` | 已阅读 | BaseTokenizer；检查训练服务状态、错误路径、持久化及资源生命周期。 |
@@ -57,8 +57,8 @@
 | `llmtuner/datasets/collators.py` | 已阅读 | Collator、TextCollator；检查样本/标签对齐、分片、打包、迭代终止及恢复路径。 |
 | `llmtuner/datasets/contracts.py` | 已阅读 | require_positive、DatasetBuildContext、DatasetIterationPolicy、Batch；检查样本/标签对齐、分片、打包、迭代终止及恢复路径。 |
 | `llmtuner/datasets/dataloader.py` | 已阅读 | DataloaderExhaustedError、require_same_dp_degree、BaseDataLoader、GrainDataLoader；检查样本/标签对齐、分片、打包、迭代终止及恢复路径。 |
-| `llmtuner/datasets/factory.py` | 已阅读 | _resolve_multimodal_recipe、_resolve_text_recipe、build_dataloader；检查样本/标签对齐、分片、打包、迭代终止及恢复路径。 |
-| `llmtuner/datasets/graph.py` | 已阅读 | TextSequence、SampleProcessor、SingleDataset、is_not_none、as_iter_dataset；检查样本/标签对齐、分片、打包、迭代终止及恢复路径。 |
+| `llmtuner/datasets/loader_builder.py` | 已阅读 | _resolve_multimodal_recipe、_resolve_text_recipe、build_dataloader；检查样本/标签对齐、分片、打包、迭代终止及恢复路径。 |
+| `llmtuner/datasets/composition.py` | 已阅读 | SingleDataset、DatasetMix、DatasetConcat、is_not_none、as_iter_dataset；检查样本/标签对齐、分片、打包、迭代终止及恢复路径。 |
 | `llmtuner/datasets/multimodal/__init__.py` | 已阅读 | 包入口及公开导出；检查样本/标签对齐、分片、打包、迭代终止及恢复路径。 |
 | `llmtuner/datasets/multimodal/collator.py` | 已阅读 | text_positions、vision_grid_positions、MultimodalCollator；检查样本/标签对齐、分片、打包、迭代终止及恢复路径。 |
 | `llmtuner/datasets/multimodal/image.py` | 已阅读 | decode_image、smart_resize、resize_to_pixel_budget、resize_to_navit_patch_grid、process_image；检查样本/标签对齐、分片、打包、迭代终止及恢复路径。 |
@@ -82,7 +82,7 @@
 | `llmtuner/models/__init__.py` | 已阅读 | 包入口及公开导出；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/common/__init__.py` | 已阅读 | __getattr__、__dir__；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/common/activation.py` | 已阅读 | ActivationFn、SwiGLU；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
-| `llmtuner/models/common/async_linear.py` | 已阅读 | warn_once_no_tp_overlap、validate_dist_gemm_preconditions、AllGatherFusedQKVLinear、RowParallelLinear、DistGEMMFeedForward；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
+| `llmtuner/models/common/tp_projections.py` | 已阅读 | warn_once_no_tp_overlap、validate_tp_projection_preconditions、AllGatherFusedQKVLinear、RowParallelLinear、TensorParallelFeedForward；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/common/attention/__init__.py` | 已阅读 | 包入口及公开导出；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/common/attention/masks.py` | 已阅读 | VarlenMetadata、round_up、get_causal_mask_mod、get_document_mask_mod、get_efficient_causal_mask_mod_for_packed_document；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/common/attention/qkv.py` | 已阅读 | local_head_split、QKVLinear；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
@@ -97,7 +97,7 @@
 | `llmtuner/models/common/moe/experts.py` | 已阅读 | grouped_mm_available、GroupedExperts、RoutedExperts、DominoRoutedExperts；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/common/moe/layer.py` | 已阅读 | MoE、iter_moe_layers；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/common/moe/routing.py` | 已阅读 | TokenChoiceTopKRouter、QuantileBalancedTopKRouter、QuantileBalancer；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
-| `llmtuner/models/common/moe/token_dispatch.py` | 已阅读 | materialize、LocalDispatchMetadata、AllToAllDispatchMetadata、LocalTokenDispatcher、BaseEPTokenDispatcher；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
+| `llmtuner/parallel/expert_parallel/token_dispatch.py` | 已阅读 | materialize、LocalDispatchMetadata、AllToAllDispatchMetadata、LocalTokenDispatcher、BaseEPTokenDispatcher；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/common/multimodal.py` | 已阅读 | get_vision_positions、build_vision_bank_indices、gather_vision_embeds、scatter_vision_embeds；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/common/rope.py` | 已阅读 | maybe_check_max_pos、yarn_inv_freq、RoPEConfig、RoPE、ComplexRoPE；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/common/scatter_add.py` | 已阅读 | deterministic_scatter_add、deterministic_scatter_add_fake、_backward、_setup_context；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
@@ -105,7 +105,6 @@
 | `llmtuner/models/hf/attention_backend.py` | 已阅读 | available_attention_backend、flex_attention_adapter、uses_deepseek_sparse_attention、register_attention_backend；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/hf/factory.py` | 已阅读 | build_model_config、build_model_config_for、num_flops_per_token、unwrap_text_config、resolve_model_class；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/hf/flops.py` | 已阅读 | quadratic_attention_flops_per_token、MoEGeometry、flops_per_token、int_attr、first_int_attr；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
-| `llmtuner/models/hf/input_processing.py` | 已阅读 | collapse_batch_dims、document_shift；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/hf/model.py` | 已阅读 | HFTransformerModel；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/hf/model_setup.py` | 已阅读 | first_present、validate_head_config、resolve_experts_implementation、apply_cast_lm_head；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
 | `llmtuner/models/hf/state_dict_adapter.py` | 已阅读 | HFTransformerStateDictAdapter；检查张量形状、前向/反向、状态转换和模型兼容性边界。 |
@@ -165,8 +164,8 @@
 
 ## 后续验证与限制
 
-- 已逐个阅读 148/148 个 Python 文件；这是实现审查覆盖，不等于所有组合均已运行通过。
-- accelerator/tensors.py 的泛 Iterable/Mapping 构造约定需进一步收窄或实现；训练归约调用只传 Tensor。
+- 已逐个阅读 147/147 个 Python 文件；这是实现审查覆盖，不等于所有组合均已运行通过。
+- accelerator/tensor_tree.py 已明确支持容器范围，out 结构在复制前递归校验；训练归约调用只传 Tensor。
 - 日志祖先传播、allocator memory history 退出关闭、指标构建失败清理仍需专项优化。
 - KV AllGather × Ulysses 的 token 重排和 mask 对齐须多设备等价性验证；不能由 CPU 测试推定正确。
 - KCP 依赖 Ascend FLA，新增 degree 和拒绝路径可在 CPU 验证，KDA 算子数值尚未实测。
@@ -178,4 +177,21 @@
 - `pytest -q --disable-warnings`：1119 passed、10 skipped。
 - `pre-commit run --all-files`：全部通过（包含 Ruff lint/format）。
 - `python -m compileall -q llmtuner`、`git diff HEAD --check`：通过。
-- 清单与当前源文件集合一致：148 条，无缺失、无重复。
+- 清单与当前源文件集合一致：147 条，无缺失、无重复。
+
+## 本轮结构调整
+
+- EP dispatch 实现整体迁移至 `parallel/expert_parallel/token_dispatch.py`。
+- 优化器状态管理集中于 `components/optimizer/state_dict.py`。
+- TP 模型构件改名为 `models/common/tp_projections.py`；前馈类使用
+  `TensorParallelFeedForward`，前置检查使用 `validate_tp_projection_preconditions`。
+- 删除 HF `input_processing.py`：reshape 直接放在唯一调用方
+  `preprocess_inputs`，目标构造直接复用 `components.loss.next_token_targets`。
+- 当前源文件数为 147；合并后的预处理逻辑继续在 `models/hf/model.py` 中审查。
+
+- 设备树模块改为 `accelerator/tensor_tree.py`，公开函数改为
+  `get_tensor_tree_device` 和 `move_tensor_tree`；旧名称删除并更新全部调用方。
+
+- 数据契约集中在 `datasets/contracts.py`：`TextSequence` 和 `SampleProcessor`
+  从构建模块迁入；配方组合与 Grain 构建改为 `datasets/composition.py`，
+  dataloader 装配改为 `datasets/loader_builder.py`。旧模块删除，消费者直接引用定义模块。

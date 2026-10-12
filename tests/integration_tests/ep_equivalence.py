@@ -23,7 +23,7 @@ import torch.distributed as dist
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
 from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
-from llmtuner.models.common.moe.token_dispatch import (
+from llmtuner.parallel.expert_parallel.token_dispatch import (
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
 )

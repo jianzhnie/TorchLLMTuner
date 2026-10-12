@@ -2,7 +2,7 @@
 
 These modules fold a TP collective into a GEMM. With TP off there is no
 collective, so what is left to test is the arithmetic -- and for
-``DistGEMMFeedForward`` that arithmetic has a trap: the fused ``w13`` stores gate
+``TensorParallelFeedForward`` that arithmetic has a trap: the fused ``w13`` stores gate
 and up *interleaved* (``[g0, u0, g1, u1, ...]``), not as two contiguous halves.
 Both pairings produce a correctly-shaped output, so a wrong one trains silently.
 The tests below pin the interleaving, and assert the halves-split is genuinely a
@@ -25,13 +25,13 @@ import pytest
 import torch
 
 from llmtuner.models.common.activation import SwiGLU
-from llmtuner.models.common.async_linear import (
-    AllGatherFusedQKVLinear,
-    DistGEMMFeedForward,
-    RowParallelLinear,
-    validate_dist_gemm_preconditions,
-)
 from llmtuner.models.common.attention.qkv import QKVLinear
+from llmtuner.models.common.tp_projections import (
+    AllGatherFusedQKVLinear,
+    RowParallelLinear,
+    TensorParallelFeedForward,
+    validate_tp_projection_preconditions,
+)
 
 DIM = 16
 HIDDEN = 32
@@ -45,9 +45,9 @@ def _x(rows: int = 5, seed: int = 1) -> torch.Tensor:
     return torch.randn(rows, DIM, generator=torch.Generator().manual_seed(seed))
 
 
-def _ffn(seed: int = 0) -> DistGEMMFeedForward:
+def _ffn(seed: int = 0) -> TensorParallelFeedForward:
     torch.manual_seed(seed)
-    return DistGEMMFeedForward(
+    return TensorParallelFeedForward(
         w13=torch.nn.Linear(DIM, 2 * HIDDEN, bias=False),
         w2=torch.nn.Linear(HIDDEN, DIM, bias=False),
         activation_fn=SwiGLU(),
@@ -60,14 +60,14 @@ def _ffn(seed: int = 0) -> DistGEMMFeedForward:
 def test_preconditions_require_sequence_parallelism() -> None:
     """Without SP there are no boundary collectives for the GEMMs to replace."""
     with pytest.raises(ValueError, match="enable_sequence_parallel"):
-        validate_dist_gemm_preconditions(enable_sp=False)
+        validate_tp_projection_preconditions(enable_sp=False)
 
 
 def test_preconditions_accept_sequence_parallelism() -> None:
-    validate_dist_gemm_preconditions(enable_sp=True)
+    validate_tp_projection_preconditions(enable_sp=True)
 
 
-# -- DistGEMMFeedForward -----------------------------------------------------
+# -- TensorParallelFeedForward -----------------------------------------------------
 
 
 def test_feed_forward_falls_back_without_tp() -> None:
@@ -105,7 +105,7 @@ def test_feed_forward_splits_gate_and_up_interleaved() -> None:
         # Make the two halves clearly distinguishable.
         w13.weight[:HIDDEN].normal_(0, 0.1)
         w13.weight[HIDDEN:].normal_(5.0, 0.1)
-    ffn = DistGEMMFeedForward(w13=w13, w2=w2, activation_fn=SwiGLU())
+    ffn = TensorParallelFeedForward(w13=w13, w2=w2, activation_fn=SwiGLU())
     x = _x()
 
     with torch.no_grad():
@@ -134,8 +134,12 @@ def test_feed_forward_uses_the_given_activation() -> None:
             return 2 * gate * up
 
     with torch.no_grad():
-        swiglu_out = DistGEMMFeedForward(w13=w13, w2=w2, activation_fn=SwiGLU())(x)
-        other_out = DistGEMMFeedForward(w13=w13, w2=w2, activation_fn=DoubleGate())(x)
+        swiglu_out = TensorParallelFeedForward(w13=w13, w2=w2, activation_fn=SwiGLU())(
+            x
+        )
+        other_out = TensorParallelFeedForward(
+            w13=w13, w2=w2, activation_fn=DoubleGate()
+        )(x)
 
     with pytest.raises(AssertionError):
         torch.testing.assert_close(swiglu_out, other_out, rtol=1e-5, atol=1e-8)
@@ -143,7 +147,7 @@ def test_feed_forward_uses_the_given_activation() -> None:
 
 def test_feed_forward_warns_when_tp_is_off(caplog) -> None:
     """Silently running unfused is the failure mode the warning exists for."""
-    import llmtuner.models.common.async_linear as dg
+    import llmtuner.models.common.tp_projections as dg
 
     dg._WARNED_NO_TP = False
     ffn = _ffn()
@@ -156,7 +160,7 @@ def test_feed_forward_warns_when_tp_is_off(caplog) -> None:
 
 def test_feed_forward_warns_only_once(caplog) -> None:
     """A per-step warning would flood the log; one per process is enough."""
-    import llmtuner.models.common.async_linear as dg
+    import llmtuner.models.common.tp_projections as dg
 
     dg._WARNED_NO_TP = False
     ffn = _ffn()

@@ -1,24 +1,7 @@
-"""Factory functions that turn configuration into a built object.
+"""Assemble dataloaders from run configuration and data-parallel ownership.
 
-These sit one level above the modules whose classes they assemble, and that is
-what they are for: ``dataloader.py`` and ``lr_scheduler.py`` hold one implementation
-each and must not depend on their siblings, while a factory has to know all of
-them. Building a dataloader means reading the recipe registry, constructing the
-tokenizer, deriving the iteration policy and packing the graph -- four modules
-whose only thing in common is that this function calls them.
-
-The other direction is what does not belong here. A class that carries a builder
-of its own suggests the data it produces is one of its fields, and for a config
-it is not: ``DataloaderConfig`` is a parsed description, and building from it is
-a separate act with its own arguments (which rank am I, how many tokens per
-batch). Keeping them apart also keeps ``datasets/`` and ``components/`` free of
-any reference back to ``trainer/``.
-
-Same shape as ``components/optimizer/lr_scheduler.build_lr_scheduler``, which exists for
-the same reason. Both take the whole run config and read their own fields off
-it rather than taking those fields restated as loose scalars: a scalar restated
-at the call site can drift from the field the config carries, and half of the
-ones this used to take had already stopped being read at all.
+Resolve a text or multimodal recipe, build its tokenizer and packing graph,
+then construct the loader. Synthetic data bypasses tokenizer and packing setup.
 """
 
 from __future__ import annotations

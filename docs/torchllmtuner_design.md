@@ -146,7 +146,7 @@ G1 决定模型层只能依赖 HF 公共约定（`config.architectures`、常见
 +---------------------------------------------------------------+
                           |
 +---------------------------------------------------------------+
-|  models/common/*  (rope, masks, qkv, aux_loss, moe, async_linear)|
+|  models/common/*  (rope, masks, qkv, aux_loss, moe, tp_projections)|
 |    通过上下文取 group, 不接收 cfg, 不 import trainer            |
 +---------------------------------------------------------------+
 ```
@@ -155,9 +155,9 @@ G1 决定模型层只能依赖 HF 公共约定（`config.architectures`、常见
 明确保留三处"models 依赖下层原语"的例外（语义上合理，不为消依赖
 制造更差的结构）：
 
-1. `models/common/async_linear.py` -> `parallel/tensor_parallel/linear_ops.py`：async_linear
+1. `models/common/tp_projections.py` -> `parallel/tensor_parallel/linear_ops.py`：tp_projections
    只是 fused collective+GEMM 原语的接线与 fallback，原语属 parallel 层（与
-   `apply_tp` 同源），上移 async_linear 会把模型构件塞进装配层，下移 linear 会把
+   `apply_tp` 同源），上移 tp_projections 会把模型构件塞进装配层，下移 linear 会把
    TP 引擎依赖拖进 models。
 2. `models/common/embedding.py` -> `components.loss`（`vocab_shard_bounds`）：
    vocab 并行 embedding 的分片边界是 loss 层共用的纯函数词汇表，反向移动会让
@@ -196,7 +196,7 @@ llmtuner/
                                 包装/构造/FLOPs/checkpoint 键）
                                 + common/{rope,activation,linear,feed_forward,
                                 embedding,cast_linear,multimodal,scatter_add,
-                                aux_loss,async_linear}.py + attention/（qkv+masks）
+                                aux_loss,tp_projections}.py + attention/（qkv+masks）
                                 + moe/（block/router/experts/dispatcher/
                                 load_balance/balancing）
   parallel/    24 文件          tensor_parallel/(tp+apply+linear)
@@ -741,7 +741,7 @@ dataloader cursor 均未变化，模型权重的导出和重载与之前完全�
 
 ### `attn_mask_type` 是推导值，不是配置项
 
-每个非 random 语料都是 packed 的：`datasets/factory.py` 总是把样本送进某种 packing
+每个非 random 语料都是 packed 的：`datasets/loader_builder.py` 总是把样本送进某种 packing
 （`datasets/packing/build.py` 的 `build_concat_then_split_packing`（默认）或
 `build_first_fit_packing`），一行里装多个文档，attention 不得跨越文档边界。但
 `attn_mask_type` 没有任何配置通路，它在 mask 处（`hf/model.py`、

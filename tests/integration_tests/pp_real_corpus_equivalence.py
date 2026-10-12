@@ -42,7 +42,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
-from llmtuner.datasets.factory import build_dataloader
+from llmtuner.datasets.loader_builder import build_dataloader
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer

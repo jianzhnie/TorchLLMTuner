@@ -34,9 +34,9 @@ from llmtuner.models.common.moe.bias_update import (
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
 from llmtuner.models.common.moe.layer import MoE, iter_moe_layers
 from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
-from llmtuner.models.common.moe.token_dispatch import LocalTokenDispatcher
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.expert_parallel import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
 try:
     from transformers import AutoConfig
