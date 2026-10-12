@@ -14,7 +14,7 @@ from ..accelerator.capabilities import has as capability
 from ..accelerator.spmd_context import spmd_context
 from ..datasets.loader import TrainerBatch
 from ..datasets.types import Batch
-from ..parallel import matrix
+from ..parallel import compatibility
 
 if TYPE_CHECKING:
     from .trainer import Trainer
@@ -28,7 +28,7 @@ def split_pipeline_microbatches(
     num_microbatches = trainer.cfg.parallel.num_pp_microbatches
     if isinstance(batch, dict):
         if labels.ndim == 1 and num_microbatches > 1:
-            matrix.pp_packed_microbatch_split(num_microbatches)
+            compatibility.pp_packed_microbatch_split(num_microbatches)
         rows_per_microbatch = labels.shape[0] // num_microbatches
         microbatches = []
         for index in range(num_microbatches):

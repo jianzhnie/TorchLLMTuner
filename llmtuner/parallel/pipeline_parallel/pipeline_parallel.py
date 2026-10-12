@@ -43,9 +43,9 @@ from llmtuner.config import ParallelConfig
 from ...accelerator.capabilities import require
 from ...components.loss import cross_entropy_loss
 from ...utils.logger_utils import get_logger
-from .. import matrix
+from .. import compatibility
 from ..parallel_dims import ParallelDims
-from .pipeline import generate_llm_fqn_per_model_part, split_model_into_stages
+from .partition import generate_llm_fqn_per_model_part, split_model_into_stages
 
 logger = get_logger(__name__)
 
@@ -315,12 +315,12 @@ def apply_pp(
     schedule over the stages is built separately (``build_pipeline_schedule``).
     """
     if getattr(model, "enable_weight_tying", False):
-        matrix.pp_weight_tying()
+        compatibility.pp_weight_tying()
     # A DSA model builds its dense mask from tok_embeddings.weight.dtype on
     # every forward; non-first stages hold an nn.Identity there (crashes on
     # the first forward), so refuse at assembly time.
     if getattr(model, "uses_dsa", False):
-        matrix.dsa_pp()
+        compatibility.dsa_pp()
     # The training and eval drivers both need the microbatch-form schedule
     # API; refuse at assembly time rather than dying with a TypeError on the
     # first train step (the public ``step`` fallback takes the same kwargs,

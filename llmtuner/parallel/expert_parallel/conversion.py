@@ -29,9 +29,9 @@ from ...models.common.moe.router import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
-from .. import matrix
-from .ckpt import mark_experts_ep_sharded
-from .probe import (
+from .. import compatibility
+from .checkpoint import mark_experts_ep_sharded
+from .hf_layout import (
     fused_experts_of,
     read_expert_groups,
     read_route_norm,
@@ -86,7 +86,7 @@ def convert_block(
     router_gate = router_of(block)
     assert router_gate is not None  # the probe established this
     if getattr(router_gate, "bias", None) is not None:
-        matrix.router_bias(router_gate)
+        compatibility.router_bias(router_gate)
     experts = fused_experts_of(block)
     assert experts is not None  # the probe established this
 
@@ -111,9 +111,9 @@ def convert_block(
         # range derives from their [0, 1] bound) and routes freely over all
         # experts, so a softmax family or a group-limited one cannot adopt it.
         if score_func != "sigmoid":
-            matrix.quantile_requires_sigmoid(score_func, block)
+            compatibility.quantile_requires_sigmoid(score_func, block)
         if num_expert_groups is not None and num_expert_groups > 1:
-            matrix.quantile_no_group_limit(block)
+            compatibility.quantile_no_group_limit(block)
         router = QuantileBalancedTopKRouter(
             num_experts,
             dim,
@@ -150,16 +150,16 @@ def convert_block(
         dispatcher.wire_meshes(ep_group=ep_group)
         # Flag the stacked expert weights as expert-dim-sharded over the EP
         # group so the checkpointer can all-gather them on save and slice
-        # them back on load (see expert_parallel/ckpt.py).
+        # them back on load (see expert_parallel/checkpoint.py).
         mark_experts_ep_sharded(grouped, ep_group)
 
     shared = getattr(block, "shared_expert", None) or getattr(
         block, "shared_experts", None
     )
     if shared is not None and hasattr(block, "shared_expert_gate"):
-        matrix.shared_expert_gate(block)
+        compatibility.shared_expert_gate(block)
     if shared is not None and tp_enabled:
-        matrix.shared_expert_tp_ep(block)
+        compatibility.shared_expert_tp_ep(block)
 
     routed_experts_cls = (
         DominoRoutedExperts if token_dispatcher == "domino" else RoutedExperts

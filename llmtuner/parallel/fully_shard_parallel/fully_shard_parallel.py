@@ -24,7 +24,7 @@ from llmtuner.config import ParallelConfig
 from ...accelerator import dist_utils
 from ...utils.logger_utils import get_logger
 from ..parallel_dims import ParallelDims
-from ..patterns import module_name_matches
+from .plan import apply_fsdp_by_pattern, set_fsdp_prefetch_windows
 
 logger = get_logger(__name__)
 
@@ -38,94 +38,10 @@ __all__ = [
     "get_fsdp_reshard_after_forward_policy",
     "iter_fsdp_modules",
     "iter_transformer_layers",
-    "set_fsdp_prefetch_windows",
     "resolve_fsdp_mesh",
     "resolve_sparse_fsdp_mesh",
+    "set_fsdp_prefetch_windows",
 ]
-
-
-def apply_fsdp_by_pattern(
-    model: nn.Module,
-    *,
-    dp_mesh: DeviceMesh,
-    cfg: ParallelConfig,
-    param_dtype: torch.dtype,
-    reduce_dtype: torch.dtype,
-) -> None:
-    """Apply native FSDP2 units selected by extended module patterns."""
-    from .fine_grained import get_fsdp_strategy
-
-    strategy = get_fsdp_strategy(cfg.fsdp_implementation)
-    shard_fn = strategy.get_fully_shard_fn()
-    named = dict(model.named_modules())
-    ignored_names = {
-        name
-        for name in named
-        if any(
-            module_name_matches(pattern, name) for pattern in cfg.fsdp_ignored_modules
-        )
-    }
-    for pattern in cfg.fsdp_ignored_modules:
-        if not any(module_name_matches(pattern, name) for name in named):
-            raise ValueError(f"FSDP ignored pattern {pattern!r} matched no module")
-    ignored_params = {
-        parameter
-        for name in ignored_names
-        for parameter in named[name].parameters(recurse=True)
-    }
-    selected: dict[str, dict[str, Any]] = {}
-    for pattern, overrides in cfg.fsdp_apply_modules.items():
-        matches = [
-            name
-            for name in named
-            if name and name not in ignored_names and module_name_matches(pattern, name)
-        ]
-        if not matches:
-            raise ValueError(f"FSDP apply pattern {pattern!r} matched no module")
-        for name in matches:
-            selected.setdefault(name, {}).update(overrides)
-    if not selected:
-        raise ValueError("fsdp_apply_modules selected no FSDP unit")
-
-    common: dict[str, Any] = {
-        "mesh": dp_mesh,
-        "mp_policy": MixedPrecisionPolicy(
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-            cast_forward_inputs=False,
-        ),
-        "ignored_params": ignored_params,
-    }
-    if cfg.fsdp_cpu_offload:
-        common["offload_policy"] = CPUOffloadPolicy(
-            pin_memory=cfg.fsdp_cpu_offload_pin_memory
-        )
-    ordered_names = sorted(selected, key=lambda name: name.count("."), reverse=True)
-    for name in ordered_names:
-        shard_fn(named[name], **common, **selected[name])
-    shard_fn(model, **common)
-    units = [module for name, module in named.items() if name in selected]
-    set_fsdp_prefetch_windows(
-        units,
-        forward_count=cfg.fsdp_forward_prefetch_count,
-        backward_count=cfg.fsdp_backward_prefetch_count,
-    )
-    disable_fsdp_gradient_division(model)
-
-
-def set_fsdp_prefetch_windows(
-    modules: list[nn.Module], *, forward_count: int, backward_count: int
-) -> None:
-    """Configure exact forward/backward prefetch windows in execution order."""
-    if forward_count < 0 or backward_count < 0:
-        raise ValueError("FSDP prefetch counts must be nonnegative")
-    for index, module in enumerate(modules):
-        forward = modules[index + 1 : index + 1 + forward_count]
-        if forward:
-            module.set_modules_to_forward_prefetch(forward)  # type: ignore[attr-defined]
-        backward = list(reversed(modules[max(0, index - backward_count) : index]))
-        if backward:
-            module.set_modules_to_backward_prefetch(backward)  # type: ignore[attr-defined]
 
 
 def iter_transformer_layers(layers: nn.Module) -> Iterator[tuple[Any, nn.Module]]:

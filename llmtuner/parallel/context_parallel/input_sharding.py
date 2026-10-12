@@ -32,7 +32,7 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.attention.flex_attention import BlockMask
 
-from .. import matrix
+from .. import compatibility
 
 __all__ = [
     "MASK_Q_SEQ_DIM",
@@ -91,7 +91,7 @@ def resolve_load_balancer(load_balancer: str | None, seq_len: int, cp_mesh: Devi
             )
         return _HeadTailLoadBalancer(seq_len, cp_size, cp_mesh.device_type)
     if load_balancer == "ptrr":
-        matrix.ptrr_load_balancer_backstop()
+        compatibility.ptrr_load_balancer_backstop()
     raise ValueError(
         f"Unknown CP load balancer {load_balancer!r}; expected 'headtail' or None."
     )

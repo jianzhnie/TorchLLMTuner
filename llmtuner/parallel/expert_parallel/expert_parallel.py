@@ -8,8 +8,8 @@ import torch.nn as nn
 from llmtuner.config import ParallelConfig
 
 from ...utils.logger_utils import get_logger
-from .. import matrix
-from .swap import restore_fp32_state_buffers, swap_hf_moe_blocks
+from .. import compatibility
+from .model_conversion import restore_fp32_state_buffers, swap_hf_moe_blocks
 
 logger = get_logger(__name__)
 
@@ -34,7 +34,7 @@ def apply_ep(
     """
     if cfg.ep == 1:
         if cfg.moe_quantile_balancing:
-            matrix.quantile_requires_ep()
+            compatibility.quantile_requires_ep()
         return model
 
     if ep_group is None or ep_group.size() != cfg.ep:

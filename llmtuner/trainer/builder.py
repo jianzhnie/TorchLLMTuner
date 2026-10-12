@@ -6,10 +6,10 @@ the assembly order, which is a contract:
 1. process group + rank resolution, then degree resolution
    (``build_parallel_dims``) -- the PP seed offset below needs this rank's
    stage coordinate;
-2. combination guards -- the support matrix (``llmtuner/parallel/matrix.py``)
+2. combination guards (``llmtuner/parallel/compatibility.py``)
    fires here: validation feasibility, chunked-loss x PP, EP x HF-initial-load
    (EP x checkpoint itself is supported since 2026-10, see
-   ``parallel/expert_parallel/ckpt.py``);
+   ``parallel/expert_parallel/checkpoint.py``);
 3. deterministic seeding (before any model build);
 4. the mesh (``build_mesh`` -- see ``llmtuner/parallel/parallel_dims.py``);
 5. the model, then parallelism in stage-table order
@@ -51,7 +51,7 @@ from ..models.hf.factory import (
 )
 from ..models.hf.model import HFTransformerModel
 from ..models.hf.state_dict_adapter import HFTransformerStateDictAdapter
-from ..parallel import matrix
+from ..parallel import compatibility
 from ..parallel.parallel_dims import build_mesh, build_parallel_dims
 from ..parallel.pipeline_parallel import PipelineParallelSetup
 from ..utils import logger_utils
@@ -88,7 +88,9 @@ def _build_model(self, cfg):
         and self.parallel_dims is not None
         and self.parallel_dims.pp_enabled
     ):
-        matrix.chunked_loss_pp(self._chunked_loss_num_chunks, self.parallel_dims.pp)
+        compatibility.chunked_loss_pp(
+            self._chunked_loss_num_chunks, self.parallel_dims.pp
+        )
     hf_model_config = build_model_config_for(cfg)
     load_hf_weights = bool(
         cfg.checkpoint.enable
@@ -102,7 +104,7 @@ def _build_model(self, cfg):
         and self.parallel_dims is not None
         and self.parallel_dims.ep_enabled
     ):
-        matrix.ep_hf_initial_load(self.parallel_dims.ep)
+        compatibility.ep_hf_initial_load(self.parallel_dims.ep)
     if load_hf_weights:
         with torch.device("meta"):
             model = HFTransformerModel(hf_model_config)

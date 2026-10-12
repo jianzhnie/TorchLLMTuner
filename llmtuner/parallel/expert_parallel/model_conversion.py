@@ -77,15 +77,15 @@ from llmtuner.errors import (
 
 from ...models.common.moe.dispatcher import EP_DISPATCHER_BACKENDS
 from ...utils.logger_utils import get_logger
-from .convert import convert_block, restore_fp32_state_buffers
-from .probe import is_hf_moe_block, moe_block_of, router_of
+from .conversion import convert_block, restore_fp32_state_buffers
+from .hf_layout import is_hf_moe_block, moe_block_of, router_of
 
 logger = get_logger(__name__)
 
 __all__ = ["swap_hf_moe_blocks"]
 
 # Re-exported for callers that reached the probe/convert helpers through this
-# module before the three-way split (tensor_parallel/apply.py, the swap tests).
+# module before the three-way split (the TP entry and swap tests).
 is_hf_moe_block = is_hf_moe_block
 restore_fp32_state_buffers = restore_fp32_state_buffers
 
@@ -228,7 +228,7 @@ def swap_hf_moe_blocks(
             f"({type(getattr(model, 'model', model)).__name__}): no layer's "
             "``mlp`` has the router-gate + fused gate_up_proj/down_proj shape "
             "this swap recognizes. Add the model family's layout to the probe "
-            "in parallel/expert_parallel/swap.py."
+            "in parallel/expert_parallel/model_conversion.py."
         )
     logger.info("Swapped %d HF MoE blocks for llmtuner MoE blocks", swapped)
     return swapped

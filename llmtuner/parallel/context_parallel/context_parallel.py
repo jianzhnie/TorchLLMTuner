@@ -8,9 +8,9 @@ from torch.distributed.device_mesh import DeviceMesh
 from llmtuner.config import ParallelConfig
 
 from ...utils.logger_utils import get_logger
-from ..head_sharding import require_heads_divisible_by
-from .cp_kernel import CPFlexKernel, DualCPFlexKernel
-from .input_shard import (
+from ..attention_heads import require_heads_divisible_by
+from .attention import CPFlexKernel, DualCPFlexKernel
+from .input_sharding import (
     shard_attention_mask_for_cp,
     shard_batch_for_cp,
     shard_batch_for_tp,

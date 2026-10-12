@@ -1,13 +1,13 @@
 """Context parallelism: the CP flex kernel, input sharding, and wiring.
 
 ``context_parallel.py`` is the public entry and wires CP onto a model.
-``cp_kernel.py`` holds the attention redistribution itself, while
-``input_shard.py`` owns batch and mask sharding.
+``attention.py`` holds attention redistribution, while
+``input_sharding.py`` owns batch and mask sharding.
 """
 
+from .attention import CPFlexKernel, DualCPFlexKernel
 from .context_parallel import apply_cp
-from .cp_kernel import CPFlexKernel
-from .input_shard import (
+from .input_sharding import (
     shard_attention_mask_for_cp,
     shard_batch_for_cp,
     shard_batch_for_tp,
@@ -17,6 +17,7 @@ from .input_shard import (
 
 __all__ = [
     "CPFlexKernel",
+    "DualCPFlexKernel",
     "apply_cp",
     "shard_attention_mask_for_cp",
     "shard_batch_for_cp",

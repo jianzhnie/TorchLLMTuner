@@ -11,14 +11,18 @@ tuples, no ``apply_*`` imports) so the contract is importable anywhere --
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 __all__ = [
     "PP_STAGE_ORDER",
     "STAGE_ORDER",
     "STAGES",
     "Stage",
+    "StageName",
     "stage_enabled",
 ]
+
+StageName = Literal["tp", "ep", "cp", "ac", "compile", "fsdp"]
 
 
 # The order IS the contract (see parallelize.py's docstring).
@@ -26,7 +30,7 @@ __all__ = [
 class Stage:
     """One assembly stage: name, whether PP runs it, why it sits here."""
 
-    name: str
+    name: StageName
     on_pp: bool
     why_here: str
 
@@ -79,6 +83,6 @@ STAGE_ORDER: tuple[str, ...] = tuple(stage.name for stage in STAGES)
 PP_STAGE_ORDER: tuple[str, ...] = tuple(stage.name for stage in STAGES if stage.on_pp)
 
 
-def stage_enabled(name: str, *, compile: bool) -> bool:
+def stage_enabled(name: StageName, *, compile: bool) -> bool:
     """Whether a stage runs this call: only ``compile`` is conditional."""
     return name != "compile" or compile

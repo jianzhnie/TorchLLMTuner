@@ -45,7 +45,6 @@ from llmtuner.errors import UnsupportedCombinationError
 from ...accelerator import dist_utils
 from ...components.loss import next_token_targets
 from ...datasets.types import Batch
-from ...parallel.compile import maybe_regional_inductor
 from ...parallel.context_parallel import (
     shard_attention_mask_for_cp,
     shard_batch_for_cp,
@@ -53,6 +52,7 @@ from ...parallel.context_parallel import (
     shard_padding_mask_for_cp,
     shard_padding_mask_for_tp,
 )
+from ...parallel.model_compile import maybe_regional_inductor
 from ...parallel.parallel_dims import ParallelDims
 from ...utils.logger_utils import get_logger
 from ..common.attention.masks import (
