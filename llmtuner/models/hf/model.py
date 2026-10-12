@@ -37,13 +37,10 @@ import torch
 from torch import nn
 from torch.nn.attention.flex_attention import and_masks
 from transformers.configuration_utils import PretrainedConfig
-from transformers.integrations.flex_attention import flex_attention_forward
-from transformers.modeling_utils import AttentionInterface
 
 from llmtuner.errors import UnsupportedCombinationError
 
 from ...accelerator import distributed
-from ...components.loss import next_token_targets
 from ...datasets.contracts import Batch
 from ...parallel.context_parallel import (
     shard_attention_mask_for_cp,
@@ -52,7 +49,6 @@ from ...parallel.context_parallel import (
     shard_padding_mask_for_cp,
     shard_padding_mask_for_tp,
 )
-from ...parallel.model_compile import maybe_regional_inductor
 from ...parallel.topology import ParallelTopology
 from ...utils.logging import get_logger
 from ..common.attention.masks import (
@@ -61,192 +57,25 @@ from ..common.attention.masks import (
     get_causal_mask_mod,
     get_document_mask_mod,
 )
-from ..common.cast_linear import TORCH_DTYPE_MAP, to_cast_linear
 from ..common.moe.layer import iter_moe_layers
-from .factory import _ATTN_IMPLEMENTATION, resolve_model_class, unwrap_text_config
+from .attention_backend import (
+    ATTENTION_BACKEND,
+    available_attention_backend,
+    register_attention_backend,
+    uses_deepseek_sparse_attention,
+)
+from .factory import resolve_model_class, unwrap_text_config
+from .input_processing import collapse_batch_dims, document_shift
+from .model_setup import (
+    apply_cast_lm_head,
+    first_present,
+    resolve_experts_implementation,
+    validate_head_config,
+)
 
 logger = get_logger(__name__)
 
 __all__ = ["HFTransformerModel"]
-
-
-def flex_supported() -> str:
-    """The attention implementation this machine can actually run.
-
-    Flex attention lowers through inductor, and inductor has no CPU target, so
-    ``torch.compile(flex_attention, ...)`` raises ``NotImplementedError`` off a
-    CUDA device. That is a property of the machine, not of the run, so it is
-    decided here rather than requested by the config.
-
-    ``"sdpa"`` is a fallback in *backend*, not in *arithmetic*: on the path this
-    wrapper takes (causal, no packing) both compute the same thing, for a reason
-    worth spelling out. The wrapper deliberately passes no ``attention_mask``
-    down to the decoder, and HF's sdpa path ignores ``is_causal`` whenever a mask
-    is present, deriving causality from the mask instead. Handing it the
-    ``BlockMask`` would therefore silently disable masking. Leaving the mask
-    unset lets sdpa default to causal -- the same thing the flex causal mod
-    applies. What is genuinely lost off CUDA is packed-document masking:
-    ``get_attention_masks`` still builds a correct ``BlockMask``, it just has no
-    flex kernel to run it in. Packed batches must run on CUDA.
-    """
-    return _ATTN_IMPLEMENTATION if torch.cuda.is_available() else "sdpa"
-
-
-def flex_attention_hf(module, query, key, value, attention_mask, **kwargs):
-    """HF ``AttentionInterface`` entry point for flex attention.
-
-    When a kernel has been attached under the attention module (the parallelism
-    layer does this to declare a local SPMD region), route through it so the
-    sharding declarations take effect; otherwise run flex directly on the plain
-    tensors.
-    """
-    kernel = getattr(module, "_titan_flex_kernel", None)
-    if kernel is None:
-        # Mark the flex region so that, when the enclosing model is compiled
-        # with a non-inductor backend, regional_inductor scoops just this
-        # region into an inductor sub-compile (see parallel/model_compile.py). A
-        # null context on the default inductor / eager paths, so no dead
-        # metadata is emitted. Empty configs: inductor defaults -- llmtuner
-        # runs HF's flex integration, not its own compiled-flex instance.
-        with maybe_regional_inductor({}):
-            return flex_attention_forward(
-                module, query, key, value, attention_mask, **kwargs
-            )
-    out = kernel(query, key, value, module=module, block_mask=attention_mask, **kwargs)
-    return out, None
-
-
-def uses_dsa(config) -> bool:
-    """True if the model uses DeepSeek-style sparse attention (DSA).
-
-    DSA models (e.g. GLM-5, model_type 'glm_moe_dsa') run an auxiliary
-    "indexer" sub-attention that scores all keys and selects the top-k per
-    query, expressing the selection as a dense additive mask. The indexer and
-    the main attention both consume the incoming mask as a *plain tensor* --
-    the modeling code calls ``.dim()`` on it and adds it to the scores -- so a
-    flex ``BlockMask`` cannot be used and the wrapper builds a dense 4D mask
-    instead (see ``masks.build_dense_attention_mask``; flex still runs, taking
-    it as its ``score_mask``). Detected by the DSA-specific ``index_topk``
-    config attr.
-    """
-    return getattr(config, "index_topk", None) is not None
-
-
-def first_present(module: nn.Module, names: tuple[str, ...], what: str) -> str:
-    """Return the first of ``names`` that ``module`` has.
-
-    HF names the same submodule differently across model families
-    (``embed_tokens``/``wte``, ``norm``/``final_layernorm``/``ln_f``), so the
-    wrapper probes instead of hardcoding one family's spelling. Resolved once at
-    construction: a missing part should fail at build time, not mid-forward.
-    """
-    for name in names:
-        if hasattr(module, name):
-            return name
-    raise AttributeError(
-        f"{type(module).__name__} has no {what} under any of {names}. "
-        "Add the model's spelling to the probe in HFTransformerModel.__init__."
-    )
-
-
-def collapse_batch_dims(
-    inputs: torch.Tensor, labels: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Flatten a ``(B, T)`` batch into the ``(B*T,)`` shape the forward takes.
-
-    The wrapper is a single-sequence entry point -- it adds and removes its own
-    batch dim around the decoder call. The synthetic source yields one document
-    per row of length ``max_seq_len``, so the concatenation is exactly the
-    single causal document the fallback attention path expects; RoPE is driven
-    per row because positions restart at each row boundary.
-
-    A packed (Grain) batch already arrives as a flat token stream, so for it
-    this is the identity -- which is what makes the two sources one code path
-    from here on. Used by both the training path (``preprocess_inputs``) and the
-    pipeline path, which chunks rows before collapsing; keeping it in one place
-    is what makes the two chunkings agree.
-    """
-    return inputs.reshape(-1), labels.reshape(-1)
-
-
-def document_shift(labels: torch.Tensor, *, seq_len: int) -> torch.Tensor:
-    """Next-token targets within a row, ``IGNORE_INDEX`` at each row end.
-
-    The synthetic source hands over labels equal to its inputs, so the shift is
-    the model's. Rows are independent documents of length ``seq_len``, so the
-    shift has to stay *within* a row: the row-final position would predict the
-    next document's first token, which the model had no context for. Those
-    positions come back ``IGNORE_INDEX`` and are excluded from the loss.
-
-    The packed source arrives already shifted and already masked at its document
-    boundaries, so it never calls this.
-    """
-    return next_token_targets(labels.reshape(-1), seq_len=seq_len)
-
-
-def validate_head_config(config: PretrainedConfig) -> None:
-    """Reject GQA head counts that no attention kernel can honor."""
-    num_heads = getattr(config, "num_attention_heads", None)
-    num_kv_heads = getattr(config, "num_key_value_heads", None)
-    num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
-    if num_heads is not None and num_heads < 1:
-        raise ValueError(f"num_attention_heads must be >= 1, got {num_heads}")
-    if num_kv_heads is not None and num_kv_heads < 1:
-        raise ValueError(f"num_key_value_heads must be >= 1, got {num_kv_heads}")
-    if (
-        num_heads is not None
-        and num_kv_heads is not None
-        and num_heads % num_kv_heads != 0
-    ):
-        raise ValueError(
-            f"num_attention_heads ({num_heads}) must be divisible by "
-            f"num_key_value_heads ({num_kv_heads})"
-        )
-
-
-def resolve_experts_implementation(model_cls: type, config: PretrainedConfig) -> None:
-    """Select the HF experts forward kernel, honoring the explicit request or
-    failing -- never silently substituting a different kernel (torchtitan's
-    semantics). "native" leaves the model's built-in kernel alone; anything
-    else requires a model whose experts implementation is settable
-    (transformers' @use_experts_implementation, probed as a classmethod).
-    Irrelevant under EP>1, where the swap replaces the whole MoE block."""
-    impl = getattr(config, "experts_implementation", "native")
-    if impl == "native":
-        return
-    can_set = getattr(model_cls, "_can_set_experts_implementation", None)
-    if impl not in ("grouped_mm", "batched_mm", "eager"):
-        raise ValueError(
-            f"experts_implementation must be one of 'native', "
-            f"'grouped_mm', 'batched_mm', 'eager', got '{impl}'"
-        )
-    if can_set is None or not can_set():
-        raise ValueError(
-            f"{model_cls.__name__} does not support a settable experts "
-            f"implementation, so experts_implementation='{impl}' cannot "
-            "be honored. Set experts_implementation='native' to use "
-            "the HF model's built-in experts kernel."
-        )
-    config._experts_implementation = impl
-
-
-def apply_cast_lm_head(model: nn.Module, config: PretrainedConfig) -> None:
-    """Optional fixed-dtype lm_head (torchtitan's CastLinear semantics):
-    score the vocabulary logits in the requested dtype while the stored
-    weight keeps its own. Swapped in place rather than wrapped so the
-    state-dict FQNs -- and a weight tie with the embedding -- are
-    untouched (see models/common/cast_linear.py for why subclassing
-    beats wrapping)."""
-    compute_dtype = getattr(config, "compute_dtype", None)
-    if compute_dtype is None:
-        return
-    if compute_dtype not in TORCH_DTYPE_MAP:
-        raise ValueError(
-            f"compute_dtype must be one of {sorted(TORCH_DTYPE_MAP)}, "
-            f"got {compute_dtype!r}"
-        )
-    if model.lm_head is not None:
-        model.lm_head = to_cast_linear(model.lm_head, TORCH_DTYPE_MAP[compute_dtype])
 
 
 class HFTransformerModel(nn.Module):
@@ -264,10 +93,10 @@ class HFTransformerModel(nn.Module):
         # resolved once here rather than per forward. The mask family is decided
         # in ``get_attention_masks``, which is the one place that knows both the
         # model and the batch's positions.
-        self.uses_dsa = uses_dsa(config)
+        self.uses_dsa = uses_deepseek_sparse_attention(config)
         validate_head_config(config)
-        config._attn_implementation = flex_supported()
-        AttentionInterface._global_mapping[_ATTN_IMPLEMENTATION] = flex_attention_hf
+        config._attn_implementation = available_attention_backend()
+        register_attention_backend()
 
         model_cls = resolve_model_class(config)
         resolve_experts_implementation(model_cls, config)
@@ -364,7 +193,7 @@ class HFTransformerModel(nn.Module):
         non-inductor compile backend must either scoop the flex region
         (``aot_eager`` + regional_inductor) or be rejected.
         """
-        return self.model.config._attn_implementation == _ATTN_IMPLEMENTATION
+        return self.model.config._attn_implementation == ATTENTION_BACKEND
 
     @property
     def enable_weight_tying(self) -> bool:
@@ -480,7 +309,7 @@ class HFTransformerModel(nn.Module):
             attention_masks = None
             if positions is not None:
                 mask = self.get_attention_masks(positions=positions)
-                if self.model.config._attn_implementation == _ATTN_IMPLEMENTATION:
+                if self.model.config._attn_implementation == ATTENTION_BACKEND:
                     attention_masks = mask
             return inputs, labels, positions, padding_mask, attention_masks
 
@@ -511,7 +340,7 @@ class HFTransformerModel(nn.Module):
                     cp_mesh,
                     self._cp_load_balancer,
                 )
-            if self.model.config._attn_implementation != _ATTN_IMPLEMENTATION:
+            if self.model.config._attn_implementation != ATTENTION_BACKEND:
                 attention_masks = None
         inputs, labels, positions = shard_batch_for_cp(
             inputs,
@@ -920,7 +749,7 @@ class HFTransformerModel(nn.Module):
 
         # is_causal is the flex-only spelling: it selects which mod the BlockMask
         # runs, so it is withheld from every other backend (see below).
-        if self.model.config._attn_implementation == _ATTN_IMPLEMENTATION:
+        if self.model.config._attn_implementation == ATTENTION_BACKEND:
             return {"attention_mask": attention_masks, "is_causal": False}
 
         # Every other backend wants a tensor mask (or none). There is no generic

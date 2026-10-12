@@ -186,9 +186,6 @@ class ParallelConfig:
     is disabled (`pipeline_parallel_size = 1`, the default).
     """
 
-    context_parallel_size: int = 1
-    """Context parallelism degree. 1 means disabled."""
-
     context_parallel_kv_allgather_size: int = 1
     """Independent KV AllGather CP axis degree."""
 
@@ -365,7 +362,6 @@ class ParallelConfig:
             "data_parallel_replicate_size",
             "tensor_parallel_size",
             "pipeline_parallel_size",
-            "context_parallel_size",
             "context_parallel_kv_allgather_size",
             "context_parallel_ulysses_size",
             "expert_parallel_size",
@@ -445,14 +441,6 @@ class ParallelConfig:
                 "parallel.context_parallel_load_balancer cannot be an empty "
                 "string; use None to disable load balancing."
             )
-        if self.context_parallel_size != 1 and (
-            self.context_parallel_kv_allgather_size != 1
-            or self.context_parallel_ulysses_size != 1
-        ):
-            raise ConfigError(
-                "context_parallel_size is the legacy single-axis setting and "
-                "cannot be combined with the explicit KV/Ulysses axis sizes"
-            )
         allowed = frozenset({None, "headtail", "ptrr"})
         if self.context_parallel_load_balancer not in allowed:
             raise ConfigError(
@@ -531,8 +519,6 @@ class ParallelConfig:
 
     @property
     def cp(self) -> int:
-        if self.context_parallel_size != 1:
-            return self.context_parallel_size
         return (
             self.context_parallel_kv_allgather_size * self.context_parallel_ulysses_size
         )

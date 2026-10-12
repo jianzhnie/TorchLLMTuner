@@ -18,6 +18,7 @@ from torch import nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
+from .attention_backend import ATTENTION_BACKEND
 from .flops import flops_per_token
 
 __all__ = [
@@ -26,13 +27,6 @@ __all__ = [
     "materialize_meta_model",
     "num_flops_per_token",
 ]
-
-
-# HF picks its attention function off ``config._attn_implementation``. Registering
-# a name of our own lets us route through ``flex_attention_hf`` without tripping
-# HF's per-model ``_supports_flex_attn`` gate -- some models support flex but do
-# not advertise it.
-_ATTN_IMPLEMENTATION = "flex_torchtitan"
 
 
 def build_model_config(
@@ -158,7 +152,7 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
     if not hasattr(config, "text_config"):
         return config
     text_config = config.text_config
-    text_config._attn_implementation = _ATTN_IMPLEMENTATION
+    text_config._attn_implementation = ATTENTION_BACKEND
     # ``build_model_config_for`` derives ``attn_mask_type`` and sets it on the
     # TOP config, but the model class is built from this sub-config and every
     # reader of that flag -- the packed guard, the mask builder, and
