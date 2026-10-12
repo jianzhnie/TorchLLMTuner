@@ -137,9 +137,7 @@ def test_num_flops_per_token_passes_the_run_sequence_length_through(
     """``num_flops_per_token`` only resolves the config and forwards
     ``cfg.max_seq_len``; the attention term must use the run's own sequence
     length, not the architecture's maximum."""
-    monkeypatch.setattr(
-        factory, "build_model_config_for", lambda cfg: _arch("llama")
-    )
+    monkeypatch.setattr(factory, "build_model_config_for", lambda cfg: _arch("llama"))
     short = num_flops_per_token(SimpleNamespace(max_seq_len=8))
     long = num_flops_per_token(SimpleNamespace(max_seq_len=32))
 

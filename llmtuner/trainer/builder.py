@@ -31,7 +31,6 @@ import torch
 
 from .. import parallel
 from ..accelerator.device import (
-    device_module,
     device_type,
     get_distributed_backend,
     get_env_dist_info,
@@ -57,8 +56,16 @@ from ..parallel.parallel_dims import build_mesh, build_parallel_dims
 from ..parallel.pipeline_parallel import PipelineParallelSetup
 from ..utils import logger_utils
 from ..utils.logger_utils import get_logger
+from ..utils.random import seed_everything as _seed_everything
 
 logger = get_logger(__name__)
+
+
+def seed_everything(
+    seed: int, *, deterministic: bool, detect_anomaly: bool = False
+) -> None:
+    """Preserve the trainer assembly API while delegating RNG setup."""
+    _seed_everything(seed, deterministic=deterministic, detect_anomaly=detect_anomaly)
 
 
 def _build_model(self, cfg):
@@ -81,9 +88,7 @@ def _build_model(self, cfg):
         and self.parallel_dims is not None
         and self.parallel_dims.pp_enabled
     ):
-        matrix.chunked_loss_pp(
-            self._chunked_loss_num_chunks, self.parallel_dims.pp
-        )
+        matrix.chunked_loss_pp(self._chunked_loss_num_chunks, self.parallel_dims.pp)
     hf_model_config = build_model_config_for(cfg)
     load_hf_weights = bool(
         cfg.checkpoint.enable
@@ -153,9 +158,7 @@ def _apply_parallelism(self, cfg, model, load_hf_weights: bool) -> None:
 
 def _build_optimizer_stack(self, cfg) -> None:
     """Optimizer, lr schedule, EMA, and the MoE/aux-loss optimizer pre-hooks."""
-    self.optimizer = OptimizersContainer(
-        cfg.optimizer, model_parts=self.model_parts
-    )
+    self.optimizer = OptimizersContainer(cfg.optimizer, model_parts=self.model_parts)
 
     # The lr schedule. Built regardless of whether the knobs were touched:
     # the default is warmup_steps=0 with no decay, so the factor is a
@@ -201,9 +204,7 @@ def _build_optimizer_stack(self, cfg) -> None:
     # Registered on the container, so it fires once per step() call --
     # not once per inner optimizer, which is what a loop over the inner
     # optimizers would give under pipeline parallelism.
-    register_aux_loss_zero_hook(
-        self.optimizer, self.model_parts, self.parallel_dims
-    )
+    register_aux_loss_zero_hook(self.optimizer, self.model_parts, self.parallel_dims)
     # A second pre-hook on the same container, same granularity. No-op for
     # a model without MoE layers, which is every model except a swapped-in
     # one (the swap is what installs ``load_balance_coeff``).
@@ -260,11 +261,7 @@ def _build_checkpointer(self, cfg, hf_model_config) -> None:
 
 def build_trainer_state(self, cfg) -> None:
     self.cfg = cfg
-    if (
-        not is_distributed()
-        and "RANK" in os.environ
-        and "WORLD_SIZE" in os.environ
-    ):
+    if not is_distributed() and "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         init_dist_pytorch(get_distributed_backend())
     self.rank, self.world_size, self.local_rank = get_env_dist_info()
 
@@ -298,9 +295,7 @@ def build_trainer_state(self, cfg) -> None:
     seed = cfg.seed
     if self.parallel_dims is not None and self.parallel_dims.pp_enabled:
         pp_mesh = self.parallel_dims.get_optional_mesh("pp")
-        seed = derive_distinct_seed(
-            seed, [(pp_mesh.get_local_rank(), pp_mesh.size())]
-        )
+        seed = derive_distinct_seed(seed, [(pp_mesh.get_local_rank(), pp_mesh.size())])
     self.seed_everything(
         seed, deterministic=cfg.deterministic, detect_anomaly=cfg.detect_anomaly
     )
@@ -379,5 +374,3 @@ def derive_distinct_seed(seed: int, distinct_coords: Iterable[tuple[int, int]]) 
         offset += local_rank * cumulative_size
         cumulative_size *= dim_size
     return (seed + offset) % 2**64
-
-

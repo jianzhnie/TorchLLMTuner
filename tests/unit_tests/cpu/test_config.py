@@ -188,9 +188,7 @@ def test_symmetric_memory_is_rejected_off_a_supported_device() -> None:
 
 def test_an_unknown_pipeline_schedule_is_rejected() -> None:
     """``get_schedule_class`` is the authority; the error names the bad value."""
-    with pytest.raises(
-        ValueError, match="Invalid parallel.pipeline_parallel_schedule"
-    ):
+    with pytest.raises(ValueError, match="Invalid parallel.pipeline_parallel_schedule"):
         ParallelConfig(pipeline_parallel_schedule="NotASchedule")
 
 

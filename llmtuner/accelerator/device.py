@@ -144,6 +144,7 @@ def should_use_pin_memory(device: torch.device | None = None) -> bool:
     device = get_current_device() if device is None else device
     return device.type in ACCELERATOR_TYPES
 
+
 def is_cuda_available() -> bool:
     """Return whether CUDA devices exist."""
     return is_device_type_available("cuda")
@@ -172,5 +173,6 @@ def get_max_cuda_memory(device: torch.device | None = None) -> int:
     mem = torch.cuda.max_memory_allocated(device=device)
     torch.cuda.reset_peak_memory_stats()
     return int(mem) // (1024 * 1024)
+
 
 device_type, device_module = get_device_info()

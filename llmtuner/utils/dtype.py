@@ -18,5 +18,7 @@ def get_dtype(dtype_str: str) -> torch.dtype:
         "float64": torch.float64,
     }
     if dtype_str not in mapping:
-        raise ValueError(f"Unknown dtype string: '{dtype_str}'. Supported: {list(mapping.keys())}")
+        raise ValueError(
+            f"Unknown dtype string: '{dtype_str}'. Supported: {list(mapping.keys())}"
+        )
     return mapping[dtype_str]

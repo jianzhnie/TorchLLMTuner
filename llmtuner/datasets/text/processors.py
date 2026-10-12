@@ -285,9 +285,7 @@ class ChatProcessor(SampleProcessor):
         return self._tokenize_sample(sample)
 
 
-def local_jsonl_recipe(
-    *, path: str, processor: type[SampleProcessor]
-) -> SingleDataset:
+def local_jsonl_recipe(*, path: str, processor: type[SampleProcessor]) -> SingleDataset:
     """One indexed JSONL file, read through ``processor``.
 
     The three ``local_jsonl*`` factories differ only in the processor: same
@@ -371,13 +369,9 @@ def make_local_jsonl_sft_multiturn(
                     )
                 return conversation
 
-            super().__init__(
-                context=context, messages_fn=messages, renderer=renderer
-            )
+            super().__init__(context=context, messages_fn=messages, renderer=renderer)
 
-    return local_jsonl_recipe(
-        path=path, processor=_LocalJsonlMultiTurnChatProcessor
-    )
+    return local_jsonl_recipe(path=path, processor=_LocalJsonlMultiTurnChatProcessor)
 
 
 DATASETS: dict[str, SingleDataset] = {

@@ -26,9 +26,11 @@ from .image import vision_to_patches
 
 __all__ = ["MultiModalCollator"]
 
+
 def text_positions(text_len: int, offset: int) -> torch.Tensor:
     """Sequential positions for a text run, identical on all 3 MRoPE axes."""
     return torch.arange(text_len).view(1, -1).expand(3, -1) + offset
+
 
 def vision_grid_positions(
     t: int, h: int, w: int, cache: dict[tuple[int, int, int], torch.Tensor]
@@ -42,6 +44,7 @@ def vision_grid_positions(
         w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
         cache[key] = torch.stack([t_index, h_index, w_index])
     return cache[key]
+
 
 class MultiModalCollator(Collator):
     """Multimodal collator for VLM training.
@@ -207,12 +210,8 @@ class MultiModalCollator(Collator):
             ~prev_vision | (tokens != prev_tokens)
         )  # (batch, seq_len)
 
-        num_image_runs = int(
-            (batch_vision_starts & (tokens == image_token_id)).sum()
-        )
-        num_video_runs = int(
-            (batch_vision_starts & (tokens == video_token_id)).sum()
-        )
+        num_image_runs = int((batch_vision_starts & (tokens == image_token_id)).sum())
+        num_video_runs = int((batch_vision_starts & (tokens == video_token_id)).sum())
         num_image_grids = 0 if grid_thw is None else int(grid_thw.shape[0])
         num_video_grids = (
             0 if grid_thw_videos is None else int(grid_thw_videos.shape[0])
@@ -275,17 +274,16 @@ class MultiModalCollator(Collator):
                         int(h.item()) // spatial_merge_size,
                         int(w.item()) // spatial_merge_size,
                     )
-                    if int(h.item()) % spatial_merge_size or int(
-                        w.item()
-                    ) % spatial_merge_size:
+                    if (
+                        int(h.item()) % spatial_merge_size
+                        or int(w.item()) % spatial_merge_size
+                    ):
                         raise ValueError(
                             "MRoPE grid spatial dimensions must be divisible by "
                             f"spatial_merge_size={spatial_merge_size}; got "
                             f"grid [{int(t.item())}, {int(h.item())}, {int(w.item())}]"
                         )
-                    expected_vision_tokens = (
-                        llm_grid_t * llm_grid_h * llm_grid_w
-                    )
+                    expected_vision_tokens = llm_grid_t * llm_grid_h * llm_grid_w
                     vision_end = vision_start
                     while (
                         vision_end < doc_end
@@ -307,9 +305,7 @@ class MultiModalCollator(Collator):
                     text_len = vision_start - pair_cursor
 
                     pos_id_offset = (
-                        int(doc_pos_ids_list[-1].max()) + 1
-                        if doc_pos_ids_list
-                        else 0
+                        int(doc_pos_ids_list[-1].max()) + 1 if doc_pos_ids_list else 0
                     )
                     # [text tokens] -- sequential positions, identical on all 3 axes.
                     doc_pos_ids_list.append(text_positions(text_len, pos_id_offset))
@@ -326,9 +322,7 @@ class MultiModalCollator(Collator):
                 # Trailing [text tokens] after the last text/vision pair.
                 if pair_cursor < doc_end:
                     pos_id_offset = (
-                        int(doc_pos_ids_list[-1].max()) + 1
-                        if doc_pos_ids_list
-                        else 0
+                        int(doc_pos_ids_list[-1].max()) + 1 if doc_pos_ids_list else 0
                     )
                     doc_pos_ids_list.append(
                         text_positions(doc_end - pair_cursor, pos_id_offset)

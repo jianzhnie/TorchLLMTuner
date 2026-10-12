@@ -41,27 +41,26 @@ def dp_rank_world_size(self) -> tuple[int, int]:
         return batch_mesh.get_local_rank(), batch_mesh.size()
     # The dense DP group spans replicate * shard; unsplit on torchrun it is
     # a plain 1-D mesh.
-    dp_mesh = self.parallel_dims.get_optional_mesh(
-        "dp", include_singleton_axes=True
-    )
+    dp_mesh = self.parallel_dims.get_optional_mesh("dp", include_singleton_axes=True)
     return dp_mesh.get_local_rank(), dp_mesh.size()
+
 
 def batch_size_per_rank(self, dp_world_size: int) -> int:
     """This rank's share of the global batch, checked rather than floored.
 
-        Both loader paths divide the global batch by ``dp_world_size`` -- the
-        random path slices rows, the Grain path is handed a token count -- and
-        both are wrong in the same silent way when it does not divide: the run
-        reads a smaller global batch than the config names, and every number
-        derived from it (the lr, the token count, the value logged as
-        ``batch_size``) describes a batch that is not the one being read.
+    Both loader paths divide the global batch by ``dp_world_size`` -- the
+    random path slices rows, the Grain path is handed a token count -- and
+    both are wrong in the same silent way when it does not divide: the run
+    reads a smaller global batch than the config names, and every number
+    derived from it (the lr, the token count, the value logged as
+    ``batch_size``) describes a batch that is not the one being read.
 
-        ``RandomTokenDataLoader`` rejects an indivisible ``batch_size`` of its
-        own, but only once it is constructed and only on the random path. The
-        token count is computed here, before either loader exists, so this is
-        the one place both paths pass through -- which is what makes the
-        failure the same for both, and the same up front.
-        """
+    ``RandomTokenDataLoader`` rejects an indivisible ``batch_size`` of its
+    own, but only once it is constructed and only on the random path. The
+    token count is computed here, before either loader exists, so this is
+    the one place both paths pass through -- which is what makes the
+    failure the same for both, and the same up front.
+    """
     global_batch_size = self.cfg.global_batch_size
     if global_batch_size % dp_world_size != 0:
         raise ValueError(
@@ -72,16 +71,17 @@ def batch_size_per_rank(self, dp_world_size: int) -> int:
         )
     return global_batch_size // dp_world_size
 
+
 def build_dataloader(self) -> BaseDataLoader | None:
     """Build the micro-batch source the config names.
 
-        Whatever the source, it rides along in the checkpoint's ``states``:
-        resuming without its read position would resume the weights and restart
-        the data, silently training a second pass over the beginning of the
-        corpus. The synthetic loader's ``load_state_dict`` reaches the saved
-        position by replaying generated batches, which is exact (batch k is a
-        pure function of ``(seed, k)``) if not free.
-        """
+    Whatever the source, it rides along in the checkpoint's ``states``:
+    resuming without its read position would resume the weights and restart
+    the data, silently training a second pass over the beginning of the
+    corpus. The synthetic loader's ``load_state_dict`` reaches the saved
+    position by replaying generated batches, which is exact (batch k is a
+    pure function of ``(seed, k)``) if not free.
+    """
     dp_rank, dp_world_size = self.dp_rank_world_size()
     batch_size_per_rank = self.batch_size_per_rank(dp_world_size)
     loader = build_dataset_dataloader(
@@ -95,14 +95,15 @@ def build_dataloader(self) -> BaseDataLoader | None:
     )
     return loader
 
+
 def data_iterator(self) -> Iterator[Batch | TrainerBatch]:
     """The raw micro-batch source.
 
-        A method rather than an attribute so tests can drive the loop with a
-        fixed batch without touching the loop itself. The loader is a
-        :class:`~llmtuner.datasets.loader.BaseDataLoader` whenever there is one,
-        so both the synthetic and the Grain path arrive here the same way.
-        """
+    A method rather than an attribute so tests can drive the loop with a
+    fixed batch without touching the loop itself. The loader is a
+    :class:`~llmtuner.datasets.loader.BaseDataLoader` whenever there is one,
+    so both the synthetic and the Grain path arrive here the same way.
+    """
     if self.dataloader is not None:
         return iter(self.dataloader)
     dp_rank, dp_world_size = self.dp_rank_world_size()
@@ -117,29 +118,30 @@ def data_iterator(self) -> Iterator[Batch | TrainerBatch]:
         )
     )
 
+
 def batch_generator(
     self, data_iterable: Iterable[Batch | TrainerBatch]
 ) -> Iterator[Batch | TrainerBatch]:
     """Wrap the source with the per-fetch accounting the step needs.
 
-        Mirrors the reference's ``batch_generator``: the timing and token
-        counters are updated as each batch is *taken*, not when it is used, so
-        a step that raises partway through still accounts for the reads it
-        performed. Yields the batch unchanged -- the loader's shape is the
-        step's business, not this wrapper's.
+    Mirrors the reference's ``batch_generator``: the timing and token
+    counters are updated as each batch is *taken*, not when it is used, so
+    a step that raises partway through still accounts for the reads it
+    performed. Yields the batch unchanged -- the loader's shape is the
+    step's business, not this wrapper's.
 
-        The token counter takes every label, not just the predictable ones.
-        It reports throughput -- tokens the loader produced, which is what
-        ``MFU`` wants -- and is not the loss denominator. That one is
-        ``local_valid_tokens`` in ``train_step``, which is separately reduced
-        across DP.
+    The token counter takes every label, not just the predictable ones.
+    It reports throughput -- tokens the loader produced, which is what
+    ``MFU`` wants -- and is not the loss denominator. That one is
+    ``local_valid_tokens`` in ``train_step``, which is separately reduced
+    across DP.
 
-        Running out of data raises ``DataloaderExhaustedError`` rather than
-        letting ``StopIteration`` escape: the loop must abandon the whole step
-        rather than train on a partial batch, and ``StopIteration`` inside a
-        generator would be read as "this generator is empty" and silently end
-        training instead of failing the step.
-        """
+    Running out of data raises ``DataloaderExhaustedError`` rather than
+    letting ``StopIteration`` escape: the loop must abandon the whole step
+    rather than train on a partial batch, and ``StopIteration`` inside a
+    generator would be read as "this generator is empty" and silently end
+    training instead of failing the step.
+    """
     data_iterator = iter(data_iterable)
     while True:
         data_load_start = perf_counter()
@@ -154,25 +156,26 @@ def batch_generator(
         self.metrics.add_data_loading_time(perf_counter() - data_load_start)
         yield batch
 
+
 def count_valid_tokens(batch: Batch | TrainerBatch) -> int:
     """The number of labels that contribute to the loss, pre-shard.
 
-        The trainer's half of the token accounting, and it stays in the trainer
-        for a reason: the count divides the loss *before* the first backward and
-        is reduced across DP before that, so it cannot be produced per
-        micro-batch by a model-side counter.
+    The trainer's half of the token accounting, and it stays in the trainer
+    for a reason: the count divides the loss *before* the first backward and
+    is reduced across DP before that, so it cannot be produced per
+    micro-batch by a model-side counter.
 
-        It is taken from the batch as the loader handed it over -- before the
-        model normalizes shapes, shifts for row ends, or shards for CP -- which
-        is what makes it rank-independent: every CP rank of a DP group holds
-        the same unsharded batch, so the dp-only reduction counts the whole batch
-        once rather than once per sequence shard.
+    It is taken from the batch as the loader handed it over -- before the
+    model normalizes shapes, shifts for row ends, or shards for CP -- which
+    is what makes it rank-independent: every CP rank of a DP group holds
+    the same unsharded batch, so the dp-only reduction counts the whole batch
+    once rather than once per sequence shard.
 
-        A collator counts its own tokens while it already has the labels in
-        hand; the synthetic source has no collator, so its count is derived here
-        from the row shift. Both agree on what counts: a document's final
-        position predicts nothing and is excluded.
-        """
+    A collator counts its own tokens while it already has the labels in
+    hand; the synthetic source has no collator, so its count is derived here
+    from the row shift. Both agree on what counts: a document's final
+    position predicts nothing and is excluded.
+    """
     if isinstance(batch, Batch):
         seq_len = batch.labels.shape[-1]
         targets = next_token_targets(batch.labels.reshape(-1), seq_len=seq_len)
@@ -199,25 +202,25 @@ def count_routing_tokens(batch: Batch | TrainerBatch) -> int:
 def microbatch(self, batch: Batch | TrainerBatch) -> dict[str, Any]:
     """Everything one accumulation group's forward/backward needs.
 
-        The split of responsibility here mirrors torchtitan's ``train_step``,
-        and each half is load-bearing:
+    The split of responsibility here mirrors torchtitan's ``train_step``,
+    and each half is load-bearing:
 
-        * **The count is popped by the trainer.** It is the loss denominator,
-          which must be reduced across DP before the first backward, so it
-          cannot come out of a per-micro-batch model call.
-        * **The accounting is taken by the trainer**, from the loader's own
-          labels, before any reshaping: throughput is a report about the loader
-          ("tokens it produced"), not about the loss. The two numbers differ --
-          a document's final position is loaded but never predicted -- and that
-          is why they are not one field. The cumulative count is divided by
-          ``cp * tp`` because every rank of a CP/TP group reads the same batch
-          and the report sums it over the loss mesh (see ``train_step``).
-        * **Everything else stays on the host until its group is consumed.**
-          ``preprocess`` moves one group's tensors to the device just ahead of
-          that group's forward (see ``to_device``), so holding the rest of the
-          accumulation window costs host memory, not device memory -- the CPU
-          invariant ``torchtitan`` documents for ``batch_generator``.
-        """
+    * **The count is popped by the trainer.** It is the loss denominator,
+      which must be reduced across DP before the first backward, so it
+      cannot come out of a per-micro-batch model call.
+    * **The accounting is taken by the trainer**, from the loader's own
+      labels, before any reshaping: throughput is a report about the loader
+      ("tokens it produced"), not about the loss. The two numbers differ --
+      a document's final position is loaded but never predicted -- and that
+      is why they are not one field. The cumulative count is divided by
+      ``cp * tp`` because every rank of a CP/TP group reads the same batch
+      and the report sums it over the loss mesh (see ``train_step``).
+    * **Everything else stays on the host until its group is consumed.**
+      ``preprocess`` moves one group's tensors to the device just ahead of
+      that group's forward (see ``to_device``), so holding the rest of the
+      accumulation window costs host memory, not device memory -- the CPU
+      invariant ``torchtitan`` documents for ``batch_generator``.
+    """
     labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
     # Count this rank's share of the sequence, not the whole batch: every
     # rank of a CP/TP group reads the *same* batch from the loader, and the
@@ -245,14 +248,15 @@ def microbatch(self, batch: Batch | TrainerBatch) -> dict[str, Any]:
         "num_routing_tokens": num_routing_tokens,
     }
 
+
 def to_device(self, batch: Batch | TrainerBatch) -> Batch | TrainerBatch:
     """Move one consumption group's tensors to the training device.
 
-        Called by ``preprocess``, once per group just ahead of that group's
-        forward -- not at read time. Reading the whole accumulation window onto
-        the device up front would keep every micro-batch resident in device
-        memory for the whole window, which is exactly what deferring avoids.
-        """
+    Called by ``preprocess``, once per group just ahead of that group's
+    forward -- not at read time. Reading the whole accumulation window onto
+    the device up front would keep every micro-batch resident in device
+    memory for the whole window, which is exactly what deferring avoids.
+    """
     if isinstance(batch, dict):
         return {
             key: value.to(self.device, non_blocking=True)
@@ -265,16 +269,17 @@ def to_device(self, batch: Batch | TrainerBatch) -> Batch | TrainerBatch:
         labels=batch.labels.to(self.device, non_blocking=True),
     )
 
+
 def preprocess(
     self, microbatch: dict[str, Any]
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Ask the model to turn its batch into forward inputs.
 
-        A thin wrapper so the two bodies call the seam the same way and neither
-        has to know which model object is canonical on its stage. The group's
-        tensors are moved to the device here -- at consumption, not at read --
-        so an accumulation window's unread groups stay on the host.
-        """
+    A thin wrapper so the two bodies call the seam the same way and neither
+    has to know which model object is canonical on its stage. The group's
+    tensors are moved to the device here -- at consumption, not at read --
+    so an accumulation window's unread groups stay on the host.
+    """
     return self.example_model.preprocess_inputs(
         self.to_device(microbatch["batch"]),
         parallel_dims=self.parallel_dims,

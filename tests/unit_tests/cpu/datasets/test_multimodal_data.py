@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('grain')
+require_env("grain")
 
 
 import base64
@@ -400,7 +400,6 @@ def test_multimodal_processor_passes_short_samples_through(mm_tokenizer, image_b
     result = processor({"txt": "hello", "jpg": image_bytes}, np.random.default_rng(0))
     assert result is not None
     assert "pixel_values" in result
-
 
 
 def test_multimodal_processor_runs_over_a_jsonl_corpus(

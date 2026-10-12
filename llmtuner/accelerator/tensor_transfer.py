@@ -51,10 +51,11 @@ def get_data_device(data: Tensor | Mapping | Iterable) -> torch.device:
             else:
                 if cur != pre:
                     raise ValueError(
-                        'device type in data should be consistent, but got '
-                        f'{cur} and {pre}')
+                        "device type in data should be consistent, but got "
+                        f"{cur} and {pre}"
+                    )
         if pre is None:
-            raise ValueError('data should not be empty.')
+            raise ValueError("data should not be empty.")
         return pre
     elif isinstance(data, Iterable) and not isinstance(data, str):
         pre = None
@@ -65,20 +66,22 @@ def get_data_device(data: Tensor | Mapping | Iterable) -> torch.device:
             else:
                 if cur != pre:
                     raise ValueError(
-                        'device type in data should be consistent, but got '
-                        f'{cur} and {pre}')
+                        "device type in data should be consistent, but got "
+                        f"{cur} and {pre}"
+                    )
         if pre is None:
-            raise ValueError('data should not be empty.')
+            raise ValueError("data should not be empty.")
         return pre
     else:
-        raise TypeError('data should be a Tensor, sequence of tensor or dict, '
-                        f'but got {data}')
+        raise TypeError(
+            f"data should be a Tensor, sequence of tensor or dict, but got {data}"
+        )
 
 
 def cast_data_device(
     data: Tensor | Mapping | Iterable,
     device: torch.device,
-    out: Tensor | Mapping | Iterable | None = None
+    out: Tensor | Mapping | Iterable | None = None,
 ) -> Tensor | Mapping | Iterable:
     """Recursively convert Tensor in ``data`` to ``device``.
 
@@ -96,11 +99,12 @@ def cast_data_device(
     if out is not None:
         if type(data) is not type(out):
             raise TypeError(
-                'out should be the same type with data, but got data is '
-                f'{type(data)} and out is {type(out)}')
+                "out should be the same type with data, but got data is "
+                f"{type(data)} and out is {type(out)}"
+            )
 
         if isinstance(out, set):
-            raise TypeError('out should not be a set')
+            raise TypeError("out should not be a set")
 
     if isinstance(data, Tensor):
         if get_data_device(data) == device:
@@ -119,24 +123,28 @@ def cast_data_device(
             data_len = len(data)
             out_len = len(out)  # type: ignore
             if data_len != out_len:
-                raise ValueError('length of data and out should be same, '
-                                 f'but got {data_len} and {out_len}')
+                raise ValueError(
+                    "length of data and out should be same, "
+                    f"but got {data_len} and {out_len}"
+                )
 
             for k, v in data.items():
-                data_on_device[k] = cast_data_device(v, device,
-                                                     out[k])  # type: ignore
+                data_on_device[k] = cast_data_device(v, device, out[k])  # type: ignore
         else:
             for k, v in data.items():
                 data_on_device[k] = cast_data_device(v, device)
 
         if len(data_on_device) == 0:
-            raise ValueError('data should not be empty')
+            raise ValueError("data should not be empty")
 
         # To ensure the type of output as same as input, we use `type(data)`
         # to wrap the output
         return type(data)(data_on_device)  # type: ignore
-    elif isinstance(data, Iterable) and not isinstance(
-            data, str) and not isinstance(data, np.ndarray):
+    elif (
+        isinstance(data, Iterable)
+        and not isinstance(data, str)
+        and not isinstance(data, np.ndarray)
+    ):
         data_on_device = []
         if out is not None:
             for v1, v2 in zip(data, out, strict=True):
@@ -146,9 +154,10 @@ def cast_data_device(
                 data_on_device.append(cast_data_device(v, device))
 
         if len(data_on_device) == 0:
-            raise ValueError('data should not be empty')
+            raise ValueError("data should not be empty")
 
         return type(data)(data_on_device)  # type: ignore
     else:
-        raise TypeError('data should be a Tensor, list of tensor or dict, '
-                        f'but got {data}')
+        raise TypeError(
+            f"data should be a Tensor, list of tensor or dict, but got {data}"
+        )

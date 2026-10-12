@@ -120,9 +120,7 @@ class RandomTokenDataLoader(BaseDataLoader):
     ) -> None:
         require_positive("dp_world_size", dp_world_size)
         if not 0 <= dp_rank < dp_world_size:
-            raise ValueError(
-                f"dp_rank must be in [0, {dp_world_size}), got {dp_rank}"
-            )
+            raise ValueError(f"dp_rank must be in [0, {dp_world_size}), got {dp_rank}")
         if batch_size % dp_world_size != 0:
             raise ValueError(
                 f"batch_size={batch_size} not divisible by "
@@ -163,9 +161,7 @@ class RandomTokenDataLoader(BaseDataLoader):
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         if not state_dict:
             return
-        require_same_dp_degree(
-            state_dict.get("dp_world_size"), self._dp_world_size
-        )
+        require_same_dp_degree(state_dict.get("dp_world_size"), self._dp_world_size)
         resume_at = state_dict.get("steps", 0)
         if resume_at < self._position:
             raise ValueError(

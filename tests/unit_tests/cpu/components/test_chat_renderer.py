@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('grain')
+require_env("grain")
 
 
 import sys
@@ -112,9 +112,7 @@ def test_build_chat_renderer_without_the_package_raises_an_install_hint(
     """Real environment check: ``renderers`` is not installed here."""
     monkeypatch.delitem(sys.modules, "renderers", raising=False)
     with pytest.raises(ImportError, match="renderers==0.1.11"):
-        build_chat_renderer(
-            tokenizer=tokenizer, renderer_name="Qwen3RendererConfig"
-        )
+        build_chat_renderer(tokenizer=tokenizer, renderer_name="Qwen3RendererConfig")
     assert "pip install" in RENDERERS_INSTALL_HINT
 
 
@@ -124,9 +122,7 @@ def test_build_chat_renderer_rejects_an_unknown_name(tokenizer, fake_renderers):
 
 
 @pytest.mark.parametrize("name", ["AutoRendererConfig", "DefaultRendererConfig"])
-def test_build_chat_renderer_refuses_auto_and_default(
-    tokenizer, fake_renderers, name
-):
+def test_build_chat_renderer_refuses_auto_and_default(tokenizer, fake_renderers, name):
     with pytest.raises(ValueError, match="Pick the model's renderer"):
         build_chat_renderer(tokenizer=tokenizer, renderer_name=name)
 
@@ -185,17 +181,13 @@ def _renderer_processor(tokenizer, fake_renderers, *, max_context_length=32):
     )
 
 
-def test_renderer_processor_supervises_every_assistant_turn(
-    tokenizer, fake_renderers
-):
+def test_renderer_processor_supervises_every_assistant_turn(tokenizer, fake_renderers):
     """The mask follows the rendered history, not a single prompt prefix."""
     processor = _renderer_processor(tokenizer, fake_renderers)
     sequence = processor({"messages": MULTI_TURN}, np.random.default_rng(0))
     assert sequence is not None
 
-    rendered = _fake_build_training_sample(
-        processor._renderer, MULTI_TURN
-    )
+    rendered = _fake_build_training_sample(processor._renderer, MULTI_TURN)
     np.testing.assert_array_equal(
         sequence.input_ids, np.asarray(rendered.token_ids[:-1])
     )
@@ -245,21 +237,15 @@ def test_renderer_processor_rejects_multimodal_content(
         rendered.multi_modal_data = {"image": object()}
         return rendered
 
-    monkeypatch.setattr(
-        sys.modules["renderers"], "build_training_sample", multimodal
-    )
+    monkeypatch.setattr(sys.modules["renderers"], "build_training_sample", multimodal)
     processor = _renderer_processor(tokenizer, fake_renderers)
     with pytest.raises(ValueError, match="text-only"):
         processor({"messages": MULTI_TURN}, np.random.default_rng(0))
 
 
 def test_renderer_processor_drops_an_oversized_sample(tokenizer, fake_renderers):
-    processor = _renderer_processor(
-        tokenizer, fake_renderers, max_context_length=1
-    )
-    assert (
-        processor({"messages": MULTI_TURN}, np.random.default_rng(0)) is None
-    )
+    processor = _renderer_processor(tokenizer, fake_renderers, max_context_length=1)
+    assert processor({"messages": MULTI_TURN}, np.random.default_rng(0)) is None
 
 
 # --------------------------------------------------------------------------
@@ -275,9 +261,12 @@ def test_chat_renderer_defaults_off() -> None:
 
 def test_chat_renderer_requires_the_sft_dataset() -> None:
     with pytest.raises(ValueError, match="chat_renderer requires"):
-        DataloaderConfig(dataset="local_jsonl", tokenizer_path="/tmp/tok",
-                         dataset_path="/tmp/rows.jsonl",
-                         chat_renderer="Qwen3RendererConfig")
+        DataloaderConfig(
+            dataset="local_jsonl",
+            tokenizer_path="/tmp/tok",
+            dataset_path="/tmp/rows.jsonl",
+            chat_renderer="Qwen3RendererConfig",
+        )
 
 
 def test_chat_renderer_rejects_an_empty_messages_field() -> None:

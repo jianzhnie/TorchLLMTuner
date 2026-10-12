@@ -77,6 +77,7 @@ __all__ = [
     "ModelWrapper",
 ]
 
+
 def purge_thread(
     purge_queue: queue.Queue[str | None],
     remove_path: Callable[[str], None],
@@ -177,9 +178,7 @@ class ModelWrapper(Stateful):
         self.cached_state_dict = self._get_state_dict()
 
     def _get_state_dict(self) -> dict[str, Any]:
-        flat = {
-            k: v for model in self.model for k, v in model.state_dict().items()
-        }
+        flat = {k: v for model in self.model for k, v in model.state_dict().items()}
         return gather_expert_state(flat, self._ep_shards, self.model)
 
     def state_dict(self) -> dict[str, Any]:
@@ -394,9 +393,7 @@ class BaseCheckpointManager(ABC):
         )
         return True
 
-    def _resolve_load_source(
-        self, step: int
-    ) -> tuple[str, bool, bool, bool] | None:
+    def _resolve_load_source(self, step: int) -> tuple[str, bool, bool, bool] | None:
         """Pick the checkpoint directory this load reads.
 
         Returns ``(checkpoint_id, model_only, from_hf, from_quantized)``, or

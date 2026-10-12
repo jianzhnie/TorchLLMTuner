@@ -330,13 +330,10 @@ def main() -> None:
                 f"rank {rank}: step {step} loss {got:.6f} vs reference "
                 f"{want:.6f} (diff {diff:.3e})"
             )
-    for step, (got, want) in enumerate(
-        zip(pp_norms, reference_norms, strict=True), 1
-    ):
+    for step, (got, want) in enumerate(zip(pp_norms, reference_norms, strict=True), 1):
         if not torch.isclose(torch.tensor(got), torch.tensor(want), rtol=TOL, atol=TOL):
             failures.append(
-                f"rank {rank}: step {step} grad norm {got:.6f} vs "
-                f"reference {want:.6f}"
+                f"rank {rank}: step {step} grad norm {got:.6f} vs reference {want:.6f}"
             )
 
     # Every rank must agree that every check passed, not just report its own.

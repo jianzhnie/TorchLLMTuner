@@ -49,6 +49,7 @@ from llmtuner.config.activation_checkpoint_config import (
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.data_config import DataloaderConfig
+from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
 from llmtuner.config.optimizer_config import (
@@ -58,7 +59,6 @@ from llmtuner.config.optimizer_config import (
     ParamGroupConfig,
 )
 from llmtuner.config.parallel_config import ParallelConfig
-from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.training_config import TrainingConfig
 from llmtuner.config.validation_config import ValidationConfig
 

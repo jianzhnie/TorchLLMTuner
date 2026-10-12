@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('spmd_types')
+require_env("spmd_types")
 
 
 import pytest

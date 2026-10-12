@@ -32,7 +32,7 @@ from __future__ import annotations
 from tests.caps import require_env
 
 require_env(
-    'checkpoint_policy', 'functorch_partitioners', 'flex_attention', 'spmd_types'
+    "checkpoint_policy", "functorch_partitioners", "flex_attention", "spmd_types"
 )
 
 

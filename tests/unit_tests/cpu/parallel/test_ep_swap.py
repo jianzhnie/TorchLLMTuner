@@ -29,7 +29,7 @@ from __future__ import annotations
 from llmtuner.errors import UnsupportedCombinationError
 from tests.caps import require_env
 
-require_env('spmd_types')
+require_env("spmd_types")
 
 
 import pytest
@@ -588,8 +588,7 @@ def test_deepseek_v2_greedy_leaves_the_grouping_off() -> None:
     model = _plain_model("deepseek_v2")
     block, gate = model.layers[1].mlp, model.layers[1].mlp.gate
     assert (
-        getattr(block, "topk_method", None)
-        or getattr(gate, "topk_method", None)
+        getattr(block, "topk_method", None) or getattr(gate, "topk_method", None)
     ) == "greedy"
     assert (
         getattr(block, "num_group", None) or getattr(gate, "num_group", None)
@@ -626,8 +625,7 @@ def test_deepseek_v2_does_not_renormalize() -> None:
     model = _plain_model("deepseek_v2")
     block, gate = model.layers[1].mlp, model.layers[1].mlp.gate
     assert (
-        getattr(block, "topk_method", None)
-        or getattr(gate, "topk_method", None)
+        getattr(block, "topk_method", None) or getattr(gate, "topk_method", None)
     ) == "greedy"
 
     swap_hf_moe_blocks(model)

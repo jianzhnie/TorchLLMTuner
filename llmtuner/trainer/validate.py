@@ -137,11 +137,10 @@ def check_validation_feasibility(
         return
     if dp_world_size > 1:
         matrix.validation_once_requires_dp1(dp_world_size)
-    dataset = (
-        training_dataset if validation.dataset is None else validation.dataset
-    )
+    dataset = training_dataset if validation.dataset is None else validation.dataset
     if dataset == "random":
         matrix.validation_once_requires_finite_corpus()
+
 
 def should_validate(self, step: int) -> bool:
     """Whether a validation pass runs at the end of ``step``.
@@ -151,37 +150,36 @@ def should_validate(self, step: int) -> bool:
     after that, every ``validation.freq`` steps.
     """
     validation = self.cfg.validation
-    return validation is not None and (
-        step == 1 or step % validation.freq == 0
-    )
+    return validation is not None and (step == 1 or step % validation.freq == 0)
+
 
 @torch.no_grad()
 def validate(self, step: int) -> None:
     """Run one eval-mode, gradient-free pass and log its loss.
 
-        The reported number is the pass's summed next-token cross-entropy
-        divided by the *global* valid-token count -- the same normalization as
-        the training loss, over the same two meshes (tokens reduced across DP,
-        the loss sum across the dp*cp*tp ``loss`` view), so the eval and train
-        numbers are directly comparable and identical on every rank.
+    The reported number is the pass's summed next-token cross-entropy
+    divided by the *global* valid-token count -- the same normalization as
+    the training loss, over the same two meshes (tokens reduced across DP,
+    the loss sum across the dp*cp*tp ``loss`` view), so the eval and train
+    numbers are directly comparable and identical on every rank.
 
-        The pass is a pure observer: the model runs in eval mode (restored to
-        train mode afterwards, even on error), no gradients are computed, no
-        optimizer or scheduler state moves, and ``ntokens_seen`` -- the
-        checkpointed training counter -- is not touched.
+    The pass is a pure observer: the model runs in eval mode (restored to
+    train mode afterwards, even on error), no gradients are computed, no
+    optimizer or scheduler state moves, and ``ntokens_seen`` -- the
+    checkpointed training counter -- is not touched.
 
-        The dataloader is built fresh per pass and closed when the pass ends:
-        it is a temporary read over the corpus, not training state, so it is
-        neither checkpointed nor shared with the training loader. ``steps=-1``
-        reads it to exhaustion (built with repeat=False); a positive ``steps``
-        bounds the pass (built repeating, so the bound is always reachable).
+    The dataloader is built fresh per pass and closed when the pass ends:
+    it is a temporary read over the corpus, not training state, so it is
+    neither checkpointed nor shared with the training loader. ``steps=-1``
+    reads it to exhaustion (built with repeat=False); a positive ``steps``
+    bounds the pass (built repeating, so the bound is always reachable).
 
-        Two outcomes are loud errors rather than a silently skipped report: a
-        pass that read zero batches (the dataset supplied less than one batch
-        of tokens on this rank, which concat-then-split packing turns into no
-        rows at all), and a pass over zero valid tokens (every label masked),
-        which has no average to report.
-        """
+    Two outcomes are loud errors rather than a silently skipped report: a
+    pass that read zero batches (the dataset supplied less than one batch
+    of tokens on this rank, which concat-then-split packing turns into no
+    rows at all), and a pass over zero valid tokens (every label masked),
+    which has no average to report.
+    """
     validation = self.cfg.validation
     assert validation is not None, "validate() is gated by should_validate"
 
@@ -193,6 +191,7 @@ def validate(self, step: int) -> None:
         for part in self.model_parts:
             part.train()
 
+
 def validate_body(self, validation: ValidationConfig, step: int) -> None:
     parallel_dims = self.parallel_dims
     if parallel_dims is not None and parallel_dims.pp_enabled:
@@ -202,9 +201,7 @@ def validate_body(self, validation: ValidationConfig, step: int) -> None:
     validation_dataloader = build_validation_dataloader(self, validation)
 
     accumulated_loss: torch.Tensor | None = None
-    total_global_valid_tokens = torch.zeros(
-        (), dtype=torch.int64, device=self.device
-    )
+    total_global_valid_tokens = torch.zeros((), dtype=torch.int64, device=self.device)
     num_steps = 0
     try:
         data_iterator = iter(validation_dataloader)
@@ -279,9 +276,7 @@ def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
     validation_dataloader = build_validation_dataloader(self, validation)
 
     accumulated_loss: torch.Tensor | None = None
-    total_global_valid_tokens = torch.zeros(
-        (), dtype=torch.int64, device=self.device
-    )
+    total_global_valid_tokens = torch.zeros((), dtype=torch.int64, device=self.device)
     num_steps = 0
     try:
         data_iterator = iter(validation_dataloader)
@@ -331,9 +326,7 @@ def validate_body_pp(self, validation: ValidationConfig, step: int) -> None:
     finish_validation(
         self,
         num_steps=num_steps,
-        accumulated_loss=(
-            accumulated_loss if self.pp_has_last_stage else None
-        ),
+        accumulated_loss=(accumulated_loss if self.pp_has_last_stage else None),
         total_global_valid_tokens=total_global_valid_tokens,
         loss_mesh=loss_mesh,
         step=step,

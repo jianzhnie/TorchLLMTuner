@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('spmd_types')
+require_env("spmd_types")
 
 
 import pytest
@@ -38,9 +38,7 @@ def test_declaration_factories_pick_the_right_realizer() -> None:
     assert colwise() == ShardingConfig(
         kind="colwise", implementation=ColumnParallelLinear
     )
-    assert rowwise() == ShardingConfig(
-        kind="rowwise", implementation=RowParallelLinear
-    )
+    assert rowwise() == ShardingConfig(kind="rowwise", implementation=RowParallelLinear)
 
 
 def test_colwise_layout_is_cut_on_output_features() -> None:

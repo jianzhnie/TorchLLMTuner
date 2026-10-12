@@ -207,9 +207,7 @@ def test_regional_inductor_not_triggered_without_flex() -> None:
 @requires_runtime
 def test_flex_model_rejects_unknown_backend(monkeypatch) -> None:
     model = _model()
-    monkeypatch.setattr(
-        type(model), "uses_flex_attention", property(lambda self: True)
-    )
+    monkeypatch.setattr(type(model), "uses_flex_attention", property(lambda self: True))
     with pytest.raises(ValueError, match="neither 'inductor' nor 'aot_eager'"):
         apply_compile(model, compile_config=CompileConfig(backend="eager"))
 
@@ -222,9 +220,7 @@ def test_flex_model_rejects_unknown_backend(monkeypatch) -> None:
 )
 def test_regional_inductor_on_unsupported_torch_loud_raises(monkeypatch) -> None:
     model = _model()
-    monkeypatch.setattr(
-        type(model), "uses_flex_attention", property(lambda self: True)
-    )
+    monkeypatch.setattr(type(model), "uses_flex_attention", property(lambda self: True))
     with pytest.raises(NotImplementedError, match="regional_inductor"):
         apply_compile(model, compile_config=CompileConfig(backend="aot_eager"))
 

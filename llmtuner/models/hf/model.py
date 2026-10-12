@@ -70,7 +70,6 @@ logger = get_logger(__name__)
 __all__ = ["HFTransformerModel"]
 
 
-
 def flex_supported() -> str:
     """The attention implementation this machine can actually run.
 
@@ -133,11 +132,6 @@ def uses_dsa(config) -> bool:
     return getattr(config, "index_topk", None) is not None
 
 
-
-
-
-
-
 def first_present(module: nn.Module, names: tuple[str, ...], what: str) -> str:
     """Return the first of ``names`` that ``module`` has.
 
@@ -188,7 +182,6 @@ def document_shift(labels: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     boundaries, so it never calls this.
     """
     return next_token_targets(labels.reshape(-1), seq_len=seq_len)
-
 
 
 def validate_head_config(config: PretrainedConfig) -> None:
@@ -543,9 +536,7 @@ class HFTransformerModel(nn.Module):
         labels: torch.Tensor,
         positions: torch.Tensor | None,
         padding_mask: torch.Tensor | None,
-    ) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Step 4b of ``preprocess_inputs``: the TP (sequence-parallel) shard.
 
         Only the token-carrying tensors are cut; positions keep the CP-shard
@@ -688,15 +679,13 @@ class HFTransformerModel(nn.Module):
         cp_mesh = (
             None if parallel_dims is None else parallel_dims.get_optional_mesh("cp")
         )
-        inputs, labels, positions, padding_mask, attention_masks = (
-            self._shard_for_cp(
-                cp_mesh,
-                packed=packed,
-                inputs=inputs,
-                labels=labels,
-                positions=positions,
-                padding_mask=padding_mask,
-            )
+        inputs, labels, positions, padding_mask, attention_masks = self._shard_for_cp(
+            cp_mesh,
+            packed=packed,
+            inputs=inputs,
+            labels=labels,
+            positions=positions,
+            padding_mask=padding_mask,
         )
         if attention_masks is not None:
             extra_kwargs["attention_masks"] = attention_masks

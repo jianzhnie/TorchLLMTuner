@@ -32,6 +32,7 @@ def _trainer_cls():
         reason="trainer import needs a newer torch than this host has",
     ).Trainer
 
+
 VOCAB = 8
 SEQ_LEN = 4
 
@@ -154,7 +155,9 @@ def test_feasibility_accepts_pipeline_parallelism() -> None:
     (upstream Validator's seam) drives the pass; see validate_body_pp."""
     Trainer = _trainer_cls()
     Trainer.check_validation_feasibility(
-        ValidationConfig(), dp_world_size=1, training_dataset="local_jsonl",
+        ValidationConfig(),
+        dp_world_size=1,
+        training_dataset="local_jsonl",
     )
 
 
@@ -162,7 +165,8 @@ def test_feasibility_rejects_steps_neg1_when_dp_gt_1() -> None:
     Trainer = _trainer_cls()
     with pytest.raises(ValueError, match="validation collectives"):
         Trainer.check_validation_feasibility(
-            ValidationConfig(steps=-1), dp_world_size=2,
+            ValidationConfig(steps=-1),
+            dp_world_size=2,
             training_dataset="local_jsonl",
         )
 
@@ -171,25 +175,29 @@ def test_feasibility_rejects_steps_neg1_on_the_infinite_corpus() -> None:
     Trainer = _trainer_cls()
     with pytest.raises(ValueError, match="infinite synthetic source"):
         Trainer.check_validation_feasibility(
-            ValidationConfig(steps=-1), dp_world_size=1,
+            ValidationConfig(steps=-1),
+            dp_world_size=1,
             training_dataset="random",
         )
     # The override corpus is what the pass reads, so it is the one checked.
     with pytest.raises(ValueError, match="infinite synthetic source"):
         Trainer.check_validation_feasibility(
             ValidationConfig(steps=-1, dataset="random"),
-            dp_world_size=1, training_dataset="local_jsonl",
+            dp_world_size=1,
+            training_dataset="local_jsonl",
         )
 
 
 def test_feasibility_accepts_the_terminating_combinations() -> None:
     Trainer = _trainer_cls()
     Trainer.check_validation_feasibility(
-        ValidationConfig(steps=-1), dp_world_size=1,
+        ValidationConfig(steps=-1),
+        dp_world_size=1,
         training_dataset="local_jsonl",
     )
     Trainer.check_validation_feasibility(
-        ValidationConfig(steps=10), dp_world_size=8,
+        ValidationConfig(steps=10),
+        dp_world_size=8,
         training_dataset="random",
     )
 

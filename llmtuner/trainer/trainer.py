@@ -697,9 +697,7 @@ class Trainer:
                     group=loss_mesh.get_group(),
                 )
         if pp_mesh is not None:
-            all_reduce(
-                step_is_finite, op="min", group=pp_mesh.get_group()
-            )
+            all_reduce(step_is_finite, op="min", group=pp_mesh.get_group())
         # grad_norm arrives already world-reduced (clip_grad_norm_ materializes
         # the DTensor norm and reduces across PP), so this term is the same on
         # every rank; it is folded in for the reader, not for the reduction.

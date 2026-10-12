@@ -103,9 +103,7 @@ def main() -> None:
 
     with torch.no_grad():
         local = model(ids, positions=positions)
-        full = torch.cat(
-            [torch.empty_like(local) for _ in range(world)], dim=-2
-        )
+        full = torch.cat([torch.empty_like(local) for _ in range(world)], dim=-2)
         dist.all_gather_into_tensor(full, local, group=tp_mesh.get_group())
     diff = (full - ref_logits).abs().max().item()
     if diff > TOL:

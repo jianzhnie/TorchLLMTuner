@@ -242,8 +242,7 @@ class TokenChoiceTopKRouter(nn.Module):
         if padding_mask_T is not None:
             if padding_mask_T.dtype != torch.bool:
                 raise ValueError(
-                    "padding_mask_T must have dtype bool, "
-                    f"got {padding_mask_T.dtype}."
+                    f"padding_mask_T must have dtype bool, got {padding_mask_T.dtype}."
                 )
             if padding_mask_T.shape != scores_TE.shape[:-1]:
                 raise ValueError(
@@ -405,8 +404,7 @@ class QuantileBalancer(nn.Module):
         super().__init__()
         if not 0 < top_k < num_experts:
             raise ValueError(
-                f"top_k ({top_k}) must be between zero and num_experts "
-                f"({num_experts})"
+                f"top_k ({top_k}) must be between zero and num_experts ({num_experts})"
             )
         self.num_experts = num_experts
         self.top_k = top_k
@@ -438,13 +436,11 @@ class QuantileBalancer(nn.Module):
             scores_TE = scores_TE[valid_mask_T]
             cutoff_T1 = cutoff_T1[valid_mask_T]
         lower_bound = expert_bias_E.min() - 1.0
-        bin_width = (
-            expert_bias_E.max() - expert_bias_E.min() + 2.0
-        ) / self.num_bins
+        bin_width = (expert_bias_E.max() - expert_bias_E.min() + 2.0) / self.num_bins
         required_bias_TE = cutoff_T1 - scores_TE
-        bin_indices_TE = torch.floor(
-            (required_bias_TE - lower_bound) / bin_width
-        ).to(torch.int64)
+        bin_indices_TE = torch.floor((required_bias_TE - lower_bound) / bin_width).to(
+            torch.int64
+        )
         bin_indices_ET = bin_indices_TE.clamp_(0, self.num_bins - 1).transpose(0, 1)
         self.required_bias_histogram_EB.scatter_add_(
             1,

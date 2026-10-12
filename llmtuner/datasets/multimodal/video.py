@@ -19,6 +19,7 @@ logger = get_logger(__name__)
 
 __all__ = ["load_video", "process_video"]
 
+
 def load_video(
     path: str,
     fps: float = 2.0,
@@ -95,6 +96,7 @@ def load_video(
     except Exception as e:
         logger.warning(f"Error loading video {path}: {e}")
         return None
+
 
 def process_video(
     video: torch.Tensor,

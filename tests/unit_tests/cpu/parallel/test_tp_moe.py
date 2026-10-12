@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('spmd_types')
+require_env("spmd_types")
 
 
 import pytest
@@ -54,12 +54,16 @@ class _Experts(nn.Module):
             mask = routing_weights[:, e] != 0
             if not mask.any():
                 continue
-            gate, up = torch.nn.functional.linear(
-                x[mask], self.gate_up_proj[e]
-            ).chunk(2, dim=-1)
-            out[mask] = out[mask] + torch.nn.functional.linear(
-                torch.nn.functional.silu(gate) * up, self.down_proj[e]
-            ) * routing_weights[mask, e : e + 1]
+            gate, up = torch.nn.functional.linear(x[mask], self.gate_up_proj[e]).chunk(
+                2, dim=-1
+            )
+            out[mask] = (
+                out[mask]
+                + torch.nn.functional.linear(
+                    torch.nn.functional.silu(gate) * up, self.down_proj[e]
+                )
+                * routing_weights[mask, e : e + 1]
+            )
         return out
 
 
@@ -173,9 +177,7 @@ def test_expert_shards_reconstruct_the_full_weights() -> None:
         assert "experts.down_proj" in ids
         # The router is never sharded.
         assert "gate.weight" not in ids
-        shards.append(
-            (b.experts.gate_up_proj.detach(), b.experts.down_proj.detach())
-        )
+        shards.append((b.experts.gate_up_proj.detach(), b.experts.down_proj.detach()))
 
     # gate_up: (E, 2F, D), gate half and up half sharded separately on dim 1,
     # so each rank's stored (E, F, D) shard is cat(gate_shard, up_shard).
@@ -355,7 +357,7 @@ def test_shared_expert_is_not_double_sharded_by_the_dense_plan() -> None:
     assert shared.gate_proj.weight.shape[0] == 32 // 2
     assert shared.down_proj.weight.shape[1] == 32 // 2
     for proj in (shared.gate_proj, shared.up_proj, shared.down_proj):
-        assert not isinstance(proj, (ColumnParallelLinear, RowParallelLinear))
+        assert not isinstance(proj, ColumnParallelLinear | RowParallelLinear)
 
 
 def test_apply_tp_raises_on_a_shared_expert_block() -> None:

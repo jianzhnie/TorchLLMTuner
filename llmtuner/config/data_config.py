@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from llmtuner.config.utils import require_at_least
+from llmtuner.config.field_checks_config import require_at_least
 from llmtuner.errors import ConfigError
 
 

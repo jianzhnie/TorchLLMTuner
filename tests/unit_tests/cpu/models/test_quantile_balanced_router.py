@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('spmd_types')
+require_env("spmd_types")
 
 
 import pytest
@@ -159,9 +159,7 @@ def test_routing_uses_biased_choice_and_unbiased_weight() -> None:
     assert torch.equal(topk_expert_ids_TK[:, 0], torch.zeros(6, dtype=torch.int64))
     with torch.no_grad():
         scores_TE = torch.sigmoid(router.gate(x_TD))
-    torch.testing.assert_close(
-        topk_scores_TK, scores_TE.gather(-1, topk_expert_ids_TK)
-    )
+    torch.testing.assert_close(topk_scores_TK, scores_TE.gather(-1, topk_expert_ids_TK))
 
 
 def test_a_training_forward_routes_like_the_base_router_but_observes() -> None:

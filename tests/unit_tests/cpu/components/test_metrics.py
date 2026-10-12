@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('wandb', 'pipelining', 'flex_attention')
+require_env("wandb", "pipelining", "flex_attention")
 
 
 import logging

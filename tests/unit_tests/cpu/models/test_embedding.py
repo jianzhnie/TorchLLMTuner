@@ -13,7 +13,7 @@ patched counts stands in for a real TP group.
 
 from tests.caps import require_env
 
-require_env('spmd_types')
+require_env("spmd_types")
 
 
 import torch
