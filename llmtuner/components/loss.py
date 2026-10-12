@@ -90,6 +90,8 @@ def next_token_targets(labels: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     its denominator (``(targets != IGNORE_INDEX).sum()``), so nothing is
     silently over- or under-counted.
     """
+    if seq_len < 1:
+        raise ValueError(f"seq_len must be >= 1, got {seq_len}")
     if labels.numel() % seq_len != 0:
         raise ValueError(
             f"next_token_targets got {labels.numel()} labels, which is not a "
@@ -98,7 +100,9 @@ def next_token_targets(labels: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     targets = torch.full_like(labels, IGNORE_INDEX)
     # Row r of the (B, T) layout occupies [r*T, (r+1)*T); its predictions are the
     # positions [r*T + 1, (r+1)*T) and its targets are [r*T + 1, (r+1)*T).
-    targets.view(-1, seq_len)[:, :-1] = labels.view(-1, seq_len)[:, 1:]
+    targets = targets.reshape(-1, seq_len)
+    targets[:, :-1] = labels.reshape(-1, seq_len)[:, 1:]
+    targets = targets.reshape(labels.shape)
     return targets
 
 

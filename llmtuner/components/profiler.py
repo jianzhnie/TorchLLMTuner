@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -191,7 +192,19 @@ class Profiler:
 
     def __enter__(self) -> Profiler:
         self.torch_profiler = self.build_torch_profiler()
-        self.memory_profiler = self.build_memory_profiler()
+        try:
+            self.memory_profiler = self.build_memory_profiler()
+        except Exception:
+            # __exit__ is not called by `with` when __enter__ fails.
+            if self.torch_profiler is not None:
+                profiler, self.torch_profiler = self.torch_profiler, None
+                try:
+                    profiler.__exit__(*sys.exc_info())
+                except Exception:
+                    logger.exception(
+                        "Failed to stop profiler after initialization error"
+                    )
+            raise
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:

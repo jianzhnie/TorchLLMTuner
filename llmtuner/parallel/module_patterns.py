@@ -8,8 +8,10 @@ parallel package lets TP and FSDP use exactly the same selection semantics.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 
+@lru_cache(maxsize=256)
 def compile_module_pattern(pattern: str) -> re.Pattern[str]:
     """Compile an FSDPTurbo compatible module path pattern."""
     parts: list[str] = []

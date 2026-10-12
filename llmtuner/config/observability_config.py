@@ -130,7 +130,7 @@ class ProfilerConfig:
 # HfArgumentParser cannot turn a nested dataclass into a set of flags -- it
 # collapses it to one opaque `--<field>` argument and never consults the fields
 # inside. The `<x>_config` field is that escape hatch: the config's own group is
-# parsed separately in train.py and grafted back on here, which is also where
+# parsed separately in trainer/cli.py and grafted back on here, which is also where
 # its __post_init__ re-runs against the parsed values.
 #
 # That is what keeps every class in this package named `*Config`. Renaming one is

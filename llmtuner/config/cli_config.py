@@ -40,7 +40,7 @@ from .training_config import MetricsConfig, ProfilerConfig, TrainingConfig
 
 # The groups the CLI parses, in the order ``LLMTunerConfig.from_groups`` takes
 # them. Parser order is significant: ``parse_args_into_dataclasses`` returns one
-# instance per class in this exact order, and ``train.py`` zips the two
+# instance per class in this exact order, and ``trainer/cli.py`` zips the two
 # together. Kept here, next to the view, so the parser's group set has one
 # definition and no caller can quietly drop or reorder a group.
 PARSER_GROUPS: tuple[type, ...] = (

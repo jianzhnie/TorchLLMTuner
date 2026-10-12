@@ -53,7 +53,10 @@ class HFTransformerStateDictAdapter:
             missing = self._hf_keys - requested
             unexpected = requested - self._hf_keys
             # A tied lm_head is legitimately omitted from a HF checkpoint.
-            if getattr(self.model_config, "tie_word_embeddings", False):
+            if (
+                getattr(self.model_config, "tie_word_embeddings", False)
+                and "lm_head.weight" not in self._hf_keys
+            ):
                 unexpected.discard("lm_head.weight")
                 hf_state.pop("lm_head.weight", None)
             if missing or unexpected:
@@ -65,6 +68,7 @@ class HFTransformerStateDictAdapter:
         return hf_state
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+        hf_state_dict = dict(hf_state_dict)
         if (
             "lm_head.weight" not in hf_state_dict
             and "model.embed_tokens.weight" in hf_state_dict

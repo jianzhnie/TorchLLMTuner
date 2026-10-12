@@ -93,7 +93,7 @@ def apply_fsdp_by_pattern(
         )
 
     for name in sorted(selected, key=lambda item: item.count("."), reverse=True):
-        shard_fn(named[name], **common, **selected[name])
+        shard_fn(named[name], **(common | selected[name]))
     shard_fn(model, **common)
     set_fsdp_prefetch_windows(
         [module for name, module in named.items() if name in selected],

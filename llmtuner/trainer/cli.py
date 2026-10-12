@@ -47,6 +47,7 @@ Profiling (off unless enabled; both write under --dump_folder):
 from __future__ import annotations
 
 import os
+import sys
 
 import torch.distributed as dist
 from transformers import HfArgumentParser
@@ -65,8 +66,11 @@ from llmtuner.config import (
 )
 from llmtuner.config.cli_config import PARSER_GROUPS, cli_groups
 from llmtuner.errors import ConfigError
+from llmtuner.utils.logging import get_logger
 
 from .trainer import Trainer
+
+logger = get_logger(__name__)
 
 
 def parse_config() -> LLMTunerConfig:
@@ -122,10 +126,17 @@ def main() -> None:
         # example validation or post-run aggregation).  The console entrypoint
         # owns the process-group lifetime and tears it down here, matching
         # torchtitan's train.py lifecycle.
-        if trainer is not None:
-            trainer.close()
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        training_error = sys.exc_info()[1]
+        try:
+            if trainer is not None:
+                trainer.close()
+        except Exception:
+            if training_error is None:
+                raise
+            logger.exception("Resource cleanup failed after an entry-point error")
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
 
 
 if __name__ == "__main__":
