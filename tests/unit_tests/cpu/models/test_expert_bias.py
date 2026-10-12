@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('spmd_types')
+require_env("spmd_types")
 
 
 import pytest
@@ -267,9 +267,7 @@ def test_wrapped_layers_are_unwrapped() -> None:
             self._checkpoint_wrapped_module = inner
 
     holder = torch.nn.Module()
-    holder.layers = torch.nn.ModuleList(
-        [_FakeCheckpointWrapper(_Layer(sparse))]
-    )
+    holder.layers = torch.nn.ModuleList([_FakeCheckpointWrapper(_Layer(sparse))])
 
     assert iter_moe_layers(holder) == [sparse]
 

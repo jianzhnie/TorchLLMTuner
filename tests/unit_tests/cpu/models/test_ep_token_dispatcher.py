@@ -11,7 +11,7 @@ against it; the gating tests (no package installed) run for real.
 
 from tests.caps import require_env
 
-require_env('spmd_types')
+require_env("spmd_types")
 
 
 import sys
@@ -155,9 +155,7 @@ def test_torchao_ep1_dispatch_pads_groups_to_multiple(fake_torchao):
 
     routed, padded_counts, metadata = dispatcher.dispatch(x_TD, scores, ids, counts)
 
-    assert padded_counts.tolist() == [
-        int(c) + (-int(c) % 4) for c in counts.tolist()
-    ]
+    assert padded_counts.tolist() == [int(c) + (-int(c) % 4) for c in counts.tolist()]
     assert routed.shape[0] == int(padded_counts.sum())
     assert routed.shape[1] == x_TD.shape[1]
     # No EP group was wired: the all-to-all path must not have run.

@@ -113,6 +113,7 @@ def require_torch_checkpointing():
             SyncCheckpointSaverConfig,
         )
         from torch_checkpointing.default_resharder import DefaultResharder
+
         try:
             from torch_checkpointing.metadata_serialization import (
                 METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,
@@ -125,6 +126,7 @@ def require_torch_checkpointing():
         from torch_checkpointing.hf.consolidation import (
             consolidate_hf_safetensors_checkpoint,
         )
+
         try:
             from torch_checkpointing.hf.metadata import (
                 HF_SAFETENSORS_INDEX_FILE_TEMPLATE,
@@ -465,8 +467,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             )
         if from_hf and self.sd_adapter is None:
             raise ValueError(
-                "checkpoint.initial_load_in_hf is True, but sd_adapter "
-                "is not provided."
+                "checkpoint.initial_load_in_hf is True, but sd_adapter is not provided."
             )
         hf_metadata_format = (
             self._backend.HuggingFaceSafetensorsDistributedMetadataFormat

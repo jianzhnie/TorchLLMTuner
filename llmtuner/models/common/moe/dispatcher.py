@@ -680,9 +680,7 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         # ep_size=1 when EP is disabled: permute_and_pad then only pads token
         # groups (rank-major == expert-major for a single rank).
         ep_size = (
-            1
-            if self.ep_group is None
-            else dist_utils.get_world_size(self.ep_group)
+            1 if self.ep_group is None else dist_utils.get_world_size(self.ep_group)
         )
         e = num_global_tokens_per_local_expert_E.shape[0] // ep_size
 

@@ -264,4 +264,3 @@ def next_document_chunk_end(
         if next_starts.size:
             end = start + 1 + int(next_starts[0])
     return end
-

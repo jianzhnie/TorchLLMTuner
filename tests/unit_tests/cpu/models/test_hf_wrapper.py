@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('flex_attention', 'spmd_types')
+require_env("flex_attention", "spmd_types")
 
 
 import pytest
@@ -74,9 +74,7 @@ def test_meta_materialization_restores_rope_and_loads_exact_weights() -> None:
     materialize_meta_model(restored, torch.device("cpu"))
     restored.load_state_dict(reference.state_dict(), strict=True)
 
-    assert torch.equal(
-        restored.rotary_emb.inv_freq, reference.rotary_emb.inv_freq
-    )
+    assert torch.equal(restored.rotary_emb.inv_freq, reference.rotary_emb.inv_freq)
     ids = torch.randint(0, _VOCAB, (16,))
     with torch.no_grad():
         assert torch.equal(restored(ids), reference(ids))

@@ -26,6 +26,7 @@ logger = get_logger(__name__)
 
 __all__ = ["BaseTokenizer", "HuggingFaceTokenizer", "MultiModalTokenizer"]
 
+
 class BaseTokenizer(ABC):
     """Interface every tokenizer in the data pipeline satisfies.
 
@@ -98,6 +99,7 @@ class BaseTokenizer(ABC):
         if self._chat_template is None:
             raise ValueError("No chat template set. Call set_chat_template() first.")
         return self._chat_template.render(messages=messages, **kwargs)
+
 
 class HuggingFaceTokenizer(BaseTokenizer):
     """A tokenizer wrapper that handles BOS/EOS token inference and encoding.
@@ -472,6 +474,7 @@ class HuggingFaceTokenizer(BaseTokenizer):
         kwargs.setdefault("eos_token", self.eos_token or "")
         kwargs.setdefault("add_generation_prompt", True)
         return super().apply_chat_template(messages, **kwargs)
+
 
 class MultiModalTokenizer(HuggingFaceTokenizer):
     """Single source of truth for multimodal special tokens.

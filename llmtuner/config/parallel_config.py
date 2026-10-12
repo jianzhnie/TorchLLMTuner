@@ -9,7 +9,7 @@ import torch
 
 from llmtuner.config.context_parallel_config import validate_context_parallel_config
 from llmtuner.config.expert_parallel_config import validate_expert_parallel_config
-from llmtuner.config.utils import require_at_least
+from llmtuner.config.field_checks_config import require_at_least
 from llmtuner.config.fsdp_config import validate_fsdp_config
 from llmtuner.config.pipeline_parallel_config import validate_pipeline_parallel_config
 from llmtuner.config.tensor_parallel_config import validate_tensor_parallel_config

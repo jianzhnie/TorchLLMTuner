@@ -34,20 +34,17 @@ def get_default_group() -> ProcessGroup | None:
 
 
 def infer_launcher():
-    if 'WORLD_SIZE' in os.environ:
-        return 'pytorch'
-    elif 'SLURM_NTASKS' in os.environ:
-        return 'slurm'
-    elif 'OMPI_COMM_WORLD_LOCAL_RANK' in os.environ:
-        return 'mpi'
+    if "WORLD_SIZE" in os.environ:
+        return "pytorch"
+    elif "SLURM_NTASKS" in os.environ:
+        return "slurm"
+    elif "OMPI_COMM_WORLD_LOCAL_RANK" in os.environ:
+        return "mpi"
     else:
-        return 'none'
+        return "none"
 
 
-def init_dist(launcher,
-              backend='nccl',
-              init_backend='torch',
-              **kwargs) -> None:
+def init_dist(launcher, backend="nccl", init_backend="torch", **kwargs) -> None:
     """Initialize distributed environment.
 
     Note:
@@ -65,36 +62,37 @@ def init_dist(launcher,
             'gloo' and 'mpi'. Defaults to 'nccl'.
         **kwargs: keyword arguments are passed to ``init_process_group``.
     """
-    if device_type == 'cpu' and backend == 'nccl':
+    if device_type == "cpu" and backend == "nccl":
         # 'nccl' is the default spelling, not a choice: on a CPU-only box it
         # can only fail, so fall back to the derived backend (gloo).
         backend = get_distributed_backend()
-    timeout = kwargs.get('timeout', None)
+    timeout = kwargs.get("timeout", None)
     if timeout is not None:
         # If a timeout (in seconds) is specified, it must be converted
         # to a timedelta object before forwarding the call to
         # the respective backend, because they expect a timedelta object.
         try:
-            kwargs['timeout'] = datetime.timedelta(seconds=timeout)
+            kwargs["timeout"] = datetime.timedelta(seconds=timeout)
         except TypeError as exception:
             raise TypeError(
-                f'Timeout for distributed training must be provided as '
+                f"Timeout for distributed training must be provided as "
                 f"timeout in seconds, but we've received the type "
-                f'{type(timeout)}. Please specify the timeout like this: '
-                f"dist_cfg=dict(backend='nccl', timeout=1800)") from exception
+                f"{type(timeout)}. Please specify the timeout like this: "
+                f"dist_cfg=dict(backend='nccl', timeout=1800)"
+            ) from exception
     if mp.get_start_method(allow_none=True) is None:
-        mp.set_start_method('spawn')
-    if launcher == 'pytorch':
+        mp.set_start_method("spawn")
+    if launcher == "pytorch":
         init_dist_pytorch(backend, init_backend=init_backend, **kwargs)
-    elif launcher == 'mpi':
+    elif launcher == "mpi":
         init_dist_mpi(backend, **kwargs)
-    elif launcher == 'slurm':
+    elif launcher == "slurm":
         init_dist_slurm(backend, init_backend=init_backend, **kwargs)
     else:
-        raise ValueError(f'Invalid launcher type: {launcher}')
+        raise ValueError(f"Invalid launcher type: {launcher}")
 
 
-def init_dist_pytorch(backend, init_backend='torch', **kwargs) -> None:
+def init_dist_pytorch(backend, init_backend="torch", **kwargs) -> None:
     """Initialize distributed environment with PyTorch launcher.
 
     Args:
@@ -102,10 +100,10 @@ def init_dist_pytorch(backend, init_backend='torch', **kwargs) -> None:
             'nccl', 'gloo' and 'mpi'. Defaults to 'nccl'.
         **kwargs: keyword arguments are passed to ``init_process_group``.
     """
-    rank = int(os.environ['RANK'])
+    rank = int(os.environ["RANK"])
     # LOCAL_RANK is set by `torch.distributed.launch` since PyTorch 1.1
-    local_rank = int(os.environ['LOCAL_RANK'])
-    if device_type not in ('cpu', 'cuda'):
+    local_rank = int(os.environ["LOCAL_RANK"])
+    if device_type not in ("cpu", "cuda"):
         # Vendor accelerators (npu / mlu / musa / xpu): one generic path --
         # the backend string is owned by ``device.py``'s map rather than a
         # second hardcoded table here, and every vendor takes LOCAL_RANK
@@ -115,30 +113,33 @@ def init_dist_pytorch(backend, init_backend='torch', **kwargs) -> None:
         torch_dist.init_process_group(
             backend=get_distributed_backend(),
             rank=rank,
-            world_size=int(os.environ['WORLD_SIZE']),
-            **kwargs)
-    elif device_type == 'cpu':
+            world_size=int(os.environ["WORLD_SIZE"]),
+            **kwargs,
+        )
+    elif device_type == "cpu":
         # gloo/mpi runs have no device to set.
-        if init_backend == 'torch':
+        if init_backend == "torch":
             torch_dist.init_process_group(backend=backend, **kwargs)
         else:
-            raise ValueError(
-                f'init_backend={init_backend!r} is not supported on CPU')
+            raise ValueError(f"init_backend={init_backend!r} is not supported on CPU")
     else:
         torch.cuda.set_device(local_rank)
 
-        if init_backend == 'torch':
+        if init_backend == "torch":
             torch_dist.init_process_group(backend=backend, **kwargs)
-        elif init_backend == 'deepspeed':
+        elif init_backend == "deepspeed":
             import deepspeed
+
             deepspeed.init_distributed(dist_backend=backend, **kwargs)
-        elif init_backend == 'colossalai':
+        elif init_backend == "colossalai":
             import colossalai
+
             colossalai.launch_from_torch(backend=backend, **kwargs)
         else:
             raise ValueError(
                 'supported "init_backend" is "torch" or "deepspeed", '
-                f'but got {init_backend}')
+                f"but got {init_backend}"
+            )
 
 
 def init_dist_mpi(backend, **kwargs) -> None:
@@ -149,34 +150,32 @@ def init_dist_mpi(backend, **kwargs) -> None:
             'nccl', 'gloo' and 'mpi'. Defaults to 'nccl'.
         **kwargs: keyword arguments are passed to ``init_process_group``.
     """
-    if backend == 'smddp':
+    if backend == "smddp":
         try:
             import smdistributed.dataparallel.torch.torch_smddp  # noqa: F401
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError(
-                'Please use an Amazon SageMaker DLC to access smdistributed: '
-                'https://github.com/aws/deep-learning-containers/blob/master'
-                '/available_images.md#sagemaker-framework-containers'
-                '-sm-support-only') from e
-    local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
-    if device_type not in ('cpu', 'cuda'):
+                "Please use an Amazon SageMaker DLC to access smdistributed: "
+                "https://github.com/aws/deep-learning-containers/blob/master"
+                "/available_images.md#sagemaker-framework-containers"
+                "-sm-support-only"
+            ) from e
+    local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
+    if device_type not in ("cpu", "cuda"):
         set_device(torch.device(device_type, local_rank))
-    elif device_type == 'cuda':
+    elif device_type == "cuda":
         torch.cuda.set_device(local_rank)
-    if 'MASTER_PORT' not in os.environ:
+    if "MASTER_PORT" not in os.environ:
         # 29500 is torch.distributed default port
-        os.environ['MASTER_PORT'] = '29500'
-    if 'MASTER_ADDR' not in os.environ:
-        raise KeyError('The environment variable MASTER_ADDR is not set')
-    os.environ['WORLD_SIZE'] = os.environ['OMPI_COMM_WORLD_SIZE']
-    os.environ['RANK'] = os.environ['OMPI_COMM_WORLD_RANK']
+        os.environ["MASTER_PORT"] = "29500"
+    if "MASTER_ADDR" not in os.environ:
+        raise KeyError("The environment variable MASTER_ADDR is not set")
+    os.environ["WORLD_SIZE"] = os.environ["OMPI_COMM_WORLD_SIZE"]
+    os.environ["RANK"] = os.environ["OMPI_COMM_WORLD_RANK"]
     torch_dist.init_process_group(backend=backend, **kwargs)
 
 
-def init_dist_slurm(backend,
-                     port=None,
-                     init_backend='torch',
-                     **kwargs) -> None:
+def init_dist_slurm(backend, port=None, init_backend="torch", **kwargs) -> None:
     """Initialize slurm distributed training environment.
 
     If argument ``port`` is not specified, then the master port will be system
@@ -187,65 +186,65 @@ def init_dist_slurm(backend,
         backend (str): Backend of torch.distributed.
         port (int, optional): Master port. Defaults to None.
     """
-    proc_id = int(os.environ['SLURM_PROCID'])
-    ntasks = int(os.environ['SLURM_NTASKS'])
-    node_list = os.environ['SLURM_NODELIST']
+    proc_id = int(os.environ["SLURM_PROCID"])
+    ntasks = int(os.environ["SLURM_NTASKS"])
+    node_list = os.environ["SLURM_NODELIST"]
     # Not sure when this environment variable could be None, so use a fallback
-    local_rank_env = os.environ.get('SLURM_LOCALID', None)
+    local_rank_env = os.environ.get("SLURM_LOCALID", None)
     if local_rank_env is not None:
         local_rank = int(local_rank_env)
     else:
         num_gpus = (
-            1 if device_type == 'cpu' else getattr(torch, device_type).device_count()
+            1 if device_type == "cpu" else getattr(torch, device_type).device_count()
         )
         local_rank = proc_id % num_gpus
-    addr = subprocess.getoutput(
-        f'scontrol show hostname {node_list} | head -n1')
+    addr = subprocess.getoutput(f"scontrol show hostname {node_list} | head -n1")
     # specify master port
     if port is not None:
-        os.environ['MASTER_PORT'] = str(port)
-    elif 'MASTER_PORT' in os.environ:
+        os.environ["MASTER_PORT"] = str(port)
+    elif "MASTER_PORT" in os.environ:
         pass  # use MASTER_PORT in the environment variable
     else:
         # 29500 is torch.distributed default port
-        os.environ['MASTER_PORT'] = '29500'
+        os.environ["MASTER_PORT"] = "29500"
     # use MASTER_ADDR in the environment variable if it already exists
-    if 'MASTER_ADDR' not in os.environ:
-        os.environ['MASTER_ADDR'] = addr
-    os.environ['WORLD_SIZE'] = str(ntasks)
-    os.environ['LOCAL_RANK'] = str(local_rank)
-    os.environ['RANK'] = str(proc_id)
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = addr
+    os.environ["WORLD_SIZE"] = str(ntasks)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["RANK"] = str(proc_id)
 
-    if device_type not in ('cpu', 'cuda'):
+    if device_type not in ("cpu", "cuda"):
         set_device(torch.device(device_type, local_rank))
-        torch_dist.init_process_group(
-            backend=get_distributed_backend(), **kwargs)
-    elif device_type == 'cpu':
-        if init_backend == 'torch':
+        torch_dist.init_process_group(backend=get_distributed_backend(), **kwargs)
+    elif device_type == "cpu":
+        if init_backend == "torch":
             torch_dist.init_process_group(backend=backend, **kwargs)
         else:
-            raise ValueError(
-                f'init_backend={init_backend!r} is not supported on CPU')
+            raise ValueError(f"init_backend={init_backend!r} is not supported on CPU")
     else:
         torch.cuda.set_device(local_rank)
 
-        if init_backend == 'torch':
+        if init_backend == "torch":
             torch_dist.init_process_group(backend=backend, **kwargs)
-        elif init_backend == 'deepspeed':
+        elif init_backend == "deepspeed":
             import deepspeed
+
             deepspeed.init_distributed(dist_backend=backend, **kwargs)
-        elif init_backend == 'colossalai':
+        elif init_backend == "colossalai":
             import colossalai
+
             colossalai.launch_from_slurm(
                 backend=backend,
-                host=os.environ['MASTER_ADDR'],
-                port=os.environ['MASTER_PORT'],
+                host=os.environ["MASTER_ADDR"],
+                port=os.environ["MASTER_PORT"],
                 **kwargs,
             )
         else:
             raise ValueError(
                 'supported "init_backend" is "torch" or "deepspeed", '
-                f'but got {init_backend}')
+                f"but got {init_backend}"
+            )
 
 
 def get_backend(group: ProcessGroup | None = None) -> str | None:
@@ -412,21 +411,24 @@ def get_comm_device(group: ProcessGroup | None = None) -> torch.device:
         torch.device: The device of backend.
     """
     backend = get_backend(group)
-    if backend == 'hccl':
+    if backend == "hccl":
         import torch_npu  # noqa: F401
-        return torch.device('npu', torch.npu.current_device())
+
+        return torch.device("npu", torch.npu.current_device())
     elif backend == torch_dist.Backend.NCCL:
-        return torch.device('cuda', torch.cuda.current_device())
-    elif backend == 'cncl':
+        return torch.device("cuda", torch.cuda.current_device())
+    elif backend == "cncl":
         import torch_mlu  # noqa: F401
-        return torch.device('mlu', torch.mlu.current_device())
-    elif backend == 'smddp':
-        return torch.device('cuda', torch.cuda.current_device())
-    elif backend == 'mccl':
+
+        return torch.device("mlu", torch.mlu.current_device())
+    elif backend == "smddp":
+        return torch.device("cuda", torch.cuda.current_device())
+    elif backend == "mccl":
         import torch_musa
-        return torch.device('musa', torch_musa.current_device())
-    elif backend == 'xccl':
-        return torch.device('xpu', torch.xpu.current_device())
+
+        return torch.device("musa", torch_musa.current_device())
+    elif backend == "xccl":
+        return torch.device("xpu", torch.xpu.current_device())
     else:
         # GLOO and MPI backends use cpu device by default
-        return torch.device('cpu')
+        return torch.device("cpu")

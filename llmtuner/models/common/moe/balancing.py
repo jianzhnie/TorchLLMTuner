@@ -144,8 +144,7 @@ def update_quantile_expert_bias(
     these layers).
     """
     histograms = [
-        moe.router.quantile_balancer.required_bias_histogram_EB
-        for moe in moe_layers
+        moe.router.quantile_balancer.required_bias_histogram_EB for moe in moe_layers
     ]
     stacked_LEB = torch.stack(histograms)
 
@@ -188,9 +187,7 @@ def register_moe_quantile_balancing_hook(
     """
     all_layers = [moe for part in model_parts for moe in iter_moe_layers(part)]
     quantile_layers = [
-        moe
-        for moe in all_layers
-        if isinstance(moe.router, QuantileBalancedTopKRouter)
+        moe for moe in all_layers if isinstance(moe.router, QuantileBalancedTopKRouter)
     ]
     if not quantile_layers:
         return

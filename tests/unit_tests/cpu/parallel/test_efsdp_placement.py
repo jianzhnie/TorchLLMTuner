@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('dtensor', 'spmd_types')
+require_env("dtensor", "spmd_types")
 
 
 import math

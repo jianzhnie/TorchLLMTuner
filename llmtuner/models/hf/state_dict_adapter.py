@@ -70,9 +70,7 @@ class HFTransformerStateDictAdapter:
             and "model.embed_tokens.weight" in hf_state_dict
             and getattr(self.model_config, "tie_word_embeddings", False)
         ):
-            hf_state_dict["lm_head.weight"] = hf_state_dict[
-                "model.embed_tokens.weight"
-            ]
+            hf_state_dict["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"]
         return {f"model.{key}": value for key, value in hf_state_dict.items()}
 
     def get_hf_storage_reader(

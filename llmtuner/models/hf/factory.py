@@ -57,7 +57,6 @@ def build_model_config(
     return config
 
 
-
 def build_model_config_for(cfg) -> PretrainedConfig:
     """Build the model config for a training run.
 
@@ -119,8 +118,7 @@ def build_model_config_for(cfg) -> PretrainedConfig:
     # NPU/SDPA train without allowing attention across sample boundaries.
     config.attn_mask_type = (
         "causal"
-        if cfg.dataloader.dataset == "random"
-        or cfg.dataloader.max_num_documents == 1
+        if cfg.dataloader.dataset == "random" or cfg.dataloader.max_num_documents == 1
         else "block_causal"
     )
     # The requested HF experts kernel travels on the config; the wrapper
@@ -130,7 +128,6 @@ def build_model_config_for(cfg) -> PretrainedConfig:
     # build time, and None (the default) means no cast.
     config.compute_dtype = getattr(cfg, "compute_dtype", None)
     return config
-
 
 
 def num_flops_per_token(cfg) -> int:
@@ -184,7 +181,6 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
     return text_config
 
 
-
 def resolve_model_class(config: PretrainedConfig) -> type:
     """Find the ``ForCausalLM`` class named by the config.
 
@@ -216,7 +212,6 @@ def resolve_model_class(config: PretrainedConfig) -> type:
         f"(architectures={getattr(config, 'architectures', None)!r}). "
         "Check that the installed transformers version ships this model."
     )
-
 
 
 def materialize_meta_model(model: nn.Module, device: torch.device) -> None:

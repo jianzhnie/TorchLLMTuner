@@ -33,9 +33,7 @@ def main() -> None:
     # The replicated contribution is counted once, plus both TP shards.
     torch.testing.assert_close(norm, torch.tensor(13.0))
     torch.testing.assert_close(replicated.grad, torch.tensor([6.0]))
-    torch.testing.assert_close(
-        sharded.grad, torch.tensor([1.5 if rank == 0 else 2.0])
-    )
+    torch.testing.assert_close(sharded.grad, torch.tensor([1.5 if rank == 0 else 2.0]))
 
     # EP may consume the same physical ranks as TP. Expert parameters are
     # counted through EP only; dense TP shards still need their TP reduction.

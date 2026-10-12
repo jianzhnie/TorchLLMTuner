@@ -282,9 +282,7 @@ def test_the_dense_block_causal_mask_agrees_with_the_modifiers() -> None:
     catches a dense mask built from the wrong boundary (e.g. document ids
     derived from a cumulative count that is off by one).
     """
-    mask = build_dense_attention_mask(
-        POSITIONS, dtype=torch.float32, block_causal=True
-    )
+    mask = build_dense_attention_mask(POSITIONS, dtype=torch.float32, block_causal=True)
     causal = _eval(get_causal_mask_mod())
     same_document = _eval(get_document_mask_mod(POSITIONS))
 

@@ -375,9 +375,7 @@ class OptimizersContainer(Optimizer, Stateful):
         # init_optim_state must run first: the unflattening step reads each
         # optimizer's live state to learn which state tensors to expect, so a
         # fresh optimizer would find nothing to write into.
-        state_dict = load_expert_state(
-            state_dict, self._ep_shards(), self.model_parts
-        )
+        state_dict = load_expert_state(state_dict, self._ep_shards(), self.model_parts)
         for optimizer in self.optimizers:
             init_optim_state(optimizer)
             load_flat_optim_state_dict(optimizer, state_dict)

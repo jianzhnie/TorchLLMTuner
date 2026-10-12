@@ -471,9 +471,7 @@ def compute_logprobs(
     unevaluable and would silently score against the local softmax.
     """
     if (tp_group is None) != (global_vocab_size is None):
-        raise ValueError(
-            "tp_group and global_vocab_size must be provided together."
-        )
+        raise ValueError("tp_group and global_vocab_size must be provided together.")
     if (
         tp_group is not None
         and global_vocab_size is not None

@@ -118,8 +118,7 @@ def reject_duplicated_hf_fields(load_dataset_kwargs: dict[str, Any]) -> None:
     )
     if duplicated:
         raise ValueError(
-            "first-class Hugging Face fields repeated in kwargs: "
-            f"{sorted(duplicated)}"
+            f"first-class Hugging Face fields repeated in kwargs: {sorted(duplicated)}"
         )
 
 

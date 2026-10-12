@@ -32,8 +32,7 @@ from llmtuner.config import (
 
 MODEL_PATH = "/home/jianzhnie/llmtuner/hfhub/models/Qwen/Qwen3-8B"
 DATASET_PATH = (
-    "/home/jianzhnie/llmtuner/hfhub/datasets/EleutherAI/"
-    "hendrycks_math/train.jsonl"
+    "/home/jianzhnie/llmtuner/hfhub/datasets/EleutherAI/hendrycks_math/train.jsonl"
 )
 
 

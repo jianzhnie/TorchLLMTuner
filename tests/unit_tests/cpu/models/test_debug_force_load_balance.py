@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('spmd_types')
+require_env("spmd_types")
 
 
 import torch
@@ -46,8 +46,7 @@ def test_every_expert_is_chosen_an_equal_number_of_times() -> None:
     assert counts_E.tolist() == [expected] * _NUM_EXPERTS
     # The assignment is the literal round-robin, not just any balanced one.
     expected_ids = (
-        torch.arange(10 * _TOP_K, dtype=torch.int64).reshape(10, _TOP_K)
-        % _NUM_EXPERTS
+        torch.arange(10 * _TOP_K, dtype=torch.int64).reshape(10, _TOP_K) % _NUM_EXPERTS
     )
     assert torch.equal(topk_expert_ids_TK, expected_ids)
 
@@ -68,8 +67,7 @@ def test_the_assignment_ignores_scores_and_bias() -> None:
     assert int(map_with_bias[:, 0].sum()) == 6 * _TOP_K // _NUM_EXPERTS
     assert torch.equal(
         ids_with_bias,
-        torch.arange(6 * _TOP_K, dtype=torch.int64).reshape(6, _TOP_K)
-        % _NUM_EXPERTS,
+        torch.arange(6 * _TOP_K, dtype=torch.int64).reshape(6, _TOP_K) % _NUM_EXPERTS,
     )
 
 
@@ -96,18 +94,14 @@ def test_disabled_by_default_and_matches_the_previous_behavior() -> None:
 
     _, topk_expert_ids_TK, _ = router(x_TD, expert_bias_E)
 
-    assert torch.equal(
-        topk_expert_ids_TK, torch.zeros_like(topk_expert_ids_TK)
-    )
+    assert torch.equal(topk_expert_ids_TK, torch.zeros_like(topk_expert_ids_TK))
     x_TD = torch.randn(6, _DIM)
     # An overwhelming bias on expert 0 must route every slot there.
     expert_bias_E = torch.tensor([100.0, 0.0, 0.0, 0.0])
 
     _, topk_expert_ids_TK, _ = router(x_TD, expert_bias_E)
 
-    assert torch.equal(
-        topk_expert_ids_TK, torch.zeros_like(topk_expert_ids_TK)
-    )
+    assert torch.equal(topk_expert_ids_TK, torch.zeros_like(topk_expert_ids_TK))
 
 
 def test_route_norm_and_scale_still_apply_to_the_forced_scores() -> None:

@@ -83,9 +83,7 @@ def main() -> int:
 
     if args.list:
         for script in scripts:
-            print(
-                f"{script.name:45s} torchrun {' '.join(_torchrun_args(script))}"
-            )
+            print(f"{script.name:45s} torchrun {' '.join(_torchrun_args(script))}")
         print(f"{len(scripts)} scripts")
         return 0
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('pipelining', 'flex_attention', 'spmd_types')
+require_env("pipelining", "flex_attention", "spmd_types")
 
 
 from types import SimpleNamespace
@@ -362,9 +362,7 @@ def test_duplicate_first_stage_module_is_rejected() -> None:
     parts = generate_llm_fqn_per_model_part(2, _NUM_LAYERS)
 
     with pytest.raises(ValueError, match="more than once"):
-        prepend_first_stage_modules(
-            parts, model, ["vision_encoder", "vision_encoder"]
-        )
+        prepend_first_stage_modules(parts, model, ["vision_encoder", "vision_encoder"])
 
 
 def test_split_keeps_first_stage_module_fqns_stable(pp_mesh) -> None:

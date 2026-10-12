@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('dtensor', 'pipelining', 'spmd_types')
+require_env("dtensor", "pipelining", "spmd_types")
 
 
 import os
@@ -111,9 +111,10 @@ def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
             # PP losses are normalized before the schedule runs backward. The
             # trainer multiplies their detached sum by the global denominator
             # to recover the raw reporting sum.
-            loss = activation.square().view(()) / kwargs["loss_kwargs"][
-                "global_valid_tokens"
-            ]
+            loss = (
+                activation.square().view(())
+                / kwargs["loss_kwargs"]["global_valid_tokens"]
+            )
             loss.backward()
             assert activation.grad is not None
             gradients.append(activation.grad.detach().clone())
@@ -921,8 +922,9 @@ def test_microbatch_counts_masked_prompts_for_router_but_not_padding() -> None:
     trainer.ntokens_seen = 0
     batch = {
         "input": torch.arange(6),
-        "labels": torch.tensor([IGNORE_INDEX, IGNORE_INDEX, 3, 4,
-                                IGNORE_INDEX, IGNORE_INDEX]),
+        "labels": torch.tensor(
+            [IGNORE_INDEX, IGNORE_INDEX, 3, 4, IGNORE_INDEX, IGNORE_INDEX]
+        ),
         "padding_mask": torch.tensor([False, False, False, False, True, True]),
         "num_valid_tokens": 2,
     }

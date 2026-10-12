@@ -32,9 +32,7 @@ def loss_reporting_meshes(
         return None, None
     dp_mesh = parallel_dims.get_optional_mesh("dp")
     loss_is_sharded = parallel_dims.dp_cp_enabled or parallel_dims.tp_enabled
-    loss_mesh = (
-        parallel_dims.get_optional_mesh("loss") if loss_is_sharded else dp_mesh
-    )
+    loss_mesh = parallel_dims.get_optional_mesh("loss") if loss_is_sharded else dp_mesh
     return dp_mesh, loss_mesh
 
 
@@ -58,8 +56,6 @@ def training_reduction_meshes(
         pp=parallel_dims.get_optional_mesh("pp"),
         loss=loss_mesh,
         sequence=(
-            parallel_dims.get_optional_mesh(sequence_axes)
-            if sequence_axes
-            else None
+            parallel_dims.get_optional_mesh(sequence_axes) if sequence_axes else None
         ),
     )

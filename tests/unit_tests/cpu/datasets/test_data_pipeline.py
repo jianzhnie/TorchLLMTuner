@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('grain')
+require_env("grain")
 
 
 import tempfile
@@ -1205,8 +1205,7 @@ def test_chat_template_injects_special_tokens_and_generation_prompt(tokenizer):
     them a template that references the variables renders blanks or raises.
     """
     tokenizer.set_chat_template(
-        "{{ bos_token }}|{{ eos_token }}|"
-        "{% if add_generation_prompt %}GEN{% endif %}"
+        "{{ bos_token }}|{{ eos_token }}|{% if add_generation_prompt %}GEN{% endif %}"
     )
     messages = [{"role": "user", "content": "x"}]
 

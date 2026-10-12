@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('dtensor', 'pipelining', 'spmd_types')
+require_env("dtensor", "pipelining", "spmd_types")
 
 
 import pytest

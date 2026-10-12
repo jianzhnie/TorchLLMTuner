@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('spmd_types')
+require_env("spmd_types")
 
 
 import pytest
@@ -41,9 +41,7 @@ _TOP_K = 2
 _NUM_TOKENS = 16
 
 
-def _moe(
-    seed: int = 0, *, aux_loss: bool = True, router=None, **kwargs
-) -> MoE:
+def _moe(seed: int = 0, *, aux_loss: bool = True, router=None, **kwargs) -> MoE:
     torch.manual_seed(seed)
     if router is None:
         router = TokenChoiceTopKRouter(
@@ -51,9 +49,7 @@ def _moe(
             _DIM,
             _TOP_K,
             score_func="sigmoid",
-            aux_loss=(
-                MicrobatchWiseLoadBalanceLoss(coeff=1.0) if aux_loss else None
-            ),
+            aux_loss=(MicrobatchWiseLoadBalanceLoss(coeff=1.0) if aux_loss else None),
         )
     moe = MoE(
         _NUM_EXPERTS,
@@ -334,9 +330,7 @@ def test_explicit_mask_takes_precedence_over_a_staged_one() -> None:
     # The explicit mask won that call; the staged one is kept, not cleared.
     moe.set_padding_mask(None)
     moe(x_TD)
-    assert (
-        moe.tokens_per_expert_E.sum().item() == 2 * _NUM_TOKENS * _TOP_K
-    )
+    assert moe.tokens_per_expert_E.sum().item() == 2 * _NUM_TOKENS * _TOP_K
 
 
 def test_leading_dims_mask_flattens_with_the_input() -> None:

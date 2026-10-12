@@ -254,9 +254,9 @@ def clip_grad_norm_(
                 dist.all_reduce(
                     expert_power, op=dist.ReduceOp.SUM, group=ep_mesh.get_group()
                 )
-            total_norm = (
-                dense_norm.pow(norm_type) + tp_power + expert_power
-            ).pow(1.0 / norm_type)
+            total_norm = (dense_norm.pow(norm_type) + tp_power + expert_power).pow(
+                1.0 / norm_type
+            )
 
     else:
         total_norm = _local_norm(dense_grads)

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env('dcp', 'dtensor')
+require_env("dcp", "dtensor")
 
 
 import torch
@@ -496,9 +496,11 @@ def _hf_manager_stub(tmp_path, monkeypatch, *, files=(), hf_metadata=_HF_METADAT
     manager._backend = backend
     manager._storage = _FakeStorage(set(files))
     manager._manager_config = types.SimpleNamespace(
-        items={MODEL: types.SimpleNamespace(
-            requires_copy=True, layout=None, resharder=None, required=False
-        )},
+        items={
+            MODEL: types.SimpleNamespace(
+                requires_copy=True, layout=None, resharder=None, required=False
+            )
+        },
         storage_config=None,
     )
     manager._manager = types.SimpleNamespace(
@@ -622,9 +624,7 @@ def test_native_load_restores_stateful_and_rejects_foreign_objects(
     assert calls["native_load"][1]["strict"] is True
 
     # A plain object the backend did not restore in place must fail loudly.
-    manager._manager = type(manager._manager)(
-        load=lambda *a, **kw: {MODEL: object()}
-    )
+    manager._manager = type(manager._manager)(load=lambda *a, **kw: {MODEL: object()})
     with pytest.raises(TypeError, match="non-Stateful"):
         manager._load_checkpoint(
             {MODEL: object()}, str(tmp_path), from_hf=False, from_quantized=False
