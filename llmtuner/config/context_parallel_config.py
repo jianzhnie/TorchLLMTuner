@@ -2,7 +2,7 @@
 
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
 
-CP_STRATEGIES = frozenset({"kv_allgather", "ulysses"})
+CP_STRATEGIES = frozenset({"kv_allgather", "ulysses", "kcp"})
 CP_LOAD_BALANCERS = frozenset({None, "headtail", "ptrr"})
 
 
@@ -34,9 +34,19 @@ def validate_context_parallel_config(cfg) -> None:
     if cfg.context_parallel_strategy not in CP_STRATEGIES:
         raise ConfigError(
             "parallel.context_parallel_strategy must be one of "
-            "'kv_allgather'/'ulysses', got "
+            "'kv_allgather'/'ulysses'/'kcp', got "
             f"{cfg.context_parallel_strategy!r}"
         )
+    if cfg.context_parallel_strategy == "kcp":
+        if cfg.tensor_parallel_size != 1:
+            raise UnsupportedCombinationError("KCP requires tensor_parallel_size=1")
+        if (
+            cfg.context_parallel_kv_allgather_size != 1
+            or cfg.context_parallel_ulysses_size != 1
+        ):
+            raise UnsupportedCombinationError(
+                "KCP cannot be combined with KV-AllGather or Ulysses CP axes"
+            )
     if (
         cfg.context_parallel_strategy == "ulysses"
         and cfg.context_parallel_load_balancer is not None

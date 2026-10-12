@@ -19,7 +19,11 @@ from ...models.common.moe.dispatcher import (
     LocalTokenDispatcher,
     TorchAOTokenDispatcher,
 )
-from ...models.common.moe.experts import GroupedExperts, RoutedExperts
+from ...models.common.moe.experts import (
+    DominoRoutedExperts,
+    GroupedExperts,
+    RoutedExperts,
+)
 from ...models.common.moe.load_balance import MicrobatchWiseLoadBalanceLoss
 from ...models.common.moe.router import (
     QuantileBalancedTopKRouter,
@@ -157,9 +161,12 @@ def convert_block(
     if shared is not None and tp_enabled:
         matrix.shared_expert_tp_ep(block)
 
+    routed_experts_cls = (
+        DominoRoutedExperts if token_dispatcher == "domino" else RoutedExperts
+    )
     moe = MoE(
         num_experts=num_experts,
-        routed_experts=RoutedExperts(grouped, dispatcher),
+        routed_experts=routed_experts_cls(grouped, dispatcher),
         router=router,
         # Auxiliary-loss-free load balancing, mirroring the HF block's own
         # e_score_correction_bias. Off for models that carry no such buffer --

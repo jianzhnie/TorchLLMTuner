@@ -35,7 +35,12 @@ from ..activation import SwiGLU
 if TYPE_CHECKING:
     from .dispatcher import LocalTokenDispatcher
 
-__all__ = ["GroupedExperts", "RoutedExperts", "grouped_mm_available"]
+__all__ = [
+    "DominoRoutedExperts",
+    "GroupedExperts",
+    "RoutedExperts",
+    "grouped_mm_available",
+]
 
 
 def grouped_mm_available() -> bool:
@@ -203,3 +208,35 @@ class RoutedExperts(nn.Module):
             metadata,
             x_TD,
         )
+
+
+class DominoRoutedExperts(RoutedExperts):
+    """Run routing and expert computation in two token slices.
+
+    Each slice owns its dispatch metadata through combine, so variable all to
+    all receive sizes cannot leak between slices. This is the semantic core of
+    FSDPTurbo Domino and is valid on every c10d backend; accelerator stream
+    overlap can be added without changing the module or checkpoint contract.
+    """
+
+    def forward(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        num_local_tokens_per_expert_E: torch.Tensor,
+    ) -> torch.Tensor:
+        del num_local_tokens_per_expert_E
+        if x_TD.shape[0] < 2:
+            raise ValueError("Domino dispatcher requires at least two tokens")
+        boundaries = (x_TD.shape[0] + 1) // 2
+        outputs: list[torch.Tensor] = []
+        for token_slice in (slice(0, boundaries), slice(boundaries, None)):
+            x = x_TD[token_slice]
+            scores = topk_scores_TK[token_slice]
+            expert_ids = topk_expert_ids_TK[token_slice]
+            counts = torch.bincount(
+                expert_ids.reshape(-1), minlength=self.token_dispatcher.num_experts
+            )
+            outputs.append(super().forward(x, scores, expert_ids, counts))
+        return torch.cat(outputs, dim=0)

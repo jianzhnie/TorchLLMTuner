@@ -6,7 +6,7 @@ from llmtuner.errors import (
     UnsupportedCombinationError,
 )
 
-EP_DISPATCHERS = ("alltoall", "torchao", "deepep", "hybridep")
+EP_DISPATCHERS = ("alltoall", "torchao", "domino", "mc2", "deepep", "hybridep")
 
 
 def validate_expert_parallel_config(cfg) -> None:
@@ -21,6 +21,12 @@ def validate_expert_parallel_config(cfg) -> None:
             "a registered gap, not a supported backend: its external kernels "
             "and distributed wrappers are not included in this build. Use "
             "'alltoall'."
+        )
+    if cfg.ep_token_dispatcher == "mc2":
+        raise EnvironmentUnsupportedError(
+            "parallel.ep_token_dispatcher='mc2' requires the Ascend fused "
+            "all-to-all/grouped-matmul operators. This build has no compatible "
+            "MC2 operator registration; refusing an unfused silent fallback."
         )
     if cfg.ep_token_dispatcher != "alltoall" and cfg.expert_parallel_size == 1:
         raise UnsupportedCombinationError(

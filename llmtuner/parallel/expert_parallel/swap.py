@@ -157,7 +157,7 @@ def swap_hf_moe_blocks(
             f"unknown ep_token_dispatcher {token_dispatcher!r}; expected one "
             f"of {EP_DISPATCHER_BACKENDS}."
         )
-    if token_dispatcher in ("deepep", "hybridep"):
+    if token_dispatcher in ("deepep", "hybridep", "mc2"):
         raise EnvironmentUnsupportedError(
             f"ep_token_dispatcher={token_dispatcher!r} is a registered gap: "
             "CUDA-only kernels plus torchtitan's distributed/deepep/ wrappers "
