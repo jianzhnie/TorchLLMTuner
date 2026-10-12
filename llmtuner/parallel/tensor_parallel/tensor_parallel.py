@@ -694,7 +694,7 @@ def resolve_tp_targets(model: nn.Module, cfg: ParallelConfig, plan):
     moe_blocks: list[tuple[str, nn.Module]] = []
     already_bracketed = False
     if plan_declares_moe and not moe_deferred_to_ep:
-        from ..expert_parallel.model_conversion import is_hf_moe_block
+        from ..expert_parallel.hf_inspection import is_hf_moe_block
 
         for module_path, module in model.named_modules():
             if getattr(module, "_tp_moe_boundary", False):

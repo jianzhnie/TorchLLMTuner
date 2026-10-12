@@ -9,7 +9,7 @@ the assembly order, which is a contract:
 2. combination guards (``llmtuner/parallel/compatibility.py``)
    fires here: validation feasibility, chunked-loss x PP, EP x HF-initial-load
    (EP x checkpoint itself is supported since 2026-10, see
-   ``parallel/expert_parallel/checkpoint.py``);
+   ``parallel/expert_parallel/checkpointing.py``);
 3. deterministic seeding (before any model build);
 4. the mesh (``build_mesh`` -- see ``llmtuner/parallel/topology.py``);
 5. the model, then parallelism in stage-table order
@@ -40,7 +40,7 @@ from ...components.checkpointer import DATALOADER, TRAIN_STATE, CheckpointManage
 from ...components.metrics import MetricsProcessor
 from ...components.optimizer import EMA, OptimizersContainer, build_lr_scheduler
 from ...models.common.aux_loss import register_aux_loss_zero_hook
-from ...models.common.moe.balancing import (
+from ...models.common.moe.bias_update import (
     register_moe_load_balancing_hook,
     register_moe_quantile_balancing_hook,
 )

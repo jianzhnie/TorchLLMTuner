@@ -2,21 +2,21 @@
 
 Vendored from torchtitan ``models/common/moe.py`` -- the ``MoE`` block and the
 walk that finds the blocks of a model. The rest of that upstream file lives
-next to this one: the routers in ``router.py``, the expert weights in
-``experts.py``, the EP dispatchers in ``dispatcher.py``, the balance loss in
-``load_balance.py``, the bias-update hooks in ``balancing.py``.
+next to this one: the routers in ``routing.py``, the expert weights in
+``experts.py``, the EP dispatchers in ``token_dispatch.py``, the balance loss in
+``auxiliary_loss.py``, the bias-update hooks in ``bias_update.py``.
 
 What changed from upstream:
 
 * the nested ``Config`` dataclass is gone; the block is constructed directly.
 * the auxiliary-loss-free bias is updated by ``MoE.update_expert_bias``,
-  registered as an optimizer step pre-hook (``balancing.py``, wired by the
+  registered as an optimizer step pre-hook (``bias_update.py``, wired by the
   trainer builder) -- torchtitan reaches the same state through its own hook.
   The rule is the same sign-based, mean-centred nudge, and the counter is
   drained there; the reduction over the axes that shard a token stream is
-  ``balancing.py``.
+  ``bias_update.py``.
 * the block is balancing-scheme-agnostic: a quantile router is driven by
-  ``balancing.py``'s quantile hook instead, and the bias buffer is registered
+  ``bias_update.py``'s quantile hook instead, and the bias buffer is registered
   for it here (upstream needs a ``KimiLatentMoE`` subclass to do that). The two
   schemes cannot both own the buffer, which the constructor enforces.
 * ``padding_mask`` (true for padding) is a staged per-microbatch input. It never
@@ -35,7 +35,7 @@ import torch
 import torch.nn as nn
 
 from .experts import RoutedExperts
-from .router import QuantileBalancedTopKRouter, TokenChoiceTopKRouter
+from .routing import QuantileBalancedTopKRouter, TokenChoiceTopKRouter
 
 __all__ = ["MOE_LAYER_ATTRS", "iter_moe_layers", "MoE"]
 

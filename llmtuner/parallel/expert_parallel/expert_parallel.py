@@ -9,7 +9,8 @@ from llmtuner.config import ParallelConfig
 
 from ...utils.logging import get_logger
 from .. import compatibility
-from .model_conversion import restore_fp32_state_buffers, swap_hf_moe_blocks
+from .block_conversion import restore_fp32_state_buffers
+from .model_replacement import swap_hf_moe_blocks
 
 logger = get_logger(__name__)
 

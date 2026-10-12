@@ -46,9 +46,9 @@ if TYPE_CHECKING:
         compute_ffn_hidden_dim,
     )
     from .linear import PartialBiasRowwiseLinear, RouterGateLinear
-    from .moe.block import MoE
+    from .moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
     from .moe.experts import GroupedExperts
-    from .moe.load_balance import MicrobatchWiseLoadBalanceLoss
+    from .moe.layer import MoE
     from .rope import ComplexRoPE, CosSinRoPE, RoPE, RoPEConfig
 
 #: Public name -> the leaf module that defines it.
@@ -62,8 +62,8 @@ _EXPORT_SOURCES = {
     "FeedForward": "feed_forward",
     "GroupedExperts": "moe.experts",
     "local_head_split": "attention.qkv",
-    "MicrobatchWiseLoadBalanceLoss": "moe.load_balance",
-    "MoE": "moe.block",
+    "MicrobatchWiseLoadBalanceLoss": "moe.auxiliary_loss",
+    "MoE": "moe.layer",
     "PartialBiasRowwiseLinear": "linear",
     "QKVLinear": "attention.qkv",
     "register_aux_loss_zero_hook": "aux_loss",

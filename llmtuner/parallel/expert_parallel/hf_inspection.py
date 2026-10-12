@@ -33,7 +33,7 @@ Weight layout: HF stores each projection as ``(out, in)`` and applies it as
 (``w1_EFD``/``w3_EFD`` are ``(F, D)``, ``w2_EDF`` is ``(D, F)``) and applies it
 with the same ``F.linear``. Moving a weight is therefore elementwise -- no
 transpose, no regrouping -- except for the one split of ``gate_up_proj`` into
-its gate and up halves. ``tests/unit_tests/cpu/parallel/test_ep_swap.py``
+its gate and up halves. ``tests/unit_tests/cpu/parallel/test_ep_model_replacement.py``
 pins both halves of that claim against the HF block being replaced.
 
 Routing parity with the HF block: Qwen3Moe and Mixtral score with a softmax over
@@ -72,7 +72,7 @@ from typing import NamedTuple
 import torch
 import torch.nn as nn
 
-from ...models.common.moe.block import MOE_LAYER_ATTRS
+from ...models.common.moe.layer import MOE_LAYER_ATTRS
 from ...utils.logging import get_logger
 from .. import compatibility
 
@@ -133,7 +133,8 @@ def fused_experts_of(block: nn.Module) -> FusedExperts | None:
 
     so the split is by role -- the first half is the gate, the second the up
     projection -- for every one of them. That is asserted family by family
-    against HF's own output in ``tests/unit_tests/cpu/parallel/test_ep_swap.py``.
+    against HF's own output in
+    ``tests/unit_tests/cpu/parallel/test_ep_model_replacement.py``.
 
     The probe reads *shapes*, not class names: the experts' class name is not
     stable across transformers versions (``Qwen3MoeExperts``,
@@ -333,7 +334,7 @@ def moe_block_of(layer: nn.Module) -> tuple[str, nn.Module | None]:
     replacement must land in the same slot.
 
     ``MOE_LAYER_ATTRS`` is shared with the expert-bias hook in
-    ``models/common/moe/block.py`` -- that hook rediscovers these blocks after the
+    ``models/common/moe/layer.py`` -- that hook rediscovers these blocks after the
     swap, so the two must agree on where a MoE can live.
     """
     for name in MOE_LAYER_ATTRS:

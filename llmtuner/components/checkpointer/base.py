@@ -59,7 +59,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 
 from ...accelerator import distributed
-from ...parallel.expert_parallel.checkpoint import (
+from ...parallel.expert_parallel.checkpointing import (
     expert_shard_map,
     gather_expert_state,
     load_expert_state,
@@ -174,7 +174,7 @@ class ModelWrapper(Stateful):
         self.model = [model] if isinstance(model, nn.Module) else model
         # EP-sharded expert weights are rank-heterogeneous under one FQN;
         # they ride through this wrapper as all-gathered full tensors and are
-        # sliced back per rank on load (parallel/expert_parallel/checkpoint.py).
+        # sliced back per rank on load (parallel/expert_parallel/checkpointing.py).
         self._ep_shards = expert_shard_map(self.model)
         self.cached_state_dict = self._get_state_dict()
 

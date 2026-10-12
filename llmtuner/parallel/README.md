@@ -24,10 +24,10 @@ each local model part.
 | `context_parallel/input_sharding.py` | CP/TP batch and mask sharding. |
 | `context_parallel/kcp.py` | Kimi Delta Attention KCP adapter. |
 | `expert_parallel/expert_parallel.py` | EP public entry. |
-| `expert_parallel/hf_layout.py` | Read supported Hugging Face MoE layouts. |
-| `expert_parallel/conversion.py` | Convert one HF MoE block to the native MoE representation. |
-| `expert_parallel/model_conversion.py` | Orchestrate conversion across model layers. |
-| `expert_parallel/checkpoint.py` | Gather and slice expert checkpoint state. |
+| `expert_parallel/hf_inspection.py` | Read supported Hugging Face MoE layouts. |
+| `expert_parallel/block_conversion.py` | Convert one HF MoE block to the native MoE representation. |
+| `expert_parallel/model_replacement.py` | Orchestrate conversion across model layers. |
+| `expert_parallel/checkpointing.py` | Gather and slice expert checkpoint state. |
 | `fully_shard_parallel/fully_shard_parallel.py` | FSDP runtime entry, mesh policy, and decoder wrapping. |
 | `fully_shard_parallel/plan.py` | Pattern-selected FSDP units and prefetch windows. |
 | `fully_shard_parallel/fine_grained.py` | Native/custom PyTorch 2.14 strategy adapter. |
