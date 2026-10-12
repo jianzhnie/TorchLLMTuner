@@ -18,12 +18,15 @@ def validate_expert_parallel_config(cfg) -> None:
     if cfg.ep_token_dispatcher in ("deepep", "hybridep"):
         raise EnvironmentUnsupportedError(
             f"parallel.ep_token_dispatcher={cfg.ep_token_dispatcher!r} is "
-            "not supported by this build; use 'alltoall'."
+            "a registered gap, not a supported backend: its external kernels "
+            "and distributed wrappers are not included in this build. Use "
+            "'alltoall'."
         )
     if cfg.ep_token_dispatcher != "alltoall" and cfg.expert_parallel_size == 1:
         raise UnsupportedCombinationError(
             f"parallel.ep_token_dispatcher={cfg.ep_token_dispatcher!r} "
-            "requires expert_parallel_size > 1."
+            "has no effect at expert_parallel_size=1; set "
+            "expert_parallel_size > 1 or use 'alltoall'."
         )
 
 

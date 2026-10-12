@@ -37,17 +37,17 @@ import torch.nn.functional as F
 from torch import nn
 
 from llmtuner.config import RegionACConfig, SelectiveACConfig
+from llmtuner.memory.activation_checkpoint import (
+    wrap_full,
+    wrap_region,
+    wrap_selective,
+)
 from llmtuner.models.common.aux_loss import (
     AuxLoss,
     collect_aux_loss_metrics,
     zero_aux_losses,
 )
 from llmtuner.models.common.moe.load_balance import MicrobatchWiseLoadBalanceLoss
-from llmtuner.parallel.activation_checkpoint import (
-    wrap_full,
-    wrap_region,
-    wrap_selective,
-)
 
 
 @pytest.fixture(autouse=True)

@@ -92,7 +92,7 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `models/common/rope.py` | `models/common/rope.py` | 0.616 | 上游持续重构后结构已分叉；同步公式与边界修复，不同步 Module/缓存形状；parity 保留（wrapper 的 rotary_emb 是 HF 自带的） |
 | `models/common/scatter_add.py` | `ops/scatter_add.py` | 0.711 | |
 | `models/common/moe/dispatcher.py` | `models/common/token_dispatcher.py` | 0.441 | 含 `TorchAOTokenDispatcher` 可选导入适配层（torchao `permute_and_pad` 委托，未装 loud-raise）；DeepEP/HybridEP 保持登记缺口，见 D 表 |
-| `parallel/activation_checkpoint.py` | `distributed/activation_checkpoint.py` | 0.374 | **FullAC + SelectiveAC + MemoryBudgetAC 已移植**（后者按上游语义设 `torch._functorch.config.activation_memory_budget`，需 compile，torch 无该 knob 时 loud-raise）；RegionAC 已接入（`region_ac` + `parallel/remat_regions.py`，声明通道以 HF block 的 `nn.Linear` FQN 结构等价替代上游 `Module.configure_remat_regions`，受限项只有上游自带的 torch_remat 需 torch ≥ 2.10，apply 期 loud-raise） |
+| `memory/activation_checkpoint.py` | `distributed/activation_checkpoint.py` | 0.374 | **FullAC + SelectiveAC + MemoryBudgetAC 已移植**（后者按上游语义设 `torch._functorch.config.activation_memory_budget`，需 compile，torch 无该 knob 时 loud-raise）；RegionAC 已接入（`region_ac` + `memory/remat_regions.py`，声明通道以 HF block 的 `nn.Linear` FQN 结构等价替代上游 `Module.configure_remat_regions`，受限项只有上游自带的 torch_remat 需 torch ≥ 2.10，apply 期 loud-raise） |
 | `parallel/fully_shard/fsdp.py` | `distributed/fsdp.py` | 0.815 | 多轴 mesh 重建、HF decoder 与 MoE placement 是 llmtuner 适配 |
 | `parallel/parallel_dims.py` | `distributed/parallel_dims.py` | 0.772 | llmtuner 扩展 world/loss/sparse mesh 视图，不能按旧 A1 结构覆盖；mesh 构建（`build_parallel_dims` / `build_mesh`）也在此文件，上游无单一对应物（mesh 逻辑散在 `distributed/parallel_dims.py` 与 `trainer.py`） |
 | `parallel/pipeline_parallel/pipeline.py` | `experiments/transformers_modeling_backend/pipeline.py` | 0.686 | `None` → `nn.Identity`；每 stage 追加 `rotary_emb`；stage 内 layer 保留原始索引（不重新编号），避免多 stage state-dict FQN 冲突 |
@@ -316,12 +316,12 @@ partitioner 做取舍，落为 `training.activation_checkpoint_mode='memory_budg
 compile 关闭时 fail-fast；torch 无该 knob（本机 2.2.2 即如此）时 loud-raise 而非
 静默设一个没人读的全局量；上游的 `visualize_memory_budget_pareto`（往 dump folder
 倒 SVG）未移植，llmtuner 的 AC 路径没有 dump folder 概念。`RegionAC` 需要
-`torch_remat`——**已接入**（`mode='region'` + `RegionACConfig` + `parallel/remat_regions.py`），
+`torch_remat`——**已接入**（`mode='region'` + `RegionACConfig` + `memory/remat_regions.py`），
 受限条件只剩上游
 那一个：`torch_remat` 要求 torch ≥ 2.10，本机 2.2.2 无法 import，故 apply 期
 loud-raise ImportError 并把 torch 版本与安装命令一并写进文案；上游的
 `Module.configure_remat_regions` 声明通道以"HF block 的 `nn.Linear` FQN"结构等价替代，
-理由与取舍见 `remat_regions.py` 与 `wrap_region`（`parallel/activation_checkpoint.py`）
+理由与取舍见 `remat_regions.py` 与 `wrap_region`（`memory/activation_checkpoint.py`）
 的 docstring。同文件的
 `disable_dynamo_lru_cache`（SAC+PP 的重编译 workaround）亦已移植。
 
@@ -481,7 +481,7 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
     dispatcher 一个 remat region 通道，属 D 表 DeepEP 那一半的解锁范围。
   - 上游 #4836 把 FullAC/SelectiveAC 的 `early_stop` 从 `False` 翻为 `True`
     （性能：recompute 产出全部所需张量后即停；上游 8×H100 实测数值不变）：
-    **已同步**，`parallel/activation_checkpoint.py` 两处均为 `early_stop=True`。
+    **已同步**，`memory/activation_checkpoint.py` 两处均为 `early_stop=True`。
   - 上游 `0167526a9` DeepEP 在 FullAC 下梯度错误修复（#5123）：**llmtuner 不受影响，
     无代码动作**。上游的病根是 DeepEP 用 atomics 分配接收槽，FullAC 在 backward
     重放 dispatch 会得到不同的 token 序，而梯度仍按 forward 的 handle 路由；修法是
@@ -851,11 +851,11 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 | `split_model_into_stages` | 同文件 stage split | 删除模块用 `Identity`，每 stage 保留 rotary，兼容 Torch 2.10 `PipelineStage`，**通过（适配）** |
 | `apply_pp`, `build_pipeline_schedule` | `distributed/pipeline_parallel.py` | llmtuner 直接消费 HF 五部件契约；pp×ep / pp×cp 放行，**通过（适配）** |
 | `apply_pp(first_stage_module_fqns=...)`, `prepend_first_stage_modules` | 同文件 `pipeline_with_first_stage_modules` | 额外顶层模块并入 stage 0：仅作用自动切分，存在的 FQN 按序前插，已占有/重复 FQN raise、缺失跳过，显式 `module_fqns_per_model_part` 给定时忽略并告警（同上游委托语义）；`split_model_into_stages` 配套把 wrapper `named_children()` 不呈现的额外顶层模块在非属主 stage 置 `Identity`（上游 "pruned on other stages" 语义），装五部件的容器经"包含已呈现部件"判定跳过。stage FQN 稳定、默认 None 逐位不变，**通过（适配）** |
-| `apply_ac`, selective helpers, `apply_memory_budget`, `disable_dynamo_lru_cache` | `distributed/activation_checkpoint.py` | FullAC/SelectiveAC 已移植，**通过**；FullAC 的对齐同时含策略这一层：上游 `FullAC._wrap_block` 不是裸 wrapper，而是把恒 `PREFER_RECOMPUTE` 的 `_full_ac_policy` 经 `create_selective_checkpoint_contexts` 传入，让 torch 对「输出不可重算/带注册副作用」的算子仍落 SAVE；llmtuner 已按同形补上 `full_policy` + `wrap_full`（`determinism_check`/`debug` 仍走 torch 默认值——实测 torch 默认即 `default`/`False`，与上游 config 默认相同，故行为一致，只是不可配）；两处 `early_stop` 已跟随上游 #4836 为 `True`。MemoryBudgetAC 已移植为 `mode='memory_budget'` + `MemoryBudgetACConfig`（设 `torch._functorch.config.activation_memory_budget`，需 compile，torch 无 knob 时 loud-raise），见 §9.1；RegionAC 已接入（`region_ac` + `parallel/remat_regions.py`，以 HF block 的 `nn.Linear` FQN 作 region 名，替代上游 `Module.configure_remat_regions` 声明通道；`recompute_regions` 与上游同语义——recompute pattern 优先于 save pattern，默认空逐位不变；`preserve_rng_state=True` 配置期即拒，torch_remat 需 torch ≥ 2.10，apply 期 loud-raise）。`disable_dynamo_lru_cache` 亦已移植（上游在每个 policy 的 `apply` 开头调用），并经 `has("dynamo_lru_cache")` 能力门：torch 2.2.2 有 `torch._C._dynamo.eval_frame` 而无 `_set_lru_cache`，此时记 info 后继续。AC 也跑在 PP 路径上（`stages.py` 的 `ac` 行 `on_pp=True`，逐 chunk 折层，与上游把 `ac_config` 交给每个 model part 的 `parallelize` 同构）。FullAC 的 `determinism_check`/`debug` 旋钮未暴露（固定默认值），登记于此 |
+| `apply_ac`, selective helpers, `apply_memory_budget`, `disable_dynamo_lru_cache` | `distributed/activation_checkpoint.py` | FullAC/SelectiveAC 已移植，**通过**；FullAC 的对齐同时含策略这一层：上游 `FullAC._wrap_block` 不是裸 wrapper，而是把恒 `PREFER_RECOMPUTE` 的 `_full_ac_policy` 经 `create_selective_checkpoint_contexts` 传入，让 torch 对「输出不可重算/带注册副作用」的算子仍落 SAVE；llmtuner 已按同形补上 `full_policy` + `wrap_full`（`determinism_check`/`debug` 仍走 torch 默认值——实测 torch 默认即 `default`/`False`，与上游 config 默认相同，故行为一致，只是不可配）；两处 `early_stop` 已跟随上游 #4836 为 `True`。MemoryBudgetAC 已移植为 `mode='memory_budget'` + `MemoryBudgetACConfig`（设 `torch._functorch.config.activation_memory_budget`，需 compile，torch 无 knob 时 loud-raise），见 §9.1；RegionAC 已接入（`region_ac` + `memory/remat_regions.py`，以 HF block 的 `nn.Linear` FQN 作 region 名，替代上游 `Module.configure_remat_regions` 声明通道；`recompute_regions` 与上游同语义——recompute pattern 优先于 save pattern，默认空逐位不变；`preserve_rng_state=True` 配置期即拒，torch_remat 需 torch ≥ 2.10，apply 期 loud-raise）。`disable_dynamo_lru_cache` 亦已移植（上游在每个 policy 的 `apply` 开头调用），并经 `has("dynamo_lru_cache")` 能力门：torch 2.2.2 有 `torch._C._dynamo.eval_frame` 而无 `_set_lru_cache`，此时记 info 后继续。AC 也跑在 PP 路径上（`stages.py` 的 `ac` 行 `on_pp=True`，逐 chunk 折层，与上游把 `ac_config` 交给每个 model part 的 `parallelize` 同构）。FullAC 的 `determinism_check`/`debug` 旋钮未暴露（固定默认值），登记于此 |
 | `apply_compile`, `maybe_enable_async_tp`, `maybe_regional_inductor_backend`, `maybe_regional_inductor` | `distributed/compile.py` 同名函数 | 四件全移植为 `parallel/compile.py` + `CompileConfig`（`training.compile_config`，默认全关 = 旧整体 compile 逐位不变）：逐 block compile 用 `Module.compile` 就地（`per_block=True`）；async TP 设 `_micro_pipeline_tp` + symm-mem 注册（按 group 名去重），配置期拒无 compile/tp=1，装配期对无 mesh/旧 torch loud-raise；regional_inductor 仅 `aot_eager`×flex 触发（wrapper `uses_flex_attention` 判定，annotation 在 `flex_attention_hf`，inductor_configs 传空），flex×其他 backend `ValueError`、torch 无该模块 `NotImplementedError`；`capture_scalar_outputs` 按上游条件（`iter_moe_layers` 非空）设置，dense 不动。上游的 `skip_fwd_side_effects_in_bwd_under_checkpoint` 与 FakeTensorMode monkeypatch 未移植（登记于 upstream map），**通过（适配）** |
 
 `VALID_AC_MODES` 声明在 `config/activation_checkpoint.py`，紧挨它约束的
-`TrainingConfig.activation_checkpoint_mode`；`parallel/activation_checkpoint.py` 从这里
+`TrainingConfig.activation_checkpoint_mode`；`memory/activation_checkpoint.py` 从这里
 import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac` 的成员
 检查不会各自漂移）。`config/training.py` 的 `global_batch_size` / `max_seq_len` /
 `steps` / `gradient_accumulation_steps` 四个 `>= 1` 守卫是"一组名字 + 一个循环"
@@ -962,10 +962,10 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
   → swap 后 MoE 直接消费/产出 T/tp 分片（无边界 collective);HF 侧
   `packed_colwise`/`moe_tp_experts` 规格 → `shard_experts_for_tp`。
 - RegionAC：**已接入**，`mode='region'` + `RegionACConfig`
-  + `parallel/remat_regions.py`。上游的 `Module.configure_remat_regions` 协议在 llmtuner
+  + `memory/remat_regions.py`。上游的 `Module.configure_remat_regions` 协议在 llmtuner
   无对应物，改为结构等价：HF block 里的每个 `nn.Linear` 就是一个 region（名字取该
   block 内相对 FQN，pattern 语义与上游同为 fnmatch 相对名），再由
-  `wrap_region`（`parallel/activation_checkpoint.py`）用 `torch_remat.checkpoint` 包 block.forward。唯一受限项是上游自带的：
+  `wrap_region`（`memory/activation_checkpoint.py`）用 `torch_remat.checkpoint` 包 block.forward。唯一受限项是上游自带的：
   `torch_remat` 要求 torch ≥ 2.10（本机 2.2.2 import 即失败），故 apply 期
   `ImportError`，文案同时给出 torch 版本要求与安装命令；`preserve_rng_state=True` 在
   config 期即拒（torch_remat 也拒，指向 `RecomputeStateHook`）。**数值未验证**：
@@ -1106,7 +1106,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `models/hf/model.py` + `models/hf/factory.py` + `models/hf/flops.py` | wrapper/forward、config 构建/类解析/meta materialize、FLOPs | B，transformers backend model（`model.py` 与上游 `.../model.py` 同名） |
 | （上游）`experiments/transformers_modeling_backend/` 的 `module_conversion.py` / `config_registry.py` / `__init__.py` | HF 模块的 `Module` 协议转换 / 实验用家族 config 注册表 / 模型注册表 | 无对应物：llmtuner 没有 `Module` 协议这一层（同类 `__class__` swap 技术用于 `GatherSequenceFirst`/`TPMoeSequenceBoundary`/TP realizer），config 由 HF `AutoConfig` + `config/` 门面构建，模型类由 HF auto mapping 解析（`resolve_model_class`） |
 | `models/hf/state_dict_adapter.py` | HF↔llmtuner state-dict 键转换与 safetensors index 严格校验 | B，`experiments/.../state_dict_adapter.py` |
-| `parallel/activation_checkpoint.py` | full/selective AC | A2，distributed AC |
+| `memory/activation_checkpoint.py` | full/selective AC | A2，distributed AC |
 | `parallel/compile.py` | `apply_compile`（逐 block compile / async TP / regional_inductor / capture_scalar_outputs） | A2，`distributed/compile.py` |
 | `accelerator/collectives.py` | reductions、timeouts、grad norm | A2（部分），`distributed/utils.py` 的两个 vendored 符号；外加 mmengine 来源的 in-place `all_reduce`（原 `accelerator/dist.py`，已并入） |
 | `parallel/context_parallel/apply.py` | `apply_cp` | C，独立 HF 编排层 |

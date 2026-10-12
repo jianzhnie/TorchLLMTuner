@@ -39,12 +39,12 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
 
-import llmtuner.parallel.fully_shard_parallel.fsdp as fsdp_module
+import llmtuner.parallel.fully_shard_parallel.fully_shard_parallel as fsdp_module
 from llmtuner.models.common.moe.block import MoE
 from llmtuner.models.common.moe.dispatcher import LocalTokenDispatcher
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
 from llmtuner.models.common.moe.router import TokenChoiceTopKRouter
-from llmtuner.parallel.fully_shard_parallel.fsdp import (
+from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp_to_decoder,
     enable_fsdp_symm_mem,
     fsdp_shard_size,

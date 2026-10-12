@@ -34,8 +34,8 @@ from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import all_reduce
 from llmtuner.config import SelectiveACConfig
-from llmtuner.parallel.activation_checkpoint import apply_ac
-from llmtuner.parallel.fully_shard_parallel.apply import apply_fsdp
+from llmtuner.memory.activation_checkpoint import apply_ac
+from llmtuner.parallel.fully_shard_parallel import apply_fsdp
 from llmtuner.parallel.parallel_dims import ParallelDims
 from llmtuner.trainer import ParallelConfig
 

@@ -29,7 +29,7 @@ from ..utils.lazy_exports import export_names, resolve_export
 _EXPORT_SOURCES = {
     "apply_cp": "context_parallel",
     "apply_ep": "expert_parallel",
-    "apply_fsdp": "fully_shard_parallel.apply",
+    "apply_fsdp": "fully_shard_parallel",
     "apply_tp": "tensor_parallel",
     "parallelize_hf_transformers": "parallelize",
 }

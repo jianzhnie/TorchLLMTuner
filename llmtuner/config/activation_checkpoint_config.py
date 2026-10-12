@@ -19,7 +19,7 @@ VALID_AC_MODES: tuple[str, ...] = (
 
 Declared here because this is where the value is constrained (the field is
 parsed and validated in this module), and imported by
-``parallel/activation_checkpoint.py`` -- which dispatches on the same set -- so
+``memory/activation_checkpoint.py`` -- which dispatches on the same set -- so
 the config's accepted set and the applier's set cannot drift apart. These are
 upstream's four policies plus the off switch; ``"region"`` needs the optional
 ``torch_remat`` package at apply time, which requires torch >= 2.10 (see
@@ -151,7 +151,7 @@ class RegionACConfig:
     models and does not own their decoder code, so the vocabulary is structural:
     every ``nn.Linear`` in a block is a region, named by its FQN relative to the
     block (``self_attn.q_proj``, ``mlp.gate_proj``, an MoE router's ``gate``).
-    ``parallel/remat_regions.py`` explains why that is the same policy in HF's
+    ``memory/remat_regions.py`` explains why that is the same policy in HF's
     spelling, and what the vocabulary deliberately leaves out.
 
     Of the three knobs upstream's ``RegionAC.Config`` inherits from its policy
@@ -180,7 +180,7 @@ class RegionACConfig:
             "else in the block is recomputed, so an empty list (the default) "
             "retains nothing and behaves like full checkpointing. Region names "
             "are the block's nn.Linear FQNs; the set is logged at apply time "
-            "and listed in parallel/remat_regions.py."
+            "and listed in memory/remat_regions.py."
         },
     )
     recompute_regions: list[str] = field(

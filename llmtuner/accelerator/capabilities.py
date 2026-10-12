@@ -182,13 +182,13 @@ CAPABILITIES: dict[str, Capability] = {
         consumers="parallel/compile.py (async TP), tensor_parallel/tp.py "
         "(fused symm-mem TP collectives), tensor_parallel/linear.py",
     ),
-    # -- activation checkpointing (consumer: parallel/activation_checkpoint.py)
+    # -- activation checkpointing (consumer: memory/activation_checkpoint.py)
     "functorch_activation_memory_budget": Capability(
         hasattr_torch("torch._functorch.config", "activation_memory_budget"),
         what="torch._functorch.config.activation_memory_budget",
         since="torch 2.6 (functorch partitioner budget knob)",
         hint="Upgrade torch, or use activation_checkpoint_mode='full'/'selective'.",
-        consumers="parallel/activation_checkpoint.py (mode='memory_budget')",
+        consumers="memory/activation_checkpoint.py (mode='memory_budget')",
     ),
     "dynamo_lru_cache": Capability(
         dynamo_lru_cache_knob,
@@ -197,7 +197,7 @@ CAPABILITIES: dict[str, Capability] = {
         "builds upstream targets",
         hint="Upgrade torch; without the knob, activation checkpointing runs "
         "without upstream's SAC + pipeline-parallel cache workaround.",
-        consumers="parallel/activation_checkpoint.py (disable_dynamo_lru_cache)",
+        consumers="memory/activation_checkpoint.py (disable_dynamo_lru_cache)",
     ),
     # -- pipeline eval driver (consumer: trainer/validate.py) ----------------
     "pipelining_microbatch_drivers": Capability(

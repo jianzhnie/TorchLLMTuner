@@ -3,7 +3,7 @@
 ``RegionAC`` retains the regions a block declares and recomputes the rest. In
 torchtitan the declarations are ``torch_remat.region`` call sites in its own
 model code, wired by ``Module.configure_remat_regions``; llmtuner runs HF models
-and does not own their decoder code, so ``parallel/remat_regions.py`` derives the
+and does not own their decoder code, so ``memory/remat_regions.py`` derives the
 vocabulary structurally -- the block's ``nn.Linear``s -- and applies upstream's
 ``fnmatch`` save rule to the configured patterns.
 
@@ -31,7 +31,7 @@ from llmtuner.config import (
     TrainingConfig,
 )
 from llmtuner.errors import ConfigError
-from llmtuner.parallel.remat_regions import (
+from llmtuner.memory.remat_regions import (
     region_names,
     region_policy,
     should_recompute,
