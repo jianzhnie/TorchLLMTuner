@@ -43,7 +43,6 @@ usual), no fused QKV (HF keeps q/k/v as separate projections), no FP8.
 
 from __future__ import annotations
 
-import fnmatch
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
@@ -58,6 +57,7 @@ from ...accelerator.capabilities import has
 from ...models.common.moe.experts import GroupedExperts
 from .. import matrix
 from ..head_sharding import require_heads_divisible_by
+from ..patterns import module_name_matches
 from .linear import (
     AllGatherLinear,
     LinearReduceScatter,
@@ -567,7 +567,7 @@ def match(
     can never win for the same path.
     """
     for pattern, spec in plan.items():
-        if fnmatch.fnmatch(module_path, pattern):
+        if module_name_matches(pattern, module_path):
             return spec
     return None
 
@@ -790,6 +790,23 @@ def apply_tp(
     """
     if mesh is None or cfg.tp <= 1:
         return model
+
+    configured_plan: dict[str, str] = {}
+    for pattern in getattr(cfg, "tp_colwise_modules", []):
+        configured_plan[pattern] = "colwise"
+    for pattern in getattr(cfg, "tp_rowwise_modules", []):
+        if pattern in configured_plan:
+            raise ValueError(f"TP pattern {pattern!r} has conflicting styles")
+        configured_plan[pattern] = "rowwise"
+    if getattr(cfg, "tp_sequence_modules", []):
+        raise ValueError(
+            "tp_sequence_modules is not valid for llmtuner's fused sequence "
+            "parallel engine; normalization modules already consume the "
+            "sequence shard without a separate transformation"
+        )
+    if configured_plan:
+        base_plan = model_tp_plan(model) if plan is None else plan
+        plan = {**base_plan, **configured_plan}
 
     # A head count that does not divide ``tp`` has no valid local head split,
     # and no downstream guard catches it: the projection-level check in

@@ -133,7 +133,7 @@ def parallelize_hf_transformers(
         runners = {
             "tp": lambda m: apply_tp(m, dense_mesh, cfg),
             "ep": lambda m: apply_ep(m, cfg, ep_group=ep_group),
-            "cp": lambda m: apply_cp(m, dense_mesh, cfg),
+            "cp": lambda m: apply_cp(m, dense_mesh, cfg, parallel_dims=parallel_dims),
             "ac": _apply_ac,
             "compile": lambda m: apply_compile(
                 m, compile_config=compile_config, tp_mesh=tp_mesh
