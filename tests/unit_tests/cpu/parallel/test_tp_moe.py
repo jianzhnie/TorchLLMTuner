@@ -26,7 +26,7 @@ import torch.nn as nn
 
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.parallel.tensor_parallel import apply_tp
-from llmtuner.parallel.tensor_parallel.tp import (
+from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     MOE_PLAN_SPECS,
     resolve_plan,
     shard_experts_for_tp,
@@ -298,7 +298,9 @@ def test_shared_expert_shards_featurewise_and_partials_sum() -> None:
     gathered it), the w2 output is partial over tp, and the boundary's
     reduce-scatter does the sum. Simulated here with two in-process shards.
     """
-    from llmtuner.parallel.tensor_parallel.tp import shard_shared_expert_for_tp
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+        shard_shared_expert_for_tp,
+    )
 
     torch.manual_seed(0)
     reference = _SharedMLP().double()
@@ -340,7 +342,7 @@ def test_shared_expert_is_not_double_sharded_by_the_dense_plan() -> None:
 
     apply_tp(model, mesh=_FakeMesh(2, 0), cfg=cfg)
 
-    from llmtuner.parallel.tensor_parallel.tp import (
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import (
         ColumnParallelLinear,
         RowParallelLinear,
     )
@@ -420,7 +422,7 @@ def test_swap_refuses_a_shared_expert_block_under_tp_x_ep() -> None:
 
 def test_tp_sharded_param_ids_covers_dense_tp_and_ep_experts_not_router() -> None:
     from llmtuner.models.common.moe.experts import GroupedExperts
-    from llmtuner.parallel.tensor_parallel.tp import (
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import (
         ColumnParallelLinear,
         tp_sharded_param_ids,
     )

@@ -27,14 +27,14 @@ from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel import matrix
 from llmtuner.parallel.parallel_dims import ParallelDims
-from llmtuner.parallel.pipeline_parallel.apply import (
-    make_schedule_loss_fn,
-    prepend_first_stage_modules,
-    validate_microbatches,
-)
 from llmtuner.parallel.pipeline_parallel.pipeline import (
     generate_llm_fqn_per_model_part,
     split_model_into_stages,
+)
+from llmtuner.parallel.pipeline_parallel.pipeline_parallel import (
+    make_schedule_loss_fn,
+    prepend_first_stage_modules,
+    validate_microbatches,
 )
 from llmtuner.trainer import ParallelConfig
 
