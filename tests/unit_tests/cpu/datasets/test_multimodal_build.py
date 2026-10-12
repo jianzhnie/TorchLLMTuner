@@ -56,7 +56,7 @@ MM_TOKENS = (IMAGE_TOKEN, VIDEO_TOKEN, VISION_START, VISION_END, PAD_TOKEN)
 MM_MODULES = (
     "llmtuner.datasets.multimodal",
     "llmtuner.datasets.multimodal.collator",
-    "llmtuner.datasets.multimodal.datasets",
+    "llmtuner.datasets.multimodal.processors",
     "llmtuner.datasets.multimodal.image",
     "llmtuner.datasets.multimodal.placeholders",
     "llmtuner.datasets.multimodal.video",
@@ -107,9 +107,9 @@ def test_build_dataloader_names_a_multimodal_recipe(tmp_path, monkeypatch):
     """The end-to-end seam: a config names ``cc12m-test`` and the loader that
     comes back carries image patches and grids in its batches."""
     pytest.importorskip("torchvision")
-    from llmtuner.datasets.multimodal.datasets import (
-        MM_DATASETS,
-        MultiModalProcessor,
+    from llmtuner.datasets.multimodal.processors import (
+        MULTIMODAL_DATASETS,
+        MultimodalProcessor,
         process_cc12_wd_sample,
     )
 
@@ -124,12 +124,12 @@ def test_build_dataloader_names_a_multimodal_recipe(tmp_path, monkeypatch):
     # Point the registered recipe at the local corpus: the recipe key is what
     # is under test here, not the Hub snapshot it normally reads.
     monkeypatch.setitem(
-        MM_DATASETS,
+        MULTIMODAL_DATASETS,
         "cc12m-test",
         SingleDataset(
             source=Base64JsonlSource(patterns=(corpus,)),
             processor=partial(
-                MultiModalProcessor, sample_processor=process_cc12_wd_sample
+                MultimodalProcessor, sample_processor=process_cc12_wd_sample
             ),
             post_filters=(lambda sample: sample is not None,),
         ),
@@ -158,7 +158,7 @@ def test_unknown_recipe_lists_both_registries(tmp_path):
     """A typo must show the caller every name that would have worked, from
     both catalogs, in one error."""
     pytest.importorskip("torchvision")
-    from llmtuner.datasets.multimodal.datasets import MM_DATASETS
+    from llmtuner.datasets.multimodal.processors import MULTIMODAL_DATASETS
 
     with pytest.raises(ValueError, match="unknown dataset") as excinfo:
         _build(
@@ -168,7 +168,7 @@ def test_unknown_recipe_lists_both_registries(tmp_path):
             )
         )
     message = str(excinfo.value)
-    for key in sorted(TEXT_DATASETS) + sorted(MM_DATASETS):
+    for key in sorted(TEXT_DATASETS) + sorted(MULTIMODAL_DATASETS):
         assert key in message
 
 

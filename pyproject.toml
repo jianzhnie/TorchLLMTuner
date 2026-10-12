@@ -51,7 +51,7 @@ dependencies = [
     # depend on JAX -- that import is behind an optional sharding/sharding path.
     "grain",
     # Imported directly by the migrated data layer (datasets/,
-    # components/tokenizer.py). `transformers` happens to pull some of these in,
+    # components/tokenizer/). `transformers` happens to pull some of these in,
     # but that is incidental -- the data layer must not break when used without
     # a model. `datasets` and `tokenizers` back the sources and the tokenizer,
     # `jinja2` renders chat templates; the rest are reached only on the

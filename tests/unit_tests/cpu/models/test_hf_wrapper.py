@@ -23,8 +23,8 @@ import torch
 
 from llmtuner.components.loss import IGNORE_INDEX, next_token_targets
 from llmtuner.config import LLMTunerConfig, TrainingConfig
+from llmtuner.models.hf.attention_backend import ATTENTION_BACKEND
 from llmtuner.models.hf.factory import (
-    _ATTN_IMPLEMENTATION,
     build_model_config,
     build_model_config_for,
     materialize_meta_model,
@@ -141,7 +141,7 @@ def test_sdpa_fallback_gives_the_decoder_no_mask(model: HFTransformerModel) -> N
     decoder is handed neither mask nor ``is_causal``: HF then builds what it
     needs itself, which is the path it is tested against.
     """
-    assert model.model.config._attn_implementation != _ATTN_IMPLEMENTATION
+    assert model.model.config._attn_implementation != ATTENTION_BACKEND
 
     kwargs = model._apply_attention(torch.arange(16), None)
 
@@ -156,7 +156,7 @@ def test_attention_masks_is_a_block_mask(model: HFTransformerModel) -> None:
 
 def test_flex_backend_gets_the_block_mask(model: HFTransformerModel) -> None:
     """The flex path is the one that consumes the mask, and only it gets it."""
-    model.model.config._attn_implementation = _ATTN_IMPLEMENTATION
+    model.model.config._attn_implementation = ATTENTION_BACKEND
 
     kwargs = model._apply_attention(torch.arange(16), None)
 
@@ -167,7 +167,7 @@ def test_flex_backend_gets_the_block_mask(model: HFTransformerModel) -> None:
 def test_flex_backend_passes_an_explicit_mask_through(
     model: HFTransformerModel,
 ) -> None:
-    model.model.config._attn_implementation = _ATTN_IMPLEMENTATION
+    model.model.config._attn_implementation = ATTENTION_BACKEND
     sentinel = model.get_attention_masks(positions=torch.arange(16))
 
     kwargs = model._apply_attention(torch.arange(16), sentinel)
@@ -566,7 +566,7 @@ def test_an_unsettable_experts_implementation_is_rejected() -> None:
 def test_native_experts_implementation_is_the_default_and_builds() -> None:
     """The default leaves the HF model's own experts kernel untouched."""
     from llmtuner.models.hf.factory import resolve_model_class
-    from llmtuner.models.hf.model import resolve_experts_implementation
+    from llmtuner.models.hf.model_setup import resolve_experts_implementation
 
     config = _qwen3_config()
     assert getattr(config, "experts_implementation", "native") == "native"

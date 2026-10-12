@@ -18,12 +18,14 @@ import torch
 import torch.nn as nn
 
 from llmtuner.components.checkpointer import (
-    CheckpointManager,
     CheckpointStorage,
+    DistributedCheckpointManager,
     ModelWrapper,
     canonical_fqn,
 )
-from llmtuner.components.checkpointer.dcp import FilesystemCheckpointStorage
+from llmtuner.components.checkpointer.distributed_checkpoint import (
+    FilesystemCheckpointStorage,
+)
 from llmtuner.components.optimizer import init_optim_state
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.config import CheckpointConfig as Config
@@ -136,7 +138,7 @@ def test_hf_options_are_rejected_without_a_state_dict_adapter(tmp_path) -> None:
     model = nn.Linear(4, 4)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
     try:
-        CheckpointManager(
+        DistributedCheckpointManager(
             Config(enable=True, last_save_in_hf=True),
             model_parts=[model],
             optimizer=optimizer,
@@ -154,7 +156,7 @@ def test_a_disabled_manager_returns_early_without_building_anything(tmp_path) ->
     """``enable=False`` is the default; it must not allocate a purge thread."""
     model = nn.Linear(4, 4)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
-    manager = CheckpointManager(
+    manager = DistributedCheckpointManager(
         Config(enable=False),
         model_parts=[model],
         optimizer=optimizer,
@@ -179,7 +181,7 @@ def test_close_and_the_public_methods_survive_a_failed_constructor(tmp_path) -> 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
     manager = None
     try:
-        CheckpointManager(
+        DistributedCheckpointManager(
             Config(enable=True, async_mode="async", last_save_in_hf=True),
             model_parts=[model],
             optimizer=optimizer,
@@ -193,7 +195,7 @@ def test_close_and_the_public_methods_survive_a_failed_constructor(tmp_path) -> 
 
     # Rebuild the same half-constructed state and drive the entry points that
     # ``__del__`` and a partially-failed setup would reach.
-    half_built = CheckpointManager.__new__(CheckpointManager)
+    half_built = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
     half_built.enable = True  # assigned first, so it reads as enabled
     assert half_built.save(1) is False
     assert half_built.load(-1) is False
@@ -348,7 +350,7 @@ def test_a_disabled_torch_checkpointing_manager_never_touches_the_backend() -> N
     machine without the backend; if the import moved above the guard, every
     caller would need the package installed just to not use it.
     """
-    from llmtuner.components.checkpointer.torch_checkpointing import (
+    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
         TorchCheckpointingManager,
     )
 
@@ -374,7 +376,7 @@ def test_an_enabled_torch_checkpointing_manager_without_the_backend_raises() -> 
 
     import pytest
 
-    from llmtuner.components.checkpointer.torch_checkpointing import (
+    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
         TorchCheckpointingManager,
     )
 
@@ -406,7 +408,7 @@ def test_an_enabled_manager_registers_the_lr_scheduler(monkeypatch) -> None:
     import pytest
 
     from llmtuner.components.checkpointer import LR_SCHEDULER
-    from llmtuner.components.checkpointer import torch_checkpointing as tc
+    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
 
     class _StubBackend:
         def __getattr__(self, name):
@@ -476,7 +478,7 @@ _HF_METADATA = object()
 def _hf_manager_stub(tmp_path, monkeypatch, *, files=(), hf_metadata=_HF_METADATA):
     import types
 
-    from llmtuner.components.checkpointer import torch_checkpointing as tc
+    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
     from llmtuner.components.checkpointer.checkpoint_keys import MODEL
 
     calls: dict[str, object] = {}
@@ -591,7 +593,7 @@ def test_native_load_restores_stateful_and_rejects_foreign_objects(
     import pytest
     from torch.distributed.checkpoint.stateful import Stateful
 
-    from llmtuner.components.checkpointer import torch_checkpointing as tc
+    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
 
     manager, calls, MODEL = _hf_manager_stub(
         tmp_path, monkeypatch, files={f"{tmp_path}/metadata.pkl"}

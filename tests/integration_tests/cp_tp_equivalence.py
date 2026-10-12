@@ -83,7 +83,7 @@ def _cfg(strategy: str, *, heads: int = HEADS) -> LLMTunerConfig:
         ),
         parallel=ParallelConfig(
             tensor_parallel_size=TP,
-            context_parallel_size=CP,
+            context_parallel_kv_allgather_size=CP,
             context_parallel_strategy=strategy,
             context_parallel_load_balancer=None,
         ),

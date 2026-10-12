@@ -75,7 +75,7 @@ def _cfg() -> LLMTunerConfig:
             num_key_value_heads=4,
         ),
         parallel=ParallelConfig(
-            context_parallel_size=2,
+            context_parallel_ulysses_size=2,
             context_parallel_strategy="ulysses",
             context_parallel_load_balancer=None,
         ),

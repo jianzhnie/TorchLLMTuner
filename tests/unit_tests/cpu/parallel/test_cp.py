@@ -26,7 +26,6 @@ import pytest
 import torch
 
 from llmtuner.config import ParallelConfig
-from llmtuner.errors import ConfigError
 from llmtuner.parallel.context_parallel import (
     CPFlexKernel,
     apply_cp,
@@ -36,7 +35,7 @@ from llmtuner.parallel.context_parallel import (
 def test_apply_cp_is_a_no_op_when_cp_is_off() -> None:
     """CP=1 must hand the model back untouched rather than raise."""
     model = torch.nn.Linear(4, 4)
-    cfg = ParallelConfig(context_parallel_size=1)
+    cfg = ParallelConfig(context_parallel_kv_allgather_size=1)
 
     assert apply_cp(model, None, cfg) is model
 
@@ -49,7 +48,7 @@ def test_apply_cp_requires_the_flex_backend() -> None:
     from silently computing attention over its own shard only.
     """
 
-    cfg = ParallelConfig(context_parallel_size=2)
+    cfg = ParallelConfig(context_parallel_kv_allgather_size=2)
 
     with pytest.raises(RuntimeError, match="attention backend"):
         apply_cp(torch.nn.Linear(4, 4), None, cfg)
@@ -118,18 +117,10 @@ def test_dual_cp_axes_derive_total_degree() -> None:
     assert cfg.non_dp_sizes() == 8
 
 
-def test_dual_cp_axes_cannot_mix_with_legacy_degree() -> None:
-    with pytest.raises(ConfigError, match="cannot be combined"):
-        ParallelConfig(
-            context_parallel_size=2,
-            context_parallel_kv_allgather_size=2,
-        )
-
-
 def test_kcp_rejects_tensor_parallelism() -> None:
     with pytest.raises(Exception, match="KCP requires tensor_parallel_size=1"):
         ParallelConfig(
-            context_parallel_size=2,
+            context_parallel_kv_allgather_size=2,
             context_parallel_strategy="kcp",
             tensor_parallel_size=2,
         )
@@ -181,7 +172,7 @@ def tp_cp_mesh():
 def _ulysses_cfg(tp: int) -> ParallelConfig:
     return ParallelConfig(
         tensor_parallel_size=tp,
-        context_parallel_size=2,
+        context_parallel_kv_allgather_size=2,
         context_parallel_strategy="ulysses",
         context_parallel_load_balancer=None,
     )
@@ -223,6 +214,6 @@ def test_ulysses_packed_is_accepted_and_the_strategy_is_latched(tp_cp_mesh) -> N
     apply_cp(
         model,
         tp_cp_mesh,
-        ParallelConfig(tensor_parallel_size=2, context_parallel_size=2),
+        ParallelConfig(tensor_parallel_size=2, context_parallel_kv_allgather_size=2),
     )
     assert model.cp_strategy == "kv_allgather"

@@ -60,7 +60,7 @@ def _cfg() -> LLMTunerConfig:
             num_key_value_heads=4,
         ),
         parallel=ParallelConfig(
-            context_parallel_size=2,
+            context_parallel_kv_allgather_size=2,
             # Contiguous split: the gathered logits then concatenate in rank
             # order and compare against the dense reference directly.
             context_parallel_load_balancer=None,

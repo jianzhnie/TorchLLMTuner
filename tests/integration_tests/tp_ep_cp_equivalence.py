@@ -5,8 +5,9 @@ Run under torchrun with 4 ranks:
     PYTHONPATH=. torchrun --nproc_per_node=4 \\
         tests/integration_tests/tp_ep_cp_equivalence.py
 
-A tiny qwen3_moe runs with tensor_parallel_size=2, context_parallel_size=2 and
-expert_parallel_size=2 on 4 gloo ranks: TP shards the dense projections, the
+A tiny qwen3_moe runs with tensor_parallel_size=2,
+context_parallel_kv_allgather_size=2 and expert_parallel_size=2 on 4 gloo ranks:
+TP shards the dense projections, the
 EP swap owns the routed experts, CP shards the sequence. Each rank's logits
 are this rank's T/(cp*tp) sequence slice; joining them over tp and then cp
 must reproduce the unsharded HF model's logits, and the summed loss must
@@ -71,7 +72,7 @@ def _cfg() -> LLMTunerConfig:
         ),
         parallel=ParallelConfig(
             tensor_parallel_size=TP,
-            context_parallel_size=CP,
+            context_parallel_kv_allgather_size=CP,
             expert_parallel_size=EP,
             context_parallel_load_balancer=None,
         ),

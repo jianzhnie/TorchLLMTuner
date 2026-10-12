@@ -28,20 +28,13 @@ import pytest
 import torch
 
 from llmtuner.components.loss import IGNORE_INDEX
-from llmtuner.components.tokenizer import MultiModalTokenizer
+from llmtuner.components.tokenizer import MultimodalTokenizer
 from llmtuner.datasets import (
     IndexedJsonlSource,
     SingleDataset,
     build_dataset,
 )
-from llmtuner.datasets.multimodal.collator import MultiModalCollator
-from llmtuner.datasets.multimodal.datasets import (
-    MultiModalProcessor,
-    build_mm_sample_packing,
-    packing_output_to_mm_sample,
-    process_cc12_wd_sample,
-    process_mm_sample,
-)
+from llmtuner.datasets.multimodal.collator import MultimodalCollator
 from llmtuner.datasets.multimodal.image import (
     calculate_vision_tokens,
     process_image,
@@ -50,7 +43,16 @@ from llmtuner.datasets.multimodal.image import (
     smart_resize,
     vision_to_patches,
 )
+from llmtuner.datasets.multimodal.packing import (
+    build_multimodal_packing,
+    packing_output_to_multimodal_sample,
+)
 from llmtuner.datasets.multimodal.placeholders import insert_vision_placeholders
+from llmtuner.datasets.multimodal.processors import (
+    MultimodalProcessor,
+    process_cc12_wd_sample,
+    process_multimodal_sample,
+)
 from llmtuner.datasets.multimodal.video import load_video, process_video
 from tests.data_fixtures import (  # noqa: F401
     VOCAB,
@@ -66,16 +68,16 @@ VIDEO_TOKEN = "<|video_pad|>"
 VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
 
-# The five tokens a MultiModalTokenizer validates against the vocabulary.
+# The five tokens a MultimodalTokenizer validates against the vocabulary.
 MM_TOKENS = (IMAGE_TOKEN, VIDEO_TOKEN, VISION_START, VISION_END, "[PAD]")
 
 
 @pytest.fixture(scope="module")
-def mm_tokenizer(tmp_path_factory) -> MultiModalTokenizer:
+def mm_tokenizer(tmp_path_factory) -> MultimodalTokenizer:
     """A tokenizer whose vision placeholders are real added tokens.
 
     They have to be in the saved vocabulary rather than added afterwards:
-    ``MultiModalTokenizer`` validates all five at construction. Ids must be
+    ``MultimodalTokenizer`` validates all five at construction. Ids must be
     contiguous with the base vocabulary -- WordLevel refuses to save a vocab
     with holes in it.
     """
@@ -85,7 +87,7 @@ def mm_tokenizer(tmp_path_factory) -> MultiModalTokenizer:
             token: max(VOCAB.values()) + 1 + i for i, token in enumerate(MM_TOKENS)
         },
     )
-    return MultiModalTokenizer(
+    return MultimodalTokenizer(
         tokenizer_path=path,
         image_token=IMAGE_TOKEN,
         video_token=VIDEO_TOKEN,
@@ -296,11 +298,16 @@ def test_insert_vision_placeholders_rejects_a_slot_with_no_token_count():
 # --------------------------------------------------------------------------
 
 
-def test_process_mm_sample_rejects_mismatched_text_and_image_lists(mm_tokenizer):
-    assert process_mm_sample(["a"], [], tokenizer=mm_tokenizer, **MM_KWARGS) is None
+def test_process_multimodal_sample_rejects_mismatched_text_and_image_lists(
+    mm_tokenizer,
+):
+    assert (
+        process_multimodal_sample(["a"], [], tokenizer=mm_tokenizer, **MM_KWARGS)
+        is None
+    )
 
 
-def test_process_mm_sample_masks_the_vision_tokens_in_the_labels(
+def test_process_multimodal_sample_masks_the_vision_tokens_in_the_labels(
     mm_tokenizer, image_bytes
 ):
     """Vision placeholders must not be predicted as text.
@@ -309,7 +316,7 @@ def test_process_mm_sample_masks_the_vision_tokens_in_the_labels(
     trains the language head against something it never sees. The assertion is
     therefore the negative one: no placeholder survives in ``labels``.
     """
-    result = process_mm_sample(
+    result = process_multimodal_sample(
         texts=[None, "hello"],
         images=[image_bytes, None],
         tokenizer=mm_tokenizer,
@@ -331,8 +338,8 @@ def test_process_mm_sample_masks_the_vision_tokens_in_the_labels(
     assert not bool(torch.isin(result["labels"], special).any())
 
 
-def test_process_mm_sample_aligns_every_token_field(mm_tokenizer, image_bytes):
-    result = process_mm_sample(
+def test_process_multimodal_sample_aligns_every_token_field(mm_tokenizer, image_bytes):
+    result = process_multimodal_sample(
         texts=[None, "hello"],
         images=[image_bytes, None],
         tokenizer=mm_tokenizer,
@@ -344,13 +351,13 @@ def test_process_mm_sample_aligns_every_token_field(mm_tokenizer, image_bytes):
     assert result["input_ids"].shape == result["labels"].shape
 
 
-def test_process_mm_sample_drops_the_sample_when_one_image_fails(
+def test_process_multimodal_sample_drops_the_sample_when_one_image_fails(
     mm_tokenizer, image_bytes
 ):
     """A partially processed sample is dropped, not kept with fewer images than
     placeholders -- keeping it would misalign every image after the failure."""
     assert (
-        process_mm_sample(
+        process_multimodal_sample(
             texts=[None, None, "hello"],
             images=[image_bytes, b"broken", None],
             tokenizer=mm_tokenizer,
@@ -381,7 +388,7 @@ def test_process_cc12_wd_sample_raises_when_the_image_field_is_absent(mm_tokeniz
 
 
 def _mm_processor(mm_tokenizer, *, max_context_length=256):
-    return MultiModalProcessor(
+    return MultimodalProcessor(
         context=make_context(mm_tokenizer, max_context_length=max_context_length),
         sample_processor=process_cc12_wd_sample,
     )
@@ -441,8 +448,8 @@ def test_multimodal_processor_runs_over_a_jsonl_corpus(
     assert row["input_ids"].shape[0] >= 2
 
 
-class _CtxSizedMMProcessor(MultiModalProcessor):
-    """``MultiModalProcessor`` with a context large enough for one image."""
+class _CtxSizedMMProcessor(MultimodalProcessor):
+    """``MultimodalProcessor`` with a context large enough for one image."""
 
     def __init__(self, *, context):
         from dataclasses import replace
@@ -470,7 +477,7 @@ def token_ids(mm_tokenizer) -> dict[str, int]:
 
 
 def _collator(mm_tokenizer, **kwargs):
-    return MultiModalCollator(
+    return MultimodalCollator(
         context=make_context(mm_tokenizer, num_tokens_per_batch=128), **kwargs
     )
 
@@ -675,7 +682,7 @@ def test_mrope_positions_restart_at_each_document(mm_tokenizer):
 
 def test_mm_packing_rejects_a_non_positive_bin_count(mm_tokenizer):
     with pytest.raises(ValueError, match="num_packing_bins must be positive"):
-        build_mm_sample_packing(
+        build_multimodal_packing(
             SingleDataset(
                 source=IndexedJsonlSource(patterns=("unused",)),
                 post_filters=(lambda sample: sample is not None,),
@@ -698,7 +705,7 @@ def test_mm_packing_flattens_per_document_media_into_one_list(mm_tokenizer):
         "pixel_values": [["a", "b"], ["c"]],
         "pixel_values_videos": [["v"]],
     }
-    packed = packing_output_to_mm_sample(output, max_context_length=32)
+    packed = packing_output_to_multimodal_sample(output, max_context_length=32)
     assert packed["pixel_values"] == ["a", "b", "c"]
     assert packed["pixel_values_videos"] == ["v"]
     assert bool(packed["padding_mask"][4:].all())

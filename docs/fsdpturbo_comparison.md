@@ -372,8 +372,8 @@ TorchLLMTuner 对一次训练任务的状态和步骤拥有更强控制，因此
 | `distributed.fully_shard_parallel_size` | `parallel.data_parallel_shard_size` | 概念最接近；TorchLLMTuner 可设为 `-1` 自动推导 |
 | `distributed.tensor_parallel_size` | `parallel.tensor_parallel_size` | 并行度可对应；TP plan 不能直接迁移 |
 | `tp_plan.colwise_parallel` / `rowwise_parallel` | HF `_tp_plan` 与内置 TP 适配 | FSDPTurbo 使用用户 pattern，TorchLLMTuner 从模型 plan 与结构推导 |
-| `ulysses_parallel_size` | `context_parallel_size` + `context_parallel_strategy='ulysses'` | TorchLLMTuner 只有一个 CP 轴 |
-| `kv_allgather_parallel_size` | `context_parallel_size` + `context_parallel_strategy='kv_allgather'` | 需要重新检查 head 数和序列长度整除关系 |
+| `ulysses_parallel_size` | `context_parallel_kv_allgather_size` + `context_parallel_strategy='ulysses'` | TorchLLMTuner 只有一个 CP 轴 |
+| `kv_allgather_parallel_size` | `context_parallel_kv_allgather_size` + `context_parallel_strategy='kv_allgather'` | 需要重新检查 head 数和序列长度整除关系 |
 | `kcp_parallel_size` | 无直接对应 | 需要新增 CP strategy 和相应 attention kernel |
 | `expert_parallel_size` | `expert_parallel_size` | 并行度概念对应，但支持的模型布局与 dispatcher 不同 |
 | `expert_fully_shard_parallel_size` | 无直接字段 | TorchLLMTuner 根据 dense sparse-region 关系推导 `efsdp` |

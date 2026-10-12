@@ -393,7 +393,7 @@ compile 一步是 `parallel/model_compile.py::apply_compile`：默认整体
 默认全关）逐开关打开逐 block compile（`per_block`，`Module.compile` 就地）、async TP
 （`_micro_pipeline_tp` + symm-mem 注册，需 compile+tp>1，配置期校验，装配期对旧
 torch/无 mesh loud-raise）、regional_inductor（`backend="aot_eager"` 且模型走 flex 时
-把 flex region scoop 进 inductor，annotation 在 wrapper 的 `flex_attention_hf`）与
+把 flex region scoop 进 inductor，annotation 在 wrapper 的 `flex_attention_adapter`）与
 `capture_scalar_outputs`（编译的 model part 含 token-choice MoE block 时设置，dense
 不动该全局量）。PP 下每 chunk 过同一函数，顺序与 pp=1 一致。
 
@@ -475,7 +475,7 @@ NotImplementedError。边界 collective 的真多卡前后向等价性**环境�
 
 ### 5.4 CP / EP（context_parallel/ + expert_parallel/）
 
-**CP 已接线**。拦截点是 `hf/model.py` 的 `flex_attention_hf` 读取的 `_titan_flex_kernel`：
+**CP 已接线**。拦截点是 `hf/attention_backend.py` 的 `flex_attention_adapter` 读取的 `_titan_flex_kernel`：
 `apply_cp`（cp>1）walk 每层 attention module 并 attach `CPFlexKernel`
 （`context_parallel/attention.py`），支持两条真实路径：默认 KV all-gather（K/V 收成
 全长，Q 保持 token 分片），以及 Ulysses（token↔head all-to-all）。Ulysses 要求 heads
@@ -682,9 +682,9 @@ PYTHONPATH=. torchrun --nproc_per_node=2 tests/integration_tests/pp_checkpoint_e
 
 # 端到端 smoke：各维度单独与组合，loss 对拍单卡基线
 torchrun --nproc_per_node=2 -m llmtuner --tensor_parallel_size 2 --steps 20 ...
-torchrun --nproc_per_node=2 -m llmtuner --context_parallel_size 2 --steps 20 ...
+torchrun --nproc_per_node=2 -m llmtuner --context_parallel_kv_allgather_size 2 --steps 20 ...
 torchrun --nproc_per_node=2 -m llmtuner --pipeline_parallel_size 2 --steps 20 ...
-torchrun --nproc_per_node=4 -m llmtuner --tensor_parallel_size 2 --context_parallel_size 2 ...
+torchrun --nproc_per_node=4 -m llmtuner --tensor_parallel_size 2 --context_parallel_kv_allgather_size 2 ...
 torchrun --nproc_per_node=4 -m llmtuner --pipeline_parallel_size 2 --tensor_parallel_size 2 ...
 ```
 

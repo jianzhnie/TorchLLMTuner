@@ -7,7 +7,7 @@ a cluster to exercise. The collectives are checked in their single-rank form
 the real bug risk lives: clipping is easy to write such that it silently does
 nothing.
 
-Checkpointing is exercised through the real ``CheckpointManager``, which runs
+Checkpointing is exercised through the real ``DistributedCheckpointManager``, which runs
 single-process as long as no process group is initialized -- so the tests cover
 the DCP path the trainer actually uses rather than a substitute. The optimizer
 cases are deliberately built on *fresh* objects: restoring into an optimizer that
@@ -39,7 +39,7 @@ from llmtuner.accelerator.collectives import (
 from llmtuner.components.checkpointer import (
     DATALOADER,
     TRAIN_STATE,
-    CheckpointManager,
+    DistributedCheckpointManager,
 )
 from llmtuner.components.loss import (
     IGNORE_INDEX,
@@ -560,12 +560,12 @@ def _lr_scheduler(optimizer, *, warmup_steps: int = 0, training_steps: int = 8):
 
 def _manager(
     folder: str, model: nn.Module, optimizer, state: _TrainState, **overrides
-) -> CheckpointManager:
+) -> DistributedCheckpointManager:
     # keep_latest_k=0 keeps the default runs unbounded, so a test that asserts on
     # what is on disk is describing the save path rather than the purge thread.
     # Tests about retention pass keep_latest_k explicitly.
     config = {"keep_latest_k": 0, **overrides}
-    return CheckpointManager(
+    return DistributedCheckpointManager(
         CheckpointConfig(enable=True, folder="checkpoint", **config),
         model_parts=[model],
         optimizer=optimizer,
@@ -647,7 +647,7 @@ def test_checkpoint_round_trips_the_lr_schedule(tmp_path) -> None:
     schedule.step()
     assert schedule.state_dict() == {"last_epoch": 2}
 
-    manager = CheckpointManager(
+    manager = DistributedCheckpointManager(
         CheckpointConfig(enable=True, folder="checkpoint", keep_latest_k=0, interval=1),
         model_parts=[model],
         optimizer=optimizer,
@@ -664,7 +664,7 @@ def test_checkpoint_round_trips_the_lr_schedule(tmp_path) -> None:
     fresh_state = _TrainState()
     fresh_schedule = _lr_scheduler(fresh_optimizer, warmup_steps=8)
 
-    resumed = CheckpointManager(
+    resumed = DistributedCheckpointManager(
         CheckpointConfig(enable=True, folder="checkpoint", keep_latest_k=0),
         model_parts=[fresh_model],
         optimizer=fresh_optimizer,
@@ -695,7 +695,7 @@ def test_the_schedule_is_not_restored_from_a_missing_checkpoint(tmp_path) -> Non
     # No checkpoint on disk: nothing to restore, and nothing must be invented.
     fresh_model, fresh_optimizer = _model_and_optimizer()
     fresh_schedule = _lr_scheduler(fresh_optimizer, warmup_steps=8)
-    manager = CheckpointManager(
+    manager = DistributedCheckpointManager(
         CheckpointConfig(enable=True, folder="checkpoint", keep_latest_k=0),
         model_parts=[fresh_model],
         optimizer=fresh_optimizer,
@@ -724,7 +724,7 @@ def test_excluding_both_optimizer_and_schedule_leaves_them_untouched(tmp_path) -
     _step(model, optimizer)
     schedule.step()
 
-    manager = CheckpointManager(
+    manager = DistributedCheckpointManager(
         CheckpointConfig(
             enable=True,
             folder="checkpoint",
@@ -743,7 +743,7 @@ def test_excluding_both_optimizer_and_schedule_leaves_them_untouched(tmp_path) -
 
     fresh_model, fresh_optimizer = _model_and_optimizer()
     fresh_schedule = _lr_scheduler(fresh_optimizer, warmup_steps=8)
-    resumed = CheckpointManager(
+    resumed = DistributedCheckpointManager(
         CheckpointConfig(
             enable=True,
             folder="checkpoint",
@@ -1095,7 +1095,7 @@ def test_checkpoint_carries_a_dataloader_read_position(tmp_path) -> None:
         seed=3, vocab_size=16, batch_size=4, seq_len=6, dp_rank=0, dp_world_size=1
     )
 
-    manager = CheckpointManager(
+    manager = DistributedCheckpointManager(
         CheckpointConfig(enable=True, folder="checkpoint", keep_latest_k=0, interval=1),
         model_parts=[model],
         optimizer=optimizer,
@@ -1114,7 +1114,7 @@ def test_checkpoint_carries_a_dataloader_read_position(tmp_path) -> None:
         seed=3, vocab_size=16, batch_size=4, seq_len=6, dp_rank=0, dp_world_size=1
     )
     fresh_model, fresh_optimizer = _model_and_optimizer()
-    resumed = CheckpointManager(
+    resumed = DistributedCheckpointManager(
         CheckpointConfig(enable=True, folder="checkpoint", keep_latest_k=0, interval=1),
         model_parts=[fresh_model],
         optimizer=fresh_optimizer,
@@ -1289,7 +1289,7 @@ def test_exclude_from_loading_accepts_the_dataloader_key(tmp_path) -> None:
     for _ in range(3):
         next(iter(loader))
 
-    manager = CheckpointManager(
+    manager = DistributedCheckpointManager(
         CheckpointConfig(
             enable=True,
             folder="checkpoint",
@@ -1310,7 +1310,7 @@ def test_exclude_from_loading_accepts_the_dataloader_key(tmp_path) -> None:
     fresh_loader = RandomTokenDataLoader(
         seed=3, vocab_size=16, batch_size=4, seq_len=6, dp_rank=0, dp_world_size=1
     )
-    resumed = CheckpointManager(
+    resumed = DistributedCheckpointManager(
         CheckpointConfig(
             enable=True,
             folder="checkpoint",
