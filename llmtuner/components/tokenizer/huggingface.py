@@ -1,104 +1,18 @@
-"""Tokenizer wrappers: HF special-token inference, chat templates, VLM tokens.
-
-Vendored from torchtitan ``components/tokenizer.py``. The special tokens a
-``MultiModalTokenizer`` needs are plain keyword arguments rather than a nested
-config. What was kept, because the numerics depend on it, is the whole loading
-strategy:
-``tokenizer.json`` before ``vocab.json``/``vocab.txt``, BPE before WordLevel,
-``added_tokens_decoder`` merged into the vocabulary, and ``encode`` suppressing
-the tokenizer's own special tokens so that ``add_bos``/``add_eos`` are the only
-ones applied.
-"""
+"""Hugging Face tokenizer loading and special-token handling."""
 
 from __future__ import annotations
 
 import json
 import os
-from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from tokenizers import AddedToken, Tokenizer
 
-from ..utils.logging import get_logger
+from ...utils.logging import get_logger
+from .base import BaseTokenizer
 
 logger = get_logger(__name__)
-
-__all__ = ["BaseTokenizer", "HuggingFaceTokenizer", "MultiModalTokenizer"]
-
-
-class BaseTokenizer(ABC):
-    """Interface every tokenizer in the data pipeline satisfies.
-
-    ``eos_id`` is deliberately public and mutable rather than a property: the
-    chat processor reads it at construction to decide whether it can locate a
-    response boundary at all.
-    """
-
-    eos_id: int | None
-
-    def __init__(self) -> None:
-        self.eos_id = None
-        self._chat_template = None
-
-    @abstractmethod
-    def encode(self, *args, **kwargs) -> list[int]: ...
-
-    @abstractmethod
-    def decode(self, *args, **kwargs) -> str: ...
-
-    @abstractmethod
-    def get_vocab_size(self) -> int: ...
-
-    def set_chat_template(self, template: str) -> None:
-        """Compile and store a Jinja chat template."""
-        import jinja2
-        import jinja2.ext
-        import jinja2.sandbox
-
-        def raise_exception(msg):
-            raise jinja2.exceptions.TemplateError(msg)
-
-        def tojson(
-            x, ensure_ascii=False, indent=None, separators=None, sort_keys=False
-        ):
-            return json.dumps(
-                x,
-                ensure_ascii=ensure_ascii,
-                indent=indent,
-                separators=separators,
-                sort_keys=sort_keys,
-            )
-
-        def strftime_now(fmt):
-            from datetime import datetime
-
-            return datetime.now().strftime(fmt)
-
-        env = jinja2.sandbox.ImmutableSandboxedEnvironment(
-            trim_blocks=True,
-            lstrip_blocks=True,
-            extensions=[jinja2.ext.loopcontrols],
-        )
-        env.globals["raise_exception"] = raise_exception
-        env.globals["strftime_now"] = strftime_now
-        env.filters["tojson"] = tojson
-        self._chat_template = env.from_string(template)
-
-    def apply_chat_template(
-        self, messages: Sequence[Mapping[str, Any]], **kwargs
-    ) -> str:
-        """Render messages through the Jinja chat template. Returns formatted text.
-
-        Messages should be a list of dicts with "role" and "content" keys, e.g.
-        [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi"}].
-
-        Additional template variables (e.g. add_generation_prompt, tools) can be
-        passed as kwargs.
-        """
-        if self._chat_template is None:
-            raise ValueError("No chat template set. Call set_chat_template() first.")
-        return self._chat_template.render(messages=messages, **kwargs)
 
 
 class HuggingFaceTokenizer(BaseTokenizer):
@@ -474,56 +388,3 @@ class HuggingFaceTokenizer(BaseTokenizer):
         kwargs.setdefault("eos_token", self.eos_token or "")
         kwargs.setdefault("add_generation_prompt", True)
         return super().apply_chat_template(messages, **kwargs)
-
-
-class MultiModalTokenizer(HuggingFaceTokenizer):
-    """Single source of truth for multimodal special tokens.
-
-    Requires 5 token strings, validates them against the vocabulary at init, and
-    exposes both string and ID attributes (e.g. ``image_token``, ``image_id``).
-    The multimodal Grain processor reads these attributes directly; the collator
-    packs the IDs into a plain ``dict[str, int]`` that travels through the batch
-    to the model forward. Adding a new VLM means passing 5 strings -- no
-    subclassing needed.
-
-    # TODO: All 5 fields are currently required. If a future VLM doesn't need
-    # some (e.g. no video, no vision_start/end markers), consider making fields
-    # optional.
-    """
-
-    # Config field prefixes that follow the {name}_token pattern.
-    TOKEN_FIELDS = ("image", "video", "vision_start", "vision_end", "pad")
-
-    def __init__(
-        self,
-        *,
-        tokenizer_path: str,
-        image_token: str,
-        video_token: str,
-        vision_start_token: str,
-        vision_end_token: str,
-        pad_token: str,
-    ):
-        super().__init__(tokenizer_path=tokenizer_path)
-
-        tokens = {
-            "image": image_token,
-            "video": video_token,
-            "vision_start": vision_start_token,
-            "vision_end": vision_end_token,
-            "pad": pad_token,
-        }
-
-        added_tokens = self.tokenizer.get_added_tokens_decoder()
-        token_to_id = {tok.content: tok_id for tok_id, tok in added_tokens.items()}
-
-        for name in self.TOKEN_FIELDS:
-            token_str = tokens[name]
-            if token_str not in token_to_id:
-                raise ValueError(
-                    f"Special token '{token_str}' ({name}_token) "
-                    f"not found in tokenizer at '{tokenizer_path}'. "
-                    f"Available added tokens: {list(token_to_id.keys())}"
-                )
-            setattr(self, f"{name}_token", token_str)
-            setattr(self, f"{name}_id", token_to_id[token_str])
