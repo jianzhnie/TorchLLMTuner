@@ -58,7 +58,7 @@ import torch.nn as nn
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 
-from ...accelerator import dist_utils
+from ...accelerator import distributed
 from ...parallel.expert_parallel.checkpoint import (
     expert_shard_map,
     gather_expert_state,
@@ -597,7 +597,7 @@ class BaseCheckpointManager(ABC):
         """
         return (
             self.keep_latest_k > 0
-            and dist_utils.is_main_process()
+            and distributed.is_main_process()
             and self._storage.isdir(self.folder)
         )
 

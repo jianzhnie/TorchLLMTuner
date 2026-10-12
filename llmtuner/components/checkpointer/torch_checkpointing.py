@@ -728,10 +728,10 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             # written to. Consolidation repacks the per-rank shards into
             # HF-layout files in the checkpoint directory.
             def pre_finalize_callback(staged: str, _event_logger) -> None:  # noqa: F811
-                from ...accelerator import dist_utils
+                from ...accelerator import distributed
 
                 # All ranks must finish writing before any rank consolidates.
-                dist_utils.barrier()
+                distributed.barrier()
                 self._backend.consolidate_hf_safetensors_checkpoint(
                     staged,
                     output_dir=checkpoint_id,

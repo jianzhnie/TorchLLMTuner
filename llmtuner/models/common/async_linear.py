@@ -23,7 +23,7 @@ What changed from upstream:
   ``remat.region(..., recompute=...)``, which only steers activation
   checkpointing; calling the projection directly is the same arithmetic.
 * The TP group is read per forward through
-  ``llmtuner.accelerator.spmd_context.spmd_mesh_group``.
+  ``llmtuner.accelerator.spmd.spmd_mesh_group``.
 
 The fallback matters: when TP is not active there is no collective to fuse, so
 each module runs its plain path. That keeps a TP=1 run working, but it also means
@@ -37,7 +37,7 @@ import math
 import torch
 import torch.nn as nn
 
-from llmtuner.accelerator.spmd_context import spmd_mesh_group
+from llmtuner.accelerator.spmd import spmd_mesh_group
 from llmtuner.models.common.attention.qkv import QKVLinear
 from llmtuner.models.common.feed_forward import FeedForward
 from llmtuner.parallel.tensor_parallel.linear_ops import (

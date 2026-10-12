@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from llmtuner.accelerator.collectives import all_reduce
-from llmtuner.accelerator.spmd_context import spmd_mesh_group, spmd_sparse_mesh
+from llmtuner.accelerator.spmd import spmd_mesh_group, spmd_sparse_mesh
 
 from ..aux_loss import AuxLoss
 

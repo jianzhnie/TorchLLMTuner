@@ -25,7 +25,7 @@ from ...datasets.dataloader import (
     DataloaderExhaustedError,
     TrainerBatch,
 )
-from ...datasets.random_data import RandomTokenDataLoader
+from ...datasets.synthetic import RandomTokenDataLoader
 
 
 def dp_rank_world_size(self) -> tuple[int, int]:

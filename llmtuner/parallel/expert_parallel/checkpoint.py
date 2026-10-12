@@ -43,7 +43,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ...accelerator import dist_utils
+from ...accelerator import distributed
 
 try:  # torch >= 2.4; the FSDP path (DTensor expert weights) needs it.
     from torch.distributed.tensor import DTensor, distribute_tensor
@@ -150,7 +150,7 @@ def gather_expert_state(
         if DTensor is not None and isinstance(value, DTensor):
             # Per-EP-rank materialization of the efsdp-sharded weight.
             value = value.full_tensor()
-        world = dist_utils.get_world_size(group)
+        world = distributed.get_world_size(group)
         gathered = value.new_empty((world * value.shape[0],) + value.shape[1:])
         dist.all_gather_into_tensor(gathered, value.contiguous(), group=group)
         out[key] = gathered
@@ -176,8 +176,8 @@ def load_expert_state(
     out = dict(sd)
     for key, group, param in matched_entries(sd, shard_map, params, direction="load"):
         full = out[key]
-        world = dist_utils.get_world_size(group)
-        rank = dist_utils.get_rank(group)
+        world = distributed.get_world_size(group)
+        rank = distributed.get_rank(group)
         num_local = param.shape[0]
         if full.shape[0] != num_local * world:
             raise ValueError(

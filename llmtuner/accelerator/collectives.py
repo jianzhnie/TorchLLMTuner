@@ -40,12 +40,12 @@ from torch.distributed.tensor import DTensor
 
 from ..utils.logging import get_logger
 from .device import device_module
-from .dist_utils import (
+from .distributed import (
     get_comm_device,
     get_default_group,
     get_world_size,
 )
-from .tensor_transfer import cast_data_device, get_data_device
+from .tensors import cast_data_device, get_data_device
 
 logger = get_logger(__name__)
 

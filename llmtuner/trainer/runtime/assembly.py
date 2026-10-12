@@ -35,7 +35,7 @@ from ...accelerator.device import (
     get_distributed_backend,
     get_env_dist_info,
 )
-from ...accelerator.dist_utils import init_dist_pytorch, is_distributed
+from ...accelerator.distributed import init_dist_pytorch, is_distributed
 from ...components.checkpointer import DATALOADER, TRAIN_STATE, CheckpointManager
 from ...components.metrics import MetricsProcessor
 from ...components.optimizer import EMA, OptimizersContainer, build_lr_scheduler
@@ -261,7 +261,7 @@ def _build_checkpointer(self, cfg, hf_model_config) -> None:
     )
 
 
-def build_trainer_state(self, cfg) -> None:
+def assemble_trainer_runtime(self, cfg) -> None:
     self.cfg = cfg
     if not is_distributed() and "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         init_dist_pytorch(get_distributed_backend())

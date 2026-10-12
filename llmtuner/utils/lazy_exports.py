@@ -5,7 +5,7 @@ public surface so that ``from llmtuner.accelerator import get_rank`` works,
 while the submodule behind a name is imported only when that name is touched.
 The laziness is load-bearing, not a style choice:
 
-* ``llmtuner.accelerator`` has to stay importable where ``dist_utils.py`` is not;
+* ``llmtuner.accelerator`` has to stay importable where ``distributed.py`` is not;
 * ``llmtuner.parallel`` is read by ``llmtuner.config``, which cannot pay for the
   engine layer (its context-parallel half pulls in the model stack);
 * ``llmtuner.components.checkpointer`` guards a torch.distributed surface that

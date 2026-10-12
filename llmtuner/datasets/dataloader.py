@@ -26,7 +26,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from ..components.tokenizer import BaseTokenizer
 from .collators import Collator, TextCollator, TrainerBatch
 from .contracts import DatasetBuildContext, require_positive
-from .dataset import as_iter_dataset
+from .graph import as_iter_dataset
 
 __all__ = [
     "BaseDataLoader",

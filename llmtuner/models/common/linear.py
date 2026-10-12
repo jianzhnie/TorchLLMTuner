@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
 
-from llmtuner.accelerator.spmd_context import spmd_mesh_group
+from llmtuner.accelerator.spmd import spmd_mesh_group
 
 __all__ = [
     "PartialBiasRowwiseLinear",

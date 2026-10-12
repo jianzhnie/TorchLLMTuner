@@ -43,9 +43,9 @@ class GarbageCollection:
         if debug:
             from torch.utils.viz._cycles import warn_tensor_cycles
 
-            from ..accelerator import dist_utils
+            from ..accelerator import distributed
 
-            if dist_utils.is_main_process():
+            if distributed.is_main_process():
                 warn_tensor_cycles()
 
     def run(self, step_count: int) -> bool:

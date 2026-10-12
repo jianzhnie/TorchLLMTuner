@@ -25,10 +25,8 @@ logger = get_logger(__name__)
 
 __all__ = [
     "MESH_AXES",
-    "ParallelDims",
     "ParallelTopology",
     "build_mesh",
-    "build_parallel_dims",
     "build_parallel_topology",
 ]
 
@@ -440,7 +438,7 @@ class ParallelTopology:
                 - the axis is logically active
 
         Example:
-            >>> parallel_dims = ParallelDims(
+            >>> parallel_dims = ParallelTopology(
             ...     dp_replicate=2, dp_shard=2, cp=1, tp=2, pp=1, ep=1, world_size=8
             ... )
             >>> meshes = parallel_dims.get_all_one_dimensional_meshes()
@@ -496,7 +494,7 @@ class ParallelTopology:
 # Mesh axis names. `axis` names a specific DeviceMesh axis; `dim` is for shapes.
 # These are the axes of the dense mesh the parallel layer is handed; ``pp`` is
 # not among them because pipeline stages live on disjoint rank sets -- the PP
-# path resolves its own views off ParallelDims instead (see
+# path resolves its own views off ParallelTopology instead (see
 # parallel/pipeline_parallel/pipeline_parallel.py).
 MESH_AXES = ("dp", "cp", "tp")
 
@@ -546,12 +544,12 @@ def build_parallel_topology(
 def build_mesh(parallel_dims: ParallelTopology | None):
     """The dense ``(dp, cp, tp)`` mesh the parallel ``apply_*`` functions index.
 
-    Takes the *already-resolved* ``ParallelDims`` (see ``build_parallel_dims``)
+    Takes the *already-resolved* ``ParallelTopology`` (see ``build_parallel_topology``)
     rather than a config, so a run has exactly one degree-resolution object --
     and therefore one set of process groups. ``None`` in, ``None`` out: there is
     no process group and no parallelism to describe.
 
-    Aliases ``ParallelDims.spmd_dense_mesh()``, which is the same object the
+    Aliases ``ParallelTopology.spmd_dense_mesh()``, which is the same object the
     SPMD context registers, so ``apply_tp``'s ``mesh["tp"]`` and a component's
     ``spmd_mesh_group("tp")`` resolve to the very same process group.
 
@@ -561,7 +559,7 @@ def build_mesh(parallel_dims: ParallelTopology | None):
     tp)`` with the two DP axes folded and singletons dropped, EP wants a
     separate sparse mesh -- and those views have to come from ONE unflatten of
     the world mesh or they end up with disjoint process groups covering the
-    same ranks. ``ParallelDims`` owns that unflatten; this function just hands
+    same ranks. ``ParallelTopology`` owns that unflatten; this function just hands
     back the dense view the parallel ``apply_*`` functions index.
     """
     if parallel_dims is None:
@@ -587,8 +585,3 @@ def build_mesh(parallel_dims: ParallelTopology | None):
             f"({parallel_dims.world_size} ranks); is pp > 1?"
         )
     return mesh
-
-
-# Compatibility aliases for external callers using the earlier terminology.
-ParallelDims = ParallelTopology
-build_parallel_dims = build_parallel_topology

@@ -5,7 +5,7 @@ frozen values passed down the build, never mutated, so ``slots=True`` is safe
 here -- nothing subclasses them.
 
 ``Batch`` (the synthetic path's micro-batch container) also lives here rather
-than in ``random_data.py``: consumers of the *type* -- the model wrapper's
+than in ``synthetic.py``: consumers of the *type* -- the model wrapper's
 ``preprocess_inputs``, the trainer's batch handling -- must not have to import
 the synthetic source itself. A models-layer file importing a data source was
 the dependency inversion that placement caused.

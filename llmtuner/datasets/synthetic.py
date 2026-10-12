@@ -13,7 +13,7 @@ the data source:
 
 What is not kept: llmtuner has no collator or ``max_num_documents`` here. The
 source shipped in this module is synthetic random tokens; the real corpus lives
-behind the Grain dataset graph in ``loader.py``. Both satisfy
+behind the Grain dataset graph in ``dataloader.py``. Both satisfy
 :class:`~llmtuner.datasets.dataloader.BaseDataLoader`, so the training loop has one
 path rather than two.
 """

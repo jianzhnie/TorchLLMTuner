@@ -11,7 +11,7 @@ Note the asymmetry, which is deliberate and load-bearing: the two Hugging Face
 sources take ``dataset_iteration_policy`` and ignore it, while the streaming one
 shards by it. ``split_dataset_by_node`` is what gives each DP rank a disjoint
 stream; the random-access and JSONL sources leave sharding to
-:func:`~llmtuner.datasets.dataset.build_dataset`, which slices after the shuffle.
+:func:`~llmtuner.datasets.graph.build_dataset`, which slices after the shuffle.
 Sharding twice would drop rows.
 
 A source slot takes either a description -- one of the three classes below -- or
@@ -192,7 +192,7 @@ def build_source(
     The policy argument is passed by every caller but read only by the streaming
     source. The others ignore it deliberately: they are random-access, and the DP
     slice is taken later, after the shuffle, by
-    :func:`~llmtuner.datasets.dataset.build_dataset`. Sharding here as well would
+    :func:`~llmtuner.datasets.graph.build_dataset`. Sharding here as well would
     drop rows.
     """
     if isinstance(source, IndexedJsonlSource):

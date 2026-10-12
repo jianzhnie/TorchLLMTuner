@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 
 from ...components.loss import IGNORE_INDEX
-from ..dataset import (
+from ..graph import (
     TextSequence,
 )
 

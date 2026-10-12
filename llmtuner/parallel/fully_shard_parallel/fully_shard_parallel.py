@@ -21,7 +21,7 @@ from torch.nn import ModuleDict
 
 from llmtuner.config import ParallelConfig
 
-from ...accelerator import dist_utils
+from ...accelerator import distributed
 from ...utils.logging import get_logger
 from ..topology import ParallelTopology
 from .plan import apply_fsdp_by_pattern, set_fsdp_prefetch_windows
@@ -564,7 +564,7 @@ def apply_fsdp(
             param_dtype=param_dtype,
             reduce_dtype=reduce_dtype,
         )
-        if dist_utils.is_distributed() and dist_utils.get_backend() != "nccl":
+        if distributed.is_distributed() and distributed.get_backend() != "nccl":
             force_sum_grad_reduction(model)
         return model
 
@@ -588,7 +588,7 @@ def apply_fsdp(
     # and, when asked, ``enable_fsdp_symm_mem``; do not repeat them here.
 
     # gloo implements no PREMUL_SUM; NCCL does, and there it is the faster path.
-    if dist_utils.is_distributed() and dist_utils.get_backend() != "nccl":
+    if distributed.is_distributed() and distributed.get_backend() != "nccl":
         force_sum_grad_reduction(model)
 
     return model

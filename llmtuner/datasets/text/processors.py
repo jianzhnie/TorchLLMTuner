@@ -25,7 +25,7 @@ from llmtuner.errors import ConfigError
 from ...components.loss import IGNORE_INDEX
 from ...utils.logging import get_logger
 from ..contracts import DatasetBuildContext
-from ..dataset import SampleProcessor, SingleDataset, TextSequence, is_not_none
+from ..graph import SampleProcessor, SingleDataset, TextSequence, is_not_none
 from ..sources import (
     HuggingFaceRandomAccessSource,
     HuggingFaceStreamingSource,

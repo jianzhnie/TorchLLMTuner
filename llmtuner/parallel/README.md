@@ -14,7 +14,7 @@ each local model part.
 
 | Path | Responsibility |
 | --- | --- |
-| `parallel_dims.py` | Resolve degrees and construct all dense, sparse, loss, and data meshes. |
+| `topology.py` | Resolve degrees and construct all dense, sparse, loss, and data meshes. |
 | `module_patterns.py` | Shared extended module path matching. |
 | `compatibility.py` | Central fail-fast checks for unsupported combinations. |
 | `tensor_parallel/tensor_parallel.py` | TP public entry, model plan resolution, and module transformation. |

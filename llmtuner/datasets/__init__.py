@@ -12,7 +12,8 @@ reason; ``build_dataloader`` is the only entry point that decides.
 from .collators import HAS_PIN_MEMORY, Collator, TextCollator, TrainerBatch
 from .contracts import DatasetBuildContext, DatasetIterationPolicy
 from .dataloader import BaseDataLoader, DataloaderExhaustedError, GrainDataLoader
-from .dataset import (
+from .factory import build_dataloader
+from .graph import (
     DatasetConcat,
     DatasetMix,
     GrainDataset,
@@ -22,7 +23,6 @@ from .dataset import (
     WeightedDataset,
     build_dataset,
 )
-from .factory import build_dataloader
 from .packing import (
     build_concat_then_split_packing,
     build_first_fit_packing,
