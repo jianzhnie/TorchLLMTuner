@@ -59,6 +59,12 @@ class ParallelConfig:
     fsdp_reshard_after_forward: Literal["default", "always", "never"] = "default"
     """FSDP2 parameter resharding policy after forward."""
 
+    fsdp_cpu_offload: bool = False
+    """Offload FSDP2 parameters and gradients to CPU between computations."""
+
+    fsdp_cpu_offload_pin_memory: bool = True
+    """Use pinned host memory for FSDP2 CPU offload transfers."""
+
     enable_fsdp_symm_mem: bool = False
     """Enable FSDP2 symmetric-memory communication when supported."""
 

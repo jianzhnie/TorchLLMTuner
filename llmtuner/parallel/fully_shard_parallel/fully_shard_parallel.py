@@ -223,6 +223,7 @@ def apply_fsdp_to_decoder(
     reduce_dtype: torch.dtype,
     pp_enabled: bool,
     cpu_offload: bool = False,
+    cpu_offload_pin_memory: bool = True,
     reshard_after_forward_policy: str = "default",
     ep_degree: int = 1,
     edp_mesh: DeviceMesh | None = None,
@@ -245,6 +246,8 @@ def apply_fsdp_to_decoder(
         pp_enabled (bool): Whether pipeline parallelism is enabled.
         cpu_offload (bool, optional): Whether to offload model parameters to
             CPU. Defaults to False.
+        cpu_offload_pin_memory (bool, optional): Whether CPU-offloaded buffers
+            use pinned host memory. Defaults to True.
         reshard_after_forward_policy (str, optional): The policy to use for
             resharding after the forward pass. Defaults to "default". Other
             options: "never", "always".
@@ -276,7 +279,9 @@ def apply_fsdp_to_decoder(
     )
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
     if cpu_offload:
-        fsdp_config["offload_policy"] = CPUOffloadPolicy()
+        fsdp_config["offload_policy"] = CPUOffloadPolicy(
+            pin_memory=cpu_offload_pin_memory
+        )
 
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         reshard_after_forward_policy, pp_enabled
@@ -567,7 +572,8 @@ def apply_fsdp(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
         pp_enabled=parallel_dims.pp_enabled,
-        cpu_offload=False,
+        cpu_offload=cfg.fsdp_cpu_offload,
+        cpu_offload_pin_memory=cfg.fsdp_cpu_offload_pin_memory,
         reshard_after_forward_policy=cfg.fsdp_reshard_after_forward,
         ep_degree=parallel_dims.ep,
         edp_mesh=edp_mesh,
