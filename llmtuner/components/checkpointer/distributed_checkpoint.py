@@ -1,7 +1,7 @@
 """The DCP checkpoint manager: sharded I/O, async saving, HF export.
 
-Vendored from torchtitan's ``components/checkpointer/dcp.py``. ``torch.distributed
-.checkpoint`` is what this buys over ``torch.save``, and it buys two distinct
+Vendored from torchtitan's checkpoint component. The
+``torch.distributed.checkpoint`` backend provides two distinct
 things:
 
 * **A sharded layout.** Under FSDP each rank holds one shard of every parameter
@@ -28,7 +28,7 @@ Two departures from torchtitan, both subtractions:
   already-deleted directory is a no-op rather than a ``FileNotFoundError`` in
   the purge thread.
 
-``AsyncMode.DISABLED`` is the default here, matching torchtitan.
+``DistributedCheckpointAsyncMode.DISABLED`` is the default here, matching torchtitan.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ from .checkpoint_keys import DATALOADER, EMA, LR_SCHEDULER, MODEL, SAFETENSORS_I
 logger = get_logger(__name__)
 
 
-class AsyncMode(str, enum.Enum):
+class DistributedCheckpointAsyncMode(str, enum.Enum):
     DISABLED = "disabled"
     ASYNC = "async"
     ASYNC_WITH_PINNED_MEM = "async_with_pinned_mem"
@@ -100,7 +100,7 @@ class FilesystemCheckpointStorage:
         filesystem.rmtree(path)
 
 
-class CheckpointManager(BaseCheckpointManager):
+class DistributedCheckpointManager(BaseCheckpointManager):
     """Checkpoint manager backed by ``torch.distributed.checkpoint``.
 
     Note on Pipeline Parallelism and Virtual Stages:
@@ -204,12 +204,12 @@ class CheckpointManager(BaseCheckpointManager):
                     f"checkpoint.{', '.join(hf_options)} is not wired: the HF "
                     "safetensors paths need a state_dict adapter, and llmtuner "
                     "ships none. Use the native DCP format, or supply one by "
-                    "passing sd_adapter to CheckpointManager."
+                    "passing sd_adapter to DistributedCheckpointManager."
                 )
 
         # -- async and distributed infrastructure --
         try:
-            self.async_mode = AsyncMode(config.async_mode)
+            self.async_mode = DistributedCheckpointAsyncMode(config.async_mode)
         except ValueError as e:
             raise ValueError(
                 f"Unknown checkpoint async_mode {config.async_mode}"
@@ -220,7 +220,10 @@ class CheckpointManager(BaseCheckpointManager):
         # Reusing the training group would have the two contend for the same
         # collectives.
         self.pg: dist.ProcessGroup | None = None
-        if self.async_mode in (AsyncMode.ASYNC, AsyncMode.ASYNC_WITH_PINNED_MEM):
+        if self.async_mode in (
+            DistributedCheckpointAsyncMode.ASYNC,
+            DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM,
+        ):
             self.pg = dist.new_group(backend="gloo")
 
         self.stager: DefaultStager | None = None
@@ -268,7 +271,7 @@ class CheckpointManager(BaseCheckpointManager):
         self,
         state_dict: dict[str, Any],
         checkpoint_id: str,
-        async_mode: AsyncMode,
+        async_mode: DistributedCheckpointAsyncMode,
         enable_garbage_collection: bool = False,
         to_hf: bool = False,
     ) -> Future | AsyncSaveResponse | None:
@@ -287,10 +290,9 @@ class CheckpointManager(BaseCheckpointManager):
                 safetensors and HF model definitions.
 
         Returns:
-            ``None`` when saved synchronously (``AsyncMode.DISABLED``); a
-            ``Future`` for ``AsyncMode.ASYNC`` (tracks disk I/O); an
-            ``AsyncSaveResponse`` for ``AsyncMode.ASYNC_WITH_PINNED_MEM``
-            (tracks both staging and disk I/O).
+            ``None`` when saved synchronously; a ``Future`` for asynchronous
+            disk I/O; or an ``AsyncSaveResponse`` for pinned-memory staging
+            followed by disk I/O.
         """
         ret: Future | AsyncSaveResponse | None = None
 
@@ -325,14 +327,14 @@ class CheckpointManager(BaseCheckpointManager):
         # For HF the storage_writer owns the path, so DCP gets no checkpoint_id.
         checkpoint_save_id = None if to_hf else checkpoint_id
 
-        if async_mode == AsyncMode.ASYNC:
+        if async_mode == DistributedCheckpointAsyncMode.ASYNC:
             ret = dcp.async_save(
                 state_dict,
                 storage_writer=storage_writer,
                 checkpoint_id=checkpoint_save_id,
                 process_group=self.pg,
             )
-        elif async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
+        elif async_mode == DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM:
             ret = dcp.async_save(
                 state_dict,
                 storage_writer=storage_writer,
@@ -433,7 +435,9 @@ class CheckpointManager(BaseCheckpointManager):
 
         begin = time.monotonic()
         checkpoint_phase = (
-            "saving" if self.async_mode == AsyncMode.DISABLED else "staging"
+            "saving"
+            if self.async_mode == DistributedCheckpointAsyncMode.DISABLED
+            else "staging"
         )
         logger.info(f"{checkpoint_phase.capitalize()} the checkpoint.")
 
@@ -448,10 +452,13 @@ class CheckpointManager(BaseCheckpointManager):
         states = self._flattened_model_states_sd()
         async_save_started_at: float | None = None
 
-        if self.async_mode in (AsyncMode.ASYNC_WITH_PINNED_MEM, AsyncMode.ASYNC):
+        if self.async_mode in (
+            DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM,
+            DistributedCheckpointAsyncMode.ASYNC,
+        ):
             GarbageCollection.collect("GC collection invoked by checkpointer.")
             if (
-                self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM
+                self.async_mode == DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM
                 and self.stager is None
             ):
                 self.stager = DefaultStager(
@@ -469,7 +476,7 @@ class CheckpointManager(BaseCheckpointManager):
                 checkpoint_id=checkpoint_id,
                 async_mode=self.async_mode,
             )
-            if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
+            if self.async_mode == DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM:
                 # No GC needed on this path: the staging buffers are reused.
                 if not isinstance(result, AsyncSaveResponse):
                     raise TypeError(
@@ -490,7 +497,7 @@ class CheckpointManager(BaseCheckpointManager):
             self.dcp_save(
                 states,
                 checkpoint_id=checkpoint_id,
-                async_mode=AsyncMode.DISABLED,
+                async_mode=DistributedCheckpointAsyncMode.DISABLED,
                 enable_garbage_collection=True,
             )
 
@@ -530,7 +537,7 @@ class CheckpointManager(BaseCheckpointManager):
         if self.staging_future is None:
             return
 
-        if self.async_mode != AsyncMode.ASYNC_WITH_PINNED_MEM:
+        if self.async_mode != DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM:
             raise RuntimeError(
                 "self.staging_future is not None, "
                 "but self.async_mode isn't ASYNC_WITH_PINNED_MEM."
@@ -549,7 +556,7 @@ class CheckpointManager(BaseCheckpointManager):
         Raises:
             RuntimeError: if a save future is set while the mode is ``DISABLED``.
         """
-        if self.async_mode == AsyncMode.DISABLED:
+        if self.async_mode == DistributedCheckpointAsyncMode.DISABLED:
             raise RuntimeError(
                 "self.save_future is not None, but self.async_mode is DISABLED."
             )
@@ -624,19 +631,19 @@ class CheckpointManager(BaseCheckpointManager):
         self.dcp_save(
             states,
             checkpoint_id=self._create_checkpoint_id(curr_step),
-            async_mode=AsyncMode.DISABLED,
+            async_mode=DistributedCheckpointAsyncMode.DISABLED,
             enable_garbage_collection=True,
             to_hf=self.last_save_in_hf,
         )
 
 
-# Bound late so the module attribute ``CheckpointManager`` (used by the
-# ``from .dcp import CheckpointManager`` export and by tests) stays the class,
+# Bound late so the module attribute ``DistributedCheckpointManager`` (used by the
+# package export and tests) stays the class,
 # while DATALOADER and LR_SCHEDULER remain importable from here for callers that
 # build a fuller ``states`` dict -- the trainer puts one of each under those keys.
 __all__ = [
-    "AsyncMode",
-    "CheckpointManager",
+    "DistributedCheckpointAsyncMode",
+    "DistributedCheckpointManager",
     "DATALOADER",
     "EMA",
     "LR_SCHEDULER",

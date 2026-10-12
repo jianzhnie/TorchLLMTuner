@@ -5,7 +5,8 @@ Ported from torchtitan's ``components/checkpointer/``. Three layers:
 * ``base`` -- the contract (``BaseCheckpointManager``) plus the policies every
   backend shares: retention, step discovery, async draining, load selection.
   Nothing here knows how bytes are written.
-* ``dcp`` -- ``CheckpointManager``, backed by ``torch.distributed.checkpoint``.
+* ``distributed_checkpoint`` -- ``DistributedCheckpointManager``, backed by
+  ``torch.distributed.checkpoint``.
   This is the one llmtuner runs. It shards under FSDP, saves asynchronously, and
   loads in place.
 * ``torch_checkpointing`` -- ``TorchCheckpointingManager``, backed by the
@@ -47,15 +48,17 @@ llmtuner fills in the first two plus whatever the caller passes in ``states``:
   (``training.ema_config``). Its state dict is the same flat, FQN-keyed layout
   as optimizer state. A load that restores the model but not this key -- an
   ``exclude_from_loading=["ema"]`` load, or any model-only load -- cold-starts
-  the average from the just-loaded weights (see ``dcp.CheckpointManager``).
+  the average from the just-loaded weights (see
+  ``distributed_checkpoint.DistributedCheckpointManager``).
 """
 
 from ...utils.lazy_exports import export_names, resolve_export
 
 # Lazy (PEP 562): ``checkpoint_keys`` / ``filesystem`` live in this package and
 # are read by ``llmtuner/config``, which must stay importable without the
-# torch.distributed surface ``base``/``dcp`` pull in (DTensor & friends are
-# absent on older torch). Eager re-exports would make any submodule import pay
+# torch.distributed surface ``base``/``distributed_checkpoint`` pulls in
+# (DTensor and friends are absent on older torch). Eager re-exports would make
+# any submodule import pay
 # for the backends.
 _EXPORT_SOURCES = {
     "BaseCheckpointManager": "base",
@@ -71,8 +74,8 @@ _EXPORT_SOURCES = {
     "OPTIMIZER": "checkpoint_keys",
     "SAFETENSORS_INDEX": "checkpoint_keys",
     "TRAIN_STATE": "checkpoint_keys",
-    "AsyncMode": "dcp",
-    "CheckpointManager": "dcp",
+    "DistributedCheckpointAsyncMode": "distributed_checkpoint",
+    "DistributedCheckpointManager": "distributed_checkpoint",
     "canonical_fqn": "checkpoint_keys",
 }
 

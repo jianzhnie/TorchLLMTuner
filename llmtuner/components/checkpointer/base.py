@@ -284,7 +284,8 @@ class BaseCheckpointManager(ABC):
     assigned, and this flag is how it knows. ``enable`` cannot serve: it is
     assigned first, so a manager that failed later still reads as enabled. That
     partial state is not hypothetical: it is exactly what the HF-options
-    rejection in ``dcp.CheckpointManager.__init__`` produces.
+    rejection in
+    ``distributed_checkpoint.DistributedCheckpointManager.__init__`` produces.
     """
 
     _STEP_DIR_PATTERN = r"step-(0|[1-9]\d*)"

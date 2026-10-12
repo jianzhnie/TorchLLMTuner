@@ -29,7 +29,7 @@ from llmtuner.config import LLMTunerConfig, ValidationConfig
 
 from ..accelerator.collectives import all_reduce, clip_grad_norm_, set_pg_timeouts
 from ..accelerator.spmd import spmd_context
-from ..components.checkpointer import CheckpointManager
+from ..components.checkpointer import DistributedCheckpointManager
 from ..components.loss import (
     chunked_lm_head_cross_entropy,
     cross_entropy_loss,
@@ -93,7 +93,7 @@ class Trainer:
     dataloader: BaseDataLoader | None = None
     lr_scheduler: LRSchedulersContainer | None
     ema: EMA | None
-    checkpointer: CheckpointManager | None
+    checkpointer: DistributedCheckpointManager | None
     metrics: MetricsProcessor | None
     gc_handler: GarbageCollection | None
 
