@@ -107,6 +107,13 @@ def kcp_kda_forward(original_forward, group):
 def apply_kcp(model: nn.Module, cp_mesh) -> int:
     """Patch every structurally recognized KDA module and return its count."""
     required = ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias")
+    if any(
+        all(hasattr(module, name) for name in ("q_proj", "k_proj", "v_proj"))
+        and not all(hasattr(module, name) for name in required)
+        for module in model.modules()
+    ):
+        raise ValueError("KCP does not support hybrid KDA/softmax attention models")
+    _kcp_runtime()
     patched = 0
     for module in model.modules():
         if all(hasattr(module, name) for name in required):

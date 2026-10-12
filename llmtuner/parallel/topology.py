@@ -523,6 +523,7 @@ def build_parallel_topology(
                     par.context_parallel_kv_allgather_size,
                 ),
                 ("context_parallel_ulysses_size", par.context_parallel_ulysses_size),
+                ("context_parallel_kcp_size", par.context_parallel_kcp_size),
                 ("expert_parallel_size", par.expert_parallel_size),
                 ("data_parallel_replicate_size", par.data_parallel_replicate_size),
             )

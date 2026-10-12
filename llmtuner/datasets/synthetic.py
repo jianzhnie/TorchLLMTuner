@@ -77,7 +77,7 @@ class RandomTokenSource:
             # A fresh generator per step, so the sequence is reproducible from
             # (seed, step) alone with no dependence on how many steps ran before.
             generator = torch.Generator(device="cpu").manual_seed(
-                self.seed * 100_000 + step
+                (self.seed * 100_000 + step) % (2**64)
             )
             input_ids = torch.randint(
                 0,

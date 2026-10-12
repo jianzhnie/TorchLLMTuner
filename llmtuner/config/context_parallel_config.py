@@ -7,6 +7,8 @@ CP_LOAD_BALANCERS = frozenset({None, "headtail", "ptrr"})
 
 
 def validate_context_parallel_config(cfg) -> None:
+    if cfg.context_parallel_kcp_size > 1 and cfg.context_parallel_strategy != "kcp":
+        raise ConfigError("context_parallel_kcp_size > 1 requires strategy='kcp'")
     if cfg.context_parallel_load_balancer == "":
         raise ConfigError(
             "parallel.context_parallel_load_balancer cannot be an empty "
@@ -39,6 +41,8 @@ def validate_context_parallel_config(cfg) -> None:
             raise UnsupportedCombinationError(
                 "KCP cannot be combined with KV-AllGather or Ulysses CP axes"
             )
+        if cfg.context_parallel_load_balancer is not None:
+            raise UnsupportedCombinationError("KCP requires contiguous sequence shards")
     if (
         cfg.context_parallel_strategy == "ulysses"
         and cfg.context_parallel_load_balancer is not None

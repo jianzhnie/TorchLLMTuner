@@ -283,7 +283,7 @@ def test_insert_vision_placeholders_rejects_a_slot_with_no_token_count():
     no count means that invariant broke, and failing loudly beats emitting text
     with a hole where an image should be.
     """
-    with pytest.raises(TypeError, match="expected str instance, NoneType"):
+    with pytest.raises(ValueError, match="one vision token count per placeholder"):
         insert_vision_placeholders(
             ["a", None],
             [],
@@ -378,7 +378,7 @@ def test_process_cc12_wd_sample_reads_the_pair_format(mm_tokenizer, image_bytes)
 def test_process_cc12_wd_sample_raises_when_the_image_field_is_absent(mm_tokenizer):
     """A row without a ``jpg`` key is malformed for this dataset, not an image
     that failed to decode -- so it raises rather than being silently dropped."""
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError, match="one vision token count per placeholder"):
         process_cc12_wd_sample({"txt": "hello"}, tokenizer=mm_tokenizer, **MM_KWARGS)
 
 
@@ -710,3 +710,74 @@ def test_mm_packing_flattens_per_document_media_into_one_list(mm_tokenizer):
     assert packed["pixel_values_videos"] == ["v"]
     assert bool(packed["padding_mask"][4:].all())
     assert int(packed["positions"][4:].max()) < 32
+
+
+@pytest.mark.parametrize("parts,counts", [(["text"], [2]), ([None], [-1])])
+def test_vision_placeholders_reject_invalid_counts(parts, counts):
+    with pytest.raises(ValueError):
+        insert_vision_placeholders(
+            parts,
+            counts,
+            vision_start_token="[start]",
+            vision_token="[vision]",
+            vision_end_token="[end]",
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"height": 0},
+        {"width": -1},
+        {"factor": 0},
+        {"min_pixels": 0},
+        {"min_pixels": 2048, "max_pixels": 1024},
+        {"max_pixels": 100},
+    ],
+)
+def test_smart_resize_rejects_invalid_geometry(kwargs):
+    parameters = dict(height=64, width=64, factor=32, min_pixels=1, max_pixels=4096)
+    with pytest.raises(ValueError):
+        smart_resize(**(parameters | kwargs))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"fps": 0},
+        {"fps": float("nan")},
+        {"fps": float("inf")},
+        {"min_frames": 0},
+        {"min_frames": 5, "max_frames": 4},
+    ],
+)
+def test_video_sampling_rejects_invalid_parameters(kwargs):
+    with pytest.raises(ValueError):
+        load_video("unused.mp4", **kwargs)
+
+
+def test_remote_image_rejects_http_errors_before_decoding(monkeypatch):
+    import requests
+
+    from llmtuner.datasets.multimodal import image as image_module
+
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            calls.append("closed")
+
+        def raise_for_status(self):
+            raise requests.HTTPError("404")
+
+        @property
+        def content(self):
+            raise AssertionError("HTTP error body must not be decoded")
+
+    monkeypatch.setattr(image_module.requests, "get", lambda *a, **k: Response())
+    with pytest.raises(requests.HTTPError, match="404"):
+        image_module.decode_image("https://example.invalid/image.png")
+    assert calls == ["closed"]

@@ -1,8 +1,8 @@
 # llmtuner 全局代码审查
 
 本报告记录本轮与上一轮连续审查的结果。静态语法与 Ruff 检查覆盖
-`llmtuner` 的全部 148 个 Python 文件；人工审查重点是训练调用链、参数转换、
-恢复状态和异常清理路径。静态检查与 CPU 回归测试不能替代多设备数值等价测试，
+`llmtuner` 的全部 148 个 Python 文件；本轮已逐个阅读全部 148 个 Python 文件的实现，清单见
+[file_review.md](file_review.md)，检查训练调用链、参数转换、恢复状态和异常清理路径。静态检查与 CPU 回归测试不能替代多设备数值等价测试，
 本报告不将未运行的硬件组合记为已验证。
 
 ## 范围与职责
@@ -68,10 +68,35 @@
 
 ## 验证
 
+后续审查补充：
+
+- FSDP ignored pattern 选中父模块时，排除其整个子树，避免忽略参数与
+  分片单元选择的语义不一致；同名前缀的其他模块不受影响。
+- EMA cold start 与普通更新共用 tensor identity 校验。cold start 在写入前
+  检查所有 parameter/buffer，替换后的 tensor 会报明确错误，不插入空状态、
+  不部分覆盖原平均值。
+- 多模态 placeholder 数量必须与 token count 一一对应，且 count 不得为负。
+  不一致时报告 ValueError，避免多余 count 被静默丢弃。
+- 远程图像读取在解码前检查 HTTP 状态，并通过 context manager 关闭响应。
+  resize 拒绝非正几何参数、反向像素预算和无法容纳最小 patch grid 的预算。
+- 视频采样在打开文件前拒绝非有限或非正 FPS，以及无效的帧数上下界。
+  参数错误不再进入解码失败的样本丢弃路径。
+
 质量门禁：全量 CPU pytest、`pre-commit run --all-files`、Ruff lint/format、
 `python -m compileall -q llmtuner`、`git diff --check`。
 
-本轮最终结果：`1091 passed, 10 skipped`。上述质量门禁均通过。
+最新全量结果：`1119 passed, 10 skipped`。上述质量门禁均通过。
 
 分布式测试需根据脚本要求选择 rank 数、设备和模型。全量 CPU 测试中的跳过项
 以及尚未运行的 torchrun 脚本不能视为通过。本轮不发布或推送修改。
+
+## 逐文件审查追加修复
+
+- pipeline 能力探测容忍旧版缺失 eval；MPI 发布 LOCAL_RANK；硬件监控查询当前设备。
+- ParallelConfig 统一委托家族校验，去除重复分支；数据配置拒绝未知 packing。
+- TP 显式 pattern 先于默认 pattern 匹配；EP 完整校验 down projection 的 D/F 维度。
+- 可选 torch_checkpointing 的 HF 最终导出修复 item_specs 函数被局部变量遮蔽。
+- 优化器状态初始化失败时恢复原 LR 与梯度；合成数据接受完整 64 位种子。
+- KCP 增加 context_parallel_kcp_size，修复合法配置无法启用 CP 的可达性问题。
+  例如 strategy='kcp'、kcp_size=4、其余两个 CP 轴为 1；不支持 packed、
+  headtail、TP 或 KDA/softmax 混合模型。Ascend 算子数值仍须目标设备验证。

@@ -94,7 +94,10 @@ def _pipelining_has_eval() -> bool:
 
     import torch.distributed.pipelining.schedules as schedules
 
-    eval_params = inspect.signature(schedules._PipelineSchedule.eval).parameters
+    evaluate = getattr(schedules._PipelineSchedule, "eval", None)
+    if evaluate is None:
+        return False
+    eval_params = inspect.signature(evaluate).parameters
     if "arg_mbs" not in eval_params:
         return False
     step = getattr(schedules._PipelineSchedule, "_step_microbatches", None)

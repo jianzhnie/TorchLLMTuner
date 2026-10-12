@@ -1226,3 +1226,15 @@ def test_explicit_chat_template_kwargs_win_over_the_injected_defaults(tokenizer)
     )
 
     assert out == "B|"
+
+
+def test_synthetic_source_accepts_full_64_bit_seed():
+    import torch
+
+    from llmtuner.datasets.synthetic import RandomTokenSource
+
+    source = RandomTokenSource(seed=2**64 - 1, vocab_size=16, batch_size=2, seq_len=4)
+    first = next(iter(source))
+    repeated = next(iter(source))
+    assert first.input_ids.shape == (2, 4)
+    assert torch.equal(first.input_ids, repeated.input_ids)

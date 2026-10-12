@@ -133,6 +133,11 @@ class DataloaderConfig:
     )
 
     def __post_init__(self) -> None:
+        if self.packing not in ("concat_then_split", "first_fit"):
+            raise ConfigError(
+                "dataloader.packing must be 'concat_then_split' or 'first_fit', "
+                f"got {self.packing!r}"
+            )
         if self.dataset != "random" and not self.tokenizer_path:
             raise ConfigError(
                 f"dataloader.tokenizer_path is required for dataset "

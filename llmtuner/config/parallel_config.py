@@ -15,7 +15,6 @@ from llmtuner.config.pipeline_parallel_config import validate_pipeline_parallel_
 from llmtuner.config.tensor_parallel_config import validate_tensor_parallel_config
 from llmtuner.errors import (
     ConfigError,
-    EnvironmentUnsupportedError,
     UnsupportedCombinationError,
 )
 
@@ -192,6 +191,9 @@ class ParallelConfig:
     context_parallel_ulysses_size: int = 1
     """Independent Ulysses CP axis degree."""
 
+    context_parallel_kcp_size: int = 1
+    """KCP degree for pure KDA models; requires strategy='kcp'."""
+
     context_parallel_strategy: str = "kv_allgather"
     """
     CP attention redistribution strategy. Options:
@@ -364,117 +366,21 @@ class ParallelConfig:
             "pipeline_parallel_size",
             "context_parallel_kv_allgather_size",
             "context_parallel_ulysses_size",
+            "context_parallel_kcp_size",
             "expert_parallel_size",
             "num_pp_microbatches",
             "ep_torchao_pad_multiple",
             group="parallel",
         )
-        if (
-            self.fsdp_forward_prefetch_count < 0
-            or self.fsdp_backward_prefetch_count < 0
-        ):
-            raise ConfigError("FSDP prefetch counts must be nonnegative")
-        if self.fsdp_implementation not in ("native", "custom"):
-            raise ConfigError(
-                "parallel.fsdp_implementation must be 'native' or 'custom'"
-            )
         if self.fixed_router and self.moe_quantile_balancing:
             raise UnsupportedCombinationError(
                 "parallel.fixed_router cannot be combined with "
                 "moe_quantile_balancing because fixed routing bypasses its choice"
             )
-        if not self.enable_sequence_parallel:
-            raise UnsupportedCombinationError(
-                "parallel.enable_sequence_parallel=False is not supported: "
-                "llmtuner's tensor parallelism is sequence-parallel by "
-                "construction (the fused TP GEMMs gather/scatter the sequence "
-                "and the batch is sharded T/tp). There is no "
-                "replicated-activation TP path to fall back to, so this flag "
-                "has nothing to disable. Leave it true, or set "
-                "tensor_parallel_size=1 to drop TP."
-            )
         if self.data_parallel_shard_size < 1 and self.data_parallel_shard_size != -1:
             raise ConfigError(
                 "parallel.data_parallel_shard_size must be >= 1 or -1 "
                 f"(derive), got {self.data_parallel_shard_size}"
-            )
-        allowed_dispatchers = (
-            "alltoall",
-            "torchao",
-            "domino",
-            "mc2",
-            "deepep",
-            "hybridep",
-        )
-        if self.ep_token_dispatcher not in allowed_dispatchers:
-            raise ConfigError(
-                "parallel.ep_token_dispatcher must be one of "
-                f"{'/'.join(allowed_dispatchers)}, got "
-                f"{self.ep_token_dispatcher!r}"
-            )
-        if self.ep_token_dispatcher in ("deepep", "hybridep"):
-            raise EnvironmentUnsupportedError(
-                f"parallel.ep_token_dispatcher={self.ep_token_dispatcher!r} is a "
-                "registered gap, not a supported backend: it is CUDA-only and "
-                "requires the deep_ep/hybridep kernels plus torchtitan's "
-                "distributed/deepep/ wrappers, which llmtuner does not vendor "
-                "(environment not covered; see docs/llmtuner_upstream_map.md "
-                "table D). Unlock conditions: vendor the wrappers, add the "
-                "CUDA-only dependency as an optional extra, and re-validate "
-                "numerics on a CUDA device. Use 'alltoall' meanwhile."
-            )
-        if self.ep_token_dispatcher == "mc2":
-            raise EnvironmentUnsupportedError(
-                "parallel.ep_token_dispatcher='mc2' requires registered "
-                "Ascend fused all-to-all/grouped-matmul operators; this "
-                "runtime does not provide the migrated operator contract."
-            )
-        if self.ep_token_dispatcher != "alltoall" and self.expert_parallel_size == 1:
-            raise UnsupportedCombinationError(
-                f"parallel.ep_token_dispatcher={self.ep_token_dispatcher!r} has no "
-                "effect at expert_parallel_size=1: the EP swap is the only "
-                "place a token dispatcher is installed and it does not run at "
-                "ep=1. Set expert_parallel_size > 1, or keep 'alltoall'."
-            )
-        if self.context_parallel_load_balancer == "":
-            raise ConfigError(
-                "parallel.context_parallel_load_balancer cannot be an empty "
-                "string; use None to disable load balancing."
-            )
-        allowed = frozenset({None, "headtail", "ptrr"})
-        if self.context_parallel_load_balancer not in allowed:
-            raise ConfigError(
-                "parallel.context_parallel_load_balancer must be one of "
-                f"None/'headtail'/'ptrr', got "
-                f"{self.context_parallel_load_balancer!r}"
-            )
-        if self.context_parallel_load_balancer == "ptrr":
-            raise UnsupportedCombinationError(
-                "parallel.context_parallel_load_balancer='ptrr' is not "
-                "implemented in llmtuner: it derives its schedule from a "
-                "BlockMask, which llmtuner's CP kernel does not consume. Use "
-                "'headtail' or None."
-            )
-        allowed_strategies = frozenset({"kv_allgather", "ulysses", "kcp"})
-        if self.context_parallel_strategy not in allowed_strategies:
-            raise ConfigError(
-                "parallel.context_parallel_strategy must be one of "
-                f"'kv_allgather'/'ulysses'/'kcp', got "
-                f"{self.context_parallel_strategy!r}"
-            )
-        if (
-            self.context_parallel_strategy == "ulysses"
-            and self.context_parallel_load_balancer is not None
-        ):
-            raise UnsupportedCombinationError(
-                "parallel.context_parallel_strategy='ulysses' requires "
-                "context_parallel_load_balancer=None: every rank attends the "
-                "full sequence in whatever order the all-to-all delivers, and "
-                "a load balancer's rearrangement would make that a permuted "
-                "corpus. Nothing raises: the attention is over the wrong "
-                "order of the right tokens, so the loss stays finite and the "
-                "run trains a different model. "
-                f"(got {self.context_parallel_load_balancer!r})"
             )
         if self.enable_fsdp_symm_mem and (
             not torch.cuda.is_available()
@@ -486,11 +392,6 @@ class ParallelConfig:
             raise ConfigError(
                 "parallel.enable_fsdp_symm_mem is only supported on NVIDIA "
                 "GPUs with compute capability 9.0 or newer."
-            )
-        if self.fsdp_symm_mem_scope not in ("all", "dense"):
-            raise ConfigError(
-                "parallel.fsdp_symm_mem_scope must be one of 'all'/'dense', "
-                f"got {self.fsdp_symm_mem_scope!r}"
             )
 
         # Import lazily so loading this module does not pull in pipelining.
@@ -520,7 +421,9 @@ class ParallelConfig:
     @property
     def cp(self) -> int:
         return (
-            self.context_parallel_kv_allgather_size * self.context_parallel_ulysses_size
+            self.context_parallel_kv_allgather_size
+            * self.context_parallel_ulysses_size
+            * self.context_parallel_kcp_size
         )
 
     @property

@@ -291,3 +291,23 @@ def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
     assert calls[0][1]["mp_policy"] is override_policy
     assert calls[1][0] is model
     assert calls[1][1]["mp_policy"] is not override_policy
+
+
+def test_ignored_fsdp_module_excludes_its_descendants():
+    from llmtuner.config import ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
+
+    model = nn.ModuleDict(
+        {
+            "ignored": nn.Sequential(nn.Linear(2, 2)),
+            "kept": nn.Sequential(nn.Linear(2, 2)),
+            "ignored_extra": nn.Linear(2, 2),
+        }
+    )
+    cfg = ParallelConfig(fsdp_apply_modules={"*": {}}, fsdp_ignored_modules=["ignored"])
+    _, selected, ignored = _resolve_pattern_units(model, cfg)
+    assert "ignored" not in selected
+    assert "ignored.0" not in selected
+    assert "kept.0" in selected
+    assert "ignored_extra" in selected
+    assert ignored == set(model["ignored"].parameters())

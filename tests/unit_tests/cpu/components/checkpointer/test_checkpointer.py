@@ -631,3 +631,69 @@ def test_native_load_restores_stateful_and_rejects_foreign_objects(
         manager._load_checkpoint(
             {MODEL: object()}, str(tmp_path), from_hf=False, from_quantized=False
         )
+
+
+def test_optimizer_initialization_restores_grads_and_lr_on_error(monkeypatch):
+    import pytest
+
+    param = torch.nn.Parameter(torch.ones(3))
+    optimizer = torch.optim.AdamW([param], lr=0.125)
+    original_grad = torch.ones_like(param)
+    param.grad = original_grad
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("initialization failed")
+
+    monkeypatch.setattr(optimizer, "step", fail)
+    with pytest.raises(RuntimeError, match="initialization failed"):
+        init_optim_state(optimizer)
+    assert optimizer.param_groups[0]["lr"] == 0.125
+    assert param.grad is original_grad
+
+
+def test_torch_checkpointing_hf_final_save_builds_item_specs(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+    from llmtuner.components.checkpointer.checkpoint_keys import MODEL
+
+    saved = []
+    manager = tc.TorchCheckpointingManager.__new__(tc.TorchCheckpointingManager)
+    manager._manager = SimpleNamespace(close=lambda: None)
+    manager._manager_config = SimpleNamespace(storage_config=None)
+    manager.last_save_model_only = True
+    manager.last_save_in_hf = True
+    manager.export_dtype = torch.float32
+    manager.folder = str(tmp_path)
+    manager.states = {MODEL: torch.nn.Linear(2, 2)}
+    manager.sd_adapter = SimpleNamespace(
+        to_hf=lambda state: state, fqn_to_index_mapping=None
+    )
+    manager._backend = SimpleNamespace(
+        LayoutInfo=lambda *args: object(),
+        SafetensorsSerialization=lambda: object(),
+        ItemSpec=lambda **kwargs: SimpleNamespace(**kwargs),
+        LocalFileSystemStorageConfig=lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        tc,
+        "item_specs",
+        lambda backend: {
+            MODEL: SimpleNamespace(requires_copy=True, resharder=None, required=False)
+        },
+    )
+    monkeypatch.setattr(tc, "sync_save_config", lambda backend: object())
+    monkeypatch.setattr(
+        tc,
+        "default_backend_config",
+        lambda *args, **kwargs: SimpleNamespace(
+            build=lambda: SimpleNamespace(
+                save=lambda *args: saved.append(args), close=lambda: None
+            )
+        ),
+    )
+    monkeypatch.setattr(manager, "_stateful_to_state_dict", lambda states: states)
+    manager._save_last_step(2)
+    assert len(saved) == 1
+    assert saved[0][0].endswith("step-2/sharded")
+    assert MODEL in saved[0][1]

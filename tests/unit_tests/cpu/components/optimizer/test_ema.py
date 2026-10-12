@@ -269,3 +269,26 @@ def test_config_validation() -> None:
         EMAConfig(decay=1.0)
     with pytest.raises(ValueError, match="decay"):
         EMAConfig(decay=-0.1)
+
+
+def test_cold_start_rejects_replaced_parameter_without_partial_updates():
+    model = _model()
+    ema = EMA(model_parts=[model])
+    before = {key: value.clone() for key, value in _ema_params(ema).items()}
+    model[1].weight = nn.Parameter(torch.zeros_like(model[1].weight))
+    replacement = model[1].weight
+    with pytest.raises(RuntimeError, match="no state for"):
+        ema.load_state_dict({})
+    assert replacement not in ema.optimizers[0].state
+    for key, value in _ema_params(ema).items():
+        torch.testing.assert_close(value, before[key])
+
+
+def test_cold_start_rejects_replaced_buffer_without_inserting_state():
+    model = _model()
+    model.register_buffer("expert_bias_E", torch.ones(4))
+    ema = EMA(model_parts=[model], buffer_patterns=["expert_bias_E$"])
+    model.expert_bias_E = torch.zeros(4)
+    with pytest.raises(RuntimeError, match="no state for"):
+        ema.load_state_dict({})
+    assert model.expert_bias_E not in ema._buffer_optimizers[0].state

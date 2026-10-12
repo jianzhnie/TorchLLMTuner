@@ -37,3 +37,14 @@ def test_apply_ep_requires_an_ep_group_when_ep_is_on() -> None:
 
     with pytest.raises(ValueError, match="EP process group"):
         apply_ep(torch.nn.Linear(4, 4), cfg)
+
+
+def test_expert_layout_rejects_inconsistent_down_width():
+    from llmtuner.parallel.expert_parallel.hf_inspection import fused_experts_of
+
+    block = torch.nn.Module()
+    block.experts = torch.nn.Module()
+    block.experts.gate_up_proj = torch.nn.Parameter(torch.randn(2, 8, 6))
+    block.experts.down_proj = torch.nn.Parameter(torch.randn(2, 6, 3))
+    with pytest.raises(ValueError, match="unrecognized expert weight shapes"):
+        fused_experts_of(block)

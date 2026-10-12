@@ -131,14 +131,16 @@ def get_device_name() -> str:
     """
     if device_type == "cpu":
         return "cpu"
-    return device_module.get_device_name(0)
+    return device_module.get_device_name(device_module.current_device())
 
 
 def get_device_capacity_bytes() -> int:
     """Total memory of the training device in bytes, or 0 for CPU."""
     if device_type == "cpu":
         return 0
-    return device_module.get_device_properties(0).total_memory
+    return device_module.get_device_properties(
+        device_module.current_device()
+    ).total_memory
 
 
 def get_peak_flops(device_name: str) -> float:

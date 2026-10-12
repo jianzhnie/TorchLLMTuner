@@ -340,3 +340,23 @@ def test_tp_linear_preserves_frozen_parameters(cls):
     weight = nn.Parameter(torch.randn(8, 8), requires_grad=False)
     module = cls(weight, tp_size=2, tp_rank=0, group=None)
     assert not module.weight.requires_grad
+
+
+def test_explicit_tp_pattern_overrides_default_wildcard(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.tensor_parallel import tensor_parallel as tp_module
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False))
+    model._tp_plan = {"*": "colwise"}
+    mesh = {
+        "tp": SimpleNamespace(
+            get_group=lambda: object(), size=lambda: 2, get_local_rank=lambda: 0
+        )
+    }
+    monkeypatch.setattr(tp_module, "supports_symm_mem", lambda mesh: False)
+    apply_tp(
+        model, mesh, ParallelConfig(tensor_parallel_size=2, tp_rowwise_modules=["0"])
+    )
+    assert isinstance(model[0], RowParallelLinear)
+    assert model[0].weight.shape == (4, 2)
