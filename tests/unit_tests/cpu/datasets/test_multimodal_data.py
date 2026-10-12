@@ -50,7 +50,7 @@ from llmtuner.datasets.multimodal.image import (
     smart_resize,
     vision_to_patches,
 )
-from llmtuner.datasets.multimodal.text import insert_vision_placeholders
+from llmtuner.datasets.multimodal.placeholders import insert_vision_placeholders
 from llmtuner.datasets.multimodal.video import load_video, process_video
 from tests.data_fixtures import (  # noqa: F401
     VOCAB,

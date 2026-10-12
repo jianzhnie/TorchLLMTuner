@@ -10,7 +10,7 @@ correct on its own -- a rank that attends its own block against its own block
 computes attention over a sequence that does not exist -- so this compares
 against a single-rank reference that attends every token against every other.
 
-This drives ``cp_kernel.cp_all_to_all`` -- the all-to-all the live Ulysses
+This drives ``attention.cp_all_to_all`` -- the all-to-all the live Ulysses
 kernel runs -- rather than a second copy of the redistribution. The kernel's
 other inputs (a real HF attention call, query/key/value in HF's
 ``(batch, heads, seq, dim)`` layout) are the equivalence harnesses' job; what is
@@ -35,7 +35,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
-from llmtuner.parallel.context_parallel.cp_kernel import cp_all_to_all
+from llmtuner.parallel.context_parallel.attention import cp_all_to_all
 
 SEQ = 16
 NUM_HEADS = 4

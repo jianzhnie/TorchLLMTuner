@@ -23,7 +23,7 @@ require_env("spmd_types")
 
 import pytest
 
-from llmtuner.accelerator.spmd_context import (
+from llmtuner.accelerator.spmd import (
     current_spmd_mesh,
     spmd_context,
     spmd_mesh_group,

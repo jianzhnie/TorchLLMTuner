@@ -58,7 +58,7 @@ MM_MODULES = (
     "llmtuner.datasets.multimodal.collator",
     "llmtuner.datasets.multimodal.datasets",
     "llmtuner.datasets.multimodal.image",
-    "llmtuner.datasets.multimodal.text",
+    "llmtuner.datasets.multimodal.placeholders",
     "llmtuner.datasets.multimodal.video",
 )
 
@@ -234,7 +234,7 @@ def test_importing_the_text_path_needs_no_multimodal_dependencies():
     """
     source = (
         "import sys; sys.modules['torchvision'] = None\n"
-        "import llmtuner.datasets, llmtuner.datasets.build\n"
+        "import llmtuner.datasets, llmtuner.datasets.factory\n"
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = str(pathlib.Path(__file__).parents[3])

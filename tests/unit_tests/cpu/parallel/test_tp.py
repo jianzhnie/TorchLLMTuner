@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from llmtuner.config import ParallelConfig
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     ColumnParallelLinear,
@@ -31,7 +32,6 @@ from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     resolve_plan,
     rowwise,
 )
-from llmtuner.trainer import ParallelConfig
 
 
 def test_declaration_factories_pick_the_right_realizer() -> None:
@@ -253,7 +253,7 @@ def test_apply_tp_raises_when_the_plan_matches_no_module() -> None:
 
 # -- head-count divisibility ---------------------------------------------------
 #
-# The check itself is exercised in ``test_head_sharding.py`` (ungated); these two
+# The check itself is exercised in ``test_attention_heads.py`` (ungated); these two
 # pin that ``apply_tp`` reaches it, and that it fires before the mesh so a bad
 # head count is a startup error rather than a shape error inside attention.
 

@@ -23,11 +23,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 
+from llmtuner.config import ParallelConfig
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel import matrix
-from llmtuner.parallel.parallel_dims import ParallelDims
-from llmtuner.parallel.pipeline_parallel.pipeline import (
+from llmtuner.parallel import compatibility
+from llmtuner.parallel.pipeline_parallel.partition import (
     generate_llm_fqn_per_model_part,
     split_model_into_stages,
 )
@@ -36,7 +36,7 @@ from llmtuner.parallel.pipeline_parallel.pipeline_parallel import (
     prepend_first_stage_modules,
     validate_microbatches,
 )
-from llmtuner.trainer import ParallelConfig
+from llmtuner.parallel.topology import ParallelTopology
 
 
 def test_single_stage_owns_everything() -> None:
@@ -255,9 +255,9 @@ def test_the_smallest_fillable_split_works() -> None:
 # -- apply_pp guards: microbatch validation and the cp/ep refusal --------------
 
 
-def _dims(*, pp: int = 2, ep: int = 1, world_size: int = 2) -> ParallelDims:
-    """Mesh-free ``ParallelDims``: the guards run before any mesh is touched."""
-    return ParallelDims(
+def _dims(*, pp: int = 2, ep: int = 1, world_size: int = 2) -> ParallelTopology:
+    """Mesh-free ``ParallelTopology``: the guards run before any mesh is touched."""
+    return ParallelTopology(
         dp_replicate=1,
         dp_shard=-1,
         cp=1,
@@ -299,8 +299,8 @@ def test_pp_with_ep_composes() -> None:
     assert dims.pp == 2 and dims.ep == 2
     # Config-level acceptance.
     ParallelConfig(pipeline_parallel_size=2, expert_parallel_size=2)
-    # The assembly-level refusal is gone from the matrix.
-    assert not hasattr(matrix, "pp_cp_ep")
+    # The assembly-level refusal is gone from the compatibility.
+    assert not hasattr(compatibility, "pp_cp_ep")
 
 
 # -- first_stage_module_fqns: co-locating extra modules with stage 0 ----------

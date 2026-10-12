@@ -32,15 +32,15 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.context_parallel import apply_cp, shard_batch_for_cp
-from llmtuner.trainer import (
+from llmtuner.config import (
     LLMTunerConfig,
     ModelConfig,
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.models.hf.factory import build_model_config_for
+from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.parallel.context_parallel import apply_cp, shard_batch_for_cp
 
 SEQ = 256  # torch's CP BlockMask path requires Q_LEN % (cp * 128) == 0
 VOCAB = 128

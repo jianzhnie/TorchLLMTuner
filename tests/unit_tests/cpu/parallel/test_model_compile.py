@@ -1,6 +1,6 @@
 """The compile step: gating, defaults, and the four compile-side toggles.
 
-``llmtuner/parallel/compile.py`` ports torchtitan's ``distributed/compile.py``:
+``llmtuner/parallel/model_compile.py`` ports torchtitan's ``distributed/compile.py``:
 per-block compile, async TP, regional_inductor and capture_scalar_outputs,
 each behind its own switch so the default is the historical whole-model
 ``torch.compile(model)``.
@@ -45,7 +45,7 @@ try:
     from llmtuner.models.hf.factory import build_model_config
     from llmtuner.models.hf.model import HFTransformerModel
     from llmtuner.parallel import compile as compile_mod
-    from llmtuner.parallel.compile import apply_compile, maybe_regional_inductor
+    from llmtuner.parallel.model_compile import apply_compile, maybe_regional_inductor
 
     _IMPORT_ERROR = None
 except Exception as e:  # noqa: BLE001 - env gate, see module docstring

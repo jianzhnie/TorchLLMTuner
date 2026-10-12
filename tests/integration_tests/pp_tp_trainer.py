@@ -10,9 +10,9 @@ import math
 import torch
 import torch.distributed as dist
 
-from llmtuner.config import MetricsConfig
-from llmtuner.trainer import (
+from llmtuner.config import (
     LLMTunerConfig,
+    MetricsConfig,
     ModelConfig,
     OptimizerConfig,
     ParallelConfig,

@@ -71,7 +71,7 @@ efsdp = (dp_shard × cp × tp) / ep
 flowchart TD
     CLI[CLI / HfArgumentParser] --> CFG[LLMTunerConfig]
     CFG --> BUILD[trainer.builder]
-    BUILD --> DIST[设备发现、进程组、ParallelDims、DeviceMesh]
+    BUILD --> DIST[设备发现、进程组、ParallelTopology、DeviceMesh]
     DIST --> MODEL[HFTransformerModel]
     MODEL --> PAR[parallelize_hf_transformers]
     PAR --> TP[Tensor Parallel]
@@ -97,7 +97,7 @@ FSDP 最后应用，使其包装位于其他模型变换之外。PP 是模型切
 
 ## 4. 训练流程
 
-命令行入口为 `llmtuner/trainer/train.py`，稳定训练接口为 `llmtuner/trainer/trainer.py`。一次训练按以下顺序执行：
+命令行入口为 `llmtuner/trainer/cli.py`，稳定训练接口为 `llmtuner/trainer/trainer.py`。一次训练按以下顺序执行：
 
 1. **解析配置**：命令行字段解析成独立配置组，再聚合为 `LLMTunerConfig`；
 2. **初始化分布式环境**：选择 CPU、CUDA 或 NPU 后端，建立进程组；
@@ -252,8 +252,8 @@ python -m examples.train_deepseek_v3
 框架允许能够保持现有数学语义的混合并行组合，并通过三层校验降低运行中失败的概率：
 
 1. 各配置类的 `__post_init__` 校验字段和值域；
-2. `LLMTunerConfig` 与 `ParallelDims` 校验跨配置约束和 mesh 代数；
-3. `parallel/matrix.py` 及模型布局 probe 校验运行时组合与模型结构。
+2. `LLMTunerConfig` 与 `ParallelTopology` 校验跨配置约束和 mesh 代数；
+3. `parallel/compatibility.py` 及模型布局 probe 校验运行时组合与模型结构。
 
 当前需要特别注意的边界包括：
 
@@ -288,9 +288,9 @@ llmtuner/
 │   ├── context_parallel/     # CP 入口、输入分片和 kernel
 │   ├── pipeline_parallel/    # PP 入口、模型切分和 schedule
 │   ├── fully_shard_parallel/ # FSDP2 入口
-│   ├── parallel_dims.py      # 并行维度与 DeviceMesh
+│   ├── topology.py      # 并行维度与 DeviceMesh
 │   ├── stages.py             # 并行装配顺序
-│   ├── matrix.py             # 不支持组合的统一裁决
+│   ├── compatibility.py             # 不支持组合的统一裁决
 │   └── parallelize.py        # 混合并行总入口
 ├── trainer/                  # 装配、batch、PP step、验证和训练循环
 └── utils/                    # 日志、随机性、GC、监控等通用工具

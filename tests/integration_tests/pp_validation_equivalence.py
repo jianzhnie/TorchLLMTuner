@@ -22,12 +22,13 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from llmtuner.config import MetricsConfig, ValidationConfig
-from llmtuner.trainer import (
+from llmtuner.config import (
     LLMTunerConfig,
+    MetricsConfig,
     ModelConfig,
     ParallelConfig,
     TrainingConfig,
+    ValidationConfig,
 )
 from llmtuner.trainer.trainer import Trainer
 

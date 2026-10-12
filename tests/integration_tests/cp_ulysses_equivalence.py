@@ -46,6 +46,12 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.nn.attention.flex_attention import create_block_mask
 
+from llmtuner.config import (
+    LLMTunerConfig,
+    ModelConfig,
+    ParallelConfig,
+    TrainingConfig,
+)
 from llmtuner.models.common.attention.masks import get_causal_mask_mod
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
@@ -54,16 +60,10 @@ from llmtuner.parallel.context_parallel import (
     shard_attention_mask_for_cp,
     shard_batch_for_cp,
 )
-from llmtuner.parallel.context_parallel.cp_kernel import (
+from llmtuner.parallel.context_parallel.attention import (
     CPFlexKernel,
     HeadToSeq,
     SeqToHead,
-)
-from llmtuner.trainer import (
-    LLMTunerConfig,
-    ModelConfig,
-    ParallelConfig,
-    TrainingConfig,
 )
 
 SEQ = 256  # torch's CP BlockMask path requires Q_LEN % (cp * 128) == 0

@@ -21,13 +21,13 @@ import pytest
 import torch
 
 from llmtuner.config import ParallelConfig
-from llmtuner.models.common.moe.dispatcher import (
+from llmtuner.models.common.moe.token_dispatch import (
     TORCHAO_INSTALL_HINT,
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
     TorchAOTokenDispatcher,
 )
-from llmtuner.parallel.expert_parallel.swap import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
 
 # --------------------------------------------------------------------------
 # config gating

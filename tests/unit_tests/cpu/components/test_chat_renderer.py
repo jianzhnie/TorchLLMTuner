@@ -32,7 +32,7 @@ from llmtuner.config import (
     ModelConfig,
     TrainingConfig,
 )
-from llmtuner.datasets.build import build_dataloader
+from llmtuner.datasets.factory import build_dataloader
 from llmtuner.datasets.text.processors import ChatProcessor
 from llmtuner.datasets.text.renderer import (
     RENDERERS_INSTALL_HINT,

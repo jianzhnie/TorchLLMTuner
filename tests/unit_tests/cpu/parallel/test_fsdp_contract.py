@@ -31,8 +31,15 @@ from torch.nn import ModuleDict, ModuleList
 import llmtuner.parallel.fully_shard_parallel.fully_shard_parallel as apply
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.parallel.fully_shard_parallel.fine_grained import (
+    CustomFSDPStrategy,
+    NativeFSDPStrategy,
+    fully_shard_fine_grained,
+    get_fsdp_strategy,
+)
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     iter_transformer_layers,
+    set_fsdp_prefetch_windows,
 )
 
 _VOCAB = 32
@@ -164,17 +171,90 @@ def test_apply_fsdp_preserves_parameter_dtype_for_mixed_precision(
 
     model = nn.Linear(4, 4, dtype=torch.bfloat16)
     parallel_dims = type(
-        "ParallelDimsStub",
+        "ParallelTopologyStub",
         (),
         {"pp_enabled": False, "ep": 1},
     )()
     config = type(
         "ParallelConfigStub",
         (),
-        {"fsdp_reshard_after_forward": "default", "enable_fsdp_symm_mem": False},
+        {
+            "fsdp_reshard_after_forward": "default",
+            "fsdp_cpu_offload": False,
+            "fsdp_cpu_offload_pin_memory": True,
+            "enable_fsdp_symm_mem": False,
+        },
     )()
 
     apply.apply_fsdp(model, config, parallel_dims)
 
     assert captured["param_dtype"] is torch.bfloat16
     assert captured["reduce_dtype"] is torch.float32
+
+
+def test_apply_fsdp_forwards_cpu_offload_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The user-facing offload knobs must reach the FSDP2 policy builder."""
+
+    class _Mesh:
+        def size(self) -> int:
+            return 2
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(apply, "resolve_fsdp_mesh", lambda _dims: _Mesh())
+    monkeypatch.setattr(apply, "resolve_sparse_fsdp_mesh", lambda _dims: None)
+    monkeypatch.setattr(
+        apply,
+        "apply_fsdp_to_decoder",
+        lambda _model, _mesh, **kwargs: captured.update(kwargs),
+    )
+
+    model = nn.Linear(4, 4)
+    parallel_dims = type("ParallelTopologyStub", (), {"pp_enabled": False, "ep": 1})()
+    config = type(
+        "ParallelConfigStub",
+        (),
+        {
+            "fsdp_reshard_after_forward": "default",
+            "fsdp_cpu_offload": True,
+            "fsdp_cpu_offload_pin_memory": False,
+            "enable_fsdp_symm_mem": False,
+        },
+    )()
+
+    apply.apply_fsdp(model, config, parallel_dims)
+
+    assert captured["cpu_offload"] is True
+    assert captured["cpu_offload_pin_memory"] is False
+
+
+def test_fsdp_prefetch_supports_arbitrary_windows() -> None:
+    class Unit(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.forward_targets: list[nn.Module] = []
+            self.backward_targets: list[nn.Module] = []
+
+        def set_modules_to_forward_prefetch(self, modules) -> None:
+            self.forward_targets = list(modules)
+
+        def set_modules_to_backward_prefetch(self, modules) -> None:
+            self.backward_targets = list(modules)
+
+    units = [Unit() for _ in range(5)]
+    set_fsdp_prefetch_windows(units, forward_count=2, backward_count=3)
+
+    assert units[0].forward_targets == units[1:3]
+    assert units[2].forward_targets == units[3:5]
+    assert units[4].backward_targets == [units[3], units[2], units[1]]
+
+
+def test_fsdp_strategy_selects_pyTorch_214_compatible_adapter() -> None:
+    assert isinstance(get_fsdp_strategy("native"), NativeFSDPStrategy)
+    assert isinstance(get_fsdp_strategy("custom"), CustomFSDPStrategy)
+
+
+def test_fine_grained_adapter_rejects_a_distinct_hook_target() -> None:
+    with pytest.raises(ValueError, match="separate hook_module"):
+        fully_shard_fine_grained(nn.Linear(2, 2), hook_module=nn.Identity())

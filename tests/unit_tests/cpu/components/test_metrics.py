@@ -74,8 +74,8 @@ class _TaggingLogger(_RecordingLogger):
         super().log(prefixed, step)
 
 
-class _FakeParallelDims:
-    """The subset of ParallelDims that the metrics rank logic reads."""
+class _FakeParallelTopology:
+    """The subset of ParallelTopology that the metrics rank logic reads."""
 
     def __init__(self, *, pp: int = 1, world_size: int = 1, non_data_parallel: int = 1):
         self.pp = pp
@@ -179,7 +179,7 @@ def test_throughput_divides_by_the_non_data_parallel_size() -> None:
     1/N of the tokens that their step processed."""
     processor = MetricsProcessor(
         Config(),
-        parallel_dims=_FakeParallelDims(non_data_parallel=4),
+        parallel_dims=_FakeParallelTopology(non_data_parallel=4),
         num_flops_per_token=1000,
     )
     processor.add_tokens(4000)
@@ -446,7 +446,7 @@ def test_a_processor_with_nothing_enabled_logs_to_a_no_op() -> None:
 def test_only_the_metrics_rank_records_unless_all_ranks_are_asked_for() -> None:
     processor = MetricsProcessor(
         Config(enable_tensorboard=True),
-        parallel_dims=_FakeParallelDims(pp=1, world_size=1),
+        parallel_dims=_FakeParallelTopology(pp=1, world_size=1),
         num_flops_per_token=0,
     )
     # Single process, metrics rank 0, so this rank does record.
@@ -454,7 +454,7 @@ def test_only_the_metrics_rank_records_unless_all_ranks_are_asked_for() -> None:
 
     off_rank = MetricsProcessor(
         Config(enable_tensorboard=True),
-        parallel_dims=_FakeParallelDims(pp=2, world_size=4),
+        parallel_dims=_FakeParallelTopology(pp=2, world_size=4),
         num_flops_per_token=0,
     )
     # Metrics rank is 2 under pp=2; this process is rank 0, so it does not.
@@ -600,19 +600,21 @@ def test_gib_is_binary_gigabytes() -> None:
 
 
 def test_metrics_rank_is_zero_without_pipeline_parallelism() -> None:
-    assert get_metrics_rank(parallel_dims=_FakeParallelDims(), pp_schedule="1F1B") == 0
+    assert (
+        get_metrics_rank(parallel_dims=_FakeParallelTopology(), pp_schedule="1F1B") == 0
+    )
 
 
 def test_metrics_rank_is_the_first_rank_of_the_last_stage() -> None:
     """The loss only exists on the last stage, so that is the rank that reports."""
-    dims = _FakeParallelDims(pp=4, world_size=16)
+    dims = _FakeParallelTopology(pp=4, world_size=16)
 
     assert get_metrics_rank(parallel_dims=dims, pp_schedule="1F1B") == 12
 
 
 def test_metrics_rank_is_zero_for_a_v_block_schedule() -> None:
     """ZBV returns loss on rank 0 regardless of how many stages there are."""
-    dims = _FakeParallelDims(pp=4, world_size=16)
+    dims = _FakeParallelTopology(pp=4, world_size=16)
 
     assert get_metrics_rank(parallel_dims=dims, pp_schedule="ZBVZeroBubble") == 0
 

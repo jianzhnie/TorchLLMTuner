@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from llmtuner.parallel.head_sharding import (
+from llmtuner.parallel.attention_heads import (
     head_counts,
     require_heads_divisible_by,
 )

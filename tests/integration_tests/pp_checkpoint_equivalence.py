@@ -44,9 +44,10 @@ import sys
 import torch
 import torch.distributed as dist
 
-from llmtuner.config import CheckpointConfig, MetricsConfig
-from llmtuner.trainer import (
+from llmtuner.config import (
+    CheckpointConfig,
     LLMTunerConfig,
+    MetricsConfig,
     ModelConfig,
     OptimizerConfig,
     ParallelConfig,

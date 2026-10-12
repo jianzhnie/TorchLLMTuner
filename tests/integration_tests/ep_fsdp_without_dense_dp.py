@@ -11,8 +11,8 @@ from torch.distributed.tensor import DTensor
 from llmtuner.config import LLMTunerConfig, ModelConfig, ParallelConfig, TrainingConfig
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.parallel_dims import ParallelDims
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
+from llmtuner.parallel.topology import ParallelTopology
 
 
 def main() -> None:
@@ -41,7 +41,7 @@ def main() -> None:
         ),
         training=TrainingConfig(max_seq_len=32, steps=1),
     )
-    dims = ParallelDims.from_config(cfg.parallel, 4)
+    dims = ParallelTopology.from_config(cfg.parallel, 4)
     dims.build_mesh()
     torch.manual_seed(0)
     model = HFTransformerModel(build_model_config_for(cfg)).to(torch.float32)

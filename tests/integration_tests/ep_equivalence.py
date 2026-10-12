@@ -20,13 +20,13 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from llmtuner.models.common.moe.block import MoE
-from llmtuner.models.common.moe.dispatcher import (
+from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
+from llmtuner.models.common.moe.layer import MoE
+from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
+from llmtuner.models.common.moe.token_dispatch import (
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
 )
-from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
-from llmtuner.models.common.moe.router import TokenChoiceTopKRouter
 
 NUM_EXPERTS = 8
 TOP_K = 2

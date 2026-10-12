@@ -40,24 +40,24 @@ from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
-from llmtuner.config import MetricsConfig
-from llmtuner.datasets.random_data import RandomTokenSource, batch_iterator
-from llmtuner.datasets.types import Batch
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.parallel_dims import ParallelDims
-from llmtuner.parallel.tensor_parallel.tensor_parallel import (
-    ColumnParallelLinear,
-    ColwiseLinearNoGather,
-    RowParallelLinear,
-)
-from llmtuner.trainer import (
+from llmtuner.config import (
     LLMTunerConfig,
+    MetricsConfig,
     ModelConfig,
     OptimizerConfig,
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.datasets.contracts import Batch
+from llmtuner.datasets.synthetic import RandomTokenSource, batch_iterator
+from llmtuner.models.hf.factory import build_model_config_for
+from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+    ColumnParallelLinear,
+    ColwiseLinearNoGather,
+    RowParallelLinear,
+)
+from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.trainer import Trainer
 
 STEPS = 4
@@ -173,7 +173,7 @@ def main() -> None:
     world = trainer.world_size
     assert world == TP * DP_SHARD, f"this check assumes 4 ranks, got {world}"
     parallel_dims = trainer.parallel_dims
-    assert isinstance(parallel_dims, ParallelDims)
+    assert isinstance(parallel_dims, ParallelTopology)
     tp_rank = parallel_dims.get_mesh("tp").get_local_rank()
 
     reference, ref_params = _reference_trajectory(cfg)

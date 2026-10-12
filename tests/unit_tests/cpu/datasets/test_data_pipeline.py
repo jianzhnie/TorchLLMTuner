@@ -44,7 +44,7 @@ from llmtuner.datasets import (
     build_dataset,
     build_first_fit_packing,
 )
-from llmtuner.datasets.random_data import RandomTokenDataLoader
+from llmtuner.datasets.synthetic import RandomTokenDataLoader
 from llmtuner.datasets.text.processors import ChatProcessor
 from tests.data_fixtures import (
     CHAT_TEMPLATE,
@@ -1056,7 +1056,7 @@ def test_packing_selector_chooses_the_recipe(
     the config would still build a working loader -- just the wrong one, with
     nothing in the batch to say so.
     """
-    import llmtuner.datasets.build as build_module
+    import llmtuner.datasets.factory as build_module
 
     calls: list[str] = []
     for name in ("build_concat_then_split_packing", "build_first_fit_packing"):
@@ -1090,7 +1090,7 @@ def test_packing_selector_chooses_the_recipe(
 
 def test_num_packing_bins_reaches_first_fit(tmp_path, corpus, monkeypatch) -> None:
     """The bin count is forwarded, not left at the callee's default."""
-    import llmtuner.datasets.build as build_module
+    import llmtuner.datasets.factory as build_module
 
     seen: dict = {}
     real = build_module.build_first_fit_packing

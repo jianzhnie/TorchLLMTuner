@@ -28,10 +28,10 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from llmtuner.accelerator.spmd_context import spmd_context, spmd_mesh_group
+from llmtuner.accelerator.spmd import spmd_context, spmd_mesh_group
 from llmtuner.models.common.aux_loss import AuxLoss
-from llmtuner.models.common.moe.load_balance import MicrobatchWiseLoadBalanceLoss
-from llmtuner.parallel.parallel_dims import ParallelDims
+from llmtuner.models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
+from llmtuner.parallel.topology import ParallelTopology
 
 E, D, K, T = 4, 8, 2, 16
 COEFF = 0.7
@@ -76,7 +76,7 @@ def main() -> None:
     world = dist.get_world_size()
     assert world == 2, f"this check assumes 2 ranks, got {world}"
 
-    parallel_dims = ParallelDims(
+    parallel_dims = ParallelTopology(
         dp_replicate=1, dp_shard=-1, cp=2, tp=1, pp=1, ep=1, world_size=world
     )
     parallel_dims.build_mesh()

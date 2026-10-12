@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from llmtuner.components.loss import IGNORE_INDEX, next_token_targets
+from llmtuner.config import LLMTunerConfig, TrainingConfig
 from llmtuner.models.hf.factory import (
     _ATTN_IMPLEMENTATION,
     build_model_config,
@@ -29,7 +30,6 @@ from llmtuner.models.hf.factory import (
     materialize_meta_model,
 )
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.trainer import LLMTunerConfig, TrainingConfig
 
 _HIDDEN = 32
 _VOCAB = 128
@@ -260,7 +260,7 @@ def test_build_model_config_for_accepts_a_local_checkpoint_path(tmp_path) -> Non
     """
     from transformers import AutoConfig
 
-    from llmtuner.trainer import ModelConfig
+    from llmtuner.config import ModelConfig
 
     saved = AutoConfig.for_model(
         "qwen3",
@@ -289,7 +289,7 @@ def test_the_mask_type_follows_the_corpus_rather_than_being_configured() -> None
 
     ``build_model_config_for`` derives ``attn_mask_type`` from the dataset
     selector because the two cannot be set independently without one of them
-    being wrong: every non-random corpus is packed by ``datasets/build.py``, and
+    being wrong: every non-random corpus is packed by ``datasets/factory.py``, and
     nothing in the config names packing separately. Setting it by hand -- which
     is what the equivalence tests used to do -- is the drift this prevents.
     """
@@ -380,7 +380,7 @@ def test_arch_overrides_reach_an_architecture_without_its_own_config_field() -> 
     ``arch_overrides`` is the path those settings take, and this pins that it
     lands on the built config rather than being silently dropped.
     """
-    from llmtuner.trainer import ModelConfig
+    from llmtuner.config import ModelConfig
 
     cfg = LLMTunerConfig(
         model=ModelConfig(
@@ -420,7 +420,7 @@ def test_arch_overrides_win_over_the_explicit_sizes() -> None:
     only ``arch_overrides`` would otherwise lose the merge to a field it never
     set. Merged last, the override decides.
     """
-    from llmtuner.trainer import ModelConfig
+    from llmtuner.config import ModelConfig
 
     cfg = LLMTunerConfig(
         model=ModelConfig(
@@ -437,7 +437,7 @@ def test_arch_overrides_are_ignored_when_the_config_file_wins(tmp_path) -> None:
     the one thing that would make the built model disagree with its weights."""
     from transformers import AutoConfig
 
-    from llmtuner.trainer import ModelConfig
+    from llmtuner.config import ModelConfig
 
     saved = AutoConfig.for_model(
         "qwen3",

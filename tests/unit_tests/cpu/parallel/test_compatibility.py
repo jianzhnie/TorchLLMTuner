@@ -8,11 +8,11 @@ config-vs-matrix agreement to test anymore because there is only one copy.
 
 import pytest
 
-from llmtuner.parallel import matrix
+from llmtuner.parallel import compatibility
 
 
 def test_every_row_has_a_verdict_reason_and_guard() -> None:
-    for row in matrix.ENTRIES:
+    for row in compatibility.ENTRIES:
         assert row.name == row.fn.__name__
         assert row.reason == row.fn.__doc__.strip()
         assert row.phase in ("assembly", "probe")
@@ -27,25 +27,25 @@ def test_every_guard_function_has_a_row() -> None:
 
     public = {
         n
-        for n, v in vars(matrix).items()
+        for n, v in vars(compatibility).items()
         if inspect.isfunction(v)
-        and v.__module__ == matrix.__name__
+        and v.__module__ == compatibility.__name__
         and not n.startswith("_")
     }
-    assert {r.name for r in matrix.ENTRIES} == public
+    assert {r.name for r in compatibility.ENTRIES} == public
 
 
 def test_config_phase_is_out_of_scope() -> None:
     # Config-phase checks live in config/* __post_init__ (see test_config.py);
     # the matrix carries only the cross-layer verdicts.
-    assert {r.phase for r in matrix.ENTRIES} == {"assembly", "probe"}
+    assert {r.phase for r in compatibility.ENTRIES} == {"assembly", "probe"}
 
 
 def test_guards_point_at_real_files() -> None:
     from pathlib import Path
 
     root = Path(__file__).parents[4] / "llmtuner"
-    for row in matrix.ENTRIES:
+    for row in compatibility.ENTRIES:
         path = row.guard.split("::")[0]
         assert (root / path).is_file(), row.guard
 
@@ -58,30 +58,34 @@ def test_rows_reject_with_their_entry_type() -> None:
         pass
 
     cases = [
-        (matrix.validation_once_requires_dp1, (4,), "data-parallel"),
-        (matrix.validation_once_requires_finite_corpus, (), "infinite synthetic"),
-        (matrix.chunked_loss_pp, (2, 2), "chunked_loss_num_chunks=2"),
-        (matrix.ep_hf_initial_load, (2,), "initial_load_in_hf"),
-        (matrix.chunked_loss_validation, (2,), "chunked_loss_num_chunks=2"),
-        (matrix.pp_weight_tying, (), "tied word embeddings"),
-        (matrix.dsa_pp, (), "DSA"),
-        (matrix.shared_expert_tp, ("layers.0.mlp", _Block()), "shared expert"),
-        (matrix.tp_moe_specs_without_block, (2, _Block()), "no HF MoE block"),
-        (matrix.tp_moe_non_tensor_output, (_Block(), _Block()), "not a bare"),
-        (matrix.quantile_requires_ep, (), "ep=1 never runs"),
-        (matrix.ptrr_load_balancer_backstop, (), "ptrr"),
-        (matrix.gpt_oss_layout, (_Block(),), "bias vectors"),
-        (matrix.group_limited_greedy, (), "single best expert"),
-        (matrix.router_bias, (_Block(),), "router bias"),
-        (matrix.quantile_requires_sigmoid, ("softmax", _Block()), "sigmoid"),
-        (matrix.quantile_no_group_limit, (_Block(),), "group-limited"),
-        (matrix.shared_expert_gate, (_Block(),), "shared_expert_gate"),
-        (matrix.shared_expert_tp_ep, (_Block(),), "tp x ep"),
-        (matrix.pp_packed_microbatch_split, (2,), "packed"),
+        (compatibility.validation_once_requires_dp1, (4,), "data-parallel"),
+        (
+            compatibility.validation_once_requires_finite_corpus,
+            (),
+            "infinite synthetic",
+        ),
+        (compatibility.chunked_loss_pp, (2, 2), "chunked_loss_num_chunks=2"),
+        (compatibility.ep_hf_initial_load, (2,), "initial_load_in_hf"),
+        (compatibility.chunked_loss_validation, (2,), "chunked_loss_num_chunks=2"),
+        (compatibility.pp_weight_tying, (), "tied word embeddings"),
+        (compatibility.dsa_pp, (), "DSA"),
+        (compatibility.shared_expert_tp, ("layers.0.mlp", _Block()), "shared expert"),
+        (compatibility.tp_moe_specs_without_block, (2, _Block()), "no HF MoE block"),
+        (compatibility.tp_moe_non_tensor_output, (_Block(), _Block()), "not a bare"),
+        (compatibility.quantile_requires_ep, (), "ep=1 never runs"),
+        (compatibility.ptrr_load_balancer_backstop, (), "ptrr"),
+        (compatibility.gpt_oss_layout, (_Block(),), "bias vectors"),
+        (compatibility.group_limited_greedy, (), "single best expert"),
+        (compatibility.router_bias, (_Block(),), "router bias"),
+        (compatibility.quantile_requires_sigmoid, ("softmax", _Block()), "sigmoid"),
+        (compatibility.quantile_no_group_limit, (_Block(),), "group-limited"),
+        (compatibility.shared_expert_gate, (_Block(),), "shared_expert_gate"),
+        (compatibility.shared_expert_tp_ep, (_Block(),), "tp x ep"),
+        (compatibility.pp_packed_microbatch_split, (2,), "packed"),
     ]
-    assert len(cases) == len(matrix.ENTRIES)
+    assert len(cases) == len(compatibility.ENTRIES)
     for fn, args, match in cases:
-        entry = next(r for r in matrix.ENTRIES if r.fn is fn)
+        entry = next(r for r in compatibility.ENTRIES if r.fn is fn)
         with pytest.raises(entry.error, match=match):
             fn(*args)
 
@@ -90,9 +94,9 @@ def test_validation_once_rows_are_config_errors() -> None:
     from llmtuner.errors import ConfigError
 
     with pytest.raises(ConfigError):
-        matrix.validation_once_requires_dp1(2)
+        compatibility.validation_once_requires_dp1(2)
     with pytest.raises(ConfigError):
-        matrix.validation_once_requires_finite_corpus()
+        compatibility.validation_once_requires_finite_corpus()
     # ... and therefore still ValueError, for the legacy assertions.
     with pytest.raises(ValueError):
-        matrix.validation_once_requires_dp1(2)
+        compatibility.validation_once_requires_dp1(2)

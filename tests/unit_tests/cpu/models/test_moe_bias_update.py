@@ -13,7 +13,7 @@ Two things are pinned here, and they fail differently:
 
 The collectives are exercised with a size-1 gloo group, so the count is a no-op
 arithmetically but the code path still runs. That is the same fixture shape
-``test_parallel_dims.py`` uses.
+``test_topology.py`` uses.
 """
 
 from __future__ import annotations
@@ -27,14 +27,14 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from llmtuner.models.common.moe.balancing import (
+from llmtuner.models.common.moe.bias_update import (
     register_moe_load_balancing_hook,
     update_expert_bias,
 )
-from llmtuner.models.common.moe.block import MoE, iter_moe_layers
-from llmtuner.models.common.moe.dispatcher import LocalTokenDispatcher
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
-from llmtuner.models.common.moe.router import TokenChoiceTopKRouter
+from llmtuner.models.common.moe.layer import MoE, iter_moe_layers
+from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
+from llmtuner.models.common.moe.token_dispatch import LocalTokenDispatcher
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.expert_parallel import swap_hf_moe_blocks
 

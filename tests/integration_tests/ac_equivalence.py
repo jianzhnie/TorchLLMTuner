@@ -33,11 +33,10 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import all_reduce
-from llmtuner.config import SelectiveACConfig
+from llmtuner.config import ParallelConfig, SelectiveACConfig
 from llmtuner.memory.activation_checkpoint import apply_ac
 from llmtuner.parallel.fully_shard_parallel import apply_fsdp
-from llmtuner.parallel.parallel_dims import ParallelDims
-from llmtuner.trainer import ParallelConfig
+from llmtuner.parallel.topology import ParallelTopology
 
 AC_MODES = ("full", "selective")
 
@@ -109,7 +108,7 @@ def main() -> None:
     assert world == 2, f"this check assumes 2 ranks, got {world}"
 
     cfg = ParallelConfig(data_parallel_replicate_size=2)
-    parallel_dims = ParallelDims.from_config(cfg, world)
+    parallel_dims = ParallelTopology.from_config(cfg, world)
     parallel_dims.build_mesh()
     loss_mesh = parallel_dims.get_mesh("loss")
 

@@ -24,7 +24,7 @@ from llmtuner.components.loss import (
     next_token_targets,
     vocab_shard_bounds,
 )
-from llmtuner.utils.gc import GarbageCollection
+from llmtuner.utils.garbage_collection import GarbageCollection
 
 # -- vocab_shard_bounds -------------------------------------------------------
 

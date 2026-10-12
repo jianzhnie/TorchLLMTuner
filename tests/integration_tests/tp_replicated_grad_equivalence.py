@@ -35,13 +35,13 @@ import torch.nn.functional as F
 from llmtuner.config import ParallelConfig
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.parallel_dims import ParallelDims, build_mesh
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     ColumnParallelLinear,
     ColwiseLinearNoGather,
     RowParallelLinear,
 )
+from llmtuner.parallel.topology import ParallelTopology, build_mesh
 from llmtuner.trainer.trainer import Trainer
 
 SEQ = 16
@@ -87,7 +87,7 @@ def main() -> None:
     assert world == 2, f"this check assumes 2 ranks, got {world}"
     half = SEQ // world
 
-    parallel_dims = ParallelDims(
+    parallel_dims = ParallelTopology(
         dp_replicate=1, dp_shard=1, cp=1, tp=world, pp=1, ep=1, world_size=world
     )
     mesh = build_mesh(parallel_dims)

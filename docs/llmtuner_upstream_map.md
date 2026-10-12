@@ -24,7 +24,7 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `parallel/**` | `distributed/` |
 | `components/metrics.py` | `observability/metrics.py` |
 | `models/common/scatter_add.py` | `ops/scatter_add.py` |
-| `parallel/pipeline_parallel/pipeline.py` | `experiments/transformers_modeling_backend/pipeline.py` |
+| `parallel/pipeline_parallel/partition.py` | `experiments/transformers_modeling_backend/pipeline.py` |
 | `datasets/text/processors.py` | `hf_datasets/text_datasets.py` |
 | `components/checkpointer/filesystem.py` | `tools/filesystem.py` |
 
@@ -55,7 +55,7 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `components/checkpointer/filesystem.py` | `tools/filesystem.py` | 1.000 |
 | `components/optimizer/utils.py` | `components/optimizer/utils.py` | 0.996 |
 | `datasets/multimodal/image.py` | `hf_datasets/multimodal/utils/image.py` | 0.977 |
-| `datasets/multimodal/text.py` | `hf_datasets/multimodal/utils/text.py` | 0.971 |
+| `datasets/multimodal/placeholders.py` | `hf_datasets/multimodal/utils/text.py` | 0.971 |
 | `datasets/multimodal/video.py` | `hf_datasets/multimodal/utils/video.py` | 0.967 |
 | `components/tokenizer.py` | `components/tokenizer.py` | 0.907 |
 
@@ -73,14 +73,14 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `components/optimizer/optimizer.py` | `components/optimizer/optimizer.py` | 0.240 | 容器化改写；`OptimizerWrapper` 已删 |
 | `components/profiler.py` | `observability/profiler.py` | 0.413 | |
 | `datasets/collators.py` | `components/data/collators.py` | 0.145 | |
-| `datasets/dataset.py` | `components/data/dataset.py` | 0.267 | 去 `Configurable`；三个节点类去 `Config` 后缀，构建走自由函数 `build_dataset` |
-| `datasets/loader.py` | `components/data/loader.py` | 0.590 | 去 `Configurable`；`GrainDataLoader` 直接收参数，无 config 类 |
+| `datasets/graph.py` | `components/data/dataset.py` | 0.267 | 去 `Configurable`；三个节点类去 `Config` 后缀，构建走自由函数 `build_dataset` |
+| `datasets/dataloader.py` | `components/data/loader.py` | 0.590 | 去 `Configurable`；`GrainDataLoader` 直接收参数，无 config 类 |
 | `datasets/multimodal/collator.py` | `hf_datasets/multimodal/mm_collator.py` | 0.777 | 增加 MRoPE grid/run/长度校验，当前已是契约适配 |
 | `datasets/multimodal/datasets.py` | `hf_datasets/multimodal/mm_datasets.py` | 0.310 | 去 `Configurable`；packing 改自由函数 `build_mm_sample_packing` |
 | `datasets/packing/`（`build`/`conversions`/`iterators`） | `components/data/packing.py` | 0.065 | 自由函数外还增加文档容量、padding mask、长文档切分和可恢复 remainder，按语义维护 |
 | `datasets/sources.py` | `components/data/sources.py` | 0.700 | |
 | `datasets/text/processors.py` | `hf_datasets/text_datasets.py` | 0.767 | 路径与 processor 构造契约已适配 |
-| `datasets/types.py` | `components/data/types.py` | 0.506 | 去 Configurable 后重塑 build context 与 iteration policy |
+| `datasets/contracts.py` | `components/data/types.py` | 0.506 | 去 Configurable 后重塑 build context 与 iteration policy |
 | `models/common/aux_loss.py` | `models/common/aux_loss.py` | 0.682 | |
 | `models/common/async_linear.py` | `models/common/async_linear.py` | 0.527 | **parity 保留**：DistGEMM* 模块层依赖 QKV/FFN vendored 部件，唯一接线方式是替换 HF 自带部件（违反五部件契约），无生产消费者；不删，作为上游对照参考 |
 | `models/common/feed_forward.py` | `models/common/feed_forward.py` | 0.560 | parity 保留：HF 自带 FFN，无生产消费者 |
@@ -91,12 +91,12 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `models/common/attention/qkv.py` | `models/common/attention.py` | 0.242 | parity 保留（HF 自带 attention 投影，无生产消费者） |
 | `models/common/rope.py` | `models/common/rope.py` | 0.616 | 上游持续重构后结构已分叉；同步公式与边界修复，不同步 Module/缓存形状；parity 保留（wrapper 的 rotary_emb 是 HF 自带的） |
 | `models/common/scatter_add.py` | `ops/scatter_add.py` | 0.711 | |
-| `models/common/moe/dispatcher.py` | `models/common/token_dispatcher.py` | 0.441 | 含 `TorchAOTokenDispatcher` 可选导入适配层（torchao `permute_and_pad` 委托，未装 loud-raise）；DeepEP/HybridEP 保持登记缺口，见 D 表 |
+| `models/common/moe/token_dispatch.py` | `models/common/token_dispatcher.py` | 0.441 | 含 `TorchAOTokenDispatcher` 可选导入适配层（torchao `permute_and_pad` 委托，未装 loud-raise）；DeepEP/HybridEP 保持登记缺口，见 D 表 |
 | `memory/activation_checkpoint.py` | `distributed/activation_checkpoint.py` | 0.374 | **FullAC + SelectiveAC + MemoryBudgetAC 已移植**（后者按上游语义设 `torch._functorch.config.activation_memory_budget`，需 compile，torch 无该 knob 时 loud-raise）；RegionAC 已接入（`region_ac` + `memory/remat_regions.py`，声明通道以 HF block 的 `nn.Linear` FQN 结构等价替代上游 `Module.configure_remat_regions`，受限项只有上游自带的 torch_remat 需 torch ≥ 2.10，apply 期 loud-raise） |
 | `parallel/fully_shard/fsdp.py` | `distributed/fsdp.py` | 0.815 | 多轴 mesh 重建、HF decoder 与 MoE placement 是 llmtuner 适配 |
-| `parallel/parallel_dims.py` | `distributed/parallel_dims.py` | 0.772 | llmtuner 扩展 world/loss/sparse mesh 视图，不能按旧 A1 结构覆盖；mesh 构建（`build_parallel_dims` / `build_mesh`）也在此文件，上游无单一对应物（mesh 逻辑散在 `distributed/parallel_dims.py` 与 `trainer.py`） |
-| `parallel/pipeline_parallel/pipeline.py` | `experiments/transformers_modeling_backend/pipeline.py` | 0.686 | `None` → `nn.Identity`；每 stage 追加 `rotary_emb`；stage 内 layer 保留原始索引（不重新编号），避免多 stage state-dict FQN 冲突 |
-| `parallel/tensor_parallel/linear.py` | `models/common/async_linear.py`（上游 `distributed/linear.py` 的后继，数学不变） | 0.511 | 保留 fused/fallback 数学意图，但运行时上下文和 autograd 形状已适配 llmtuner |
+| `parallel/topology.py` | `distributed/topology.py` | 0.772 | llmtuner 扩展 world/loss/sparse mesh 视图，不能按旧 A1 结构覆盖；mesh 构建（`build_parallel_topology` / `build_mesh`）也在此文件，上游无单一对应物（mesh 逻辑散在 `distributed/topology.py` 与 `trainer.py`） |
+| `parallel/pipeline_parallel/partition.py` | `experiments/transformers_modeling_backend/pipeline.py` | 0.686 | `None` → `nn.Identity`；每 stage 追加 `rotary_emb`；stage 内 layer 保留原始索引（不重新编号），避免多 stage state-dict FQN 冲突 |
+| `parallel/tensor_parallel/linear_ops.py` | `models/common/async_linear.py`（上游 `distributed/linear.py` 的后继，数学不变） | 0.511 | 保留 fused/fallback 数学意图，但运行时上下文和 autograd 形状已适配 llmtuner |
 | `accelerator/collectives.py` | `distributed/utils.py`（vendored `set_pg_timeouts` 与 EP 感知 `clip_grad_norm_` 两个符号） | 部分 | EP 裁剪按物理本地 expert 参数适配（免 DTensor "ep" 轴断言） |
 
 ## B —— 适配层（读意图，不要抄形状）
@@ -109,18 +109,18 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `models/hf/model.py`（+ `models/hf/factory.py` 构建侧、`models/hf/flops.py` 算术侧） | `experiments/transformers_modeling_backend/model.py` 的包装层；上游另有 `models/*/model.py` 各一份 | 0.059 |
 | `models/hf/state_dict_adapter.py` | `experiments/transformers_modeling_backend/state_dict_adapter.py`；llmtuner 更强：读 safetensors index 做 missing/unexpected 严格校验；上游的 `hf_to_titan_moe_state_dict` 转换对因 llmtuner EP swap 直接搬运 HF 权重（无第二 key 布局）而不需要 | — |
 | `parallel/parallelize.py` | `experiments/transformers_modeling_backend/parallelize.py` + 各 `models/*/parallelize.py` | 0.089 |
-| `parallel/tensor_parallel/tp.py`（+ `apply.py` 入口） | 各模型 TP plan；上游的 TP 声明层已随 DTensor 后端迁到 `protocols/sharding.py` + 各模型 `*_sharding.py`，旧的 `distributed/tensor_parallel.py` 于 `7e7f271e0` 删除。llmtuner 是**手写 plan realizer**，对应上游的声明式 `_sharding_config` 面（逐项对应见本文「TP/SP 对齐结论」） | 0.056 |
+| `parallel/tensor_parallel/tensor_parallel.py`（+ `apply.py` 入口） | 各模型 TP plan；上游的 TP 声明层已随 DTensor 后端迁到 `protocols/sharding.py` + 各模型 `*_sharding.py`，旧的 `distributed/tensor_parallel.py` 于 `7e7f271e0` 删除。llmtuner 是**手写 plan realizer**，对应上游的声明式 `_sharding_config` 面（逐项对应见本文「TP/SP 对齐结论」） | 0.056 |
 | `parallel/expert_parallel/apply.py` + `swap.py` | `experiments/.../moe_replacement.py` + 各模型 EP parallelize；llmtuner 搬运 HF 权重而非重新初始化 | 0.036–0.146 |
 | `parallel/fully_shard/apply.py` | 各 `models/*/parallelize.py` 的 FSDP driver；HF 五部件适配 | 0.155 |
-| `parallel/pipeline_parallel/apply.py` | `distributed/pipeline_parallel.py`；llmtuner 直接消费 HF stage 部件 | 0.130 |
+| `parallel/pipeline_parallel/pipeline_parallel.py` | `distributed/pipeline_parallel.py`；llmtuner 直接消费 HF stage 部件 | 0.130 |
 | `trainer/trainer.py` | `trainer.py`，基本重写 | 0.065 |
 | `config/`（顶层配置包） | `config/configs.py` | 0.189 |
-| `trainer/train.py` | `train.py` | 0.186 |
+| `trainer/cli.py` | `train.py` | 0.186 |
 | `models/common/moe/experts.py` | `models/common/grouped_experts.py` + `models/gpt_oss/moe.py` | 0.119 |
-| `utils/gc.py` | `tools/utils.py` 的 GC helper，去 structured logger | 0.211 |
+| `utils/garbage_collection.py` | `tools/utils.py` 的 GC helper，去 structured logger | 0.211 |
 
-**注意 mesh 构建**：mesh 构建逻辑在 `parallel/parallel_dims.py`（`build_parallel_dims` /
-`build_mesh`），上游没有单一对应物——mesh 逻辑散在 `distributed/parallel_dims.py` 和
+**注意 mesh 构建**：mesh 构建逻辑在 `parallel/topology.py`（`build_parallel_topology` /
+`build_mesh`），上游没有单一对应物——mesh 逻辑散在 `distributed/topology.py` 和
 `trainer.py` 里。整文件按 A2 分类（见上表），mesh 构建这一段记在该行的"改写点"里，
 不另占一个分类行。
 
@@ -128,27 +128,27 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 
 | llmtuner | 说明 |
 | --- | --- |
-| `accelerator/spmd_context.py` | `spmd_types` pip 包的**独立活跃适配层**，由 trainer 和 `models/common/*` 使用 |
-| `parallel/context_parallel/apply.py` | 0.058；CP 的编排层，上游无对应文件 |
-| `parallel/context_parallel/cp_kernel.py` | 0.051；llmtuner 独有的 CP flex kernel |
-| `parallel/context_parallel/input_shard.py` | 0.078 |
-| `utils/logger_utils.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤，默认 INFO）、`get_distributed_rank` | C |
+| `accelerator/spmd.py` | `spmd_types` pip 包的**独立活跃适配层**，由 trainer 和 `models/common/*` 使用 |
+| `parallel/context_parallel/context_parallel.py` | 0.058；CP 的编排层，上游无对应文件 |
+| `parallel/context_parallel/attention.py` | 0.051；llmtuner 独有的 CP flex kernel |
+| `parallel/context_parallel/input_sharding.py` | 0.078 |
+| `utils/logging.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤，默认 INFO）、`get_distributed_rank` | C |
 | `utils/monitoring.py` | 与 `tools/utils.py` 0.107，独立实现（含 `get_peak_flops`） |
 | `components/checkpointer/checkpoint_keys.py` | 上游无 |
 | `accelerator/device.py` | 上游无（0.382 是噪音，命中实验目录） |
 | `models/common/activation.py` | 与上游同名但不同源；公式由 llmtuner 自持，不能按 A 类覆盖 |
 | `models/common/embedding.py` | 与上游同名但不同源；包含 llmtuner 的 vocab-shard 契约；Embedding 类 parity 保留（HF 自带 tok_embeddings；vocab-shard 公式由 components/loss.py 自持） |
-| `datasets/random_data.py` | 合成语料，上游无 |
-| `datasets/build.py` | 工厂；上游把 `build()` 放在 config 上 |
-| `accelerator/dist_utils.py` | vendored 自 OpenMMLab `mmengine.dist`（**不是 torchtitan 来源**），已去 mmengine 化，设备谓词与后端表统一由同包的 `accelerator/device.py` 提供；不进 trainer 装配路径。按「能力缺口」对照上游 `distributed/utils.py` 的结论是**无缺口**——上游的 `dist_sum`/`dist_max`/`dist_mean`/`dist_sum_tensor` 在 llmtuner 侧是 `accelerator/collectives.py::all_reduce`（调用点 clone + in-place），`set_pg_timeouts`/`clip_grad_norm_` 同文件，仅有的 `init_distributed`/fake 后端差异单列于 D 表 |
+| `datasets/synthetic.py` | 合成语料，上游无 |
+| `datasets/factory.py` | 工厂；上游把 `build()` 放在 config 上 |
+| `accelerator/distributed.py` | vendored 自 OpenMMLab `mmengine.dist`（**不是 torchtitan 来源**），已去 mmengine 化，设备谓词与后端表统一由同包的 `accelerator/device.py` 提供；不进 trainer 装配路径。按「能力缺口」对照上游 `distributed/utils.py` 的结论是**无缺口**——上游的 `dist_sum`/`dist_max`/`dist_mean`/`dist_sum_tensor` 在 llmtuner 侧是 `accelerator/collectives.py::all_reduce`（调用点 clone + in-place），`set_pg_timeouts`/`clip_grad_norm_` 同文件，仅有的 `init_distributed`/fake 后端差异单列于 D 表 |
 | `trainer/seed.py` | 上游 `distributed/utils.py::set_determinism` 的 distinct-seed 派生公式的纯函数提取（仅该项，非全文件移植）；DTensor RNG tracker 不移植。`Trainer.seed_everything` 还含 `PYTHONHASHSEED = str(seed % 2**32)`（为后续 spawn 的 dataloader worker 而设）与 `detect_anomaly`（`torch.autograd.set_detect_anomaly(True, check_nan=False)` + 上游同文告警），落点为 `TrainingConfig.detect_anomaly`；不移植的仍是只服务上游自有栈的两件（DTensor mesh-aware RNG tracker、flex-attention 确定性内核调优） |
 
 ## D —— 真正缺失
 
 | 上游 | 影响 |
 | --- | --- |
-| `distributed/compile.py` | **已移植**：逐 block compile、async TP `_micro_pipeline_tp`、`regional_inductor`、`capture_scalar_outputs` 四件全部落 `llmtuner/parallel/compile.py` + `CompileConfig`，见下"已从 D 移除" |
-| `models/common/moe_sharding.py` | **部分移除**。其载荷 MoE-under-TP 已在 `parallel/tensor_parallel/tp.py` 落 B 类适配：HF plan 的 `packed_colwise`/`packed_rowwise`/`moe_tp_experts` 规格不再 raise，专家权重沿 F 维原地切分、router Replicate、块边界 AG/RS 对偶 collective；**tp×ep 按上游语义放行**（TP 只切 dense、EP 独占 routed 专家沿 E 切、router Replicate，`apply_tp` 在 ep>1 时把块留给 swap，专家梯度排除由 `tp_sharded_param_ids` 统一判定；shared-expert×tp 保持 loud-raise；tp×ep×cp 放行（上游 release 套件实测 MoE FSDP+TP+EP+CP，对齐通过；真多卡数值等价测试 tests/integration_tests/tp_ep_cp_equivalence.py 待 torch≥2.12 多卡复跑）。pp×ep / pp×cp 同样解锁（上游 native 路径按 model part 装配、sparse mesh 带 pp 轴；dense CP+PP 在 release CI），等价脚本 pp_ep_equivalence.py / pp_cp_equivalence.py 待复跑。声明层+装配层就位并有 CPU 单测，但真多卡前后向等价性**环境未覆盖**（见"版本与漂移"），待 torch≥2.12 多卡复跑后方可视为完整移除。见下"已从 D 移除（部分）" |
+| `distributed/compile.py` | **已移植**：逐 block compile、async TP `_micro_pipeline_tp`、`regional_inductor`、`capture_scalar_outputs` 四件全部落 `llmtuner/parallel/model_compile.py` + `CompileConfig`，见下"已从 D 移除" |
+| `models/common/moe_sharding.py` | **部分移除**。其载荷 MoE-under-TP 已在 `parallel/tensor_parallel/tensor_parallel.py` 落 B 类适配：HF plan 的 `packed_colwise`/`packed_rowwise`/`moe_tp_experts` 规格不再 raise，专家权重沿 F 维原地切分、router Replicate、块边界 AG/RS 对偶 collective；**tp×ep 按上游语义放行**（TP 只切 dense、EP 独占 routed 专家沿 E 切、router Replicate，`apply_tp` 在 ep>1 时把块留给 swap，专家梯度排除由 `tp_sharded_param_ids` 统一判定；shared-expert×tp 保持 loud-raise；tp×ep×cp 放行（上游 release 套件实测 MoE FSDP+TP+EP+CP，对齐通过；真多卡数值等价测试 tests/integration_tests/tp_ep_cp_equivalence.py 待 torch≥2.12 多卡复跑）。pp×ep / pp×cp 同样解锁（上游 native 路径按 model part 装配、sparse mesh 带 pp 轴；dense CP+PP 在 release CI），等价脚本 pp_ep_equivalence.py / pp_cp_equivalence.py 待复跑。声明层+装配层就位并有 CPU 单测，但真多卡前后向等价性**环境未覆盖**（见"版本与漂移"），待 torch≥2.12 多卡复跑后方可视为完整移除。见下"已从 D 移除（部分）" |
 | `components/optimizer/ema.py`（515 行） | **已移植**（`llmtuner/components/optimizer/ema.py`）：在线 EMA 模型平均，config/trainer/checkpointer 三侧接线完成，见下"已从 D 移除" |
 | `components/optimizer/optimizer.py` 的 `implementation="fused_opt_states_bf16"`（+ `_register_bf16_optimizer_state_hook`） | **登记缺口**：上游第四种实现模式用 Adam 的 step pre-hook 预建 bf16 `exp_avg`/`exp_avg_sq`（fused CUDA 核据此走 fp32 参数+bf16 状态的混合精度路径，省一半优化器状态显存），再用 `register_load_state_dict_post_hook` 在 DCP 载入后把被 torch 转回参数 dtype 的状态重新降为 bf16。llmtuner 的 `implementation` 只声明 `fused`/`foreach`/`for-loop`（配置期即 Literal 拒绝，装配期 `_build_impl_kwargs` 再兜一道 `ValueError`）。不移植的理由是**不可验证**：它的全部价值来自那个 CUDA fused 核，本机无 CUDA 也无从复现上游的显存收益；同时它改写 checkpoint 里 Adam 状态的 dtype，属续训兼容敏感面，盲写风险高于收益。解锁条件：CUDA 目标设备 + 确有优化器状态显存诉求；届时实现要点即上面两条 hook（上游 `components/optimizer/optimizer.py:339` 起） |
 | `components/optimizer/optimizer.py` 的 `optimizer_factory_kwargs_by_name` | **登记缺口（无消费者）**：上游用它把「实例级对象」——per-parameter compute metadata、通信 bucket 规格——按 optimizer 名传进工厂，而它现在的两个消费者（`DistMuon`、Float8 系优化器）都在 llmtuner 裁剪面内（前者属已在 C 类登记为范围外的 `distributed/flex_shard/`）。按本仓"有调用者再补"的口径不预置字段；补 `DistMuon` 时一并加 |
@@ -156,18 +156,18 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 
 | Ulysses CP × varlen/packed（baff3c681） | **已移植**：`apply_cp` 不再 fail-fast，wrapper 全长透传文档 mask、kernel 按 mask Q 长度分派，见下"已从 D 移除" |
 | 多轮对话 SFT 的 renderer 路径（4a0d8dab3） | **已适配为可选路径**：不引入硬依赖、不复制 Configurable 外形。`datasets/text/renderer.py` 为可选导入适配层（`build_chat_renderer` + `RendererTokenizerWrapper`），`ChatProcessor(renderer=...)` 走多-turn renderer 分支，`--chat_renderer`/`--messages_field` 接线 `local_jsonl_sft`；未装 `renderers` 时启用 loud-raise（ImportError 带安装指引），默认关闭逐位不变。真实库数值**未验证**（本机无 renderers，单测以 fake 模块覆盖接口与 mask 移位语义）；解锁条件：pyproject 加 optional extra `renderers==0.1.11` 后装包复跑 |
-| `models/common/moe/dispatcher.py` 的 DeepEP/HybridEP 两个 dispatcher | 登记缺口：CUDA-only（`deep_ep`/`hybridep` 内核 + GB200/NVLink72 假设）且 dispatch/combine 经上游 `distributed/deepep/` wrappers（1155 行）驱动，可选导入无法忠实表达契约，故不 vendor；`ParallelConfig.ep_token_dispatcher="deepep"/"hybridep"` 配置期 NotImplementedError（含解锁条件），swap 入口防御性同语义。解锁条件：vendor 上游 wrappers + pyproject 加 CUDA-only optional extra + CUDA 目标设备复跑数值。`AllToAllTokenDispatcher` 满足同一 dispatch/combine 契约 |
-| `models/common/moe/dispatcher.py` 的 `TorchAOTokenDispatcher` | **已适配为可选导入适配层**：torchao 不进 pyproject、不复制上游 Config 嵌套。`TorchAOTokenDispatcher(num_experts, top_k, pad_multiple)` 继承 `AllToAllTokenDispatcher`，仅 `_permute`/`_unpermute` 改委托 torchao `permute_and_pad`（expert-major 重排 + 每组 pad 到 `pad_multiple`，EP=1 本地 padded permute 路径一并移植），构造期 lazy import，未装 torchao loud-raise ImportError（带 `pip install torchao` 指引）；`ParallelConfig.ep_token_dispatcher="torchao"` + `ep_torchao_pad_multiple`（默认 16=FP8）接线 `apply_ep` → swap，默认 `alltoall` 逐位不变。数值**环境未覆盖**（本机无 torchao/CUDA，单测以 sys.modules fake 覆盖 sentinel-row padding 契约与 EP=1 combine 等价性）；解锁条件：CUDA 目标设备装 torchao 复跑 |
+| `models/common/moe/token_dispatch.py` 的 DeepEP/HybridEP 两个 dispatcher | 登记缺口：CUDA-only（`deep_ep`/`hybridep` 内核 + GB200/NVLink72 假设）且 dispatch/combine 经上游 `distributed/deepep/` wrappers（1155 行）驱动，可选导入无法忠实表达契约，故不 vendor；`ParallelConfig.ep_token_dispatcher="deepep"/"hybridep"` 配置期 NotImplementedError（含解锁条件），swap 入口防御性同语义。解锁条件：vendor 上游 wrappers + pyproject 加 CUDA-only optional extra + CUDA 目标设备复跑数值。`AllToAllTokenDispatcher` 满足同一 dispatch/combine 契约 |
+| `models/common/moe/token_dispatch.py` 的 `TorchAOTokenDispatcher` | **已适配为可选导入适配层**：torchao 不进 pyproject、不复制上游 Config 嵌套。`TorchAOTokenDispatcher(num_experts, top_k, pad_multiple)` 继承 `AllToAllTokenDispatcher`，仅 `_permute`/`_unpermute` 改委托 torchao `permute_and_pad`（expert-major 重排 + 每组 pad 到 `pad_multiple`，EP=1 本地 padded permute 路径一并移植），构造期 lazy import，未装 torchao loud-raise ImportError（带 `pip install torchao` 指引）；`ParallelConfig.ep_token_dispatcher="torchao"` + `ep_torchao_pad_multiple`（默认 16=FP8）接线 `apply_ep` → swap，默认 `alltoall` 逐位不变。数值**环境未覆盖**（本机无 torchao/CUDA，单测以 sys.modules fake 覆盖 sentinel-row padding 契约与 EP=1 combine 等价性）；解锁条件：CUDA 目标设备装 torchao 复跑 |
 | DSA（DeepSeek sparse attention）的稠密 additive mask 路径 | **已移植**：`models/common/attention/masks.py::build_dense_attention_mask` + `models/hf/model.py::get_attention_masks` 的 DSA 分支，与上游 `_build_dense_attention_mask` 逐行等价（causal / block_causal 两种 `attn_mask_type`）；flex 照旧运行并按 mask 类型当 `score_mask`（HF 集成分支）。**未覆盖**：真 DSA 模型端到端（transformers 的 DSA 家族需 torch≥2.4 才能建模型）与 CP×DSA / PP×DSA（两者显式拒绝；PP 拒绝是因为非首 stage 的 embedding 已置 Identity，稠密 mask 建不出） |
-| 单进程模拟多卡的 debug 后端（`comm.backend` 的 `fake` / `real_pp_fake_spmd`，`DistributedTopology`） | 登记缺口：上游用 torch 的 `backend="fake"` 建一个"逻辑世界"，可在单进程内模拟任意 world_size 的 mesh（`real_pp_fake_spmd` 再叠一个真实 PP 组，供 PP 边通信）；llmtuner 只有 `world_size == 1 → parallel_dims is None` 与真多卡两条路，单机并行验证走 gloo + torchrun 集成测试。解锁条件：torch 提供 `backend="fake"`（本机 2.2.2 无此 backend）+ 决定给 `accelerator/dist_utils.py` 加一条 debug 后端；届时 mesh 构造无需改动（`build_mesh` 已是 `world_size` 驱动）。经评估**不引入** fake 后端与 `DistributedTopology`，保留本条为登记缺口 |
-| vocab-sharded `lm_head` + 端到端 vocab-parallel loss | **D 类，两步走，第一步已完成**。第二步（模型侧）未实现：上游 HF 路径把 `lm_head` 的 weight/bias 沿 vocab 维 `S(0)` 切、输入从 sequence-parallel gather 回全长、输出 `S(-1)`（vocab 分片），core `cross_entropy_loss` 检测到分片后走 vocab-parallel CE（`hf_sharding.py` 的 `lm_head` 段）。llmtuner 仍把 HF plan 的 `colwise_gather_output` 解析为 None、`lm_head` 保持复制（`tensor_parallel/tp.py::resolve_plan`）。**第一步（loss 侧接线，已完成）**：`Trainer.loss_vocab_kwargs()` + `HFTransformerModel.vocab_size` 把 `tp_group`/`global_vocab_size` 送到四个调用点（`Trainer.loss_sum`、`chunked_lm_head_cross_entropy`、PP `scalar_loss_fn`、Validator），`components/loss.py` 按形状分派，因此复制 head 下逐位不变；第二步（vocab-shard realizer + head 已分片但 loss 未被告知时 loud-raise）在多卡环境复跑后再做。 |
+| 单进程模拟多卡的 debug 后端（`comm.backend` 的 `fake` / `real_pp_fake_spmd`，`DistributedTopology`） | 登记缺口：上游用 torch 的 `backend="fake"` 建一个"逻辑世界"，可在单进程内模拟任意 world_size 的 mesh（`real_pp_fake_spmd` 再叠一个真实 PP 组，供 PP 边通信）；llmtuner 只有 `world_size == 1 → parallel_dims is None` 与真多卡两条路，单机并行验证走 gloo + torchrun 集成测试。解锁条件：torch 提供 `backend="fake"`（本机 2.2.2 无此 backend）+ 决定给 `accelerator/distributed.py` 加一条 debug 后端；届时 mesh 构造无需改动（`build_mesh` 已是 `world_size` 驱动）。经评估**不引入** fake 后端与 `DistributedTopology`，保留本条为登记缺口 |
+| vocab-sharded `lm_head` + 端到端 vocab-parallel loss | **D 类，两步走，第一步已完成**。第二步（模型侧）未实现：上游 HF 路径把 `lm_head` 的 weight/bias 沿 vocab 维 `S(0)` 切、输入从 sequence-parallel gather 回全长、输出 `S(-1)`（vocab 分片），core `cross_entropy_loss` 检测到分片后走 vocab-parallel CE（`hf_sharding.py` 的 `lm_head` 段）。llmtuner 仍把 HF plan 的 `colwise_gather_output` 解析为 None、`lm_head` 保持复制（`tensor_parallel/tensor_parallel.py::resolve_plan`）。**第一步（loss 侧接线，已完成）**：`Trainer.loss_vocab_kwargs()` + `HFTransformerModel.vocab_size` 把 `tp_group`/`global_vocab_size` 送到四个调用点（`Trainer.loss_sum`、`chunked_lm_head_cross_entropy`、PP `scalar_loss_fn`、Validator），`components/loss.py` 按形状分派，因此复制 head 下逐位不变；第二步（vocab-shard realizer + head 已分片但 loss 未被告知时 loud-raise）在多卡环境复跑后再做。 |
 
 **已从 D 移除（部分）**：`models/common/moe_sharding.py`——上游该文件是
 声明层：`ShardingConfig` 声明 router 参数 TP Replicate、routed 专家权重仅在 EP 开时
 沿专家维 E 取 placement（DP_REPLICATE/EFSDP 为 R,EP 为 S(0)），由上游 Module 协议
 的 parallelize 引擎消费。llmtuner 按 B 类语义适配，不复制其 Config 协议：MoE-under-TP
 的声明改由 HF tp_plan 的 `packed_colwise`/`packed_rowwise`/`moe_tp_experts` 规格承载
-（`resolve_plan` 解析为 None），执行落在 `parallel/tensor_parallel/tp.py` 的结构路
+（`resolve_plan` 解析为 None），执行落在 `parallel/tensor_parallel/tensor_parallel.py` 的结构路
 径——`shard_experts_for_tp`（`down_proj (E,D,F)` 切 dim 2，`gate_up_proj (E,2F,D)`
 gate/up 两半各自切 dim 1,router 不动）+ `TPMoeSequenceBoundary`（`__class__` swap
 安装块边界 sequence all-gather / reduce-scatter，与 dense TP 同一对偶契约，序列维
@@ -181,7 +181,7 @@ swap,swap 后的原生 MoE 直接消费/产出 T/tp 序列分片，即上游 ep+
 sequence-parallel 布局，无边界 collective);trainer 的排除判定抽为模块级
 `tp_sharded_param_ids`（三类：dense TP realizer、MoE-under-TP 的 F 分片（按名解析）、EP 的
 `GroupedExperts` E 切片；EP 专家梯度按 rank 完备，跨 TP 求和会混不同专家的梯度）。
-组合矩阵终态（config 期校验在各 config `__post_init__`，跨层裁决单一来源 `parallel/matrix.py`）：tp>1×ep>1（cp=1）放行；tp>1×ep>1×cp>1 在
+组合矩阵终态（config 期校验在各 config `__post_init__`，跨层裁决单一来源 `parallel/compatibility.py`）：tp>1×ep>1（cp=1）放行；tp>1×ep>1×cp>1 在
 `ParallelConfig.__post_init__` fail-fast（未验证）;shared-expert 块 ×tp:gate/up/down 布局放行（`shard_shared_expert_for_tp` F 维分片，边界内无 collective；非标准布局如 Qwen2Moe 门控仍 loud-raise)；tp×ep×shared 在 swap `convert_block` 处 loud-raise。MoE 块内部一律排除出 dense realizer 的 targets（避免 shared_experts 投影被再包一层 ColumnParallelLinear/RowParallelLinear 造成 F/tp² 双重切分）;plan 声明 MoE 规格但
 探针找不到块（ep=1）loud-raise;GPT-OSS 布局 loud-raise。aux loss / padding-mask
 LB / quantile hook 的归约轴按 ep_enabled 含 tp 书写，放行后不重复计数。测试
@@ -212,7 +212,7 @@ flex 模块，**环境未覆盖，待 torch≥2.12 + 目标设备复跑**；单�
 Ulysses 拒绝（per-head sinks 只走 TP 分片）不适用：llmtuner 尚无 GPT-OSS 支持。
 
 **已从 D 移除**：`distributed/compile.py`——四件互相独立的
-能力全部落 `llmtuner/parallel/compile.py::apply_compile`，由
+能力全部落 `llmtuner/parallel/model_compile.py::apply_compile`，由
 `config/compile.py::CompileConfig`（`training.compile_config`，默认全关）驱动，
 装配顺序不变（AC 之后、FSDP 之前；PP 下每 chunk 由
 `parallel/parallelize.py::parallelize_hf_transformers` 过同一函数）：
@@ -249,7 +249,7 @@ Ulysses 拒绝（per-head sinks 只走 TP 分片）不适用：llmtuner 尚无 G
 **已从 D 移除**：`pipeline_with_first_stage_modules`——
 多模态 first-stage 模块并入 stage 0，落为 `apply_pp` 的可选关键字参数
 `first_stage_module_fqns: Sequence[str] | None`（默认 None，默认时切分与
-state-dict 键逐位不变）+ `parallel/pipeline_parallel/apply.py::
+state-dict 键逐位不变）+ `parallel/pipeline_parallel/pipeline_parallel.py::
 prepend_first_stage_modules`（仅作用于自动生成的切分，把存在的 FQN 按序前插
 stage 0；已被切分占有的 FQN 与重复 FQN loud-raise，缺失模块跳过；显式
 `module_fqns_per_model_part` 给定时忽略并告警，与上游委托语义一致）。配套改动
@@ -262,7 +262,7 @@ stage 0；已被切分占有的 FQN 与重复 FQN loud-raise，缺失模块跳�
 接线），属"能力就位 + 契约测试"；多 stage 真跑待目标设备（torch≥2.12）复跑。
 
 **已从 D 移除**：validation 循环——上游
-`components/validate.py::Validator` 落 `trainer/validate.py`
+`components/validate.py::Validator` 落 `trainer/runtime/validation.py`
 （`Trainer.validate`/`should_validate`/`check_validation_feasibility` 的
 薄委托背后）+
 `config/validation.py::ValidationConfig`（`training.validation_config`，默认
@@ -275,7 +275,7 @@ checkpoint save 之后、profiler.step 之前，与上游同序。两条上游 b
 移植：零 batch / 零有效 token 报 `ValueError`（上游 6c2dadbb3），dp>1 拒绝
 `steps=-1`（上游 90b25912f，在 trainer 构造期、真实 dp degree 已知后检查）；
 另对 random 无限语料的 `steps=-1` 同样 fail-fast。PP × validation 已支持：
-`trainer/validate.py::validate_body_pp` 驱动 schedule 的 eval 通路（与上游
+`trainer/runtime/validation.py::run_pipeline_validation_loop` 驱动 schedule 的 eval 通路（与上游
 `pp_schedule.eval` 同 seam）。
 
 **已从 D 移除**：quantile-balanced MoE routing——
@@ -301,7 +301,7 @@ DTensor unwrap/rewrap 与 CUDA `torch._foreach_lerp_` 专项未移植（llmtuner
 变换，落 `models/common/cast_linear.py`（`nn.Linear` 子类，state-dict FQN 不变），
 经 `ModelConfig.compute_dtype` 启用，默认关闭；router `_debug_force_load_balance`
 ——落 `TokenChoiceTopKRouter` 同名构造参数，round-robin 语义与上游逐字一致；
-PP per-stage seed——`trainer/builder.py` 的 `derive_distinct_seed`（上游
+PP per-stage seed——`trainer/runtime/assembly.py` 的 `derive_distinct_seed`（上游
 `distinct_seed_mesh_dims=["pp"]` 同公式），trainer 在 `pp_enabled` 时按 stage rank
 偏移，pp=1 逐位不变；DTensor RNG tracker 不移植（初始化走 materialize 路径）。
 
@@ -382,16 +382,16 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
 
 | 面 | llmtuner | 上游 | 判定 |
 | --- | --- | --- | --- |
-| 声明形态 | `parallel/tensor_parallel/tp.py` 的 `ShardingConfig` + `resolve_plan`（消费 HF `tp_plan` 的规格字符串） | `protocols/sharding.py::ShardingConfig` 挂在模块 `_sharding_config` 上，由 `Module._parallelize` 分发 | **等价（形态不同）**：两者都是"权重切分 + 激活布局"的声明，llmtuner 的词汇表来自 HF |
+| 声明形态 | `parallel/tensor_parallel/tensor_parallel.py` 的 `ShardingConfig` + `resolve_plan`（消费 HF `tp_plan` 的规格字符串） | `protocols/sharding.py::ShardingConfig` 挂在模块 `_sharding_config` 上，由 `Module._parallelize` 分发 | **等价（形态不同）**：两者都是"权重切分 + 激活布局"的声明，llmtuner 的词汇表来自 HF |
 | colwise | `ColumnParallelLinear`：weight 切 dim 0，融合 all-gather 入、输出 feature-sharded | `hf_sharding.py:60 _hf_colwise_config`：weight/bias `S(0)`、out `S(-1)` | **等价** |
 | rowwise | `RowParallelLinear`：weight 切 dim 1，融合 reduce-scatter 出（回到序列分片） | `hf_sharding.py:71 _hf_rowwise_config`：weight `S(1)`、bias `R`、out_src `P`、out_dst → SP placement | **等价**（上游 `P`→SP 的重分布正是 llmtuner 融合 RS 的位置） |
 | 注意力边界 | `GatherSequenceFirst` + `ColwiseLinearNoGather`：父模块持有 gather，q/k/v 退化为 plain feature-sharded GEMM | `decoder_sharding.py:218 set_gqa_attention_sharding` + `_attach_flex_kernel`（SP 输入在注意力内部 gather 回 Replicate） | **等价** |
-| 序列并行语义 | TP 即 SP：batch 先按 CP、再按 TP 切；`parallelism.enable_sequence_parallel=false` 直接 config-raise | `sp_enabled = tp_enabled and enable_sequence_parallel`（`parallel_dims.py:550`） | **有意分歧**：llmtuner 没有"激活全复制"的退化路径 |
+| 序列并行语义 | TP 即 SP：batch 先按 CP、再按 TP 切；`parallelism.enable_sequence_parallel=false` 直接 config-raise | `sp_enabled = tp_enabled and enable_sequence_parallel`（`topology.py:550`） | **有意分歧**：llmtuner 没有"激活全复制"的退化路径 |
 | 序列切分顺序 | 先 CP（`models/hf/model.py:603`）后 TP（`:635`），TP 切在 CP 分片内 | `hf_sharding.py:52 _hf_sequence_parallel_placement()` = `PartitionSpec(DP, (CP, TP), None)` | **等价**：CP 外、TP 内的联合切分 |
 | norm 权重 | q/k norm 保持复制（HF 4.57 起 plan 已不声明它们），梯度由 `Trainer._allreduce_replicated_tp_grads`（`trainer/trainer.py:532`）汇总 | `decoder_sharding.py:177 norm_config`：SP 时权重 `R`，"BWD AR 交给 FSDP" | **等价**（同 D14：上游归 FSDP、llmtuner 归 trainer，数值一致） |
-| token 计数 / loss mesh | `trainer/batch.py:224` 计 `labels.numel() // (cp*tp)`；loss mesh 含 tp（`parallel/parallel_dims.py:220`） | loss mesh 只含 dp×cp（`parallel_dims.py:260`） | **耦合差异**：上游把 tp 的归约放进 vocab-parallel CE，llmtuner 的 head 是复制的、必须跨 tp 求和。两侧各自自洽，随 lm_head 缺口一同处理 |
+| token 计数 / loss mesh | `trainer/runtime/batch.py:224` 计 `labels.numel() // (cp*tp)`；loss mesh 含 tp（`parallel/topology.py:220`） | loss mesh 只含 dp×cp（`topology.py:260`） | **耦合差异**：上游把 tp 的归约放进 vocab-parallel CE，llmtuner 的 head 是复制的、必须跨 tp 求和。两侧各自自洽，随 lm_head 缺口一同处理 |
 | lm_head 与 loss | HF 的 `colwise_gather_output` 解析为 None → head 保持复制（全 vocab）+ 普通 CE；loss 侧参数已接线（按形状分派，复制下 no-op） | head `S(0)`/`S(-1)` vocab 分片 + core `cross_entropy_loss` 检测分片走 vocab-parallel CE | **D 类缺口，两步走的第二步未做**：loss 侧接线已完成，head 真分片与"未接线即 loud-raise"待做，见上"D —— 真正缺失"表 |
-| 注意力头整除 | `parallel/head_sharding.py`：`apply_tp` 查 `% tp`、ulysses CP 查 `% (tp*cp)` | 上游解析期校验 `head_shard_degree`：`heads % (tp*cp)` | **等价**：合起来即上游那一次检查 |
+| 注意力头整除 | `parallel/attention_heads.py`：`apply_tp` 查 `% tp`、ulysses CP 查 `% (tp*cp)` | 上游解析期校验 `head_shard_degree`：`heads % (tp*cp)` | **等价**：合起来即上游那一次检查 |
 | 未实现的 HF 规格 | `colwise_rep` / `rowwise_rep` / `local_*` / `gather` / `replicate` / `sequence_parallel` loud-raise | 这些是 DTensor 时代的 replicated-activation 布局，上游由 SPMD 声明承担 | **有意拒绝**：llmtuner 的 GEMM 是 SP 对偶 collective，没有全复制激活路径；报错指名规格 + 说明理由 |
 
 **验证边界**：TP/SP 的数值等价需要多卡与 torch≥2.12（symm-mem、`spmd_types`、
@@ -487,8 +487,8 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
     重放 dispatch 会得到不同的 token 序，而梯度仍按 forward 的 handle 路由；修法是
     给 `deepep::dispatch`/`combine` 注册 ORDERED effect 让 checkpoint 恒 SAVE。
     该 effect 注册落在上游 `distributed/deepep/` wrappers 里，llmtuner 刻意不
-    vendor 这部分（`deepep`/`hybridep` 在 `config/parallel.py` 与
-    `expert_parallel/swap.py` 配置期即拒绝，D 表登记），没有可挂 effect 的 op。
+    vendor 这部分（`deepep`/`hybridep` 在 `config/parallel_config.py` 与
+    `expert_parallel/model_replacement.py` 配置期即拒绝，D 表登记），没有可挂 effect 的 op。
     llmtuner 唯一的通信 dispatcher（AllToAll）用的是 `all_to_all_single` + 固定
     split，接收序确定，FullAC 重放数值安全——与上游对 HybridEP（接收序确定）不动
     的判断同构。selective AC 的 save set 已含 deepep/hybridep op（resolve-or-skip，
@@ -556,7 +556,7 @@ llmtuner 侧是 `datasets/multimodal/image.py`），本表的 llmtuner 列是唯
     HPMESH_DIST_BACKEND 同样不收）；日志级别保持在 `get_logger` 的显式
     参数上（默认 INFO）。同约定 2026-10-08 清掉最后两个项目级旋钮：
     `LOG_RANK`（上游 logger 的 rank 白名单）迁移为 `MetricsConfig.log_ranks`
-    配置字段（经 `logger_utils.set_log_ranks` 接线 console 过滤）；
+    配置字段（经 `logging.set_log_ranks` 接线 console 过滤）；
     `HF_BACKEND_LOGIT_DUMP` 改为 wrapper 上的显式 `logit_dump_dir` 属性
     （调试钩子，非配置面）。第三方/启动器变量（RANK/WORLD_SIZE/MASTER_*、
     SLURM_*/OMPI_*、WANDB_*、NO_COLOR/TERM 等）是生态接口，不在此列。
@@ -711,11 +711,11 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 
 | llmtuner 重要符号 | TorchTitan 对应实现 | 主要差异 | 结论/维护动作 |
 |---|---|---|---|
-| `trainer.train.parse_config`, `main` | `torchtitan/train.py` | llmtuner 直接构造一个集中式 dataclass 配置；上游构造 Configurable 树；group 嫁接表在 `LLMTunerConfig.from_groups` | 通过（适配）；同步启动顺序和全局运行时设置，不同步配置树 |
+| `trainer.cli.parse_config`, `main` | `torchtitan/train.py` | llmtuner 直接构造一个集中式 dataclass 配置；上游构造 Configurable 树；group 嫁接表在 `LLMTunerConfig.from_groups` | 通过（适配）；同步启动顺序和全局运行时设置，不同步配置树 |
 | `llmtuner.config.LLMTunerConfig` 及各子 config | `config/configs.py` 与各组件嵌套 `Config` | llmtuner 的 SEAM 0：全部字段集中；上游字段分散在组件 | 通过（适配）；新增功能必须先落到这里 |
 | `LLMTunerConfig.auto_fill_model` | 上游模型 registry/config build | llmtuner 用 HF `AutoConfig` 填充；上游选原生模型 config | 通过；本地模型与 Hub 配置分别测试 |
-| `parallel.parallel_dims.build_parallel_dims`, `build_mesh` | `distributed/parallel_dims.py` + `trainer.py` | 上游无单一对应函数；llmtuner 把解析与 mesh 构造分开 | 通过（适配） |
-| `accelerator.dist_utils.init_dist_pytorch` | `train.py` 的 PG 初始化段 | trainer 的 PG 引导：trainer 直接调它而非 `init_dist` 门面，避开后者的 `mp.set_start_method('spawn')` 副作用；厂商加速器 backend 由设备层推导，CUDA 路径才消费 `backend` 实参 | 通过；后端特有行为需实际设备验证 |
+| `parallel.topology.build_parallel_topology`, `build_mesh` | `distributed/topology.py` + `trainer.py` | 上游无单一对应函数；llmtuner 把解析与 mesh 构造分开 | 通过（适配） |
+| `accelerator.distributed.init_dist_pytorch` | `train.py` 的 PG 初始化段 | trainer 的 PG 引导：trainer 直接调它而非 `init_dist` 门面，避开后者的 `mp.set_start_method('spawn')` 副作用；厂商加速器 backend 由设备层推导，CUDA 路径才消费 `backend` 实参 | 通过；后端特有行为需实际设备验证 |
 | `Trainer.__init__` | `torchtitan/trainer.py::Trainer.__init__` | llmtuner 直接接收 HF wrapper、容器和自由函数；没有 Configurable build | 通过（适配） |
 | `Trainer.batch_generator` | `Trainer.next_batch`/post-dataloading 路径 | llmtuner 把 dataloader exhausted、CP/TP shard 和设备搬运集中处理 | 通过（适配） |
 | `Trainer.forward_backward_step`, `train_step` | `Trainer.train_step` 及 PP/non-PP 分支 | llmtuner 显式支持梯度累积、chunk loss、PP loss；非日志 step 不保留 loss graph | 通过；有 graph 释放回归测试 |
@@ -723,7 +723,7 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 | `Trainer._allreduce_replicated_tp_grads` | 上游 SPMD/TP placement 自动归约 | llmtuner 手写 TP plan，复制参数必须显式 SUM | 通过（适配）；新增 TP module 类型时必须更新识别集合 |
 | `Trainer.state_dict`, `load_state_dict` | 上游 trainer state Stateful | llmtuner 只保存训练步等最小状态 | 通过 |
 | `Trainer.train`, `close` | 上游同名方法 | 生命周期更短；仍保证 profiler/checkpointer/logger drain | 通过 |
-| `Trainer.validate`, `should_validate`, `check_validation_feasibility` | `components/validate.py::Validator`（含上游 6c2dadbb3 零 batch/零有效 token 报错、90b25912f dp>1 拒绝 `steps=-1`） | `training.validation_config`（`ValidationConfig`，freq/steps/dataset，默认 None 关闭且逐位不变）；eval 模式 + `no_grad`，结束后恢复 train；loss 按全局有效 token 归一化，token 走 dp mesh、loss 走 dp×cp×tp loss mesh，与训练同语义；`steps=-1` 对 random 无限语料亦拒绝；PP 组合支持：`trainer/validate.py::validate_body_pp` 驱动 schedule 的 eval 通路（与上游 `pp_schedule.eval` 同 seam），microbatch 管线与训练体一致 | 通过（适配）；多 rank 归约语义与 PP 组合待目标设备验证 |
+| `Trainer.validate`, `should_validate`, `check_validation_feasibility` | `components/validate.py::Validator`（含上游 6c2dadbb3 零 batch/零有效 token 报错、90b25912f dp>1 拒绝 `steps=-1`） | `training.validation_config`（`ValidationConfig`，freq/steps/dataset，默认 None 关闭且逐位不变）；eval 模式 + `no_grad`，结束后恢复 train；loss 按全局有效 token 归一化，token 走 dp mesh、loss 走 dp×cp×tp loss mesh，与训练同语义；`steps=-1` 对 random 无限语料亦拒绝；PP 组合支持：`trainer/runtime/validation.py::run_pipeline_validation_loop` 驱动 schedule 的 eval 通路（与上游 `pp_schedule.eval` 同 seam），microbatch 管线与训练体一致 | 通过（适配）；多 rank 归约语义与 PP 组合待目标设备验证 |
 
 ### 3. Hugging Face 模型适配层
 
@@ -790,7 +790,7 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 | `LocalTokenDispatcher`/`AllToAllTokenDispatcher` 的索引数学 | 上游同名方法 | `_local_reorder`（stable argsort，索引再除 `top_k`）、`_permute`（rank-major → expert-major：`input_starts[seg_ids] + arange − output_starts[seg_ids]`）、`_unpermute`（`new_empty` + index put）、`combine`（fp32 乘 score + `deterministic_scatter_add`）与上游逐字一致；`all_to_all_single` + `materialize` 对应上游编译分支的 `all_to_all_single`/`wait_tensor`（非编译分支的 `spmd.all_to_all` 只是同一 collective 的 SPMD 包装）。注意：`BaseEPTokenDispatcher.num_experts` 是全局专家数（`convert.py` 传全局 E，上游 DeepEP/HybridEP 亦用 `self.num_experts // ep_group.size()`） |
 | `TorchAOTokenDispatcher` | 上游同名 dispatcher | 可选导入适配层：`_permute`/`_unpermute` 委托 torchao `permute_and_pad`（expert-major 重排 + token 组 pad 到 `pad_multiple`，EP=1 本地 padded permute 路径一并移植）；构造期 lazy import，未装 torchao loud-raise ImportError 带安装指引；`ParallelConfig.ep_token_dispatcher="torchao"` + `ep_torchao_pad_multiple` 接线，**通过（适配）**，数值**环境未覆盖**（无 torchao/CUDA），待 CUDA 目标设备复跑 |
 | `DeepEPTokenDispatcher` / `HybridEPTokenDispatcher` | 上游同名 dispatcher | **登记缺口（loud-raise）**：CUDA-only（`deep_ep`/`hybridep` 内核）且 dispatch/combine 需上游 `distributed/deepep/` wrappers（1155 行，未 vendor），可选导入无法忠实表达契约；`ParallelConfig.ep_token_dispatcher` 选到即 NotImplementedError（含解锁条件：vendor wrappers + CUDA optional extra + CUDA 设备复跑），swap 入口防御性同语义；`AllToAllTokenDispatcher` 满足同一 dispatch/combine 契约 |
-| `async_linear` 三个模块 | `models/common/async_linear.py` | 保留 fused collective+GEMM，mesh 从 llmtuner context 获取。上游重构为组合式 `Async*Linear`、后再改为继承新 `ColumnParallelLinear`/`RowParallelLinear` 通信角色，llmtuner 保持子类式委托 `parallel/tensor_parallel/linear.py`，数学等价，**受限**：需 TP/CUDA 能力 |
+| `async_linear` 三个模块 | `models/common/async_linear.py` | 保留 fused collective+GEMM，mesh 从 llmtuner context 获取。上游重构为组合式 `Async*Linear`、后再改为继承新 `ColumnParallelLinear`/`RowParallelLinear` 通信角色，llmtuner 保持子类式委托 `parallel/tensor_parallel/linear_ops.py`，数学等价，**受限**：需 TP/CUDA 能力 |
 
 #### 4.4 多模态
 
@@ -806,15 +806,15 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 
 | llmtuner 符号 | TorchTitan 对应符号 | 差异与正确性 |
 |---|---|---|
-| `ParallelDims.from_config/_validate` | `distributed/parallel_dims.py` | llmtuner 使用稳定 `ValueError`，支持 `dp_shard=-1` 精确推导并校验 EP 整除，**通过** |
+| `ParallelTopology.from_config/_validate` | `distributed/topology.py` | llmtuner 使用稳定 `ValueError`，支持 `dp_shard=-1` 精确推导并校验 EP 整除，**通过** |
 | `build_mesh` 与 mesh accessor | 同文件的 mesh 构造/flatten | llmtuner 额外建立 loss mesh，因 TP 端到端切序列，**通过（适配）** |
 | `get_all_one_dimensional_meshes` | 同名上游方法 | 已排除 fake-backed axes，**通过** |
-| 分布式初始化（`accelerator/dist_utils.py`） | `distributed/utils.py` 的 `init_distributed` + `DistributedTopology`（`comm.backend` 的 `fake` / `real_pp_fake_spmd` 两种逻辑世界） | **未移植（登记）**：上游可在单进程内用 torch 的 `backend="fake"`（+ 真实 PP 组）模拟整个多卡拓扑，llmtuner 只有"`world_size == 1` → `parallel_dims is None`"与真多卡两条路，单机并行验证走 gloo + torchrun 集成测试。解锁条件：torch 提供 `backend="fake"`（本机 2.2.2 无）+ 决定给初始化加一条 debug 后端；见 `torchllmtuner_design.md` §8 的验证边界 |
+| 分布式初始化（`accelerator/distributed.py`） | `distributed/utils.py` 的 `init_distributed` + `DistributedTopology`（`comm.backend` 的 `fake` / `real_pp_fake_spmd` 两种逻辑世界） | **未移植（登记）**：上游可在单进程内用 torch 的 `backend="fake"`（+ 真实 PP 组）模拟整个多卡拓扑，llmtuner 只有"`world_size == 1` → `parallel_dims is None`"与真多卡两条路，单机并行验证走 gloo + torchrun 集成测试。解锁条件：torch 提供 `backend="fake"`（本机 2.2.2 无）+ 决定给初始化加一条 debug 后端；见 `torchllmtuner_design.md` §8 的验证边界 |
 | `collectives.set_pg_timeouts` | 上游 trainer/comm timeout | llmtuner 独立实现，**通过（适配）** |
 | 归约调用（train_step 的 loss/token 归约） | 上游 scattered reductions | 收敛为 `accelerator.collectives.all_reduce` 在调用点直接使用（clone + in-place collective），不重建 `dist_sum`/`dist_max`/`dist_sum_tensor` 薄封装；`reduce_equivalence.py` 验证 all_reduce 语义与 clone 调用惯例（trainer 的内联 clone 由 review 保证），**通过** |
 | `clip_grad_norm_` | 上游 distributed grad clipping | llmtuner 按本地 dense/TP 分片/EP expert 参数分组：TP 分片范数跨 TP 归约，复制参数只计一次，EP expert 范数跨 EP 归约，最后跨 PP 归约；FSDP 的 DTensor 范数先 `full_tensor()`。上游 TP 使用 DTensor，而这里的 TP 权重是本地张量，故额外 TP 归约必需；`tp_grad_norm_equivalence.py` 钉住裁剪系数。上游的 `dist_sum`/`dist_max`/`dist_mean` 薄封装**不重建**——对应物是 `accelerator/collectives.all_reduce` 在调用点使用 |
 | `pp_forward_backward_body` | torchtitan pipeline training driver | 私有 `_step_microbatches` 不经过公共 `step()`，必须显式设置每个 `PipelineStage.has_backward` 并清理 runtime state；否则 PyTorch 默认值为 `False`，整个 PP 训练无梯度且 loss 仍变化。已修复并由 `pp_equivalence.py` 验证 1F1B 轨迹和 grad norm |
-| 种子与确定性（`Trainer.seed_everything`、`trainer/seed.py`） | `distributed/utils.py::set_determinism` | 含四项确定性开关（`use_deterministic_algorithms`、`cudnn.deterministic/benchmark`、`fill_uninitialized_memory=False`、`CUBLAS_WORKSPACE_CONFIG`）以及 `PYTHONHASHSEED = str(seed % 2**32)`（为之后 spawn 的 dataloader worker）与 `TrainingConfig.detect_anomaly`（`set_detect_anomaly(True, check_nan=False)` + 上游同文告警，`check_nan=False` 因 NaN/Inf 检查走 `aten._is_any_true` 无 DTensor 策略）；PP 的 distinct-seed 派生（`trainer/builder.py`）对应上游同函数公式。不移植两件：DTensor mesh-aware RNG tracker（上游用于分片参数初始化，llmtuner 走 HF 自身初始化）与 `warn_only` 开关（llmtuner 固定 `False`，更严）。**通过（适配）** |
+| 种子与确定性（`Trainer.seed_everything`、`trainer/seed.py`） | `distributed/utils.py::set_determinism` | 含四项确定性开关（`use_deterministic_algorithms`、`cudnn.deterministic/benchmark`、`fill_uninitialized_memory=False`、`CUBLAS_WORKSPACE_CONFIG`）以及 `PYTHONHASHSEED = str(seed % 2**32)`（为之后 spawn 的 dataloader worker）与 `TrainingConfig.detect_anomaly`（`set_detect_anomaly(True, check_nan=False)` + 上游同文告警，`check_nan=False` 因 NaN/Inf 检查走 `aten._is_any_true` 无 DTensor 策略）；PP 的 distinct-seed 派生（`trainer/runtime/assembly.py`）对应上游同函数公式。不移植两件：DTensor mesh-aware RNG tracker（上游用于分片参数初始化，llmtuner 走 HF 自身初始化）与 `warn_only` 开关（llmtuner 固定 `False`，更严）。**通过（适配）** |
 
 #### 5.2 TP
 
@@ -832,7 +832,7 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 | llmtuner 符号 | TorchTitan 对应符号 | 差异与正确性 |
 |---|---|---|
 | `resolve_fsdp_mesh`, `resolve_sparse_fsdp_mesh` | `distributed/fsdp.py` mesh dims | llmtuner 把多轴 mesh 重建为 FSDP 可理解的 1D/2D mesh，**通过（适配）** |
-| `apply_fsdp_to_decoder` | 同名上游函数 | 支持 HF ModuleList、MoE expert placement、prefetch。含上游 4b5023b80 同源修复：专家分片度经 `fsdp_shard_size` 只计 shard 轴，HSDP 下不再误选 `Shard(1)`，**通过（适配）**。逐项复核结论：装配顺序/reshard 策略/权重绑定/prefetch 与上游逐段一致；参数名**不跟**上游的 `ep_degree`，保持 `ep_size`（llmtuner 的配置面统一拼 ``*_size``，见 `config/parallel.py`；`ep_size` 也与 `expert_parallel_size` 同词根）；专家分片度的辅助函数为 `fsdp_shard_size`；专家计数读 `moe.router.num_experts`（本地切片的 `inner_experts.num_experts` 会把它变成 `efsdp*ep**2`）；不带上游的 `dp_mesh_dims`/`edp_mesh_dims`——llmtuner 传专用 1-D/2-D 子网，torch 按形状读出的轴与上游显式声明一致，且普通 tensor 参数上这两个入口本就不可用，**通过（适配）** |
+| `apply_fsdp_to_decoder` | 同名上游函数 | 支持 HF ModuleList、MoE expert placement、prefetch。含上游 4b5023b80 同源修复：专家分片度经 `fsdp_shard_size` 只计 shard 轴，HSDP 下不再误选 `Shard(1)`，**通过（适配）**。逐项复核结论：装配顺序/reshard 策略/权重绑定/prefetch 与上游逐段一致；参数名**不跟**上游的 `ep_degree`，保持 `ep_size`（llmtuner 的配置面统一拼 ``*_size``，见 `config/parallel_config.py`；`ep_size` 也与 `expert_parallel_size` 同词根）；专家分片度的辅助函数为 `fsdp_shard_size`；专家计数读 `moe.router.num_experts`（本地切片的 `inner_experts.num_experts` 会把它变成 `efsdp*ep**2`）；不带上游的 `dp_mesh_dims`/`edp_mesh_dims`——llmtuner 传专用 1-D/2-D 子网，torch 按形状读出的轴与上游显式声明一致，且普通 tensor 参数上这两个入口本就不可用，**通过（适配）** |
 | （无）`linear_param_shard_placements`、`apply_fsdp_to_multimodal_encoder` | 上游 `distributed/fsdp.py` 的另两个导出 | 前者按 `Shard(ndim-2)` 切 stacked/grouped 线性权重：llmtuner 没有 `num_linears` 式融合 Linear，2-D `nn.Linear` 默认 `Shard(0)`、packed 3-D 专家权重 `Shard(1)` 已切在同一个输出维；后者服务 vision tower，llmtuner 的 `models/common/multimodal.py` 只有融合算子、无编码器模块（无消费者）。**有意未移植**，布局等价性由 `test_efsdp_placement.py::test_packed_expert_weights_shard_their_output_dim_at_index_one` 钉住 |
 | `enable_fsdp_symm_mem` | 同名上游函数 | 支持 `scope="all"/"dense"/None`（上游 65e495dda），非法 scope 抛 ValueError；经 `fsdp_symm_mem_scope` config 字段（默认 "all"）对用户开放，**通过（适配）**。上游把"关"表达为 `fsdp_symm_mem_scope=None`（单字段，且 `tyro.conf.Suppress` 不进 CLI），llmtuner 拆成 `enable_fsdp_symm_mem=False` + `fsdp_symm_mem_scope="all"` 两字段并允许 CLI 传入——**默认语义等价**（两个默认都是关；scope 默认值在 enable=False 时不可达），差异只在形态与可见性 |
 | `disable_fsdp_gradient_division` | 同名上游 helper | global valid-token loss 自行缩放，故禁用 FSDP 平均，**通过** |
@@ -842,9 +842,9 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 
 | llmtuner 符号 | TorchTitan 对应符号 | 差异与正确性 |
 |---|---|---|
-| `apply_cp` | `distributed/context_parallel.py`（上游此前的 `context_parallel/` 包已重整为单文件）+ 模型 parallelize | 给 HF attention 注入 kernel；校验 backend、mesh 和 Ulysses heads；ulysses×packed 不 fail-fast（经 `set_cp_mesh(strategy=...)` 闩锁策略），**通过（适配）**。上游该文件是「输入分片 + 负载均衡器」的声明面（`shard_tensors` / `get_cp_input_seq_len` / `ContextParallelLoadBalancer`），kernel 在 `models/common/cp_attention.py`；llmtuner 的对应物是 `context_parallel/input_shard.py` + `cp_kernel.py` |
+| `apply_cp` | `distributed/context_parallel.py`（上游此前的 `context_parallel/` 包已重整为单文件）+ 模型 parallelize | 给 HF attention 注入 kernel；校验 backend、mesh 和 Ulysses heads；ulysses×packed 不 fail-fast（经 `set_cp_mesh(strategy=...)` 闩锁策略），**通过（适配）**。上游该文件是「输入分片 + 负载均衡器」的声明面（`shard_tensors` / `get_cp_input_seq_len` / `ContextParallelLoadBalancer`），kernel 在 `models/common/cp_attention.py`；llmtuner 的对应物是 `context_parallel/input_sharding.py` + `cp_kernel.py` |
 | `shard_batch_for_cp/tp`、`shard_padding_mask_for_cp/tp`、`shard_attention_mask_for_cp` | `distributed/context_parallel.py::shard_tensors`（上游走 `SpmdType` 声明 + `spmd.shard(R→S(seq_dim))`） | llmtuner 无声明面，改为逐类张量的显式入口，permute+切分委托 torch 私有 `_context_parallel_shard`；默认连续切分与 `headtail` 均衡切分的语义与上游一致（`seq_len % (2*cp)` 两边同样校验），mask 只切 Q 轴、KV 保持全长。三处差异：负载均衡器由上游的抽象类 + `generate_permutation()` 换成字符串现场构造 torch 的 `_HeadTailLoadBalancer`；`ptrr` 仍是登记缺口（loud-raise：它要在切 batch 时读 BlockMask，而 mask 在 wrapper 的 forward 内才构建）；上游 `shard_tensors` 每次调用的 `shape[seq_dim] % cp` 与「所有 CP 张量同 seq len/同 device」两条检查，llmtuner 改在配置解析期查 `max_seq_len % cp`（更早更强，但不覆盖绕过配置传入别的 T 的用法）。**通过（适配，两处已知差异见审计）** |
-| `CPFlexKernel`（KV all-gather / Ulysses 两条路径） | `models/common/cp_attention.py` 同名意图 | 剥掉上游 CPInnerAttention/FlexInnerAttention 类层，redistribution 与 kernel 合在 `context_parallel/cp_kernel.py`。KV all-gather 用的是**同一个** torch 算子 `flex_cp_allgather`（上游 HF 后端的 `_wrap_flex_kernel_cp` 也用它；backward 的 reduce-scatter 由算子自带，故 llmtuner 没有 `reduce_dtype` 旋钮——上游只有**原生**模型的 `KVAllGatherCPFlexInnerAttention.Config` 有该字段，HF 后端同样没有）；Ulysses 为 seq↔head all-to-all，与上游 `UlyssesCPInnerAttention` 同一置换。ulysses 的 `_full_length_causal_mask` 复用 `masks.create_attention_mask`（与 wrapper 同 builder、同参数）；ulysses 支持 packed/varlen——wrapper 全长透传文档 mask，kernel 按 mask Q 长度分派（上游 `UlyssesCPVarlenInnerAttention` 语义，varlen 元数据不随 token 分片）；kernel 新增 `packed` 标记：ulysses 下若到达的 mask 是 Q 切分或缺失（文档结构无法从长度恢复）则 raise，堵住绕过 wrapper 的静默退化。遗留数值分歧（2026-10-09 审查登记）：上游**原生**模型的 KV all-gather backward 默认 fp32 归约（`KVAllGatherCPFlexInnerAttention.Config.reduce_dtype`），llmtuner 走 `flex_cp_allgather` 自带 backward（激活 dtype）——长序列 bf16 累加可能有系统性小偏差，待 torch≥2.12 环境确认算子行为后决定是否在 backward 前升 fp32 | **通过（适配）** |
+| `CPFlexKernel`（KV all-gather / Ulysses 两条路径） | `models/common/cp_attention.py` 同名意图 | 剥掉上游 CPInnerAttention/FlexInnerAttention 类层，redistribution 与 kernel 合在 `context_parallel/attention.py`。KV all-gather 用的是**同一个** torch 算子 `flex_cp_allgather`（上游 HF 后端的 `_wrap_flex_kernel_cp` 也用它；backward 的 reduce-scatter 由算子自带，故 llmtuner 没有 `reduce_dtype` 旋钮——上游只有**原生**模型的 `KVAllGatherCPFlexInnerAttention.Config` 有该字段，HF 后端同样没有）；Ulysses 为 seq↔head all-to-all，与上游 `UlyssesCPInnerAttention` 同一置换。ulysses 的 `_full_length_causal_mask` 复用 `masks.create_attention_mask`（与 wrapper 同 builder、同参数）；ulysses 支持 packed/varlen——wrapper 全长透传文档 mask，kernel 按 mask Q 长度分派（上游 `UlyssesCPVarlenInnerAttention` 语义，varlen 元数据不随 token 分片）；kernel 新增 `packed` 标记：ulysses 下若到达的 mask 是 Q 切分或缺失（文档结构无法从长度恢复）则 raise，堵住绕过 wrapper 的静默退化。遗留数值分歧（2026-10-09 审查登记）：上游**原生**模型的 KV all-gather backward 默认 fp32 归约（`KVAllGatherCPFlexInnerAttention.Config.reduce_dtype`），llmtuner 走 `flex_cp_allgather` 自带 backward（激活 dtype）——长序列 bf16 累加可能有系统性小偏差，待 torch≥2.12 环境确认算子行为后决定是否在 backward 前升 fp32 | **通过（适配）** |
 | `swap_hf_moe_blocks` | transformers backend `moe_replacement.py` | 上游重新初始化，llmtuner 搬运 HF 权重；不是共享实现，等价性测试覆盖，**通过（适配）** |
 | `apply_ep` | 上游模型 EP parallelize | 先 swap 再建立 dispatcher/组，**通过（适配）** |
 | `generate_llm_fqn_per_model_part` | transformers backend `pipeline.py` | 加权切层公式一致，**通过** |
@@ -852,14 +852,14 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 | `apply_pp`, `build_pipeline_schedule` | `distributed/pipeline_parallel.py` | llmtuner 直接消费 HF 五部件契约；pp×ep / pp×cp 放行，**通过（适配）** |
 | `apply_pp(first_stage_module_fqns=...)`, `prepend_first_stage_modules` | 同文件 `pipeline_with_first_stage_modules` | 额外顶层模块并入 stage 0：仅作用自动切分，存在的 FQN 按序前插，已占有/重复 FQN raise、缺失跳过，显式 `module_fqns_per_model_part` 给定时忽略并告警（同上游委托语义）；`split_model_into_stages` 配套把 wrapper `named_children()` 不呈现的额外顶层模块在非属主 stage 置 `Identity`（上游 "pruned on other stages" 语义），装五部件的容器经"包含已呈现部件"判定跳过。stage FQN 稳定、默认 None 逐位不变，**通过（适配）** |
 | `apply_ac`, selective helpers, `apply_memory_budget`, `disable_dynamo_lru_cache` | `distributed/activation_checkpoint.py` | FullAC/SelectiveAC 已移植，**通过**；FullAC 的对齐同时含策略这一层：上游 `FullAC._wrap_block` 不是裸 wrapper，而是把恒 `PREFER_RECOMPUTE` 的 `_full_ac_policy` 经 `create_selective_checkpoint_contexts` 传入，让 torch 对「输出不可重算/带注册副作用」的算子仍落 SAVE；llmtuner 已按同形补上 `full_policy` + `wrap_full`（`determinism_check`/`debug` 仍走 torch 默认值——实测 torch 默认即 `default`/`False`，与上游 config 默认相同，故行为一致，只是不可配）；两处 `early_stop` 已跟随上游 #4836 为 `True`。MemoryBudgetAC 已移植为 `mode='memory_budget'` + `MemoryBudgetACConfig`（设 `torch._functorch.config.activation_memory_budget`，需 compile，torch 无 knob 时 loud-raise），见 §9.1；RegionAC 已接入（`region_ac` + `memory/remat_regions.py`，以 HF block 的 `nn.Linear` FQN 作 region 名，替代上游 `Module.configure_remat_regions` 声明通道；`recompute_regions` 与上游同语义——recompute pattern 优先于 save pattern，默认空逐位不变；`preserve_rng_state=True` 配置期即拒，torch_remat 需 torch ≥ 2.10，apply 期 loud-raise）。`disable_dynamo_lru_cache` 亦已移植（上游在每个 policy 的 `apply` 开头调用），并经 `has("dynamo_lru_cache")` 能力门：torch 2.2.2 有 `torch._C._dynamo.eval_frame` 而无 `_set_lru_cache`，此时记 info 后继续。AC 也跑在 PP 路径上（`stages.py` 的 `ac` 行 `on_pp=True`，逐 chunk 折层，与上游把 `ac_config` 交给每个 model part 的 `parallelize` 同构）。FullAC 的 `determinism_check`/`debug` 旋钮未暴露（固定默认值），登记于此 |
-| `apply_compile`, `maybe_enable_async_tp`, `maybe_regional_inductor_backend`, `maybe_regional_inductor` | `distributed/compile.py` 同名函数 | 四件全移植为 `parallel/compile.py` + `CompileConfig`（`training.compile_config`，默认全关 = 旧整体 compile 逐位不变）：逐 block compile 用 `Module.compile` 就地（`per_block=True`）；async TP 设 `_micro_pipeline_tp` + symm-mem 注册（按 group 名去重），配置期拒无 compile/tp=1，装配期对无 mesh/旧 torch loud-raise；regional_inductor 仅 `aot_eager`×flex 触发（wrapper `uses_flex_attention` 判定，annotation 在 `flex_attention_hf`，inductor_configs 传空），flex×其他 backend `ValueError`、torch 无该模块 `NotImplementedError`；`capture_scalar_outputs` 按上游条件（`iter_moe_layers` 非空）设置，dense 不动。上游的 `skip_fwd_side_effects_in_bwd_under_checkpoint` 与 FakeTensorMode monkeypatch 未移植（登记于 upstream map），**通过（适配）** |
+| `apply_compile`, `maybe_enable_async_tp`, `maybe_regional_inductor_backend`, `maybe_regional_inductor` | `distributed/compile.py` 同名函数 | 四件全移植为 `parallel/model_compile.py` + `CompileConfig`（`training.compile_config`，默认全关 = 旧整体 compile 逐位不变）：逐 block compile 用 `Module.compile` 就地（`per_block=True`）；async TP 设 `_micro_pipeline_tp` + symm-mem 注册（按 group 名去重），配置期拒无 compile/tp=1，装配期对无 mesh/旧 torch loud-raise；regional_inductor 仅 `aot_eager`×flex 触发（wrapper `uses_flex_attention` 判定，annotation 在 `flex_attention_hf`，inductor_configs 传空），flex×其他 backend `ValueError`、torch 无该模块 `NotImplementedError`；`capture_scalar_outputs` 按上游条件（`iter_moe_layers` 非空）设置，dense 不动。上游的 `skip_fwd_side_effects_in_bwd_under_checkpoint` 与 FakeTensorMode monkeypatch 未移植（登记于 upstream map），**通过（适配）** |
 
 `VALID_AC_MODES` 声明在 `config/activation_checkpoint.py`，紧挨它约束的
 `TrainingConfig.activation_checkpoint_mode`；`memory/activation_checkpoint.py` 从这里
 import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac` 的成员
 检查不会各自漂移）。`config/training.py` 的 `global_batch_size` / `max_seq_len` /
 `steps` / `gradient_accumulation_steps` 四个 `>= 1` 守卫是"一组名字 + 一个循环"
-的写法，与 `config/parallel.py`、`parallel/parallel_dims.py` 的既有写法一致。
+的写法，与 `config/parallel_config.py`、`parallel/topology.py` 的既有写法一致。
 
 ### 6. 数据系统
 
@@ -892,7 +892,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 | `vocab_shard_bounds`, `next_token_targets` | 上游公式散在 loss/训练器 | llmtuner 提取成共享 helper，**通过（适配）**。`vocab_shard_bounds` 的 `chunk_size=ceil(V/tp)`、`min(V, ...)` 双侧夹取与上游 forward 内的内联公式逐行同构 |
 | `chunked_lm_head_cross_entropy` | 上游 `ChunkedLossWrapper` | 自行 backward 以控制 logits 峰值，**通过**。允许不整除的短尾 chunk（sum 归约下数值等价）。**三条结构差异登记**：(1) 上游 wrapper 支持**多输出**（tuple pred/labels，服务 dMTP 一类多输出模型），llmtuner 只接单个 `(T, H)`；llmtuner 无此类模型，故无消费者；(2) 上游 `__call__` 返回 `(loss, metrics)` 并有 `_combine_chunk_metrics` 逐 chunk 指标合并，llmtuner 只返回求和 loss；(3) 上游用预分配缓冲的 `GradAccumulator`（就地拷贝），llmtuner 用 list + `torch.cat`（多一次 `T*H` 拷贝）。另有性能差异登记：不合并 lm_head 的 FSDP reshard/grad-sync（上游在 chunk 循环期间禁用），chunked×FSDP 下每 chunk 多一次 all-gather/reduce-scatter，数值等价 |
 | `compute_logprobs`, `mse_loss` | 上游对应 loss | 直接自由函数，无 BaseLoss。分片路径的 `return_entropy` 生效：entropy 经 `vocab_parallel_entropy` 免 gather 计算（上游 a3d59d316 同源），**通过**。严格性差异登记：`tp_group` 已给但 `global_vocab_size=None` 时静默走全词表路径（上游 raise），当前无调用者触发。另登记：两者在 llmtuner **均无生产调用者**（上游的 `compute_logprobs` 只服务 `rl/`，`mse_loss` 只被 flux 的 `MSELoss` 选到，两者都在裁剪面内），仓内唯一引用是 `tests/integration_tests/vocab_parallel_loss_equivalence.py`，故按"移植曲面"保留而非删除 |
-| `OptimizersContainer` | `components/optimizer/optimizer.py` | 删除 OptimizerWrapper；多 PP part 容器直接实现 Optimizer/Stateful surface。构造算法（分组/首个 pattern 命中/`_build_impl_kwargs`/`step`/flat FQN state dict）与上游同构，三条登记差异——上游第四种 `implementation="fused_opt_states_bf16"`（bf16 Adam 状态 + load post-hook 复原 dtype，价值全在 CUDA fused 核）与 `optimizer_factory_kwargs_by_name`（无消费者）均已入 D 表；`DistMuon` 工厂属已登记为范围外的 `distributed/flex_shard/`；`default_adamw` 便捷构造（上游 `lr=8e-4`/betas (0.9,0.95)/wd 0.1）未移植，其调用者只有 torchft recipe 与 RL 示例。MoE 负载均衡/quantile hook 的注册点从容器挪到 `trainer/builder.py`（上游由各模型代码注册），hook 本体在 `models/common/moe/balancing.py`。优于上游：`_validate_params` 点名未被认领的参数并检出重复认领（上游仅一条 assert），`step` 的 closure 断言改 `ValueError`。**一处相对上游的额外适配**：llmtuner/上游都把 `fused` 放进 param group（支持组级覆盖），而 torch 只在**构造参数**上校验设备，于是 CPU 上默认 `implementation="fused"` 构造通过、首步 `optimizer.step()` 崩在 `aten::_fused_adamw_`；上游 GPU-only 不会遇到。现按设备解析：torch 没有该设备的 fused 核时降级为 for-loop 并记 info（CUDA/XPU 与上游逐字相同；CPU 上 for-loop 与 foreach 实测逐位一致），**通过（适配）** |
+| `OptimizersContainer` | `components/optimizer/optimizer.py` | 删除 OptimizerWrapper；多 PP part 容器直接实现 Optimizer/Stateful surface。构造算法（分组/首个 pattern 命中/`_build_impl_kwargs`/`step`/flat FQN state dict）与上游同构，三条登记差异——上游第四种 `implementation="fused_opt_states_bf16"`（bf16 Adam 状态 + load post-hook 复原 dtype，价值全在 CUDA fused 核）与 `optimizer_factory_kwargs_by_name`（无消费者）均已入 D 表；`DistMuon` 工厂属已登记为范围外的 `distributed/flex_shard/`；`default_adamw` 便捷构造（上游 `lr=8e-4`/betas (0.9,0.95)/wd 0.1）未移植，其调用者只有 torchft recipe 与 RL 示例。MoE 负载均衡/quantile hook 的注册点从容器挪到 `trainer/runtime/assembly.py`（上游由各模型代码注册），hook 本体在 `models/common/moe/bias_update.py`。优于上游：`_validate_params` 点名未被认领的参数并检出重复认领（上游仅一条 assert），`step` 的 closure 断言改 `ValueError`。**一处相对上游的额外适配**：llmtuner/上游都把 `fused` 放进 param group（支持组级覆盖），而 torch 只在**构造参数**上校验设备，于是 CPU 上默认 `implementation="fused"` 构造通过、首步 `optimizer.step()` 崩在 `aten::_fused_adamw_`；上游 GPU-only 不会遇到。现按设备解析：torch 没有该设备的 fused 核时降级为 for-loop 并记 info（CUDA/XPU 与上游逐字相同；CPU 上 for-loop 与 foreach 实测逐位一致），**通过（适配）** |
 | `init_optim_state` | `components/optimizer/utils.py` | 已支持部分参数已有 Adam state，并保持首次真实 step=1，**通过** |
 | flat state dict helpers | 同文件 | FQN flat format，支持 nested state，**通过** |
 | `wsd_factor`, `LRSchedulersContainer`, `build_lr_scheduler` | `components/optimizer/lr_scheduler.py` | 去 Configurable，数学与 state 语义保留，**通过**。默认值分叉登记：上游 `decay_ratio=None`（默认）表示 warmup 后贯穿余程 decay；llmtuner 无 None，默认 `0.0` 表示永不 decay（config docstring 声明为有意设计）。另新增 `total_steps < training_steps` 拒绝（上游会跑出负 lr）。复核：WSD 公式逐行一致（同样的 0-based `+1` 修正、`stable_steps = total + 1 - warmup - decay`、三种 decay 形状与 `min_lr_factor` 缩放），差异仅形状（`wsd_factor` 提到模块级、`build_lr_scheduler` 自由函数取代嵌套闭包与 `Config.build`）与两处小新增：`load_state_dict({})` 空字典 no-op（上游会 KeyError）、`LRSchedulersContainer(total_steps=...)` 作为曲线长度断言 seam（上游无此属性） |
@@ -903,7 +903,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 |---|---|---|
 | `ModelWrapper` | `components/checkpointer/base.py` | 合并 PP parts，缓存稳定 storage 供 async staging，**通过** |
 | `CheckpointStorage` | 上游 backend storage seam | llmtuner Protocol，不依赖 Configurable，**通过（适配）** |
-| `BaseCheckpointManager` 生命周期方法 | 同名基类 | load/save/close、异步 drain、retention 集中在基类。resume 优先于 initial_load_* 时记 info 日志（上游 810e62786）。策略方法与上游逐行同构，两处适配登记——新增 `_initialized` 门（上游靠各类自己的 `hasattr`/`getattr` 容错部分构造，见 `dcp.CheckpointManager.__init__` 的 HF 选项拒绝）与 `enable` 短路（上游的 manager 只在配置了 checkpointer 时才构造）；`_should_purge` 的 rank 判定换 `dist_utils.is_main_process()`（非分布式下 `dist.get_rank()` 会 raise），**通过（适配）** |
+| `BaseCheckpointManager` 生命周期方法 | 同名基类 | load/save/close、异步 drain、retention 集中在基类。resume 优先于 initial_load_* 时记 info 日志（上游 810e62786）。策略方法与上游逐行同构，两处适配登记——新增 `_initialized` 门（上游靠各类自己的 `hasattr`/`getattr` 容错部分构造，见 `dcp.CheckpointManager.__init__` 的 HF 选项拒绝）与 `enable` 短路（上游的 manager 只在配置了 checkpointer 时才构造）；`_should_purge` 的 rank 判定换 `distributed.is_main_process()`（非分布式下 `dist.get_rank()` 会 raise），**通过（适配）** |
 | `_parse_step/_find_load_step/_purge_stale_checkpoints` | 同名策略 | exact `step-N`、清理 staged/abandoned、保留豁免，**通过** |
 | `dcp.CheckpointManager` | `components/checkpointer/dcp.py` | 本地/remote DCP、HF export guard。异步写总时长经 `save_future` done-callback 记 info 日志（上游 d9ca9e55a，以 info 行替代 structured scalar）。`_save`/`_load_checkpoint`/`dcp_save`/`_save_last_step`/`_flattened_model_states_sd` 与上游逐行同构，4 处 `assert` 改显式 `raise`、HF 选项的拒绝信息更具体（llmtuner 不随包发布 `sd_adapter`）；配置校验 13 条逐条搬到 `config/checkpoint.py`（另收上游 `dcp.Config.async_mode` 与 `training_engine.create_seed_checkpoint`），`initial_load_model_only` 无 `initial_load_path` 的上游告警故意不移植；上游 `SaveDone` 是零引用死类、不移植；`EXPORT_DTYPE_MAP` 在 `base.py`（两个后端都要它），它与 `models/common/cast_linear.TORCH_DTYPE_MAP` 仍是两张同表（一张写 checker 能导出的 dtype、一张写 lm_head 能计算的 dtype，重叠是巧合），登记为已知重复，**通过（适配）** |
 | `TorchCheckpointingManager` | 同名 backend | optional dependency 延迟导入，保存统一经过 backend。HF 导出路径（`sharded/` + barrier + consolidate）与上游同构；后端未安装故仍属静态复核，**通过（适配）** |
@@ -927,18 +927,18 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 | llmtuner 符号组 | TorchTitan 对应 | 结论 |
 |---|---|---|
 | `components/checkpointer/filesystem.py` | `tools/filesystem.py` | A1，去 docstring 后 AST 等价，**通过** |
-| `accelerator.spmd_context.*` | 意图接近 `distributed/spmd_types.py`，实际基于 pip `spmd_types` | C 类活代码；不要替换成上游 module protocol |
+| `accelerator.spmd.*` | 意图接近 `distributed/spmd_types.py`，实际基于 pip `spmd_types` | C 类活代码；不要替换成上游 module protocol |
 | `accelerator.device.*` | 无可靠同源 | C 类，统一 NPU/CUDA/MLU/MUSA/CPU 设备信息与 backend 选择 |
 | `utils.monitoring.*` | 部分意图见 `tools/utils.py` | C 类，包含 peak FLOPS（含 MI350X）和 memory snapshot |
-| `utils.gc.GarbageCollection` | `tools/utils.py` GC helper | 去 structured logger，**通过（适配）** |
-| `utils.logger_utils.*` | 无单一对应 | C 类日志格式与 rank helper；全仓模块 logger 统一经 `get_logger`（发射时 rank 过滤），级别默认 INFO（上游 `TITAN_LOG_LEVEL` 未移植：不引入项目级环境变量） |
+| `utils.garbage_collection.GarbageCollection` | `tools/utils.py` GC helper | 去 structured logger，**通过（适配）** |
+| `utils.logging.*` | 无单一对应 | C 类日志格式与 rank helper；全仓模块 logger 统一经 `get_logger`（发射时 rank 过滤），级别默认 INFO（上游 `TITAN_LOG_LEVEL` 未移植：不引入项目级环境变量） |
 | `components/checkpointer/checkpoint_keys.py` | 无文件对应 | C 类，checkpoint state key 常量的单一来源 |
 
 ### 9. 缺口与禁止误判项
 
 #### 9.1 真缺口
 
-- `distributed/compile.py`：**已移植**（`parallel/compile.py::apply_compile`
+- `distributed/compile.py`：**已移植**（`parallel/model_compile.py::apply_compile`
   + `CompileConfig`）。逐 block compile（`per_block`）、async TP（`_micro_pipeline_tp`
   + symm-mem，配置期/装配期双层 loud-raise）、regional_inductor（`aot_eager`×flex
   才 scoop，annotation 在 `flex_attention_hf`）、`capture_scalar_outputs`（含
@@ -954,11 +954,11 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
   shared-expert×tp（gate/up/down 布局）放行（未知布局保持 loud-raise）；tp×ep×shared 保持拒绝。真多卡前后向等价性环境未覆盖，待 torch≥2.12
   复跑。符号对应：上游
   `expert_param_placement_sparse`（EP 轴 S(0) 声明）→ llmtuner EP swap 的 per-rank
-  experts 切片（`parallel/expert_parallel/convert.py::convert_block`)；上游
+  experts 切片（`parallel/expert_parallel/block_conversion.py::convert_block`)；上游
   `dense_param_placement(tp=R)` 的 router Replicate 声明 → llmtuner router 不切 +
   `_allreduce_replicated_tp_grads` 求和；上游
   `_moe_sharding_config` 的块边界 in/out 声明（ep=1 时 Replicate）→
-  `tensor_parallel/tp.py::TPMoeSequenceBoundary`（入口 `apply_tp` 在 `tensor_parallel/apply.py`）;ep>1 时的 sequence-parallel 布局
+  `tensor_parallel/tensor_parallel.py::TPMoeSequenceBoundary`（入口 `apply_tp` 在 `tensor_parallel/tensor_parallel.py`）;ep>1 时的 sequence-parallel 布局
   → swap 后 MoE 直接消费/产出 T/tp 分片（无边界 collective);HF 侧
   `packed_colwise`/`moe_tp_experts` 规格 → `shard_experts_for_tp`。
 - RegionAC：**已接入**，`mode='region'` + `RegionACConfig`
@@ -1001,7 +1001,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
   mask 随 label 移位、超长丢弃、文本限定，语义逐字）；renderer 路径与
   chat-template 路径互斥（构造期二选一），renderer 在时不再要求 eos_id。
   接线：`DataloaderConfig.chat_renderer`/`messages_field`（仅
-  `dataset=local_jsonl_sft`）→ `datasets/build.py` →
+  `dataset=local_jsonl_sft`）→ `datasets/factory.py` →
   `make_local_jsonl_sft_multiturn`。未装 `renderers` 时启用 ImportError
   带 `pip install renderers==0.1.11` 指引；默认关闭逐位不变。真实库数值
   未验证（本机无 renderers，单测用 sys.modules fake 模块覆盖），解锁条件：
@@ -1024,7 +1024,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
   padding 契约），解锁条件：CUDA 目标设备装 torchao 复跑。
 - router `_debug_force_load_balance`：**已移植**（`TokenChoiceTopKRouter`
   同名构造参数，round-robin 语义逐字一致，见 §4.3）。
-- PP per-stage seed：**已移植**（`trainer/builder.py::derive_distinct_seed` +
+- PP per-stage seed：**已移植**（`trainer/runtime/assembly.py::derive_distinct_seed` +
   trainer 接线；DTensor RNG tracker 不移植）。
 - `pipeline_with_first_stage_modules`：**已移植**（`apply_pp` 的
   `first_stage_module_fqns` 参数 + `prepend_first_stage_modules`；
@@ -1071,21 +1071,21 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `components/optimizer/utils.py` | optimizer state 初始化与 flat/FQN 转换 | A1，同文件 |
 | `components/profiler.py` | `Profiler`, `MemoryProfiler` | A2，`observability/profiler.py` |
 | `components/tokenizer.py` | tokenizer 三类 | A1，同文件 |
-| `datasets/build.py` | `build_dataloader` | C，config build 替代品 |
+| `datasets/factory.py` | `build_dataloader` | C，config build 替代品 |
 | `datasets/collators.py` | `Collator`, `TextCollator` | A2，`components/data/collators.py` |
-| `datasets/dataset.py` | dataset nodes 与 build 工厂 | A2，`components/data/dataset.py` |
-| `datasets/loader.py` | `BaseDataLoader`, `GrainDataLoader` | A2，`components/data/loader.py` |
+| `datasets/graph.py` | dataset nodes 与 build 工厂 | A2，`components/data/dataset.py` |
+| `datasets/dataloader.py` | `BaseDataLoader`, `GrainDataLoader` | A2，`components/data/loader.py` |
 | `datasets/multimodal/collator.py` | `MultiModalCollator` | A2，`hf_datasets/multimodal/mm_collator.py` |
 | `datasets/multimodal/datasets.py` | processor 与 sample packing | A2，`hf_datasets/multimodal/mm_datasets.py` |
 | `datasets/multimodal/image.py` | decode/resize/patch helpers | A1，`hf_datasets/multimodal/utils/image.py` |
-| `datasets/multimodal/text.py` | padding 与 placeholder helpers | A1，`hf_datasets/multimodal/utils/text.py` |
+| `datasets/multimodal/placeholders.py` | padding 与 placeholder helpers | A1，`hf_datasets/multimodal/utils/text.py` |
 | `datasets/multimodal/video.py` | video load/process | A1，`hf_datasets/multimodal/utils/video.py` |
 | `datasets/packing/` | 两种 packing 与 Stateful iterator | A2，`components/data/packing.py` |
-| `datasets/random_data.py` | synthetic source/loader | C |
+| `datasets/synthetic.py` | synthetic source/loader | C |
 | `datasets/sources.py` | JSONL/HF sources 与 cursor | A2，`components/data/sources.py` |
 | `datasets/text/processors.py` | text/chat processors | A2，`hf_datasets/text_datasets.py` |
 | `datasets/text/renderer.py` | 可选 renderer 适配层（`build_chat_renderer` / `RendererTokenizerWrapper`） | B，`components/renderer.py`（未装 `renderers` 时 ImportError） |
-| `datasets/types.py` | build context/iteration policy | A2，`components/data/types.py` |
+| `datasets/contracts.py` | build context/iteration policy | A2，`components/data/types.py` |
 | `models/common/activation.py` | activation wrappers | C，同名不同源 |
 | `models/common/aux_loss.py` | aux-loss carrier/registry/hooks | A2，同文件 |
 | `models/common/async_linear.py` | TP-overlap projections/FFN | A2，同路径同名 |
@@ -1098,45 +1098,45 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `models/common/moe/`（`block.py` MoE 本体 + `router.py` + `experts.py` + `dispatcher.py` + `load_balance.py` + `balancing.py`） | router、experts、MoE、balance loss、bias 更新钩子 | A2，上游单文件 `moe.py` + `token_dispatcher.py`；llmtuner 拆为子包 |
 | `models/common/multimodal.py` | vision/text fusion helpers | A2，同文件 |
 | `models/common/attention/qkv.py` | fused QKV 与 state hooks | A2，`attention.py` 拆分 |
-| （上游）`models/common/config_utils.py` | 上游 config 工厂：`make_*_config`、`fused_*_param_init`、`get_attention_config`、`make_token_dispatcher_config` | 无对应物：llmtuner 没有 config tree，`Module.Config` 那层整体不存在，其*判定*分别落在 `expert_parallel/probe.py`（top_k/score_func/route_norm/route_scale/expert groups）、`parallel/matrix.py`（组合裁决与 loud-raise）、`models/hf/factory.py`（HF config 构建）、`models/hf/model.py` 的 `flex_supported`（attention backend 选择） |
+| （上游）`models/common/config_utils.py` | 上游 config 工厂：`make_*_config`、`fused_*_param_init`、`get_attention_config`、`make_token_dispatcher_config` | 无对应物：llmtuner 没有 config tree，`Module.Config` 那层整体不存在，其*判定*分别落在 `expert_parallel/hf_inspection.py`（top_k/score_func/route_norm/route_scale/expert groups）、`parallel/compatibility.py`（组合裁决与 loud-raise）、`models/hf/factory.py`（HF config 构建）、`models/hf/model.py` 的 `flex_supported`（attention backend 选择） |
 | （上游）`models/common/lora.py` | `get_lora_linear`/`get_lora_grouped_linear` | 无对应物（裁剪面）：LoRA 由 HF/peft 提供，llmtuner 不持有上游 `_linear()` seam 与量化轴，故不移植 |
 | `models/common/rope.py` | RoPE 全家族 | A2，同文件 |
 | `models/common/scatter_add.py` | deterministic scatter-add autograd | A2，`ops/scatter_add.py` |
-| `models/common/moe/dispatcher.py` | local/all-to-all dispatchers + TorchAO 可选导入适配层；DeepEP/HybridEP 登记缺口（config 期 loud-raise） | A2，同文件 |
+| `models/common/moe/token_dispatch.py` | local/all-to-all dispatchers + TorchAO 可选导入适配层；DeepEP/HybridEP 登记缺口（config 期 loud-raise） | A2，同文件 |
 | `models/hf/model.py` + `models/hf/factory.py` + `models/hf/flops.py` | wrapper/forward、config 构建/类解析/meta materialize、FLOPs | B，transformers backend model（`model.py` 与上游 `.../model.py` 同名） |
 | （上游）`experiments/transformers_modeling_backend/` 的 `module_conversion.py` / `config_registry.py` / `__init__.py` | HF 模块的 `Module` 协议转换 / 实验用家族 config 注册表 / 模型注册表 | 无对应物：llmtuner 没有 `Module` 协议这一层（同类 `__class__` swap 技术用于 `GatherSequenceFirst`/`TPMoeSequenceBoundary`/TP realizer），config 由 HF `AutoConfig` + `config/` 门面构建，模型类由 HF auto mapping 解析（`resolve_model_class`） |
 | `models/hf/state_dict_adapter.py` | HF↔llmtuner state-dict 键转换与 safetensors index 严格校验 | B，`experiments/.../state_dict_adapter.py` |
 | `memory/activation_checkpoint.py` | full/selective AC | A2，distributed AC |
-| `parallel/compile.py` | `apply_compile`（逐 block compile / async TP / regional_inductor / capture_scalar_outputs） | A2，`distributed/compile.py` |
+| `parallel/model_compile.py` | `apply_compile`（逐 block compile / async TP / regional_inductor / capture_scalar_outputs） | A2，`distributed/compile.py` |
 | `accelerator/collectives.py` | reductions、timeouts、grad norm | A2（部分），`distributed/utils.py` 的两个 vendored 符号；外加 mmengine 来源的 in-place `all_reduce`（原 `accelerator/dist.py`，已并入） |
-| `parallel/context_parallel/apply.py` | `apply_cp` | C，独立 HF 编排层 |
-| `parallel/context_parallel/cp_kernel.py` | `CPFlexKernel` 与 seq/head autograd | C，CP flex attention 组合实现 |
-| `parallel/context_parallel/input_shard.py` | CP/TP batch 和 mask sharding | C，独立输入分片层 |
-| `accelerator/dist_utils.py`、`accelerator/tensor_transfer.py` | 前者负责 init_dist 多 launcher 与 rank/group 查询；后者负责嵌套张量设备搬运，旧导入路径继续可用 | C，vendored 自 OpenMMLab `mmengine.dist`（非 torchtitan 来源），已去 mmengine 化；原同包 `dist.py` 的无消费者面（object collectives、gather/broadcast、collect_results 等）已删，唯一在用的 `all_reduce` 并入 `collectives.py` |
+| `parallel/context_parallel/context_parallel.py` | `apply_cp` | C，独立 HF 编排层 |
+| `parallel/context_parallel/attention.py` | `CPFlexKernel` 与 seq/head autograd | C，CP flex attention 组合实现 |
+| `parallel/context_parallel/input_sharding.py` | CP/TP batch 和 mask sharding | C，独立输入分片层 |
+| `accelerator/distributed.py`、`accelerator/tensors.py` | 前者负责 init_dist 多 launcher 与 rank/group 查询；后者负责嵌套张量设备搬运，旧导入路径继续可用 | C，vendored 自 OpenMMLab `mmengine.dist`（非 torchtitan 来源），已去 mmengine 化；原同包 `dist.py` 的无消费者面（object collectives、gather/broadcast、collect_results 等）已删，唯一在用的 `all_reduce` 并入 `collectives.py` |
 | `parallel/expert_parallel/apply.py` | `apply_ep` | B，模型 EP parallelize |
-| `parallel/expert_parallel/swap.py`（编排）+ `probe.py`（探测）+ `convert.py`（转换） | HF MoE 探测、权重搬运与 swap | B，transformers backend `moe_replacement.py` |
+| `parallel/expert_parallel/model_replacement.py`（编排）+ `probe.py`（探测）+ `convert.py`（转换） | HF MoE 探测、权重搬运与 swap | B，transformers backend `moe_replacement.py` |
 | `parallel/fully_shard/fsdp.py` | FSDP engine、mesh 与 placement | A2，`distributed/fsdp.py` |
 | `parallel/fully_shard/apply.py` | `apply_fsdp` HF driver | B，各模型 parallelize |
-| `parallel/parallel_dims.py`（含 mesh 构建 `build_parallel_dims` / `build_mesh`） | `ParallelDims` 与 mesh accessors、dims/mesh/distributed init | A2，`distributed/parallel_dims.py`；mesh 构建段上游无单一对应物 |
-| `parallel/head_sharding.py` | attention 头数整除守卫：`apply_tp` 的 `% tp` 与 ulysses CP 的 `% (tp*cp)` 共用一个实现 | B，上游解析期的 `head_shard_degree` 校验（上游在解析期校验，llmtuner 在装配期，因为头数只存在于模型 config 里） |
-| `parallel/context_parallel/apply.py` 读的 `context_parallel_load_balancer` 默认值 | CP 输入分片是否做 headtail 均衡 | B，`config/parallelism.py` 的 `context_parallel_load_balancer`（上游默认 `None`=连续分片，headtail 由 recipe 显式打开；上游自测 `test_config_manager.py` 亦断言默认 `None`）→ llmtuner 默认同为 `None`，均衡分片是显式选择（它改变每个 rank 参与 attention 的 token 集合，不该由默认替用户决定） |
+| `parallel/topology.py`（含 mesh 构建 `build_parallel_topology` / `build_mesh`） | `ParallelTopology` 与 mesh accessors、dims/mesh/distributed init | A2，`distributed/topology.py`；mesh 构建段上游无单一对应物 |
+| `parallel/attention_heads.py` | attention 头数整除守卫：`apply_tp` 的 `% tp` 与 ulysses CP 的 `% (tp*cp)` 共用一个实现 | B，上游解析期的 `head_shard_degree` 校验（上游在解析期校验，llmtuner 在装配期，因为头数只存在于模型 config 里） |
+| `parallel/context_parallel/context_parallel.py` 读的 `context_parallel_load_balancer` 默认值 | CP 输入分片是否做 headtail 均衡 | B，`config/parallel_config.py` 的 `context_parallel_load_balancer`（上游默认 `None`=连续分片，headtail 由 recipe 显式打开；上游自测 `test_config_manager.py` 亦断言默认 `None`）→ llmtuner 默认同为 `None`，均衡分片是显式选择（它改变每个 rank 参与 attention 的 token 集合，不该由默认替用户决定） |
 | `parallel/parallelize.py` | 五种并行的总装配 | B，transformers backend parallelize |
 | `parallel/stages.py` | `STAGES` / `STAGE_ORDER` / `PP_STAGE_ORDER`：装配顺序契约的单一来源 | C，上游无对应物 |
-| `parallel/pipeline_parallel/pipeline.py` | FQN split 与 stage 构造 | A2，transformers backend pipeline |
-| `parallel/pipeline_parallel/apply.py` | metadata、apply、schedule build | B，`distributed/pipeline_parallel.py` |
-| `parallel/tensor_parallel/linear.py` | fused/fallback collective GEMM | A2，`models/common/async_linear.py`（上游 `distributed/linear.py` 的后继） |
-| `parallel/tensor_parallel/tp.py` + `apply.py` | HF plan realizer 与 `apply_tp` 入口 | B，各模型 TP plan（上游 `distributed/tensor_parallel.py` 于 `7e7f271e0` 删除，后继为 `protocols/sharding.py` + `hf_sharding.py` / `decoder_sharding.py` 的声明面） |
+| `parallel/pipeline_parallel/partition.py` | FQN split 与 stage 构造 | A2，transformers backend pipeline |
+| `parallel/pipeline_parallel/pipeline_parallel.py` | metadata、apply、schedule build | B，`distributed/pipeline_parallel.py` |
+| `parallel/tensor_parallel/linear_ops.py` | fused/fallback collective GEMM | A2，`models/common/async_linear.py`（上游 `distributed/linear.py` 的后继） |
+| `parallel/tensor_parallel/tensor_parallel.py` + `apply.py` | HF plan realizer 与 `apply_tp` 入口 | B，各模型 TP plan（上游 `distributed/tensor_parallel.py` 于 `7e7f271e0` 删除，后继为 `protocols/sharding.py` + `hf_sharding.py` / `decoder_sharding.py` 的声明面） |
 | `config/`（`model/parallel/optimizer/checkpoint/data/observability/activation_checkpoint/compile/validation/training/root.py` + `cli.py`） | 全部配置 dataclass，逐组 `__post_init__` 校验；`cli.py` 是解析面的视图（`PARSER_GROUPS` + `cli_groups`），把 CLI 载不动的字段摘出 `--help` | B，`config/configs.py` + 嵌套 Config |
-| `trainer/train.py` | parse/main | B，根 `train.py` |
+| `trainer/cli.py` | parse/main | B，根 `train.py` |
 | `trainer/trainer.py` + `builder.py`（装配段与播种）/ `validate.py` / `batch.py` | 完整训练生命周期 | B，根 `trainer.py` + `training_engine.py` |
 | `components/checkpointer/checkpoint_keys.py` | checkpoint state key 常量 | C |
 | `accelerator/device.py` | 设备发现、backend 选择、pin-memory 判定；mmengine 厂商谓词面（`is_cuda_available`/`is_npu_available`/full-precision 探针/`get_max_cuda_memory`）作为设备能力小面保留给下游脚本，llmtuner 自身不调用 | C |
 | `components/checkpointer/filesystem.py` | path/storage helpers | A1，`tools/filesystem.py` |
-| `utils/gc.py` | `GarbageCollection` | B，`tools/utils.py` |
-| `utils/logger_utils.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤，默认 INFO）、`set_log_ranks`（控制台打印 rank 集合，由 `MetricsConfig.log_ranks` 接线）、`get_distributed_rank` | C |
+| `utils/garbage_collection.py` | `GarbageCollection` | B，`tools/utils.py` |
+| `utils/logging.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤，默认 INFO）、`set_log_ranks`（控制台打印 rank 集合，由 `MetricsConfig.log_ranks` 接线）、`get_distributed_rank` | C |
 | `utils/lazy_exports.py` | `export_names` / `resolve_export`：各包索引共用的 PEP 562 懒加载实现 | C |
 | `utils/monitoring.py` | device/memory/FLOPS helpers | C；部分意图可参考 `tools/utils.py` |
-| `accelerator/spmd_context.py` | SPMD mesh 上下文 | C，pip `spmd_types` 适配 |
+| `accelerator/spmd.py` | SPMD mesh 上下文 | C，pip `spmd_types` 适配 |
 
 五条横切约定，适用于上表所有模块：
 
@@ -1144,7 +1144,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
   `llmtuner.config.*` / CLI；集成面与内部分级见 design doc §3.4。
 - **组合判定**：分工两处——config 期可判的组合校验在各 config 的 `__post_init__`
   （与其余字段校验同处）；跨层组合裁决（assembly/probe 期）的单一来源是
-  `parallel/matrix.py`（每个组合一个普通函数 + 底部 `ENTRIES` 扁平表一行；守卫点
+  `parallel/compatibility.py`（每个组合一个普通函数 + 底部 `ENTRIES` 扁平表一行；守卫点
   触发、函数给出判定与文案）。
 - **能力探测**：torch 版本/环境探测集中在 `accelerator/capabilities.py`
   （`has`/`require`，缺失经 `EnvironmentUnsupportedError` 报解锁指引）。
@@ -1263,7 +1263,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
    五部件契约；`named_children()` 不负责改写 state-dict FQN。
 4. 模型和并行底层不得读取 trainer 的全局运行配置。
 5. TP、CP、EP、PP 和 FSDP 的未支持组合必须 fail fast。
-6. `accelerator/spmd_context.py` 是活跃运行路径，由 trainer 和 `models/common/*`
+6. `accelerator/spmd.py` 是活跃运行路径，由 trainer 和 `models/common/*`
    使用。
 
 ### 3. 执行前准备
@@ -1343,12 +1343,12 @@ git -C <torchtitan> log <上次-torchtitan-基线>..HEAD -- torchtitan/
 
 - `models/hf/model.py`
 - `parallel/parallelize.py`
-- `parallel/tensor_parallel/tp.py`
+- `parallel/tensor_parallel/tensor_parallel.py`
 - `parallel/expert_parallel/*`
-- `parallel/context_parallel/cp_kernel.py`（CP redistribution 与 kernel）
+- `parallel/context_parallel/attention.py`（CP redistribution 与 kernel）
 - `parallel/fully_shard/apply.py`
-- `parallel/pipeline_parallel/apply.py`
-- `trainer/*` 与 `parallel/parallel_dims.py` 的 build 入口
+- `parallel/pipeline_parallel/pipeline_parallel.py`
+- `trainer/*` 与 `parallel/topology.py` 的 build 入口
 
 实现前必须写明对应不变量，例如：
 
@@ -1362,7 +1362,7 @@ git -C <torchtitan> log <上次-torchtitan-基线>..HEAD -- torchtitan/
 
 C 类没有可机械同步的上游实现，只能依据 llmtuner 的调用图、设计契约和测试判断是否修改。
 
-- `accelerator/spmd_context.py` 是活代码。
+- `accelerator/spmd.py` 是活代码。
 - CP 编排、flex kernel、random dataset、build factory 和工具模块不能因低相似度或
   同名文件被强行覆盖。
 

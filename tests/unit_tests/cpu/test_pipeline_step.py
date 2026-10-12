@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from llmtuner.datasets.types import Batch
+from llmtuner.datasets.contracts import Batch
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.trainer.pipeline_step import split_pipeline_microbatches
+from llmtuner.trainer.runtime.pipeline import split_pipeline_microbatches
 
 
 def _trainer(num_microbatches: int):

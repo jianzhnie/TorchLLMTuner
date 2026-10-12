@@ -26,7 +26,7 @@ from llmtuner.models.common.feed_forward import (
 )
 from llmtuner.models.common.linear import PartialBiasRowwiseLinear, RouterGateLinear
 from llmtuner.models.common.moe.experts import GroupedExperts
-from llmtuner.models.common.moe.router import TokenChoiceTopKRouter
+from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
 
 
 def _ffn(dim: int = 8, hidden: int = 6) -> FeedForward:
@@ -250,7 +250,7 @@ def test_router_gate_matches_a_plain_fp32_linear() -> None:
 
 def test_router_gate_is_the_moe_router_projection() -> None:
     """One class, imported by the MoE router -- not a second copy of it."""
-    from llmtuner.models.common.moe.router import RouterGateLinear as FromRouter
+    from llmtuner.models.common.moe.routing import RouterGateLinear as FromRouter
 
     assert FromRouter is RouterGateLinear
 

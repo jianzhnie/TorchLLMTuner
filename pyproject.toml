@@ -30,11 +30,11 @@ dependencies = [
     # torchtitan's transformers_modeling_backend experiment, which this
     # aligns with.
     "transformers>=5.9,<5.10",
-    # Direct import in utils/logger_utils.py (reached from trainer/config.py) --
+    # Direct import in utils/logging.py (reached from trainer/config.py) --
     # undeclared until now, and pulled in only transitively by transformers.
     "colorama>=0.4",
     # Used by the SPMD type-checker and by the mesh helpers in
-    # accelerator/spmd_context.py.
+    # accelerator/spmd.py.
     # Pinned exactly -- the API is still moving. Upstream moved to a main-commit
     # pin for torch_remat-under-TP fixes (metadata queries no longer type
     # checked, assert_type_like overrides replace per group); llmtuner stays on
@@ -76,7 +76,7 @@ dev = [
 ]
 
 [project.scripts]
-llmtuner-train = "llmtuner.trainer.train:main"
+llmtuner-train = "llmtuner.trainer.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/jianzhnie/TorchLLMTuner"

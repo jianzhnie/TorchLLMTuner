@@ -51,9 +51,9 @@ from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import all_reduce
+from llmtuner.config import ParallelConfig
 from llmtuner.parallel.fully_shard_parallel import apply_fsdp
-from llmtuner.parallel.parallel_dims import ParallelDims
-from llmtuner.trainer import ParallelConfig
+from llmtuner.parallel.topology import ParallelTopology
 
 VOCAB = 32
 HIDDEN = 16
@@ -138,7 +138,7 @@ def main() -> None:
         cfg = ParallelConfig(data_parallel_replicate_size=2)
     else:
         cfg = ParallelConfig(data_parallel_shard_size=2)
-    parallel_dims = ParallelDims.from_config(cfg, world)
+    parallel_dims = ParallelTopology.from_config(cfg, world)
     parallel_dims.build_mesh()
     loss_mesh = parallel_dims.get_mesh("loss")
 
