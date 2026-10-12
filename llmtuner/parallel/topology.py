@@ -1,10 +1,9 @@
-"""``ParallelDims``: the resolved parallel degrees and every DeviceMesh built
-from them.
+"""Resolved parallel degrees and every DeviceMesh view built from them.
 
 Config says how many ways to split (``config/parallel_config.py``); this module turns
 that into the actual process topology: the dense mesh (dp_shard x dp_replicate
 x cp x tp, x pp) and, under EP, the sparse mesh (pp x dp_replicate x efsdp x
-ep). It also owns the module-level ``build_parallel_dims`` / ``build_mesh``
+ep). It also owns ``build_parallel_topology`` and ``build_mesh``
 entry points and the loss/dataloading sub-mesh derivations the trainer
 reduces over.
 """
@@ -19,7 +18,7 @@ from llmtuner.config import LLMTunerConfig, ParallelConfig
 from llmtuner.errors import ConfigError
 
 from ..accelerator.device import device_type
-from ..utils.logger_utils import get_logger
+from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -27,13 +26,15 @@ logger = get_logger(__name__)
 __all__ = [
     "MESH_AXES",
     "ParallelDims",
+    "ParallelTopology",
     "build_mesh",
     "build_parallel_dims",
+    "build_parallel_topology",
 ]
 
 
 @dataclass
-class ParallelDims:
+class ParallelTopology:
     dp_replicate: int
     dp_shard: int
     cp: int
@@ -52,7 +53,7 @@ class ParallelDims:
     @classmethod
     def from_config(
         cls, parallelism_config: ParallelConfig, world_size: int
-    ) -> ParallelDims:
+    ) -> ParallelTopology:
         return cls(
             dp_replicate=parallelism_config.data_parallel_replicate_size,
             dp_shard=parallelism_config.data_parallel_shard_size,
@@ -500,7 +501,9 @@ class ParallelDims:
 MESH_AXES = ("dp", "cp", "tp")
 
 
-def build_parallel_dims(cfg: LLMTunerConfig, world_size: int) -> ParallelDims | None:
+def build_parallel_topology(
+    cfg: LLMTunerConfig, world_size: int
+) -> ParallelTopology | None:
     """Resolve the parallelism degrees against ``world_size`` (torchtitan class).
 
     Single-process (step 0, no torchrun) -> ``None``: no process group, no
@@ -537,10 +540,10 @@ def build_parallel_dims(cfg: LLMTunerConfig, world_size: int) -> ParallelDims | 
                 "at the matching world size or set them back to 1."
             )
         return None
-    return ParallelDims.from_config(cfg.parallel, world_size)
+    return ParallelTopology.from_config(cfg.parallel, world_size)
 
 
-def build_mesh(parallel_dims: ParallelDims | None):
+def build_mesh(parallel_dims: ParallelTopology | None):
     """The dense ``(dp, cp, tp)`` mesh the parallel ``apply_*`` functions index.
 
     Takes the *already-resolved* ``ParallelDims`` (see ``build_parallel_dims``)
@@ -584,3 +587,8 @@ def build_mesh(parallel_dims: ParallelDims | None):
             f"({parallel_dims.world_size} ranks); is pp > 1?"
         )
     return mesh
+
+
+# Compatibility aliases for external callers using the earlier terminology.
+ParallelDims = ParallelTopology
+build_parallel_dims = build_parallel_topology

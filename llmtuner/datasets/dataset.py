@@ -35,6 +35,7 @@ from typing import Any, TypeAlias, cast
 import grain.python as grain
 import numpy as np
 
+from .contracts import DatasetBuildContext, DatasetIterationPolicy
 from .sources import (
     HuggingFaceRandomAccessSource,
     HuggingFaceStreamingSource,
@@ -42,7 +43,6 @@ from .sources import (
     RandomAccessDataSource,
     build_source,
 )
-from .types import DatasetBuildContext, DatasetIterationPolicy
 
 __all__ = [
     "DatasetConcat",

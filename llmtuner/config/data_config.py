@@ -162,7 +162,7 @@ class DataloaderConfig:
                 )
         # Membership in ``datasets.text.processors.DATASETS`` /
         # ``datasets.multimodal.datasets.MM_DATASETS`` is checked by
-        # ``datasets/build.py`` at build time, not here: reading the registries
+        # ``datasets/factory.py`` at build time, not here: reading the registries
         # would import the datasets package into the config layer.
         if self.max_num_documents is not None and self.max_num_documents < 1:
             raise ConfigError(

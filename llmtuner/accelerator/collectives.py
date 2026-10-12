@@ -17,7 +17,7 @@ The reductions and ``clip_grad_norm_`` are vendored from torchtitan
   a reduction and its mesh; llmtuner's counterpart is this module's
   ``all_reduce`` (cast to the comm device + in-place c10d collective, vendored
   from mmengine's ``dist.all_reduce``), called at the site.
-  ``trainer/trainer.py`` and ``trainer/validate.py`` reduce their loss/token
+  ``trainer/trainer.py`` and ``trainer/runtime/validation.py`` reduce loss/token
   denominators over ``dp_mesh`` / ``loss_mesh`` with it, and
   ``components/metrics.py`` reduces nothing at all (see its docstring), so
   there is no caller that would read better with a named helper. This also
@@ -38,7 +38,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
-from ..utils.logger_utils import get_logger
+from ..utils.logging import get_logger
 from .device import device_module
 from .dist_utils import (
     get_comm_device,

@@ -1,7 +1,7 @@
 """Cross-layer combination verdicts: the single source for assembly/probe guards.
 
 The support matrix's scope is the combinations that need MORE than the config
-to decide -- assembly time (the model, the resolved ``ParallelDims``, the
+to decide -- assembly time (the model, the resolved ``ParallelTopology``, the
 dataset name) and probe time (the HF model's layout, via the EP swap's
 duck-typed probes). Each is a plain function below plus one row in the
 ``ENTRIES`` table at the bottom: the function carries the verdict (exception
@@ -335,13 +335,13 @@ ENTRIES: tuple[Row, ...] = (
         validation_once_requires_dp1,
         "assembly",
         ConfigError,
-        "trainer/validate.py::check_validation_feasibility",
+        "trainer/runtime/validation.py::check_validation_feasibility",
     ),
     Row(
         validation_once_requires_finite_corpus,
         "assembly",
         ConfigError,
-        "trainer/validate.py::check_validation_feasibility",
+        "trainer/runtime/validation.py::check_validation_feasibility",
     ),
     Row(
         chunked_loss_pp,
@@ -353,13 +353,13 @@ ENTRIES: tuple[Row, ...] = (
         ep_hf_initial_load,
         "assembly",
         UnsupportedCombinationError,
-        "trainer/builder.py::build_trainer_state",
+        "trainer/runtime/assembly.py::build_trainer_state",
     ),
     Row(
         chunked_loss_validation,
         "assembly",
         UnsupportedCombinationError,
-        "trainer/validate.py::check_validation_feasibility",
+        "trainer/runtime/validation.py::check_validation_feasibility",
     ),
     Row(
         pp_weight_tying,
@@ -377,7 +377,7 @@ ENTRIES: tuple[Row, ...] = (
         pp_packed_microbatch_split,
         "assembly",
         UnsupportedCombinationError,
-        "trainer/pipeline_step.py::split_pipeline_microbatches",
+        "trainer/pipeline.py::split_pipeline_microbatches",
     ),
     Row(
         shared_expert_tp,
@@ -407,48 +407,48 @@ ENTRIES: tuple[Row, ...] = (
         ptrr_load_balancer_backstop,
         "assembly",
         UnsupportedCombinationError,
-        "parallel/context_parallel/input_shard.py::resolve_load_balancer",
+        "parallel/context_parallel/input_sharding.py::resolve_load_balancer",
     ),
     Row(
         gpt_oss_layout,
         "probe",
         UnsupportedCombinationError,
-        "parallel/expert_parallel/probe.py::fused_experts_of",
+        "parallel/expert_parallel/hf_layout.py::fused_experts_of",
     ),
     Row(
         group_limited_greedy,
         "probe",
         UnsupportedCombinationError,
-        "parallel/expert_parallel/probe.py::read_expert_groups",
+        "parallel/expert_parallel/hf_layout.py::read_expert_groups",
     ),
     Row(
         router_bias,
         "probe",
         UnsupportedCombinationError,
-        "parallel/expert_parallel/convert.py::convert_block",
+        "parallel/expert_parallel/conversion.py::convert_block",
     ),
     Row(
         quantile_requires_sigmoid,
         "probe",
         UnsupportedCombinationError,
-        "parallel/expert_parallel/convert.py::convert_block",
+        "parallel/expert_parallel/conversion.py::convert_block",
     ),
     Row(
         quantile_no_group_limit,
         "probe",
         UnsupportedCombinationError,
-        "parallel/expert_parallel/convert.py::convert_block",
+        "parallel/expert_parallel/conversion.py::convert_block",
     ),
     Row(
         shared_expert_gate,
         "probe",
         UnsupportedCombinationError,
-        "parallel/expert_parallel/convert.py::convert_block",
+        "parallel/expert_parallel/conversion.py::convert_block",
     ),
     Row(
         shared_expert_tp_ep,
         "probe",
         UnsupportedCombinationError,
-        "parallel/expert_parallel/convert.py::convert_block",
+        "parallel/expert_parallel/conversion.py::convert_block",
     ),
 )

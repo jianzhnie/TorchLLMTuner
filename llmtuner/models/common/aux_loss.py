@@ -11,7 +11,7 @@ Vendored from torchtitan ``models/common/aux_loss.py``. What changed:
 * The ``spmd_types`` blocks are gone. ``spmd_assert_type`` on the injection's
   output described a placement the framework already inferred.
 * ``OptimizersContainer`` becomes a plain ``torch.optim.Optimizer`` (llmtuner's
-  trainer owns one directly) and ``ParallelDims`` is llmtuner's.
+  trainer owns one directly) and ``ParallelTopology`` is llmtuner's.
 
 Design, unchanged from upstream:
 
@@ -41,12 +41,12 @@ from torch.distributed._functional_collectives import all_reduce
 from llmtuner.accelerator.device import device_type
 
 if TYPE_CHECKING:
-    # Annotation-only: ``ParallelDims`` appears in two signatures below and
+    # Annotation-only: ``ParallelTopology`` appears in two signatures below and
     # nowhere at runtime. Importing it eagerly would form a cycle --
     # ``parallel/__init__`` -> ``expert_parallel`` -> ``moe/load_balance`` ->
     # here -- which is entered whenever a model module is imported before
     # ``llmtuner.parallel``.
-    from llmtuner.parallel.parallel_dims import ParallelDims
+    from llmtuner.parallel.topology import ParallelTopology
 
 __all__ = [
     "AuxLoss",
@@ -229,7 +229,7 @@ def zero_aux_losses(model_parts: Sequence[nn.Module]) -> None:
                 module.instance_acc.zero_()
 
 
-def collect_aux_loss_metrics(parallel_dims: ParallelDims) -> dict[str, float]:
+def collect_aux_loss_metrics(parallel_dims: ParallelTopology) -> dict[str, float]:
     """Reduce the current step's ``group_acc`` registers for logging.
 
     Returns ``{metric_name}/mean`` per group, or ``{}`` when no auxiliary loss
@@ -269,7 +269,7 @@ def collect_aux_loss_metrics(parallel_dims: ParallelDims) -> dict[str, float]:
 def register_aux_loss_zero_hook(
     optimizer: torch.optim.Optimizer,
     model_parts: Sequence[nn.Module],
-    parallel_dims: ParallelDims,
+    parallel_dims: ParallelTopology,
 ) -> None:
     """Register the step pre-hook that rolls ``instance_acc`` into ``group_acc``.
 

@@ -4,14 +4,14 @@
 the assembly order, which is a contract:
 
 1. process group + rank resolution, then degree resolution
-   (``build_parallel_dims``) -- the PP seed offset below needs this rank's
+   (``build_parallel_topology``) -- the PP seed offset below needs this rank's
    stage coordinate;
 2. combination guards (``llmtuner/parallel/compatibility.py``)
    fires here: validation feasibility, chunked-loss x PP, EP x HF-initial-load
    (EP x checkpoint itself is supported since 2026-10, see
    ``parallel/expert_parallel/checkpoint.py``);
 3. deterministic seeding (before any model build);
-4. the mesh (``build_mesh`` -- see ``llmtuner/parallel/parallel_dims.py``);
+4. the mesh (``build_mesh`` -- see ``llmtuner/parallel/topology.py``);
 5. the model, then parallelism in stage-table order
    (``llmtuner/parallel/stages.py``, driven by ``parallelize_hf_transformers``);
 6. optimizer, lr schedule, EMA, and the MoE aux/balance pre-hooks;
@@ -29,34 +29,34 @@ from typing import Any
 
 import torch
 
-from .. import parallel
-from ..accelerator.device import (
+from ... import parallel
+from ...accelerator.device import (
     device_type,
     get_distributed_backend,
     get_env_dist_info,
 )
-from ..accelerator.dist_utils import init_dist_pytorch, is_distributed
-from ..components.checkpointer import DATALOADER, TRAIN_STATE, CheckpointManager
-from ..components.metrics import MetricsProcessor
-from ..components.optimizer import EMA, OptimizersContainer, build_lr_scheduler
-from ..models.common.aux_loss import register_aux_loss_zero_hook
-from ..models.common.moe.balancing import (
+from ...accelerator.dist_utils import init_dist_pytorch, is_distributed
+from ...components.checkpointer import DATALOADER, TRAIN_STATE, CheckpointManager
+from ...components.metrics import MetricsProcessor
+from ...components.optimizer import EMA, OptimizersContainer, build_lr_scheduler
+from ...models.common.aux_loss import register_aux_loss_zero_hook
+from ...models.common.moe.balancing import (
     register_moe_load_balancing_hook,
     register_moe_quantile_balancing_hook,
 )
-from ..models.hf.factory import (
+from ...models.hf.factory import (
     build_model_config_for,
     materialize_meta_model,
     num_flops_per_token,
 )
-from ..models.hf.model import HFTransformerModel
-from ..models.hf.state_dict_adapter import HFTransformerStateDictAdapter
-from ..parallel import compatibility
-from ..parallel.parallel_dims import build_mesh, build_parallel_dims
-from ..parallel.pipeline_parallel import PipelineParallelSetup
-from ..utils import logger_utils
-from ..utils.logger_utils import get_logger
-from ..utils.random import seed_everything as _seed_everything
+from ...models.hf.model import HFTransformerModel
+from ...models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from ...parallel import compatibility
+from ...parallel.pipeline_parallel import PipelineParallelSetup
+from ...parallel.topology import build_mesh, build_parallel_topology
+from ...utils import logging as logging_utils
+from ...utils.logging import get_logger
+from ...utils.seeding import seed_everything as _seed_everything
 
 logger = get_logger(__name__)
 
@@ -78,7 +78,7 @@ def _build_model(self, cfg):
     #
     # Chunked loss + PP is rejected up front: under PP the last stage's
     # loss is computed inside the schedule
-    # (``pipeline_parallel/apply.py:scalar_loss_fn``), which receives logits
+    # (``pipeline_parallel/pipeline_parallel.py:scalar_loss_fn``), which receives logits
     # from the stage forward. Rewiring that seam for hidden states plus a
     # per-chunk backward is a PP-side change, so the combination loud-raises
     # here rather than training on a silently un-chunked (or wrong) loss.
@@ -270,7 +270,7 @@ def build_trainer_state(self, cfg) -> None:
     # Resolve the degrees first: the PP seed offset below needs this rank's
     # stage coordinate, and degree resolution draws no random numbers, so
     # seeding after it leaves every non-PP run bit-identical.
-    self.parallel_dims = build_parallel_dims(cfg, self.world_size)
+    self.parallel_dims = build_parallel_topology(cfg, self.world_size)
 
     # Validation's infeasible combinations are rejected here, before the
     # model and dataloader exist: a ``steps=-1`` pass that cannot terminate
@@ -354,7 +354,7 @@ def build_trainer_state(self, cfg) -> None:
         tag=cfg.metrics.tag,
     )
     # The trainer synchronizes PP loss metrics to every stage before logging.
-    logger_utils.set_log_ranks(cfg.metrics.log_ranks)
+    logging_utils.set_log_ranks(cfg.metrics.log_ranks)
 
 
 # -- seeding ------------------------------------------------------------------

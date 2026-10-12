@@ -102,7 +102,7 @@ from llmtuner.config import (
 from ..accelerator.capabilities import has
 from ..errors import EnvironmentUnsupportedError
 from ..models.common.aux_loss import AuxLoss, in_checkpoint_recompute
-from ..utils.logger_utils import get_logger
+from ..utils.logging import get_logger
 from .remat_regions import (
     region_names,
     region_policy,

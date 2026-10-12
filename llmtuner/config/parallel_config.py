@@ -25,7 +25,7 @@ class ParallelConfig:
     """The parallelism sizes.
 
     The field names and semantics are torchtitan's, spelled ``*_size`` rather
-    than ``*_degree``. ``ParallelDims.from_config`` reads these six fields by
+    than ``*_degree``. ``ParallelTopology.from_config`` reads these six fields by
     name, so the spelling here and there has to stay in step. Short aliases
     (``tp`` / ``pp`` / ``cp`` / ``ep`` / ``dp``) are exposed as properties at
     the end of the class, so callers and tests can use the same names
@@ -93,8 +93,9 @@ class ParallelConfig:
     """Sequence parallelism as part of tensor parallelism.
 
     Not a switch here. llmtuner's TP is the sequence-parallel formulation only:
-    ``parallel/tensor_parallel/tp.py`` gathers and scatters the sequence inside
-    the fused GEMMs, and the trainer shards the batch so ``T / tp`` tokens
+    ``parallel/tensor_parallel/tensor_parallel.py`` gathers and scatters the
+    sequence inside the fused GEMMs, and the trainer shards the batch so
+    ``T / tp`` tokens
     enter each rank. There is no replicated-activation realization to fall
     back to, so ``False`` has nothing to select and is rejected rather than
     silently ignored -- see ``ParallelConfig.__post_init__``.
@@ -174,7 +175,7 @@ class ParallelConfig:
     Upstream's path to a CSV describing a runtime pipeline schedule. Accepted
     for config compatibility but NOT implemented: llmtuner builds schedules by
     name only, so any non-empty value is refused when the schedule is built
-    (``parallel/pipeline_parallel/apply.py``). Leave it empty and name a
+    (``parallel/pipeline_parallel/pipeline_parallel.py``). Leave it empty and name a
     schedule with ``pipeline_parallel_schedule`` instead.
     """
 
@@ -313,7 +314,7 @@ class ParallelConfig:
         """Product of fixed world-mesh degrees: dp_replicate*tp*pp*cp.
 
         EP is not an additional world dimension. It tiles the existing
-        ``dp_shard * cp * tp`` sparse region, matching ``ParallelDims`` and
+        ``dp_shard * cp * tp`` sparse region, matching ``ParallelTopology`` and
         TorchTitan's mesh algebra.
         """
         return (
@@ -327,8 +328,8 @@ class ParallelConfig:
         """Resolve ``data_parallel_shard_size`` against world_size.
 
         ``-1`` means "derive from world_size": the leftover ranks after
-        dp_replicate / tp / pp / cp / ep, matching ``ParallelDims``'s
-        interpretation. Mirrors ``ParallelDims._validate``'s divisibility
+        dp_replicate / tp / pp / cp / ep, matching ``ParallelTopology``'s
+        interpretation. Mirrors ``ParallelTopology._validate``'s divisibility
         check so a mis-sized launch fails here with a config-level message
         rather than deep inside mesh construction.
         """

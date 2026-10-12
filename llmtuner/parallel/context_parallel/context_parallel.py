@@ -7,7 +7,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from llmtuner.config import ParallelConfig
 
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
 from ..attention_heads import require_heads_divisible_by
 from .attention import CPFlexKernel, DualCPFlexKernel
 from .input_sharding import (
@@ -161,7 +161,7 @@ def apply_cp(
     kv_mesh = ulysses_mesh = None
     if dual_axes:
         if parallel_dims is None:
-            raise ValueError("dual CP axes require ParallelDims")
+            raise ValueError("dual CP axes require ParallelTopology")
         kv_mesh = parallel_dims.get_optional_mesh("cp_kv")
         ulysses_mesh = parallel_dims.get_optional_mesh("cp_ulysses")
         if kv_mesh is None or ulysses_mesh is None:

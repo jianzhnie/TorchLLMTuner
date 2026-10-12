@@ -22,12 +22,12 @@ from .block import MoE, iter_moe_layers
 from .router import QuantileBalancedTopKRouter
 
 if TYPE_CHECKING:
-    from ....parallel.parallel_dims import ParallelDims
+    from ....parallel.topology import ParallelTopology
 
 
 def update_expert_bias(
     mappers: list[tuple[nn.Module, list[MoE]]],
-    parallel_dims: ParallelDims | None,
+    parallel_dims: ParallelTopology | None,
 ) -> None:
     """Turn every MoE's accumulated token counts into one bias update.
 
@@ -87,7 +87,7 @@ def update_expert_bias(
 def register_moe_load_balancing_hook(
     optimizer: torch.optim.Optimizer,
     model_parts: Sequence[nn.Module],
-    parallel_dims: ParallelDims | None,
+    parallel_dims: ParallelTopology | None,
 ) -> None:
     """Register the step pre-hook that updates every MoE's expert bias.
 
@@ -127,7 +127,7 @@ def register_moe_load_balancing_hook(
 @torch.no_grad()
 def update_quantile_expert_bias(
     moe_layers: list[MoE],
-    parallel_dims: ParallelDims | None,
+    parallel_dims: ParallelTopology | None,
 ) -> None:
     """Reduce the quantile histograms and write the next expert biases.
 
@@ -167,7 +167,7 @@ def update_quantile_expert_bias(
 def register_moe_quantile_balancing_hook(
     optimizer: torch.optim.Optimizer,
     model_parts: Sequence[nn.Module],
-    parallel_dims: ParallelDims | None,
+    parallel_dims: ParallelTopology | None,
 ) -> None:
     """Register the step pre-hook that updates quantile-balanced expert biases.
 

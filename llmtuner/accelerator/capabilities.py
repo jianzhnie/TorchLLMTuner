@@ -151,36 +151,39 @@ class Capability:
 
 
 CAPABILITIES: dict[str, Capability] = {
-    # -- compile-time knobs (consumers: parallel/compile.py) -------------------
+    # -- compile-time knobs (consumers: parallel/model_compile.py) -------------------
     "dynamo_capture_scalar_outputs": Capability(
         hasattr_torch("torch._dynamo.config", "capture_scalar_outputs"),
         what="torch._dynamo.config.capture_scalar_outputs",
         since="torch 2.7 (dynamo config flag)",
         hint="Upgrade torch, or run the token-choice MoE without compile.",
-        consumers="parallel/compile.py (token-choice MoE dispatch compile)",
+        consumers="parallel/model_compile.py (token-choice MoE dispatch compile)",
     ),
     "inductor_micro_pipeline_tp": Capability(
         hasattr_torch("torch._inductor.config", "_micro_pipeline_tp"),
         what="torch._inductor.config._micro_pipeline_tp",
         since="torch 2.8 (inductor micro-pipeline TP pass)",
         hint="Upgrade torch, or run without async TP.",
-        consumers="parallel/compile.py (compile_config.enable_async_tensor_parallel)",
+        consumers=(
+            "parallel/model_compile.py (compile_config.enable_async_tensor_parallel)"
+        ),
     ),
     "fx_regional_inductor": Capability(
         importable("torch.fx.passes.regional_inductor", "regional_inductor"),
         what="torch.fx.passes.regional_inductor (+ torch._dynamo.backends.common)",
         since="torch 2.10 (fx regional-inductor pass)",
         hint="Upgrade torch, use backend='inductor', or run without compile.",
-        consumers="parallel/compile.py (aot_eager backend on flex models)",
+        consumers="parallel/model_compile.py (aot_eager backend on flex models)",
     ),
-    # -- symmetric memory (consumers: parallel/compile.py, tensor_parallel) ----
+    # -- symmetric memory (consumers: parallel/model_compile.py, tensor_parallel) ----
     "symm_mem": Capability(
         importable("torch.distributed._symmetric_memory", "enable_symm_mem_for_group"),
         what="torch.distributed._symmetric_memory.enable_symm_mem_for_group",
         since="torch 2.8 (symmetric-memory collectives, CUDA-only)",
         hint="Upgrade torch, or run without async TP / symm-mem collectives.",
-        consumers="parallel/compile.py (async TP), tensor_parallel/tp.py "
-        "(fused symm-mem TP collectives), tensor_parallel/linear.py",
+        consumers="parallel/model_compile.py (async TP), "
+        "tensor_parallel/tensor_parallel.py (fused symm-mem TP collectives), "
+        "tensor_parallel/linear_ops.py",
     ),
     # -- activation checkpointing (consumer: memory/activation_checkpoint.py)
     "functorch_activation_memory_budget": Capability(
@@ -199,7 +202,7 @@ CAPABILITIES: dict[str, Capability] = {
         "without upstream's SAC + pipeline-parallel cache workaround.",
         consumers="memory/activation_checkpoint.py (disable_dynamo_lru_cache)",
     ),
-    # -- pipeline eval driver (consumer: trainer/validate.py) ----------------
+    # -- pipeline eval driver (consumer: trainer/runtime/validation.py) --------
     "pipelining_microbatch_drivers": Capability(
         _pipelining_has_eval,
         what="torch.distributed.pipelining microbatch drivers "
@@ -207,8 +210,8 @@ CAPABILITIES: dict[str, Capability] = {
         "_step_microbatches(return_outputs=...))",
         since="torch main/2.10+ (2.9's eval swallows the microbatch kwargs)",
         hint="Upgrade torch, or run with pipeline_parallel_size=1.",
-        consumers="pipeline_parallel/apply.py (PP assembly), "
-        "trainer/pipeline_step.py + trainer/validate.py (PP train/eval drivers)",
+        consumers="pipeline_parallel/pipeline_parallel.py (PP assembly), "
+        "trainer/runtime/{pipeline,validation}.py (PP train/eval drivers)",
     ),
     # -- model kernels (consumer: models/common/moe/experts.py) ----------------
     "torch_grouped_mm": Capability(

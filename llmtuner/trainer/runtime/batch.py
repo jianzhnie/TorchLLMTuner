@@ -17,11 +17,15 @@ from typing import Any
 
 import torch
 
-from ..components.loss import IGNORE_INDEX, next_token_targets
-from ..datasets import build_dataloader as build_dataset_dataloader
-from ..datasets.loader import BaseDataLoader, DataloaderExhaustedError, TrainerBatch
-from ..datasets.random_data import RandomTokenDataLoader
-from ..datasets.types import Batch
+from ...components.loss import IGNORE_INDEX, next_token_targets
+from ...datasets import build_dataloader as build_dataset_dataloader
+from ...datasets.contracts import Batch
+from ...datasets.dataloader import (
+    BaseDataLoader,
+    DataloaderExhaustedError,
+    TrainerBatch,
+)
+from ...datasets.random_data import RandomTokenDataLoader
 
 
 def dp_rank_world_size(self) -> tuple[int, int]:
@@ -101,7 +105,7 @@ def data_iterator(self) -> Iterator[Batch | TrainerBatch]:
 
     A method rather than an attribute so tests can drive the loop with a
     fixed batch without touching the loop itself. The loader is a
-    :class:`~llmtuner.datasets.loader.BaseDataLoader` whenever there is one,
+    :class:`~llmtuner.datasets.dataloader.BaseDataLoader` whenever there is one,
     so both the synthetic and the Grain path arrive here the same way.
     """
     if self.dataloader is not None:

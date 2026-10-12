@@ -72,7 +72,7 @@ from ...parallel.expert_parallel.checkpoint import (
     gather_expert_state,
     load_expert_state,
 )
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
 from ..checkpointer.checkpoint_keys import canonical_fqn
 from .utils import (
     get_flat_optim_state_dict,

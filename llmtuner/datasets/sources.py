@@ -33,7 +33,7 @@ import datasets
 import grain.python as grain
 from datasets.distributed import split_dataset_by_node
 
-from .types import DatasetIterationPolicy
+from .contracts import DatasetIterationPolicy
 
 __all__ = [
     "HuggingFaceRandomAccessSource",

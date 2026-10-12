@@ -44,7 +44,7 @@ from llmtuner.errors import UnsupportedCombinationError
 
 from ...accelerator import dist_utils
 from ...components.loss import next_token_targets
-from ...datasets.types import Batch
+from ...datasets.contracts import Batch
 from ...parallel.context_parallel import (
     shard_attention_mask_for_cp,
     shard_batch_for_cp,
@@ -53,8 +53,8 @@ from ...parallel.context_parallel import (
     shard_padding_mask_for_tp,
 )
 from ...parallel.model_compile import maybe_regional_inductor
-from ...parallel.parallel_dims import ParallelDims
-from ...utils.logger_utils import get_logger
+from ...parallel.topology import ParallelTopology
+from ...utils.logging import get_logger
 from ..common.attention.masks import (
     build_dense_attention_mask,
     create_attention_mask,
@@ -104,7 +104,7 @@ def flex_attention_hf(module, query, key, value, attention_mask, **kwargs):
     if kernel is None:
         # Mark the flex region so that, when the enclosing model is compiled
         # with a non-inductor backend, regional_inductor scoops just this
-        # region into an inductor sub-compile (see parallel/compile.py). A
+        # region into an inductor sub-compile (see parallel/model_compile.py). A
         # null context on the default inductor / eager paths, so no dead
         # metadata is emitted. Empty configs: inductor defaults -- llmtuner
         # runs HF's flex integration, not its own compiled-flex instance.
@@ -566,7 +566,7 @@ class HFTransformerModel(nn.Module):
         self,
         input_dict: dict[str, torch.Tensor],
         *,
-        parallel_dims: ParallelDims | None,
+        parallel_dims: ParallelTopology | None,
         parallelism=None,
         max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:

@@ -21,7 +21,7 @@ import torch
 from ...components.loss import IGNORE_INDEX
 from ...components.tokenizer import MultiModalTokenizer
 from ..collators import Collator, TrainerBatch
-from ..types import DatasetBuildContext
+from ..contracts import DatasetBuildContext
 from .image import vision_to_patches
 
 __all__ = ["MultiModalCollator"]

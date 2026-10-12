@@ -25,7 +25,8 @@ Four deliberate departures, all subtractions:
   logger; the ``logger.info`` lines that carry the same information are kept.
 
 * **``GarbageCollection`` is local.** torchtitan's version carries
-  structured-logger tags in ``run``; llmtuner's ``utils/gc.py`` keeps the
+  structured-logger tags in ``run``; llmtuner's
+  ``utils/garbage_collection.py`` keeps the
   collection and drops the tags. Its ``run`` is likewise not wired into the
   training loop yet -- the checkpointer uses only ``collect``.
 
@@ -63,8 +64,8 @@ from ...parallel.expert_parallel.checkpoint import (
     gather_expert_state,
     load_expert_state,
 )
-from ...utils.gc import GarbageCollection
-from ...utils.logger_utils import get_logger
+from ...utils.garbage_collection import GarbageCollection
+from ...utils.logging import get_logger
 from . import filesystem
 from .checkpoint_keys import EMA, LR_SCHEDULER, MODEL, OPTIMIZER
 

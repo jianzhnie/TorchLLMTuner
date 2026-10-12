@@ -39,7 +39,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
 
 if TYPE_CHECKING:
     # ``llmtuner.config`` imports this package, so the runtime import happens

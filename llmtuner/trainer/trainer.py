@@ -1,9 +1,9 @@
 """Training loop and stable Trainer interface.
 
-``builder`` assembles the model and runtime state, ``batch`` prepares inputs,
-``pipeline_step`` drives PP schedules, and ``validate`` runs evaluation. This
-module owns the optimizer step, gradient checks, loss reductions, checkpoint
-counters, and the outer training loop.
+``runtime.assembly`` assembles runtime state, ``runtime.batch`` prepares
+inputs, ``runtime.pipeline`` drives PP schedules, and ``runtime.validation``
+evaluates. This module owns optimizer steps, gradient checks, loss reductions,
+checkpoint counters, and the outer training loop.
 
 Step order matters: read every accumulation batch, reduce the whole-batch
 valid-token count over DP, run forward/backward with that denominator, clip
@@ -40,21 +40,21 @@ from ..components.optimizer import (
     LRSchedulersContainer,
 )
 from ..components.profiler import Profiler
-from ..datasets.loader import BaseDataLoader, DataloaderExhaustedError, TrainerBatch
-from ..datasets.types import Batch
+from ..datasets.contracts import Batch
+from ..datasets.dataloader import BaseDataLoader, DataloaderExhaustedError, TrainerBatch
 from ..models.common.aux_loss import (
     AuxLoss,
     collect_aux_loss_metrics,
 )
 from ..models.common.moe.block import MoE
-from ..parallel.parallel_dims import ParallelDims
 from ..parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
-from ..utils.gc import GarbageCollection
-from ..utils.logger_utils import get_logger
-from . import batch as batch_mod
-from . import builder, pipeline_step
-from . import validate as validation_pass
-from .reduction_meshes import training_reduction_meshes
+from ..parallel.topology import ParallelTopology
+from ..utils.garbage_collection import GarbageCollection
+from ..utils.logging import get_logger
+from .runtime import assembly, pipeline
+from .runtime import batch as batch_runtime
+from .runtime import validation as validation_runtime
+from .runtime.reductions import training_reduction_meshes
 
 # Rank-aware: the helper attaches a handler whose filter passes below-ERROR
 # lines only on the log ranks (rank 0 by default), so a torchrun run logs one
@@ -76,7 +76,7 @@ class Trainer:
     local_rank: int
     world_size: int
     device: torch.device
-    parallel_dims: ParallelDims | None
+    parallel_dims: ParallelTopology | None
     mesh: DeviceMesh | None
     model: torch.nn.Module | None
     model_parts: list[torch.nn.Module]
@@ -102,9 +102,9 @@ class Trainer:
     ntokens_seen: int
 
     def __init__(self, cfg: LLMTunerConfig):
-        """Assemble the trainer. The whole body lives in ``builder.py`` --
+        """Assemble the trainer. The whole body lives in ``runtime/assembly.py`` --
         the assembly order there is a contract (see its docstring)."""
-        builder.build_trainer_state(self, cfg)
+        assembly.build_trainer_state(self, cfg)
 
     # -- setup helpers ---------------------------------------------------------
 
@@ -112,8 +112,8 @@ class Trainer:
     def seed_everything(
         seed: int, *, deterministic: bool, detect_anomaly: bool = False
     ) -> None:
-        """Seed every generator; the body lives in ``builder.py``."""
-        builder.seed_everything(
+        """Seed every generator; the body lives in ``runtime/assembly.py``."""
+        assembly.seed_everything(
             seed, deterministic=deterministic, detect_anomaly=detect_anomaly
         )
 
@@ -121,25 +121,25 @@ class Trainer:
 
     def dp_rank_world_size(self) -> tuple[int, int]:
         """This rank's position and extent along the dataloading (DP) axis."""
-        return batch_mod.dp_rank_world_size(self)
+        return batch_runtime.dp_rank_world_size(self)
 
     def batch_size_per_rank(self, dp_world_size: int) -> int:
         """This rank's share of the global batch. Body in ``batch.py``."""
-        return batch_mod.batch_size_per_rank(self, dp_world_size)
+        return batch_runtime.batch_size_per_rank(self, dp_world_size)
 
     def build_dataloader(self) -> BaseDataLoader | None:
         """Build the micro-batch source the config names. Body in ``batch.py``."""
-        return batch_mod.build_dataloader(self)
+        return batch_runtime.build_dataloader(self)
 
     def data_iterator(self) -> Iterator[Batch | TrainerBatch]:
         """The raw micro-batch source. Body in ``batch.py``."""
-        return batch_mod.data_iterator(self)
+        return batch_runtime.data_iterator(self)
 
     def batch_generator(
         self, data_iterable: Iterable[Batch | TrainerBatch]
     ) -> Iterator[Batch | TrainerBatch]:
         """Wrap the source with per-fetch accounting. Body in ``batch.py``."""
-        return batch_mod.batch_generator(self, data_iterable)
+        return batch_runtime.batch_generator(self, data_iterable)
 
     @staticmethod
     def count_valid_tokens(batch: Batch | TrainerBatch) -> int:
@@ -147,7 +147,7 @@ class Trainer:
 
         Body in ``batch.py``.
         """
-        return batch_mod.count_valid_tokens(batch)
+        return batch_runtime.count_valid_tokens(batch)
 
     # -- the step, one function per level --------------------------------------
 
@@ -167,14 +167,14 @@ class Trainer:
 
         Body in ``batch.py``.
         """
-        return batch_mod.microbatch(self, batch)
+        return batch_runtime.microbatch(self, batch)
 
     def to_device(self, batch: Batch | TrainerBatch) -> Batch | TrainerBatch:
         """Move one consumption group's tensors to the training device.
 
         Body in ``batch.py``.
         """
-        return batch_mod.to_device(self, batch)
+        return batch_runtime.to_device(self, batch)
 
     def preprocess(
         self, microbatch: dict[str, Any]
@@ -183,7 +183,7 @@ class Trainer:
 
         Body in ``batch.py``.
         """
-        return batch_mod.preprocess(self, microbatch)
+        return batch_runtime.preprocess(self, microbatch)
 
     def forward_backward_step(
         self,
@@ -352,7 +352,7 @@ class Trainer:
         self, batch: Batch | TrainerBatch
     ) -> list[Batch | TrainerBatch]:
         """Split this rank's batch into whole-row pipeline microbatches."""
-        return pipeline_step.split_pipeline_microbatches(self, batch)
+        return pipeline.split_pipeline_microbatches(self, batch)
 
     def pp_forward_backward_body(
         self,
@@ -361,7 +361,7 @@ class Trainer:
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Drive the pipeline schedule for one accumulation group."""
-        return pipeline_step.forward_backward_pipeline(
+        return pipeline.forward_backward_pipeline(
             self, batch, global_valid_tokens=global_valid_tokens
         )
 
@@ -846,7 +846,7 @@ class Trainer:
 
         The body lives in ``validate.py``; see there for the rationale.
         """
-        validation_pass.check_validation_feasibility(
+        validation_runtime.check_validation_feasibility(
             validation,
             dp_world_size=dp_world_size,
             training_dataset=training_dataset,
@@ -858,7 +858,7 @@ class Trainer:
 
         The body lives in ``validate.py``; see there for the gating rule.
         """
-        return validation_pass.should_validate(self, step)
+        return validation_runtime.should_validate(self, step)
 
     def validate(self, step: int) -> None:
         """Run one eval-mode, gradient-free pass and log its loss.
@@ -866,11 +866,11 @@ class Trainer:
         The body lives in ``validate.py`` (gradient-free via its own
         ``torch.no_grad``); see there for the reporting contract.
         """
-        validation_pass.validate(self, step)
+        validation_runtime.validate(self, step)
 
     def validate_body(self, validation: ValidationConfig, step: int) -> None:
         """The pass itself; the body lives in ``validate.py``."""
-        validation_pass.validate_body(self, validation, step)
+        validation_runtime.validate_body(self, validation, step)
 
     # -- step cadence ------------------------------------------------------------
 

@@ -23,14 +23,14 @@ import numpy as np
 from llmtuner.errors import ConfigError
 
 from ...components.loss import IGNORE_INDEX
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
+from ..contracts import DatasetBuildContext
 from ..dataset import SampleProcessor, SingleDataset, TextSequence, is_not_none
 from ..sources import (
     HuggingFaceRandomAccessSource,
     HuggingFaceStreamingSource,
     IndexedJsonlSource,
 )
-from ..types import DatasetBuildContext
 
 logger = get_logger(__name__)
 

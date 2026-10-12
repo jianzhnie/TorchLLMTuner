@@ -77,7 +77,7 @@ def build_model_config_for(cfg) -> PretrainedConfig:
     thing that would make the built model disagree with the weights it loads.
 
     It also sets ``attn_mask_type``, which is derived rather than configured. Any
-    real corpus is packed -- ``datasets/build.py`` always runs the samples
+    real corpus is packed -- ``datasets/factory.py`` always runs the samples
     through ``ConcatThenSplitPackingConfig`` -- so a row holds several documents
     and attention must not cross a boundary between them. The synthetic random
     corpus is one document per row, where the document mask is a no-op.

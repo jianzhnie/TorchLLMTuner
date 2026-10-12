@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from llmtuner.config import ParallelConfig
 
-from ...utils.logger_utils import get_logger
+from ...utils.logging import get_logger
 from .. import compatibility
 from .model_conversion import restore_fp32_state_buffers, swap_hf_moe_blocks
 

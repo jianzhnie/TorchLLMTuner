@@ -28,7 +28,8 @@ from typing import TYPE_CHECKING
 import grain.python as grain
 
 from .collators import TextCollator
-from .loader import BaseDataLoader, GrainDataLoader
+from .contracts import DatasetBuildContext, DatasetIterationPolicy
+from .dataloader import BaseDataLoader, GrainDataLoader
 from .packing import build_concat_then_split_packing, build_first_fit_packing
 from .random_data import RandomTokenDataLoader
 from .text.processors import (
@@ -37,7 +38,6 @@ from .text.processors import (
     make_local_jsonl_sft,
     make_local_jsonl_sft_multiturn,
 )
-from .types import DatasetBuildContext, DatasetIterationPolicy
 
 if TYPE_CHECKING:
     from ..config import LLMTunerConfig

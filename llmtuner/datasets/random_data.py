@@ -4,7 +4,7 @@ Vendored in shape from torchtitan ``trainer.py:batch_generator``, and from the
 ``components/data`` contract it satisfies. What is kept is the *contract*, not
 the data source:
 
-* :class:`~llmtuner.datasets.loader.DataloaderExhaustedError` is raised, not
+* :class:`~llmtuner.datasets.dataloader.DataloaderExhaustedError` is raised, not
   swallowed. Running out of data
   mid-step cancels the whole step rather than training on a partial batch, so
   the training loop can catch it and stop cleanly.
@@ -14,7 +14,7 @@ the data source:
 What is not kept: llmtuner has no collator or ``max_num_documents`` here. The
 source shipped in this module is synthetic random tokens; the real corpus lives
 behind the Grain dataset graph in ``loader.py``. Both satisfy
-:class:`~llmtuner.datasets.loader.BaseDataLoader`, so the training loop has one
+:class:`~llmtuner.datasets.dataloader.BaseDataLoader`, so the training loop has one
 path rather than two.
 """
 
@@ -25,8 +25,8 @@ from typing import Any
 
 import torch
 
-from .loader import BaseDataLoader, DataloaderExhaustedError, require_same_dp_degree
-from .types import Batch, require_positive
+from .contracts import Batch, require_positive
+from .dataloader import BaseDataLoader, DataloaderExhaustedError, require_same_dp_degree
 
 __all__ = [
     "Batch",
