@@ -401,7 +401,14 @@ class ParallelConfig:
                 "parallel.data_parallel_shard_size must be >= 1 or -1 "
                 f"(derive), got {self.data_parallel_shard_size}"
             )
-        allowed_dispatchers = ("alltoall", "torchao", "deepep", "hybridep")
+        allowed_dispatchers = (
+            "alltoall",
+            "torchao",
+            "domino",
+            "mc2",
+            "deepep",
+            "hybridep",
+        )
         if self.ep_token_dispatcher not in allowed_dispatchers:
             raise ConfigError(
                 "parallel.ep_token_dispatcher must be one of "
@@ -418,6 +425,12 @@ class ParallelConfig:
                 "table D). Unlock conditions: vendor the wrappers, add the "
                 "CUDA-only dependency as an optional extra, and re-validate "
                 "numerics on a CUDA device. Use 'alltoall' meanwhile."
+            )
+        if self.ep_token_dispatcher == "mc2":
+            raise EnvironmentUnsupportedError(
+                "parallel.ep_token_dispatcher='mc2' requires registered "
+                "Ascend fused all-to-all/grouped-matmul operators; this "
+                "runtime does not provide the migrated operator contract."
             )
         if self.ep_token_dispatcher != "alltoall" and self.expert_parallel_size == 1:
             raise UnsupportedCombinationError(
@@ -453,11 +466,11 @@ class ParallelConfig:
                 "BlockMask, which llmtuner's CP kernel does not consume. Use "
                 "'headtail' or None."
             )
-        allowed_strategies = frozenset({"kv_allgather", "ulysses"})
+        allowed_strategies = frozenset({"kv_allgather", "ulysses", "kcp"})
         if self.context_parallel_strategy not in allowed_strategies:
             raise ConfigError(
                 "parallel.context_parallel_strategy must be one of "
-                f"'kv_allgather'/'ulysses', got "
+                f"'kv_allgather'/'ulysses'/'kcp', got "
                 f"{self.context_parallel_strategy!r}"
             )
         if (

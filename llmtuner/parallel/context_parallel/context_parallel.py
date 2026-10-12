@@ -110,6 +110,20 @@ def apply_cp(
     if cfg.cp == 1:
         return model
 
+    if cfg.context_parallel_strategy == "kcp":
+        if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
+            raise ValueError("KCP requires a cp mesh")
+        from .kcp import apply_kcp
+
+        patched = apply_kcp(model, mesh["cp"])
+        model.set_cp_mesh(
+            mesh["cp"],
+            load_balancer=cfg.context_parallel_load_balancer,
+            strategy="kcp",
+        )
+        logger.info("Applied KCP to %d KDA modules", patched)
+        return model
+
     # Lazy: ``models/hf/model.py`` imports this package's ``__init__`` at module
     # scope (for the CP input sharding), and the ``__init__`` eagerly
     # re-exports ``apply_cp`` from this module -- a module-level import of

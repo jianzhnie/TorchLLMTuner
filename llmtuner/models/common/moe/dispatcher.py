@@ -73,7 +73,14 @@ __all__ = [
 #: EP dispatch backends selectable via ``ParallelConfig.ep_token_dispatcher``.
 #: ``alltoall`` is the default; ``torchao`` is an optional-import adapter;
 #: ``deepep``/``hybridep`` are registered gaps refused at config time.
-EP_DISPATCHER_BACKENDS = ("alltoall", "torchao", "deepep", "hybridep")
+EP_DISPATCHER_BACKENDS = (
+    "alltoall",
+    "torchao",
+    "domino",
+    "mc2",
+    "deepep",
+    "hybridep",
+)
 
 TORCHAO_INSTALL_HINT = (
     "ep_token_dispatcher='torchao' requires the optional `torchao` package, "

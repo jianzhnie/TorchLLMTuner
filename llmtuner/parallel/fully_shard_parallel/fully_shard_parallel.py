@@ -53,11 +53,10 @@ def apply_fsdp_by_pattern(
     reduce_dtype: torch.dtype,
 ) -> None:
     """Apply native FSDP2 units selected by extended module patterns."""
-    if cfg.fsdp_implementation != "native":
-        raise RuntimeError(
-            "custom fine-grained FSDP requires its multi-stream state engine; "
-            "the native pattern path cannot emulate it"
-        )
+    from .fine_grained import get_fsdp_strategy
+
+    strategy = get_fsdp_strategy(cfg.fsdp_implementation)
+    shard_fn = strategy.get_fully_shard_fn()
     named = dict(model.named_modules())
     ignored_names = {
         name
@@ -103,8 +102,8 @@ def apply_fsdp_by_pattern(
         )
     ordered_names = sorted(selected, key=lambda name: name.count("."), reverse=True)
     for name in ordered_names:
-        fully_shard(named[name], **common, **selected[name])
-    fully_shard(model, **common)
+        shard_fn(named[name], **common, **selected[name])
+    shard_fn(model, **common)
     units = [module for name, module in named.items() if name in selected]
     set_fsdp_prefetch_windows(
         units,
@@ -318,6 +317,7 @@ def apply_fsdp_to_decoder(
     symm_mem_scope: str | None = None,
     forward_prefetch_count: int = 0,
     backward_prefetch_count: int = 0,
+    fsdp_implementation: str = "native",
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -367,6 +367,11 @@ def apply_fsdp_to_decoder(
         reduce_dtype=reduce_dtype,
         cast_forward_inputs=False,
     )
+    shard_fn = fully_shard
+    if fsdp_implementation == "custom":
+        from .fine_grained import fully_shard_fine_grained
+
+        shard_fn = fully_shard_fine_grained
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy(
@@ -385,14 +390,14 @@ def apply_fsdp_to_decoder(
             for m in (model.tok_embeddings, model.norm, model.lm_head)
             if m is not None
         ]
-        fully_shard(
+        shard_fn(
             modules,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward_policy == "always",
         )
     else:
         if model.tok_embeddings is not None:
-            fully_shard(
+            shard_fn(
                 model.tok_embeddings,
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward,
@@ -400,7 +405,7 @@ def apply_fsdp_to_decoder(
         # As an optimization, do not reshard_after_forward the last layers
         # by default since FSDP would prefetch them immediately.
         if model.norm is not None and model.lm_head is not None:
-            fully_shard(
+            shard_fn(
                 [model.norm, model.lm_head],
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward_policy == "always",
@@ -449,7 +454,7 @@ def apply_fsdp_to_decoder(
             # When ep_degree == 1 and no Shard(1) override needed, skip
             # shard_placement_fn entirely for simplicity
             if ep_degree == 1 and expert_shard_placement == Shard(0):
-                fully_shard(
+                shard_fn(
                     transformer_block,
                     **fsdp_config,
                     reshard_after_forward=reshard_after_forward,
@@ -468,7 +473,7 @@ def apply_fsdp_to_decoder(
                         return Shard(1)
                     return None
 
-                fully_shard(
+                shard_fn(
                     transformer_block,
                     **fsdp_config,
                     reshard_after_forward=reshard_after_forward,
@@ -511,20 +516,20 @@ def apply_fsdp_to_decoder(
                             placement=Shard(0), mesh_info=_dp_mesh_info
                         )
 
-                fully_shard(
+                shard_fn(
                     transformer_block,
                     **fsdp_config,
                     reshard_after_forward=reshard_after_forward,
                     shard_placement_fn=_shard_placement_fn,
                 )
         else:
-            fully_shard(
+            shard_fn(
                 transformer_block,
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward,
             )
 
-    fully_shard(model, **fsdp_config)
+    shard_fn(model, **fsdp_config)
 
     # None is a no-op; an unknown scope raises inside.
     enable_fsdp_symm_mem(model, symm_mem_scope)
@@ -606,12 +611,6 @@ def apply_fsdp(
     """
     if parallel_dims is None:
         return model
-    if getattr(cfg, "fsdp_implementation", "native") == "custom":
-        raise RuntimeError(
-            "fsdp_implementation='custom' is not available until the "
-            "fine-grained multi-stream state engine is installed; refusing "
-            "to silently run native FSDP"
-        )
 
     storage_mesh = resolve_fsdp_mesh(parallel_dims)
     edp_mesh = resolve_sparse_fsdp_mesh(parallel_dims)
@@ -667,6 +666,7 @@ def apply_fsdp(
         symm_mem_scope=(cfg.fsdp_symm_mem_scope if cfg.enable_fsdp_symm_mem else None),
         forward_prefetch_count=getattr(cfg, "fsdp_forward_prefetch_count", 0),
         backward_prefetch_count=getattr(cfg, "fsdp_backward_prefetch_count", 0),
+        fsdp_implementation=getattr(cfg, "fsdp_implementation", "native"),
     )
     # ``apply_fsdp_to_decoder`` already calls ``disable_fsdp_gradient_division``
     # and, when asked, ``enable_fsdp_symm_mem``; do not repeat them here.
