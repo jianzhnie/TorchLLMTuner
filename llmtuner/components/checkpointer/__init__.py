@@ -17,6 +17,7 @@ Ported from torchtitan's ``components/checkpointer/``. Three layers:
   the third of torchtitan's backends, and installing the package is the only
   step needed to use it.
 
+``storage`` defines the path-operation contract and filesystem adapter.
 ``checkpoint_keys`` also holds ``canonical_fqn``, which strips the activation-checkpoint
 wrapper segment from an FQN.
 
@@ -62,7 +63,7 @@ from ...utils.lazy_exports import export_names, resolve_export
 # for the backends.
 _EXPORT_SOURCES = {
     "BaseCheckpointManager": "base",
-    "CheckpointStorage": "base",
+    "CheckpointStorage": "storage",
     "ModelWrapper": "base",
     # The state keys are resolved from their own dependency-free module rather
     # than through ``base``: the keys belong there, and a re-export chain was

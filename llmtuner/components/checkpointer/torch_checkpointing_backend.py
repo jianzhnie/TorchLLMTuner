@@ -154,7 +154,7 @@ def require_torch_checkpointing():
     except ImportError as error:
         raise ImportError(f"{_INSTALL_HINT} ({error})") from error
 
-    return BackendConfig(
+    return BackendSymbols(
         TCPStoreBarrierConfig=TCPStoreBarrierConfig,
         LayoutInfo=LayoutInfo,
         SafetensorsSerialization=SafetensorsSerialization,
@@ -179,11 +179,11 @@ def require_torch_checkpointing():
 
 
 @dataclass(frozen=True, slots=True)
-class BackendConfig:
+class BackendSymbols:
     """The lazily imported ``torch_checkpointing`` names, bundled for transit.
 
     A frozen dataclass rather than a dict so every attribute access is a static
-    name -- a typo fails at import time instead of midway through a save.
+    name. Required backend symbols are resolved together before manager setup.
     """
 
     TCPStoreBarrierConfig: Any
@@ -256,7 +256,7 @@ def init_subprocess_logging(
         backend_logger.setLevel(logging.INFO)
 
 
-def item_specs(backend: BackendConfig) -> dict[str, Any]:
+def item_specs(backend: BackendSymbols) -> dict[str, Any]:
     resharder = backend.DefaultResharder()
     return {
         MODEL: backend.ItemSpec(
@@ -280,7 +280,7 @@ def item_specs(backend: BackendConfig) -> dict[str, Any]:
     }
 
 
-def writer_config(backend: BackendConfig, *, use_barrier: bool):
+def writer_config(backend: BackendSymbols, *, use_barrier: bool):
     return backend.CheckpointWriterConfig(
         checkpoint_write_barrier_timeout_sec=_DEFAULT_BARRIER_TIMEOUT_SEC,
         barrier_config=(
@@ -296,7 +296,7 @@ def writer_config(backend: BackendConfig, *, use_barrier: bool):
     )
 
 
-def async_save_config(backend: BackendConfig):
+def async_save_config(backend: BackendSymbols):
     return backend.AsyncCheckpointSaverConfig(
         writer_config=writer_config(backend, use_barrier=True),
         staging_config=backend.CheckpointStagerConfig(use_pinned_memory=True),
@@ -304,7 +304,7 @@ def async_save_config(backend: BackendConfig):
     )
 
 
-def sync_save_config(backend: BackendConfig, *, use_barrier: bool = True):
+def sync_save_config(backend: BackendSymbols, *, use_barrier: bool = True):
     return backend.SyncCheckpointSaverConfig(
         writer_config=writer_config(backend, use_barrier=use_barrier),
         wait_timeout_secs=_DEFAULT_BARRIER_TIMEOUT_SEC,
@@ -312,7 +312,7 @@ def sync_save_config(backend: BackendConfig, *, use_barrier: bool = True):
 
 
 def default_backend_config(
-    backend: BackendConfig,
+    backend: BackendSymbols,
     save_config,
     *,
     storage_config=None,

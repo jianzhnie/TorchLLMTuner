@@ -67,6 +67,7 @@ from .base import (
     purge_thread,
 )
 from .checkpoint_keys import DATALOADER, EMA, LR_SCHEDULER, MODEL, SAFETENSORS_INDEX
+from .storage import FilesystemCheckpointStorage
 
 logger = get_logger(__name__)
 
@@ -75,29 +76,6 @@ class DistributedCheckpointAsyncMode(str, enum.Enum):
     DISABLED = "disabled"
     ASYNC = "async"
     ASYNC_WITH_PINNED_MEM = "async_with_pinned_mem"
-
-
-class FilesystemCheckpointStorage:
-    """``CheckpointStorage`` backed by ``checkpointer/filesystem``.
-
-    Local paths go through ``os``/``shutil`` and remote fsspec URIs through
-    fsspec, so DCP keeps reading and writing remote checkpoint folders exactly as
-    it does when the paths are local. The storage does not itself reject a remote
-    URI it cannot address -- ``Config.__post_init__`` already refuses the
-    combinations that would need to.
-    """
-
-    def isdir(self, path: str) -> bool:
-        return filesystem.isdir(path)
-
-    def isfile(self, path: str) -> bool:
-        return filesystem.isfile(path)
-
-    def listdir(self, path: str) -> list[str]:
-        return filesystem.listdir(path)
-
-    def remove(self, path: str) -> None:
-        filesystem.rmtree(path)
 
 
 class DistributedCheckpointManager(BaseCheckpointManager):

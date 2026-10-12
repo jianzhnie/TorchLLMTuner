@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any, TypeAlias, cast
+from typing import Any, TypeAlias, TypeVar, cast
 
 import grain.python as grain
 
@@ -54,6 +54,7 @@ __all__ = [
 ]
 
 GrainDataset: TypeAlias = grain.MapDataset | grain.IterDataset
+_DatasetT = TypeVar("_DatasetT", grain.MapDataset, grain.IterDataset)
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -183,20 +184,9 @@ def build_map_dataset(
     dataset_iteration_policy: DatasetIterationPolicy,
 ) -> grain.MapDataset:
     """Process globally indexed rows before shuffle, sharding, and repeat."""
-    # Filter raw rows.
-    for filter_fn in node.pre_filters:
-        dataset = dataset.filter(filter_fn)
-
-    # Process rows into training samples.
-    if node.processor is not None:
-        dataset = dataset.random_map(
-            node.processor(context=context),
-            seed=dataset_iteration_policy.seed,
-        )
-
-    # Filter processed samples.
-    for filter_fn in node.post_filters:
-        dataset = dataset.filter(filter_fn)
+    dataset = apply_sample_transforms(
+        node, dataset, context=context, seed=dataset_iteration_policy.seed
+    )
 
     return apply_iteration_policy(dataset, dataset_iteration_policy)
 
@@ -217,17 +207,28 @@ def build_iter_dataset(
             seed=dataset_iteration_policy.seed,
         )
 
-    # Filter and process rows in stream order.
+    # Streaming processors use a per-rank seed; map processors share the
+    # global indexed seed so DP shards see one consistent transformation.
+    return apply_sample_transforms(
+        node,
+        dataset,
+        context=context,
+        seed=dataset_iteration_policy.seed + dataset_iteration_policy.dp_rank,
+    )
+
+
+def apply_sample_transforms(
+    node: SingleDataset,
+    dataset: _DatasetT,
+    *,
+    context: DatasetBuildContext,
+    seed: int,
+) -> _DatasetT:
+    """Apply the shared row contract without changing dataset ordering."""
     for filter_fn in node.pre_filters:
         dataset = dataset.filter(filter_fn)
     if node.processor is not None:
-        dataset = dataset.random_map(
-            node.processor(context=context),
-            # A stream has no global index to shuffle, so the seed is what
-            # separates ranks: without the dp_rank offset every rank would
-            # draw the same samples from the same window.
-            seed=dataset_iteration_policy.seed + dataset_iteration_policy.dp_rank,
-        )
+        dataset = dataset.random_map(node.processor(context=context), seed=seed)
     for filter_fn in node.post_filters:
         dataset = dataset.filter(filter_fn)
     return dataset

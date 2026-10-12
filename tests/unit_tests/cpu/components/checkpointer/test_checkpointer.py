@@ -18,12 +18,12 @@ import torch
 import torch.nn as nn
 
 from llmtuner.components.checkpointer import (
-    CheckpointStorage,
     DistributedCheckpointManager,
     ModelWrapper,
     canonical_fqn,
 )
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.storage import (
+    CheckpointStorage,
     FilesystemCheckpointStorage,
 )
 from llmtuner.components.optimizer import init_optim_state
