@@ -3,8 +3,22 @@
 Run under torchrun with 2 ranks, in two phases that share a workdir:
 
     D=$(mktemp -d)
-    torchrun --nproc_per_node=2 tests/pp_checkpoint_equivalence.py full "$D"
-    torchrun --nproc_per_node=2 tests/pp_checkpoint_equivalence.py resume "$D"
+    torchrun --nproc_per_node=2 \\
+        tests/integration_tests/pp_checkpoint_equivalence.py full "$D"
+    torchrun --nproc_per_node=2 \\
+        tests/integration_tests/pp_checkpoint_equivalence.py resume "$D"
+
+Append ``--packed`` to both commands to use a checkpointable local JSONL corpus
+with independently packed pipeline microbatches. On CPU that variant uses the
+explicit dense-mask SDPA substitute from the real-corpus harness, rather than
+the production CUDA flex kernel.
+
+Set ``LLMTUNER_TEST_LEGACY_LAYOUT=1`` for the full phase to save the historical
+loader format without batch layout metadata, then resume normally to exercise
+the manager's strict planner migration on both ranks.
+
+Set ``LLMTUNER_TEST_RESUME_LR=0.003`` on the resume phase to verify that saved
+optimizer learning rates override fresh construction values before scheduling.
 
 Phase ``full`` trains a tiny offline qwen3 for N+M optimizer steps with
 ``pp=2`` (schedule 1F1B, 4 micro-batches per step) through the real
@@ -26,26 +40,27 @@ keys collide across ranks in one shared checkpoint (the flat FQN-keyed
 optimizer state dict is what prevents that).
 
 The synthetic random corpus is registered in the checkpoint's ``states`` under
-``DATALOADER`` (its cursor is ``_num_batches_yielded``, restored by replaying
+``DATALOADER`` (its cursor is ``_position``, restored by replaying
 generated batches), so the resume phase reads exactly the batches the
 uninterrupted run consumed at steps N+1..N+M with no manual fast-forward.
 
-Everything runs in fp32 on CPU/gloo. The workdir is removed by the resume
-phase once the comparison is done.
+Everything runs in fp32 on CPU/gloo. The caller owns the workdir and its cleanup.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 
 from llmtuner.config import (
     CheckpointConfig,
+    DataloaderConfig,
+    EMAConfig,
     LLMTunerConfig,
     MetricsConfig,
     ModelConfig,
@@ -67,7 +82,8 @@ SEED = 42
 FULL_LOSSES_FILE = "losses_full.json"
 
 
-def _cfg(workdir: str) -> LLMTunerConfig:
+def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
+    data_root = os.path.join(workdir, f"data-rank-{os.environ.get('RANK', '0')}")
     return LLMTunerConfig(
         model=ModelConfig(
             model_name_or_path="qwen3",  # offline: AutoConfig.for_model("qwen3", ...)
@@ -102,6 +118,22 @@ def _cfg(workdir: str) -> LLMTunerConfig:
                 keep_latest_k=0,
             ),
             metrics_config=MetricsConfig(log_freq=1),
+            ema_config=EMAConfig(
+                decay=None if os.environ.get("LLMTUNER_TEST_EMA") == "dynamic" else 0.5,
+                half_life_fraction=0.5,
+            )
+            if os.environ.get("LLMTUNER_TEST_EMA") in {"1", "dynamic"}
+            else None,
+            dataloader_config=(
+                DataloaderConfig(
+                    dataset="local_jsonl",
+                    tokenizer_path=os.path.join(data_root, "tokenizer"),
+                    dataset_path=os.path.join(data_root, "rows.jsonl"),
+                    shuffle=False,
+                )
+                if packed
+                else DataloaderConfig()
+            ),
         ),
     )
 
@@ -118,8 +150,8 @@ def _train_steps(trainer: Trainer, data_iterator, num_steps: int) -> list[float]
     return losses
 
 
-def _phase_full(workdir: str) -> None:
-    trainer = Trainer(_cfg(workdir))
+def _phase_full(workdir: str, *, packed: bool = False) -> None:
+    trainer = Trainer(_cfg(workdir, packed=packed))
     assert trainer.world_size == 2, (
         f"this check assumes 2 ranks, got {trainer.world_size}"
     )
@@ -129,10 +161,33 @@ def _phase_full(workdir: str) -> None:
 
     # The interval policy agrees this is a checkpointing step; a full state
     # (not the model-only last-step export) because ``last_step`` is False.
-    saved = trainer.checkpointer.save(SPLIT_STEP)
+    if os.environ.get("LLMTUNER_TEST_LEGACY_LAYOUT") == "1":
+        original_state_dict = trainer.dataloader.state_dict
+
+        def legacy_state_dict():
+            state = original_state_dict()
+            state.pop("batch_layout", None)
+            return state
+
+        with patch.object(trainer.dataloader, "state_dict", legacy_state_dict):
+            saved = trainer.checkpointer.save(SPLIT_STEP)
+    else:
+        saved = trainer.checkpointer.save(SPLIT_STEP)
     assert saved, "the split-step checkpoint was not written"
 
     losses += _train_steps(trainer, data_iterator, EXTRA_STEPS)
+    torch.save(
+        {
+            "model": {
+                key: value.detach().cpu().clone()
+                for part in trainer.model_parts
+                for key, value in part.state_dict().items()
+            },
+            "ntokens_seen": trainer.ntokens_seen,
+            "ema": trainer.ema.state_dict() if trainer.ema is not None else {},
+        },
+        os.path.join(workdir, f"final-state-rank-{trainer.rank}.pt"),
+    )
 
     checkpoint_dir = os.path.join(workdir, "checkpoint", f"step-{SPLIT_STEP}")
     if trainer.pp_has_last_stage:
@@ -148,13 +203,15 @@ def _phase_full(workdir: str) -> None:
         flush=True,
     )
     dist.barrier()
-    trainer.checkpointer.close()
-    trainer.metrics.close()
+    trainer.close()
     dist.destroy_process_group()
 
 
-def _phase_resume(workdir: str) -> None:
-    trainer = Trainer(_cfg(workdir))
+def _phase_resume(workdir: str, *, packed: bool = False) -> None:
+    cfg = _cfg(workdir, packed=packed)
+    if "LLMTUNER_TEST_RESUME_LR" in os.environ:
+        cfg.optimizer.learning_rate = float(os.environ["LLMTUNER_TEST_RESUME_LR"])
+    trainer = Trainer(cfg)
     assert trainer.world_size == 2, (
         f"this check assumes 2 ranks, got {trainer.world_size}"
     )
@@ -190,6 +247,32 @@ def _phase_resume(workdir: str) -> None:
     data_iterator = trainer.data_iterator()
 
     losses = _train_steps(trainer, data_iterator, EXTRA_STEPS)
+    final_state = torch.load(
+        os.path.join(workdir, f"final-state-rank-{trainer.rank}.pt"),
+        map_location="cpu",
+        weights_only=True,
+    )
+    actual_parameters = {
+        key: value.detach().cpu()
+        for part in trainer.model_parts
+        for key, value in part.state_dict().items()
+    }
+    if actual_parameters.keys() != final_state["model"].keys():
+        failures.append(f"rank {trainer.rank}: final model keys differ")
+    else:
+        for key, actual in actual_parameters.items():
+            if not torch.equal(actual, final_state["model"][key]):
+                failures.append(f"rank {trainer.rank}: final parameter {key} differs")
+    if trainer.ntokens_seen != final_state["ntokens_seen"]:
+        failures.append(f"rank {trainer.rank}: restored token counter differs")
+    if trainer.ema is not None:
+        for key, actual in trainer.ema.state_dict().items():
+            expected = final_state["ema"][key]
+            if isinstance(actual, torch.Tensor):
+                if not torch.equal(actual.cpu(), expected.cpu()):
+                    failures.append(f"rank {trainer.rank}: EMA {key} differs")
+            elif actual != expected:
+                failures.append(f"rank {trainer.rank}: EMA metadata {key} differs")
 
     with open(os.path.join(workdir, FULL_LOSSES_FILE)) as f:
         full_losses = json.load(f)
@@ -229,11 +312,8 @@ def _phase_resume(workdir: str) -> None:
             print("all checks passed")
 
     dist.barrier()
-    trainer.checkpointer.close()
-    trainer.metrics.close()
+    trainer.close()
     dist.destroy_process_group()
-    if trainer.rank == 0:
-        shutil.rmtree(workdir, ignore_errors=True)
 
     assert local_ok.item() == 0, "PP checkpoint round-trip check failed"
 
@@ -244,13 +324,35 @@ def main() -> None:
     if phase not in ("full", "resume") or not workdir:
         raise SystemExit(
             "usage: torchrun --nproc_per_node=2 "
-            "tests/pp_checkpoint_equivalence.py {full|resume} WORKDIR"
+            "tests/integration_tests/pp_checkpoint_equivalence.py "
+            "{full|resume} WORKDIR [--packed]"
         )
-    if phase == "full":
-        os.makedirs(workdir, exist_ok=True)
-        _phase_full(workdir)
-    else:
-        _phase_resume(workdir)
+    packed = sys.argv[3:] == ["--packed"]
+    if sys.argv[3:] and not packed:
+        raise SystemExit("only --packed is accepted after WORKDIR")
+    run_phase = _phase_full if phase == "full" else _phase_resume
+    os.makedirs(workdir, exist_ok=True)
+    if packed:
+        from llmtuner.accelerator.device import device_type
+        from llmtuner.models.hf.model import HFTransformerModel
+        from tests.integration_tests.pp_real_corpus_equivalence import (
+            _cpu_packed_attention,
+            _write_corpus,
+        )
+
+        if phase == "full":
+            data_root = os.path.join(
+                workdir, f"data-rank-{os.environ.get('RANK', '0')}"
+            )
+            os.makedirs(data_root, exist_ok=True)
+            _write_corpus(data_root)
+        if device_type == "cpu":
+            with patch.object(
+                HFTransformerModel, "_apply_attention", _cpu_packed_attention
+            ):
+                run_phase(workdir, packed=True)
+            return
+    run_phase(workdir, packed=packed)
 
 
 if __name__ == "__main__":

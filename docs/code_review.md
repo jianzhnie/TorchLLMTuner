@@ -531,3 +531,295 @@ stream，Grain按collator.num_rows_per_batch()==1合并，PP再切分。要实�
 padding_mask的零维和二维输入。全量CPU1334 passed、2 skipped；
 pre-commit、compileall、diff检查通过。新增改动未提交，packed PP多
 microbatch及既有硬件/可选后端验证项仍未完成。
+
+## Packing 直接构造参数校验（2026-10-13）
+
+- `datasets/packing/iterators.py`：直接构造 document splitter 时，零 context
+  length 使 chunk end 等于起点，非空样本无法结束分块循环；负值同样不能保证前进。
+- 复用 `contracts.require_positive`，在 splitter、document packing dataset
+  和 iterator 构造时校验 context length、每行 token 数及 document 容量。
+  正常 builder 路径已有校验，本次覆盖直接调用路径。
+- 回归新增 14 个零值/负值构造用例；不通过实际运行无限循环复现。
+- 验证：数据管线单测 99 passed；完整 CPU 单测 1348 passed、2 skipped；
+  pre-commit、compileall 和 diff whitespace 检查通过。
+
+## Document packing 游标恢复验证（2026-10-13）
+
+- 阅读安装的 Grain `FlatMapIterDataset` 和 `_FlatMapDatasetIterator`：当前
+  first-fit 入口不使用 `max_fan_out` 限制 iterator 输出，不能据声明上限推断丢块。
+- 新增 4 个 document packing 恢复用例，在消费 0/1/2/3 行后恢复：覆盖空样本、
+  跨行文档余量、末行 padding；逐字段比较后续行，并核对真实 token 恰为 1..10。
+- 同时从耗尽后的状态恢复，确认不会重放末行。该验证不涉及 PP microbatch
+  的独立 packing，也不证明多进程 loader 的全部恢复组合。
+
+## Packed PP 独立 microbatch 装配（2026-10-13）
+
+- `datasets/loader_builder.py` 按 PP microbatch token 预算构造 text packing
+  graph；`PipelineTextCollator` 将独立 packed rows 组成 `(M, T)` schedule
+  batch。沿用现有 PP 按整行切分路径，不再切割整步平坦 packed stream。
+- 有限尾批补 fully masked rows，保留固定 schedule 形状、不重放数据；合批
+  输出沿用 pinned-memory 分配策略。文档容量约束作用于每个 packed row。
+- 对外部平坦 packed batch 的拒绝检查保留，错误信息改为推荐配置好的 text loader。
+- loader 回归覆盖 concat-then-split、first-fit 的独立 packing 等价及游标恢复，
+  另验证有限尾批的 labels、padding、有效 token 计数和输入不被修改。
+- 修复 `pp_real_corpus_equivalence.py`：全步有效 token 分母、microbatch
+  行切分、PP stage 实际初始权重、探测后 loader 恢复及最终参数比较。
+- 两个 CPU/Gloo ranks、4 microbatches、3 AdamW steps：loss 轨迹分别为
+  4.877315、4.479658、4.298073，与单进程参考一致；最终参数最大误差
+  7.451e-09。CPU harness 将生产 BlockMask 的 mask_mod 展开为稠密 SDPA
+  mask；该结果证明 PP 装配/调度/缩放和优化更新，不证明 CUDA flex kernel。
+- 原先“real-corpus harness 在 packed split 处失败”的历史记录由本节取代；
+  GPU/NPU packed PP、PP×CP/TP packed 组合仍需进一步运行验证。
+- 最终完整 CPU 单测：1355 passed、2 skipped；compileall 和 diff 检查通过。
+  pre-commit 对除用户 `examples/native_alltoall.py` 外的全部 tracked files
+  通过；all-files 曾被该 example 的既有 E501 注释阻止，未修改其内容。
+
+## Packed PP 有限验证及单文档容量（2026-10-13）
+
+- 扩展 real-corpus 两 rank PP 检查：训练后执行 `steps=-1` 的有限验证，
+  与单进程逐有效 token 加权参考比较；明确断言语料触发全 padding
+  microbatch，且验证后各 stage 恢复 train mode。
+- CPU/Gloo 实际运行通过：finite validation loss 4.186483；训练 loss
+  轨迹一致，最终参数最大误差仍为 7.451e-09。CPU attention 使用明确
+  的 dense-mask SDPA 测试替代，未验证生产 CUDA flex。
+- loader 等价/恢复用例补充 `max_num_documents=1` × 两种 text packing，
+  确认容量作用于每个 microbatch 的真实文档，而非将 padding 计为文档。
+- real-corpus 测试语料改用 TemporaryDirectory，在进程正常退出及 Python
+  异常展开时清理；数据管线单测 108 passed。
+- 完整 CPU 回归：1357 passed、2 skipped；compileall、diff 检查及
+  排除用户 example 的全部 tracked-file pre-commit 通过。
+
+## Packed PP DCP 恢复验证（2026-10-13）
+
+- `pp_checkpoint_equivalence.py` 新增 `--packed`，full/resume 阶段使用同一
+  checkpointable JSONL 图；CPU 明确使用 real-corpus harness 的稠密文档 mask
+  SDPA 替代，未验证 CUDA flex。默认 synthetic 变体保留。
+- 两阶段各两个 CPU/Gloo ranks 实际运行：step 2 保存 DCP，然后恢复继续
+  step 3/4。不中断 loss 为 4.894712925、4.546628475、4.389602661、
+  4.289792061；恢复 tail 与最后两步逐位一致，最大差异 0。
+- 增加各 stage 最终参数逐位比较、累计 token 计数比较；恢复后的 Adam
+  exp_avg 非空且非零。参数和计数均一致，证明 packed loader 游标与训练
+  状态共同恢复；并未证明更换 packing 配置后的恢复语义。
+- 修复测试资源管理：使用 `trainer.close()` 关闭 loader 等资源；resume
+  不再删除调用者工作目录，由外层 TemporaryDirectory 管理清理。
+
+## Loader batch layout 恢复校验（2026-10-13）
+
+- Grain loader 检查点增加 `batch_layout`：每步 token 数、context 长度、
+  每步 packed row 数、文档容量。恢复时在修改 iterator 前比较，拒绝
+  配置变化后将旧 batch cursor 应用于新布局。
+- 旧 version-1 检查点缺少该字段时保持兼容；无法从缺失元数据证明旧
+  布局相同。该校验尚不涵盖数据内容、tokenizer、shuffle 或 packing recipe
+  的变化，不宣称完整数据图 fingerprint 校验。
+- 两种 packing × 文档容量 None/1 的恢复回归均加入不兼容 row 数断言；
+  数据管线测试 108 passed。
+- 带 layout 元数据的两 rank packed PP DCP full/resume 实际运行通过，
+  loss tail、最终参数和 token 计数一致；完整 CPU 1357 passed、2 skipped。
+
+## DCP layout 元数据验证及旧格式缺口（2026-10-13）
+
+- 新增真实单进程 DCP 保存/加载回归：保存 token batch 32，恢复至 16，
+  loader 拒绝 saved layout，iterator 状态保持不变且仍可正常取 batch；通过。
+- 直接 `load_state_dict` 的旧格式兼容不能推广到 DCP：实测严格默认 planner
+  对旧检查点缺少 `loader.batch_layout.*` 报 Missing key，在 loader 方法
+  被调用前失败。此前旧格式兼容说明仅针对直接调用，该 DCP 迁移缺口
+  尚待定向兼容修复，不能用全局 allow_partial_load 掩盖模型缺失权重。
+
+## 旧 DCP layout 定向迁移（2026-10-13）
+
+- 标准 DCP 加载增加 `DataloaderLayoutLoadPlanner`。仅当检查点含 loader
+  version 且整组 batch_layout 字段缺失时，从请求的加载计划移除新增
+  layout 字段并警告旧布局无法验证。其他字段仍由默认严格 planner 检查。
+- 真实 DCP 回归：旧 loader cursor 和模型权重成功加载；缺失模型权重
+  仍报错；保存端仅有部分 layout 字段也报错，避免掩盖不完整元数据。
+- 修复前一节记录的旧 DCP 缺键迁移缺口；旧检查点缺少布局证据，仍不能
+  宣称其布局与当前配置相同。checkpointer 单测 35 passed。
+
+## DCP planner 多 rank 迁移回归（2026-10-13）
+
+- 正常新格式 packed PP full/resume 在两 CPU/Gloo ranks 通过；新增 planner
+  不改变恢复后的 loss、最终参数或 token 计数，loss 最大差异 0。
+- checkpoint harness 增加 `LLMTUNER_TEST_LEGACY_LAYOUT=1` 保存端模拟：
+  仅在保存时省略 loader layout 字段，恢复使用未修改的正常 manager。
+  实际两阶段两 rank 运行通过并触发旧布局警告，恢复 tail 为
+  4.389602661、4.289792061，逐位等于不中断训练；参数和 token 计数一致。
+- 此回归验证缺失整组 layout 字段的迁移路径，无法校验真正旧运行的
+  布局是否被用户改变；CPU attention 仍为明确标注的 SDPA 替代。
+
+## CLI 隐式 args 文件审查（2026-10-13）
+
+- HfArgumentParser 默认会探测 `sys.argv[0]` 同名 `.args`，与当前 CLI
+  文档的 flags-only 输入契约冲突：旁置文件能悄悄改变未指定的训练参数。
+- `parse_config` 显式设置 `look_for_args_file=False`。回归创建含 steps
+  和 global_batch_size 的真实 `.args` 文件，确认仅显式 steps 生效，
+  batch size 保持配置默认。不引入新的配置文件输入或优先级规则。
+- 验证：新回归通过；完整 CPU 1361 passed、2 skipped；排除用户
+  example 的 tracked-file pre-commit、compileall、diff 检查通过。
+
+## 本地 HF 配置自动填充（2026-10-13）
+
+- `auto_fill_model` 原仅按单个斜杠识别 Hub ID，绝对目录及无斜杠
+  相对目录不填充；factory 实际按路径存在性读取本地 config，造成聚合
+  config 的 vocab/layer/width 与实际模型分歧。
+- 自动填充同样先识别现存路径；本地目录及 Hub ID 读取已保存的 HF
+  架构，离线 architecture name 保持显式尺寸。同步修正文档与 CLI help。
+- 两个真实本地 config.json 回归覆盖绝对路径及无斜杠相对目录，
+  六个架构字段均匹配 saved config，验证无网络。
+- 验证：完整 CPU 1363 passed、2 skipped；排除用户 example 的
+  tracked-file pre-commit、compileall 和 diff 检查通过。
+
+## 复合 HF text_config 自动填充（2026-10-13）
+
+- Qwen2.5-VL 等复合配置的 decoder 尺寸在 `text_config`；model factory
+  已 unwrap，但配置自动填充读取外层并退回默认，导致 run 架构字段不一致。
+- 自动填充跟随 factory 读取 `text_config`，不引入 config 到模型层的
+  import 依赖。真实本地 Qwen2.5-VL config.json 回归核对六个尺寸字段；
+  不构建 vision encoder，不宣称多模态训练数值验证。
+- 完整 CPU 回归 1364 passed、2 skipped；排除用户 example 的
+  tracked-file pre-commit、compileall、diff 检查通过。
+
+## 复合 HF decoder context 扩展（2026-10-13）
+
+- factory 加载预训练 config 后原直接访问外层 max_position_embeddings；
+  Qwen2.5-VL 外层没有此字段，实际构造配置会 AttributeError。
+- 读取 text_config（dense config 则自身）并扩展 decoder context。
+  两个真实本地复合配置回归覆盖请求长度短于/长于 saved context，
+  确认不缩短且 vision config 不改变；不涉及 vision 模型训练数值。
+- 验证：factory config 6 passed；完整 CPU 1366 passed、2 skipped；
+  排除用户 example 的 tracked-file pre-commit、compileall、diff 检查通过。
+
+## 程序化 Trainer 架构同步（2026-10-13）
+
+- 程序化 Trainer 不经过 CLI auto-fill；离线 arch_overrides 可覆盖
+  vocab_size，但 synthetic loader 仍按 cfg 默认值生成 token，导致
+  embedding 越界；saved HF 架构也有相同分歧风险。
+- 在 `_build_model` 解析 HF config 后同步六个 decoder 尺寸到 cfg.model，
+  随后的 parallel/loader 装配使用实际架构；不额外请求网络配置。
+- 真实 Trainer 回归使用 vocab override 17，确认 cfg 与生成 token 范围
+  一致，并成功完成一步 forward/backward/optimizer 更新。
+- 验证：完整 CPU 1367 passed、2 skipped；排除用户 example 的
+  tracked-file pre-commit、compileall、diff 检查通过。
+
+## 装配配置复用与清单核对（2026-10-13）
+
+- 实际源码 149 个 Python 文件与逐文件表 149 条一致，无遗漏或过期路径；
+  此为阅读覆盖，不代表全部硬件组合验证。
+- metrics FLOPs 改用 `_build_model` 已解析的 HF config，避免再加载本地
+  文件或 Hub 配置；修正原“从参数测量”的错误注释，实际为架构公式。
+- 新增真实 Trainer 装配回归，确认底层 HF config builder 只调用一次。
+  既有 trainer 测试 71 passed；新增计数回归单独通过。
+
+## FLOPs 配置复用完整回归（2026-10-13）
+
+- 配置复用改动后的完整 CPU suite：1368 passed、2 skipped。
+- 阅读 FLOPs 公式及 geometry helpers，确认仅读取配置；实际对 Llama 和
+  Qwen3-MoE 比较调用前后完整 config.to_dict，均未改变。该证据覆盖
+  指标计算的配置副作用，不证明 FLOPs 公式对所有模型家族均准确。
+
+## Synthetic loader 游标类型（2026-10-13）
+
+- synthetic loader 原接受 bool 游标；steps=True 等同 1，恢复会跳过
+  首批数据。显式要求非负 int 并排除 bool，在 replay 之前报错。
+- 五个回归覆盖 True/False/负值/浮点/字符串，确认状态未改变且下一批
+  与新 loader 相同。正常整数及既有重复恢复语义保持。
+
+## Synthetic 数据配置恢复校验（2026-10-13）
+
+- synthetic 检查点新增 batch_layout，保存 seed/vocab_size/batch_size/seq_len；
+  恢复时在 replay 前拒绝配置变化，避免同一个 cursor 恢复到另一条数据流。
+- 旧 DCP planner 识别 historical synthetic steps 字段并定向兼容缺失
+  整组 layout；其他键继续严格检查。旧格式无法证明数据配置相同。
+- 四个回归分别改变四个配置字段，拒绝后状态未改变；数据管线 118 passed。
+
+## Synthetic layout 两 rank 恢复（2026-10-13）
+
+- 使用保存端 legacy-layout 模拟，默认 synthetic PP DCP 两阶段各两
+  CPU/Gloo ranks 实际运行通过。不中断 loss 为 4.878459930、
+  4.867841721、4.858004093、4.862647057；恢复最后两步逐位一致，
+  最终 stage 参数和累计 token 计数一致。
+- 该验证无 attention kernel 替代，覆盖 CPU synthetic 原生路径；
+  真正旧格式缺少 seed/尺寸证据，仍不能校验用户是否改变旧数据配置。
+- 新格式经 integration runner 的 full/resume 同样通过（20.8s），
+  loss、参数和 token 计数一致；无额外 layout 缺失兼容。
+
+## Scheduler 恢复 base learning rate（2026-10-13）
+
+- 真实 AdamW 回归先恢复 optimizer，再恢复 scheduler，保存 lr=1.0、
+  新建 lr=0.1。修复前 scheduler 使用构造时 base_lrs，恢复 lr 0.0625
+  而参考 0.625，违反其“base lrs 由 optimizer 恢复”的契约。
+- 恢复时从 optimizer param_groups.initial_lr 重建 base_lrs，再计算
+  当前 lr；回归同时比较恢复时及下一步的学习率。scheduler 22 passed。
+
+## Scheduler 修复完整回归（2026-10-13）
+
+- 完整 CPU suite 1378 passed、2 skipped；scheduler 专项 22 passed。
+- 两 rank PP DCP full/resume 经 runner 通过，恢复 loss tail 与不中断
+  训练逐位一致，参数及 token 计数一致。此案例配置 lr 未变化；新建
+  lr 与保存 lr 不同的场景由真实 optimizer/scheduler 专项回归验证。
+- 排除用户 example 的 tracked-file pre-commit、compileall、diff
+  检查通过；不将该 CPU 证据扩展为 GPU/NPU 恢复验证。
+
+## DCP optimizer/scheduler 加载顺序（2026-10-13）
+
+- 真实 Trainer DCP 回归发现 Stateful 回调顺序并不保证 optimizer 先于
+  scheduler；保存 lr=0.01、新建 lr=0.001 时仍恢复错误 lr 0.0005，
+  而正确值为 0.005。此前组件单测未覆盖实际 DCP 顺序。
+- 标准 DCP 加载将 scheduler 状态作为普通 dict 读取，待 DCP 完成
+  optimizer 恢复后再调用 scheduler.load_state_dict；HF model-only 不受影响。
+- 真实 Trainer 保存/恢复回归修复前失败、修复后通过，验证 scheduler
+  metrics 和 base_lrs 均使用保存值。
+
+## DCP 不同新建学习率的两 rank 恢复（2026-10-13）
+
+- checkpoint harness 增加 resume-only `LLMTUNER_TEST_RESUME_LR`，保持
+  保存端配置不变。实际两 CPU/Gloo ranks 保存 lr=0.0003，恢复构造
+  lr=0.003（10 倍），正常 DCP 加载后继续两步。
+- 恢复 loss tail 与不中断训练逐位一致，最终参数及 token 计数一致；
+  证明 optimizer 完成后应用 scheduler 的顺序在多 rank 实际路径生效。
+- pre-commit（排除用户 example）与 diff 检查通过；CPU synthetic
+  原生 attention，无 kernel 替代，GPU/NPU 尚未验证。
+
+## Scheduler epoch 输入校验（2026-10-13）
+
+- scheduler 恢复游标要求非负 int，排除 bool；LambdaLR 在本容器
+  构造时已执行初始 step，所以合法保存状态从 epoch 0 开始。
+- 五个回归覆盖负值、布尔、浮点和字符串，验证失败前不修改 epoch
+  或当前学习率；scheduler 专项 27 passed。
+- 完整 CPU 1384 passed、2 skipped；排除用户 example 的 tracked-file
+  pre-commit、compileall、diff 检查通过。
+
+## EMA 更新失败前身份校验（2026-10-13）
+
+- EMA update 原逐 model part 校验后立即 lerp，后一个 part 参数被
+  替换时先前 averages 已改变，失败不能保持原 EMA 状态。
+- 更新先解析全部 parameter/buffer averages，身份校验完成后再 lerp；
+  合并仅单调用方的 `_update_group`。多 part 回归替换后一个 part
+  参数，确认报错前先前 averages 均保持不变；EMA 19 passed。
+
+## EMA 修复完整回归（2026-10-13）
+
+- 核对新增回归直接保存所有 EMA optimizer state 中的 live averages，
+  第一 part live 参数加 1 后替换第二 part 参数，失败后逐个比较平均值；
+  无依赖 flat state_dict 是否返回 Tensor 的空断言风险。
+- 完整 CPU 1385 passed、2 skipped；排除用户 example 的 tracked-file
+  pre-commit、compileall、diff 检查通过。身份预校验保证本次路径不部分
+  更新，不宣称任意设备 kernel 异常下具有事务回滚。
+
+## EMA 两 rank DCP 恢复验证（2026-10-13）
+
+- 确认 trainer 在 optimizer update 后执行 EMA；实际 complex64 buffer
+  更新 [1+2j] 至 live [3+4j]、decay 0.5 得 [2+3j]，声明 dtype 可用。
+- checkpoint harness 新增 LLMTUNER_TEST_EMA=1（固定 decay 0.5），保存
+  最终 EMA state 并逐字段比较恢复后的结果。两 CPU/Gloo ranks
+  full/resume 经 runner 通过：EMA、最终模型参数、token 计数及 loss
+  tail 逐位一致。该结果不涵盖 dynamic decay、buffer EMA 或 GPU/NPU。
+- tracked-file pre-commit（排除用户 example）通过。
+
+## Dynamic EMA 多 rank 恢复（2026-10-13）
+
+- checkpoint harness 增加 LLMTUNER_TEST_EMA=dynamic，half_life_fraction
+  0.5；两 CPU/Gloo ranks 的 full/resume 实际通过，EMA、模型参数、
+  token 计数和 loss tail 逐位一致。覆盖从 trainer step 延续 EMA aging。
+- 初始 runner rendezvous 地址被解析为非本机地址，TCPStore 持续重试，
+  未进入训练；终止该 handle 后用显式 127.0.0.1 和独立端口通过。
+  该启动失败不是 EMA 数值失败；runner 的本机 rendezvous 默认待改进。

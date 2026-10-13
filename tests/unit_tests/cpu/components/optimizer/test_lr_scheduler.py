@@ -286,3 +286,36 @@ def test_a_third_of_the_way_through_warmup_is_a_third_of_the_lr() -> None:
     _advance(scheduler, 1)
     # lambda(1) == 2/3 on a 3-step warmup.
     assert _lrs(scheduler)[0] == pytest.approx(0.9 * 2 / 3)
+
+
+def test_scheduler_restore_uses_optimizer_restored_initial_lr():
+    original_optimizer = _optimizer(lr=1.0)
+    original = build_lr_scheduler(
+        LRSchedulerConfig(warmup_steps=8),
+        optimizers=[original_optimizer],
+        training_steps=16,
+    )
+    _advance(original, 4)
+    resumed_optimizer = _optimizer(lr=0.1)
+    resumed = build_lr_scheduler(
+        LRSchedulerConfig(warmup_steps=8),
+        optimizers=[resumed_optimizer],
+        training_steps=16,
+    )
+    resumed_optimizer.load_state_dict(original_optimizer.state_dict())
+    resumed.load_state_dict(original.state_dict())
+    assert _lrs(resumed) == pytest.approx(_lrs(original))
+    assert _step(resumed) == pytest.approx(_step(original))
+
+
+@pytest.mark.parametrize("epoch", [-1, True, False, 1.5, "2"])
+def test_invalid_scheduler_epoch_leaves_schedule_unchanged(epoch):
+    scheduler = build_lr_scheduler(
+        LRSchedulerConfig(warmup_steps=4), optimizers=[_optimizer()], training_steps=8
+    )
+    before = scheduler.state_dict()
+    lr_before = scheduler.get_metrics()
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        scheduler.load_state_dict({"last_epoch": epoch})
+    assert scheduler.state_dict() == before
+    assert scheduler.get_metrics() == lr_before

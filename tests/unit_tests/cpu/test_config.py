@@ -624,3 +624,66 @@ def test_the_cli_view_parses_into_the_real_groups() -> None:
 def test_unknown_packing_is_rejected():
     with pytest.raises(ConfigError, match="dataloader.packing"):
         DataloaderConfig(packing="typo")
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_auto_fill_reads_local_hf_architecture(tmp_path, monkeypatch, relative):
+    from transformers import AutoConfig
+
+    directory = tmp_path / "saved_model"
+    saved = AutoConfig.for_model(
+        "llama",
+        vocab_size=257,
+        hidden_size=96,
+        intermediate_size=192,
+        num_hidden_layers=3,
+        num_attention_heads=6,
+        num_key_value_heads=2,
+    )
+    saved.save_pretrained(directory)
+    monkeypatch.chdir(tmp_path)
+    cfg = LLMTunerConfig(
+        model=ModelConfig(
+            model_name_or_path="saved_model" if relative else str(directory)
+        )
+    )
+    cfg.auto_fill_model()
+    for field in (
+        "vocab_size",
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+    ):
+        assert getattr(cfg.model, field) == getattr(saved, field)
+
+
+def test_auto_fill_uses_composite_hf_text_architecture(tmp_path):
+    from transformers import AutoConfig
+
+    saved = AutoConfig.for_model(
+        "qwen2_5_vl",
+        text_config={
+            "vocab_size": 257,
+            "hidden_size": 96,
+            "intermediate_size": 192,
+            "num_hidden_layers": 3,
+            "num_attention_heads": 6,
+            "num_key_value_heads": 2,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+        },
+    )
+    saved.save_pretrained(tmp_path)
+    cfg = LLMTunerConfig(model=ModelConfig(model_name_or_path=str(tmp_path)))
+    cfg.auto_fill_model()
+    for field in (
+        "vocab_size",
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+    ):
+        assert getattr(cfg.model, field) == getattr(saved.text_config, field)
