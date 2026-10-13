@@ -55,8 +55,9 @@ def _resolve_multimodal_recipe(dataset_name: str):
     live in this package and the config layer must not import them.
     """
     try:
-        from .multimodal.collator import MultiModalCollator
-        from .multimodal.datasets import MM_DATASETS, build_mm_sample_packing
+        from .multimodal.collator import MultimodalCollator
+        from .multimodal.packing import build_multimodal_packing
+        from .multimodal.processors import MULTIMODAL_DATASETS
     except ImportError as exc:
         raise ImportError(
             f"dataset {dataset_name!r} is not one of the text "
@@ -66,13 +67,17 @@ def _resolve_multimodal_recipe(dataset_name: str):
             "(and av for video): install them with `pip install torchvision "
             "pillow av`, or name a text recipe instead."
         ) from exc
-    if dataset_name not in MM_DATASETS:
+    if dataset_name not in MULTIMODAL_DATASETS:
         raise ValueError(
             f"unknown dataset {dataset_name!r}. Expected 'random', "
             f"'local_jsonl', a text recipe {sorted(DATASETS)}, or a "
-            f"multimodal recipe {sorted(MM_DATASETS)}"
+            f"multimodal recipe {sorted(MULTIMODAL_DATASETS)}"
         )
-    return MM_DATASETS[dataset_name], MultiModalCollator, build_mm_sample_packing
+    return (
+        MULTIMODAL_DATASETS[dataset_name],
+        MultimodalCollator,
+        build_multimodal_packing,
+    )
 
 
 def _resolve_text_recipe(dataloader_config, *, dataset_name: str, tokenizer):
@@ -179,10 +184,10 @@ def build_dataloader(
     if is_multimodal:
         # Resolved before the tokenizer is constructed, so a bad name fails
         # fast without loading tokenizer assets.
-        from llmtuner.components.tokenizer import MultiModalTokenizer
+        from llmtuner.components.tokenizer import MultimodalTokenizer
 
         recipe, collator, build_packing = _resolve_multimodal_recipe(dataset_name)
-        tokenizer = MultiModalTokenizer(
+        tokenizer = MultimodalTokenizer(
             tokenizer_path=dataloader_config.tokenizer_path,
             image_token=dataloader_config.mm_image_token,
             video_token=dataloader_config.mm_video_token,

@@ -16,7 +16,7 @@ class DataloaderConfig:
     ``random`` (the default) keeps the synthetic corpus and needs no assets, so
     the default run is unchanged and reproducible offline. Any other value
     names a recipe from ``datasets.text.processors.DATASETS`` or
-    ``datasets.multimodal.datasets.MM_DATASETS``, or the built-in
+    ``datasets.multimodal.processors.MULTIMODAL_DATASETS``, or the built-in
     ``local_jsonl`` --
     which is deliberately NOT in either dict, because its corpus path is a
     runtime argument rather than a constant.
@@ -33,7 +33,7 @@ class DataloaderConfig:
         metadata={
             "help": "Corpus selector: 'random' (synthetic, no assets) | "
             "'local_jsonl' | a key of datasets.text.processors.DATASETS | a key of "
-            "datasets.multimodal.datasets.MM_DATASETS (needs torchvision)"
+            "datasets.multimodal.processors.MULTIMODAL_DATASETS (needs torchvision)"
         },
     )
     tokenizer_path: str | None = field(
@@ -161,7 +161,7 @@ class DataloaderConfig:
                     "chat_renderer is set"
                 )
         # Membership in ``datasets.text.processors.DATASETS`` /
-        # ``datasets.multimodal.datasets.MM_DATASETS`` is checked by
+        # ``datasets.multimodal.processors.MULTIMODAL_DATASETS`` is checked by
         # ``datasets/factory.py`` at build time, not here: reading the registries
         # would import the datasets package into the config layer.
         if self.max_num_documents is not None and self.max_num_documents < 1:
