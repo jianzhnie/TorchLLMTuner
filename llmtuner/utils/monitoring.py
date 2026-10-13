@@ -45,6 +45,7 @@ __all__ = [
     "get_device_name",
     "get_device_capacity_bytes",
     "record_memory_history",
+    "stop_memory_history",
     "read_memory_snapshot",
 ]
 
@@ -258,6 +259,13 @@ def record_memory_history(*, max_entries: int) -> bool:
         return False
     memory._record_memory_history(stacks="python", max_entries=max_entries)
     return True
+
+
+def stop_memory_history() -> None:
+    """Disable allocator history after the owning profiler has finished."""
+    memory = memory_module()
+    if memory is not None:
+        memory._record_memory_history(enabled=None)
 
 
 def read_memory_snapshot():

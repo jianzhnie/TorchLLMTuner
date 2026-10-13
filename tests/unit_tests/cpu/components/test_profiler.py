@@ -39,6 +39,15 @@ def test_the_defaults_disable_everything() -> None:
     assert not config.enable_memory_snapshot
 
 
+@pytest.mark.parametrize("name", ["profiler_repeat", "profiler_skip_first"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_negative_optional_schedule_arguments_fail_before_profiler_start(name, enabled):
+    with pytest.raises(ValueError, match=rf"profiler\.{name} must be >= 0"):
+        Config(enable_profiling=enabled, **{name: -1})
+    for value in (None, 0, 1):
+        assert getattr(Config(**{name: value}), name) == value
+
+
 def test_a_cycle_that_cannot_fit_its_parts_is_rejected() -> None:
     """The schedule's wait would go negative. torch accepts a negative wait and
     then never activates, producing a run that profiles nothing."""
@@ -555,7 +564,7 @@ def test_profiler_exit_preserves_oom_and_attempts_snapshot_after_trace_failure(
 
     profiler = Profiler(Config())
     profiler.torch_profiler = SimpleNamespace(__exit__=stop)
-    profiler.memory_profiler = SimpleNamespace(step=snapshot)
+    profiler.memory_profiler = SimpleNamespace(step=snapshot, close=lambda: None)
     original = torch.OutOfMemoryError("training OOM")
     assert profiler.__exit__(type(original), original, None) is False
     assert calls == ["trace", "snapshot"]
@@ -579,3 +588,50 @@ def test_profiler_exit_raises_trace_error_when_training_succeeded():
         profiler.__exit__(None, None, None)
     assert caught.value is original
     assert profiler.torch_profiler is None
+
+
+@pytest.mark.parametrize("oom", [False, True])
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_memory_history_stops_after_snapshot_and_preserves_training_error(
+    monkeypatch, oom, close_fails
+):
+    calls = []
+    monkeypatch.setattr(profiler_module, "record_memory_history", lambda **_: True)
+
+    def stop_history():
+        calls.append("stop")
+        if close_fails:
+            raise RuntimeError("history shutdown failed")
+
+    monkeypatch.setattr(profiler_module, "stop_memory_history", stop_history)
+    memory = MemoryProfiler(0, 10, "", "", 0, 100)
+    monkeypatch.setattr(memory, "step", lambda **_: calls.append("snapshot"))
+    profiler = Profiler(Config())
+    profiler.memory_profiler = memory
+    original = torch.OutOfMemoryError("oom") if oom else None
+    if close_fails and not oom:
+        with pytest.raises(RuntimeError, match="history shutdown failed"):
+            profiler.__exit__(None, None, None)
+    else:
+        assert (
+            profiler.__exit__(type(original) if oom else None, original, None) is False
+        )
+    assert calls == (["snapshot", "stop"] if oom else ["stop"])
+    memory.close()
+    profiler.__exit__(None, None, None)
+    assert calls.count("stop") == 1
+
+
+def test_stop_memory_history_disables_device_allocator(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.utils import monitoring
+
+    calls = []
+    monkeypatch.setattr(
+        monitoring,
+        "memory_module",
+        lambda: SimpleNamespace(_record_memory_history=lambda **kw: calls.append(kw)),
+    )
+    monitoring.stop_memory_history()
+    assert calls == [{"enabled": None}]

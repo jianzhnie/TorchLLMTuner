@@ -1199,3 +1199,92 @@ microbatch及既有硬件/可选后端验证项仍未完成。
   各自普通异常/KeyboardInterrupt四组合，原始assembly错误保留，
   checkpointer失败后metrics仍被释放。
 - construction/cleanup/close专项通过，修改文件pre-commit通过。
+
+## Allocator history 生命周期（2026-10-13）
+
+- MemoryProfiler 启动 allocator history 后，Profiler 退出此前仅清空对象引用，
+  同一进程的后续工作仍可能继续记录。新增幂等 close，调用设备 allocator
+  的 _record_memory_history(enabled=None)；CPU 无 allocator 时跳过。
+- 正常退出、普通异常和 OOM 均关闭记录；OOM snapshot 在关闭之前写出。
+  snapshot 或 trace 失败后仍尝试关闭，清理错误不覆盖已有训练异常。
+- CPU mock 回归验证关闭参数、顺序、幂等及关闭失败传播；没有 GPU/NPU，
+  未验证设备实际停止记录。上游 torchtitan 当前也未显式关闭该记录。
+
+## Validation 跨 rank 归约验证（2026-10-13）
+
+- 从 Trainer.validate 追踪 mode restoration、temporary loader、loss/token
+  mesh 和 finalize_validation，未发现本轮可复现的新生产缺陷。
+- 新增 validation_reduction_equivalence.py，四 CPU/Gloo ranks 分别构造
+  DP×CP、DP×TP 的 2×2 真实 mesh，运行生产验证循环和 collective。
+  DP rank/step 有效 token 数不同，首步有一半 sequence shard 全部 masked。
+- 用完整 DP batches 的独立 summed cross-entropy / valid token 参考核对
+  所有 rank 的 loss，并检查 loader 关闭、混合 module modes 恢复、两次
+  no-grad forward 和训练 ntokens_seen 不变。实际 runner 通过（5.6 秒）。
+- 模型为 deterministic projection 和显式 sequence slices；topology 为
+  mesh-backed test double，未覆盖实际 attention、TP/CP/FSDP 模型变换。
+  validation CPU 专项 25 passed，新脚本 pre-commit 通过。
+
+## Profiler schedule 配置提前校验（2026-10-13）
+
+- ProfilerConfig 接受 profiler_repeat=-1/profiler_skip_first=-1，PyTorch
+  schedule 在启动时抛 AssertionError；此前该输入错误会推迟到训练装配后。
+- 配置层复用 require_at_least 拒绝两字段负值，None、0 和正值仍有效，
+  profiling 开启/关闭均校验，避免后续启用时暴露潜伏配置错误。
+- 回归覆盖两个字段及 enable_profiling 开关；未改变 skip_first_wait，
+  PyTorch 将它按布尔开关解释，并没有相同的非负计数约束。
+
+## 异步 checkpoint 完成日志（2026-10-13）
+
+- DCP async Future 的 done callback 不区分成功/异常/取消，总是打印
+  Finished writing；保存失败虽在 wait 时传播，日志此前仍误报写入成功。
+- 回调先检查 cancelled 和 exception，仅成功记录完成耗时；失败记录
+  step 与实际异常，取消独立报告。没有在 callback 中消吞 wait 的错误。
+- 回归注入真实 concurrent.futures.Future，覆盖成功、OSError(disk full)、
+  cancelled，验证日志分类以及 wait 继续抛原始异常/CancelledError。
+- checkpointer CPU 专项 36 passed，未改变保存格式、staging 或 collective。
+
+## 异步 DCP 专用通信组释放（2026-10-13）
+
+- DistributedCheckpointManager 为 async 保存创建专用 Gloo group，但此前
+  close 未销毁该组。CLI 的全局 teardown 会清理它，programmatic 重复
+  创建 manager 则会残留通信资源。
+- close 在 staging/save futures 完成后清理 purge thread、stager 与自建
+  group；某一清理失败仍尝试其他项，保留首个异常，清空已消费 handle。
+  默认组已经全局销毁时跳过专用组销毁，避免重复退出错误。
+- 实际单 rank Gloo 测试注入 stager.close OSError，验证专用组从注册表
+  删除、默认组仍可 barrier、首个异常保留和二次 close 无重复。
+- checkpointer CPU 专项 37 passed；多 rank/HCCL 环境未验证本项销毁。
+
+## 实际双 rank async DCP 生命周期（2026-10-13）
+
+- 新增 async_checkpoint_lifecycle_equivalence.py，两 CPU/Gloo ranks
+  实际运行 async_save、等待、group teardown、DCP restore，重复两轮。
+- 使用生产 OptimizersContainer 与 LRSchedulersContainer，恢复时故意
+  改变初始 learning_rate，验证恢复后的下一步参数和完整 optimizer
+  state 与连续训练逐元素一致（rtol=atol=0），scheduler state 相同。
+- 每个 manager 自建组退出后从注册表消失；重复 close 无异常；默认组
+  barrier/all_reduce 仍可用，save_future 清空。实际 runner 通过（3.7秒）。
+- 初稿使用原生新 AdamW，DCP 不会恢复其未初始化 state slots；生产
+  容器已有 init_optim_state，因此测试改用真实训练容器。不能据本项
+  宣称裸 optimizer 具有相同恢复契约。
+- 新脚本 pre-commit 通过；本项仅覆盖 replicated CPU parameters 与
+  async thread 保存，未覆盖 pinned-memory/process staging 或 GPU/NPU。
+
+## Scheduler restore 避免 get_lr 警告（2026-10-13）
+
+- LambdaLR.get_lr 在 step 外调用会发 UserWarning，load_state_dict 原本
+  用它恢复 _last_lr；warnings-as-errors 配置下会使正常 checkpoint
+  restore 失败。改按恢复的 base_lrs 和对应 lr_lambdas(last_epoch) 重算，
+  保留多 param-group 各自的 base LR、optimizer LR 和 epoch/count 同步。
+- 已有恢复回归提升该警告为 error，验证 optimizer restored initial_lr
+  与下一 scheduler step；scheduler 专项 27 passed。
+- 两 rank async DCP 继续训练测试以相同警告为 error 实际重跑通过；
+  模型/optimizer 与连续训练仍逐元素一致。
+
+## DCP 构造失败释放自建通信组（2026-10-13）
+
+- async manager 创建 Gloo group 后，retention thread.start 失败会发生在
+  _initialized=True 之前；public close 跳过部分构造对象，造成自建组残留。
+- 在 thread.start 失败处主动清理已获取资源；清理失败不会替换构造错误。
+- 真实单 rank Gloo 回归注入线程启动 RuntimeError，验证原始异常保留、
+  已创建专用组被释放、默认组仍可 barrier；checkpointer 专项 38 passed。

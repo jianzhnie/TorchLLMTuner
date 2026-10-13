@@ -239,7 +239,16 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 args=(self.purge_queue, self._storage.remove),
                 daemon=True,
             )
-            self.purge_thread.start()
+            try:
+                self.purge_thread.start()
+            except BaseException:
+                # The public close() skips incomplete construction, but this
+                # point already owns an async process group.
+                try:
+                    self._close()
+                except BaseException:
+                    logger.exception("DCP cleanup failed during construction")
+                raise
 
         logger.info(
             "Checkpointing active. Checkpoints will be loaded from and saved "
@@ -256,16 +265,32 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         self.close()
 
     def _close(self) -> None:
+        releases = []
         if (
             hasattr(self, "purge_thread")
             and self.purge_thread
             and self.purge_thread.is_alive()
         ):
             self.purge_queue.put(None)
-            self.purge_thread.join()
+            releases.append(self.purge_thread.join)
 
         if self.stager is not None:
-            self.stager.close()
+            stager, self.stager = self.stager, None
+            releases.append(stager.close)
+        pg, self.pg = self.pg, None
+        if pg is not None and dist.is_initialized():
+            releases.append(lambda: dist.destroy_process_group(pg))
+        first_error: BaseException | None = None
+        for release in releases:
+            try:
+                release()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                else:
+                    logger.exception("Additional DCP resource cleanup failure")
+        if first_error is not None:
+            raise first_error
 
     def dcp_save(
         self,
@@ -517,14 +542,27 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             # duration is otherwise invisible, which is the number that says
             # whether async checkpointing is actually keeping up.
             assert self.save_future is not None
-            self.save_future.add_done_callback(
-                lambda _: logger.info(
+
+            def log_save_completion(future: Future) -> None:
+                if future.cancelled():
+                    logger.warning(
+                        "Checkpoint write for step %d was cancelled.", curr_step
+                    )
+                    return
+                error = future.exception()
+                if error is not None:
+                    logger.error(
+                        "Checkpoint write for step %d failed: %s", curr_step, error
+                    )
+                    return
+                logger.info(
                     "Finished writing the checkpoint for step %d in %.2f "
                     "seconds (async total).",
                     curr_step,
                     time.monotonic() - async_save_started_at,
                 )
-            )
+
+            self.save_future.add_done_callback(log_save_completion)
 
         logger.info(
             f"Finished {checkpoint_phase} the checkpoint in "

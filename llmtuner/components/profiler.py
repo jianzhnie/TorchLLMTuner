@@ -59,7 +59,11 @@ if TYPE_CHECKING:
 
 from ..accelerator.device import device_type
 from ..utils.logging import get_distributed_rank, get_logger
-from ..utils.monitoring import read_memory_snapshot, record_memory_history
+from ..utils.monitoring import (
+    read_memory_snapshot,
+    record_memory_history,
+    stop_memory_history,
+)
 
 logger = get_logger(__name__)
 
@@ -157,6 +161,12 @@ class MemoryProfiler:
             "Finished dumping memory snapshot in %.2f seconds", time.monotonic() - begin
         )
 
+    def close(self) -> None:
+        """Stop the allocator history started by this profiler, once."""
+        if self._records_history:
+            self._records_history = False
+            stop_memory_history()
+
 
 class Profiler:
     """Owns the trace and memory-snapshot lifecycle for a training run.
@@ -225,6 +235,13 @@ class Profiler:
                 if first_error is None:
                     first_error = error
                 logger.exception("Failed to write OOM memory snapshot")
+        if memory is not None:
+            try:
+                memory.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                logger.exception("Failed to stop allocator memory history")
         if exc_val is None and first_error is not None:
             raise first_error
         return False
