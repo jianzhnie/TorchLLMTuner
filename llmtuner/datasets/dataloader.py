@@ -9,8 +9,8 @@ config here would be a parameter bag built one line before its only consumer.
 ``GrainDataLoader``'s ``dataset`` is the already-built Grain graph, not something
 this module constructs. The caller has the dataset registry, and building it
 there is what keeps ``loader.py`` free of a dependency on every concrete dataset
--- which is also why :func:`~llmtuner.datasets.factory.build_dataloader`, which does
-own that registry, lives one level up.
+-- the registry belongs to
+:func:`~llmtuner.datasets.loader_builder.build_dataloader`.
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ from torch.distributed.checkpoint.stateful import Stateful
 
 from ..components.tokenizer import BaseTokenizer
 from .collators import Collator, TextCollator, TrainerBatch
+from .composition import as_iter_dataset
 from .contracts import DatasetBuildContext, require_positive
-from .graph import as_iter_dataset
 
 __all__ = [
     "BaseDataLoader",
@@ -105,8 +105,8 @@ class GrainDataLoader(BaseDataLoader):
         Upstream builds this graph here, from a ``DatasetIterationPolicy`` it
         assembles on the spot. That is not available to us: building the
         registry's recipes means importing the registry, which is the coupling
-        :func:`~llmtuner.datasets.factory.build_dataloader` exists to absorb. So the
-        policy is spent there, when the caller builds the graph, and only the
+        loader builder exists to absorb. The policy is spent when the caller
+        builds the graph, and only the
         knobs the batching below actually reads -- ``repeat`` and the prefetch
         depth -- arrive here. ``seed``, ``shuffle`` and the streaming window
         describe order the graph has already fixed; a copy here would be a field

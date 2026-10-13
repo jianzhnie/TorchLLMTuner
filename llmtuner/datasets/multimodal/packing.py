@@ -10,14 +10,14 @@ import numpy as np
 import torch
 
 from ...components.loss import IGNORE_INDEX
-from ..contracts import DatasetBuildContext, DatasetIterationPolicy, require_positive
-from ..graph import (
+from ..composition import (
     DatasetConcat,
     DatasetMix,
     SingleDataset,
     as_iter_dataset,
     build_dataset,
 )
+from ..contracts import DatasetBuildContext, DatasetIterationPolicy, require_positive
 
 
 def build_multimodal_packing(

@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 
 from llmtuner.models.common.activation import SwiGLU
-from llmtuner.models.common.async_linear import DistGEMMFeedForward
 from llmtuner.models.common.feed_forward import (
     FeedForward,
     SigmoidGatedFeedForward,
@@ -27,6 +26,7 @@ from llmtuner.models.common.feed_forward import (
 from llmtuner.models.common.linear import PartialBiasRowwiseLinear, RouterGateLinear
 from llmtuner.models.common.moe.experts import GroupedExperts
 from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
+from llmtuner.models.common.tp_projections import TensorParallelFeedForward
 
 
 def _ffn(dim: int = 8, hidden: int = 6) -> FeedForward:
@@ -172,17 +172,17 @@ def test_default_activation_is_swiglu() -> None:
     assert isinstance(_ffn().activation_fn, SwiGLU)
 
 
-# -- DistGEMMFeedForward -----------------------------------------------------
+# -- TensorParallelFeedForward -----------------------------------------------------
 
 
 def test_dist_gemm_ffn_is_a_feed_forward() -> None:
     """The fused class subclasses the base, so the checkpoint hooks carry over."""
-    assert issubclass(DistGEMMFeedForward, FeedForward)
+    assert issubclass(TensorParallelFeedForward, FeedForward)
 
 
 def test_dist_gemm_ffn_splits_its_weights_like_the_base() -> None:
     inner = _ffn()
-    fused = DistGEMMFeedForward(w13=inner.w13, w2=inner.w2)
+    fused = TensorParallelFeedForward(w13=inner.w13, w2=inner.w2)
     assert set(fused.state_dict()) == set(inner.state_dict())
 
 
@@ -195,7 +195,7 @@ def test_dist_gemm_ffn_falls_back_to_the_plain_path_without_tp() -> None:
     """
     torch.manual_seed(0)
     inner = _ffn()
-    fused = DistGEMMFeedForward(w13=inner.w13, w2=inner.w2)
+    fused = TensorParallelFeedForward(w13=inner.w13, w2=inner.w2)
     x = torch.randn(4, 8)
 
     assert torch.equal(fused(x), inner(x))

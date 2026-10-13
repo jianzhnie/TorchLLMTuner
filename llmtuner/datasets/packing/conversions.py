@@ -8,9 +8,7 @@ from __future__ import annotations
 import numpy as np
 
 from ...components.loss import IGNORE_INDEX
-from ..graph import (
-    TextSequence,
-)
+from ..contracts import TextSequence
 
 
 def packing_output_is_full(packing_output: dict[str, np.ndarray]) -> bool:

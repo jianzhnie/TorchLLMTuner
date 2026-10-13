@@ -45,7 +45,7 @@ from .distributed import (
     get_default_group,
     get_world_size,
 )
-from .tensors import cast_data_device, get_data_device
+from .tensor_tree import get_tensor_tree_device, move_tensor_tree
 
 logger = get_logger(__name__)
 
@@ -331,9 +331,9 @@ def all_reduce(
     if group is None:
         group = get_default_group()
 
-    input_device = get_data_device(data)
+    input_device = get_tensor_tree_device(data)
     backend_device = get_comm_device(group)
-    data_on_device = cast_data_device(data, backend_device)
+    data_on_device = move_tensor_tree(data, backend_device)
 
     if op.lower() == "mean":
         dist.all_reduce(data_on_device, _REDUCE_OPS["sum"], group)
@@ -346,4 +346,4 @@ def all_reduce(
             f"reduce op should be one of {list(_REDUCE_OPS)} or 'mean', but got {op}"
         )
 
-    cast_data_device(data_on_device, input_device, out=data)
+    move_tensor_tree(data_on_device, input_device, out=data)

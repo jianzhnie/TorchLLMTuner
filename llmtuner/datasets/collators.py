@@ -17,8 +17,7 @@ import torch
 
 from ..accelerator.device import should_use_pin_memory
 from ..components.loss import IGNORE_INDEX
-from .contracts import DatasetBuildContext
-from .graph import TextSequence
+from .contracts import DatasetBuildContext, TextSequence
 
 __all__ = ["Collator", "HAS_PIN_MEMORY", "TextCollator", "TrainerBatch"]
 

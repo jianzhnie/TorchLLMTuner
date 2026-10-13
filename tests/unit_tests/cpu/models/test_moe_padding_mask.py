@@ -33,7 +33,7 @@ from llmtuner.models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
-from llmtuner.models.common.moe.token_dispatch import LocalTokenDispatcher
+from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
 _NUM_EXPERTS = 4
 _DIM = 8

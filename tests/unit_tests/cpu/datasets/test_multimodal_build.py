@@ -234,7 +234,7 @@ def test_importing_the_text_path_needs_no_multimodal_dependencies():
     """
     source = (
         "import sys; sys.modules['torchvision'] = None\n"
-        "import llmtuner.datasets, llmtuner.datasets.factory\n"
+        "import llmtuner.datasets, llmtuner.datasets.loader_builder\n"
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = str(pathlib.Path(__file__).parents[3])

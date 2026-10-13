@@ -11,7 +11,7 @@ parser group or a nested one:
   ``MetricsConfig``, ``ProfilerConfig``, ``LRSchedulerConfig``.
 
 These are descriptions, not builders. Nothing here constructs the runtime object
-it describes -- the loader in ``datasets/factory.py``, the scheduler in
+it describes -- the loader in ``datasets/loader_builder.py``, the scheduler in
 ``components/optimizer/lr_scheduler.py`` -- for two reasons. A config that
 carries its own builder suggests the built object is one of its fields, and it
 is not: building takes arguments the config does not have (which rank am I, how
