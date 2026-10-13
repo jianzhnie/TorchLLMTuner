@@ -1,6 +1,6 @@
 """The ``torch_checkpointing`` checkpoint manager.
 
-Vendored from torchtitan's ``components/checkpointer/torch_checkpointing.py``.
+Vendored from torchtitan's ``components/checkpointer/torch_checkpointing_backend.py``.
 Its class structure, policy wiring, and comments are kept verbatim where they
 carry a reason; three things were altered, and each is a subtraction or a
 necessary adaptation rather than a redesign.
@@ -83,7 +83,8 @@ CHECKPOINTING_LOGGER_NAME = "torch_checkpointing"
 
 _INSTALL_HINT = (
     "the torch_checkpointing backend is not installed. Install it, or use the "
-    "DCP checkpoint manager (components/checkpointer/dcp.py), which needs only "
+    "DCP checkpoint manager "
+    "(components/checkpointer/distributed_checkpoint.py), which needs only "
     "torch.distributed.checkpoint."
 )
 

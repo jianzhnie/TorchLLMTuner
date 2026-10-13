@@ -36,7 +36,11 @@ from ...accelerator.device import (
     get_env_dist_info,
 )
 from ...accelerator.distributed import init_dist_pytorch, is_distributed
-from ...components.checkpointer import DATALOADER, TRAIN_STATE, CheckpointManager
+from ...components.checkpointer import (
+    DATALOADER,
+    TRAIN_STATE,
+    DistributedCheckpointManager,
+)
 from ...components.metrics import MetricsProcessor
 from ...components.optimizer import EMA, OptimizersContainer, build_lr_scheduler
 from ...models.common.aux_loss import register_aux_loss_zero_hook
@@ -247,7 +251,7 @@ def _build_checkpointer(self, cfg, hf_model_config) -> None:
     states: dict[str, Any] = {TRAIN_STATE: self}
     if self.dataloader is not None:
         states[DATALOADER] = self.dataloader
-    self.checkpointer = CheckpointManager(
+    self.checkpointer = DistributedCheckpointManager(
         cfg.checkpoint,
         model_parts=self.model_parts,
         optimizer=self.optimizer,
