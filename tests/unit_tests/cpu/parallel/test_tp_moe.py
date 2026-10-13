@@ -450,3 +450,11 @@ def test_tp_one_leaves_a_moe_model_bit_identical() -> None:
     for k, v in model.state_dict().items():
         assert torch.equal(v, before[k])
     assert "moe_tp_experts" in MOE_PLAN_SPECS
+
+
+def test_tp_expert_sharding_preserves_freezing():
+    block = _MoeBlock(num_experts=4, dim=8, hidden=8, top_k=2)
+    block.experts.gate_up_proj.requires_grad_(False)
+    shard_experts_for_tp(block, tp_size=2, tp_rank=0)
+    assert not block.experts.gate_up_proj.requires_grad
+    assert block.experts.down_proj.requires_grad

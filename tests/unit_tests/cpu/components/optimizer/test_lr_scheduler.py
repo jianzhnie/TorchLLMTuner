@@ -263,6 +263,9 @@ def test_load_state_dict_restores_the_scheduled_lr() -> None:
     resumed.load_state_dict(saved)
 
     assert _lrs(resumed)[0] == pytest.approx(expected)
+    assert resumed.schedulers[0].optimizer.param_groups[0]["lr"] == pytest.approx(
+        expected
+    )
 
 
 def test_load_state_dict_ignores_an_empty_dict() -> None:

@@ -836,3 +836,17 @@ def test_the_fp32_restore_covers_the_bias_buffer() -> None:
         == torch.tensor(0.012345, dtype=torch.float32).item()
     )
     assert moe.tokens_per_expert_E[0].item() == 1001.0
+
+
+def test_ep_conversion_preserves_parameter_freezing():
+    model = _model(_config(norm_topk_prob=True))
+    for layer in model.layers:
+        layer.mlp.gate.weight.requires_grad_(False)
+        layer.mlp.experts.gate_up_proj.requires_grad_(False)
+    assert swap_hf_moe_blocks(model) == 2
+    for layer in model.layers:
+        assert not layer.mlp.router.gate.weight.requires_grad
+        experts = layer.mlp.routed_experts.inner_experts
+        assert not experts.w1_EFD.requires_grad
+        assert not experts.w3_EFD.requires_grad
+        assert experts.w2_EDF.requires_grad

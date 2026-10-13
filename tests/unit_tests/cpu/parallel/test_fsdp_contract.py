@@ -258,3 +258,36 @@ def test_fsdp_strategy_selects_pyTorch_214_compatible_adapter() -> None:
 def test_fine_grained_adapter_rejects_a_distinct_hook_target() -> None:
     with pytest.raises(ValueError, match="separate hook_module"):
         fully_shard_fine_grained(nn.Linear(2, 2), hook_module=nn.Identity())
+
+
+def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.config import ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(nn.Linear(2, 2))
+    calls = []
+    override_policy = object()
+    cfg = ParallelConfig(fsdp_apply_modules={"0": {"mp_policy": override_policy}})
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda implementation: SimpleNamespace(
+            get_fully_shard_fn=lambda: (
+                lambda module, **kwargs: calls.append((module, kwargs))
+            )
+        ),
+    )
+    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda model: None)
+    plan.apply_fsdp_by_pattern(
+        model,
+        dp_mesh=object(),
+        cfg=cfg,
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+    )
+    assert calls[0][0] is model[0]
+    assert calls[0][1]["mp_policy"] is override_policy
+    assert calls[1][0] is model
+    assert calls[1][1]["mp_policy"] is not override_policy
