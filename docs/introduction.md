@@ -83,7 +83,7 @@ flowchart TD
     FSDP --> RUNTIME[Trainer 训练与验证循环]
     RUNTIME --> OPT[Optimizer / LR Scheduler / EMA]
     RUNTIME --> DATA[Grain DataLoader]
-    RUNTIME --> CKPT[CheckpointManager]
+    RUNTIME --> CKPT[DistributedCheckpointManager]
     RUNTIME --> METRICS[Metrics / Profiler]
 ```
 

@@ -70,7 +70,7 @@ def _cfg() -> LLMTunerConfig:
             pipeline_parallel_size=PP,
             pipeline_parallel_schedule="1F1B",
             num_pp_microbatches=MICROBATCHES,
-            context_parallel_size=CP,
+            context_parallel_kv_allgather_size=CP,
             data_parallel_shard_size=-1,
         ),
         optimizer=OptimizerConfig(learning_rate=3e-4, weight_decay=0.0),

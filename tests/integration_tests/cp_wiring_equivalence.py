@@ -83,7 +83,7 @@ def _cfg(load_balancer: str | None) -> LLMTunerConfig:
             num_key_value_heads=4,
         ),
         parallel=ParallelConfig(
-            context_parallel_size=2,
+            context_parallel_kv_allgather_size=2,
             context_parallel_load_balancer=load_balancer,
         ),
         training=TrainingConfig(max_seq_len=SEQ, steps=1),

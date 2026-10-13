@@ -122,7 +122,7 @@ def main() -> None:
     assert world == 2, f"this check assumes 2 ranks, got {world}"
 
     cfg = LLMTunerConfig(
-        parallel=ParallelConfig(context_parallel_size=2),
+        parallel=ParallelConfig(context_parallel_kv_allgather_size=2),
         training=TrainingConfig(max_seq_len=SEQ, steps=STEPS),
     )
     parallel_dims = ParallelTopology.from_config(cfg.parallel, world)

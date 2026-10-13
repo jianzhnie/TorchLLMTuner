@@ -56,7 +56,7 @@ from llmtuner.errors import ConfigError, UnsupportedCombinationError
         "data_parallel_replicate_size",
         "tensor_parallel_size",
         "pipeline_parallel_size",
-        "context_parallel_size",
+        "context_parallel_kv_allgather_size",
         "expert_parallel_size",
     ],
 )
@@ -394,7 +394,7 @@ def test_cp_must_divide_seq_len() -> None:
     """A ragged sequence split would give ranks unequal token counts."""
     with pytest.raises(ValueError):
         LLMTunerConfig(
-            parallel=ParallelConfig(context_parallel_size=3),
+            parallel=ParallelConfig(context_parallel_kv_allgather_size=3),
             training=TrainingConfig(max_seq_len=64),
         )
 
@@ -416,12 +416,16 @@ def test_cp_tp_joint_seq_len_divisibility() -> None:
     """
     with pytest.raises(ValueError, match="cp \* tp"):
         LLMTunerConfig(
-            parallel=ParallelConfig(context_parallel_size=2, tensor_parallel_size=2),
+            parallel=ParallelConfig(
+                context_parallel_kv_allgather_size=2, tensor_parallel_size=2
+            ),
             training=TrainingConfig(max_seq_len=6),
         )
     # And the valid case still passes.
     LLMTunerConfig(
-        parallel=ParallelConfig(context_parallel_size=2, tensor_parallel_size=2),
+        parallel=ParallelConfig(
+            context_parallel_kv_allgather_size=2, tensor_parallel_size=2
+        ),
         training=TrainingConfig(max_seq_len=8),
     )
 

@@ -57,7 +57,7 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `datasets/multimodal/image.py` | `hf_datasets/multimodal/utils/image.py` | 0.977 |
 | `datasets/multimodal/placeholders.py` | `hf_datasets/multimodal/utils/text.py` | 0.971 |
 | `datasets/multimodal/video.py` | `hf_datasets/multimodal/utils/video.py` | 0.967 |
-| `components/tokenizer.py` | `components/tokenizer.py` | 0.907 |
+| `components/tokenizer/` | `components/tokenizer.py` | 0.907 |
 
 ## A2 —— 移植但已改写（比例中等，需逐处核对）
 
@@ -65,8 +65,8 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | --- | --- | --- | --- |
 | `components/checkpointer/__init__.py` | `components/checkpointer/__init__.py` | 0.757 | |
 | `components/checkpointer/base.py` | `components/checkpointer/base.py` | 0.717 | |
-| `components/checkpointer/dcp.py` | `components/checkpointer/dcp.py` | 0.735 | 本地/remote storage、HF export 与生命周期已重塑 |
-| `components/checkpointer/torch_checkpointing.py` | `components/checkpointer/torch_checkpointing.py` | 0.265 | |
+| `components/checkpointer/distributed_checkpoint.py` | `components/checkpointer/distributed_checkpoint.py` | 0.735 | 本地/remote storage、HF export 与生命周期已重塑 |
+| `components/checkpointer/torch_checkpointing_backend.py` | `components/checkpointer/torch_checkpointing_backend.py` | 0.265 | |
 | `components/loss.py` | `components/loss.py` | 0.297 | 去 loss 类层次，保留自由函数与 vocab-parallel 数学 |
 | `components/metrics.py` | `observability/metrics.py` | 0.381 | |
 | `components/optimizer/lr_scheduler.py` | `components/optimizer/lr_scheduler.py` | 0.373 | 去 `Configurable` |
@@ -76,7 +76,7 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `datasets/graph.py` | `components/data/dataset.py` | 0.267 | 去 `Configurable`；三个节点类去 `Config` 后缀，构建走自由函数 `build_dataset` |
 | `datasets/dataloader.py` | `components/data/loader.py` | 0.590 | 去 `Configurable`；`GrainDataLoader` 直接收参数，无 config 类 |
 | `datasets/multimodal/collator.py` | `hf_datasets/multimodal/mm_collator.py` | 0.777 | 增加 MRoPE grid/run/长度校验，当前已是契约适配 |
-| `datasets/multimodal/datasets.py` | `hf_datasets/multimodal/mm_datasets.py` | 0.310 | 去 `Configurable`；packing 改自由函数 `build_mm_sample_packing` |
+| `datasets/multimodal/processors.py` | `hf_datasets/multimodal/mm_datasets.py` | 0.310 | 去 `Configurable`；packing 改自由函数 `build_multimodal_packing` |
 | `datasets/packing/`（`build`/`conversions`/`iterators`） | `components/data/packing.py` | 0.065 | 自由函数外还增加文档容量、padding mask、长文档切分和可恢复 remainder，按语义维护 |
 | `datasets/sources.py` | `components/data/sources.py` | 0.700 | |
 | `datasets/text/processors.py` | `hf_datasets/text_datasets.py` | 0.767 | 路径与 processor 构造契约已适配 |
@@ -230,7 +230,7 @@ Ulysses 拒绝（per-head sinks 只走 TP 分片）不适用：llmtuner 尚无 G
 * **regional_inductor**：flex 只有 inductor lowering，故非 inductor backend 下
   flex 模型必须 scoop。`backend="aot_eager"` 且模型走 flex（wrapper 新 property
   `uses_flex_attention`）时用 `torch.fx.passes.regional_inductor` 包
-  `aot_autograd`；annotation 落 `hf/model.py` 的 `flex_attention_hf` 的
+  `aot_autograd`；annotation 落 `hf/attention_backend.py` 的 `flex_attention_adapter` 的
   `maybe_regional_inductor({})`（默认 nullcontext，inductor/eager 路径零开销）。
   flex 模型配其他非 inductor backend → `ValueError`；torch 无 regional_inductor
   → `NotImplementedError`；sdpa 模型 backend 原样透传。inductor_configs 传空
@@ -852,7 +852,7 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 | `apply_pp`, `build_pipeline_schedule` | `distributed/pipeline_parallel.py` | llmtuner 直接消费 HF 五部件契约；pp×ep / pp×cp 放行，**通过（适配）** |
 | `apply_pp(first_stage_module_fqns=...)`, `prepend_first_stage_modules` | 同文件 `pipeline_with_first_stage_modules` | 额外顶层模块并入 stage 0：仅作用自动切分，存在的 FQN 按序前插，已占有/重复 FQN raise、缺失跳过，显式 `module_fqns_per_model_part` 给定时忽略并告警（同上游委托语义）；`split_model_into_stages` 配套把 wrapper `named_children()` 不呈现的额外顶层模块在非属主 stage 置 `Identity`（上游 "pruned on other stages" 语义），装五部件的容器经"包含已呈现部件"判定跳过。stage FQN 稳定、默认 None 逐位不变，**通过（适配）** |
 | `apply_ac`, selective helpers, `apply_memory_budget`, `disable_dynamo_lru_cache` | `distributed/activation_checkpoint.py` | FullAC/SelectiveAC 已移植，**通过**；FullAC 的对齐同时含策略这一层：上游 `FullAC._wrap_block` 不是裸 wrapper，而是把恒 `PREFER_RECOMPUTE` 的 `_full_ac_policy` 经 `create_selective_checkpoint_contexts` 传入，让 torch 对「输出不可重算/带注册副作用」的算子仍落 SAVE；llmtuner 已按同形补上 `full_policy` + `wrap_full`（`determinism_check`/`debug` 仍走 torch 默认值——实测 torch 默认即 `default`/`False`，与上游 config 默认相同，故行为一致，只是不可配）；两处 `early_stop` 已跟随上游 #4836 为 `True`。MemoryBudgetAC 已移植为 `mode='memory_budget'` + `MemoryBudgetACConfig`（设 `torch._functorch.config.activation_memory_budget`，需 compile，torch 无 knob 时 loud-raise），见 §9.1；RegionAC 已接入（`region_ac` + `memory/remat_regions.py`，以 HF block 的 `nn.Linear` FQN 作 region 名，替代上游 `Module.configure_remat_regions` 声明通道；`recompute_regions` 与上游同语义——recompute pattern 优先于 save pattern，默认空逐位不变；`preserve_rng_state=True` 配置期即拒，torch_remat 需 torch ≥ 2.10，apply 期 loud-raise）。`disable_dynamo_lru_cache` 亦已移植（上游在每个 policy 的 `apply` 开头调用），并经 `has("dynamo_lru_cache")` 能力门：torch 2.2.2 有 `torch._C._dynamo.eval_frame` 而无 `_set_lru_cache`，此时记 info 后继续。AC 也跑在 PP 路径上（`stages.py` 的 `ac` 行 `on_pp=True`，逐 chunk 折层，与上游把 `ac_config` 交给每个 model part 的 `parallelize` 同构）。FullAC 的 `determinism_check`/`debug` 旋钮未暴露（固定默认值），登记于此 |
-| `apply_compile`, `maybe_enable_async_tp`, `maybe_regional_inductor_backend`, `maybe_regional_inductor` | `distributed/compile.py` 同名函数 | 四件全移植为 `parallel/model_compile.py` + `CompileConfig`（`training.compile_config`，默认全关 = 旧整体 compile 逐位不变）：逐 block compile 用 `Module.compile` 就地（`per_block=True`）；async TP 设 `_micro_pipeline_tp` + symm-mem 注册（按 group 名去重），配置期拒无 compile/tp=1，装配期对无 mesh/旧 torch loud-raise；regional_inductor 仅 `aot_eager`×flex 触发（wrapper `uses_flex_attention` 判定，annotation 在 `flex_attention_hf`，inductor_configs 传空），flex×其他 backend `ValueError`、torch 无该模块 `NotImplementedError`；`capture_scalar_outputs` 按上游条件（`iter_moe_layers` 非空）设置，dense 不动。上游的 `skip_fwd_side_effects_in_bwd_under_checkpoint` 与 FakeTensorMode monkeypatch 未移植（登记于 upstream map），**通过（适配）** |
+| `apply_compile`, `maybe_enable_async_tp`, `maybe_regional_inductor_backend`, `maybe_regional_inductor` | `distributed/compile.py` 同名函数 | 四件全移植为 `parallel/model_compile.py` + `CompileConfig`（`training.compile_config`，默认全关 = 旧整体 compile 逐位不变）：逐 block compile 用 `Module.compile` 就地（`per_block=True`）；async TP 设 `_micro_pipeline_tp` + symm-mem 注册（按 group 名去重），配置期拒无 compile/tp=1，装配期对无 mesh/旧 torch loud-raise；regional_inductor 仅 `aot_eager`×flex 触发（wrapper `uses_flex_attention` 判定，annotation 在 `flex_attention_adapter`，inductor_configs 传空），flex×其他 backend `ValueError`、torch 无该模块 `NotImplementedError`；`capture_scalar_outputs` 按上游条件（`iter_moe_layers` 非空）设置，dense 不动。上游的 `skip_fwd_side_effects_in_bwd_under_checkpoint` 与 FakeTensorMode monkeypatch 未移植（登记于 upstream map），**通过（适配）** |
 
 `VALID_AC_MODES` 声明在 `config/activation_checkpoint.py`，紧挨它约束的
 `TrainingConfig.activation_checkpoint_mode`；`memory/activation_checkpoint.py` 从这里
@@ -874,9 +874,9 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 | `TextCollator` | `components/data/collators.py` | packed labels/positions 与 valid-token 计数契约。上游 d398a8fb9/ec953b360 已把 `batch` 改名 `microbatch` 并引入 `TrainingMicrobatch` 类型；llmtuner 保持 dict 版 `TrainerBatch`（labels 与 num_valid_tokens 已内含），语义等价，属故意分叉。载荷逐字一致（zeros+cat、超长 raise、`positions[num_tokens:].remainder_()`、`num_valid_tokens=(labels != IGNORE_INDEX).sum()`）；**一处设备面差异登记**：`HAS_PIN_MEMORY` 上游用 `torch.accelerator.is_available()`（有加速器），llmtuner 用 `should_use_pin_memory()`（本进程解析出的设备是加速器），"有 GPU 但 `--use_cpu`"时前者 True、后者 False，后者更贴合 pin 内存的实际用途，**通过** |
 | packing build 函数和 iterators | `components/data/packing.py` | registry 选择移到 `DataloaderConfig.packing`，算法保留；document-aware iterator、padding_mask 与可恢复 remainder 均已含上游 f23d7dfe2 载荷。AST 归一化仅 3 hunk（`Config.build()` → `build_*_packing()` 自由函数），grain 图逐字相同（`length_struct`/`padding_struct` 的 `IGNORE_INDEX`/`True` 填充、`meta_features`、`seed`/`shuffle_bins`/`num_packing_bins`/`max_sequences_per_bin`，以及 `DocumentAwareConcatThenSplitIterator` 的 `get_state`/`set_state`），**通过** |
 | `TextProcessor`, `ChatProcessor` | `hf_datasets/text_datasets.py` | llmtuner 路径重组，处理语义一致；SFT prompt/response token 边界校验与上游 8108e201a 逐字一致。逐行核对的三条 SFT 信号规则：超长丢弃判据（`len(tokens) - 1 > max_context_length`）、prompt 段 labels 置 `IGNORE_INDEX`（`labels[:max(prompt_len - 1, 0)]`）、renderer 路径 `~loss_mask[1:]` 掩码，全部与上游一致；`DATASETS` 注册表三项同源，llmtuner 另加 `make_local_jsonl{,_sft,_multiturn}` 工厂（C 类）。**交叉验证**：llmtuner 的 tokenizer 抄的是上游 `experiments/transformers_modeling_backend/tokenizer.py`（`add_generation_prompt` 默认 True），而上游 SFT 数据路径用基础 tokenizer（HF 默认 False），所以 `ChatProcessor` 显式传 `add_generation_prompt=False` 才是与上游渲染一致的那一半，代码正是如此，**通过** |
-| `MultiModalCollator` | `hf_datasets/multimodal/mm_collator.py` | 已增加 MRoPE grid/run/长度校验，**通过** |
+| `MultimodalCollator` | `hf_datasets/multimodal/mm_collator.py` | 已增加 MRoPE grid/run/长度校验，**通过** |
 | image/text/video helpers | `hf_datasets/multimodal/utils/*` | A1 移植，路径扁平化；单测覆盖，**通过** |
-| `MultiModalProcessor` 与 packing helpers | `hf_datasets/multimodal/mm_datasets.py` | 去 Configurable，packing 为自由函数。归一化 AST diff 逐条核对，唯一语义差异是**有意分叉**——上游 `_process_cc12_wd_sample` 对缺 `jpg` 的行兜底成纯文本行（`texts=[text]`），llmtuner 不兜底，让 `insert_vision_placeholders` 的 `None` 槽在 `"".join` 处响亮失败；理由是 cc12m-wds 缺图属样本畸形而非解码失败，仓内两例
+| `MultimodalProcessor` 与 packing helpers | `hf_datasets/multimodal/mm_datasets.py` | 去 Configurable，packing 为自由函数。归一化 AST diff 逐条核对，唯一语义差异是**有意分叉**——上游 `_process_cc12_wd_sample` 对缺 `jpg` 的行兜底成纯文本行（`texts=[text]`），llmtuner 不兜底，让 `insert_vision_placeholders` 的 `None` 槽在 `"".join` 处响亮失败；理由是 cc12m-wds 缺图属样本畸形而非解码失败，仓内两例
 `test_insert_vision_placeholders_rejects_a_slot_with_no_token_count` /
 `test_process_cc12_wd_sample_raises_when_the_image_field_is_absent` 把该契约钉住。九参数显式转发表与上游逐字相同（上游调用方同形），不为了 DRY 偏离。其余为 Config→显式参数的形状差异，**通过（适配）** |
 | `RandomTokenSource/RandomTokenDataLoader` | 无对应 | C 类合成数据；DP rank/world 校验已覆盖，**通过** |
@@ -903,9 +903,9 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 |---|---|---|
 | `ModelWrapper` | `components/checkpointer/base.py` | 合并 PP parts，缓存稳定 storage 供 async staging，**通过** |
 | `CheckpointStorage` | 上游 backend storage seam | llmtuner Protocol，不依赖 Configurable，**通过（适配）** |
-| `BaseCheckpointManager` 生命周期方法 | 同名基类 | load/save/close、异步 drain、retention 集中在基类。resume 优先于 initial_load_* 时记 info 日志（上游 810e62786）。策略方法与上游逐行同构，两处适配登记——新增 `_initialized` 门（上游靠各类自己的 `hasattr`/`getattr` 容错部分构造，见 `dcp.CheckpointManager.__init__` 的 HF 选项拒绝）与 `enable` 短路（上游的 manager 只在配置了 checkpointer 时才构造）；`_should_purge` 的 rank 判定换 `distributed.is_main_process()`（非分布式下 `dist.get_rank()` 会 raise），**通过（适配）** |
+| `BaseCheckpointManager` 生命周期方法 | 同名基类 | load/save/close、异步 drain、retention 集中在基类。resume 优先于 initial_load_* 时记 info 日志（上游 810e62786）。策略方法与上游逐行同构，两处适配登记——新增 `_initialized` 门（上游靠各类自己的 `hasattr`/`getattr` 容错部分构造，见 `distributed_checkpoint.DistributedCheckpointManager.__init__` 的 HF 选项拒绝）与 `enable` 短路（上游的 manager 只在配置了 checkpointer 时才构造）；`_should_purge` 的 rank 判定换 `distributed.is_main_process()`（非分布式下 `dist.get_rank()` 会 raise），**通过（适配）** |
 | `_parse_step/_find_load_step/_purge_stale_checkpoints` | 同名策略 | exact `step-N`、清理 staged/abandoned、保留豁免，**通过** |
-| `dcp.CheckpointManager` | `components/checkpointer/dcp.py` | 本地/remote DCP、HF export guard。异步写总时长经 `save_future` done-callback 记 info 日志（上游 d9ca9e55a，以 info 行替代 structured scalar）。`_save`/`_load_checkpoint`/`dcp_save`/`_save_last_step`/`_flattened_model_states_sd` 与上游逐行同构，4 处 `assert` 改显式 `raise`、HF 选项的拒绝信息更具体（llmtuner 不随包发布 `sd_adapter`）；配置校验 13 条逐条搬到 `config/checkpoint.py`（另收上游 `dcp.Config.async_mode` 与 `training_engine.create_seed_checkpoint`），`initial_load_model_only` 无 `initial_load_path` 的上游告警故意不移植；上游 `SaveDone` 是零引用死类、不移植；`EXPORT_DTYPE_MAP` 在 `base.py`（两个后端都要它），它与 `models/common/cast_linear.TORCH_DTYPE_MAP` 仍是两张同表（一张写 checker 能导出的 dtype、一张写 lm_head 能计算的 dtype，重叠是巧合），登记为已知重复，**通过（适配）** |
+| `distributed_checkpoint.DistributedCheckpointManager` | `components/checkpointer/distributed_checkpoint.py` | 本地/remote DCP、HF export guard。异步写总时长经 `save_future` done-callback 记 info 日志（上游 d9ca9e55a，以 info 行替代 structured scalar）。`_save`/`_load_checkpoint`/`dcp_save`/`_save_last_step`/`_flattened_model_states_sd` 与上游逐行同构，4 处 `assert` 改显式 `raise`、HF 选项的拒绝信息更具体（llmtuner 不随包发布 `sd_adapter`）；配置校验 13 条逐条搬到 `config/checkpoint.py`（另收上游 `dcp.Config.async_mode` 与 `training_engine.create_seed_checkpoint`），`initial_load_model_only` 无 `initial_load_path` 的上游告警故意不移植；上游 `SaveDone` 是零引用死类、不移植；`EXPORT_DTYPE_MAP` 在 `base.py`（两个后端都要它），它与 `models/common/cast_linear.TORCH_DTYPE_MAP` 仍是两张同表（一张写 checker 能导出的 dtype、一张写 lm_head 能计算的 dtype，重叠是巧合），登记为已知重复，**通过（适配）** |
 | `TorchCheckpointingManager` | 同名 backend | optional dependency 延迟导入，保存统一经过 backend。HF 导出路径（`sharded/` + barrier + consolidate）与上游同构；后端未安装故仍属静态复核，**通过（适配）** |
 | `FilesystemCheckpointStorage`、`async_save_config` | 上游 `_FilesystemCheckpointStorage`、`_async_save_config` | 去私有化：测试需要这两个 seam（storage 契约/本地 IO、异步配置分支），符合"非必需不加 `_`"的取向，**通过（适配）** |
 | `canonical_fqn` | `components/checkpointer/utils.py` | A1，移除 checkpoint wrapper segment，**通过** |
@@ -919,8 +919,8 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 | `MetricsProcessor` | 同名上游类 | 去 Configurable；按真实 step window 算吞吐/MFU，log frequency 构造时校验，**通过（适配）**。训练/校验两条日志的 key 集合与 `tps`/`tflops`/`time_metrics`/`memory` 公式与上游一致；差异为形状——上游自由函数 `compute_training_performance_metrics` 的载荷内联进 `_derive`/`DerivedMetrics`，MFU 抑制条件由 `has_quantization` 换成 `gpu_peak_flops == 0 or num_flops_per_token == 0`（无量化路径的等价替代，见模块 docstring），`_build_metric_logger` 去掉 `ft_*` 并只吞 ImportError；`should_log` 不写 `step_last_log`（无副作用，容忍先 log 后 should_log）。模块全程不碰 `torch.distributed` |
 | `get_metrics_rank`, `ensure_pp_loss_visible` | 上游 `_get_metrics_rank` / PP warning | llmtuner 明确 PP schedule 可见性：rank 查询去私有化为 `get_metrics_rank`，`ensure_pp_loss_visible` 增加 `not pp_enabled` 提前返回（上游无该守卫，只靠唯一调用点门控，语义等价），**通过** |
 | `Profiler`, `MemoryProfiler` | `observability/profiler.py` | 去 Configurable，schedule 与 OOM 处理保留；`caused_by_oom` 与上游 773e16e75 语义等价（含防环与隐式链）。activity 列表按 resolved device：CUDA 可用加 CUDA，否则 XPU 可用加 XPU（其余设备仍 CPU-only，与上游一致），用例 `test_the_trace_activity_follows_the_resolved_device` 钉住 cpu/cuda/xpu 三态。裁剪登记：`leaf_folder`（只服务上游 torchft 的 per-replica 子目录）、CUDA-graph annotations（随 D10 无图路径）、`structured_logger` span、`active()` builder；memory history 经 `utils/monitoring` 的 device 探针（上游非 CUDA 分支调不存在的 `torch.memory`），**通过（适配）** |
-| `BaseTokenizer`, `HuggingFaceTokenizer` | `components/tokenizer.py` | A1；encode 强制 `add_special_tokens=False` 后自行处理 BOS/EOS。`apply_chat_template` 接受 `Sequence[Mapping]`（上游 4a0d8dab3 多轮 SFT 配套），**通过**。`apply_chat_template` 自动注入 `bos_token`/`eos_token` kwargs 与默认 `add_generation_prompt=True`（上游 backend tokenizer 同源）；SFT 全量渲染在 `datasets/text/processors.py` 显式传 `add_generation_prompt=False` |
-| `MultiModalTokenizer` | 同文件多模态 tokenizer | 组合 text/vision token 契约，**通过** |
+| `BaseTokenizer`, `HuggingFaceTokenizer`（`components/tokenizer/`） | `components/tokenizer.py` | A1；encode 强制 `add_special_tokens=False` 后自行处理 BOS/EOS。`apply_chat_template` 接受 `Sequence[Mapping]`（上游 4a0d8dab3 多轮 SFT 配套），**通过**。`apply_chat_template` 自动注入 `bos_token`/`eos_token` kwargs 与默认 `add_generation_prompt=True`（上游 backend tokenizer 同源）；SFT 全量渲染在 `datasets/text/processors.py` 显式传 `add_generation_prompt=False` |
+| `MultimodalTokenizer` | 同文件多模态 tokenizer | 组合 text/vision token 契约，**通过** |
 
 ### 8. Utils 与 C 类模块
 
@@ -941,7 +941,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 - `distributed/compile.py`：**已移植**（`parallel/model_compile.py::apply_compile`
   + `CompileConfig`）。逐 block compile（`per_block`）、async TP（`_micro_pipeline_tp`
   + symm-mem，配置期/装配期双层 loud-raise）、regional_inductor（`aot_eager`×flex
-  才 scoop，annotation 在 `flex_attention_hf`）、`capture_scalar_outputs`（含
+  才 scoop，annotation 在 `flex_attention_adapter`）、`capture_scalar_outputs`（含
   token-choice MoE block 时设置，dense 不动）四件各自独立开关，默认全关即旧整体
   compile 逐位不变。未移植登记：`skip_fwd_side_effects_in_bwd_under_checkpoint`、
   FakeTensorMode monkeypatch、`components` 列表。见 §5 符号行与 upstream map。
@@ -1060,8 +1060,8 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 |---|---|---|
 | `errors.py` | `LLMTunerError` 与 `ConfigError` / `UnsupportedCombinationError` / `EnvironmentUnsupportedError` 三类 fail-fast 层级 | C，llmtuner 独有 |
 | `components/checkpointer/base.py` | `ModelWrapper`, `CheckpointStorage`, `BaseCheckpointManager`, `purge_thread` | A2，同文件 |
-| `components/checkpointer/dcp.py` | `CheckpointManager`, `AsyncMode` | A2，同文件 |
-| `components/checkpointer/torch_checkpointing.py` | `TorchCheckpointingManager` 与 backend config helpers | A2，同文件 |
+| `components/checkpointer/distributed_checkpoint.py` | `DistributedCheckpointManager`, `DistributedCheckpointAsyncMode` | A2，同文件 |
+| `components/checkpointer/torch_checkpointing_backend.py` | `TorchCheckpointingManager` 与 backend config helpers | A2，同文件 |
 | `components/checkpointer/utils.py` | `canonical_fqn` | A1，同文件 |
 | `components/loss.py` | CE、vocab CE、chunked CE、logprobs、MSE | A2，同文件 |
 | `components/metrics.py` | monitor、logger、`MetricsProcessor` | A2，`observability/metrics.py` |
@@ -1070,13 +1070,13 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `components/optimizer/ema.py` | 在线 EMA 平均，复用 flat FQN state-dict 契约 | A2，同文件（上游 1b9eef3bd） |
 | `components/optimizer/utils.py` | optimizer state 初始化与 flat/FQN 转换 | A1，同文件 |
 | `components/profiler.py` | `Profiler`, `MemoryProfiler` | A2，`observability/profiler.py` |
-| `components/tokenizer.py` | tokenizer 三类 | A1，同文件 |
+| `components/tokenizer/` | tokenizer 三类 | A1，同文件 |
 | `datasets/factory.py` | `build_dataloader` | C，config build 替代品 |
 | `datasets/collators.py` | `Collator`, `TextCollator` | A2，`components/data/collators.py` |
 | `datasets/graph.py` | dataset nodes 与 build 工厂 | A2，`components/data/dataset.py` |
 | `datasets/dataloader.py` | `BaseDataLoader`, `GrainDataLoader` | A2，`components/data/loader.py` |
-| `datasets/multimodal/collator.py` | `MultiModalCollator` | A2，`hf_datasets/multimodal/mm_collator.py` |
-| `datasets/multimodal/datasets.py` | processor 与 sample packing | A2，`hf_datasets/multimodal/mm_datasets.py` |
+| `datasets/multimodal/collator.py` | `MultimodalCollator` | A2，`hf_datasets/multimodal/mm_collator.py` |
+| `datasets/multimodal/processors.py` | processor 与 sample packing | A2，`hf_datasets/multimodal/mm_datasets.py` |
 | `datasets/multimodal/image.py` | decode/resize/patch helpers | A1，`hf_datasets/multimodal/utils/image.py` |
 | `datasets/multimodal/placeholders.py` | padding 与 placeholder helpers | A1，`hf_datasets/multimodal/utils/text.py` |
 | `datasets/multimodal/video.py` | video load/process | A1，`hf_datasets/multimodal/utils/video.py` |
@@ -1098,7 +1098,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `models/common/moe/`（`block.py` MoE 本体 + `router.py` + `experts.py` + `dispatcher.py` + `load_balance.py` + `balancing.py`） | router、experts、MoE、balance loss、bias 更新钩子 | A2，上游单文件 `moe.py` + `token_dispatcher.py`；llmtuner 拆为子包 |
 | `models/common/multimodal.py` | vision/text fusion helpers | A2，同文件 |
 | `models/common/attention/qkv.py` | fused QKV 与 state hooks | A2，`attention.py` 拆分 |
-| （上游）`models/common/config_utils.py` | 上游 config 工厂：`make_*_config`、`fused_*_param_init`、`get_attention_config`、`make_token_dispatcher_config` | 无对应物：llmtuner 没有 config tree，`Module.Config` 那层整体不存在，其*判定*分别落在 `expert_parallel/hf_inspection.py`（top_k/score_func/route_norm/route_scale/expert groups）、`parallel/compatibility.py`（组合裁决与 loud-raise）、`models/hf/factory.py`（HF config 构建）、`models/hf/model.py` 的 `flex_supported`（attention backend 选择） |
+| （上游）`models/common/config_utils.py` | 上游 config 工厂：`make_*_config`、`fused_*_param_init`、`get_attention_config`、`make_token_dispatcher_config` | 无对应物：llmtuner 没有 config tree，`Module.Config` 那层整体不存在，其*判定*分别落在 `expert_parallel/hf_inspection.py`（top_k/score_func/route_norm/route_scale/expert groups）、`parallel/compatibility.py`（组合裁决与 loud-raise）、`models/hf/factory.py`（HF config 构建）、`models/hf/model.py` 的 `available_attention_backend`（attention backend 选择） |
 | （上游）`models/common/lora.py` | `get_lora_linear`/`get_lora_grouped_linear` | 无对应物（裁剪面）：LoRA 由 HF/peft 提供，llmtuner 不持有上游 `_linear()` seam 与量化轴，故不移植 |
 | `models/common/rope.py` | RoPE 全家族 | A2，同文件 |
 | `models/common/scatter_add.py` | deterministic scatter-add autograd | A2，`ops/scatter_add.py` |

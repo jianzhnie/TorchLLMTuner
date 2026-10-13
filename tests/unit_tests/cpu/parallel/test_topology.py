@@ -320,7 +320,7 @@ def test_cp_only_still_needs_a_loss_reduction() -> None:
     torchrun in
     ``tests/integration_tests/cp_wiring_equivalence.py``.
     """
-    cfg = _config(data_parallel_shard_size=1, context_parallel_size=2)
+    cfg = _config(data_parallel_shard_size=1, context_parallel_kv_allgather_size=2)
     pd = build_parallel_topology(cfg, world_size=2)
     assert isinstance(pd, ParallelTopology)
 

@@ -385,7 +385,7 @@ def test_tp_ep_cp_together_are_now_allowed() -> None:
     ParallelConfig(
         tensor_parallel_size=2,
         expert_parallel_size=2,
-        context_parallel_size=2,
+        context_parallel_kv_allgather_size=2,
     )
 
 

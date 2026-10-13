@@ -391,7 +391,7 @@ The first migration slice is implemented in the working tree:
   `context_parallel_ulysses_size` axes. The composite kernel gathers K/V over
   the first group, exchanges Q/K/V from sequence to heads over the second,
   attends `S / kv` queries against full-sequence K/V, and applies the inverse
-  exchange to its output. The legacy `context_parallel_size` remains available
+  exchange to its output. The legacy `context_parallel_kv_allgather_size` remains available
   for single-axis configurations and cannot be mixed with the new fields.
 
 Domino is integrated at the dispatcher/module boundary: routing, dispatch,
@@ -420,4 +420,3 @@ adapter.
 MC2's fused runtime still requires its runtime engine. It must not be marked
 complete from configuration fields or copied source alone; their remaining
 integration boundary is described in the capability matrix below.
-
