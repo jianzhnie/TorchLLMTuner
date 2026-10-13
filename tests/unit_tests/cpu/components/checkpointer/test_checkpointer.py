@@ -964,3 +964,50 @@ def test_failed_retention_thread_start_releases_async_group(tmp_path, monkeypatc
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+def test_auto_resume_skips_native_model_only_final_export(tmp_path):
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.config import OptimizerConfig
+
+    model = nn.Linear(2, 2)
+    optimizer = OptimizersContainer(OptimizerConfig(), model_parts=[model])
+    scheduler = _schedule(optimizer.optimizers[0])
+    config = Config(enable=True, interval=1, keep_latest_k=0)
+    manager = DistributedCheckpointManager(
+        config,
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states={},
+        folder=str(tmp_path),
+    )
+    try:
+        expected = {key: value.clone() for key, value in model.state_dict().items()}
+        assert manager.save(1)
+        with torch.no_grad():
+            model.weight.zero_()
+            model.bias.zero_()
+        assert manager.save(2, last_step=True)
+        export = str(tmp_path / "checkpoint" / "step-2")
+        assert manager._is_valid_checkpoint(export)
+        assert not manager._is_resumable_checkpoint(export)
+        assert manager._find_load_step() == 1
+        assert manager.load(-1)
+        torch.testing.assert_close(model.state_dict(), expected, rtol=0, atol=0)
+        # Native model-only exports remain available as initial model weights.
+        imported = DistributedCheckpointManager(
+            Config(enable=True, initial_load_path=export, keep_latest_k=0),
+            model_parts=[model],
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            states={},
+            folder=str(tmp_path / "imported"),
+        )
+        try:
+            assert imported.load(-1)
+            assert not model.weight.any() and not model.bias.any()
+        finally:
+            imported.close()
+    finally:
+        manager.close()

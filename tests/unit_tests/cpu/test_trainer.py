@@ -900,8 +900,9 @@ def test_checkpoint_is_sharded_over_steps_not_over_ranks(tmp_path) -> None:
 
     steps = sorted(p.name for p in (tmp_path / "checkpoint").iterdir())
     assert steps == ["step-1", "step-3"]
-    # ``.metadata`` is what marks a step directory resumable; it is written per
-    # step, not per rank, so its presence proves nothing collided.
+    # ``.metadata`` marks a completed DCP write; its state keys distinguish
+    # resumable training checkpoints from model-only exports. One per step
+    # rather than per rank proves nothing collided.
     assert (tmp_path / "checkpoint" / "step-3" / ".metadata").is_file()
 
 

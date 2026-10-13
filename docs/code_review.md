@@ -1165,3 +1165,28 @@ microbatch及既有硬件/可选后端验证项仍未完成。
 - 在 thread.start 失败处主动清理已获取资源；清理失败不会替换构造错误。
 - 真实单 rank Gloo 回归注入线程启动 RuntimeError，验证原始异常保留、
   已创建专用组被释放、默认组仍可 barrier；checkpointer 专项 38 passed。
+
+## 原生 DCP 最终模型导出与自动恢复（2026-10-13）
+
+- 默认 final checkpoint 只保存模型，但同样含 .metadata；此前 automatic
+  resume 只检查该文件，会选择较新的模型导出并因缺失训练状态而失败。
+- DCP discovery 读取 metadata，非 step-0 必须包含 optimizer 和
+  lr_scheduler keys 才参与 automatic resume；step-0 保留 model-only
+  seed 语义。retention 的 valid 判断仍保留模型导出，不视为 abandoned。
+- 真实 DCP 回归保存 full step-1 和 model-only step-2，验证自动选择
+  step-1、恢复参数，以及 step-2 仍可通过 initial_load_model_only 导入。
+- checkpointer/trainer 专项 121 passed；多 rank async 集成同步增加
+  newer native model-only export 和 automatic resume 覆盖。
+- 使用 DCP 自身 reader selection，兼容本地及 fsspec reader；本轮
+  实际验证限 CPU/本地。可选 torch_checkpointing backend 未验证同项。
+
+## Automatic resume 减少 metadata 读取（2026-10-13）
+
+- 复查 requested state 加载：optimizer/scheduler 之外的 trainer、loader、
+  EMA 仍由严格加载契约处理，没有新增静默补齐或绕过缺失状态的行为。
+- discovery 原本探测全部 step 再取 max；metadata 内容检查使每个探测
+  实际读取 metadata，旧 checkpoint 的 I/O 在找到最新完整项后仍发生。
+- 改为按 step 递减探测，找到首个 resumable checkpoint 即返回；保留
+  max_step、非规范目录过滤和无可恢复项返回 -1。
+- 手工计数验证 step-5 model-only / step-3 full / step-1 full 时只探测
+  5 和 3；max_step=2 只探测 1。checkpointer/trainer 专项 121 passed。
