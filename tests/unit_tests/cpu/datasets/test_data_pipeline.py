@@ -197,6 +197,19 @@ def test_documents_shorter_than_two_tokens_are_dropped(tokenizer, corpus):
 
 # --------------------------------------------------------------------------
 # TextSequence and collator
+
+
+@pytest.mark.parametrize("field", ["input_ids", "labels", "positions", "padding_mask"])
+@pytest.mark.parametrize("shape", [(), (2, 2)])
+def test_text_sequence_rejects_non_vector_fields(field, shape):
+    values = {"input_ids": np.arange(2), "labels": np.arange(2)}
+    values[field] = np.zeros(shape, dtype=np.int64)
+    with pytest.raises(
+        ValueError, match=f"TextSequence.{field} must be one-dimensional"
+    ):
+        TextSequence(**values)
+
+
 # --------------------------------------------------------------------------
 
 

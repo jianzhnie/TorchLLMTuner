@@ -120,6 +120,11 @@ def reject_unrepresentable_attention_kwargs(kwargs: dict) -> None:
     failure would be silent, and silence is indistinguishable from "this model
     has no softcap".
     """
+    if kwargs.get("dropout", 0.0) > 0:
+        raise NotImplementedError(
+            "flex attention does not support attention dropout; set "
+            "attention_dropout=0 or use model.eval()"
+        )
     blocking = sorted(
         name for name in ("softcap", "s_aux") if kwargs.get(name) is not None
     )

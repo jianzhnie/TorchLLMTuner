@@ -106,6 +106,12 @@ class TextSequence:
     """Per-token mask that is true for padding; `None` before padding."""
 
     def __post_init__(self) -> None:
+        for name in ("input_ids", "labels", "positions", "padding_mask"):
+            value = getattr(self, name)
+            if value is not None and value.ndim != 1:
+                raise ValueError(
+                    f"TextSequence.{name} must be one-dimensional, got {value.shape}"
+                )
         lengths = [len(self.input_ids), len(self.labels)]
         if self.positions is not None:
             lengths.append(len(self.positions))

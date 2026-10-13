@@ -67,8 +67,8 @@ is reachable here: activation checkpointing applies on the ``pp > 1`` path too
 (per stage chunk, upstream's ``ac_config``-per-model-part order). It is the
 only place that touches that process-global knob, it runs only when a mode is
 actually applied, and it is capability-guarded -- the knob is absent from the
-torch 2.2.2 build this repo develops against, where the function logs and
-returns instead of failing the run.
+older torch builds, where the function logs and returns instead of failing
+the run.
 
 The remaining deviation from upstream is the entry point: torchtitan selects a
 policy by instantiating an ``ActivationCheckpointing`` subclass, llmtuner by

@@ -5,22 +5,17 @@ Run under torchrun with 2 ranks:
     PYTHONPATH=. torchrun --nproc_per_node=2 \\
         tests/integration_tests/pp_real_corpus_equivalence.py
 
-The pipeline used to refuse every corpus but the synthetic ``random`` one,
-on the grounds that a packed corpus's per-token positions could not cross the
-pipeline. They can and do: the PP body threads each microbatch's
-``extra_kwargs`` (positions, masks) through the schedule's ``kwarg_mbs``, the
-same channel upstream's ``Validator`` uses. This check trains a tiny qwen3
-for a few steps on a packed local_jsonl corpus and compares the loss
-trajectory against a single-process, unsharded reference computed in-process
-over the same loader.
+Status: this historical harness currently requests four microbatches over a
+flat packed token stream. The trainer deliberately rejects that combination,
+because splitting the stream can cut a document's context. Its reference loop
+also assumes row-batched tensors and normalizes each microbatch independently;
+it must be repaired before it can establish training equivalence.
 
-Non-vacuity: the corpus is really packed (more than one document per row),
-the model is really split, and every batch carries positions.
+Keep the production refusal in place. Supporting this combination requires
+packing independent microbatches at the loader, with matching positions, masks,
+and the full-step valid-token denominator. This script is currently a known
+failing integration check, not evidence that packed PP training is supported.
 
-Environment note: needs torch >= 2.12 (the pipelining/flex surface) and
-grain. Written 2026-10-02 with the PP x real-corpus unlock; environment not
-covered on the development host -- awaiting a multi-rank run on the target
-torch.
 """
 
 from __future__ import annotations

@@ -208,6 +208,22 @@ def test_ulysses_kv_heads_use_the_local_count_too(tp_cp_mesh) -> None:
         apply_cp(model, tp_cp_mesh, _ulysses_cfg(tp=2))
 
 
+def test_ulysses_replicated_attention_heads_are_not_divided_by_tp(tp_cp_mesh):
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+        ReplicatedAttentionSequenceBoundary,
+    )
+
+    class ReplicatedAttention(ReplicatedAttentionSequenceBoundary, torch.nn.Module):
+        pass
+
+    model = _StubModel(num_attention_heads=2, num_key_value_heads=2)
+    layer = torch.nn.Module()
+    layer.self_attn = ReplicatedAttention()
+    model.layers.append(layer)
+    apply_cp(model, tp_cp_mesh, _ulysses_cfg(tp=2))
+    assert isinstance(layer.self_attn._titan_flex_kernel, CPFlexKernel)
+
+
 def test_ulysses_packed_is_accepted_and_the_strategy_is_latched(tp_cp_mesh) -> None:
     """Ulysses x packed is a supported combination, and the wrapper must be
     told the strategy -- its mask handling branches on it (a packed document

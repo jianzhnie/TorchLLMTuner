@@ -283,6 +283,25 @@ def looks_like_attention(module: nn.Module) -> bool:
     return all(hasattr(module, name) for name in ("q_proj", "k_proj", "v_proj"))
 
 
+class ReplicatedAttentionSequenceBoundary:
+    """Run unsharded attention on the gathered sequence, return local tokens.
+
+    Some HF plans shard only MLPs (e.g. DeepSeek MLA). Attention still needs
+    the full sequence and RoPE positions. Its output is replicated, so slice
+    tokens without summing; the input gather sums partial gradients in backward.
+    Replicated attention parameter gradients are reduced by the trainer.
+    """
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+        gathered = all_gather_along(hidden_states, -2, self._tp_seq_group)
+        output = super().forward(gathered, *args, **kwargs)
+        attention = output[0] if isinstance(output, tuple) else output
+        local = attention.chunk(self._tp_seq_group.size(), dim=-2)[
+            self._tp_seq_group.rank()
+        ].contiguous()
+        return (local, *output[1:]) if isinstance(output, tuple) else local
+
+
 # -- MoE under TP ---------------------------------------------------------------
 
 # The HF tp_plan spec strings that declare MoE-under-TP (transformers 5.x
@@ -838,15 +857,28 @@ def apply_tp(
     # config parse (upstream torchtitan ``config/validation.py``'s
     # ``head_shard_degree``); here the
     # model's own config is the first place the counts exist.
-    require_heads_divisible_by(
-        model,
-        size=cfg.tp,
-        axis="tp",
-        why=(
-            "tensor parallelism shards attention heads across the TP group, so "
-            "each rank must hold a whole number of heads"
-        ),
+    attention_paths = [
+        path
+        for path, _ in model.named_modules()
+        if path.rsplit(".", 1)[-1] == "self_attn"
+    ]
+    resolved_plan = resolve_plan(model, plan) if attention_paths else {}
+    attention_is_sharded = any(
+        isinstance(module, nn.Linear)
+        and any(path.startswith(f"{attention}.") for attention in attention_paths)
+        and match(resolved_plan, path) is not None
+        for path, module in model.named_modules()
     )
+    if not attention_paths or attention_is_sharded:
+        require_heads_divisible_by(
+            model,
+            size=cfg.tp,
+            axis="tp",
+            why=(
+                "tensor parallelism shards attention heads across the TP group, so "
+                "each rank must hold a whole number of heads"
+            ),
+        )
 
     # Validate the plan before touching the mesh: a plan that resolves to
     # nothing, or that matches no module, used to leave the model fully
@@ -855,6 +887,27 @@ def apply_tp(
     sharding_plan, targets, moe_blocks, moe_deferred_to_ep = resolve_tp_targets(
         model, cfg, plan
     )
+    # Validate every dense target before replacing any parameters or modules.
+    for module_path, inner, spec in targets:
+        if inner.bias is not None:
+            raise ValueError(
+                f"TP over {module_path} has a bias, which this minimal engine does "
+                "not shard; HF decoder projections are bias-free."
+            )
+        dimension = 0 if spec.kind == "colwise" else 1
+        size = inner.weight.shape[dimension]
+        if size % cfg.tp:
+            raise ValueError(
+                f"TP over {module_path}: weight dim {dimension} (size {size}) "
+                f"is not divisible by tp_size={cfg.tp}"
+            )
+    replicated_attention = [
+        module
+        for path, module in model.named_modules()
+        if path.rsplit(".", 1)[-1] == "self_attn"
+        and not hasattr(module, "_tp_seq_group")
+        and not any(target.startswith(f"{path}.") for target, _, _ in targets)
+    ]
 
     tp_size = mesh["tp"].size()
     if tp_size != cfg.tp:
@@ -872,11 +925,6 @@ def apply_tp(
     # Deepest paths first, so replacing a module never hides an inner target.
     attention_parents: dict[str, nn.Module] = {}
     for module_path, inner, spec in sorted(targets, key=lambda t: -t[0].count(".")):
-        if inner.bias is not None:
-            raise ValueError(
-                f"TP over {module_path} has a bias, which this minimal engine does "
-                "not shard; HF decoder projections are bias-free."
-            )
         parent_path, _, attr = module_path.rpartition(".")
         parent = model.get_submodule(parent_path) if parent_path else model
 
@@ -909,6 +957,14 @@ def apply_tp(
         parent.__class__ = type(
             f"TPGather{type(parent).__name__}",
             (GatherSequenceFirst, type(parent)),
+            {},
+        )
+
+    for attention in replicated_attention:
+        attention._tp_seq_group = group
+        attention.__class__ = type(
+            f"TPReplicated{type(attention).__name__}",
+            (ReplicatedAttentionSequenceBoundary, type(attention)),
             {},
         )
 

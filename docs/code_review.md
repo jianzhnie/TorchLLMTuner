@@ -227,3 +227,307 @@ compileall、git diff HEAD --check 均通过。六项基础集成及 EP×pattern
 恢复 PyTorch 默认预取，不能视为禁用全部预取。窗口反转、边界清空与零窗口
 回归通过；四进程 CPU/Gloo EP×pattern FSDP 重跑通过。最新全量 CPU 测试
 1311 passed、2 skipped。GPU/NPU 内核与完整 CP backward 尚未验证。
+
+
+### 2026-10-13：PP 恢复、验证及 CP 梯度的真实运行补证
+
+本轮复查 trainer/runtime/validation.py、HF attention adapter 和 CP attention
+接口，继续使用 torch 2.14 与 CPU/Gloo；以下脚本均退出 0：
+
+| 脚本 | ranks | 实际验证范围 |
+| --- | --- | --- |
+| `pp_validation_equivalence.py` | 2 | 两步训练各触发一次 eval；末阶段 loss 有限且为正，验证后恢复训练模式 |
+| `pp_checkpoint_equivalence.py full/resume WORKDIR` | 2 | 独立进程保存/恢复 step-2 DCP，恢复 Adam moments 与数据游标，续训两步 loss 逐位一致 |
+| `pp_tp_trainer.py` | 4 | PP=2、TP=2 真实 trainer step；各 rank loss 一致，close 后 caller 进程组仍可归约 |
+| `cp_grad_equivalence.py` | 2 | 无 attention 模型的纯 CP 输入分片、FSDP 参数梯度归约与四步 SGD 更新 |
+
+PP checkpoint 原轨迹为 4.878459930419922、4.867841720581055、
+4.858004093170166、4.86264705657959；恢复后的后两步完全一致，最大差异 0。
+CP 最终参数最大误差 5.960e-08（容差 1e-4），禁用归约的参考副本梯度误差
+分别为 6.229e-02、6.905e-02，确认测试能识别遗漏归约。
+
+命令沿用上述显式 loopback torchrun 格式，端口依次 29731～29735；
+checkpoint 的 full/resume 使用同一临时目录、不同 torchrun 进程。日志在
+`/tmp/llmtuner-review-pp-validation.log`、`pp-checkpoint-full/resume.log`、
+`pp-tp-trainer.log`、`cp-grad.log`（后三项也有相同 llmtuner-review 前缀）。
+更新 PP validation 脚本中“等待多 rank 验证”的过时说明。
+
+直接调用 CPU flex_attention backward 仍明确抛出 NotImplementedError。
+因此本轮 CP 梯度结果只证明无 attention 的分片与归约，不能替代完整模型 CP
+attention backward；该项、GPU/NPU 内核及可选后端仍待验证。本轮没有发现需
+修改生产代码的新增缺陷，也未改变 trainer/trainer.py 或 components/metrics.py
+的文件边界。此前 149/149 源码阅读覆盖保持不变。
+
+
+### 2026-10-13：并行梯度 norm 契约复查
+
+复查 accelerator/collectives.py 及 TP 复制参数梯度归约调用方。真实 CPU/Gloo
+运行 tp_grad_norm_equivalence、ep_grad_norm_equivalence、
+tp_replicated_grad_equivalence（各两 ranks）和 ep_fsdp_without_dense_dp
+（四 ranks）均通过。最后一项仅检查 TP=4、EP=2、dense DP=1 时专家使用
+size=2 sparse FSDP mesh，不能视为完整该组合训练等价。
+
+发现并修复两项 clip_grad_norm_ 问题：
+
+- PyTorch 接受文档中的 norm_type="inf"，本仓库分布式分支直接调用
+  math.isinf 时抛 TypeError；入口统一转为 float，与 PyTorch 一致。
+- error_if_nonfinite 仅检查局部 norm，漏掉归约溢出，并可能导致一个 rank
+  提前抛错、其他 rank 等待 collective。改为完成 TP/EP/PP 及 DTensor
+  norm 归约后检查全局值，异常时不修改梯度。旧实现的局部有限 norm 加
+  归约溢出模拟复现为返回 tensor(inf)，没有按要求抛错。
+
+扩展 TP 两进程集成：字符串 infinity norm、两个有限 2e38 的 SUM 溢出、
+仅 rank 0 有 inf 三项均通过；后两项两个 rank 都抛出非有限值错误，梯度
+未修改，后续 barrier 正常。新增两项单进程 inf/NaN 回归。
+最新全量 CPU 测试 1313 passed、2 skipped。GPU/NPU 内核和完整 CP
+attention backward 仍未验证。
+
+修复后 EP norm 两进程与 PP×TP trainer 四进程重跑通过。
+pre-commit --all-files、compileall 与 diff 检查通过；新增改动尚未提交。
+
+
+### 2026-10-13：优化器状态初始化的 tensor LR 契约
+
+复查 optimizer/state_dict.py、checkpoint base 与 torch_checkpointing backend
+的恢复调用关系。复现 init_optim_state 临时用 torch.tensor(0.0) 替换 tensor
+学习率：float64 CPU LR 被改为 float32，原 device 同样无法保留。改用
+zeros_like(lr)，保留原 dtype/device/shape；原 LR 对象在 finally 中恢复，
+梯度身份、参数值和首次 Adam step 计数保持不变。
+
+新增 Adam/AdamW × 成功/step-pre-hook 异常四项回归，修复前四项均因 dtype
+不一致失败，修复后通过。optimizer state 与 checkpointer 定向测试 40 passed；
+最新全量 CPU 测试 1317 passed、2 skipped。pre-commit --all-files、compileall
+及 diff 检查通过。上游当前路径为 torchtitan/components/optim/utils.py，
+其 init_optim_state 仍使用 CPU 零 tensor；本次为本仓库有意修正，未修改上游。
+
+CUDA capturable/fused 初始化尚未实机验证；当前 CUDA 不可用，且 importlib
+确认 torch_checkpointing 未安装，因此不能将接口复查与模拟测试视为该后端
+真实 round-trip。源码阅读覆盖仍为 149/149，新增改动尚未提交。
+
+
+### 2026-10-13：复制 attention 的 TP 序列边界与组合数值验证
+
+复查 TP 入口、trainer 梯度归约、chunked loss 及 MoE auxiliary loss 的调用契约。
+shared_expert_tp_equivalence 首次运行因 ModuleList.index 不存在失败，改为
+enumerate 保留层索引；随后发现脚本绕过 preprocess_inputs，未切分 TP token
+输入。修正脚本后暴露生产问题：DeepSeek-V3 HF TP plan 只分片 MLP，MLA
+attention 保持复制，局部长度 32 与完整 RoPE positions 长度 64 不匹配。
+
+新增 ReplicatedAttentionSequenceBoundary：没有任何 TP 投影目标的 self_attn
+先 gather 输入序列，执行原复制 attention，再切回本 rank token 输出。输出
+切片不做 SUM；输入 gather backward 归约部分梯度，复制参数梯度仍由 trainer
+求和。保留 module 路径、参数布局、tuple 辅助输出及原类行为。已有投影分片
+attention 继续使用原路径。此修复适配 HF DeepSeek base_model_tp_plan 对复制
+attention 的声明，不把其复制参数擅自改成 head shard。
+
+两 CPU/Gloo ranks 的 DeepSeek/shared-expert TP 集成已扩展真实 backward：
+logits 最大误差 0，全部复制 attention 参数及 shared gate/up/down shard 梯度
+最大误差 2.043e-07。HF DeepseekV3RMSNorm 源码显式转 float32，因此梯度
+容差用 1e-6，前向保留 1e-9；此前仅前向、未执行的注释已更新。
+
+其他真实 CPU/Gloo 结果：
+
+| 组合 | ranks | 结果及范围 |
+| --- | --- | --- |
+| PP=2 × EP=2 | 4 | 四步 trainer loss 与独立单进程参考通过 1e-4 容差 |
+| MoE auxiliary loss × CP | 2 | router 梯度最大误差 1.192e-07，验证 forward SUM/identity backward |
+| chunked loss × FSDP | 2 | 四步 loss 最大误差 4.768e-07，最终参数最大误差 1.490e-08 |
+| chunked loss × TP | 2 | 四步 loss 最大误差 4.768e-07；此脚本不比较最终参数 |
+
+命令使用前述显式 loopback torchrun，端口 29751、29771～29774；TP chunked
+变体设置 CHUNKED_LOSS_EQ_TP=2。日志为 /tmp/llmtuner-review-pp_ep_equivalence.log
+及 shared_expert_tp_equivalence、moe_aux_loss_grad_equivalence、
+chunked_loss_equivalence[-tp] 的 llmtuner-review-*-passed.log。修复前失败日志
+另行保留在 /tmp，不纳入仓库。
+
+全量 CPU 测试 1317 passed、2 skipped；pre-commit --all-files、compileall 与
+Git diff 检查通过。GPU/NPU 及复制 MLA attention × CP 等其他组合尚未验证；
+源码阅读覆盖仍为 149/149。新增变更尚未提交或推送。
+
+
+### 复制 MLA attention × TP × Ulysses CP 的校验补证
+
+CP 原 head 校验无条件要求 global_heads % (tp*cp)==0，即使前一步 TP 已明确
+保留 attention 复制。现在检查实际 attention 边界：所有层均为复制 attention
+时只要求 heads % cp==0，其他布局保留 tp*cp 检查。新增 CPU 回归验证两
+heads、TP=2、CP=2 的复制 attention 能附加 kernel；原 head 分片拒绝测试
+继续通过。配置约束未放宽到未经标记的普通 attention。
+
+新增 replicated_attention_cp_equivalence.py，四 CPU/Gloo ranks 实际运行
+DeepSeek MLA + dense/shared/routed MLP，TP=2、Ulysses CP=2、两 attention
+heads；通过真实 preprocess_inputs 检查每 rank 64/256 tokens，局部 logits
+与完整 SDPA 参考对应切片最大差异 1.356e-08（容差 1e-7）。HF DeepSeek
+RMSNorm 内部 float32 和 SDPA/flex 运算顺序差异使 float64 模型仍有 fp32
+噪声。仅完整模型前向，不能作为 CP backward 验证。
+
+测试装配初次采用全 dense DeepSeek，触发现有“MoE plan 无实际 MoE block”
+拒绝；改为两层含实际 MoE。默认 grouped expert kernel 不支持 float64，测试
+显式选择 eager，与此前 shared expert 测试一致。最终使用显式 loopback
+四 ranks、端口 29785；日志 /tmp/llmtuner-review-replicated-attention-cp-passed.log。
+
+最新全量 CPU 测试 1318 passed、2 skipped；pre-commit all-files 及新增未跟踪
+集成脚本的单独 hooks、compileall、diff 检查通过。GPU/NPU 与完整 CP
+backward 仍待验证；新增改动尚未提交。
+
+
+### TP 复制 attention 的 head 整除条件
+
+继 CP 校验修复后，复查 apply_tp 发现入口仍无条件要求 heads % tp==0，
+错误拒绝只分片 MLP、保留复制 attention 的模型。现在根据解析后的 TP plan
+是否实际匹配 self_attn 的 Linear 投影决定是否需要此条件；无 attention
+结构信息时保留原检查，head 分片路径的检查顺序和拒绝测试保持有效。
+
+shared_expert_tp_equivalence 改用三个 query/KV heads、TP=2，真实两进程
+CPU/Gloo 前向与 backward 通过：logits 最大误差 0，复制 attention/shared
+expert 梯度最大误差 3.262e-07（梯度容差 1e-6，原因仍为 HF RMSNorm FP32）。
+这样该测试也能捕获对复制 attention 错误施加 head 整除条件的回归。
+日志 /tmp/llmtuner-review-replicated-odd-heads.log，端口 29791。
+pre-commit --all-files、compileall 与 diff 检查通过；新增改动尚未提交。
+
+本次修改后全量 CPU 测试：1318 passed、2 skipped。
+
+
+### Dense TP 目标的变换前校验
+
+复查 apply_tp 的失败路径，发现 bias 和 weight 维度整除检查在逐个替换
+模块时执行：后面的目标非法可能留下已经变换的前面模块。现在在 mesh
+通信和 MoE/dense 参数变换之前校验全部 dense 目标，错误包含模块路径。
+新增“第二个 Linear 有 bias”和“第二个 colwise 输出维度不整除”两项回归，
+断言失败后所有 module/Parameter 对象身份不变。此保证覆盖可提前判定的
+上述 dense 配置错误，不宣称自定义 realizer 任意运行时异常都可事务回滚。
+定向 TP 测试 28 passed。新增改动尚未提交。
+
+本次最终验证：1320 passed、2 skipped；pre-commit、compileall、diff 检查通过。
+
+
+### CPU flex dropout 与 packed Ulysses 回归
+
+复查 HF flex_attention_forward 明确拒绝非零 dropout；本仓库 CPU eager CP
+fallback 原先静默忽略该 kwarg。现在同样拒绝非零 attention dropout，提示
+设为零或 eval。新增拒绝回归，普通 dropout=0 路径保留，定向测试 8 passed。
+
+四进程 CPU/Gloo cp_tp_equivalence 实际通过 KV-AllGather/Ulysses 两策略：
+TP/CP 拼接 logits 和 reduced loss 误差均为 0，原 head 分片校验继续有效。
+packed Ulysses 脚本首次在辅助 SDPA gradient 检查失败：mask 被扩展为全局
+四 heads，all-to-all 后只有两个本地 heads。去掉不必要 expand，广播原
+(1,1,S,S) mask，重跑通过。完整模型 packed forward logits 误差 0、loss
+误差 2.274e-13；忽略文档边界的参考差异 0.6232，确认非空验证。SDPA
+替代内核的 collective 梯度误差 0；不声称完整 flex backward 已验证。
+
+端口 29801/29803；日志 /tmp/llmtuner-review-cp-tp-current.log、
+/tmp/llmtuner-review-cp-varlen-fixed.log。源码覆盖仍为149/149，GPU/NPU
+和完整 CP flex backward 仍待验证，新增改动未提交。
+
+本次全量 CPU 测试1321 passed、2 skipped；pre-commit、compileall、diff 检查通过。
+
+
+### Activation checkpoint × FSDP 补充数值验证
+
+继续复查 memory/activation_checkpoint.py 的 full/selective policy、recompute
+context 与 aux metric 抑制契约，核对已有 CPU MoE top-k/梯度回归。实际运行
+两 CPU/Gloo ranks 的 ac_equivalence.py：full/selective 分别在每 rank 不同
+数据上训练四步，与单进程合并批次、未启用 AC 的参考比较首步梯度、各步 loss
+和最终参数。两个模式最终参数最大差异均为0，所有检查通过（容差1e-4）。
+日志 /tmp/llmtuner-review-ac-current.log，显式 loopback 端口29811。
+
+该脚本使用无 attention 的 decoder，证明的是 AC 重计算与 FSDP 复制梯度
+归约组合；不能作为完整 HF attention/EP/设备内核数值验证。修正模块说明中
+“仓库开发环境 torch2.2.2”的过时描述，改为具体能力缺失时的版本兼容语义。
+本轮没有发现需修改生产行为的新增缺陷；前次全量测试1321 passed、2 skipped
+仍为最新全量结果。源码逐文件覆盖149/149，GPU/NPU、完整 CP backward
+及可选后端真实 round-trip 仍未完成；新增改动未提交。
+
+
+### Loss reporting 与词表并行 loss 的真实通信补证
+
+复查 trainer/runtime/reductions.py 的 token/loss mesh 选择和 loss.py 的
+compute_logprobs/vocab-parallel 分支。真实两 CPU/Gloo ranks 运行
+loss_report_rank_consistency：rank1 全部 labels=IGNORE_INDEX、rank0 正常，
+两 rank 完成 train_step，所有 metrics 一致，loss/max_loss=4.862001895904541，
+grad_norm=1.2443631887435913。此结果验证本地零有效 token 不会跳过 collective。
+
+vocab_parallel_loss_equivalence 两 ranks 通过：V=8、7、5 的均匀/非均匀
+词表分片、IGNORE_INDEX、reduction=none、带 group 的 full-vocab fallback
+及 value/gradient 对比。未把此分支测试作为 trainer 自动分片 lm_head 的证明。
+显式 loopback 端口29821/29822，日志 /tmp/llmtuner-review-
+loss_report_rank_consistency-current.log 和 vocab_parallel_loss_equivalence-current.log。
+
+本轮没有发现新增生产缺陷。最新全量 CPU 结果仍为1321 passed、2 skipped，
+未因只增加审查记录重复执行全量测试。GPU/NPU、完整 CP flex backward 与
+可选后端 round-trip 仍待验证；源码覆盖149/149，新增记录未提交。
+
+
+### 集成 runner 的 world size 解析
+
+复查 tests/integration_tests/run_all.py，发现仅匹配紧跟 torchrun 的
+--nproc_per_node=N；带 --standalone 的 pp_tp_trainer 和
+ ep_fsdp_without_dense_dp 被默认按两 ranks 启动，和实际要求四 ranks 冲突。
+修正解析以允许中间选项，并兼容下划线/连字符及等号/空格参数形式。新增三项
+回归3 passed，直接核对四个四-rank 脚本的解析均返回4。
+
+此改动修正验证工具，不改变训练代码。runner 仍不能自动编排 PP checkpoint
+的 full/resume 两阶段或所有脚本变体；不能以一次 run_all 证明全组合覆盖，
+之前 checkpoint 已按两阶段单独实跑。新增记录与工具改动未提交。
+
+
+### 集成 runner 自动编排 PP checkpoint 两阶段
+
+修正 run_all 无参数启动 pp_checkpoint_equivalence 必定失败的问题：使用
+共享 TemporaryDirectory 分别启动 full/resume torchrun；仅 full 成功后
+运行 resume，两阶段任一失败返回失败，退出清理临时目录。成功/失败两项
+runner 回归验证共用目录、full 失败不启动 resume 和清理行为；runner 定向
+测试5 passed。
+
+真实执行 GLOO_SOCKET_IFNAME=lo0 MASTER_ADDR=127.0.0.1 python
+ tests/integration_tests/run_all.py pp_checkpoint_equivalence：两阶段完成，
+checkpoint 数值比较通过，runner 报告1 passed、0 failed，耗时22.1s。
+日志 /tmp/llmtuner-review-runner-checkpoint.log。其他可选脚本变体仍需单独
+选择，未将 runner 默认调用视为所有并行矩阵覆盖。新增改动未提交。
+
+本轮全量1324 passed、2 skipped；随后新增两项runner流程回归单独通过。
+pre-commit all-files及新增文件hooks、compileall和diff检查通过。
+
+
+### PP 多 stage 调度变体补证
+
+复查 pipeline schedule 构建与模型 stage ownership，实际两 CPU/Gloo ranks
+运行 pp_equivalence.py Interleaved1F1B 和 ZBVZeroBubble，各四步、四个
+microbatches；均对独立单进程训练参考检查 loss 和全局 grad norm，并验证
+stage 参数覆盖、ownership、首步梯度非空及累计 tokens。Interleaved1F1B
+loss 最大差异0，ZBVZeroBubble loss最大差异4.768e-07，grad norm均通过
+1e-5容差。未检查所有最终参数逐项数值，不能把该结果写成参数等价证明。
+
+显式loopback端口29831/29832；日志 /tmp/llmtuner-review-pp-Interleaved1F1B.log
+和 /tmp/llmtuner-review-pp-ZBVZeroBubble.log。此次没有发现新增生产缺陷。
+最新全量仍为1324 passed、2 skipped，随后两项runner流程回归另已通过。
+硬件与可选后端验证限制保持，新增记录未提交。
+
+
+### PP packed corpus 集成的未完成项
+
+实际两 CPU/Gloo ranks 运行 pp_real_corpus_equivalence.py，初始化被现有
+UnsupportedCombinationError 拒绝：flat packed stream 的4 microbatches
+会切断文档上下文。保留该生产保护，没有把测试失败记作通过。复查脚本发现
+参考循环也假定行batch切分、使用每microbatch分母、报告未归一化loss，与
+trainer 的完整step分母不一致。修正脚本顶部错误支持声明，保留明确待修状态。
+
+要验证原范围需要 loader 先独立打包每个microbatch，并对齐positions/masks
+和完整step分母；当前脚本不能作为真实packed PP训练的数值证明。日志
+/tmp/llmtuner-review-pp-real-corpus.log，端口29841，退出1。此为新增具体未完成
+验证项，源码149/149阅读与既有CPU测试通过不能证明它完成。未修改生产代码。
+
+
+### Packed 数据调用链与 TextSequence 维度契约
+
+复查 loader_builder、GrainDataLoader、TextCollator 和 pipeline runtime。
+当前 packing context 使用完整 per-rank batch token预算，collator输出一维
+stream，Grain按collator.num_rows_per_batch()==1合并，PP再切分。要实现
+独立packed microbatches，必须将packing预算改为每microbatch并在loader
+组织独立样本，不能仅去掉PP拒绝或在切片处重置positions；该支持尚未实现。
+
+发现TextSequence只比较len，二维字段可能长度相等而通过，后续collator
+向一维buffer拼接失败；零维字段则直接len TypeError。新增四个字段的ndim=1
+校验，明确拒绝非token向量。八项回归覆盖input_ids/labels/positions/
+padding_mask的零维和二维输入。全量CPU1334 passed、2 skipped；
+pre-commit、compileall、diff检查通过。新增改动未提交，packed PP多
+microbatch及既有硬件/可选后端验证项仍未完成。

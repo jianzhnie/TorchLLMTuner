@@ -78,15 +78,27 @@ def require_ulysses_compatible(model: nn.Module, cfg: ParallelConfig, cp_mesh) -
     # rank's local head count -- equivalently, the global count must divide
     # tp * cp (upstream torchtitan's head_shard_degree in its
     # config/validation.py).
+    from ..tensor_parallel.tensor_parallel import ReplicatedAttentionSequenceBoundary
+
+    attentions = [
+        getattr(layer, name)
+        for layer in getattr(model, "layers", [])
+        for name in _ATTN_MODULE_NAMES
+        if hasattr(layer, name)
+    ]
+    # A TP plan may leave attention replicated (e.g. MLA). Its heads have
+    # not been cut by TP; only Ulysses divides them. For mixed layouts keep
+    # the stricter check required by any head-sharded layer.
+    replicated = bool(attentions) and all(
+        isinstance(attention, ReplicatedAttentionSequenceBoundary)
+        for attention in attentions
+    )
+    head_degree = cp_mesh.size() * (1 if replicated else cfg.tp)
     require_heads_divisible_by(
         model,
-        size=cfg.tp * cp_mesh.size(),
-        axis="tp*cp",
-        why=(
-            f"ulysses splits each TP rank's local heads across the CP group "
-            f"(tp={cfg.tp}, cp={cp_mesh.size()}), so the global count must "
-            "divide tp*cp"
-        ),
+        size=head_degree,
+        axis="cp" if replicated else "tp*cp",
+        why="ulysses must divide the heads actually held by each attention module",
     )
 
 

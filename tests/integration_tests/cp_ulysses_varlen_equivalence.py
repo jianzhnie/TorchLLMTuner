@@ -233,9 +233,7 @@ def _check_gradients_under_varlen_mask(
     mask = _packed_additive_mask(positions, document=True)
 
     def sdpa(q, k, v):
-        return F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask.expand(b, h, s, s)
-        )
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
     # Reference: full sequence, per-rank token shard of the loss weight.
     lo, hi = rank * s // cp, (rank + 1) * s // cp

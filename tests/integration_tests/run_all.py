@@ -26,13 +26,14 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 
-_TORCHRUN_RE = re.compile(r"torchrun\s+(--nproc_per_node=\d+)[\s\\]+(\S+)")
+_TORCHRUN_RE = re.compile(r"torchrun\b[^\n]*?--nproc[_-]per[_-]node(?:=|\s+)(\d+)")
 
 
 def _torchrun_args(script: Path) -> list[str]:
@@ -45,7 +46,7 @@ def _torchrun_args(script: Path) -> list[str]:
     docstring = ast.get_docstring(ast.parse(script.read_text())) or ""
     match = _TORCHRUN_RE.search(docstring)
     if match:
-        return [match.group(1)]
+        return [f"--nproc_per_node={match.group(1)}"]
     return ["--nproc_per_node=2"]
 
 
@@ -98,7 +99,18 @@ def main() -> int:
         ]
         print(f"=== {' '.join(cmd)}", flush=True)
         start = time.monotonic()
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env)
+        if script.stem == "pp_checkpoint_equivalence":
+            # Separate processes must share the same checkpoint and trajectory.
+            with tempfile.TemporaryDirectory(
+                prefix="llmtuner-pp-checkpoint-"
+            ) as folder:
+                proc = subprocess.run([*cmd, "full", folder], cwd=REPO_ROOT, env=env)
+                if proc.returncode == 0:
+                    proc = subprocess.run(
+                        [*cmd, "resume", folder], cwd=REPO_ROOT, env=env
+                    )
+        else:
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env)
         elapsed = time.monotonic() - start
         results.append((script.name, proc.returncode == 0, elapsed))
 
