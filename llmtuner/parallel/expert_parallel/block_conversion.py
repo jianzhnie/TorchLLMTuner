@@ -24,11 +24,6 @@ from ...models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
-from ...models.common.moe.token_dispatch import (
-    AllToAllTokenDispatcher,
-    LocalTokenDispatcher,
-    TorchAOTokenDispatcher,
-)
 from .. import compatibility
 from .checkpointing import mark_experts_ep_sharded
 from .hf_inspection import (
@@ -39,6 +34,11 @@ from .hf_inspection import (
     resolve_score_func,
     resolve_top_k,
     router_of,
+)
+from .token_dispatch import (
+    AllToAllTokenDispatcher,
+    LocalTokenDispatcher,
+    TorchAOTokenDispatcher,
 )
 
 

@@ -3,7 +3,8 @@
 Vendored from torchtitan ``models/common/moe.py`` -- the ``MoE`` block and the
 walk that finds the blocks of a model. The rest of that upstream file lives
 next to this one: the routers in ``routing.py``, the expert weights in
-``experts.py``, the EP dispatchers in ``token_dispatch.py``, the balance loss in
+``experts.py``, the EP dispatchers in
+``parallel/expert_parallel/token_dispatch.py``, the balance loss in
 ``auxiliary_loss.py``, the bias-update hooks in ``bias_update.py``.
 
 What changed from upstream:

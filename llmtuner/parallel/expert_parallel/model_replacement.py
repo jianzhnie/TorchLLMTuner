@@ -75,10 +75,10 @@ from llmtuner.errors import (
     UnsupportedCombinationError,
 )
 
-from ...models.common.moe.token_dispatch import EP_DISPATCHER_BACKENDS
 from ...utils.logging import get_logger
 from .block_conversion import convert_block
 from .hf_inspection import is_hf_moe_block, moe_block_of, router_of
+from .token_dispatch import EP_DISPATCHER_BACKENDS
 
 logger = get_logger(__name__)
 

@@ -3,7 +3,8 @@
 One node of the ``moe`` package: ``TokenChoiceTopKRouter`` is the base router,
 ``QuantileBalancedTopKRouter`` the quantile-balanced variant, and
 ``QuantileBalancer`` its per-step bias estimator. Nothing here knows about EP
-dispatch or the bias-update hooks -- those live in ``token_dispatch.py`` and
+dispatch or the bias-update hooks -- those live in
+``parallel/expert_parallel/token_dispatch.py`` and
 ``bias_update.py`` respectively.
 
 Shape legend, scoped to this file: ``T`` = tokens, ``D`` = model dimension,

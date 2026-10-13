@@ -3,7 +3,8 @@
 ``expert_parallel.py`` is the public entry. ``hf_inspection.py`` inspects HF
 layouts, ``block_conversion.py`` constructs native MoE blocks,
 ``model_replacement.py`` replaces them in a complete model, and
-``checkpointing.py`` converts expert checkpoint state.
+``checkpointing.py`` converts expert checkpoint state. ``token_dispatch.py``
+implements local and distributed token dispatch and combine operations.
 """
 
 from .expert_parallel import *  # noqa: F401,F403
