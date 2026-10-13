@@ -10,6 +10,7 @@ a loud error.
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -91,3 +92,33 @@ def test_load_with_a_mismatched_expert_count_raises(monkeypatch) -> None:
         raise AssertionError("expected ValueError")
     except ValueError as exc:
         assert "different expert layout" in str(exc)
+
+
+@pytest.mark.parametrize("optimizer_state", [False, True])
+def test_activation_checkpoint_wrappers_preserve_expert_state_matching(
+    monkeypatch, optimizer_state
+):
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+    )
+
+    model = _model_with_experts()
+    group = _fake_group(monkeypatch, world=2, rank=0)
+    checkpointing.mark_experts_ep_sharded(model.mlp, group)
+    model.mlp = checkpoint_wrapper(model.mlp)
+    shard_map = checkpointing.expert_shard_map([model])
+    assert set(shard_map) == {"mlp.w1_EFD", "mlp.w2_EDF"}
+    assert set(checkpointing.named_params([model])) == set(shard_map)
+    source = model.state_dict()
+    if optimizer_state:
+        source = {
+            f"state.{key}.exp_avg": value.clone() for key, value in source.items()
+        }
+    saved = checkpointing.gather_expert_state(source, shard_map, [model])
+    for key, value in source.items():
+        assert saved[key].shape[0] == 4
+        torch.testing.assert_close(saved[key], torch.cat([value, value + 100]))
+    _fake_group(monkeypatch, world=2, rank=1)
+    restored = checkpointing.load_expert_state(saved, shard_map, [model])
+    for key, value in source.items():
+        torch.testing.assert_close(restored[key], value + 100)

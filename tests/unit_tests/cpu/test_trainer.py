@@ -47,7 +47,7 @@ from llmtuner.components.loss import (
     next_token_targets,
     vocab_shard_bounds,
 )
-from llmtuner.components.optimizer import OptimizersContainer
+from llmtuner.components.optimizer import EMA, OptimizersContainer
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.config import (
     CheckpointConfig,
@@ -569,7 +569,13 @@ def _lr_scheduler(optimizer, *, warmup_steps: int = 0, training_steps: int = 8):
 
 
 def _manager(
-    folder: str, model: nn.Module, optimizer, state: _TrainState, **overrides
+    folder: str,
+    model: nn.Module,
+    optimizer,
+    state: _TrainState,
+    *,
+    ema=None,
+    **overrides,
 ) -> DistributedCheckpointManager:
     # keep_latest_k=0 keeps the default runs unbounded, so a test that asserts on
     # what is on disk is describing the save path rather than the purge thread.
@@ -582,6 +588,7 @@ def _manager(
         lr_scheduler=_lr_scheduler(optimizer),
         states={TRAIN_STATE: state},
         folder=folder,
+        ema=ema,
     )
 
 
@@ -603,6 +610,74 @@ def _optimizer_state(optimizer: OptimizersContainer) -> dict:
         for key, value in optimizer.state_dict().items()
         if key.startswith("state.") and key.endswith(("exp_avg", "exp_avg_sq"))
     }
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.complex64])
+@pytest.mark.parametrize("exclude_ema", [False, True])
+def test_checkpoint_restores_buffer_ema_or_reseeds_from_loaded_model(
+    tmp_path, dtype, exclude_ema
+) -> None:
+    model, optimizer = _model_and_optimizer()
+    model.register_buffer("running_value", torch.tensor([1.0], dtype=dtype))
+    ema = EMA(model_parts=[model], decay=0.5, buffer_patterns=["^running_value$"])
+    with torch.no_grad():
+        model.running_value.add_(2.0 + (2.0j if dtype.is_complex else 0.0))
+    _step(model, optimizer)
+    ema.step(1)
+    saved_buffer = model.running_value.clone()
+    saved_ema = {key: value.clone() for key, value in ema.state_dict().items()}
+    assert not torch.equal(saved_ema["state.running_value.ema_params"], saved_buffer)
+
+    manager = _manager(
+        str(tmp_path), model, optimizer, _TrainState(), ema=ema, interval=1
+    )
+    try:
+        assert manager.save(1)
+    finally:
+        manager.close()
+
+    fresh_model, fresh_optimizer = _model_and_optimizer()
+    fresh_model.register_buffer("running_value", torch.zeros(1, dtype=dtype))
+    fresh_ema = EMA(
+        model_parts=[fresh_model], decay=0.5, buffer_patterns=["^running_value$"]
+    )
+    resumed = _manager(
+        str(tmp_path),
+        fresh_model,
+        fresh_optimizer,
+        _TrainState(),
+        ema=fresh_ema,
+        exclude_from_loading=["ema"] if exclude_ema else [],
+    )
+    try:
+        assert resumed.load(-1)
+    finally:
+        resumed.close()
+
+    assert torch.equal(fresh_model.running_value, saved_buffer)
+    if exclude_ema:
+        expected_ema = {
+            f"state.{name}.ema_params": value.detach().clone()
+            for name, value in [
+                *fresh_model.named_parameters(),
+                ("running_value", fresh_model.running_value),
+            ]
+        }
+    else:
+        expected_ema = saved_ema
+    assert fresh_ema.state_dict().keys() == expected_ema.keys()
+    for key, expected in expected_ema.items():
+        assert torch.equal(fresh_ema.state_dict()[key], expected)
+
+    with torch.no_grad():
+        fresh_model.running_value.add_(4.0)
+    fresh_ema.step(2)
+    expected_buffer = torch.lerp(
+        expected_ema["state.running_value.ema_params"], fresh_model.running_value, 0.5
+    )
+    assert torch.equal(
+        fresh_ema.state_dict()["state.running_value.ema_params"], expected_buffer
+    )
 
 
 def test_checkpoint_round_trips_model_optimizer_and_counters(tmp_path) -> None:

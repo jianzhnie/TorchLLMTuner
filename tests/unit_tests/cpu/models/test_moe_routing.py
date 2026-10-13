@@ -402,3 +402,47 @@ def test_router_rejects_invalid_expert_capacity(kwargs, match):
 
     with pytest.raises(ValueError, match=match):
         TokenChoiceTopKRouter(**({"num_experts": 8, "dim": 4} | kwargs))
+
+
+def test_quantile_bias_update_matches_with_full_checkpoint_recomputation():
+    import copy
+
+    from llmtuner.memory.activation_checkpoint import wrap_full
+
+    torch.manual_seed(31)
+    original = MoE(
+        4,
+        RoutedExperts(
+            GroupedExperts(4, 8, 4, use_grouped_mm=False),
+            LocalTokenDispatcher(4, 2),
+        ),
+        QuantileBalancedTopKRouter(4, 4, 2, num_bins=32),
+        load_balance_coeff=None,
+    )
+    for parameter in original.parameters():
+        torch.nn.init.normal_(parameter, std=0.1)
+    replayed = copy.deepcopy(original)
+    wrapped = wrap_full(replayed)
+    padding = torch.tensor([False, True, False, False, True, False, False])
+    original.set_padding_mask(padding)
+    replayed.set_padding_mask(padding)
+    inputs = torch.randn(7, 4)
+    baseline = inputs.clone().requires_grad_()
+    checkpointed = inputs.clone().requires_grad_()
+    expected = original(baseline)
+    actual = wrapped(checkpointed)
+    torch.testing.assert_close(actual, expected)
+    expected.square().sum().backward()
+    actual.square().sum().backward()
+    torch.testing.assert_close(checkpointed.grad, baseline.grad)
+    for left, right in zip(original.parameters(), replayed.parameters(), strict=True):
+        torch.testing.assert_close(left.grad, right.grad)
+    before = original.router.quantile_balancer.required_bias_histogram_EB
+    after = replayed.router.quantile_balancer.required_bias_histogram_EB
+    assert int(before.sum()) == int((~padding).sum()) * 4
+    assert int(after.sum()) > int(before.sum()), "Backward must replay routing"
+    update_quantile_expert_bias([original], None)
+    update_quantile_expert_bias([replayed], None)
+    torch.testing.assert_close(replayed.expert_bias_E, original.expert_bias_E)
+    assert not replayed.router.quantile_balancer.required_bias_histogram_EB.any()
+    assert not replayed.tokens_per_expert_E.any()

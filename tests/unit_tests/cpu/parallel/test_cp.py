@@ -137,6 +137,65 @@ def test_kcp_degree_requires_kcp_strategy() -> None:
         ParallelConfig(context_parallel_kcp_size=2)
 
 
+def test_kcp_reports_missing_model_before_optional_runtime(monkeypatch):
+    from llmtuner.parallel.context_parallel.kcp import apply_kcp
+
+    def runtime():
+        pytest.fail("Model capability must be checked before kernel imports")
+
+    monkeypatch.setattr("llmtuner.parallel.context_parallel.kcp._kcp_runtime", runtime)
+    model = torch.nn.Linear(4, 4)
+    original_forward = model.forward
+    with pytest.raises(ValueError, match="no Kimi Delta Attention module"):
+        apply_kcp(model, cp_mesh=None)
+    assert model.forward == original_forward
+
+
+def test_kcp_rejects_unit_convolution_before_loading_optional_runtime(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.context_parallel.kcp import kcp_kda_forward
+
+    def runtime():
+        pytest.fail("Invalid KCP convolution must fail before loading kernels")
+
+    monkeypatch.setattr("llmtuner.parallel.context_parallel.kcp._kcp_runtime", runtime)
+    module = SimpleNamespace(q_conv1d=torch.nn.Conv1d(4, 4, kernel_size=1))
+    forward = kcp_kda_forward(lambda *args, **kwargs: None, group=None)
+    with pytest.raises(ValueError, match="kernel size must be greater than 1"):
+        forward(module, torch.zeros(1, 8, 4))
+
+
+@pytest.mark.parametrize(
+    "head_dim,lower_bound,message",
+    [
+        (257, None, "head dimension must be at most 256"),
+        (64, -6, "lower bound must be in"),
+        (64, 0, "lower bound must be in"),
+        (64, float("nan"), "lower bound must be in"),
+    ],
+)
+def test_kcp_rejects_invalid_kernel_options_before_import(
+    monkeypatch, head_dim, lower_bound, message
+):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.context_parallel.kcp import kcp_kda_forward
+
+    def runtime():
+        pytest.fail("Invalid KCP options must fail before loading kernels")
+
+    monkeypatch.setattr("llmtuner.parallel.context_parallel.kcp._kcp_runtime", runtime)
+    module = SimpleNamespace(
+        q_conv1d=torch.nn.Conv1d(4, 4, kernel_size=3),
+        head_k_dim=head_dim,
+        gate_lower_bound=lower_bound,
+    )
+    forward = kcp_kda_forward(lambda *args, **kwargs: None, group=None)
+    with pytest.raises(ValueError, match=message):
+        forward(module, torch.zeros(1, 8, 4))
+
+
 # -- ulysses head divisibility -------------------------------------------------
 #
 # The check lives behind mesh validation, so it needs a CP axis of size 2 --
