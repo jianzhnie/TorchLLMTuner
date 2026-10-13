@@ -53,8 +53,8 @@ def maybe_check_max_pos(positions: torch.Tensor, *, max_valid_pos: int) -> None:
     if is_compiling():
         return
     torch._assert_async(
-        torch.all(positions <= max_valid_pos),
-        f"position_ids exceed {max_valid_pos=}",
+        torch.all((positions >= 0) & (positions <= max_valid_pos)),
+        f"position_ids must be in [0, {max_valid_pos}]",
     )
 
 

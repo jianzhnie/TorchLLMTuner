@@ -35,7 +35,12 @@ from ...accelerator.device import (
     get_distributed_backend,
     get_env_dist_info,
 )
-from ...accelerator.distributed import init_dist_pytorch, is_distributed
+from ...accelerator.distributed import (
+    get_rank,
+    get_world_size,
+    init_dist_pytorch,
+    is_distributed,
+)
 from ...components.checkpointer import (
     DATALOADER,
     TRAIN_STATE,
@@ -270,6 +275,11 @@ def assemble_trainer_runtime(self, cfg) -> None:
     if not is_distributed() and "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         init_dist_pytorch(get_distributed_backend())
     self.rank, self.world_size, self.local_rank = get_env_dist_info()
+    if is_distributed():
+        # Programmatic callers may initialize the group without torchrun's
+        # environment. Mesh degrees must describe the live group.
+        self.rank = get_rank()
+        self.world_size = get_world_size()
 
     # Resolve the degrees first: the PP seed offset below needs this rank's
     # stage coordinate, and degree resolution draws no random numbers, so

@@ -11,11 +11,14 @@ trainer; this module owns only the pass itself.
 
 from __future__ import annotations
 
+import sys
+
 import torch
 
 from llmtuner.accelerator.capabilities import require
 from llmtuner.config import ValidationConfig
 from llmtuner.parallel import compatibility
+from llmtuner.utils.logging import get_logger
 
 from ...accelerator.collectives import all_reduce
 from ...accelerator.spmd import spmd_context
@@ -239,7 +242,15 @@ def run_validation_loop(self, validation: ValidationConfig, step: int) -> None:
     finally:
         # Releases the Grain prefetch thread; a no-op for loaders without
         # one. The loader is temporary, so nothing else holds it open.
-        validation_dataloader.close()
+        failed = sys.exc_info()[0] is not None
+        try:
+            validation_dataloader.close()
+        except BaseException:
+            if not failed:
+                raise
+            get_logger(__name__).exception(
+                "Validation dataloader cleanup failed after validation failed"
+            )
 
     finalize_validation(
         self,
@@ -326,7 +337,15 @@ def run_pipeline_validation_loop(self, validation: ValidationConfig, step: int) 
             total_global_valid_tokens.add_(global_valid_tokens)
             num_steps += 1
     finally:
-        validation_dataloader.close()
+        failed = sys.exc_info()[0] is not None
+        try:
+            validation_dataloader.close()
+        except BaseException:
+            if not failed:
+                raise
+            get_logger(__name__).exception(
+                "Validation dataloader cleanup failed after validation failed"
+            )
 
     finalize_validation(
         self,

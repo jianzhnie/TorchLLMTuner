@@ -309,3 +309,12 @@ def test_state_round_trips_into_a_fresh_container() -> None:
     assert restored.keys() == saved.keys()
     for key, value in saved.items():
         assert torch.equal(restored[key], value)
+
+
+def test_container_owns_model_part_collection():
+    model = _model()
+    parts = [model]
+    container = OptimizersContainer(_cfg(_catch_all()), model_parts=parts)
+    parts.clear()
+    assert container.model_parts == [model]
+    assert container.state_dict()

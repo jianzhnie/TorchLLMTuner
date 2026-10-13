@@ -421,6 +421,8 @@ class QuantileBalancer(nn.Module):
             raise ValueError(
                 f"top_k ({top_k}) must be between zero and num_experts ({num_experts})"
             )
+        if num_bins < 1:
+            raise ValueError(f"num_bins must be positive, got {num_bins}")
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_bins = num_bins

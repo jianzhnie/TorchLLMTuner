@@ -159,6 +159,9 @@ def get_fixed_block_mask_mod(fixed_block_size: int) -> _mask_mod_signature:
         fixed_block_size: number of tokens per block.
     """
 
+    if fixed_block_size < 1:
+        raise ValueError("fixed_block_size must be >= 1")
+
     # Credit to @drisspg.
     def blocked_mask_mod(
         b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor

@@ -248,3 +248,13 @@ def test_yarn_truncate_controls_fractional_cutoffs() -> None:
     truncated = yarn_inv_freq(DIM, 10000.0, 4.0, 32.0, 1.0, 64, True)
     fractional = yarn_inv_freq(DIM, 10000.0, 4.0, 32.0, 1.0, 64, False)
     assert not torch.equal(truncated, fractional)
+
+
+@pytest.mark.parametrize("cls", [ComplexRoPE, CosSinRoPE])
+def test_negative_position_does_not_select_cache_tail(cls):
+    rope = cls(RoPEConfig(dim=DIM, max_context_length=MAX_LEN))
+    q, _ = _qk()
+    positions = torch.zeros(TOKENS, dtype=torch.long)
+    positions[0] = -1
+    with pytest.raises(RuntimeError, match="position_ids"):
+        rope(q, positions=positions)

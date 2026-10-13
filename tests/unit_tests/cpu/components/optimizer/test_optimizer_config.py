@@ -151,3 +151,17 @@ def test_betas_actually_changes_the_trajectory() -> None:
 
     assert default[0] == torchtitan[0], "step 1 is bias-corrected and must match"
     assert default[-1] != torchtitan[-1], "betas had no effect by the last step"
+
+
+@pytest.mark.parametrize("field", ["learning_rate", "weight_decay", "eps"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_optimizer_rejects_nonfinite_hyperparameters(field, value):
+    with pytest.raises(ValueError, match=field):
+        OptimizerConfig(**{field: value})
+
+
+def test_scheduler_rejects_unknown_decay_type_at_configuration_time():
+    from llmtuner.config.optimizer_config import LRSchedulerConfig
+
+    with pytest.raises(ValueError, match="decay_type"):
+        LRSchedulerConfig(decay_type="unknown")

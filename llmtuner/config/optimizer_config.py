@@ -62,6 +62,11 @@ class LRSchedulerConfig:
     )
 
     def __post_init__(self) -> None:
+        if self.decay_type not in ("linear", "sqrt", "cosine"):
+            raise ConfigError(
+                "lr_scheduler.decay_type must be linear/sqrt/cosine, "
+                f"got {self.decay_type!r}"
+            )
         if self.warmup_steps < 0:
             raise ConfigError(
                 f"lr_scheduler.warmup_steps must be >= 0, got {self.warmup_steps}"
@@ -180,16 +185,18 @@ class OptimizerConfig:
             raise ConfigError(f"optimizer.betas must each be in [0, 1), got {betas}")
         self.betas = betas
 
-        if self.learning_rate < 0:
+        if not math.isfinite(self.learning_rate) or self.learning_rate < 0:
             raise ConfigError(
-                f"optimizer.learning_rate must be >= 0, got {self.learning_rate}"
+                "optimizer.learning_rate must be finite and >= 0, "
+                f"got {self.learning_rate}"
             )
-        if self.weight_decay < 0:
+        if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
             raise ConfigError(
-                f"optimizer.weight_decay must be >= 0, got {self.weight_decay}"
+                "optimizer.weight_decay must be finite and >= 0, "
+                f"got {self.weight_decay}"
             )
-        if self.eps <= 0:
-            raise ConfigError(f"optimizer.eps must be > 0, got {self.eps}")
+        if not math.isfinite(self.eps) or self.eps <= 0:
+            raise ConfigError(f"optimizer.eps must be finite and > 0, got {self.eps}")
 
         # The degenerate grouping: no explicit param_groups means one catch-all
         # group over every trainable parameter, built from the flat scalars.

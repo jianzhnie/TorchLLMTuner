@@ -287,3 +287,11 @@ def test_the_dense_block_causal_mask_agrees_with_the_modifiers() -> None:
     same_document = _eval(get_document_mask_mod(POSITIONS))
 
     assert (mask[0, 0] == 0).equal(causal & same_document)
+
+
+@pytest.mark.parametrize("size", [0, -1])
+def test_fixed_block_mask_rejects_nonpositive_size(size):
+    from llmtuner.models.common.attention.masks import get_fixed_block_mask_mod
+
+    with pytest.raises(ValueError, match="fixed_block_size"):
+        get_fixed_block_mask_mod(size)

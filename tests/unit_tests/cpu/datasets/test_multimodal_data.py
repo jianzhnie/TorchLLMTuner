@@ -351,6 +351,18 @@ def test_process_multimodal_sample_aligns_every_token_field(mm_tokenizer, image_
     assert result["input_ids"].shape == result["labels"].shape
 
 
+def test_process_multimodal_sample_preserves_source_texts(mm_tokenizer, image_bytes):
+    texts = ["image caption", "hello"]
+    result = process_multimodal_sample(
+        texts=texts,
+        images=[image_bytes, None],
+        tokenizer=mm_tokenizer,
+        **MM_KWARGS,
+    )
+    assert result is not None
+    assert texts == ["image caption", "hello"]
+
+
 def test_process_multimodal_sample_drops_the_sample_when_one_image_fails(
     mm_tokenizer, image_bytes
 ):
@@ -509,6 +521,18 @@ def test_collator_pads_the_token_batch_with_pad_and_ignore(mm_tokenizer, token_i
 def test_collator_pads_positions_within_the_context_window(mm_tokenizer, token_ids):
     batch = _collator(mm_tokenizer)([_mm_sample(10, token_ids)])
     assert int(batch["positions"][10:].max()) < 32
+
+
+def test_collator_masks_existing_padding_without_mutating_sample(
+    mm_tokenizer, token_ids
+):
+    sample = _mm_sample(10, token_ids)
+    original_labels = sample["labels"].clone()
+    sample["padding_mask"] = torch.arange(10) >= 7
+    batch = _collator(mm_tokenizer)([sample])
+    assert batch["num_valid_tokens"] == 7
+    assert (batch["labels"][7:] == IGNORE_INDEX).all()
+    torch.testing.assert_close(sample["labels"], original_labels)
 
 
 def test_collator_concatenates_whole_samples_before_padding(mm_tokenizer, token_ids):

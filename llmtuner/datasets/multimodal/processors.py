@@ -142,6 +142,7 @@ def process_multimodal_sample(
     if not texts or len(texts) != len(images):
         return None
 
+    texts = list(texts)
     processed_images = []
     num_image_tokens = []
 

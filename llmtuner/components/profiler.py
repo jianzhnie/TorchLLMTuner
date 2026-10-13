@@ -208,15 +208,25 @@ class Profiler:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        if self.torch_profiler is not None:
-            self.torch_profiler.__exit__(exc_type, exc_val, exc_tb)
-            self.torch_profiler = None
-        if self.memory_profiler is not None:
-            if caused_by_oom(exc_val):
-                # The one snapshot that matters most, and the only chance to
-                # take it: the allocator still holds the state that failed.
-                self.memory_profiler.step(exit_ctx=True)
-            self.memory_profiler = None
+        first_error: BaseException | None = None
+        trace, self.torch_profiler = self.torch_profiler, None
+        memory, self.memory_profiler = self.memory_profiler, None
+        if trace is not None:
+            try:
+                trace.__exit__(exc_type, exc_val, exc_tb)
+            except BaseException as error:
+                first_error = error
+                logger.exception("Failed to stop trace profiler")
+        if memory is not None and caused_by_oom(exc_val):
+            try:
+                # Attempt the OOM snapshot even when trace export failed.
+                memory.step(exit_ctx=True)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                logger.exception("Failed to write OOM memory snapshot")
+        if exc_val is None and first_error is not None:
+            raise first_error
         return False
 
     def step(self) -> None:

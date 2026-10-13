@@ -245,7 +245,9 @@ def microbatch(self, batch: Batch | TrainerBatch) -> dict[str, Any]:
     if isinstance(batch, dict):
         # ``num_valid_tokens`` is the model's to ignore, and a plain int
         # among tensors would be splatted into the forward as a kwarg.
-        batch.pop("num_valid_tokens", None)
+        batch = {
+            key: value for key, value in batch.items() if key != "num_valid_tokens"
+        }
     return {
         "batch": batch,
         "num_valid_tokens": num_valid_tokens,

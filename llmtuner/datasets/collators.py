@@ -103,6 +103,11 @@ class TextCollator(Collator):
             torch.arange(pad_len, out=positions[num_tokens:])
             positions[num_tokens:].remainder_(self._max_context_length)
 
+        # Enforce the batch contract even for custom recipes that supply a
+        # padding mask without already masking labels. The output owns its
+        # storage, so this does not mutate the source TextSequence.
+        labels.masked_fill_(padding_mask, IGNORE_INDEX)
+
         return {
             "input": input_ids,
             "labels": labels,

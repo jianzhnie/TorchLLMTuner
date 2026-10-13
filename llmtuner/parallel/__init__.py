@@ -10,7 +10,7 @@ trainer code run from step 0 (single device) through step 4 (full hybrid
 parallelism) without an ``if degree > 1`` at any call site -- and it is why
 ``parallelize_hf_transformers`` can apply all of them unconditionally.
 
-Pipeline parallelism lives in ``pipeline_parallel/``: ``pipeline.py`` computes
+Pipeline parallelism lives in ``pipeline_parallel/``: ``partition.py`` computes
 the stage split and ``pipeline_parallel.py`` builds this rank's schedule.
 ``parallelize_hf_transformers`` dispatches to it when ``pp > 1`` and returns a
 ``PipelineParallelSetup`` instead of a model.
@@ -20,10 +20,10 @@ from __future__ import annotations
 
 from ..utils.lazy_exports import export_names, resolve_export
 
-# Lazy (PEP 562): ``matrix`` is read by ``llmtuner/config``, which must stay
+# Lazy (PEP 562): ``compatibility`` is read by ``llmtuner/config``, which must stay
 # importable without the engine layer (context_parallel pulls in the model
 # stack and its spmd surface). Eager re-exports would make any submodule
-# import -- matrix included -- pay for the whole engine.
+# import -- compatibility included -- pay for the whole engine.
 _EXPORT_SOURCES = {
     "apply_cp": "context_parallel",
     "apply_ep": "expert_parallel",

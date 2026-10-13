@@ -311,8 +311,18 @@ class LoggerContainer(BaseLogger):
             logger_instance.log(metrics, step)
 
     def close(self) -> None:
-        for logger_instance in self._loggers:
-            logger_instance.close()
+        loggers, self._loggers = self._loggers, []
+        first_error: BaseException | None = None
+        for logger_instance in loggers:
+            try:
+                logger_instance.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                else:
+                    logger.exception("Additional metrics logger cleanup failure")
+        if first_error is not None:
+            raise first_error
 
 
 def is_v_schedule(pp_schedule: str) -> bool:
@@ -404,21 +414,28 @@ class MetricsProcessor:
             config_dict=config_dict,
             tag=tag,
         )
-        self.device_memory_monitor = build_device_memory_monitor()
-        self.color = (
-            Color()
-            if colors_enabled(disable_color_printing=config.disable_color_printing)
-            else NoColor()
-        )
-        self._pp_schedule = pp_schedule
-        self.gpu_peak_flops = get_peak_flops(self.device_memory_monitor.device_name)
-        self.num_flops_per_token = num_flops_per_token
+        try:
+            self.device_memory_monitor = build_device_memory_monitor()
+            self.color = (
+                Color()
+                if colors_enabled(disable_color_printing=config.disable_color_printing)
+                else NoColor()
+            )
+            self._pp_schedule = pp_schedule
+            self.gpu_peak_flops = get_peak_flops(self.device_memory_monitor.device_name)
+            self.num_flops_per_token = num_flops_per_token
 
-        self.ntokens_since_last_log = 0
-        self.data_loading_times: list[float] = []
-        self.time_last_log = time.perf_counter()
-        self.step_last_log: int | None = None
-        self.device_memory_monitor.reset_peak_stats()
+            self.ntokens_since_last_log = 0
+            self.data_loading_times: list[float] = []
+            self.time_last_log = time.perf_counter()
+            self.step_last_log: int | None = None
+            self.device_memory_monitor.reset_peak_stats()
+        except BaseException:
+            try:
+                self.logger.close()
+            except BaseException:
+                logger.exception("Metrics logger cleanup failed during initialization")
+            raise
 
     @property
     def _non_data_parallel_size(self) -> int:
@@ -489,22 +506,30 @@ class MetricsProcessor:
 
         logger_container = LoggerContainer()
 
-        if config.enable_wandb:
-            try:
-                logger_container.add_logger(
-                    WandBLogger(base_log_dir, config_dict=config_dict, tag=tag)
-                )
-            except ImportError as error:
-                # Only the missing-package case: that is a dependency the user
-                # can install. A credential or project error is a
-                # misconfiguration they should see, not something to swallow.
-                raise ImportError(
-                    "metrics.enable_wandb is set but wandb is not installed. "
-                    "Install it with 'pip install wandb', or unset it."
-                ) from error
+        try:
+            if config.enable_wandb:
+                try:
+                    logger_container.add_logger(
+                        WandBLogger(base_log_dir, config_dict=config_dict, tag=tag)
+                    )
+                except ImportError as error:
+                    # Only the missing-package case: that is a dependency the user
+                    # can install. A credential or project error is a
+                    # misconfiguration they should see, not something to swallow.
+                    raise ImportError(
+                        "metrics.enable_wandb is set but wandb is not installed. "
+                        "Install it with 'pip install wandb', or unset it."
+                    ) from error
 
-        if config.enable_tensorboard:
-            logger_container.add_logger(TensorBoardLogger(base_log_dir, tag))
+            if config.enable_tensorboard:
+                logger_container.add_logger(TensorBoardLogger(base_log_dir, tag))
+
+        except BaseException:
+            try:
+                logger_container.close()
+            except BaseException:
+                logger.exception("Metrics logger cleanup failed during initialization")
+            raise
 
         return logger_container
 

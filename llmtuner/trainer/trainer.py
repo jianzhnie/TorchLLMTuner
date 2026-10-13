@@ -105,7 +105,16 @@ class Trainer:
     def __init__(self, cfg: LLMTunerConfig):
         """Assemble the trainer. The whole body lives in ``runtime/assembly.py`` --
         the assembly order there is a contract (see its docstring)."""
-        assembly.assemble_trainer_runtime(self, cfg)
+        try:
+            assembly.assemble_trainer_runtime(self, cfg)
+        except BaseException:
+            # Failed construction never returns an object to the caller, so
+            # release resources already acquired by partial assembly here.
+            try:
+                self.close()
+            except Exception:
+                logger.exception("Resource cleanup failed during trainer construction")
+            raise
 
     # -- setup helpers ---------------------------------------------------------
 

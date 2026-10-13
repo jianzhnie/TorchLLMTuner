@@ -24,6 +24,7 @@ from grain import experimental as grain_experimental
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ..components.tokenizer import BaseTokenizer
+from ..utils.logging import get_logger
 from .collators import Collator, TextCollator, TrainerBatch
 from .composition import as_iter_dataset
 from .contracts import DatasetBuildContext, require_positive
@@ -200,8 +201,13 @@ class GrainDataLoader(BaseDataLoader):
             )
         try:
             self._iterator.set_state(state_dict[self._rank_id])
-        except Exception:
-            self.close()
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                get_logger(__name__).exception(
+                    "Dataloader cleanup failed after state restoration failed"
+                )
             raise
 
     def close(self) -> None:

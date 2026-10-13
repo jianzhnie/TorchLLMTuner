@@ -1487,3 +1487,126 @@ def test_cli_destroys_process_group_when_close_fails(monkeypatch, training_fails
     ):
         cli.main()
     assert calls == ["destroy"]
+
+
+@pytest.mark.parametrize(
+    "training_fails, close_fails", [(True, False), (False, True), (False, False)]
+)
+def test_cli_preserves_primary_error_when_group_cleanup_fails(
+    monkeypatch, training_fails, close_fails
+):
+    from llmtuner.trainer import cli
+
+    class FakeTrainer:
+        def __init__(self, cfg):
+            pass
+
+        def train(self):
+            if training_fails:
+                raise ValueError("training failed")
+
+        def close(self):
+            if close_fails:
+                raise KeyError("close failed")
+
+    def destroy():
+        raise RuntimeError("destroy failed")
+
+    monkeypatch.setattr(
+        cli,
+        "parse_config",
+        lambda: SimpleNamespace(
+            checkpoint=SimpleNamespace(create_seed_checkpoint=False)
+        ),
+    )
+    monkeypatch.setattr(cli, "Trainer", FakeTrainer)
+    monkeypatch.setattr(cli.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(cli.dist, "destroy_process_group", destroy)
+    error, message = (
+        (ValueError, "training failed")
+        if training_fails
+        else (
+            (KeyError, "close failed")
+            if close_fails
+            else (RuntimeError, "destroy failed")
+        )
+    )
+    with pytest.raises(error, match=message):
+        cli.main()
+
+
+@pytest.mark.parametrize("world_size, enabled", [("2", True), ("1", False)])
+def test_cli_rejects_seed_configuration_before_trainer_construction(
+    monkeypatch, world_size, enabled
+):
+    from llmtuner.trainer import cli
+
+    monkeypatch.setenv("WORLD_SIZE", world_size)
+    monkeypatch.setattr(
+        cli,
+        "parse_config",
+        lambda: SimpleNamespace(
+            checkpoint=SimpleNamespace(create_seed_checkpoint=True, enable=enabled)
+        ),
+    )
+
+    def build(cfg):
+        pytest.fail("invalid seed configuration must not construct Trainer")
+
+    monkeypatch.setattr(cli, "Trainer", build)
+    with pytest.raises(cli.ConfigError):
+        cli.main()
+
+
+def test_failed_trainer_construction_releases_partial_resources(monkeypatch):
+    from llmtuner.trainer import trainer as module
+
+    calls = []
+
+    def assemble(self, cfg):
+        self.metrics = SimpleNamespace(close=lambda: calls.append("metrics"))
+
+        def close():
+            calls.append("checkpointer")
+            raise RuntimeError("cleanup failed")
+
+        self.checkpointer = SimpleNamespace(close=close)
+        raise ValueError("assembly failed")
+
+    monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+    with pytest.raises(ValueError, match="assembly failed"):
+        module.Trainer(SimpleNamespace())
+    assert calls == ["checkpointer", "metrics"]
+
+
+def test_microbatch_preserves_loader_owned_dictionary():
+    from llmtuner.trainer.runtime import batch as runtime
+
+    labels = torch.tensor([[1, 2]])
+    original = {"input": labels, "labels": labels, "num_valid_tokens": 2}
+    trainer = SimpleNamespace(
+        ntokens_seen=0, count_valid_tokens=runtime.count_valid_tokens
+    )
+    result = runtime.microbatch(trainer, original)
+    assert original["num_valid_tokens"] == 2
+    assert "num_valid_tokens" not in result["batch"]
+    assert result["batch"]["labels"] is labels
+
+
+def test_assembly_uses_live_process_group_rank_and_size(monkeypatch):
+    from llmtuner.trainer.runtime import assembly
+
+    trainer = SimpleNamespace()
+    monkeypatch.setattr(assembly, "is_distributed", lambda: True)
+    monkeypatch.setattr(assembly, "get_env_dist_info", lambda: (0, 1, 0))
+    monkeypatch.setattr(assembly, "get_rank", lambda: 3)
+    monkeypatch.setattr(assembly, "get_world_size", lambda: 4)
+
+    def topology(cfg, world_size):
+        assert world_size == 4
+        assert trainer.rank == 3
+        raise RuntimeError("stop after rank resolution")
+
+    monkeypatch.setattr(assembly, "build_parallel_topology", topology)
+    with pytest.raises(RuntimeError, match="stop after rank resolution"):
+        assembly.assemble_trainer_runtime(trainer, SimpleNamespace())

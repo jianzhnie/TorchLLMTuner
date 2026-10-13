@@ -152,7 +152,7 @@ class OptimizersContainer(Optimizer, Stateful):
         impl_kwargs = self._build_impl_kwargs(config)
         all_params: list[nn.Parameter] = []
         self.optimizers = []
-        self.model_parts = model_parts
+        self.model_parts = list(model_parts)
 
         for part_idx, model in enumerate(self.model_parts):
             groups_by_opt_name, patterns_by_opt_name = self._build_param_groups(

@@ -172,3 +172,21 @@ def test_tp_group_and_global_vocab_size_are_required_together() -> None:
         cross_entropy_loss(logits, labels, global_vocab_size=logits.shape[-1])
     with pytest.raises(ValueError, match="together"):
         compute_logprobs(logits, labels, tp_group=object())
+
+
+def test_entropy_handles_masked_classes_and_large_common_offset():
+    logits = torch.tensor([[0.0, 0.0, float("-inf")], [10000.0, 10000.0, 10000.0]])
+    labels = torch.tensor([0, 1])
+    logprobs, entropy = compute_logprobs(logits, labels, return_entropy=True)
+    expected = torch.log(torch.tensor([2.0, 3.0]))
+    torch.testing.assert_close(entropy, expected)
+    torch.testing.assert_close(logprobs, -expected)
+
+
+def test_entropy_keeps_invalid_all_masked_distribution_visible():
+    _, entropy = compute_logprobs(
+        torch.full((1, 3), float("-inf")),
+        torch.tensor([IGNORE_INDEX]),
+        return_entropy=True,
+    )
+    assert torch.isnan(entropy).all()

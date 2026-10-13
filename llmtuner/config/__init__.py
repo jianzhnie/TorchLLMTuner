@@ -36,7 +36,7 @@ Kept deliberately small for the learning path: one optimizer (adamw), one LR
 schedule, deterministic seeding. Add knobs only when a learning step needs them.
 
 The classes live one domain per file under this package
-(``model.py`` / ``parallel.py`` / ...); everything is re-exported here so
+(``model_config.py`` / ``parallel_config.py`` / ...); everything is re-exported here so
 ``from llmtuner.config import X`` resolves for every public name.
 """
 

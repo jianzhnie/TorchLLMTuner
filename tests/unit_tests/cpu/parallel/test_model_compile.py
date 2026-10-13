@@ -44,7 +44,7 @@ try:
 
     from llmtuner.models.hf.factory import build_model_config
     from llmtuner.models.hf.model import HFTransformerModel
-    from llmtuner.parallel import compile as compile_mod
+    from llmtuner.parallel import model_compile as compile_mod
     from llmtuner.parallel.model_compile import apply_compile, maybe_regional_inductor
 
     _IMPORT_ERROR = None

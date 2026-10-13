@@ -636,3 +636,9 @@ def test_vocab_size_is_the_inner_configs_number(model: HFTransformerModel) -> No
         )
         is None
     )
+
+
+def test_pipeline_chunk_without_embedding_or_head_is_not_weight_tied(model):
+    model.tok_embeddings = torch.nn.Identity()
+    model.lm_head = torch.nn.Identity()
+    assert not model.enable_weight_tying

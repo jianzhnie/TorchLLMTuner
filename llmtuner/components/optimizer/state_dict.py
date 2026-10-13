@@ -143,7 +143,7 @@ def optim_state_dict_to_fqn_keys(optim_sd: dict[str, Any]) -> dict[str, Any]:
                 "param_names is available for FQN-keyed state dicts."
             )
         fqns = param_group["param_names"]
-        for param_id, fqn in zip(param_group["params"], fqns, strict=False):
+        for param_id, fqn in zip(param_group["params"], fqns, strict=True):
             id_to_fqn[param_id] = fqn
         new_group = {k: v for k, v in param_group.items() if k != "param_names"}
         new_group["params"] = list(fqns)
@@ -176,7 +176,7 @@ def unflatten_optim_state_dict(
         fqns = param_group["param_names"]
         params = param_group["params"]
         ids: list[int] = []
-        for fqn, param in zip(fqns, params, strict=False):
+        for fqn, param in zip(fqns, params, strict=True):
             ids.append(param_id)
             if param in optim.state:
                 param_state: dict[str, Any] = {}
