@@ -515,7 +515,8 @@ def test_pickling_a_none_snapshot_is_still_a_valid_file(tmp_path) -> None:
         assert pickle.load(handle) is None
 
 
-def test_profiler_start_failure_stops_started_trace(monkeypatch):
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt])
+def test_profiler_start_failure_stops_started_trace(monkeypatch, error_type):
     from types import SimpleNamespace
 
     calls = []
@@ -524,13 +525,13 @@ def test_profiler_start_failure_stops_started_trace(monkeypatch):
     monkeypatch.setattr(profiler, "build_torch_profiler", lambda: trace)
 
     def fail():
-        raise ValueError("snapshot setup failed")
+        raise error_type("snapshot setup failed")
 
     monkeypatch.setattr(profiler, "build_memory_profiler", fail)
-    with pytest.raises(ValueError, match="snapshot setup failed"):
+    with pytest.raises(error_type, match="snapshot setup failed"):
         profiler.__enter__()
     assert len(calls) == 1
-    assert calls[0][0] is ValueError
+    assert calls[0][0] is error_type
     assert profiler.torch_profiler is None
 
 

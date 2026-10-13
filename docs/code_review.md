@@ -975,3 +975,104 @@ microbatch及既有硬件/可选后端验证项仍未完成。
 - 补充float64输入/权重的实际投影回归，核对输出FP32、前向数学结果、
   以FP32计算后恢复至float64的输入和权重梯度。未修改生产契约。
 - 模型构件/router专项70 passed，修改文件pre-commit通过。
+
+## Quantile routing full AC 统计与更新（2026-10-13）
+
+- 新增实际wrap_full重计算回归，使用quantile MoE、混合padding输入，
+  比较开启/关闭AC的输出、输入及所有参数梯度。
+- 确認初始histogram只含有效token，并要求backward后观测数增长，
+  证明真实重放路由；均匀重复观测不改变本场景quantile bias更新。
+- 两侧实际执行update_quantile_expert_bias后bias一致，重计算侧
+  histogram/token counter清空；专项回归通过，pre-commit通过。
+  不涵盖selective/region AC或不同微批重计算倍数的组合。
+
+## Quantile selective AC 与梯度累积（2026-10-13）
+
+- 原full AC回归参数化为full/selective，进一步覆盖1/3个不同微批。
+  实际wrap_selective采用仓库生产save policy，不替换算子或重计算机制。
+- 四场景比较输出、各微批输入梯度、累积参数梯度、有效token直方图
+  计数和最终quantile bias；要求真实重放统计且更新后scratch清空。
+- quantile routing专项28 passed；本轮未发现production缺陷，测试
+  pre-commit通过。不涵盖region AC、跨rank或各微批不同AC策略。
+
+## Quantile 全空观测窗口不漂移（2026-10-13）
+
+- 实际零histogram连续100次estimate造成现有非零bias漂移2.38e-7：
+  原实现虽然回填当前bin位置，但重新插值和mean-center仍产生roundoff。
+- 全专家观测数为零时直接返回现有bias副本，无新观测不改变平衡状态。
+- 回归要求100次空更新后torch.equal严格保持；quantile专项29 passed，
+  修改文件pre-commit通过。部分专家空观测的原估计路径保持现有语义。
+
+## Quantile 大计数插值精度（2026-10-13）
+
+- 构造int64直方图复现float32 target/counts-before舍入问题：分位目标
+  8388609.5落入单观测bin时丢失半个观测，bias为±0.25而非±0.125。
+- 计数相关插值使用float64，最终结果恢复expert_bias dtype；新增独立
+  数学参考回归要求精确±0.125。该场景含不同expert总计数，检查公开
+  estimate接口的有效输入，不宣称常规observe会生成不同总计数。
+- quantile专项30 passed；修改文件pre-commit通过。Ascend设备上的
+  float64算子支持和成本尚未验证。
+
+## Quantile 大计数采用整数分位秩（2026-10-13）
+
+- 上轮float64插值方案替换为int64计数分位秩与残差：ceil(count*K/E)
+  用整数除法，先计算count*K-before*E，再转float32形成bin内比例。
+- 保留大计数半token目标的精度，避免训练设备float64支持要求；已有
+  ±0.125精确参考、空窗口不漂移、full/selective AC累积回归均通过。
+- quantile专项30 passed，pre-commit通过；Ascend实际运行仍待硬件验证。
+
+## Quantile histogram 累积溢出（2026-10-13）
+
+- 真实observe复现int32 bin达到2147483647后再观察一个token回绕
+  为-2147483648；之后int64 sum无法修复，跨rank归约亦存在同类风险。
+- non-persistent histogram改int64，使本地scatter_add与hook归约保持
+  64位计数；内存由每bin4字节增至8字节，checkpoint格式不受影响。
+- 边界回归实际调用observe，验证两个expert均为2147483648且总数
+  4294967296；quantile专项31 passed，修改文件pre-commit通过。
+  Ascend int64 scatter/collective实际内核仍待验证。
+
+## Quantile DP×CP 实际归约（2026-10-13）
+
+- 新增quantile_bias_equivalence.py，四CPU/Gloo ranks采用2×2独立
+  DP/CP mesh，实际调用生产update_quantile_expert_bias完成两轴归约。
+- rank各自填充不同bin，归约后每expert总观测数超过int32上限；
+  以all_gather后int64求和构造独立完整histogram，核对最终bias精确
+  一致，并验证各rank histogram与token counter清空。
+- 实际runner通过（4.5秒），脚本pre-commit通过；不涵盖Ascend或
+  真实router生成海量token的负载测试。
+
+## Quantile TP 条件归约验证（2026-10-13）
+
+- 四rank脚本扩展DP×TP、EP关闭/开启场景；EP关闭只参考同TP坐标
+  的DP rank，EP开启参考全部DP×TP rank。输入刻意按rank设置不同bin。
+- 除最终bias外，拦截估计器输入并精确比较完整histogram，防止均匀
+  重复计数因quantile缩放不变而漏检；各场景scratch均清空。
+- DP×CP与两种DP×TP共三场景实际通过（4.5秒），pre-commit通过。
+  本项检查hook的mesh条件，未装配真实TP/EP模型或验证NPU通信。
+
+## Profiler 初始化中断清理（2026-10-13）
+
+- Profiler.__enter__在memory构建阶段只捕获Exception；KeyboardInterrupt
+  不调用外层__exit__，使已启动trace留存。初始化失败清理改捕获
+  BaseException，trace清理异常同样不覆盖原始初始化错误。
+- 实际回归参数化ValueError/KeyboardInterrupt，验证trace恰好退出
+  一次、收到原错误类型、handle清空且原始错误保留。
+- profiler专项通过，修改文件pre-commit通过。
+
+## Trainer/CLI 清理中断处理（2026-10-13）
+
+- Trainer.close某资源close抛KeyboardInterrupt时原路径跳过后续资源。
+  改记录BaseException，尝试释放全部资源后重新抛首个错误，维持幂等。
+- train和CLI的清理异常处理同样覆盖BaseException，已有主异常时
+  不用清理中断覆盖它；成功训练后发生清理中断仍向调用方抛出。
+- 回归增加KeyboardInterrupt资源失败、主训练异常加清理中断，验证
+  metrics/dataloader/GC均被释放、二次close无重复、主错误保留。
+
+## Trainer 初始化失败主异常保留（2026-10-13）
+
+- 构造器外层捕获BaseException，但partial-resource close只捕获
+  Exception；清理KeyboardInterrupt仍会替换原assembly错误。
+- 构造器清理异常处理统一BaseException；测试覆盖assembly与cleanup
+  各自普通异常/KeyboardInterrupt四组合，原始assembly错误保留，
+  checkpointer失败后metrics仍被释放。
+- construction/cleanup/close专项通过，修改文件pre-commit通过。
