@@ -41,6 +41,7 @@ from transformers.configuration_utils import PretrainedConfig
 from llmtuner.errors import UnsupportedCombinationError
 
 from ...accelerator import distributed
+from ...components.loss import next_token_targets
 from ...datasets.contracts import Batch
 from ...parallel.context_parallel import (
     shard_attention_mask_for_cp,
@@ -65,7 +66,6 @@ from .attention_backend import (
     uses_deepseek_sparse_attention,
 )
 from .factory import resolve_model_class, unwrap_text_config
-from .input_processing import collapse_batch_dims, document_shift
 from .model_setup import (
     apply_cast_lm_head,
     first_present,
@@ -463,8 +463,8 @@ class HFTransformerModel(nn.Module):
 
         if isinstance(input_dict, Batch):
             # Rows are independent documents of length T.
-            labels = document_shift(
-                input_dict.labels, seq_len=input_dict.labels.shape[-1]
+            labels = next_token_targets(
+                input_dict.labels.reshape(-1), seq_len=input_dict.labels.shape[-1]
             )
             inputs = input_dict.input_ids
         else:
@@ -476,7 +476,7 @@ class HFTransformerModel(nn.Module):
             # load-balancing statistics (see forward's ``padding_mask``).
             padding_mask = input_dict.get("padding_mask")
 
-        inputs, labels = collapse_batch_dims(inputs, labels)
+        inputs, labels = inputs.reshape(-1), labels.reshape(-1)
         if positions is not None:
             positions = positions.reshape(-1)
         if padding_mask is not None:

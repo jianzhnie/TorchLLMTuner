@@ -1,18 +1,10 @@
-"""Optimizer state-dict helpers for distributed checkpointing.
+"""Initialize optimizer state and serialize it by parameter name.
 
-Vendored from torchtitan ``components/optimizer/utils.py``, unchanged in logic.
-These utilities operate directly on ``torch.optim.Optimizer`` state dicts; they
-are model-agnostic and optimizer-agnostic.
-
-``get_flat_optim_state_dict`` / ``load_flat_optim_state_dict`` convert between an
-optimizer's native (integer-indexed) state dict and a flat, FQN-keyed dict that
-DCP can save and reshard. ``init_optim_state`` materializes optimizer state and
-is a precondition for both.
-
-``init_optim_state`` moved here from ``components/checkpointer/base.py``, which
-is where it lived while llmtuner had no optimizer package: the function is
-optimizer machinery, not checkpoint machinery, and its home is the same one
-upstream puts it in. The checkpointer imports it from here.
+Adapted from torchtitan ``components/optimizer/utils.py``. Native optimizer
+state uses integer parameter indices; these helpers convert it to a flat,
+fully qualified name (FQN) layout for distributed checkpointing.
+``init_optim_state`` materializes lazy state while preserving gradients,
+learning rates, existing state, and the first real Adam step.
 """
 
 from typing import Any

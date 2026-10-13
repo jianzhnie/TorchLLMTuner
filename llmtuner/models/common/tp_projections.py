@@ -1,7 +1,7 @@
 """Model components that fold the TP collectives into their GEMMs.
 
 Vendored from torchtitan ``models/common/async_linear.py`` (renamed from
-``dist_gemm.py`` upstream in 9e159aed7; this file follows the new name).
+``dist_gemm.py`` upstream in 9e159aed7).
 These are drop-in
 replacements for the stock QKV, output and SwiGLU projections: they move the TP
 collective inside the GEMM, over the autograd Functions in
@@ -14,7 +14,7 @@ What changed from upstream:
   llmtuner. Upstream's empty ``Config`` subclasses existed only to make the fused
   class name a config choice; without a config system there is nothing to
   choose between.
-* ``DistGEMMFeedForward`` subclasses :class:`~llmtuner.models.common.feed_forward.
+* ``TensorParallelFeedForward`` subclasses :class:`~llmtuner.models.common.feed_forward.
   FeedForward`, as it does upstream: the fused and unfused paths share the weight
   layout (``w13`` holding the interleaved gate and up) and the activation split,
   so only the two GEMMs differ. It overrides ``forward`` and falls back to the
@@ -51,9 +51,9 @@ logger = get_logger(__name__)
 
 __all__ = [
     "AllGatherFusedQKVLinear",
-    "DistGEMMFeedForward",
+    "TensorParallelFeedForward",
     "RowParallelLinear",
-    "validate_dist_gemm_preconditions",
+    "validate_tp_projection_preconditions",
 ]
 
 # Shape suffix legend, scoped to this file:
@@ -75,19 +75,18 @@ def warn_once_no_tp_overlap() -> None:
     if not _WARNED_NO_TP:
         _WARNED_NO_TP = True
         logger.warning(
-            "tp_gemm_backend='dist_gemm' selected but tensor parallelism is not "
-            "active; running the standard feed-forward path without collective "
+            "Tensor-parallel projection selected but tensor parallelism is not "
+            "active; running the standard projection without collective "
             "overlap."
         )
 
 
-def validate_dist_gemm_preconditions(*, enable_sp: bool) -> None:
+def validate_tp_projection_preconditions(*, enable_sp: bool) -> None:
     """Reject configurations the fused modules cannot serve.
 
-    Called from the sharding setup, the first point that sees both the selected
-    modules and the parallelism settings. The condition is not detectable from
-    inside a module at runtime: under spmd_types an activation is a plain local
-    tensor with no placements to inspect.
+    Call before wiring these projections into a sequence-parallel model.
+    Activations are local tensors, so placements cannot reveal whether the
+    caller enabled sequence parallelism.
 
     Raises:
         ValueError: if sequence parallelism is off. The fused GEMMs *replace* the
@@ -97,8 +96,8 @@ def validate_dist_gemm_preconditions(*, enable_sp: bool) -> None:
     """
     if not enable_sp:
         raise ValueError(
-            "tp_gemm_backend='dist_gemm' requires "
-            "parallelism.enable_sequence_parallel; the fused GEMMs replace the SP "
+            "Tensor-parallel projections require "
+            "parallel.enable_sequence_parallel; the fused GEMMs replace the SP "
             "all-gather and reduce-scatter, so there is nothing for them to fuse "
             "with SP disabled."
         )
@@ -184,7 +183,7 @@ class RowParallelLinear(nn.Module):
         )
 
 
-class DistGEMMFeedForward(FeedForward):
+class TensorParallelFeedForward(FeedForward):
     """SwiGLU feed-forward with both TP collectives folded into its GEMMs.
 
     The fused ``w13`` projection consumes an all-gather of the sequence shard;
