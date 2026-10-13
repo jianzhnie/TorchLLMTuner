@@ -115,7 +115,8 @@ class GrainDataLoader(BaseDataLoader):
 
         ``read_options`` defaults to a fresh ``grain.ReadOptions`` rather than
         being shared as a mutable default. ``max_num_documents`` is the maximum
-        non-padding document segments in one local token batch; it is carried
+        non-padding document segments in one packed row (one microbatch under
+        pipeline parallelism); it is carried
         into the build context for the packing nodes to read, and the collators
         ignore it.
         """
@@ -155,6 +156,12 @@ class GrainDataLoader(BaseDataLoader):
         )
 
         collator = collator(context=context)
+        self._batch_layout = {
+            "num_tokens_per_batch": num_tokens_per_batch,
+            "max_context_length": max_context_length,
+            "num_rows_per_batch": collator.num_rows_per_batch(),
+            "max_num_documents": max_num_documents,
+        }
 
         # TODO(data-multiprocessing): CPU-heavy processing should use multiple
         # processes rather than only threads. Grain can divide map-style data among
@@ -184,6 +191,7 @@ class GrainDataLoader(BaseDataLoader):
         return {
             "version": 1,
             "dp_world_size": self._dp_world_size,
+            "batch_layout": self._batch_layout.copy(),
             self._rank_id: self._iterator.get_state(),
         }
 
@@ -198,6 +206,13 @@ class GrainDataLoader(BaseDataLoader):
         if self._rank_id not in state_dict:
             raise ValueError(
                 f"checkpoint is missing dataloader state for {self._rank_id}"
+            )
+        saved_layout = state_dict.get("batch_layout")
+        if saved_layout is not None and saved_layout != self._batch_layout:
+            raise ValueError(
+                "cannot resume after changing dataloader batch layout: "
+                f"checkpoint has {saved_layout}, "
+                f"current loader has {self._batch_layout}"
             )
         try:
             self._iterator.set_state(state_dict[self._rank_id])

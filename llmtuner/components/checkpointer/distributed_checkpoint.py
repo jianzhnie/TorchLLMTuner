@@ -49,6 +49,7 @@ from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
 )
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict_saver import (
     AsyncCheckpointerType,
@@ -70,6 +71,27 @@ from .checkpoint_keys import DATALOADER, EMA, LR_SCHEDULER, MODEL, SAFETENSORS_I
 from .storage import FilesystemCheckpointStorage
 
 logger = get_logger(__name__)
+
+
+class DataloaderLayoutLoadPlanner(DefaultLoadPlanner):
+    """Allow pre-layout loader checkpoints while keeping all other keys strict."""
+
+    def create_local_plan(self):
+        assert self.metadata is not None
+        saved_keys = self.metadata.state_dict_metadata
+        prefix = f"{DATALOADER}.batch_layout."
+        if (
+            f"{DATALOADER}.version" in saved_keys or f"{DATALOADER}.steps" in saved_keys
+        ) and not any(key.startswith(prefix) for key in saved_keys):
+            layout_keys = [key for key in self.state_dict if key.startswith(prefix)]
+            if layout_keys:
+                logger.warning(
+                    "Legacy dataloader checkpoint has no batch layout metadata; "
+                    "its saved layout cannot be validated."
+                )
+                for key in layout_keys:
+                    del self.state_dict[key]
+        return super().create_local_plan()
 
 
 class DistributedCheckpointAsyncMode(str, enum.Enum):
@@ -377,7 +399,18 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
             states[MODEL].load_state_dict(state_dict)
         else:
-            dcp.load(state_dict, checkpoint_id=checkpoint_id)
+            # DCP's Stateful callback order is not an optimizer-before-scheduler
+            # contract. Restore the scheduler only after optimizer groups load.
+            scheduler = states.get(LR_SCHEDULER)
+            if scheduler is not None:
+                state_dict[LR_SCHEDULER] = scheduler.state_dict()
+            dcp.load(
+                state_dict,
+                checkpoint_id=checkpoint_id,
+                planner=DataloaderLayoutLoadPlanner(),
+            )
+            if scheduler is not None:
+                scheduler.load_state_dict(state_dict[LR_SCHEDULER])
 
             # The model states were flattened into the top-level dict by
             # ``_flattened_model_states_sd``, so DCP writes into those flat

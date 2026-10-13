@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
@@ -264,18 +265,21 @@ class LLMTunerConfig:
         return self.parallel.derive_dp(world_size)
 
     def auto_fill_model(self) -> None:
-        """Fill model arch fields from a HF hub config when given a hub id.
+        """Fill architecture fields from a local HF directory or Hub config.
 
         Called explicitly (not in __post_init__) so offline runs never hit the network.
         """
         mp = self.model.model_name_or_path
-        if mp.count("/") != 1:
+        if not os.path.exists(mp) and mp.count("/") != 1:
             return  # offline architecture name; explicit sizes are authoritative
         try:
             hf_config = AutoConfig.from_pretrained(mp)
         except Exception as e:  # noqa: BLE001 - warn, keep explicit values
             logger.warning("Could not load AutoConfig for '%s': %s", mp, e)
             return
+        # The model factory trains the decoder described by text_config for
+        # composite HF configurations; the aggregate run sizes must match it.
+        hf_config = getattr(hf_config, "text_config", hf_config)
         m = self.model
         m.vocab_size = getattr(hf_config, "vocab_size", m.vocab_size)
         m.hidden_size = getattr(hf_config, "hidden_size", m.hidden_size)

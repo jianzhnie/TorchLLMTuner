@@ -158,10 +158,15 @@ class PipelineTextCollator(Collator):
                 )
                 padding["num_valid_tokens"] = 0
                 batches.append(padding)
-        return {
-            **{
-                key: torch.stack([batch[key] for batch in batches])
-                for key in ("input", "labels", "positions", "padding_mask")
-            },
-            "num_valid_tokens": sum(batch["num_valid_tokens"] for batch in batches),
-        }
+        result: TrainerBatch = {}
+        for key in ("input", "labels", "positions", "padding_mask"):
+            template = batches[0][key]
+            output = torch.empty(
+                (self._num_microbatches, *template.shape),
+                dtype=template.dtype,
+                pin_memory=HAS_PIN_MEMORY,
+            )
+            torch.stack([batch[key] for batch in batches], out=output)
+            result[key] = output
+        result["num_valid_tokens"] = sum(batch["num_valid_tokens"] for batch in batches)
+        return result

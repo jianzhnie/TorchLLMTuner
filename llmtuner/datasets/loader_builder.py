@@ -130,7 +130,10 @@ def build_dataloader(
     reads, and ``num_tokens_per_batch`` is the per-rank token count, matching
     torchtitan's ``num_tokens_per_microbatch_per_dp_rank``. The Grain loader
     divides every dataset's rows among ``dp_world_size`` ranks and hands each
-    one exactly that many tokens, so the DP slice the trainer used to perform
+    one exactly that many tokens. Under pipeline parallelism, text packing uses
+    the per-microbatch budget, then groups independently packed rows into one
+    schedule step. Thus no document context is cut by runtime microbatching.
+    The DP slice the trainer used to perform
     no longer exists on this path. (The synthetic ``random`` corpus is the
     exception: it is generated per rank from ``global_batch_size`` and does
     not read ``num_tokens_per_batch``.)
