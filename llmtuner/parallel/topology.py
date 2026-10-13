@@ -518,7 +518,6 @@ def build_parallel_topology(
             for field, value in (
                 ("tensor_parallel_size", par.tensor_parallel_size),
                 ("pipeline_parallel_size", par.pipeline_parallel_size),
-                ("context_parallel_size", par.context_parallel_size),
                 (
                     "context_parallel_kv_allgather_size",
                     par.context_parallel_kv_allgather_size,

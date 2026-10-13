@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 # HF names the attention submodule differently across model families; probe in
-# the style of hf/model.py's ``first_present`` rather than hardcoding one
+# the style of hf/model_setup.py's ``first_present`` rather than hardcoding one
 # family's spelling.
 _ATTN_MODULE_NAMES = ("self_attn", "attn", "attention")
 
@@ -129,13 +129,13 @@ def apply_cp(
     # re-exports ``apply_cp`` from this module -- a module-level import of
     # hf/model here would close that cycle whenever hf/model is imported
     # first. Keeping it at the call site is what lets both import orders work.
-    from ...models.hf.model import _ATTN_IMPLEMENTATION
+    from ...models.hf.attention_backend import ATTENTION_BACKEND
 
     impl = getattr(getattr(model, "model", None), "config", None)
     impl = getattr(impl, "_attn_implementation", None)
-    if impl != _ATTN_IMPLEMENTATION:
+    if impl != ATTENTION_BACKEND:
         raise RuntimeError(
-            f"CP requires the {_ATTN_IMPLEMENTATION!r} attention backend, but "
+            f"CP requires the {ATTENTION_BACKEND!r} attention backend, but "
             f"this model runs {impl!r}. CP expresses the sharded attention mask "
             "as a BlockMask, which only the flex path consumes -- the same "
             "reason the sdpa fallback cannot run packed sequences. On a "
