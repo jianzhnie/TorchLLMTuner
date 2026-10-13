@@ -63,7 +63,10 @@ def require_ulysses_compatible(model: nn.Module, cfg: ParallelConfig, cp_mesh) -
             "rearranged shards back into the very order the mask was "
             "sharded in, so the rearrangement lands in the mask and cancels."
         )
-    if getattr(model_config, "attn_mask_type", "causal") == "block_causal":
+    if (
+        getattr(model_config, "attn_mask_type", "causal") == "block_causal"
+        and cfg.context_parallel_kv_allgather_size == 1
+    ):
         # Packed sequences ARE supported: the all-to-all reassembles the
         # full token stream on every rank before attention, so the
         # full-length document mask applies unsharded (upstream's varlen
@@ -215,7 +218,13 @@ def apply_cp(
                 cp_mesh=cp_mesh, strategy=strategy, packed=packed
             )
 
-    model.set_cp_mesh(cp_mesh, load_balancer=load_balancer, strategy=strategy)
+    cp_options = {
+        "load_balancer": load_balancer,
+        "strategy": "kv_allgather" if dual_axes else strategy,
+    }
+    if dual_axes:
+        cp_options["mask_mesh"] = kv_mesh
+    model.set_cp_mesh(cp_mesh, **cp_options)
     logger.info(
         "Applied CP (%s) with degree %d",
         "kv_allgather*ulysses" if dual_axes else strategy,

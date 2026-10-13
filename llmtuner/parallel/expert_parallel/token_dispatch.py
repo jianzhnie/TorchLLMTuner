@@ -230,10 +230,11 @@ class LocalTokenDispatcher:
         """
         out_TD = torch.zeros_like(x_TD)
 
-        # fp32 for the multiply, then back: the score is a probability and the
-        # expert output may be low precision.
+        # Promote low-precision expert outputs for score multiplication while
+        # preserving float64 outputs used by high-precision models.
+        compute_dtype = torch.promote_types(routed_output_RD.dtype, torch.float32)
         routed_output_RD = (
-            routed_output_RD.to(torch.float32)
+            routed_output_RD.to(compute_dtype)
             * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
         ).to(routed_output_RD.dtype)
 

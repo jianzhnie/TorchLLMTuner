@@ -34,6 +34,22 @@ def kcp_kda_forward(original_forward, group):
             raise ValueError("KCP KDA requires [1, local_sequence, hidden] input")
         if cache_params is not None or kwargs.get("cu_seqlens") is not None:
             raise ValueError("KCP KDA does not support cache or packed cu_seqlens")
+        kernel_size = module.q_conv1d.weight.size(-1)
+        if kernel_size <= 1:
+            raise ValueError(
+                f"KCP KDA convolution kernel size must be greater than 1; "
+                f"got {kernel_size}"
+            )
+        if module.head_k_dim > 256:
+            raise ValueError(
+                f"KCP KDA key head dimension must be at most 256; "
+                f"got {module.head_k_dim}"
+            )
+        lower_bound = module.gate_lower_bound
+        if lower_bound is not None and not -5 <= lower_bound < 0:
+            raise ValueError(
+                f"KCP KDA gate lower bound must be in [-5, 0); got {lower_bound}"
+            )
         causal_conv1d, chunk_kda, build_cp_context = _kcp_runtime()
         batch, local_sequence, _ = hidden_states.shape
         if attention_mask is not None:
@@ -45,7 +61,7 @@ def kcp_kda_forward(original_forward, group):
                 device=hidden_states.device,
             ),
             group=group,
-            conv1d_kernel_size=module.q_conv1d.weight.size(-1),
+            conv1d_kernel_size=kernel_size,
         )
 
         def project(name):
@@ -83,8 +99,8 @@ def kcp_kda_forward(original_forward, group):
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             use_beta_sigmoid_in_kernel=False,
-            safe_gate=module.gate_lower_bound is not None,
-            lower_bound=module.gate_lower_bound,
+            safe_gate=lower_bound is not None,
+            lower_bound=lower_bound,
             state_v_first=False,
             disable_recompute=getattr(module.config, "skip_kda_recompute", False),
             cp_context=context,
@@ -113,16 +129,19 @@ def apply_kcp(model: nn.Module, cp_mesh) -> int:
         for module in model.modules()
     ):
         raise ValueError("KCP does not support hybrid KDA/softmax attention models")
-    _kcp_runtime()
-    patched = 0
-    for module in model.modules():
-        if all(hasattr(module, name) for name in required):
-            wrapped = kcp_kda_forward(type(module).forward, cp_mesh.get_group())
-            module.forward = wrapped.__get__(module, type(module))
-            patched += 1
-    if not patched:
+    modules = [
+        module
+        for module in model.modules()
+        if all(hasattr(module, name) for name in required)
+    ]
+    if not modules:
         raise ValueError("KCP selected but no Kimi Delta Attention module was found")
-    return patched
+    _kcp_runtime()
+    group = cp_mesh.get_group()
+    for module in modules:
+        wrapped = kcp_kda_forward(type(module).forward, group)
+        module.forward = wrapped.__get__(module, type(module))
+    return len(modules)
 
 
 __all__ = ["apply_kcp", "kcp_kda_forward"]
