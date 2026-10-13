@@ -158,9 +158,9 @@ def pp_packed_microbatch_split(num_microbatches: int) -> None:
     raise UnsupportedCombinationError(
         f"pp > 1 with num_pp_microbatches={num_microbatches} > 1 over a packed "
         "corpus is not supported: the batch is a flat token stream and the "
-        "microbatch split would cut documents mid-context (upstream packs "
-        "per-microbatch at the loader; llmtuner's loader packs per batch). "
-        "Set num_pp_microbatches=1 or use a row-batched corpus."
+        "microbatch split would cut documents mid-context. Use the configured "
+        "text loader, which independently packs each pipeline microbatch, "
+        "provide a row-batched corpus, or set num_pp_microbatches=1."
     )
 
 

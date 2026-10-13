@@ -14,7 +14,7 @@ import grain.python as grain
 import numpy as np
 
 from ...components.loss import IGNORE_INDEX
-from ..contracts import TextSequence
+from ..contracts import TextSequence, require_positive
 
 
 class DocumentAwareConcatThenSplitIterDataset(grain.IterDataset):
@@ -28,6 +28,9 @@ class DocumentAwareConcatThenSplitIterDataset(grain.IterDataset):
         max_context_length: int,
         num_tokens_per_row: int,
     ) -> None:
+        require_positive("max_num_documents_per_row", max_num_documents_per_row)
+        require_positive("max_context_length", max_context_length)
+        require_positive("num_tokens_per_row", num_tokens_per_row)
         super().__init__(parent)
         self._max_num_documents_per_row = max_num_documents_per_row
         self._max_context_length = max_context_length
@@ -53,6 +56,9 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
         max_context_length: int,
         num_tokens_per_row: int,
     ) -> None:
+        require_positive("max_num_documents_per_row", max_num_documents_per_row)
+        require_positive("max_context_length", max_context_length)
+        require_positive("num_tokens_per_row", num_tokens_per_row)
         super().__init__(parent)
         self._max_num_documents_per_row = max_num_documents_per_row
         self._max_context_length = max_context_length
@@ -215,6 +221,7 @@ class SplitTextSequenceDocuments(grain.experimental.FlatMapTransform):
         *,
         max_context_length: int,
     ) -> None:
+        require_positive("max_context_length", max_context_length)
         self._max_context_length = max_context_length
         self.max_fan_out = max_context_length
 
