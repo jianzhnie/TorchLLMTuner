@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+from torch.distributed.tensor import Shard
 
 from llmtuner.config import ParallelConfig
 
@@ -23,11 +24,9 @@ def set_fsdp_prefetch_windows(
         raise ValueError("FSDP prefetch counts must be nonnegative")
     for index, module in enumerate(modules):
         forward = modules[index + 1 : index + 1 + forward_count]
-        if forward:
-            module.set_modules_to_forward_prefetch(forward)  # type: ignore[attr-defined]
+        module.set_modules_to_forward_prefetch(forward)  # type: ignore[attr-defined]
         backward = list(reversed(modules[max(0, index - backward_count) : index]))
-        if backward:
-            module.set_modules_to_backward_prefetch(backward)  # type: ignore[attr-defined]
+        module.set_modules_to_backward_prefetch(backward)  # type: ignore[attr-defined]
 
 
 def _resolve_pattern_units(
@@ -85,15 +84,33 @@ def apply_fsdp_by_pattern(
     cfg: ParallelConfig,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
+    edp_mesh: DeviceMesh | None = None,
 ) -> None:
     """Apply independently configured FSDP units selected by module patterns."""
     named, selected, ignored_params = _resolve_pattern_units(model, cfg)
     # The entry module imports this plan; defer runtime-policy imports.
     from .fully_shard_parallel import (
+        build_fsdp_placement_fn,
         disable_fsdp_gradient_division,
         enable_fsdp_symm_mem,
+        fsdp_shard_size,
         get_fsdp_reshard_after_forward_policy,
     )
+
+    expert_placements: dict[nn.Parameter, Shard] = {}
+    if cfg.ep > 1:
+        if edp_mesh is None:
+            raise ValueError("pattern FSDP with EP requires a sparse FSDP mesh")
+        from ...models.common.moe.experts import GroupedExperts
+
+        degree = fsdp_shard_size(edp_mesh)
+        expert_placements = {
+            parameter: Shard(1 if degree > module.num_experts else 0)
+            for module in model.modules()
+            if isinstance(module, GroupedExperts)
+            for parameter in module.parameters(recurse=False)
+            if parameter not in ignored_params
+        }
 
     shard_fn = get_fsdp_strategy(cfg.fsdp_implementation).get_fully_shard_fn()
     common: dict[str, Any] = {
@@ -113,9 +130,15 @@ def apply_fsdp_by_pattern(
             pin_memory=cfg.fsdp_cpu_offload_pin_memory
         )
 
-    for name in sorted(selected, key=lambda item: item.count("."), reverse=True):
-        shard_fn(named[name], **(common | selected[name]))
-    shard_fn(model, **common)
+    unit_names = sorted(selected, key=lambda item: item.count("."), reverse=True)
+    for name in [*unit_names, ""]:
+        options = common | selected.get(name, {})
+        if expert_placements and "shard_placement_fn" not in options:
+            assert edp_mesh is not None
+            options["shard_placement_fn"] = build_fsdp_placement_fn(
+                expert_placements, dp_mesh=options["mesh"], edp_mesh=edp_mesh
+            )
+        shard_fn(named[name], **options)
     set_fsdp_prefetch_windows(
         [module for name, module in named.items() if name in selected],
         forward_count=cfg.fsdp_forward_prefetch_count,

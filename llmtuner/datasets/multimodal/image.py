@@ -3,8 +3,9 @@
 Handles image decoding, resizing, normalization, and patch extraction for the
 vision encoder.
 
-Vendored from torchtitan ``hf_datasets/multimodal/utils/image.py`` without
-semantic change. Resizing and normalizing run on uint8 where possible so
+Adapted from torchtitan ``hf_datasets/multimodal/utils/image.py`` with explicit
+geometry validation and strict pixel budgets. Resizing and normalizing run on
+uint8 where possible so
 torchvision can take its SIMD paths; the final tensor is float32 in the
 ``(T, H, W, C)`` layout the vision encoder expects.
 """
@@ -85,6 +86,11 @@ def smart_resize(
         raise ValueError("pixel budgets must satisfy 0 < min_pixels <= max_pixels")
     if max_pixels < factor * factor:
         raise ValueError("max_pixels must fit at least one factor-sized patch grid")
+    grid_area = factor * factor
+    min_cells = (min_pixels + grid_area - 1) // grid_area
+    max_cells = max_pixels // grid_area
+    if min_cells > max_cells:
+        raise ValueError("pixel budgets contain no factor-aligned patch grid")
     if max(height, width) / min(height, width) > 200:
         raise ValueError(
             f"Absolute aspect ratio must be smaller than 200, "
@@ -103,6 +109,31 @@ def smart_resize(
         beta = math.sqrt(min_pixels / (height * width))
         h_bar = math.ceil(height * beta / factor) * factor
         w_bar = math.ceil(width * beta / factor) * factor
+
+    if not min_pixels <= h_bar * w_bar <= max_pixels:
+        # Clamping a narrow side to one grid cell or rounding both sides up
+        # can overshoot the budget. Search feasible integer grids only on this
+        # exceptional path, preferring the original aspect ratio. Enumerating
+        # the shorter side bounds the search by sqrt(max_cells).
+        ratio = width / height
+        best_score = (math.inf, math.inf)
+        target_cells = h_bar * w_bar / grid_area
+        for short in range(1, math.isqrt(max_cells) + 1):
+            lower = max(short, (min_cells + short - 1) // short)
+            upper = max_cells // short
+            if lower > upper:
+                continue
+            for landscape in (True, False):
+                ideal = short * ratio if landscape else short / ratio
+                long = min(upper, max(lower, round(ideal)))
+                h, w = (short, long) if landscape else (long, short)
+                score = (
+                    abs(math.log((w / h) / ratio)),
+                    abs(h * w - target_cells),
+                )
+                if score < best_score:
+                    best_score = score
+                    h_bar, w_bar = h * factor, w * factor
 
     return h_bar, w_bar
 
@@ -136,6 +167,8 @@ def resize_to_pixel_budget(
         ``(resize_h, resize_w, 0, 0)`` -- trailing zeros are padding (always 0
         here), kept for a uniform interface with ``resize_to_navit_patch_grid``.
     """
+    if min(height, width, patch_size, merge_size) < 1:
+        raise ValueError("height, width, patch_size and merge_size must be positive")
     factor = patch_size * merge_size
     # Ensure both dims >= factor so the rounding has a valid starting point.
     if height < factor or width < factor:
@@ -179,6 +212,13 @@ def resize_to_navit_patch_grid(
         ``(resize_h, resize_w, pad_h, pad_w)`` -- resize to the first two, then
         pad right/bottom by the last two.
     """
+    if (
+        min(height, width, patch_size, merge_size, max_patches, max_patches_per_side)
+        < 1
+    ):
+        raise ValueError(
+            "image dimensions, patch sizes and patch budgets must be positive"
+        )
     num_patches_h = max(1.0, height // patch_size)
     num_patches_w = max(1.0, width // patch_size)
     num_patches = num_patches_h * num_patches_w
@@ -301,7 +341,27 @@ def calculate_vision_tokens(
     Returns:
         (total_tokens, tokens_per_row, num_rows)
     """
-    t_patches = math.ceil(num_frames / temporal_patch_size)
+    if (
+        min(
+            num_frames,
+            height,
+            width,
+            patch_size,
+            spatial_merge_size,
+            temporal_patch_size,
+        )
+        < 1
+    ):
+        raise ValueError(
+            "frame count, image dimensions and patch sizes must be positive"
+        )
+    factor = patch_size * spatial_merge_size
+    if height % factor or width % factor:
+        raise ValueError(
+            f"image dimensions must be divisible by patch_size * "
+            f"spatial_merge_size={factor}; got ({height}, {width})"
+        )
+    t_patches = (num_frames + temporal_patch_size - 1) // temporal_patch_size
     tokens_per_row = width // (patch_size * spatial_merge_size)
     num_rows = height // (patch_size * spatial_merge_size)
     total_tokens = t_patches * tokens_per_row * num_rows
@@ -350,7 +410,23 @@ def vision_to_patches(
         grid_thw: (3,) tensor ``[T_patches, H_patches, W_patches]`` counting
             raw patches (before spatial merging).
     """
+    if img.ndim != 4 or any(size < 1 for size in img.shape):
+        raise ValueError("vision tensor must have nonempty (T, H, W, C) dimensions")
+    if min(patch_size, temporal_patch_size, merge_size) < 1:
+        raise ValueError(
+            "patch_size, temporal_patch_size and merge_size must be positive"
+        )
+    if patch_order not in ("block", "raster"):
+        raise ValueError(
+            f"patch_order must be 'block' or 'raster', got {patch_order!r}."
+        )
     T, H, W, C = img.shape
+    factor = patch_size * (merge_size if patch_order == "block" else 1)
+    if H % factor or W % factor:
+        raise ValueError(
+            f"image dimensions must be divisible by the {patch_order} patch "
+            f"grid factor={factor}; got ({H}, {W})"
+        )
     ps = patch_size
     ts = temporal_patch_size
 
@@ -378,7 +454,7 @@ def vision_to_patches(
             m=merge_size,
             n=merge_size,
         )
-    elif patch_order == "raster":
+    else:
         # (t, h, w) -- plain row-major (merge_size unused in the layout).
         patches = E.rearrange(
             img,
@@ -386,10 +462,6 @@ def vision_to_patches(
             pt=ts,
             ph=ps,
             pw=ps,
-        )
-    else:
-        raise ValueError(
-            f"patch_order must be 'block' or 'raster', got {patch_order!r}."
         )
 
     grid_thw = torch.tensor([T_patches, H_patches, W_patches])

@@ -249,6 +249,15 @@ def test_fsdp_prefetch_supports_arbitrary_windows() -> None:
     assert units[2].forward_targets == units[3:5]
     assert units[4].backward_targets == [units[3], units[2], units[1]]
 
+    # Reconfiguration must clear old windows, including a unit moved to the
+    # boundary where it has no neighbour in that direction.
+    set_fsdp_prefetch_windows(list(reversed(units)), forward_count=1, backward_count=1)
+    assert units[0].forward_targets == []
+    assert units[4].backward_targets == []
+    set_fsdp_prefetch_windows(units, forward_count=0, backward_count=0)
+    assert all(unit.forward_targets == [] for unit in units)
+    assert all(unit.backward_targets == [] for unit in units)
+
 
 def test_fsdp_strategy_selects_pyTorch_214_compatible_adapter() -> None:
     assert isinstance(get_fsdp_strategy("native"), NativeFSDPStrategy)
@@ -269,6 +278,7 @@ def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
     model = nn.Sequential(nn.Linear(2, 2))
     calls = []
     override_policy = object()
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *args, **kwargs: None)
     cfg = ParallelConfig(fsdp_apply_modules={"0": {"mp_policy": override_policy}})
     monkeypatch.setattr(
         plan,
@@ -326,6 +336,7 @@ def test_fsdp_patterns_honor_runtime_policies(monkeypatch, policy, pp, expected)
     model = nn.Sequential(nn.Linear(2, 2))
     calls = []
     scopes = []
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *args, **kwargs: None)
     cfg = ParallelConfig(
         fsdp_apply_modules={"0": {}},
         fsdp_reshard_after_forward=policy,
@@ -353,3 +364,22 @@ def test_fsdp_patterns_honor_runtime_policies(monkeypatch, policy, pp, expected)
     )
     assert all(call["reshard_after_forward"] is expected for call in calls)
     assert scopes == ["dense"]
+
+
+def test_pattern_fsdp_with_ep_requires_sparse_mesh_before_mutation(monkeypatch):
+    from llmtuner.config import ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(nn.Linear(2, 2))
+    cfg = ParallelConfig(expert_parallel_size=2, fsdp_apply_modules={"0": {}})
+    calls = []
+    monkeypatch.setattr(plan, "get_fsdp_strategy", lambda _: calls.append("shard"))
+    with pytest.raises(ValueError, match="requires a sparse FSDP mesh"):
+        plan.apply_fsdp_by_pattern(
+            model,
+            dp_mesh=object(),
+            cfg=cfg,
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        )
+    assert calls == []

@@ -22,7 +22,8 @@ behavior: one whole-model ``torch.compile(model, backend="inductor")``.
   aten ops. When the model routes through llmtuner's flex path, the backend
   is wrapped so just the annotated flex region is scooped into an inductor
   sub-compile (the annotation is ``maybe_regional_inductor`` at the flex
-  call site in ``models/hf/model.py``). A flex model with any other
+  call sites in ``models/hf/attention_backend.py`` and the CP kernel). A flex
+  model with any other
   non-inductor backend raises, as upstream does.
 * **capture_scalar_outputs**: token-choice MoE dispatch has data-dependent
   shapes (per-expert token counts), which dynamo cannot trace without
@@ -54,13 +55,6 @@ logger = get_logger(__name__)
 
 __all__ = ["apply_compile", "maybe_regional_inductor"]
 
-
-# Toggled on by ``maybe_regional_inductor_backend`` when the model compiles
-# with a non-inductor backend and its flex regions must be scooped into an
-# inductor sub-compile. Read by ``maybe_regional_inductor`` at trace time;
-# left False on the default inductor / eager paths so no annotation metadata
-# is emitted.
-_regional_inductor_enabled: bool = False
 
 # TP group names already registered for symmetric memory, so the per-chunk
 # calls under pipeline parallelism register each group exactly once.
@@ -169,7 +163,7 @@ def maybe_regional_inductor_backend(model: nn.Module, backend: str) -> str | Cal
 
     ``regional_inductor`` lowers just the regions annotated with
     ``compile_with_inductor`` (see ``maybe_regional_inductor`` and the flex
-    call site in ``models/hf/model.py``) while the rest stays in
+    call sites in the HF adapter and CP kernel) while the rest stays in
     aot_eager. Only applied for ``aot_eager`` on a model that actually runs
     flex attention: the default inductor backend already lowers flex
     directly, and a model on the sdpa fallback has no flex region to scoop,
@@ -181,6 +175,8 @@ def maybe_regional_inductor_backend(model: nn.Module, backend: str) -> str | Cal
     """
     uses_flex = getattr(model, "uses_flex_attention", False)
     if not uses_flex or backend == "inductor":
+        for module in model.modules():
+            module._regional_inductor_enabled = False
         return backend
 
     if backend != "aot_eager":
@@ -202,24 +198,31 @@ def maybe_regional_inductor_backend(model: nn.Module, backend: str) -> str | Cal
     from torch._dynamo.backends.common import aot_autograd
     from torch.fx.passes.regional_inductor import regional_inductor
 
-    global _regional_inductor_enabled
-    _regional_inductor_enabled = True
+    compiled_backend = aot_autograd(
+        fw_compiler=regional_inductor, bw_compiler=regional_inductor
+    )
+    # Compilation is lazy. Keep the decision on this model's modules so a
+    # later model's backend selection cannot change it before tracing starts.
+    for module in model.modules():
+        module._regional_inductor_enabled = True
 
     logger.info("regional_inductor is enabled")
-    return aot_autograd(fw_compiler=regional_inductor, bw_compiler=regional_inductor)
+    return compiled_backend
 
 
 def maybe_regional_inductor(
     inductor_configs: dict,
+    *,
+    enabled: bool = False,
 ) -> contextlib.AbstractContextManager:
     """Context manager that marks the wrapped region for ``regional_inductor``.
 
-    Returns a null context unless regional inductor is enabled (see
+    The caller supplies its module's setting from backend selection (see
     ``maybe_regional_inductor_backend``). When enabled, the region is tagged
     with ``compile_with_inductor`` so a non-inductor outer compile lowers
     just this region to inductor with ``inductor_configs``.
     """
-    if not _regional_inductor_enabled:
+    if not enabled:
         return contextlib.nullcontext()
     import torch.fx.traceback as fx_traceback
 

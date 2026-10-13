@@ -52,6 +52,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.attention.masks import get_causal_mask_mod
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
@@ -267,7 +268,7 @@ def _check_refusals(mesh, failures: list[str]) -> None:
         lambda: ParallelConfig(context_parallel_strategy="ring"),
     )
     _expect(
-        ValueError,
+        UnsupportedCombinationError,
         "load_balancer=None",
         "ulysses + headtail",
         lambda: ParallelConfig(

@@ -201,7 +201,6 @@ def test_regional_inductor_not_triggered_without_flex() -> None:
     """CPU/sdpa model + aot_eager: the backend passes through unwrapped."""
     backend = compile_mod.maybe_regional_inductor_backend(_model(), "aot_eager")
     assert backend == "aot_eager"
-    assert compile_mod._regional_inductor_enabled is False
 
 
 @requires_runtime
@@ -227,7 +226,6 @@ def test_regional_inductor_on_unsupported_torch_loud_raises(monkeypatch) -> None
 
 @requires_runtime
 def test_maybe_regional_inductor_is_null_when_disabled() -> None:
-    assert not compile_mod._regional_inductor_enabled
     with maybe_regional_inductor({}):
         pass  # must be a no-op context on the default path
 
@@ -253,3 +251,101 @@ def test_capture_scalar_outputs_set_only_for_token_choice_moe(monkeypatch) -> No
         torch._dynamo.config.capture_scalar_outputs = False
         apply_compile(_model(), compile_config=CompileConfig())
         assert torch._dynamo.config.capture_scalar_outputs is False
+
+
+@requires_runtime
+@pytest.mark.skipif(
+    not has("fx_regional_inductor"), reason="regional inductor unavailable"
+)
+def test_regional_inductor_annotations_are_isolated_between_models(monkeypatch):
+    import torch.fx.traceback as fx_traceback
+
+    from llmtuner.models.hf import attention_backend
+
+    regional_model, inductor_model, untouched_model = (_model() for _ in range(3))
+    monkeypatch.setattr(
+        type(regional_model), "uses_flex_attention", property(lambda self: True)
+    )
+    compile_mod.maybe_regional_inductor_backend(regional_model, "aot_eager")
+    compile_mod.maybe_regional_inductor_backend(inductor_model, "inductor")
+    annotations = []
+
+    @contextlib.contextmanager
+    def annotate(metadata):
+        annotations.append(metadata)
+        yield
+
+    monkeypatch.setattr(fx_traceback, "annotate", annotate)
+    monkeypatch.setattr(
+        attention_backend,
+        "flex_attention_forward",
+        lambda *args, **kwargs: (args[1], None),
+    )
+    query = torch.zeros(1, 2, 4, 8)
+    for model, expected_count in (
+        (regional_model, 1),
+        (inductor_model, 1),
+        (untouched_model, 1),
+        (regional_model, 2),
+    ):
+        output, _ = attention_backend.flex_attention_adapter(
+            model.layers[0].self_attn, query, query, query, None
+        )
+        assert output is query
+        assert len(annotations) == expected_count
+    assert all("compile_with_inductor" in metadata for metadata in annotations)
+
+
+@requires_runtime
+def test_cp_flex_annotations_cover_attention_and_exclude_collectives(monkeypatch):
+    from types import SimpleNamespace
+
+    import transformers.integrations.flex_attention as hf_flex
+
+    from llmtuner.parallel.context_parallel import attention
+
+    active = False
+
+    @contextlib.contextmanager
+    def annotate(config, *, enabled):
+        nonlocal active
+        assert enabled
+        active = True
+        yield
+        active = False
+
+    query = SimpleNamespace(is_cuda=True)
+    output = torch.randn(1, 4, 2, 8)
+
+    def flex(module, q, k, v, mask, **kwargs):
+        assert active
+        return output, None
+
+    monkeypatch.setattr(attention, "maybe_regional_inductor", annotate)
+    monkeypatch.setattr(hf_flex, "flex_attention_forward", flex)
+    actual = attention.run_flex(
+        SimpleNamespace(_regional_inductor_enabled=True), query, query, query, None, {}
+    )
+    assert not active
+    torch.testing.assert_close(actual, output.transpose(1, 2))
+
+
+@requires_runtime
+@pytest.mark.parametrize("per_block", [False, True])
+def test_compiled_cpu_training_matches_eager_outputs_and_gradients(per_block):
+    reference = _model()
+    model = apply_compile(
+        _model(), compile_config=CompileConfig(backend="aot_eager", per_block=per_block)
+    )
+    tokens = torch.arange(_SEQ) % _VOCAB
+    expected = reference(tokens)
+    actual = model(tokens)
+    torch.testing.assert_close(actual, expected)
+    expected.square().sum().backward()
+    actual.square().sum().backward()
+    reference_gradients = {
+        name: parameter.grad for name, parameter in reference.named_parameters()
+    }
+    for name, parameter in model.named_parameters():
+        canonical_name = name.removeprefix("_orig_mod.")
+        torch.testing.assert_close(parameter.grad, reference_gradients[canonical_name])

@@ -64,6 +64,12 @@ class MultimodalCollator(Collator):
         build_mrope_positions: bool = False,
         patch_order: Literal["block", "raster"] = "block",
     ) -> None:
+        if min(patch_size, temporal_patch_size, spatial_merge_size) < 1:
+            raise ValueError("multimodal patch sizes must be positive")
+        if max_images_per_batch < 0:
+            raise ValueError("max_images_per_batch must be nonnegative")
+        if patch_order not in ("block", "raster"):
+            raise ValueError("patch_order must be 'block' or 'raster'")
         self._num_tokens_per_batch = context.num_tokens_per_batch
         self._max_context_length = context.max_context_length
         self.max_images_per_batch = max_images_per_batch
