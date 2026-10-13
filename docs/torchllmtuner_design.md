@@ -539,7 +539,7 @@ schedule 尚未验证。
 
 - `loss.py`：vendored 自 torchtitan 的 `cross_entropy_loss`（sum 归约）、
   `next_token_targets`、`vocab_shard_bounds`。
-- Checkpointer：DCP 格式，`ModelWrapper` 支持多 model_part；optimizer state 由
+- Checkpointer：DCP 格式，`ModelCheckpointState` 支持多 model_part；optimizer state 由
   `OptimizersContainer` 序列化为扁平 FQN 字典（无论 PP 与否都是同一格式）。
 - `synthetic.py`：`RandomTokenSource` 确定性合成语料——`(seed, step)` 唯一决定
   batch，等价性测试和 smoke run 不需要真实数据集。

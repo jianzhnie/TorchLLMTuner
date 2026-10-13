@@ -9,7 +9,7 @@ Ported from torchtitan's ``components/checkpointer/``. Three layers:
   ``torch.distributed.checkpoint``.
   This is the one llmtuner runs. It shards under FSDP, saves asynchronously, and
   loads in place.
-* ``torch_checkpointing`` -- ``TorchCheckpointingManager``, backed by the
+* ``torch_checkpointing_backend`` -- ``TorchCheckpointingManager``, backed by the
   ``torch_checkpointing`` package. That package is not a llmtuner dependency and
   is not installed in the development environment, so this module imports (its
   backend imports are deferred) but constructing the manager raises
@@ -17,15 +17,16 @@ Ported from torchtitan's ``components/checkpointer/``. Three layers:
   the third of torchtitan's backends, and installing the package is the only
   step needed to use it.
 
+``model_state`` adapts model parts to the checkpoint state interface.
 ``storage`` defines the path-operation contract and filesystem adapter.
 ``checkpoint_keys`` also holds ``canonical_fqn``, which strips the activation-checkpoint
 wrapper segment from an FQN.
 
-State keys. A checkpoint is keyed by the top-level names in ``base``: ``model``,
+State keys. A checkpoint uses the names defined in ``checkpoint_keys``: ``model``,
 ``optimizer``, ``lr_scheduler``, ``dataloader``, ``train_state``, ``ema``.
 llmtuner fills in the first two plus whatever the caller passes in ``states``:
 
-* ``model`` -- a ``ModelWrapper`` over the model chunks.
+* ``model`` -- a ``ModelCheckpointState`` over the model chunks.
 * ``optimizer`` -- the ``OptimizersContainer`` itself, passed through. It is
   already a ``Stateful`` whose state dict is flat and FQN-keyed, which is what
   DCP needs to reshard a pipeline checkpoint, and it materializes a fresh
@@ -64,7 +65,7 @@ from ...utils.lazy_exports import export_names, resolve_export
 _EXPORT_SOURCES = {
     "BaseCheckpointManager": "base",
     "CheckpointStorage": "storage",
-    "ModelWrapper": "base",
+    "ModelCheckpointState": "model_state",
     # The state keys are resolved from their own dependency-free module rather
     # than through ``base``: the keys belong there, and a re-export chain was
     # one more place for the two to disagree.
