@@ -172,6 +172,7 @@ def init_dist_mpi(backend, **kwargs) -> None:
         raise KeyError("The environment variable MASTER_ADDR is not set")
     os.environ["WORLD_SIZE"] = os.environ["OMPI_COMM_WORLD_SIZE"]
     os.environ["RANK"] = os.environ["OMPI_COMM_WORLD_RANK"]
+    os.environ["LOCAL_RANK"] = str(local_rank)
     torch_dist.init_process_group(backend=backend, **kwargs)
 
 

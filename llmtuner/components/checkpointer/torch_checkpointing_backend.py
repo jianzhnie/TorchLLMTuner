@@ -697,7 +697,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         self._manager.close()
         storage_config = self._manager_config.storage_config
         input_checkpoint_id = checkpoint_id
-        item_specs: dict[str, Any] | None = None
+        save_items: dict[str, Any] | None = None
         pre_finalize_callback: Callable[[str, Any], None] | None = None
         if self.last_save_in_hf:
             assert self.sd_adapter is not None
@@ -706,9 +706,9 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             # pre-finalize callback consolidates them up into checkpoint_id, so
             # the published checkpoint is HF-layout rather than sharded.
             input_checkpoint_id = filesystem.join(checkpoint_id, "sharded")
-            item_specs = item_specs(self._backend)
-            model_spec = item_specs[MODEL]
-            item_specs[MODEL] = self._backend.ItemSpec(
+            save_items = item_specs(self._backend)
+            model_spec = save_items[MODEL]
+            save_items[MODEL] = self._backend.ItemSpec(
                 requires_copy=model_spec.requires_copy,
                 layout=self._backend.LayoutInfo(
                     f"{MODEL}_{{rank}}.safetensors",
@@ -745,7 +745,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             self._backend,
             sync_save_config(self._backend),
             storage_config=storage_config,
-            items=item_specs,
+            items=save_items,
             pre_finalize_callback=pre_finalize_callback,
         )
         manager = manager_config.build()

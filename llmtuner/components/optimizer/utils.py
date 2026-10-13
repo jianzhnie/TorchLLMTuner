@@ -77,25 +77,27 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
                 if isinstance(param_group["lr"], torch.Tensor)
                 else 0.0
             )
-    optim.step(closure=None)
+    try:
+        optim.step(closure=None)
 
-    # A zero learning rate keeps parameters unchanged, but Adam still advances
-    # its step counter (and coupled weight decay can update its moments). Reset
-    # the materialized state so the first real update remains Adam step 1.
-    if isinstance(optim, torch.optim.Adam | torch.optim.AdamW):
-        for param in params_to_initialize:
-            state = optim.state[param]
-            state["step"].zero_()
-            state["exp_avg"].zero_()
-            state["exp_avg_sq"].zero_()
-            if "max_exp_avg_sq" in state:
-                state["max_exp_avg_sq"].zero_()
+        # A zero learning rate keeps parameters unchanged, but Adam still advances
+        # its step counter (and coupled weight decay can update its moments). Reset
+        # the materialized state so the first real update remains Adam step 1.
+        if isinstance(optim, torch.optim.Adam | torch.optim.AdamW):
+            for param in params_to_initialize:
+                state = optim.state[param]
+                state["step"].zero_()
+                state["exp_avg"].zero_()
+                state["exp_avg_sq"].zero_()
+                if "max_exp_avg_sq" in state:
+                    state["max_exp_avg_sq"].zero_()
 
-    for param_group in optim.param_groups:
-        if "lr" in param_group:
-            param_group["lr"] = saved_lrs.pop(0)
-    for param, grad in zip(params, saved_grads, strict=False):
-        param.grad = grad
+    finally:
+        for param_group in optim.param_groups:
+            if "lr" in param_group:
+                param_group["lr"] = saved_lrs.pop(0)
+        for param, grad in zip(params, saved_grads, strict=False):
+            param.grad = grad
 
 
 def get_flat_optim_state_dict(optim: torch.optim.Optimizer) -> dict[str, Any]:

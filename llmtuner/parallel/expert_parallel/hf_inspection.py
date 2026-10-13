@@ -180,7 +180,7 @@ def fused_experts_of(block: nn.Module) -> FusedExperts | None:
     # architectures whose expert hidden size matches the dense MLP's -- Mixtral
     # and OLMoE, but not Qwen3Moe or DeepSeek -- so it is deliberately not
     # checked against ``double_hidden``.
-    if double_hidden % 2 != 0 or down.shape[1] != dim:
+    if double_hidden % 2 != 0 or down.shape[1:] != (dim, double_hidden // 2):
         raise ValueError(
             f"unrecognized expert weight shapes: gate_up_proj "
             f"{tuple(gate_up.shape)}, down_proj {tuple(down.shape)}. Expected "

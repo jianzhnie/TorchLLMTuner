@@ -126,6 +126,17 @@ def test_kcp_rejects_tensor_parallelism() -> None:
         )
 
 
+def test_kcp_has_an_independent_reachable_degree() -> None:
+    cfg = ParallelConfig(context_parallel_strategy="kcp", context_parallel_kcp_size=4)
+    assert cfg.cp == 4
+    assert cfg.derive_dp(8) == 2
+
+
+def test_kcp_degree_requires_kcp_strategy() -> None:
+    with pytest.raises(ValueError, match="requires strategy='kcp'"):
+        ParallelConfig(context_parallel_kcp_size=2)
+
+
 # -- ulysses head divisibility -------------------------------------------------
 #
 # The check lives behind mesh validation, so it needs a CP axis of size 2 --

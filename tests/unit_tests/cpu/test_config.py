@@ -619,3 +619,8 @@ def test_the_cli_view_parses_into_the_real_groups() -> None:
     # ``__post_init__`` still ran: no explicit param_groups means the
     # catch-all group the optimizer builds for a run.
     assert len(cfg.optimizer.param_groups) == 1
+
+
+def test_unknown_packing_is_rejected():
+    with pytest.raises(ConfigError, match="dataloader.packing"):
+        DataloaderConfig(packing="typo")

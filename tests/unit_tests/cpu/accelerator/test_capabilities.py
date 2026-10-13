@@ -29,6 +29,13 @@ def test_registry_covers_the_expected_names() -> None:
     assert sorted(CAPABILITIES) == sorted(ALL_NAMES)
 
 
+def test_pipeline_probe_tolerates_missing_eval(monkeypatch) -> None:
+    import torch.distributed.pipelining.schedules as schedules
+
+    monkeypatch.delattr(schedules._PipelineSchedule, "eval", raising=False)
+    assert capabilities._pipelining_has_eval() is False
+
+
 def test_every_entry_probes_a_bool() -> None:
     for name in ALL_NAMES:
         assert isinstance(has(name), bool), name

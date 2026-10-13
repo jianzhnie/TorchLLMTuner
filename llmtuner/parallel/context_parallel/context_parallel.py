@@ -113,6 +113,11 @@ def apply_cp(
     if cfg.context_parallel_strategy == "kcp":
         if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
             raise ValueError("KCP requires a cp mesh")
+        if mesh["cp"].size() != cfg.cp:
+            raise ValueError("KCP mesh degree does not match the configured CP degree")
+        model_config = getattr(getattr(model, "model", None), "config", None)
+        if getattr(model_config, "attn_mask_type", "causal") == "block_causal":
+            raise ValueError("KCP does not support packed document attention")
         from .kcp import apply_kcp
 
         patched = apply_kcp(model, mesh["cp"])

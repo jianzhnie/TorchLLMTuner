@@ -819,7 +819,15 @@ def apply_tp(
         )
     if configured_plan:
         base_plan = model_tp_plan(model) if plan is None else plan
-        plan = {**base_plan, **configured_plan}
+        # Matching uses the first pattern; explicit overrides must come first.
+        plan = {
+            **configured_plan,
+            **{
+                key: value
+                for key, value in base_plan.items()
+                if key not in configured_plan
+            },
+        }
 
     # A head count that does not divide ``tp`` has no valid local head split,
     # and no downstream guard catches it: the projection-level check in
