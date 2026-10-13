@@ -8,6 +8,8 @@ true upstream and is what keeps a text-only or image-only run from needing it.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 import torchvision.transforms.v2.functional as TVF
@@ -41,6 +43,10 @@ def load_video(
         Tensor of shape (T, H, W, C) in uint8, channel-last format,
         or None if loading fails.
     """
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError("fps must be finite and positive")
+    if not 1 <= min_frames <= max_frames:
+        raise ValueError("frame bounds must satisfy 1 <= min_frames <= max_frames")
     try:
         import av
 

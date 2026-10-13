@@ -34,7 +34,7 @@ def _resolve_pattern_units(
     model: nn.Module, cfg: ParallelConfig
 ) -> tuple[dict[str, nn.Module], dict[str, dict[str, Any]], set[nn.Parameter]]:
     named = dict(model.named_modules())
-    ignored_names = {
+    ignored_roots = {
         name
         for name in named
         if any(
@@ -44,6 +44,17 @@ def _resolve_pattern_units(
     for pattern in cfg.fsdp_ignored_modules:
         if not any(module_name_matches(pattern, name) for name in named):
             raise ValueError(f"FSDP ignored pattern {pattern!r} matched no module")
+
+    # Ignoring a module excludes its complete subtree, matching the recursive
+    # ignored-parameter collection below.
+    ignored_names = {
+        name
+        for name in named
+        if any(
+            root == "" or name == root or name.startswith(f"{root}.")
+            for root in ignored_roots
+        )
+    }
 
     selected: dict[str, dict[str, Any]] = {}
     for pattern, overrides in cfg.fsdp_apply_modules.items():
