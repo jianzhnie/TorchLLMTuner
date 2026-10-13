@@ -306,6 +306,25 @@ llmtuner/
 
 包级 `__init__.py` 只负责稳定导出；跨模块调用优先使用包级公共接口。
 
+### 文件日志
+
+通过 `get_logger` 为模块添加文件输出，原有控制台日志继续保留：
+
+```python
+from llmtuner.utils.logging import get_logger
+
+logger = get_logger(__name__, log_file="outputs/train.log")
+logger.info("训练开始")
+```
+
+文件使用 UTF-8、无颜色格式，包含时间、rank、模块与日志级别。默认追加
+（`file_mode="a"`），显式传入 `file_mode="w"` 时在首次写入前覆盖旧内容。
+父目录自动创建；同一路径的模块共享 handler，重复配置不会重复写入或再次
+截断。已配置路径不能切换打开模式；省略 `log_file` 不会移除现有文件输出。
+
+文件只由 rank 0 写入，与控制台的 `set_log_ranks` 设置独立；其他 rank 的
+ERROR 日志仍输出到控制台。文件输出通过 Python API 配置，未新增 CLI 参数。
+
 ## 10. 测试与开发
 
 CPU 单元测试：
