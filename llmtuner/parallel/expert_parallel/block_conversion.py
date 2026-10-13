@@ -1,9 +1,9 @@
 """The EP swap's block conversion: HF MoE block -> llmtuner MoE.
 
-Split out of ``swap.py``: ``convert_block`` builds the llmtuner MoE for one
+Split out of ``model_replacement.py``: ``convert_block`` builds the llmtuner MoE for one
 probed HF block and moves its weights over; ``restore_fp32_state_buffers``
 undoes the buffer dtype cast ``Module.to`` applies. The layout probes live in
-``probe.py``, the orchestration in ``swap.py``.
+``hf_inspection.py``, the orchestration in ``model_replacement.py``.
 """
 
 from __future__ import annotations
@@ -181,6 +181,10 @@ def convert_block(
     moe.to(dtype=router_gate.weight.dtype, device=router_gate.weight.device)
     restore_fp32_state_buffers(moe)
     moe.train(block.training)
+    router.gate.weight.requires_grad_(router_gate.weight.requires_grad)
+    grouped.w1_EFD.requires_grad_(experts.gate_EFD.requires_grad)
+    grouped.w3_EFD.requires_grad_(experts.up_EFD.requires_grad)
+    grouped.w2_EDF.requires_grad_(experts.down_EDF.requires_grad)
     with torch.no_grad():
         router.gate.weight.copy_(router_gate.weight)
         # HF keeps all E experts in two stacked parameters; each rank keeps its

@@ -11,22 +11,15 @@ from .logging import get_logger
 logger = get_logger(__name__)
 
 
-def set_seed(seed: int, set_deterministic=False):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.accelerator.manual_seed(seed)
-    torch.accelerator.manual_seed_all(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    if set_deterministic:
-        set_deterministic_algorithms()
+def set_seed(seed: int, set_deterministic: bool = False) -> None:
+    """Seed the active device and host generators through the shared path."""
+    seed_everything(seed, deterministic=set_deterministic)
 
 
 def set_deterministic_algorithms():
     """Enable deterministic algorithms and deterministic accelerator kernels."""
     os.environ["HCCL_DETERMINISTIC"] = "True"
     os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
-    torch.use_deterministic_algorithms(True)
     # torchtitan's ``set_determinism``, minus the parts that only exist
     # for its own stack (the DTensor mesh-aware RNG tracker, the
     # flex-attention kernels) and plus this one spelled out:
@@ -54,7 +47,7 @@ def seed_everything(
     delegates here.
     """
     random.seed(seed)
-    np.random.seed(seed)
+    np.random.seed(seed % 2**32)
     torch.manual_seed(seed)
     # Hash randomization is not observable in this process (PYTHONHASHSEED is
     # read at interpreter start), but dataloader workers are spawned later and

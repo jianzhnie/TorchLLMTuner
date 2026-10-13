@@ -1,14 +1,15 @@
 """HF MoE block layout probes for the EP swap.
 
-The entry point is ``swap.py`` (``swap_hf_moe_blocks``); the conversion is
-``convert.py``. This module is the duck-typed detector every HF family is
+The entry point is ``model_replacement.py`` (``swap_hf_moe_blocks``); the conversion is
+``block_conversion.py``. This module is the duck-typed detector every HF family is
 identified through, shared by the swap and by ``tensor_parallel.py``
 (``is_hf_moe_block``).
 
 Every sparse decoder layer of a transformers 5.x MoE model holds the same block
 under ``layer.mlp``: a router, plus two stacked expert parameters. This module
 only *detects* that layout and reads its dimensions -- the weight move into the
-grouped-GEMM stack lives in ``convert.py``, the orchestration in ``swap.py``.
+grouped-GEMM stack lives in ``block_conversion.py``; the orchestration lives
+in ``model_replacement.py``.
 
 Both halves of the block vary by family, and the probe is duck-typed against
 structures rather than class names, which are not stable across transformers

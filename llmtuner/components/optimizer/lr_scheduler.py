@@ -192,6 +192,10 @@ class LRSchedulersContainer(Stateful):
             scheduler.last_epoch = last_epoch
             scheduler._step_count = last_epoch + 1
             scheduler._last_lr = scheduler.get_lr()
+            for group, learning_rate in zip(
+                scheduler.optimizer.param_groups, scheduler._last_lr, strict=True
+            ):
+                group["lr"] = learning_rate
 
 
 def build_lr_scheduler(

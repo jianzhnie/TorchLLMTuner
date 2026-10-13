@@ -110,7 +110,7 @@ def all_gather_along(
 ) -> torch.Tensor:
     """Autograd-covered all-gather along ``dim``; backward is the reduce-scatter dual.
 
-    Used for the attention boundary gather (see ``tp.py``): any number of
+    Used for the attention boundary gather (see ``tensor_parallel.py``): any number of
     leading dims, any gather dim -- unlike the fused symm-mem ops, which are
     strictly 2D.
     """
@@ -125,8 +125,8 @@ def reduce_scatter_along(
 
     The exact mirror of ``all_gather_along``: sums the per-rank partials and
     hands each rank its slice of ``dim``. Used for the MoE-block boundary under
-    TP (see ``tp.py``), where the block's output is partial over the TP group
-    and must return to a sequence shard.
+    TP (see ``tensor_parallel.py``). The block's output is partial over the
+    TP group and must return to a sequence shard.
     """
     _, reduce_scatter = functional_collectives()
     return reduce_scatter(x.contiguous(), "sum", dim, group)

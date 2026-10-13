@@ -70,11 +70,23 @@ class TokenChoiceTopKRouter(nn.Module):
         _debug_force_load_balance: bool = False,
     ) -> None:
         super().__init__()
+        if num_experts < 1 or dim < 1:
+            raise ValueError("num_experts and dim must be positive")
+        if not 1 <= top_k <= num_experts:
+            raise ValueError("top_k must be in [1, num_experts]")
+        if score_func not in ("sigmoid", "softmax", "sqrtsoftplus"):
+            raise ValueError(f"Unknown score function {score_func}")
+        if num_expert_groups is None and num_limited_groups is not None:
+            raise ValueError("num_limited_groups requires num_expert_groups")
         if num_expert_groups is not None:
+            if num_expert_groups < 1:
+                raise ValueError("num_expert_groups must be positive")
             if num_limited_groups is None:
                 raise ValueError(
                     "num_limited_groups must be set when num_expert_groups is set"
                 )
+            if num_limited_groups < 1:
+                raise ValueError("num_limited_groups must be positive")
             if num_limited_groups > num_expert_groups:
                 raise ValueError(
                     f"num_limited_groups ({num_limited_groups}) cannot exceed "
@@ -92,6 +104,8 @@ class TokenChoiceTopKRouter(nn.Module):
                     f"num_experts_per_group ({num_experts // num_expert_groups}) "
                     "must be >= 2 to form a group score"
                 )
+            if top_k > num_limited_groups * (num_experts // num_expert_groups):
+                raise ValueError("top_k exceeds the selected expert groups' capacity")
         self.gate = RouterGateLinear(dim, num_experts)
         self.num_experts = num_experts
         self.top_k = top_k
@@ -192,8 +206,8 @@ class TokenChoiceTopKRouter(nn.Module):
         # once the load-balancing bias can push ``scores_for_choice`` negative
         # -- a masked 0.0 then outranks a real expert inside a selected group.
         # V2 never reaches this code (its ``topk_method`` is "greedy", so
-        # ``swap.py`` builds it no group restriction), but matching the majority
-        # spelling is the right default for the ones that do.
+        # ``model_replacement.py`` builds it without group restriction).
+        # Match the majority convention for the grouped families.
         scores_for_choice_TE = scores_TGP.masked_fill(
             unselected_groups_TG.unsqueeze(-1), float("-inf")
         ).flatten(-2)

@@ -4,7 +4,7 @@ This is the one place configuration lives, and every class here is named the
 same way -- ``*Config``. What varies is only whether a config is a top-level
 parser group or a nested one:
 
-* Top-level groups, handed to ``HfArgumentParser`` in ``train.py`` --
+* Top-level groups, handed to ``HfArgumentParser`` in ``trainer/cli.py`` --
   ``ModelConfig``, ``ParallelConfig``, ``OptimizerConfig``, ``TrainingConfig``.
 * Nested configs, each also parsed as its own group and then grafted onto the
   group that holds it -- ``CheckpointConfig``, ``DataloaderConfig``,

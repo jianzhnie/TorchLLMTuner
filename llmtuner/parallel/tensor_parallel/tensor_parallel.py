@@ -124,7 +124,10 @@ class ColumnParallelLinear(nn.Module):
         self.in_features = weight.shape[1]
         self.out_features = weight.shape[0]
         self.weight = nn.Parameter(
-            shard_weight(weight, 0, tp_size=tp_size, tp_rank=tp_rank)
+            shard_weight(weight, 0, tp_size=tp_size, tp_rank=tp_rank),
+            requires_grad=weight.requires_grad
+            if isinstance(weight, nn.Parameter)
+            else True,
         )
         self.group = group
         self.tp_size = tp_size
@@ -177,7 +180,10 @@ class RowParallelLinear(nn.Module):
         self.in_features = weight.shape[1]
         self.out_features = weight.shape[0]
         self.weight = nn.Parameter(
-            shard_weight(weight, 1, tp_size=tp_size, tp_rank=tp_rank)
+            shard_weight(weight, 1, tp_size=tp_size, tp_rank=tp_rank),
+            requires_grad=weight.requires_grad
+            if isinstance(weight, nn.Parameter)
+            else True,
         )
         self.group = group
         self.tp_size = tp_size
@@ -234,7 +240,10 @@ class ColwiseLinearNoGather(nn.Module):
         self.in_features = weight.shape[1]
         self.out_features = weight.shape[0]
         self.weight = nn.Parameter(
-            shard_weight(weight, 0, tp_size=tp_size, tp_rank=tp_rank)
+            shard_weight(weight, 0, tp_size=tp_size, tp_rank=tp_rank),
+            requires_grad=weight.requires_grad
+            if isinstance(weight, nn.Parameter)
+            else True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -352,7 +361,8 @@ def shard_shared_expert_for_tp(
         if proj is None or not isinstance(proj, nn.Linear):
             continue
         proj.weight = nn.Parameter(
-            shard_weight(proj.weight.data, dim, tp_size=tp_size, tp_rank=tp_rank)
+            shard_weight(proj.weight, dim, tp_size=tp_size, tp_rank=tp_rank),
+            requires_grad=proj.weight.requires_grad,
         )
         if dim == 0:
             proj.out_features = proj.weight.shape[0]
@@ -414,9 +424,12 @@ def shard_experts_for_tp(
     up_shard = _shard(gate_up[:, hidden:], 1)
     with torch.no_grad():
         experts.gate_up_proj = nn.Parameter(
-            torch.cat([gate_shard, up_shard], dim=1).contiguous()
+            torch.cat([gate_shard, up_shard], dim=1).contiguous(),
+            requires_grad=gate_up.requires_grad,
         )
-        experts.down_proj = nn.Parameter(_shard(down, 2))
+        experts.down_proj = nn.Parameter(
+            _shard(down, 2), requires_grad=down.requires_grad
+        )
     return frozenset({"experts.gate_up_proj", "experts.down_proj"})
 
 
@@ -872,6 +885,7 @@ def apply_tp(
             group=group,
             use_symm_mem=use_symm_mem,
         )
+        wrapped.train(inner.training)
         setattr(parent, attr, wrapped)
 
     for parent in attention_parents.values():

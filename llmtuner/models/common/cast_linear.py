@@ -86,9 +86,12 @@ def to_cast_linear(linear: nn.Module, compute_dtype: torch.dtype) -> CastLinear:
         linear.out_features,
         compute_dtype=compute_dtype,
         bias=linear.bias is not None,
-        device=linear.weight.device,
+        # Parameters are rebound below; meta avoids allocating and randomly
+        # initializing a second vocabulary-sized projection.
+        device="meta",
         dtype=linear.weight.dtype,
     )
     cast.weight = linear.weight
     cast.bias = linear.bias
+    cast.train(linear.training)
     return cast

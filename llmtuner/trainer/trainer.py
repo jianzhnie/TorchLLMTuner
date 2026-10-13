@@ -15,6 +15,7 @@ all stages. The process group belongs to the entry point, not ``Trainer.close``.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable, Iterator
 from contextlib import nullcontext
 from datetime import timedelta
@@ -416,7 +417,7 @@ class Trainer:
 
         This is *not* where activation checkpointing lives. AC is applied in the
         parallel layer (``parallel/parallelize.py``'s ``apply_ac`` stage, fed by
-        ``builder``), which is where torchtitan applies its ``ac_config`` too --
+        ``runtime/assembly.py``), where torchtitan applies its ``ac_config`` too --
         not around the loop body. The one upstream wrapper with no counterpart
         here is ``spmd.no_typecheck()`` around ``loss.backward()``; it was
         dropped deliberately (see ``models/common/rope.py``), because it is a
@@ -832,7 +833,7 @@ class Trainer:
             "would be garbage.",
         )
 
-    # -- validation (bodies live in validate.py) --------------------------------
+    # -- validation (bodies live in runtime/validation.py) ----------------------
 
     @staticmethod
     def check_validation_feasibility(
@@ -844,7 +845,7 @@ class Trainer:
     ) -> None:
         """Reject the validation configurations that cannot terminate cleanly.
 
-        The body lives in ``validate.py``; see there for the rationale.
+        The body lives in ``runtime/validation.py``; see there for the rationale.
         """
         validation_runtime.check_validation_feasibility(
             validation,
@@ -856,20 +857,20 @@ class Trainer:
     def should_validate(self, step: int) -> bool:
         """Whether a validation pass runs at the end of ``step``.
 
-        The body lives in ``validate.py``; see there for the gating rule.
+        The body lives in ``runtime/validation.py``; see there for the gating rule.
         """
         return validation_runtime.should_validate(self, step)
 
     def validate(self, step: int) -> None:
         """Run one eval-mode, gradient-free pass and log its loss.
 
-        The body lives in ``validate.py`` (gradient-free via its own
+        The body lives in ``runtime/validation.py`` (gradient-free via its own
         ``torch.no_grad``); see there for the reporting contract.
         """
         validation_runtime.validate(self, step)
 
     def validate_body(self, validation: ValidationConfig, step: int) -> None:
-        """The pass itself; the body lives in ``validate.py``."""
+        """The pass itself; the body lives in ``runtime/validation.py``."""
         validation_runtime.run_validation_loop(self, validation, step)
 
     # -- step cadence ------------------------------------------------------------
@@ -1006,7 +1007,13 @@ class Trainer:
             # ``train`` -- gets the same cleanup from the same place. It is in
             # a ``finally`` so a run that dies mid-loop still finishes the
             # checkpoint it had already started writing.
-            self.close()
+            training_error = sys.exc_info()[1]
+            try:
+                self.close()
+            except Exception:
+                if training_error is None:
+                    raise
+                logger.exception("Resource cleanup failed after a training error")
 
     def close(self) -> None:
         """Release everything ``train`` acquired, in reverse order of use.
@@ -1015,13 +1022,17 @@ class Trainer:
         was never fully built (or is being closed twice) does not raise on the
         cleanup path, where an exception would mask the real failure.
         """
-        if self.checkpointer is not None:
-            # Drains any async save still in flight and stops the purge thread.
-            self.checkpointer.close()
-        if self.metrics is not None:
-            self.metrics.close()
-        if self.dataloader is not None:
-            # Releases the Grain prefetch thread. Without this the loader is
-            # only collected at interpreter shutdown, where its ``__del__``
-            # raises against an already-torn-down state.
-            self.dataloader.close()
+        first_error: Exception | None = None
+        for name in ("checkpointer", "metrics", "dataloader", "gc_handler"):
+            resource = getattr(self, name, None)
+            if resource is None:
+                continue
+            setattr(self, name, None)
+            try:
+                resource.close()
+            except Exception as error:
+                logger.exception("Failed to close trainer resource %s", name)
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error

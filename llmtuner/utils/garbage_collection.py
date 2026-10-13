@@ -38,15 +38,21 @@ class GarbageCollection:
             raise ValueError(f"gc_freq must be a positive integer, got {gc_freq}")
         self.gc_freq = gc_freq
         self.debug = debug
+        self._was_enabled = gc.isenabled()
+        self._closed = False
         gc.disable()
-        self.collect("Initial GC collection")
-        if debug:
-            from torch.utils.viz._cycles import warn_tensor_cycles
+        try:
+            self.collect("Initial GC collection")
+            if debug:
+                from torch.utils.viz._cycles import warn_tensor_cycles
 
-            from ..accelerator import distributed
+                from ..accelerator import distributed
 
-            if distributed.is_main_process():
-                warn_tensor_cycles()
+                if distributed.is_main_process():
+                    warn_tensor_cycles()
+        except Exception:
+            self.close()
+            raise
 
     def run(self, step_count: int) -> bool:
         """Collect if this step should. Returns whether a collection ran."""
@@ -60,6 +66,14 @@ class GarbageCollection:
             self.collect("Performing periodic GC collection")
             return True
         return False
+
+    def close(self) -> None:
+        """Restore the automatic collector's state before training began."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._was_enabled:
+            gc.enable()
 
     @staticmethod
     def collect(reason: str, generation: int = 1) -> None:

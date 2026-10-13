@@ -183,13 +183,18 @@ def validate(self, step: int) -> None:
     validation = self.cfg.validation
     assert validation is not None, "validate() is gated by should_validate"
 
-    for part in self.model_parts:
-        part.eval()
+    training_modes = {
+        module: module.training
+        for part in self.model_parts
+        for module in part.modules()
+    }
     try:
+        for part in self.model_parts:
+            part.eval()
         self.validate_body(validation, step)
     finally:
-        for part in self.model_parts:
-            part.train()
+        for module, training in training_modes.items():
+            module.training = training
 
 
 def run_validation_loop(self, validation: ValidationConfig, step: int) -> None:
