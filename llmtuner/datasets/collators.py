@@ -11,13 +11,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any, TypeAlias
 
 import torch
 
 from ..accelerator.device import should_use_pin_memory
 from ..components.loss import IGNORE_INDEX
-from .contracts import DatasetBuildContext, TextSequence
+from .contracts import DatasetBuildContext, TextSequence, require_positive
 
 __all__ = ["Collator", "HAS_PIN_MEMORY", "TextCollator", "TrainerBatch"]
 
@@ -114,4 +115,53 @@ class TextCollator(Collator):
             "positions": positions,
             "padding_mask": padding_mask,
             "num_valid_tokens": int((labels != IGNORE_INDEX).sum()),
+        }
+
+
+class PipelineTextCollator(Collator):
+    """Group independently packed rows into one pipeline schedule step."""
+
+    def __init__(self, *, context: DatasetBuildContext, num_microbatches: int) -> None:
+        require_positive("num_microbatches", num_microbatches)
+        if context.num_tokens_per_batch % num_microbatches:
+            raise ValueError("token batch must be divisible by num_microbatches")
+        self._num_microbatches = num_microbatches
+        self._max_context_length = context.max_context_length
+        self._collator = TextCollator(
+            context=replace(
+                context,
+                num_tokens_per_batch=context.num_tokens_per_batch // num_microbatches,
+            )
+        )
+
+    def num_rows_per_batch(self) -> int:
+        return self._num_microbatches
+
+    def __call__(self, rows: Sequence[TextSequence]) -> TrainerBatch:
+        if not 0 < len(rows) <= self._num_microbatches:
+            raise ValueError("pipeline batch must contain 1..num_microbatches rows")
+        batches = [self._collator([row]) for row in rows]
+        # Finite validation may end before a complete schedule step. Keep the
+        # schedule shapes fixed with fully masked rows, without repeating data.
+        if len(batches) < self._num_microbatches:
+            template = batches[0]
+            for _ in range(self._num_microbatches - len(batches)):
+                padding = {
+                    key: torch.zeros_like(template[key])
+                    for key in ("input", "labels", "positions", "padding_mask")
+                }
+                padding["labels"].fill_(IGNORE_INDEX)
+                padding["padding_mask"].fill_(True)
+                padding["positions"].copy_(
+                    torch.arange(padding["positions"].numel())
+                    % self._max_context_length
+                )
+                padding["num_valid_tokens"] = 0
+                batches.append(padding)
+        return {
+            **{
+                key: torch.stack([batch[key] for batch in batches])
+                for key in ("input", "labels", "positions", "padding_mask")
+            },
+            "num_valid_tokens": sum(batch["num_valid_tokens"] for batch in batches),
         }

@@ -6,11 +6,13 @@ then construct the loader. Synthetic data bypasses tokenizer and packing setup.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING
 
 import grain.python as grain
 
-from .collators import TextCollator
+from .collators import PipelineTextCollator, TextCollator
 from .contracts import DatasetBuildContext, DatasetIterationPolicy
 from .dataloader import BaseDataLoader, GrainDataLoader
 from .packing import build_concat_then_split_packing, build_first_fit_packing
@@ -198,6 +200,16 @@ def build_dataloader(
         read_options=grain.ReadOptions(),
         max_num_documents=dataloader_config.max_num_documents,
     )
+    packing_context = context
+    if not is_multimodal and config.parallel.pipeline_parallel_size > 1:
+        num_microbatches = config.parallel.num_pp_microbatches
+        if num_tokens_per_batch % num_microbatches:
+            raise ValueError("token batch must be divisible by num_pp_microbatches")
+        if num_microbatches > 1:
+            packing_context = replace(
+                context, num_tokens_per_batch=num_tokens_per_batch // num_microbatches
+            )
+            collator = partial(PipelineTextCollator, num_microbatches=num_microbatches)
     # The iteration policy is spent here, on the graph it orders, rather than
     # handed down: the loader takes the built graph, so a policy on the loader
     # would be a parameter no line of it reads. What does reach the loader is
@@ -206,7 +218,7 @@ def build_dataloader(
     graph = build_packing(
         recipe,
         **packing_kwargs,
-        context=context,
+        context=packing_context,
         dataset_iteration_policy=DatasetIterationPolicy(
             seed=config.seed,
             shuffle=dataloader_config.shuffle,

@@ -16,7 +16,7 @@ there is what keeps ``loader.py`` free of a dependency on every concrete dataset
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import grain.python as grain
@@ -90,7 +90,7 @@ class GrainDataLoader(BaseDataLoader):
         tokenizer: BaseTokenizer,
         max_context_length: int,
         num_tokens_per_batch: int,
-        collator: type[Collator] = TextCollator,
+        collator: Callable[..., Collator] = TextCollator,
         repeat: bool = True,
         read_options: grain.ReadOptions | None = None,
         num_prefetch_batches: int = 2,
