@@ -8,27 +8,56 @@ policy are adapted from torchtitan ``components/data/types.py``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, TypeAlias
 
 import grain.python as grain
 import numpy as np
 import torch
+from torch.distributed.checkpoint.stateful import Stateful
 
 from ..components.tokenizer.base import BaseTokenizer
 
 __all__ = [
+    "BaseDataLoader",
     "Batch",
+    "DataloaderExhaustedError",
     "DatasetBuildContext",
     "DatasetIterationPolicy",
+    "GrainDataset",
     "SampleProcessor",
+    "SampleProcessorFactory",
     "TextSequence",
-    "require_positive",
+    "TrainerBatch",
+    "require_positive_integer",
+    "require_same_dp_degree",
+    "validate_dp_coordinates",
 ]
 
+# Model inputs, aligned labels, and num_valid_tokens metadata. Collators count
+# valid labels while constructing batches; the trainer removes this count
+# before model preprocessing. Synthetic Batch targets are shifted separately.
+TrainerBatch: TypeAlias = dict[str, Any]
+GrainDataset: TypeAlias = grain.MapDataset | grain.IterDataset
 
-def require_positive(name: str, value: int) -> None:
-    """Raise unless ``value`` is positive, naming ``name``.
+
+class DataloaderExhaustedError(Exception):
+    """Signal exhausted training data without PEP 479's StopIteration wrapping."""
+
+
+class BaseDataLoader(Stateful, ABC):
+    """Checkpointable batch iterator with optional resource cleanup."""
+
+    @abstractmethod
+    def __iter__(self) -> Iterator[Batch | TrainerBatch]: ...
+
+    def close(self) -> None:
+        pass
+
+
+def require_positive_integer(name: str, value: int) -> None:
+    """Require a positive integer size, rejecting booleans and non-integers.
 
     The data pipeline's one shape check, shared by the dataclasses below and by
     the builders that take the same numbers as plain parameters (the loader's
@@ -37,8 +66,32 @@ def require_positive(name: str, value: int) -> None:
     with the message text spelled out at each site, so the wording could drift
     between the two entry points for the same value.
     """
-    if value <= 0:
-        raise ValueError(f"{name} must be positive, got {value}")
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be positive integer, got {value!r}")
+
+
+def require_same_dp_degree(saved_dp_world_size: int, dp_world_size: int) -> None:
+    """Reject checkpoint slices written under another data-parallel degree."""
+    require_positive_integer("checkpoint dp_world_size", saved_dp_world_size)
+    if saved_dp_world_size != dp_world_size:
+        raise ValueError(
+            "cannot resume after changing the effective data-parallel degree, "
+            f"checkpoint has dp_world_size={saved_dp_world_size}, "
+            f"current run has dp_world_size={dp_world_size}"
+        )
+
+
+def validate_dp_coordinates(*, dp_rank: int, dp_world_size: int) -> None:
+    """Validate integer rank ownership before constructing a data stream."""
+    require_positive_integer("dp_world_size", dp_world_size)
+    if (
+        not isinstance(dp_rank, int)
+        or isinstance(dp_rank, bool)
+        or not 0 <= dp_rank < dp_world_size
+    ):
+        raise ValueError(
+            f"dp_rank must be an integer in [0, {dp_world_size}), got {dp_rank!r}"
+        )
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -52,10 +105,10 @@ class DatasetBuildContext:
     max_num_documents: int | None = None
 
     def __post_init__(self) -> None:
-        require_positive("max_context_length", self.max_context_length)
-        require_positive("num_tokens_per_batch", self.num_tokens_per_batch)
+        require_positive_integer("max_context_length", self.max_context_length)
+        require_positive_integer("num_tokens_per_batch", self.num_tokens_per_batch)
         if self.max_num_documents is not None:
-            require_positive("max_num_documents", self.max_num_documents)
+            require_positive_integer("max_num_documents", self.max_num_documents)
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -70,12 +123,12 @@ class DatasetIterationPolicy:
     streaming_shuffle_buffer_size: int
 
     def __post_init__(self) -> None:
-        require_positive("dp_world_size", self.dp_world_size)
-        if not 0 <= self.dp_rank < self.dp_world_size:
-            raise ValueError(
-                f"dp_rank must be in [0, {self.dp_world_size}), got {self.dp_rank}"
-            )
-        require_positive(
+        for name in ("shuffle", "repeat"):
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be bool, got {value!r}")
+        validate_dp_coordinates(dp_rank=self.dp_rank, dp_world_size=self.dp_world_size)
+        require_positive_integer(
             "streaming_shuffle_buffer_size", self.streaming_shuffle_buffer_size
         )
 
@@ -141,3 +194,13 @@ class SampleProcessor(ABC):
         sample: Any,
         rng: np.random.Generator,
     ) -> Any: ...
+
+
+class SampleProcessorFactory(Protocol):
+    """Create a row processor with the current dataset build context.
+
+    Processor classes and partials binding processor options both satisfy this
+    contract. Leave ``context`` unbound; dataset construction supplies it.
+    """
+
+    def __call__(self, *, context: DatasetBuildContext) -> SampleProcessor: ...

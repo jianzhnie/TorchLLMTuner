@@ -11,20 +11,22 @@ import torch
 
 from ...components.loss import IGNORE_INDEX
 from ..composition import (
-    DatasetConcat,
-    DatasetMix,
-    SingleDataset,
+    DatasetRecipe,
     as_iter_dataset,
     build_dataset,
 )
-from ..contracts import DatasetBuildContext, DatasetIterationPolicy, require_positive
+from ..contracts import (
+    DatasetBuildContext,
+    DatasetIterationPolicy,
+    require_positive_integer,
+)
 
 
 def build_multimodal_packing(
-    dataset: SingleDataset | DatasetMix | DatasetConcat,
+    dataset: DatasetRecipe,
     *,
     context: DatasetBuildContext,
-    dataset_iteration_policy: DatasetIterationPolicy,
+    iteration_policy: DatasetIterationPolicy,
     num_packing_bins: int = 8,
 ) -> grain.IterDataset[dict[str, Any]]:
     """Pack whole multimodal documents into fixed-length rows.
@@ -36,12 +38,12 @@ def build_multimodal_packing(
     ``num_packing_bins`` is how many candidate rows are kept open; more bins can
     reduce padding, but retain more media.
     """
-    require_positive("num_packing_bins", num_packing_bins)
+    require_positive_integer("num_packing_bins", num_packing_bins)
 
     dataset_graph = build_dataset(
         dataset,
         context=context,
-        dataset_iteration_policy=dataset_iteration_policy,
+        iteration_policy=iteration_policy,
     )
     dataset_graph = dataset_graph.filter(
         lambda sample: len(sample["input_ids"]) <= context.max_context_length
@@ -63,14 +65,15 @@ def build_multimodal_packing(
             "positions": 0,
         },
         num_packing_bins=num_packing_bins,
+        max_sequences_per_bin=context.max_num_documents,
         meta_features=(
             "labels",
             "positions",
             "pixel_values",
             "pixel_values_videos",
         ),
-        seed=dataset_iteration_policy.seed,
-        shuffle_bins=dataset_iteration_policy.shuffle,
+        seed=iteration_policy.seed,
+        shuffle_bins=iteration_policy.shuffle,
     )
     return dataset_graph.map(
         partial(
@@ -96,8 +99,10 @@ def packing_output_to_multimodal_sample(
     *,
     max_context_length: int,
 ) -> dict[str, Any]:
-    """Restore Torch token fields and flatten per-document media lists."""
+    """Mask packing padding, restore tensors, and flatten document media."""
     padding_mask = np.asarray(packing_output["input_ids_segment_ids"]) == 0
+    labels = np.asarray(packing_output["labels"]).copy()
+    labels[padding_mask] = IGNORE_INDEX
     positions = np.asarray(packing_output["positions"]).copy()
     if np.any(padding_mask):
         first_padding_token = int(np.flatnonzero(padding_mask)[0])
@@ -106,7 +111,7 @@ def packing_output_to_multimodal_sample(
         )
     return {
         "input_ids": torch.from_numpy(packing_output["input_ids"]),
-        "labels": torch.from_numpy(packing_output["labels"]),
+        "labels": torch.from_numpy(labels),
         "positions": torch.from_numpy(positions),
         "padding_mask": torch.from_numpy(padding_mask),
         "pixel_values": [

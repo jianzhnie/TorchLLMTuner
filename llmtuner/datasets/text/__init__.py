@@ -1,10 +1,6 @@
-"""Text dataset recipes.
+"""Text data: sample processors, dataset recipes and chat renderers.
 
-Deliberately empty of imports. ``processors.py`` defines the recipes themselves,
-and re-exporting it here would make ``import llmtuner.datasets.text`` alone pull
-in ``datasets``/``tokenizers``/``jinja2`` -- the assets the parent package keeps
-off its own surface. Callers import the concrete module
-(``llmtuner.datasets.text.processors``) or, more usually, go through
-``build_dataloader``, which imports it lazily because a run that overrides
-``dataset`` never consults a recipe at all.
+Import concrete modules to avoid loading optional tokenizer and renderer
+assets when importing this package. Recipes live in ``recipes.py``;
+sample tokenization and supervision live in ``processors.py``.
 """

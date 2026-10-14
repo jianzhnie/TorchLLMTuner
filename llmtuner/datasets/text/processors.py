@@ -1,4 +1,4 @@
-"""Text dataset recipes: plain-text and single-turn chat.
+"""Text sample processing: plain text and supervised chat.
 
 Vendored from torchtitan ``hf_datasets/text_datasets.py``. A processor is
 constructed with its build context and takes the few per-dataset knobs
@@ -24,23 +24,13 @@ from llmtuner.errors import ConfigError
 
 from ...components.loss import IGNORE_INDEX
 from ...utils.logging import get_logger
-from ..composition import SingleDataset, is_not_none
 from ..contracts import DatasetBuildContext, SampleProcessor, TextSequence
-from ..sources import (
-    HuggingFaceRandomAccessSource,
-    HuggingFaceStreamingSource,
-    IndexedJsonlSource,
-)
 
 logger = get_logger(__name__)
 
 __all__ = [
     "ChatProcessor",
-    "DATASETS",
     "TextProcessor",
-    "make_local_jsonl",
-    "make_local_jsonl_sft",
-    "make_local_jsonl_sft_multiturn",
 ]
 
 
@@ -283,125 +273,3 @@ class ChatProcessor(SampleProcessor):
         if self._renderer is not None:
             return self._tokenize_with_renderer(self._messages_fn(sample))
         return self._tokenize_sample(sample)
-
-
-def local_jsonl_recipe(*, path: str, processor: type[SampleProcessor]) -> SingleDataset:
-    """One indexed JSONL file, read through ``processor``.
-
-    The three ``local_jsonl*`` factories differ only in the processor: same
-    source, same "a processor drops a row by returning ``None``" filter. Built
-    here so a new variant cannot forget either half.
-    """
-    return SingleDataset(
-        source=IndexedJsonlSource(patterns=(path,)),
-        processor=processor,
-        post_filters=(is_not_none,),
-    )
-
-
-def make_local_jsonl(*, path: str) -> SingleDataset:
-    """Build the ``local_jsonl`` recipe over a caller-supplied corpus.
-
-    A function rather than an entry in :data:`DATASETS`: the path is a runtime
-    argument, so it cannot live in a module-level dict without a global.
-    """
-    return local_jsonl_recipe(path=path, processor=TextProcessor)
-
-
-def make_local_jsonl_sft(
-    *, path: str, prompt_field: str, response_field: str
-) -> SingleDataset:
-    """Build a single-turn supervised-chat recipe from a local JSONL file."""
-
-    class _LocalJsonlChatProcessor(ChatProcessor):
-        def __init__(self, *, context: DatasetBuildContext) -> None:
-            def messages(sample: dict[str, Any]) -> list[dict[str, str]]:
-                try:
-                    prompt = sample[prompt_field]
-                    response = sample[response_field]
-                except KeyError as exc:
-                    raise KeyError(
-                        f"local_jsonl_sft row lacks configured field {exc.args[0]!r}"
-                    ) from exc
-                if not isinstance(prompt, str) or not isinstance(response, str):
-                    raise TypeError(
-                        "local_jsonl_sft prompt and response fields must be strings"
-                    )
-                return [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": response},
-                ]
-
-            super().__init__(context=context, messages_fn=messages)
-
-    return local_jsonl_recipe(path=path, processor=_LocalJsonlChatProcessor)
-
-
-def make_local_jsonl_sft_multiturn(
-    *, path: str, messages_field: str, renderer: Any
-) -> SingleDataset:
-    """Build a multi-turn supervised-chat recipe from a local JSONL file.
-
-    Each row's ``messages_field`` holds the conversation as a list of
-    ``{"role": ..., "content": ...}`` messages ending with an assistant
-    turn. ``renderer`` is a built ``renderers`` renderer (see
-    ``datasets/text/renderer.build_chat_renderer``); it owns tokenization and
-    the per-turn loss mask.
-    """
-
-    class _LocalJsonlMultiTurnChatProcessor(ChatProcessor):
-        def __init__(self, *, context: DatasetBuildContext) -> None:
-            def messages(sample: dict[str, Any]) -> list[dict[str, str]]:
-                try:
-                    conversation = sample[messages_field]
-                except KeyError as exc:
-                    raise KeyError(
-                        "local_jsonl_sft row lacks configured messages field "
-                        f"{exc.args[0]!r}"
-                    ) from exc
-                if not isinstance(conversation, list) or not all(
-                    isinstance(message, dict) and "role" in message
-                    for message in conversation
-                ):
-                    raise TypeError(
-                        "local_jsonl_sft messages field must be a list of "
-                        "message dicts with a 'role' key"
-                    )
-                return conversation
-
-            super().__init__(context=context, messages_fn=messages, renderer=renderer)
-
-    return local_jsonl_recipe(path=path, processor=_LocalJsonlMultiTurnChatProcessor)
-
-
-DATASETS: dict[str, SingleDataset] = {
-    "c4": SingleDataset(
-        source=HuggingFaceStreamingSource(
-            path="allenai/c4",
-            name="en",
-            split="train",
-        ),
-        processor=TextProcessor,
-        post_filters=(is_not_none,),
-    ),
-    "c4_test": SingleDataset(
-        source=HuggingFaceRandomAccessSource(
-            path="json",
-            split="train",
-            load_dataset_kwargs={
-                "data_files": "tests/assets/c4_test/data.json",
-            },
-        ),
-        processor=TextProcessor,
-        post_filters=(is_not_none,),
-    ),
-    "c4_validation": SingleDataset(
-        source=HuggingFaceStreamingSource(
-            path="allenai/c4",
-            name="en",
-            split="validation",
-        ),
-        processor=TextProcessor,
-        post_filters=(is_not_none,),
-    ),
-}

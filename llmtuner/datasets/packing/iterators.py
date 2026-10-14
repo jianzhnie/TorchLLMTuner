@@ -14,7 +14,7 @@ import grain.python as grain
 import numpy as np
 
 from ...components.loss import IGNORE_INDEX
-from ..contracts import TextSequence, require_positive
+from ..contracts import TextSequence, require_positive_integer
 
 
 class DocumentAwareConcatThenSplitIterDataset(grain.IterDataset):
@@ -28,9 +28,9 @@ class DocumentAwareConcatThenSplitIterDataset(grain.IterDataset):
         max_context_length: int,
         num_tokens_per_row: int,
     ) -> None:
-        require_positive("max_num_documents_per_row", max_num_documents_per_row)
-        require_positive("max_context_length", max_context_length)
-        require_positive("num_tokens_per_row", num_tokens_per_row)
+        require_positive_integer("max_num_documents_per_row", max_num_documents_per_row)
+        require_positive_integer("max_context_length", max_context_length)
+        require_positive_integer("num_tokens_per_row", num_tokens_per_row)
         super().__init__(parent)
         self._max_num_documents_per_row = max_num_documents_per_row
         self._max_context_length = max_context_length
@@ -56,9 +56,9 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
         max_context_length: int,
         num_tokens_per_row: int,
     ) -> None:
-        require_positive("max_num_documents_per_row", max_num_documents_per_row)
-        require_positive("max_context_length", max_context_length)
-        require_positive("num_tokens_per_row", num_tokens_per_row)
+        require_positive_integer("max_num_documents_per_row", max_num_documents_per_row)
+        require_positive_integer("max_context_length", max_context_length)
+        require_positive_integer("num_tokens_per_row", num_tokens_per_row)
         super().__init__(parent)
         self._max_num_documents_per_row = max_num_documents_per_row
         self._max_context_length = max_context_length
@@ -86,12 +86,11 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             segment = self._take_segment(self._num_tokens_per_row - num_tokens)
             if segment is None:
                 break
-            input_seg, label_seg, position_seg, mask_seg = segment
-            input_parts.append(input_seg)
-            label_parts.append(label_seg)
-            position_parts.append(position_seg)
-            mask_parts.append(mask_seg)
-            num_tokens += len(input_seg)
+            input_parts.append(segment.input_ids)
+            label_parts.append(segment.labels)
+            position_parts.append(segment.positions)
+            mask_parts.append(segment.padding_mask)
+            num_tokens += len(segment.input_ids)
 
         if not input_parts:
             raise StopIteration
@@ -117,12 +116,10 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             padding_mask=padding_mask,
         )
 
-    def _take_segment(
-        self, available_tokens: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    def _take_segment(self, available_tokens: int) -> TextSequence | None:
         """Cut the next document-bounded segment off the remainder stream.
 
-        Returns ``(input_ids, labels, positions, padding_mask)`` for the
+        Returns a sequence with explicit positions and padding mask for the
         segment, or ``None`` when the parent iterator is exhausted
         (``self._finished`` set). Empty sequences are skipped internally.
         """
@@ -172,11 +169,11 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             self._remainder = None
             self._remainder_parent_state = None
             self._remainder_offset = 0
-        return (
-            np.asarray(sequence.input_ids[token_slice]),
-            np.asarray(sequence.labels[token_slice]),
-            np.arange(num_segment_tokens, dtype=np.int64),
-            mask_seg,
+        return TextSequence(
+            input_ids=np.asarray(sequence.input_ids[token_slice]),
+            labels=np.asarray(sequence.labels[token_slice]),
+            positions=np.arange(num_segment_tokens, dtype=np.int64),
+            padding_mask=mask_seg,
         )
 
     def get_state(self) -> dict[str, Any]:
@@ -193,24 +190,45 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
         }
 
     def set_state(self, state: dict[str, Any]) -> None:
-        self._parent.set_state(state["parent"])
-        self._remainder = None
-        self._remainder_parent_state = None
-        self._remainder_offset = 0
-        self._finished = state["finished"]
-        if state["has_remainder"]:
-            self._remainder_parent_state = state["parent"]
-            try:
-                self._remainder = next(self._parent)
-            except StopIteration:
-                # The recorded remainder came from the parent's last element:
-                # the state restored above is already past it, so there is no
-                # remainder to rebuild -- the next __next__ simply raises.
-                self._remainder = None
-                self._remainder_parent_state = None
-                self._finished = True
-                return
-            self._remainder_offset = state["remainder_offset"]
+        has_remainder = state["has_remainder"]
+        finished = state["finished"]
+        offset = state["remainder_offset"]
+        if not isinstance(has_remainder, bool) or not isinstance(finished, bool):
+            raise ValueError("packing checkpoint flags must be booleans")
+        if (
+            not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+            or (not has_remainder and offset != 0)
+            or (has_remainder and finished)
+        ):
+            raise ValueError("packing checkpoint has inconsistent remainder state")
+        previous_parent_state = self._parent.get_state()
+        remainder = None
+        try:
+            self._parent.set_state(state["parent"])
+            if has_remainder:
+                try:
+                    remainder = next(self._parent)
+                except StopIteration as error:
+                    raise ValueError(
+                        "packing checkpoint remainder is missing from the parent source"
+                    ) from error
+                if not 0 < offset < len(remainder.input_ids):
+                    raise ValueError(
+                        "packing checkpoint remainder offset is outside "
+                        "the restored sample"
+                    )
+        except Exception:
+            # Replaying the remainder advances the parent. Invalid state must
+            # not change the live stream's next token or consume its sample.
+            self._parent.set_state(previous_parent_state)
+            raise
+
+        self._remainder = remainder
+        self._remainder_parent_state = state["parent"] if has_remainder else None
+        self._remainder_offset = offset
+        self._finished = finished
 
 
 class SplitTextSequenceDocuments(grain.experimental.FlatMapTransform):
@@ -221,7 +239,7 @@ class SplitTextSequenceDocuments(grain.experimental.FlatMapTransform):
         *,
         max_context_length: int,
     ) -> None:
-        require_positive("max_context_length", max_context_length)
+        require_positive_integer("max_context_length", max_context_length)
         self._max_context_length = max_context_length
         self.max_fan_out = max_context_length
 

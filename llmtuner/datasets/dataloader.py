@@ -15,67 +15,29 @@ there is what keeps ``loader.py`` free of a dependency on every concrete dataset
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from typing import Any
 
 import grain.python as grain
 from grain import experimental as grain_experimental
-from torch.distributed.checkpoint.stateful import Stateful
 
-from ..components.tokenizer import BaseTokenizer
+from ..components.tokenizer.base import BaseTokenizer
 from ..utils.logging import get_logger
-from .collators import Collator, TextCollator, TrainerBatch
+from .collators import CollatorFactory, TextCollator
 from .composition import as_iter_dataset
-from .contracts import DatasetBuildContext, require_positive
+from .contracts import (
+    BaseDataLoader,
+    DatasetBuildContext,
+    GrainDataset,
+    TrainerBatch,
+    require_positive_integer,
+    require_same_dp_degree,
+    validate_dp_coordinates,
+)
 
 __all__ = [
-    "BaseDataLoader",
-    "DataloaderExhaustedError",
     "GrainDataLoader",
 ]
-
-
-# NOTE: This class deliberately inherits from `Exception` and not `StopIteration`.
-# According to PEP 479, raising a `StopIteration` or its subclass from within a
-# generator will wrap it in a `RuntimeError`. Since this exception is designed
-# to be raised from a generator-based dataloader and caught by the training loop,
-# inheriting from `StopIteration` would make it uncatchable and would crash the
-# program.
-# See: https://peps.python.org/pep-0479/
-class DataloaderExhaustedError(Exception):
-    """An exception that indicates dataloader exhaustion."""
-
-    pass
-
-
-def require_same_dp_degree(saved_dp_world_size: int, dp_world_size: int) -> None:
-    """Reject a resume whose checkpoint was written under another DP degree.
-
-    Every loader keys its saved state by the *global* batch's split, so a
-    different degree means the checkpoint describes a different slice layout:
-    resuming would train on a different sample split with nothing to show for it
-    (the loss is normalized by the same token count either way).
-
-    Lives here because this module owns the resume contract; the synthetic
-    loader implements the same one and was raising its own copy of the message.
-    """
-    if saved_dp_world_size != dp_world_size:
-        raise ValueError(
-            "cannot resume after changing the effective data-parallel degree, "
-            f"checkpoint has dp_world_size={saved_dp_world_size}, "
-            f"current run has dp_world_size={dp_world_size}"
-        )
-
-
-class BaseDataLoader(Stateful, ABC):
-    """Enforces the `Stateful`, `state_dict()`, and `load_state_dict()` contract."""
-
-    @abstractmethod
-    def __iter__(self) -> Iterator[TrainerBatch]: ...
-
-    def close(self) -> None:
-        pass
 
 
 class GrainDataLoader(BaseDataLoader):
@@ -83,54 +45,37 @@ class GrainDataLoader(BaseDataLoader):
 
     def __init__(
         self,
-        dataset: grain.MapDataset | grain.IterDataset,
+        dataset: GrainDataset,
         *,
         dp_world_size: int,
         dp_rank: int,
         tokenizer: BaseTokenizer,
         max_context_length: int,
         num_tokens_per_batch: int,
-        collator: Callable[..., Collator] = TextCollator,
+        collator: CollatorFactory = TextCollator,
         repeat: bool = True,
         read_options: grain.ReadOptions | None = None,
         num_prefetch_batches: int = 2,
         max_num_documents: int | None = None,
     ) -> None:
-        """``dataset`` is the built graph: which node it starts from decides
-        shuffle order, so it is built by the caller, not here.
+        """Batch an already composed graph without changing its data ownership.
 
-        Without a config there is no field list to declare, so this is the flat
-        version of one: everything the loader reads is a named argument and
-        nothing else is carried.
-
-        Upstream builds this graph here, from a ``DatasetIterationPolicy`` it
-        assembles on the spot. That is not available to us: building the
-        registry's recipes means importing the registry, which is the coupling
-        loader builder exists to absorb. The policy is spent when the caller
-        builds the graph, and only the
-        knobs the batching below actually reads -- ``repeat`` and the prefetch
-        depth -- arrive here. ``seed``, ``shuffle`` and the streaming window
-        describe order the graph has already fixed; a copy here would be a field
-        no line below reads.
-
-        ``read_options`` defaults to a fresh ``grain.ReadOptions`` rather than
-        being shared as a mutable default. ``max_num_documents`` is the maximum
-        non-padding document segments in one packed row (one microbatch under
-        pipeline parallelism); it is carried
-        into the build context for the packing nodes to read, and the collators
-        ignore it.
+        The builder owns shuffle, repetition and DP sharding. Here ``repeat``
+        controls dropping partial batches and the finite-DP safety check.
+        Runtime context configures the collator and map-to-iterator reads;
+        max_num_documents also belongs to the checkpoint's batch-layout identity.
+        Prefetch depth must be a positive integer, matching DataloaderConfig.
         """
-        if max_num_documents is not None:
-            require_positive("max_num_documents", max_num_documents)
+        validate_dp_coordinates(dp_rank=dp_rank, dp_world_size=dp_world_size)
+        require_positive_integer("num_prefetch_batches", num_prefetch_batches)
+        if not isinstance(repeat, bool):
+            raise TypeError(f"repeat must be bool, got {repeat!r}")
         if read_options is None:
             read_options = grain.ReadOptions()
-        # The graph is built before this loader exists and may already have been
-        # built for a different rank -- the trainer derives the policy from a
-        # config that is not handed here. Catch the mismatch rather than train
-        # on a slice that silently disagrees with the rest of the mesh.
-        expected_rank_id = f"dp_rank_{dp_rank}"
+        # Graph ownership is resolved by the builder. The loader records its
+        # rank for checkpoint lookup; it cannot infer ownership from a graph.
         self._dp_world_size = dp_world_size
-        self._rank_id = expected_rank_id
+        self._rank_id = f"dp_rank_{dp_rank}"
 
         # A finite dataset cannot be shared by several ranks: each one reaches
         # the end at a different step, and the ranks that ran out first stop
@@ -155,11 +100,13 @@ class GrainDataLoader(BaseDataLoader):
             max_num_documents=max_num_documents,
         )
 
-        collator = collator(context=context)
+        batch_collator = collator(context=context)
+        num_rows_per_batch = batch_collator.num_rows_per_batch()
+        require_positive_integer("num_rows_per_batch", num_rows_per_batch)
         self._batch_layout = {
             "num_tokens_per_batch": num_tokens_per_batch,
             "max_context_length": max_context_length,
-            "num_rows_per_batch": collator.num_rows_per_batch(),
+            "num_rows_per_batch": num_rows_per_batch,
             "max_num_documents": max_num_documents,
         }
 
@@ -173,9 +120,9 @@ class GrainDataLoader(BaseDataLoader):
 
         # Batch and collate samples.
         dataset = dataset.batch(
-            collator.num_rows_per_batch(),
+            num_rows_per_batch,
             drop_remainder=repeat,
-            batch_fn=collator,
+            batch_fn=batch_collator,
         )
 
         # Queue completed batches while the trainer consumes the previous batch.
@@ -198,17 +145,18 @@ class GrainDataLoader(BaseDataLoader):
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         if not state_dict:
             return
-        if state_dict["version"] != 1:
-            raise ValueError(
-                f"unsupported GrainDataLoader state version {state_dict['version']}"
-            )
-        require_same_dp_degree(state_dict["dp_world_size"], self._dp_world_size)
+        version = state_dict.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) or version != 1:
+            raise ValueError(f"unsupported GrainDataLoader state version {version!r}")
+        require_same_dp_degree(state_dict.get("dp_world_size"), self._dp_world_size)
         if self._rank_id not in state_dict:
             raise ValueError(
                 f"checkpoint is missing dataloader state for {self._rank_id}"
             )
         saved_layout = state_dict.get("batch_layout")
-        if saved_layout is not None and saved_layout != self._batch_layout:
+        if saved_layout is None:
+            raise ValueError("checkpoint is missing dataloader batch_layout")
+        if saved_layout != self._batch_layout:
             raise ValueError(
                 "cannot resume after changing dataloader batch layout: "
                 f"checkpoint has {saved_layout}, "

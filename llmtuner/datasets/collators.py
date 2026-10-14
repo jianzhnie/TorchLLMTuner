@@ -12,23 +12,21 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import Any, TypeAlias
+from typing import Any, Protocol
 
 import torch
 
 from ..accelerator.device import should_use_pin_memory
 from ..components.loss import IGNORE_INDEX
-from .contracts import DatasetBuildContext, TextSequence, require_positive
+from .contracts import (
+    DatasetBuildContext,
+    TextSequence,
+    TrainerBatch,
+    require_positive_integer,
+)
 
-__all__ = ["Collator", "HAS_PIN_MEMORY", "TextCollator", "TrainerBatch"]
+__all__ = ["Collator", "CollatorFactory", "HAS_PIN_MEMORY", "TextCollator"]
 
-
-# The input dict holds the model's forward kwargs, labels, and
-# ``num_valid_tokens``, the number of labels that contribute to the loss.
-# Collators over token labels count them here so the trainer does not rescan
-# every batch on the critical path; the trainer pops the count before the batch
-# reaches the model.
-TrainerBatch: TypeAlias = dict[str, Any]
 
 # Page-locked batches let the trainer issue an async host-to-device copy; a copy
 # out of pageable memory is synchronous whatever ``non_blocking`` says. There has
@@ -48,6 +46,12 @@ class Collator(ABC):
         return 1
 
 
+class CollatorFactory(Protocol):
+    """Construct a collator after recipe-specific options have been bound."""
+
+    def __call__(self, *, context: DatasetBuildContext) -> Collator: ...
+
+
 class TextCollator(Collator):
     """Packs text rows into one page-locked, pre-padded token batch."""
 
@@ -56,6 +60,8 @@ class TextCollator(Collator):
         self._max_context_length = context.max_context_length
 
     def __call__(self, rows: Sequence[TextSequence]) -> TrainerBatch:
+        if not rows:
+            raise ValueError("text batch must contain at least one row")
         num_tokens = sum(len(row.input_ids) for row in rows)
         if num_tokens > self._num_tokens_per_batch:
             raise ValueError("text rows exceed the configured token batch")
@@ -122,7 +128,7 @@ class PipelineTextCollator(Collator):
     """Group independently packed rows into one pipeline schedule step."""
 
     def __init__(self, *, context: DatasetBuildContext, num_microbatches: int) -> None:
-        require_positive("num_microbatches", num_microbatches)
+        require_positive_integer("num_microbatches", num_microbatches)
         if context.num_tokens_per_batch % num_microbatches:
             raise ValueError("token batch must be divisible by num_microbatches")
         self._num_microbatches = num_microbatches

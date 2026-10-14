@@ -1,58 +1,29 @@
-"""The data iterator the training loop pulls micro-batches from.
+"""Deterministic synthetic token batches and a checkpointable DP loader.
 
-Vendored in shape from torchtitan ``trainer.py:batch_generator``, and from the
-``components/data`` contract it satisfies. What is kept is the *contract*, not
-the data source:
-
-* :class:`~llmtuner.datasets.dataloader.DataloaderExhaustedError` is raised, not
-  swallowed. Running out of data
-  mid-step cancels the whole step rather than training on a partial batch, so
-  the training loop can catch it and stop cleanly.
-* The iterator is infinite from the loop's point of view: a finite source is
-  restarted, an empty one raises immediately rather than spinning forever.
-
-What is not kept: llmtuner has no collator or ``max_num_documents`` here. The
-source shipped in this module is synthetic random tokens; the real corpus lives
-behind the Grain dataset graph in ``dataloader.py``. Both satisfy
-:class:`~llmtuner.datasets.dataloader.BaseDataLoader`, so the training loop has one
-path rather than two.
+RandomTokenSource generates each global batch from its seed and absolute index.
+RandomTokenDataLoader slices rows for DP ownership and checkpoints the index.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from typing import Any
 
 import torch
 
-from .contracts import Batch, require_positive
-from .dataloader import BaseDataLoader, DataloaderExhaustedError, require_same_dp_degree
+from .contracts import (
+    BaseDataLoader,
+    Batch,
+    require_positive_integer,
+    require_same_dp_degree,
+    validate_dp_coordinates,
+)
 
 __all__ = [
     "Batch",
     "RandomTokenDataLoader",
     "RandomTokenSource",
-    "batch_iterator",
 ]
-
-
-def batch_iterator(source: Iterable[Batch]) -> Iterator[Batch]:
-    """Yield batches forever, restarting a finite source.
-
-    Every batch is yielded on CPU. The caller moves it to the device: keeping the
-    move outside the iterator is what lets the trainer overlap it with gradient
-    accumulation instead of blocking the fetch on a host-to-device copy.
-    """
-    while True:
-        exhausted = True
-        for batch in source:
-            exhausted = False
-            yield batch
-        if exhausted:
-            # Without this, an empty source would spin here forever.
-            raise DataloaderExhaustedError(
-                "The data source yielded nothing; there is no batch to train on."
-            )
 
 
 class RandomTokenSource:
@@ -66,16 +37,23 @@ class RandomTokenSource:
     def __init__(
         self, *, seed: int, vocab_size: int, batch_size: int, seq_len: int
     ) -> None:
-        require_positive("vocab_size", vocab_size)
-        require_positive("batch_size", batch_size)
-        require_positive("seq_len", seq_len)
+        require_positive_integer("vocab_size", vocab_size)
+        require_positive_integer("batch_size", batch_size)
+        require_positive_integer("seq_len", seq_len)
         self.seed = seed
         self.vocab_size = vocab_size
         self.batch_size = batch_size
         self.seq_len = seq_len
 
     def __iter__(self) -> Iterator[Batch]:
-        step = 0
+        return self.iter_from(0)
+
+    def iter_from(self, step: int) -> Iterator[Batch]:
+        """Generate the deterministic stream starting at an absolute batch index."""
+        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+            raise ValueError(
+                f"synthetic source step must be a nonnegative integer, got {step!r}"
+            )
         while True:
             # A fresh generator per step, so the sequence is reproducible from
             # (seed, step) alone with no dependence on how many steps ran before.
@@ -121,9 +99,10 @@ class RandomTokenDataLoader(BaseDataLoader):
         dp_rank: int = 0,
         dp_world_size: int = 1,
     ) -> None:
-        require_positive("dp_world_size", dp_world_size)
-        if not 0 <= dp_rank < dp_world_size:
-            raise ValueError(f"dp_rank must be in [0, {dp_world_size}), got {dp_rank}")
+        validate_dp_coordinates(dp_rank=dp_rank, dp_world_size=dp_world_size)
+        source = RandomTokenSource(
+            seed=seed, vocab_size=vocab_size, batch_size=batch_size, seq_len=seq_len
+        )
         if batch_size % dp_world_size != 0:
             raise ValueError(
                 f"batch_size={batch_size} not divisible by "
@@ -132,25 +111,17 @@ class RandomTokenDataLoader(BaseDataLoader):
         self._dp_world_size = dp_world_size
         self._dp_rank = dp_rank
         self._rows_per_rank = batch_size // dp_world_size
-        self._source = RandomTokenSource(
-            seed=seed, vocab_size=vocab_size, batch_size=batch_size, seq_len=seq_len
-        )
-        self._iterator = self._slice_each(batch_iterator(self._source))
-        # The position in the global stream: how many batches this loader has
-        # consumed, by training or by resuming alike. The source is a pure
-        # function of ``(seed, step)`` and cannot restart from an arbitrary
-        # cursor -- Grain derives such a cursor from the index, but a plain
-        # generator does not -- so this count is both what a checkpoint saves
-        # and how far a resume replays.
-        #
-        # Deliberately *not* the number of batches ``__iter__`` has handed out:
-        # a resume seeks by replaying, and resetting that count would make the
-        # next checkpoint report a position relative to the resume -- so the
-        # resume after that would rewind to it.
+        self._source = source
+        self._iterator = self._slice_each(iter(self._source))
+        # Absolute global batch cursor, independent of DP slicing. Each batch is
+        # reproducible from (seed, step), so restoring it needs no replay.
         self._position = 0
 
     def __iter__(self) -> Iterator[Batch]:
-        for batch in self._iterator:
+        while True:
+            # Read the current stream each time: restoring a cursor must also
+            # take effect for an iterator already held by the training loop.
+            batch = next(self._iterator)
             self._position += 1
             yield batch
 
@@ -194,13 +165,7 @@ class RandomTokenDataLoader(BaseDataLoader):
                 f"cannot resume at batch {resume_at}: this loader has already "
                 f"yielded {self._position}. A fresh loader is required."
             )
-        # This loader cannot seek, so a replay from the start is the only way
-        # to reach ``resume_at``: a checkpoint must be loaded into a FRESH
-        # loader. Drain the difference, not ``resume_at``, so a resume onto a
-        # loader that has already seeked stops at the absolute position rather
-        # than overshooting by however far it had seeked already.
-        for _ in range(resume_at - self._position):
-            next(self._iterator)
+        self._iterator = self._slice_each(self._source.iter_from(resume_at))
         self._position = resume_at
 
     def _slice_each(self, batches: Iterator[Batch]) -> Iterator[Batch]:

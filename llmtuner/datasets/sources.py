@@ -7,17 +7,11 @@ llmtuner uses (``llmtuner/config/``: configs are descriptions, not builders), an
 it is what lets a dataset catalog hold sources at module scope without touching
 the filesystem or the Hub: constructing one resolves nothing.
 
-Note the asymmetry, which is deliberate and load-bearing: the two Hugging Face
-sources take ``dataset_iteration_policy`` and ignore it, while the streaming one
-shards by it. ``split_dataset_by_node`` is what gives each DP rank a disjoint
-stream; the random-access and JSONL sources leave sharding to
-:func:`~llmtuner.datasets.composition.build_dataset`, which slices after the shuffle.
-Sharding twice would drop rows.
+Random-access sources leave DP sharding to composition.build_dataset, after
+shuffle. Streaming sources use split_dataset_by_node before window shuffle.
+Built random-access objects and Grain streams pass through unchanged. Unsupported
+source objects raise TypeError at construction.
 
-A source slot takes either a description -- one of the three classes below -- or
-an already-built node, and :func:`build_source` dispatches on the concrete class
-rather than a method. That is what the union in its signature spells out, and it
-is why an unhandled source is a type error rather than a runtime one.
 """
 
 from __future__ import annotations
@@ -27,7 +21,7 @@ import json
 from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypeAlias, runtime_checkable
 
 import datasets
 import grain.python as grain
@@ -36,6 +30,7 @@ from datasets.distributed import split_dataset_by_node
 from .contracts import DatasetIterationPolicy
 
 __all__ = [
+    "DatasetSource",
     "HuggingFaceRandomAccessSource",
     "HuggingFaceStreamingSource",
     "IndexedJsonlSource",
@@ -108,12 +103,18 @@ class IndexedJsonlDataSource:
         path = self._paths[self._path_ids[index]]
         with open(path, "rb") as file:
             file.seek(self._byte_offsets[index])
-            return json.loads(file.readline())
+            row = json.loads(file.readline())
+        if not isinstance(row, dict):
+            raise ValueError(
+                f"JSONL row {index} in {path!r} must be a JSON object; "
+                f"got {type(row).__name__}"
+            )
+        return row
 
 
 def reject_duplicated_hf_fields(load_dataset_kwargs: dict[str, Any]) -> None:
     """Refuse kwargs that shadow the sources' first-class Hugging Face fields."""
-    duplicated = {"split", "name", "revision", "streaming"} & (
+    duplicated = {"path", "split", "name", "revision", "streaming"} & (
         load_dataset_kwargs.keys()
     )
     if duplicated:
@@ -123,8 +124,8 @@ def reject_duplicated_hf_fields(load_dataset_kwargs: dict[str, Any]) -> None:
 
 
 @dataclass(kw_only=True)
-class HuggingFaceRandomAccessSource:
-    """Provides random access to a materialized Hugging Face dataset."""
+class _HuggingFaceSource:
+    """Shared inert Hugging Face loading options and explicit-field validation."""
 
     path: str
     split: str
@@ -134,6 +135,11 @@ class HuggingFaceRandomAccessSource:
 
     def __post_init__(self) -> None:
         reject_duplicated_hf_fields(self.load_dataset_kwargs)
+
+
+@dataclass(kw_only=True)
+class HuggingFaceRandomAccessSource(_HuggingFaceSource):
+    """Provides random access to a materialized Hugging Face dataset."""
 
 
 class HuggingFaceRandomAccessDataSource:
@@ -151,7 +157,7 @@ class HuggingFaceRandomAccessDataSource:
 
 
 @dataclass(kw_only=True)
-class HuggingFaceStreamingSource:
+class HuggingFaceStreamingSource(_HuggingFaceSource):
     """Provides a DP-sharded Hugging Face stream with cursor checkpointing.
 
     The dataset is *not* loaded here. A dataset catalog holds these at module
@@ -159,26 +165,21 @@ class HuggingFaceStreamingSource:
     Hub; :func:`build_source` is what resolves and splits the stream.
     """
 
-    path: str
-    split: str
-    name: str | None = None
-    revision: str | None = None
-    load_dataset_kwargs: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        reject_duplicated_hf_fields(self.load_dataset_kwargs)
+DatasetSource: TypeAlias = (
+    IndexedJsonlSource
+    | HuggingFaceRandomAccessSource
+    | HuggingFaceStreamingSource
+    | RandomAccessDataSource
+    | grain.IterDataset
+)
+"""An inert source description or an already readable dataset source."""
 
 
 def build_source(
-    source: (
-        IndexedJsonlSource
-        | HuggingFaceRandomAccessSource
-        | HuggingFaceStreamingSource
-        | RandomAccessDataSource
-        | grain.IterDataset
-    ),
+    source: DatasetSource,
     *,
-    dataset_iteration_policy: DatasetIterationPolicy,
+    iteration_policy: DatasetIterationPolicy,
 ) -> RandomAccessDataSource | grain.IterDataset:
     """Resolve ``source`` into something Grain can read.
 
@@ -197,30 +198,26 @@ def build_source(
     """
     if isinstance(source, IndexedJsonlSource):
         return IndexedJsonlDataSource(source.patterns)
-    if isinstance(source, HuggingFaceRandomAccessSource):
+    if isinstance(source, HuggingFaceRandomAccessSource | HuggingFaceStreamingSource):
+        # Descriptions are mutable: recheck options at the point of use so
+        # edits after construction cannot bypass the explicit-field contract.
+        reject_duplicated_hf_fields(source.load_dataset_kwargs)
+        streaming = isinstance(source, HuggingFaceStreamingSource)
         dataset = datasets.load_dataset(
             source.path,
             name=source.name,
             split=source.split,
             revision=source.revision,
-            streaming=False,
+            streaming=streaming,
             **source.load_dataset_kwargs,
         )
-        if not isinstance(dataset, datasets.Dataset):
-            raise TypeError(
-                "random-access Hugging Face source requires one Dataset; "
-                f"got {type(dataset).__qualname__}"
-            )
-        return HuggingFaceRandomAccessDataSource(dataset)
-    if isinstance(source, HuggingFaceStreamingSource):
-        dataset = datasets.load_dataset(
-            source.path,
-            name=source.name,
-            split=source.split,
-            revision=source.revision,
-            streaming=True,
-            **source.load_dataset_kwargs,
-        )
+        if not streaming:
+            if not isinstance(dataset, datasets.Dataset):
+                raise TypeError(
+                    "random-access Hugging Face source requires one Dataset; "
+                    f"got {type(dataset).__qualname__}"
+                )
+            return HuggingFaceRandomAccessDataSource(dataset)
         if not isinstance(dataset, datasets.IterableDataset):
             raise TypeError(
                 "streaming Hugging Face source requires one IterableDataset; "
@@ -238,11 +235,16 @@ def build_source(
             # into different orders and train on the same data twice.
             split_dataset_by_node(
                 dataset,
-                rank=dataset_iteration_policy.dp_rank,
-                world_size=dataset_iteration_policy.dp_world_size,
+                rank=iteration_policy.dp_rank,
+                world_size=iteration_policy.dp_world_size,
             ),
-            repeat=dataset_iteration_policy.repeat,
-            shuffle=dataset_iteration_policy.shuffle,
+            repeat=iteration_policy.repeat,
+            shuffle=iteration_policy.shuffle,
+        )
+    if isinstance(source, str | bytes):
+        raise TypeError(
+            "dataset source cannot be a string or bytes; use IndexedJsonlSource "
+            "or a Hugging Face source description for dataset paths"
         )
     if isinstance(source, RandomAccessDataSource) or isinstance(
         source, grain.IterDataset
@@ -281,16 +283,21 @@ class HuggingFaceStreamingIterDataset(grain.IterDataset):
 
 
 def file_patterns_to_paths(patterns: tuple[str, ...]) -> tuple[str, ...]:
-    """Return sorted, unique absolute paths matched by file patterns.
+    """Resolve patterns in order, sorting matches within each pattern.
 
     Every pattern must match at least one file. Duplicate resolved paths are
     rejected so one file cannot be indexed twice.
     """
+    if not patterns:
+        raise ValueError("JSONL source requires at least one file pattern")
     paths: list[str] = []
     for pattern in patterns:
         matches = sorted(glob.glob(pattern))
         if not matches:
             raise FileNotFoundError(f"pattern matched no files: {pattern!r}")
+        for match in matches:
+            if not Path(match).is_file():
+                raise ValueError(f"JSONL pattern matched a non-file path: {match!r}")
         paths.extend(str(Path(match).resolve()) for match in matches)
     if len(paths) != len(set(paths)):
         raise ValueError("patterns resolve to the same file more than once")
@@ -316,16 +323,18 @@ class HuggingFaceCursorIterator(grain.DatasetIterator):
         self._iterator = iter(dataset)
 
     def __next__(self) -> dict[str, Any]:
+        self._assert_not_closed()
         try:
             return next(self._iterator)
         except StopIteration:
             if not self._repeat:
                 raise
-            self._epoch += 1
+            epoch = self._epoch + 1
             if self._shuffle:
-                self._dataset.set_epoch(self._epoch)
+                self._dataset.set_epoch(epoch)
             self._dataset.load_state_dict(self._initial_state)
             self._iterator = iter(self._dataset)
+            self._epoch = epoch
             return next(self._iterator)
 
     def get_state(self) -> dict[str, Any]:
@@ -335,8 +344,18 @@ class HuggingFaceCursorIterator(grain.DatasetIterator):
         }
 
     def set_state(self, state: dict[str, Any]) -> None:
-        self._epoch = state["epoch"]
+        if not isinstance(state, dict):
+            raise ValueError("streaming checkpoint state must be a dictionary")
+        epoch = state.get("epoch")
+        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
+            raise ValueError("streaming checkpoint epoch must be a nonnegative integer")
+        if "hf" not in state:
+            raise ValueError("streaming checkpoint state is missing the 'hf' field")
+        hf_state = state["hf"]
+        if not isinstance(hf_state, dict):
+            raise ValueError("streaming checkpoint 'hf' field must be a dictionary")
         if self._shuffle:
-            self._dataset.set_epoch(self._epoch)
-        self._dataset.load_state_dict(state["hf"])
+            self._dataset.set_epoch(epoch)
+        self._dataset.load_state_dict(hf_state)
         self._iterator = iter(self._dataset)
+        self._epoch = epoch

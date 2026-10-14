@@ -14,13 +14,15 @@ import grain.python as grain
 
 from ...components.loss import IGNORE_INDEX
 from ..composition import (
-    DatasetConcat,
-    DatasetMix,
-    SingleDataset,
+    DatasetRecipe,
     as_iter_dataset,
     build_dataset,
 )
-from ..contracts import DatasetBuildContext, DatasetIterationPolicy, require_positive
+from ..contracts import (
+    DatasetBuildContext,
+    DatasetIterationPolicy,
+    require_positive_integer,
+)
 from .conversions import (
     packing_output_is_full,
     packing_output_to_text_sequence,
@@ -48,16 +50,16 @@ def row_lengths(context: DatasetBuildContext) -> dict[str, int]:
 
 
 def build_concat_then_split_packing(
-    dataset: (SingleDataset | DatasetMix | DatasetConcat),
+    dataset: DatasetRecipe,
     *,
     context: DatasetBuildContext,
-    dataset_iteration_policy: DatasetIterationPolicy,
+    iteration_policy: DatasetIterationPolicy,
 ) -> grain.IterDataset:
     """Concatenate documents, chunking them into fixed-length rows."""
     dataset_graph = build_dataset(
         dataset,
         context=context,
-        dataset_iteration_policy=dataset_iteration_policy,
+        iteration_policy=iteration_policy,
     )
     if context.max_num_documents is not None:
         dataset_graph = as_iter_dataset(dataset_graph, context=context)
@@ -87,10 +89,10 @@ def build_concat_then_split_packing(
 
 
 def build_first_fit_packing(
-    dataset: (SingleDataset | DatasetMix | DatasetConcat),
+    dataset: DatasetRecipe,
     *,
     context: DatasetBuildContext,
-    dataset_iteration_policy: DatasetIterationPolicy,
+    iteration_policy: DatasetIterationPolicy,
     num_packing_bins: int = 8,
 ) -> grain.IterDataset:
     """Pack document chunks no longer than the context window.
@@ -98,12 +100,12 @@ def build_first_fit_packing(
     ``num_packing_bins`` is how many candidate rows are kept open; more bins can
     reduce padding, but buffer more samples.
     """
-    require_positive("num_packing_bins", num_packing_bins)
+    require_positive_integer("num_packing_bins", num_packing_bins)
 
     dataset_graph = build_dataset(
         dataset,
         context=context,
-        dataset_iteration_policy=dataset_iteration_policy,
+        iteration_policy=iteration_policy,
     )
     dataset_graph = as_iter_dataset(dataset_graph, context=context)
     dataset_graph = grain.experimental.FlatMapIterDataset(
@@ -131,11 +133,9 @@ def build_first_fit_packing(
         },
         num_packing_bins=num_packing_bins,
         meta_features=("labels", "positions"),
-        seed=dataset_iteration_policy.seed,
-        shuffle_bins=dataset_iteration_policy.shuffle,
-        max_sequences_per_bin=(
-            context.max_num_documents if context.max_num_documents is not None else None
-        ),
+        seed=iteration_policy.seed,
+        shuffle_bins=iteration_policy.shuffle,
+        max_sequences_per_bin=context.max_num_documents,
     )
     return dataset_graph.map(
         partial(

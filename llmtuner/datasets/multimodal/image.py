@@ -242,15 +242,16 @@ def resize_to_navit_patch_grid(
 
 def process_image(
     image: str | bytes | Image.Image,
+    *,
     patch_size: int = 16,
     merge_size: int = 2,
-    max_pixels: int = 16777216,
-    min_pixels: int = 65536,
-    image_mean: tuple[float, ...] = (0.5, 0.5, 0.5),
-    image_std: tuple[float, ...] = (0.5, 0.5, 0.5),
     resize_fn: Callable[..., tuple[int, int, int, int]] = resize_to_pixel_budget,
+    min_pixels: int = 65536,
+    max_pixels: int = 16777216,
     max_patches: int = 4096,
     max_patches_per_side: int = 512,
+    image_mean: tuple[float, ...] = (0.5, 0.5, 0.5),
+    image_std: tuple[float, ...] = (0.5, 0.5, 0.5),
 ) -> torch.Tensor | None:
     """Load and preprocess a single image for VLM training.
 
@@ -266,14 +267,14 @@ def process_image(
         image: Raw bytes, file path, HTTP(S) URL, or PIL Image.
         patch_size: Spatial patch size used by the vision encoder.
         merge_size: Spatial merge factor (patches merged per dimension).
-        max_pixels: Upper pixel budget (``resize_to_pixel_budget``).
-        min_pixels: Lower pixel budget (``resize_to_pixel_budget``).
-        image_mean: Per-channel mean for normalization.
-        image_std: Per-channel std for normalization.
         resize_fn: Resize-strategy callable (see above).
+        min_pixels: Lower pixel budget (``resize_to_pixel_budget``).
+        max_pixels: Upper pixel budget (``resize_to_pixel_budget``).
         max_patches: Pre-padding patch budget (``resize_to_navit_patch_grid``).
         max_patches_per_side: Pre-padding per-side patch limit
             (``resize_to_navit_patch_grid``).
+        image_mean: Per-channel mean for normalization.
+        image_std: Per-channel std for normalization.
 
     Returns:
         Tensor of shape (1, H, W, C) with a dummy temporal dim, or None on failure.
