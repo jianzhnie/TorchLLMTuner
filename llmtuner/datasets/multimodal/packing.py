@@ -23,7 +23,7 @@ from ..contracts import (
 
 
 def build_multimodal_packing(
-    dataset: DatasetRecipe,
+    recipe: DatasetRecipe,
     *,
     context: DatasetBuildContext,
     iteration_policy: DatasetIterationPolicy,
@@ -41,7 +41,7 @@ def build_multimodal_packing(
     require_positive_integer("num_packing_bins", num_packing_bins)
 
     dataset_graph = build_dataset(
-        dataset,
+        recipe,
         context=context,
         iteration_policy=iteration_policy,
     )
@@ -100,6 +100,7 @@ def packing_output_to_multimodal_sample(
     max_context_length: int,
 ) -> dict[str, Any]:
     """Mask packing padding, restore tensors, and flatten document media."""
+    require_positive_integer("max_context_length", max_context_length)
     padding_mask = np.asarray(packing_output["input_ids_segment_ids"]) == 0
     labels = np.asarray(packing_output["labels"]).copy()
     labels[padding_mask] = IGNORE_INDEX

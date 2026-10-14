@@ -48,14 +48,14 @@ def text_packing_lengths(*, num_tokens_per_row: int) -> dict[str, int]:
 
 
 def build_concat_then_split_packing(
-    dataset: DatasetRecipe,
+    recipe: DatasetRecipe,
     *,
     context: DatasetBuildContext,
     iteration_policy: DatasetIterationPolicy,
 ) -> grain.IterDataset:
     """Concatenate documents, chunking them into fixed-length rows."""
     dataset_graph = build_dataset(
-        dataset,
+        recipe,
         context=context,
         iteration_policy=iteration_policy,
     )
@@ -90,7 +90,7 @@ def build_concat_then_split_packing(
 
 
 def build_first_fit_packing(
-    dataset: DatasetRecipe,
+    recipe: DatasetRecipe,
     *,
     context: DatasetBuildContext,
     iteration_policy: DatasetIterationPolicy,
@@ -104,7 +104,7 @@ def build_first_fit_packing(
     require_positive_integer("num_packing_bins", num_packing_bins)
 
     dataset_graph = build_dataset(
-        dataset,
+        recipe,
         context=context,
         iteration_policy=iteration_policy,
     )

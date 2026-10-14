@@ -219,7 +219,7 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
                         "packing checkpoint remainder offset is outside "
                         "the restored sample"
                     )
-        except Exception:
+        except BaseException:
             # Replaying the remainder advances the parent. Invalid state must
             # not change the live stream's next token or consume its sample.
             self._parent.set_state(previous_parent_state)
