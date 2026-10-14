@@ -113,7 +113,7 @@ G1 决定模型层只能依赖 HF 公共约定（`config.architectures`、常见
                           v
 +---------------------------------------------------------------+
 |  trainer/trainer.py                                           |
-|    init_dist -> build_mesh -> HFTransformerModel              |
+|    init_dist -> build_device_mesh -> HFTransformerModel              |
 |    -> parallelize_hf_transformers -> AdamW -> train loop      |
 +---------------------------------------------------------------+
                           |
@@ -302,7 +302,7 @@ cp 整除 seq_len、async_tp×{compile,tp}），与其余字段校验同处、�
 |---|---|
 | 聚合配置 | `llmtuner.LLMTunerConfig`（根，eager） |
 | 训练器 | `llmtuner.Trainer`（根，PEP 562 懒加载） |
-| 全部配置类 | `llmtuner.config.*`（17 个，`config/__init__` 全量再导出） |
+| 全部配置类 | `llmtuner.config.*`（17 个公开配置类，`config/__init__` 全量再导出） |
 | CLI | `python -m llmtuner` / `llmtuner.trainer.cli:main` |
 
 `llmtuner.trainer` 的配置再导出是**兼容别名**（旧调用方不炸），新代码不写它。
@@ -314,7 +314,7 @@ cp 整除 seq_len、async_tp×{compile,tp}），与其余字段校验同处、�
 |---|---|
 | 装配入口 | `llmtuner.parallel.parallelize_hf_transformers`（懒导出） |
 | 异常三类 | `llmtuner.errors`（ConfigError / UnsupportedCombinationError / EnvironmentUnsupportedError） |
-| 装配 stage 表 | `llmtuner.parallel.stages`（STAGES / STAGE_ORDER / PP_STAGE_ORDER） |
+| 装配 stage 表 | `llmtuner.parallel.stages`（STAGES / STAGE_ORDER） |
 | 组合矩阵 | `llmtuner.parallel.matrix`（ENTRIES / 各裁决函数） |
 | 能力注册表 | `llmtuner.accelerator.capabilities`（has / require / CAPABILITIES） |
 
@@ -329,11 +329,12 @@ cp 整除 seq_len、async_tp×{compile,tp}），与其余字段校验同处、�
 
 ### 4.1 SEAM 0：唯一配置入口
 
-`LLMTunerConfig`（config/root.py，经 `llmtuner.config` 再导出）由四组 dataclass **组合**（不是多继承）：
+`LLMTunerConfig`（config/llmtuner_config.py，经 `llmtuner.config` 再导出）由四组 dataclass **组合**（不是多继承）：
 `ModelConfig / ParallelConfig / OptimizerConfig / TrainingConfig`。CLI 用
-`HfArgumentParser` 平铺解析九组 flag（`config/cli.py` 把 CLI 载不动的字段——dict /
+`HfArgumentParser` 平铺解析九组 flag（`config/cli_config.py` 把 CLI 载不动的字段——dict /
 嵌套 dataclass 及其列表 / callable——从 `--help` 里摘掉，它们只能程序化传入），组合后经
-`cfg.auto_fill_model()`（hub id 时从 HF 拉架构补齐）得到唯一配置对象。
+得到唯一配置对象。Trainer 装配时解析 HF 架构并同步模型尺寸，CLI
+解析不读取 HF 配置；显式调用 `cfg.auto_fill_model()` 可用于运行前预览。
 
 配置流动遵守 G2：只有 trainer 组装层读 `LLMTunerConfig`；往下传递时拆成显式参数——
 `ParallelTopology.from_config(cfg.parallel, world_size)` 读度数，`apply_*` 收
@@ -377,14 +378,14 @@ def apply_fsdp(model, cfg, parallel_dims=None) -> nn.Module # fully_shard/apply.
 
 公共语义：对应度数 `<= 1`（或 `mesh`/`ep_group` 为 None）时 no-op 原样返回；否则返回就地改造后的
 模型。**顺序即契约**——且契约是数据不是注释：`parallel/stages.py` 的 `STAGES`
-表是唯一来源（有序、`on_pp` 标记、每项带位置理由），`parallelize.py` 的两条
+表是唯一来源（有序、每项带位置理由），`parallelize.py` 的两条
 路径都由它驱动（无引擎依赖，任何地方可导入）：
 
 ```
 STAGE_ORDER    = tp -> ep -> cp -> ac -> compile(可选) -> fsdp   # pp=1 路径
-PP_STAGE_ORDER = on_pp 子序列（当前全部 stage 均 on_pp，与上同序）  # pp>1 per-part
+STAGE_ORDER 同时用于完整模型与每个 PP model part  # pp>1 per-part
 # AC 包住已经 TP/EP/CP 改造的层；FSDP 最后，outer wraps inner
-# pp>1 时先调 pipeline_parallel.apply_pp（只切 stage），per-part 走 PP_STAGE_ORDER，
+# pp>1 时先调 pipeline_parallel.apply_pp（只切 stage），per-part 走 STAGE_ORDER，
 # 最后建 schedule，返回 PipelineParallelSetup
 ```
 
@@ -420,13 +421,13 @@ microbatch forward/backward，只有末 stage 计算 loss。
 eval 模式 + `no_grad` 跑一次临时 dataloader，loss 按全局有效 token 归一化（与训练
 同一对归约 mesh），不更新参数、不进 checkpoint、不动 `ntokens_seen`；零 batch /
 零有效 token 与 dp>1 的 `steps=-1` 均 loud-raise；PP 下由
-`trainer/runtime/validation.py::run_pipeline_validation_loop` 复用 schedule 的 eval 驱动（需
+`trainer/runtime/validation.py::evaluate_pipeline_batch` 复用 schedule 的 eval 驱动（需
 pipelining schedule 的微批驱动形态，见 §3.2 的 `pipelining_microbatch_drivers`）。
 
 ### 5.2 mesh 与 ParallelTopology
 
-`parallel/topology.py` 是 mesh 构建的单轨：`build_parallel_topology` /
-`build_mesh` 两个薄入口与 `ParallelTopology` 同住一个模块（trainer 的 PG 引导直接调
+`parallel/topology.py` 是 mesh 构建的单轨：`resolve_parallel_topology` /
+`build_device_mesh` 两个薄入口与 `ParallelTopology` 同住一个模块（trainer 的 PG 引导直接调
 `accelerator/distributed.init_dist_pytorch`；多 launcher 门面 `init_dist` 保留给
 独立脚本）；所有具体视图由 `ParallelTopology` 统一构造——它只负责构建/校验，
 运行时 mesh 访问的唯一通道是 `accelerator/spmd.py`。world mesh 包含
@@ -492,8 +493,8 @@ input_ids/labels/positions 同步切片；BlockMask 只沿 Q 维分片
 探测 Qwen3Moe、OLMoE、Mixtral、DeepSeek-V2/V3、GLM4 等共同布局，并替换为
 `models/common` 的 `MoE`：router gate 与 experts 权重逐元素直拷进
 `TokenChoiceTopKRouter` / `GroupedExperts`；ep>1 时每 rank 切本地 experts 片并接
-`AllToAllTokenDispatcher`（`wire_meshes(ep_group=...)`），ep==1 用
-`LocalTokenDispatcher`。dispatch 后端可由 `ParallelConfig.ep_token_dispatcher`
+`AllToAllTokenDispatcher`（`set_ep_group(ep_group=...)`），ep==1 用
+`LocalTokenDispatcher`。dispatch 后端可由 `ParallelConfig.ep_config.ep_token_dispatcher`
 选择：`alltoall`（默认，逐位不变）、`torchao`（可选导入适配层，token 组按
 `ep_torchao_pad_multiple` 补齐供 FP8/MXFP8 量化 grouped GEMM 使用，未装
 torchao 构造期 ImportError 带安装指引，数值环境未覆盖待 CUDA 复跑）；
@@ -519,12 +520,14 @@ wrapper 的 `named_children()` 只呈现五部件、看不到它们）同样按�
 当前无真实消费者，属能力就位。
 
 **接线已落地**（多卡数值轨迹的验证状态见 §8 第 10 条）：`pipeline_parallel/pipeline_parallel.py` 的 `apply_pp` 按 schedule 类推导 stage 数
-（looped schedule 默认每 rank 2 个）并完成切分；每个 model_part 按 `PP_STAGE_ORDER`
+（looped schedule 默认每 rank 2 个）并完成切分；每个 model_part 按 `STAGE_ORDER`
 装配（当前与单卡路径同序，编排同在 `parallelize.py` 一个调用点）；
 `build_pipeline_schedule` 建 schedule
 （`scale_grads=False`，loss 是 sum 由 trainer 归一）。trainer 侧：
-`pp_forward_backward_body` 驱动 `schedule.step`——首 stage 收 `input_ids`、末 stage
-收 labels 并返回 detach 求和的 loss 与 token 数、其余 stage 返回哨兵 -1.0；optimizer
+`pp_forward_backward_body` 委托 `trainer/runtime/pipeline.py`，按 capability 选择
+`_step_microbatches` 或 `schedule.step`。首 stage 收 inputs、末 stage 收 labels；
+末 stage 对已归一化 loss detach 求和，再乘全局有效 token 数恢复原始 loss sum，
+其余 stage 返回设备上的零 loss 哨兵。optimizer
 是 `components/optimizer/` 的 `OptimizersContainer`，每个 model_part 一个内层
 optimizer；checkpoint 的 optimizer state 一律按参数 FQN 扁平存取
 （`state.<fqn>.exp_avg` 形式），positional 索引跨 stage 撞键的问题因此不复存在——
@@ -534,6 +537,13 @@ optimizer；checkpoint 的 optimizer state 一律按参数 FQN 扁平存取
 权重）；DSA（dense-mask）模型 × PP 拒绝（非首 stage 的 `tok_embeddings` 是
 `nn.Identity`，mask 构建必崩）；looped schedule 已覆盖 Interleaved1F1B，V 风格
 schedule 尚未验证。
+
+batch 切分由 `split_pipeline_microbatches` 统一供训练和验证使用。多个
+microbatch 只支持按第 0 维对齐的样本行，切分前检查所有非标量 tensor 的
+行数；一维 packed corpus 拒绝多个 microbatch。单 microbatch 保留完整的
+媒体 patch、grid 和坐标张量；多 microbatch 尚不支持按媒体 span 或坐标轴
+重新分配这些非行布局。切分会重计有效 label 数，保留 scalar/非 tensor
+metadata，并保持原 batch 不变。
 
 ### 5.6 components / datasets
 
@@ -620,7 +630,7 @@ torch≥2.12 多卡复跑。
 
 1. PP+chunked loss、tied embeddings 的 PP 与 DSA 模型 × PP 均明确拒绝；
    PP × validation 已支持——schedule 自带
-   eval 驱动（与上游校验器同 seam），`trainer/runtime/validation.py::run_pipeline_validation_loop` 接入
+   eval 驱动（与上游校验器同 seam），`trainer/runtime/validation.py::evaluate_pipeline_batch` 接入
    （`tests/integration_tests/pp_validation_equivalence.py` 待 torch≥2.12 复跑）；
    PP × 真实语料已支持（positions 随 microbatch 穿管，
    `pp_real_corpus_equivalence.py` 同样待复跑）。

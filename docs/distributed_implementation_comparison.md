@@ -39,7 +39,7 @@ TorchLLMTuner 的核心并行路径在当前约束内是完整且内部一致的
 2. **FSDP 兼容入口残留**：`fully_shard_parallel/apply.py` 只做再导出，与“同名文件为核心入口”的目录约定冲突；本轮已删除。
 3. **旧路径元数据**：组合矩阵和测试曾指向已删除的 TP/PP/EP/FSDP 文件；前一轮已修复并由真实文件检查覆盖。
 
-FSDPTurbo 的 KCP、MC2、Domino、自定义 fine-grained FSDP 和低精度通信没有直接迁移。它们依赖特定模型 patch、NPU kernel、HCCL 行为或另一套专家布局，需要独立设计和设备数值测试。
+当前已接线 KCP、Domino 双切片语义和 PyTorch 2.14 custom fine-grained FSDP 适配。Domino 有 CPU/Gloo 前向及梯度等价证据；KCP 与 custom FSDP 的目标设备路径仍需数值验证。MC2 因缺少兼容融合算子注册而明确拒绝，低精度通信栈仍未迁移。
 
 ## 3. 模块映射
 
@@ -244,6 +244,8 @@ TorchLLMTuner 先 probe HF MoE block，再转换为公共 MoE 实现：
 - EP rank 只持有本地专家；
 - All-to-All dispatcher 负责 token dispatch/combine；
 - 可选 TorchAO padded dispatcher；
+- Domino 双切片 dispatch/compute/combine，允许空 token rank 参与两次交换；
+- debug-only fixed router，使用确定性 round-robin 选择；
 - aux-loss 和 quantile balancing 通过 optimizer pre-hook 更新；
 - checkpoint adapter gather/load 逻辑专家张量，使恢复不绑定物理 EP shard；
 - TP × EP 的 expert feature shard 和 sequence boundary 有独立实现。
@@ -258,8 +260,8 @@ TorchLLMTuner 先 probe HF MoE block，再转换为公共 MoE 实现：
 
 ### 8.3 未迁移项
 
-- MC2 与 Domino 依赖通信/计算融合和特定设备后端；
-- fixed router 属训练算法变化，需要配置、checkpoint 和指标共同设计；
+- MC2 需要兼容的 Ascend 融合算子注册，当前配置明确拒绝；
+- Domino 的 accelerator stream overlap 尚未实现和验证；双切片语义已接线；
 - 低精度 dispatcher 依赖当前尚未移植的量化栈；
 - FSDPTurbo dispatcher 不能直接作用于 TorchLLMTuner 的 `GroupedExperts`，接口和权重布局不同。
 
@@ -301,22 +303,23 @@ PP split
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| FSDP2 | 完整 | dense、MoE、HSDP、reshard、mixed precision |
+| FSDP2 | 已实现，待目标设备验证 | dense、MoE、HSDP、reshard、mixed precision |
 | FSDP CPU offload | 本轮补齐 | 已暴露 enable 与 pin-memory 配置 |
-| FSDP custom backend | 未实现 | FSDPTurbo 专有路径，需单独验证 |
-| TP dense | 完整 | attention/MLP/embed/head/vocab loss |
-| TP MoE | 有条件完整 | 已支持布局完整；未知布局拒绝 |
-| PP | 完整 | stage、schedule、microbatch、validation |
-| CP KV AllGather | 完整 | FlexAttention 与 BlockMask 契约内 |
-| CP Ulysses | 完整 | head 整除和顺序约束内 |
-| CP KCP | 未实现 | 模型与 kernel 专用能力 |
-| EP All-to-All | 完整 | 已支持 HF MoE 布局内 |
+| FSDP custom backend | 已适配，待硬件验证 | PyTorch 2.14 原生 FSDP 生命周期；不同 hook_module 不支持 |
+| TP dense | 已实现，待目标设备验证 | attention/MLP/embed/head/vocab loss |
+| TP MoE | 有条件实现 | 已支持布局完整；未知布局拒绝 |
+| PP | 已实现，待目标设备验证 | stage、schedule、microbatch、validation |
+| CP KV AllGather | 已实现，待目标设备验证 | FlexAttention 与 BlockMask 契约内 |
+| CP Ulysses | 已实现，待目标设备验证 | head 整除和顺序约束内 |
+| CP KCP | 已接线，待设备验证 | 识别 KDA 模块；需 fla 与 Ascend kernels，限制见入口 |
+| EP All-to-All | 已实现，待目标设备验证 | 已支持 HF MoE 布局内 |
 | EP TorchAO | 可选 | 需要 TorchAO |
-| EP MC2/Domino | 未实现 | 设备专用融合路径 |
-| TP × FSDP | 完整 | 有多进程等价性测试 |
-| CP × TP | 完整 | 联合 sequence 整除和 loss mesh |
-| EP × FSDP | 完整 | sparse mesh 与 expert placement |
-| TP × EP | 完整 | expert feature shard 与 boundary |
+| EP Domino | CPU 数值通过 | 双切片前向/梯度及重计算、空 rank；stream overlap 待实现 |
+| EP MC2 | 明确拒绝 | 当前无兼容 Ascend 融合算子注册 |
+| TP × FSDP | 已实现，待目标设备验证 | 有多进程等价性测试 |
+| CP × TP | 已实现，待目标设备验证 | 联合 sequence 整除和 loss mesh |
+| EP × FSDP | 已实现，待目标设备验证 | sparse mesh 与 expert placement |
+| TP × EP | 已实现，待目标设备验证 | expert feature shard 与 boundary |
 | PP × TP/CP/EP/FSDP | 已接线 | 各 stage 使用相同 stage order；设备组合测试按环境运行 |
 | TP × EP × CP | 已接线 | mesh 与输入/loss 路径完整；依赖支持的模型和设备 |
 
@@ -324,8 +327,8 @@ PP split
 
 ## 12. 本轮代码变更
 
-1. 新增 `ParallelConfig.fsdp_cpu_offload`，默认 `False`；
-2. 新增 `ParallelConfig.fsdp_cpu_offload_pin_memory`，默认 `True`；
+1. 新增 `ParallelConfig.fsdp_config.fsdp_cpu_offload`，默认 `False`；
+2. 新增 `ParallelConfig.fsdp_config.fsdp_cpu_offload_pin_memory`，默认 `True`；
 3. 将配置传入 `CPUOffloadPolicy(pin_memory=...)`；
 4. 增加 FSDP 配置传递测试；
 5. 删除 `fully_shard_parallel/apply.py` 兼容转发文件；
@@ -391,8 +394,8 @@ The first migration slice is implemented in the working tree:
   `context_parallel_ulysses_size` axes. The composite kernel gathers K/V over
   the first group, exchanges Q/K/V from sequence to heads over the second,
   attends `S / kv` queries against full-sequence K/V, and applies the inverse
-  exchange to its output. The legacy `context_parallel_kv_allgather_size` remains available
-  for single-axis configurations and cannot be mixed with the new fields.
+  exchange to its output. Both axis fields can be combined; their product determines the total CP degree.
+  Each axis can also be used alone with the other degree set to one.
 
 Domino is integrated at the dispatcher/module boundary: routing, dispatch,
 expert compute and combine execute in two independently tracked token slices,
