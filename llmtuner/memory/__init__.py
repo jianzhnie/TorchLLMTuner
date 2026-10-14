@@ -12,13 +12,13 @@ Parallel topology and sharding remain in ``llmtuner.parallel``.
 
 from __future__ import annotations
 
-from ..utils.lazy_exports import export_names, resolve_export
+from ..utils.lazy_exports import resolve_export
 
 _EXPORT_SOURCES = {
     "apply_ac": "activation_checkpoint",
 }
 
-__all__ = export_names(_EXPORT_SOURCES)
+__all__ = sorted(_EXPORT_SOURCES)
 
 
 def __getattr__(name: str):
@@ -27,4 +27,4 @@ def __getattr__(name: str):
 
 
 def __dir__() -> list[str]:
-    return export_names(_EXPORT_SOURCES)
+    return sorted(_EXPORT_SOURCES)

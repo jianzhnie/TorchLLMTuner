@@ -52,5 +52,8 @@ class CompileConfig:
     )
 
     def __post_init__(self) -> None:
-        if not self.backend:
-            raise ConfigError("compile.backend cannot be empty.")
+        if not isinstance(self.backend, str) or not self.backend.strip():
+            raise ConfigError("compile.backend must be a non-empty string.")
+        for name in ("per_block", "enable_async_tensor_parallel"):
+            if not isinstance(getattr(self, name), bool):
+                raise ConfigError(f"compile.{name} must be a boolean.")
