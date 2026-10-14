@@ -5,16 +5,14 @@ Run under torchrun with 2 ranks:
     PYTHONPATH=. torchrun --nproc_per_node=2 \\
         tests/integration_tests/pp_real_corpus_equivalence.py
 
-Status: this historical harness currently requests four microbatches over a
-flat packed token stream. The trainer deliberately rejects that combination,
-because splitting the stream can cut a document's context. Its reference loop
-also assumes row-batched tensors and normalizes each microbatch independently;
-it must be repaired before it can establish training equivalence.
+The loader independently packs four microbatches before grouping a schedule
+step. The reference uses the same document masks and a full-step valid-token
+denominator. Flat packed streams supplied externally remain unsupported for
+multiple pipeline microbatches.
 
-Keep the production refusal in place. Supporting this combination requires
-packing independent microbatches at the loader, with matching positions, masks,
-and the full-step valid-token denominator. This script is currently a known
-failing integration check, not evidence that packed PP training is supported.
+Finite validation exhausts the corpus, including a fully padded microbatch in
+the last schedule step. CPU uses dense-mask SDPA as an explicit test substitute
+for the production flex kernel; GPU/NPU execution requires separate validation.
 
 """
 
@@ -22,12 +20,14 @@ from __future__ import annotations
 
 import json
 import tempfile
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
-from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
+from llmtuner.accelerator.tensor_tree import move_tensor_tree
+from llmtuner.components.loss import cross_entropy_loss
 from llmtuner.config import (
     DataloaderConfig,
     LLMTunerConfig,
@@ -36,6 +36,7 @@ from llmtuner.config import (
     OptimizerConfig,
     ParallelConfig,
     TrainingConfig,
+    ValidationConfig,
 )
 from llmtuner.datasets.loader_builder import build_dataloader
 from llmtuner.models.hf.factory import build_model_config_for
@@ -55,11 +56,27 @@ NUM_ROWS = 48  # > STEPS * GLOBAL_BATCH rows so no repeat kicks in
 TOL = 1e-5
 
 
-def _write_corpus() -> tuple[str, str]:
+def _cpu_packed_attention(self, positions, attention_masks):
+    """CPU test substitute: expand the production mask, then use HF SDPA."""
+    from torch.nn.attention.flex_attention import create_mask
+
+    if attention_masks is None:
+        attention_masks = self.get_attention_masks(positions=positions)
+    mask = create_mask(
+        attention_masks.mask_mod,
+        B=1,
+        H=1,
+        Q_LEN=positions.numel(),
+        KV_LEN=positions.numel(),
+        device=str(positions.device),
+    )
+    return {"attention_mask": mask}
+
+
+def _write_corpus(root: str) -> tuple[str, str]:
     """A tiny tokenizer and a JSONL corpus of multi-document rows."""
     import os
 
-    root = tempfile.mkdtemp(prefix="pp_real_corpus_")
     tokenizer_path = os.path.join(root, "tokenizer")
     write_tokenizer(tokenizer_path)
     corpus_path = os.path.join(root, "rows.jsonl")
@@ -96,6 +113,7 @@ def _cfg(tokenizer_path: str, corpus_path: str) -> LLMTunerConfig:
             seed=SEED,
             deterministic=True,
             metrics_config=MetricsConfig(log_freq=1),
+            validation_config=ValidationConfig(freq=1, steps=-1),
             dataloader_config=DataloaderConfig(
                 dataset="local_jsonl",
                 tokenizer_path=tokenizer_path,
@@ -106,10 +124,16 @@ def _cfg(tokenizer_path: str, corpus_path: str) -> LLMTunerConfig:
     )
 
 
-def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
+def _reference_trajectory(
+    cfg: LLMTunerConfig,
+    initial_state: dict[str, torch.Tensor],
+    device: torch.device,
+) -> tuple[list[float], dict[str, torch.Tensor], float, bool]:
     """The same steps in one process over the same loader, unsharded."""
     torch.manual_seed(cfg.seed)
     model = HFTransformerModel(build_model_config_for(cfg))
+    model.load_state_dict(initial_state, strict=True)
+    model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr,
@@ -123,7 +147,6 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
         dp_world_size=1,
         num_tokens_per_batch=GLOBAL_BATCH * SEQ,
     )
-    rows_per_mb = GLOBAL_BATCH // MICROBATCHES
     losses = []
     for _ in range(cfg.steps):
         optimizer.zero_grad(set_to_none=True)
@@ -131,12 +154,12 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
         # The packed batch carries per-token positions; drop the trainer's
         # bookkeeping int before the forward, as the trainer does.
         batch = dict(batch)
-        batch.pop("num_valid_tokens", None)
+        num_valid = batch.pop("num_valid_tokens")
+        batch = move_tensor_tree(batch, device=device)
         loss_sum = None
         for mb in range(MICROBATCHES):
-            row = slice(mb * rows_per_mb, (mb + 1) * rows_per_mb)
+            row = slice(mb, mb + 1)
             microbatch = {k: v[row] for k, v in batch.items()}
-            num_valid = int((microbatch["labels"] != IGNORE_INDEX).sum())
             inputs, labels, extra = model.preprocess_inputs(
                 microbatch, parallel_dims=None
             )
@@ -146,13 +169,49 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
             loss_sum = loss.detach() if loss_sum is None else loss_sum + loss.detach()
         clip_grad_norm_(model.parameters(), max_norm=cfg.max_norm, foreach=True)
         optimizer.step()
-        losses.append(float(loss_sum))
+        losses.append(float(loss_sum / num_valid))
     loader.close()
-    return losses
+    model.eval()
+    validation_loader = build_dataloader(
+        cfg,
+        dp_rank=0,
+        dp_world_size=1,
+        num_tokens_per_batch=GLOBAL_BATCH * SEQ,
+        repeat=False,
+    )
+    validation_sum = 0.0
+    validation_tokens = 0
+    saw_padding_microbatch = False
+    try:
+        with torch.no_grad():
+            for batch in validation_loader:
+                validation_tokens += batch["num_valid_tokens"]
+                batch = move_tensor_tree(
+                    {k: v for k, v in batch.items() if k != "num_valid_tokens"},
+                    device=device,
+                )
+                for mb in range(MICROBATCHES):
+                    microbatch = {k: v[mb : mb + 1] for k, v in batch.items()}
+                    saw_padding_microbatch |= bool(microbatch["padding_mask"].all())
+                    inputs, labels, extra = model.preprocess_inputs(
+                        microbatch, parallel_dims=None
+                    )
+                    validation_sum += float(
+                        cross_entropy_loss(model(inputs, **extra), labels)
+                    )
+    finally:
+        validation_loader.close()
+    assert validation_tokens > 0
+    return (
+        losses,
+        {name: value.detach().cpu() for name, value in model.state_dict().items()},
+        validation_sum / validation_tokens,
+        saw_padding_microbatch,
+    )
 
 
-def main() -> None:
-    tokenizer_path, corpus_path = _write_corpus()
+def _run(root: str) -> None:
+    tokenizer_path, corpus_path = _write_corpus(root)
     cfg = _cfg(tokenizer_path, corpus_path)
     failures: list[str] = []
 
@@ -161,6 +220,16 @@ def main() -> None:
     assert trainer.world_size == WORLD, (
         f"this check assumes {WORLD} ranks, got {trainer.world_size}"
     )
+    local_state = {
+        name: value.detach().cpu().clone()
+        for part in trainer.model_parts
+        for name, value in part.state_dict().items()
+    }
+    stage_states = [None] * WORLD
+    dist.all_gather_object(stage_states, local_state)
+    initial_state = {
+        name: value for state in stage_states for name, value in state.items()
+    }
 
     # -- non-vacuity: the model is split, and the corpus is really packed -----
     num_layers_held = sum(len(part.layers) for part in trainer.model_parts)
@@ -169,8 +238,14 @@ def main() -> None:
             f"rank {rank}: holds {num_layers_held} of {cfg.num_hidden_layers} "
             "layers -- the model was not split"
         )
-    data_iterator = trainer.data_iterator()
+    loader_state = trainer.dataloader.state_dict()
     probe = next(iter(trainer.dataloader))
+    trainer.dataloader.load_state_dict(loader_state)
+    data_iterator = trainer.data_iterator()
+    if probe["labels"].shape != (MICROBATCHES, GLOBAL_BATCH * SEQ // MICROBATCHES):
+        failures.append(
+            f"rank {rank}: unexpected microbatch shape {probe['labels'].shape}"
+        )
     if "positions" not in probe:
         failures.append(f"rank {rank}: packed batch carries no positions")
     positions = probe["positions"]
@@ -187,23 +262,76 @@ def main() -> None:
         metrics = trainer.train_step(data_iterator)
         assert metrics is not None  # log_freq=1: every step reports
         pp_losses.append(metrics["loss"])
+    validation_reports = []
+
+    def capture_validation(*, loss, step):
+        validation_reports.append(loss)
+
+    trainer.metrics.log_validation = capture_validation
+    trainer.validate(trainer.step)
+    if any(not part.training for part in trainer.model_parts):
+        failures.append(f"rank {rank}: validation did not restore training mode")
+    local_final_state = {
+        name: value.detach().cpu().clone()
+        for part in trainer.model_parts
+        for name, value in part.state_dict().items()
+    }
     trainer.close()
 
-    reference = _reference_trajectory(cfg)
+    reference, final_state, reference_validation, saw_padding = _reference_trajectory(
+        cfg, initial_state, trainer.device
+    )
+    if not saw_padding:
+        failures.append(
+            f"rank {rank}: finite corpus did not exercise a padded microbatch"
+        )
+    if trainer.pp_has_last_stage:
+        if len(validation_reports) != 1:
+            failures.append(f"rank {rank}: expected one finite validation report")
+        elif abs(validation_reports[0] - reference_validation) > TOL:
+            failures.append(
+                f"rank {rank}: validation {validation_reports[0]} "
+                f"vs {reference_validation}"
+            )
+    max_parameter_diff = 0.0
+    for name, actual in local_final_state.items():
+        diff = float((actual - final_state[name]).abs().max())
+        max_parameter_diff = max(max_parameter_diff, diff)
+        if diff > TOL:
+            failures.append(f"rank {rank}: final parameter {name} diff {diff:.3e}")
+    max_diff = torch.tensor(max_parameter_diff, device=trainer.device)
+    dist.all_reduce(max_diff, op=dist.ReduceOp.MAX)
     for step, (got, want) in enumerate(zip(pp_losses, reference, strict=True)):
         if abs(got - want) > TOL:
             failures.append(f"rank {rank} step {step + 1}: loss {got} vs {want}")
 
     if rank == 0:
+        if trainer.device.type == "cpu":
+            print("CPU attention uses dense-mask SDPA; CUDA flex is not verified.")
         print(f"pp={PP} corpus=local_jsonl(packed) steps={STEPS} tol={TOL:.0e}")
         print(f"pp losses  = {[f'{x:.6f}' for x in pp_losses]}")
         print(f"reference  = {[f'{x:.6f}' for x in reference]}")
+        print(f"final parameter max diff = {float(max_diff):.3e}")
+        print(f"finite validation reference = {reference_validation:.6f}")
         for f in failures:
             print(f"  FAIL {f}")
         print("all checks passed" if not failures else "CHECKS FAILED")
-    verdict = torch.tensor(len(failures), dtype=torch.int64)
+    verdict = torch.tensor(len(failures), dtype=torch.int64, device=trainer.device)
     dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
     assert int(verdict) == 0, f"{int(verdict)} check(s) failed -- see rank 0 output"
+
+
+def main() -> None:
+    from llmtuner.accelerator.device import device_type
+
+    with tempfile.TemporaryDirectory(prefix="pp_real_corpus_") as root:
+        if device_type == "cpu":
+            with patch.object(
+                HFTransformerModel, "_apply_attention", _cpu_packed_attention
+            ):
+                _run(root)
+        else:
+            _run(root)
 
 
 if __name__ == "__main__":

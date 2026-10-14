@@ -1381,6 +1381,19 @@ def test_dp_slice_partitions_global_batch() -> None:
 # -- the console entry point ----------------------------------------------------
 
 
+def test_cli_does_not_load_implicit_args_file(tmp_path, monkeypatch):
+    import sys
+
+    from llmtuner.trainer.cli import parse_config
+
+    entry = tmp_path / "train.py"
+    entry.with_suffix(".args").write_text("--global_batch_size 123 --steps 99")
+    monkeypatch.setattr(sys, "argv", [str(entry), "--steps", "1"])
+    cfg = parse_config()
+    assert cfg.steps == 1
+    assert cfg.global_batch_size == LLMTunerConfig().global_batch_size
+
+
 def test_create_seed_checkpoint_writes_a_step_0_checkpoint_and_exits(tmp_path) -> None:
     """``--create_seed_checkpoint`` saves the untrained model at step 0.
 
@@ -1620,3 +1633,78 @@ def test_assembly_uses_live_process_group_rank_and_size(monkeypatch):
     monkeypatch.setattr(assembly, "build_parallel_topology", topology)
     with pytest.raises(RuntimeError, match="stop after rank resolution"):
         assembly.assemble_trainer_runtime(trainer, SimpleNamespace())
+
+
+def test_programmatic_trainer_uses_resolved_override_vocabulary():
+    from llmtuner.config import ModelConfig, TrainingConfig
+
+    cfg = LLMTunerConfig(
+        model=ModelConfig(arch_overrides={"vocab_size": 17}),
+        training=TrainingConfig(global_batch_size=2, max_seq_len=8, steps=1),
+    )
+    trainer = Trainer(cfg)
+    try:
+        batch = next(trainer.data_iterator())
+        assert cfg.vocab_size == 17
+        assert int(batch.input_ids.max()) < 17
+        trainer.step = 1
+        trainer.train_step(iter([batch]))
+    finally:
+        trainer.close()
+
+
+def test_trainer_resolves_hf_configuration_once(monkeypatch):
+    from llmtuner.config import TrainingConfig
+    from llmtuner.models.hf import factory
+
+    calls = []
+    original = factory.build_model_config
+
+    def tracked(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(factory, "build_model_config", tracked)
+    trainer = Trainer(
+        LLMTunerConfig(training=TrainingConfig(global_batch_size=2, max_seq_len=8))
+    )
+    try:
+        assert len(calls) == 1
+    finally:
+        trainer.close()
+
+
+def test_trainer_dcp_restores_saved_base_lr_with_different_new_lr(tmp_path):
+    from llmtuner.config import TrainingConfig
+
+    def config(lr):
+        return LLMTunerConfig(
+            optimizer=OptimizerConfig(
+                learning_rate=lr,
+                lr_scheduler_config=LRSchedulerConfig(warmup_steps=4),
+            ),
+            training=TrainingConfig(
+                global_batch_size=2,
+                max_seq_len=8,
+                steps=8,
+                dump_folder=str(tmp_path),
+                checkpoint_config=CheckpointConfig(enable=True, interval=1),
+            ),
+        )
+
+    original = Trainer(config(0.01))
+    try:
+        original.step = 1
+        original.train_step(original.data_iterator())
+        expected = original.lr_scheduler.get_metrics()
+        assert original.checkpointer.save(1)
+    finally:
+        original.close()
+    resumed = Trainer(config(0.001))
+    try:
+        assert resumed.checkpointer.load(1)
+        assert resumed.lr_scheduler.get_metrics() == expected
+        for scheduler in resumed.lr_scheduler:
+            assert scheduler.base_lrs == [0.01]
+    finally:
+        resumed.close()

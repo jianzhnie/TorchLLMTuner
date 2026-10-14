@@ -772,3 +772,57 @@ def test_async_checkpoint_round_trip_without_a_process_group(tmp_path):
             torch.testing.assert_close(value, expected[key])
     finally:
         resumed.close()
+
+
+def test_legacy_loader_layout_planner_keeps_model_keys_strict(tmp_path):
+    import pytest
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer.distributed_checkpoint import (
+        DataloaderLayoutLoadPlanner,
+    )
+
+    checkpoint = tmp_path / "legacy"
+    dcp.save(
+        {"dataloader": {"version": 1, "cursor": 7}, "weight": torch.ones(2)},
+        checkpoint_id=checkpoint,
+    )
+    target = {
+        "dataloader": {"version": 1, "cursor": 0, "batch_layout": {"tokens": 32}},
+        "weight": torch.zeros(2),
+    }
+    dcp.load(target, checkpoint_id=checkpoint, planner=DataloaderLayoutLoadPlanner())
+    assert target["dataloader"]["cursor"] == 7
+    torch.testing.assert_close(target["weight"], torch.ones(2))
+    target["missing_weight"] = torch.zeros(2)
+    with pytest.raises(CheckpointException, match="missing_weight"):
+        dcp.load(
+            target, checkpoint_id=checkpoint, planner=DataloaderLayoutLoadPlanner()
+        )
+
+
+def test_partial_loader_layout_metadata_is_rejected(tmp_path):
+    import pytest
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer.distributed_checkpoint import (
+        DataloaderLayoutLoadPlanner,
+    )
+
+    checkpoint = tmp_path / "partial"
+    dcp.save(
+        {"dataloader": {"version": 1, "batch_layout": {"tokens": 32}}},
+        checkpoint_id=checkpoint,
+    )
+    target = {
+        "dataloader": {
+            "version": 1,
+            "batch_layout": {"tokens": 32, "rows": 2},
+        }
+    }
+    with pytest.raises(CheckpointException, match="batch_layout.rows"):
+        dcp.load(
+            target, checkpoint_id=checkpoint, planner=DataloaderLayoutLoadPlanner()
+        )

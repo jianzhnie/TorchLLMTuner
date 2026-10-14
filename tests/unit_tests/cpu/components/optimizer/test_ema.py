@@ -308,3 +308,22 @@ def test_ema_owns_model_part_collection():
     averages = [ema._param_optimizers[0].state[p]["ema_params"] for p in params]
     for average, before in zip(averages, initial, strict=True):
         torch.testing.assert_close(average, before + 1)
+
+
+def test_update_rejects_later_replaced_parameter_before_updating_earlier_part():
+    first, second = _model(), _model()
+    ema = EMA(model_parts=[first, second], decay=0.5)
+    averages = [
+        state["ema_params"]
+        for optimizer in ema.optimizers
+        for state in optimizer.state.values()
+    ]
+    before = [average.clone() for average in averages]
+    with torch.no_grad():
+        for param in first.parameters():
+            param.add_(1)
+    second[0].weight = torch.nn.Parameter(second[0].weight.detach().clone())
+    with pytest.raises(RuntimeError, match="EMA has no state"):
+        ema.step(1)
+    for average, expected in zip(averages, before, strict=True):
+        torch.testing.assert_close(average, expected)

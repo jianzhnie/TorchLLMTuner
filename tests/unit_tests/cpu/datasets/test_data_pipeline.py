@@ -23,6 +23,7 @@ import tempfile
 import grain.python as grain
 import numpy as np
 import pytest
+import torch
 
 from llmtuner.components.loss import IGNORE_INDEX
 from llmtuner.components.tokenizer import HuggingFaceTokenizer
@@ -406,6 +407,40 @@ def test_loader_rejects_resuming_across_a_changed_dp_size(tokenizer, corpus):
     loader.close()
 
 
+def test_dcp_restore_checks_saved_layout_before_restoring_iterator(
+    tmp_path, tokenizer, corpus
+):
+    import torch.distributed.checkpoint as dcp
+
+    def fresh(num_tokens):
+        dataset = build_dataset(
+            text_dataset(corpus),
+            context=make_context(tokenizer, num_tokens_per_batch=num_tokens),
+            dataset_iteration_policy=make_policy(repeat=True),
+        )
+        return GrainDataLoader(
+            dataset,
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            max_context_length=8,
+            num_tokens_per_batch=num_tokens,
+        )
+
+    saved, restored = fresh(32), fresh(16)
+    try:
+        next(iter(saved))
+        dcp.save({"loader": saved}, checkpoint_id=tmp_path / "checkpoint")
+        initial_state = restored.state_dict()
+        with pytest.raises(ValueError, match="changing dataloader batch layout"):
+            dcp.load({"loader": restored}, checkpoint_id=tmp_path / "checkpoint")
+        assert restored.state_dict() == initial_state
+        assert next(iter(restored))["input"].shape == (16,)
+    finally:
+        saved.close()
+        restored.close()
+
+
 def test_loader_rejects_an_unknown_state_version(tokenizer, corpus):
     dataset = build_dataset(
         text_dataset(corpus),
@@ -644,6 +679,87 @@ def test_document_capped_nested_packing_keeps_inner_padding(
     # Positions restart per segment; padding positions wrap within the window.
     assert rows[0].positions.tolist() == [0, 1, 0, 1, 2, 0]
     assert rows[0].input_ids.tolist() == [1, 2, 3, 4, 5, 0]
+
+
+# --------------------------------------------------------------------------
+# Packing parameter validation
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("consumed_rows", [0, 1, 2, 3])
+def test_document_packing_restore_preserves_remainders_and_empty_samples(consumed_rows):
+    from llmtuner.datasets.packing.iterators import (
+        DocumentAwareConcatThenSplitIterDataset,
+    )
+
+    def sequence(ids):
+        return TextSequence(
+            input_ids=np.asarray(ids, dtype=np.int64),
+            labels=np.asarray(ids, dtype=np.int64) + 1,
+        )
+
+    graph = DocumentAwareConcatThenSplitIterDataset(
+        _SequenceIterDataset(
+            [sequence([]), sequence(list(range(1, 10))), sequence([]), sequence([10])]
+        ),
+        max_num_documents_per_row=2,
+        max_context_length=4,
+        num_tokens_per_row=4,
+    )
+    iterator = iter(graph)
+    prefix = [next(iterator) for _ in range(consumed_rows)]
+    state = iterator.get_state()
+    suffix = list(iterator)
+    restored = iter(graph)
+    restored.set_state(state)
+    actual = list(restored)
+    assert len(actual) == len(suffix)
+    for expected, row in zip(suffix, actual, strict=True):
+        for field in ("input_ids", "labels", "positions", "padding_mask"):
+            np.testing.assert_array_equal(getattr(row, field), getattr(expected, field))
+    real_tokens = np.concatenate(
+        [row.input_ids[~row.padding_mask] for row in prefix + actual]
+    )
+    np.testing.assert_array_equal(real_tokens, np.arange(1, 11))
+    exhausted = iter(graph)
+    exhausted.set_state(restored.get_state())
+    assert list(exhausted) == []
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_document_split_rejects_non_positive_context(value):
+    from llmtuner.datasets.packing.iterators import SplitTextSequenceDocuments
+
+    with pytest.raises(ValueError, match="max_context_length must be positive"):
+        SplitTextSequenceDocuments(max_context_length=value)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+@pytest.mark.parametrize(
+    "field",
+    ["max_num_documents_per_row", "max_context_length", "num_tokens_per_row"],
+)
+@pytest.mark.parametrize("direct_iterator", [False, True])
+def test_document_packing_rejects_non_positive_dimensions(
+    field, value, direct_iterator
+):
+    from llmtuner.datasets.packing.iterators import (
+        DocumentAwareConcatThenSplitIterator,
+        DocumentAwareConcatThenSplitIterDataset,
+    )
+
+    parent = _SequenceIterDataset([])
+    dimensions = dict(
+        max_num_documents_per_row=2, max_context_length=4, num_tokens_per_row=8
+    )
+    dimensions[field] = value
+    constructor = (
+        DocumentAwareConcatThenSplitIterator
+        if direct_iterator
+        else DocumentAwareConcatThenSplitIterDataset
+    )
+    with pytest.raises(ValueError, match=f"{field} must be positive"):
+        constructor(iter(parent) if direct_iterator else parent, **dimensions)
 
 
 # --------------------------------------------------------------------------
@@ -1052,6 +1168,85 @@ def test_dataloader_arguments_build_a_grain_loader_over_a_local_corpus(
     loader.close()
 
 
+@pytest.mark.parametrize("packing", ["concat_then_split", "first_fit"])
+@pytest.mark.parametrize("max_num_documents", [None, 1])
+def test_pipeline_loader_matches_independently_packed_microbatches(
+    tmp_path, corpus, packing, max_num_documents
+):
+    from llmtuner.config import ParallelConfig
+
+    tokenizer_path = str(tmp_path / "tokenizer")
+    write_tokenizer(tokenizer_path)
+    cfg = _loader_config(
+        DataloaderConfig(
+            dataset="local_jsonl",
+            tokenizer_path=tokenizer_path,
+            dataset_path=corpus,
+            packing=packing,
+            max_num_documents=max_num_documents,
+            shuffle=False,
+        )
+    )
+    reference = build_dataloader(
+        cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=16
+    )
+    cfg.parallel = ParallelConfig(pipeline_parallel_size=2, num_pp_microbatches=2)
+    pipeline = build_dataloader(
+        cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=32
+    )
+    try:
+        for _ in range(3):
+            batch = next(iter(pipeline))
+            expected = [next(iter(reference)) for _ in range(2)]
+            assert batch["input"].shape == (2, 16)
+            assert batch["num_valid_tokens"] == sum(
+                row["num_valid_tokens"] for row in expected
+            )
+            for index, row in enumerate(expected):
+                for field in ("input", "labels", "positions", "padding_mask"):
+                    torch.testing.assert_close(batch[field][index], row[field])
+                if max_num_documents == 1:
+                    positions = batch["positions"][index][~batch["padding_mask"][index]]
+                    assert int((positions == 0).sum()) <= 1
+        state = pipeline.state_dict()
+        incompatible = {
+            **state,
+            "batch_layout": {**state["batch_layout"], "num_rows_per_batch": 4},
+        }
+        expected_next = next(iter(pipeline))
+        with pytest.raises(ValueError, match="changing dataloader batch layout"):
+            pipeline.load_state_dict(incompatible)
+        pipeline.load_state_dict(state)
+        resumed = next(iter(pipeline))
+        for field in ("input", "labels", "positions", "padding_mask"):
+            torch.testing.assert_close(resumed[field], expected_next[field])
+    finally:
+        reference.close()
+        pipeline.close()
+
+
+def test_pipeline_collator_pads_a_finite_partial_schedule_without_repeating_tokens(
+    tokenizer,
+):
+    from dataclasses import replace
+
+    from llmtuner.datasets.collators import PipelineTextCollator
+
+    context = replace(make_context(tokenizer), num_tokens_per_batch=16)
+    collator = PipelineTextCollator(context=context, num_microbatches=2)
+    row = TextSequence(
+        input_ids=np.asarray([1, 2, 3]), labels=np.asarray([2, 3, IGNORE_INDEX])
+    )
+    batch = collator([row])
+    assert batch["input"].shape == (2, 8)
+    assert batch["num_valid_tokens"] == 2
+    assert batch["input"][0, :3].tolist() == [1, 2, 3]
+    assert batch["padding_mask"][1].all()
+    assert (batch["labels"][1] == IGNORE_INDEX).all()
+    assert int((~batch["padding_mask"]).sum()) == 3
+    np.testing.assert_array_equal(row.labels, [2, 3, IGNORE_INDEX])
+
+
 @pytest.mark.parametrize(
     ("selector", "expected"),
     [
@@ -1312,3 +1507,29 @@ def test_restore_failure_preserves_error_when_iterator_close_fails():
         loader.load_state_dict({"version": 1, "dp_world_size": 1, "dp_rank_0": {}})
     assert caught.value is original
     assert closed == [True]
+
+
+@pytest.mark.parametrize("cursor", [True, False, -1, 1.5, "2"])
+def test_synthetic_loader_rejects_invalid_cursor_without_advancing(cursor):
+    loader = RandomTokenDataLoader(seed=42, vocab_size=16, batch_size=2, seq_len=4)
+    reference = RandomTokenDataLoader(seed=42, vocab_size=16, batch_size=2, seq_len=4)
+    before = loader.state_dict()
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        loader.load_state_dict({"dp_world_size": 1, "steps": cursor})
+    assert loader.state_dict() == before
+    torch.testing.assert_close(
+        next(iter(loader)).input_ids, next(iter(reference)).input_ids
+    )
+
+
+@pytest.mark.parametrize("field", ["seed", "vocab_size", "batch_size", "seq_len"])
+def test_synthetic_resume_rejects_changed_source_configuration(field):
+    settings = dict(seed=42, vocab_size=16, batch_size=2, seq_len=4)
+    saved = RandomTokenDataLoader(**settings)
+    next(iter(saved))
+    settings[field] += 1
+    restored = RandomTokenDataLoader(**settings)
+    before = restored.state_dict()
+    with pytest.raises(ValueError, match="synthetic data configuration"):
+        restored.load_state_dict(saved.state_dict())
+    assert restored.state_dict() == before

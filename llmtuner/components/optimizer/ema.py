@@ -241,13 +241,14 @@ class EMA(OptimizersContainer):
     # with no behavior change.
     def _update(self, num_updates: int) -> None:
         decay = self._decay_at(num_updates)
+        groups: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
         for ema_opt, model in zip(
             self._param_optimizers, self.model_parts, strict=True
         ):
             params: list[torch.Tensor] = [
                 p for p in model.parameters() if p.requires_grad
             ]
-            self._update_group(ema_opt, params, decay)
+            groups.append((self._tracked_averages(ema_opt, params), params))
         for ema_opt, model in zip(
             # Empty when buffer_patterns is unset: shorter than model_parts.
             self._buffer_optimizers,
@@ -259,19 +260,10 @@ class EMA(OptimizersContainer):
                 for name, b in model.named_buffers()
                 if any(p.search(name) for p in self._buffer_patterns)
             ]
-            self._update_group(ema_opt, buffers, decay)
-
-    def _update_group(
-        self,
-        ema_opt: "EMAParamOptimizer",
-        tensors: list[torch.Tensor],
-        decay: float,
-    ) -> None:
-        """Shared lerp/decay body for one model part's params or buffers."""
-        if tensors:
-            torch._foreach_lerp_(
-                self._tracked_averages(ema_opt, tensors), tensors, 1.0 - decay
-            )
+            groups.append((self._tracked_averages(ema_opt, buffers), buffers))
+        for averages, tensors in groups:
+            if tensors:
+                torch._foreach_lerp_(averages, tensors, 1.0 - decay)
 
     def _tracked_averages(
         self, ema_opt: EMAParamOptimizer, tensors: list[torch.Tensor]
