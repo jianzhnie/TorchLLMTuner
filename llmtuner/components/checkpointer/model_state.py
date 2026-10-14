@@ -116,6 +116,25 @@ class ModelCheckpointState(Stateful):
         return self.cached_state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # Validate the combined view before any part copies weights. strict=False
+        # below permits other PP parts and auxiliary checkpoint categories, but
+        # must not permit missing local model state or late shape failures.
+        missing = self.cached_state_dict.keys() - state_dict.keys()
+        if missing:
+            raise ValueError(f"Model checkpoint is missing keys: {sorted(missing)}")
+        for key, expected in self.cached_state_dict.items():
+            if not isinstance(expected, torch.Tensor):
+                continue
+            value = state_dict[key]
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"Model checkpoint {key!r} must be a tensor")
+            # PyTorch accepts old one-element checkpoints for scalar state.
+            legacy_scalar = expected.ndim == 0 and value.shape == torch.Size([1])
+            if value.shape != expected.shape and not legacy_scalar:
+                raise ValueError(
+                    f"Model checkpoint {key!r} has shape {tuple(value.shape)}, "
+                    f"expected {tuple(expected.shape)}"
+                )
         # Each PP part consumes its own keys from the combined model state.
         # Other parts' keys are ignored; checkpoint state categories are separate.
         state_dict = load_expert_state(

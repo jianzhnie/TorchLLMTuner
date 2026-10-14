@@ -2198,6 +2198,19 @@ def test_synthetic_resume_seeks_without_generating_previous_batches(monkeypatch)
     assert loader.state_dict()["steps"] == 1_000_001
 
 
+def test_synthetic_resume_rejects_missing_cursor_without_changing_stream():
+    settings = dict(seed=42, vocab_size=16, batch_size=2, seq_len=4)
+    loader = RandomTokenDataLoader(**settings)
+    reference = RandomTokenDataLoader(**settings)
+    saved = loader.state_dict()
+    saved.pop("steps")
+    with pytest.raises(ValueError, match="missing synthetic loader steps"):
+        loader.load_state_dict(saved)
+    torch.testing.assert_close(
+        next(iter(loader)).input_ids, next(iter(reference)).input_ids
+    )
+
+
 def test_synthetic_resume_updates_existing_iterators():
     settings = dict(
         seed=42, vocab_size=16, batch_size=4, seq_len=8, dp_rank=1, dp_world_size=2

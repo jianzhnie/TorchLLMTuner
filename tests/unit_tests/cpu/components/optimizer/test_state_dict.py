@@ -330,3 +330,75 @@ def test_flat_optimizer_restore_keeps_parameter_names_for_the_next_save():
     load_flat_optim_state_dict(optimizer, flat_state=saved)
     assert optimizer.param_groups[0]["param_names"] == ["weight"]
     assert get_flat_optim_state_dict(optimizer).keys() == saved.keys()
+
+
+@pytest.mark.parametrize("moment", ["exp_avg", "exp_avg_sq", "max_exp_avg_sq"])
+def test_container_rejects_wrong_moment_shape_before_loading_any_optimizer(moment):
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+
+    container = object.__new__(OptimizersContainer)
+    container.model_parts = []
+    container.optimizers = []
+    for name in ["first", "second"]:
+        optimizer = torch.optim.AdamW(
+            [{"params": [torch.nn.Parameter(torch.ones(2))], "param_names": [name]}],
+            lr=0.1,
+            amsgrad=True,
+        )
+        container.optimizers.append(optimizer)
+    checkpoint = container.state_dict()
+    checkpoint["param_groups.first.lr"] = 0.9
+    checkpoint[f"state.second.{moment}"] = torch.zeros(3)
+    original_states = [next(iter(opt.state.values())) for opt in container.optimizers]
+
+    with pytest.raises(ValueError, match=f"state.second.{moment}.*shape"):
+        container.load_state_dict(checkpoint)
+
+    for optimizer, original_state in zip(
+        container.optimizers, original_states, strict=True
+    ):
+        assert optimizer.param_groups[0]["lr"] == 0.1
+        assert next(iter(optimizer.state.values())) is original_state
+
+
+@pytest.mark.parametrize("optimizer_type", [torch.optim.Adam, torch.optim.AdamW])
+@pytest.mark.parametrize(
+    "counter",
+    [
+        torch.tensor([1.0, 2.0]),
+        torch.tensor(float("nan")),
+        torch.tensor(float("inf")),
+        torch.tensor(-1.0),
+        torch.tensor(1.5),
+        torch.tensor(True),
+        True,
+        "2",
+    ],
+)
+def test_adam_restore_rejects_invalid_step_before_changing_state(
+    optimizer_type, counter
+):
+    from llmtuner.components.optimizer.state_dict import (
+        get_flat_optim_state_dict,
+        load_flat_optim_state_dict,
+    )
+
+    parameter = torch.nn.Parameter(torch.ones(2))
+    optimizer = optimizer_type(
+        [{"params": [parameter], "param_names": ["weight"]}],
+        lr=0.1,
+        foreach=False,
+    )
+    init_optim_state(optimizer)
+    checkpoint = get_flat_optim_state_dict(optimizer)
+    checkpoint["state.weight.step"] = counter
+    checkpoint["param_groups.weight.lr"] = 0.9
+    original_state = optimizer.state[parameter]
+    with pytest.raises(ValueError, match="state.weight.step.*counter"):
+        load_flat_optim_state_dict(optimizer, flat_state=checkpoint)
+    assert optimizer.state[parameter] is original_state
+    assert optimizer.param_groups[0]["lr"] == 0.1
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    assert original_state["step"].item() == 1
+    assert torch.isfinite(parameter).all()

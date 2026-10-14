@@ -7,6 +7,7 @@ fully qualified name (FQN) layout for distributed checkpointing.
 learning rates, existing state, and the first real Adam step.
 """
 
+import math
 from typing import Any
 
 import torch
@@ -187,7 +188,52 @@ def unflatten_optim_state_dict(
                 for state_name in optim.state[param]:
                     flat_key = f"state.{fqn}.{state_name}"
                     if flat_key in flat_state:
-                        param_state[state_name] = flat_state[flat_key]
+                        value = flat_state[flat_key]
+                        expected = optim.state[param][state_name]
+                        if (
+                            isinstance(optim, torch.optim.Adam | torch.optim.AdamW)
+                            and state_name == "step"
+                        ):
+                            counter = value
+                            if isinstance(counter, torch.Tensor):
+                                if counter.numel() != 1:
+                                    raise ValueError(
+                                        f"Optimizer state {flat_key!r} counter must "
+                                        "contain exactly one value"
+                                    )
+                                counter = counter.item()
+                            if (
+                                isinstance(counter, bool)
+                                or not isinstance(counter, int | float)
+                                or counter < 0
+                                or (
+                                    isinstance(counter, float)
+                                    and (
+                                        not math.isfinite(counter)
+                                        or not counter.is_integer()
+                                    )
+                                )
+                            ):
+                                raise ValueError(
+                                    f"Optimizer state {flat_key!r} counter must be "
+                                    "a finite nonnegative integer"
+                                )
+                        # Adam moments must match the destination parameter layout.
+                        # Optimizer.load_state_dict casts tensors but does not check
+                        # shapes, so malformed moments otherwise fail on the first
+                        # update after other optimizers have already been restored.
+                        if isinstance(expected, torch.Tensor) and state_name != "step":
+                            if not isinstance(value, torch.Tensor):
+                                raise ValueError(
+                                    f"Optimizer state {flat_key!r} must be a tensor"
+                                )
+                            if value.shape != expected.shape:
+                                raise ValueError(
+                                    f"Optimizer state {flat_key!r} has shape "
+                                    f"{tuple(value.shape)}, expected "
+                                    f"{tuple(expected.shape)}"
+                                )
+                        param_state[state_name] = value
                     else:
                         # State value is itself a nested dict (e.g. Shampoo).
                         nested = _restore_nested_state(flat_state, prefix=flat_key)

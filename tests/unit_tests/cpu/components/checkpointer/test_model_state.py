@@ -107,3 +107,38 @@ def test_buffer_key_collision_fails_before_refreshing_checkpoint_cache() -> None
         state.state_dict()
     assert state.cached_state_dict.keys() == cached.keys()
     assert all(state.cached_state_dict[key] is value for key, value in cached.items())
+
+
+@pytest.mark.parametrize("invalid", ["missing", "shape", "type"])
+def test_model_restore_validates_all_parts_before_copying_weights(invalid):
+    first = nn.ModuleDict({"first": nn.Linear(2, 2)})
+    second = nn.ModuleDict({"second": nn.Linear(2, 2)})
+    state = ModelCheckpointState([first, second])
+    original = {key: value.clone() for key, value in state.state_dict().items()}
+    saved = {key: value + 1 for key, value in original.items()}
+    if invalid == "missing":
+        del saved["second.weight"]
+    elif invalid == "shape":
+        saved["second.weight"] = torch.zeros(3, 2)
+    else:
+        saved["second.weight"] = None
+    with pytest.raises(ValueError, match="second.weight"):
+        state.load_state_dict(saved)
+    torch.testing.assert_close(state.state_dict(), original, rtol=0, atol=0)
+
+
+def test_model_restore_allows_auxiliary_checkpoint_categories():
+    model = nn.Linear(2, 2)
+    state = ModelCheckpointState(model)
+    saved = {key: value.clone() + 1 for key, value in state.state_dict().items()}
+    state.load_state_dict({**saved, "optimizer": {"step": 2}})
+    torch.testing.assert_close(state.state_dict(), saved, rtol=0, atol=0)
+
+
+def test_model_restore_keeps_legacy_scalar_buffer_compatibility():
+    model = nn.Module()
+    model.register_buffer("counter", torch.tensor(0))
+    state = ModelCheckpointState(model)
+    state.load_state_dict({"counter": torch.tensor([3])})
+    assert model.counter.ndim == 0
+    assert model.counter.item() == 3
