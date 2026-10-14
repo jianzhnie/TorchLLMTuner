@@ -21,7 +21,7 @@ import torch
 from ...components.loss import IGNORE_INDEX
 from ...components.tokenizer.multimodal import MultimodalTokenizer
 from ..collators import Collator
-from ..contracts import DatasetBuildContext, TrainerBatch
+from ..contracts import DatasetBuildContext, TrainerBatch, require_positive_integer
 from .image import vision_to_patches
 from .mrope import build_mrope_positions
 
@@ -46,10 +46,18 @@ class MultimodalCollator(Collator):
         build_mrope_positions: bool = False,
         patch_order: Literal["block", "raster"] = "block",
     ) -> None:
-        if min(patch_size, temporal_patch_size, spatial_merge_size) < 1:
-            raise ValueError("multimodal patch sizes must be positive")
-        if max_images_per_batch < 0:
-            raise ValueError("max_images_per_batch must be nonnegative")
+        for name, value in (
+            ("patch_size", patch_size),
+            ("temporal_patch_size", temporal_patch_size),
+            ("spatial_merge_size", spatial_merge_size),
+        ):
+            require_positive_integer(name, value)
+        if (
+            not isinstance(max_images_per_batch, int)
+            or isinstance(max_images_per_batch, bool)
+            or max_images_per_batch < 0
+        ):
+            raise ValueError("max_images_per_batch must be a nonnegative integer")
         if patch_order not in ("block", "raster"):
             raise ValueError("patch_order must be 'block' or 'raster'")
         self._num_tokens_per_batch = context.num_tokens_per_batch
@@ -63,12 +71,12 @@ class MultimodalCollator(Collator):
         self.patch_order = patch_order
 
     def collate_media(
-        self, media: list[torch.Tensor]
+        self, media: Sequence[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process image/video tensors into packed patches and grid dimensions.
 
         Args:
-            media: Non-empty list of image/video tensors, each of shape
+            media: Non-empty sequence of image/video tensors, each of shape
                 (T, H, W, C)
 
         Returns:
@@ -97,7 +105,7 @@ class MultimodalCollator(Collator):
 
     def collate_text(
         self,
-        batch: list[dict[str, Any]],
+        batch: Sequence[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Concatenate whole samples and pad only the token-batch tail."""
         if not batch:
@@ -153,18 +161,17 @@ class MultimodalCollator(Collator):
 
     def __call__(self, batch: Sequence[dict[str, Any]]) -> TrainerBatch:
         """Collate batch with patch-based approach."""
-        # Count media in each sample.
-        batch = list(batch)
-        images_per_sample: list[int] = []
-        for sample in batch:
-            num_images = len(sample.get("pixel_values", []))
-            for vid in sample.get("pixel_values_videos", []):
-                num_images += (
-                    vid.shape[0] + self.temporal_patch_size - 1
-                ) // self.temporal_patch_size
-            images_per_sample.append(num_images)
-
-        total_images = sum(images_per_sample)
+        all_images = [
+            image for sample in batch for image in sample.get("pixel_values", [])
+        ]
+        all_videos = [
+            video for sample in batch for video in sample.get("pixel_values_videos", [])
+        ]
+        # Each image costs one entry; videos cost one per temporal patch group.
+        total_images = len(all_images) + sum(
+            (video.shape[0] + self.temporal_patch_size - 1) // self.temporal_patch_size
+            for video in all_videos
+        )
         if total_images > self.max_images_per_batch:
             raise ValueError(
                 f"multimodal batch has {total_images} vision entries, exceeding "
@@ -172,20 +179,7 @@ class MultimodalCollator(Collator):
             )
 
         # Collate image and video patches.
-        all_images = [
-            img
-            for sample in batch
-            if "pixel_values" in sample
-            for img in sample["pixel_values"]
-        ]
         patches, grids = self.collate_media(all_images) if all_images else (None, None)
-
-        all_videos = [
-            vid
-            for sample in batch
-            if "pixel_values_videos" in sample
-            for vid in sample["pixel_values_videos"]
-        ]
         video_patches, video_grids = (
             self.collate_media(all_videos) if all_videos else (None, None)
         )

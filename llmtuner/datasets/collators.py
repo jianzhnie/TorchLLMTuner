@@ -138,7 +138,6 @@ class PipelineTextCollator(Collator):
         if context.num_tokens_per_batch % num_microbatches:
             raise ValueError("token batch must be divisible by num_microbatches")
         self._num_microbatches = num_microbatches
-        self._max_context_length = context.max_context_length
         self._collator = TextCollator(
             context=replace(
                 context,
@@ -156,20 +155,12 @@ class PipelineTextCollator(Collator):
         # Finite validation may end before a complete schedule step. Keep the
         # schedule shapes fixed with fully masked rows, without repeating data.
         if len(batches) < self._num_microbatches:
-            template = batches[0]
+            empty_row = TextSequence(
+                input_ids=rows[0].input_ids[:0],
+                labels=rows[0].labels[:0],
+            )
             for _ in range(self._num_microbatches - len(batches)):
-                padding = {
-                    key: torch.zeros_like(template[key])
-                    for key in ("input", "labels", "positions", "padding_mask")
-                }
-                padding["labels"].fill_(IGNORE_INDEX)
-                padding["padding_mask"].fill_(True)
-                padding["positions"].copy_(
-                    torch.arange(padding["positions"].numel())
-                    % self._max_context_length
-                )
-                padding["num_valid_tokens"] = 0
-                batches.append(padding)
+                batches.append(self._collator([empty_row]))
         result: TrainerBatch = {}
         for key in ("input", "labels", "positions", "padding_mask"):
             template = batches[0][key]

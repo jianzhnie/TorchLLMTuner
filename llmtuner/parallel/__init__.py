@@ -5,10 +5,10 @@ mechanisms only: TP linear kernels, FSDP plans, CP kernels and input sharding,
 EP model conversion, and PP stage splitting. External callers can use the
 family packages; implementation code imports from the defining modules.
 
-Every ``apply_*`` is a no-op when its degree is 1. That is what lets the same
-trainer code run from step 0 (single device) through step 4 (full hybrid
-parallelism) without an ``if degree > 1`` at any call site -- and it is why
-``parallelize_hf_transformers`` can apply all of them unconditionally.
+The composition entry calls each transformation in the declared stage order.
+Each entry decides whether it is needed from the configuration and topology.
+FSDP may still be required with a singleton DP shard axis when CP, replication,
+or expert sharding is active; callers must not skip it based only on DP degree.
 
 Pipeline parallelism lives in ``pipeline_parallel/``: ``partition.py`` computes
 the stage split and ``pipeline_parallel.py`` builds this rank's schedule.
