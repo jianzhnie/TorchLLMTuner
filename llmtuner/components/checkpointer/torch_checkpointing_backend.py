@@ -649,12 +649,16 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             pass
 
     def _wait_for_saving(self) -> None:
-        # Clear the active save before waiting so close() does not retry a
-        # failure.
+        # Completed failures are consumed once. A timeout or interruption
+        # leaves the write active, so subsequent saves must still wait for it.
         save_future = self.save_future
         assert save_future is not None
         self.save_future = None
-        save_future.result(timeout=self._manager_config.save.wait_timeout_secs)
+        try:
+            save_future.result(timeout=self._manager_config.save.wait_timeout_secs)
+        finally:
+            if not save_future.done():
+                self.save_future = save_future
 
     def _close(self) -> None:
         try:

@@ -602,14 +602,18 @@ class DistributedCheckpointManager(BaseCheckpointManager):
 
         staging_future = self.staging_future
         self.staging_future = None
-        staging_future.result()
+        try:
+            staging_future.result()
+        finally:
+            if not staging_future.done():
+                self.staging_future = staging_future
 
     def _wait_for_saving(self) -> None:
         """Wait for any background save to complete.
 
         Blocking; ensures all checkpoint data has reached storage. The tracking
-        future is cleared first so a failed save is not retried by a later
-        ``close()`` or ``__del__``.
+        future is cleared first so a completed failure is not retried by a later
+        ``close()`` or ``__del__``. Interrupted waits retain an active write.
 
         Raises:
             RuntimeError: if a save future is set while the mode is ``DISABLED``.
@@ -622,7 +626,11 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         save_future = self.save_future
         assert save_future is not None
         self.save_future = None
-        save_future.result()
+        try:
+            save_future.result()
+        finally:
+            if not save_future.done():
+                self.save_future = save_future
 
     def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
         if not self._storage.isfile(filesystem.join(checkpoint_dir, ".metadata")):

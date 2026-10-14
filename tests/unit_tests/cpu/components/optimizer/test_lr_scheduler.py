@@ -414,3 +414,22 @@ def test_scheduler_rejects_duplicate_optimizer_before_changing_learning_rate():
         )
     assert optimizer.param_groups[0]["lr"] == 0.2
     assert "initial_lr" not in optimizer.param_groups[0]
+
+
+@pytest.mark.parametrize("decay_ratio", [0.0, 1.0])
+def test_completed_schedule_rejects_extra_step_without_mutation(decay_ratio):
+    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=1.0)
+    scheduler = build_lr_scheduler(
+        LRSchedulerConfig(decay_ratio=decay_ratio),
+        optimizers=[optimizer],
+        training_steps=2,
+    )
+    for _ in range(2):
+        optimizer.step()
+        scheduler.step()
+    saved = scheduler.state_dict()
+    learning_rate = optimizer.param_groups[0]["lr"]
+    with pytest.raises(ValueError, match="beyond total_steps"):
+        scheduler.step()
+    assert scheduler.state_dict() == saved
+    assert optimizer.param_groups[0]["lr"] == learning_rate

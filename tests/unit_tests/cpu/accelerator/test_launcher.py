@@ -140,3 +140,25 @@ def test_slurm_cuda_bootstrap_preserves_rank_and_options(
     assert distributed.os.environ["LOCAL_RANK"] == "1"
     assert distributed.os.environ["WORLD_SIZE"] == "8"
     assert distributed.os.environ["MASTER_PORT"] == expected_port
+
+
+@pytest.mark.parametrize("device", ["cpu", "npu", "xpu", "mlu", "musa"])
+@pytest.mark.parametrize("engine", ["deepspeed", "colossalai", "unknown"])
+@pytest.mark.parametrize("launcher", ["pytorch", "slurm"])
+def test_unsupported_launcher_engine_fails_before_setup(
+    monkeypatch, device, engine, launcher
+):
+    monkeypatch.setattr(distributed, "device_type", device)
+    calls = []
+    monkeypatch.setattr(distributed, "set_device", calls.append)
+    monkeypatch.setattr(
+        distributed.torch_dist, "init_process_group", lambda **kw: calls.append(kw)
+    )
+    monkeypatch.setattr(
+        distributed.subprocess, "run", lambda *args, **kw: calls.append(args)
+    )
+    bootstrap = getattr(distributed, f"init_dist_{launcher}")
+    with pytest.raises(ValueError, match=f"not supported on {device}"):
+        bootstrap("nccl", init_backend=engine)
+    assert calls == []
+    assert "RANK" not in distributed.os.environ

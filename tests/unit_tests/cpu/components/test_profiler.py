@@ -679,3 +679,35 @@ def test_stop_memory_history_disables_device_allocator(monkeypatch):
     )
     monitoring.stop_memory_history()
     assert calls == [{"enabled": None}]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("freq", 0),
+        ("freq", True),
+        ("step_num", -1),
+        ("rank", -1),
+        ("max_entries", 0),
+        ("max_entries", 1.5),
+    ],
+)
+def test_invalid_memory_profiler_arguments_do_not_start_history(
+    monkeypatch, field, value
+):
+    calls = []
+    monkeypatch.setattr(
+        profiler_module, "record_memory_history", lambda **kwargs: calls.append(kwargs)
+    )
+    arguments = dict(
+        step_num=0,
+        freq=1,
+        rank=0,
+        max_entries=10,
+        snapshot_dir="",
+        leaf_folder="",
+    )
+    arguments[field] = value
+    with pytest.raises(ValueError, match=field):
+        MemoryProfiler(**arguments)
+    assert calls == []

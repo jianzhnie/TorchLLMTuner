@@ -76,7 +76,7 @@ def seed_everything(
         # ``aten._is_any_true``, which has no DTensor sharding strategy and
         # would crash on sharded parameters. Stack-trace recording -- the
         # useful half -- stays on. Same setting as upstream's.
-        torch.autograd.set_detect_anomaly(True, check_nan=False)
+    torch.autograd.set_detect_anomaly(detect_anomaly, check_nan=False)
 
 
 def derive_distinct_seed(seed: int, distinct_coords: Iterable[tuple[int, int]]) -> int:

@@ -272,3 +272,18 @@ def test_invalid_seed_does_not_change_rng_or_environment(seed):
     assert actual_numpy_state[2:] == numpy_state[2:]
     assert torch.equal(torch.get_rng_state(), torch_state)
     assert os.environ.get("PYTHONHASHSEED") == hash_seed
+
+
+def test_seed_configuration_disables_anomaly_detection_for_subsequent_run():
+    from llmtuner.utils.seeding import seed_everything
+
+    enabled = torch.is_anomaly_enabled()
+    check_nan = torch.is_anomaly_check_nan_enabled()
+    try:
+        seed_everything(1, deterministic=False, detect_anomaly=True)
+        assert torch.is_anomaly_enabled()
+        assert not torch.is_anomaly_check_nan_enabled()
+        seed_everything(1, deterministic=False, detect_anomaly=False)
+        assert not torch.is_anomaly_enabled()
+    finally:
+        torch.autograd.set_detect_anomaly(enabled, check_nan=check_nan)

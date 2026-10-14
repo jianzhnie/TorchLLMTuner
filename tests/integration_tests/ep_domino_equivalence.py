@@ -32,8 +32,11 @@ def main():
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
         generator = torch.Generator().manual_seed(19)
-        for routed_class, zero_receives, recompute in product(
-            (RoutedExperts, DominoRoutedExperts), (False, True), (False, True)
+        for routed_class, zero_receives, recompute, small_rank in product(
+            (RoutedExperts, DominoRoutedExperts),
+            (False, True),
+            (False, True),
+            (None, 0, 1),
         ):
             reference_experts = GroupedExperts(8, 12, 4, use_grouped_mm=False).double()
             with torch.no_grad():
@@ -88,12 +91,19 @@ def main():
             )
             (expected * weights).sum().backward()
             token_slice = slice(0, 5) if rank == 0 else slice(5, 12)
+            if small_rank is not None:
+                token_slice = (
+                    slice(0, small_rank) if rank == 0 else slice(small_rank, 12)
+                )
             local_inputs = inputs[token_slice].clone().requires_grad_()
             local_scores = (
                 scores[token_slice].T.contiguous().T.detach().requires_grad_()
             )
             local_ids = expert_ids[token_slice].T.contiguous().T
-            assert not local_scores.is_contiguous() and not local_ids.is_contiguous()
+            if local_inputs.shape[0] > 1:
+                assert (
+                    not local_scores.is_contiguous() and not local_ids.is_contiguous()
+                )
             actual = distributed_experts(
                 local_inputs,
                 local_scores,
@@ -128,6 +138,7 @@ def main():
                 print(
                     f"{routed_class.__name__} zero_receives={zero_receives} "
                     f"recompute={recompute}: "
+                    f"small_rank={small_rank}: "
                     "forward and gradients match",
                     flush=True,
                 )

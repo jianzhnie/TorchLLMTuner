@@ -108,6 +108,10 @@ def init_dist_pytorch(backend, init_backend="torch", **kwargs) -> None:
             'nccl', 'gloo' and 'mpi'. Defaults to 'nccl'.
         **kwargs: keyword arguments are passed to ``init_process_group``.
     """
+    if device_type != "cuda" and init_backend != "torch":
+        raise ValueError(
+            f"init_backend={init_backend!r} is not supported on {device_type}"
+        )
     rank = int(os.environ["RANK"])
     # LOCAL_RANK is set by `torch.distributed.launch` since PyTorch 1.1
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -196,6 +200,10 @@ def init_dist_slurm(backend, port=None, init_backend="torch", **kwargs) -> None:
         backend (str): Backend of torch.distributed.
         port (int, optional): Master port. Defaults to None.
     """
+    if device_type != "cuda" and init_backend != "torch":
+        raise ValueError(
+            f"init_backend={init_backend!r} is not supported on {device_type}"
+        )
     proc_id = int(os.environ["SLURM_PROCID"])
     ntasks = int(os.environ["SLURM_NTASKS"])
     # Not sure when this environment variable could be None, so use a fallback

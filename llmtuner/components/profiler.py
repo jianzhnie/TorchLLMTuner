@@ -65,6 +65,14 @@ class MemoryProfiler:
         rank: int,
         max_entries: int,
     ) -> None:
+        for name, value, minimum in (
+            ("step_num", step_num, 0),
+            ("freq", freq, 1),
+            ("rank", rank, 0),
+            ("max_entries", max_entries, 1),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
         self._records_history = record_memory_history(max_entries=max_entries)
         if not self._records_history:
             # Not an error: the device has no allocator history to keep. Said
