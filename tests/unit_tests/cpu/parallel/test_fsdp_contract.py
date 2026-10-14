@@ -40,8 +40,8 @@ from llmtuner.parallel.fully_shard_parallel.fine_grained import (
 )
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     iter_transformer_layers,
-    set_fsdp_prefetch_windows,
 )
+from llmtuner.parallel.fully_shard_parallel.plan import set_fsdp_prefetch_windows
 
 _VOCAB = 32
 

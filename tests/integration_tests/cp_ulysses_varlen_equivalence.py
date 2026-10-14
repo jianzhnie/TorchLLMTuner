@@ -151,7 +151,7 @@ def _run_ulysses_packed(mesh, failures: list[str]) -> dict[str, float]:
     cfg = _cfg()
     model = _build_model(cfg, flex=True)
     ref = _build_model(cfg, flex=False)
-    apply_cp(model, mesh, cfg.parallel)
+    apply_cp(model, mesh=mesh, cfg=cfg.parallel)
 
     ids, labels, positions = _packed_data()
     with mock.patch(

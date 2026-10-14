@@ -130,7 +130,7 @@ def main():
             model.model.config._attn_implementation = "flex_torchtitan"
             if packed:
                 model.model.config.attn_mask_type = "block_causal"
-            apply_cp(model, mesh, cfg.parallel, topology)
+            apply_cp(model, mesh=mesh, cfg=cfg.parallel, parallel_dims=topology)
             with (
                 patch(
                     "llmtuner.models.hf.model.create_attention_mask",

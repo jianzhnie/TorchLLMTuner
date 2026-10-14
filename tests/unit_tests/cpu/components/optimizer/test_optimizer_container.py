@@ -45,6 +45,43 @@ def _catch_all(lr: float = 0.1, **kwargs) -> ParamGroupConfig:
     )
 
 
+def test_unmatched_trainable_parameters_fail_before_optimizer_creation(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("Incomplete parameter plans must fail before optimizer creation")
+
+    monkeypatch.setattr(torch.optim, "AdamW", unexpected)
+    group = ParamGroupConfig(
+        pattern=r"\.bias$", optimizer_name="AdamW", optimizer_kwargs={"lr": 0.1}
+    )
+    with pytest.raises(ValueError, match="unassigned.*0.weight"):
+        OptimizersContainer(_cfg(group), model_parts=[_model()])
+
+
+def test_unmatched_frozen_parameters_need_no_optimizer_group():
+    model = nn.Linear(2, 2)
+    model.weight.requires_grad_(False)
+    group = ParamGroupConfig(
+        pattern=r"bias$", optimizer_name="AdamW", optimizer_kwargs={"lr": 0.1}
+    )
+    container = OptimizersContainer(_cfg(group), model_parts=[model])
+    assert container.optimizers[0].param_groups[0]["params"] == [model.bias]
+
+
+def test_unknown_later_optimizer_fails_before_any_optimizer_creation(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("All optimizer names must be resolved before construction")
+
+    monkeypatch.setattr(torch.optim, "AdamW", unexpected)
+    groups = [
+        ParamGroupConfig(
+            pattern=r"\.bias$", optimizer_name="AdamW", optimizer_kwargs={"lr": 0.1}
+        ),
+        ParamGroupConfig(pattern=".*", optimizer_name="unknown"),
+    ]
+    with pytest.raises(NotImplementedError, match="unknown"):
+        OptimizersContainer(_cfg(*groups), model_parts=[_model()])
+
+
 def test_the_default_config_becomes_a_single_catch_all_group() -> None:
     """An empty ``param_groups`` must not mean "optimize nothing"."""
     cfg = OptimizerConfig(learning_rate=0.25)

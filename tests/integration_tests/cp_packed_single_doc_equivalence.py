@@ -111,7 +111,7 @@ def main() -> None:
     cfg = _cfg()
     model = _build_model(cfg, flex=True)
     ref = _build_model(cfg, flex=False)
-    apply_cp(model, mesh, cfg.parallel)
+    apply_cp(model, mesh=mesh, cfg=cfg.parallel)
 
     # One document filling the whole row: the packing collator's output for an
     # overlong document. Monotonic positions -- no restart anywhere.

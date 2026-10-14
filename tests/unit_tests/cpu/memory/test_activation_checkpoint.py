@@ -53,9 +53,9 @@ from llmtuner.config import (
     SelectiveACConfig,
     TrainingConfig,
 )
+from llmtuner.config.activation_checkpoint_config import VALID_AC_MODES
 from llmtuner.memory import activation_checkpoint as ac_mod
 from llmtuner.memory.activation_checkpoint import (
-    VALID_AC_MODES,
     apply_ac,
     get_default_save_ops,
     mm_recompute_shapes,
@@ -182,13 +182,61 @@ def test_region_needs_its_config() -> None:
         apply_ac(_model(), "region")
 
 
+def test_torch_checkpoint_debug_rejects_selective_context() -> None:
+    inputs = torch.ones(2, requires_grad=True)
+    with pytest.raises(ValueError, match="debug=True.*context_fn"):
+        torch.utils.checkpoint.checkpoint(
+            lambda value: value.square(),
+            inputs,
+            use_reentrant=False,
+            context_fn=lambda: ac_mod.checkpoint_contexts(ac_mod.full_policy),
+            debug=True,
+        )
+
+
+def test_selective_invalid_later_block_preserves_model_and_global_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _model()
+    blocks = tuple(model.layers.children())
+    parameters = tuple(model.parameters())
+
+    def unexpected_setup() -> None:
+        pytest.fail("invalid selective patterns must fail before global setup")
+
+    monkeypatch.setattr(ac_mod, "disable_dynamo_lru_cache", unexpected_setup)
+    with pytest.raises(ValueError, match="expected to match a nn.Linear"):
+        apply_ac(
+            model,
+            "selective",
+            selective=SelectiveACConfig(
+                force_recompute_mm_shapes_by_fqns=["layers.1.self_attn"]
+            ),
+        )
+    assert tuple(model.layers.children()) == blocks
+    assert all(
+        actual is original
+        for actual, original in zip(model.parameters(), parameters, strict=True)
+    )
+
+
 def test_region_without_torch_remat_is_a_loud_import_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The package is optional *and* version-gated: the error names both."""
     monkeypatch.setitem(sys.modules, "torch_remat", None)
+
+    def unexpected_setup() -> None:
+        pytest.fail("missing region dependency must fail before global setup")
+
+    monkeypatch.setattr(ac_mod, "disable_dynamo_lru_cache", unexpected_setup)
+    model = _model()
+    blocks = tuple(model.layers.children())
+    forwards = tuple(block.forward for block in blocks)
     with pytest.raises(ImportError, match="torch >= 2.10"):
-        apply_ac(_model(), "region", region=RegionACConfig())
+        apply_ac(model, "region", region=RegionACConfig())
+    assert tuple(model.layers.children()) == blocks
+    assert tuple(block.forward for block in blocks) == forwards
 
 
 def test_region_annotates_the_hf_projections_and_checkpoints_each_block(

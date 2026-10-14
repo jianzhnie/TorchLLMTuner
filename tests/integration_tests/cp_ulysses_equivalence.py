@@ -160,7 +160,7 @@ def _run_ulysses(
     cfg = _cfg(num_kv_heads)
     model = _build_model(cfg, flex=True)
     ref = _build_model(cfg, flex=False)
-    apply_cp(model, mesh, cfg.parallel)
+    apply_cp(model, mesh=mesh, cfg=cfg.parallel)
 
     ids, labels, positions = _data()
     ids_sh, labels_sh, pos_sh = shard_batch_for_cp(
@@ -299,7 +299,7 @@ def _check_refusals(mesh, failures: list[str]) -> None:
         ValueError,
         "num_key_value_heads",
         "attach with indivisible kv heads",
-        lambda: apply_cp(model, mesh, cfg.parallel),
+        lambda: apply_cp(model, mesh=mesh, cfg=cfg.parallel),
     )
     model = _build_model(_cfg(), flex=True)
     # As in a packed run: ``build_model_config_for`` derives this from the
@@ -307,7 +307,7 @@ def _check_refusals(mesh, failures: list[str]) -> None:
     # cp_ulysses_varlen_equivalence.py.
     model.model.config.attn_mask_type = "block_causal"
     try:
-        apply_cp(model, mesh, _cfg().parallel)
+        apply_cp(model, mesh=mesh, cfg=_cfg().parallel)
     except Exception as e:  # noqa: BLE001 - any raise here is the failure
         failures.append(f"attach with packed sequences raised: {e}")
     if model._cp_strategy != "ulysses":

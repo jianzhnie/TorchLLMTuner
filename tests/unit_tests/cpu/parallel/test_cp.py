@@ -37,7 +37,7 @@ def test_apply_cp_is_a_no_op_when_cp_is_off() -> None:
     model = torch.nn.Linear(4, 4)
     cfg = ParallelConfig(context_parallel_kv_allgather_size=1)
 
-    assert apply_cp(model, None, cfg) is model
+    assert apply_cp(model, mesh=None, cfg=cfg) is model
 
 
 def test_apply_cp_requires_the_flex_backend() -> None:
@@ -51,7 +51,7 @@ def test_apply_cp_requires_the_flex_backend() -> None:
     cfg = ParallelConfig(context_parallel_kv_allgather_size=2)
 
     with pytest.raises(RuntimeError, match="attention backend"):
-        apply_cp(torch.nn.Linear(4, 4), None, cfg)
+        apply_cp(torch.nn.Linear(4, 4), mesh=None, cfg=cfg)
 
 
 # -- the kernel's strategy dispatch -------------------------------------------
@@ -290,18 +290,18 @@ def test_ulysses_heads_must_divide_tp_times_cp(tp_cp_mesh) -> None:
     divides -- but the same 4 heads over tp=1 must still pass, and 2 heads
     over tp=2 (1 local) must refuse even though 2 % cp == 0."""
     model = _StubModel(num_attention_heads=4, num_key_value_heads=4)
-    apply_cp(model, tp_cp_mesh, _ulysses_cfg(tp=2))
+    apply_cp(model, mesh=tp_cp_mesh, cfg=_ulysses_cfg(tp=2))
 
     model = _StubModel(num_attention_heads=2, num_key_value_heads=2)
     with pytest.raises(ValueError, match=r"tp\*cp"):
-        apply_cp(model, tp_cp_mesh, _ulysses_cfg(tp=2))
+        apply_cp(model, mesh=tp_cp_mesh, cfg=_ulysses_cfg(tp=2))
 
 
 def test_ulysses_kv_heads_use_the_local_count_too(tp_cp_mesh) -> None:
     """num_key_value_heads falls under the same local-head rule."""
     model = _StubModel(num_attention_heads=8, num_key_value_heads=2)
     with pytest.raises(ValueError, match="num_key_value_heads"):
-        apply_cp(model, tp_cp_mesh, _ulysses_cfg(tp=2))
+        apply_cp(model, mesh=tp_cp_mesh, cfg=_ulysses_cfg(tp=2))
 
 
 def test_ulysses_replicated_attention_heads_are_not_divided_by_tp(tp_cp_mesh):
@@ -316,7 +316,7 @@ def test_ulysses_replicated_attention_heads_are_not_divided_by_tp(tp_cp_mesh):
     layer = torch.nn.Module()
     layer.self_attn = ReplicatedAttention()
     model.layers.append(layer)
-    apply_cp(model, tp_cp_mesh, _ulysses_cfg(tp=2))
+    apply_cp(model, mesh=tp_cp_mesh, cfg=_ulysses_cfg(tp=2))
     assert isinstance(layer.self_attn._titan_flex_kernel, CPFlexKernel)
 
 
@@ -330,13 +330,15 @@ def test_ulysses_packed_is_accepted_and_the_strategy_is_latched(tp_cp_mesh) -> N
     """
     model = _StubModel(num_attention_heads=4, num_key_value_heads=4)
     model.model.config.attn_mask_type = "block_causal"
-    apply_cp(model, tp_cp_mesh, _ulysses_cfg(tp=2))
+    apply_cp(model, mesh=tp_cp_mesh, cfg=_ulysses_cfg(tp=2))
     assert model.cp_strategy == "ulysses"
 
     model = _StubModel(num_attention_heads=4, num_key_value_heads=4)
     apply_cp(
         model,
-        tp_cp_mesh,
-        ParallelConfig(tensor_parallel_size=2, context_parallel_kv_allgather_size=2),
+        mesh=tp_cp_mesh,
+        cfg=ParallelConfig(
+            tensor_parallel_size=2, context_parallel_kv_allgather_size=2
+        ),
     )
     assert model.cp_strategy == "kv_allgather"

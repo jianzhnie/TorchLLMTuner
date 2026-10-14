@@ -445,9 +445,16 @@ def test_activation_checkpoint_messages_name_the_training_field() -> None:
 # -- CompileConfig / MemoryBudgetACConfig ------------------------------------
 
 
+@pytest.mark.parametrize("field", ["per_block", "enable_async_tensor_parallel"])
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_compile_switches_require_boolean_values(field, value):
+    with pytest.raises(ConfigError, match=field):
+        CompileConfig(**{field: value})
+
+
 def test_an_empty_compile_backend_is_rejected() -> None:
     """``torch.compile(backend="")`` fails inside inductor, far from the flag."""
-    with pytest.raises(ValueError, match="compile.backend cannot be empty"):
+    with pytest.raises(ValueError, match="compile.backend.*non-empty string"):
         CompileConfig(backend="")
     assert CompileConfig().backend == "inductor"
 
@@ -543,7 +550,7 @@ def test_cp_tp_joint_seq_len_divisibility() -> None:
     T=6, cp=2, tp=2 passes both single-axis checks but leaves a length-3
     shard for tp=2; the joint check catches it at config time.
     """
-    with pytest.raises(ValueError, match="cp \* tp"):
+    with pytest.raises(ValueError, match=r"cp \* tp"):
         LLMTunerConfig(
             parallel=ParallelConfig(
                 context_parallel_kv_allgather_size=2, tensor_parallel_size=2
@@ -639,6 +646,12 @@ def test_ac_determinism_check_is_an_enum() -> None:
         with pytest.raises(ConfigError, match="determinism_check"):
             cls(determinism_check="bogus")
         cls(determinism_check="none")
+
+
+def test_selective_ac_rejects_unsupported_debug_tracing() -> None:
+    with pytest.raises(ConfigError, match="selective_ac.debug.*context_fn"):
+        SelectiveACConfig(debug=True)
+    assert SelectiveACConfig(debug=False).debug is False
 
 
 def test_from_groups_does_not_mutate_the_parsed_groups() -> None:
@@ -847,6 +860,26 @@ def test_auto_fill_reads_local_hf_architecture(tmp_path, monkeypatch, relative):
         "num_key_value_heads",
     ):
         assert getattr(cfg.model, field) == getattr(saved, field)
+
+
+@pytest.mark.parametrize(
+    "identifier", ["llama", "/missing/model/path", "local-checkpoint", "org/model"]
+)
+def test_auto_fill_only_skips_registered_offline_architectures(monkeypatch, identifier):
+    from transformers import AutoConfig
+
+    calls = []
+
+    def load_config(name):
+        calls.append(name)
+        return AutoConfig.for_model("llama", vocab_size=257)
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", load_config)
+    cfg = LLMTunerConfig(model=ModelConfig(model_name_or_path=identifier))
+    cfg.auto_fill_model()
+    assert calls == ([] if identifier == "llama" else [identifier])
+    if calls:
+        assert cfg.vocab_size == 257
 
 
 def test_auto_fill_uses_composite_hf_text_architecture(tmp_path):

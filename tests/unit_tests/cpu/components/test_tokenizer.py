@@ -7,6 +7,66 @@ from tokenizers.models import WordLevel
 from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
 
 
+@pytest.mark.parametrize("source", ["vocab.json", "vocab.txt", "tokenizer.json"])
+def test_added_tokens_preserve_configured_ids_and_decoder_flags(tmp_path, source):
+    vocab = {"[UNK]": 0, "hello": 1}
+    if source == "tokenizer.json":
+        backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+        backend.add_tokens(["<extra>", "<eos>"])
+        backend.save(str(tmp_path / source))
+    elif source == "vocab.json":
+        (tmp_path / source).write_text(json.dumps(vocab), encoding="utf-8")
+    else:
+        (tmp_path / source).write_text("[UNK]\nhello\n", encoding="utf-8")
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "eos_token": "<eos>",
+                "add_eos_token": True,
+                "added_tokens_decoder": {
+                    "3": {"content": "<eos>", "special": True},
+                    "2": {"content": "<extra>", "special": False},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    tokenizer = HuggingFaceTokenizer(tokenizer_path=str(tmp_path))
+    assert tokenizer.token_to_id("<extra>") == 2
+    assert tokenizer.eos_id == 3
+    assert tokenizer.encode("hello") == [1, 3]
+    assert tokenizer.decode([2, 3], skip_special_tokens=True) == "<extra>"
+    assert tokenizer.get_vocab_size() == 4
+
+
+@pytest.mark.parametrize(
+    "decoder",
+    [
+        {"3": {"content": "<gap>"}},
+        {"1": {"content": "[UNK]"}},
+        {"2": {"content": "<same>"}, "3": {"content": "<same>"}},
+        {"2": {"content": "<one>"}, "02": {"content": "<two>"}},
+        {"-1": {"content": "<negative>"}},
+        {"bad": {"content": "<invalid>"}},
+        {"": {"content": "<empty-id>"}},
+        {"٢": {"content": "<unicode-id>"}},
+        {"２": {"content": "<fullwidth-id>"}},
+        {"+2": {"content": "<signed-id>"}},
+        {"2.0": {"content": "<fractional-id>"}},
+    ],
+)
+def test_incompatible_added_token_ids_fail_before_vocabulary_changes(decoder):
+    tokenizer = HuggingFaceTokenizer.__new__(HuggingFaceTokenizer)
+    tokenizer.tokenizer = Tokenizer(
+        WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")
+    )
+    tokenizer._hf_config = {"bos_token": "<bos>", "added_tokens_decoder": decoder}
+    original = tokenizer.tokenizer.get_vocab()
+    with pytest.raises(ValueError):
+        tokenizer._infer_special_tokens()
+    assert tokenizer.tokenizer.get_vocab() == original
+
+
 @pytest.mark.parametrize("rule", ["a", "a b extra"])
 def test_bpe_merge_rejects_malformed_rules_with_line_number(tmp_path, rule):
     (tmp_path / "vocab.json").write_text(

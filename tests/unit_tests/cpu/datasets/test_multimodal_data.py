@@ -51,7 +51,7 @@ from llmtuner.datasets.multimodal.packing import (
 from llmtuner.datasets.multimodal.placeholders import insert_vision_placeholders
 from llmtuner.datasets.multimodal.processors import (
     MultimodalProcessor,
-    process_cc12_wd_sample,
+    process_cc12m_sample,
     process_multimodal_sample,
 )
 from llmtuner.datasets.multimodal.video import load_video, process_video
@@ -413,19 +413,19 @@ def test_process_multimodal_sample_drops_the_sample_when_one_image_fails(
     )
 
 
-def test_process_cc12_wd_sample_reads_the_pair_format(mm_tokenizer, image_bytes):
-    result = process_cc12_wd_sample(
+def test_process_cc12m_sample_reads_the_pair_format(mm_tokenizer, image_bytes):
+    result = process_cc12m_sample(
         {"txt": "hello", "jpg": image_bytes}, tokenizer=mm_tokenizer, **MM_KWARGS
     )
     assert result is not None
     assert len(result["pixel_values"]) == 1
 
 
-def test_process_cc12_wd_sample_raises_when_the_image_field_is_absent(mm_tokenizer):
+def test_process_cc12m_sample_raises_when_the_image_field_is_absent(mm_tokenizer):
     """A row without a ``jpg`` key is malformed for this dataset, not an image
     that failed to decode -- so it raises rather than being silently dropped."""
     with pytest.raises(ValueError, match="one vision token count per placeholder"):
-        process_cc12_wd_sample({"txt": "hello"}, tokenizer=mm_tokenizer, **MM_KWARGS)
+        process_cc12m_sample({"txt": "hello"}, tokenizer=mm_tokenizer, **MM_KWARGS)
 
 
 # --------------------------------------------------------------------------
@@ -436,7 +436,7 @@ def test_process_cc12_wd_sample_raises_when_the_image_field_is_absent(mm_tokeniz
 def _mm_processor(mm_tokenizer, *, max_context_length=256):
     return MultimodalProcessor(
         context=make_context(mm_tokenizer, max_context_length=max_context_length),
-        sample_processor=process_cc12_wd_sample,
+        sample_processor=process_cc12m_sample,
     )
 
 
@@ -502,7 +502,7 @@ class _CtxSizedMMProcessor(MultimodalProcessor):
 
         super().__init__(
             context=replace(context, max_context_length=1024),
-            sample_processor=process_cc12_wd_sample,
+            sample_processor=process_cc12m_sample,
         )
 
 
@@ -1072,7 +1072,7 @@ def test_multimodal_constructors_reject_zero_patch_sizes(mm_tokenizer, field):
     with pytest.raises(ValueError, match="patch sizes must be positive"):
         MultimodalProcessor(
             context=make_context(mm_tokenizer),
-            sample_processor=process_cc12_wd_sample,
+            sample_processor=process_cc12m_sample,
             **{field: 0},
         )
 
@@ -1096,15 +1096,20 @@ def test_resize_rejects_empty_dimensions_before_division(resize_fn, budgets):
 def test_smart_resize_respects_tight_budgets_and_narrow_aspect_ratios(
     height, width, min_pixels, max_pixels
 ):
-    h, w = smart_resize(height, width, 32, min_pixels, max_pixels)
+    h, w = smart_resize(
+        height, width, factor=32, min_pixels=min_pixels, max_pixels=max_pixels
+    )
     assert h % 32 == 0 and w % 32 == 0
     assert min_pixels <= h * w <= max_pixels
 
 
 def test_smart_resize_rejects_budgets_with_no_feasible_grid():
     with pytest.raises(ValueError, match="no factor-aligned patch grid"):
-        smart_resize(32, 64, 32, 1100, 1200)
+        smart_resize(32, 64, factor=32, min_pixels=1100, max_pixels=1200)
 
 
 def test_smart_resize_preserves_upstream_result_when_already_in_budget():
-    assert smart_resize(100, 200, 32, 1024, 100000000) == (96, 192)
+    assert smart_resize(100, 200, factor=32, min_pixels=1024, max_pixels=100000000) == (
+        96,
+        192,
+    )

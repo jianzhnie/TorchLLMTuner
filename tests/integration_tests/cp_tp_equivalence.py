@@ -168,7 +168,7 @@ def _run_strategy(name, *, strategy, cp_mesh, tp_mesh, failures) -> dict[str, fl
 
     # TP then CP, the order parallelize_hf_transformers uses.
     model = apply_tp(model, tp_mesh, cfg.parallel)
-    apply_cp(model, _dense_view(cp_mesh, tp_mesh), cfg.parallel)
+    apply_cp(model, mesh=_dense_view(cp_mesh, tp_mesh), cfg=cfg.parallel)
 
     # Non-vacuity on the TP axis: at least the q/k/v/o and gate/up/down
     # projections must have been swapped for sharded realizers. A count of
@@ -287,12 +287,14 @@ def _check_ulysses_headcount_guard(cp_mesh, tp_mesh, failures) -> None:
     """
     ok = _cfg("ulysses", heads=HEADS)
     model_ok = _build(ok, flex=True)
-    apply_cp(model_ok, _dense_view(cp_mesh, tp_mesh), ok.parallel)  # must not raise
+    apply_cp(
+        model_ok, mesh=_dense_view(cp_mesh, tp_mesh), cfg=ok.parallel
+    )  # must not raise
 
     bad = _cfg("ulysses", heads=HEADS // 2 + 2)  # 6, not divisible by tp*cp=4
     model_bad = _build(bad, flex=True)
     try:
-        apply_cp(model_bad, _dense_view(cp_mesh, tp_mesh), bad.parallel)
+        apply_cp(model_bad, mesh=_dense_view(cp_mesh, tp_mesh), cfg=bad.parallel)
     except ValueError:
         return
     failures.append(
