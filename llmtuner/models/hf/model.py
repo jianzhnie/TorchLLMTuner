@@ -216,7 +216,12 @@ class HFTransformerModel(nn.Module):
     # -- HF integration hooks --------------------------------------------------
 
     def set_cp_mesh(
-        self, mesh, *, load_balancer: str | None = None, strategy: str = "kv_allgather"
+        self,
+        mesh,
+        *,
+        load_balancer: str | None = None,
+        strategy: str = "kv_allgather",
+        mask_mesh=None,
     ) -> None:
         """Record the CP mesh so logit dumps can tag their CP coordinate.
 
@@ -225,8 +230,13 @@ class HFTransformerModel(nn.Module):
         match the strategy -- kv_allgather attends gathered K/V against a
         Q-sharded mask, while ulysses reassembles the full sequence in the
         all-to-all and needs a packed corpus's document mask full-length.
+        With dual CP axes, ``mask_mesh`` selects the KV axis because Ulysses
+        assembles queries within each KV shard before attention.
         """
         self.cp_mesh = mesh
+        # Dual CP gathers queries within Ulysses, so masks shard only over KV.
+        # Token inputs and positions still shard over the total CP mesh.
+        self._cp_mask_mesh = mesh if mask_mesh is None else mask_mesh
         self._cp_load_balancer = load_balancer
         self._cp_strategy = strategy
 
@@ -338,7 +348,7 @@ class HFTransformerModel(nn.Module):
             if self._cp_strategy != "ulysses":
                 attention_masks = shard_attention_mask_for_cp(
                     attention_masks,
-                    cp_mesh,
+                    getattr(self, "_cp_mask_mesh", cp_mesh),
                     self._cp_load_balancer,
                 )
             if self.model.config._attn_implementation != ATTENTION_BACKEND:
@@ -630,7 +640,9 @@ class HFTransformerModel(nn.Module):
         mask = self.get_attention_masks(positions=full_positions)
         if self._cp_strategy == "ulysses":
             return mask
-        return shard_attention_mask_for_cp(mask, self.cp_mesh, self._cp_load_balancer)
+        return shard_attention_mask_for_cp(
+            mask, getattr(self, "_cp_mask_mesh", self.cp_mesh), self._cp_load_balancer
+        )
 
     # -- forward ---------------------------------------------------------------
 

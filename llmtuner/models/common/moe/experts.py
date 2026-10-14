@@ -145,6 +145,12 @@ class GroupedExperts(nn.Module):
         numeric baseline cannot see. FP16 also has more mantissa bits than
         BF16, so it uses the loop instead of losing precision in this cast.
         """
+        if x_TD.shape[0] == 0:
+            # A rank with no expert tokens must still traverse dispatch in
+            # backward. Empty linear keeps the input and weight graph alive
+            # and produces zero parameter gradients without any expert work.
+            return F.linear(x_TD, weight_EOI[0].to(x_TD.dtype))
+
         if self.use_grouped_mm and x_TD.dtype == torch.bfloat16:
             return torch._grouped_mm(
                 x_TD.bfloat16(),

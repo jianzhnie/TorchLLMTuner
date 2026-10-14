@@ -44,6 +44,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ...accelerator import distributed
+from ...components.checkpointer.checkpoint_keys import canonical_fqn
 
 try:  # torch >= 2.4; the FSDP path (DTensor expert weights) needs it.
     from torch.distributed.tensor import DTensor, distribute_tensor
@@ -82,13 +83,15 @@ def expert_shard_map(
                 continue
             for name, _ in module.named_parameters(recurse=False):
                 fqn = f"{module_path}.{name}" if module_path else name
-                shard_map[fqn] = group
+                shard_map[canonical_fqn(fqn)] = group
     return shard_map
 
 
 def named_params(model_parts: list[nn.Module]) -> dict[str, torch.Tensor]:
     return {
-        fqn: param for model in model_parts for fqn, param in model.named_parameters()
+        canonical_fqn(fqn): param
+        for model in model_parts
+        for fqn, param in model.named_parameters()
     }
 
 

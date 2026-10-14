@@ -365,9 +365,9 @@ class CPFlexKernel(nn.Module):
 class DualCPFlexKernel(nn.Module):
     """Compose independent KV-AllGather and Ulysses process groups.
 
-    Q is redistributed only across Ulysses. K/V first gather their sequence
-    shards across the KV axis and then exchange sequence for heads across the
-    Ulysses axis. Attention consequently sees ``S / kv`` queries and full-S
+    Q is redistributed only across Ulysses. K/V exchange sequence for heads
+    across Ulysses before gathering across KV, preserving the input mesh's
+    KV-outer, Ulysses-inner token order. Attention sees ``S / kv`` queries and full-S
     keys while retaining the total ``kv * ulysses`` input/output token shard.
     """
 
@@ -382,12 +382,12 @@ class DualCPFlexKernel(nn.Module):
         self._ulysses_group = ulysses_mesh.get_group()
 
     def forward(self, query, key, value, *, module, block_mask=None, **kwargs):
-        key, value = self._flex_cp_allgather(
-            key.contiguous(), value.contiguous(), _SEQ_DIM, self._kv_pg_name
-        )
         q = SeqToHead.apply(query.contiguous(), self._ulysses_group)
         k = SeqToHead.apply(key.contiguous(), self._ulysses_group)
         v = SeqToHead.apply(value.contiguous(), self._ulysses_group)
+        k, v = self._flex_cp_allgather(
+            k.contiguous(), v.contiguous(), _SEQ_DIM, self._kv_pg_name
+        )
         out = run_flex(module, q, k, v, block_mask, kwargs)
         out = HeadToSeq.apply(out.contiguous(), self._ulysses_group)
         return out.transpose(1, 2)
