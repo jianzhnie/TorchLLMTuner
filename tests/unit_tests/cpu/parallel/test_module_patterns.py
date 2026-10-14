@@ -8,7 +8,7 @@ from llmtuner.parallel.module_patterns import (
 
 def test_invalid_pattern_is_checked_with_empty_module_inventory():
     with pytest.raises(ValueError, match="invalid module pattern range"):
-        resolve_module_patterns([], ["layers.{3-1}"], plan_name="FSDP")
+        resolve_module_patterns([], patterns=["layers.{3-1}"], plan_name="FSDP")
 
 
 @pytest.mark.parametrize(
@@ -29,7 +29,9 @@ def test_extended_module_patterns(pattern: str, name: str, expected: bool) -> No
 
 def test_pattern_resolution_rejects_unmatched_pattern() -> None:
     with pytest.raises(ValueError, match="matched no module"):
-        resolve_module_patterns(["model.layers.0"], ["missing.*"], plan_name="TP")
+        resolve_module_patterns(
+            ["model.layers.0"], patterns=["missing.*"], plan_name="TP"
+        )
 
 
 @pytest.mark.parametrize("pattern", ["layers.{１-３}", "layers.{١-٣}"])

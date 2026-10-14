@@ -717,3 +717,18 @@ def test_ffn_save_hook_preserves_entries_if_bias_split_fails():
         FeedForward._split_w13_on_save(ffn, state, "", {})
     assert state.keys() == original.keys()
     assert all(state[key] is value for key, value in original.items())
+
+
+@pytest.mark.parametrize("field", ["dim", "hidden_dim", "num_experts"])
+@pytest.mark.parametrize("value", [True, False, 1.5, "2"])
+def test_grouped_experts_rejects_noninteger_dimensions(field, value):
+    options = {"dim": 4, "hidden_dim": 8, "num_experts": 2}
+    options[field] = value
+    with pytest.raises(ValueError, match=field + " must be positive integer"):
+        GroupedExperts(**options)
+
+
+@pytest.mark.parametrize("value", [1, "false", 0.0])
+def test_grouped_experts_rejects_nonboolean_backend_override(value):
+    with pytest.raises(TypeError, match="use_grouped_mm must be bool or None"):
+        GroupedExperts(4, 8, 2, use_grouped_mm=value)

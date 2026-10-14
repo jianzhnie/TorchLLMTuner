@@ -387,7 +387,9 @@ def test_every_layer_of_every_part_is_updated() -> None:
         assert float(moe.tokens_per_expert_E.sum()) == 0.0, "a counter was not drained"
 
 
-@pytest.mark.parametrize("coeff", [float("nan"), float("inf"), -float("inf")])
-def test_moe_rejects_non_finite_balance_coefficient(coeff):
+@pytest.mark.parametrize(
+    "coeff", [float("nan"), float("inf"), -float("inf"), True, False, "0.1", 0, -1]
+)
+def test_moe_rejects_invalid_balance_coefficient(coeff):
     with pytest.raises(ValueError, match="load_balance_coeff must be finite"):
         _moe(coeff=coeff)

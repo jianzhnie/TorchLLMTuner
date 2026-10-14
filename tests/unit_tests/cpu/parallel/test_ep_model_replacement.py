@@ -848,12 +848,13 @@ def test_the_fp32_restore_covers_the_bias_buffer() -> None:
     ``Module.to``.
     """
     from llmtuner.models.common.moe.experts import GroupedExperts
+    from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
 
     grouped = GroupedExperts(dim=16, hidden_dim=32, num_experts=256)
     moe = MoE(
         num_experts=256,
         routed_experts=RoutedExperts(grouped, None),
-        router=torch.nn.Linear(16, 256, bias=False),
+        router=TokenChoiceTopKRouter(num_experts=256, dim=16),
         load_balance_coeff=1e-3,
     )
     assert moe.expert_bias_E is not None, "no bias registered -- vacuous"
@@ -867,7 +868,7 @@ def test_the_fp32_restore_covers_the_bias_buffer() -> None:
 
     assert moe.expert_bias_E.dtype == torch.float32
     assert moe.tokens_per_expert_E.dtype == torch.float32
-    assert moe.router.weight.dtype == torch.bfloat16  # params still follow
+    assert moe.router.gate.weight.dtype == torch.bfloat16  # params still follow
 
     # Exactness, which is the whole reason the dtype matters.
     # 0.012345 as bf16 is 0.012329; as fp32 it is exact to float32 precision.
@@ -892,6 +893,32 @@ def test_ep_conversion_preserves_parameter_freezing():
         assert not experts.w1_EFD.requires_grad
         assert not experts.w3_EFD.requires_grad
         assert experts.w2_EDF.requires_grad
+
+
+def test_interrupted_conversion_restores_auxiliary_counts(monkeypatch):
+    from llmtuner.parallel.expert_parallel import model_replacement
+
+    model = _model(_config(norm_topk_prob=True))
+    original_blocks = [layer.mlp for layer in model.layers]
+    counts_before = dict(AuxLoss._group_counts)
+    convert = model_replacement.convert_block
+    calls = 0
+
+    def interrupted(block, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt("conversion interrupted")
+        return convert(block, **kwargs)
+
+    monkeypatch.setattr(model_replacement, "convert_block", interrupted)
+    with pytest.raises(KeyboardInterrupt, match="conversion interrupted"):
+        swap_hf_moe_blocks(model, router_aux_loss_coef=0.01)
+    assert dict(AuxLoss._group_counts) == counts_before
+    assert all(
+        layer.mlp is original
+        for layer, original in zip(model.layers, original_blocks, strict=True)
+    )
 
 
 def test_later_router_conversion_error_preserves_original_block_slots():

@@ -5,6 +5,26 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 
 from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+from llmtuner.components.tokenizer.multimodal import MultimodalTokenizer
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_multimodal_tokens_resolve_from_base_vocabulary(tmp_path, missing):
+    tokens = {name: f"<{name}>" for name in MultimodalTokenizer.TOKEN_FIELDS}
+    vocab = {token: index for index, token in enumerate(tokens.values())}
+    vocab["[UNK]"] = len(vocab)
+    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    assert backend.get_added_tokens_decoder() == {}
+    backend.save(str(tmp_path / "tokenizer.json"))
+    kwargs = {f"{name}_token": token for name, token in tokens.items()}
+    if missing:
+        kwargs["image_token"] = "<missing>"
+        with pytest.raises(ValueError, match="not found in tokenizer"):
+            MultimodalTokenizer(tokenizer_path=str(tmp_path), **kwargs)
+    else:
+        tokenizer = MultimodalTokenizer(tokenizer_path=str(tmp_path), **kwargs)
+        for name, token in tokens.items():
+            assert getattr(tokenizer, f"{name}_id") == vocab[token]
 
 
 @pytest.mark.parametrize("source", ["vocab.json", "vocab.txt", "tokenizer.json"])
