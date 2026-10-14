@@ -318,6 +318,63 @@ def test_fine_grained_adapter_rejects_a_distinct_hook_target() -> None:
         fully_shard_fine_grained(nn.Linear(2, 2), hook_module=nn.Identity())
 
 
+@pytest.mark.parametrize("implementation", ["native", "custom"])
+@pytest.mark.parametrize("override", ["hook_module", "reshard_after_foward"])
+def test_invalid_pattern_override_rejected_before_any_sharding(
+    monkeypatch, implementation, override
+):
+    from llmtuner.config import ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_implementation=implementation,
+            fsdp_apply_modules={"0": {}, "1": {override: nn.Identity()}},
+        )
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid override must be rejected before strategy execution")
+
+    monkeypatch.setattr(plan, "get_fsdp_strategy", unexpected)
+    with pytest.raises(ValueError, match=override):
+        plan.apply_fsdp_by_pattern(
+            model,
+            dp_mesh=object(),
+            cfg=cfg,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+        )
+
+
+@pytest.mark.parametrize("container", [nn.ModuleList, nn.ModuleDict])
+def test_pattern_container_rejected_before_any_sharding(monkeypatch, container):
+    from llmtuner.config import ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(
+        nn.Linear(2, 2),
+        container([nn.Linear(2, 2)])
+        if container is nn.ModuleList
+        else container({"linear": nn.Linear(2, 2)}),
+    )
+    cfg = ParallelConfig(fsdp_config=FSDPConfig(fsdp_apply_modules={"*": {}}))
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("container selection must fail before strategy execution")
+
+    monkeypatch.setattr(plan, "get_fsdp_strategy", unexpected)
+    with pytest.raises(ValueError, match="container without forward"):
+        plan.apply_fsdp_by_pattern(
+            model,
+            dp_mesh=object(),
+            cfg=cfg,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+        )
+
+
 def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
     from types import SimpleNamespace
 
@@ -352,6 +409,43 @@ def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
     assert calls[0][1]["mp_policy"] is override_policy
     assert calls[1][0] is model
     assert calls[1][1]["mp_policy"] is not override_policy
+
+
+@pytest.mark.parametrize("unit_ignored", [None, set()])
+def test_unit_override_cannot_clear_global_fsdp_exclusions(monkeypatch, unit_ignored):
+    from types import SimpleNamespace
+
+    from llmtuner.config import ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    calls = []
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"0": {"ignored_params": unit_ignored}},
+            fsdp_ignored_modules=["1"],
+        )
+    )
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda implementation: SimpleNamespace(
+            get_fully_shard_fn=lambda: (
+                lambda module, **kwargs: calls.append(kwargs["ignored_params"])
+            )
+        ),
+    )
+    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda model: None)
+    plan.apply_fsdp_by_pattern(
+        model,
+        dp_mesh=object(),
+        cfg=cfg,
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+    )
+    assert calls == [set(model[1].parameters()), set(model[1].parameters())]
+    assert calls[0] is not calls[1]
 
 
 @pytest.mark.parametrize(

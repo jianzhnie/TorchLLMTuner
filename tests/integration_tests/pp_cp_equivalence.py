@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
@@ -87,11 +88,16 @@ def _cfg() -> LLMTunerConfig:
     )
 
 
-def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
+def _reference_trajectory(
+    cfg: LLMTunerConfig, initial_state: dict[str, torch.Tensor]
+) -> list[float]:
     """The same steps in one process: no pipeline, no CP (CP is numerically
     transparent: every rank attends the same full K/V)."""
     torch.manual_seed(cfg.seed)
     model = HFTransformerModel(build_model_config_for(cfg))
+    # Pipeline stages use stage-specific initialization seeds. Compare the
+    # same weights so initialization differences cannot masquerade as CP errors.
+    model.load_state_dict(initial_state, strict=True)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr,
@@ -154,6 +160,20 @@ def main() -> None:
         )
 
     # -- the trajectory ------------------------------------------------------
+    local_initial_state = {}
+    for part in trainer.model_parts:
+        for key, value in part.state_dict().items():
+            if isinstance(value, DTensor):
+                value = value.full_tensor()
+            local_initial_state[key] = value.detach().cpu().clone()
+    stage_states = [None] * trainer.world_size
+    dist.all_gather_object(stage_states, local_initial_state)
+    initial_state = {}
+    for stage_state in stage_states:
+        for key, value in stage_state.items():
+            if key in initial_state:
+                torch.testing.assert_close(initial_state[key], value, rtol=0, atol=0)
+            initial_state[key] = value
     data_iterator = trainer.data_iterator()
     pp_cp_losses = []
     for _step in range(STEPS):
@@ -163,7 +183,7 @@ def main() -> None:
         pp_cp_losses.append(metrics["loss"])
     trainer.close()
 
-    reference = _reference_trajectory(cfg)
+    reference = _reference_trajectory(cfg, initial_state)
     for step, (got, want) in enumerate(zip(pp_cp_losses, reference, strict=True)):
         if abs(got - want) > TOL:
             failures.append(f"rank {rank} step {step + 1}: loss {got} vs {want}")

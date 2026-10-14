@@ -161,9 +161,9 @@ def main() -> None:
     if abs(got_loss - ref_loss) > TOL:
         failures.append(f"rank {rank}: loss {got_loss:.6f} vs reference {ref_loss:.6f}")
 
-    num_local = NUM_EXPERTS // cfg.ep
+    num_local = NUM_EXPERTS // cfg.ep_size
     # Sparse mesh layout (dp_replicate, efsdp, ep): ep coordinate is fastest.
-    ep_rank = rank % cfg.ep
+    ep_rank = rank % cfg.ep_size
     lo_e = ep_rank * num_local
     for layer_idx, (layer, ref_layer) in enumerate(
         zip(model.layers, ref.layers, strict=True)

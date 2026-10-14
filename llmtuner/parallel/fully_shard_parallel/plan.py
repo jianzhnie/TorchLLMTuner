@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import Shard
 
 from llmtuner.config.parallel_config import ParallelConfig
@@ -97,6 +98,36 @@ def apply_fsdp_by_pattern(
 ) -> None:
     """Apply independently configured FSDP units selected by module patterns."""
     named_modules, unit_options, ignored_params = _resolve_pattern_units(model, cfg)
+    for name in [*unit_options, ""]:
+        if isinstance(named_modules[name], nn.ModuleList | nn.ModuleDict):
+            raise ValueError(
+                f"FSDP unit {name!r} is a container without forward; select its "
+                "children or a parent module that implements forward"
+            )
+    allowed_overrides = {
+        name
+        for name, parameter in inspect.signature(fully_shard).parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    } | {"hook_module"}
+    for name, options in unit_options.items():
+        unknown = options.keys() - allowed_overrides
+        if unknown:
+            raise ValueError(
+                f"FSDP unit {name!r} has unsupported overrides: {sorted(unknown)}"
+            )
+    # Validate every hook override before sharding any unit. A late rejection
+    # would otherwise leave earlier units transformed on a failed assembly.
+    for name, options in unit_options.items():
+        if "hook_module" not in options:
+            continue
+        if cfg.fsdp_config.fsdp_implementation == "native":
+            raise ValueError("native FSDP does not accept a hook_module override")
+        target = options["hook_module"]
+        if target is not None and target is not named_modules[name]:
+            raise ValueError(
+                "PyTorch 2.14 native FSDP cannot attach a unit to a separate "
+                "hook_module; select the managed module as the hook target"
+            )
     # The entry module imports this plan; defer runtime-policy imports.
     from .fully_shard_parallel import (
         build_fsdp_placement_fn,
@@ -144,6 +175,11 @@ def apply_fsdp_by_pattern(
     unit_names = sorted(unit_options, key=lambda item: item.count("."), reverse=True)
     for name in [*unit_names, ""]:
         options = common | unit_options.get(name, {})
+        # Per-unit exclusions may add parameters, but cannot undo the global
+        # ignored-module boundary. Keep a fresh set for each unit.
+        options["ignored_params"] = ignored_params | (
+            options["ignored_params"] or set()
+        )
         if expert_placements and "shard_placement_fn" not in options:
             assert edp_mesh is not None
             options["shard_placement_fn"] = build_fsdp_placement_fn(

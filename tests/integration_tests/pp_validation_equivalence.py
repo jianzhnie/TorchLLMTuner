@@ -5,11 +5,12 @@ Run under torchrun with 2 ranks:
     PYTHONPATH=. torchrun --nproc_per_node=2 \\
         tests/integration_tests/pp_validation_equivalence.py
 
-A tiny qwen3 trains under pp=2 with validation enabled (freq=1, steps=1).
+A tiny qwen3 trains under pp=2 with validation enabled (freq=1, steps=2).
 Every train step is followed by a validation pass driven through
 ``schedule.eval`` (upstream's Validator seam). The check pins: the pass runs
 on both ranks without hanging, the logged validation loss is finite and
-positive, and the model returns to train mode afterwards.
+positive, matches an unpipelined model with the same microbatch boundaries,
+and the model returns to train mode afterwards.
 
 Environment note: needs torch >= 2.12 (the pipelining surface; the eval
 driver is gated by the ``pipelining_microbatch_drivers`` capability). Verified
@@ -20,7 +21,9 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
+from llmtuner.components.loss import IGNORE_INDEX, next_token_targets
 from llmtuner.config import (
     LLMTunerConfig,
     MetricsConfig,
@@ -30,6 +33,9 @@ from llmtuner.config import (
     ValidationConfig,
 )
 from llmtuner.config.parallel_config import PipelineParallelConfig
+from llmtuner.datasets.synthetic import RandomTokenSource
+from llmtuner.models.hf.factory import build_model_config_for
+from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
 
 STEPS = 2
@@ -39,6 +45,8 @@ SEQ = 32
 VOCAB = 128
 PP = 2
 WORLD = 2
+VALIDATION_STEPS = 2
+TOL = 1e-5
 
 
 def _cfg() -> LLMTunerConfig:
@@ -66,9 +74,57 @@ def _cfg() -> LLMTunerConfig:
             seed=42,
             deterministic=True,
             metrics_config=MetricsConfig(log_freq=1),
-            validation_config=ValidationConfig(freq=1, steps=1),
+            validation_config=ValidationConfig(freq=1, steps=VALIDATION_STEPS),
         ),
     )
+
+
+@torch.no_grad()
+def _reference_validation(trainer: Trainer) -> float:
+    """Reconstruct current stage weights and independently score the same corpus."""
+    local_state = {
+        name: tensor.detach().cpu().clone()
+        for part in trainer.model_parts
+        for name, tensor in part.state_dict().items()
+    }
+    stage_states = [None] * WORLD
+    dist.all_gather_object(stage_states, local_state)
+    state = {}
+    for stage_state in stage_states:
+        for name, tensor in stage_state.items():
+            if name in state:
+                torch.testing.assert_close(state[name], tensor, rtol=0, atol=0)
+            state[name] = tensor
+    # Isolate reference initialization from the training process's RNG state.
+    with torch.random.fork_rng(devices=[]):
+        model = HFTransformerModel(build_model_config_for(trainer.cfg)).eval()
+    model.load_state_dict(state, strict=True)
+    batches = iter(
+        RandomTokenSource(
+            seed=trainer.cfg.seed,
+            vocab_size=VOCAB,
+            batch_size=GLOBAL_BATCH,
+            seq_len=SEQ,
+        )
+    )
+    loss_sum = torch.zeros(())
+    valid_tokens = 0
+    for _ in range(VALIDATION_STEPS):
+        batch = next(batches)
+        targets = next_token_targets(batch.labels, seq_len=SEQ).reshape(
+            GLOBAL_BATCH, SEQ
+        )
+        valid_tokens += int((targets != IGNORE_INDEX).sum())
+        for inputs, labels in zip(
+            batch.input_ids.chunk(MICROBATCHES),
+            targets.chunk(MICROBATCHES),
+            strict=True,
+        ):
+            logits = model(inputs.reshape(-1))
+            loss_sum += F.cross_entropy(
+                logits.float(), labels.reshape(-1), reduction="sum"
+            )
+    return float(loss_sum) / valid_tokens
 
 
 def main() -> None:
@@ -92,10 +148,12 @@ def main() -> None:
     trainer.metrics.log_validation = _capture
 
     data_iterator = trainer.data_iterator()
+    expected: list[float] = []
     for _ in range(STEPS):
         trainer.step += 1
         trainer.train_step(data_iterator)
         if trainer.should_validate(trainer.step):
+            expected.append(_reference_validation(trainer))
             trainer.validate(trainer.step)
     trainer.close()
 
@@ -107,18 +165,31 @@ def main() -> None:
             )
         if any(not (0.0 < loss < float("inf")) for loss in reported):
             failures.append(f"rank {rank}: non-finite validation loss {reported}")
+        if len(reported) == len(expected):
+            if any(
+                abs(actual - ref) > TOL
+                for actual, ref in zip(reported, expected, strict=True)
+            ):
+                failures.append(
+                    f"rank {rank}: validation losses {reported} differ from {expected}"
+                )
     if any(not part.training for part in trainer.model_parts):
         failures.append(f"rank {rank}: a model part is still in eval mode")
 
-    if rank == 0:
+    if trainer.pp_has_last_stage:
         print(f"pp={PP} validation freq=1 steps={STEPS}")
         print(f"reported losses = {reported}")
+        print(f"reference losses = {expected}")
+        if len(reported) == len(expected) and reported:
+            max_diff = max(abs(a - b) for a, b in zip(reported, expected, strict=True))
+            print(f"max abs diff = {max_diff:.3e}")
         for f in failures:
             print(f"  FAIL {f}")
         print("all checks passed" if not failures else "CHECKS FAILED")
     verdict = torch.tensor(len(failures), dtype=torch.int64)
     dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
-    assert int(verdict) == 0, f"{int(verdict)} check(s) failed -- see rank 0 output"
+    dist.destroy_process_group()
+    assert int(verdict) == 0, f"{int(verdict)} check(s) failed -- see last stage output"
 
 
 if __name__ == "__main__":

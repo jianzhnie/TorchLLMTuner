@@ -7,6 +7,9 @@ Run under torchrun with 2 ranks, one mode per invocation (from the repo root):
     PYTHONPATH=. torchrun --nproc_per_node=2 \
         tests/integration_tests/fsdp_mesh_equivalence.py shard
 
+Append ``custom`` after the mode to exercise the PyTorch-backed fine-grained
+adapter. This does not test FSDPTurbo's separate hook-target state engine.
+
 Two regressions are pinned here, both rooted in how the FSDP mesh is chosen:
 
 * ``ddp`` (``dp_replicate=2, dp_shard=1, cp=1``): FSDP used to early-return
@@ -128,6 +131,8 @@ def _full_param(p: torch.Tensor) -> torch.Tensor:
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "ddp"
     assert mode in MODES, f"unknown mode {mode!r}; expected one of {MODES}"
+    implementation = sys.argv[2] if len(sys.argv) > 2 else "native"
+    assert implementation in ("native", "custom")
 
     dist.init_process_group("gloo")
     rank = dist.get_rank()
@@ -138,6 +143,7 @@ def main() -> None:
         cfg = ParallelConfig(data_parallel_replicate_size=2)
     else:
         cfg = ParallelConfig(data_parallel_shard_size=2)
+    cfg.fsdp_config.fsdp_implementation = implementation
     parallel_dims = ParallelTopology.from_config(cfg, world)
     parallel_dims.build_device_mesh()
     loss_mesh = parallel_dims.get_mesh("loss")
@@ -232,7 +238,10 @@ def main() -> None:
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
 
     if rank == 0:
-        print(f"mode={mode} steps={STEPS} lr={LR} tol={TOL:.0e}")
+        print(
+            f"mode={mode} implementation={implementation} "
+            f"steps={STEPS} lr={LR} tol={TOL:.0e}"
+        )
         for step, (got, want) in enumerate(zip(losses, ref_losses, strict=True)):
             print(f"step{step}: loss dist={got:.6f} ref={want:.6f}")
         print(f"final param max abs diff = {param_diff:.3e}")
