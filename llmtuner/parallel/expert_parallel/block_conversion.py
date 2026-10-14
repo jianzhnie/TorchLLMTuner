@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ...accelerator import distributed
+from ...accelerator.distributed import get_rank, get_world_size
 from ...models.common.aux_loss import AuxLoss
 from ...models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
 from ...models.common.moe.experts import (
@@ -59,15 +59,6 @@ def restore_fp32_state_buffers(module: nn.Module) -> None:
                     buffer.data = buffer.data.to(torch.float32)
 
 
-def build_aux_loss(
-    aux_loss_coeff: float | None,
-) -> MicrobatchWiseLoadBalanceLoss | None:
-    """Build the optional loss shared by both router construction paths."""
-    return (
-        MicrobatchWiseLoadBalanceLoss(coeff=aux_loss_coeff) if aux_loss_coeff else None
-    )
-
-
 def convert_block(
     block: nn.Module,
     *,
@@ -80,8 +71,8 @@ def convert_block(
     tp_enabled: bool = False,
 ) -> MoE:
     """Build the llmtuner MoE for one HF block and move its weights over."""
-    ep_size = 1 if ep_group is None else distributed.get_world_size(ep_group)
-    ep_rank = 0 if ep_group is None else distributed.get_rank(ep_group)
+    ep_size = 1 if ep_group is None else get_world_size(ep_group)
+    ep_rank = 0 if ep_group is None else get_rank(ep_group)
 
     router_gate = router_of(block)
     assert router_gate is not None  # the probe established this
@@ -111,6 +102,18 @@ def convert_block(
     num_expert_groups, num_limited_groups = read_expert_groups(block, router_gate)
     grouped = GroupedExperts(dim, hidden, num_local)
     score_func = resolve_score_func(block, router_gate)
+    router_options = {
+        "num_experts": num_experts,
+        "dim": dim,
+        "top_k": top_k,
+        "route_norm": read_route_norm(block, router_gate),
+        "route_scale": read_route_scale(block, router_gate),
+        "aux_loss": (
+            MicrobatchWiseLoadBalanceLoss(coeff=aux_loss_coeff)
+            if aux_loss_coeff
+            else None
+        ),
+    }
     if quantile_balancing:
         # The quantile scheme is defined over sigmoid scores (the histogram
         # range derives from their [0, 1] bound) and routes freely over all
@@ -120,27 +123,17 @@ def convert_block(
         if num_expert_groups is not None and num_expert_groups > 1:
             compatibility.quantile_no_group_limit(block)
         router = QuantileBalancedTopKRouter(
-            num_experts,
-            dim,
-            top_k,
-            route_norm=read_route_norm(block, router_gate),
-            route_scale=read_route_scale(block, router_gate),
-            aux_loss=build_aux_loss(aux_loss_coeff),
+            **router_options,
         )
         # The quantile update owns expert_bias_E; the sign-based update is
         # off (MoE registers the buffer for a quantile router regardless).
         load_balance_coeff = None
     else:
         router = TokenChoiceTopKRouter(
-            num_experts,
-            dim,
-            top_k,
+            **router_options,
             score_func=score_func,
-            route_norm=read_route_norm(block, router_gate),
-            route_scale=read_route_scale(block, router_gate),
             num_expert_groups=num_expert_groups,
             num_limited_groups=num_limited_groups,
-            aux_loss=build_aux_loss(aux_loss_coeff),
         )
     if token_dispatcher == "torchao":
         # Optional-import adapter: the constructor raises ImportError with an

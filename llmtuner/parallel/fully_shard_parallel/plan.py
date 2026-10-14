@@ -45,43 +45,43 @@ def set_fsdp_prefetch_windows(
 def _resolve_pattern_units(
     model: nn.Module, cfg: ParallelConfig
 ) -> tuple[dict[str, nn.Module], dict[str, dict[str, Any]], set[nn.Parameter]]:
-    named = dict(model.named_modules())
+    named_modules = dict(model.named_modules())
     ignored_roots = resolve_module_patterns(
-        list(named), cfg.fsdp_ignored_modules, plan_name="FSDP ignored"
+        list(named_modules), patterns=cfg.fsdp_ignored_modules, plan_name="FSDP ignored"
     )
 
     # Ignoring a module excludes its complete subtree, matching the recursive
     # ignored-parameter collection below.
     ignored_names = {
         name
-        for name in named
+        for name in named_modules
         if any(
             root == "" or name == root or name.startswith(f"{root}.")
             for root in ignored_roots
         )
     }
 
-    selected: dict[str, dict[str, Any]] = {}
+    unit_options: dict[str, dict[str, Any]] = {}
     for pattern, overrides in cfg.fsdp_apply_modules.items():
         compiled = compile_module_pattern(pattern)
         matches = [
             name
-            for name in named
+            for name in named_modules
             if name and name not in ignored_names and compiled.fullmatch(name)
         ]
         if not matches:
             raise ValueError(f"FSDP apply pattern {pattern!r} matched no module")
         for name in matches:
-            selected.setdefault(name, {}).update(overrides)
-    if not selected:
+            unit_options.setdefault(name, {}).update(overrides)
+    if not unit_options:
         raise ValueError("fsdp_apply_modules selected no FSDP unit")
 
     ignored_params = {
         parameter
         for name in ignored_roots
-        for parameter in named[name].parameters(recurse=True)
+        for parameter in named_modules[name].parameters(recurse=True)
     }
-    return named, selected, ignored_params
+    return named_modules, unit_options, ignored_params
 
 
 def apply_fsdp_by_pattern(
@@ -94,7 +94,7 @@ def apply_fsdp_by_pattern(
     edp_mesh: DeviceMesh | None = None,
 ) -> None:
     """Apply independently configured FSDP units selected by module patterns."""
-    named, selected, ignored_params = _resolve_pattern_units(model, cfg)
+    named_modules, unit_options, ignored_params = _resolve_pattern_units(model, cfg)
     # The entry module imports this plan; defer runtime-policy imports.
     from .fully_shard_parallel import (
         build_fsdp_placement_fn,
@@ -137,19 +137,19 @@ def apply_fsdp_by_pattern(
             pin_memory=cfg.fsdp_cpu_offload_pin_memory
         )
 
-    unit_names = sorted(selected, key=lambda item: item.count("."), reverse=True)
+    unit_names = sorted(unit_options, key=lambda item: item.count("."), reverse=True)
     for name in [*unit_names, ""]:
-        options = common | selected.get(name, {})
+        options = common | unit_options.get(name, {})
         if expert_placements and "shard_placement_fn" not in options:
             assert edp_mesh is not None
             options["shard_placement_fn"] = build_fsdp_placement_fn(
                 expert_placements, dp_mesh=options["mesh"], edp_mesh=edp_mesh
             )
-        shard_fn(named[name], **options)
+        shard_fn(named_modules[name], **options)
     # Use stable module registration order, independent of pattern ordering.
     # Arbitrary model forward order cannot be inferred from named_modules().
     set_fsdp_prefetch_windows(
-        [module for name, module in named.items() if name in selected],
+        [module for name, module in named_modules.items() if name in unit_options],
         forward_count=cfg.fsdp_forward_prefetch_count,
         backward_count=cfg.fsdp_backward_prefetch_count,
     )

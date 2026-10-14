@@ -1,16 +1,10 @@
-"""Grain-backed dataloader.
+"""Batch, prefetch, and checkpoint already composed Grain dataset graphs.
 
-Vendored from torchtitan ``components/data/loader.py``. Everything the loader
-needs is a constructor argument: the already-built graph, the collator, the
-iteration knobs, and the runtime objects -- the tokenizer, the DP extent -- that
-no description can hold. There is no config dataclass in between, because a
-config here would be a parameter bag built one line before its only consumer.
-
-``GrainDataLoader``'s ``dataset`` is the already-built Grain graph, not something
-this module constructs. The caller has the dataset registry, and building it
-there is what keeps ``loader.py`` free of a dependency on every concrete dataset
--- the registry belongs to
-:func:`~llmtuner.datasets.loader_builder.build_dataloader`.
+Adapted from torchtitan ``components/data/loader.py``. The loader builder owns
+source selection, shuffle, repetition, and DP sharding. GrainDataLoader owns
+collation, thread prefetch, and one resumable iterator. Checkpoints validate DP
+degree and batch layout before restoring its cursor; failed restoration closes
+the iterator while preserving the original error.
 """
 
 from __future__ import annotations

@@ -1,16 +1,8 @@
-"""Activation functions used by the feed-forward and expert layers.
+"""Gated activations for feed-forward layers and MoE experts.
 
-Vendored from torchtitan ``models/common/activation.py``. Two changes:
-
-* The ``Function`` base is gone. Upstream it exists so a model config can name
-  an activation by class and have it built; llmtuner constructs modules directly,
-  so a plain ``nn.Module`` with the same call signature is enough.
-* ``ActivationFn`` survives as an ``ABC`` -- it is the shared type for
-  "consumes the gate and up halves of a fused projection", which lets a caller
-  swap activations without caring which one it holds.
-
-The call signature is ``(gate, up)`` rather than a single tensor because these
-consume the two halves of a fused gate-and-up projection separately.
+Adapted from torchtitan ``models/common/activation.py``. ActivationFn defines
+the shared ``(gate, up)`` interface; modules are constructed directly without
+upstream model-config factories.
 """
 
 from __future__ import annotations

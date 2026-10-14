@@ -1,20 +1,11 @@
-"""SwiGLU feed-forward layers.
+"""SwiGLU feed-forward layers with interleaved gate/up projections.
 
-Vendored from torchtitan ``models/common/feed_forward.py``. What was dropped is
-the ``Module`` protocol and its nested ``Config`` dataclasses -- llmtuner builds
-the module directly, so there is nothing to build from -- and ``torch_remat``.
-Upstream wraps each projection in ``remat.region(..., recompute=...)``, which
-only steers activation checkpointing; calling the projection directly is the
-same arithmetic. The checkpoint hooks are kept: without them an external
-checkpoint that stores the logical ``w1`` / ``w3`` projections cannot load.
+Adapted from torchtitan ``models/common/feed_forward.py``. Constructors accept
+projection modules directly. Checkpoint hooks expose logical w1/w3 keys while
+runtime computation uses fused w13 weights. TensorParallelFeedForward reuses
+this layout and activation split, adding collectives inside its GEMMs.
 
-This is the base class of ``tp_projections.TensorParallelFeedForward``.
-That module folds the TP collectives into the two GEMMs, so it
-overrides how the projections run and reuses the fused-weight layout contract
-(``w13`` interleaved gate/up) and the activation split established here.
-
-Shape suffix legend, scoped to this file:
-  T = token dimensions, D = model dimension, F = feed-forward hidden dimension.
+Tensor suffixes: T = token dimensions, D = model width, F = hidden width.
 """
 
 from __future__ import annotations

@@ -255,27 +255,19 @@ class HuggingFaceTokenizer(BaseTokenizer):
             "mask_token",
         ]
 
-        # List to collect AddedToken objects for updating the underlying tokenizer
-        added_tokens_to_add = []
-
         if not self._hf_config:
             return
 
-        for kind in ("bos", "eos", "unk"):
-            setattr(
-                self,
-                f"{kind}_token",
-                self._get_token_from_config(self._hf_config, f"{kind}_token"),
-            )
-
-        # Process standard top-level token keys
+        added_tokens_to_add: list[AddedToken] = []
         for key in standard_keys:
+            token_str = self._get_token_from_config(self._hf_config, key)
+            if key in ("bos_token", "eos_token", "unk_token"):
+                setattr(self, key, token_str)
             token_config = self._hf_config.get(key)
-            if token_config is not None:
-                token_str = self._get_token_from_config(self._hf_config, key)
-                if token_str is not None:
-                    added_token = self._build_added_token(token_str, token_config)
-                    added_tokens_to_add.append(added_token)
+            if token_str is not None:
+                added_tokens_to_add.append(
+                    self._build_added_token(token_str, token_config)
+                )
 
         # Process added_tokens_decoder (comprehensive special token definitions)
         added_tokens_decoder = self._hf_config.get("added_tokens_decoder", {})

@@ -209,7 +209,7 @@ def swap_hf_moe_blocks(
             # duplicating routing logic in each dispatcher.
             moe.router._debug_force_load_balance = fixed_router
             replacements.append((layer, attr, moe))
-    except Exception:
+    except BaseException:
         # Failed construction must not inflate auxiliary-loss metric divisors.
         AuxLoss._group_counts.clear()
         AuxLoss._group_counts.update(aux_group_counts)

@@ -33,6 +33,7 @@ Shape legend, scoped to this file: ``T`` = tokens, ``D`` = model dimension,
 from __future__ import annotations
 
 import math
+from numbers import Real
 
 import torch
 import torch.nn as nn
@@ -82,6 +83,17 @@ class MoE(nn.Module):
         shared_experts: nn.Module | None = None,
     ) -> None:
         super().__init__()
+        if (
+            not isinstance(num_experts, int)
+            or isinstance(num_experts, bool)
+            or num_experts < 1
+        ):
+            raise ValueError("num_experts must be a positive integer")
+        if num_experts != router.num_experts:
+            raise ValueError(
+                f"MoE num_experts ({num_experts}) must match router.num_experts "
+                f"({router.num_experts})"
+            )
         self.routed_experts = routed_experts
         self.router = router
         self.shared_experts = shared_experts
@@ -99,7 +111,10 @@ class MoE(nn.Module):
                 "and quantile updates cannot both own expert_bias_E."
             )
         if load_balance_coeff is not None and (
-            not math.isfinite(load_balance_coeff) or load_balance_coeff <= 0.0
+            not isinstance(load_balance_coeff, Real)
+            or isinstance(load_balance_coeff, bool)
+            or not math.isfinite(load_balance_coeff)
+            or load_balance_coeff <= 0.0
         ):
             raise ValueError(
                 "load_balance_coeff must be finite and positive, "
@@ -229,12 +244,12 @@ class MoE(nn.Module):
                 # The padding-filtered map is what is counted: padding tokens
                 # are dispatched and computed, but they carry no loss, so they
                 # must not steer the bias.
-                counts_map_TE = (
-                    routing_map_TE
+                valid_counts_E = (
+                    num_local_tokens_per_expert_E
                     if padding_mask_T is None
-                    else routing_map_TE & ~padding_mask_T.unsqueeze(-1)
+                    else (routing_map_TE & ~padding_mask_T.unsqueeze(-1)).sum(dim=0)
                 )
-                self.tokens_per_expert_E.add_(counts_map_TE.sum(dim=0))
+                self.tokens_per_expert_E.add_(valid_counts_E)
 
         out_TD = self.routed_experts(
             x_TD,

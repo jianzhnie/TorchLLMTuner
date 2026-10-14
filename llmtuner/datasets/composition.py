@@ -140,14 +140,19 @@ def build_dataset(
     """
     match node:
         case SingleDataset():
-            builder = build_single_dataset
+            return build_single_dataset(
+                node, context=context, iteration_policy=iteration_policy
+            )
         case DatasetMix():
-            builder = build_dataset_mix
+            return build_dataset_mix(
+                node, context=context, iteration_policy=iteration_policy
+            )
         case DatasetConcat():
-            builder = build_dataset_concat
+            return build_dataset_concat(
+                node, context=context, iteration_policy=iteration_policy
+            )
         case _:
             raise TypeError(f"unhandled dataset type {type(node).__qualname__}")
-    return builder(node, context=context, iteration_policy=iteration_policy)
 
 
 def build_single_dataset(
@@ -171,7 +176,7 @@ def build_single_dataset(
         dataset = apply_sample_transforms(
             node, dataset, context=context, seed=iteration_policy.seed
         )
-        return apply_iteration_policy(dataset, iteration_policy)
+        return apply_iteration_policy(dataset, iteration_policy=iteration_policy)
     # Shuffle raw stream rows.
     if iteration_policy.shuffle:
         dataset = grain.experimental.WindowShuffleIterDataset(
@@ -209,6 +214,7 @@ def apply_sample_transforms(
 
 def apply_iteration_policy(
     dataset: grain.MapDataset,
+    *,
     iteration_policy: DatasetIterationPolicy,
 ) -> grain.MapDataset:
     """Apply the map-side iteration policy: shuffle, shard, repeat.
@@ -314,4 +320,4 @@ def build_dataset_concat(
         raise TypeError("DatasetConcat requires map-style children")
 
     dataset = grain.MapDataset.concatenate(cast(list[grain.MapDataset], children))
-    return apply_iteration_policy(dataset, iteration_policy)
+    return apply_iteration_policy(dataset, iteration_policy=iteration_policy)
