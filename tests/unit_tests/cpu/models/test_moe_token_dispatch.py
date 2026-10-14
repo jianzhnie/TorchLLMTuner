@@ -34,6 +34,24 @@ from llmtuner.parallel.expert_parallel.token_dispatch import (
 # --------------------------------------------------------------------------
 
 
+def test_local_combine_preserves_float64_values_and_gradients():
+    dispatcher = LocalTokenDispatcher(1, 1)
+    inputs = torch.tensor([[1.0000000001]], dtype=torch.float64, requires_grad=True)
+    scores = torch.tensor([[0.7500000001]], dtype=torch.float64, requires_grad=True)
+    routed, _, metadata = dispatcher.dispatch(
+        inputs,
+        scores,
+        torch.zeros(1, 1, dtype=torch.long),
+        torch.ones(1, dtype=torch.long),
+    )
+    actual = dispatcher.combine(routed, metadata, inputs)
+    expected = inputs * scores
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.sum().backward()
+    torch.testing.assert_close(inputs.grad, scores.detach(), rtol=0, atol=0)
+    torch.testing.assert_close(scores.grad, inputs.detach(), rtol=0, atol=0)
+
+
 def test_default_dispatcher_is_alltoall():
     cfg = ParallelConfig()
     assert cfg.ep_token_dispatcher == "alltoall"

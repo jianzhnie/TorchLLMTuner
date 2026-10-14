@@ -823,3 +823,155 @@ microbatch及既有硬件/可选后端验证项仍未完成。
 - 初始 runner rendezvous 地址被解析为非本机地址，TCPStore 持续重试，
   未进入训练；终止该 handle 后用显式 127.0.0.1 和独立端口通过。
   该启动失败不是 EMA 数值失败；runner 的本机 rendezvous 默认待改进。
+
+## 集成 runner 本机 rendezvous 修复（2026-10-13）
+
+- 默认 hostname 与 c10d 动态 rendezvous 均在本机网络环境中被解析为
+  非本机地址，TCPStore 持续重试；失败发生在训练启动前。
+- runner 使用单节点 static rendezvous，显式 master address 127.0.0.1；
+  `--master-port` 默认 29500，可为并发任务指定独立端口，拒绝非法端口。
+- 实际执行 `LLMTUNER_TEST_EMA=dynamic PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  python tests/integration_tests/run_all.py --master-port 29897
+  pp_checkpoint_equivalence`：两 CPU/Gloo ranks full/resume 通过，22.7 秒，
+  loss tail 逐位一致，最终模型、EMA、token 计数一致。
+- 本次修复验证单机 runner，不涵盖多节点或 GPU/NPU 训练。
+
+## Buffer EMA 实际 DCP 恢复契约（2026-10-13）
+
+- 新增真实 DistributedCheckpointManager 保存/恢复回归，覆盖 float32 与
+  complex64 buffer，各自验证正常恢复和 exclude_from_loading=["ema"]。
+- 保存时刻的 buffer EMA 与 live buffer 明确不同，避免 round-trip 空验证；
+  新模型从零 buffer 启动，恢复后精确比较所有 parameter/buffer EMA 键和值。
+- 排除 EMA 时验证 averages 等于刚加载的模型状态，而非随机初始状态；
+  随后改变 buffer 并执行下一 firing，核对 lerp 数值。四个场景均通过。
+- 本项是 CPU 单进程真实 DCP 验证，未验证多 rank buffer EMA 或 GPU/NPU；
+  本次未发现需修改 production 实现的问题。
+
+- 本轮完整 CPU 回归：1392 passed、2 skipped；tracked-file pre-commit
+  （排除未修改的 examples/native_alltoall.py）、compileall 与 diff 检查通过。
+
+## 双 CP 轴 token 顺序与 mask 修复（2026-10-13）
+
+- KV-outer/Ulysses-inner mesh 按全 CP rank 连续分片输入。原实现先 KV gather
+  再 Ulysses exchange，形成不同的 KV token 排列，与 causal/document mask 不符。
+  改为先 Ulysses exchange，再 KV gather；保留原反向 collective 链。
+- 双轴 attention 查询长度为 S/kv，原模型按总 CP degree 分片 mask，
+  查询长度不匹配。set_cp_mesh 新增 mask_mesh，双轴指定 KV mesh；
+  普通和 packed mask 均仅按 KV 轴 Q-shard，输入仍按完整 CP mesh 分片。
+- 新增 cp_dual_axis_equivalence.py，四 CPU/Gloo ranks、KV=2/Ulysses=2、
+  GQA heads=4/KV heads=2；真实模型 causal/packed eager-flex 前向最大差异
+  均为 0。生产 dual collectives 配合 dense SDPA 验证 Q/K/V 梯度与完整
+  attention 参考一致且非零；额外旧通信顺序 oracle 要求数值明显不同。
+- CPU flex backward 不可用，梯度验证仅替换 attention 内核；尚未证明
+  CUDA/NPU flex backward 或双 CP×TP/PP 组合。CPU 单测1392 passed、2 skipped。
+
+## 单轴 CP 回归与 KCP 输入约束（2026-10-13）
+
+- 双轴修复后实际 runner 执行 cp_wiring_equivalence 与
+  cp_ulysses_varlen_equivalence：两 CPU/Gloo ranks 分别10.4秒、5.7秒通过，
+  覆盖 KV gather 前向/反向、headtail mask、packed Ulysses 输入与通信梯度。
+- 对照 FSDPTurbo/fsdp_turbo/distributed/context_parallel/kcp/kda_state.py
+  发现 llmtuner KCP 缺少卷积 kernel_size > 1 约束；现于 optional runtime
+  加载前拒绝不满足条件的 KDA 输入，并复用已验证 kernel_size 构建 context。
+- 新回归以未安装 KCP runtime 环境验证错误路径先于内核导入；CP 专项
+  15 passed，修改文件 pre-commit 与 diff 检查通过。未证明 Ascend KCP
+  内核数值正确性，fla/triton_ascend_kernels 在当前环境不可运行。
+
+- 进一步对照 FSDPTurbo/fsdp_turbo/modules/kcp.py，补齐 head_k_dim<=256
+  和 safe-gate lower_bound∈[-5,0) 约束；在 optional runtime 加载前拒绝
+  超范围 head dimension、负界越界、零和 NaN。CP 专项19 passed。
+
+## KCP 装配错误顺序（2026-10-13）
+
+- apply_kcp 在确认模型存在 KDA 模块前加载 optional runtime，使普通模型
+  在缺依赖环境中报 ImportError，掩盖实际不支持的模型结构。
+- 先完成候选模块识别，无候选时报告 no Kimi Delta Attention module；
+  通过后加载 runtime、取得一次 process group，再统一装配 forward。
+- 回归验证不支持的模型在内核加载前失败且原 forward 不变；CP20 passed。
+
+- KCP 本轮修改后的完整 CPU 回归1398 passed、2 skipped；tracked-file
+  pre-commit（含新增双轴脚本，排除未修改的用户 example）、compileall 与
+  git diff HEAD --check 通过。
+
+## EP 空接收 expert 的梯度断链修复（2026-10-13）
+
+- 新增两 rank CPU/Gloo EP 回归，token 数分别5/7，覆盖普通和两切片
+  Domino；同时构造全部 token 只路由到 rank0 的零接收场景。
+- 修复前正常收发场景通过，但零接收 rank 的 local_inputs.grad 为 None：
+  GroupedExperts CPU fallback 没有任何 expert segment 时返回无图空张量，
+  与 dispatch 输入和权重断开，导致通信 backward 不能完整执行。
+- 空输入 fallback 使用 empty F.linear，保持输入和权重图连接，产生正确
+  零权重梯度；正常 expert segment 的计算保持原实现。新增 CPU 回归
+  验证空输出仍可 backward，输入梯度存在，所有 expert 权重梯度为零。
+- 专项43 passed；两 rank 脚本逐个比较输出、输入/路由权重梯度以及
+  本地 expert 权重梯度与全局完整参考。脚本使用float64、CPU fallback，
+  尚未验证 CUDA grouped_mm 空接收场景或 accelerator stream overlap。
+
+- 普通 RoutedExperts 与 DominoRoutedExperts 各自的正常/零接收四场景
+  两 CPU/Gloo ranks 实际全部通过（4.1秒）；完整CPU1399 passed、2 skipped。
+  本次修改文件 pre-commit、compileall 和 diff 检查通过。
+
+## Grouped GEMM 空输入与混合精度（2026-10-13）
+
+- 实际 bf16、use_grouped_mm=True 的空输入仍进入 fused op，报 Invalid
+  strides/sizes；原空输入处理仅位于 CPU loop 前，未覆盖 fused 分支。
+- 将 empty F.linear 放在 fused/loop 分支之前，空输入完全跳过 grouped
+  GEMM，同时转换所选权重至输入 dtype，保持 fp32 权重/bf16 输入的
+  零梯度连接。非空输入仍走既定 grouped/loop 路径。
+- 四种 dtype×use_grouped_mm 回归，以 fp32 权重验证 float32/bf16 空输入
+  输出dtype、输入梯度存在、全部权重梯度为零，并禁止调用 fused op。
+  专项46 passed；此证据支持空输入分支，不证明非空 CUDA grouped_mm。
+
+- 本轮完整CPU1402 passed、2 skipped；两 rank普通/Domino EP四场景
+  复跑通过（3.6秒）；修改文件pre-commit、compileall、diff检查通过。
+
+## EP×activation checkpoint FQN 修复（2026-10-13）
+
+- 使用真实 torch checkpoint_wrapper 复现：model.state_dict 去掉
+  _checkpoint_wrapped_module 段，但 expert_shard_map/named_params 保留该段，
+  使模型及 canonical optimizer/EMA expert state 不匹配，跳过 EP gather。
+- EP shard map 和参数映射统一复用 canonical_fqn，恢复与模型/optimizer
+  state key 的一致性，避免同FQN各rank异质expert切片被当作复制状态。
+- 新增真实 wrapper、模拟两rankcollective回归，覆盖模型键与optimizer
+  exp_avg键；验证完整expert tensor被gather、rank1恢复正确切片。
+  EP checkpoint/model state专项13 passed；尚未验证真实多rank DCP×AC。
+
+## EP×AC 真实多 rank DCP 与 degree 恢复（2026-10-13）
+
+- 新增 ep_checkpoint_ac_equivalence.py，两 CPU/Gloo ranks 使用真实
+  checkpoint_wrapper、ModelCheckpointState、OptimizersContainer 和 EMA。
+  各rank专家初值和Adam梯度不同，保存前更新optimizer/EMA，确保切片异质。
+- 实际 DCP 保存后，依次恢复到 wrapped EP=2、unwrapped EP=2、
+  unwrapped EP=1；模型、Adam状态（含metadata）、EMA完整键值精确一致。
+  显式要求保存模型expert axis=4，防止未gather局部slice的空验证。
+- runner 实际通过（4.5秒），脚本pre-commit与diff检查通过。此项证明
+  wrapper键清理、真实EP collective和DCP恢复契约，不涵盖AC重计算
+  backward、FSDP DTensor专家或GPU/NPU。
+
+## EP×activation checkpoint 重计算反向（2026-10-13）
+
+- ep_domino_equivalence 扩展真实checkpoint_wrapper；普通AllToAll与
+  Domino×正常/零接收×checkpoint开关共八个两rank CPU/Gloo场景。
+- checkpoint启用时计数forward调用，要求实际调用两次，避免只测试
+  wrapper构造而未触发重计算；输出、输入/路由权重梯度、本地expert
+  参数梯度均与完整expert参考一致，实际runner通过（4.0秒）。
+- 本轮未发现新的production问题；脚本pre-commit和diff检查通过。
+  结果不涵盖CUDA grouped_mm、编译或FSDP组合的重计算反向。
+
+## EP combine 保留 float64 精度（2026-10-13）
+
+- LocalTokenDispatcher.combine 无条件将expert输出转float32，在float64
+  模型中损失精度；此前本地/分布式参考共用该combine，无法检出此问题。
+- 改用promote_types(output.dtype,float32)，保持低精度输出的float32
+  乘法，同时保留float64；返回仍遵守原expert输出dtype。
+- 新测试采用float64精细值，直接与数学乘法比较输出、输入及score梯度，
+  要求零误差；dispatcher15 passed，普通/Domino×零接收×AC八场景
+  两CPU/Gloo ranks复跑通过（3.8秒）。修改文件质量检查通过。
+
+## Router FP32 明确契约核查（2026-10-13）
+
+- RouterGateLinear 明确规定FP32投影及反向GEMM；routing的softmax/sigmoid
+  使用该FP32输出。该行为是router契约，区别于expert combine无意降精度。
+- 补充float64输入/权重的实际投影回归，核对输出FP32、前向数学结果、
+  以FP32计算后恢复至float64的输入和权重梯度。未修改生产契约。
+- 模型构件/router专项70 passed，修改文件pre-commit通过。

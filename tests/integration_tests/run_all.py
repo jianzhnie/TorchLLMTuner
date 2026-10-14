@@ -16,6 +16,9 @@ Usage (from the repo root):
 Every script runs with ``PYTHONPATH=.`` and its own torchrun process; the
 exit code is non-zero if any script fails, and a pass/fail table is printed
 at the end either way.
+
+Rendezvous uses static loopback on one node. For concurrent runners, supply
+distinct ports with ``--master-port PORT`` (default: 29500).
 """
 
 from __future__ import annotations
@@ -67,11 +70,19 @@ def main() -> int:
         help="Script names (with or without .py) to run; default is all.",
     )
     parser.add_argument(
+        "--master-port",
+        type=int,
+        default=29500,
+        help="Local rendezvous port; choose another port for concurrent runners.",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List the discovered scripts and their torchrun args, then exit.",
     )
     args = parser.parse_args()
+    if not 1 <= args.master_port <= 65535:
+        parser.error("--master-port must be between 1 and 65535")
 
     scripts = discover()
     if args.scripts:
@@ -94,6 +105,9 @@ def main() -> int:
     for script in scripts:
         cmd = [
             "torchrun",
+            "--nnodes=1",
+            "--master-addr=127.0.0.1",
+            f"--master-port={args.master_port}",
             *_torchrun_args(script),
             str(script.relative_to(REPO_ROOT)),
         ]

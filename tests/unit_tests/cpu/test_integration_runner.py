@@ -33,11 +33,18 @@ def test_checkpoint_runner_shares_folder_and_stops_on_full_failure(
     spec = importlib.util.spec_from_file_location("integration_runner", runner)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    monkeypatch.setattr(module.sys, "argv", [str(runner), "pp_checkpoint_equivalence"])
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [str(runner), "--master-port", "29897", "pp_checkpoint_equivalence"],
+    )
     calls = []
 
     def run(command, **kwargs):
         calls.append(command)
+        assert "--nnodes=1" in command
+        assert "--master-addr=127.0.0.1" in command
+        assert "--master-port=29897" in command
         assert Path(command[-1]).is_dir()
         return SimpleNamespace(returncode=full_returncode if len(calls) == 1 else 0)
 
@@ -51,3 +58,20 @@ def test_checkpoint_runner_shares_folder_and_stops_on_full_failure(
     else:
         assert len(calls) == 1
     assert not Path(calls[0][-1]).exists()
+
+
+@pytest.mark.parametrize("port", ["0", "-1", "65536"])
+def test_invalid_master_port_fails_before_launch(monkeypatch, port):
+    runner = Path(__file__).parents[2] / "integration_tests" / "run_all.py"
+    spec = importlib.util.spec_from_file_location("integration_runner", runner)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module.sys, "argv", [str(runner), "--master-port", port])
+
+    def run(*args, **kwargs):
+        pytest.fail("Invalid rendezvous configuration must not launch workers")
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    with pytest.raises(SystemExit) as error:
+        module.main()
+    assert error.value.code == 2

@@ -248,6 +248,33 @@ def test_router_gate_matches_a_plain_fp32_linear() -> None:
     torch.testing.assert_close(gate(x), plain(x.float()), rtol=0, atol=0)
 
 
+def test_router_gate_float64_inputs_follow_explicit_fp32_projection_contract():
+    gate = RouterGateLinear(3, 2).double()
+    with torch.no_grad():
+        gate.weight.copy_(
+            torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=torch.float64)
+        )
+    inputs = torch.tensor(
+        [[1.0000000001, 2.0000000001, 3.0000000001]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    output = gate(inputs)
+    assert output.dtype == torch.float32
+    torch.testing.assert_close(output, inputs.float() @ gate.weight.float().T)
+    output.sum().backward()
+    expected_input_grad = torch.ones_like(output) @ gate.weight.detach().float()
+    expected_weight_grad = torch.ones_like(output).T @ inputs.detach().float()
+    assert inputs.grad.dtype == torch.float64
+    assert gate.weight.grad.dtype == torch.float64
+    torch.testing.assert_close(
+        inputs.grad, expected_input_grad.double(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        gate.weight.grad, expected_weight_grad.double(), rtol=0, atol=0
+    )
+
+
 def test_router_gate_is_the_moe_router_projection() -> None:
     """One class, imported by the MoE router -- not a second copy of it."""
     from llmtuner.models.common.moe.routing import RouterGateLinear as FromRouter
@@ -398,6 +425,31 @@ def test_a_malformed_group_config_is_rejected(kwargs: dict, message: str) -> Non
 
 
 # -- GroupedExperts: the two expert-GEMM paths -------------------------------
+
+
+@pytest.mark.parametrize("use_grouped_mm", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_empty_expert_batch_preserves_input_and_weight_gradients(
+    use_grouped_mm, dtype, monkeypatch
+):
+    def grouped_mm(*args, **kwargs):
+        pytest.fail("Empty expert batches must not invoke a grouped GEMM kernel")
+
+    monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising=False)
+    # Weights remain fp32, as with mixed precision training.
+    experts = GroupedExperts(8, 12, 4, use_grouped_mm=use_grouped_mm)
+    for parameter in experts.parameters():
+        torch.nn.init.normal_(parameter, std=0.02)
+    inputs = torch.empty(0, 8, dtype=dtype, requires_grad=True)
+    output = experts(inputs, torch.zeros(4, dtype=torch.long))
+    assert output.shape == (0, 8)
+    assert output.dtype == dtype
+    output.sum().backward()
+    assert inputs.grad is not None
+    assert inputs.grad.shape == inputs.shape
+    for parameter in experts.parameters():
+        assert parameter.grad is not None
+        assert torch.count_nonzero(parameter.grad) == 0
 
 
 def _grouped(*, use_grouped_mm: bool | None, dtype=torch.float32, seed: int = 0):
