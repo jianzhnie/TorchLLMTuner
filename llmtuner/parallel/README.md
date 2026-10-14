@@ -15,6 +15,9 @@ each local model part.
 | Path | Responsibility |
 | --- | --- |
 | `topology.py` | Resolve degrees and construct all dense, sparse, loss, and data meshes. |
+| `stages.py` | Define the shared transformation order for dense models and PP parts. |
+| `attention_heads.py` | Validate attention head counts against TP and Ulysses degrees. |
+| `model_compile.py` | Apply compilation and configure optional async TP support. |
 | `module_patterns.py` | Shared extended module path matching. |
 | `compatibility.py` | Central fail-fast checks for unsupported combinations. |
 | `tensor_parallel/tensor_parallel.py` | TP public entry, model plan resolution, and module transformation. |
@@ -27,6 +30,8 @@ each local model part.
 | `expert_parallel/hf_inspection.py` | Read supported Hugging Face MoE layouts. |
 | `expert_parallel/block_conversion.py` | Convert one HF MoE block to the native MoE representation. |
 | `expert_parallel/model_replacement.py` | Orchestrate conversion across model layers. |
+| `expert_parallel/token_dispatch.py` | Dispatch tokens to experts and combine their outputs. |
+| `expert_parallel/torchao_dispatch.py` | Adapt optional TorchAO padding and dispatch kernels. |
 | `expert_parallel/checkpointing.py` | Gather and slice expert checkpoint state. |
 | `fully_shard_parallel/fully_shard_parallel.py` | FSDP runtime entry, mesh policy, and decoder wrapping. |
 | `fully_shard_parallel/plan.py` | Pattern-selected FSDP units and prefetch windows. |
@@ -34,5 +39,10 @@ each local model part.
 | `pipeline_parallel/pipeline_parallel.py` | PP public entry and schedule construction. |
 | `pipeline_parallel/partition.py` | Stage partitioning and model splitting. |
 
-Each family is imported through its package. The same-named file is its core
-entry; supporting files do not orchestrate other parallel families.
+Family packages expose public APIs lazily; implementation code imports symbols
+from their defining modules. The same-named file is each family's core entry.
+Supporting files implement its mechanisms.
+
+Apply stages through `parallelize_hf_transformers` when composing parallelism.
+FSDP can be required even with a singleton DP shard axis, so DP degree alone
+does not determine whether to skip its stage.

@@ -105,11 +105,11 @@ class LLMTunerConfig:
         # splits both sharders perform, is exactly max_seq_len % (cp * tp) == 0.
         # Two separate modulo checks would miss ragged cases (e.g. T=6, cp=2,
         # tp=2 passes both but leaves a length-3 shard for tp=2).
-        joint = self.parallel.cp * self.parallel.tp
+        joint = self.parallel.cp_size * self.parallel.tp_size
         if self.training.max_seq_len % joint != 0:
             raise ConfigError(
                 f"max_seq_len ({self.training.max_seq_len}) must be divisible by "
-                f"cp * tp ({self.parallel.cp} * {self.parallel.tp})"
+                f"cp * tp ({self.parallel.cp_size} * {self.parallel.tp_size})"
             )
         # Async TP is a compiled-TP optimization: without compile there is no
         # inductor pass to pipeline the collectives, and without TP there are
@@ -128,12 +128,12 @@ class LLMTunerConfig:
         if (
             self.training.compile_config.enable_async_tensor_parallel
             and self.training.compile
-            and self.parallel.tp < 2
+            and self.parallel.tp_size < 2
         ):
             raise ConfigError(
                 "training.compile_config.enable_async_tensor_parallel "
                 "requires tensor_parallel_size > 1 (got "
-                f"{self.parallel.tp}): it pipelines the TP collectives, "
+                f"{self.parallel.tp_size}): it pipelines the TP collectives, "
                 "and there are none at tp=1."
             )
 

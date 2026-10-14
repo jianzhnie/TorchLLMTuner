@@ -44,7 +44,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ...accelerator import distributed
+from ...accelerator.distributed import get_rank, get_world_size
 from ...utils.module_names import canonical_fqn
 
 try:  # torch >= 2.4; the FSDP path (DTensor expert weights) needs it.
@@ -113,9 +113,9 @@ def index_checkpoint_parameters(
 
 def iter_expert_state_entries(
     state_dict: dict[str, Any],
+    *,
     shard_map: dict[str, dist.ProcessGroup],
     params: dict[str, torch.Tensor],
-    *,
     direction: Literal["save", "load"],
 ) -> Iterator[tuple[str, dist.ProcessGroup, torch.Tensor]]:
     """Yield ``(key, group, live_param)`` for entries holding expert state.
@@ -175,13 +175,13 @@ def gather_expert_state(
     params = index_checkpoint_parameters(model_parts)
     out = dict(state_dict)
     for key, group, _ in iter_expert_state_entries(
-        state_dict, shard_map, params, direction="save"
+        state_dict, shard_map=shard_map, params=params, direction="save"
     ):
         value = out[key]
         if DTensor is not None and isinstance(value, DTensor):
             # Per-EP-rank materialization of the efsdp-sharded weight.
             value = value.full_tensor()
-        world = distributed.get_world_size(group)
+        world = get_world_size(group)
         gathered = value.new_empty((world * value.shape[0],) + value.shape[1:])
         dist.all_gather_into_tensor(gathered, value.contiguous(), group=group)
         out[key] = gathered
@@ -207,11 +207,11 @@ def load_expert_state(
     params = index_checkpoint_parameters(model_parts)
     out = dict(state_dict)
     for key, group, param in iter_expert_state_entries(
-        state_dict, shard_map, params, direction="load"
+        state_dict, shard_map=shard_map, params=params, direction="load"
     ):
         full = out[key]
-        world = distributed.get_world_size(group)
-        rank = distributed.get_rank(group)
+        world = get_world_size(group)
+        rank = get_rank(group)
         num_local = param.shape[0]
         if full.shape[0] != num_local * world:
             raise ValueError(

@@ -47,7 +47,9 @@ def _resolve_pattern_units(
 ) -> tuple[dict[str, nn.Module], dict[str, dict[str, Any]], set[nn.Parameter]]:
     named_modules = dict(model.named_modules())
     ignored_roots = resolve_module_patterns(
-        list(named_modules), patterns=cfg.fsdp_ignored_modules, plan_name="FSDP ignored"
+        list(named_modules),
+        patterns=cfg.fsdp_config.fsdp_ignored_modules,
+        plan_name="FSDP ignored",
     )
 
     # Ignoring a module excludes its complete subtree, matching the recursive
@@ -62,7 +64,7 @@ def _resolve_pattern_units(
     }
 
     unit_options: dict[str, dict[str, Any]] = {}
-    for pattern, overrides in cfg.fsdp_apply_modules.items():
+    for pattern, overrides in cfg.fsdp_config.fsdp_apply_modules.items():
         compiled = compile_module_pattern(pattern)
         matches = [
             name
@@ -119,7 +121,9 @@ def apply_fsdp_by_pattern(
             if parameter not in ignored_params
         }
 
-    shard_fn = get_fsdp_strategy(cfg.fsdp_implementation).get_fully_shard_fn()
+    shard_fn = get_fsdp_strategy(
+        cfg.fsdp_config.fsdp_implementation
+    ).get_fully_shard_fn()
     common: dict[str, Any] = {
         "mesh": dp_mesh,
         "mp_policy": MixedPrecisionPolicy(
@@ -129,12 +133,12 @@ def apply_fsdp_by_pattern(
         ),
         "ignored_params": ignored_params,
         "reshard_after_forward": get_fsdp_reshard_after_forward_policy(
-            cfg.fsdp_reshard_after_forward, cfg.pp > 1
+            cfg.fsdp_config.fsdp_reshard_after_forward, cfg.pp > 1
         ),
     }
-    if cfg.fsdp_cpu_offload:
+    if cfg.fsdp_config.fsdp_cpu_offload:
         common["offload_policy"] = CPUOffloadPolicy(
-            pin_memory=cfg.fsdp_cpu_offload_pin_memory
+            pin_memory=cfg.fsdp_config.fsdp_cpu_offload_pin_memory
         )
 
     unit_names = sorted(unit_options, key=lambda item: item.count("."), reverse=True)
@@ -150,12 +154,15 @@ def apply_fsdp_by_pattern(
     # Arbitrary model forward order cannot be inferred from named_modules().
     set_fsdp_prefetch_windows(
         [module for name, module in named_modules.items() if name in unit_options],
-        forward_count=cfg.fsdp_forward_prefetch_count,
-        backward_count=cfg.fsdp_backward_prefetch_count,
+        forward_count=cfg.fsdp_config.fsdp_forward_prefetch_count,
+        backward_count=cfg.fsdp_config.fsdp_backward_prefetch_count,
     )
 
     enable_fsdp_symm_mem(
-        model, cfg.fsdp_symm_mem_scope if cfg.enable_fsdp_symm_mem else None
+        model,
+        cfg.fsdp_config.fsdp_symm_mem_scope
+        if cfg.fsdp_config.enable_fsdp_symm_mem
+        else None,
     )
     disable_fsdp_gradient_division(model)
 

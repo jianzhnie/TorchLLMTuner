@@ -73,7 +73,7 @@ import torch.nn as nn
 
 from llmtuner.errors import UnsupportedCombinationError
 
-from ...config.expert_parallel_config import validate_expert_dispatcher
+from ...config.parallel_config import validate_expert_dispatcher
 from ...models.common.aux_loss import AuxLoss
 from ...models.common.moe.layer import MoE
 from ...utils.logging import get_logger

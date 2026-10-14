@@ -293,7 +293,7 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
         cfg.metrics,
         parallel_dims=trainer.parallel_dims,
         dump_folder=cfg.dump_folder,
-        pp_schedule=cfg.pipeline_parallel_schedule,
+        pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
         num_flops_per_token=flops_per_token(
             unwrap_text_config(hf_model_config), seq_len=cfg.max_seq_len
         ),
