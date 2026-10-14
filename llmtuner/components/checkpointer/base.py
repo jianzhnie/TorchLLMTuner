@@ -51,7 +51,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -68,12 +68,12 @@ from ...utils.garbage_collection import GarbageCollection
 from ...utils.logging import get_logger
 from . import filesystem
 from .checkpoint_keys import EMA, LR_SCHEDULER, MODEL, OPTIMIZER
+from .storage import CheckpointStorage
 
 logger = get_logger(__name__)
 
 __all__ = [
     "BaseCheckpointManager",
-    "CheckpointStorage",
     "EXPORT_DTYPE_MAP",
     "ModelWrapper",
 ]
@@ -205,46 +205,6 @@ class ModelWrapper(Stateful):
             model.load_state_dict(state_dict, strict=False)
         # Refresh the cache so state_dict() reflects the freshly loaded values.
         self.cached_state_dict = self._get_state_dict()
-
-
-@runtime_checkable
-class CheckpointStorage(Protocol):
-    """The path operations a checkpoint manager needs from its storage.
-
-    Managers differ in how they read and write checkpoint bytes, but they ask
-    the same handful of questions about paths: is this a checkpoint directory,
-    did this metadata file land, which steps are on disk, delete this one. This
-    protocol is the whole of that surface, so policies like retention and
-    latest-step discovery can live on ``BaseCheckpointManager`` without knowing
-    which backend answers them.
-
-    Paths are ``str`` rather than ``Path`` because a checkpoint id may be a
-    remote URI (``gs://...``) that ``Path`` would mangle -- it collapses the
-    double slash. Carrying ``str`` keeps the vocabulary lossless; whether a
-    given implementation can actually reach a remote URI is up to that
-    implementation, which should reject what it cannot address rather than
-    silently rewrite it.
-
-    ``runtime_checkable`` so implementations can assert conformance in their
-    tests. It only checks that the method names exist, which is enough to catch
-    a rename that would otherwise surface as an ``AttributeError`` mid-save.
-    """
-
-    def isdir(self, path: str) -> bool:
-        """Whether ``path`` is an existing directory."""
-        ...
-
-    def isfile(self, path: str) -> bool:
-        """Whether ``path`` is an existing entry that is not a directory."""
-        ...
-
-    def listdir(self, path: str) -> list[str]:
-        """The entry names directly under the directory ``path``."""
-        ...
-
-    def remove(self, path: str) -> None:
-        """Recursively delete the directory ``path``."""
-        ...
 
 
 class BaseCheckpointManager(ABC):

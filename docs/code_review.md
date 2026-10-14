@@ -1,8 +1,8 @@
 # llmtuner 全局代码审查
 
 本报告记录本轮与上一轮连续审查的结果。静态语法与 Ruff 检查覆盖
-`llmtuner` 当前全部 147 个 Python 文件；此前逐文件审查覆盖 148 个文件，
-本轮合并 HF 输入薄封装后，更新后的清单见
+`llmtuner` 当前全部 148 个 Python 文件；此前逐文件审查覆盖 148 个文件，
+合并 HF 输入薄封装并新增独立存储模块后，更新后的清单见
 [file_review.md](file_review.md)，检查训练调用链、参数转换、恢复状态和异常清理路径。静态检查与 CPU 回归测试不能替代多设备数值等价测试，
 本报告不将未运行的硬件组合记为已验证。
 
@@ -12,7 +12,7 @@
 | --- | ---: | --- |
 | 包入口 | 3 | 公共导出、CLI 入口 |
 | `accelerator` | 7 | 设备选择、collective、嵌套 tensor 转移 |
-| `components` | 19 | loss、优化器、EMA、checkpoint、metrics、profiler |
+| `components` | 20 | loss、优化器、EMA、checkpoint、metrics、profiler |
 | `config` | 19 | 字段校验、CLI 配置组合、并行能力限制 |
 | `datasets` | 22 | DP ownership、packing、标签对齐、多模态处理 |
 | `memory` | 3 | activation checkpoint 与重计算区域 |

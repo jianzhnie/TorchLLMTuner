@@ -21,7 +21,8 @@
 | `llmtuner/components/checkpointer/checkpoint_keys.py` | 已阅读 | canonical_fqn；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/checkpointer/distributed_checkpoint.py` | 已阅读 | DistributedCheckpointAsyncMode、FilesystemCheckpointStorage、DistributedCheckpointManager；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/checkpointer/filesystem.py` | 已阅读 | is_remote、resolve、exists、isdir、isfile；检查训练服务状态、错误路径、持久化及资源生命周期。 |
-| `llmtuner/components/checkpointer/torch_checkpointing_backend.py` | 已阅读 | require_torch_checkpointing、BackendConfig、BackendCheckpointStorage、init_subprocess_logging、item_specs；检查训练服务状态、错误路径、持久化及资源生命周期。 |
+| `llmtuner/components/checkpointer/storage.py` | 已阅读 | CheckpointStorage 协议和 FilesystemCheckpointStorage；不依赖管理器或 DCP，保留本地及 fsspec 路径语义。 |
+| `llmtuner/components/checkpointer/torch_checkpointing_backend.py` | 已阅读 | require_torch_checkpointing、BackendSymbols、BackendCheckpointStorage、init_subprocess_logging、item_specs；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/loss.py` | 已阅读 | vocab_shard_bounds、next_token_targets、cross_entropy_loss、shard_local_labels、LossParallelCrossEntropy；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/metrics.py` | 已阅读 | DeviceMemoryMonitor、build_device_memory_monitor、BaseLogger、TensorBoardLogger、WandBLogger；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/optimizer/__init__.py` | 已阅读 | 包入口及公开导出；检查训练服务状态、错误路径、持久化及资源生命周期。 |
@@ -164,7 +165,7 @@
 
 ## 后续验证与限制
 
-- 已逐个阅读 147/147 个 Python 文件；这是实现审查覆盖，不等于所有组合均已运行通过。
+- 已逐个阅读 148/148 个 Python 文件；这是实现审查覆盖，不等于所有组合均已运行通过。
 - accelerator/tensor_tree.py 已明确支持容器范围，out 结构在复制前递归校验；训练归约调用只传 Tensor。
 - 日志祖先传播、allocator memory history 退出关闭、指标构建失败清理仍需专项优化。
 - KV AllGather × Ulysses 的 token 重排和 mask 对齐须多设备等价性验证；不能由 CPU 测试推定正确。
@@ -177,7 +178,7 @@
 - `pytest -q --disable-warnings`：1119 passed、10 skipped。
 - `pre-commit run --all-files`：全部通过（包含 Ruff lint/format）。
 - `python -m compileall -q llmtuner`、`git diff HEAD --check`：通过。
-- 清单与当前源文件集合一致：147 条，无缺失、无重复。
+- 清单与当前源文件集合一致：148 条，无缺失、无重复。
 
 ## 本轮结构调整
 
@@ -187,7 +188,7 @@
   `TensorParallelFeedForward`，前置检查使用 `validate_tp_projection_preconditions`。
 - 删除 HF `input_processing.py`：reshape 直接放在唯一调用方
   `preprocess_inputs`，目标构造直接复用 `components.loss.next_token_targets`。
-- 当前源文件数为 147；合并后的预处理逻辑继续在 `models/hf/model.py` 中审查。
+- 合并 HF 预处理时源文件数为 147；合并后的预处理逻辑继续在 `models/hf/model.py` 中审查。
 
 - 设备树模块改为 `accelerator/tensor_tree.py`，公开函数改为
   `get_tensor_tree_device` 和 `move_tensor_tree`；旧名称删除并更新全部调用方。
@@ -195,3 +196,9 @@
 - 数据契约集中在 `datasets/contracts.py`：`TextSequence` 和 `SampleProcessor`
   从构建模块迁入；配方组合与 Grain 构建改为 `datasets/composition.py`，
   dataloader 装配改为 `datasets/loader_builder.py`。旧模块删除，消费者直接引用定义模块。
+
+- 数据组合统一 `_apply_sample_transforms`，保留 map 全局种子和 streaming
+  rank 偏移种子，以及两条路径不同的 shuffle/分片顺序。
+- checkpoint 的延迟导入符号容器改名 `BackendSymbols`，区分运行配置和后端 API。
+
+- checkpoint 路径协议和文件系统适配器集中于 `storage.py`；base 保留共享策略，DCP 后端保留保存/加载实现。当前源文件数为 148。
