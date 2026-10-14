@@ -100,3 +100,12 @@ def test_both_counts_are_reported_independently() -> None:
     axis the caller named -- 'tp*cp' for the ulysses call site."""
     with pytest.raises(ValueError, match=r"must be divisible by tp\*cp \(4\)"):
         _check(_model(4, 2), 4, axis="tp*cp")
+
+
+@pytest.mark.parametrize("field", ["num_attention_heads", "num_key_value_heads"])
+@pytest.mark.parametrize("count", [0, -2, False, True, 2.0, "2"])
+def test_invalid_explicit_head_counts_are_rejected(field, count) -> None:
+    model = _model(8, 4)
+    setattr(model.model.config, field, count)
+    with pytest.raises(ValueError, match=f"{field} must be a positive integer"):
+        _check(model, 2)

@@ -642,13 +642,17 @@ def test_mm_recompute_shapes_uses_linear_in_out_order() -> None:
 
     # gate_proj is Linear(16 -> 32): weight (32, 16), so (in, out) = (16, 32).
     assert layer.mlp.gate_proj.weight.shape == (32, 16)
-    assert mm_recompute_shapes(layer, "layers.0", ["gate_proj"]) == {(16, 32)}
-    assert mm_recompute_shapes(layer, "layers.0", ["down_proj"]) == {(32, 16)}
+    assert mm_recompute_shapes(layer, base_fqn="layers.0", fqns=("gate_proj",)) == {
+        (16, 32)
+    }
+    assert mm_recompute_shapes(layer, base_fqn="layers.0", fqns=("down_proj",)) == {
+        (32, 16)
+    }
 
     # A pattern matching a container (not an nn.Linear) is a loud error, so a
     # wrong fqn never passes for "matched nothing".
     with pytest.raises(ValueError, match="nn.Linear"):
-        mm_recompute_shapes(layer, "layers.0", ["layers.0"])
+        mm_recompute_shapes(layer, base_fqn="layers.0", fqns=["layers.0"])
 
 
 def test_selective_policy_recomputes_forced_shapes_and_alternates_the_rest() -> None:
@@ -781,3 +785,31 @@ def test_full_ac_matches_uncheckpointed_bitwise_on_moe() -> None:
         assert p.grad is not None, f"{name} got no gradient under full AC"
         ref_name = name.replace("._checkpoint_wrapped_module", "")
         assert torch.equal(p.grad, ref_grads[ref_name]), f"{name} grad differs"
+
+
+@pytest.mark.parametrize("layers", [None, [], {}])
+def test_ac_rejects_invalid_layer_container_before_global_setup(layers, monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.memory import activation_checkpoint as module
+
+    def unexpected_setup():
+        pytest.fail("invalid layer container must fail before global mutation")
+
+    monkeypatch.setattr(module, "disable_dynamo_lru_cache", unexpected_setup)
+    with pytest.raises(TypeError, match="layers as nn.Module"):
+        module.apply_ac(SimpleNamespace(layers=layers), "full")
+
+
+def test_ac_supports_plain_module_layer_container():
+    model = torch.nn.Module()
+    model.layers = torch.nn.Module()
+    model.layers.add_module("decoder", torch.nn.Linear(4, 4))
+    weight = model.layers.decoder.weight
+    apply_ac(model, "full")
+    assert isinstance(model.layers.decoder, CheckpointWrapper)
+    assert model.layers.decoder.weight is weight
+    inputs = torch.randn(2, 4, requires_grad=True)
+    model.layers.decoder(inputs).sum().backward()
+    assert inputs.grad is not None
+    assert weight.grad is not None

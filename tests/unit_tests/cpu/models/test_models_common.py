@@ -23,8 +23,8 @@ from llmtuner.models.common.feed_forward import (
     SigmoidGatedFeedForward,
     compute_ffn_hidden_dim,
 )
-from llmtuner.models.common.linear import PartialBiasRowwiseLinear, RouterGateLinear
 from llmtuner.models.common.moe.experts import GroupedExperts
+from llmtuner.models.common.moe.gate import RouterGateLinear
 from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
 from llmtuner.models.common.tp_projections import TensorParallelFeedForward
 
@@ -53,6 +53,27 @@ def test_hidden_dim_rounds_up_to_the_multiple() -> None:
 def test_hidden_dim_applies_the_multiplier_before_rounding() -> None:
     assert compute_ffn_hidden_dim(12, ffn_dim_multiplier=1.5) == 48
     assert compute_ffn_hidden_dim(12, ffn_dim_multiplier=1.5, multiple_of=10) == 50
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"dim": 0}, "dim must be positive"),
+        ({"dim": -1}, "dim must be positive"),
+        ({"multiple_of": 0}, "multiple_of must be positive"),
+        ({"multiple_of": -1}, "multiple_of must be positive"),
+        ({"ffn_dim_multiplier": 0}, "finite and positive"),
+        ({"ffn_dim_multiplier": True}, "finite and positive"),
+        ({"ffn_dim_multiplier": "1.5"}, "finite and positive"),
+        ({"ffn_dim_multiplier": -1}, "finite and positive"),
+        ({"ffn_dim_multiplier": float("nan")}, "finite and positive"),
+        ({"ffn_dim_multiplier": float("inf")}, "finite and positive"),
+        ({"ffn_dim_multiplier": 0.001}, "zero hidden dimension"),
+    ],
+)
+def test_hidden_dim_rejects_invalid_geometry(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        compute_ffn_hidden_dim(**({"dim": 12} | kwargs))
 
 
 def test_forward_is_w2_of_the_gated_activation() -> None:
@@ -280,25 +301,6 @@ def test_router_gate_is_the_moe_router_projection() -> None:
     from llmtuner.models.common.moe.routing import RouterGateLinear as FromRouter
 
     assert FromRouter is RouterGateLinear
-
-
-# -- PartialBiasRowwiseLinear ------------------------------------------------
-
-
-def test_partial_bias_rowwise_requires_a_bias() -> None:
-    with pytest.raises(ValueError, match="requires bias=True"):
-        PartialBiasRowwiseLinear(8, 4, bias=False)
-
-
-def test_partial_bias_rowwise_matches_a_plain_linear_without_a_tp_group() -> None:
-    """No TP group -> no redistribution, so it is an ordinary F.linear."""
-    torch.manual_seed(0)
-    layer = PartialBiasRowwiseLinear(8, 4)
-    x = torch.randn(3, 8)
-
-    assert torch.equal(
-        layer(x), torch.nn.functional.linear(x, layer.weight, layer.bias)
-    )
 
 
 # -- node-limited routing (DeepSeek-V3) ----------------------------------------
@@ -614,3 +616,71 @@ def test_quantile_balancer_rejects_nonpositive_histogram_size(num_bins):
 def test_grouped_experts_rejects_empty_geometry(sizes):
     with pytest.raises(ValueError, match="must be positive"):
         GroupedExperts(*sizes, use_grouped_mm=False)
+
+
+def test_router_fp32_scores_and_gradients_are_preserved_under_autocast():
+    torch.manual_seed(29)
+    router = RouterGateLinear(4, 3)
+    x = torch.randn(2, 4, requires_grad=True)
+    expected = router(x)
+    expected.sum().backward()
+    expected_input_grad = x.grad.clone()
+    expected_weight_grad = router.weight.grad.clone()
+    router.zero_grad(set_to_none=True)
+    x.grad = None
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = router(x)
+        actual.sum().backward()
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)
+    assert torch.equal(x.grad, expected_input_grad)
+    assert torch.equal(router.weight.grad, expected_weight_grad)
+
+
+@pytest.mark.parametrize("field", ["dim", "multiple_of"])
+@pytest.mark.parametrize("value", [True, False, 1.5, "12", None])
+def test_ffn_dimensions_require_integers(field, value):
+    with pytest.raises(ValueError, match=f"{field} must be positive integer"):
+        compute_ffn_hidden_dim(**({"dim": 12} | {field: value}))
+
+
+@pytest.mark.parametrize("param_name", ["weight", "bias"])
+def test_ffn_checkpoint_rejects_ambiguous_fused_and_logical_keys(param_name):
+    ffn = FeedForward(w13=nn.Linear(8, 12, bias=True), w2=nn.Linear(6, 8, bias=False))
+    state = ffn.state_dict()
+    state[f"w13.{param_name}"] = getattr(ffn.w13, param_name).detach().clone()
+    original = getattr(ffn.w13, param_name).detach().clone()
+
+    with pytest.raises(ValueError, match="both fused.*and logical"):
+        ffn.load_state_dict(state)
+
+    assert torch.equal(getattr(ffn.w13, param_name), original)
+    assert f"w1.{param_name}" in state
+    assert f"w3.{param_name}" in state
+
+
+@pytest.mark.parametrize("failure", ["shape", "ambiguous"])
+def test_ffn_load_hook_preserves_all_entries_if_bias_conversion_fails(failure):
+    ffn = FeedForward(w13=nn.Linear(8, 12, bias=True), w2=nn.Linear(6, 8, bias=False))
+    state = ffn.state_dict()
+    if failure == "shape":
+        state["w3.bias"] = torch.zeros(7)
+    else:
+        state["w13.bias"] = ffn.w13.bias.detach().clone()
+    original = state.copy()
+
+    with pytest.raises((RuntimeError, ValueError)):
+        FeedForward._merge_w13_on_load(ffn, state, "")
+
+    assert state.keys() == original.keys()
+    assert all(state[key] is value for key, value in original.items())
+
+
+def test_ffn_save_hook_preserves_entries_if_bias_split_fails():
+    ffn = FeedForward(w13=nn.Linear(8, 12, bias=True), w2=nn.Linear(6, 8, bias=False))
+    state = {"w13.weight": ffn.w13.weight.detach(), "w13.bias": torch.zeros(7)}
+    original = state.copy()
+    with pytest.raises(RuntimeError):
+        FeedForward._split_w13_on_save(ffn, state, "", {})
+    assert state.keys() == original.keys()
+    assert all(state[key] is value for key, value in original.items())

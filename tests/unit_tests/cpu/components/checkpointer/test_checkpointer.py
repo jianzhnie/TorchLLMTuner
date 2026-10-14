@@ -14,13 +14,14 @@ from tests.caps import require_env
 require_env("dcp", "dtensor")
 
 
+import pytest
 import torch
 import torch.nn as nn
 
 from llmtuner.components.checkpointer import (
     DistributedCheckpointManager,
-    canonical_fqn,
 )
+from llmtuner.components.checkpointer.base import BaseCheckpointManager
 from llmtuner.components.checkpointer.storage import (
     CheckpointStorage,
     FilesystemCheckpointStorage,
@@ -30,26 +31,46 @@ from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.config import CheckpointConfig as Config
 from llmtuner.config import LRSchedulerConfig
 
-# -- canonical_fqn ------------------------------------------------------------
+# -- checkpoint step validation ----------------------------------------------
 
 
-def test_canonical_fqn_strips_the_wrapper_at_any_depth() -> None:
-    assert (
-        canonical_fqn(
-            "model.layers.0._checkpoint_wrapped_module.self_attn.q_proj.weight"
-        )
-        == "model.layers.0.self_attn.q_proj.weight"
+@pytest.mark.parametrize(
+    "dirname,expected",
+    [
+        ("step-0", 0),
+        ("step-12", 12),
+        ("step-007", None),
+        ("step-1٢", None),
+        ("step-1２", None),
+        ("step-１２", None),
+    ],
+)
+def test_checkpoint_directory_names_require_canonical_ascii_digits(dirname, expected):
+    from types import SimpleNamespace
+
+    manager = SimpleNamespace(_STEP_DIR_PATTERN=BaseCheckpointManager._STEP_DIR_PATTERN)
+    assert BaseCheckpointManager._parse_step(manager, dirname) == expected
+
+
+@pytest.mark.parametrize(
+    "method,step",
+    [("save", value) for value in (-1, True, 1.5, "2", None)]
+    + [("load", value) for value in (-2, True, 1.5, "2", None)],
+)
+def test_invalid_checkpoint_steps_fail_before_storage_access(method, step):
+    from types import SimpleNamespace
+
+    def unexpected(*args):
+        pytest.fail("Invalid steps must fail before storage or save policy access")
+
+    manager = SimpleNamespace(
+        _initialized=True,
+        enable=True,
+        _save=unexpected,
+        _resolve_load_source=unexpected,
     )
-    # The wrapper can also wrap the whole module, putting the segment first.
-    assert (
-        canonical_fqn("_checkpoint_wrapped_module.model.layers.0.weight")
-        == "model.layers.0.weight"
-    )
-
-
-def test_canonical_fqn_leaves_a_real_name_alone() -> None:
-    name = "model.layers.0.self_attn.q_proj.weight"
-    assert canonical_fqn(name) == name
+    with pytest.raises(ValueError, match=f"checkpoint {method} step"):
+        getattr(BaseCheckpointManager, method)(manager, step)
 
 
 # -- config validation --------------------------------------------------------
@@ -127,6 +148,38 @@ def _schedule(optimizer):
     return build_lr_scheduler(
         LRSchedulerConfig(), optimizers=[optimizer], training_steps=8
     )
+
+
+def test_manager_owns_states_and_orders_core_restore_dependencies(tmp_path):
+    from llmtuner.components.checkpointer.checkpoint_keys import (
+        LR_SCHEDULER,
+        MODEL,
+        OPTIMIZER,
+    )
+
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    scheduler = _schedule(optimizer)
+    extra = object()
+    supplied = {LR_SCHEDULER: object(), "extra": extra, OPTIMIZER: object()}
+    original = supplied.copy()
+    manager = DistributedCheckpointManager(
+        Config(enable=True),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states=supplied,
+        folder=str(tmp_path),
+    )
+    try:
+        assert supplied == original
+        assert list(manager.states) == [MODEL, OPTIMIZER, LR_SCHEDULER, "extra"]
+        assert manager.states[OPTIMIZER] is optimizer
+        assert manager.states[LR_SCHEDULER] is scheduler
+        supplied.clear()
+        assert manager.states["extra"] is extra
+    finally:
+        manager.close()
 
 
 # -- the manager's unwired-option guard ---------------------------------------
@@ -386,12 +439,22 @@ def test_an_enabled_manager_registers_the_lr_scheduler(monkeypatch) -> None:
 
     The backend is absent, so the import is stubbed to reach the registration.
     Everything after it needs real backend objects and is cut short, but the
-    states dict is populated first, which is what this pins.
+    manager-owned states dict is populated first, which is what this pins.
     """
     import pytest
 
-    from llmtuner.components.checkpointer import LR_SCHEDULER
     from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+    from llmtuner.components.checkpointer.base import BaseCheckpointManager
+    from llmtuner.components.checkpointer.checkpoint_keys import LR_SCHEDULER
+
+    captured_states = {}
+    initialize = BaseCheckpointManager.__init__
+
+    def capture_states(manager, *args, **kwargs):
+        initialize(manager, *args, **kwargs)
+        captured_states.update(manager.states)
+
+    monkeypatch.setattr(BaseCheckpointManager, "__init__", capture_states)
 
     class _StubBackend:
         def __getattr__(self, name):
@@ -417,7 +480,8 @@ def test_an_enabled_manager_registers_the_lr_scheduler(monkeypatch) -> None:
             states=states,
             folder="/tmp/unused",
         )
-    assert states[LR_SCHEDULER] is sentinel
+    assert states == {}
+    assert captured_states[LR_SCHEDULER] is sentinel
 
 
 # -- TorchCheckpointingManager HF initial load --------------------------------
@@ -850,7 +914,7 @@ def test_async_checkpoint_completion_reports_actual_outcome(
         )
         future = Future()
         monkeypatch.setattr(
-            manager, "dcp_save", lambda *args, future=future, **kwargs: future
+            manager, "_save_checkpoint", lambda *args, future=future, **kwargs: future
         )
         original = OSError("disk full")
         with caplog.at_level(logging.INFO):

@@ -14,15 +14,54 @@ return a sum would be invisible otherwise.
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 from llmtuner.components.loss import (
     IGNORE_INDEX,
+    LossParallelCrossEntropy,
     compute_logprobs,
     cross_entropy_loss,
     mse_loss,
+    next_token_targets,
+    vocab_shard_bounds,
 )
+
+
+@pytest.mark.parametrize("field", ["global_vocab_size", "tp_world_size", "tp_rank"])
+@pytest.mark.parametrize("value", [True, 1.5, "2", None])
+def test_vocab_shard_bounds_rejects_non_integer_coordinates(field, value):
+    coordinates = dict(global_vocab_size=10, tp_world_size=3, tp_rank=1)
+    coordinates[field] = value
+    with pytest.raises(ValueError, match=field):
+        vocab_shard_bounds(**coordinates)
+
+
+@pytest.mark.parametrize("seq_len", [True, 1.5, "2", None])
+def test_invalid_target_sequence_length_preserves_labels(seq_len):
+    labels = torch.tensor([1, 2, 3, 4])
+    original = labels.clone()
+    with pytest.raises(ValueError, match="seq_len"):
+        next_token_targets(labels, seq_len=seq_len)
+    torch.testing.assert_close(labels, original)
+
+
+@pytest.mark.parametrize("reduction", ["mean", "invalid", None])
+def test_vocab_parallel_rejects_reduction_before_process_group_access(
+    monkeypatch, reduction
+):
+    import llmtuner.components.loss as loss_module
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail("invalid reduction reached distributed communication")
+
+    monkeypatch.setattr(loss_module.distributed, "get_world_size", unexpected_call)
+    monkeypatch.setattr(loss_module.distributed, "get_rank", unexpected_call)
+    monkeypatch.setattr(loss_module.funcol, "all_reduce", unexpected_call)
+    logits, labels = _logits_and_labels()
+    with pytest.raises(ValueError, match="reduction must be"):
+        LossParallelCrossEntropy.apply(logits, labels, object(), 9, reduction)
 
 
 def _logits_and_labels(seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:

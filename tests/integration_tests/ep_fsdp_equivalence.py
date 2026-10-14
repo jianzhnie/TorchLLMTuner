@@ -120,7 +120,7 @@ def main() -> None:
         fsdp_apply_modules={"model.model.layers.{*}": {}} if args.pattern_fsdp else {},
     )
     parallel_dims = ParallelTopology.from_config(cfg, world)
-    parallel_dims.build_mesh()
+    parallel_dims.build_device_mesh()
     loss_mesh = parallel_dims.get_mesh("loss")
 
     failures: list[str] = []

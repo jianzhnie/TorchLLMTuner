@@ -126,7 +126,7 @@ def main() -> None:
         training=TrainingConfig(max_seq_len=SEQ, steps=STEPS),
     )
     parallel_dims = ParallelTopology.from_config(cfg.parallel, world)
-    parallel_dims.build_mesh()
+    parallel_dims.build_device_mesh()
     cp_mesh = parallel_dims.get_mesh("cp")
     loss_mesh = parallel_dims.get_mesh("loss")
 

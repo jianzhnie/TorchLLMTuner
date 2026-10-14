@@ -40,8 +40,8 @@ keys collide across ranks in one shared checkpoint (the flat FQN-keyed
 optimizer state dict is what prevents that).
 
 The synthetic random corpus is registered in the checkpoint's ``states`` under
-``DATALOADER`` (its cursor is ``_position``, restored by replaying
-generated batches), so the resume phase reads exactly the batches the
+``DATALOADER`` (its cursor is ``_position``, restored by directly generating
+from the saved absolute batch index), so the resume phase reads exactly the batches the
 uninterrupted run consumed at steps N+1..N+M with no manual fast-forward.
 
 Everything runs in fp32 on CPU/gloo. The caller owns the workdir and its cleanup.
@@ -266,13 +266,18 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
     if trainer.ntokens_seen != final_state["ntokens_seen"]:
         failures.append(f"rank {trainer.rank}: restored token counter differs")
     if trainer.ema is not None:
-        for key, actual in trainer.ema.state_dict().items():
-            expected = final_state["ema"][key]
-            if isinstance(actual, torch.Tensor):
-                if not torch.equal(actual.cpu(), expected.cpu()):
-                    failures.append(f"rank {trainer.rank}: EMA {key} differs")
-            elif actual != expected:
-                failures.append(f"rank {trainer.rank}: EMA metadata {key} differs")
+        actual_ema = trainer.ema.state_dict()
+        expected_ema = final_state["ema"]
+        if actual_ema.keys() != expected_ema.keys():
+            failures.append(f"rank {trainer.rank}: final EMA keys differ")
+        else:
+            for key, actual in actual_ema.items():
+                expected = expected_ema[key]
+                if isinstance(actual, torch.Tensor):
+                    if not torch.equal(actual.cpu(), expected.cpu()):
+                        failures.append(f"rank {trainer.rank}: EMA {key} differs")
+                elif actual != expected:
+                    failures.append(f"rank {trainer.rank}: EMA metadata {key} differs")
 
     with open(os.path.join(workdir, FULL_LOSSES_FILE)) as f:
         full_losses = json.load(f)

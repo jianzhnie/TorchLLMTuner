@@ -79,7 +79,7 @@ def main() -> None:
     parallel_dims = ParallelTopology(
         dp_replicate=1, dp_shard=-1, cp=2, tp=1, pp=1, ep=1, world_size=world
     )
-    parallel_dims.build_mesh()
+    parallel_dims.build_device_mesh()
 
     failures: list[str] = []
 

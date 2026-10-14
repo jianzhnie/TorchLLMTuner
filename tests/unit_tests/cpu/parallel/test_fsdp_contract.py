@@ -29,6 +29,7 @@ import torch.nn as nn
 from torch.nn import ModuleDict, ModuleList
 
 import llmtuner.parallel.fully_shard_parallel.fully_shard_parallel as apply
+from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.fully_shard_parallel.fine_grained import (
@@ -43,6 +44,28 @@ from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
 )
 
 _VOCAB = 32
+
+
+@pytest.mark.parametrize("implementation", ["custon", "", None])
+def test_decoder_fsdp_rejects_unknown_implementation_before_model_access(
+    monkeypatch, implementation
+):
+    monkeypatch.setattr(
+        apply,
+        "fully_shard",
+        lambda *args, **kwargs: pytest.fail("invalid backend reached model sharding"),
+    )
+    with pytest.raises(ValueError, match="unknown FSDP implementation"):
+        apply.apply_fsdp_to_decoder(
+            None,
+            None,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            pp_enabled=False,
+            fsdp_implementation=implementation,
+        )
+
+
 _HIDDEN = 8
 _NUM_LAYERS = 3
 
@@ -175,16 +198,7 @@ def test_apply_fsdp_preserves_parameter_dtype_for_mixed_precision(
         (),
         {"pp_enabled": False, "ep": 1},
     )()
-    config = type(
-        "ParallelConfigStub",
-        (),
-        {
-            "fsdp_reshard_after_forward": "default",
-            "fsdp_cpu_offload": False,
-            "fsdp_cpu_offload_pin_memory": True,
-            "enable_fsdp_symm_mem": False,
-        },
-    )()
+    config = ParallelConfig()
 
     apply.apply_fsdp(model, config, parallel_dims)
 
@@ -212,16 +226,7 @@ def test_apply_fsdp_forwards_cpu_offload_policy(
 
     model = nn.Linear(4, 4)
     parallel_dims = type("ParallelTopologyStub", (), {"pp_enabled": False, "ep": 1})()
-    config = type(
-        "ParallelConfigStub",
-        (),
-        {
-            "fsdp_reshard_after_forward": "default",
-            "fsdp_cpu_offload": True,
-            "fsdp_cpu_offload_pin_memory": False,
-            "enable_fsdp_symm_mem": False,
-        },
-    )()
+    config = ParallelConfig(fsdp_cpu_offload=True, fsdp_cpu_offload_pin_memory=False)
 
     apply.apply_fsdp(model, config, parallel_dims)
 
@@ -257,6 +262,48 @@ def test_fsdp_prefetch_supports_arbitrary_windows() -> None:
     set_fsdp_prefetch_windows(units, forward_count=0, backward_count=0)
     assert all(unit.forward_targets == [] for unit in units)
     assert all(unit.backward_targets == [] for unit in units)
+
+
+@pytest.mark.parametrize("field", ["forward_count", "backward_count"])
+@pytest.mark.parametrize("value", [True, 1.5, float("nan"), "2", None, -1])
+def test_fsdp_prefetch_rejects_invalid_counts_before_mutation(field, value) -> None:
+    class Unit(nn.Module):
+        def set_modules_to_forward_prefetch(self, modules) -> None:
+            pytest.fail("invalid counts must be rejected before configuring units")
+
+        def set_modules_to_backward_prefetch(self, modules) -> None:
+            pytest.fail("invalid counts must be rejected before configuring units")
+
+    counts = {"forward_count": 1, "backward_count": 1, field: value}
+    with pytest.raises(ValueError, match=field):
+        set_fsdp_prefetch_windows([Unit(), Unit()], **counts)
+
+
+def test_fsdp_prefetch_rejects_missing_interface_before_mutation():
+    class Unit(nn.Module):
+        def set_modules_to_forward_prefetch(self, modules):
+            pytest.fail("invalid plan modified a preceding unit")
+
+        def set_modules_to_backward_prefetch(self, modules):
+            pytest.fail("invalid plan modified a preceding unit")
+
+    with pytest.raises(TypeError, match="prefetch unit 1 lacks callable"):
+        set_fsdp_prefetch_windows(
+            [Unit(), nn.Identity()], forward_count=1, backward_count=1
+        )
+
+
+def test_fsdp_prefetch_rejects_duplicate_units_before_mutation():
+    class Unit(nn.Module):
+        def set_modules_to_forward_prefetch(self, modules):
+            pytest.fail("duplicate units must fail before configuring windows")
+
+        def set_modules_to_backward_prefetch(self, modules):
+            pytest.fail("duplicate units must fail before configuring windows")
+
+    unit = Unit()
+    with pytest.raises(ValueError, match="distinct module objects"):
+        set_fsdp_prefetch_windows([unit, unit], forward_count=1, backward_count=1)
 
 
 def test_fsdp_strategy_selects_pyTorch_214_compatible_adapter() -> None:
@@ -301,6 +348,30 @@ def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
     assert calls[0][1]["mp_policy"] is override_policy
     assert calls[1][0] is model
     assert calls[1][1]["mp_policy"] is not override_policy
+
+
+@pytest.mark.parametrize(
+    "pattern, message",
+    [("missing", "matched no module"), ("{2-1}", "invalid module pattern range")],
+)
+def test_fsdp_ignored_patterns_reject_invalid_selections(pattern, message):
+    from llmtuner.config.parallel_config import ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
+
+    model = nn.Sequential(nn.Linear(2, 2))
+    cfg = ParallelConfig(fsdp_apply_modules={"0": {}}, fsdp_ignored_modules=[pattern])
+    with pytest.raises(ValueError, match=message):
+        _resolve_pattern_units(model, cfg)
+
+
+def test_fsdp_apply_pattern_is_validated_when_every_module_is_ignored():
+    from llmtuner.config.parallel_config import ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
+
+    model = nn.Sequential(nn.Linear(2, 2))
+    cfg = ParallelConfig(fsdp_apply_modules={"{3-1}": {}}, fsdp_ignored_modules=["*"])
+    with pytest.raises(ValueError, match="invalid module pattern range"):
+        _resolve_pattern_units(model, cfg)
 
 
 def test_ignored_fsdp_module_excludes_its_descendants():

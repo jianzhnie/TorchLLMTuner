@@ -27,8 +27,8 @@ from llmtuner.models.hf.attention_backend import ATTENTION_BACKEND
 from llmtuner.models.hf.factory import (
     build_model_config,
     build_model_config_for,
-    materialize_meta_model,
 )
+from llmtuner.models.hf.materialization import materialize_meta_model
 from llmtuner.models.hf.model import HFTransformerModel
 
 _HIDDEN = 32
@@ -80,7 +80,93 @@ def test_meta_materialization_restores_rope_and_loads_exact_weights() -> None:
         assert torch.equal(restored(ids), reference(ids))
 
 
+def test_empty_architecture_overrides_build_offline_defaults(monkeypatch):
+    from transformers import AutoConfig
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("explicit offline overrides must not load a Hub config")
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", unexpected)
+    overrides = {}
+    config = build_model_config("qwen3", seq_len=64, arch_overrides=overrides)
+    assert config.model_type == "qwen3"
+    assert config.max_position_embeddings == 64
+    assert overrides == {}
+
+
 # -- part names ---------------------------------------------------------------
+
+
+def test_meta_materialization_leaves_persistent_buffers_for_checkpoint() -> None:
+    reference = torch.nn.Linear(3, 2)
+    reference.register_buffer("calibration", torch.tensor([1.25]))
+    with torch.device("meta"):
+        restored = torch.nn.Linear(3, 2)
+        restored.register_buffer("calibration", torch.empty(1))
+
+    materialize_meta_model(restored, torch.device("cpu"))
+    restored.load_state_dict(reference.state_dict(), strict=True)
+    torch.testing.assert_close(restored.calibration, reference.calibration)
+    torch.testing.assert_close(restored.weight, reference.weight)
+
+
+def test_meta_materialization_preserves_real_nonpersistent_buffers() -> None:
+    with torch.device("meta"):
+        model = torch.nn.Linear(3, 2)
+    expected = torch.tensor([1.25, 2.5])
+    model.register_buffer("runtime_scale", expected.clone(), persistent=False)
+    model.register_buffer("scale_alias", model.runtime_scale, persistent=False)
+
+    materialize_meta_model(model, torch.device("cpu"))
+
+    torch.testing.assert_close(model.runtime_scale, expected)
+    torch.testing.assert_close(model.scale_alias, expected)
+    assert not model.weight.is_meta
+
+
+def test_unknown_meta_buffer_is_rejected_before_materialization() -> None:
+    with torch.device("meta"):
+        model = torch.nn.Linear(3, 2)
+        model.register_buffer("runtime_scale", torch.empty(2), persistent=False)
+    weight, buffer = model.weight, model.runtime_scale
+
+    with pytest.raises(RuntimeError, match="unsupported non-checkpoint buffers"):
+        materialize_meta_model(model, torch.device("cpu"))
+
+    assert model.weight is weight and model.weight.is_meta
+    assert model.runtime_scale is buffer and model.runtime_scale.is_meta
+
+
+def test_meta_materialization_preserves_tied_parameters_and_gradients() -> None:
+    reference = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Linear(3, 3))
+    reference[1].weight = reference[0].weight
+    with torch.device("meta"):
+        restored = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Linear(3, 3))
+        restored[1].weight = restored[0].weight
+
+    materialize_meta_model(restored, torch.device("cpu"))
+    restored.load_state_dict(reference.state_dict(), strict=True)
+
+    assert restored[0].weight is restored[1].weight
+    assert len(list(restored.parameters())) == len(list(reference.parameters()))
+    inputs = torch.randn(2, 3)
+    actual, expected = restored(inputs), reference(inputs)
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(restored[0].weight.grad, reference[0].weight.grad)
+
+
+def test_meta_materialization_preserves_persistent_buffer_aliases() -> None:
+    with torch.device("meta"):
+        model = torch.nn.Module()
+        model.register_buffer("scale", torch.empty(2))
+        model.register_buffer("scale_alias", model.scale)
+
+    materialize_meta_model(model, torch.device("cpu"))
+    assert model.scale is model.scale_alias
+    model.load_state_dict({"scale": torch.ones(2), "scale_alias": torch.ones(2)})
+    torch.testing.assert_close(model.scale, torch.ones(2))
 
 
 def test_named_children_flattens_the_decoder(model: HFTransformerModel) -> None:
@@ -566,11 +652,11 @@ def test_an_unsettable_experts_implementation_is_rejected() -> None:
 def test_native_experts_implementation_is_the_default_and_builds() -> None:
     """The default leaves the HF model's own experts kernel untouched."""
     from llmtuner.models.hf.factory import resolve_model_class
-    from llmtuner.models.hf.model_setup import resolve_experts_implementation
+    from llmtuner.models.hf.model_setup import configure_experts_implementation
 
     config = _qwen3_config()
     assert getattr(config, "experts_implementation", "native") == "native"
-    resolve_experts_implementation(resolve_model_class(config), config)
+    configure_experts_implementation(config, model_cls=resolve_model_class(config))
     assert getattr(config, "_experts_implementation", None) is None
 
     model = HFTransformerModel(config).eval()
@@ -642,3 +728,50 @@ def test_pipeline_chunk_without_embedding_or_head_is_not_weight_tied(model):
     model.tok_embeddings = torch.nn.Identity()
     model.lm_head = torch.nn.Identity()
     assert not model.enable_weight_tying
+
+
+@pytest.mark.parametrize("field", ["num_attention_heads", "num_key_value_heads"])
+@pytest.mark.parametrize("value", [0, -1, True, 2.0, 1.5, "4"])
+def test_hf_attention_heads_require_positive_integers(field, value):
+    from transformers.configuration_utils import PretrainedConfig
+
+    from llmtuner.models.hf.model_setup import validate_head_config
+
+    config = PretrainedConfig(num_attention_heads=4, num_key_value_heads=2)
+    setattr(config, field, value)
+    with pytest.raises(ValueError, match=f"{field} must be a positive integer"):
+        validate_head_config(config)
+
+
+@pytest.mark.parametrize("placeholder", [None, 42, "placeholder"])
+def test_submodule_name_resolution_skips_non_module_attributes(placeholder):
+    from llmtuner.models.hf.model_setup import resolve_submodule_name
+
+    decoder = torch.nn.Module()
+    decoder.embed_tokens = placeholder
+    decoder.wte = torch.nn.Embedding(8, 4)
+    assert (
+        resolve_submodule_name(
+            decoder, ("embed_tokens", "wte"), component="token embedding"
+        )
+        == "wte"
+    )
+
+
+def test_submodule_name_resolution_rejects_missing_module():
+    from llmtuner.models.hf.model_setup import resolve_submodule_name
+
+    decoder = torch.nn.Module()
+    decoder.norm = None
+    with pytest.raises(AttributeError, match="has no final norm module"):
+        resolve_submodule_name(decoder, ("norm", "ln_f"), component="final norm")
+
+
+@pytest.mark.parametrize("architecture", ["AutoConfig", "__version__"])
+def test_model_class_resolution_skips_non_model_attributes(architecture):
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from llmtuner.models.hf.factory import resolve_model_class
+
+    config = LlamaConfig(architectures=[architecture])
+    assert resolve_model_class(config) is LlamaForCausalLM

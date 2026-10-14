@@ -29,7 +29,7 @@ from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     MOE_PLAN_SPECS,
-    resolve_plan,
+    resolve_tp_sharding_plan,
     shard_experts_for_tp,
 )
 
@@ -140,7 +140,7 @@ def _applied_model(tp_size: int, tp_rank: int, seed: int = 0) -> _MoeModel:
 
 
 def test_moe_plan_specs_resolve_instead_of_raising() -> None:
-    plan = resolve_plan(_MoeModel(), None)
+    plan = resolve_tp_sharding_plan(_MoeModel(), plan=None)
     assert set(plan) == set(MOE_PLAN)
     # The MoE spec strings resolve to None: nothing for the per-Linear engine
     # to swap; the structural MoE path realizes them. "rowwise" on the packed
@@ -156,7 +156,7 @@ def test_ep_plan_strings_still_raise_on_the_tp_path() -> None:
         _tp_plan = {"layers.*.mlp.experts.gate_up_proj": "grouped_gemm"}
 
     with pytest.raises(ValueError, match="Unsupported TP plan entry"):
-        resolve_plan(M(), None)
+        resolve_tp_sharding_plan(M(), plan=None)
 
 
 # -- weight sharding ----------------------------------------------------------
@@ -293,7 +293,8 @@ class _SharedMLP(nn.Module):
         return self.down_proj(gate * self.up_proj(x))
 
 
-def test_shared_expert_shards_featurewise_and_partials_sum() -> None:
+@pytest.mark.parametrize("plural_fallback", [False, True])
+def test_shared_expert_shards_featurewise_and_partials_sum(plural_fallback) -> None:
     """The two ranks' halves of a sharded shared expert sum to the reference.
 
     The helper takes no collective: the input is replicated (the MoE boundary
@@ -311,11 +312,19 @@ def test_shared_expert_shards_featurewise_and_partials_sum() -> None:
     partials = []
     for rank in (0, 1):
         block = nn.Module()
-        block.shared_expert = _SharedMLP().double()
-        block.shared_expert.load_state_dict(reference.state_dict())
+        shared = _SharedMLP().double()
+        shared.load_state_dict(reference.state_dict())
+        if plural_fallback:
+            block.shared_expert = None
+            block.shared_experts = shared
+        else:
+            block.shared_expert = shared
         ids = shard_shared_expert_for_tp(block, tp_size=2, tp_rank=rank)
-        assert len(ids) == 3
-        partials.append(block.shared_expert(x))
+        prefix = "shared_experts" if plural_fallback else "shared_expert"
+        assert ids == {
+            f"{prefix}.{name}.weight" for name in ("gate_proj", "up_proj", "down_proj")
+        }
+        partials.append(shared(x))
 
     assert torch.allclose(partials[0] + partials[1], reference(x), atol=1e-12)
     # The sharded weights keep the same module paths with halved features.
@@ -358,6 +367,38 @@ def test_shared_expert_is_not_double_sharded_by_the_dense_plan() -> None:
     assert shared.down_proj.weight.shape[1] == 32 // 2
     for proj in (shared.gate_proj, shared.up_proj, shared.down_proj):
         assert not isinstance(proj, ColumnParallelLinear | RowParallelLinear)
+
+
+@pytest.mark.parametrize("failure", ["layout", "hidden", "bias", "shared_hidden"])
+def test_moe_tp_validates_all_blocks_before_sharding(failure) -> None:
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import realize_moe_blocks_tp
+
+    blocks = [_MoeBlock(4, 16, 8, 2), _MoeBlock(4, 16, 8, 2)]
+    if failure == "layout":
+        blocks[1].shared_expert = nn.Linear(16, 16)
+    elif failure == "hidden":
+        blocks[1].experts = _Experts(4, 16, 7)
+    else:
+        shared = nn.Module()
+        hidden = 7 if failure == "shared_hidden" else 8
+        shared.gate_proj = nn.Linear(16, hidden, bias=failure == "bias")
+        shared.up_proj = nn.Linear(16, hidden, bias=False)
+        shared.down_proj = nn.Linear(hidden, 16, bias=False)
+        blocks[1].shared_expert = shared
+    original = [{name: p for name, p in block.named_parameters()} for block in blocks]
+    with pytest.raises(ValueError if failure != "layout" else NotImplementedError):
+        realize_moe_blocks_tp(
+            [("first", blocks[0]), ("second", blocks[1])],
+            tp_size=2,
+            tp_rank=0,
+            group=None,
+        )
+    for block, parameters in zip(blocks, original, strict=True):
+        assert type(block) is _MoeBlock
+        assert not hasattr(block, "_tp_moe_boundary")
+        assert all(
+            dict(block.named_parameters())[name] is p for name, p in parameters.items()
+        )
 
 
 def test_apply_tp_raises_on_a_shared_expert_block() -> None:

@@ -111,7 +111,7 @@ def main():
             training=TrainingConfig(max_seq_len=512, steps=1),
         )
         topology = ParallelTopology.from_config(cfg.parallel, 4)
-        topology.build_mesh()
+        topology.build_device_mesh()
         mesh = topology.get_mesh("cp")
         check_collective_gradients(topology)
         generator = torch.Generator().manual_seed(31)

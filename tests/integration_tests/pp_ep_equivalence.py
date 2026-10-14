@@ -35,7 +35,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
-from llmtuner.datasets.synthetic import RandomTokenSource, batch_iterator
+from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
@@ -128,7 +128,7 @@ def _reference_trajectory(
     # DP splits the global batch across EP ranks before PP forms its local
     # microbatches. Attention sees one row per forward on each rank here.
     rows_per_mb = cfg.global_batch_size // (MICROBATCHES * EP)
-    batches = batch_iterator(
+    batches = iter(
         RandomTokenSource(
             seed=cfg.seed,
             vocab_size=cfg.vocab_size,

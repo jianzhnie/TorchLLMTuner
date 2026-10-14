@@ -14,6 +14,24 @@ from llmtuner.components.optimizer import LRSchedulersContainer, build_lr_schedu
 from llmtuner.config import LRSchedulerConfig
 
 
+def test_scheduler_restore_preserves_tensor_learning_rate_identity():
+    learning_rate = torch.tensor(0.4)
+    optimizer = torch.optim.AdamW(
+        [torch.nn.Parameter(torch.zeros(2))], lr=learning_rate
+    )
+    scheduler = LRSchedulersContainer(
+        [optimizer], lambda step: 1.0 / (step + 1), total_steps=10
+    )
+    scheduler.load_state_dict({"last_epoch": 3})
+    assert optimizer.param_groups[0]["lr"] is learning_rate
+    torch.testing.assert_close(learning_rate, torch.tensor(0.1))
+    assert scheduler.get_metrics()["lr/AdamW"] == pytest.approx(0.1)
+    optimizer.step()
+    scheduler.step()
+    assert optimizer.param_groups[0]["lr"] is learning_rate
+    torch.testing.assert_close(learning_rate, torch.tensor(0.08))
+
+
 def _optimizer(lr: float = 1.0) -> torch.optim.Optimizer:
     parameter = torch.nn.Parameter(torch.zeros(2, 2))
     return torch.optim.AdamW([parameter], lr=lr)
@@ -43,6 +61,19 @@ def _advance(scheduler: LRSchedulersContainer, steps: int) -> None:
 
 
 # -- the curve ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("steps", [0, -1, True, 1.5])
+def test_invalid_schedule_extent_preserves_optimizer(steps):
+    optimizer = _optimizer(lr=0.25)
+    original_groups = [group.copy() for group in optimizer.param_groups]
+    with pytest.raises(ValueError, match="training_steps"):
+        build_lr_scheduler(
+            LRSchedulerConfig(), optimizers=[optimizer], training_steps=steps
+        )
+    with pytest.raises(ValueError, match="total_steps"):
+        LRSchedulersContainer([optimizer], lambda step: 0.5, total_steps=steps)
+    assert optimizer.param_groups == original_groups
 
 
 def test_default_config_is_a_constant_learning_rate() -> None:
@@ -320,3 +351,25 @@ def test_invalid_scheduler_epoch_leaves_schedule_unchanged(epoch):
         scheduler.load_state_dict({"last_epoch": epoch})
     assert scheduler.state_dict() == before
     assert scheduler.get_metrics() == lr_before
+
+
+def test_scheduler_restore_validates_all_groups_before_updating_any_scheduler():
+    first, second = _optimizer(0.1), _optimizer(0.2)
+    container = LRSchedulersContainer(
+        [first, second], lambda step: 1 / (step + 1), total_steps=10
+    )
+    original = container.schedulers[0].state_dict()
+    del second.param_groups[0]["initial_lr"]
+    with pytest.raises(KeyError, match="initial_lr"):
+        container.load_state_dict({"last_epoch": 4})
+    assert first.param_groups[0]["lr"] == 0.1
+    assert container.schedulers[0].state_dict() == original
+
+
+def test_scheduler_rejects_duplicate_optimizer_before_changing_learning_rate():
+    parameter = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.SGD([parameter], lr=0.2)
+    with pytest.raises(ValueError, match="only once"):
+        LRSchedulersContainer([optimizer, optimizer], lambda step: 0.5, total_steps=10)
+    assert optimizer.param_groups[0]["lr"] == 0.2
+    assert "initial_lr" not in optimizer.param_groups[0]

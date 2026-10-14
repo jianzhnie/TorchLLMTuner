@@ -23,6 +23,8 @@ require_env("pipelining")
 
 
 import re
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -44,8 +46,52 @@ from llmtuner.config import (
     SelectiveACConfig,
     TrainingConfig,
 )
-from llmtuner.config.cli_config import PARSER_GROUPS, cli_groups
+from llmtuner.config.cli_config import PARSER_GROUPS, PROGRAMMATIC_ONLY, cli_view
+
+
+def test_cli_views_preserve_hidden_field_properties():
+    from dataclasses import fields
+
+    for config, hidden in PROGRAMMATIC_ONLY.items():
+        original_fields = {field.name: field for field in fields(config)}
+        view_fields = {field.name: field for field in fields(cli_view(config))}
+        for name in hidden:
+            original = original_fields[name]
+            view = view_fields[name]
+            assert view is not original
+            assert original.init
+            assert not view.init
+            for attribute in (
+                "default",
+                "default_factory",
+                "metadata",
+                "repr",
+                "compare",
+                "hash",
+                "kw_only",
+            ):
+                assert getattr(view, attribute) == getattr(original, attribute)
+
+
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
+
+
+def test_cli_config_parsing_does_not_require_training_engine():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "sys.modules['llmtuner.trainer.trainer'] = None; "
+            "from llmtuner.trainer.cli import parse_config; "
+            "assert parse_config(['--steps', '1']).steps == 1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
 
 # -- ParallelConfig ----------------------------------------------------------
 
@@ -71,6 +117,60 @@ def test_dp_shard_accepts_minus_one_as_derive_but_not_zero() -> None:
     assert ParallelConfig(data_parallel_shard_size=-1).data_parallel_shard_size == -1
     with pytest.raises(ValueError, match="must be >= 1 or -1"):
         ParallelConfig(data_parallel_shard_size=0)
+
+
+def test_tp_config_rejects_conflicting_pattern_styles() -> None:
+    with pytest.raises(ConfigError, match="conflicting styles"):
+        ParallelConfig(tp_colwise_modules=["layers.*"], tp_rowwise_modules=["layers.*"])
+
+
+def test_tp_config_rejects_unsupported_sequence_module_plan() -> None:
+    with pytest.raises(UnsupportedCombinationError, match="tp_sequence_modules"):
+        ParallelConfig(tp_sequence_modules=["layers.*.norm"])
+
+
+def test_tp_config_accepts_distinct_pattern_styles() -> None:
+    config = ParallelConfig(
+        tp_colwise_modules=["*.up_proj"], tp_rowwise_modules=["*.down_proj"]
+    )
+    assert config.tp_colwise_modules == ["*.up_proj"]
+    assert config.tp_rowwise_modules == ["*.down_proj"]
+
+
+@pytest.mark.parametrize("value", [True, 1.0, -1.0, float("nan"), "2", None])
+def test_dp_shard_requires_an_integer(value) -> None:
+    with pytest.raises(ConfigError, match="data_parallel_shard_size"):
+        ParallelConfig(data_parallel_shard_size=value)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "fsdp_forward_prefetch_count",
+        "fsdp_backward_prefetch_count",
+        "train_timeout_seconds",
+    ],
+)
+@pytest.mark.parametrize("value", [True, 1.5, float("nan"), "2", None, -1])
+def test_parallel_runtime_counts_require_valid_integers(field, value) -> None:
+    with pytest.raises(ConfigError, match=field):
+        ParallelConfig(**{field: value})
+
+
+def test_fsdp_prefetch_allows_zero_and_explicit_windows() -> None:
+    config = ParallelConfig(
+        fsdp_forward_prefetch_count=0, fsdp_backward_prefetch_count=3
+    )
+    assert config.fsdp_forward_prefetch_count == 0
+    assert config.fsdp_backward_prefetch_count == 3
+
+
+@pytest.mark.parametrize("value", [True, 1.0, float("nan"), "2", None, 0, -1])
+@pytest.mark.parametrize("shard_size", [-1, 1])
+def test_dp_derivation_requires_positive_integer_world_size(value, shard_size) -> None:
+    config = ParallelConfig(data_parallel_shard_size=shard_size)
+    with pytest.raises(ConfigError, match="world_size must be a positive integer"):
+        config.derive_dp(value)
 
 
 def test_an_empty_load_balancer_is_rejected_rather_than_coerced() -> None:
@@ -206,6 +306,17 @@ def test_total_steps_if_given_must_be_positive() -> None:
     assert LRSchedulerConfig(total_steps=None).total_steps is None
     with pytest.raises(ValueError, match="total_steps must be >= 1"):
         LRSchedulerConfig(total_steps=0)
+
+
+@pytest.mark.parametrize("field", ["decay_ratio", "min_lr_factor"])
+@pytest.mark.parametrize(
+    "value", [True, False, None, "0.5", float("nan"), float("inf")]
+)
+def test_scheduler_fractions_reject_non_numeric_and_nonfinite_values(field, value):
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match=f"{field} must be in"):
+        LRSchedulerConfig(**{field: value})
 
 
 def test_decay_ratio_is_a_fraction() -> None:
@@ -360,6 +471,24 @@ def test_a_non_positive_log_freq_is_rejected() -> None:
     assert MetricsConfig(log_freq=1).log_freq == 1
 
 
+@pytest.mark.parametrize("value", [True, 1.5, float("nan"), "2", None])
+def test_observability_counts_require_integers(value) -> None:
+    with pytest.raises(ConfigError, match="log_freq"):
+        MetricsConfig(log_freq=value)
+    with pytest.raises(ConfigError, match="profile_freq"):
+        ProfilerConfig(profile_freq=value)
+    with pytest.raises(ConfigError, match="interval"):
+        CheckpointConfig(interval=value)
+
+
+@pytest.mark.parametrize("field", ["profiler_warmup", "profiler_active"])
+@pytest.mark.parametrize("value", ["2", None, True, 1.5])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_profiler_validates_cycle_fields_before_arithmetic(field, value, enabled):
+    with pytest.raises(ConfigError, match=field):
+        ProfilerConfig(enable_profiling=enabled, **{field: value})
+
+
 def test_profiling_must_fit_one_cycle_into_the_interval() -> None:
     """A cycle is ``profiler_warmup + profiler_active``; a shorter interval
     would never reach the active iterations it exists to capture."""
@@ -474,10 +603,35 @@ def test_profiler_and_dataloader_scalars_have_floors() -> None:
     ProfilerConfig(profiler_warmup=0)  # zero warmup is a legal choice
     with pytest.raises(ConfigError, match="memory_snapshot_max_entries"):
         ProfilerConfig(memory_snapshot_max_entries=0)
+    with pytest.raises(ConfigError, match="memory_snapshot_freq"):
+        ProfilerConfig(memory_snapshot_freq=1.5)
+    with pytest.raises(ConfigError, match="memory_snapshot_freq"):
+        ProfilerConfig(memory_snapshot_freq=0)
     with pytest.raises(ConfigError, match="streaming_shuffle_buffer_size"):
         DataloaderConfig(streaming_shuffle_buffer_size=0)
     with pytest.raises(ConfigError, match="num_prefetch_batches"):
         DataloaderConfig(num_prefetch_batches=0)
+    with pytest.raises(ConfigError, match="max_num_documents"):
+        DataloaderConfig(max_num_documents=1.5)
+    with pytest.raises(ConfigError, match="chunked_loss_num_chunks"):
+        TrainingConfig(chunked_loss_num_chunks=1.5)
+    with pytest.raises(ConfigError, match="load_step"):
+        CheckpointConfig(load_step="latest")
+
+
+@pytest.mark.parametrize("max_documents", [None, 1, 2])
+@pytest.mark.parametrize("dataset", [None, "random", "local_jsonl"])
+def test_attention_mask_follows_effective_corpus_and_document_limit(
+    max_documents, dataset
+):
+    config = DataloaderConfig(max_num_documents=max_documents)
+    expected = (
+        "causal"
+        if dataset in (None, "random") or max_documents == 1
+        else "block_causal"
+    )
+    assert config.attention_mask_type(dataset=dataset) == expected
+    assert config.dataset == "random"
 
 
 def test_ac_determinism_check_is_an_enum() -> None:
@@ -550,20 +704,23 @@ def test_the_fields_the_cli_cannot_carry_are_not_offered_as_flags() -> None:
     ``arch_overrides`` (a dict), ``param_groups`` (a list of nested
     dataclasses) and ``purge_exempt`` (a callable) are programmatic-only, and
     ``HfArgumentParser`` rejects any value given to them -- but it still lists
-    them in ``--help``, looking usable. ``cli_groups`` hides them by handing the
+    them in ``--help``, looking usable. ``cli_view`` hides them by handing the
     parser an ``init=False`` view of each group; this pins that, and pins the
     flags that must *not* disappear with them.
 
     Matched as option lines, not substrings: the prose of neighbouring help
     strings legitimately mentions these names (e.g. "``purge_exempt=None``").
     """
-    parser = HfArgumentParser(list(cli_groups(PARSER_GROUPS)))
+    parser = HfArgumentParser([cli_view(group) for group in PARSER_GROUPS])
     help_text = parser.format_help()
 
     for hidden in (
         "arch_overrides",
         "param_groups",
         "purge_exempt",
+        "fsdp_apply_modules",
+        "module_fqns_per_model_part",
+        "lr_scheduler_config",
         # Nested dataclasses collapse to single-value flags that reject every
         # value; they are grafted from their own parser groups instead.
         "ema_config",
@@ -578,19 +735,26 @@ def test_the_fields_the_cli_cannot_carry_are_not_offered_as_flags() -> None:
         "region_ac",
     ):
         assert not re.search(rf"^\s+--{hidden}\b", help_text, re.M), hidden
-    for kept in ("tensor_parallel_size", "learning_rate", "steps"):
+    for kept in (
+        "tensor_parallel_size",
+        "learning_rate",
+        "steps",
+        "tp_colwise_modules",
+        "fsdp_ignored_modules",
+        "warmup_steps",
+    ):
         assert re.search(rf"^\s+--{kept}\b", help_text, re.M), kept
 
 
 def test_the_cli_view_parses_into_the_real_groups() -> None:
     """The views are drop-in: defaults, ``__post_init__`` and ``isinstance``.
 
-    ``parse_args_into_dataclasses`` returns the subclasses ``cli_groups``
+    ``parse_args_into_dataclasses`` returns the subclasses ``cli_view``
     generates, so every passthrough the graft table keys by group still works --
     and the hidden fields keep the group's own defaults rather than becoming
     missing attributes.
     """
-    parser = HfArgumentParser(list(cli_groups(PARSER_GROUPS)))
+    parser = HfArgumentParser([cli_view(group) for group in PARSER_GROUPS])
     parsed = parser.parse_args_into_dataclasses(
         ["--vocab_size", "64", "--tensor_parallel_size", "2", "--learning_rate", "1e-3"]
     )
@@ -621,9 +785,35 @@ def test_the_cli_view_parses_into_the_real_groups() -> None:
     assert len(cfg.optimizer.param_groups) == 1
 
 
+def test_cli_hidden_configuration_defaults_are_not_shared():
+    from llmtuner.config.cli_config import cli_view
+
+    optimizer_view = cli_view(OptimizerConfig)
+    first, second = optimizer_view(), optimizer_view()
+    first.lr_scheduler_config.warmup_steps = 3
+    assert second.lr_scheduler_config.warmup_steps == 0
+    parallel_view = cli_view(ParallelConfig)
+    first_parallel, second_parallel = parallel_view(), parallel_view()
+    first_parallel.fsdp_apply_modules["layers.*"] = {}
+    assert second_parallel.fsdp_apply_modules == {}
+
+
 def test_unknown_packing_is_rejected():
     with pytest.raises(ConfigError, match="dataloader.packing"):
         DataloaderConfig(packing="typo")
+
+
+def test_model_rejects_nonuniform_gqa_head_groups():
+    with pytest.raises(ConfigError, match="divisible by num_key_value_heads"):
+        ModelConfig(hidden_size=96, num_attention_heads=6, num_key_value_heads=4)
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 3, 6])
+def test_model_accepts_uniform_attention_head_groups(kv_heads):
+    config = ModelConfig(
+        hidden_size=96, num_attention_heads=6, num_key_value_heads=kv_heads
+    )
+    assert config.num_key_value_heads == kv_heads
 
 
 @pytest.mark.parametrize("relative", [False, True])
@@ -687,3 +877,75 @@ def test_auto_fill_uses_composite_hf_text_architecture(tmp_path):
         "num_key_value_heads",
     ):
         assert getattr(cfg.model, field) == getattr(saved.text_config, field)
+
+
+@pytest.mark.parametrize("field", ["freq", "steps"])
+@pytest.mark.parametrize("value", [True, 1.5, "2", None])
+def test_validation_config_rejects_non_integer_step_controls(field, value):
+    from llmtuner.config.validation_config import ValidationConfig
+
+    with pytest.raises(ConfigError, match=f"validation.{field}"):
+        ValidationConfig(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "num_pp_microbatches",
+        "context_parallel_kcp_size",
+        "context_parallel_ulysses_size",
+        "context_parallel_kv_allgather_size",
+        "expert_parallel_size",
+    ],
+)
+@pytest.mark.parametrize("value", [True, 1.5, "2", None])
+def test_parallel_integer_degrees_reject_non_integer_values(field, value):
+    with pytest.raises(ConfigError, match=f"parallel.{field}"):
+        ParallelConfig(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("config_type", "field", "group"),
+    [
+        (ModelConfig, "hidden_size", "model"),
+        (TrainingConfig, "steps", "training"),
+        (DataloaderConfig, "num_packing_bins", "dataloader"),
+        (ProfilerConfig, "memory_snapshot_max_entries", "profiler"),
+    ],
+)
+@pytest.mark.parametrize("value", [True, 1.5, float("nan"), "2", None])
+def test_integer_field_validation_covers_config_groups(
+    config_type, field, group, value
+):
+    with pytest.raises(ConfigError, match=rf"{group}\.{field}"):
+        config_type(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["warmup_steps", "total_steps"])
+@pytest.mark.parametrize("value", [True, 1.5, float("nan"), "2"])
+def test_lr_schedule_counts_require_integers(field, value):
+    with pytest.raises(ConfigError, match=field):
+        LRSchedulerConfig(**{field: value})
+
+
+@pytest.mark.parametrize("value", [True, 1.5, float("nan"), "2", None])
+def test_ema_update_interval_requires_integer(value):
+    from llmtuner.config.ema_config import EMAConfig
+
+    with pytest.raises(ConfigError, match="update_every_n_steps"):
+        EMAConfig(update_every_n_steps=value)
+
+
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), -float("inf"), True, "1", None]
+)
+def test_training_rejects_invalid_gradient_clip_threshold(value):
+    with pytest.raises(ConfigError, match="max_norm"):
+        TrainingConfig(max_norm=value)
+
+
+@pytest.mark.parametrize("value", [-1, 0, 1.5])
+def test_training_accepts_finite_gradient_clip_threshold(value):
+    assert TrainingConfig(max_norm=value).max_norm == value

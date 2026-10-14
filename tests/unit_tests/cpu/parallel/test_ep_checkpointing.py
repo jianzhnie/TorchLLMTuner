@@ -50,14 +50,18 @@ def test_save_gathers_and_load_slices_back(monkeypatch) -> None:
     assert set(shard_map) == {"mlp.w1_EFD", "mlp.w2_EDF"}
 
     sd = model.state_dict()
-    full = checkpointing.gather_expert_state(sd, shard_map, [model])
+    full = checkpointing.gather_expert_state(
+        sd, shard_map=shard_map, model_parts=[model]
+    )
     assert full["mlp.w1_EFD"].shape == (4, 4, 3)  # E = num_local * world
     torch.testing.assert_close(full["mlp.w1_EFD"][:2], grouped.w1_EFD.detach())
     torch.testing.assert_close(full["mlp.w1_EFD"][2:], grouped.w1_EFD.detach() + 100)
 
     # Load on rank 1 keeps the other half.
     _fake_group(monkeypatch, world=2, rank=1)
-    loaded = checkpointing.load_expert_state(full, shard_map, [model])
+    loaded = checkpointing.load_expert_state(
+        full, shard_map=shard_map, model_parts=[model]
+    )
     torch.testing.assert_close(loaded["mlp.w1_EFD"], grouped.w1_EFD.detach() + 100)
     assert loaded["mlp.w1_EFD"].shape == grouped.w1_EFD.shape
 
@@ -74,7 +78,9 @@ def test_scalars_and_unrelated_state_are_untouched(monkeypatch) -> None:
         "state.mlp.w1_EFD.exp_avg": torch.zeros(2, 4, 3),
         "state.mlp.w1_EFD.step": torch.tensor(3.0),
     }
-    out = checkpointing.gather_expert_state(sd, shard_map, [model])
+    out = checkpointing.gather_expert_state(
+        sd, shard_map=shard_map, model_parts=[model]
+    )
     assert out["state.mlp.w1_EFD.exp_avg"].shape == (4, 4, 3)
     assert out["state.mlp.w1_EFD.step"].item() == 3.0
 
@@ -88,10 +94,49 @@ def test_load_with_a_mismatched_expert_count_raises(monkeypatch) -> None:
     # 6 experts on disk, this rank holds 2 x ep=2 = 4 -> loud mismatch.
     bad = {"mlp.w1_EFD": torch.zeros(6, 4, 3)}
     try:
-        checkpointing.load_expert_state(bad, shard_map, [model])
+        checkpointing.load_expert_state(bad, shard_map=shard_map, model_parts=[model])
         raise AssertionError("expected ValueError")
     except ValueError as exc:
         assert "different expert layout" in str(exc)
+
+
+@pytest.mark.parametrize("direction", ["save", "load"])
+@pytest.mark.parametrize("shape", [(4, 4), (4, 5, 3)])
+def test_expert_weight_shape_mismatch_is_rejected(monkeypatch, direction, shape):
+    model = _model_with_experts()
+    group = _fake_group(monkeypatch, world=2, rank=0)
+    checkpointing.mark_experts_ep_sharded(model.mlp, group)
+    transform = (
+        checkpointing.gather_expert_state
+        if direction == "save"
+        else checkpointing.load_expert_state
+    )
+    with pytest.raises(ValueError, match="EP checkpoint weight.*incompatible shape"):
+        transform(
+            {"mlp.w1_EFD": torch.zeros(shape)},
+            shard_map=checkpointing.expert_shard_map([model]),
+            model_parts=[model],
+        )
+
+
+@pytest.mark.parametrize("direction", ["save", "load"])
+def test_non_parameter_shaped_optimizer_state_is_untouched(monkeypatch, direction):
+    model = _model_with_experts()
+    group = _fake_group(monkeypatch, world=2, rank=0)
+    checkpointing.mark_experts_ep_sharded(model.mlp, group)
+    value = torch.ones(4)
+    state = {"state.mlp.w1_EFD.statistics": value}
+    transform = (
+        checkpointing.gather_expert_state
+        if direction == "save"
+        else checkpointing.load_expert_state
+    )
+    result = transform(
+        state,
+        shard_map=checkpointing.expert_shard_map([model]),
+        model_parts=[model],
+    )
+    assert result["state.mlp.w1_EFD.statistics"] is value
 
 
 @pytest.mark.parametrize("optimizer_state", [False, True])
@@ -108,17 +153,48 @@ def test_activation_checkpoint_wrappers_preserve_expert_state_matching(
     model.mlp = checkpoint_wrapper(model.mlp)
     shard_map = checkpointing.expert_shard_map([model])
     assert set(shard_map) == {"mlp.w1_EFD", "mlp.w2_EDF"}
-    assert set(checkpointing.named_params([model])) == set(shard_map)
+    assert set(checkpointing.index_checkpoint_parameters([model])) == set(shard_map)
     source = model.state_dict()
     if optimizer_state:
         source = {
             f"state.{key}.exp_avg": value.clone() for key, value in source.items()
         }
-    saved = checkpointing.gather_expert_state(source, shard_map, [model])
+    saved = checkpointing.gather_expert_state(
+        source, shard_map=shard_map, model_parts=[model]
+    )
     for key, value in source.items():
         assert saved[key].shape[0] == 4
         torch.testing.assert_close(saved[key], torch.cat([value, value + 100]))
     _fake_group(monkeypatch, world=2, rank=1)
-    restored = checkpointing.load_expert_state(saved, shard_map, [model])
+    restored = checkpointing.load_expert_state(
+        saved, shard_map=shard_map, model_parts=[model]
+    )
     for key, value in source.items():
         torch.testing.assert_close(restored[key], value + 100)
+
+
+def test_live_parameter_index_rejects_colliding_model_part_names():
+    parts = [torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)]
+    with pytest.raises(ValueError, match="identifies different parameters"):
+        checkpointing.index_checkpoint_parameters(parts)
+
+
+def test_live_parameter_index_accepts_repeated_identity():
+    model = torch.nn.Linear(2, 2)
+    params = checkpointing.index_checkpoint_parameters([model, model])
+    assert params["weight"] is model.weight
+
+
+def test_expert_shard_map_rejects_conflicting_groups():
+    parts = [_model_with_experts(), _model_with_experts()]
+    for part in parts:
+        checkpointing.mark_experts_ep_sharded(part.mlp, object())
+    with pytest.raises(ValueError, match="different expert process groups"):
+        checkpointing.expert_shard_map(parts)
+
+
+def test_expert_shard_map_accepts_repeated_group_identity():
+    model = _model_with_experts()
+    group = object()
+    checkpointing.mark_experts_ep_sharded(model.mlp, group)
+    assert checkpointing.expert_shard_map([model, model])["mlp.w1_EFD"] is group

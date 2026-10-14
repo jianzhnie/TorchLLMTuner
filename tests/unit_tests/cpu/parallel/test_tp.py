@@ -28,8 +28,8 @@ from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     RowParallelLinear,
     ShardingConfig,
     colwise,
-    match,
-    resolve_plan,
+    match_tp_sharding_spec,
+    resolve_tp_sharding_plan,
     rowwise,
 )
 
@@ -105,14 +105,101 @@ def test_plan_resolution_from_hf_string_map() -> None:
             "layers.*.o_proj": "rowwise",
         }
 
-    plan = resolve_plan(M(), None)
+    plan = resolve_tp_sharding_plan(M(), plan=None)
     assert {k: v.kind for k, v in plan.items()} == {
         "layers.*.q_proj": "colwise",
         "layers.*.o_proj": "rowwise",
     }
-    assert match(plan, "layers.3.q_proj").kind == "colwise"
-    assert match(plan, "layers.0.o_proj").kind == "rowwise"
-    assert match(plan, "layers.0.up_proj") is None
+    assert match_tp_sharding_spec("layers.3.q_proj", plan=plan).kind == "colwise"
+    assert match_tp_sharding_spec("layers.0.o_proj", plan=plan).kind == "rowwise"
+    assert match_tp_sharding_spec("layers.0.up_proj", plan=plan) is None
+
+
+@pytest.mark.parametrize("overrides", [[], ["projection"]])
+def test_tp_target_resolution_reads_the_model_plan_once(overrides) -> None:
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_targets
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection = nn.Linear(4, 4, bias=False)
+            self.plan_reads = 0
+
+        @property
+        def tp_plan(self):
+            self.plan_reads += 1
+            if self.plan_reads > 1:
+                pytest.fail("target resolution must reuse the original plan")
+            return {"projection": "colwise"}
+
+    model = Model()
+    targets, moe_blocks = resolve_tp_targets(
+        model,
+        cfg=ParallelConfig(tensor_parallel_size=2, tp_rowwise_modules=overrides),
+        plan=None,
+    )
+    assert model.plan_reads == 1
+    assert targets[0][:2] == ("projection", model.projection)
+    assert targets[0][2].kind == ("rowwise" if overrides else "colwise")
+    assert moe_blocks == []
+
+
+@pytest.mark.parametrize("cls", [ColumnParallelLinear, RowParallelLinear])
+@pytest.mark.parametrize("shape", [(), (4,), (1, 2, 3, 4)])
+def test_tp_projection_rejects_unsupported_rank_before_communication(
+    monkeypatch, cls, shape
+):
+    import llmtuner.parallel.tensor_parallel.tensor_parallel as tp_module
+
+    def unexpected(*args):
+        pytest.fail("invalid layout reached communication")
+
+    monkeypatch.setattr(tp_module, "all_gather_linear", unexpected)
+    monkeypatch.setattr(tp_module, "linear_reduce_scatter", unexpected)
+    projection = cls(
+        torch.ones(6, 4), tp_size=1, tp_rank=0, group=None, use_symm_mem=False
+    )
+    with pytest.raises(ValueError, match="TP projection input must be"):
+        projection(torch.empty(shape))
+
+
+@pytest.mark.parametrize("cls", [ColumnParallelLinear, RowParallelLinear])
+@pytest.mark.parametrize("shape", [(0, 4), (1, 0, 4)])
+def test_tp_projection_preserves_empty_token_shape_and_gradients(
+    monkeypatch, cls, shape
+):
+    import llmtuner.parallel.tensor_parallel.tensor_parallel as tp_module
+
+    def local_linear(inputs, weight, group):
+        return torch.nn.functional.linear(inputs, weight)
+
+    monkeypatch.setattr(tp_module, "all_gather_linear", local_linear)
+    monkeypatch.setattr(tp_module, "linear_reduce_scatter", local_linear)
+    projection = cls(
+        torch.ones(6, 4), tp_size=1, tp_rank=0, group=None, use_symm_mem=False
+    )
+    inputs = torch.empty(shape, requires_grad=True)
+    output = projection(inputs)
+    assert output.shape == (*shape[:-1], 6)
+    output.sum().backward()
+    assert inputs.grad is not None
+    assert inputs.grad.shape == inputs.shape
+    torch.testing.assert_close(
+        projection.weight.grad, torch.zeros_like(projection.weight)
+    )
+
+
+def test_target_resolution_applies_configured_pattern_overrides():
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_targets
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False))
+    cfg = ParallelConfig(tensor_parallel_size=2, tp_rowwise_modules=["0"])
+    targets, moe_blocks = resolve_tp_targets(model, cfg=cfg, plan={"0": "colwise"})
+    assert len(targets) == 1
+    assert targets[0][0] == "0"
+    assert targets[0][1] is model[0]
+    assert targets[0][2].kind == "rowwise"
+    assert not moe_blocks
 
 
 def test_plan_resolution_prefers_the_tp_plan_property_over_the_attribute() -> None:
@@ -130,7 +217,7 @@ def test_plan_resolution_prefers_the_tp_plan_property_over_the_attribute() -> No
         def tp_plan(self) -> dict[str, str]:
             return {"model.layers.*.q_proj": "colwise"}
 
-    plan = resolve_plan(Wrapper(), None)
+    plan = resolve_tp_sharding_plan(Wrapper(), plan=None)
     assert set(plan) == {"model.layers.*.q_proj"}
 
 
@@ -138,7 +225,7 @@ def test_a_wrapper_tp_plan_matches_the_modules_it_exposes() -> None:
     """The regression this locks in: TP matched 0 of 15 projections.
 
     Two things had to line up and neither did. The plan lives on the inner HF
-    model, not the wrapper, so ``resolve_plan`` found nothing; and even once
+    model, not the wrapper, so ``resolve_tp_sharding_plan`` found nothing; and even once
     found, HF's patterns are spelled relative to the HF model while the
     wrapper's ``named_modules`` paths sit under ``model.``. ``apply_tp`` then
     matched nothing and left the model replicated -- a TP run that silently
@@ -162,14 +249,15 @@ def test_a_wrapper_tp_plan_matches_the_modules_it_exposes() -> None:
         },
     )
     model = HFTransformerModel(config)
-    plan = resolve_plan(model, None)
+    plan = resolve_tp_sharding_plan(model, plan=None)
 
     assert plan, "the wrapper exposed no usable TP plan"
 
     matched = [
         path
         for path, mod in model.named_modules()
-        if isinstance(mod, nn.Linear) and match(plan, path) is not None
+        if isinstance(mod, nn.Linear)
+        and match_tp_sharding_spec(path, plan=plan) is not None
     ]
     # 7 projections per layer x 2 layers. ``lm_head`` is deliberately absent:
     # HF's plan does not shard it, which is why the vocab-parallel loss path
@@ -183,7 +271,8 @@ def test_qwen3_plan_resolves_rather_than_raising_on_its_qk_norms() -> None:
 
     Qwen3 -- the architecture the repo's own example trains -- once marked
     ``q_norm`` / ``k_norm`` with HF's ``replicated_with_grad_allreduce``, a spec
-    ``resolve_plan`` had no branch for; every Qwen3 TP run died in ``apply_tp``
+    ``resolve_tp_sharding_plan`` had no branch for; every Qwen3 TP run died
+    in ``apply_tp``
     before touching a weight, and no test caught it because the only plan under
     test was a hand-written ``{colwise, rowwise}`` map.
 
@@ -213,13 +302,13 @@ def test_qwen3_plan_resolves_rather_than_raising_on_its_qk_norms() -> None:
     model = HFTransformerModel(config)
 
     # The real plan must resolve, whatever the installed transformers declares.
-    plan = resolve_plan(model, None)
+    plan = resolve_tp_sharding_plan(model, plan=None)
 
     # And the branch that used to raise, on the same model's real plan.
     injected = dict(model.tp_plan)
     injected["model.layers.*.self_attn.q_norm"] = "replicated_with_grad_allreduce"
     injected["model.layers.*.self_attn.k_norm"] = "replicated_with_grad_allreduce"
-    resolved = resolve_plan(model, injected)
+    resolved = resolve_tp_sharding_plan(model, plan=injected)
     norms = [p for p in resolved if p.endswith(("q_norm", "k_norm"))]
     assert len(norms) >= 2, "the injected norm entries are not in the plan"
     assert all(resolved[p] is None for p in norms), "a norm must not be sharded"
@@ -227,7 +316,8 @@ def test_qwen3_plan_resolves_rather_than_raising_on_its_qk_norms() -> None:
     matched = [
         path
         for path, mod in model.named_modules()
-        if isinstance(mod, nn.Linear) and match(plan, path) is not None
+        if isinstance(mod, nn.Linear)
+        and match_tp_sharding_spec(path, plan=plan) is not None
     ]
     # 7 projections per layer x 2; the norms are neither nn.Linear nor sharded.
     assert len(matched) == 14
@@ -303,9 +393,10 @@ def test_apply_tp_refuses_heads_that_do_not_divide_tp() -> None:
     thing to notice. Upstream refuses this at config parse; llmtuner refuses it
     here, before the mesh is touched (the sentinel proves the ordering)."""
     model = _HeadStub(num_attention_heads=8, num_key_value_heads=8)
+    model.projection = nn.Linear(1024, 1024, bias=False)
     cfg = ParallelConfig(tensor_parallel_size=16)
     with pytest.raises(ValueError, match=r"num_attention_heads \(8\).*tp \(16\)"):
-        apply_tp(model, mesh=object(), cfg=cfg)
+        apply_tp(model, mesh=object(), cfg=cfg, plan={"projection": "colwise"})
 
 
 def test_a_divisible_head_count_gets_past_the_guard() -> None:
@@ -345,7 +436,7 @@ def test_replicated_activation_styles_are_refused_not_reinterpreted(spec: str) -
     """
     plan = {"layers.*.self_attn.q_proj": spec}
     with pytest.raises(ValueError, match=spec) as err:
-        resolve_plan(nn.Linear(4, 4), plan)
+        resolve_tp_sharding_plan(nn.Linear(4, 4), plan=plan)
     message = str(err.value)
     assert "colwise" in message and "rowwise" in message
     assert "replicated-activation" in message
@@ -354,7 +445,9 @@ def test_replicated_activation_styles_are_refused_not_reinterpreted(spec: str) -
 def test_an_unknown_plan_spec_still_raises_with_the_same_advice() -> None:
     """A typo must not be mistaken for a style this engine can honor."""
     with pytest.raises(ValueError, match="not_a_style"):
-        resolve_plan(nn.Linear(4, 4), {"layers.*.q_proj": "not_a_style"})
+        resolve_tp_sharding_plan(
+            nn.Linear(4, 4), plan={"layers.*.q_proj": "not_a_style"}
+        )
 
 
 @pytest.mark.parametrize(
@@ -384,6 +477,45 @@ def test_explicit_tp_pattern_overrides_default_wildcard(monkeypatch):
     )
     assert isinstance(model[0], RowParallelLinear)
     assert model[0].weight.shape == (4, 2)
+
+
+@pytest.mark.parametrize("pattern", ["*", ""])
+def test_apply_tp_rejects_root_projection_before_mutation(pattern):
+    model = nn.Linear(4, 4, bias=False)
+    weight = model.weight
+    with pytest.raises(ValueError, match="root nn.Linear"):
+        apply_tp(
+            model,
+            mesh=object(),
+            cfg=ParallelConfig(tensor_parallel_size=2),
+            plan={pattern: "colwise"},
+        )
+    assert model.weight is weight
+    assert model.weight.shape == (4, 4)
+    assert list(model.named_children()) == []
+
+
+@pytest.mark.parametrize("shared_module", [True, False])
+def test_apply_tp_rejects_shared_projection_weights_before_mutation(shared_module):
+    model = nn.ModuleDict(
+        {"first": nn.Linear(4, 4, bias=False), "second": nn.Linear(4, 4, bias=False)}
+    )
+    if shared_module:
+        model["second"] = model["first"]
+    else:
+        model["second"].weight = model["first"].weight
+    original_modules = list(model.children())
+    original_weight = model["first"].weight
+    with pytest.raises(ValueError, match="shared weight paths"):
+        apply_tp(
+            model,
+            mesh=object(),
+            cfg=ParallelConfig(tensor_parallel_size=2),
+            plan={"first": "colwise"},
+        )
+    assert list(model.children()) == original_modules
+    assert model["first"].weight is original_weight
+    assert model["second"].weight is original_weight
 
 
 def test_apply_tp_rejects_missing_mesh_when_enabled():

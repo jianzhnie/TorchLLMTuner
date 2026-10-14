@@ -47,6 +47,51 @@ def _tokens(seq: int = 6, seed: int = 1) -> torch.Tensor:
 # -- construction ------------------------------------------------------------
 
 
+def test_empty_token_projection_preserves_head_layout_and_gradients():
+    module = _qkv(bias=True)
+    inputs = torch.empty(0, DIM, requires_grad=True)
+    q, k, v = module(inputs)
+    assert q.shape == (0, N_HEADS, HEAD_DIM)
+    assert k.shape == v.shape == (0, N_KV_HEADS, HEAD_DIM)
+    (q.sum() + k.sum() + v.sum()).backward()
+    assert inputs.grad is not None and inputs.grad.shape == inputs.shape
+    torch.testing.assert_close(
+        module.wqkv.weight.grad, torch.zeros_like(module.wqkv.weight)
+    )
+
+
+def test_local_head_split_accepts_empty_token_axes():
+    inputs = torch.empty(2, 0, N_HEADS * HEAD_DIM)
+    assert local_head_split(inputs, HEAD_DIM).shape == (2, 0, N_HEADS, HEAD_DIM)
+
+
+@pytest.mark.parametrize("leading_shape", [(), (5,), (2, 5), (2, 3, 5), (2, 0)])
+def test_qkv_preserves_leading_axes_and_projection_gradients(leading_shape):
+    module = _qkv(bias=True).double()
+    inputs = torch.randn(*leading_shape, DIM, dtype=torch.float64, requires_grad=True)
+    actual = module(inputs)
+    # Independent per-projection GEMMs use the logical checkpoint weights.
+    logical = module.state_dict(keep_vars=True)
+    expected = tuple(
+        torch.nn.functional.linear(
+            inputs, logical[f"{name}.weight"], logical[f"{name}.bias"]
+        ).unflatten(-1, (heads, HEAD_DIM))
+        for name, heads in (("wq", N_HEADS), ("wk", N_KV_HEADS), ("wv", N_KV_HEADS))
+    )
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference)
+        assert value.is_contiguous()
+    parameters = (inputs, module.wqkv.weight, module.wqkv.bias)
+    actual_grads = torch.autograd.grad(
+        sum(value.square().sum() for value in actual), parameters
+    )
+    expected_grads = torch.autograd.grad(
+        sum(value.square().sum() for value in expected), parameters
+    )
+    for value, reference in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(value, reference)
+
+
 def test_r_dim_is_heads_per_kv_plus_two() -> None:
     """R bundles a KV group's Q heads with its one K and one V head."""
     qkv = _qkv()
@@ -265,3 +310,78 @@ def test_local_head_split_keeps_values_in_place() -> None:
     )
     out = local_head_split(t, HEAD_DIM)
     assert out.reshape(6, -1).equal(t)
+
+
+@pytest.mark.parametrize("field", ["head_dim", "n_heads", "n_kv_heads"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_qkv_rejects_non_positive_head_geometry(field, value):
+    kwargs = {"head_dim": HEAD_DIM, "n_heads": N_HEADS, "n_kv_heads": N_KV_HEADS}
+    kwargs[field] = value
+    with pytest.raises(ValueError, match=f"{field} must be positive"):
+        QKVLinear(**kwargs, linear=torch.nn.Linear(DIM, FUSED_OUT))
+
+
+@pytest.mark.parametrize("head_dim", [0, -1])
+def test_local_head_split_rejects_non_positive_head_dim(head_dim):
+    with pytest.raises(ValueError, match="head_dim must be positive"):
+        local_head_split(torch.empty(2, 8), head_dim)
+
+
+@pytest.mark.parametrize("param_name", ["weight", "bias"])
+def test_checkpoint_rejects_fused_and_logical_qkv_keys(param_name):
+    module = _qkv(bias=True)
+    state = module.state_dict()
+    parameter = getattr(module.wqkv, param_name)
+    original = parameter.detach().clone()
+    state[f"wqkv.{param_name}"] = original.clone()
+
+    with pytest.raises(ValueError, match="both fused.*and logical"):
+        module.load_state_dict(state)
+
+    assert torch.equal(parameter, original)
+    assert all(f"{name}.{param_name}" in state for name in ("wq", "wk", "wv"))
+
+
+@pytest.mark.parametrize("name", ["head_dim", "n_heads", "n_kv_heads"])
+@pytest.mark.parametrize("value", [True, False, 2.0, "2", None])
+def test_qkv_sizes_require_integer_values(name, value):
+    dimensions = dict(head_dim=HEAD_DIM, n_heads=N_HEADS, n_kv_heads=N_KV_HEADS)
+    dimensions[name] = value
+    with pytest.raises(ValueError, match=f"{name} must be positive integer"):
+        QKVLinear(**dimensions, linear=torch.nn.Linear(DIM, FUSED_OUT))
+
+
+@pytest.mark.parametrize("value", [True, False, 2.0, "2", None])
+def test_local_head_split_requires_integer_head_dim(value):
+    with pytest.raises(ValueError, match="head_dim must be positive integer"):
+        local_head_split(torch.empty(2, 8), value)
+
+
+@pytest.mark.parametrize("failure", ["shape", "ambiguous"])
+def test_qkv_load_hook_preserves_entries_if_bias_conversion_fails(failure):
+    module = _qkv(bias=True)
+    state = module.state_dict()
+    if failure == "shape":
+        state["wv.bias"] = torch.zeros(1)
+    else:
+        state["wqkv.bias"] = module.wqkv.bias.detach().clone()
+    original = state.copy()
+
+    with pytest.raises((RuntimeError, ValueError)):
+        QKVLinear._merge_qkv_on_load(module, state, "")
+
+    assert state.keys() == original.keys()
+    assert all(state[key] is value for key, value in original.items())
+
+
+def test_qkv_save_hook_preserves_entries_if_bias_split_fails():
+    module = _qkv(bias=True)
+    state = {
+        "wqkv.weight": module.wqkv.weight.detach(),
+        "wqkv.bias": torch.zeros(1),
+    }
+    original = state.copy()
+    with pytest.raises(RuntimeError):
+        QKVLinear._split_qkv_on_save(module, state, "", {})
+    assert state.keys() == original.keys()
+    assert all(state[key] is value for key, value in original.items())

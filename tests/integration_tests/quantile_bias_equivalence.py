@@ -65,7 +65,7 @@ def main():
                 return estimate(histogram, bias)
 
             balancer.estimate_expert_bias = checked_estimate
-            update_quantile_expert_bias([moe], topology)
+            update_quantile_expert_bias([moe], parallel_dims=topology)
             assert observed == [True]
             torch.testing.assert_close(moe.expert_bias_E, expected, rtol=0, atol=0)
             assert not histogram.any()

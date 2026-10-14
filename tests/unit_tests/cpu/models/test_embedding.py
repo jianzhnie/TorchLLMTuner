@@ -16,12 +16,13 @@ from tests.caps import require_env
 require_env("spmd_types")
 
 
+import pytest
 import torch
 import torch.distributed as dist
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from llmtuner.models.common import embedding as embedding_mod
-from llmtuner.models.common.embedding import Embedding
+from llmtuner.models.common.embedding import VocabParallelEmbedding
 
 
 def _single_rank_fake_pg():
@@ -39,7 +40,7 @@ def test_owning_shard_freezes_only_its_local_padding_row(monkeypatch):
         monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 1)
         monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 0)
 
-        emb = Embedding(num_embeddings=8, embedding_dim=4, padding_idx=7)
+        emb = VocabParallelEmbedding(num_embeddings=8, embedding_dim=4, padding_idx=7)
         emb.weight = torch.nn.Parameter(
             torch.randn(8, 4, dtype=torch.float64), requires_grad=True
         )
@@ -65,7 +66,7 @@ def test_non_owning_shard_passes_no_local_padding_idx(monkeypatch):
         monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 2)
         monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 1)
 
-        emb = Embedding(num_embeddings=8, embedding_dim=4, padding_idx=3)
+        emb = VocabParallelEmbedding(num_embeddings=8, embedding_dim=4, padding_idx=3)
         emb.weight = torch.nn.Parameter(
             torch.randn(4, 4, dtype=torch.float64), requires_grad=True
         )
@@ -81,3 +82,53 @@ def test_non_owning_shard_passes_no_local_padding_idx(monkeypatch):
         assert grad[3].abs().sum() > 0  # local row for global id 7
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("options", [{"scale_grad_by_freq": True}, {"max_norm": 1.0}])
+def test_foreign_tokens_do_not_change_local_embedding_state(monkeypatch, options):
+    monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: object())
+    monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 2)
+    monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 1)
+    embedding = VocabParallelEmbedding(8, 3, **options)
+    weight = torch.full((4, 3), 2.0)
+    embedding.weight = torch.nn.Parameter(weight.clone())
+    reference = torch.nn.Embedding(4, 3, **options)
+    reference.weight = torch.nn.Parameter(weight.clone())
+
+    # Global 0 and 7 used to be clamped to local rows 0 and 3. Only row 3
+    # is actually owned here, so row 0 must not be renormalized and row 3's
+    # gradient must count just the two real occurrences.
+    output = embedding(torch.tensor([[0, 7, 0, 7]]))
+    expected = reference(torch.tensor([3, 3]))
+    torch.testing.assert_close(output[0, [1, 3]], expected)
+    assert torch.count_nonzero(output[0, [0, 2]]) == 0
+    output.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(embedding.weight, reference.weight)
+    torch.testing.assert_close(embedding.weight.grad, reference.weight.grad)
+
+
+@pytest.mark.parametrize("shape", [(8, 3), (3, 3), (4, 2)])
+def test_wrong_vocab_shard_shape_is_rejected_before_renormalization(monkeypatch, shape):
+    monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: object())
+    monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 2)
+    monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 1)
+    embedding = VocabParallelEmbedding(8, 3, max_norm=1.0)
+    embedding.weight = torch.nn.Parameter(torch.full(shape, 2.0))
+    original = embedding.weight.detach().clone()
+    with pytest.raises(ValueError, match="local vocabulary shard"):
+        embedding(torch.tensor([[4, 7]]))
+    torch.testing.assert_close(embedding.weight, original)
+
+
+def test_empty_vocab_shard_returns_zero_with_empty_gradient(monkeypatch):
+    monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: object())
+    monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 4)
+    monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 3)
+    embedding = VocabParallelEmbedding(2, 3)
+    embedding.weight = torch.nn.Parameter(torch.empty(0, 3))
+    output = embedding(torch.tensor([[0, 1]]))
+    torch.testing.assert_close(output, torch.zeros(1, 2, 3))
+    output.sum().backward()
+    assert embedding.weight.grad is not None
+    assert embedding.weight.grad.shape == (0, 3)

@@ -36,7 +36,7 @@ from llmtuner.datasets.loader_builder import build_dataloader
 from llmtuner.datasets.text.processors import ChatProcessor
 from llmtuner.datasets.text.renderer import (
     RENDERERS_INSTALL_HINT,
-    RendererTokenizerWrapper,
+    RendererTokenizerAdapter,
     build_chat_renderer,
 )
 from tests.data_fixtures import (
@@ -132,20 +132,20 @@ def test_build_chat_renderer_returns_a_library_renderer(tokenizer, fake_renderer
         tokenizer=tokenizer, renderer_name="Qwen3RendererConfig"
     )
     assert isinstance(renderer, _FakeRenderer)
-    assert isinstance(renderer.tokenizer, RendererTokenizerWrapper)
+    assert isinstance(renderer.tokenizer, RendererTokenizerAdapter)
 
 
 # --------------------------------------------------------------------------
-# RendererTokenizerWrapper
+# RendererTokenizerAdapter
 # --------------------------------------------------------------------------
 
 
 def test_wrapper_exposes_the_hf_style_surface(tokenizer):
-    wrapper = RendererTokenizerWrapper(tokenizer)
+    wrapper = RendererTokenizerAdapter(tokenizer)
     assert wrapper.name_or_path == tokenizer.tokenizer_path
     assert wrapper.bos_token_id == tokenizer.bos_id
     assert wrapper.eos_token_id == tokenizer.eos_id
-    assert wrapper.unk_token_id is None
+    assert wrapper.unk_token_id == tokenizer.token_to_id("[UNK]")
     assert wrapper.encode("lorem") == [4]
     assert wrapper.decode([4, 5]) == "lorem ipsum"
     assert wrapper.convert_tokens_to_ids("lorem") == 4
@@ -280,7 +280,7 @@ def test_chat_renderer_rejects_an_empty_messages_field() -> None:
         )
 
 
-def test_make_local_jsonl_sft_multiturn_builds_a_renderer_processor(
+def test_build_local_jsonl_sft_multiturn_builds_a_renderer_processor(
     tokenizer, fake_renderers, tmp_path
 ):
     """The recipe build_dataloader wires when chat_renderer is set.
@@ -289,14 +289,14 @@ def test_make_local_jsonl_sft_multiturn_builds_a_renderer_processor(
     recipe itself -- processor class, configured messages field, and the
     renderer it was handed.
     """
-    from llmtuner.datasets.text.processors import make_local_jsonl_sft_multiturn
+    from llmtuner.datasets.text.recipes import build_local_jsonl_sft_multiturn
 
     corpus_path = tmp_path / "rows.jsonl"
     corpus_path.write_text('{"conversation": []}\n')
     renderer = build_chat_renderer(
         tokenizer=tokenizer, renderer_name="Qwen3RendererConfig"
     )
-    recipe = make_local_jsonl_sft_multiturn(
+    recipe = build_local_jsonl_sft_multiturn(
         path=str(corpus_path), messages_field="conversation", renderer=renderer
     )
     processor = recipe.processor(context=make_context(tokenizer))

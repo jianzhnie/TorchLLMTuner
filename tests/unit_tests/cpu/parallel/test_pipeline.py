@@ -85,6 +85,23 @@ def test_rotary_emb_is_replicated_on_every_stage() -> None:
     assert all("rotary_emb" in part for part in parts)
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"num_stages": True},
+        {"num_stages": 1.5},
+        {"num_layers": -1},
+        {"num_layers": True},
+        {"input_weight": -1},
+        {"output_weight": 0.5},
+    ],
+)
+def test_partition_rejects_invalid_counts_before_single_stage_return(kwargs):
+    arguments = {"num_stages": 1, "num_layers": 3} | kwargs
+    with pytest.raises(ValueError):
+        generate_llm_fqn_per_model_part(**arguments)
+
+
 def test_input_and_output_weights_shift_the_boundary() -> None:
     """A heavier embedding should pull fewer transformer layers onto stage 0."""
     light = generate_llm_fqn_per_model_part(2, 8, input_weight=1, output_weight=1)
@@ -144,6 +161,37 @@ def test_the_output_weight_is_guarded_independently_of_the_input_weight() -> Non
 # -- split_model_into_stages, over a single-rank gloo group --------------------
 
 _NUM_LAYERS = 4
+
+
+def test_unsupported_mesh_callback_is_rejected_before_stage_build(monkeypatch, pp_mesh):
+    from llmtuner.parallel.pipeline_parallel import partition
+
+    def old_stage(model, stage_index, num_stages, device, *, group):
+        raise AssertionError("stage construction must not run")
+
+    monkeypatch.setattr(partition, "PipelineStage", old_stage)
+    with pytest.raises(ValueError, match="does not support get_mesh"):
+        split_model_into_stages(
+            nn.Module(),
+            pp_mesh,
+            "1F1B",
+            torch.device("cpu"),
+            [["tok_embeddings"]],
+            get_mesh=lambda: None,
+        )
+
+
+@pytest.mark.parametrize(
+    "schedule, assignments",
+    [("1F1B", []), ("ZBVZeroBubble", [["tok_embeddings"]])],
+)
+def test_stage_assignment_rejects_empty_or_invalid_v_layout(
+    pp_mesh, schedule, assignments
+):
+    with pytest.raises(ValueError, match="num_stages|2 stages per rank"):
+        split_model_into_stages(
+            nn.Module(), pp_mesh, schedule, torch.device("cpu"), assignments
+        )
 
 
 @pytest.fixture(scope="module")
@@ -357,6 +405,15 @@ def test_first_stage_module_already_owned_by_the_split_is_rejected() -> None:
         prepend_first_stage_modules(parts, model, ["norm"])
 
 
+def test_first_stage_attribute_must_be_a_module() -> None:
+    model = nn.Module()
+    model.encoder = "configured encoder"
+    assignments = [["tok_embeddings"], ["lm_head"]]
+    with pytest.raises(ValueError, match="must be an nn.Module"):
+        prepend_first_stage_modules(assignments, model, ["encoder"])
+    assert assignments == [["tok_embeddings"], ["lm_head"]]
+
+
 def test_duplicate_first_stage_module_is_rejected() -> None:
     model = _model_with_vision_encoder()
     parts = generate_llm_fqn_per_model_part(2, _NUM_LAYERS)
@@ -387,6 +444,49 @@ def test_split_keeps_first_stage_module_fqns_stable(pp_mesh) -> None:
     assert first_keys.isdisjoint(last_keys)
     # FQN stability: every key on either stage is a key of the unsplit model.
     assert first_keys | last_keys <= unsplit_keys
+
+
+@pytest.mark.parametrize("container_type", [nn.ModuleList, nn.ModuleDict])
+def test_split_preserves_container_assigned_by_its_own_name(pp_mesh, container_type):
+    model = _model()
+    layers = [nn.Linear(16, 16), nn.Linear(16, 16)]
+    model.layers = (
+        container_type(layers)
+        if container_type is nn.ModuleList
+        else container_type({str(i): layer for i, layer in enumerate(layers)})
+    )
+    assignments = [
+        ["tok_embeddings", "layers", "rotary_emb"],
+        ["norm", "lm_head", "rotary_emb"],
+    ]
+    layer_keys = {key for key in model.state_dict() if ".layers." in key}
+
+    _, parts = split_model_into_stages(
+        model, pp_mesh, "1F1B", torch.device("cpu"), assignments
+    )
+
+    assert len(parts[0].layers) == 2
+    assert len(parts[1].layers) == 0
+    assert len(layer_keys) == 4
+    assert {key for key in parts[0].state_dict() if ".layers." in key} == layer_keys
+    assert not any(".layers." in key for key in parts[1].state_dict())
+
+
+def test_split_blanks_unassigned_alias_of_first_stage_module(pp_mesh) -> None:
+    model = _model_with_vision_encoder()
+    model.vision_alias = model.vision_encoder
+    module_names = generate_llm_fqn_per_model_part(2, _NUM_LAYERS)
+    prepend_first_stage_modules(module_names, model, ["vision_encoder"])
+
+    _, model_parts = split_model_into_stages(
+        model, pp_mesh, "1F1B", torch.device("cpu"), module_names
+    )
+
+    assert not isinstance(model_parts[0].vision_encoder, nn.Identity)
+    assert isinstance(model_parts[1].vision_encoder, nn.Identity)
+    for part in model_parts:
+        assert isinstance(part.vision_alias, nn.Identity)
+        assert not any(key.startswith("vision_alias.") for key in part.state_dict())
 
 
 def test_split_without_first_stage_modules_is_unchanged(pp_mesh) -> None:
@@ -435,13 +535,13 @@ def test_schedule_loss_fn_reads_the_denominator_from_either_route() -> None:
     torch.testing.assert_close(loss_fn(pred, labels), reference / 4.0)
 
 
-def test_schedule_loss_takes_the_vocab_kwargs_the_builder_hands_over() -> None:
+def test_schedule_loss_takes_the_vocab_parameters_the_builder_hands_over() -> None:
     """The schedule's loss is the trainer's loss by another route, so it must
     carry the same vocab-parallel arguments -- and must stay a no-op when the
     logits are full-vocab.
 
     The sentinel group is what proves the sharded branch was not taken (it
-    would raise if a collective touched it); the default, no ``vocab_kwargs``
+    would raise if a collective touched it); the default, no vocab parameters
     at all, is the call a caller that does not know the vocabulary makes, and
     it must not change the value either.
     """
@@ -456,10 +556,25 @@ def test_schedule_loss_takes_the_vocab_kwargs_the_builder_hands_over() -> None:
 
     with_vocab = make_schedule_loss_fn(
         schedule,
-        vocab_kwargs={"tp_group": object(), "global_vocab_size": pred.shape[-1]},
+        tp_group=object(),
+        global_vocab_size=pred.shape[-1],
     )
     torch.testing.assert_close(with_vocab(pred, labels), reference / 4.0)
 
     torch.testing.assert_close(
         make_schedule_loss_fn(schedule)(pred, labels), reference / 4.0
     )
+
+
+def test_schedule_loss_explicit_denominator_does_not_read_schedule_state():
+    schedule = SimpleNamespace()
+    logits = torch.randn(3, 5, requires_grad=True)
+    labels = torch.tensor([1, 2, 3])
+    loss = make_schedule_loss_fn(schedule)(
+        logits, labels, global_valid_tokens=torch.tensor(3.0)
+    )
+    expected = F.cross_entropy(logits, labels)
+    torch.testing.assert_close(loss, expected)
+    actual_grad = torch.autograd.grad(loss, logits)[0]
+    expected_grad = torch.autograd.grad(expected, logits)[0]
+    torch.testing.assert_close(actual_grad, expected_grad)

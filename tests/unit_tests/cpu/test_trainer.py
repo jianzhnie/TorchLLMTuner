@@ -59,11 +59,9 @@ from llmtuner.config import (
     TrainingConfig,
 )
 from llmtuner.datasets.contracts import Batch
-from llmtuner.datasets.dataloader import DataloaderExhaustedError
 from llmtuner.datasets.synthetic import (
     RandomTokenDataLoader,
     RandomTokenSource,
-    batch_iterator,
 )
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
@@ -471,7 +469,7 @@ def test_an_indivisible_global_batch_is_rejected() -> None:
         trainer.batch_size_per_rank(4)
 
 
-def _source(n: int, *, batch_size: int = 2, seq_len: int = 4) -> RandomTokenSource:
+def _source(*, batch_size: int = 2, seq_len: int = 4) -> RandomTokenSource:
     return RandomTokenSource(
         seed=0, vocab_size=16, batch_size=batch_size, seq_len=seq_len
     )
@@ -483,37 +481,17 @@ def test_iterator_is_deterministic_from_seed_and_step() -> None:
     Two independent iterators must therefore agree element for element. That is
     the property a resumed run and a fresh DP comparison both rely on.
     """
-    it1, it2 = batch_iterator(_source(0)), batch_iterator(_source(0))
+    it1, it2 = iter(_source()), iter(_source())
 
     for _ in range(3):
         assert torch.equal(next(it1).input_ids, next(it2).input_ids)
 
 
 def test_different_steps_produce_different_batches() -> None:
-    it = batch_iterator(_source(0))
+    it = iter(_source())
     first, second = next(it).input_ids, next(it).input_ids
 
     assert not torch.equal(first, second)
-
-
-def test_iterator_restarts_a_finite_source() -> None:
-    """Exhausting the source restarts it rather than stopping the loop."""
-    finite = [Batch(torch.zeros(2, 4), torch.zeros(2, 4))]  # exactly one batch
-
-    it = batch_iterator(finite)
-    for _ in range(5):
-        batch = next(it)
-        assert batch.input_ids.shape == (2, 4)
-
-
-def test_iterator_rejects_an_empty_source() -> None:
-    """An empty source must raise, not spin forever in the restart loop."""
-    it = batch_iterator([])
-    try:
-        next(it)
-    except DataloaderExhaustedError:
-        return
-    raise AssertionError("an empty source should raise DataloaderExhaustedError")
 
 
 # -- checkpointing ------------------------------------------------------------
@@ -1019,7 +997,7 @@ def test_microbatch_counts_masked_prompts_for_router_but_not_padding() -> None:
 
     assert microbatch["num_valid_tokens"] == 2
     assert microbatch["num_routing_tokens"] == 4
-    assert "num_valid_tokens" not in microbatch["batch"]
+    assert microbatch["batch"] is batch
 
 
 def test_count_valid_tokens_reports_the_row_final_mask_the_loss_skips() -> None:
@@ -1034,6 +1012,20 @@ def test_count_valid_tokens_reports_the_row_final_mask_the_loss_skips() -> None:
     num_valid = Trainer.count_valid_tokens(batch)
 
     assert num_valid == batch.labels.numel() - batch.labels.shape[0]
+
+
+@pytest.mark.parametrize("field", ["labels", "positions", "padding_mask"])
+def test_preprocess_rejects_misaligned_fields_before_mask_construction(field):
+    model = _wrapper()
+    batch = {"input": torch.arange(4), "labels": torch.arange(4)}
+    batch[field] = torch.zeros(
+        3, dtype=torch.bool if field == "padding_mask" else torch.long
+    )
+    model.get_attention_masks = lambda **kwargs: pytest.fail(
+        "invalid batch reached mask construction"
+    )
+    with pytest.raises(ValueError, match=f"{field} has 3 tokens"):
+        model.preprocess_inputs(batch, parallel_dims=None)
 
 
 def test_preprocess_inputs_shifts_the_synthetic_labels_within_a_row() -> None:
@@ -1062,9 +1054,9 @@ def test_preprocess_inputs_shifts_the_synthetic_labels_within_a_row() -> None:
 def test_preprocess_inputs_reads_the_grain_batch_without_consuming_it() -> None:
     """The collator already shifted and masked the labels; the shift is a read.
 
-    ``num_valid_tokens`` never reaches the model -- the trainer pops it first,
-    because the denominator is the whole-batch count and ``positions`` is the
-    one entry the forward takes.
+    The shared trainer preprocessing boundary filters ``num_valid_tokens``
+    before invoking the model. The denominator is the whole-batch count;
+    ``positions`` remains a forward input.
     """
     grain_batch = {
         "input": torch.arange(8),
@@ -1427,11 +1419,12 @@ def test_synthetic_batch_is_deterministic() -> None:
     That is what makes two runs comparable and what makes every DP rank see the
     same global batch without a broadcast.
     """
-    trainer = _bare_trainer(
-        _cfg_with_batch(global_batch_size=8, max_seq_len=16, seed=42)
-    )
+    cfg = _cfg_with_batch(global_batch_size=8, max_seq_len=16, seed=42)
+    trainer, reference = _bare_trainer(cfg), _bare_trainer(cfg)
+    trainer.dataloader = trainer.build_dataloader()
+    reference.dataloader = reference.build_dataloader()
     first = next(trainer.data_iterator())
-    second = next(trainer.data_iterator())
+    second = next(reference.data_iterator())
 
     assert torch.equal(first.input_ids, second.input_ids)
     assert first.input_ids.shape == (8, 16)
@@ -1445,7 +1438,9 @@ def test_dp_slice_partitions_global_batch() -> None:
     would drop or duplicate samples once per step, invisibly.
     """
     cfg = _cfg_with_batch(global_batch_size=8, max_seq_len=16, seed=42)
-    batch = next(_bare_trainer(cfg).data_iterator())
+    trainer = _bare_trainer(cfg)
+    trainer.dataloader = trainer.build_dataloader()
+    batch = next(trainer.data_iterator())
 
     per_rank = cfg.global_batch_size // 2
     rank_0 = batch.input_ids[0:per_rank]
@@ -1455,6 +1450,34 @@ def test_dp_slice_partitions_global_batch() -> None:
 
 
 # -- the console entry point ----------------------------------------------------
+
+
+def test_data_iterator_rejects_incomplete_assembly():
+    trainer = _bare_trainer(_cfg_with_batch())
+    with pytest.raises(RuntimeError, match="dataloader has not been initialized"):
+        trainer.data_iterator()
+
+
+def test_checkpointer_assembly_rejects_missing_dataloader(monkeypatch):
+    from llmtuner.trainer.runtime import assembly
+
+    trainer = _bare_trainer(_cfg_with_batch())
+    trainer.dataloader = None
+    with pytest.raises(RuntimeError, match="before building the checkpointer"):
+        assembly._build_checkpointer(trainer, object())
+
+
+@pytest.mark.parametrize("args", [[], ("--steps", "7")])
+def test_cli_explicit_arguments_ignore_process_argv(monkeypatch, args):
+    import sys
+
+    from llmtuner.trainer.cli import parse_config
+
+    process_args = ["llmtuner", "--unknown-environment-flag"]
+    monkeypatch.setattr(sys, "argv", process_args)
+    cfg = parse_config(args)
+    assert cfg.steps == (7 if args else LLMTunerConfig().steps)
+    assert sys.argv is process_args
 
 
 def test_cli_does_not_load_implicit_args_file(tmp_path, monkeypatch):
@@ -1577,7 +1600,7 @@ def test_cli_destroys_process_group_when_close_fails(monkeypatch, training_fails
             checkpoint=SimpleNamespace(create_seed_checkpoint=False)
         ),
     )
-    monkeypatch.setattr(cli, "Trainer", FakeTrainer)
+    monkeypatch.setattr("llmtuner.trainer.trainer.Trainer", FakeTrainer)
     monkeypatch.setattr(cli.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(
         cli.dist, "destroy_process_group", lambda: calls.append("destroy")
@@ -1620,7 +1643,7 @@ def test_cli_preserves_primary_error_when_group_cleanup_fails(
             checkpoint=SimpleNamespace(create_seed_checkpoint=False)
         ),
     )
-    monkeypatch.setattr(cli, "Trainer", FakeTrainer)
+    monkeypatch.setattr("llmtuner.trainer.trainer.Trainer", FakeTrainer)
     monkeypatch.setattr(cli.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(cli.dist, "destroy_process_group", destroy)
     error, message = (
@@ -1654,8 +1677,29 @@ def test_cli_rejects_seed_configuration_before_trainer_construction(
     def build(cfg):
         pytest.fail("invalid seed configuration must not construct Trainer")
 
-    monkeypatch.setattr(cli, "Trainer", build)
+    monkeypatch.setattr("llmtuner.trainer.trainer.Trainer", build)
     with pytest.raises(cli.ConfigError):
+        cli.main()
+
+
+def test_cli_seed_checkpoint_uses_initialized_world_size(monkeypatch):
+    from llmtuner.trainer import cli
+
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setattr(cli.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(cli.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(
+        cli,
+        "parse_config",
+        lambda: SimpleNamespace(
+            checkpoint=SimpleNamespace(create_seed_checkpoint=True, enable=True)
+        ),
+    )
+    monkeypatch.setattr(
+        "llmtuner.trainer.trainer.Trainer",
+        lambda cfg: pytest.fail("seed checkpoint must be unsharded"),
+    )
+    with pytest.raises(cli.ConfigError, match="single device"):
         cli.main()
 
 
@@ -1694,8 +1738,31 @@ def test_microbatch_preserves_loader_owned_dictionary():
     )
     result = runtime.microbatch(trainer, original)
     assert original["num_valid_tokens"] == 2
-    assert "num_valid_tokens" not in result["batch"]
+    assert result["batch"] is original
     assert result["batch"]["labels"] is labels
+
+
+def test_preprocess_filters_metadata_without_changing_source():
+    from llmtuner.trainer.runtime import batch as runtime
+
+    labels = torch.tensor([[1, 2]])
+    batch = {"input": labels, "labels": labels, "num_valid_tokens": 2}
+    seen = []
+
+    def preprocess(source, **kwargs):
+        seen.append(source)
+        return source["input"], source["labels"], {}
+
+    trainer = SimpleNamespace(
+        example_model=SimpleNamespace(preprocess_inputs=preprocess),
+        to_device=lambda source: source,
+        parallel_dims=None,
+        cfg=SimpleNamespace(max_seq_len=2),
+    )
+    runtime.preprocess(trainer, batch)
+    assert set(seen[0]) == {"input", "labels"}
+    assert batch["num_valid_tokens"] == 2
+    assert seen[0]["labels"] is labels
 
 
 def test_assembly_uses_live_process_group_rank_and_size(monkeypatch):
@@ -1712,7 +1779,7 @@ def test_assembly_uses_live_process_group_rank_and_size(monkeypatch):
         assert trainer.rank == 3
         raise RuntimeError("stop after rank resolution")
 
-    monkeypatch.setattr(assembly, "build_parallel_topology", topology)
+    monkeypatch.setattr(assembly, "resolve_parallel_topology", topology)
     with pytest.raises(RuntimeError, match="stop after rank resolution"):
         assembly.assemble_trainer_runtime(trainer, SimpleNamespace())
 
@@ -1735,6 +1802,26 @@ def test_programmatic_trainer_uses_resolved_override_vocabulary():
         trainer.close()
 
 
+def test_checkpointer_registration_sees_initialized_trainer_state(monkeypatch):
+    from llmtuner.trainer.runtime import assembly
+
+    original = assembly._build_checkpointer
+    observed = []
+
+    def tracked(trainer, hf_config):
+        observed.append(trainer.state_dict())
+        return original(trainer, hf_config)
+
+    monkeypatch.setattr(assembly, "_build_checkpointer", tracked)
+    trainer = Trainer(
+        LLMTunerConfig(training=TrainingConfig(global_batch_size=2, max_seq_len=8))
+    )
+    try:
+        assert observed == [{"step": 0, "ntokens_seen": 0}]
+    finally:
+        trainer.close()
+
+
 def test_trainer_resolves_hf_configuration_once(monkeypatch):
     from llmtuner.config import TrainingConfig
     from llmtuner.models.hf import factory
@@ -1752,6 +1839,56 @@ def test_trainer_resolves_hf_configuration_once(monkeypatch):
     )
     try:
         assert len(calls) == 1
+    finally:
+        trainer.close()
+
+
+def test_cli_and_trainer_load_local_hf_configuration_once(tmp_path, monkeypatch):
+    import sys
+
+    from transformers import AutoConfig
+
+    from llmtuner.trainer.cli import parse_config
+
+    saved = AutoConfig.for_model(
+        "qwen3",
+        vocab_size=17,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+    )
+    saved.save_pretrained(tmp_path)
+    original = AutoConfig.from_pretrained
+    calls = []
+
+    def tracked(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", tracked)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "llmtuner",
+            "--model_name_or_path",
+            str(tmp_path),
+            "--global_batch_size",
+            "2",
+            "--max_seq_len",
+            "8",
+        ],
+    )
+    cfg = parse_config()
+    assert calls == []
+    trainer = Trainer(cfg)
+    try:
+        assert len(calls) == 1
+        assert cfg.vocab_size == 17
+        batch = next(trainer.data_iterator())
+        assert int(batch.input_ids.max()) < 17
     finally:
         trainer.close()
 
@@ -1790,3 +1927,17 @@ def test_trainer_dcp_restores_saved_base_lr_with_different_new_lr(tmp_path):
             assert scheduler.base_lrs == [0.01]
     finally:
         resumed.close()
+
+
+@pytest.mark.parametrize("field", ["step", "ntokens_seen"])
+@pytest.mark.parametrize("value", [-1, True, 1.5])
+def test_trainer_checkpoint_rejects_invalid_counters_without_partial_restore(
+    field, value
+):
+    trainer = object.__new__(Trainer)
+    trainer.step = 3
+    trainer.ntokens_seen = 12
+    checkpoint = {"step": 8, "ntokens_seen": 50, field: value}
+    with pytest.raises(ValueError, match=f"trainer {field}"):
+        trainer.load_state_dict(checkpoint)
+    assert trainer.state_dict() == {"step": 3, "ntokens_seen": 12}

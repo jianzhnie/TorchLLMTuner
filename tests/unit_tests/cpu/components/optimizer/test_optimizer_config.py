@@ -161,7 +161,7 @@ def test_optimizer_rejects_nonfinite_hyperparameters(field, value):
 
 
 def test_scheduler_rejects_unknown_decay_type_at_configuration_time():
-    from llmtuner.config.optimizer_config import LRSchedulerConfig
+    from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 
     with pytest.raises(ValueError, match="decay_type"):
         LRSchedulerConfig(decay_type="unknown")

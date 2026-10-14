@@ -1,4 +1,4 @@
-"""``num_flops_per_token``: the MFU denominator, over the real architectures.
+"""``flops_per_token``: the MFU denominator, over the real architectures.
 
 MFU is a number nobody cross-checks: a loss curve cannot see it, and a wrong
 denominator produces output that looks exactly like a right one. The two ways
@@ -16,16 +16,11 @@ attribute bag stands in and the test says so.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
+import torch
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
-from llmtuner.models.hf import factory
-from llmtuner.models.hf.factory import (
-    num_flops_per_token,
-)
 from llmtuner.models.hf.flops import (
     flops_per_token,
     quadratic_attention_flops_per_token,
@@ -131,15 +126,27 @@ def test_a_missing_size_suppresses_mfu_instead_of_guessing() -> None:
     assert flops_per_token(_Bare(), seq_len=4) == 0
 
 
-def test_num_flops_per_token_passes_the_run_sequence_length_through(
-    monkeypatch,
-) -> None:
-    """``num_flops_per_token`` only resolves the config and forwards
-    ``cfg.max_seq_len``; the attention term must use the run's own sequence
-    length, not the architecture's maximum."""
-    monkeypatch.setattr(factory, "build_model_config_for", lambda cfg: _arch("llama"))
-    short = num_flops_per_token(SimpleNamespace(max_seq_len=8))
-    long = num_flops_per_token(SimpleNamespace(max_seq_len=32))
+@pytest.mark.parametrize(
+    "field", ["hidden_size", "num_hidden_layers", "vocab_size", "num_attention_heads"]
+)
+@pytest.mark.parametrize("value", [0, -1, True, False])
+def test_invalid_required_geometry_suppresses_flops(field, value):
+    fields = dict(
+        hidden_size=32,
+        num_hidden_layers=2,
+        vocab_size=64,
+        num_attention_heads=4,
+        intermediate_size=64,
+    )
+    fields[field] = value
+    assert flops_per_token(_Arch(**fields), seq_len=8) == 0
+
+
+def test_flops_uses_run_sequence_length() -> None:
+    """Use the run's sequence length, rather than the architecture maximum."""
+    arch = _arch("llama")
+    short = flops_per_token(arch, seq_len=8)
+    long = flops_per_token(arch, seq_len=32)
 
     assert short > 0
     assert long > short
@@ -250,6 +257,34 @@ def test_the_dense_prefix_of_a_mixed_stack_costs_the_dense_width() -> None:
 
 
 # -- MLA ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("q_lora_rank", [None, 16])
+def test_mla_projection_cost_matches_actual_hf_linear_weights(q_lora_rank):
+    from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+        DeepseekV3Attention,
+    )
+
+    from llmtuner.models.hf.flops import attention_param_term
+
+    arch = _arch(
+        "deepseek_v3",
+        q_lora_rank=q_lora_rank,
+        kv_lora_rank=16,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=4,
+        v_head_dim=8,
+    )
+    attention = DeepseekV3Attention(arch, layer_idx=0)
+    linear_weights = sum(
+        module.weight.numel()
+        for module in attention.modules()
+        if isinstance(module, torch.nn.Linear)
+    )
+    assert (
+        attention_param_term(arch, hidden=32, num_heads=4, qk_head_dim=12, v_head_dim=8)
+        == 2 * linear_weights
+    )
 
 
 def test_an_mla_layer_uses_the_qk_and_v_widths_not_head_dim() -> None:
@@ -440,3 +475,60 @@ def test_a_degenerate_sequence_length_is_still_a_number(seq_len: int) -> None:
     """``seq_len`` only scales the attention term, so a one-token or empty
     sequence is a valid count rather than a division or a zero."""
     assert flops_per_token(_arch("llama"), seq_len=seq_len) > 0
+
+
+@pytest.mark.parametrize("seq_len", [-1, True, 1.5])
+def test_invalid_sequence_length_is_rejected(seq_len: object) -> None:
+    with pytest.raises(ValueError, match="seq_len"):
+        flops_per_token(_arch("llama"), seq_len=seq_len)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("size", [0, -1])
+@pytest.mark.parametrize("kind", [None, "sliding_attention", "chunked_attention"])
+def test_invalid_attention_window_suppresses_flops(size, kind) -> None:
+    arch = _arch("llama")
+    arch.sliding_window = size
+    arch.attention_chunk_size = size
+    arch.layer_types = None if kind is None else [kind] * arch.num_hidden_layers
+    assert flops_per_token(arch, seq_len=8) == 0
+
+
+def test_disabled_sliding_window_does_not_affect_flops() -> None:
+    arch = _arch("llama")
+    expected = flops_per_token(arch, seq_len=8)
+    arch.sliding_window = -1
+    arch.use_sliding_window = False
+    assert flops_per_token(arch, seq_len=8) == expected
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("intermediate_size", 0),
+        ("intermediate_size", -1),
+        ("num_key_value_heads", 0),
+        ("num_key_value_heads", -1),
+        ("num_key_value_heads", 3),
+    ],
+)
+def test_invalid_dense_projection_geometry_suppresses_flops(field, value):
+    arch = _arch("llama")
+    setattr(arch, field, value)
+    assert flops_per_token(arch, seq_len=8) == 0
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("num_local_experts", 0),
+        ("num_local_experts", -1),
+        ("num_experts_per_tok", 0),
+        ("num_experts_per_tok", 9),
+        ("intermediate_size", 0),
+        ("shared_expert_intermediate_size", -1),
+    ],
+)
+def test_invalid_moe_projection_geometry_suppresses_flops(field, value):
+    arch = _arch("mixtral", num_local_experts=8, num_experts_per_tok=2)
+    setattr(arch, field, value)
+    assert flops_per_token(arch, seq_len=8) == 0

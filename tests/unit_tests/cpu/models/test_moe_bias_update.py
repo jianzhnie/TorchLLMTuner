@@ -28,11 +28,11 @@ import torch
 import torch.distributed as dist
 
 from llmtuner.models.common.moe.bias_update import (
-    register_moe_load_balancing_hook,
+    register_moe_balancing_hook,
     update_expert_bias,
 )
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
-from llmtuner.models.common.moe.layer import MoE, iter_moe_layers
+from llmtuner.models.common.moe.layer import MoE, collect_moe_layers
 from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.expert_parallel import swap_hf_moe_blocks
@@ -60,20 +60,20 @@ def single_rank_group(tmp_path_factory):
         dist.destroy_process_group()
 
 
-def _moe(*, coeff: float | None = 0.1) -> MoE:
+def _moe(*, coeff: float | None = 0.1, num_experts: int = _NUM_EXPERTS) -> MoE:
     return MoE(
-        _NUM_EXPERTS,
+        num_experts,
         RoutedExperts(
-            GroupedExperts(_DIM, 8, _NUM_EXPERTS),
-            LocalTokenDispatcher(_NUM_EXPERTS, _TOP_K),
+            GroupedExperts(_DIM, 8, num_experts),
+            LocalTokenDispatcher(num_experts, _TOP_K),
         ),
-        TokenChoiceTopKRouter(_NUM_EXPERTS, _DIM, _TOP_K),
+        TokenChoiceTopKRouter(num_experts, _DIM, _TOP_K),
         load_balance_coeff=coeff,
     )
 
 
 class _Holder(torch.nn.Module):
-    """Stands in for a model part: ``iter_moe_layers`` walks ``.layers``."""
+    """Stands in for a model part: ``collect_moe_layers`` walks ``.layers``."""
 
     def __init__(self, moes: list[MoE | None]) -> None:
         super().__init__()
@@ -191,7 +191,7 @@ def test_the_hook_fires_once_per_optimizer_step() -> None:
     moe = _moe()
     model = _Holder([moe])
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
-    register_moe_load_balancing_hook(optimizer, [model], parallel_dims=None)
+    register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
     assert float(moe.expert_bias_E.abs().sum()) == 0.0  # nothing yet: no counts
     moe.tokens_per_expert_E.copy_(torch.tensor([10.0, 0.0, 5.0, 5.0]))
@@ -205,7 +205,7 @@ def test_no_hook_is_registered_for_a_model_without_moe_layers() -> None:
     model = _Holder([])
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
 
-    register_moe_load_balancing_hook(optimizer, [model], parallel_dims=None)
+    register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
     assert optimizer._optimizer_step_pre_hooks == {}
 
@@ -219,7 +219,7 @@ def test_no_hook_is_registered_when_every_coeff_is_none() -> None:
     model = _Holder([_moe(coeff=None), _moe(coeff=None)])
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
 
-    register_moe_load_balancing_hook(optimizer, [model], parallel_dims=None)
+    register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
     assert optimizer._optimizer_step_pre_hooks == {}
 
@@ -236,7 +236,7 @@ def test_a_mixed_coeff_configuration_is_rejected() -> None:
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
 
     with pytest.raises(ValueError, match="load_balance_coeff"):
-        register_moe_load_balancing_hook(optimizer, [model], parallel_dims=None)
+        register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
     assert optimizer._optimizer_step_pre_hooks == {}
 
@@ -246,14 +246,33 @@ def test_a_dense_layer_among_sparse_ones_is_skipped() -> None:
     sparse = _moe()
     model = _Holder([sparse, None, None])
 
-    assert iter_moe_layers(model) == [sparse]
+    assert collect_moe_layers(model) == [sparse]
+
+
+@pytest.mark.parametrize("repeated_part", [False, True])
+def test_shared_moe_block_is_balanced_once_per_optimizer_step(repeated_part):
+    sparse = _moe(coeff=0.1)
+    model = _Holder([sparse, sparse])
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    register_moe_balancing_hook(
+        optimizer,
+        model_parts=[model, model] if repeated_part else [model],
+        parallel_dims=None,
+    )
+    sparse.tokens_per_expert_E.copy_(torch.tensor([10.0, 0.0, 5.0, 5.0]))
+    before = sparse.expert_bias_E.clone()
+    optimizer.step()
+    torch.testing.assert_close(
+        sparse.expert_bias_E - before, torch.tensor([-0.1, 0.1, 0.0, 0.0])
+    )
+    assert collect_moe_layers(model) == [sparse]
 
 
 def test_wrapped_layers_are_unwrapped() -> None:
     """AC wraps each layer in CheckpointWrapper; the lookup must see through.
 
     Older torch versions do not forward attribute reads through the wrapper,
-    so without the explicit unwrap ``iter_moe_layers`` returns [] and every
+    so without the explicit unwrap ``collect_moe_layers`` returns [] and every
     downstream consumer (bias hooks, padding-mask staging, compile's MoE
     detection) silently no-ops.
     """
@@ -269,7 +288,7 @@ def test_wrapped_layers_are_unwrapped() -> None:
     holder = torch.nn.Module()
     holder.layers = torch.nn.ModuleList([_FakeCheckpointWrapper(_Layer(sparse))])
 
-    assert iter_moe_layers(holder) == [sparse]
+    assert collect_moe_layers(holder) == [sparse]
 
 
 def test_the_hook_updates_a_real_swapped_model() -> None:
@@ -306,11 +325,11 @@ def test_the_hook_updates_a_real_swapped_model() -> None:
     model = HFTransformerModel(config).float().eval()
     assert swap_hf_moe_blocks(model) == 2
 
-    layers = iter_moe_layers(model)
+    layers = collect_moe_layers(model)
     assert len(layers) == 2, "the hook cannot see the swapped-in blocks"
 
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
-    register_moe_load_balancing_hook(optimizer, [model], parallel_dims=None)
+    register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
     balanced = torch.zeros(8)
     for moe in layers:
         moe.tokens_per_expert_E.copy_(
@@ -331,13 +350,25 @@ def test_the_collective_runs_over_a_real_process_group(single_rank_group) -> Non
     """The reduction path executes without a mesh -- e.g. before a mesh exists."""
     moe = _moe()
     moe.tokens_per_expert_E.copy_(torch.tensor([10.0, 0.0, 5.0, 5.0]))
-    model = _Holder([moe])
-
-    update_expert_bias([(model, [moe])], parallel_dims=None)
+    update_expert_bias([moe], parallel_dims=None)
 
     # A size-1 group leaves the counts alone, so the update is the same one the
     # direct test asserts.
     assert float(moe.expert_bias_E[1]) > 0
+
+
+def test_bias_update_supports_different_expert_counts():
+    layers = [_moe(num_experts=size) for size in (4, 8)]
+    references = [_moe(num_experts=size) for size in (4, 8)]
+    for layer, reference in zip(layers, references, strict=True):
+        counts = torch.arange(layer.tokens_per_expert_E.numel(), dtype=torch.float32)
+        layer.tokens_per_expert_E.copy_(counts)
+        reference.tokens_per_expert_E.copy_(counts)
+        reference.update_expert_bias()
+    update_expert_bias(layers)
+    for layer, reference in zip(layers, references, strict=True):
+        torch.testing.assert_close(layer.expert_bias_E, reference.expert_bias_E)
+        assert torch.count_nonzero(layer.tokens_per_expert_E) == 0
 
 
 def test_every_layer_of_every_part_is_updated() -> None:
@@ -347,8 +378,16 @@ def test_every_layer_of_every_part_is_updated() -> None:
     for moe in (a, b, c):
         moe.tokens_per_expert_E.copy_(torch.tensor([10.0, 0.0, 5.0, 5.0]))
 
-    update_expert_bias([(p, iter_moe_layers(p)) for p in parts], parallel_dims=None)
+    update_expert_bias(
+        [moe for part in parts for moe in collect_moe_layers(part)], parallel_dims=None
+    )
 
     for moe in (a, b, c):
         assert float(moe.expert_bias_E[1]) > 0, "a layer was skipped"
         assert float(moe.tokens_per_expert_E.sum()) == 0.0, "a counter was not drained"
+
+
+@pytest.mark.parametrize("coeff", [float("nan"), float("inf"), -float("inf")])
+def test_moe_rejects_non_finite_balance_coefficient(coeff):
+    with pytest.raises(ValueError, match="load_balance_coeff must be finite"):
+        _moe(coeff=coeff)

@@ -1,20 +1,13 @@
-"""PP per-stage seed derivation (llmtuner.trainer.runtime.assembly).
+"""Seed derivation used for distinct pipeline-stage RNG streams.
 
-trainer.py is not importable in a minimal CPU environment, so the derivation
-lives in a dependency-free helper; these tests pin the seed semantics the
-trainer relies on: distinct RNG streams per PP stage, reproducible per stage,
-and bit-identical behavior when pp == 1.
+The utility can be tested without importing trainer assembly or DCP. Pin
+reproducible stage-specific streams and unchanged seeds for a single stage.
 """
 
-from tests.caps import require_env
-
-# The derivation lives in trainer/runtime/assembly.py, whose import chain needs the
-# DCP stack.
-require_env("dcp")
-
+import pytest
 import torch
 
-from llmtuner.trainer.runtime.assembly import derive_distinct_seed
+from llmtuner.utils.seeding import derive_distinct_seed
 
 
 def _rng_snapshot(seed: int) -> torch.Tensor:
@@ -50,7 +43,7 @@ class TestDeriveDistinctSeed:
         # And with no distinct dims at all there is nothing to offset.
         assert derive_distinct_seed(base_seed, []) == base_seed
 
-    def test_offset_matches_row_major_indexing(self):
+    def test_first_coordinate_varies_fastest(self):
         # Multi-dim generality: (r0, s0), (r1, s1) -> r0 + r1 * s0.
         assert derive_distinct_seed(100, [(2, 3), (1, 5)]) == 100 + 2 + 1 * 3
 
@@ -59,3 +52,8 @@ class TestDeriveDistinctSeed:
         derived = derive_distinct_seed(base_seed, [(3, 4)])
         assert derived == (base_seed + 3) % 2**64
         torch.manual_seed(derived)  # must be accepted by torch
+
+    def test_invalid_coordinates_are_rejected(self):
+        for coordinates in [[(4, 4)], [(-1, 4)], [(0, 0)], [(1, True)]]:
+            with pytest.raises(ValueError, match="seed coordinate"):
+                derive_distinct_seed(1, coordinates)

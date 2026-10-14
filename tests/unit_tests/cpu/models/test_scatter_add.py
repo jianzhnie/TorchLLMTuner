@@ -14,9 +14,33 @@ from tests.caps import require_env
 require_env("spmd_types")
 
 
+import pytest
 import torch
 
 from llmtuner.models.common.scatter_add import deterministic_scatter_add
+
+
+@pytest.mark.parametrize("shape", [(3, 2), (2, 3), (3, 3)])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_larger_source_has_zero_gradients_outside_index_region(shape, compiled):
+    index = torch.tensor([[0, 1], [1, 2]])
+    src = torch.randn(shape, dtype=torch.float64, requires_grad=True)
+    out = torch.randn(3, 2, dtype=torch.float64, requires_grad=True)
+    reference_src = src.detach().clone().requires_grad_()
+    reference_out = out.detach().clone().requires_grad_()
+    operation = (
+        torch.compile(deterministic_scatter_add, backend="aot_eager", fullgraph=True)
+        if compiled
+        else deterministic_scatter_add
+    )
+    actual = operation(out, index, src)
+    expected = reference_out.scatter_add(0, index, reference_src[:2, :2])
+    weights = torch.arange(6, dtype=torch.float64).reshape(3, 2)
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(src.grad, reference_src.grad)
+    torch.testing.assert_close(out.grad, reference_out.grad)
 
 
 def _inputs(seed: int = 0):

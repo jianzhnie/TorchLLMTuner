@@ -130,8 +130,8 @@ def _expert_placement(
     apply_fsdp_to_decoder(
         model,
         dp_mesh,
-        torch.float32,
-        torch.float32,
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
         pp_enabled=False,
         ep_degree=ep_size,
         edp_mesh=edp_mesh,
