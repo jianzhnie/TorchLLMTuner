@@ -39,6 +39,32 @@ def test_tied_head_import_does_not_mutate_source():
     assert imported["model.model.embed_tokens.weight"] is weight
 
 
+@pytest.mark.parametrize("text_tied", [False, True])
+def test_composite_checkpoint_uses_text_weight_ties(text_tied):
+    from transformers import AutoConfig
+
+    config = AutoConfig.for_model(
+        "llava", text_config={"tie_word_embeddings": text_tied}
+    )
+    config.tie_word_embeddings = not text_tied
+    adapter = HFTransformerStateDictAdapter(config, None)
+    adapter._hf_keys = {"model.embed_tokens.weight"}
+    weight = torch.randn(4, 2)
+    source = {"model.embed_tokens.weight": weight}
+    imported = adapter.from_hf(source)
+
+    assert adapter.model_config is config.text_config
+    assert ("model.lm_head.weight" in imported) == text_tied
+    assert source == {"model.embed_tokens.weight": weight}
+    if text_tied:
+        assert imported["model.lm_head.weight"] is weight
+        assert adapter.to_hf(imported) == source
+    else:
+        imported["model.lm_head.weight"] = weight.clone()
+        with pytest.raises(ValueError, match="unexpected=.*lm_head.weight"):
+            adapter.to_hf(imported)
+
+
 @pytest.mark.parametrize("complete", [False, True])
 def test_hf_index_checks_global_pipeline_keys(monkeypatch, complete):
     import llmtuner.models.hf.state_dict_adapter as adapter_module

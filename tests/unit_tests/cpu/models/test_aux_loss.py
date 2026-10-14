@@ -45,8 +45,8 @@ from llmtuner.memory.activation_checkpoint import (
 from llmtuner.models.common.aux_loss import (
     AuxLoss,
     collect_aux_loss_metrics,
-    register_aux_loss_zero_hook,
-    zero_aux_losses,
+    register_aux_loss_metrics_hook,
+    rollup_aux_loss_metrics,
 )
 from llmtuner.models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
 
@@ -311,12 +311,12 @@ def test_metric_accumulates_across_microbatches_within_a_step() -> None:
 # -- roll-up and collection --------------------------------------------------
 
 
-def test_zero_hook_rolls_instances_into_the_group_and_clears_them() -> None:
+def test_metrics_rollup_rolls_instances_into_the_group_and_clears_them() -> None:
     loss = _ConstantLoss(coeff=1.0)
     AuxLoss.set_step_denominator(torch.tensor(2.0))
     loss(torch.ones(4, requires_grad=True))
 
-    zero_aux_losses([loss])
+    rollup_aux_loss_metrics([loss])
 
     torch.testing.assert_close(
         AuxLoss.group_acc[("batch", "_constant_loss")],
@@ -327,14 +327,14 @@ def test_zero_hook_rolls_instances_into_the_group_and_clears_them() -> None:
     assert loss.instance_acc.item() == 0.0
 
 
-def test_zero_hook_sums_instances_within_one_group() -> None:
+def test_metrics_rollup_sums_instances_within_one_group() -> None:
     """Two layers in the same group contribute one register holding both."""
     a, b = _ConstantLoss(coeff=1.0), _ConstantLoss(coeff=1.0)
     AuxLoss.set_step_denominator(torch.tensor(1.0))
     a(torch.ones(2, requires_grad=True))  # raw 2
     b(torch.ones(3, requires_grad=True))  # raw 2
 
-    zero_aux_losses([a, b])
+    rollup_aux_loss_metrics([a, b])
 
     torch.testing.assert_close(
         AuxLoss.group_acc[("batch", "_constant_loss")],
@@ -344,13 +344,13 @@ def test_zero_hook_sums_instances_within_one_group() -> None:
     )
 
 
-def test_zero_hook_finds_nested_loss_modules() -> None:
+def test_metrics_rollup_finds_nested_loss_modules() -> None:
     """Losses live inside the model, not at its top level."""
     container = torch.nn.Sequential(_ConstantLoss(coeff=1.0))
     AuxLoss.set_step_denominator(torch.tensor(1.0))
     container[0](torch.ones(2, requires_grad=True))
 
-    zero_aux_losses([container])
+    rollup_aux_loss_metrics([container])
 
     torch.testing.assert_close(
         AuxLoss.group_acc[("batch", "_constant_loss")],
@@ -360,12 +360,12 @@ def test_zero_hook_finds_nested_loss_modules() -> None:
     )
 
 
-def test_zero_hook_ignores_modules_that_are_not_aux_losses() -> None:
+def test_metrics_rollup_ignores_modules_that_are_not_aux_losses() -> None:
     container = torch.nn.Sequential(torch.nn.Linear(2, 2), _ConstantLoss(coeff=1.0))
     AuxLoss.set_step_denominator(torch.tensor(1.0))
     container[1](torch.ones(2, requires_grad=True))
 
-    zero_aux_losses([container])
+    rollup_aux_loss_metrics([container])
 
     assert set(AuxLoss.group_acc) == {("batch", "_constant_loss")}
 
@@ -380,7 +380,7 @@ def test_collect_divides_the_group_sum_by_the_instance_count() -> None:
     AuxLoss.set_step_denominator(torch.tensor(1.0))
     a(torch.ones(2, requires_grad=True))  # raw 2
     b(torch.ones(4, requires_grad=True))  # raw 2
-    zero_aux_losses([a, b])
+    rollup_aux_loss_metrics([a, b])
 
     metrics = collect_aux_loss_metrics(parallel_dims=_NoMeshes())
 
@@ -390,7 +390,7 @@ def test_collect_divides_the_group_sum_by_the_instance_count() -> None:
 def test_collect_clamps_a_missing_group_register_to_zero() -> None:
     """A rank owning no instance of a group still reports the group's mean.
 
-    The register is only created by ``zero_aux_losses`` on ranks that hold an
+    The register is only created by ``rollup_aux_loss_metrics`` on ranks that hold an
     instance, so a rank without one must contribute a zero rather than be
     skipped -- otherwise collective participation would diverge.
     """
@@ -565,7 +565,7 @@ def test_aux_hook_preserves_registered_model_parts_after_caller_list_edit():
     loss.instance_acc.fill_(3.0)
     parts = [loss]
     optimizer = torch.optim.SGD([nn.Parameter(torch.ones(1))], lr=0.1)
-    register_aux_loss_zero_hook(optimizer, model_parts=parts)
+    register_aux_loss_metrics_hook(optimizer, model_parts=parts)
     parts.clear()
     optimizer.step()
     key = (loss.reduce_mesh, loss.metric_name)

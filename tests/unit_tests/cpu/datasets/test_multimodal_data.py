@@ -243,10 +243,13 @@ def test_process_video_resizes_and_normalizes():
     assert float(out.max()) <= 1.5 and float(out.min()) >= -1.5
 
 
-def test_load_video_without_a_backend_returns_none(tmp_path):
-    """``av`` is imported inside the function so a missing video backend is a
-    None here rather than an ImportError that takes the whole layer down."""
-    assert load_video(str(tmp_path / "missing.mp4")) is None
+def test_load_video_without_a_backend_raises_install_hint(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "av", None)
+    """Missing backend is an environment error, rather than a dropped sample."""
+    with pytest.raises(ImportError, match="pip install av"):
+        load_video(str(tmp_path / "missing.mp4"))
 
 
 @pytest.mark.parametrize(
@@ -935,6 +938,16 @@ def test_smart_resize_rejects_invalid_geometry(kwargs):
 def test_video_sampling_rejects_invalid_parameters(kwargs):
     with pytest.raises(ValueError):
         load_video("unused.mp4", **kwargs)
+
+
+@pytest.mark.parametrize("field", ["min_frames", "max_frames"])
+@pytest.mark.parametrize("value", [True, 1.5, "4", None])
+def test_video_frame_counts_fail_before_backend_loading(field, value, monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "av", None)
+    with pytest.raises(ValueError, match=f"{field} must be positive integer"):
+        load_video("unused.mp4", **{field: value})
 
 
 @pytest.mark.parametrize("reported_frames", [0, 10])

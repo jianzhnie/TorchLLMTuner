@@ -30,7 +30,6 @@ from llmtuner.models.common.tp_projections import (
     AllGatherFusedQKVLinear,
     ReduceScatterLinear,
     TensorParallelFeedForward,
-    validate_tp_projection_preconditions,
 )
 
 DIM = 16
@@ -80,16 +79,6 @@ def test_invalid_projection_bias_fails_before_allocation(monkeypatch, bias):
     monkeypatch.setattr(torch, "empty", unexpected)
     with pytest.raises(TypeError, match="bias must be bool"):
         ReduceScatterLinear(4, 8, bias=bias)
-
-
-def test_preconditions_require_sequence_parallelism() -> None:
-    """Without SP there are no boundary collectives for the GEMMs to replace."""
-    with pytest.raises(ValueError, match="enable_sequence_parallel"):
-        validate_tp_projection_preconditions(enable_sp=False)
-
-
-def test_preconditions_accept_sequence_parallelism() -> None:
-    validate_tp_projection_preconditions(enable_sp=True)
 
 
 # -- TensorParallelFeedForward -----------------------------------------------------

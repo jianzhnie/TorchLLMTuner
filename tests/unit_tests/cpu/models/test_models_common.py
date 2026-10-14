@@ -469,6 +469,40 @@ def _grouped(*, use_grouped_mm: bool | None, dtype=torch.float32, seed: int = 0)
 _COUNTS = torch.tensor([5, 6, 4, 7])
 
 
+@pytest.mark.parametrize(
+    "counts, error_type, message",
+    [
+        (torch.ones(3, dtype=torch.long), ValueError, "shape"),
+        (torch.ones(2, 2, dtype=torch.long), ValueError, "shape"),
+        (torch.ones(4), TypeError, "integer dtype"),
+        (torch.ones(4, dtype=torch.bool), TypeError, "integer dtype"),
+        (torch.tensor([-1, 2, 1, 2]), RuntimeError, "nonnegative"),
+        (torch.tensor([1, 1, 1, 0]), RuntimeError, "sum"),
+        (torch.tensor([2, 1, 1, 1]), RuntimeError, "sum"),
+    ],
+)
+def test_expert_segment_counts_fail_before_any_projection(
+    counts, error_type, message, monkeypatch
+):
+    module = _grouped(use_grouped_mm=False)
+    inputs = torch.randn(4, 16)
+    original = inputs.clone()
+    monkeypatch.setattr(
+        module, "_grouped_mm", lambda *args: pytest.fail("invalid counts reached GEMM")
+    )
+    with pytest.raises(error_type, match=message):
+        module(inputs, counts)
+    torch.testing.assert_close(inputs, original)
+    assert all(parameter.grad is None for parameter in module.parameters())
+
+
+@pytest.mark.parametrize("shape", [(16,), (4, 15), (2, 2, 16)])
+def test_expert_inputs_require_a_routed_token_matrix(shape):
+    module = _grouped(use_grouped_mm=False)
+    with pytest.raises(ValueError, match="Expert inputs must have shape"):
+        module(torch.ones(shape), torch.ones(4, dtype=torch.long))
+
+
 def test_grouped_experts_runs_every_expert_over_its_own_tokens() -> None:
     """The loop path segments the tokens, one expert each, no bleeding.
 
@@ -504,7 +538,6 @@ def test_the_grouped_mm_probe_follows_the_op(monkeypatch) -> None:
     the bug that would send every model down a branch that raises elsewhere.
     """
     from llmtuner.accelerator.capabilities import probe
-    from llmtuner.models.common.moe import experts as ge
 
     probe.cache_clear()
 
@@ -515,24 +548,24 @@ def test_the_grouped_mm_probe_follows_the_op(monkeypatch) -> None:
         raise RuntimeError("strides should be multiple of 16 bytes")
 
     monkeypatch.setattr(torch, "_grouped_mm", _works, raising=False)
-    assert ge.grouped_mm_available() is True
+    assert _grouped(use_grouped_mm=None).use_grouped_mm is True
 
     monkeypatch.setattr(torch, "_grouped_mm", _raises, raising=False)
     probe.cache_clear()
-    assert ge.grouped_mm_available() is False
+    assert _grouped(use_grouped_mm=None).use_grouped_mm is False
 
     # An op that is simply absent counts as unavailable, not as an error.
     monkeypatch.delattr(torch, "_grouped_mm", raising=False)
     probe.cache_clear()
-    assert ge.grouped_mm_available() is False
+    assert _grouped(use_grouped_mm=None).use_grouped_mm is False
     probe.cache_clear()
 
 
 def test_the_grouped_mm_probe_agrees_with_the_real_op_here() -> None:
     """On whatever host this runs, the probe must match the actual call."""
-    from llmtuner.models.common.moe.experts import grouped_mm_available
+    from llmtuner.accelerator.capabilities import has
 
-    reported = grouped_mm_available()
+    reported = has("torch_grouped_mm")
     try:
         torch._grouped_mm(
             torch.zeros(8, 8, dtype=torch.bfloat16),
@@ -558,9 +591,9 @@ def test_the_fused_path_matches_the_loop_bit_for_bit_in_bf16() -> None:
     assertion and would hide a mis-segmented expert. Skipped where the op is
     unavailable.
     """
-    from llmtuner.models.common.moe.experts import grouped_mm_available
+    from llmtuner.accelerator.capabilities import has
 
-    if not grouped_mm_available():
+    if not has("torch_grouped_mm"):
         pytest.skip("torch._grouped_mm is unavailable on this build")
 
     loop = _grouped(use_grouped_mm=False, dtype=torch.bfloat16)
@@ -596,9 +629,9 @@ def test_the_fused_path_is_refused_for_a_wider_dtype() -> None:
 
 def test_the_default_follows_the_probe() -> None:
     """``None`` means "decide here", and the decision is the probe's."""
-    from llmtuner.models.common.moe.experts import grouped_mm_available
+    from llmtuner.accelerator.capabilities import has
 
-    assert _grouped(use_grouped_mm=None).use_grouped_mm == grouped_mm_available()
+    assert _grouped(use_grouped_mm=None).use_grouped_mm == has("torch_grouped_mm")
     # An explicit value still wins, which is what lets a test pin a path.
     assert _grouped(use_grouped_mm=False).use_grouped_mm is False
     assert _grouped(use_grouped_mm=True).use_grouped_mm is True

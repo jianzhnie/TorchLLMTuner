@@ -23,9 +23,11 @@ import torch
 from llmtuner.config import ParallelConfig
 from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
 from llmtuner.parallel.expert_parallel.token_dispatch import (
-    TORCHAO_INSTALL_HINT,
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
+)
+from llmtuner.parallel.expert_parallel.torchao_dispatch import (
+    TORCHAO_INSTALL_HINT,
     TorchAOTokenDispatcher,
 )
 
@@ -185,16 +187,20 @@ def fake_torchao(monkeypatch):
 
 
 def test_torchao_dispatcher_without_the_package_raises_an_install_hint(monkeypatch):
-    """Real environment check: ``torchao`` is not installed here."""
-    monkeypatch.delitem(sys.modules, "torchao", raising=False)
+    """A missing adapter dependency must fail on hosts with or without torchao."""
+    monkeypatch.setitem(sys.modules, "torchao.prototype.moe_training.ep.permute", None)
     with pytest.raises(ImportError, match="pip install torchao"):
         TorchAOTokenDispatcher(num_experts=4, top_k=2, pad_multiple=16)
     assert "ep_token_dispatcher='torchao'" in TORCHAO_INSTALL_HINT
 
 
-def test_torchao_dispatcher_rejects_bad_pad_multiple(fake_torchao):
+@pytest.mark.parametrize("pad_multiple", [0, -1, True, 1.5, "16", None])
+def test_torchao_dispatcher_rejects_bad_pad_multiple_before_import(
+    pad_multiple, monkeypatch
+):
+    monkeypatch.setitem(sys.modules, "torchao.prototype.moe_training.ep.permute", None)
     with pytest.raises(ValueError, match="pad_multiple"):
-        TorchAOTokenDispatcher(num_experts=4, top_k=2, pad_multiple=0)
+        TorchAOTokenDispatcher(num_experts=4, top_k=2, pad_multiple=pad_multiple)
 
 
 def _routing(num_tokens=6, dim=4, num_experts=4, top_k=2, seed=0):

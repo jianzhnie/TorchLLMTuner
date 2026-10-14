@@ -73,6 +73,54 @@ def test_invalid_checkpoint_steps_fail_before_storage_access(method, step):
         getattr(BaseCheckpointManager, method)(manager, step)
 
 
+# -- retention directory ownership --------------------------------------------
+
+
+@pytest.mark.parametrize("prefix", ["_tmp-", ".pending+"])
+def test_retention_only_queues_canonical_abandoned_staging_directories(
+    tmp_path, prefix
+):
+    import queue
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    manager = DistributedCheckpointManager(
+        Config(enable=True, keep_latest_k=0),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=str(tmp_path),
+    )
+    checkpoint_folder = Path(manager.folder)
+    checkpoint_folder.mkdir(parents=True, exist_ok=True)
+    names = [
+        f"{prefix}step-{suffix}"
+        for suffix in ("0", "12", "20", "007", "1٢", "1２", "１２")
+    ]
+    names.extend(["step-20", "notes", "step-1٢"])
+    for name in names:
+        (checkpoint_folder / name).mkdir()
+    manager.keep_latest_k = 2
+    manager.purge_queue = queue.Queue()
+    # Inspect the deletion queue without running destructive background work.
+    manager.purge_thread = SimpleNamespace(is_alive=lambda: False)
+    try:
+        manager._purge_stale_checkpoints(saving_step=20, staging_dir_prefix=prefix)
+        queued = set()
+        while not manager.purge_queue.empty():
+            queued.add(manager.purge_queue.get_nowait())
+        assert queued == {
+            str(checkpoint_folder / f"{prefix}step-0"),
+            str(checkpoint_folder / f"{prefix}step-12"),
+        }
+        assert all((checkpoint_folder / name).is_dir() for name in names)
+    finally:
+        manager.close()
+
+
 # -- config validation --------------------------------------------------------
 
 

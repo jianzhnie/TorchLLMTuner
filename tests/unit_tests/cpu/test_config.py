@@ -49,6 +49,16 @@ from llmtuner.config import (
 from llmtuner.config.cli_config import PARSER_GROUPS, PROGRAMMATIC_ONLY, cli_view
 
 
+def test_cli_view_rejects_class_variables_in_hidden_fields(monkeypatch):
+    from dataclasses import make_dataclass
+    from typing import ClassVar
+
+    config = make_dataclass("Config", [("shared", ClassVar[int], 1)])
+    monkeypatch.setitem(PROGRAMMATIC_ONLY, config, frozenset({"shared"}))
+    with pytest.raises(RuntimeError, match="PROGRAMMATIC_ONLY is stale"):
+        cli_view(config)
+
+
 def test_cli_views_preserve_hidden_field_properties():
     from dataclasses import fields
 
@@ -213,10 +223,13 @@ def test_sequence_parallel_cannot_be_turned_off() -> None:
     realization to fall back to, so refusing is the only honest answer.
     """
     with pytest.raises(NotImplementedError, match="enable_sequence_parallel"):
-        ParallelConfig(enable_sequence_parallel=False)
+        ParallelConfig(tensor_parallel_size=2, enable_sequence_parallel=False)
     # The default stays on, and saying so explicitly is not an error.
     assert ParallelConfig().enable_sequence_parallel is True
     assert ParallelConfig(enable_sequence_parallel=True).enable_sequence_parallel
+    assert not ParallelConfig(
+        tensor_parallel_size=1, enable_sequence_parallel=False
+    ).enable_sequence_parallel
 
 
 def test_an_unknown_context_parallel_strategy_is_rejected() -> None:

@@ -264,7 +264,7 @@ def test_invalid_buffer_selection_fails_before_averages_are_allocated(
     def fail_if_allocated(*args, **kwargs):
         pytest.fail("EMA allocated parameter averages before validating patterns")
 
-    monkeypatch.setattr(ema_module, "EMAParamOptimizer", fail_if_allocated)
+    monkeypatch.setattr(ema_module, "EMAStateOptimizer", fail_if_allocated)
     model = _model()
     model.register_buffer("step_counter", torch.zeros((), dtype=torch.long))
     with pytest.raises(re.error if invalid_pattern else ValueError):
@@ -337,7 +337,7 @@ def test_invalid_ema_schedule_is_rejected_before_allocation(monkeypatch, name, v
     def unexpected_allocation(*args, **kwargs):
         raise AssertionError("invalid schedule must fail before allocating averages")
 
-    monkeypatch.setattr(ema_module, "EMAParamOptimizer", unexpected_allocation)
+    monkeypatch.setattr(ema_module, "EMAStateOptimizer", unexpected_allocation)
     with pytest.raises(ValueError, match=name):
         EMAConfig(**{name: value})
     with pytest.raises(ValueError, match=name):
@@ -403,7 +403,7 @@ def test_repeated_model_part_is_rejected_before_allocating_averages(monkeypatch)
     def fail_if_allocated(*args, **kwargs):
         pytest.fail("EMA allocated averages before checking parameter ownership")
 
-    monkeypatch.setattr(ema_module, "EMAParamOptimizer", fail_if_allocated)
+    monkeypatch.setattr(ema_module, "EMAStateOptimizer", fail_if_allocated)
     model = _model()
     with pytest.raises(ValueError, match="more than one group"):
         EMA(model_parts=[model, model])
@@ -466,7 +466,7 @@ def test_ema_rejects_shrinking_scope_before_changing_averages(operation, change)
 
 @pytest.mark.parametrize("track_buffers", [False, True])
 def test_ema_rejects_tensor_names_colliding_after_wrapper_removal(track_buffers):
-    from llmtuner.components.optimizer.ema import EMAParamOptimizer
+    from llmtuner.components.optimizer.ema import EMAStateOptimizer
 
     tensor_factory = (
         torch.ones if track_buffers else lambda n: nn.Parameter(torch.ones(n))
@@ -476,4 +476,4 @@ def test_ema_rejects_tensor_names_colliding_after_wrapper_removal(track_buffers)
         ("_checkpoint_wrapped_module.weight", tensor_factory(2)),
     ]
     with pytest.raises(ValueError, match="EMA tensor FQNs collide"):
-        EMAParamOptimizer(tensors)
+        EMAStateOptimizer(tensors)
