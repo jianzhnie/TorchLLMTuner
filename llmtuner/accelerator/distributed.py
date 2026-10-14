@@ -11,6 +11,7 @@ import functools
 import os
 import subprocess
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 import torch.multiprocessing as mp
@@ -28,12 +29,19 @@ def is_distributed() -> bool:
 
 
 def get_default_group() -> ProcessGroup | None:
-    """Return default process group."""
+    """Return the initialized default process group, when one exists.
 
-    return torch_dist.distributed_c10d._get_default_group()
+    ``group.WORLD`` is the public handle for the default process group.  Keep
+    the uninitialized case explicit so callers can retain the backend-neutral
+    ``None`` behavior without reaching into ``distributed_c10d`` internals.
+    """
+
+    if not is_distributed():
+        return None
+    return torch_dist.group.WORLD
 
 
-def infer_launcher():
+def infer_launcher() -> Literal["pytorch", "slurm", "mpi", "none"]:
     if "WORLD_SIZE" in os.environ:
         return "pytorch"
     elif "SLURM_NTASKS" in os.environ:
@@ -163,6 +171,7 @@ def init_dist_mpi(backend, **kwargs) -> None:
     local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
     if device_type not in ("cpu", "cuda"):
         set_device(torch.device(device_type, local_rank))
+        backend = get_distributed_backend()
     elif device_type == "cuda":
         torch.cuda.set_device(local_rank)
     if "MASTER_PORT" not in os.environ:
@@ -189,7 +198,6 @@ def init_dist_slurm(backend, port=None, init_backend="torch", **kwargs) -> None:
     """
     proc_id = int(os.environ["SLURM_PROCID"])
     ntasks = int(os.environ["SLURM_NTASKS"])
-    node_list = os.environ["SLURM_NODELIST"]
     # Not sure when this environment variable could be None, so use a fallback
     local_rank_env = os.environ.get("SLURM_LOCALID", None)
     if local_rank_env is not None:
@@ -199,36 +207,41 @@ def init_dist_slurm(backend, port=None, init_backend="torch", **kwargs) -> None:
             1 if device_type == "cpu" else getattr(torch, device_type).device_count()
         )
         local_rank = proc_id % num_gpus
-    addr = subprocess.getoutput(f"scontrol show hostname {node_list} | head -n1")
+    if "MASTER_ADDR" not in os.environ:
+        result = subprocess.run(
+            ["scontrol", "show", "hostnames", os.environ["SLURM_NODELIST"]],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        hosts = result.stdout.splitlines()
+        if not hosts or not hosts[0].strip():
+            raise RuntimeError("scontrol returned no hostnames for SLURM_NODELIST")
+        os.environ["MASTER_ADDR"] = hosts[0].strip()
     # specify master port
     if port is not None:
         os.environ["MASTER_PORT"] = str(port)
-    elif "MASTER_PORT" in os.environ:
-        pass  # use MASTER_PORT in the environment variable
     else:
-        # 29500 is torch.distributed default port
-        os.environ["MASTER_PORT"] = "29500"
-    # use MASTER_ADDR in the environment variable if it already exists
-    if "MASTER_ADDR" not in os.environ:
-        os.environ["MASTER_ADDR"] = addr
+        os.environ.setdefault("MASTER_PORT", "29500")
     os.environ["WORLD_SIZE"] = str(ntasks)
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["RANK"] = str(proc_id)
+
+    # Slurm has now published the same environment as torchrun. Reuse its
+    # CPU/CUDA PyTorch bootstrap; ColossalAI retains its Slurm-specific entry.
+    if init_backend == "torch" and device_type in ("cpu", "cuda"):
+        init_dist_pytorch(backend, **kwargs)
+        return
 
     if device_type not in ("cpu", "cuda"):
         set_device(torch.device(device_type, local_rank))
         torch_dist.init_process_group(backend=get_distributed_backend(), **kwargs)
     elif device_type == "cpu":
-        if init_backend == "torch":
-            torch_dist.init_process_group(backend=backend, **kwargs)
-        else:
-            raise ValueError(f"init_backend={init_backend!r} is not supported on CPU")
+        raise ValueError(f"init_backend={init_backend!r} is not supported on CPU")
     else:
         torch.cuda.set_device(local_rank)
 
-        if init_backend == "torch":
-            torch_dist.init_process_group(backend=backend, **kwargs)
-        elif init_backend == "deepspeed":
+        if init_backend == "deepspeed":
             import deepspeed
 
             deepspeed.init_distributed(dist_backend=backend, **kwargs)

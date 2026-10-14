@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import importlib
 import os
-from typing import Any
+from types import ModuleType
 
 import torch
 
@@ -84,7 +84,7 @@ def get_device_type() -> str:
     )
 
 
-def get_device_info() -> tuple[str, Any]:
+def get_device_info() -> tuple[str, ModuleType]:
     """Return ``(device type, torch device module)`` for training."""
     kind = get_device_type()
     return kind, torch if kind == "cpu" else getattr(torch, kind)
@@ -164,14 +164,14 @@ def is_npu_support_full_precision() -> bool:
 
 
 def get_max_cuda_memory(device: torch.device | None = None) -> int:
-    """Peak CUDA memory occupied by tensors, in MB, and reset the peak.
+    """Peak CUDA memory occupied by tensors, in MiB, and reset that device's peak.
 
     With ``device=None`` the current device is reported. Note the side
     effect: the peak counter is reset, so consecutive calls measure the
     interval between calls, not the program maximum.
     """
     mem = torch.cuda.max_memory_allocated(device=device)
-    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.reset_peak_memory_stats(device=device)
     return int(mem) // (1024 * 1024)
 
 
