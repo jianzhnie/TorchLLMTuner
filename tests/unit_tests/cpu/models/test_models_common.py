@@ -529,7 +529,7 @@ def test_the_fused_path_is_refused_for_a_wider_dtype() -> None:
     *fused*, so comparing a default against a forced fused model would compare
     the same path with itself and pass no matter what the gate did.
     """
-    for dtype in (torch.float32, torch.float64):
+    for dtype in (torch.float16, torch.float32, torch.float64):
         loop = _grouped(use_grouped_mm=False, dtype=dtype)
         forced = _grouped(use_grouped_mm=True, dtype=dtype)
         forced.load_state_dict(loop.state_dict())
@@ -548,3 +548,17 @@ def test_the_default_follows_the_probe() -> None:
     # An explicit value still wins, which is what lets a test pin a path.
     assert _grouped(use_grouped_mm=False).use_grouped_mm is False
     assert _grouped(use_grouped_mm=True).use_grouped_mm is True
+
+
+@pytest.mark.parametrize("num_bins", [0, -1])
+def test_quantile_balancer_rejects_nonpositive_histogram_size(num_bins):
+    from llmtuner.models.common.moe.routing import QuantileBalancer
+
+    with pytest.raises(ValueError, match="num_bins must be positive"):
+        QuantileBalancer(4, 1, num_bins)
+
+
+@pytest.mark.parametrize("sizes", [(0, 8, 4), (8, 0, 4), (8, 8, 0)])
+def test_grouped_experts_rejects_empty_geometry(sizes):
+    with pytest.raises(ValueError, match="must be positive"):
+        GroupedExperts(*sizes, use_grouped_mm=False)

@@ -532,3 +532,49 @@ def test_profiler_start_failure_stops_started_trace(monkeypatch):
     assert len(calls) == 1
     assert calls[0][0] is ValueError
     assert profiler.torch_profiler is None
+
+
+@pytest.mark.parametrize("snapshot_fails", [False, True])
+def test_profiler_exit_preserves_oom_and_attempts_snapshot_after_trace_failure(
+    snapshot_fails,
+):
+    from types import SimpleNamespace
+
+    calls = []
+
+    def stop(*args):
+        calls.append("trace")
+        raise RuntimeError("trace export failed")
+
+    def snapshot(**kwargs):
+        calls.append("snapshot")
+        assert kwargs == {"exit_ctx": True}
+        if snapshot_fails:
+            raise OSError("snapshot write failed")
+
+    profiler = Profiler(Config())
+    profiler.torch_profiler = SimpleNamespace(__exit__=stop)
+    profiler.memory_profiler = SimpleNamespace(step=snapshot)
+    original = torch.OutOfMemoryError("training OOM")
+    assert profiler.__exit__(type(original), original, None) is False
+    assert calls == ["trace", "snapshot"]
+    assert profiler.torch_profiler is None
+    assert profiler.memory_profiler is None
+    profiler.__exit__(None, None, None)
+    assert calls == ["trace", "snapshot"]
+
+
+def test_profiler_exit_raises_trace_error_when_training_succeeded():
+    from types import SimpleNamespace
+
+    original = RuntimeError("trace export failed")
+
+    def stop(*args):
+        raise original
+
+    profiler = Profiler(Config())
+    profiler.torch_profiler = SimpleNamespace(__exit__=stop)
+    with pytest.raises(RuntimeError, match="trace export failed") as caught:
+        profiler.__exit__(None, None, None)
+    assert caught.value is original
+    assert profiler.torch_profiler is None

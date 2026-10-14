@@ -198,7 +198,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         # Reusing the training group would have the two contend for the same
         # collectives.
         self.pg: dist.ProcessGroup | None = None
-        if self.async_mode in (
+        if dist.is_initialized() and self.async_mode in (
             DistributedCheckpointAsyncMode.ASYNC,
             DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM,
         ):
@@ -521,8 +521,9 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 "but self.async_mode isn't ASYNC_WITH_PINNED_MEM."
             )
 
-        self.staging_future.result()
+        staging_future = self.staging_future
         self.staging_future = None
+        staging_future.result()
 
     def _wait_for_saving(self) -> None:
         """Wait for any background save to complete.

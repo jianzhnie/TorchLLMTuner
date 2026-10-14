@@ -132,7 +132,9 @@ class EMA(OptimizersContainer):
         self.start_step = start_step
         self.step_bias = step_bias
         self.update_every_n_steps = update_every_n_steps
-        self.model_parts = model_parts
+        # The tracked scope is fixed; caller-owned list edits must not detach
+        # model parts from the optimizer groups constructed below.
+        self.model_parts = list(model_parts)
 
         self._param_optimizers: list[EMAParamOptimizer] = []
         all_params: list[nn.Parameter] = []

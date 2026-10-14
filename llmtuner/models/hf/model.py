@@ -210,7 +210,8 @@ class HFTransformerModel(nn.Module):
         embed, head = self.tok_embeddings, self.lm_head
         if head is None:
             return False
-        return getattr(embed, "weight", None) is getattr(head, "weight", None)
+        weight = getattr(embed, "weight", None)
+        return weight is not None and weight is getattr(head, "weight", None)
 
     # -- HF integration hooks --------------------------------------------------
 

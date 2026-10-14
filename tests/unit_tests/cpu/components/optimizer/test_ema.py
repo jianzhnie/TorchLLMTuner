@@ -292,3 +292,19 @@ def test_cold_start_rejects_replaced_buffer_without_inserting_state():
     with pytest.raises(RuntimeError, match="no state for"):
         ema.load_state_dict({})
     assert model.expert_bias_E not in ema._buffer_optimizers[0].state
+
+
+def test_ema_owns_model_part_collection():
+    model = _model()
+    parts = [model]
+    ema = EMA(model_parts=parts, decay=0.5)
+    params = list(model.parameters())
+    initial = [p.detach().clone() for p in params]
+    parts.clear()
+    with torch.no_grad():
+        for p in params:
+            p.add_(2)
+    ema.step(1)
+    averages = [ema._param_optimizers[0].state[p]["ema_params"] for p in params]
+    for average, before in zip(averages, initial, strict=True):
+        torch.testing.assert_close(average, before + 1)

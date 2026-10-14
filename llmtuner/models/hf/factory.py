@@ -162,8 +162,9 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
     # boundaries), and the ulysses packed refusal would never fire. Carrying it
     # down here is what keeps "which corpus did the trainer load" answerable
     # from the object that actually runs.
-    if hasattr(config, "attn_mask_type"):
-        text_config.attn_mask_type = config.attn_mask_type
+    for name in ("attn_mask_type", "experts_implementation", "compute_dtype"):
+        if hasattr(config, name):
+            setattr(text_config, name, getattr(config, name))
     if not getattr(text_config, "architectures", None):
         from transformers.models.auto.modeling_auto import (
             MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,

@@ -680,3 +680,95 @@ def test_torch_checkpointing_hf_final_save_builds_item_specs(tmp_path, monkeypat
     assert len(saved) == 1
     assert saved[0][0].endswith("step-2/sharded")
     assert MODEL in saved[0][1]
+
+
+def test_checkpoint_close_drains_all_resources_and_preserves_first_error():
+    import pytest
+
+    manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
+    manager._initialized = True
+    manager.enable = True
+    calls = []
+    original = ValueError("staging failed")
+
+    def staging():
+        calls.append("staging")
+        raise original
+
+    def saving():
+        calls.append("saving")
+        raise RuntimeError("saving failed")
+
+    def cleanup():
+        calls.append("cleanup")
+        raise RuntimeError("cleanup failed")
+
+    manager.maybe_wait_for_staging = staging
+    manager.maybe_wait_for_saving = saving
+    manager._close = cleanup
+    with pytest.raises(ValueError, match="staging failed") as caught:
+        manager.close()
+    assert caught.value is original
+    assert calls == ["staging", "saving", "cleanup"]
+    manager.close()
+    assert calls == ["staging", "saving", "cleanup"]
+
+
+def test_failed_staging_future_is_consumed_once():
+    from concurrent.futures import Future
+
+    import pytest
+
+    from llmtuner.components.checkpointer.distributed_checkpoint import (
+        DistributedCheckpointAsyncMode,
+    )
+
+    manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
+    manager.async_mode = DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM
+    manager.staging_future = Future()
+    manager.staging_future.set_exception(ValueError("staging failed"))
+    with pytest.raises(ValueError, match="staging failed"):
+        manager._maybe_wait_for_staging()
+    assert manager.staging_future is None
+    manager._maybe_wait_for_staging()
+
+
+def test_async_checkpoint_round_trip_without_a_process_group(tmp_path):
+    import torch.distributed as dist
+
+    assert not dist.is_initialized()
+    model = nn.Linear(3, 2)
+    expected = {key: value.clone() for key, value in model.state_dict().items()}
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    config = Config(enable=True, interval=1, keep_latest_k=0, async_mode="async")
+    manager = DistributedCheckpointManager(
+        config,
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states={},
+        folder=str(tmp_path),
+    )
+    assert manager.pg is None
+    try:
+        assert manager.save(1)
+    finally:
+        manager.close()
+    with torch.no_grad():
+        model.weight.fill_(0)
+        model.bias.fill_(0)
+    resumed = DistributedCheckpointManager(
+        config,
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states={},
+        folder=str(tmp_path),
+    )
+    try:
+        assert resumed.load(1)
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value, expected[key])
+    finally:
+        resumed.close()

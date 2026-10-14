@@ -396,3 +396,93 @@ def test_validate_restores_mixed_module_modes(monkeypatch, fail) -> None:
         trainer.validate(step=1)
     assert model.training
     assert not model.frozen.training
+
+
+@pytest.mark.parametrize("forward_fails", [False, True])
+def test_validation_preserves_forward_error_when_close_fails(
+    monkeypatch, forward_fails
+):
+    loader = _ListLoader([_batch(2)])
+
+    def close():
+        loader.closed = True
+        raise RuntimeError("close failed")
+
+    loader.close = close
+    model = _EchoModel()
+    original = ValueError("forward failed")
+    if forward_fails:
+
+        def forward(*args, **kwargs):
+            raise original
+
+        model.forward = forward
+    trainer, _ = _make_trainer(
+        monkeypatch, validation=ValidationConfig(steps=1), loader=loader, model=model
+    )
+    with pytest.raises(
+        ValueError if forward_fails else RuntimeError,
+        match="forward failed" if forward_fails else "close failed",
+    ) as caught:
+        trainer.validate(step=1)
+    if forward_fails:
+        assert caught.value is original
+    assert loader.closed
+    assert model.training
+
+
+@pytest.mark.parametrize("rows", [0, 1, 3])
+@pytest.mark.parametrize("packed_dict", [False, True])
+def test_pipeline_microbatch_split_rejects_incomplete_rows(rows, packed_dict):
+    from llmtuner.datasets.contracts import Batch
+    from llmtuner.trainer.runtime.pipeline import split_pipeline_microbatches
+
+    inputs = torch.ones(rows, SEQ_LEN, dtype=torch.long)
+    labels = inputs.clone()
+    batch = (
+        {"input_ids": inputs, "labels": labels}
+        if packed_dict
+        else Batch(input_ids=inputs, labels=labels)
+    )
+    trainer = SimpleNamespace(
+        cfg=SimpleNamespace(parallel=SimpleNamespace(num_pp_microbatches=2))
+    )
+    with pytest.raises(ValueError, match="Pipeline batch"):
+        split_pipeline_microbatches(trainer, batch)
+
+
+@pytest.mark.parametrize("iteration_fails", [False, True])
+def test_pipeline_validation_cleanup_preserves_iteration_error(
+    monkeypatch, iteration_fails
+):
+    import llmtuner.trainer.runtime.validation as validation_module
+
+    original = ValueError("iteration failed")
+    closed = []
+
+    class Loader:
+        def __iter__(self):
+            if iteration_fails:
+                raise original
+            return iter([])
+
+        def close(self):
+            closed.append(True)
+            raise RuntimeError("close failed")
+
+    monkeypatch.setattr(validation_module, "require", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        validation_module, "loss_reporting_meshes", lambda dims: (None, None)
+    )
+    monkeypatch.setattr(
+        validation_module, "build_validation_dataloader", lambda *args: Loader()
+    )
+    trainer = SimpleNamespace(parallel_dims=None, device=torch.device("cpu"))
+    with pytest.raises(
+        ValueError if iteration_fails else RuntimeError,
+        match="iteration failed" if iteration_fails else "close failed",
+    ) as caught:
+        validation_module.run_pipeline_validation_loop(trainer, ValidationConfig(), 1)
+    if iteration_fails:
+        assert caught.value is original
+    assert closed == [True]

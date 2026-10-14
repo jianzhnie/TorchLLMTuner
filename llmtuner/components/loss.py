@@ -503,7 +503,12 @@ def compute_logprobs(
     if not return_entropy:
         return logprobs
     with torch.no_grad():
-        entropy = torch.logsumexp(logits, dim=-1) - (
-            torch.softmax(logits, dim=-1) * logits
+        log_probs = F.log_softmax(logits, dim=-1)
+        # Masked classes have p=0 and contribute zero, rather than 0 * -inf.
+        # Keep NaNs for invalid distributions such as an all-masked row.
+        entropy = -torch.where(
+            torch.isneginf(log_probs),
+            torch.zeros_like(log_probs),
+            log_probs.exp() * log_probs,
         ).sum(dim=-1)
     return logprobs, entropy

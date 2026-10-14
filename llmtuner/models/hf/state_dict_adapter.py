@@ -12,6 +12,7 @@ import os
 import re
 from typing import Any
 
+import torch.distributed as dist
 from torch.distributed.checkpoint import HuggingFaceStorageReader
 
 from ...components.checkpointer.checkpoint_keys import SAFETENSORS_INDEX
@@ -50,6 +51,12 @@ class HFTransformerStateDictAdapter:
         }
         if self._hf_keys is not None:
             requested = set(hf_state)
+            if dist.is_available() and dist.is_initialized():
+                # PP ranks own disjoint layer keys. Validate the whole model's
+                # coverage while returning only this rank's tensor dictionary.
+                keys_by_rank: list[set[str] | None] = [None] * dist.get_world_size()
+                dist.all_gather_object(keys_by_rank, requested)
+                requested = set().union(*keys_by_rank)
             missing = self._hf_keys - requested
             unexpected = requested - self._hf_keys
             # A tied lm_head is legitimately omitted from a HF checkpoint.

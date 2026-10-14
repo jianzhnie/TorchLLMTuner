@@ -1238,3 +1238,64 @@ def test_synthetic_source_accepts_full_64_bit_seed():
     repeated = next(iter(source))
     assert first.input_ids.shape == (2, 4)
     assert torch.equal(first.input_ids, repeated.input_ids)
+
+
+def test_text_collator_masks_source_padding_without_mutating_labels(tokenizer):
+    source_labels = np.array([2, 3, 4], dtype=np.int64)
+    sequence = TextSequence(
+        input_ids=np.array([1, 2, 3], dtype=np.int64),
+        labels=source_labels,
+        padding_mask=np.array([False, True, False]),
+    )
+    collator = TextCollator(context=make_context(tokenizer, num_tokens_per_batch=4))
+    batch = collator([sequence])
+    assert batch["labels"].tolist() == [2, IGNORE_INDEX, 4, IGNORE_INDEX]
+    assert batch["num_valid_tokens"] == 2
+    assert source_labels.tolist() == [2, 3, 4]
+
+
+@pytest.mark.parametrize("field", ["vocab_size", "batch_size", "seq_len"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_synthetic_source_rejects_empty_or_negative_shapes(field, value):
+    from llmtuner.datasets.synthetic import RandomTokenSource
+
+    kwargs = dict(seed=0, vocab_size=8, batch_size=2, seq_len=4)
+    kwargs[field] = value
+    with pytest.raises(ValueError, match=field):
+        RandomTokenSource(**kwargs)
+
+
+def test_standalone_chat_template_loads_without_tokenizer_config(tokenizer):
+    from pathlib import Path
+
+    path = Path(tokenizer.tokenizer_path)
+    (path / "tokenizer_config.json").unlink()
+    (path / "chat_template.jinja").write_text(
+        "{% for message in messages %}{{ message.content }}{% endfor %}",
+        encoding="utf-8",
+    )
+    loaded = HuggingFaceTokenizer(tokenizer_path=str(path))
+    assert loaded.apply_chat_template([{"role": "user", "content": "你好"}]) == "你好"
+
+
+def test_restore_failure_preserves_error_when_iterator_close_fails():
+    from types import SimpleNamespace
+
+    original = ValueError("invalid cursor")
+    closed = []
+
+    def set_state(state):
+        raise original
+
+    def close():
+        closed.append(True)
+        raise RuntimeError("close failed")
+
+    loader = GrainDataLoader.__new__(GrainDataLoader)
+    loader._dp_world_size = 1
+    loader._rank_id = "dp_rank_0"
+    loader._iterator = SimpleNamespace(set_state=set_state, close=close)
+    with pytest.raises(ValueError, match="invalid cursor") as caught:
+        loader.load_state_dict({"version": 1, "dp_world_size": 1, "dp_rank_0": {}})
+    assert caught.value is original
+    assert closed == [True]

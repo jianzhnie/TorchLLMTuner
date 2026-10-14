@@ -63,13 +63,12 @@ class HuggingFaceTokenizer(BaseTokenizer):
         # Auto-load chat template: standalone .jinja file takes priority
         # (e.g. GPT-OSS), then fall back to inline in tokenizer_config.json
         # (e.g. Llama3, Qwen3, DeepSeek V3).
-        if self._hf_config is not None:
-            jinja_path = os.path.join(tokenizer_path, self.CHAT_TEMPLATE_FILE)
-            if os.path.exists(jinja_path):
-                with open(jinja_path) as f:
-                    self.set_chat_template(f.read())
-            elif "chat_template" in self._hf_config:
-                self.set_chat_template(self._hf_config["chat_template"])
+        jinja_path = os.path.join(tokenizer_path, self.CHAT_TEMPLATE_FILE)
+        if os.path.exists(jinja_path):
+            with open(jinja_path, encoding="utf-8") as f:
+                self.set_chat_template(f.read())
+        elif self._hf_config is not None and "chat_template" in self._hf_config:
+            self.set_chat_template(self._hf_config["chat_template"])
 
     def _load_config(self, config_path: str) -> dict | None:
         """Load configuration from JSON file if it exists."""

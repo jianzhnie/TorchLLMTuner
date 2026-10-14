@@ -6,7 +6,7 @@ HOW its activations move around the cut. This file keeps those apart.
 * ``ShardingConfig`` (built by the ``colwise()`` / ``rowwise()`` factories) is the
   DECLARATION -- plain data, no tensors, no collectives.
 * ``ColumnParallelLinear`` / ``RowParallelLinear`` are the modules that REALIZE a
-  declaration, built on the fused collective+GEMM primitives in ``linear.py``.
+  declaration, built on the fused collective+GEMM primitives in ``linear_ops.py``.
 * ``apply_tp`` is the ENGINE -- it reads a plan (the model's HF ``tp_plan`` by
   default, or an explicit ``{pattern: ShardingConfig}`` map), cuts each target
   weight and swaps the projection out for its sharded module.
@@ -391,7 +391,7 @@ def shard_experts_for_tp(
     The parameter objects are replaced with the same attribute names, so
     ``state_dict`` FQNs do not change -- the shapes shrink, the same convention
     the dense TP realizers already follow. The router weight is not touched
-    (Replicate). Returns the ids of the sharded parameters so the trainer's
+    (Replicate). Returns the names of the sharded parameters so the trainer's
     replicated-gradient all-reduce can exclude them: each rank's F-shard
     gradient is already complete, and summing it with a *different* shard's
     gradient would corrupt it.
@@ -758,7 +758,7 @@ def realize_moe_blocks_tp(moe_blocks, *, tp_size: int, tp_rank: int, group) -> N
         shared = getattr(block, "shared_expert", None) or getattr(
             block, "shared_experts", None
         )
-        shared_ids: set[int] = set()
+        shared_names: set[str] = set()
         if shared is not None:
             # The gate/up/down layout shards featurewise with no collectives
             # (the boundary already gathered the sequence); anything else --
@@ -769,7 +769,7 @@ def realize_moe_blocks_tp(moe_blocks, *, tp_size: int, tp_rank: int, group) -> N
                 for n in ("gate_proj", "up_proj", "down_proj")
             ):
                 compatibility.shared_expert_tp(module_path, block)
-            shared_ids = shard_shared_expert_for_tp(
+            shared_names = shard_shared_expert_for_tp(
                 block, tp_size=tp_size, tp_rank=tp_rank
             )
         # The sharded expert parameters are excluded from the trainer's
@@ -778,7 +778,7 @@ def realize_moe_blocks_tp(moe_blocks, *, tp_size: int, tp_rank: int, group) -> N
         # shard's gradient would corrupt it. Names, not ids -- FSDP runs after
         # this and replaces the Parameter objects.
         block.tp_sharded_param_names = (
-            shard_experts_for_tp(block, tp_size=tp_size, tp_rank=tp_rank) | shared_ids
+            shard_experts_for_tp(block, tp_size=tp_size, tp_rank=tp_rank) | shared_names
         )
         block._tp_seq_group = group
         block._tp_moe_boundary = True
@@ -801,8 +801,10 @@ def apply_tp(
     Llama, ...). Pass an explicit ``{path_pattern: ShardingConfig}`` to override
     it -- e.g. to leave a projection replicated or to use a different realizer.
     """
-    if mesh is None or cfg.tp <= 1:
+    if cfg.tp <= 1:
         return model
+    if mesh is None:
+        raise ValueError(f"tp={cfg.tp} requires a device mesh with a 'tp' axis")
 
     configured_plan: dict[str, str] = {}
     for pattern in getattr(cfg, "tp_colwise_modules", []):
@@ -854,8 +856,12 @@ def apply_tp(
         model, cfg, plan
     )
 
-    group = mesh["tp"].get_group()
     tp_size = mesh["tp"].size()
+    if tp_size != cfg.tp:
+        raise ValueError(
+            f"TP mesh size {tp_size} does not match configured tp={cfg.tp}"
+        )
+    group = mesh["tp"].get_group()
     tp_rank = mesh["tp"].get_local_rank()
     use_symm_mem = supports_symm_mem(mesh["tp"])
     if use_symm_mem:

@@ -311,3 +311,45 @@ def test_ignored_fsdp_module_excludes_its_descendants():
     assert "kept.0" in selected
     assert "ignored_extra" in selected
     assert ignored == set(model["ignored"].parameters())
+
+
+@pytest.mark.parametrize(
+    "policy, pp, expected",
+    [("never", 1, False), ("always", 2, True), ("default", 2, False)],
+)
+def test_fsdp_patterns_honor_runtime_policies(monkeypatch, policy, pp, expected):
+    from types import SimpleNamespace
+
+    from llmtuner.config import ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(nn.Linear(2, 2))
+    calls = []
+    scopes = []
+    cfg = ParallelConfig(
+        fsdp_apply_modules={"0": {}},
+        fsdp_reshard_after_forward=policy,
+        pipeline_parallel_size=pp,
+        fsdp_symm_mem_scope="dense",
+    )
+    cfg.enable_fsdp_symm_mem = True  # Exercise wiring without CUDA kernels.
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: lambda module, **kwargs: calls.append(kwargs)
+        ),
+    )
+    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda _: None)
+    monkeypatch.setattr(
+        apply, "enable_fsdp_symm_mem", lambda model, scope: scopes.append(scope)
+    )
+    plan.apply_fsdp_by_pattern(
+        model,
+        dp_mesh=object(),
+        cfg=cfg,
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+    )
+    assert all(call["reshard_after_forward"] is expected for call in calls)
+    assert scopes == ["dense"]

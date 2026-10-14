@@ -112,7 +112,8 @@ from .remat_regions import (
 logger = get_logger(__name__)
 
 # ``VALID_AC_MODES`` is declared next to the field it constrains
-# (``config/training.py``) and imported here. It stays in ``__all__`` as a
+# (``config/activation_checkpoint_config.py``) and imported here.
+# It stays in ``__all__`` as a
 # re-export so ``from llmtuner.memory.activation_checkpoint import
 # VALID_AC_MODES`` keeps working.
 __all__ = [

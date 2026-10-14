@@ -722,3 +722,64 @@ def test_a_tpu_name_must_start_with_tpu() -> None:
     """The verticals are matched with startswith, so a device that merely
     mentions a TPU version does not borrow its peak."""
     assert get_peak_flops("not a tpu v6e") == 0.0
+
+
+def test_logger_container_closes_every_sink_after_failure():
+    from types import SimpleNamespace
+
+    calls = []
+    original = OSError("writer close failed")
+
+    def fail():
+        calls.append("first")
+        raise original
+
+    container = LoggerContainer()
+    container.add_logger(SimpleNamespace(close=fail))
+    container.add_logger(SimpleNamespace(close=lambda: calls.append("second")))
+    with pytest.raises(OSError, match="writer close failed") as caught:
+        container.close()
+    assert caught.value is original
+    assert calls == ["first", "second"]
+    container.close()
+    assert calls == ["first", "second"]
+
+
+def test_metrics_releases_first_sink_when_second_sink_construction_fails(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+    monkeypatch.setattr(
+        metrics_module,
+        "WandBLogger",
+        lambda *args, **kwargs: SimpleNamespace(close=lambda: calls.append("wandb")),
+    )
+
+    def fail(*args, **kwargs):
+        raise ValueError("tensorboard initialization failed")
+
+    monkeypatch.setattr(metrics_module, "TensorBoardLogger", fail)
+    with pytest.raises(ValueError, match="tensorboard initialization failed"):
+        MetricsProcessor(
+            Config(enable_wandb=True, enable_tensorboard=True), parallel_dims=None
+        )
+    assert calls == ["wandb"]
+
+
+def test_metrics_releases_sinks_when_monitor_construction_fails(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+    monkeypatch.setattr(
+        MetricsProcessor,
+        "_build_metric_logger",
+        lambda *args, **kwargs: SimpleNamespace(close=lambda: calls.append("logger")),
+    )
+
+    def fail():
+        raise ValueError("monitor initialization failed")
+
+    monkeypatch.setattr(metrics_module, "build_device_memory_monitor", fail)
+    with pytest.raises(ValueError, match="monitor initialization failed"):
+        MetricsProcessor(Config(), parallel_dims=None)
+    assert calls == ["logger"]

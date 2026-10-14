@@ -78,6 +78,8 @@ class GroupedExperts(nn.Module):
         use_grouped_mm: bool | None = None,
     ) -> None:
         super().__init__()
+        if min(dim, hidden_dim, num_experts) < 1:
+            raise ValueError("dim, hidden_dim and num_experts must be positive")
         self.num_experts = num_experts
         self.hidden_dim = hidden_dim
         self.dim = dim
@@ -129,7 +131,7 @@ class GroupedExperts(nn.Module):
         * ``torch._grouped_mm`` -- one kernel for all experts, the shape
           torchtitan's MoE is written against, and the one taken whenever the op
           is available (``use_grouped_mm``) *and* the activations are already
-          bf16 or narrower.
+          bf16.
         * a per-expert loop of ``F.linear`` -- the fallback. It is the *same*
           arithmetic HF's own MoE does (v5's ``Qwen3MoeExperts.forward`` also
           loops with ``nn.functional.linear``), which is what makes a swapped-in
@@ -140,10 +142,10 @@ class GroupedExperts(nn.Module):
         on an fp32 or fp64 model the fused path would round every expert input
         and weight to 8 mantissa bits: measured 1.4e-1 relative error on fp32
         and 1.3e0 on fp64, silently, which is exactly the class of change a
-        numeric baseline cannot see. At or below bf16 the cast is the identity
-        or a widening, so there is nothing to lose.
+        numeric baseline cannot see. FP16 also has more mantissa bits than
+        BF16, so it uses the loop instead of losing precision in this cast.
         """
-        if self.use_grouped_mm and x_TD.dtype in (torch.bfloat16, torch.float16):
+        if self.use_grouped_mm and x_TD.dtype == torch.bfloat16:
             return torch._grouped_mm(
                 x_TD.bfloat16(),
                 weight_EOI.bfloat16().transpose(-2, -1),

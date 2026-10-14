@@ -387,11 +387,22 @@ class BaseCheckpointManager(ABC):
         """
         if not getattr(self, "_initialized", False):
             return
-        try:
-            self.maybe_wait_for_staging()
-            self.maybe_wait_for_saving()
-        finally:
-            self._close()
+        first_error: BaseException | None = None
+        for release in (
+            self.maybe_wait_for_staging,
+            self.maybe_wait_for_saving,
+            self._close,
+        ):
+            try:
+                release()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                else:
+                    logger.exception("Additional checkpoint cleanup failure")
+        self._initialized = False
+        if first_error is not None:
+            raise first_error
 
     def maybe_wait_for_saving(self) -> None:
         """Block until the last asynchronous save completes.

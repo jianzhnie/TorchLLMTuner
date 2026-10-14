@@ -1,6 +1,6 @@
 """Tensor parallelism public API.
 
-``tensor_parallel.py`` is the entry and plan engine; ``linear.py`` contains
+``tensor_parallel.py`` is the entry and plan engine; ``linear_ops.py`` contains
 the fused collective/GEMM primitives it realizes plans into.
 """
 

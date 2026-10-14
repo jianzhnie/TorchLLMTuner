@@ -66,6 +66,9 @@ class RandomTokenSource:
     def __init__(
         self, *, seed: int, vocab_size: int, batch_size: int, seq_len: int
     ) -> None:
+        require_positive("vocab_size", vocab_size)
+        require_positive("batch_size", batch_size)
+        require_positive("seq_len", seq_len)
         self.seed = seed
         self.vocab_size = vocab_size
         self.batch_size = batch_size

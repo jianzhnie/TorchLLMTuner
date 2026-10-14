@@ -75,7 +75,7 @@ logger = get_logger(__name__)
 
 def parse_config() -> LLMTunerConfig:
     # ``PARSER_GROUPS`` is the parser's group set and order (see
-    # ``config/cli.py``, which also explains the views ``cli_groups`` builds:
+    # ``config/cli_config.py``, which also explains the views ``cli_groups`` builds:
     # they hide the fields the CLI cannot carry). Parsing returns one instance
     # per view, in that order, so the two tuples zip; the instances are
     # subclasses of the groups, which is how they are keyed below.
@@ -99,6 +99,16 @@ def parse_config() -> LLMTunerConfig:
 
 def main() -> None:
     cfg = parse_config()
+    if cfg.checkpoint.create_seed_checkpoint:
+        if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+            raise ConfigError(
+                "Must create a seed checkpoint using a single device, to "
+                "disable sharding."
+            )
+        if not cfg.checkpoint.enable:
+            raise ConfigError(
+                "Must enable checkpointing when creating a seed checkpoint."
+            )
     trainer = None
     try:
         trainer = Trainer(cfg)
@@ -107,15 +117,6 @@ def main() -> None:
             # step-0 model, so it must be written from a single process (any
             # sharding would bake one rank's shard layout into the artifact), and
             # loading treats step-0 as model-only (see ``checkpointer/base.py``).
-            if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-                raise ConfigError(
-                    "Must create a seed checkpoint using a single device, to "
-                    "disable sharding."
-                )
-            if not cfg.checkpoint.enable:
-                raise ConfigError(
-                    "Must enable checkpointing when creating a seed checkpoint."
-                )
             if trainer.checkpointer.save(curr_step=0, last_step=True):
                 print("Created seed checkpoint at step 0")
         else:
@@ -135,8 +136,16 @@ def main() -> None:
                 raise
             logger.exception("Resource cleanup failed after an entry-point error")
         finally:
-            if dist.is_initialized():
-                dist.destroy_process_group()
+            cleanup_error = sys.exc_info()[1]
+            try:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            except Exception:
+                if training_error is None and cleanup_error is None:
+                    raise
+                logger.exception(
+                    "Process-group cleanup failed after an entry-point error"
+                )
 
 
 if __name__ == "__main__":

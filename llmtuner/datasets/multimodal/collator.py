@@ -125,6 +125,7 @@ class MultimodalCollator(Collator):
                 for sample in batch
             ]
         )
+        labels.masked_fill_(padding_mask, IGNORE_INDEX)
         pad_len = self._num_tokens_per_batch - input_ids.shape[0]
         if pad_len < 0:
             raise ValueError("multimodal rows exceed the configured token batch")

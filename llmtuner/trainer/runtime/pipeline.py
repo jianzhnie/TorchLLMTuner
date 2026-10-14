@@ -26,9 +26,16 @@ def split_pipeline_microbatches(
     """Split whole rows for PP without cutting packed document boundaries."""
     labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
     num_microbatches = trainer.cfg.parallel.num_pp_microbatches
+    if isinstance(batch, dict) and labels.ndim == 1 and num_microbatches > 1:
+        compatibility.pp_packed_microbatch_split(num_microbatches)
+    if num_microbatches < 1 or labels.shape[0] % num_microbatches != 0:
+        raise ValueError(
+            "Pipeline batch rows must be divisible by num_pp_microbatches: "
+            f"got {labels.shape[0]} rows and {num_microbatches} microbatches"
+        )
+    if labels.shape[0] == 0:
+        raise ValueError("Pipeline batches must contain at least one row")
     if isinstance(batch, dict):
-        if labels.ndim == 1 and num_microbatches > 1:
-            compatibility.pp_packed_microbatch_split(num_microbatches)
         rows_per_microbatch = labels.shape[0] // num_microbatches
         microbatches = []
         for index in range(num_microbatches):

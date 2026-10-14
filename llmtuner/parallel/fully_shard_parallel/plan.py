@@ -88,6 +88,13 @@ def apply_fsdp_by_pattern(
 ) -> None:
     """Apply independently configured FSDP units selected by module patterns."""
     named, selected, ignored_params = _resolve_pattern_units(model, cfg)
+    # The entry module imports this plan; defer runtime-policy imports.
+    from .fully_shard_parallel import (
+        disable_fsdp_gradient_division,
+        enable_fsdp_symm_mem,
+        get_fsdp_reshard_after_forward_policy,
+    )
+
     shard_fn = get_fsdp_strategy(cfg.fsdp_implementation).get_fully_shard_fn()
     common: dict[str, Any] = {
         "mesh": dp_mesh,
@@ -97,6 +104,9 @@ def apply_fsdp_by_pattern(
             cast_forward_inputs=False,
         ),
         "ignored_params": ignored_params,
+        "reshard_after_forward": get_fsdp_reshard_after_forward_policy(
+            cfg.fsdp_reshard_after_forward, cfg.pp > 1
+        ),
     }
     if cfg.fsdp_cpu_offload:
         common["offload_policy"] = CPUOffloadPolicy(
@@ -112,10 +122,9 @@ def apply_fsdp_by_pattern(
         backward_count=cfg.fsdp_backward_prefetch_count,
     )
 
-    # Local import avoids a module cycle: the entry module owns FSDP runtime
-    # policies, while this module owns plan resolution.
-    from .fully_shard_parallel import disable_fsdp_gradient_division
-
+    enable_fsdp_symm_mem(
+        model, cfg.fsdp_symm_mem_scope if cfg.enable_fsdp_symm_mem else None
+    )
     disable_fsdp_gradient_division(model)
 
 

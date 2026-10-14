@@ -360,3 +360,21 @@ def test_explicit_tp_pattern_overrides_default_wildcard(monkeypatch):
     )
     assert isinstance(model[0], RowParallelLinear)
     assert model[0].weight.shape == (4, 2)
+
+
+def test_apply_tp_rejects_missing_mesh_when_enabled():
+    with pytest.raises(ValueError, match="requires a device mesh"):
+        apply_tp(nn.Linear(4, 4), None, ParallelConfig(tensor_parallel_size=2))
+
+
+def test_apply_tp_rejects_mesh_degree_mismatch_before_mutation():
+    from types import SimpleNamespace
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False))
+    original = model[0]
+    mesh = {"tp": SimpleNamespace(size=lambda: 4)}
+    with pytest.raises(ValueError, match="does not match configured"):
+        apply_tp(
+            model, mesh, ParallelConfig(tensor_parallel_size=2), plan={"0": "colwise"}
+        )
+    assert model[0] is original
