@@ -48,6 +48,8 @@ from llmtuner.models.common.attention.masks import (
     get_causal_mask_mod,
 )
 
+from ..model_compile import maybe_regional_inductor
+
 __all__ = ["CPFlexKernel", "DualCPFlexKernel"]
 
 # q/k/v arrive HF-shaped: (batch, heads, seq, dim). The sequence axis the CP
@@ -150,7 +152,10 @@ def run_flex(module, q, k, v, block_mask, kwargs) -> torch.Tensor:
             flex_attention_forward,
         )
 
-        out, _ = flex_attention_forward(module, q, k, v, block_mask, **kwargs)
+        with maybe_regional_inductor(
+            {}, enabled=getattr(module, "_regional_inductor_enabled", False)
+        ):
+            out, _ = flex_attention_forward(module, q, k, v, block_mask, **kwargs)
         return out.transpose(1, 2)
     reject_unrepresentable_attention_kwargs(kwargs)
     from torch.nn.attention.flex_attention import flex_attention

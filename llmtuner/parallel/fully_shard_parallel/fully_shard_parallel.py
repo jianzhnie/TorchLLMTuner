@@ -8,7 +8,7 @@ per-module wrap policy (MoE blocks get the sparse treatment by their
 ``moe_enabled`` flag).
 """
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
@@ -167,6 +167,35 @@ def fsdp_shard_size(dp_mesh: DeviceMesh) -> int:
     if "dp_replicate" in (dp_mesh.mesh_dim_names or ()):
         degree //= dp_mesh["dp_replicate"].size()
     return degree
+
+
+def build_fsdp_placement_fn(
+    expert_placements: dict[nn.Parameter, Shard],
+    *,
+    dp_mesh: DeviceMesh,
+    edp_mesh: DeviceMesh,
+) -> Callable[[nn.Parameter], Any]:
+    """Keep EP-owned parameters on their sparse FSDP mesh inside any unit."""
+    from torch.distributed.fsdp._fully_shard._fsdp_common import (
+        FSDPMeshInfo,
+        ShardPlacementResult,
+    )
+    from torch.distributed.fsdp._fully_shard._fsdp_init import _get_mesh_info
+
+    edp_mesh_info = _get_mesh_info(edp_mesh, None)
+    dp_mesh_info = _get_mesh_info(dp_mesh, None)
+    assert isinstance(edp_mesh_info, FSDPMeshInfo)
+    assert isinstance(dp_mesh_info, FSDPMeshInfo)
+
+    def placement(param: nn.Parameter) -> ShardPlacementResult:
+        expert_placement = expert_placements.get(param)
+        if expert_placement is not None:
+            return ShardPlacementResult(
+                placement=expert_placement, mesh_info=edp_mesh_info
+            )
+        return ShardPlacementResult(placement=Shard(0), mesh_info=dp_mesh_info)
+
+    return placement
 
 
 def enable_fsdp_symm_mem(model: nn.Module, scope: str | None = "all") -> None:
@@ -397,46 +426,18 @@ def apply_fsdp_to_decoder(
                 )
             else:
                 # ep_degree > 1: per-param mesh
-                from torch.distributed.fsdp._fully_shard._fsdp_common import (
-                    FSDPMeshInfo,
-                    ShardPlacementResult,
-                )
-                from torch.distributed.fsdp._fully_shard._fsdp_init import (
-                    _get_mesh_info,
-                )
-
                 assert edp_mesh is not None
-
-                # Delegate to FSDP2's mesh-info builder; with ``None`` mesh
-                # dims it reads the DP submesh straight off the mesh passed in.
-                edp_mesh_info = _get_mesh_info(edp_mesh, None)
-                dp_mesh_info = _get_mesh_info(dp_mesh, None)
-                # _get_mesh_info is typed to the DataParallelMeshInfo base; with
-                # a shard dim it always yields FSDPMeshInfo/HSDPMeshInfo.
-                assert isinstance(edp_mesh_info, FSDPMeshInfo)
-                assert isinstance(dp_mesh_info, FSDPMeshInfo)
-
-                def _shard_placement_fn(
-                    param: nn.Parameter,
-                    _expert_params: set = expert_params,
-                    _expert_placement: Shard = expert_shard_placement,
-                    _edp_mesh_info: FSDPMeshInfo = edp_mesh_info,
-                    _dp_mesh_info: FSDPMeshInfo = dp_mesh_info,
-                ) -> ShardPlacementResult:
-                    if param in _expert_params:
-                        return ShardPlacementResult(
-                            placement=_expert_placement, mesh_info=_edp_mesh_info
-                        )
-                    else:
-                        return ShardPlacementResult(
-                            placement=Shard(0), mesh_info=_dp_mesh_info
-                        )
+                placement_fn = build_fsdp_placement_fn(
+                    dict.fromkeys(expert_params, expert_shard_placement),
+                    dp_mesh=dp_mesh,
+                    edp_mesh=edp_mesh,
+                )
 
                 shard_fn(
                     transformer_block,
                     **fsdp_config,
                     reshard_after_forward=reshard_after_forward,
-                    shard_placement_fn=_shard_placement_fn,
+                    shard_placement_fn=placement_fn,
                 )
         else:
             shard_fn(
@@ -563,6 +564,7 @@ def apply_fsdp(
             cfg=cfg,
             param_dtype=param_dtype,
             reduce_dtype=reduce_dtype,
+            edp_mesh=edp_mesh,
         )
         if distributed.is_distributed() and distributed.get_backend() != "nccl":
             force_sum_grad_reduction(model)

@@ -805,3 +805,110 @@ def test_remote_image_rejects_http_errors_before_decoding(monkeypatch):
     with pytest.raises(requests.HTTPError, match="404"):
         image_module.decode_image("https://example.invalid/image.png")
     assert calls == ["closed"]
+
+
+@pytest.mark.parametrize("frames", [1, 2, 3, 5])
+@pytest.mark.parametrize("merge_size", [1, 2])
+def test_vision_token_count_matches_extracted_patches(frames, merge_size):
+    image = torch.zeros(frames, 32, 48, 3)
+    patches, grid = vision_to_patches(image, 8, 2, merge_size)
+    total, columns, rows = calculate_vision_tokens(frames, 32, 48, 8, merge_size, 2)
+    assert total == patches.shape[0] // merge_size**2
+    assert columns == int(grid[2]) // merge_size
+    assert rows == int(grid[1]) // merge_size
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "num_frames",
+        "height",
+        "width",
+        "patch_size",
+        "spatial_merge_size",
+        "temporal_patch_size",
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1])
+def test_vision_token_count_rejects_nonpositive_geometry(field, value):
+    geometry = dict(
+        num_frames=1,
+        height=32,
+        width=32,
+        patch_size=16,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+    )
+    geometry[field] = value
+    with pytest.raises(ValueError, match="must be positive"):
+        calculate_vision_tokens(**geometry)
+
+
+def test_vision_token_count_rejects_partial_merge_grid():
+    with pytest.raises(ValueError, match="must be divisible"):
+        calculate_vision_tokens(1, 48, 32, 16, 2, 2)
+    with pytest.raises(ValueError, match="must be divisible"):
+        vision_to_patches(torch.zeros(1, 48, 32, 3), 16, 2, 2)
+
+
+@pytest.mark.parametrize(
+    "shape", [(0, 32, 32, 3), (1, 0, 32, 3), (1, 32, 32, 0), (32, 32, 3)]
+)
+def test_vision_to_patches_rejects_empty_or_wrong_rank_tensors(shape):
+    with pytest.raises(ValueError, match="nonempty"):
+        vision_to_patches(torch.zeros(shape), 16, 2, 2)
+
+
+def test_raster_patches_do_not_require_block_merge_divisibility():
+    patches, grid = vision_to_patches(
+        torch.zeros(1, 48, 32, 3), 16, 2, 2, patch_order="raster"
+    )
+    assert grid.tolist() == [1, 3, 2]
+    assert patches.shape[0] == 6
+
+
+@pytest.mark.parametrize(
+    "field", ["patch_size", "temporal_patch_size", "spatial_merge_size"]
+)
+def test_multimodal_constructors_reject_zero_patch_sizes(mm_tokenizer, field):
+    with pytest.raises(ValueError, match="patch sizes must be positive"):
+        _collator(mm_tokenizer, **{field: 0})
+    with pytest.raises(ValueError, match="patch sizes must be positive"):
+        MultimodalProcessor(
+            context=make_context(mm_tokenizer),
+            sample_processor=process_cc12_wd_sample,
+            **{field: 0},
+        )
+
+
+@pytest.mark.parametrize(
+    "resize_fn, budgets",
+    [
+        (resize_to_pixel_budget, dict(min_pixels=1024, max_pixels=4096)),
+        (resize_to_navit_patch_grid, dict(max_patches=16, max_patches_per_side=8)),
+    ],
+)
+def test_resize_rejects_empty_dimensions_before_division(resize_fn, budgets):
+    with pytest.raises(ValueError, match="must be positive"):
+        resize_fn(0, 32, patch_size=16, merge_size=2, **budgets)
+
+
+@pytest.mark.parametrize("height, width", [(32, 6144), (6144, 32), (32, 64)])
+@pytest.mark.parametrize(
+    "min_pixels, max_pixels", [(65536, 65536), (3000, 4096), (1100, 2048)]
+)
+def test_smart_resize_respects_tight_budgets_and_narrow_aspect_ratios(
+    height, width, min_pixels, max_pixels
+):
+    h, w = smart_resize(height, width, 32, min_pixels, max_pixels)
+    assert h % 32 == 0 and w % 32 == 0
+    assert min_pixels <= h * w <= max_pixels
+
+
+def test_smart_resize_rejects_budgets_with_no_feasible_grid():
+    with pytest.raises(ValueError, match="no factor-aligned patch grid"):
+        smart_resize(32, 64, 32, 1100, 1200)
+
+
+def test_smart_resize_preserves_upstream_result_when_already_in_budget():
+    assert smart_resize(100, 200, 32, 1024, 100000000) == (96, 192)

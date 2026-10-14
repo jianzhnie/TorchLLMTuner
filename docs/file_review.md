@@ -307,3 +307,46 @@ symmetric memory 与真实 torch_checkpointing round-trip 未执行。
 提交前补充修正 tests/unit_tests/cpu/parallel/test_model_compile.py 的旧模块导入，
 恢复此前被导入异常错误跳过的运行时测试。编译模块定向测试 12 passed、2 skipped；
 最新全量测试 1244 passed、3 skipped。pre-commit、compileall 和 diff 检查通过。
+
+
+### 逐文件阅读后的跨模块复查
+
+本轮源码仍为 149 个文件，已阅读 149/149。继续修正 model_compile 的全局
+regional inductor 状态与 CP 标注遗漏；核对 image token 数、patch 提取与 resize
+的几何和预算契约。新增不同模型编译配置隔离、真实 CPU 编译前向/梯度、完整
+视觉网格与紧预算回归。详情及上游差异见 code_review.md 最新章节。
+
+已执行六个真实 CPU/Gloo 集成脚本：tp_equivalence、ep_equivalence、
+tp_fsdp_equivalence、ep_fsdp_equivalence、pp_equivalence、cp_ulysses_equivalence。
+全部通过；Ulysses 旧异常类型断言修正后重跑。显式 loopback 命令格式：
+`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=N
+--master-addr=127.0.0.1 --master-port=PORT tests/integration_tests/NAME.py`。
+TP/EP/FSDP/PP 使用脚本自身的 loss、梯度或多步参数参考；CP 完整模型仅前向，
+all-to-all 自身另有反向与 round-trip。GPU/NPU、KCP、torchao 和真实
+regional inductor 设备内核尚未验证。
+
+
+补充 EP×pattern FSDP 数值回归：增加 ep_fsdp_equivalence.py 的
+`--pattern-fsdp` 模式（实际路径模式 `model.model.layers.{*}`）。修复前专家权重
+落在 size=4 dense mesh，loss 311.819031 对参考 311.874283，专家梯度出现
+0.14～0.20 量级误差；修复后专家位于 size=2 sparse mesh，loss 311.874268，
+所有路由及专家梯度通过 1e-4 容差。普通与 pattern 路径共用参数级 mesh 分配，
+各 unit 的 mesh 和 shard_placement_fn 显式 override 仍优先；缺少 sparse mesh
+在变换前拒绝。参考 torchtitan/distributed/fsdp.py 的专家 placement 语义。
+复现日志为 /tmp/llmtuner-review-ep-pattern-fsdp-before.log，修复后日志为
+/tmp/llmtuner-review-ep-pattern-fsdp-after.log；日志不是仓库提交文件。
+
+普通 EP×FSDP 回归重跑通过。优化器能力探测按生产参数名 group 契约修正，
+恢复执行被误跳过的 20 项测试，全部通过。源码清单与磁盘集合核对：149/149，
+缺失文件 0、已删除但仍列出的文件 0。
+
+本阶段最终全量测试：1311 passed、2 skipped；pre-commit --all-files、
+compileall、git diff HEAD --check 均通过。六项基础集成及 EP×pattern FSDP
+集成通过，普通 EP×FSDP 重跑通过；本阶段验证结果如上，提交与推送状态以 Git 历史为准。
+
+
+补充 FSDP prefetch 重配修复：每次更新都写入 forward/backward 目标列表，
+包括空列表，避免窗口设为零或执行顺序改变后残留旧目标。空 backward 列表
+恢复 PyTorch 默认预取，不能视为禁用全部预取。窗口反转、边界清空与零窗口
+回归通过；四进程 CPU/Gloo EP×pattern FSDP 重跑通过。最新全量 CPU 测试
+1311 passed、2 skipped。GPU/NPU 内核与完整 CP backward 尚未验证。

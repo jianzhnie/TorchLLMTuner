@@ -67,8 +67,10 @@ def _torch_param_names() -> bool:
         return False
     import torch
 
-    opt = torch.optim.Adam([torch.nn.Parameter(torch.zeros(1))])
-    return "param_names" in opt.state_dict()["param_groups"][0]
+    opt = torch.optim.Adam(
+        [{"params": [torch.nn.Parameter(torch.zeros(1))], "param_names": ["weight"]}]
+    )
+    return opt.state_dict()["param_groups"][0].get("param_names") == ["weight"]
 
 
 # name -> probe. The name is what the marker and the skip reason print.

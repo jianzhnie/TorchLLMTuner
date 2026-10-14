@@ -20,7 +20,9 @@ def flex_attention_adapter(module, query, key, value, attention_mask, **kwargs):
     """Adapt the Hugging Face attention interface to llmtuner flex kernels."""
     kernel = getattr(module, "_titan_flex_kernel", None)
     if kernel is None:
-        with maybe_regional_inductor({}):
+        with maybe_regional_inductor(
+            {}, enabled=getattr(module, "_regional_inductor_enabled", False)
+        ):
             return flex_attention_forward(
                 module, query, key, value, attention_mask, **kwargs
             )

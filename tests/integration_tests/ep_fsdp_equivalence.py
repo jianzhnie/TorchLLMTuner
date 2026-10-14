@@ -5,6 +5,9 @@ Run under torchrun with 4 ranks (from the repo root):
     PYTHONPATH=. torchrun --nproc_per_node=4 \
         tests/integration_tests/ep_fsdp_equivalence.py
 
+Add ``--pattern-fsdp`` to exercise pattern-selected FSDP units with the same
+expert mesh, loss, and gradient checks.
+
 Regression pin for the missing ``moe_enabled``/``moe`` flags on the EP swap:
 without them, FSDP's MoE branch never fires and the expert weights -- each
 rank holding a DIFFERENT slice of the experts -- are sharded as dense
@@ -25,6 +28,8 @@ assignment is exactly what the missing flags broke.
 """
 
 from __future__ import annotations
+
+import argparse
 
 import torch
 import torch.distributed as dist
@@ -101,12 +106,19 @@ def _full(t: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pattern-fsdp", action="store_true")
+    args = parser.parse_args()
     dist.init_process_group("gloo")
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 4, f"this check assumes 4 ranks, got {world}"
 
-    cfg = ParallelConfig(data_parallel_shard_size=4, expert_parallel_size=2)
+    cfg = ParallelConfig(
+        data_parallel_shard_size=4,
+        expert_parallel_size=2,
+        fsdp_apply_modules={"model.model.layers.{*}": {}} if args.pattern_fsdp else {},
+    )
     parallel_dims = ParallelTopology.from_config(cfg, world)
     parallel_dims.build_mesh()
     loss_mesh = parallel_dims.get_mesh("loss")

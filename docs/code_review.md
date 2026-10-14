@@ -1,8 +1,7 @@
 # llmtuner 全局代码审查
 
 本报告记录本轮与上一轮连续审查的结果。静态语法与 Ruff 检查覆盖
-`llmtuner` 当前全部 149 个 Python 文件；此前逐文件审查覆盖 148 个文件，
-合并 HF 输入薄封装并新增独立存储模块后，更新后的清单见
+`llmtuner` 当前全部 149 个 Python 文件；本轮逐文件阅读覆盖全部 149 个文件，最新清单见
 [file_review.md](file_review.md)，检查训练调用链、参数转换、恢复状态和异常清理路径。静态检查与 CPU 回归测试不能替代多设备数值等价测试，
 本报告不将未运行的硬件组合记为已验证。
 
@@ -182,3 +181,49 @@ HF/Tokenizer 继续复查：已阅读 models/hf/model_setup.py、factory.py、fl
 提交前补充修正 tests/unit_tests/cpu/parallel/test_model_compile.py 的旧模块导入，
 恢复此前被导入异常错误跳过的运行时测试。编译模块定向测试 12 passed、2 skipped；
 最新全量测试 1244 passed、3 skipped。pre-commit、compileall 和 diff 检查通过。
+
+
+## 跨模块复查：编译配置、视觉网格与真实通信
+
+- 复现 regional inductor 进程全局开关泄漏：模型 A 选择 flex/aot_eager 后，
+  模型 B 选择 inductor 仍读取开启状态。改为在各模型模块上保存设置，HF attention
+  adapter 显式读取；CP 路径只标注 flex 计算，不把通信包入该区域。
+  两模型隔离回归与 CP 标注回归通过；CPU aot_eager 的整模型和分块编译实际前向、
+  全参数梯度均与 eager 一致。真实 CUDA regional inductor 尚未执行。
+- 多模态 token 估计拒绝非完整 merge 网格；patch 提取检查空张量、维度、正大小
+  与空间整除。raster 仍只要求 raw patch 整除，允许不按 block merge 对齐。
+  构造阶段拒绝零 patch 大小；图像 resize 在除法前校验几何。
+- 复现 smart_resize 在窄长图像上超过像素预算：32×6144、factor=32、预算
+  65536 曾输出 32×3520=112640。上游算法的合法结果保持不变，仅越界时搜索
+  可行整数网格；预算中没有任何 factor 对齐网格时明确拒绝。这是相对 torchtitan
+  hf_datasets/multimodal/utils/image.py 的有意修正。多模态定向测试 98 passed。
+- 真实 CPU/Gloo：TP、EP、TP×FSDP、EP×FSDP、PP、Ulysses CP 六个集成脚本通过。
+  Ulysses 脚本旧断言期待 ValueError，更新为现有 UnsupportedCombinationError
+  后重跑通过，未修改生产错误类型。CP 此处只验证完整模型前向与 all-to-all
+  自身反向，不声称完整 flex attention backward 已通过。
+
+
+补充 EP×pattern FSDP 数值回归：增加 ep_fsdp_equivalence.py 的
+`--pattern-fsdp` 模式（实际路径模式 `model.model.layers.{*}`）。修复前专家权重
+落在 size=4 dense mesh，loss 311.819031 对参考 311.874283，专家梯度出现
+0.14～0.20 量级误差；修复后专家位于 size=2 sparse mesh，loss 311.874268，
+所有路由及专家梯度通过 1e-4 容差。普通与 pattern 路径共用参数级 mesh 分配，
+各 unit 的 mesh 和 shard_placement_fn 显式 override 仍优先；缺少 sparse mesh
+在变换前拒绝。参考 torchtitan/distributed/fsdp.py 的专家 placement 语义。
+复现日志为 /tmp/llmtuner-review-ep-pattern-fsdp-before.log，修复后日志为
+/tmp/llmtuner-review-ep-pattern-fsdp-after.log；日志不是仓库提交文件。
+
+普通 EP×FSDP 在复用 placement 逻辑后重跑通过。修正 tests/caps.py 的
+optimizer param_names 能力探测，使用与生产代码一致的显式参数名 group；此前
+错误要求 PyTorch 自动生成名称导致整组跳过，恢复后 20 项优化器测试通过。
+
+本阶段最终全量测试：1311 passed、2 skipped；pre-commit --all-files、
+compileall、git diff HEAD --check 均通过。六项基础集成及 EP×pattern FSDP
+集成通过，普通 EP×FSDP 重跑通过；本阶段验证结果如上，提交与推送状态以 Git 历史为准。
+
+
+补充 FSDP prefetch 重配修复：每次更新都写入 forward/backward 目标列表，
+包括空列表，避免窗口设为零或执行顺序改变后残留旧目标。空 backward 列表
+恢复 PyTorch 默认预取，不能视为禁用全部预取。窗口反转、边界清空与零窗口
+回归通过；四进程 CPU/Gloo EP×pattern FSDP 重跑通过。最新全量 CPU 测试
+1311 passed、2 skipped。GPU/NPU 内核与完整 CP backward 尚未验证。

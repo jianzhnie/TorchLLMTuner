@@ -305,6 +305,8 @@ class MultimodalProcessor(SampleProcessor):
         video_min_frames: int = 4,
         video_max_frames: int = 768,
     ) -> None:
+        if min(patch_size, temporal_patch_size, spatial_merge_size) < 1:
+            raise ValueError("multimodal patch sizes must be positive")
         self._sample_processor = sample_processor
         self._tokenizer = context.tokenizer
         self._max_context_length = context.max_context_length
