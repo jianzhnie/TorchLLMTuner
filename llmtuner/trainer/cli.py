@@ -1,94 +1,67 @@
-"""Console entry point: parse the config groups and run the Trainer.
+"""Parse flat configuration flags and run training or seed checkpoint export.
 
-Deciding which group a config belongs to
+HfArgumentParser receives the scalar views defined in config/cli_config.py.
+Each group validates its fields; LLMTunerConfig.from_groups assembles them into
+one run configuration. This entry point accepts flags, with no implicit args
+file or config-file channel.
 
-HfArgumentParser is given the config GROUPS (not the composed config), so each
-field becomes a clean flat CLI flag (--steps, --data_parallel_shard_size,
---learning_rate, --dump_folder, ...) and each group runs its own __post_init__
-validation. The nine groups live in ``llmtuner.config`` and are composed into the
-single LLMTunerConfig by ``LLMTunerConfig.from_groups``, which owns the
-graft table (which nested group lands on which top-level group).
+The console owns the process-group lifetime. It closes the trainer and destroys
+the group on exit, preserving the original error if cleanup also fails.
 
-Flags are the whole input: this entry point takes no config file.
-``HfArgumentParser`` does expose ``parse_json_file`` / ``parse_yaml_file``, but
-as methods that replace argv rather than as something an argv path can select,
-so wiring them would be a second input channel with its own precedence rules
-(upstream instead names a config-registry function, ``--module`` /
-``--config``). Until that exists, the flags are it.
-
-Grafting happens after parsing, so a nested config's fields still reach the user
-as bare flags: --enable, --interval, --log_freq, --dataset, --profile_freq.
-HfArgumentParser has no way to prefix one group's fields, and llmtuner's top-level
-groups are flat too (--tensor_parallel_size, --learning_rate).
-
-Single process (step 0):
+Examples:
     python -m llmtuner --steps 20
-    # or, after `pip install -e .`:  llmtuner-train --steps 20
-
-Data parallel, 2 ranks (step 1):
     torchrun --nproc_per_node=2 -m llmtuner --data_parallel_shard_size -1
-
-Checkpointing (disabled unless --enable is passed):
     python -m llmtuner --steps 20 --enable --interval 10 --dump_folder ./outputs
-
-Metrics (stdout always; TensorBoard and WandB are opt-in):
     python -m llmtuner --steps 20 --enable_tensorboard
-    python -m llmtuner --steps 20 --enable_wandb --tag baseline
-
-Data (synthetic random tokens unless a corpus is named):
-    python -m llmtuner --steps 20 --dataset local_jsonl \
+    python -m llmtuner --steps 20 --dataset local_jsonl \\
         --dataset_path ./corpus.jsonl --tokenizer_path ./tokenizer
-
-Profiling (off unless enabled; both write under --dump_folder):
     python -m llmtuner --steps 20 --enable_profiling --profile_freq 4
-    python -m llmtuner --steps 20 --enable_memory_snapshot --memory_snapshot_freq 5
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Sequence
 
 import torch.distributed as dist
 from transformers import HfArgumentParser
 
-from llmtuner.config import (
-    CheckpointConfig,
-    DataloaderConfig,
-    LLMTunerConfig,
-    LRSchedulerConfig,
-    MetricsConfig,
-    ModelConfig,
-    OptimizerConfig,
-    ParallelConfig,
-    ProfilerConfig,
-    TrainingConfig,
-)
-from llmtuner.config.cli_config import PARSER_GROUPS, cli_groups
+from llmtuner.config.checkpoint_config import CheckpointConfig
+from llmtuner.config.cli_config import PARSER_GROUPS, cli_view
+from llmtuner.config.data_config import DataloaderConfig
+from llmtuner.config.llmtuner_config import LLMTunerConfig
+from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
+from llmtuner.config.model_config import ModelConfig
+from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
+from llmtuner.config.optimizer_config import OptimizerConfig
+from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.config.training_config import TrainingConfig
 from llmtuner.errors import ConfigError
 from llmtuner.utils.logging import get_logger
-
-from .trainer import Trainer
 
 logger = get_logger(__name__)
 
 
-def parse_config() -> LLMTunerConfig:
+def parse_config(args: Sequence[str] | None = None) -> LLMTunerConfig:
+    """Parse explicit flags, or the process argv when args is omitted."""
     # ``PARSER_GROUPS`` is the parser's group set and order (see
-    # ``config/cli_config.py``, which also explains the views ``cli_groups`` builds:
+    # ``config/cli_config.py``, which also explains the views ``cli_view`` builds:
     # they hide the fields the CLI cannot carry). Parsing returns one instance
     # per view, in that order, so the two tuples zip; the instances are
     # subclasses of the groups, which is how they are keyed below.
-    parser = HfArgumentParser(list(cli_groups(PARSER_GROUPS)))
+    parser = HfArgumentParser([cli_view(group) for group in PARSER_GROUPS])
     # Each group is its own parser group, so every scalar field becomes a flag.
     parsed = dict(
         zip(
             PARSER_GROUPS,
-            parser.parse_args_into_dataclasses(look_for_args_file=False),
+            parser.parse_args_into_dataclasses(
+                args=None if args is None else list(args), look_for_args_file=False
+            ),
             strict=True,
         )
     )
-    cfg = LLMTunerConfig.from_groups(
+    return LLMTunerConfig.from_groups(
         model=parsed[ModelConfig],
         parallel=parsed[ParallelConfig],
         optimizer=parsed[OptimizerConfig],
@@ -99,14 +72,17 @@ def parse_config() -> LLMTunerConfig:
         metrics=parsed[MetricsConfig],
         profiler=parsed[ProfilerConfig],
     )
-    cfg.auto_fill_model()  # pull arch from a HF hub id when given one (no-op offline)
-    return cfg
 
 
 def main() -> None:
     cfg = parse_config()
     if cfg.checkpoint.create_seed_checkpoint:
-        if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        world_size = (
+            dist.get_world_size()
+            if dist.is_initialized()
+            else int(os.environ.get("WORLD_SIZE", "1"))
+        )
+        if world_size != 1:
             raise ConfigError(
                 "Must create a seed checkpoint using a single device, to "
                 "disable sharding."
@@ -117,6 +93,8 @@ def main() -> None:
             )
     trainer = None
     try:
+        from .trainer import Trainer
+
         trainer = Trainer(cfg)
         if cfg.checkpoint.create_seed_checkpoint:
             # Mirrors torchtitan ``train.py``: a seed checkpoint is the unsharded
