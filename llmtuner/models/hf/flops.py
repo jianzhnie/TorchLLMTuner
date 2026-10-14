@@ -2,8 +2,8 @@
 
 One node of the ``hf`` package. The arithmetic is pure -- it reads an HF config
 and returns a number -- which is why it lives apart from ``factory.py``, whose
-job is building things. ``num_flops_per_token`` (the entry point the trainer
-calls) stays there because it needs the resolved config; it delegates here.
+job is building things. Trainer runtime assembly passes its already resolved
+text config to ``flops_per_token``; estimating throughput never rebuilds it.
 
 The convention, matching torchtitan's (``models/utils.py`` plus the HF
 backend's ``get_nparams_and_flops``), is documented on :func:`flops_per_token`.
@@ -38,6 +38,17 @@ def quadratic_attention_flops_per_token(
     there; causal sparsity and the recomputed backward pass are not discounted,
     exactly as upstream.
     """
+    if isinstance(seq_len, bool) or not isinstance(seq_len, int) or seq_len < 0:
+        raise ValueError(f"seq_len must be a non-negative integer, got {seq_len!r}")
+    if sliding_window_size is not None and (
+        isinstance(sliding_window_size, bool)
+        or not isinstance(sliding_window_size, int)
+        or sliding_window_size <= 0
+    ):
+        raise ValueError(
+            "sliding_window_size must be a positive integer or None, "
+            f"got {sliding_window_size!r}"
+        )
     attended_tokens = (
         seq_len if sliding_window_size is None else min(seq_len, sliding_window_size)
     )
@@ -96,15 +107,21 @@ def flops_per_token(arch: PretrainedConfig, *, seq_len: int) -> int:
     friends, whose projections a per-family or model-based count would have to
     supply).
     """
+    if isinstance(seq_len, bool) or not isinstance(seq_len, int) or seq_len < 0:
+        raise ValueError(f"seq_len must be a non-negative integer, got {seq_len!r}")
+
     hidden = int_attr(arch, "hidden_size")
     num_layers = int_attr(arch, "num_hidden_layers")
     vocab_size = int_attr(arch, "vocab_size")
     num_heads = int_attr(arch, "num_attention_heads")
-    if None in (hidden, num_layers, vocab_size, num_heads):
+    if any(
+        value is None or value <= 0
+        for value in (hidden, num_layers, vocab_size, num_heads)
+    ):
         return 0
 
     head_dims = attention_head_dims(arch, hidden=hidden, num_heads=num_heads)
-    if head_dims is None:
+    if head_dims is None or any(value <= 0 for value in head_dims):
         return 0
     qk_head_dim, v_head_dim = head_dims
 
@@ -117,7 +134,8 @@ def flops_per_token(arch: PretrainedConfig, *, seq_len: int) -> int:
         return 0
 
     dense_intermediate = int_attr(arch, "intermediate_size")
-    if moe is None and dense_intermediate is None:
+    needs_dense_ffn = moe is None or len(moe.layers) != num_layers
+    if needs_dense_ffn and (dense_intermediate is None or dense_intermediate <= 0):
         return 0
 
     attention_params = attention_param_term(
@@ -156,7 +174,7 @@ def flops_per_token(arch: PretrainedConfig, *, seq_len: int) -> int:
 def int_attr(arch: PretrainedConfig, name: str) -> int | None:
     """An int attribute, or ``None`` when absent or not an int."""
     value = getattr(arch, name, None)
-    return value if isinstance(value, int) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def first_int_attr(arch: PretrainedConfig, *names: str) -> int | None:
@@ -202,21 +220,29 @@ def attention_param_term(
 ) -> int | None:
     """Per-layer attention projection cost, in units of ``2 * in * out``.
 
-    ``None`` for an MLA config that does not state the ranks its projections
-    are built from (``q_lora_rank``/``kv_lora_rank``), which would otherwise be
-    a guessed parameter count.
+    ``None`` for an MLA config missing its KV rank or head geometry. Q can
+    independently use a low-rank projection or a direct projection when
+    ``q_lora_rank`` is None; K/V remain compressed in both cases.
     """
-    num_kv_heads = int_attr(arch, "num_key_value_heads") or num_heads
+    num_kv_heads = int_attr(arch, "num_key_value_heads")
+    if num_kv_heads is None:
+        num_kv_heads = num_heads
+    if num_kv_heads <= 0 or num_heads % num_kv_heads:
+        return None
     q_lora_rank = int_attr(arch, "q_lora_rank")
-    if q_lora_rank is not None:
-        kv_lora_rank = int_attr(arch, "kv_lora_rank")
+    kv_lora_rank = int_attr(arch, "kv_lora_rank")
+    if q_lora_rank is not None or kv_lora_rank is not None:
         qk_rope_head_dim = int_attr(arch, "qk_rope_head_dim")
         qk_nope_head_dim = int_attr(arch, "qk_nope_head_dim")
         if None in (kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim):
             return None
-        # ``q_b_proj`` widens to the full QK width; ``kv_b_proj`` splits its
+        # Q projects directly or through q_a/q_b; kv_b_proj splits its
         # output into the nope key and the value, so it is sized by their sum.
-        q_proj = hidden * q_lora_rank + q_lora_rank * num_heads * qk_head_dim
+        q_proj = (
+            hidden * num_heads * qk_head_dim
+            if q_lora_rank is None
+            else hidden * q_lora_rank + q_lora_rank * num_heads * qk_head_dim
+        )
         kv_proj = hidden * (kv_lora_rank + qk_rope_head_dim) + kv_lora_rank * (
             num_heads * (qk_nope_head_dim + v_head_dim)
         )
@@ -243,7 +269,7 @@ def moe_geometry(
     if num_experts is None:
         return None
     top_k = first_int_attr(arch, "num_experts_per_tok", "top_k")
-    if top_k is None:
+    if num_experts <= 0 or top_k is None or not 1 <= top_k <= num_experts:
         return _UNRESOLVED
 
     # Dense layers: an explicit prefix (DeepSeek), an explicit index list
@@ -269,13 +295,16 @@ def moe_geometry(
     expert_intermediate = int_attr(arch, "moe_intermediate_size")
     if expert_intermediate is None and uniform_width:
         expert_intermediate = int_attr(arch, "intermediate_size")
-    if expert_intermediate is None:
+    if expert_intermediate is None or expert_intermediate <= 0:
         return _UNRESOLVED
 
     shared_intermediate = int_attr(arch, "shared_expert_intermediate_size")
     if shared_intermediate is None:
         n_shared = int_attr(arch, "n_shared_experts") or 0
         shared_intermediate = n_shared * expert_intermediate
+
+    if shared_intermediate < 0:
+        return _UNRESOLVED
 
     if len(layers) != num_layers and int_attr(arch, "intermediate_size") is None:
         return _UNRESOLVED
@@ -312,6 +341,8 @@ def attention_windows(
         # ``use_sliding_window=False`` is the explicit opt-out; a window that is
         # declared and not opted out of is what the model's own attention reads.
         if sliding_window is not None and getattr(arch, "use_sliding_window", True):
+            if sliding_window <= 0:
+                return None
             return [sliding_window] * num_layers
         return [None] * num_layers
 
@@ -327,12 +358,12 @@ def attention_windows(
             windows.append(None)
         elif layer_type == "sliding_attention":
             window = int_attr(arch, "sliding_window")
-            if window is None:
+            if window is None or window <= 0:
                 return None
             windows.append(window)
         elif layer_type == "chunked_attention":
             chunk = int_attr(arch, "attention_chunk_size")
-            if chunk is None:
+            if chunk is None or chunk <= 0:
                 return None
             windows.append(chunk)
         else:

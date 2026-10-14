@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     # Annotation-only, and a string at runtime (``from __future__ import
     # annotations`` above): naming the flex signature in a type hint must not
     # make this module require flex.
-    from torch.nn.attention.flex_attention import _mask_mod_signature
+    from torch.nn.attention.flex_attention import BlockMask, _mask_mod_signature
 
 __all__ = [
     "build_dense_attention_mask",
@@ -365,7 +365,17 @@ def build_dense_attention_mask(
     return mask.unsqueeze(0).unsqueeze(0)
 
 
-def create_attention_mask(*args, **kwargs):
+def create_attention_mask(
+    mask_mod: _mask_mod_signature,
+    *,
+    B: int | None,
+    H: int | None,
+    Q_LEN: int,
+    KV_LEN: int,
+    device: torch.device | str | None = None,
+    BLOCK_SIZE: int | tuple[int, int] = 128,
+    separate_full_blocks: bool = True,
+) -> BlockMask:
     """Build a BlockMask, caching compilation where the backend supports it.
 
     torch-npu 2.10's Inductor backend fails while lowering
@@ -376,11 +386,21 @@ def create_attention_mask(*args, **kwargs):
     create_block_mask, compiled_create_block_mask, supports_separate_full_blocks = (
         flex_ops()
     )
-    if not supports_separate_full_blocks:
-        # PyTorch 2.10 (the current vLLM Ascend image) predates this tuning
-        # knob. Its create_block_mask always uses the older combined layout.
-        kwargs.pop("separate_full_blocks", None)
-    device = kwargs.get("device")
+    # PyTorch 2.10 predates separate_full_blocks and uses the combined layout.
+    layout_options = (
+        {"separate_full_blocks": separate_full_blocks}
+        if supports_separate_full_blocks
+        else {}
+    )
     device_type = torch.device(device).type if device is not None else None
     builder = create_block_mask if device_type == "npu" else compiled_create_block_mask
-    return builder(*args, **kwargs)
+    return builder(
+        mask_mod,
+        B,
+        H,
+        Q_LEN,
+        KV_LEN,
+        device=device,
+        BLOCK_SIZE=BLOCK_SIZE,
+        **layout_options,
+    )

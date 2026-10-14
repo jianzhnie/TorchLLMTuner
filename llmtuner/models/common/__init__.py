@@ -7,7 +7,8 @@ families big enough to need more than one file are subpackages -- ``attention/``
 layer, auxiliary loss, bias-update hooks) -- and the rest are one node
 per file: ``activation``, ``tp_projections`` (TP-overlapped GEMMs), ``aux_loss``
 (the gradient carrier), ``cast_linear``, ``embedding``, ``feed_forward``,
-``linear``, ``multimodal``, ``rope``, ``scatter_add``.
+``multimodal``, ``rope``, ``scatter_add``. The FP32 router gate lives in
+``moe/gate.py``.
 
 Two conventions this package depends on:
 
@@ -29,7 +30,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from ...utils.lazy_exports import export_names, resolve_export
+from ...utils.lazy_exports import resolve_export
 
 if TYPE_CHECKING:
     # The static view of the lazy table below, for type checkers and IDEs.
@@ -45,11 +46,11 @@ if TYPE_CHECKING:
         SigmoidGatedFeedForward,
         compute_ffn_hidden_dim,
     )
-    from .linear import PartialBiasRowwiseLinear, RouterGateLinear
     from .moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
     from .moe.experts import GroupedExperts
+    from .moe.gate import RouterGateLinear
     from .moe.layer import MoE
-    from .rope import ComplexRoPE, CosSinRoPE, RoPE, RoPEConfig
+    from .rope import ComplexRoPE, CosSinRoPE, RoPE
 
 #: Public name -> the leaf module that defines it.
 _EXPORT_SOURCES = {
@@ -64,12 +65,10 @@ _EXPORT_SOURCES = {
     "local_head_split": "attention.qkv",
     "MicrobatchWiseLoadBalanceLoss": "moe.auxiliary_loss",
     "MoE": "moe.layer",
-    "PartialBiasRowwiseLinear": "linear",
     "QKVLinear": "attention.qkv",
     "register_aux_loss_zero_hook": "aux_loss",
     "RoPE": "rope",
-    "RoPEConfig": "rope",
-    "RouterGateLinear": "linear",
+    "RouterGateLinear": "moe.gate",
     "SigmoidGatedFeedForward": "feed_forward",
     "SwiGLU": "activation",
 }
@@ -88,11 +87,9 @@ __all__ = [
     "local_head_split",
     "MicrobatchWiseLoadBalanceLoss",
     "MoE",
-    "PartialBiasRowwiseLinear",
     "QKVLinear",
     "register_aux_loss_zero_hook",
     "RoPE",
-    "RoPEConfig",
     "RouterGateLinear",
     "SigmoidGatedFeedForward",
     "SwiGLU",
@@ -104,4 +101,4 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    return export_names(_EXPORT_SOURCES)
+    return sorted(_EXPORT_SOURCES)

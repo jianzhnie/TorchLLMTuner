@@ -1,10 +1,11 @@
 """The Hugging Face adaptation layer: build it, run it, count it, checkpoint it.
 
-Four nodes:
+Main modules:
 
 * ``factory.py`` -- builds the HF ``PretrainedConfig`` (offline architecture,
-  hub id or local checkpoint), resolves the ``ForCausalLM`` class, and
-  materializes a meta-device model. The construction seam.
+  hub id or local checkpoint) and resolves the ``ForCausalLM`` class.
+* ``materialization.py`` -- allocates meta model storage after parallelism,
+  rebuilds runtime buffers, and restores shared parameter and buffer aliases.
 * ``model.py`` -- ``HFTransformerModel``: the five-part contract
   (``tok_embeddings`` / ``layers`` / ``norm`` / ``lm_head`` / ``rotary_emb``),
   the packed-document attention wiring, and the forward the trainer calls.
@@ -12,8 +13,8 @@ Four nodes:
   ``experiments/transformers_modeling_backend/model.py``.
 * ``flops.py`` -- training FLOPs per token, the MFU denominator. Pure
   arithmetic over an HF config, kept apart from the building; the trainer's
-  entry point (``num_flops_per_token``) stays in ``factory.py`` because it is
-  the one that has to resolve the config first.
+  runtime assembly passes the already resolved text config directly to
+  ``flops_per_token``.
 * ``state_dict_adapter.py`` -- ``HFTransformerStateDictAdapter``: the model's
   state-dict FQNs to standard HF safetensors keys.
 

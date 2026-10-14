@@ -122,9 +122,9 @@ class GroupedExperts(nn.Module):
     ) -> torch.Tensor:
         """Compute ``x @ weight_EOI.transpose(-2, -1)`` per expert.
 
-        ``offsets_E`` is the exclusive cumulative token count (length ``E``),
+        ``offsets_E`` contains the cumulative segment ends (length ``E``),
         so segment ``e`` spans ``offsets_E[e-1] : offsets_E[e]`` -- exactly what
-        ``torch._grouped_mm`` expects. Pass an empty tensor for expert 0.
+        ``torch._grouped_mm`` expects. Expert 0 starts at offset zero.
 
         Two implementations sit behind this one call:
 

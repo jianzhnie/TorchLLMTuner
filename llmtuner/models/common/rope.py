@@ -25,19 +25,17 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Literal
 
 import torch
 import torch.nn as nn
 
 from ...accelerator.capabilities import is_compiling
+from ...config.rope_config import RoPEConfig
 
 __all__ = [
     "ComplexRoPE",
     "CosSinRoPE",
     "RoPE",
-    "RoPEConfig",
 ]
 
 
@@ -60,6 +58,7 @@ def maybe_check_max_pos(positions: torch.Tensor, *, max_valid_pos: int) -> None:
 
 def yarn_inv_freq(
     dim: int,
+    *,
     base: float,
     rope_factor: float,
     beta_fast: float,
@@ -98,34 +97,6 @@ def yarn_inv_freq(
         0, 1
     )
     return inv_freq / rope_factor * ramp + inv_freq * (1 - ramp)
-
-
-@dataclass
-class RoPEConfig:
-    """RoPE hyperparameters.
-
-    The scaling fields are grouped by the mode that reads them: ``llama`` reads
-    ``scaling_factor``/``low_freq_factor``/``high_freq_factor``/
-    ``original_max_position_embeddings``, ``yarn`` reads the ``rope_factor``/
-    ``beta_*``/``original_seq_len``/``truncate`` set. Fields for an unused mode
-    are kept at their defaults, and ``CosSinRoPE`` rejects ``llama`` outright.
-    """
-
-    dim: int
-    max_context_length: int
-    theta: float = 10000.0
-    scaling: Literal["none", "llama", "yarn"] = "none"
-    # llama scaling params
-    scaling_factor: float = 8.0
-    low_freq_factor: float = 1.0
-    high_freq_factor: float = 4.0
-    original_max_position_embeddings: int = 8192
-    # yarn scaling params
-    rope_factor: float = 1.0
-    beta_fast: float = 32.0
-    beta_slow: float = 1.0
-    original_seq_len: int = 4096
-    truncate: bool = True
 
 
 class RoPE(nn.Module, ABC):
@@ -240,12 +211,12 @@ class ComplexRoPE(RoPE):
             # YaRN (DeepSeek V3 style)
             freqs = yarn_inv_freq(
                 dim,
-                theta,
-                cfg.rope_factor,
-                cfg.beta_fast,
-                cfg.beta_slow,
-                cfg.original_seq_len,
-                cfg.truncate,
+                base=theta,
+                rope_factor=cfg.rope_factor,
+                beta_fast=cfg.beta_fast,
+                beta_slow=cfg.beta_slow,
+                original_seq_len=cfg.original_seq_len,
+                truncate=cfg.truncate,
             )
 
         t = torch.arange(end, device=freqs.device)
@@ -309,12 +280,12 @@ class CosSinRoPE(RoPE):
         if cfg.scaling == "yarn" and cfg.rope_factor > 1.0:
             inv_freq = yarn_inv_freq(
                 dim,
-                base,
-                cfg.rope_factor,
-                cfg.beta_fast,
-                cfg.beta_slow,
-                cfg.original_seq_len,
-                cfg.truncate,
+                base=base,
+                rope_factor=cfg.rope_factor,
+                beta_fast=cfg.beta_fast,
+                beta_slow=cfg.beta_slow,
+                original_seq_len=cfg.original_seq_len,
+                truncate=cfg.truncate,
             )
         else:
             inv_freq = 1.0 / (

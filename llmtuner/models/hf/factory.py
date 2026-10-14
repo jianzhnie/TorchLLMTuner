@@ -1,31 +1,30 @@
-"""Construction-time helpers: build the config, resolve the class, count FLOPs.
+"""Build Hugging Face model configs and resolve their model classes.
 
-Everything here runs BEFORE the model exists (or, for ``num_flops_per_token``,
-describes it from the config alone): building the HF ``PretrainedConfig``,
-resolving the ``ForCausalLM`` class it names, materializing a meta-device
-model, and counting FLOPs. The model body itself -- ``HFTransformerModel`` and
-the five-part contract -- lives in ``model.py``, which imports from here;
-nothing here imports back.
+The helpers build the HF ``PretrainedConfig`` and resolve its ``ForCausalLM``
+class. Meta storage allocation lives in ``materialization.py``; FLOPs estimation
+lives in ``flops.py``. The model body and five-part contract live in ``model.py``,
+which imports these helpers; nothing here imports the model body.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
-from torch import nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from .attention_backend import ATTENTION_BACKEND
-from .flops import flops_per_token
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
+
+    from ...config.llmtuner_config import LLMTunerConfig
 
 __all__ = [
     "build_model_config",
     "build_model_config_for",
-    "materialize_meta_model",
-    "num_flops_per_token",
 ]
 
 
@@ -37,12 +36,12 @@ def build_model_config(
 ) -> PretrainedConfig:
     """Build the HF config the wrapper will instantiate.
 
-    Two paths, matching the rest of llmtuner: a hub id (``"org/name"``) loads the
-    real architecture, anything else is treated as an offline architecture name
-    built from ``arch_overrides`` so the framework runs with no network access.
+    ``arch_overrides`` selects offline architecture construction, including an
+    empty dict to use architecture defaults. ``None`` loads the config from a
+    local checkpoint directory or Hub identifier.
     """
     overrides = dict(arch_overrides or {})
-    if overrides:
+    if arch_overrides is not None:
         overrides.setdefault("max_position_embeddings", seq_len)
         return AutoConfig.for_model(model_name_or_path, **overrides)
 
@@ -54,7 +53,7 @@ def build_model_config(
     return config
 
 
-def build_model_config_for(cfg) -> PretrainedConfig:
+def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
     """Build the model config for a training run.
 
     A thin adapter over :func:`build_model_config`: it maps the run's config onto
@@ -85,10 +84,9 @@ def build_model_config_for(cfg) -> PretrainedConfig:
     mod attends across document boundaries without complaint. Deriving it here
     means the flag cannot disagree with the corpus the trainer loaded.
     """
-    # A local checkpoint directory (e.g. "/abs/path" or "./ckpt") holds its own
-    # config.json and must go through ``from_pretrained``; the "/" count test
-    # alone would misread any absolute path as a hub id.
-    offline = not os.path.exists(cfg.hf_model) and cfg.hf_model.count("/") != 1
+    # Only registered architecture names select offline construction. Missing
+    # paths and Hub IDs belong to from_pretrained, which owns their validation.
+    offline = not os.path.exists(cfg.hf_model) and cfg.hf_model in CONFIG_MAPPING
     overrides = (
         {
             "vocab_size": cfg.vocab_size,
@@ -113,11 +111,7 @@ def build_model_config_for(cfg) -> PretrainedConfig:
     # masking. ``max_num_documents=1`` is the deliberate tensor-attention path:
     # one padded SFT document per row needs only ordinary causality, which lets
     # NPU/SDPA train without allowing attention across sample boundaries.
-    config.attn_mask_type = (
-        "causal"
-        if cfg.dataloader.dataset == "random" or cfg.dataloader.max_num_documents == 1
-        else "block_causal"
-    )
+    config.attn_mask_type = cfg.dataloader.attention_mask_type()
     # The requested HF experts kernel travels on the config; the wrapper
     # validates settable-ness against the resolved model class at build time.
     config.experts_implementation = getattr(cfg, "experts_implementation", "native")
@@ -125,24 +119,6 @@ def build_model_config_for(cfg) -> PretrainedConfig:
     # build time, and None (the default) means no cast.
     config.compute_dtype = getattr(cfg, "compute_dtype", None)
     return config
-
-
-def num_flops_per_token(cfg) -> int:
-    """Training FLOPs per token for the model ``cfg`` describes.
-
-    This is the denominator MFU divides into, so it has to describe the model
-    that actually runs rather than a textbook transformer. It is derived from
-    the same arch config the model is built from (``build_model_config_for``),
-    which is what keeps the two from drifting.
-
-    Returns 0 for a model whose config does not expose the sizes the formula
-    needs, which suppresses MFU rather than reporting a number derived from
-    guessed geometry. The arithmetic -- and the architectures that deliberately
-    fall into that case -- is in
-    :func:`llmtuner.models.hf.flops.flops_per_token`.
-    """
-    arch = unwrap_text_config(build_model_config_for(cfg))
-    return flops_per_token(arch, seq_len=cfg.max_seq_len)
 
 
 def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -179,16 +155,15 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
     return text_config
 
 
-def resolve_model_class(config: PretrainedConfig) -> type:
+def resolve_model_class(config: PretrainedConfig) -> type[PreTrainedModel]:
     """Find the ``ForCausalLM`` class named by the config.
 
     Prefer the name the config declares; fall back to the ``model_type`` ->
     ``Auto`` mapping, which covers configs whose architecture name does not match
     the installed class name.
     """
-    import importlib
-
     import transformers
+    from transformers import PreTrainedModel
     from transformers.models.auto.modeling_auto import (
         MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
     )
@@ -198,10 +173,8 @@ def resolve_model_class(config: PretrainedConfig) -> type:
     ]:
         if not name:
             continue
-        cls = getattr(transformers, name, None) or getattr(
-            importlib.import_module("transformers"), name, None
-        )
-        if cls is not None:
+        cls = getattr(transformers, name, None)
+        if isinstance(cls, type) and issubclass(cls, PreTrainedModel):
             return cls
 
     raise ImportError(
@@ -210,44 +183,3 @@ def resolve_model_class(config: PretrainedConfig) -> type:
         f"(architectures={getattr(config, 'architectures', None)!r}). "
         "Check that the installed transformers version ships this model."
     )
-
-
-def materialize_meta_model(model: nn.Module, device: torch.device) -> None:
-    """Materialize an already-parallelized HF model without a full copy.
-
-    FSDP turns meta parameters into sharded meta ``DTensor`` objects; calling
-    ``to_empty`` afterwards allocates only their local shards. Non-persistent
-    buffers are not present in the HF checkpoint, so they must be reconstructed
-    rather than left as uninitialized ``to_empty`` storage. Decoder RoPE is the
-    only such buffer in the currently supported HF text models; unknown buffers
-    fail loudly so a new architecture cannot train on garbage state.
-    """
-    meta_buffers = [
-        (module, name)
-        for module in model.modules()
-        for name, value in module.named_buffers(recurse=False)
-        if value.is_meta
-    ]
-    model.to_empty(device=device)
-
-    refreshed: set[tuple[int, str]] = set()
-    rope_modules = {module for module, name in meta_buffers if name == "inv_freq"}
-    for module in rope_modules:
-        if not hasattr(module, "config"):
-            continue
-        fresh = type(module)(module.config, device=device)
-        for name, value in fresh.named_buffers(recurse=False):
-            if name in {"inv_freq", "original_inv_freq"}:
-                setattr(module, name, value)
-                refreshed.add((id(module), name))
-
-    unresolved = [
-        f"{type(module).__name__}.{name}"
-        for module, name in meta_buffers
-        if (id(module), name) not in refreshed
-    ]
-    if unresolved:
-        raise RuntimeError(
-            "meta materialization has unsupported non-checkpoint buffers: "
-            + ", ".join(unresolved)
-        )

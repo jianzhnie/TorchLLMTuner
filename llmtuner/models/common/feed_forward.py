@@ -19,6 +19,8 @@ Shape suffix legend, scoped to this file:
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -37,9 +39,21 @@ def compute_ffn_hidden_dim(
 
     This applies the 2/3 scaling, optional multiplier, and rounds up to multiple_of.
     """
-    hidden_dim = int(2 * 4 * dim / 3)
+    for name, value in (("dim", dim), ("multiple_of", multiple_of)):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{name} must be positive integer, got {value!r}")
+    if ffn_dim_multiplier is not None and (
+        not isinstance(ffn_dim_multiplier, int | float)
+        or isinstance(ffn_dim_multiplier, bool)
+        or not math.isfinite(ffn_dim_multiplier)
+        or ffn_dim_multiplier <= 0
+    ):
+        raise ValueError("ffn_dim_multiplier must be finite and positive")
+    hidden_dim = 8 * dim // 3
     if ffn_dim_multiplier is not None:
         hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+    if hidden_dim <= 0:
+        raise ValueError("ffn_dim_multiplier produces a zero hidden dimension")
     return multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
 
@@ -73,25 +87,44 @@ class FeedForward(nn.Module):
     @staticmethod
     def _split_w13_on_save(module, state_dict, prefix, local_metadata) -> None:
         """Expose fused parameters under the logical w1/w3 checkpoint keys."""
+        split = {}
+        fused_keys = []
         for param_name in ("weight", "bias"):
             fused_key = f"{prefix}w13.{param_name}"
             if fused_key not in state_dict:
                 continue
-            gate_up = state_dict.pop(fused_key).unflatten(0, (-1, 2))
-            state_dict[f"{prefix}w1.{param_name}"] = gate_up[:, 0].contiguous()
-            state_dict[f"{prefix}w3.{param_name}"] = gate_up[:, 1].contiguous()
+            gate_up = state_dict[fused_key].unflatten(0, (-1, 2))
+            split[f"{prefix}w1.{param_name}"] = gate_up[:, 0].contiguous()
+            split[f"{prefix}w3.{param_name}"] = gate_up[:, 1].contiguous()
+            fused_keys.append(fused_key)
+        for key in fused_keys:
+            del state_dict[key]
+        state_dict.update(split)
 
     @staticmethod
     def _merge_w13_on_load(module, state_dict, prefix, *args) -> None:
         """Pack logical w1/w3 checkpoint entries into the fused parameter."""
+        merged = []
         for param_name in ("weight", "bias"):
             gate_key = f"{prefix}w1.{param_name}"
             up_key = f"{prefix}w3.{param_name}"
             if gate_key not in state_dict or up_key not in state_dict:
                 continue
-            state_dict[f"{prefix}w13.{param_name}"] = torch.stack(
-                [state_dict.pop(gate_key), state_dict.pop(up_key)], dim=1
+            fused_key = f"{prefix}w13.{param_name}"
+            if fused_key in state_dict:
+                raise ValueError(
+                    f"checkpoint contains both fused {fused_key!r} and logical "
+                    f"{gate_key!r}/{up_key!r} projections"
+                )
+            value = torch.stack(
+                [state_dict[gate_key], state_dict[up_key]], dim=1
             ).flatten(0, 1)
+            merged.append((gate_key, up_key, fused_key, value))
+        # Prepare all projections before changing keys, so a bad bias or an
+        # ambiguous entry does not consume an otherwise valid weight pair.
+        for gate_key, up_key, fused_key, value in merged:
+            del state_dict[gate_key], state_dict[up_key]
+            state_dict[fused_key] = value
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(self.activation_fn(*self.split_gate_up(self.w13(x))))

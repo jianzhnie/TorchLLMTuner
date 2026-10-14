@@ -5,8 +5,8 @@ scored in a configured dtype regardless of the dtype the rest of the model
 runs in, because bf16 logits lose the precision the loss (and RL logprob/KL
 math downstream of it) needs. Upstream swaps the lm_head's config node inside
 its model-config tree; llmtuner has no config tree, so the swap happens at model
-build time in ``models/hf/model.py`` and this file carries only the module
-and the in-place swap helper.
+build time in ``models/hf/model_setup.py`` and this file carries only the module
+and the replacement builder.
 
 The class is an ``nn.Linear`` subclass rather than a wrapper around one on
 purpose: a wrapper would register the original projection as a child and
@@ -23,15 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["TORCH_DTYPE_MAP", "CastLinear", "to_cast_linear"]
-
-# Keys spell dtypes the way the training config does; the set matches
-# torchtitan's TORCH_DTYPE_MAP.
-TORCH_DTYPE_MAP = {
-    "float16": torch.float16,
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-}
+__all__ = ["CastLinear", "build_cast_linear"]
 
 
 class CastLinear(nn.Linear):
@@ -55,19 +47,31 @@ class CastLinear(nn.Linear):
         device=None,
         dtype=None,
     ) -> None:
+        if compute_dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        ):
+            raise ValueError(
+                "compute_dtype must be float16, bfloat16, float32 or float64, "
+                f"got {compute_dtype!r}"
+            )
         super().__init__(
             in_features, out_features, bias=bias, device=device, dtype=dtype
         )
         self.compute_dtype = compute_dtype
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        bias = None if self.bias is None else self.bias.to(self.compute_dtype)
-        return F.linear(
-            input.to(self.compute_dtype), self.weight.to(self.compute_dtype), bias
-        )
+        # An outer autocast context must not override the configured matmul dtype.
+        with torch.autocast(device_type=input.device.type, enabled=False):
+            bias = None if self.bias is None else self.bias.to(self.compute_dtype)
+            return F.linear(
+                input.to(self.compute_dtype), self.weight.to(self.compute_dtype), bias
+            )
 
 
-def to_cast_linear(linear: nn.Module, compute_dtype: torch.dtype) -> CastLinear:
+def build_cast_linear(linear: nn.Module, *, compute_dtype: torch.dtype) -> CastLinear:
     """Build a ``CastLinear`` that reuses ``linear``'s parameter objects.
 
     Rebinding rather than copying is the point: a tied lm_head shares one
