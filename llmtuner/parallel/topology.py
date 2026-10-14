@@ -65,7 +65,7 @@ class ParallelTopology:
         return cls(
             dp_replicate=parallelism_config.data_parallel_replicate_size,
             dp_shard=parallelism_config.data_parallel_shard_size,
-            cp=parallelism_config.cp,
+            cp=parallelism_config.cp_size,
             tp=parallelism_config.tensor_parallel_size,
             pp=parallelism_config.pipeline_parallel_size,
             ep=parallelism_config.expert_parallel_size,

@@ -510,7 +510,13 @@ def model_tp_config(model: nn.Module) -> Mapping[str, str | ShardingConfig]:
     guarantees -- would otherwise be read as "no plan" and shard nothing, so
     this is the one place the two spellings are reconciled.
     """
-    return getattr(model, "tp_config", None) or getattr(model, "_tp_config", None) or {}
+    return (
+        getattr(model, "tp_config", None)
+        or getattr(model, "_tp_config", None)
+        or getattr(model, "_tp_plan", None)
+        or getattr(model, "tp_plan", None)
+        or {}
+    )
 
 
 def resolve_tp_sharding_plan(
@@ -704,7 +710,7 @@ def resolve_tp_targets(
     sharding_plan = resolve_tp_sharding_plan(model, plan=raw_plan)
     if not sharding_plan:
         raise ValueError(
-            f"apply_tp with tp={cfg.tp}: {type(model).__name__} provides no TP "
+            f"apply_tp with tp={cfg.tp_size}: {type(model).__name__} provides no TP "
             "plan (neither a `tp_config`/`_tp_config` declaration nor an explicit "
             "`plan` argument). Refusing to run TP as a silently replicated "
             "model; shard the projections declaratively or set tp=1."
@@ -733,7 +739,7 @@ def resolve_tp_targets(
     # for the native MoE stack by apply_ep, which runs next; the swapped block
     # consumes and produces the T/tp sequence shard directly (all-to-all
     # dispatch), so no sequence-boundary collectives are installed either.
-    moe_deferred_to_ep = plan_declares_moe and cfg.ep > 1
+    moe_deferred_to_ep = plan_declares_moe and cfg.ep_size > 1
     moe_blocks: list[tuple[str, nn.Module]] = []
     already_bracketed = False
     if plan_declares_moe and not moe_deferred_to_ep:
@@ -750,7 +756,7 @@ def resolve_tp_targets(
             if is_hf_moe_block(module):
                 moe_blocks.append((module_path, module))
         if not moe_blocks and not already_bracketed:
-            compatibility.tp_moe_specs_without_block(cfg.tp, model)
+            compatibility.tp_moe_specs_without_block(cfg.tp_size, model)
     if moe_blocks:
         # MoE-block internals never take the dense realizer path: the routed
         # experts are stacked parameters (no nn.Linear to match), and the
@@ -765,7 +771,7 @@ def resolve_tp_targets(
     nothing_sharded = not targets and not moe_blocks and not already_bracketed
     if nothing_sharded and not moe_deferred_to_ep:
         raise ValueError(
-            f"apply_tp with tp={cfg.tp}: the plan patterns "
+            f"apply_tp with tp={cfg.tp_size}: the plan patterns "
             f"{sorted(sharding_plan)} matched no nn.Linear on "
             f"{type(model).__name__}. The patterns are spelled relative to the "
             "module tree being parallelized; check the prefix (e.g. a wrapper's "
@@ -850,10 +856,10 @@ def apply_tp(
     Llama, ...). Pass an explicit ``{path_pattern: ShardingConfig}`` to override
     it -- e.g. to leave a projection replicated or to use a different realizer.
     """
-    if cfg.tp <= 1:
+    if cfg.tp_size <= 1:
         return model
     if mesh is None:
-        raise ValueError(f"tp={cfg.tp} requires a device mesh with a 'tp' axis")
+        raise ValueError(f"tp={cfg.tp_size} requires a device mesh with a 'tp' axis")
 
     # Resolve targets once before accessing process groups or changing weights.
     targets, moe_blocks = resolve_tp_targets(model, cfg=cfg, plan=plan)
@@ -877,7 +883,7 @@ def apply_tp(
     if not attention_paths or attention_is_sharded:
         require_heads_divisible_by(
             model,
-            size=cfg.tp,
+            size=cfg.tp_size,
             axis="tp",
             why=(
                 "tensor parallelism shards attention heads across the TP group, so "
@@ -903,10 +909,10 @@ def apply_tp(
             )
         dimension = 0 if spec.kind == "colwise" else 1
         size = inner.weight.shape[dimension]
-        if size % cfg.tp:
+        if size % cfg.tp_size:
             raise ValueError(
                 f"TP over {module_path}: weight dim {dimension} (size {size}) "
-                f"is not divisible by tp_size={cfg.tp}"
+                f"is not divisible by tp_size={cfg.tp_size}"
             )
     replicated_attention = [
         module
@@ -917,9 +923,9 @@ def apply_tp(
     ]
 
     tp_size = mesh["tp"].size()
-    if tp_size != cfg.tp:
+    if tp_size != cfg.tp_size:
         raise ValueError(
-            f"TP mesh size {tp_size} does not match configured tp={cfg.tp}"
+            f"TP mesh size {tp_size} does not match configured tp={cfg.tp_size}"
         )
     group = mesh["tp"].get_group()
     tp_rank = mesh["tp"].get_local_rank()

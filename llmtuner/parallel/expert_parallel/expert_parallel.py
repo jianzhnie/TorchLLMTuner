@@ -24,7 +24,7 @@ def apply_ep(
 ) -> nn.Module:
     """Swap every HF MoE block for the EP-capable llmtuner MoE.
 
-    No-op when ``cfg.ep == 1`` (the model is handed back untouched), so the
+    No-op when ``cfg.ep_size == 1`` (the model is handed back untouched), so the
     caller needs no degree check of its own.
 
     The swap moves weights, so it must happen before FSDP wraps the model.
@@ -32,14 +32,14 @@ def apply_ep(
     tokens cross ranks by all-to-all; the two are orthogonal to the CP
     attention kernel, so CP and EP compose freely.
     """
-    if cfg.ep == 1:
+    if cfg.ep_size == 1:
         if cfg.ep_config.moe_quantile_balancing:
             compatibility.quantile_requires_ep()
         return model
 
-    if ep_group is None or ep_group.size() != cfg.ep:
+    if ep_group is None or ep_group.size() != cfg.ep_size:
         raise ValueError(
-            f"ep={cfg.ep} requires an EP process group of that size, got "
+            f"ep={cfg.ep_size} requires an EP process group of that size, got "
             f"{None if ep_group is None else ep_group.size()}. The group comes "
             "from the sparse mesh's 'ep' axis (parallelize_hf_transformers "
             "resolves it from parallel_dims)."
@@ -52,12 +52,12 @@ def apply_ep(
         fixed_router=cfg.ep_config.fixed_router,
         token_dispatcher=cfg.ep_config.ep_token_dispatcher,
         torchao_pad_multiple=cfg.ep_config.ep_torchao_pad_multiple,
-        tp_enabled=cfg.tp > 1,
+        tp_enabled=cfg.tp_size > 1,
     )
     logger.info(
         "Applied EP (%s dispatch): swapped %d MoE blocks, degree %d",
         cfg.ep_config.ep_token_dispatcher,
         swapped,
-        cfg.ep,
+        cfg.ep_size,
     )
     return model
