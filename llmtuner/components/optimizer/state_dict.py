@@ -65,7 +65,7 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
         if "lr" in param_group:
             saved_lrs.append(param_group["lr"])
             param_group["lr"] = (
-                torch.tensor(0.0)
+                torch.zeros_like(param_group["lr"])
                 if isinstance(param_group["lr"], torch.Tensor)
                 else 0.0
             )

@@ -50,6 +50,11 @@ def test_the_cpu_fallback_refuses_attention_sinks() -> None:
         )
 
 
+def test_the_cpu_fallback_refuses_nonzero_attention_dropout():
+    with pytest.raises(NotImplementedError, match="attention dropout"):
+        reject_unrepresentable_attention_kwargs({"dropout": 0.1})
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

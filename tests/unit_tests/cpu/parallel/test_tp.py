@@ -41,6 +41,30 @@ def test_declaration_factories_pick_the_right_realizer() -> None:
     assert rowwise() == ShardingConfig(kind="rowwise", implementation=RowParallelLinear)
 
 
+@pytest.mark.parametrize("failure", ["bias", "dimension"])
+def test_invalid_later_dense_target_is_rejected_before_mutation(failure):
+    model = nn.Sequential(
+        nn.Linear(4, 4, bias=False),
+        nn.Linear(4, 3 if failure == "dimension" else 4, bias=failure == "bias"),
+    )
+    original_modules = list(model)
+    original_parameters = list(model.parameters())
+    with pytest.raises(ValueError, match="bias|not divisible"):
+        apply_tp(
+            model,
+            mesh=object(),
+            cfg=ParallelConfig(tensor_parallel_size=2),
+            plan={"0": "colwise", "1": "colwise"},
+        )
+    assert list(model) == original_modules
+    assert all(
+        current is original
+        for current, original in zip(
+            model.parameters(), original_parameters, strict=True
+        )
+    )
+
+
 def test_colwise_layout_is_cut_on_output_features() -> None:
     # nn.Linear weight is [out, in]; colwise keeps that layout and cuts dim 0,
     # storing [out/tp, in] -- the w_shard_n = [N/R, K] contract AllGatherLinear

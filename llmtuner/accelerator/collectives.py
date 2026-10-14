@@ -173,9 +173,9 @@ def clip_grad_norm_(
     Returns:
         The total norm of the parameter gradients (viewed as one vector).
 
-    NOTE: intentionally not ``torch.no_grad()`` -- ``get_total_norm`` must keep
-    its autograd history so the clip's effect propagates. Do not add it.
+    Nonfinite checks run after the global norm is assembled, before clipping.
     """
+    norm_type = float(norm_type)
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     else:
@@ -212,9 +212,9 @@ def clip_grad_norm_(
     ]
 
     def _local_norm(grads: list[torch.Tensor]) -> torch.Tensor:
-        norm = torch.nn.utils.get_total_norm(
-            grads, norm_type, error_if_nonfinite, foreach
-        )
+        # Check only after every mesh reduction, so one bad local shard does
+        # not raise while its peers are still waiting in a collective.
+        norm = torch.nn.utils.get_total_norm(grads, norm_type, False, foreach)
         if isinstance(norm, DTensor):
             norm = norm.full_tensor()
         return norm
@@ -276,6 +276,14 @@ def clip_grad_norm_(
             total_norm **= norm_type
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
             total_norm **= 1.0 / norm_type
+
+    if error_if_nonfinite and not torch.isfinite(total_norm):
+        raise RuntimeError(
+            f"The total norm of order {norm_type} for gradients from "
+            "`parameters` is non-finite, so it cannot be clipped. To disable "
+            "this error and scale the gradients by the non-finite norm anyway, "
+            "set `error_if_nonfinite=False`"
+        )
 
     if max_norm > 0:
         # torch's foreach clip batches DTensor grads together by device and

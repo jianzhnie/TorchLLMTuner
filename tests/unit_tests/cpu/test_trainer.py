@@ -424,6 +424,16 @@ def test_clip_does_not_exhaust_a_generator() -> None:
     assert all(p.grad is not None for p in params)
 
 
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
+def test_clip_rejects_nonfinite_norm_before_changing_gradients(value) -> None:
+    parameter = nn.Parameter(torch.zeros(1))
+    parameter.grad = torch.tensor([value])
+    before = parameter.grad.clone()
+    with pytest.raises(RuntimeError, match="non-finite"):
+        clip_grad_norm_(parameter, max_norm=1.0, error_if_nonfinite=True)
+    torch.testing.assert_close(parameter.grad, before, equal_nan=True)
+
+
 # -- the data iterator --------------------------------------------------------
 
 
