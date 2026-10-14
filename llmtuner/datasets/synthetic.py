@@ -159,13 +159,36 @@ class RandomTokenDataLoader(BaseDataLoader):
         return {
             "dp_world_size": self._dp_world_size,
             "steps": self._position,
+            "batch_layout": {
+                "seed": self._source.seed,
+                "vocab_size": self._source.vocab_size,
+                "batch_size": self._source.batch_size,
+                "seq_len": self._source.seq_len,
+            },
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         if not state_dict:
             return
         require_same_dp_degree(state_dict.get("dp_world_size"), self._dp_world_size)
+        saved_layout = state_dict.get("batch_layout")
+        if (
+            saved_layout is not None
+            and saved_layout != self.state_dict()["batch_layout"]
+        ):
+            raise ValueError(
+                "cannot resume after changing synthetic data configuration"
+            )
         resume_at = state_dict.get("steps", 0)
+        if (
+            not isinstance(resume_at, int)
+            or isinstance(resume_at, bool)
+            or resume_at < 0
+        ):
+            raise ValueError(
+                "synthetic loader steps must be a nonnegative integer, "
+                f"got {resume_at!r}"
+            )
         if resume_at < self._position:
             raise ValueError(
                 f"cannot resume at batch {resume_at}: this loader has already "

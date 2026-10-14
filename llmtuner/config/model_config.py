@@ -11,17 +11,18 @@ from llmtuner.errors import ConfigError
 
 @dataclass
 class ModelConfig:
-    """Model architecture. None fields are auto-filled from the HF config.
+    """Model architecture, with CLI sizes filled from saved HF configurations.
 
     Offline path: when ``model_name_or_path`` has no '/', build a tiny local model
     with AutoConfig.for_model using the explicit sizes below. Online path: a hub id
-    ("org/name") pulls real architecture via AutoConfig.from_pretrained.
+    ("org/name") or a local model directory reads the saved architecture via
+    AutoConfig.from_pretrained.
     """
 
     model_name_or_path: str = field(
         default="llama",
         metadata={
-            "help": "HF architecture name (offline) or hub id 'org/name' (online)"
+            "help": "HF architecture name, local model directory, or hub id 'org/name'"
         },
     )
     vocab_size: int = field(default=128, metadata={"help": "Vocabulary size"})

@@ -56,8 +56,9 @@ from ...models.common.moe.bias_update import (
 from ...models.hf.factory import (
     build_model_config_for,
     materialize_meta_model,
-    num_flops_per_token,
+    unwrap_text_config,
 )
+from ...models.hf.flops import flops_per_token
 from ...models.hf.model import HFTransformerModel
 from ...models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 from ...parallel import compatibility
@@ -101,6 +102,20 @@ def _build_model(self, cfg):
             self._chunked_loss_num_chunks, self.parallel_dims.pp
         )
     hf_model_config = build_model_config_for(cfg)
+    # Programmatic Trainer callers need the same resolved geometry as the CLI.
+    # In particular, synthetic token generation must use the real vocabulary,
+    # including offline arch_overrides and local saved configurations.
+    text_config = unwrap_text_config(hf_model_config)
+    for name in (
+        "vocab_size",
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+    ):
+        if hasattr(text_config, name):
+            setattr(cfg.model, name, getattr(text_config, name))
     load_hf_weights = bool(
         cfg.checkpoint.enable
         and cfg.checkpoint.initial_load_in_hf
@@ -356,15 +371,16 @@ def assemble_trainer_runtime(self, cfg) -> None:
     #    to emit: the same loss and grad_norm, plus throughput, MFU and
     #    memory, and the frequency is now one knob instead of two.
     #
-    #    ``num_flops_per_token`` is measured from the parameters, not from
-    #    the config's sizes, so the number describes the model that actually
-    #    exists -- including one whose sizes came from the Hub.
+    #    FLOPs use the already resolved HF geometry, so metrics describe the
+    #    model built above without loading its configuration a second time.
     self.metrics = MetricsProcessor(
         cfg.metrics,
         parallel_dims=self.parallel_dims,
         dump_folder=cfg.dump_folder,
         pp_schedule=cfg.pipeline_parallel_schedule,
-        num_flops_per_token=num_flops_per_token(cfg),
+        num_flops_per_token=flops_per_token(
+            unwrap_text_config(hf_model_config), seq_len=cfg.max_seq_len
+        ),
         tag=cfg.metrics.tag,
     )
     # The trainer synchronizes PP loss metrics to every stage before logging.

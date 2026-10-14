@@ -188,7 +188,16 @@ class LRSchedulersContainer(Stateful):
         if not state_dict:
             return
         last_epoch = state_dict["last_epoch"]
+        if (
+            not isinstance(last_epoch, int)
+            or isinstance(last_epoch, bool)
+            or last_epoch < 0
+        ):
+            raise ValueError("scheduler last_epoch must be a nonnegative integer")
         for scheduler in self.schedulers:
+            scheduler.base_lrs = [
+                group["initial_lr"] for group in scheduler.optimizer.param_groups
+            ]
             scheduler.last_epoch = last_epoch
             scheduler._step_count = last_epoch + 1
             scheduler._last_lr = scheduler.get_lr()

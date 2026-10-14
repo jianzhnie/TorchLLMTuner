@@ -81,7 +81,13 @@ def parse_config() -> LLMTunerConfig:
     # subclasses of the groups, which is how they are keyed below.
     parser = HfArgumentParser(list(cli_groups(PARSER_GROUPS)))
     # Each group is its own parser group, so every scalar field becomes a flag.
-    parsed = dict(zip(PARSER_GROUPS, parser.parse_args_into_dataclasses(), strict=True))
+    parsed = dict(
+        zip(
+            PARSER_GROUPS,
+            parser.parse_args_into_dataclasses(look_for_args_file=False),
+            strict=True,
+        )
+    )
     cfg = LLMTunerConfig.from_groups(
         model=parsed[ModelConfig],
         parallel=parsed[ParallelConfig],

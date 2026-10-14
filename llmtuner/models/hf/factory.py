@@ -47,7 +47,10 @@ def build_model_config(
         return AutoConfig.for_model(model_name_or_path, **overrides)
 
     config = AutoConfig.from_pretrained(model_name_or_path)
-    config.max_position_embeddings = max(config.max_position_embeddings, seq_len)
+    text_config = getattr(config, "text_config", config)
+    text_config.max_position_embeddings = max(
+        text_config.max_position_embeddings, seq_len
+    )
     return config
 
 
