@@ -1740,14 +1740,20 @@ def test_pipeline_loader_matches_independently_packed_microbatches(
         pipeline.close()
 
 
+@pytest.mark.parametrize("max_context_length", [3, 16])
 def test_pipeline_collator_pads_a_finite_partial_schedule_without_repeating_tokens(
     tokenizer,
+    max_context_length,
 ):
     from dataclasses import replace
 
     from llmtuner.datasets.collators import PipelineTextCollator
 
-    context = replace(make_context(tokenizer), num_tokens_per_batch=16)
+    context = replace(
+        make_context(tokenizer),
+        num_tokens_per_batch=16,
+        max_context_length=max_context_length,
+    )
     collator = PipelineTextCollator(context=context, num_microbatches=2)
     row = TextSequence(
         input_ids=np.asarray([1, 2, 3]), labels=np.asarray([2, 3, IGNORE_INDEX])
@@ -1758,6 +1764,10 @@ def test_pipeline_collator_pads_a_finite_partial_schedule_without_repeating_toke
     assert batch["input"][0, :3].tolist() == [1, 2, 3]
     assert batch["padding_mask"][1].all()
     assert (batch["labels"][1] == IGNORE_INDEX).all()
+    assert batch["input"][1].eq(0).all()
+    torch.testing.assert_close(
+        batch["positions"][1], torch.arange(8) % max_context_length
+    )
     assert int((~batch["padding_mask"]).sum()) == 3
     np.testing.assert_array_equal(row.labels, [2, 3, IGNORE_INDEX])
 

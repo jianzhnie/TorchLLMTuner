@@ -30,8 +30,8 @@ def _model_with_experts(num_local: int = 2) -> nn.Module:
 def _fake_group(monkeypatch, *, world: int, rank: int):
     """A fake EP group where rank r's local value is ``base + 100 * r``."""
     group = object()
-    monkeypatch.setattr(checkpointing.distributed, "get_world_size", lambda g: world)
-    monkeypatch.setattr(checkpointing.distributed, "get_rank", lambda g: rank)
+    monkeypatch.setattr(checkpointing, "get_world_size", lambda g: world)
+    monkeypatch.setattr(checkpointing, "get_rank", lambda g: rank)
 
     def fake_all_gather(out, value, group=None):
         out.copy_(torch.cat([value + 100 * r for r in range(world)], dim=0))

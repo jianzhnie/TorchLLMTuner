@@ -3,7 +3,7 @@
 The wrapper's job is plumbing -- expose the decoder's parts under stable names,
 add the batch dim HF expects, feed RoPE explicit `position_ids`, and route
 attention through a mask -- but three separate layers read those names (FSDP
-walks `layers`, the parallel layer renames `tp_plan`, the trainer scores the
+walks `layers`, the parallel layer renames `tp_config`, the trainer scores the
 logits), so a silent change here propagates everywhere.
 
 These run on the sdpa fallback, so the mask exercised below is the one sdpa
@@ -700,10 +700,10 @@ def test_native_experts_implementation_is_the_default_and_builds() -> None:
     assert model.model is not None
 
 
-def test_tp_plan_reads_the_inner_attribute_and_falls_back_to_the_property() -> None:
-    """HF builds the plan as an instance ``_tp_plan`` (config plan + each child's
-    own), and exposes it through the ``tp_plan`` property. The wrapper must read
-    that attribute -- the property switches to ``_ep_plan`` when the config asks
+def test_tp_config_reads_the_inner_attribute_and_falls_back_to_the_property() -> None:
+    """HF builds the plan as an instance ``_tp_config`` (config plan + each child's
+    own), and exposes it through the ``tp_config`` property. The wrapper must read
+    that attribute -- the property switches to ``_ep_config`` when the config asks
     for expert parallelism, and those are EP specs, not TP ones -- but a model
     that only answers through the property must not read as "no plan", because
     ``apply_tp`` would then silently shard nothing.
@@ -715,29 +715,29 @@ def test_tp_plan_reads_the_inner_attribute_and_falls_back_to_the_property() -> N
     from types import SimpleNamespace
 
     class AttributeOnly:
-        _tp_plan = {"layers.*.self_attn.q_proj": "rowwise"}
+        _tp_config = {"layers.*.self_attn.q_proj": "rowwise"}
 
         @property
-        def tp_plan(self) -> dict[str, str]:
+        def tp_config(self) -> dict[str, str]:
             return {"layers.*.self_attn.q_proj": "colwise"}
 
-    assert HFTransformerModel.tp_plan.fget(SimpleNamespace(model=AttributeOnly())) == {
-        "model.layers.*.self_attn.q_proj": "rowwise"
-    }
+    assert HFTransformerModel.tp_config.fget(
+        SimpleNamespace(model=AttributeOnly())
+    ) == {"model.layers.*.self_attn.q_proj": "rowwise"}
 
     class PropertyOnly:
         @property
-        def tp_plan(self) -> dict[str, str]:
+        def tp_config(self) -> dict[str, str]:
             return {"layers.*.self_attn.q_proj": "colwise"}
 
-    assert HFTransformerModel.tp_plan.fget(SimpleNamespace(model=PropertyOnly())) == {
+    assert HFTransformerModel.tp_config.fget(SimpleNamespace(model=PropertyOnly())) == {
         "model.layers.*.self_attn.q_proj": "colwise"
     }
 
     class Neither:
         pass
 
-    assert HFTransformerModel.tp_plan.fget(SimpleNamespace(model=Neither())) == {}
+    assert HFTransformerModel.tp_config.fget(SimpleNamespace(model=Neither())) == {}
 
 
 def test_vocab_size_is_the_inner_configs_number(model: HFTransformerModel) -> None:

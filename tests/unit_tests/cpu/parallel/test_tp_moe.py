@@ -97,7 +97,7 @@ class _MoeModel(nn.Module):
         self.layers = nn.ModuleList(
             [nn.ModuleDict({"mlp": _MoeBlock(num_experts, dim, hidden, top_k=2)})]
         )
-        self._tp_plan = MOE_PLAN
+        self._tp_config = MOE_PLAN
 
 
 class _FakeMeshAxis:
@@ -151,9 +151,9 @@ def test_moe_plan_specs_resolve_instead_of_raising() -> None:
     assert plan["layers.*.mlp.experts.down_proj"].kind == "rowwise"
 
 
-def test_ep_plan_strings_still_raise_on_the_tp_path() -> None:
+def test_ep_config_strings_still_raise_on_the_tp_path() -> None:
     class M(nn.Module):
-        _tp_plan = {"layers.*.mlp.experts.gate_up_proj": "grouped_gemm"}
+        _tp_config = {"layers.*.mlp.experts.gate_up_proj": "grouped_gemm"}
 
     with pytest.raises(ValueError, match="Unsupported TP plan entry"):
         resolve_tp_sharding_plan(M(), plan=None)
@@ -268,7 +268,7 @@ def test_apply_tp_is_idempotent_on_a_moe_block() -> None:
 
 def test_apply_tp_raises_when_moe_specs_match_no_block() -> None:
     class Dense(nn.Module):
-        _tp_plan = dict(MOE_PLAN)
+        _tp_config = dict(MOE_PLAN)
 
         def __init__(self) -> None:
             super().__init__()
@@ -346,7 +346,7 @@ def test_shared_expert_is_not_double_sharded_by_the_dense_plan() -> None:
         }
     )
     model = _MoeModel()
-    model._tp_plan = plan
+    model._tp_config = plan
     block = model.layers[0]["mlp"]
     block.shared_experts = _SharedMLP()
     cfg = ParallelConfig(tensor_parallel_size=2)

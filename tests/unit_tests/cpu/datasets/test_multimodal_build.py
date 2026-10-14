@@ -149,9 +149,7 @@ def test_build_dataloader_names_a_multimodal_recipe(tmp_path, monkeypatch):
         "cc12m-test",
         SingleDataset(
             source=Base64JsonlSource(patterns=(corpus,)),
-            processor=partial(
-                MultimodalProcessor, sample_processor=process_cc12m_sample
-            ),
+            processor=partial(MultimodalProcessor, process_sample=process_cc12m_sample),
             post_filters=(lambda sample: sample is not None,),
         ),
     )

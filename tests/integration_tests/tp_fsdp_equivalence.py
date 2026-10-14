@@ -78,7 +78,7 @@ TOL = 1e-4
 def _cfg() -> LLMTunerConfig:
     return LLMTunerConfig(
         model=ModelConfig(
-            # llama, not qwen3: qwen3's HF tp_plan carries
+            # llama, not qwen3: qwen3's HF tp_config carries
             # ``replicated_with_grad_allreduce`` norm entries that the minimal
             # TP engine deliberately rejects (apply_tp fails loudly on them).
             model_name_or_path="llama",
