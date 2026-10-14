@@ -14,20 +14,6 @@ def text_positions(text_len: int, offset: int) -> torch.Tensor:
     return torch.arange(text_len).view(1, -1).expand(3, -1) + offset
 
 
-def vision_grid_positions(
-    t: int, h: int, w: int, cache: dict[tuple[int, int, int], torch.Tensor]
-) -> torch.Tensor:
-    """The (3, t*h*w) 3D grid coordinates for a vision run, cached by shape."""
-    key = (t, h, w)
-    if key not in cache:
-        hw = h * w
-        t_index = torch.arange(t).view(-1, 1).expand(-1, hw).flatten()
-        h_index = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
-        w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
-        cache[key] = torch.stack([t_index, h_index, w_index])
-    return cache[key]
-
-
 def build_mrope_positions(
     tokens: torch.Tensor,
     grid_thw: torch.Tensor | None,
@@ -218,12 +204,15 @@ def build_mrope_positions(
                 # [text tokens] -- sequential positions, identical on all 3 axes.
                 doc_pos_ids_list.append(text_positions(text_len, pos_id_offset))
                 # [vision tokens] -- 3D grid positions (T, H, W).
+                grid_shape = (llm_grid_t, llm_grid_h, llm_grid_w)
+                if grid_shape not in grid_cache:
+                    t, h, w = grid_shape
+                    t_index = torch.arange(t).view(-1, 1).expand(-1, h * w).flatten()
+                    h_index = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
+                    w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
+                    grid_cache[grid_shape] = torch.stack([t_index, h_index, w_index])
                 doc_pos_ids_list.append(
-                    vision_grid_positions(
-                        llm_grid_t, llm_grid_h, llm_grid_w, grid_cache
-                    )
-                    + text_len
-                    + pos_id_offset
+                    grid_cache[grid_shape] + text_len + pos_id_offset
                 )
                 pair_cursor = vision_end
 

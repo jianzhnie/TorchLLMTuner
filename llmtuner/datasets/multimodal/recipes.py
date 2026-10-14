@@ -6,7 +6,7 @@ from ..composition import SingleDataset, is_not_none
 from ..sources import HuggingFaceStreamingSource
 from .processors import (
     MultimodalProcessor,
-    process_cc12_wd_sample,
+    process_cc12m_sample,
     process_obelics_sample,
 )
 
@@ -32,7 +32,7 @@ MULTIMODAL_DATASETS: dict[str, SingleDataset] = {
         ),
         processor=partial(
             MultimodalProcessor,
-            sample_processor=process_cc12_wd_sample,
+            sample_processor=process_cc12m_sample,
         ),
         post_filters=(is_not_none,),
     ),
@@ -46,7 +46,7 @@ MULTIMODAL_DATASETS: dict[str, SingleDataset] = {
         ),
         processor=partial(
             MultimodalProcessor,
-            sample_processor=process_cc12_wd_sample,
+            sample_processor=process_cc12m_sample,
         ),
         post_filters=(is_not_none,),
     ),
