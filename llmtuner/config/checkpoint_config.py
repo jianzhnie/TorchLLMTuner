@@ -12,6 +12,7 @@ from llmtuner.components.checkpointer.checkpoint_keys import (
     MODEL,
     OPTIMIZER,
 )
+from llmtuner.config.field_checks_config import require_integer_at_least
 from llmtuner.errors import ConfigError
 from llmtuner.utils.logging import get_logger
 
@@ -105,16 +106,16 @@ class CheckpointConfig:
     def __post_init__(self) -> None:
         if not self.folder.strip():
             raise ConfigError("checkpoint.folder must not be empty.")
-        if self.interval < 1:
-            raise ConfigError(f"checkpoint.interval must be >= 1, got {self.interval}")
+        require_integer_at_least(self, "interval", group="checkpoint")
+        if not isinstance(self.load_step, int) or isinstance(self.load_step, bool):
+            raise ConfigError(
+                f"checkpoint.load_step must be an integer >= -1, got {self.load_step!r}"
+            )
         if self.load_step < -1:
             raise ConfigError(
                 f"checkpoint.load_step must be >= -1, got {self.load_step}"
             )
-        if self.keep_latest_k < 0:
-            raise ConfigError(
-                f"checkpoint.keep_latest_k must be >= 0, got {self.keep_latest_k}"
-            )
+        require_integer_at_least(self, "keep_latest_k", group="checkpoint", minimum=0)
         if self.keep_latest_k == 1:
             raise ConfigError(
                 "checkpoint.keep_latest_k must not be 1: at least 2 replicas "

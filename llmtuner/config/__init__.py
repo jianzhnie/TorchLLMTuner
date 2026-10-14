@@ -32,8 +32,8 @@ Design notes (see docs/torchllmtuner_design.md): grouped by concern, then COMPOS
 validation runs automatically via ``default_factory``, with no fragile manual
 chaining. The single entry point is ``LLMTunerConfig``.
 
-Kept deliberately small for the learning path: one optimizer (adamw), one LR
-schedule, deterministic seeding. Add knobs only when a learning step needs them.
+The default optimizer is AdamW; programmatic parameter groups may select Adam
+or AdamW independently. Learning rates follow the warmup-stable-decay schedule.
 
 The classes live one domain per file under this package
 (``model_config.py`` / ``parallel_config.py`` / ...); everything is re-exported here so
@@ -49,16 +49,17 @@ from llmtuner.config.activation_checkpoint_config import (
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.data_config import DataloaderConfig
+from llmtuner.config.ema_config import EMAConfig
 from llmtuner.config.llmtuner_config import LLMTunerConfig
+from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
 from llmtuner.config.optimizer_config import (
-    EMAConfig,
-    LRSchedulerConfig,
     OptimizerConfig,
     ParamGroupConfig,
 )
 from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.config.rope_config import RoPEConfig
 from llmtuner.config.training_config import TrainingConfig
 from llmtuner.config.validation_config import ValidationConfig
 
@@ -77,6 +78,7 @@ __all__ = [
     "ParamGroupConfig",
     "ProfilerConfig",
     "RegionACConfig",
+    "RoPEConfig",
     "SelectiveACConfig",
     "TrainingConfig",
     "VALID_AC_MODES",

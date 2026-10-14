@@ -5,11 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-import torch
-
 from llmtuner.config.context_parallel_config import validate_context_parallel_config
 from llmtuner.config.expert_parallel_config import validate_expert_parallel_config
-from llmtuner.config.field_checks_config import require_at_least
+from llmtuner.config.field_checks_config import require_integer_at_least
 from llmtuner.config.fsdp_config import validate_fsdp_config
 from llmtuner.config.pipeline_parallel_config import validate_pipeline_parallel_config
 from llmtuner.config.tensor_parallel_config import validate_tensor_parallel_config
@@ -71,7 +69,7 @@ class ParallelConfig:
     """Number of earlier FSDP units explicitly prefetched during backward."""
 
     fsdp_apply_modules: dict[str, dict[str, Any]] = field(default_factory=dict)
-    """Optional module patterns and per-unit ``fully_shard`` overrides."""
+    """Programmatic-only module patterns and per-unit ``fully_shard`` overrides."""
 
     fsdp_ignored_modules: list[str] = field(default_factory=list)
     """Module patterns excluded from FSDP parameter management."""
@@ -130,8 +128,9 @@ class ParallelConfig:
     This provides more explicit control over which modules belong to each chunk
     compared to split points.
 
-    Name drift: upstream has since renamed this field
-    ``pipeline_parallel_module_fqns_per_model_part``. The flag here keeps the
+    Programmatic-only: the CLI parser cannot construct nested lists.
+    Upstream has since renamed this field
+    ``pipeline_parallel_module_fqns_per_model_part``. The field here keeps the
     spelling it was audited under.
     """
 
@@ -327,11 +326,19 @@ class ParallelConfig:
         """Resolve ``data_parallel_shard_size`` against world_size.
 
         ``-1`` means "derive from world_size": the leftover ranks after
-        dp_replicate / tp / pp / cp / ep, matching ``ParallelTopology``'s
+        dp_replicate / tp / pp / cp, matching ``ParallelTopology``'s
         interpretation. Mirrors ``ParallelTopology._validate``'s divisibility
         check so a mis-sized launch fails here with a config-level message
         rather than deep inside mesh construction.
         """
+        if (
+            not isinstance(world_size, int)
+            or isinstance(world_size, bool)
+            or world_size < 1
+        ):
+            raise ConfigError(
+                f"world_size must be a positive integer, got {world_size!r}"
+            )
         fixed = self.non_dp_sizes()
         if self.data_parallel_shard_size == -1:
             if world_size % fixed != 0:
@@ -349,18 +356,9 @@ class ParallelConfig:
         return dp_shard
 
     def __post_init__(self):
-        validate_fsdp_config(self)
-        validate_tensor_parallel_config(self)
-        validate_pipeline_parallel_config(self)
-        validate_context_parallel_config(self)
-        validate_expert_parallel_config(self)
-        if self.train_timeout_seconds < 1:
-            raise ConfigError(
-                "parallel.train_timeout_seconds must be >= 1, got "
-                f"{self.train_timeout_seconds}"
-            )
-        require_at_least(
+        require_integer_at_least(
             self,
+            "train_timeout_seconds",
             "data_parallel_replicate_size",
             "tensor_parallel_size",
             "pipeline_parallel_size",
@@ -377,33 +375,23 @@ class ParallelConfig:
                 "parallel.fixed_router cannot be combined with "
                 "moe_quantile_balancing because fixed routing bypasses its choice"
             )
-        if self.data_parallel_shard_size < 1 and self.data_parallel_shard_size != -1:
+        if (
+            not isinstance(self.data_parallel_shard_size, int)
+            or isinstance(self.data_parallel_shard_size, bool)
+            or (
+                self.data_parallel_shard_size < 1
+                and self.data_parallel_shard_size != -1
+            )
+        ):
             raise ConfigError(
                 "parallel.data_parallel_shard_size must be >= 1 or -1 "
                 f"(derive), got {self.data_parallel_shard_size}"
             )
-        if self.enable_fsdp_symm_mem and (
-            not torch.cuda.is_available()
-            or (
-                torch.version.hip is None
-                and torch.cuda.get_device_capability() < (9, 0)
-            )
-        ):
-            raise ConfigError(
-                "parallel.enable_fsdp_symm_mem is only supported on NVIDIA "
-                "GPUs with compute capability 9.0 or newer."
-            )
-
-        # Import lazily so loading this module does not pull in pipelining.
-        from torch.distributed.pipelining.schedules import get_schedule_class
-
-        try:
-            get_schedule_class(self.pipeline_parallel_schedule)
-        except ValueError as e:
-            raise ConfigError(
-                "Invalid parallel.pipeline_parallel_schedule "
-                f"{self.pipeline_parallel_schedule!r}: {e}"
-            ) from e
+        validate_fsdp_config(self)
+        validate_tensor_parallel_config(self)
+        validate_pipeline_parallel_config(self)
+        validate_context_parallel_config(self)
+        validate_expert_parallel_config(self)
 
     # Short aliases for the torchtitan-spelled degree fields.
     @property
