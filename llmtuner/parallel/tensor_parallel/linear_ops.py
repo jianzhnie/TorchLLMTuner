@@ -48,10 +48,8 @@ def functional_collectives():
     """Import torch's functional collectives, lazily and version-tolerantly.
 
     The autograd-covered variants were renamed across torch releases. Current
-    torch exposes the dimension-preserving ``*_tensor_autograd`` names; older
-    releases used ``*_single`` or ``*_into_tensor``. Prefer the autograd
-    variants explicitly: the non-autograd collectives would silently break TP
-    weight/input gradients.
+    builds expose ``*_single_autograd`` or ``*_tensor_autograd`` names. Require
+    a complete autograd pair: non-autograd collectives would break TP gradients.
     """
     try:
         from torch.distributed import functional_collectives as funcol
@@ -60,13 +58,16 @@ def functional_collectives():
         # module name only; the public alias existed in older releases.
         from torch.distributed import _functional_collectives as funcol
 
-    if hasattr(funcol, "all_gather_single_autograd"):
-        return funcol.all_gather_single_autograd, funcol.reduce_scatter_single_autograd
-    if hasattr(funcol, "all_gather_tensor_autograd"):
-        return funcol.all_gather_tensor_autograd, funcol.reduce_scatter_tensor_autograd
-    if hasattr(funcol, "all_gather_single"):
-        return funcol.all_gather_single, funcol.reduce_scatter_single
-    return funcol.all_gather_into_tensor, funcol.reduce_scatter_tensor
+    for suffix in ("single_autograd", "tensor_autograd"):
+        all_gather = getattr(funcol, f"all_gather_{suffix}", None)
+        reduce_scatter = getattr(funcol, f"reduce_scatter_{suffix}", None)
+        if callable(all_gather) and callable(reduce_scatter):
+            return all_gather, reduce_scatter
+    raise ImportError(
+        "TP requires autograd-enabled functional all-gather and reduce-scatter; "
+        "install a torch build providing the *_single_autograd or "
+        "*_tensor_autograd pair."
+    )
 
 
 def all_gather_linear(
@@ -78,7 +79,7 @@ def all_gather_linear(
     ``w_shard_n`` the ``[N / R, K]`` output-feature weight shard; returns the
     full-sequence, feature-sharded ``[M, N / R]``.
 
-    No hand-written backward is needed: ``all_gather_single``'s registered
+    No hand-written backward is needed: the autograd all-gather's registered
     backward is a reduce-scatter (the dgrad dual), and the weight gradient falls
     out of the local matmul against the gathered input.
     """
@@ -96,7 +97,7 @@ def linear_reduce_scatter(
     ``[M, K / R]`` activation, ``w_shard_k`` the ``[N, K / R]`` input-feature
     weight shard; returns the sequence-sharded ``[M / R, N]``.
 
-    ``reduce_scatter_single``'s registered backward is an all-gather (the dgrad
+    The autograd reduce-scatter's backward is an all-gather (the dgrad
     dual); the weight gradient is the local matmul against the re-gathered
     output gradient, which autograd produces on its own.
     """

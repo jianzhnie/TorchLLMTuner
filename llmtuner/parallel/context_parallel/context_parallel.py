@@ -2,41 +2,33 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
-from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import ParallelConfig
 
 from ...utils.logging import get_logger
 from ..attention_heads import require_heads_divisible_by
 from .attention import CPFlexKernel, DualCPFlexKernel
-from .input_sharding import (
-    shard_attention_mask_for_cp,
-    shard_batch_for_cp,
-    shard_batch_for_tp,
-    shard_padding_mask_for_cp,
-    shard_padding_mask_for_tp,
-)
+
+if TYPE_CHECKING:
+    from ..topology import ParallelTopology
 
 logger = get_logger(__name__)
 
-__all__ = [
-    "CPFlexKernel",
-    "apply_cp",
-    "shard_attention_mask_for_cp",
-    "shard_batch_for_cp",
-    "shard_batch_for_tp",
-    "shard_padding_mask_for_cp",
-    "shard_padding_mask_for_tp",
-]
+__all__ = ["apply_cp"]
 
 # HF names the attention submodule differently across model families; probe in
-# the style of hf/model_setup.py's ``first_present`` rather than hardcoding one
+# the style of hf/model_setup.py's ``resolve_submodule_name`` rather than hardcoding one
 # family's spelling.
 _ATTN_MODULE_NAMES = ("self_attn", "attn", "attention")
 
 
-def require_ulysses_compatible(model: nn.Module, cfg: ParallelConfig, cp_mesh) -> None:
+def _require_ulysses_compatible(
+    model: nn.Module, *, cfg: ParallelConfig, cp_mesh: DeviceMesh
+) -> None:
     """Reject the ulysses combinations that would train a silently wrong model.
 
     The all-to-all is an even split of an evenly-sharded tensor, and every
@@ -107,9 +99,10 @@ def require_ulysses_compatible(model: nn.Module, cfg: ParallelConfig, cp_mesh) -
 
 def apply_cp(
     model: nn.Module,
+    *,
     mesh: DeviceMesh | None,
     cfg: ParallelConfig,
-    parallel_dims=None,
+    parallel_dims: ParallelTopology | None = None,
 ) -> nn.Module:
     """Attach a CP flex kernel to every decoder layer's attention module.
 
@@ -144,11 +137,8 @@ def apply_cp(
         logger.info("Applied KCP to %d KDA modules", patched)
         return model
 
-    # Lazy: ``models/hf/model.py`` imports this package's ``__init__`` at module
-    # scope (for the CP input sharding), and the ``__init__`` eagerly
-    # re-exports ``apply_cp`` from this module -- a module-level import of
-    # hf/model here would close that cycle whenever hf/model is imported
-    # first. Keeping it at the call site is what lets both import orders work.
+    # Import the HF backend only when CP is enabled; disabled CP needs no
+    # Transformers attention registration dependencies.
     from ...models.hf.attention_backend import ATTENTION_BACKEND
 
     impl = getattr(getattr(model, "model", None), "config", None)
@@ -186,9 +176,9 @@ def apply_cp(
         ulysses_mesh = parallel_dims.get_optional_mesh("cp_ulysses")
         if kv_mesh is None or ulysses_mesh is None:
             raise ValueError("dual CP axis meshes were not constructed")
-        require_ulysses_compatible(model, cfg, ulysses_mesh)
+        _require_ulysses_compatible(model, cfg=cfg, cp_mesh=ulysses_mesh)
     elif strategy == "ulysses":
-        require_ulysses_compatible(model, cfg, cp_mesh)
+        _require_ulysses_compatible(model, cfg=cfg, cp_mesh=cp_mesh)
 
     layers = getattr(model, "layers", None)
     if layers is None:

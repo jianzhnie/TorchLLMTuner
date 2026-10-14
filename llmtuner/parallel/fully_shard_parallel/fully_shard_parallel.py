@@ -19,11 +19,12 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully
 from torch.distributed.tensor import Shard
 from torch.nn import ModuleDict
 
-from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import ParallelConfig
 
 from ...accelerator import distributed
 from ...utils.logging import get_logger
 from ..topology import ParallelTopology
+from .fine_grained import get_fsdp_strategy
 from .plan import apply_fsdp_by_pattern, set_fsdp_prefetch_windows
 
 logger = get_logger(__name__)
@@ -31,7 +32,6 @@ logger = get_logger(__name__)
 __all__ = [
     "apply_fsdp",
     "apply_fsdp_to_decoder",
-    "apply_fsdp_by_pattern",
     "disable_fsdp_gradient_division",
     "enable_fsdp_symm_mem",
     "fsdp_shard_size",
@@ -40,7 +40,6 @@ __all__ = [
     "iter_transformer_layers",
     "resolve_fsdp_mesh",
     "resolve_sparse_fsdp_mesh",
-    "set_fsdp_prefetch_windows",
 ]
 
 
@@ -251,6 +250,7 @@ def get_fsdp_reshard_after_forward_policy(
 def apply_fsdp_to_decoder(
     model: nn.Module,
     dp_mesh: DeviceMesh,
+    *,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
     pp_enabled: bool,
@@ -263,9 +263,8 @@ def apply_fsdp_to_decoder(
     forward_prefetch_count: int = 0,
     backward_prefetch_count: int = 0,
     fsdp_implementation: str = "native",
-):
-    """
-    Apply data parallelism (via FSDP2) to a decoder-style transformer model.
+) -> None:
+    """Apply FSDP in place to a decoder-style transformer model.
 
     Shared by all dense and MoE decoders (llama3, qwen3, deepseek_v3,
     gpt_oss, qwen3_vl, ...). The MoE handling is a strict superset of the dense
@@ -307,16 +306,17 @@ def apply_fsdp_to_decoder(
     full SPMD mesh, the explicit form is not available here anyway (see
     ``resolve_fsdp_mesh``).
     """
+    strategy = get_fsdp_strategy(fsdp_implementation)
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
         cast_forward_inputs=False,
     )
-    shard_fn = fully_shard
-    if fsdp_implementation == "custom":
-        from .fine_grained import fully_shard_fine_grained
-
-        shard_fn = fully_shard_fine_grained
+    shard_fn = (
+        fully_shard
+        if fsdp_implementation == "native"
+        else strategy.get_fully_shard_fn()
+    )
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy(
@@ -557,7 +557,7 @@ def apply_fsdp(
         param_dtype = torch.get_default_dtype()
     reduce_dtype = torch.float32
 
-    if getattr(cfg, "fsdp_apply_modules", None):
+    if cfg.fsdp_apply_modules:
         apply_fsdp_by_pattern(
             model,
             dp_mesh=storage_mesh,
@@ -582,9 +582,9 @@ def apply_fsdp(
         ep_degree=parallel_dims.ep,
         edp_mesh=edp_mesh,
         symm_mem_scope=(cfg.fsdp_symm_mem_scope if cfg.enable_fsdp_symm_mem else None),
-        forward_prefetch_count=getattr(cfg, "fsdp_forward_prefetch_count", 0),
-        backward_prefetch_count=getattr(cfg, "fsdp_backward_prefetch_count", 0),
-        fsdp_implementation=getattr(cfg, "fsdp_implementation", "native"),
+        forward_prefetch_count=cfg.fsdp_forward_prefetch_count,
+        backward_prefetch_count=cfg.fsdp_backward_prefetch_count,
+        fsdp_implementation=cfg.fsdp_implementation,
     )
     # ``apply_fsdp_to_decoder`` already calls ``disable_fsdp_gradient_division``
     # and, when asked, ``enable_fsdp_symm_mem``; do not repeat them here.

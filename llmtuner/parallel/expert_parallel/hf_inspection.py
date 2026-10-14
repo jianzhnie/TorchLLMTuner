@@ -67,18 +67,13 @@ only adds, and is refused at the point the shared expert is found.
 
 from __future__ import annotations
 
-import sys
 from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 
 from ...models.common.moe.layer import MOE_LAYER_ATTRS
-from ...utils.logging import get_logger
 from .. import compatibility
-
-logger = get_logger(__name__)
-
 
 __all__ = [
     "FusedExperts",
@@ -90,6 +85,7 @@ __all__ = [
     "read_route_norm",
     "read_route_scale",
     "resolve_score_func",
+    "resolve_shared_expert",
     "resolve_top_k",
     "router_of",
 ]
@@ -175,11 +171,8 @@ def fused_experts_of(block: nn.Module) -> FusedExperts | None:
     if hasattr(experts, "gate_up_proj_bias") or hasattr(experts, "down_proj_bias"):
         compatibility.gpt_oss_layout(experts)
     num_experts, double_hidden, dim = gate_up.shape
-    # down_proj is (E, D, F) with the *same* D: the token dim must agree on both
-    # sides. Its trailing dim is F, which equals ``double_hidden / 2`` only for
-    # architectures whose expert hidden size matches the dense MLP's -- Mixtral
-    # and OLMoE, but not Qwen3Moe or DeepSeek -- so it is deliberately not
-    # checked against ``double_hidden``.
+    # Both projections must agree on D and on the expert width F. F may differ
+    # from the dense MLP width; only the actual expert tensor shapes matter.
     if double_hidden % 2 != 0 or down.shape[1:] != (dim, double_hidden // 2):
         raise ValueError(
             f"unrecognized expert weight shapes: gate_up_proj "
@@ -223,15 +216,21 @@ def is_hf_moe_block(module: nn.Module) -> bool:
     on where it lives -- DeepSeek and Mixtral declare it on the block, Qwen3Moe
     and OLMoE on the router.
     """
-    try:
-        experts = fused_experts_of(module)
-    except NotImplementedError:
-        # A block this swap refuses to convert is still a MoE, and the caller
-        # must see the refusal rather than a generic "not a MoE block" skip.
-        raise
+    # Unsupported layouts must propagate their error rather than be skipped
+    # as ordinary dense blocks.
+    experts = fused_experts_of(module)
     if experts is None:
         return False
     return has_router_weight(router_of(module)) and resolve_top_k(module) is not None
+
+
+def resolve_shared_expert(block: nn.Module) -> tuple[str, nn.Module | None]:
+    """Select a populated shared-expert attribute and preserve its HF path."""
+    for name in ("shared_expert", "shared_experts"):
+        shared = getattr(block, name, None)
+        if shared is not None:
+            return name, shared
+    return "shared_expert", None
 
 
 def resolve_top_k(block: nn.Module) -> int | None:
@@ -391,87 +390,3 @@ def read_expert_groups(
     if ignores_norm_topk_prob(block, router):
         compatibility.group_limited_greedy()
     return num_groups, read_int_attr(block, router, "topk_group")
-
-
-def probe_expert_layouts() -> None:
-    """Development-time survey of the expert layouts transformers 5.9 ships.
-
-    Not called at import: it builds seven real models, which is far too much
-    work to pay for on every import of a training package. Run it by hand
-    against a new transformers minor.
-
-    Kept because the shapes are the whole premise of ``fused_experts_of``:
-    when an upgrade breaks the swap, this says immediately whether the layout
-    moved or the probe broke.
-
-    Measured on transformers 5.9.0 with the uniform tiny config above::
-
-        qwen3_moe    gate_up_proj (8, 96, 64)   down_proj (8, 64, 48)    silu
-        olmoe        gate_up_proj (8, 256, 64)  down_proj (8, 64, 128)   silu
-        mixtral      gate_up_proj (8, 256, 64)  down_proj (8, 64, 128)   silu
-        gpt_oss      gate_up_proj (8, 64, 256)  down_proj (8, 128, 64)   clamped glu
-
-    Mixtral and OLMoE have ``2F == D``, which is why ``fused_experts_of``
-    cannot validate the gate/up halves against each other and checks the token
-    dim instead.
-
-    GPT-OSS is unlike the others twice over, and both are why it is refused:
-    ``gate_up_proj`` is transposed (``(E, D, 2F)``, splitting on the token dim
-    rather than the output dim), and its activation is not a module at all but a
-    hardcoded clamped sigmoid-GLU (``gate.clamp(max=7) * sigmoid(1.702 * gate)``
-    with a clamped ``up``), plus a bias vector per projection. DeepSeek-V2/V3 and
-    GLM4 do not appear here: their layer 0 is the dense ``first_k_dense_replace``
-    MLP, and their later layers are reached through the swap tests instead.
-
-    Uses ``sys.modules`` rather than importing transformers at the top of this
-    module, which would make the package unimportable without it.
-    """
-    transformers = sys.modules.get("transformers")
-    if transformers is None:
-        raise RuntimeError(
-            "probe_expert_layouts needs transformers imported first; it is a "
-            "development tool, not part of the training path."
-        )
-
-    # A uniform tiny config: several families build a 4000-expert model from
-    # their own defaults, and the point here is the shape convention, not size.
-    common = dict(
-        hidden_size=64,
-        intermediate_size=128,
-        moe_intermediate_size=48,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        num_experts=8,
-        num_experts_per_tok=2,
-        num_local_experts=8,
-        n_routed_experts=8,
-        n_shared_experts=1,
-        decoder_sparse_step=1,
-        first_k_dense_replace=1,
-        n_group=2,
-        topk_group=1,
-        max_position_embeddings=128,
-    )
-    for family in ("qwen3_moe", "olmoe", "mixtral", "gpt_oss"):
-        try:
-            config = transformers.AutoConfig.for_model(family, **common)
-            layers = transformers.AutoModelForCausalLM.from_config(
-                config, experts_implementation="eager"
-            ).model.layers
-            # The last layer, not the first: DeepSeek and GLM4 put a dense MLP
-            # at index 0 (first_k_dense_replace), so layer 0 carries no experts.
-            experts = layers[-1].mlp.experts
-            gate_up = getattr(experts, "gate_up_proj", None)
-            down = getattr(experts, "down_proj", None)
-            # GPT-OSS spells it ``_act_fn`` and has no ``act_fn``.
-            act = getattr(experts, "act_fn", None) or getattr(experts, "_act_fn", None)
-            logger.info(
-                "%s: gate_up_proj %s, down_proj %s, act %s",
-                family,
-                "?" if gate_up is None else tuple(gate_up.shape),
-                "?" if down is None else tuple(down.shape),
-                type(act).__name__,
-            )
-        except Exception as err:  # noqa: BLE001 - a survey, not a gate
-            logger.info("%s: unavailable (%s)", family, err)

@@ -1,10 +1,4 @@
-"""The EP swap's block conversion: HF MoE block -> llmtuner MoE.
-
-Split out of ``model_replacement.py``: ``convert_block`` builds the llmtuner MoE for one
-probed HF block and moves its weights over; ``restore_fp32_state_buffers``
-undoes the buffer dtype cast ``Module.to`` applies. The layout probes live in
-``hf_inspection.py``, the orchestration in ``model_replacement.py``.
-"""
+"""Construct an EP-capable MoE from a probed HF block and copy its weights."""
 
 from __future__ import annotations
 
@@ -13,6 +7,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ...accelerator import distributed
+from ...models.common.aux_loss import AuxLoss
 from ...models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
 from ...models.common.moe.experts import (
     DominoRoutedExperts,
@@ -32,6 +27,7 @@ from .hf_inspection import (
     read_route_norm,
     read_route_scale,
     resolve_score_func,
+    resolve_shared_expert,
     resolve_top_k,
     router_of,
 )
@@ -53,16 +49,20 @@ def restore_fp32_state_buffers(module: nn.Module) -> None:
     Neither has a gradient, so casting them buys nothing and silently costs
     precision. Upstream keeps both fp32 unconditionally.
 
-    Scoped to float buffers: an integer buffer's dtype is already exact and
-    casting it back would be wrong.
+    Restore only buffers owned by MoE statistics and auxiliary losses. Shared
+    experts are reused from the HF block and retain their original dtypes.
     """
-    for buffer in module.buffers():
-        if torch.is_floating_point(buffer):
-            buffer.data = buffer.data.to(torch.float32)
+    for child in module.modules():
+        if isinstance(child, MoE | AuxLoss):
+            for buffer in child.buffers(recurse=False):
+                if torch.is_floating_point(buffer):
+                    buffer.data = buffer.data.to(torch.float32)
 
 
-def build_aux_loss(aux_loss_coeff: float | None):
-    """The per-microbatch load-balance loss a router carries, or none."""
+def build_aux_loss(
+    aux_loss_coeff: float | None,
+) -> MicrobatchWiseLoadBalanceLoss | None:
+    """Build the optional loss shared by both router construction paths."""
     return (
         MicrobatchWiseLoadBalanceLoss(coeff=aux_loss_coeff) if aux_loss_coeff else None
     )
@@ -87,6 +87,11 @@ def convert_block(
     assert router_gate is not None  # the probe established this
     if getattr(router_gate, "bias", None) is not None:
         compatibility.router_bias(router_gate)
+    _, shared = resolve_shared_expert(block)
+    if shared is not None and hasattr(block, "shared_expert_gate"):
+        compatibility.shared_expert_gate(block)
+    if shared is not None and tp_enabled:
+        compatibility.shared_expert_tp_ep(block)
     experts = fused_experts_of(block)
     assert experts is not None  # the probe established this
 
@@ -153,14 +158,6 @@ def convert_block(
         # them back on load (see expert_parallel/checkpointing.py).
         mark_experts_ep_sharded(grouped, ep_group)
 
-    shared = getattr(block, "shared_expert", None) or getattr(
-        block, "shared_experts", None
-    )
-    if shared is not None and hasattr(block, "shared_expert_gate"):
-        compatibility.shared_expert_gate(block)
-    if shared is not None and tp_enabled:
-        compatibility.shared_expert_tp_ep(block)
-
     routed_experts_cls = (
         DominoRoutedExperts if token_dispatcher == "domino" else RoutedExperts
     )
@@ -172,7 +169,6 @@ def convert_block(
         # e_score_correction_bias. Off for models that carry no such buffer --
         # a frozen zero bias is dead state in the checkpoint.
         load_balance_coeff=load_balance_coeff,
-        shared_experts=shared,
     )
 
     # Match the block's dtype/device before the copies so they are exact, and
@@ -199,4 +195,7 @@ def convert_block(
         bias = getattr(router_gate, "e_score_correction_bias", None)
         if bias is not None and moe.expert_bias_E is not None:
             moe.expert_bias_E.copy_(bias.float())
+    # Reuse the HF shared expert after initializing the new subtree. Casting
+    # or setting the mode recursively must not mutate this original module.
+    moe.shared_experts = shared
     return moe

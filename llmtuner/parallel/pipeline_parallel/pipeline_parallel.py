@@ -1,6 +1,6 @@
 """Pipeline parallelism: split the model, then build the schedule over it.
 
-``pipeline.py`` (same package) computes the stage split; this module is the
+``partition.py`` (same package) computes the stage split; this module is the
 driver around it, vendored in shape from torchtitan's
 ``distributed/pipeline_parallel.pipeline_llm``:
 
@@ -16,7 +16,7 @@ driver around it, vendored in shape from torchtitan's
   normalizes, wrapped down to the bare scalar a schedule requires.
 
 What is not ported: the ``get_mesh`` callback (llmtuner passes plain tensors
-across stage boundaries, never DTensors -- see ``pipeline.py``) and csv-loaded
+across stage boundaries, never DTensors -- see ``partition.py``) and csv-loaded
 runtime schedules, which are rejected rather than honored.
 """
 
@@ -25,7 +25,6 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -38,7 +37,7 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
 )
 
-from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import ParallelConfig
 
 from ...accelerator.capabilities import require
 from ...components.loss import cross_entropy_loss
@@ -69,7 +68,12 @@ class PipelineParallelSetup:
 
 
 def scalar_loss_fn(
-    pred: torch.Tensor, labels: torch.Tensor, **loss_kwargs
+    pred: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    global_valid_tokens: torch.Tensor,
+    tp_group: dist.ProcessGroup | None = None,
+    global_vocab_size: int | None = None,
 ) -> torch.Tensor:
     """Summed next-token CE over one microbatch, as a bare scalar.
 
@@ -89,7 +93,7 @@ def scalar_loss_fn(
 
     The caller divides it back out for reporting.
 
-    ``tp_group`` / ``global_vocab_size`` ride along in ``loss_kwargs`` and go
+    ``tp_group`` / ``global_vocab_size`` go
     straight to :func:`cross_entropy_loss`; a full-vocab (replicated) head
     keeps ``pred.shape[-1] == global_vocab_size`` and takes the plain path, so
     the default is the old behaviour.
@@ -98,17 +102,18 @@ def scalar_loss_fn(
         cross_entropy_loss(
             pred,
             labels,
-            tp_group=loss_kwargs.get("tp_group"),
-            global_vocab_size=loss_kwargs.get("global_vocab_size"),
+            tp_group=tp_group,
+            global_vocab_size=global_vocab_size,
         )
-        / loss_kwargs["global_valid_tokens"]
+        / global_valid_tokens
     )
 
 
 def make_schedule_loss_fn(
     schedule: _PipelineSchedule,
     *,
-    vocab_kwargs: dict[str, Any] | None = None,
+    tp_group: dist.ProcessGroup | None = None,
+    global_vocab_size: int | None = None,
 ) -> Callable[..., torch.Tensor]:
     """The schedule's ``loss_fn``, reading the denominator from either route.
 
@@ -126,25 +131,27 @@ def make_schedule_loss_fn(
     Returning the closure rather than a lambda also makes this testable without
     a live pipeline, which a lambda defined inline could not be.
 
-    ``vocab_kwargs`` is this path's copy of ``Trainer.loss_vocab_kwargs``:
     ``tp_group`` and ``global_vocab_size`` are constant for the whole run, so
     they are captured here at build time (where the pre-split model still
     exists and knows its vocabulary) rather than read off the schedule on every
     call the way the per-step denominator has to be. The closure is what the
     schedule actually calls, so both drivers receive them.
     """
-    vocab = dict(vocab_kwargs or {})
 
     def _schedule_loss_fn(
-        pred: torch.Tensor, labels: torch.Tensor, **loss_kwargs: Any
+        pred: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        global_valid_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if global_valid_tokens is None:
+            global_valid_tokens = schedule._llmtuner_global_valid_tokens
         return scalar_loss_fn(
             pred,
             labels,
-            global_valid_tokens=loss_kwargs.get(
-                "global_valid_tokens", schedule._llmtuner_global_valid_tokens
-            ),
-            **vocab,
+            global_valid_tokens=global_valid_tokens,
+            tp_group=tp_group,
+            global_vocab_size=global_vocab_size,
         )
 
     return _schedule_loss_fn
@@ -232,8 +239,14 @@ def prepend_first_stage_modules(
     seen: set[str] = set()
     present = []
     for fqn in first_stage_module_fqns:
-        if getattr(model, fqn, None) is None:
+        module = getattr(model, fqn, None)
+        if module is None:
             continue
+        if not isinstance(module, nn.Module):
+            raise ValueError(
+                f"first-stage module {fqn!r} must be an nn.Module, "
+                f"got {type(module).__name__}"
+            )
         if fqn in owned:
             raise ValueError(
                 f"first-stage module {fqn!r} is already assigned to a pipeline "
@@ -340,7 +353,10 @@ def apply_pp(
             parallel_dims, parallelism, num_layers
         )
         module_names_per_stage = generate_llm_fqn_per_model_part(
-            num_stages, num_layers, input_weight, output_weight
+            num_stages,
+            num_layers,
+            input_weight=input_weight,
+            output_weight=output_weight,
         )
         if first_stage_module_fqns:
             prepend_first_stage_modules(
@@ -458,10 +474,8 @@ def build_pipeline_schedule(
     schedule._llmtuner_global_valid_tokens = torch.ones((), dtype=torch.float32)
     schedule._loss_fn = make_schedule_loss_fn(
         schedule,
-        vocab_kwargs={
-            "tp_group": tp_group,
-            "global_vocab_size": global_vocab_size,
-        },
+        tp_group=tp_group,
+        global_vocab_size=global_vocab_size,
     )
     logger.info(
         f"Using pipeline schedule {parallelism.pipeline_parallel_schedule} "

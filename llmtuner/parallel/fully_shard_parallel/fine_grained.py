@@ -55,7 +55,7 @@ class CustomFSDPStrategy(NativeFSDPStrategy):
         return fully_shard_fine_grained
 
 
-def get_fsdp_strategy(implementation: str):
+def get_fsdp_strategy(implementation: str) -> NativeFSDPStrategy:
     if implementation == "native":
         return NativeFSDPStrategy()
     if implementation == "custom":

@@ -350,10 +350,10 @@ class CPFlexKernel(nn.Module):
             # ``separate_full_blocks`` handling, same BLOCK_SIZE.
             mask = create_attention_mask(
                 get_causal_mask_mod(),
-                1,
-                None,
-                seq_len,
-                seq_len,
+                B=1,
+                H=None,
+                Q_LEN=seq_len,
+                KV_LEN=seq_len,
                 device=q_BHSD.device,
                 BLOCK_SIZE=128,
                 separate_full_blocks=True,

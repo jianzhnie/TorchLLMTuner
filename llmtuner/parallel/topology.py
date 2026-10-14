@@ -3,7 +3,7 @@
 Config says how many ways to split (``config/parallel_config.py``); this module turns
 that into the actual process topology: the dense mesh (dp_shard x dp_replicate
 x cp x tp, x pp) and, under EP, the sparse mesh (pp x dp_replicate x efsdp x
-ep). It also owns ``build_parallel_topology`` and ``build_mesh``
+ep). It also owns ``resolve_parallel_topology`` and ``build_device_mesh``
 entry points and the loss/dataloading sub-mesh derivations the trainer
 reduces over.
 """
@@ -14,7 +14,8 @@ from dataclasses import dataclass, field
 
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
-from llmtuner.config import LLMTunerConfig, ParallelConfig
+from llmtuner.config.llmtuner_config import LLMTunerConfig
+from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import ConfigError
 
 from ..accelerator.device import device_type
@@ -26,8 +27,8 @@ logger = get_logger(__name__)
 __all__ = [
     "MESH_AXES",
     "ParallelTopology",
-    "build_mesh",
-    "build_parallel_topology",
+    "build_device_mesh",
+    "resolve_parallel_topology",
 ]
 
 
@@ -86,16 +87,30 @@ class ParallelTopology:
             "cp_ulysses": self.cp_ulysses,
         }
         for name, degree in named_degrees.items():
-            if degree < 1:
-                raise ValueError(f"{name} must be >= 1, got {degree}")
+            if not isinstance(degree, int) or isinstance(degree, bool) or degree < 1:
+                raise ValueError(
+                    f"{name} must be >= 1 (a positive integer), got {degree!r}"
+                )
         if self.cp_kv * self.cp_ulysses not in (1, cp):
             raise ValueError(
                 "cp_kv * cp_ulysses must equal cp when explicit CP axes are used"
             )
-        if dp_shard != -1 and dp_shard < 1:
-            raise ValueError(f"dp_shard must be -1 or >= 1, got {dp_shard}")
-        if self.world_size < 1:
-            raise ValueError(f"world_size must be >= 1, got {self.world_size}")
+        if (
+            not isinstance(dp_shard, int)
+            or isinstance(dp_shard, bool)
+            or (dp_shard != -1 and dp_shard < 1)
+        ):
+            raise ValueError(
+                f"dp_shard must be -1 or >= 1 (a positive integer), got {dp_shard!r}"
+            )
+        if (
+            not isinstance(self.world_size, int)
+            or isinstance(self.world_size, bool)
+            or self.world_size < 1
+        ):
+            raise ValueError(
+                f"world_size must be >= 1 (a positive integer), got {self.world_size!r}"
+            )
         if dp_shard < 0:
             fixed = dp_replicate * cp * tp * pp
             if self.world_size % fixed != 0:
@@ -131,7 +146,7 @@ class ParallelTopology:
             return True if self.ep > 1 else False
         return size > 1
 
-    def build_mesh(self) -> DeviceMesh:
+    def build_device_mesh(self) -> DeviceMesh:
         """
         Build the device mesh with the required mesh dimensions.
 
@@ -278,7 +293,7 @@ class ParallelTopology:
         return self._world_mesh
 
     def _expected_mesh_sizes(self) -> dict[str, int]:
-        """The size contract of every single-axis mesh ``build_mesh`` creates.
+        """The size contract of every single-axis mesh ``build_device_mesh`` creates.
 
         Split out of ``_validate_meshes`` so the contract is stated once and is
         readable without a process group -- which is the only way to pin the
@@ -343,7 +358,7 @@ class ParallelTopology:
             ValueError: If the requested dimension name(s) is not valid.
         """
         if not self._single_axis_meshes:
-            self.build_mesh()
+            self.build_device_mesh()
 
         if isinstance(dims, str):
             dims = [dims]
@@ -410,13 +425,13 @@ class ParallelTopology:
     def spmd_dense_mesh(self) -> DeviceMesh:
         """Dense SPMD mesh used for forward/backward typechecking."""
         if not self._single_axis_meshes:
-            self.build_mesh()
+            self.build_device_mesh()
         return self._global_meshes["spmd_dense_for_fwdbwd"]
 
     def spmd_sparse_mesh(self) -> DeviceMesh | None:
         """Sparse SPMD mesh used inside expert dispatch."""
         if not self._single_axis_meshes:
-            self.build_mesh()
+            self.build_device_mesh()
         return self._global_meshes.get("spmd_sparse_for_fwdbwd")
 
     def get_all_one_dimensional_meshes(self) -> dict[str, DeviceMesh]:
@@ -447,7 +462,7 @@ class ParallelTopology:
 
         """
         if not self._single_axis_meshes:
-            self.build_mesh()
+            self.build_device_mesh()
         return {
             k: v
             for k, v in self._single_axis_meshes.items()
@@ -499,8 +514,8 @@ class ParallelTopology:
 MESH_AXES = ("dp", "cp", "tp")
 
 
-def build_parallel_topology(
-    cfg: LLMTunerConfig, world_size: int
+def resolve_parallel_topology(
+    cfg: LLMTunerConfig, *, world_size: int
 ) -> ParallelTopology | None:
     """Resolve the parallelism degrees against ``world_size`` (torchtitan class).
 
@@ -541,10 +556,11 @@ def build_parallel_topology(
     return ParallelTopology.from_config(cfg.parallel, world_size)
 
 
-def build_mesh(parallel_dims: ParallelTopology | None):
+def build_device_mesh(parallel_dims: ParallelTopology | None):
     """The dense ``(dp, cp, tp)`` mesh the parallel ``apply_*`` functions index.
 
-    Takes the *already-resolved* ``ParallelTopology`` (see ``build_parallel_topology``)
+    Takes the *already-resolved* ``ParallelTopology`` (see
+    ``resolve_parallel_topology``)
     rather than a config, so a run has exactly one degree-resolution object --
     and therefore one set of process groups. ``None`` in, ``None`` out: there is
     no process group and no parallelism to describe.
@@ -553,7 +569,7 @@ def build_mesh(parallel_dims: ParallelTopology | None):
     SPMD context registers, so ``apply_tp``'s ``mesh["tp"]`` and a component's
     ``spmd_mesh_group("tp")`` resolve to the very same process group.
 
-    ``build_mesh`` deliberately does NOT call ``init_device_mesh`` itself. The
+    ``build_device_mesh`` deliberately does NOT call ``init_device_mesh`` itself. The
     parallelism layer needs more than one view of the same ranks -- FSDP wants
     ``(dp_replicate, dp_shard, cp, tp)``, SPMD type checking wants ``(dp, cp,
     tp)`` with the two DP axes folded and singletons dropped, EP wants a

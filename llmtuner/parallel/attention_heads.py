@@ -37,18 +37,22 @@ def head_counts(model: nn.Module) -> list[tuple[str, int]]:
     Reads the HF config the wrapper holds under ``model.model``; returns an
     empty list when there is none. GQA configs may omit ``num_key_value_heads``
     entirely -- then every head is a KV head, so the count falls back to
-    ``num_attention_heads``, exactly as upstream's
-    ``n_kv_heads = getattr(attention, "n_kv_heads", None) or n_heads`` does.
+    ``num_attention_heads``. Explicit counts must be positive integers;
+    zero is an invalid count rather than a request for the MHA default.
     """
     config = getattr(getattr(model, "model", None), "config", None)
     n_heads = getattr(config, "num_attention_heads", None)
-    if not n_heads:
+    if n_heads is None:
         return []
-    n_kv_heads = getattr(config, "num_key_value_heads", None) or n_heads
-    return [
+    n_kv_heads = getattr(config, "num_key_value_heads", None)
+    counts = [
         ("num_attention_heads", n_heads),
-        ("num_key_value_heads", n_kv_heads),
+        ("num_key_value_heads", n_heads if n_kv_heads is None else n_kv_heads),
     ]
+    for field, count in counts:
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            raise ValueError(f"{field} must be a positive integer, got {count!r}")
+    return counts
 
 
 def require_heads_divisible_by(
@@ -58,7 +62,7 @@ def require_heads_divisible_by(
     axis: str,
     why: str,
 ) -> None:
-    """Raise unless every attention head count divides ``size``.
+    """Raise unless ``size`` divides every attention head count.
 
     ``axis`` names the parallelism whose size this is (``"tp"``, ``"tp*cp"``)
     and ``why`` gives the one-line reason that axis divides heads, so each call

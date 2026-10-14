@@ -35,14 +35,14 @@ from llmtuner.errors import (
 
 __all__ = [
     "ENTRIES",
-    "Row",
+    "CompatibilityRule",
 ]
 
 Phase = Literal["config", "assembly", "probe"]
 
 
 @dataclass(frozen=True)
-class Row:
+class CompatibilityRule:
     """One matrix row. ``name``/``reason`` derive from the function."""
 
     fn: Callable
@@ -330,122 +330,122 @@ def shared_expert_tp_ep(block: object) -> None:
 # == the table ====================================================================
 
 
-ENTRIES: tuple[Row, ...] = (
-    Row(
+ENTRIES: tuple[CompatibilityRule, ...] = (
+    CompatibilityRule(
         validation_once_requires_dp1,
         "assembly",
         ConfigError,
         "trainer/runtime/validation.py::check_validation_feasibility",
     ),
-    Row(
+    CompatibilityRule(
         validation_once_requires_finite_corpus,
         "assembly",
         ConfigError,
         "trainer/runtime/validation.py::check_validation_feasibility",
     ),
-    Row(
+    CompatibilityRule(
         chunked_loss_pp,
         "assembly",
         UnsupportedCombinationError,
         "trainer/trainer.py::Trainer.__init__",
     ),
-    Row(
+    CompatibilityRule(
         ep_hf_initial_load,
         "assembly",
         UnsupportedCombinationError,
         "trainer/runtime/assembly.py::assemble_trainer_runtime",
     ),
-    Row(
+    CompatibilityRule(
         chunked_loss_validation,
         "assembly",
         UnsupportedCombinationError,
         "trainer/runtime/validation.py::check_validation_feasibility",
     ),
-    Row(
+    CompatibilityRule(
         pp_weight_tying,
         "assembly",
         UnsupportedCombinationError,
         "parallel/pipeline_parallel/pipeline_parallel.py::apply_pp",
     ),
-    Row(
+    CompatibilityRule(
         dsa_pp,
         "assembly",
         UnsupportedCombinationError,
         "parallel/pipeline_parallel/pipeline_parallel.py::apply_pp",
     ),
-    Row(
+    CompatibilityRule(
         pp_packed_microbatch_split,
         "assembly",
         UnsupportedCombinationError,
         "trainer/runtime/pipeline.py::split_pipeline_microbatches",
     ),
-    Row(
+    CompatibilityRule(
         shared_expert_tp,
         "assembly",
         UnsupportedCombinationError,
         "parallel/tensor_parallel/tensor_parallel.py::apply_tp",
     ),
-    Row(
+    CompatibilityRule(
         tp_moe_specs_without_block,
         "assembly",
         UnsupportedCombinationError,
         "parallel/tensor_parallel/tensor_parallel.py::apply_tp",
     ),
-    Row(
+    CompatibilityRule(
         tp_moe_non_tensor_output,
         "assembly",
         UnsupportedCombinationError,
         "parallel/tensor_parallel/tensor_parallel.py::TPMoeSequenceBoundary.forward",
     ),
-    Row(
+    CompatibilityRule(
         quantile_requires_ep,
         "assembly",
         UnsupportedCombinationError,
         "parallel/expert_parallel/expert_parallel.py::apply_ep",
     ),
-    Row(
+    CompatibilityRule(
         ptrr_load_balancer_backstop,
         "assembly",
         UnsupportedCombinationError,
         "parallel/context_parallel/input_sharding.py::resolve_load_balancer",
     ),
-    Row(
+    CompatibilityRule(
         gpt_oss_layout,
         "probe",
         UnsupportedCombinationError,
         "parallel/expert_parallel/hf_inspection.py::fused_experts_of",
     ),
-    Row(
+    CompatibilityRule(
         group_limited_greedy,
         "probe",
         UnsupportedCombinationError,
         "parallel/expert_parallel/hf_inspection.py::read_expert_groups",
     ),
-    Row(
+    CompatibilityRule(
         router_bias,
         "probe",
         UnsupportedCombinationError,
         "parallel/expert_parallel/block_conversion.py::convert_block",
     ),
-    Row(
+    CompatibilityRule(
         quantile_requires_sigmoid,
         "probe",
         UnsupportedCombinationError,
         "parallel/expert_parallel/block_conversion.py::convert_block",
     ),
-    Row(
+    CompatibilityRule(
         quantile_no_group_limit,
         "probe",
         UnsupportedCombinationError,
         "parallel/expert_parallel/block_conversion.py::convert_block",
     ),
-    Row(
+    CompatibilityRule(
         shared_expert_gate,
         "probe",
         UnsupportedCombinationError,
         "parallel/expert_parallel/block_conversion.py::convert_block",
     ),
-    Row(
+    CompatibilityRule(
         shared_expert_tp_ep,
         "probe",
         UnsupportedCombinationError,

@@ -52,6 +52,7 @@ __all__ = ["generate_llm_fqn_per_model_part", "split_model_into_stages"]
 def generate_llm_fqn_per_model_part(
     num_stages: int,
     num_layers: int,
+    *,
     input_weight: int = 1,
     output_weight: int = 1,
 ) -> list[list[str]]:
@@ -77,8 +78,20 @@ def generate_llm_fqn_per_model_part(
         treats the embedding and the norm+head as two layers each when deciding
         the split.
     """
-    if num_stages < 1:
+    if (
+        not isinstance(num_stages, int)
+        or isinstance(num_stages, bool)
+        or num_stages < 1
+    ):
         raise ValueError("Number of stages must be at least 1")
+
+    for name, value in (
+        ("num_layers", num_layers),
+        ("input_weight", input_weight),
+        ("output_weight", output_weight),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer, got {value!r}")
 
     if num_stages == 1:
         # Single stage gets everything.
@@ -96,16 +109,6 @@ def generate_llm_fqn_per_model_part(
     # Layers per stage, distributing the remainder over the first stages.
     layers_per_stage = num_effective_layers // num_stages
     extra_layers = num_effective_layers % num_stages
-
-    if layers_per_stage == 0:
-        raise ValueError(
-            f"Configuration would result in empty stages. "
-            f"With {num_stages} stages and {num_effective_layers} effective layers "
-            f"(num_layers={num_layers} + input_weight={input_weight} + "
-            f"output_weight={output_weight}), each stage would get "
-            f"{layers_per_stage} layers on average. "
-            f"Reduce num_stages or increase num_layers/weights."
-        )
 
     # The weighted modules must fit inside a stage, or that stage would hold
     # nothing but the embedding (or nothing but the head).
@@ -133,26 +136,17 @@ def generate_llm_fqn_per_model_part(
         if stage_idx == 0:
             # First stage owns the input modules.
             stage_modules.append("tok_embeddings")
-            remaining_layers_for_stage = effective_layers_for_stage - input_weight
-            for _ in range(remaining_layers_for_stage):
-                if current_layer < num_layers:
-                    stage_modules.append(f"layers.{current_layer}")
-                    current_layer += 1
-
+            effective_layers_for_stage -= input_weight
         elif stage_idx == num_stages - 1:
-            # Last stage owns the output modules.
-            remaining_layers_for_stage = effective_layers_for_stage - output_weight
-            for _ in range(remaining_layers_for_stage):
-                if current_layer < num_layers:
-                    stage_modules.append(f"layers.{current_layer}")
-                    current_layer += 1
-            stage_modules.extend(["norm", "lm_head"])
+            effective_layers_for_stage -= output_weight
 
-        else:
-            for _ in range(effective_layers_for_stage):
-                if current_layer < num_layers:
-                    stage_modules.append(f"layers.{current_layer}")
-                    current_layer += 1
+        for _ in range(effective_layers_for_stage):
+            if current_layer < num_layers:
+                stage_modules.append(f"layers.{current_layer}")
+                current_layer += 1
+
+        if stage_idx == num_stages - 1:
+            stage_modules.extend(["norm", "lm_head"])
 
         stage_modules.append("rotary_emb")
         module_names_per_stage.append(stage_modules)
@@ -197,6 +191,9 @@ def split_model_into_stages(
     """
     pp_rank = pp_mesh.get_local_rank()
     pp_size = pp_mesh.size()
+    supports_get_mesh = "get_mesh" in inspect.signature(PipelineStage).parameters
+    if get_mesh is not None and not supports_get_mesh:
+        raise ValueError("this PyTorch PipelineStage does not support get_mesh")
 
     def _build_stage_from_modules(
         stage_idx: int, module_names: list[str], num_stages: int
@@ -205,6 +202,10 @@ def split_model_into_stages(
         modules_to_keep = set(module_names)
 
         for module_name, module_value in model.named_children():
+            # Assigning a container by its own FQN keeps the complete module;
+            # child FQNs below select only a subset of its layers.
+            if module_name in modules_to_keep:
+                continue
             # Layer-like containers (e.g. "layers.0", "layers.1").
             if isinstance(module_value, nn.ModuleDict | nn.ModuleList):
                 layers_to_keep = {
@@ -239,7 +240,7 @@ def split_model_into_stages(
                         setattr(model, module_name, nn.ModuleList())
             # Simple attributes (e.g. "norm", "lm_head") not owned by this stage
             # are replaced by an Identity so the forward still runs.
-            elif module_name not in modules_to_keep:
+            else:
                 setattr(model, module_name, nn.Identity())
 
         # Extra top-level modules the model's ``named_children`` override does
@@ -255,13 +256,21 @@ def split_model_into_stages(
         # already impose).
         presented = dict(model.named_children())
         presented_ids = {id(module) for module in presented.values()}
-        for module_name, module_value in nn.Module.named_children(model):
+        # named_children() deduplicates module aliases. Every registered name
+        # needs its own ownership decision, including aliases of kept modules.
+        for module_name, module_value in list(model._modules.items()):
+            if module_value is None:
+                continue
             if module_name in presented or module_name in modules_to_keep:
                 continue
             # A container that holds the presented parts (the wrapper's inner
             # HF model) is what the parts live in, not an extra module --
             # never blank it.
-            if presented_ids & {id(m) for m in module_value.modules()}:
+            if any(
+                id(m) in presented_ids
+                for m in module_value.modules()
+                if m is not module_value
+            ):
                 continue
             setattr(model, module_name, nn.Identity())
 
@@ -269,7 +278,7 @@ def split_model_into_stages(
         # ``get_mesh`` was added after PyTorch 2.10. llmtuner passes None because
         # its stages exchange plain tensors, so omitting it on older releases
         # has exactly the same semantics.
-        if "get_mesh" in inspect.signature(PipelineStage).parameters:
+        if supports_get_mesh:
             stage_kwargs["get_mesh"] = get_mesh
         stage = PipelineStage(model, stage_idx, num_stages, device, **stage_kwargs)
         return stage, model
@@ -283,28 +292,22 @@ def split_model_into_stages(
         "v" if schedule_class in (ScheduleZBVZeroBubble, ScheduleDualPipeV) else "loop"
     )
 
-    def _get_stage_indices() -> tuple[int, ...]:
-        """Stage ids this rank runs, for a looped or a V schedule."""
-        assert num_stages % pp_size == 0, (
+    if num_stages < 1 or num_stages % pp_size != 0:
+        raise ValueError(
             f"num_stages {num_stages} must be evenly divisible by pp_size {pp_size}"
         )
-        stages_per_rank = num_stages // pp_size
-        if style == "loop":
-            return tuple(pp_rank + s * pp_size for s in range(stages_per_rank))
+    stages_per_rank = num_stages // pp_size
+    if style == "loop":
+        stage_indices = tuple(pp_rank + s * pp_size for s in range(stages_per_rank))
+    else:
         # "v": the rank takes one stage from each half, paired front-to-back.
-        assert stages_per_rank == 2, (
-            f"v schedules assume 2 stages per rank, got {stages_per_rank}"
-        )
-        stage_v_pairs = list(
-            zip(
-                range(pp_size),
-                range(num_stages - 1, pp_size - 1, -1),
-                strict=True,
+        if stages_per_rank != 2:
+            raise ValueError(
+                f"v schedules assume 2 stages per rank, got {stages_per_rank}"
             )
-        )
-        return stage_v_pairs[pp_rank]
+        stage_indices = (pp_rank, num_stages - 1 - pp_rank)
 
-    for stage_idx in _get_stage_indices():
+    for stage_idx in stage_indices:
         module_names = module_names_per_stage[stage_idx]
         stage, model_chunk = _build_stage_from_modules(
             stage_idx,

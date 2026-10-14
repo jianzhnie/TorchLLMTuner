@@ -22,10 +22,11 @@ Vendored from torchtitan ``models/common/token_dispatcher.py``. The ``Local`` an
   dispatch/combine instead, and without that, FullAC/RegionAC + DeepEP computes
   wrong gradients.
 
-None of that is a functional gap: none of the backends changes the routing
-contract, only how the tokens cross ranks. The dispatch/combine/metadata
-interface below is the whole contract, and ``AllToAllTokenDispatcher``
-implements it.
+``DominoRoutedExperts`` reuses all-to-all dispatch for two token slices; this
+does not provide accelerator stream overlap. MC2 requires Ascend fused
+operators and is rejected by the shared backend validator in
+``config/expert_parallel_config.py``. Backend availability and supported
+routing semantics are separate contracts.
 
 What changed from upstream, and why:
 
@@ -61,7 +62,6 @@ from ...accelerator import distributed
 from ...models.common.scatter_add import deterministic_scatter_add
 
 __all__ = [
-    "EP_DISPATCHER_BACKENDS",
     "TORCHAO_INSTALL_HINT",
     "LocalDispatchMetadata",
     "AllToAllDispatchMetadata",
@@ -69,18 +69,6 @@ __all__ = [
     "AllToAllTokenDispatcher",
     "TorchAOTokenDispatcher",
 ]
-
-#: EP dispatch backends selectable via ``ParallelConfig.ep_token_dispatcher``.
-#: ``alltoall`` is the default; ``torchao`` is an optional-import adapter;
-#: ``deepep``/``hybridep`` are registered gaps refused at config time.
-EP_DISPATCHER_BACKENDS = (
-    "alltoall",
-    "torchao",
-    "domino",
-    "mc2",
-    "deepep",
-    "hybridep",
-)
 
 TORCHAO_INSTALL_HINT = (
     "ep_token_dispatcher='torchao' requires the optional `torchao` package, "
@@ -160,11 +148,22 @@ class LocalTokenDispatcher:
             token_indices_experts_sorted_N: ``(N,)`` token-to-original mapping.
             topk_scores_experts_sorted_N: ``(N,)`` scores in expert-sorted order.
         """
+        if x_TD.ndim != 2:
+            raise ValueError("Token inputs must have shape (tokens, hidden_dim)")
+        routing_shape = (x_TD.shape[0], self.top_k)
+        if (
+            topk_scores_TK.shape != routing_shape
+            or topk_expert_ids_TK.shape != routing_shape
+        ):
+            raise ValueError(
+                "Routing scores and expert IDs must both have shape "
+                f"{routing_shape}, matching the token count and top_k"
+            )
         # N = T*K: one entry per (token, chosen expert) pair.
         token_indices_experts_sorted_N = torch.argsort(
-            topk_expert_ids_TK.view(-1), stable=True
+            topk_expert_ids_TK.reshape(-1), stable=True
         )
-        topk_scores_experts_sorted_N = topk_scores_TK.view(-1)[
+        topk_scores_experts_sorted_N = topk_scores_TK.reshape(-1)[
             token_indices_experts_sorted_N
         ]
         token_indices_experts_sorted_N = token_indices_experts_sorted_N // self.top_k
@@ -267,10 +266,6 @@ class BaseEPTokenDispatcher(LocalTokenDispatcher, ABC):
     def wire_meshes(self, *, ep_group: dist.ProcessGroup | None) -> None:
         """Install the EP group used by dispatch/combine."""
         self.ep_group = ep_group
-        self.init_buffer()
-
-    def init_buffer(self) -> None:
-        """Initialize backend communication buffers, if any."""
 
     @abstractmethod
     def dispatch(
@@ -585,8 +580,9 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
     ``pad_multiple`` -- the alignment FP8/MXFP8 quantized grouped GEMM kernels
     require (16 for FP8, 32 for MXFP8). The padding shows up in
     ``num_tokens_per_local_expert_e`` and must be stripped by the matching
-    ``_unpermute``, so a for-loop ``GroupedExperts`` that does not expect
-    padding cannot be paired with it.
+    ``_unpermute``. ``GroupedExperts`` consumes the returned padded counts
+    with either its grouped GEMM or per-expert loop; padding is removed before
+    scores are applied in combine.
 
     Invariants (unchanged from the all-to-all dispatcher):
 
