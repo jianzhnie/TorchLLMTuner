@@ -101,3 +101,19 @@
 - KCP 增加 context_parallel_kcp_size，修复合法配置无法启用 CP 的可达性问题。
   例如 strategy='kcp'、kcp_size=4、其余两个 CP 轴为 1；不支持 packed、
   headtail、TP 或 KDA/softmax 混合模型。Ascend 算子数值仍须目标设备验证。
+
+## 日志生命周期审查
+
+`utils/logging.py` 使用 handler 所有权标记代替名称初始化缓存，支持 handler 被移除后的重新初始化，保留应用添加的 handler。重复获取 logger 更新日志级别。自有 console handler 按 record 标记去重，保留向应用/root handler 的传播；应用 handler 的输出和过滤仍由应用控制。分布式 rank 查询失败直接回退环境变量，避免在查询异常中再次记录日志引起递归。回归覆盖层级去重、caplog、应用 handler、动态 rank、初始化恢复与异常回退。
+
+日志后续优化：并发初始化加锁，fork 子进程重建锁；formatter 复制记录并复用过滤阶段查询的 rank。rank 回退仅解析 RANK，避免无关 WORLD_SIZE/LOCAL_RANK 配置错误阻塞日志，也不主动导入分布式/设备模块。set_log_ranks 显式校验整数与非负约束。新增并发安装、单次 rank 查询、原记录不变与环境回退回归。
+
+日志 rank 获取调整为复用 accelerator.distributed.is_distributed/get_rank；启动前或查询失败保留 RANK 回退，不在异常路径记录日志。此前直接查询已加载 torch.distributed 的实现已替换。
+
+日志新增文件输出：get_logger 保留位置参数 log_level，新增关键字 log_file/file_mode，默认 UTF-8 追加、无 ANSI 颜色，只有 rank 0 写入。RankFormatter 共享格式化职责；同一规范路径共享 FileHandler，过滤按文件目的地去重，覆盖模式只首次打开截断。回归覆盖中文、追加/覆盖、层级去重、并发初始化、rank 门控、traceback、模式冲突和关闭后重新配置。
+
+日志 handler 所有权改用类型识别；记录状态集中为 RecordState，弱引用表随 LogRecord 生命周期释放，不修改应用收到的原始记录。控制台和文件 handler 分别装配自己的 formatter/filter，保留层级去重与 rank 策略。
+
+日志进一步整理：锁、文件 handler 弱缓存、记录弱缓存与 rank 配置集中为 LoggingState 实例属性，通过延迟缓存访问；移除模块级 LOGGER_LOCK/FILE_HANDLERS/RECORD_STATES/LOG_FORMAT，格式字符串内联于 RankFormatter 构造，文件 handler 查找创建合并进 get_logger。全量 CPU 测试 1161 passed、10 skipped，pre-commit/compileall/diff 检查通过。
+
+日志封装合并：纯文本和彩色 formatter 统一为 RankFormatter(color=...)；MainProcessFilter/FileLogFilter 合并为 DestinationFilter(path=...)，统一 rank 策略与目的地去重。get_logger 使用局部 config 复用状态访问；保留 handler 类型用于所有权识别，共享记录状态方法用于单次 rank 查询。

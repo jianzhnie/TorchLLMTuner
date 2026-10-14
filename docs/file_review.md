@@ -152,7 +152,7 @@
 | `llmtuner/utils/dtypes.py` | 已阅读 | dtype 映射及未知类型拒绝。 |
 | `llmtuner/utils/garbage_collection.py` | 已阅读 | GC 启停、异常回滚、重复 close；多管理器并存未承诺。 |
 | `llmtuner/utils/lazy_exports.py` | 已阅读 | 导出排序、叶模块解析及未知属性拒绝。 |
-| `llmtuner/utils/logging.py` | 已阅读 | rank 过滤、格式及初始化；后续检查祖先 logger 重复输出。 |
+| `llmtuner/utils/logging.py` | 已阅读 | rank 过滤与层级去重；保留应用 handler，按 handler 实例判断初始化，修复 rank 查询失败递归。 |
 | `llmtuner/utils/monitoring.py` | 已阅读 | 设备容量、FLOPS、颜色、内存快照；修复设备 0 硬编码。 |
 | `llmtuner/utils/seeding.py` | 已阅读 | Python/NumPy/Torch 种子及确定性设置。 |
 
@@ -209,3 +209,21 @@
 - 模型状态缓存刷新前显式校验 key 集合；检测包装后新增/删除参数或 buffer，避免保存陈旧或混合结构状态。模型状态适配回归集中于 `test_model_state.py`。
 
 - ModelCheckpointState 构造时复制模型分块集合，避免调用方列表修改导致 checkpoint 范围与 EP shard map 不一致；保留空集合兼容性并拒绝非模块成员，覆盖两分块恢复。
+
+- 日志初始化移除全局名称缓存，直接识别自有 handler；重复获取更新级别，保留应用 handler。祖先自有 handler 跳过已输出记录，同时保留 root 传播与 caplog 捕获。rank 查询失败直接回退，避免 DEBUG 日志递归。
+
+本轮日志优化验证：CPU 全量测试 1138 passed、10 skipped；pre-commit、compileall 与 diff 空白检查通过。新增 5 项日志回归测试，源文件总数仍为 149。本轮未运行多设备训练数值验证。
+
+- 日志第二轮：初始化 check/add 加锁并在 fork 后重建锁；过滤和格式化共享单次 rank 查询，formatter 复制 record 避免影响应用 handler；rank 查询不触发设备导入，仅依赖已加载的 torch.distributed 或 RANK；log_ranks 拒绝字符串、非整数及负数。
+
+日志 rank 获取调整为复用 accelerator.distributed.is_distributed/get_rank；启动前或查询失败保留 RANK 回退，不在异常路径记录日志。此前直接查询已加载 torch.distributed 的实现已替换。
+
+日志新增文件输出：get_logger 保留位置参数 log_level，新增关键字 log_file/file_mode，默认 UTF-8 追加、无 ANSI 颜色，只有 rank 0 写入。RankFormatter 共享格式化职责；同一规范路径共享 FileHandler，过滤按文件目的地去重，覆盖模式只首次打开截断。回归覆盖中文、追加/覆盖、层级去重、并发初始化、rank 门控、traceback、模式冲突和关闭后重新配置。
+
+文件日志验证：CPU 全量测试 1161 passed、10 skipped；pre-commit（含新增日志测试文件）、compileall 和 diff 空白检查通过。未运行多进程硬件训练；rank 策略由 CPU 模拟验证。
+
+日志可读性重构：删除 HANDLER_MARKER 及所有 llmtuner 动态 record 标记；ConsoleHandler/FileHandler 显式表达所有权，RecordState 通过弱引用表保存 rank 和目的地去重状态。统一 LOGGER_LOCK/LOG_RANKS 引用，修复部分改名后的未定义引用。
+
+日志进一步整理：锁、文件 handler 弱缓存、记录弱缓存与 rank 配置集中为 LoggingState 实例属性，通过延迟缓存访问；移除模块级 LOGGER_LOCK/FILE_HANDLERS/RECORD_STATES/LOG_FORMAT，格式字符串内联于 RankFormatter 构造，文件 handler 查找创建合并进 get_logger。全量 CPU 测试 1161 passed、10 skipped，pre-commit/compileall/diff 检查通过。
+
+日志封装合并：纯文本和彩色 formatter 统一为 RankFormatter(color=...)；MainProcessFilter/FileLogFilter 合并为 DestinationFilter(path=...)，统一 rank 策略与目的地去重。get_logger 使用局部 config 复用状态访问；保留 handler 类型用于所有权识别，共享记录状态方法用于单次 rank 查询。
