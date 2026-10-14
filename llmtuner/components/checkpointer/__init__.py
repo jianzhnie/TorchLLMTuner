@@ -19,8 +19,7 @@ Ported from torchtitan's ``components/checkpointer/``. Three layers:
 
 ``model_state`` adapts model parts to the checkpoint state interface.
 ``storage`` defines the path-operation contract and filesystem adapter.
-``checkpoint_keys`` also holds ``canonical_fqn``, which strips the activation-checkpoint
-wrapper segment from an FQN.
+Model name normalization lives in ``utils/module_names.py``.
 
 State keys. A checkpoint uses the names defined in ``checkpoint_keys``: ``model``,
 ``optimizer``, ``lr_scheduler``, ``dataloader``, ``train_state``, ``ema``.
@@ -38,13 +37,13 @@ llmtuner fills in the first two plus whatever the caller passes in ``states``:
 * ``lr_scheduler`` -- the ``LRSchedulersContainer`` from
   ``components/optimizer/lr_scheduler.py``, always registered. It holds one
   integer, ``last_epoch``, that nothing else in the checkpoint carries: the
-  optimizer restores the ``base_lrs`` so the *current* lr comes back right, but
+  optimizer restores group ``initial_lr`` values and the saved ``lr``, but
   the step count is the scheduler's own, and a resumed run's fresh scheduler
   starts it at 0. Without it the curve restarts on the step after a resume --
   invisible while the lr is constant, wrong for the rest of the run once warmup
   or decay is set.
 * ``dataloader`` -- the ``BaseDataLoader``, registered only when it is loadable.
-  See the trainer's ``build_dataloader`` for why the synthetic one is not.
+  Both synthetic and Grain loaders support cursor restoration.
 * ``ema`` -- the ``EMA`` pseudo-optimizer from
   ``components/optimizer/ema.py``, registered only when the run configures one
   (``training.ema_config``). Its state dict is the same flat, FQN-keyed layout
@@ -54,7 +53,7 @@ llmtuner fills in the first two plus whatever the caller passes in ``states``:
   ``distributed_checkpoint.DistributedCheckpointManager``).
 """
 
-from ...utils.lazy_exports import export_names, resolve_export
+from ...utils.lazy_exports import resolve_export
 
 # Lazy (PEP 562): ``checkpoint_keys`` / ``filesystem`` live in this package and
 # are read by ``llmtuner/config``, which must stay importable without the
@@ -78,10 +77,9 @@ _EXPORT_SOURCES = {
     "TRAIN_STATE": "checkpoint_keys",
     "DistributedCheckpointAsyncMode": "distributed_checkpoint",
     "DistributedCheckpointManager": "distributed_checkpoint",
-    "canonical_fqn": "checkpoint_keys",
 }
 
-__all__ = export_names(_EXPORT_SOURCES)
+__all__ = sorted(_EXPORT_SOURCES)
 
 
 def __getattr__(name: str):
@@ -90,4 +88,4 @@ def __getattr__(name: str):
 
 
 def __dir__() -> list[str]:
-    return export_names(_EXPORT_SOURCES)
+    return sorted(_EXPORT_SOURCES)

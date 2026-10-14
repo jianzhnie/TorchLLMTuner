@@ -22,7 +22,8 @@ Departures from upstream:
 * **``state_dict`` reports ``last_epoch`` and nothing else.** ``LambdaLR`` is
   stateless apart from it -- the lr is a pure function of ``(last_epoch,
   base_lr)`` -- so ``_last_lr`` is recomputed on load rather than stored. The
-  base lrs come back with the optimizer's own state. A stateful scheduler
+  base learning rates are reconstructed from restored optimizer group
+  ``initial_lr`` values. A stateful scheduler
   (``ReduceLROnPlateau`` and friends) would need more, which is why the load path
   spells this out instead of round-tripping the whole dict.
 """
@@ -35,16 +36,16 @@ from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
+import torch
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
+from ...config.field_checks_config import require_integer_at_least
 from ...utils.logging import get_logger
 
 if TYPE_CHECKING:
-    # ``llmtuner.config`` imports this package, so the runtime import happens
-    # inside ``build_lr_scheduler`` -- the one place a config's fields are read.
-    from ...config import LRSchedulerConfig
+    from ...config.lr_scheduler_config import LRSchedulerConfig
 
 logger = get_logger(__name__)
 
@@ -112,15 +113,18 @@ class LRSchedulersContainer(Stateful):
     def __init__(
         self,
         optimizers: list[Optimizer],
-        lr_lambda: Callable[[int], float],
         *,
+        lr_lambda: Callable[[int], float],
         total_steps: int,
     ) -> None:
         if not optimizers:
             raise ValueError(
                 "LRSchedulersContainer needs at least one optimizer to schedule."
             )
+        if len({id(optimizer) for optimizer in optimizers}) != len(optimizers):
+            raise ValueError("Each optimizer must appear only once in the scheduler")
         self.total_steps = total_steps
+        require_integer_at_least(self, "total_steps", group="lr_scheduler")
         self.schedulers = [LambdaLR(optimizer, lr_lambda) for optimizer in optimizers]
 
     def __iter__(self) -> Iterator[LambdaLR]:
@@ -157,17 +161,11 @@ class LRSchedulersContainer(Stateful):
             optimizer_index = optimizer_indices[optimizer_name]
             optimizer_indices[optimizer_name] += 1
             last_lrs = scheduler.get_last_lr()
+            prefix = f"lr/{optimizer_name}"
+            if optimizer_counts[optimizer_name] > 1:
+                prefix = f"{prefix}/{optimizer_index}"
             for group_index, value in enumerate(last_lrs):
-                if optimizer_counts[optimizer_name] > 1:
-                    key = f"lr/{optimizer_name}/{optimizer_index}"
-                    if len(last_lrs) > 1:
-                        key = f"{key}/{group_index}"
-                else:
-                    key = (
-                        f"lr/{optimizer_name}"
-                        if len(last_lrs) == 1
-                        else f"lr/{optimizer_name}/{group_index}"
-                    )
+                key = f"{prefix}/{group_index}" if len(last_lrs) > 1 else prefix
                 metrics[key] = float(value)
         return metrics
 
@@ -183,7 +181,8 @@ class LRSchedulersContainer(Stateful):
 
         ``LambdaLR`` is stateless apart from that -- the lr is a pure function of
         ``(last_epoch, base_lr)`` -- so ``_last_lr`` is recomputed rather than
-        stored, per scheduler, from its own optimizer's ``base_lrs``.
+        stored, per scheduler, from its optimizer groups' restored
+        ``initial_lr`` values.
         """
         if not state_dict:
             return
@@ -194,22 +193,30 @@ class LRSchedulersContainer(Stateful):
             or last_epoch < 0
         ):
             raise ValueError("scheduler last_epoch must be a nonnegative integer")
+        restored = []
         for scheduler in self.schedulers:
-            scheduler.base_lrs = [
+            base_lrs = [
                 group["initial_lr"] for group in scheduler.optimizer.param_groups
             ]
-            scheduler.last_epoch = last_epoch
-            scheduler._step_count = last_epoch + 1
-            scheduler._last_lr = [
+            last_lrs = [
                 base_lr * lr_lambda(last_epoch)
                 for base_lr, lr_lambda in zip(
-                    scheduler.base_lrs, scheduler.lr_lambdas, strict=True
+                    base_lrs, scheduler.lr_lambdas, strict=True
                 )
             ]
+            restored.append((scheduler, base_lrs, last_lrs))
+        for scheduler, base_lrs, last_lrs in restored:
+            scheduler.base_lrs = base_lrs
+            scheduler.last_epoch = last_epoch
+            scheduler._step_count = last_epoch + 1
+            scheduler._last_lr = last_lrs
             for group, learning_rate in zip(
-                scheduler.optimizer.param_groups, scheduler._last_lr, strict=True
+                scheduler.optimizer.param_groups, last_lrs, strict=True
             ):
-                group["lr"] = learning_rate
+                if isinstance(group["lr"], torch.Tensor):
+                    group["lr"].fill_(learning_rate)
+                else:
+                    group["lr"] = learning_rate
 
 
 def build_lr_scheduler(
@@ -228,6 +235,12 @@ def build_lr_scheduler(
     turns the learning rate negative -- which ascends the loss instead of
     failing.
     """
+    if (
+        not isinstance(training_steps, int)
+        or isinstance(training_steps, bool)
+        or training_steps < 1
+    ):
+        raise ValueError("training_steps must be a positive integer")
     total_steps = (
         config.total_steps if config.total_steps is not None else training_steps
     )
@@ -275,4 +288,6 @@ def build_lr_scheduler(
         decay_type=config.decay_type,
         min_lr_factor=config.min_lr_factor,
     )
-    return LRSchedulersContainer(optimizers, lr_lambda, total_steps=total_steps)
+    return LRSchedulersContainer(
+        optimizers, lr_lambda=lr_lambda, total_steps=total_steps
+    )

@@ -1,7 +1,19 @@
-"""Tokenizer interfaces and Hugging Face implementations."""
+"""Tokenizer interfaces with implementations loaded only when requested."""
 
-from .base import BaseTokenizer
-from .huggingface import HuggingFaceTokenizer
-from .multimodal import MultimodalTokenizer
+from ...utils.lazy_exports import resolve_export
 
-__all__ = ["BaseTokenizer", "HuggingFaceTokenizer", "MultimodalTokenizer"]
+_EXPORT_SOURCES = {
+    "BaseTokenizer": "base",
+    "HuggingFaceTokenizer": "huggingface",
+    "MultimodalTokenizer": "multimodal",
+}
+
+__all__ = sorted(_EXPORT_SOURCES)
+
+
+def __getattr__(name: str):
+    return resolve_export(__name__, _EXPORT_SOURCES, name)
+
+
+def __dir__() -> list[str]:
+    return sorted(_EXPORT_SOURCES)

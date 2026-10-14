@@ -55,7 +55,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from ..config import ProfilerConfig
+    from ..config.observability_config import ProfilerConfig
 
 from ..accelerator.device import device_type
 from ..utils.logging import get_distributed_rank, get_logger
@@ -69,14 +69,11 @@ logger = get_logger(__name__)
 
 __all__ = ["MemoryProfiler", "Profiler"]
 
-# Directory layout, kept as plain format strings rather than derived at the
-# point of use so the trace/snapshot tree is legible in one place.
-PROFILE_DIR = "profiling/traces"  # the ProfilerConfig default
-PROFILE_ITER_DIR = "iteration_{step}"  # PROFILE_DIR/{PROFILE_ITER_DIR}
+# File layout within the directories selected by ProfilerConfig.
+PROFILE_ITER_DIR = "iteration_{step}"
 PROFILE_FILE = "rank{rank}_trace.json.gz"  # .../{PROFILE_FILE}
 
-MEMORY_DIR = "profiling/memory_snapshot"  # the ProfilerConfig default
-MEMORY_STEP_DIR = "step_{step:012d}"  # MEMORY_DIR/{MEMORY_STEP_DIR}
+MEMORY_STEP_DIR = "step_{step:012d}"
 MEMORY_EXIT_DIR = "step_{step:012d}_exit"  # the OOM variant of the same
 MEMORY_FILE = "{rank:06d}_step_{step}.pickle"
 
@@ -95,6 +92,7 @@ class MemoryProfiler:
 
     def __init__(
         self,
+        *,
         step_num: int,
         freq: int,
         snapshot_dir: str,
@@ -199,25 +197,27 @@ class Profiler:
         self._base_folder = base_folder
         self.torch_profiler = None
         self.memory_profiler = None
+        self._entered = False
+        self._used = False
 
     def __enter__(self) -> Profiler:
-        self.torch_profiler = self.build_torch_profiler()
+        if self._entered:
+            raise RuntimeError("Profiler is already active")
+        if self._used:
+            raise RuntimeError("Profiler has finished; create a new instance")
+        self._entered = True
         try:
+            self.torch_profiler = self.build_torch_profiler()
             self.memory_profiler = self.build_memory_profiler()
         except BaseException:
             # __exit__ is not called by `with` when __enter__ fails.
-            if self.torch_profiler is not None:
-                profiler, self.torch_profiler = self.torch_profiler, None
-                try:
-                    profiler.__exit__(*sys.exc_info())
-                except BaseException:
-                    logger.exception(
-                        "Failed to stop profiler after initialization error"
-                    )
+            self.__exit__(*sys.exc_info())
             raise
+        self._used = True
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self._entered = False
         first_error: BaseException | None = None
         trace, self.torch_profiler = self.torch_profiler, None
         memory, self.memory_profiler = self.memory_profiler, None
@@ -265,15 +265,17 @@ class Profiler:
 
         trace_dir = os.path.join(self._base_folder, cfg.save_traces_folder)
         rank = get_distributed_rank()
+        start_step = self._global_step
 
         def trace_handler(prof):
+            global_step = start_step + prof.step_num
             directory = os.path.join(
                 trace_dir,
-                PROFILE_ITER_DIR.format(step=prof.step_num),
+                PROFILE_ITER_DIR.format(step=global_step),
             )
             os.makedirs(directory, exist_ok=True)
 
-            logger.info("Dumping profiler traces at step %d", prof.step_num)
+            logger.info("Dumping profiler traces at step %d", global_step)
             begin = time.monotonic()
             prof.export_chrome_trace(
                 os.path.join(directory, PROFILE_FILE.format(rank=rank))
@@ -312,21 +314,19 @@ class Profiler:
             # trace from being CPU-only on a device the run actually uses.
             activities.append(torch.profiler.ProfilerActivity.XPU)
 
+        schedule = torch.profiler.schedule(
+            wait=wait,
+            warmup=cfg.profiler_warmup,
+            active=cfg.profiler_active,
+            **optional_params,
+        )
         torch_profiler = torch.profiler.profile(
             activities=activities,
-            schedule=torch.profiler.schedule(
-                wait=wait,
-                warmup=cfg.profiler_warmup,
-                active=cfg.profiler_active,
-                **optional_params,
-            ),
+            schedule=lambda step: schedule(start_step + step),
             on_trace_ready=trace_handler,
             record_shapes=True,
         )
         torch_profiler.__enter__()
-        # The schedule counts from zero. Starting it at the resumed step is what
-        # makes the trace directories line up with the run's step numbers.
-        torch_profiler.step_num = self._global_step
         return torch_profiler
 
     def build_memory_profiler(self):
@@ -359,12 +359,12 @@ class Profiler:
             "Memory profiler active. Snapshots will be saved at %s", snapshot_dir
         )
         return MemoryProfiler(
-            self._global_step,
-            freq,
-            snapshot_dir,
-            "",
-            rank,
-            cfg.memory_snapshot_max_entries,
+            step_num=self._global_step,
+            freq=freq,
+            snapshot_dir=snapshot_dir,
+            leaf_folder="",
+            rank=rank,
+            max_entries=cfg.memory_snapshot_max_entries,
         )
 
 

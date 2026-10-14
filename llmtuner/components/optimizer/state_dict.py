@@ -53,23 +53,22 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
         return
 
     saved_grads = [param.grad for param in params]
-    for param in params:
-        param.grad = None
-    for param in params_to_initialize:
-        param.grad = torch.zeros_like(param)
-
-    # Some optimizers update parameters regardless of gradients due to lr, so set
-    # lr to zero before stepping to keep parameters unchanged.
     saved_lrs = []
-    for param_group in optim.param_groups:
-        if "lr" in param_group:
-            saved_lrs.append(param_group["lr"])
-            param_group["lr"] = (
-                torch.zeros_like(param_group["lr"])
-                if isinstance(param_group["lr"], torch.Tensor)
-                else 0.0
-            )
     try:
+        for param in params:
+            param.grad = None
+        for param in params_to_initialize:
+            param.grad = torch.zeros_like(param)
+
+        # A zero learning rate keeps the materialization step from updating weights.
+        for param_group in optim.param_groups:
+            if "lr" in param_group:
+                saved_lrs.append((param_group, param_group["lr"]))
+                param_group["lr"] = (
+                    torch.zeros_like(param_group["lr"])
+                    if isinstance(param_group["lr"], torch.Tensor)
+                    else 0.0
+                )
         optim.step(closure=None)
 
         # A zero learning rate keeps parameters unchanged, but Adam still advances
@@ -85,10 +84,9 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
                     state["max_exp_avg_sq"].zero_()
 
     finally:
-        for param_group in optim.param_groups:
-            if "lr" in param_group:
-                param_group["lr"] = saved_lrs.pop(0)
-        for param, grad in zip(params, saved_grads, strict=False):
+        for param_group, lr in saved_lrs:
+            param_group["lr"] = lr
+        for param, grad in zip(params, saved_grads, strict=True):
             param.grad = grad
 
 
@@ -105,7 +103,7 @@ def get_flat_optim_state_dict(optim: torch.optim.Optimizer) -> dict[str, Any]:
 
     flat: dict[str, Any] = {}
     for fqn, state in fqn_sd["state"].items():
-        flatten_state_nested(state, f"state.{fqn}", flat)
+        _flatten_state(state, prefix=f"state.{fqn}", out=flat)
     for param_group in fqn_sd["param_groups"]:
         for fqn in param_group["params"]:
             for key, value in param_group.items():
@@ -136,6 +134,7 @@ def optim_state_dict_to_fqn_keys(optim_sd: dict[str, Any]) -> dict[str, Any]:
     """
     id_to_fqn: dict[int, str] = {}
     new_param_groups: list[dict[str, Any]] = []
+    seen_fqns: set[str] = set()
     for param_group in optim_sd["param_groups"]:
         if "param_names" not in param_group:
             raise ValueError(
@@ -144,7 +143,12 @@ def optim_state_dict_to_fqn_keys(optim_sd: dict[str, Any]) -> dict[str, Any]:
             )
         fqns = param_group["param_names"]
         for param_id, fqn in zip(param_group["params"], fqns, strict=True):
+            if param_id in id_to_fqn:
+                raise ValueError(f"Duplicate optimizer parameter id: {param_id}")
+            if fqn in seen_fqns:
+                raise ValueError(f"Duplicate optimizer parameter FQN: {fqn!r}")
             id_to_fqn[param_id] = fqn
+            seen_fqns.add(fqn)
         new_group = {k: v for k, v in param_group.items() if k != "param_names"}
         new_group["params"] = list(fqns)
         new_param_groups.append(new_group)
@@ -186,45 +190,81 @@ def unflatten_optim_state_dict(
                         param_state[state_name] = flat_sd[flat_key]
                     else:
                         # State value is itself a nested dict (e.g. Shampoo).
-                        nested = reconstruct_nested(flat_sd, flat_key)
-                        if nested:
-                            param_state[state_name] = nested
+                        nested = _restore_nested_state(flat_sd, prefix=flat_key)
+                        if not nested:
+                            raise KeyError(
+                                f"Optimizer state key {flat_key!r} not found "
+                                "in checkpoint."
+                            )
+                        param_state[state_name] = nested
                 if param_state:
                     state[param_id] = param_state
             param_id += 1
 
-        if not fqns:
-            param_groups.append({"params": ids})
-            continue
-        new_group: dict[str, Any] = {"params": ids}
-        for key in param_group:
-            if key in ("params", "param_names"):
-                continue
-            flat_key = f"param_groups.{fqns[0]}.{key}"
-            if flat_key not in flat_sd:
-                raise KeyError(
-                    f"Optimizer param group key {key!r} not found in checkpoint "
-                    f"(looked up via param {fqns[0]!r})."
-                )
-            new_group[key] = flat_sd[flat_key]
-        param_groups.append(new_group)
+        param_groups.append(
+            _restore_param_group(param_group, param_ids=ids, flat_state=flat_sd)
+        )
 
     return {"state": state, "param_groups": param_groups}
 
 
-def flatten_state_nested(
-    state: dict[str, Any], prefix: str, out: dict[str, Any]
-) -> None:
+def _restore_param_group(
+    param_group: dict[str, Any], *, param_ids: list[int], flat_state: dict[str, Any]
+) -> dict[str, Any]:
+    """Restore compatible saved options for one current parameter group."""
+    fqns = param_group["param_names"]
+    if not fqns:
+        # No FQN exists to key this group's options in the flat checkpoint.
+        # Preserve the live options so even an empty group remains usable
+        # by optimizer.step() and learning-rate schedulers after loading.
+        return {**param_group, "params": param_ids, "param_names": list(fqns)}
+    new_group: dict[str, Any] = {"params": param_ids, "param_names": list(fqns)}
+    for key in param_group:
+        if key in ("params", "param_names"):
+            continue
+        flat_key = f"param_groups.{fqns[0]}.{key}"
+        if flat_key not in flat_state:
+            raise KeyError(
+                f"Optimizer param group key {key!r} not found in checkpoint "
+                f"(looked up via param {fqns[0]!r})."
+            )
+        new_group[key] = flat_state[flat_key]
+        for fqn in fqns[1:]:
+            other_key = f"param_groups.{fqn}.{key}"
+            if other_key not in flat_state:
+                raise KeyError(
+                    f"Optimizer param group key {other_key!r} not found in checkpoint."
+                )
+            expected, actual = new_group[key], flat_state[other_key]
+            matches = (
+                torch.equal(expected, actual)
+                if isinstance(expected, torch.Tensor)
+                and isinstance(actual, torch.Tensor)
+                else expected == actual
+            )
+            if not matches:
+                raise ValueError(
+                    f"Cannot merge optimizer parameters {fqns[0]!r} and "
+                    f"{fqn!r}: checkpoint group option {key!r} differs"
+                )
+    return new_group
+
+
+def _flatten_state(state: dict[str, Any], *, prefix: str, out: dict[str, Any]) -> None:
     """Flatten a (possibly nested) per-param state dict into dotted keys."""
     for key, value in state.items():
         flat_key = f"{prefix}.{key}"
-        if isinstance(value, dict):
-            flatten_state_nested(value, flat_key, out)
+        if isinstance(value, dict) and value:
+            _flatten_state(value, prefix=flat_key, out=out)
         else:
+            if flat_key in out:
+                raise ValueError(
+                    f"Optimizer state keys collide when flattened: {flat_key!r}"
+                )
             out[flat_key] = value
 
 
-def reconstruct_nested(flat_sd: dict[str, Any], prefix: str) -> dict[str, Any]:
+def _restore_nested_state(flat_sd: dict[str, Any], *, prefix: str) -> dict[str, Any]:
     """Rebuild the nested dict stored under ``prefix`` in a flat state dict."""
     result: dict[str, Any] = {}
     prefix_dot = prefix + "."
@@ -233,7 +273,18 @@ def reconstruct_nested(flat_sd: dict[str, Any], prefix: str) -> dict[str, Any]:
             continue
         current = result
         parts = key[len(prefix_dot) :].split(".")
+        path = prefix
         for part in parts[:-1]:
+            path = f"{path}.{part}"
+            if path in flat_sd:
+                raise ValueError(
+                    f"Conflicting nested optimizer state paths under {prefix!r}: "
+                    f"{key!r}"
+                )
             current = current.setdefault(part, {})
+        if parts[-1] in current:
+            raise ValueError(
+                f"Conflicting nested optimizer state paths under {prefix!r}: {key!r}"
+            )
         current[parts[-1]] = value
     return result

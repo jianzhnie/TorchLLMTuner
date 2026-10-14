@@ -1,17 +1,8 @@
-"""Filesystem helpers for checkpoint IO that accept local paths and fsspec URIs.
+"""Checkpoint path operations for local paths and fsspec URIs.
 
-Vendored from torchtitan's ``tools/filesystem.py``, unchanged in behavior. What
-it buys is the same thing it buys there: local paths keep going through
-``os``/``shutil`` exactly as before, and only a remote path (``gs://``,
-``s3://``) is routed through fsspec. The local code path -- the only one llmtuner
-exercises today -- is behaviorally identical to calling ``os`` yourself, so this
-is not a new dependency on the hot path.
-
-Why it exists here at all: the checkpointer's ``CheckpointStorage`` protocol and
-DCP both take paths as ``str`` rather than ``Path``, because ``Path`` collapses
-the double slash in ``gs://bucket/x`` and would silently point at a local
-directory named ``gs:`` instead. Every path operation in the checkpoint code
-goes through this module so that translation happens in one place.
+Adapted from torchtitan's tools/filesystem.py. Local operations use os/shutil;
+remote operations resolve fsspec lazily. Paths remain strings to preserve URI
+schemes. Deletion ignores missing paths and propagates other storage failures.
 """
 
 from __future__ import annotations
@@ -21,16 +12,16 @@ import posixpath
 import shutil
 
 
-def is_remote(path: str | os.PathLike) -> bool:
+def is_remote(path: str | os.PathLike[str]) -> bool:
     """Whether ``path`` is a remote fsspec URI rather than a local path.
 
     The ``"://"`` heuristic is the same one PyTorch DCP's
     ``FileSystem.validate_checkpoint_id`` uses.
     """
-    return "://" in str(path)
+    return "://" in os.fspath(path)
 
 
-def resolve(path: str | os.PathLike):
+def resolve(path: str | os.PathLike[str]):
     """Return ``(fs, path)`` for a remote URI via fsspec.
 
     Imported lazily so a pure-local environment never needs fsspec at all, and
@@ -39,31 +30,31 @@ def resolve(path: str | os.PathLike):
     """
     from fsspec.core import url_to_fs
 
-    return url_to_fs(path)
+    return url_to_fs(os.fspath(path))
 
 
-def exists(path: str | os.PathLike) -> bool:
+def exists(path: str | os.PathLike[str]) -> bool:
     if is_remote(path):
         fs, p = resolve(path)
         return fs.exists(p)
     return os.path.exists(path)
 
 
-def isdir(path: str | os.PathLike) -> bool:
+def isdir(path: str | os.PathLike[str]) -> bool:
     if is_remote(path):
         fs, p = resolve(path)
         return fs.isdir(p)
     return os.path.isdir(path)
 
 
-def isfile(path: str | os.PathLike) -> bool:
+def isfile(path: str | os.PathLike[str]) -> bool:
     if is_remote(path):
         fs, p = resolve(path)
         return fs.isfile(p)
     return os.path.isfile(path)
 
 
-def listdir(path: str | os.PathLike) -> list[str]:
+def listdir(path: str | os.PathLike[str]) -> list[str]:
     """List directory entries as basenames, matching ``os.listdir``.
 
     fsspec's ``ls`` returns full paths, so entries are reduced to their basename
@@ -85,21 +76,19 @@ def listdir(path: str | os.PathLike) -> list[str]:
     return os.listdir(path)
 
 
-def rmtree(path: str | os.PathLike) -> None:
-    if is_remote(path):
-        fs, p = resolve(path)
-        # Mirror ``shutil.rmtree(..., ignore_errors=True)`` for the common
-        # already-deleted case. Other errors (permissions, transient backend
-        # failures) propagate so the caller can decide what to do with them.
-        try:
+def rmtree(path: str | os.PathLike[str]) -> None:
+    """Delete a checkpoint directory, ignoring only already-missing paths."""
+    try:
+        if is_remote(path):
+            fs, p = resolve(path)
             fs.rm(p, recursive=True)
-        except FileNotFoundError:
-            pass
-    else:
-        shutil.rmtree(path, ignore_errors=True)
+        else:
+            shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
 
 
-def join(base: str | os.PathLike, name: str) -> str:
+def join(base: str | os.PathLike[str], name: str) -> str:
     """Join ``base`` and ``name``, mirroring ``os.path.join`` for local paths.
 
     A remote ``name`` (e.g. ``gs://bucket/run/ckpt``) is returned unchanged --
@@ -111,5 +100,5 @@ def join(base: str | os.PathLike, name: str) -> str:
     if is_remote(name):
         return name
     if is_remote(base):
-        return posixpath.join(str(base), name)
+        return posixpath.join(os.fspath(base), name)
     return os.path.join(base, name)

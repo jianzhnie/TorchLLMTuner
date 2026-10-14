@@ -1,42 +1,12 @@
-"""The checkpoint contract: what a checkpoint holds, and the policies over it.
+"""Shared checkpoint manager policies, independent of the storage backend.
 
-Vendored from torchtitan's ``components/checkpointer/base.py``. The class
-structure is kept -- a backend-agnostic ``BaseCheckpointManager`` with the
-shared policies (retention, step discovery, async draining, load selection) and
-concrete subclasses that only implement how bytes are read and written -- because
-that split is what makes the DCP and torch_checkpointing managers share 90% of
-their logic in torchtitan, and it is what will let llmtuner do the same.
+Adapted from torchtitan's components/checkpointer/base.py. This module owns
+state registration, load-source selection, save cadence, retention, and
+asynchronous cleanup. Concrete managers implement checkpoint IO and completion
+checks; configuration lives in config/checkpoint_config.py.
 
-Four deliberate departures, all subtractions:
-
-* **The config is not defined here.** torchtitan's ``BaseCheckpointManager``
-  carries its own nested config, which is what keeps a manager's defaults next
-  to the manager. llmtuner keeps all configuration in one module
-  (``llmtuner.config``), so the managers take an explicit ``config``
-  argument of the type defined there.
-
-* **No tyro.** ``purge_exempt`` was
-  ``Annotated[Function.Config | None, tyro.conf.Suppress]`` -- a CLI-suppressed
-  pluggable predicate. It is typed as a plain ``Callable[[int], bool] | None``
-  here; nothing parses it off a command line.
-
-* **No ``structured_logger`` spans.** torchtitan wraps load/save in
-  ``sl.log_trace_span`` and stamps ``sl.add_step_tag``. llmtuner has no structured
-  logger; the ``logger.info`` lines that carry the same information are kept.
-
-* **``GarbageCollection`` is local.** torchtitan's version carries
-  structured-logger tags in ``run``; llmtuner's
-  ``utils/garbage_collection.py`` keeps the
-  collection and drops the tags. Its ``run`` is likewise not wired into the
-  training loop yet -- the checkpointer uses only ``collect``.
-
-``MODEL`` / ``OPTIMIZER`` / ``LR_SCHEDULER`` / ``DATALOADER`` / ``TRAIN_STATE``
-are the top-level state keys a checkpoint is keyed by. llmtuner shares none of
-torchtitan's component containers, so which of them a run actually populates
-differs -- see ``components/checkpointer/__init__.py`` for the mapping.
-
-The model's checkpoint state adapter lives in ``model_state.py``; the storage
-contract lives in ``storage.py``. This module owns manager policies.
+Model state adaptation lives in model_state.py. Path operations are described
+by storage.py and implemented in filesystem.py.
 """
 
 from __future__ import annotations
@@ -48,7 +18,8 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -61,7 +32,21 @@ from .checkpoint_keys import EMA, LR_SCHEDULER, MODEL, OPTIMIZER
 from .model_state import ModelCheckpointState
 from .storage import CheckpointStorage
 
+if TYPE_CHECKING:
+    from ...config.checkpoint_config import CheckpointConfig
+
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class CheckpointLoadSource:
+    """Resolved storage path and format flags for one checkpoint restore."""
+
+    checkpoint_id: str
+    model_only: bool
+    from_hf: bool
+    from_quantized: bool
+
 
 __all__ = [
     "BaseCheckpointManager",
@@ -114,10 +99,8 @@ EXPORT_DTYPE_MAP: dict[str, torch.dtype] = {
 }
 """The dtypes a checkpoint may be exported in, by their config spelling.
 
-``cast_linear.TORCH_DTYPE_MAP`` holds the same three pairs for the lm_head's
-``compute_dtype``. They are deliberately separate tables: one names what the
-checkpointer can write, the other what the output projection can compute in,
-and the overlap is incidental (see the symbol guide's note on this).
+Export support is a checkpoint policy, independent of the lm_head compute
+dtype policy defined in ``config/model_config.py``.
 """
 
 
@@ -162,7 +145,7 @@ class BaseCheckpointManager(ABC):
     ``distributed_checkpoint.DistributedCheckpointManager.__init__`` produces.
     """
 
-    _STEP_DIR_PATTERN = r"step-(0|[1-9]\d*)"
+    _STEP_DIR_PATTERN = r"step-(0|[1-9][0-9]*)"
     """The canonical checkpoint directory name, e.g. ``step-100``.
 
     Only non-negative integers without leading zeros match, so a stray
@@ -172,7 +155,7 @@ class BaseCheckpointManager(ABC):
 
     def __init__(
         self,
-        config,
+        config: CheckpointConfig,
         *,
         model_parts: list[nn.Module],
         optimizer: Any,
@@ -196,7 +179,8 @@ class BaseCheckpointManager(ABC):
         whose ``state_dict`` is already flat and FQN-keyed (the format DCP needs
         to reshard a pipeline checkpoint) and which materializes state before DCP
         plans a load. ``lr_scheduler`` last, because a load runs in this order and
-        the scheduler's restore reads the optimizer's ``base_lrs``; without it a
+        the scheduler's restore reads optimizer group ``initial_lr`` values. Without
+        it a
         resumed run's fresh scheduler restarts ``last_epoch`` at 0, so a warmup
         or decay curve restarts on the step after a resume.
         """
@@ -206,16 +190,18 @@ class BaseCheckpointManager(ABC):
 
         self.folder = filesystem.join(folder, config.folder)
         self.interval = config.interval
-        self.states = states
-        states.update(
-            {
-                MODEL: ModelCheckpointState(model_parts),
-                OPTIMIZER: optimizer,
-                LR_SCHEDULER: lr_scheduler,
-            }
-        )
+        self.states = {
+            MODEL: ModelCheckpointState(model_parts),
+            OPTIMIZER: optimizer,
+            LR_SCHEDULER: lr_scheduler,
+        }
         if ema is not None:
-            states[EMA] = ema
+            self.states[EMA] = ema
+        # Own the mapping and preserve optimizer-before-scheduler load order,
+        # even when the caller's dictionary already contains core state keys.
+        self.states.update(
+            (key, value) for key, value in states.items() if key not in self.states
+        )
 
         # -- loading and saving policy --
         self.load_only = config.load_only
@@ -249,18 +235,20 @@ class BaseCheckpointManager(ABC):
         if not getattr(self, "_initialized", False) or not self.enable:
             return False
 
+        if not isinstance(step, int) or isinstance(step, bool) or step < -1:
+            raise ValueError(
+                f"checkpoint load step must be an integer >= -1, got {step!r}"
+            )
         resolved = self._resolve_load_source(step)
         if resolved is None:
             return False
-        checkpoint_id, model_only, from_hf, from_quantized = resolved
-
-        logger.info("Loading the checkpoint from %s.", checkpoint_id)
+        logger.info("Loading the checkpoint from %s.", resolved.checkpoint_id)
         begin = time.monotonic()
         self._load_checkpoint(
-            self._states_to_load(model_only),
-            checkpoint_id,
-            from_hf=from_hf,
-            from_quantized=from_quantized,
+            self._states_to_load(resolved.model_only),
+            resolved.checkpoint_id,
+            from_hf=resolved.from_hf,
+            from_quantized=resolved.from_quantized,
         )
         GarbageCollection.collect("GC collection for checkpoint loading.")
         logger.info(
@@ -269,10 +257,10 @@ class BaseCheckpointManager(ABC):
         )
         return True
 
-    def _resolve_load_source(self, step: int) -> tuple[str, bool, bool, bool] | None:
+    def _resolve_load_source(self, step: int) -> CheckpointLoadSource | None:
         """Pick the checkpoint directory this load reads.
 
-        Returns ``(checkpoint_id, model_only, from_hf, from_quantized)``, or
+        Returns a named path/format descriptor, or
         ``None`` for a fresh start (nothing on disk and no initial weights
         configured). The resolution order is the fault-tolerance contract: an
         existing ``checkpoint.folder`` wins over the ``initial_*`` options, so
@@ -362,13 +350,27 @@ class BaseCheckpointManager(ABC):
                     step,
                 )
 
-        return checkpoint_id, model_only, from_hf, from_quantized
+        return CheckpointLoadSource(
+            checkpoint_id=checkpoint_id,
+            model_only=model_only,
+            from_hf=from_hf,
+            from_quantized=from_quantized,
+        )
 
     @torch.no_grad()
     def save(self, curr_step: int, last_step: bool = False) -> bool:
         """Persist state for ``curr_step``."""
         if not getattr(self, "_initialized", False) or not self.enable:
             return False
+        if (
+            not isinstance(curr_step, int)
+            or isinstance(curr_step, bool)
+            or curr_step < 0
+        ):
+            raise ValueError(
+                "checkpoint save step must be a non-negative integer, "
+                f"got {curr_step!r}"
+            )
         return self._save(curr_step, last_step)
 
     def maybe_wait_for_staging(self) -> None:
