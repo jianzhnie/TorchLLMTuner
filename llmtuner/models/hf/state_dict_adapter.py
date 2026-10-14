@@ -21,7 +21,8 @@ class HFTransformerStateDictAdapter:
     """Translate llmtuner wrapper FQNs to standard HF safetensors FQNs."""
 
     def __init__(self, model_config: Any, hf_assets_path: str | None) -> None:
-        self.model_config = model_config
+        # Composite HF models store the trained decoder's weight ties here.
+        self.model_config = getattr(model_config, "text_config", model_config)
         self.hf_assets_path = hf_assets_path
         self._hf_keys: set[str] | None = None
         self.fqn_to_index_mapping: dict[str, int] | None = None
@@ -110,8 +111,8 @@ class HFTransformerStateDictAdapter:
     def get_hf_storage_reader(
         self,
         path: str,
-        from_quantized: bool = False,
         *,
+        from_quantized: bool = False,
         thread_count: int | None = None,
     ) -> HuggingFaceStorageReader:
         if from_quantized:

@@ -1,52 +1,14 @@
-"""Route tokens to experts: reorder locally, all-to-all across EP ranks.
+"""Local and all-to-all token dispatch with per-call combine metadata.
 
-Vendored from torchtitan ``models/common/token_dispatcher.py``. The ``Local`` and
-``AllToAll`` dispatchers came across; of the three optional backends:
+Adapted from torchtitan ``models/common/token_dispatcher.py``. Local dispatch
+sorts assignments by expert; all-to-all also transfers tokens to expert ranks
+using explicit process groups. With no EP group, it follows the local path.
+Combine reverses permutation and communication, applies routing scores, and
+scatters outputs back to their original tokens.
 
-* ``TorchAOTokenDispatcher`` is ported as an optional-import adapter: it varies
-  from ``AllToAllTokenDispatcher`` only in its ``_permute``/``_unpermute``,
-  which delegate to torchao's ``permute_and_pad``. torchao is not a dependency;
-  constructing the dispatcher without it raises ``ImportError`` with an install
-  hint. Its padded-permute numerics are unverified on this (macOS/CPU) machine
-  and await a re-run on the CUDA target with the real package.
-* ``DeepEPTokenDispatcher`` and ``HybridEPTokenDispatcher`` stay registered
-  gaps. They drive DeepEP v2's ``ElasticBuffer`` and HybridEP's kernels through
-  torchtitan's ``distributed/deepep/`` wrappers (1155 lines) around the
-  CUDA-only ``deep_ep``/``hybridep`` packages; the dispatch/combine surface
-  cannot be expressed faithfully without vendoring those wrappers, so selecting
-  either backend is refused at config time (``ParallelConfig``) with the unlock
-  conditions spelled out. Any future vendoring must also carry the wrappers'
-  checkpoint-effect registration: DeepEP assigns receive slots with atomics, so
-  an activation-checkpoint recompute that replays dispatch can reorder tokens
-  while backward routes gradients by the forward's handle -- upstream saves
-  dispatch/combine instead, and without that, FullAC/RegionAC + DeepEP computes
-  wrong gradients.
-
-``DominoRoutedExperts`` reuses all-to-all dispatch for two token slices; this
-does not provide accelerator stream overlap. MC2 requires Ascend fused
-operators and is rejected by the shared backend validator in
-``config/expert_parallel_config.py``. Backend availability and supported
-routing semantics are separate contracts.
-
-What changed from upstream, and why:
-
-* Dispatchers are constructed directly from plain ints; there is no nested
-  ``Config`` in between.
-* ``spmd.all_to_all`` is gone in favour of ``all_to_all_single``. Upstream
-  already writes that call as the compiled/traced branch; it is the native
-  collective, it needs no ``spmd_types``, and it is the branch that actually
-  runs on a non-NCCL backend. The eager path now uses it too.
-* every ``spmd.is_type_checking()`` block is deleted -- they annotate the SPMD
-  type checker and have no runtime effect.
-* ``maybe_set_sparse_mesh()`` is gone. It swaps the ambient mesh while the
-  expert body runs; llmtuner passes process groups explicitly instead.
-* the mesh is a plain ``ProcessGroup``, not a ``DeviceMesh``, because all this
-  code does with it is launch collectives.
-
-The two dispatchers differ in one way: ``LocalTokenDispatcher`` only reorders
-tokens (EP=1), while ``AllToAllTokenDispatcher`` additionally moves them between
-ranks (EP>1). The EP one falls back to the local path when it has no group, so
-the EP=1 code path is literally the same code.
+TorchAO padded permutation lives in ``torchao_dispatch.py``. Domino reuses the
+all-to-all path for separate token slices. Backend gaps and adaptation details
+are recorded in ``docs/llmtuner_upstream_map.md``.
 """
 
 from __future__ import annotations
@@ -62,21 +24,11 @@ from ...accelerator import distributed
 from ...models.common.scatter_add import deterministic_scatter_add
 
 __all__ = [
-    "TORCHAO_INSTALL_HINT",
     "LocalDispatchMetadata",
     "AllToAllDispatchMetadata",
     "LocalTokenDispatcher",
     "AllToAllTokenDispatcher",
-    "TorchAOTokenDispatcher",
 ]
-
-TORCHAO_INSTALL_HINT = (
-    "ep_token_dispatcher='torchao' requires the optional `torchao` package, "
-    "which is not installed. Install it with `pip install torchao`, or use "
-    "the default ep_token_dispatcher='alltoall'. torchao's `permute_and_pad` "
-    "pads each expert's token group to a multiple of pad_multiple for "
-    "FP8/MXFP8 quantized grouped GEMMs."
-)
 
 
 def materialize(tensor: torch.Tensor) -> torch.Tensor:
@@ -122,7 +74,7 @@ class LocalTokenDispatcher:
         self.num_experts = num_experts
         self.top_k = top_k
 
-    def wire_meshes(self, *, ep_group: dist.ProcessGroup | None) -> None:
+    def set_ep_group(self, *, ep_group: dist.ProcessGroup | None) -> None:
         """No-op for the EP=1 dispatcher. Subclasses override."""
         del ep_group
 
@@ -263,7 +215,7 @@ class BaseEPTokenDispatcher(LocalTokenDispatcher, ABC):
         # ``None`` means EP is off and every method falls back to local.
         self.ep_group: dist.ProcessGroup | None = None
 
-    def wire_meshes(self, *, ep_group: dist.ProcessGroup | None) -> None:
+    def set_ep_group(self, *, ep_group: dist.ProcessGroup | None) -> None:
         """Install the EP group used by dispatch/combine."""
         self.ep_group = ep_group
 
@@ -569,150 +521,3 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             metadata,
             x_TD,
         )
-
-
-class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
-    """All-to-all dispatch with token-group padding for quantized grouped GEMMs.
-
-    Identical to ``AllToAllTokenDispatcher`` except ``_permute``/``_unpermute``
-    delegate to torchao's ``permute_and_pad``, which reorders tokens to
-    expert-major order AND pads each expert's token group to a multiple of
-    ``pad_multiple`` -- the alignment FP8/MXFP8 quantized grouped GEMM kernels
-    require (16 for FP8, 32 for MXFP8). The padding shows up in
-    ``num_tokens_per_local_expert_e`` and must be stripped by the matching
-    ``_unpermute``. ``GroupedExperts`` consumes the returned padded counts
-    with either its grouped GEMM or per-expert loop; padding is removed before
-    scores are applied in combine.
-
-    Invariants (unchanged from the all-to-all dispatcher):
-
-    * ``dispatch(x_TD(T, D), topk_scores_TK(T, K), topk_expert_ids_TK(T, K),
-      num_local_tokens_per_expert_E(E,))`` returns tokens in expert-major
-      order for the local experts, per-local-expert counts (padded), and
-      metadata consumed only by ``combine``.
-    * ``combine`` inverts dispatch exactly: unpermute (strip padding),
-      all-to-all back, weight by score, deterministic scatter home.
-
-    torchao is an optional dependency: constructing this class without it
-    raises ``ImportError`` with an install hint. With ``ep_group=None`` it
-    skips the all-to-all and applies only the local padded permute (the EP=1
-    debug/numerics path upstream supports).
-
-    The padded-permute numerics are unverified on this (macOS/CPU) machine --
-    no torchao, no CUDA -- and await a re-run on the CUDA target with the real
-    package installed.
-    """
-
-    def __init__(self, num_experts: int, top_k: int, pad_multiple: int) -> None:
-        super().__init__(num_experts, top_k)
-        if pad_multiple < 1:
-            raise ValueError(f"pad_multiple must be >= 1, got {pad_multiple}.")
-        self.pad_multiple = pad_multiple
-        try:
-            from torchao.prototype.moe_training.ep.permute import permute_and_pad
-        except ImportError as exc:
-            raise ImportError(TORCHAO_INSTALL_HINT) from exc
-        self._permute_and_pad = permute_and_pad
-
-    def dispatch(
-        self,
-        x_TD: torch.Tensor,
-        topk_scores_TK: torch.Tensor,
-        topk_expert_ids_TK: torch.Tensor,
-        num_local_tokens_per_expert_E: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, AllToAllDispatchMetadata]:
-        """Dispatch, padding each local expert's token group to ``pad_multiple``."""
-        if self.ep_group is not None:
-            return super().dispatch(
-                x_TD,
-                topk_scores_TK,
-                topk_expert_ids_TK,
-                num_local_tokens_per_expert_E,
-            )
-
-        # EP=1: no all-to-all. Locally reorder to expert-sorted order, then
-        # apply the padded permute so the quantized grouped GEMM sees groups
-        # aligned to pad_multiple.
-        (
-            routed_input_ND,
-            token_indices_experts_sorted_N,
-            topk_scores_experts_sorted_N,
-        ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
-
-        (
-            input_shape,
-            routed_input_RD,
-            permuted_indices,
-            num_tokens_per_local_expert_padded_e,
-        ) = self._permute(routed_input_ND, num_local_tokens_per_expert_E)
-
-        metadata = AllToAllDispatchMetadata(
-            token_indices_experts_sorted_N=token_indices_experts_sorted_N,
-            topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
-            input_shape=input_shape,
-            permuted_indices=permuted_indices,
-            # Unused in the EP=1 combine path (no all-to-all to reverse).
-            input_splits=[],
-            output_splits=[],
-        )
-        return routed_input_RD, num_tokens_per_local_expert_padded_e, metadata
-
-    def combine(
-        self,
-        routed_output_RD: torch.Tensor,
-        metadata: AllToAllDispatchMetadata,
-        x_TD: torch.Tensor,
-    ) -> torch.Tensor:
-        """Strip the padding, then run the local score + scatter home."""
-        if self.ep_group is not None:
-            return super().combine(routed_output_RD, metadata, x_TD)
-
-        # EP=1: _unpermute removes the padding and recovers expert-sorted
-        # order; the rest is exactly the local dispatcher's combine.
-        assert isinstance(metadata, AllToAllDispatchMetadata)
-        routed_output_RD = self._unpermute(
-            routed_output_RD, metadata.input_shape, metadata.permuted_indices
-        )
-        return LocalTokenDispatcher.combine(self, routed_output_RD, metadata, x_TD)
-
-    def _permute(
-        self,
-        routed_input_RD: torch.Tensor,
-        num_global_tokens_per_local_expert_E: torch.Tensor,
-    ) -> tuple[tuple, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Padded expert-major permute via torchao's ``permute_and_pad``."""
-        # ep_size=1 when EP is disabled: permute_and_pad then only pads token
-        # groups (rank-major == expert-major for a single rank).
-        ep_size = (
-            1 if self.ep_group is None else distributed.get_world_size(self.ep_group)
-        )
-        e = num_global_tokens_per_local_expert_E.shape[0] // ep_size
-
-        (
-            input_shape,
-            routed_input_RD,
-            permuted_indices,
-            num_global_tokens_per_local_expert_padded_e,
-            _group_offsets,
-        ) = self._permute_and_pad(
-            routed_input_RD,
-            num_global_tokens_per_local_expert_E,
-            ep_size,
-            e,
-            self.pad_multiple,
-        )
-        return (
-            input_shape,
-            routed_input_RD,
-            permuted_indices,
-            num_global_tokens_per_local_expert_padded_e,
-        )
-
-    def _unpermute(
-        self,
-        routed_output_RD: torch.Tensor,
-        input_shape: tuple,
-        permuted_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Reverse the padded permute and strip the sentinel row it added."""
-        return super()._unpermute(routed_output_RD, input_shape, permuted_indices)[:-1]

@@ -33,7 +33,7 @@ __all__ = ["EMA"]
 logger = get_logger(__name__)
 
 
-class EMAParamOptimizer(Optimizer):
+class EMAStateOptimizer(Optimizer):
     """Holds ``state[t]["ema_params"]`` per tensor (parameter or buffer) for
     one model part.
 
@@ -57,9 +57,42 @@ class EMAParamOptimizer(Optimizer):
 
     def step(self, closure=None) -> None:
         raise RuntimeError(
-            "EMAParamOptimizer must not be step()-ed; call "
+            "EMAStateOptimizer must not be step()-ed; call "
             "EMA.step(current_step) instead."
         )
+
+    def tracked_averages(self, tensors: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Resolve fixed-identity EMA state without inserting missing entries."""
+        # State is keyed by tensor identity and the tracked set is fixed at
+        # construction, so a tensor that appeared or
+        # was replaced since then has no entry. state is a defaultdict, so
+        # indexing it here would insert an empty entry and fail later with a
+        # bare KeyError("ema_params").
+        untracked = [t for t in tensors if "ema_params" not in self.state.get(t, {})]
+        if untracked:
+            raise RuntimeError(
+                f"EMA has no state for {len(untracked)} of {len(tensors)} "
+                f"tensors (first: shape {tuple(untracked[0].shape)}, dtype "
+                f"{untracked[0].dtype}). EMA tracks the tensors that existed "
+                "when it was built, by identity, so unfreezing a parameter, "
+                "replacing a parameter or buffer, or rebuilding part of the "
+                "model after the EMA is constructed is not supported. Build "
+                "the EMA after the model is final."
+            )
+        live_ids = {id(tensor) for tensor in tensors}
+        missing = sum(
+            id(tensor) not in live_ids
+            for group in self.param_groups
+            for tensor in group["params"]
+        )
+        if missing:
+            raise RuntimeError(
+                f"EMA tracked scope lost {missing} tensors. Removing or freezing "
+                "a tracked parameter, removing a tracked buffer, or renaming it "
+                "outside buffer_patterns after EMA construction is not supported. "
+                "Build the EMA after the model is final."
+            )
+        return [self.state[t]["ema_params"] for t in tensors]
 
 
 class EMA(OptimizersContainer):
@@ -70,7 +103,7 @@ class EMA(OptimizersContainer):
     ``__init__``/``step()``/``zero_grad()`` -- this is never a real training
     optimizer. Never merged into ``Trainer.optimizer`` or the LR scheduler
     container -- it is a sibling object, only built when the run configures
-    one (``training.ema_config``), and stepped explicitly from
+    one (``training.ema``), and stepped explicitly from
     ``train_step()``.
 
     Args:
@@ -150,28 +183,23 @@ class EMA(OptimizersContainer):
         all_params = [parameter for group in parameter_groups for _, parameter in group]
         self._validate_params(all_params)
         self._param_optimizers = [
-            EMAParamOptimizer(group) for group in parameter_groups
+            EMAStateOptimizer(group) for group in parameter_groups
         ]
 
-        self._buffer_optimizers: list[EMAParamOptimizer] = []
-        if self._buffer_patterns:
-            total_matched = 0
-            for named_buffers in buffer_groups:
-                total_matched += len(named_buffers)
-                self._buffer_optimizers.append(EMAParamOptimizer(named_buffers))
-            if total_matched == 0:
-                logger.warning(
-                    "EMA buffer_patterns=%s matched no buffers across any "
-                    "model part -- buffer EMA is configured but silently "
-                    "tracking nothing. Check the patterns for typos.",
-                    list(buffer_patterns),
-                )
+        self._buffer_optimizers = [EMAStateOptimizer(group) for group in buffer_groups]
+        if self._buffer_patterns and not any(buffer_groups):
+            logger.warning(
+                "EMA buffer_patterns=%s matched no buffers across any "
+                "model part -- buffer EMA is configured but silently "
+                "tracking nothing. Check the patterns for typos.",
+                list(buffer_patterns),
+            )
 
         # OptimizersContainer.state_dict()/load_state_dict() (reused as-is)
         # iterate self.optimizers and merge each one's FQN-keyed flat dict, so
         # folding _buffer_optimizers in here is what gives buffer EMA the same
         # "ema" checkpoint key as parameters.
-        self.optimizers: list[EMAParamOptimizer] = (
+        self.optimizers: list[EMAStateOptimizer] = (
             self._param_optimizers + self._buffer_optimizers
         )
         low_precision = sorted(
@@ -241,7 +269,7 @@ class EMA(OptimizersContainer):
             params: list[torch.Tensor] = [
                 p for p in model.parameters() if p.requires_grad
             ]
-            groups.append((self._tracked_averages(ema_opt, params), params))
+            groups.append((ema_opt.tracked_averages(params), params))
         for ema_opt, model in zip(
             # Empty when buffer_patterns is unset: shorter than model_parts.
             self._buffer_optimizers,
@@ -253,43 +281,8 @@ class EMA(OptimizersContainer):
                 for name, b in model.named_buffers()
                 if any(p.search(name) for p in self._buffer_patterns)
             ]
-            groups.append((self._tracked_averages(ema_opt, buffers), buffers))
+            groups.append((ema_opt.tracked_averages(buffers), buffers))
         return groups
-
-    def _tracked_averages(
-        self, ema_opt: EMAParamOptimizer, tensors: list[torch.Tensor]
-    ) -> list[torch.Tensor]:
-        """Resolve fixed-identity EMA state without inserting missing entries."""
-        # State is keyed by tensor identity and the tracked set is fixed at
-        # construction, so a tensor that appeared or
-        # was replaced since then has no entry. state is a defaultdict, so
-        # indexing it here would insert an empty entry and fail later with a
-        # bare KeyError("ema_params").
-        untracked = [t for t in tensors if "ema_params" not in ema_opt.state.get(t, {})]
-        if untracked:
-            raise RuntimeError(
-                f"EMA has no state for {len(untracked)} of {len(tensors)} "
-                f"tensors (first: shape {tuple(untracked[0].shape)}, dtype "
-                f"{untracked[0].dtype}). EMA tracks the tensors that existed "
-                "when it was built, by identity, so unfreezing a parameter, "
-                "replacing a parameter or buffer, or rebuilding part of the "
-                "model after the EMA is constructed is not supported. Build "
-                "the EMA after the model is final."
-            )
-        live_ids = {id(tensor) for tensor in tensors}
-        missing = sum(
-            id(tensor) not in live_ids
-            for group in ema_opt.param_groups
-            for tensor in group["params"]
-        )
-        if missing:
-            raise RuntimeError(
-                f"EMA tracked scope lost {missing} tensors. Removing or freezing "
-                "a tracked parameter, removing a tracked buffer, or renaming it "
-                "outside buffer_patterns after EMA construction is not supported. "
-                "Build the EMA after the model is final."
-            )
-        return [ema_opt.state[t]["ema_params"] for t in tensors]
 
     # -- checkpointing ----------------------------------------------------------
 

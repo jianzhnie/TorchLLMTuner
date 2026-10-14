@@ -113,16 +113,16 @@ def get_flat_optim_state_dict(optim: torch.optim.Optimizer) -> dict[str, Any]:
 
 
 def load_flat_optim_state_dict(
-    optim: torch.optim.Optimizer, flat_sd: dict[str, Any]
+    optim: torch.optim.Optimizer, *, flat_state: dict[str, Any]
 ) -> None:
     """Load a flat, FQN-keyed optimizer state dict into ``optim``.
 
     Inverse of ``get_flat_optim_state_dict``. The optimizer state must already
     exist (it tells us which state tensors to expect); call ``init_optim_state``
-    first. Keys in ``flat_sd`` that this optimizer does not own are ignored, so a
+    first. Keys in ``flat_state`` that this optimizer does not own are ignored, so a
     single flat dict covering several optimizers can be passed to each of them.
     """
-    optim.load_state_dict(unflatten_optim_state_dict(optim, flat_sd))
+    optim.load_state_dict(unflatten_optim_state_dict(optim, flat_state=flat_state))
 
 
 def optim_state_dict_to_fqn_keys(optim_sd: dict[str, Any]) -> dict[str, Any]:
@@ -166,12 +166,12 @@ def optim_state_dict_to_fqn_keys(optim_sd: dict[str, Any]) -> dict[str, Any]:
 
 
 def unflatten_optim_state_dict(
-    optim: torch.optim.Optimizer, flat_sd: dict[str, Any]
+    optim: torch.optim.Optimizer, *, flat_state: dict[str, Any]
 ) -> dict[str, Any]:
     """Rebuild an integer-keyed optimizer state dict from a flat, FQN-keyed one.
 
     Walks the live optimizer's param groups to recover the FQN order and the set
-    of state tensors to expect, then pulls matching values out of ``flat_sd``.
+    of state tensors to expect, then pulls matching values out of ``flat_state``.
     """
     state: dict[int, dict[str, Any]] = {}
     param_groups: list[dict[str, Any]] = []
@@ -186,11 +186,11 @@ def unflatten_optim_state_dict(
                 param_state: dict[str, Any] = {}
                 for state_name in optim.state[param]:
                     flat_key = f"state.{fqn}.{state_name}"
-                    if flat_key in flat_sd:
-                        param_state[state_name] = flat_sd[flat_key]
+                    if flat_key in flat_state:
+                        param_state[state_name] = flat_state[flat_key]
                     else:
                         # State value is itself a nested dict (e.g. Shampoo).
-                        nested = _restore_nested_state(flat_sd, prefix=flat_key)
+                        nested = _restore_nested_state(flat_state, prefix=flat_key)
                         if not nested:
                             raise KeyError(
                                 f"Optimizer state key {flat_key!r} not found "
@@ -202,7 +202,7 @@ def unflatten_optim_state_dict(
             param_id += 1
 
         param_groups.append(
-            _restore_param_group(param_group, param_ids=ids, flat_state=flat_sd)
+            _restore_param_group(param_group, param_ids=ids, flat_state=flat_state)
         )
 
     return {"state": state, "param_groups": param_groups}

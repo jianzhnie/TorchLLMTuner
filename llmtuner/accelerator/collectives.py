@@ -50,6 +50,7 @@ from .tensor_tree import get_tensor_tree_device, move_tensor_tree
 logger = get_logger(__name__)
 
 __all__ = [
+    "PartialToInvariantAllReduce",
     "all_reduce",
     "clip_grad_norm_",
     "set_pg_timeouts",
@@ -359,3 +360,25 @@ def all_reduce(
         dist.all_reduce(data_on_device, op=_REDUCE_OPS[op], group=group)
 
     move_tensor_tree(data_on_device, input_device, out=data)
+
+
+class PartialToInvariantAllReduce(torch.autograd.Function):
+    """Sum partial values in forward and pass gradients through unchanged.
+
+    Use when every rank computes the same loss from the reduced sum. Its
+    derivative with respect to each local summand equals the derivative with
+    respect to the sum. A second all-reduce in backward would multiply that
+    gradient by the group size. Forward clones the input before reducing it.
+
+    Adapted from torchtitan's MoE auxiliary-loss placement conversion.
+    """
+
+    @staticmethod
+    def forward(ctx, partial, group):  # pyrefly: ignore[bad-override]
+        reduced = partial.clone()
+        all_reduce(reduced, group=group)
+        return reduced
+
+    @staticmethod
+    def backward(ctx, grad_output):  # pyrefly: ignore[bad-override]
+        return grad_output, None

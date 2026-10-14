@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 def validate_tensor_parallel_config(cfg: "ParallelConfig") -> None:
     """Reject unsupported TP settings before model or mesh construction."""
-    if not cfg.enable_sequence_parallel:
+    if cfg.tensor_parallel_size > 1 and not cfg.enable_sequence_parallel:
         raise UnsupportedCombinationError(
             "parallel.enable_sequence_parallel=False is not supported: "
             "llmtuner's tensor parallelism is sequence-parallel by "

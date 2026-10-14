@@ -424,7 +424,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
 
             hf_state_dict = self.sd_adapter.to_hf(state_dict)
             hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
-                checkpoint_id, from_quantized
+                checkpoint_id, from_quantized=from_quantized
             )
 
             dcp.load(hf_state_dict, storage_reader=hf_storage_reader)

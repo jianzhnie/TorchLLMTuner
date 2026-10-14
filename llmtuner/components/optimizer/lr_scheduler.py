@@ -1,31 +1,12 @@
-"""The learning-rate schedule: linear warmup, stable phase, then decay.
+"""Warmup-stable-decay schedules for the trainer's inner optimizers.
 
-Vendored from torchtitan ``components/optimizer/lr_scheduler.py``: the same
-``LRSchedulersContainer``, driven by the same ``LambdaLR``, over the same
-Warmup-Stable-Decay (WSD) curve (https://arxiv.org/abs/2404.06395).
+Adapted from torchtitan ``components/optimizer/lr_scheduler.py``. Each inner
+optimizer owns one LambdaLR, sharing the WSD factor but retaining its own base
+learning rates. The container steps them together and checkpoints their common
+last_epoch; restore recomputes rates from optimizer initial_lr values.
 
-The container is not optional. A ``LambdaLR`` reads ``lr`` off the first of its
-optimizer's ``param_groups``, and an ``OptimizersContainer`` built the way the
-loop needs it has none: its ``param_groups`` is the parameter view
-``Optimizer.__init__`` merges, and no group carries an ``lr`` of its own. So the
-scheduler has to be handed the *inner* optimizers, one ``LambdaLR`` each -- which
-is exactly what this class holds, and why it exists rather than a bare
-``LambdaLR``.
-
-Departures from upstream:
-
-* **The config is not defined here.** The knobs live in ``LRSchedulerConfig`` in
-  ``llmtuner.config``, with every other config in the package;
-  :func:`build_lr_scheduler` is the seam that turns one into the container.
-  Upstream's ``Config.build`` is that seam, spelled with torchtitan's config
-  system.
-* **``state_dict`` reports ``last_epoch`` and nothing else.** ``LambdaLR`` is
-  stateless apart from it -- the lr is a pure function of ``(last_epoch,
-  base_lr)`` -- so ``_last_lr`` is recomputed on load rather than stored. The
-  base learning rates are reconstructed from restored optimizer group
-  ``initial_lr`` values. A stateful scheduler
-  (``ReduceLROnPlateau`` and friends) would need more, which is why the load path
-  spells this out instead of round-tripping the whole dict.
+Configuration lives in ``config/lr_scheduler_config.py``. This module owns the
+curve, scheduler lifecycle, and learning-rate metrics.
 """
 
 from __future__ import annotations
@@ -63,8 +44,8 @@ def wsd_factor(
 ) -> float:
     """The multiplicative factor to apply to the base lr at ``current_step``.
 
-    A LambdaLR contract: the factor ranges from 1 to ``min_lr_factor``, scaling
-    the lr down from its optimizer-configured value.
+    Warmup starts at ``1 / warmup_steps``; the stable phase uses 1. Decay
+    approaches ``min_lr_factor`` within the configured schedule.
     """
     warmup_stable_steps = warmup_steps + stable_steps
     if current_step < warmup_steps:
@@ -106,8 +87,8 @@ class LRSchedulersContainer(Stateful):
         optimizers: one scheduler is built per entry, in order.
         lr_lambda: maps ``last_epoch`` to the multiplicative lr factor.
         total_steps: the schedule's length, resolved by :func:`build_lr_scheduler`
-            from the config and the run length. Kept only so callers can assert
-            on the curve's extent; nothing at step time reads it.
+            from the config and run length. Restore rejects checkpoint progress
+            beyond this length.
     """
 
     def __init__(
@@ -174,7 +155,13 @@ class LRSchedulersContainer(Stateful):
         # together from the same lambda, so they share a step count by
         # construction. Storing it once is what lets a checkpoint survive
         # resharding to a different number of optimizers.
-        return {"last_epoch": self.schedulers[0].last_epoch}
+        last_epoch = self.schedulers[0].last_epoch
+        if any(scheduler.last_epoch != last_epoch for scheduler in self.schedulers):
+            raise ValueError(
+                "Cannot checkpoint schedulers with different last_epoch values; "
+                "advance them through LRSchedulersContainer.step() together"
+            )
+        return {"last_epoch": last_epoch}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore ``last_epoch`` on every scheduler.
@@ -193,6 +180,12 @@ class LRSchedulersContainer(Stateful):
             or last_epoch < 0
         ):
             raise ValueError("scheduler last_epoch must be a nonnegative integer")
+        if last_epoch > self.total_steps:
+            raise ValueError(
+                f"scheduler last_epoch ({last_epoch}) exceeds total_steps "
+                f"({self.total_steps}); restore with a schedule covering the "
+                "checkpoint's progress"
+            )
         restored = []
         for scheduler in self.schedulers:
             base_lrs = [

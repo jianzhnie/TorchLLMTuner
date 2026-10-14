@@ -49,7 +49,6 @@ __all__ = [
     "AllGatherFusedQKVLinear",
     "TensorParallelFeedForward",
     "ReduceScatterLinear",
-    "validate_tp_projection_preconditions",
 ]
 
 # Shape suffix legend, scoped to this file:
@@ -63,9 +62,8 @@ def warn_once_no_tp_overlap() -> None:
     """Say so when the dist-GEMM modules were selected but TP is not on.
 
     Otherwise the fallback is indistinguishable from the feature working: the run
-    succeeds, the loss looks fine, and nothing ran fused. The preconditions cover
-    the wrong-backend and SP-disabled cases with hard errors, but TP=1 has to stay
-    runnable, so it warns instead.
+    succeeds, the loss looks fine, and nothing ran fused. TP=1 remains runnable
+    through the standard projection, with a warning identifying the fallback.
     """
     global _WARNED_NO_TP
     if not _WARNED_NO_TP:
@@ -74,28 +72,6 @@ def warn_once_no_tp_overlap() -> None:
             "Tensor-parallel projection selected but tensor parallelism is not "
             "active; running the standard projection without collective "
             "overlap."
-        )
-
-
-def validate_tp_projection_preconditions(*, enable_sp: bool) -> None:
-    """Reject configurations the fused modules cannot serve.
-
-    Call before wiring these projections into a sequence-parallel model.
-    Activations are local tensors, so placements cannot reveal whether the
-    caller enabled sequence parallelism.
-
-    Raises:
-        ValueError: if sequence parallelism is off. The fused GEMMs *replace* the
-            SP all-gather and reduce-scatter, so with SP disabled there is
-            nothing for them to fuse with and the ranks would compute different
-            things.
-    """
-    if not enable_sp:
-        raise ValueError(
-            "Tensor-parallel projections require "
-            "parallel.enable_sequence_parallel; the fused GEMMs replace the SP "
-            "all-gather and reduce-scatter, so there is nothing for them to fuse "
-            "with SP disabled."
         )
 
 
@@ -122,7 +98,7 @@ class AllGatherFusedQKVLinear(QKVLinear):
         )
 
 
-class ReduceScatterLinear(nn.Module):
+class ReduceScatterLinear(nn.Linear):
     """A rowwise linear whose matmul is fused with the TP reduce-scatter.
 
     Constructed from full feature dimensions, unlike the HF sharding wrapper
@@ -133,8 +109,8 @@ class ReduceScatterLinear(nn.Module):
     Args:
         in_features: input feature count (the weight's second dim).
         out_features: output feature count (the weight's first dim).
-        bias: whether to hold a bias. The reduce-scatter path handles a partial
-            bias, so this is free to be ``None``.
+        bias: whether to allocate a bias parameter. False stores ``bias=None``;
+            the constructor option itself must be a boolean.
     """
 
     def __init__(
@@ -144,7 +120,6 @@ class ReduceScatterLinear(nn.Module):
         *,
         bias: bool = False,
     ) -> None:
-        super().__init__()
         for name, value in (
             ("in_features", in_features),
             ("out_features", out_features),
@@ -153,15 +128,7 @@ class ReduceScatterLinear(nn.Module):
                 raise ValueError(f"{name} must be positive integer, got {value!r}")
         if not isinstance(bias, bool):
             raise TypeError(f"bias must be bool, got {type(bias).__name__}")
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features))
-        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        """Reuse standard Linear initialization for the same parameter layout."""
-        nn.Linear.reset_parameters(self)
+        super().__init__(in_features, out_features, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         tp_group = spmd_mesh_group("tp")

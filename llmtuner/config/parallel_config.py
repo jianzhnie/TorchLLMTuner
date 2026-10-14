@@ -87,18 +87,11 @@ class ParallelConfig:
     """Tensor Parallelism degree. 1 means disabled."""
 
     enable_sequence_parallel: bool = True
-    """Sequence parallelism as part of tensor parallelism.
+    """Use sequence parallelism when tensor parallelism is active.
 
-    Not a switch here. llmtuner's TP is the sequence-parallel formulation only:
-    ``parallel/tensor_parallel/tensor_parallel.py`` gathers and scatters the
-    sequence inside the fused GEMMs, and the trainer shards the batch so
-    ``T / tp`` tokens
-    enter each rank. There is no replicated-activation realization to fall
-    back to, so ``False`` has nothing to select and is rejected rather than
-    silently ignored -- see ``ParallelConfig.__post_init__``.
-
-    Unlike the other fields here this one is llmtuner's own: it is not forwarded
-    to any upstream API, so it is not a name this config has to keep in step.
+    TP > 1 requires this flag: fused GEMMs gather and scatter the sequence,
+    and the trainer supplies each rank with ``T / tp`` tokens. TP = 1 disables
+    tensor parallelism, so this flag may be False.
     """
 
     tp_colwise_modules: list[str] = field(default_factory=list)

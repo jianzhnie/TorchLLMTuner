@@ -15,6 +15,7 @@ import torch
 import torchvision.transforms.v2.functional as TVF
 
 from ...utils.logging import get_logger
+from ..contracts import require_positive_integer
 from .image import smart_resize
 
 logger = get_logger(__name__)
@@ -42,15 +43,24 @@ def load_video(
 
     Returns:
         Tensor of shape (T, H, W, C) in uint8, channel-last format,
-        or None if loading fails.
+        or None if loading fails. Missing PyAV raises ImportError with an
+        installation hint.
     """
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("fps must be finite and positive")
+    require_positive_integer("min_frames", min_frames)
+    require_positive_integer("max_frames", max_frames)
     if not 1 <= min_frames <= max_frames:
         raise ValueError("frame bounds must satisfy 1 <= min_frames <= max_frames")
     try:
         import av
+    except ImportError as error:
+        raise ImportError(
+            "Video loading requires the optional PyAV backend; "
+            "install it with `pip install av`."
+        ) from error
 
+    try:
         with av.open(path) as container:
             stream = container.streams.video[0]
 

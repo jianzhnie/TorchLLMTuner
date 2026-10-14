@@ -385,7 +385,7 @@ class OptimizersContainer(Optimizer, Stateful):
             init_optim_state(optimizer)
         # Validate every inner state before applying any checkpoint values.
         optimizer_states = [
-            unflatten_optim_state_dict(optimizer, state_dict)
+            unflatten_optim_state_dict(optimizer, flat_state=state_dict)
             for optimizer in self.optimizers
         ]
         for optimizer, optimizer_state in zip(

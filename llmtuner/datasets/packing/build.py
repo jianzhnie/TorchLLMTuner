@@ -2,7 +2,7 @@
 
 ``build_concat_then_split_packing`` and ``build_first_fit_packing`` turn a
 dataset recipe into a Grain graph that emits fixed-length rows; both fill every
-token feature to ``context.num_tokens_per_batch``, and ``row_lengths`` is the
+token feature to ``context.num_tokens_per_batch``, and ``text_packing_lengths`` is the
 one place that length is spelled out.
 """
 
@@ -34,7 +34,7 @@ from .iterators import (
 )
 
 
-def row_lengths(context: DatasetBuildContext) -> dict[str, int]:
+def text_packing_lengths(*, num_tokens_per_row: int) -> dict[str, int]:
     """The per-feature row length every packing node fills to.
 
     All four token features are packed to the same length; the dict is what the
@@ -42,10 +42,8 @@ def row_lengths(context: DatasetBuildContext) -> dict[str, int]:
     two packers' idea of a row identical.
     """
     return {
-        "input_ids": context.num_tokens_per_batch,
-        "labels": context.num_tokens_per_batch,
-        "positions": context.num_tokens_per_batch,
-        "padding_mask": context.num_tokens_per_batch,
+        feature: num_tokens_per_row
+        for feature in ("input_ids", "labels", "positions", "padding_mask")
     }
 
 
@@ -77,7 +75,10 @@ def build_concat_then_split_packing(
     )
     dataset_graph = as_iter_dataset(dataset_graph, context=context)
     dataset_graph = grain.experimental.ConcatThenSplitIterDataset(
-        dataset_graph, length_struct=row_lengths(context)
+        dataset_graph,
+        length_struct=text_packing_lengths(
+            num_tokens_per_row=context.num_tokens_per_batch
+        ),
     )
     dataset_graph = dataset_graph.filter(packing_output_is_full)
     return dataset_graph.map(
@@ -124,7 +125,9 @@ def build_first_fit_packing(
     # ranks receive similarly filled rows.
     dataset_graph = grain.experimental.FirstFitPackIterDataset(
         dataset_graph,
-        length_struct=row_lengths(context),
+        length_struct=text_packing_lengths(
+            num_tokens_per_row=context.num_tokens_per_batch
+        ),
         padding_struct={
             "input_ids": 0,
             "labels": IGNORE_INDEX,

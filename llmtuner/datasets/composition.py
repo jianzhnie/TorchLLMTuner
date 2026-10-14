@@ -63,6 +63,42 @@ class SingleDataset:
     post_filters: tuple[Callable[[Any], bool], ...] = ()
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class WeightedDataset:
+    """A dataset and its relative selection weight."""
+
+    dataset: DatasetRecipe
+    weight: float = 1.0
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class DatasetMix:
+    """Interleave weighted children.
+
+    `MapDataset.filter` leaves rejected indices as `None`, so the all-map path
+    weights attempted indices rather than accepted samples. Otherwise, weights
+    select elements emitted by each iterable child. The child defines the
+    element: mixing `TextSequence` children weights documents; mixing packed
+    fixed-length children weights physical tokens.
+
+    With `repeat=True` the mix is infinite. With `repeat=False` the mix stops
+    at the first exhausted child, so larger children are not fully covered.
+    """
+
+    datasets: tuple[WeightedDataset, ...]
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class DatasetConcat:
+    """Concatenates finite children before global shuffle and DP sharding."""
+
+    datasets: tuple[DatasetRecipe, ...]
+
+
+DatasetRecipe: TypeAlias = SingleDataset | DatasetMix | DatasetConcat
+"""A source/transform recipe; build_dataset turns it into a GrainDataset."""
+
+
 def is_not_none(sample: Any) -> bool:
     """``post_filters`` entry for a processor that drops unusable rows.
 
@@ -206,31 +242,6 @@ def apply_iteration_policy(
     return dataset
 
 
-@dataclass(frozen=True, kw_only=True, slots=True)
-class WeightedDataset:
-    """A dataset and its relative selection weight."""
-
-    dataset: DatasetRecipe
-    weight: float = 1.0
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class DatasetMix:
-    """Interleave weighted children.
-
-    `MapDataset.filter` leaves rejected indices as `None`, so the all-map path
-    weights attempted indices rather than accepted samples. Otherwise, weights
-    select elements emitted by each iterable child. The child defines the
-    element: mixing `TextSequence` children weights documents; mixing packed
-    fixed-length children weights physical tokens.
-
-    With `repeat=True` the mix is infinite. With `repeat=False` the mix stops
-    at the first exhausted child, so larger children are not fully covered.
-    """
-
-    datasets: tuple[WeightedDataset, ...]
-
-
 def build_dataset_mix(
     node: DatasetMix,
     *,
@@ -273,17 +284,6 @@ def build_dataset_mix(
         )
     children = [as_iter_dataset(child, context=context) for child in children]
     return grain.IterDataset.mix(children, weights=weights)
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class DatasetConcat:
-    """Concatenates finite children before global shuffle and DP sharding."""
-
-    datasets: tuple[DatasetRecipe, ...]
-
-
-DatasetRecipe: TypeAlias = SingleDataset | DatasetMix | DatasetConcat
-"""A source/transform recipe; build_dataset turns it into a GrainDataset."""
 
 
 def build_dataset_concat(

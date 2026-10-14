@@ -26,23 +26,15 @@ def dp_rank_world_size(self: Trainer) -> tuple[int, int]:
 
     PP uses the batch mesh so every stage reads the same shard. Without a
     topology, including before mesh initialization, use a single rank."""
-    # ``getattr``, not attribute access: a Trainer built with ``__new__``
-    # (the tests' way of exercising the pure helpers) has no mesh, and the
-    # only correct answer there is "one rank, no sharding".
-    if getattr(self, "parallel_dims", None) is None:
+    parallel_dims = getattr(self, "parallel_dims", None)
+    if parallel_dims is None:
         return 0, 1
-    if self.parallel_dims.pp_enabled:
-        # Under PP the dataloading view is the "batch" axis: it spans
-        # dp_replicate * dp_shard and excludes pp, so every stage of one
-        # pipeline reads the same shard of the global batch.
-        batch_mesh = self.parallel_dims.get_optional_mesh(
-            "batch", include_singleton_axes=True
-        )
-        return batch_mesh.get_local_rank(), batch_mesh.size()
-    # The dense DP group spans replicate * shard; unsplit on torchrun it is
-    # a plain 1-D mesh.
-    dp_mesh = self.parallel_dims.get_optional_mesh("dp", include_singleton_axes=True)
-    return dp_mesh.get_local_rank(), dp_mesh.size()
+    # Both views span DP replicate * shard. PP's batch view excludes stages,
+    # ensuring each stage reads the same shard of the global batch.
+    mesh = parallel_dims.get_optional_mesh(
+        "batch" if parallel_dims.pp_enabled else "dp", include_singleton_axes=True
+    )
+    return mesh.get_local_rank(), mesh.size()
 
 
 def batch_size_per_rank(self: Trainer, dp_world_size: int) -> int:

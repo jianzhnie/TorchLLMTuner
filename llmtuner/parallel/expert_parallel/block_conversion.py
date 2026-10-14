@@ -34,8 +34,8 @@ from .hf_inspection import (
 from .token_dispatch import (
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
-    TorchAOTokenDispatcher,
 )
+from .torchao_dispatch import TorchAOTokenDispatcher
 
 
 def restore_fp32_state_buffers(module: nn.Module) -> None:
@@ -146,13 +146,15 @@ def convert_block(
         # Optional-import adapter: the constructor raises ImportError with an
         # install hint when torchao is absent. EP=1 is supported by the
         # dispatcher itself (local padded permute only).
-        dispatcher = TorchAOTokenDispatcher(num_experts, top_k, torchao_pad_multiple)
+        dispatcher = TorchAOTokenDispatcher(
+            num_experts, top_k, pad_multiple=torchao_pad_multiple
+        )
     elif ep_group is None:
         dispatcher = LocalTokenDispatcher(num_experts, top_k)
     else:
         dispatcher = AllToAllTokenDispatcher(num_experts, top_k)
     if ep_group is not None:
-        dispatcher.wire_meshes(ep_group=ep_group)
+        dispatcher.set_ep_group(ep_group=ep_group)
         # Flag the stacked expert weights as expert-dim-sharded over the EP
         # group so the checkpointer can all-gather them on save and slice
         # them back on load (see expert_parallel/checkpointing.py).

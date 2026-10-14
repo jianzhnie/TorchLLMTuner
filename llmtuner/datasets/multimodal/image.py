@@ -61,6 +61,7 @@ def decode_image(image: str | bytes | Image.Image) -> torch.Tensor:
 def smart_resize(
     height: int,
     width: int,
+    *,
     factor: int,
     min_pixels: int,
     max_pixels: int,
@@ -177,7 +178,9 @@ def resize_to_pixel_budget(
     # The budget arithmetic is ``smart_resize`` -- this strategy only adds the
     # "grow first so the rounding has somewhere to start" step and the padding
     # slots of the return shape.
-    h_bar, w_bar = smart_resize(height, width, factor, min_pixels, max_pixels)
+    h_bar, w_bar = smart_resize(
+        height, width, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels
+    )
     return h_bar, w_bar, 0, 0
 
 

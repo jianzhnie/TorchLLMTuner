@@ -75,7 +75,8 @@ def cli_view(cls: type) -> type:
     hidden = PROGRAMMATIC_ONLY.get(cls)
     if not hidden:
         return cls
-    unknown = hidden - set(cls.__dataclass_fields__)
+    fields = {option.name: option for option in dataclasses.fields(cls)}
+    unknown = hidden - fields.keys()
     if unknown:
         raise RuntimeError(
             f"{cls.__name__} has no fields {sorted(unknown)}: "
@@ -86,7 +87,7 @@ def cli_view(cls: type) -> type:
         "__annotations__": {name: hints[name] for name in hidden}
     }
     for name in hidden:
-        option = copy(cls.__dataclass_fields__[name])
+        option = copy(fields[name])
         option.init = False
         namespace[name] = option
     return dataclasses.dataclass(type(cls.__name__, (cls,), namespace))

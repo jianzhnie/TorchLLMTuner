@@ -109,10 +109,11 @@ class RandomTokenDataLoader(BaseDataLoader):
                 f"dp_world_size={dp_world_size}"
             )
         self._dp_world_size = dp_world_size
-        self._dp_rank = dp_rank
-        self._rows_per_rank = batch_size // dp_world_size
+        rows_per_rank = batch_size // dp_world_size
+        start = dp_rank * rows_per_rank
+        self._rows = slice(start, start + rows_per_rank)
         self._source = source
-        self._iterator = self._slice_each(iter(self._source))
+        self._iterator = iter(self._source)
         # Absolute global batch cursor, independent of DP slicing. Each batch is
         # reproducible from (seed, step), so restoring it needs no replay.
         self._position = 0
@@ -123,7 +124,10 @@ class RandomTokenDataLoader(BaseDataLoader):
             # take effect for an iterator already held by the training loop.
             batch = next(self._iterator)
             self._position += 1
-            yield batch
+            yield Batch(
+                input_ids=batch.input_ids[self._rows],
+                labels=batch.labels[self._rows],
+            )
 
     def state_dict(self) -> dict[str, Any]:
         # See ``_position``: the position is what a resume needs.
@@ -165,13 +169,5 @@ class RandomTokenDataLoader(BaseDataLoader):
                 f"cannot resume at batch {resume_at}: this loader has already "
                 f"yielded {self._position}. A fresh loader is required."
             )
-        self._iterator = self._slice_each(self._source.iter_from(resume_at))
+        self._iterator = self._source.iter_from(resume_at)
         self._position = resume_at
-
-    def _slice_each(self, batches: Iterator[Batch]) -> Iterator[Batch]:
-        start = self._dp_rank * self._rows_per_rank
-        for batch in batches:
-            yield Batch(
-                input_ids=batch.input_ids[start : start + self._rows_per_rank],
-                labels=batch.labels[start : start + self._rows_per_rank],
-            )

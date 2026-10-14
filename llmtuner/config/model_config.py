@@ -15,10 +15,9 @@ LM_HEAD_COMPUTE_DTYPES = ("float32", "float16", "bfloat16")
 class ModelConfig:
     """Model architecture, with CLI sizes filled from saved HF configurations.
 
-    Offline path: when ``model_name_or_path`` has no '/', build a tiny local model
-    with AutoConfig.for_model using the explicit sizes below. Online path: a hub id
-    ("org/name") or a local model directory reads the saved architecture via
-    AutoConfig.from_pretrained.
+    Registered architecture names build locally with AutoConfig.for_model using
+    the explicit sizes below. Other identifiers and existing local model paths
+    read the saved architecture via AutoConfig.from_pretrained.
     """
 
     model_name_or_path: str = field(
