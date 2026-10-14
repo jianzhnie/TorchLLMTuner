@@ -30,14 +30,8 @@ class TrainingConfig:
     global_batch_size: int = field(
         default=8,
         metadata={
-            "help": "Sequences per step across ALL DP ranks. Under pipeline "
-            "parallelism this is the step total, not the per-iteration read: "
-            "each rank reads global_batch_size / dp_world_size rows once, and "
-            "those rows are then sliced into num_pp_microbatches pipeline "
-            "micro-batches rather than repeated reads. torchtitan instead reads "
-            "num_pp_microbatches separate batches per accumulation group, so "
-            "the same global_batch_size there consumes num_pp_microbatches "
-            "times more tokens per step; multiply here to match it."
+            "help": "Sequences per step across DP ranks. PP splits each rank batch "
+            "into num_pp_microbatches."
         },
     )
     max_seq_len: int = field(default=64, metadata={"help": "Sequence length"})
@@ -55,14 +49,8 @@ class TrainingConfig:
     activation_checkpoint_mode: str = field(
         default="none",
         metadata={
-            "help": "Activation checkpointing: 'none' (off), 'full' (recompute "
-            "each decoder layer during backward), 'selective' (per-op: save "
-            "the expensive ops, recompute the rest -- tune it with "
-            "selective_ac), 'memory_budget' (let the compile partitioner "
-            "trade compute for memory -- tune it with memory_budget_ac, "
-            "requires compile=True), or 'region' (retain the block's "
-            "nn.Linear regions named by region_ac.save_regions and recompute "
-            "the rest -- needs the optional torch_remat package). Wraps layers "
+            "help": "Activation checkpointing: none, full, selective, memory_budget "
+            "(requires compile), or region (requires torch_remat). Applied "
             "after TP/EP/CP and before compile/FSDP."
         },
     )
@@ -121,22 +109,16 @@ class TrainingConfig:
     gradient_accumulation_steps: int = field(
         default=1,
         metadata={
-            "help": "Micro-batches accumulated per optimizer update. Each is a "
-            "full forward/backward; the step's gradients are summed and the "
-            "reported loss is the sum over all of them divided by the global "
-            "valid-token count, so the number stays comparable across settings. "
-            "Contrast num_pp_microbatches, which splits one batch's pipeline "
-            "schedule rather than training on more data."
+            "help": "Full forward/backward microbatches per optimizer update. PP "
+            "microbatches instead split each batch; loss uses the global "
+            "valid-token count."
         },
     )
     chunked_loss_num_chunks: int = field(
         default=1,
         metadata={
-            "help": "Split the lm_head + cross-entropy computation into this "
-            "many sequence chunks, cutting peak logits memory from O(T*V) to "
-            "O(T*V/chunks) -- the key memory lever for large-vocabulary models. "
-            "1 (the default) disables chunking. Not supported with pipeline "
-            "parallelism."
+            "help": "Sequence chunks for lm_head and cross-entropy; reduces peak "
+            "logits memory. 1 disables chunking; unsupported with PP."
         },
     )
     dump_folder: str = field(
@@ -183,13 +165,7 @@ class TrainingConfig:
 
     @property
     def checkpoint(self) -> CheckpointConfig:
-        """The checkpoint manager's config.
-
-        A property backed by ``checkpoint_config`` rather than a field of its own
-        so the flat ``cfg.checkpoint`` spelling works at the call site. A
-        property is not a dataclass field, so the parser never turns it into a
-        flag.
-        """
+        """The checkpoint manager's config."""
         return self.checkpoint_config
 
     @property
@@ -209,21 +185,12 @@ class TrainingConfig:
 
     @property
     def ema(self) -> EMAConfig | None:
-        """The weight EMA's config, or None when EMA is off.
-
-        Unlike the other nested configs there is no always-on default: an EMA
-        doubles the weight memory a run carries, so it exists only when the
-        run asks for it.
-        """
+        """The weight EMA's config, or None when EMA is off."""
         return self.ema_config
 
     @property
     def validation(self) -> ValidationConfig | None:
-        """The validation loop's config, or None when validation is off.
-
-        Opt-in like ``ema``: a validation pass re-reads the corpus and runs a
-        full forward over it, so it exists only when the run asks for it.
-        """
+        """The validation loop's config, or None when validation is off."""
         return self.validation_config
 
     def __post_init__(self) -> None:

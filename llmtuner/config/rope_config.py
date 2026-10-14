@@ -12,14 +12,7 @@ from .field_checks_config import require_integer_at_least
 
 @dataclass(kw_only=True)
 class RoPEConfig:
-    """RoPE hyperparameters.
-
-    The scaling fields are grouped by the mode that reads them: ``llama`` reads
-    ``scaling_factor``/``low_freq_factor``/``high_freq_factor``/
-    ``original_max_position_embeddings``, ``yarn`` reads the ``rope_factor``/
-    ``beta_*``/``original_seq_len``/``truncate`` set. Fields for unused modes
-    are ignored; ``CosSinRoPE`` rejects ``llama`` at runtime construction.
-    """
+    """RoPE hyperparameters."""
 
     dim: int
     max_context_length: int

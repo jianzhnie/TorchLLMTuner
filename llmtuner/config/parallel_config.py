@@ -1,57 +1,44 @@
-"""Parallelism sizes config (TP/CP/EP/PP/FSDP and related validation)."""
+"""Parallel execution policies, mesh degrees, and combination validation."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from functools import wraps
 from typing import Any, Literal
 
-from llmtuner.config.context_parallel_config import validate_context_parallel_config
-from llmtuner.config.expert_parallel_config import validate_expert_parallel_config
+import torch
+
 from llmtuner.config.field_checks_config import require_integer_at_least
-from llmtuner.config.fsdp_config import validate_fsdp_config
-from llmtuner.config.pipeline_parallel_config import validate_pipeline_parallel_config
-from llmtuner.config.tensor_parallel_config import validate_tensor_parallel_config
 from llmtuner.errors import (
     ConfigError,
+    EnvironmentUnsupportedError,
     UnsupportedCombinationError,
 )
 
+__all__ = [
+    "CP_LOAD_BALANCERS",
+    "CP_STRATEGIES",
+    "EP_DISPATCHERS",
+    "ContextParallelConfig",
+    "ExpertParallelConfig",
+    "FSDPConfig",
+    "FSDPReshardPolicy",
+    "FSDPSymmMemScope",
+    "ParallelConfig",
+    "PipelineParallelConfig",
+    "TensorParallelConfig",
+    "validate_expert_dispatcher",
+]
+
+FSDPReshardPolicy = Literal["default", "always", "never"]
+
+
+FSDPSymmMemScope = Literal["all", "dense"]
+
 
 @dataclass(kw_only=True, slots=True)
-class ParallelConfig:
-    """The parallelism sizes.
-
-    The field names and semantics are torchtitan's, spelled ``*_size`` rather
-    than ``*_degree``. ``ParallelTopology.from_config`` reads these six fields by
-    name, so the spelling here and there has to stay in step. Short aliases
-    (``tp`` / ``pp`` / ``cp`` / ``ep`` / ``dp``) are exposed as properties at
-    the end of the class, so callers and tests can use the same names
-    ``LLMTunerConfig`` does without going through the long spelling.
-    """
-
-    data_parallel_replicate_size: int = 1
-    """
-    The `data_parallel_replicate_size` argument specifies the degree of
-    data parallelism for weight replication. When this value is greater
-    than 1, weights will be replicated across `data_parallel_replicate_size`
-    ranks. If `data_parallel_shard_size` is also greater than 1, the parallelism
-    method used is HSDP (Hybrid Sharded Data Parallelism). Otherwise, the
-    parallelism method used is DDP (Distributed Data Parallelism).
-    1 means disabled.
-    """
-
-    data_parallel_shard_size: int = -1
-    """Data-parallel sharding degree; ``-1`` derives the leftover degree.
-
-    The `data_parallel_shard_size` argument specifies the degree of data
-    parallelism for weight sharding. When this value is greater than 1, weights
-    will be sharded across `data_parallel_shard_size` ranks. If
-    `data_parallel_replicate_size` is also greater than 1, the parallelism
-    method used is HSDP (Hybrid Sharded Data Parallelism). Otherwise, the
-    parallelism method used is FSDP (Fully Sharded Data Parallelism).
-    -1 means leftover ranks will be used (After DP_REPLICATE/SP/PP). Note that
-    only `data_parallel_shard_size` can be negative. 1 means disabled.
-    """
+class FSDPConfig:
+    """Execution policy for FSDP; parallel degrees live in ParallelConfig."""
 
     fsdp_reshard_after_forward: Literal["default", "always", "never"] = "default"
     """FSDP2 parameter resharding policy after forward."""
@@ -83,98 +70,258 @@ class ParallelConfig:
     fsdp_symm_mem_scope: Literal["all", "dense"] = "all"
     """Apply symmetric-memory communication to all or dense FSDP modules."""
 
-    tensor_parallel_size: int = 1
-    """Tensor Parallelism degree. 1 means disabled."""
+    def __post_init__(self) -> None:
+        if self.fsdp_reshard_after_forward not in {"default", "always", "never"}:
+            raise ConfigError(
+                "parallel.fsdp_reshard_after_forward must be one of "
+                "'default'/'always'/'never', got "
+                f"{self.fsdp_reshard_after_forward!r}"
+            )
+        if self.fsdp_symm_mem_scope not in ("all", "dense"):
+            raise ConfigError(
+                "parallel.fsdp_symm_mem_scope must be one of 'all'/'dense', got "
+                f"{self.fsdp_symm_mem_scope!r}"
+            )
+        require_integer_at_least(
+            self,
+            "fsdp_forward_prefetch_count",
+            "fsdp_backward_prefetch_count",
+            group="parallel",
+            minimum=0,
+        )
+        if self.fsdp_implementation not in ("native", "custom"):
+            raise ConfigError(
+                "parallel.fsdp_implementation must be 'native' or 'custom'"
+            )
+        if self.fsdp_ignored_modules and not self.fsdp_apply_modules:
+            raise ConfigError(
+                "parallel.fsdp_ignored_modules requires fsdp_apply_modules; "
+                "ignored patterns only belong to the pattern-driven FSDP path"
+            )
+        if self.enable_fsdp_symm_mem and (
+            not torch.cuda.is_available()
+            or (
+                torch.version.hip is None
+                and torch.cuda.get_device_capability() < (9, 0)
+            )
+        ):
+            raise ConfigError(
+                "parallel.enable_fsdp_symm_mem is only supported on NVIDIA "
+                "GPUs with compute capability 9.0 or newer."
+            )
+
+
+@dataclass(kw_only=True, slots=True)
+class TensorParallelConfig:
+    """Execution policy for TP; parallel degrees live in ParallelConfig."""
 
     enable_sequence_parallel: bool = True
-    """Use sequence parallelism when tensor parallelism is active.
-
-    TP > 1 requires this flag: fused GEMMs gather and scatter the sequence,
-    and the trainer supplies each rank with ``T / tp`` tokens. TP = 1 disables
-    tensor parallelism, so this flag may be False.
-    """
+    """Required for TP > 1; TP = 1 permits disabling it."""
 
     tp_colwise_modules: list[str] = field(default_factory=list)
+
     tp_rowwise_modules: list[str] = field(default_factory=list)
+
     tp_sequence_modules: list[str] = field(default_factory=list)
     """Optional pattern overrides layered on top of the model TP plan."""
 
-    pipeline_parallel_size: int = 1
+    def __post_init__(self) -> None:
+        if self.tp_sequence_modules:
+            raise UnsupportedCombinationError(
+                "parallel.tp_sequence_modules is not supported by the fused sequence "
+                "parallel engine; normalization already consumes the sequence shard"
+            )
+        conflicting = set(self.tp_colwise_modules) & set(self.tp_rowwise_modules)
+        if conflicting:
+            raise ConfigError(
+                f"TP patterns {sorted(conflicting)!r} have conflicting styles in "
+                "parallel.tp_colwise_modules and parallel.tp_rowwise_modules"
+            )
+
+
+CP_STRATEGIES = frozenset({"kv_allgather", "ulysses", "kcp"})
+
+
+CP_LOAD_BALANCERS = frozenset({None, "headtail", "ptrr"})
+
+
+@dataclass(kw_only=True, slots=True)
+class ContextParallelConfig:
+    """Execution policy for CP; parallel degrees live in ParallelConfig."""
+
+    context_parallel_strategy: str = "kv_allgather"
+    """Attention redistribution: kv_allgather, ulysses, or kcp."""
+
+    context_parallel_load_balancer: str | None = None
+    """Sequence balancing: None or headtail; ptrr is unsupported. Ulysses/KCP require
+    None.
     """
-    Pipeline Parallelism degree, or number of ranks. 1 means disabled.
-    If using looped schedules, this still specifies the number of physical
-    ranks, not the number of stages. Stages per rank are inferred from split
-    points degree, and schedule.
+
+    def __post_init__(self) -> None:
+        if self.context_parallel_load_balancer == "":
+            raise ConfigError(
+                "parallel.context_parallel_load_balancer cannot be an empty "
+                "string; use None to disable load balancing."
+            )
+        if self.context_parallel_load_balancer not in CP_LOAD_BALANCERS:
+            raise ConfigError(
+                "parallel.context_parallel_load_balancer must be one of "
+                "None/'headtail'/'ptrr', got "
+                f"{self.context_parallel_load_balancer!r}"
+            )
+        if self.context_parallel_load_balancer == "ptrr":
+            raise UnsupportedCombinationError(
+                "parallel.context_parallel_load_balancer='ptrr' is not "
+                "implemented in llmtuner; use 'headtail' or None."
+            )
+        if self.context_parallel_strategy not in CP_STRATEGIES:
+            raise ConfigError(
+                "parallel.context_parallel_strategy must be one of "
+                "'kv_allgather'/'ulysses'/'kcp', got "
+                f"{self.context_parallel_strategy!r}"
+            )
+        if self.context_parallel_strategy == "kcp":
+            if self.context_parallel_load_balancer is not None:
+                raise UnsupportedCombinationError(
+                    "KCP requires contiguous sequence shards"
+                )
+        if (
+            self.context_parallel_strategy == "ulysses"
+            and self.context_parallel_load_balancer is not None
+        ):
+            raise UnsupportedCombinationError(
+                "parallel.context_parallel_strategy='ulysses' requires "
+                "context_parallel_load_balancer=None."
+            )
+
+
+EP_DISPATCHERS = ("alltoall", "torchao", "domino", "mc2", "deepep", "hybridep")
+
+
+def validate_expert_dispatcher(backend: str) -> None:
+    """Validate backend availability without requiring a parallel config."""
+    if backend not in EP_DISPATCHERS:
+        raise ConfigError(
+            "parallel.ep_token_dispatcher must be one of "
+            f"{'/'.join(EP_DISPATCHERS)}, got {backend!r}"
+        )
+    if backend in ("deepep", "hybridep"):
+        raise EnvironmentUnsupportedError(
+            f"parallel.ep_token_dispatcher={backend!r} is "
+            "a registered gap, not a supported backend: its external kernels "
+            "and distributed wrappers are not included in this build. Use "
+            "'alltoall'."
+        )
+    if backend == "mc2":
+        raise EnvironmentUnsupportedError(
+            "parallel.ep_token_dispatcher='mc2' requires the Ascend fused "
+            "all-to-all/grouped-matmul operators. This build has no compatible "
+            "MC2 operator registration; refusing an unfused silent fallback."
+        )
+
+
+@dataclass(kw_only=True, slots=True)
+class ExpertParallelConfig:
+    """Execution policy for EP; parallel degrees live in ParallelConfig."""
+
+    router_aux_loss_coef: float | None = None
+    """Override the HF MoE auxiliary-loss coefficient; None preserves the model
+    setting.
     """
+
+    moe_quantile_balancing: bool = False
+    """Quantile-balanced routing; requires sigmoid scores, unrestricted groups, and EP
+    > 1.
+    """
+
+    fixed_router: bool = False
+    """Debug-only deterministic round-robin routing."""
+
+    ep_token_dispatcher: str = "alltoall"
+    """EP backend: alltoall, torchao, or domino. Other registered backends are
+    unavailable.
+    """
+
+    ep_torchao_pad_multiple: int = 16
+    """Token padding for torchao grouped GEMMs: typically 16 (FP8) or 32 (MXFP8)."""
+
+    def __post_init__(self) -> None:
+        validate_expert_dispatcher(self.ep_token_dispatcher)
+        require_integer_at_least(
+            self, "ep_torchao_pad_multiple", group="parallel.ep_config"
+        )
+        if self.fixed_router and self.moe_quantile_balancing:
+            raise UnsupportedCombinationError(
+                "parallel.fixed_router cannot be combined with moe_quantile_balancing"
+            )
+
+
+@dataclass(kw_only=True, slots=True)
+class PipelineParallelConfig:
+    """Execution policy for PP; parallel degrees live in ParallelConfig."""
 
     module_fqns_per_model_part: list[list[str]] | None = None
-    """
-    Specify a list of lists containing the FQNs (Fully Qualified Names) of
-    modules for each model chunk.
-    Each inner list represents one model chunk and contains the module names
-    that belong to that chunk.
-    e.g. [['tok_embeddings', 'layers.0'], ['layers.1', 'layers.2'],
-    ['layers.3', 'layers.4']]
-    will create 3 chunks: the first containing tok_embeddings and layers.0,
-    the second containing layers.1 and layers.2, and the third containing
-    layers.3 and layers.4.
-    This provides more explicit control over which modules belong to each chunk
-    compared to split points.
-
-    Programmatic-only: the CLI parser cannot construct nested lists.
-    Upstream has since renamed this field
-    ``pipeline_parallel_module_fqns_per_model_part``. The field here keeps the
-    spelling it was audited under.
-    """
+    """Explicit module FQNs per pipeline chunk; nested lists are programmatic-only."""
 
     pipeline_parallel_first_stage_less_layers: int = 1
-    """
-    The number of layers to reduce in the first stage of pipeline parallelism.
-    This is because the first stage has the extra overhead of the embedding
-    layer, which is not present in the other stages.
-    """
+    """Layers removed from the first stage to offset embedding overhead."""
 
     pipeline_parallel_last_stage_less_layers: int = 1
-    """
-    The number of layers to reduce in the last stage of pipeline parallelism.
-    This is because the last stage has the extra overhead of the output layer,
-    which is not present in the other stages.
-    """
+    """Layers removed from the last stage to offset output-layer overhead."""
 
     pipeline_parallel_layers_per_stage: int | None = None
-    """
-    The number of layers per (virtual) pipeline stage. If specified, the
-    module_fqns_per_model_part will be calculated from the number of layers and
-    pipeline_parallel_size. If not specified, the layers per stage will be
-    inferred from the model, schedule, and pipeline_parallel_size.
-    """
+    """Layers per virtual stage; None infers the split from model and schedule."""
 
     pipeline_parallel_schedule: str = "1F1B"
-    """
-    Name of the Pipeline Parallel schedule. The supported set is whatever
-    ``torch.distributed.pipelining.schedules.get_schedule_class`` accepts --
-    that function is the authority and this field is validated against it in
-    ``__post_init__``, so ask it rather than a link (the list moves between
-    torch releases). The schedule must be compatible with the split points and
-    stages per rank: looped schedules (e.g. Interleaved1F1B) require
-    pipeline_parallel_size = number of ranks and split_points = number of
-    stages - 1.
-    """
+    """PyTorch pipeline schedule name; must match the stage layout."""
 
     pipeline_parallel_schedule_csv: str | None = ""
-    """
-    Upstream's path to a CSV describing a runtime pipeline schedule. Accepted
-    for config compatibility but NOT implemented: llmtuner builds schedules by
-    name only, so any non-empty value is refused when the schedule is built
-    (``parallel/pipeline_parallel/pipeline_parallel.py``). Leave it empty and name a
-    schedule with ``pipeline_parallel_schedule`` instead.
-    """
+    """Reserved CSV schedule path; non-empty values are unsupported."""
 
     num_pp_microbatches: int = 1
-    """
-    Number of pipeline microbatches per data-parallel rank and gradient
-    accumulation iteration. This setting is ignored when pipeline parallelism
-    is disabled (`pipeline_parallel_size = 1`, the default).
+    """Pipeline splits per DP rank and accumulation iteration; ignored when PP = 1."""
+
+    def __post_init__(self) -> None:
+        require_integer_at_least(self, "num_pp_microbatches", group="parallel")
+        if self.pipeline_parallel_schedule_csv:
+            raise ConfigError(
+                "parallel.pipeline_parallel_schedule_csv is not supported; "
+                "use pipeline_parallel_schedule instead."
+            )
+        # Keep schedule discovery lazy to avoid importing pipelining at import time.
+        from torch.distributed.pipelining.schedules import get_schedule_class
+
+        try:
+            get_schedule_class(self.pipeline_parallel_schedule)
+        except ValueError as exc:
+            raise ConfigError(
+                "Invalid parallel.pipeline_parallel_schedule "
+                f"{self.pipeline_parallel_schedule!r}: {exc}"
+            ) from exc
+
+
+@dataclass(kw_only=True, slots=True)
+class ParallelConfig:
+    """Parallel degrees composed with TP/FSDP/EP/CP/PP execution plans."""
+
+    fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
+    tp_config: TensorParallelConfig = field(default_factory=TensorParallelConfig)
+    pp_config: PipelineParallelConfig = field(default_factory=PipelineParallelConfig)
+    cp_config: ContextParallelConfig = field(default_factory=ContextParallelConfig)
+    ep_config: ExpertParallelConfig = field(default_factory=ExpertParallelConfig)
+
+    data_parallel_replicate_size: int = 1
+    """Replication degree; > 1 enables DDP, or HSDP with DP sharding > 1."""
+
+    data_parallel_shard_size: int = -1
+    """Sharding degree; -1 derives leftover ranks, 1 disables sharding."""
+
+    tensor_parallel_size: int = 1
+    """Tensor Parallelism degree. 1 means disabled."""
+
+    pipeline_parallel_size: int = 1
+    """Physical pipeline ranks; virtual stages are inferred from the split and
+    schedule.
     """
 
     context_parallel_kv_allgather_size: int = 1
@@ -186,128 +333,16 @@ class ParallelConfig:
     context_parallel_kcp_size: int = 1
     """KCP degree for pure KDA models; requires strategy='kcp'."""
 
-    context_parallel_strategy: str = "kv_allgather"
-    """
-    CP attention redistribution strategy. Options:
-    - "kv_allgather": all-gather K/V; Q stays token-sharded
-    - "ulysses": all-to-all between the token and head shards, so attention
-      runs on the full sequence with num_heads / cp heads per rank. Requires
-      num_attention_heads and num_key_value_heads divisible by cp, and
-      context_parallel_load_balancer=None: every rank attends the full
-      sequence in whatever order the all-to-all delivers, and flex cannot be
-      handed a mask over a different order than the tokens it is attending.
-    """
-
-    context_parallel_load_balancer: str | None = None
-    """
-    Load balancer type for context parallelism. Options:
-    - "headtail": Use HeadTailLoadBalancer for SDPA
-    - "ptrr": accepted for config compatibility, but NOT implemented -- it is
-      rejected with NotImplementedError when the CP mesh is built
-      (``parallel/context_parallel/input_sharding.py``), because it needs a
-      BlockMask to derive its schedule from and llmtuner's kernel does not
-      consume one. Use "headtail" or None.
-    - None (default): contiguous input sharding, upstream's own default. The
-      balanced split is opt-in -- it changes which tokens each rank attends,
-      so it is never chosen on a user's behalf.
-    """
     expert_parallel_size: int = 1
-    """
-    Expert parallelism degree. 1 means disabled. No effect for non-MoE models.
-
-    Mesh constraint: the dense region (dp_shard * cp * tp) and sparse region
-    (efsdp * ep) cover the same ranks, so dp_shard * cp * tp == efsdp * ep.
-    EP borrows ranks from FSDP and TP: efsdp = dp_shard * cp * tp / ep.
-    pp and dp_replicate are outer dimensions unaffected by this constraint.
-
-    tp x ep x cp IS supported (upstream-aligned: torchtitan runs
-    FSDP+TP+EP+CP together; the sparse region dp_shard*cp*tp tiles over all
-    three, and the token-count/balance reductions already cover cp and tp).
-    TP shards only the dense parts and EP owns the routed experts.
-
-    Deliberate divergence: upstream requires ep >= tp on MoE models, having
-    deprecated pure TP on routed experts. llmtuner keeps tp > 1 with ep == 1
-    working -- its TP plan shards the expert weights in place along F rather
-    than replicating the token compute -- so that guard is not ported. See
-    docs/torchllmtuner_design.md, section 8 item 11.
-    """
-
-    router_aux_loss_coef: float | None = None
-    """
-    Coefficient of the per-forward MoE load-balance loss, for HF models whose
-    config does not carry one.
-
-    The swap reads ``router_aux_loss_coef`` off the HF config when it is there
-    (Qwen3Moe has it). DeepSeek-V3 does not -- its config has no aux-loss field
-    at all -- so without this the balance loss its design calls for
-    (DeepSeek-V3 Sec 2.1.2, the sequence-wise complementary loss) would never be
-    instantiated. ``None`` keeps the HF config's value, or no loss when it has
-    none; setting it overrides for every MoE layer.
-    """
-
-    moe_quantile_balancing: bool = False
-    """
-    Replace the sign-based load-balancing bias with quantile-balanced routing
-    (Kimi K3 Sec 2.3.3): the router observes a biased Top-(K+1) cutoff per
-    token, accumulates a required-bias histogram, and an optimizer pre-hook
-    re-solves ``expert_bias_E`` as the ``top_k / num_experts`` quantile once
-    per step. Mutually exclusive with the sign-based update -- the swap forces
-    ``load_balance_coeff`` off. Requires sigmoid router scores, no
-    group-limited routing, and ep > 1 (the swap is what installs the router).
-    """
-
-    fixed_router: bool = False
-    """Debug-only deterministic round-robin routing."""
-
-    ep_token_dispatcher: str = "alltoall"
-    """
-    EP dispatch backend the MoE swap installs. Options:
-
-    - "alltoall": default. ``AllToAllTokenDispatcher`` -- local reorder plus
-      all-to-all collectives over the EP group.
-    - "torchao": ``TorchAOTokenDispatcher``, same dispatch but each local
-      expert's token group is padded to ``ep_torchao_pad_multiple`` for
-      FP8/MXFP8 quantized grouped GEMMs. Requires the optional ``torchao``
-      package; constructing the dispatcher without it raises ImportError
-      with an install hint. Numerics unverified (no torchao/CUDA on the
-      development machine), awaiting a CUDA-target re-run.
-    - "deepep" / "hybridep": registered gaps, refused here with
-      NotImplementedError. Both are CUDA-only and drive their kernels through
-      torchtitan's ``distributed/deepep/`` wrappers, which are not vendored;
-      ``alltoall`` satisfies the same dispatch/combine contract meanwhile.
-
-    Requires expert_parallel_size > 1 (the EP swap is the only place a
-    dispatcher is installed, and it does not run at ep=1).
-    """
-
-    ep_torchao_pad_multiple: int = 16
-    """
-    Token-group padding multiple for ``ep_token_dispatcher="torchao"``:
-    16 for FP8, 32 for MXFP8 quantized grouped GEMM kernels. Ignored by the
-    other backends.
+    """EP degree for MoE. Tiles the dense DP-shard × CP × TP region; EP = 1 permits
+    pure TP.
     """
 
     train_timeout_seconds: int = 100
-    """Timeout, in seconds, applied to every process group once training starts.
-
-    The process groups are created with a deliberately long timeout, because
-    startup -- model build, the first collective, compile -- is what actually
-    takes minutes on a large run. Left at that value, a later hang is
-    indistinguishable from a slow start: the job waits out the startup timeout,
-    which can be half an hour. The trainer therefore lowers every group's
-    timeout to this after the first completed train step, at which point the
-    startup work is known to be behind it.
-
-    Default matches torchtitan's ``comm.train_timeout_seconds``.
-    """
+    """Process-group timeout applied after the first training step, in seconds."""
 
     def non_dp_sizes(self) -> int:
-        """Product of fixed world-mesh degrees: dp_replicate*tp*pp*cp.
-
-        EP is not an additional world dimension. It tiles the existing
-        ``dp_shard * cp * tp`` sparse region, matching ``ParallelTopology`` and
-        TorchTitan's mesh algebra.
-        """
+        """Product of fixed world-mesh degrees: dp_replicate*tp*pp*cp."""
         return (
             self.data_parallel_replicate_size
             * self.tensor_parallel_size
@@ -316,14 +351,7 @@ class ParallelConfig:
         )
 
     def derive_dp(self, world_size: int) -> int:
-        """Resolve ``data_parallel_shard_size`` against world_size.
-
-        ``-1`` means "derive from world_size": the leftover ranks after
-        dp_replicate / tp / pp / cp, matching ``ParallelTopology``'s
-        interpretation. Mirrors ``ParallelTopology._validate``'s divisibility
-        check so a mis-sized launch fails here with a config-level message
-        rather than deep inside mesh construction.
-        """
+        """Resolve ``data_parallel_shard_size`` against world_size."""
         if (
             not isinstance(world_size, int)
             or isinstance(world_size, bool)
@@ -349,6 +377,15 @@ class ParallelConfig:
         return dp_shard
 
     def __post_init__(self):
+        for name, expected in (
+            ("fsdp_config", FSDPConfig),
+            ("tp_config", TensorParallelConfig),
+            ("pp_config", PipelineParallelConfig),
+            ("cp_config", ContextParallelConfig),
+            ("ep_config", ExpertParallelConfig),
+        ):
+            if not isinstance(getattr(self, name), expected):
+                raise ConfigError(f"parallel.{name} must be {expected.__name__}")
         require_integer_at_least(
             self,
             "train_timeout_seconds",
@@ -359,15 +396,8 @@ class ParallelConfig:
             "context_parallel_ulysses_size",
             "context_parallel_kcp_size",
             "expert_parallel_size",
-            "num_pp_microbatches",
-            "ep_torchao_pad_multiple",
             group="parallel",
         )
-        if self.fixed_router and self.moe_quantile_balancing:
-            raise UnsupportedCombinationError(
-                "parallel.fixed_router cannot be combined with "
-                "moe_quantile_balancing because fixed routing bypasses its choice"
-            )
         if (
             not isinstance(self.data_parallel_shard_size, int)
             or isinstance(self.data_parallel_shard_size, bool)
@@ -380,27 +410,58 @@ class ParallelConfig:
                 "parallel.data_parallel_shard_size must be >= 1 or -1 "
                 f"(derive), got {self.data_parallel_shard_size}"
             )
-        validate_fsdp_config(self)
-        validate_tensor_parallel_config(self)
-        validate_pipeline_parallel_config(self)
-        validate_context_parallel_config(self)
-        validate_expert_parallel_config(self)
+        for name in ("fsdp_config", "tp_config", "pp_config", "cp_config", "ep_config"):
+            getattr(self, name).__post_init__()
+        if self.tp > 1 and not self.tp_config.enable_sequence_parallel:
+            raise UnsupportedCombinationError(
+                "parallel.enable_sequence_parallel=False is not supported: "
+                "llmtuner's tensor parallelism is sequence-parallel by "
+                "construction. Leave it true, or set tensor_parallel_size=1."
+            )
+        if (
+            self.context_parallel_kcp_size > 1
+            and self.context_parallel_strategy != "kcp"
+        ):
+            raise ConfigError("context_parallel_kcp_size > 1 requires strategy='kcp'")
+        if self.context_parallel_strategy == "kcp":
+            if self.tp != 1:
+                raise UnsupportedCombinationError("KCP requires tensor_parallel_size=1")
+            if (
+                self.context_parallel_kv_allgather_size != 1
+                or self.context_parallel_ulysses_size != 1
+            ):
+                raise UnsupportedCombinationError(
+                    "KCP cannot be combined with KV-AllGather or Ulysses CP axes"
+                )
+        if (
+            self.context_parallel_ulysses_size > 1
+            and self.context_parallel_load_balancer is not None
+        ):
+            raise UnsupportedCombinationError(
+                "the Ulysses CP axis requires context_parallel_load_balancer=None"
+            )
+        if self.ep_token_dispatcher != "alltoall" and self.ep == 1:
+            raise UnsupportedCombinationError(
+                f"parallel.ep_token_dispatcher={self.ep_token_dispatcher!r} "
+                "has no effect at expert_parallel_size=1; set "
+                "expert_parallel_size > 1 or use 'alltoall'."
+            )
 
     # Short aliases for the torchtitan-spelled degree fields.
     @property
-    def dp(self) -> int:
+    def dp_size(self) -> int:
         return self.data_parallel_shard_size
 
     @property
-    def tp(self) -> int:
+    def tp_size(self) -> int:
         return self.tensor_parallel_size
 
     @property
-    def pp(self) -> int:
+    def pp_size(self) -> int:
         return self.pipeline_parallel_size
 
     @property
-    def cp(self) -> int:
+    def cp_size(self) -> int:
         return (
             self.context_parallel_kv_allgather_size
             * self.context_parallel_ulysses_size
@@ -408,5 +469,5 @@ class ParallelConfig:
         )
 
     @property
-    def ep(self) -> int:
+    def ep_size(self) -> int:
         return self.expert_parallel_size
