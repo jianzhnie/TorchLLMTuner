@@ -1511,20 +1511,21 @@ def test_create_seed_checkpoint_writes_a_step_0_checkpoint_and_exits(tmp_path) -
     assert not (tmp_path / "checkpoint" / "step-5").exists()
 
 
-def test_close_releases_all_resources_even_when_one_fails() -> None:
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_close_releases_all_resources_even_when_one_fails(error_type) -> None:
     trainer = Trainer.__new__(Trainer)
     calls = []
 
     def fail():
         calls.append("checkpointer")
-        raise RuntimeError("save failed")
+        raise error_type("save failed")
 
     trainer.checkpointer = SimpleNamespace(close=fail)
     for name in ("metrics", "dataloader", "gc_handler"):
         setattr(
             trainer, name, SimpleNamespace(close=lambda name=name: calls.append(name))
         )
-    with pytest.raises(RuntimeError, match="save failed"):
+    with pytest.raises(error_type, match="save failed"):
         trainer.close()
     assert calls == ["checkpointer", "metrics", "dataloader", "gc_handler"]
     trainer.close()
@@ -1535,7 +1536,8 @@ def test_close_accepts_a_partially_initialized_trainer() -> None:
     Trainer.__new__(Trainer).close()
 
 
-def test_training_error_survives_cleanup_error() -> None:
+@pytest.mark.parametrize("cleanup_error", [RuntimeError, KeyboardInterrupt])
+def test_training_error_survives_cleanup_error(cleanup_error) -> None:
     trainer = Trainer.__new__(Trainer)
     trainer.cfg = SimpleNamespace(checkpoint=SimpleNamespace(load_step=-1))
 
@@ -1543,7 +1545,7 @@ def test_training_error_survives_cleanup_error() -> None:
         raise ValueError("training failed")
 
     def close():
-        raise RuntimeError("cleanup failed")
+        raise cleanup_error("cleanup failed")
 
     trainer.checkpointer = SimpleNamespace(load=load, close=close)
     with pytest.raises(ValueError, match="training failed"):
@@ -1656,7 +1658,11 @@ def test_cli_rejects_seed_configuration_before_trainer_construction(
         cli.main()
 
 
-def test_failed_trainer_construction_releases_partial_resources(monkeypatch):
+@pytest.mark.parametrize("cleanup_error", [RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize("assembly_error", [ValueError, KeyboardInterrupt])
+def test_failed_trainer_construction_releases_partial_resources(
+    monkeypatch, cleanup_error, assembly_error
+):
     from llmtuner.trainer import trainer as module
 
     calls = []
@@ -1666,13 +1672,13 @@ def test_failed_trainer_construction_releases_partial_resources(monkeypatch):
 
         def close():
             calls.append("checkpointer")
-            raise RuntimeError("cleanup failed")
+            raise cleanup_error("cleanup failed")
 
         self.checkpointer = SimpleNamespace(close=close)
-        raise ValueError("assembly failed")
+        raise assembly_error("assembly failed")
 
     monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
-    with pytest.raises(ValueError, match="assembly failed"):
+    with pytest.raises(assembly_error, match="assembly failed"):
         module.Trainer(SimpleNamespace())
     assert calls == ["checkpointer", "metrics"]
 

@@ -112,7 +112,7 @@ class Trainer:
             # release resources already acquired by partial assembly here.
             try:
                 self.close()
-            except Exception:
+            except BaseException:
                 logger.exception("Resource cleanup failed during trainer construction")
             raise
 
@@ -1019,7 +1019,7 @@ class Trainer:
             training_error = sys.exc_info()[1]
             try:
                 self.close()
-            except Exception:
+            except BaseException:
                 if training_error is None:
                     raise
                 logger.exception("Resource cleanup failed after a training error")
@@ -1031,7 +1031,7 @@ class Trainer:
         was never fully built (or is being closed twice) does not raise on the
         cleanup path, where an exception would mask the real failure.
         """
-        first_error: Exception | None = None
+        first_error: BaseException | None = None
         for name in ("checkpointer", "metrics", "dataloader", "gc_handler"):
             resource = getattr(self, name, None)
             if resource is None:
@@ -1039,7 +1039,7 @@ class Trainer:
             setattr(self, name, None)
             try:
                 resource.close()
-            except Exception as error:
+            except BaseException as error:
                 logger.exception("Failed to close trainer resource %s", name)
                 if first_error is None:
                     first_error = error

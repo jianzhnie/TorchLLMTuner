@@ -428,7 +428,7 @@ class QuantileBalancer(nn.Module):
         self.num_bins = num_bins
         self.register_buffer(
             "required_bias_histogram_EB",
-            torch.zeros(num_experts, num_bins, dtype=torch.int32),
+            torch.zeros(num_experts, num_bins, dtype=torch.int64),
             persistent=False,
         )
 
@@ -483,9 +483,21 @@ class QuantileBalancer(nn.Module):
         invariant the sign-based update keeps.
         """
         counts_E = histogram_EB.sum(dim=-1, dtype=torch.int64)
-        target_count_E = counts_E.float() * (self.top_k / self.num_experts)
+        if not counts_E.any():
+            # With no valid tokens there is no new balance estimate. Avoid
+            # interpolating and re-centering the existing bias: that can
+            # introduce roundoff drift on every empty observation window.
+            return expert_bias_E.clone()
+        # Keep the quantile numerator integral until after subtracting the
+        # preceding bin count. Float32 cannot represent half-token targets
+        # at large counts, and float64 is unavailable on some accelerators.
+        target_numerator_E = counts_E * self.top_k
         cumulative_counts_EB = histogram_EB.cumsum(dim=-1, dtype=torch.int64)
-        target_rank_E = target_count_E.ceil().to(torch.int64)
+        target_rank_E = torch.div(
+            target_numerator_E + self.num_experts - 1,
+            self.num_experts,
+            rounding_mode="floor",
+        )
         target_bin_E = (cumulative_counts_EB < target_rank_E.unsqueeze(-1)).sum(dim=-1)
 
         target_bin_E1 = target_bin_E.unsqueeze(-1)
@@ -499,7 +511,8 @@ class QuantileBalancer(nn.Module):
         # its current bias rather than writing a NaN into the persistent
         # buffer.
         safe_counts = counts_in_bin_E.float().clamp(min=1.0)
-        fraction_E = (target_count_E - counts_before_E.float()) / safe_counts
+        residual_E = target_numerator_E - counts_before_E * self.num_experts
+        fraction_E = residual_E.float() / self.num_experts / safe_counts
         quantile_position_E = target_bin_E.float() + fraction_E
         if (counts_E == 0).any():
             bias_min = expert_bias_E.min() - 1.0
@@ -507,4 +520,6 @@ class QuantileBalancer(nn.Module):
             quantile_position_E = torch.where(
                 counts_E == 0, current_position_E, quantile_position_E
             )
-        return (quantile_position_E - quantile_position_E.mean()) * bin_width
+        return ((quantile_position_E - quantile_position_E.mean()) * bin_width).to(
+            expert_bias_E.dtype
+        )

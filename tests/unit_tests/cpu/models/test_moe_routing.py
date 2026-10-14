@@ -323,6 +323,32 @@ def test_a_mixed_model_is_rejected() -> None:
     assert optimizer._optimizer_step_pre_hooks == {}
 
 
+def test_quantile_histogram_accumulation_exceeds_int32_without_wrapping():
+    from llmtuner.models.common.moe.routing import QuantileBalancer
+
+    balancer = QuantileBalancer(2, 1, 4)
+    histogram = balancer.required_bias_histogram_EB
+    assert histogram.dtype == torch.int64
+    histogram[:, 2] = torch.iinfo(torch.int32).max
+    balancer.observe(torch.full((1, 2), 0.5), torch.full((1, 1), 0.5), torch.zeros(2))
+    assert histogram[:, 2].tolist() == [2147483648, 2147483648]
+    assert histogram.sum().item() == 4294967296
+
+
+def test_empty_quantile_observations_preserve_existing_bias_exactly():
+    from llmtuner.models.common.moe.routing import QuantileBalancer
+
+    balancer = QuantileBalancer(4, 2, 32)
+    original = torch.tensor([-0.31, -0.12, 0.17, 0.26])
+    current = original.clone()
+    for _ in range(100):
+        current = balancer.estimate_expert_bias(
+            balancer.required_bias_histogram_EB, current
+        )
+    assert torch.equal(current, original)
+    assert current.data_ptr() != original.data_ptr()
+
+
 def test_the_hook_solves_the_bias_and_drains_the_scratch() -> None:
     """One step: the bias is overwritten by the quantile estimate, and both
     the histogram and the token counter are drained for the next window."""
@@ -404,10 +430,13 @@ def test_router_rejects_invalid_expert_capacity(kwargs, match):
         TokenChoiceTopKRouter(**({"num_experts": 8, "dim": 4} | kwargs))
 
 
-def test_quantile_bias_update_matches_with_full_checkpoint_recomputation():
+@pytest.mark.parametrize("mode", ["full", "selective"])
+@pytest.mark.parametrize("microbatches", [1, 3])
+def test_quantile_bias_update_matches_with_checkpoint_recomputation(mode, microbatches):
     import copy
 
-    from llmtuner.memory.activation_checkpoint import wrap_full
+    from llmtuner.config.activation_checkpoint_config import SelectiveACConfig
+    from llmtuner.memory.activation_checkpoint import wrap_full, wrap_selective
 
     torch.manual_seed(31)
     original = MoE(
@@ -422,27 +451,44 @@ def test_quantile_bias_update_matches_with_full_checkpoint_recomputation():
     for parameter in original.parameters():
         torch.nn.init.normal_(parameter, std=0.1)
     replayed = copy.deepcopy(original)
-    wrapped = wrap_full(replayed)
+    wrapped = (
+        wrap_full(replayed)
+        if mode == "full"
+        else wrap_selective(replayed, SelectiveACConfig())
+    )
     padding = torch.tensor([False, True, False, False, True, False, False])
     original.set_padding_mask(padding)
     replayed.set_padding_mask(padding)
-    inputs = torch.randn(7, 4)
-    baseline = inputs.clone().requires_grad_()
-    checkpointed = inputs.clone().requires_grad_()
-    expected = original(baseline)
-    actual = wrapped(checkpointed)
-    torch.testing.assert_close(actual, expected)
-    expected.square().sum().backward()
-    actual.square().sum().backward()
-    torch.testing.assert_close(checkpointed.grad, baseline.grad)
+    for _ in range(microbatches):
+        inputs = torch.randn(7, 4)
+        baseline = inputs.clone().requires_grad_()
+        checkpointed = inputs.clone().requires_grad_()
+        expected = original(baseline)
+        actual = wrapped(checkpointed)
+        torch.testing.assert_close(actual, expected)
+        expected.square().sum().backward()
+        actual.square().sum().backward()
+        torch.testing.assert_close(checkpointed.grad, baseline.grad)
     for left, right in zip(original.parameters(), replayed.parameters(), strict=True):
         torch.testing.assert_close(left.grad, right.grad)
     before = original.router.quantile_balancer.required_bias_histogram_EB
     after = replayed.router.quantile_balancer.required_bias_histogram_EB
-    assert int(before.sum()) == int((~padding).sum()) * 4
+    assert int(before.sum()) == int((~padding).sum()) * 4 * microbatches
     assert int(after.sum()) > int(before.sum()), "Backward must replay routing"
     update_quantile_expert_bias([original], None)
     update_quantile_expert_bias([replayed], None)
     torch.testing.assert_close(replayed.expert_bias_E, original.expert_bias_E)
     assert not replayed.router.quantile_balancer.required_bias_histogram_EB.any()
     assert not replayed.tokens_per_expert_E.any()
+
+
+def test_quantile_interpolation_preserves_fractional_large_token_counts():
+    from llmtuner.models.common.moe.routing import QuantileBalancer
+
+    histogram = torch.tensor(
+        [[8388609, 1, 0, 8388609], [8388609, 0, 1, 8388608]], dtype=torch.int64
+    )
+    bias = torch.zeros(2)
+    actual = QuantileBalancer(2, 1, 4).estimate_expert_bias(histogram, bias)
+    assert actual.dtype == bias.dtype
+    torch.testing.assert_close(actual, torch.tensor([0.125, -0.125]), rtol=0, atol=0)

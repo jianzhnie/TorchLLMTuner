@@ -137,7 +137,7 @@ def main() -> None:
         try:
             if trainer is not None:
                 trainer.close()
-        except Exception:
+        except BaseException:
             if training_error is None:
                 raise
             logger.exception("Resource cleanup failed after an entry-point error")
@@ -146,7 +146,7 @@ def main() -> None:
             try:
                 if dist.is_initialized():
                     dist.destroy_process_group()
-            except Exception:
+            except BaseException:
                 if training_error is None and cleanup_error is None:
                     raise
                 logger.exception(
