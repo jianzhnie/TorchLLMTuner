@@ -50,6 +50,7 @@ import torch
 import torch.distributed as dist
 
 from llmtuner.config import LLMTunerConfig, ModelConfig, ParallelConfig, TrainingConfig
+from llmtuner.config.parallel_config import ContextParallelConfig
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.context_parallel import (
@@ -84,8 +85,9 @@ def _cfg(strategy: str, *, heads: int = HEADS) -> LLMTunerConfig:
         parallel=ParallelConfig(
             tensor_parallel_size=TP,
             context_parallel_kv_allgather_size=CP,
-            context_parallel_strategy=strategy,
-            context_parallel_load_balancer=None,
+            cp_config=ContextParallelConfig(
+                context_parallel_strategy=strategy, context_parallel_load_balancer=None
+            ),
         ),
         training=TrainingConfig(max_seq_len=SEQ, steps=1),
     )

@@ -740,6 +740,16 @@ def test_tp_config_reads_the_inner_attribute_and_falls_back_to_the_property() ->
     assert HFTransformerModel.tp_config.fget(SimpleNamespace(model=Neither())) == {}
 
 
+@pytest.mark.parametrize("attribute", ["_tp_plan", "tp_plan"])
+def test_tp_config_reads_transformers_plan_interfaces(attribute: str) -> None:
+    from types import SimpleNamespace
+
+    inner = SimpleNamespace(**{attribute: {"layers.*.q_proj": "colwise"}})
+    assert HFTransformerModel.tp_config.fget(SimpleNamespace(model=inner)) == {
+        "model.layers.*.q_proj": "colwise"
+    }
+
+
 def test_vocab_size_is_the_inner_configs_number(model: HFTransformerModel) -> None:
     """The loss seam reads the vocabulary off the model, not off the config field.
 

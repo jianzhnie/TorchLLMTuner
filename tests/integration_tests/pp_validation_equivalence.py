@@ -29,6 +29,7 @@ from llmtuner.config import (
     TrainingConfig,
     ValidationConfig,
 )
+from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.trainer.trainer import Trainer
 
 STEPS = 2
@@ -53,9 +54,10 @@ def _cfg() -> LLMTunerConfig:
         ),
         parallel=ParallelConfig(
             pipeline_parallel_size=PP,
-            pipeline_parallel_schedule="1F1B",
-            num_pp_microbatches=MICROBATCHES,
             data_parallel_shard_size=-1,
+            pp_config=PipelineParallelConfig(
+                pipeline_parallel_schedule="1F1B", num_pp_microbatches=MICROBATCHES
+            ),
         ),
         training=TrainingConfig(
             global_batch_size=GLOBAL_BATCH,

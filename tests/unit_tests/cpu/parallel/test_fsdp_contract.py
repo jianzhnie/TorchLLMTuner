@@ -29,7 +29,7 @@ import torch.nn as nn
 from torch.nn import ModuleDict, ModuleList
 
 import llmtuner.parallel.fully_shard_parallel.fully_shard_parallel as apply
-from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.fully_shard_parallel.fine_grained import (
@@ -226,7 +226,9 @@ def test_apply_fsdp_forwards_cpu_offload_policy(
 
     model = nn.Linear(4, 4)
     parallel_dims = type("ParallelTopologyStub", (), {"pp_enabled": False, "ep": 1})()
-    config = ParallelConfig(fsdp_cpu_offload=True, fsdp_cpu_offload_pin_memory=False)
+    config = ParallelConfig(
+        fsdp_config=FSDPConfig(fsdp_cpu_offload=True, fsdp_cpu_offload_pin_memory=False)
+    )
 
     apply.apply_fsdp(model, config, parallel_dims)
 
@@ -326,7 +328,9 @@ def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
     calls = []
     override_policy = object()
     monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *args, **kwargs: None)
-    cfg = ParallelConfig(fsdp_apply_modules={"0": {"mp_policy": override_policy}})
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(fsdp_apply_modules={"0": {"mp_policy": override_policy}})
+    )
     monkeypatch.setattr(
         plan,
         "get_fsdp_strategy",
@@ -359,7 +363,11 @@ def test_fsdp_ignored_patterns_reject_invalid_selections(pattern, message):
     from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
 
     model = nn.Sequential(nn.Linear(2, 2))
-    cfg = ParallelConfig(fsdp_apply_modules={"0": {}}, fsdp_ignored_modules=[pattern])
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"0": {}}, fsdp_ignored_modules=[pattern]
+        )
+    )
     with pytest.raises(ValueError, match=message):
         _resolve_pattern_units(model, cfg)
 
@@ -369,7 +377,11 @@ def test_fsdp_apply_pattern_is_validated_when_every_module_is_ignored():
     from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
 
     model = nn.Sequential(nn.Linear(2, 2))
-    cfg = ParallelConfig(fsdp_apply_modules={"{3-1}": {}}, fsdp_ignored_modules=["*"])
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"{3-1}": {}}, fsdp_ignored_modules=["*"]
+        )
+    )
     with pytest.raises(ValueError, match="invalid module pattern range"):
         _resolve_pattern_units(model, cfg)
 
@@ -385,7 +397,11 @@ def test_ignored_fsdp_module_excludes_its_descendants():
             "ignored_extra": nn.Linear(2, 2),
         }
     )
-    cfg = ParallelConfig(fsdp_apply_modules={"*": {}}, fsdp_ignored_modules=["ignored"])
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"*": {}}, fsdp_ignored_modules=["ignored"]
+        )
+    )
     _, selected, ignored = _resolve_pattern_units(model, cfg)
     assert "ignored" not in selected
     assert "ignored.0" not in selected
@@ -409,12 +425,14 @@ def test_fsdp_patterns_honor_runtime_policies(monkeypatch, policy, pp, expected)
     scopes = []
     monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *args, **kwargs: None)
     cfg = ParallelConfig(
-        fsdp_apply_modules={"0": {}},
-        fsdp_reshard_after_forward=policy,
         pipeline_parallel_size=pp,
-        fsdp_symm_mem_scope="dense",
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"0": {}},
+            fsdp_reshard_after_forward=policy,
+            fsdp_symm_mem_scope="dense",
+        ),
     )
-    cfg.enable_fsdp_symm_mem = True  # Exercise wiring without CUDA kernels.
+    cfg.fsdp_config.enable_fsdp_symm_mem = True  # Exercise wiring without CUDA kernels.
     monkeypatch.setattr(
         plan,
         "get_fsdp_strategy",
@@ -442,7 +460,9 @@ def test_pattern_fsdp_with_ep_requires_sparse_mesh_before_mutation(monkeypatch):
     from llmtuner.parallel.fully_shard_parallel import plan
 
     model = nn.Sequential(nn.Linear(2, 2))
-    cfg = ParallelConfig(expert_parallel_size=2, fsdp_apply_modules={"0": {}})
+    cfg = ParallelConfig(
+        expert_parallel_size=2, fsdp_config=FSDPConfig(fsdp_apply_modules={"0": {}})
+    )
     calls = []
     monkeypatch.setattr(plan, "get_fsdp_strategy", lambda _: calls.append("shard"))
     with pytest.raises(ValueError, match="requires a sparse FSDP mesh"):

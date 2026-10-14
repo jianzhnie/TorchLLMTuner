@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel import compatibility
@@ -323,18 +324,24 @@ def test_zero_or_negative_microbatches_is_rejected() -> None:
     for n in (0, -2):
         with pytest.raises(ValueError, match="num_pp_microbatches"):
             validate_microbatches(
-                _dims(), ParallelConfig(num_pp_microbatches=n), global_batch_size=8
+                _dims(),
+                ParallelConfig(pp_config=PipelineParallelConfig(num_pp_microbatches=n)),
+                global_batch_size=8,
             )
 
 
 def test_microbatch_divisibility_is_still_enforced() -> None:
     with pytest.raises(ValueError, match="divisible"):
         validate_microbatches(
-            _dims(), ParallelConfig(num_pp_microbatches=3), global_batch_size=8
+            _dims(),
+            ParallelConfig(pp_config=PipelineParallelConfig(num_pp_microbatches=3)),
+            global_batch_size=8,
         )
     # 8 rows over dp=1, 4 microbatches: legal.
     validate_microbatches(
-        _dims(), ParallelConfig(num_pp_microbatches=4), global_batch_size=8
+        _dims(),
+        ParallelConfig(pp_config=PipelineParallelConfig(num_pp_microbatches=4)),
+        global_batch_size=8,
     )
 
 

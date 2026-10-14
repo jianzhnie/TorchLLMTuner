@@ -13,6 +13,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from llmtuner.config import LLMTunerConfig, ModelConfig, ParallelConfig, TrainingConfig
+from llmtuner.config.parallel_config import ContextParallelConfig
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.context_parallel.attention import (
@@ -106,7 +107,7 @@ def main():
             parallel=ParallelConfig(
                 context_parallel_kv_allgather_size=2,
                 context_parallel_ulysses_size=2,
-                context_parallel_load_balancer=None,
+                cp_config=ContextParallelConfig(context_parallel_load_balancer=None),
             ),
             training=TrainingConfig(max_seq_len=512, steps=1),
         )

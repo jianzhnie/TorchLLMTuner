@@ -47,6 +47,12 @@ from llmtuner.config import (
     TrainingConfig,
 )
 from llmtuner.config.cli_config import PARSER_GROUPS, PROGRAMMATIC_ONLY, cli_view
+from llmtuner.config.parallel_config import (
+    ContextParallelConfig,
+    FSDPConfig,
+    PipelineParallelConfig,
+    TensorParallelConfig,
+)
 
 
 def test_cli_view_rejects_class_variables_in_hidden_fields(monkeypatch):
@@ -131,20 +137,28 @@ def test_dp_shard_accepts_minus_one_as_derive_but_not_zero() -> None:
 
 def test_tp_config_rejects_conflicting_pattern_styles() -> None:
     with pytest.raises(ConfigError, match="conflicting styles"):
-        ParallelConfig(tp_colwise_modules=["layers.*"], tp_rowwise_modules=["layers.*"])
+        ParallelConfig(
+            tp_config=TensorParallelConfig(
+                tp_colwise_modules=["layers.*"], tp_rowwise_modules=["layers.*"]
+            )
+        )
 
 
 def test_tp_config_rejects_unsupported_sequence_module_plan() -> None:
     with pytest.raises(UnsupportedCombinationError, match="tp_sequence_modules"):
-        ParallelConfig(tp_sequence_modules=["layers.*.norm"])
+        ParallelConfig(
+            tp_config=TensorParallelConfig(tp_sequence_modules=["layers.*.norm"])
+        )
 
 
 def test_tp_config_accepts_distinct_pattern_styles() -> None:
     config = ParallelConfig(
-        tp_colwise_modules=["*.up_proj"], tp_rowwise_modules=["*.down_proj"]
+        tp_config=TensorParallelConfig(
+            tp_colwise_modules=["*.up_proj"], tp_rowwise_modules=["*.down_proj"]
+        )
     )
-    assert config.tp_colwise_modules == ["*.up_proj"]
-    assert config.tp_rowwise_modules == ["*.down_proj"]
+    assert config.tp_config.tp_colwise_modules == ["*.up_proj"]
+    assert config.tp_config.tp_rowwise_modules == ["*.down_proj"]
 
 
 @pytest.mark.parametrize("value", [True, 1.0, -1.0, float("nan"), "2", None])
@@ -164,15 +178,23 @@ def test_dp_shard_requires_an_integer(value) -> None:
 @pytest.mark.parametrize("value", [True, 1.5, float("nan"), "2", None, -1])
 def test_parallel_runtime_counts_require_valid_integers(field, value) -> None:
     with pytest.raises(ConfigError, match=field):
-        ParallelConfig(**{field: value})
+        (
+            FSDPConfig(**{field: value})
+            if field.startswith("fsdp_")
+            else PipelineParallelConfig(**{field: value})
+            if field == "num_pp_microbatches"
+            else ParallelConfig(**{field: value})
+        )
 
 
 def test_fsdp_prefetch_allows_zero_and_explicit_windows() -> None:
     config = ParallelConfig(
-        fsdp_forward_prefetch_count=0, fsdp_backward_prefetch_count=3
+        fsdp_config=FSDPConfig(
+            fsdp_forward_prefetch_count=0, fsdp_backward_prefetch_count=3
+        )
     )
-    assert config.fsdp_forward_prefetch_count == 0
-    assert config.fsdp_backward_prefetch_count == 3
+    assert config.fsdp_config.fsdp_forward_prefetch_count == 0
+    assert config.fsdp_config.fsdp_backward_prefetch_count == 3
 
 
 @pytest.mark.parametrize("value", [True, 1.0, float("nan"), "2", None, 0, -1])
@@ -186,18 +208,22 @@ def test_dp_derivation_requires_positive_integer_world_size(value, shard_size) -
 def test_an_empty_load_balancer_is_rejected_rather_than_coerced() -> None:
     """``""`` is not ``None``: one disables, the other is a mistake."""
     with pytest.raises(ValueError, match="cannot be an empty string"):
-        ParallelConfig(context_parallel_load_balancer="")
+        ParallelConfig(
+            cp_config=ContextParallelConfig(context_parallel_load_balancer="")
+        )
     assert (
         ParallelConfig(
-            context_parallel_load_balancer=None
-        ).context_parallel_load_balancer
+            cp_config=ContextParallelConfig(context_parallel_load_balancer=None)
+        ).cp_config.context_parallel_load_balancer
         is None
     )
 
 
 def test_a_load_balancer_that_is_not_a_known_strategy_is_rejected() -> None:
     with pytest.raises(ValueError, match="must be one of"):
-        ParallelConfig(context_parallel_load_balancer="roundrobin")
+        ParallelConfig(
+            cp_config=ContextParallelConfig(context_parallel_load_balancer="roundrobin")
+        )
 
 
 def test_ptrr_is_rejected_at_config_time_not_at_the_first_forward() -> None:
@@ -210,7 +236,9 @@ def test_ptrr_is_rejected_at_config_time_not_at_the_first_forward() -> None:
     build -- this pins it to the config.
     """
     with pytest.raises(NotImplementedError, match="ptrr"):
-        ParallelConfig(context_parallel_load_balancer="ptrr")
+        ParallelConfig(
+            cp_config=ContextParallelConfig(context_parallel_load_balancer="ptrr")
+        )
 
 
 def test_sequence_parallel_cannot_be_turned_off() -> None:
@@ -223,18 +251,26 @@ def test_sequence_parallel_cannot_be_turned_off() -> None:
     realization to fall back to, so refusing is the only honest answer.
     """
     with pytest.raises(NotImplementedError, match="enable_sequence_parallel"):
-        ParallelConfig(tensor_parallel_size=2, enable_sequence_parallel=False)
+        ParallelConfig(
+            tensor_parallel_size=2,
+            tp_config=TensorParallelConfig(enable_sequence_parallel=False),
+        )
     # The default stays on, and saying so explicitly is not an error.
-    assert ParallelConfig().enable_sequence_parallel is True
-    assert ParallelConfig(enable_sequence_parallel=True).enable_sequence_parallel
+    assert ParallelConfig().tp_config.enable_sequence_parallel is True
+    assert ParallelConfig(
+        tp_config=TensorParallelConfig(enable_sequence_parallel=True)
+    ).tp_config.enable_sequence_parallel
     assert not ParallelConfig(
-        tensor_parallel_size=1, enable_sequence_parallel=False
-    ).enable_sequence_parallel
+        tensor_parallel_size=1,
+        tp_config=TensorParallelConfig(enable_sequence_parallel=False),
+    ).tp_config.enable_sequence_parallel
 
 
 def test_an_unknown_context_parallel_strategy_is_rejected() -> None:
     with pytest.raises(ValueError, match="must be one of"):
-        ParallelConfig(context_parallel_strategy="ring")
+        ParallelConfig(
+            cp_config=ContextParallelConfig(context_parallel_strategy="ring")
+        )
 
 
 def test_ulysses_cannot_share_a_load_balancer() -> None:
@@ -259,25 +295,30 @@ def test_ulysses_cannot_share_a_load_balancer() -> None:
         UnsupportedCombinationError, match="requires.*load_balancer=None"
     ):
         ParallelConfig(
-            context_parallel_strategy="ulysses",
-            context_parallel_load_balancer="headtail",
+            cp_config=ContextParallelConfig(
+                context_parallel_strategy="ulysses",
+                context_parallel_load_balancer="headtail",
+            )
         )
     # Ullysses alone is legal, and so is the default balancer for the default
     # strategy -- the refusal is exactly the pair.
     assert (
-        ParallelConfig(context_parallel_strategy="ulysses").context_parallel_strategy
+        ParallelConfig(
+            cp_config=ContextParallelConfig(context_parallel_strategy="ulysses")
+        ).cp_config.context_parallel_strategy
         == "ulysses"
     )
 
     cfg = ParallelConfig(
-        context_parallel_strategy="ulysses",
-        context_parallel_load_balancer=None,
+        cp_config=ContextParallelConfig(
+            context_parallel_strategy="ulysses", context_parallel_load_balancer=None
+        )
     )
-    assert cfg.context_parallel_load_balancer is None
+    assert cfg.cp_config.context_parallel_load_balancer is None
     # The default balancer is upstream's: None means contiguous sharding, and
     # the balanced split is opt-in. The pairing is only constrained the other
     # way round, so this is the one direction that must hold.
-    assert ParallelConfig().context_parallel_load_balancer is None
+    assert ParallelConfig().cp_config.context_parallel_load_balancer is None
 
 
 def _symm_mem_supported() -> bool:
@@ -296,13 +337,15 @@ def _symm_mem_supported() -> bool:
 def test_symmetric_memory_is_rejected_off_a_supported_device() -> None:
     """On a machine without the capability there is no silent fallback to catch."""
     with pytest.raises(ValueError, match="compute capability 9.0"):
-        ParallelConfig(enable_fsdp_symm_mem=True)
+        ParallelConfig(fsdp_config=FSDPConfig(enable_fsdp_symm_mem=True))
 
 
 def test_an_unknown_pipeline_schedule_is_rejected() -> None:
     """``get_schedule_class`` is the authority; the error names the bad value."""
     with pytest.raises(ValueError, match="Invalid parallel.pipeline_parallel_schedule"):
-        ParallelConfig(pipeline_parallel_schedule="NotASchedule")
+        ParallelConfig(
+            pp_config=PipelineParallelConfig(pipeline_parallel_schedule="NotASchedule")
+        )
 
 
 # -- LRSchedulerConfig -------------------------------------------------------
@@ -610,7 +653,7 @@ def test_optimizer_scalar_ranges() -> None:
 
 def test_num_pp_microbatches_and_gc_freq_have_floors() -> None:
     with pytest.raises(ConfigError, match="num_pp_microbatches"):
-        ParallelConfig(num_pp_microbatches=0)
+        ParallelConfig(pp_config=PipelineParallelConfig(num_pp_microbatches=0))
     with pytest.raises(ConfigError, match="gc_freq"):
         TrainingConfig(gc_freq=0)
 
@@ -820,8 +863,8 @@ def test_cli_hidden_configuration_defaults_are_not_shared():
     assert second.lr_scheduler_config.warmup_steps == 0
     parallel_view = cli_view(ParallelConfig)
     first_parallel, second_parallel = parallel_view(), parallel_view()
-    first_parallel.fsdp_apply_modules["layers.*"] = {}
-    assert second_parallel.fsdp_apply_modules == {}
+    first_parallel.fsdp_config.fsdp_apply_modules["layers.*"] = {}
+    assert second_parallel.fsdp_config.fsdp_apply_modules == {}
 
 
 def test_unknown_packing_is_rejected():
@@ -949,7 +992,13 @@ def test_validation_config_rejects_non_integer_step_controls(field, value):
 @pytest.mark.parametrize("value", [True, 1.5, "2", None])
 def test_parallel_integer_degrees_reject_non_integer_values(field, value):
     with pytest.raises(ConfigError, match=f"parallel.{field}"):
-        ParallelConfig(**{field: value})
+        (
+            FSDPConfig(**{field: value})
+            if field.startswith("fsdp_")
+            else PipelineParallelConfig(**{field: value})
+            if field == "num_pp_microbatches"
+            else ParallelConfig(**{field: value})
+        )
 
 
 @pytest.mark.parametrize(

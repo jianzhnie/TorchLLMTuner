@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 
 from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import TensorParallelConfig
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     ColumnParallelLinear,
@@ -135,7 +136,10 @@ def test_tp_target_resolution_reads_the_model_plan_once(overrides) -> None:
     model = Model()
     targets, moe_blocks = resolve_tp_targets(
         model,
-        cfg=ParallelConfig(tensor_parallel_size=2, tp_rowwise_modules=overrides),
+        cfg=ParallelConfig(
+            tensor_parallel_size=2,
+            tp_config=TensorParallelConfig(tp_rowwise_modules=overrides),
+        ),
         plan=None,
     )
     assert model.plan_reads == 1
@@ -193,7 +197,9 @@ def test_target_resolution_applies_configured_pattern_overrides():
     from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_targets
 
     model = nn.Sequential(nn.Linear(4, 4, bias=False))
-    cfg = ParallelConfig(tensor_parallel_size=2, tp_rowwise_modules=["0"])
+    cfg = ParallelConfig(
+        tensor_parallel_size=2, tp_config=TensorParallelConfig(tp_rowwise_modules=["0"])
+    )
     targets, moe_blocks = resolve_tp_targets(model, cfg=cfg, plan={"0": "colwise"})
     assert len(targets) == 1
     assert targets[0][0] == "0"
@@ -473,7 +479,12 @@ def test_explicit_tp_pattern_overrides_default_wildcard(monkeypatch):
     }
     monkeypatch.setattr(tp_module, "supports_symm_mem", lambda mesh: False)
     apply_tp(
-        model, mesh, ParallelConfig(tensor_parallel_size=2, tp_rowwise_modules=["0"])
+        model,
+        mesh,
+        ParallelConfig(
+            tensor_parallel_size=2,
+            tp_config=TensorParallelConfig(tp_rowwise_modules=["0"]),
+        ),
     )
     assert isinstance(model[0], RowParallelLinear)
     assert model[0].weight.shape == (4, 2)

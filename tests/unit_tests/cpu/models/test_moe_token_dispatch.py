@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import ExpertParallelConfig
 from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
 from llmtuner.parallel.expert_parallel.token_dispatch import (
     AllToAllTokenDispatcher,
@@ -100,38 +101,48 @@ def test_local_combine_preserves_float64_values_and_gradients():
 
 def test_default_dispatcher_is_alltoall():
     cfg = ParallelConfig()
-    assert cfg.ep_token_dispatcher == "alltoall"
-    assert cfg.ep_torchao_pad_multiple == 16
+    assert cfg.ep_config.ep_token_dispatcher == "alltoall"
+    assert cfg.ep_config.ep_torchao_pad_multiple == 16
 
 
 def test_unknown_dispatcher_value_rejected():
     with pytest.raises(ValueError, match="ep_token_dispatcher"):
-        ParallelConfig(ep_token_dispatcher="fastep")
+        ParallelConfig(ep_config=ExpertParallelConfig(ep_token_dispatcher="fastep"))
 
 
 @pytest.mark.parametrize("backend", ["deepep", "hybridep"])
 def test_cuda_only_backends_refused_with_unlock_conditions(backend):
     with pytest.raises(NotImplementedError, match="registered gap") as excinfo:
-        ParallelConfig(expert_parallel_size=2, ep_token_dispatcher=backend)
+        ParallelConfig(
+            expert_parallel_size=2,
+            ep_config=ExpertParallelConfig(ep_token_dispatcher=backend),
+        )
     assert "alltoall" in str(excinfo.value)
 
 
 def test_non_default_dispatcher_requires_ep():
     with pytest.raises(NotImplementedError, match="expert_parallel_size=1"):
-        ParallelConfig(expert_parallel_size=1, ep_token_dispatcher="torchao")
+        ParallelConfig(
+            expert_parallel_size=1,
+            ep_config=ExpertParallelConfig(ep_token_dispatcher="torchao"),
+        )
 
 
 def test_torchao_dispatcher_accepted_with_ep():
-    cfg = ParallelConfig(expert_parallel_size=2, ep_token_dispatcher="torchao")
-    assert cfg.ep_token_dispatcher == "torchao"
+    cfg = ParallelConfig(
+        expert_parallel_size=2,
+        ep_config=ExpertParallelConfig(ep_token_dispatcher="torchao"),
+    )
+    assert cfg.ep_config.ep_token_dispatcher == "torchao"
 
 
 def test_pad_multiple_must_be_positive():
     with pytest.raises(ValueError, match="ep_torchao_pad_multiple"):
         ParallelConfig(
             expert_parallel_size=2,
-            ep_token_dispatcher="torchao",
-            ep_torchao_pad_multiple=0,
+            ep_config=ExpertParallelConfig(
+                ep_token_dispatcher="torchao", ep_torchao_pad_multiple=0
+            ),
         )
 
 
@@ -273,7 +284,10 @@ def test_swap_refuses_unknown_backend():
 @pytest.mark.parametrize("backend", ["fastep", "deepep", "hybridep", "mc2"])
 def test_direct_swap_and_config_report_the_same_backend_error(backend):
     with pytest.raises((ValueError, NotImplementedError)) as config_error:
-        ParallelConfig(expert_parallel_size=2, ep_token_dispatcher=backend)
+        ParallelConfig(
+            expert_parallel_size=2,
+            ep_config=ExpertParallelConfig(ep_token_dispatcher=backend),
+        )
     with pytest.raises(type(config_error.value)) as swap_error:
         swap_hf_moe_blocks(types.SimpleNamespace(layers=[]), token_dispatcher=backend)
     assert str(swap_error.value) == str(config_error.value)
