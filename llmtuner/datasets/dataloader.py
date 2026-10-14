@@ -33,6 +33,7 @@ from .contracts import (
     require_positive_integer,
     require_same_dp_degree,
     validate_dp_coordinates,
+    validate_loader_iteration,
 )
 
 __all__ = [
@@ -68,8 +69,7 @@ class GrainDataLoader(BaseDataLoader):
         """
         validate_dp_coordinates(dp_rank=dp_rank, dp_world_size=dp_world_size)
         require_positive_integer("num_prefetch_batches", num_prefetch_batches)
-        if not isinstance(repeat, bool):
-            raise TypeError(f"repeat must be bool, got {repeat!r}")
+        validate_loader_iteration(repeat=repeat, dp_world_size=dp_world_size)
         if read_options is None:
             read_options = grain.ReadOptions()
         # Graph ownership is resolved by the builder. The loader records its
@@ -77,21 +77,10 @@ class GrainDataLoader(BaseDataLoader):
         self._dp_world_size = dp_world_size
         self._rank_id = f"dp_rank_{dp_rank}"
 
-        # A finite dataset cannot be shared by several ranks: each one reaches
-        # the end at a different step, and the ranks that ran out first stop
-        # entering the next collective while the others block in it. Checked
-        # here rather than at the first short batch, which is the point -- by
-        # the time a rank notices, its peers are already waiting.
         # TODO(data-finite-dp): Support finite distributed datasets with a global
         # remainder policy. Simple map datasets can truncate or pad before DP
         # sharding; filtered, mixed, packed, and streaming datasets need
         # coordinated exhaustion so every rank runs the same number of steps.
-        if dp_world_size > 1 and not repeat:
-            raise ValueError(
-                "repeat=False with data parallelism can exhaust ranks at different "
-                "steps and hang collectives; use repeat=True with a trainer-"
-                "controlled step count"
-            )
         context = DatasetBuildContext(
             tokenizer=tokenizer,
             max_context_length=max_context_length,

@@ -171,30 +171,6 @@ def apply_sample_transforms(
     return dataset
 
 
-def shard_for_dp(
-    dataset: grain.MapDataset,
-    iteration_policy: DatasetIterationPolicy,
-) -> grain.MapDataset:
-    """Give ``dp_rank`` a contiguous, disjoint slice of ``dataset``.
-
-    Contiguous rather than strided because Grain's shuffle is a permutation
-    computed from the index: a contiguous slice of the shuffled index space is
-    still an even share of the whole, and it keeps each rank's reads sequential.
-    """
-    dp_world_size = iteration_policy.dp_world_size
-    dp_rank = iteration_policy.dp_rank
-    if len(dataset) < dp_world_size:
-        raise ValueError(
-            f"dataset has {len(dataset)} rows, fewer than dp_world_size={dp_world_size}"
-        )
-    shard_size, remainder = divmod(len(dataset), dp_world_size)
-    shard_start = dp_rank * shard_size + min(dp_rank, remainder)
-    shard_stop = shard_start + shard_size
-    if dp_rank < remainder:
-        shard_stop += 1
-    return dataset[shard_start:shard_stop]
-
-
 def apply_iteration_policy(
     dataset: grain.MapDataset,
     iteration_policy: DatasetIterationPolicy,
@@ -206,15 +182,25 @@ def apply_iteration_policy(
 
     * ``shuffle`` is global, so every rank computes the same permutation (a
       per-rank shuffle would give each rank a different dataset);
-    * then ``shard_for_dp`` slices that permutation, which is why it takes the
-      policy rather than a bare rank;
+    * then each DP rank takes a contiguous, disjoint slice of that permutation;
     * then ``repeat``. Grain preserves the epoch through sliced map indices, so
       the upstream shuffle re-runs with seed + epoch on each repeat instead of
       re-slicing the same order.
     """
     if iteration_policy.shuffle:
         dataset = dataset.shuffle(seed=iteration_policy.seed)
-    dataset = shard_for_dp(dataset, iteration_policy)
+    dp_world_size = iteration_policy.dp_world_size
+    dp_rank = iteration_policy.dp_rank
+    if len(dataset) < dp_world_size:
+        raise ValueError(
+            f"dataset has {len(dataset)} rows, fewer than dp_world_size={dp_world_size}"
+        )
+    shard_size, remainder = divmod(len(dataset), dp_world_size)
+    shard_start = dp_rank * shard_size + min(dp_rank, remainder)
+    shard_stop = shard_start + shard_size
+    if dp_rank < remainder:
+        shard_stop += 1
+    dataset = dataset[shard_start:shard_stop]
     if iteration_policy.repeat:
         dataset = dataset.repeat()
     return dataset

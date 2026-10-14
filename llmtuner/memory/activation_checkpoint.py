@@ -589,12 +589,16 @@ def apply_ac(
             f"{type(model).__name__}."
         )
 
-    # Upstream sets this before wrapping, for every policy; so does the
-    # memory_budget branch above (inside ``apply_memory_budget``). Placed
-    # after the checks so a rejected config never mutates a global.
-    disable_dynamo_lru_cache()
+    if mode == "region":
+        # Resolve the optional dependency before changing process-global state.
+        require_torch_remat()
+        # Region annotations modify the original blocks in place.
+        disable_dynamo_lru_cache()
 
+    # Build full/selective wrappers before replacing any layer. A bad FQN in
+    # a later block must not leave earlier blocks checkpointed.
     blocks = tuple(layers.named_children())
+    wrapped_blocks = []
     for layer_id, transformer_block in blocks:
         if mode == "selective":
             wrapped = wrap_selective(
@@ -608,6 +612,11 @@ def apply_ac(
             wrapped = wrap_full(
                 transformer_block, preserve_rng_state=preserve_rng_state
             )
+        wrapped_blocks.append((layer_id, wrapped))
+
+    if mode != "region":
+        disable_dynamo_lru_cache()
+    for layer_id, wrapped in wrapped_blocks:
         layers.register_module(layer_id, wrapped)
 
     logger.info("Applied %s activation checkpointing to %d layers", mode, len(blocks))

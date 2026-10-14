@@ -33,6 +33,7 @@ __all__ = [
     "require_positive_integer",
     "require_same_dp_degree",
     "validate_dp_coordinates",
+    "validate_loader_iteration",
 ]
 
 # Model inputs, aligned labels, and num_valid_tokens metadata. Collators count
@@ -91,6 +92,22 @@ def validate_dp_coordinates(*, dp_rank: int, dp_world_size: int) -> None:
     ):
         raise ValueError(
             f"dp_rank must be an integer in [0, {dp_world_size}), got {dp_rank!r}"
+        )
+
+
+def validate_loader_iteration(*, repeat: bool, dp_world_size: int) -> None:
+    """Reject loader policies that can exhaust DP ranks at different steps.
+
+    Finite distributed loading needs coordinated exhaustion or a global
+    remainder policy; dropping a local partial batch alone is insufficient.
+    """
+    if not isinstance(repeat, bool):
+        raise TypeError(f"repeat must be bool, got {repeat!r}")
+    if dp_world_size > 1 and not repeat:
+        raise ValueError(
+            "repeat=False with data parallelism can exhaust ranks at different "
+            "steps and hang collectives; use repeat=True with a trainer-"
+            "controlled step count"
         )
 
 
