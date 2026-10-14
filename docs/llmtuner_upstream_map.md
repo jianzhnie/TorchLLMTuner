@@ -901,7 +901,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 
 | llmtuner 符号 | TorchTitan 对应符号 | 差异与正确性 |
 |---|---|---|
-| `ModelWrapper` | `components/checkpointer/base.py` | 合并 PP parts，缓存稳定 storage 供 async staging，**通过** |
+| `ModelCheckpointState` | `components/checkpointer/base.py` | 合并 PP parts，缓存稳定 storage 供 async staging，**通过** |
 | `CheckpointStorage` | 上游 backend storage seam | llmtuner Protocol，不依赖 Configurable，**通过（适配）** |
 | `BaseCheckpointManager` 生命周期方法 | 同名基类 | load/save/close、异步 drain、retention 集中在基类。resume 优先于 initial_load_* 时记 info 日志（上游 810e62786）。策略方法与上游逐行同构，两处适配登记——新增 `_initialized` 门（上游靠各类自己的 `hasattr`/`getattr` 容错部分构造，见 `distributed_checkpoint.DistributedCheckpointManager.__init__` 的 HF 选项拒绝）与 `enable` 短路（上游的 manager 只在配置了 checkpointer 时才构造）；`_should_purge` 的 rank 判定换 `distributed.is_main_process()`（非分布式下 `dist.get_rank()` 会 raise），**通过（适配）** |
 | `_parse_step/_find_load_step/_purge_stale_checkpoints` | 同名策略 | exact `step-N`、清理 staged/abandoned、保留豁免，**通过** |
@@ -1059,7 +1059,9 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | llmtuner 模块 | 重要符号 | 对应类别 |
 |---|---|---|
 | `errors.py` | `LLMTunerError` 与 `ConfigError` / `UnsupportedCombinationError` / `EnvironmentUnsupportedError` 三类 fail-fast 层级 | C，llmtuner 独有 |
-| `components/checkpointer/base.py` | `ModelWrapper`, `CheckpointStorage`, `BaseCheckpointManager`, `purge_thread` | A2，同文件 |
+| `components/checkpointer/base.py` | `BaseCheckpointManager`, `purge_thread` | A2，共享管理策略 |
+| `components/checkpointer/model_state.py` | `ModelCheckpointState` | A2，上游 `components/checkpointer/base.py::ModelWrapper`，独立模型状态适配 |
+| `components/checkpointer/storage.py` | `CheckpointStorage`, `FilesystemCheckpointStorage` | A2，集中本地存储契约与适配 |
 | `components/checkpointer/distributed_checkpoint.py` | `DistributedCheckpointManager`, `DistributedCheckpointAsyncMode` | A2，同文件 |
 | `components/checkpointer/torch_checkpointing_backend.py` | `TorchCheckpointingManager` 与 backend config helpers | A2，同文件 |
 | `components/checkpointer/utils.py` | `canonical_fqn` | A1，同文件 |

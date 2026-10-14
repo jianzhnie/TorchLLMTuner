@@ -97,7 +97,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
 
     2. With complex PP schedules there are multiple model chunks per PP rank,
        which compounds (1) by also requiring us to reason about multiple local
-       ``optim`` objects. ``ModelWrapper`` flattens the state dicts from each
+       ``optim`` objects. ``ModelCheckpointState`` flattens the state dicts from each
        chunk into one before saving or loading, relying on the individual
        state dicts not to collide -- guaranteed for the model by correct
        pipeline splitting, and for the optimizer by the FQN keying in (1).

@@ -35,11 +35,8 @@ are the top-level state keys a checkpoint is keyed by. llmtuner shares none of
 torchtitan's component containers, so which of them a run actually populates
 differs -- see ``components/checkpointer/__init__.py`` for the mapping.
 
-The ``Stateful`` views a checkpoint wraps its inputs in -- ``ModelWrapper`` here,
-and the ``OptimizersContainer`` itself on the optimizer side -- are not part of
-this contract: they are what a model or an optimizer looks like *to* a
-checkpointer, and they live with the thing they wrap. This module keeps the
-model one only because a model has no other home.
+The model's checkpoint state adapter lives in ``model_state.py``; the storage
+contract lives in ``storage.py``. This module owns manager policies.
 """
 
 from __future__ import annotations
@@ -55,19 +52,13 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.tensor import DTensor
 
 from ...accelerator import distributed
-from ...parallel.expert_parallel.checkpointing import (
-    expert_shard_map,
-    gather_expert_state,
-    load_expert_state,
-)
 from ...utils.garbage_collection import GarbageCollection
 from ...utils.logging import get_logger
 from . import filesystem
 from .checkpoint_keys import EMA, LR_SCHEDULER, MODEL, OPTIMIZER
+from .model_state import ModelCheckpointState
 from .storage import CheckpointStorage
 
 logger = get_logger(__name__)
@@ -75,7 +66,6 @@ logger = get_logger(__name__)
 __all__ = [
     "BaseCheckpointManager",
     "EXPORT_DTYPE_MAP",
-    "ModelWrapper",
 ]
 
 
@@ -117,20 +107,6 @@ def purge_thread(
         logger.info("Destroying the purge thread.")
 
 
-def shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
-    """Whether ``a`` and ``b`` are backed by the same storage.
-
-    For ``DTensor`` the local shard is compared via ``_local_tensor`` rather
-    than ``to_local()``, which is autograd-aware. The dispatcher-level alias
-    check also supports wrapper subclasses without directly accessible storage.
-    """
-    if isinstance(a, DTensor):
-        a = a._local_tensor
-    if isinstance(b, DTensor):
-        b = b._local_tensor
-    return torch._C._is_alias_of(a, b)
-
-
 EXPORT_DTYPE_MAP: dict[str, torch.dtype] = {
     "float16": torch.float16,
     "float32": torch.float32,
@@ -143,68 +119,6 @@ EXPORT_DTYPE_MAP: dict[str, torch.dtype] = {
 checkpointer can write, the other what the output projection can compute in,
 and the overlap is incidental (see the symbol guide's note on this).
 """
-
-
-class ModelWrapper(Stateful):
-    """A ``Stateful`` view over one module or a list of them.
-
-    Serves two purposes:
-
-    1. **Flattening.** Combines the state dicts of several modules (individual
-       chunks under pipeline parallelism) into one flat view, so the
-       checkpointing code interacts with them through a single interface.
-    2. **Stable-storage caching.** Caches the flattened state dict and, on every
-       ``state_dict()`` call, returns tensors backed by the *same* storage.
-       Async DCP staging may cache pinned host buffers keyed by the source
-       storage, so keeping storage stable lets it reuse those buffers across
-       saves -- this is the fast checkpoint path. Parameter tensors already
-       satisfy this, since the cached view shares the parameter's storage.
-       Tensors produced by module ``state_dict`` hooks (one that splits a fused
-       parameter, say) may be freshly allocated each call, so they are refreshed
-       in place: their storage stays put while their values track the parameters.
-
-    Notes:
-        - ``load_state_dict`` updates the underlying modules and refreshes the
-          cache.
-        - The module tree must not be structurally modified (keys changing,
-          tensor references replaced) after wrapping, or the cache goes stale.
-    """
-
-    def __init__(self, model: nn.Module | list[nn.Module]) -> None:
-        self.model = [model] if isinstance(model, nn.Module) else model
-        # EP-sharded expert weights are rank-heterogeneous under one FQN;
-        # they ride through this wrapper as all-gathered full tensors and are
-        # sliced back per rank on load (parallel/expert_parallel/checkpointing.py).
-        self._ep_shards = expert_shard_map(self.model)
-        self.cached_state_dict = self._get_state_dict()
-
-    def _get_state_dict(self) -> dict[str, Any]:
-        flat = {k: v for model in self.model for k, v in model.state_dict().items()}
-        return gather_expert_state(flat, self._ep_shards, self.model)
-
-    def state_dict(self) -> dict[str, Any]:
-        # Recompute so hook-produced tensors reflect the current parameters,
-        # then merge into the cache without changing storage objects.
-        for key, value in self._get_state_dict().items():
-            cached = self.cached_state_dict.get(key)
-            if (
-                cached is None
-                or cached.shape != value.shape
-                or cached.dtype != value.dtype
-            ):
-                self.cached_state_dict[key] = value
-            elif not shares_storage(cached, value):
-                cached.copy_(value)
-        return self.cached_state_dict
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        # strict=False because this is the flattened checkpoint dict, which
-        # mixes model FQN keys with non-model keys (optimizer, lr_scheduler, ...).
-        state_dict = load_expert_state(state_dict, self._ep_shards, self.model)
-        for model in self.model:
-            model.load_state_dict(state_dict, strict=False)
-        # Refresh the cache so state_dict() reflects the freshly loaded values.
-        self.cached_state_dict = self._get_state_dict()
 
 
 class BaseCheckpointManager(ABC):
@@ -295,7 +209,7 @@ class BaseCheckpointManager(ABC):
         self.states = states
         states.update(
             {
-                MODEL: ModelWrapper(model_parts),
+                MODEL: ModelCheckpointState(model_parts),
                 OPTIMIZER: optimizer,
                 LR_SCHEDULER: lr_scheduler,
             }

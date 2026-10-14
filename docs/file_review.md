@@ -17,10 +17,11 @@
 | `llmtuner/accelerator/tensor_tree.py` | 已阅读 | 统一张量树遍历、容器重建和 out 结构预校验；覆盖 namedtuple/defaultdict、键顺序、混合设备与失败前无写入。 |
 | `llmtuner/components/__init__.py` | 已阅读 | 包入口及公开导出；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/checkpointer/__init__.py` | 已阅读 | __getattr__、__dir__；检查训练服务状态、错误路径、持久化及资源生命周期。 |
-| `llmtuner/components/checkpointer/base.py` | 已阅读 | purge_thread、shares_storage、ModelWrapper、CheckpointStorage、BaseCheckpointManager；检查训练服务状态、错误路径、持久化及资源生命周期。 |
+| `llmtuner/components/checkpointer/base.py` | 已阅读 | purge_thread、BaseCheckpointManager；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/checkpointer/checkpoint_keys.py` | 已阅读 | canonical_fqn；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/checkpointer/distributed_checkpoint.py` | 已阅读 | DistributedCheckpointAsyncMode、FilesystemCheckpointStorage、DistributedCheckpointManager；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/checkpointer/filesystem.py` | 已阅读 | is_remote、resolve、exists、isdir、isfile；检查训练服务状态、错误路径、持久化及资源生命周期。 |
+| `llmtuner/components/checkpointer/model_state.py` | 已阅读 | ModelCheckpointState 聚合 PP/EP 状态并维护缓存；支持非张量 extra_state，按 shape/dtype/device 刷新张量缓存。 |
 | `llmtuner/components/checkpointer/storage.py` | 已阅读 | CheckpointStorage 协议和 FilesystemCheckpointStorage；不依赖管理器或 DCP，保留本地及 fsspec 路径语义。 |
 | `llmtuner/components/checkpointer/torch_checkpointing_backend.py` | 已阅读 | require_torch_checkpointing、BackendSymbols、BackendCheckpointStorage、init_subprocess_logging、item_specs；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/loss.py` | 已阅读 | vocab_shard_bounds、next_token_targets、cross_entropy_loss、shard_local_labels、LossParallelCrossEntropy；检查训练服务状态、错误路径、持久化及资源生命周期。 |
@@ -165,7 +166,7 @@
 
 ## 后续验证与限制
 
-- 已逐个阅读 148/148 个 Python 文件；这是实现审查覆盖，不等于所有组合均已运行通过。
+- 已逐个阅读 149/149 个 Python 文件；这是实现审查覆盖，不等于所有组合均已运行通过。
 - accelerator/tensor_tree.py 已明确支持容器范围，out 结构在复制前递归校验；训练归约调用只传 Tensor。
 - 日志祖先传播、allocator memory history 退出关闭、指标构建失败清理仍需专项优化。
 - KV AllGather × Ulysses 的 token 重排和 mask 对齐须多设备等价性验证；不能由 CPU 测试推定正确。
@@ -178,7 +179,7 @@
 - `pytest -q --disable-warnings`：1119 passed、10 skipped。
 - `pre-commit run --all-files`：全部通过（包含 Ruff lint/format）。
 - `python -m compileall -q llmtuner`、`git diff HEAD --check`：通过。
-- 清单与当前源文件集合一致：148 条，无缺失、无重复。
+- 清单与当前源文件集合一致：149 条，无缺失、无重复。
 
 ## 本轮结构调整
 
@@ -202,3 +203,9 @@
 - checkpoint 的延迟导入符号容器改名 `BackendSymbols`，区分运行配置和后端 API。
 
 - checkpoint 路径协议和文件系统适配器集中于 `storage.py`；base 保留共享策略，DCP 后端保留保存/加载实现。当前源文件数为 148。
+
+- 模型 checkpoint 状态适配独立为 `model_state.py::ModelCheckpointState`；新增模块后当前文件数为 149。
+
+- 模型状态缓存刷新前显式校验 key 集合；检测包装后新增/删除参数或 buffer，避免保存陈旧或混合结构状态。模型状态适配回归集中于 `test_model_state.py`。
+
+- ModelCheckpointState 构造时复制模型分块集合，避免调用方列表修改导致 checkpoint 范围与 EP shard map 不一致；保留空集合兼容性并拒绝非模块成员，覆盖两分块恢复。

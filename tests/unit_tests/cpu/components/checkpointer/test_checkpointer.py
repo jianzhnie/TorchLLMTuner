@@ -19,7 +19,6 @@ import torch.nn as nn
 
 from llmtuner.components.checkpointer import (
     DistributedCheckpointManager,
-    ModelWrapper,
     canonical_fqn,
 )
 from llmtuner.components.checkpointer.storage import (
@@ -317,22 +316,6 @@ def test_init_optim_state_completes_a_partially_initialized_optimizer() -> None:
             assert actual == expected
     # The newly materialized state must still make the next real update step 1.
     assert int(optimizer.state[model.bias]["step"]) == 0
-
-
-def test_model_wrapper_keeps_tensor_storage_stable_across_calls() -> None:
-    """Stable storage is what lets async DCP reuse its pinned host buffers."""
-    model = nn.Linear(4, 4)
-    wrapper = ModelWrapper(model)
-
-    first = wrapper.state_dict()
-    storages = {k: v.untyped_storage().data_ptr() for k, v in first.items()}
-    with torch.no_grad():
-        model.weight.add_(1)
-
-    second = wrapper.state_dict()
-
-    assert {k: v.untyped_storage().data_ptr() for k, v in second.items()} == storages
-    assert torch.equal(second["weight"], model.weight)
 
 
 # -- TorchCheckpointingManager ------------------------------------------------
