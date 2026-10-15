@@ -104,7 +104,13 @@ class OptimizerConfig:
         # Normalizing here makes that unreachable, and the length
         # check is what turns a typo like ``--betas 0.9`` into an error rather
         # than a one-element betas that torch rejects deep in a step.
-        betas = tuple(self.betas)
+        try:
+            betas = tuple(self.betas)
+        except TypeError as error:
+            raise ConfigError(
+                "optimizer.betas must contain two numeric entries; "
+                "pass both: --betas 0.9 0.95."
+            ) from error
         if len(betas) != 2:
             raise ConfigError(
                 f"optimizer.betas must have exactly 2 entries (beta1, beta2), "

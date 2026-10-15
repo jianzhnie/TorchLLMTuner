@@ -121,7 +121,9 @@ class OptimizersContainer(Optimizer, Stateful):
         self.model_parts = list(model_parts)
 
         model_group_plans = [
-            self._build_param_groups(model, config.param_groups, impl_kwargs)
+            self._build_param_groups(
+                model, param_group_configs=config.param_groups, impl_kwargs=impl_kwargs
+            )
             for model in self.model_parts
         ]
         for groups_by_opt_name in model_group_plans:
@@ -129,26 +131,22 @@ class OptimizersContainer(Optimizer, Stateful):
                 for group in groups.param_groups:
                     all_params.extend(group["params"])
         self._validate_params(all_params)
-
-        for part_idx, groups_by_opt_name in enumerate(model_group_plans):
-            for opt_name, groups in groups_by_opt_name.items():
-                optimizer = self._resolve_optimizer_factory(opt_name)(
-                    groups.param_groups
-                )
-                self.optimizers.append(optimizer)
-                self._log_optimizer(optimizer, part_idx, groups.patterns)
-
-        self._initialize_optimizer_interface(all_params)
-
-    @staticmethod
-    def _resolve_optimizer_factory(name: str) -> Callable[..., Optimizer]:
         optimizer_factories: dict[str, Callable[..., Optimizer]] = {
             "Adam": torch.optim.Adam,
             "AdamW": torch.optim.AdamW,
         }
-        if name not in optimizer_factories:
-            raise NotImplementedError(f"Optimizer {name} not added.")
-        return optimizer_factories[name]
+        for groups_by_opt_name in model_group_plans:
+            for name in groups_by_opt_name:
+                if name not in optimizer_factories:
+                    raise NotImplementedError(f"Optimizer {name} not added.")
+
+        for part_idx, groups_by_opt_name in enumerate(model_group_plans):
+            for opt_name, groups in groups_by_opt_name.items():
+                optimizer = optimizer_factories[opt_name](groups.param_groups)
+                self.optimizers.append(optimizer)
+                self._log_optimizer(optimizer, part_idx, groups.patterns)
+
+        self._initialize_optimizer_interface(all_params)
 
     @staticmethod
     def _build_impl_kwargs(config: OptimizerConfig) -> dict[str, Any]:
@@ -181,6 +179,7 @@ class OptimizersContainer(Optimizer, Stateful):
     @staticmethod
     def _build_param_groups(
         model: nn.Module,
+        *,
         param_group_configs: list[ParamGroupConfig],
         impl_kwargs: dict[str, Any],
     ) -> dict[str, _OptimizerGroups]:

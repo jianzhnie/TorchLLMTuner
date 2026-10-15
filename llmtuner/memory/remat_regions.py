@@ -46,7 +46,7 @@ __all__ = [
     "region_names",
     "region_policy",
     "should_recompute",
-    "unmatched_save_patterns",
+    "unmatched_region_patterns",
 ]
 
 
@@ -85,8 +85,8 @@ def should_recompute(
     ) or any(fnmatch.fnmatch(region, pattern) for pattern in recompute_patterns)
 
 
-def unmatched_save_patterns(
-    regions: Sequence[str], save_patterns: Sequence[str]
+def unmatched_region_patterns(
+    regions: Sequence[str], patterns: Sequence[str]
 ) -> tuple[str, ...]:
     """The patterns that matched no region of ``regions``.
 
@@ -97,7 +97,7 @@ def unmatched_save_patterns(
     """
     return tuple(
         pattern
-        for pattern in save_patterns
+        for pattern in patterns
         if not any(fnmatch.fnmatch(region, pattern) for region in regions)
     )
 

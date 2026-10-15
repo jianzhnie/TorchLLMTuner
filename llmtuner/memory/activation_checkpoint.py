@@ -77,7 +77,7 @@ passing a mode string (the extension point its config already documents).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 
 import torch
@@ -92,7 +92,7 @@ from torch.utils.checkpoint import (
     create_selective_checkpoint_contexts,
 )
 
-from llmtuner.config import (
+from llmtuner.config.activation_checkpoint_config import (
     VALID_AC_MODES,
     MemoryBudgetACConfig,
     RegionACConfig,
@@ -106,18 +106,12 @@ from ..utils.logging import get_logger
 from .remat_regions import (
     region_names,
     region_policy,
-    unmatched_save_patterns,
+    unmatched_region_patterns,
 )
 
 logger = get_logger(__name__)
 
-# ``VALID_AC_MODES`` is declared next to the field it constrains
-# (``config/activation_checkpoint_config.py``) and imported here.
-# It stays in ``__all__`` as a
-# re-export so ``from llmtuner.memory.activation_checkpoint import
-# VALID_AC_MODES`` keeps working.
 __all__ = [
-    "VALID_AC_MODES",
     "apply_ac",
     "full_policy",
     "require_torch_remat",
@@ -212,7 +206,7 @@ def get_default_save_ops() -> set:
 
 
 def mm_recompute_shapes(
-    module: nn.Module, base_fqn: str | None, fqns: list[str]
+    module: nn.Module, *, base_fqn: str | None, fqns: Sequence[str]
 ) -> set[tuple[int, int]]:
     """Collect the ``(in, out)`` weight shapes to force-recompute, by fqn.
 
@@ -295,7 +289,7 @@ def wrap_selective(
     """Wrap one block with the selective policy (upstream's ``_wrap_block``)."""
     save_ops = get_default_save_ops()
     mm_shapes = mm_recompute_shapes(
-        module, base_fqn, cfg.force_recompute_mm_shapes_by_fqns
+        module, base_fqn=base_fqn, fqns=cfg.force_recompute_mm_shapes_by_fqns
     )
     policy = selective_policy(save_ops, mm_shapes)
     return ptd_checkpoint_wrapper(
@@ -321,23 +315,18 @@ def full_policy(_ctx, _op, *_args, **_kwargs) -> CheckpointPolicy:
     return CheckpointPolicy.PREFER_RECOMPUTE
 
 
-@contextmanager
-def _recompute_aux_context():
-    token = in_checkpoint_recompute.set(True)
-    try:
-        yield
-    finally:
-        in_checkpoint_recompute.reset(token)
-
-
 def checkpoint_contexts(policy: Callable):
     """Keep checkpoint's op policy while marking its backward-time replay."""
     forward_context, recompute_context = create_selective_checkpoint_contexts(policy)
 
     @contextmanager
     def marked_recompute():
-        with _recompute_aux_context(), recompute_context:
-            yield
+        token = in_checkpoint_recompute.set(True)
+        try:
+            with recompute_context:
+                yield
+        finally:
+            in_checkpoint_recompute.reset(token)
 
     return forward_context, marked_recompute()
 
@@ -494,7 +483,7 @@ def wrap_region(
         retained,
         f" ({', '.join(sorted(regions))})" if regions else "",
     )
-    unmatched = unmatched_save_patterns(regions, cfg.save_regions)
+    unmatched = unmatched_region_patterns(regions, cfg.save_regions)
     if unmatched:
         logger.warning(
             "RegionAC save_regions matched nothing in %s: %s (available: %s)",
@@ -502,7 +491,7 @@ def wrap_region(
             ", ".join(unmatched),
             ", ".join(sorted(regions)) or "none",
         )
-    unmatched_recompute = unmatched_save_patterns(regions, cfg.recompute_regions)
+    unmatched_recompute = unmatched_region_patterns(regions, cfg.recompute_regions)
     if unmatched_recompute:
         logger.warning(
             "RegionAC recompute_regions matched nothing in %s: %s (available: %s)",
@@ -594,9 +583,9 @@ def apply_ac(
         return model
 
     layers = getattr(model, "layers", None)
-    if layers is None:
+    if not isinstance(layers, nn.Module):
         raise TypeError(
-            f"apply_ac expects a HFTransformerModel (with .layers); got "
+            f"apply_ac expects a HFTransformerModel (with .layers as nn.Module); got "
             f"{type(model).__name__}."
         )
 
@@ -605,7 +594,8 @@ def apply_ac(
     # after the checks so a rejected config never mutates a global.
     disable_dynamo_lru_cache()
 
-    for layer_id, transformer_block in layers.named_children():
+    blocks = tuple(layers.named_children())
+    for layer_id, transformer_block in blocks:
         if mode == "selective":
             wrapped = wrap_selective(
                 transformer_block, selective, base_fqn=f"layers.{layer_id}"
@@ -620,5 +610,5 @@ def apply_ac(
             )
         layers.register_module(layer_id, wrapped)
 
-    logger.info("Applied %s activation checkpointing to %d layers", mode, len(layers))
+    logger.info("Applied %s activation checkpointing to %d layers", mode, len(blocks))
     return model
