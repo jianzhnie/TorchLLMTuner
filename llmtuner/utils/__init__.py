@@ -2,6 +2,8 @@
 
 Members:
 
+* ``module_names.py`` -- canonical model FQNs for optimizer and parallel state.
+
 * ``garbage_collection.py`` -- ``GarbageCollection``: the collect/disable pair
   the trainer wraps around phases where allocator churn would show up as time.
 * ``logging.py`` -- ``get_logger`` (a colour formatter that filters by rank

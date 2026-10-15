@@ -1,22 +1,9 @@
-"""One implementation of the lazy package index (PEP 562) used across llmtuner.
+"""Resolve lazy package exports without importing optional training dependencies.
 
-Five ``__init__`` files here are *indexes*: each names a slice of its package's
-public surface so that ``from llmtuner.accelerator import get_rank`` works,
-while the submodule behind a name is imported only when that name is touched.
-The laziness is load-bearing, not a style choice:
-
-* ``llmtuner.accelerator`` has to stay importable where ``distributed.py`` is not;
-* ``llmtuner.parallel`` is read by ``llmtuner.config``, which cannot pay for the
-  engine layer (its context-parallel half pulls in the model stack);
-* ``llmtuner.components.checkpointer`` guards a torch.distributed surface that
-  older torch builds do not have;
-* ``llmtuner.models.common`` must not drag the MoE stack into every consumer;
-* ``llmtuner`` itself keeps ``Trainer`` -- and the whole ``torch.distributed``
-  stack behind it -- out of ``import llmtuner``.
-
-Each index keeps its own name -> submodule table; that table is the discoverable
-thing. What is shared is the lookup, the error message and the ``__dir__`` sort,
-which used to be copy-pasted into all five.
+Each package owns its name-to-submodule mapping. PEP 562 __getattr__ delegates
+here to import the defining submodule only when the attribute is requested.
+This keeps lightweight package imports independent of the model/parallel stack.
+Package indexes sort their mappings directly for __all__ and __dir__.
 """
 
 from __future__ import annotations
@@ -25,12 +12,7 @@ from collections.abc import Mapping
 from importlib import import_module
 from typing import Any
 
-__all__ = ["export_names", "resolve_export"]
-
-
-def export_names(sources: Mapping[str, str]) -> list[str]:
-    """The sorted names an index exports, for ``__all__`` and ``__dir__``."""
-    return sorted(sources)
+__all__ = ["resolve_export"]
 
 
 def resolve_export(module_name: str, sources: Mapping[str, str], name: str) -> Any:

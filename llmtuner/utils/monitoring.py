@@ -32,8 +32,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, fields
-
-import torch
+from typing import Any
 
 from ..accelerator.device import device_module, device_type
 
@@ -205,7 +204,14 @@ def get_peak_flops(device_name: str) -> float:
     if "data center gpu max 1550" in name:
         # Ponte Vecchio, measured rather than quoted: the datasheet figure
         # depends on the compute-unit mode, which the device itself reports.
-        max_compute_units = torch.xpu.get_device_properties("xpu").max_compute_units
+        # Use the accelerator selected by ``accelerator.device``.  Calling
+        # ``torch.xpu`` directly bypasses vendor/device injection and can ask
+        # the wrong backend when this probe is exercised outside an XPU run.
+        if device_type != "xpu":
+            return 0.0
+        max_compute_units = device_module.get_device_properties(
+            device_module.current_device()
+        ).max_compute_units
         return 512 * max_compute_units * 1300 * 10**6
     if name.startswith("tpu"):
         # Dense BF16 matrix-engine peak per device.
@@ -225,7 +231,7 @@ def get_peak_flops(device_name: str) -> float:
     return 0.0
 
 
-def memory_module():
+def memory_module() -> Any | None:
     """The module that owns memory history for the training device, or None.
 
     Not ``torch.cuda.memory`` unconditionally, the way torchtitan does it: its
@@ -268,7 +274,7 @@ def stop_memory_history() -> None:
         memory._record_memory_history(enabled=None)
 
 
-def read_memory_snapshot():
+def read_memory_snapshot() -> Any:
     """The accumulated allocator history, for writing to a snapshot file."""
     memory = memory_module()
     if memory is None:

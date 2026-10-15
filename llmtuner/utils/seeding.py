@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import os
 import random
+from collections.abc import Iterable
 
 import numpy as np
 import torch
@@ -11,12 +12,7 @@ from .logging import get_logger
 logger = get_logger(__name__)
 
 
-def set_seed(seed: int, set_deterministic: bool = False) -> None:
-    """Seed the active device and host generators through the shared path."""
-    seed_everything(seed, deterministic=set_deterministic)
-
-
-def set_deterministic_algorithms():
+def set_deterministic_algorithms() -> None:
     """Enable deterministic algorithms and deterministic accelerator kernels."""
     os.environ["HCCL_DETERMINISTIC"] = "True"
     os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
@@ -46,6 +42,20 @@ def seed_everything(
     torchtitan's ``set_determinism`` semantics; ``Trainer.seed_everything``
     delegates here.
     """
+    if (
+        not isinstance(seed, int)
+        or isinstance(seed, bool)
+        or not -(2**63) <= seed < 2**64
+    ):
+        raise ValueError(
+            f"seed must be an integer in [-2**63, 2**64 - 1], got {seed!r}"
+        )
+    for name, value in (
+        ("deterministic", deterministic),
+        ("detect_anomaly", detect_anomaly),
+    ):
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be bool, got {value!r}")
     random.seed(seed)
     np.random.seed(seed % 2**32)
     torch.manual_seed(seed)
@@ -67,3 +77,35 @@ def seed_everything(
         # would crash on sharded parameters. Stack-trace recording -- the
         # useful half -- stays on. Same setting as upstream's.
         torch.autograd.set_detect_anomaly(True, check_nan=False)
+
+
+def derive_distinct_seed(seed: int, distinct_coords: Iterable[tuple[int, int]]) -> int:
+    """Offset ``seed`` by this rank's coordinates along distinct mesh dims.
+
+    Each ``(local_rank, dim_size)`` pair contributes ``local_rank`` times the
+    product of all previous dimensions' sizes. The first dimension varies
+    fastest, so every valid coordinate tuple maps to a unique offset. The
+    result is reduced mod 2**64 to stay inside ``torch.manual_seed``'s range.
+
+    Empty coordinates (or all-zero local ranks) add no offset. The seed is
+    still normalized modulo 2**64, including negative seeds; PyTorch maps
+    those to the same generator state as their normalized equivalents.
+    """
+    offset = 0
+    cumulative_size = 1
+    for local_rank, dim_size in distinct_coords:
+        if (
+            not isinstance(local_rank, int)
+            or isinstance(local_rank, bool)
+            or not isinstance(dim_size, int)
+            or isinstance(dim_size, bool)
+            or dim_size < 1
+            or not 0 <= local_rank < dim_size
+        ):
+            raise ValueError(
+                "each seed coordinate must contain an integer rank in "
+                f"[0, dim_size), got ({local_rank!r}, {dim_size!r})"
+            )
+        offset += local_rank * cumulative_size
+        cumulative_size *= dim_size
+    return (seed + offset) % 2**64
