@@ -38,6 +38,8 @@ from numbers import Real
 import torch
 import torch.nn as nn
 
+from llmtuner.models.common.aux_loss import in_checkpoint_recompute
+
 from .experts import RoutedExperts
 from .routing import QuantileBalancedTopKRouter, TokenChoiceTopKRouter
 
@@ -93,6 +95,19 @@ class MoE(nn.Module):
             raise ValueError(
                 f"MoE num_experts ({num_experts}) must match router.num_experts "
                 f"({router.num_experts})"
+            )
+        dispatcher = routed_experts.token_dispatcher
+        if dispatcher is None:
+            raise ValueError("MoE routed experts require a token dispatcher")
+        if dispatcher.num_experts != num_experts:
+            raise ValueError(
+                "MoE dispatcher.num_experts must match router.num_experts; "
+                f"got {dispatcher.num_experts} and {num_experts}"
+            )
+        if dispatcher.top_k != router.top_k:
+            raise ValueError(
+                "MoE dispatcher.top_k must match router.top_k; "
+                f"got {dispatcher.top_k} and {router.top_k}"
             )
         self.routed_experts = routed_experts
         self.router = router
@@ -151,9 +166,7 @@ class MoE(nn.Module):
         is sign-based and then mean-centred:
 
         * the sign makes the step size independent of how lopsided the load is,
-          so a single runaway expert cannot dominate the update -- and it is
-          also what makes the doubled count from activation checkpointing
-          harmless, since ``sign`` of a scaled value is the same sign;
+          so a single runaway expert cannot dominate the update;
         * centring keeps ``sum(expert_bias_E) == 0``, so the bias shifts which
           experts win without shifting the routed output as a whole.
 
@@ -234,13 +247,10 @@ class MoE(nn.Module):
         ) = self.router(x_TD, self.expert_bias_E, padding_mask_T=padding_mask_T)
         num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
 
-        if self.training:
+        if self.training and not in_checkpoint_recompute.get():
             with torch.no_grad():
-                # NOTE: activation checkpointing runs the forward twice, so this
-                # counts a token twice on recompute (the mask is stable across
-                # the replay, so both passes filter identically). The bias
-                # update uses sign() and the quantile histogram is uniformly
-                # scaled, so the doubled count changes neither.
+                # Count the original forward only: selective replay and early
+                # stopping need not replay every microbatch equally.
                 # The padding-filtered map is what is counted: padding tokens
                 # are dispatched and computed, but they carry no loss, so they
                 # must not steer the bias.

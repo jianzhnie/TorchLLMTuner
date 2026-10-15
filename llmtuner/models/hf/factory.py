@@ -108,6 +108,7 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
     # Same ride for the lm_head compute-dtype cast: the wrapper applies it at
     # build time, and None (the default) means no cast.
     config.compute_dtype = getattr(cfg, "compute_dtype", None)
+    config.norm_backend = cfg.norm_backend
     return config
 
 
@@ -124,7 +125,12 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
     text_config._attn_implementation = ATTENTION_BACKEND
     # Runtime settings originate on the composite config. The text model must
     # see the same mask policy and kernels after unwrapping.
-    for name in ("attn_mask_type", "experts_implementation", "compute_dtype"):
+    for name in (
+        "attn_mask_type",
+        "experts_implementation",
+        "compute_dtype",
+        "norm_backend",
+    ):
         if hasattr(config, name):
             setattr(text_config, name, getattr(config, name))
     if not getattr(text_config, "architectures", None):

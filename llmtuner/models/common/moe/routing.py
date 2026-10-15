@@ -13,11 +13,15 @@ Shape legend, scoped to this file: ``T`` = tokens, ``D`` = model dimension,
 
 from __future__ import annotations
 
+import math
+from numbers import Real
 from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from llmtuner.models.common.aux_loss import in_checkpoint_recompute
 
 from .gate import RouterGateLinear
 
@@ -86,6 +90,18 @@ class TokenChoiceTopKRouter(nn.Module):
             raise ValueError("top_k must be in [1, num_experts]")
         if score_func not in ("sigmoid", "softmax", "sqrtsoftplus"):
             raise ValueError(f"Unknown score function {score_func}")
+        if (
+            not isinstance(route_scale, Real)
+            or isinstance(route_scale, bool)
+            or not math.isfinite(route_scale)
+        ):
+            raise ValueError("route_scale must be a finite real number")
+        for name, value in (
+            ("route_norm", route_norm),
+            ("_debug_force_load_balance", _debug_force_load_balance),
+        ):
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be bool")
         if num_expert_groups is None and num_limited_groups is not None:
             raise ValueError("num_limited_groups requires num_expert_groups")
         if num_expert_groups is not None:
@@ -451,7 +467,7 @@ class QuantileBalancer(nn.Module):
         Padding tokens are filtered out first: a bias estimated from tokens
         that carry no loss would balance the wrong distribution.
         """
-        if not self.training:
+        if not self.training or in_checkpoint_recompute.get():
             return
         if padding_mask_T is not None:
             valid_mask_T = ~padding_mask_T

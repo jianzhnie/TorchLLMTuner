@@ -47,6 +47,17 @@ def materialize_meta_model(model: nn.Module, device: torch.device) -> None:
             if name in {"inv_freq", "original_inv_freq"}:
                 restored_buffers[module, name] = value
 
+    # A recognized buffer may have arbitrary registered aliases, including
+    # in other modules. Reconstruct the physical tensor once and resolve all
+    # its buffer paths before rejecting unknown non-persistent storage.
+    for paths in tensor_paths.values():
+        restored_paths = [path for path in paths if path in restored_buffers]
+        if restored_paths:
+            value = restored_buffers[restored_paths[0]]
+            for module, name in paths:
+                if name in module._buffers:
+                    restored_buffers[module, name] = value
+
     unresolved = [
         f"{type(module).__name__}.{name}"
         for module, name in meta_buffers

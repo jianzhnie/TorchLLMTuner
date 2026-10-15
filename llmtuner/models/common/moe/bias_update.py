@@ -81,13 +81,40 @@ def update_expert_bias(
     """
     if not moe_layers:
         return
-    counts = _reduce_token_statistics(
-        [moe.tokens_per_expert_E for moe in moe_layers], parallel_dims
-    )
+    # A shared bias has one update owner, even across distinct MoE modules.
+    # Validate ownership before communication or any mutation.
+    unique_layers = list({id(moe): moe for moe in moe_layers}.values())
+    groups: dict[int, list[int]] = {}
+    for index, moe in enumerate(unique_layers):
+        key = id(moe.expert_bias_E) if moe.expert_bias_E is not None else id(moe)
+        groups.setdefault(key, []).append(index)
+    for indices in groups.values():
+        coefficient = unique_layers[indices[0]].load_balance_coeff
+        if any(unique_layers[i].load_balance_coeff != coefficient for i in indices):
+            raise ValueError("Shared expert bias requires identical load_balance_coeff")
 
-    for moe, counts_E in zip(moe_layers, counts, strict=True):
-        moe.tokens_per_expert_E.copy_(counts_E)
-        moe.update_expert_bias()
+    counts = _reduce_token_statistics(
+        [moe.tokens_per_expert_E for moe in unique_layers], parallel_dims
+    )
+    for indices in groups.values():
+        owner = unique_layers[indices[0]]
+        seen_counts: set[int] = set()
+        contributions = []
+        for index in indices:
+            counter_id = id(unique_layers[index].tokens_per_expert_E)
+            if counter_id not in seen_counts:
+                contributions.append(counts[index])
+                seen_counts.add(counter_id)
+        combined = (
+            contributions[0]
+            if len(contributions) == 1
+            else torch.stack(contributions).sum(0)
+        )
+        owner.tokens_per_expert_E.copy_(combined)
+        owner.update_expert_bias()
+        if owner.load_balance_coeff is not None and owner.expert_bias_E is not None:
+            for index in indices[1:]:
+                unique_layers[index].tokens_per_expert_E.zero_()
 
 
 @torch.no_grad()
@@ -112,18 +139,44 @@ def update_quantile_expert_bias(
     """
     if not moe_layers:
         return
+    unique_layers = list({id(moe): moe for moe in moe_layers}.values())
+    groups: dict[int, list[int]] = {}
+    for index, moe in enumerate(unique_layers):
+        groups.setdefault(id(moe.expert_bias_E), []).append(index)
+    for indices in groups.values():
+        owner = unique_layers[indices[0]].router.quantile_balancer
+        policy = (owner.num_experts, owner.top_k, owner.num_bins)
+        for index in indices[1:]:
+            other = unique_layers[index].router.quantile_balancer
+            if (other.num_experts, other.top_k, other.num_bins) != policy:
+                raise ValueError(
+                    "Shared quantile bias requires identical histogram policy"
+                )
     histograms = [
-        moe.router.quantile_balancer.required_bias_histogram_EB for moe in moe_layers
+        moe.router.quantile_balancer.required_bias_histogram_EB for moe in unique_layers
     ]
     reduced_histograms = _reduce_token_statistics(histograms, parallel_dims)
-
-    for moe, histogram_EB in zip(moe_layers, reduced_histograms, strict=True):
-        quantile_balancer = moe.router.quantile_balancer
-        moe.expert_bias_E.copy_(
-            quantile_balancer.estimate_expert_bias(histogram_EB, moe.expert_bias_E)
+    for indices in groups.values():
+        owner = unique_layers[indices[0]]
+        seen_histograms: set[int] = set()
+        contributions = []
+        for index in indices:
+            if id(histograms[index]) not in seen_histograms:
+                contributions.append(reduced_histograms[index])
+                seen_histograms.add(id(histograms[index]))
+        combined = (
+            contributions[0]
+            if len(contributions) == 1
+            else torch.stack(contributions).sum(0)
         )
-        quantile_balancer.required_bias_histogram_EB.zero_()
-        moe.tokens_per_expert_E.zero_()
+        owner.expert_bias_E.copy_(
+            owner.router.quantile_balancer.estimate_expert_bias(
+                combined, owner.expert_bias_E
+            )
+        )
+        for index in indices:
+            histograms[index].zero_()
+            unique_layers[index].tokens_per_expert_E.zero_()
 
 
 def register_moe_balancing_hook(

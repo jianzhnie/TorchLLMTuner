@@ -12,9 +12,9 @@ import os
 from typing import Any
 
 import torch.distributed as dist
-from torch.distributed.checkpoint import HuggingFaceStorageReader
 
 from ...components.checkpointer.checkpoint_keys import SAFETENSORS_INDEX
+from ...components.checkpointer.hf_storage import IndexedHuggingFaceStorageReader
 
 
 class HFTransformerStateDictAdapter:
@@ -114,10 +114,10 @@ class HFTransformerStateDictAdapter:
         *,
         from_quantized: bool = False,
         thread_count: int | None = None,
-    ) -> HuggingFaceStorageReader:
+    ) -> IndexedHuggingFaceStorageReader:
         if from_quantized:
             raise NotImplementedError("Quantized HF checkpoints are not supported")
         if thread_count is None:
             # Two workers overlap shard reads without heavy storage pressure.
             thread_count = 2
-        return HuggingFaceStorageReader(path, thread_count=thread_count)
+        return IndexedHuggingFaceStorageReader(path, thread_count=thread_count)

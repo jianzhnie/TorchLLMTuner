@@ -71,6 +71,7 @@ from .model_setup import (
     apply_cast_lm_head,
     configure_experts_implementation,
     resolve_submodule_name,
+    stabilize_residual_norm_gradients,
     validate_head_config,
 )
 
@@ -102,6 +103,7 @@ class HFTransformerModel(nn.Module):
         model_cls = resolve_model_class(config)
         configure_experts_implementation(config, model_cls=model_cls)
         self.model = model_cls(config=config)
+        stabilize_residual_norm_gradients(self.model)
         self.model.config._attn_implementation = config._attn_implementation
 
         apply_cast_lm_head(self.model, config)
@@ -486,6 +488,23 @@ class HFTransformerModel(nn.Module):
             )
             inputs = input_dict.input_ids
         else:
+            # This wrapper calls a text decoder, with no vision encoder or
+            # media/three-axis RoPE input path. Never train on placeholders
+            # while silently discarding the media they describe.
+            for field in (
+                "pixel_values",
+                "pixel_values_videos",
+                "grid_thw",
+                "grid_thw_videos",
+                "mrope_positions",
+            ):
+                if input_dict.get(field) is not None:
+                    raise UnsupportedCombinationError(
+                        f"HFTransformerModel cannot consume {field}: its text "
+                        "decoder does not implement multimodal inputs. Use a "
+                        "text dataset or a model adapter that consumes media "
+                        "and its positional metadata."
+                    )
             # Packed stream: the collator already shifted and masked the labels
             # at every document boundary, so for this path the shift is a read.
             inputs, labels = input_dict["input"], input_dict["labels"]
@@ -718,8 +737,8 @@ class HFTransformerModel(nn.Module):
 
         # Stage the padding mask on every MoE block -- including ``None``, so
         # a mask from a previous microbatch can never survive into this one.
-        # The staged mask then persists until this line re-stages it, so an
-        # activation-checkpointing recompute sees the same mask.
+        # Full/selective checkpoint contexts retain each forward's mask for
+        # replay even when another microbatch re-stages these blocks.
         for moe in collect_moe_layers(self):
             moe.set_padding_mask(padding_mask)
 

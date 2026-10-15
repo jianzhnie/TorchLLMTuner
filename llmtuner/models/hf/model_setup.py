@@ -10,6 +10,76 @@ from ...utils.dtypes import get_dtype
 from ..common.cast_linear import build_cast_linear
 
 
+def _isolate_norm_input(module, args, kwargs):
+    if args:
+        value = args[0]
+        return (value.view_as(value), *args[1:]), kwargs
+    value = kwargs["hidden_states"]
+    return args, {**kwargs, "hidden_states": value.view_as(value)}
+
+
+def stabilize_residual_norm_gradients(model: nn.Module) -> None:
+    """Give known Qwen3 residual norms a shared-storage gradient merge boundary.
+
+    Without the view, eager may accumulate the residual between RMSNorm's two
+    backward contributions. AOT instead sums those contributions inside its
+    graph. The view makes both merge the norm gradient before the residual,
+    without copying activation data or changing parameters and checkpoint keys.
+    Apply at construction in both execution modes, before parallel transforms.
+    """
+    model_type = getattr(model.config, "model_type", None)
+    backend = getattr(model.config, "norm_backend", "native")
+    if backend not in ("native", "aten"):
+        raise ValueError("model.norm_backend must be 'native' or 'aten'")
+    if backend == "aten" and model_type not in ("qwen3", "qwen3_moe"):
+        raise ValueError("model.norm_backend='aten' requires qwen3 or qwen3_moe")
+    if model_type == "qwen3":
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+
+        norm_type = Qwen3RMSNorm
+    elif model_type == "qwen3_moe":
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
+
+        norm_type = Qwen3MoeRMSNorm
+    else:
+        return
+    # Remove only adaptations owned here when reapplying construction setup.
+    # User hooks and instance-specific forward implementations remain intact.
+    for module in model.modules():
+        if type(module) is not norm_type:
+            continue
+        for key, hook in list(module._forward_pre_hooks.items()):
+            if hook is _isolate_norm_input:
+                del module._forward_pre_hooks[key]
+                module._forward_pre_hooks_with_kwargs.pop(key, None)
+        if (
+            backend == "native"
+            and "forward" in module.__dict__
+            and getattr(module.forward, "__module__", None)
+            == f"{__package__}.normalization"
+        ):
+            from .normalization import forward_aten_rms_norm
+
+            if getattr(module.forward, "__func__", None) is forward_aten_rms_norm:
+                del module.forward
+    if backend == "aten":
+        from types import MethodType
+
+        from .normalization import forward_aten_rms_norm
+
+        for module in model.modules():
+            if type(module) is norm_type:
+                module.forward = MethodType(forward_aten_rms_norm, module)
+        return
+    for layer in model.model.layers:
+        for name in ("input_layernorm", "post_attention_layernorm"):
+            norm = getattr(layer, name, None)
+            if type(norm) is norm_type and _isolate_norm_input not in (
+                norm._forward_pre_hooks.values()
+            ):
+                norm.register_forward_pre_hook(_isolate_norm_input, with_kwargs=True)
+
+
 def resolve_submodule_name(
     module: nn.Module, names: tuple[str, ...], *, component: str
 ) -> str:

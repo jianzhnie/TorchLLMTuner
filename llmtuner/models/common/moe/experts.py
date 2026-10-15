@@ -36,7 +36,6 @@ if TYPE_CHECKING:
     from ....parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
 __all__ = [
-    "DominoRoutedExperts",
     "GroupedExperts",
     "RoutedExperts",
 ]
@@ -221,40 +220,3 @@ class RoutedExperts(nn.Module):
             metadata,
             x_TD,
         )
-
-
-class DominoRoutedExperts(RoutedExperts):
-    """Run routing and expert computation in two token slices.
-
-    Each slice owns its dispatch metadata through combine, so variable all to
-    all receive sizes cannot leak between slices. This is the semantic core of
-    FSDPTurbo Domino and is valid on every c10d backend; accelerator stream
-    overlap can be added without changing the module or checkpoint contract.
-    """
-
-    def forward(
-        self,
-        x_TD: torch.Tensor,
-        topk_scores_TK: torch.Tensor,
-        topk_expert_ids_TK: torch.Tensor,
-        num_local_tokens_per_expert_E: torch.Tensor,
-    ) -> torch.Tensor:
-        del num_local_tokens_per_expert_E
-        # Every rank executes both exchanges, including ranks with zero or
-        # one token. Rank-local early returns would strand their peers.
-        split_at = (x_TD.shape[0] + 1) // 2
-        outputs: list[torch.Tensor] = []
-        for token_slice in (slice(0, split_at), slice(split_at, None)):
-            slice_input_TD = x_TD[token_slice]
-            slice_scores_TK = topk_scores_TK[token_slice]
-            slice_expert_ids_TK = topk_expert_ids_TK[token_slice]
-            slice_counts_E = torch.bincount(
-                slice_expert_ids_TK.reshape(-1),
-                minlength=self.token_dispatcher.num_experts,
-            )
-            outputs.append(
-                super().forward(
-                    slice_input_TD, slice_scores_TK, slice_expert_ids_TK, slice_counts_E
-                )
-            )
-        return torch.cat(outputs, dim=0)
