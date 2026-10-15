@@ -178,6 +178,10 @@ class LLMTunerConfig:
         return self.model.experts_implementation
 
     @property
+    def norm_backend(self) -> str:
+        return self.model.norm_backend
+
+    @property
     def compute_dtype(self) -> str | None:
         return self.model.compute_dtype
 

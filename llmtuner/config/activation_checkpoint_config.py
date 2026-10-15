@@ -18,6 +18,13 @@ VALID_AC_MODES: tuple[str, ...] = (
 "Accepted activation-checkpointing modes."
 
 
+def _validate_patterns(value: list[str], *, field_name: str) -> None:
+    if not isinstance(value, list) or any(
+        not isinstance(pattern, str) or not pattern.strip() for pattern in value
+    ):
+        raise ConfigError(f"{field_name} must be a list of nonempty strings")
+
+
 @dataclass(kw_only=True)
 class SelectiveACConfig:
     """Settings for ``activation_checkpoint_mode='selective'``."""
@@ -55,6 +62,14 @@ class SelectiveACConfig:
     )
 
     def __post_init__(self) -> None:
+        _validate_patterns(
+            self.force_recompute_mm_shapes_by_fqns,
+            field_name="selective_ac.force_recompute_mm_shapes_by_fqns",
+        )
+        for name in ("preserve_rng_state", "debug"):
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                raise ConfigError(f"selective_ac.{name} must be bool, got {value!r}")
         if self.debug:
             raise ConfigError(
                 "selective_ac.debug must stay False: PyTorch checkpoint "
@@ -83,10 +98,15 @@ class MemoryBudgetACConfig:
     )
 
     def __post_init__(self) -> None:
-        if not 0 <= self.memory_budget <= 1:
+        if (
+            isinstance(self.memory_budget, bool)
+            or not isinstance(self.memory_budget, int | float)
+            or not 0 <= self.memory_budget <= 1
+        ):
             raise ConfigError(
-                "memory_budget_ac.memory_budget must be between 0 and 1, got "
-                f"{self.memory_budget}"
+                "memory_budget_ac.memory_budget must be between 0 and 1 "
+                "(numeric, excluding bool), "
+                f"got {self.memory_budget!r}"
             )
 
 
@@ -127,6 +147,13 @@ class RegionACConfig:
     )
 
     def __post_init__(self) -> None:
+        for name in ("save_regions", "recompute_regions"):
+            _validate_patterns(getattr(self, name), field_name=f"region_ac.{name}")
+        if not isinstance(self.preserve_rng_state, bool):
+            raise ConfigError(
+                "region_ac.preserve_rng_state must be bool, "
+                f"got {self.preserve_rng_state!r}"
+            )
         if self.determinism_check not in ("default", "none"):
             raise ConfigError(
                 "region_ac.determinism_check must be 'default' or 'none', got "

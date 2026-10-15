@@ -39,3 +39,8 @@ class CompileConfig:
         for name in ("per_block", "enable_async_tensor_parallel"):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigError(f"compile.{name} must be a boolean.")
+        if self.enable_async_tensor_parallel and self.backend != "inductor":
+            raise ConfigError(
+                "compile.enable_async_tensor_parallel requires backend='inductor': "
+                "the TP micro-pipeline pass runs in Inductor's post-grad pipeline."
+            )

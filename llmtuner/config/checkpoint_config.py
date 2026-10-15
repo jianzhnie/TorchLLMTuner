@@ -27,7 +27,18 @@ class CheckpointConfig:
     """Whether to enable checkpointing."""
 
     folder: str = "checkpoint"
-    """Checkpoint folder, relative to the trainer dump folder."""
+    """Checkpoint folder, relative to the trainer dump folder.
+
+    Local native DCP rewrites use fresh shard generations and replace metadata
+    only after writing completes. Old and failed generations remain until the
+    step directory is purged, so repeated saves of one step consume extra disk.
+    Local HF exports similarly publish an index referring to fresh generation
+    shards. Native DCP supports local/file://, memory://, s3:// and gs:// paths;
+    object storage must atomically replace the entire metadata object. An error
+    after remote commit can leave the new generation published despite a failed
+    acknowledgement. S3/GCS transports still require deployment validation.
+    memory:// is limited to single-process synchronous or threaded saves.
+    """
 
     interval: int = 500
     """Checkpointing interval in steps."""
@@ -50,7 +61,11 @@ class CheckpointConfig:
     """Whether the initial Hugging Face checkpoint uses quantized keys."""
 
     last_save_model_only: bool = True
-    """Whether the final checkpoint contains only model state."""
+    """Whether the final checkpoint contains only model state.
+
+    If a resumable checkpoint already exists at the same step, final weights
+    are written to its ``model-export/`` child to preserve the training state.
+    """
 
     last_save_in_hf: bool = False
     """Whether the final model-only checkpoint uses Hugging Face safetensors."""
@@ -59,7 +74,11 @@ class CheckpointConfig:
     """Model dtype used by a final model-only checkpoint."""
 
     keep_latest_k: int = 10
-    """Number of recent checkpoints to retain, or zero to retain all."""
+    """Recent artifacts to retain per category, or zero to retain all.
+
+    Resumable training checkpoints and model-only exports have independent
+    limits, so a final export cannot evict the last training recovery point.
+    """
 
     purge_exempt: Callable[[int], bool] | None = None
     """Optional predicate that exempts checkpoint steps from purging.
