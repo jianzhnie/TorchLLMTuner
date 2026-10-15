@@ -31,6 +31,8 @@ import torch
 
 from llmtuner.errors import EnvironmentUnsupportedError
 
+from .device import get_current_device
+
 __all__ = ["CAPABILITIES", "has", "is_compiling", "require"]
 
 
@@ -116,7 +118,8 @@ def grouped_mm_runs() -> bool:
     test would be wrong on both counts and would go stale silently.
 
     The probe is necessarily approximate -- a shape that satisfies the op
-    need not be one a real layer uses. It is deliberately shaped like the
+    need not be one a real layer uses. It uses the selected training device and
+    transposed expert weights. It is deliberately shaped like the
     real call (``(T, K) @ (E, K, N)``, bf16, int32 offsets) so that it fails
     for the same reasons a real call would.
     """
@@ -124,10 +127,11 @@ def grouped_mm_runs() -> bool:
     if grouped_mm is None:
         return False
     try:
+        device = get_current_device()
         grouped_mm(
-            torch.zeros(8, 8, dtype=torch.bfloat16),
-            torch.zeros(2, 8, 8, dtype=torch.bfloat16),
-            offs=torch.tensor([4, 8], dtype=torch.int32),
+            torch.zeros(8, 8, dtype=torch.bfloat16, device=device),
+            torch.zeros(2, 8, 8, dtype=torch.bfloat16, device=device).transpose(-2, -1),
+            offs=torch.tensor([4, 8], dtype=torch.int32, device=device),
         )
     except Exception:
         return False

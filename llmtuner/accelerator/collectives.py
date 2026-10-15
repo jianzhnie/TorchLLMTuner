@@ -31,7 +31,8 @@ The single non-obvious line kept from upstream is the ``DTensor`` branch in
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import timedelta
 
 import torch
@@ -218,6 +219,12 @@ def clip_grad_norm_(
         norm = torch.nn.utils.get_total_norm(grads, norm_type, False, foreach)
         if isinstance(norm, DTensor):
             norm = norm.full_tensor()
+        # Squaring a finite fp16 norm (e.g. 300) already overflows. Mesh
+        # accumulation must use at least fp32 before taking p-th powers.
+        if (
+            pp_mesh is not None or tp_mesh is not None or ep_mesh is not None
+        ) and norm.dtype in (torch.float16, torch.bfloat16):
+            norm = norm.float()
         return norm
 
     if tp_mesh is not None or ep_mesh is not None:
@@ -228,7 +235,11 @@ def clip_grad_norm_(
         # collective, including a PP stage with no expert or TP weight grads.
         device = next(
             (p.grad.device for p in parameters if p.grad is not None),
-            parameters[0].device if parameters else dense_norm.device,
+            parameters[0].device
+            if parameters
+            else get_comm_device(
+                (tp_mesh if tp_mesh is not None else ep_mesh).get_group()
+            ),
         )
         dense_norm = dense_norm.to(device)
         tp_norm = tp_norm.to(device)
@@ -269,6 +280,15 @@ def clip_grad_norm_(
         total_norm = total_norm.full_tensor()
 
     if pp_mesh is not None:
+        # Empty gradient lists produce a CPU zero; NCCL/HCCL still require
+        # this stage to participate using its parameter device.
+        device = next(
+            (p.grad.device for p in parameters if p.grad is not None),
+            parameters[0].device
+            if parameters
+            else get_comm_device(pp_mesh.get_group()),
+        )
+        total_norm = total_norm.to(device)
         if math.isinf(norm_type):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
         else:
@@ -360,6 +380,35 @@ def all_reduce(
         dist.all_reduce(data_on_device, op=_REDUCE_OPS[op], group=group)
 
     move_tensor_tree(data_on_device, input_device, out=data)
+
+
+@contextmanager
+def synchronize_local_errors(
+    phase: str, *, group: dist.ProcessGroup | None = None
+) -> Iterator[None]:
+    """Coordinate a rank-local phase before peers enter subsequent collectives.
+
+    Every group member must enter in the same order. The body must not contain
+    collectives: this boundary cannot recover blocked/killed peers or a failure
+    inside communication. Local exceptions retain their identity and traceback;
+    successful peers receive a RuntimeError naming the failed phase.
+    """
+    error: Exception | None = None
+    try:
+        yield
+    except Exception as caught:
+        error = caught
+    ready = error is None
+    if get_world_size(group) > 1:
+        status = torch.tensor(
+            int(ready), device=get_comm_device(group), dtype=torch.int32
+        )
+        all_reduce(status, op="min", group=group)
+        ready = bool(status.item())
+    if not ready:
+        if error is not None:
+            raise error
+        raise RuntimeError(f"{phase} failed on another rank")
 
 
 class PartialToInvariantAllReduce(torch.autograd.Function):
