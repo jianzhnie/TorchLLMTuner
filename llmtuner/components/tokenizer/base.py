@@ -23,10 +23,16 @@ class BaseTokenizer(ABC):
         self._chat_template = None
 
     @abstractmethod
-    def encode(self, *args, **kwargs) -> list[int]: ...
+    def encode(
+        self,
+        text: str,
+        *,
+        add_bos: bool | None = None,
+        add_eos: bool | None = None,
+    ) -> list[int]: ...
 
     @abstractmethod
-    def decode(self, *args, **kwargs) -> str: ...
+    def decode(self, token_ids: list[int], **kwargs: Any) -> str: ...
 
     @abstractmethod
     def get_vocab_size(self) -> int: ...

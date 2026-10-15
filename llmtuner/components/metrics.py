@@ -74,7 +74,7 @@ if TYPE_CHECKING:
     # Annotation-only. ``parallel_dims`` imports the training config, which
     # imports the checkpointer, so importing it for real here would close a
     # cycle back into the components package that only exists to name a type.
-    from ..config import MetricsConfig
+    from ..config.observability_config import MetricsConfig
     from ..parallel.topology import ParallelTopology
 
 # llmtuner configures handlers per module, rather than on the root logger the
@@ -385,7 +385,7 @@ class MetricsProcessor:
         pp_schedule: the pipeline schedule name, which decides the metrics rank.
         num_flops_per_token: model FLOPs per token, used for tflops and MFU. The
             caller sets this once the model exists. ``0`` -- the value
-            :func:`~llmtuner.models.hf.factory.num_flops_per_token` returns for a
+            :func:`~llmtuner.models.hf.flops.flops_per_token` returns for a
             config whose geometry it cannot read -- suppresses MFU rather than
             reporting ``0.00%``; ``tflops`` is then ``0.0`` of its own accord.
         config_dict: the full job config, handed to wandb. Only wandb reads it.
@@ -404,6 +404,15 @@ class MetricsProcessor:
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
     ):
+        if (
+            isinstance(num_flops_per_token, bool)
+            or not isinstance(num_flops_per_token, int)
+            or num_flops_per_token < 0
+        ):
+            raise ValueError(
+                "num_flops_per_token must be a non-negative integer, "
+                f"got {num_flops_per_token!r}"
+            )
         self.config = config
         self.parallel_dims = parallel_dims
         self.logger = self._build_metric_logger(

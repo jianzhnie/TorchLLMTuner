@@ -1,7 +1,9 @@
 """Checkpoint path-operation contract and filesystem implementation.
 
-This module stays independent of checkpoint managers and distributed engines.
-Filesystem operations use local paths or lazily resolved fsspec URIs.
+Managers share directory discovery and retention through CheckpointStorage,
+independently of the engine that reads and writes checkpoint tensors.
+FilesystemCheckpointStorage delegates to filesystem.py for local paths and
+lazily resolved fsspec URIs.
 """
 
 from __future__ import annotations

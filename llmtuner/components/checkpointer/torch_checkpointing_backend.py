@@ -57,7 +57,7 @@ from ...utils.garbage_collection import GarbageCollection
 from . import filesystem
 
 if TYPE_CHECKING:
-    from ...config import CheckpointConfig
+    from ...config.checkpoint_config import CheckpointConfig
 
 from ...utils.logging import get_logger
 from .base import (

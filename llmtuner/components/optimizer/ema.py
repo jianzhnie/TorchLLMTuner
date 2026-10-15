@@ -1,47 +1,18 @@
-"""Online EMA of model weights, driven as a gradient-free pseudo-optimizer.
+"""Maintain EMA weights with the optimizer container's FQN checkpoint format.
 
-Vendored from torchtitan's ``components/optimizer/ema.py``. ``EMA`` subclasses
-``OptimizersContainer`` -- it is never a real training optimizer -- to reuse its
-flat, FQN-keyed, resharding-safe ``state_dict()``/``load_state_dict()``: the EMA
-checkpoint key (``ema``) therefore has exactly the layout optimizer state
-already follows (``state.{fqn}.ema_params``), which is what lets DCP reshard it
-across world sizes with no bespoke format.
+Adapted from torchtitan ``components/optimizer/ema.py``. EMA is a sibling of the
+training optimizer: the trainer calls ``step(current_step)`` explicitly, and
+DCP saves the averages as ``state.{fqn}.ema_params``.
 
-Semantics, kept from upstream:
+The tracked scope is fixed at construction: trainable parameters and selected
+floating-point or complex buffers. Updates validate tensor identity before
+changing any average. Dynamic decay derives its firing count from the trainer
+step, so checkpoint resume preserves aging without a separate EMA counter.
+Loading an empty state reseeds all averages from the restored model.
 
-* **Update.** On every firing, ``ema = decay * ema + (1 - decay) * param``,
-  implemented as ``torch._foreach_lerp_(ema_params, params, 1 - decay)``.
-* **Decay.** Either fixed (``decay``), or dynamic (the default): with
-  ``num_updates`` the count of firings so far,
-  ``decay = 2 ** (-1 / (half_life_fraction * num_updates))``, which keeps
-  roughly the most recent ``half_life_fraction`` share of updates dominant.
-  The count is *derived from the trainer step* rather than stored, so the
-  schedule survives a checkpoint resume: only ``ema_params`` are checkpointed,
-  and a stored counter would restart at 0, collapsing the decay to a full
-  overwrite of the restored average on the first firing after a resume.
-* **Tracked set.** Parameters with ``requires_grad`` at construction time, plus
-  the floating-point buffers matched by ``buffer_patterns`` (e.g. an MoE's
-  ``expert_bias_E``, updated by a non-gradient heuristic). The set is keyed by
-  tensor identity and fixed at construction: a parameter or buffer that appears
-  or is replaced afterwards raises rather than silently going unaveraged.
-* **Cold start.** ``load_state_dict({})`` reseeds the average from the live
-  model weights. The checkpointer calls this when a load restored the model
-  but not the EMA (an ``exclude_from_loading=["ema"]`` load, or a model-only
-  load), which is also the path for turning EMA on mid-run against a checkpoint
-  that predates it.
-
-Departures from upstream, all subtractions:
-
-* **No ``Configurable``.** The knobs are explicit constructor arguments; their
-  validation lives in ``llmtuner.config.EMAConfig``, where every llmtuner
-  config lives, and the trainer passes the fields across.
-* **No ``offload_to_cpu``.** Upstream's offload path is a CUDA side-stream
-  H2D/D2H pipeline over pinned memory, tuned for GH200's NVLink-C2C. llmtuner
-  runs CPU and NPU, has no use for it, and cannot exercise it in this
-  environment, so it is not ported; the EMA tensors simply live where the
-  parameters live. With it go the DTensor unwrap/rewrap dance at save/load --
-  the inherited container state dict hands DCP the live ``ema_params`` tensors,
-  which under FSDP2 are DTensors already.
+Configuration is passed as constructor arguments instead of upstream's
+Configurable interface. Averages stay on their tensors' devices; the upstream
+CUDA side-stream CPU offload path is not implemented.
 """
 
 import re
@@ -52,8 +23,9 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 
+from ...config.ema_config import validate_ema_schedule
 from ...utils.logging import get_logger
-from ..checkpointer.checkpoint_keys import canonical_fqn
+from ...utils.module_names import canonical_fqn
 from .optimizer import OptimizersContainer
 
 __all__ = ["EMA"]
@@ -74,6 +46,11 @@ class EMAParamOptimizer(Optimizer):
     def __init__(self, named_tensors: Sequence[tuple[str, torch.Tensor]]) -> None:
         tensors = [t for _, t in named_tensors]
         names = [canonical_fqn(name) for name, _ in named_tensors]
+        if len(names) != len(set(names)):
+            raise ValueError(
+                "EMA tensor FQNs collide after wrapper removal: "
+                f"{[name for name, _ in named_tensors]}"
+            )
         super().__init__([{"params": tensors, "param_names": names}], {})
         for t in tensors:
             self.state[t]["ema_params"] = t.detach().clone()
@@ -132,40 +109,54 @@ class EMA(OptimizersContainer):
         self.start_step = start_step
         self.step_bias = step_bias
         self.update_every_n_steps = update_every_n_steps
+        validate_ema_schedule(self)
+        self._buffer_patterns = [re.compile(pattern) for pattern in buffer_patterns]
         # The tracked scope is fixed; caller-owned list edits must not detach
         # model parts from the optimizer groups constructed below.
         self.model_parts = list(model_parts)
 
-        self._param_optimizers: list[EMAParamOptimizer] = []
-        all_params: list[nn.Parameter] = []
-        for model in model_parts:
-            named_params = [
-                (name, p) for name, p in model.named_parameters() if p.requires_grad
+        buffer_groups = (
+            [
+                [
+                    (name, buffer)
+                    for name, buffer in model.named_buffers()
+                    if any(pattern.search(name) for pattern in self._buffer_patterns)
+                ]
+                for model in self.model_parts
             ]
-            self._param_optimizers.append(EMAParamOptimizer(named_params))
-            all_params.extend(p for _, p in named_params)
-        self._validate_params(all_params)
+            if self._buffer_patterns
+            else []
+        )
+        for named_buffers in buffer_groups:
+            for name, buffer in named_buffers:
+                if not (torch.is_floating_point(buffer) or torch.is_complex(buffer)):
+                    raise ValueError(
+                        f"EMA buffer_patterns matched buffer {name!r} of "
+                        f"dtype {buffer.dtype}. Only floating-point and complex "
+                        "buffers can be averaged: an integer or boolean "
+                        "average has to be rounded back into the buffer's "
+                        "dtype, which freezes it once the per-step increment "
+                        "falls below one."
+                    )
 
-        self._buffer_patterns = [re.compile(p) for p in buffer_patterns]
+        parameter_groups = [
+            [
+                (name, parameter)
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            ]
+            for model in self.model_parts
+        ]
+        all_params = [parameter for group in parameter_groups for _, parameter in group]
+        self._validate_params(all_params)
+        self._param_optimizers = [
+            EMAParamOptimizer(group) for group in parameter_groups
+        ]
+
         self._buffer_optimizers: list[EMAParamOptimizer] = []
         if self._buffer_patterns:
             total_matched = 0
-            for model in model_parts:
-                named_buffers = [
-                    (name, b)
-                    for name, b in model.named_buffers()
-                    if any(p.search(name) for p in self._buffer_patterns)
-                ]
-                for name, b in named_buffers:
-                    if not (torch.is_floating_point(b) or torch.is_complex(b)):
-                        raise ValueError(
-                            f"EMA buffer_patterns matched buffer {name!r} of "
-                            f"dtype {b.dtype}. Only floating-point and complex "
-                            "buffers can be averaged: an integer or boolean "
-                            "average has to be rounded back into the buffer's "
-                            "dtype, which freezes it once the per-step increment "
-                            "falls below one."
-                        )
+            for named_buffers in buffer_groups:
                 total_matched += len(named_buffers)
                 self._buffer_optimizers.append(EMAParamOptimizer(named_buffers))
             if total_matched == 0:
@@ -202,7 +193,7 @@ class EMA(OptimizersContainer):
                 ", ".join(low_precision),
             )
 
-        self._post_init(all_params)
+        self._initialize_optimizer_interface(all_params)
 
     def zero_grad(self, *args, **kwargs) -> None:
         pass  # never called by the training loop; no-op for safety
@@ -214,6 +205,12 @@ class EMA(OptimizersContainer):
         """Call directly with the trainer's global step -- never merged into
         the optimizer container, so there is no closure/zero-arg step() to
         honor."""
+        if (
+            not isinstance(current_step, int)
+            or isinstance(current_step, bool)
+            or current_step < 0
+        ):
+            raise ValueError("EMA current_step must be a nonnegative integer")
         elapsed = current_step - self.start_step
         if elapsed <= 0 or elapsed % self.update_every_n_steps != 0:
             return
@@ -224,23 +221,19 @@ class EMA(OptimizersContainer):
         # overwrite of the restored EMA. step_bias is added after the division
         # so its value is never truncated by update_every_n_steps.
         num_updates = elapsed // self.update_every_n_steps + self.step_bias
-        self._update(num_updates)
+        decay = (
+            self.decay
+            if self.decay is not None
+            else 2.0 ** (-1.0 / (self.half_life_fraction * num_updates))
+        )
+        for averages, tensors in self._tracked_groups():
+            if tensors:
+                torch._foreach_lerp_(averages, tensors, 1.0 - decay)
 
-    def _decay_at(self, num_updates: int) -> float:
-        if self.decay is not None:
-            return self.decay
-        return 2.0 ** (-1.0 / (self.half_life_fraction * num_updates))
-
-    # TODO: params/buffers are re-derived from the model on every firing
-    # (model.parameters()/model.named_buffers() + regex matching for
-    # buffers), even though the identical lists are already sitting in
-    # ema_opt.param_groups[0]["params"] from construction -- EMA state is
-    # already looked up by tensor identity, so identity (and thus this list)
-    # is already assumed stable across the run. Reusing param_groups[0]
-    # instead of recomputing would remove this per-step traversal/regex cost
-    # with no behavior change.
-    def _update(self, num_updates: int) -> None:
-        decay = self._decay_at(num_updates)
+    def _tracked_groups(
+        self,
+    ) -> list[tuple[list[torch.Tensor], list[torch.Tensor]]]:
+        """Validate all live tensor identities before an update or cold start."""
         groups: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
         for ema_opt, model in zip(
             self._param_optimizers, self.model_parts, strict=True
@@ -261,16 +254,14 @@ class EMA(OptimizersContainer):
                 if any(p.search(name) for p in self._buffer_patterns)
             ]
             groups.append((self._tracked_averages(ema_opt, buffers), buffers))
-        for averages, tensors in groups:
-            if tensors:
-                torch._foreach_lerp_(averages, tensors, 1.0 - decay)
+        return groups
 
     def _tracked_averages(
         self, ema_opt: EMAParamOptimizer, tensors: list[torch.Tensor]
     ) -> list[torch.Tensor]:
         """Resolve fixed-identity EMA state without inserting missing entries."""
         # State is keyed by tensor identity and the tracked set is fixed at
-        # construction (see the TODO on _update), so a tensor that appeared or
+        # construction, so a tensor that appeared or
         # was replaced since then has no entry. state is a defaultdict, so
         # indexing it here would insert an empty entry and fail later with a
         # bare KeyError("ema_params").
@@ -285,51 +276,33 @@ class EMA(OptimizersContainer):
                 "model after the EMA is constructed is not supported. Build "
                 "the EMA after the model is final."
             )
+        live_ids = {id(tensor) for tensor in tensors}
+        missing = sum(
+            id(tensor) not in live_ids
+            for group in ema_opt.param_groups
+            for tensor in group["params"]
+        )
+        if missing:
+            raise RuntimeError(
+                f"EMA tracked scope lost {missing} tensors. Removing or freezing "
+                "a tracked parameter, removing a tracked buffer, or renaming it "
+                "outside buffer_patterns after EMA construction is not supported. "
+                "Build the EMA after the model is final."
+            )
         return [ema_opt.state[t]["ema_params"] for t in tensors]
 
     # -- checkpointing ----------------------------------------------------------
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         if state_dict:
-            # ``Optimizer.load_state_dict`` replaces each param group with the
-            # loaded one, which drops ``param_names`` -- the extra key the flat
-            # save path (``get_flat_optim_state_dict``) reads the FQNs back
-            # from. Snapshot and reattach them so a load leaves the container
-            # saveable again. The DCP resume path never calls this (it writes
-            # into the tensors ``state_dict()`` reports), but the direct path
-            # must not corrupt the group.
-            param_names = [
-                [group["param_names"] for group in ema_opt.param_groups]
-                for ema_opt in self.optimizers
-            ]
             super().load_state_dict(state_dict)
-            for ema_opt, groups_names in zip(self.optimizers, param_names, strict=True):
-                for group, names in zip(
-                    ema_opt.param_groups, groups_names, strict=True
-                ):
-                    group["param_names"] = names
             return
         # The checkpoint had no EMA data (excluded via exclude_from_loading,
         # or predates this feature) -- cold-start from the just-loaded model
         # weights (and buffers, if buffer_patterns is set).
         # Resolve every group before copying: a stale model identity must not
         # partially overwrite the restored averages or insert empty states.
-        groups: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
-        for ema_opt, model in zip(
-            self._param_optimizers, self.model_parts, strict=True
-        ):
-            tensors = [p for p in model.parameters() if p.requires_grad]
-            groups.append((self._tracked_averages(ema_opt, tensors), tensors))
-        for ema_opt, model in zip(
-            self._buffer_optimizers, self.model_parts, strict=False
-        ):
-            tensors = [
-                b
-                for name, b in model.named_buffers()
-                if any(pattern.search(name) for pattern in self._buffer_patterns)
-            ]
-            groups.append((self._tracked_averages(ema_opt, tensors), tensors))
-        for averages, tensors in groups:
+        for averages, tensors in self._tracked_groups():
             for average, tensor in zip(averages, tensors, strict=True):
                 average.copy_(tensor.detach())
         logger.warning(

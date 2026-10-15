@@ -1,26 +1,28 @@
-"""Training optimizer services.
+"""Training optimizer services, loaded only when requested.
 
-``optimizer.py`` groups optimizers across model parts; ``state_dict.py``
-initializes and serializes optimizer state by parameter name.
-``lr_scheduler.py`` builds learning-rate schedules, and ``ema.py`` maintains
-checkpointable moving averages. The exports below form the public API.
+Parameter grouping lives in optimizer.py, state initialization and FQN
+serialization in state_dict.py, schedules in lr_scheduler.py, and EMA in ema.py.
+Implementation code imports the defining module directly.
 """
 
-from .ema import EMA
-from .lr_scheduler import LRSchedulersContainer, build_lr_scheduler
-from .optimizer import OptimizersContainer
-from .state_dict import (
-    get_flat_optim_state_dict,
-    init_optim_state,
-    load_flat_optim_state_dict,
-)
+from ...utils.lazy_exports import resolve_export
 
-__all__ = [
-    "EMA",
-    "LRSchedulersContainer",
-    "OptimizersContainer",
-    "build_lr_scheduler",
-    "get_flat_optim_state_dict",
-    "init_optim_state",
-    "load_flat_optim_state_dict",
-]
+_EXPORT_SOURCES = {
+    "EMA": "ema",
+    "LRSchedulersContainer": "lr_scheduler",
+    "OptimizersContainer": "optimizer",
+    "build_lr_scheduler": "lr_scheduler",
+    "get_flat_optim_state_dict": "state_dict",
+    "init_optim_state": "state_dict",
+    "load_flat_optim_state_dict": "state_dict",
+}
+
+__all__ = sorted(_EXPORT_SOURCES)
+
+
+def __getattr__(name: str):
+    return resolve_export(__name__, _EXPORT_SOURCES, name)
+
+
+def __dir__() -> list[str]:
+    return sorted(_EXPORT_SOURCES)

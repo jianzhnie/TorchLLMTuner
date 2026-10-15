@@ -1,29 +1,15 @@
-"""Loss functions: plain next-token CE, and its vocab-parallel form.
+"""Summed training losses and per-token log-probabilities.
 
-Vendored from torchtitan ``components/loss.py``. The arithmetic is unchanged.
-The functions are called directly rather than through the ``BaseLoss`` /
-``CrossEntropyLoss`` / ``MSELoss`` hierarchy, and the ``spmd.assert_type``
-annotations are gone -- llmtuner configures by argument and checks shapes, not
-SPMD types. Concretely, the vocab-parallel path is selected by comparing
-``pred.shape[-1]`` with ``global_vocab_size`` rather than by upstream's
-``spmd_mesh_size("tp") > 1``, which keeps a caller that has no SPMD context
-working and cannot disagree with the tensors in front of it.
+Adapted from torchtitan ``components/loss.py``. Callers normalize summed losses
+by the global valid-token count. Vocab-parallel CE uses local tensors and TP
+collectives; provide both the TP group and global vocabulary size to select it
+when the logits contain a vocabulary shard.
 
-Two names here are llmtuner's rather than upstream's: ``next_token_targets`` and
-``vocab_shard_bounds``. Nothing in torchtitan defines either. ``next_token_targets``
-is the row-wise label shift the trainer applies; ``vocab_shard_bounds`` is the
-bound formula lifted out of upstream's ``LossParallelCrossEntropy.forward`` so
-the vocab-parallel embedding and the vocab-parallel loss cannot disagree about
-which rank owns which token. ``IGNORE_INDEX`` is genuinely upstream.
-
-Three entry points, and the difference between them is worth stating plainly:
-
-* ``cross_entropy_loss`` -- the loss, with a sum reduction, so the caller can
-  divide by a *global* token count once the per-rank counts have been reduced.
-* ``chunked_lm_head_cross_entropy`` -- the same summed CE, run in sequence
-  chunks so peak logits memory is bounded; it runs its own backward.
-* ``compute_logprobs`` -- per-token log-probabilities, for inference-side use
-  (GRPO, perplexity). Different job, mostly the same math.
+``next_token_targets`` shifts synthetic labels within rows during model
+preprocessing. Packed dataset labels are already aligned. ``vocab_shard_bounds``
+is shared by embedding and loss code to keep vocabulary ownership consistent.
+Chunked CE performs backward internally; the other loss functions return tensors
+for the caller to backpropagate.
 """
 
 from __future__ import annotations
@@ -64,11 +50,23 @@ def vocab_shard_bounds(
     ``V`` as well as its end, so a TP degree greater than the vocabulary yields
     empty (not negative) slices, which the callers reject explicitly.
     """
-    if global_vocab_size < 1:
+    if (
+        not isinstance(global_vocab_size, int)
+        or isinstance(global_vocab_size, bool)
+        or global_vocab_size < 1
+    ):
         raise ValueError(f"global_vocab_size must be >= 1, got {global_vocab_size}")
-    if tp_world_size < 1:
+    if (
+        not isinstance(tp_world_size, int)
+        or isinstance(tp_world_size, bool)
+        or tp_world_size < 1
+    ):
         raise ValueError(f"tp_world_size must be >= 1, got {tp_world_size}")
-    if not 0 <= tp_rank < tp_world_size:
+    if (
+        not isinstance(tp_rank, int)
+        or isinstance(tp_rank, bool)
+        or not 0 <= tp_rank < tp_world_size
+    ):
         raise ValueError(f"tp_rank {tp_rank} is outside [0, {tp_world_size})")
     chunk_size = (global_vocab_size + tp_world_size - 1) // tp_world_size
     start = min(global_vocab_size, chunk_size * tp_rank)
@@ -90,7 +88,7 @@ def next_token_targets(labels: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     its denominator (``(targets != IGNORE_INDEX).sum()``), so nothing is
     silently over- or under-counted.
     """
-    if seq_len < 1:
+    if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 1:
         raise ValueError(f"seq_len must be >= 1, got {seq_len}")
     if labels.numel() % seq_len != 0:
         raise ValueError(
@@ -197,6 +195,12 @@ class LossParallelCrossEntropy(torch.autograd.Function):
         returns the per-token NLL ``[T]``, which GRPO negates to get per-token
         logprobs without ever all-gathering the vocabulary.
         """
+        if reduction not in ("sum", "none"):
+            raise ValueError(
+                f"reduction must be 'sum' or 'none', got {reduction!r}: the "
+                "vocab-parallel sums are token-summed, and 'mean' here would "
+                "divide by the wrong count."
+            )
         logits_dtype = logits.dtype
         logits = logits.float()
 
@@ -270,12 +274,6 @@ class LossParallelCrossEntropy(torch.autograd.Function):
         ctx.reduction = reduction
         if reduction == "none":
             return result
-        if reduction != "sum":
-            raise ValueError(
-                f"reduction must be 'sum' or 'none', got {reduction!r}: the "
-                "vocab-parallel sums are token-summed, and 'mean' here would "
-                "divide by the wrong count."
-            )
         return result.sum()
 
     @staticmethod
@@ -321,51 +319,20 @@ def chunked_lm_head_cross_entropy(
     tp_group: dist.ProcessGroup | None = None,
     global_vocab_size: int | None = None,
 ) -> torch.Tensor:
-    """Summed next-token CE, computed in sequence chunks to bound peak memory.
+    """Compute summed CE in token chunks and perform scaled backward.
 
-    Materializing ``lm_head(hidden_states)`` costs ``T * V`` floats at once,
-    which with a 150k vocabulary dwarfs the rest of the step. This splits the
-    token axis into ``num_chunks`` pieces and runs ``lm_head`` + cross-entropy
-    on one piece at a time, so the peak logits memory is ``T * V / num_chunks``
-    (the accumulated gradients are ``T * H`` and ``V * H`` -- independent of
-    the chunking).
+    Inputs are aligned ``hidden_states[T, H]`` and ``labels[T]``. Returns a
+    detached, unnormalized loss; gradients are scaled by ``grad_scale``.
+    Hidden states must require grad. The caller must not backward the result.
 
-    FSDP note: upstream wraps this loop with lm_head reshard/grad-sync
-    management; llmtuner deliberately does not, so with an FSDP-sharded
-    lm_head each chunk pays an extra all-gather/reduce-scatter round --
-    a memory/latency cost, never a numerics difference. Merging that
-    reshard management is a standalone performance item, not a gap.
+    Each chunk runs the head and backward independently, bounding logits memory
+    while accumulating head gradients. A single backward then propagates the
+    assembled hidden-state gradients through the decoder. Chunks need not divide
+    T, and CP/TP sequence shards can be chunked locally.
 
-    The function runs the backward ITSELF and returns the detached summed loss
-    (un-normalized, the same sum reduction ``cross_entropy_loss`` uses). The
-    backward is per chunk -- that is what keeps the peak low, since each
-    chunk's logits are freed before the next chunk's are computed -- and each
-    chunk's backward is scaled by ``grad_scale`` (the trainer passes
-    ``1 / global_valid_tokens``), so the accumulated gradients equal those of
-    ``(full_sum * grad_scale).backward()``. Chunking a sum and backwarding the
-    pieces is exact: one chunk's logits gradient does not depend on any other
-    chunk.
-
-    Two rounds of backward happen: the per-chunk ones (which accumulate the
-    lm_head weight gradient and each chunk's hidden-state gradient), then a
-    single ``torch.autograd.backward(hidden_states, assembled_grads)`` that
-    propagates the assembled ``T * H`` gradient through the decoder in one
-    pass -- the decoder graph is traversed once, not once per chunk.
-
-    Chunks need not divide the sequence: ``torch.chunk`` leaves a short final
-    piece, and the sum reduction makes the split invisible to the value. Under
-    CP/TP the hidden states are already a shard of the sequence along the
-    token axis; chunking that local shard composes with the sum reduction the
-    same way.
-
-    ``tp_group`` / ``global_vocab_size`` are passed straight through to
-    :func:`cross_entropy_loss`, so a vocab-sharded ``lm_head`` takes the
-    vocab-parallel path per chunk and a replicated one takes the plain path --
-    the selection is by shape, so the default (both ``None``, or a full-vocab
-    head) is bit-for-bit the old behaviour.
-
-    ``hidden_states`` must require grad -- this is a training path, and a
-    silent no-backward would look like a working step.
+    ``tp_group`` and ``global_vocab_size`` follow ``cross_entropy_loss``'s
+    vocabulary-shard contract. FSDP head resharding and gradient synchronization
+    are not deferred across chunks, so each chunk can incur extra collectives.
     """
     if num_chunks < 1:
         raise ValueError(f"num_chunks must be >= 1, got {num_chunks}")
@@ -373,6 +340,8 @@ def chunked_lm_head_cross_entropy(
         raise ValueError(
             f"hidden_states must be (T, H), got shape {tuple(hidden_states.shape)}"
         )
+    if labels.ndim != 1:
+        raise ValueError(f"labels must be (T,), got shape {tuple(labels.shape)}")
     if labels.shape[0] != hidden_states.shape[0]:
         raise ValueError(
             f"labels length {labels.shape[0]} does not match the token axis of "

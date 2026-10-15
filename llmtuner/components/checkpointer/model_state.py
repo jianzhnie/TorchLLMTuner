@@ -76,8 +76,19 @@ class ModelCheckpointState(Stateful):
         self.cached_state_dict = self._get_state_dict()
 
     def _get_state_dict(self) -> dict[str, Any]:
-        flat = {k: v for model in self.model for k, v in model.state_dict().items()}
-        return gather_expert_state(flat, self._ep_shards, self.model)
+        flat: dict[str, Any] = {}
+        for part_index, model in enumerate(self.model):
+            part_state = model.state_dict()
+            duplicates = flat.keys() & part_state.keys()
+            if duplicates:
+                raise ValueError(
+                    f"Model checkpoint keys overlap at part {part_index}: "
+                    f"{sorted(duplicates)}. Model parts must use distinct FQNs."
+                )
+            flat.update(part_state)
+        return gather_expert_state(
+            flat, shard_map=self._ep_shards, model_parts=self.model
+        )
 
     def state_dict(self) -> dict[str, Any]:
         # Recompute so hook-produced tensors reflect the current parameters,
@@ -107,7 +118,9 @@ class ModelCheckpointState(Stateful):
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         # Each PP part consumes its own keys from the combined model state.
         # Other parts' keys are ignored; checkpoint state categories are separate.
-        state_dict = load_expert_state(state_dict, self._ep_shards, self.model)
+        state_dict = load_expert_state(
+            state_dict, shard_map=self._ep_shards, model_parts=self.model
+        )
         for model in self.model:
             model.load_state_dict(state_dict, strict=False)
         # Refresh the cache so state_dict() reflects the freshly loaded values.

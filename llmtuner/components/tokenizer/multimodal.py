@@ -20,8 +20,19 @@ class MultimodalTokenizer(HuggingFaceTokenizer):
     # optional.
     """
 
-    # Config field prefixes that follow the {name}_token pattern.
+    # Shared with the collator's special-token metadata construction.
     TOKEN_FIELDS = ("image", "video", "vision_start", "vision_end", "pad")
+
+    image_token: str
+    image_id: int
+    video_token: str
+    video_id: int
+    vision_start_token: str
+    vision_start_id: int
+    vision_end_token: str
+    vision_end_id: int
+    pad_token: str
+    pad_id: int
 
     def __init__(
         self,
@@ -32,7 +43,7 @@ class MultimodalTokenizer(HuggingFaceTokenizer):
         vision_start_token: str,
         vision_end_token: str,
         pad_token: str,
-    ):
+    ) -> None:
         super().__init__(tokenizer_path=tokenizer_path)
 
         tokens = {
@@ -46,8 +57,7 @@ class MultimodalTokenizer(HuggingFaceTokenizer):
         added_tokens = self.tokenizer.get_added_tokens_decoder()
         token_to_id = {tok.content: tok_id for tok_id, tok in added_tokens.items()}
 
-        for name in self.TOKEN_FIELDS:
-            token_str = tokens[name]
+        for name, token_str in tokens.items():
             if token_str not in token_to_id:
                 raise ValueError(
                     f"Special token '{token_str}' ({name}_token) "

@@ -23,10 +23,9 @@ Two departures from torchtitan, both subtractions:
 
 * **No ``torchtitan.tools.filesystem``.** The local equivalent is
   ``checkpointer/filesystem``, which has the same API for the paths this module
-  uses. The one difference is deliberate: llmtuner's ``rmtree`` mirrors
-  ``shutil.rmtree(..., ignore_errors=True)`` for local paths, so a purge of an
-  already-deleted directory is a no-op rather than a ``FileNotFoundError`` in
-  the purge thread.
+  uses. Deletion ignores missing paths and reports other failures, so a purge
+  of an already-deleted directory is a no-op while permission or storage
+  errors remain visible in the purge thread's logs.
 
 ``DistributedCheckpointAsyncMode.DISABLED`` is the default here, matching torchtitan.
 """
@@ -60,7 +59,7 @@ from ...utils.garbage_collection import GarbageCollection
 from . import filesystem
 
 if TYPE_CHECKING:
-    from ...config import CheckpointConfig
+    from ...config.checkpoint_config import CheckpointConfig
 
 from ...utils.logging import get_logger
 from .base import (
@@ -144,9 +143,10 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             ``LRSchedulersContainer``. Required: its ``last_epoch`` is the only
             thing that makes a resumed run continue the curve rather than
             restart it, and nothing else in the checkpoint carries it -- the
-            optimizer restores ``base_lrs`` but not the step count. Registering
+            optimizer restores group ``initial_lr`` values but not the step count.
+            Registering
             it here also keeps it ordered after the optimizer, which it must be:
-            ``load_state_dict`` writes ``base_lrs`` into the optimizers.
+            scheduler restore reads those values and recomputes group ``lr``.
         ema: online EMA of model weights (``components.optimizer.EMA``), or
             None when the run has not configured one. Registered under the
             ``ema`` key; on a load that restores the model but not the EMA, the
@@ -299,10 +299,11 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         if first_error is not None:
             raise first_error
 
-    def dcp_save(
+    def _save_checkpoint(
         self,
         state_dict: dict[str, Any],
         checkpoint_id: str,
+        *,
         async_mode: DistributedCheckpointAsyncMode,
         enable_garbage_collection: bool = False,
         to_hf: bool = False,
@@ -412,7 +413,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         Raises:
             ValueError: if ``from_hf`` is set without an ``sd_adapter``.
         """
-        state_dict = self._flattened_model_states_sd(states)
+        state_dict = self._flatten_model_state(states)
 
         if from_hf:
             if self.sd_adapter is None:
@@ -445,7 +446,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 scheduler.load_state_dict(state_dict[LR_SCHEDULER])
 
             # The model states were flattened into the top-level dict by
-            # ``_flattened_model_states_sd``, so DCP writes into those flat
+            # ``_flatten_model_state``, so DCP writes into those flat
             # entries rather than into the model. Pushing them back is a second
             # step, done explicitly here.
             if MODEL in states:
@@ -492,7 +493,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             return True
 
         checkpoint_id = self._create_checkpoint_id(curr_step)
-        states = self._flattened_model_states_sd()
+        states = self._flatten_model_state()
         async_save_started_at: float | None = None
 
         if self.async_mode in (
@@ -514,7 +515,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 )
 
             async_save_started_at = time.monotonic()
-            result = self.dcp_save(
+            result = self._save_checkpoint(
                 states,
                 checkpoint_id=checkpoint_id,
                 async_mode=self.async_mode,
@@ -537,7 +538,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 self.save_future = result
 
         else:
-            self.dcp_save(
+            self._save_checkpoint(
                 states,
                 checkpoint_id=checkpoint_id,
                 async_mode=DistributedCheckpointAsyncMode.DISABLED,
@@ -644,8 +645,8 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             self._storage.isfile(filesystem.join(checkpoint_dir, SAFETENSORS_INDEX))
         )
 
-    def _flattened_model_states_sd(
-        self, state_dict: dict[str, Any] | None = None
+    def _flatten_model_state(
+        self, states: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         """Flatten model parameters into the top-level state dictionary.
 
@@ -654,10 +655,10 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         writer one consistent format.
 
         Args:
-            state_dict: a custom dict to flatten. Defaults to ``None``, which
+            states: a custom dict to flatten. Defaults to ``None``, which
                 uses the instance's own ``states``.
         """
-        states = state_dict if state_dict is not None else self.states
+        states = self.states if states is None else states
         sd = {k: v for k, v in states.items() if k != MODEL}
         if MODEL in states:
             sd.update(states[MODEL].state_dict())
@@ -696,9 +697,9 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             )
         else:
             logger.info(f"Saving a full checkpoint at last step, step {curr_step}.")
-            states = self._flattened_model_states_sd()
+            states = self._flatten_model_state()
 
-        self.dcp_save(
+        self._save_checkpoint(
             states,
             checkpoint_id=self._create_checkpoint_id(curr_step),
             async_mode=DistributedCheckpointAsyncMode.DISABLED,
