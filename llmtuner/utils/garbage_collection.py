@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import gc
 import time
+from threading import RLock
+from typing import ClassVar
 
 from .logging import get_logger
 
@@ -24,6 +26,12 @@ class GarbageCollection:
         debug: collect every step and warn about tensor reference cycles.
     """
 
+    # Automatic GC is process-wide. Overlapping training scopes must share
+    # ownership, including scopes closed in a different order than construction.
+    _owners: ClassVar[int] = 0
+    _restore_enabled: ClassVar[bool] = False
+    _ownership_lock: ClassVar[RLock] = RLock()
+
     def __init__(self, gc_freq: int = 1000, *, debug: bool = False) -> None:
         if not isinstance(gc_freq, int) or isinstance(gc_freq, bool) or gc_freq <= 0:
             raise ValueError(f"gc_freq must be a positive integer, got {gc_freq}")
@@ -31,9 +39,12 @@ class GarbageCollection:
             raise TypeError(f"debug must be bool, got {debug!r}")
         self.gc_freq = gc_freq
         self.debug = debug
-        self._was_enabled = gc.isenabled()
         self._closed = False
-        gc.disable()
+        with GarbageCollection._ownership_lock:
+            if GarbageCollection._owners == 0:
+                GarbageCollection._restore_enabled = gc.isenabled()
+            gc.disable()
+            GarbageCollection._owners += 1
         try:
             self.collect("Initial GC collection")
             if debug:
@@ -64,11 +75,16 @@ class GarbageCollection:
 
     def close(self) -> None:
         """Restore the automatic collector's state before training began."""
-        if self._closed:
-            return
-        self._closed = True
-        if self._was_enabled:
-            gc.enable()
+        with GarbageCollection._ownership_lock:
+            if self._closed:
+                return
+            self._closed = True
+            GarbageCollection._owners -= 1
+            if GarbageCollection._owners == 0:
+                if GarbageCollection._restore_enabled:
+                    gc.enable()
+                else:
+                    gc.disable()
 
     @staticmethod
     def collect(reason: str, *, generation: int = 1) -> None:
