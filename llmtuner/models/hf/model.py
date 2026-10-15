@@ -35,15 +35,16 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import and_masks
+from torch.distributed.device_mesh import DeviceMesh
+from torch.nn.attention.flex_attention import BlockMask, and_masks
 from transformers.configuration_utils import PretrainedConfig
 
 from llmtuner.errors import UnsupportedCombinationError
 
 from ...accelerator import distributed
 from ...components.loss import next_token_targets
-from ...datasets.contracts import Batch
-from ...parallel.context_parallel import (
+from ...datasets.contracts import Batch, TrainerBatch
+from ...parallel.context_parallel.input_sharding import (
     shard_attention_mask_for_cp,
     shard_batch_for_cp,
     shard_batch_for_tp,
@@ -58,7 +59,7 @@ from ..common.attention.masks import (
     get_causal_mask_mod,
     get_document_mask_mod,
 )
-from ..common.moe.layer import iter_moe_layers
+from ..common.moe.layer import collect_moe_layers
 from .attention_backend import (
     ATTENTION_BACKEND,
     available_attention_backend,
@@ -68,8 +69,8 @@ from .attention_backend import (
 from .factory import resolve_model_class, unwrap_text_config
 from .model_setup import (
     apply_cast_lm_head,
-    first_present,
-    resolve_experts_implementation,
+    configure_experts_implementation,
+    resolve_submodule_name,
     validate_head_config,
 )
 
@@ -99,7 +100,7 @@ class HFTransformerModel(nn.Module):
         register_attention_backend()
 
         model_cls = resolve_model_class(config)
-        resolve_experts_implementation(model_cls, config)
+        configure_experts_implementation(config, model_cls=model_cls)
         self.model = model_cls(config=config)
         self.model.config._attn_implementation = config._attn_implementation
 
@@ -121,13 +122,17 @@ class HFTransformerModel(nn.Module):
         object.__setattr__(
             self,
             "_embed_name",
-            first_present(self._decoder, ("embed_tokens", "wte"), "token embedding"),
+            resolve_submodule_name(
+                self._decoder, ("embed_tokens", "wte"), component="token embedding"
+            ),
         )
         object.__setattr__(
             self,
             "_norm_name",
-            first_present(
-                self._decoder, ("norm", "final_layernorm", "ln_f"), "final norm"
+            resolve_submodule_name(
+                self._decoder,
+                ("norm", "final_layernorm", "ln_f"),
+                component="final norm",
             ),
         )
 
@@ -296,7 +301,7 @@ class HFTransformerModel(nn.Module):
 
     def _shard_for_cp(
         self,
-        cp_mesh,
+        cp_mesh: DeviceMesh | None,
         *,
         packed: bool,
         inputs: torch.Tensor,
@@ -308,7 +313,7 @@ class HFTransformerModel(nn.Module):
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
-        torch.Tensor | None,
+        BlockMask | torch.Tensor | None,
     ]:
         """Steps 3-4 of ``preprocess_inputs``: mask full-length, then CP-shard.
 
@@ -370,7 +375,7 @@ class HFTransformerModel(nn.Module):
 
     def _shard_for_tp(
         self,
-        tp_mesh,
+        tp_mesh: DeviceMesh | None,
         *,
         inputs: torch.Tensor,
         labels: torch.Tensor,
@@ -404,10 +409,9 @@ class HFTransformerModel(nn.Module):
 
     def preprocess_inputs(
         self,
-        input_dict: dict[str, torch.Tensor],
+        input_dict: Batch | TrainerBatch,
         *,
         parallel_dims: ParallelTopology | None,
-        parallelism=None,
         max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Turn a dataloader batch into ``(inputs, labels, extra_kwargs)``.
@@ -451,10 +455,9 @@ class HFTransformerModel(nn.Module):
 
         ``positions`` is optional: the synthetic source has none and the forward
         falls back to its own ``arange``, which is right for a single document
-        but must not be relied on for a packed one. ``parallelism`` is accepted
-        for signature parity with the reference but unused: llmtuner's CP
-        load-balancer string is latched onto this wrapper by ``apply_cp`` (see
-        ``set_cp_mesh``).
+        but must not be relied on for a packed one. The CP load-balancer
+        setting is latched onto this wrapper by the context-parallel entry
+        point (see ``set_cp_mesh``).
 
         The reference also takes ``max_num_documents``, to size a fixed-shape
         varlen mask for CUDA graph capture. It is not accepted here because
@@ -467,7 +470,6 @@ class HFTransformerModel(nn.Module):
         Tensors arrive on the trainer's device; the trainer moves them before
         calling, so this is pure structure and stays device-free.
         """
-        del parallelism
         extra_kwargs: dict[str, Any] = {}
         positions = None
         padding_mask = None
@@ -492,6 +494,17 @@ class HFTransformerModel(nn.Module):
             positions = positions.reshape(-1)
         if padding_mask is not None:
             padding_mask = padding_mask.reshape(-1).to(torch.bool)
+
+        for name, value in (
+            ("labels", labels),
+            ("positions", positions),
+            ("padding_mask", padding_mask),
+        ):
+            if value is not None and value.numel() != inputs.numel():
+                raise ValueError(
+                    f"{name} has {value.numel()} tokens, but input has "
+                    f"{inputs.numel()}; batch token fields must have equal lengths"
+                )
 
         # Whether the mask must be prebuilt full-length: a packed corpus
         # (``block_causal``) carries a document structure that is not
@@ -547,7 +560,7 @@ class HFTransformerModel(nn.Module):
             extra_kwargs["padding_mask"] = padding_mask
         return inputs, labels, extra_kwargs
 
-    def get_attention_masks(self, positions: torch.Tensor):
+    def get_attention_masks(self, positions: torch.Tensor) -> BlockMask | torch.Tensor:
         """Build this batch's attention mask: a flex BlockMask, or a dense one.
 
         ``attn_mask_type`` selects between plain causal and causal-plus-same-
@@ -581,16 +594,16 @@ class HFTransformerModel(nn.Module):
         num_tokens = positions.shape[0]
         return create_attention_mask(
             mask_mod,
-            1,
-            None,
-            num_tokens,
-            num_tokens,
+            B=1,
+            H=None,
+            Q_LEN=num_tokens,
+            KV_LEN=num_tokens,
             device=positions.device,
             BLOCK_SIZE=128,
             separate_full_blocks=True,
         )
 
-    def _get_cp_attention_masks(self, positions: torch.Tensor):
+    def _get_cp_attention_masks(self, positions: torch.Tensor) -> BlockMask:
         """Build the BlockMask for a CP forward: full-length, strategy-shaped.
 
         Under CP, ``positions`` is this rank's shard of the sequence (possibly
@@ -702,7 +715,7 @@ class HFTransformerModel(nn.Module):
         # a mask from a previous microbatch can never survive into this one.
         # The staged mask then persists until this line re-stages it, so an
         # activation-checkpointing recompute sees the same mask.
-        for moe in iter_moe_layers(self):
+        for moe in collect_moe_layers(self):
             moe.set_padding_mask(padding_mask)
 
         # A HF decoder expects a batch dim; the wrapper's contract is flat.

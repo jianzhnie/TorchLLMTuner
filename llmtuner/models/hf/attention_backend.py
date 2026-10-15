@@ -39,7 +39,7 @@ def uses_deepseek_sparse_attention(config) -> bool:
 
 def register_attention_backend() -> None:
     """Register llmtuner's flex adapter with Hugging Face."""
-    AttentionInterface._global_mapping[ATTENTION_BACKEND] = flex_attention_adapter
+    AttentionInterface.register(ATTENTION_BACKEND, flex_attention_adapter)
 
 
 __all__ = [

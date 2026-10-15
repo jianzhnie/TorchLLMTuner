@@ -5,9 +5,10 @@ Split out of torchtitan's single ``models/common/moe.py`` (plus its
 
 * ``routing.py`` -- ``TokenChoiceTopKRouter``, ``QuantileBalancedTopKRouter``,
   ``QuantileBalancer``. Token-choice routing, including node-limited groups.
+* ``gate.py`` -- ``RouterGateLinear``, the FP32 router projection and backward.
 * ``experts.py`` -- ``GroupedExperts`` (every expert's weights as three stacked
   tensors) and ``RoutedExperts`` (the dispatch/combine pair around them).
-* ``layer.py`` -- ``MoE`` itself, plus ``iter_moe_layers`` /
+* ``layer.py`` -- ``MoE`` itself, plus ``collect_moe_layers`` /
   ``MOE_LAYER_ATTRS``, the walk the hooks and the compile pass use.
 * ``auxiliary_loss.py`` -- ``MicrobatchWiseLoadBalanceLoss``, the per-forward
   sequence-wise auxiliary loss a router can carry.

@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..linear import RouterGateLinear
+from .gate import RouterGateLinear
 
 if TYPE_CHECKING:
     from ..aux_loss import AuxLoss
@@ -118,9 +118,7 @@ class TokenChoiceTopKRouter(nn.Module):
         self.aux_loss = aux_loss
         self._debug_force_load_balance = _debug_force_load_balance
 
-    def _debug_force_load_balance_routing(
-        self, scores_TE: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _select_balanced_experts(self, scores_TE: torch.Tensor) -> torch.Tensor:
         """Balanced round-robin expert assignment.
 
         Token ``t``'s ``k``-th slot gets expert ``(t * K + k) % E``, so over a
@@ -129,7 +127,7 @@ class TokenChoiceTopKRouter(nn.Module):
         comes from the real scores (gathered, bias excluded), matching the
         normal path -- only the choice is forced.
 
-        Returns expert ids and scores, both ``(T, K)``.
+        Returns expert ids of shape ``(T, K)``.
         """
         num_tokens = scores_TE.shape[0]
         topk_expert_ids_TK = (
@@ -140,8 +138,7 @@ class TokenChoiceTopKRouter(nn.Module):
             ).reshape(num_tokens, self.top_k)
             % self.num_experts
         )
-        topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
-        return topk_expert_ids_TK, topk_scores_TK
+        return topk_expert_ids_TK
 
     def _select_experts(
         self,
@@ -152,8 +149,8 @@ class TokenChoiceTopKRouter(nn.Module):
     ) -> torch.Tensor:
         """Top-k expert ids, using the load-balancing bias on top of the scores.
 
-        ``sorted=False`` matches upstream: the ids come back in top-k order but
-        the scores are gathered separately, so no ordering is relied on.
+        ``sorted=False`` matches upstream: selected ids need not be ordered.
+        Scores are gathered by id, so their ordering stays aligned.
 
         ``padding_mask_T`` is accepted so subclasses (the quantile router) can
         filter their observations to valid tokens; the choice itself never
@@ -269,17 +266,13 @@ class TokenChoiceTopKRouter(nn.Module):
         if self._debug_force_load_balance:
             # The bias and the group restriction are both bypassed: the point
             # of the flag is a routing decision nothing downstream can skew.
-            (
-                topk_expert_ids_TK,
-                topk_scores_TK,
-            ) = self._debug_force_load_balance_routing(scores_TE)
+            topk_expert_ids_TK = self._select_balanced_experts(scores_TE)
         else:
             topk_expert_ids_TK = self._select_experts(
                 scores_TE, expert_bias_E, padding_mask_T=padding_mask_T
             )
-            # The bias only picks experts; the weight a token carries is the
-            # score of the expert it actually landed on, bias excluded.
-            topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
+        # Every selection path carries unbiased scores to the chosen experts.
+        topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
 
         if self.route_norm:
             denominator = topk_scores_TK.sum(dim=-1, keepdim=True) + 1e-20
@@ -325,7 +318,7 @@ class QuantileBalancedTopKRouter(TokenChoiceTopKRouter):
     Top-(K+1) once: the first K experts route the token, and the (K+1)-th
     biased score is the cutoff a *required* expert bias is measured against.
     ``QuantileBalancer`` accumulates those required biases into a histogram,
-    and ``register_moe_quantile_balancing_hook`` turns the histogram into the
+    and ``register_moe_balancing_hook`` turns the histogram into the
     next mean-centred ``expert_bias_E`` once per optimizer step.
 
     The routing *weight* still comes from the original unbiased scores --

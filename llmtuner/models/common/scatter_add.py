@@ -19,6 +19,7 @@ reproducible.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 __all__ = ["deterministic_scatter_add"]
 
@@ -54,6 +55,17 @@ def _backward(
 ) -> tuple[torch.Tensor, None, torch.Tensor]:
     (index,) = ctx.saved_tensors
     grad_src = torch.gather(grad_output, dim=0, index=index)
+    # scatter_add reads only the prefix shaped like index. Unused source
+    # elements contribute nothing and therefore receive zero gradients.
+    if ctx.src_shape != index.shape:
+        padding = tuple(
+            value
+            for source_size, index_size in reversed(
+                list(zip(ctx.src_shape, index.shape, strict=True))
+            )
+            for value in (0, source_size - index_size)
+        )
+        grad_src = F.pad(grad_src, padding)
     return grad_output, None, grad_src
 
 
@@ -62,8 +74,9 @@ def _setup_context(
     inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     output: torch.Tensor,
 ) -> None:
-    _out, index, _src = inputs
+    _out, index, src = inputs
     ctx.save_for_backward(index)
+    ctx.src_shape = src.shape
 
 
 deterministic_scatter_add.register_autograd(

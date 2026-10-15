@@ -32,13 +32,15 @@ Shape legend, scoped to this file: ``T`` = tokens, ``D`` = model dimension,
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
 from .experts import RoutedExperts
 from .routing import QuantileBalancedTopKRouter, TokenChoiceTopKRouter
 
-__all__ = ["MOE_LAYER_ATTRS", "iter_moe_layers", "MoE"]
+__all__ = ["MOE_LAYER_ATTRS", "collect_moe_layers", "MoE"]
 
 # The decoder-layer attributes that may hold a MoE block. Every model family
 # transformers 5.x supports keeps it on ``mlp``, dense layers included -- a
@@ -96,21 +98,15 @@ class MoE(nn.Module):
                 "update, so load_balance_coeff must be None -- the sign-based "
                 "and quantile updates cannot both own expert_bias_E."
             )
-        if load_balance_coeff is not None:
-            if load_balance_coeff <= 0.0:
-                raise ValueError(
-                    f"load_balance_coeff must be positive, got {load_balance_coeff}"
-                )
-            self.register_buffer(
-                "expert_bias_E",
-                torch.zeros(num_experts, dtype=torch.float32),
-                persistent=True,
+        if load_balance_coeff is not None and (
+            not math.isfinite(load_balance_coeff) or load_balance_coeff <= 0.0
+        ):
+            raise ValueError(
+                "load_balance_coeff must be finite and positive, "
+                f"got {load_balance_coeff}"
             )
-        elif quantile_balanced:
-            # The quantile scheme routes on the bias too, so the buffer exists
-            # even with no sign-based update to drive it; the quantile hook
-            # overwrites it once per step. Persistent for the same reason the
-            # sign-based one is: a resumed run keeps the reached balance.
+        if load_balance_coeff is not None or quantile_balanced:
+            # Both schemes persist the reached balance across checkpoint resumes.
             self.register_buffer(
                 "expert_bias_E",
                 torch.zeros(num_experts, dtype=torch.float32),
@@ -252,21 +248,17 @@ class MoE(nn.Module):
         return out_TD
 
 
-def iter_moe_layers(model_part: nn.Module) -> list[MoE]:
-    """The MoE blocks of one model part, in a stable order.
+def collect_moe_layers(model_part: nn.Module) -> list[MoE]:
+    """Collect distinct native MoE blocks in decoder-layer order.
 
-    Every model part is a ``HFTransformerModel``, whose ``layers`` is a
-    ``ModuleList``. A dense layer carries no MoE -- and the swap leaves the block
-    *in the attribute it already held* (``mlp``, for every family) rather than
-    parking it under a new name. So the lookup has to walk the same names the
-    swap writes to (``MOE_LAYER_ATTRS``); anything else finds nothing on a real
-    model, which is the worst failure mode available here -- the register
-    function below then no-ops and the bias is never updated at all.
+    Look up the attributes EP replacement writes, including through activation
+    checkpoint wrappers. Return an empty list when no decoder layers exist.
     """
     layers = getattr(model_part, "layers", None)
     if not isinstance(layers, nn.ModuleList):
         return []
     found: list[MoE] = []
+    seen: set[int] = set()
     for layer in layers:
         # Activation checkpointing wraps each layer in torch's
         # CheckpointWrapper; older torch versions don't forward attribute
@@ -277,6 +269,8 @@ def iter_moe_layers(model_part: nn.Module) -> list[MoE]:
         for attr in MOE_LAYER_ATTRS:
             block = getattr(layer, attr, None)
             if isinstance(block, MoE):
-                found.append(block)
+                if id(block) not in seen:
+                    found.append(block)
+                    seen.add(id(block))
                 break
     return found

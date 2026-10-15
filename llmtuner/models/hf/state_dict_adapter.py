@@ -9,16 +9,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from typing import Any
 
 import torch.distributed as dist
 from torch.distributed.checkpoint import HuggingFaceStorageReader
 
 from ...components.checkpointer.checkpoint_keys import SAFETENSORS_INDEX
-from ...utils.logging import get_logger
-
-logger = get_logger(__name__)
 
 
 class HFTransformerStateDictAdapter:
@@ -34,21 +30,48 @@ class HFTransformerStateDictAdapter:
             return
         index_path = os.path.join(hf_assets_path, SAFETENSORS_INDEX)
         if not os.path.isfile(index_path):
-            # HuggingFaceStorageReader also supports a single model.safetensors.
+            # Read only the header: single-file checkpoints omit tied heads
+            # too, and need the same key coverage policy as indexed exports.
+            tensor_path = os.path.join(hf_assets_path, "model.safetensors")
+            if os.path.isfile(tensor_path):
+                from safetensors import safe_open
+
+                with safe_open(tensor_path, framework="pt") as tensors:
+                    self._hf_keys = set(tensors.keys())
             return
         with open(index_path, encoding="utf-8") as stream:
-            weight_map = json.load(stream)["weight_map"]
-        self._hf_keys = set(weight_map)
-        self.fqn_to_index_mapping = {
-            key: int(match.group())
+            index = json.load(stream)
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError("HF checkpoint index requires a non-empty weight_map")
+        if any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(filename, str)
+            or not filename
             for key, filename in weight_map.items()
-            if (match := re.search(r"\d+", filename)) is not None
+        ):
+            raise ValueError(
+                "HF weight_map keys and filenames must be non-empty strings"
+            )
+        self._hf_keys = set(weight_map)
+        # HF filenames need not contain a shard number. Preserve their tensor
+        # grouping while providing the writer's required contiguous 1..N IDs.
+        shard_indices = {
+            filename: shard_index
+            for shard_index, filename in enumerate(sorted(set(weight_map.values())), 1)
+        }
+        self.fqn_to_index_mapping = {
+            key: shard_indices[filename] for key, filename in weight_map.items()
         }
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        hf_state = {
-            key.removeprefix("model."): value for key, value in state_dict.items()
-        }
+        hf_state = {}
+        for key, value in state_dict.items():
+            hf_key = key.removeprefix("model.")
+            if hf_key in hf_state:
+                raise ValueError(f"HF checkpoint key mapping collision: {hf_key!r}")
+            hf_state[hf_key] = value
         if self._hf_keys is not None:
             requested = set(hf_state)
             if dist.is_available() and dist.is_initialized():

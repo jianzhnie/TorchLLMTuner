@@ -1,8 +1,8 @@
 """Vocab-parallel embedding.
 
-Vendored from torchtitan ``models/common/embedding.py``. The only change is that
-the nested ``Config`` is gone: llmtuner constructs the module directly, so there is
-nothing to build from. The forward is unchanged.
+This implementation uses llmtuner's vocabulary shard bounds and local tensor
+contract. It is a standalone model component; the HF TP path does not currently
+install it automatically.
 
 Why it exists at all: when the TP axis shards the embedding weight on its vocab
 dim (``Shard(0)`` on ``tok_embeddings``), HF's plain ``nn.Embedding.forward``
@@ -13,7 +13,6 @@ range, so each rank gathers its own shard and the partial results sum to the ful
 embedding (the mask zeroes the ranks that hold no matching row). On a mesh with no
 TP group it falls back to plain ``F.embedding``.
 
-TODO(pianpwk): rename to VocabParallelEmbedding
 """
 
 from __future__ import annotations
@@ -26,10 +25,10 @@ from ...accelerator import distributed
 from ...accelerator.spmd import spmd_mesh_group
 from ...components.loss import vocab_shard_bounds
 
-__all__ = ["Embedding"]
+__all__ = ["VocabParallelEmbedding"]
 
 
-class Embedding(nn.Embedding):
+class VocabParallelEmbedding(nn.Embedding):
     """nn.Embedding with optional local vocab-parallel execution.
 
     NOTE: currently unused. It pairs with a TP-sharded embedding weight (the
@@ -57,11 +56,20 @@ class Embedding(nn.Embedding):
         # Same bounds the vocab-parallel loss uses -- the two must agree on
         # which rank owns which token (and the helper clamps the shard start to
         # the vocabulary, which the hand-rolled ``rank * chunk_size`` did not).
-        offset, _ = vocab_shard_bounds(
+        offset, end = vocab_shard_bounds(
             self.num_embeddings, tp_size, distributed.get_rank(tp_group)
         )
+        expected_shape = (end - offset, self.embedding_dim)
+        if tuple(self.weight.shape) != expected_shape:
+            raise ValueError(
+                "VocabParallelEmbedding requires a local vocabulary shard of "
+                f"shape {expected_shape}, got {tuple(self.weight.shape)}"
+            )
         mask = (input >= offset) & (input < offset + self.weight.shape[0])
-        local_input = (input - offset).clamp(0, self.weight.shape[0] - 1)
+        # Exclude foreign tokens from the lookup itself. Masking only the
+        # output would still count clamped foreign IDs in scale_grad_by_freq
+        # and renormalize unrelated boundary rows when max_norm is enabled.
+        local_input = input[mask] - offset
         # padding_idx is a global row id; only the shard that owns that row may
         # hand it to the local F.embedding. Any other shard would either crash
         # (the id is beyond the shard's row count) or silently zero the
@@ -81,4 +89,6 @@ class Embedding(nn.Embedding):
             self.scale_grad_by_freq,
             self.sparse,
         )
-        return out * mask.unsqueeze(-1).to(out.dtype)
+        output = out.new_zeros((*input.shape, self.embedding_dim))
+        output[mask] = out
+        return output

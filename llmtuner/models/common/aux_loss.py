@@ -268,19 +268,15 @@ def collect_aux_loss_metrics(parallel_dims: ParallelTopology) -> dict[str, float
 
 def register_aux_loss_zero_hook(
     optimizer: torch.optim.Optimizer,
+    *,
     model_parts: Sequence[nn.Module],
-    parallel_dims: ParallelTopology,
 ) -> None:
     """Register the step pre-hook that rolls ``instance_acc`` into ``group_acc``.
 
-    ``parallel_dims`` is accepted for symmetry with the metric collection it
-    feeds; the roll-up itself is local.
-
-    TODO: drop the unused ``parallel_dims`` argument once a second caller
-    exists -- it is kept so the call site reads the same as
-    ``register_moe_load_balancing_hook``.
+    This roll-up is local; distributed metric reduction happens later in
+    ``collect_aux_loss_metrics``.
     """
-    del parallel_dims
+    tracked_parts = tuple(model_parts)
     optimizer.register_step_pre_hook(
-        lambda *args, **kwargs: zero_aux_losses(model_parts)
+        lambda *args, **kwargs: zero_aux_losses(tracked_parts)
     )

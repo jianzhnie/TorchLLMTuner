@@ -40,17 +40,16 @@ __all__ = ["QKVLinear", "local_head_split"]
 def local_head_split(
     t: torch.Tensor,
     head_dim: int,
-    *,
-    dp_shard_dim: int = 0,
 ) -> torch.Tensor:
     """Split the last dimension into heads, keeping it sharded on the local axis.
 
     A thin reshape used where a tensor's trailing dim is ``n_heads * head_dim``:
     the split is local by construction, so no communication is involved on
-    either sharded axis (``dp_shard_dim`` keeps its shard, and the last dim
-    stays sharded on ``tp``).
+    the existing sharded axes.
     """
-    return t.view(*t.shape[:-1], -1, head_dim)
+    if not isinstance(head_dim, int) or isinstance(head_dim, bool) or head_dim <= 0:
+        raise ValueError(f"head_dim must be positive integer, got {head_dim!r}")
+    return t.unflatten(-1, (-1, head_dim))
 
 
 class QKVLinear(nn.Module):
@@ -78,6 +77,13 @@ class QKVLinear(nn.Module):
         linear: nn.Module,
     ) -> None:
         super().__init__()
+        for name, value in (
+            ("head_dim", head_dim),
+            ("n_heads", n_heads),
+            ("n_kv_heads", n_kv_heads),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be positive integer, got {value!r}")
         self.head_dim = head_dim
         if n_heads % n_kv_heads != 0:
             raise ValueError(
@@ -95,7 +101,10 @@ class QKVLinear(nn.Module):
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project ``x`` and return ``(q, k, v)``, each ``(T, n_heads, H)``."""
+        """Project ``(..., D)`` into Q/K/V, preserving every leading axis.
+
+        Q has shape ``(..., n_heads, H)``; K and V use ``n_kv_heads``.
+        """
         return self._split(self._project(x))
 
     def _project(self, x: torch.Tensor) -> torch.Tensor:
@@ -111,20 +120,18 @@ class QKVLinear(nn.Module):
         self, qkv: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reshape the fused output by KV group and cut out ``(q, k, v)``."""
-        num_tokens = qkv.shape[0]
         # [T, n_kv_heads * R * head_dim] -> [T, n_kv_heads, R, head_dim].
         # -1 rather than n_kv_heads so a TP-sharded output still reshapes.
-        qkv = qkv.view(num_tokens, -1, self.r_dim, self.head_dim)
+        qkv = qkv.unflatten(-1, (-1, self.r_dim, self.head_dim))
 
-        local_num_tokens = qkv.shape[0]
         xq, xk, xv = torch.split(qkv, [self.heads_per_kv, 1, 1], dim=-2)
         # split leaves xk/xv as strided views into the fused buffer; attention
         # and KV-cache kernels read raw memory assuming a contiguous head-major
         # layout, so materialize all three here.
         return (
-            xq.reshape(local_num_tokens, -1, self.head_dim).contiguous(),
-            xk.reshape(local_num_tokens, -1, self.head_dim).contiguous(),
-            xv.reshape(local_num_tokens, -1, self.head_dim).contiguous(),
+            xq.flatten(-3, -2).contiguous(),
+            xk.flatten(-3, -2).contiguous(),
+            xv.flatten(-3, -2).contiguous(),
         )
 
     @staticmethod
@@ -132,11 +139,13 @@ class QKVLinear(nn.Module):
         """Split fused ``wqkv`` into stock ``wq``/``wk``/``wv`` (weight and bias)."""
         hd, hpk, r = module.head_dim, module.heads_per_kv, module.r_dim
 
+        split = {}
+        fused_keys = []
         for param, ndim in (("weight", 4), ("bias", 3)):
             key = f"{prefix}wqkv.{param}"
             if key not in state_dict:
                 continue
-            tensor = state_dict.pop(key)
+            tensor = state_dict[key]
             # Gather to Replicate so the n_kv-leading reshape is local (dim 0
             # unsharded) when a Shard(0) split would not divide n_kv_heads
             # (e.g. dp_shard=8, n_kv_heads=4); stays a DTensor for the copy.
@@ -147,26 +156,31 @@ class QKVLinear(nn.Module):
             n_kv = tensor.shape[0] // (r * hd)
             tail = (tensor.shape[1],) if ndim == 4 else ()
             w = tensor.reshape(n_kv, r, hd, *tail)
-            state_dict[f"{prefix}wq.{param}"] = (
-                w[:, :hpk].reshape(-1, *tail).contiguous()
-            )
-            state_dict[f"{prefix}wk.{param}"] = (
-                w[:, hpk].reshape(-1, *tail).contiguous()
-            )
-            state_dict[f"{prefix}wv.{param}"] = (
-                w[:, hpk + 1].reshape(-1, *tail).contiguous()
-            )
+            split[f"{prefix}wq.{param}"] = w[:, :hpk].reshape(-1, *tail).contiguous()
+            split[f"{prefix}wk.{param}"] = w[:, hpk].reshape(-1, *tail).contiguous()
+            split[f"{prefix}wv.{param}"] = w[:, hpk + 1].reshape(-1, *tail).contiguous()
+            fused_keys.append(key)
+        for key in fused_keys:
+            del state_dict[key]
+        state_dict.update(split)
 
     @staticmethod
     def _merge_qkv_on_load(module, state_dict, prefix, *args) -> None:
         """Merge stock ``wq``/``wk``/``wv`` back into fused ``wqkv``."""
         hd, hpk = module.head_dim, module.heads_per_kv
 
+        merged = []
         for param, ndim in (("weight", 4), ("bias", 3)):
             keys = [f"{prefix}{w}.{param}" for w in ("wq", "wk", "wv")]
             if not all(k in state_dict for k in keys):
                 continue
-            wq, wk, wv = (state_dict.pop(k) for k in keys)
+            fused_key = f"{prefix}wqkv.{param}"
+            if fused_key in state_dict:
+                raise ValueError(
+                    f"checkpoint contains both fused {fused_key!r} and logical "
+                    f"Q/K/V projections {keys}"
+                )
+            wq, wk, wv = (state_dict[k] for k in keys)
             # TODO: check whether this all-gather can be avoided.
             # Gather to Replicate so the n_kv reshape is local; stays a DTensor
             # so the fused result can be copied into the sharded wqkv param.
@@ -180,6 +194,10 @@ class QKVLinear(nn.Module):
             q = wq.reshape(n_kv, hpk, hd, *tail)
             k = wk.reshape(n_kv, 1, hd, *tail)
             v = wv.reshape(n_kv, 1, hd, *tail)
-            state_dict[f"{prefix}wqkv.{param}"] = torch.cat([q, k, v], dim=1).reshape(
-                -1, *tail
-            )
+            value = torch.cat([q, k, v], dim=1).reshape(-1, *tail)
+            merged.append((keys, fused_key, value))
+        # Keep the source entries intact if any projection cannot be merged.
+        for keys, fused_key, value in merged:
+            for key in keys:
+                del state_dict[key]
+            state_dict[fused_key] = value

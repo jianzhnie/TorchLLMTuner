@@ -2,18 +2,16 @@
 
 Vendored from torchtitan ``models/common/async_linear.py`` (renamed from
 ``dist_gemm.py`` upstream in 9e159aed7).
-These are drop-in
-replacements for the stock QKV, output and SwiGLU projections: they move the TP
-collective inside the GEMM, over the autograd Functions in
+These replace the stock QKV, output and SwiGLU projections. They move the TP
+collective inside the GEMM, using the autograd Functions in
 ``llmtuner/parallel/tensor_parallel/linear_ops.py`` (which holds the collective+GEMM
 math itself; this file is only the wiring and the fallbacks).
 
 What changed from upstream:
 
-* Each class takes its sizes and weights as keyword args, like the rest of
-  llmtuner. Upstream's empty ``Config`` subclasses existed only to make the fused
-  class name a config choice; without a config system there is nothing to
-  choose between.
+* Modules are constructed directly. QKV and FFN inherit their base
+  constructors; ReduceScatterLinear takes feature sizes followed by a keyword
+  bias option. Upstream's nested ``Config`` subclasses are omitted.
 * ``TensorParallelFeedForward`` subclasses :class:`~llmtuner.models.common.feed_forward.
   FeedForward`, as it does upstream: the fused and unfused paths share the weight
   layout (``w13`` holding the interleaved gate and up) and the activation split,
@@ -31,8 +29,6 @@ a misconfiguration looks like success -- hence the warning rather than silence.
 """
 
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn as nn
@@ -52,7 +48,7 @@ logger = get_logger(__name__)
 __all__ = [
     "AllGatherFusedQKVLinear",
     "TensorParallelFeedForward",
-    "RowParallelLinear",
+    "ReduceScatterLinear",
     "validate_tp_projection_preconditions",
 ]
 
@@ -126,13 +122,13 @@ class AllGatherFusedQKVLinear(QKVLinear):
         )
 
 
-class RowParallelLinear(nn.Module):
+class ReduceScatterLinear(nn.Module):
     """A rowwise linear whose matmul is fused with the TP reduce-scatter.
 
-    Named for the role it fills rather than the collective it performs, so it
-    does not read like the :class:`LinearReduceScatter` autograd Function it
-    calls. Nothing here is attention-specific -- it serves attention's output
-    projection and the FFN's down projection alike.
+    Constructed from full feature dimensions, unlike the HF sharding wrapper
+    in ``parallel/tensor_parallel/tensor_parallel.py``, which receives already
+    sharded weights. This module delegates fused communication and GEMMs to
+    the ``LinearReduceScatter`` autograd Function.
 
     Args:
         in_features: input feature count (the weight's second dim).
@@ -149,6 +145,14 @@ class RowParallelLinear(nn.Module):
         bias: bool = False,
     ) -> None:
         super().__init__()
+        for name, value in (
+            ("in_features", in_features),
+            ("out_features", out_features),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be positive integer, got {value!r}")
+        if not isinstance(bias, bool):
+            raise TypeError(f"bias must be bool, got {type(bias).__name__}")
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -156,17 +160,8 @@ class RowParallelLinear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """Initialize exactly as ``nn.Linear`` does.
-
-        Upstream subclasses ``Linear`` and gets this from its constructor; with
-        the parameters held directly, ``torch.empty`` would otherwise leave
-        them as uninitialized memory.
-        """
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
+        """Reuse standard Linear initialization for the same parameter layout."""
+        nn.Linear.reset_parameters(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         tp_group = spmd_mesh_group("tp")
