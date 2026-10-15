@@ -40,21 +40,23 @@ def insert_vision_placeholders(
             f"Expected one vision token count per placeholder: got "
             f"{num_placeholders} placeholders and {len(num_vision_tokens)} counts"
         )
-    if any(count < 0 for count in num_vision_tokens):
-        raise ValueError("Vision token counts must be nonnegative")
+    if any(
+        not isinstance(count, int) or isinstance(count, bool) or count < 0
+        for count in num_vision_tokens
+    ):
+        raise ValueError("Vision token counts must be nonnegative integers")
     output_parts: list[str] = []
-    vision_idx = 0
+    token_counts = iter(num_vision_tokens)
 
     for part in input_parts:
         if part is None:
             output_parts.extend(
                 [
                     vision_start_token,
-                    *([vision_token] * num_vision_tokens[vision_idx]),
+                    vision_token * next(token_counts),
                     vision_end_token,
                 ]
             )
-            vision_idx += 1
         else:
             output_parts.append(part)
 

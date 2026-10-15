@@ -55,32 +55,28 @@ Workflow overview::
 
 Vendored from torchtitan ``hf_datasets/multimodal/mm_datasets.py``. The
 per-dataset sample function is a constructor argument, which is why
-``MULTIMODAL_DATASETS`` binds it with ``functools.partial`` rather than wrapping each
-one in its own config subclass.
+``recipes.MULTIMODAL_DATASETS`` binds it with ``functools.partial`` rather than
+wrapping each one in its own config subclass.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from functools import partial
 from typing import Any
 
 import numpy as np
 import torch
 
 from ...components.loss import IGNORE_INDEX
-from ...components.tokenizer import MultimodalTokenizer
+from ...components.tokenizer.multimodal import MultimodalTokenizer
 from ...utils.logging import get_logger
-from ..composition import SingleDataset, is_not_none
 from ..contracts import DatasetBuildContext, SampleProcessor
-from ..sources import HuggingFaceStreamingSource
 from .image import calculate_vision_tokens, process_image, resize_to_pixel_budget
 from .placeholders import insert_vision_placeholders
 
 logger = get_logger(__name__)
 
 __all__ = [
-    "MULTIMODAL_DATASETS",
     "MultimodalProcessor",
 ]
 
@@ -88,6 +84,7 @@ __all__ = [
 def process_multimodal_sample(
     texts: list[str | None],
     images: list[bytes | None],
+    *,
     tokenizer: MultimodalTokenizer,
     patch_size: int,
     temporal_patch_size: int,
@@ -99,7 +96,7 @@ def process_multimodal_sample(
     resize_fn: Callable[..., tuple[int, int, int, int]],
     max_patches: int,
     max_patches_per_side: int,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any] | None:
     """Common processing logic for multimodal samples.
 
@@ -216,43 +213,24 @@ def process_multimodal_sample(
 
 def process_obelics_sample(
     sample: dict[str, Any],
+    *,
     tokenizer: MultimodalTokenizer,
-    patch_size: int,
-    temporal_patch_size: int,
-    spatial_merge_size: int,
-    min_pixels: int,
-    max_pixels: int,
-    image_mean: tuple[float, ...],
-    image_std: tuple[float, ...],
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any] | None:
     """Process a sample from the OBELICS dataset (interleaved text and images)."""
     return process_multimodal_sample(
         texts=sample.get("texts", []),
         images=sample.get("images", []),
         tokenizer=tokenizer,
-        patch_size=patch_size,
-        temporal_patch_size=temporal_patch_size,
-        spatial_merge_size=spatial_merge_size,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
-        image_mean=image_mean,
-        image_std=image_std,
         **kwargs,
     )
 
 
 def process_cc12_wd_sample(
     sample: dict[str, Any],
+    *,
     tokenizer: MultimodalTokenizer,
-    patch_size: int,
-    temporal_patch_size: int,
-    spatial_merge_size: int,
-    min_pixels: int,
-    max_pixels: int,
-    image_mean: tuple[float, ...],
-    image_std: tuple[float, ...],
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any] | None:
     """Process a sample from the CC12-WD dataset (text-image pairs)."""
     text = sample.get("txt", "")
@@ -271,13 +249,6 @@ def process_cc12_wd_sample(
         texts=texts,
         images=images,
         tokenizer=tokenizer,
-        patch_size=patch_size,
-        temporal_patch_size=temporal_patch_size,
-        spatial_merge_size=spatial_merge_size,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
-        image_mean=image_mean,
-        image_std=image_std,
         **kwargs,
     )
 
@@ -361,43 +332,3 @@ class MultimodalProcessor(SampleProcessor):
             )
             return None
         return processed
-
-
-MULTIMODAL_DATASETS: dict[str, SingleDataset] = {
-    "obelics": SingleDataset(
-        source=HuggingFaceStreamingSource(
-            path="HuggingFaceM4/OBELICS",
-            split="train",
-        ),
-        processor=partial(
-            MultimodalProcessor,
-            sample_processor=process_obelics_sample,
-        ),
-        post_filters=(is_not_none,),
-    ),
-    "cc12m": SingleDataset(
-        source=HuggingFaceStreamingSource(
-            path="pixparse/cc12m-wds",
-            split="train",
-        ),
-        processor=partial(
-            MultimodalProcessor,
-            sample_processor=process_cc12_wd_sample,
-        ),
-        post_filters=(is_not_none,),
-    ),
-    "cc12m-test": SingleDataset(
-        source=HuggingFaceStreamingSource(
-            path="tests/assets/cc12m_test",
-            split="train",
-            load_dataset_kwargs={
-                "data_files": {"train": "*.tar"},
-            },
-        ),
-        processor=partial(
-            MultimodalProcessor,
-            sample_processor=process_cc12_wd_sample,
-        ),
-        post_filters=(is_not_none,),
-    ),
-}

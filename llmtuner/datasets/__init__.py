@@ -1,42 +1,45 @@
-"""The data pipeline: a Grain dataset graph plus the loaders that drive it.
+"""Public data contracts, recipes, packing builders, and dataloaders.
 
-The public surface is the substrate below plus ``build_dataloader``, which
-assembles them from a ``llmtuner.config.DataloaderConfig``. The concrete dataset
-catalogs (``datasets.text.processors``, ``datasets.multimodal.processors``) are
-deliberately not re-exported: they pull in optional dependencies -- torchvision,
-and a video backend behind them -- that a run using none of them should not have
-to install. Neither subpackage's ``__init__`` imports its children, for the same
-reason; ``build_dataloader`` is the only entry point that decides.
+build_dataloader consumes LLMTunerConfig plus runtime DP ownership and token
+budgets. Text recipes are loaded with the builder; multimodal recipes and media
+backends are imported only when a multimodal dataset is requested. Concrete
+catalogs live in text/recipes.py and multimodal/recipes.py and are not re-exported.
+Exports resolve on first access so importing a standalone helper does not require
+Grain or load dataset catalogs. Implementation code imports defining modules.
 """
 
-from .collators import HAS_PIN_MEMORY, Collator, TextCollator, TrainerBatch
-from .composition import (
-    DatasetConcat,
-    DatasetMix,
-    GrainDataset,
-    SingleDataset,
-    WeightedDataset,
-    build_dataset,
-)
-from .contracts import (
-    DatasetBuildContext,
-    DatasetIterationPolicy,
-    SampleProcessor,
-    TextSequence,
-)
-from .dataloader import BaseDataLoader, DataloaderExhaustedError, GrainDataLoader
-from .loader_builder import build_dataloader
-from .packing import (
-    build_concat_then_split_packing,
-    build_first_fit_packing,
-)
-from .sources import (
-    HuggingFaceRandomAccessSource,
-    HuggingFaceStreamingSource,
-    IndexedJsonlSource,
-    RandomAccessDataSource,
-    build_source,
-)
+from typing import Any
+
+from ..utils.lazy_exports import resolve_export
+
+_EXPORT_SOURCES = {
+    "HAS_PIN_MEMORY": "collators",
+    "Collator": "collators",
+    "TextCollator": "collators",
+    "DatasetConcat": "composition",
+    "DatasetMix": "composition",
+    "DatasetRecipe": "composition",
+    "SingleDataset": "composition",
+    "WeightedDataset": "composition",
+    "build_dataset": "composition",
+    "BaseDataLoader": "contracts",
+    "DataloaderExhaustedError": "contracts",
+    "DatasetBuildContext": "contracts",
+    "DatasetIterationPolicy": "contracts",
+    "GrainDataset": "contracts",
+    "SampleProcessor": "contracts",
+    "TextSequence": "contracts",
+    "TrainerBatch": "contracts",
+    "GrainDataLoader": "dataloader",
+    "build_dataloader": "loader_builder",
+    "build_concat_then_split_packing": "packing.build",
+    "build_first_fit_packing": "packing.build",
+    "HuggingFaceRandomAccessSource": "sources",
+    "HuggingFaceStreamingSource": "sources",
+    "IndexedJsonlSource": "sources",
+    "RandomAccessDataSource": "sources",
+    "build_source": "sources",
+}
 
 __all__ = [
     "BaseDataLoader",
@@ -45,6 +48,7 @@ __all__ = [
     "DatasetConcat",
     "DatasetIterationPolicy",
     "DatasetMix",
+    "DatasetRecipe",
     "DataloaderExhaustedError",
     "GrainDataLoader",
     "GrainDataset",
@@ -65,3 +69,11 @@ __all__ = [
     "build_first_fit_packing",
     "build_source",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    return resolve_export(__name__, _EXPORT_SOURCES, name)
+
+
+def __dir__() -> list[str]:
+    return sorted(_EXPORT_SOURCES)

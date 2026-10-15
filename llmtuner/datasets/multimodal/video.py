@@ -24,6 +24,7 @@ __all__ = ["load_video", "process_video"]
 
 def load_video(
     path: str,
+    *,
     fps: float = 2.0,
     min_frames: int = 4,
     max_frames: int = 768,
@@ -59,6 +60,7 @@ def load_video(
                 total_frames = int(
                     float(stream.duration * stream.time_base) * video_fps
                 )
+            all_frames = None
             if total_frames == 0:
                 # No metadata available -- decode all frames to count them
                 container.seek(0)
@@ -69,21 +71,16 @@ def load_video(
                 if not all_frames:
                     return None
                 total_frames = len(all_frames)
-                duration = total_frames / video_fps
-                nframes = max(min_frames, min(int(duration * fps), max_frames))
-                nframes = min(nframes, total_frames)
-                indices = np.linspace(0, total_frames - 1, nframes).astype(int).tolist()
-                selected = [all_frames[i] for i in indices]
-                return torch.from_numpy(np.stack(selected))
 
             duration = total_frames / video_fps
             nframes = int(duration * fps)
             nframes = max(min_frames, min(nframes, max_frames))
             nframes = min(nframes, total_frames)
 
-            indices = set(
-                np.linspace(0, total_frames - 1, nframes).astype(int).tolist()
-            )
+            indices = np.linspace(0, total_frames - 1, nframes).astype(int).tolist()
+            if all_frames is not None:
+                return torch.from_numpy(np.stack([all_frames[i] for i in indices]))
+            selected_indices = set(indices)
 
             # Must decode sequentially -- inter-frame codecs (H.264/H.265) have
             # dependencies between frames. Only selected frames are converted to
@@ -91,7 +88,7 @@ def load_video(
             frames = []
             container.seek(0)
             for i, frame in enumerate(container.decode(video=0)):
-                if i in indices:
+                if i in selected_indices:
                     frames.append(frame.to_ndarray(format="rgb24"))
 
         if not frames:
@@ -106,10 +103,11 @@ def load_video(
 
 def process_video(
     video: torch.Tensor,
+    *,
     patch_size: int,
     merge_size: int,
-    max_pixels: int,
     min_pixels: int,
+    max_pixels: int,
     image_mean: tuple[float, ...] = (0.5, 0.5, 0.5),
     image_std: tuple[float, ...] = (0.5, 0.5, 0.5),
 ) -> torch.Tensor:
@@ -121,20 +119,26 @@ def process_video(
         video: Raw video tensor of shape (T, H, W, C) in uint8.
         patch_size: Spatial patch size.
         merge_size: Spatial merge size.
-        max_pixels: Maximum spatial pixels per frame (H * W budget).
         min_pixels: Minimum spatial pixels per frame (H * W budget).
+        max_pixels: Maximum spatial pixels per frame (H * W budget).
         image_mean: Per-channel mean for normalization.
         image_std: Per-channel std for normalization.
 
     Returns:
         Normalized tensor of shape (T, H', W', C) in float32.
     """
-    T, H, W, C = video.shape
+    if video.ndim != 4 or any(size < 1 for size in video.shape):
+        raise ValueError("video must have nonempty (T, H, W, C) dimensions")
+    if video.shape[-1] != 3 or video.dtype != torch.uint8:
+        raise ValueError("video must contain uint8 RGB pixels")
+    if patch_size < 1 or merge_size < 1:
+        raise ValueError("patch_size and merge_size must be positive")
+    _, height, width, _ = video.shape
     factor = patch_size * merge_size
 
     target_h, target_w = smart_resize(
-        H,
-        W,
+        height,
+        width,
         factor=factor,
         min_pixels=min_pixels,
         max_pixels=max_pixels,

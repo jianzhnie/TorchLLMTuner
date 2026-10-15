@@ -6,31 +6,66 @@ then construct the loader. Synthetic data bypasses tokenizer and packing setup.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import grain.python as grain
 
-from .collators import PipelineTextCollator, TextCollator
-from .contracts import DatasetBuildContext, DatasetIterationPolicy
-from .dataloader import BaseDataLoader, GrainDataLoader
-from .packing import build_concat_then_split_packing, build_first_fit_packing
+from .collators import CollatorFactory, PipelineTextCollator, TextCollator
+from .contracts import (
+    BaseDataLoader,
+    DatasetBuildContext,
+    DatasetIterationPolicy,
+    require_positive_integer,
+    validate_dp_coordinates,
+)
+from .dataloader import GrainDataLoader
+from .packing.build import (
+    build_concat_then_split_packing,
+    build_first_fit_packing,
+)
 from .synthetic import RandomTokenDataLoader
-from .text.processors import (
+from .text.recipes import (
     DATASETS,
-    make_local_jsonl,
-    make_local_jsonl_sft,
-    make_local_jsonl_sft_multiturn,
+    build_local_jsonl,
+    build_local_jsonl_sft,
+    build_local_jsonl_sft_multiturn,
 )
 
 if TYPE_CHECKING:
-    from ..config import LLMTunerConfig
+    from ..components.tokenizer.base import BaseTokenizer
+    from ..config.data_config import DataloaderConfig
+    from ..config.llmtuner_config import LLMTunerConfig
+    from .composition import DatasetRecipe
 
 __all__ = ["build_dataloader"]
 
 
-def _resolve_multimodal_recipe(dataset_name: str):
+class _PackingBuilder(Protocol):
+    """Build a packing graph after recipe-specific options have been bound."""
+
+    def __call__(
+        self,
+        dataset: DatasetRecipe,
+        *,
+        context: DatasetBuildContext,
+        iteration_policy: DatasetIterationPolicy,
+    ) -> grain.IterDataset: ...
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _ResolvedRecipe:
+    """Recipe-specific graph and collation choices for shared loader assembly."""
+
+    dataset: DatasetRecipe
+    build_packing: _PackingBuilder
+    collator: CollatorFactory
+
+
+def _resolve_multimodal_recipe(
+    dataset_name: str, *, num_packing_bins: int
+) -> _ResolvedRecipe:
     """Find one multimodal recipe and its collator and packer, imported lazily.
 
     The import stays inside the call: the multimodal subtree pulls in
@@ -42,7 +77,7 @@ def _resolve_multimodal_recipe(dataset_name: str):
     try:
         from .multimodal.collator import MultimodalCollator
         from .multimodal.packing import build_multimodal_packing
-        from .multimodal.processors import MULTIMODAL_DATASETS
+        from .multimodal.recipes import MULTIMODAL_DATASETS
     except ImportError as exc:
         raise ImportError(
             f"dataset {dataset_name!r} is not one of the text "
@@ -58,14 +93,21 @@ def _resolve_multimodal_recipe(dataset_name: str):
             f"'local_jsonl', a text recipe {sorted(DATASETS)}, or a "
             f"multimodal recipe {sorted(MULTIMODAL_DATASETS)}"
         )
-    return (
-        MULTIMODAL_DATASETS[dataset_name],
-        MultimodalCollator,
-        build_multimodal_packing,
+    return _ResolvedRecipe(
+        dataset=MULTIMODAL_DATASETS[dataset_name],
+        build_packing=partial(
+            build_multimodal_packing, num_packing_bins=num_packing_bins
+        ),
+        collator=MultimodalCollator,
     )
 
 
-def _resolve_text_recipe(dataloader_config, *, dataset_name: str, tokenizer):
+def _resolve_text_recipe(
+    dataloader_config: DataloaderConfig,
+    *,
+    dataset_name: str,
+    tokenizer: BaseTokenizer,
+) -> _ResolvedRecipe:
     """Find one text recipe and its packing and collation policy.
 
     Both recipes are built the same way and differ only in kind: the
@@ -73,7 +115,7 @@ def _resolve_text_recipe(dataloader_config, *, dataset_name: str, tokenizer):
     why the trainer needs no way to tell them apart.
     """
     if dataset_name == "local_jsonl":
-        recipe = make_local_jsonl(path=dataloader_config.dataset_path)
+        recipe = build_local_jsonl(path=dataloader_config.dataset_path)
     elif dataset_name == "local_jsonl_sft":
         if dataloader_config.chat_renderer is not None:
             # Imported here, not at module scope: the renderers package is an
@@ -81,7 +123,7 @@ def _resolve_text_recipe(dataloader_config, *, dataset_name: str, tokenizer):
             # must not have to install it.
             from llmtuner.datasets.text.renderer import build_chat_renderer
 
-            recipe = make_local_jsonl_sft_multiturn(
+            recipe = build_local_jsonl_sft_multiturn(
                 path=dataloader_config.dataset_path,
                 messages_field=dataloader_config.messages_field,
                 renderer=build_chat_renderer(
@@ -90,23 +132,23 @@ def _resolve_text_recipe(dataloader_config, *, dataset_name: str, tokenizer):
                 ),
             )
         else:
-            recipe = make_local_jsonl_sft(
+            recipe = build_local_jsonl_sft(
                 path=dataloader_config.dataset_path,
                 prompt_field=dataloader_config.prompt_field,
                 response_field=dataloader_config.response_field,
             )
     else:
         recipe = DATASETS[dataset_name]
+    build_packing: _PackingBuilder = build_concat_then_split_packing
     if dataloader_config.packing == "first_fit":
-        # Always passed, at its default when unset: forwarding it only for
-        # first_fit would make it a field whose value is silently dropped.
-        return (
-            recipe,
+        # Bind recipe-specific options before the shared graph-building step.
+        build_packing = partial(
             build_first_fit_packing,
-            {"num_packing_bins": dataloader_config.num_packing_bins},
-            TextCollator,
+            num_packing_bins=dataloader_config.num_packing_bins,
         )
-    return recipe, build_concat_then_split_packing, {}, TextCollator
+    return _ResolvedRecipe(
+        dataset=recipe, build_packing=build_packing, collator=TextCollator
+    )
 
 
 def build_dataloader(
@@ -144,6 +186,7 @@ def build_dataloader(
     caller, so validation can score a held-out corpus without forking the
     config. Both default to the training behaviour.
     """
+    validate_dp_coordinates(dp_rank=dp_rank, dp_world_size=dp_world_size)
     dataloader_config = config.dataloader
     max_context_length = config.max_seq_len
     dataset_name = dataloader_config.dataset if dataset is None else dataset
@@ -164,17 +207,30 @@ def build_dataloader(
         and dataset_name not in DATASETS
     )
 
+    require_positive_integer("num_tokens_per_batch", num_tokens_per_batch)
+    num_microbatches = (
+        config.parallel.num_pp_microbatches
+        if not is_multimodal and config.parallel.pipeline_parallel_size > 1
+        else 1
+    )
+    require_positive_integer("num_pp_microbatches", num_microbatches)
+    if num_tokens_per_batch % num_microbatches:
+        raise ValueError("token batch must be divisible by num_pp_microbatches")
+    packing_tokens_per_batch = num_tokens_per_batch // num_microbatches
+
     # Imported here, not at module scope: building the tokenizer pulls in
     # ``tokenizers``/``jinja2``, and a random-token run should not have to
     # have them installed.
-    from llmtuner.components.tokenizer import HuggingFaceTokenizer
+    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
 
     if is_multimodal:
         # Resolved before the tokenizer is constructed, so a bad name fails
         # fast without loading tokenizer assets.
-        from llmtuner.components.tokenizer import MultimodalTokenizer
+        from llmtuner.components.tokenizer.multimodal import MultimodalTokenizer
 
-        recipe, collator, build_packing = _resolve_multimodal_recipe(dataset_name)
+        resolved = _resolve_multimodal_recipe(
+            dataset_name, num_packing_bins=dataloader_config.num_packing_bins
+        )
         tokenizer = MultimodalTokenizer(
             tokenizer_path=dataloader_config.tokenizer_path,
             image_token=dataloader_config.mm_image_token,
@@ -188,41 +244,34 @@ def build_dataloader(
         # split, and the collator reshapes the media into patches. This is not
         # ``--packing``: that selector names a text recipe, and the media path
         # ignores it.
-        packing_kwargs: dict[str, int] = {}
     else:
         tokenizer = HuggingFaceTokenizer(
             tokenizer_path=dataloader_config.tokenizer_path
         )
-        recipe, build_packing, packing_kwargs, collator = _resolve_text_recipe(
+        resolved = _resolve_text_recipe(
             dataloader_config, dataset_name=dataset_name, tokenizer=tokenizer
         )
     context = DatasetBuildContext(
         tokenizer=tokenizer,
         max_context_length=max_context_length,
-        num_tokens_per_batch=num_tokens_per_batch,
+        num_tokens_per_batch=packing_tokens_per_batch,
         read_options=grain.ReadOptions(),
         max_num_documents=dataloader_config.max_num_documents,
     )
-    packing_context = context
-    if not is_multimodal and config.parallel.pipeline_parallel_size > 1:
-        num_microbatches = config.parallel.num_pp_microbatches
-        if num_tokens_per_batch % num_microbatches:
-            raise ValueError("token batch must be divisible by num_pp_microbatches")
-        if num_microbatches > 1:
-            packing_context = replace(
-                context, num_tokens_per_batch=num_tokens_per_batch // num_microbatches
-            )
-            collator = partial(PipelineTextCollator, num_microbatches=num_microbatches)
+    collator = (
+        partial(PipelineTextCollator, num_microbatches=num_microbatches)
+        if num_microbatches > 1
+        else resolved.collator
+    )
     # The iteration policy is spent here, on the graph it orders, rather than
     # handed down: the loader takes the built graph, so a policy on the loader
     # would be a parameter no line of it reads. What does reach the loader is
     # what batching -- not ordering -- reads: the prefetch depth, the drop
     # policy, and the token batch the collator assembles into.
-    graph = build_packing(
-        recipe,
-        **packing_kwargs,
-        context=packing_context,
-        dataset_iteration_policy=DatasetIterationPolicy(
+    graph = resolved.build_packing(
+        resolved.dataset,
+        context=context,
+        iteration_policy=DatasetIterationPolicy(
             seed=config.seed,
             shuffle=dataloader_config.shuffle,
             repeat=repeat,

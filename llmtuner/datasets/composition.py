@@ -1,27 +1,15 @@
-"""Composable dataset recipes backed by Grain.
+"""Build Grain graphs from composable dataset recipes.
 
-Vendored from torchtitan ``components/data/dataset.py``. Each node here is a
-plain dataclass describing a recipe; the free function :func:`build_dataset`
-turns one into a Grain graph. Construction lives outside the dataclass because
-it takes arguments the description does not have -- which rank am I, how many
-tokens per batch -- and because a class that carries its own builder suggests
-the built graph is one of its fields, which it is not. That is the shape
-``llmtuner/config/`` states for every config in the package (descriptions, not
-builders) and the one ``components/optimizer`` and ``components/profiler``
-already use. A ``SampleProcessor`` gets its runtime values, the tokenizer above
-all, as ``__init__(*, context)``.
+Adapted from torchtitan ``components/data/dataset.py``. SingleDataset describes
+one source and its row transforms; DatasetMix interleaves weighted children;
+DatasetConcat joins finite map-style children. Builders receive runtime values
+through DatasetBuildContext and ordering/sharding through DatasetIterationPolicy.
 
-The three nodes are named for what they are -- a single dataset, a mix, a
-concatenation -- rather than suffixed ``Config``. A ``...Config`` name promises
-a description of something built later; these are nodes, and the thing built
-from them is a ``GrainDataset`` the caller already holds the type of.
-
-The ordering in :func:`build_map_dataset` is the part that must not move. It
-runs pre-filters, then the processor, then post-filters, and only then shuffles,
-shards, and repeats. Shuffling after filtering is what makes the DP slices
-disjoint *and* uniform; sharding before filtering would leave ranks with
-different numbers of surviving rows, and the loader's even-step assumption
-(``repeat=True``) would silently stop holding.
+Map graphs apply pre-filters, processing, and post-filters before global shuffle,
+DP sharding, and repeat. Grain map filters preserve indexed slots and mark
+rejected rows as None, so disjoint index slices do not guarantee equal numbers
+of usable rows. Streaming sources handle ownership in build_source and shuffle
+raw rows before processing. Packing and loaders consume the resulting graphs.
 """
 
 from __future__ import annotations
@@ -29,23 +17,23 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from numbers import Real
 from typing import Any, TypeAlias, TypeVar, cast
 
 import grain.python as grain
 
-from .contracts import DatasetBuildContext, DatasetIterationPolicy, SampleProcessor
-from .sources import (
-    HuggingFaceRandomAccessSource,
-    HuggingFaceStreamingSource,
-    IndexedJsonlSource,
-    RandomAccessDataSource,
-    build_source,
+from .contracts import (
+    DatasetBuildContext,
+    DatasetIterationPolicy,
+    GrainDataset,
+    SampleProcessorFactory,
 )
+from .sources import DatasetSource, RandomAccessDataSource, build_source
 
 __all__ = [
     "DatasetConcat",
     "DatasetMix",
-    "GrainDataset",
+    "DatasetRecipe",
     "SingleDataset",
     "WeightedDataset",
     "as_iter_dataset",
@@ -53,7 +41,6 @@ __all__ = [
     "is_not_none",
 ]
 
-GrainDataset: TypeAlias = grain.MapDataset | grain.IterDataset
 _DatasetT = TypeVar("_DatasetT", grain.MapDataset, grain.IterDataset)
 
 
@@ -65,21 +52,13 @@ class SingleDataset:
     This node owns the leaf shuffle, repeat, and effective-DP sharding.
     """
 
-    source: (
-        IndexedJsonlSource
-        | HuggingFaceRandomAccessSource
-        | HuggingFaceStreamingSource
-        | RandomAccessDataSource
-        | grain.IterDataset
-    )
+    source: DatasetSource
     pre_filters: tuple[Callable[[Any], bool], ...] = ()
-    processor: type[SampleProcessor] | None = None
-    """Processor class, constructed per build as ``processor(context=context)``.
+    processor: SampleProcessorFactory | None = None
+    """Factory called once per build as ``processor(context=context)``.
 
-    A class rather than a bound :func:`functools.partial`: a partial's fixed
-    keyword arguments are *overridden* by an explicit keyword at the call site,
-    so ``partial(Proc, context=other)`` here would be silently replaced by the
-    build context rather than raising.
+    Use a processor class directly or a partial binding processor options.
+    The build context always comes from this graph's caller.
     """
     post_filters: tuple[Callable[[Any], bool], ...] = ()
 
@@ -113,46 +92,37 @@ def as_iter_dataset(
 
 
 def build_dataset(
-    node: SingleDataset | DatasetMix | DatasetConcat,
+    node: DatasetRecipe,
     *,
     context: DatasetBuildContext,
-    dataset_iteration_policy: DatasetIterationPolicy,
+    iteration_policy: DatasetIterationPolicy,
 ) -> GrainDataset:
     """Build one node of a Grain dataset graph from its description.
 
-    Dispatches on the concrete class rather than a method, so a new recipe has
-    to be added here -- and the union below stops type-checking until it is.
+    Dispatches on the concrete node class. Add new node kinds to both this
+    dispatcher and DatasetRecipe so builders share the same accepted types.
     """
-    if isinstance(node, SingleDataset):
-        return build_single(
-            node,
-            context=context,
-            dataset_iteration_policy=dataset_iteration_policy,
-        )
-    if isinstance(node, DatasetMix):
-        return build_mix(
-            node,
-            context=context,
-            dataset_iteration_policy=dataset_iteration_policy,
-        )
-    if isinstance(node, DatasetConcat):
-        return build_concat(
-            node,
-            context=context,
-            dataset_iteration_policy=dataset_iteration_policy,
-        )
-    raise TypeError(f"unhandled dataset type {type(node).__qualname__}")
+    match node:
+        case SingleDataset():
+            builder = build_single_dataset
+        case DatasetMix():
+            builder = build_dataset_mix
+        case DatasetConcat():
+            builder = build_dataset_concat
+        case _:
+            raise TypeError(f"unhandled dataset type {type(node).__qualname__}")
+    return builder(node, context=context, iteration_policy=iteration_policy)
 
 
-def build_single(
+def build_single_dataset(
     node: SingleDataset,
     *,
     context: DatasetBuildContext,
-    dataset_iteration_policy: DatasetIterationPolicy,
+    iteration_policy: DatasetIterationPolicy,
 ) -> GrainDataset:
     source = build_source(
         node.source,
-        dataset_iteration_policy=dataset_iteration_policy,
+        iteration_policy=iteration_policy,
     )
     if isinstance(source, RandomAccessDataSource):
         dataset: GrainDataset = grain.MapDataset.source(source)
@@ -162,49 +132,16 @@ def build_single(
         raise TypeError("source must be a RandomAccessDataSource or grain.IterDataset")
 
     if isinstance(dataset, grain.MapDataset):
-        return build_map_dataset(
-            node,
-            dataset,
-            context=context,
-            dataset_iteration_policy=dataset_iteration_policy,
+        dataset = apply_sample_transforms(
+            node, dataset, context=context, seed=iteration_policy.seed
         )
-    return build_iter_dataset(
-        node,
-        dataset,
-        context=context,
-        dataset_iteration_policy=dataset_iteration_policy,
-    )
-
-
-def build_map_dataset(
-    node: SingleDataset,
-    dataset: grain.MapDataset,
-    *,
-    context: DatasetBuildContext,
-    dataset_iteration_policy: DatasetIterationPolicy,
-) -> grain.MapDataset:
-    """Process globally indexed rows before shuffle, sharding, and repeat."""
-    dataset = apply_sample_transforms(
-        node, dataset, context=context, seed=dataset_iteration_policy.seed
-    )
-
-    return apply_iteration_policy(dataset, dataset_iteration_policy)
-
-
-def build_iter_dataset(
-    node: SingleDataset,
-    dataset: grain.IterDataset,
-    *,
-    context: DatasetBuildContext,
-    dataset_iteration_policy: DatasetIterationPolicy,
-) -> grain.IterDataset:
-    """Shuffle streaming rows before row processing."""
+        return apply_iteration_policy(dataset, iteration_policy)
     # Shuffle raw stream rows.
-    if dataset_iteration_policy.shuffle:
+    if iteration_policy.shuffle:
         dataset = grain.experimental.WindowShuffleIterDataset(
             dataset,
-            window_size=dataset_iteration_policy.streaming_shuffle_buffer_size,
-            seed=dataset_iteration_policy.seed,
+            window_size=iteration_policy.streaming_shuffle_buffer_size,
+            seed=iteration_policy.seed,
         )
 
     # Streaming processors use a per-rank seed; map processors share the
@@ -213,7 +150,7 @@ def build_iter_dataset(
         node,
         dataset,
         context=context,
-        seed=dataset_iteration_policy.seed + dataset_iteration_policy.dp_rank,
+        seed=iteration_policy.seed + iteration_policy.dp_rank,
     )
 
 
@@ -236,7 +173,7 @@ def apply_sample_transforms(
 
 def shard_for_dp(
     dataset: grain.MapDataset,
-    dataset_iteration_policy: DatasetIterationPolicy,
+    iteration_policy: DatasetIterationPolicy,
 ) -> grain.MapDataset:
     """Give ``dp_rank`` a contiguous, disjoint slice of ``dataset``.
 
@@ -244,8 +181,8 @@ def shard_for_dp(
     computed from the index: a contiguous slice of the shuffled index space is
     still an even share of the whole, and it keeps each rank's reads sequential.
     """
-    dp_world_size = dataset_iteration_policy.dp_world_size
-    dp_rank = dataset_iteration_policy.dp_rank
+    dp_world_size = iteration_policy.dp_world_size
+    dp_rank = iteration_policy.dp_rank
     if len(dataset) < dp_world_size:
         raise ValueError(
             f"dataset has {len(dataset)} rows, fewer than dp_world_size={dp_world_size}"
@@ -260,7 +197,7 @@ def shard_for_dp(
 
 def apply_iteration_policy(
     dataset: grain.MapDataset,
-    dataset_iteration_policy: DatasetIterationPolicy,
+    iteration_policy: DatasetIterationPolicy,
 ) -> grain.MapDataset:
     """Apply the map-side iteration policy: shuffle, shard, repeat.
 
@@ -275,10 +212,10 @@ def apply_iteration_policy(
       the upstream shuffle re-runs with seed + epoch on each repeat instead of
       re-slicing the same order.
     """
-    if dataset_iteration_policy.shuffle:
-        dataset = dataset.shuffle(seed=dataset_iteration_policy.seed)
-    dataset = shard_for_dp(dataset, dataset_iteration_policy)
-    if dataset_iteration_policy.repeat:
+    if iteration_policy.shuffle:
+        dataset = dataset.shuffle(seed=iteration_policy.seed)
+    dataset = shard_for_dp(dataset, iteration_policy)
+    if iteration_policy.repeat:
         dataset = dataset.repeat()
     return dataset
 
@@ -287,7 +224,7 @@ def apply_iteration_policy(
 class WeightedDataset:
     """A dataset and its relative selection weight."""
 
-    dataset: SingleDataset | DatasetMix | DatasetConcat
+    dataset: DatasetRecipe
     weight: float = 1.0
 
 
@@ -308,29 +245,39 @@ class DatasetMix:
     datasets: tuple[WeightedDataset, ...]
 
 
-def build_mix(
+def build_dataset_mix(
     node: DatasetMix,
     *,
     context: DatasetBuildContext,
-    dataset_iteration_policy: DatasetIterationPolicy,
+    iteration_policy: DatasetIterationPolicy,
 ) -> GrainDataset:
     if not node.datasets or any(
-        not math.isfinite(item.weight) or item.weight <= 0 for item in node.datasets
+        not isinstance(item.weight, Real)
+        or isinstance(item.weight, bool)
+        or not math.isfinite(item.weight)
+        or item.weight <= 0
+        for item in node.datasets
     ):
         raise ValueError("DatasetMix requires finite, positive-weight datasets")
+    # Grain scales weights by 100 / min(weights). Normalize first so a
+    # common tiny or huge scale cannot overflow that intermediate value.
+    weights = [float(item.weight) for item in node.datasets]
+    minimum = min(weights)
+    weights = [weight / minimum for weight in weights]
+    if any(not math.isfinite(weight * 100) for weight in weights):
+        raise ValueError("DatasetMix weight ratios exceed Grain's numeric range")
     children = [
         build_dataset(
             item.dataset,
             context=context,
             # Inserting or reordering a child reseeds every later child.
-            dataset_iteration_policy=replace(
-                dataset_iteration_policy,
-                seed=dataset_iteration_policy.seed + index,
+            iteration_policy=replace(
+                iteration_policy,
+                seed=iteration_policy.seed + index,
             ),
         )
         for index, item in enumerate(node.datasets)
     ]
-    weights = [item.weight for item in node.datasets]
     # TODO(data-token-weighted-mix): Support source weights by token count,
     # not only emitted examples or packed rows. Checkpoint running estimates.
     if all(isinstance(child, grain.MapDataset) for child in children):
@@ -346,17 +293,21 @@ def build_mix(
 class DatasetConcat:
     """Concatenates finite children before global shuffle and DP sharding."""
 
-    datasets: tuple[SingleDataset | DatasetMix | DatasetConcat, ...]
+    datasets: tuple[DatasetRecipe, ...]
 
 
-def build_concat(
+DatasetRecipe: TypeAlias = SingleDataset | DatasetMix | DatasetConcat
+"""A source/transform recipe; build_dataset turns it into a GrainDataset."""
+
+
+def build_dataset_concat(
     node: DatasetConcat,
     *,
     context: DatasetBuildContext,
-    dataset_iteration_policy: DatasetIterationPolicy,
+    iteration_policy: DatasetIterationPolicy,
 ) -> grain.MapDataset:
     child_iteration_policy = replace(
-        dataset_iteration_policy,
+        iteration_policy,
         shuffle=False,
         repeat=False,
         dp_rank=0,
@@ -366,7 +317,7 @@ def build_concat(
         build_dataset(
             dataset,
             context=context,
-            dataset_iteration_policy=child_iteration_policy,
+            iteration_policy=child_iteration_policy,
         )
         for dataset in node.datasets
     ]
@@ -377,4 +328,4 @@ def build_concat(
         raise TypeError("DatasetConcat requires map-style children")
 
     dataset = grain.MapDataset.concatenate(cast(list[grain.MapDataset], children))
-    return apply_iteration_policy(dataset, dataset_iteration_policy)
+    return apply_iteration_policy(dataset, iteration_policy)

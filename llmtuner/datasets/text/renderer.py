@@ -17,12 +17,13 @@ predicts token ``j + 1``.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from ...components.tokenizer import HuggingFaceTokenizer
+    from ...components.tokenizer.huggingface import HuggingFaceTokenizer
 
-__all__ = ["RENDERERS_INSTALL_HINT", "RendererTokenizerWrapper", "build_chat_renderer"]
+__all__ = ["RENDERERS_INSTALL_HINT", "RendererTokenizerAdapter", "build_chat_renderer"]
 
 
 RENDERERS_INSTALL_HINT = (
@@ -32,7 +33,7 @@ RENDERERS_INSTALL_HINT = (
 )
 
 
-class RendererTokenizerWrapper:
+class RendererTokenizerAdapter:
     """Adapt llmtuner's loaded tokenizer to ``renderers.OffsetTokenizer``.
 
     ``renderers`` needs Hugging Face-style special-token attributes, raw
@@ -43,7 +44,7 @@ class RendererTokenizerWrapper:
     tokenizer.
     """
 
-    def __init__(self, tokenizer: HuggingFaceTokenizer):
+    def __init__(self, tokenizer: HuggingFaceTokenizer) -> None:
         # The `tokenizers.Tokenizer` inside; it has the offsets and token -> id lookup.
         self._tokenizer_backend = tokenizer.tokenizer
         self.name_or_path = tokenizer.tokenizer_path
@@ -51,17 +52,18 @@ class RendererTokenizerWrapper:
         self.eos_token = tokenizer.eos_token
         self.bos_token_id = tokenizer.bos_id
         self.eos_token_id = tokenizer.eos_id
-        # `tokenizers` returns None for unknown tokens; it has no unk id.
-        self.unk_token_id = None
+        self.unk_token_id = tokenizer.unk_id
 
     def encode(
-        self, text: str, add_special_tokens: bool = False, **kwargs
+        self, text: str, add_special_tokens: bool = False, **kwargs: Any
     ) -> list[int]:
         return self._tokenizer_backend.encode(
             text, add_special_tokens=add_special_tokens
         ).ids
 
-    def decode(self, token_ids, skip_special_tokens: bool = False, **kwargs) -> str:
+    def decode(
+        self, token_ids: Iterable[int], skip_special_tokens: bool = False, **kwargs: Any
+    ) -> str:
         return self._tokenizer_backend.decode(
             list(token_ids), skip_special_tokens=skip_special_tokens
         )
@@ -75,7 +77,7 @@ class RendererTokenizerWrapper:
 
     def __call__(
         self, text: str, *, add_special_tokens: bool, return_offsets_mapping: bool
-    ) -> dict:
+    ) -> dict[str, Any]:
         encoding = self._tokenizer_backend.encode(
             text, add_special_tokens=add_special_tokens
         )
@@ -85,7 +87,7 @@ class RendererTokenizerWrapper:
         return output
 
 
-def build_chat_renderer(*, tokenizer: HuggingFaceTokenizer, renderer_name: str):
+def build_chat_renderer(*, tokenizer: HuggingFaceTokenizer, renderer_name: str) -> Any:
     """Build a ``renderers`` renderer over llmtuner's tokenizer.
 
     ``renderer_name`` is the exact name of a config class the ``renderers``
@@ -127,5 +129,5 @@ def build_chat_renderer(*, tokenizer: HuggingFaceTokenizer, renderer_name: str):
             "model's renderer, e.g. Qwen3RendererConfig."
         )
     return renderers.create_renderer(
-        tokenizer=RendererTokenizerWrapper(tokenizer), config=config
+        tokenizer=RendererTokenizerAdapter(tokenizer), config=config
     )
