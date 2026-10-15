@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from llmtuner.config.activation_checkpoint_config import (
@@ -15,9 +16,9 @@ from llmtuner.config.activation_checkpoint_config import (
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.data_config import DataloaderConfig
-from llmtuner.config.field_checks_config import require_at_least
+from llmtuner.config.ema_config import EMAConfig
+from llmtuner.config.field_checks_config import require_integer_at_least
 from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
-from llmtuner.config.optimizer_config import EMAConfig
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.errors import ConfigError
 
@@ -226,11 +227,19 @@ class TrainingConfig:
         return self.validation_config
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.max_norm, int | float)
+            or isinstance(self.max_norm, bool)
+            or not math.isfinite(self.max_norm)
+        ):
+            raise ConfigError(
+                f"training.max_norm must be a finite number, got {self.max_norm!r}"
+            )
         # One check, not five copies: these fields share the floor and the
         # wording, and the same shape guards ParallelConfig's degrees. The
         # text is the contract -- test_config.py pins
         # ``f"{field} must be >= 1"`` for each of these names.
-        require_at_least(
+        require_integer_at_least(
             self,
             "global_batch_size",
             "max_seq_len",
@@ -239,11 +248,7 @@ class TrainingConfig:
             "gc_freq",
             group="training",
         )
-        if self.chunked_loss_num_chunks < 1:
-            raise ConfigError(
-                "training.chunked_loss_num_chunks must be >= 1, got "
-                f"{self.chunked_loss_num_chunks} (1 disables chunking)"
-            )
+        require_integer_at_least(self, "chunked_loss_num_chunks", group="training")
         if self.activation_checkpoint_mode not in VALID_AC_MODES:
             raise ConfigError(
                 "training.activation_checkpoint_mode must be one of: "

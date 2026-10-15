@@ -3,22 +3,18 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, fields
 from typing import Any
-
-from transformers import AutoConfig
 
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.data_config import DataloaderConfig
+from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 from llmtuner.config.model_config import ModelConfig
-from llmtuner.config.optimizer_config import LRSchedulerConfig, OptimizerConfig
+from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
+from llmtuner.config.optimizer_config import OptimizerConfig
 from llmtuner.config.parallel_config import ParallelConfig
-from llmtuner.config.training_config import (
-    MetricsConfig,
-    ProfilerConfig,
-    TrainingConfig,
-    ValidationConfig,
-)
+from llmtuner.config.training_config import TrainingConfig
+from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.errors import ConfigError
 from llmtuner.utils.logging import get_logger
 
@@ -73,11 +69,15 @@ class LLMTunerConfig:
         a run halve one without touching the other. Each group's own
         ``__post_init__`` already ran during parsing.
         """
-        # The CLI's TrainingConfig view marks nested fields init=False, so
-        # dataclasses.replace(view, checkpoint_config=...) would raise. Build
-        # the base class from its init fields and overlay the parsed groups.
-        # This also leaves the caller's parsed instance untouched.
-        optimizer = replace(optimizer, lr_scheduler_config=lr_scheduler)
+        # CLI views hide nested fields with init=False. Rebuild the base
+        # configs to graft parsed groups without modifying caller instances.
+        optimizer_fields = {
+            item.name: getattr(optimizer, item.name)
+            for item in fields(OptimizerConfig)
+            if item.init
+        }
+        optimizer_fields["lr_scheduler_config"] = lr_scheduler
+        optimizer = OptimizerConfig(**optimizer_fields)
         training_fields = {
             item.name: getattr(training, item.name)
             for item in fields(TrainingConfig)
@@ -260,17 +260,16 @@ class LLMTunerConfig:
     def validation(self) -> ValidationConfig | None:
         return self.training.validation
 
-    def derive_dp(self, world_size: int) -> int:
-        """Flat passthrough so callers use cfg.derive_dp(world_size) uniformly."""
-        return self.parallel.derive_dp(world_size)
-
     def auto_fill_model(self) -> None:
         """Fill architecture fields from a local HF directory or Hub config.
 
         Called explicitly (not in __post_init__) so offline runs never hit the network.
         """
+        from transformers import AutoConfig
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
         mp = self.model.model_name_or_path
-        if not os.path.exists(mp) and mp.count("/") != 1:
+        if not os.path.exists(mp) and mp in CONFIG_MAPPING:
             return  # offline architecture name; explicit sizes are authoritative
         try:
             hf_config = AutoConfig.from_pretrained(mp)
@@ -280,18 +279,4 @@ class LLMTunerConfig:
         # The model factory trains the decoder described by text_config for
         # composite HF configurations; the aggregate run sizes must match it.
         hf_config = getattr(hf_config, "text_config", hf_config)
-        m = self.model
-        m.vocab_size = getattr(hf_config, "vocab_size", m.vocab_size)
-        m.hidden_size = getattr(hf_config, "hidden_size", m.hidden_size)
-        m.intermediate_size = getattr(
-            hf_config, "intermediate_size", m.intermediate_size
-        )
-        m.num_hidden_layers = getattr(
-            hf_config, "num_hidden_layers", m.num_hidden_layers
-        )
-        m.num_attention_heads = getattr(
-            hf_config, "num_attention_heads", m.num_attention_heads
-        )
-        m.num_key_value_heads = getattr(
-            hf_config, "num_key_value_heads", m.num_key_value_heads
-        )
+        self.model.update_architecture(hf_config)

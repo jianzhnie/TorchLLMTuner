@@ -1,42 +1,30 @@
-"""The config groups as the CLI parser sees them.
+"""Expose scalar config fields to HfArgumentParser through dataclass views.
 
-``HfArgumentParser`` turns every ``init=True`` dataclass field into a flag.
-Two field shapes cannot survive that round trip, and both join
-``PROGRAMMATIC_ONLY`` instead of becoming flags that reject every value:
+The parser receives PARSER_GROUPS in a fixed order. Programmatic-only fields
+are hidden with init=False in subclasses that preserve defaults and validation.
+This prevents dictionaries, nested dataclasses, and other unsupported values
+from appearing as unusable command-line flags.
 
-* value types the parser cannot parse (``dict`` / ``list[dataclass]`` /
-  ``Callable``): ``ModelConfig.arch_overrides``,
-  ``OptimizerConfig.param_groups``, ``CheckpointConfig.purge_exempt``;
-* nested dataclasses, which the parser does not recurse into -- each collapses
-  to one opaque flag that rejects every value: ``TrainingConfig``'s
-  ``ema_config`` / ``validation_config``, the four graft targets
-  (``checkpoint_config`` / ``dataloader_config`` / ``metrics_config`` /
-  ``profiler_config``) and the AC/compile sub-configs (``compile_config`` /
-  ``selective_ac`` / ``memory_budget_ac`` / ``region_ac``). These are parsed
-  as their own top-level groups and grafted back by
-  ``LLMTunerConfig.from_groups``.
-
-A flag that exists only to reject its values is worse than no flag: it shows up
-in ``--help`` looking usable. ``init=False`` is the one hook
-``HfArgumentParser`` honours -- it skips those fields -- so the CLI is handed a
-generated *view* of each group instead: a subclass of the real one whose
-programmatic-only fields are re-declared ``init=False``, carrying the base
-default over. Defaults, ``__post_init__`` and ``isinstance`` against the real
-group all still hold, so nothing downstream can tell the difference; the view
-keeps the group's own name so argparse messages read the same.
+LLMTunerConfig.from_groups grafts the separately parsed scheduler, checkpoint,
+dataloader, metrics, and profiler groups into their owning configs. EMA,
+validation, and the nested activation-checkpoint/compile configs remain
+programmatic-only and retain their defaults when using this CLI.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import typing
+from copy import copy
 
 from .checkpoint_config import CheckpointConfig
 from .data_config import DataloaderConfig
+from .lr_scheduler_config import LRSchedulerConfig
 from .model_config import ModelConfig
-from .optimizer_config import LRSchedulerConfig, OptimizerConfig
+from .observability_config import MetricsConfig, ProfilerConfig
+from .optimizer_config import OptimizerConfig
 from .parallel_config import ParallelConfig
-from .training_config import MetricsConfig, ProfilerConfig, TrainingConfig
+from .training_config import TrainingConfig
 
 # The groups the CLI parses, in the order ``LLMTunerConfig.from_groups`` takes
 # them. Parser order is significant: ``parse_args_into_dataclasses`` returns one
@@ -60,15 +48,15 @@ PARSER_GROUPS: tuple[type, ...] = (
 # every value it is given; ``cli_view`` fails loudly if a name here goes stale.
 PROGRAMMATIC_ONLY: dict[type, frozenset[str]] = {
     ModelConfig: frozenset({"arch_overrides"}),
-    OptimizerConfig: frozenset({"param_groups"}),
+    OptimizerConfig: frozenset({"param_groups", "lr_scheduler_config"}),
     CheckpointConfig: frozenset({"purge_exempt"}),
+    ParallelConfig: frozenset({"fsdp_apply_modules", "module_fqns_per_model_part"}),
     TrainingConfig: frozenset(
         {
             "ema_config",
             "validation_config",
-            # Nested dataclasses become single-value flags that reject every value
-            # (HfArgumentParser does not recurse into them) -- hide them; they are
-            # grafted from their own parser groups in LLMTunerConfig.from_groups.
+            # Only checkpoint/data/metrics/profiler have separate parser groups.
+            # Other nested configs remain programmatic-only.
             "checkpoint_config",
             "dataloader_config",
             "metrics_config",
@@ -91,27 +79,14 @@ def cli_view(cls: type) -> type:
     if unknown:
         raise RuntimeError(
             f"{cls.__name__} has no fields {sorted(unknown)}: "
-            "config.cli.PROGRAMMATIC_ONLY is stale"
+            "config.cli_config.PROGRAMMATIC_ONLY is stale"
         )
     hints = typing.get_type_hints(cls)
     namespace: dict[str, typing.Any] = {
         "__annotations__": {name: hints[name] for name in hidden}
     }
     for name in hidden:
-        base = cls.__dataclass_fields__[name]
-        option: dict[str, typing.Any] = {"init": False}
-        if base.default is not dataclasses.MISSING:
-            option["default"] = base.default
-        else:
-            option["default_factory"] = base.default_factory
-        namespace[name] = dataclasses.field(**option)
+        option = copy(cls.__dataclass_fields__[name])
+        option.init = False
+        namespace[name] = option
     return dataclasses.dataclass(type(cls.__name__, (cls,), namespace))
-
-
-def cli_groups(groups: tuple[type, ...]) -> tuple[type, ...]:
-    """The parser-facing view of ``groups``, in the same order.
-
-    Order is the parser's contract -- ``parse_args_into_dataclasses`` returns
-    one instance per class in this order -- so this preserves it.
-    """
-    return tuple(cli_view(cls) for cls in groups)

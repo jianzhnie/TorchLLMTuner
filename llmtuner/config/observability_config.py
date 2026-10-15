@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from llmtuner.config.field_checks_config import require_at_least
+from llmtuner.config.field_checks_config import require_integer_at_least
 from llmtuner.errors import ConfigError
 
 
@@ -52,9 +52,11 @@ class MetricsConfig:
     line is not prefixed: it is read live, never merged."""
 
     def __post_init__(self) -> None:
-        if self.log_freq < 1:
-            raise ConfigError(f"metrics.log_freq must be >= 1, got {self.log_freq}")
-        if any(r < 0 for r in self.log_ranks):
+        require_integer_at_least(self, "log_freq", group="metrics")
+        if any(
+            not isinstance(rank, int) or isinstance(rank, bool) or rank < 0
+            for rank in self.log_ranks
+        ):
             raise ConfigError(
                 f"metrics.log_ranks entries must be >= 0, got {self.log_ranks}"
             )
@@ -115,30 +117,32 @@ class ProfilerConfig:
     """
 
     def __post_init__(self) -> None:
+        require_integer_at_least(
+            self,
+            "profile_freq",
+            "profiler_active",
+            "memory_snapshot_max_entries",
+            group="profiler",
+        )
+        require_integer_at_least(self, "profiler_warmup", group="profiler", minimum=0)
+        for name in (
+            "profiler_repeat",
+            "profiler_skip_first",
+            "profiler_skip_first_wait",
+        ):
+            if getattr(self, name) is not None:
+                require_integer_at_least(self, name, group="profiler", minimum=0)
+        if self.memory_snapshot_freq is not None:
+            require_integer_at_least(self, "memory_snapshot_freq", group="profiler")
         cycle = self.profiler_warmup + self.profiler_active
         if self.enable_profiling and self.profile_freq < cycle:
             raise ConfigError(
                 "profiler.profile_freq must be >= profiler_warmup + "
                 f"profiler_active ({cycle}), got {self.profile_freq}"
             )
-        require_at_least(
-            self, "profiler_active", "memory_snapshot_max_entries", group="profiler"
-        )
-        require_at_least(self, "profiler_warmup", group="profiler", minimum=0)
-        for name in ("profiler_repeat", "profiler_skip_first"):
-            if getattr(self, name) is not None:
-                require_at_least(self, name, group="profiler", minimum=0)
 
 
-# HfArgumentParser cannot turn a nested dataclass into a set of flags -- it
-# collapses it to one opaque `--<field>` argument and never consults the fields
-# inside. The `<x>_config` field is that escape hatch: the config's own group is
-# parsed separately in trainer/cli.py and grafted back on here, which is also where
-# its __post_init__ re-runs against the parsed values.
-#
-# That is what keeps every class in this package named `*Config`. Renaming one is
-# not cosmetic -- HfArgumentParser takes the flag stem from the FIELD, so the
-# field names below are the CLI: `metrics_config` is what makes this class's
-# fields reach the user as `--log_freq` and `--enable_tensorboard`. A class
-# named `MetricsArguments` with a field `metrics_arguments` would move every one
-# of them behind a `--metrics_arguments` prefix, which is a breaking change.
+# The CLI parses MetricsConfig and ProfilerConfig as separate flat groups,
+# exposing their own field names (for example --log_freq). cli_config hides
+# the nested fields on TrainingConfig; LLMTunerConfig.from_groups attaches the
+# parsed objects to their owners. Nested field names do not add CLI prefixes.

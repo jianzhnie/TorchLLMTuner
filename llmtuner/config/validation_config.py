@@ -1,26 +1,23 @@
-"""Validation (eval) loop config, grafted onto TrainingConfig."""
+"""Validation cadence, pass length, and optional corpus selection."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from llmtuner.errors import ConfigError
+from ..errors import ConfigError
+from .field_checks_config import require_integer_at_least
 
 
 @dataclass(kw_only=True)
 class ValidationConfig:
-    """The validation (eval) loop's knobs (see ``Trainer.validate``).
+    """Configure a pass run by ``Trainer.validate``.
 
-    Set ``training.validation_config`` to one of these to turn validation on;
-    the default ``None`` means no validation runs and the training loop is
-    bit-identical to before. Programmatic-only, like ``ema_config``: a nested
-    dataclass does not survive ``HfArgumentParser``.
+    Assign to ``training.validation_config`` to enable validation. This nested
+    config is programmatic; ``config/cli_config.py`` excludes it from CLI views.
 
-    Validation replays the training loss forward-only: summed next-token
-    cross-entropy over the whole pass, divided by the global valid-token count
-    reduced across DP, so the number is independent of how the batches were
-    split across ranks. It updates no parameters and touches no checkpoint
-    state.
+    Validation reports summed next-token loss divided by global valid tokens.
+    Each pass owns a fresh loader, leaves training counters unchanged, and
+    restores model modes and attention layout after success or failure.
     """
 
     freq: int = 10
@@ -33,12 +30,18 @@ class ValidationConfig:
     both are rejected at trainer build time rather than hanging the pass."""
 
     dataset: str | None = None
-    """Corpus override for validation, same vocabulary as
-    ``dataloader.dataset``. None (the default) validates on the training
-    corpus."""
+    """Optional corpus override using the dataloader's dataset names.
+
+    None selects the training corpus. Tokenizer, corpus path, packing capacity,
+    and other loader settings remain those of the training data configuration.
+    Attention layout follows the effective corpus; KCP rejects packed passes.
+    """
 
     def __post_init__(self) -> None:
-        if self.freq < 1:
-            raise ConfigError(f"validation.freq must be >= 1, got {self.freq}")
-        if not (self.steps >= 1 or self.steps == -1):
+        require_integer_at_least(self, "freq", group="validation")
+        if (
+            not isinstance(self.steps, int)
+            or isinstance(self.steps, bool)
+            or not (self.steps >= 1 or self.steps == -1)
+        ):
             raise ConfigError(f"validation.steps must be >= 1 or -1, got {self.steps}")

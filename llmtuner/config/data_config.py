@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from llmtuner.config.field_checks_config import require_at_least
+from llmtuner.config.field_checks_config import require_integer_at_least
 from llmtuner.errors import ConfigError
 
 
@@ -15,11 +15,10 @@ class DataloaderConfig:
 
     ``random`` (the default) keeps the synthetic corpus and needs no assets, so
     the default run is unchanged and reproducible offline. Any other value
-    names a recipe from ``datasets.text.processors.DATASETS`` or
-    ``datasets.multimodal.processors.MULTIMODAL_DATASETS``, or the built-in
-    ``local_jsonl`` --
-    which is deliberately NOT in either dict, because its corpus path is a
-    runtime argument rather than a constant.
+    names a recipe from ``datasets.text.recipes.DATASETS`` or
+    ``datasets.multimodal.recipes.MULTIMODAL_DATASETS``, or the built-in
+    ``local_jsonl`` / ``local_jsonl_sft``. Local recipes use a caller-supplied
+    corpus path and therefore are not entries in the registries.
 
     Every non-``random`` dataset builds its graph on Grain, which needs a
     tokenizer, so ``tokenizer_path`` is required there and unused otherwise.
@@ -32,8 +31,9 @@ class DataloaderConfig:
         default="random",
         metadata={
             "help": "Corpus selector: 'random' (synthetic, no assets) | "
-            "'local_jsonl' | a key of datasets.text.processors.DATASETS | a key of "
-            "datasets.multimodal.processors.MULTIMODAL_DATASETS (needs torchvision)"
+            "'local_jsonl' | 'local_jsonl_sft' | a key of "
+            "datasets.text.recipes.DATASETS | a key of "
+            "datasets.multimodal.recipes.MULTIMODAL_DATASETS (needs torchvision)"
         },
     )
     tokenizer_path: str | None = field(
@@ -44,7 +44,7 @@ class DataloaderConfig:
     )
     dataset_path: str | None = field(
         default=None,
-        metadata={"help": "Corpus path. Required for --dataset local_jsonl."},
+        metadata={"help": "Corpus path. Required for local_jsonl and local_jsonl_sft."},
     )
     prompt_field: str = field(
         default="prompt",
@@ -73,7 +73,10 @@ class DataloaderConfig:
     )
     shuffle: bool = field(
         default=True,
-        metadata={"help": "Globally shuffle before sharding across DP ranks"},
+        metadata={
+            "help": "Shuffle globally before map-data DP sharding; "
+            "shuffle streaming rows within each rank."
+        },
     )
     streaming_shuffle_buffer_size: int = field(
         default=1_000,
@@ -97,7 +100,8 @@ class DataloaderConfig:
         default=8,
         metadata={
             "help": "Candidate rows 'first_fit' keeps open. More bins can "
-            "reduce padding, but buffer more documents. Ignored otherwise."
+            "reduce padding, but buffer more documents. Also applies to "
+            "multimodal packing; ignored for text concat_then_split."
         },
     )
     max_num_documents: int | None = field(
@@ -132,6 +136,21 @@ class DataloaderConfig:
         metadata={"help": "Padding token. Multimodal recipes only."},
     )
 
+    def attention_mask_type(
+        self, *, dataset: str | None = None
+    ) -> Literal["causal", "block_causal"]:
+        """Choose document isolation for this layout and optional corpus override.
+
+        Synthetic rows and single-document rows need ordinary causality.
+        Other corpus rows can contain multiple documents and require isolation.
+        """
+        corpus = self.dataset if dataset is None else dataset
+        return (
+            "causal"
+            if corpus == "random" or self.max_num_documents == 1
+            else "block_causal"
+        )
+
     def __post_init__(self) -> None:
         if self.packing not in ("concat_then_split", "first_fit"):
             raise ConfigError(
@@ -147,8 +166,10 @@ class DataloaderConfig:
             raise ConfigError(
                 f"dataloader.dataset_path is required for dataset {self.dataset!r}"
             )
-        if self.dataset == "local_jsonl_sft" and (
-            not self.prompt_field.strip() or not self.response_field.strip()
+        if (
+            self.dataset == "local_jsonl_sft"
+            and self.chat_renderer is None
+            and (not self.prompt_field.strip() or not self.response_field.strip())
         ):
             raise ConfigError(
                 "dataloader.prompt_field/response_field cannot be empty for "
@@ -165,16 +186,13 @@ class DataloaderConfig:
                     "dataloader.messages_field cannot be empty when "
                     "chat_renderer is set"
                 )
-        # Membership in ``datasets.text.processors.DATASETS`` /
-        # ``datasets.multimodal.processors.MULTIMODAL_DATASETS`` is checked by
+        # Membership in ``datasets.text.recipes.DATASETS`` /
+        # ``datasets.multimodal.recipes.MULTIMODAL_DATASETS`` is checked by
         # ``datasets/loader_builder.py`` at build time, not here: reading the registries
         # would import the datasets package into the config layer.
-        if self.max_num_documents is not None and self.max_num_documents < 1:
-            raise ConfigError(
-                f"dataloader.max_num_documents must be >= 1, got "
-                f"{self.max_num_documents}"
-            )
-        require_at_least(
+        if self.max_num_documents is not None:
+            require_integer_at_least(self, "max_num_documents", group="dataloader")
+        require_integer_at_least(
             self,
             "streaming_shuffle_buffer_size",
             "num_prefetch_batches",

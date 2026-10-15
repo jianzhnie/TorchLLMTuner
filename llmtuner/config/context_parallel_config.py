@@ -1,12 +1,18 @@
 """Context parallel configuration constants and validation."""
 
+from typing import TYPE_CHECKING
+
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
+
+if TYPE_CHECKING:
+    from .parallel_config import ParallelConfig
+
 
 CP_STRATEGIES = frozenset({"kv_allgather", "ulysses", "kcp"})
 CP_LOAD_BALANCERS = frozenset({None, "headtail", "ptrr"})
 
 
-def validate_context_parallel_config(cfg) -> None:
+def validate_context_parallel_config(cfg: "ParallelConfig") -> None:
     if cfg.context_parallel_kcp_size > 1 and cfg.context_parallel_strategy != "kcp":
         raise ConfigError("context_parallel_kcp_size > 1 requires strategy='kcp'")
     if cfg.context_parallel_load_balancer == "":
