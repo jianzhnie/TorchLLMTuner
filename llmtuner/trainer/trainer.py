@@ -57,7 +57,7 @@ from ..parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
 from ..utils.logging import get_logger
-from ..utils.seeding import seed_everything
+from ..utils.seeding import rollback_execution_settings_on_error, seed_everything
 from .runtime import assembly, pipeline
 from .runtime import batch as batch_runtime
 from .runtime import validation as validation_runtime
@@ -112,16 +112,24 @@ class Trainer:
     def __init__(self, cfg: LLMTunerConfig):
         """Assemble the trainer. The whole body lives in ``runtime/assembly.py`` --
         the assembly order there is a contract (see its docstring)."""
-        try:
-            assembly.assemble_trainer_runtime(self, cfg)
-        except BaseException:
-            # Failed construction never returns an object to the caller, so
-            # release resources already acquired by partial assembly here.
+        compile_settings = nullcontext()
+        if getattr(getattr(cfg, "training", None), "compile", False):
+            from ..parallel.model_compile import rollback_compile_settings_on_error
+
+            compile_settings = rollback_compile_settings_on_error()
+        with rollback_execution_settings_on_error(), compile_settings:
             try:
-                self.close()
+                assembly.assemble_trainer_runtime(self, cfg)
             except BaseException:
-                logger.exception("Resource cleanup failed during trainer construction")
-            raise
+                # Failed construction never returns an object to the caller, so
+                # release resources already acquired by partial assembly here.
+                try:
+                    self.close()
+                except BaseException:
+                    logger.exception(
+                        "Resource cleanup failed during trainer construction"
+                    )
+                raise
 
     # -- setup helpers ---------------------------------------------------------
 
@@ -1046,9 +1054,10 @@ class Trainer:
     def close(self) -> None:
         """Release everything ``train`` acquired, in reverse order of use.
 
-        Safe to call more than once: each release is guarded, so a trainer that
-        was never fully built (or is being closed twice) does not raise on the
-        cleanup path, where an exception would mask the real failure.
+        Successful releases are not repeated. Failed sinks and loaders remain
+        available for retry, including during partial initialization. Attempt
+        every release before propagating the first cleanup error; callers with
+        an active training error preserve it at their exception boundary.
         """
         first_error: BaseException | None = None
         for name in ("checkpointer", "metrics", "dataloader", "gc_handler"):
@@ -1059,11 +1068,11 @@ class Trainer:
             try:
                 resource.close()
             except BaseException as error:
-                if name == "metrics" or (
+                if name in ("metrics", "dataloader") or (
                     name == "checkpointer" and getattr(resource, "_initialized", False)
                 ):
-                    # Failed sinks and interrupted checkpoint waits may retain
-                    # live resources. Keep their owner available for a retry.
+                    # Failed sinks, loader workers, and interrupted checkpoint
+                    # waits may retain resources. Keep their owner for a retry.
                     setattr(self, name, resource)
                 logger.exception("Failed to close trainer resource %s", name)
                 if first_error is None:

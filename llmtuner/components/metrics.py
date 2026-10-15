@@ -236,10 +236,12 @@ class TensorBoardLogger(BaseLogger):
 class WandBLogger(BaseLogger):
     """Streams metrics to Weights & Biases.
 
-    Every run parameter comes from the environment, matching torchtitan. That is
+    Experiment identity comes from the environment, matching torchtitan. That is
     deliberate for a launcher-driven tool: ``WANDB_RUN_ID`` and ``WANDB_RESUME_FROM``
     are how a requeued job rejoins its own run, and reading them from the
     environment means a launcher can set them without touching the config.
+    Each logger creates and owns a separate run; closing it leaves existing
+    runs alive. This requires WandB support for ``reinit="create_new"``.
     """
 
     def __init__(
@@ -255,6 +257,7 @@ class WandBLogger(BaseLogger):
 
         os.makedirs(log_dir, exist_ok=True)
         self.run = wandb.init(
+            reinit="create_new",
             entity=os.getenv("WANDB_TEAM"),
             project=os.getenv("WANDB_PROJECT", "llmtuner"),
             name=os.getenv("WANDB_RUN_NAME"),

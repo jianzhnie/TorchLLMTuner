@@ -216,7 +216,22 @@ def clip_grad_norm_(
     def _local_norm(grads: list[torch.Tensor]) -> torch.Tensor:
         # Check only after every mesh reduction, so one bad local shard does
         # not raise while its peers are still waiting in a collective.
-        norm = torch.nn.utils.get_total_norm(grads, norm_type, False, foreach)
+        if any(grad.dtype in (torch.float16, torch.bfloat16) for grad in grads):
+            # Keep only scalar FP32 norms, rather than retaining FP32 copies
+            # of every gradient at once. DTensor preserves the reduction layout.
+            norms = [
+                torch.linalg.vector_norm(
+                    grad,
+                    norm_type,
+                    dtype=torch.float32
+                    if grad.dtype in (torch.float16, torch.bfloat16)
+                    else None,
+                )
+                for grad in grads
+            ]
+            norm = torch.nn.utils.get_total_norm(norms, norm_type, False, foreach)
+        else:
+            norm = torch.nn.utils.get_total_norm(grads, norm_type, False, foreach)
         if isinstance(norm, DTensor):
             norm = norm.full_tensor()
         # Squaring a finite fp16 norm (e.g. 300) already overflows. Mesh

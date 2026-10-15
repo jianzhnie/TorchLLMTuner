@@ -60,6 +60,7 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
         if param in optim.state
     }
     saved_lrs = []
+    saved_adam_options = []
     try:
         for param in params:
             param.grad = None
@@ -75,6 +76,19 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
                     if isinstance(param_group["lr"], torch.Tensor)
                     else 0.0
                 )
+        # Even at lr=0, Adam computes its normalized update: 0/0 becomes NaN
+        # when eps is zero or underflows in FP16, and zero * NaN corrupts the
+        # parameter. Use an exactly representable denominator floor only for
+        # this state-allocation step; restore the user's epsilon afterward.
+        if isinstance(optim, torch.optim.Adam | torch.optim.AdamW):
+            for param_group in optim.param_groups:
+                saved_adam_options.append(
+                    (param_group, param_group["eps"], param_group["weight_decay"])
+                )
+                param_group["eps"] = 1.0
+                # Coupled Adam decay can overflow even for finite weights.
+                # State allocation must not depend on parameter magnitudes.
+                param_group["weight_decay"] = 0.0
         optim.step(closure=None)
 
         # A zero learning rate keeps parameters unchanged, but Adam still advances
@@ -101,6 +115,9 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
                 optim.state[param] = original_state
         raise
     finally:
+        for param_group, epsilon, weight_decay in saved_adam_options:
+            param_group["eps"] = epsilon
+            param_group["weight_decay"] = weight_decay
         for param_group, lr in saved_lrs:
             param_group["lr"] = lr
         for param, grad in zip(params, saved_grads, strict=True):
@@ -196,16 +213,25 @@ def unflatten_optim_state_dict(
     for param_group in optim.param_groups:
         fqns = param_group["param_names"]
         params = param_group["params"]
+        restored_group = _restore_param_group(
+            param_group, param_ids=[], flat_state=flat_state
+        )
         ids: list[int] = []
         for fqn, param in zip(fqns, params, strict=True):
             ids.append(param_id)
             if param in optim.state:
                 param_state: dict[str, Any] = {}
-                for state_name in optim.state[param]:
+                expected_state = dict(optim.state[param])
+                if isinstance(optim, torch.optim.Adam | torch.optim.AdamW):
+                    if restored_group["amsgrad"]:
+                        expected_state["max_exp_avg_sq"] = expected_state["exp_avg_sq"]
+                    else:
+                        expected_state.pop("max_exp_avg_sq", None)
+                for state_name in expected_state:
                     flat_key = f"state.{fqn}.{state_name}"
                     if flat_key in flat_state:
                         value = flat_state[flat_key]
-                        expected = optim.state[param][state_name]
+                        expected = expected_state[state_name]
                         if (
                             isinstance(optim, torch.optim.Adam | torch.optim.AdamW)
                             and state_name == "step"
@@ -251,7 +277,14 @@ def unflatten_optim_state_dict(
                                 )
                         param_state[state_name] = value
                     else:
-                        # State value is itself a nested dict (e.g. Shampoo).
+                        # Only dictionary-valued state may use nested keys.
+                        # A malformed subtree must not replace a required Adam
+                        # tensor/counter and defer failure until the next update.
+                        if not isinstance(expected_state[state_name], dict):
+                            raise KeyError(
+                                f"Optimizer state key {flat_key!r} not found "
+                                "in checkpoint."
+                            )
                         nested = _restore_nested_state(flat_state, prefix=flat_key)
                         if not nested:
                             raise KeyError(
@@ -263,9 +296,8 @@ def unflatten_optim_state_dict(
                     state[param_id] = param_state
             param_id += 1
 
-        param_groups.append(
-            _restore_param_group(param_group, param_ids=ids, flat_state=flat_state)
-        )
+        restored_group["params"] = ids
+        param_groups.append(restored_group)
 
     return {"state": state, "param_groups": param_groups}
 

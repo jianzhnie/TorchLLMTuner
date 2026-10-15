@@ -1,6 +1,6 @@
 """The ``torch_checkpointing`` checkpoint manager.
 
-Vendored from torchtitan's ``components/checkpointer/torch_checkpointing_backend.py``.
+Vendored from torchtitan's ``components/checkpointer/torch_checkpointing.py``.
 Its class structure, policy wiring, and comments are kept verbatim where they
 carry a reason; three things were altered, and each is a subtraction or a
 necessary adaptation rather than a redesign.
@@ -8,8 +8,8 @@ necessary adaptation rather than a redesign.
 **The backend is not installed here, so its imports are deferred.** Every
 ``torch_checkpointing`` and ``torch_checkpointing.*`` import in torchtitan sits
 at module scope. Doing that here would make this file unimportable on any machine
-without the package -- which is every machine llmtuner runs on today -- and would
-take ``components/checkpointer/__init__.py`` down with it. They are hoisted into
+without the package and would take ``components/checkpointer/__init__.py`` down
+with it. Imports are deferred to
 ``require_torch_checkpointing()`` instead, called from ``__init__``. So:
 
 * this module imports fine, and so does the package that re-exports it;
@@ -26,17 +26,12 @@ way torchtitan does it.
 **No tyro.** The config is a plain dataclass (see ``base.py``), and
 ``purge_exempt`` is a plain callable.
 
-Reachability note, stated plainly because it is easy to mistake for working code:
-nothing in llmtuner constructs this manager yet. It is here because it is the third
-of torchtitan's checkpointer backends and the port is meant to be complete, and
-because the moment someone installs ``torch_checkpointing`` it is the faster
-backend with no further porting work. Until then it is unexercised: the tests in
-``test_checkpointer.py`` cover only the import guard and the per-config branch of
-``__init__``. Nothing above that line has ever run, so the backend-dependent
-paths -- ``_save`` / ``_load_checkpoint`` / ``_save_last_step`` and the storage
-adapter -- are a faithful transcription rather than verified behaviour, and the
-first real use should start by round-tripping a checkpoint on a machine that has
-the package installed.
+Runtime assembly currently selects DCP; this manager is available to direct callers.
+CPU tests exercise policy, load/export adapters, future ownership, and constructor
+cleanup with backend substitutes. They do not verify the optional package's I/O,
+subprocess lifecycle, compatibility, or performance. Before enabling this backend
+in a production run, validate a complete save/load round trip with the installed
+package and the intended distributed topology.
 """
 
 from __future__ import annotations
@@ -45,8 +40,9 @@ import logging
 import os
 import queue
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -311,6 +307,22 @@ def sync_save_config(backend: BackendSymbols, *, use_barrier: bool = True):
     )
 
 
+@contextmanager
+def temporary_backend_manager(config: Any) -> Iterator[Any]:
+    """Own a short-lived backend without masking a failed checkpoint operation."""
+    manager = config.build()
+    try:
+        yield manager
+    except BaseException:
+        try:
+            manager.close()
+        except BaseException:
+            logger.exception("Temporary checkpoint backend cleanup failed")
+        raise
+    else:
+        manager.close()
+
+
 def default_backend_config(
     backend: BackendSymbols,
     save_config,
@@ -429,22 +441,31 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
         self._manager = self._manager_config.build()
 
-        if self.keep_latest_k > 0:
-            self.purge_queue: queue.Queue[str | None] = queue.Queue()
-            self.purge_thread = threading.Thread(
-                target=purge_thread,
-                args=(self.purge_queue, self._storage.remove),
-                daemon=True,
+        try:
+            if self.keep_latest_k > 0:
+                self.purge_queue: queue.Queue[str | None] = queue.Queue()
+                self.purge_thread = threading.Thread(
+                    target=purge_thread,
+                    args=(self.purge_queue, self._storage.remove),
+                    daemon=True,
+                )
+                self.purge_thread.start()
+
+            logger.info(
+                "Checkpointing active. Checkpoints will be loaded from and saved "
+                f"to {self.folder}"
             )
-            self.purge_thread.start()
 
-        logger.info(
-            "Checkpointing active. Checkpoints will be loaded from and saved "
-            f"to {self.folder}"
-        )
+        except BaseException:
+            # Public close is guarded until initialization completes. Release
+            # the already-built backend explicitly if local service setup fails.
+            try:
+                self._close()
+            except BaseException:
+                logger.exception("Backend cleanup failed during construction")
+            raise
 
-        # Last: the backend manager is built above and ``__del__`` runs ``close``
-        # on whatever was left behind if any of that raised.
+        # Public methods become usable only after all owned services are ready.
         self._initialized = True
 
     def __del__(self) -> None:
@@ -519,8 +540,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 },
                 default=None,
             )
-            hf_manager = hf_config.build()
-            try:
+            with temporary_backend_manager(hf_config) as hf_manager:
                 hf_manager.load(
                     checkpoint_id,
                     into={MODEL: hf_state},
@@ -530,8 +550,6 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                     strict=True,
                     metadata_format=hf_metadata_format,
                 )
-            finally:
-                hf_manager.close()
             states[MODEL].load_state_dict(self.sd_adapter.from_hf(hf_state))
         else:
             loaded = self._manager.load(
@@ -763,14 +781,11 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             items=save_items,
             pre_finalize_callback=pre_finalize_callback,
         )
-        manager = manager_config.build()
-        try:
+        with temporary_backend_manager(manager_config) as manager:
             manager.save(
                 input_checkpoint_id,
                 self._stateful_to_state_dict(states),
             )
-        finally:
-            manager.close()
         GarbageCollection.collect("GC collection invoked by checkpointer.")
 
     def _should_prewarm(self) -> bool:
