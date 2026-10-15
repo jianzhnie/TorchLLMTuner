@@ -251,6 +251,11 @@ class ChatProcessor(SampleProcessor):
         )
         if rendered.multi_modal_data is not None:
             raise ValueError("ChatProcessor supports text-only samples.")
+        if len(rendered.token_ids) < 2:
+            raise ConfigError(
+                "chat renderer must produce at least two tokens for "
+                "next-token supervision; check the renderer and messages"
+            )
 
         # Decoded only when it will be printed: the render is per sample.
         if not self._logged_first_sample:

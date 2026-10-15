@@ -6,8 +6,11 @@ then construct the loader. Synthetic data bypasses tokenizer and packing setup.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import asdict, dataclass
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 import grain.python as grain
@@ -26,6 +29,7 @@ from .packing.build import (
     build_concat_then_split_packing,
     build_first_fit_packing,
 )
+from .sources import file_patterns_to_paths
 from .synthetic import RandomTokenDataLoader
 from .text.recipes import (
     DATASETS,
@@ -41,6 +45,63 @@ if TYPE_CHECKING:
     from .composition import DatasetRecipe
 
 __all__ = ["build_dataloader"]
+
+
+def corpus_data_identity(config: LLMTunerConfig, *, dataset: str, repeat: bool) -> str:
+    """Fingerprint tokenizer assets, processing policy and source identity.
+
+    Local text includes file contents. Other recipes require a caller-declared
+    snapshot identifier; this cannot infer remote contents or callable semantics.
+    This is a construction-time snapshot, not a file mutation lock.
+    """
+    data_settings = asdict(config.dataloader)
+    # Ranks may stage identical assets in different local directories. DCP
+    # shares loader metadata, so paths cannot define content identity.
+    for name in ("dataset_path", "tokenizer_path", "num_prefetch_batches"):
+        data_settings.pop(name)
+    if data_settings["data_identity"] is None:
+        # Preserve existing local-text-v1 checkpoint identities.
+        data_settings.pop("data_identity")
+    settings = {
+        "version": 1,
+        "dataset": dataset,
+        "seed": config.seed,
+        "repeat": repeat,
+        "data": data_settings,
+    }
+    digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode())
+    local_text = dataset in {"local_jsonl", "local_jsonl_sft"}
+    if not local_text and config.dataloader.data_identity is None:
+        raise ValueError("registered corpus identity requires dataloader.data_identity")
+    files = (
+        list(file_patterns_to_paths((config.dataloader.dataset_path,)))
+        if local_text
+        else []
+    )
+    tokenizer_path = Path(config.dataloader.tokenizer_path)
+    for name in (
+        "tokenizer.json",
+        "vocab.txt",
+        "vocab.json",
+        "merges.txt",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+    ):
+        path = tokenizer_path / name
+        digest.update(name.encode())
+        if path.is_file():
+            files.append(str(path))
+        else:
+            digest.update(b"absent")
+    for filename in files:
+        file_digest = hashlib.sha256()
+        with open(filename, "rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                file_digest.update(chunk)
+        digest.update(file_digest.digest())
+    return (
+        "local-text-v1:" if local_text else "declared-corpus-v1:"
+    ) + digest.hexdigest()
 
 
 class _PackingBuilder(Protocol):
@@ -203,6 +264,13 @@ def build_dataloader(
         raise ValueError("token batch must be divisible by num_pp_microbatches")
     packing_tokens_per_batch = num_tokens_per_batch // num_microbatches
 
+    data_identity = (
+        corpus_data_identity(config, dataset=dataset_name, repeat=repeat)
+        if dataset_name in {"local_jsonl", "local_jsonl_sft"}
+        or dataloader_config.data_identity is not None
+        else None
+    )
+
     if is_multimodal:
         # Resolved before the tokenizer is constructed, so a bad name fails
         # fast without loading tokenizer assets.
@@ -267,4 +335,5 @@ def build_dataloader(
         repeat=repeat,
         num_prefetch_batches=dataloader_config.num_prefetch_batches,
         max_num_documents=dataloader_config.max_num_documents,
+        data_identity=data_identity,
     )

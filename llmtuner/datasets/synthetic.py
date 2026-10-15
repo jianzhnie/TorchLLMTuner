@@ -143,6 +143,10 @@ class RandomTokenDataLoader(BaseDataLoader):
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if not isinstance(state_dict, dict):
+            raise ValueError(
+                "RandomTokenDataLoader checkpoint state must be a dictionary"
+            )
         if not state_dict:
             return
         require_same_dp_degree(state_dict.get("dp_world_size"), self._dp_world_size)

@@ -80,7 +80,10 @@ def build_concat_then_split_packing(
             num_tokens_per_row=context.num_tokens_per_batch
         ),
     )
-    dataset_graph = dataset_graph.filter(packing_output_is_full)
+    # Finite validation must include the last document tokens even when they
+    # do not fill a row. Conversion masks Grain's padding before collation.
+    if iteration_policy.repeat:
+        dataset_graph = dataset_graph.filter(packing_output_is_full)
     return dataset_graph.map(
         partial(
             packing_output_to_text_sequence,

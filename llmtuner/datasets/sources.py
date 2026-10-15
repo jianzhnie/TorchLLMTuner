@@ -312,10 +312,16 @@ class HuggingFaceCursorIterator(grain.DatasetIterator):
             if not self._repeat:
                 raise
             epoch = self._epoch + 1
-            if self._shuffle:
-                self._dataset.set_epoch(epoch)
-            self._dataset.load_state_dict(self._initial_state)
-            self._iterator = iter(self._dataset)
+            try:
+                if self._shuffle:
+                    self._dataset.set_epoch(epoch)
+                self._dataset.load_state_dict(self._initial_state)
+                self._iterator = iter(self._dataset)
+            except BaseException:
+                # Reset may have changed the source epoch or cursor before
+                # failing. As with set_state, this stream cannot be reused.
+                super().close()
+                raise
             self._epoch = epoch
             return next(self._iterator)
 
@@ -326,6 +332,7 @@ class HuggingFaceCursorIterator(grain.DatasetIterator):
         }
 
     def set_state(self, state: dict[str, Any]) -> None:
+        self._assert_not_closed()
         if not isinstance(state, dict):
             raise ValueError("streaming checkpoint state must be a dictionary")
         epoch = state.get("epoch")
@@ -336,8 +343,28 @@ class HuggingFaceCursorIterator(grain.DatasetIterator):
         hf_state = state["hf"]
         if not isinstance(hf_state, dict):
             raise ValueError("streaming checkpoint 'hf' field must be a dictionary")
-        if self._shuffle:
-            self._dataset.set_epoch(epoch)
-        self._dataset.load_state_dict(hf_state)
-        self._iterator = iter(self._dataset)
-        self._epoch = epoch
+        try:
+            # Release the old stream before restoring shared source state:
+            # generator cleanup may itself modify that state.
+            close = getattr(self._iterator, "close", None)
+            if close is not None:
+                close()
+            if self._shuffle:
+                self._dataset.set_epoch(epoch)
+            self._dataset.load_state_dict(hf_state)
+            self._iterator = iter(self._dataset)
+            self._epoch = epoch
+        except BaseException:
+            # A failed restore cannot safely reuse the closed or mutated stream.
+            super().close()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            close = getattr(self._iterator, "close", None)
+            if close is not None:
+                close()
+        finally:
+            super().close()
