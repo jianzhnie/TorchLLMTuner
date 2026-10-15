@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +25,9 @@ import torch.nn as nn
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
 
+from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...accelerator.device import device_type
+from ...accelerator.distributed import get_comm_device
 from ...parallel.expert_parallel.checkpointing import (
     expert_shard_map,
     gather_expert_state,
@@ -39,6 +42,9 @@ from .state_dict import (
 )
 
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+    from torch.distributed.device_mesh import DeviceMesh
+
     # Type-only. ``llmtuner.config`` does not import this package at runtime (it
     # describes the object; the trainer builds it), so there is no cycle to
     # break -- this matches ``lr_scheduler.py``'s import of ``LRSchedulerConfig``.
@@ -55,6 +61,7 @@ class _OptimizerGroups:
 
     param_groups: list[dict[str, Any]] = field(default_factory=list)
     patterns: list[str] = field(default_factory=list)
+    config_indices: list[int] = field(default_factory=list)
 
 
 def fused_kernel_device_types() -> frozenset[str]:
@@ -99,54 +106,125 @@ class OptimizersContainer(Optimizer, Stateful):
     Parameters are matched to groups by regex against their FQN, first pattern
     wins; that is what lets norm and bias parameters take a different weight
     decay from the rest. A ``ValueError`` is raised if a pattern matches nothing
-    (a typo'd pattern is otherwise a silent no-op) or if a trainable parameter
-    ends up in no group at all.
+    across all local model parts (a typo'd pattern is otherwise a silent no-op)
+    or if a trainable parameter ends up in no group at all.
+
+    Rules are validated across local parts, or across pipeline ranks when an
+    explicit pipeline_mesh is supplied. All pipeline ranks must then construct
+    the container together with the same ordered rules.
 
     Args:
         config: the run's optimizer configuration. ``param_groups`` is the list
             of ``ParamGroupConfig`` patterns; ``implementation`` selects
             ``fused`` / ``foreach`` / ``for-loop`` for every inner optimizer.
         model_parts: the model chunks to optimize, one per pipeline stage.
+        pipeline_mesh: optional PP axis for checking rules over every stage.
+        initialization_group: optional group coordinating local planning and
+            construction errors; defaults to the PP group. Trainer supplies world
+            so failures also reach other data replicas. All members must construct
+            together, while rule matching continues to use the PP group.
     """
 
     optimizers: list[Optimizer]
     model_parts: list[nn.Module]
 
     def __init__(
-        self, config: OptimizerConfig, *, model_parts: list[nn.Module]
+        self,
+        config: OptimizerConfig,
+        *,
+        model_parts: list[nn.Module],
+        pipeline_mesh: DeviceMesh | None = None,
+        initialization_group: ProcessGroup | None = None,
     ) -> None:
-        impl_kwargs = self._build_impl_kwargs(config)
         all_params: list[nn.Parameter] = []
         self.optimizers = []
         self.model_parts = list(model_parts)
 
-        model_group_plans = [
-            self._build_param_groups(
-                model, param_group_configs=config.param_groups, impl_kwargs=impl_kwargs
-            )
-            for model in self.model_parts
-        ]
-        for groups_by_opt_name in model_group_plans:
-            for groups in groups_by_opt_name.values():
-                for group in groups.param_groups:
-                    all_params.extend(group["params"])
-        self._validate_params(all_params)
-        optimizer_factories: dict[str, Callable[..., Optimizer]] = {
-            "Adam": torch.optim.Adam,
-            "AdamW": torch.optim.AdamW,
+        pipeline_group = (
+            pipeline_mesh.get_group()
+            if pipeline_mesh is not None and pipeline_mesh.size() > 1
+            else None
+        )
+        error_group = (
+            initialization_group if initialization_group is not None else pipeline_group
+        )
+        with (
+            synchronize_local_errors("Optimizer parameter planning", group=error_group)
+            if error_group is not None
+            else nullcontext()
+        ):
+            impl_kwargs = self._build_impl_kwargs(config)
+            model_group_plans = [
+                self._build_param_groups(
+                    model,
+                    param_group_configs=config.param_groups,
+                    impl_kwargs=impl_kwargs,
+                )
+                for model in self.model_parts
+            ]
+        matched_configs = {
+            index
+            for plan in model_group_plans
+            for groups in plan.values()
+            for index in groups.config_indices
         }
-        for groups_by_opt_name in model_group_plans:
-            for name in groups_by_opt_name:
-                if name not in optimizer_factories:
-                    raise NotImplementedError(f"Optimizer {name} not added.")
+        if pipeline_group is not None:
+            group = pipeline_group
+            matches = torch.tensor(
+                [index in matched_configs for index in range(len(config.param_groups))],
+                dtype=torch.int32,
+                device=get_comm_device(group),
+            )
+            all_reduce(matches, op="max", group=group)
+            matched_configs = {
+                index for index, matched in enumerate(matches.tolist()) if matched
+            }
+        with (
+            synchronize_local_errors("Optimizer initialization", group=error_group)
+            if error_group is not None
+            else nullcontext()
+        ):
+            for index, param_group_config in enumerate(config.param_groups):
+                if index not in matched_configs:
+                    raise ValueError(
+                        "optimizer.param_groups pattern "
+                        f"{param_group_config.pattern!r} matched no parameters "
+                        "across model parts in the pipeline"
+                    )
+            for groups_by_opt_name in model_group_plans:
+                for groups in groups_by_opt_name.values():
+                    for group in groups.param_groups:
+                        all_params.extend(group["params"])
+            self._validate_params(all_params)
+            checkpoint_names: set[str] = set()
+            for part_index, groups_by_opt_name in enumerate(model_group_plans):
+                for groups in groups_by_opt_name.values():
+                    for group in groups.param_groups:
+                        names = set(group["param_names"])
+                        collisions = checkpoint_names & names
+                        if collisions:
+                            raise ValueError(
+                                "Optimizer checkpoint FQNs collide across model parts "
+                                f"at part {part_index}: {sorted(collisions)}. "
+                                "Model parts must use unique parameter FQNs."
+                            )
+                        checkpoint_names.update(names)
+            optimizer_factories: dict[str, Callable[..., Optimizer]] = {
+                "Adam": torch.optim.Adam,
+                "AdamW": torch.optim.AdamW,
+            }
+            for groups_by_opt_name in model_group_plans:
+                for name in groups_by_opt_name:
+                    if name not in optimizer_factories:
+                        raise NotImplementedError(f"Optimizer {name} not added.")
 
-        for part_idx, groups_by_opt_name in enumerate(model_group_plans):
-            for opt_name, groups in groups_by_opt_name.items():
-                optimizer = optimizer_factories[opt_name](groups.param_groups)
-                self.optimizers.append(optimizer)
-                self._log_optimizer(optimizer, part_idx, groups.patterns)
+            for part_idx, groups_by_opt_name in enumerate(model_group_plans):
+                for opt_name, groups in groups_by_opt_name.items():
+                    optimizer = optimizer_factories[opt_name](groups.param_groups)
+                    self.optimizers.append(optimizer)
+                    self._log_optimizer(optimizer, part_idx, groups.patterns)
 
-        self._initialize_optimizer_interface(all_params)
+            self._initialize_optimizer_interface(all_params)
 
     @staticmethod
     def _build_impl_kwargs(config: OptimizerConfig) -> dict[str, Any]:
@@ -186,7 +264,8 @@ class OptimizersContainer(Optimizer, Stateful):
         """Partition a model's parameters into per-optimizer param groups.
 
         Each parameter is claimed by the first ``ParamGroupConfig`` whose pattern
-        it matches, so order matters and a catch-all belongs last.
+        any of its registered names matches, so order matters and a catch-all
+        belongs last. Shared parameters are assigned once by identity.
 
         Returns groups keyed by optimizer name, paired with diagnostic patterns.
         The patterns stay out of the group dict on purpose -- they are for the
@@ -197,15 +276,19 @@ class OptimizersContainer(Optimizer, Stateful):
         helpers read them back to key optimizer state by FQN.
         """
         groups: dict[str, _OptimizerGroups] = defaultdict(_OptimizerGroups)
-        claimed: set[str] = set()
+        claimed: set[int] = set()
         canonical_names: dict[str, str] = {}
         trainable_parameters = [
             (name, param)
-            for name, param in model.named_parameters()
+            for name, param in model.named_parameters(remove_duplicate=False)
             if param.requires_grad
         ]
 
-        for param_group_config in param_group_configs:
+        primary_names: dict[int, str] = {}
+        for name, param in trainable_parameters:
+            primary_names.setdefault(id(param), name)
+
+        for config_index, param_group_config in enumerate(param_group_configs):
             reserved = {
                 "params",
                 "param_names",
@@ -219,24 +302,26 @@ class OptimizersContainer(Optimizer, Stateful):
             params: list[nn.Parameter] = []
             param_names: list[str] = []
             for name, param in trainable_parameters:
-                if name not in claimed and pattern.search(name):
-                    canonical_name = canonical_fqn(name)
+                if id(param) not in claimed and pattern.search(name):
+                    # Match any alias, but checkpoint under the first registered
+                    # name so group pattern changes do not rename optimizer state.
+                    primary_name = primary_names[id(param)]
+                    canonical_name = canonical_fqn(primary_name)
                     if canonical_name in canonical_names:
                         raise ValueError(
                             "Optimizer parameter FQNs collide after wrapper removal: "
                             f"{canonical_names[canonical_name]!r} and {name!r} "
                             f"both map to {canonical_name!r}"
                         )
-                    canonical_names[canonical_name] = name
+                    canonical_names[canonical_name] = primary_name
                     params.append(param)
                     param_names.append(canonical_name)
-                    claimed.add(name)
+                    claimed.add(id(param))
 
             if not params:
-                raise ValueError(
-                    f"optimizer.param_groups pattern "
-                    f"{param_group_config.pattern!r} matched no parameters"
-                )
+                # A rule may target another local pipeline chunk. The
+                # constructor checks unmatched rules over all local parts.
+                continue
 
             optimizer_groups = groups[param_group_config.optimizer_name]
             optimizer_groups.param_groups.append(
@@ -248,6 +333,7 @@ class OptimizersContainer(Optimizer, Stateful):
                 }
             )
             optimizer_groups.patterns.append(param_group_config.pattern)
+            optimizer_groups.config_indices.append(config_index)
 
         return groups
 
