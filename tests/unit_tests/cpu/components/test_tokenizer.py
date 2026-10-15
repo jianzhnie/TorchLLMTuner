@@ -175,3 +175,30 @@ def test_invalid_chat_template_collections_are_rejected(tmp_path, template, erro
     )
     with pytest.raises(ValueError, match=error):
         HuggingFaceTokenizer(tokenizer_path=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "vocab",
+    [
+        [],
+        {},
+        {"[UNK]": 0, "hello": 3},
+        {"[UNK]": 0, "hello": 0},
+        {"[UNK]": -1},
+        {"[UNK]": True},
+        {"[UNK]": "0"},
+    ],
+)
+def test_vocab_json_rejects_invalid_id_layout(tmp_path, vocab):
+    (tmp_path / "vocab.json").write_text(json.dumps(vocab), encoding="utf-8")
+    with pytest.raises(ValueError, match="vocab.json"):
+        HuggingFaceTokenizer(tokenizer_path=str(tmp_path))
+
+
+def test_vocab_json_accepts_unsorted_contiguous_ids(tmp_path):
+    (tmp_path / "vocab.json").write_text(
+        json.dumps({"hello": 1, "[UNK]": 0}), encoding="utf-8"
+    )
+    tokenizer = HuggingFaceTokenizer(tokenizer_path=str(tmp_path))
+    assert tokenizer.encode("hello", add_bos=False, add_eos=False) == [1]
+    assert tokenizer.tokenizer.get_vocab_size() == 2

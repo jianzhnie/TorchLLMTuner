@@ -16,7 +16,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.datasets.contracts import Batch, DataloaderExhaustedError
 from llmtuner.trainer.runtime.batch import batch_generator
-from llmtuner.trainer.runtime.validation import run_validation_loop
+from llmtuner.trainer.runtime.validation import finalize_validation, run_validation_loop
 
 
 class Metrics:
@@ -138,6 +138,107 @@ def main():
                 assert logs == []
             dist.barrier()
             print(f"rank={rank} validation {failure}: closed and coordinated")
+        for phase in ("construction", "iteration"):
+            closed = []
+            original = ValueError(f"validation {phase} failed")
+
+            class InitializationLoader:
+                def __iter__(self, phase=phase, original=original):
+                    if rank == 0 and phase == "iteration":
+                        raise original
+                    return iter([batch])
+
+                def close(self, closed=closed):
+                    closed.append(True)
+
+            def create(*args, phase=phase, original=original):
+                if rank == 0 and phase == "construction":
+                    raise original
+                return InitializationLoader()
+
+            with patch(
+                "llmtuner.trainer.runtime.validation.create_validation_dataloader",
+                side_effect=create,
+            ):
+                try:
+                    run_validation_loop(trainer, ValidationConfig(steps=1), step=8)
+                except ValueError as error:
+                    assert rank == 0 and error is original
+                except RuntimeError as error:
+                    assert rank == 1
+                    assert "Validation input initialization" in str(error)
+                else:
+                    raise AssertionError(
+                        "validation initialization was not coordinated"
+                    )
+            assert closed == ([] if rank == 0 and phase == "construction" else [True])
+            dist.barrier()
+            print(f"rank={rank} validation {phase}: coordinated and cleaned")
+        close_calls = []
+        cleanup_error = OSError("validation loader close failed")
+
+        class CleanupLoader:
+            def __iter__(self):
+                return iter([batch])
+
+            def close(self):
+                close_calls.append(True)
+                if rank == 0:
+                    raise cleanup_error
+
+        with (
+            patch(
+                "llmtuner.trainer.runtime.validation.create_validation_dataloader",
+                return_value=CleanupLoader(),
+            ),
+            patch(
+                "llmtuner.trainer.runtime.validation.finalize_validation"
+            ) as finalize,
+        ):
+            try:
+                run_validation_loop(trainer, ValidationConfig(steps=1), step=9)
+            except OSError as error:
+                assert rank == 0 and error is cleanup_error
+            except RuntimeError as error:
+                assert rank == 1 and "Validation input cleanup" in str(error)
+            else:
+                raise AssertionError("validation cleanup was not coordinated")
+            finalize.assert_not_called()
+        assert close_calls == [True]
+        dist.barrier()
+        print(f"rank={rank} validation cleanup: coordinated before loss reduction")
+        for failure in ("sink", "nonfinite", "preflight"):
+            original = OSError("validation sink failed")
+
+            def log_validation(*, loss, step, original=original):
+                raise original
+
+            report_trainer = SimpleNamespace(
+                metrics=SimpleNamespace(log_validation=log_validation)
+            )
+            # Rank 0 represents a final PP stage; rank 1 holds no loss.
+            loss = torch.tensor(float("nan") if failure == "nonfinite" else 4.0)
+            try:
+                finalize_validation(
+                    report_trainer,
+                    num_steps=0 if rank == 0 and failure == "preflight" else 1,
+                    accumulated_loss=loss if rank == 0 else None,
+                    total_global_valid_tokens=torch.tensor(4),
+                    loss_mesh=None,
+                    step=10,
+                )
+            except OSError as error:
+                assert rank == 0 and failure == "sink" and error is original
+            except FloatingPointError:
+                assert rank == 0 and failure == "nonfinite"
+            except ValueError:
+                assert rank == 0 and failure == "preflight"
+            except RuntimeError as error:
+                assert rank == 1 and "Validation result" in str(error)
+            else:
+                raise AssertionError("validation result failure was not coordinated")
+            dist.barrier()
+            print(f"rank={rank} validation {failure}: result error coordinated")
     finally:
         dist.destroy_process_group()
 

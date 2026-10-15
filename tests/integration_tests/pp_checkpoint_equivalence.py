@@ -47,6 +47,12 @@ uninterrupted run consumed at steps N+1..N+M with no manual fast-forward.
 Final model, optimizer, scheduler, trainer counters and enabled EMA are compared
 exactly. Set LLMTUNER_TEST_EMA=dynamic in both phases to exercise EMA aging.
 
+Set LLMTUNER_TEST_TP_SIZE=2 and LLMTUNER_TEST_PP_SIZE=1 on two ranks
+for tensor-parallel checkpoint ownership checks.
+
+Set LLMTUNER_TEST_AMSGRAD=0 or 1 independently in each phase to verify
+that saved optimizer options determine maximum-moment layout across PP/FSDP.
+
 Everything runs in fp32 on CPU/gloo. The caller owns the workdir and its cleanup.
 Set LLMTUNER_TEST_RELOCATED_HOOKS=1 with custom in both phases to
 configure four attention projection units per ancestor hook and verify real
@@ -114,6 +120,7 @@ from llmtuner.config import (
     TrainingConfig,
 )
 from llmtuner.config.compile_config import CompileConfig
+from llmtuner.config.optimizer_config import ParamGroupConfig
 from llmtuner.config.parallel_config import FSDPConfig, PipelineParallelConfig
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.module_names import canonical_fqn
@@ -209,6 +216,7 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
             num_key_value_heads=4,
         ),
         parallel=ParallelConfig(
+            tensor_parallel_size=int(os.environ.get("LLMTUNER_TEST_TP_SIZE", "1")),
             expert_parallel_size=int(os.environ.get("LLMTUNER_TEST_EP_SIZE", "1")),
             pipeline_parallel_size=int(os.environ.get("LLMTUNER_TEST_PP_SIZE", "2")),
             context_parallel_kv_allgather_size=int(
@@ -224,7 +232,23 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
                 pipeline_parallel_schedule=schedule, num_pp_microbatches=MICROBATCHES
             ),
         ),
-        optimizer=OptimizerConfig(learning_rate=3e-4, weight_decay=0.0),
+        optimizer=OptimizerConfig(
+            param_groups=[
+                ParamGroupConfig(
+                    pattern=".*",
+                    optimizer_name="AdamW",
+                    optimizer_kwargs={
+                        "lr": 3e-4,
+                        "weight_decay": 0.0,
+                        "amsgrad": os.environ["LLMTUNER_TEST_AMSGRAD"] == "1",
+                    },
+                )
+            ]
+            if "LLMTUNER_TEST_AMSGRAD" in os.environ
+            else [],
+            learning_rate=3e-4,
+            weight_decay=0.0,
+        ),
         training=TrainingConfig(
             global_batch_size=GLOBAL_BATCH,
             max_seq_len=SEQ,

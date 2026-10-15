@@ -387,7 +387,18 @@ def test_shared_expert_is_not_double_sharded_by_the_dense_plan(root_block) -> No
         torch.testing.assert_close(actual, value, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("failure", ["layout", "hidden", "bias", "shared_hidden"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "layout",
+        "hidden",
+        "bias",
+        "shared_hidden",
+        "gate_shape",
+        "up_shape",
+        "down_shape",
+    ],
+)
 def test_moe_tp_validates_all_blocks_before_sharding(failure) -> None:
     from llmtuner.parallel.tensor_parallel.tensor_parallel import realize_moe_blocks_tp
 
@@ -402,6 +413,12 @@ def test_moe_tp_validates_all_blocks_before_sharding(failure) -> None:
         shared.gate_proj = nn.Linear(16, hidden, bias=failure == "bias")
         shared.up_proj = nn.Linear(16, hidden, bias=False)
         shared.down_proj = nn.Linear(hidden, 16, bias=False)
+        if failure == "gate_shape":
+            shared.gate_proj = nn.Linear(18, hidden, bias=False)
+        elif failure == "up_shape":
+            shared.up_proj = nn.Linear(16, hidden * 2, bias=False)
+        elif failure == "down_shape":
+            shared.down_proj = nn.Linear(hidden, 18, bias=False)
         blocks[1].shared_expert = shared
     original = [{name: p for name, p in block.named_parameters()} for block in blocks]
     with pytest.raises(ValueError if failure != "layout" else NotImplementedError):
@@ -517,3 +534,70 @@ def test_tp_expert_sharding_preserves_freezing():
     shard_experts_for_tp(block, tp_size=2, tp_rank=0)
     assert not block.experts.gate_up_proj.requires_grad
     assert block.experts.down_proj.requires_grad
+
+
+@pytest.mark.parametrize(
+    "sharing",
+    [
+        "experts_module",
+        "expert_parameter",
+        "external",
+        "shared_external",
+        "shared_axes",
+    ],
+)
+def test_tp_rejects_shared_moe_shards_before_mutating_model(sharing):
+    model = _MoeModel()
+    first = model.layers[0]["mlp"]
+    second = _MoeBlock(4, 16, 8, top_k=2)
+    model.layers.append(nn.ModuleDict({"mlp": second}))
+    if sharing == "experts_module":
+        second.experts = first.experts
+    elif sharing == "expert_parameter":
+        second.experts.gate_up_proj = first.experts.gate_up_proj
+    elif sharing == "external":
+        model.external_weight = first.experts.gate_up_proj
+    else:
+        first.shared_expert = _SharedMLP(16, 16)
+        shared = first.shared_expert
+        if sharing == "shared_external":
+            shared.up_proj.weight = shared.gate_proj.weight
+            model.external_weight = shared.gate_proj.weight
+        else:
+            shared.down_proj.weight = shared.gate_proj.weight
+    parameters = dict(model.named_parameters(remove_duplicate=False))
+    values = {name: p.detach().clone() for name, p in parameters.items()}
+    classes = [type(first), type(second)]
+    with pytest.raises(ValueError, match="shared.*paths"):
+        apply_tp(
+            model,
+            mesh=_FakeMesh(2, 0),
+            cfg=ParallelConfig(tensor_parallel_size=2),
+        )
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        assert parameter is parameters[name]
+        torch.testing.assert_close(parameter, values[name], rtol=0, atol=0)
+    assert [type(first), type(second)] == classes
+    assert not getattr(first, "_tp_moe_boundary", False)
+    assert not getattr(second, "_tp_moe_boundary", False)
+
+
+@pytest.mark.parametrize("same_module", [False, True])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_tp_preserves_tied_shared_gate_up_projection(same_module, rank):
+    model = _MoeModel()
+    block = model.layers[0]["mlp"]
+    shared = _SharedMLP(16, 8)
+    block.shared_expert = shared
+    if same_module:
+        shared.up_proj = shared.gate_proj
+    else:
+        shared.up_proj.weight = shared.gate_proj.weight
+    original = shared.gate_proj.weight.detach().clone()
+    shared.gate_proj.weight.requires_grad_(False)
+    apply_tp(model, mesh=_FakeMesh(2, rank), cfg=ParallelConfig(tensor_parallel_size=2))
+    assert shared.gate_proj.weight is shared.up_proj.weight
+    assert not shared.gate_proj.weight.requires_grad
+    torch.testing.assert_close(shared.gate_proj.weight, original.chunk(2, 0)[rank])
+    assert shared.gate_proj.out_features == 4
+    assert shared.up_proj.out_features == 4
