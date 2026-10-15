@@ -240,6 +240,54 @@ def test_round_up(value: int, multiple: int, expected: int) -> None:
 # -- the dense additive mask (DSA models) ------------------------------------
 
 
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+@pytest.mark.parametrize("supports_layout", [False, True])
+def test_attention_mask_forwards_explicit_options_and_selects_builder(
+    monkeypatch, device, supports_layout
+):
+    from types import SimpleNamespace
+
+    from llmtuner.models.common.attention import masks
+
+    calls = []
+    result = object()
+
+    def eager(*args, **kwargs):
+        calls.append(("eager", args, kwargs))
+        return result
+
+    def compiled(*args, **kwargs):
+        calls.append(("compiled", args, kwargs))
+        return result
+
+    monkeypatch.setattr(masks, "flex_ops", lambda: (eager, compiled, supports_layout))
+    # Exercise dispatch selection without requiring an NPU device or kernel.
+    monkeypatch.setattr(
+        masks.torch, "device", lambda value: SimpleNamespace(type=value)
+    )
+    modifier = get_causal_mask_mod()
+    actual = masks.create_attention_mask(
+        modifier,
+        B=2,
+        H=4,
+        Q_LEN=7,
+        KV_LEN=11,
+        device=device,
+        BLOCK_SIZE=(4, 8),
+        separate_full_blocks=False,
+    )
+    assert actual is result
+    assert len(calls) == 1
+    kind, args, kwargs = calls[0]
+    assert kind == ("eager" if device == "npu" else "compiled")
+    assert args == (modifier, 2, 4, 7, 11)
+    assert kwargs == {
+        "device": device,
+        "BLOCK_SIZE": (4, 8),
+        **({"separate_full_blocks": False} if supports_layout else {}),
+    }
+
+
 def test_the_dense_mask_is_a_4d_additive_tensor() -> None:
     """DSA's modeling code calls ``.dim()`` on the mask and adds it to the
     scores, so this has to be a plain ``[1, 1, T, T]`` tensor of 0.0/-inf --

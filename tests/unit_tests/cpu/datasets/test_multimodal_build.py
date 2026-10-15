@@ -38,7 +38,7 @@ from llmtuner.datasets import (
     SingleDataset,
     build_dataloader,
 )
-from llmtuner.datasets.text.processors import DATASETS as TEXT_DATASETS
+from llmtuner.datasets.text.recipes import DATASETS as TEXT_DATASETS
 from tests.data_fixtures import VOCAB, Base64JsonlSource, png_bytes, write_tokenizer
 
 IMAGE_TOKEN = "<|image_pad|>"
@@ -57,6 +57,8 @@ MM_MODULES = (
     "llmtuner.datasets.multimodal",
     "llmtuner.datasets.multimodal.collator",
     "llmtuner.datasets.multimodal.processors",
+    "llmtuner.datasets.multimodal.recipes",
+    "llmtuner.datasets.multimodal.packing",
     "llmtuner.datasets.multimodal.image",
     "llmtuner.datasets.multimodal.placeholders",
     "llmtuner.datasets.multimodal.video",
@@ -65,7 +67,7 @@ MM_MODULES = (
 # The text recipe module, which the text path *does* import. Listed for the
 # same reason: it keeps the guard meaningful across a rename of the file, which
 # would otherwise leave a stale string matching nothing.
-TEXT_RECIPE_MODULE = "llmtuner.datasets.text.processors"
+TEXT_RECIPE_MODULE = "llmtuner.datasets.text.recipes"
 
 
 def _loaded(names: tuple[str, ...]) -> list[str]:
@@ -107,11 +109,30 @@ def test_build_dataloader_names_a_multimodal_recipe(tmp_path, monkeypatch):
     """The end-to-end seam: a config names ``cc12m-test`` and the loader that
     comes back carries image patches and grids in its batches."""
     pytest.importorskip("torchvision")
+    from llmtuner.datasets.multimodal import packing
     from llmtuner.datasets.multimodal.processors import (
-        MULTIMODAL_DATASETS,
         MultimodalProcessor,
         process_cc12_wd_sample,
     )
+    from llmtuner.datasets.multimodal.recipes import MULTIMODAL_DATASETS
+
+    seen = {}
+    original_pack = packing.grain.experimental.FirstFitPackIterDataset
+
+    def capture_pack(*args, **kwargs):
+        seen["max_sequences_per_bin"] = kwargs.get("max_sequences_per_bin")
+        return original_pack(*args, **kwargs)
+
+    monkeypatch.setattr(
+        packing.grain.experimental, "FirstFitPackIterDataset", capture_pack
+    )
+    original_build = packing.build_multimodal_packing
+
+    def capture_packing(*args, **kwargs):
+        seen.update(kwargs)
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(packing, "build_multimodal_packing", capture_packing)
 
     corpus = str(tmp_path / "pairs.jsonl")
     encoded = base64.b64encode(png_bytes(64, 64)).decode()
@@ -140,9 +161,13 @@ def test_build_dataloader_names_a_multimodal_recipe(tmp_path, monkeypatch):
             dataset="cc12m-test",
             tokenizer_path=_mm_tokenizer_path(tmp_path),
             mm_pad_token=PAD_TOKEN,
+            num_packing_bins=3,
+            max_num_documents=2,
         ),
         num_tokens=256,
     )
+    assert seen["num_packing_bins"] == 3
+    assert seen["max_sequences_per_bin"] == 2
     batch = next(iter(loader))
     assert batch["input"].shape == (256,)
     assert batch["labels"].shape == (256,)
@@ -158,7 +183,7 @@ def test_unknown_recipe_lists_both_registries(tmp_path):
     """A typo must show the caller every name that would have worked, from
     both catalogs, in one error."""
     pytest.importorskip("torchvision")
-    from llmtuner.datasets.multimodal.processors import MULTIMODAL_DATASETS
+    from llmtuner.datasets.multimodal.recipes import MULTIMODAL_DATASETS
 
     with pytest.raises(ValueError, match="unknown dataset") as excinfo:
         _build(
@@ -243,5 +268,20 @@ def test_importing_the_text_path_needs_no_multimodal_dependencies():
         capture_output=True,
         text=True,
         env=env,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_base_tokenizer_import_does_not_load_optional_implementations():
+    source = (
+        "import sys; sys.modules['tokenizers'] = None\n"
+        "from llmtuner.components.tokenizer import BaseTokenizer\n"
+        "from llmtuner.components.tokenizer.base import BaseTokenizer as Defined\n"
+        "assert BaseTokenizer is Defined\n"
+        "assert 'llmtuner.components.tokenizer.huggingface' not in sys.modules\n"
+        "assert 'llmtuner.components.tokenizer.multimodal' not in sys.modules\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr

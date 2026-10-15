@@ -33,7 +33,7 @@ import torch
 import torch.distributed as dist
 
 from llmtuner.models.common.moe.bias_update import (
-    register_moe_quantile_balancing_hook,
+    register_moe_balancing_hook,
     update_quantile_expert_bias,
 )
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
@@ -80,7 +80,7 @@ def _moe(**kwargs) -> MoE:
 
 
 class _Holder(torch.nn.Module):
-    """Stands in for a model part: ``iter_moe_layers`` walks ``.layers``."""
+    """Stands in for a model part: ``collect_moe_layers`` walks ``.layers``."""
 
     def __init__(self, moes: list[MoE | None]) -> None:
         super().__init__()
@@ -281,7 +281,7 @@ def test_the_update_pushes_load_toward_balance() -> None:
 # -- the hook -----------------------------------------------------------------
 
 
-def test_no_hook_is_registered_without_quantile_routers() -> None:
+def test_balancing_entry_selects_sign_update_without_quantile_routers() -> None:
     model = _Holder(
         [
             MoE(
@@ -297,9 +297,17 @@ def test_no_hook_is_registered_without_quantile_routers() -> None:
     )
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
 
-    register_moe_quantile_balancing_hook(optimizer, [model], parallel_dims=None)
+    register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
-    assert optimizer._optimizer_step_pre_hooks == {}
+    assert len(optimizer._optimizer_step_pre_hooks) == 1
+    moe = model.layers[0].mlp
+    counts = torch.arange(_NUM_EXPERTS, dtype=moe.tokens_per_expert_E.dtype)
+    moe.tokens_per_expert_E.copy_(counts)
+    previous_bias = moe.expert_bias_E.clone()
+    expected_bias = previous_bias + 0.1 * (counts.float().mean() - counts).sign()
+    optimizer.step()
+    torch.testing.assert_close(moe.expert_bias_E, expected_bias)
+    assert moe.tokens_per_expert_E.count_nonzero() == 0
 
 
 def test_a_mixed_model_is_rejected() -> None:
@@ -318,7 +326,7 @@ def test_a_mixed_model_is_rejected() -> None:
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
 
     with pytest.raises(ValueError, match="mutually exclusive"):
-        register_moe_quantile_balancing_hook(optimizer, [model], parallel_dims=None)
+        register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
     assert optimizer._optimizer_step_pre_hooks == {}
 
@@ -364,7 +372,7 @@ def test_the_hook_solves_the_bias_and_drains_the_scratch() -> None:
     moe.train()
     model = _Holder([moe])
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
-    register_moe_quantile_balancing_hook(optimizer, [model], parallel_dims=None)
+    register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
     scores_TE = torch.tensor([0.92, 0.68, 0.31, 0.07]).expand(4, -1)
     with torch.no_grad():
@@ -475,8 +483,8 @@ def test_quantile_bias_update_matches_with_checkpoint_recomputation(mode, microb
     after = replayed.router.quantile_balancer.required_bias_histogram_EB
     assert int(before.sum()) == int((~padding).sum()) * 4 * microbatches
     assert int(after.sum()) > int(before.sum()), "Backward must replay routing"
-    update_quantile_expert_bias([original], None)
-    update_quantile_expert_bias([replayed], None)
+    update_quantile_expert_bias([original], parallel_dims=None)
+    update_quantile_expert_bias([replayed], parallel_dims=None)
     torch.testing.assert_close(replayed.expert_bias_E, original.expert_bias_E)
     assert not replayed.router.quantile_balancer.required_bias_histogram_EB.any()
     assert not replayed.tokens_per_expert_E.any()
@@ -492,3 +500,60 @@ def test_quantile_interpolation_preserves_fractional_large_token_counts():
     actual = QuantileBalancer(2, 1, 4).estimate_expert_bias(histogram, bias)
     assert actual.dtype == bias.dtype
     torch.testing.assert_close(actual, torch.tensor([0.125, -0.125]), rtol=0, atol=0)
+
+
+def test_quantile_update_reduces_different_histogram_shapes(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.models.common.moe import bias_update
+
+    layers = []
+    expected = []
+    for experts, bins in [(4, 16), (8, 32)]:
+        layer = MoE(
+            experts,
+            RoutedExperts(
+                GroupedExperts(4, 8, experts, use_grouped_mm=False),
+                LocalTokenDispatcher(experts, 2),
+            ),
+            QuantileBalancedTopKRouter(experts, 4, 2, num_bins=bins),
+            load_balance_coeff=None,
+        )
+        balancer = layer.router.quantile_balancer
+        histogram = balancer.required_bias_histogram_EB
+        histogram.copy_(torch.arange(histogram.numel()).reshape(histogram.shape) % 7)
+        expected.append(
+            balancer.estimate_expert_bias(histogram * 4, layer.expert_bias_E)
+        )
+        layer.tokens_per_expert_E.fill_(3)
+        layers.append(layer)
+
+    groups = {axis: object() for axis in ("dp", "cp", "tp")}
+    calls = []
+
+    def reduce(statistics, *, group):
+        calls.append(group)
+        statistics.mul_(2)
+
+    topology = SimpleNamespace(
+        ep_enabled=False,
+        get_optional_mesh=lambda axis: SimpleNamespace(get_group=lambda: groups[axis]),
+    )
+    monkeypatch.setattr(bias_update, "all_reduce", reduce)
+    update_quantile_expert_bias(layers, parallel_dims=topology)
+
+    assert calls == [groups["dp"], groups["cp"]]
+    for layer, reference in zip(layers, expected, strict=True):
+        torch.testing.assert_close(layer.expert_bias_E, reference)
+        assert not layer.router.quantile_balancer.required_bias_histogram_EB.any()
+        assert not layer.tokens_per_expert_E.any()
+
+
+def test_quantile_bias_update_with_no_layers_is_a_noop(monkeypatch):
+    from llmtuner.models.common.moe import bias_update
+
+    def unexpected_collective(*args, **kwargs):
+        raise AssertionError("empty layer list must not start a collective")
+
+    monkeypatch.setattr(bias_update, "all_reduce", unexpected_collective)
+    update_quantile_expert_bias([], parallel_dims=None)

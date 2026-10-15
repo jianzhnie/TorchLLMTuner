@@ -2,7 +2,7 @@
 
 Run under torchrun with 2 ranks:
 
-    torchrun --nproc_per_node=2 tests/ep_equivalence.py
+    PYTHONPATH=. torchrun --nproc_per_node=2 tests/integration_tests/ep_equivalence.py
 
 Both sides get the same global weights and the same tokens. The reference keeps
 all 8 experts on every rank and routes locally; the EP path gives each rank 4
@@ -123,7 +123,6 @@ def main() -> None:
         print(f"EP    vs fp64    = {got_err:.3e}")
         # Both paths must sit within fp32 noise of the exact answer, and their
         # disagreement must be no worse than that noise.
-        assert rel < 1e-5, f"EP output diverged from reference (rel {rel:.3e})"
 
     # The gather is the real point: every rank must agree, not just rank 0.
     diff_t = torch.tensor(rel)
@@ -132,6 +131,10 @@ def main() -> None:
         print(f"max rel error across ranks = {diff_t.item():.3e}")
 
     dist.destroy_process_group()
+    assert diff_t.item() < 1e-5, (
+        f"EP output diverged from reference on at least one rank "
+        f"(max rel error {diff_t.item():.3e})"
+    )
 
 
 if __name__ == "__main__":

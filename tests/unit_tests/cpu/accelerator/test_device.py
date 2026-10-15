@@ -36,3 +36,21 @@ def test_cpu_is_available_but_not_pinned() -> None:
     cpu = torch.device("cpu")
     assert device.is_device_available(cpu)
     assert not device.should_use_pin_memory(cpu)
+
+
+def test_cuda_peak_query_resets_the_requested_device(monkeypatch) -> None:
+    requested_device = torch.device("cuda:3")
+    calls = []
+
+    def peak(*, device):
+        calls.append(("query", device))
+        return 7 * 1024 * 1024 + 512
+
+    def reset(*, device):
+        calls.append(("reset", device))
+
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", peak)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", reset)
+
+    assert device.get_max_cuda_memory(requested_device) == 7
+    assert calls == [("query", requested_device), ("reset", requested_device)]

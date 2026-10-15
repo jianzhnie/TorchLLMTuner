@@ -139,7 +139,7 @@ def main() -> None:
     else:
         cfg = ParallelConfig(data_parallel_shard_size=2)
     parallel_dims = ParallelTopology.from_config(cfg, world)
-    parallel_dims.build_mesh()
+    parallel_dims.build_device_mesh()
     loss_mesh = parallel_dims.get_mesh("loss")
 
     global_tokens = world * SEQ

@@ -88,3 +88,22 @@ def test_empty_model_parts_preserve_manager_compatibility(parts) -> None:
 def test_invalid_model_part_is_rejected_before_shard_inspection() -> None:
     with pytest.raises(TypeError, match="nn.Module"):
         ModelCheckpointState([nn.Linear(2, 2), object()])
+
+
+def test_overlapping_model_parts_are_rejected_instead_of_overwriting() -> None:
+    with pytest.raises(ValueError, match="overlap at part 1.*bias.*weight"):
+        ModelCheckpointState([nn.Linear(2, 2), nn.Linear(2, 2)])
+
+
+def test_buffer_key_collision_fails_before_refreshing_checkpoint_cache() -> None:
+    first = nn.ModuleDict({"first": nn.Linear(2, 2)})
+    second = nn.ModuleDict({"second": nn.Linear(2, 2)})
+    first.register_buffer("counter", torch.tensor(1))
+    state = ModelCheckpointState([first, second])
+    cached = state.cached_state_dict.copy()
+    second.register_buffer("counter", torch.tensor(2))
+
+    with pytest.raises(ValueError, match="overlap at part 1.*counter"):
+        state.state_dict()
+    assert state.cached_state_dict.keys() == cached.keys()
+    assert all(state.cached_state_dict[key] is value for key, value in cached.items())

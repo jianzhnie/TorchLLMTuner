@@ -169,7 +169,8 @@ def in_memory_stream(rows: list[dict[str, Any]]) -> grain.IterDataset:
 
     A source slot takes an already-built node as well as a description, and
     this is the local stand-in for one: streaming rather than random-access,
-    so a dataset built on it takes the ``build_iter_dataset`` branch. That
+    so a dataset built on it takes the streaming branch of
+    ``build_single_dataset``. That
     branch is otherwise reachable only through the Hugging Face streaming
     source, which needs the network.
     """
@@ -227,7 +228,7 @@ class Base64JsonlSource:
 
     def _index(self):
         return build_source(
-            IndexedJsonlSource(patterns=self._patterns), dataset_iteration_policy=None
+            IndexedJsonlSource(patterns=self._patterns), iteration_policy=None
         )
 
     def __len__(self):

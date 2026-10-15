@@ -318,3 +318,59 @@ def test_container_owns_model_part_collection():
     parts.clear()
     assert container.model_parts == [model]
     assert container.state_dict()
+
+
+@pytest.mark.parametrize("field", ["params", "param_names"])
+def test_param_group_options_cannot_override_parameter_ownership(field):
+    model = torch.nn.Linear(2, 2)
+    config = OptimizerConfig(
+        implementation="for-loop",
+        param_groups=[
+            ParamGroupConfig(
+                pattern=".*",
+                optimizer_name="AdamW",
+                optimizer_kwargs={"lr": 0.1, field: []},
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="managed parameter fields"):
+        OptimizersContainer(config, model_parts=[model])
+
+
+def test_optimizer_rejects_parameter_names_colliding_after_wrapper_removal():
+    model = torch.nn.Module()
+    model.register_parameter("weight", torch.nn.Parameter(torch.ones(2, 2)))
+    model.add_module("_checkpoint_wrapped_module", torch.nn.Linear(2, 2))
+
+    with pytest.raises(ValueError, match="FQNs collide after wrapper removal"):
+        OptimizersContainer(
+            OptimizerConfig(implementation="for-loop"), model_parts=[model]
+        )
+
+
+@pytest.mark.parametrize("invalid_layout", ["repeated_part", "later_pattern_mismatch"])
+def test_all_model_parts_are_validated_before_building_optimizers(
+    monkeypatch, invalid_layout
+):
+    def unexpected_constructor(*args, **kwargs):
+        pytest.fail("all parameter groups must be validated before construction")
+
+    monkeypatch.setattr(torch.optim, "AdamW", unexpected_constructor)
+    model = _model()
+    if invalid_layout == "repeated_part":
+        parts = [model, model]
+        config = _cfg(_catch_all())
+        error = "more than one group"
+    else:
+        parts = [model, nn.Linear(8, 8)]
+        config = _cfg(
+            ParamGroupConfig(
+                pattern=r"^1\.weight$",
+                optimizer_name="AdamW",
+                optimizer_kwargs={"lr": 0.1},
+            ),
+            _catch_all(),
+        )
+        error = "matched no parameters"
+    with pytest.raises(ValueError, match=error):
+        OptimizersContainer(config, model_parts=parts)

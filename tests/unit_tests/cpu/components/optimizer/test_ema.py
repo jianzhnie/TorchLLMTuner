@@ -67,13 +67,23 @@ def test_the_first_dynamic_update_nearly_overwrites_the_average() -> None:
         torch.testing.assert_close(_ema_params(ema)[name], expected)
 
 
-def test_decay_grows_with_the_firing_count() -> None:
-    ema = EMA(model_parts=[_model()])
-    assert ema._decay_at(1) == pytest.approx(2.0**-20)
-    assert ema._decay_at(20) == pytest.approx(0.5)
-    assert ema._decay_at(200) == pytest.approx(2.0**-0.1)
-    # A fixed decay replaces the schedule outright.
-    assert EMA(model_parts=[_model()], decay=0.9)._decay_at(1) == 0.9
+@pytest.mark.parametrize(
+    "step, fixed_decay, expected_decay",
+    [(1, None, 2.0**-20), (20, None, 0.5), (200, None, 2.0**-0.1), (1, 0.9, 0.9)],
+)
+def test_decay_schedule_controls_the_actual_update(
+    step, fixed_decay, expected_decay
+) -> None:
+    model = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.zero_()
+    ema = EMA(model_parts=[model], decay=fixed_decay)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    ema.step(step)
+    torch.testing.assert_close(
+        _ema_params(ema)["weight"], torch.full_like(model.weight, 1 - expected_decay)
+    )
 
 
 def test_step_gating_against_start_step_and_update_every_n_steps() -> None:
@@ -243,6 +253,27 @@ def test_an_integer_buffer_match_is_rejected() -> None:
         EMA(model_parts=[model], buffer_patterns=["step_counter"])
 
 
+@pytest.mark.parametrize("invalid_pattern", [True, False])
+def test_invalid_buffer_selection_fails_before_averages_are_allocated(
+    monkeypatch, invalid_pattern
+):
+    import re
+
+    from llmtuner.components.optimizer import ema as ema_module
+
+    def fail_if_allocated(*args, **kwargs):
+        pytest.fail("EMA allocated parameter averages before validating patterns")
+
+    monkeypatch.setattr(ema_module, "EMAParamOptimizer", fail_if_allocated)
+    model = _model()
+    model.register_buffer("step_counter", torch.zeros((), dtype=torch.long))
+    with pytest.raises(re.error if invalid_pattern else ValueError):
+        EMA(
+            model_parts=[model],
+            buffer_patterns=["[" if invalid_pattern else "step_counter"],
+        )
+
+
 def test_a_replaced_parameter_is_a_loud_error_not_a_keyerror() -> None:
     model = _model()
     ema = EMA(model_parts=[model])
@@ -255,6 +286,62 @@ def test_the_inner_optimizer_cannot_be_stepped() -> None:
     ema = EMA(model_parts=[_model()])
     with pytest.raises(RuntimeError, match="must not be step"):
         ema.optimizers[0].step()
+
+
+@pytest.mark.parametrize("name", ["start_step", "step_bias", "update_every_n_steps"])
+@pytest.mark.parametrize("value", [-1, True, 1.5])
+def test_ema_step_configuration_rejects_invalid_integers(name, value):
+    with pytest.raises(ValueError, match=name):
+        EMAConfig(**{name: value})
+    with pytest.raises(ValueError, match=name):
+        EMA(model_parts=[_model()], **{name: value})
+
+
+@pytest.mark.parametrize("step", [-1, True, 1.5])
+def test_invalid_step_preserves_ema_weights(step):
+    model = _model()
+    ema = EMA(model_parts=[model])
+    before = {name: value.clone() for name, value in _ema_params(ema).items()}
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(1)
+    with pytest.raises(ValueError, match="current_step"):
+        ema.step(step)
+    for name, value in _ema_params(ema).items():
+        torch.testing.assert_close(value, before[name])
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("decay", -0.1),
+        ("decay", 1.0),
+        ("decay", float("nan")),
+        ("decay", float("inf")),
+        ("decay", True),
+        ("decay", False),
+        ("decay", "0.5"),
+        ("half_life_fraction", 0.0),
+        ("half_life_fraction", -0.1),
+        ("half_life_fraction", float("nan")),
+        ("half_life_fraction", float("inf")),
+        ("half_life_fraction", True),
+        ("half_life_fraction", False),
+        ("half_life_fraction", "0.05"),
+        ("half_life_fraction", None),
+    ],
+)
+def test_invalid_ema_schedule_is_rejected_before_allocation(monkeypatch, name, value):
+    from llmtuner.components.optimizer import ema as ema_module
+
+    def unexpected_allocation(*args, **kwargs):
+        raise AssertionError("invalid schedule must fail before allocating averages")
+
+    monkeypatch.setattr(ema_module, "EMAParamOptimizer", unexpected_allocation)
+    with pytest.raises(ValueError, match=name):
+        EMAConfig(**{name: value})
+    with pytest.raises(ValueError, match=name):
+        EMA(model_parts=[_model()], **{name: value})
 
 
 def test_config_validation() -> None:
@@ -310,6 +397,18 @@ def test_ema_owns_model_part_collection():
         torch.testing.assert_close(average, before + 1)
 
 
+def test_repeated_model_part_is_rejected_before_allocating_averages(monkeypatch):
+    from llmtuner.components.optimizer import ema as ema_module
+
+    def fail_if_allocated(*args, **kwargs):
+        pytest.fail("EMA allocated averages before checking parameter ownership")
+
+    monkeypatch.setattr(ema_module, "EMAParamOptimizer", fail_if_allocated)
+    model = _model()
+    with pytest.raises(ValueError, match="more than one group"):
+        EMA(model_parts=[model, model])
+
+
 def test_update_rejects_later_replaced_parameter_before_updating_earlier_part():
     first, second = _model(), _model()
     ema = EMA(model_parts=[first, second], decay=0.5)
@@ -327,3 +426,54 @@ def test_update_rejects_later_replaced_parameter_before_updating_earlier_part():
         ema.step(1)
     for average, expected in zip(averages, before, strict=True):
         torch.testing.assert_close(average, expected)
+
+
+@pytest.mark.parametrize("operation", ["update", "cold_start"])
+@pytest.mark.parametrize(
+    "change", ["remove_parameter", "freeze_parameter", "remove_buffer"]
+)
+def test_ema_rejects_shrinking_scope_before_changing_averages(operation, change):
+    first, second = _model(), _model()
+    second.register_buffer("expert_bias_E", torch.ones(4))
+    ema = EMA(
+        model_parts=[first, second], decay=0.5, buffer_patterns=["expert_bias_E$"]
+    )
+    averages = [
+        state["ema_params"]
+        for optimizer in ema.optimizers
+        for state in optimizer.state.values()
+    ]
+    before = [average.clone() for average in averages]
+    with torch.no_grad():
+        for parameter in first.parameters():
+            parameter.add_(2)
+    if change == "remove_parameter":
+        second[0].register_parameter("weight", None)
+    elif change == "freeze_parameter":
+        second[0].weight.requires_grad_(False)
+    else:
+        del second.expert_bias_E
+
+    with pytest.raises(RuntimeError, match="tracked scope lost"):
+        if operation == "update":
+            ema.step(1)
+        else:
+            ema.load_state_dict({})
+
+    for average, expected in zip(averages, before, strict=True):
+        torch.testing.assert_close(average, expected)
+
+
+@pytest.mark.parametrize("track_buffers", [False, True])
+def test_ema_rejects_tensor_names_colliding_after_wrapper_removal(track_buffers):
+    from llmtuner.components.optimizer.ema import EMAParamOptimizer
+
+    tensor_factory = (
+        torch.ones if track_buffers else lambda n: nn.Parameter(torch.ones(n))
+    )
+    tensors = [
+        ("weight", tensor_factory(2)),
+        ("_checkpoint_wrapped_module.weight", tensor_factory(2)),
+    ]
+    with pytest.raises(ValueError, match="EMA tensor FQNs collide"):
+        EMAParamOptimizer(tensors)

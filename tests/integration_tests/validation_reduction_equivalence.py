@@ -70,7 +70,7 @@ class Projection(torch.nn.Module):
 
 def main():
     dist.init_process_group("gloo")
-    original_builder = validation.build_validation_dataloader
+    original_builder = validation.create_validation_dataloader
     try:
         assert dist.get_world_size() == 4
         for axis in ("cp", "tp"):
@@ -105,7 +105,9 @@ def main():
                 log_validation=lambda logs=logs, **kw: logs.append(kw),
             )
             loader = Loader(batches(mesh["dp"].get_local_rank()))
-            validation.build_validation_dataloader = lambda *args, loader=loader: loader
+            validation.create_validation_dataloader = lambda *args, loader=loader: (
+                loader
+            )
             trainer.validate(step=7)
             reference_sum = torch.zeros((), dtype=torch.float64)
             reference_count = 0
@@ -133,7 +135,7 @@ def main():
             if dist.get_rank() == 0:
                 print(f"DP x {axis.upper()}: validation matches full-batch loss")
     finally:
-        validation.build_validation_dataloader = original_builder
+        validation.create_validation_dataloader = original_builder
         dist.destroy_process_group()
 
 

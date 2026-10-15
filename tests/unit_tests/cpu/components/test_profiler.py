@@ -31,6 +31,31 @@ from llmtuner.utils.monitoring import record_memory_history
 # -- config -------------------------------------------------------------------
 
 
+def test_profiler_rejects_nested_entry_and_reuse():
+    profiler = Profiler(Config())
+    with profiler:
+        with pytest.raises(RuntimeError, match="already active"):
+            profiler.__enter__()
+        assert profiler._entered
+    with pytest.raises(RuntimeError, match="create a new instance"):
+        profiler.__enter__()
+    assert not profiler._entered
+
+
+def test_trace_initialization_failure_allows_retry(monkeypatch):
+    profiler = Profiler(Config())
+
+    def fail():
+        raise ValueError("trace setup failed")
+
+    monkeypatch.setattr(profiler, "build_torch_profiler", fail)
+    with pytest.raises(ValueError, match="trace setup failed"):
+        profiler.__enter__()
+    monkeypatch.setattr(profiler, "build_torch_profiler", lambda: None)
+    with profiler:
+        assert profiler._entered
+
+
 def test_the_defaults_disable_everything() -> None:
     """Profiling is opt-in: it changes what the run does and costs real time."""
     config = Config()
@@ -64,8 +89,10 @@ def test_the_cycle_length_only_has_to_fit_when_profiling_is_on() -> None:
 
 
 def test_a_zero_snapshot_frequency_is_rejected_at_build_time(tmp_path) -> None:
+    config = Config(enable_memory_snapshot=True)
+    config.memory_snapshot_freq = 0
     profiler = Profiler(
-        Config(enable_memory_snapshot=True, memory_snapshot_freq=0),
+        config,
         base_folder=str(tmp_path),
     )
 
@@ -434,7 +461,22 @@ def test_the_schedule_restarts_from_the_resumed_step(tmp_path) -> None:
     )
 
     with profiler as entered:
-        assert entered.torch_profiler.step_num == 100
+        assert entered.torch_profiler.step_num == 0
+        assert entered.torch_profiler.schedule(0) == torch.profiler.schedule(
+            wait=0, warmup=0, active=1
+        )(100)
+    assert (tmp_path / "profiling/traces/iteration_100/rank0_trace.json.gz").exists()
+
+
+def test_resumed_schedule_initial_action_uses_global_step(tmp_path):
+    config = Config(enable_profiling=True, profile_freq=5, profiler_warmup=1)
+    profiler = Profiler(config, global_step=3, base_folder=str(tmp_path))
+    expected = torch.profiler.schedule(wait=3, warmup=1, active=1)
+    with profiler:
+        trace = profiler.torch_profiler
+        assert trace.current_action == expected(3)
+        trace.step()
+        assert trace.current_action == expected(4)
 
 
 def test_profiling_is_off_by_default_and_builds_nothing(tmp_path) -> None:
@@ -604,7 +646,9 @@ def test_memory_history_stops_after_snapshot_and_preserves_training_error(
             raise RuntimeError("history shutdown failed")
 
     monkeypatch.setattr(profiler_module, "stop_memory_history", stop_history)
-    memory = MemoryProfiler(0, 10, "", "", 0, 100)
+    memory = MemoryProfiler(
+        step_num=0, freq=10, snapshot_dir="", leaf_folder="", rank=0, max_entries=100
+    )
     monkeypatch.setattr(memory, "step", lambda **_: calls.append("snapshot"))
     profiler = Profiler(Config())
     profiler.memory_profiler = memory

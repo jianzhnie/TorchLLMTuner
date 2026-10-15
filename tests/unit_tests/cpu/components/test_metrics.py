@@ -95,6 +95,12 @@ def _processor(num_flops_per_token: int = 1000, **config_overrides) -> MetricsPr
     )
 
 
+@pytest.mark.parametrize("value", [-1, True, 1.5])
+def test_processor_rejects_invalid_flops(value: object) -> None:
+    with pytest.raises(ValueError, match="num_flops_per_token"):
+        _processor(num_flops_per_token=value)  # type: ignore[arg-type]
+
+
 def _derive(processor: MetricsProcessor, step: int = 1):
     """``_derive`` with the anchor that ``log`` would have established.
 

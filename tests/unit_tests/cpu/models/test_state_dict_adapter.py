@@ -1,5 +1,6 @@
 """HF state conversion preserves tied weights and caller-owned mappings."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -72,3 +73,99 @@ def test_hf_index_still_rejects_missing_keys_without_distributed():
     adapter._hf_keys = {"model.layers.0.weight", "model.layers.1.weight"}
     with pytest.raises(ValueError, match="missing=.*model.layers.1.weight"):
         adapter.to_hf({"model.model.layers.0.weight": torch.zeros(2, 2)})
+
+
+@pytest.mark.parametrize("stores_head", [False, True])
+def test_single_file_checkpoint_loads_tied_head(tmp_path, stores_head):
+    import torch.distributed.checkpoint as dcp
+    from safetensors.torch import save_file
+
+    weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    saved = {"model.embed_tokens.weight": weight}
+    if stores_head:
+        saved["lm_head.weight"] = weight.clone()
+    save_file(saved, str(tmp_path / "model.safetensors"))
+    adapter = HFTransformerStateDictAdapter(
+        SimpleNamespace(tie_word_embeddings=True), str(tmp_path)
+    )
+    local_weight = torch.zeros_like(weight)
+    target = {
+        "model.model.embed_tokens.weight": local_weight,
+        "model.lm_head.weight": local_weight,
+    }
+
+    hf_state = adapter.to_hf(target)
+    assert set(hf_state) == set(saved)
+    dcp.load(hf_state, storage_reader=adapter.get_hf_storage_reader(str(tmp_path)))
+    restored = adapter.from_hf(hf_state)
+    torch.testing.assert_close(restored["model.lm_head.weight"], weight)
+    torch.testing.assert_close(restored["model.model.embed_tokens.weight"], weight)
+
+
+def test_hf_key_mapping_rejects_collisions():
+    adapter = HFTransformerStateDictAdapter(SimpleNamespace(), None)
+    with pytest.raises(ValueError, match="key mapping collision"):
+        adapter.to_hf({"model.weight": torch.ones(1), "weight": torch.zeros(1)})
+
+
+@pytest.mark.parametrize(
+    "filenames",
+    [
+        ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"),
+        ("decoder.safetensors", "embedding.safetensors"),
+        ("v2-model-00001.safetensors", "v2-model-00002.safetensors"),
+        ("model-00003.safetensors", "model-00009.safetensors"),
+    ],
+)
+def test_index_shard_grouping_survives_export_round_trip(tmp_path, filenames):
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint import HuggingFaceStorageWriter
+
+    source_path = tmp_path / "source"
+    source_path.mkdir()
+    weight_map = {"a": filenames[0], "b": filenames[1], "c": filenames[0]}
+    (source_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
+    adapter = HFTransformerStateDictAdapter(SimpleNamespace(), str(source_path))
+    mapping = adapter.fqn_to_index_mapping
+    assert set(mapping) == set(weight_map)
+    assert set(mapping.values()) == {1, 2}
+    assert mapping["a"] == mapping["c"] != mapping["b"]
+
+    source = {
+        f"model.{key}": torch.tensor([float(i)]) for i, key in enumerate(weight_map)
+    }
+    output_path = str(tmp_path / "export")
+    dcp.save(
+        adapter.to_hf(source),
+        storage_writer=HuggingFaceStorageWriter(
+            output_path, fqn_to_index_mapping=mapping
+        ),
+    )
+    restored = {
+        key: torch.zeros_like(value) for key, value in adapter.to_hf(source).items()
+    }
+    dcp.load(restored, storage_reader=adapter.get_hf_storage_reader(output_path))
+    for key, value in adapter.from_hf(restored).items():
+        torch.testing.assert_close(value, source[key])
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        [],
+        {},
+        {"weight_map": {}},
+        {"weight_map": []},
+        {"weight_map": {"a": None}},
+        {"weight_map": {"a": ""}},
+        {"weight_map": {"": "model.safetensors"}},
+    ],
+)
+def test_invalid_index_is_rejected_during_adapter_construction(tmp_path, index):
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(index), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="weight_map"):
+        HFTransformerStateDictAdapter(SimpleNamespace(), str(tmp_path))

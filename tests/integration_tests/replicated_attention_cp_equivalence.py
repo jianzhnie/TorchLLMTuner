@@ -57,14 +57,14 @@ def main():
         context_parallel_load_balancer=None,
     )
     dims = ParallelTopology.from_config(cfg, 4)
-    dims.build_mesh()
+    dims.build_device_mesh()
     model, reference = build_model(), build_model()
     apply_tp(model, dims.spmd_dense_mesh(), cfg)
     model.model.config._attn_implementation = "flex_torchtitan"
     apply_cp(model, dims.spmd_dense_mesh(), cfg, parallel_dims=dims)
     ids = torch.randint(128, (256,), generator=torch.Generator().manual_seed(7))
     inputs, _, extra = model.preprocess_inputs(
-        {"input": ids, "labels": ids}, parallel_dims=dims, parallelism=cfg
+        {"input": ids, "labels": ids}, parallel_dims=dims
     )
     assert inputs.numel() == 64
     with torch.no_grad():

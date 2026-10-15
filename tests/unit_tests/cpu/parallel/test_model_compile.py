@@ -183,6 +183,35 @@ def test_async_tp_without_tp_mesh_raises() -> None:
 
 
 @requires_runtime
+def test_per_block_compile_rejects_missing_layers_before_global_changes(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid per-block model must fail before global setup")
+
+    monkeypatch.setattr(compile_mod, "maybe_enable_async_tp", unexpected)
+    with pytest.raises(TypeError, match=".layers module"):
+        apply_compile(
+            torch.nn.Linear(2, 2), compile_config=CompileConfig(per_block=True)
+        )
+
+
+@requires_runtime
+@pytest.mark.parametrize("ndim,size", [(1, 1), (2, 4)])
+def test_async_tp_rejects_invalid_mesh_before_registration(monkeypatch, ndim, size):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(compile_mod, "has", lambda capability: True)
+
+    def unexpected():
+        pytest.fail("invalid mesh must fail before process-group registration")
+
+    mesh = SimpleNamespace(ndim=ndim, size=lambda: size, get_group=unexpected)
+    with pytest.raises(ValueError, match="one-dimensional TP mesh with size > 1"):
+        compile_mod.maybe_enable_async_tp(
+            CompileConfig(enable_async_tensor_parallel=True), mesh
+        )
+
+
+@requires_runtime
 @pytest.mark.skipif(
     has("inductor_micro_pipeline_tp"),
     reason="this torch carries _micro_pipeline_tp; the loud-raise is unreachable",
@@ -236,16 +265,16 @@ def test_capture_scalar_outputs_set_only_for_token_choice_moe(monkeypatch) -> No
 
     A real swapped MoE cannot be built in this environment (the installed
     transformers' Qwen3Moe layout predates the swap's probe), so the
-    detection seam itself is stubbed; ``iter_moe_layers`` is pinned by the
+    detection seam itself is stubbed; ``collect_moe_layers`` is pinned by the
     EP tests.
     """
     with _preserve_dynamo_flag("capture_scalar_outputs"):
         torch._dynamo.config.capture_scalar_outputs = False
-        monkeypatch.setattr(compile_mod, "iter_moe_layers", lambda m: [object()])
+        monkeypatch.setattr(compile_mod, "collect_moe_layers", lambda m: [object()])
         apply_compile(_model(), compile_config=CompileConfig())
         assert torch._dynamo.config.capture_scalar_outputs is True
 
-    monkeypatch.undo()  # restore the real iter_moe_layers for the dense case
+    monkeypatch.undo()  # restore the real collect_moe_layers for the dense case
 
     with _preserve_dynamo_flag("capture_scalar_outputs"):
         torch._dynamo.config.capture_scalar_outputs = False

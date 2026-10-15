@@ -4,6 +4,7 @@
         tests/integration_tests/ep_domino_equivalence.py
 
 Odd, unequal rank token counts and zero receives exercise split bookkeeping.
+Routing scores and expert IDs use noncontiguous storage on both ranks.
 """
 
 from itertools import product
@@ -88,8 +89,11 @@ def main():
             (expected * weights).sum().backward()
             token_slice = slice(0, 5) if rank == 0 else slice(5, 12)
             local_inputs = inputs[token_slice].clone().requires_grad_()
-            local_scores = scores[token_slice].clone().requires_grad_()
-            local_ids = expert_ids[token_slice]
+            local_scores = (
+                scores[token_slice].T.contiguous().T.detach().requires_grad_()
+            )
+            local_ids = expert_ids[token_slice].T.contiguous().T
+            assert not local_scores.is_contiguous() and not local_ids.is_contiguous()
             actual = distributed_experts(
                 local_inputs,
                 local_scores,

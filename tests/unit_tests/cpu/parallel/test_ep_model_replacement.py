@@ -442,6 +442,29 @@ def test_deepseek_v3_shared_experts_survive_the_swap() -> None:
     assert model.layers[1].mlp.shared_experts is not None
 
 
+def test_swap_preserves_shared_expert_buffer_dtype() -> None:
+    model = _deepseek_model()
+    shared = model.layers[1].mlp.shared_experts
+    shared.register_buffer("calibration", torch.tensor([1.25], dtype=torch.float64))
+
+    swap_hf_moe_blocks(model)
+
+    assert model.layers[1].mlp.shared_experts is shared
+    assert shared.calibration.dtype == torch.float64
+    assert shared.calibration.item() == 1.25
+    assert model.layers[1].mlp.tokens_per_expert_E.dtype == torch.float32
+
+
+def test_swap_preserves_falsey_shared_expert() -> None:
+    model = _deepseek_model()
+    shared = torch.nn.Sequential()
+    model.layers[1].mlp.shared_expert = shared
+
+    swap_hf_moe_blocks(model)
+
+    assert model.layers[1].mlp.shared_experts is shared
+
+
 def test_deepseek_v3_gets_the_load_balancing_bias() -> None:
     """The probed ``e_score_correction_bias`` turns the bias path on -- and only there.
 
@@ -505,9 +528,11 @@ def test_the_swap_refuses_to_guess_a_shared_expert_gate() -> None:
     """
     model = _deepseek_model()
     model.layers[1].mlp.shared_expert_gate = torch.nn.Linear(64, 1)
+    counts_before = dict(AuxLoss._group_counts)
 
     with pytest.raises(NotImplementedError, match="shared_expert_gate"):
-        swap_hf_moe_blocks(model)
+        swap_hf_moe_blocks(model, router_aux_loss_coef=1e-3)
+    assert dict(AuxLoss._group_counts) == counts_before
 
 
 # -- the other families: where the block lives, and what the experts are called -
@@ -763,6 +788,23 @@ def test_a_block_with_the_wrong_expert_layout_is_rejected() -> None:
         swap_hf_moe_blocks(model)
 
 
+def test_late_invalid_expert_layout_does_not_replace_earlier_layers() -> None:
+    model = _model(_config(norm_topk_prob=True))
+    blocks_before = [layer.mlp for layer in model.layers]
+    counts_before = dict(AuxLoss._group_counts)
+    model.layers[1].mlp.experts.gate_up_proj = torch.nn.Parameter(torch.zeros(8, 7, 64))
+
+    with pytest.raises(ValueError, match="unrecognized expert weight shapes"):
+        swap_hf_moe_blocks(model)
+
+    assert all(
+        layer.mlp is block
+        for layer, block in zip(model.layers, blocks_before, strict=True)
+    )
+    assert all(not getattr(layer, "moe_enabled", False) for layer in model.layers)
+    assert dict(AuxLoss._group_counts) == counts_before
+
+
 def test_the_swap_keeps_the_token_count_buffer_in_fp32() -> None:
     """The swapped MoE's state buffers must survive ``.to(dtype=...)`` unscathed.
 
@@ -850,3 +892,46 @@ def test_ep_conversion_preserves_parameter_freezing():
         assert not experts.w1_EFD.requires_grad
         assert not experts.w3_EFD.requires_grad
         assert experts.w2_EDF.requires_grad
+
+
+def test_later_router_conversion_error_preserves_original_block_slots():
+    model = _model(_config(norm_topk_prob=True))
+    original_blocks = [layer.mlp for layer in model.layers]
+    counts_before = dict(AuxLoss._group_counts)
+    model.layers[1].mlp.gate.bias = torch.nn.Parameter(torch.zeros(8))
+
+    with pytest.raises(UnsupportedCombinationError, match="bias"):
+        swap_hf_moe_blocks(model)
+
+    assert dict(AuxLoss._group_counts) == counts_before
+    for layer, original in zip(model.layers, original_blocks, strict=True):
+        assert layer.mlp is original
+        assert not getattr(layer, "moe_enabled", False)
+        assert "moe" not in layer.__dict__
+
+
+@pytest.mark.parametrize("later_failure", [False, True])
+def test_conversion_preserves_shared_expert_dtype_and_child_modes(later_failure):
+    model = _model(_config(norm_topk_prob=True))
+    shared = torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.Dropout())
+    shared.train()
+    shared[0].eval()
+    shared.register_buffer("calibration", torch.tensor([1.25]))
+    model.layers[0].mlp.shared_expert = shared
+    original_weight = shared[0].weight
+    original_blocks = [layer.mlp for layer in model.layers]
+    if later_failure:
+        model.layers[1].mlp.gate.bias = torch.nn.Parameter(torch.zeros(8))
+        with pytest.raises(UnsupportedCombinationError, match="bias"):
+            swap_hf_moe_blocks(model)
+        assert model.layers[0].mlp is original_blocks[0]
+    else:
+        assert swap_hf_moe_blocks(model) == 2
+        assert model.layers[0].mlp.shared_experts is shared
+
+    assert shared[0].weight is original_weight
+    assert shared[0].weight.dtype == torch.float32
+    assert shared.calibration.dtype == torch.float32
+    assert shared.training
+    assert not shared[0].training
+    assert shared[1].training

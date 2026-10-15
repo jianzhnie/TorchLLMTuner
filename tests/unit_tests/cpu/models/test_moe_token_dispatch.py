@@ -29,6 +29,50 @@ from llmtuner.parallel.expert_parallel.token_dispatch import (
     TorchAOTokenDispatcher,
 )
 
+
+@pytest.mark.parametrize(
+    "dispatcher_cls", [LocalTokenDispatcher, AllToAllTokenDispatcher]
+)
+@pytest.mark.parametrize(
+    "scores_shape,ids_shape", [((2, 1), (2, 1)), ((3, 2), (2, 2)), ((2, 3), (2, 2))]
+)
+def test_dispatch_rejects_mismatched_routing_shapes(
+    dispatcher_cls, scores_shape, ids_shape
+):
+    dispatcher = dispatcher_cls(num_experts=4, top_k=2)
+    with pytest.raises(ValueError, match="token count and top_k"):
+        dispatcher.dispatch(
+            torch.ones(2, 3),
+            torch.ones(scores_shape),
+            torch.zeros(ids_shape, dtype=torch.long),
+            torch.tensor([4, 0, 0, 0]),
+        )
+
+
+def test_local_dispatch_preserves_noncontiguous_routing_values_and_gradients():
+    dispatcher = LocalTokenDispatcher(num_experts=4, top_k=2)
+    ids = torch.tensor([[0, 1, 2], [2, 3, 0]])[:, :2].T
+    scores = torch.tensor([[0.2, 0.7, 0.1], [0.8, 0.3, 0.9]])[:, :2].T
+    assert not ids.is_contiguous() and not scores.is_contiguous()
+    counts = torch.bincount(ids.reshape(-1), minlength=4)
+    outputs, gradients = [], []
+    for routing_ids, routing_scores in (
+        (ids, scores),
+        (ids.contiguous(), scores.contiguous()),
+    ):
+        inputs = torch.arange(6.0).reshape(2, 3).requires_grad_()
+        routing_scores = routing_scores.detach().requires_grad_()
+        routed, _, metadata = dispatcher.dispatch(
+            inputs, routing_scores, routing_ids, counts
+        )
+        output = dispatcher.combine(routed.square(), metadata, inputs)
+        outputs.append(output)
+        gradients.append(torch.autograd.grad(output.sum(), (inputs, routing_scores)))
+    torch.testing.assert_close(outputs[0], outputs[1])
+    for actual, expected in zip(gradients[0], gradients[1], strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
 # --------------------------------------------------------------------------
 # config gating
 # --------------------------------------------------------------------------
@@ -216,5 +260,17 @@ def test_swap_refuses_registered_gap_backends():
 
 def test_swap_refuses_unknown_backend():
     model = types.SimpleNamespace(layers=[])
-    with pytest.raises(ValueError, match="unknown ep_token_dispatcher"):
+    with pytest.raises(ValueError, match="ep_token_dispatcher must be one of"):
         swap_hf_moe_blocks(model, token_dispatcher="fastep")
+
+
+@pytest.mark.parametrize("backend", ["fastep", "deepep", "hybridep", "mc2"])
+def test_direct_swap_and_config_report_the_same_backend_error(backend):
+    with pytest.raises((ValueError, NotImplementedError)) as config_error:
+        ParallelConfig(expert_parallel_size=2, ep_token_dispatcher=backend)
+    with pytest.raises(type(config_error.value)) as swap_error:
+        swap_hf_moe_blocks(types.SimpleNamespace(layers=[]), token_dispatcher=backend)
+    assert str(swap_error.value) == str(config_error.value)
+    if backend == "mc2":
+        assert "Ascend" in str(swap_error.value)
+        assert "CUDA" not in str(swap_error.value)

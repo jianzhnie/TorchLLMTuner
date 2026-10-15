@@ -35,7 +35,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
-from llmtuner.datasets.synthetic import RandomTokenSource, batch_iterator
+from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
@@ -98,7 +98,7 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> list[float]:
         foreach=cfg.optimizer.implementation == "foreach",
     )
     rows_per_mb = cfg.global_batch_size // MICROBATCHES
-    batches = batch_iterator(
+    batches = iter(
         RandomTokenSource(
             seed=cfg.seed,
             vocab_size=cfg.vocab_size,

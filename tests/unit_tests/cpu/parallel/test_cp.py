@@ -151,6 +151,43 @@ def test_kcp_reports_missing_model_before_optional_runtime(monkeypatch):
     assert model.forward == original_forward
 
 
+def test_kcp_reapplication_replaces_wrapper_and_updates_group(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.context_parallel.kcp import apply_kcp
+
+    class KDA(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for name in ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias"):
+                setattr(self, name, None)
+
+        def forward(self, x):
+            return x
+
+    calls = []
+
+    def wrap(original, group):
+        calls.append((original, group))
+
+        def forward(self, x):
+            return group
+
+        return forward
+
+    monkeypatch.setattr(
+        "llmtuner.parallel.context_parallel.kcp._kcp_runtime", lambda: ()
+    )
+    monkeypatch.setattr("llmtuner.parallel.context_parallel.kcp.kcp_kda_forward", wrap)
+    module = KDA()
+    first_group, second_group = object(), object()
+    assert apply_kcp(module, SimpleNamespace(get_group=lambda: first_group)) == 1
+    assert module(None) is first_group
+    assert apply_kcp(module, SimpleNamespace(get_group=lambda: second_group)) == 1
+    assert module(None) is second_group
+    assert calls == [(KDA.forward, first_group), (KDA.forward, second_group)]
+
+
 def test_kcp_rejects_unit_convolution_before_loading_optional_runtime(monkeypatch):
     from types import SimpleNamespace
 

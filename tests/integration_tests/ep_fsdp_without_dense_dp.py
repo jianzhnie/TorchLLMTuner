@@ -42,7 +42,7 @@ def main() -> None:
         training=TrainingConfig(max_seq_len=32, steps=1),
     )
     dims = ParallelTopology.from_config(cfg.parallel, 4)
-    dims.build_mesh()
+    dims.build_device_mesh()
     torch.manual_seed(0)
     model = HFTransformerModel(build_model_config_for(cfg)).to(torch.float32)
     model = parallelize_hf_transformers(

@@ -28,7 +28,7 @@ from llmtuner.models.common.activation import SwiGLU
 from llmtuner.models.common.attention.qkv import QKVLinear
 from llmtuner.models.common.tp_projections import (
     AllGatherFusedQKVLinear,
-    RowParallelLinear,
+    ReduceScatterLinear,
     TensorParallelFeedForward,
     validate_tp_projection_preconditions,
 )
@@ -55,6 +55,31 @@ def _ffn(seed: int = 0) -> TensorParallelFeedForward:
 
 
 # -- preconditions -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["in_features", "out_features"])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "2", None])
+def test_invalid_projection_dimensions_fail_before_allocation(
+    monkeypatch, field, value
+):
+    def unexpected(*args, **kwargs):
+        pytest.fail("Invalid dimensions reached parameter allocation")
+
+    monkeypatch.setattr(torch, "empty", unexpected)
+    dimensions = dict(in_features=4, out_features=8)
+    dimensions[field] = value
+    with pytest.raises(ValueError, match=field):
+        ReduceScatterLinear(**dimensions)
+
+
+@pytest.mark.parametrize("bias", [0, 1, "false", None])
+def test_invalid_projection_bias_fails_before_allocation(monkeypatch, bias):
+    def unexpected(*args, **kwargs):
+        pytest.fail("Invalid bias reached parameter allocation")
+
+    monkeypatch.setattr(torch, "empty", unexpected)
+    with pytest.raises(TypeError, match="bias must be bool"):
+        ReduceScatterLinear(4, 8, bias=bias)
 
 
 def test_preconditions_require_sequence_parallelism() -> None:
@@ -173,12 +198,12 @@ def test_feed_forward_warns_only_once(caplog) -> None:
     assert sum("tensor parallelism" in r.message for r in caplog.records) == 1
 
 
-# -- RowParallelLinear -------------------------------------------------------
+# -- ReduceScatterLinear -------------------------------------------------------
 
 
-def test_row_parallel_linear_falls_back_to_a_plain_linear() -> None:
+def test_reduce_scatter_linear_falls_back_to_a_plain_linear() -> None:
     torch.manual_seed(2)
-    row = RowParallelLinear(DIM, DIM, bias=True)
+    row = ReduceScatterLinear(DIM, DIM, bias=True)
     with torch.no_grad():
         row.weight.normal_()
         row.bias.normal_()
@@ -191,30 +216,30 @@ def test_row_parallel_linear_falls_back_to_a_plain_linear() -> None:
     assert torch.equal(out, expected)
 
 
-def test_row_parallel_linear_without_bias() -> None:
+def test_reduce_scatter_linear_without_bias() -> None:
     torch.manual_seed(2)
-    row = RowParallelLinear(DIM, DIM, bias=False)
+    row = ReduceScatterLinear(DIM, DIM, bias=False)
     assert row.bias is None
     with torch.no_grad():
         out = row(_x(rows=4))
     assert out.shape == (4, DIM)
 
 
-def test_row_parallel_linear_holds_its_weight_as_a_parameter() -> None:
+def test_reduce_scatter_linear_holds_its_weight_as_a_parameter() -> None:
     """The fused backward computes wgrad itself, so these must be Parameters."""
-    row = RowParallelLinear(DIM, 2 * DIM, bias=True)
+    row = ReduceScatterLinear(DIM, 2 * DIM, bias=True)
     assert row.weight.shape == (2 * DIM, DIM)
     assert row.weight.requires_grad
     assert row.bias.requires_grad
 
 
-def test_row_parallel_linear_initializes_its_parameters() -> None:
+def test_reduce_scatter_linear_initializes_its_parameters() -> None:
     """``torch.empty`` leaves memory uninitialized; the constructor must init.
 
     Pinned by the same statistics ``nn.Linear``'s kaiming-uniform init has:
     finite, nonzero variance, and bounded by ``1/sqrt(fan_in)``.
     """
-    row = RowParallelLinear(DIM, 2 * DIM, bias=True)
+    row = ReduceScatterLinear(DIM, 2 * DIM, bias=True)
     bound = 1 / DIM**0.5
     assert torch.isfinite(row.weight).all()
     assert torch.isfinite(row.bias).all()
@@ -223,18 +248,30 @@ def test_row_parallel_linear_initializes_its_parameters() -> None:
     assert row.bias.abs().max() <= bound
 
 
-def test_row_parallel_linear_init_is_seeded() -> None:
+def test_reduce_scatter_linear_init_is_seeded() -> None:
     """Same seed, same weights -- an uninitialized buffer would not be."""
     torch.manual_seed(11)
-    a = RowParallelLinear(DIM, DIM, bias=True)
+    a = ReduceScatterLinear(DIM, DIM, bias=True)
     torch.manual_seed(11)
-    b = RowParallelLinear(DIM, DIM, bias=True)
+    b = ReduceScatterLinear(DIM, DIM, bias=True)
     assert torch.equal(a.weight, b.weight)
     assert torch.equal(a.bias, b.bias)
 
 
-def test_row_parallel_linear_reset_parameters_reinitializes() -> None:
-    row = RowParallelLinear(DIM, DIM, bias=True)
+@pytest.mark.parametrize("bias", [False, True])
+def test_reduce_scatter_linear_initialization_matches_torch_linear(bias):
+    torch.manual_seed(17)
+    actual = ReduceScatterLinear(DIM, 2 * DIM, bias=bias)
+    torch.manual_seed(17)
+    expected = torch.nn.Linear(DIM, 2 * DIM, bias=bias)
+    assert torch.equal(actual.weight, expected.weight)
+    assert actual.state_dict().keys() == expected.state_dict().keys()
+    if bias:
+        assert torch.equal(actual.bias, expected.bias)
+
+
+def test_reduce_scatter_linear_reset_parameters_reinitializes() -> None:
+    row = ReduceScatterLinear(DIM, DIM, bias=True)
     with torch.no_grad():
         row.weight.fill_(0.0)
     row.reset_parameters()

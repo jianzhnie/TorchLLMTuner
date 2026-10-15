@@ -74,6 +74,18 @@ def check_max_reduces_across_the_group() -> str | None:
     return None
 
 
+def check_mean_preserves_fraction_and_dtype() -> str | None:
+    for dtype in (torch.float32, torch.float64):
+        out = torch.tensor([_BASE + dist.get_rank()], dtype=dtype)
+        storage = out.data_ptr()
+        all_reduce(out, op="mean", group=_mesh.get_group())
+        if out.dtype != dtype or out.data_ptr() != storage:
+            return f"rank {dist.get_rank()}: mean changed dtype or tensor storage"
+        if not torch.equal(out, torch.tensor([2.5], dtype=dtype)):
+            return f"rank {dist.get_rank()}: mean is {out.tolist()}, expected [2.5]"
+    return None
+
+
 def check_the_local_average_pattern() -> str | None:
     """The shape of the historical misuse, reduced to arithmetic.
 
@@ -100,6 +112,7 @@ CHECKS = [
     check_the_argument_survives_the_reduction,
     check_sum_reduces_across_the_group,
     check_max_reduces_across_the_group,
+    check_mean_preserves_fraction_and_dtype,
     check_the_local_average_pattern,
 ]
 

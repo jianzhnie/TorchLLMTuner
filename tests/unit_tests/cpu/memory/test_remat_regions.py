@@ -35,7 +35,7 @@ from llmtuner.memory.remat_regions import (
     region_names,
     region_policy,
     should_recompute,
-    unmatched_save_patterns,
+    unmatched_region_patterns,
 )
 
 
@@ -136,10 +136,10 @@ def test_the_policy_is_the_rule_applied_per_region() -> None:
 
 def test_unmatched_patterns_are_reported() -> None:
     """A typo would otherwise be indistinguishable from a missing region."""
-    assert unmatched_save_patterns(_REGIONS, ["mlp.nope", "self_attn.*"]) == (
+    assert unmatched_region_patterns(_REGIONS, ["mlp.nope", "self_attn.*"]) == (
         "mlp.nope",
     )
-    assert unmatched_save_patterns(_REGIONS, ["self_attn.*"]) == ()
+    assert unmatched_region_patterns(_REGIONS, ["self_attn.*"]) == ()
 
 
 # -- the recompute rule --------------------------------------------------------

@@ -37,6 +37,26 @@ VOCAB = 8
 SEQ_LEN = 4
 
 
+@pytest.mark.parametrize("loss", [float("nan"), float("inf"), -float("inf")])
+def test_validation_rejects_nonfinite_loss_before_logging(loss):
+    from llmtuner.trainer.runtime.validation import finalize_validation
+
+    logged = []
+    trainer = SimpleNamespace(
+        metrics=SimpleNamespace(log_validation=lambda **kwargs: logged.append(kwargs))
+    )
+    with pytest.raises(FloatingPointError, match="not finite at step 7"):
+        finalize_validation(
+            trainer,
+            num_steps=1,
+            accumulated_loss=torch.tensor(loss),
+            total_global_valid_tokens=torch.tensor(2),
+            loss_mesh=None,
+            step=7,
+        )
+    assert logged == []
+
+
 class _ListLoader:
     """The smallest object with the dataloader surface the pass uses."""
 
@@ -152,7 +172,7 @@ def test_validation_defaults_to_off() -> None:
 
 def test_feasibility_accepts_pipeline_parallelism() -> None:
     """PP x validation composes since 2026-10-02: the schedule's eval driver
-    (upstream Validator's seam) drives the pass; see run_pipeline_validation_loop."""
+    (upstream Validator's seam) drives the pass; see evaluate_pipeline_batch."""
     Trainer = _trainer_cls()
     Trainer.check_validation_feasibility(
         ValidationConfig(),
@@ -371,6 +391,8 @@ def test_validate_raises_on_zero_valid_tokens(
 
 @pytest.mark.parametrize("fail", [False, True])
 def test_validate_restores_mixed_module_modes(monkeypatch, fail) -> None:
+    from llmtuner.trainer.runtime import validation as validation_runtime
+
     model = _EchoModel()
     model.add_module("frozen", torch.nn.Dropout())
     model.train()
@@ -382,13 +404,14 @@ def test_validate_restores_mixed_module_modes(monkeypatch, fail) -> None:
         model=model,
     )
 
-    def validate_body(validation, step):
+    def run_validation_loop(active_trainer, validation, step):
+        assert active_trainer is trainer
         assert not model.training
         assert not model.frozen.training
         if fail:
             raise RuntimeError("validation failed")
 
-    trainer.validate_body = validate_body
+    monkeypatch.setattr(validation_runtime, "run_validation_loop", run_validation_loop)
     if fail:
         with pytest.raises(RuntimeError, match="validation failed"):
             trainer.validate(step=1)
@@ -396,6 +419,62 @@ def test_validate_restores_mixed_module_modes(monkeypatch, fail) -> None:
         trainer.validate(step=1)
     assert model.training
     assert not model.frozen.training
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize(
+    "dataset,expected", [("local_jsonl", "block_causal"), ("random", "causal")]
+)
+def test_validation_override_restores_training_attention_mask(
+    monkeypatch, fail, dataset, expected
+):
+    from llmtuner.trainer.runtime import validation as validation_runtime
+
+    trainer, _ = _make_trainer(
+        monkeypatch,
+        validation=ValidationConfig(steps=1, dataset=dataset),
+        loader=_ListLoader([]),
+    )
+    config = SimpleNamespace(attn_mask_type="causal")
+    trainer.model.model = SimpleNamespace(config=config)
+    kernel = torch.nn.Module()
+    kernel.packed = True
+    trainer.model._titan_flex_kernel = kernel
+
+    def run_loop(active_trainer, validation, step):
+        assert config.attn_mask_type == expected
+        assert kernel.packed == (expected == "block_causal")
+        if fail:
+            raise RuntimeError("validation failed")
+
+    monkeypatch.setattr(validation_runtime, "run_validation_loop", run_loop)
+    if fail:
+        with pytest.raises(RuntimeError, match="validation failed"):
+            trainer.validate(1)
+    else:
+        trainer.validate(1)
+    assert config.attn_mask_type == "causal"
+    assert kernel.packed is True
+
+
+def test_kcp_rejects_packed_validation_before_loop(monkeypatch):
+    from llmtuner.trainer.runtime import validation as validation_runtime
+
+    trainer, _ = _make_trainer(
+        monkeypatch,
+        validation=ValidationConfig(steps=1, dataset="local_jsonl"),
+        loader=_ListLoader([]),
+    )
+    trainer.cfg.parallel.context_parallel_kcp_size = 2
+    trainer.cfg.parallel.context_parallel_strategy = "kcp"
+
+    def unexpected(*args):
+        pytest.fail("KCP packed validation must fail before constructing a loader")
+
+    monkeypatch.setattr(validation_runtime, "run_validation_loop", unexpected)
+    with pytest.raises(ValueError, match="KCP.*packed"):
+        trainer.validate(1)
+    assert trainer.model.training
 
 
 @pytest.mark.parametrize("forward_fails", [False, True])
@@ -444,11 +523,8 @@ def test_pipeline_microbatch_split_rejects_incomplete_rows(rows, packed_dict):
         if packed_dict
         else Batch(input_ids=inputs, labels=labels)
     )
-    trainer = SimpleNamespace(
-        cfg=SimpleNamespace(parallel=SimpleNamespace(num_pp_microbatches=2))
-    )
     with pytest.raises(ValueError, match="Pipeline batch"):
-        split_pipeline_microbatches(trainer, batch)
+        split_pipeline_microbatches(batch, num_microbatches=2)
 
 
 @pytest.mark.parametrize("iteration_fails", [False, True])
@@ -472,17 +548,51 @@ def test_pipeline_validation_cleanup_preserves_iteration_error(
 
     monkeypatch.setattr(validation_module, "require", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        validation_module, "loss_reporting_meshes", lambda dims: (None, None)
+        validation_module, "resolve_loss_reduction_meshes", lambda dims: (None, None)
     )
     monkeypatch.setattr(
-        validation_module, "build_validation_dataloader", lambda *args: Loader()
+        validation_module, "create_validation_dataloader", lambda *args: Loader()
     )
-    trainer = SimpleNamespace(parallel_dims=None, device=torch.device("cpu"))
+    trainer = SimpleNamespace(
+        parallel_dims=SimpleNamespace(pp_enabled=True), device=torch.device("cpu")
+    )
     with pytest.raises(
         ValueError if iteration_fails else RuntimeError,
         match="iteration failed" if iteration_fails else "close failed",
     ) as caught:
-        validation_module.run_pipeline_validation_loop(trainer, ValidationConfig(), 1)
+        validation_module.run_validation_loop(trainer, ValidationConfig(), 1)
     if iteration_fails:
         assert caught.value is original
+    assert closed == [True]
+
+
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_validation_closes_loader_after_token_allocation_failure(monkeypatch, pipeline):
+    import llmtuner.trainer.runtime.validation as validation_module
+
+    original = RuntimeError("token allocation failed")
+    closed = []
+
+    class Loader:
+        def close(self):
+            closed.append(True)
+            raise ValueError("cleanup failed")
+
+    def fail_allocation(*args, **kwargs):
+        raise original
+
+    monkeypatch.setattr(validation_module, "require", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        validation_module, "resolve_loss_reduction_meshes", lambda dims: (None, None)
+    )
+    monkeypatch.setattr(
+        validation_module, "create_validation_dataloader", lambda *args: Loader()
+    )
+    monkeypatch.setattr(validation_module.torch, "zeros", fail_allocation)
+    trainer = SimpleNamespace(
+        parallel_dims=SimpleNamespace(pp_enabled=pipeline), device=torch.device("cpu")
+    )
+    with pytest.raises(RuntimeError, match="token allocation failed") as caught:
+        validation_module.run_validation_loop(trainer, ValidationConfig(), 1)
+    assert caught.value is original
     assert closed == [True]

@@ -76,7 +76,7 @@ def main() -> None:
 
     parallel = ParallelConfig(tensor_parallel_size=world)
     dims = ParallelTopology.from_config(parallel, world)
-    dims.build_mesh()
+    dims.build_device_mesh()
     tp_mesh = dims.get_mesh("tp")
 
     model = _model()

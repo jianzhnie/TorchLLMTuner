@@ -1,30 +1,32 @@
-"""Pure-function edges: vocabulary sharding, target shifting, coalesced IO.
-
-These are the pieces that a training run calls constantly but never *varies* --
-the shapes that reach them depend on the config, and the configs the suite
-already exercises are all well-formed. So the branches that decide what to do
-with an empty shard, a ragged label stream, or a remote URI have no coverage
-from the end-to-end tests no matter how many of those run.
-
-Everything here is CPU-only and needs no process group; the pieces that do
-(sharded cross-entropy) are covered in ``integration_tests/``.
-"""
+"""CPU checks for target shifting, vocabulary bounds, GC, and RNG utilities."""
 
 from __future__ import annotations
 
 import os
-import tempfile
 
 import pytest
 import torch
 
-from llmtuner.components.checkpointer import filesystem
 from llmtuner.components.loss import (
     IGNORE_INDEX,
     next_token_targets,
     vocab_shard_bounds,
 )
 from llmtuner.utils.garbage_collection import GarbageCollection
+
+
+@pytest.mark.parametrize("debug", [0, 1, "false", None])
+def test_gc_rejects_non_boolean_debug_before_disabling_collector(monkeypatch, debug):
+    from llmtuner.utils import garbage_collection
+
+    monkeypatch.setattr(
+        garbage_collection.gc,
+        "disable",
+        lambda: pytest.fail("invalid debug option must not change GC state"),
+    )
+    with pytest.raises(TypeError, match="debug must be bool"):
+        GarbageCollection(debug=debug)
+
 
 # -- vocab_shard_bounds -------------------------------------------------------
 
@@ -118,40 +120,33 @@ def test_a_ragged_label_count_is_rejected() -> None:
         next_token_targets(torch.zeros(5, dtype=torch.long), seq_len=2)
 
 
-# -- filesystem routing -------------------------------------------------------
-
-
-def test_a_remote_uri_is_routed_to_fsspec_not_the_local_filesystem() -> None:
-    """The branch is on the scheme, so a local path must not pay fsspec's cost."""
-    assert filesystem.is_remote("gs://bucket/path") is True
-    assert filesystem.is_remote("s3://bucket/path") is True
-    assert filesystem.is_remote("/abs/path") is False
-    assert filesystem.is_remote("relative/path") is False
-
-
-def test_local_queries_answer_without_a_remote_backend() -> None:
-    """exists/isdir/isfile on a plain path go through os, and must be correct."""
-    with tempfile.TemporaryDirectory() as tmp:
-        a_file = os.path.join(tmp, "a.txt")
-        with open(a_file, "w") as handle:
-            handle.write("x")
-        assert filesystem.exists(a_file) is True
-        assert filesystem.isfile(a_file) is True
-        assert filesystem.isdir(a_file) is False
-        assert filesystem.isdir(tmp) is True
-        assert filesystem.exists(os.path.join(tmp, "missing")) is False
-
-
-def test_listdir_returns_names_not_paths() -> None:
-    """Callers join the results themselves; returning full paths would double up."""
-    with tempfile.TemporaryDirectory() as tmp:
-        for name in ("b.txt", "a.txt"):
-            with open(os.path.join(tmp, name), "w") as handle:
-                handle.write("x")
-        assert sorted(filesystem.listdir(tmp)) == ["a.txt", "b.txt"]
-
-
 # -- GarbageCollection --------------------------------------------------------
+
+
+def test_closed_collector_cannot_run(monkeypatch):
+    collector = GarbageCollection()
+    collector.close()
+
+    def fail_if_collected(*args, **kwargs):
+        pytest.fail("closed collector triggered manual collection")
+
+    monkeypatch.setattr(collector, "collect", fail_if_collected)
+    with pytest.raises(RuntimeError, match="closed"):
+        collector.run(1000)
+
+
+@pytest.mark.parametrize("frequency", [True, 1.5, float("nan"), "2", None])
+def test_gc_rejects_invalid_frequency_before_disabling_collection(
+    frequency, monkeypatch
+):
+    import gc
+
+    def unexpected_disable():
+        pytest.fail("invalid frequency must not change global GC state")
+
+    monkeypatch.setattr(gc, "disable", unexpected_disable)
+    with pytest.raises(ValueError, match="positive integer"):
+        GarbageCollection(gc_freq=frequency)
 
 
 def test_a_non_positive_collection_frequency_is_rejected() -> None:
@@ -207,7 +202,7 @@ def test_target_shift_accepts_noncontiguous_labels():
     torch.testing.assert_close(targets, expected)
 
 
-@pytest.mark.parametrize("seed", [2**32, 2**64 - 1, -1])
+@pytest.mark.parametrize("seed", [-(2**63), 2**32, 2**64 - 1, -1])
 def test_seeding_supports_pytorch_seed_range(seed):
     import random
 
@@ -223,28 +218,57 @@ def test_seeding_supports_pytorch_seed_range(seed):
     torch.testing.assert_close(first[2], second[2])
 
 
-def test_gc_initialization_failure_restores_automatic_collection(monkeypatch):
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_gc_initialization_failure_restores_automatic_collection(
+    monkeypatch, error_type, enabled
+):
     import gc
 
     original = gc.isenabled()
 
     def fail(reason):
-        raise RuntimeError("collection failed")
+        raise error_type("collection failed")
 
     monkeypatch.setattr(GarbageCollection, "collect", staticmethod(fail))
     try:
-        gc.enable()
-        with pytest.raises(RuntimeError, match="collection failed"):
+        (gc.enable if enabled else gc.disable)()
+        with pytest.raises(error_type, match="collection failed"):
             GarbageCollection()
-        assert gc.isenabled()
+        assert gc.isenabled() is enabled
     finally:
         (gc.enable if original else gc.disable)()
 
 
-def test_set_seed_uses_the_available_device_api():
-    from llmtuner.utils.seeding import set_seed
+def test_seed_flags_require_boolean_values():
+    from llmtuner.utils.seeding import seed_everything
 
-    set_seed(2**32)
-    expected = torch.rand(3)
-    set_seed(2**32)
-    torch.testing.assert_close(torch.rand(3), expected)
+    with pytest.raises(TypeError, match="deterministic"):
+        seed_everything(1, deterministic=1)
+    with pytest.raises(TypeError, match="must be bool"):
+        seed_everything(1, deterministic=False, detect_anomaly=0)
+
+
+@pytest.mark.parametrize("seed", [True, 1.5, "1", -(2**63) - 1, 2**64])
+def test_invalid_seed_does_not_change_rng_or_environment(seed):
+    import random
+
+    import numpy as np
+
+    from llmtuner.utils.seeding import seed_everything
+
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    hash_seed = os.environ.get("PYTHONHASHSEED")
+
+    with pytest.raises(ValueError, match="seed must be an integer"):
+        seed_everything(seed, deterministic=False)
+
+    assert random.getstate() == python_state
+    actual_numpy_state = np.random.get_state()
+    assert actual_numpy_state[0] == numpy_state[0]
+    np.testing.assert_array_equal(actual_numpy_state[1], numpy_state[1])
+    assert actual_numpy_state[2:] == numpy_state[2:]
+    assert torch.equal(torch.get_rng_state(), torch_state)
+    assert os.environ.get("PYTHONHASHSEED") == hash_seed

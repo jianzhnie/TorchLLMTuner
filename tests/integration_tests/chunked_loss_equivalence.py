@@ -47,7 +47,7 @@ from llmtuner.config import (
     TrainingConfig,
 )
 from llmtuner.datasets.contracts import Batch
-from llmtuner.datasets.synthetic import RandomTokenSource, batch_iterator
+from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
@@ -110,7 +110,7 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> tuple[list[float], dict]:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
-    batches = batch_iterator(
+    batches = iter(
         RandomTokenSource(
             seed=cfg.seed,
             vocab_size=cfg.vocab_size,

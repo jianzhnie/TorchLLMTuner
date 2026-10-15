@@ -43,6 +43,7 @@ from llmtuner.datasets.multimodal.image import (
     smart_resize,
     vision_to_patches,
 )
+from llmtuner.datasets.multimodal.mrope import build_mrope_positions
 from llmtuner.datasets.multimodal.packing import (
     build_multimodal_packing,
     packing_output_to_multimodal_sample,
@@ -248,6 +249,39 @@ def test_load_video_without_a_backend_returns_none(tmp_path):
     assert load_video(str(tmp_path / "missing.mp4")) is None
 
 
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((32, 32, 3), torch.uint8),
+        ((0, 32, 32, 3), torch.uint8),
+        ((1, 0, 32, 3), torch.uint8),
+        ((1, 32, 32, 1), torch.uint8),
+        ((1, 32, 32, 3), torch.float32),
+    ],
+)
+def test_process_video_rejects_invalid_pixel_layout(shape, dtype):
+    with pytest.raises(ValueError, match="video must"):
+        process_video(
+            torch.zeros(shape, dtype=dtype),
+            patch_size=16,
+            merge_size=2,
+            min_pixels=1024,
+            max_pixels=4096,
+        )
+
+
+@pytest.mark.parametrize("geometry", [{"patch_size": -1}, {"merge_size": -1}])
+def test_process_video_rejects_negative_patch_geometry(geometry):
+    with pytest.raises(ValueError, match="must be positive"):
+        process_video(
+            torch.zeros(1, 32, 32, 3, dtype=torch.uint8),
+            **(
+                dict(patch_size=16, merge_size=2, min_pixels=1024, max_pixels=4096)
+                | geometry
+            ),
+        )
+
+
 # --------------------------------------------------------------------------
 # Placeholder insertion: the alignment contract
 # --------------------------------------------------------------------------
@@ -443,7 +477,7 @@ def test_multimodal_processor_runs_over_a_jsonl_corpus(
 
     config = SingleDataset(
         source=Base64JsonlSource(patterns=(path,)),
-        # A class, not a `partial` fixing a different context: `build_map_dataset`
+        # A class, not a `partial` fixing a different context: row transformation
         # calls `processor(context=...)`, and a partial's bound keyword would be
         # silently overridden by that call-site keyword.
         processor=_CtxSizedMMProcessor,
@@ -452,7 +486,7 @@ def test_multimodal_processor_runs_over_a_jsonl_corpus(
     dataset = build_dataset(
         config,
         context=make_context(mm_tokenizer, num_tokens_per_batch=1024),
-        dataset_iteration_policy=make_policy(shuffle=False),
+        iteration_policy=make_policy(shuffle=False),
     )
     row = next(iter(dataset))
     assert row is not None
@@ -516,6 +550,29 @@ def test_collator_pads_the_token_batch_with_pad_and_ignore(mm_tokenizer, token_i
     assert batch["input"][10:].tolist() == [token_ids["pad"]] * 118
     assert batch["labels"][10:].tolist() == [IGNORE_INDEX] * 118
     assert batch["num_valid_tokens"] == 10
+
+
+@pytest.mark.parametrize("field", ["input_ids", "labels", "positions", "padding_mask"])
+@pytest.mark.parametrize("shape", [(9,), (2, 5)])
+def test_collator_rejects_misaligned_text_fields(mm_tokenizer, token_ids, field, shape):
+    sample = _mm_sample(10, token_ids)
+    sample[field] = torch.zeros(
+        shape, dtype=torch.bool if field == "padding_mask" else torch.long
+    )
+    with pytest.raises(ValueError, match="must be a 1D tensor"):
+        _collator(mm_tokenizer)([sample])
+
+
+def test_collator_rejects_nonboolean_padding_mask(mm_tokenizer, token_ids):
+    sample = _mm_sample(10, token_ids)
+    sample["padding_mask"] = torch.zeros(10, dtype=torch.long)
+    with pytest.raises(ValueError, match="padding_mask must have bool dtype"):
+        _collator(mm_tokenizer)([sample])
+
+
+def test_collator_rejects_empty_batch(mm_tokenizer):
+    with pytest.raises(ValueError, match="at least one sample"):
+        _collator(mm_tokenizer)([])
 
 
 def test_collator_pads_positions_within_the_context_window(mm_tokenizer, token_ids):
@@ -610,17 +667,75 @@ def test_collator_enforces_the_per_batch_media_budget(mm_tokenizer, image_bytes)
         collator([sample, sample])
 
 
+@pytest.mark.parametrize("merge_size", [0, -1, True, 1.5, None])
+def test_mrope_rejects_invalid_merge_size(merge_size):
+    with pytest.raises(ValueError, match="spatial_merge_size"):
+        build_mrope_positions(
+            torch.tensor([1]),
+            None,
+            None,
+            None,
+            spatial_merge_size=merge_size,
+            patch_order="block",
+            image_token_id=2,
+            video_token_id=3,
+        )
+
+
+@pytest.mark.parametrize("media_kind", ["image", "video"])
+@pytest.mark.parametrize(
+    "grid",
+    [
+        torch.tensor([1, 2, 2]),
+        torch.tensor([[1, 2]]),
+        torch.tensor([[1.5, 2.0, 2.0]]),
+        torch.tensor([[True, True, True]]),
+        torch.tensor([[0, 2, 2]]),
+        torch.tensor([[-1, 2, 2]]),
+    ],
+)
+def test_mrope_rejects_invalid_grid_geometry(media_kind, grid):
+    with pytest.raises(ValueError, match="MRoPE grid_thw"):
+        build_mrope_positions(
+            torch.tensor([2 if media_kind == "image" else 3]),
+            grid if media_kind == "image" else None,
+            grid if media_kind == "video" else None,
+            None,
+            spatial_merge_size=2,
+            patch_order="block",
+            image_token_id=2,
+            video_token_id=3,
+        )
+
+
+def test_mrope_empty_tokens_return_empty_coordinates():
+    result = build_mrope_positions(
+        torch.empty(0, dtype=torch.long),
+        None,
+        None,
+        None,
+        spatial_merge_size=2,
+        patch_order="block",
+        image_token_id=2,
+        video_token_id=3,
+    )
+    assert result.shape == (0, 3)
+    assert result.dtype == torch.long
+
+
 def test_mrope_rejects_a_raster_patch_order(mm_tokenizer):
     """MRoPE coordinates index the block-ordered patch sequence, so a raster
     order would leave every coordinate pointing at the wrong patch."""
     collator = _collator(mm_tokenizer, patch_order="raster", build_mrope_positions=True)
     ids = _ids_of(mm_tokenizer)
     with pytest.raises(ValueError, match="MRoPE requires patch_order='block'"):
-        collator._build_mrope_positions(
+        build_mrope_positions(
             torch.zeros(4, dtype=torch.long),
             torch.tensor([[1, 2, 2]]),
             None,
             torch.zeros(4, dtype=torch.long),
+            spatial_merge_size=collator.spatial_merge_size,
+            patch_order=collator.patch_order,
             image_token_id=ids["image"],
             video_token_id=ids["video"],
         )
@@ -632,11 +747,13 @@ def test_mrope_rejects_media_grid_count_mismatches(mm_tokenizer):
     tokens = torch.tensor([ids["image"], VOCAB["lorem"]])
 
     with pytest.raises(ValueError, match="media/grid mismatch"):
-        collator._build_mrope_positions(
+        build_mrope_positions(
             tokens,
             None,
             None,
             torch.arange(2),
+            spatial_merge_size=collator.spatial_merge_size,
+            patch_order=collator.patch_order,
             image_token_id=ids["image"],
             video_token_id=ids["video"],
         )
@@ -650,11 +767,13 @@ def test_mrope_rejects_placeholder_lengths_that_disagree_with_the_grid(mm_tokeni
     tokens = torch.tensor([ids["image"]] * 3 + [VOCAB["lorem"]])
 
     with pytest.raises(ValueError, match="placeholder run has 3 token.*requires 4"):
-        collator._build_mrope_positions(
+        build_mrope_positions(
             tokens,
             torch.tensor([[1, 4, 4]]),
             None,
             torch.arange(4),
+            spatial_merge_size=collator.spatial_merge_size,
+            patch_order=collator.patch_order,
             image_token_id=ids["image"],
             video_token_id=ids["video"],
         )
@@ -667,16 +786,39 @@ def test_mrope_treats_adjacent_image_and_video_placeholders_as_two_runs(
     ids = _ids_of(mm_tokenizer)
     tokens = torch.tensor([ids["image"], ids["video"], VOCAB["lorem"]])
 
-    positions = collator._build_mrope_positions(
+    positions = build_mrope_positions(
         tokens,
         torch.tensor([[1, 2, 2]]),
         torch.tensor([[1, 2, 2]]),
         torch.arange(3),
+        spatial_merge_size=collator.spatial_merge_size,
+        patch_order=collator.patch_order,
         image_token_id=ids["image"],
         video_token_id=ids["video"],
     )
 
     assert positions.shape == (3, 3)
+
+
+@pytest.mark.parametrize("media_kind", ["image", "video"])
+def test_mrope_separates_identical_placeholders_across_documents(
+    mm_tokenizer, media_kind
+):
+    collator = _collator(mm_tokenizer, build_mrope_positions=True)
+    token_id = getattr(mm_tokenizer, f"{media_kind}_id")
+    grids = torch.tensor([[1, 2, 4], [1, 2, 4]])
+    mrope = build_mrope_positions(
+        torch.full((4,), token_id),
+        grids if media_kind == "image" else None,
+        grids if media_kind == "video" else None,
+        torch.tensor([0, 1, 0, 1]),
+        spatial_merge_size=collator.spatial_merge_size,
+        patch_order=collator.patch_order,
+        image_token_id=mm_tokenizer.image_id,
+        video_token_id=mm_tokenizer.video_id,
+    )
+    expected = torch.tensor([[0, 0, 0], [0, 0, 1]] * 2)
+    torch.testing.assert_close(mrope, expected)
 
 
 def test_mrope_positions_restart_at_each_document(mm_tokenizer):
@@ -686,11 +828,13 @@ def test_mrope_positions_restart_at_each_document(mm_tokenizer):
     ids = _ids_of(mm_tokenizer)
     tokens = torch.full((6,), VOCAB["lorem"], dtype=torch.long)
     tokens[3] = ids["image"]
-    mrope = collator._build_mrope_positions(
+    mrope = build_mrope_positions(
         tokens,
         torch.tensor([[1, 2, 2]]),
         None,
         torch.tensor([0, 1, 2, 0, 1, 2]),
+        spatial_merge_size=collator.spatial_merge_size,
+        patch_order=collator.patch_order,
         image_token_id=ids["image"],
         video_token_id=ids["video"],
     )
@@ -713,7 +857,7 @@ def test_mm_packing_rejects_a_non_positive_bin_count(mm_tokenizer):
             ),
             num_packing_bins=0,
             context=make_context(mm_tokenizer, num_tokens_per_batch=1024),
-            dataset_iteration_policy=make_policy(),
+            iteration_policy=make_policy(),
         )
 
 
@@ -733,10 +877,23 @@ def test_mm_packing_flattens_per_document_media_into_one_list(mm_tokenizer):
     assert packed["pixel_values"] == ["a", "b", "c"]
     assert packed["pixel_values_videos"] == ["v"]
     assert bool(packed["padding_mask"][4:].all())
+    assert bool((packed["labels"][4:] == IGNORE_INDEX).all())
+    assert bool((packed["labels"][:4] == 0).all())
+    assert bool((output["labels"] == 0).all())
     assert int(packed["positions"][4:].max()) < 32
 
 
-@pytest.mark.parametrize("parts,counts", [(["text"], [2]), ([None], [-1])])
+@pytest.mark.parametrize(
+    "parts,counts",
+    [
+        (["text"], [2]),
+        ([None], [-1]),
+        ([None], [True]),
+        ([None], [1.5]),
+        ([None], ["2"]),
+        ([None], [None]),
+    ],
+)
 def test_vision_placeholders_reject_invalid_counts(parts, counts):
     with pytest.raises(ValueError):
         insert_vision_placeholders(
@@ -778,6 +935,45 @@ def test_smart_resize_rejects_invalid_geometry(kwargs):
 def test_video_sampling_rejects_invalid_parameters(kwargs):
     with pytest.raises(ValueError):
         load_video("unused.mp4", **kwargs)
+
+
+@pytest.mark.parametrize("reported_frames", [0, 10])
+def test_video_sampling_matches_with_and_without_frame_metadata(
+    monkeypatch, reported_frames
+):
+    import sys
+    from types import SimpleNamespace
+
+    class Container:
+        streams = SimpleNamespace(
+            video=[
+                SimpleNamespace(average_rate=5, frames=reported_frames, duration=None)
+            ]
+        )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def seek(self, offset):
+            pass
+
+        def decode(self, **kwargs):
+            for index in range(10):
+                yield SimpleNamespace(
+                    to_ndarray=lambda format, index=index: np.full(
+                        (2, 2, 3), index, dtype=np.uint8
+                    )
+                )
+
+    monkeypatch.setitem(
+        sys.modules, "av", SimpleNamespace(open=lambda path: Container())
+    )
+    result = load_video("sample.mp4", fps=2, min_frames=1, max_frames=8)
+    assert result is not None
+    assert result[:, 0, 0, 0].tolist() == [0, 3, 6, 9]
 
 
 def test_remote_image_rejects_http_errors_before_decoding(monkeypatch):

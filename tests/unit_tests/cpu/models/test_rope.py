@@ -22,11 +22,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from llmtuner.config.rope_config import RoPEConfig
 from llmtuner.models.common.rope import (
     ComplexRoPE,
     CosSinRoPE,
     RoPE,
-    RoPEConfig,
     yarn_inv_freq,
 )
 
@@ -34,6 +34,53 @@ DIM = 64
 MAX_LEN = 128
 TOKENS = 16
 HEADS = 8
+
+
+@pytest.mark.parametrize(
+    "options,field",
+    [
+        ({"dim": 3}, "dim"),
+        ({"dim": True}, "dim"),
+        ({"max_context_length": 0}, "max_context_length"),
+        ({"scaling": "unknown"}, "scaling"),
+        ({"theta": 0}, "theta"),
+        ({"theta": float("nan")}, "theta"),
+        ({"theta": "10000"}, "theta"),
+        ({"scaling": "llama", "scaling_factor": 0}, "scaling_factor"),
+        ({"scaling": "llama", "low_freq_factor": 4}, "high_freq_factor"),
+        (
+            {"scaling": "llama", "original_max_position_embeddings": 0},
+            "original_max_position_embeddings",
+        ),
+        ({"scaling": "yarn", "rope_factor": 0.5}, "rope_factor"),
+        ({"scaling": "yarn", "rope_factor": "4"}, "rope_factor"),
+        ({"scaling": "yarn", "rope_factor": True}, "rope_factor"),
+        ({"scaling": "yarn", "rope_factor": 4, "theta": 1}, "theta"),
+        ({"scaling": "yarn", "beta_slow": 0}, "beta_slow"),
+        ({"scaling": "yarn", "rope_factor": 4, "beta_fast": 0.5}, "beta_fast"),
+        ({"scaling": "yarn", "original_seq_len": 0}, "original_seq_len"),
+        ({"scaling": "yarn", "truncate": "false"}, "truncate"),
+    ],
+)
+def test_rope_config_rejects_invalid_dimensions_and_scaling(options, field):
+    from llmtuner.errors import ConfigError
+
+    values = {"dim": DIM, "max_context_length": MAX_LEN, **options}
+    with pytest.raises(ConfigError, match=field):
+        RoPEConfig(**values)
+
+
+@pytest.mark.parametrize("rope_class", [ComplexRoPE, CosSinRoPE])
+def test_plain_rope_ignores_unused_scaling_fields(rope_class):
+    config = RoPEConfig(
+        dim=DIM,
+        max_context_length=MAX_LEN,
+        scaling_factor=0,
+        rope_factor=0,
+        beta_fast=0,
+    )
+    expected = rope_class(RoPEConfig(dim=DIM, max_context_length=MAX_LEN))
+    torch.testing.assert_close(rope_class(config).cache, expected.cache)
 
 
 def _qk(seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
@@ -245,8 +292,15 @@ def test_yarn_factor_of_one_is_a_no_op() -> None:
 
 def test_yarn_truncate_controls_fractional_cutoffs() -> None:
     """truncate=True floors/ceils the beta cutoffs; False keeps them fractional."""
-    truncated = yarn_inv_freq(DIM, 10000.0, 4.0, 32.0, 1.0, 64, True)
-    fractional = yarn_inv_freq(DIM, 10000.0, 4.0, 32.0, 1.0, 64, False)
+    options = dict(
+        base=10000.0,
+        rope_factor=4.0,
+        beta_fast=32.0,
+        beta_slow=1.0,
+        original_seq_len=64,
+    )
+    truncated = yarn_inv_freq(DIM, **options, truncate=True)
+    fractional = yarn_inv_freq(DIM, **options, truncate=False)
     assert not torch.equal(truncated, fractional)
 
 

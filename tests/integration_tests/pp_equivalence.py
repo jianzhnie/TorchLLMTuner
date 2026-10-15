@@ -2,9 +2,10 @@
 
 Run under torchrun with 2 ranks, one schedule per invocation:
 
-    torchrun --nproc_per_node=2 tests/pp_equivalence.py            # 1F1B
-    torchrun --nproc_per_node=2 tests/pp_equivalence.py Interleaved1F1B
-    torchrun --nproc_per_node=2 tests/pp_equivalence.py ZBVZeroBubble
+    torchrun --nproc_per_node=2 tests/integration_tests/pp_equivalence.py
+    torchrun --nproc_per_node=2 \\
+        tests/integration_tests/pp_equivalence.py Interleaved1F1B
+    torchrun --nproc_per_node=2 tests/integration_tests/pp_equivalence.py ZBVZeroBubble
 
 A tiny offline qwen3 (random init, fixed seed) goes through the real
 ``Trainer`` with ``pp=2``, 4 micro-batches per step, for 4 optimizer steps,
@@ -52,7 +53,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
-from llmtuner.datasets.synthetic import RandomTokenSource, batch_iterator
+from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
@@ -144,7 +145,7 @@ def _reference_trajectory(
     )
     rows_per_mb = cfg.global_batch_size // MICROBATCHES
 
-    batches = batch_iterator(
+    batches = iter(
         RandomTokenSource(
             seed=cfg.seed,
             vocab_size=cfg.vocab_size,

@@ -41,7 +41,7 @@ from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     ColwiseLinearNoGather,
     RowParallelLinear,
 )
-from llmtuner.parallel.topology import ParallelTopology, build_mesh
+from llmtuner.parallel.topology import ParallelTopology, build_device_mesh
 from llmtuner.trainer.trainer import Trainer
 
 SEQ = 16
@@ -90,7 +90,7 @@ def main() -> None:
     parallel_dims = ParallelTopology(
         dp_replicate=1, dp_shard=1, cp=1, tp=world, pp=1, ep=1, world_size=world
     )
-    mesh = build_mesh(parallel_dims)
+    mesh = build_device_mesh(parallel_dims)
     cfg = ParallelConfig(tensor_parallel_size=world)
 
     ref = _model()

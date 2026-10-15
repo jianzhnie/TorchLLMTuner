@@ -45,6 +45,7 @@ from llmtuner.memory.activation_checkpoint import (
 from llmtuner.models.common.aux_loss import (
     AuxLoss,
     collect_aux_loss_metrics,
+    register_aux_loss_zero_hook,
     zero_aux_losses,
 )
 from llmtuner.models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
@@ -557,3 +558,16 @@ def test_balance_loss_skips_reduction_without_a_registered_mesh() -> None:
 
     # Must not raise, must not attempt a collective on a nonexistent group.
     assert torch.equal(loss._reduce_token_partials(partial, ("cp", "tp")), partial)
+
+
+def test_aux_hook_preserves_registered_model_parts_after_caller_list_edit():
+    loss = MicrobatchWiseLoadBalanceLoss(coeff=1.0)
+    loss.instance_acc.fill_(3.0)
+    parts = [loss]
+    optimizer = torch.optim.SGD([nn.Parameter(torch.ones(1))], lr=0.1)
+    register_aux_loss_zero_hook(optimizer, model_parts=parts)
+    parts.clear()
+    optimizer.step()
+    key = (loss.reduce_mesh, loss.metric_name)
+    torch.testing.assert_close(AuxLoss.group_acc[key], torch.tensor(3.0))
+    assert loss.instance_acc.item() == 0

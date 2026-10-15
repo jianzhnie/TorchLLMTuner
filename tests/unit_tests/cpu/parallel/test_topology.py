@@ -1,7 +1,7 @@
 """``ParallelTopology`` and the config layer that resolves it: guards, not happy path.
 
 Two things live here. The first is the derivation chain a config walks before a
-process group exists -- ``ParallelConfig.derive_dp`` -> ``build_parallel_topology``
+process group exists -- ``ParallelConfig.derive_dp`` -> ``resolve_parallel_topology``
 -> ``ParallelTopology`` -- where a mis-sized launch has to fail with a config-level
 message rather than deep inside mesh construction. The second is the part a
 successful run never executes: the assignment guards that reject an inconsistent
@@ -9,7 +9,7 @@ size, and the two mesh lookups that fail *because* an axis is disabled. Those ar
 the paths that turn a misconfigured run into a stack trace instead of a silent
 wrong-size process group.
 
-``build_mesh`` is what needs a real process group, so the mesh tests run behind a
+``build_device_mesh`` is what needs a real process group, so the mesh tests run behind a
 single-rank gloo group -- the same fixture shape as ``test_pipeline.py``.
 """
 
@@ -26,7 +26,30 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.config import LLMTunerConfig, ParallelConfig
-from llmtuner.parallel.topology import ParallelTopology, build_parallel_topology
+from llmtuner.parallel.topology import ParallelTopology, resolve_parallel_topology
+
+
+@pytest.mark.parametrize("field", ["dp_replicate", "dp_shard", "cp", "tp", "pp", "ep"])
+@pytest.mark.parametrize("value", [True, 1.0, 1.5, "2"])
+def test_topology_degrees_require_integer_values(field, value):
+    values = dict(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1)
+    values[field] = value
+    with pytest.raises(ValueError, match=">= 1"):
+        ParallelTopology(**values)
+
+
+@pytest.mark.parametrize("value", [True, 1.0, 1.5, "2"])
+def test_topology_world_size_requires_integer_value(value):
+    with pytest.raises(ValueError, match="world_size must be >= 1"):
+        ParallelTopology(
+            dp_replicate=1,
+            dp_shard=1,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=value,
+        )
 
 
 def _config(**parallel_kw) -> LLMTunerConfig:
@@ -138,7 +161,7 @@ def test_a_disabled_axis_resolves_to_none_rather_than_a_size_one_mesh(
     run over a degenerate group.
     """
     dims = _dims(world_size=1, dp_shard=1, tp=1)
-    dims.build_mesh()
+    dims.build_device_mesh()
 
     assert dims.get_optional_mesh("tp") is None
     assert dims.get_optional_mesh("cp") is None
@@ -152,7 +175,7 @@ def test_get_mesh_raises_for_a_disabled_axis_but_names_the_reason(
 ) -> None:
     """ "Not available" must distinguish "off" from "misspelled"."""
     dims = _dims(world_size=1, dp_shard=1)
-    dims.build_mesh()
+    dims.build_device_mesh()
 
     with pytest.raises(ValueError, match="is not available"):
         dims.get_mesh("tp")
@@ -161,7 +184,7 @@ def test_get_mesh_raises_for_a_disabled_axis_but_names_the_reason(
 def test_an_unknown_axis_name_lists_the_valid_ones(single_rank_group) -> None:
     """A typo should be self-correcting, not a bare IndexError."""
     dims = _dims(world_size=1, dp_shard=1)
-    dims.build_mesh()
+    dims.build_device_mesh()
 
     with pytest.raises(ValueError, match="Invalid mesh dim"):
         dims.get_optional_mesh("tensor_parallel")
@@ -172,7 +195,7 @@ def test_resolving_to_a_mesh_that_covers_the_world_is_the_single_axis_case(
 ) -> None:
     """``dp_shard`` on a 1-rank world: the axis is live at size 1 by design."""
     dims = _dims(world_size=1, dp_shard=1)
-    dims.build_mesh()
+    dims.build_device_mesh()
     mesh = dims.get_optional_mesh("dp_shard")
     assert mesh is not None
     assert mesh.size() == 1
@@ -183,7 +206,7 @@ def test_a_multi_axis_request_returns_one_mesh_from_the_cache(
 ) -> None:
     """Multi-axis lookups are cached by name-tuple, so identity must hold."""
     dims = _dims(world_size=1, dp_shard=1)
-    dims.build_mesh()
+    dims.build_device_mesh()
     init_device_mesh("cpu", (1,), mesh_dim_names=("dp_shard",))
     # A second call must hand back the same object, not rebuild it.
     first = dims.get_optional_mesh(["dp_shard"])
@@ -191,13 +214,13 @@ def test_a_multi_axis_request_returns_one_mesh_from_the_cache(
     assert first is second
 
 
-def test_build_mesh_reuses_the_same_world_and_submesh(single_rank_group) -> None:
+def test_build_device_mesh_reuses_the_same_world_and_submesh(single_rank_group) -> None:
     """Repeated setup must not mix cached views from separate world meshes."""
     dims = _dims(world_size=1, dp_shard=1)
-    world_mesh = dims.build_mesh()
+    world_mesh = dims.build_device_mesh()
     dp_shard_mesh = dims.get_optional_mesh("dp_shard")
 
-    assert dims.build_mesh() is world_mesh
+    assert dims.build_device_mesh() is world_mesh
     assert dims.get_optional_mesh("dp_shard") is dp_shard_mesh
 
 
@@ -223,70 +246,70 @@ def test_the_loss_mesh_spans_tp_as_well_as_dp_and_cp() -> None:
     assert sizes["loss"] == sizes["batch"] * sizes["cp"] * sizes["tp"] == 8
 
 
-# -- config resolution: derive_dp and build_parallel_topology ---------------------
+# -- config resolution: derive_dp and resolve_parallel_topology ---------------------
 
 
 def test_derive_dp_derives_from_world_size() -> None:
     """``-1`` means "use whatever is left", not "1"."""
     cfg = _config(data_parallel_shard_size=-1)
-    assert cfg.derive_dp(world_size=8) == 8
-    assert cfg.derive_dp(world_size=4) == 4
+    assert cfg.parallel.derive_dp(world_size=8) == 8
+    assert cfg.parallel.derive_dp(world_size=4) == 4
 
 
 def test_derive_dp_rejects_inconsistent_sizes() -> None:
     """A pinned dp_shard that does not multiply out to world_size is a launch bug."""
     cfg = _config(data_parallel_shard_size=1)
     with pytest.raises(ValueError):
-        cfg.derive_dp(world_size=2)
+        cfg.parallel.derive_dp(world_size=2)
 
 
 def test_derive_dp_rejects_indivisible_world() -> None:
     cfg = _config(data_parallel_shard_size=-1, tensor_parallel_size=2)
     with pytest.raises(ValueError):
-        cfg.derive_dp(world_size=7)  # 7 % 2 != 0
+        cfg.parallel.derive_dp(world_size=7)  # 7 % 2 != 0
 
 
 def test_derive_dp_narrows_by_the_non_dp_sizes() -> None:
     """tp=2 consumes half the ranks; the rest are data-parallel."""
     cfg = _config(data_parallel_shard_size=-1, tensor_parallel_size=2)
-    assert cfg.derive_dp(world_size=8) == 4
+    assert cfg.parallel.derive_dp(world_size=8) == 4
 
 
 def test_derive_dp_does_not_count_ep_as_an_extra_world_axis() -> None:
     """EP tiles the dense sparse-region ranks; it does not consume more ranks."""
     cfg = _config(data_parallel_shard_size=-1, expert_parallel_size=4)
-    pd = build_parallel_topology(cfg, world_size=8)
+    pd = resolve_parallel_topology(cfg, world_size=8)
 
-    assert cfg.derive_dp(world_size=8) == 8
+    assert cfg.parallel.derive_dp(world_size=8) == 8
     assert pd is not None
     assert pd.dp_shard == 8
     assert pd.ep == 4
 
 
-def test_build_parallel_topology_resolves_against_world_size() -> None:
+def test_resolve_parallel_topology_resolves_against_world_size() -> None:
     """Single process -> no process group, so there is no ``ParallelTopology`` at all.
 
     ``None`` is the sentinel every downstream ``parallel_dims is None`` guard
     keys on, so returning a degenerate object here would make them all dead.
     """
-    assert build_parallel_topology(LLMTunerConfig(), world_size=1) is None
+    assert resolve_parallel_topology(LLMTunerConfig(), world_size=1) is None
 
     cfg = _config(data_parallel_shard_size=-1, tensor_parallel_size=2)
-    pd = build_parallel_topology(cfg, world_size=8)
+    pd = resolve_parallel_topology(cfg, world_size=8)
     assert isinstance(pd, ParallelTopology)
     # tp=2 over 8 ranks leaves 4 for data parallelism; dp_shard=-1 resolves here.
     assert (pd.tp, pd.dp_shard) == (2, 4)
 
 
-def test_build_parallel_topology_rejects_parallel_degrees_at_world_size_1() -> None:
+def test_resolve_parallel_topology_rejects_parallel_degrees_at_world_size_1() -> None:
     """No torchrun + tp>1 must fail, not silently train a replicated model."""
     cfg = _config(tensor_parallel_size=2)
     with pytest.raises(ValueError, match="world_size=1"):
-        build_parallel_topology(cfg, world_size=1)
+        resolve_parallel_topology(cfg, world_size=1)
 
     cfg = _config(pipeline_parallel_size=2)
     with pytest.raises(ValueError, match="world_size=1"):
-        build_parallel_topology(cfg, world_size=1)
+        resolve_parallel_topology(cfg, world_size=1)
 
 
 def test_derive_dp_matches_parallel_dims_resolution() -> None:
@@ -298,8 +321,8 @@ def test_derive_dp_matches_parallel_dims_resolution() -> None:
     ranks go to data parallelism, silently.
     """
     cfg = _config(data_parallel_shard_size=-1, tensor_parallel_size=2)
-    pd = build_parallel_topology(cfg, world_size=8)
-    assert cfg.derive_dp(world_size=8) == pd.dp_shard
+    pd = resolve_parallel_topology(cfg, world_size=8)
+    assert cfg.parallel.derive_dp(world_size=8) == pd.dp_shard
 
 
 def test_cp_only_still_needs_a_loss_reduction() -> None:
@@ -321,7 +344,7 @@ def test_cp_only_still_needs_a_loss_reduction() -> None:
     ``tests/integration_tests/cp_wiring_equivalence.py``.
     """
     cfg = _config(data_parallel_shard_size=1, context_parallel_kv_allgather_size=2)
-    pd = build_parallel_topology(cfg, world_size=2)
+    pd = resolve_parallel_topology(cfg, world_size=2)
     assert isinstance(pd, ParallelTopology)
 
     assert pd.cp_enabled

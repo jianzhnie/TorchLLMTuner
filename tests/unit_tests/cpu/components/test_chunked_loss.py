@@ -184,6 +184,36 @@ def test_returned_loss_is_detached_and_unnormalized() -> None:
     torch.testing.assert_close(loss_sum, full, rtol=1e-5, atol=1e-7)
 
 
+@pytest.mark.parametrize("shape", [(), (T, 1), (T, V)])
+def test_invalid_label_shape_fails_before_head_and_preserves_gradients(shape):
+    hidden, _, lm_head = _inputs()
+    hidden.requires_grad_(True)
+    hidden.grad = torch.ones_like(hidden)
+    lm_head.weight.grad = torch.ones_like(lm_head.weight)
+    lm_head.bias.grad = torch.ones_like(lm_head.bias)
+    gradients = [hidden.grad, lm_head.weight.grad, lm_head.bias.grad]
+    originals = [gradient.clone() for gradient in gradients]
+    calls = []
+    handle = lm_head.register_forward_pre_hook(lambda *args: calls.append(True))
+    try:
+        with pytest.raises(ValueError, match=r"labels must be \(T,\)"):
+            chunked_lm_head_cross_entropy(
+                lm_head,
+                hidden,
+                torch.zeros(shape, dtype=torch.long),
+                num_chunks=3,
+                grad_scale=1.0,
+            )
+    finally:
+        handle.remove()
+    assert not calls
+    for actual, original in zip(gradients, originals, strict=True):
+        torch.testing.assert_close(actual, original)
+    assert hidden.grad is gradients[0]
+    assert lm_head.weight.grad is gradients[1]
+    assert lm_head.bias.grad is gradients[2]
+
+
 def test_invalid_inputs_raise() -> None:
     hidden, labels, lm_head = _inputs()
     with pytest.raises(ValueError, match="num_chunks"):

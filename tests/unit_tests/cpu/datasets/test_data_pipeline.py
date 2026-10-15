@@ -62,6 +62,22 @@ from tests.data_fixtures import (
     write_tokenizer,
 )
 
+
+@pytest.mark.parametrize("step", [-1, True, 1.5, "1"])
+def test_synthetic_source_rejects_invalid_start_index(step):
+    from llmtuner.datasets.synthetic import RandomTokenSource
+
+    source = RandomTokenSource(seed=1, vocab_size=8, batch_size=2, seq_len=4)
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        next(source.iter_from(step))
+
+
+@pytest.mark.parametrize("batch_size", [True, 1.5, "2"])
+def test_synthetic_loader_validates_batch_size_before_dp_arithmetic(batch_size):
+    with pytest.raises(ValueError, match="batch_size must be positive integer"):
+        RandomTokenDataLoader(seed=1, vocab_size=8, batch_size=batch_size, seq_len=4)
+
+
 # --------------------------------------------------------------------------
 # Tokenizer
 # --------------------------------------------------------------------------
@@ -72,6 +88,215 @@ def test_special_tokens_are_inferred_from_the_config(tokenizer):
     assert tokenizer.eos_id == VOCAB["[EOS]"]
     assert tokenizer.bos_token == "[BOS]"
     assert tokenizer.eos_token == "[EOS]"
+
+
+def test_jsonl_patterns_preserve_pattern_order_and_sort_each_match(tmp_path):
+    from llmtuner.datasets.sources import file_patterns_to_paths
+
+    for name in ("a2.jsonl", "a1.jsonl", "z.jsonl"):
+        (tmp_path / name).write_text("{}\n")
+    paths = file_patterns_to_paths(
+        (str(tmp_path / "z.jsonl"), str(tmp_path / "a*.jsonl"))
+    )
+    assert paths == tuple(
+        str(tmp_path / name) for name in ("z.jsonl", "a1.jsonl", "a2.jsonl")
+    )
+
+
+@pytest.mark.parametrize("source", ["corpus.jsonl", b"corpus.jsonl"])
+def test_source_rejects_character_sequences(source):
+    from llmtuner.datasets.sources import build_source
+
+    with pytest.raises(TypeError, match="source cannot be a string or bytes"):
+        build_source(source, iteration_policy=make_policy())
+
+
+def test_jsonl_source_rejects_empty_patterns():
+    from llmtuner.datasets.sources import IndexedJsonlDataSource
+
+    with pytest.raises(ValueError, match="at least one file pattern"):
+        IndexedJsonlDataSource(())
+
+
+def test_jsonl_source_rejects_directory_matches(tmp_path):
+    from llmtuner.datasets.sources import IndexedJsonlDataSource
+
+    with pytest.raises(ValueError, match="non-file path"):
+        IndexedJsonlDataSource((str(tmp_path),))
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_closed_streaming_cursor_does_not_consume_source(repeat):
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    consumed = []
+
+    class Source:
+        def state_dict(self):
+            return {}
+
+        def __iter__(self):
+            for text in ("first", "second"):
+                consumed.append(text)
+                yield {"text": text}
+
+    cursor = HuggingFaceCursorIterator(Source(), repeat=repeat, shuffle=False)
+    assert next(cursor) == {"text": "first"}
+    cursor.close()
+    cursor.close()
+    with pytest.raises(ValueError, match="closed iterator"):
+        next(cursor)
+    assert consumed == ["first"]
+
+
+@pytest.mark.parametrize("epoch", [True, -1, 1.5, "2"])
+def test_streaming_cursor_rejects_invalid_epoch_without_touching_source(epoch):
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    class Source:
+        def __init__(self):
+            self.calls = []
+
+        def state_dict(self):
+            return {}
+
+        def __iter__(self):
+            return iter([{"text": "first"}, {"text": "second"}])
+
+        def set_epoch(self, value):
+            self.calls.append(value)
+
+        def load_state_dict(self, value):
+            self.calls.append(value)
+
+    source = Source()
+    cursor = HuggingFaceCursorIterator(source, repeat=True, shuffle=True)
+    assert next(cursor) == {"text": "first"}
+    with pytest.raises(ValueError, match="epoch must be a nonnegative integer"):
+        cursor.set_state({"epoch": epoch, "hf": {}})
+    assert cursor.get_state()["epoch"] == 0
+    assert source.calls == []
+    assert next(cursor) == {"text": "second"}
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_streaming_repeat_preserves_epoch_when_reset_fails(streaming):
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    class Source:
+        def state_dict(self):
+            return {}
+
+        def __iter__(self):
+            return iter([])
+
+        def set_epoch(self, epoch):
+            pass
+
+        def load_state_dict(self, state):
+            raise RuntimeError("reset failed")
+
+    cursor = HuggingFaceCursorIterator(Source(), repeat=True, shuffle=streaming)
+    with pytest.raises(RuntimeError, match="reset failed"):
+        next(cursor)
+    assert cursor.get_state()["epoch"] == 0
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("field", ["path", "split", "name", "revision", "streaming"])
+def test_hf_source_rejects_kwargs_shadowing_explicit_fields(streaming, field):
+    from llmtuner.datasets.sources import (
+        HuggingFaceRandomAccessSource,
+        HuggingFaceStreamingSource,
+    )
+
+    source_type = (
+        HuggingFaceStreamingSource if streaming else HuggingFaceRandomAccessSource
+    )
+    with pytest.raises(ValueError, match="first-class Hugging Face fields repeated"):
+        source_type(path="dataset", split="train", load_dataset_kwargs={field: "x"})
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_hf_source_revalidates_mutated_options_before_loading(streaming, monkeypatch):
+    from llmtuner.datasets import sources
+
+    source_type = (
+        sources.HuggingFaceStreamingSource
+        if streaming
+        else sources.HuggingFaceRandomAccessSource
+    )
+    source = source_type(path="dataset", split="train")
+    source.load_dataset_kwargs["streaming"] = not streaming
+    calls = []
+    monkeypatch.setattr(
+        sources.datasets, "load_dataset", lambda *a, **k: calls.append(k)
+    )
+    with pytest.raises(ValueError, match="first-class Hugging Face fields repeated"):
+        sources.build_source(source, iteration_policy=make_policy())
+    assert calls == []
+
+
+@pytest.mark.parametrize("value", [True, False, 1.5, float("nan"), "2", None])
+def test_dataset_context_rejects_non_integer_sizes(tokenizer, value):
+    with pytest.raises(ValueError, match="max_context_length.*positive integer"):
+        make_context(tokenizer, max_context_length=value)
+
+
+def test_tokenizer_accepts_named_inputs_and_explicit_default_settings(tokenizer):
+    expected = tokenizer.encode("lorem ipsum")
+    assert tokenizer.encode(text="lorem ipsum", add_bos=None, add_eos=None) == expected
+    assert tokenizer.decode(token_ids=expected, skip_special_tokens=False) == (
+        tokenizer.decode(expected, skip_special_tokens=False)
+    )
+
+
+@pytest.mark.parametrize("kwargs", [{"add_boss": False}, {"add_special_tokens": False}])
+def test_tokenizer_rejects_unrecognized_encode_options(tokenizer, kwargs):
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        tokenizer.encode("lorem", **kwargs)
+
+
+def test_tokenizer_requires_bos_eos_options_by_keyword(tokenizer):
+    with pytest.raises(TypeError):
+        tokenizer.encode("lorem", False, False)
+
+
+def test_tokenizer_preserves_non_special_added_token_metadata(tmp_path):
+    import json
+
+    path = write_tokenizer(str(tmp_path / "tokenizer"))
+    config_path = tmp_path / "tokenizer" / "tokenizer_config.json"
+    config = json.loads(config_path.read_text())
+    config["added_tokens_decoder"] = {
+        "70": {
+            "content": "<ordinary>",
+            "special": False,
+            "normalized": False,
+            "single_word": True,
+        }
+    }
+    config_path.write_text(json.dumps(config))
+    loaded = HuggingFaceTokenizer(tokenizer_path=path)
+    token_id = loaded.token_to_id("<ordinary>")
+    token = loaded.tokenizer.get_added_tokens_decoder()[token_id]
+    assert token.special is False
+    assert token.normalized is False
+    assert token.single_word is True
+    assert loaded.decode([token_id], skip_special_tokens=True) == "<ordinary>"
+
+
+@pytest.mark.parametrize("content", [None, 7, [], {}])
+def test_tokenizer_rejects_invalid_special_token_content(tmp_path, content):
+    import json
+
+    path = write_tokenizer(str(tmp_path / "tokenizer"))
+    config_path = tmp_path / "tokenizer" / "tokenizer_config.json"
+    config = json.loads(config_path.read_text())
+    config["bos_token"] = {"content": content}
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="bos_token.*content must be a string"):
+        HuggingFaceTokenizer(tokenizer_path=path)
 
 
 def test_encode_suppresses_native_special_tokens_and_adds_its_own(tokenizer):
@@ -123,9 +348,7 @@ def test_dp_ranks_get_disjoint_slices_that_cover_the_corpus(tokenizer, corpus):
         dataset = build_dataset(
             config,
             context=make_context(tokenizer),
-            dataset_iteration_policy=make_policy(
-                shuffle=True, dp_world_size=2, dp_rank=rank
-            ),
+            iteration_policy=make_policy(shuffle=True, dp_world_size=2, dp_rank=rank),
         )
         iterator = iter(dataset)
         seen.append(token_ids([next(iterator) for _ in range(per_rank)]))
@@ -142,7 +365,7 @@ def test_repeat_replays_in_order_when_shuffle_is_off(tokenizer, corpus):
     dataset = build_dataset(
         text_dataset(corpus),
         context=make_context(tokenizer),
-        dataset_iteration_policy=make_policy(shuffle=False, repeat=True),
+        iteration_policy=make_policy(shuffle=False, repeat=True),
     )
     iterator = iter(dataset)
     first = token_ids([next(iterator) for _ in range(NUM_ROWS)])
@@ -160,7 +383,7 @@ def test_repeat_reshuffles_each_epoch_when_shuffle_is_on(tokenizer, corpus):
     dataset = build_dataset(
         text_dataset(corpus),
         context=make_context(tokenizer),
-        dataset_iteration_policy=make_policy(shuffle=True, repeat=True),
+        iteration_policy=make_policy(shuffle=True, repeat=True),
     )
     iterator = iter(dataset)
     first = token_ids([next(iterator) for _ in range(NUM_ROWS)])
@@ -175,7 +398,7 @@ def test_too_few_rows_for_the_dp_size_raises(tokenizer, corpus):
         build_dataset(
             text_dataset(corpus),
             context=make_context(tokenizer),
-            dataset_iteration_policy=make_policy(dp_world_size=NUM_ROWS + 1),
+            iteration_policy=make_policy(dp_world_size=NUM_ROWS + 1),
         )
 
 
@@ -189,7 +412,7 @@ def test_documents_shorter_than_two_tokens_are_dropped(tokenizer, corpus):
     short = text_dataset(corpus)
     context = make_context(tokenizer)
     dataset = build_dataset(
-        short, context=context, dataset_iteration_policy=make_policy(shuffle=False)
+        short, context=context, iteration_policy=make_policy(shuffle=False)
     )
     kept = sum(1 for sequence in (dataset[i] for i in range(len(dataset))) if sequence)
     # Every row here is at least two tokens, so nothing should be filtered.
@@ -245,18 +468,20 @@ def test_dataset_build_context_rejects_non_positive_sizes(tokenizer, kwargs, mes
     [
         {"dp_world_size": 0},
         {"dp_rank": -1},
+        {"dp_rank": True},
+        {"dp_rank": 0.5},
         {"dp_rank": 2, "dp_world_size": 2},
         {"streaming_shuffle_buffer_size": 0},
     ],
 )
-def test_dataset_iteration_policy_rejects_invalid_parallelism(kwargs):
+def test_iteration_policy_rejects_invalid_parallelism(kwargs):
     with pytest.raises(ValueError):
         make_policy(**kwargs)
 
 
 @pytest.mark.parametrize(
     ("dp_rank", "dp_world_size"),
-    [(-1, 1), (1, 1), (0, 0)],
+    [(-1, 1), (1, 1), (0, 0), (True, 2), (0.5, 2)],
 )
 def test_random_loader_rejects_invalid_parallel_coordinates(dp_rank, dp_world_size):
     with pytest.raises(ValueError):
@@ -267,6 +492,56 @@ def test_random_loader_rejects_invalid_parallel_coordinates(dp_rank, dp_world_si
             seq_len=8,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
+        )
+
+
+@pytest.mark.parametrize("repeat", ["false", 0, 1, None])
+def test_loader_repeat_requires_boolean_before_graph_construction(repeat):
+    with pytest.raises(TypeError, match="repeat must be bool"):
+        GrainDataLoader(
+            None,
+            dp_world_size=1,
+            dp_rank=0,
+            tokenizer=None,
+            max_context_length=8,
+            num_tokens_per_batch=8,
+            repeat=repeat,
+        )
+
+
+@pytest.mark.parametrize("field", ["shuffle", "repeat"])
+@pytest.mark.parametrize("value", ["false", 0, 1, None])
+def test_iteration_flags_require_booleans(field, value):
+    with pytest.raises(TypeError, match=f"{field} must be bool"):
+        make_policy(**{field: value})
+
+
+@pytest.mark.parametrize("rank", [True, 0.5, -1, 2])
+def test_grain_loader_rejects_invalid_rank_before_building_graph(rank):
+    with pytest.raises(ValueError, match="dp_rank must be an integer"):
+        GrainDataLoader(
+            None,
+            dp_world_size=2,
+            dp_rank=rank,
+            tokenizer=None,
+            max_context_length=8,
+            num_tokens_per_batch=8,
+        )
+
+
+@pytest.mark.parametrize("depth", [0, -1, True, 1.5, "2"])
+def test_grain_loader_rejects_invalid_prefetch_before_building_graph(depth):
+    with pytest.raises(
+        ValueError, match="num_prefetch_batches must be positive integer"
+    ):
+        GrainDataLoader(
+            None,
+            dp_world_size=1,
+            dp_rank=0,
+            tokenizer=None,
+            max_context_length=8,
+            num_tokens_per_batch=8,
+            num_prefetch_batches=depth,
         )
 
 
@@ -328,6 +603,24 @@ def test_collator_num_rows_per_batch_is_one(collator):
     assert collator.num_rows_per_batch() == 1
 
 
+def test_text_collator_rejects_empty_batch_before_allocating(collator, monkeypatch):
+    def unexpected_allocation(*args, **kwargs):
+        pytest.fail("empty batch must fail before tensor allocation")
+
+    monkeypatch.setattr(torch, "zeros", unexpected_allocation)
+    with pytest.raises(ValueError, match="at least one row"):
+        collator([])
+
+
+def test_text_collator_preserves_empty_row_as_fully_padded_batch(collator):
+    empty = np.array([], dtype=np.int64)
+    batch = collator([TextSequence(input_ids=empty, labels=empty)])
+    assert batch["num_valid_tokens"] == 0
+    assert batch["padding_mask"].all()
+    assert (batch["labels"] == IGNORE_INDEX).all()
+    assert batch["positions"].tolist() == list(range(16))
+
+
 # --------------------------------------------------------------------------
 # Loader
 # --------------------------------------------------------------------------
@@ -345,11 +638,33 @@ def _loader(dataset, tokenizer, *, dp_rank=0, dp_world_size=1, config_kwargs=Non
     )
 
 
+def test_loader_resolves_collator_batch_rows_once(tokenizer):
+    class SingleResolutionCollator(TextCollator):
+        calls = 0
+
+        def num_rows_per_batch(self):
+            self.calls += 1
+            assert self.calls == 1, "batch layout must be resolved only once"
+            return 1
+
+    sample = TextSequence(input_ids=np.arange(4), labels=np.arange(4))
+    loader = _loader(
+        grain.MapDataset.source([sample]),
+        tokenizer,
+        config_kwargs={"collator": SingleResolutionCollator, "repeat": False},
+    )
+    try:
+        assert loader.state_dict()["batch_layout"]["num_rows_per_batch"] == 1
+        assert next(iter(loader))["input"].numel() == 32
+    finally:
+        loader.close()
+
+
 def test_loader_emits_the_trainer_batch_contract(tokenizer, corpus):
     dataset = build_dataset(
         text_dataset(corpus),
         context=make_context(tokenizer, num_tokens_per_batch=32),
-        dataset_iteration_policy=make_policy(repeat=True),
+        iteration_policy=make_policy(repeat=True),
     )
     batch = next(iter(_loader(dataset, tokenizer)))
     assert sorted(batch) == [
@@ -375,7 +690,7 @@ def test_loader_resume_reproduces_the_following_batches_exactly(tokenizer, corpu
         dataset = build_dataset(
             text_dataset(corpus),
             context=make_context(tokenizer, num_tokens_per_batch=32),
-            dataset_iteration_policy=make_policy(shuffle=True, repeat=True),
+            iteration_policy=make_policy(shuffle=True, repeat=True),
         )
         return _loader(dataset, tokenizer)
 
@@ -399,7 +714,7 @@ def test_loader_rejects_resuming_across_a_changed_dp_size(tokenizer, corpus):
     dataset = build_dataset(
         text_dataset(corpus),
         context=make_context(tokenizer, num_tokens_per_batch=32),
-        dataset_iteration_policy=make_policy(repeat=True),
+        iteration_policy=make_policy(repeat=True),
     )
     loader = _loader(dataset, tokenizer)
     with pytest.raises(ValueError, match="data-parallel degree"):
@@ -416,7 +731,7 @@ def test_dcp_restore_checks_saved_layout_before_restoring_iterator(
         dataset = build_dataset(
             text_dataset(corpus),
             context=make_context(tokenizer, num_tokens_per_batch=num_tokens),
-            dataset_iteration_policy=make_policy(repeat=True),
+            iteration_policy=make_policy(repeat=True),
         )
         return GrainDataLoader(
             dataset,
@@ -441,23 +756,52 @@ def test_dcp_restore_checks_saved_layout_before_restoring_iterator(
         restored.close()
 
 
-def test_loader_rejects_an_unknown_state_version(tokenizer, corpus):
+@pytest.mark.parametrize("version", [99, True, 1.0, None])
+def test_loader_rejects_an_unknown_state_version(tokenizer, corpus, version):
     dataset = build_dataset(
         text_dataset(corpus),
         context=make_context(tokenizer, num_tokens_per_batch=32),
-        dataset_iteration_policy=make_policy(repeat=True),
+        iteration_policy=make_policy(repeat=True),
     )
     loader = _loader(dataset, tokenizer)
     with pytest.raises(ValueError, match="unsupported GrainDataLoader state version"):
-        loader.load_state_dict({"version": 99, "dp_world_size": 1, "dp_rank_0": {}})
+        loader.load_state_dict(
+            {"version": version, "dp_world_size": 1, "dp_rank_0": {}}
+        )
     loader.close()
+
+
+def test_loader_rejects_missing_layout_without_changing_cursor(tokenizer, corpus):
+    dataset = build_dataset(
+        text_dataset(corpus),
+        context=make_context(tokenizer, num_tokens_per_batch=32),
+        iteration_policy=make_policy(repeat=True),
+    )
+    loader = _loader(dataset, tokenizer)
+    try:
+        before = loader.state_dict()
+        invalid = {key: value for key, value in before.items() if key != "batch_layout"}
+        with pytest.raises(ValueError, match="missing dataloader batch_layout"):
+            loader.load_state_dict(invalid)
+        assert loader.state_dict() == before
+    finally:
+        loader.close()
+
+
+@pytest.mark.parametrize("degree", [True, 1.0, None, 0])
+def test_synthetic_resume_rejects_invalid_saved_dp_degree(degree):
+    loader = RandomTokenDataLoader(seed=42, vocab_size=16, batch_size=2, seq_len=4)
+    before = loader.state_dict()
+    with pytest.raises(ValueError, match="checkpoint dp_world_size"):
+        loader.load_state_dict({"dp_world_size": degree, "steps": 10})
+    assert loader.state_dict() == before
 
 
 def test_loader_requires_the_rank_entry_present_in_the_checkpoint(tokenizer, corpus):
     dataset = build_dataset(
         text_dataset(corpus),
         context=make_context(tokenizer, num_tokens_per_batch=32),
-        dataset_iteration_policy=make_policy(repeat=True),
+        iteration_policy=make_policy(repeat=True),
     )
     loader = _loader(dataset, tokenizer)
     with pytest.raises(ValueError, match="missing dataloader state"):
@@ -474,7 +818,7 @@ def test_finite_dataset_under_dp_is_rejected_up_front(tokenizer, corpus):
     dataset = build_dataset(
         text_dataset(corpus),
         context=make_context(tokenizer, num_tokens_per_batch=32),
-        dataset_iteration_policy=make_policy(repeat=True),
+        iteration_policy=make_policy(repeat=True),
     )
     with pytest.raises(ValueError, match="repeat=False"):
         _loader(dataset, tokenizer, dp_world_size=2, config_kwargs={"repeat": False})
@@ -484,7 +828,7 @@ def test_max_num_documents_must_be_positive(tokenizer, corpus, num_tokens_per_ba
     dataset = build_dataset(
         text_dataset(corpus),
         context=make_context(tokenizer, num_tokens_per_batch=32),
-        dataset_iteration_policy=make_policy(),
+        iteration_policy=make_policy(),
     )
     with pytest.raises(ValueError, match="max_num_documents must be positive"):
         _loader(dataset, tokenizer, config_kwargs={"max_num_documents": 0})
@@ -498,7 +842,7 @@ def test_max_num_documents_must_be_positive(tokenizer, corpus, num_tokens_per_ba
 def test_concat_then_split_fills_the_token_batch(tokenizer, corpus):
     context = make_context(tokenizer, num_tokens_per_batch=32)
     graph = build_concat_then_split_packing(
-        text_dataset(corpus), context=context, dataset_iteration_policy=make_policy()
+        text_dataset(corpus), context=context, iteration_policy=make_policy()
     )
     loader = _loader(graph, tokenizer, config_kwargs={"repeat": False})
     rows = [next(iter(loader)) for _ in range(3)]
@@ -514,7 +858,7 @@ def test_first_fit_packing_fills_the_token_batch(tokenizer, corpus):
         text_dataset(corpus),
         num_packing_bins=4,
         context=context,
-        dataset_iteration_policy=make_policy(),
+        iteration_policy=make_policy(),
     )
     loader = _loader(graph, tokenizer, config_kwargs={"repeat": False})
     iterator = iter(loader)
@@ -535,7 +879,7 @@ def test_concat_then_split_marks_padding_so_it_never_contributes_loss(
     """
     context = make_context(tokenizer, num_tokens_per_batch=32)
     graph = build_concat_then_split_packing(
-        text_dataset(corpus), context=context, dataset_iteration_policy=make_policy()
+        text_dataset(corpus), context=context, iteration_policy=make_policy()
     )
     loader = _loader(graph, tokenizer, config_kwargs={"repeat": False})
     iterator = iter(loader)
@@ -558,7 +902,7 @@ def test_document_aware_packing_caps_segments_per_row(tokenizer, corpus):
     """
     context = make_context(tokenizer, num_tokens_per_batch=32, max_num_documents=1)
     graph = build_concat_then_split_packing(
-        text_dataset(corpus), context=context, dataset_iteration_policy=make_policy()
+        text_dataset(corpus), context=context, iteration_policy=make_policy()
     )
     loader = _loader(graph, tokenizer, config_kwargs={"repeat": False})
     row = next(iter(loader))
@@ -591,7 +935,7 @@ def test_document_aware_packing_keeps_each_row_to_one_document(tokenizer, corpus
     source = [
         [int(token) for token in sequence.input_ids]
         for sequence in build_dataset(
-            text_dataset(corpus), context=context, dataset_iteration_policy=policy
+            text_dataset(corpus), context=context, iteration_policy=policy
         )
     ]
     # Which source document each token came from, flattened.
@@ -599,7 +943,7 @@ def test_document_aware_packing_keeps_each_row_to_one_document(tokenizer, corpus
     flat_source = [token for doc in source for token in doc]
 
     graph = build_concat_then_split_packing(
-        text_dataset(corpus), context=context, dataset_iteration_policy=policy
+        text_dataset(corpus), context=context, iteration_policy=policy
     )
 
     flat_packed: list[int] = []
@@ -734,6 +1078,80 @@ def test_document_split_rejects_non_positive_context(value):
         SplitTextSequenceDocuments(max_context_length=value)
 
 
+@pytest.mark.parametrize("offset", [-1, 0, 5, 6, True, 1.5])
+def test_document_packing_rejects_invalid_restored_offset(offset):
+    from llmtuner.datasets.packing.iterators import (
+        DocumentAwareConcatThenSplitIterDataset,
+    )
+
+    graph = DocumentAwareConcatThenSplitIterDataset(
+        _SequenceIterDataset(
+            [TextSequence(input_ids=np.arange(5), labels=np.arange(5))]
+        ),
+        max_num_documents_per_row=2,
+        max_context_length=2,
+        num_tokens_per_row=2,
+    )
+    iterator = iter(graph)
+    next(iterator)
+    state = iterator.get_state()
+    state["remainder_offset"] = offset
+    with pytest.raises(ValueError, match="packing checkpoint"):
+        iter(graph).set_state(state)
+
+
+def test_document_packing_rejects_missing_checkpoint_remainder():
+    from llmtuner.datasets.packing.iterators import (
+        DocumentAwareConcatThenSplitIterDataset,
+    )
+
+    graph = DocumentAwareConcatThenSplitIterDataset(
+        _SequenceIterDataset([]),
+        max_num_documents_per_row=2,
+        max_context_length=2,
+        num_tokens_per_row=2,
+    )
+    iterator = iter(graph)
+    state = iterator.get_state()
+    state.update(has_remainder=True, remainder_offset=1)
+    with pytest.raises(ValueError, match="remainder is missing"):
+        iterator.set_state(state)
+
+
+@pytest.mark.parametrize("parent_position", [0, 1])
+def test_failed_packing_restore_preserves_live_token_stream(parent_position):
+    from llmtuner.datasets.packing.iterators import (
+        DocumentAwareConcatThenSplitIterDataset,
+    )
+
+    graph = DocumentAwareConcatThenSplitIterDataset(
+        _SequenceIterDataset(
+            [TextSequence(input_ids=np.arange(5), labels=np.arange(5))]
+        ),
+        max_num_documents_per_row=2,
+        max_context_length=2,
+        num_tokens_per_row=2,
+    )
+    iterator = iter(graph)
+    next(iterator)
+    original_state = iterator.get_state()
+    reference = iter(graph)
+    reference.set_state(original_state)
+    invalid_state = dict(original_state, remainder_offset=5)
+    parent_iterator = iter(graph._parent)
+    if parent_position:
+        next(parent_iterator)
+    invalid_state["parent"] = parent_iterator.get_state()
+    with pytest.raises(ValueError, match="packing checkpoint remainder"):
+        iterator.set_state(invalid_state)
+    assert iterator.get_state() == original_state
+    for actual, expected in zip(list(iterator), list(reference), strict=True):
+        for field in ("input_ids", "labels", "positions", "padding_mask"):
+            np.testing.assert_array_equal(
+                getattr(actual, field), getattr(expected, field)
+            )
+
+
 @pytest.mark.parametrize("value", [0, -1])
 @pytest.mark.parametrize(
     "field",
@@ -767,6 +1185,40 @@ def test_document_packing_rejects_non_positive_dimensions(
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "weight", [np.float32(1), np.float64(1), np.int64(1), 5e-324, 1e308]
+)
+def test_mix_accepts_real_weights_across_numeric_scales(tokenizer, corpus, weight):
+    mix = DatasetMix(
+        datasets=(WeightedDataset(dataset=text_dataset(corpus), weight=weight),)
+    )
+    graph = build_dataset(
+        mix, context=make_context(tokenizer), iteration_policy=make_policy()
+    )
+    assert next(iter(graph)) is not None
+
+
+def test_mix_rejects_unrepresentable_ratios_before_building_sources(
+    tokenizer, monkeypatch
+):
+    from llmtuner.datasets import composition
+
+    def unexpected_build(*args, **kwargs):
+        pytest.fail("invalid ratios must be rejected before source construction")
+
+    monkeypatch.setattr(composition, "build_source", unexpected_build)
+    mix = DatasetMix(
+        datasets=tuple(
+            WeightedDataset(dataset=object(), weight=weight)
+            for weight in (5e-324, 1e308)
+        )
+    )
+    with pytest.raises(ValueError, match="weight ratios"):
+        build_dataset(
+            mix, context=make_context(tokenizer), iteration_policy=make_policy()
+        )
+
+
 def test_mix_rejects_a_non_positive_weight(tokenizer, corpus):
     dataset = text_dataset(corpus)
     mix = DatasetMix(
@@ -777,7 +1229,7 @@ def test_mix_rejects_a_non_positive_weight(tokenizer, corpus):
     )
     with pytest.raises(ValueError, match="finite, positive-weight"):
         build_dataset(
-            mix, context=make_context(tokenizer), dataset_iteration_policy=make_policy()
+            mix, context=make_context(tokenizer), iteration_policy=make_policy()
         )
 
 
@@ -791,7 +1243,7 @@ def test_mix_produces_a_batch_from_interleaved_children(tokenizer, corpus):
     graph = build_dataset(
         mix,
         context=make_context(tokenizer, num_tokens_per_batch=32),
-        dataset_iteration_policy=make_policy(),
+        iteration_policy=make_policy(),
     )
     row = next(iter(_loader(graph, tokenizer)))
     assert row["input"].shape == (32,)
@@ -820,20 +1272,35 @@ def test_mix_of_streaming_children_draws_from_both(tokenizer):
         )
     )
     context = make_context(tokenizer, num_tokens_per_batch=8)
-    graph = build_dataset(mix, context=context, dataset_iteration_policy=make_policy())
+    graph = build_dataset(mix, context=context, iteration_policy=make_policy())
     assert isinstance(graph, grain.IterDataset)
 
     def rows_of(config):
         return token_ids(
-            build_dataset(
-                config, context=context, dataset_iteration_policy=make_policy()
-            )
+            build_dataset(config, context=context, iteration_policy=make_policy())
         )
 
     from_first, from_second = rows_of(first), rows_of(second)
     assert set(from_first) != set(from_second), "the children must be distinguishable"
     # Every row from both children, and nothing else.
     assert sorted(token_ids(list(graph))) == sorted(from_first + from_second)
+
+
+@pytest.mark.parametrize("weight", [True, "1", None, float("nan"), float("inf")])
+def test_mix_rejects_invalid_weights_before_building_sources(
+    tokenizer, monkeypatch, weight
+):
+    from llmtuner.datasets import composition
+
+    def unexpected_build(*args, **kwargs):
+        pytest.fail("invalid weights must be rejected before source construction")
+
+    monkeypatch.setattr(composition, "build_source", unexpected_build)
+    mix = DatasetMix(datasets=(WeightedDataset(dataset=object(), weight=weight),))
+    with pytest.raises(ValueError, match="finite, positive-weight"):
+        build_dataset(
+            mix, context=make_context(tokenizer), iteration_policy=make_policy()
+        )
 
 
 def test_mix_of_streaming_children_rejects_a_non_positive_weight(tokenizer, corpus):
@@ -846,7 +1313,7 @@ def test_mix_of_streaming_children_rejects_a_non_positive_weight(tokenizer, corp
     )
     with pytest.raises(ValueError, match="finite, positive-weight"):
         build_dataset(
-            mix, context=make_context(tokenizer), dataset_iteration_policy=make_policy()
+            mix, context=make_context(tokenizer), iteration_policy=make_policy()
         )
 
 
@@ -858,10 +1325,9 @@ def test_mix_of_streaming_children_rejects_a_non_positive_weight(tokenizer, corp
 def test_a_streaming_source_takes_the_iter_dataset_branch(tokenizer, corpus):
     """The streaming half of ``SingleDataset`` is otherwise never entered.
 
-    ``build_map_dataset`` and ``build_iter_dataset`` are different pastes of
-    the pipeline -- streaming shuffles with a window *before* processing while
-    the map path shuffles globally *after* -- and every other test feeds a
-    random-access source, so only the map path has ever run.
+    Streaming shuffles with a window before processing, while the map path
+    shuffles globally afterward. Both paths share the row transforms, but
+    their ordering policies need separate coverage.
 
     Both a correct stream and a wrong one produce correctly shaped batches, so
     the assertions are on content: every document once, and the window shuffle
@@ -871,7 +1337,7 @@ def test_a_streaming_source_takes_the_iter_dataset_branch(tokenizer, corpus):
     ordered = build_dataset(
         streaming_text_dataset(corpus),
         context=context,
-        dataset_iteration_policy=make_policy(shuffle=False),
+        iteration_policy=make_policy(shuffle=False),
     )
     assert isinstance(ordered, grain.IterDataset)
     rows = token_ids(list(ordered))
@@ -881,7 +1347,7 @@ def test_a_streaming_source_takes_the_iter_dataset_branch(tokenizer, corpus):
     shuffled = build_dataset(
         streaming_text_dataset(corpus),
         context=context,
-        dataset_iteration_policy=make_policy(shuffle=True),
+        iteration_policy=make_policy(shuffle=True),
     )
     assert set(token_ids(list(shuffled))) == set(rows)
     # A window shuffle is not the identity; if it were, the stream order would
@@ -903,7 +1369,7 @@ def test_concat_rejects_a_streaming_child(tokenizer, corpus):
         build_dataset(
             concat,
             context=make_context(tokenizer),
-            dataset_iteration_policy=make_policy(),
+            iteration_policy=make_policy(),
         )
 
 
@@ -920,9 +1386,7 @@ def test_concat_shards_map_children_like_a_single_dataset(tokenizer, corpus):
         graph = build_dataset(
             concat,
             context=make_context(tokenizer),
-            dataset_iteration_policy=make_policy(
-                shuffle=True, dp_world_size=2, dp_rank=rank
-            ),
+            iteration_policy=make_policy(shuffle=True, dp_world_size=2, dp_rank=rank),
         )
         seen.append(token_ids([next(iter(graph)) for _ in range(per_rank)]))
 
@@ -1503,8 +1967,11 @@ def test_restore_failure_preserves_error_when_iterator_close_fails():
     loader._dp_world_size = 1
     loader._rank_id = "dp_rank_0"
     loader._iterator = SimpleNamespace(set_state=set_state, close=close)
+    loader._batch_layout = {}
     with pytest.raises(ValueError, match="invalid cursor") as caught:
-        loader.load_state_dict({"version": 1, "dp_world_size": 1, "dp_rank_0": {}})
+        loader.load_state_dict(
+            {"version": 1, "dp_world_size": 1, "dp_rank_0": {}, "batch_layout": {}}
+        )
     assert caught.value is original
     assert closed == [True]
 
@@ -1533,3 +2000,308 @@ def test_synthetic_resume_rejects_changed_source_configuration(field):
     with pytest.raises(ValueError, match="synthetic data configuration"):
         restored.load_state_dict(saved.state_dict())
     assert restored.state_dict() == before
+
+
+def test_local_sft_recipe_survives_worker_serialization(tokenizer, tmp_path):
+    import pickle
+
+    from llmtuner.datasets.text.recipes import build_local_jsonl_sft
+
+    recipe = build_local_jsonl_sft(
+        path=str(tmp_path / "chat.jsonl"),
+        prompt_field="question",
+        response_field="answer",
+    )
+    restored = pickle.loads(pickle.dumps(recipe))
+    tokenizer.set_chat_template(CHAT_TEMPLATE)
+    context = make_context(tokenizer, max_context_length=32)
+    sample = {"question": "lorem", "answer": "ipsum"}
+    expected = recipe.processor(context=context)(sample, np.random.default_rng(0))
+    actual = restored.processor(context=context)(sample, np.random.default_rng(0))
+    assert expected is not None
+    assert actual is not None
+    np.testing.assert_array_equal(actual.input_ids, expected.input_ids)
+    np.testing.assert_array_equal(actual.labels, expected.labels)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_hf_source_forwards_load_options_and_rejects_dataset_dict(
+    streaming, monkeypatch
+):
+    import datasets
+
+    from llmtuner.datasets.sources import (
+        HuggingFaceRandomAccessSource,
+        HuggingFaceStreamingSource,
+        build_source,
+    )
+
+    seen = {}
+
+    def load(path, **kwargs):
+        seen.update(path=path, **kwargs)
+        return {}
+
+    monkeypatch.setattr(datasets, "load_dataset", load)
+    source_type = (
+        HuggingFaceStreamingSource if streaming else HuggingFaceRandomAccessSource
+    )
+    source = source_type(
+        path="local-corpus",
+        name="subset",
+        split="train",
+        revision="fixed-revision",
+        load_dataset_kwargs={"data_files": "rows.jsonl"},
+    )
+    with pytest.raises(TypeError, match="requires one"):
+        build_source(source, iteration_policy=make_policy())
+    assert seen == {
+        "path": "local-corpus",
+        "name": "subset",
+        "split": "train",
+        "revision": "fixed-revision",
+        "streaming": streaming,
+        "data_files": "rows.jsonl",
+    }
+
+
+def test_multiturn_config_does_not_require_unused_single_turn_fields():
+    config = DataloaderConfig(
+        dataset="local_jsonl_sft",
+        tokenizer_path="tokenizer",
+        dataset_path="chat.jsonl",
+        chat_renderer="Qwen3RendererConfig",
+        prompt_field="",
+        response_field="",
+        messages_field="conversation",
+    )
+    assert config.messages_field == "conversation"
+
+
+@pytest.mark.parametrize("field", ["prompt_field", "response_field"])
+def test_single_turn_config_requires_its_message_fields(field):
+    with pytest.raises(ValueError, match="prompt_field/response_field cannot be empty"):
+        DataloaderConfig(
+            dataset="local_jsonl_sft",
+            tokenizer_path="tokenizer",
+            dataset_path="chat.jsonl",
+            **{field: ""},
+        )
+
+
+def test_synthetic_resume_seeks_without_generating_previous_batches(monkeypatch):
+    loader = RandomTokenDataLoader(seed=42, vocab_size=16, batch_size=2, seq_len=4)
+    checkpoint = loader.state_dict()
+    checkpoint["steps"] = 1_000_000
+    original_randint = torch.randint
+    calls = []
+
+    def capture_randint(*args, **kwargs):
+        calls.append(1)
+        return original_randint(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "randint", capture_randint)
+    loader.load_state_dict(checkpoint)
+    assert calls == []
+    actual = next(iter(loader))
+    assert len(calls) == 1
+    generator = torch.Generator().manual_seed(42 * 100_000 + 1_000_000)
+    expected = original_randint(0, 16, (2, 4), generator=generator)
+    assert torch.equal(actual.input_ids, expected)
+    assert loader.state_dict()["steps"] == 1_000_001
+
+
+def test_synthetic_resume_updates_existing_iterators():
+    settings = dict(
+        seed=42, vocab_size=16, batch_size=4, seq_len=8, dp_rank=1, dp_world_size=2
+    )
+    loader = RandomTokenDataLoader(**settings)
+    active = iter(loader)
+    next(active)
+    checkpoint = loader.state_dict()
+    checkpoint["steps"] = 10
+    loader.load_state_dict(checkpoint)
+
+    reference = RandomTokenDataLoader(**settings)
+    reference.load_state_dict(checkpoint)
+    expected = iter(reference)
+    for cursor in (11, 12):
+        actual = next(active)
+        batch = next(expected)
+        torch.testing.assert_close(actual.input_ids, batch.input_ids)
+        torch.testing.assert_close(actual.labels, batch.labels)
+        assert loader.state_dict()["steps"] == cursor
+
+
+@pytest.mark.parametrize(
+    ("dp_rank", "dp_world_size"), [(True, 1), (1, 1), (-1, 2), (0, 0)]
+)
+def test_loader_rejects_invalid_ownership_before_tokenizer_setup(
+    dp_rank, dp_world_size, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+    from llmtuner.datasets.loader_builder import build_dataloader
+
+    def unexpected_tokenizer(*args, **kwargs):
+        pytest.fail("invalid DP coordinates must fail before loading tokenizer assets")
+
+    monkeypatch.setattr(HuggingFaceTokenizer, "__init__", unexpected_tokenizer)
+    config = SimpleNamespace(
+        dataloader=SimpleNamespace(dataset="local_jsonl"), max_seq_len=16
+    )
+    with pytest.raises(ValueError, match="dp_rank|dp_world_size"):
+        build_dataloader(
+            config,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            num_tokens_per_batch=16,
+        )
+
+
+def test_loader_checks_pipeline_budget_before_loading_tokenizer(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+    from llmtuner.datasets.loader_builder import build_dataloader
+
+    def unexpected_tokenizer(*args, **kwargs):
+        pytest.fail("invalid pipeline token budget must fail before asset loading")
+
+    monkeypatch.setattr(HuggingFaceTokenizer, "__init__", unexpected_tokenizer)
+    config = SimpleNamespace(
+        dataloader=SimpleNamespace(dataset="local_jsonl"),
+        max_seq_len=16,
+        parallel=SimpleNamespace(pipeline_parallel_size=2, num_pp_microbatches=3),
+    )
+    with pytest.raises(ValueError, match="divisible by num_pp_microbatches"):
+        build_dataloader(config, dp_rank=0, dp_world_size=1, num_tokens_per_batch=16)
+
+
+@pytest.mark.parametrize("state", [None, {}, {"epoch": 0}, {"epoch": 0, "hf": None}])
+def test_streaming_cursor_rejects_malformed_checkpoint_state(state):
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    class Source:
+        def state_dict(self):
+            return {}
+
+        def __iter__(self):
+            return iter([{"text": "first"}])
+
+        def load_state_dict(self, value):
+            pytest.fail("malformed state must be rejected before source mutation")
+
+    cursor = HuggingFaceCursorIterator(Source(), repeat=False, shuffle=False)
+    with pytest.raises(ValueError, match="streaming checkpoint"):
+        cursor.set_state(state)
+
+
+@pytest.mark.parametrize("line", ["[]", "null", "42", '"text"'])
+def test_jsonl_source_rejects_non_object_rows(tmp_path, line):
+    from llmtuner.datasets.sources import IndexedJsonlDataSource
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text(line + "\n", encoding="utf-8")
+    source = IndexedJsonlDataSource((str(path),))
+    with pytest.raises(ValueError, match="JSONL row 0.*must be a JSON object"):
+        source[0]
+
+
+@pytest.mark.parametrize("special", ["bos", "eos"])
+def test_explicit_tokenizer_config_false_overrides_native_special_tokens(special):
+    from types import SimpleNamespace
+
+    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+
+    tokenizer = HuggingFaceTokenizer.__new__(HuggingFaceTokenizer)
+    tokenizer.bos_id = 1
+    tokenizer.eos_id = 2
+    tokenizer._hf_config = {f"add_{special}_token": False}
+    tokenizer.tokenizer = SimpleNamespace(
+        encode=lambda text, add_special_tokens=True: SimpleNamespace(
+            ids=[1, 2] if add_special_tokens else [3]
+        )
+    )
+    tokenizer._infer_should_add_bos_eos()
+    expected = [3, 2] if special == "bos" else [1, 3]
+    assert tokenizer.encode("text") == expected
+
+
+@pytest.mark.parametrize("content", ["[]", "null", "42"])
+def test_tokenizer_config_requires_json_object(tmp_path, content):
+    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+
+    path = tmp_path / "tokenizer_config.json"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match="Tokenizer config.*must be a JSON object"):
+        HuggingFaceTokenizer._load_config(str(path))
+
+
+@pytest.mark.parametrize("vocab_file", ["vocab.txt", "vocab.json"])
+def test_vocabulary_only_tokenizer_splits_whitespace(tmp_path, vocab_file):
+    import json
+
+    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+
+    vocab = {"[UNK]": 0, "hello": 1, "world": 2}
+    content = "\n".join(vocab) if vocab_file.endswith("txt") else json.dumps(vocab)
+    (tmp_path / vocab_file).write_text(content, encoding="utf-8")
+    tokenizer = HuggingFaceTokenizer(tokenizer_path=str(tmp_path))
+    assert tokenizer.encode("hello world", add_bos=False, add_eos=False) == [1, 2]
+    assert tokenizer.encode("hello\tworld", add_bos=False, add_eos=False) == [1, 2]
+
+
+def test_text_vocabulary_preserves_token_whitespace(tmp_path):
+    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+
+    (tmp_path / "vocab.txt").write_text("[UNK]\n hello\nworld \n", encoding="utf-8")
+    tokenizer = HuggingFaceTokenizer(tokenizer_path=str(tmp_path))
+    assert tokenizer.token_to_id(" hello") == 1
+    assert tokenizer.token_to_id("world ") == 2
+    assert tokenizer.token_to_id("hello") is None
+
+
+def test_text_vocabulary_rejects_duplicate_tokens(tmp_path):
+    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+
+    (tmp_path / "vocab.txt").write_text("[UNK]\nhello\nhello\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Duplicate token.*line 3"):
+        HuggingFaceTokenizer(tokenizer_path=str(tmp_path))
+
+
+@pytest.mark.parametrize("vocab_file", ["vocab.txt", "vocab.json"])
+def test_bpe_tokenizer_loads_merges_and_decodes(tmp_path, vocab_file):
+    import json
+
+    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+
+    vocab = {
+        token: index
+        for index, token in enumerate(
+            ["h", "e", "l", "o", "he", "hel", "hell", "hello"]
+        )
+    }
+    content = "\n".join(vocab) if vocab_file.endswith("txt") else json.dumps(vocab)
+    (tmp_path / vocab_file).write_text(content, encoding="utf-8")
+    (tmp_path / "merges.txt").write_text(
+        "#version: 0.2\nh e\nhe l\nhel l\nhell o\n", encoding="utf-8"
+    )
+    tokenizer = HuggingFaceTokenizer(tokenizer_path=str(tmp_path))
+    assert tokenizer.encode("hello") == [vocab["hello"]]
+    assert tokenizer.decode([vocab["hello"]]) == "hello"
+
+
+def test_serialized_tokenizer_takes_priority_over_vocabulary(tmp_path):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+
+    Tokenizer(WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")).save(
+        str(tmp_path / "tokenizer.json")
+    )
+    (tmp_path / "vocab.json").write_text("invalid JSON", encoding="utf-8")
+    tokenizer = HuggingFaceTokenizer(tokenizer_path=str(tmp_path))
+    assert tokenizer.encode("hello") == [1]
