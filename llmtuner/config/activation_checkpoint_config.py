@@ -33,7 +33,9 @@ class SelectiveACConfig:
 
     Ported from torchtitan's ``SelectiveAC.Config``: ``preserve_rng_state``,
     ``determinism_check`` and ``debug`` are the same knobs with the same
-    defaults. The save set itself is not configurable (it is
+    defaults, except that ``debug`` must stay false: PyTorch rejects debug
+    tracing with the custom context required by selective checkpointing.
+    The save set itself is not configurable (it is
     ``activation_checkpoint.get_default_save_ops``); these are the per-run
     knobs around it.
 
@@ -45,8 +47,9 @@ class SelectiveACConfig:
       HF models the router living at ``mlp.gate`` is a container (e.g.
       ``Qwen3MoeTopKRouter``), not a ``Linear``, so the pattern matches nothing
       on an HF MoE and the setting silently does nothing; on a dense HF model
-      there is no router at all. Set it to a real ``*.q_proj``/``*.o_proj``
-      style name to use it -- a pattern that matches a non-``Linear`` raises
+      there is no router at all. Use FQN substrings such as ``q_proj`` or
+      ``self_attn.o_proj`` (not shell globs) -- a substring matching a
+      non-``Linear`` raises
       rather than being ignored, so a wrong guess is loud.
     * The shared save set drops ``aten.topk`` (see that function's docstring:
       HF's routers mutate topk's output in place, which torch's selective
@@ -90,12 +93,18 @@ class SelectiveACConfig:
     debug: bool = field(
         default=False,
         metadata={
-            "help": "Capture activation-checkpointing debug information. "
-            "Slower; see torch.utils.checkpoint's documentation for details."
+            "help": "Must stay false: PyTorch checkpoint debug tracing is "
+            "incompatible with selective checkpointing's custom context_fn."
         },
     )
 
     def __post_init__(self) -> None:
+        if self.debug:
+            raise ConfigError(
+                "selective_ac.debug must stay False: PyTorch checkpoint "
+                "debug=True is incompatible with the custom context_fn "
+                "required by selective activation checkpointing."
+            )
         if self.determinism_check not in ("default", "none"):
             raise ConfigError(
                 "selective_ac.determinism_check must be 'default' or 'none', "

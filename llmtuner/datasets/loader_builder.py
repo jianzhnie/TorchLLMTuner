@@ -19,6 +19,7 @@ from .contracts import (
     DatasetIterationPolicy,
     require_positive_integer,
     validate_dp_coordinates,
+    validate_loader_iteration,
 )
 from .dataloader import GrainDataLoader
 from .packing.build import (
@@ -199,6 +200,8 @@ def build_dataloader(
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
         )
+
+    validate_loader_iteration(repeat=repeat, dp_world_size=dp_world_size)
 
     # A name that is neither a text recipe nor ``local_jsonl`` is tried against
     # the multimodal registry.
