@@ -826,3 +826,141 @@ def test_partial_loader_layout_metadata_is_rejected(tmp_path):
         dcp.load(
             target, checkpoint_id=checkpoint, planner=DataloaderLayoutLoadPlanner()
         )
+
+
+def test_async_checkpoint_completion_reports_actual_outcome(
+    tmp_path, monkeypatch, caplog
+):
+    import logging
+    from concurrent.futures import CancelledError, Future
+
+    import pytest
+
+    for outcome in ("success", "failure", "cancelled"):
+        caplog.clear()
+        model = nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters())
+        manager = DistributedCheckpointManager(
+            Config(enable=True, interval=1, keep_latest_k=0, async_mode="async"),
+            model_parts=[model],
+            optimizer=optimizer,
+            lr_scheduler=_schedule(optimizer),
+            states={},
+            folder=str(tmp_path),
+        )
+        future = Future()
+        monkeypatch.setattr(
+            manager, "dcp_save", lambda *args, future=future, **kwargs: future
+        )
+        original = OSError("disk full")
+        with caplog.at_level(logging.INFO):
+            assert manager.save(2)
+            if outcome == "success":
+                future.set_result(None)
+            elif outcome == "failure":
+                future.set_exception(original)
+            else:
+                assert future.cancel()
+        success = "Finished writing the checkpoint for step 2"
+        assert (success in caplog.text) == (outcome == "success")
+        if outcome == "failure":
+            assert "Checkpoint write for step 2 failed: disk full" in caplog.text
+            with pytest.raises(OSError) as caught:
+                manager.maybe_wait_for_saving()
+            assert caught.value is original
+        elif outcome == "cancelled":
+            assert "Checkpoint write for step 2 was cancelled" in caplog.text
+            with pytest.raises(CancelledError):
+                manager.maybe_wait_for_saving()
+        manager.close()
+
+
+def test_async_checkpoint_close_releases_owned_group_after_stager_failure(tmp_path):
+    from types import SimpleNamespace
+
+    import pytest
+    import torch.distributed as dist
+
+    assert not dist.is_initialized()
+    dist.init_process_group(
+        "gloo", init_method=(tmp_path / "rendezvous").as_uri(), rank=0, world_size=1
+    )
+    manager = None
+    try:
+        model = nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters())
+        manager = DistributedCheckpointManager(
+            Config(enable=True, keep_latest_k=0, async_mode="async"),
+            model_parts=[model],
+            optimizer=optimizer,
+            lr_scheduler=_schedule(optimizer),
+            states={},
+            folder=str(tmp_path),
+        )
+        group = manager.pg
+        assert group is not None
+        assert dist.get_process_group_ranks(group) == [0]
+        original = OSError("stager close failed")
+
+        def close():
+            raise original
+
+        manager.stager = SimpleNamespace(close=close)
+        with pytest.raises(OSError) as caught:
+            manager.close()
+        assert caught.value is original
+        assert manager.pg is None and manager.stager is None
+        with pytest.raises(KeyError):
+            dist.get_process_group_ranks(group)
+        assert dist.is_initialized() and dist.get_world_size() == 1
+        dist.barrier()
+        manager.close()
+    finally:
+        if manager is not None:
+            manager.close()
+        dist.destroy_process_group()
+
+
+def test_failed_retention_thread_start_releases_async_group(tmp_path, monkeypatch):
+    import threading
+
+    import pytest
+    import torch.distributed as dist
+
+    assert not dist.is_initialized()
+    dist.init_process_group(
+        "gloo", init_method=(tmp_path / "rendezvous").as_uri(), rank=0, world_size=1
+    )
+    created = []
+    new_group = dist.new_group
+    original = RuntimeError("cannot start retention thread")
+
+    def track_group(*args, **kwargs):
+        group = new_group(*args, **kwargs)
+        created.append(group)
+        return group
+
+    def fail_start(self):
+        raise original
+
+    monkeypatch.setattr(dist, "new_group", track_group)
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    try:
+        model = nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters())
+        with pytest.raises(RuntimeError) as caught:
+            DistributedCheckpointManager(
+                Config(enable=True, keep_latest_k=2, async_mode="async"),
+                model_parts=[model],
+                optimizer=optimizer,
+                lr_scheduler=_schedule(optimizer),
+                states={},
+                folder=str(tmp_path),
+            )
+        assert caught.value is original
+        assert len(created) == 1
+        with pytest.raises(KeyError):
+            dist.get_process_group_ranks(created[0])
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()

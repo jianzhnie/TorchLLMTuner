@@ -125,6 +125,9 @@ class ProfilerConfig:
             self, "profiler_active", "memory_snapshot_max_entries", group="profiler"
         )
         require_at_least(self, "profiler_warmup", group="profiler", minimum=0)
+        for name in ("profiler_repeat", "profiler_skip_first"):
+            if getattr(self, name) is not None:
+                require_at_least(self, name, group="profiler", minimum=0)
 
 
 # HfArgumentParser cannot turn a nested dataclass into a set of flags -- it

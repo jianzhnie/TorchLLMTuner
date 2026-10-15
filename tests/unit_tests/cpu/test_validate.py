@@ -4,9 +4,9 @@ Everything here runs single-process on CPU: the pass's two loud errors (zero
 batches, zero valid tokens), the token-normalized reporting loss, the
 eval/train mode bracketing, and the build-time rejection of the combinations
 that cannot terminate cleanly (``steps=-1`` with DP > 1 or an infinite corpus,
-and pipeline parallelism). The cross-rank reductions are exercised only in
-their single-rank identity form; the multi-rank semantics share the training
-loss's meshes and need a real cluster to verify.
+and finite distributed datasets). These unit tests exercise reductions in
+their single-rank identity form; validation_reduction_equivalence.py separately
+checks real four-rank CPU/Gloo DP x CP and DP x TP reduction semantics.
 """
 
 from __future__ import annotations

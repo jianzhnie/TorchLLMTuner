@@ -288,6 +288,7 @@ def test_a_third_of_the_way_through_warmup_is_a_third_of_the_lr() -> None:
     assert _lrs(scheduler)[0] == pytest.approx(0.9 * 2 / 3)
 
 
+@pytest.mark.filterwarnings("error:To get the last learning rate computed")
 def test_scheduler_restore_uses_optimizer_restored_initial_lr():
     original_optimizer = _optimizer(lr=1.0)
     original = build_lr_scheduler(
