@@ -520,24 +520,26 @@ class BaseCheckpointManager(ABC):
 
         Note:
             Not remote friendly: one ``listdir`` plus a metadata probe per step
-            folder, each a network round trip on remote (fsspec) storage rather
-            than a single batched listing. Acceptable because it runs once, at
-            load time.
+            folder until a resumable checkpoint is found. Newest-first probing
+            avoids reading older metadata after the result is known, especially
+            on remote storage.
         """
         folder = folder or self.folder
         if not self._storage.isdir(folder):
             return -1
 
-        resumable_steps = []
+        candidates = []
         for dirname in self._storage.listdir(folder):
             step = self._parse_step(dirname)
             if step is None:
                 continue
             if max_step is not None and step > max_step:
                 continue
+            candidates.append((step, dirname))
+        for step, dirname in sorted(candidates, reverse=True):
             if self._is_resumable_checkpoint(filesystem.join(folder, dirname)):
-                resumable_steps.append(step)
-        return max(resumable_steps) if resumable_steps else -1
+                return step
+        return -1
 
     def _purge_stale_checkpoints(
         self,

@@ -80,6 +80,8 @@ def main():
                 group = manager.pg
                 assert group is not None
                 assert manager.save(1)
+                # A newer native model-only export must not hide the resume.
+                assert manager.save(2, last_step=True)
                 manager.close()
                 manager.close()
                 assert_group_released(group)
@@ -101,7 +103,8 @@ def main():
                 )
                 active.append(resumed)
                 resumed_group = resumed.pg
-                assert resumed.load(1)
+                assert resumed._find_load_step() == 1
+                assert resumed.load(-1)
                 torch.testing.assert_close(resumed_model.state_dict(), saved_model)
                 resumed.close()
                 assert_group_released(resumed_group)

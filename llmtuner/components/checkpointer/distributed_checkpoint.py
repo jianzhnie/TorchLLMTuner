@@ -67,7 +67,14 @@ from .base import (
     BaseCheckpointManager,
     purge_thread,
 )
-from .checkpoint_keys import DATALOADER, EMA, LR_SCHEDULER, MODEL, SAFETENSORS_INDEX
+from .checkpoint_keys import (
+    DATALOADER,
+    EMA,
+    LR_SCHEDULER,
+    MODEL,
+    OPTIMIZER,
+    SAFETENSORS_INDEX,
+)
 from .storage import FilesystemCheckpointStorage
 
 logger = get_logger(__name__)
@@ -617,10 +624,23 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         save_future.result()
 
     def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
-        return self._storage.isfile(filesystem.join(checkpoint_dir, ".metadata"))
+        if not self._storage.isfile(filesystem.join(checkpoint_dir, ".metadata")):
+            return False
+        if self._parse_step(os.path.basename(checkpoint_dir)) == 0:
+            # Seed checkpoints intentionally restore only model state.
+            return True
+        from torch.distributed.checkpoint._storage_utils import _storage_setup
+
+        reader = _storage_setup(None, checkpoint_dir, reader=True)
+        assert reader is not None
+        keys = reader.read_metadata().state_dict_metadata
+        return all(
+            any(key == name or key.startswith(f"{name}.") for key in keys)
+            for name in (OPTIMIZER, LR_SCHEDULER)
+        )
 
     def _is_valid_checkpoint(self, checkpoint_dir: str) -> bool:
-        return self._is_resumable_checkpoint(checkpoint_dir) or (
+        return self._storage.isfile(filesystem.join(checkpoint_dir, ".metadata")) or (
             self._storage.isfile(filesystem.join(checkpoint_dir, SAFETENSORS_INDEX))
         )
 
