@@ -323,7 +323,7 @@ _REDUCE_OPS = {
 
 
 def all_reduce(
-    data: torch.Tensor, op: str = "sum", group: dist.ProcessGroup | None = None
+    data: torch.Tensor, *, op: str = "sum", group: dist.ProcessGroup | None = None
 ) -> None:
     """In-place all-reduce; a no-op outside a distributed environment.
 
@@ -331,8 +331,17 @@ def all_reduce(
     casts the tensor to the group's comm device first and copies the result
     back, so a CPU tensor reduces correctly over an NCCL/HCCL group (the
     trainer's loss/token denominators are CPU scalars). ``op="mean"`` is
-    emulated as sum + divide because c10d has no mean reduction.
+    emulated as sum + divide and requires floating or complex data so copying
+    back cannot silently truncate a fractional result. Arguments are validated
+    even when no process group is initialized.
     """
+    op = op.lower()
+    if op not in _REDUCE_OPS and op != "mean":
+        raise ValueError(
+            f"reduce op should be one of {list(_REDUCE_OPS)} or 'mean', but got {op}"
+        )
+    if op == "mean" and not (data.is_floating_point() or data.is_complex()):
+        raise TypeError("in-place mean reduction requires a floating or complex tensor")
     world_size = get_world_size(group)
     if world_size <= 1:
         return
@@ -343,15 +352,10 @@ def all_reduce(
     backend_device = get_comm_device(group)
     data_on_device = move_tensor_tree(data, backend_device)
 
-    if op.lower() == "mean":
-        dist.all_reduce(data_on_device, _REDUCE_OPS["sum"], group)
-        # true_divide because int64 tensors reject in-place true division.
-        data_on_device = torch.true_divide(data_on_device, world_size)
-    elif op.lower() in _REDUCE_OPS:
-        dist.all_reduce(data_on_device, _REDUCE_OPS[op.lower()], group)
+    if op == "mean":
+        dist.all_reduce(data_on_device, op=_REDUCE_OPS["sum"], group=group)
+        data_on_device.div_(world_size)
     else:
-        raise ValueError(
-            f"reduce op should be one of {list(_REDUCE_OPS)} or 'mean', but got {op}"
-        )
+        dist.all_reduce(data_on_device, op=_REDUCE_OPS[op], group=group)
 
     move_tensor_tree(data_on_device, input_device, out=data)

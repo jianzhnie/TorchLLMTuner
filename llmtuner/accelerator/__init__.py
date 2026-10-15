@@ -19,15 +19,15 @@ a sibling submodule (``llmtuner.accelerator.device`` ...) does not pay for it
 unless a toolbox name is actually touched. ``collectives`` /
 ``spmd`` is imported as a submodule -- re-exporting it would make
 ``import llmtuner.accelerator`` pull in the parallel and trainer layers and
-close an import cycle. Topology construction (``build_parallel_topology`` /
-``build_mesh``) lives with ``ParallelTopology`` in
+close an import cycle. Topology construction (``resolve_parallel_topology`` /
+``build_device_mesh``) lives with ``ParallelTopology`` in
 ``llmtuner/parallel/topology.py``; the trainer bootstraps its PG via
 ``distributed.init_dist_pytorch``.
 """
 
 from __future__ import annotations
 
-from ..utils.lazy_exports import export_names, resolve_export
+from ..utils.lazy_exports import resolve_export
 
 _EXPORT_SOURCES = {
     "barrier": "distributed",
@@ -45,7 +45,7 @@ _EXPORT_SOURCES = {
     "master_only": "distributed",
 }
 
-__all__ = export_names(_EXPORT_SOURCES)
+__all__ = sorted(_EXPORT_SOURCES)
 
 
 def __getattr__(name: str):
@@ -54,4 +54,4 @@ def __getattr__(name: str):
 
 
 def __dir__() -> list[str]:
-    return export_names(_EXPORT_SOURCES)
+    return sorted(_EXPORT_SOURCES)

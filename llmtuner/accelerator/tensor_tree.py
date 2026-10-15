@@ -92,7 +92,7 @@ def _move(data: Any, device: torch.device, out: Any = None) -> Any:
     return type(data)(moved)
 
 
-def move_tensor_tree(data: Any, device: torch.device, out: Any = None) -> Any:
+def move_tensor_tree(data: Any, device: torch.device | str, *, out: Any = None) -> Any:
     """Move tensor leaves, preserving containers and optionally copying to out.
 
     ``out`` must have identical container types, keys, lengths, and tensor shapes.
