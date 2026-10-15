@@ -68,17 +68,17 @@ only adds, and is refused at the point the shared expert is found.
 
 from __future__ import annotations
 
+import torch.distributed as dist
 import torch.nn as nn
 
-from llmtuner.errors import (
-    EnvironmentUnsupportedError,
-    UnsupportedCombinationError,
-)
+from llmtuner.errors import UnsupportedCombinationError
 
+from ...config.expert_parallel_config import validate_expert_dispatcher
+from ...models.common.aux_loss import AuxLoss
+from ...models.common.moe.layer import MoE
 from ...utils.logging import get_logger
 from .block_conversion import convert_block
 from .hf_inspection import is_hf_moe_block, moe_block_of, router_of
-from .token_dispatch import EP_DISPATCHER_BACKENDS
 
 logger = get_logger(__name__)
 
@@ -88,7 +88,7 @@ __all__ = ["swap_hf_moe_blocks"]
 def swap_hf_moe_blocks(
     model: nn.Module,
     *,
-    ep_group=None,
+    ep_group: dist.ProcessGroup | None = None,
     router_aux_loss_coef: float | None = None,
     quantile_balancing: bool = False,
     fixed_router: bool = False,
@@ -114,6 +114,7 @@ def swap_hf_moe_blocks(
             optimizer step instead of nudged by the sign rule, and
             ``load_balance_coeff`` is forced off. Requires sigmoid router
             scores and no group-limited routing.
+        fixed_router: use deterministic balanced expert selection for debug runs.
         token_dispatcher: EP dispatch backend (``"alltoall"`` default,
             ``"torchao"`` optional-import adapter, ``"deepep"``/``"hybridep"``
             registered gaps refused here). See
@@ -130,8 +131,8 @@ def swap_hf_moe_blocks(
         Qwen3Moe's ``decoder_sparse_step``) swap only the sparse layers.
 
     Raises:
-        TypeError: if no layer carries a recognizable HF MoE block. EP on a
-            dense model is a config mistake, and silently swapping nothing
+        UnsupportedCombinationError: if no layer carries a recognizable HF MoE
+            block. EP on a dense model is a config mistake; swapping nothing
             would run it replicated.
         NotImplementedError: if a MoE block uses a layout this swap does not
             implement -- GPT-OSS's transposed, bias-bearing experts (see
@@ -147,17 +148,7 @@ def swap_hf_moe_blocks(
     # Backend gating, before any probing: ParallelConfig.__post_init__ is the
     # primary gate; this is the defensive copy for callers that reach the swap
     # directly.
-    if token_dispatcher not in EP_DISPATCHER_BACKENDS:
-        raise ValueError(
-            f"unknown ep_token_dispatcher {token_dispatcher!r}; expected one "
-            f"of {EP_DISPATCHER_BACKENDS}."
-        )
-    if token_dispatcher in ("deepep", "hybridep", "mc2"):
-        raise EnvironmentUnsupportedError(
-            f"ep_token_dispatcher={token_dispatcher!r} is a registered gap: "
-            "CUDA-only kernels plus torchtitan's distributed/deepep/ wrappers "
-            "that llmtuner does not vendor. Use 'alltoall' meanwhile."
-        )
+    validate_expert_dispatcher(token_dispatcher)
 
     hf_config = getattr(getattr(model, "model", None), "config", None)
     aux_loss_coeff = (
@@ -173,38 +164,65 @@ def swap_hf_moe_blocks(
     # frozen zero bias never lands in the checkpoint.
     default_coeff = getattr(hf_config, "load_balance_coeff", 1e-3)
 
-    swapped = 0
+    # Probe every layer before constructing replacements: a later unsupported
+    # expert layout must not leave earlier layers converted.
+    candidates: list[tuple[nn.Module, str, nn.Module]] = []
     for layer in layers:
         attr, block = moe_block_of(layer)
         # Dense layers of a mixed model (Qwen3Moe's decoder_sparse_step, and the
         # first_k_dense_replace of the DeepSeek/GLM4 families) are left alone.
         if block is None or not is_hf_moe_block(block):
             continue
-        router_gate = router_of(block)
-        load_balance_coeff = (
-            float(default_coeff)
-            if getattr(router_gate, "e_score_correction_bias", None) is not None
-            else None
+        candidates.append((layer, attr, block))
+
+    if not candidates:
+        raise UnsupportedCombinationError(
+            f"no HF MoE block found on {type(model).__name__} "
+            f"({type(getattr(model, 'model', model)).__name__}): no layer's "
+            "``mlp`` has the router-gate + fused gate_up_proj/down_proj shape "
+            "this swap recognizes. Add the model family's layout to the probe "
+            "in parallel/expert_parallel/hf_inspection.py."
         )
-        moe = convert_block(
-            block,
-            ep_group=ep_group,
-            aux_loss_coeff=aux_loss_coeff,
-            load_balance_coeff=load_balance_coeff,
-            quantile_balancing=quantile_balancing,
-            token_dispatcher=token_dispatcher,
-            torchao_pad_multiple=torchao_pad_multiple,
-            tp_enabled=tp_enabled,
-        )
-        # The router already owns the deterministic balanced selection used by
-        # equivalence/debug runs; expose the FSDPTurbo plan flag without
-        # duplicating routing logic in each dispatcher.
-        moe.router._debug_force_load_balance = fixed_router
+
+    replacements: list[tuple[nn.Module, str, MoE]] = []
+    aux_group_counts = dict(AuxLoss._group_counts)
+    try:
+        for layer, attr, block in candidates:
+            router_gate = router_of(block)
+            load_balance_coeff = (
+                float(default_coeff)
+                if getattr(router_gate, "e_score_correction_bias", None) is not None
+                else None
+            )
+            moe = convert_block(
+                block,
+                ep_group=ep_group,
+                aux_loss_coeff=aux_loss_coeff,
+                load_balance_coeff=load_balance_coeff,
+                quantile_balancing=quantile_balancing,
+                token_dispatcher=token_dispatcher,
+                torchao_pad_multiple=torchao_pad_multiple,
+                tp_enabled=tp_enabled,
+            )
+            # The router already owns the deterministic balanced selection used by
+            # equivalence/debug runs; expose the FSDPTurbo plan flag without
+            # duplicating routing logic in each dispatcher.
+            moe.router._debug_force_load_balance = fixed_router
+            replacements.append((layer, attr, moe))
+    except Exception:
+        # Failed construction must not inflate auxiliary-loss metric divisors.
+        AuxLoss._group_counts.clear()
+        AuxLoss._group_counts.update(aux_group_counts)
+        raise
+
+    # Install only after every replacement was constructed successfully.
+    # A later conversion error must not leave a mixture of HF and native blocks.
+    for layer, attr, moe in replacements:
         # Replace in the slot the block was actually found in. Writing to a
         # different attribute would leave the original block in place and route
         # around the swap entirely.
         setattr(layer, attr, moe)
-        # FSDP's MoE branch (fully_shard/fsdp.py) keys off these two
+        # FSDP's MoE branch (fully_shard_parallel/plan.py) keys off these two
         # attributes, as does upstream's swap (moe_replacement.py):
         # ``moe_enabled`` marks the block as sparse, and ``moe`` is where the
         # branch reads the expert weights from. Without them the experts are
@@ -215,15 +233,6 @@ def swap_hf_moe_blocks(
         # weight in the state_dict.
         layer.moe_enabled = True
         object.__setattr__(layer, "moe", moe)
-        swapped += 1
 
-    if swapped == 0:
-        raise UnsupportedCombinationError(
-            f"no HF MoE block found on {type(model).__name__} "
-            f"({type(getattr(model, 'model', model)).__name__}): no layer's "
-            "``mlp`` has the router-gate + fused gate_up_proj/down_proj shape "
-            "this swap recognizes. Add the model family's layout to the probe "
-            "in parallel/expert_parallel/model_replacement.py."
-        )
-    logger.info("Swapped %d HF MoE blocks for llmtuner MoE blocks", swapped)
-    return swapped
+    logger.info("Swapped %d HF MoE blocks for llmtuner MoE blocks", len(replacements))
+    return len(replacements)

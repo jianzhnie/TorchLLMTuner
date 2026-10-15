@@ -43,12 +43,13 @@ from collections.abc import Callable
 
 import torch
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 
-from llmtuner.config import CompileConfig
+from llmtuner.config.compile_config import CompileConfig
 from llmtuner.errors import EnvironmentUnsupportedError
 
 from ..accelerator.capabilities import has
-from ..models.common.moe.layer import iter_moe_layers
+from ..models.common.moe.layer import collect_moe_layers
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -56,16 +57,11 @@ logger = get_logger(__name__)
 __all__ = ["apply_compile", "maybe_regional_inductor"]
 
 
-# TP group names already registered for symmetric memory, so the per-chunk
-# calls under pipeline parallelism register each group exactly once.
-_symm_mem_enabled_groups: set[str] = set()
-
-
 def apply_compile(
     model: nn.Module,
     *,
     compile_config: CompileConfig | None = None,
-    tp_mesh=None,
+    tp_mesh: DeviceMesh | None = None,
 ) -> nn.Module:
     """Compile ``model`` according to ``compile_config``; returns the model.
 
@@ -80,10 +76,14 @@ def apply_compile(
     """
     if compile_config is None:
         compile_config = CompileConfig()
+    layers = getattr(model, "layers", None)
+    if compile_config.per_block and not isinstance(layers, nn.Module):
+        raise TypeError("per_block compile requires a model with a .layers module")
 
+    backend = maybe_regional_inductor_backend(model, compile_config.backend)
     maybe_enable_async_tp(compile_config, tp_mesh)
 
-    if iter_moe_layers(model):
+    if collect_moe_layers(model):
         # Token-choice dispatch sizes its expert splits from the routing,
         # so the compiled graph has data-dependent shapes. Dense models
         # never touch the flag, keeping their trace bitwise unchanged.
@@ -97,10 +97,8 @@ def apply_compile(
         torch._dynamo.config.capture_scalar_outputs = True
         logger.info("capture_scalar_outputs is enabled (token-choice MoE)")
 
-    backend = maybe_regional_inductor_backend(model, compile_config.backend)
-
     if compile_config.per_block:
-        for layer_id, block in model.layers.named_children():
+        for layer_id, block in layers.named_children():
             # Module.compile, not torch.compile(block): it sets the compiled
             # call impl in place, so the layer keeps its identity for FSDP
             # and the state dict.
@@ -112,7 +110,9 @@ def apply_compile(
     return torch.compile(model, backend=backend)
 
 
-def maybe_enable_async_tp(compile_config: CompileConfig, tp_mesh) -> None:
+def maybe_enable_async_tp(
+    compile_config: CompileConfig, tp_mesh: DeviceMesh | None
+) -> None:
     """Configure Inductor's async TP pass for the TP mesh.
 
     Every precondition is checked here and fails loudly: async TP asked for
@@ -145,14 +145,15 @@ def maybe_enable_async_tp(compile_config: CompileConfig, tp_mesh) -> None:
             f"which this torch ({torch.__version__}) does not carry. Upgrade "
             "torch, or run without async TP."
         )
+    if tp_mesh.ndim != 1 or tp_mesh.size() <= 1:
+        raise ValueError("async TP requires a one-dimensional TP mesh with size > 1")
     from torch.distributed._symmetric_memory import enable_symm_mem_for_group
 
     group_name = tp_mesh.get_group().group_name
-    if group_name not in _symm_mem_enabled_groups:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            enable_symm_mem_for_group(group_name)
-        _symm_mem_enabled_groups.add(group_name)
+    # PyTorch owns registration and already returns early for registered groups.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        enable_symm_mem_for_group(group_name)
 
     inductor_config._micro_pipeline_tp = True
     logger.info("Async TP is enabled")

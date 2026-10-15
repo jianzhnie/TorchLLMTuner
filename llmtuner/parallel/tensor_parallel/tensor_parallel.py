@@ -43,7 +43,7 @@ usual), no fused QKV (HF keeps q/k/v as separate projections), no FP8.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -51,7 +51,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
-from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import ParallelConfig
 
 from ...accelerator.capabilities import has
 from ...models.common.moe.experts import GroupedExperts
@@ -138,7 +138,9 @@ class ColumnParallelLinear(nn.Module):
         # the HF decoder feeds [B, T, K] hidden states: fold the leading dims
         # and restore them after, with the row count multiplied by tp_size --
         # that is the all-gathered sequence length.
-        if x.ndim > 2 and x.shape[0] != 1:
+        if x.ndim not in (2, 3):
+            raise ValueError("TP projection input must be [T, K] or [1, T, K]")
+        if x.ndim == 3 and x.shape[0] != 1:
             raise ValueError(
                 "TP realizers gather/reduce rows in rank order; a batched "
                 f"[B, T, K] input with B={x.shape[0]} would interleave batches "
@@ -153,7 +155,7 @@ class ColumnParallelLinear(nn.Module):
             )
         else:
             y_2d = all_gather_linear(x_2d, self.weight, self.group)
-        return y_2d.reshape(*lead[:-1], lead[-1] * self.tp_size, -1)
+        return y_2d.reshape(*lead[:-1], lead[-1] * self.tp_size, y_2d.shape[-1])
 
 
 class RowParallelLinear(nn.Module):
@@ -193,7 +195,9 @@ class RowParallelLinear(nn.Module):
         # Mirror of ColumnParallelLinear.forward: fold to 2D for the collective, then
         # restore the leading dims with the row count divided by tp_size --
         # that is the reduce-scattered sequence shard.
-        if x.ndim > 2 and x.shape[0] != 1:
+        if x.ndim not in (2, 3):
+            raise ValueError("TP projection input must be [T, K] or [1, T, K]")
+        if x.ndim == 3 and x.shape[0] != 1:
             raise ValueError(
                 "TP realizers gather/reduce rows in rank order; a batched "
                 f"[B, T, K] input with B={x.shape[0]} would interleave batches "
@@ -208,7 +212,7 @@ class RowParallelLinear(nn.Module):
             )
         else:
             y_2d = linear_reduce_scatter(x_2d, self.weight, self.group)
-        return y_2d.reshape(*lead[:-1], lead[-1] // self.tp_size, -1)
+        return y_2d.reshape(*lead[:-1], lead[-1] // self.tp_size, y_2d.shape[-1])
 
 
 class ColwiseLinearNoGather(nn.Module):
@@ -307,7 +311,7 @@ class ReplicatedAttentionSequenceBoundary:
 # The HF tp_plan spec strings that declare MoE-under-TP (transformers 5.x
 # spelling, e.g. Qwen3Moe's ``base_model_tp_plan``). They name no nn.Linear --
 # the expert weights are stacked parameters on the experts module -- so they
-# resolve to None in the plan and are realized structurally by ``_apply_moe_tp``
+# resolve to None in the plan and are realized by ``realize_moe_blocks_tp``
 # below, which is what keeps the refusal-to-replicate validation honest.
 MOE_PLAN_SPECS = frozenset({"packed_colwise", "packed_rowwise", "moe_tp_experts"})
 
@@ -369,10 +373,9 @@ def shard_shared_expert_for_tp(
     all-reduce excludes them (their gradients are complete per shard, exactly
     like the routed experts').
     """
-    shared_name = (
-        "shared_expert" if hasattr(block, "shared_expert") else "shared_experts"
-    )
-    shared = getattr(block, shared_name, None)
+    from ..expert_parallel.hf_inspection import resolve_shared_expert
+
+    shared_name, shared = resolve_shared_expert(block)
     assert shared is not None  # the caller checked
     names: set[str] = set()
     for name, dim in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
@@ -389,6 +392,32 @@ def shard_shared_expert_for_tp(
             proj.in_features = proj.weight.shape[1]
         names.add(f"{shared_name}.{name}.weight")
     return names
+
+
+def expert_tp_hidden_size(block: nn.Module, *, tp_size: int) -> int:
+    """Validate packed expert geometry and return the unsharded F dimension."""
+    gate_up = block.experts.gate_up_proj
+    down = block.experts.down_proj
+    if gate_up.ndim != 3 or down.ndim != 3:
+        raise ValueError("TP expert weights must be three-dimensional")
+    num_experts, double_hidden, dim = gate_up.shape
+    if down.shape[0] != num_experts or down.shape[1] != dim:
+        raise ValueError(
+            f"unrecognized expert weight shapes for TP sharding: "
+            f"gate_up_proj {tuple(gate_up.shape)}, down_proj {tuple(down.shape)}"
+        )
+    hidden = down.shape[2]
+    if double_hidden != 2 * hidden:
+        raise ValueError(
+            f"gate_up_proj {tuple(gate_up.shape)} is not (E, 2F, D) against "
+            f"down_proj's F={hidden}; the gate/up halves cannot be located."
+        )
+    if hidden % tp_size != 0:
+        raise ValueError(
+            f"expert hidden dim F={hidden} is not divisible by tp_size={tp_size}; "
+            "each TP rank must hold the same F-shard of every expert."
+        )
+    return hidden
 
 
 def shard_experts_for_tp(
@@ -418,23 +447,7 @@ def shard_experts_for_tp(
     experts = block.experts
     gate_up = experts.gate_up_proj
     down = experts.down_proj
-    num_experts, double_hidden, dim = gate_up.shape
-    if down.shape[0] != num_experts or down.shape[1] != dim:
-        raise ValueError(
-            f"unrecognized expert weight shapes for TP sharding: "
-            f"gate_up_proj {tuple(gate_up.shape)}, down_proj {tuple(down.shape)}"
-        )
-    hidden = down.shape[2]
-    if double_hidden != 2 * hidden:
-        raise ValueError(
-            f"gate_up_proj {tuple(gate_up.shape)} is not (E, 2F, D) against "
-            f"down_proj's F={hidden}; the gate/up halves cannot be located."
-        )
-    if hidden % tp_size != 0:
-        raise ValueError(
-            f"expert hidden dim F={hidden} is not divisible by tp_size={tp_size}; "
-            "each TP rank must hold the same F-shard of every expert."
-        )
+    hidden = expert_tp_hidden_size(block, tp_size=tp_size)
 
     def _shard(w: torch.Tensor, dim_: int) -> torch.Tensor:
         return torch.chunk(w.detach(), tp_size, dim=dim_)[tp_rank].contiguous()
@@ -485,7 +498,7 @@ def rowwise() -> ShardingConfig:
 # -- engine -------------------------------------------------------------------
 
 
-def model_tp_plan(model: nn.Module) -> dict:
+def model_tp_plan(model: nn.Module) -> Mapping[str, str | ShardingConfig]:
     """The TP plan ``model`` declares, or ``{}``.
 
     Prefers the ``tp_plan`` property over the raw ``_tp_plan`` attribute.
@@ -500,48 +513,19 @@ def model_tp_plan(model: nn.Module) -> dict:
     return getattr(model, "tp_plan", None) or getattr(model, "_tp_plan", None) or {}
 
 
-def resolve_plan(model: nn.Module, plan) -> dict[str, ShardingConfig | None]:
-    """Normalize a plan into ``{module_path_pattern: ShardingConfig}``.
+def resolve_tp_sharding_plan(
+    model: nn.Module, *, plan: Mapping[str, str | ShardingConfig] | None = None
+) -> dict[str, ShardingConfig | None]:
+    """Normalize an explicit or model-declared TP plan for dense projections.
 
-    ``plan`` may be ``None`` (use the model's declared plan), a map of patterns
-    to ``ShardingConfig``, or a map of patterns to strings (the form HF ships).
+    Patterns retain insertion order. Colwise/rowwise specs become ShardingConfig;
+    replicated specs become None so matching leaves their modules intact.
+    Replicated projection gradients are reduced by the trainer.
 
-    HF's ``colwise`` and ``rowwise`` specs map onto realizers. Specs that require
-    a replicated result (``replicated_with_grad_allreduce`` and the newer
-    ``colwise_gather_output`` used for ``lm_head``) are left whole on every
-    rank; the trainer's own
-    ``_allreduce_replicated_tp_grads`` already sums. That last one is not
-    decoration: Qwen3's plan marks ``q_norm`` / ``k_norm`` with it, and without
-    this branch every Qwen3 TP run dies here before touching a weight.
-
-    HF's MoE specs (``packed_colwise``, ``packed_rowwise``,
-    ``moe_tp_experts``) resolve to None here: they declare MoE-under-TP --
-    routed expert weights sharded on the expert hidden dim F (``gate_up_proj``
-    on its packed output dim, ``down_proj`` on its input dim), the router held
-    Replicate -- and they name stacked parameters on the experts module, not
-    nn.Linear modules, so there is nothing for the per-Linear engine to swap.
-    They are realized structurally by ``_apply_moe_tp`` (weight sharding in
-    ``shard_experts_for_tp``, activation collectives in
-    ``TPMoeSequenceBoundary``), which ``apply_tp`` invokes when the raw plan
-    carries any of these specs. This is llmtuner's counterpart to upstream's
-    ``models/common/moe_sharding.py`` declarations; see
-    docs/llmtuner_upstream_map.md (D: ``models/common/moe_sharding.py``).
-    EP-plan strings (``grouped_gemm``, ``ep_router``) are not TP declarations
-    and still raise.
-
-    When ``plan`` is omitted the model's own declaration is used (see
-    ``model_tp_plan``).
-
-    What is *not* here: HF's replicated-activation styles. ``colwise_rep`` /
-    ``rowwise_rep`` (shard the weight, keep the activation full --
-    ``ColwiseParallel(output_layouts=Replicate())`` and its dual) and the
-    ``local_*`` / ``gather`` / ``replicate`` / ``sequence_parallel`` MoE-side
-    styles describe a DTensor layout whose activations never leave Replicate,
-    while this engine's GEMMs are the sequence-parallel pair (gather in,
-    reduce-scatter out). Realizing them faithfully would mean a second,
-    replicated-activation TP path; the models that ship those plans (Apertus,
-    GLM-4V, Phi-4-multimodal, Llama-4, FlexOlmo) are therefore refused rather
-    than run with a layout their neighbouring ops do not expect.
+    MoE specs also become None: they name stacked expert parameters rather than
+    nn.Linear modules. resolve_tp_targets reads the raw plan to select the
+    structural MoE path. EP specs and unsupported replicated-activation layouts
+    raise instead of silently applying sequence-parallel realizers.
     """
     if plan is None:
         plan = model_tp_plan(model)
@@ -585,21 +569,16 @@ def resolve_plan(model: nn.Module, plan) -> dict[str, ShardingConfig | None]:
     return resolved
 
 
-def match(
-    plan: dict[str, ShardingConfig | None], module_path: str
+def match_tp_sharding_spec(
+    module_path: str, *, plan: dict[str, ShardingConfig | None]
 ) -> ShardingConfig | None:
-    """The first pattern in ``plan`` that matches ``module_path``.
+    """Return the first matching TP specification, preserving plan order.
 
-    The None entries are plans that deliberately declare a projection *not*
-    sharded; for those first-match-wins is load-bearing, because ``match``
-    walks the plan in insertion order and stops at the first hit. Returning
-    None from them is indistinguishable from "no pattern matched" to the
-    caller, which is correct here -- both mean "leave this module alone" -- but
-    it does mean a sharded pattern sitting *after* a replicated one in the plan
-    can never win for the same path.
+    A matching ``None`` entry leaves the module replicated and stops lookup;
+    later sharding patterns cannot override it. No match also returns ``None``.
     """
     for pattern, spec in plan.items():
-        if module_name_matches(pattern, module_path):
+        if module_name_matches(module_path, pattern=pattern):
             return spec
     return None
 
@@ -682,17 +661,47 @@ def tp_sharded_param_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
     return sharded_ids
 
 
-def resolve_tp_targets(model: nn.Module, cfg: ParallelConfig, plan):
+def resolve_tp_targets(
+    model: nn.Module,
+    *,
+    cfg: ParallelConfig,
+    plan: Mapping[str, str | ShardingConfig] | None = None,
+) -> tuple[list[tuple[str, nn.Linear, ShardingConfig]], list[tuple[str, nn.Module]]]:
     """Validate the TP plan and split its matches into dense and MoE targets.
 
-    Returns ``(sharding_plan, targets, moe_blocks, moe_deferred_to_ep)`` where
+    Returns ``(targets, moe_blocks)`` where
     ``targets`` are ``(module_path, nn.Linear, ShardingConfig)`` triples and
     ``moe_blocks`` are the HF MoE blocks to realize in place. A plan that
     resolves to nothing, or that matches no module, used to leave the model
     fully replicated while the run reported a healthy TP setup -- both are
     loud errors here, raised before any process-group access.
     """
-    sharding_plan = resolve_plan(model, plan)
+    configured_plan: dict[str, str] = {}
+    for pattern in cfg.tp_colwise_modules:
+        configured_plan[pattern] = "colwise"
+    for pattern in cfg.tp_rowwise_modules:
+        if pattern in configured_plan:
+            raise ValueError(f"TP pattern {pattern!r} has conflicting styles")
+        configured_plan[pattern] = "rowwise"
+    if cfg.tp_sequence_modules:
+        raise ValueError(
+            "tp_sequence_modules is not valid for llmtuner's fused sequence "
+            "parallel engine; normalization modules already consume the "
+            "sequence shard without a separate transformation"
+        )
+    raw_plan = model_tp_plan(model) if plan is None else plan
+    if configured_plan:
+        # Matching uses the first pattern; explicit overrides must come first.
+        raw_plan = {
+            **configured_plan,
+            **{
+                key: value
+                for key, value in raw_plan.items()
+                if key not in configured_plan
+            },
+        }
+
+    sharding_plan = resolve_tp_sharding_plan(model, plan=raw_plan)
     if not sharding_plan:
         raise ValueError(
             f"apply_tp with tp={cfg.tp}: {type(model).__name__} provides no TP "
@@ -704,16 +713,18 @@ def resolve_tp_targets(model: nn.Module, cfg: ParallelConfig, plan):
     targets: list[tuple[str, nn.Linear, ShardingConfig]] = []
     for module_path, module in model.named_modules():
         if isinstance(module, nn.Linear):
-            spec = match(sharding_plan, module_path)
+            spec = match_tp_sharding_spec(module_path, plan=sharding_plan)
             if spec is not None:
+                if not module_path:
+                    raise ValueError(
+                        "TP cannot replace a root nn.Linear in place; wrap it in "
+                        "a container module and target its child path"
+                    )
                 targets.append((module_path, module, spec))
 
     # MoE-under-TP is declared by spec strings that name no nn.Linear (the
     # expert weights are stacked parameters), so it has to be detected on the
-    # RAW plan, before resolve_plan maps those specs to None.
-    raw_plan = plan
-    if raw_plan is None:
-        raw_plan = model_tp_plan(model)
+    # RAW plan, before resolve_tp_sharding_plan maps those specs to None.
     plan_declares_moe = any(
         isinstance(spec, str) and spec in MOE_PLAN_SPECS for spec in raw_plan.values()
     )
@@ -761,10 +772,12 @@ def resolve_tp_targets(model: nn.Module, cfg: ParallelConfig, plan):
             "`model.` prefix) rather than training a replicated model by "
             "mistake."
         )
-    return sharding_plan, targets, moe_blocks, moe_deferred_to_ep
+    return targets, moe_blocks
 
 
-def realize_moe_blocks_tp(moe_blocks, *, tp_size: int, tp_rank: int, group) -> None:
+def realize_moe_blocks_tp(
+    moe_blocks: list[tuple[str, nn.Module]], *, tp_size: int, tp_rank: int, group
+) -> None:
     """Shard each HF MoE block's experts and shared expert in place, and give
     the block the TP sequence-boundary class.
 
@@ -773,11 +786,11 @@ def realize_moe_blocks_tp(moe_blocks, *, tp_size: int, tp_rank: int, group) -> N
     sharded featurewise by ``shard_shared_expert_for_tp``, collective-free
     inside the sequence boundary.
     """
+    from ..expert_parallel.hf_inspection import resolve_shared_expert
+
     for module_path, block in moe_blocks:
-        shared = getattr(block, "shared_expert", None) or getattr(
-            block, "shared_experts", None
-        )
-        shared_names: set[str] = set()
+        _, shared = resolve_shared_expert(block)
+        expert_tp_hidden_size(block, tp_size=tp_size)
         if shared is not None:
             # The gate/up/down layout shards featurewise with no collectives
             # (the boundary already gathered the sequence); anything else --
@@ -788,6 +801,22 @@ def realize_moe_blocks_tp(moe_blocks, *, tp_size: int, tp_rank: int, group) -> N
                 for n in ("gate_proj", "up_proj", "down_proj")
             ):
                 compatibility.shared_expert_tp(module_path, block)
+            for name, dim in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
+                projection = getattr(shared, name)
+                if projection.bias is not None:
+                    raise ValueError(
+                        f"TP shared expert {module_path}.{name} has an unsupported bias"
+                    )
+                if projection.weight.shape[dim] % tp_size:
+                    raise ValueError(
+                        f"TP shared expert {module_path}.{name} weight dim {dim} "
+                        f"is not divisible by tp_size={tp_size}"
+                    )
+
+    for _, block in moe_blocks:
+        _, shared = resolve_shared_expert(block)
+        shared_names: set[str] = set()
+        if shared is not None:
             shared_names = shard_shared_expert_for_tp(
                 block, tp_size=tp_size, tp_rank=tp_rank
             )
@@ -812,7 +841,8 @@ def apply_tp(
     model: nn.Module,
     mesh: DeviceMesh | None,
     cfg: ParallelConfig,
-    plan=None,
+    *,
+    plan: Mapping[str, str | ShardingConfig] | None = None,
 ) -> nn.Module:
     """Tensor-parallelize ``model`` in place. No-op when ``tp == 1``.
 
@@ -825,30 +855,8 @@ def apply_tp(
     if mesh is None:
         raise ValueError(f"tp={cfg.tp} requires a device mesh with a 'tp' axis")
 
-    configured_plan: dict[str, str] = {}
-    for pattern in getattr(cfg, "tp_colwise_modules", []):
-        configured_plan[pattern] = "colwise"
-    for pattern in getattr(cfg, "tp_rowwise_modules", []):
-        if pattern in configured_plan:
-            raise ValueError(f"TP pattern {pattern!r} has conflicting styles")
-        configured_plan[pattern] = "rowwise"
-    if getattr(cfg, "tp_sequence_modules", []):
-        raise ValueError(
-            "tp_sequence_modules is not valid for llmtuner's fused sequence "
-            "parallel engine; normalization modules already consume the "
-            "sequence shard without a separate transformation"
-        )
-    if configured_plan:
-        base_plan = model_tp_plan(model) if plan is None else plan
-        # Matching uses the first pattern; explicit overrides must come first.
-        plan = {
-            **configured_plan,
-            **{
-                key: value
-                for key, value in base_plan.items()
-                if key not in configured_plan
-            },
-        }
+    # Resolve targets once before accessing process groups or changing weights.
+    targets, moe_blocks = resolve_tp_targets(model, cfg=cfg, plan=plan)
 
     # A head count that does not divide ``tp`` has no valid local head split,
     # and no downstream guard catches it: the projection-level check in
@@ -862,12 +870,9 @@ def apply_tp(
         for path, _ in model.named_modules()
         if path.rsplit(".", 1)[-1] == "self_attn"
     ]
-    resolved_plan = resolve_plan(model, plan) if attention_paths else {}
     attention_is_sharded = any(
-        isinstance(module, nn.Linear)
-        and any(path.startswith(f"{attention}.") for attention in attention_paths)
-        and match(resolved_plan, path) is not None
-        for path, module in model.named_modules()
+        any(path.startswith(f"{attention}.") for attention in attention_paths)
+        for path, _, _ in targets
     )
     if not attention_paths or attention_is_sharded:
         require_heads_divisible_by(
@@ -880,15 +885,17 @@ def apply_tp(
             ),
         )
 
-    # Validate the plan before touching the mesh: a plan that resolves to
-    # nothing, or that matches no module, used to leave the model fully
-    # replicated while the run reported a healthy TP setup. Both are loud
-    # errors now, and both fire before any process-group access.
-    sharding_plan, targets, moe_blocks, moe_deferred_to_ep = resolve_tp_targets(
-        model, cfg, plan
-    )
     # Validate every dense target before replacing any parameters or modules.
+    parameter_paths: dict[int, list[str]] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        parameter_paths.setdefault(id(parameter), []).append(name)
     for module_path, inner, spec in targets:
+        aliases = parameter_paths[id(inner.weight)]
+        if len(aliases) > 1:
+            raise ValueError(
+                f"TP over {module_path} cannot preserve shared weight paths "
+                f"{aliases!r}; leave these projections replicated"
+            )
         if inner.bias is not None:
             raise ValueError(
                 f"TP over {module_path} has a bias, which this minimal engine does "

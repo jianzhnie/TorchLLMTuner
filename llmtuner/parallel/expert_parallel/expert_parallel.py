@@ -5,16 +5,15 @@ from __future__ import annotations
 import torch.distributed as dist
 import torch.nn as nn
 
-from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import ParallelConfig
 
 from ...utils.logging import get_logger
 from .. import compatibility
-from .block_conversion import restore_fp32_state_buffers
 from .model_replacement import swap_hf_moe_blocks
 
 logger = get_logger(__name__)
 
-__all__ = ["apply_ep", "restore_fp32_state_buffers", "swap_hf_moe_blocks"]
+__all__ = ["apply_ep"]
 
 
 def apply_ep(
@@ -50,7 +49,7 @@ def apply_ep(
         ep_group=ep_group,
         router_aux_loss_coef=cfg.router_aux_loss_coef,
         quantile_balancing=cfg.moe_quantile_balancing,
-        fixed_router=getattr(cfg, "fixed_router", False),
+        fixed_router=cfg.fixed_router,
         token_dispatcher=cfg.ep_token_dispatcher,
         torchao_pad_multiple=cfg.ep_torchao_pad_multiple,
         tp_enabled=cfg.tp > 1,

@@ -37,14 +37,15 @@ independent, replication-safe layout; a sharded write plan is future work.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
 from ...accelerator import distributed
-from ...components.checkpointer.checkpoint_keys import canonical_fqn
+from ...utils.module_names import canonical_fqn
 
 try:  # torch >= 2.4; the FSDP path (DTensor expert weights) needs it.
     from torch.distributed.tensor import DTensor, distribute_tensor
@@ -83,25 +84,40 @@ def expert_shard_map(
                 continue
             for name, _ in module.named_parameters(recurse=False):
                 fqn = f"{module_path}.{name}" if module_path else name
-                shard_map[canonical_fqn(fqn)] = group
+                fqn = canonical_fqn(fqn)
+                if fqn in shard_map and shard_map[fqn] is not group:
+                    raise ValueError(
+                        f"EP checkpoint FQN {fqn!r} belongs to different "
+                        "expert process groups"
+                    )
+                shard_map[fqn] = group
     return shard_map
 
 
-def named_params(model_parts: list[nn.Module]) -> dict[str, torch.Tensor]:
-    return {
-        canonical_fqn(fqn): param
-        for model in model_parts
-        for fqn, param in model.named_parameters()
-    }
+def index_checkpoint_parameters(
+    model_parts: list[nn.Module],
+) -> dict[str, torch.Tensor]:
+    """Index live parameters without silently overwriting canonical FQNs."""
+    params: dict[str, torch.Tensor] = {}
+    for model in model_parts:
+        for fqn, param in model.named_parameters():
+            name = canonical_fqn(fqn)
+            if name in params and params[name] is not param:
+                raise ValueError(
+                    f"EP checkpoint parameter FQN {name!r} identifies "
+                    "different parameters across model parts or wrapper paths"
+                )
+            params[name] = param
+    return params
 
 
-def matched_entries(
-    sd: dict[str, Any],
+def iter_expert_state_entries(
+    state_dict: dict[str, Any],
     shard_map: dict[str, dist.ProcessGroup],
     params: dict[str, torch.Tensor],
     *,
-    direction: str,
-):
+    direction: Literal["save", "load"],
+) -> Iterator[tuple[str, dist.ProcessGroup, torch.Tensor]]:
     """Yield ``(key, group, live_param)`` for entries holding expert state.
 
     An entry matches when its key is the expert FQN itself (model dicts) or a
@@ -117,38 +133,50 @@ def matched_entries(
       ``num_local * world``) is the explicit ValueError in
       ``load_expert_state``. Scalars fall out on ndim.
     """
-    for key, value in sd.items():
-        for fqn, group in shard_map.items():
+    for key, value in state_dict.items():
+        candidates = ((key, shard_map[key]),) if key in shard_map else shard_map.items()
+        for fqn, group in candidates:
             if key != fqn and not key.startswith(f"state.{fqn}."):
                 continue
             param = params.get(fqn)
             if param is None or not isinstance(value, torch.Tensor):
                 continue
-            if direction == "save":
-                if value.shape != param.shape:
-                    continue
-            elif not (value.ndim == param.ndim and value.shape[1:] == param.shape[1:]):
+            shape_matches = (
+                value.shape == param.shape
+                if direction == "save"
+                else value.ndim == param.ndim and value.shape[1:] == param.shape[1:]
+            )
+            if not shape_matches:
+                if key == fqn:
+                    raise ValueError(
+                        f"EP checkpoint weight {key!r} has incompatible shape "
+                        f"{tuple(value.shape)} for live parameter {tuple(param.shape)} "
+                        f"during {direction}"
+                    )
                 continue
             yield key, group, param
             break
 
 
 def gather_expert_state(
-    sd: dict[str, Any],
+    state_dict: dict[str, Any],
+    *,
     shard_map: dict[str, dist.ProcessGroup],
     model_parts: list[nn.Module],
 ) -> dict[str, Any]:
-    """Return ``sd`` with every expert entry all-gathered to the full tensor.
+    """Return ``state_dict`` with every expert entry all-gathered to the full tensor.
 
     The result presents one replicated ``(E, ...)`` tensor per expert weight,
     which every checkpoint backend can save (and plan a load against) with
     its ordinary replicated-tensor semantics.
     """
     if not shard_map:
-        return sd
-    params = named_params(model_parts)
-    out = dict(sd)
-    for key, group, _ in matched_entries(sd, shard_map, params, direction="save"):
+        return state_dict
+    params = index_checkpoint_parameters(model_parts)
+    out = dict(state_dict)
+    for key, group, _ in iter_expert_state_entries(
+        state_dict, shard_map, params, direction="save"
+    ):
         value = out[key]
         if DTensor is not None and isinstance(value, DTensor):
             # Per-EP-rank materialization of the efsdp-sharded weight.
@@ -161,11 +189,12 @@ def gather_expert_state(
 
 
 def load_expert_state(
-    sd: dict[str, Any],
+    state_dict: dict[str, Any],
+    *,
     shard_map: dict[str, dist.ProcessGroup],
     model_parts: list[nn.Module],
 ) -> dict[str, Any]:
-    """Return ``sd`` with every full expert entry sliced back to this rank.
+    """Return ``state_dict`` with every full expert entry sliced back to this rank.
 
     The inverse of ``gather_expert_state``: after the backend has filled the
     full tensors, each rank keeps its own ``num_local`` experts -- the same
@@ -174,10 +203,12 @@ def load_expert_state(
     downstream ``load_state_dict`` copies shard-for-shard.
     """
     if not shard_map:
-        return sd
-    params = named_params(model_parts)
-    out = dict(sd)
-    for key, group, param in matched_entries(sd, shard_map, params, direction="load"):
+        return state_dict
+    params = index_checkpoint_parameters(model_parts)
+    out = dict(state_dict)
+    for key, group, param in iter_expert_state_entries(
+        state_dict, shard_map, params, direction="load"
+    ):
         full = out[key]
         world = distributed.get_world_size(group)
         rank = distributed.get_rank(group)

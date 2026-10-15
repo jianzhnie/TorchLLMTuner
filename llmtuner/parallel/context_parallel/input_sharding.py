@@ -1,4 +1,4 @@
-"""Shard model inputs and attention masks across the CP axis.
+"""Shard model inputs across CP/TP and attention masks across CP.
 
 This module is the one concentration point for llmtuner's use of torch's private
 context-parallel helpers (``_context_parallel_shard`` and the load balancers).
@@ -51,23 +51,25 @@ try:
     from torch.distributed.tensor.experimental._attention import (
         _HeadTailLoadBalancer,
     )
+except ImportError:  # pragma: no cover - depends on the torch build
+    _HeadTailLoadBalancer = None
+
+try:
     from torch.distributed.tensor.experimental._context_parallel import (
         _context_parallel_shard,
     )
 except ImportError:  # pragma: no cover - exercised only on torch builds without these
-    _HeadTailLoadBalancer = None
     _context_parallel_shard = None
 
 
-def require_torch_cp() -> None:
-    """Fail with a version note rather than a bare ``TypeError: NoneType``."""
-    if _context_parallel_shard is None or _HeadTailLoadBalancer is None:
+def require_torch_input_sharding() -> None:
+    """Report a missing shard helper before attempting to call it."""
+    if _context_parallel_shard is None:
         raise ImportError(
-            "llmtuner's context parallelism relies on torch's private CP helpers "
+            "TP/CP input sharding requires torch's private helper "
             "``torch.distributed.tensor.experimental._context_parallel."
-            "_context_parallel_shard`` and ``..._attention._HeadTailLoadBalancer``, "
-            "which this torch build does not provide. They are present in torch "
-            "2.6+; upgrade torch, or set cp=1."
+            "_context_parallel_shard``, which this torch build does not provide. "
+            "Install a compatible torch build or disable TP/CP input sharding."
         )
 
 
@@ -78,11 +80,17 @@ def resolve_load_balancer(load_balancer: str | None, seq_len: int, cp_mesh: Devi
     trainer sharding the batch and the wrapper sharding the BlockMask construct
     them independently and still agree on the rearrangement.
     """
-    require_torch_cp()
+    require_torch_input_sharding()
     if load_balancer is None:
         return None
     cp_size = cp_mesh.size()
     if load_balancer == "headtail":
+        if _HeadTailLoadBalancer is None:
+            raise ImportError(
+                "headtail load balancing requires torch's private "
+                "_HeadTailLoadBalancer; install a compatible torch build "
+                "or set parallel.context_parallel_load_balancer=None."
+            )
         if seq_len % (2 * cp_size) != 0:
             raise ValueError(
                 f"'headtail' load balancing requires seq_len ({seq_len}) to be "
@@ -165,18 +173,28 @@ def shard_padding_mask_for_tp(
     The same contiguous cut, for the same reason: the mask must follow the
     token stream it describes into this rank's ``T / tp`` slice.
     """
-    require_torch_cp()
-    if padding_mask.shape[0] % tp_mesh.size() != 0:
+    return _shard_tp_buffers([padding_mask], tp_mesh)[0]
+
+
+def _shard_tp_buffers(
+    buffers: list[torch.Tensor], tp_mesh: DeviceMesh
+) -> tuple[torch.Tensor, ...]:
+    """Apply one contiguous sequence partition to related token buffers."""
+    require_torch_input_sharding()
+    seq_len = buffers[0].shape[0]
+    if seq_len % tp_mesh.size() != 0:
         raise ValueError(
-            f"sequence length {padding_mask.shape[0]} is not divisible by "
+            f"sequence length {seq_len} is not divisible by "
             f"tp={tp_mesh.size()}; seq_len must be a multiple of the TP degree."
         )
-    return _context_parallel_shard(
-        mesh=tp_mesh,
-        buffers=[padding_mask],
-        seq_dims=[0],
-        load_balancer=None,
-    )[0]
+    return tuple(
+        _context_parallel_shard(
+            mesh=tp_mesh,
+            buffers=buffers,
+            seq_dims=[0] * len(buffers),
+            load_balancer=None,
+        )
+    )
 
 
 def shard_batch_for_tp(
@@ -215,19 +233,8 @@ def shard_batch_for_tp(
     the CP shard's business; slicing inside it evenly keeps every TP rank at
     the same GEMM size.
     """
-    require_torch_cp()
-    if input_ids.shape[0] % tp_mesh.size() != 0:
-        raise ValueError(
-            f"sequence length {input_ids.shape[0]} is not divisible by "
-            f"tp={tp_mesh.size()}; seq_len must be a multiple of the TP degree."
-        )
-    sharded = _context_parallel_shard(
-        mesh=tp_mesh,
-        buffers=[input_ids, labels],
-        seq_dims=[0, 0],
-        load_balancer=None,
-    )
-    return tuple(sharded)
+    input_shard, label_shard = _shard_tp_buffers([input_ids, labels], tp_mesh)
+    return input_shard, label_shard
 
 
 def shard_attention_mask_for_cp(

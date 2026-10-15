@@ -3,25 +3,30 @@
 ``context_parallel.py`` is the public entry and wires CP onto a model.
 ``attention.py`` holds attention redistribution, while
 ``input_sharding.py`` owns batch and mask sharding.
+
+Public symbols are loaded on request; importing a supporting module does not
+load the runtime entry or optional communication kernels.
 """
 
-from .attention import CPFlexKernel, DualCPFlexKernel
-from .context_parallel import apply_cp
-from .input_sharding import (
-    shard_attention_mask_for_cp,
-    shard_batch_for_cp,
-    shard_batch_for_tp,
-    shard_padding_mask_for_cp,
-    shard_padding_mask_for_tp,
-)
+from ...utils.lazy_exports import resolve_export
 
-__all__ = [
-    "CPFlexKernel",
-    "DualCPFlexKernel",
-    "apply_cp",
-    "shard_attention_mask_for_cp",
-    "shard_batch_for_cp",
-    "shard_batch_for_tp",
-    "shard_padding_mask_for_cp",
-    "shard_padding_mask_for_tp",
-]
+_EXPORT_SOURCES = {
+    "CPFlexKernel": "attention",
+    "DualCPFlexKernel": "attention",
+    "apply_cp": "context_parallel",
+    "shard_attention_mask_for_cp": "input_sharding",
+    "shard_batch_for_cp": "input_sharding",
+    "shard_batch_for_tp": "input_sharding",
+    "shard_padding_mask_for_cp": "input_sharding",
+    "shard_padding_mask_for_tp": "input_sharding",
+}
+
+__all__ = sorted(_EXPORT_SOURCES)
+
+
+def __getattr__(name: str):
+    return resolve_export(__name__, _EXPORT_SOURCES, name)
+
+
+def __dir__() -> list[str]:
+    return sorted(_EXPORT_SOURCES)

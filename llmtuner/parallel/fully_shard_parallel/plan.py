@@ -10,9 +10,9 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from torch.distributed.tensor import Shard
 
-from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import ParallelConfig
 
-from ..module_patterns import module_name_matches
+from ..module_patterns import compile_module_pattern, resolve_module_patterns
 from .fine_grained import get_fsdp_strategy
 
 
@@ -20,8 +20,21 @@ def set_fsdp_prefetch_windows(
     modules: list[nn.Module], *, forward_count: int, backward_count: int
 ) -> None:
     """Configure exact forward and backward prefetch windows."""
-    if forward_count < 0 or backward_count < 0:
-        raise ValueError("FSDP prefetch counts must be nonnegative")
+    for name, count in (
+        ("forward_count", forward_count),
+        ("backward_count", backward_count),
+    ):
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(f"{name} must be a nonnegative integer, got {count!r}")
+    if len({id(module) for module in modules}) != len(modules):
+        raise ValueError("FSDP prefetch units must be distinct module objects")
+    for index, module in enumerate(modules):
+        for method in (
+            "set_modules_to_forward_prefetch",
+            "set_modules_to_backward_prefetch",
+        ):
+            if not callable(getattr(module, method, None)):
+                raise TypeError(f"FSDP prefetch unit {index} lacks callable {method}")
     for index, module in enumerate(modules):
         forward = modules[index + 1 : index + 1 + forward_count]
         module.set_modules_to_forward_prefetch(forward)  # type: ignore[attr-defined]
@@ -33,16 +46,9 @@ def _resolve_pattern_units(
     model: nn.Module, cfg: ParallelConfig
 ) -> tuple[dict[str, nn.Module], dict[str, dict[str, Any]], set[nn.Parameter]]:
     named = dict(model.named_modules())
-    ignored_roots = {
-        name
-        for name in named
-        if any(
-            module_name_matches(pattern, name) for pattern in cfg.fsdp_ignored_modules
-        )
-    }
-    for pattern in cfg.fsdp_ignored_modules:
-        if not any(module_name_matches(pattern, name) for name in named):
-            raise ValueError(f"FSDP ignored pattern {pattern!r} matched no module")
+    ignored_roots = resolve_module_patterns(
+        list(named), cfg.fsdp_ignored_modules, plan_name="FSDP ignored"
+    )
 
     # Ignoring a module excludes its complete subtree, matching the recursive
     # ignored-parameter collection below.
@@ -57,10 +63,11 @@ def _resolve_pattern_units(
 
     selected: dict[str, dict[str, Any]] = {}
     for pattern, overrides in cfg.fsdp_apply_modules.items():
+        compiled = compile_module_pattern(pattern)
         matches = [
             name
             for name in named
-            if name and name not in ignored_names and module_name_matches(pattern, name)
+            if name and name not in ignored_names and compiled.fullmatch(name)
         ]
         if not matches:
             raise ValueError(f"FSDP apply pattern {pattern!r} matched no module")
@@ -71,7 +78,7 @@ def _resolve_pattern_units(
 
     ignored_params = {
         parameter
-        for name in ignored_names
+        for name in ignored_roots
         for parameter in named[name].parameters(recurse=True)
     }
     return named, selected, ignored_params
@@ -139,6 +146,8 @@ def apply_fsdp_by_pattern(
                 expert_placements, dp_mesh=options["mesh"], edp_mesh=edp_mesh
             )
         shard_fn(named[name], **options)
+    # Use stable module registration order, independent of pattern ordering.
+    # Arbitrary model forward order cannot be inferred from named_modules().
     set_fsdp_prefetch_windows(
         [module for name, module in named.items() if name in selected],
         forward_count=cfg.fsdp_forward_prefetch_count,
