@@ -560,7 +560,14 @@ class Trainer:
             )
             if dp_mesh is not None:
                 all_reduce(global_routing_tokens, group=dp_mesh.get_group())
-            AuxLoss.set_step_denominator(global_routing_tokens)
+            AuxLoss.set_step_denominator(
+                global_routing_tokens, model_parts=self.model_parts
+            )
+
+        # Forward can mutate checkpointed state too: running buffers and
+        # embedding max_norm weights are examples. Finish the previous snapshot
+        # before model execution; background upload may still overlap training.
+        self.checkpointer.maybe_wait_for_staging()
 
         # Process each group, then free it. Loss values are retained only on a
         # logging step: backward has already consumed them, and non-logging
@@ -605,12 +612,6 @@ class Trainer:
         grad_norm = self._clip_and_check_finite(
             reduction_meshes=reduction_meshes, loss_is_finite=loss_is_finite
         )
-
-        # Before the optimizer update: a background checkpoint save may still be
-        # staging, and letting it overlap the update would have two writers
-        # touching the model's state dict at once. A no-op when the backend does
-        # not stage.
-        self.checkpointer.maybe_wait_for_staging()
 
         self.optimizer.step()
         # After the update, so the lr the optimizer just applied is the one this
@@ -823,7 +824,11 @@ class Trainer:
         # collection (there is no mesh to reduce over and no second rank's
         # contribution); the injection itself is unaffected.
         if AuxLoss.has_pending_counts() and self.parallel_dims is not None:
-            metrics.update(collect_aux_loss_metrics(self.parallel_dims))
+            metrics.update(
+                collect_aux_loss_metrics(
+                    self.parallel_dims, model_parts=self.model_parts
+                )
+            )
         return metrics
 
     def _check_finite(self, step_is_finite: torch.Tensor) -> None:
@@ -969,6 +974,13 @@ class Trainer:
                         # would make ``state_dict`` resume past a step whose
                         # weights were never updated.
                         self.step -= 1
+                        # Finite data can end before cfg.steps and off the
+                        # checkpoint interval. Preserve the last completed
+                        # update using the configured final-save policy.
+                        if self.step > 0 and self.checkpointer.save(
+                            self.step, last_step=True
+                        ):
+                            logger.info(f"Saved checkpoint for step {self.step}")
                         break
 
                     if step_metrics is not None:
@@ -1047,6 +1059,12 @@ class Trainer:
             try:
                 resource.close()
             except BaseException as error:
+                if name == "metrics" or (
+                    name == "checkpointer" and getattr(resource, "_initialized", False)
+                ):
+                    # Failed sinks and interrupted checkpoint waits may retain
+                    # live resources. Keep their owner available for a retry.
+                    setattr(self, name, resource)
                 logger.exception("Failed to close trainer resource %s", name)
                 if first_error is None:
                     first_error = error

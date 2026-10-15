@@ -17,21 +17,28 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.device import (
     device_type,
     get_distributed_backend,
     get_env_dist_info,
 )
 from ...accelerator.distributed import (
+    get_default_group,
     get_rank,
     get_world_size,
     init_dist_pytorch,
     is_distributed,
 )
-from ...components.checkpointer.checkpoint_keys import DATALOADER, TRAIN_STATE
+from ...components.checkpointer.checkpoint_keys import (
+    DATALOADER,
+    RNG_STATE,
+    TRAIN_STATE,
+)
 from ...components.checkpointer.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
+from ...components.checkpointer.random_state import RNGCheckpointState
 from ...components.metrics import MetricsProcessor
 from ...components.optimizer.ema import EMA
 from ...components.optimizer.lr_scheduler import build_lr_scheduler
@@ -153,42 +160,52 @@ def _build_optimizer_stack(trainer: Trainer) -> None:
     """Optimizer, lr schedule, EMA, and the MoE/aux-loss optimizer pre-hooks."""
     cfg = trainer.cfg
     trainer.optimizer = OptimizersContainer(
-        cfg.optimizer, model_parts=trainer.model_parts
-    )
-
-    # LambdaLR needs the inner optimizers' learning rates; the container exposes
-    # only a merged parameter view. The default schedule keeps the rate constant.
-    trainer.lr_scheduler = build_lr_scheduler(
-        cfg.lr_scheduler_config,
-        optimizers=list(trainer.optimizer),
-        training_steps=cfg.steps,
-    )
-
-    # EMA runs after the optimizer update and has its own checkpoint state.
-    ema_config = cfg.training.ema
-    trainer.ema = (
-        EMA(
-            model_parts=trainer.model_parts,
-            decay=ema_config.decay,
-            half_life_fraction=ema_config.half_life_fraction,
-            start_step=ema_config.start_step,
-            step_bias=ema_config.step_bias,
-            update_every_n_steps=ema_config.update_every_n_steps,
-            buffer_patterns=ema_config.buffer_patterns,
-        )
-        if ema_config is not None
-        else None
-    )
-
-    # Container hooks run once per training step, including with multiple PP
-    # optimizers. Collect accumulated auxiliary losses and apply MoE balancing.
-    register_aux_loss_metrics_hook(trainer.optimizer, model_parts=trainer.model_parts)
-    # Select one balancing policy and register one container-level pre-hook.
-    register_moe_balancing_hook(
-        trainer.optimizer,
+        cfg.optimizer,
         model_parts=trainer.model_parts,
-        parallel_dims=trainer.parallel_dims,
+        initialization_group=get_default_group() if is_distributed() else None,
+        pipeline_mesh=(
+            trainer.parallel_dims.get_optional_mesh("pp")
+            if trainer.parallel_dims is not None
+            else None
+        ),
     )
+
+    with synchronize_local_errors("Optimizer services construction"):
+        # LambdaLR needs the inner optimizers' learning rates; the container exposes
+        # only a merged parameter view. The default schedule keeps the rate constant.
+        trainer.lr_scheduler = build_lr_scheduler(
+            cfg.lr_scheduler_config,
+            optimizers=list(trainer.optimizer),
+            training_steps=cfg.steps,
+        )
+
+        # EMA runs after the optimizer update and has its own checkpoint state.
+        ema_config = cfg.training.ema
+        trainer.ema = (
+            EMA(
+                model_parts=trainer.model_parts,
+                decay=ema_config.decay,
+                half_life_fraction=ema_config.half_life_fraction,
+                start_step=ema_config.start_step,
+                step_bias=ema_config.step_bias,
+                update_every_n_steps=ema_config.update_every_n_steps,
+                buffer_patterns=ema_config.buffer_patterns,
+            )
+            if ema_config is not None
+            else None
+        )
+
+        # Container hooks run once per training step, including with multiple PP
+        # optimizers. Collect accumulated auxiliary losses and apply MoE balancing.
+        register_aux_loss_metrics_hook(
+            trainer.optimizer, model_parts=trainer.model_parts
+        )
+        # Select one balancing policy and register one container-level pre-hook.
+        register_moe_balancing_hook(
+            trainer.optimizer,
+            model_parts=trainer.model_parts,
+            parallel_dims=trainer.parallel_dims,
+        )
 
 
 def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> None:
@@ -203,7 +220,11 @@ def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> 
         raise RuntimeError(
             "Trainer dataloader must be initialized before building the checkpointer"
         )
-    states: dict[str, Any] = {TRAIN_STATE: trainer, DATALOADER: trainer.dataloader}
+    states: dict[str, Any] = {
+        TRAIN_STATE: trainer,
+        DATALOADER: trainer.dataloader,
+        RNG_STATE: RNGCheckpointState(trainer.device, topology=trainer.parallel_dims),
+    }
     trainer.checkpointer = DistributedCheckpointManager(
         cfg.checkpoint,
         model_parts=trainer.model_parts,
@@ -273,13 +294,17 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
     else:
         trainer.mesh = build_device_mesh(trainer.parallel_dims)
 
+    seeding.initialize_dtensor_rng(trainer.mesh)
+
     # Build the model before optimizer services capture its parameters.
-    model, hf_model_config, load_hf_weights = _build_model(trainer)
+    with synchronize_local_errors("Model construction"):
+        model, hf_model_config, load_hf_weights = _build_model(trainer)
     _apply_parallelism(trainer, model, load_hf_weights=load_hf_weights)
     _build_optimizer_stack(trainer)
 
     # The checkpointer captures the loader cursor alongside model state.
-    trainer.dataloader = trainer.build_dataloader()
+    with synchronize_local_errors("Dataloader construction"):
+        trainer.dataloader = trainer.build_dataloader()
 
     # Counters the checkpoint carries. Kept as plain ints so a resumed run
     # can log "step 61 (resumed at 60)" without re-deriving them.
@@ -289,14 +314,15 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
     _build_checkpointer(trainer, hf_model_config)
 
     # Metrics use the resolved topology and HF geometry of the model built above.
-    trainer.metrics = MetricsProcessor(
-        cfg.metrics,
-        parallel_dims=trainer.parallel_dims,
-        dump_folder=cfg.dump_folder,
-        pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
-        num_flops_per_token=flops_per_token(
-            unwrap_text_config(hf_model_config), seq_len=cfg.max_seq_len
-        ),
-    )
+    with synchronize_local_errors("Metrics construction"):
+        trainer.metrics = MetricsProcessor(
+            cfg.metrics,
+            parallel_dims=trainer.parallel_dims,
+            dump_folder=cfg.dump_folder,
+            pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
+            num_flops_per_token=flops_per_token(
+                unwrap_text_config(hf_model_config), seq_len=cfg.max_seq_len
+            ),
+        )
     # The trainer synchronizes PP loss metrics to every stage before logging.
     logging_utils.set_log_ranks(cfg.metrics.log_ranks)
