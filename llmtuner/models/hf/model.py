@@ -734,6 +734,43 @@ class HFTransformerModel(nn.Module):
             positions = torch.arange(local_seq_len, device=input_ids.device)
 
         kwargs = self._apply_attention(positions, attention_masks)
+        if (
+            self.cp_mesh is None
+            and positions.numel() != local_seq_len
+            and self.model.config._attn_implementation == "sdpa"
+            and kwargs.get("attention_mask") is None
+        ):
+            # HF builds masks before attention gathers the TP token shards.
+            # Build against the full attention sequence, preserving HF's causal
+            # and sliding-window rules in eager and compiled execution alike.
+            from transformers.masking_utils import (
+                create_causal_mask,
+                create_sliding_window_causal_mask,
+            )
+
+            mask_inputs = input_ids.new_empty(
+                (1, positions.numel(), 1), dtype=torch.float32
+            )
+            mask_kwargs = {
+                "config": self.model.config,
+                "inputs_embeds": mask_inputs,
+                "attention_mask": None,
+                "past_key_values": None,
+                "position_ids": positions.unsqueeze(0),
+            }
+            masks = {"full_attention": create_causal_mask(**mask_kwargs)}
+            if getattr(self._decoder, "has_sliding_layers", False):
+                masks["sliding_attention"] = create_sliding_window_causal_mask(
+                    **mask_kwargs
+                )
+            if hasattr(self._decoder, "has_sliding_layers"):
+                kwargs["attention_mask"] = masks
+            elif getattr(self.model.config, "sliding_window", None) is not None:
+                kwargs["attention_mask"] = create_sliding_window_causal_mask(
+                    **mask_kwargs
+                )
+            else:
+                kwargs["attention_mask"] = masks["full_attention"]
 
         # Stage the padding mask on every MoE block -- including ``None``, so
         # a mask from a previous microbatch can never survive into this one.
@@ -741,6 +778,9 @@ class HFTransformerModel(nn.Module):
         # replay even when another microbatch re-stages these blocks.
         for moe in collect_moe_layers(self):
             moe.set_padding_mask(padding_mask)
+
+        if self.model.config.model_type == "kimi_linear" and padding_mask is not None:
+            kwargs["valid_token_mask"] = (~padding_mask).unsqueeze(0)
 
         # A HF decoder expects a batch dim; the wrapper's contract is flat.
         hidden_states = self._decoder(

@@ -47,13 +47,22 @@ def build_model_config(
     overrides = deepcopy(arch_overrides) if arch_overrides is not None else {}
     if arch_overrides is not None:
         overrides.setdefault("max_position_embeddings", seq_len)
-        config = AutoConfig.for_model(model_name_or_path, **overrides)
+        if model_name_or_path == "kimi_linear":
+            from ..kimi.kimi_linear_config import KimiLinearConfig
+
+            config = KimiLinearConfig(**overrides)
+        else:
+            config = AutoConfig.for_model(model_name_or_path, **overrides)
         if hasattr(config, "text_config"):
             config.text_config.max_position_embeddings = max(
                 config.text_config.max_position_embeddings, seq_len
             )
         return config
 
+    # Register only the lightweight local config; model/kernel imports stay lazy.
+    from ..kimi.kimi_linear_config import KimiLinearConfig
+
+    AutoConfig.register("kimi_linear", KimiLinearConfig, exist_ok=True)
     config = AutoConfig.from_pretrained(model_name_or_path)
     text_config = getattr(config, "text_config", config)
     text_config.max_position_embeddings = max(
@@ -76,7 +85,9 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
     """
     # Only registered architecture names select offline construction. Missing
     # paths and Hub IDs belong to from_pretrained, which owns their validation.
-    offline = not os.path.exists(cfg.hf_model) and cfg.hf_model in CONFIG_MAPPING
+    offline = not os.path.exists(cfg.hf_model) and (
+        cfg.hf_model in CONFIG_MAPPING or cfg.hf_model == "kimi_linear"
+    )
     overrides = (
         {
             "vocab_size": cfg.vocab_size,
@@ -151,6 +162,11 @@ def resolve_model_class(config: PretrainedConfig) -> type[PreTrainedModel]:
     ``Auto`` mapping, which covers configs whose architecture name does not match
     the installed class name.
     """
+    if config.model_type == "kimi_linear":
+        from ..kimi.model import KimiLinearForCausalLM
+
+        return KimiLinearForCausalLM
+
     import transformers
     from transformers import PreTrainedModel
     from transformers.models.auto.modeling_auto import (

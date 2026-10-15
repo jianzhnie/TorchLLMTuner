@@ -167,10 +167,14 @@ class GroupedExperts(nn.Module):
         out_TD = x_TD.new_empty(x_TD.shape[0], weight_EOI.shape[1])
         start = 0
         for expert, count in enumerate(counts.tolist()):
-            if count:
-                end = start + count
-                out_TD[start:end] = F.linear(x_TD[start:end], weight_EOI[expert])
-                start = end
+            # Counts are data-dependent segment sizes, not Python branch
+            # conditions. Empty linear segments preserve zero expert gradients.
+            torch._check(count >= 0)
+            end = start + count
+            torch._check(end <= x_TD.shape[0])
+            segment = torch.narrow(x_TD, 0, start, count)
+            out_TD[start:end] = F.linear(segment, weight_EOI[expert])
+            start = end
         return out_TD
 
 
