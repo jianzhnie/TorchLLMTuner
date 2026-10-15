@@ -482,7 +482,10 @@ def test_quantile_bias_update_matches_with_checkpoint_recomputation(mode, microb
     before = original.router.quantile_balancer.required_bias_histogram_EB
     after = replayed.router.quantile_balancer.required_bias_histogram_EB
     assert int(before.sum()) == int((~padding).sum()) * 4 * microbatches
-    assert int(after.sum()) > int(before.sum()), "Backward must replay routing"
+    torch.testing.assert_close(after, before)
+    torch.testing.assert_close(
+        replayed.tokens_per_expert_E, original.tokens_per_expert_E
+    )
     update_quantile_expert_bias([original], parallel_dims=None)
     update_quantile_expert_bias([replayed], parallel_dims=None)
     torch.testing.assert_close(replayed.expert_bias_E, original.expert_bias_E)
@@ -579,3 +582,29 @@ def test_quantile_balancer_rejects_invalid_histogram_geometry(field, value):
     options[field] = value
     with pytest.raises(ValueError, match=field + " must be positive integer"):
         QuantileBalancer(**options)
+
+
+@pytest.mark.parametrize(
+    "scale", [float("nan"), float("inf"), -float("inf"), True, "1"]
+)
+@pytest.mark.parametrize(
+    "router_class", [TokenChoiceTopKRouter, QuantileBalancedTopKRouter]
+)
+def test_router_rejects_nonfinite_or_nonnumeric_scale_before_gate_allocation(
+    monkeypatch, scale, router_class
+):
+    from llmtuner.models.common.moe import routing
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid routing policy must fail before gate allocation")
+
+    monkeypatch.setattr(routing, "RouterGateLinear", unexpected)
+    with pytest.raises(ValueError, match="route_scale"):
+        router_class(4, 8, 2, route_scale=scale)
+
+
+@pytest.mark.parametrize("field", ["route_norm", "_debug_force_load_balance"])
+@pytest.mark.parametrize("value", [0, 1, "false"])
+def test_router_rejects_truthy_nonboolean_policy(field, value):
+    with pytest.raises(ValueError, match=field):
+        TokenChoiceTopKRouter(4, 8, 2, **{field: value})

@@ -134,6 +134,32 @@ def test_hf_key_mapping_rejects_collisions():
         adapter.to_hf({"model.weight": torch.ones(1), "weight": torch.zeros(1)})
 
 
+def test_hf_reader_selects_each_tensor_from_its_indexed_file(tmp_path):
+    import torch.distributed.checkpoint as dcp
+    from safetensors.torch import save_file
+
+    save_file(
+        {"a": torch.tensor([1.0]), "b": torch.tensor([999.0])},
+        str(tmp_path / "first.safetensors"),
+    )
+    save_file(
+        {"a": torch.tensor([999.0]), "b": torch.tensor([2.0])},
+        str(tmp_path / "second.safetensors"),
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {"a": "first.safetensors", "b": "second.safetensors"}}
+        ),
+        encoding="utf-8",
+    )
+    adapter = HFTransformerStateDictAdapter(SimpleNamespace(), None)
+    restored = {"a": torch.zeros(1), "b": torch.zeros(1)}
+    dcp.load(restored, storage_reader=adapter.get_hf_storage_reader(str(tmp_path)))
+    torch.testing.assert_close(
+        restored, {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}, rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize(
     "filenames",
     [

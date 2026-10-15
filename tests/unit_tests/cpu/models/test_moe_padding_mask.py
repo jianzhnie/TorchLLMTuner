@@ -352,3 +352,114 @@ def test_moe_rejects_invalid_or_mismatched_expert_count(num_experts):
     routed = RoutedExperts(GroupedExperts(8, 8, 4), LocalTokenDispatcher(4, 2))
     with pytest.raises(ValueError, match="num_experts"):
         MoE(num_experts, routed, router)
+
+
+@pytest.mark.parametrize("counts", [(8, 2), (4, 1)])
+def test_moe_rejects_dispatcher_router_mismatch(counts):
+    router = TokenChoiceTopKRouter(4, 8, 2)
+    routed = RoutedExperts(GroupedExperts(8, 8, 4), LocalTokenDispatcher(*counts))
+    with pytest.raises(ValueError, match="dispatcher"):
+        MoE(4, routed, router)
+
+
+@pytest.mark.parametrize("mode", ["full", "selective"])
+@pytest.mark.parametrize("maskless_second", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_checkpoint_replay_restores_each_microbatch_padding_mask(
+    mode, maskless_second, compiled
+):
+    import copy
+
+    from llmtuner.config.activation_checkpoint_config import SelectiveACConfig
+    from llmtuner.memory.activation_checkpoint import wrap_full, wrap_selective
+
+    original = _moe()
+    replayed = copy.deepcopy(original)
+    wrapped = (
+        wrap_full(replayed)
+        if mode == "full"
+        else wrap_selective(replayed, SelectiveACConfig())
+    )
+    if compiled:
+        wrapped = torch.compile(wrapped, backend="eager")
+    masks = [_padding_mask(), None if maskless_second else ~_padding_mask()]
+    AuxLoss.set_step_denominator(torch.tensor(float(_NUM_TOKENS)))
+    expected_outputs, actual_outputs = [], []
+    for index, mask in enumerate(masks):
+        inputs = _tokens(index + 10)
+        original.set_padding_mask(mask)
+        replayed.set_padding_mask(mask)
+        expected_outputs.append(original(inputs.clone().requires_grad_()))
+        actual_outputs.append(wrapped(inputs.clone().requires_grad_()))
+    for expected, actual in zip(expected_outputs, actual_outputs, strict=True):
+        torch.testing.assert_close(actual, expected)
+    sum(output.square().sum() for output in expected_outputs).backward()
+    sum(output.square().sum() for output in actual_outputs).backward()
+    for expected, actual in zip(
+        original.parameters(), replayed.parameters(), strict=True
+    ):
+        torch.testing.assert_close(actual.grad, expected.grad)
+    assert replayed._pending_padding_mask is masks[-1]
+
+
+@pytest.mark.parametrize("mode", ["full", "selective"])
+def test_failed_checkpoint_replay_restores_mask_and_recompute_context(mode):
+    from llmtuner.config.activation_checkpoint_config import SelectiveACConfig
+    from llmtuner.memory.activation_checkpoint import wrap_full, wrap_selective
+    from llmtuner.models.common.aux_loss import in_checkpoint_recompute
+
+    moe = _moe()
+    original_forward = moe.routed_experts.forward
+    observed_masks = []
+
+    def fail_recompute(*args, **kwargs):
+        if in_checkpoint_recompute.get():
+            observed_masks.append(moe._pending_padding_mask)
+            raise RuntimeError("injected expert replay failure")
+        return original_forward(*args, **kwargs)
+
+    moe.routed_experts.forward = fail_recompute
+    # Exercise discovery through a parent module, as on decoder layers.
+    parent = torch.nn.Sequential(moe)
+    wrapped = (
+        wrap_full(parent)
+        if mode == "full"
+        else wrap_selective(parent, SelectiveACConfig())
+    )
+    original_mask, latest_mask = _padding_mask(), ~_padding_mask()
+    AuxLoss.set_step_denominator(torch.tensor(float(_NUM_TOKENS)))
+    moe.set_padding_mask(original_mask)
+    output = wrapped(_tokens().requires_grad_())
+    moe.set_padding_mask(latest_mask)
+    with pytest.raises(RuntimeError, match="injected expert replay failure"):
+        output.square().sum().backward()
+    assert observed_masks == [original_mask]
+    assert moe._pending_padding_mask is latest_mask
+    assert not in_checkpoint_recompute.get()
+
+
+@pytest.mark.parametrize("mode", ["full", "selective"])
+def test_checkpoint_retained_graph_follows_backend_contract(mode):
+    from llmtuner.config.activation_checkpoint_config import SelectiveACConfig
+    from llmtuner.memory.activation_checkpoint import wrap_full, wrap_selective
+
+    moe = _moe()
+    wrapped = (
+        wrap_full(moe) if mode == "full" else wrap_selective(moe, SelectiveACConfig())
+    )
+    AuxLoss.set_step_denominator(torch.tensor(float(_NUM_TOKENS)))
+    output = wrapped(_tokens().requires_grad_())
+    loss = output.square().sum()
+    loss.backward(retain_graph=True)
+    first_gradients = [parameter.grad.clone() for parameter in moe.parameters()]
+    if mode == "selective":
+        # PyTorch SAC consumes saved entries during its first backward.
+        with pytest.raises(RuntimeError, match="only allowed to backward once"):
+            loss.backward()
+        from llmtuner.models.common.aux_loss import in_checkpoint_recompute
+
+        assert not in_checkpoint_recompute.get()
+        return
+    loss.backward()
+    for parameter, gradient in zip(moe.parameters(), first_gradients, strict=True):
+        torch.testing.assert_close(parameter.grad, 2 * gradient)

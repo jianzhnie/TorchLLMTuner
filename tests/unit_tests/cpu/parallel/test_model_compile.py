@@ -392,3 +392,215 @@ def test_compiled_cpu_training_matches_eager_outputs_and_gradients(per_block):
     for name, parameter in model.named_parameters():
         canonical_name = name.removeprefix("_orig_mod.")
         torch.testing.assert_close(parameter.grad, reference_gradients[canonical_name])
+
+
+def test_unknown_backend_is_rejected_before_module_flags_change():
+    from torch._dynamo.exc import InvalidBackend
+
+    from llmtuner.parallel.model_compile import apply_compile
+
+    model = torch.nn.Linear(4, 4)
+    model._regional_inductor_enabled = True
+    with pytest.raises(InvalidBackend):
+        apply_compile(
+            model, compile_config=CompileConfig(backend="llmtuner_missing_backend")
+        )
+    assert model._regional_inductor_enabled is True
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_async_tp_requires_inductor_backend(backend):
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="inductor"):
+        CompileConfig(backend=backend, enable_async_tensor_parallel=True)
+
+
+def test_async_tp_setup_failure_preserves_regional_flags():
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    model._regional_inductor_enabled = True
+    assert not hasattr(model[0], "_regional_inductor_enabled")
+    with pytest.raises(ValueError, match="tensor_parallel_size"):
+        apply_compile(
+            model, compile_config=CompileConfig(enable_async_tensor_parallel=True)
+        )
+    assert model._regional_inductor_enabled is True
+    assert not hasattr(model[0], "_regional_inductor_enabled")
+
+
+def test_missing_moe_compile_capability_fails_before_setup(monkeypatch):
+    from llmtuner.errors import EnvironmentUnsupportedError
+
+    model = torch.nn.Linear(4, 4)
+    model._regional_inductor_enabled = True
+    monkeypatch.setattr(compile_mod, "collect_moe_layers", lambda model: [object()])
+    monkeypatch.setattr(compile_mod, "has", lambda name: False)
+    with pytest.raises(EnvironmentUnsupportedError, match="capture_scalar_outputs"):
+        apply_compile(model, compile_config=CompileConfig(backend="eager"))
+    assert model._regional_inductor_enabled is True
+
+
+@requires_runtime
+def test_compiled_qwen_training_matches_native_hf_trajectory():
+    """Use native HF forward as an oracle independent of the flat wrapper."""
+    import copy
+
+    from torch._dynamo.utils import counters
+
+    torch._dynamo.reset()
+    counters.clear()
+    torch.manual_seed(42)
+    config = build_model_config(
+        "qwen3",
+        seq_len=_SEQ,
+        arch_overrides={
+            "vocab_size": _VOCAB,
+            "hidden_size": _HIDDEN,
+            "intermediate_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+        },
+    )
+    wrapper = HFTransformerModel(config)
+    reference = copy.deepcopy(wrapper.model)
+    model = apply_compile(wrapper, compile_config=CompileConfig(backend="aot_eager"))
+    actual_optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0)
+    reference_optimizer = torch.optim.AdamW(
+        reference.parameters(), lr=3e-4, weight_decay=0
+    )
+    generator = torch.Generator().manual_seed(1234)
+    for _ in range(4):
+        tokens = torch.randint(_VOCAB, (_SEQ,), generator=generator)
+        targets = torch.randint(_VOCAB, (_SEQ,), generator=generator)
+        actual_optimizer.zero_grad(set_to_none=True)
+        reference_optimizer.zero_grad(set_to_none=True)
+        actual = model(tokens)
+        expected = reference(tokens.unsqueeze(0), use_cache=False).logits.squeeze(0)
+        torch.testing.assert_close(actual, expected)
+        actual_loss = torch.nn.functional.cross_entropy(actual, targets)
+        expected_loss = torch.nn.functional.cross_entropy(expected, targets)
+        torch.testing.assert_close(actual_loss, expected_loss)
+        actual_loss.backward()
+        expected_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(reference.parameters(), 1.0)
+        expected_parameters = dict(reference.named_parameters())
+        for name, parameter in wrapper.model.named_parameters():
+            torch.testing.assert_close(parameter.grad, expected_parameters[name].grad)
+        actual_optimizer.step()
+        reference_optimizer.step()
+        for name, parameter in wrapper.model.named_parameters():
+            torch.testing.assert_close(parameter, expected_parameters[name])
+    assert counters["stats"]["unique_graphs"] > 0
+
+
+@requires_runtime
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_compile_setup_failure_restores_scalar_capture(
+    monkeypatch, initial, error_type
+):
+    with _preserve_dynamo_flag("capture_scalar_outputs"):
+        torch._dynamo.config.capture_scalar_outputs = initial
+        monkeypatch.setattr(compile_mod, "collect_moe_layers", lambda model: [object()])
+
+        def fail(*args, **kwargs):
+            assert torch._dynamo.config.capture_scalar_outputs
+            raise error_type("compile setup failed")
+
+        monkeypatch.setattr(torch, "compile", fail)
+        with pytest.raises(error_type, match="compile setup failed"):
+            apply_compile(_model(), compile_config=CompileConfig())
+        assert torch._dynamo.config.capture_scalar_outputs is initial
+
+
+@requires_runtime
+@pytest.mark.parametrize("failure_index", [0, 1, 2])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_partial_block_compile_failure_restores_original_calls(
+    monkeypatch, failure_index, error_type
+):
+    model = _model()
+    blocks = list(model.layers)
+    parameters = dict(model.named_parameters())
+    state_keys = set(model.state_dict())
+
+    # Include a previously compiled layer: rollback must restore its callable,
+    # rather than indiscriminately clearing all compiled implementations.
+    def original_impl(*args, **kwargs):
+        return None
+
+    blocks[0]._compiled_call_impl = original_impl
+    previous = [block._compiled_call_impl for block in blocks]
+    attempted = []
+
+    def compile_block(block, **kwargs):
+        attempted.append(block)
+        block._compiled_call_impl = lambda *args, **kwargs: None
+        if block is blocks[failure_index]:
+            raise error_type("block setup failed")
+
+    monkeypatch.setattr(type(blocks[0]), "compile", compile_block)
+    with pytest.raises(error_type, match="block setup failed"):
+        apply_compile(model, compile_config=CompileConfig(per_block=True))
+    assert len(attempted) == failure_index + 1
+    assert all(a is b for a, b in zip(model.layers, blocks, strict=True))
+    assert all(
+        block._compiled_call_impl is old
+        for block, old in zip(blocks, previous, strict=True)
+    )
+    assert set(model.state_dict()) == state_keys
+    assert all(
+        dict(model.named_parameters())[key] is p for key, p in parameters.items()
+    )
+
+
+@pytest.mark.parametrize("backend", ["inductor", "aot_eager"])
+def test_compile_failure_restores_regional_annotation_ownership(monkeypatch, backend):
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+    model.uses_flex_attention = True
+    model._regional_inductor_enabled = True
+    model[0]._regional_inductor_enabled = False
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("compile setup failed")
+
+    monkeypatch.setattr(torch, "compile", fail)
+    with pytest.raises(RuntimeError, match="compile setup failed"):
+        apply_compile(model, compile_config=CompileConfig(backend=backend))
+    assert model._regional_inductor_enabled is True
+    assert model[0]._regional_inductor_enabled is False
+    assert "_regional_inductor_enabled" not in model[1].__dict__
+
+
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.parametrize("failure_stage", ["registration", "compile"])
+def test_failed_async_compile_restores_inductor_pass(
+    monkeypatch, initial, failure_stage
+):
+    import torch._inductor.config as inductor_config
+
+    original = inductor_config._micro_pipeline_tp
+    model = torch.nn.Linear(4, 4)
+
+    def setup(*args):
+        inductor_config._micro_pipeline_tp = True
+        if failure_stage == "registration":
+            raise RuntimeError("async setup failed")
+
+    def fail(*args, **kwargs):
+        assert inductor_config._micro_pipeline_tp is True
+        raise RuntimeError("async compile failed")
+
+    monkeypatch.setattr(compile_mod, "maybe_enable_async_tp", setup)
+    monkeypatch.setattr(torch, "compile", fail)
+    try:
+        inductor_config._micro_pipeline_tp = initial
+        with pytest.raises(RuntimeError, match="async"):
+            apply_compile(
+                model, compile_config=CompileConfig(enable_async_tensor_parallel=True)
+            )
+        assert inductor_config._micro_pipeline_tp is initial
+    finally:
+        inductor_config._micro_pipeline_tp = original

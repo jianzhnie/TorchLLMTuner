@@ -281,7 +281,7 @@ def test_swap_refuses_unknown_backend():
         swap_hf_moe_blocks(model, token_dispatcher="fastep")
 
 
-@pytest.mark.parametrize("backend", ["fastep", "deepep", "hybridep", "mc2"])
+@pytest.mark.parametrize("backend", ["fastep", "deepep", "hybridep"])
 def test_direct_swap_and_config_report_the_same_backend_error(backend):
     with pytest.raises((ValueError, NotImplementedError)) as config_error:
         ParallelConfig(
@@ -291,6 +291,42 @@ def test_direct_swap_and_config_report_the_same_backend_error(backend):
     with pytest.raises(type(config_error.value)) as swap_error:
         swap_hf_moe_blocks(types.SimpleNamespace(layers=[]), token_dispatcher=backend)
     assert str(swap_error.value) == str(config_error.value)
-    if backend == "mc2":
-        assert "Ascend" in str(swap_error.value)
-        assert "CUDA" not in str(swap_error.value)
+
+
+def test_batched_dispatch_counts_preserve_slice_and_rank_order(monkeypatch):
+    from llmtuner.parallel.expert_parallel import token_dispatch
+
+    dispatcher = token_dispatch.AllToAllTokenDispatcher(6, 2)
+    dispatcher.ep_group = object()
+    local_counts = torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]])
+    # Received wire layout: source rank, slice, local expert.
+    received = torch.tensor([[[1, 2], [3, 4]], [[5, 6], [7, 8]], [[9, 10], [11, 12]]])
+    calls = []
+    monkeypatch.setattr(token_dispatch.distributed, "get_world_size", lambda _: 3)
+
+    def exchange(tensor, output_splits, input_splits, *, group):
+        calls.append(tensor.clone())
+        assert output_splits is None and input_splits is None
+        assert group is dispatcher.ep_group
+        return received.reshape(3, -1)
+
+    monkeypatch.setattr(token_dispatch, "all_to_all_single", exchange)
+    prepared = dispatcher.prepare_dispatch_counts(local_counts)
+    assert len(calls) == 1
+    torch.testing.assert_close(
+        calls[0], torch.tensor([[1, 2, 7, 8], [3, 4, 9, 10], [5, 6, 11, 12]])
+    )
+    torch.testing.assert_close(prepared[0].counts, torch.tensor([1, 2, 5, 6, 9, 10]))
+    torch.testing.assert_close(prepared[1].counts, torch.tensor([3, 4, 7, 8, 11, 12]))
+    assert prepared[0].input_splits == [3, 7, 11]
+    assert prepared[1].input_splits == [15, 19, 23]
+    assert prepared[0].output_splits == [3, 11, 19]
+    assert prepared[1].output_splits == [7, 15, 23]
+
+
+def test_mc2_configuration_defers_device_capability_checks():
+    config = ParallelConfig(
+        expert_parallel_size=2,
+        ep_config=ExpertParallelConfig(ep_token_dispatcher="mc2"),
+    )
+    assert config.ep_config.ep_token_dispatcher == "mc2"

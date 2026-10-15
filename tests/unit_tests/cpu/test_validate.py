@@ -11,15 +11,81 @@ checks real four-rank CPU/Gloo DP x CP and DP x TP reduction semantics.
 
 from __future__ import annotations
 
+import random
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
 from llmtuner.components.loss import IGNORE_INDEX
 from llmtuner.config import LLMTunerConfig, TrainingConfig, ValidationConfig
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_validation_preserves_training_random_streams(monkeypatch, failed):
+    from llmtuner.trainer.runtime import validation as validation_runtime
+
+    trainer, _ = _make_trainer(
+        monkeypatch, validation=ValidationConfig(steps=1), loader=_ListLoader([])
+    )
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    expected = (random.random(), np.random.random(), torch.rand(4))
+    random.setstate(python_state)
+    np.random.set_state(numpy_state)
+    torch.set_rng_state(torch_state)
+
+    def random_pass(*args):
+        random.random()
+        np.random.random()
+        torch.rand(17)
+        if failed:
+            raise RuntimeError("validation failed")
+
+    monkeypatch.setattr(validation_runtime, "run_validation_loop", random_pass)
+    try:
+        if failed:
+            with pytest.raises(RuntimeError, match="validation failed"):
+                trainer.validate(1)
+        else:
+            trainer.validate(1)
+        assert random.random() == expected[0]
+        assert np.random.random() == expected[1]
+        torch.testing.assert_close(torch.rand(4), expected[2], rtol=0, atol=0)
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
+
+
+def test_validation_finishes_staging_before_forward_mutates_weights(monkeypatch):
+    from llmtuner.trainer.runtime import validation as validation_runtime
+
+    trainer, _ = _make_trainer(
+        monkeypatch, validation=ValidationConfig(steps=1), loader=_ListLoader([])
+    )
+    embedding = torch.nn.Embedding(2, 2, max_norm=1.0)
+    with torch.no_grad():
+        embedding.weight.fill_(10)
+    expected = embedding.weight.detach().clone()
+    snapshot = {}
+    trainer.model_parts = [embedding]
+    trainer.checkpointer = SimpleNamespace(
+        maybe_wait_for_staging=lambda: snapshot.update(
+            weight=embedding.weight.detach().clone()
+        )
+    )
+    monkeypatch.setattr(
+        validation_runtime,
+        "run_validation_loop",
+        lambda *args: embedding(torch.tensor([0, 1])),
+    )
+    trainer.validate(1)
+    torch.testing.assert_close(snapshot["weight"], expected, rtol=0, atol=0)
 
 
 def _trainer_cls():
@@ -119,6 +185,7 @@ def _make_trainer(
     trainer.device = torch.device("cpu")
     trainer.model = model if model is not None else _EchoModel()
     trainer.model_parts = [trainer.model]
+    trainer.checkpointer = None
     trainer.ntokens_seen = 7
     logged: dict[str, Any] = {}
     trainer.metrics = SimpleNamespace(
@@ -319,6 +386,7 @@ def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
     trainer.parallel_dims = _Dims()
     trainer.model = None
     trainer.model_parts = [_EchoModel()]
+    trainer.checkpointer = None
     trainer.pp_has_first_stage = True
     trainer.pp_has_last_stage = True
     trainer.pp_schedule = _FakePPSchedule(per_mb_loss=6.0)

@@ -1,107 +1,67 @@
-"""Input partition contracts, independent of distributed backend availability."""
+"""Token alignment through actual PyTorch CP and TP input partitions.
 
-from types import SimpleNamespace
+The fake process group supplies mesh coordinates; no collective or attention
+kernel is validated by these local DTensor partitions.
+"""
 
 import pytest
 import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from llmtuner.parallel.context_parallel import input_sharding
-
-
-def test_contiguous_sharding_does_not_require_headtail_balancer(monkeypatch):
-    monkeypatch.setattr(input_sharding, "_HeadTailLoadBalancer", None)
-    monkeypatch.setattr(
-        input_sharding, "_context_parallel_shard", lambda **kwargs: kwargs["buffers"]
-    )
-    mesh = SimpleNamespace(size=lambda: 2)
-    assert input_sharding.resolve_load_balancer(None, 8, mesh) is None
-    ids = torch.arange(8)
-    result, _ = input_sharding.shard_batch_for_tp(ids, ids, mesh)
-    assert result is ids
-    with pytest.raises(ImportError, match="headtail load balancing requires"):
-        input_sharding.resolve_load_balancer("headtail", 8, mesh)
+from llmtuner.parallel.context_parallel.input_sharding import (
+    shard_batch_for_cp,
+    shard_batch_for_tp,
+    shard_padding_mask_for_cp,
+    shard_padding_mask_for_tp,
+)
 
 
-def test_missing_shard_helper_reports_actual_dependency(monkeypatch):
-    monkeypatch.setattr(input_sharding, "_context_parallel_shard", None)
-    with pytest.raises(ImportError, match="TP/CP input sharding requires"):
-        input_sharding.shard_batch_for_tp(
-            torch.arange(8), torch.arange(8), SimpleNamespace(size=lambda: 2)
-        )
-
-
-@pytest.mark.parametrize("rank", [0, 1])
-def test_headtail_batch_and_padding_use_identical_reordering(monkeypatch, rank):
-    mesh = SimpleNamespace(size=lambda: 2, device_type="cpu")
-    balancers = []
-
-    class Balancer:
-        def __init__(self, seq_len, cp_size, device):
-            balancers.append((seq_len, cp_size, device))
-            chunks = torch.arange(seq_len).chunk(2 * cp_size)
-            self.indices = torch.cat([chunks[rank], chunks[-rank - 1]])
-
-    def shard(*, mesh, buffers, seq_dims, load_balancer):
-        return [
-            buffer.index_select(dim, load_balancer.indices)
-            for buffer, dim in zip(buffers, seq_dims, strict=True)
-        ]
-
-    monkeypatch.setattr(input_sharding, "_HeadTailLoadBalancer", Balancer)
-    monkeypatch.setattr(input_sharding, "_context_parallel_shard", shard)
-    ids = torch.arange(8)
-    labels = ids + 10
-    positions = ids + 20
-    padding = ids >= 6
-    actual = input_sharding.shard_batch_for_cp(ids, labels, positions, mesh, "headtail")
-    mask = input_sharding.shard_padding_mask_for_cp(padding, mesh, "headtail")
-    expected_indices = torch.tensor([0, 1, 6, 7] if rank == 0 else [2, 3, 4, 5])
-    for result, source in zip(
-        (*actual, mask), (ids, labels, positions, padding), strict=True
-    ):
-        torch.testing.assert_close(result, source[expected_indices])
-    assert balancers == [(8, 2, "cpu"), (8, 2, "cpu")]
-
-
-@pytest.mark.parametrize("rank", [0, 1])
-def test_tp_tokens_labels_and_padding_share_contiguous_partition(monkeypatch, rank):
-    mesh = SimpleNamespace(size=lambda: 2)
-    calls = []
-
-    def shard(*, mesh, buffers, seq_dims, load_balancer):
-        calls.append((seq_dims, load_balancer))
-        return [
-            buffer.chunk(mesh.size(), dim=dim)[rank]
-            for buffer, dim in zip(buffers, seq_dims, strict=True)
-        ]
-
-    monkeypatch.setattr(input_sharding, "require_torch_input_sharding", lambda: None)
-    monkeypatch.setattr(input_sharding, "_context_parallel_shard", shard)
-    ids = torch.arange(8)
-    labels = ids + 10
-    padding = ids >= 6
-    ids_shard, labels_shard = input_sharding.shard_batch_for_tp(ids, labels, mesh)
-    mask_shard = input_sharding.shard_padding_mask_for_tp(padding, mesh)
-    expected = slice(rank * 4, (rank + 1) * 4)
-    torch.testing.assert_close(ids_shard, ids[expected])
-    torch.testing.assert_close(labels_shard, labels[expected])
-    torch.testing.assert_close(mask_shard, padding[expected])
-    assert calls == [([0, 0], None), ([0], None)]
-
-
-@pytest.mark.parametrize("field", ["batch", "padding"])
-def test_tp_nondivisible_sequence_fails_before_sharding(monkeypatch, field):
-    monkeypatch.setattr(input_sharding, "require_torch_input_sharding", lambda: None)
-    monkeypatch.setattr(
-        input_sharding,
-        "_context_parallel_shard",
-        lambda **kwargs: pytest.fail("invalid length reached sharding"),
-    )
-    mesh = SimpleNamespace(size=lambda: 2)
-    with pytest.raises(ValueError, match="not divisible"):
-        if field == "batch":
-            input_sharding.shard_batch_for_tp(torch.arange(7), torch.arange(7), mesh)
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("load_balancer", [None, "headtail"])
+def test_cp_then_tp_preserves_token_fields(rank, load_balancer):
+    dist.init_process_group("fake", store=FakeStore(), rank=rank, world_size=4)
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("cp", "tp"))
+        cp_rank, tp_rank = divmod(rank, 2)
+        tokens = torch.arange(16)
+        labels = tokens + 100
+        positions = tokens % 5
+        padding = tokens % 3 == 1
+        original = [x.clone() for x in (tokens, labels, positions, padding)]
+        if load_balancer is None:
+            cp_indices = torch.arange(cp_rank * 8, (cp_rank + 1) * 8)
         else:
-            input_sharding.shard_padding_mask_for_tp(
-                torch.zeros(7, dtype=torch.bool), mesh
+            # Four chunks: each CP rank owns its head and opposite tail.
+            cp_indices = torch.cat(
+                [
+                    torch.arange(cp_rank * 4, (cp_rank + 1) * 4),
+                    torch.arange((3 - cp_rank) * 4, (4 - cp_rank) * 4),
+                ]
             )
+        tokens_cp, labels_cp, positions_cp = shard_batch_for_cp(
+            tokens, labels, positions, mesh["cp"], load_balancer
+        )
+        padding_cp = shard_padding_mask_for_cp(padding, mesh["cp"], load_balancer)
+        for actual, source in zip(
+            (tokens_cp, labels_cp, positions_cp, padding_cp), original, strict=True
+        ):
+            torch.testing.assert_close(actual, source[cp_indices])
+        tokens_tp, labels_tp = shard_batch_for_tp(tokens_cp, labels_cp, mesh["tp"])
+        padding_tp = shard_padding_mask_for_tp(padding_cp, mesh["tp"])
+        final_indices = cp_indices[tp_rank * 4 : (tp_rank + 1) * 4]
+        for actual, source in zip(
+            (tokens_tp, labels_tp, padding_tp),
+            (tokens, labels, padding),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, source[final_indices])
+        # RoPE consumes the CP sequence after projection gathers the TP slices.
+        torch.testing.assert_close(positions_cp, positions[cp_indices])
+        for source, snapshot in zip(
+            (tokens, labels, positions, padding), original, strict=True
+        ):
+            torch.testing.assert_close(source, snapshot)
+    finally:
+        dist.destroy_process_group()

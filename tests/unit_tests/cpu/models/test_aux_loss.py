@@ -1,9 +1,9 @@
 """Auxiliary-loss gradient injection, metric roll-up, and the balance loss.
 
-``AuxLoss`` keeps its state on the class (``_group_counts``, ``group_acc``,
-``_step_denominator``) because instances on different pipeline stages still have
-to agree on the layer count. That makes the tests order-dependent by default, so
-the fixture below snapshots and restores all three around every test.
+``AuxLoss`` keeps runtime denominators and metric snapshots on its instances.
+Standalone calls also support class defaults (``_group_counts``, ``group_acc``,
+``_step_denominator``). The fixture snapshots and restores those defaults around
+every test; runtime tests verify that separate models do not share their values.
 
 Two properties are worth proving beyond the arithmetic, because both fail
 silently:
@@ -571,3 +571,50 @@ def test_aux_hook_preserves_registered_model_parts_after_caller_list_edit():
     key = (loss.reduce_mesh, loss.metric_name)
     torch.testing.assert_close(AuxLoss.group_acc[key], torch.tensor(3.0))
     assert loss.instance_acc.item() == 0
+
+
+def test_metric_layer_count_uses_current_model_instead_of_prior_constructions():
+    previous_model = nn.Sequential(_ConstantLoss(coeff=1.0), _ConstantLoss(coeff=1.0))
+    current_model = nn.Sequential(_ConstantLoss(coeff=1.0))
+    AuxLoss.set_step_denominator(torch.tensor(1))
+    current_model[0](torch.ones(1, requires_grad=True))
+    rollup_aux_loss_metrics([current_model])
+    metrics = collect_aux_loss_metrics(_NoMeshes(), model_parts=[current_model])
+    assert metrics == {"_constant_loss/mean": 2.0}
+    assert len(previous_model) == 2
+
+
+def test_current_dense_model_excludes_stale_auxiliary_metric_groups():
+    previous_loss = _ConstantLoss(coeff=1.0)
+    previous_loss.instance_acc.fill_(2.0)
+    rollup_aux_loss_metrics([previous_loss])
+    assert collect_aux_loss_metrics(_NoMeshes(), model_parts=[nn.Linear(2, 2)]) == {}
+
+
+def test_interleaved_model_rollups_preserve_each_models_metrics():
+    first = _ConstantLoss(coeff=1.0)
+    second = _ConstantLoss(coeff=1.0)
+    first.instance_acc.fill_(2.0)
+    second.instance_acc.fill_(7.0)
+    rollup_aux_loss_metrics([first])
+    rollup_aux_loss_metrics([second])
+    assert collect_aux_loss_metrics(_NoMeshes(), model_parts=[first]) == {
+        "_constant_loss/mean": 2.0
+    }
+    assert collect_aux_loss_metrics(_NoMeshes(), model_parts=[second]) == {
+        "_constant_loss/mean": 7.0
+    }
+
+
+def test_runtime_denominators_are_isolated_and_discard_failed_step_metrics():
+    first = _ConstantLoss(coeff=1.0)
+    second = _ConstantLoss(coeff=1.0)
+    first.instance_acc.fill_(99.0)  # A previous failed forward never rolled up.
+    AuxLoss.set_step_denominator(torch.tensor(2.0), model_parts=[first])
+    AuxLoss.set_step_denominator(torch.tensor(8.0), model_parts=[second])
+    for loss, denominator in [(first, 2.0), (second, 8.0)]:
+        raw = torch.tensor(4.0, requires_grad=True)
+        carrier = torch.ones(1, requires_grad=True)
+        loss.inject(raw, carrier=carrier).sum().backward()
+        torch.testing.assert_close(raw.grad, torch.tensor(1.0 / denominator))
+        torch.testing.assert_close(loss.instance_acc, torch.tensor(4.0 / denominator))

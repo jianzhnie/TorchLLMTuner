@@ -347,3 +347,88 @@ def test_ulysses_packed_is_accepted_and_the_strategy_is_latched(tp_cp_mesh) -> N
         ),
     )
     assert model.cp_strategy == "kv_allgather"
+
+
+@pytest.mark.parametrize("failure", ["missing_attention", "kernel_setup"])
+def test_cp_missing_late_attention_preserves_earlier_kernel(monkeypatch, failure):
+    from types import SimpleNamespace
+
+    from llmtuner.models.hf.attention_backend import ATTENTION_BACKEND
+    from llmtuner.parallel.context_parallel import context_parallel as cp
+
+    old_kernel = object()
+    attention = SimpleNamespace(_titan_flex_kernel=old_kernel)
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            config=SimpleNamespace(_attn_implementation=ATTENTION_BACKEND)
+        ),
+        layers=[SimpleNamespace(self_attn=attention), SimpleNamespace()],
+        set_cp_mesh=lambda *args, **kwargs: pytest.fail("invalid model changed mesh"),
+    )
+
+    class Mesh:
+        mesh_dim_names = ("cp",)
+
+        def __getitem__(self, key):
+            return self
+
+        def size(self):
+            return 2
+
+    calls = []
+
+    def kernel(**kwargs):
+        calls.append(kwargs)
+        if failure == "kernel_setup" and len(calls) == 2:
+            raise RuntimeError("kernel setup failed")
+        return object()
+
+    if failure == "kernel_setup":
+        model.layers[1].self_attn = SimpleNamespace()
+    monkeypatch.setattr(cp, "CPFlexKernel", kernel)
+    error = AttributeError if failure == "missing_attention" else RuntimeError
+    message = "layer 1" if failure == "missing_attention" else "kernel setup failed"
+    with pytest.raises(error, match=message):
+        apply_cp(
+            model, mesh=Mesh(), cfg=ParallelConfig(context_parallel_kv_allgather_size=2)
+        )
+    assert attention._titan_flex_kernel is old_kernel
+
+
+@pytest.mark.parametrize("axis", ["cp_kv", "cp_ulysses"])
+def test_dual_cp_rejects_wrong_axis_degree_before_kernel_setup(monkeypatch, axis):
+    from types import SimpleNamespace
+
+    from llmtuner.models.hf.attention_backend import ATTENTION_BACKEND
+    from llmtuner.parallel.context_parallel import context_parallel as cp
+
+    class Mesh:
+        mesh_dim_names = ("cp",)
+
+        def __init__(self, degree):
+            self.degree = degree
+
+        def __getitem__(self, key):
+            return self
+
+        def size(self):
+            return self.degree
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            config=SimpleNamespace(_attn_implementation=ATTENTION_BACKEND)
+        )
+    )
+    topology = SimpleNamespace(
+        get_optional_mesh=lambda name: Mesh(1 if name == axis else 2)
+    )
+    monkeypatch.setattr(cp, "_require_ulysses_compatible", lambda *a, **kw: None)
+    with pytest.raises(ValueError, match=axis):
+        apply_cp(
+            model,
+            mesh=Mesh(4),
+            cfg=ParallelConfig(
+                context_parallel_kv_allgather_size=2, context_parallel_ulysses_size=2
+            ),
+            parallel_dims=topology,
+        )

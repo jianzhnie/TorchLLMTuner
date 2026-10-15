@@ -1044,3 +1044,87 @@ def test_training_rejects_invalid_gradient_clip_threshold(value):
 @pytest.mark.parametrize("value", [-1, 0, 1.5])
 def test_training_accepts_finite_gradient_clip_threshold(value):
     assert TrainingConfig(max_norm=value).max_norm == value
+
+
+@pytest.mark.parametrize("field", ["fixed_router", "moe_quantile_balancing"])
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_ep_routing_flags_require_actual_booleans(field, value):
+    from llmtuner.config.parallel_config import ExpertParallelConfig
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match=field):
+        ExpertParallelConfig(**{field: value})
+
+
+@pytest.mark.parametrize("value", [True, "0.1", float("nan"), float("inf"), -0.1])
+def test_ep_aux_loss_coefficient_rejects_invalid_values(value):
+    from llmtuner.config.parallel_config import ExpertParallelConfig
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="router_aux_loss_coef"):
+        ExpertParallelConfig(router_aux_loss_coef=value)
+
+
+@pytest.mark.parametrize("value", [None, 0, 0.1])
+def test_ep_aux_loss_coefficient_accepts_finite_nonnegative_values(value):
+    from llmtuner.config.parallel_config import ExpertParallelConfig
+
+    assert (
+        ExpertParallelConfig(router_aux_loss_coef=value).router_aux_loss_coef == value
+    )
+
+
+@pytest.mark.parametrize("field", ["compile", "deterministic", "detect_anomaly"])
+@pytest.mark.parametrize("value", ["false", 0, 1, None])
+def test_training_execution_flags_require_bool(field, value):
+    from llmtuner.config.training_config import TrainingConfig
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match=field):
+        TrainingConfig(**{field: value})
+
+
+@pytest.mark.parametrize("value, expected", [("true", True), ("false", False)])
+def test_cli_training_execution_flags_parse_as_bool(value, expected):
+    from llmtuner.trainer.cli import parse_config
+
+    config = parse_config(
+        [
+            "--steps",
+            "1",
+            "--compile",
+            value,
+            "--deterministic",
+            value,
+            "--detect_anomaly",
+            value,
+        ]
+    )
+    for name in ("compile", "deterministic", "detect_anomaly"):
+        assert getattr(config.training, name) is expected
+
+
+@pytest.mark.parametrize("value", ["false", 0, 1, None])
+def test_dataloader_shuffle_requires_bool(value):
+    from llmtuner.config.data_config import DataloaderConfig
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="shuffle"):
+        DataloaderConfig(shuffle=value)
+
+
+@pytest.mark.parametrize("field", ["prompt_field", "response_field", "messages_field"])
+@pytest.mark.parametrize("value", [None, 1, [], "   "])
+def test_sft_fields_reject_invalid_names(field, value):
+    from llmtuner.config.data_config import DataloaderConfig
+    from llmtuner.errors import ConfigError
+
+    options = dict(
+        dataset="local_jsonl_sft",
+        tokenizer_path="tokenizer",
+        dataset_path="corpus.jsonl",
+    )
+    if field == "messages_field":
+        options["chat_renderer"] = "renderer"
+    with pytest.raises(ConfigError, match=field):
+        DataloaderConfig(**options, **{field: value})

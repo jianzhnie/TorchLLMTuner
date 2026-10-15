@@ -44,7 +44,50 @@ The synthetic random corpus is registered in the checkpoint's ``states`` under
 from the saved absolute batch index), so the resume phase reads exactly the batches the
 uninterrupted run consumed at steps N+1..N+M with no manual fast-forward.
 
+Final model, optimizer, scheduler, trainer counters and enabled EMA are compared
+exactly. Set LLMTUNER_TEST_EMA=dynamic in both phases to exercise EMA aging.
+
 Everything runs in fp32 on CPU/gloo. The caller owns the workdir and its cleanup.
+Set LLMTUNER_TEST_RELOCATED_HOOKS=1 with custom in both phases to
+configure four attention projection units per ancestor hook and verify real
+Trainer/AdamW/DCP/EMA resume with four communication contexts.
+Set LLMTUNER_TEST_AC=full or selective in both phases to compose checkpoint
+replay with those hooks; Interleaved1F1B exercises every local model part.
+Set LLMTUNER_TEST_COMPILE_BACKEND=aot_eager in both phases to exercise
+whole-model compilation; asserts OptimizedModule and nonzero compiled graphs.
+Set LLMTUNER_TEST_PP_SIZE=1 and LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom
+in both phases to check a real Trainer with FSDP2 over the same two ranks.
+For PP2 × FSDP2 use four ranks with LLMTUNER_TEST_WORLD_SIZE=4,
+LLMTUNER_TEST_PP_SIZE=2 and LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom.
+Set LLMTUNER_TEST_PP_SCHEDULE=Interleaved1F1B or ZBVZeroBubble in both
+phases for two local stages per rank; those cases use six decoder layers.
+The loss reference writer follows the schedule's last-stage ownership.
+For packed PP2 × KV-CP2 on four ranks, additionally set LLMTUNER_TEST_CP_SIZE=2
+and LLMTUNER_TEST_SEQ_LEN=256 in both phases and append --packed. CPU retains
+CP mask predicates and collectives with explicit dense SDPA arithmetic.
+Set LLMTUNER_TEST_ASYNC_MODE=async in both phases for CPU-compatible threaded
+DCP upload; the full phase closes the Trainer before inspecting the checkpoint.
+The pinned process stager requires its target-device environment.
+
+Set LLMTUNER_TEST_MOE=1 and LLMTUNER_TEST_EP_SIZE=2 on four ranks
+(LLMTUNER_TEST_WORLD_SIZE=4, LLMTUNER_TEST_PP_SIZE=1) for real qwen3_moe
+EP2/FSDP4 recovery. Add LLMTUNER_TEST_SHARED_LAYERS=1 to share Q projections
+across the two MoE layers; all phases must use the same configuration.
+
+Set LLMTUNER_TEST_SHARED_ROOT_EXPERT=1 with the MoE/EP scenario to register
+an alias to the converted local expert down projection at the wrapper root,
+after EP conversion and before FSDP; check sparse parameter identity on recovery.
+
+Set LLMTUNER_TEST_SHARED_ROOT=1 with LLMTUNER_TEST_PP_SIZE=1 to register
+layer 0 Q projection weight at the wrapper root and check shared identity during
+training and new-runtime checkpoint recovery.
+
+Set LLMTUNER_TEST_SHARED_BOUNDARY=1 with LLMTUNER_TEST_PP_SIZE=1 to share
+layer 0 input RMSNorm weight with the final RMSNorm, checking the default FSDP
+boundary ownership through training and recovery.
+
+Set LLMTUNER_TEST_SHARED_LAYERS=1 with LLMTUNER_TEST_PP_SIZE=1 to tie the
+first two decoder Q projections before FSDP and check grouped-state recovery.
 """
 
 from __future__ import annotations
@@ -56,7 +99,9 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
+from llmtuner.components.metrics import get_metrics_rank
 from llmtuner.config import (
     CheckpointConfig,
     DataloaderConfig,
@@ -68,38 +113,115 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
-from llmtuner.config.parallel_config import PipelineParallelConfig
+from llmtuner.config.compile_config import CompileConfig
+from llmtuner.config.parallel_config import FSDPConfig, PipelineParallelConfig
 from llmtuner.trainer.trainer import Trainer
+from llmtuner.utils.module_names import canonical_fqn
 
 SPLIT_STEP = 2  # N: checkpoint taken after this many steps
 EXTRA_STEPS = 2  # M: steps trained after the checkpoint (both runs)
 TOTAL_STEPS = SPLIT_STEP + EXTRA_STEPS
 MICROBATCHES = 4
 GLOBAL_BATCH = 8
-SEQ = 32
+SEQ = int(os.environ.get("LLMTUNER_TEST_SEQ_LEN", "32"))
 VOCAB = 128
 SEED = 42
 
 FULL_LOSSES_FILE = "losses_full.json"
 
 
+def _equal_rank_state(
+    actual: torch.Tensor, expected: torch.Tensor, *, label: str = "tensor"
+) -> bool:
+    """Compare every rank's shard without DTensor.equal's world collective.
+
+    Pipeline stages own different numbers of tensors. DTensor.equal reduces
+    over the default process group, so comparing their state directly can
+    mismatch collectives across stages. All ranks validate their local shards;
+    the final world reduction aggregates failures after all comparisons.
+    """
+    if isinstance(actual, DTensor) != isinstance(expected, DTensor):
+        print(f"{label}: tensor types differ: {type(actual)} vs {type(expected)}")
+        return False
+    if isinstance(actual, DTensor):
+        if (
+            actual.shape != expected.shape
+            or actual.placements != expected.placements
+            or not torch.equal(actual.device_mesh.mesh, expected.device_mesh.mesh)
+        ):
+            print(
+                f"{label}: DTensor layouts differ: "
+                f"shape={actual.shape}/{expected.shape}, "
+                f"placements={actual.placements}/{expected.placements}, "
+                f"mesh={actual.device_mesh.mesh}/{expected.device_mesh.mesh}"
+            )
+            return False
+        actual, expected = actual.to_local(), expected.to_local()
+    actual, expected = actual.cpu(), expected.cpu()
+    if actual.dtype != expected.dtype or actual.shape != expected.shape:
+        print(
+            f"{label}: local metadata differs: "
+            f"dtype={actual.dtype}/{expected.dtype}, "
+            f"shape={actual.shape}/{expected.shape}"
+        )
+        return False
+    if torch.equal(actual, expected):
+        return True
+    # Diagnostics preserve exact equality as the acceptance criterion.
+    actual_values, expected_values = (
+        actual.to(torch.float64),
+        expected.to(torch.float64),
+    )
+    difference = (actual_values - expected_values).abs()
+    relative = difference / expected_values.abs().clamp_min(
+        torch.finfo(torch.float64).tiny
+    )
+    print(
+        f"{label}: values differ: max_abs={difference.max().item():.9g}, "
+        f"max_rel={relative.max().item():.9g}, "
+        f"unequal={torch.count_nonzero(actual != expected).item()}/{actual.numel()}"
+    )
+    return False
+
+
 def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
     data_root = os.path.join(workdir, f"data-rank-{os.environ.get('RANK', '0')}")
+    schedule = os.environ.get("LLMTUNER_TEST_PP_SCHEDULE", "1F1B")
+    moe = os.environ.get("LLMTUNER_TEST_MOE") == "1"
     return LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3",  # offline: AutoConfig.for_model("qwen3", ...)
+            model_name_or_path="qwen3_moe" if moe else "qwen3",
+            experts_implementation="eager" if moe else "native",
+            norm_backend=os.environ.get("LLMTUNER_TEST_NORM_BACKEND", "native"),
+            arch_overrides={
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 48,
+                "norm_topk_prob": True,
+            }
+            if moe
+            else {},
             vocab_size=VOCAB,
             hidden_size=64,
             intermediate_size=128,
-            num_hidden_layers=2,
+            num_hidden_layers=2 if schedule in {"1F1B", "GPipe"} else 6,
             num_attention_heads=4,
             num_key_value_heads=4,
         ),
         parallel=ParallelConfig(
-            pipeline_parallel_size=2,
+            expert_parallel_size=int(os.environ.get("LLMTUNER_TEST_EP_SIZE", "1")),
+            pipeline_parallel_size=int(os.environ.get("LLMTUNER_TEST_PP_SIZE", "2")),
+            context_parallel_kv_allgather_size=int(
+                os.environ.get("LLMTUNER_TEST_CP_SIZE", "1")
+            ),
             data_parallel_shard_size=-1,
+            fsdp_config=FSDPConfig(
+                fsdp_implementation=os.environ.get(
+                    "LLMTUNER_TEST_FSDP_IMPLEMENTATION", "native"
+                )
+            ),
             pp_config=PipelineParallelConfig(
-                pipeline_parallel_schedule="1F1B", num_pp_microbatches=MICROBATCHES
+                pipeline_parallel_schedule=schedule, num_pp_microbatches=MICROBATCHES
             ),
         ),
         optimizer=OptimizerConfig(learning_rate=3e-4, weight_decay=0.0),
@@ -109,11 +231,17 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
             steps=TOTAL_STEPS,
             seed=SEED,
             deterministic=True,
+            compile="LLMTUNER_TEST_COMPILE_BACKEND" in os.environ,
+            compile_config=CompileConfig(
+                backend=os.environ.get("LLMTUNER_TEST_COMPILE_BACKEND", "inductor")
+            ),
+            activation_checkpoint_mode=os.environ.get("LLMTUNER_TEST_AC", "none"),
             dump_folder=workdir,
             checkpoint_config=CheckpointConfig(
                 enable=True,
                 folder="checkpoint",
                 interval=SPLIT_STEP,
+                async_mode=os.environ.get("LLMTUNER_TEST_ASYNC_MODE", "disabled"),
                 # No retention policy to exercise: keep the purge thread out.
                 keep_latest_k=0,
             ),
@@ -144,16 +272,127 @@ def _train_steps(trainer: Trainer, data_iterator, num_steps: int) -> list[float]
     for _ in range(num_steps):
         trainer.step += 1
         metrics = trainer.train_step(data_iterator)
+        if "LLMTUNER_TEST_COMPILE_BACKEND" in os.environ:
+            from torch._dynamo.eval_frame import OptimizedModule
+            from torch._dynamo.utils import counters
+
+            assert all(
+                isinstance(part, OptimizedModule) for part in trainer.model_parts
+            )
+            assert counters["stats"]["unique_graphs"] > 0
+        _assert_shared_layers(trainer)
         assert metrics is not None  # log_freq=1: every step reports
-        if trainer.pp_has_last_stage:
+        if not trainer.parallel_dims.pp_enabled or trainer.pp_has_last_stage:
             losses.append(metrics["loss"])
     return losses
 
 
+def _assert_shared_layers(trainer: Trainer) -> None:
+    if os.environ.get("LLMTUNER_TEST_NORM_BACKEND") == "aten":
+        from llmtuner.models.hf.normalization import forward_aten_rms_norm
+
+        norms = [
+            module
+            for part in trainer.model_parts
+            for module in part.modules()
+            if type(module).__name__ in ("Qwen3RMSNorm", "Qwen3MoeRMSNorm")
+        ]
+        assert norms, "aten normalization scenario did not find any Qwen norms"
+        assert all(
+            getattr(module.forward, "__func__", None) is forward_aten_rms_norm
+            for module in norms
+        ), "requested aten normalization backend was not applied"
+    if os.environ.get("LLMTUNER_TEST_RELOCATED_HOOKS") == "1":
+        from llmtuner.parallel.fully_shard_parallel.fine_grained_state import (
+            FineGrainedFSDPState,
+        )
+
+        for model in trainer.model_parts:
+            root = model._get_fsdp_state()
+            assert isinstance(root, FineGrainedFSDPState)
+            if root._is_root is not None:
+                assert len(root.communication_contexts) == 4
+            for layer in model.layers:
+                states = [
+                    getattr(layer.self_attn, name)._get_fsdp_state()
+                    for name in ("q_proj", "k_proj", "v_proj", "o_proj")
+                ]
+                if root._is_root is not None:
+                    assert len({id(state._comm_ctx) for state in states}) == 4
+                assert all(state.hook_module() is layer.self_attn for state in states)
+    if os.environ.get("LLMTUNER_TEST_SHARED_ROOT_EXPERT") == "1":
+        model = trainer.model_parts[0]
+        first = list(model.layers)[0]
+        assert model.external_expert is first.mlp.routed_experts.inner_experts.w2_EDF
+    if (
+        os.environ.get("LLMTUNER_TEST_MOE") == "1"
+        and int(os.environ.get("LLMTUNER_TEST_EP_SIZE", "1")) > 1
+    ):
+        from llmtuner.models.common.moe.layer import MoE
+
+        ep_size = int(os.environ["LLMTUNER_TEST_EP_SIZE"])
+        dense_degree = trainer.world_size // trainer.parallel_dims.pp
+        for layer in trainer.model_parts[0].layers:
+            assert isinstance(layer.mlp, MoE)
+            expert = layer.mlp.routed_experts.inner_experts.w1_EFD
+            router = layer.mlp.router.gate.weight
+            assert isinstance(expert, DTensor)
+            assert isinstance(router, DTensor)
+            assert expert.device_mesh.size() == dense_degree // ep_size
+            assert router.device_mesh.size() == dense_degree
+    if os.environ.get("LLMTUNER_TEST_SHARED_ROOT") == "1":
+        model = trainer.model_parts[0]
+        first = list(model.layers)[0]
+        assert model.external_weight is first.self_attn.q_proj.weight
+    if os.environ.get("LLMTUNER_TEST_SHARED_BOUNDARY") == "1":
+        model = trainer.model_parts[0]
+        first = list(model.layers)[0]
+        assert first.input_layernorm.weight is model.norm.weight
+        assert first._get_fsdp_state() is model.norm._get_fsdp_state()
+    if os.environ.get("LLMTUNER_TEST_SHARED_LAYERS") != "1":
+        return
+    first, second = list(trainer.model_parts[0].layers)[:2]
+    assert first.self_attn.q_proj.weight is second.self_attn.q_proj.weight
+    assert first._get_fsdp_state() is second._get_fsdp_state()
+
+
+def _runtime_state(trainer: Trainer) -> dict:
+    return {
+        "model": {
+            canonical_fqn(key): value.detach().cpu().clone()
+            for part in trainer.model_parts
+            for key, value in part.state_dict().items()
+        },
+        "ntokens_seen": trainer.ntokens_seen,
+        "trainer": trainer.state_dict(),
+        "optimizer": trainer.optimizer.state_dict(),
+        "scheduler": trainer.lr_scheduler.state_dict(),
+        "ema": trainer.ema.state_dict() if trainer.ema is not None else {},
+    }
+
+
+def _compare_loaded_state(actual, expected, failures: list[str], path: str) -> None:
+    if isinstance(actual, torch.Tensor) and isinstance(expected, torch.Tensor):
+        if not _equal_rank_state(actual, expected, label=path):
+            failures.append(f"{path}: loaded tensor differs before any update")
+    elif isinstance(actual, dict) and isinstance(expected, dict):
+        if actual.keys() != expected.keys():
+            failures.append(f"{path}: loaded keys differ before any update")
+        for key in actual.keys() & expected.keys():
+            _compare_loaded_state(actual[key], expected[key], failures, f"{path}.{key}")
+    elif isinstance(actual, tuple | list) and isinstance(expected, type(actual)):
+        if len(actual) != len(expected):
+            failures.append(f"{path}: loaded sequence length differs")
+        for index, (got, want) in enumerate(zip(actual, expected, strict=False)):
+            _compare_loaded_state(got, want, failures, f"{path}.{index}")
+    elif type(actual) is not type(expected) or actual != expected:
+        failures.append(f"{path}: loaded metadata differs before any update")
+
+
 def _phase_full(workdir: str, *, packed: bool = False) -> None:
     trainer = Trainer(_cfg(workdir, packed=packed))
-    assert trainer.world_size == 2, (
-        f"this check assumes 2 ranks, got {trainer.world_size}"
+    assert trainer.world_size == int(os.environ.get("LLMTUNER_TEST_WORLD_SIZE", "2")), (
+        f"unexpected world size: {trainer.world_size}"
     )
 
     data_iterator = trainer.data_iterator()
@@ -174,23 +413,25 @@ def _phase_full(workdir: str, *, packed: bool = False) -> None:
     else:
         saved = trainer.checkpointer.save(SPLIT_STEP)
     assert saved, "the split-step checkpoint was not written"
+    torch.save(
+        _runtime_state(trainer),
+        os.path.join(workdir, f"split-state-rank-{trainer.rank}.pt"),
+    )
 
     losses += _train_steps(trainer, data_iterator, EXTRA_STEPS)
     torch.save(
-        {
-            "model": {
-                key: value.detach().cpu().clone()
-                for part in trainer.model_parts
-                for key, value in part.state_dict().items()
-            },
-            "ntokens_seen": trainer.ntokens_seen,
-            "ema": trainer.ema.state_dict() if trainer.ema is not None else {},
-        },
+        _runtime_state(trainer),
         os.path.join(workdir, f"final-state-rank-{trainer.rank}.pt"),
     )
 
+    # close must drain an async upload before its checkpoint is inspected or
+    # a separate resume process is started. Final state has already been captured.
+    trainer.close()
     checkpoint_dir = os.path.join(workdir, "checkpoint", f"step-{SPLIT_STEP}")
-    if trainer.pp_has_last_stage:
+    if trainer.rank == get_metrics_rank(
+        parallel_dims=trainer.parallel_dims,
+        pp_schedule=trainer.cfg.parallel.pp_config.pipeline_parallel_schedule,
+    ):
         with open(os.path.join(workdir, FULL_LOSSES_FILE), "w") as f:
             json.dump(losses, f)
         assert os.path.isfile(os.path.join(checkpoint_dir, ".metadata")), (
@@ -203,7 +444,6 @@ def _phase_full(workdir: str, *, packed: bool = False) -> None:
         flush=True,
     )
     dist.barrier()
-    trainer.close()
     dist.destroy_process_group()
 
 
@@ -212,12 +452,13 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
     if "LLMTUNER_TEST_RESUME_LR" in os.environ:
         cfg.optimizer.learning_rate = float(os.environ["LLMTUNER_TEST_RESUME_LR"])
     trainer = Trainer(cfg)
-    assert trainer.world_size == 2, (
-        f"this check assumes 2 ranks, got {trainer.world_size}"
+    assert trainer.world_size == int(os.environ.get("LLMTUNER_TEST_WORLD_SIZE", "2")), (
+        f"unexpected world size: {trainer.world_size}"
     )
     failures: list[str] = []
 
     loaded = trainer.checkpointer.load(-1)
+    _assert_shared_layers(trainer)
     if not loaded:
         failures.append(f"rank {trainer.rank}: no checkpoint was loaded")
     if trainer.step != SPLIT_STEP:
@@ -225,6 +466,22 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
             f"rank {trainer.rank}: resumed at step {trainer.step}, "
             f"expected {SPLIT_STEP}"
         )
+
+    split_state_path = os.path.join(workdir, f"split-state-rank-{trainer.rank}.pt")
+    # Older harness artifacts lack this independent save-point snapshot.
+    if os.path.isfile(split_state_path):
+        split_state = torch.load(
+            split_state_path, map_location="cpu", weights_only=True
+        )
+        # A deliberate LR override tests a different contract from exact restore.
+        if "LLMTUNER_TEST_RESUME_LR" not in os.environ:
+            _compare_loaded_state(
+                _runtime_state(trainer),
+                split_state,
+                failures,
+                f"rank {trainer.rank}.split",
+            )
+            print(f"rank {trainer.rank}: pre-update state failures={len(failures)}")
 
     # Non-vacuity: the optimizer must have come back warm -- a cold Adam (no
     # or zeroed moments) is exactly the failure a loss match would then catch,
@@ -253,7 +510,7 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
         weights_only=True,
     )
     actual_parameters = {
-        key: value.detach().cpu()
+        canonical_fqn(key): value.detach().cpu()
         for part in trainer.model_parts
         for key, value in part.state_dict().items()
     }
@@ -261,10 +518,28 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
         failures.append(f"rank {trainer.rank}: final model keys differ")
     else:
         for key, actual in actual_parameters.items():
-            if not torch.equal(actual, final_state["model"][key]):
+            if not _equal_rank_state(actual, final_state["model"][key], label=key):
                 failures.append(f"rank {trainer.rank}: final parameter {key} differs")
     if trainer.ntokens_seen != final_state["ntokens_seen"]:
         failures.append(f"rank {trainer.rank}: restored token counter differs")
+    if trainer.state_dict() != final_state["trainer"]:
+        failures.append(f"rank {trainer.rank}: final trainer state differs")
+    if trainer.lr_scheduler.state_dict() != final_state["scheduler"]:
+        failures.append(f"rank {trainer.rank}: final scheduler state differs")
+    actual_optimizer = trainer.optimizer.state_dict()
+    expected_optimizer = final_state["optimizer"]
+    if actual_optimizer.keys() != expected_optimizer.keys():
+        failures.append(f"rank {trainer.rank}: final optimizer keys differ")
+    else:
+        for key, actual in actual_optimizer.items():
+            expected = expected_optimizer[key]
+            matches = (
+                _equal_rank_state(actual, expected, label=key)
+                if isinstance(actual, torch.Tensor)
+                else actual == expected
+            )
+            if not matches:
+                failures.append(f"rank {trainer.rank}: optimizer {key} differs")
     if trainer.ema is not None:
         actual_ema = trainer.ema.state_dict()
         expected_ema = final_state["ema"]
@@ -274,7 +549,7 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
             for key, actual in actual_ema.items():
                 expected = expected_ema[key]
                 if isinstance(actual, torch.Tensor):
-                    if not torch.equal(actual.cpu(), expected.cpu()):
+                    if not _equal_rank_state(actual, expected, label=key):
                         failures.append(f"rank {trainer.rank}: EMA {key} differs")
                 elif actual != expected:
                     failures.append(f"rank {trainer.rank}: EMA metadata {key} differs")
@@ -285,7 +560,13 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
 
     # The real losses live on the last-stage rank; collect them everywhere.
     gathered = [losses]
-    dist.broadcast_object_list(gathered, src=trainer.world_size - 1)
+    dist.broadcast_object_list(
+        gathered,
+        src=get_metrics_rank(
+            parallel_dims=trainer.parallel_dims,
+            pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
+        ),
+    )
     resumed_losses = gathered[0]
 
     max_diff = 0.0
@@ -302,18 +583,21 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
 
     local_ok = torch.tensor([0.0 if not failures else 1.0])
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
+    rank_failures = [None] * trainer.world_size
+    dist.all_gather_object(rank_failures, failures)
 
     if trainer.rank == 0:
         print(
-            f"pp=2 checkpoint round-trip: split={SPLIT_STEP} "
-            f"extra={EXTRA_STEPS} microbatches={MICROBATCHES}"
+            f"pp={cfg.parallel.pp_size} checkpoint round-trip: split={SPLIT_STEP} "
+            f"extra={EXTRA_STEPS} fsdp={cfg.parallel.fsdp_config.fsdp_implementation}"
         )
         print(f"uninterrupted losses = {[f'{x:.6f}' for x in full_losses]}")
         print(f"resumed losses       = {[f'{x:.6f}' for x in resumed_losses]}")
         print(f"max abs diff         = {max_diff:.3e}")
-        for f_ in failures:
-            print(f"  FAIL {f_}")
-        if not failures:
+        for errors in rank_failures:
+            for error in errors:
+                print(f"  FAIL {error}")
+        if local_ok.item() == 0:
             print("all checks passed")
 
     dist.barrier()
@@ -323,7 +607,7 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
     assert local_ok.item() == 0, "PP checkpoint round-trip check failed"
 
 
-def main() -> None:
+def _run() -> None:
     phase = sys.argv[1] if len(sys.argv) > 1 else None
     workdir = sys.argv[2] if len(sys.argv) > 2 else None
     if phase not in ("full", "resume") or not workdir:
@@ -351,6 +635,15 @@ def main() -> None:
             )
             os.makedirs(data_root, exist_ok=True)
             _write_corpus(data_root)
+        if (
+            device_type == "cpu"
+            and int(os.environ.get("LLMTUNER_TEST_CP_SIZE", "1")) > 1
+        ):
+            from tests.integration_tests.pp_cp_equivalence import cpu_cp_attention
+
+            with cpu_cp_attention():
+                run_phase(workdir, packed=True)
+            return
         if device_type == "cpu":
             with patch.object(
                 HFTransformerModel, "_apply_attention", _cpu_packed_attention
@@ -358,6 +651,74 @@ def main() -> None:
                 run_phase(workdir, packed=True)
             return
     run_phase(workdir, packed=packed)
+
+
+def main() -> None:
+    if os.environ.get("LLMTUNER_TEST_RELOCATED_HOOKS") == "1":
+        if os.environ.get("LLMTUNER_TEST_FSDP_IMPLEMENTATION") != "custom":
+            raise ValueError("Relocated-hook checkpoint scenario requires custom FSDP")
+        from llmtuner.trainer.runtime import assembly
+
+        apply_parallelism = assembly._apply_parallelism
+
+        def configure_hooks(trainer, model, **kwargs):
+            # Hook targets must be actual modules, available after model build.
+            names = {module: name for name, module in model.named_modules()}
+            trainer.cfg.parallel.fsdp_config.fsdp_apply_modules = {
+                names[getattr(layer.self_attn, name)]: {"hook_module": layer.self_attn}
+                for layer in model.layers
+                for name in ("q_proj", "k_proj", "v_proj", "o_proj")
+            }
+            apply_parallelism(trainer, model, **kwargs)
+
+        with patch.object(assembly, "_apply_parallelism", configure_hooks):
+            _run()
+        return
+    shared_layers = os.environ.get("LLMTUNER_TEST_SHARED_LAYERS") == "1"
+    shared_boundary = os.environ.get("LLMTUNER_TEST_SHARED_BOUNDARY") == "1"
+    shared_root = os.environ.get("LLMTUNER_TEST_SHARED_ROOT") == "1"
+    shared_root_expert = os.environ.get("LLMTUNER_TEST_SHARED_ROOT_EXPERT") == "1"
+    if not (shared_layers or shared_boundary or shared_root or shared_root_expert):
+        _run()
+        return
+    if os.environ.get("LLMTUNER_TEST_PP_SIZE") != "1":
+        raise ValueError("Shared-parameter checkpoint scenarios require PP1")
+    from llmtuner.models.hf.model import HFTransformerModel
+
+    original_init = HFTransformerModel.__init__
+
+    def initialize_shared(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if shared_layers:
+            first, second = self.layers[:2]
+            second.self_attn.q_proj.weight = first.self_attn.q_proj.weight
+        if shared_boundary:
+            self.layers[0].input_layernorm.weight = self.norm.weight
+        if shared_root:
+            self.register_parameter(
+                "external_weight", self.layers[0].self_attn.q_proj.weight
+            )
+
+    from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
+
+    def apply_ep_with_alias(model, **kwargs):
+        model = apply_ep(model, **kwargs)
+        if shared_root_expert:
+            if os.environ.get("LLMTUNER_TEST_MOE") != "1" or not isinstance(
+                model.layers[0].mlp, MoE
+            ):
+                raise ValueError("Root expert checkpoint scenario requires MoE/EP")
+            expert = model.layers[0].mlp.routed_experts.inner_experts.w2_EDF
+            model.register_parameter("external_expert", expert)
+        return model
+
+    from llmtuner.models.common.moe.layer import MoE
+
+    with (
+        patch.object(HFTransformerModel, "__init__", initialize_shared),
+        patch("llmtuner.parallel.parallelize.apply_ep", apply_ep_with_alias),
+    ):
+        _run()
 
 
 if __name__ == "__main__":

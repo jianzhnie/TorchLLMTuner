@@ -586,6 +586,58 @@ def test_profiler_start_failure_stops_started_trace(monkeypatch, error_type):
     assert profiler.torch_profiler is None
 
 
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_partial_trace_entry_failure_attempts_cleanup(
+    monkeypatch, tmp_path, error_type, cleanup_fails
+):
+    calls = []
+    original = error_type("trace start failed")
+
+    class Trace:
+        def __enter__(self):
+            calls.append("start")
+            raise original
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            calls.append("stop")
+            assert exc_value is original
+            if cleanup_fails:
+                raise ValueError("trace stop failed")
+
+    monkeypatch.setattr(torch.profiler, "profile", lambda **kwargs: Trace())
+    profiler = Profiler(Config(enable_profiling=True), base_folder=str(tmp_path))
+    with pytest.raises(error_type, match="trace start failed") as raised:
+        profiler.__enter__()
+    assert raised.value is original
+    assert calls == ["start", "stop"]
+    assert profiler.torch_profiler is None
+    assert not profiler._entered
+
+
+@_NO_WARMUP
+def test_started_cpu_trace_is_exported_when_entry_later_raises(monkeypatch, tmp_path):
+    enter = torch.profiler.profile.__enter__
+
+    def start_then_fail(trace):
+        enter(trace)
+        torch.ones(2).add_(1)
+        raise RuntimeError("failure after trace activation")
+
+    cfg = Config(enable_profiling=True, profile_freq=1, profiler_warmup=0)
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.profiler.profile, "__enter__", start_then_fail)
+        with pytest.raises(RuntimeError, match="after trace activation"):
+            with Profiler(cfg, base_folder=str(tmp_path)):
+                pytest.fail("failed entry must not reach the body")
+    assert list(tmp_path.rglob("rank0_trace.json.gz"))
+    # A subsequent trace can start after the partially entered one is stopped.
+    with Profiler(cfg, base_folder=str(tmp_path / "next")) as profiler:
+        torch.ones(2).mul_(2)
+        profiler.step()
+    assert list((tmp_path / "next").rglob("rank0_trace.json.gz"))
+
+
 @pytest.mark.parametrize("snapshot_fails", [False, True])
 def test_profiler_exit_preserves_oom_and_attempts_snapshot_after_trace_failure(
     snapshot_fails,
@@ -642,7 +694,7 @@ def test_memory_history_stops_after_snapshot_and_preserves_training_error(
 
     def stop_history():
         calls.append("stop")
-        if close_fails:
+        if close_fails and calls.count("stop") == 1:
             raise RuntimeError("history shutdown failed")
 
     monkeypatch.setattr(profiler_module, "stop_memory_history", stop_history)
@@ -661,9 +713,14 @@ def test_memory_history_stops_after_snapshot_and_preserves_training_error(
             profiler.__exit__(type(original) if oom else None, original, None) is False
         )
     assert calls == (["snapshot", "stop"] if oom else ["stop"])
-    memory.close()
+    assert (profiler.memory_profiler is memory) is close_fails
+    assert memory._records_history is close_fails
+    # Retry through the owning scope rather than losing the active recorder.
     profiler.__exit__(None, None, None)
-    assert calls.count("stop") == 1
+    memory.close()
+    assert profiler.memory_profiler is None
+    assert memory._records_history is False
+    assert calls.count("stop") == (2 if close_fails else 1)
 
 
 def test_stop_memory_history_disables_device_allocator(monkeypatch):
@@ -711,3 +768,96 @@ def test_invalid_memory_profiler_arguments_do_not_start_history(
     with pytest.raises(ValueError, match=field):
         MemoryProfiler(**arguments)
     assert calls == []
+
+
+@pytest.mark.parametrize("close_first", [0, 1])
+def test_overlapping_memory_profilers_share_history_until_last_close(
+    monkeypatch, close_first
+):
+    calls = []
+    monkeypatch.setattr(
+        profiler_module,
+        "record_memory_history",
+        lambda **kwargs: calls.append("start") or True,
+    )
+    monkeypatch.setattr(
+        profiler_module, "stop_memory_history", lambda: calls.append("stop")
+    )
+    profilers = [
+        MemoryProfiler(
+            step_num=0, freq=1, snapshot_dir="", leaf_folder="", rank=0, max_entries=100
+        )
+        for _ in range(2)
+    ]
+    try:
+        assert calls == ["start"]
+        profilers[close_first].close()
+        assert calls == ["start"]
+        assert profilers[1 - close_first]._records_history
+        profilers[1 - close_first].close()
+        assert calls == ["start", "stop"]
+    finally:
+        for profiler in profilers:
+            profiler.close()
+
+
+def test_conflicting_memory_history_capacity_does_not_restart_owner(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        profiler_module,
+        "record_memory_history",
+        lambda **kwargs: calls.append("start") or True,
+    )
+    monkeypatch.setattr(
+        profiler_module, "stop_memory_history", lambda: calls.append("stop")
+    )
+    owner = MemoryProfiler(
+        step_num=0, freq=1, snapshot_dir="", leaf_folder="", rank=0, max_entries=100
+    )
+    try:
+        with pytest.raises(ValueError, match="identical max_entries"):
+            MemoryProfiler(
+                step_num=0,
+                freq=1,
+                snapshot_dir="",
+                leaf_folder="",
+                rank=0,
+                max_entries=200,
+            )
+        assert calls == ["start"]
+        assert owner._records_history
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_failed_snapshot_does_not_publish_partial_file(
+    tmp_path, monkeypatch, writable_snapshots, existing
+):
+    profiler = MemoryProfiler(
+        step_num=0,
+        freq=1,
+        snapshot_dir=str(tmp_path),
+        leaf_folder="",
+        rank=0,
+        max_entries=100,
+    )
+    directory = tmp_path / MEMORY_STEP_DIR.format(step=1)
+    directory.mkdir()
+    destination = directory / profiler_module.MEMORY_FILE.format(rank=0, step=1)
+    if existing:
+        destination.write_bytes(b"previous complete snapshot")
+
+    def fail(value, output, **kwargs):
+        output.write(b"partial")
+        raise RuntimeError("snapshot serialization failed")
+
+    monkeypatch.setattr(profiler_module.pickle, "dump", fail)
+    try:
+        with pytest.raises(RuntimeError, match="snapshot serialization failed"):
+            profiler.step()
+        assert list(directory.iterdir()) == ([destination] if existing else [])
+        if existing:
+            assert destination.read_bytes() == b"previous complete snapshot"
+    finally:
+        profiler.close()

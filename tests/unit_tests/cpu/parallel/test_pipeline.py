@@ -164,6 +164,61 @@ def test_the_output_weight_is_guarded_independently_of_the_input_weight() -> Non
 _NUM_LAYERS = 4
 
 
+def test_split_rejects_shared_parameter_across_stages_before_copy(monkeypatch, pp_mesh):
+    from llmtuner.parallel.pipeline_parallel import partition
+
+    model = _model()
+    model.layers[2].self_attn.q_proj.weight = model.layers[0].self_attn.q_proj.weight
+
+    def unexpected_copy(module):
+        raise AssertionError("shared ownership must be checked before copying")
+
+    monkeypatch.setattr(partition.copy, "deepcopy", unexpected_copy)
+    with pytest.raises(NotImplementedError, match="shared parameter.*stages"):
+        split_model_into_stages(
+            model,
+            pp_mesh,
+            "1F1B",
+            torch.device("cpu"),
+            generate_llm_fqn_per_model_part(2, _NUM_LAYERS),
+        )
+
+
+def test_split_preserves_shared_parameter_within_stage(pp_mesh):
+    model = _model()
+    model.layers[1].self_attn.q_proj.weight = model.layers[0].self_attn.q_proj.weight
+    _, parts = split_model_into_stages(
+        model,
+        pp_mesh,
+        "1F1B",
+        torch.device("cpu"),
+        generate_llm_fqn_per_model_part(2, _NUM_LAYERS),
+    )
+    assert parts[0].layers[0].self_attn.q_proj.weight is (
+        parts[0].layers[1].self_attn.q_proj.weight
+    )
+    inputs = torch.randint(32, (16,))
+    expected = model(inputs)
+    actual = parts[1](parts[0](inputs))
+    torch.testing.assert_close(actual, expected)
+    expected.square().sum().backward()
+    actual.square().sum().backward()
+    for part in parts:
+        for name, parameter in part.named_parameters():
+            torch.testing.assert_close(
+                parameter.grad, dict(model.named_parameters())[name].grad
+            )
+    reference_optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    stage_optimizer = torch.optim.SGD(
+        [parameter for part in parts for parameter in part.parameters()], lr=0.01
+    )
+    reference_optimizer.step()
+    stage_optimizer.step()
+    for part in parts:
+        for name, parameter in part.named_parameters():
+            torch.testing.assert_close(parameter, dict(model.named_parameters())[name])
+
+
 def test_unsupported_mesh_callback_is_rejected_before_stage_build(monkeypatch, pp_mesh):
     from llmtuner.parallel.pipeline_parallel import partition
 

@@ -5,8 +5,20 @@ Run under torchrun with 4 ranks (from the repo root):
     PYTHONPATH=. torchrun --nproc_per_node=4 \
         tests/integration_tests/ep_fsdp_equivalence.py
 
+Add ``--converted-root-expert`` to register a root alias to the local down
+projection after real EP conversion and before FSDP. This checks shared identity,
+sparse placement and expert gradients through root-owned FSDP management.
+
+Add ``--external-expert-alias`` to check that an external full-expert down
+projection alias is rejected before installing EP-sharded replacements.
+
+Add ``--shared-projection`` to share the two MoE layers' Q projection before
+parallel transforms and compare its accumulated gradient with the dense reference.
+
 Add ``--pattern-fsdp`` to exercise pattern-selected FSDP units with the same
 expert mesh, loss, and gradient checks.
+Add ``--fsdp-implementation custom`` to exercise custom parameter groups and
+hook-owned communication buffers; default module hooks are used here.
 
 Regression pin for the missing ``moe_enabled``/``moe`` flags on the EP swap:
 without them, FSDP's MoE branch never fires and the expert weights -- each
@@ -30,6 +42,7 @@ assignment is exactly what the missing flags broke.
 from __future__ import annotations
 
 import argparse
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -41,8 +54,10 @@ from llmtuner.accelerator.collectives import all_reduce
 from llmtuner.accelerator.spmd import spmd_context
 from llmtuner.config import ParallelConfig
 from llmtuner.config.parallel_config import FSDPConfig
+from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.parallel.topology import ParallelTopology
 
@@ -74,10 +89,15 @@ def _config() -> AutoConfig:
     )
 
 
-def _model(seed: int = 0) -> HFTransformerModel:
+def _model(seed: int = 0, *, shared_projection: bool = False) -> HFTransformerModel:
     """Deterministically initialized tiny qwen3_moe; identical on every rank."""
     torch.manual_seed(seed)
-    return HFTransformerModel(_config()).float().eval()
+    model = HFTransformerModel(_config()).float().eval()
+    if shared_projection:
+        model.layers[1].self_attn.q_proj.weight = model.layers[
+            0
+        ].self_attn.q_proj.weight
+    return model
 
 
 def _data() -> tuple[torch.Tensor, torch.Tensor]:
@@ -109,7 +129,20 @@ def _full(t: torch.Tensor) -> torch.Tensor:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pattern-fsdp", action="store_true")
+    parser.add_argument("--shared-projection", action="store_true")
+    parser.add_argument("--external-expert-alias", action="store_true")
+    parser.add_argument("--converted-root-expert", action="store_true")
+    parser.add_argument(
+        "--fsdp-implementation", choices=("native", "custom"), default="native"
+    )
     args = parser.parse_args()
+    if args.fsdp_implementation == "custom":
+        from llmtuner.parallel.fully_shard_parallel.fine_grained_param_group import (
+            FineGrainedFSDPParamGroup,
+        )
+        from llmtuner.parallel.fully_shard_parallel.fine_grained_state import (
+            FineGrainedFSDPState,
+        )
     dist.init_process_group("gloo")
     rank = dist.get_rank()
     world = dist.get_world_size()
@@ -119,14 +152,39 @@ def main() -> None:
         data_parallel_shard_size=4,
         expert_parallel_size=2,
         fsdp_config=FSDPConfig(
+            fsdp_implementation=args.fsdp_implementation,
             fsdp_apply_modules={"model.model.layers.{*}": {}}
             if args.pattern_fsdp
-            else {}
+            else {},
         ),
     )
     parallel_dims = ParallelTopology.from_config(cfg, world)
     parallel_dims.build_device_mesh()
     loss_mesh = parallel_dims.get_mesh("loss")
+
+    if args.external_expert_alias:
+        model = _model()
+        original = model.layers[0].mlp
+        source = original.experts.down_proj
+        model.register_parameter("external_expert", source)
+        try:
+            parallelize_hf_transformers(
+                model,
+                cfg=cfg,
+                mesh=parallel_dims.spmd_dense_mesh(),
+                parallel_dims=parallel_dims,
+                device=torch.device("cpu"),
+            )
+        except UnsupportedCombinationError as error:
+            assert "external_expert" in str(error)
+        else:
+            raise AssertionError("EP-sharded external aliases must not be split")
+        assert model.layers[0].mlp is original
+        assert model.external_expert is source
+        if rank == 0:
+            print("EP external expert alias rejected before installation", flush=True)
+        dist.destroy_process_group()
+        return
 
     failures: list[str] = []
 
@@ -135,7 +193,7 @@ def main() -> None:
     # the batch's rows one at a time and sums -- the same total as one batched
     # call, and exactly what dp sharding splits.
     ids_all, labels_all = _data()
-    ref = _model()
+    ref = _model(shared_projection=args.shared_projection)
     with spmd_context(None):
         ref_losses = [
             _loss_sum(ref, ids_all[r], labels_all[r]) for r in range(ids_all.shape[0])
@@ -144,13 +202,37 @@ def main() -> None:
     ref_loss = sum(loss.item() for loss in ref_losses)
 
     # -- ep=2 + dp_shard=4 through the real orchestration entry point ----------
-    model = parallelize_hf_transformers(
-        _model(),
-        cfg=cfg,
-        mesh=parallel_dims.spmd_dense_mesh(),
-        parallel_dims=parallel_dims,
-        device=torch.device("cpu"),
-    )
+    def apply_ep_with_alias(model, **kwargs):
+        model = apply_ep(model, **kwargs)
+        if args.converted_root_expert:
+            model.register_parameter(
+                "external_expert",
+                model.layers[0].mlp.routed_experts.inner_experts.w2_EDF,
+            )
+        return model
+
+    with patch("llmtuner.parallel.parallelize.apply_ep", apply_ep_with_alias):
+        model = parallelize_hf_transformers(
+            _model(shared_projection=args.shared_projection),
+            cfg=cfg,
+            mesh=parallel_dims.spmd_dense_mesh(),
+            parallel_dims=parallel_dims,
+            device=torch.device("cpu"),
+        )
+    if args.converted_root_expert:
+        expert = model.layers[0].mlp.routed_experts.inner_experts.w2_EDF
+        assert model.external_expert is expert
+        assert isinstance(expert, DTensor)
+        assert expert.device_mesh.size() == 2
+
+    if args.shared_projection:
+        assert model.layers[0].self_attn.q_proj.weight is (
+            model.layers[1].self_attn.q_proj.weight
+        )
+        if not args.converted_root_expert:
+            assert model.layers[0]._get_fsdp_state() is (
+                model.layers[1]._get_fsdp_state()
+            )
 
     with spmd_context(parallel_dims):
         loss_sum = _loss_sum(model, ids_all[rank], labels_all[rank])
@@ -160,6 +242,13 @@ def main() -> None:
     got_loss = float(loss_sum)
     if abs(got_loss - ref_loss) > TOL:
         failures.append(f"rank {rank}: loss {got_loss:.6f} vs reference {ref_loss:.6f}")
+
+    if args.shared_projection:
+        actual = _full(model.layers[0].self_attn.q_proj.weight.grad)
+        expected = ref.layers[0].self_attn.q_proj.weight.grad
+        difference = (actual - expected).abs().max().item()
+        if difference > TOL:
+            failures.append(f"rank {rank}: shared Q gradient diff {difference:.3e}")
 
     num_local = NUM_EXPERTS // cfg.ep_size
     # Sparse mesh layout (dp_replicate, efsdp, ep): ep coordinate is fastest.
@@ -180,6 +269,19 @@ def main() -> None:
                 f"rank {rank} layer {layer_idx}: moe_enabled/moe flags missing"
             )
         grouped = moe.routed_experts.inner_experts
+        if args.fsdp_implementation == "custom":
+            state = (
+                model._get_fsdp_state()
+                if args.converted_root_expert
+                and (layer_idx == 0 or args.shared_projection)
+                else layer._get_fsdp_state()
+            )
+            assert isinstance(state, FineGrainedFSDPState)
+            assert len(state._fsdp_param_groups) == 2
+            assert all(
+                isinstance(group, FineGrainedFSDPParamGroup)
+                for group in state._fsdp_param_groups
+            )
         w1 = grouped.w1_EFD
         gate_w = moe.router.gate.weight
         if not isinstance(w1, DTensor) or w1.device_mesh.size() != 2:
@@ -196,6 +298,19 @@ def main() -> None:
                 f"rank {rank} layer {layer_idx}: router weight not on the "
                 f"dense dp mesh (mesh {gate_mesh})"
             )
+
+        if isinstance(w1, DTensor):
+            expert_ranks = w1.device_mesh.mesh.reshape(-1).tolist()
+            expected_ranks = list(range(ep_rank, world, cfg.ep_size))
+            if expert_ranks != expected_ranks:
+                failures.append(
+                    f"rank {rank}: expert mesh ranks {expert_ranks}, "
+                    f"want {expected_ranks}"
+                )
+        if isinstance(gate_w, DTensor):
+            dense_ranks = gate_w.device_mesh.mesh.reshape(-1).tolist()
+            if dense_ranks != list(range(world)):
+                failures.append(f"rank {rank}: dense mesh ranks {dense_ranks}")
 
         ref_mlp = ref_layer.mlp
         gate_diff = (_full(gate_w.grad) - ref_mlp.gate.weight.grad).abs().max().item()
@@ -233,7 +348,8 @@ def main() -> None:
     if rank == 0:
         print(
             f"tokens/rank={TOKENS_PER_RANK} experts={NUM_EXPERTS} "
-            f"ep=2 dp_shard=4 (efsdp=2) tol={TOL:.0e}"
+            f"ep=2 dp_shard=4 (efsdp=2) tol={TOL:.0e} "
+            f"implementation={args.fsdp_implementation} pattern={args.pattern_fsdp}"
         )
         print(f"loss: ep+fsdp={got_loss:.6f} ref={ref_loss:.6f}")
         print(f"failed ranks = {int(local_ok.item())}")

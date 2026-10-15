@@ -861,3 +861,103 @@ def test_ac_supports_plain_module_layer_container():
     model.layers.decoder(inputs).sum().backward()
     assert inputs.grad is not None
     assert weight.grad is not None
+
+
+@pytest.mark.parametrize("mode", ["full", "selective"])
+def test_compiled_checkpoint_matches_dense_outputs_and_gradients(mode):
+    import copy
+
+    torch.manual_seed(47)
+    reference = torch.nn.Sequential(
+        torch.nn.Linear(4, 8), torch.nn.GELU(), torch.nn.Linear(8, 4)
+    )
+    actual = copy.deepcopy(reference)
+    wrapped = (
+        ac_mod.wrap_full(actual)
+        if mode == "full"
+        else ac_mod.wrap_selective(actual, SelectiveACConfig())
+    )
+    compiled = torch.compile(wrapped, backend="eager")
+    inputs = torch.randn(3, 4)
+    expected_input = inputs.clone().requires_grad_()
+    actual_input = inputs.clone().requires_grad_()
+    expected = reference(expected_input)
+    output = compiled(actual_input)
+    torch.testing.assert_close(output, expected)
+    expected.square().sum().backward()
+    output.square().sum().backward()
+    torch.testing.assert_close(actual_input.grad, expected_input.grad)
+    for left, right in zip(reference.parameters(), actual.parameters(), strict=True):
+        torch.testing.assert_close(right.grad, left.grad)
+
+
+@pytest.mark.parametrize(
+    "value", [True, False, "0.5", None, float("nan"), float("inf")]
+)
+def test_memory_budget_rejects_invalid_numeric_types(value):
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="memory_budget"):
+        MemoryBudgetACConfig(memory_budget=value)
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", "", None])
+@pytest.mark.parametrize("field", ["preserve_rng_state", "debug"])
+def test_selective_checkpoint_requires_boolean_flags(field, value):
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match=field):
+        SelectiveACConfig(**{field: value})
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", "", None])
+def test_region_checkpoint_requires_boolean_rng_flag(value):
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="preserve_rng_state"):
+        RegionACConfig(preserve_rng_state=value)
+
+
+@pytest.mark.parametrize("value", ["self_attn.*", None, [1], [""], ["   "]])
+@pytest.mark.parametrize(
+    "field", ["save_regions", "recompute_regions", "force_recompute_mm_shapes_by_fqns"]
+)
+def test_checkpoint_pattern_fields_require_nonempty_string_lists(field, value):
+    from llmtuner.errors import ConfigError
+
+    config = (
+        SelectiveACConfig
+        if field == "force_recompute_mm_shapes_by_fqns"
+        else RegionACConfig
+    )
+    with pytest.raises(ConfigError, match=field):
+        config(**{field: value})
+
+
+def test_full_checkpoint_compiles_with_dispatch_recompute_context():
+    import copy
+
+    from torch._dynamo.utils import counters
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    torch._dynamo.reset()
+    counters.clear()
+    forward, replay = ac_mod.checkpoint_contexts(ac_mod.full_policy)
+    assert isinstance(forward, TorchDispatchMode)
+    assert isinstance(replay, TorchDispatchMode)
+    torch.manual_seed(42)
+    reference = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.Tanh())
+    compiled = torch.compile(
+        ac_mod.wrap_full(copy.deepcopy(reference)), backend="aot_eager"
+    )
+    inputs = torch.randn(2, 4, requires_grad=True)
+    other = inputs.detach().clone().requires_grad_(True)
+    expected = reference(inputs)
+    actual = compiled(other)
+    torch.testing.assert_close(actual, expected)
+    expected.square().sum().backward()
+    actual.square().sum().backward()
+    torch.testing.assert_close(other.grad, inputs.grad)
+    for got, want in zip(compiled.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(got.grad, want.grad)
+    assert counters["stats"]["unique_graphs"] > 0

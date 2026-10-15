@@ -13,17 +13,23 @@ multiple pipeline microbatches.
 Finite validation exhausts the corpus, including a fully padded microbatch in
 the last schedule step. CPU uses dense-mask SDPA as an explicit test substitute
 for the production flex kernel; GPU/NPU execution requires separate validation.
+For PP2 × KV-CP2, set LLMTUNER_TEST_CP_SIZE=2 and run four ranks.
+Set LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom to exercise the custom engine.
+That CPU scenario retains actual CP masks/collectives and substitutes only
+attention arithmetic, with sequence length 256 and a proportionally larger corpus.
 
 """
 
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.accelerator.tensor_tree import move_tensor_tree
@@ -38,7 +44,7 @@ from llmtuner.config import (
     TrainingConfig,
     ValidationConfig,
 )
-from llmtuner.config.parallel_config import PipelineParallelConfig
+from llmtuner.config.parallel_config import FSDPConfig, PipelineParallelConfig
 from llmtuner.datasets.loader_builder import build_dataloader
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
@@ -48,12 +54,13 @@ from tests.data_fixtures import write_tokenizer
 STEPS = 3
 MICROBATCHES = 4
 GLOBAL_BATCH = 8
-SEQ = 64
+CP = int(os.environ.get("LLMTUNER_TEST_CP_SIZE", "1"))
+SEQ = 256 if CP > 1 else 64
 VOCAB = 128
 SEED = 42
 PP = 2
-WORLD = 2
-NUM_ROWS = 48  # > STEPS * GLOBAL_BATCH rows so no repeat kicks in
+WORLD = PP * CP
+NUM_ROWS = 48 * (SEQ // 64)  # Keep the finite corpus above a full token batch.
 TOL = 1e-5
 
 
@@ -102,7 +109,13 @@ def _cfg(tokenizer_path: str, corpus_path: str) -> LLMTunerConfig:
         ),
         parallel=ParallelConfig(
             pipeline_parallel_size=PP,
+            context_parallel_kv_allgather_size=CP,
             data_parallel_shard_size=-1,
+            fsdp_config=FSDPConfig(
+                fsdp_implementation=os.environ.get(
+                    "LLMTUNER_TEST_FSDP_IMPLEMENTATION", "native"
+                )
+            ),
             pp_config=PipelineParallelConfig(
                 pipeline_parallel_schedule="1F1B", num_pp_microbatches=MICROBATCHES
             ),
@@ -223,7 +236,10 @@ def _run(root: str) -> None:
         f"this check assumes {WORLD} ranks, got {trainer.world_size}"
     )
     local_state = {
-        name: value.detach().cpu().clone()
+        name: (value.full_tensor() if isinstance(value, DTensor) else value)
+        .detach()
+        .cpu()
+        .clone()
         for part in trainer.model_parts
         for name, value in part.state_dict().items()
     }
@@ -274,7 +290,10 @@ def _run(root: str) -> None:
     if any(not part.training for part in trainer.model_parts):
         failures.append(f"rank {rank}: validation did not restore training mode")
     local_final_state = {
-        name: value.detach().cpu().clone()
+        name: (value.full_tensor() if isinstance(value, DTensor) else value)
+        .detach()
+        .cpu()
+        .clone()
         for part in trainer.model_parts
         for name, value in part.state_dict().items()
     }
@@ -307,19 +326,22 @@ def _run(root: str) -> None:
         if abs(got - want) > TOL:
             failures.append(f"rank {rank} step {step + 1}: loss {got} vs {want}")
 
+    verdict = torch.tensor(len(failures), dtype=torch.int64, device=trainer.device)
+    dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
+    rank_failures = [None] * WORLD
+    dist.all_gather_object(rank_failures, failures)
     if rank == 0:
         if trainer.device.type == "cpu":
             print("CPU attention uses dense-mask SDPA; CUDA flex is not verified.")
-        print(f"pp={PP} corpus=local_jsonl(packed) steps={STEPS} tol={TOL:.0e}")
+        print(f"pp={PP} cp={CP} corpus=local_jsonl(packed) steps={STEPS} tol={TOL:.0e}")
         print(f"pp losses  = {[f'{x:.6f}' for x in pp_losses]}")
         print(f"reference  = {[f'{x:.6f}' for x in reference]}")
         print(f"final parameter max diff = {float(max_diff):.3e}")
         print(f"finite validation reference = {reference_validation:.6f}")
-        for f in failures:
-            print(f"  FAIL {f}")
-        print("all checks passed" if not failures else "CHECKS FAILED")
-    verdict = torch.tensor(len(failures), dtype=torch.int64, device=trainer.device)
-    dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
+        for errors in rank_failures:
+            for error in errors:
+                print(f"  FAIL {error}")
+        print("all checks passed" if int(verdict) == 0 else "CHECKS FAILED")
     assert int(verdict) == 0, f"{int(verdict)} check(s) failed -- see rank 0 output"
 
 
@@ -327,7 +349,12 @@ def main() -> None:
     from llmtuner.accelerator.device import device_type
 
     with tempfile.TemporaryDirectory(prefix="pp_real_corpus_") as root:
-        if device_type == "cpu":
+        if device_type == "cpu" and CP > 1:
+            from tests.integration_tests.pp_cp_equivalence import cpu_cp_attention
+
+            with cpu_cp_attention():
+                _run(root)
+        elif device_type == "cpu":
             with patch.object(
                 HFTransformerModel, "_apply_attention", _cpu_packed_attention
             ):

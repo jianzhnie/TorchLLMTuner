@@ -68,6 +68,59 @@ from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
 
 
+@pytest.mark.parametrize("mutable_state", ["running_stats", "embedding_weight"])
+def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_state):
+    model = (
+        nn.BatchNorm1d(2)
+        if mutable_state == "running_stats"
+        else nn.Embedding(2, 2, max_norm=1.0)
+    )
+    if mutable_state == "embedding_weight":
+        with torch.no_grad():
+            model.weight.fill_(10)
+    expected = {name: value.clone() for name, value in model.state_dict().items()}
+    snapshot = {}
+
+    def finish_staging():
+        # A pending copy can complete at this wait boundary. Read real live
+        # state so BatchNorm/Embedding mutations before the wait are observable.
+        snapshot.update(
+            {name: value.clone() for name, value in model.state_dict().items()}
+        )
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1)
+    trainer.parallel_dims = None
+    trainer.device = torch.device("cpu")
+    trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer.lr_scheduler = SimpleNamespace(get_metrics=lambda: {}, step=lambda: None)
+    trainer.checkpointer = SimpleNamespace(maybe_wait_for_staging=finish_staging)
+    trainer.model_parts = [model]
+    trainer.ema = None
+    trainer.should_log = lambda: False
+    trainer.microbatch = lambda batch: {
+        "batch": batch,
+        "num_valid_tokens": 1,
+        "num_routing_tokens": 1,
+    }
+    trainer._allreduce_replicated_tp_grads = lambda: None
+    trainer._clip_and_check_finite = lambda **kwargs: torch.tensor(1.0)
+
+    def forward_backward(*args, **kwargs):
+        inputs = (
+            torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+            if mutable_state == "running_stats"
+            else torch.tensor([0, 1])
+        )
+        loss = model(inputs).sum()
+        loss.backward()
+        return loss.detach()
+
+    trainer.forward_backward_step = forward_backward
+    assert trainer.train_step(iter([None])) is None
+    torch.testing.assert_close(snapshot, expected, rtol=0, atol=0)
+
+
 def test_train_step_rejects_a_fully_masked_window_before_forward() -> None:
     """A zero denominator must fail before any model or optimizer update."""
     trainer = Trainer.__new__(Trainer)
@@ -1291,11 +1344,9 @@ def test_microbatch_counts_only_the_ranks_share_under_sequence_sharding() -> Non
 def test_the_synthetic_loader_reports_an_absolute_position_after_a_resume() -> None:
     """A checkpoint written *after* a resume must not lose the seek.
 
-    The loader cannot seek, so resuming replays. If the saved position were the
-    count of batches ``__iter__`` handed out, that count would start at zero on
-    the resumed loader, and the batch right after the resume would save as
-    batch 0 instead of its true index. The *next* resume would then rewind to
-    it and re-train those batches -- a silent replay of already-seen data.
+    The loader seeks directly using the absolute batch index. Counting only
+    batches yielded after restoration would lose that offset, so a second
+    checkpoint could silently replay already-seen data on the next resume.
     """
 
     def loader() -> RandomTokenDataLoader:
@@ -1341,9 +1392,9 @@ def test_the_synthetic_loader_reports_an_absolute_position_after_a_resume() -> N
 def test_the_synthetic_loader_still_refuses_to_rewind() -> None:
     """The absolute position must not turn a backwards resume into an overshoot.
 
-    ``state_dict`` now carries an absolute index, so the seek drains the
-    difference. A checkpoint from *behind* the live loader stays an error --
-    replaying forward to a past batch is not something this loader can do.
+    Direct indexed generation could reproduce an earlier batch, but the live
+    loader's contract rejects backwards restoration. A caller restoring an
+    older checkpoint must construct a fresh loader explicitly.
     """
     loader = RandomTokenDataLoader(
         seed=3, vocab_size=64, batch_size=1, seq_len=4, dp_rank=0, dp_world_size=1
@@ -1941,3 +1992,264 @@ def test_trainer_checkpoint_rejects_invalid_counters_without_partial_restore(
     with pytest.raises(ValueError, match=f"trainer {field}"):
         trainer.load_state_dict(checkpoint)
     assert trainer.state_dict() == {"step": 3, "ntokens_seen": 12}
+
+
+def test_incomplete_accumulation_window_never_updates_parameters():
+    from llmtuner.datasets.contracts import DataloaderExhaustedError
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.cfg = SimpleNamespace(gradient_accumulation_steps=2)
+    trainer.parallel_dims = None
+    trainer.device = torch.device("cpu")
+    trainer.ntokens_seen = 0
+    parameter = nn.Parameter(torch.tensor(3.0))
+    parameter.grad = torch.tensor(7.0)
+    optimizer = torch.optim.Adam([parameter], lr=0.1)
+    trainer.optimizer = optimizer
+    trainer.lr_scheduler = SimpleNamespace(get_metrics=lambda: {})
+    trainer.should_log = lambda: False
+    trainer.metrics = SimpleNamespace(
+        add_tokens=lambda count: None, add_data_loading_time=lambda duration: None
+    )
+    trainer.forward_backward_step = lambda *args, **kwargs: pytest.fail(
+        "an incomplete window must not enter forward/backward"
+    )
+    batch = Batch(
+        input_ids=torch.ones(1, 4, dtype=torch.long),
+        labels=torch.ones(1, 4, dtype=torch.long),
+    )
+    with pytest.raises(DataloaderExhaustedError):
+        trainer.train_step(trainer.batch_generator([batch]))
+    assert parameter.item() == 3.0
+    assert parameter.grad is None
+    assert optimizer.state == {}
+    # This counter reports consumed loader tokens, including a canceled window.
+    assert trainer.ntokens_seen == 4
+
+
+def test_trainer_retains_checkpointer_after_interrupted_close():
+    class Checkpointer:
+        _initialized = True
+        pending = True
+
+        def close(self):
+            if self.pending:
+                raise KeyboardInterrupt("upload still active")
+            self._initialized = False
+
+    trainer = Trainer.__new__(Trainer)
+    resource = Checkpointer()
+    trainer.checkpointer = resource
+    with pytest.raises(KeyboardInterrupt, match="upload still active"):
+        trainer.close()
+    assert trainer.checkpointer is resource
+    resource.pending = False
+    trainer.close()
+    assert trainer.checkpointer is None
+
+
+@pytest.mark.parametrize("axis", ["pp", "tp", "ep"])
+def test_parallel_norm_accumulation_does_not_overflow_half_precision(monkeypatch, axis):
+    from llmtuner.accelerator import collectives
+
+    parameter = nn.Parameter(torch.zeros(1, dtype=torch.float16))
+    parameter.grad = torch.tensor([300.0], dtype=torch.float16)
+    mesh = SimpleNamespace(get_group=lambda: object())
+
+    def reduce(tensor, *, op, group):
+        assert op == torch.distributed.ReduceOp.SUM
+        tensor.mul_(2)
+
+    monkeypatch.setattr(collectives.dist, "all_reduce", reduce)
+    kwargs = {f"{axis}_mesh": mesh}
+    if axis == "tp":
+        kwargs["tp_sharded_parameters"] = [parameter]
+    elif axis == "ep":
+        kwargs["expert_parameters"] = [parameter]
+    norm = clip_grad_norm_([parameter], max_norm=1.0, error_if_nonfinite=True, **kwargs)
+    torch.testing.assert_close(norm.float(), torch.tensor(180000.0).sqrt())
+    torch.testing.assert_close(
+        parameter.grad.float(), torch.tensor([2.0**-0.5]), rtol=1e-3, atol=0
+    )
+
+
+def test_pp_norm_without_gradients_uses_parameter_device(monkeypatch):
+    from llmtuner.accelerator import collectives
+
+    parameter = nn.Parameter(torch.empty(1, device="meta"))
+    mesh = SimpleNamespace(get_group=lambda: object())
+
+    def reduce(tensor, *, op, group):
+        assert tensor.device == parameter.device
+
+    monkeypatch.setattr(collectives.dist, "all_reduce", reduce)
+    norm = clip_grad_norm_([parameter], max_norm=0, pp_mesh=mesh)
+    assert norm.device == parameter.device
+
+
+@pytest.mark.parametrize("axis", ["tp", "ep", "pp"])
+def test_parameterless_norm_uses_mesh_communication_device(monkeypatch, axis):
+    from llmtuner.accelerator import collectives
+
+    group = object()
+    mesh = SimpleNamespace(get_group=lambda: group)
+    device = torch.device("meta")
+
+    def communication_device(actual_group=None):
+        assert actual_group is group
+        return device
+
+    def reduce(tensor, *, op, group):
+        assert tensor.device == device
+
+    monkeypatch.setattr(collectives, "get_comm_device", communication_device)
+    monkeypatch.setattr(collectives.dist, "all_reduce", reduce)
+    kwargs = {f"{axis}_mesh": mesh}
+    if axis == "tp":
+        kwargs["tp_sharded_parameters"] = []
+    elif axis == "ep":
+        kwargs["expert_parameters"] = []
+    norm = clip_grad_norm_([], max_norm=0, **kwargs)
+    assert norm.device == device
+
+
+@pytest.mark.parametrize("completed_steps", [0, 1])
+def test_data_exhaustion_saves_last_completed_step(monkeypatch, completed_steps):
+    import llmtuner.trainer.trainer as trainer_module
+    from llmtuner.datasets.contracts import DataloaderExhaustedError
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.cfg = SimpleNamespace(
+        checkpoint=SimpleNamespace(load_step=-1),
+        profiler=None,
+        dump_folder="unused",
+        gc_freq=1,
+        steps=10,
+    )
+    trainer.step = 0
+    trainer.ntokens_seen = 0
+    trainer.parallel_dims = None
+    trainer.metrics = SimpleNamespace()
+    saves = []
+    closed = []
+    trainer.checkpointer = SimpleNamespace(
+        load=lambda step: False,
+        save=lambda step, last_step=False: saves.append((step, last_step)),
+    )
+    trainer.close = lambda: closed.append(True)
+    trainer.data_iterator = lambda: iter(())
+    trainer.batch_generator = lambda source: source
+    trainer.should_validate = lambda step: False
+
+    def train_step(iterator):
+        if trainer.step > completed_steps:
+            raise DataloaderExhaustedError()
+        return None
+
+    trainer.train_step = train_step
+    monkeypatch.setattr(
+        trainer_module,
+        "Profiler",
+        lambda *args, **kwargs: nullcontext(SimpleNamespace(step=lambda: None)),
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "GarbageCollection",
+        lambda **kwargs: SimpleNamespace(run=lambda step: None),
+    )
+    trainer.train()
+    assert trainer.step == completed_steps
+    expected = [(step, False) for step in range(1, completed_steps + 1)]
+    if completed_steps:
+        expected.append((completed_steps, True))
+    assert saves == expected
+    assert closed == [True]
+
+
+def test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state(
+    tmp_path,
+):
+    from copy import deepcopy
+    from itertools import islice
+
+    def config():
+        return LLMTunerConfig(
+            training=TrainingConfig(
+                global_batch_size=2,
+                max_seq_len=8,
+                gradient_accumulation_steps=2,
+                steps=8,
+                dump_folder=str(tmp_path),
+                checkpoint_config=CheckpointConfig(
+                    enable=True, interval=100, last_save_model_only=False
+                ),
+            )
+        )
+
+    original = Trainer(config())
+    loader = original.dataloader
+    # The real checkpointable source advances three batches: two update the
+    # model, one is consumed in the canceled final accumulation window.
+    original.data_iterator = lambda: islice(iter(loader), 3)
+    try:
+        original.train()
+        assert original.step == 1
+        assert original.ntokens_seen == 48
+        assert loader.state_dict()["steps"] == 3
+        expected_model = deepcopy(original.model.state_dict())
+        expected_optimizer = deepcopy(original.optimizer.state_dict())
+        expected_scheduler = deepcopy(original.lr_scheduler.state_dict())
+        expected_trainer = original.state_dict()
+        expected_loader = loader.state_dict()
+    finally:
+        original.close()
+    assert (tmp_path / "checkpoint" / "step-1" / ".metadata").is_file()
+    assert not (tmp_path / "checkpoint" / "step-2").exists()
+
+    resumed = Trainer(config())
+    try:
+        assert resumed.checkpointer.load(1)
+        torch.testing.assert_close(
+            resumed.model.state_dict(), expected_model, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            resumed.optimizer.state_dict(), expected_optimizer, rtol=0, atol=0
+        )
+        assert resumed.lr_scheduler.state_dict() == expected_scheduler
+        assert resumed.state_dict() == expected_trainer
+        assert resumed.dataloader.state_dict() == expected_loader
+        next_batch = next(resumed.data_iterator())
+        reference = next(
+            RandomTokenSource(
+                seed=resumed.cfg.seed,
+                vocab_size=resumed.cfg.vocab_size,
+                batch_size=2,
+                seq_len=8,
+            ).iter_from(3)
+        )
+        torch.testing.assert_close(next_batch.input_ids, reference.input_ids)
+        torch.testing.assert_close(next_batch.labels, reference.labels)
+    finally:
+        resumed.close()
+
+
+def test_trainer_retries_failed_metrics_cleanup_without_reclosing_other_resources():
+    trainer = Trainer.__new__(Trainer)
+    calls = []
+
+    def close_metrics():
+        calls.append("metrics")
+        if calls.count("metrics") == 1:
+            raise OSError("metrics close failed")
+
+    metrics = SimpleNamespace(close=close_metrics)
+    trainer.metrics = metrics
+    trainer.dataloader = SimpleNamespace(close=lambda: calls.append("data"))
+    with pytest.raises(OSError, match="metrics close failed"):
+        trainer.close()
+    assert trainer.metrics is metrics
+    assert trainer.dataloader is None
+    trainer.close()
+    trainer.close()
+    assert calls == ["metrics", "data", "metrics"]
+    assert trainer.metrics is None

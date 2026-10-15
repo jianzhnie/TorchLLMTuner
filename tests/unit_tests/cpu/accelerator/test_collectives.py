@@ -35,3 +35,22 @@ def test_partial_to_invariant_reduces_forward_without_reducing_backward(monkeypa
 
     torch.testing.assert_close(local_partial.grad, torch.tensor([8.0, 14.0]))
     assert calls == [group]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_local_error_boundary_preserves_single_rank_exception(monkeypatch, fails):
+    monkeypatch.setattr(collectives, "get_world_size", lambda group: 1)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("single-rank phases must not perform communication")
+
+    monkeypatch.setattr(collectives, "all_reduce", unexpected)
+    failure = ValueError("local construction failed")
+    if fails:
+        with pytest.raises(ValueError) as caught:
+            with collectives.synchronize_local_errors("Construction"):
+                raise failure
+        assert caught.value is failure
+    else:
+        with collectives.synchronize_local_errors("Construction"):
+            pass

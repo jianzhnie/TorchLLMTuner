@@ -167,8 +167,8 @@ def test_a_positive_frequency_disables_the_automatic_collector() -> None:
         assert collector.gc_freq == 1000
         assert _gc.isenabled() is False, "the collector takes over scheduling"
     finally:
-        # Do not leak the disabled state into whichever test runs next.
-        _gc.enable()
+        # Release ownership as well as restoring the process GC state.
+        collector.close()
 
 
 @pytest.mark.parametrize("initially_enabled", [True, False])
@@ -287,3 +287,56 @@ def test_seed_configuration_disables_anomaly_detection_for_subsequent_run():
         assert not torch.is_anomaly_enabled()
     finally:
         torch.autograd.set_detect_anomaly(enabled, check_nan=check_nan)
+
+
+@pytest.mark.parametrize("initially_enabled", [True, False])
+@pytest.mark.parametrize("close_first", [0, 1])
+def test_overlapping_collectors_restore_gc_only_after_last_close(
+    initially_enabled, close_first
+):
+    import gc
+
+    original = gc.isenabled()
+    collectors = []
+    try:
+        (gc.enable if initially_enabled else gc.disable)()
+        collectors = [GarbageCollection(), GarbageCollection()]
+        collectors[close_first].close()
+        assert not gc.isenabled()
+        collectors[1 - close_first].close()
+        assert gc.isenabled() == initially_enabled
+    finally:
+        for collector in collectors:
+            collector.close()
+        (gc.enable if original else gc.disable)()
+
+
+def test_failed_overlapping_collector_keeps_existing_owner(monkeypatch):
+    import gc
+
+    original = gc.isenabled()
+    gc.enable()
+    collector = GarbageCollection()
+    try:
+
+        def fail(reason, **kwargs):
+            raise RuntimeError("collection failed")
+
+        monkeypatch.setattr(GarbageCollection, "collect", staticmethod(fail))
+        with pytest.raises(RuntimeError, match="collection failed"):
+            GarbageCollection()
+        assert not gc.isenabled()
+        collector.close()
+        assert gc.isenabled()
+    finally:
+        collector.close()
+        (gc.enable if original else gc.disable)()
+
+
+def test_canonical_fqn_removes_compile_and_checkpoint_wrappers():
+    from llmtuner.utils.module_names import canonical_fqn
+
+    assert (
+        canonical_fqn("_orig_mod.layers.0._checkpoint_wrapped_module.weight")
+        == "layers.0.weight"
+    )

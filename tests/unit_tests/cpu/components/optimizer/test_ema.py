@@ -411,7 +411,13 @@ def test_repeated_model_part_is_rejected_before_allocating_averages(monkeypatch)
 
 def test_update_rejects_later_replaced_parameter_before_updating_earlier_part():
     first, second = _model(), _model()
-    ema = EMA(model_parts=[first, second], decay=0.5)
+    ema = EMA(
+        model_parts=[
+            nn.ModuleDict({"first": first}),
+            nn.ModuleDict({"second": second}),
+        ],
+        decay=0.5,
+    )
     averages = [
         state["ema_params"]
         for optimizer in ema.optimizers
@@ -436,7 +442,12 @@ def test_ema_rejects_shrinking_scope_before_changing_averages(operation, change)
     first, second = _model(), _model()
     second.register_buffer("expert_bias_E", torch.ones(4))
     ema = EMA(
-        model_parts=[first, second], decay=0.5, buffer_patterns=["expert_bias_E$"]
+        model_parts=[
+            nn.ModuleDict({"first": first}),
+            nn.ModuleDict({"second": second}),
+        ],
+        decay=0.5,
+        buffer_patterns=["expert_bias_E$"],
     )
     averages = [
         state["ema_params"]
@@ -477,3 +488,93 @@ def test_ema_rejects_tensor_names_colliding_after_wrapper_removal(track_buffers)
     ]
     with pytest.raises(ValueError, match="EMA tensor FQNs collide"):
         EMAStateOptimizer(tensors)
+
+
+@pytest.mark.parametrize("state", [None, [], "", [1], "invalid"])
+def test_invalid_checkpoint_cannot_cold_start_or_change_ema(state):
+    model = _model()
+    ema = EMA(model_parts=[model], decay=0.75)
+    before = {name: value.clone() for name, value in _ema_params(ema).items()}
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(2)
+    with pytest.raises(ValueError, match="dictionary"):
+        ema.load_state_dict(state)
+    for name, average in _ema_params(ema).items():
+        torch.testing.assert_close(average, before[name], rtol=0, atol=0)
+    ema.step(1)
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(
+            _ema_params(ema)[name], before[name] * 0.75 + parameter.detach() * 0.25
+        )
+
+
+def test_buffer_pattern_matches_shared_alias_without_duplicate_averaging():
+    model = _model()
+    model.register_buffer("first_bias", torch.zeros(4))
+    model.register_buffer("second_bias", model.first_bias)
+    ema = EMA(model_parts=[model], decay=0.5, buffer_patterns=["second_bias$"])
+    assert len(ema._buffer_optimizers[0].state) == 1
+    assert ema._buffer_optimizers[0].param_groups[0]["param_names"] == ["first_bias"]
+    model.first_bias.fill_(2)
+    ema.step(1)
+    torch.testing.assert_close(_ema_params(ema)["first_bias"], torch.ones(4))
+
+    from copy import deepcopy
+
+    resumed_model = deepcopy(model)
+    resumed = EMA(
+        model_parts=[resumed_model], decay=0.5, buffer_patterns=["first_bias$"]
+    )
+    resumed.load_state_dict(deepcopy(ema.state_dict()))
+    model.first_bias.fill_(4)
+    resumed_model.first_bias.fill_(4)
+    ema.step(2)
+    resumed.step(2)
+    torch.testing.assert_close(
+        _ema_params(ema)["first_bias"], _ema_params(resumed)["first_bias"]
+    )
+    assert resumed_model.first_bias is resumed_model.second_bias
+
+
+@pytest.mark.parametrize("second_buffer", [False, True])
+def test_cross_part_ema_names_fail_before_state_allocation(monkeypatch, second_buffer):
+    from llmtuner.components.optimizer import ema as ema_module
+
+    first, second = nn.Module(), nn.Module()
+    first.register_parameter("weight", nn.Parameter(torch.ones(2)))
+    if second_buffer:
+        second.register_buffer("weight", torch.ones(2))
+    else:
+        second.register_parameter("weight", nn.Parameter(torch.ones(2)))
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("EMA checkpoint FQN conflicts must fail before state allocation")
+
+    monkeypatch.setattr(ema_module, "EMAStateOptimizer", unexpected)
+    with pytest.raises(ValueError, match="EMA tensor FQNs collide.*weight"):
+        EMA(
+            model_parts=[first, second], buffer_patterns=[".*"] if second_buffer else []
+        )
+
+
+@pytest.mark.parametrize("operation", ["step", "cold_start"])
+@pytest.mark.parametrize("change", ["shape", "dtype"])
+def test_metadata_change_is_rejected_before_any_average_mutation(operation, change):
+    model = nn.Linear(2, 2)
+    model.register_buffer("history", torch.zeros(2))
+    ema = EMA(model_parts=[model], decay=0.5, buffer_patterns=["history"])
+    before = {name: value.clone() for name, value in _ema_params(ema).items()}
+    with torch.no_grad():
+        model.weight.add_(1)
+        if change == "shape":
+            model.history.resize_(3)
+        else:
+            model.history.data = model.history.double()
+    with pytest.raises(RuntimeError, match="metadata changed"):
+        if operation == "step":
+            ema.step(1)
+        else:
+            ema.load_state_dict({})
+    for name, value in _ema_params(ema).items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)

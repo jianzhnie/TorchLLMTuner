@@ -198,3 +198,75 @@ def test_expert_shard_map_accepts_repeated_group_identity():
     group = object()
     checkpointing.mark_experts_ep_sharded(model.mlp, group)
     assert checkpointing.expert_shard_map([model, model])["mlp.w1_EFD"] is group
+
+
+@pytest.mark.parametrize("kind", ["model", "optimizer", "ema"])
+def test_expert_aliases_gather_and_restore_all_registered_paths(monkeypatch, kind):
+    model = _model_with_experts()
+    model.register_parameter("external_expert", model.mlp.w2_EDF)
+    model.alias = model.mlp
+    group = _fake_group(monkeypatch, world=2, rank=0)
+    checkpointing.mark_experts_ep_sharded(model.mlp, group)
+    shard_map = checkpointing.expert_shard_map([model])
+    assert set(shard_map) == {
+        "external_expert",
+        "mlp.w1_EFD",
+        "mlp.w2_EDF",
+        "alias.w1_EFD",
+        "alias.w2_EDF",
+    }
+    parameters = checkpointing.index_checkpoint_parameters([model])
+    assert parameters["external_expert"] is parameters["mlp.w2_EDF"]
+    assert parameters["alias.w2_EDF"] is parameters["external_expert"]
+    if kind == "model":
+        source = model.state_dict()
+    else:
+        field = "exp_avg" if kind == "optimizer" else "ema_params"
+        source = {
+            f"state.external_expert.{field}": model.external_expert.detach().clone(),
+            "state.external_expert.step": torch.tensor(3.0),
+        }
+    saved = checkpointing.gather_expert_state(
+        source, shard_map=shard_map, model_parts=[model]
+    )
+    _fake_group(monkeypatch, world=2, rank=1)
+    loaded = checkpointing.load_expert_state(
+        saved, shard_map=shard_map, model_parts=[model]
+    )
+    for name, value in source.items():
+        if value.ndim:
+            assert saved[name].shape[0] == value.shape[0] * 2
+            torch.testing.assert_close(loaded[name], value + 100)
+        else:
+            torch.testing.assert_close(loaded[name], value)
+
+
+def test_shared_expert_parameter_rejects_different_process_groups():
+    model = _model_with_experts()
+    model.other = nn.Module()
+    model.other.weight = model.mlp.w2_EDF
+    checkpointing.mark_experts_ep_sharded(model.mlp, object())
+    checkpointing.mark_experts_ep_sharded(model.other, object())
+    with pytest.raises(ValueError, match="Shared EP checkpoint parameters"):
+        checkpointing.expert_shard_map([model])
+
+
+def test_save_validates_later_expert_before_first_collective(monkeypatch):
+    model = _model_with_experts()
+    group = _fake_group(monkeypatch, world=2, rank=0)
+    checkpointing.mark_experts_ep_sharded(model.mlp, group)
+    calls = []
+    monkeypatch.setattr(
+        checkpointing.dist,
+        "all_gather_into_tensor",
+        lambda *args, **kwargs: calls.append(True),
+    )
+    state = model.state_dict()
+    state["mlp.w2_EDF"] = torch.zeros(2, 99, 4)
+    with pytest.raises(ValueError, match="w2_EDF.*incompatible shape"):
+        checkpointing.gather_expert_state(
+            state,
+            shard_map=checkpointing.expert_shard_map([model]),
+            model_parts=[model],
+        )
+    assert not calls

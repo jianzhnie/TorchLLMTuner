@@ -5,12 +5,20 @@ Run under torchrun with 4 ranks:
     PYTHONPATH=. torchrun --nproc_per_node=4 \
         tests/integration_tests/pp_ep_equivalence.py
 
+Add `--activation-checkpoint full` or `--activation-checkpoint selective`
+to exercise decoder checkpoint replay. `--aux-coefficient 0.3` magnifies
+the router auxiliary gradient relative to the default coefficient 0.001.
+Add `--compile-backend aot_eager` to compile every local stage while retaining
+the independent eager, uncheckpointed reference and existing tolerances.
+
 The pipeline (pp=2) composes with expert parallelism (ep=2): the sparse mesh
 carries a pp axis, so each stage's ranks form their own EP group, and the MoE
 swap runs per stage chunk (parallelize.py's PP per-part path, stage order
 from the STAGES table). A tiny qwen3_moe trains for a few steps on the
 synthetic corpus; the per-step losses must track a single-process,
-single-stage reference computed in-process.
+single-stage reference computed in-process. Each step also compares clipped
+gradients and post-AdamW parameters, materializing dense DTensors and merging
+expert shards in EP rank order.
 
 Non-vacuity: the model is actually split (each rank holds half the layers),
 each MoE block holds only this stage's half of the experts, and the reference
@@ -20,6 +28,8 @@ Environment note: needs torch >= 2.12 for the pipelining/SPMD surface.
 """
 
 from __future__ import annotations
+
+import argparse
 
 import torch
 import torch.distributed as dist
@@ -35,13 +45,16 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.datasets.synthetic import RandomTokenSource
+from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.expert_parallel import swap_hf_moe_blocks
 from llmtuner.trainer.trainer import Trainer
+from llmtuner.utils.module_names import canonical_fqn
 
 STEPS = 4
 MICROBATCHES = 4
@@ -60,7 +73,12 @@ WORLD = 4  # pp * dp_shard = 2 * 2; the sparse region (2 ranks/stage) fits ep=2
 TOL = 1e-4
 
 
-def _cfg() -> LLMTunerConfig:
+def _cfg(
+    *,
+    activation_checkpoint: str = "none",
+    aux_coefficient: float = 0.001,
+    compile_backend: str | None = None,
+) -> LLMTunerConfig:
     return LLMTunerConfig(
         model=ModelConfig(
             model_name_or_path="qwen3_moe",
@@ -75,6 +93,7 @@ def _cfg() -> LLMTunerConfig:
                 "num_experts_per_tok": 2,
                 "moe_intermediate_size": 48,
                 "norm_topk_prob": True,
+                "router_aux_loss_coef": aux_coefficient,
             },
         ),
         parallel=ParallelConfig(
@@ -92,6 +111,9 @@ def _cfg() -> LLMTunerConfig:
             steps=STEPS,
             seed=SEED,
             deterministic=True,
+            compile=compile_backend is not None,
+            compile_config=CompileConfig(backend=compile_backend or "inductor"),
+            activation_checkpoint_mode=activation_checkpoint,
             metrics_config=MetricsConfig(log_freq=1),
         ),
     )
@@ -99,7 +121,7 @@ def _cfg() -> LLMTunerConfig:
 
 def _reference_trajectory(
     cfg: LLMTunerConfig, initial_states: list[dict[str, torch.Tensor]]
-) -> list[float]:
+) -> tuple[list[float], list[dict[str, tuple[torch.Tensor, torch.Tensor]]]]:
     """Run the same steps on one process from the pipeline's initial state.
 
     PP intentionally derives a distinct initialization seed per stage and EP
@@ -139,9 +161,11 @@ def _reference_trajectory(
         )
     )
     losses = []
+    snapshots = []
     for _ in range(cfg.steps):
         optimizer.zero_grad(set_to_none=True)
         batch = next(batches)
+        AuxLoss.set_step_denominator(torch.tensor(batch.input_ids.numel()))
         targets = model.preprocess_inputs(batch, parallel_dims=None)[1].reshape(
             cfg.global_batch_size, cfg.max_seq_len
         )
@@ -155,12 +179,29 @@ def _reference_trajectory(
             loss_sum = loss.detach() if loss_sum is None else loss_sum + loss.detach()
         clip_grad_norm_(model.parameters(), max_norm=cfg.max_norm, foreach=True)
         optimizer.step()
+        snapshots.append(
+            {
+                name: (parameter.grad.detach().clone(), parameter.detach().clone())
+                for name, parameter in model.named_parameters()
+            }
+        )
         losses.append(float(loss_sum / num_valid))
-    return losses
+    return losses, snapshots
 
 
 def main() -> None:
-    cfg = _cfg()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--activation-checkpoint", choices=("none", "full", "selective"), default="none"
+    )
+    parser.add_argument("--aux-coefficient", type=float, default=0.001)
+    parser.add_argument("--compile-backend", choices=("aot_eager",))
+    args = parser.parse_args()
+    cfg = _cfg(
+        activation_checkpoint=args.activation_checkpoint,
+        aux_coefficient=args.aux_coefficient,
+        compile_backend=args.compile_backend,
+    )
     failures: list[str] = []
 
     trainer = Trainer(cfg)
@@ -184,6 +225,9 @@ def main() -> None:
                 f"rank {rank} part {part_idx} layer {layer_idx}: "
                 "the swap did not install llmtuner MoE blocks"
             )
+            if args.aux_coefficient:
+                assert moe.router.aux_loss is not None
+                assert moe.router.aux_loss.coeff == args.aux_coefficient
             held = moe.routed_experts.inner_experts.num_experts
             if held != num_local:
                 failures.append(
@@ -202,21 +246,69 @@ def main() -> None:
             # the DTensor itself retains its process mesh and can hang.
             if isinstance(value, DTensor):
                 value = value.full_tensor()
-            local_initial_state[key] = value.detach().cpu().clone()
+            local_initial_state[canonical_fqn(key)] = value.detach().cpu().clone()
     initial_states = [None] * trainer.world_size
     dist.all_gather_object(initial_states, local_initial_state)
 
     # -- the trajectory ------------------------------------------------------
     data_iterator = trainer.data_iterator()
     pp_ep_losses = []
+    actual_snapshots = []
     for _step in range(STEPS):
         trainer.step += 1
         metrics = trainer.train_step(data_iterator)
+        if args.compile_backend is not None:
+            from torch._dynamo.eval_frame import OptimizedModule
+            from torch._dynamo.utils import counters
+
+            assert all(
+                isinstance(part, OptimizedModule) for part in trainer.model_parts
+            )
+            assert counters["stats"]["unique_graphs"] > 0
         assert metrics is not None  # log_freq=1: every step reports
         pp_ep_losses.append(metrics["loss"])
+        local = {}
+        for part in trainer.model_parts:
+            for name, parameter in part.named_parameters():
+                values = []
+                for value in (parameter.grad, parameter):
+                    assert value is not None, name
+                    if isinstance(value, DTensor):
+                        value = value.full_tensor()
+                    values.append(value.detach().cpu().clone())
+                local[canonical_fqn(name)] = tuple(values)
+        gathered = [None] * WORLD
+        dist.all_gather_object(gathered, local)
+        merged = {}
+        for name in {key for state in gathered for key in state}:
+            entries = [state[name] for state in gathered if name in state]
+            if name.endswith(("w1_EFD", "w3_EFD", "w2_EDF")):
+                merged[name] = tuple(
+                    torch.cat([entry[i] for entry in entries]) for i in range(2)
+                )
+            else:
+                for entry in entries[1:]:
+                    for left, right in zip(entries[0], entry, strict=True):
+                        torch.testing.assert_close(left, right, rtol=TOL, atol=TOL)
+                merged[name] = entries[0]
+        actual_snapshots.append(merged)
     trainer.close()
 
-    reference = _reference_trajectory(cfg, initial_states)
+    reference, expected_snapshots = _reference_trajectory(cfg, initial_states)
+    for step, (actual, expected) in enumerate(
+        zip(actual_snapshots, expected_snapshots, strict=True)
+    ):
+        assert actual.keys() == expected.keys()
+        for name in expected:
+            for kind, left, right in zip(
+                ("gradient", "parameter"), actual[name], expected[name], strict=True
+            ):
+                try:
+                    torch.testing.assert_close(left, right, rtol=TOL, atol=TOL)
+                except AssertionError as error:
+                    failures.append(
+                        f"rank {rank} step {step + 1} {name} {kind}: {error}"
+                    )
     for step, (got, want) in enumerate(zip(pp_ep_losses, reference, strict=True)):
         if abs(got - want) > TOL:
             failures.append(f"rank {rank} step {step + 1}: loss {got} vs {want}")

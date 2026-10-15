@@ -5,9 +5,17 @@
 
 Odd, unequal rank token counts and zero receives exercise split bookkeeping.
 Routing scores and expert IDs use noncontiguous storage on both ranks.
+CUDA: add --device cuda; use --trace-dir outputs/domino-traces to export
+per-rank profiler traces. Inspect NCCL dispatch1 and expert0 kernel intervals
+on separate streams; trace export alone does not prove overlap. Add
+--nondefault-stream to exercise a caller stream different from the default.
 """
 
+import argparse
+import os
+from contextlib import nullcontext
 from itertools import product
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -16,10 +24,10 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 from llmtuner.models.common.moe.experts import (
-    DominoRoutedExperts,
     GroupedExperts,
     RoutedExperts,
 )
+from llmtuner.parallel.expert_parallel.domino_dispatch import DominoRoutedExperts
 from llmtuner.parallel.expert_parallel.token_dispatch import (
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
@@ -27,10 +35,34 @@ from llmtuner.parallel.expert_parallel.token_dispatch import (
 
 
 def main():
-    dist.init_process_group("gloo")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--trace-dir", type=Path)
+    parser.add_argument("--nondefault-stream", action="store_true")
+    args = parser.parse_args()
+    if args.nondefault_stream and args.device != "cuda":
+        parser.error("--nondefault-stream requires --device cuda")
+    if args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requires CUDA devices and NCCL")
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device("cpu")
+    dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
+    profiler = None
     try:
+        if args.trace_dir is not None:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if device.type == "cuda":
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            profiler = torch.profiler.profile(activities=activities, record_shapes=True)
+            profiler.start()
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
+        caller_stream = (
+            torch.cuda.Stream(device=device) if args.nondefault_stream else None
+        )
         generator = torch.Generator().manual_seed(19)
         for routed_class, zero_receives, recompute, small_rank in product(
             (RoutedExperts, DominoRoutedExperts),
@@ -38,7 +70,9 @@ def main():
             (False, True),
             (None, 0, 1),
         ):
-            reference_experts = GroupedExperts(8, 12, 4, use_grouped_mm=False).double()
+            reference_experts = (
+                GroupedExperts(8, 12, 4, use_grouped_mm=False).double().to(device)
+            )
             with torch.no_grad():
                 for parameter in reference_experts.parameters():
                     parameter.copy_(
@@ -47,7 +81,9 @@ def main():
                         )
                         * 0.1
                     )
-            local_experts = GroupedExperts(8, 12, 2, use_grouped_mm=False).double()
+            local_experts = (
+                GroupedExperts(8, 12, 2, use_grouped_mm=False).double().to(device)
+            )
             with torch.no_grad():
                 for target, source in zip(
                     local_experts.parameters(),
@@ -81,6 +117,9 @@ def main():
             if zero_receives:
                 expert_ids = torch.tensor([[0, 1]] * 12)
             weights = torch.randn(12, 8, generator=generator, dtype=torch.float64)
+            inputs, scores, expert_ids, weights = (
+                tensor.to(device) for tensor in (inputs, scores, expert_ids, weights)
+            )
             reference_inputs = inputs.clone().requires_grad_()
             reference_scores = scores.clone().requires_grad_()
             expected = reference(
@@ -104,13 +143,41 @@ def main():
                 assert (
                     not local_scores.is_contiguous() and not local_ids.is_contiguous()
                 )
-            actual = distributed_experts(
-                local_inputs,
-                local_scores,
-                local_ids,
-                torch.bincount(local_ids.flatten(), minlength=4),
+            local_counts = torch.bincount(local_ids.flatten(), minlength=4)
+            if caller_stream is not None:
+                default_stream = torch.cuda.current_stream(device)
+                caller_stream.wait_stream(default_stream)
+                for tensor in (
+                    local_inputs,
+                    local_scores,
+                    local_ids,
+                    local_counts,
+                    weights,
+                    *local_experts.parameters(),
+                ):
+                    tensor.record_stream(caller_stream)
+            context = (
+                torch.cuda.stream(caller_stream)
+                if caller_stream is not None
+                else nullcontext()
             )
-            (actual * weights[token_slice]).sum().backward()
+            with context:
+                actual = distributed_experts(
+                    local_inputs,
+                    local_scores,
+                    local_ids,
+                    local_counts,
+                )
+                (actual * weights[token_slice]).sum().backward()
+            if caller_stream is not None:
+                default_stream.wait_stream(caller_stream)
+                for tensor in (
+                    actual,
+                    local_inputs.grad,
+                    local_scores.grad,
+                    *(parameter.grad for parameter in local_experts.parameters()),
+                ):
+                    tensor.record_stream(default_stream)
             if recompute:
                 assert len(calls) == 2, "Checkpoint backward must actually recompute"
             torch.testing.assert_close(
@@ -139,10 +206,17 @@ def main():
                     f"{routed_class.__name__} zero_receives={zero_receives} "
                     f"recompute={recompute}: "
                     f"small_rank={small_rank}: "
+                    f"device={device} nondefault_stream={args.nondefault_stream}: "
                     "forward and gradients match",
                     flush=True,
                 )
     finally:
+        if profiler is not None:
+            profiler.stop()
+            args.trace_dir.mkdir(parents=True, exist_ok=True)
+            profiler.export_chrome_trace(
+                str(args.trace_dir / f"rank{dist.get_rank()}.json")
+            )
         dist.destroy_process_group()
 
 

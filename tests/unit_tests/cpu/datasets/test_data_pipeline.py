@@ -203,6 +203,47 @@ def test_streaming_repeat_preserves_epoch_when_reset_fails(streaming):
     assert cursor.get_state()["epoch"] == 0
 
 
+@pytest.mark.parametrize("failure", ["epoch", "restore", "iterate"])
+def test_streaming_repeat_reset_failure_closes_mutated_cursor(failure):
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    events = []
+    original = RuntimeError(f"{failure} failed")
+
+    class Source:
+        def state_dict(self):
+            return {}
+
+        def __iter__(self):
+            events.append("iterate")
+            if events.count("iterate") > 1 and failure == "iterate":
+                raise original
+            return iter([])
+
+        def set_epoch(self, epoch):
+            events.append("epoch")
+            if failure == "epoch":
+                raise original
+
+        def load_state_dict(self, state):
+            events.append("restore")
+            if failure == "restore":
+                raise original
+
+    cursor = HuggingFaceCursorIterator(Source(), repeat=True, shuffle=True)
+    with pytest.raises(RuntimeError) as raised:
+        next(cursor)
+    assert raised.value is original
+    assert cursor.get_state()["epoch"] == 0
+    stopped_events = events.copy()
+    with pytest.raises(ValueError, match="closed"):
+        next(cursor)
+    with pytest.raises(ValueError, match="closed"):
+        cursor.set_state({"epoch": 0, "hf": {}})
+    assert events == stopped_events
+    cursor.close()
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("field", ["path", "split", "name", "revision", "streaming"])
 def test_hf_source_rejects_kwargs_shadowing_explicit_fields(streaming, field):
@@ -2529,3 +2570,470 @@ def test_text_packing_conversions_reject_invalid_context(length, direction):
             text_sequence_to_packing_input(None, max_context_length=length)
         else:
             packing_output_to_text_sequence({}, max_context_length=length)
+
+
+@pytest.mark.parametrize("state", [None, [], "", [1], "invalid"])
+def test_loader_rejects_non_mapping_checkpoint_without_advancing(
+    tokenizer, corpus, state
+):
+    dataset = build_dataset(
+        text_dataset(corpus),
+        context=make_context(tokenizer, num_tokens_per_batch=32),
+        iteration_policy=make_policy(repeat=True),
+    )
+    loader = _loader(dataset, tokenizer)
+    try:
+        before = loader.state_dict()
+        with pytest.raises(ValueError, match="dictionary"):
+            loader.load_state_dict(state)
+        assert loader.state_dict() == before
+    finally:
+        loader.close()
+
+
+@pytest.mark.parametrize("state", [None, [], "", [1], "invalid"])
+def test_synthetic_rejects_non_dictionary_checkpoint_without_changing_stream(state):
+    settings = dict(
+        seed=42, vocab_size=16, batch_size=4, seq_len=8, dp_rank=1, dp_world_size=2
+    )
+    loader = RandomTokenDataLoader(**settings)
+    reference = RandomTokenDataLoader(**settings)
+    active = iter(loader)
+    expected = iter(reference)
+    next(active)
+    next(expected)
+    before = loader.state_dict()
+    with pytest.raises(ValueError, match="dictionary"):
+        loader.load_state_dict(state)
+    assert loader.state_dict() == before
+    for _ in range(2):
+        actual = next(active)
+        batch = next(expected)
+        torch.testing.assert_close(actual.input_ids, batch.input_ids)
+        torch.testing.assert_close(actual.labels, batch.labels)
+
+
+@pytest.mark.parametrize("huggingface_source", [False, True])
+def test_streaming_cursor_close_releases_active_source_generator(huggingface_source):
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    released = []
+
+    class Source:
+        def state_dict(self):
+            return {}
+
+        def __iter__(self):
+            try:
+                yield {"index": 0}
+                yield {"index": 1}
+            finally:
+                released.append(True)
+
+    source = Source()
+    if huggingface_source:
+        from datasets import IterableDataset
+
+        source = IterableDataset.from_generator(source.__iter__)
+    cursor = HuggingFaceCursorIterator(source, repeat=False, shuffle=False)
+    assert next(cursor) == {"index": 0}
+    cursor.close()
+    assert released == [True]
+    cursor.close()
+    assert released == [True]
+    with pytest.raises(ValueError, match="closed"):
+        next(cursor)
+
+
+def test_streaming_cursor_remains_closed_when_source_cleanup_fails():
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    released = []
+
+    class Source:
+        def state_dict(self):
+            return {}
+
+        def __iter__(self):
+            try:
+                yield {"index": 0}
+            finally:
+                released.append(True)
+                raise RuntimeError("source cleanup failed")
+
+    cursor = HuggingFaceCursorIterator(Source(), repeat=False, shuffle=False)
+    next(cursor)
+    with pytest.raises(RuntimeError, match="source cleanup failed"):
+        cursor.close()
+    cursor.close()
+    assert released == [True]
+    with pytest.raises(ValueError, match="closed"):
+        next(cursor)
+
+
+def test_streaming_restore_closes_old_generator_before_source_state_changes():
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    events = []
+
+    class Source:
+        def __init__(self):
+            self.position = 0
+
+        def state_dict(self):
+            return {"position": self.position}
+
+        def load_state_dict(self, state):
+            events.append("restore")
+            self.position = state["position"]
+
+        def __iter__(self):
+            try:
+                while self.position < 10:
+                    position = self.position
+                    self.position += 1
+                    yield {"index": position}
+            finally:
+                events.append("close")
+                self.position = 0
+
+    source = Source()
+    cursor = HuggingFaceCursorIterator(source, repeat=False, shuffle=False)
+    old_iterator = cursor._iterator
+    assert next(cursor) == {"index": 0}
+    cursor.set_state({"epoch": 0, "hf": {"position": 5}})
+    try:
+        assert events == ["close", "restore"]
+        assert next(cursor) == {"index": 5}
+        assert list(old_iterator) == []
+    finally:
+        cursor.close()
+        old_iterator.close()
+
+
+@pytest.mark.parametrize("failure", ["close", "restore", "iterate"])
+def test_streaming_restore_failure_closes_cursor_and_preserves_error(failure):
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    events = []
+
+    class Stream:
+        def __next__(self):
+            return {"index": 0}
+
+        def close(self):
+            events.append("close")
+            if failure == "close":
+                raise RuntimeError("close failed")
+
+    class Source:
+        def state_dict(self):
+            return {}
+
+        def __iter__(self):
+            if "restore" in events and failure == "iterate":
+                raise RuntimeError("iterate failed")
+            return Stream()
+
+        def load_state_dict(self, state):
+            events.append("restore")
+            if failure == "restore":
+                raise RuntimeError("restore failed")
+
+    cursor = HuggingFaceCursorIterator(Source(), repeat=False, shuffle=False)
+    with pytest.raises(RuntimeError, match=f"{failure} failed"):
+        cursor.set_state({"epoch": 0, "hf": {}})
+    assert events == (["close"] if failure == "close" else ["close", "restore"])
+    cursor.close()
+    with pytest.raises(ValueError, match="closed"):
+        next(cursor)
+    with pytest.raises(ValueError, match="closed"):
+        cursor.set_state({"epoch": 0, "hf": {}})
+
+
+def test_finite_concat_packing_preserves_partial_final_row(tokenizer, monkeypatch):
+    from llmtuner.datasets.packing import build
+
+    sample = TextSequence(
+        input_ids=np.array([1, 2, 3], dtype=np.int64),
+        labels=np.array([2, 3, 4], dtype=np.int64),
+    )
+    monkeypatch.setattr(
+        build,
+        "build_dataset",
+        lambda *args, **kwargs: grain.MapDataset.source([sample]),
+    )
+    graph = build.build_concat_then_split_packing(
+        None,
+        context=make_context(tokenizer, num_tokens_per_batch=8),
+        iteration_policy=make_policy(repeat=False),
+    )
+    rows = list(graph)
+    assert len(rows) == 1
+    np.testing.assert_array_equal(rows[0].labels[:3], sample.labels)
+    assert np.all(rows[0].labels[3:] == IGNORE_INDEX)
+    assert np.all(rows[0].padding_mask[3:])
+
+
+@pytest.mark.parametrize("packing", ["concat_then_split", "first_fit"])
+@pytest.mark.parametrize("max_num_documents", [None, 1])
+def test_finite_packing_loader_preserves_all_targets(
+    tokenizer, monkeypatch, packing, max_num_documents
+):
+    from llmtuner.datasets.packing import build
+
+    expected = np.arange(20, 31, dtype=np.int64)
+    samples = [TextSequence(input_ids=np.arange(11, dtype=np.int64), labels=expected)]
+    monkeypatch.setattr(
+        build, "build_dataset", lambda *args, **kwargs: grain.MapDataset.source(samples)
+    )
+    context = make_context(
+        tokenizer,
+        num_tokens_per_batch=8,
+        max_context_length=4,
+        max_num_documents=max_num_documents,
+    )
+    builder = (
+        build.build_concat_then_split_packing
+        if packing == "concat_then_split"
+        else build.build_first_fit_packing
+    )
+    graph = builder(None, context=context, iteration_policy=make_policy(repeat=False))
+    loader = GrainDataLoader(
+        graph,
+        dp_rank=0,
+        dp_world_size=1,
+        tokenizer=tokenizer,
+        max_context_length=4,
+        num_tokens_per_batch=8,
+        max_num_documents=max_num_documents,
+        repeat=False,
+    )
+    try:
+        labels = []
+        count = 0
+        for batch in loader:
+            labels.extend(batch["labels"][batch["labels"] != IGNORE_INDEX].tolist())
+            count += batch["num_valid_tokens"]
+            assert torch.all(batch["labels"][batch["padding_mask"]] == IGNORE_INDEX)
+        assert sorted(labels) == expected.tolist()
+        assert count == len(expected)
+    finally:
+        loader.close()
+
+
+def test_loader_rejects_changed_data_identity_before_restoring_cursor(tokenizer):
+    def loader(identity):
+        return GrainDataLoader(
+            grain.MapDataset.source(
+                [TextSequence(input_ids=np.array([1]), labels=np.array([2]))]
+            ),
+            dp_rank=0,
+            dp_world_size=1,
+            tokenizer=tokenizer,
+            max_context_length=1,
+            num_tokens_per_batch=1,
+            repeat=False,
+            data_identity=identity,
+        )
+
+    source = loader("sha256:source-a")
+    target = loader("sha256:source-b")
+    matching = loader("sha256:source-a")
+    try:
+        state = source.state_dict()
+        before = target.state_dict()
+        with pytest.raises(ValueError, match="batch layout"):
+            target.load_state_dict(state)
+        assert target.state_dict() == before
+        matching.load_state_dict(state)
+        assert next(iter(matching))["labels"].item() == 2
+    finally:
+        for item in (source, target, matching):
+            item.close()
+
+
+def test_dcp_preserves_saved_data_identity_for_loader_validation(tmp_path, tokenizer):
+    import torch.distributed.checkpoint as dcp
+
+    def loader(identity):
+        return GrainDataLoader(
+            grain.MapDataset.source(
+                [TextSequence(input_ids=np.array([1]), labels=np.array([2]))]
+            ),
+            dp_rank=0,
+            dp_world_size=1,
+            tokenizer=tokenizer,
+            max_context_length=1,
+            num_tokens_per_batch=1,
+            repeat=False,
+            data_identity=identity,
+        )
+
+    source = loader("source-a")
+    target = loader("source-b")
+    matching = loader("source-a")
+    try:
+        checkpoint = str(tmp_path / "data-checkpoint")
+        dcp.save({"dataloader": source}, checkpoint_id=checkpoint)
+        with pytest.raises(ValueError, match="batch layout"):
+            dcp.load({"dataloader": target}, checkpoint_id=checkpoint)
+        assert target.state_dict()["batch_layout"]["data_identity"] == "source-b"
+        assert next(iter(target))["labels"].item() == 2
+        dcp.load({"dataloader": matching}, checkpoint_id=checkpoint)
+        assert next(iter(matching))["labels"].item() == 2
+    finally:
+        for item in (source, target, matching):
+            item.close()
+
+
+@pytest.mark.parametrize(
+    "change", ["corpus", "seed", "tokenizer", "legacy", "declared"]
+)
+def test_local_builder_rejects_changed_data_identity(tmp_path, corpus, change):
+    import json
+    from pathlib import Path
+
+    local_corpus = tmp_path / "identity.jsonl"
+    local_corpus.write_bytes(Path(corpus).read_bytes())
+
+    tokenizer_path = tmp_path / "identity-tokenizer"
+    write_tokenizer(str(tokenizer_path))
+    cfg = _loader_config(
+        DataloaderConfig(
+            dataset="local_jsonl",
+            dataset_path=str(local_corpus),
+            tokenizer_path=str(tokenizer_path),
+            shuffle=False,
+        )
+    )
+    source = build_dataloader(cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=16)
+    try:
+        next(iter(source))
+        state = source.state_dict()
+        if change == "corpus":
+            rows = [json.loads(line) for line in local_corpus.read_text().splitlines()]
+            rows[0]["text"] += " hello"
+            local_corpus.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        elif change == "seed":
+            cfg.training.seed += 1
+        elif change == "legacy":
+            state["batch_layout"].pop("data_identity")
+        elif change == "declared":
+            cfg.dataloader.data_identity = "recipe-v2"
+        else:
+            path = tokenizer_path / "tokenizer_config.json"
+            path.write_text(path.read_text() + "\n")
+        target = build_dataloader(
+            cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=16
+        )
+        try:
+            with pytest.raises(ValueError, match="batch layout"):
+                target.load_state_dict(state)
+        finally:
+            target.close()
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize("change", ["snapshot", "seed", "tokenizer"])
+def test_registered_recipe_identity_guards_resume(
+    tmp_path, corpus, monkeypatch, change
+):
+    from llmtuner.datasets.text.recipes import DATASETS, build_local_jsonl
+
+    monkeypatch.setitem(DATASETS, "snapshot_fixture", build_local_jsonl(path=corpus))
+    tokenizer_path = tmp_path / "tokenizer"
+    write_tokenizer(str(tokenizer_path))
+    cfg = _loader_config(
+        DataloaderConfig(
+            dataset="snapshot_fixture",
+            tokenizer_path=str(tokenizer_path),
+            data_identity="dataset-commit:123/recipe-v1",
+            shuffle=False,
+        )
+    )
+
+    def build():
+        return build_dataloader(
+            cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=16
+        )
+
+    source = build()
+    matching = build()
+    try:
+        next(iter(source))
+        state = source.state_dict()
+        matching.load_state_dict(state)
+        expected = next(iter(source))
+        restored = next(iter(matching))
+        for key in ("input", "labels", "positions", "padding_mask"):
+            torch.testing.assert_close(expected[key], restored[key], rtol=0, atol=0)
+        if change == "snapshot":
+            cfg.dataloader.data_identity = "dataset-commit:456/recipe-v1"
+        elif change == "seed":
+            cfg.training.seed += 1
+        else:
+            path = tokenizer_path / "tokenizer_config.json"
+            path.write_text(path.read_text() + "\n")
+        changed = build()
+        try:
+            with pytest.raises(ValueError, match="batch layout"):
+                changed.load_state_dict(state)
+        finally:
+            changed.close()
+    finally:
+        source.close()
+        matching.close()
+
+
+@pytest.mark.parametrize("identity", ["", "  ", 1, False])
+def test_corpus_identity_requires_nonempty_string(identity):
+    with pytest.raises(ValueError, match="data_identity"):
+        DataloaderConfig(data_identity=identity)
+
+
+def test_random_dataset_rejects_unused_corpus_identity():
+    with pytest.raises(ValueError, match="only to corpus"):
+        DataloaderConfig(data_identity="snapshot-v1")
+
+
+def test_cli_exposes_corpus_identity():
+    from llmtuner.trainer.cli import parse_config
+
+    cfg = parse_config(
+        [
+            "--dataset",
+            "c4",
+            "--tokenizer_path",
+            "/tmp/tokenizer",
+            "--data_identity",
+            "dataset-revision:abc/recipe-v1",
+        ]
+    )
+    assert cfg.dataloader.data_identity == "dataset-revision:abc/recipe-v1"
+
+
+def test_local_data_identity_ignores_asset_location(tmp_path, corpus):
+    import shutil
+
+    from llmtuner.datasets.loader_builder import corpus_data_identity
+
+    identities = []
+    for rank in range(2):
+        root = tmp_path / f"rank-{rank}"
+        root.mkdir()
+        corpus_path = root / "rows.jsonl"
+        shutil.copyfile(corpus, corpus_path)
+        tokenizer_path = root / "tokenizer"
+        write_tokenizer(str(tokenizer_path))
+        cfg = _loader_config(
+            DataloaderConfig(
+                dataset="local_jsonl",
+                dataset_path=str(corpus_path),
+                tokenizer_path=str(tokenizer_path),
+                num_prefetch_batches=rank + 1,
+            )
+        )
+        identities.append(corpus_data_identity(cfg, dataset="local_jsonl", repeat=True))
+    assert identities[0] == identities[1]

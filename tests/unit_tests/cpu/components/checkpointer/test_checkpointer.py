@@ -187,6 +187,23 @@ def test_config_rejects_hf_safetensors_against_a_remote_folder() -> None:
     raise AssertionError("last_save_in_hf over a remote URI should be rejected")
 
 
+def test_hf_export_rejects_remote_dump_folder_before_storage_setup():
+    from types import SimpleNamespace
+
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    with pytest.raises(ValueError, match="remote effective checkpoint folder"):
+        DistributedCheckpointManager(
+            Config(enable=True, last_save_in_hf=True),
+            model_parts=[model],
+            optimizer=optimizer,
+            lr_scheduler=_schedule(optimizer),
+            states={},
+            folder="memory://remote-run",
+            sd_adapter=SimpleNamespace(),
+        )
+
+
 def _schedule(optimizer):
     """The lr schedule the manager now requires alongside the optimizer.
 
@@ -759,12 +776,14 @@ def test_torch_checkpointing_hf_final_save_builds_item_specs(tmp_path, monkeypat
     manager.last_save_model_only = True
     manager.last_save_in_hf = True
     manager.export_dtype = torch.float32
+    manager._storage = FilesystemCheckpointStorage()
     manager.folder = str(tmp_path)
     manager.states = {MODEL: torch.nn.Linear(2, 2)}
     manager.sd_adapter = SimpleNamespace(
         to_hf=lambda state: state, fqn_to_index_mapping=None
     )
     manager._backend = SimpleNamespace(
+        METADATA_FILE_NAME="metadata.pkl",
         LayoutInfo=lambda *args: object(),
         SafetensorsSerialization=lambda: object(),
         ItemSpec=lambda **kwargs: SimpleNamespace(**kwargs),
@@ -891,8 +910,8 @@ def test_legacy_loader_layout_planner_keeps_model_keys_strict(tmp_path):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer.distributed_checkpoint import (
-        DataloaderLayoutLoadPlanner,
+    from llmtuner.components.checkpointer.load_planner import (
+        CheckpointLoadPlanner,
     )
 
     checkpoint = tmp_path / "legacy"
@@ -904,14 +923,12 @@ def test_legacy_loader_layout_planner_keeps_model_keys_strict(tmp_path):
         "dataloader": {"version": 1, "cursor": 0, "batch_layout": {"tokens": 32}},
         "weight": torch.zeros(2),
     }
-    dcp.load(target, checkpoint_id=checkpoint, planner=DataloaderLayoutLoadPlanner())
+    dcp.load(target, checkpoint_id=checkpoint, planner=CheckpointLoadPlanner())
     assert target["dataloader"]["cursor"] == 7
     torch.testing.assert_close(target["weight"], torch.ones(2))
     target["missing_weight"] = torch.zeros(2)
     with pytest.raises(CheckpointException, match="missing_weight"):
-        dcp.load(
-            target, checkpoint_id=checkpoint, planner=DataloaderLayoutLoadPlanner()
-        )
+        dcp.load(target, checkpoint_id=checkpoint, planner=CheckpointLoadPlanner())
 
 
 def test_partial_loader_layout_metadata_is_rejected(tmp_path):
@@ -919,8 +936,8 @@ def test_partial_loader_layout_metadata_is_rejected(tmp_path):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer.distributed_checkpoint import (
-        DataloaderLayoutLoadPlanner,
+    from llmtuner.components.checkpointer.load_planner import (
+        CheckpointLoadPlanner,
     )
 
     checkpoint = tmp_path / "partial"
@@ -935,9 +952,42 @@ def test_partial_loader_layout_metadata_is_rejected(tmp_path):
         }
     }
     with pytest.raises(CheckpointException, match="batch_layout.rows"):
-        dcp.load(
-            target, checkpoint_id=checkpoint, planner=DataloaderLayoutLoadPlanner()
-        )
+        dcp.load(target, checkpoint_id=checkpoint, planner=CheckpointLoadPlanner())
+
+
+def test_process_checkpoint_tracks_upload_when_staging_completes_synchronously(
+    tmp_path, monkeypatch
+):
+    from concurrent.futures import Future
+
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    manager = DistributedCheckpointManager(
+        Config(
+            enable=True, interval=1, keep_latest_k=0, async_mode="async_with_pinned_mem"
+        ),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=str(tmp_path),
+    )
+    upload = Future()
+    manager.stager = object()
+    monkeypatch.setattr(manager, "_save_checkpoint", lambda *args, **kwargs: upload)
+    try:
+        assert manager.save(1)
+        assert manager.save_future is upload
+        assert manager.staging_future is None
+        assert not upload.done()
+        upload.set_result(None)
+        manager.maybe_wait_for_saving()
+        assert manager.save_future is None
+    finally:
+        if not upload.done():
+            upload.set_result(None)
+        manager.stager = None
+        manager.close()
 
 
 def test_async_checkpoint_completion_reports_actual_outcome(
@@ -1187,3 +1237,894 @@ def test_dcp_interrupted_wait_retains_active_future(phase):
     future.set_result(None)
     wait(manager)
     assert getattr(manager, field) is None
+
+
+@pytest.mark.parametrize("phase", ["staging", "saving"])
+def test_interrupted_close_preserves_resources_until_future_finishes(phase):
+    from concurrent.futures import Future
+
+    from llmtuner.components.checkpointer.distributed_checkpoint import (
+        DistributedCheckpointAsyncMode,
+    )
+
+    class InterruptedFuture(Future):
+        def result(self, timeout=None):
+            if not self.done():
+                raise KeyboardInterrupt("interrupted close")
+            return super().result(timeout)
+
+    future = InterruptedFuture()
+    manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
+    manager._initialized = True
+    manager.enable = True
+    manager.async_mode = DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM
+    manager.staging_future = future if phase == "staging" else None
+    manager.save_future = future if phase == "saving" else None
+    released = []
+    manager._close = lambda: released.append(True)
+    with pytest.raises(KeyboardInterrupt, match="interrupted close"):
+        manager.close()
+    assert released == []
+    assert manager._initialized is True
+    future.set_result(None)
+    manager.close()
+    manager.close()
+    assert released == [True]
+    assert manager._initialized is False
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("succeeds", [False, True])
+def test_retention_preserves_last_checkpoint_until_new_save_succeeds(
+    tmp_path, asynchronous, succeeds
+):
+    import queue
+    from concurrent.futures import Future
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    manager = DistributedCheckpointManager(
+        Config(
+            enable=True,
+            interval=1,
+            keep_latest_k=0,
+            async_mode="async" if asynchronous else "disabled",
+        ),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=str(tmp_path),
+    )
+    old = Path(manager.folder) / "step-1"
+    old.mkdir(parents=True)
+    (old / ".metadata").touch()
+    manager.keep_latest_k = 1
+    manager.purge_queue = queue.Queue()
+    manager.purge_thread = SimpleNamespace(is_alive=lambda: False)
+    future = Future()
+
+    def save(states, *, checkpoint_id, **kwargs):
+        if asynchronous:
+            return future
+        if not succeeds:
+            raise OSError("write failed")
+        Path(checkpoint_id).mkdir()
+        (Path(checkpoint_id) / ".metadata").touch()
+
+    # These fixtures model publication with marker files, not real DCP metadata.
+    manager._is_resumable_checkpoint = manager._is_valid_checkpoint
+    manager._save_checkpoint = save
+    try:
+        if not asynchronous and not succeeds:
+            with pytest.raises(OSError, match="write failed"):
+                manager.save(2)
+        else:
+            manager.save(2)
+        if asynchronous:
+            assert manager.purge_queue.empty()
+            if succeeds:
+                new = Path(manager.folder) / "step-2"
+                new.mkdir()
+                (new / ".metadata").touch()
+                future.set_result(None)
+                manager.maybe_wait_for_saving()
+            else:
+                future.set_exception(OSError("write failed"))
+                with pytest.raises(OSError, match="write failed"):
+                    manager.maybe_wait_for_saving()
+        if succeeds:
+            assert manager.purge_queue.get_nowait() == str(old)
+        assert manager.purge_queue.empty()
+    finally:
+        if asynchronous and not future.done():
+            future.set_result(None)
+        manager.close()
+
+
+def test_final_model_export_does_not_evict_last_resumable_checkpoint(tmp_path):
+    import queue
+    from types import SimpleNamespace
+
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.config import OptimizerConfig
+
+    model = nn.Linear(2, 2)
+    optimizer = OptimizersContainer(OptimizerConfig(), model_parts=[model])
+    manager = DistributedCheckpointManager(
+        Config(enable=True, interval=1, keep_latest_k=0),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer.optimizers[0]),
+        states={},
+        folder=str(tmp_path),
+    )
+    try:
+        assert manager.save(1)
+        manager.keep_latest_k = 1
+        manager.purge_queue = queue.Queue()
+        manager.purge_thread = SimpleNamespace(is_alive=lambda: False)
+        assert manager.save(2, last_step=True)
+        assert manager.purge_queue.empty()
+        assert manager._find_load_step() == 1
+        assert manager.save(3)
+        deleted = set()
+        while not manager.purge_queue.empty():
+            deleted.add(manager.purge_queue.get_nowait())
+        assert deleted == {str(tmp_path / "checkpoint" / "step-1")}
+        assert manager._find_load_step() == 3
+    finally:
+        manager.close()
+
+
+def test_flattened_model_keys_cannot_overwrite_training_state():
+    from types import SimpleNamespace
+
+    from llmtuner.components.checkpointer.checkpoint_keys import MODEL, OPTIMIZER
+
+    manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
+    optimizer_state = object()
+    manager.states = {
+        OPTIMIZER: optimizer_state,
+        MODEL: SimpleNamespace(state_dict=lambda: {OPTIMIZER: torch.ones(2)}),
+    }
+    with pytest.raises(ValueError, match="Model checkpoint keys.*optimizer"):
+        manager._flatten_model_state()
+    assert manager.states[OPTIMIZER] is optimizer_state
+
+
+def test_same_step_final_export_preserves_complete_checkpoint(tmp_path):
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.config import OptimizerConfig
+
+    model = nn.Linear(2, 2)
+    optimizer = OptimizersContainer(OptimizerConfig(), model_parts=[model])
+    manager = DistributedCheckpointManager(
+        Config(enable=True, interval=1, keep_latest_k=0),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer.optimizers[0]),
+        states={},
+        folder=str(tmp_path),
+    )
+    try:
+        expected = {key: value.clone() for key, value in model.state_dict().items()}
+        assert manager.save(1)
+        with torch.no_grad():
+            model.weight.add_(1)
+        assert manager.save(1, last_step=True)
+        checkpoint = str(tmp_path / "checkpoint" / "step-1")
+        assert manager._is_resumable_checkpoint(checkpoint)
+        export = str(tmp_path / "checkpoint" / "step-1" / "model-export")
+        assert manager._is_valid_checkpoint(export)
+        assert not manager._is_resumable_checkpoint(export)
+        assert manager.load(1)
+        torch.testing.assert_close(model.state_dict(), expected, rtol=0, atol=0)
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError("removed by retention"),
+        ValueError("corrupt metadata"),
+        PermissionError("metadata access denied"),
+    ],
+)
+def test_resumability_scan_only_tolerates_disappearing_metadata(monkeypatch, error):
+    from types import SimpleNamespace
+
+    from torch.distributed.checkpoint import _storage_utils
+
+    def read_metadata():
+        raise error
+
+    monkeypatch.setattr(
+        _storage_utils,
+        "_storage_setup",
+        lambda *args, **kwargs: SimpleNamespace(read_metadata=read_metadata),
+    )
+    manager = SimpleNamespace(
+        _storage=SimpleNamespace(isfile=lambda path: True),
+        _parse_step=lambda name: 1,
+    )
+    if isinstance(error, FileNotFoundError):
+        assert not DistributedCheckpointManager._is_resumable_checkpoint(
+            manager, "checkpoint/step-1"
+        )
+    else:
+        with pytest.raises(type(error), match=str(error)):
+            DistributedCheckpointManager._is_resumable_checkpoint(
+                manager, "checkpoint/step-1"
+            )
+
+
+@pytest.mark.parametrize("async_mode", ["disabled", "async"])
+@pytest.mark.parametrize("failure_phase", ["shards", "publication"])
+def test_failed_same_step_save_preserves_published_model(
+    tmp_path, monkeypatch, async_mode, failure_phase
+):
+    from copy import deepcopy
+
+    from torch.distributed.checkpoint import FileSystemWriter
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer import checkpoint_writer
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.config import OptimizerConfig
+
+    model = nn.Linear(2, 2)
+    optimizer = OptimizersContainer(OptimizerConfig(), model_parts=[model])
+    scheduler = _schedule(optimizer.optimizers[0])
+    manager = DistributedCheckpointManager(
+        Config(enable=True, interval=1, keep_latest_k=0, async_mode=async_mode),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states={},
+        folder=str(tmp_path),
+    )
+    try:
+        model(torch.ones(2, 2)).sum().backward()
+        optimizer.step()
+        scheduler.step()
+        expected = {key: value.clone() for key, value in model.state_dict().items()}
+        expected_optimizer = deepcopy(optimizer.state_dict())
+        expected_scheduler = deepcopy(scheduler.state_dict())
+        assert manager.save(1)
+        manager.maybe_wait_for_saving()
+        checkpoint = tmp_path / "checkpoint" / "step-1"
+        metadata = (checkpoint / ".metadata").read_bytes()
+        with torch.no_grad():
+            model.weight.add_(5)
+        optimizer.step()
+        scheduler.step()
+        write_data = FileSystemWriter._write_data
+
+        def fail_after_writing(self, *args, **kwargs):
+            write_data(self, *args, **kwargs)
+            raise OSError("injected failure after writing shards")
+
+        with monkeypatch.context() as patch:
+            if failure_phase == "shards":
+                patch.setattr(FileSystemWriter, "_write_data", fail_after_writing)
+            else:
+
+                def fail_publication(*args, **kwargs):
+                    raise OSError("injected failure publishing metadata")
+
+                patch.setattr(checkpoint_writer.os, "replace", fail_publication)
+            with pytest.raises(CheckpointException, match="injected failure"):
+                manager.save(1)
+                manager.maybe_wait_for_saving()
+        assert (checkpoint / ".metadata").read_bytes() == metadata
+        assert manager.load(1)
+        torch.testing.assert_close(model.state_dict(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            optimizer.state_dict(), expected_optimizer, rtol=0, atol=0
+        )
+        assert scheduler.state_dict() == expected_scheduler
+        # A retry must publish a fresh generation and remain readable by the
+        # ordinary DCP reader, without deleting the earlier generation's files.
+        with torch.no_grad():
+            model.weight.add_(7)
+        expected_retry = {
+            key: value.clone() for key, value in model.state_dict().items()
+        }
+        assert manager.save(1)
+        manager.maybe_wait_for_saving()
+        assert (checkpoint / ".metadata").read_bytes() != metadata
+        with torch.no_grad():
+            model.weight.zero_()
+        assert manager.load(1)
+        torch.testing.assert_close(model.state_dict(), expected_retry, rtol=0, atol=0)
+    finally:
+        manager.close()
+
+
+def _read_hf_export_into_fresh_model(tmp_path, model, adapter):
+    from copy import deepcopy
+
+    restored = deepcopy(model)
+    optimizer = torch.optim.AdamW(restored.parameters())
+    manager = DistributedCheckpointManager(
+        Config(
+            enable=True,
+            initial_load_path=str(tmp_path / "checkpoint" / "step-1"),
+            initial_load_in_hf=True,
+            keep_latest_k=0,
+        ),
+        model_parts=[restored],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=str(tmp_path / "imported"),
+        sd_adapter=adapter,
+    )
+    try:
+        assert manager.load(-1)
+        return restored.state_dict()
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_hf_export_roundtrip_without_process_group(tmp_path, indexed):
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+
+    model = nn.ModuleDict({"model": nn.Linear(2, 2)})
+    optimizer = torch.optim.AdamW(model.parameters())
+    adapter = HFTransformerStateDictAdapter(SimpleNamespace(), None)
+    if indexed:
+        adapter.fqn_to_index_mapping = {"weight": 1, "bias": 2}
+    manager = DistributedCheckpointManager(
+        Config(enable=True, last_save_in_hf=True, keep_latest_k=0),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=str(tmp_path),
+        sd_adapter=adapter,
+    )
+    try:
+        expected = {key: value.clone() for key, value in model.state_dict().items()}
+        assert manager.save(1, last_step=True)
+        export = tmp_path / "checkpoint" / "step-1"
+        assert manager._is_valid_checkpoint(str(export))
+        save_file(
+            {"weight": torch.full((2, 2), 999.0), "bias": torch.full((2,), 999.0)},
+            str(export / "abandoned.safetensors"),
+        )
+        with torch.no_grad():
+            model["model"].weight.zero_()
+        torch.testing.assert_close(
+            _read_hf_export_into_fresh_model(tmp_path, model, adapter),
+            expected,
+            rtol=0,
+            atol=0,
+        )
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+@pytest.mark.parametrize("failure_phase", ["consolidation", "publication"])
+def test_failed_hf_export_rewrite_preserves_published_weights(
+    tmp_path, monkeypatch, indexed, failure_phase
+):
+    from types import SimpleNamespace
+
+    from torch.distributed.checkpoint import _consolidate_hf_safetensors
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer import hf_storage
+    from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+
+    model = nn.ModuleDict({"model": nn.Linear(2, 2)})
+    optimizer = torch.optim.AdamW(model.parameters())
+    adapter = HFTransformerStateDictAdapter(SimpleNamespace(), None)
+    if indexed:
+        adapter.fqn_to_index_mapping = {"weight": 1, "bias": 2}
+    manager = DistributedCheckpointManager(
+        Config(enable=True, last_save_in_hf=True, keep_latest_k=0),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=str(tmp_path),
+        sd_adapter=adapter,
+    )
+    try:
+        expected = {key: value.clone() for key, value in model.state_dict().items()}
+        assert manager.save(1, last_step=True)
+        with torch.no_grad():
+            model["model"].weight.add_(5)
+        consolidate = _consolidate_hf_safetensors._consolidate_safetensors_files
+
+        def fail_after_consolidation(*args, **kwargs):
+            consolidate(*args, **kwargs)
+            raise OSError("injected failure after HF consolidation")
+
+        with monkeypatch.context() as patch:
+            if failure_phase == "consolidation":
+                patch.setattr(
+                    _consolidate_hf_safetensors,
+                    "_consolidate_safetensors_files",
+                    fail_after_consolidation,
+                )
+            else:
+
+                def fail_publication(*args, **kwargs):
+                    raise OSError("injected failure publishing HF index")
+
+                patch.setattr(hf_storage.os, "replace", fail_publication)
+            with pytest.raises(CheckpointException, match="injected failure"):
+                manager.save(1, last_step=True)
+        torch.testing.assert_close(
+            _read_hf_export_into_fresh_model(tmp_path, model, manager.sd_adapter),
+            expected,
+            rtol=0,
+            atol=0,
+        )
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("protocol", ["memory", "file"])
+@pytest.mark.parametrize("async_mode", ["disabled", "async"])
+@pytest.mark.parametrize("failure_phase", ["shards", "publication"])
+def test_fsspec_same_step_failure_preserves_checkpoint(
+    tmp_path, monkeypatch, protocol, async_mode, failure_phase
+):
+    from uuid import uuid4
+
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint import FileSystemWriter
+    from torch.distributed.checkpoint._fsspec_filesystem import (
+        FileSystem as FsspecFileSystem,
+    )
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer import checkpoint_writer, filesystem
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.config import OptimizerConfig
+
+    folder = (
+        f"memory://llmtuner-tests/{uuid4().hex}"
+        if protocol == "memory"
+        else (tmp_path / "remote-checkpoint").as_uri()
+    )
+    model = nn.Linear(2, 2)
+    optimizer = OptimizersContainer(OptimizerConfig(), model_parts=[model])
+    manager = DistributedCheckpointManager(
+        Config(
+            enable=True,
+            folder=folder,
+            interval=1,
+            keep_latest_k=0,
+            async_mode=async_mode,
+        ),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer.optimizers[0]),
+        states={},
+        folder=str(tmp_path),
+    )
+    fs, checkpoint = filesystem.resolve(filesystem.join(folder, "step-1"))
+    metadata_path = f"{checkpoint}/.metadata"
+    try:
+        expected = {key: value.clone() for key, value in model.state_dict().items()}
+        assert manager.save(1)
+        manager.maybe_wait_for_saving()
+        metadata = fs.cat_file(metadata_path)
+        with torch.no_grad():
+            model.weight.add_(5)
+        write_data = FileSystemWriter._write_data
+
+        def fail_after_writing(self, *args, **kwargs):
+            write_data(self, *args, **kwargs)
+            raise OSError("injected remote shard failure")
+
+        def fail_publication(*args, **kwargs):
+            raise OSError("injected remote publication failure")
+
+        with monkeypatch.context() as patch:
+            if failure_phase == "shards":
+                patch.setattr(FileSystemWriter, "_write_data", fail_after_writing)
+            else:
+                patch.setattr(FsspecFileSystem, "rename", fail_publication)
+                # fsspec caches filesystem instances per thread; the async
+                # writer resets its filesystem in the worker thread.
+                patch.setattr(type(fs), "pipe_file", fail_publication)
+                patch.setattr(checkpoint_writer.os, "replace", fail_publication)
+            with pytest.raises(CheckpointException, match="injected remote"):
+                manager.save(1)
+                manager.maybe_wait_for_saving()
+        assert fs.cat_file(metadata_path) == metadata
+        assert manager.load(1)
+        torch.testing.assert_close(model.state_dict(), expected, rtol=0, atol=0)
+        # An unmodified DCP reader must understand the generated remote files.
+        target = {key: torch.zeros_like(value) for key, value in expected.items()}
+        dcp.load(target, checkpoint_id=filesystem.join(folder, "step-1"))
+        torch.testing.assert_close(target, expected, rtol=0, atol=0)
+        with torch.no_grad():
+            model.weight.add_(7)
+        retry = {key: value.clone() for key, value in model.state_dict().items()}
+        assert manager.save(1)
+        manager.maybe_wait_for_saving()
+        dcp.load(target, checkpoint_id=filesystem.join(folder, "step-1"))
+        torch.testing.assert_close(target, retry, rtol=0, atol=0)
+    finally:
+        manager.close()
+        manager._storage.remove(folder)
+
+
+def test_generation_writer_rejects_non_atomic_fsspec_protocol(monkeypatch):
+    from types import SimpleNamespace
+
+    from torch.distributed.checkpoint._fsspec_filesystem import (
+        FileSystem as FsspecFileSystem,
+    )
+
+    from llmtuner.components.checkpointer.checkpoint_writer import (
+        GenerationFileSystemWriter,
+    )
+    from llmtuner.errors import UnsupportedCombinationError
+
+    def init_path(self, path):
+        self.fs = SimpleNamespace(protocol="ftp")
+        return path
+
+    monkeypatch.setattr(FsspecFileSystem, "init_path", init_path)
+    with pytest.raises(UnsupportedCombinationError, match="atomic.*replacement"):
+        GenerationFileSystemWriter("ftp://server/checkpoint")
+
+
+@pytest.mark.parametrize("mode", ["distributed", "process"])
+def test_memory_checkpoint_rejects_separate_processes_before_group_setup(
+    tmp_path, monkeypatch, mode
+):
+    import torch.distributed as dist
+
+    from llmtuner.errors import UnsupportedCombinationError
+
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    scheduler = _schedule(optimizer)
+    if mode == "distributed":
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+        # This unit simulates storage policy only; real coordination is covered
+        # by trainer_initialization_coordination.py with an actual Gloo group.
+        monkeypatch.setattr(
+            "llmtuner.accelerator.collectives.get_world_size", lambda group=None: 1
+        )
+
+    def unexpected_group(*args, **kwargs):
+        pytest.fail("Invalid memory checkpoint mode must fail before group setup")
+
+    monkeypatch.setattr(dist, "new_group", unexpected_group)
+    with pytest.raises(UnsupportedCombinationError, match="memory.*process-local"):
+        DistributedCheckpointManager(
+            Config(
+                enable=True,
+                folder="memory://llmtuner-tests/invalid",
+                async_mode="async"
+                if mode == "distributed"
+                else "async_with_pinned_mem",
+            ),
+            model_parts=[model],
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            states={},
+            folder=str(tmp_path),
+        )
+
+
+@pytest.mark.parametrize("async_mode", ["disabled", "async"])
+def test_remote_lost_publication_acknowledgement_leaves_consistent_checkpoint(
+    tmp_path, monkeypatch, async_mode
+):
+    from uuid import uuid4
+
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer import filesystem
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.config import OptimizerConfig
+
+    folder = f"memory://llmtuner-tests/{uuid4().hex}"
+    model = nn.Linear(2, 2)
+    optimizer = OptimizersContainer(OptimizerConfig(), model_parts=[model])
+    manager = DistributedCheckpointManager(
+        Config(
+            enable=True,
+            folder=folder,
+            interval=1,
+            keep_latest_k=0,
+            async_mode=async_mode,
+        ),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer.optimizers[0]),
+        states={},
+        folder=str(tmp_path),
+    )
+    fs, _ = filesystem.resolve(folder)
+    publish = type(fs).pipe_file
+    try:
+        assert manager.save(1)
+        manager.maybe_wait_for_saving()
+        with torch.no_grad():
+            model.weight.add_(5)
+        expected = {key: value.clone() for key, value in model.state_dict().items()}
+
+        def publish_then_fail(self, *args, **kwargs):
+            publish(self, *args, **kwargs)
+            raise OSError("lost remote publication acknowledgement")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(type(fs), "pipe_file", publish_then_fail)
+            with pytest.raises(CheckpointException, match="lost remote publication"):
+                manager.save(1)
+                manager.maybe_wait_for_saving()
+        with torch.no_grad():
+            model.weight.zero_()
+        assert manager.load(1)
+        torch.testing.assert_close(model.state_dict(), expected, rtol=0, atol=0)
+    finally:
+        manager.close()
+        manager._storage.remove(folder)
+
+
+def test_load_waits_for_pending_upload_before_discovering_latest_checkpoint(
+    tmp_path, monkeypatch
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    model = nn.Linear(3, 2)
+    expected = {key: value.clone() for key, value in model.state_dict().items()}
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    manager = DistributedCheckpointManager(
+        Config(enable=True, interval=1, keep_latest_k=0, async_mode="async"),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=1),
+        states={},
+        folder=str(tmp_path),
+    )
+    release = Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+    save = manager._save_checkpoint
+    wait = manager._wait_for_saving
+    resolve = manager._resolve_load_source
+
+    def delayed_save(*args, **kwargs):
+        actual_upload = save(*args, **kwargs)
+
+        def upload():
+            assert release.wait(10), "Load did not wait for the pending upload"
+            actual_upload.result()
+
+        return executor.submit(upload)
+
+    def wait_for_upload():
+        release.set()
+        wait()
+
+    monkeypatch.setattr(manager, "_save_checkpoint", delayed_save)
+    monkeypatch.setattr(manager, "_wait_for_saving", wait_for_upload)
+    try:
+        assert manager.save(1)
+        pending = manager.save_future
+        assert pending is not None and not pending.done()
+
+        def resolve_after_upload(step):
+            assert pending.done(), "Load discovered storage before upload completed"
+            return resolve(step)
+
+        monkeypatch.setattr(manager, "_resolve_load_source", resolve_after_upload)
+        with torch.no_grad():
+            model.weight.zero_()
+            model.bias.zero_()
+        assert manager.load(-1)
+        assert manager.save_future is None
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
+    finally:
+        release.set()
+        manager.close()
+        executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("failed_phase", [None, "staging", "saving"])
+def test_load_synchronizes_snapshot_before_state_or_storage_access(failed_phase):
+    from types import SimpleNamespace
+
+    calls = []
+
+    def synchronize(phase):
+        calls.append(phase)
+        if phase == failed_phase:
+            raise RuntimeError(f"{phase} failed")
+
+    def resolve(step):
+        calls.append("resolve")
+        return None
+
+    manager = SimpleNamespace(
+        _initialized=True,
+        enable=True,
+        maybe_wait_for_staging=lambda: synchronize("staging"),
+        maybe_wait_for_saving=lambda: synchronize("saving"),
+        _resolve_load_source=resolve,
+    )
+    if failed_phase:
+        with pytest.raises(RuntimeError, match=f"{failed_phase} failed"):
+            BaseCheckpointManager.load(manager)
+        assert calls == (
+            ["staging"] if failed_phase == "staging" else ["staging", "saving"]
+        )
+    else:
+        assert BaseCheckpointManager.load(manager) is False
+        assert calls == ["staging", "saving", "resolve"]
+
+
+def test_compiled_checkpoint_planner_restores_tensors_and_group_options(tmp_path):
+    import torch.distributed.checkpoint as dcp
+
+    from llmtuner.components.checkpointer.load_planner import (
+        CheckpointLoadPlanner,
+    )
+
+    checkpoint = tmp_path / "compiled"
+    dcp.save(
+        {
+            "_orig_mod.model.weight": torch.tensor([2.0, 3.0]),
+            "optimizer": {
+                "state._orig_mod.model.weight.exp_avg": torch.tensor([0.5, 0.25]),
+                "param_groups._orig_mod.model.weight.lr": 0.125,
+            },
+            "ema": {"state": {"_orig_mod.model.weight.ema_params": torch.ones(2)}},
+        },
+        checkpoint_id=checkpoint,
+    )
+    target = {
+        "model.weight": torch.zeros(2),
+        "optimizer": {
+            "state.model.weight.exp_avg": torch.zeros(2),
+            "param_groups.model.weight.lr": 0.0,
+        },
+        "ema": {"state": {"model.weight.ema_params": torch.zeros(2)}},
+    }
+    dcp.load(target, checkpoint_id=checkpoint, planner=CheckpointLoadPlanner())
+    assert torch.equal(target["model.weight"], torch.tensor([2.0, 3.0]))
+    assert torch.equal(
+        target["optimizer"]["state.model.weight.exp_avg"], torch.tensor([0.5, 0.25])
+    )
+    assert target["optimizer"]["param_groups.model.weight.lr"] == 0.125
+    assert torch.equal(target["ema"]["state"]["model.weight.ema_params"], torch.ones(2))
+
+
+def test_compiled_checkpoint_planner_rejects_ambiguous_names(tmp_path):
+    import pytest
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer.load_planner import (
+        CheckpointLoadPlanner,
+    )
+
+    checkpoint = tmp_path / "ambiguous"
+    dcp.save(
+        {"model.weight": torch.ones(2), "_orig_mod.model.weight": torch.zeros(2)},
+        checkpoint_id=checkpoint,
+    )
+    with pytest.raises(CheckpointException, match="Ambiguous compiled checkpoint keys"):
+        dcp.load(
+            {"model.weight": torch.zeros(2)},
+            checkpoint_id=checkpoint,
+            planner=CheckpointLoadPlanner(),
+        )
+
+
+@pytest.mark.parametrize("flatten", [True, False])
+def test_compiled_checkpoint_flat_scalar_keeps_canonical_target(tmp_path, flatten):
+    import torch.distributed.checkpoint as dcp
+
+    from llmtuner.components.checkpointer.load_planner import (
+        CheckpointLoadPlanner,
+    )
+
+    checkpoint = tmp_path / "nested-compiled"
+    dcp.save(
+        {
+            "optimizer.param_groups.layers._orig_mod.0._orig_mod.weight.lr": 0.25,
+            "model.layers._orig_mod.0.weight": torch.ones(2),
+        },
+        checkpoint_id=checkpoint,
+    )
+    target = {
+        "optimizer.param_groups.layers.0.weight.lr": 0.0,
+        "model.layers.0.weight": torch.zeros(2),
+    }
+    original_keys = set(target)
+    dcp.load(
+        target,
+        checkpoint_id=checkpoint,
+        planner=CheckpointLoadPlanner(flatten_state_dict=flatten),
+    )
+    assert set(target) == original_keys
+    assert target["optimizer.param_groups.layers.0.weight.lr"] == 0.25
+    assert torch.equal(target["model.layers.0.weight"], torch.ones(2))
+
+
+def test_compiled_checkpoint_migration_keeps_missing_keys_strict(tmp_path):
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer.load_planner import (
+        CheckpointLoadPlanner,
+    )
+
+    checkpoint = tmp_path / "incomplete-compiled"
+    dcp.save({"_orig_mod.model.weight": torch.ones(2)}, checkpoint_id=checkpoint)
+    with pytest.raises(CheckpointException, match="model.bias"):
+        dcp.load(
+            {"model.weight": torch.zeros(2), "model.bias": torch.zeros(2)},
+            checkpoint_id=checkpoint,
+            planner=CheckpointLoadPlanner(),
+        )
+
+
+def test_staging_group_construction_failure_releases_upload_group(
+    tmp_path, monkeypatch
+):
+    import torch.distributed as dist
+
+    assert not dist.is_initialized()
+    dist.init_process_group(
+        "gloo",
+        init_method=(tmp_path / "staging-group-rendezvous").as_uri(),
+        rank=0,
+        world_size=1,
+    )
+    groups = []
+    new_group = dist.new_group
+    failure = OSError("staging group initialization failed")
+
+    def create_group(*args, **kwargs):
+        if groups:
+            raise failure
+        group = new_group(*args, **kwargs)
+        groups.append(group)
+        return group
+
+    monkeypatch.setattr(dist, "new_group", create_group)
+    try:
+        model = nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters())
+        with pytest.raises(OSError) as caught:
+            DistributedCheckpointManager(
+                Config(enable=True, async_mode="async_with_pinned_mem"),
+                model_parts=[model],
+                optimizer=optimizer,
+                lr_scheduler=_schedule(optimizer),
+                states={},
+                folder=str(tmp_path),
+            )
+        assert caught.value is failure
+        assert len(groups) == 1
+        with pytest.raises(KeyError):
+            dist.get_process_group_ranks(groups[0])
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
