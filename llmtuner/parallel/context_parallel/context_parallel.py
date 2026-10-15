@@ -177,6 +177,15 @@ def apply_cp(
         ulysses_mesh = parallel_dims.get_optional_mesh("cp_ulysses")
         if kv_mesh is None or ulysses_mesh is None:
             raise ValueError("dual CP axis meshes were not constructed")
+        for axis, axis_mesh, degree in (
+            ("cp_kv", kv_mesh, cfg.context_parallel_kv_allgather_size),
+            ("cp_ulysses", ulysses_mesh, cfg.context_parallel_ulysses_size),
+        ):
+            if axis_mesh.size() != degree:
+                raise ValueError(
+                    f"mesh {axis!r} axis has size {axis_mesh.size()}, "
+                    f"but cfg requests {degree}"
+                )
         _require_ulysses_compatible(model, cfg=cfg, cp_mesh=ulysses_mesh)
     elif strategy == "ulysses":
         _require_ulysses_compatible(model, cfg=cfg, cp_mesh=cp_mesh)
@@ -189,6 +198,7 @@ def apply_cp(
         )
     model_config = getattr(getattr(model, "model", None), "config", None)
     packed = getattr(model_config, "attn_mask_type", "causal") == "block_causal"
+    attentions = []
     for idx, layer in enumerate(layers):
         for name in _ATTN_MODULE_NAMES:
             if hasattr(layer, name):
@@ -200,14 +210,16 @@ def apply_cp(
                 f"under any of {_ATTN_MODULE_NAMES}. Add the model's spelling "
                 "to the probe in apply_cp."
             )
+        attentions.append(attn_mod)
+    kernels = []
+    for _ in attentions:
         if dual_axes:
-            attn_mod._titan_flex_kernel = DualCPFlexKernel(
-                kv_mesh=kv_mesh, ulysses_mesh=ulysses_mesh
-            )
+            kernel = DualCPFlexKernel(kv_mesh=kv_mesh, ulysses_mesh=ulysses_mesh)
         else:
-            attn_mod._titan_flex_kernel = CPFlexKernel(
-                cp_mesh=cp_mesh, strategy=strategy, packed=packed
-            )
+            kernel = CPFlexKernel(cp_mesh=cp_mesh, strategy=strategy, packed=packed)
+        kernels.append(kernel)
+    for attn_mod, kernel in zip(attentions, kernels, strict=True):
+        attn_mod._titan_flex_kernel = kernel
 
     cp_options = {
         "load_balancer": load_balancer,

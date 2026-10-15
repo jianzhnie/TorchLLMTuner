@@ -42,9 +42,38 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
 )
 
+from ...errors import UnsupportedCombinationError
 from ...utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+class ComposablePipelineStage(PipelineStage):
+    """Finalize any FSDP state, including custom composable implementations.
+
+    PyTorch 2.14's stage uses fully_shard.state(), which only discovers state
+    registered by that specific API. FSDPModule's accessor discovers the actual
+    state attached to the module and preserves custom lifecycle callbacks.
+    """
+
+    def perform_reduce_grad(self, grad_scale_factor: int) -> None:
+        from torch.distributed.fsdp import FSDPModule
+
+        if not isinstance(self.submod, FSDPModule):
+            super().perform_reduce_grad(grad_scale_factor)
+            return
+        module = self.submod
+        module.set_is_last_backward(True)
+        module.set_reshard_after_backward(True)
+        module.set_requires_gradient_sync(True)
+        state = module._get_fsdp_state()
+        for child_state in state._state_ctx.all_states:
+            for group in child_state._fsdp_param_groups:
+                group.post_backward()
+        state._root_post_backward_final_callback()
+        if grad_scale_factor != 1:
+            self.scale_grads(grad_scale_factor)
+
 
 __all__ = ["generate_llm_fqn_per_model_part", "split_model_into_stages"]
 
@@ -280,7 +309,9 @@ def split_model_into_stages(
         # has exactly the same semantics.
         if supports_get_mesh:
             stage_kwargs["get_mesh"] = get_mesh
-        stage = PipelineStage(model, stage_idx, num_stages, device, **stage_kwargs)
+        stage = ComposablePipelineStage(
+            model, stage_idx, num_stages, device, **stage_kwargs
+        )
         return stage, model
 
     num_stages = len(module_names_per_stage)
@@ -306,6 +337,28 @@ def split_model_into_stages(
                 f"v schedules assume 2 stages per rank, got {stages_per_rank}"
             )
         stage_indices = (pp_rank, num_stages - 1 - pp_rank)
+
+    # Independent copies of stages cannot preserve a Parameter shared across
+    # their consumers. Validate globally before copying any local stage, so
+    # every rank rejects the same partition without entering communication.
+    parameter_owners: dict[int, tuple[int, str]] = {}
+    for stage_idx, module_names in enumerate(module_names_per_stage):
+        for module_name in module_names:
+            if getattr(whole_model, module_name, False) is None:
+                continue
+            module = whole_model.get_submodule(module_name)
+            for name, parameter in module.named_parameters(remove_duplicate=False):
+                owner = parameter_owners.setdefault(
+                    id(parameter), (stage_idx, f"{module_name}.{name}")
+                )
+                if owner[0] != stage_idx:
+                    raise UnsupportedCombinationError(
+                        f"PP shared parameter {owner[1]!r} / "
+                        f"{module_name}.{name!s} spans stages {owner[0]} and "
+                        f"{stage_idx}. Place its consumers in the same stage; "
+                        "cross-stage shared-parameter gradient synchronization "
+                        "is not implemented."
+                    )
 
     for stage_idx in stage_indices:
         module_names = module_names_per_stage[stage_idx]

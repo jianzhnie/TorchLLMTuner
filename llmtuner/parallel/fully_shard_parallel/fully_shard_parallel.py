@@ -201,10 +201,10 @@ def enable_fsdp_symm_mem(model: nn.Module, scope: str | None = "all") -> None:
     """Enable symmetric-memory communication for the FSDP modules ``scope`` selects.
 
     ``None`` disables it. ``"all"`` covers every FSDP module; ``"dense"``
-    skips any module flagged ``moe_enabled`` -- an MoE transformer block is one
-    FSDP module, so its attention parameters are skipped along with its
-    experts. Symmetric memory is not always beneficial for the expert (sparse)
-    FSDP modules, hence the narrower scope.
+    skips states owning any ``moe_enabled`` subtree, including grouped dense/MoE
+    consumers and root-managed MoE children. Settings apply once per state, so
+    attention parameters sharing an MoE state are skipped with its experts.
+    Symmetric memory is not always beneficial for expert communication.
     """
     if scope is None:
         return
@@ -213,8 +213,27 @@ def enable_fsdp_symm_mem(model: nn.Module, scope: str | None = "all") -> None:
             f"enable_fsdp_symm_mem scope must be one of 'all', 'dense', None; "
             f"got {scope!r}"
         )
-    for module in iter_fsdp_modules(model):
-        if scope == "dense" and getattr(module, "moe_enabled", False):
+    states: dict[int, FSDPModule] = {}
+    sparse_states: set[int] = set()
+    pending = [(model, None, False)]
+    visited = set()
+    while pending:
+        module, owner, in_moe = pending.pop()
+        if isinstance(module, FSDPModule):
+            owner = id(module._get_fsdp_state())
+            states.setdefault(owner, module)
+        in_moe = in_moe or getattr(module, "moe_enabled", False)
+        key = (id(module), owner, in_moe)
+        if key in visited:
+            continue
+        visited.add(key)
+        if in_moe and owner is not None:
+            sparse_states.add(owner)
+        pending.extend((child, owner, in_moe) for child in module.children())
+    # Grouped modules share communication settings. Decide the complete scope
+    # before configuring anything, including MoE children managed by a root state.
+    for owner, module in states.items():
+        if scope == "dense" and owner in sparse_states:
             continue
         module.set_force_sum_reduction_for_comms(True)
         module.set_symm_mem_for_comm()
@@ -327,126 +346,124 @@ def apply_fsdp_to_decoder(
         reshard_after_forward_policy, pp_enabled
     )
 
+    # Resolve ownership before any sharding replaces Parameters. Include
+    # the decoder boundary units so a layer/norm/head alias is not split into
+    # independent sharded tensors. Existing tied embedding/head units stay intact.
+    units: list[tuple[list[nn.Module], bool]] = []
+    boundary = [
+        module
+        for module in (model.tok_embeddings, model.norm, model.lm_head)
+        if module is not None
+    ]
+    final_reshard = reshard_after_forward_policy == "always"
     if model.enable_weight_tying:
-        # When weights are tied, tok_embeddings and output share the same parameter.
-        # Group them together in one FSDP unit to avoid duplicate all-gathers.
-        modules = [
-            m
-            for m in (model.tok_embeddings, model.norm, model.lm_head)
-            if m is not None
-        ]
-        shard_fn(
-            modules,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward_policy == "always",
-        )
+        if boundary:
+            units.append((boundary, final_reshard))
     else:
         if model.tok_embeddings is not None:
-            shard_fn(
-                model.tok_embeddings,
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward,
-            )
-        # As an optimization, do not reshard_after_forward the last layers
-        # by default since FSDP would prefetch them immediately.
+            units.append(([model.tok_embeddings], reshard_after_forward))
         if model.norm is not None and model.lm_head is not None:
-            shard_fn(
-                [model.norm, model.lm_head],
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward_policy == "always",
-            )
-
-    for _layer_id, transformer_block in iter_transformer_layers(model.layers):
-        # NOTE: In an MoE layer, we use shard_placement_fn to apply different
-        # FSDP mesh and shard placement to different parameters:
-        # - When EP > 1: routed experts use edp_mesh, other params use dp_mesh
-        # - When EP = 1: all params use the same FSDP mesh, but experts may
-        #   use Shard(1) when FSDP degree > num_experts to avoid padding
-        #
-        # Upstream also overrides the placement of stacked linear weights in
-        # this block (``linear_param_shard_placements``); llmtuner's blocks hold
-        # only plain 2-D nn.Linear weights, whose default Shard(0) already is
-        # the output dim, so there is nothing to override.
-        # Dense blocks (no ``moe_enabled``) fall through to a plain fully_shard.
-        if getattr(transformer_block, "moe_enabled", False):
-            assert hasattr(transformer_block, "moe")
-            # Expert weights live on the grouped-GEMM child (inner_experts).
-            # pyrefly: ignore [missing-attribute]
-            experts = transformer_block.moe.routed_experts.inner_experts
-            expert_params = set(experts.parameters())
-            # The total expert count, read off the router. llmtuner's grouped
-            # weights are built per rank by the EP swap, so
-            # ``experts.num_experts`` is only this rank's slice (total / ep);
-            # the router is the child that always holds the total. Upstream
-            # reads ``experts.num_experts`` instead and gets the same number,
-            # because its experts are an SPMD DTensor sharded on ``ep`` with the
-            # logical count intact. So this is a spelling difference forced by
-            # the different expert representation, not a different threshold --
-            # both sides compare ``efsdp * ep`` against the same total.
-            num_experts = transformer_block.moe.router.num_experts
-
+            units.append(([model.norm, model.lm_head], final_reshard))
+    boundary_count = len(units)
+    units.extend(
+        ([block], reshard_after_forward)
+        for _, block in iter_transformer_layers(model.layers)
+    )
+    # Build one placement map before parameter replacement. A shared unit may
+    # span dense and MoE layers, but every expert retains its own mesh/layout.
+    expert_placements: dict[nn.Parameter, Shard] = {}
+    expert_units: set[int] = set()
+    for index, (modules, _) in enumerate(units):
+        for module in modules:
+            if not getattr(module, "moe_enabled", False):
+                continue
+            expert_units.add(index)
+            experts = module.moe.routed_experts.inner_experts
+            num_experts = module.moe.router.num_experts
             if ep_degree > 1:
                 assert edp_mesh is not None
-                efsdp_ep_size = edp_mesh["efsdp"].size() * ep_degree
+                shard_degree = edp_mesh["efsdp"].size() * ep_degree
             else:
-                efsdp_ep_size = fsdp_shard_size(dp_mesh)
+                shard_degree = fsdp_shard_size(dp_mesh)
+            placement = Shard(1 if shard_degree > num_experts else 0)
+            for parameter in experts.parameters():
+                previous = expert_placements.setdefault(parameter, placement)
+                if previous != placement:
+                    raise ValueError(
+                        "Shared expert parameters have conflicting FSDP placements"
+                    )
+    if ep_degree > 1 and expert_placements:
+        assert edp_mesh is not None
+        expert_placement_fn = build_fsdp_placement_fn(
+            expert_placements, dp_mesh=dp_mesh, edp_mesh=edp_mesh
+        )
+    else:
 
-            if efsdp_ep_size > num_experts:
-                expert_shard_placement = Shard(1)
-            else:
-                expert_shard_placement = Shard(0)
+        def expert_placement_fn(parameter: nn.Parameter) -> Shard | None:
+            return expert_placements.get(parameter)
 
-            # When ep_degree == 1 and no Shard(1) override needed, skip
-            # shard_placement_fn entirely for simplicity
-            if ep_degree == 1 and expert_shard_placement == Shard(0):
-                shard_fn(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                )
-            elif ep_degree == 1:
-                # ep_degree == 1, but sharding the expert axis would pad, so
-                # place the expert weights on their output-feature dim instead.
-                # ``Shard(1)`` is that dim for every packed weight here --
-                # ``w1``/``w3`` are (E, F, D) and ``w2`` is (E, D, F) -- i.e.
-                # the same segment upstream's ``Shard(weight.ndim - 2)`` cuts.
-                def _experts_shard_placement_fn(
-                    param: nn.Parameter,
-                    _expert_params: set = expert_params,
-                ) -> Shard | None:
-                    if param in _expert_params:
-                        return Shard(1)
-                    return None
+    # Root-owned registrations may alias a parameter inside a decoder unit.
+    # Exclude every planned layer subtree when collecting the remaining owners;
+    # recursively inspecting the root would incorrectly merge all units.
+    nested_modules = {
+        descendant
+        for module in [
+            *boundary,
+            *[block for _, block in iter_transformer_layers(model.layers)],
+        ]
+        for descendant in module.modules()
+    }
+    root_parameters = {
+        parameter
+        for module in model.modules()
+        if module not in nested_modules
+        for parameter in module.parameters(recurse=False)
+    }
+    root_index = len(units)
+    units.append(([model], False))
+    groups = {index: {index} for index in range(len(units))}
+    parameter_owners: dict[nn.Parameter, int] = {}
+    for index, (modules, _) in enumerate(units):
+        for module in modules:
+            parameters = root_parameters if index == root_index else module.parameters()
+            for parameter in parameters:
+                previous = parameter_owners.setdefault(parameter, index)
+                merged = groups[previous] | groups[index]
+                for owner in merged:
+                    groups[owner] = merged
+    module_units = {
+        module: index for index, (modules, _) in enumerate(units) for module in modules
+    }
+    sharded_units: set[int] = set()
 
-                shard_fn(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                    shard_placement_fn=_experts_shard_placement_fn,
-                )
-            else:
-                # ep_degree > 1: per-param mesh
-                assert edp_mesh is not None
-                placement_fn = build_fsdp_placement_fn(
-                    dict.fromkeys(expert_params, expert_shard_placement),
-                    dp_mesh=dp_mesh,
-                    edp_mesh=edp_mesh,
-                )
+    def shard_unit(index: int) -> None:
+        if root_index in groups[index] and index != root_index:
+            return  # Root and its shared consumers must be transformed last.
+        if index in sharded_units:
+            return
+        owners = sorted(groups[index])
+        modules = list(
+            dict.fromkeys(module for owner in owners for module in units[owner][0])
+        )
+        # One state has one reshard policy. Retain any boundary unit's request
+        # to keep parameters available through its last forward consumer.
+        options = dict(fsdp_config)
+        if expert_units.intersection(owners):
+            options["shard_placement_fn"] = expert_placement_fn
+        shard_fn(
+            modules[0] if len(modules) == 1 else modules,
+            **options,
+            reshard_after_forward=all(units[owner][1] for owner in owners),
+        )
+        sharded_units.update(owners)
 
-                shard_fn(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                    shard_placement_fn=placement_fn,
-                )
-        else:
-            shard_fn(
-                transformer_block,
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward,
-            )
+    for index in range(boundary_count):
+        shard_unit(index)
 
-    shard_fn(model, **fsdp_config)
+    for _, transformer_block in iter_transformer_layers(model.layers):
+        shard_unit(module_units[transformer_block])
+
+    shard_unit(root_index)
 
     # None is a no-op; an unknown scope raises inside.
     enable_fsdp_symm_mem(model, symm_mem_scope)

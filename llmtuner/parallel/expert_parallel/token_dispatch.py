@@ -60,6 +60,31 @@ class AllToAllDispatchMetadata(LocalDispatchMetadata):
     output_splits: list[int]
 
 
+@dataclass(frozen=True, kw_only=True)
+class DispatchCounts:
+    """Receive counts and host split sizes for one token exchange."""
+
+    counts: torch.Tensor
+    input_splits: list[int]
+    output_splits: list[int]
+
+
+@dataclass(frozen=True, kw_only=True)
+class PendingAllToAllDispatch:
+    """Launched token exchange and the metadata needed to consume it.
+
+    Keep this object alive until completion: each slice owns its tensors and
+    split sizes independently, including when receive sizes differ by rank.
+    """
+
+    routed_input: torch.Tensor
+    token_indices: torch.Tensor
+    scores: torch.Tensor
+    counts: torch.Tensor
+    input_splits: list[int]
+    output_splits: list[int]
+
+
 class LocalTokenDispatcher:
     """Token dispatcher for EP=1: local reordering only.
 
@@ -368,6 +393,81 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
                 num_local_tokens_per_expert_E,
             )
 
+        return self.finish_dispatch(
+            self.begin_dispatch(
+                x_TD,
+                topk_scores_TK,
+                topk_expert_ids_TK,
+                num_local_tokens_per_expert_E,
+            )
+        )
+
+    def prepare_dispatch_counts(
+        self,
+        counts: torch.Tensor,
+    ) -> list[DispatchCounts]:
+        """Exchange all slices' expert counts in one collective.
+
+        Input is (slices, global_experts). Pack destination rank first so every
+        peer receives all slices for its local experts. Materialize host split
+        sizes once, before launching any token exchange.
+        """
+        if self.ep_group is None:
+            raise ValueError("prepare_dispatch_counts requires an EP process group")
+        ep_size = distributed.get_world_size(self.ep_group)
+        if (
+            counts.ndim != 2
+            or counts.shape[0] < 1
+            or counts.shape[1] != self.num_experts
+        ):
+            raise ValueError("Slice counts must have shape (slices, num_experts)")
+        if self.num_experts % ep_size:
+            raise ValueError("num_experts must be divisible by the EP world size")
+        num_slices = counts.shape[0]
+        with torch.no_grad():
+            send_counts = counts.reshape(num_slices, ep_size, -1)
+            received = (
+                materialize(
+                    all_to_all_single(
+                        send_counts.transpose(0, 1).contiguous().reshape(ep_size, -1),
+                        None,
+                        None,
+                        group=self.ep_group,
+                    )
+                )
+                .reshape(ep_size, num_slices, -1)
+                .transpose(0, 1)
+            )
+            # A blocking host copy makes both lists ready for Python consumers;
+            # no second slice count collective can serialize a token transfer.
+            splits = torch.stack((send_counts.sum(-1), received.sum(-1)))
+            host_splits = splits.cpu().tolist()
+            return [
+                DispatchCounts(
+                    counts=received[i].reshape(-1),
+                    input_splits=host_splits[0][i],
+                    output_splits=host_splits[1][i],
+                )
+                for i in range(num_slices)
+            ]
+
+    def begin_dispatch(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        num_local_tokens_per_expert_E: torch.Tensor,
+        *,
+        prepared_counts: DispatchCounts | None = None,
+    ) -> PendingAllToAllDispatch:
+        """Launch an EP token exchange without consuming its token result.
+
+        Count exchange still synchronizes to obtain host split sizes. Callers
+        can prepare multiple slices before running expert computation; actual
+        stream scheduling and overlap require separate accelerator validation.
+        """
+        if self.ep_group is None:
+            raise ValueError("begin_dispatch requires an EP process group")
         ep_size = distributed.get_world_size(self.ep_group)
         # _local_reorder yields (N, D), N = T*K; the all-to-all below yields
         # (R, D) with R != N, since each rank ends up with only its own experts'
@@ -378,46 +478,57 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             topk_scores_experts_sorted_N,
         ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
 
-        with torch.no_grad():
-            num_global_tokens_per_local_expert_EP_e = self._token_count_exchange(
-                num_local_tokens_per_expert_E
+        if prepared_counts is None:
+            with torch.no_grad():
+                exchanged_counts = self._token_count_exchange(
+                    num_local_tokens_per_expert_E
+                )
+                received_counts, input_splits, output_splits = (
+                    self._sync_token_count_exchange(
+                        num_local_tokens_per_expert_E, exchanged_counts, ep_size
+                    )
+                )
+            prepared_counts = DispatchCounts(
+                counts=received_counts,
+                input_splits=input_splits,
+                output_splits=output_splits,
             )
-            (
-                num_global_tokens_per_local_expert_E,
-                input_splits_list,
-                output_splits_list,
-            ) = self._sync_token_count_exchange(
-                num_local_tokens_per_expert_E,
-                num_global_tokens_per_local_expert_EP_e,
-                ep_size,
-            )
+        num_global_tokens_per_local_expert_E = prepared_counts.counts
+        input_splits_list = prepared_counts.input_splits
+        output_splits_list = prepared_counts.output_splits
 
         routed_input_RD = self._dispatch_token_exchange(
             routed_input_ND,
             output_splits_list,
             input_splits_list,
         )
-        # The all-to-all delivers in rank-major order but the experts want
-        # expert-major:
-        #   (e0,r0), (e1,r0), ..., (e0,r1), (e1,r1), ...   (rank-major)
-        #   (e0,r0), (e0,r1), ..., (e1,r0), (e1,r1), ...   (expert-major)
+        return PendingAllToAllDispatch(
+            routed_input=routed_input_RD,
+            token_indices=token_indices_experts_sorted_N,
+            scores=topk_scores_experts_sorted_N,
+            counts=num_global_tokens_per_local_expert_E,
+            input_splits=input_splits_list,
+            output_splits=output_splits_list,
+        )
+
+    def finish_dispatch(
+        self,
+        pending: PendingAllToAllDispatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, AllToAllDispatchMetadata]:
+        """Consume a launched exchange and arrange tokens by local expert."""
         (
             input_shape,
             routed_input_RD,
             permuted_indices,
             num_global_tokens_per_local_expert_e,
-        ) = self._permute(
-            routed_input_RD,
-            num_global_tokens_per_local_expert_E,
-        )
-
+        ) = self._permute(pending.routed_input, pending.counts)
         metadata = AllToAllDispatchMetadata(
-            token_indices_experts_sorted_N=token_indices_experts_sorted_N,
-            topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
+            token_indices_experts_sorted_N=pending.token_indices,
+            topk_scores_experts_sorted_N=pending.scores,
             input_shape=input_shape,
             permuted_indices=permuted_indices,
-            input_splits=input_splits_list,
-            output_splits=output_splits_list,
+            input_splits=pending.input_splits,
+            output_splits=pending.output_splits,
         )
         return routed_input_RD, num_global_tokens_per_local_expert_e, metadata
 

@@ -31,6 +31,7 @@ from ..memory.activation_checkpoint import apply_ac
 from .context_parallel.context_parallel import apply_cp
 from .expert_parallel.expert_parallel import apply_ep
 from .fully_shard_parallel.fully_shard_parallel import apply_fsdp
+from .fully_shard_parallel.plan import resolve_pipeline_fsdp_configs
 from .model_compile import apply_compile
 from .pipeline_parallel.pipeline_parallel import (
     PipelineParallelSetup,
@@ -74,6 +75,7 @@ def parallelize_hf_transformers(
         part: nn.Module,
         *,
         dense_mesh: DeviceMesh | None,
+        part_cfg: ParallelConfig | None = None,
     ) -> nn.Module:
         """Bind stage options once, then transform the model in declared order."""
         runners = {
@@ -93,7 +95,11 @@ def parallelize_hf_transformers(
             "compile": partial(
                 apply_compile, compile_config=compile_config, tp_mesh=tp_mesh
             ),
-            "fsdp": partial(apply_fsdp, cfg=cfg, parallel_dims=parallel_dims),
+            "fsdp": partial(
+                apply_fsdp,
+                cfg=cfg if part_cfg is None else part_cfg,
+                parallel_dims=parallel_dims,
+            ),
         }
         for name in STAGE_ORDER:
             if name != "compile" or compile:
@@ -133,8 +139,15 @@ def parallelize_hf_transformers(
             global_batch_size=global_batch_size,
         )
         dense_mesh = parallel_dims.spmd_dense_mesh()
+        fsdp_configs = (
+            resolve_pipeline_fsdp_configs(model, model_parts, cfg)
+            if cfg.fsdp_config.fsdp_apply_modules
+            else [cfg] * len(model_parts)
+        )
         for i, part in enumerate(model_parts):
-            model_parts[i] = apply_stages(part, dense_mesh=dense_mesh)
+            model_parts[i] = apply_stages(
+                part, dense_mesh=dense_mesh, part_cfg=fsdp_configs[i]
+            )
             # Rebind the stage's submodule in case a transform replaced the chunk.
             stages[i].submod = model_parts[i]
         return PipelineParallelSetup(

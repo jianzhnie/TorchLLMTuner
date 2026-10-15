@@ -80,10 +80,12 @@ def apply_compile(
     if compile_config.per_block and not isinstance(layers, nn.Module):
         raise TypeError("per_block compile requires a model with a .layers module")
 
-    backend = maybe_regional_inductor_backend(model, compile_config.backend)
-    maybe_enable_async_tp(compile_config, tp_mesh)
+    # Resolve registered/custom backends before changing module or global flags.
+    from torch._dynamo.backends.registry import lookup_backend
 
-    if collect_moe_layers(model):
+    lookup_backend(compile_config.backend)
+    has_moe = bool(collect_moe_layers(model))
+    if has_moe:
         # Token-choice dispatch sizes its expert splits from the routing,
         # so the compiled graph has data-dependent shapes. Dense models
         # never touch the flag, keeping their trace bitwise unchanged.
@@ -94,20 +96,60 @@ def apply_compile(
                 "data-dependent shapes. Upgrade torch, or run this model "
                 "without compile."
             )
-        torch._dynamo.config.capture_scalar_outputs = True
-        logger.info("capture_scalar_outputs is enabled (token-choice MoE)")
+    previous_async_tp = None
+    if compile_config.enable_async_tensor_parallel and has(
+        "inductor_micro_pipeline_tp"
+    ):
+        import torch._inductor.config as inductor_config
 
-    if compile_config.per_block:
-        for layer_id, block in layers.named_children():
-            # Module.compile, not torch.compile(block): it sets the compiled
-            # call impl in place, so the layer keeps its identity for FSDP
-            # and the state dict.
-            block.compile(backend=backend, fullgraph=True)
-            logger.info(f"Compiling decoder layer {layer_id} (fullgraph)")
-        return model
+        previous_async_tp = inductor_config._micro_pipeline_tp
+    previous_capture = torch._dynamo.config.capture_scalar_outputs if has_moe else None
+    regional_flags = [
+        (
+            module,
+            "_regional_inductor_enabled" in module.__dict__,
+            module.__dict__.get("_regional_inductor_enabled"),
+        )
+        for module in model.modules()
+    ]
+    compiled_blocks = []
+    try:
+        # Check/register async TP before changing per-module regional flags.
+        if compile_config.enable_async_tensor_parallel:
+            maybe_enable_async_tp(compile_config, tp_mesh)
+        backend = maybe_regional_inductor_backend(model, compile_config.backend)
+        if has_moe:
+            torch._dynamo.config.capture_scalar_outputs = True
+            logger.info("capture_scalar_outputs is enabled (token-choice MoE)")
 
-    logger.info(f"Compiling the whole model (backend={backend!r})")
-    return torch.compile(model, backend=backend)
+        if compile_config.per_block:
+            for layer_id, block in layers.named_children():
+                # Module.compile, not torch.compile(block): it sets the compiled
+                # call impl in place, so the layer keeps its identity for FSDP
+                # and the state dict.
+                compiled_blocks.append((block, block._compiled_call_impl))
+                block.compile(backend=backend, fullgraph=True)
+                logger.info(f"Compiling decoder layer {layer_id} (fullgraph)")
+            return model
+
+        logger.info(f"Compiling the whole model (backend={backend!r})")
+        return torch.compile(model, backend=backend)
+    except BaseException:
+        if previous_async_tp is not None:
+            inductor_config._micro_pipeline_tp = previous_async_tp
+        for module, had_flag, previous_flag in regional_flags:
+            if not had_flag:
+                module.__dict__.pop("_regional_inductor_enabled", None)
+            else:
+                module._regional_inductor_enabled = previous_flag
+        for block, previous_impl in reversed(compiled_blocks):
+            block._compiled_call_impl = previous_impl
+        # Compilation setup may fail before a usable model is returned. Keep
+        # that failed attempt from changing subsequent models' tracing policy.
+        # Successful models still need this flag during lazy tracing.
+        if has_moe:
+            torch._dynamo.config.capture_scalar_outputs = previous_capture
+        raise
 
 
 def maybe_enable_async_tp(
