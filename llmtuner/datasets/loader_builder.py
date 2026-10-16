@@ -48,7 +48,7 @@ class _PackingBuilder(Protocol):
 
     def __call__(
         self,
-        dataset: DatasetRecipe,
+        recipe: DatasetRecipe,
         *,
         context: DatasetBuildContext,
         iteration_policy: DatasetIterationPolicy,
@@ -59,7 +59,7 @@ class _PackingBuilder(Protocol):
 class _ResolvedRecipe:
     """Recipe-specific graph and collation choices for shared loader assembly."""
 
-    dataset: DatasetRecipe
+    recipe: DatasetRecipe
     build_packing: _PackingBuilder
     collator: CollatorFactory
 
@@ -67,14 +67,7 @@ class _ResolvedRecipe:
 def _resolve_multimodal_recipe(
     dataset_name: str, *, num_packing_bins: int
 ) -> _ResolvedRecipe:
-    """Find one multimodal recipe and its collator and packer, imported lazily.
-
-    The import stays inside the call: the multimodal subtree pulls in
-    torchvision (and a video backend behind it), and a text-only run must not
-    have to install them. Unknown recipe names are rejected here, at build
-    time, rather than in ``DataloaderConfig.__post_init__`` -- the registries
-    live in this package and the config layer must not import them.
-    """
+    """Resolve media packing lazily, keeping registries out of configuration."""
     try:
         from .multimodal.collator import MultimodalCollator
         from .multimodal.packing import build_multimodal_packing
@@ -95,7 +88,7 @@ def _resolve_multimodal_recipe(
             f"multimodal recipe {sorted(MULTIMODAL_DATASETS)}"
         )
     return _ResolvedRecipe(
-        dataset=MULTIMODAL_DATASETS[dataset_name],
+        recipe=MULTIMODAL_DATASETS[dataset_name],
         build_packing=partial(
             build_multimodal_packing, num_packing_bins=num_packing_bins
         ),
@@ -109,12 +102,7 @@ def _resolve_text_recipe(
     dataset_name: str,
     tokenizer: BaseTokenizer,
 ) -> _ResolvedRecipe:
-    """Find one text recipe and its packing and collation policy.
-
-    Both recipes are built the same way and differ only in kind: the
-    discriminating work is in the packing node, never in the collator, which is
-    why the trainer needs no way to tell them apart.
-    """
+    """Resolve a text recipe with its configured packing and collation policy."""
     if dataset_name == "local_jsonl":
         recipe = build_local_jsonl(path=dataloader_config.dataset_path)
     elif dataset_name == "local_jsonl_sft":
@@ -148,7 +136,7 @@ def _resolve_text_recipe(
             num_packing_bins=dataloader_config.num_packing_bins,
         )
     return _ResolvedRecipe(
-        dataset=recipe, build_packing=build_packing, collator=TextCollator
+        recipe=recipe, build_packing=build_packing, collator=TextCollator
     )
 
 
@@ -198,8 +186,7 @@ def build_dataloader(
 
     validate_loader_iteration(repeat=repeat, dp_world_size=dp_world_size)
 
-    # A name that is neither a text recipe nor ``local_jsonl`` is tried against
-    # the multimodal registry.
+    # Try names outside the text registry and local builders as media recipes.
     is_multimodal = (
         dataset_name not in {"local_jsonl", "local_jsonl_sft"}
         and dataset_name not in DATASETS
@@ -232,11 +219,8 @@ def build_dataloader(
             vision_end_token=dataloader_config.mm_vision_end_token,
             pad_token=dataloader_config.mm_pad_token,
         )
-        # Multimodal samples carry media lists alongside their token fields,
-        # so they pack by whole documents (FirstFit) rather than concat-then-
-        # split, and the collator reshapes the media into patches. This is not
-        # ``--packing``: that selector names a text recipe, and the media path
-        # ignores it.
+        # Media lists require whole-document FirstFit packing; --packing applies
+        # only to text. The media collator constructs patches after packing.
     else:
         # Keep tokenizer dependencies out of the synthetic-data path.
         from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
@@ -259,13 +243,9 @@ def build_dataloader(
         if num_microbatches > 1
         else resolved.collator
     )
-    # The iteration policy is spent here, on the graph it orders, rather than
-    # handed down: the loader takes the built graph, so a policy on the loader
-    # would be a parameter no line of it reads. What does reach the loader is
-    # what batching -- not ordering -- reads: the prefetch depth, the drop
-    # policy, and the token batch the collator assembles into.
+    # Apply ordering and sharding to the graph before loader batching/prefetch.
     graph = resolved.build_packing(
-        resolved.dataset,
+        resolved.recipe,
         context=context,
         iteration_policy=DatasetIterationPolicy(
             seed=config.seed,

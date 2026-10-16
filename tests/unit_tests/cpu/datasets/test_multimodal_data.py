@@ -1126,3 +1126,13 @@ def test_smart_resize_preserves_upstream_result_when_already_in_budget():
         96,
         192,
     )
+
+
+@pytest.mark.parametrize("length", [0, -1, True, 1.5, "8", None])
+def test_multimodal_packing_rejects_invalid_context_before_reading_fields(length):
+    from llmtuner.datasets.multimodal.packing import (
+        packing_output_to_multimodal_sample,
+    )
+
+    with pytest.raises(ValueError, match="max_context_length"):
+        packing_output_to_multimodal_sample({}, max_context_length=length)

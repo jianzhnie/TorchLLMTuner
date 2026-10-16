@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 
 from ...components.loss import IGNORE_INDEX
-from ..contracts import TextSequence
+from ..contracts import TextSequence, require_positive_integer
 
 
 def packing_output_is_full(packing_output: dict[str, np.ndarray]) -> bool:
@@ -23,8 +23,9 @@ def text_sequence_to_packing_input(
 ) -> dict[str, np.ndarray]:
     """Convert a `TextSequence` to the array dictionary expected by text packing.
 
-    Missing positions become `0..num_tokens-1`.
+    Missing positions wrap at the context length.
     """
+    require_positive_integer("max_context_length", max_context_length)
     positions = text_sequence.positions
     if positions is None:
         positions = (
@@ -47,6 +48,7 @@ def packing_output_to_text_sequence(
     max_context_length: int,
 ) -> TextSequence:
     """Finalize packed text by masking padding and canonicalizing positions."""
+    require_positive_integer("max_context_length", max_context_length)
     segment_ids = np.asarray(packing_output["input_ids_segment_ids"])
     padding_mask = np.asarray(packing_output["padding_mask"], dtype=np.bool_).copy()
     padding_mask[segment_ids == 0] = True

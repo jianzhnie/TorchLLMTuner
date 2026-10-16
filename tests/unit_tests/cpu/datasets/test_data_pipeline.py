@@ -1118,6 +1118,51 @@ def test_document_packing_rejects_missing_checkpoint_remainder():
         iterator.set_state(state)
 
 
+def test_interrupted_packing_restore_preserves_live_token_stream(monkeypatch):
+    from llmtuner.datasets.packing.iterators import (
+        DocumentAwareConcatThenSplitIterDataset,
+    )
+
+    graph = DocumentAwareConcatThenSplitIterDataset(
+        _SequenceIterDataset(
+            [
+                TextSequence(input_ids=np.arange(5), labels=np.arange(5)),
+                TextSequence(input_ids=np.arange(5, 8), labels=np.arange(5, 8)),
+            ]
+        ),
+        max_num_documents_per_row=2,
+        max_context_length=2,
+        num_tokens_per_row=2,
+    )
+    iterator = iter(graph)
+    next(iterator)
+    state = iterator.get_state()
+    next(iterator)
+    next(iterator)
+    reference = iter(graph)
+    reference.set_state(iterator.get_state())
+    parent_type = type(iterator._parent)
+    original_next = parent_type.__next__
+
+    def interrupted_next(parent):
+        sample = original_next(parent)
+        if parent is iterator._parent:
+            raise KeyboardInterrupt("interrupted remainder replay")
+        return sample
+
+    with monkeypatch.context() as patch:
+        patch.setattr(parent_type, "__next__", interrupted_next)
+        with pytest.raises(KeyboardInterrupt, match="remainder replay"):
+            iterator.set_state(state)
+
+    assert iterator._parent.get_state() == reference._parent.get_state()
+    for actual, expected in zip(list(iterator), list(reference), strict=True):
+        for field in ("input_ids", "labels", "positions", "padding_mask"):
+            np.testing.assert_array_equal(
+                getattr(actual, field), getattr(expected, field)
+            )
+
+
 @pytest.mark.parametrize("parent_position", [0, 1])
 def test_failed_packing_restore_preserves_live_token_stream(parent_position):
     from llmtuner.datasets.packing.iterators import (
@@ -2440,3 +2485,18 @@ def test_grain_window_shuffle_restores_stream_and_buffer_progress():
     restored = iter(graph)
     restored.set_state(saved)
     assert [next(restored) for _ in range(25)] == expected
+
+
+@pytest.mark.parametrize("length", [0, -1, True, 1.5, "8", None])
+@pytest.mark.parametrize("direction", ["to_packing", "from_packing"])
+def test_text_packing_conversions_reject_invalid_context(length, direction):
+    from llmtuner.datasets.packing.conversions import (
+        packing_output_to_text_sequence,
+        text_sequence_to_packing_input,
+    )
+
+    with pytest.raises(ValueError, match="max_context_length"):
+        if direction == "to_packing":
+            text_sequence_to_packing_input(None, max_context_length=length)
+        else:
+            packing_output_to_text_sequence({}, max_context_length=length)
