@@ -12,24 +12,7 @@ from llmtuner.errors import ConfigError
 
 @dataclass
 class ParamGroupConfig:
-    """One parameter group and the optimizer that owns it.
-
-    A list of these, in order, is what ``OptimizerConfig.param_groups`` means:
-    each parameter is claimed by the first entry whose ``pattern`` matches its
-    FQN, so a catch-all ``.*`` belongs last.
-
-    ``optimizer_name`` and ``optimizer_kwargs`` define the group's optimizer
-    completely -- there is no inheritance from ``OptimizerConfig``'s flat
-    scalars, which supply the *default* catch-all group and nothing else. A
-    group that omits an option uses the selected optimizer class's default,
-    so set ``lr`` explicitly when the run requires a particular learning rate.
-
-    There is no CLI flag for this: ``HfArgumentParser`` builds one flag per
-    dataclass *field*, and a list of nested dataclasses has no flag spelling.
-    Groups are set from code, by constructing an ``OptimizerConfig`` with
-    ``param_groups=[...]``. See that class's ``__post_init__`` for how the flat
-    scalars become a group when this list is left empty.
-    """
+    """One parameter group and the optimizer that owns it."""
 
     pattern: str
     """Regex matched against parameter FQNs, e.g. ``r".*\\.bias$"``, ``r".*"``."""
@@ -38,21 +21,17 @@ class ParamGroupConfig:
     """Optimizer class for this group's parameters: ``"Adam"`` or ``"AdamW"``."""
 
     optimizer_kwargs: dict[str, Any] = field(default_factory=dict)
-    """Keyword arguments for the optimizer constructor; omitted options use
-    its defaults. Nothing is filled in from the enclosing config.
-    Entries override the run-wide implementation kwargs, so a group can ask for
-    ``fused=False`` where the run default is fused."""
+    "Per-group optimizer arguments; omitted values use optimizer defaults, not "
+    "enclosing config values."
 
 
 @dataclass
 class OptimizerConfig:
-    """Default AdamW options and explicit Adam/AdamW parameter groups.
+    """Default AdamW options and explicit Adam/AdamW parameter groups."""
 
-    The schedule lives here rather than in ``TrainingConfig`` because it
-    scales this group's learning rate: a lr with no schedule is the degenerate
-    case of one, and splitting them would let the two be set independently.
-    """
-
+    optimizer_type: Literal["Adam", "AdamW"] = field(
+        default="AdamW", metadata={"help": "Optimizer class"}
+    )
     learning_rate: float = field(default=3e-4, metadata={"help": "Learning rate"})
     weight_decay: float = field(default=0.0, metadata={"help": "Weight decay"})
     # Annotated as the CLI's input shape; __post_init__ normalizes to the
@@ -72,11 +51,8 @@ class OptimizerConfig:
     implementation: Literal["fused", "foreach", "for-loop"] = field(
         default="fused",
         metadata={
-            "help": "Optimizer kernel: 'fused' | 'foreach' | 'for-loop'. "
-            "'fused' needs a device torch ships a fused Adam kernel for "
-            "(CUDA/XPU); on any other device the request is honoured as the "
-            "for-loop kernel, which computes the same update. torchtitan's "
-            "default."
+            "help": "Optimizer kernel: fused, foreach, or for-loop. Fused requires a "
+            "supported device."
         },
     )
     param_groups: list[ParamGroupConfig] = field(
@@ -161,11 +137,5 @@ class OptimizerConfig:
 
     @property
     def lr_scheduler(self) -> LRSchedulerConfig:
-        """The schedule's config.
-
-        A property backed by ``lr_scheduler_config`` so the flat
-        ``cfg.lr_scheduler`` spelling works at the call site, while the parser
-        still sees a real field to generate flags from. See
-        ``TrainingConfig.checkpoint`` for the same shape.
-        """
+        """The schedule's config."""
         return self.lr_scheduler_config

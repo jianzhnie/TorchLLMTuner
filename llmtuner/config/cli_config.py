@@ -1,15 +1,4 @@
-"""Expose scalar config fields to HfArgumentParser through dataclass views.
-
-The parser receives PARSER_GROUPS in a fixed order. Programmatic-only fields
-are hidden with init=False in subclasses that preserve defaults and validation.
-This prevents dictionaries, nested dataclasses, and other unsupported values
-from appearing as unusable command-line flags.
-
-LLMTunerConfig.from_groups grafts the separately parsed scheduler, checkpoint,
-dataloader, metrics, and profiler groups into their owning configs. EMA,
-validation, and the nested activation-checkpoint/compile configs remain
-programmatic-only and retain their defaults when using this CLI.
-"""
+"""Expose scalar config fields to HfArgumentParser through dataclass views."""
 
 from __future__ import annotations
 
@@ -23,7 +12,14 @@ from .lr_scheduler_config import LRSchedulerConfig
 from .model_config import ModelConfig
 from .observability_config import MetricsConfig, ProfilerConfig
 from .optimizer_config import OptimizerConfig
-from .parallel_config import ParallelConfig
+from .parallel_config import (
+    ContextParallelConfig,
+    ExpertParallelConfig,
+    FSDPConfig,
+    ParallelConfig,
+    PipelineParallelConfig,
+    TensorParallelConfig,
+)
 from .training_config import TrainingConfig
 
 # The groups the CLI parses, in the order ``LLMTunerConfig.from_groups`` takes
@@ -34,6 +30,11 @@ from .training_config import TrainingConfig
 PARSER_GROUPS: tuple[type, ...] = (
     ModelConfig,
     ParallelConfig,
+    FSDPConfig,
+    TensorParallelConfig,
+    PipelineParallelConfig,
+    ContextParallelConfig,
+    ExpertParallelConfig,
     OptimizerConfig,
     LRSchedulerConfig,
     TrainingConfig,
@@ -50,7 +51,11 @@ PROGRAMMATIC_ONLY: dict[type, frozenset[str]] = {
     ModelConfig: frozenset({"arch_overrides"}),
     OptimizerConfig: frozenset({"param_groups", "lr_scheduler_config"}),
     CheckpointConfig: frozenset({"purge_exempt"}),
-    ParallelConfig: frozenset({"fsdp_apply_modules", "module_fqns_per_model_part"}),
+    ParallelConfig: frozenset(
+        {"fsdp_config", "tp_config", "pp_config", "cp_config", "ep_config"}
+    ),
+    FSDPConfig: frozenset({"fsdp_apply_modules"}),
+    PipelineParallelConfig: frozenset({"module_fqns_per_model_part"}),
     TrainingConfig: frozenset(
         {
             "ema_config",

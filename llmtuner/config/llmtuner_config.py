@@ -12,7 +12,14 @@ from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
 from llmtuner.config.optimizer_config import OptimizerConfig
-from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.config.parallel_config import (
+    ContextParallelConfig,
+    ExpertParallelConfig,
+    FSDPConfig,
+    ParallelConfig,
+    PipelineParallelConfig,
+    TensorParallelConfig,
+)
 from llmtuner.config.training_config import TrainingConfig
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.errors import ConfigError
@@ -23,12 +30,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class LLMTunerConfig:
-    """Single entry point: composes the argument groups (no multiple inheritance).
-
-    Each group validates itself in its own __post_init__ (run by default_factory).
-    Nested groups (``parallel``, ``training``) are reachable both as themselves and
-    through the flat property view below.
-    """
+    """Single entry point: composes the argument groups (no multiple inheritance)."""
 
     model: ModelConfig = field(default_factory=ModelConfig)
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
@@ -48,29 +50,32 @@ class LLMTunerConfig:
         dataloader: DataloaderConfig,
         metrics: MetricsConfig,
         profiler: ProfilerConfig,
+        fsdp_config: FSDPConfig | None = None,
+        tp_config: TensorParallelConfig | None = None,
+        pp_config: PipelineParallelConfig | None = None,
+        cp_config: ContextParallelConfig | None = None,
+        ep_config: ExpertParallelConfig | None = None,
     ) -> LLMTunerConfig:
-        """Compose the nine parsed argument groups into the aggregate config.
-
-        The CLI parses every group flat; which nested group grafts onto which
-        top-level group is a deliberate choice, and this is the table of it:
-
-          model          ModelConfig            top level
-          parallel       ParallelConfig         top level
-          optimizer      OptimizerConfig        top level (LRSchedulerConfig
-                                                       grafts here)
-          training       TrainingConfig         top level (the rest graft here)
-                         CheckpointConfig
-                         DataloaderConfig
-                         MetricsConfig
-                         ProfilerConfig
-
-        The schedule grafts onto the OPTIMIZER group, not onto ``training``: it
-        scales the learning rate that group sets, and splitting them would let
-        a run halve one without touching the other. Each group's own
-        ``__post_init__`` already ran during parsing.
-        """
+        """Compose the nine parsed argument groups into the aggregate config."""
         # CLI views hide nested fields with init=False. Rebuild the base
         # configs to graft parsed groups without modifying caller instances.
+        plans = {
+            name: plan
+            for name, plan in {
+                "fsdp_config": fsdp_config,
+                "tp_config": tp_config,
+                "pp_config": pp_config,
+                "cp_config": cp_config,
+                "ep_config": ep_config,
+            }.items()
+            if plan is not None
+        }
+        parallel_fields = {
+            item.name: getattr(parallel, item.name)
+            for item in fields(ParallelConfig)
+            if item.init
+        }
+        parallel = ParallelConfig(**(parallel_fields | plans))
         optimizer_fields = {
             item.name: getattr(optimizer, item.name)
             for item in fields(OptimizerConfig)
@@ -222,7 +227,7 @@ class LLMTunerConfig:
 
     @property
     def pipeline_parallel_schedule(self) -> str:
-        return self.parallel.pipeline_parallel_schedule
+        return self.parallel.pp_config.pipeline_parallel_schedule
 
     @property
     def max_norm(self) -> float:
@@ -261,10 +266,7 @@ class LLMTunerConfig:
         return self.training.validation
 
     def auto_fill_model(self) -> None:
-        """Fill architecture fields from a local HF directory or Hub config.
-
-        Called explicitly (not in __post_init__) so offline runs never hit the network.
-        """
+        """Fill architecture fields from a local HF directory or Hub config."""
         from transformers import AutoConfig
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 

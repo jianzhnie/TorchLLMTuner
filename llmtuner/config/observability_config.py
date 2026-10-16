@@ -1,9 +1,4 @@
-"""Observability configs: metrics reporting and profiling.
-
-Both are nested configs grafted onto ``TrainingConfig``; neither constructs the
-runtime object it describes (``components/metrics.py`` /
-``components/profiler.py`` own those) -- configs here are only ever read.
-"""
+"""Observability configs: metrics reporting and profiling."""
 
 from __future__ import annotations
 
@@ -15,13 +10,7 @@ from llmtuner.errors import ConfigError
 
 @dataclass(kw_only=True)
 class MetricsConfig:
-    """What the metrics processor reports, and where.
-
-    ``log_freq`` and ``tag`` are this module's own: the first is a CLI concern
-    (the processor reads its window length from here), the second names a logging
-    key. Both live with the config rather than the processor because the config
-    is what the command line describes.
-    """
+    """What the metrics processor reports, and where."""
 
     log_freq: int = 1
     """Console log frequency, in steps. Also the TensorBoard/WandB frequency --
@@ -102,12 +91,8 @@ class ProfilerConfig:
     """Snapshot frequency, in iterations. Defaults to ``profile_freq``."""
 
     save_memory_snapshot_folder: str = "profiling/memory_snapshot"
-    """Snapshot location, relative to the base folder.
-
-    Spelled out rather than derived from ``save_traces_folder``: the two are
-    independent knobs, and a derived default would silently follow a custom
-    trace folder into an unexpected place.
-    """
+    "Memory snapshot folder relative to the run output directory; independent of "
+    "trace storage."
 
     memory_snapshot_max_entries: int = 1_000_000
     """Alloc/free events kept per snapshot.

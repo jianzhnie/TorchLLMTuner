@@ -15,14 +15,7 @@ logger = get_logger(__name__)
 
 @dataclass(kw_only=True)
 class EMAConfig:
-    """Online EMA of model weights (see ``components/optimizer/ema.py``).
-
-    Set ``training.ema_config`` to one of these to turn EMA on; the default
-    ``None`` means no EMA is built and the run pays nothing for it -- there is
-    no CLI flag (a nested dataclass does not survive ``HfArgumentParser``;
-    ``ParamGroupConfig`` is programmatic-only for the same reason). The field
-    names and semantics are upstream's.
-    """
+    """Online EMA of model weights (see ``components/optimizer/ema.py``)."""
 
     decay: float | None = None
     """Fixed decay per firing: ``ema = decay * ema + (1 - decay) * param``.

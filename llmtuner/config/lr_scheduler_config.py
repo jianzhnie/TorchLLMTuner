@@ -11,19 +11,7 @@ from .field_checks_config import require_integer_at_least
 
 @dataclass(kw_only=True)
 class LRSchedulerConfig:
-    """The WSD schedule's knobs.
-
-    The runtime side -- the ``LambdaLR`` this builds -- is
-    ``llmtuner.components.optimizer.LRSchedulersContainer``.
-
-    ``decay_ratio`` is the switch that matters. At its default of 0 there is no
-    decay phase, so the factor is 1.0 throughout (after any warmup) and the
-    learning rate is exactly the one the optimizer was built with -- which is
-    what makes the default run comparable to every measurement taken at a
-    constant lr. Setting it to a fraction appends a decay covering that fraction
-    of ``total_steps``; whatever is left over after warmup and decay is the
-    stable phase, at the peak learning rate.
-    """
+    """The WSD schedule's knobs."""
 
     warmup_steps: int = field(
         default=0,

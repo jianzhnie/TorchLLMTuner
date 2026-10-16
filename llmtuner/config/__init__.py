@@ -1,44 +1,4 @@
-"""llmtuner configuration: every dataclass a run is described by.
-
-This is the one place configuration lives, and every class here is named the
-same way -- ``*Config``. What varies is only whether a config is a top-level
-parser group or a nested one:
-
-* Top-level groups, handed to ``HfArgumentParser`` in ``trainer/cli.py`` --
-  ``ModelConfig``, ``ParallelConfig``, ``OptimizerConfig``, ``TrainingConfig``.
-* Nested configs, each also parsed as its own group and then grafted onto the
-  group that holds it -- ``CheckpointConfig``, ``DataloaderConfig``,
-  ``MetricsConfig``, ``ProfilerConfig``, ``LRSchedulerConfig``.
-
-These are descriptions, not builders. Nothing here constructs the runtime object
-it describes -- the loader in ``datasets/loader_builder.py``, the scheduler in
-``components/optimizer/lr_scheduler.py`` -- for two reasons. A config that
-carries its own builder suggests the built object is one of its fields, and it
-is not: building takes arguments the config does not have (which rank am I, how
-many tokens per batch). And a builder has to name the type it produces, which
-for a config nested under a component would mean importing the component into
-this module while the component imports this one back.
-
-So the seam is a factory function that takes the config as its first argument.
-``trainer/trainer.py`` calls those; this module is only ever read.
-
-A component -- the checkpointer, the metrics processor, the profiler, the
-learning-rate schedule -- does not define its own config class next to itself
-either; it takes an instance from here and reads fields off it. It names the
-type only under ``TYPE_CHECKING``, for the same cycle reason.
-
-Design notes (see docs/torchllmtuner_design.md): grouped by concern, then COMPOSED
--- not mixed in via multiple inheritance -- so each group's ``__post_init__``
-validation runs automatically via ``default_factory``, with no fragile manual
-chaining. The single entry point is ``LLMTunerConfig``.
-
-The default optimizer is AdamW; programmatic parameter groups may select Adam
-or AdamW independently. Learning rates follow the warmup-stable-decay schedule.
-
-The classes live one domain per file under this package
-(``model_config.py`` / ``parallel_config.py`` / ...); everything is re-exported here so
-``from llmtuner.config import X`` resolves for every public name.
-"""
+"""llmtuner configuration: every dataclass a run is described by."""
 
 from llmtuner.config.activation_checkpoint_config import (
     VALID_AC_MODES,
@@ -58,12 +18,24 @@ from llmtuner.config.optimizer_config import (
     OptimizerConfig,
     ParamGroupConfig,
 )
-from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.config.parallel_config import (
+    ContextParallelConfig,
+    ExpertParallelConfig,
+    FSDPConfig,
+    ParallelConfig,
+    PipelineParallelConfig,
+    TensorParallelConfig,
+)
 from llmtuner.config.rope_config import RoPEConfig
 from llmtuner.config.training_config import TrainingConfig
 from llmtuner.config.validation_config import ValidationConfig
 
 __all__ = [
+    "FSDPConfig",
+    "TensorParallelConfig",
+    "PipelineParallelConfig",
+    "ContextParallelConfig",
+    "ExpertParallelConfig",
     "CheckpointConfig",
     "CompileConfig",
     "DataloaderConfig",

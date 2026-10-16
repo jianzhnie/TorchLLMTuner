@@ -21,18 +21,7 @@ logger = get_logger(__name__)
 
 @dataclass(kw_only=True)
 class CheckpointConfig:
-    """What the checkpoint manager keeps, where, and when.
-
-    ``HfArgumentParser`` cannot nest a dataclass behind a named flag -- a nested
-    field surfaces as one opaque ``--checkpoint CHECKPOINT`` string -- so this is
-    a flat dataclass with every field becoming its own flag (``--enable``,
-    ``--interval``, ...). Its ``__post_init__`` therefore runs on the parsed
-    values, which is where the cross-field checks belong.
-
-    No ``slots=True``, deliberately: the re-created class breaks the zero-arg
-    ``super()`` cell in a subclass's ``__post_init__``. ``ParallelConfig``
-    omits it for the same reason.
-    """
+    """What the checkpoint manager keeps, where, and when."""
 
     enable: bool = False
     """Whether to enable checkpointing."""
@@ -95,13 +84,8 @@ class CheckpointConfig:
     """Whether to permit loads while disabling all saves."""
 
     async_mode: Literal["disabled", "async", "async_with_pinned_mem"] = "disabled"
-    """DCP save mode: synchronous, threaded async, or pinned-memory async.
-
-    Only the DCP backend reads it; the torch_checkpointing one saves
-    synchronously. Kept here anyway because it is a checkpointing policy like
-    every other field on this class, and splitting one field off into a
-    subclass per backend is what this file's single-config design avoids.
-    """
+    "DCP save mode: synchronous, threaded async, or pinned-memory async; ignored by "
+    "torch_checkpointing."
 
     def __post_init__(self) -> None:
         if not self.folder.strip():

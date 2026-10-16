@@ -11,21 +11,7 @@ from llmtuner.errors import ConfigError
 
 @dataclass(kw_only=True)
 class DataloaderConfig:
-    """Where the micro-batches come from.
-
-    ``random`` (the default) keeps the synthetic corpus and needs no assets, so
-    the default run is unchanged and reproducible offline. Any other value
-    names a recipe from ``datasets.text.recipes.DATASETS`` or
-    ``datasets.multimodal.recipes.MULTIMODAL_DATASETS``, or the built-in
-    ``local_jsonl`` / ``local_jsonl_sft``. Local recipes use a caller-supplied
-    corpus path and therefore are not entries in the registries.
-
-    Every non-``random`` dataset builds its graph on Grain, which needs a
-    tokenizer, so ``tokenizer_path`` is required there and unused otherwise.
-    Multimodal recipes additionally need the optional dependencies
-    torchvision/Pillow (and av for video) and the five ``mm_*_token`` strings
-    below, which must exist as added tokens in that tokenizer.
-    """
+    """Where the micro-batches come from."""
 
     dataset: str = field(
         default="random",
@@ -57,11 +43,8 @@ class DataloaderConfig:
     chat_renderer: str | None = field(
         default=None,
         metadata={
-            "help": "Multi-turn SFT via the optional renderers package: name "
-            "of its renderer config class (e.g. 'Qwen3RendererConfig'). Only "
-            "valid with dataset=local_jsonl_sft, whose rows must then carry a "
-            "messages list; replaces the single-turn chat-template path. "
-            "Needs `pip install renderers==0.1.11`."
+            "help": "Optional renderers config class for multi-turn SFT; requires a "
+            "compatible SFT recipe."
         },
     )
     messages_field: str = field(
@@ -89,11 +72,8 @@ class DataloaderConfig:
     packing: Literal["concat_then_split", "first_fit"] = field(
         default="concat_then_split",
         metadata={
-            "help": "Text packing recipe. 'concat_then_split' concatenates "
-            "documents and chunks them into fixed-length rows; 'first_fit' "
-            "lays documents of up to the context window into bins instead, "
-            "which sustains single-document rows. Ignored for multimodal "
-            "recipes, which pack whole documents regardless."
+            "help": "Text packing: concat_then_split chunks concatenated documents; "
+            "first_fit packs documents into rows."
         },
     )
     num_packing_bins: int = field(
@@ -139,11 +119,7 @@ class DataloaderConfig:
     def attention_mask_type(
         self, *, dataset: str | None = None
     ) -> Literal["causal", "block_causal"]:
-        """Choose document isolation for this layout and optional corpus override.
-
-        Synthetic rows and single-document rows need ordinary causality.
-        Other corpus rows can contain multiple documents and require isolation.
-        """
+        """Choose document isolation for this layout and optional corpus override."""
         corpus = self.dataset if dataset is None else dataset
         return (
             "causal"

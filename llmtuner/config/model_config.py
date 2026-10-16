@@ -13,12 +13,7 @@ LM_HEAD_COMPUTE_DTYPES = ("float32", "float16", "bfloat16")
 
 @dataclass
 class ModelConfig:
-    """Model architecture, with CLI sizes filled from saved HF configurations.
-
-    Registered architecture names build locally with AutoConfig.for_model using
-    the explicit sizes below. Other identifiers and existing local model paths
-    read the saved architecture via AutoConfig.from_pretrained.
-    """
+    """Model architecture, with CLI sizes filled from saved HF configurations."""
 
     model_name_or_path: str = field(
         default="llama",
@@ -43,44 +38,27 @@ class ModelConfig:
     experts_implementation: str = field(
         default="native",
         metadata={
-            "help": "HF experts forward kernel for MoE models: 'native' keeps "
-            "the model's built-in kernel; 'grouped_mm' / 'batched_mm' / 'eager' "
-            "require a model with a settable experts implementation and raise "
-            "otherwise (never silently substituted). Irrelevant under EP>1, "
-            "where the swap replaces the whole MoE block."
+            "help": "HF MoE expert kernel: native, grouped_mm, batched_mm, or eager. "
+            "Overrides require model support; ignored under EP > 1."
         },
     )
     compute_dtype: str | None = field(
         default=None,
         metadata={
-            "help": "Forward matmul dtype for the lm_head only: 'float32', "
-            "'float16', or 'bfloat16'. None (default) leaves the output "
-            "projection in the model's own dtype. The stored weight keeps its "
-            "dtype -- the cast happens inside the forward, so logits are "
-            "scored at the requested precision without an upcast copy of the "
-            "weight living in the optimizer."
+            "help": "lm_head forward dtype: float32, float16, bfloat16, or None for "
+            "model dtype. Stored weights retain their dtype."
         },
     )
     arch_overrides: dict[str, Any] = field(
         default_factory=dict,
         metadata={
-            "help": "Extra architecture settings, by name, for fields this "
-            "config does not name. The six fields above cover every dense "
-            "decoder; anything else a model needs -- an MoE's "
-            "n_routed_experts / num_experts_per_tok, MLA's q_lora_rank -- has "
-            "no field here. Offline only: they are applied on top of the six "
-            "above when building the HF config, and ignored for a hub id or a "
-            "local checkpoint directory, where the saved config wins. Supplied "
-            "programmatically (a dict does not survive the CLI parser)."
+            "help": "Programmatic architecture overrides for locally built models; "
+            "ignored for saved HF configurations."
         },
     )
 
     def update_architecture(self, architecture: object) -> None:
-        """Copy available decoder geometry from a resolved architecture.
-
-        Callers unwrap composite HF configurations before supplying them.
-        Missing fields retain their explicit values for nonstandard decoders.
-        """
+        """Copy available decoder geometry from a resolved architecture."""
         for name in (
             "vocab_size",
             "hidden_size",
