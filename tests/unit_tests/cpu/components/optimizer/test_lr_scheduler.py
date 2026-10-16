@@ -37,6 +37,22 @@ def _optimizer(lr: float = 1.0) -> torch.optim.Optimizer:
     return torch.optim.AdamW([parameter], lr=lr)
 
 
+def test_checkpoint_rejects_independently_advanced_inner_schedulers():
+    optimizers = [_optimizer(), _optimizer()]
+    container = LRSchedulersContainer(
+        optimizers, lr_lambda=lambda step: 1.0 / (step + 1), total_steps=10
+    )
+    assert container.state_dict() == {"last_epoch": 0}
+    optimizers[0].step()
+    next(iter(container)).step()
+    before = [scheduler.state_dict() for scheduler in container]
+    with pytest.raises(ValueError, match="different last_epoch"):
+        container.state_dict()
+    assert [scheduler.state_dict() for scheduler in container] == before
+    container.load_state_dict({"last_epoch": 1})
+    assert container.state_dict() == {"last_epoch": 1}
+
+
 def _lrs(scheduler: LRSchedulersContainer) -> list[float]:
     return scheduler.schedulers[0].get_last_lr()
 
@@ -353,6 +369,27 @@ def test_invalid_scheduler_epoch_leaves_schedule_unchanged(epoch):
         scheduler.load_state_dict({"last_epoch": epoch})
     assert scheduler.state_dict() == before
     assert scheduler.get_metrics() == lr_before
+
+
+@pytest.mark.parametrize("decay_ratio", [0.0, 0.5])
+@pytest.mark.parametrize("decay_type", ["linear", "sqrt", "cosine"])
+def test_restore_rejects_progress_past_the_schedule_without_mutating_state(
+    decay_ratio, decay_type
+):
+    optimizers = [_optimizer(0.1), _optimizer(0.2)]
+    container = build_lr_scheduler(
+        LRSchedulerConfig(decay_ratio=decay_ratio, decay_type=decay_type),
+        optimizers=optimizers,
+        training_steps=8,
+    )
+    before = [scheduler.state_dict() for scheduler in container]
+    learning_rates = container.get_metrics()
+    with pytest.raises(ValueError, match="last_epoch.*exceeds total_steps"):
+        container.load_state_dict({"last_epoch": 9})
+    assert [scheduler.state_dict() for scheduler in container] == before
+    assert container.get_metrics() == learning_rates
+    container.load_state_dict({"last_epoch": 8})
+    assert container.state_dict() == {"last_epoch": 8}
 
 
 def test_scheduler_restore_validates_all_groups_before_updating_any_scheduler():

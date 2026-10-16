@@ -65,7 +65,7 @@ def _build(*, ep_group, ep_rank: int, ep_size: int, w) -> MoE:
     dispatcher = LocalTokenDispatcher(NUM_EXPERTS, TOP_K)
     if ep_group is not None:
         dispatcher = AllToAllTokenDispatcher(NUM_EXPERTS, TOP_K)
-        dispatcher.wire_meshes(ep_group=ep_group)
+        dispatcher.set_ep_group(ep_group=ep_group)
 
     return MoE(
         num_experts=NUM_EXPERTS,

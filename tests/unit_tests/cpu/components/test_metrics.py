@@ -379,6 +379,33 @@ def test_extra_metrics_are_merged_into_the_report() -> None:
     assert sink.calls[0][0]["custom/thing"] == 7
 
 
+@pytest.mark.parametrize(
+    "configured, override, expected",
+    [
+        ("configured", None, "configured"),
+        ("configured", "override", "override"),
+        (None, None, None),
+    ],
+)
+def test_processor_resolves_the_configured_tag_before_building_sinks(
+    configured, override, expected, monkeypatch
+):
+    received = []
+
+    def build_sink(self, **kwargs):
+        received.append(kwargs["tag"])
+        return BaseLogger()
+
+    monkeypatch.setattr(MetricsProcessor, "_build_metric_logger", build_sink)
+    processor = MetricsProcessor(
+        Config(tag=configured), parallel_dims=None, tag=override
+    )
+    try:
+        assert received == [expected]
+    finally:
+        processor.close()
+
+
 def test_the_tag_is_applied_by_the_sink_and_only_by_the_sink() -> None:
     """Applied once: a key carrying the tag from the processor *and* the sink
     records as ``baseline/baseline/throughput(tps)``."""

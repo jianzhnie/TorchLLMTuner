@@ -220,6 +220,19 @@ def test_scatter_rejects_a_bank_too_small_for_the_spans() -> None:
         )
 
 
+@pytest.mark.parametrize("rows", [3, 6])
+def test_scatter_count_mismatch_preserves_input(rows: int) -> None:
+    inputs = _embeds()
+    original = inputs.clone()
+    with pytest.raises(ValueError, match="packed vision output"):
+        scatter_vision_embeds(
+            inputs,
+            vision_embeds=_bank(rows),
+            vision_positions=[(0, 2, 3), (1, 7, 2)],
+        )
+    torch.testing.assert_close(inputs, original, rtol=0, atol=0)
+
+
 def test_scatter_casts_to_the_input_dtype() -> None:
     positions = get_vision_positions(_tokens(), torch.tensor([3, 2]), PLACEHOLDER)
     out = scatter_vision_embeds(

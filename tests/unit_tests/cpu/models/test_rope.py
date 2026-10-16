@@ -305,10 +305,52 @@ def test_yarn_truncate_controls_fractional_cutoffs() -> None:
 
 
 @pytest.mark.parametrize("cls", [ComplexRoPE, CosSinRoPE])
-def test_negative_position_does_not_select_cache_tail(cls):
+@pytest.mark.parametrize("compiled", [False, True])
+def test_negative_position_does_not_select_cache_tail(cls, compiled):
     rope = cls(RoPEConfig(dim=DIM, max_context_length=MAX_LEN))
+    if compiled:
+        rope = torch.compile(rope, backend="eager", fullgraph=True)
     q, _ = _qk()
     positions = torch.zeros(TOKENS, dtype=torch.long)
     positions[0] = -1
     with pytest.raises(RuntimeError, match="position_ids"):
         rope(q, positions=positions)
+
+
+@pytest.mark.parametrize("cls", [ComplexRoPE, CosSinRoPE])
+@pytest.mark.parametrize("shape", [(1, TOKENS), (TOKENS, 1), (TOKENS - 1,), ()])
+def test_rope_rejects_positions_outside_token_axis_contract(cls, shape):
+    rope = cls(RoPEConfig(dim=DIM, max_context_length=MAX_LEN))
+    q, _ = _qk()
+    with pytest.raises(ValueError, match="positions must have shape"):
+        rope(q, positions=torch.zeros(shape, dtype=torch.long))
+
+
+@pytest.mark.parametrize("cls", [ComplexRoPE, CosSinRoPE])
+def test_rope_reports_implicit_positions_exceeding_cache(cls):
+    rope = cls(RoPEConfig(dim=DIM, max_context_length=TOKENS - 1))
+    q, _ = _qk()
+    with pytest.raises(ValueError, match="exceeds cache capacity"):
+        rope(q)
+
+
+@pytest.mark.parametrize("cls", [ComplexRoPE, CosSinRoPE])
+@pytest.mark.parametrize("dtype", [torch.bool, torch.uint8, torch.float32])
+def test_rope_rejects_mask_and_floating_position_dtypes(cls, dtype):
+    rope = cls(RoPEConfig(dim=DIM, max_context_length=TOKENS))
+    q, _ = _qk()
+    with pytest.raises(TypeError, match="int32 or int64"):
+        rope(q, positions=torch.ones(TOKENS, dtype=dtype))
+
+
+@pytest.mark.parametrize("cls", [ComplexRoPE, CosSinRoPE])
+def test_rope_int32_positions_match_int64(cls):
+    rope = cls(RoPEConfig(dim=DIM, max_context_length=MAX_LEN))
+    q, _ = _qk()
+    positions = torch.arange(TOKENS)
+    torch.testing.assert_close(
+        rope(q, positions=positions.to(torch.int32)),
+        rope(q, positions=positions),
+        rtol=0,
+        atol=0,
+    )

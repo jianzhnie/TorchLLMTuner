@@ -132,3 +132,53 @@ def test_empty_vocab_shard_returns_zero_with_empty_gradient(monkeypatch):
     output.sum().backward()
     assert embedding.weight.grad is not None
     assert embedding.weight.grad.shape == (0, 3)
+
+
+@pytest.mark.parametrize("invalid_token", [-1, 8, 100])
+def test_invalid_global_tokens_fail_before_weight_renormalization(
+    monkeypatch, invalid_token
+):
+    monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: object())
+    monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 2)
+    monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 1)
+    embedding = VocabParallelEmbedding(8, 3, max_norm=1.0)
+    embedding.weight = torch.nn.Parameter(torch.full((4, 3), 2.0))
+    original = embedding.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="global vocabulary"):
+        embedding(torch.tensor([4, invalid_token]))
+    torch.testing.assert_close(embedding.weight, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("vocab_size,tp_size", [(7, 3), (2, 4)])
+def test_summed_vocab_shards_match_full_embedding_and_gradients(
+    monkeypatch, vocab_size, tp_size
+):
+    from llmtuner.components.loss import vocab_shard_bounds
+
+    monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: object())
+    monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: tp_size)
+    reference = torch.nn.Embedding(vocab_size, 3, padding_idx=vocab_size - 1)
+    inputs = torch.tensor([list(range(vocab_size)) + [0, 0]])
+    expected = reference(inputs)
+    shards = []
+    outputs = []
+    for rank in range(tp_size):
+        monkeypatch.setattr(
+            embedding_mod.distributed, "get_rank", lambda g, rank=rank: rank
+        )
+        start, end = vocab_shard_bounds(vocab_size, tp_size, rank)
+        shard = VocabParallelEmbedding(vocab_size, 3, padding_idx=vocab_size - 1)
+        shard.weight = torch.nn.Parameter(reference.weight.detach()[start:end].clone())
+        shards.append(shard)
+        outputs.append(shard(inputs))
+    actual = torch.stack(outputs).sum(0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    gradient = torch.arange(actual.numel(), dtype=actual.dtype).reshape(actual.shape)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch.testing.assert_close(
+        torch.cat([shard.weight.grad for shard in shards]),
+        reference.weight.grad,
+        rtol=0,
+        atol=0,
+    )

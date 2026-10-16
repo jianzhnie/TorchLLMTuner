@@ -44,7 +44,7 @@ def test_restore_rejects_conflicting_nested_paths_without_mutating_state(
     ]
     flat.update(reversed(entries) if reverse_order else entries)
     with pytest.raises(ValueError, match="Conflicting nested optimizer state paths"):
-        load_flat_optim_state_dict(optimizer, flat)
+        load_flat_optim_state_dict(optimizer, flat_state=flat)
     assert optimizer.state[parameter] is original
     assert optimizer.state[parameter] == {"cache": {"leaf": 1}}
     if isinstance(parent_value, dict):
@@ -79,7 +79,7 @@ def test_flat_restore_rejects_merging_groups_with_different_learning_rates(tenso
     )
     original_group = target.param_groups[0]
     with pytest.raises(ValueError, match="checkpoint group option 'lr' differs"):
-        load_flat_optim_state_dict(target, get_flat_optim_state_dict(source))
+        load_flat_optim_state_dict(target, flat_state=get_flat_optim_state_dict(source))
     assert target.param_groups[0] is original_group
     assert target.param_groups[0]["lr"] == 0.3
     assert not target.state
@@ -109,7 +109,7 @@ def test_flat_optimizer_state_preserves_empty_nested_dictionaries(tmp_path, pers
             for key, value in flat.items()
         }
         dcp.load(flat, checkpoint_id=tmp_path)
-    load_flat_optim_state_dict(optimizer, flat)
+    load_flat_optim_state_dict(optimizer, flat_state=flat)
     assert optimizer.state[parameter] == {
         "cache": {},
         "nested": {"empty": {}, "count": 3},
@@ -132,7 +132,7 @@ def test_flat_restore_preserves_empty_parameter_group_options():
     init_optim_state(optimizer)
     flat_state = get_flat_optim_state_dict(optimizer)
     empty_options = dict(optimizer.param_groups[1])
-    load_flat_optim_state_dict(optimizer, flat_state)
+    load_flat_optim_state_dict(optimizer, flat_state=flat_state)
     assert optimizer.param_groups[1] == empty_options
     parameter.grad = torch.ones_like(parameter)
     optimizer.step()
@@ -241,7 +241,7 @@ def test_optimizer_restore_rejects_misaligned_parameter_names():
     optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(2))])
     optimizer.param_groups[0]["param_names"] = []
     with pytest.raises(ValueError, match="zip"):
-        unflatten_optim_state_dict(optimizer, {})
+        unflatten_optim_state_dict(optimizer, flat_state={})
 
 
 @pytest.mark.parametrize(
@@ -277,7 +277,7 @@ def test_incomplete_optimizer_checkpoint_is_rejected_without_state_changes():
     original_state = optimizer.state[parameter]
     original_moment = original_state["exp_avg"]
     with pytest.raises(KeyError, match="state.weight.exp_avg"):
-        load_flat_optim_state_dict(optimizer, checkpoint)
+        load_flat_optim_state_dict(optimizer, flat_state=checkpoint)
     assert optimizer.state[parameter] is original_state
     assert optimizer.state[parameter]["exp_avg"] is original_moment
     assert original_state["step"].item() == 0
@@ -327,6 +327,6 @@ def test_flat_optimizer_restore_keeps_parameter_names_for_the_next_save():
     optimizer.param_groups[0]["param_names"] = ["weight"]
     init_optim_state(optimizer)
     saved = get_flat_optim_state_dict(optimizer)
-    load_flat_optim_state_dict(optimizer, saved)
+    load_flat_optim_state_dict(optimizer, flat_state=saved)
     assert optimizer.param_groups[0]["param_names"] == ["weight"]
     assert get_flat_optim_state_dict(optimizer).keys() == saved.keys()

@@ -54,7 +54,7 @@ def main():
                     target.copy_(source[rank * 2 : (rank + 1) * 2])
             reference = RoutedExperts(reference_experts, LocalTokenDispatcher(4, 2))
             dispatcher = AllToAllTokenDispatcher(4, 2)
-            dispatcher.wire_meshes(ep_group=dist.group.WORLD)
+            dispatcher.set_ep_group(ep_group=dist.group.WORLD)
             distributed_experts = routed_class(local_experts, dispatcher)
             calls = []
             if recompute:

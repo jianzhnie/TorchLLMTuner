@@ -311,6 +311,18 @@ def test_build_model_config_for_offline_arch() -> None:
     assert config.max_position_embeddings >= cfg.max_seq_len
 
 
+@pytest.mark.parametrize("model_type", ["llava", "gemma3"])
+@pytest.mark.parametrize("saved_length", [16, 128])
+def test_offline_composite_extends_text_context_without_mutating_overrides(
+    model_type, saved_length
+) -> None:
+    overrides = {"text_config": {"max_position_embeddings": saved_length}}
+    config = build_model_config(model_type, seq_len=64, arch_overrides=overrides)
+
+    assert config.text_config.max_position_embeddings == max(saved_length, 64)
+    assert overrides == {"text_config": {"max_position_embeddings": saved_length}}
+
+
 def test_wrapper_rejects_an_invalid_gqa_head_ratio() -> None:
     """HF accepts this config but fails later when it repeats KV heads.
 
