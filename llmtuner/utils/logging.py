@@ -142,6 +142,11 @@ class FileHandler(logging.FileHandler):
         self.setFormatter(RankFormatter())
         self.addFilter(DestinationFilter(str(path)))
 
+    def filter(self, record: LogRecord) -> bool:
+        # A shared handler may remain attached to another logger after close.
+        # It must not reserve a destination or reopen an append stream.
+        return not self._closed and super().filter(record)
+
 
 def set_log_ranks(ranks: Iterable[int]) -> None:
     """Set which ranks print below-ERROR lines (default: rank 0 only).
@@ -191,6 +196,9 @@ def get_logger(
     config = get_logging_state()
     with config.lock:
         logger.setLevel(log_level)
+        for handler in logger.handlers[:]:
+            if isinstance(handler, FileHandler) and handler._closed:
+                logger.removeHandler(handler)
         # Do not remove handlers installed by an embedding application. Only
         # manage the handler owned by this module.
         if not any(isinstance(handler, ConsoleHandler) for handler in logger.handlers):
