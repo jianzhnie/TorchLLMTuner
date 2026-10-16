@@ -1,34 +1,55 @@
-"""The validation (eval) pass, extracted from ``trainer.py``.
+"""Validation passes, token/loss reductions, and temporary loader lifecycle.
 
-These are module-level functions whose first parameter is deliberately named
-``self``: the bodies moved here verbatim from ``Trainer``, and ``Trainer``
-keeps same-named thin delegates (``should_validate`` / ``validate`` /
-``validate_body`` / ``check_validation_feasibility``) so its public surface,
-error types and message texts are unchanged. Everything the bodies touch --
-``dp_rank_world_size``, ``loss_sum``, ``metrics``, ... -- stays on the
-trainer; this module owns only the pass itself.
+Trainer delegates evaluation here. Pipeline input preparation is shared with
+training; this module owns validation scheduling, reporting, and mode restore.
 """
 
 from __future__ import annotations
 
+import math
 import sys
+from typing import TYPE_CHECKING
 
 import torch
 
 from llmtuner.accelerator.capabilities import require
-from llmtuner.config import ValidationConfig
+from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.parallel import compatibility
 from llmtuner.utils.logging import get_logger
 
 from ...accelerator.collectives import all_reduce
 from ...accelerator.spmd import spmd_context
-from ...datasets import build_dataloader
-from ...datasets.contracts import Batch
-from ...datasets.dataloader import DataloaderExhaustedError
-from .reductions import loss_reporting_meshes
+from ...datasets.contracts import (
+    BaseDataLoader,
+    Batch,
+    DataloaderExhaustedError,
+    TrainerBatch,
+)
+from ...datasets.loader_builder import build_dataloader
+from .pipeline import prepare_pipeline_inputs
+from .reductions import resolve_loss_reduction_meshes
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
+    from ..trainer import Trainer
 
 
-def build_validation_dataloader(self, validation: ValidationConfig):
+def close_validation_dataloader(loader: BaseDataLoader, *, failed: bool) -> None:
+    """Close temporary data resources without replacing an active pass error."""
+    try:
+        loader.close()
+    except BaseException:
+        if not failed:
+            raise
+        get_logger(__name__).exception(
+            "Validation dataloader cleanup failed after validation failed"
+        )
+
+
+def create_validation_dataloader(
+    self: Trainer, validation: ValidationConfig
+) -> BaseDataLoader:
     """The pass's temporary loader: fresh per pass, closed when the pass ends.
 
     ``steps=-1`` reads it to exhaustion (built with repeat=False); a positive
@@ -46,7 +67,9 @@ def build_validation_dataloader(self, validation: ValidationConfig):
     )
 
 
-def count_validation_batch_tokens(self, batch, dp_mesh) -> torch.Tensor:
+def count_validation_batch_tokens(
+    self: Trainer, batch: Batch | TrainerBatch, *, dp_mesh: DeviceMesh | None
+) -> torch.Tensor:
     """Throughput accounting plus the dp-reduced global valid-token count.
 
     The throughput number counts every label the loader produced, whether or
@@ -67,12 +90,12 @@ def count_validation_batch_tokens(self, batch, dp_mesh) -> torch.Tensor:
 
 
 def finalize_validation(
-    self,
+    self: Trainer,
     *,
     num_steps: int,
     accumulated_loss: torch.Tensor | None,
     total_global_valid_tokens: torch.Tensor,
-    loss_mesh,
+    loss_mesh: DeviceMesh | None,
     step: int,
 ) -> None:
     """Reduce the pass's sums and report the average, with loud empty-pass errors.
@@ -108,6 +131,10 @@ def finalize_validation(
     else:
         global_loss_sum = accumulated_loss
     global_avg_loss = float(global_loss_sum) / num_global_valid_tokens
+    if not math.isfinite(global_avg_loss):
+        raise FloatingPointError(
+            f"Validation loss is not finite at step {step}: {global_avg_loss}"
+        )
     self.metrics.log_validation(loss=global_avg_loss, step=step)
 
 
@@ -145,7 +172,7 @@ def check_validation_feasibility(
         compatibility.validation_once_requires_finite_corpus()
 
 
-def should_validate(self, step: int) -> bool:
+def should_validate(self: Trainer, step: int) -> bool:
     """Whether a validation pass runs at the end of ``step``.
 
     Step 1 always validates (a run sees its first eval number immediately,
@@ -157,7 +184,7 @@ def should_validate(self, step: int) -> bool:
 
 
 @torch.no_grad()
-def validate(self, step: int) -> None:
+def validate(self: Trainer, step: int) -> None:
     """Run one eval-mode, gradient-free pass and log its loss.
 
     The reported number is the pass's summed next-token cross-entropy
@@ -166,8 +193,8 @@ def validate(self, step: int) -> None:
     the loss sum across the dp*cp*tp ``loss`` view), so the eval and train
     numbers are directly comparable and identical on every rank.
 
-    The pass is a pure observer: the model runs in eval mode (restored to
-    train mode afterwards, even on error), no gradients are computed, no
+    The pass is a pure observer: the model runs in eval mode (each module's
+    original mode is restored afterwards, even on error), no gradients are computed, no
     optimizer or scheduler state moves, and ``ntokens_seen`` -- the
     checkpointed training counter -- is not touched.
 
@@ -191,66 +218,101 @@ def validate(self, step: int) -> None:
         for part in self.model_parts
         for module in part.modules()
     }
+    mask_configs = {
+        id(config): config
+        for part in self.model_parts
+        if (config := getattr(getattr(part, "model", None), "config", None)) is not None
+    }
+    original_masks = {
+        key: (
+            hasattr(config, "attn_mask_type"),
+            getattr(config, "attn_mask_type", None),
+        )
+        for key, config in mask_configs.items()
+    }
+    kernel_modes = {
+        kernel: kernel.packed
+        for module in training_modes
+        if (kernel := getattr(module, "_titan_flex_kernel", None)) is not None
+        and hasattr(kernel, "packed")
+    }
     try:
+        if validation.dataset is not None:
+            mask_type = self.cfg.dataloader.attention_mask_type(
+                dataset=validation.dataset
+            )
+            if (
+                mask_type == "block_causal"
+                and self.cfg.parallel.cp > 1
+                and self.cfg.parallel.context_parallel_strategy == "kcp"
+            ):
+                raise ValueError("KCP does not support packed document validation")
+            for config in mask_configs.values():
+                config.attn_mask_type = mask_type
+            for kernel in kernel_modes:
+                kernel.packed = mask_type == "block_causal"
         for part in self.model_parts:
             part.eval()
-        self.validate_body(validation, step)
+        run_validation_loop(self, validation, step)
     finally:
+        for kernel, packed in kernel_modes.items():
+            kernel.packed = packed
+        for key, config in mask_configs.items():
+            had_mask, original_mask = original_masks[key]
+            if not had_mask:
+                if hasattr(config, "attn_mask_type"):
+                    delattr(config, "attn_mask_type")
+            else:
+                config.attn_mask_type = original_mask
         for module, training in training_modes.items():
             module.training = training
 
 
-def run_validation_loop(self, validation: ValidationConfig, step: int) -> None:
+def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) -> None:
+    """Read, score, and finalize one validation pass for dense or PP models."""
     parallel_dims = self.parallel_dims
-    if parallel_dims is not None and parallel_dims.pp_enabled:
-        run_pipeline_validation_loop(self, validation, step)
-        return
-    dp_mesh, loss_mesh = loss_reporting_meshes(parallel_dims)
-    validation_dataloader = build_validation_dataloader(self, validation)
+    pipeline = parallel_dims is not None and parallel_dims.pp_enabled
+    if pipeline:
+        require(
+            "pipelining_microbatch_drivers",
+            feature="validation with pipeline parallelism",
+        )
+    dp_mesh, loss_mesh = resolve_loss_reduction_meshes(parallel_dims)
+    validation_dataloader = create_validation_dataloader(self, validation)
 
-    accumulated_loss: torch.Tensor | None = None
-    total_global_valid_tokens = torch.zeros((), dtype=torch.int64, device=self.device)
-    num_steps = 0
     try:
+        accumulated_loss: torch.Tensor | None = None
+        total_global_valid_tokens = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
+        num_steps = 0
         data_iterator = iter(validation_dataloader)
         while validation.steps == -1 or num_steps < validation.steps:
             try:
                 batch = next(data_iterator)
             except (DataloaderExhaustedError, StopIteration):
                 break
-            global_valid_tokens = count_validation_batch_tokens(self, batch, dp_mesh)
-            if isinstance(batch, dict):
-                # ``num_valid_tokens`` is the trainer's bookkeeping; a
-                # plain int among tensors would be splatted into the model
-                # forward as a kwarg. Keep the loader-owned batch intact.
-                batch = {k: v for k, v in batch.items() if k != "num_valid_tokens"}
-            inputs, labels, extra_kwargs = self.example_model.preprocess_inputs(
-                self.to_device(batch),
-                parallel_dims=self.parallel_dims,
-                parallelism=self.cfg.parallel,
-                max_context_length=self.cfg.max_seq_len,
+            global_valid_tokens = count_validation_batch_tokens(
+                self, batch, dp_mesh=dp_mesh
             )
-            with self.param_context(), spmd_context(self.parallel_dims):
-                logits = self.example_model(inputs, **extra_kwargs)
-                loss_sum = self.loss_sum(logits, labels, **self.loss_vocab_kwargs())
-            if accumulated_loss is None:
-                accumulated_loss = loss_sum.clone()
+            if pipeline:
+                loss_sum = evaluate_pipeline_batch(self, batch)
             else:
-                accumulated_loss.add_(loss_sum)
+                inputs, labels, extra_kwargs = self.preprocess(batch)
+                with self.param_context(), spmd_context(parallel_dims):
+                    logits = self.example_model(inputs, **extra_kwargs)
+                    loss_sum = self.loss_sum(logits, labels, **self.loss_vocab_kwargs())
+            if loss_sum is not None:
+                if accumulated_loss is None:
+                    accumulated_loss = loss_sum.detach().clone()
+                else:
+                    accumulated_loss.add_(loss_sum.detach())
             total_global_valid_tokens.add_(global_valid_tokens)
             num_steps += 1
     finally:
-        # Releases the Grain prefetch thread; a no-op for loaders without
-        # one. The loader is temporary, so nothing else holds it open.
-        failed = sys.exc_info()[0] is not None
-        try:
-            validation_dataloader.close()
-        except BaseException:
-            if not failed:
-                raise
-            get_logger(__name__).exception(
-                "Validation dataloader cleanup failed after validation failed"
-            )
+        close_validation_dataloader(
+            validation_dataloader, failed=sys.exc_info()[0] is not None
+        )
 
     finalize_validation(
         self,
@@ -262,96 +324,27 @@ def run_validation_loop(self, validation: ValidationConfig, step: int) -> None:
     )
 
 
-def run_pipeline_validation_loop(self, validation: ValidationConfig, step: int) -> None:
-    """The PP validation pass: drive the schedule's ``eval`` per step.
+def evaluate_pipeline_batch(
+    self: Trainer, batch: Batch | TrainerBatch
+) -> torch.Tensor | None:
+    """Run forward-only microbatches; only the final PP stage returns a loss sum.
 
-    Upstream torchtitan's ``Validator`` seam: the pipeline schedule carries an
-    eval-only driver, so a validation pass runs the same stages forward-only.
-    The microbatch plumbing mirrors the training body
-    (``pipeline.run_pipeline_step``): first
-    stage gets the inputs, last stage the labels, and every stage gets the
-    per-microbatch kwargs (positions, masks).
-
-    The schedule's loss function divides by the run's denominator attribute;
-    for the pass it is pinned to 1 so the reported per-microbatch losses are
-    raw summed cross-entropies, and the division happens once at the end, by
-    the pass's global valid-token count -- the same normalization as the
-    non-PP path and the training loss. The training body re-publishes the
-    real denominator before every train step, so no restore is needed.
-
-    Only the last stage's ranks hold losses; every other stage's ranks run
-    the same loop (same loader reads, same token counting, same eval calls)
-    and simply do not report.
+    Pin the schedule denominator to one so its losses are summed cross-entropies.
+    The common validation loop normalizes once at the end; training republishes
+    its denominator before the next optimizer step.
     """
-    require(
-        "pipelining_microbatch_drivers",
-        feature="validation with pipeline parallelism",
-    )
-
-    dp_mesh, loss_mesh = loss_reporting_meshes(self.parallel_dims)
-    validation_dataloader = build_validation_dataloader(self, validation)
-
-    accumulated_loss: torch.Tensor | None = None
-    total_global_valid_tokens = torch.zeros((), dtype=torch.int64, device=self.device)
-    num_steps = 0
-    try:
-        data_iterator = iter(validation_dataloader)
-        while validation.steps == -1 or num_steps < validation.steps:
-            try:
-                batch = next(data_iterator)
-            except (DataloaderExhaustedError, StopIteration):
-                break
-            global_valid_tokens = count_validation_batch_tokens(self, batch, dp_mesh)
-
-            arg_mbs: list[tuple[torch.Tensor, ...]] = []
-            kwarg_mbs: list[dict] = []
-            target_mbs: list[torch.Tensor] | None = (
-                [] if self.pp_has_last_stage else None
-            )
-            for mb in self.pp_microbatches(batch):
-                inputs, mb_labels, extra_kwargs = self.preprocess({"batch": mb})
-                if self.pp_has_first_stage:
-                    arg_mbs.append((inputs,))
-                kwarg_mbs.append(extra_kwargs)
-                if target_mbs is not None:
-                    target_mbs.append(mb_labels)
-
-            losses: list[torch.Tensor] | None = [] if self.pp_has_last_stage else None
-            with self.param_context(), spmd_context(self.parallel_dims):
-                self.pp_schedule._llmtuner_global_valid_tokens = torch.ones(
-                    (), dtype=torch.float32
-                )
-                self.pp_schedule.eval(
-                    arg_mbs=arg_mbs if self.pp_has_first_stage else None,
-                    kwarg_mbs=kwarg_mbs,
-                    target_mbs=target_mbs,
-                    losses=losses,
-                )
-            if self.pp_has_last_stage:
-                assert losses is not None
-                step_loss = torch.sum(torch.stack([loss.detach() for loss in losses]))
-                if accumulated_loss is None:
-                    accumulated_loss = step_loss
-                else:
-                    accumulated_loss = accumulated_loss + step_loss
-            total_global_valid_tokens.add_(global_valid_tokens)
-            num_steps += 1
-    finally:
-        failed = sys.exc_info()[0] is not None
-        try:
-            validation_dataloader.close()
-        except BaseException:
-            if not failed:
-                raise
-            get_logger(__name__).exception(
-                "Validation dataloader cleanup failed after validation failed"
-            )
-
-    finalize_validation(
-        self,
-        num_steps=num_steps,
-        accumulated_loss=(accumulated_loss if self.pp_has_last_stage else None),
-        total_global_valid_tokens=total_global_valid_tokens,
-        loss_mesh=loss_mesh,
-        step=step,
-    )
+    inputs = prepare_pipeline_inputs(self, batch)
+    losses: list[torch.Tensor] | None = [] if self.pp_has_last_stage else None
+    with self.param_context(), spmd_context(self.parallel_dims):
+        self.pp_schedule._llmtuner_global_valid_tokens = torch.ones(
+            (), dtype=torch.float32
+        )
+        self.pp_schedule.eval(
+            arg_mbs=inputs.args if self.pp_has_first_stage else None,
+            kwarg_mbs=inputs.kwargs,
+            target_mbs=inputs.targets,
+            losses=losses,
+        )
+    if losses is None:
+        return None
+    return torch.stack([loss.detach() for loss in losses]).sum()

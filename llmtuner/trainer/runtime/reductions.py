@@ -24,7 +24,7 @@ class TrainingReductionMeshes:
     sequence: DeviceMesh | None
 
 
-def loss_reporting_meshes(
+def resolve_loss_reduction_meshes(
     parallel_dims: ParallelTopology | None,
 ) -> tuple[DeviceMesh | None, DeviceMesh | None]:
     """Return the DP token-count mesh and the loss-sum mesh."""
@@ -36,11 +36,11 @@ def loss_reporting_meshes(
     return dp_mesh, loss_mesh
 
 
-def training_reduction_meshes(
+def resolve_training_reduction_meshes(
     parallel_dims: ParallelTopology | None,
 ) -> TrainingReductionMeshes:
     """Resolve the four meshes used by one training step."""
-    dp_mesh, loss_mesh = loss_reporting_meshes(parallel_dims)
+    dp_mesh, loss_mesh = resolve_loss_reduction_meshes(parallel_dims)
     if parallel_dims is None:
         return TrainingReductionMeshes(None, None, None, None)
     sequence_axes = [

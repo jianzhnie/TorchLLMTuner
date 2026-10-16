@@ -26,23 +26,28 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from llmtuner.config import LLMTunerConfig, ValidationConfig
+from llmtuner.config.llmtuner_config import LLMTunerConfig
+from llmtuner.config.validation_config import ValidationConfig
 
 from ..accelerator.collectives import all_reduce, clip_grad_norm_, set_pg_timeouts
 from ..accelerator.spmd import spmd_context
-from ..components.checkpointer import DistributedCheckpointManager
+from ..components.checkpointer.distributed_checkpoint import (
+    DistributedCheckpointManager,
+)
 from ..components.loss import (
     chunked_lm_head_cross_entropy,
     cross_entropy_loss,
 )
 from ..components.metrics import MetricsProcessor
-from ..components.optimizer import (
-    EMA,
-    LRSchedulersContainer,
-)
+from ..components.optimizer.ema import EMA
+from ..components.optimizer.lr_scheduler import LRSchedulersContainer
 from ..components.profiler import Profiler
-from ..datasets.contracts import Batch
-from ..datasets.dataloader import BaseDataLoader, DataloaderExhaustedError, TrainerBatch
+from ..datasets.contracts import (
+    BaseDataLoader,
+    Batch,
+    DataloaderExhaustedError,
+    TrainerBatch,
+)
 from ..models.common.aux_loss import (
     AuxLoss,
     collect_aux_loss_metrics,
@@ -52,10 +57,14 @@ from ..parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
 from ..utils.logging import get_logger
+from ..utils.seeding import seed_everything
 from .runtime import assembly, pipeline
 from .runtime import batch as batch_runtime
 from .runtime import validation as validation_runtime
-from .runtime.reductions import training_reduction_meshes
+from .runtime.reductions import (
+    TrainingReductionMeshes,
+    resolve_training_reduction_meshes,
+)
 
 # Rank-aware: the helper attaches a handler whose filter passes below-ERROR
 # lines only on the log ranks (rank 0 by default), so a torchrun run logs one
@@ -87,10 +96,8 @@ class Trainer:
     _pp_loss_sentinel: torch.Tensor | None
     _chunked_loss_num_chunks: int
     optimizer: torch.optim.Optimizer
-    # Defaulted, not just annotated: ``data_iterator`` reads it, and that is
-    # the one helper the tests drive off a ``Trainer`` built with ``__new__``.
-    # A real Trainer always holds a loader (it is registered in the checkpoint
-    # states), so ``None`` is only the not-built state of such a test double.
+    # None denotes incomplete assembly; data_iterator rejects it explicitly.
+    # Defaults also let close() safely handle partial initialization failures.
     dataloader: BaseDataLoader | None = None
     lr_scheduler: LRSchedulersContainer | None
     ema: EMA | None
@@ -122,8 +129,8 @@ class Trainer:
     def seed_everything(
         seed: int, *, deterministic: bool, detect_anomaly: bool = False
     ) -> None:
-        """Seed every generator; the body lives in ``runtime/assembly.py``."""
-        assembly.seed_everything(
+        """Seed host and device generators through the shared utility."""
+        seed_everything(
             seed, deterministic=deterministic, detect_anomaly=detect_anomaly
         )
 
@@ -137,7 +144,7 @@ class Trainer:
         """This rank's share of the global batch. Body in ``batch.py``."""
         return batch_runtime.batch_size_per_rank(self, dp_world_size)
 
-    def build_dataloader(self) -> BaseDataLoader | None:
+    def build_dataloader(self) -> BaseDataLoader:
         """Build the micro-batch source the config names. Body in ``batch.py``."""
         return batch_runtime.build_dataloader(self)
 
@@ -187,13 +194,13 @@ class Trainer:
         return batch_runtime.to_device(self, batch)
 
     def preprocess(
-        self, microbatch: dict[str, Any]
+        self, batch: Batch | TrainerBatch
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Ask the model to turn its batch into forward inputs.
 
         Body in ``batch.py``.
         """
-        return batch_runtime.preprocess(self, microbatch)
+        return batch_runtime.preprocess(self, batch)
 
     def forward_backward_step(
         self,
@@ -227,7 +234,7 @@ class Trainer:
             return self.pp_forward_backward_body(
                 microbatch["batch"], global_valid_tokens=global_valid_tokens
             )
-        inputs, labels, extra_kwargs = self.preprocess(microbatch)
+        inputs, labels, extra_kwargs = self.preprocess(microbatch["batch"])
         return self._forward_backward_body(
             inputs,
             labels,
@@ -286,10 +293,9 @@ class Trainer:
         """The vocab-parallel arguments for the loss seam, when TP is on.
 
         Both are handed to :func:`cross_entropy_loss`, which selects the
-        sharded path by *shape*: while the ``lm_head`` is replicated every call
-        still holds ``pred.shape[-1] == global_vocab_size`` and takes the plain
-        path, so today this is a no-op and the wiring exists in one place
-        instead of at every loss call site.
+        vocab-sharded path when the local logits width differs from the global
+        vocabulary size. A replicated lm_head takes the plain loss path; a
+        TP-sharded head uses the TP group for distributed cross entropy.
 
         ``global_vocab_size`` is read from the model rather than from
         ``cfg.model.vocab_size``: the head is built against the HF config's
@@ -362,7 +368,9 @@ class Trainer:
         self, batch: Batch | TrainerBatch
     ) -> list[Batch | TrainerBatch]:
         """Split this rank's batch into whole-row pipeline microbatches."""
-        return pipeline.split_pipeline_microbatches(self, batch)
+        return pipeline.split_pipeline_microbatches(
+            batch, num_microbatches=self.cfg.parallel.num_pp_microbatches
+        )
 
     def pp_forward_backward_body(
         self,
@@ -497,15 +505,8 @@ class Trainer:
         # gates on (``dp_cp_enabled``) extended by tp for the sequence-parallel
         # loss shard upstream does not have.
         parallel_dims = self.parallel_dims
-        reduction_meshes = training_reduction_meshes(parallel_dims)
+        reduction_meshes = resolve_training_reduction_meshes(parallel_dims)
         dp_mesh = reduction_meshes.dp
-        pp_mesh = reduction_meshes.pp
-        loss_mesh = reduction_meshes.loss
-        # CP/TP ranks hold disjoint token slices of the same DP batch.  Their
-        # loss pieces must be summed back together before computing the
-        # worst per-DP-rank average; reducing local shard averages directly
-        # makes ``max_loss`` smaller by the sequence sharding degree.
-        sequence_mesh = reduction_meshes.sequence
 
         # Read the whole step's data up front. The denominator must be known
         # before the first forward (the loss divides by it there), so every
@@ -602,7 +603,7 @@ class Trainer:
         self._allreduce_replicated_tp_grads()
 
         grad_norm = self._clip_and_check_finite(
-            pp_mesh=pp_mesh, loss_mesh=loss_mesh, loss_is_finite=loss_is_finite
+            reduction_meshes=reduction_meshes, loss_is_finite=loss_is_finite
         )
 
         # Before the optimizer update: a background checkpoint save may still be
@@ -636,16 +637,16 @@ class Trainer:
             global_valid_tokens=global_valid_tokens,
             local_valid_tokens=local_valid_tokens,
             local_valid_tokens_tensor=local_valid_tokens_tensor,
-            loss_mesh=loss_mesh,
-            pp_mesh=pp_mesh,
-            dp_mesh=dp_mesh,
-            sequence_mesh=sequence_mesh,
+            reduction_meshes=reduction_meshes,
             grad_norm=grad_norm,
             lr_metrics=lr_metrics,
         )
 
     def _clip_and_check_finite(
-        self, *, pp_mesh, loss_mesh, loss_is_finite: torch.Tensor
+        self,
+        *,
+        reduction_meshes: TrainingReductionMeshes,
+        loss_is_finite: torch.Tensor,
     ) -> torch.Tensor:
         """Clip gradients, then fold loss and grad-norm finiteness into one flag.
 
@@ -654,6 +655,8 @@ class Trainer:
         before the optimizer step and returns only ``grad_norm`` (already
         world-reduced by ``clip_grad_norm_``).
         """
+        pp_mesh = reduction_meshes.pp
+        loss_mesh = reduction_meshes.loss
         parameters = [p for part in self.model_parts for p in part.parameters()]
         expert_parameters = [
             p
@@ -723,10 +726,7 @@ class Trainer:
         global_valid_tokens: torch.Tensor,
         local_valid_tokens: int,
         local_valid_tokens_tensor: torch.Tensor,
-        loss_mesh,
-        pp_mesh,
-        dp_mesh,
-        sequence_mesh,
+        reduction_meshes: TrainingReductionMeshes,
         grad_norm: torch.Tensor,
         lr_metrics: dict[str, float],
     ) -> dict[str, float]:
@@ -735,6 +735,12 @@ class Trainer:
         Every collective here is unconditional (see the comment at the loss
         reduction): ranks enter them regardless of what their own shard saw.
         """
+        dp_mesh = reduction_meshes.dp
+        pp_mesh = reduction_meshes.pp
+        loss_mesh = reduction_meshes.loss
+        # CP/TP hold disjoint slices of the same DP batch; restore the complete
+        # local loss before computing the worst per-DP-rank average.
+        sequence_mesh = reduction_meshes.sequence
         # Only the last stage computes CE. Other stages carry a finite
         # sentinel for the step check; it must not enter reported metrics.
         if pp_mesh is not None and not self.pp_has_last_stage:
@@ -878,10 +884,6 @@ class Trainer:
         """
         validation_runtime.validate(self, step)
 
-    def validate_body(self, validation: ValidationConfig, step: int) -> None:
-        """The pass itself; the body lives in ``runtime/validation.py``."""
-        validation_runtime.run_validation_loop(self, validation, step)
-
     # -- step cadence ------------------------------------------------------------
 
     def should_log(self) -> bool:
@@ -903,8 +905,13 @@ class Trainer:
         return {"step": self.step, "ntokens_seen": self.ntokens_seen}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.step = state_dict["step"]
-        self.ntokens_seen = state_dict["ntokens_seen"]
+        step = state_dict["step"]
+        ntokens_seen = state_dict["ntokens_seen"]
+        for name, value in (("step", step), ("ntokens_seen", ntokens_seen)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"trainer {name} must be a nonnegative integer")
+        self.step = step
+        self.ntokens_seen = ntokens_seen
 
     # -- the loop ---------------------------------------------------------------
 
