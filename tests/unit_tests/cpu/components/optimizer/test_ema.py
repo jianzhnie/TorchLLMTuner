@@ -578,3 +578,57 @@ def test_metadata_change_is_rejected_before_any_average_mutation(operation, chan
             ema.load_state_dict({})
     for name, value in _ema_params(ema).items():
         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
+def test_dynamic_ema_sparse_firings_resume_parameter_and_buffer_against_formula():
+    import copy
+
+    model = nn.Module()
+    model.register_parameter(
+        "weight", nn.Parameter(torch.tensor([1.0], dtype=torch.float64))
+    )
+    model.register_buffer("history", torch.tensor([2.0], dtype=torch.float64))
+    options = dict(
+        half_life_fraction=0.5,
+        start_step=2,
+        step_bias=3,
+        update_every_n_steps=3,
+        buffer_patterns=["history$"],
+    )
+    continuous = EMA(model_parts=[model], **options)
+    expected = {"weight": 1.0, "history": 2.0}
+    resumed = None
+    resumed_model = None
+    for step in range(1, 15):
+        with torch.no_grad():
+            model.weight.fill_(1.0 + step * 0.25)
+            model.history.fill_(2.0 - step * 0.5)
+        continuous.step(step)
+        elapsed = step - 2
+        if elapsed > 0 and elapsed % 3 == 0:
+            firing = elapsed // 3 + 3
+            decay = 2 ** (-1 / (0.5 * firing))
+            for name in expected:
+                live = getattr(model, name).item()
+                expected[name] = decay * expected[name] + (1 - decay) * live
+        if resumed is not None:
+            assert resumed_model is not None
+            with torch.no_grad():
+                resumed_model.weight.copy_(model.weight)
+                resumed_model.history.copy_(model.history)
+            resumed.step(step)
+            torch.testing.assert_close(
+                resumed.state_dict(), continuous.state_dict(), rtol=0, atol=0
+            )
+        for name, value in expected.items():
+            torch.testing.assert_close(
+                continuous.state_dict()[f"state.{name}.ema_params"],
+                torch.tensor([value], dtype=torch.float64),
+                rtol=1e-14,
+                atol=1e-14,
+            )
+        if step == 7:  # Between firings at steps 5 and 8.
+            resumed_model = copy.deepcopy(model)
+            resumed = EMA(model_parts=[resumed_model], **options)
+            resumed.load_state_dict(copy.deepcopy(continuous.state_dict()))
+    assert resumed is not None
