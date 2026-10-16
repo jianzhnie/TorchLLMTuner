@@ -181,7 +181,9 @@ class ChatProcessor(SampleProcessor):
         tokens = np.asarray(full_tokens, dtype=np.int64)
         return tokens[:-1], tokens[1:].copy()
 
-    def _tokenize_sample(self, sample: dict[str, Any]) -> TextSequence | None:
+    def _tokenize_single_turn(
+        self, messages: list[dict[str, str]]
+    ) -> TextSequence | None:
         """Tokenize a single-turn sample and mask prompt labels.
 
         Returns None if the rendered sample exceeds ``max_context_length``,
@@ -190,7 +192,6 @@ class ChatProcessor(SampleProcessor):
         Uses prefix re-tokenization to find the prompt/response token
         boundary, avoiding BPE merge errors.
         """
-        messages = self._messages_fn(sample)
         self._validate_messages(messages)
 
         # The tokenizer defaults add_generation_prompt=True (torchtitan parity);
@@ -228,7 +229,9 @@ class ChatProcessor(SampleProcessor):
             labels=labels,
         )
 
-    def _tokenize_with_renderer(self, messages: list[dict[str, str]]):
+    def _tokenize_with_renderer(
+        self, messages: list[dict[str, str]]
+    ) -> TextSequence | None:
         """Tokenize a multi-turn conversation through the renderer.
 
         Semantics (kept from upstream): ``build_training_sample`` with
@@ -270,6 +273,7 @@ class ChatProcessor(SampleProcessor):
         self, sample: dict[str, Any], rng: np.random.Generator
     ) -> TextSequence | None:
         del rng
+        messages = self._messages_fn(sample)
         if self._renderer is not None:
-            return self._tokenize_with_renderer(self._messages_fn(sample))
-        return self._tokenize_sample(sample)
+            return self._tokenize_with_renderer(messages)
+        return self._tokenize_single_turn(messages)

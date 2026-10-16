@@ -1,67 +1,16 @@
-"""Multimodal dataset processing for VLM training.
+"""Decode multimodal samples into token targets and processed images.
 
-Workflow overview::
+Dataset adapters normalize OBELICS interleaved rows and CC12M image-text pairs.
+MultimodalProcessor binds vision options and implements Grain's sample contract.
+Packing groups whole documents; MultimodalCollator later assembles patch tensors.
 
-    HuggingFace Dataset (streaming)
-            |
-            v
-    +-------------------------------------------------------+
-    |  Sample Processor  (MultimodalProcessor)              |
-    |                                                       |
-    |  1. Parse raw sample (dataset-specific format)        |
-    |     e.g. OBELICS interleaved text/images,             |
-    |          CC12M text-image pairs                       |
-    |                                                       |
-    |  2. Process vision: decode image/video bytes,         |
-    |     resize to multiples of (patch_size * merge_size), |
-    |     normalize with image_mean/std                     |
-    |     -> pixel_values: list[Tensor(T,H,W,C)]            |
-    |                                                       |
-    |  3. Process text: insert vision placeholder tokens    |
-    |     <|vision_start|><|image_pad|>...<|vision_end|>    |
-    |     into text, then tokenize                          |
-    |     -> input_ids: Tensor(num_tokens,)                 |
-    |     -> labels: next-token targets, with vision tokens |
-    |       masked to ignore_id (-100)                      |
-    +-------------------------------------------------------+
-            |
-            v  (packing: whole documents, first-fit into bins)
-    +-------------------------------------------------------+
-    |  Sample Packer                                        |
-    |  Bin-pack short samples into num_tokens_per_batch-    |
-    |  token rows to reduce padding waste                   |
-    +-------------------------------------------------------+
-            |
-            v  GrainDataLoader batches rows (num_tokens_per_batch tokens)
-    +-------------------------------------------------------+
-    |  Collator  (MultimodalCollator)                       |
-    |                                                       |
-    |  1. collate_images: for each image Tensor(T,H,W,C),   |
-    |     reshape into patches, then concatenate            |
-    |     -> pixel_values: (total_patches, patch_dim)       |
-    |     -> grid_thw: (N, 3) per-image [T, H', W'] dims    |
-    |     (same for videos)                                 |
-    |                                                       |
-    |  2. collate_text: concatenate whole samples and pad   |
-    |     the tail to the token batch                       |
-    |     -> input_ids: (num_tokens_per_batch,)             |
-    |     -> labels: (num_tokens_per_batch,)                |
-    +-------------------------------------------------------+
-            |
-            v
-    Model receives: {input_ids, pixel_values, grid_thw,
-                     pixel_values_videos, grid_thw_videos,
-                     special_tokens: dict[str, int]}, labels
-
-Vendored from torchtitan ``hf_datasets/multimodal/mm_datasets.py``. The
-per-dataset sample function is a constructor argument, which is why
-``recipes.MULTIMODAL_DATASETS`` binds it with ``functools.partial`` rather than
-wrapping each one in its own config subclass.
+Adapted from torchtitan ``hf_datasets/multimodal/mm_datasets.py``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -226,13 +175,13 @@ def process_obelics_sample(
     )
 
 
-def process_cc12_wd_sample(
+def process_cc12m_sample(
     sample: dict[str, Any],
     *,
     tokenizer: MultimodalTokenizer,
     **kwargs: Any,
 ) -> dict[str, Any] | None:
-    """Process a sample from the CC12-WD dataset (text-image pairs)."""
+    """Process a CC12M WebDataset row with ``txt`` and ``jpg`` fields."""
     text = sample.get("txt", "")
     image = sample.get("jpg", None)
 
@@ -278,23 +227,25 @@ class MultimodalProcessor(SampleProcessor):
     ) -> None:
         if min(patch_size, temporal_patch_size, spatial_merge_size) < 1:
             raise ValueError("multimodal patch sizes must be positive")
-        self._sample_processor = sample_processor
-        self._tokenizer = context.tokenizer
         self._max_context_length = context.max_context_length
-        self._patch_size = patch_size
-        self._temporal_patch_size = temporal_patch_size
-        self._spatial_merge_size = spatial_merge_size
-        self._min_pixels = min_pixels
-        self._max_pixels = max_pixels
-        self._image_mean = image_mean
-        self._image_std = image_std
-        self._resize_fn = resize_fn
-        self._max_patches = max_patches
-        self._max_patches_per_side = max_patches_per_side
-        self._video_dir = video_dir
-        self._video_fps = video_fps
-        self._video_min_frames = video_min_frames
-        self._video_max_frames = video_max_frames
+        self._sample_processor = partial(
+            sample_processor,
+            tokenizer=context.tokenizer,
+            patch_size=patch_size,
+            temporal_patch_size=temporal_patch_size,
+            spatial_merge_size=spatial_merge_size,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            image_mean=image_mean,
+            image_std=image_std,
+            resize_fn=resize_fn,
+            max_patches=max_patches,
+            max_patches_per_side=max_patches_per_side,
+            video_dir=video_dir,
+            video_fps=video_fps,
+            video_min_frames=video_min_frames,
+            video_max_frames=video_max_frames,
+        )
 
     def __call__(
         self,
@@ -302,24 +253,7 @@ class MultimodalProcessor(SampleProcessor):
         rng: np.random.Generator,
     ) -> dict[str, Any] | None:
         del rng
-        processed = self._sample_processor(
-            sample=sample,
-            tokenizer=self._tokenizer,
-            patch_size=self._patch_size,
-            temporal_patch_size=self._temporal_patch_size,
-            spatial_merge_size=self._spatial_merge_size,
-            min_pixels=self._min_pixels,
-            max_pixels=self._max_pixels,
-            image_mean=self._image_mean,
-            image_std=self._image_std,
-            resize_fn=self._resize_fn,
-            max_patches=self._max_patches,
-            max_patches_per_side=self._max_patches_per_side,
-            video_dir=self._video_dir,
-            video_fps=self._video_fps,
-            video_min_frames=self._video_min_frames,
-            video_max_frames=self._video_max_frames,
-        )
+        processed = self._sample_processor(sample=sample)
         if (
             processed is not None
             and processed["input_ids"].shape[0] > self._max_context_length

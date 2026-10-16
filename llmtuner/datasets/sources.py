@@ -142,20 +142,6 @@ class HuggingFaceRandomAccessSource(_HuggingFaceSource):
     """Provides random access to a materialized Hugging Face dataset."""
 
 
-class HuggingFaceRandomAccessDataSource:
-    """The materialized dataset :func:`build_source` builds for a
-    ``HuggingFaceRandomAccessSource``."""
-
-    def __init__(self, dataset: datasets.Dataset) -> None:
-        self._dataset = dataset
-
-    def __len__(self) -> int:
-        return len(self._dataset)
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        return self._dataset[index]
-
-
 @dataclass(kw_only=True)
 class HuggingFaceStreamingSource(_HuggingFaceSource):
     """Provides a DP-sharded Hugging Face stream with cursor checkpointing.
@@ -217,7 +203,7 @@ def build_source(
                     "random-access Hugging Face source requires one Dataset; "
                     f"got {type(dataset).__qualname__}"
                 )
-            return HuggingFaceRandomAccessDataSource(dataset)
+            return dataset
         if not isinstance(dataset, datasets.IterableDataset):
             raise TypeError(
                 "streaming Hugging Face source requires one IterableDataset; "

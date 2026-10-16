@@ -62,13 +62,13 @@ class MultimodalCollator(Collator):
         self.build_mrope_positions = build_mrope_positions
         self.patch_order = patch_order
 
-    def collate_images(
-        self, all_images: list[torch.Tensor]
+    def collate_media(
+        self, media: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process image/video tensors into packed patches and grid dimensions.
 
         Args:
-            all_images: Non-empty list of image/video tensors, each of shape
+            media: Non-empty list of image/video tensors, each of shape
                 (T, H, W, C)
 
         Returns:
@@ -79,13 +79,13 @@ class MultimodalCollator(Collator):
         """
         results = [
             vision_to_patches(
-                img,
+                item,
                 self.patch_size,
                 self.temporal_patch_size,
                 self.spatial_merge_size,
                 patch_order=self.patch_order,
             )
-            for img in all_images
+            for item in media
         ]
         all_patches = [r[0] for r in results]
         grid_thw_list = [r[1] for r in results]
@@ -178,7 +178,7 @@ class MultimodalCollator(Collator):
             if "pixel_values" in sample
             for img in sample["pixel_values"]
         ]
-        patches, grids = self.collate_images(all_images) if all_images else (None, None)
+        patches, grids = self.collate_media(all_images) if all_images else (None, None)
 
         all_videos = [
             vid
@@ -187,7 +187,7 @@ class MultimodalCollator(Collator):
             for vid in sample["pixel_values_videos"]
         ]
         video_patches, video_grids = (
-            self.collate_images(all_videos) if all_videos else (None, None)
+            self.collate_media(all_videos) if all_videos else (None, None)
         )
 
         # Pad text.
