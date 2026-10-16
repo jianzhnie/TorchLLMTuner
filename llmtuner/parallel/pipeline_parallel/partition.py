@@ -230,7 +230,18 @@ def split_model_into_stages(
         model = copy.deepcopy(whole_model)
         modules_to_keep = set(module_names)
 
-        for module_name, module_value in model.named_children():
+        presented = dict(model.named_children())
+        presented_ids = {id(module) for module in presented.values()}
+        for module_name, module_value in presented.items():
+            # Flattened HF children also expose their registered parent for
+            # complete FSDP traversal. Keep that structural parent: replacing
+            # it would discard the parts selected below and their state keys.
+            if any(
+                id(child) in presented_ids
+                for child in module_value.modules()
+                if child is not module_value
+            ):
+                continue
             # Assigning a container by its own FQN keeps the complete module;
             # child FQNs below select only a subset of its layers.
             if module_name in modules_to_keep:
@@ -274,9 +285,8 @@ def split_model_into_stages(
 
         # Extra top-level modules the model's ``named_children`` override does
         # not present (e.g. a multimodal encoder registered beside the decoder
-        # on ``HFTransformerModel``, whose child iteration shows only the five
-        # decoder parts). The loop above cannot see them, so keep-or-blank is
-        # applied here against the real ``_modules`` children: a non-owner
+        # on ``HFTransformerModel``). Apply keep-or-blank against the real
+        # ``_modules`` children: a non-owner
         # gets an Identity, exactly like the decoder parts above. Without
         # this, the deep copy would leave a live copy on every stage and two
         # stages' state-dict keys would collide in one checkpoint. A module

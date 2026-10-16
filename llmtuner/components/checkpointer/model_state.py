@@ -21,6 +21,10 @@ from ...parallel.expert_parallel.checkpointing import (
     gather_expert_state,
     load_expert_state,
 )
+from ...parallel.tensor_parallel.checkpointing import (
+    gather_tensor_parallel_state,
+    load_tensor_parallel_state,
+)
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -112,8 +116,11 @@ class ModelCheckpointState(Stateful):
                         f"{sorted(duplicates)}. Model parts must use distinct FQNs."
                     )
                 flat.update(part_state)
-        return gather_expert_state(
-            flat, shard_map=self._ep_shards, model_parts=self.model
+        return gather_tensor_parallel_state(
+            gather_expert_state(
+                flat, shard_map=self._ep_shards, model_parts=self.model
+            ),
+            model_parts=self.model,
         )
 
     def state_dict(self) -> dict[str, Any]:
@@ -162,7 +169,8 @@ class ModelCheckpointState(Stateful):
                     cached.copy_(value)
         return self.cached_state_dict
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Validate full checkpoint keys and shapes without copying or communicating."""
         # Validate the combined view before any part copies weights. strict=False
         # below permits other PP parts and auxiliary checkpoint categories, but
         # must not permit missing local model state or late shape failures.
@@ -182,10 +190,15 @@ class ModelCheckpointState(Stateful):
                     f"Model checkpoint {key!r} has shape {tuple(value.shape)}, "
                     f"expected {tuple(expected.shape)}"
                 )
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.validate_state_dict(state_dict)
         # Each PP part consumes its own keys from the combined model state.
         # Other parts' keys are ignored; checkpoint state categories are separate.
         state_dict = load_expert_state(
-            state_dict, shard_map=self._ep_shards, model_parts=self.model
+            load_tensor_parallel_state(state_dict, model_parts=self.model),
+            shard_map=self._ep_shards,
+            model_parts=self.model,
         )
         for model in self.model:
             model.load_state_dict(state_dict, strict=False)

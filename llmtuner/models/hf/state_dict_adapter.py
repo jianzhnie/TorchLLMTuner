@@ -2,7 +2,8 @@
 
 The wrapper stores a HF ``ForCausalLM`` below ``self.model``. Consequently its
 state-dict FQNs have exactly one extra ``model.`` prefix compared with the
-checkpoint produced by Transformers. No tensor conversion is required.
+checkpoint produced by Transformers. Converted Kimi EP models additionally
+map full grouped expert tensors back to individual HF expert projections.
 """
 
 from __future__ import annotations
@@ -20,9 +21,21 @@ from ...components.checkpointer.hf_storage import IndexedHuggingFaceStorageReade
 class HFTransformerStateDictAdapter:
     """Translate llmtuner wrapper FQNs to standard HF safetensors FQNs."""
 
-    def __init__(self, model_config: Any, hf_assets_path: str | None) -> None:
+    def __init__(
+        self,
+        model_config: Any,
+        hf_assets_path: str | None,
+        *,
+        kimi_expert_parallel: bool = False,
+    ) -> None:
         # Composite HF models store the trained decoder's weight ties here.
         self.model_config = getattr(model_config, "text_config", model_config)
+        self.kimi_expert_parallel = kimi_expert_parallel
+        if (
+            kimi_expert_parallel
+            and getattr(self.model_config, "model_type", None) != "kimi_linear"
+        ):
+            raise ValueError("kimi_expert_parallel requires a kimi_linear model config")
         self.hf_assets_path = hf_assets_path
         self._hf_keys: set[str] | None = None
         self.fqn_to_index_mapping: dict[str, int] | None = None
@@ -67,6 +80,12 @@ class HFTransformerStateDictAdapter:
         }
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        if self.kimi_expert_parallel:
+            from ..kimi.checkpoint import convert_kimi_expert_state
+
+            state_dict = convert_kimi_expert_state(
+                state_dict, num_experts=self.model_config.num_experts, to_hf=True
+            )
         hf_state = {}
         for key, value in state_dict.items():
             hf_key = key.removeprefix("model.")
@@ -106,7 +125,14 @@ class HFTransformerStateDictAdapter:
             and getattr(self.model_config, "tie_word_embeddings", False)
         ):
             hf_state_dict["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"]
-        return {f"model.{key}": value for key, value in hf_state_dict.items()}
+        state = {f"model.{key}": value for key, value in hf_state_dict.items()}
+        if self.kimi_expert_parallel:
+            from ..kimi.checkpoint import convert_kimi_expert_state
+
+            state = convert_kimi_expert_state(
+                state, num_experts=self.model_config.num_experts, to_hf=False
+            )
+        return state
 
     def get_hf_storage_reader(
         self,

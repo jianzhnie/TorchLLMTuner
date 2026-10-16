@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from ..common.moe.layer import MoE
+
 __all__ = ["materialize_meta_model"]
 
 
@@ -14,8 +16,8 @@ def materialize_meta_model(model: nn.Module, device: torch.device) -> None:
     FSDP turns meta parameters into sharded meta ``DTensor`` objects; calling
     ``to_empty`` afterwards allocates only their local shards. Non-persistent
     buffers are not present in the HF checkpoint, so they must be reconstructed
-    rather than left as uninitialized ``to_empty`` storage. Decoder RoPE is the
-    only such buffer in the currently supported HF text models; unknown buffers
+    rather than left as uninitialized ``to_empty`` storage. Decoder RoPE and
+    native MoE token counters are reconstructed explicitly; unknown buffers
     fail loudly so a new architecture cannot train on garbage state.
     """
     # Module._apply may allocate each registered path independently when
@@ -39,6 +41,13 @@ def materialize_meta_model(model: nn.Module, device: torch.device) -> None:
                 restored_buffers[module, name] = buffer.to(device)
 
     rope_modules = {module for module, name in meta_buffers if name == "inv_freq"}
+    for module, name in meta_buffers:
+        if isinstance(module, MoE) and name == "tokens_per_expert_E":
+            # Per-step routing statistics start empty and are intentionally
+            # excluded from HF weights and native checkpoint state.
+            restored_buffers[module, name] = torch.zeros(
+                module.router.num_experts, dtype=torch.float32, device=device
+            )
     for module in rope_modules:
         if not hasattr(module, "config"):
             continue

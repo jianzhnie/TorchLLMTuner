@@ -50,8 +50,9 @@ __all__ = ["MOE_LAYER_ATTRS", "collect_moe_layers", "MoE"]
 # dense ``mlp`` is simply not a MoE and is skipped. The swap for an HF model
 # replaces the block in the attribute it was found under, so this list is shared
 # with it rather than duplicated: the two must agree or the expert-bias hook
-# silently finds no layers on a real swapped model.
-MOE_LAYER_ATTRS = ("mlp",)
+# silently finds no layers on a real swapped model. Kimi uses
+# ``block_sparse_moe`` for its sparse layers.
+MOE_LAYER_ATTRS = ("mlp", "block_sparse_moe")
 
 
 class MoE(nn.Module):
@@ -247,6 +248,17 @@ class MoE(nn.Module):
         ) = self.router(x_TD, self.expert_bias_E, padding_mask_T=padding_mask_T)
         num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
 
+        out_TD = self.routed_experts(
+            x_TD,
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            num_local_tokens_per_expert_E,
+        )
+
+        if self.shared_experts is not None:
+            out_TD = out_TD + self.shared_experts(x_TD)
+        # Commit this block's observations only after both expert paths succeed.
+        # Earlier accumulated microbatches remain owned by the optimizer step.
         if self.training and not in_checkpoint_recompute.get():
             with torch.no_grad():
                 # Count the original forward only: selective replay and early
@@ -261,15 +273,6 @@ class MoE(nn.Module):
                 )
                 self.tokens_per_expert_E.add_(valid_counts_E)
 
-        out_TD = self.routed_experts(
-            x_TD,
-            topk_scores_TK,
-            topk_expert_ids_TK,
-            num_local_tokens_per_expert_E,
-        )
-
-        if self.shared_experts is not None:
-            out_TD = out_TD + self.shared_experts(x_TD)
         return out_TD
 
 

@@ -44,8 +44,9 @@
 """Kimi text decoder integration for the HF training wrapper.
 
 Adapted from FSDPTurbo 0af4eca models/kimi/modeling_kimi_linear.py.
-Dense training is implemented here; sparse experts and attention residuals
-require their own integration before the corresponding configs can run.
+Dense, local sparse-expert and attention-residual training are implemented.
+Native all-to-all EP conversion lives in parallel/expert_parallel; hybrid KCP
+and pipeline transfer of attention-residual history require further integration.
 """
 
 import torch
@@ -57,6 +58,8 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 
+from ..common.activation import SituGLU
+from .attention_residual import attention_residual
 from .delta_attention import KimiDeltaAttention
 from .kimi_linear_config import KimiLinearConfig
 from .latent_attention import KimiLatentAttention
@@ -75,15 +78,37 @@ class KimiMLP(nn.Module):
         self.down_proj = nn.Linear(
             config.intermediate_size, config.hidden_size, bias=False
         )
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.situ = config.hidden_act == "situ"
+        self.act_fn = (
+            SituGLU(
+                config.activation_situ_beta or 1.0, config.activation_situ_linear_beta
+            )
+            if self.situ
+            else ACT2FN[config.hidden_act]
+        )
 
     def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_proj(x), self.up_proj(x)
+        return self.down_proj(
+            self.act_fn(gate, up) if self.situ else self.act_fn(gate) * up
+        )
 
 
 class KimiDecoderLayer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.layer_idx = layer_idx
+        self.attn_res_block_size = config.attn_res_block_size
+        if self.attn_res_block_size is not None:
+            for name in ("self_attention_res", "mlp_res"):
+                setattr(
+                    self,
+                    f"{name}_norm",
+                    KimiRMSNorm(config.hidden_size, config.rms_norm_eps),
+                )
+                setattr(
+                    self, f"{name}_proj", nn.Linear(config.hidden_size, 1, bias=False)
+                )
         self.is_linear_attn = config.is_kda_layer(layer_idx)
         self.self_attn = (
             KimiDeltaAttention if self.is_linear_attn else KimiLatentAttention
@@ -103,7 +128,44 @@ class KimiDecoderLayer(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
 
-    def forward(self, hidden_states, attention_mask=None, **kwargs):
+    def forward(
+        self, hidden_states, attention_mask=None, block_residual=None, **kwargs
+    ):
+        if self.attn_res_block_size is not None:
+            shape = hidden_states.shape
+            prefix = hidden_states
+            if block_residual.shape[1]:
+                hidden_states = attention_residual(
+                    prefix.reshape(-1, shape[-1]),
+                    block_residual,
+                    self.self_attention_res_proj.weight,
+                    self.self_attention_res_norm.weight,
+                    self.self_attention_res_norm.variance_epsilon,
+                ).reshape(shape)
+            if self.layer_idx % self.attn_res_block_size == 0:
+                block_residual = torch.cat(
+                    (block_residual, prefix.reshape(-1, shape[-1]).unsqueeze(1)), 1
+                )
+                prefix = None
+            output = self.self_attn(
+                self.input_layernorm(hidden_states),
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+            prefix = output if prefix is None else prefix + output
+            hidden_states = attention_residual(
+                prefix.reshape(-1, shape[-1]),
+                block_residual,
+                self.mlp_res_proj.weight,
+                self.mlp_res_norm.weight,
+                self.mlp_res_norm.variance_epsilon,
+            ).reshape(shape)
+            feed_forward = getattr(self, "block_sparse_moe", None)
+            if feed_forward is None:
+                feed_forward = self.mlp
+            return prefix + feed_forward(
+                self.post_attention_layernorm(hidden_states)
+            ), block_residual
         hidden_states = hidden_states + self.self_attn(
             self.input_layernorm(hidden_states), attention_mask=attention_mask, **kwargs
         )
@@ -119,6 +181,17 @@ class KimiTextDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        if config.attn_res_block_size is not None:
+            if (
+                not isinstance(config.attn_res_block_size, int)
+                or isinstance(config.attn_res_block_size, bool)
+                or config.attn_res_block_size <= 0
+            ):
+                raise ValueError("attn_res_block_size must be a positive integer")
+            self.output_attn_res_norm = KimiRMSNorm(
+                config.hidden_size, config.rms_norm_eps
+            )
+            self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
@@ -137,13 +210,21 @@ class KimiTextDecoder(nn.Module):
         valid_token_mask=None,
         **kwargs,
     ):
-        if use_cache:
+        if use_cache or kwargs.get("past_key_values") is not None:
             raise ValueError("Kimi training decoder does not support inference cache")
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Provide exactly one of input_ids or inputs_embeds")
         hidden = (
             self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         )
+        if position_ids is not None and (
+            position_ids.shape != hidden.shape[:2]
+            or position_ids.device != hidden.device
+            or position_ids.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError(
+                "Kimi position_ids must be integer [batch, sequence] on input device"
+            )
         valid_tokens = valid_token_mask
         if valid_tokens is not None and (
             valid_tokens.shape != hidden.shape[:2]
@@ -169,10 +250,14 @@ class KimiTextDecoder(nn.Module):
                 starts = torch.cat((starts.new_zeros(1), starts))
             if starts.numel() > 1:
                 boundaries = torch.cat((starts, starts.new_tensor([hidden.shape[1]])))
+        blocks = hidden.new_zeros(hidden.shape[0] * hidden.shape[1], 0, hidden.shape[2])
         for layer in self.layers:
             if layer.is_linear_attn:
                 hidden = layer(
-                    hidden, attention_mask=valid_tokens, cu_seqlens=boundaries
+                    hidden,
+                    attention_mask=valid_tokens,
+                    cu_seqlens=boundaries,
+                    block_residual=blocks,
                 )
             else:
                 mask = attention_mask
@@ -190,7 +275,17 @@ class KimiTextDecoder(nn.Module):
                     mask = torch.zeros_like(allowed, dtype=hidden.dtype).masked_fill(
                         ~allowed, float("-inf")
                     )
-                hidden = layer(hidden, attention_mask=mask)
+                hidden = layer(hidden, attention_mask=mask, block_residual=blocks)
+            if self.config.attn_res_block_size is not None:
+                hidden, blocks = hidden
+        if self.config.attn_res_block_size is not None:
+            hidden = attention_residual(
+                hidden.reshape(-1, hidden.shape[-1]),
+                blocks,
+                self.output_attn_res_proj.weight,
+                self.output_attn_res_norm.weight,
+                self.output_attn_res_norm.variance_epsilon,
+            ).reshape_as(hidden)
         return BaseModelOutputWithPast(last_hidden_state=self.norm(hidden))
 
 
@@ -202,8 +297,6 @@ class KimiLinearForCausalLM(PreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config):
-        if config.attn_res_block_size is not None:
-            raise ValueError("Kimi attention residual integration remains incomplete")
         super().__init__(config)
         self.model = KimiTextDecoder(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)

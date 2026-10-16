@@ -100,12 +100,13 @@ def _build_model(
         and cfg.checkpoint.initial_load_in_hf
         and cfg.checkpoint.initial_load_path
     )
-    # EP swap rewrites the expert layout, which the HF checkpoint does not
-    # carry -- refuse loudly instead of loading garbage into the experts.
+    # Kimi has an explicit full-expert HF layout adapter. Other EP families
+    # still need their own checkpoint mapping before meta initialization.
     if (
         load_hf_weights
         and trainer.parallel_dims is not None
         and trainer.parallel_dims.ep_enabled
+        and getattr(text_config, "model_type", None) != "kimi_linear"
     ):
         compatibility.ep_hf_initial_load(trainer.parallel_dims.ep)
     if load_hf_weights:
@@ -234,7 +235,12 @@ def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> 
         states=states,
         folder=cfg.dump_folder,
         sd_adapter=HFTransformerStateDictAdapter(
-            hf_model_config, cfg.checkpoint.initial_load_path or cfg.hf_model
+            hf_model_config,
+            cfg.checkpoint.initial_load_path or cfg.hf_model,
+            kimi_expert_parallel=(
+                getattr(hf_model_config, "model_type", None) == "kimi_linear"
+                and cfg.parallel.ep_size > 1
+            ),
         ),
     )
 

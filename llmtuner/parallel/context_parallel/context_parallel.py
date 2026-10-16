@@ -137,6 +137,17 @@ def apply_cp(
         logger.info("Applied KCP to %d KDA modules", patched)
         return model
 
+    model_config = getattr(getattr(model, "model", None), "config", None)
+    if getattr(model_config, "model_type", None) == "deepseek_v4":
+        if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
+            raise ValueError("DeepSeek V4 HCA CP requires a cp mesh")
+        cp_mesh = mesh["cp"]
+        if cp_mesh.size() != cfg.cp_size:
+            raise ValueError("HCA CP mesh degree does not match configuration")
+        from .compressor_attention import apply_compressor_context_parallel
+
+        return apply_compressor_context_parallel(model, cp_mesh=cp_mesh, cfg=cfg)
+
     # Import the HF backend only when CP is enabled; disabled CP needs no
     # Transformers attention registration dependencies.
     from ...models.hf.attention_backend import ATTENTION_BACKEND

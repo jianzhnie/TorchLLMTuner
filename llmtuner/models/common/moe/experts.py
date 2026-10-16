@@ -23,6 +23,7 @@ instead of E separate ones.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -36,9 +37,21 @@ if TYPE_CHECKING:
     from ....parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
 __all__ = [
+    "ExpertErrorCapture",
     "GroupedExperts",
     "RoutedExperts",
 ]
+
+
+@dataclass
+class ExpertErrorCapture:
+    """Carry a local compute error through FSDP post-forward hooks.
+
+    This opaque object survives input pytree casting by identity. The caller
+    must check error before consuming the returned expert output.
+    """
+
+    error: Exception | None = None
 
 
 class GroupedExperts(nn.Module):
@@ -91,6 +104,36 @@ class GroupedExperts(nn.Module):
         self.w2_EDF = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
 
     def forward(
+        self,
+        x_RD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+        *,
+        error_capture: ExpertErrorCapture | None = None,
+    ) -> torch.Tensor:
+        """Compute experts, optionally deferring a local error until after hooks.
+
+        Only the dispatcher may opt into capture after validating the local
+        compute boundary. The failed output is an unused detached input placeholder:
+        callers must propagate error_capture.error before combine or backward.
+        Pre/post-forward hook errors are outside this compute-only boundary.
+        """
+        if error_capture is None:
+            return self._compute(x_RD, num_tokens_per_expert_E)
+        error_capture.error = None
+        try:
+            if any(
+                type(parameter) not in (torch.Tensor, nn.Parameter)
+                for parameter in self.parameters(recurse=False)
+            ):
+                raise RuntimeError(
+                    "Expert error capture requires materialized local weights"
+                )
+            return self._compute(x_RD, num_tokens_per_expert_E)
+        except Exception as error:
+            error_capture.error = error
+            return x_RD.detach()
+
+    def _compute(
         self,
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,

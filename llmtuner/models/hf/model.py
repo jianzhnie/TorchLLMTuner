@@ -97,7 +97,11 @@ class HFTransformerModel(nn.Module):
         # model and the batch's positions.
         self.uses_dsa = uses_deepseek_sparse_attention(config)
         validate_head_config(config)
-        config._attn_implementation = available_attention_backend()
+        config._attn_implementation = (
+            "eager"
+            if config.model_type == "deepseek_v4"
+            else available_attention_backend()
+        )
         register_attention_backend()
 
         model_cls = resolve_model_class(config)
@@ -297,6 +301,9 @@ class HFTransformerModel(nn.Module):
         This does NOT flatten ``state_dict`` keys: the state dict is built from
         ``_modules``, which still holds everything under ``self.model``, so keys
         keep their ``model.`` prefix. Only the child *iteration* is reshaped.
+        The registered parent follows the standard parts so recursive walkers
+        also discover architecture-specific state. Consumers selecting parts
+        must preserve this structural parent rather than replace it.
         """
         yield "tok_embeddings", self.tok_embeddings
         yield "layers", self.layers
@@ -305,6 +312,10 @@ class HFTransformerModel(nn.Module):
             yield "lm_head", self.lm_head
         if self.rotary_emb is not None:
             yield "rotary_emb", self.rotary_emb
+        # Preserve traversal of architecture-specific parameters and buffers.
+        # FSDP's visited-module set skips the parts already yielded above and
+        # discovers remaining state through its actual registered parent.
+        yield "model", self.model
 
     def _shard_for_cp(
         self,
@@ -733,6 +744,16 @@ class HFTransformerModel(nn.Module):
         if positions is None:
             positions = torch.arange(local_seq_len, device=input_ids.device)
 
+        if self.cp_mesh is not None and self._cp_strategy == "compressor_ulysses":
+            from ...accelerator.collectives import synchronize_local_errors
+
+            with synchronize_local_errors(
+                "HCA CP wrapper input", group=self.cp_mesh.get_group()
+            ):
+                if padding_mask is not None and padding_mask.any():
+                    raise ValueError("HCA CP padding is not yet implemented")
+                if attention_masks is not None:
+                    raise ValueError("HCA CP constructs global causal masks internally")
         kwargs = self._apply_attention(positions, attention_masks)
         if (
             self.cp_mesh is None
@@ -831,6 +852,23 @@ class HFTransformerModel(nn.Module):
         more than the backend, and would hide the packing gap this fallback
         leaves open.
         """
+        if self.cp_mesh is not None and self._cp_strategy == "compressor_ulysses":
+            if attention_masks is not None:
+                raise ValueError("HCA CP constructs global causal masks internally")
+            return {"attention_mask": None}
+
+        if self.cp_mesh is not None and self._cp_strategy == "kcp":
+            if getattr(self.model.config, "attn_mask_type", "causal") != "causal":
+                raise ValueError("KCP does not support packed document attention")
+            if attention_masks is not None:
+                raise ValueError(
+                    "KCP constructs causal masks from local token validity"
+                )
+            # KDA consumes local validity; the MLA Ulysses callable reconstructs
+            # global causality after exchange. A flex BlockMask would bypass
+            # that contract and describe a different query/key layout.
+            return {"attention_mask": None}
+
         if attention_masks is None:
             if self.cp_mesh is None:
                 attention_masks = self.get_attention_masks(positions=positions)

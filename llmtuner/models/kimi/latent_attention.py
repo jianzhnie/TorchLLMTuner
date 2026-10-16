@@ -167,6 +167,8 @@ class KimiLatentAttention(nn.Module):
         past_key_values: Cache | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        if past_key_values is not None and hasattr(self, "_kcp_attention"):
+            raise ValueError("KCP MLA training does not support a KV cache")
         batch_size, seq_length = hidden_states.shape[:-1]
         query_shape = (batch_size, seq_length, -1, self.q_head_dim)
         key_shape = (
@@ -221,6 +223,7 @@ class KimiLatentAttention(nn.Module):
                 self.config._attn_implementation
             ]
 
+        attention_interface = getattr(self, "_kcp_attention", attention_interface)
         attn_output, _ = attention_interface(
             self,
             query_states,

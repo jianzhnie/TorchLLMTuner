@@ -66,7 +66,8 @@ class RNGCheckpointState(Stateful):
         }
         return {self.key: pickle.dumps(state, protocol=4)}
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    def validate_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any] | None:
+        """Validate a saved stream without changing any live generator."""
         if not isinstance(state_dict, dict):
             raise ValueError("RNG checkpoint state must be a dictionary")
         if not state_dict:
@@ -106,6 +107,12 @@ class RNGCheckpointState(Stateful):
         random.Random().setstate(state["python"])
         np.random.RandomState().set_state(state["numpy"])
         torch.Generator().set_state(state["cpu"])
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        state = self.validate_state_dict(state_dict)
+        if state is None:
+            return
         if self.device.type != "cpu":
             module = torch.get_device_module(self.device)
             module.set_rng_state(state["device"], self.device)
