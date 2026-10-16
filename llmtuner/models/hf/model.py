@@ -246,7 +246,7 @@ class HFTransformerModel(nn.Module):
         self._cp_strategy = strategy
 
     @property
-    def tp_plan(self) -> dict[str, str]:
+    def tp_config(self) -> dict[str, str]:
         """HF's TP plan, with patterns rewritten to THIS wrapper's module paths.
 
         HF states its plan relative to the model it ships -- ``layers.*.q_proj``,
@@ -266,17 +266,17 @@ class HFTransformerModel(nn.Module):
         plan rather than an error because "no declared plan" is a real answer:
         ``apply_tp`` then leaves the model replicated instead of guessing.
 
-        Reads the inner model's ``_tp_plan`` first and falls back to its
-        ``tp_plan`` property only when the attribute carries nothing. HF builds
-        the instance ``_tp_plan`` from ``config.base_model_tp_plan`` plus each
+        Reads the inner model's ``_tp_config`` first and falls back to its
+        ``tp_config`` property only when the attribute carries nothing. HF builds
+        the instance ``_tp_config`` from ``config.base_model_tp_config`` plus each
         child module's own plan, which is the TP plan this layer wants; the
-        property additionally switches to ``_ep_plan`` when the config asks for
+        property additionally switches to ``_ep_config`` when the config asks for
         expert parallelism, and those are EP specs, not TP ones. The fallback is
         for a model that exposes the plan through the property alone.
         """
-        plan = getattr(self.model, "_tp_plan", None) or {}
+        plan = getattr(self.model, "_tp_config", None) or {}
         if not plan:
-            plan = getattr(self.model, "tp_plan", None) or {}
+            plan = getattr(self.model, "tp_config", None) or {}
         return {f"model.{pattern}": spec for pattern, spec in plan.items()}
 
     def named_children(self):

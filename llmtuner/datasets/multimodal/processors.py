@@ -19,7 +19,7 @@ import torch
 from ...components.loss import IGNORE_INDEX
 from ...components.tokenizer.multimodal import MultimodalTokenizer
 from ...utils.logging import get_logger
-from ..contracts import DatasetBuildContext, SampleProcessor
+from ..contracts import DatasetBuildContext, SampleProcessor, require_positive_integer
 from .image import calculate_vision_tokens, process_image, resize_to_pixel_budget
 from .placeholders import insert_vision_placeholders
 
@@ -209,7 +209,7 @@ class MultimodalProcessor(SampleProcessor):
         self,
         *,
         context: DatasetBuildContext,
-        sample_processor: Callable[..., dict[str, Any] | None],
+        process_sample: Callable[..., dict[str, Any] | None],
         patch_size: int = 16,
         temporal_patch_size: int = 2,
         spatial_merge_size: int = 2,
@@ -225,11 +225,15 @@ class MultimodalProcessor(SampleProcessor):
         video_min_frames: int = 4,
         video_max_frames: int = 768,
     ) -> None:
-        if min(patch_size, temporal_patch_size, spatial_merge_size) < 1:
-            raise ValueError("multimodal patch sizes must be positive")
+        for name, value in (
+            ("patch_size", patch_size),
+            ("temporal_patch_size", temporal_patch_size),
+            ("spatial_merge_size", spatial_merge_size),
+        ):
+            require_positive_integer(name, value)
         self._max_context_length = context.max_context_length
-        self._sample_processor = partial(
-            sample_processor,
+        self._process_sample = partial(
+            process_sample,
             tokenizer=context.tokenizer,
             patch_size=patch_size,
             temporal_patch_size=temporal_patch_size,
@@ -253,7 +257,7 @@ class MultimodalProcessor(SampleProcessor):
         rng: np.random.Generator,
     ) -> dict[str, Any] | None:
         del rng
-        processed = self._sample_processor(sample=sample)
+        processed = self._process_sample(sample=sample)
         if (
             processed is not None
             and processed["input_ids"].shape[0] > self._max_context_length

@@ -21,7 +21,7 @@ MULTIMODAL_DATASETS: dict[str, SingleDataset] = {
         ),
         processor=partial(
             MultimodalProcessor,
-            sample_processor=process_obelics_sample,
+            process_sample=process_obelics_sample,
         ),
         post_filters=(is_not_none,),
     ),
@@ -32,7 +32,7 @@ MULTIMODAL_DATASETS: dict[str, SingleDataset] = {
         ),
         processor=partial(
             MultimodalProcessor,
-            sample_processor=process_cc12m_sample,
+            process_sample=process_cc12m_sample,
         ),
         post_filters=(is_not_none,),
     ),
@@ -46,7 +46,7 @@ MULTIMODAL_DATASETS: dict[str, SingleDataset] = {
         ),
         processor=partial(
             MultimodalProcessor,
-            sample_processor=process_cc12m_sample,
+            process_sample=process_cc12m_sample,
         ),
         post_filters=(is_not_none,),
     ),

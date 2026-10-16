@@ -45,9 +45,18 @@ class ParallelTopology:
     cp_ulysses: int = 1
     # Cache by axis name(s); DeviceMesh equality is by identity, so reuse the
     # same object instead of re-slicing a submesh on every lookup.
-    _single_axis_meshes: dict[str, DeviceMesh] = field(default_factory=dict)
-    _multi_axis_meshes: dict[tuple[str, ...], DeviceMesh] = field(default_factory=dict)
-    _world_mesh: DeviceMesh | None = None
+    _single_axis_meshes: dict[str, DeviceMesh] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _multi_axis_meshes: dict[tuple[str, ...], DeviceMesh] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _global_meshes: dict[str, DeviceMesh] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _world_mesh: DeviceMesh | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def from_config(
@@ -65,10 +74,10 @@ class ParallelTopology:
             cp_ulysses=parallelism_config.context_parallel_ulysses_size,
         )
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self._validate()
 
-    def _validate(self):
+    def _validate(self) -> None:
         dp_replicate, dp_shard, cp, tp, pp, ep = (
             self.dp_replicate,
             self.dp_shard,
@@ -196,7 +205,7 @@ class ParallelTopology:
             world_mesh: DeviceMesh,
             dim_names: tuple[str, ...],
             dim_sizes: tuple[int, ...],
-        ):
+        ) -> DeviceMesh:
             """Unflatten the world mesh to create the required mesh dimensions.
 
             Keep all axes backed by usable process groups so mesh slicing works
@@ -218,11 +227,11 @@ class ParallelTopology:
         batch = self.dp_replicate * self.dp_shard
         efsdp = self.dp_shard * self.cp * self.tp // self.ep
 
-        self._world_mesh = init_device_mesh(
+        world_mesh = init_device_mesh(
             device_type, (self.world_size,), mesh_dim_names=("world",)
         )
         dataloading_mesh = unflatten_mesh(
-            self._world_mesh,
+            world_mesh,
             ("pp", "batch", "cp", "tp"),
             (self.pp, batch, self.cp, self.tp),
         )
@@ -234,35 +243,35 @@ class ParallelTopology:
         # spmd_dense_mesh_for_fwdbwd (dp, cp, tp) is used for forward/backward
         # typechecking, with dp folding dp_replicate * dp_shard into one axis.
         full_dense_mesh_for_fsdp = unflatten_mesh(
-            self._world_mesh,
+            world_mesh,
             ("pp", "dp_replicate", "dp_shard", "cp", "tp"),
             (self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp),
         )
         full_dense_mesh_for_fwdbwd = unflatten_mesh(
-            self._world_mesh,
+            world_mesh,
             ("pp", "dp", "cp", "tp"),
             (self.pp, batch, self.cp, self.tp),
         )
         spmd_dense_mesh_for_fwdbwd = full_dense_mesh_for_fwdbwd["dp", "cp", "tp"]
 
         full_sparse_mesh = unflatten_mesh(
-            self._world_mesh,
+            world_mesh,
             ("pp", "dp_replicate", "efsdp", "ep"),
             (self.pp, self.dp_replicate, efsdp, self.ep),
         )
 
-        self._global_meshes = {
+        global_meshes = {
             "dataloading": dataloading_mesh,
             "loss": loss_mesh,
             "dense": full_dense_mesh_for_fsdp,
             "sparse": full_sparse_mesh,
         }
-        self._global_meshes["spmd_dense_for_fwdbwd"] = spmd_dense_mesh_for_fwdbwd
+        global_meshes["spmd_dense_for_fwdbwd"] = spmd_dense_mesh_for_fwdbwd
         if self.ep > 1:
-            self._global_meshes["spmd_sparse_for_fwdbwd"] = full_sparse_mesh[
+            global_meshes["spmd_sparse_for_fwdbwd"] = full_sparse_mesh[
                 "dp_replicate", "efsdp", "ep"
             ]
-        self._single_axis_meshes = {
+        single_axis_meshes = {
             "pp": dataloading_mesh["pp"],
             "batch": dataloading_mesh["batch"],
             "loss": loss_mesh,
@@ -274,16 +283,19 @@ class ParallelTopology:
         }
         if self.cp_kv * self.cp_ulysses == self.cp and self.cp > 1:
             cp_axes_mesh = unflatten_mesh(
-                self._world_mesh,
+                world_mesh,
                 ("pp", "batch", "cp_kv", "cp_ulysses", "tp"),
                 (self.pp, batch, self.cp_kv, self.cp_ulysses, self.tp),
             )
-            self._single_axis_meshes["cp_kv"] = cp_axes_mesh["cp_kv"]
-            self._single_axis_meshes["cp_ulysses"] = cp_axes_mesh["cp_ulysses"]
-        self._single_axis_meshes["dp"] = spmd_dense_mesh_for_fwdbwd["dp"]
-        self._single_axis_meshes["dp_shard"] = full_dense_mesh_for_fsdp["dp_shard"]
+            single_axis_meshes["cp_kv"] = cp_axes_mesh["cp_kv"]
+            single_axis_meshes["cp_ulysses"] = cp_axes_mesh["cp_ulysses"]
+        single_axis_meshes["dp"] = spmd_dense_mesh_for_fwdbwd["dp"]
+        single_axis_meshes["dp_shard"] = full_dense_mesh_for_fsdp["dp_shard"]
 
-        self._validate_meshes()
+        self._validate_meshes(single_axis_meshes)
+        self._world_mesh = world_mesh
+        self._global_meshes = global_meshes
+        self._single_axis_meshes = single_axis_meshes
 
         logger.info(
             f"Successfully created meshes with active dimensions: "
@@ -321,10 +333,10 @@ class ParallelTopology:
             sizes["cp_ulysses"] = self.cp_ulysses
         return sizes
 
-    def _validate_meshes(self) -> None:
+    def _validate_meshes(self, meshes: dict[str, DeviceMesh]) -> None:
         """Validate that created meshes have the expected sizes."""
         for mesh_name, expected_size in self._expected_mesh_sizes().items():
-            actual_size = self._single_axis_meshes[mesh_name].size()
+            actual_size = meshes[mesh_name].size()
             assert actual_size == expected_size, (
                 f"Mesh '{mesh_name}' has unexpected size: "
                 f"expected {expected_size}, got {actual_size}"
@@ -357,11 +369,13 @@ class ParallelTopology:
         Raises:
             ValueError: If the requested dimension name(s) is not valid.
         """
-        if not self._single_axis_meshes:
-            self.build_device_mesh()
-
         if isinstance(dims, str):
             dims = [dims]
+        if not dims or len(set(dims)) != len(dims):
+            raise ValueError("mesh dimensions must be nonempty and unique")
+
+        if not self._single_axis_meshes:
+            self.build_device_mesh()
 
         for mesh_name in dims:
             if mesh_name not in self._single_axis_meshes:
