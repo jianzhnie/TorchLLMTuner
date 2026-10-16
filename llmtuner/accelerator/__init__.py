@@ -6,8 +6,8 @@ Members:
 * ``device.py`` -- llmtuner's backend-neutral device module (NPU/CUDA/MLU/MUSA
   discovery, distributed-backend selection, per-vendor predicates).
 * ``collectives.py`` -- PG timeouts (``set_pg_timeouts``), the in-place
-  ``all_reduce`` used for loss/token denominators, and EP-aware
-  ``clip_grad_norm_``.
+  ``all_reduce`` used for loss/token denominators, forward SUM with identity
+  backward via ``PartialToInvariantAllReduce``, and EP-aware ``clip_grad_norm_``.
 * ``spmd.py`` -- the ambient SPMD mesh context (TLS mesh stack and
   by-name process-group queries) that trainer and ``models/common`` read.
 * ``distributed.py`` -- process-group bootstrap and rank/world queries, vendored

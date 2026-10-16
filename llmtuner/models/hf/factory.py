@@ -9,6 +9,7 @@ which imports these helpers; nothing here imports the model body.
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from transformers import AutoConfig
@@ -25,6 +26,8 @@ if TYPE_CHECKING:
 __all__ = [
     "build_model_config",
     "build_model_config_for",
+    "resolve_model_class",
+    "unwrap_text_config",
 ]
 
 
@@ -40,10 +43,16 @@ def build_model_config(
     empty dict to use architecture defaults. ``None`` loads the config from a
     local checkpoint directory or Hub identifier.
     """
-    overrides = dict(arch_overrides or {})
+    # Some HF composite constructors modify nested configuration dictionaries.
+    overrides = deepcopy(arch_overrides) if arch_overrides is not None else {}
     if arch_overrides is not None:
         overrides.setdefault("max_position_embeddings", seq_len)
-        return AutoConfig.for_model(model_name_or_path, **overrides)
+        config = AutoConfig.for_model(model_name_or_path, **overrides)
+        if hasattr(config, "text_config"):
+            config.text_config.max_position_embeddings = max(
+                config.text_config.max_position_embeddings, seq_len
+            )
+        return config
 
     config = AutoConfig.from_pretrained(model_name_or_path)
     text_config = getattr(config, "text_config", config)
@@ -54,35 +63,16 @@ def build_model_config(
 
 
 def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
-    """Build the model config for a training run.
+    """Build architecture and runtime settings for a training run.
 
-    A thin adapter over :func:`build_model_config`: it maps the run's config onto
-    the explicit ``(name, seq_len, arch_overrides)`` that function takes, and
-    handles the offline case where the name is a bare architecture ("llama")
-    rather than a hub id ("org/name"). Offline, the explicit sizes in ``cfg`` are
-    authoritative, so they become the overrides; otherwise the Hub's own config
-    wins and the overrides are empty.
+    Registered architecture names use offline construction with explicit model
+    sizes and ``arch_overrides``. Hub IDs and existing checkpoint paths keep
+    their saved architecture; only the supported sequence length is extended.
 
-    ``cfg.arch_overrides`` rides along on top of the explicit sizes, and exists
-    because those sizes are only the dense-decoder six: an MoE or an MLA
-    attention has fields -- ``n_routed_experts``, ``q_lora_rank`` -- that
-    ``ModelConfig`` names nowhere, and a model built without them silently gets
-    the architecture's own defaults (DeepSeek V3 asks for 256 experts). Same
-    offline-only rule as the sizes: a hub id or a local checkpoint directory
-    carries its own config, and overriding its architecture by hand is the one
-    thing that would make the built model disagree with the weights it loads.
-
-    It also sets ``attn_mask_type``, which is derived rather than configured. Any
-    real corpus is packed -- ``datasets/loader_builder.py`` always runs the samples
-    through ``ConcatThenSplitPackingConfig`` -- so a row holds several documents
-    and attention must not cross a boundary between them. The synthetic random
-    corpus is one document per row, where the document mask is a no-op.
-
-    Left unset, ``attn_mask_type`` falls back to ``"causal"`` at the mask site.
-    That is correct on a CPU/sdpa run only because the wrapper's packed-sequence
-    guard raises first, and silently wrong on the flex path, where a causal-only
-    mod attends across document boundaries without complaint. Deriving it here
-    means the flag cannot disagree with the corpus the trainer loaded.
+    Derive the attention mask from the dataloader's packing policy. Multiple
+    documents require block-causal attention; synthetic data and one-document
+    rows use ordinary causality. Forward the requested experts implementation
+    and lm-head compute dtype for validation during model construction.
     """
     # Only registered architecture names select offline construction. Missing
     # paths and Hub IDs belong to from_pretrained, which owns their validation.
@@ -132,15 +122,8 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
         return config
     text_config = config.text_config
     text_config._attn_implementation = ATTENTION_BACKEND
-    # ``build_model_config_for`` derives ``attn_mask_type`` and sets it on the
-    # TOP config, but the model class is built from this sub-config and every
-    # reader of that flag -- the packed guard, the mask builder, and
-    # ``apply_cp``'s ulysses check -- reads ``self.model.config``. Left on the
-    # top config it is invisible on a composite model: a packed corpus would
-    # train with a causal-only mask (attention straight across document
-    # boundaries), and the ulysses packed refusal would never fire. Carrying it
-    # down here is what keeps "which corpus did the trainer load" answerable
-    # from the object that actually runs.
+    # Runtime settings originate on the composite config. The text model must
+    # see the same mask policy and kernels after unwrapping.
     for name in ("attn_mask_type", "experts_implementation", "compute_dtype"):
         if hasattr(config, name):
             setattr(text_config, name, getattr(config, name))
@@ -169,7 +152,7 @@ def resolve_model_class(config: PretrainedConfig) -> type[PreTrainedModel]:
     )
 
     for name in (config.architectures or []) + [
-        MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get(getattr(config, "model_type", ""), "")
+        MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get(getattr(config, "model_type", ""), ""),
     ]:
         if not name:
             continue

@@ -6,6 +6,9 @@ Main modules:
   hub id or local checkpoint) and resolves the ``ForCausalLM`` class.
 * ``materialization.py`` -- allocates meta model storage after parallelism,
   rebuilds runtime buffers, and restores shared parameter and buffer aliases.
+* ``model_setup.py`` -- validates attention heads and experts kernels, resolves
+  decoder submodule names, and applies the optional lm-head dtype cast.
+* ``attention_backend.py`` -- selects and registers the HF attention adapter.
 * ``model.py`` -- ``HFTransformerModel``: the five-part contract
   (``tok_embeddings`` / ``layers`` / ``norm`` / ``lm_head`` / ``rotary_emb``),
   the packed-document attention wiring, and the forward the trainer calls.

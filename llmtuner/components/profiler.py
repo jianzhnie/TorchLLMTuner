@@ -1,47 +1,12 @@
-"""Kineto traces and allocator memory snapshots, over one training run.
+"""Training traces and allocator snapshots, adapted from torchtitan.
 
-Vendored from torchtitan's ``observability/profiler.py``. The shape is kept: a
-``Profiler`` that is entered once around the training loop and stepped once per
-iteration, owning a torch profiler for traces and a ``MemoryProfiler`` for
-periodic snapshots, plus the OOM path that forces a final snapshot before the
-process dies.
+Enter ``Profiler`` around the training loop and call ``step`` after each
+iteration. It owns trace collection, periodic snapshots, and an OOM snapshot
+on exit. Trace activities follow the resolved device: CPU plus CUDA or XPU
+when selected; other devices collect CPU traces. Allocator history uses
+``utils/monitoring`` and unavailable history disables snapshot output.
 
-The memory side is the part worth having even when traces are off: a run that
-OOMs at step 400 leaves no evidence of what the allocator was holding, and the
-exit snapshot is what answers that.
-
-Departures from torchtitan, each a subtraction or a device-portability fix:
-
-* **No ``structured_logger``.** The ``log_trace_span`` wrappers around
-  ``profiler.step()`` go with it, which llmtuner does not have; a profiler step is
-  already the finest thing the trace shows.
-
-* **No ``active()`` builder.** torchtitan splits ``build`` (returns a configured
-  profiler) from ``active`` (supplies the runtime step and folder), because a
-  config there has to be buildable with no arguments. llmtuner constructs the
-  ``Profiler`` where the trainer knows both, so they collapse into the
-  constructor.
-
-* **No CUDA-graph annotations.** Those annotate a trace with the module FQNs
-  captured inside ``torch.cuda.graph`` regions. llmtuner does not capture CUDA
-  graphs, so ``get_cudagraph_annotations`` could only ever return an empty dict
-  and the version probe around ``export_chrome_trace`` guards a branch that
-  cannot be taken.
-
-* **The trace activities follow the resolved device.** ``cuda`` adds
-  ``ProfilerActivity.CUDA`` and ``xpu`` adds ``ProfilerActivity.XPU``, which is
-  upstream's branch pair; every other resolved device (``npu``, ``mlu``,
-  ``musa``, ``cpu``) traces CPU work only, exactly as upstream does. This reads
-  the device from ``accelerator/device.py`` rather than probing
-  ``torch.cuda.is_available()``/``torch.xpu.is_available()``, so the trace
-  describes the device the run is actually on.
-
-* **Memory history is recorded through the device module, not ``torch``.** See
-  ``utils/monitoring.record_memory_history`` -- torchtitan's non-CUDA
-  branch calls ``torch.memory``, which does not exist.
-
-One addition: the rank comes from ``utils/logging``, so a single-process
-run has a rank without a process group, the same way metrics does it.
+Upstream sources and adaptation details are in ``docs/llmtuner_upstream_map.md``.
 """
 
 from __future__ import annotations
@@ -195,8 +160,8 @@ class Profiler:
         self._config = config
         self._global_step = global_step
         self._base_folder = base_folder
-        self.torch_profiler = None
-        self.memory_profiler = None
+        self.torch_profiler: torch.profiler.profile | None = None
+        self.memory_profiler: MemoryProfiler | None = None
         self._entered = False
         self._used = False
 
@@ -253,7 +218,7 @@ class Profiler:
         if self.memory_profiler is not None:
             self.memory_profiler.step()
 
-    def build_torch_profiler(self):
+    def build_torch_profiler(self) -> torch.profiler.profile | None:
         """Create, start, and return the torch profiler, or ``None`` if off.
 
         Entered here rather than by the caller so the returned handle is
@@ -329,7 +294,7 @@ class Profiler:
         torch_profiler.__enter__()
         return torch_profiler
 
-    def build_memory_profiler(self):
+    def build_memory_profiler(self) -> MemoryProfiler | None:
         """Create a :class:`MemoryProfiler`, or ``None`` if snapshots are off.
 
         Its constructor starts recording immediately; that is why this is built

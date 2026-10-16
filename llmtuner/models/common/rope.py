@@ -29,7 +29,6 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 
-from ...accelerator.capabilities import is_compiling
 from ...config.rope_config import RoPEConfig
 
 __all__ = [
@@ -37,23 +36,6 @@ __all__ = [
     "CosSinRoPE",
     "RoPE",
 ]
-
-
-# TODO: This is an async bounds check rather than a host-side comparison so it
-# does not force a device sync. It is a no-op under torch.compile, where the
-# position range is already guaranteed by the BlockMask.
-def maybe_check_max_pos(positions: torch.Tensor, *, max_valid_pos: int) -> None:
-    """Assert every position fits the cache, without syncing device to host.
-
-    Uses ``torch._assert_async`` so the failure surfaces at a later kernel
-    launch instead of blocking on a ``.item()`` call.
-    """
-    if is_compiling():
-        return
-    torch._assert_async(
-        torch.all((positions >= 0) & (positions <= max_valid_pos)),
-        f"position_ids must be in [0, {max_valid_pos}]",
-    )
 
 
 def yarn_inv_freq(
@@ -230,11 +212,7 @@ class ComplexRoPE(RoPE):
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return the complex cache shaped ``(T, 1, dim / 2)`` for broadcast."""
-        if positions is not None:
-            maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
-        # Half the width: each complex value covers a pair of real dimensions.
-        complex_query_shape = (*query.shape[:-1], query.shape[-1] // 2)
-        return reshape_for_broadcast(self.cache, complex_query_shape, positions)
+        return reshape_for_broadcast(self.cache, query.shape[0], positions=positions)
 
     @staticmethod
     def apply_rotary_emb(
@@ -309,9 +287,7 @@ class CosSinRoPE(RoPE):
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return the cos/sin cache shaped ``(T, 1, dim * 2)`` for broadcast."""
-        if positions is not None:
-            maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
-        return reshape_for_broadcast(self.cache, query.shape, positions)
+        return reshape_for_broadcast(self.cache, query.shape[0], positions=positions)
 
     @staticmethod
     def apply_rotary_emb(
@@ -346,7 +322,8 @@ class CosSinRoPE(RoPE):
 
 def reshape_for_broadcast(
     rope_cache: torch.Tensor,
-    query_shape: torch.Size | tuple[int, ...],
+    num_tokens: int,
+    *,
     positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reshape a RoPE cache for broadcasting with query/key tensors.
@@ -356,9 +333,24 @@ def reshape_for_broadcast(
     multiplies every head identically.
     """
     cache_width = rope_cache.shape[-1]
-    num_tokens = query_shape[0]
     if positions is None:
+        if num_tokens > rope_cache.shape[0]:
+            raise ValueError(
+                f"RoPE token count {num_tokens} exceeds cache capacity "
+                f"{rope_cache.shape[0]}"
+            )
         rope_cache = rope_cache[:num_tokens]
     else:
+        if positions.ndim != 1 or positions.shape[0] != num_tokens:
+            raise ValueError(f"RoPE positions must have shape ({num_tokens},)")
+        if positions.dtype not in (torch.int32, torch.int64):
+            raise TypeError("RoPE positions must have int32 or int64 dtype")
+        max_valid_pos = rope_cache.shape[0] - 1
+        # This standalone helper cannot assume the caller built a BlockMask.
+        # Keep the asynchronous bounds assertion in compiled graphs too.
+        torch._assert_async(
+            torch.all((positions >= 0) & (positions <= max_valid_pos)),
+            f"position_ids must be in [0, {max_valid_pos}]",
+        )
         rope_cache = rope_cache[positions]
     return rope_cache.view(num_tokens, 1, cache_width)

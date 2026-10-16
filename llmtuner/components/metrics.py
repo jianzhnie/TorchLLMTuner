@@ -389,8 +389,8 @@ class MetricsProcessor:
             config whose geometry it cannot read -- suppresses MFU rather than
             reporting ``0.00%``; ``tflops`` is then ``0.0`` of its own accord.
         config_dict: the full job config, handed to wandb. Only wandb reads it.
-        tag: prefix applied to every recorded key, so two runs can share one
-            project or event directory. The console line is not tagged.
+        tag: optional override for ``config.tag``, applied to recorded keys.
+            ``None`` uses the config value; the console line is not tagged.
     """
 
     def __init__(
@@ -421,7 +421,7 @@ class MetricsProcessor:
             dump_folder=dump_folder,
             pp_schedule=pp_schedule,
             config_dict=config_dict,
-            tag=tag,
+            tag=config.tag if tag is None else tag,
         )
         try:
             self.device_memory_monitor = build_device_memory_monitor()

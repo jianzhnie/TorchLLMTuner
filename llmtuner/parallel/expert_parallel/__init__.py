@@ -5,6 +5,7 @@ layouts, ``block_conversion.py`` constructs native MoE blocks,
 ``model_replacement.py`` replaces them in a complete model, and
 ``checkpointing.py`` converts expert checkpoint state. ``token_dispatch.py``
 implements local and distributed token dispatch and combine operations.
+``torchao_dispatch.py`` adds the optional TorchAO padding adapter.
 
 Public symbols are loaded on request; importing a supporting module does not
 load the runtime entry or optional communication kernels.

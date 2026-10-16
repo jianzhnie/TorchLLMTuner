@@ -27,7 +27,10 @@ class LRSchedulerConfig:
 
     warmup_steps: int = field(
         default=0,
-        metadata={"help": "Steps to linearly ramp the learning rate from 0."},
+        metadata={
+            "help": "Linear warmup steps. The first update uses base_lr / "
+            "warmup_steps; 0 disables warmup."
+        },
     )
     total_steps: int | None = field(
         default=None,

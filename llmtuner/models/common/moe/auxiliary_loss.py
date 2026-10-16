@@ -20,34 +20,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from llmtuner.accelerator.collectives import all_reduce
+from llmtuner.accelerator.collectives import PartialToInvariantAllReduce
 from llmtuner.accelerator.spmd import spmd_mesh_group, spmd_sparse_mesh
 
 from ..aux_loss import AuxLoss
 
 __all__ = ["MicrobatchWiseLoadBalanceLoss"]
-
-
-class PartialToInvariantAllReduce(torch.autograd.Function):
-    """All-reduce in forward, identity in backward (Partial -> Invariant).
-
-    The reduced sum is identical on every rank of the group, and every rank
-    computes the same downstream loss from it, so the gradient of that loss
-    w.r.t. one rank's partial equals the gradient w.r.t. the sum itself
-    (``d sum / d partial = 1``). ``torch.distributed.nn.all_reduce`` instead
-    all-reduces on the backward too, summing every rank's identical gradient
-    and multiplying what reaches the router by the group size.
-    """
-
-    @staticmethod
-    def forward(ctx, partial_E, group):  # pyrefly: ignore[bad-override]
-        reduced_E = partial_E.clone()
-        all_reduce(reduced_E, group=group)
-        return reduced_E
-
-    @staticmethod
-    def backward(ctx, grad_out):  # pyrefly: ignore[bad-override]
-        return grad_out, None
 
 
 class MicrobatchWiseLoadBalanceLoss(AuxLoss):

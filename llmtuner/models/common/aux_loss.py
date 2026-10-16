@@ -1,29 +1,14 @@
-"""Auxiliary-loss gradient injection and distributed metric collection.
+"""Auxiliary-loss gradient injection and metrics, adapted from torchtitan.
 
-Vendored from torchtitan ``models/common/aux_loss.py``. What changed:
+``AuxLoss`` scales gradients by the configured coefficient and the step's
+global routed-token count, including masked prompts and excluding padding.
+Forward calls accumulate local metrics; an optimizer pre-hook rolls these
+into per-group registers. Collection sums over each group's mesh and PP stages,
+then divides by the build-time instance count to report the mean over layers.
 
-* The ``Module`` protocol and its ``Config`` carrier are gone; ``AuxLoss``
-  takes its coefficients as keyword args, and ``_init_self_buffers`` (a
-  meta-device build hook) is dropped.
-* ``torch_remat`` is optional. Region AC marks the accumulation and injection
-  as a retained region; full/selective AC suppress the replayed metric write
-  through their checkpoint recompute context.
-* The ``spmd_types`` blocks are gone. ``spmd_assert_type`` on the injection's
-  output described a placement the framework already inferred.
-* ``OptimizersContainer`` becomes a plain ``torch.optim.Optimizer`` (llmtuner's
-  trainer owns one directly) and ``ParallelTopology`` is llmtuner's.
-
-Design, unchanged from upstream:
-
-Normalization: every auxiliary loss is scaled by the step's global routed-token
-count (``set_step_denominator``), including masked prompt tokens but excluding
-padding. The per-step metric is the mean over loss instances (layers) of that
-scaled value, summed over
-data-parallel ranks and pipeline stages.
-
-The metric accumulates during the model forward. A step pre-hook rolls the
-per-instance accumulators into ``group_acc`` registers, and
-``collect_aux_loss_metrics`` reduces those for logging.
+Full/selective activation checkpoint replay suppresses metric writes. Region
+checkpointing may retain the accumulation and injection through torch_remat.
+Upstream sources and adaptations are in ``docs/llmtuner_upstream_map.md``.
 """
 
 from __future__ import annotations
@@ -41,17 +26,13 @@ from torch.distributed._functional_collectives import all_reduce
 from llmtuner.accelerator.device import device_type
 
 if TYPE_CHECKING:
-    # Annotation-only: ``ParallelTopology`` appears in two signatures below and
-    # nowhere at runtime. Importing it eagerly would form a cycle --
-    # ``parallel/__init__`` -> ``expert_parallel`` -> ``moe/load_balance`` ->
-    # here -- which is entered whenever a model module is imported before
-    # ``llmtuner.parallel``.
+    # Keep model import independent of the parallel package's initialization.
     from llmtuner.parallel.topology import ParallelTopology
 
 __all__ = [
     "AuxLoss",
     "collect_aux_loss_metrics",
-    "register_aux_loss_zero_hook",
+    "register_aux_loss_metrics_hook",
 ]
 
 # Non-reentrant activation checkpointing replays the forward during backward.
@@ -117,7 +98,7 @@ class AuxLoss(nn.Module):
 
     # Per metric group (``(reduce_mesh, metric_name)``): this rank's total value
     # for the current step, rolled up from the per-instance ``instance_acc``
-    # buffers by ``zero_aux_losses`` at each optimizer step pre-hook and
+    # buffers by ``rollup_aux_loss_metrics`` at each optimizer step pre-hook and
     # reduced by ``collect_aux_loss_metrics`` at log time. Cleared at the next
     # pre-hook.
     group_acc: ClassVar[dict[tuple[str, str], torch.Tensor]] = {}
@@ -128,7 +109,7 @@ class AuxLoss(nn.Module):
         self.reduce_mesh = reduce_mesh
         # Per-instance accumulator: the sum of this loss instance's scaled
         # per-microbatch values over the current training step. Filled in the
-        # forward; rolled into ``group_acc`` and zeroed by ``zero_aux_losses``
+        # forward; rolled into ``group_acc`` and zeroed by ``rollup_aux_loss_metrics``
         # at each optimizer step pre-hook. Non-persistent: it is scratch, and
         # a checkpoint resuming mid-step should not restore a partial sum.
         self.register_buffer(
@@ -211,7 +192,7 @@ class AuxLoss(nn.Module):
         return AuxLossInjection.apply(carrier, injected)
 
 
-def zero_aux_losses(model_parts: Sequence[nn.Module]) -> None:
+def rollup_aux_loss_metrics(model_parts: Sequence[nn.Module]) -> None:
     """Roll per-instance ``instance_acc`` into ``group_acc`` and clear them.
 
     Optimizer step pre-hook. Each metric group is summed once per model part
@@ -240,18 +221,13 @@ def collect_aux_loss_metrics(parallel_dims: ParallelTopology) -> dict[str, float
 
     pp_mesh = parallel_dims.get_optional_mesh("pp")
 
-    def _group_acc_or_zero(key: tuple[str, str]) -> torch.Tensor:
-        value = AuxLoss.group_acc.get(key)
-        if value is not None:
-            return value
-        # Ranks that own no instance of this group still join the collectives
-        # below with a zero contribution.
-        return torch.zeros((), dtype=torch.float32, device=device_type)
-
-    group_accs = {key: _group_acc_or_zero(key) for key in AuxLoss._group_counts}
     metrics = {}
-    for key, total in sorted(group_accs.items()):
+    for key, count in sorted(AuxLoss._group_counts.items()):
         mesh_name, tag = key
+        total = AuxLoss.group_acc.get(key)
+        if total is None:
+            # A stage with no local instance still joins every collective.
+            total = torch.zeros((), dtype=torch.float32, device=device_type)
         reduce_mesh = parallel_dims.get_optional_mesh(mesh_name)
         for mesh in (reduce_mesh, pp_mesh):
             if mesh is None:
@@ -262,11 +238,11 @@ def collect_aux_loss_metrics(parallel_dims: ParallelTopology) -> dict[str, float
             # build-time instance count below (identical on every rank) then
             # gives the mean over all layers.
             total = all_reduce(total, reduceOp="sum", group=mesh)
-        metrics[f"{tag}/mean"] = float(total.item()) / AuxLoss._group_counts[key]
+        metrics[f"{tag}/mean"] = float(total.item()) / count
     return metrics
 
 
-def register_aux_loss_zero_hook(
+def register_aux_loss_metrics_hook(
     optimizer: torch.optim.Optimizer,
     *,
     model_parts: Sequence[nn.Module],
@@ -278,5 +254,5 @@ def register_aux_loss_zero_hook(
     """
     tracked_parts = tuple(model_parts)
     optimizer.register_step_pre_hook(
-        lambda *args, **kwargs: zero_aux_losses(tracked_parts)
+        lambda *args, **kwargs: rollup_aux_loss_metrics(tracked_parts)
     )

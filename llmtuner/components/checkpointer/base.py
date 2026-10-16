@@ -245,7 +245,7 @@ class BaseCheckpointManager(ABC):
         logger.info("Loading the checkpoint from %s.", resolved.checkpoint_id)
         begin = time.monotonic()
         self._load_checkpoint(
-            self._states_to_load(resolved.model_only),
+            self._states_to_load(model_only=resolved.model_only),
             resolved.checkpoint_id,
             from_hf=resolved.from_hf,
             from_quantized=resolved.from_quantized,
@@ -450,7 +450,7 @@ class BaseCheckpointManager(ABC):
     ) -> None:
         """Restore ``states`` from a resolved checkpoint source."""
 
-    def _states_to_load(self, model_only: bool) -> dict[str, Any]:
+    def _states_to_load(self, *, model_only: bool) -> dict[str, Any]:
         """Select the live state objects that must be restored."""
         if model_only:
             return {MODEL: self.states[MODEL]}
@@ -570,7 +570,7 @@ class BaseCheckpointManager(ABC):
                 saving_dirnames.add(f"{staging_dir_prefix}step-{saving_step}")
 
             staging_pattern = (
-                re.compile(rf"{re.escape(staging_dir_prefix)}step-(0|[1-9]\d*)")
+                re.compile(rf"{re.escape(staging_dir_prefix)}{self._STEP_DIR_PATTERN}")
                 if staging_dir_prefix
                 else None
             )

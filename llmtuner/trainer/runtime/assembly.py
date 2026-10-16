@@ -36,7 +36,7 @@ from ...components.metrics import MetricsProcessor
 from ...components.optimizer.ema import EMA
 from ...components.optimizer.lr_scheduler import build_lr_scheduler
 from ...components.optimizer.optimizer import OptimizersContainer
-from ...models.common.aux_loss import register_aux_loss_zero_hook
+from ...models.common.aux_loss import register_aux_loss_metrics_hook
 from ...models.common.moe.bias_update import (
     register_moe_balancing_hook,
 )
@@ -72,13 +72,7 @@ def _build_model(
     parallelism is applied, so the load sees the sharded layout).
     """
     cfg = trainer.cfg
-    #
-    # Chunked loss + PP is rejected up front: under PP the last stage's
-    # loss is computed inside the schedule
-    # (``pipeline_parallel/pipeline_parallel.py:scalar_loss_fn``), which receives logits
-    # from the stage forward. Rewiring that seam for hidden states plus a
-    # per-chunk backward is a PP-side change, so the combination loud-raises
-    # here rather than training on a silently un-chunked (or wrong) loss.
+    # PP schedules consume logits; chunked loss requires a hidden-state path.
     trainer._chunked_loss_num_chunks = cfg.training.chunked_loss_num_chunks
     if (
         trainer._chunked_loss_num_chunks > 1
@@ -162,27 +156,15 @@ def _build_optimizer_stack(trainer: Trainer) -> None:
         cfg.optimizer, model_parts=trainer.model_parts
     )
 
-    # The lr schedule. Built regardless of whether the knobs were touched:
-    # the default is warmup_steps=0 with no decay, so the factor is a
-    # constant 1.0 and step 1 runs at exactly ``cfg.lr``. That costs one
-    # multiply per step and removes the branch that would otherwise decide
-    # whether the lr is scheduled -- a branch whose two sides would have to
-    # be kept numerically identical forever.
-    #
-    # Handed the *inner* optimizers, not the container: a LambdaLR reads
-    # ``lr`` off its optimizer's param groups, and the container's own
-    # groups carry none (they are the merged parameter view). This is why
-    # the scheduler is a container too.
+    # LambdaLR needs the inner optimizers' learning rates; the container exposes
+    # only a merged parameter view. The default schedule keeps the rate constant.
     trainer.lr_scheduler = build_lr_scheduler(
         cfg.lr_scheduler_config,
         optimizers=list(trainer.optimizer),
         training_steps=cfg.steps,
     )
 
-    # The weight EMA, a sibling of the optimizer rather than part of it:
-    # stepped explicitly in ``train_step`` after the real update, and
-    # registered with the checkpointer under its own ``ema`` key. Built
-    # only when configured -- None costs nothing.
+    # EMA runs after the optimizer update and has its own checkpoint state.
     ema_config = cfg.training.ema
     trainer.ema = (
         EMA(
@@ -198,15 +180,9 @@ def _build_optimizer_stack(trainer: Trainer) -> None:
         else None
     )
 
-    # Aux losses (the MoE load-balance loss a swapped-in MoE carries)
-    # accumulate per forward; this pre-hook rolls the per-instance sums
-    # into the step registers at each optimizer step. Harmless when no
-    # aux loss exists.
-    #
-    # Registered on the container, so it fires once per step() call --
-    # not once per inner optimizer, which is what a loop over the inner
-    # optimizers would give under pipeline parallelism.
-    register_aux_loss_zero_hook(trainer.optimizer, model_parts=trainer.model_parts)
+    # Container hooks run once per training step, including with multiple PP
+    # optimizers. Collect accumulated auxiliary losses and apply MoE balancing.
+    register_aux_loss_metrics_hook(trainer.optimizer, model_parts=trainer.model_parts)
     # Select one balancing policy and register one container-level pre-hook.
     register_moe_balancing_hook(
         trainer.optimizer,
@@ -275,13 +251,8 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
             training_dataset=cfg.dataloader.dataset,
         )
 
-    # Deterministic seeding BEFORE model build so ranks sharing an SPMD
-    # group build identical initial weights -- the precondition for
-    # bit-exact DP comparisons. Pipeline stages hold different layers, so
-    # seeding every stage identically would correlate their initialization;
-    # under PP each stage offsets the base seed by its stage rank (the
-    # upstream distinct_seed_mesh_dims=["pp"] semantics), while ranks at
-    # the same stage keep the base seed.
+    # Seed before model construction. PP stages use distinct seeds; ranks
+    # sharing a stage retain identical initialization.
     seed = cfg.seed
     if trainer.parallel_dims is not None and trainer.parallel_dims.pp_enabled:
         pp_mesh = trainer.parallel_dims.get_optional_mesh("pp")
@@ -296,16 +267,8 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
         f"{device_type}:{trainer.local_rank}" if device_type != "cpu" else "cpu"
     )
 
-    # Select the dense mesh. ``parallel_dims``
-    #    is the same resolved degrees the mesh was built from, kept so the
-    #    trainer can ask "how many DP ranks?" without re-indexing the mesh.
+    # PP needs the dense mesh for this stage, which covers only its ranks.
     if trainer.parallel_dims is not None and trainer.parallel_dims.pp_enabled:
-        # The dense (dp, cp, tp) mesh does not cover the world under PP,
-        # so ``build_device_mesh``'s coverage backstop would reject it. The same
-        # view over this rank's non-PP coordinates exists per stage and is
-        # what the per-part apply_* functions index (parallelize
-        # resolves it off parallel_dims itself); keep the attribute
-        # consistent.
         trainer.mesh = trainer.parallel_dims.spmd_dense_mesh()
     else:
         trainer.mesh = build_device_mesh(trainer.parallel_dims)
@@ -315,8 +278,7 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
     _apply_parallelism(trainer, model, load_hf_weights=load_hf_weights)
     _build_optimizer_stack(trainer)
 
-    # Build the micro-batch source before the checkpointer, which
-    #    serializes its read position alongside the model.
+    # The checkpointer captures the loader cursor alongside model state.
     trainer.dataloader = trainer.build_dataloader()
 
     # Counters the checkpoint carries. Kept as plain ints so a resumed run
@@ -326,14 +288,7 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
 
     _build_checkpointer(trainer, hf_model_config)
 
-    # Metrics need the mesh (for the throughput
-    #    divisor and the metrics rank) and the model config (for FLOPs per
-    #    token). It replaces the plain per-step ``logger.info`` the loop used
-    #    to emit: the same loss and grad_norm, plus throughput, MFU and
-    #    memory, and the frequency is now one knob instead of two.
-    #
-    #    FLOPs use the already resolved HF geometry, so metrics describe the
-    #    model built above without loading its configuration a second time.
+    # Metrics use the resolved topology and HF geometry of the model built above.
     trainer.metrics = MetricsProcessor(
         cfg.metrics,
         parallel_dims=trainer.parallel_dims,
@@ -342,7 +297,6 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
         num_flops_per_token=flops_per_token(
             unwrap_text_config(hf_model_config), seq_len=cfg.max_seq_len
         ),
-        tag=cfg.metrics.tag,
     )
     # The trainer synchronizes PP loss metrics to every stage before logging.
     logging_utils.set_log_ranks(cfg.metrics.log_ranks)

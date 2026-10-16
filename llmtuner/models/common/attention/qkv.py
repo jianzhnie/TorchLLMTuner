@@ -1,31 +1,17 @@
-"""Fused QKV projection and the head-split helper.
+"""Fused QKV projection with checkpoint conversion for separate projections.
 
-Vendored from torchtitan ``models/common/attention.py``. Only these two pieces
-came across: the rest of that module is a family of attention implementations
-that would duplicate the HF models llmtuner wraps. What was removed here:
+Adapted from torchtitan ``models/common/attention.py``. The output is grouped
+by KV head: each group contains its query heads followed by one K and one V
+head. Leading input dimensions are preserved; local_head_split reshapes the
+trailing projection dimension without communication.
 
-* the ``Module`` protocol and its ``Config`` -- ``QKVLinear`` takes its sizes as
-  keyword args, and ``linear`` is a plain ``nn.Linear`` (a ``nn.Linear`` plus a
-  ``Config`` adds nothing, so llmtuner uses the module directly).
-* the ``spmd.local_map`` / ``spmd.assert_type`` decorations and the
-  ``spmd.local()`` blocks -- type-checker annotations with no runtime effect.
-  ``local_head_split`` documented a sharding contract; that is now prose rather
-  than an assertion, since ``spmd_types`` is not wired into llmtuner's forward
-  path.
+QKVLinear accepts an existing projection module so callers control its dtype,
+bias and sharding. TP subclasses override _project to fuse communication with
+the projection while sharing the grouped output split.
 
-Why fuse Q, K and V into one projection: three separate GEMMs of the same input
-become one, which cuts kernel launches and gives the TP sharding a single tensor
-to split. The ``R`` dimension below is ``heads_per_kv + 2`` -- one K head and one
-V head per KV group alongside its Q heads -- so the fused layout stays grouped by
-KV head.
-
-Why the checkpoint hooks: external checkpoints (HF among them) store separate
-``wq``/``wk``/``wv`` tensors, so the fused parameter has to present itself under
-those names on save and accept them on load. Without this an HP-format
-checkpoint would not load at all.
-
-Shape legend, scoped to this file: ``T`` = tokens, ``D`` = model dimension,
-``H`` = head dimension, ``R`` = heads-per-KV-group + 2.
+State-dict hooks convert fused wqkv weight/bias to logical wq/wk/wv keys on
+save and merge those keys on load. DTensor conversion gathers replicated
+weights before reshaping by KV group.
 """
 
 from __future__ import annotations

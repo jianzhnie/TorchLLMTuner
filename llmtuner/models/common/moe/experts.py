@@ -39,19 +39,7 @@ __all__ = [
     "DominoRoutedExperts",
     "GroupedExperts",
     "RoutedExperts",
-    "grouped_mm_available",
 ]
-
-
-def grouped_mm_available() -> bool:
-    """Whether ``torch._grouped_mm`` can run here.
-
-    The probe (run the op once on a real-shaped dummy -- a version or device
-    test would be wrong on both counts) lives in the capability registry as
-    ``torch_grouped_mm``; this wrapper keeps the local name the constructor
-    and the tests use.
-    """
-    return has("torch_grouped_mm")
 
 
 class GroupedExperts(nn.Module):
@@ -84,7 +72,7 @@ class GroupedExperts(nn.Module):
         self.hidden_dim = hidden_dim
         self.dim = dim
         self.use_grouped_mm = (
-            grouped_mm_available() if use_grouped_mm is None else use_grouped_mm
+            has("torch_grouped_mm") if use_grouped_mm is None else use_grouped_mm
         )
         self.activation_fn = activation_fn if activation_fn is not None else SwiGLU()
 
@@ -105,8 +93,34 @@ class GroupedExperts(nn.Module):
 
         ``x_RD`` holds each expert's tokens contiguously, in expert order -- the
         dispatcher's job is to produce that layout. ``num_tokens_per_expert_E``
-        gives the per-expert counts that delimit the segments.
+        gives nonnegative integer segment lengths whose sum must cover all rows.
         """
+        if x_RD.ndim != 2 or x_RD.shape[1] != self.dim:
+            raise ValueError(
+                f"Expert inputs must have shape (routed_tokens, {self.dim}), "
+                f"got {tuple(x_RD.shape)}"
+            )
+        if num_tokens_per_expert_E.shape != (self.num_experts,):
+            raise ValueError(
+                f"Expert token counts must have shape ({self.num_experts},), "
+                f"got {tuple(num_tokens_per_expert_E.shape)}"
+            )
+        if num_tokens_per_expert_E.dtype not in (
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        ):
+            raise TypeError("Expert token counts must use an integer dtype")
+        torch._assert_async(
+            (num_tokens_per_expert_E >= 0).all(),
+            "Expert token counts must be nonnegative",
+        )
+        torch._assert_async(
+            num_tokens_per_expert_E.sum() == x_RD.shape[0],
+            "Expert token counts must sum to the number of routed tokens",
+        )
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
 
         gate_RF = self._grouped_mm(x_RD, self.w1_EFD, offsets_E)

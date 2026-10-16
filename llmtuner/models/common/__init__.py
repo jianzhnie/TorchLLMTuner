@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from .aux_loss import (
         AuxLoss,
         collect_aux_loss_metrics,
-        register_aux_loss_zero_hook,
+        register_aux_loss_metrics_hook,
     )
     from .feed_forward import (
         FeedForward,
@@ -66,7 +66,7 @@ _EXPORT_SOURCES = {
     "MicrobatchWiseLoadBalanceLoss": "moe.auxiliary_loss",
     "MoE": "moe.layer",
     "QKVLinear": "attention.qkv",
-    "register_aux_loss_zero_hook": "aux_loss",
+    "register_aux_loss_metrics_hook": "aux_loss",
     "RoPE": "rope",
     "RouterGateLinear": "moe.gate",
     "SigmoidGatedFeedForward": "feed_forward",
@@ -88,7 +88,7 @@ __all__ = [
     "MicrobatchWiseLoadBalanceLoss",
     "MoE",
     "QKVLinear",
-    "register_aux_loss_zero_hook",
+    "register_aux_loss_metrics_hook",
     "RoPE",
     "RouterGateLinear",
     "SigmoidGatedFeedForward",

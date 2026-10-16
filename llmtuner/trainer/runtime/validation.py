@@ -145,21 +145,11 @@ def check_validation_feasibility(
     training_dataset: str,
     chunked_loss_num_chunks: int = 1,
 ) -> None:
-    """Reject the validation configurations that cannot terminate cleanly.
+    """Reject infeasible validation before models and loaders are built.
 
-    Runs at trainer build time, where the real parallel degrees are known
-    (config-level ``__post_init__`` cannot see them: ``dp_shard`` defaults
-    to the derive-me marker ``-1``). Each rejected combination would
-    otherwise fail later and worse (chunked loss x validation refuses first:
-    the pass scores full logits, so a model that only fits with chunked
-    training would OOM on its first eval):
-
-    * ``steps=-1`` consumes the finite dataset once, so every rank stops
-      when its own shard is exhausted. With DP > 1 the ranks can exhaust at
-      different iterations and hang on the pass's collectives (the token
-      and loss reductions every rank must enter together).
-    * ``steps=-1`` against the synthetic corpus has no exhaustion at all:
-      the random source is infinite, so "one finite pass" never ends.
+    Chunked training loss cannot use this full-logits evaluation path. A finite
+    pass (``steps=-1``) requires DP=1 to avoid unequal shard exhaustion, and a
+    real corpus because the synthetic random source never ends.
     """
     if chunked_loss_num_chunks > 1:
         compatibility.chunked_loss_validation(chunked_loss_num_chunks)
@@ -185,30 +175,15 @@ def should_validate(self: Trainer, step: int) -> bool:
 
 @torch.no_grad()
 def validate(self: Trainer, step: int) -> None:
-    """Run one eval-mode, gradient-free pass and log its loss.
+    """Evaluate without gradients, restoring model modes and mask policy.
 
-    The reported number is the pass's summed next-token cross-entropy
-    divided by the *global* valid-token count -- the same normalization as
-    the training loss, over the same two meshes (tokens reduced across DP,
-    the loss sum across the dp*cp*tp ``loss`` view), so the eval and train
-    numbers are directly comparable and identical on every rank.
+    Report summed next-token cross-entropy divided by the global valid-token
+    count, using the same DP token and loss-mesh reductions as training. Only
+    the last PP stage reports. Optimizer, scheduler, and training token counters
+    are unchanged; the temporary loader is closed after each pass.
 
-    The pass is a pure observer: the model runs in eval mode (each module's
-    original mode is restored afterwards, even on error), no gradients are computed, no
-    optimizer or scheduler state moves, and ``ntokens_seen`` -- the
-    checkpointed training counter -- is not touched.
-
-    The dataloader is built fresh per pass and closed when the pass ends:
-    it is a temporary read over the corpus, not training state, so it is
-    neither checkpointed nor shared with the training loader. ``steps=-1``
-    reads it to exhaustion (built with repeat=False); a positive ``steps``
-    bounds the pass (built repeating, so the bound is always reachable).
-
-    Two outcomes are loud errors rather than a silently skipped report: a
-    pass that read zero batches (the dataset supplied less than one batch
-    of tokens on this rank, which concat-then-split packing turns into no
-    rows at all), and a pass over zero valid tokens (every label masked),
-    which has no average to report.
+    ``steps=-1`` reads a finite corpus once; positive steps use a repeating
+    loader. Empty passes and passes without valid tokens raise explicit errors.
     """
     validation = self.cfg.validation
     assert validation is not None, "validate() is gated by should_validate"

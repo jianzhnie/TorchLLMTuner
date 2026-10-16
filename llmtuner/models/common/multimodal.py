@@ -1,9 +1,8 @@
 """Model-agnostic vision-to-text fusion for VLMs.
 
-Vendored from torchtitan ``models/common/multimodal.py``. The only removal is a
-pair of ``spmd_types`` calls in ``gather_vision_embeds`` (``spmd.local()`` and an
-``is_type_checking()`` assertion) -- type-checker annotations with no runtime
-effect, describing a placement the framework already inferred.
+Adapted from torchtitan ``models/common/multimodal.py``. Gather omits upstream
+``spmd_types`` annotations; span scatter checks the total feature count before
+writing into the input embeddings.
 
 Two fusion strategies are supported, and they are not interchangeable:
 
@@ -150,6 +149,13 @@ def scatter_vision_embeds(
             the packed vision output holds, which would mean the two streams
             disagree about how much vision there is.
     """
+    expected_tokens = sum(num_tokens for _, _, num_tokens in vision_positions)
+    if expected_tokens != vision_embeds.shape[0]:
+        raise ValueError(
+            f"Vision placeholder runs consume {expected_tokens} embeddings but "
+            f"the packed vision output contains {vision_embeds.shape[0]}."
+        )
+
     vision_offset = 0
     for _, vision_start, num_tokens in vision_positions:
         inputs_embeds[vision_start : vision_start + num_tokens] = vision_embeds[
@@ -157,9 +163,4 @@ def scatter_vision_embeds(
         ].to(inputs_embeds.dtype)
         vision_offset += num_tokens
 
-    if vision_offset != vision_embeds.shape[0]:
-        raise ValueError(
-            f"Vision placeholder runs consume {vision_offset} embeddings but "
-            f"the packed vision output contains {vision_embeds.shape[0]}."
-        )
     return inputs_embeds

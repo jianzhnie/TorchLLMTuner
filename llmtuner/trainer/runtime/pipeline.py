@@ -14,7 +14,7 @@ import torch
 from ...accelerator.capabilities import has as capability
 from ...accelerator.spmd import spmd_context
 from ...components.loss import IGNORE_INDEX
-from ...datasets.contracts import Batch, TrainerBatch
+from ...datasets.contracts import Batch, TrainerBatch, require_positive_integer
 from ...parallel import compatibility
 
 if TYPE_CHECKING:
@@ -36,18 +36,45 @@ def split_pipeline_microbatches(
     """Split whole rows for PP without cutting packed document boundaries.
 
     A single microbatch keeps every tensor intact: packed media patches and
-    coordinate axes do not share the labels' leading dimension.
+    coordinate axes do not share the labels' leading dimension. Multiple
+    microbatches require every non-scalar tensor to use the same leading row
+    dimension; layouts needing media-aware slicing must be prepared separately.
     """
+    require_positive_integer("num_pp_microbatches", num_microbatches)
     labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
+    expected_ranks = (2,) if isinstance(batch, Batch) else (1, 2)
+    if labels.ndim not in expected_ranks:
+        raise ValueError(
+            f"Pipeline batch labels must have rank in {expected_ranks}, "
+            f"got shape {tuple(labels.shape)}"
+        )
     if isinstance(batch, dict) and labels.ndim == 1 and num_microbatches > 1:
         compatibility.pp_packed_microbatch_split(num_microbatches)
-    if num_microbatches < 1 or labels.shape[0] % num_microbatches != 0:
+    if labels.shape[0] % num_microbatches != 0:
         raise ValueError(
             "Pipeline batch rows must be divisible by num_pp_microbatches: "
             f"got {labels.shape[0]} rows and {num_microbatches} microbatches"
         )
     if labels.shape[0] == 0:
         raise ValueError("Pipeline batches must contain at least one row")
+    if num_microbatches > 1:
+        fields = (
+            {"input_ids": batch.input_ids, "labels": labels}
+            if isinstance(batch, Batch)
+            else batch
+        )
+        for name, value in fields.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim > 0
+                and value.shape[0] != labels.shape[0]
+            ):
+                raise ValueError(
+                    f"Pipeline batch field {name!r} has {value.shape[0]} leading "
+                    f"entries, but labels have {labels.shape[0]} rows; multiple "
+                    "microbatches require row-aligned tensors. Use one "
+                    "microbatch for packed media or coordinate layouts."
+                )
     if isinstance(batch, dict):
         rows_per_microbatch = labels.shape[0] // num_microbatches
         microbatches = []

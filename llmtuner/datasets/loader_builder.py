@@ -161,31 +161,26 @@ def build_dataloader(
     repeat: bool = True,
     dataset: str | None = None,
 ) -> BaseDataLoader:
-    """Build the loader a :class:`~llmtuner.config.LLMTunerConfig` names.
+    """Build a checkpointable loader for this rank's data ownership.
 
-    The config answers everything that describes the *run*; the keyword
-    arguments answer the things it cannot. ``config.dataloader`` (a
-    ``DataloaderConfig``) names the corpus and how to shuffle, tokenize and pack
-    it, while the flat view on the same object supplies the scalars that go with
-    it -- ``seed``, ``vocab_size``, ``global_batch_size``, ``max_seq_len``.
+    Args:
+        config: dataset, tokenization, packing, and run geometry.
+        dp_rank: rank within the data-parallel group; PP stages in one pipeline
+            use the same coordinates so they read the same batch.
+        dp_world_size: number of independent data shards.
+        num_tokens_per_batch: token budget per rank. Text PP divides this budget
+            among independently packed microbatch rows before runtime splitting.
+            Random data derives its row count from config.global_batch_size.
+        repeat: repeat corpus data indefinitely when true. False builds a finite
+            corpus loader only with dp_world_size=1; distributed exhaustion is
+            not coordinated. Random data remains infinite regardless of repeat.
+        dataset: optional recipe override, used for held-out validation data
+            without changing config.dataloader.dataset.
 
-    ``dp_rank``/``dp_world_size`` say which slice of the corpus this process
-    reads, and ``num_tokens_per_batch`` is the per-rank token count, matching
-    torchtitan's ``num_tokens_per_microbatch_per_dp_rank``. The Grain loader
-    divides every dataset's rows among ``dp_world_size`` ranks and hands each
-    one exactly that many tokens. Under pipeline parallelism, text packing uses
-    the per-microbatch budget, then groups independently packed rows into one
-    schedule step. Thus no document context is cut by runtime microbatching.
-    The DP slice the trainer used to perform
-    no longer exists on this path. (The synthetic ``random`` corpus is the
-    exception: it is generated per rank from ``global_batch_size`` and does
-    not read ``num_tokens_per_batch``.)
-
-    ``repeat=False`` builds a finite, single-pass loader -- the validation
-    loop's shape: a bounded pass sets it so exhaustion (not a step count) ends
-    the pass. ``dataset`` overrides ``config.dataloader.dataset`` for that same
-    caller, so validation can score a held-out corpus without forking the
-    config. Both default to the training behaviour.
+    Synthetic data bypasses tokenizer and packing setup. Corpus loaders resolve
+    a text or multimodal recipe, construct its tokenizer and packing graph, then
+    bind the corresponding collator. Multimodal packing uses whole documents
+    and does not use the text packing selector or PP row grouping.
     """
     validate_dp_coordinates(dp_rank=dp_rank, dp_world_size=dp_world_size)
     dataloader_config = config.dataloader

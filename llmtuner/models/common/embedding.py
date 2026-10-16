@@ -9,9 +9,10 @@ dim (``Shard(0)`` on ``tok_embeddings``), HF's plain ``nn.Embedding.forward``
 would index into a *local* weight with *global* token ids. This override applies
 the vocab offset from ``vocab_shard_bounds`` (the same shard-bound formula the
 vocab-parallel loss uses) and masks the ids outside the local
-range, so each rank gathers its own shard and the partial results sum to the full
-embedding (the mask zeroes the ranks that hold no matching row). On a mesh with no
-TP group it falls back to plain ``F.embedding``.
+range, so each rank looks up its own shard and returns a partial embedding
+(the mask zeroes tokens owned by other ranks). The caller must sum these partial
+results across TP ranks to obtain the full embedding; this module performs no
+collective. On a mesh with no TP group it falls back to plain ``F.embedding``.
 
 """
 
@@ -31,15 +32,14 @@ __all__ = ["VocabParallelEmbedding"]
 class VocabParallelEmbedding(nn.Embedding):
     """nn.Embedding with optional local vocab-parallel execution.
 
-    NOTE: currently unused. It pairs with a TP-sharded embedding weight (the
-    ``Shard(0)`` on ``tok_embeddings``), but the TP path is not wired up, so
-    nothing constructs it and the plain HF embedding is what runs. Whoever wires
-    TP needs to swap it in, or the local weight will be indexed with global token
-    ids.
+    The active TP path requires a local vocabulary-sharded weight while
+    ``num_embeddings`` records the global vocabulary size. Its output is this
+    rank's partial contribution, requiring caller-owned reduction. The HF TP
+    engine does not automatically install this standalone component.
     """
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Run vocab-parallel embedding when the active mesh has a TP group."""
+        """Return a local contribution under TP, or a full ordinary embedding."""
         tp_group = spmd_mesh_group("tp")
         if tp_group is None:
             return F.embedding(
@@ -65,6 +65,10 @@ class VocabParallelEmbedding(nn.Embedding):
                 "VocabParallelEmbedding requires a local vocabulary shard of "
                 f"shape {expected_shape}, got {tuple(self.weight.shape)}"
             )
+        torch._assert_async(
+            ((input >= 0) & (input < self.num_embeddings)).all(),
+            "VocabParallelEmbedding token IDs must lie within the global vocabulary",
+        )
         mask = (input >= offset) & (input < offset + self.weight.shape[0])
         # Exclude foreign tokens from the lookup itself. Masking only the
         # output would still count clamped foreign IDs in scale_grad_by_freq
