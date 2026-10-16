@@ -1,7 +1,10 @@
 """Activation checkpointing: recompute each decoder layer during backward.
 
 Vendored in shape from torchtitan's ``distributed/activation_checkpoint.py``.
-All four of its policies are ported:
+Full and region policies follow upstream; selective and memory-budget modes
+retain earlier upstream implementations. Current torchtitan SelectiveAC uses a
+RegionAC preset, while this module intentionally keeps per-op SAC (see
+``docs/llmtuner_upstream_map.md``):
 
 * ``"full"`` (upstream ``FullAC``) wraps each decoder layer in torch's
   non-reentrant ``checkpoint_wrapper``, so a forward keeps only the layer's

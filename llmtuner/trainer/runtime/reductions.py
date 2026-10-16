@@ -18,10 +18,10 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class TrainingReductionMeshes:
-    dp: DeviceMesh | None
-    pp: DeviceMesh | None
-    loss: DeviceMesh | None
-    sequence: DeviceMesh | None
+    dp_mesh: DeviceMesh | None
+    pp_mesh: DeviceMesh | None
+    loss_mesh: DeviceMesh | None
+    sequence_mesh: DeviceMesh | None
 
 
 def resolve_loss_reduction_meshes(
@@ -51,11 +51,14 @@ def resolve_training_reduction_meshes(
         )
         if enabled
     ]
+    sequence_mesh = (
+        parallel_dims.get_optional_mesh(sequence_axes) if sequence_axes else None
+    )
+    if sequence_mesh is not None and len(sequence_axes) > 1:
+        sequence_mesh = sequence_mesh._flatten("sequence_loss")
     return TrainingReductionMeshes(
-        dp=dp_mesh,
-        pp=parallel_dims.get_optional_mesh("pp"),
-        loss=loss_mesh,
-        sequence=(
-            parallel_dims.get_optional_mesh(sequence_axes) if sequence_axes else None
-        ),
+        dp_mesh=dp_mesh,
+        pp_mesh=parallel_dims.get_optional_mesh("pp"),
+        loss_mesh=loss_mesh,
+        sequence_mesh=sequence_mesh,
     )

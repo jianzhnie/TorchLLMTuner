@@ -530,7 +530,7 @@ class Trainer:
         # loss shard upstream does not have.
         parallel_dims = self.parallel_dims
         reduction_meshes = resolve_training_reduction_meshes(parallel_dims)
-        dp_mesh = reduction_meshes.dp
+        dp_mesh = reduction_meshes.dp_mesh
 
         # Read the whole step's data up front. The denominator must be known
         # before the first forward (the loss divides by it there), so every
@@ -680,8 +680,8 @@ class Trainer:
         before the optimizer step and returns only ``grad_norm`` (already
         world-reduced by ``clip_grad_norm_``).
         """
-        pp_mesh = reduction_meshes.pp
-        loss_mesh = reduction_meshes.loss
+        pp_mesh = reduction_meshes.pp_mesh
+        loss_mesh = reduction_meshes.loss_mesh
         parameters = [p for part in self.model_parts for p in part.parameters()]
         expert_parameters = [
             p
@@ -760,12 +760,12 @@ class Trainer:
         Every collective here is unconditional (see the comment at the loss
         reduction): ranks enter them regardless of what their own shard saw.
         """
-        dp_mesh = reduction_meshes.dp
-        pp_mesh = reduction_meshes.pp
-        loss_mesh = reduction_meshes.loss
+        dp_mesh = reduction_meshes.dp_mesh
+        pp_mesh = reduction_meshes.pp_mesh
+        loss_mesh = reduction_meshes.loss_mesh
         # CP/TP hold disjoint slices of the same DP batch; restore the complete
         # local loss before computing the worst per-DP-rank average.
-        sequence_mesh = reduction_meshes.sequence
+        sequence_mesh = reduction_meshes.sequence_mesh
         # Only the last stage computes CE. Other stages carry a finite
         # sentinel for the step check; it must not enter reported metrics.
         if pp_mesh is not None and not self.pp_has_last_stage:

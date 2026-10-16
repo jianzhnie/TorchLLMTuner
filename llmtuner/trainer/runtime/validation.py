@@ -81,12 +81,15 @@ def count_validation_batch_tokens(
     from the unsharded batch, exactly as in training, so the dp-axis reduction
     counts the whole batch once even when CP later slices the sequence.
     """
-    labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
-    self.metrics.add_tokens(labels.numel())
-    local_valid_tokens = self.count_valid_tokens(batch)
-    global_valid_tokens = torch.tensor(
-        local_valid_tokens, dtype=torch.int64, device=self.device
-    )
+    # Counting and metric updates are local and may fail on only one rank.
+    # Agree on success before any peer enters the DP token collective.
+    with synchronize_local_errors("Validation token accounting"):
+        labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
+        self.metrics.add_tokens(labels.numel())
+        local_valid_tokens = self.count_valid_tokens(batch)
+        global_valid_tokens = torch.tensor(
+            local_valid_tokens, dtype=torch.int64, device=self.device
+        )
     if dp_mesh is not None:
         all_reduce(global_valid_tokens, group=dp_mesh.get_group())
     return global_valid_tokens
