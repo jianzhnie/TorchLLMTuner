@@ -25,7 +25,13 @@ from .contracts import (
     require_positive_integer,
 )
 
-__all__ = ["Collator", "CollatorFactory", "HAS_PIN_MEMORY", "TextCollator"]
+__all__ = [
+    "Collator",
+    "CollatorFactory",
+    "HAS_PIN_MEMORY",
+    "PipelineTextCollator",
+    "TextCollator",
+]
 
 
 # Page-locked batches let the trainer issue an async host-to-device copy; a copy
@@ -53,7 +59,7 @@ class CollatorFactory(Protocol):
 
 
 class TextCollator(Collator):
-    """Packs text rows into one page-locked, pre-padded token batch."""
+    """Pack text rows into a padded batch, pinning memory when supported."""
 
     def __init__(self, *, context: DatasetBuildContext) -> None:
         self._num_tokens_per_batch = context.num_tokens_per_batch

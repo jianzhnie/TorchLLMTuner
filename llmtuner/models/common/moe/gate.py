@@ -88,7 +88,7 @@ class RouterGateLinear(nn.Linear):
             bias-free projection the HF MoE blocks ship.
     """
 
-    def __init__(self, dim: int, num_experts: int, bias: bool = False) -> None:
+    def __init__(self, dim: int, num_experts: int, *, bias: bool = False) -> None:
         super().__init__(dim, num_experts, bias=bias)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:

@@ -66,8 +66,15 @@ class GroupedExperts(nn.Module):
         use_grouped_mm: bool | None = None,
     ) -> None:
         super().__init__()
-        if min(dim, hidden_dim, num_experts) < 1:
-            raise ValueError("dim, hidden_dim and num_experts must be positive")
+        for name, value in (
+            ("dim", dim),
+            ("hidden_dim", hidden_dim),
+            ("num_experts", num_experts),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be positive integer, got {value!r}")
+        if use_grouped_mm is not None and not isinstance(use_grouped_mm, bool):
+            raise TypeError("use_grouped_mm must be bool or None")
         self.num_experts = num_experts
         self.hidden_dim = hidden_dim
         self.dim = dim
@@ -134,30 +141,14 @@ class GroupedExperts(nn.Module):
         weight_EOI: torch.Tensor,
         offsets_E: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute ``x @ weight_EOI.transpose(-2, -1)`` per expert.
+        """Project contiguous token segments with each expert's weight.
 
-        ``offsets_E`` contains the cumulative segment ends (length ``E``),
-        so segment ``e`` spans ``offsets_E[e-1] : offsets_E[e]`` -- exactly what
-        ``torch._grouped_mm`` expects. Expert 0 starts at offset zero.
+        ``offsets_E`` contains cumulative segment ends; expert zero starts at
+        zero. BF16 activations use torch._grouped_mm when enabled. Other dtypes
+        use per-expert F.linear to avoid reducing their precision to BF16.
 
-        Two implementations sit behind this one call:
-
-        * ``torch._grouped_mm`` -- one kernel for all experts, the shape
-          torchtitan's MoE is written against, and the one taken whenever the op
-          is available (``use_grouped_mm``) *and* the activations are already
-          bf16.
-        * a per-expert loop of ``F.linear`` -- the fallback. It is the *same*
-          arithmetic HF's own MoE does (v5's ``Qwen3MoeExperts.forward`` also
-          loops with ``nn.functional.linear``), which is what makes a swapped-in
-          MoE checkable against the HF block it replaced, and it keeps the
-          input dtype.
-
-        The dtype gate is not a nicety. ``torch._grouped_mm`` is bf16-only, so
-        on an fp32 or fp64 model the fused path would round every expert input
-        and weight to 8 mantissa bits: measured 1.4e-1 relative error on fp32
-        and 1.3e0 on fp64, silently, which is exactly the class of change a
-        numeric baseline cannot see. FP16 also has more mantissa bits than
-        BF16, so it uses the loop instead of losing precision in this cast.
+        Empty input still runs an empty linear operation to retain the input
+        and weight gradient paths required by distributed dispatch backward.
         """
         if x_TD.shape[0] == 0:
             # A rank with no expert tokens must still traverse dispatch in
@@ -251,14 +242,19 @@ class DominoRoutedExperts(RoutedExperts):
         del num_local_tokens_per_expert_E
         if x_TD.shape[0] < 2:
             raise ValueError("Domino dispatcher requires at least two tokens")
-        boundaries = (x_TD.shape[0] + 1) // 2
+        split_at = (x_TD.shape[0] + 1) // 2
         outputs: list[torch.Tensor] = []
-        for token_slice in (slice(0, boundaries), slice(boundaries, None)):
-            x = x_TD[token_slice]
-            scores = topk_scores_TK[token_slice]
-            expert_ids = topk_expert_ids_TK[token_slice]
-            counts = torch.bincount(
-                expert_ids.reshape(-1), minlength=self.token_dispatcher.num_experts
+        for token_slice in (slice(0, split_at), slice(split_at, None)):
+            slice_input_TD = x_TD[token_slice]
+            slice_scores_TK = topk_scores_TK[token_slice]
+            slice_expert_ids_TK = topk_expert_ids_TK[token_slice]
+            slice_counts_E = torch.bincount(
+                slice_expert_ids_TK.reshape(-1),
+                minlength=self.token_dispatcher.num_experts,
             )
-            outputs.append(super().forward(x, scores, expert_ids, counts))
+            outputs.append(
+                super().forward(
+                    slice_input_TD, slice_scores_TK, slice_expert_ids_TK, slice_counts_E
+                )
+            )
         return torch.cat(outputs, dim=0)

@@ -54,15 +54,12 @@ class MultimodalTokenizer(HuggingFaceTokenizer):
             "pad": pad_token,
         }
 
-        added_tokens = self.tokenizer.get_added_tokens_decoder()
-        token_to_id = {tok.content: tok_id for tok_id, tok in added_tokens.items()}
-
         for name, token_str in tokens.items():
-            if token_str not in token_to_id:
+            token_id = self.token_to_id(token_str)
+            if token_id is None:
                 raise ValueError(
                     f"Special token '{token_str}' ({name}_token) "
-                    f"not found in tokenizer at '{tokenizer_path}'. "
-                    f"Available added tokens: {list(token_to_id.keys())}"
+                    f"not found in tokenizer at '{tokenizer_path}'."
                 )
             setattr(self, f"{name}_token", token_str)
-            setattr(self, f"{name}_id", token_to_id[token_str])
+            setattr(self, f"{name}_id", token_id)

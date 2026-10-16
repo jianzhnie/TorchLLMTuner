@@ -50,7 +50,7 @@ def module_name_matches(module_name: str, *, pattern: str) -> bool:
 
 
 def resolve_module_patterns(
-    module_names: list[str], patterns: list[str], *, plan_name: str
+    module_names: list[str], *, patterns: list[str], plan_name: str
 ) -> set[str]:
     """Resolve patterns and reject typos that would otherwise be silent."""
     selected: set[str] = set()

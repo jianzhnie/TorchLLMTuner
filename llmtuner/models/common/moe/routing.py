@@ -71,8 +71,17 @@ class TokenChoiceTopKRouter(nn.Module):
         _debug_force_load_balance: bool = False,
     ) -> None:
         super().__init__()
-        if num_experts < 1 or dim < 1:
-            raise ValueError("num_experts and dim must be positive")
+        for name, value in (
+            ("num_experts", num_experts),
+            ("dim", dim),
+            ("top_k", top_k),
+            ("num_expert_groups", num_expert_groups),
+            ("num_limited_groups", num_limited_groups),
+        ):
+            if value is None and name in ("num_expert_groups", "num_limited_groups"):
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be positive integer, got {value!r}")
         if not 1 <= top_k <= num_experts:
             raise ValueError("top_k must be in [1, num_experts]")
         if score_func not in ("sigmoid", "softmax", "sqrtsoftplus"):
@@ -80,14 +89,10 @@ class TokenChoiceTopKRouter(nn.Module):
         if num_expert_groups is None and num_limited_groups is not None:
             raise ValueError("num_limited_groups requires num_expert_groups")
         if num_expert_groups is not None:
-            if num_expert_groups < 1:
-                raise ValueError("num_expert_groups must be positive")
             if num_limited_groups is None:
                 raise ValueError(
                     "num_limited_groups must be set when num_expert_groups is set"
                 )
-            if num_limited_groups < 1:
-                raise ValueError("num_limited_groups must be positive")
             if num_limited_groups > num_expert_groups:
                 raise ValueError(
                     f"num_limited_groups ({num_limited_groups}) cannot exceed "
@@ -107,7 +112,7 @@ class TokenChoiceTopKRouter(nn.Module):
                 )
             if top_k > num_limited_groups * (num_experts // num_expert_groups):
                 raise ValueError("top_k exceeds the selected expert groups' capacity")
-        self.gate = RouterGateLinear(dim, num_experts)
+        self.gate = RouterGateLinear(dim=dim, num_experts=num_experts)
         self.num_experts = num_experts
         self.top_k = top_k
         self.score_func = score_func
@@ -348,15 +353,17 @@ class QuantileBalancedTopKRouter(TokenChoiceTopKRouter):
         aux_loss: AuxLoss | None = None,
     ) -> None:
         super().__init__(
-            num_experts,
-            dim,
-            top_k,
+            num_experts=num_experts,
+            dim=dim,
+            top_k=top_k,
             score_func="sigmoid",
             route_norm=route_norm,
             route_scale=route_scale,
             aux_loss=aux_loss,
         )
-        self.quantile_balancer = QuantileBalancer(num_experts, top_k, num_bins)
+        self.quantile_balancer = QuantileBalancer(
+            num_experts=num_experts, top_k=top_k, num_bins=num_bins
+        )
 
     def _select_experts(
         self,
@@ -410,12 +417,17 @@ class QuantileBalancer(nn.Module):
 
     def __init__(self, num_experts: int, top_k: int, num_bins: int) -> None:
         super().__init__()
+        for name, value in (
+            ("num_experts", num_experts),
+            ("top_k", top_k),
+            ("num_bins", num_bins),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be positive integer, got {value!r}")
         if not 0 < top_k < num_experts:
             raise ValueError(
                 f"top_k ({top_k}) must be between zero and num_experts ({num_experts})"
             )
-        if num_bins < 1:
-            raise ValueError(f"num_bins must be positive, got {num_bins}")
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_bins = num_bins

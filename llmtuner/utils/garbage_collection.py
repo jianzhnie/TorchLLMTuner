@@ -1,14 +1,8 @@
-"""A GC helper for the training loop and the checkpointer.
+"""Schedule cyclic garbage collection at explicit training boundaries.
 
-Vendored from torchtitan's ``tools/utils.py`` (the ``GarbageCollection`` class
-only). It exists because CPython's cyclic collector is costly to run over a
-process holding a multi-gigabyte object graph, and the default schedule fires at
-unpredictable times -- often in the middle of a forward. torchtitan disables it
-outright and collects at points the training loop chooses instead.
-
-``collect`` is the piece the checkpointer needs: a save allocates a lot of
-transient host memory (staging buffers, flattened state dicts), and dropping the
-previous step's garbage before allocating more measurably reduces peak RSS.
+Adapted from torchtitan's ``tools/utils.py``. Disable automatic collection while
+the helper is active and restore its previous state on close or setup failure.
+The checkpointer also uses ``collect`` before allocating staging buffers.
 """
 
 from __future__ import annotations
@@ -18,9 +12,6 @@ import time
 
 from .logging import get_logger
 
-# ``get_logger``, not a bare ``logging.getLogger``: without the handler this
-# module's installer attaches, the collection notices are emitted and then
-# dropped, which is indistinguishable from the collector never running.
 logger = get_logger(__name__)
 
 
@@ -48,9 +39,9 @@ class GarbageCollection:
             if debug:
                 from torch.utils.viz._cycles import warn_tensor_cycles
 
-                from ..accelerator import distributed
+                from ..accelerator.distributed import is_main_process
 
-                if distributed.is_main_process():
+                if is_main_process():
                     warn_tensor_cycles()
         except BaseException:
             self.close()

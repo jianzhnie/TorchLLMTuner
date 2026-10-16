@@ -216,11 +216,6 @@ def build_dataloader(
         raise ValueError("token batch must be divisible by num_pp_microbatches")
     packing_tokens_per_batch = num_tokens_per_batch // num_microbatches
 
-    # Imported here, not at module scope: building the tokenizer pulls in
-    # ``tokenizers``/``jinja2``, and a random-token run should not have to
-    # have them installed.
-    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
-
     if is_multimodal:
         # Resolved before the tokenizer is constructed, so a bad name fails
         # fast without loading tokenizer assets.
@@ -243,6 +238,9 @@ def build_dataloader(
         # ``--packing``: that selector names a text recipe, and the media path
         # ignores it.
     else:
+        # Keep tokenizer dependencies out of the synthetic-data path.
+        from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+
         tokenizer = HuggingFaceTokenizer(
             tokenizer_path=dataloader_config.tokenizer_path
         )

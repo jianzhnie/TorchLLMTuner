@@ -19,6 +19,7 @@ from __future__ import annotations
 import glob
 import json
 from array import array
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, runtime_checkable
@@ -69,9 +70,8 @@ class IndexedJsonlSource:
 class IndexedJsonlDataSource:
     """The offset index :func:`build_source` builds for an ``IndexedJsonlSource``.
 
-    Separate from the source so the index is built once per ``build_source()``
-    call and not carried around in a dataclass that is compared and hashed as
-    configuration.
+    Keep file scanning out of the inert source description. Each build creates
+    one index containing file IDs and byte offsets, without retaining row data.
     """
 
     def __init__(self, patterns: tuple[str, ...]) -> None:
@@ -167,20 +167,12 @@ def build_source(
     *,
     iteration_policy: DatasetIterationPolicy,
 ) -> RandomAccessDataSource | grain.IterDataset:
-    """Resolve ``source`` into something Grain can read.
+    """Build a source description or return an already readable source.
 
-    A source slot takes either a description -- one of the three classes above --
-    or something already built. The second form is the escape hatch for a caller
-    that has its own random-access object or a Grain stream in hand: there is no
-    ``build()`` to override any more, so without it every source would have to be
-    one of the three, and the tests that hold raw rows in memory would have to
-    write themselves a JSONL file first.
-
-    The policy argument is passed by every caller but read only by the streaming
-    source. The others ignore it deliberately: they are random-access, and the DP
-    slice is taken later, after the shuffle, by
-    :func:`~llmtuner.datasets.composition.build_dataset`. Sharding here as well would
-    drop rows.
+    JSONL and materialized HF sources are sharded after global shuffle by the
+    composition layer. HF streams use the iteration policy to shard before
+    window shuffle and to control repetition. Built random-access sources and
+    Grain streams pass through unchanged.
     """
     if isinstance(source, IndexedJsonlSource):
         return IndexedJsonlDataSource(source.patterns)
@@ -232,9 +224,7 @@ def build_source(
             "dataset source cannot be a string or bytes; use IndexedJsonlSource "
             "or a Hugging Face source description for dataset paths"
         )
-    if isinstance(source, RandomAccessDataSource) or isinstance(
-        source, grain.IterDataset
-    ):
+    if isinstance(source, RandomAccessDataSource | grain.IterDataset):
         return source
     raise TypeError(f"unhandled source type {type(source).__qualname__}")
 
@@ -262,7 +252,8 @@ class HuggingFaceStreamingIterDataset(grain.IterDataset):
 
     def __iter__(self) -> grain.DatasetIterator:
         return HuggingFaceCursorIterator(
-            self._dataset,
+            # HF stores progress on the dataset; each Grain cursor must own it.
+            deepcopy(self._dataset),
             repeat=self._repeat,
             shuffle=self._shuffle,
         )
@@ -291,7 +282,12 @@ def file_patterns_to_paths(patterns: tuple[str, ...]) -> tuple[str, ...]:
 
 
 class HuggingFaceCursorIterator(grain.DatasetIterator):
-    """Exposes a Hugging Face streaming cursor to Grain checkpoint recursion."""
+    """Expose an HF stream cursor to Grain checkpoint recursion.
+
+    Exact resume depends on the source's state_dict coverage. Build sources
+    without HF buffer shuffle; composition applies checkpointable Grain window
+    shuffle afterward. HF's own shuffle buffer does not preserve its contents.
+    """
 
     def __init__(
         self,
