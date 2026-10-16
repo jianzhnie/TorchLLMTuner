@@ -608,3 +608,37 @@ def test_router_rejects_nonfinite_or_nonnumeric_scale_before_gate_allocation(
 def test_router_rejects_truthy_nonboolean_policy(field, value):
     with pytest.raises(ValueError, match=field):
         TokenChoiceTopKRouter(4, 8, 2, **{field: value})
+
+
+@pytest.mark.parametrize("failed_path", ["routed", "shared"])
+def test_failed_expert_call_preserves_prior_token_counts(monkeypatch, failed_path):
+    router = TokenChoiceTopKRouter(_NUM_EXPERTS, _DIM, _TOP_K)
+    experts = GroupedExperts(_DIM, 8, _NUM_EXPERTS, use_grouped_mm=False)
+    for parameter in experts.parameters():
+        torch.nn.init.normal_(parameter, std=0.02)
+    routed = RoutedExperts(experts, LocalTokenDispatcher(_NUM_EXPERTS, _TOP_K))
+    shared = torch.nn.Linear(_DIM, _DIM)
+    moe = MoE(_NUM_EXPERTS, routed, router, shared_experts=shared).train()
+    prior = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    moe.tokens_per_expert_E.copy_(prior)
+    inputs = torch.randn(5, _DIM)
+    failed = routed if failed_path == "routed" else shared
+    original_forward = failed.forward
+    original_error = ValueError("injected expert failure")
+
+    def fail(*args, **kwargs):
+        raise original_error
+
+    monkeypatch.setattr(failed, "forward", fail)
+    with pytest.raises(ValueError) as caught:
+        moe(inputs)
+    assert caught.value is original_error
+    torch.testing.assert_close(moe.tokens_per_expert_E, prior, rtol=0, atol=0)
+    monkeypatch.setattr(failed, "forward", original_forward)
+    with torch.no_grad():
+        expected_counts = router(inputs, moe.expert_bias_E)[2].sum(0)
+    output = moe(inputs)
+    output.sum().backward()
+    torch.testing.assert_close(
+        moe.tokens_per_expert_E, prior + expected_counts, rtol=0, atol=0
+    )

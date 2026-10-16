@@ -16,6 +16,7 @@ import os
 from contextlib import nullcontext
 from itertools import product
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -23,6 +24,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 
+import llmtuner.parallel.expert_parallel.domino_dispatch as domino_implementation
 from llmtuner.models.common.moe.experts import (
     GroupedExperts,
     RoutedExperts,
@@ -63,6 +65,145 @@ def main():
         caller_stream = (
             torch.cuda.Stream(device=device) if args.nondefault_stream else None
         )
+        # One bad rank must not leave its peer in the first count exchange.
+        failure_dispatcher = AllToAllTokenDispatcher(4, 2)
+        failure_dispatcher.set_ep_group(ep_group=dist.group.WORLD)
+        failure_model = DominoRoutedExperts(
+            GroupedExperts(8, 12, 2, use_grouped_mm=False).to(device),
+            failure_dispatcher,
+        )
+        for parameter in failure_model.parameters():
+            torch.nn.init.normal_(parameter, std=0.02)
+        for failure in ("shape", "negative", "out_of_range", "dtype"):
+            ids = torch.tensor([[0, 1], [2, 3]], device=device)
+            scores = torch.ones(2, 2, device=device) / 2
+            if rank == 0:
+                if failure == "shape":
+                    scores = scores[:1]
+                elif failure == "negative":
+                    ids[0, 0] = -1
+                elif failure == "out_of_range":
+                    ids[0, 0] = 4
+                else:
+                    ids = ids.float()
+            try:
+                failure_model(
+                    torch.ones(2, 8, device=device),
+                    scores,
+                    ids,
+                    torch.ones(4, dtype=torch.int64, device=device),
+                )
+            except (ValueError, RuntimeError) as error:
+                if rank == 0:
+                    assert isinstance(error, ValueError), str(error)
+                else:
+                    assert "Domino input preparation failed on another rank" in str(
+                        error
+                    )
+            else:
+                raise AssertionError(f"rank {rank}: {failure} did not fail")
+            dist.barrier()
+            # Reuse the same runtime after the coordinated rejection.
+            result = failure_model(
+                torch.ones(2, 8, device=device),
+                torch.ones(2, 2, device=device) / 2,
+                torch.tensor([[0, 1], [2, 3]], device=device),
+                torch.ones(4, dtype=torch.int64, device=device),
+            )
+            assert result.shape == (2, 8)
+            dist.barrier()
+            if rank == 0:
+                print(
+                    f"Domino {failure}: coordinated rejection and healthy retry",
+                    flush=True,
+                )
+        # A hook on only one peer must disable the local boundary on both.
+        phases = []
+        coordinate = domino_implementation.synchronize_local_errors
+
+        def record_phase(phase, **kwargs):
+            phases.append(phase)
+            return coordinate(phase, **kwargs)
+
+        hook = (
+            failure_model.inner_experts.register_forward_pre_hook(lambda *args: None)
+            if rank == 0
+            else None
+        )
+        try:
+            with patch.object(
+                domino_implementation, "synchronize_local_errors", record_phase
+            ):
+                eligible = failure_model._can_coordinate_experts(
+                    torch.ones(2, 8, device=device), failure_dispatcher
+                )
+                assert not eligible
+
+            assert phases == [], f"rank {rank}: rank-local eligibility diverged"
+        finally:
+            if hook is not None:
+                hook.remove()
+        dist.barrier()
+        # Inject an error inside the standard local body, leaving module/hook
+        # eligibility unchanged. Fail the first projection of either slice.
+        for failed_slice in (0, 1):
+            original_linear = torch.nn.functional.linear
+            linear_calls = 0
+
+            def fail_linear(
+                *args,
+                failure_at=1 + 6 * failed_slice,
+                original=original_linear,
+                **kwargs,
+            ):
+                nonlocal linear_calls
+                linear_calls += 1
+                if rank == 0 and linear_calls == failure_at:
+                    raise ValueError("injected local expert projection failure")
+                return original(*args, **kwargs)
+
+            try:
+                with patch("torch.nn.functional.linear", fail_linear):
+                    failure_model(
+                        torch.ones(2, 8, device=device),
+                        torch.ones(2, 2, device=device) / 2,
+                        torch.tensor([[0, 1], [2, 3]], device=device),
+                        torch.ones(4, dtype=torch.int64, device=device),
+                    )
+            except (ValueError, RuntimeError) as error:
+                if rank == 0:
+                    assert isinstance(error, ValueError), str(error)
+                    assert "injected local expert projection failure" in str(error)
+                else:
+                    assert "Domino expert computation failed on another rank" in str(
+                        error
+                    )
+            else:
+                raise AssertionError(
+                    f"rank {rank}: expert slice{failed_slice} did not fail"
+                )
+            dist.barrier()
+            failure_model.zero_grad(set_to_none=True)
+            retry_input = torch.ones(2, 8, device=device, requires_grad=True)
+            retry_scores = torch.full((2, 2), 0.5, device=device, requires_grad=True)
+            retry_output = failure_model(
+                retry_input,
+                retry_scores,
+                torch.tensor([[0, 1], [2, 3]], device=device),
+                torch.ones(4, dtype=torch.int64, device=device),
+            )
+            retry_output.sum().backward()
+            assert retry_input.grad is not None
+            assert torch.isfinite(retry_output).all()
+            assert torch.isfinite(retry_input.grad).all()
+            assert retry_scores.grad is not None
+            assert all(p.grad is not None for p in failure_model.parameters())
+            dist.barrier()
+            if rank == 0:
+                print(
+                    f"Domino expert slice{failed_slice}: rejection and backward retry",
+                    flush=True,
+                )
         generator = torch.Generator().manual_seed(19)
         for routed_class, zero_receives, recompute, small_rank in product(
             (RoutedExperts, DominoRoutedExperts),

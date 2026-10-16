@@ -127,7 +127,11 @@ def test_mc2_routed_experts_preserve_separate_weights_and_router_gradients(monke
     monkeypatch.setattr(
         mc2_dispatch, "mc2_communication_context", lambda *args: (ops, "test", 1)
     )
-    experts = GroupedExperts(4, 3, 2, use_grouped_mm=False).half()
+    experts = mc2_dispatch.MC2GroupedExperts(4, 3, 2, use_grouped_mm=False).half()
+    parameter_ids = [id(parameter) for parameter in experts.parameters()]
+    hooks = []
+    experts.register_forward_pre_hook(lambda module, args: hooks.append("pre"))
+    experts.register_forward_hook(lambda module, args, output: hooks.append("post"))
     reference_experts = GroupedExperts(4, 3, 2, use_grouped_mm=False).half()
     for parameter in experts.parameters():
         torch.nn.init.normal_(parameter, std=0.1)
@@ -155,6 +159,8 @@ def test_mc2_routed_experts_preserve_separate_weights_and_router_gradients(monke
     counts = torch.bincount(ids.flatten(), minlength=2)
     actual = actual_model(inputs, scores, ids, counts)
     expected = reference_model(ref_inputs, ref_scores, ids, counts)
+    assert hooks == ["pre", "post"]
+    assert [id(parameter) for parameter in experts.parameters()] == parameter_ids
     actual.square().sum().backward()
     expected.square().sum().backward()
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-3)
@@ -165,3 +171,19 @@ def test_mc2_routed_experts_preserve_separate_weights_and_router_gradients(monke
     ):
         torch.testing.assert_close(got.grad, want.grad, atol=1e-4, rtol=1e-3)
     assert set(experts.state_dict()) == {"w1_EFD", "w3_EFD", "w2_EDF"}
+
+
+@pytest.mark.parametrize(
+    "counts, world_size, expected",
+    [
+        ([2, 0, 3, 1, 4, 0], 2, [3, 4, 3]),
+        ([0, 0, 0, 0, 0, 0], 3, [0, 0]),
+        ([5, 0, 0, 2, 1, 7], 3, [6, 9]),
+    ],
+)
+def test_mc2_weight_gradient_counts_sum_source_ranks(counts, world_size, expected):
+    from llmtuner.parallel.expert_parallel.mc2_ops import _expert_counts
+
+    actual = _expert_counts(counts, world_size, torch.device("cpu"))
+    assert actual.dtype == torch.int64
+    assert actual.tolist() == expected

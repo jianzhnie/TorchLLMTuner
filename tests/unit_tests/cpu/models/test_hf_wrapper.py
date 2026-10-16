@@ -196,13 +196,45 @@ def test_meta_materialization_preserves_persistent_buffer_aliases() -> None:
 
 
 def test_named_children_flattens_the_decoder(model: HFTransformerModel) -> None:
-    """Five parts, in the order the parallel layer walks them.
+    """Decoder parts precede their registered parent for complete traversal.
 
     The names are a contract: ``apply_tp`` matches TP-plan entries against these
     paths, and FSDP walks the same children to find the transformer blocks.
     """
     names = [name for name, _ in model.named_children()]
-    assert names == ["tok_embeddings", "layers", "norm", "lm_head", "rotary_emb"]
+    assert names == [
+        "tok_embeddings",
+        "layers",
+        "norm",
+        "lm_head",
+        "rotary_emb",
+        "model",
+    ]
+
+
+def test_child_traversal_reaches_architecture_specific_state(model):
+    model.model.model.output_projection = torch.nn.Linear(_HIDDEN, _HIDDEN)
+    model.model.model.register_buffer("output_scale", torch.ones(_HIDDEN))
+    visited = set()
+
+    def walk(module):
+        if module in visited:
+            return
+        visited.add(module)
+        for child in module.children():
+            walk(child)
+
+    walk(model)
+    parameters = {
+        id(parameter)
+        for module in visited
+        for parameter in module.parameters(recurse=False)
+    }
+    buffers = {
+        id(buffer) for module in visited for buffer in module.buffers(recurse=False)
+    }
+    assert parameters == {id(parameter) for parameter in model.parameters()}
+    assert buffers == {id(buffer) for buffer in model.buffers()}
 
 
 def test_state_dict_does_not_duplicate_tensors(model: HFTransformerModel) -> None:
@@ -1017,3 +1049,16 @@ def test_norm_backend_reapplication_removes_only_owned_adaptations(model):
         )
         assert set(norm._forward_pre_hooks_with_kwargs) <= set(norm._forward_pre_hooks)
     user_handle.remove()
+
+
+@pytest.mark.parametrize("backend", ["sdpa", ATTENTION_BACKEND])
+def test_kcp_attention_seam_does_not_build_flex_mask(model, backend):
+    model.cp_mesh = object()
+    model._cp_strategy = "kcp"
+    model.model.config._attn_implementation = backend
+    assert model._apply_attention(torch.arange(8), None) == {"attention_mask": None}
+    with pytest.raises(ValueError, match="local token validity"):
+        model._apply_attention(torch.arange(8), object())
+    model.model.config.attn_mask_type = "block_causal"
+    with pytest.raises(ValueError, match="packed document"):
+        model._apply_attention(torch.arange(8), None)

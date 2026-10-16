@@ -14,7 +14,10 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
-from llmtuner.parallel.expert_parallel.mc2_dispatch import MC2RoutedExperts
+from llmtuner.parallel.expert_parallel.mc2_dispatch import (
+    MC2GroupedExperts,
+    MC2RoutedExperts,
+)
 from llmtuner.parallel.expert_parallel.mc2_ops import load_mc2_ops
 from llmtuner.parallel.expert_parallel.token_dispatch import (
     AllToAllTokenDispatcher,
@@ -41,7 +44,7 @@ def main():
             for parameter in reference_experts.parameters():
                 torch.nn.init.normal_(parameter, std=0.05)
             local_experts = (
-                GroupedExperts(16, 32, 2, use_grouped_mm=False).half().to(device)
+                MC2GroupedExperts(16, 32, 2, use_grouped_mm=False).half().to(device)
             )
             with torch.no_grad():
                 for local, full in zip(

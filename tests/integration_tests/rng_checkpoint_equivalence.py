@@ -15,6 +15,7 @@ This covers default CPU streams, not private loader or DTensor generators.
 import random
 from contextlib import nullcontext
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -24,7 +25,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel
 
-from llmtuner.components.checkpointer.checkpoint_keys import RNG_STATE
+from llmtuner.components.checkpointer.checkpoint_keys import MODEL, RNG_STATE
 from llmtuner.components.checkpointer.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
@@ -137,6 +138,52 @@ def main():
                 resumed = runtime(123, selected_mesh, custom=backend == "custom")
                 reader = manager(resumed, folder, async_mode=mode)
                 try:
+                    rng = reader.states[RNG_STATE]
+                    for target, method, phase in (
+                        (resumed[3], "load_state_dict", "scheduler restoration"),
+                        (
+                            reader.states[MODEL],
+                            "validate_state_dict",
+                            "model validation",
+                        ),
+                        (rng, "validate_state_dict", "RNG validation"),
+                        (rng, "load_state_dict", "RNG restoration"),
+                    ):
+                        original_method = getattr(target, method)
+                        failure = ValueError(f"injected rank-local {phase}")
+
+                        def fail_local(
+                            state, original_method=original_method, failure=failure
+                        ):
+                            if rank == 0:
+                                raise failure
+                            return original_method(state)
+
+                        before = (
+                            random.getstate(),
+                            np.random.get_state(),
+                            torch.get_rng_state().clone(),
+                        )
+                        with patch.object(target, method, fail_local):
+                            try:
+                                reader.load(2)
+                            except (ValueError, RuntimeError) as error:
+                                if rank == 0:
+                                    assert error is failure
+                                else:
+                                    assert str(error) == (
+                                        f"Checkpoint {phase} failed on another rank"
+                                    )
+                            else:
+                                raise AssertionError("load failure was not coordinated")
+                        if phase == "RNG validation":
+                            assert random.getstate() == before[0]
+                            numpy_state = np.random.get_state()
+                            assert numpy_state[0] == before[1][0]
+                            np.testing.assert_array_equal(numpy_state[1], before[1][1])
+                            assert numpy_state[2:] == before[1][2:]
+                            assert torch.equal(torch.get_rng_state(), before[2])
+                        dist.barrier()
                     assert reader.load(2)
                 finally:
                     reader.close()

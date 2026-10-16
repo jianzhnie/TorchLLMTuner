@@ -556,3 +556,54 @@ def test_flat_optimizer_type_rejects_unknown_values(name):
 
     with pytest.raises(ConfigError, match="optimizer_type"):
         OptimizerConfig(optimizer_type=name)
+
+
+def test_partial_optimizer_failure_requires_checkpoint_restore(monkeypatch):
+    from copy import deepcopy
+
+    parts = [
+        nn.ModuleDict({"first": _model()}),
+        nn.ModuleDict({"second": _model()}),
+    ]
+    container = OptimizersContainer(_cfg(_catch_all()), model_parts=parts)
+    # Warm both Adam states before taking an independent recoverable snapshot.
+    for part in parts:
+        for parameter in part.parameters():
+            parameter.grad = torch.ones_like(parameter)
+    container.step()
+    saved_models = [deepcopy(part.state_dict()) for part in parts]
+    saved_optimizer = deepcopy(container.state_dict())
+    for part in parts:
+        for parameter in part.parameters():
+            parameter.grad = torch.full_like(parameter, 2)
+    original_error = RuntimeError("injected second optimizer failure")
+
+    def fail(*args, **kwargs):
+        raise original_error
+
+    with monkeypatch.context() as fault:
+        fault.setattr(container.optimizers[1], "step", fail)
+        with pytest.raises(RuntimeError) as caught:
+            container.step()
+    assert caught.value is original_error
+    assert any(
+        not torch.equal(value, parts[0].state_dict()[name])
+        for name, value in saved_models[0].items()
+    )
+    for name, value in saved_models[1].items():
+        torch.testing.assert_close(parts[1].state_dict()[name], value, rtol=0, atol=0)
+    # Restore every model part and optimizer; zero_grad alone cannot undo this.
+    for part, saved in zip(parts, saved_models, strict=True):
+        part.load_state_dict(saved)
+    container.load_state_dict(saved_optimizer)
+    container.zero_grad(set_to_none=True)
+    for part, saved in zip(parts, saved_models, strict=True):
+        for name, value in part.state_dict().items():
+            torch.testing.assert_close(value, saved[name], rtol=0, atol=0)
+    actual = container.state_dict()
+    assert actual.keys() == saved_optimizer.keys()
+    for name, expected in saved_optimizer.items():
+        if isinstance(expected, torch.Tensor):
+            torch.testing.assert_close(actual[name], expected, rtol=0, atol=0)
+        else:
+            assert actual[name] == expected

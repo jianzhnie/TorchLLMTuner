@@ -5,7 +5,13 @@ from types import SimpleNamespace
 import pytest
 import torch.distributed as dist
 
+import llmtuner.parallel.tensor_parallel.linear_ops as linear_ops
 from llmtuner.parallel.tensor_parallel.linear_ops import functional_collectives
+
+
+@pytest.fixture(autouse=True)
+def isolate_collective_resolution(monkeypatch):
+    monkeypatch.setattr(linear_ops, "_autograd_collectives", None)
 
 
 @pytest.mark.parametrize("suffix", ["single_autograd", "tensor_autograd"])
@@ -15,6 +21,20 @@ def test_functional_collectives_select_complete_autograd_pair(monkeypatch, suffi
         **{f"all_gather_{suffix}": gather, f"reduce_scatter_{suffix}": scatter}
     )
     monkeypatch.setattr(dist, "functional_collectives", backend, raising=False)
+    assert functional_collectives() == (gather, scatter)
+
+
+def test_collective_resolution_is_stable_after_backend_probe(monkeypatch):
+    gather, scatter = lambda *args: None, lambda *args: None
+    backend = SimpleNamespace(
+        all_gather_single_autograd=gather,
+        reduce_scatter_single_autograd=scatter,
+    )
+    monkeypatch.setattr(dist, "functional_collectives", backend, raising=False)
+    assert functional_collectives() == (gather, scatter)
+    # Tensor tracing must not repeat capability imports or inspect the backend.
+    del backend.all_gather_single_autograd
+    del backend.reduce_scatter_single_autograd
     assert functional_collectives() == (gather, scatter)
 
 
