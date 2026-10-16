@@ -1144,3 +1144,11 @@ def test_fixed_router_ep1_tp_layout_rejected_before_transform():
         expert_parallel_size=2,
         ep_config=ExpertParallelConfig(fixed_router=True),
     )
+
+
+def test_seed_checkpoint_rejects_load_only_configuration():
+    from llmtuner.config.checkpoint_config import CheckpointConfig
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="create_seed_checkpoint.*load_only"):
+        CheckpointConfig(enable=True, create_seed_checkpoint=True, load_only=True)

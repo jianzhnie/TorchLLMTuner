@@ -13,6 +13,7 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
+from llmtuner.parallel.expert_parallel import checkpointing
 from llmtuner.parallel.expert_parallel.checkpointing import (
     expert_shard_map,
     gather_expert_state,
@@ -82,6 +83,46 @@ def main():
                         raise AssertionError(f"rank={rank} {case}: preflight succeeded")
                     gather.assert_not_called()
                 dist.barrier()
+        for error_type in (KeyboardInterrupt, SystemExit):
+            for failing_rank in (0, 1):
+                model = torch.nn.Linear(2, 2, bias=False)
+                mark_experts_ep_sharded(model, group)
+                original = error_type("interrupted EP checkpoint planning")
+                index_parameters = checkpointing.index_checkpoint_parameters
+
+                def interrupted_index(
+                    parts,
+                    failing_rank=failing_rank,
+                    original=original,
+                    index_parameters=index_parameters,
+                ):
+                    if rank % 2 == failing_rank:
+                        raise original
+                    return index_parameters(parts)
+
+                with (
+                    patch.object(
+                        checkpointing, "index_checkpoint_parameters", interrupted_index
+                    ),
+                    patch.object(dist, "all_gather_into_tensor") as gather,
+                ):
+                    try:
+                        gather_expert_state(
+                            model.state_dict(),
+                            shard_map=expert_shard_map([model]),
+                            model_parts=[model],
+                        )
+                    except BaseException as error:
+                        if rank % 2 == failing_rank:
+                            assert error is original
+                        else:
+                            assert isinstance(error, RuntimeError)
+                            assert "preparation failed on another rank" in str(error)
+                    else:
+                        raise AssertionError("EP interruption was accepted")
+                    gather.assert_not_called()
+                dist.barrier()
+        print(f"rank={rank}: EP planning interrupts coordinated", flush=True)
         # A fresh valid snapshot on the same EP groups must still work.
         model = torch.nn.Module()
         name = f"stage{stage}_weight"

@@ -15,8 +15,9 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.datasets.contracts import Batch, DataloaderExhaustedError
-from llmtuner.trainer.runtime.batch import batch_generator
+from llmtuner.trainer.runtime.batch import batch_generator, fetch_batch
 from llmtuner.trainer.runtime.validation import finalize_validation, run_validation_loop
+from llmtuner.trainer.trainer import Trainer
 
 
 class Metrics:
@@ -36,7 +37,14 @@ def main():
         rank = dist.get_rank()
         assert dist.get_world_size() == 2
         batch = Batch(input_ids=torch.ones(1, 4), labels=torch.ones(1, 4))
-        for failure in ("exhaustion", "exception", "malformed"):
+        for failure in (
+            "exhaustion",
+            "exception",
+            "malformed",
+            "interrupt",
+            "exit",
+            "count",
+        ):
             trainer = SimpleNamespace(metrics=Metrics())
 
             def source(failure=failure):
@@ -44,6 +52,12 @@ def main():
                 if rank == 0:
                     if failure == "exception":
                         raise ValueError("source decode failed")
+                    if failure == "interrupt":
+                        raise KeyboardInterrupt("source interrupted")
+                    if failure == "exit":
+                        raise SystemExit("source exited")
+                    if failure == "count":
+                        yield {"labels": batch.labels, "num_valid_tokens": 1.5}
                     if failure == "malformed":
                         yield {}
                     return
@@ -56,8 +70,16 @@ def main():
             except DataloaderExhaustedError:
                 assert failure == "exhaustion"
             except ValueError as error:
-                assert rank == 0 and failure == "exception"
-                assert str(error) == "source decode failed"
+                assert rank == 0 and failure in ("exception", "count")
+                if failure == "exception":
+                    assert str(error) == "source decode failed"
+                else:
+                    assert "num_valid_tokens" in str(error)
+            except (KeyboardInterrupt, SystemExit) as error:
+                assert rank == 0
+                assert failure == (
+                    "interrupt" if isinstance(error, KeyboardInterrupt) else "exit"
+                )
             except KeyError:
                 assert rank == 0 and failure == "malformed"
             except RuntimeError as error:
@@ -68,6 +90,151 @@ def main():
             assert trainer.metrics.tokens == 4
             dist.barrier()
             print(f"rank={rank} {failure}: coordinated before yielding")
+        for error_type in (KeyboardInterrupt, SystemExit):
+            failure = error_type("fetch interrupted while peer exhausted")
+
+            def interrupted_source(failure=failure):
+                if rank == 0:
+                    raise failure
+                return
+                yield
+
+            try:
+                fetch_batch(interrupted_source())
+            except (KeyboardInterrupt, SystemExit) as error:
+                assert rank == 0 and error is failure
+            except RuntimeError as error:
+                assert rank == 1 and "Data fetch failed" in str(error)
+            else:
+                raise AssertionError("fetch failure lost to exhaustion")
+            dist.barrier()
+            print(f"rank={rank} {error_type.__name__}: precedes exhaustion")
+        for error_type in (ValueError, KeyboardInterrupt, SystemExit):
+            failure = error_type("training iterator initialization failed")
+            closed = []
+
+            class InitializationLoader:
+                def __iter__(self, failure=failure):
+                    if rank == 0:
+                        raise failure
+                    return iter([batch])
+
+                def close(self, closed=closed):
+                    closed.append("loader")
+
+            trainer = Trainer.__new__(Trainer)
+            trainer.cfg = SimpleNamespace(checkpoint=SimpleNamespace(load_step=-1))
+            trainer.step = 0
+            trainer.dataloader = InitializationLoader()
+            trainer.checkpointer = SimpleNamespace(
+                load=lambda step: False,
+                close=lambda closed=closed: closed.append("checkpoint"),
+            )
+            with patch("llmtuner.trainer.trainer.Profiler") as profiler:
+                try:
+                    trainer.train()
+                except (ValueError, KeyboardInterrupt, SystemExit) as error:
+                    assert rank == 0 and error is failure
+                except RuntimeError as error:
+                    assert rank == 1
+                    assert str(error) == (
+                        "Training input initialization failed on another rank"
+                    )
+                else:
+                    raise AssertionError("iterator initialization was not coordinated")
+                profiler.assert_not_called()
+            assert closed == ["checkpoint", "loader"]
+            dist.barrier()
+            print(f"rank={rank} {error_type.__name__}: training iterator coordinated")
+        from llmtuner.models.hf.factory import build_model_config
+        from llmtuner.models.hf.model import HFTransformerModel
+
+        model = HFTransformerModel(
+            build_model_config(
+                "qwen3",
+                seq_len=4,
+                arch_overrides={
+                    "vocab_size": 32,
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                },
+            )
+        )
+        trainer = Trainer.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(max_seq_len=4)
+        trainer.device = torch.device("cpu")
+        trainer.parallel_dims = None
+        trainer.model = model
+        for failing_rank in (0, 1):
+            value = {
+                "input": torch.ones(4, dtype=torch.long),
+                "labels": torch.ones(
+                    3 if rank == failing_rank else 4, dtype=torch.long
+                ),
+            }
+            try:
+                trainer.preprocess(value)
+            except ValueError as error:
+                assert rank == failing_rank and "equal lengths" in str(error)
+            except RuntimeError as error:
+                assert rank != failing_rank
+                assert (
+                    str(error) == "Training batch preprocessing failed on another rank"
+                )
+            else:
+                raise AssertionError("malformed preprocessing was not coordinated")
+            dist.barrier()
+        print(f"rank={rank}: HF preprocessing length errors coordinated")
+        from llmtuner.trainer.runtime.pipeline import (
+            prepare_pipeline_inputs,
+            split_pipeline_microbatches,
+        )
+
+        trainer.pp_has_first_stage = rank == 0
+        trainer.pp_has_last_stage = rank == 1
+        trainer.pp_microbatches = lambda value: split_pipeline_microbatches(
+            value, num_microbatches=2
+        )
+        for failing_rank in (0, 1):
+            rows = 3 if rank == failing_rank else 4
+            value = Batch(
+                input_ids=torch.ones(rows, 4, dtype=torch.long),
+                labels=torch.ones(rows, 4, dtype=torch.long),
+            )
+            with patch.object(trainer, "preprocess") as preprocess:
+                try:
+                    prepare_pipeline_inputs(trainer, value)
+                except ValueError as error:
+                    assert rank == failing_rank and "divisible" in str(error)
+                except RuntimeError as error:
+                    assert rank != failing_rank
+                    assert str(error) == (
+                        "Pipeline input splitting failed on another rank"
+                    )
+                else:
+                    raise AssertionError("pipeline split failure was not coordinated")
+                preprocess.assert_not_called()
+            dist.barrier()
+        print(f"rank={rank}: pipeline split errors coordinated before preprocessing")
+        preprocessing_mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("sequence",))
+        for axis in ("cp", "tp"):
+            trainer.parallel_dims = SimpleNamespace(
+                get_optional_mesh=lambda name, axis=axis: (
+                    preprocessing_mesh if name == axis else None
+                )
+            )
+            value = {
+                "input": torch.arange(4),
+                "labels": torch.arange(4),
+            }
+            inputs, labels, _ = trainer.preprocess(value)
+            torch.testing.assert_close(inputs, value["input"].chunk(2)[rank])
+            torch.testing.assert_close(labels, value["labels"].chunk(2)[rank])
+            dist.barrier()
+            print(f"rank={rank}: preprocessing {axis} local slicing passed")
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))
         topology = SimpleNamespace(
             pp_enabled=False,
@@ -78,7 +245,14 @@ def main():
             spmd_sparse_mesh=lambda: None,
             get_optional_mesh=lambda name: mesh,
         )
-        for failure in ("exhaustion", "exception", "malformed"):
+        for failure in (
+            "exhaustion",
+            "exception",
+            "malformed",
+            "interrupt",
+            "exit",
+            "count",
+        ):
             logs = []
 
             class Loader:
@@ -92,6 +266,12 @@ def main():
                     if rank == 0:
                         if self.failure == "exception":
                             raise ValueError("validation decode failed")
+                        if self.failure == "interrupt":
+                            raise KeyboardInterrupt("validation interrupted")
+                        if self.failure == "exit":
+                            raise SystemExit("validation exited")
+                        if self.failure == "count":
+                            yield {"labels": batch.labels, "num_valid_tokens": 1.5}
                         if self.failure == "malformed":
                             yield {}
                         return
@@ -121,8 +301,16 @@ def main():
                 try:
                     run_validation_loop(trainer, ValidationConfig(steps=3), step=7)
                 except ValueError as error:
-                    assert rank == 0 and failure == "exception"
-                    assert str(error) == "validation decode failed"
+                    assert rank == 0 and failure in ("exception", "count")
+                    if failure == "exception":
+                        assert str(error) == "validation decode failed"
+                    else:
+                        assert "num_valid_tokens" in str(error)
+                except (KeyboardInterrupt, SystemExit) as error:
+                    assert rank == 0
+                    assert failure == (
+                        "interrupt" if isinstance(error, KeyboardInterrupt) else "exit"
+                    )
                 except KeyError:
                     assert rank == 0 and failure == "malformed"
                 except RuntimeError as error:

@@ -1,11 +1,13 @@
 """Run with two CPU/Gloo ranks: local TP planning failures reach every peer."""
 
 from datetime import timedelta
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
+from llmtuner.parallel.tensor_parallel import checkpointing
 from llmtuner.parallel.tensor_parallel.checkpointing import (
     gather_tensor_parallel_state,
     load_tensor_parallel_state,
@@ -52,6 +54,45 @@ try:
                 raise AssertionError(f"rank {rank} accepted {loading=} {failure=}")
             dist.barrier()
             print(f"rank {rank}: coordinated {loading=} {failure=}", flush=True)
+    for operation in (gather_tensor_parallel_state, load_tensor_parallel_state):
+        for error_type in (KeyboardInterrupt, SystemExit):
+            for failing_rank in (0, 1):
+                model = nn.Linear(2, 2, bias=False)
+                model._tp_checkpoint_layouts = {"weight": (0, False, dist.group.WORLD)}
+                original = error_type("interrupted TP checkpoint planning")
+                index_layouts = checkpointing._index_layouts
+
+                def interrupted_index(
+                    parts,
+                    failing_rank=failing_rank,
+                    original=original,
+                    index_layouts=index_layouts,
+                ):
+                    if rank == failing_rank:
+                        raise original
+                    return index_layouts(parts)
+
+                with patch.object(checkpointing, "_index_layouts", interrupted_index):
+                    try:
+                        operation(
+                            {
+                                "weight": torch.ones(
+                                    4 if operation is load_tensor_parallel_state else 2,
+                                    2,
+                                )
+                            },
+                            model_parts=[model],
+                        )
+                    except BaseException as error:
+                        if rank == failing_rank:
+                            assert error is original
+                        else:
+                            assert isinstance(error, RuntimeError)
+                            assert "preparation failed on another rank" in str(error)
+                    else:
+                        raise AssertionError("TP interruption was accepted")
+                dist.barrier()
+    print(f"rank {rank}: TP planning interrupts coordinated", flush=True)
     model = nn.Linear(2, 2, bias=False)
     model._tp_checkpoint_layouts = {"weight": (0, False, dist.group.WORLD)}
     state = {"weight": torch.full((2, 2), float(rank))}

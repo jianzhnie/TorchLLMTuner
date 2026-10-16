@@ -56,6 +56,25 @@ def test_local_error_boundary_preserves_single_rank_exception(monkeypatch, fails
             pass
 
 
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt, SystemExit])
+def test_local_error_boundary_coordinates_before_reraising(monkeypatch, error_type):
+    monkeypatch.setattr(collectives, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(collectives, "get_comm_device", lambda group: "cpu")
+    statuses = []
+
+    def reduce(status, *, op, group):
+        assert op == "min"
+        statuses.append(status.item())
+
+    monkeypatch.setattr(collectives, "all_reduce", reduce)
+    failure = error_type("local construction interrupted")
+    with pytest.raises(error_type) as caught:
+        with collectives.synchronize_local_errors("Construction"):
+            raise failure
+    assert caught.value is failure
+    assert statuses == [0]
+
+
 @pytest.mark.parametrize("foreach", [False, True])
 def test_fp16_finite_gradients_use_fp32_norm_before_clipping(foreach):
     parameter = torch.nn.Parameter(torch.zeros(4, dtype=torch.float16))

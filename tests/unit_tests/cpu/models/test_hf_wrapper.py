@@ -163,17 +163,21 @@ def test_unknown_meta_buffer_is_rejected_before_materialization() -> None:
     assert model.runtime_scale is buffer and model.runtime_scale.is_meta
 
 
-def test_meta_materialization_preserves_tied_parameters_and_gradients() -> None:
+@pytest.mark.parametrize("frozen", [False, True])
+def test_meta_materialization_preserves_tied_parameters_and_gradients(frozen) -> None:
     reference = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Linear(3, 3))
     reference[1].weight = reference[0].weight
+    reference[0].weight.requires_grad_(not frozen)
     with torch.device("meta"):
         restored = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Linear(3, 3))
         restored[1].weight = restored[0].weight
+        restored[0].weight.requires_grad_(not frozen)
 
     materialize_meta_model(restored, torch.device("cpu"))
     restored.load_state_dict(reference.state_dict(), strict=True)
 
     assert restored[0].weight is restored[1].weight
+    assert restored[0].weight.requires_grad is (not frozen)
     assert len(list(restored.parameters())) == len(list(reference.parameters()))
     inputs = torch.randn(2, 3)
     actual, expected = restored(inputs), reference(inputs)

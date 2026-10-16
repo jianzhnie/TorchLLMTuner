@@ -11,6 +11,7 @@ execution-policy rollback. A fresh Trainer then performs an update.
 import os
 import random
 from datetime import timedelta
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -102,11 +103,12 @@ def main():
     try:
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
-        for failing_rank, name in enumerate(
-            ("build_model_config_for", "HFTransformerModel")
+        for (failing_rank, name), error_type in product(
+            enumerate(("build_model_config_for", "HFTransformerModel")),
+            (ValueError, KeyboardInterrupt, SystemExit),
         ):
             original = getattr(assembly, name)
-            failure = ValueError(f"injected {name} failure")
+            failure = error_type(f"injected {name} failure")
 
             def build(
                 *args,
@@ -125,7 +127,7 @@ def main():
             ):
                 try:
                     failed_constructor(config())
-                except ValueError as error:
+                except (ValueError, KeyboardInterrupt, SystemExit) as error:
                     assert rank == failing_rank and error is failure
                 except RuntimeError as error:
                     assert rank != failing_rank
@@ -137,7 +139,8 @@ def main():
                 transform.assert_not_called()
             dist.barrier()
             print(
-                f"rank={rank} {name}: coordinated before parallel transforms",
+                f"rank={rank} {name}/{error_type.__name__}: coordinated "
+                "before parallel transforms",
                 flush=True,
             )
         # No rank may enter checkpointer construction while another loader failed.

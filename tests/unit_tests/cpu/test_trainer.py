@@ -2549,3 +2549,75 @@ def test_new_train_step_discards_previous_routing_window(quantile):
     trainer.lr_scheduler = SimpleNamespace(get_metrics=stop_after_reset)
     with pytest.raises(RuntimeError, match="checked new window boundary"):
         trainer.train_step(iter(()))
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+def test_fetch_interrupt_coordinates_before_reraising(monkeypatch, error_type):
+    from llmtuner.trainer.runtime import batch as runtime
+
+    monkeypatch.setattr(runtime, "get_world_size", lambda: 2)
+    monkeypatch.setattr(runtime, "get_comm_device", lambda: "cpu")
+    statuses = []
+
+    def reduce(status, *, op):
+        assert op == "min"
+        statuses.append(status.item())
+
+    monkeypatch.setattr(runtime, "all_reduce", reduce)
+    failure = error_type("loader interrupted")
+
+    def source():
+        raise failure
+        yield
+
+    with pytest.raises(error_type) as caught:
+        runtime.fetch_batch(source())
+    assert caught.value is failure
+    assert statuses == [0]
+
+
+@pytest.mark.parametrize("count", [True, False, -1, 1.5, "2", 5, [2]])
+def test_valid_token_metadata_rejects_invalid_counts(count):
+    batch = {"labels": torch.ones(1, 4), "num_valid_tokens": count}
+    with pytest.raises(ValueError, match="num_valid_tokens"):
+        Trainer.count_valid_tokens(batch)
+
+
+@pytest.mark.parametrize("phase", ["valid_tokens", "routing_tokens"])
+def test_microbatch_failure_does_not_advance_checkpointed_token_counter(phase):
+    trainer = _bare_trainer(_cfg_with_batch())
+    trainer.ntokens_seen = 17
+    batch = {
+        "input": torch.arange(4),
+        "labels": torch.ones(4, dtype=torch.long),
+        "num_valid_tokens": -1,
+    }
+    if phase == "routing_tokens":
+        batch["num_valid_tokens"] = 4
+        del batch["input"]
+    with pytest.raises(ValueError if phase == "valid_tokens" else KeyError):
+        trainer.microbatch(batch)
+    assert trainer.ntokens_seen == 17
+
+
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt])
+def test_failed_assembly_restores_activation_memory_budget(monkeypatch, error_type):
+    import torch._functorch.config as functorch_config
+
+    from llmtuner.trainer.runtime import assembly
+
+    original = functorch_config.activation_memory_budget
+    failure = error_type("assembly failed after applying memory budget")
+
+    def assemble(trainer, cfg):
+        functorch_config.activation_memory_budget = 0.25
+        raise failure
+
+    monkeypatch.setattr(assembly, "assemble_trainer_runtime", assemble)
+    try:
+        with pytest.raises(error_type) as caught:
+            Trainer(SimpleNamespace(training=SimpleNamespace(compile=True)))
+        assert caught.value is failure
+        assert functorch_config.activation_memory_budget == original
+    finally:
+        functorch_config.activation_memory_budget = original

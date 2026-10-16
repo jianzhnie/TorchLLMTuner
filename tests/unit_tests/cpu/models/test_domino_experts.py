@@ -111,9 +111,17 @@ def test_domino_launches_both_slices_before_consuming_tokens(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("failed_slice", [None, 0, 1])
+@pytest.mark.parametrize(
+    ("failed_slice", "error_type"),
+    [(None, ValueError)]
+    + [
+        (index, error)
+        for index in (0, 1)
+        for error in (ValueError, KeyboardInterrupt, SystemExit)
+    ],
+)
 def test_domino_cuda_schedule_waits_before_cross_stream_consumption(
-    monkeypatch, failed_slice
+    monkeypatch, failed_slice, error_type
 ):
     from contextlib import contextmanager
     from types import SimpleNamespace
@@ -215,7 +223,7 @@ def test_domino_cuda_schedule_waits_before_cross_stream_consumption(
         drained = []
         original_run = domino._run_experts
         calls = 0
-        expected_error = ValueError("injected CUDA-schedule expert failure")
+        expected_error = error_type("injected CUDA-schedule expert failure")
 
         def run(*args, **kwargs):
             nonlocal calls
@@ -229,7 +237,7 @@ def test_domino_cuda_schedule_waits_before_cross_stream_consumption(
         monkeypatch.setattr(
             implementation, "materialize", lambda tensor: drained.append(tensor)
         )
-        with pytest.raises(ValueError) as caught:
+        with pytest.raises(error_type) as caught:
             domino._forward_cuda(slices, prepared, dispatcher, coordinate_experts=True)
         assert caught.value is expected_error
         assert len(drained) == 2 + failed_slice
@@ -264,9 +272,12 @@ def test_domino_cuda_schedule_waits_before_cross_stream_consumption(
     assert events.count(("storage", "compute")) == 4
 
 
-@pytest.mark.parametrize("wait_failure", [False, True])
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(
+    "wait_failure", [None, RuntimeError, KeyboardInterrupt, SystemExit]
+)
 def test_domino_expert_failure_waits_for_all_launched_dispatches(
-    monkeypatch, wait_failure
+    monkeypatch, wait_failure, error_type
 ):
     from types import SimpleNamespace
 
@@ -285,7 +296,7 @@ def test_domino_expert_failure_waits_for_all_launched_dispatches(
         def wait(self):
             waited.append(self.index)
             if wait_failure and self.index == 0:
-                raise RuntimeError("injected transfer wait failure")
+                raise wait_failure("injected transfer wait failure")
             return torch.ones(1, 8)
 
     def begin(*args, prepared_counts):
@@ -298,19 +309,19 @@ def test_domino_expert_failure_waits_for_all_launched_dispatches(
         "finish_dispatch",
         lambda pending: (torch.ones(1, 8), torch.tensor([1, 0]), None),
     )
-    original_error = ValueError("injected expert failure")
+    original_error = error_type("injected expert failure")
 
     def fail(*args):
         raise original_error
 
     monkeypatch.setattr(experts, "forward", fail)
     ids = torch.tensor([[0, 1], [2, 3]])
-    with pytest.raises(ValueError, match="injected expert failure") as caught:
+    with pytest.raises(error_type, match="injected expert failure") as caught:
         domino(torch.ones(2, 8), torch.ones(2, 2) / 2, ids, torch.ones(4))
     assert caught.value is original_error
     assert waited == [0, 1]
     if wait_failure:
-        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert isinstance(caught.value.__cause__, wait_failure)
         assert "injected transfer wait failure" in str(caught.value.__cause__)
 
 
@@ -370,7 +381,10 @@ def test_domino_coordinates_only_known_local_expert_bodies(monkeypatch, boundary
     assert phases == (["Domino expert computation"] if boundary == "plain" else [])
 
 
-def test_expert_compute_error_reaches_posthook_before_propagation(monkeypatch):
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt, SystemExit])
+def test_expert_compute_error_reaches_posthook_before_propagation(
+    monkeypatch, error_type
+):
     from torch.utils._pytree import tree_map
 
     from llmtuner.models.common.moe.experts import ExpertErrorCapture
@@ -379,7 +393,7 @@ def test_expert_compute_error_reaches_posthook_before_propagation(monkeypatch):
     inputs = torch.randn(2, 8, requires_grad=True)
     capture = ExpertErrorCapture()
     assert tree_map(lambda value: value, {"capture": capture})["capture"] is capture
-    original_error = ValueError("injected local compute error")
+    original_error = error_type("injected local compute error")
     calls = []
 
     def fail(*args):
@@ -392,13 +406,16 @@ def test_expert_compute_error_reaches_posthook_before_propagation(monkeypatch):
     monkeypatch.setattr(torch.nn.functional, "linear", fail)
     handle = experts.register_forward_hook(posthook)
     try:
-        placeholder = experts(
-            inputs, torch.ones(2, dtype=torch.long), error_capture=capture
-        )
+        try:
+            placeholder = experts(
+                inputs, torch.ones(2, dtype=torch.long), error_capture=capture
+            )
+        except BaseException as error:
+            raise AssertionError("Local error bypassed expert capture") from error
         assert capture.error is original_error
         assert calls == [original_error]
         assert placeholder.data_ptr() == inputs.data_ptr()
-        with pytest.raises(ValueError) as caught:
+        with pytest.raises(error_type) as caught:
             experts(inputs, torch.ones(2, dtype=torch.long))
         assert caught.value is original_error
         assert calls == [original_error]
