@@ -38,7 +38,7 @@ def _require_ulysses_compatible(
     here rather than discovered from the loss curve.
     """
     model_config = getattr(getattr(model, "model", None), "config", None)
-    load_balancer = cfg.context_parallel_load_balancer
+    load_balancer = cfg.cp_config.context_parallel_load_balancer
     if load_balancer is not None:
         raise ValueError(
             "Ulysses CP requires context_parallel_load_balancer=None: the "
@@ -118,7 +118,7 @@ def apply_cp(
     if cfg.cp == 1:
         return model
 
-    if cfg.context_parallel_strategy == "kcp":
+    if cfg.cp_config.context_parallel_strategy == "kcp":
         if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
             raise ValueError("KCP requires a cp mesh")
         if mesh["cp"].size() != cfg.cp:
@@ -131,7 +131,7 @@ def apply_cp(
         patched = apply_kcp(model, mesh["cp"])
         model.set_cp_mesh(
             mesh["cp"],
-            load_balancer=cfg.context_parallel_load_balancer,
+            load_balancer=cfg.cp_config.context_parallel_load_balancer,
             strategy="kcp",
         )
         logger.info("Applied KCP to %d KDA modules", patched)
@@ -162,8 +162,8 @@ def apply_cp(
             f"mesh 'cp' axis has size {cp_mesh.size()}, but cfg requests cp={cfg.cp}."
         )
 
-    strategy = cfg.context_parallel_strategy
-    load_balancer = cfg.context_parallel_load_balancer
+    strategy = cfg.cp_config.context_parallel_strategy
+    load_balancer = cfg.cp_config.context_parallel_load_balancer
     dual_axes = (
         cfg.context_parallel_kv_allgather_size > 1
         and cfg.context_parallel_ulysses_size > 1

@@ -35,7 +35,14 @@ from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
 from llmtuner.config.optimizer_config import OptimizerConfig
-from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.config.parallel_config import (
+    ContextParallelConfig,
+    ExpertParallelConfig,
+    FSDPConfig,
+    ParallelConfig,
+    PipelineParallelConfig,
+    TensorParallelConfig,
+)
 from llmtuner.config.training_config import TrainingConfig
 from llmtuner.errors import ConfigError
 from llmtuner.utils.logging import get_logger
@@ -64,6 +71,11 @@ def parse_config(args: Sequence[str] | None = None) -> LLMTunerConfig:
     return LLMTunerConfig.from_groups(
         model=parsed[ModelConfig],
         parallel=parsed[ParallelConfig],
+        fsdp_config=parsed[FSDPConfig],
+        tp_config=parsed[TensorParallelConfig],
+        pp_config=parsed[PipelineParallelConfig],
+        cp_config=parsed[ContextParallelConfig],
+        ep_config=parsed[ExpertParallelConfig],
         optimizer=parsed[OptimizerConfig],
         lr_scheduler=parsed[LRSchedulerConfig],
         training=parsed[TrainingConfig],

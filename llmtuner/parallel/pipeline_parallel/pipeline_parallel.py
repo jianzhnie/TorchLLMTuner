@@ -170,11 +170,13 @@ def get_pipeline_metadata(
     to two; ``pipeline_parallel_layers_per_stage`` overrides the default and
     is validated against the schedule kind.
     """
-    schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
+    schedule_class = get_schedule_class(
+        parallelism.pp_config.pipeline_parallel_schedule
+    )
     is_single_stage_schedule = issubclass(schedule_class, PipelineScheduleSingle)
-    layers_per_stage = parallelism.pipeline_parallel_layers_per_stage
-    input_weight = parallelism.pipeline_parallel_first_stage_less_layers
-    output_weight = parallelism.pipeline_parallel_last_stage_less_layers
+    layers_per_stage = parallelism.pp_config.pipeline_parallel_layers_per_stage
+    input_weight = parallelism.pp_config.pipeline_parallel_first_stage_less_layers
+    output_weight = parallelism.pp_config.pipeline_parallel_last_stage_less_layers
 
     if layers_per_stage is None:
         stages_per_rank = 1 if is_single_stage_schedule else 2
@@ -196,13 +198,14 @@ def get_pipeline_metadata(
     stages_per_rank = num_stages // parallel_dims.pp
     if is_single_stage_schedule and stages_per_rank != 1:
         raise ValueError(
-            f"Schedule {parallelism.pipeline_parallel_schedule!r} runs exactly "
+            f"Schedule {parallelism.pp_config.pipeline_parallel_schedule!r} "
+            "runs exactly "
             f"1 stage per rank, but the split yields {stages_per_rank}; "
             f"{model_info}."
         )
     if not is_single_stage_schedule and stages_per_rank < 2:
         raise ValueError(
-            f"Schedule {parallelism.pipeline_parallel_schedule!r} needs at "
+            f"Schedule {parallelism.pp_config.pipeline_parallel_schedule!r} needs at "
             f"least 2 stages per rank, but the split yields {stages_per_rank}; "
             f"{model_info}."
         )
@@ -276,7 +279,7 @@ def validate_microbatches(
             f"the data-parallel degree ({dp})"
         )
     rows_per_rank = global_batch_size // dp
-    num_microbatches = cfg.num_pp_microbatches
+    num_microbatches = cfg.pp_config.num_pp_microbatches
     # torchtitan validates this in its config's __post_init__ (trainer.py);
     # llmtuner's config does not, so the check lives here -- a 0 would otherwise
     # surface as a ZeroDivisionError on the modulo below.
@@ -346,7 +349,7 @@ def apply_pp(
     pp_mesh = parallel_dims.get_mesh("pp")
     validate_microbatches(parallel_dims, cfg, global_batch_size)
 
-    module_names_per_stage = parallelism.module_fqns_per_model_part
+    module_names_per_stage = parallelism.pp_config.module_fqns_per_model_part
     if module_names_per_stage is None:
         num_layers = len(model.layers)
         num_stages, input_weight, output_weight = get_pipeline_metadata(
@@ -383,14 +386,16 @@ def apply_pp(
         # schedules (GPipe, 1F1B) drive exactly one stage per rank -- an
         # explicit split with more would have its extra chunks silently
         # dropped by the PipelineScheduleSingle branch.
-        schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
+        schedule_class = get_schedule_class(
+            parallelism.pp_config.pipeline_parallel_schedule
+        )
         if issubclass(schedule_class, PipelineScheduleSingle) and (
             num_stages != parallel_dims.pp
         ):
             raise ValueError(
                 f"module_fqns_per_model_part defines {num_stages} stages "
                 f"({num_stages // parallel_dims.pp} per rank), but schedule "
-                f"{parallelism.pipeline_parallel_schedule!r} drives exactly "
+                f"{parallelism.pp_config.pipeline_parallel_schedule!r} drives exactly "
                 "one stage per rank. Use a looped schedule (e.g. "
                 "interleaved_1f1b) or one stage per rank."
             )
@@ -398,7 +403,7 @@ def apply_pp(
     stages, model_parts = split_model_into_stages(
         model,
         pp_mesh,
-        parallelism.pipeline_parallel_schedule,
+        parallelism.pp_config.pipeline_parallel_schedule,
         device,
         module_names_per_stage,
     )
@@ -429,13 +434,15 @@ def build_pipeline_schedule(
     the logits' shape.
     """
     parallelism = cfg
-    if parallelism.pipeline_parallel_schedule_csv:
+    if parallelism.pp_config.pipeline_parallel_schedule_csv:
         raise NotImplementedError(
             "pipeline_parallel_schedule_csv is not wired: llmtuner builds "
             "schedules by name only."
         )
-    schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
-    num_microbatches = parallelism.num_pp_microbatches
+    schedule_class = get_schedule_class(
+        parallelism.pp_config.pipeline_parallel_schedule
+    )
+    num_microbatches = parallelism.pp_config.num_pp_microbatches
     num_total_stages = parallelism.pipeline_parallel_size * len(stages)
     if num_microbatches < num_total_stages:
         logger.warning(
@@ -478,7 +485,7 @@ def build_pipeline_schedule(
         global_vocab_size=global_vocab_size,
     )
     logger.info(
-        f"Using pipeline schedule {parallelism.pipeline_parallel_schedule} "
+        f"Using pipeline schedule {parallelism.pp_config.pipeline_parallel_schedule} "
         f"with {num_microbatches} microbatches and {num_total_stages} stages."
     )
     return schedule

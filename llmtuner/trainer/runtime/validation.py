@@ -218,8 +218,8 @@ def validate(self: Trainer, step: int) -> None:
             )
             if (
                 mask_type == "block_causal"
-                and self.cfg.parallel.cp > 1
-                and self.cfg.parallel.context_parallel_strategy == "kcp"
+                and self.cfg.parallel.cp_size > 1
+                and self.cfg.parallel.cp_config.context_parallel_strategy == "kcp"
             ):
                 raise ValueError("KCP does not support packed document validation")
             for config in mask_configs.values():

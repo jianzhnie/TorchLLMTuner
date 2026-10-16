@@ -557,7 +557,7 @@ def apply_fsdp(
         param_dtype = torch.get_default_dtype()
     reduce_dtype = torch.float32
 
-    if cfg.fsdp_apply_modules:
+    if cfg.fsdp_config.fsdp_apply_modules:
         apply_fsdp_by_pattern(
             model,
             dp_mesh=storage_mesh,
@@ -576,15 +576,19 @@ def apply_fsdp(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
         pp_enabled=parallel_dims.pp_enabled,
-        cpu_offload=cfg.fsdp_cpu_offload,
-        cpu_offload_pin_memory=cfg.fsdp_cpu_offload_pin_memory,
-        reshard_after_forward_policy=cfg.fsdp_reshard_after_forward,
+        cpu_offload=cfg.fsdp_config.fsdp_cpu_offload,
+        cpu_offload_pin_memory=cfg.fsdp_config.fsdp_cpu_offload_pin_memory,
+        reshard_after_forward_policy=cfg.fsdp_config.fsdp_reshard_after_forward,
         ep_degree=parallel_dims.ep,
         edp_mesh=edp_mesh,
-        symm_mem_scope=(cfg.fsdp_symm_mem_scope if cfg.enable_fsdp_symm_mem else None),
-        forward_prefetch_count=cfg.fsdp_forward_prefetch_count,
-        backward_prefetch_count=cfg.fsdp_backward_prefetch_count,
-        fsdp_implementation=cfg.fsdp_implementation,
+        symm_mem_scope=(
+            cfg.fsdp_config.fsdp_symm_mem_scope
+            if cfg.fsdp_config.enable_fsdp_symm_mem
+            else None
+        ),
+        forward_prefetch_count=cfg.fsdp_config.fsdp_forward_prefetch_count,
+        backward_prefetch_count=cfg.fsdp_config.fsdp_backward_prefetch_count,
+        fsdp_implementation=cfg.fsdp_config.fsdp_implementation,
     )
     # ``apply_fsdp_to_decoder`` already calls ``disable_fsdp_gradient_division``
     # and, when asked, ``enable_fsdp_symm_mem``; do not repeat them here.

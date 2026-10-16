@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
-from functools import wraps
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
@@ -347,7 +346,7 @@ class ParallelConfig:
             self.data_parallel_replicate_size
             * self.tensor_parallel_size
             * self.pipeline_parallel_size
-            * self.cp
+            * self.cp_size
         )
 
     def derive_dp(self, world_size: int) -> int:
@@ -412,7 +411,10 @@ class ParallelConfig:
             )
         for name in ("fsdp_config", "tp_config", "pp_config", "cp_config", "ep_config"):
             getattr(self, name).__post_init__()
-        if self.tp > 1 and not self.tp_config.enable_sequence_parallel:
+        if (
+            self.tensor_parallel_size > 1
+            and not self.tp_config.enable_sequence_parallel
+        ):
             raise UnsupportedCombinationError(
                 "parallel.enable_sequence_parallel=False is not supported: "
                 "llmtuner's tensor parallelism is sequence-parallel by "
@@ -420,11 +422,11 @@ class ParallelConfig:
             )
         if (
             self.context_parallel_kcp_size > 1
-            and self.context_parallel_strategy != "kcp"
+            and self.cp_config.context_parallel_strategy != "kcp"
         ):
             raise ConfigError("context_parallel_kcp_size > 1 requires strategy='kcp'")
-        if self.context_parallel_strategy == "kcp":
-            if self.tp != 1:
+        if self.cp_config.context_parallel_strategy == "kcp":
+            if self.tensor_parallel_size != 1:
                 raise UnsupportedCombinationError("KCP requires tensor_parallel_size=1")
             if (
                 self.context_parallel_kv_allgather_size != 1
@@ -435,14 +437,17 @@ class ParallelConfig:
                 )
         if (
             self.context_parallel_ulysses_size > 1
-            and self.context_parallel_load_balancer is not None
+            and self.cp_config.context_parallel_load_balancer is not None
         ):
             raise UnsupportedCombinationError(
                 "the Ulysses CP axis requires context_parallel_load_balancer=None"
             )
-        if self.ep_token_dispatcher != "alltoall" and self.ep == 1:
+        if (
+            self.ep_config.ep_token_dispatcher != "alltoall"
+            and self.expert_parallel_size == 1
+        ):
             raise UnsupportedCombinationError(
-                f"parallel.ep_token_dispatcher={self.ep_token_dispatcher!r} "
+                f"parallel.ep_token_dispatcher={self.ep_config.ep_token_dispatcher!r} "
                 "has no effect at expert_parallel_size=1; set "
                 "expert_parallel_size > 1 or use 'alltoall'."
             )

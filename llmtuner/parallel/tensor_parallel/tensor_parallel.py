@@ -7,7 +7,7 @@ HOW its activations move around the cut. This file keeps those apart.
   DECLARATION -- plain data, no tensors, no collectives.
 * ``ColumnParallelLinear`` / ``RowParallelLinear`` are the modules that REALIZE a
   declaration, built on the fused collective+GEMM primitives in ``linear_ops.py``.
-* ``apply_tp`` is the ENGINE -- it reads a plan (the model's HF ``tp_plan`` by
+* ``apply_tp`` is the ENGINE -- it reads a plan (the model's HF ``tp_config`` by
   default, or an explicit ``{pattern: ShardingConfig}`` map), cuts each target
   weight and swaps the projection out for its sharded module.
 
@@ -308,8 +308,8 @@ class ReplicatedAttentionSequenceBoundary:
 
 # -- MoE under TP ---------------------------------------------------------------
 
-# The HF tp_plan spec strings that declare MoE-under-TP (transformers 5.x
-# spelling, e.g. Qwen3Moe's ``base_model_tp_plan``). They name no nn.Linear --
+# The HF tp_config spec strings that declare MoE-under-TP (transformers 5.x
+# spelling, e.g. Qwen3Moe's ``base_model_tp_config``). They name no nn.Linear --
 # the expert weights are stacked parameters on the experts module -- so they
 # resolve to None in the plan and are realized by ``realize_moe_blocks_tp``
 # below, which is what keeps the refusal-to-replicate validation honest.
@@ -498,19 +498,19 @@ def rowwise() -> ShardingConfig:
 # -- engine -------------------------------------------------------------------
 
 
-def model_tp_plan(model: nn.Module) -> Mapping[str, str | ShardingConfig]:
+def model_tp_config(model: nn.Module) -> Mapping[str, str | ShardingConfig]:
     """The TP plan ``model`` declares, or ``{}``.
 
-    Prefers the ``tp_plan`` property over the raw ``_tp_plan`` attribute.
+    Prefers the ``tp_config`` property over the raw ``_tp_config`` attribute.
     ``transformers`` exposes the plan as a property on ``PreTrainedModel`` (its
-    instance ``_tp_plan`` built from ``config.base_model_tp_plan`` plus each
+    instance ``_tp_config`` built from ``config.base_model_tp_config`` plus each
     child module's own plan), and ``HFTransformerModel`` re-parents the HF model
     under ``self.model``, so *its* plan has to be rewritten to survive the extra
     level. A wrapper that exposes only the property -- the shape HF itself
     guarantees -- would otherwise be read as "no plan" and shard nothing, so
     this is the one place the two spellings are reconciled.
     """
-    return getattr(model, "tp_plan", None) or getattr(model, "_tp_plan", None) or {}
+    return getattr(model, "tp_config", None) or getattr(model, "_tp_config", None) or {}
 
 
 def resolve_tp_sharding_plan(
@@ -528,7 +528,7 @@ def resolve_tp_sharding_plan(
     raise instead of silently applying sequence-parallel realizers.
     """
     if plan is None:
-        plan = model_tp_plan(model)
+        plan = model_tp_config(model)
     resolved: dict[str, ShardingConfig | None] = {}
     for pattern, spec in plan.items():
         if isinstance(spec, ShardingConfig):
@@ -677,19 +677,19 @@ def resolve_tp_targets(
     loud errors here, raised before any process-group access.
     """
     configured_plan: dict[str, str] = {}
-    for pattern in cfg.tp_colwise_modules:
+    for pattern in cfg.tp_config.tp_colwise_modules:
         configured_plan[pattern] = "colwise"
-    for pattern in cfg.tp_rowwise_modules:
+    for pattern in cfg.tp_config.tp_rowwise_modules:
         if pattern in configured_plan:
             raise ValueError(f"TP pattern {pattern!r} has conflicting styles")
         configured_plan[pattern] = "rowwise"
-    if cfg.tp_sequence_modules:
+    if cfg.tp_config.tp_sequence_modules:
         raise ValueError(
             "tp_sequence_modules is not valid for llmtuner's fused sequence "
             "parallel engine; normalization modules already consume the "
             "sequence shard without a separate transformation"
         )
-    raw_plan = model_tp_plan(model) if plan is None else plan
+    raw_plan = model_tp_config(model) if plan is None else plan
     if configured_plan:
         # Matching uses the first pattern; explicit overrides must come first.
         raw_plan = {
@@ -705,7 +705,7 @@ def resolve_tp_targets(
     if not sharding_plan:
         raise ValueError(
             f"apply_tp with tp={cfg.tp}: {type(model).__name__} provides no TP "
-            "plan (neither a `tp_plan`/`_tp_plan` declaration nor an explicit "
+            "plan (neither a `tp_config`/`_tp_config` declaration nor an explicit "
             "`plan` argument). Refusing to run TP as a silently replicated "
             "model; shard the projections declaratively or set tp=1."
         )
@@ -846,7 +846,7 @@ def apply_tp(
 ) -> nn.Module:
     """Tensor-parallelize ``model`` in place. No-op when ``tp == 1``.
 
-    ``plan`` defaults to the model's HF ``tp_plan`` (HF ships one for Qwen3,
+    ``plan`` defaults to the model's HF ``tp_config`` (HF ships one for Qwen3,
     Llama, ...). Pass an explicit ``{path_pattern: ShardingConfig}`` to override
     it -- e.g. to leave a projection replicated or to use a different realizer.
     """

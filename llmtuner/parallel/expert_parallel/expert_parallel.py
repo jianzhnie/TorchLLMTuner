@@ -33,7 +33,7 @@ def apply_ep(
     attention kernel, so CP and EP compose freely.
     """
     if cfg.ep == 1:
-        if cfg.moe_quantile_balancing:
+        if cfg.ep_config.moe_quantile_balancing:
             compatibility.quantile_requires_ep()
         return model
 
@@ -47,16 +47,16 @@ def apply_ep(
     swapped = swap_hf_moe_blocks(
         model,
         ep_group=ep_group,
-        router_aux_loss_coef=cfg.router_aux_loss_coef,
-        quantile_balancing=cfg.moe_quantile_balancing,
-        fixed_router=cfg.fixed_router,
-        token_dispatcher=cfg.ep_token_dispatcher,
-        torchao_pad_multiple=cfg.ep_torchao_pad_multiple,
+        router_aux_loss_coef=cfg.ep_config.router_aux_loss_coef,
+        quantile_balancing=cfg.ep_config.moe_quantile_balancing,
+        fixed_router=cfg.ep_config.fixed_router,
+        token_dispatcher=cfg.ep_config.ep_token_dispatcher,
+        torchao_pad_multiple=cfg.ep_config.ep_torchao_pad_multiple,
         tp_enabled=cfg.tp > 1,
     )
     logger.info(
         "Applied EP (%s dispatch): swapped %d MoE blocks, degree %d",
-        cfg.ep_token_dispatcher,
+        cfg.ep_config.ep_token_dispatcher,
         swapped,
         cfg.ep,
     )

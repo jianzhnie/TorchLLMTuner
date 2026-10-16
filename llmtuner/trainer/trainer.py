@@ -369,7 +369,7 @@ class Trainer:
     ) -> list[Batch | TrainerBatch]:
         """Split this rank's batch into whole-row pipeline microbatches."""
         return pipeline.split_pipeline_microbatches(
-            batch, num_microbatches=self.cfg.parallel.num_pp_microbatches
+            batch, num_microbatches=self.cfg.parallel.pp_config.num_pp_microbatches
         )
 
     def pp_forward_backward_body(
