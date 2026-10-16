@@ -59,10 +59,38 @@ def main():
                     torch.testing.assert_close(
                         got.grad.full_tensor(), want.grad, atol=1e-12, rtol=1e-12
                     )
+                # Exercise the next unshard after an actual sharded update;
+                # a single backward cannot expose stale parameter views/hooks.
+                optimizer = torch.optim.SGD(root.parameters(), lr=0.1)
+                reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+                optimizer.step()
+                reference_optimizer.step()
+                for got, want in zip(
+                    experts.parameters(), reference.parameters(), strict=True
+                ):
+                    torch.testing.assert_close(
+                        got.full_tensor(), want, atol=1e-12, rtol=1e-12
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                reference_optimizer.zero_grad(set_to_none=True)
+                next_inputs = torch.randn(5, 4, dtype=torch.float64)
+                next_actual = root(next_inputs)
+                next_expected = reference(next_inputs, torch.tensor(counts))
+                torch.testing.assert_close(
+                    next_actual, next_expected, atol=1e-12, rtol=1e-12
+                )
+                next_actual.square().sum().backward()
+                next_expected.square().sum().backward()
+                for got, want in zip(
+                    experts.parameters(), reference.parameters(), strict=True
+                ):
+                    torch.testing.assert_close(
+                        got.grad.full_tensor(), want.grad, atol=1e-12, rtol=1e-12
+                    )
                 if dist.get_rank() == 0:
                     print(
                         f"custom={custom} relocated={relocated}: "
-                        "FSDP MC2 lifecycle passed"
+                        "FSDP MC2 backward/update/next-forward lifecycle passed"
                     )
     finally:
         dist.destroy_process_group()

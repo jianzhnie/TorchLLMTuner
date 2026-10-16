@@ -47,6 +47,23 @@ def test_invalid_nested_output_does_not_modify_earlier_leaves() -> None:
     assert out["first"].item() == 0
 
 
+def test_huggingface_output_preserves_mapping_and_attribute_access() -> None:
+    from transformers.modeling_outputs import BaseModelOutput
+
+    tensor = torch.ones(2)
+    data = BaseModelOutput(last_hidden_state=tensor, hidden_states=(tensor,))
+    moved = move_tensor_tree(data, "meta")
+    assert isinstance(moved, BaseModelOutput)
+    assert moved.last_hidden_state is moved["last_hidden_state"]
+    assert moved.hidden_states is moved["hidden_states"]
+    assert moved.last_hidden_state.device.type == "meta"
+    assert moved.hidden_states[0].device.type == "meta"
+    assert moved.attentions is None
+    assert data.last_hidden_state is tensor
+    assert data.hidden_states[0] is tensor
+    assert tensor.device.type == "cpu"
+
+
 def test_mapping_output_matches_keys_independently_of_order() -> None:
     data = {"first": torch.tensor([1]), "second": [torch.tensor([2])]}
     out = {"second": [torch.tensor([0])], "first": torch.tensor([0])}

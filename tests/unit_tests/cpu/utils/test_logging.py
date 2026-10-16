@@ -266,3 +266,23 @@ def test_closed_file_handler_can_be_reconfigured(logger_name, tmp_path):
     contents = path.read_text(encoding="utf-8")
     assert contents.count("before close") == 1
     assert contents.count("after close") == 1
+
+
+@pytest.mark.parametrize("mode", ["a", "w"])
+def test_closed_attached_file_handler_does_not_hide_reconfigured_output(
+    logger_name, tmp_path, mode
+):
+    path = tmp_path / "train.log"
+    parent = module.get_logger(logger_name, log_file=path, file_mode=mode)
+    child = module.get_logger(f"{logger_name}.child", log_file=path, file_mode=mode)
+    child.info("before close")
+    old = next(h for h in parent.handlers if isinstance(h, module.FileHandler))
+    old.close()
+    module.get_logger(logger_name, log_file=path, file_mode=mode)
+    child.info("after close")
+    contents = path.read_text(encoding="utf-8")
+    assert contents.count("after close") == 1
+    assert ("before close" in contents) == (mode == "a")
+    assert old.stream is None
+    assert old not in parent.handlers
+    assert old in child.handlers

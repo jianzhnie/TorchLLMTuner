@@ -17,7 +17,7 @@ from llmtuner.models.kimi.latent_attention import KimiLatentAttention
 from llmtuner.parallel.context_parallel.kcp import kcp_kda_forward, kcp_mla_attention
 
 
-def run_case(query_rank, gate, padding):
+def run_case(query_rank, gate, padding, additive):
     torch.manual_seed(42)
     config = KimiLinearConfig(
         hidden_size=12,
@@ -46,11 +46,18 @@ def run_case(query_rank, gate, padding):
     full_mask = torch.ones(length, length, dtype=torch.bool).tril()[None, None]
     full_mask = full_mask & valid[:, None, None, :]
     source = inputs.clone().requires_grad_()
-    expected = reference(source, attention_mask=full_mask)
     shard = slice(rank * local_length, (rank + 1) * local_length)
     local = inputs[:, shard].clone().requires_grad_()
     local_mask = torch.ones(local_length, local_length, dtype=torch.bool).tril()
     local_mask = local_mask[None, None] & valid[:, None, None, shard]
+    if additive:
+        full_mask = torch.zeros_like(full_mask, dtype=inputs.dtype).masked_fill(
+            ~full_mask, float("-inf")
+        )
+        local_mask = torch.zeros_like(local_mask, dtype=inputs.dtype).masked_fill(
+            ~local_mask, float("-inf")
+        )
+    expected = reference(source, attention_mask=full_mask)
     actual = model(local, attention_mask=local_mask)
     torch.testing.assert_close(actual, expected[:, shard], atol=1e-6, rtol=1e-6)
     actual.backward(gradient[:, shard])
@@ -64,7 +71,8 @@ def run_case(query_rank, gate, padding):
             parameter.grad, wanted.grad, atol=3e-6, rtol=3e-6, msg=name
         )
     print(
-        f"rank {rank}: MLA q_lora={query_rank}, gate={gate}, padding={padding} passed",
+        f"rank {rank}: MLA q_lora={query_rank}, gate={gate}, "
+        f"padding={padding}, additive={additive} passed",
         flush=True,
     )
 
@@ -75,7 +83,8 @@ def main():
         for query_rank in (None, 4):
             for gate in (False, True):
                 for padding in (False, True):
-                    run_case(query_rank, gate, padding)
+                    for additive in (False, True):
+                        run_case(query_rank, gate, padding, additive)
         # A mask error on one rank must be shared before peers enter all-to-all.
         query = torch.randn(1, 4, 3, 4)
         mask = torch.ones(1, 1, 3, 3, dtype=torch.bool).tril()

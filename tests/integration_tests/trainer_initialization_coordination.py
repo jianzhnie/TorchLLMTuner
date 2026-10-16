@@ -361,6 +361,42 @@ def main():
                     new_group.assert_not_called()
                 dist.barrier()
         print(f"rank={rank}: model checkpoint preparation coordinated", flush=True)
+        # Optimizer services run after real FSDP/optimizer construction. Verify
+        # their local failures roll back both ranks before loader/checkpoint work.
+        original_scheduler = assembly.build_lr_scheduler
+        for failing_rank, error_type in product(
+            (0, 1), (ValueError, KeyboardInterrupt, SystemExit)
+        ):
+            failure = error_type("injected scheduler construction failure")
+
+            def build_scheduler(
+                *args, failing_rank=failing_rank, failure=failure, **kwargs
+            ):
+                if rank == failing_rank:
+                    raise failure
+                return original_scheduler(*args, **kwargs)
+
+            with (
+                patch.object(assembly, "build_lr_scheduler", build_scheduler),
+                patch.object(Trainer, "build_dataloader") as loader,
+            ):
+                try:
+                    failed_constructor(config())
+                except (ValueError, KeyboardInterrupt, SystemExit) as error:
+                    assert rank == failing_rank and error is failure
+                except RuntimeError as error:
+                    assert rank != failing_rank
+                    assert str(error) == (
+                        "Optimizer services construction failed on another rank"
+                    )
+                else:
+                    raise AssertionError("asymmetric scheduler unexpectedly succeeded")
+                loader.assert_not_called()
+            dist.barrier()
+        print(
+            f"rank={rank}: optimizer service errors and interrupts rolled back",
+            flush=True,
+        )
         original_metrics = assembly.MetricsProcessor
         metrics_closed = []
         failure = ValueError("injected metrics backend failure")

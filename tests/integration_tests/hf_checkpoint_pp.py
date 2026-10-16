@@ -116,8 +116,18 @@ def main() -> None:
         dist.barrier()
         if rank == 0:
             exported = {}
-            for shard in (directory / "checkpoint" / "step-1").glob("*.safetensors"):
-                exported.update(load_file(str(shard)))
+            export_path = directory / "checkpoint" / "step-1"
+            index = json.loads(
+                (export_path / "model.safetensors.index.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert index["weight_map"].keys() == reference.keys()
+            for filename in set(index["weight_map"].values()):
+                shard = load_file(str(export_path / filename))
+                for key, owner in index["weight_map"].items():
+                    if owner == filename:
+                        exported[key] = shard[key]
             assert exported.keys() == reference.keys()
             for key, value in reference.items():
                 torch.testing.assert_close(exported[key], value)
