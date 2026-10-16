@@ -2365,3 +2365,78 @@ def test_serialized_tokenizer_takes_priority_over_vocabulary(tmp_path):
     (tmp_path / "vocab.json").write_text("invalid JSON", encoding="utf-8")
     tokenizer = HuggingFaceTokenizer(tokenizer_path=str(tmp_path))
     assert tokenizer.encode("hello") == [1]
+
+
+def test_streaming_graph_cursors_keep_independent_checkpoint_positions():
+    from datasets import IterableDataset
+
+    from llmtuner.datasets.sources import HuggingFaceStreamingIterDataset
+
+    def rows():
+        for index in range(5):
+            yield {"index": index}
+
+    graph = HuggingFaceStreamingIterDataset(
+        IterableDataset.from_generator(rows), repeat=False, shuffle=False
+    )
+    first = iter(graph)
+    second = iter(graph)
+    assert next(first) == {"index": 0}
+    assert next(second) == {"index": 0}
+    second_state = second.get_state()
+    assert next(first) == {"index": 1}
+    assert second.get_state() == second_state
+    assert next(second) == {"index": 1}
+
+    restored = iter(graph)
+    restored.set_state(second_state)
+    assert next(restored) == {"index": 1}
+    assert next(first) == {"index": 2}
+    assert next(second) == {"index": 2}
+
+
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_streaming_cursor_resumes_across_repeated_epochs(shuffle):
+    from datasets import IterableDataset
+
+    from llmtuner.datasets.sources import HuggingFaceStreamingIterDataset
+
+    def rows():
+        for index in range(3):
+            yield {"index": index}
+
+    graph = HuggingFaceStreamingIterDataset(
+        IterableDataset.from_generator(rows), repeat=True, shuffle=shuffle
+    )
+    cursor = iter(graph)
+    assert [next(cursor)["index"] for _ in range(5)] == [0, 1, 2, 0, 1]
+    saved = cursor.get_state()
+    assert saved["epoch"] == 1
+    restored = iter(graph)
+    restored.set_state(saved)
+    expected = [next(cursor) for _ in range(8)]
+    assert [next(restored) for _ in range(8)] == expected
+    assert saved["epoch"] == 1
+
+
+def test_grain_window_shuffle_restores_stream_and_buffer_progress():
+    from datasets import IterableDataset
+
+    from llmtuner.datasets.sources import HuggingFaceStreamingIterDataset
+
+    def rows():
+        for index in range(17):
+            yield {"index": index}
+
+    source = HuggingFaceStreamingIterDataset(
+        IterableDataset.from_generator(rows), repeat=True, shuffle=True
+    )
+    graph = grain.experimental.WindowShuffleIterDataset(source, window_size=5, seed=42)
+    original = iter(graph)
+    for _ in range(9):
+        next(original)
+    saved = original.get_state()
+    expected = [next(original) for _ in range(25)]
+    restored = iter(graph)
+    restored.set_state(saved)
+    assert [next(restored) for _ in range(25)] == expected

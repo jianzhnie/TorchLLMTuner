@@ -344,3 +344,11 @@ def test_leading_dims_mask_flattens_with_the_input() -> None:
     out = moe(x_BTD, padding_mask=mask_BT)
     assert out.shape == x_BTD.shape
     assert moe.tokens_per_expert_E.sum().item() == (~mask_BT).sum().item() * _TOP_K
+
+
+@pytest.mark.parametrize("num_experts", [True, False, 1.5, "4", 0, 3])
+def test_moe_rejects_invalid_or_mismatched_expert_count(num_experts):
+    router = TokenChoiceTopKRouter(4, 8, 2)
+    routed = RoutedExperts(GroupedExperts(8, 8, 4), LocalTokenDispatcher(4, 2))
+    with pytest.raises(ValueError, match="num_experts"):
+        MoE(num_experts, routed, router)

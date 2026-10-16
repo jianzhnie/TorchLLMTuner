@@ -557,3 +557,25 @@ def test_quantile_bias_update_with_no_layers_is_a_noop(monkeypatch):
 
     monkeypatch.setattr(bias_update, "all_reduce", unexpected_collective)
     update_quantile_expert_bias([], parallel_dims=None)
+
+
+@pytest.mark.parametrize(
+    "field", ["num_experts", "dim", "top_k", "num_expert_groups", "num_limited_groups"]
+)
+@pytest.mark.parametrize("value", [True, False, 1.5, "2"])
+def test_router_rejects_noninteger_geometry_before_gate_build(field, value):
+    options = {"num_experts": 8, "dim": 4, "top_k": 1}
+    options[field] = value
+    with pytest.raises(ValueError, match=field + " must be positive integer"):
+        TokenChoiceTopKRouter(**options)
+
+
+@pytest.mark.parametrize("field", ["num_experts", "top_k", "num_bins"])
+@pytest.mark.parametrize("value", [True, False, 1.5, "2", 0])
+def test_quantile_balancer_rejects_invalid_histogram_geometry(field, value):
+    from llmtuner.models.common.moe.routing import QuantileBalancer
+
+    options = {"num_experts": 4, "top_k": 1, "num_bins": 8}
+    options[field] = value
+    with pytest.raises(ValueError, match=field + " must be positive integer"):
+        QuantileBalancer(**options)
