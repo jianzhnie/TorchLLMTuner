@@ -15,7 +15,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.datasets.contracts import Batch, DataloaderExhaustedError
-from llmtuner.trainer.runtime.batch import batch_generator, fetch_batch
+from llmtuner.trainer.runtime.batch import batch_generator, fetch_batch, microbatch
 from llmtuner.trainer.runtime.validation import (
     count_validation_batch_tokens,
     finalize_validation,
@@ -41,6 +41,27 @@ def main():
         rank = dist.get_rank()
         assert dist.get_world_size() == 2
         batch = Batch(input_ids=torch.ones(1, 4), labels=torch.ones(1, 4))
+        for failing_rank in (0, 1):
+            host_batch = {"input": torch.ones(4), "labels": torch.ones(4)}
+            if rank == failing_rank:
+                del host_batch["input"]
+            runtime = SimpleNamespace(
+                parallel_dims=None,
+                ntokens_seen=17,
+                count_valid_tokens=Trainer.count_valid_tokens,
+            )
+            try:
+                microbatch(runtime, host_batch)
+            except KeyError as error:
+                assert rank == failing_rank and error.args == ("input",)
+            except RuntimeError as error:
+                assert rank != failing_rank
+                assert str(error) == "Training token accounting failed on another rank"
+            else:
+                raise AssertionError("token-accounting failure was not coordinated")
+            assert runtime.ntokens_seen == 17
+            dist.barrier()
+            print(f"rank={rank} training accounting rank={failing_rank}: coordinated")
         token_mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("validation_dp",))
         for failing_rank in (0, 1):
             local_batch = (

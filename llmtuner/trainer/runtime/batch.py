@@ -192,9 +192,9 @@ def microbatch(self: Trainer, batch: Batch | TrainerBatch) -> dict[str, Any]:
     sequence_shards = (
         1 if parallel_dims is None else parallel_dims.cp * parallel_dims.tp
     )
-    num_valid_tokens = self.count_valid_tokens(batch)
-
-    num_routing_tokens = count_routing_tokens(batch)
+    with synchronize_local_errors("Training token accounting"):
+        num_valid_tokens = self.count_valid_tokens(batch)
+        num_routing_tokens = count_routing_tokens(batch)
     # Commit accounting only after both counters have been validated.
     self.ntokens_seen += labels.numel() // sequence_shards
 

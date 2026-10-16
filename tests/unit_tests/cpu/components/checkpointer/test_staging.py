@@ -59,3 +59,35 @@ def test_staging_failures_finish_futures_without_breaking_callbacks(
     else:
         assert isinstance(upstream_error, RuntimeError)
         assert upstream_error.__cause__ is failure
+
+
+@pytest.mark.parametrize("mode", ["value", "completed", "pending"])
+def test_staging_success_preserves_snapshot_and_completion_boundary(mode):
+    snapshot = {"model": object()}
+    source = Future()
+    if mode == "completed":
+        source.set_result(snapshot)
+    stage_result = snapshot if mode == "value" else source
+    closed = []
+    stager = CoordinatedStager(
+        SimpleNamespace(
+            stage=lambda state: stage_result,
+            close=lambda: closed.append(True),
+        ),
+        None,
+    )
+
+    upload = stager.stage({"live_state": object()})
+    if mode == "pending":
+        assert not upload.done()
+        assert not stager.completion.done()
+        # Resolve on a worker, as DefaultStager does. The upload must receive
+        # the staged snapshot itself, without rebuilding or reading live state.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(source.set_result, snapshot).result(timeout=5)
+
+    assert upload.result(timeout=5) is snapshot
+    assert stager.completion.result(timeout=5) is None
+    stager.synchronize_staging()
+    stager.close()
+    assert closed == [True]

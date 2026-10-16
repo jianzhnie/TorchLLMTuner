@@ -12,8 +12,10 @@ construction and topology-changing restores are not covered.
 This covers default CPU streams, not private loader or DTensor generators.
 """
 
+import pickle
 import random
 from contextlib import nullcontext
+from copy import deepcopy
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -128,6 +130,10 @@ def main():
                 folder = f"{paths[0]}/{backend}_{mode}"
                 writer = manager(original, folder, async_mode=mode)
                 try:
+                    checkpoint_model = deepcopy(original[0].state_dict())
+                    checkpoint_optimizer = deepcopy(original[2].state_dict())
+                    checkpoint_scheduler = deepcopy(original[3].state_dict())
+                    checkpoint_rng = writer.states[RNG_STATE].state_dict()
                     assert writer.save(2)
                     if mode == "async":
                         assert writer.save_future is not None
@@ -185,6 +191,26 @@ def main():
                             assert torch.equal(torch.get_rng_state(), before[2])
                         dist.barrier()
                     assert reader.load(2)
+                    # Check the actual restored boundary before a stochastic
+                    # update can hide a missing or stale checkpoint component.
+                    torch.testing.assert_close(
+                        resumed[0].state_dict(), checkpoint_model, rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(
+                        resumed[2].state_dict(), checkpoint_optimizer, rtol=0, atol=0
+                    )
+                    assert resumed[3].state_dict() == checkpoint_scheduler
+                    saved_rng = pickle.loads(checkpoint_rng[rng.key])
+                    restored_rng = pickle.loads(rng.state_dict()[rng.key])
+                    for key in saved_rng:
+                        if key == "numpy":
+                            np.testing.assert_equal(restored_rng[key], saved_rng[key])
+                        elif key == "cpu":
+                            torch.testing.assert_close(
+                                restored_rng[key], saved_rng[key], rtol=0, atol=0
+                            )
+                        else:
+                            assert restored_rng[key] == saved_rng[key], key
                 finally:
                     reader.close()
                 actual_losses = [update(resumed) for _ in range(2)]
