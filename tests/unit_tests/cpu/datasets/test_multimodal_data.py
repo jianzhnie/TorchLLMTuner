@@ -439,7 +439,7 @@ def test_process_cc12m_sample_raises_when_the_image_field_is_absent(mm_tokenizer
 def _mm_processor(mm_tokenizer, *, max_context_length=256):
     return MultimodalProcessor(
         context=make_context(mm_tokenizer, max_context_length=max_context_length),
-        sample_processor=process_cc12m_sample,
+        process_sample=process_cc12m_sample,
     )
 
 
@@ -505,7 +505,7 @@ class _CtxSizedMMProcessor(MultimodalProcessor):
 
         super().__init__(
             context=replace(context, max_context_length=1024),
-            sample_processor=process_cc12m_sample,
+            process_sample=process_cc12m_sample,
         )
 
 
@@ -652,6 +652,18 @@ def _ids_of(mm_tokenizer) -> dict[str, int]:
         "vision_end": mm_tokenizer.vision_end_id,
         "pad": mm_tokenizer.pad_id,
     }
+
+
+@pytest.mark.parametrize("budget", [-1, True, 1.5, "128", None])
+def test_collator_rejects_invalid_media_budget(mm_tokenizer, budget):
+    with pytest.raises(ValueError, match="max_images_per_batch.*nonnegative integer"):
+        _collator(mm_tokenizer, max_images_per_batch=budget)
+
+
+def test_collator_accepts_text_with_zero_media_budget(mm_tokenizer, token_ids):
+    batch = _collator(mm_tokenizer, max_images_per_batch=0)([_mm_sample(4, token_ids)])
+    assert batch["pixel_values"] is None
+    assert batch["pixel_values_videos"] is None
 
 
 def test_collator_enforces_the_per_batch_media_budget(mm_tokenizer, image_bytes):
@@ -1079,14 +1091,15 @@ def test_raster_patches_do_not_require_block_merge_divisibility():
 @pytest.mark.parametrize(
     "field", ["patch_size", "temporal_patch_size", "spatial_merge_size"]
 )
-def test_multimodal_constructors_reject_zero_patch_sizes(mm_tokenizer, field):
-    with pytest.raises(ValueError, match="patch sizes must be positive"):
-        _collator(mm_tokenizer, **{field: 0})
-    with pytest.raises(ValueError, match="patch sizes must be positive"):
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "16", None])
+def test_multimodal_constructors_reject_invalid_patch_sizes(mm_tokenizer, field, value):
+    with pytest.raises(ValueError, match=f"{field} must be positive integer"):
+        _collator(mm_tokenizer, **{field: value})
+    with pytest.raises(ValueError, match=f"{field} must be positive integer"):
         MultimodalProcessor(
             context=make_context(mm_tokenizer),
-            sample_processor=process_cc12m_sample,
-            **{field: 0},
+            process_sample=process_cc12m_sample,
+            **{field: value},
         )
 
 

@@ -100,7 +100,7 @@ def test_sharded_weights_reconstruct_the_original() -> None:
 
 def test_plan_resolution_from_hf_string_map() -> None:
     class M(nn.Module):
-        _tp_plan = {
+        _tp_config = {
             "layers.*.q_proj": "colwise",
             "layers.*.o_proj": "rowwise",
         }
@@ -126,7 +126,7 @@ def test_tp_target_resolution_reads_the_model_plan_once(overrides) -> None:
             self.plan_reads = 0
 
         @property
-        def tp_plan(self):
+        def tp_config(self):
             self.plan_reads += 1
             if self.plan_reads > 1:
                 pytest.fail("target resolution must reuse the original plan")
@@ -202,26 +202,26 @@ def test_target_resolution_applies_configured_pattern_overrides():
     assert not moe_blocks
 
 
-def test_plan_resolution_prefers_the_tp_plan_property_over_the_attribute() -> None:
+def test_plan_resolution_prefers_the_tp_config_property_over_the_attribute() -> None:
     """A wrapper that re-parents the model must win over the raw attribute.
 
     ``HFTransformerModel`` holds the HF model under ``self.model``, so its module
-    paths carry a ``model.`` prefix the raw HF plan does not. Reading ``_tp_plan``
+    paths carry a ``model.`` prefix the raw HF plan does not. Reading ``_tp_config``
     off such a wrapper yields patterns that match nothing.
     """
 
     class Wrapper(nn.Module):
-        _tp_plan = {"layers.*.q_proj": "colwise"}
+        _tp_config = {"layers.*.q_proj": "colwise"}
 
         @property
-        def tp_plan(self) -> dict[str, str]:
+        def tp_config(self) -> dict[str, str]:
             return {"model.layers.*.q_proj": "colwise"}
 
     plan = resolve_tp_sharding_plan(Wrapper(), plan=None)
     assert set(plan) == {"model.layers.*.q_proj"}
 
 
-def test_a_wrapper_tp_plan_matches_the_modules_it_exposes() -> None:
+def test_a_wrapper_tp_config_matches_the_modules_it_exposes() -> None:
     """The regression this locks in: TP matched 0 of 15 projections.
 
     Two things had to line up and neither did. The plan lives on the inner HF
@@ -277,7 +277,7 @@ def test_qwen3_plan_resolves_rather_than_raising_on_its_qk_norms() -> None:
     test was a hand-written ``{colwise, rowwise}`` map.
 
     Transformers 4.57 no longer ships that spec for Qwen3 (its
-    ``base_model_tp_plan`` is projections only), so the branch is pinned by
+    ``base_model_tp_config`` is projections only), so the branch is pinned by
     injecting the entry into the real plan rather than by asserting on whatever
     the installed version happens to declare. The branch's meaning is what the
     test is for: a norm entry resolves to ``None`` (left whole on every rank,
@@ -305,7 +305,7 @@ def test_qwen3_plan_resolves_rather_than_raising_on_its_qk_norms() -> None:
     plan = resolve_tp_sharding_plan(model, plan=None)
 
     # And the branch that used to raise, on the same model's real plan.
-    injected = dict(model.tp_plan)
+    injected = dict(model.tp_config)
     injected["model.layers.*.self_attn.q_norm"] = "replicated_with_grad_allreduce"
     injected["model.layers.*.self_attn.k_norm"] = "replicated_with_grad_allreduce"
     resolved = resolve_tp_sharding_plan(model, plan=injected)
@@ -354,7 +354,7 @@ def test_apply_tp_raises_when_the_plan_matches_no_module() -> None:
     """A plan that matches nothing is the same silent-replication failure."""
 
     class Model(nn.Module):
-        _tp_plan = {"*.q_proj": "colwise"}
+        _tp_config = {"*.q_proj": "colwise"}
 
         def __init__(self) -> None:
             super().__init__()
@@ -465,7 +465,7 @@ def test_explicit_tp_pattern_overrides_default_wildcard(monkeypatch):
     from llmtuner.parallel.tensor_parallel import tensor_parallel as tp_module
 
     model = nn.Sequential(nn.Linear(4, 4, bias=False))
-    model._tp_plan = {"*": "colwise"}
+    model._tp_config = {"*": "colwise"}
     mesh = {
         "tp": SimpleNamespace(
             get_group=lambda: object(), size=lambda: 2, get_local_rank=lambda: 0

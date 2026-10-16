@@ -56,6 +56,16 @@ def _config(**parallel_kw) -> LLMTunerConfig:
     return LLMTunerConfig(parallel=ParallelConfig(**parallel_kw))
 
 
+@pytest.mark.parametrize("axes", [[], ["tp", "tp"], ["cp", "tp", "cp"]])
+def test_mesh_query_rejects_empty_or_duplicate_axes_before_initialization(axes):
+    topology = ParallelTopology(
+        dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1
+    )
+    with pytest.raises(ValueError, match="nonempty and unique"):
+        topology.get_optional_mesh(axes)
+    assert topology._world_mesh is None
+
+
 @pytest.fixture(scope="module")
 def single_rank_group(tmp_path_factory):
     """A size-1 gloo group: enough for ``init_device_mesh``, no p2p traffic."""
@@ -66,6 +76,28 @@ def single_rank_group(tmp_path_factory):
     yield
     if created:
         dist.destroy_process_group()
+
+
+def test_failed_mesh_build_does_not_publish_partial_caches(
+    single_rank_group, monkeypatch
+):
+    topology = ParallelTopology(
+        dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1
+    )
+    with monkeypatch.context() as patch:
+
+        def fail_validation(self, meshes):
+            raise ValueError("injected mesh validation failure")
+
+        patch.setattr(ParallelTopology, "_validate_meshes", fail_validation)
+        with pytest.raises(ValueError, match="injected mesh validation failure"):
+            topology.build_device_mesh()
+    assert topology._world_mesh is None
+    assert topology._single_axis_meshes == {}
+    assert topology._multi_axis_meshes == {}
+    world_mesh = topology.build_device_mesh()
+    assert topology.build_device_mesh() is world_mesh
+    assert topology.get_mesh("dp_shard").size() == 1
 
 
 def _dims(world_size: int = 8, **overrides) -> ParallelTopology:
