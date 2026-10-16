@@ -1149,3 +1149,40 @@ def test_swap_rejects_external_fused_expert_alias_before_installation(whole_bloc
     )
     assert model.external_expert is (original_blocks[0] if whole_block else original)
     assert AuxLoss._group_counts == before_counts
+
+
+def test_direct_swap_rejects_fixed_quantile_conflict_before_replacing_blocks():
+    model = _deepseek_model(n_group=1, topk_group=1)
+    original = [layer.mlp for layer in model.layers]
+    with pytest.raises(UnsupportedCombinationError, match="fixed_router.*quantile"):
+        swap_hf_moe_blocks(model, fixed_router=True, quantile_balancing=True)
+    assert all(
+        layer.mlp is block for layer, block in zip(model.layers, original, strict=True)
+    )
+
+
+def test_fixed_router_ep1_public_assembly_runs_constant_routing():
+    from llmtuner.config.parallel_config import ExpertParallelConfig, ParallelConfig
+    from llmtuner.parallel.parallelize import parallelize_hf_transformers
+    from tests.integration_tests.fixed_router_ep_equivalence import explicit_reference
+
+    reference = _model(_config(norm_topk_prob=True))
+    target = _model(_config(norm_topk_prob=True))
+    original = target.layers[0].mlp
+    inputs = torch.randn(5, 64, dtype=torch.float64)
+    expected, _, _ = explicit_reference(
+        reference.layers[0].mlp, inputs, torch.zeros(5, dtype=torch.bool)
+    )
+    result = parallelize_hf_transformers(
+        target,
+        cfg=ParallelConfig(ep_config=ExpertParallelConfig(fixed_router=True)),
+        mesh=None,
+        parallel_dims=None,
+    )
+    assert result is target
+    block = target.layers[0].mlp
+    assert block is not original
+    assert block.router.fixed_router
+    assert block.routed_experts.inner_experts.w1_EFD.shape == (8, 48, 64)
+    actual = block(inputs)
+    torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)

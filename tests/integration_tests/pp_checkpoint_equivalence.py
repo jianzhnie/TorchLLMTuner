@@ -83,6 +83,9 @@ E4/top2 group-limited Kimi experts and one shared expert. Add
 LLMTUNER_TEST_EP_SIZE=2 for native alltoall EP2/custom-FSDP recovery.
 LLMTUNER_TEST_KIMI_LATENT=1 adds width32 latent projections and RMSNorm.
 
+Set LLMTUNER_TEST_FIXED_ROUTER=1 with LLMTUNER_TEST_MOE=1 and PP_SIZE=1
+to verify fixed routing, including EP1 local experts, through Trainer recovery.
+
 Set LLMTUNER_TEST_MOE=1 and LLMTUNER_TEST_EP_SIZE=2 on four ranks
 (LLMTUNER_TEST_WORLD_SIZE=4, LLMTUNER_TEST_PP_SIZE=1) for real qwen3_moe
 EP2/FSDP4 recovery. Add LLMTUNER_TEST_TP_SIZE=2 for TP2/EP2 with
@@ -295,6 +298,7 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
             expert_parallel_size=int(os.environ.get("LLMTUNER_TEST_EP_SIZE", "1")),
             ep_config=ExpertParallelConfig(
                 moe_quantile_balancing=quantile,
+                fixed_router=os.environ.get("LLMTUNER_TEST_FIXED_ROUTER") == "1",
                 ep_token_dispatcher=os.environ.get(
                     "LLMTUNER_TEST_DISPATCHER", "alltoall"
                 ),
@@ -396,6 +400,15 @@ def _train_steps(trainer: Trainer, data_iterator, num_steps: int) -> list[float]
 
 
 def _assert_shared_layers(trainer: Trainer) -> None:
+    if os.environ.get("LLMTUNER_TEST_FIXED_ROUTER") == "1":
+        from llmtuner.models.common.moe.layer import MoE
+
+        for layer in trainer.model_parts[0].layers:
+            assert isinstance(layer.mlp, MoE)
+            assert layer.mlp.router.fixed_router
+            assert layer.mlp.routed_experts.inner_experts.w1_EFD.shape[0] == (
+                8 // trainer.parallel_dims.ep
+            )
     if os.environ.get("LLMTUNER_TEST_DISPATCHER") == "domino":
         from llmtuner.parallel.expert_parallel.domino_dispatch import (
             DominoRoutedExperts,

@@ -1128,3 +1128,19 @@ def test_sft_fields_reject_invalid_names(field, value):
         options["chat_renderer"] = "renderer"
     with pytest.raises(ConfigError, match=field):
         DataloaderConfig(**options, **{field: value})
+
+
+def test_fixed_router_ep1_tp_layout_rejected_before_transform():
+    from llmtuner.config.parallel_config import ExpertParallelConfig, ParallelConfig
+    from llmtuner.errors import UnsupportedCombinationError
+
+    with pytest.raises(UnsupportedCombinationError, match="feature-sharded TP"):
+        ParallelConfig(
+            tensor_parallel_size=2,
+            ep_config=ExpertParallelConfig(fixed_router=True),
+        )
+    ParallelConfig(
+        tensor_parallel_size=2,
+        expert_parallel_size=2,
+        ep_config=ExpertParallelConfig(fixed_router=True),
+    )

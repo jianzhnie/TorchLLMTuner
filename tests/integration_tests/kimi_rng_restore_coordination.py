@@ -5,6 +5,7 @@ Uses small real Kimi MoE modules, not a full Trainer or device RNG setter.
 """
 
 from contextlib import nullcontext
+from itertools import product
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -29,7 +30,7 @@ def main():
         with context as root:
             paths = [root]
             dist.broadcast_object_list(paths, src=0)
-            for source_grouped in (False, True):
+            for source_grouped, source_compiled in product((False, True), repeat=2):
                 torch.manual_seed(11)
                 source = torch.nn.Module()
                 source.model = make_model(latent=True, shared=1)
@@ -38,9 +39,14 @@ def main():
                     swap_hf_moe_blocks(source.model)
                 torch.manual_seed(100 + rank)
                 rng = RNGCheckpointState(torch.device("cpu"))
-                saved = dict(source.state_dict())
+                saved_model = (
+                    torch.compile(source, backend="eager")
+                    if source_compiled
+                    else source
+                )
+                saved = dict(saved_model.state_dict())
                 saved["rng_state"] = rng
-                folder = f"{paths[0]}/{source_grouped}"
+                folder = f"{paths[0]}/{source_grouped}-{source_compiled}"
                 dcp.save(saved, checkpoint_id=folder)
                 expected_random = torch.rand(5)
                 target = torch.nn.Module()
@@ -85,7 +91,10 @@ def main():
                 )
                 dist.barrier()
                 if rank == 0:
-                    print(f"source_grouped={source_grouped}: RNG failure coordinated")
+                    print(
+                        f"source_grouped={source_grouped}, "
+                        f"source_compiled={source_compiled}: RNG failure coordinated"
+                    )
     finally:
         dist.destroy_process_group()
 
