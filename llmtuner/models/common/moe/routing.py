@@ -52,6 +52,8 @@ class TokenChoiceTopKRouter(nn.Module):
             ``MicrobatchWiseLoadBalanceLoss``) run on the scores each training
             forward; its gradient is injected on the top-k scores' backward
             path. ``None`` disables it.
+        fixed_router: use FSDPTurbo debug routing: expert ``(t + k) % E``
+            and constant weights ``1 / K``, ignoring normalization and scale.
         _debug_force_load_balance: replace the routing decision with a
             round-robin assignment that lands exactly the same number of tokens
             on every expert, so a load-imbalance bug can be told apart from a
@@ -73,6 +75,7 @@ class TokenChoiceTopKRouter(nn.Module):
         num_limited_groups: int | None = None,
         aux_loss: AuxLoss | None = None,
         _debug_force_load_balance: bool = False,
+        fixed_router: bool = False,
     ) -> None:
         super().__init__()
         for name, value in (
@@ -97,6 +100,7 @@ class TokenChoiceTopKRouter(nn.Module):
         ):
             raise ValueError("route_scale must be a finite real number")
         for name, value in (
+            ("fixed_router", fixed_router),
             ("route_norm", route_norm),
             ("_debug_force_load_balance", _debug_force_load_balance),
         ):
@@ -138,6 +142,7 @@ class TokenChoiceTopKRouter(nn.Module):
         self.num_limited_groups = num_limited_groups
         self.aux_loss = aux_loss
         self._debug_force_load_balance = _debug_force_load_balance
+        self.fixed_router = fixed_router
 
     def _select_balanced_experts(self, scores_TE: torch.Tensor) -> torch.Tensor:
         """Balanced round-robin expert assignment.
@@ -284,7 +289,12 @@ class TokenChoiceTopKRouter(nn.Module):
                     f"{tuple(scores_TE.shape)}."
                 )
 
-        if self._debug_force_load_balance:
+        if self.fixed_router:
+            topk_expert_ids_TK = (
+                torch.arange(scores_TE.shape[0], device=scores_TE.device)[:, None]
+                + torch.arange(self.top_k, device=scores_TE.device)[None, :]
+            ) % self.num_experts
+        elif self._debug_force_load_balance:
             # The bias and the group restriction are both bypassed: the point
             # of the flag is a routing decision nothing downstream can skew.
             topk_expert_ids_TK = self._select_balanced_experts(scores_TE)
@@ -292,13 +302,18 @@ class TokenChoiceTopKRouter(nn.Module):
             topk_expert_ids_TK = self._select_experts(
                 scores_TE, expert_bias_E, padding_mask_T=padding_mask_T
             )
-        # Every selection path carries unbiased scores to the chosen experts.
-        topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
-
-        if self.route_norm:
-            denominator = topk_scores_TK.sum(dim=-1, keepdim=True) + 1e-20
-            topk_scores_TK = topk_scores_TK / denominator
-        topk_scores_TK = topk_scores_TK * self.route_scale
+        if self.fixed_router:
+            # Match FSDPTurbo's fixed_router_for_debug: constant detached
+            # weights replace the complete routing result, including scale.
+            topk_scores_TK = scores_TE.new_full(
+                topk_expert_ids_TK.shape, 1.0 / self.top_k
+            )
+        else:
+            topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
+            if self.route_norm:
+                denominator = topk_scores_TK.sum(dim=-1, keepdim=True) + 1e-20
+                topk_scores_TK = topk_scores_TK / denominator
+            topk_scores_TK = topk_scores_TK * self.route_scale
 
         # One-hot map marking each token's chosen experts. Built by scatter so
         # a token choosing the same expert twice (route_norm edge case) still

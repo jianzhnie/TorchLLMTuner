@@ -256,7 +256,9 @@ class ExpertParallelConfig:
     """
 
     fixed_router: bool = False
-    """Debug-only deterministic round-robin routing."""
+    """Debug-only expert (token + slot) % E assignment with constant 1/K weights.
+    EP=1 uses local routing and currently requires TP=1.
+    """
 
     ep_token_dispatcher: str = "alltoall"
     """EP backend: alltoall, torchao, or domino. Other registered backends are
@@ -470,6 +472,16 @@ class ParallelConfig:
         ):
             raise UnsupportedCombinationError(
                 "the Ulysses CP axis requires context_parallel_load_balancer=None"
+            )
+        if (
+            self.ep_config.fixed_router
+            and self.expert_parallel_size == 1
+            and self.tensor_parallel_size > 1
+        ):
+            raise UnsupportedCombinationError(
+                "parallel.ep_config.fixed_router with expert_parallel_size=1 "
+                "requires tensor_parallel_size=1; fixed routing is not yet "
+                "adapted to the HF feature-sharded TP expert layout"
             )
         if (
             self.ep_config.ep_token_dispatcher != "alltoall"
