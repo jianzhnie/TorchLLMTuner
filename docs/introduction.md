@@ -60,7 +60,10 @@ efsdp = (dp_shard × cp × tp) / ep
 - 支持从模型标识自动补全架构参数，也可用 `arch_overrides` 覆盖特定字段；
 - HF 状态字典与并行后模型之间的适配；
 - 基于 Grain 的数据流水线；
-- 随机数据、JSONL、Hugging Face dataset、文本 packing 和多模态 batch；
+- 随机数据、JSONL、Hugging Face dataset 和文本 packing；
+- 多模态处理、packing 与 batch 构建；当前 `HFTransformerModel` 是文本 decoder
+  适配器，不消费图片、视频或 MRoPE 输入，遇到这些字段会明确报错；完整视觉训练
+  仍需实现消费媒体及位置元数据的模型适配器；
 - chat template 和可选的多轮 renderer。
 
 具体模型能否启用 TP 或 EP 取决于其模块布局、TP plan 和 MoE 专家结构。框架在探测到未知或不安全的布局时会拒绝应用对应并行策略。
@@ -345,3 +348,62 @@ pre-commit run --all-files
 
 - `docs/torchllmtuner_design.md`
 - `docs/llmtuner_upstream_map.md`
+
+### 本地文本数据的恢复身份
+
+`local_jsonl` 和 `local_jsonl_sft` 的 loader 会保存数据身份指纹，包含数据配置、
+seed、重复策略、匹配 JSONL 文件的内容及 tokenizer 相关文件的内容。
+同路径替换内容也会改变指纹；相同内容放在不同rank目录时身份保持一致。
+目录路径和prefetch深度不影响指纹，恢复前身份不匹配会拒绝加载数据游标。
+内容哈希会增加构建时的读取成本，且不保护构建后对文件的修改。
+
+缺少身份字段的旧本地文本 checkpoint 不能直接恢复 loader。
+如果明确要保留模型和优化器状态、重新开始数据流，可通过
+`checkpoint.exclude_from_loading` 排除 `dataloader`；这不是精确续训。
+自定义 Grain 图可向 `GrainDataLoader` 传入 `data_identity`，由调用方保证其含义。
+注册数据集及远端数据目前没有自动内容身份校验，仍须保证来源和处理配置不变。
+
+配置驱动的注册或远端数据可设置 `dataloader.data_identity`（CLI：
+`--data_identity dataset-commit:abc/recipe-v1`），声明数据快照和配方版本。
+loader 将该标识与数据配置、seed、重复策略及本地 tokenizer 资产内容共同
+生成恢复指纹，变化时在恢复游标前拒绝加载。未设置时保持原有行为。
+此标识不会下载或检查远端内容；调用方须固定实际来源版本，并在数据内容或
+配方语义变化时更新标识。相同标识不能证明远端内容相同。
+本地文本设置此字段时仍保留 JSONL 内容哈希；synthetic 数据不接受该字段。
+
+### 有限训练数据耗尽
+
+训练会在前向之前读取完整梯度累积窗口。任一 rank 耗尽数据时，所有 rank
+协调取消不足的窗口，不执行该窗口的参数更新；数据游标及 `ntokens_seen`
+仍反映已读取的数据，不回滚为最后一次更新前的位置。
+
+如果已有完成的训练 step，数据耗尽会按最后完成的 step 强制触发最终保存策略，
+即使它未达到配置的训练步数或保存间隔。checkpoint 禁用时不会写入文件；
+最终保存配置为 model-only 或 HF 导出时，产物不能替代完整训练状态用于精确恢复。
+尚未完成任何 step 的新运行不会因数据耗尽创建 step-0 checkpoint。
+
+### CPU 归一化后端
+
+`model.norm_backend` 默认为 `native`。Qwen3/Qwen3 MoE 可显式选择 `aten`
+（CLI：`--norm_backend aten`），使用 ATen RMSNorm 前后向边界控制 eager 与
+Inductor 的归约差异。该选项只支持 CPU、float16/bfloat16/float32 输入和
+一阶梯度；默认 native 保留编译融合。参数身份及 checkpoint 权重键保持不变，
+后端属于运行配置，恢复时应明确设置。旧运行的逐位训练轨迹不能由权重兼容推出。
+
+aten 会牺牲融合性能，不建议作为通用加速后端。已验证 CPU/Gloo 下特定
+custom FSDP、full activation checkpoint、dynamic EMA 的同模式及
+Inductor → eager 严格恢复；这不代表所有模型、布局或并行组合均已验证。
+
+生产 ATen RMSNorm 另有 CPU/Gloo 的 2-rank 和 2×2 mesh DTensor 前后向验证，
+覆盖复制、序列分片及隐藏维重分布，含实际 Inductor 编译；可运行
+`tests/integration_tests/aten_norm_dtensor_equivalence.py` 复核。
+该算子级结果不替代完整 TP/FSDP 训练组合或混合精度验证。
+
+### 编译与低精度重计算
+
+Inductor 默认可省略融合算子间的低精度转换。BF16 checkpoint 重计算因此可能
+与 eager 产生不同梯度，即使输出一致。需要保留 eager 转换语义时，可在启动前
+设置 `TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1`。已验证双 rank custom
+FSDP 的小型混合精度 Block 矩阵；该设置可能影响性能，不保证全部模型或设备
+逐位一致。复核入口：`fine_grained_mixed_precision.py --local-probe` 及
+`--checkpoint --compile-backend inductor`；原始融合路径差异保留在审查台账。

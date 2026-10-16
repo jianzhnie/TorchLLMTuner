@@ -1,9 +1,21 @@
 # llmtuner → torchtitan 对应关系表
 
-[llmtuner](../llmtuner) 拿掉了 TorchTitan 的 `Configurable` 与 `Module` 两个抽象层，换来一个
-明显更短的框架：126 个 Python 模块（102 个实现模块）、约 30.7k 行，覆盖 TP / FSDP2 /
-CP / EP / PP 五条并行路径的装配、训练循环、checkpoint 与等价性测试。本文是这些模块与
-torchtitan 之间对应关系的**唯一权威**。
+[llmtuner](../llmtuner) 使用普通 dataclass 配置与 HF 模型适配，覆盖
+TP / FSDP / CP / EP / PP 的装配、训练和 checkpoint。模块清单及当前数量以
+[逐文件审查台账](file_review.md) 为准；本表记录上游机制对应关系与本项目适配。
+历史 AST 相似度和批次结果仅对应其记录时的版本，不代表当前逐行一致。
+
+### Qwen3 归一化适配来源
+
+`models/hf/model_setup.py` 的 residual norm view 和 `models/hf/normalization.py`
+的显式 ATen 后端是本项目针对 HF Qwen3/Qwen3 MoE eager/AOT/Inductor 舍入
+与恢复契约的适配。参考对象是 HF 原生 RMSNorm；不属于 torchtitan norm 的
+直接搬运，也不套用高保真源码同步规则。检查本地 torchtitan commit
+`01b1b69e3` 的 `torchtitan/models/common/norm.py` 时，其 GatedRMSNorm 使用
+不同实现边界，不能以名称相近推导数值路径相同。
+
+生产配置、支持范围与证据见
+[并行实现比较](distributed_implementation_comparison.md#当前生产归一化与编译状态2026-10-15)。
 
 ## 怎么用这张表
 
@@ -135,6 +147,8 @@ C 类上会把项目**故意删掉**的抽象又拽回来。
 | `utils/logging.py` | `get_logger`（彩色 formatter + 发射时 rank 过滤，默认 INFO）、`get_distributed_rank` | C |
 | `utils/monitoring.py` | 与 `tools/utils.py` 0.107，独立实现（含 `get_peak_flops`） |
 | `components/checkpointer/checkpoint_keys.py` | 上游无 |
+| `components/checkpointer/checkpoint_writer.py` | DCP generation shard，本地/file:// 原子 metadata 替换与对象存储整对象发布；基于 PyTorch FileSystemWriter/fsspec 的必要适配，torchtitan `components/checkpointer/dcp.py` 无对应机制。memory/file 失败恢复已验证，S3/GCS 实测及断电持久性未覆盖。 |
+| `components/checkpointer/hf_storage.py` | 基于 PyTorch HF reader/consolidation 格式；本项目按索引选取 tensor，generation 发布及协调合并/发布失败。torchtitan `components/checkpointer/dcp.py` 无此发布机制；只覆盖本地 HF。 |
 | `accelerator/device.py` | 上游无（0.382 是噪音，命中实验目录） |
 | `models/common/activation.py` | 与上游同名但不同源；公式由 llmtuner 自持，不能按 A 类覆盖 |
 | `models/common/embedding.py` | 与上游同名但不同源；VocabParallelEmbedding 使用 llmtuner 的 vocab-shard 契约（HF 自带 tok_embeddings；vocab-shard 公式由 components/loss.py 自持）；未自动接入 HF TP 路径 |
@@ -785,7 +799,7 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 | `QuantileBalancedTopKRouter`, `QuantileBalancer`, `register_moe_balancing_hook` | 上游 f8bb599a7 的 quantile router/balancer 与 `register_moe_quantile_balancing_hook`（本地合并注册入口） | 训练时 biased top-(K+1)：前 K dispatch、第 K+1 个 biased 分为 cutoff；1000-bin int32 直方图（non-persistent）按 token 分片轴 all-reduce 后取 `top_k/num_experts` 分位数（bin 内插值），mean-centred 覆写 `expert_bias_E`；与 sign-based bias 互斥（同层构造 raise、跨层 hook raise、全 quantile 时统一入口仅注册 quantile 更新）；`ParallelConfig.moe_quantile_balancing` 启用，**通过（适配）** |
 | `MoE.update_expert_bias` | 上游 expert bias 更新 | 在 optimizer step hook 执行；跨 PP part 汇总，**通过**。注册严格性与上游对齐：所有 MoE层 `load_balance_coeff` 混合配置（部分为 None）即 `ValueError`（上游 `_should_register_moe_balancing_hook` 同源），coeff 全 None 时不注册 hook（免每步无谓 collective） |
 | `MicrobatchWiseLoadBalanceLoss` | 上游 load-balance loss | llmtuner 用 autograd carrier 注入，按全局 routed-token 数归一（含 masked prompt、不含 padding）。通用 `PartialToInvariantAllReduce` 定义移到 `accelerator/collectives.py`；模型保留 token-partition axes 与公式选择，前向 sum、反向 identity 语义保持。CPU 通信契约及 loss 回归通过，实际多进程数值等价另行验证。 |
-| `aux_loss.AuxLoss.inject/collect_aux_loss_metrics` | `models/common/aux_loss.py` | 去全局 Module registry，使用显式寄存器与 step denominator；`reduce_mesh="dp"` ↔ llmtuner `"batch"` 是 mesh 命名适配。step 本地汇总命名为 `rollup_aux_loss_metrics`，注册入口为 `register_aux_loss_metrics_hook`，替代旧 zero 命名，无兼容别名。收集直接遍历排序后的 group counts，缺少本地实例时仍以零参与归约；mesh/PP 归约次序和 layer mean 分母保持，CPU 回归通过，真实分布式数值验证另行执行。 |
+| `aux_loss.AuxLoss.inject/collect_aux_loss_metrics` | `models/common/aux_loss.py` | Trainer把step denominator写入当前model parts的实例，optimizer pre-hook将指标保存为实例快照；收集按当前实例去重计数，跨PP交换group keys，空stage仍以零归约。保留无model_parts的独立调用类默认值。`reduce_mesh="dp"` ↔ llmtuner `"batch"` 是mesh命名适配；`rollup_aux_loss_metrics`与`register_aux_loss_metrics_hook`承担汇总和注册。新step丢弃失败累积，mesh/PP归约顺序和layer mean保持。CPU隔离回归、2rank PP指标及4rank PP2×EP2/full AC独立梯度和参数参考通过；目标设备及全部组合待验证。 |
 | `LocalTokenDispatcher` | `models/common/token_dispatcher.py` | 本地排序、dispatch/combine 与上游同意图，**通过** |
 | `AllToAllTokenDispatcher` | 上游 EP dispatcher | llmtuner 直接操作本地专家切片和 PG，非 MinimalAsyncEP（上游已删除该实验），**通过（适配）** |
 | `LocalTokenDispatcher`/`AllToAllTokenDispatcher` 的索引数学 | 上游同名方法 | `_local_reorder`（stable argsort，索引再除 `top_k`）、`_permute`（rank-major → expert-major：`input_starts[seg_ids] + arange − output_starts[seg_ids]`）、`_unpermute`（`new_empty` + index put）、`combine`（fp32 乘 score + `deterministic_scatter_add`）与上游逐字一致；`all_to_all_single` + `materialize` 对应上游编译分支的 `all_to_all_single`/`wait_tensor`（非编译分支的 `spmd.all_to_all` 只是同一 collective 的 SPMD 包装）。注意：`BaseEPTokenDispatcher.num_experts` 是全局专家数（`convert.py` 传全局 E，上游 DeepEP/HybridEP 亦用 `self.num_experts // ep_group.size()`） |
@@ -870,7 +884,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 | `TextSequence`, `SampleProcessor`, `SingleDataset` | `components/data/dataset.py` | 使用 dataclass 与自由构建函数。map 迭代策略集中在 `apply_iteration_policy`：全局 shuffle、连续 DP 切片、repeat；以 `divmod` 和 `min(rank, remainder)` 分配余数，single 与 concat 复用。mix 保留 `seed + index` 派生；concat 子策略为 `shuffle=False, repeat=False, dp=0/1`。CPU 回归覆盖分片顺序与完整覆盖，不代表硬件 collective 验证。 |
 | `WeightedDataset`, `DatasetMix`, `DatasetConcat` | 同文件 config nodes | 数据组合语义保留，**通过** |
 | `build_dataset` 与 `build_*` | 上游各 config `.build()` | llmtuner 工厂替代对象构建协议，**通过（适配）** |
-| source 类与 `build_source` | `components/data/sources.py` | 同上；HF streaming cursor 显式 Stateful。AST 归一化 6 hunk 全是 Configurable→dataclass+`build_source` 分派；索引 JSONL 解析、`split_dataset_by_node`、streaming 不支持精确 resume 的拒绝、`load_dataset` 一等字段与 kwargs 冲突校验（提成 `reject_duplicated_hf_fields`）全部逐字一致，**通过** |
+| source 类与 `build_source` | `components/data/sources.py` | 适配为dataclass描述与build_source分派；JSONL索引、HF显式字段和kwargs冲突校验、split_dataset_by_node保留来源语义。每个Grain cursor深拷贝HF source以隔离进度；恢复前关闭旧generator，恢复或重复epoch重置失败后关闭cursor并保留原始异常。实际HF重复epoch及Grain window shuffle恢复CPU回归通过。精确续读依赖HF state_dict覆盖，不使用无法恢复buffer内容的HF内置shuffle；网络来源版本与内容一致性另行保证。 |
 | `GrainDataLoader` | `components/data/loader.py` | 直接收参数，无 loader Config，state round-trip 保留。`dataset.batch(collator.num_rows_per_batch(), drop_remainder=repeat, batch_fn=collator)` 与 `ThreadPrefetchIterDataset(prefetch_buffer_size=num_prefetch_batches)` 逐字相同；差异只是数据集图由调用方建好再传入（`DataloaderConfig` 单入口设计的 C 类工厂），**通过** |
 | `TextCollator` | `components/data/collators.py` | packed labels/positions 与 valid-token 计数契约。上游 d398a8fb9/ec953b360 已把 `batch` 改名 `microbatch` 并引入 `TrainingMicrobatch` 类型；llmtuner 保持 dict 版 `TrainerBatch`（labels 与 num_valid_tokens 已内含），语义等价，属故意分叉。载荷逐字一致（zeros+cat、超长 raise、`positions[num_tokens:].remainder_()`、`num_valid_tokens=(labels != IGNORE_INDEX).sum()`）；**一处设备面差异登记**：`HAS_PIN_MEMORY` 上游用 `torch.accelerator.is_available()`（有加速器），llmtuner 用 `should_use_pin_memory()`（本进程解析出的设备是加速器），"有 GPU 但 `--use_cpu`"时前者 True、后者 False，后者更贴合 pin 内存的实际用途，**通过** |
 | packing build 函数和 iterators | `components/data/packing.py` | registry 选择移到 `DataloaderConfig.packing`，算法保留；document-aware iterator、padding_mask 与可恢复 remainder 均已含上游 f23d7dfe2 载荷。AST 归一化仅 3 hunk（`Config.build()` → `build_*_packing()` 自由函数），grain 图逐字相同（`length_struct`/`padding_struct` 的 `IGNORE_INDEX`/`True` 填充、`meta_features`、`seed`/`shuffle_bins`/`num_packing_bins`/`max_sequences_per_bin`，以及 `DocumentAwareConcatThenSplitIterator` 的 `get_state`/`set_state`），**通过** |
@@ -1588,3 +1602,145 @@ parallel stage 顺序及 checkpoint 状态注册语义。
 本仓库 gather_expert_state/load_expert_state 的 shard_map 和
 model_parts 改为关键字参数；全 tensor expert checkpoint 格式与
 跨 EP degree 的恢复语义保持不变。
+
+## FSDPTurbo MC2 适配来源
+
+| llmtuner | FSDPTurbo | 适配与验证边界 |
+| --- | --- | --- |
+| `parallel/expert_parallel/mc2_ops.py` | `ops/npu/grouped_matmul_mc2.py` | 融合通信/GEMM及反向；可选依赖懒加载，shared experts 在 MoE 外层执行；CPU 模拟通过，NPU 内核待验证 |
+| `parallel/expert_parallel/mc2_dispatch.py` | `distributed/expert_parallel/dispatcher_mc2.py` | 复用本地排序/count exchange；MC2GroupedExperts拥有参数及融合forward以触发FSDP hooks，可微拼接 gate/up，保留 w1/w3/w2 checkpoint 布局；TP 尚未适配 |
+
+目标设备验证使用 `tests/integration_tests/ep_mc2_equivalence.py`，要求两张
+Ascend 设备、HCCL 及 torch_npu 的 `npu_alltoallv_gmm`、`npu_gmm_alltoallv`、
+`npu_grouped_matmul`。当前接线和 CPU 代数证据不代表真实融合内核已验证。
+
+### Kimi EP adapter (2026-10-15)
+
+`parallel/expert_parallel/kimi_conversion.py` adapts Kimi routing and latent
+projection ownership from FSDPTurbo commit
+`0af4eca242c14ebff254dab1a38045f1395fa520`,
+`models/kimi/modeling_kimi_linear.py`, to this repository's `GroupedExperts`,
+`TokenChoiceTopKRouter` and native all-to-all dispatcher. It stacks local
+individual expert projections without transposing them. The gate and shared
+expert consume the original input; latent normalization and up projection run
+after weighted combine. The source correction bias remains the same Parameter,
+with no sign-based automatic update. Native model/optimizer/EMA recovery is
+verified for CPU EP2/custom-FSDP2; original HF key conversion, other Kimi dispatch
+backends, TP composition and device validation remain open (KIMI-EP-01).
+
+Kimi HF layout mapping is implemented in `models/kimi/checkpoint.py`, consuming
+full tensors from the EP checkpoint gather before translating grouped expert
+projections back to the original `experts.N.w{1,2,3}.weight` schema. The explicit
+HF adapter flag preserves the unconverted-model path. CPU EP2 gather/export/
+independent import/slice is verified; Trainer HF initialization and native
+optimizer/EMA migration across EP on/off remain open (KIMI-HF-STATE-01).
+
+KIMI-HF-INIT-01 validates the real Trainer HF initialization path for Kimi
+EP2 with native/custom FSDP2 on CPU/Gloo, including latent experts, exact
+weight loading and one optimizer update. Meta materialization explicitly
+reconstructs native MoE's nonpersistent FP32 token counters as zeros.
+Other EP model families retain the HF initialization guard.
+
+
+### Kimi Linear MLA 的 KCP Ulysses 分支（2026-10-15）
+
+- 参考：FSDPTurbo `0af4eca242c14ebff254dab1a38045f1395fa520` 的
+  `distributed/context_parallel/kcp/kcp_context_parallel.py`、
+  `distributed/context_parallel/ulysses/ulysses_attention.py`。
+- 生产路径：`apply_cp` → `apply_kcp` → 本地 `KimiLatentAttention` 的
+  `_kcp_attention` callable → `kcp_mla_attention`；KDA 保持 state CP。
+- 差异：不 patch 全局 HF 注册表；复用本仓库 `SeqToHead`/`HeadToSeq`
+  autograd 交换，输出恢复 HF 的 BSHD。MLA 已展开 KV 到完整 query heads，
+  不根据配置重复扩展 KV。局部 mask 严格验证后从 diagonal 恢复 key validity，
+  gather 后构造完整因果 mask，拒绝任意 bias/document mask。
+- 本地错误边界只覆盖校验且使用 CP 子组；collective 在边界外执行。
+  HF wrapper 对 KCP 绕过 flex BlockMask，decoder 仍提供本地 padding 语义。
+- 数值证据：`kimi_mla_cp_equivalence.py`，CPU/Gloo CP2、FP32、8 组配置，
+  full-sequence eager MLA 参考的输出/输入梯度/归约参数梯度通过。
+  具体命令与批次见 `docs/file_review.md` 的 KCP-HYBRID-MLA-01。
+- 未完成：完整 KDA+MLA Trainer 数值、目标设备 KDA 内核、compile、
+  Kimi K3 compressor/transposed compressor；此分支不代表完整 KCP 迁移。
+
+
+### KCP padding 与 compressor 来源边界复核（2026-10-15）
+
+本地 `KimiDeltaAttention.forward` 的 padding 契约是先移除无效 token，
+计算卷积和 recurrent state 后再 scatter 回原位置。FSDPTurbo 同一固定 commit
+的 `distributed/context_parallel/kcp/kda_state.py::_apply_mask` 是清零输入/输出，
+直接沿用不能保持本地契约。当前 KCP 在 CP 子组协调拒绝包含 padding 的输入；
+全有效 mask 仍允许。正确 padding 状态通信仍是实现缺口。
+
+上游 `examples/kimi_k3/config.yaml` 的 KCP patch 是
+`modeling_kimi_linear.eager_attention_forward` + `KimiDeltaAttention.forward`，
+没有 compressor patch。`examples/deepseekv4/config.yaml` 的 Ulysses/KV
+AllGather patch 才使用 compressor/transposed 类型，目标为 Transformers
+DeepSeek V4 attention。实现缺口应分别跟踪 K3 多模态顶层分片和 compressor
+的 sliding/压缩 KV 两段顺序，不能假定后者由迁移 K3 自动解决。
+
+
+### Compressor CP 的压缩前边界（COMPRESSOR-CP-BOUNDARY-01）
+
+FSDPTurbo 的 Ulysses compressor wrapper 只重排已生成的 sliding/compressed
+两段 KV；迁移时必须另核对模型 compressor 的全局窗口所有权。当前
+Transformers5.9.0 的 DeepSeek V4 HCA 在无 cache 时丢弃局部不足窗口的尾部，
+并从局部0构造压缩位置。CPU实验中 sequence6、compress_rate4，CP2 的两个
+3-token局部调用均无压缩条目，完整序列调用却有1个。因此复制后置交换不能
+单独完成迁移。CSA 还有前窗 overlap，sink/mask/共享KV也须一起验收。
+详细配置、证据和下一动作以 `docs/file_review.md` 同名问题为准。
+
+
+`parallel/context_parallel/compression_windows.py` 现提供跨shard窗口重分配及
+HCA计算支持（COMPRESSOR-CP-WINDOW-01）。压缩数学来源 Transformers5.9.0
+`DeepseekV4HCACompressor.forward`；窗口owner/变长可微all-to-all是本地适配，
+返回全局window ID以保留RoPE和后续mask语义。真实CP2/HCA前后向通过，
+但尚未装入DeepSeek V4生产attention，完整迁移仍开放。
+
+
+HCA组合forward现位于 `compressor_attention.py::hca_attention_forward`，
+projection/partial RoPE/grouped output遵循 Transformers5.9.0
+`DeepseekV4Attention.forward`，通信使用本地窗口owner和Ulysses原语。
+真实CP2单层输出及全部梯度对完整未修改HF模块通过；生产安装仍未接通。
+证据以 COMPRESSOR-CP-HCA-MODULE-01 台账为准。
+
+
+全HCA子集现经 `apply_cp` → `apply_hca_context_parallel` 安装到decoder；
+HF wrapper使用hca_ulysses策略绕过通用mask并协调拒绝padding。真实配置/mesh
+安装的decoder输出及梯度通过；完整wrapper/Trainer仍待验证。详见
+COMPRESSOR-CP-INSTALL-01，CSA/混合层及目标设备依然开放。
+
+
+全HCA子集的实际Trainer/AdamW/动态EMA/full→resume现有CPU/Gloo CP2证据：
+`hca_trainer_checkpoint.py`，更新前完整状态及后续更新通过；DP1无FSDP
+sharding。见COMPRESSOR-CP-TRAINER-01，未外推CSA或其他并行组合。
+
+
+内部入口命名已统一为 `compressor_ulysses_attention`、
+`compressor_attention_forward`、`compressor_decoder_forward` 和
+`apply_compressor_context_parallel`；内部策略为 `compressor_ulysses`。
+HCA/CSA压缩算法函数继续分别命名。旧名已从实现/测试删除；历史记录保留
+原名用于追踪，见 COMPRESSOR-CP-NAMING-01。用户配置与checkpoint键未改。
+
+
+### FSDPTurbo fixed router 语义校正
+
+上游 commit `0af4eca242c14ebff254dab1a38045f1395fa520` 的
+`fsdp_turbo/distributed/expert_parallel/utils.py::fixed_router_for_debug`
+使用 `(token + slot) % E` 专家编号和 detached `1/K` 权重。
+公开 `ep_config.fixed_router` 现由 `TokenChoiceTopKRouter.fixed_router`
+实现此语义，忽略真实 gate score、route_norm 与 route_scale；gate 仍执行，
+配置的 auxiliary loss 仍按本项目显式策略注入梯度。
+它与本表已有的 torchtitan `_debug_force_load_balance` 是两个选项：
+后者维持 `(token*K+slot)%E` 与真实 score 的原有契约，未删除或改名。
+CPU/Gloo EP2 alltoall/Domino、AC、padding、空token/专家、SGD 的证据见
+`docs/file_review.md` 中 FIXED-ROUTER-UPSTREAM-01；不证明目标设备融合或性能。
+
+### 调度器当前上游差异复核（2026-10-16）
+
+本地 torchtitan HEAD `01b1b69e3881397db5dcd4f96d3c5ffa6a79384d` 的当前路径为
+`torchtitan/components/optim/lr_scheduler.py`。历史映射中的 `components/optimizer/`
+保留为来源记录。当前上游使用 HostLambdaLR 缓存 host 学习率、默认 warmup 后立即
+decay，并允许短 schedule 在末值继续；llmtuner 保留默认恒定 lr、拒绝短 schedule
+及超界恢复的显式契约，从恢复后的 optimizer `initial_lr` 重建并写回实际 lr。
+两者沿用 optimizer 更新后推进调度与虚拟末 step。CPU 标量/tensor lr 恢复已有
+单测，设备 capturable/fused 及 host 缓存性能不能由此推断；本轮无行为迁移。
+参见 `docs/file_review.md` 的 `OPTIMIZER-SCHEDULE-RESTORE-REVIEW-04`。

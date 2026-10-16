@@ -3,13 +3,16 @@
 Run with torchrun --nproc_per_node=4; optional native/custom (default custom).
 Append aux to validate coefficient 0.01 against an independent routing formula.
 Append adam after aux to use the production AdamW optimizer container.
+Use noaux in place of aux and append none after adam for diagnostic controls.
+Append fp32_router after the AC mode to diagnose the HF gate dtype contract.
+This explicitly changes the oracle; the default HF reference remains unchanged.
 Uses the explicit CPU attention substitute, not target-device flex acceptance.
 Model assembly, preprocessing, token accounting, accumulation, replicated gradient
 reduction, clipping, optimizer ordering and metrics use production Trainer code.
 """
 
 import sys
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -40,22 +43,38 @@ def main():
         cfg.parallel.fsdp_config.fsdp_implementation = implementation
         aux = len(sys.argv) > 2 and sys.argv[2] == "aux"
         adam = len(sys.argv) > 3 and sys.argv[3] == "adam"
+        ac_mode = sys.argv[4] if len(sys.argv) > 4 else "full"
+        assert ac_mode in {"full", "none"}
         cfg.model.arch_overrides["router_aux_loss_coef"] = 0.01 if aux else 0.0
         topology = ParallelTopology.from_config(cfg.parallel, 4)
         with cpu_cp_attention():
             model = _build(cfg).train()
             oracle = _build(cfg).train()
+            fp32_router_reference = len(sys.argv) > 5 and sys.argv[5] == "fp32_router"
+            if fp32_router_reference:
+
+                def fp32_gate(module, hidden):
+                    hidden = hidden.reshape(-1, module.hidden_dim)
+                    logits = F.linear(hidden.float(), module.weight.float())
+                    probabilities = logits.softmax(-1)
+                    scores, selected = probabilities.topk(module.top_k, dim=-1)
+                    if module.norm_topk_prob:
+                        scores = scores / scores.sum(-1, keepdim=True)
+                    return logits, scores, selected
+
+                for layer in oracle.layers:
+                    layer.mlp.gate.forward = MethodType(fp32_gate, layer.mlp.gate)
             model = parallelize_hf_transformers(
                 model,
                 cfg=cfg.parallel,
                 mesh=topology.spmd_dense_mesh(),
                 parallel_dims=topology,
                 device=torch.device("cpu"),
-                activation_checkpoint="full",
+                activation_checkpoint=ac_mode,
             )
             layer_calls = [0, 0]
             for index, layer in enumerate(model.layers):
-                body = layer._checkpoint_wrapped_module
+                body = getattr(layer, "_checkpoint_wrapped_module", layer)
 
                 def count_execution(module, inputs, index=index):
                     layer_calls[index] += 1
@@ -201,7 +220,10 @@ def main():
                     after - before
                     for after, before in zip(layer_calls, calls_before, strict=True)
                 ]
-                assert all(count >= 4 for count in executions), executions
+                if ac_mode == "full":
+                    assert all(count >= 4 for count in executions), executions
+                else:
+                    assert executions == [2, 2], executions
                 if aux:
                     names = {
                         module.metric_name
@@ -232,7 +254,11 @@ def main():
                 count = 0
                 for name, parameter in model.named_parameters():
                     key = canonical_fqn(name)
-                    if adam and step == 1 and "w1_EFD" in key:
+                    if (
+                        adam
+                        and step == 1
+                        and ("w1_EFD" in key or ".k_proj.weight" in key)
+                    ):
                         observed_gradient = full(parameter.grad)
                         expected_gradient = oracle_view(
                             parameters, key, tp_rank, ep_rank, gradient=True
@@ -316,7 +342,7 @@ def main():
                 print(
                     f"rank={dist.get_rank()} {implementation} aux={aux} "
                     f"{optimizer_name} step={step}: "
-                    "Trainer unequal-token accumulation/full AC: "
+                    f"Trainer unequal-token accumulation/ac={ac_mode}: "
                     "27 gradients/updates/optimizer states/EMA OK; "
                     f"body calls={executions}",
                     flush=True,
