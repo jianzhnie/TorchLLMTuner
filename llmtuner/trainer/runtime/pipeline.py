@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from ...accelerator.capabilities import has as capability
+from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.spmd import spmd_context
 from ...components.loss import IGNORE_INDEX
 from ...datasets.contracts import Batch, TrainerBatch, require_positive_integer
@@ -113,7 +114,11 @@ def prepare_pipeline_inputs(
     arg_mbs: list[tuple[torch.Tensor, ...]] = []
     kwarg_mbs: list[dict[str, Any]] = []
     target_mbs: list[torch.Tensor] | None = [] if trainer.pp_has_last_stage else None
-    for microbatch in trainer.pp_microbatches(batch):
+    # Splitting must succeed everywhere before preprocessing enters its
+    # coordinated boundary once for each resulting microbatch.
+    with synchronize_local_errors("Pipeline input splitting"):
+        microbatches = trainer.pp_microbatches(batch)
+    for microbatch in microbatches:
         inputs, labels, extra_kwargs = trainer.preprocess(microbatch)
         if trainer.pp_has_first_stage:
             arg_mbs.append((inputs,))

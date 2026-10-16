@@ -65,10 +65,12 @@ def rollback_compile_settings_on_error() -> Iterator[None]:
     group registration and concurrent policy changes are outside this scope.
     """
     import torch._dynamo.config as dynamo_config
+    import torch._functorch.config as functorch_config
     import torch._inductor.config as inductor_config
 
     capture = getattr(dynamo_config, "capture_scalar_outputs", None)
     async_tp = getattr(inductor_config, "_micro_pipeline_tp", None)
+    memory_budget = getattr(functorch_config, "activation_memory_budget", None)
     try:
         yield
     except BaseException:
@@ -76,6 +78,8 @@ def rollback_compile_settings_on_error() -> Iterator[None]:
             dynamo_config.capture_scalar_outputs = capture
         if async_tp is not None:
             inductor_config._micro_pipeline_tp = async_tp
+        if memory_budget is not None:
+            functorch_config.activation_memory_budget = memory_budget
         raise
 
 

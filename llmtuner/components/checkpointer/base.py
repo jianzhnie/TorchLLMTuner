@@ -22,9 +22,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from ...accelerator import distributed
+from ...accelerator.collectives import synchronize_local_errors
 from ...utils.garbage_collection import GarbageCollection
 from ...utils.logging import get_logger
 from . import filesystem
@@ -253,13 +255,32 @@ class BaseCheckpointManager(ABC):
         # snapshot and its publication before discovering a restore source.
         self.maybe_wait_for_staging()
         self.maybe_wait_for_saving()
-        resolved = self._resolve_load_source(step)
+        with synchronize_local_errors("Checkpoint load preflight"):
+            resolved = self._resolve_load_source(step)
+            states = (
+                None
+                if resolved is None
+                else self._states_to_load(model_only=resolved.model_only)
+            )
+        if distributed.get_world_size() > 1:
+            # Source discovery is local IO: successful ranks can still disagree
+            # about visibility or latest step. Agree before any rank returns or
+            # enters the reader's collective state restoration.
+            selection = (resolved, sorted(states) if states is not None else None)
+            selections = [None] * distributed.get_world_size()
+            dist.all_gather_object(selections, selection)
+            if any(candidate != selection for candidate in selections):
+                raise RuntimeError(
+                    "Checkpoint ranks discovered inconsistent restore sources or "
+                    "state categories; check storage visibility and load configuration"
+                )
         if resolved is None:
             return False
+        assert states is not None
         logger.info("Loading the checkpoint from %s.", resolved.checkpoint_id)
         begin = time.monotonic()
         self._load_checkpoint(
-            self._states_to_load(model_only=resolved.model_only),
+            states,
             resolved.checkpoint_id,
             from_hf=resolved.from_hf,
             from_quantized=resolved.from_quantized,

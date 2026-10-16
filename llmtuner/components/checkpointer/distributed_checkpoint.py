@@ -90,7 +90,7 @@ class CoordinatedStager:
 
     should_synchronize_after_execute = False
 
-    def __init__(self, stager: Any, group: dist.ProcessGroup) -> None:
+    def __init__(self, stager: Any, group: dist.ProcessGroup | None) -> None:
         self.stager = stager
         self.group = group
         self.completion: Future[None] = Future()
@@ -98,7 +98,7 @@ class CoordinatedStager:
     def stage(self, state_dict: dict[str, Any]) -> Future:
         try:
             staged = self.stager.stage(state_dict)
-        except Exception as error:
+        except BaseException as error:
             staged = Future()
             staged.set_exception(error)
         if not isinstance(staged, Future):
@@ -111,9 +111,17 @@ class CoordinatedStager:
             try:
                 with synchronize_local_errors("Checkpoint staging", group=self.group):
                     snapshot = source.result()
-            except Exception as error:
-                coordinated.set_exception(error)
+            except BaseException as error:
                 self.completion.set_exception(error)
+                if not isinstance(error, Exception):
+                    # PyTorch 2.14 staging callbacks catch Exception only.
+                    # Keep the original interrupt for the training thread,
+                    # but finish the upload future without killing a worker.
+                    upload_error = RuntimeError("Checkpoint staging interrupted")
+                    upload_error.__cause__ = error
+                    coordinated.set_exception(upload_error)
+                else:
+                    coordinated.set_exception(error)
             else:
                 coordinated.set_result(snapshot)
                 self.completion.set_result(None)
@@ -427,11 +435,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 process_group=self.pg,
             )
         elif async_mode == DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM:
-            stager = (
-                CoordinatedStager(self.stager, self.staging_pg)
-                if self.staging_pg is not None
-                else self.stager
-            )
+            stager = CoordinatedStager(self.stager, self.staging_pg)
             ret = dcp.async_save(
                 state_dict,
                 storage_writer=storage_writer,

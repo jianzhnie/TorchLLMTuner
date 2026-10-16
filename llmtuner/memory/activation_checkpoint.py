@@ -36,8 +36,8 @@ All four of its policies are ported:
 
 * ``"region"`` (upstream ``RegionAC``) keeps the block's declared regions and
   recomputes the rest, using the optional ``torch_remat`` package (imported at
-  apply time; it needs torch >= 2.10, so this mode is the one policy llmtuner
-  cannot exercise on its development torch). Upstream gets its region names
+  apply time; it requires torch >= 2.10 and the package must be installed to
+  execute this policy). Upstream gets its region names
   from ``torch_remat.region`` call sites in its own model code, wired by
   ``Module.configure_remat_regions``; HF models carry neither, so
   ``remat_regions`` derives the same vocabulary structurally -- the block's

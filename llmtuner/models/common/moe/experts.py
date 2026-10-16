@@ -51,7 +51,7 @@ class ExpertErrorCapture:
     must check error before consuming the returned expert output.
     """
 
-    error: Exception | None = None
+    error: BaseException | None = None
 
 
 class GroupedExperts(nn.Module):
@@ -129,7 +129,7 @@ class GroupedExperts(nn.Module):
                     "Expert error capture requires materialized local weights"
                 )
             return self._compute(x_RD, num_tokens_per_expert_E)
-        except Exception as error:
+        except BaseException as error:
             error_capture.error = error
             return x_RD.detach()
 

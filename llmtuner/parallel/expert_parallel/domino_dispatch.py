@@ -151,7 +151,7 @@ class DominoRoutedExperts(RoutedExperts):
                         coordinate_experts=coordinate_experts,
                     )
                     outputs.append(dispatcher.combine(routed_output, metadata, args[0]))
-            except Exception as error:
+            except BaseException as error:
                 # Both token transfers precede expert computation. Even if
                 # expert0 fails, retain and wait for every launched transfer
                 # before discarding its buffers. This starts no new collective
@@ -160,7 +160,7 @@ class DominoRoutedExperts(RoutedExperts):
                 for exchange in pending:
                     try:
                         materialize(exchange.routed_input)
-                    except Exception as caught:
+                    except BaseException as caught:
                         cleanup_error = caught
                 if cleanup_error is not None:
                     raise error from cleanup_error
@@ -365,7 +365,7 @@ class DominoRoutedExperts(RoutedExperts):
             for tensor in (output0, output1):
                 tensor.record_stream(compute_stream)
             return torch.cat((output0, output1), dim=0)
-        except Exception as error:
+        except BaseException as error:
             # Consume already enqueued dispatch/combine results on their stream.
             # No replacement collective is launched on the failing path.
             cleanup_error = None
@@ -380,7 +380,7 @@ class DominoRoutedExperts(RoutedExperts):
                         continue
                     try:
                         materialize(tensor)
-                    except Exception as caught:
+                    except BaseException as caught:
                         cleanup_error = caught
             compute_stream.wait_stream(comm_stream)
             if cleanup_error is not None:
