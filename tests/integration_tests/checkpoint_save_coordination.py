@@ -383,12 +383,26 @@ def main():
                         torch.testing.assert_close(
                             target, model.state_dict(), rtol=0, atol=0
                         )
+                        # Exceed the horizon with an actual publication. Earlier
+                        # saves only fill it and never exercise the purge worker.
+                        with torch.no_grad():
+                            model.bias.add_(3)
+                        assert manager.save(3)
+                        manager.maybe_wait_for_saving()
                     finally:
                         manager.close()
                     dist.barrier()
+                    assert not manager.purge_thread.is_alive()
+                    assert sorted(
+                        path.name for path in (folder / "checkpoint").glob("step-*")
+                    ) == ["step-2", "step-3"]
+                    dcp.load(target, checkpoint_id=folder / "checkpoint" / "step-3")
+                    torch.testing.assert_close(
+                        target, model.state_dict(), rtol=0, atol=0
+                    )
                     print(
                         f"rank={rank} {mode} failed_rank={failing_rank}: "
-                        "old snapshot and retry passed",
+                        "old snapshot, retry and completed retention passed",
                         flush=True,
                     )
             check_load_preflight(root)
