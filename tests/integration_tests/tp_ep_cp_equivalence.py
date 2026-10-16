@@ -141,7 +141,7 @@ def main() -> None:
     # The assembly order from parallelize.py's STAGES table: tp -> ep -> cp.
     model = apply_tp(model, tp_mesh, cfg.parallel)
     apply_ep(model, cfg.parallel, ep_group=ep_mesh.get_group())
-    apply_cp(model, _dense_view(cp_mesh, tp_mesh), cfg.parallel)
+    apply_cp(model, mesh=_dense_view(cp_mesh, tp_mesh), cfg=cfg.parallel)
 
     failures: list[str] = []
 

@@ -109,9 +109,10 @@ def test_compile_config_defaults_reproduce_whole_model_compile() -> None:
     assert cfg.enable_async_tensor_parallel is False
 
 
-def test_compile_config_rejects_empty_backend() -> None:
+@pytest.mark.parametrize("backend", ["", "  ", None, True, 1])
+def test_compile_config_rejects_empty_backend(backend) -> None:
     with pytest.raises(ValueError, match="backend"):
-        CompileConfig(backend="")
+        CompileConfig(backend=backend)
 
 
 @requires_parallel_config
@@ -192,6 +193,19 @@ def test_per_block_compile_rejects_missing_layers_before_global_changes(monkeypa
         apply_compile(
             torch.nn.Linear(2, 2), compile_config=CompileConfig(per_block=True)
         )
+
+
+@requires_runtime
+def test_invalid_flex_backend_fails_before_async_tp_setup(monkeypatch):
+    model = torch.nn.Linear(2, 2)
+    model.uses_flex_attention = True
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Unsupported backend must fail before async TP global setup")
+
+    monkeypatch.setattr(compile_mod, "maybe_enable_async_tp", unexpected)
+    with pytest.raises(ValueError, match="neither 'inductor' nor 'aot_eager'"):
+        apply_compile(model, compile_config=CompileConfig(backend="eager"))
 
 
 @requires_runtime

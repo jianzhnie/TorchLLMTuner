@@ -96,6 +96,14 @@ def test_bad_betas_are_rejected_with_a_message_that_says_how_to_pass_them(
         OptimizerConfig(betas=betas)
 
 
+@pytest.mark.parametrize("betas", [None, True, 0.9])
+def test_noniterable_betas_report_configuration_error(betas):
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="optimizer.betas.*two numeric entries"):
+        OptimizerConfig(betas=betas)
+
+
 def test_flags_parse_and_the_flat_view_reaches_them() -> None:
     """The whole chain: flag -> nested config -> property -> optimizer group."""
     (_, _, optimizer, *_rest) = _parser().parse_args_into_dataclasses(
@@ -160,8 +168,27 @@ def test_optimizer_rejects_nonfinite_hyperparameters(field, value):
         OptimizerConfig(**{field: value})
 
 
+@pytest.mark.parametrize("field", ["learning_rate", "weight_decay", "eps"])
+@pytest.mark.parametrize("value", [True, False, "0.1", None])
+def test_optimizer_rejects_nonnumeric_hyperparameters(field, value):
+    with pytest.raises(ValueError, match=field):
+        OptimizerConfig(**{field: value})
+
+
+@pytest.mark.parametrize("value", [True, False, "0.1", None])
+def test_optimizer_rejects_nonnumeric_beta_entries(value):
+    with pytest.raises(ValueError, match="betas"):
+        OptimizerConfig(betas=[value, 0.9])
+
+
 def test_scheduler_rejects_unknown_decay_type_at_configuration_time():
     from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 
     with pytest.raises(ValueError, match="decay_type"):
         LRSchedulerConfig(decay_type="unknown")
+
+
+@pytest.mark.parametrize("implementation", ["quantum", "", None, True])
+def test_optimizer_rejects_unknown_implementation_during_configuration(implementation):
+    with pytest.raises(ValueError, match="Unknown optimizer implementation"):
+        OptimizerConfig(implementation=implementation)

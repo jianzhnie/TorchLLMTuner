@@ -1376,7 +1376,7 @@ def test_concat_rejects_a_streaming_child(tokenizer, corpus):
 def test_concat_shards_map_children_like_a_single_dataset(tokenizer, corpus):
     """Concatenation is transparent to everything downstream of it.
 
-    ``shard_for_dp`` is applied to the concatenation exactly as it is to one
+    DP sharding is applied to the concatenation exactly as it is to one
     dataset, so the DP disjointness guarantee has to survive the extra layer.
     """
     concat = DatasetConcat(datasets=(text_dataset(corpus), text_dataset(corpus)))
@@ -1388,9 +1388,15 @@ def test_concat_shards_map_children_like_a_single_dataset(tokenizer, corpus):
             context=make_context(tokenizer),
             iteration_policy=make_policy(shuffle=True, dp_world_size=2, dp_rank=rank),
         )
-        seen.append(token_ids([next(iter(graph)) for _ in range(per_rank)]))
+        iterator = iter(graph)
+        seen.append(token_ids([next(iterator) for _ in range(per_rank)]))
 
-    assert not (set(seen[0]) & set(seen[1]))
+    reference = build_dataset(
+        concat,
+        context=make_context(tokenizer),
+        iteration_policy=make_policy(shuffle=True),
+    )
+    assert seen[0] + seen[1] == token_ids(list(reference))
 
 
 # --------------------------------------------------------------------------
@@ -2024,6 +2030,28 @@ def test_local_sft_recipe_survives_worker_serialization(tokenizer, tmp_path):
     np.testing.assert_array_equal(actual.labels, expected.labels)
 
 
+def test_hf_random_access_source_uses_dataset_directly(monkeypatch):
+    import datasets
+
+    from llmtuner.datasets.sources import (
+        HuggingFaceRandomAccessSource,
+        RandomAccessDataSource,
+        build_source,
+    )
+
+    dataset = datasets.Dataset.from_dict({"text": ["first", "second", "third"]})
+    monkeypatch.setattr(datasets, "load_dataset", lambda *args, **kwargs: dataset)
+    source = build_source(
+        HuggingFaceRandomAccessSource(path="local-corpus", split="train"),
+        iteration_policy=make_policy(),
+    )
+    assert source is dataset
+    assert isinstance(source, RandomAccessDataSource)
+    graph = grain.MapDataset.source(source)
+    assert list(graph) == [{"text": text} for text in ("first", "second", "third")]
+    assert source[-1] == {"text": "third"}
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 def test_hf_source_forwards_load_options_and_rejects_dataset_dict(
     streaming, monkeypatch
@@ -2157,6 +2185,38 @@ def test_loader_rejects_invalid_ownership_before_tokenizer_setup(
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             num_tokens_per_batch=16,
+        )
+
+
+@pytest.mark.parametrize(
+    ("repeat", "dp_world_size", "error_type", "message"),
+    [
+        (False, 2, ValueError, "repeat=False"),
+        ("false", 1, TypeError, "repeat must be bool"),
+        (None, 1, TypeError, "repeat must be bool"),
+    ],
+)
+def test_loader_checks_iteration_before_loading_assets(
+    repeat, dp_world_size, error_type, message, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
+
+    def unexpected_tokenizer(*args, **kwargs):
+        pytest.fail("invalid iteration policy must fail before asset loading")
+
+    monkeypatch.setattr(HuggingFaceTokenizer, "__init__", unexpected_tokenizer)
+    config = SimpleNamespace(
+        dataloader=SimpleNamespace(dataset="local_jsonl"), max_seq_len=16
+    )
+    with pytest.raises(error_type, match=message):
+        build_dataloader(
+            config,
+            dp_rank=0,
+            dp_world_size=dp_world_size,
+            num_tokens_per_batch=16,
+            repeat=repeat,
         )
 
 

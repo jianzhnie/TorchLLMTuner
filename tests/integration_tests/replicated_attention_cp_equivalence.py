@@ -61,7 +61,7 @@ def main():
     model, reference = build_model(), build_model()
     apply_tp(model, dims.spmd_dense_mesh(), cfg)
     model.model.config._attn_implementation = "flex_torchtitan"
-    apply_cp(model, dims.spmd_dense_mesh(), cfg, parallel_dims=dims)
+    apply_cp(model, mesh=dims.spmd_dense_mesh(), cfg=cfg, parallel_dims=dims)
     ids = torch.randint(128, (256,), generator=torch.Generator().manual_seed(7))
     inputs, _, extra = model.preprocess_inputs(
         {"input": ids, "labels": ids}, parallel_dims=dims

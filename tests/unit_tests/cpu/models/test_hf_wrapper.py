@@ -370,6 +370,31 @@ def test_build_model_config_for_accepts_a_local_checkpoint_path(tmp_path) -> Non
     assert config.hidden_size == 24
 
 
+@pytest.mark.parametrize(
+    "identifier",
+    ["/missing/model/path", "./missing/model", "org/model", "local-checkpoint"],
+)
+def test_unregistered_model_identifier_uses_pretrained_resolution(
+    monkeypatch, identifier
+):
+    from transformers import AutoConfig
+
+    from llmtuner.config import ModelConfig
+
+    calls = []
+
+    def load_config(name):
+        calls.append(name)
+        return AutoConfig.for_model("qwen3")
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", load_config)
+    config = build_model_config_for(
+        LLMTunerConfig(model=ModelConfig(model_name_or_path=identifier))
+    )
+    assert calls == [identifier]
+    assert config.model_type == "qwen3"
+
+
 def test_the_mask_type_follows_the_corpus_rather_than_being_configured() -> None:
     """Packed corpora need the document mask; the synthetic one must not pay for it.
 

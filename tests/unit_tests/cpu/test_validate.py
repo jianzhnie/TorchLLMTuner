@@ -422,11 +422,13 @@ def test_validate_restores_mixed_module_modes(monkeypatch, fail) -> None:
 
 
 @pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("original", ["missing", None, "causal", "block_causal"])
+@pytest.mark.parametrize("max_documents", [None, 1])
 @pytest.mark.parametrize(
     "dataset,expected", [("local_jsonl", "block_causal"), ("random", "causal")]
 )
 def test_validation_override_restores_training_attention_mask(
-    monkeypatch, fail, dataset, expected
+    monkeypatch, fail, original, max_documents, dataset, expected
 ):
     from llmtuner.trainer.runtime import validation as validation_runtime
 
@@ -435,8 +437,16 @@ def test_validation_override_restores_training_attention_mask(
         validation=ValidationConfig(steps=1, dataset=dataset),
         loader=_ListLoader([]),
     )
-    config = SimpleNamespace(attn_mask_type="causal")
+    trainer.cfg.dataloader.max_num_documents = max_documents
+    if max_documents == 1:
+        expected = "causal"
+    config = SimpleNamespace()
+    if original != "missing":
+        config.attn_mask_type = original
     trainer.model.model = SimpleNamespace(config=config)
+    other_part = _EchoModel()
+    other_part.model = SimpleNamespace(config=config)
+    trainer.model_parts.append(other_part)
     kernel = torch.nn.Module()
     kernel.packed = True
     trainer.model._titan_flex_kernel = kernel
@@ -453,7 +463,10 @@ def test_validation_override_restores_training_attention_mask(
             trainer.validate(1)
     else:
         trainer.validate(1)
-    assert config.attn_mask_type == "causal"
+    if original == "missing":
+        assert not hasattr(config, "attn_mask_type")
+    else:
+        assert config.attn_mask_type == original
     assert kernel.packed is True
 
 

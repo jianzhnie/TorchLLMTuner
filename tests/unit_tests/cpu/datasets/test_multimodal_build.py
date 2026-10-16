@@ -112,7 +112,7 @@ def test_build_dataloader_names_a_multimodal_recipe(tmp_path, monkeypatch):
     from llmtuner.datasets.multimodal import packing
     from llmtuner.datasets.multimodal.processors import (
         MultimodalProcessor,
-        process_cc12_wd_sample,
+        process_cc12m_sample,
     )
     from llmtuner.datasets.multimodal.recipes import MULTIMODAL_DATASETS
 
@@ -150,7 +150,7 @@ def test_build_dataloader_names_a_multimodal_recipe(tmp_path, monkeypatch):
         SingleDataset(
             source=Base64JsonlSource(patterns=(corpus,)),
             processor=partial(
-                MultimodalProcessor, sample_processor=process_cc12_wd_sample
+                MultimodalProcessor, sample_processor=process_cc12m_sample
             ),
             post_filters=(lambda sample: sample is not None,),
         ),
