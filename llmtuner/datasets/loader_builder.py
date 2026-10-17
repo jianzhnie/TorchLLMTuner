@@ -194,7 +194,7 @@ def build_dataloader(
 
     require_positive_integer("num_tokens_per_batch", num_tokens_per_batch)
     num_microbatches = (
-        config.parallel.num_pp_microbatches
+        config.parallel.pp_config.num_pp_microbatches
         if not is_multimodal and config.parallel.pipeline_parallel_size > 1
         else 1
     )

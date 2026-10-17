@@ -103,17 +103,17 @@ def parallelize_hf_transformers(
     # EP groups come from the sparse mesh in both assembly paths. Under PP
     # this slice contains only ranks in the current pipeline stage.
     ep_group = None
-    if cfg.ep > 1:
+    if cfg.ep_size > 1:
         if parallel_dims is None:
             raise ValueError(
-                f"ep={cfg.ep} needs a process group, but this run is "
+                f"ep={cfg.ep_size} needs a process group, but this run is "
                 "single-process (parallel_dims is None). EP requires "
                 "world_size > 1."
             )
         ep_mesh = parallel_dims.get_optional_mesh("ep")
         if ep_mesh is None:
             raise ValueError(
-                f"ep={cfg.ep} but parallel_dims has no multi-rank 'ep' axis."
+                f"ep={cfg.ep_size} but parallel_dims has no multi-rank 'ep' axis."
             )
         ep_group = ep_mesh.get_group()
     tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")

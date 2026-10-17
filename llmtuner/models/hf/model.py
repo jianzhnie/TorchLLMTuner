@@ -262,9 +262,8 @@ class HFTransformerModel(nn.Module):
         run that looks like a working one. That failure is what makes this
         translation load-bearing rather than cosmetic.
 
-        Returns ``{}`` when the model ships no plan. That is left as an empty
-        plan rather than an error because "no declared plan" is a real answer:
-        ``apply_tp`` then leaves the model replicated instead of guessing.
+        Returns ``{}`` when the model ships no plan. The parallel entry point
+        rejects an enabled TP run without a plan or explicit pattern overrides.
 
         Reads the inner model's ``_tp_config`` first and falls back to its
         ``tp_config`` property only when the attribute carries nothing. HF builds
@@ -272,11 +271,17 @@ class HFTransformerModel(nn.Module):
         child module's own plan, which is the TP plan this layer wants; the
         property additionally switches to ``_ep_config`` when the config asks for
         expert parallelism, and those are EP specs, not TP ones. The fallback is
-        for a model that exposes the plan through the property alone.
+        for a model that exposes the plan through the property alone. Versions
+        exposing ``_tp_plan`` / ``tp_plan`` are supported through the same
+        pattern translation.
         """
         plan = getattr(self.model, "_tp_config", None) or {}
         if not plan:
             plan = getattr(self.model, "tp_config", None) or {}
+        if not plan:
+            plan = getattr(self.model, "_tp_plan", None) or {}
+        if not plan:
+            plan = getattr(self.model, "tp_plan", None) or {}
         return {f"model.{pattern}": spec for pattern, spec in plan.items()}
 
     def named_children(self):

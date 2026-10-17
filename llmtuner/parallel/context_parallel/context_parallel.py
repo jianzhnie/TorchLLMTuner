@@ -88,7 +88,7 @@ def _require_ulysses_compatible(
         isinstance(attention, ReplicatedAttentionSequenceBoundary)
         for attention in attentions
     )
-    head_degree = cp_mesh.size() * (1 if replicated else cfg.tp)
+    head_degree = cp_mesh.size() * (1 if replicated else cfg.tp_size)
     require_heads_divisible_by(
         model,
         size=head_degree,
@@ -106,7 +106,7 @@ def apply_cp(
 ) -> nn.Module:
     """Attach a CP flex kernel to every decoder layer's attention module.
 
-    No-op when ``cfg.cp == 1`` (the model is handed back untouched), so the
+    No-op when ``cfg.cp_size == 1`` (the model is handed back untouched), so the
     caller needs no degree check of its own.
 
     The kernel declares the CP region: q/k/v reach it sequence-sharded and it
@@ -115,13 +115,13 @@ def apply_cp(
     along the sequence axis -- that is the trainer's half of the wiring
     (``shard_batch_for_cp``).
     """
-    if cfg.cp == 1:
+    if cfg.cp_size == 1:
         return model
 
     if cfg.cp_config.context_parallel_strategy == "kcp":
         if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
             raise ValueError("KCP requires a cp mesh")
-        if mesh["cp"].size() != cfg.cp:
+        if mesh["cp"].size() != cfg.cp_size:
             raise ValueError("KCP mesh degree does not match the configured CP degree")
         model_config = getattr(getattr(model, "model", None), "config", None)
         if getattr(model_config, "attn_mask_type", "causal") == "block_causal":
@@ -153,13 +153,14 @@ def apply_cp(
         )
     if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
         raise ValueError(
-            f"cp={cfg.cp} requires a device mesh with a 'cp' axis, got "
+            f"cp={cfg.cp_size} requires a device mesh with a 'cp' axis, got "
             f"{None if mesh is None else mesh.mesh_dim_names}."
         )
     cp_mesh = mesh["cp"]
-    if cp_mesh.size() != cfg.cp:
+    if cp_mesh.size() != cfg.cp_size:
         raise ValueError(
-            f"mesh 'cp' axis has size {cp_mesh.size()}, but cfg requests cp={cfg.cp}."
+            f"mesh 'cp' axis has size {cp_mesh.size()}, "
+            f"but cfg requests cp={cfg.cp_size}."
         )
 
     strategy = cfg.cp_config.context_parallel_strategy
@@ -218,6 +219,6 @@ def apply_cp(
     logger.info(
         "Applied CP (%s) with degree %d",
         "kv_allgather*ulysses" if dual_axes else strategy,
-        cfg.cp,
+        cfg.cp_size,
     )
     return model

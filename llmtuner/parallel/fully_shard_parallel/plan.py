@@ -107,7 +107,7 @@ def apply_fsdp_by_pattern(
     )
 
     expert_placements: dict[nn.Parameter, Shard] = {}
-    if cfg.ep > 1:
+    if cfg.ep_size > 1:
         if edp_mesh is None:
             raise ValueError("pattern FSDP with EP requires a sparse FSDP mesh")
         from ...models.common.moe.experts import GroupedExperts
@@ -133,7 +133,7 @@ def apply_fsdp_by_pattern(
         ),
         "ignored_params": ignored_params,
         "reshard_after_forward": get_fsdp_reshard_after_forward_policy(
-            cfg.fsdp_config.fsdp_reshard_after_forward, cfg.pp > 1
+            cfg.fsdp_config.fsdp_reshard_after_forward, cfg.pp_size > 1
         ),
     }
     if cfg.fsdp_config.fsdp_cpu_offload:
