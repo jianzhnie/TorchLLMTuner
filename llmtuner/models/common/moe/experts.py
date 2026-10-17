@@ -240,8 +240,8 @@ class DominoRoutedExperts(RoutedExperts):
         num_local_tokens_per_expert_E: torch.Tensor,
     ) -> torch.Tensor:
         del num_local_tokens_per_expert_E
-        if x_TD.shape[0] < 2:
-            raise ValueError("Domino dispatcher requires at least two tokens")
+        # Every rank executes both exchanges, including ranks with zero or
+        # one token. Rank-local early returns would strand their peers.
         split_at = (x_TD.shape[0] + 1) // 2
         outputs: list[torch.Tensor] = []
         for token_slice in (slice(0, split_at), slice(split_at, None)):

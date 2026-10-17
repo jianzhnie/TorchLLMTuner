@@ -182,9 +182,9 @@ def test_detect_anomaly_watches_nans_but_skips_the_dtensor_hostile_check(
     )
 
     Trainer.seed_everything(1, deterministic=False)
-    assert calls == []
+    assert calls == [(False, False)]
     Trainer.seed_everything(1, deterministic=False, detect_anomaly=True)
-    assert calls == [(True, False)]
+    assert calls == [(False, False), (True, False)]
 
 
 # -- losses -------------------------------------------------------------------

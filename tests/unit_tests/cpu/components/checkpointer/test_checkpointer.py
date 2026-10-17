@@ -1123,3 +1123,67 @@ def test_auto_resume_skips_native_model_only_final_export(tmp_path):
             imported.close()
     finally:
         manager.close()
+
+
+@pytest.mark.parametrize("outcome", ["pending", "success", "failure"])
+def test_torch_checkpointing_wait_retains_only_active_writes(outcome):
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+
+    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+        TorchCheckpointingManager,
+    )
+
+    future = Future()
+    manager = SimpleNamespace(
+        save_future=future,
+        _manager_config=SimpleNamespace(save=SimpleNamespace(wait_timeout_secs=0)),
+    )
+    if outcome == "success":
+        future.set_result(None)
+        TorchCheckpointingManager._wait_for_saving(manager)
+    else:
+        error = TimeoutError if outcome == "pending" else OSError
+        if outcome == "failure":
+            future.set_exception(OSError("disk full"))
+        with pytest.raises(error):
+            TorchCheckpointingManager._wait_for_saving(manager)
+    assert manager.save_future is (future if outcome == "pending" else None)
+    if outcome == "pending":
+        future.set_result(None)
+        TorchCheckpointingManager._wait_for_saving(manager)
+        assert manager.save_future is None
+
+
+@pytest.mark.parametrize("phase", ["staging", "saving"])
+def test_dcp_interrupted_wait_retains_active_future(phase):
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+
+    from llmtuner.components.checkpointer.distributed_checkpoint import (
+        DistributedCheckpointAsyncMode,
+    )
+
+    class InterruptedFuture(Future):
+        def result(self, timeout=None):
+            if not self.done():
+                raise KeyboardInterrupt("interrupted wait")
+            return super().result(timeout)
+
+    future = InterruptedFuture()
+    field = "staging_future" if phase == "staging" else "save_future"
+    manager = SimpleNamespace(
+        async_mode=DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM,
+        **{field: future},
+    )
+    wait = (
+        DistributedCheckpointManager._maybe_wait_for_staging
+        if phase == "staging"
+        else DistributedCheckpointManager._wait_for_saving
+    )
+    with pytest.raises(KeyboardInterrupt, match="interrupted wait"):
+        wait(manager)
+    assert getattr(manager, field) is future
+    future.set_result(None)
+    wait(manager)
+    assert getattr(manager, field) is None
