@@ -479,7 +479,7 @@ def test_kcp_rejects_packed_validation_before_loop(monkeypatch):
         loader=_ListLoader([]),
     )
     trainer.cfg.parallel.context_parallel_kcp_size = 2
-    trainer.cfg.parallel.context_parallel_strategy = "kcp"
+    trainer.cfg.parallel.cp_config.context_parallel_strategy = "kcp"
 
     def unexpected(*args):
         pytest.fail("KCP packed validation must fail before constructing a loader")

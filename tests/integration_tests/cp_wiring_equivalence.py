@@ -54,6 +54,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.config.parallel_config import ContextParallelConfig
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.context_parallel import (
@@ -84,7 +85,9 @@ def _cfg(load_balancer: str | None) -> LLMTunerConfig:
         ),
         parallel=ParallelConfig(
             context_parallel_kv_allgather_size=2,
-            context_parallel_load_balancer=load_balancer,
+            cp_config=ContextParallelConfig(
+                context_parallel_load_balancer=load_balancer
+            ),
         ),
         training=TrainingConfig(max_seq_len=SEQ, steps=1),
     )

@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 
 from llmtuner.config import LLMTunerConfig, ModelConfig, ParallelConfig, TrainingConfig
+from llmtuner.config.parallel_config import ContextParallelConfig
 from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
@@ -74,7 +75,7 @@ def _cfg() -> LLMTunerConfig:
             tensor_parallel_size=TP,
             context_parallel_kv_allgather_size=CP,
             expert_parallel_size=EP,
-            context_parallel_load_balancer=None,
+            cp_config=ContextParallelConfig(context_parallel_load_balancer=None),
         ),
         training=TrainingConfig(max_seq_len=SEQ, steps=1),
     )

@@ -40,6 +40,7 @@ from transformers import AutoConfig
 from llmtuner.accelerator.collectives import all_reduce
 from llmtuner.accelerator.spmd import spmd_context
 from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import FSDPConfig
 from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
@@ -117,7 +118,11 @@ def main() -> None:
     cfg = ParallelConfig(
         data_parallel_shard_size=4,
         expert_parallel_size=2,
-        fsdp_apply_modules={"model.model.layers.{*}": {}} if args.pattern_fsdp else {},
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"model.model.layers.{*}": {}}
+            if args.pattern_fsdp
+            else {}
+        ),
     )
     parallel_dims = ParallelTopology.from_config(cfg, world)
     parallel_dims.build_device_mesh()

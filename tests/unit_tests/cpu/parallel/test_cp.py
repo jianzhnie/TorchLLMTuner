@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import ContextParallelConfig
 from llmtuner.parallel.context_parallel import (
     CPFlexKernel,
     apply_cp,
@@ -103,7 +104,7 @@ def test_an_unknown_strategy_is_refused(fake_cp_mesh) -> None:
 def test_the_default_strategy_is_kv_allgather(fake_cp_mesh) -> None:
     """The default has to match ``ParallelConfig``'s, or a caller that relies on
     both defaults gets whichever the other object happened to pick."""
-    assert ParallelConfig().context_parallel_strategy == "kv_allgather"
+    assert ParallelConfig().cp_config.context_parallel_strategy == "kv_allgather"
     assert CPFlexKernel(cp_mesh=fake_cp_mesh).strategy == "kv_allgather"
 
 
@@ -113,7 +114,7 @@ def test_dual_cp_axes_derive_total_degree() -> None:
         context_parallel_ulysses_size=4,
     )
 
-    assert cfg.cp == 8
+    assert cfg.cp_size == 8
     assert cfg.non_dp_sizes() == 8
 
 
@@ -121,14 +122,17 @@ def test_kcp_rejects_tensor_parallelism() -> None:
     with pytest.raises(Exception, match="KCP requires tensor_parallel_size=1"):
         ParallelConfig(
             context_parallel_kv_allgather_size=2,
-            context_parallel_strategy="kcp",
             tensor_parallel_size=2,
+            cp_config=ContextParallelConfig(context_parallel_strategy="kcp"),
         )
 
 
 def test_kcp_has_an_independent_reachable_degree() -> None:
-    cfg = ParallelConfig(context_parallel_strategy="kcp", context_parallel_kcp_size=4)
-    assert cfg.cp == 4
+    cfg = ParallelConfig(
+        context_parallel_kcp_size=4,
+        cp_config=ContextParallelConfig(context_parallel_strategy="kcp"),
+    )
+    assert cfg.cp_size == 4
     assert cfg.derive_dp(8) == 2
 
 
@@ -280,8 +284,9 @@ def _ulysses_cfg(tp: int) -> ParallelConfig:
     return ParallelConfig(
         tensor_parallel_size=tp,
         context_parallel_kv_allgather_size=2,
-        context_parallel_strategy="ulysses",
-        context_parallel_load_balancer=None,
+        cp_config=ContextParallelConfig(
+            context_parallel_strategy="ulysses", context_parallel_load_balancer=None
+        ),
     )
 
 

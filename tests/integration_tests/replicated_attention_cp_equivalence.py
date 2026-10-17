@@ -13,6 +13,7 @@ import torch.distributed as dist
 from transformers import AutoConfig
 
 from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import ContextParallelConfig
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.context_parallel import apply_cp
 from llmtuner.parallel.tensor_parallel import apply_tp
@@ -53,8 +54,9 @@ def main():
     cfg = ParallelConfig(
         tensor_parallel_size=2,
         context_parallel_ulysses_size=2,
-        context_parallel_strategy="ulysses",
-        context_parallel_load_balancer=None,
+        cp_config=ContextParallelConfig(
+            context_parallel_strategy="ulysses", context_parallel_load_balancer=None
+        ),
     )
     dims = ParallelTopology.from_config(cfg, 4)
     dims.build_device_mesh()

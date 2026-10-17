@@ -52,6 +52,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.config.parallel_config import ContextParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.attention.masks import get_causal_mask_mod
 from llmtuner.models.hf.factory import build_model_config_for
@@ -87,8 +88,9 @@ def _cfg(num_kv_heads: int = 4) -> LLMTunerConfig:
         ),
         parallel=ParallelConfig(
             context_parallel_ulysses_size=2,
-            context_parallel_strategy="ulysses",
-            context_parallel_load_balancer=None,
+            cp_config=ContextParallelConfig(
+                context_parallel_strategy="ulysses", context_parallel_load_balancer=None
+            ),
         ),
         training=TrainingConfig(max_seq_len=SEQ, steps=1),
     )
@@ -265,7 +267,9 @@ def _check_refusals(mesh, failures: list[str]) -> None:
         ValueError,
         "context_parallel_strategy",
         "bad strategy value",
-        lambda: ParallelConfig(context_parallel_strategy="ring"),
+        lambda: ParallelConfig(
+            cp_config=ContextParallelConfig(context_parallel_strategy="ring")
+        ),
     )
     _expect(
         UnsupportedCombinationError,
@@ -273,8 +277,10 @@ def _check_refusals(mesh, failures: list[str]) -> None:
         "ulysses + headtail",
         lambda: ParallelConfig(
             context_parallel_ulysses_size=2,
-            context_parallel_strategy="ulysses",
-            context_parallel_load_balancer="headtail",
+            cp_config=ContextParallelConfig(
+                context_parallel_strategy="ulysses",
+                context_parallel_load_balancer="headtail",
+            ),
         ),
     )
 

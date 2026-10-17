@@ -53,6 +53,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
@@ -102,11 +103,10 @@ def _cfg(schedule: str) -> LLMTunerConfig:
         ),
         parallel=ParallelConfig(
             pipeline_parallel_size=2,
-            pipeline_parallel_schedule=schedule,
-            num_pp_microbatches=MICROBATCHES,
-            # -1 derives the shard degree from the world size; with pp=2 on 2
-            # ranks that leaves dp=1, so both stages see the whole batch.
             data_parallel_shard_size=-1,
+            pp_config=PipelineParallelConfig(
+                pipeline_parallel_schedule=schedule, num_pp_microbatches=MICROBATCHES
+            ),
         ),
         optimizer=OptimizerConfig(learning_rate=3e-4, weight_decay=0.0),
         training=TrainingConfig(

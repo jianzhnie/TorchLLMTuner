@@ -38,6 +38,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.config.parallel_config import ContextParallelConfig
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.context_parallel import apply_cp, shard_batch_for_cp
@@ -61,9 +62,7 @@ def _cfg() -> LLMTunerConfig:
         ),
         parallel=ParallelConfig(
             context_parallel_kv_allgather_size=2,
-            # Contiguous split: the gathered logits then concatenate in rank
-            # order and compare against the dense reference directly.
-            context_parallel_load_balancer=None,
+            cp_config=ContextParallelConfig(context_parallel_load_balancer=None),
         ),
         training=TrainingConfig(max_seq_len=SEQ, steps=1),
     )

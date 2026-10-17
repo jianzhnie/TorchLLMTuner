@@ -33,6 +33,7 @@ from llmtuner.config import (
     ModelConfig,
     TrainingConfig,
 )
+from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.datasets import (
     DatasetConcat,
     DatasetMix,
@@ -1705,7 +1706,10 @@ def test_pipeline_loader_matches_independently_packed_microbatches(
     reference = build_dataloader(
         cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=16
     )
-    cfg.parallel = ParallelConfig(pipeline_parallel_size=2, num_pp_microbatches=2)
+    cfg.parallel = ParallelConfig(
+        pipeline_parallel_size=2,
+        pp_config=PipelineParallelConfig(num_pp_microbatches=2),
+    )
     pipeline = build_dataloader(
         cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=32
     )
@@ -2288,7 +2292,9 @@ def test_loader_checks_pipeline_budget_before_loading_tokenizer(monkeypatch):
     config = SimpleNamespace(
         dataloader=SimpleNamespace(dataset="local_jsonl"),
         max_seq_len=16,
-        parallel=SimpleNamespace(pipeline_parallel_size=2, num_pp_microbatches=3),
+        parallel=SimpleNamespace(
+            pipeline_parallel_size=2, pp_config=SimpleNamespace(num_pp_microbatches=3)
+        ),
     )
     with pytest.raises(ValueError, match="divisible by num_pp_microbatches"):
         build_dataloader(config, dp_rank=0, dp_world_size=1, num_tokens_per_batch=16)

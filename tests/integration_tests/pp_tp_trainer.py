@@ -18,6 +18,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.trainer.trainer import Trainer
 
 
@@ -35,9 +36,10 @@ def main() -> None:
         parallel=ParallelConfig(
             pipeline_parallel_size=2,
             tensor_parallel_size=2,
-            pipeline_parallel_schedule="1F1B",
-            num_pp_microbatches=2,
             data_parallel_shard_size=1,
+            pp_config=PipelineParallelConfig(
+                pipeline_parallel_schedule="1F1B", num_pp_microbatches=2
+            ),
         ),
         optimizer=OptimizerConfig(learning_rate=3e-4, weight_decay=0.0),
         training=TrainingConfig(

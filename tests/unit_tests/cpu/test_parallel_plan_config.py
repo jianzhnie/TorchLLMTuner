@@ -28,18 +28,10 @@ def test_parallel_dataclass_owns_degrees_and_nested_plans():
     assert replace(config, tensor_parallel_size=2).tp_config is config.tp_config
 
 
-def test_legacy_fields_delegate_to_plan_without_duplicate_state():
-    config = ParallelConfig(tp_colwise_modules=["first"], fsdp_cpu_offload=True)
-    assert config.tp_config.tp_colwise_modules == ["first"]
-    assert config.fsdp_config.fsdp_cpu_offload
-    config.tp_colwise_modules = ["second"]
-    assert config.tp_config.tp_colwise_modules == ["second"]
-    config.tp_config.tp_colwise_modules.append("third")
-    assert config.tp_colwise_modules == ["second", "third"]
-    with pytest.raises(TypeError, match="Cannot combine tp_config"):
-        ParallelConfig(
-            tp_config=TensorParallelConfig(), tp_colwise_modules=["ambiguous"]
-        )
+@pytest.mark.parametrize("name", ["tp_colwise_modules", "fsdp_cpu_offload"])
+def test_parallel_rejects_flattened_policy_keywords(name):
+    with pytest.raises(TypeError, match=name):
+        ParallelConfig(**{name: None})
 
 
 def test_default_plans_and_mutable_fields_are_independent():
@@ -52,8 +44,8 @@ def test_default_plans_and_mutable_fields_are_independent():
 
 @pytest.mark.parametrize("name", ["tp", "fsdp", "ep", "cp", "pp"])
 def test_parallel_rejects_invalid_plan_type(name):
-    with pytest.raises(ConfigError, match=f"{name}_plan"):
-        ParallelConfig(**{f"{name}_plan": None})
+    with pytest.raises(ConfigError, match=f"{name}_config"):
+        ParallelConfig(**{f"{name}_config": None})
 
 
 def test_plans_validate_their_own_policies():
