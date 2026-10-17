@@ -41,13 +41,33 @@ def test_config_phase_is_out_of_scope() -> None:
     assert {r.phase for r in compatibility.ENTRIES} == {"assembly", "probe"}
 
 
-def test_guards_point_at_real_files() -> None:
+def test_guards_point_at_functions_that_call_the_verdict() -> None:
+    import ast
     from pathlib import Path
 
     root = Path(__file__).parents[4] / "llmtuner"
     for row in compatibility.ENTRIES:
-        path = row.guard.split("::")[0]
-        assert (root / path).is_file(), row.guard
+        path, qualified_name = row.guard.split("::")
+        node = ast.parse((root / path).read_text())
+        for name in qualified_name.split("."):
+            matches = [
+                child
+                for child in node.body
+                if isinstance(
+                    child, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
+                )
+                and child.name == name
+            ]
+            assert len(matches) == 1, row.guard
+            node = matches[0]
+        assert any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "compatibility"
+            and child.func.attr == row.name
+            for child in ast.walk(node)
+        ), row.guard
 
 
 # -- every row rejects with its entry's type and message ------------------------

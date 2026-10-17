@@ -32,10 +32,17 @@ description: 审查、修改和重构 TorchLLMTuner 的 llmtuner 代码时，指
 - 数据共享类型定义在 `datasets/contracts.py`；配方组合在 `composition.py`，
   loader 装配在 `loader_builder.py`。
 - MoE token dispatch 位于 `parallel/expert_parallel/token_dispatch.py`；
-  router、专家计算和 MoE layer 位于 `models/common/moe/`。
+  TorchAO padding 适配位于同目录 `torchao_dispatch.py`，依赖在构造时导入；
+  router、专家计算和 MoE layer 位于 `models/common/moe/`，FP32 router
+  投影定义在 `models/common/moe/gate.py`。
 - 优化器状态初始化与 FQN 序列化位于 `components/optimizer/state_dict.py`；
   TP 模型投影构件位于 `models/common/tp_projections.py`，通信原语位于
   `parallel/tensor_parallel/linear_ops.py`。
+- HF 配置构建与类解析位于 `models/hf/factory.py`；并行变换后的 meta 存储
+  分配、运行时 buffer 重建与共享引用恢复位于 `models/hf/materialization.py`。
+- 优化器参数组、学习率调度和 EMA 配置分别位于 `config/optimizer_config.py`、
+  `config/lr_scheduler_config.py` 和 `config/ema_config.py`；运行时直接导入
+  定义模块，`config/__init__.py` 维护统一公共导出。
 
 实现代码从符号的定义模块导入；包 `__init__.py` 只暴露有意维护的公共 API。
 保留现有懒加载，避免配置或轻量入口引入训练引擎、媒体后端或可选内核。

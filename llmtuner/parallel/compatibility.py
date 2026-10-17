@@ -12,7 +12,7 @@ site; the verdict lives here, so the site cannot quietly disagree.
 Config-phase combination checks are NOT here: they live in the owning
 config's ``__post_init__`` (``config/parallel_config.py``,
 ``config/training_config.py``,
-``config/root.py``), alongside every other field validation. The division of
+``config/llmtuner_config.py``), alongside every other field validation. The division of
 labor is documented in docs/torchllmtuner_design.md (§3.3, the
 combination-verdict section).
 
@@ -270,14 +270,14 @@ def group_limited_greedy() -> None:
 
 
 def router_bias(router_gate: object) -> None:
-    """RouterGateLinear has no slot for a router bias. Every supported family is bias-
-    free, so this fires only on a family the probe does not know.
+    """The EP conversion constructs a bias-free router and copies only its weight.
+    Reject biased HF gates before conversion so their bias is not silently lost.
     """
     raise UnsupportedCombinationError(
         f"{type(router_gate).__name__} carries a router bias, which "
-        "RouterGateLinear has no slot for. Every supported family "
-        "(Qwen3Moe, OLMoE, Mixtral, DeepSeek-V2/V3, GLM4) is bias-free, "
-        "so this fires only on a family the probe does not know."
+        "the EP conversion does not preserve: it constructs a bias-free "
+        "router and copies only the gate weight. Supporting this layout "
+        "requires preserving the bias and validating routing equivalence."
     )
 
 
@@ -347,13 +347,13 @@ ENTRIES: tuple[CompatibilityRule, ...] = (
         chunked_loss_pp,
         "assembly",
         UnsupportedCombinationError,
-        "trainer/trainer.py::Trainer.__init__",
+        "trainer/runtime/assembly.py::_build_model",
     ),
     CompatibilityRule(
         ep_hf_initial_load,
         "assembly",
         UnsupportedCombinationError,
-        "trainer/runtime/assembly.py::assemble_trainer_runtime",
+        "trainer/runtime/assembly.py::_build_model",
     ),
     CompatibilityRule(
         chunked_loss_validation,
@@ -383,13 +383,13 @@ ENTRIES: tuple[CompatibilityRule, ...] = (
         shared_expert_tp,
         "assembly",
         UnsupportedCombinationError,
-        "parallel/tensor_parallel/tensor_parallel.py::apply_tp",
+        "parallel/tensor_parallel/tensor_parallel.py::realize_moe_blocks_tp",
     ),
     CompatibilityRule(
         tp_moe_specs_without_block,
         "assembly",
         UnsupportedCombinationError,
-        "parallel/tensor_parallel/tensor_parallel.py::apply_tp",
+        "parallel/tensor_parallel/tensor_parallel.py::resolve_tp_targets",
     ),
     CompatibilityRule(
         tp_moe_non_tensor_output,

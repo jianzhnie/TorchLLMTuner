@@ -257,7 +257,7 @@ python -m examples.train_deepseek_v3
 
 当前需要特别注意的边界包括：
 
-- TP 只能使用序列并行路径，`enable_sequence_parallel=False` 不受支持；
+- TP>1 只能使用序列并行路径，`enable_sequence_parallel=False` 不受支持；TP=1 时该开关不影响执行；
 - `max_seq_len` 必须能被 `cp × tp` 整除；
 - chunked loss 当前不能与 PP 或 validation 同时启用；
 - PP 不支持跨首尾 stage 的 tied word embedding；
