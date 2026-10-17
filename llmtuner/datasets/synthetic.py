@@ -154,7 +154,9 @@ class RandomTokenDataLoader(BaseDataLoader):
             raise ValueError(
                 "cannot resume after changing synthetic data configuration"
             )
-        resume_at = state_dict.get("steps", 0)
+        if "steps" not in state_dict:
+            raise ValueError("checkpoint is missing synthetic loader steps")
+        resume_at = state_dict["steps"]
         if (
             not isinstance(resume_at, int)
             or isinstance(resume_at, bool)

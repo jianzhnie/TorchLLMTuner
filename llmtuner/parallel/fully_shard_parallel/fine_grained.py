@@ -2,8 +2,9 @@
 
 FSDPTurbo's original implementation subclasses private FSDP state classes. Those
 classes changed between the PyTorch releases supported by this project. This
-adapter keeps the public fine-grained contract while delegating parameter and
-communication state to the installed PyTorch 2.14 implementation.
+adapter supports pattern-selected native units while delegating parameter and
+communication state to the installed PyTorch 2.14 implementation. It does not
+implement FSDPTurbo's relocated hooks or multiple communication-context engine.
 """
 
 from __future__ import annotations
