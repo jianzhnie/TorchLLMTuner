@@ -13,10 +13,8 @@ are this rank's T/(cp*tp) sequence slice; joining them over tp and then cp
 must reproduce the unsharded HF model's logits, and the summed loss must
 reduce to the reference's.
 
-Environment note: needs torch >= 2.12 (the flex/spmd import surface). The
-combination was config-refused until 2026-10-02; this script is the numeric
-proof, pending a multi-rank run on the target torch (environment not covered
-on the development host).
+Environment note: uses CPU eager flex for the parallel forward and SDPA for
+the reference. CPU flex backward and GPU/NPU kernels are not exercised.
 
 Non-vacuity: TP must have swapped projections (wrapper count), each rank must
 hold only its half of the experts, and the CP gather must matter (a rank
@@ -50,7 +48,9 @@ TP = 2
 CP = 2
 EP = 2
 WORLD = TP * CP  # EP tiles the existing ranks; it is not an extra axis
-TOL = 1e-9
+# Expert computation is float64, but routing scores deliberately use FP32;
+# match the HF-versus-EP tolerance used by ep_wiring_equivalence.py.
+TOL = 1e-6
 IGNORE_INDEX = -100
 
 
@@ -84,7 +84,9 @@ def _cfg() -> LLMTunerConfig:
 def _build(cfg: LLMTunerConfig, *, seed: int = 0) -> HFTransformerModel:
     """Deterministically initialized tiny qwen3_moe; identical on every rank."""
     torch.manual_seed(seed)
-    return HFTransformerModel(build_model_config_for(cfg)).to(torch.float64).eval()
+    config = build_model_config_for(cfg)
+    config.experts_implementation = "eager"
+    return HFTransformerModel(config).to(torch.float64).eval()
 
 
 def _data(seed: int = 0):
@@ -138,6 +140,9 @@ def main() -> None:
 
     model = _build(cfg)
     ref = _build(cfg)
+    # The production CPU default is SDPA, which CP correctly rejects. As in
+    # the CP wiring harness, explicitly select eager flex for this forward test.
+    model.model.config._attn_implementation = "flex_torchtitan"
 
     # The assembly order from parallelize.py's STAGES table: tp -> ep -> cp.
     model = apply_tp(model, tp_mesh, cfg.parallel)

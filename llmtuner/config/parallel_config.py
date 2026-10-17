@@ -61,7 +61,9 @@ class FSDPConfig:
     """Module patterns excluded from FSDP parameter management."""
 
     fsdp_implementation: Literal["native", "custom"] = "native"
-    """FSDP engine. ``custom`` selects the fine-grained implementation."""
+    """FSDP engine. ``custom`` uses a fine-grained adapter backed by native FSDP2;
+    attaching hooks to a different managed module is not supported.
+    """
 
     enable_fsdp_symm_mem: bool = False
     """Enable FSDP2 symmetric-memory communication when supported."""
