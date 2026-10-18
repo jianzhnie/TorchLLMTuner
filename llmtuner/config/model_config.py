@@ -42,6 +42,13 @@ class ModelConfig:
             "Overrides require model support; ignored under EP > 1."
         },
     )
+    norm_backend: str = field(
+        default="native",
+        metadata={
+            "help": "Qwen3 RMSNorm: native or aten (CPU first-order ATen "
+            "boundaries for eager/Inductor reproducibility; slower)."
+        },
+    )
     compute_dtype: str | None = field(
         default=None,
         metadata={
@@ -71,6 +78,8 @@ class ModelConfig:
                 setattr(self, name, getattr(architecture, name))
 
     def __post_init__(self) -> None:
+        if self.norm_backend not in ("native", "aten"):
+            raise ConfigError("model.norm_backend must be 'native' or 'aten'.")
         # Architecture numbers must be sane before any model build: an invalid
         # value here used to surface deep inside HF's for_model or the
         # wrapper's forward, long after the config was accepted.

@@ -194,6 +194,10 @@ class TrainingConfig:
         return self.validation_config
 
     def __post_init__(self) -> None:
+        for name in ("compile", "deterministic", "detect_anomaly"):
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                raise ConfigError(f"training.{name} must be bool, got {value!r}")
         if (
             not isinstance(self.max_norm, int | float)
             or isinstance(self.max_norm, bool)

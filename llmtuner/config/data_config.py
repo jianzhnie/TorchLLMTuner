@@ -32,6 +32,14 @@ class DataloaderConfig:
         default=None,
         metadata={"help": "Corpus path. Required for local_jsonl and local_jsonl_sft."},
     )
+    data_identity: str | None = field(
+        default=None,
+        metadata={
+            "help": "Stable source/recipe snapshot identifier for corpus resume. "
+            "For registered or remote data, change it when source contents or "
+            "recipe semantics change; local text also retains content hashing."
+        },
+    )
     prompt_field: str = field(
         default="prompt",
         metadata={"help": "Prompt field used by dataset=local_jsonl_sft."},
@@ -128,6 +136,18 @@ class DataloaderConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.data_identity is not None and (
+            not isinstance(self.data_identity, str) or not self.data_identity.strip()
+        ):
+            raise ConfigError(
+                "dataloader.data_identity must be a nonempty string or None"
+            )
+        if self.dataset == "random" and self.data_identity is not None:
+            raise ConfigError(
+                "dataloader.data_identity applies only to corpus datasets"
+            )
+        if not isinstance(self.shuffle, bool):
+            raise ConfigError(f"dataloader.shuffle must be bool, got {self.shuffle!r}")
         if self.packing not in ("concat_then_split", "first_fit"):
             raise ConfigError(
                 "dataloader.packing must be 'concat_then_split' or 'first_fit', "
@@ -145,7 +165,10 @@ class DataloaderConfig:
         if (
             self.dataset == "local_jsonl_sft"
             and self.chat_renderer is None
-            and (not self.prompt_field.strip() or not self.response_field.strip())
+            and any(
+                not isinstance(value, str) or not value.strip()
+                for value in (self.prompt_field, self.response_field)
+            )
         ):
             raise ConfigError(
                 "dataloader.prompt_field/response_field cannot be empty for "
@@ -157,7 +180,10 @@ class DataloaderConfig:
                     f"dataloader.chat_renderer requires "
                     f"dataset='local_jsonl_sft', got {self.dataset!r}"
                 )
-            if not self.messages_field.strip():
+            if (
+                not isinstance(self.messages_field, str)
+                or not self.messages_field.strip()
+            ):
                 raise ConfigError(
                     "dataloader.messages_field cannot be empty when "
                     "chat_renderer is set"

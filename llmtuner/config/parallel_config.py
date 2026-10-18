@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -27,6 +28,7 @@ __all__ = [
     "PipelineParallelConfig",
     "TensorParallelConfig",
     "validate_expert_dispatcher",
+    "validate_router_aux_loss_coefficient",
 ]
 
 FSDPReshardPolicy = Literal["default", "always", "never"]
@@ -49,10 +51,18 @@ class FSDPConfig:
     """Use pinned host memory for FSDP2 CPU offload transfers."""
 
     fsdp_forward_prefetch_count: int = 0
-    """Number of later FSDP units explicitly prefetched during forward."""
+    """Number of later units explicitly prefetched during forward.
+
+    Decoder EP uses one explicit target when zero; pattern plans use the count
+    directly. Zero does not request explicit forward targets in a pattern plan.
+    """
 
     fsdp_backward_prefetch_count: int = 0
-    """Number of earlier FSDP units explicitly prefetched during backward."""
+    """Number of earlier units explicitly prefetched during backward.
+
+    Zero retains the engine's implicit policy; decoder EP uses one explicit
+    target when zero. This does not disable all backward prefetching.
+    """
 
     fsdp_apply_modules: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Programmatic-only module patterns and per-unit ``fully_shard`` overrides."""
@@ -61,8 +71,10 @@ class FSDPConfig:
     """Module patterns excluded from FSDP parameter management."""
 
     fsdp_implementation: Literal["native", "custom"] = "native"
-    """FSDP engine. ``custom`` uses a fine-grained adapter backed by native FSDP2;
-    attaching hooks to a different managed module is not supported.
+    """FSDP engine. ``custom`` uses PyTorch 2.14 parameter groups/collectives
+    with relocated ancestor hooks and multiple communication contexts.
+    Apply one engine consistently, including the root; target-device validation
+    and the full upstream migration matrix remain incomplete.
     """
 
     enable_fsdp_symm_mem: bool = False
@@ -200,7 +212,7 @@ EP_DISPATCHERS = ("alltoall", "torchao", "domino", "mc2", "deepep", "hybridep")
 
 
 def validate_expert_dispatcher(backend: str) -> None:
-    """Validate backend availability without requiring a parallel config."""
+    """Validate backend names and implementation gaps without importing kernels."""
     if backend not in EP_DISPATCHERS:
         raise ConfigError(
             "parallel.ep_token_dispatcher must be one of "
@@ -213,11 +225,19 @@ def validate_expert_dispatcher(backend: str) -> None:
             "and distributed wrappers are not included in this build. Use "
             "'alltoall'."
         )
-    if backend == "mc2":
-        raise EnvironmentUnsupportedError(
-            "parallel.ep_token_dispatcher='mc2' requires the Ascend fused "
-            "all-to-all/grouped-matmul operators. This build has no compatible "
-            "MC2 operator registration; refusing an unfused silent fallback."
+
+
+def validate_router_aux_loss_coefficient(coefficient: float | None) -> None:
+    """Validate the explicit or inherited MoE load-balance coefficient."""
+    if coefficient is not None and (
+        isinstance(coefficient, bool)
+        or not isinstance(coefficient, int | float)
+        or not math.isfinite(coefficient)
+        or coefficient < 0
+    ):
+        raise ConfigError(
+            "parallel.ep_config.router_aux_loss_coef must be None or a finite "
+            f"nonnegative number, got {coefficient!r}"
         )
 
 
@@ -248,6 +268,13 @@ class ExpertParallelConfig:
 
     def __post_init__(self) -> None:
         validate_expert_dispatcher(self.ep_token_dispatcher)
+        validate_router_aux_loss_coefficient(self.router_aux_loss_coef)
+        for name in ("fixed_router", "moe_quantile_balancing"):
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                raise ConfigError(
+                    f"parallel.ep_config.{name} must be bool, got {value!r}"
+                )
         require_integer_at_least(
             self, "ep_torchao_pad_multiple", group="parallel.ep_config"
         )
