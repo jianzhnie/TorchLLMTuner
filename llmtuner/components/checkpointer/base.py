@@ -189,9 +189,19 @@ class BaseCheckpointManager(ABC):
             return
 
         self.folder = filesystem.join(folder, config.folder)
+        if config.last_save_in_hf and filesystem.is_remote(self.folder):
+            raise ValueError(
+                "checkpoint.last_save_in_hf is not supported with a remote "
+                f"effective checkpoint folder, got {self.folder}"
+            )
         self.interval = config.interval
         self.states = {
-            MODEL: ModelCheckpointState(model_parts),
+            MODEL: ModelCheckpointState(
+                model_parts,
+                initialization_group=distributed.get_default_group()
+                if distributed.is_distributed()
+                else None,
+            ),
             OPTIMIZER: optimizer,
             LR_SCHEDULER: lr_scheduler,
         }
@@ -239,6 +249,10 @@ class BaseCheckpointManager(ABC):
             raise ValueError(
                 f"checkpoint load step must be an integer >= -1, got {step!r}"
             )
+        # Loading mutates the same live state that staging reads. Finish the
+        # snapshot and its publication before discovering a restore source.
+        self.maybe_wait_for_staging()
+        self.maybe_wait_for_saving()
         resolved = self._resolve_load_source(step)
         if resolved is None:
             return False
@@ -385,7 +399,8 @@ class BaseCheckpointManager(ABC):
         Safe to call at any point in the object's life: ``__del__`` routes here,
         and it can run on a partially constructed object whose ``__init__``
         raised. ``_close`` is a no-op when that happened, so implementations of
-        it may assume their own attributes exist.
+        it may assume their own attributes exist. Interrupted waits preserve
+        live worker resources so close can be retried after completion.
         """
         if not getattr(self, "_initialized", False):
             return
@@ -402,6 +417,17 @@ class BaseCheckpointManager(ABC):
                     first_error = error
                 else:
                     logger.exception("Additional checkpoint cleanup failure")
+                # An interrupted result() retains its live future. Its worker
+                # still owns the stager/process group, so leave the manager open
+                # for another close attempt instead of releasing those resources.
+                if any(
+                    future is not None and not future.done()
+                    for future in (
+                        getattr(self, "staging_future", None),
+                        getattr(self, "save_future", None),
+                    )
+                ):
+                    raise first_error from None
         self._initialized = False
         if first_error is not None:
             raise first_error
@@ -416,7 +442,16 @@ class BaseCheckpointManager(ABC):
             return
         if getattr(self, "save_future", None) is None:
             return
-        self._wait_for_saving()
+        try:
+            self._wait_for_saving()
+        except BaseException:
+            if getattr(self, "save_future", None) is None:
+                self._pending_retention = None
+            raise
+        retention = getattr(self, "_pending_retention", None)
+        self._pending_retention = None
+        if retention is not None:
+            self._purge_stale_checkpoints(**retention, completed=True)
 
     @abstractmethod
     def _wait_for_saving(self) -> None:
@@ -438,6 +473,19 @@ class BaseCheckpointManager(ABC):
         """Standardized checkpoint path, e.g. ``checkpoints/step-100``."""
         folder = folder or self.folder
         return filesystem.join(folder, f"step-{step}")
+
+    def _create_final_checkpoint_id(self, step: int) -> str:
+        """Keep a same-step training checkpoint intact when exporting weights."""
+        checkpoint_id = self._create_checkpoint_id(step)
+        if self.last_save_model_only and self._is_resumable_checkpoint(checkpoint_id):
+            export_id = filesystem.join(checkpoint_id, "model-export")
+            logger.info(
+                "Preserving training checkpoint %s; writing final weights to %s.",
+                checkpoint_id,
+                export_id,
+            )
+            return export_id
+        return checkpoint_id
 
     @abstractmethod
     def _load_checkpoint(
@@ -548,8 +596,9 @@ class BaseCheckpointManager(ABC):
         *,
         saving_step: int,
         staging_dir_prefix: str | None = None,
+        completed: bool = False,
     ) -> None:
-        """Delete abandoned entries, and reserve one retained slot for this save.
+        """Delete abandoned entries and retain only successfully published saves.
 
         Two kinds of entry are collected:
 
@@ -559,10 +608,9 @@ class BaseCheckpointManager(ABC):
         * **complete** -- a valid checkpoint past the retention horizon, deleted
           only if ``purge_exempt`` does not protect its step.
 
-        ``keep_latest_k - 1`` rather than ``keep_latest_k`` is the retention
-        count because the save this call precedes has not landed yet: the slot
-        it is about to fill is reserved here, so the horizon is computed as if
-        it were already on disk.
+        Before publication retain all ``keep_latest_k`` existing checkpoints.
+        After successful completion include the new checkpoint in that horizon.
+        Resumable checkpoints and model-only exports have independent horizons.
         """
         if self._should_purge():
             saving_dirnames = {f"step-{saving_step}"}
@@ -575,10 +623,13 @@ class BaseCheckpointManager(ABC):
                 else None
             )
             checkpoints: list[tuple[int, str]] = []
+            exports: list[tuple[int, str]] = []
             abandoned: list[str] = []
 
             for dirname in self._storage.listdir(self.folder):
-                if dirname in saving_dirnames:
+                if dirname in saving_dirnames and not (
+                    completed and dirname == f"step-{saving_step}"
+                ):
                     continue
 
                 checkpoint_dir = filesystem.join(self.folder, dirname)
@@ -591,23 +642,30 @@ class BaseCheckpointManager(ABC):
                 if step is None:
                     continue
                 if self._is_valid_checkpoint(checkpoint_dir):
-                    checkpoints.append((step, checkpoint_dir))
+                    retained = (
+                        checkpoints
+                        if self._is_resumable_checkpoint(checkpoint_dir)
+                        else exports
+                    )
+                    retained.append((step, checkpoint_dir))
                 else:
                     abandoned.append(checkpoint_dir)
 
-            checkpoints.sort()
-            num_to_keep = self.keep_latest_k - 1
-            num_to_purge = max(0, len(checkpoints) - num_to_keep)
-            for step, checkpoint_dir in checkpoints[:num_to_purge]:
-                if self._is_purge_exempt(step):
-                    logger.info(
-                        "Checkpointer is preserving checkpoint %s outside "
-                        "keep_latest_k.",
-                        checkpoint_dir,
-                    )
-                    continue
-                assert self.purge_thread is not None
-                self.purge_queue.put(checkpoint_dir)
+            # Model-only exports cannot replace training recovery points. Apply
+            # the configured horizon independently to both artifact categories.
+            for category in (checkpoints, exports):
+                category.sort()
+                num_to_purge = max(0, len(category) - self.keep_latest_k)
+                for step, checkpoint_dir in category[:num_to_purge]:
+                    if self._is_purge_exempt(step):
+                        logger.info(
+                            "Checkpointer is preserving checkpoint %s outside "
+                            "keep_latest_k.",
+                            checkpoint_dir,
+                        )
+                        continue
+                    assert self.purge_thread is not None
+                    self.purge_queue.put(checkpoint_dir)
 
             for checkpoint_dir in abandoned:
                 assert self.purge_thread is not None

@@ -592,12 +592,23 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
         if last_step:
             self._save_last_step(curr_step)
+            self._purge_stale_checkpoints(
+                saving_step=curr_step,
+                staging_dir_prefix=self._manager_config.save.writer_config.temp_dir_prefix,
+                completed=True,
+            )
         else:
             self.save_future = self._manager.save(
                 self._create_checkpoint_id(curr_step),
                 self._stateful_to_state_dict(self.states),
             )
             self._prewarmed = True
+            self._pending_retention = {
+                "saving_step": curr_step,
+                "staging_dir_prefix": (
+                    self._manager_config.save.writer_config.temp_dir_prefix
+                ),
+            }
 
         return True
 
@@ -697,7 +708,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
         # The final save must land before the process exits, so retire the async
         # manager and write synchronously through a fresh one.
-        checkpoint_id = self._create_checkpoint_id(curr_step)
+        checkpoint_id = self._create_final_checkpoint_id(curr_step)
         self._manager.close()
         storage_config = self._manager_config.storage_config
         input_checkpoint_id = checkpoint_id

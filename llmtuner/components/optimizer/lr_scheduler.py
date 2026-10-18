@@ -121,9 +121,10 @@ class LRSchedulersContainer(Stateful):
         the one this computes from the previous ``last_epoch`` -- which is why
         the first training step runs at ``lambda(0)``.
         """
-        if any(
-            scheduler.last_epoch >= self.total_steps for scheduler in self.schedulers
-        ):
+        # Independent stepping of an exposed inner scheduler breaks the common
+        # progress contract. Reject it before advancing any optimizer's rate.
+        last_epoch = self.state_dict()["last_epoch"]
+        if last_epoch >= self.total_steps:
             raise ValueError(
                 "Cannot advance lr_scheduler beyond total_steps "
                 f"({self.total_steps}); extend the schedule before continuing"

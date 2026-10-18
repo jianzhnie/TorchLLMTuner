@@ -92,7 +92,20 @@ class EMAStateOptimizer(Optimizer):
                 "outside buffer_patterns after EMA construction is not supported. "
                 "Build the EMA after the model is final."
             )
-        return [self.state[t]["ema_params"] for t in tensors]
+        averages = [self.state[t]["ema_params"] for t in tensors]
+        for tensor, average in zip(tensors, averages, strict=True):
+            if (
+                tensor.shape != average.shape
+                or tensor.dtype != average.dtype
+                or tensor.device != average.device
+            ):
+                raise RuntimeError(
+                    "EMA tracked tensor metadata changed after construction: "
+                    f"live={tensor.shape}/{tensor.dtype}/{tensor.device}, "
+                    f"average={average.shape}/{average.dtype}/{average.device}. "
+                    "Build EMA after model dtype, device and shape are final."
+                )
+        return averages
 
 
 class EMA(OptimizersContainer):
@@ -121,7 +134,7 @@ class EMA(OptimizersContainer):
             bias -- the firing count already continues correctly on its own.
         update_every_n_steps: only fire the EMA update every N optimizer steps.
         buffer_patterns: regex patterns (``re.search``, matched against buffer
-            FQNs from ``model.named_buffers()``) selecting which buffers also
+            all registered buffer aliases) selecting which buffers also
             get an EMA tracked alongside trainable parameters. Empty (default):
             no buffers tracked.
     """
@@ -149,14 +162,7 @@ class EMA(OptimizersContainer):
         self.model_parts = list(model_parts)
 
         buffer_groups = (
-            [
-                [
-                    (name, buffer)
-                    for name, buffer in model.named_buffers()
-                    if any(pattern.search(name) for pattern in self._buffer_patterns)
-                ]
-                for model in self.model_parts
-            ]
+            [self._selected_buffers(model) for model in self.model_parts]
             if self._buffer_patterns
             else []
         )
@@ -182,6 +188,17 @@ class EMA(OptimizersContainer):
         ]
         all_params = [parameter for group in parameter_groups for _, parameter in group]
         self._validate_params(all_params)
+        checkpoint_names: set[str] = set()
+        for group in [*parameter_groups, *buffer_groups]:
+            for name, _ in group:
+                fqn = canonical_fqn(name)
+                if fqn in checkpoint_names:
+                    raise ValueError(
+                        "EMA tensor FQNs collide across model parts or "
+                        f"parameter/buffer groups: {fqn!r}. "
+                        "Tracked tensors must use unique checkpoint FQNs."
+                    )
+                checkpoint_names.add(fqn)
         self._param_optimizers = [
             EMAStateOptimizer(group) for group in parameter_groups
         ]
@@ -258,6 +275,16 @@ class EMA(OptimizersContainer):
             if tensors:
                 torch._foreach_lerp_(averages, tensors, 1.0 - decay)
 
+    def _selected_buffers(self, model: nn.Module) -> list[tuple[str, torch.Tensor]]:
+        """Match all aliases and track each buffer once under its first name."""
+        primary_names: dict[int, str] = {}
+        selected: dict[int, tuple[str, torch.Tensor]] = {}
+        for name, buffer in model.named_buffers(remove_duplicate=False):
+            primary_names.setdefault(id(buffer), name)
+            if any(pattern.search(name) for pattern in self._buffer_patterns):
+                selected.setdefault(id(buffer), (primary_names[id(buffer)], buffer))
+        return list(selected.values())
+
     def _tracked_groups(
         self,
     ) -> list[tuple[list[torch.Tensor], list[torch.Tensor]]]:
@@ -276,17 +303,15 @@ class EMA(OptimizersContainer):
             self.model_parts,
             strict=False,
         ):
-            buffers: list[torch.Tensor] = [
-                b
-                for name, b in model.named_buffers()
-                if any(p.search(name) for p in self._buffer_patterns)
-            ]
+            buffers = [buffer for _, buffer in self._selected_buffers(model)]
             groups.append((ema_opt.tracked_averages(buffers), buffers))
         return groups
 
     # -- checkpointing ----------------------------------------------------------
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if not isinstance(state_dict, dict):
+            raise ValueError("EMA checkpoint state must be a dictionary")
         if state_dict:
             super().load_state_dict(state_dict)
             return

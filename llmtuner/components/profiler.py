@@ -15,7 +15,10 @@ import os
 import pickle
 import sys
 import time
-from typing import TYPE_CHECKING
+from tempfile import NamedTemporaryFile
+from threading import RLock
+from typing import TYPE_CHECKING, ClassVar
+from weakref import WeakSet
 
 import torch
 
@@ -55,6 +58,9 @@ class MemoryProfiler:
     than by the caller, so the loop does not have to know the policy.
     """
 
+    _history_owners: ClassVar[WeakSet[MemoryProfiler]] = WeakSet()
+    _history_lock: ClassVar[RLock] = RLock()
+
     def __init__(
         self,
         *,
@@ -73,7 +79,17 @@ class MemoryProfiler:
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
-        self._records_history = record_memory_history(max_entries=max_entries)
+        self._max_entries = max_entries
+        with self._history_lock:
+            if any(owner._max_entries != max_entries for owner in self._history_owners):
+                raise ValueError(
+                    "Overlapping memory profilers require identical max_entries"
+                )
+            self._records_history = bool(self._history_owners) or record_memory_history(
+                max_entries=max_entries
+            )
+            if self._records_history:
+                self._history_owners.add(self)
         if not self._records_history:
             # Not an error: the device has no allocator history to keep. Said
             # once, at the point the run asked for snapshots, rather than
@@ -122,21 +138,32 @@ class MemoryProfiler:
         output_file = os.path.join(
             directory, MEMORY_FILE.format(rank=self._rank, step=curr_step)
         )
-        with open(output_file, "wb") as output:
-            # Protocol 4 rather than the interpreter's default: memory_viz's JS
-            # parser reads that one.
-            pickle.dump(
-                read_memory_snapshot(), output, protocol=_SNAPSHOT_PICKLE_PROTOCOL
-            )
+        temporary_path = None
+        try:
+            with NamedTemporaryFile(
+                dir=directory, suffix=".tmp", delete=False
+            ) as output:
+                temporary_path = output.name
+                # Protocol 4 is understood by memory_viz's JS parser.
+                pickle.dump(
+                    read_memory_snapshot(), output, protocol=_SNAPSHOT_PICKLE_PROTOCOL
+                )
+            os.replace(temporary_path, output_file)
+        finally:
+            if temporary_path is not None and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
         logger.info(
             "Finished dumping memory snapshot in %.2f seconds", time.monotonic() - begin
         )
 
     def close(self) -> None:
         """Stop the allocator history started by this profiler, once."""
-        if self._records_history:
-            self._records_history = False
-            stop_memory_history()
+        with self._history_lock:
+            if self._records_history:
+                if not any(owner is not self for owner in self._history_owners):
+                    stop_memory_history()
+                self._history_owners.discard(self)
+                self._records_history = False
 
 
 class Profiler:
@@ -212,6 +239,9 @@ class Profiler:
             try:
                 memory.close()
             except BaseException as error:
+                # A failed backend shutdown may leave allocator recording active.
+                # Retain its owner so callers can retry exit after the failure.
+                self.memory_profiler = memory
                 if first_error is None:
                     first_error = error
                 logger.exception("Failed to stop allocator memory history")
@@ -299,7 +329,17 @@ class Profiler:
             on_trace_ready=trace_handler,
             record_shapes=True,
         )
-        torch_profiler.__enter__()
+        try:
+            torch_profiler.__enter__()
+        except BaseException:
+            # Starting a trace can acquire resources before raising. The
+            # outer context has not received this handle yet, so it cannot
+            # release it. Preserve the original failure if stopping also fails.
+            try:
+                torch_profiler.__exit__(*sys.exc_info())
+            except BaseException:
+                logger.exception("Failed to stop partially started trace profiler")
+            raise
         return torch_profiler
 
     def build_memory_profiler(self) -> MemoryProfiler | None:

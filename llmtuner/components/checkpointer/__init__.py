@@ -73,6 +73,7 @@ _EXPORT_SOURCES = {
     "LR_SCHEDULER": "checkpoint_keys",
     "MODEL": "checkpoint_keys",
     "OPTIMIZER": "checkpoint_keys",
+    "RNG_STATE": "checkpoint_keys",
     "SAFETENSORS_INDEX": "checkpoint_keys",
     "TRAIN_STATE": "checkpoint_keys",
     "DistributedCheckpointAsyncMode": "distributed_checkpoint",

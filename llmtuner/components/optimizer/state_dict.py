@@ -54,6 +54,11 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
         return
 
     saved_grads = [param.grad for param in params]
+    saved_empty_states = {
+        param: optim.state[param]
+        for param in params_to_initialize
+        if param in optim.state
+    }
     saved_lrs = []
     try:
         for param in params:
@@ -84,6 +89,17 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
                 if "max_exp_avg_sq" in state:
                     state["max_exp_avg_sq"].zero_()
 
+    except BaseException:
+        # Adam may allocate one field or complete one parameter before an
+        # allocation/hook fails. A nonempty partial entry would otherwise be
+        # mistaken for initialized state on the next checkpoint attempt.
+        for param in params_to_initialize:
+            optim.state.pop(param, None)
+            if param in saved_empty_states:
+                original_state = saved_empty_states[param]
+                original_state.clear()
+                optim.state[param] = original_state
+        raise
     finally:
         for param_group, lr in saved_lrs:
             param_group["lr"] = lr

@@ -17,6 +17,7 @@ LR_SCHEDULER = "lr_scheduler"
 DATALOADER = "dataloader"
 TRAIN_STATE = "train_state"
 EMA = "ema"
+RNG_STATE = "rng_state"
 
 # Written by the HF safetensors export (``HFTransformerStateDictAdapter``) and
 # probed by the DCP checkpointer's "is this a resumable checkpoint" test.
@@ -28,6 +29,7 @@ __all__ = [
     "LR_SCHEDULER",
     "MODEL",
     "OPTIMIZER",
+    "RNG_STATE",
     "SAFETENSORS_INDEX",
     "TRAIN_STATE",
 ]

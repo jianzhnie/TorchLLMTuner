@@ -251,11 +251,10 @@ class WandBLogger(BaseLogger):
         # Deferred so that a run without wandb enabled does not import it.
         import wandb
 
-        self.wandb = wandb
         self.tag = tag
 
         os.makedirs(log_dir, exist_ok=True)
-        self.wandb.init(
+        self.run = wandb.init(
             entity=os.getenv("WANDB_TEAM"),
             project=os.getenv("WANDB_PROJECT", "llmtuner"),
             name=os.getenv("WANDB_RUN_NAME"),
@@ -284,13 +283,14 @@ class WandBLogger(BaseLogger):
         # commit=True: without it wandb treats an explicit step as a partial
         # record and holds it open, so a metric logged once per step can be
         # merged into (or overwritten by) the next one.
-        self.wandb.log(prefixed, step=step, commit=True)
+        if self.run is None:
+            raise RuntimeError("WandBLogger is closed")
+        self.run.log(prefixed, step=step, commit=True)
 
     def close(self) -> None:
-        # ``run`` is None when init failed or ``finish`` already ran; calling
-        # finish again would raise during interpreter shutdown.
-        if self.wandb.run is not None:
-            self.wandb.finish()
+        if self.run is not None:
+            self.run.finish()
+            self.run = None
 
 
 class LoggerContainer(BaseLogger):
@@ -317,6 +317,9 @@ class LoggerContainer(BaseLogger):
             try:
                 logger_instance.close()
             except BaseException as error:
+                # Keep failed owners reachable so Trainer.close can retry;
+                # successfully closed sinks must not be closed a second time.
+                self._loggers.append(logger_instance)
                 if first_error is None:
                     first_error = error
                 else:
