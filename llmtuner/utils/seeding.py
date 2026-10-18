@@ -1,7 +1,11 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+from __future__ import annotations
+
 import os
 import random
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -10,6 +14,44 @@ from ..accelerator.device import device_module, device_type
 from .logging import get_logger
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
+
+def initialize_dtensor_rng(mesh: DeviceMesh | None) -> None:
+    """Initialize DTensor random-op tracking without a global seed broadcast.
+
+    PyTorch 2.14 uses the device's default RNG directly. Disable first-use
+    synchronization so PP stage seeds and checkpoint-restored streams survive.
+    Constructing the tracker does not reseed or consume random numbers.
+    """
+    if mesh is None or mesh.device_type == "cpu":
+        return
+    from torch.distributed.tensor import _random
+
+    if _random.is_rng_supported_mesh(mesh) and _random._rng_tracker is None:
+        _random._rng_tracker = _random.OffsetBasedRNGTracker(mesh, run_state_sync=False)
+
+
+@contextmanager
+def preserve_rng_state(device: torch.device) -> Iterator[None]:
+    """Isolate Python, NumPy, CPU and the selected device's default RNGs.
+
+    This does not snapshot private generators owned by loaders. PyTorch 2.14
+    regular DTensor random ops use the device default stream saved here.
+    """
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    try:
+        with torch.random.fork_rng(
+            devices=[] if device.type == "cpu" else [device],
+            device_type=device.type,
+        ):
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
 
 
 def set_deterministic_algorithms() -> None:

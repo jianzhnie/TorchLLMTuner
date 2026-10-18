@@ -3,7 +3,7 @@
 This module has no torch dependency and does not define checkpoint format keys.
 """
 
-_WRAPPER_SEGMENTS = ("_checkpoint_wrapped_module",)
+_WRAPPER_SEGMENTS = ("_checkpoint_wrapped_module", "_orig_mod")
 
 
 def canonical_fqn(
