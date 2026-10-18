@@ -294,7 +294,7 @@ def wrap_selective(
     policy = selective_policy(save_ops, mm_shapes)
     return ptd_checkpoint_wrapper(
         module,
-        context_fn=lambda: checkpoint_contexts(policy),
+        context_fn=lambda: checkpoint_contexts(policy, module),
         preserve_rng_state=cfg.preserve_rng_state,
         determinism_check=cfg.determinism_check,
         early_stop=True,
@@ -315,20 +315,59 @@ def full_policy(_ctx, _op, *_args, **_kwargs) -> CheckpointPolicy:
     return CheckpointPolicy.PREFER_RECOMPUTE
 
 
-def checkpoint_contexts(policy: Callable):
+def checkpoint_contexts(policy: Callable, module: nn.Module | None = None):
     """Keep checkpoint's op policy while marking its backward-time replay."""
     forward_context, recompute_context = create_selective_checkpoint_contexts(policy)
+    # HF stages masks outside decoder layers. Multiple outstanding forwards
+    # must retain their own masks until their checkpoint backward executes.
+    from llmtuner.models.common.moe.layer import MoE
+
+    masks = (
+        [
+            (child, child._pending_padding_mask)
+            for child in module.modules()
+            if isinstance(child, MoE)
+        ]
+        if module is not None
+        else []
+    )
 
     @contextmanager
     def marked_recompute():
         token = in_checkpoint_recompute.set(True)
+        current_masks = [(child, child._pending_padding_mask) for child, _ in masks]
+        for child, mask in masks:
+            child.set_padding_mask(mask)
         try:
-            with recompute_context:
-                yield
+            yield
         finally:
+            for child, mask in current_masks:
+                child.set_padding_mask(mask)
             in_checkpoint_recompute.reset(token)
 
-    return forward_context, marked_recompute()
+    class RecomputeContext(type(recompute_context)):
+        # Checkpoint may replay again for a retained graph. Generator context
+        # managers are single-use, so create one for each entry.
+        def __enter__(self):
+            self.context = marked_recompute()
+            self.context.__enter__()
+            try:
+                return super().__enter__()
+            except BaseException as error:
+                self.context.__exit__(type(error), error, error.__traceback__)
+                raise
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            try:
+                return super().__exit__(exc_type, exc_value, traceback)
+            finally:
+                self.context.__exit__(exc_type, exc_value, traceback)
+
+    return forward_context, RecomputeContext(
+        policy,
+        recompute_context.storage,
+        recompute_context.allow_cache_entry_mutation,
+    )
 
 
 def wrap_full(module: nn.Module, *, preserve_rng_state: bool = True) -> nn.Module:
@@ -345,7 +384,7 @@ def wrap_full(module: nn.Module, *, preserve_rng_state: bool = True) -> nn.Modul
     """
     return ptd_checkpoint_wrapper(
         module,
-        context_fn=lambda: checkpoint_contexts(full_policy),
+        context_fn=lambda: checkpoint_contexts(full_policy, module),
         preserve_rng_state=preserve_rng_state,
         early_stop=True,
     )
