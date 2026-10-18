@@ -284,6 +284,10 @@ def create_varlen_metadata_for_document(
         if padding_doc_starts is not None:
             torch._assert_async(padding_doc_starts.sum() <= max_num_padding_segments)
         packed_cu_seqlens = packed_cu_seqlens[:num_slots]
+        torch._assert_async(
+            (torch.diff(packed_cu_seqlens) <= max_context_length).all(),
+            "packed document length exceeds max_context_length kernel bound",
+        )
         max_seqlen = max_context_length
     else:
         doc_starts = is_doc_start.nonzero(as_tuple=True)[0].to(torch.int32)
