@@ -122,15 +122,17 @@ class HFTransformerStateDictAdapter:
                     f"missing={sorted(missing)[:8]}, "
                     f"unexpected={sorted(unexpected)[:8]}"
                 )
-        if (
-            getattr(self.model_config, "tie_word_embeddings", False)
-            and "model.embed_tokens.weight" in hf_state
-            and "lm_head.weight" in hf_state
-        ):
-            # Safetensors cannot serialize aliases within one shard. Preserve
-            # both exported keys without changing the model's parameter ties;
-            # the HF model restores sharing according to its configuration.
-            hf_state["lm_head.weight"] = hf_state["lm_head.weight"].clone()
+        if getattr(self.model_config, "tie_word_embeddings", False):
+            # All ranks with tied configuration participate, including PP parts
+            # without either key. DTensor clone preserves placements locally.
+            with synchronize_local_errors("HF export tied weights"):
+                if (
+                    "model.embed_tokens.weight" in hf_state
+                    and "lm_head.weight" in hf_state
+                ):
+                    # Safetensors cannot serialize aliases within one shard.
+                    # HF restores parameter sharing from its configuration.
+                    hf_state["lm_head.weight"] = hf_state["lm_head.weight"].clone()
         return hf_state
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
