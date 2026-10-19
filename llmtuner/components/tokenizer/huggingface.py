@@ -46,6 +46,11 @@ class HuggingFaceTokenizer(BaseTokenizer):
         self.unk_id = None
 
         self.tokenizer = self._load_tokenizer_from_path(tokenizer_path)
+        # Sample processors and packing own sequence limits and padding. Saved
+        # batch policies must not discard content or add supervised pad tokens;
+        # renderer adapters also access this backend directly for offsets.
+        self.tokenizer.no_padding()
+        self.tokenizer.no_truncation()
 
         self._hf_config = self._load_config(
             os.path.join(tokenizer_path, "tokenizer_config.json")

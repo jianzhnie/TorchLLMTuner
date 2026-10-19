@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from tokenizers import AddedToken
+
 from .huggingface import HuggingFaceTokenizer
 
 
 class MultimodalTokenizer(HuggingFaceTokenizer):
     """Single source of truth for multimodal special tokens.
 
-    Requires 5 token strings, validates them against the vocabulary at init, and
+    Requires 5 distinct token strings, validates them against the vocabulary, and
     exposes both string and ID attributes (e.g. ``image_token``, ``image_id``).
     The multimodal Grain processor reads these attributes directly; the collator
     packs the IDs into a plain ``dict[str, int]`` that travels through the batch
@@ -53,6 +55,11 @@ class MultimodalTokenizer(HuggingFaceTokenizer):
             "vision_end": vision_end_token,
             "pad": pad_token,
         }
+        if len(set(tokens.values())) != len(tokens):
+            raise ValueError(
+                "Multimodal image, video, vision_start, vision_end and pad tokens "
+                "must be distinct so their input roles remain unambiguous."
+            )
 
         for name, token_str in tokens.items():
             token_id = self.token_to_id(token_str)
@@ -63,3 +70,35 @@ class MultimodalTokenizer(HuggingFaceTokenizer):
                 )
             setattr(self, f"{name}_token", token_str)
             setattr(self, f"{name}_id", token_id)
+
+        if len({getattr(self, f"{name}_id") for name in tokens}) != len(tokens):
+            raise ValueError("Multimodal markers must have distinct vocabulary IDs")
+
+        # Vocabulary membership alone does not prevent punctuation splitting or
+        # normalization. Register only missing matchers; explicit asset metadata
+        # must keep its matching and decoding semantics.
+        registered = self.tokenizer.get_added_tokens_decoder()
+        self.tokenizer.add_tokens(
+            [
+                AddedToken(token, normalized=False, special=True)
+                for name, token in tokens.items()
+                if getattr(self, f"{name}_id") not in registered
+            ]
+        )
+        for name, token in tokens.items():
+            token_id = getattr(self, f"{name}_id")
+            if self.encode(token * 2, add_bos=False, add_eos=False) != [
+                token_id,
+                token_id,
+            ]:
+                raise ValueError(
+                    f"Multimodal {name}_token {token!r} must encode atomically "
+                    "when repeated; check the tokenizer AddedToken metadata."
+                )
+        markers = ("vision_start", "image", "image", "vision_end")
+        if self.encode(
+            "".join(tokens[name] for name in markers),
+            add_bos=False,
+            add_eos=False,
+        ) != [getattr(self, f"{name}_id") for name in markers]:
+            raise ValueError("Adjacent multimodal markers must encode atomically")
