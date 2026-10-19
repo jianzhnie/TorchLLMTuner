@@ -129,9 +129,13 @@ def batch_generator(
     while True:
         data_load_start = perf_counter()
         batch = fetch_batch(data_iterator)
-        labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
-        self.metrics.add_tokens(labels.numel())
-        self.metrics.add_data_loading_time(perf_counter() - data_load_start)
+        # Fetch has already coordinated loader errors. Keep local metric
+        # callbacks in a separate boundary before peers account tokens or
+        # fetch another batch; the loader collective must stay outside it.
+        with synchronize_local_errors("Training fetch accounting"):
+            labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
+            self.metrics.add_tokens(labels.numel())
+            self.metrics.add_data_loading_time(perf_counter() - data_load_start)
         yield batch
 
 

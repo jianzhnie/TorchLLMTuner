@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import sys
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -45,9 +45,12 @@ def close_validation_dataloader(loader: BaseDataLoader, *, failed: bool) -> None
     except BaseException:
         if not failed:
             raise
-        get_logger(__name__).exception(
-            "Validation dataloader cleanup failed after validation failed"
-        )
+        try:
+            get_logger(__name__).exception(
+                "Validation dataloader cleanup failed after validation failed"
+            )
+        except BaseException:
+            pass  # Preserve the active validation failure, including interrupts.
 
 
 def create_validation_dataloader(
@@ -199,8 +202,15 @@ def validate(self: Trainer, step: int) -> None:
 
     # Validation follows save() in the training loop. Eval forward can still
     # mutate state (for example embedding max_norm); finish the snapshot first.
-    if self.checkpointer is not None:
-        self.checkpointer.maybe_wait_for_staging()
+    staging_failure: BaseException | None = None
+    try:
+        if self.checkpointer is not None:
+            self.checkpointer.maybe_wait_for_staging()
+    except BaseException as error:
+        staging_failure = error
+    with synchronize_local_errors("Validation checkpoint staging"):
+        if staging_failure is not None:
+            raise staging_failure
 
     training_modes = {
         module: module.training
@@ -225,24 +235,32 @@ def validate(self: Trainer, step: int) -> None:
         if (kernel := getattr(module, "_titan_flex_kernel", None)) is not None
         and hasattr(kernel, "packed")
     }
-    with preserve_rng_state(self.device):
+    with ExitStack() as resources:
+        # RNG capture is local and may fail before mode setup. Peers must not
+        # begin validation forward until every rank owns its restoration context.
+        with synchronize_local_errors("Validation RNG setup"):
+            resources.enter_context(preserve_rng_state(self.device))
         try:
-            if validation.dataset is not None:
-                mask_type = self.cfg.dataloader.attention_mask_type(
-                    dataset=validation.dataset
-                )
-                if (
-                    mask_type == "block_causal"
-                    and self.cfg.parallel.cp_size > 1
-                    and self.cfg.parallel.cp_config.context_parallel_strategy == "kcp"
-                ):
-                    raise ValueError("KCP does not support packed document validation")
-                for config in mask_configs.values():
-                    config.attn_mask_type = mask_type
-                for kernel in kernel_modes:
-                    kernel.packed = mask_type == "block_causal"
-            for part in self.model_parts:
-                part.eval()
+            with synchronize_local_errors("Validation mode setup"):
+                if validation.dataset is not None:
+                    mask_type = self.cfg.dataloader.attention_mask_type(
+                        dataset=validation.dataset
+                    )
+                    if (
+                        mask_type == "block_causal"
+                        and self.cfg.parallel.cp_size > 1
+                        and self.cfg.parallel.cp_config.context_parallel_strategy
+                        == "kcp"
+                    ):
+                        raise ValueError(
+                            "KCP does not support packed document validation"
+                        )
+                    for config in mask_configs.values():
+                        config.attn_mask_type = mask_type
+                    for kernel in kernel_modes:
+                        kernel.packed = mask_type == "block_causal"
+                for part in self.model_parts:
+                    part.eval()
             run_validation_loop(self, validation, step)
         finally:
             for kernel, packed in kernel_modes.items():
@@ -256,6 +274,17 @@ def validate(self: Trainer, step: int) -> None:
                     config.attn_mask_type = original_mask
             for module, training in training_modes.items():
                 module.training = training
+        # Only a successful pass reaches this boundary. On pass failure the
+        # stack unwinds normally, preserving the original error without new
+        # communication that peers may no longer reach.
+        rng_failure: BaseException | None = None
+        try:
+            resources.close()
+        except BaseException as error:
+            rng_failure = error
+        with synchronize_local_errors("Validation RNG cleanup"):
+            if rng_failure is not None:
+                raise rng_failure
 
 
 def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) -> None:

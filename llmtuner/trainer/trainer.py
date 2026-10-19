@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Iterable, Iterator
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import timedelta
 from typing import Any
 
@@ -132,9 +132,12 @@ class Trainer:
                 try:
                     self.close()
                 except BaseException:
-                    logger.exception(
-                        "Resource cleanup failed during trainer construction"
-                    )
+                    try:
+                        logger.exception(
+                            "Resource cleanup failed during trainer construction"
+                        )
+                    except BaseException:
+                        pass  # Construction must retain the original assembly error.
                 raise
 
     # -- setup helpers ---------------------------------------------------------
@@ -497,8 +500,9 @@ class Trainer:
         # reported for a step must be the one the optimizer applied during it;
         # reading after ``lr_scheduler.step()`` would report the next step's
         # value and, on the last step, one past the end of the schedule.
-        lr_metrics = self.lr_scheduler.get_metrics()
-        should_log = self.should_log()
+        with synchronize_local_errors("Training step reporting setup"):
+            lr_metrics = self.lr_scheduler.get_metrics()
+            should_log = self.should_log()
 
         # The meshes are resolved once here rather than inline at each
         # collective, and each reduction gets the group *its* quantity spans.
@@ -591,7 +595,16 @@ class Trainer:
         # Forward can mutate checkpointed state too: running buffers and
         # embedding max_norm weights are examples. Finish the previous snapshot
         # before model execution; background upload may still overlap training.
-        self.checkpointer.maybe_wait_for_staging()
+        staging_failure: BaseException | None = None
+        try:
+            self.checkpointer.maybe_wait_for_staging()
+        except BaseException as error:
+            staging_failure = error
+        # Waiting can involve background communication; agree only after the
+        # wait returns, before any rank starts model execution.
+        with synchronize_local_errors("Training checkpoint staging"):
+            if staging_failure is not None:
+                raise staging_failure
 
         # Process each group, then free it. Loss values are retained only on a
         # logging step: backward has already consumed them, and non-logging
@@ -642,11 +655,16 @@ class Trainer:
         # schedule produced for the previous step -- which is what makes step 1
         # run at ``lambda(0)`` rather than ``lambda(1)``. The snapshot taken at
         # the top of this function is the value handed to the optimizer.
-        self.lr_scheduler.step()
-        if self.ema is not None:
-            # ``self.step`` is the step just optimized, which is what the EMA
-            # schedule's start_step/update_every_n_steps are defined against.
-            self.ema.step(self.step)
+        # Built-in schedulers only update local rates. Agree on failure before
+        # peers advance EMA or enter metric/checkpoint collectives. The optimizer
+        # update above may already be committed; this does not roll it back.
+        with synchronize_local_errors("Training scheduler update"):
+            self.lr_scheduler.step()
+        with synchronize_local_errors("Training EMA update"):
+            if self.ema is not None:
+                # EMA validates fixed layouts and updates only local storage.
+                # All ranks enter, including PP stages with no tracked tensors.
+                self.ema.step(self.step)
 
         if not should_log:
             return None
@@ -681,7 +699,6 @@ class Trainer:
         world-reduced by ``clip_grad_norm_``).
         """
         pp_mesh = reduction_meshes.pp_mesh
-        loss_mesh = reduction_meshes.loss_mesh
         parameters = [p for part in self.model_parts for p in part.parameters()]
         expert_parameters = [
             p
@@ -723,23 +740,11 @@ class Trainer:
         # update that follows is collective, so the disagreement is not
         # recoverable. int32, not bool: NCCL has no bool reduction.
         step_is_finite = loss_is_finite
-        # Only the last PP stage holds a real loss; the others carry the
-        # sentinel, which is finite by construction and says nothing. Skipping
-        # the loss-mesh reduction there matches torchtitan and costs nothing --
-        # the flag still crosses stages through the pp reduction below.
-        if pp_mesh is None or self.pp_has_last_stage:
-            if loss_mesh is not None:
-                all_reduce(
-                    step_is_finite,
-                    op="min",
-                    group=loss_mesh.get_group(),
-                )
-        if pp_mesh is not None:
-            all_reduce(step_is_finite, op="min", group=pp_mesh.get_group())
-        # grad_norm arrives already world-reduced (clip_grad_norm_ materializes
-        # the DTensor norm and reduces across PP), so this term is the same on
-        # every rank; it is folded in for the reader, not for the reduction.
         step_is_finite.logical_and_(torch.isfinite(grad_norm).all())
+        # A PP-only reduction cannot propagate an earlier stage's verdict to
+        # other DP replicas. Use one world verdict for every local loss and
+        # norm, including stages normally returning a finite loss sentinel.
+        all_reduce(step_is_finite, op="min")
 
         self._check_finite(step_is_finite)
         return grad_norm
@@ -859,8 +864,8 @@ class Trainer:
         """Stop before the optimizer update if anything went non-finite.
 
         ``step_is_finite`` is already the *global* verdict: ``train_step`` folds
-        this rank's loss and grad_norm into it, then reduces it across the loss
-        and PP meshes. The reduction is what every rank participates in, which
+        this rank's loss and grad_norm into it, then reduces it across all
+        ranks. The reduction is what every rank participates in, which
         is why it happens in the caller -- a rank that skipped it would hang the
         others, and the check would no longer be rank-uniform.
 
@@ -933,21 +938,27 @@ class Trainer:
     def state_dict(self) -> dict[str, Any]:
         return {"step": self.step, "ntokens_seen": self.ntokens_seen}
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Validate checkpoint counters without changing the current run."""
         step = state_dict["step"]
         ntokens_seen = state_dict["ntokens_seen"]
         for name, value in (("step", step), ("ntokens_seen", ntokens_seen)):
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"trainer {name} must be a nonnegative integer")
-        self.step = step
-        self.ntokens_seen = ntokens_seen
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.validate_state_dict(state_dict)
+        self.step = state_dict["step"]
+        self.ntokens_seen = state_dict["ntokens_seen"]
 
     # -- the loop ---------------------------------------------------------------
 
     def train(self) -> None:
         try:
-            if self.checkpointer.load(self.cfg.checkpoint.load_step):
-                logger.info(f"Resuming from step {self.step}")
+            loaded = self.checkpointer.load(self.cfg.checkpoint.load_step)
+            with synchronize_local_errors("Training resume reporting"):
+                if loaded:
+                    logger.info(f"Resuming from step {self.step}")
 
             # The step this process's *first* train step lands on. Startup work --
             # process groups, the model build, the first collective, compile --
@@ -969,21 +980,29 @@ class Trainer:
             # and only dumps a trace at the end of a cycle, so a per-step
             # context would never reach one. Left open when profiling is off --
             # the Profiler holds no handles in that case.
-            with Profiler(
-                self.cfg.profiler,
-                global_step=self.step,
-                base_folder=self.cfg.dump_folder,
-            ) as profiler:
+            with ExitStack() as stack:
+                # Local tracing setup can fail after peers acquired handles.
+                # ExitStack closes those handles if the shared boundary raises.
+                with synchronize_local_errors("Training profiler initialization"):
+                    profiler = stack.enter_context(
+                        Profiler(
+                            self.cfg.profiler,
+                            global_step=self.step,
+                            base_folder=self.cfg.dump_folder,
+                        )
+                    )
                 # Takes the cyclic collector over from CPython for the duration
                 # of training: the default schedule fires at unpredictable
                 # times, often inside a forward, and walking a multi-gigabyte
                 # object graph there is pure stall. Built here rather than in
                 # ``__init__`` because that is when the model and optimizer
                 # exist, so the first collection already covers the real graph.
-                self.gc_handler = GarbageCollection(gc_freq=self.cfg.gc_freq)
+                with synchronize_local_errors("Training GC initialization"):
+                    self.gc_handler = GarbageCollection(gc_freq=self.cfg.gc_freq)
                 while self.should_continue_training():
                     self.step += 1
-                    self.gc_handler.run(self.step)
+                    with synchronize_local_errors("Training GC step"):
+                        self.gc_handler.run(self.step)
 
                     try:
                         step_metrics = self.train_step(data_iterator)
@@ -991,7 +1010,6 @@ class Trainer:
                         # The step is abandoned rather than trained on a
                         # partial batch: a batch's worth of tokens either all
                         # contribute to a gradient or none of them do.
-                        logger.warning("Ran out of data; the last step was canceled.")
                         # ``self.step`` counts *completed* optimizer steps, so
                         # the abandoned one is given back. torchtitan's
                         # ``num_completed_steps`` only advances at the end of a
@@ -999,35 +1017,48 @@ class Trainer:
                         # would make ``state_dict`` resume past a step whose
                         # weights were never updated.
                         self.step -= 1
+                        with synchronize_local_errors("Training exhaustion reporting"):
+                            logger.warning(
+                                "Ran out of data; the last step was canceled."
+                            )
                         # Finite data can end before cfg.steps and off the
                         # checkpoint interval. Preserve the last completed
                         # update using the configured final-save policy.
-                        if self.step > 0 and self.checkpointer.save(
+                        saved = self.step > 0 and self.checkpointer.save(
                             self.step, last_step=True
+                        )
+                        with synchronize_local_errors(
+                            "Training exhausted checkpoint reporting"
                         ):
-                            logger.info(f"Saved checkpoint for step {self.step}")
+                            if saved:
+                                logger.info(f"Saved checkpoint for step {self.step}")
                         break
 
-                    if step_metrics is not None:
-                        self.metrics.log(
-                            self.step,
-                            global_avg_loss=step_metrics["loss"],
-                            global_max_loss=step_metrics["max_loss"],
-                            grad_norm=step_metrics["grad_norm"],
-                            extra_metrics={
-                                k: v
-                                for k, v in step_metrics.items()
-                                if k not in ("loss", "max_loss", "grad_norm")
-                            },
-                        )
+                    # Reporting is local, but a sink can fail on just one
+                    # rank. Agree before any peer starts checkpoint collectives.
+                    with synchronize_local_errors("Training metric reporting"):
+                        if step_metrics is not None:
+                            self.metrics.log(
+                                self.step,
+                                global_avg_loss=step_metrics["loss"],
+                                global_max_loss=step_metrics["max_loss"],
+                                grad_norm=step_metrics["grad_norm"],
+                                extra_metrics={
+                                    k: v
+                                    for k, v in step_metrics.items()
+                                    if k not in ("loss", "max_loss", "grad_norm")
+                                },
+                            )
 
                     # The manager owns the interval policy: ``save`` decides for
                     # itself whether this step is a checkpointing step. The final
                     # step is forced so a run that ends off-interval still leaves
                     # a resumable artifact rather than only a mid-run one.
                     last_step = self.step == self.cfg.steps
-                    if self.checkpointer.save(self.step, last_step=last_step):
-                        logger.info(f"Saved checkpoint for step {self.step}")
+                    saved = self.checkpointer.save(self.step, last_step=last_step)
+                    with synchronize_local_errors("Training checkpoint reporting"):
+                        if saved:
+                            logger.info(f"Saved checkpoint for step {self.step}")
 
                     # Validation, after the checkpoint save and before the
                     # profiler advances -- the reference's order. The pass is
@@ -1039,7 +1070,8 @@ class Trainer:
                     # Advances the schedule. After the save, so the profiler's
                     # active iteration covers an ordinary step rather than one
                     # that also wrote a checkpoint.
-                    profiler.step()
+                    with synchronize_local_errors("Training profiler step"):
+                        profiler.step()
 
                     if self.step == first_step_of_this_process:
                         # Startup is finished on this process; from here a long
@@ -1066,7 +1098,11 @@ class Trainer:
             except BaseException:
                 if training_error is None:
                     raise
-                logger.exception("Resource cleanup failed after a training error")
+                try:
+                    logger.exception("Resource cleanup failed after a training error")
+                except BaseException:
+                    # Reporting must not replace the active training failure.
+                    pass
 
     def close(self) -> None:
         """Release everything ``train`` acquired, in reverse order of use.
@@ -1091,8 +1127,12 @@ class Trainer:
                     # Failed sinks, loader workers, and interrupted checkpoint
                     # waits may retain resources. Keep their owner for a retry.
                     setattr(self, name, resource)
-                logger.exception("Failed to close trainer resource %s", name)
                 if first_error is None:
                     first_error = error
+                try:
+                    logger.exception("Failed to close trainer resource %s", name)
+                except BaseException:
+                    # Continue releasing resources even when the sink is broken.
+                    pass
         if first_error is not None:
             raise first_error
