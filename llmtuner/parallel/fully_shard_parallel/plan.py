@@ -20,6 +20,7 @@ from torch.distributed.fsdp import (
 from torch.distributed.tensor import Shard
 
 from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.utils.module_names import canonical_fqn
 
 from ..module_patterns import compile_module_pattern, resolve_module_patterns
@@ -84,6 +85,28 @@ class FSDPPatternReferences:
         parameters: dict[nn.Parameter, tuple[nn.Parameter, ...]],
     ) -> None:
         """Record explicit one-to-many mappings supplied by the conversion."""
+        contributors: dict[nn.Parameter, set[nn.Parameter]] = {}
+        for source, targets in parameters.items():
+            for target in targets:
+                contributors.setdefault(target, set()).add(source)
+        globally_ignored = {
+            parameter
+            for module in self.ignored_modules.values()
+            if module is not None
+            for parameter in module.parameters()
+        }
+        for name, options in self.unit_options.items():
+            exclusions = options.get("ignored_params") or set()
+            if not isinstance(exclusions, set):
+                continue  # Preserve the FSDP override type validation.
+            excluded = globally_ignored | exclusions
+            for sources in contributors.values():
+                if sources & excluded and not sources <= excluded:
+                    raise UnsupportedCombinationError(
+                        f"FSDP pattern {name!r}: cannot exclude part of a stacked "
+                        "expert parameter; exclude all source projections in "
+                        "the stack or use an unstacked expert layout"
+                    )
         self.module_targets.update(modules)
         self.parameter_targets.update(parameters)
 
