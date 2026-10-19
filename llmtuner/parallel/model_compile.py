@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 import torch
 import torch.nn as nn
@@ -55,6 +55,28 @@ from ..utils.logging import get_logger
 logger = get_logger(__name__)
 
 __all__ = ["apply_compile", "maybe_regional_inductor"]
+
+
+@contextlib.contextmanager
+def rollback_compile_settings_on_error() -> Iterator[None]:
+    """Restore compile policy if later runtime assembly fails.
+
+    Successful runtimes retain these settings for lazy tracing. Symmetric-memory
+    group registration and concurrent policy changes are outside this scope.
+    """
+    import torch._dynamo.config as dynamo_config
+    import torch._inductor.config as inductor_config
+
+    capture = getattr(dynamo_config, "capture_scalar_outputs", None)
+    async_tp = getattr(inductor_config, "_micro_pipeline_tp", None)
+    try:
+        yield
+    except BaseException:
+        if capture is not None:
+            dynamo_config.capture_scalar_outputs = capture
+        if async_tp is not None:
+            inductor_config._micro_pipeline_tp = async_tp
+        raise
 
 
 def apply_compile(

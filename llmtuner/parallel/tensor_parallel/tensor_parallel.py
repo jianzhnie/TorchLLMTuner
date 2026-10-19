@@ -378,14 +378,21 @@ def shard_shared_expert_for_tp(
     shared_name, shared = resolve_shared_expert(block)
     assert shared is not None  # the caller checked
     names: set[str] = set()
-    for name, dim in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
-        proj = getattr(shared, name, None)
-        if proj is None or not isinstance(proj, nn.Linear):
-            continue
-        proj.weight = nn.Parameter(
-            shard_weight(proj.weight, dim, tp_size=tp_size, tp_rank=tp_rank),
-            requires_grad=proj.weight.requires_grad,
-        )
+    projections = [
+        (name, dim, getattr(shared, name), getattr(shared, name).weight)
+        for name, dim in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1))
+        if isinstance(getattr(shared, name, None), nn.Linear)
+    ]
+    # Capture all originals first: gate/up may share a Parameter or the whole
+    # Linear module. Never slice an already replaced projection a second time.
+    shards: dict[int, nn.Parameter] = {}
+    for name, dim, proj, weight in projections:
+        if id(weight) not in shards:
+            shards[id(weight)] = nn.Parameter(
+                shard_weight(weight, dim, tp_size=tp_size, tp_rank=tp_rank),
+                requires_grad=weight.requires_grad,
+            )
+        proj.weight = shards[id(weight)]
         if dim == 0:
             proj.out_features = proj.weight.shape[0]
         else:
@@ -812,6 +819,21 @@ def realize_moe_blocks_tp(
                 for n in ("gate_proj", "up_proj", "down_proj")
             ):
                 compatibility.shared_expert_tp(module_path, block)
+            gate_shape = tuple(shared.gate_proj.weight.shape)
+            up_shape = tuple(shared.up_proj.weight.shape)
+            down_shape = tuple(shared.down_proj.weight.shape)
+            model_dim = block.experts.gate_up_proj.shape[-1]
+            if (
+                len(gate_shape) != 2
+                or gate_shape[1] != model_dim
+                or up_shape != gate_shape
+                or down_shape != (model_dim, gate_shape[0])
+            ):
+                raise ValueError(
+                    f"TP shared expert {module_path!r} requires gate/up (F, D) "
+                    f"and down (D, F), with D={model_dim}; got gate={gate_shape}, "
+                    f"up={up_shape}, down={down_shape}"
+                )
             for name, dim in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
                 projection = getattr(shared, name)
                 if projection.bias is not None:
@@ -900,6 +922,30 @@ def apply_tp(
     parameter_paths: dict[int, list[str]] = {}
     for name, parameter in model.named_parameters(remove_duplicate=False):
         parameter_paths.setdefault(id(parameter), []).append(name)
+    # MoE slicing also replaces Parameters. A shared expert module would be
+    # sliced twice, while individually tied weights would silently lose their
+    # identity. Permit only the same shared MLP's gate/up tie: both use the
+    # identical column slice, and the shared realizer preserves that identity.
+    # Reject all other aliases before any constructor or MoE mutation runs.
+    for module_path, block in moe_blocks:
+        from ..expert_parallel.hf_inspection import resolve_shared_expert
+
+        shared_name, shared = resolve_shared_expert(block)
+        prefix = f"{module_path}." if module_path else ""
+        tied_shared_paths = {
+            f"{prefix}{shared_name}.{name}.weight" for name in ("gate_proj", "up_proj")
+        }
+        sharded_parameters = list(block.experts.parameters())
+        if shared is not None:
+            sharded_parameters.extend(shared.parameters())
+        for parameter in sharded_parameters:
+            aliases = parameter_paths[id(parameter)]
+            if len(aliases) > 1 and set(aliases) != tied_shared_paths:
+                raise ValueError(
+                    f"TP over MoE {module_path!r} cannot preserve shared weight "
+                    f"paths {aliases!r}; shared MoE shards require an "
+                    "alias-preserving TP implementation"
+                )
     for module_path, inner, spec in targets:
         aliases = parameter_paths[id(inner.weight)]
         if len(aliases) > 1:

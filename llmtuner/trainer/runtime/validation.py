@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import sys
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,7 +19,7 @@ from llmtuner.parallel import compatibility
 from llmtuner.utils.logging import get_logger
 from llmtuner.utils.seeding import preserve_rng_state
 
-from ...accelerator.collectives import all_reduce
+from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...accelerator.spmd import spmd_context
 from ...datasets.contracts import (
     BaseDataLoader,
@@ -107,37 +108,41 @@ def finalize_validation(
     on this rank, which concat-then-split packing turns into no rows at all),
     and a pass over zero valid tokens (every label masked), which has no
     average to report. Under PP only the last stage holds losses; other stages
-    run the identical loop and return without reporting.
+    run the identical loop and coordinate reporting errors without emitting metrics.
     """
-    if num_steps == 0:
-        raise ValueError(
-            "Validation ran zero batches on this rank. This happens when "
-            "the validation dataset supplies fewer than one batch of "
-            "tokens on this rank, because concat-then-split packing drops "
-            "partially filled batches. Decrease the per-rank batch size or "
-            "use a larger validation dataset."
+    # Preflight and reporting are local phases. Loss reduction remains outside
+    # those boundaries, since a collective failure cannot be coordinated here.
+    with synchronize_local_errors("Validation result preflight"):
+        if num_steps == 0:
+            raise ValueError(
+                "Validation ran zero batches on this rank. This happens when "
+                "the validation dataset supplies fewer than one batch of "
+                "tokens on this rank, because concat-then-split packing drops "
+                "partially filled batches. Decrease the per-rank batch size or "
+                "use a larger validation dataset."
+            )
+        num_global_valid_tokens = int(total_global_valid_tokens.item())
+        if num_global_valid_tokens == 0:
+            raise ValueError(
+                "Validation ran on zero valid tokens; cannot compute an "
+                "average validation loss. Ensure the validation batches "
+                "contain unmasked labels."
+            )
+        global_loss_sum = (
+            accumulated_loss.clone() if accumulated_loss is not None else None
         )
-    num_global_valid_tokens = int(total_global_valid_tokens.item())
-    if num_global_valid_tokens == 0:
-        raise ValueError(
-            "Validation ran on zero valid tokens; cannot compute an "
-            "average validation loss. Ensure the validation batches "
-            "contain unmasked labels."
-        )
-    if accumulated_loss is None:
-        # A PP stage that is not the last one holds no losses.
-        return
-    if loss_mesh is not None:
-        global_loss_sum = accumulated_loss.clone()
+    if global_loss_sum is not None and loss_mesh is not None:
         all_reduce(global_loss_sum, group=loss_mesh.get_group())
-    else:
-        global_loss_sum = accumulated_loss
-    global_avg_loss = float(global_loss_sum) / num_global_valid_tokens
-    if not math.isfinite(global_avg_loss):
-        raise FloatingPointError(
-            f"Validation loss is not finite at step {step}: {global_avg_loss}"
-        )
-    self.metrics.log_validation(loss=global_avg_loss, step=step)
+    # Non-final PP stages must participate even though only the final stage
+    # checks and logs the loss; otherwise a sink failure strands their next step.
+    with synchronize_local_errors("Validation result reporting"):
+        if global_loss_sum is not None:
+            global_avg_loss = float(global_loss_sum) / num_global_valid_tokens
+            if not math.isfinite(global_avg_loss):
+                raise FloatingPointError(
+                    f"Validation loss is not finite at step {step}: {global_avg_loss}"
+                )
+            self.metrics.log_validation(loss=global_avg_loss, step=step)
 
 
 def check_validation_feasibility(
@@ -261,15 +266,18 @@ def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) 
             feature="validation with pipeline parallelism",
         )
     dp_mesh, loss_mesh = resolve_loss_reduction_meshes(parallel_dims)
-    validation_dataloader = create_validation_dataloader(self, validation)
-
+    validation_dataloader: BaseDataLoader | None = None
     try:
+        # These operations are local. Coordinate before fetch_batch enters its
+        # world collective, and retain successful peer loaders for cleanup.
+        with synchronize_local_errors("Validation input initialization"):
+            validation_dataloader = create_validation_dataloader(self, validation)
+            total_global_valid_tokens = torch.zeros(
+                (), dtype=torch.int64, device=self.device
+            )
+            data_iterator = iter(validation_dataloader)
         accumulated_loss: torch.Tensor | None = None
-        total_global_valid_tokens = torch.zeros(
-            (), dtype=torch.int64, device=self.device
-        )
         num_steps = 0
-        data_iterator = iter(validation_dataloader)
         while validation.steps == -1 or num_steps < validation.steps:
             try:
                 batch = fetch_batch(data_iterator)
@@ -293,9 +301,17 @@ def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) 
             total_global_valid_tokens.add_(global_valid_tokens)
             num_steps += 1
     finally:
-        close_validation_dataloader(
-            validation_dataloader, failed=sys.exc_info()[0] is not None
-        )
+        failed = sys.exc_info()[0] is not None
+        # A successful loop proceeds to loss collectives. Agree on local close
+        # success first; during failure unwinding preserve the original error
+        # without introducing communication that peers may no longer reach.
+        with (
+            nullcontext()
+            if failed
+            else synchronize_local_errors("Validation input cleanup")
+        ):
+            if validation_dataloader is not None:
+                close_validation_dataloader(validation_dataloader, failed=failed)
 
     finalize_validation(
         self,

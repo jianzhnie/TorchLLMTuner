@@ -37,6 +37,14 @@ class RandomTokenSource:
     def __init__(
         self, *, seed: int, vocab_size: int, batch_size: int, seq_len: int
     ) -> None:
+        if (
+            not isinstance(seed, int)
+            or isinstance(seed, bool)
+            or not -(2**63) <= seed < 2**64
+        ):
+            raise ValueError(
+                f"seed must be an integer in [-2**63, 2**64 - 1], got {seed!r}"
+            )
         require_positive_integer("vocab_size", vocab_size)
         require_positive_integer("batch_size", batch_size)
         require_positive_integer("seq_len", seq_len)

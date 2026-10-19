@@ -166,6 +166,18 @@ class HuggingFaceTokenizer(BaseTokenizer):
                     vocab[token] = line_number - 1
             vocab_source = "vocab.txt"
 
+        if not isinstance(vocab, dict) or not vocab:
+            raise ValueError(
+                f"{vocab_source} must contain a nonempty token-to-ID mapping"
+            )
+        ids = list(vocab.values())
+        if any(not isinstance(index, int) or isinstance(index, bool) for index in ids):
+            raise ValueError(f"{vocab_source} token IDs must be integers")
+        if sorted(ids) != list(range(len(ids))):
+            raise ValueError(
+                f"{vocab_source} token IDs must be unique and contiguous from zero"
+            )
+
         from tokenizers import pre_tokenizers
 
         if not os.path.exists(merges_txt_path):

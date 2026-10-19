@@ -27,7 +27,7 @@ class ParamGroupConfig:
 
 @dataclass
 class OptimizerConfig:
-    """Default AdamW options and explicit Adam/AdamW parameter groups."""
+    """Default Adam/AdamW options and explicit parameter groups."""
 
     optimizer_type: Literal["Adam", "AdamW"] = field(
         default="AdamW", metadata={"help": "Optimizer class"}
@@ -69,6 +69,11 @@ class OptimizerConfig:
     )
 
     def __post_init__(self) -> None:
+        if self.optimizer_type not in ("Adam", "AdamW"):
+            raise ConfigError(
+                f"optimizer.optimizer_type must be 'Adam' or 'AdamW', "
+                f"got {self.optimizer_type!r}"
+            )
         if self.implementation not in ("fused", "foreach", "for-loop"):
             raise ConfigError(
                 f"Unknown optimizer implementation {self.implementation!r}; "
@@ -125,7 +130,7 @@ class OptimizerConfig:
             self.param_groups = [
                 ParamGroupConfig(
                     pattern=".*",
-                    optimizer_name="AdamW",
+                    optimizer_name=self.optimizer_type,
                     optimizer_kwargs={
                         "lr": self.learning_rate,
                         "weight_decay": self.weight_decay,

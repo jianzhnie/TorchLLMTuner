@@ -54,6 +54,52 @@ def preserve_rng_state(device: torch.device) -> Iterator[None]:
         np.random.set_state(numpy_state)
 
 
+@contextmanager
+def rollback_execution_settings_on_error() -> Iterator[None]:
+    """Undo seeding's process-wide policy changes if runtime assembly fails.
+
+    Successful assembly keeps its settings for lazy compilation and training.
+    Host RNG streams are restored after cleanup as well. Device RNG streams and
+    concurrently modified policies are outside this contract.
+    """
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    cpu_state = torch.get_rng_state()
+    environment = {
+        name: os.environ.get(name)
+        for name in (
+            "PYTHONHASHSEED",
+            "HCCL_DETERMINISTIC",
+            "CLOSE_MATMUL_K_SHIFT",
+            "CUBLAS_WORKSPACE_CONFIG",
+        )
+    }
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    cudnn_deterministic = torch.backends.cudnn.deterministic
+    cudnn_benchmark = torch.backends.cudnn.benchmark
+    fill_memory = torch.utils.deterministic.fill_uninitialized_memory
+    anomaly = torch.is_anomaly_enabled()
+    check_nan = torch.is_anomaly_check_nan_enabled()
+    try:
+        yield
+    except BaseException:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(cpu_state)
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        torch.backends.cudnn.deterministic = cudnn_deterministic
+        torch.backends.cudnn.benchmark = cudnn_benchmark
+        torch.utils.deterministic.fill_uninitialized_memory = fill_memory
+        torch.autograd.set_detect_anomaly(anomaly, check_nan=check_nan)
+        for name, value in environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        raise
+
+
 def set_deterministic_algorithms() -> None:
     """Enable deterministic algorithms and deterministic accelerator kernels."""
     os.environ["HCCL_DETERMINISTIC"] = "True"
