@@ -72,6 +72,8 @@ only adds, and is refused at the point the shared expert is found.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -94,6 +96,11 @@ logger = get_logger(__name__)
 
 __all__ = ["swap_hf_moe_blocks"]
 
+MoEReplacementObserver = Callable[
+    [dict[nn.Module, nn.Module], dict[nn.Parameter, tuple[nn.Parameter, ...]]],
+    None,
+]
+
 
 def swap_hf_moe_blocks(
     model: nn.Module,
@@ -105,6 +112,7 @@ def swap_hf_moe_blocks(
     token_dispatcher: str = "alltoall",
     torchao_pad_multiple: int = 16,
     tp_enabled: bool = False,
+    on_replacement: MoEReplacementObserver | None = None,
 ) -> int:
     """Replace every HF MoE block in ``model`` with llmtuner's MoE, in place.
 
@@ -136,6 +144,9 @@ def swap_hf_moe_blocks(
             shared expert): the swap itself is layout-identical either way --
             the swapped block consumes and produces the T/tp sequence shard
             directly, which is the layout upstream's ep+sp MoE uses.
+        on_replacement: receive module and fused-parameter mappings after all
+            replacements are planned, before any block is installed. Used by
+            assembly to preserve programmatic references across layout changes.
 
     Returns:
         The number of blocks swapped. Mixed sparse/dense models (e.g.
@@ -224,6 +235,11 @@ def swap_hf_moe_blocks(
     replacements: list[tuple[nn.Module, str, MoE]] = []
     converted_blocks: dict[int, MoE] = {}
     converted_parameters: dict[int, tuple[nn.Parameter, ...]] = {}
+    original_parameters = (
+        {id(parameter): parameter for parameter in model.parameters()}
+        if on_replacement is not None
+        else {}
+    )
     converted_biases: dict[int, torch.Tensor] = {}
     aux_group_counts = dict(AuxLoss._group_counts)
     # Stacking a projection cannot preserve individual expert aliases. Reject
@@ -411,6 +427,22 @@ def swap_hf_moe_blocks(
                         layout[2],
                     )
             converted_layouts.append((converted_blocks.get(id(owner), owner), updated))
+
+        if on_replacement is not None:
+            module_targets = {}
+            for _, _, block in candidates:
+                moe = converted_blocks[id(block)]
+                module_targets[block] = moe
+                if not isinstance(block, KimiSparseMoE):
+                    module_targets[block.experts] = moe.routed_experts.inner_experts
+                    module_targets[router_of(block)] = moe.router.gate
+            on_replacement(
+                module_targets,
+                {
+                    original_parameters[source]: targets
+                    for source, targets in converted_parameters.items()
+                },
+            )
 
     except BaseException:
         # Failed replacement planning must not inflate auxiliary-loss metric divisors.

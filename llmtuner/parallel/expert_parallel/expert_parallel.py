@@ -10,7 +10,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...utils.logging import get_logger
 from .. import compatibility
 from .domino_dispatch import DominoRoutedExperts
-from .model_replacement import swap_hf_moe_blocks
+from .model_replacement import MoEReplacementObserver, swap_hf_moe_blocks
 
 logger = get_logger(__name__)
 
@@ -23,6 +23,7 @@ def apply_ep(
     *,
     ep_group: dist.ProcessGroup | None = None,
     error_group: dist.ProcessGroup | None = None,
+    on_replacement: MoEReplacementObserver | None = None,
 ) -> nn.Module:
     """Swap every HF MoE block for the EP-capable llmtuner MoE.
 
@@ -31,6 +32,9 @@ def apply_ep(
     error_group, when supplied, spans every rank sharing later stage-local
     collectives. Domino and MC2 use it for failure coordination; standalone callers
     without it coordinate only their EP group.
+
+    on_replacement receives explicit conversion mappings before installation,
+    allowing assembly to rebind programmatic FSDP overrides.
 
     The swap moves weights, so it must happen before FSDP wraps the model.
     With a multi-rank group each rank keeps ``num_experts / ep`` of them and
@@ -62,6 +66,7 @@ def apply_ep(
         token_dispatcher=cfg.ep_config.ep_token_dispatcher,
         torchao_pad_multiple=cfg.ep_config.ep_torchao_pad_multiple,
         tp_enabled=cfg.tp_size > 1,
+        on_replacement=on_replacement,
     )
     # Failures must reach all ranks sharing later FSDP/TP/CP collectives,
     # not only the ranks in one token-exchange group.

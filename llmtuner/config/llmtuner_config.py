@@ -56,7 +56,7 @@ class LLMTunerConfig:
         cp_config: ContextParallelConfig | None = None,
         ep_config: ExpertParallelConfig | None = None,
     ) -> LLMTunerConfig:
-        """Compose the nine parsed argument groups into the aggregate config."""
+        """Compose parsed argument groups into the aggregate run configuration."""
         # CLI views hide nested fields with init=False. Rebuild the base
         # configs to graft parsed groups without modifying caller instances.
         plans = {

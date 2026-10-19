@@ -84,7 +84,8 @@ class LRSchedulersContainer(Stateful):
     second lambda.
 
     Args:
-        optimizers: one scheduler is built per entry, in order.
+        optimizers: one scheduler is built per entry, in order. An empty list
+            tracks progress without learning-rate metrics for frozen PP stages.
         lr_lambda: maps ``last_epoch`` to the multiplicative lr factor.
         total_steps: the schedule's length, resolved by :func:`build_lr_scheduler`
             from the config and run length. Restore rejects checkpoint progress
@@ -98,15 +99,14 @@ class LRSchedulersContainer(Stateful):
         lr_lambda: Callable[[int], float],
         total_steps: int,
     ) -> None:
-        if not optimizers:
-            raise ValueError(
-                "LRSchedulersContainer needs at least one optimizer to schedule."
-            )
         if len({id(optimizer) for optimizer in optimizers}) != len(optimizers):
             raise ValueError("Each optimizer must appear only once in the scheduler")
         self.total_steps = total_steps
         require_integer_at_least(self, "total_steps", group="lr_scheduler")
         self.schedulers = [LambdaLR(optimizer, lr_lambda) for optimizer in optimizers]
+        # A frozen pipeline stage owns no optimizer, but must checkpoint the
+        # same training progress as stages with trainable parameters.
+        self._last_epoch = 0
 
     def __iter__(self) -> Iterator[LambdaLR]:
         return iter(self.schedulers)
@@ -131,6 +131,7 @@ class LRSchedulersContainer(Stateful):
             )
         for scheduler in self.schedulers:
             scheduler.step()
+        self._last_epoch = last_epoch + 1
 
     def get_metrics(self) -> dict[str, float]:
         """The current lr of each optimizer, keyed so several cannot collide.
@@ -163,7 +164,9 @@ class LRSchedulersContainer(Stateful):
         # together from the same lambda, so they share a step count by
         # construction. Storing it once is what lets a checkpoint survive
         # resharding to a different number of optimizers.
-        last_epoch = self.schedulers[0].last_epoch
+        last_epoch = (
+            self.schedulers[0].last_epoch if self.schedulers else self._last_epoch
+        )
         if any(scheduler.last_epoch != last_epoch for scheduler in self.schedulers):
             raise ValueError(
                 "Cannot checkpoint schedulers with different last_epoch values; "
@@ -227,6 +230,7 @@ class LRSchedulersContainer(Stateful):
                     group["lr"].fill_(learning_rate)
                 else:
                     group["lr"] = learning_rate
+        self._last_epoch = last_epoch
 
 
 def build_lr_scheduler(
