@@ -63,6 +63,7 @@ from .linear_ops import (
     LinearReduceScatter,
     all_gather_along,
     all_gather_linear,
+    functional_collectives,
     linear_reduce_scatter,
     reduce_scatter_along,
 )
@@ -984,6 +985,9 @@ def apply_tp(
     if use_symm_mem:
         enable_symm_mem(group)
 
+    # Resolve optional imports before tensor graphs are compiled.
+    functional_collectives()
+
     # Prepare every dense replacement before changing the model. A failing
     # custom constructor must not leave earlier projections or MoE blocks sharded.
     # Constructors are responsible for avoiding side effects on their inputs.
@@ -1037,5 +1041,20 @@ def apply_tp(
             (ReplicatedAttentionSequenceBoundary, type(attention)),
             {},
         )
+
+    layouts = model.__dict__.setdefault("_tp_checkpoint_layouts", {})
+    for path, _, spec in targets:
+        layouts[f"{path}.weight"] = (0 if spec.kind == "colwise" else 1, False, group)
+    for path, block in moe_blocks:
+        prefix = f"{path}." if path else ""
+        layouts[f"{prefix}experts.gate_up_proj"] = (1, True, group)
+        layouts[f"{prefix}experts.down_proj"] = (2, False, group)
+        for name in block.tp_sharded_param_names:
+            if not name.startswith("experts."):
+                layouts[f"{prefix}{name}"] = (
+                    1 if ".down_proj." in name else 0,
+                    False,
+                    group,
+                )
 
     return model

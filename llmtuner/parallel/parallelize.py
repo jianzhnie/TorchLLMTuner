@@ -80,7 +80,9 @@ def parallelize_hf_transformers(
         """Bind stage options once, then transform the model in declared order."""
         runners = {
             "tp": partial(apply_tp, mesh=dense_mesh, cfg=cfg),
-            "ep": partial(apply_ep, cfg=cfg, ep_group=ep_group),
+            "ep": partial(
+                apply_ep, cfg=cfg, ep_group=ep_group, error_group=ep_error_group
+            ),
             "cp": partial(
                 apply_cp, mesh=dense_mesh, cfg=cfg, parallel_dims=parallel_dims
             ),
@@ -109,6 +111,7 @@ def parallelize_hf_transformers(
     # EP groups come from the sparse mesh in both assembly paths. Under PP
     # this slice contains only ranks in the current pipeline stage.
     ep_group = None
+    ep_error_group = None
     if cfg.ep_size > 1:
         if parallel_dims is None:
             raise ValueError(
@@ -122,6 +125,10 @@ def parallelize_hf_transformers(
                 f"ep={cfg.ep_size} but parallel_dims has no multi-rank 'ep' axis."
             )
         ep_group = ep_mesh.get_group()
+        if cfg.ep_config.ep_token_dispatcher == "domino":
+            # The stage-local loss view spans DP/CP/TP, the same ranks that
+            # share dense and sparse FSDP communication after expert execution.
+            ep_error_group = parallel_dims.get_mesh("loss").get_group()
     tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
 
     if parallel_dims is not None and parallel_dims.pp_enabled:

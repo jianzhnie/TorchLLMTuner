@@ -54,6 +54,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
 
+from ..common.activation import SituGLU
 from .kimi_linear_config import KimiLinearConfig
 from .normalization import KimiRMSNorm
 
@@ -188,10 +189,18 @@ class KimiExpertMLP(nn.Module):
         self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.situ = config.hidden_act == "situ"
+        self.act_fn = (
+            SituGLU(
+                config.activation_situ_beta or 1.0, config.activation_situ_linear_beta
+            )
+            if self.situ
+            else ACT2FN[config.hidden_act]
+        )
 
     def forward(self, x):
-        return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
+        gate, up = self.w1(x), self.w3(x)
+        return self.w2(self.act_fn(gate, up) if self.situ else self.act_fn(gate) * up)
 
 
 class KimiSparseMoE(nn.Module):

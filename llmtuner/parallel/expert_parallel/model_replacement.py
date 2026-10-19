@@ -1,5 +1,8 @@
 """Swap a HF MoE block for llmtuner's EP-capable MoE, weights included.
 
+Kimi's ``block_sparse_moe`` and individual experts use ``kimi_conversion.py``;
+the fused-layout details below apply to the transformers model families.
+
 Every sparse decoder layer of a transformers 5.x MoE model holds the same block
 under ``layer.mlp``: a router, plus two stacked expert parameters. Expert
 parallelism needs those weights in grouped-GEMM form with a token dispatcher in
@@ -80,9 +83,11 @@ from llmtuner.errors import UnsupportedCombinationError
 
 from ...models.common.aux_loss import AuxLoss
 from ...models.common.moe.layer import MoE
+from ...models.kimi.moe import KimiSparseMoE
 from ...utils.logging import get_logger
 from .block_conversion import convert_block
 from .hf_inspection import is_hf_moe_block, moe_block_of, router_of
+from .kimi_conversion import convert_kimi_block
 
 logger = get_logger(__name__)
 
@@ -177,7 +182,9 @@ def swap_hf_moe_blocks(
         attr, block = moe_block_of(layer)
         # Dense layers of a mixed model (Qwen3Moe's decoder_sparse_step, and the
         # first_k_dense_replace of the DeepSeek/GLM4 families) are left alone.
-        if block is None or not is_hf_moe_block(block):
+        if block is None or not (
+            isinstance(block, KimiSparseMoE) or is_hf_moe_block(block)
+        ):
             continue
         candidates.append((layer, attr, block))
 
@@ -212,12 +219,59 @@ def swap_hf_moe_blocks(
     converted_parameters: dict[int, tuple[nn.Parameter, ...]] = {}
     converted_biases: dict[int, torch.Tensor] = {}
     aux_group_counts = dict(AuxLoss._group_counts)
+    # Stacking a projection cannot preserve individual expert aliases. Reject
+    # them before constructing any replacement, including cross-block aliases.
+    kimi_expert_ids = {
+        id(parameter)
+        for _, _, block in candidates
+        if isinstance(block, KimiSparseMoE)
+        for parameter in block.experts.parameters()
+    }
+    owners: dict[int, tuple[int, str]] = {}
+    checked_kimi_blocks: set[int] = set()
+    for _, _, block in candidates:
+        if not isinstance(block, KimiSparseMoE) or id(block) in checked_kimi_blocks:
+            continue
+        checked_kimi_blocks.add(id(block))
+        for name, parameter in block.experts.named_parameters(remove_duplicate=False):
+            owner = (id(block), name)
+            previous = owners.setdefault(id(parameter), owner)
+            if previous != owner:
+                raise UnsupportedCombinationError(
+                    "Kimi EP cannot stack a shared individual expert parameter "
+                    f"at experts.{name}; expert aliases require a layout adapter"
+                )
+    owners.clear()
+    for path, module in module_paths:
+        for name, parameter in module.named_parameters(recurse=False):
+            if id(parameter) not in kimi_expert_ids:
+                continue
+            owner = (id(module), name)
+            previous = owners.setdefault(id(parameter), owner)
+            if previous != owner or id(parameter) in external_parameters:
+                raise UnsupportedCombinationError(
+                    f"Kimi EP cannot stack a shared individual expert parameter "
+                    f"at {path}.{name}; expert aliases require a layout adapter"
+                )
     try:
         for layer, attr, block in candidates:
             # Repeated layer slots may reference one physical HF block. Preserve
             # that sharing rather than cloning trainable weights and statistics.
             if id(block) in converted_blocks:
                 replacements.append((layer, attr, converted_blocks[id(block)]))
+                continue
+            if isinstance(block, KimiSparseMoE):
+                moe = convert_kimi_block(
+                    block,
+                    ep_group=ep_group,
+                    aux_loss_coeff=aux_loss_coeff,
+                    quantile_balancing=quantile_balancing,
+                    token_dispatcher=token_dispatcher,
+                    tp_enabled=tp_enabled,
+                )
+                moe.router._debug_force_load_balance = fixed_router
+                converted_blocks[id(block)] = moe
+                replacements.append((layer, attr, moe))
                 continue
             router_gate = router_of(block)
             load_balance_coeff = (

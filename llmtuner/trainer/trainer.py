@@ -53,6 +53,7 @@ from ..models.common.aux_loss import (
     collect_aux_loss_metrics,
 )
 from ..models.common.moe.layer import MoE
+from ..models.common.moe.routing import QuantileBalancedTopKRouter
 from ..parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
@@ -476,6 +477,16 @@ class Trainer:
         # outright rather than zeroing them in place is both cheaper and what
         # makes the accumulated-gradient bookkeeping below trivially correct.
         self.optimizer.zero_grad(set_to_none=True)
+        # A new accumulation window owns fresh routing observations, just as
+        # it owns fresh gradients. The previous window may have failed before
+        # optimizer pre-hooks drained its counters and quantile histograms.
+        with torch.no_grad():
+            for part in self.model_parts:
+                for module in part.modules():
+                    if isinstance(module, MoE):
+                        module.tokens_per_expert_E.zero_()
+                        if isinstance(module.router, QuantileBalancedTopKRouter):
+                            module.router.quantile_balancer.required_bias_histogram_EB.zero_()
 
         # Snapshot the lr *before* the schedule advances below. The value
         # reported for a step must be the one the optimizer applied during it;

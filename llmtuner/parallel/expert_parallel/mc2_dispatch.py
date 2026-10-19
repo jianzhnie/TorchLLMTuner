@@ -24,12 +24,43 @@ from llmtuner.parallel.expert_parallel.token_dispatch import (
 )
 
 
+class MC2GroupedExperts(GroupedExperts):
+    """Own fused compute and weights so ordinary module/FSDP hooks run."""
+
+    def forward(
+        self, inputs, ops, comm_name, world_size, send_counts, recv_counts
+    ) -> torch.Tensor:
+        gate_up_weights = torch.cat((self.w1_EFD, self.w3_EFD), dim=1)
+        gate_up = AllToAllGroupedMatmul.apply(
+            inputs,
+            gate_up_weights,
+            ops,
+            comm_name,
+            world_size,
+            send_counts,
+            recv_counts,
+        )
+        gate, up = gate_up.chunk(2, dim=-1)
+        activated = self.activation_fn(gate, up)
+        return GroupedMatmulAllToAll.apply(
+            activated,
+            self.w2_EDF,
+            ops,
+            comm_name,
+            world_size,
+            recv_counts,
+            send_counts,
+        )
+
+
 class MC2RoutedExperts(RoutedExperts):
     """Execute Ascend fused collectives; no unfused or local fallback."""
 
     def __init__(
-        self, grouped_experts: GroupedExperts, dispatcher: AllToAllTokenDispatcher
+        self, grouped_experts: MC2GroupedExperts, dispatcher: AllToAllTokenDispatcher
     ) -> None:
+        if not isinstance(grouped_experts, MC2GroupedExperts):
+            raise TypeError("MC2 requires MC2GroupedExperts to own fused computation")
         load_mc2_ops()
         if not isinstance(dispatcher, AllToAllTokenDispatcher):
             raise EnvironmentUnsupportedError(
@@ -58,27 +89,8 @@ class MC2RoutedExperts(RoutedExperts):
         prepared = dispatcher.prepare_dispatch_counts(counts.unsqueeze(0))[0]
         send_counts = counts.cpu().tolist()
         recv_counts = prepared.counts.cpu().tolist()
-        experts = self.inner_experts
-        gate_up_weights = torch.cat((experts.w1_EFD, experts.w3_EFD), dim=1)
-        gate_up = AllToAllGroupedMatmul.apply(
-            routed,
-            gate_up_weights,
-            ops,
-            comm_name,
-            world_size,
-            send_counts,
-            recv_counts,
-        )
-        gate, up = gate_up.chunk(2, dim=-1)
-        activated = experts.activation_fn(gate, up)
-        combined = GroupedMatmulAllToAll.apply(
-            activated,
-            experts.w2_EDF,
-            ops,
-            comm_name,
-            world_size,
-            recv_counts,
-            send_counts,
+        combined = self.inner_experts(
+            routed, ops, comm_name, world_size, send_counts, recv_counts
         )
         metadata = LocalDispatchMetadata(
             token_indices_experts_sorted_N=indices,

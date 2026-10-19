@@ -475,6 +475,15 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         Raises:
             ValueError: if ``from_hf`` is set without an ``sd_adapter``.
         """
+        if not from_hf:
+            from .kimi_layout import load_changed_kimi_layout
+
+            if load_changed_kimi_layout(
+                checkpoint_id, states=states, adapter=self.sd_adapter
+            ):
+                if MODEL in states and EMA in self.states and EMA not in states:
+                    self.states[EMA].load_state_dict({})
+                return
         state_dict = self._flatten_model_state(states)
 
         if from_hf:
@@ -508,13 +517,17 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 checkpoint_id=checkpoint_id,
                 planner=planner,
             )
-            if scheduler is not None:
-                scheduler.load_state_dict(state_dict[LR_SCHEDULER])
+            with synchronize_local_errors("Checkpoint scheduler restoration"):
+                if scheduler is not None:
+                    scheduler.load_state_dict(state_dict[LR_SCHEDULER])
 
             # The model states were flattened into the top-level dict by
             # ``_flatten_model_state``, so DCP writes into those flat
             # entries rather than into the model. Pushing them back is a second
             # step, done explicitly here.
+            with synchronize_local_errors("Checkpoint model validation"):
+                if MODEL in states:
+                    states[MODEL].validate_state_dict(state_dict)
             if MODEL in states:
                 states[MODEL].load_state_dict(state_dict)
 
@@ -525,9 +538,16 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         # weights were actually restored to reseed from.
         if MODEL in states and EMA in self.states and EMA not in states:
             self.states[EMA].load_state_dict({})
-        if not from_hf and rng_state is not None and planner.has_rng_state:
-            # Restore last: model hooks and other Stateful callbacks may draw RNG.
-            rng_state.load_state_dict(state_dict[RNG_STATE])
+        if not from_hf:
+            # All ranks must reject invalid streams before any peer resumes.
+            # These phases are local only; DCP and model collectives stay above.
+            with synchronize_local_errors("Checkpoint RNG validation"):
+                if rng_state is not None and planner.has_rng_state:
+                    rng_state.validate_state_dict(state_dict[RNG_STATE])
+            with synchronize_local_errors("Checkpoint RNG restoration"):
+                if rng_state is not None and planner.has_rng_state:
+                    # Restore last: model hooks and Stateful callbacks may draw RNG.
+                    rng_state.load_state_dict(state_dict[RNG_STATE])
 
     def _save(self, curr_step: int, last_step: bool = False) -> bool:
         """Save the checkpoint for the current step.

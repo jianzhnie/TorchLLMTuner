@@ -44,13 +44,23 @@ def ensure_symm_mem_ops():
     return symm_mem
 
 
+_autograd_collectives = None
+
+
 def functional_collectives():
     """Import torch's functional collectives, lazily and version-tolerantly.
+
+    Resolve this environment-only choice outside compiled tensor graphs.
+    Tracing the failed public import can split an upstream norm from its
+    collective and lose its backward contribution under AOT/FSDP.
 
     The autograd-covered variants were renamed across torch releases. Current
     builds expose ``*_single_autograd`` or ``*_tensor_autograd`` names. Require
     a complete autograd pair: non-autograd collectives would break TP gradients.
     """
+    global _autograd_collectives
+    if _autograd_collectives is not None:
+        return _autograd_collectives
     try:
         from torch.distributed import functional_collectives as funcol
     except ImportError:
@@ -62,7 +72,8 @@ def functional_collectives():
         all_gather = getattr(funcol, f"all_gather_{suffix}", None)
         reduce_scatter = getattr(funcol, f"reduce_scatter_{suffix}", None)
         if callable(all_gather) and callable(reduce_scatter):
-            return all_gather, reduce_scatter
+            _autograd_collectives = (all_gather, reduce_scatter)
+            return _autograd_collectives
     raise ImportError(
         "TP requires autograd-enabled functional all-gather and reduce-scatter; "
         "install a torch build providing the *_single_autograd or "

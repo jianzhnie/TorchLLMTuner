@@ -33,6 +33,10 @@ from ...parallel.expert_parallel.checkpointing import (
     gather_expert_state,
     load_expert_state,
 )
+from ...parallel.tensor_parallel.checkpointing import (
+    gather_tensor_parallel_state,
+    load_tensor_parallel_state,
+)
 from ...utils.logging import get_logger
 from ...utils.module_names import canonical_fqn
 from .state_dict import (
@@ -419,6 +423,10 @@ class OptimizersContainer(Optimizer, Stateful):
         ``closure`` is rejected rather than ignored: this container cannot
         support one, and silently dropping it would skip the user's loss
         recomputation. Returning ``None`` matches ``Optimizer.step``.
+
+        Updates are not atomic across optimizers or step hooks. An exception
+        may leave earlier optimizers and pre-hook state already advanced; a
+        caller must restore a complete training checkpoint before retrying.
         """
         if closure is not None:
             raise ValueError("OptimizersContainer does not support closures")
@@ -452,9 +460,12 @@ class OptimizersContainer(Optimizer, Stateful):
         # Expert optimizer states are rank-heterogeneous like the expert
         # weights themselves; gather them to the full tensors the checkpoint
         # stores (parallel/expert_parallel/checkpointing.py).
-        return gather_expert_state(
-            result,
-            shard_map=expert_shard_map(self.model_parts),
+        return gather_tensor_parallel_state(
+            gather_expert_state(
+                result,
+                shard_map=expert_shard_map(self.model_parts),
+                model_parts=self.model_parts,
+            ),
             model_parts=self.model_parts,
         )
 
@@ -463,7 +474,7 @@ class OptimizersContainer(Optimizer, Stateful):
         # optimizer's live state to learn which state tensors to expect, so a
         # fresh optimizer would find nothing to write into.
         state_dict = load_expert_state(
-            state_dict,
+            load_tensor_parallel_state(state_dict, model_parts=self.model_parts),
             shard_map=expert_shard_map(self.model_parts),
             model_parts=self.model_parts,
         )
