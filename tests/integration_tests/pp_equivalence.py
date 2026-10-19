@@ -7,6 +7,12 @@ Run under torchrun with 2 ranks, one schedule per invocation:
         tests/integration_tests/pp_equivalence.py Interleaved1F1B
     torchrun --nproc_per_node=2 tests/integration_tests/pp_equivalence.py ZBVZeroBubble
 
+Append an accumulation count after the schedule (for example 1F1B 2).
+Set LLMTUNER_TEST_OPTIMIZER_GROUPS=1 for embedding/head/stage-specific rules.
+Use four ranks with LLMTUNER_TEST_WORLD_SIZE=4 and
+LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom for PP2 × custom FSDP2.
+The dense reference uses the same per-DP-rank microbatch boundaries.
+
 A tiny offline qwen3 (random init, fixed seed) goes through the real
 ``Trainer`` with ``pp=2``, 4 micro-batches per step, for 4 optimizer steps,
 under either a single-stage schedule (1F1B: one stage per rank), a looped
@@ -36,11 +42,13 @@ which is a different floating-point summation order than one whole-model norm.
 
 from __future__ import annotations
 
+import os
 import sys
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
@@ -51,9 +59,14 @@ from llmtuner.config import (
     ModelConfig,
     OptimizerConfig,
     ParallelConfig,
+    ParamGroupConfig,
     TrainingConfig,
 )
-from llmtuner.config.parallel_config import PipelineParallelConfig
+from llmtuner.config.parallel_config import (
+    ContextParallelConfig,
+    FSDPConfig,
+    PipelineParallelConfig,
+)
 from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
@@ -62,7 +75,7 @@ from llmtuner.trainer.trainer import Trainer
 STEPS = 4
 MICROBATCHES = 4
 GLOBAL_BATCH = 8
-SEQ = 32
+SEQ = int(os.environ.get("LLMTUNER_TEST_SEQ_LEN", "32"))
 VOCAB = 128
 SEED = 42
 
@@ -103,12 +116,40 @@ def _cfg(schedule: str) -> LLMTunerConfig:
         ),
         parallel=ParallelConfig(
             pipeline_parallel_size=2,
+            context_parallel_kv_allgather_size=int(
+                os.environ.get("LLMTUNER_TEST_CP_SIZE", "1")
+            ),
+            cp_config=ContextParallelConfig(
+                context_parallel_load_balancer=os.environ.get(
+                    "LLMTUNER_TEST_CP_LOAD_BALANCER"
+                )
+            ),
             data_parallel_shard_size=-1,
+            fsdp_config=FSDPConfig(
+                fsdp_implementation=os.environ.get(
+                    "LLMTUNER_TEST_FSDP_IMPLEMENTATION", "native"
+                )
+            ),
             pp_config=PipelineParallelConfig(
                 pipeline_parallel_schedule=schedule, num_pp_microbatches=MICROBATCHES
             ),
         ),
-        optimizer=OptimizerConfig(learning_rate=3e-4, weight_decay=0.0),
+        optimizer=OptimizerConfig(
+            learning_rate=3e-4,
+            weight_decay=0.0,
+            param_groups=(
+                [
+                    ParamGroupConfig(
+                        pattern=pattern,
+                        optimizer_name="AdamW",
+                        optimizer_kwargs={"lr": 3e-4, "weight_decay": 0.0},
+                    )
+                    for pattern in (r"embed_tokens\.weight$", r"lm_head\.weight$", ".*")
+                ]
+                if os.environ.get("LLMTUNER_TEST_OPTIMIZER_GROUPS") == "1"
+                else []
+            ),
+        ),
         training=TrainingConfig(
             global_batch_size=GLOBAL_BATCH,
             max_seq_len=SEQ,
@@ -121,8 +162,13 @@ def _cfg(schedule: str) -> LLMTunerConfig:
 
 
 def _reference_trajectory(
-    cfg: LLMTunerConfig, initial_state: dict[str, torch.Tensor]
-) -> tuple[list[float], list[float]]:
+    cfg: LLMTunerConfig,
+    initial_state: dict[str, torch.Tensor],
+    *,
+    dp_size: int,
+) -> tuple[
+    list[float], list[float], list[dict[str, tuple[torch.Tensor, torch.Tensor]]]
+]:
     """The same training step with no pipeline: same chunks, one process.
 
     Mirrors the trainer's step arithmetic exactly -- the same per-row target
@@ -143,7 +189,10 @@ def _reference_trajectory(
         fused=cfg.optimizer.implementation == "fused",
         foreach=cfg.optimizer.implementation == "foreach",
     )
-    rows_per_mb = cfg.global_batch_size // MICROBATCHES
+    # Each DP rank splits its own rows into microbatches. The dense oracle
+    # visits all those chunks with the same independent attention boundaries.
+    reference_microbatches = dp_size * MICROBATCHES
+    rows_per_mb = cfg.global_batch_size // reference_microbatches
 
     batches = iter(
         RandomTokenSource(
@@ -155,37 +204,41 @@ def _reference_trajectory(
     )
     losses = []
     norms = []
+    snapshots = []
     for _ in range(cfg.steps):
         optimizer.zero_grad(set_to_none=True)
-        batch = next(batches)
-        # The model's own synthetic-path shift: within a row, row ends ignored.
-        # Read off the model that actually trains, so the oracle's targets and
-        # the PP body's cannot drift apart.
-        targets = model.preprocess_inputs(batch, parallel_dims=None)[1].reshape(
-            cfg.global_batch_size, cfg.max_seq_len
+        step_batches = [next(batches) for _ in range(cfg.gradient_accumulation_steps)]
+        target_batches = [
+            model.preprocess_inputs(batch, parallel_dims=None)[1].reshape(
+                cfg.global_batch_size, cfg.max_seq_len
+            )
+            for batch in step_batches
+        ]
+        num_valid = sum(
+            int((targets != IGNORE_INDEX).sum()) for targets in target_batches
         )
-        num_valid = int((targets != IGNORE_INDEX).sum())
-
         loss_sum = None
-        for mb in range(MICROBATCHES):
-            row = slice(mb * rows_per_mb, (mb + 1) * rows_per_mb)
-            logits = model(batch.input_ids[row].reshape(-1))
-            loss = cross_entropy_loss(logits, targets[row].reshape(-1))
-            # Normalized BEFORE backward, as the trainer's PP body does -- the
-            # schedule's ``scalar_loss_fn`` divides by this same count. Not
-            # cosmetic: ``clip_grad_norm_`` below reads the gradient, so
-            # dividing afterwards would clip a gradient ``num_valid`` times too
-            # large against an absolute threshold. The divisor is the whole
-            # batch's count, not this micro-batch's, because it has to be the
-            # same number for every micro-batch of the step.
-            (loss / num_valid).backward()
-            loss_sum = loss.detach() if loss_sum is None else loss_sum + loss.detach()
+        for batch, targets in zip(step_batches, target_batches, strict=True):
+            for mb in range(reference_microbatches):
+                row = slice(mb * rows_per_mb, (mb + 1) * rows_per_mb)
+                logits = model(batch.input_ids[row].reshape(-1))
+                loss = cross_entropy_loss(logits, targets[row].reshape(-1))
+                (loss / num_valid).backward()
+                loss_sum = (
+                    loss.detach() if loss_sum is None else loss_sum + loss.detach()
+                )
 
         norm = clip_grad_norm_(model.parameters(), max_norm=cfg.max_norm, foreach=True)
         norms.append(float(norm))
         optimizer.step()
+        snapshots.append(
+            {
+                name: (parameter.grad.detach().clone(), parameter.detach().clone())
+                for name, parameter in model.named_parameters()
+            }
+        )
         losses.append(float(loss_sum / num_valid))
-    return losses, norms
+    return losses, norms, snapshots
 
 
 def main() -> None:
@@ -196,14 +249,21 @@ def main() -> None:
         )
     _, stages_per_rank = SCENARIOS[schedule]
     cfg = _cfg(schedule)
+    if len(sys.argv) > 2:
+        cfg.training.gradient_accumulation_steps = int(sys.argv[2])
+        if cfg.gradient_accumulation_steps < 1:
+            raise ValueError("accumulation steps must be positive")
     failures: list[str] = []
 
     # Trainer init owns the process group (torchrun env); pp=2 over 2 ranks.
     trainer = Trainer(cfg)
     rank = trainer.rank
-    assert trainer.world_size == 2, (
-        f"this check assumes 2 ranks, got {trainer.world_size}"
+    assert trainer.world_size == int(os.environ.get("LLMTUNER_TEST_WORLD_SIZE", "2")), (
+        f"unexpected world size: {trainer.world_size}"
     )
+    pp_rank = trainer.parallel_dims.get_mesh("pp").get_local_rank()
+    _, dp_size = trainer.dp_rank_world_size()
+    replicas = trainer.world_size // cfg.parallel.pp_size
 
     # -- non-vacuity: this rank holds its stages and only their layers -------
     assert len(trainer.model_parts) == stages_per_rank
@@ -217,9 +277,9 @@ def main() -> None:
     # rank 0 and the last on rank 1; a V schedule pairs them front-to-back, so
     # rank 0 holds both and rank 1 neither.
     if schedule in V_SCHEDULES:
-        want_first = want_last = rank == 0
+        want_first = want_last = pp_rank == 0
     else:
-        want_first = rank == 0
+        want_first = pp_rank == 0
         want_last = not want_first
     if (trainer.pp_has_first_stage, trainer.pp_has_last_stage) != (
         want_first,
@@ -250,14 +310,17 @@ def main() -> None:
     reference_numel = sum(
         p.numel() for p in HFTransformerModel(build_model_config_for(cfg)).parameters()
     )
-    if total_numel.item() != reference_numel:
+    if total_numel.item() != reference_numel * replicas:
         failures.append(
             f"rank {rank}: stage parameters sum to {total_numel.item()}, "
-            f"the whole model has {reference_numel}"
+            f"the replicated logical model has {reference_numel * replicas}"
         )
 
     local_initial_state = {
-        key: value.detach().cpu().clone()
+        key: (value.full_tensor() if isinstance(value, DTensor) else value)
+        .detach()
+        .cpu()
+        .clone()
         for part in trainer.model_parts
         for key, value in part.state_dict().items()
     }
@@ -271,10 +334,23 @@ def main() -> None:
     data_iterator = trainer.data_iterator()
     pp_losses = []
     pp_norms = []
+    pp_snapshots = []
     for step in range(STEPS):
         trainer.step += 1
         metrics = trainer.train_step(data_iterator)
         assert metrics is not None  # log_freq=1: every step reports
+        pp_snapshots.append(
+            {
+                name: tuple(
+                    (value.full_tensor() if isinstance(value, DTensor) else value)
+                    .detach()
+                    .clone()
+                    for value in (parameter.grad, parameter)
+                )
+                for part in trainer.model_parts
+                for name, parameter in part.named_parameters()
+            }
+        )
         if step == 0:
             active_grads = sum(
                 p.grad is not None
@@ -303,7 +379,36 @@ def main() -> None:
             pp_losses.append(metrics["loss"])
             pp_norms.append(metrics["grad_norm"])
 
-    reference, reference_norms = _reference_trajectory(cfg, initial_state)
+    reference, reference_norms, reference_snapshots = _reference_trajectory(
+        cfg, initial_state, dp_size=dp_size
+    )
+    maximum_state_errors = torch.zeros(2, dtype=torch.float64)
+    for step, (actual, expected) in enumerate(
+        zip(pp_snapshots, reference_snapshots, strict=True), 1
+    ):
+        for name, tensors in actual.items():
+            for index, (label, got, want) in enumerate(
+                zip(
+                    ("clipped gradient", "parameter"),
+                    tensors,
+                    expected[name],
+                    strict=True,
+                )
+            ):
+                difference = (got - want).abs()
+                maximum_state_errors[index] = max(
+                    float(maximum_state_errors[index]), float(difference.max())
+                )
+                if not torch.allclose(got, want, rtol=TOL, atol=TOL):
+                    largest = int(difference.argmax())
+                    actual_gradient = tensors[0].flatten()[largest]
+                    reference_gradient = expected[name][0].flatten()[largest]
+                    failures.append(
+                        f"rank {rank}: step {step} {name} {label} differs "
+                        f"(max abs={float(difference.max()):.3e}, "
+                        f"gradient at max={float(actual_gradient):.9e}/"
+                        f"{float(reference_gradient):.9e})"
+                    )
 
     # The real losses live on the rank holding the last stage; collect them on
     # rank 0 for the report. That rank is the last one for single-stage and
@@ -340,6 +445,9 @@ def main() -> None:
     # Every rank must agree that every check passed, not just report its own.
     local_ok = torch.tensor([0.0 if not failures else 1.0])
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
+    dist.all_reduce(maximum_state_errors, op=dist.ReduceOp.MAX)
+    rank_failures = [None] * trainer.world_size
+    dist.all_gather_object(rank_failures, failures)
 
     if rank == 0:
         print(
@@ -351,10 +459,13 @@ def main() -> None:
         print(f"reference norms  = {[f'{x:.6f}' for x in reference_norms]}")
         print(f"pp norms         = {[f'{x:.6f}' for x in pp_norms]}")
         print(f"max abs diff     = {max_diff:.3e}")
+        print(f"max gradient diff = {float(maximum_state_errors[0]):.3e}")
+        print(f"max parameter diff = {float(maximum_state_errors[1]):.3e}")
         print(f"failed ranks     = {int(local_ok.item())}")
-        for f in failures:
-            print(f"  FAIL {f}")
-        if not failures:
+        for errors in rank_failures:
+            for error in errors:
+                print(f"  FAIL {error}")
+        if local_ok.item() == 0:
             print("all checks passed")
 
     assert local_ok.item() == 0, "PP equivalence check failed"

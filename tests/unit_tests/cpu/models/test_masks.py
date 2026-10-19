@@ -343,3 +343,10 @@ def test_fixed_block_mask_rejects_nonpositive_size(size):
 
     with pytest.raises(ValueError, match="fixed_block_size"):
         get_fixed_block_mask_mod(size)
+
+
+def test_fixed_varlen_metadata_rejects_document_longer_than_kernel_bound():
+    with pytest.raises(RuntimeError, match="max_context_length"):
+        create_varlen_metadata_for_document(
+            torch.arange(8), max_num_documents=1, max_context_length=4
+        )

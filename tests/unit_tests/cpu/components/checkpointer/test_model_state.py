@@ -7,6 +7,21 @@ from torch import nn
 from llmtuner.components.checkpointer.model_state import ModelCheckpointState
 
 
+def test_compiled_model_checkpoint_uses_original_names_and_restores_both_directions():
+    source = nn.Linear(2, 2)
+    compiled = torch.compile(source, backend="eager")
+    state = ModelCheckpointState(compiled).state_dict()
+    assert set(state) == {"weight", "bias"}
+    saved = {name: tensor.clone() for name, tensor in state.items()}
+    target = nn.Linear(2, 2)
+    ModelCheckpointState(target).load_state_dict(saved)
+    torch.testing.assert_close(target.state_dict(), source.state_dict(), rtol=0, atol=0)
+    with torch.no_grad():
+        target.weight.add_(1)
+    ModelCheckpointState(compiled).load_state_dict(target.state_dict())
+    torch.testing.assert_close(source.weight, target.weight, rtol=0, atol=0)
+
+
 def test_model_checkpoint_state_keeps_tensor_storage_stable_across_calls() -> None:
     """Stable storage is what lets async DCP reuse its pinned host buffers."""
     model = nn.Linear(4, 4)
@@ -142,3 +157,59 @@ def test_model_restore_keeps_legacy_scalar_buffer_compatibility():
     state.load_state_dict({"counter": torch.tensor([3])})
     assert model.counter.ndim == 0
     assert model.counter.item() == 3
+
+
+@pytest.mark.parametrize("view", ["transpose", "offset"])
+def test_checkpoint_refresh_tracks_changed_buffer_view_without_mutating_model(view):
+    model = nn.Module()
+    rows = 2 if view == "transpose" else 4
+    model.register_buffer("matrix", torch.arange(rows * 2.0).reshape(rows, 2))
+    transpose = False
+
+    def export_view(module, state, prefix, metadata):
+        value = state[f"{prefix}matrix"]
+        if view == "offset":
+            state[f"{prefix}matrix"] = value[2:] if transpose else value[:2]
+        elif transpose:
+            state[f"{prefix}matrix"] = value.T
+
+    model.register_state_dict_post_hook(export_view)
+    wrapper = ModelCheckpointState(model)
+    original = model.matrix.clone()
+    transpose = True
+    exported = wrapper.state_dict()
+    torch.testing.assert_close(
+        exported["matrix"], original.T if view == "transpose" else original[2:]
+    )
+    torch.testing.assert_close(model.matrix, original)
+    cached_storage = exported["matrix"].untyped_storage().data_ptr()
+    transpose = False
+    exported = wrapper.state_dict()
+    torch.testing.assert_close(
+        exported["matrix"], original if view == "transpose" else original[:2]
+    )
+    torch.testing.assert_close(model.matrix, original)
+    assert exported["matrix"].untyped_storage().data_ptr() == cached_storage
+
+
+def test_dcp_restores_shared_buffers_and_storage_views_in_new_model(tmp_path):
+    from torch.distributed import checkpoint as dcp
+
+    def build(value):
+        model = nn.Module()
+        model.register_buffer("matrix", value)
+        model.child = nn.Module()
+        model.child.register_buffer("alias", model.matrix)
+        model.child.register_buffer("tail", model.matrix[1:])
+        return model
+
+    original = torch.arange(6.0).reshape(3, 2)
+    source = build(original.clone())
+    dcp.save({"model": ModelCheckpointState(source)}, checkpoint_id=tmp_path)
+    target = build(torch.zeros_like(original))
+    dcp.load({"model": ModelCheckpointState(target)}, checkpoint_id=tmp_path)
+    assert target.matrix is target.child.alias
+    assert torch._C._is_alias_of(target.matrix, target.child.tail)
+    assert target.child.tail.storage_offset() == target.matrix.stride(0)
+    torch.testing.assert_close(target.matrix, original)
+    torch.testing.assert_close(target.child.tail, original[1:])

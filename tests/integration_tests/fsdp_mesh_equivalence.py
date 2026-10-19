@@ -7,8 +7,8 @@ Run under torchrun with 2 ranks, one mode per invocation (from the repo root):
     PYTHONPATH=. torchrun --nproc_per_node=2 \
         tests/integration_tests/fsdp_mesh_equivalence.py shard
 
-Append ``custom`` after the mode to exercise the PyTorch-backed fine-grained
-adapter. This does not test FSDPTurbo's separate hook-target state engine.
+Append ``custom`` after the mode to exercise the fine-grained state engine
+with default module hooks. Relocated hooks/multiple contexts are not tested.
 
 Two regressions are pinned here, both rooted in how the FSDP mesh is chosen:
 

@@ -849,11 +849,12 @@ def test_the_fp32_restore_covers_the_bias_buffer() -> None:
     """
     from llmtuner.models.common.moe.experts import GroupedExperts
     from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
+    from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
     grouped = GroupedExperts(dim=16, hidden_dim=32, num_experts=256)
     moe = MoE(
         num_experts=256,
-        routed_experts=RoutedExperts(grouped, None),
+        routed_experts=RoutedExperts(grouped, LocalTokenDispatcher(256, 1)),
         router=TokenChoiceTopKRouter(num_experts=256, dim=16),
         load_balance_coeff=1e-3,
     )
@@ -962,3 +963,189 @@ def test_conversion_preserves_shared_expert_dtype_and_child_modes(later_failure)
     assert shared.training
     assert not shared[0].training
     assert shared[1].training
+
+
+@pytest.mark.parametrize("value", [True, "0.1", float("nan"), float("inf"), -0.1])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_invalid_aux_loss_coefficient_preserves_hf_blocks(value, inherited):
+    from llmtuner.errors import ConfigError
+
+    model = _model(_config(norm_topk_prob=True))
+    blocks = [layer.mlp for layer in model.layers]
+    if inherited:
+        object.__setattr__(model.model.config, "router_aux_loss_coef", value)
+    kwargs = {} if inherited else {"router_aux_loss_coef": value}
+    with pytest.raises(ConfigError, match="router_aux_loss_coef"):
+        swap_hf_moe_blocks(model, **kwargs)
+    assert all(
+        layer.mlp is block for layer, block in zip(model.layers, blocks, strict=True)
+    )
+
+
+def test_swap_preserves_moe_block_sharing_across_layers():
+    reference = _model(_config(norm_topk_prob=True))
+    swapped = _model(_config(norm_topk_prob=True))
+    reference.layers[1].mlp = reference.layers[0].mlp
+    swapped.layers[1].mlp = swapped.layers[0].mlp
+    ids, positions = _data()
+    with torch.no_grad():
+        expected = reference(ids, positions=positions)
+    assert swap_hf_moe_blocks(swapped) == 2
+    assert swapped.layers[0].mlp is swapped.layers[1].mlp
+    assert swapped.layers[0].moe is swapped.layers[1].moe
+    assert swapped.layers[0].mlp.router.gate.weight is (
+        swapped.layers[1].mlp.router.gate.weight
+    )
+    with torch.no_grad():
+        actual = swapped(ids, positions=positions)
+    torch.testing.assert_close(actual, expected, atol=TOL, rtol=TOL)
+
+
+@pytest.mark.parametrize("projection", ["router", "gate_up_proj", "down_proj"])
+def test_swap_preserves_projection_sharing_and_accumulated_gradients(projection):
+    reference = _model(_config(norm_topk_prob=True, aux_coeff=0.0))
+    swapped = _model(_config(norm_topk_prob=True, aux_coeff=0.0))
+    for model in (reference, swapped):
+        blocks = [layer.mlp for layer in model.layers]
+        if projection == "router":
+            blocks[1].gate.weight = blocks[0].gate.weight
+        else:
+            setattr(
+                blocks[1].experts, projection, getattr(blocks[0].experts, projection)
+            )
+    original = reference.layers[0].mlp
+    assert swap_hf_moe_blocks(swapped) == 2
+    first, second = [layer.mlp for layer in swapped.layers]
+    if projection == "router":
+        actual = first.router.gate.weight
+        assert actual is second.router.gate.weight
+        expected = original.gate.weight
+        actual_parts = [actual]
+    elif projection == "gate_up_proj":
+        a = first.routed_experts.inner_experts
+        b = second.routed_experts.inner_experts
+        assert a.w1_EFD is b.w1_EFD and a.w3_EFD is b.w3_EFD
+        expected = original.experts.gate_up_proj
+        actual_parts = [a.w1_EFD, a.w3_EFD]
+    else:
+        actual = first.routed_experts.inner_experts.w2_EDF
+        assert actual is second.routed_experts.inner_experts.w2_EDF
+        expected = original.experts.down_proj
+        actual_parts = [actual]
+    ids, positions = _data()
+    reference_output = reference(ids, positions=positions)
+    swapped_output = swapped(ids, positions=positions)
+    torch.testing.assert_close(swapped_output, reference_output, atol=TOL, rtol=TOL)
+    reference_output.square().mean().backward()
+    swapped_output.square().mean().backward()
+    actual_grad = (
+        torch.cat([p.grad for p in actual_parts], dim=1)
+        if len(actual_parts) == 2
+        else actual_parts[0].grad
+    )
+    torch.testing.assert_close(actual_grad, expected.grad, atol=1e-7, rtol=1e-5)
+    torch.optim.SGD(actual_parts, lr=0.1).step()
+    torch.optim.SGD([expected], lr=0.1).step()
+    actual_value = (
+        torch.cat(actual_parts, dim=1) if len(actual_parts) == 2 else actual_parts[0]
+    )
+    torch.testing.assert_close(actual_value, expected, atol=TOL, rtol=TOL)
+
+
+@pytest.mark.parametrize("projection", ["router", "down_proj"])
+def test_swap_preserves_parameter_shared_with_unconverted_module(projection):
+    model = _model(_config(norm_topk_prob=True, aux_coeff=0.0))
+    original = model.layers[0].mlp
+    parameter = (
+        original.gate.weight if projection == "router" else original.experts.down_proj
+    )
+    consumer = torch.nn.Module()
+    consumer.register_parameter("weight", parameter)
+    model.extra_consumer = consumer
+    swap_hf_moe_blocks(model)
+    converted = model.layers[0].mlp
+    actual = (
+        converted.router.gate.weight
+        if projection == "router"
+        else converted.routed_experts.inner_experts.w2_EDF
+    )
+    assert actual is consumer.weight
+    loss = actual.square().sum() + 2 * consumer.weight.square().sum()
+    loss.backward()
+    torch.testing.assert_close(parameter.grad, 6 * parameter)
+
+
+def test_swap_preserves_shared_sign_balancing_bias_and_joint_update():
+    from llmtuner.models.common.moe.bias_update import update_expert_bias
+
+    model = _deepseek_model()
+    model.layers[2].mlp.gate.e_score_correction_bias = model.layers[
+        1
+    ].mlp.gate.e_score_correction_bias
+    swap_hf_moe_blocks(model)
+    first, second = model.layers[1].mlp, model.layers[2].mlp
+    assert first.expert_bias_E is second.expert_bias_E
+    before = first.expert_bias_E.clone()
+    first.tokens_per_expert_E[0] = 8
+    second.tokens_per_expert_E[1:] = 3
+    total = first.tokens_per_expert_E + second.tokens_per_expert_E
+    delta = first.load_balance_coeff * torch.sign(total.mean() - total)
+    update_expert_bias([first, second])
+    torch.testing.assert_close(first.expert_bias_E, before + delta - delta.mean())
+    assert torch.count_nonzero(first.tokens_per_expert_E) == 0
+    assert torch.count_nonzero(second.tokens_per_expert_E) == 0
+
+
+def test_shared_quantile_bias_survives_conversion_and_state_restore():
+    from copy import deepcopy
+
+    from llmtuner.models.common.moe.bias_update import update_quantile_expert_bias
+
+    def build():
+        model = _deepseek_model(n_group=1, topk_group=1)
+        model.layers[2].mlp.gate.e_score_correction_bias = model.layers[
+            1
+        ].mlp.gate.e_score_correction_bias
+        swap_hf_moe_blocks(model, quantile_balancing=True)
+        return model
+
+    model = build()
+    first, second = model.layers[1].mlp, model.layers[2].mlp
+    assert first.expert_bias_E is second.expert_bias_E
+    h1 = first.router.quantile_balancer.required_bias_histogram_EB
+    h2 = second.router.quantile_balancer.required_bias_histogram_EB
+    h1[:, 200] = 3
+    h2[:, 700] = 5
+    expected = first.router.quantile_balancer.estimate_expert_bias(
+        h1 + h2, first.expert_bias_E.clone()
+    )
+    update_quantile_expert_bias([first, second])
+    torch.testing.assert_close(first.expert_bias_E, expected)
+    saved = deepcopy(model.state_dict())
+    restored = build()
+    restored.load_state_dict(saved)
+    a, b = restored.layers[1].mlp, restored.layers[2].mlp
+    assert a.expert_bias_E is b.expert_bias_E
+    torch.testing.assert_close(a.expert_bias_E, expected)
+    assert not a.router.quantile_balancer.required_bias_histogram_EB.any()
+    assert not b.router.quantile_balancer.required_bias_histogram_EB.any()
+
+
+@pytest.mark.parametrize("whole_block", [False, True])
+def test_swap_rejects_external_fused_expert_alias_before_installation(whole_block):
+    model = _model(_config(norm_topk_prob=True, aux_coeff=0.0))
+    original_blocks = [layer.mlp for layer in model.layers]
+    original = original_blocks[0].experts.gate_up_proj
+    if whole_block:
+        model.external_expert = original_blocks[0]
+    else:
+        model.register_parameter("external_expert", original)
+    before_counts = dict(AuxLoss._group_counts)
+    with pytest.raises(UnsupportedCombinationError, match="external_expert"):
+        swap_hf_moe_blocks(model)
+    assert all(
+        layer.mlp is block
+        for layer, block in zip(model.layers, original_blocks, strict=True)
+    )
+    assert model.external_expert is (original_blocks[0] if whole_block else original)
+    assert AuxLoss._group_counts == before_counts

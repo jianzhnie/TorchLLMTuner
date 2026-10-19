@@ -1,204 +1,171 @@
-"""PP x CP check: a 2-stage pipeline with 2-way CP must match single-process.
+"""PP2 × CP2 training against an independent dense model on CPU/Gloo.
 
-Run under torchrun with 4 ranks:
+Run with four ranks, optionally selecting a schedule and accumulation count:
 
     PYTHONPATH=. torchrun --nproc_per_node=4 \
-        tests/integration_tests/pp_cp_equivalence.py
+        tests/integration_tests/pp_cp_equivalence.py 1F1B 2
 
-The pipeline (pp=2) composes with context parallelism (cp=2, kv_allgather):
-every stage's decoder layers run the CP attention over this rank's sequence
-shard, and the p2p channel carries the already-sharded activations between
-stages at the same CP coordinate. A tiny qwen3 (dense) trains for a few steps
-on the synthetic corpus; the per-step losses must track a single-process,
-unsharded reference computed in-process.
-
-Non-vacuity: the model is actually split across stages, and the CP mesh is
-size 2 (a size-1 CP group would make the comparison vacuous).
-
-Environment note: needs torch >= 2.12 (the pipelining/flex surface). Written
-2026-10-02 with the PP x CP unlock; environment not covered on the
-development host -- awaiting a multi-rank run on the target torch.
+Real Trainer, CP sharding/masks, KV collective/autograd and FSDP run unchanged.
+Only attention computation uses dense-mask SDPA; production flex kernels and
+target-device behavior are not validated. FSDP defaults to custom; set
+LLMTUNER_TEST_FSDP_IMPLEMENTATION=native to exercise the native implementation.
+For headtail numerical diagnosis, set LLMTUNER_TEST_CP_LOAD_BALANCER=headtail
+and LLMTUNER_TEST_CP_FP64_DIAGNOSTIC=1. That explicitly substitutes FP64 model
+and CE arithmetic, retaining FP32 scalar loss communication; it does not
+validate the production FP32 trajectory.
+LLMTUNER_TEST_CP_REORDER_REFERENCE=1 independently permutes dense reference
+KV and mask columns into headtail order, isolating floating-point reduction
+order. The original unpermuted reference remains the default.
 """
 
-from __future__ import annotations
+import os
+from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
-import torch.distributed as dist
-from torch.distributed.tensor import DTensor
+import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_mask
 
-from llmtuner.accelerator.collectives import clip_grad_norm_
-from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
-from llmtuner.config import (
-    LLMTunerConfig,
-    MetricsConfig,
-    ModelConfig,
-    OptimizerConfig,
-    ParallelConfig,
-    TrainingConfig,
-)
-from llmtuner.config.parallel_config import PipelineParallelConfig
-from llmtuner.datasets.synthetic import RandomTokenSource
-from llmtuner.models.hf.factory import build_model_config_for
+from llmtuner.accelerator.device import device_type
+from llmtuner.models.hf.attention_backend import ATTENTION_BACKEND
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.trainer.trainer import Trainer
-
-STEPS = 4
-MICROBATCHES = 4
-GLOBAL_BATCH = 8
-SEQ = 256  # torch's CP BlockMask path requires Q_LEN % (cp * 128) == 0
-VOCAB = 128
-SEED = 42
-PP = 2
-CP = 2
-WORLD = 4  # pp * cp, dp_shard = 1
-
-# Looser than the dense PP check: CP's all-gathered K/V reassociate the fp32
-# attention sums relative to the unsharded reference.
-TOL = 1e-4
 
 
-def _cfg() -> LLMTunerConfig:
-    return LLMTunerConfig(
-        model=ModelConfig(
-            model_name_or_path="qwen3",
-            vocab_size=VOCAB,
-            hidden_size=64,
-            intermediate_size=128,
-            num_hidden_layers=4,  # 4 so both stages get 2 layers
-            num_attention_heads=4,
-            num_key_value_heads=4,
+def _dense_attention(module, q, k, v, block_mask, kwargs):
+    """Expand the actual sharded mask predicate at local-Q/full-KV lengths."""
+    mask = create_mask(
+        block_mask.mask_mod,
+        B=1,
+        H=1,
+        Q_LEN=q.shape[2],
+        KV_LEN=k.shape[2],
+        device=str(q.device),
+    )
+    return F.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, scale=kwargs.get("scaling"), enable_gqa=True
+    )
+
+
+def _dense_adapter(module, q, k, v, mask, **kwargs):
+    if os.environ.get("LLMTUNER_TEST_CP_REORDER_REFERENCE") == "1":
+        # Independent arithmetic: pair chunk r with chunk 2*cp-1-r.
+        # The dense oracle keeps original query/output order; only the KV
+        # reduction order changes, with the same mask columns permuted.
+        cp = int(os.environ["LLMTUNER_TEST_CP_SIZE"])
+        chunks = torch.arange(k.shape[2], device=k.device).reshape(2 * cp, -1)
+        order = torch.cat(
+            [torch.cat((chunks[r], chunks[2 * cp - 1 - r])) for r in range(cp)]
+        )
+        dense_mask = create_mask(
+            mask.mask_mod,
+            B=1,
+            H=1,
+            Q_LEN=q.shape[2],
+            KV_LEN=k.shape[2],
+            device=str(q.device),
+        ).index_select(-1, order)
+        output = F.scaled_dot_product_attention(
+            q,
+            k.index_select(2, order),
+            v.index_select(2, order),
+            attn_mask=dense_mask,
+            scale=kwargs.get("scaling"),
+            enable_gqa=True,
+        )
+        return output.transpose(1, 2), None
+    return _dense_attention(module, q, k, v, mask, kwargs).transpose(1, 2), None
+
+
+def _validate_reordered_reference():
+    """Check permutation invariance independently in FP64, including GQA grads."""
+    generator = torch.Generator().manual_seed(123)
+    mask = SimpleNamespace(mask_mod=lambda b, h, q, k: q >= k)
+    for kv_heads in (4, 2):
+        inputs = [
+            torch.randn(
+                1, heads, 16, 8, generator=generator, dtype=torch.float64
+            ).requires_grad_()
+            for heads in (4, kv_heads, kv_heads)
+        ]
+        expected = _dense_attention(None, *inputs, mask, {})
+        actual = _dense_adapter(None, *inputs, mask)[0].transpose(1, 2)
+        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+        actual_grads = torch.autograd.grad(actual.square().sum(), inputs)
+        expected_grads = torch.autograd.grad(expected.square().sum(), inputs)
+        for got, want in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-12)
+
+
+@contextmanager
+def cpu_cp_attention():
+    """Use one explicit CPU attention substitute across PP/CP harnesses."""
+    if device_type != "cpu":
+        raise RuntimeError("This explicit SDPA substitute requires CPU/Gloo")
+    with (
+        patch(
+            "llmtuner.models.hf.model.available_attention_backend",
+            return_value=ATTENTION_BACKEND,
         ),
-        parallel=ParallelConfig(
-            pipeline_parallel_size=PP,
-            context_parallel_kv_allgather_size=CP,
-            data_parallel_shard_size=-1,
-            pp_config=PipelineParallelConfig(
-                pipeline_parallel_schedule="1F1B", num_pp_microbatches=MICROBATCHES
-            ),
+        patch(
+            "llmtuner.parallel.context_parallel.attention.run_flex", _dense_attention
         ),
-        optimizer=OptimizerConfig(learning_rate=3e-4, weight_decay=0.0),
-        training=TrainingConfig(
-            global_batch_size=GLOBAL_BATCH,
-            max_seq_len=SEQ,
-            steps=STEPS,
-            seed=SEED,
-            deterministic=True,
-            metrics_config=MetricsConfig(log_freq=1),
+        patch(
+            "llmtuner.models.hf.attention_backend.flex_attention_forward",
+            _dense_adapter,
         ),
-    )
-
-
-def _reference_trajectory(
-    cfg: LLMTunerConfig, initial_state: dict[str, torch.Tensor]
-) -> list[float]:
-    """The same steps in one process: no pipeline, no CP (CP is numerically
-    transparent: every rank attends the same full K/V)."""
-    torch.manual_seed(cfg.seed)
-    model = HFTransformerModel(build_model_config_for(cfg))
-    # Pipeline stages use stage-specific initialization seeds. Compare the
-    # same weights so initialization differences cannot masquerade as CP errors.
-    model.load_state_dict(initial_state, strict=True)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-        fused=cfg.optimizer.implementation == "fused",
-        foreach=cfg.optimizer.implementation == "foreach",
-    )
-    rows_per_mb = cfg.global_batch_size // MICROBATCHES
-    batches = iter(
-        RandomTokenSource(
-            seed=cfg.seed,
-            vocab_size=cfg.vocab_size,
-            batch_size=cfg.global_batch_size,
-            seq_len=cfg.max_seq_len,
-        )
-    )
-    losses = []
-    for _ in range(cfg.steps):
-        optimizer.zero_grad(set_to_none=True)
-        batch = next(batches)
-        targets = model.preprocess_inputs(batch, parallel_dims=None)[1].reshape(
-            cfg.global_batch_size, cfg.max_seq_len
-        )
-        num_valid = int((targets != IGNORE_INDEX).sum())
-        loss_sum = None
-        for mb in range(MICROBATCHES):
-            row = slice(mb * rows_per_mb, (mb + 1) * rows_per_mb)
-            logits = model(batch.input_ids[row].reshape(-1))
-            loss = cross_entropy_loss(logits, targets[row].reshape(-1))
-            (loss / num_valid).backward()
-            loss_sum = loss.detach() if loss_sum is None else loss_sum + loss.detach()
-        clip_grad_norm_(model.parameters(), max_norm=cfg.max_norm, foreach=True)
-        optimizer.step()
-        losses.append(float(loss_sum / num_valid))
-    return losses
-
-
-def main() -> None:
-    cfg = _cfg()
-    failures: list[str] = []
-
-    trainer = Trainer(cfg)
-    rank = trainer.rank
-    assert trainer.world_size == WORLD, (
-        f"this check assumes {WORLD} ranks, got {trainer.world_size}"
-    )
-
-    # -- non-vacuity: the model is split, and CP is real ----------------------
-    num_layers_held = sum(len(part.layers) for part in trainer.model_parts)
-    if num_layers_held >= cfg.num_hidden_layers:
-        failures.append(
-            f"rank {rank}: holds {num_layers_held} of {cfg.num_hidden_layers} "
-            "layers -- the model was not split"
-        )
-    cp_mesh = trainer.parallel_dims.get_optional_mesh("cp")
-    if cp_mesh is None or cp_mesh.size() != CP:
-        failures.append(
-            f"rank {rank}: cp mesh size "
-            f"{None if cp_mesh is None else cp_mesh.size()}, want {CP}"
-        )
-
-    # -- the trajectory ------------------------------------------------------
-    local_initial_state = {}
-    for part in trainer.model_parts:
-        for key, value in part.state_dict().items():
-            if isinstance(value, DTensor):
-                value = value.full_tensor()
-            local_initial_state[key] = value.detach().cpu().clone()
-    stage_states = [None] * trainer.world_size
-    dist.all_gather_object(stage_states, local_initial_state)
-    initial_state = {}
-    for stage_state in stage_states:
-        for key, value in stage_state.items():
-            if key in initial_state:
-                torch.testing.assert_close(initial_state[key], value, rtol=0, atol=0)
-            initial_state[key] = value
-    data_iterator = trainer.data_iterator()
-    pp_cp_losses = []
-    for _step in range(STEPS):
-        trainer.step += 1
-        metrics = trainer.train_step(data_iterator)
-        assert metrics is not None  # log_freq=1: every step reports
-        pp_cp_losses.append(metrics["loss"])
-    trainer.close()
-
-    reference = _reference_trajectory(cfg, initial_state)
-    for step, (got, want) in enumerate(zip(pp_cp_losses, reference, strict=True)):
-        if abs(got - want) > TOL:
-            failures.append(f"rank {rank} step {step + 1}: loss {got} vs {want}")
-
-    if rank == 0:
-        print(f"pp={PP} cp={CP} world={WORLD} steps={STEPS} tol={TOL:.0e}")
-        print(f"pp+cp losses = {[f'{x:.6f}' for x in pp_cp_losses]}")
-        print(f"reference    = {[f'{x:.6f}' for x in reference]}")
-        for f in failures:
-            print(f"  FAIL {f}")
-        print("all checks passed" if not failures else "CHECKS FAILED")
-    verdict = torch.tensor(len(failures), dtype=torch.int64)
-    dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
-    assert int(verdict) == 0, f"{int(verdict)} check(s) failed -- see rank 0 output"
+    ):
+        yield
 
 
 if __name__ == "__main__":
-    main()
+    if device_type != "cpu":
+        raise RuntimeError("This explicit SDPA substitute requires CPU/Gloo")
+    # Set scenario defaults before importing the shared harness's constants.
+    os.environ.setdefault("LLMTUNER_TEST_WORLD_SIZE", "4")
+    os.environ.setdefault("LLMTUNER_TEST_CP_SIZE", "2")
+    os.environ.setdefault("LLMTUNER_TEST_SEQ_LEN", "256")
+    os.environ.setdefault("LLMTUNER_TEST_FSDP_IMPLEMENTATION", "custom")
+    if os.environ.get("LLMTUNER_TEST_CP_REORDER_REFERENCE") == "1" and (
+        os.environ.get("LLMTUNER_TEST_CP_LOAD_BALANCER") != "headtail"
+    ):
+        raise ValueError("The reordered reference requires headtail load balancing")
+    if os.environ.get("LLMTUNER_TEST_CP_REORDER_REFERENCE") == "1":
+        _validate_reordered_reference()
+    from tests.integration_tests.pp_equivalence import main
+
+    with ExitStack() as diagnostics, cpu_cp_attention():
+        if os.environ.get("LLMTUNER_TEST_CP_FP64_DIAGNOSTIC") == "1":
+            original_init = HFTransformerModel.__init__
+
+            def initialize_double(self, *args, **kwargs):
+                original_init(self, *args, **kwargs)
+                self.double()
+
+            def double_loss(pred, labels, **kwargs):
+                # Scalar loss communication keeps Trainer's FP32 sentinel
+                # contract; backward still evaluates CE on FP64 logits.
+                return F.cross_entropy(
+                    pred.reshape(-1, pred.shape[-1]),
+                    labels.reshape(-1),
+                    reduction="sum",
+                    ignore_index=-100,
+                ).float()
+
+            diagnostics.enter_context(
+                patch.object(HFTransformerModel, "__init__", initialize_double)
+            )
+            diagnostics.enter_context(
+                patch(
+                    "llmtuner.parallel.pipeline_parallel.pipeline_parallel."
+                    "cross_entropy_loss",
+                    double_loss,
+                )
+            )
+            diagnostics.enter_context(
+                patch(
+                    "tests.integration_tests.pp_equivalence.cross_entropy_loss",
+                    double_loss,
+                )
+            )
+        main()

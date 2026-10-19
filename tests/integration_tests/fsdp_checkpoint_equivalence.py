@@ -3,22 +3,41 @@
     PYTHONPATH=. torchrun --nproc_per_node=2 \
         tests/integration_tests/fsdp_checkpoint_equivalence.py
 
-Runs native/custom adapters with shard and replicate meshes on CPU/Gloo,
+Runs native/custom engines with shard and replicate meshes on CPU/Gloo,
 including shard-to-replicate and replicate-to-shard checkpoint restoration.
-Custom here means the current native adapter, not the pending relocated-hook
-engine. Uses rank-distinct batches, a decaying LR, and fresh resume objects.
+Custom here uses default module hooks; relocated hooks and multiple contexts
+are not exercised. Uses rank-distinct batches, a decaying LR, and fresh objects.
 Checks loss, all gradients, final parameters, Adam moments/counters, and LR.
-Target-device kernels and async checkpoint transports are not covered.
+Injects a rank-zero failure after a threaded same-step rewrite has written its
+shards; a fresh runtime must still restore the original published checkpoint.
+Target-device kernels and pinned-memory checkpoint transports are not covered.
+Append ``--fsspec`` to exercise file:// URIs through the real fsspec adapter.
+``--checkpoint-root s3://bucket/prefix`` (or gs://) uses a unique subdirectory
+under that root and retains artifacts for inspection; requires the corresponding
+fsspec driver and credentials. Cloud transports are not validated by local runs.
+``--process-save-cpu`` uses the real DCP save subprocess with shared CPU staging;
+pinning, async device staging and nonblocking device copies are disabled. This
+validates worker serialization/I/O, not pinned-memory device transport.
 """
 
+import argparse
 from contextlib import nullcontext
+from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from fsdp_mesh_equivalence import SEQ, _build_model, _data, _full, _loss_sum
+from torch.distributed.checkpoint import FileSystemWriter
+from torch.distributed.checkpoint.api import CheckpointException
+from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.tensor import DTensor
 
+from llmtuner.components.checkpointer import distributed_checkpoint
+from llmtuner.components.checkpointer.checkpoint_writer import (
+    GenerationFileSystemWriter,
+)
 from llmtuner.components.checkpointer.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
@@ -36,6 +55,16 @@ STEPS = 6
 RESUME_STEP = 2
 LR = 0.01
 ATOL = 1e-5
+
+
+class _FailAfterWritingGenerationWriter(GenerationFileSystemWriter):
+    """Serializable fault injector; execute the failure inside the save worker."""
+
+    def _write_data(self, *args, **kwargs):
+        result = super()._write_data(*args, **kwargs)
+        if dist.get_rank() == 0:
+            raise OSError("injected rank-zero failure after writing shards")
+        return result
 
 
 def runtime(cfg, topology, *, seed=0, learning_rate=LR):
@@ -60,15 +89,38 @@ def runtime(cfg, topology, *, seed=0, learning_rate=LR):
     return model, optimizer, scheduler
 
 
-def checkpoint_manager(model, optimizer, scheduler, folder):
-    return DistributedCheckpointManager(
-        CheckpointConfig(enable=True, interval=1, keep_latest_k=0),
+def checkpoint_manager(
+    model,
+    optimizer,
+    scheduler,
+    folder,
+    *,
+    async_mode="disabled",
+    process_save_cpu=False,
+):
+    manager = DistributedCheckpointManager(
+        CheckpointConfig(
+            enable=True,
+            interval=1,
+            keep_latest_k=0,
+            async_mode="async_with_pinned_mem" if process_save_cpu else async_mode,
+        ),
         model_parts=[model],
         optimizer=optimizer,
         lr_scheduler=scheduler,
         states={},
         folder=folder,
     )
+    if process_save_cpu:
+        manager.stager = DefaultStager(
+            StagingOptions(
+                use_pinned_memory=False,
+                use_shared_memory=True,
+                use_async_staging=False,
+                use_non_blocking_copy=False,
+            )
+        )
+    return manager
 
 
 def update(model, optimizer, scheduler, step, rank):
@@ -98,7 +150,44 @@ def full_optimizer_state(optimizer):
     return {key: _full(value) for key, value in optimizer.state_dict().items()}
 
 
-def check_case(mode, resume_mode, implementation, root, rank):
+def fail_same_step_rewrite(cfg, topology, folder, rank, *, process_save_cpu=False):
+    replacement = runtime(cfg, topology, seed=987, learning_rate=0.7)
+    manager = checkpoint_manager(
+        *replacement, folder, async_mode="async", process_save_cpu=process_save_cpu
+    )
+    write_data = FileSystemWriter._write_data
+
+    def fail_after_writing(self, *args, **kwargs):
+        result = write_data(self, *args, **kwargs)
+        if rank == 0:
+            raise OSError("injected rank-zero failure after writing shards")
+        return result
+
+    try:
+        injection = (
+            patch.object(
+                distributed_checkpoint,
+                "GenerationFileSystemWriter",
+                _FailAfterWritingGenerationWriter,
+            )
+            if process_save_cpu
+            else patch.object(FileSystemWriter, "_write_data", fail_after_writing)
+        )
+        with injection:
+            try:
+                manager.save(RESUME_STEP)
+                manager.maybe_wait_for_saving()
+            except CheckpointException as error:
+                assert "injected rank-zero failure" in str(error)
+            else:
+                raise AssertionError("The failed rewrite must fail on every rank")
+    finally:
+        manager.close()
+
+
+def check_case(
+    mode, resume_mode, implementation, root, rank, *, process_save_cpu=False
+):
     cfg, topology = topology_for(mode, implementation)
     model, optimizer, scheduler = runtime(cfg, topology)
     reference = _build_model()
@@ -130,11 +219,17 @@ def check_case(mode, resume_mode, implementation, root, rank):
                 resumed_gradients, gradients, rtol=0, atol=resume_atol
             )
         if step + 1 == RESUME_STEP:
-            manager = checkpoint_manager(model, optimizer, scheduler, folder)
+            manager = checkpoint_manager(
+                model, optimizer, scheduler, folder, process_save_cpu=process_save_cpu
+            )
             try:
                 assert manager.save(RESUME_STEP)
             finally:
                 manager.close()
+            dist.barrier()
+            fail_same_step_rewrite(
+                cfg, topology, folder, rank, process_save_cpu=process_save_cpu
+            )
             dist.barrier()
             # Different weights and base LR make a missing restore observable.
             resume_cfg, resume_topology = topology_for(resume_mode, implementation)
@@ -193,6 +288,20 @@ def check_case(mode, resume_mode, implementation, root, rank):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    location = parser.add_mutually_exclusive_group()
+    location.add_argument(
+        "--fsspec", action="store_true", help="Use file:// checkpoint URIs"
+    )
+    location.add_argument(
+        "--checkpoint-root", help="Use a unique subfolder under this checkpoint root"
+    )
+    parser.add_argument(
+        "--process-save-cpu",
+        action="store_true",
+        help="Exercise the save subprocess with shared CPU staging (no device pinning)",
+    )
+    args = parser.parse_args()
     dist.init_process_group("gloo")
     try:
         assert dist.get_world_size() == 2
@@ -201,10 +310,21 @@ def main():
         with context as root:
             paths = [root]
             dist.broadcast_object_list(paths, src=0)
+            checkpoint_root = Path(paths[0]).as_uri() if args.fsspec else paths[0]
+            if args.checkpoint_root:
+                subfolder = f"equivalence-{Path(paths[0]).name}"
+                checkpoint_root = f"{args.checkpoint_root.rstrip('/')}/{subfolder}"
             for mode in ("shard", "ddp"):
                 for resume_mode in ("shard", "ddp"):
                     for implementation in ("native", "custom"):
-                        check_case(mode, resume_mode, implementation, paths[0], rank)
+                        check_case(
+                            mode,
+                            resume_mode,
+                            implementation,
+                            checkpoint_root,
+                            rank,
+                            process_save_cpu=args.process_save_cpu,
+                        )
             dist.barrier()
     finally:
         dist.destroy_process_group()

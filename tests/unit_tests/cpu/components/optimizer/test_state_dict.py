@@ -402,3 +402,45 @@ def test_adam_restore_rejects_invalid_step_before_changing_state(
     optimizer.step()
     assert original_state["step"].item() == 1
     assert torch.isfinite(parameter).all()
+
+
+@pytest.mark.parametrize("failure", ["allocation", "post_hook"])
+def test_failed_adam_materialization_discards_partial_state_and_can_retry(
+    monkeypatch, failure
+):
+    parameter = torch.nn.Parameter(torch.ones(2))
+    gradient = torch.ones_like(parameter)
+    parameter.grad = gradient
+    optimizer = torch.optim.AdamW([parameter], lr=0.1)
+    before = parameter.detach().clone()
+    original_zeros_like = torch.zeros_like
+    calls = 0
+
+    def allocate(value, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("partial state failed")
+        return original_zeros_like(value, *args, **kwargs)
+
+    def post_hook(*args, **kwargs):
+        raise RuntimeError("partial state failed")
+
+    handle = None
+    if failure == "allocation":
+        monkeypatch.setattr(torch, "zeros_like", allocate)
+    else:
+        handle = optimizer.register_step_post_hook(post_hook)
+    with pytest.raises(RuntimeError, match="partial state failed"):
+        init_optim_state(optimizer)
+    assert not optimizer.state
+    assert parameter.grad is gradient
+    assert optimizer.param_groups[0]["lr"] == 0.1
+    torch.testing.assert_close(parameter, before, rtol=0, atol=0)
+    monkeypatch.undo()
+    if handle is not None:
+        handle.remove()
+    init_optim_state(optimizer)
+    assert optimizer.state[parameter]["step"].item() == 0
+    optimizer.step()
+    assert optimizer.state[parameter]["step"].item() == 1

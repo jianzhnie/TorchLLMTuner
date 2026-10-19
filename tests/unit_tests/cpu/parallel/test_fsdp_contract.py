@@ -313,9 +313,283 @@ def test_fsdp_strategy_selects_pyTorch_214_compatible_adapter() -> None:
     assert isinstance(get_fsdp_strategy("custom"), CustomFSDPStrategy)
 
 
-def test_fine_grained_adapter_rejects_a_distinct_hook_target() -> None:
-    with pytest.raises(ValueError, match="separate hook_module"):
+def test_native_strategy_does_not_load_the_custom_private_engine():
+    import subprocess
+    import sys
+    from textwrap import dedent
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            dedent(
+                """
+                import importlib.abc
+                import sys
+
+                import torch.nn as nn
+                from torch.distributed.fsdp import fully_shard
+
+                class MissingCustomEngine(importlib.abc.MetaPathFinder):
+                    def find_spec(self, fullname, path=None, target=None):
+                        if fullname.endswith('.fine_grained_state'):
+                            raise ImportError('missing custom private API')
+
+                sys.meta_path.insert(0, MissingCustomEngine())
+                from llmtuner.errors import EnvironmentUnsupportedError
+                from llmtuner.parallel.fully_shard_parallel.fine_grained import (
+                    get_fsdp_strategy,
+                )
+
+                assert get_fsdp_strategy('native').get_fully_shard_fn() is fully_shard
+                assert not any(x.endswith('.fine_grained_state') for x in sys.modules)
+                custom = get_fsdp_strategy('custom').get_fully_shard_fn()
+                try:
+                    custom(nn.Linear(2, 2))
+                except EnvironmentUnsupportedError as error:
+                    assert 'PyTorch 2.14' in str(error)
+                    assert "fsdp_implementation='native'" in str(error)
+                    assert isinstance(error.__cause__, ImportError)
+                else:
+                    raise AssertionError('missing custom engine was ignored')
+                """
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_fine_grained_rejects_an_unrelated_hook_target() -> None:
+    with pytest.raises(ValueError, match="hook_module must contain"):
         fully_shard_fine_grained(nn.Linear(2, 2), hook_module=nn.Identity())
+
+
+def test_custom_contexts_share_streams_without_allocating_unused_streams(monkeypatch):
+    require_env("fine_grained_fsdp")
+    from types import SimpleNamespace
+    from weakref import ref
+
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPCommContext
+
+    from llmtuner.parallel.fully_shard_parallel.fine_grained_state import (
+        FineGrainedFSDPState,
+    )
+
+    owner = nn.Identity()
+    states = [FineGrainedFSDPState() for _ in range(3)]
+    for index, state in enumerate(states):
+        state.hook_module = ref(owner)
+        state._device = torch.device("cpu")
+        state._fsdp_param_groups = [
+            SimpleNamespace(reduce_scatter_max_input_buffers=index + 1)
+        ]
+    states[0]._state_ctx.all_states = states
+    calls = []
+
+    def init(context, device):
+        calls.append(context)
+        context.device_handle = object()
+        for name in (
+            "all_gather_copy_in_stream",
+            "all_gather_stream",
+            "reduce_scatter_stream",
+            "all_reduce_stream",
+        ):
+            setattr(context, name, object())
+        context.all_gather_state = None
+        context.reduce_scatter_states = []
+        context._last_post_reduce_events = {}
+        context.post_forward_order = []
+
+    monkeypatch.setattr(FSDPCommContext, "lazy_init", init)
+    states[0]._init_shared_state()
+    contexts = states[0].communication_contexts
+    assert len(calls) == 1
+    assert len(contexts) == 3
+    for index, context in enumerate(contexts):
+        assert context.all_gather_stream is contexts[0].all_gather_stream
+        assert context.device_handle is contexts[0].device_handle
+        assert context.post_forward_order is contexts[0].post_forward_order
+        assert context.reduce_scatter_max_input_buffers == index + 1
+    assert len({id(c.reduce_scatter_states) for c in contexts}) == 3
+    assert len({id(c._last_post_reduce_events) for c in contexts}) == 3
+
+
+@pytest.mark.parametrize("forward", [False, True])
+def test_fine_grained_all_gather_waits_before_releasing_foreign_hook_buffers(
+    monkeypatch, forward
+):
+    require_env("fine_grained_fsdp")
+    from types import SimpleNamespace
+    from weakref import ref
+
+    from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
+        AllGatherState,
+        FSDPParamGroup,
+    )
+
+    from llmtuner.parallel.fully_shard_parallel.fine_grained_param_group import (
+        FineGrainedFSDPParamGroup,
+        HookAllGatherState,
+    )
+
+    owner, other_owner = nn.Identity(), nn.Identity()
+    event, new_event = object(), object()
+    payload = torch.ones(1)
+    weak_payload = ref(payload)
+    foreign = SimpleNamespace(
+        all_gather_state=HookAllGatherState(
+            SimpleNamespace(buffer=payload), event, ref(other_owner)
+        )
+    )
+    del payload
+    same_state = HookAllGatherState(object(), object(), ref(owner))
+    same = SimpleNamespace(all_gather_state=same_state)
+    local = SimpleNamespace(all_gather_state=None)
+    group = object.__new__(FineGrainedFSDPParamGroup)
+    group.hook_module = ref(owner)
+    group.comm_ctx = local
+    group.communication_contexts = [local, same, foreign]
+    group._all_gather_result = object()
+    group._training_state = (
+        TrainingState.FORWARD if forward else TrainingState.PRE_BACKWARD
+    )
+    waits = []
+
+    def wait(waited_event):
+        assert weak_payload() is not None, "freed the buffer before its event wait"
+        waits.append(waited_event)
+
+    def native_wait(self):
+        assert (foreign.all_gather_state is None) == forward
+        assert same.all_gather_state is same_state
+        self.comm_ctx.all_gather_state = AllGatherState(object(), new_event)
+
+    monkeypatch.setattr(group, "_wait_all_gather_streams_on_event", wait)
+    monkeypatch.setattr(FSDPParamGroup, "wait_for_unshard", native_wait)
+    group.wait_for_unshard()
+    assert waits == ([event] if forward else [])
+    assert (weak_payload() is None) == forward
+    assert local.all_gather_state.hook_module() is owner
+    assert local.all_gather_state.event is new_event
+
+
+@pytest.mark.parametrize("reduce_grads", [False, True])
+def test_fine_grained_reduce_scatter_preserves_same_hook_and_tags_new_buffers(
+    monkeypatch, reduce_grads
+):
+    require_env("fine_grained_fsdp")
+    from types import SimpleNamespace
+    from weakref import ref
+
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
+        FSDPParamGroup,
+        ReduceScatterState,
+    )
+
+    from llmtuner.parallel.fully_shard_parallel.fine_grained_param_group import (
+        FineGrainedFSDPParamGroup,
+        HookReduceScatterState,
+    )
+
+    owner, other_owner = nn.Identity(), nn.Identity()
+    event, new_event = object(), object()
+    payload = torch.ones(1)
+    weak_payload = ref(payload)
+    same_state = HookReduceScatterState(torch.ones(1), None, ref(owner))
+    foreign = SimpleNamespace(
+        reduce_scatter_states=[
+            same_state,
+            HookReduceScatterState(payload, event, ref(other_owner)),
+            HookReduceScatterState(torch.ones(1), None, ref(other_owner)),
+        ]
+    )
+    del payload
+    local = SimpleNamespace(reduce_scatter_states=[])
+    group = object.__new__(FineGrainedFSDPParamGroup)
+    group.hook_module = ref(owner)
+    group.comm_ctx = local
+    group.communication_contexts = [local, foreign]
+    group.reduce_grads = reduce_grads
+    waits = []
+
+    def wait(waited_event):
+        assert weak_payload() is not None, "freed the buffer before its event wait"
+        waits.append(waited_event)
+
+    group.device_handle = SimpleNamespace(
+        current_stream=lambda: SimpleNamespace(wait_event=wait)
+    )
+
+    def native_reduce(self):
+        assert len(foreign.reduce_scatter_states) == (1 if reduce_grads else 3)
+        if reduce_grads:
+            self.comm_ctx.reduce_scatter_states.append(
+                ReduceScatterState(torch.ones(1), new_event)
+            )
+
+    monkeypatch.setattr(FSDPParamGroup, "post_backward", native_reduce)
+    group.post_backward()
+    assert waits == ([event] if reduce_grads else [])
+    assert foreign.reduce_scatter_states[0] is same_state
+    assert (weak_payload() is None) == reduce_grads
+    if reduce_grads:
+        assert local.reduce_scatter_states[0].hook_module() is owner
+        assert local.reduce_scatter_states[0].event is new_event
+    else:
+        assert local.reduce_scatter_states == []
+
+
+@pytest.mark.parametrize("shared_weight", [False, True])
+def test_custom_pattern_accepts_an_ancestor_hook_for_all_managed_units(
+    monkeypatch, shared_weight
+):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    if shared_weight:
+        model[1].weight = model[0].weight
+    calls = []
+
+    def shard(module, **options):
+        calls.append((module, options))
+
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda implementation: SimpleNamespace(get_fully_shard_fn=lambda: shard),
+    )
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *args, **kwargs: None)
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_implementation="custom",
+            fsdp_apply_modules={
+                "0": {"hook_module": model},
+                "1": {"hook_module": model},
+            },
+        )
+    )
+    plan.apply_fsdp_by_pattern(
+        model,
+        dp_mesh=object(),
+        cfg=cfg,
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+    )
+    assert calls[-1][0] is model
+    units = calls[:-1]
+    assert len(units) == (1 if shared_weight else 2)
+    assert all(options["hook_module"] is model for _, options in units)
+    if shared_weight:
+        assert units[0][0] == [model[0], model[1]]
+    else:
+        assert {module for module, _ in units} == {model[0], model[1]}
 
 
 @pytest.mark.parametrize("implementation", ["native", "custom"])
@@ -346,6 +620,204 @@ def test_invalid_pattern_override_rejected_before_any_sharding(
             param_dtype=torch.float32,
             reduce_dtype=torch.float32,
         )
+
+
+@pytest.mark.parametrize("implementation", ["native", "custom"])
+@pytest.mark.parametrize("value", ["true", 0, -1, 3, 8])
+def test_invalid_pattern_reshard_value_rejected_before_any_sharding(
+    monkeypatch, implementation, value
+):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    calls = []
+    mesh = SimpleNamespace(ndim=2, size=lambda dim: (2, 4)[dim])
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: lambda *a, **kw: calls.append(a)
+        ),
+    )
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *a, **kw: None)
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_implementation=implementation,
+            fsdp_apply_modules={"0": {}, "1": {"reshard_after_forward": value}},
+        )
+    )
+    with pytest.raises(ValueError, match="reshard_after_forward"):
+        plan.apply_fsdp_by_pattern(
+            model,
+            dp_mesh=mesh,
+            cfg=cfg,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("value", [None, True, False, 1, 2, 4])
+def test_pattern_reshard_policy_uses_unit_mesh(monkeypatch, value):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    calls = []
+    unit_mesh = SimpleNamespace(ndim=2, size=lambda dim: (2, 4)[dim])
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: lambda module, **kw: calls.append(kw)
+        ),
+    )
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *a, **kw: None)
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={
+                "0": {},
+                "1": {"mesh": unit_mesh, "reshard_after_forward": value},
+            }
+        )
+    )
+    plan.apply_fsdp_by_pattern(
+        model,
+        dp_mesh=object(),
+        cfg=cfg,
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+    )
+    assert len(calls) == 3
+    assert calls[1]["mesh"] is unit_mesh
+    assert calls[1]["reshard_after_forward"] is value
+
+
+@pytest.mark.parametrize("implementation", ["native", "custom"])
+def test_pattern_integer_reshard_with_spmd_rejected_before_sharding(
+    monkeypatch, implementation
+):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    calls = []
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: lambda *a, **kw: calls.append(a)
+        ),
+    )
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_implementation=implementation,
+            fsdp_apply_modules={
+                "0": {},
+                "1": {
+                    "reshard_after_forward": 1,
+                    "dp_mesh_dims": SimpleNamespace(shard=("dp_shard",)),
+                },
+            },
+        )
+    )
+    with pytest.raises(NotImplementedError, match="dp_mesh_dims"):
+        plan.apply_fsdp_by_pattern(
+            nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)),
+            dp_mesh=object(),
+            cfg=cfg,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("implementation", ["native", "custom"])
+@pytest.mark.parametrize(
+    "override,value",
+    [
+        ("mp_policy", object()),
+        ("offload_policy", object()),
+        ("shard_placement_fn", 1),
+        ("ignored_params", {"weight"}),
+    ],
+)
+def test_invalid_pattern_policy_rejected_before_sharding(
+    monkeypatch, implementation, override, value
+):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    calls = []
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: lambda *a, **kw: calls.append(a)
+        ),
+    )
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *a, **kw: None)
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_implementation=implementation,
+            fsdp_apply_modules={"0": {}, "1": {override: value}},
+        )
+    )
+    with pytest.raises(TypeError, match=override):
+        plan.apply_fsdp_by_pattern(
+            nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)),
+            dp_mesh=object(),
+            cfg=cfg,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("policy", ["mp_policy", "offload_policy"])
+@pytest.mark.parametrize("implementation", ["native", "custom"])
+def test_pattern_none_policy_follows_engine_contract(
+    monkeypatch, policy, implementation
+):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    calls = []
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: lambda module, **kw: calls.append(kw)
+        ),
+    )
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *a, **kw: None)
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_implementation=implementation, fsdp_apply_modules={"0": {policy: None}}
+        )
+    )
+
+    def apply_pattern():
+        plan.apply_fsdp_by_pattern(
+            nn.Sequential(nn.Linear(2, 2)),
+            dp_mesh=object(),
+            cfg=cfg,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+        )
+
+    if implementation == "native":
+        with pytest.raises(TypeError, match=policy):
+            apply_pattern()
+        assert calls == []
+    else:
+        apply_pattern()
+        assert calls[0][policy] is None
 
 
 @pytest.mark.parametrize("container", [nn.ModuleList, nn.ModuleDict])
@@ -383,7 +855,7 @@ def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
 
     model = nn.Sequential(nn.Linear(2, 2))
     calls = []
-    override_policy = object()
+    override_policy = apply.MixedPrecisionPolicy(param_dtype=torch.float32)
     monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *args, **kwargs: None)
     cfg = ParallelConfig(
         fsdp_config=FSDPConfig(fsdp_apply_modules={"0": {"mp_policy": override_policy}})
@@ -409,6 +881,106 @@ def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
     assert calls[0][1]["mp_policy"] is override_policy
     assert calls[1][0] is model
     assert calls[1][1]["mp_policy"] is not override_policy
+
+
+def test_pipeline_patterns_rebind_copied_hooks_and_excluded_parameters():
+    import copy
+
+    from llmtuner.parallel.fully_shard_parallel.plan import (
+        resolve_pipeline_fsdp_configs,
+    )
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    first, second = copy.deepcopy(model), copy.deepcopy(model)
+    first._modules.pop("1")
+    second._modules.pop("0")
+    mesh = object()
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_implementation="custom",
+            fsdp_apply_modules={
+                "0": {
+                    "hook_module": model,
+                    "mesh": mesh,
+                    "ignored_params": {model[0].bias},
+                }
+            },
+        )
+    )
+    configs = resolve_pipeline_fsdp_configs(model, [first, second], cfg)
+    options = configs[0].fsdp_config.fsdp_apply_modules["0"]
+    assert options["hook_module"] is first
+    assert options["mesh"] is mesh
+    assert options["ignored_params"] == {first[0].bias}
+    assert configs[1].fsdp_config.fsdp_apply_modules == {"": {}}
+    from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
+
+    _, units, _ = _resolve_pattern_units(second, configs[1])
+    assert units == {"": {}}
+    assert cfg.fsdp_config.fsdp_apply_modules["0"]["hook_module"] is model
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+def test_custom_fsdp_recompute_enters_backward_lifecycle(monkeypatch, recompute):
+    from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
+    from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
+
+    from llmtuner.models.common.aux_loss import in_checkpoint_recompute
+    from llmtuner.parallel.fully_shard_parallel.fine_grained_state import (
+        FineGrainedFSDPState,
+    )
+
+    state = FineGrainedFSDPState()
+    state._training_state = TrainingState.IDLE
+    seen = []
+
+    def pre_forward(self, module, args, kwargs):
+        seen.append(self._training_state)
+        return args, kwargs
+
+    monkeypatch.setattr(FSDPState, "_pre_forward", pre_forward)
+    token = in_checkpoint_recompute.set(recompute)
+    try:
+        assert state._pre_forward(nn.Identity(), (), {}) == ((), {})
+    finally:
+        in_checkpoint_recompute.reset(token)
+    assert seen == [TrainingState.PRE_BACKWARD if recompute else TrainingState.IDLE]
+
+
+def test_pipeline_patterns_reject_globally_unmatched_units():
+    from llmtuner.parallel.fully_shard_parallel.plan import (
+        resolve_pipeline_fsdp_configs,
+    )
+
+    cfg = ParallelConfig(fsdp_config=FSDPConfig(fsdp_apply_modules={"missing": {}}))
+    with pytest.raises(ValueError, match="matched no module"):
+        resolve_pipeline_fsdp_configs(nn.Sequential(nn.Linear(2, 2)), [], cfg)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_fsdp_patterns_accept_logical_paths_after_checkpoint_and_compile(compiled):
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+    )
+
+    from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
+
+    model = nn.Sequential(nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)))
+    first = model[0][0]
+    ignored = model[0][1]
+    model[0] = checkpoint_wrapper(model[0])
+    block = model[0]
+    if compiled:
+        model = torch.compile(model, backend="eager")
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"0": {}, "0.0": {}},
+            fsdp_ignored_modules=["0.1"],
+        )
+    )
+    modules, units, excluded = _resolve_pattern_units(model, cfg)
+    assert {modules[name] for name in units} == {block, first}
+    assert excluded == set(ignored.parameters())
 
 
 @pytest.mark.parametrize("unit_ignored", [None, set()])
@@ -568,3 +1140,248 @@ def test_pattern_fsdp_with_ep_requires_sparse_mesh_before_mutation(monkeypatch):
             reduce_dtype=torch.float32,
         )
     assert calls == []
+
+
+def test_shared_pattern_units_reject_conflicting_policies_before_sharding(monkeypatch):
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    model[1].weight = model[0].weight
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={
+                "0": {"reshard_after_forward": True},
+                "1": {"reshard_after_forward": False},
+            }
+        )
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("conflicting shared units mutated the model")
+
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: type(
+            "Strategy", (), {"get_fully_shard_fn": staticmethod(lambda: unexpected)}
+        )(),
+    )
+    with pytest.raises(ValueError, match="share parameters.*conflicting"):
+        plan.apply_fsdp_by_pattern(
+            model,
+            dp_mesh=object(),
+            cfg=cfg,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+        )
+
+
+def test_shared_pattern_dependency_cycle_merges_states(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.ModuleDict(
+        {"a": nn.Sequential(nn.Linear(2, 2)), "b": nn.Sequential(nn.Linear(2, 2))}
+    )
+    # Parents own parameters used in the other branch's selected child.
+    model["a"].register_parameter("shared", model["b"][0].weight)
+    model["b"].register_parameter("shared", model["a"][0].weight)
+    root = nn.Sequential(model)
+    calls = []
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={name: {} for name in ("0.a", "0.a.0", "0.b", "0.b.0")}
+        )
+    )
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: lambda module, **kwargs: calls.append(module)
+        ),
+    )
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *args, **kwargs: None)
+    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda model: None)
+    plan.apply_fsdp_by_pattern(
+        root,
+        dp_mesh=object(),
+        cfg=cfg,
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+    )
+    assert calls == [[model["a"], model["a"][0], model["b"], model["b"][0]], root]
+
+
+@pytest.mark.parametrize("excluded", [None, set()])
+def test_shared_pattern_units_compare_effective_exclusions(monkeypatch, excluded):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    model[1].weight = model[0].weight
+    calls = []
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"0": {"ignored_params": excluded}, "1": {}}
+        )
+    )
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: lambda module, **kwargs: calls.append(module)
+        ),
+    )
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *args, **kwargs: None)
+    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda model: None)
+    plan.apply_fsdp_by_pattern(
+        model,
+        dp_mesh=object(),
+        cfg=cfg,
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+    )
+    assert calls == [[model[0], model[1]], model]
+
+
+def test_fsdp_ignored_pattern_resolves_shared_module_alias():
+    from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
+
+    shared = nn.Linear(2, 2)
+    model = nn.ModuleDict({"first": shared, "alias": shared, "kept": nn.Linear(2, 2)})
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"kept": {}}, fsdp_ignored_modules=["alias"]
+        )
+    )
+    _, units, ignored = _resolve_pattern_units(model, cfg)
+    assert units == {"kept": {}}
+    assert ignored == set(shared.parameters())
+
+
+def test_fsdp_apply_patterns_normalize_shared_module_aliases():
+    from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
+
+    shared = nn.Linear(2, 2)
+    model = nn.Sequential(shared, shared)
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"1": {"reshard_after_forward": False}, "*": {}}
+        )
+    )
+    modules, units, ignored = _resolve_pattern_units(model, cfg)
+    assert modules["0"] is shared
+    assert units == {"0": {"reshard_after_forward": False}}
+    assert ignored == set()
+
+
+def test_fsdp_prefetch_windows_count_shared_states_once():
+    from types import SimpleNamespace
+
+    from torch.distributed.fsdp import FSDPModule
+
+    class Unit(FSDPModule, nn.Linear):
+        def __new__(cls, state):
+            return object.__new__(cls)
+
+        def __init__(self, state):
+            nn.Linear.__init__(self, 2, 2)
+            self.state = state
+
+        def _get_fsdp_state(self):
+            return self.state
+
+    shared = SimpleNamespace()
+    first = Unit(shared)
+    middle = Unit(SimpleNamespace())
+    last = Unit(shared)
+    set_fsdp_prefetch_windows([first, middle, last], forward_count=1, backward_count=1)
+    assert shared._states_to_forward_prefetch == [middle.state]
+    assert shared._states_to_backward_prefetch == []
+    assert middle.state._states_to_forward_prefetch == []
+    assert middle.state._states_to_backward_prefetch == [shared]
+
+
+@pytest.mark.parametrize("base_degree, unit_degree", [(2, 2), (1, 2), (2, 1)])
+def test_pattern_fsdp_without_ep_shards_expert_features_when_degree_exceeds_experts(
+    monkeypatch,
+    base_degree,
+    unit_degree,
+):
+    from types import SimpleNamespace
+
+    from torch.distributed.tensor import Shard
+
+    from llmtuner.models.common.moe.experts import GroupedExperts
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(GroupedExperts(4, 8, 1, use_grouped_mm=False))
+    calls = []
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: lambda module, **kwargs: calls.append(kwargs)
+        ),
+    )
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *a, **kw: None)
+    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda _: None)
+    mesh = SimpleNamespace(size=lambda: base_degree, mesh_dim_names=("dp_shard",))
+    unit_mesh = SimpleNamespace(size=lambda: unit_degree, mesh_dim_names=("dp_shard",))
+    plan.apply_fsdp_by_pattern(
+        model,
+        dp_mesh=mesh,
+        cfg=ParallelConfig(
+            fsdp_config=FSDPConfig(fsdp_apply_modules={"0": {"mesh": unit_mesh}})
+        ),
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+    )
+    placement = calls[0]["shard_placement_fn"]
+    for parameter in model[0].parameters():
+        assert placement(parameter) == (Shard(1) if unit_degree > 1 else None)
+    assert placement(nn.Parameter(torch.ones(4, 4))) is None
+
+
+@pytest.mark.parametrize("layout", ["grouped", "managed", "nested"])
+@pytest.mark.parametrize("scope", ["dense", "all"])
+def test_symm_mem_selects_states_by_actual_moe_ownership(layout, scope):
+    calls = []
+
+    class Unit(nn.Module, apply.FSDPModule):
+        def __new__(cls, *args, **kwargs):
+            return object.__new__(cls)
+
+        def __init__(self, state, *, moe=False):
+            super().__init__()
+            self.state = state
+            self.moe_enabled = moe
+
+        def _get_fsdp_state(self):
+            return self.state
+
+        def set_force_sum_reduction_for_comms(self, value):
+            assert value is True
+
+        def set_symm_mem_for_comm(self):
+            calls.append(self.state)
+
+    dense_state, expert_state = object(), object()
+    if layout == "grouped":
+        model = nn.ModuleList(
+            [Unit(expert_state), Unit(expert_state, moe=True), Unit(dense_state)]
+        )
+    elif layout == "managed":
+        model = nn.ModuleList([Unit(expert_state), Unit(dense_state)])
+        model[0].child = nn.Identity()
+        model[0].child.moe_enabled = True
+    else:
+        model = Unit(dense_state)
+        model.child = Unit(expert_state, moe=True)
+
+    apply.enable_fsdp_symm_mem(model, scope)
+    expected = {dense_state} if scope == "dense" else {dense_state, expert_state}
+    assert set(calls) == expected
+    assert len(calls) == len(expected)

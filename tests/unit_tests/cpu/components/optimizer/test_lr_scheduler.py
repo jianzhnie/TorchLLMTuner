@@ -433,3 +433,23 @@ def test_completed_schedule_rejects_extra_step_without_mutation(decay_ratio):
         scheduler.step()
     assert scheduler.state_dict() == saved
     assert optimizer.param_groups[0]["lr"] == learning_rate
+
+
+def test_container_step_rejects_divergent_progress_before_changing_rates():
+    optimizers = [_optimizer(), _optimizer()]
+    container = LRSchedulersContainer(
+        optimizers, lr_lambda=lambda step: 1.0 / (step + 1), total_steps=10
+    )
+    optimizers[0].step()
+    container.schedulers[0].step()
+    before = [scheduler.state_dict() for scheduler in container]
+    rates = [optimizer.param_groups[0]["lr"] for optimizer in optimizers]
+    with pytest.raises(ValueError, match="different last_epoch"):
+        container.step()
+    assert [scheduler.state_dict() for scheduler in container] == before
+    assert [optimizer.param_groups[0]["lr"] for optimizer in optimizers] == rates
+    container.load_state_dict({"last_epoch": 1})
+    for optimizer in optimizers:
+        optimizer.step()
+    container.step()
+    assert container.state_dict() == {"last_epoch": 2}

@@ -124,6 +124,32 @@ def test_meta_materialization_preserves_real_nonpersistent_buffers() -> None:
     assert not model.weight.is_meta
 
 
+@pytest.mark.parametrize("external_alias", [False, True])
+def test_meta_materialization_restores_alias_of_reconstructed_rope_buffer(
+    external_alias,
+) -> None:
+    class RotaryModule(torch.nn.Module):
+        def __init__(self, config, device=None):
+            super().__init__()
+            self.config = config
+            self.register_buffer(
+                "inv_freq", torch.arange(4, device=device), persistent=False
+            )
+            self.register_buffer("cache_alias", self.inv_freq, persistent=False)
+
+    rotary = RotaryModule({}, device="meta")
+    model = rotary
+    if external_alias:
+        model = torch.nn.Module()
+        model.register_buffer("external_alias", rotary.inv_freq, persistent=False)
+        model.add_module("rotary", rotary)
+    materialize_meta_model(model, torch.device("cpu"))
+    assert rotary.cache_alias is rotary.inv_freq
+    if external_alias:
+        assert model.external_alias is rotary.inv_freq
+    torch.testing.assert_close(rotary.inv_freq, torch.arange(4))
+
+
 def test_unknown_meta_buffer_is_rejected_before_materialization() -> None:
     with torch.device("meta"):
         model = torch.nn.Linear(3, 2)
@@ -822,3 +848,172 @@ def test_model_class_resolution_skips_non_model_attributes(architecture):
 
     config = LlamaConfig(architectures=[architecture])
     assert resolve_model_class(config) is LlamaForCausalLM
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "pixel_values",
+        "pixel_values_videos",
+        "grid_thw",
+        "grid_thw_videos",
+        "mrope_positions",
+    ],
+)
+def test_text_decoder_rejects_unconsumed_media_inputs(model, field):
+    from llmtuner.errors import UnsupportedCombinationError
+
+    batch = {
+        "input": torch.tensor([1, 2, 3]),
+        "labels": torch.tensor([2, 3, 4]),
+        field: torch.ones(1),
+    }
+    with pytest.raises(UnsupportedCombinationError, match=field):
+        model.preprocess_inputs(batch, parallel_dims=None)
+
+
+def test_text_decoder_accepts_absent_media_fields(model):
+    tokens = torch.tensor([1, 2, 3])
+    batch = {
+        "input": tokens,
+        "labels": tokens + 1,
+        "pixel_values": None,
+        "pixel_values_videos": None,
+        "grid_thw": None,
+        "grid_thw_videos": None,
+        "special_tokens": {"image_id": 50},
+    }
+    inputs, labels, kwargs = model.preprocess_inputs(batch, parallel_dims=None)
+    torch.testing.assert_close(inputs, tokens)
+    torch.testing.assert_close(labels, tokens + 1)
+    assert kwargs == {}
+
+
+@pytest.mark.parametrize("model_type", ["qwen3", "qwen3_moe"])
+def test_residual_norm_boundary_preserves_identity_state_and_hf_numerics(model_type):
+    import copy
+    from types import SimpleNamespace
+
+    from torch import nn
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
+
+    from llmtuner.models.hf.model_setup import stabilize_residual_norm_gradients
+
+    norm_type = Qwen3RMSNorm if model_type == "qwen3" else Qwen3MoeRMSNorm
+    layer = nn.Module()
+    layer.input_layernorm = norm_type(8, eps=1e-6)
+    layer.post_attention_layernorm = norm_type(8, eps=1e-6)
+    native = copy.deepcopy(layer.input_layernorm)
+    model = nn.Module()
+    model.config = SimpleNamespace(model_type=model_type)
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([layer])
+    parameters = dict(model.named_parameters())
+    keys = set(model.state_dict())
+    stabilize_residual_norm_gradients(model)
+    stabilize_residual_norm_gradients(model)
+    assert set(model.state_dict()) == keys
+    assert all(
+        dict(model.named_parameters())[name] is p for name, p in parameters.items()
+    )
+    assert len(layer.input_layernorm._forward_pre_hooks) == 1
+    assert type(layer.input_layernorm) is norm_type
+    # Non-contiguous inputs and keyword calls exercise the actual HF signature.
+    inputs = torch.randn(8, 5).t().requires_grad_()
+    reference_inputs = inputs.detach().clone().requires_grad_()
+    actual = layer.input_layernorm(hidden_states=inputs)
+    expected = native(reference_inputs)
+    assert torch.equal(actual, expected)
+    actual.square().sum().backward()
+    expected.square().sum().backward()
+    torch.testing.assert_close(inputs.grad, reference_inputs.grad)
+    torch.testing.assert_close(layer.input_layernorm.weight.grad, native.weight.grad)
+    copied = copy.deepcopy(model)
+    assert torch.equal(copied.model.layers[0].input_layernorm(inputs), actual)
+
+
+@pytest.mark.parametrize("backend", ["native", "aten"])
+def test_norm_backend_reaches_constructed_model(backend):
+    from llmtuner.config.model_config import ModelConfig
+    from llmtuner.models.hf.normalization import forward_aten_rms_norm
+
+    cfg = LLMTunerConfig(
+        model=ModelConfig(
+            model_name_or_path="qwen3",
+            norm_backend=backend,
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+    )
+    config = build_model_config_for(cfg)
+    assert config.norm_backend == backend
+    model = HFTransformerModel(config).eval()
+    norm = model.model.model.layers[0].input_layernorm
+    assert (norm.forward.__func__ is forward_aten_rms_norm) == (backend == "aten")
+    assert torch.isfinite(model(torch.arange(8))).all()
+
+
+def test_aten_norm_backend_builds_with_stable_state_and_compiles(model):
+    import copy
+
+    from llmtuner.models.hf.model_setup import stabilize_residual_norm_gradients
+
+    reference = copy.deepcopy(model)
+    keys = set(model.state_dict())
+    params = dict(model.named_parameters())
+    model.model.config.norm_backend = "aten"
+    stabilize_residual_norm_gradients(model.model)
+    assert set(model.state_dict()) == keys
+    assert all(dict(model.named_parameters())[name] is p for name, p in params.items())
+    tokens = torch.arange(16)
+    actual = model(tokens)
+    assert torch.equal(actual, reference(tokens))
+    compiled = torch.compile(model, backend="aot_eager")
+    torch.testing.assert_close(compiled(tokens), actual, rtol=0, atol=0)
+    copied = copy.deepcopy(model)
+    assert torch.equal(copied(tokens), actual)
+
+
+def test_aten_norm_backend_rejects_unsupported_model():
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from llmtuner.models.hf.model_setup import stabilize_residual_norm_gradients
+
+    module = nn.Module()
+    module.config = SimpleNamespace(model_type="llama", norm_backend="aten")
+    with pytest.raises(ValueError, match="requires qwen3"):
+        stabilize_residual_norm_gradients(module)
+
+
+def test_norm_backend_reapplication_removes_only_owned_adaptations(model):
+    from llmtuner.models.hf.model_setup import (
+        _isolate_norm_input,
+        stabilize_residual_norm_gradients,
+    )
+    from llmtuner.models.hf.normalization import forward_aten_rms_norm
+
+    norm = model.model.model.layers[0].input_layernorm
+    native_forward = type(norm).forward
+
+    def user_hook(module, args):
+        return None
+
+    user_handle = norm.register_forward_pre_hook(user_hook)
+    for backend in ("aten", "aten", "native", "native", "aten", "native"):
+        model.model.config.norm_backend = backend
+        stabilize_residual_norm_gradients(model.model)
+        assert user_handle.id in norm._forward_pre_hooks
+        owned = sum(h is _isolate_norm_input for h in norm._forward_pre_hooks.values())
+        assert owned == (1 if backend == "native" else 0)
+        assert norm.forward.__func__ is (
+            native_forward if backend == "native" else forward_aten_rms_norm
+        )
+        assert set(norm._forward_pre_hooks_with_kwargs) <= set(norm._forward_pre_hooks)
+    user_handle.remove()

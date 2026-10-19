@@ -77,6 +77,9 @@ def _torch_param_names() -> bool:
 CAPS: dict[str, Callable[[], bool]] = {
     # torch.distributed.tensor.DTensor (the DTensor/DTensorSpec import surface)
     "dtensor": lambda: _importable_attr("torch.distributed.tensor", "DTensor"),
+    "fine_grained_fsdp": lambda: importable(
+        "llmtuner.parallel.fully_shard_parallel.fine_grained_state"
+    ),
     # the spmd_types shims the model/parallel layers import
     "spmd_types": lambda: importable("spmd_types"),
     # Grain data graph (datasets/)

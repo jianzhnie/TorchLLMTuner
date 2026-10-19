@@ -567,41 +567,44 @@ class _FakeWandB:
 def test_wandb_logger_prefixes_what_it_sends() -> None:
     logger = WandBLogger.__new__(WandBLogger)  # skip init: it starts a run
     logger.tag = "run1"
-    logger.wandb = _FakeWandB()
+    logger.run = _FakeWandB()
 
     logger.log({"loss": 1.5}, step=4)
 
-    assert logger.wandb.sent == [({"run1/loss": 1.5}, 4)]
+    assert logger.run.sent == [({"run1/loss": 1.5}, 4)]
 
 
 def test_wandb_logger_sends_untagged_keys_without_a_tag() -> None:
     logger = WandBLogger.__new__(WandBLogger)
     logger.tag = None
-    logger.wandb = _FakeWandB()
+    logger.run = _FakeWandB()
 
     logger.log({"loss": 1.5}, step=4)
 
-    assert logger.wandb.sent == [({"loss": 1.5}, 4)]
+    assert logger.run.sent == [({"loss": 1.5}, 4)]
 
 
 def test_wandb_close_tolerates_an_already_finished_run() -> None:
     """``run`` is None once finish has run; calling it again raises, and close()
     tends to be called during interpreter shutdown."""
     logger = WandBLogger.__new__(WandBLogger)
-    logger.wandb = _FakeWandB(run=None)
+    logger.run = None
 
     logger.close()
 
-    assert not logger.wandb.finished
+    assert logger.run is None
 
 
 def test_wandb_close_finishes_a_live_run() -> None:
     logger = WandBLogger.__new__(WandBLogger)
-    logger.wandb = _FakeWandB()
+    logger.run = _FakeWandB()
 
+    run = logger.run
+    logger.close()
     logger.close()
 
-    assert logger.wandb.finished
+    assert run.finished
+    assert logger.run is None
 
 
 # -- device memory ------------------------------------------------------------
@@ -765,7 +768,8 @@ def test_logger_container_closes_every_sink_after_failure():
 
     def fail():
         calls.append("first")
-        raise original
+        if calls.count("first") == 1:
+            raise original
 
     container = LoggerContainer()
     container.add_logger(SimpleNamespace(close=fail))
@@ -774,8 +778,12 @@ def test_logger_container_closes_every_sink_after_failure():
         container.close()
     assert caught.value is original
     assert calls == ["first", "second"]
+    assert container.number_of_loggers == 1
     container.close()
-    assert calls == ["first", "second"]
+    assert calls == ["first", "second", "first"]
+    assert container.number_of_loggers == 0
+    container.close()
+    assert calls == ["first", "second", "first"]
 
 
 def test_metrics_releases_first_sink_when_second_sink_construction_fails(monkeypatch):
@@ -816,3 +824,22 @@ def test_metrics_releases_sinks_when_monitor_construction_fails(monkeypatch):
     with pytest.raises(ValueError, match="monitor initialization failed"):
         MetricsProcessor(Config(), parallel_dims=None)
     assert calls == ["logger"]
+
+
+def test_wandb_logger_uses_owned_run_after_global_run_changes(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    owned = _FakeWandB()
+    other = _FakeWandB()
+    module = SimpleNamespace(init=lambda **kwargs: owned, run=other)
+    monkeypatch.setitem(sys.modules, "wandb", module)
+    logger = WandBLogger(str(tmp_path))
+    logger.log({"loss": 2.0}, step=1)
+    logger.close()
+    assert owned.sent == [({"loss": 2.0}, 1)]
+    assert owned.finished
+    assert not other.finished
+    assert not other.sent
+    with pytest.raises(RuntimeError, match="closed"):
+        logger.log({"loss": 3.0}, step=2)

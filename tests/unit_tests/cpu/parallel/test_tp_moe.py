@@ -332,7 +332,8 @@ def test_shared_expert_shards_featurewise_and_partials_sum(plural_fallback) -> N
     assert partials and partials[0].shape == x.shape
 
 
-def test_shared_expert_is_not_double_sharded_by_the_dense_plan() -> None:
+@pytest.mark.parametrize("root_block", [False, True])
+def test_shared_expert_is_not_double_sharded_by_the_dense_plan(root_block) -> None:
     """HF plans (e.g. DeepSeek-V3) declare shared_experts.*_proj as
     colwise/rowwise dense targets. The MoE path already shards them
     featurewise; the dense wrap loop must not wrap them again (that was the
@@ -349,6 +350,11 @@ def test_shared_expert_is_not_double_sharded_by_the_dense_plan() -> None:
     model._tp_config = plan
     block = model.layers[0]["mlp"]
     block.shared_experts = _SharedMLP()
+    if root_block:
+        model = block
+        model._tp_config = {
+            key.removeprefix("layers.*.mlp."): value for key, value in plan.items()
+        }
     cfg = ParallelConfig(tensor_parallel_size=2)
 
     apply_tp(model, mesh=_FakeMesh(2, 0), cfg=cfg)
@@ -367,6 +373,18 @@ def test_shared_expert_is_not_double_sharded_by_the_dense_plan() -> None:
     assert shared.down_proj.weight.shape[1] == 32 // 2
     for proj in (shared.gate_proj, shared.up_proj, shared.down_proj):
         assert not isinstance(proj, ColumnParallelLinear | RowParallelLinear)
+
+    # Reapplication must also recognize the already realized MoE subtree.
+    modules = list(model.modules())
+    parameters = list(model.parameters())
+    values = [parameter.detach().clone() for parameter in parameters]
+    apply_tp(model, mesh=_FakeMesh(2, 0), cfg=cfg)
+    assert list(model.modules()) == modules
+    for actual, original, value in zip(
+        model.parameters(), parameters, values, strict=True
+    ):
+        assert actual is original
+        torch.testing.assert_close(actual, value, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("failure", ["layout", "hidden", "bias", "shared_hidden"])

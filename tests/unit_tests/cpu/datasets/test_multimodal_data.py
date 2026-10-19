@@ -1149,3 +1149,139 @@ def test_multimodal_packing_rejects_invalid_context_before_reading_fields(length
 
     with pytest.raises(ValueError, match="max_context_length"):
         packing_output_to_multimodal_sample({}, max_context_length=length)
+
+
+def test_multimodal_packing_preserves_source_padding():
+    from llmtuner.datasets.multimodal.packing import multimodal_sample_to_packing_input
+
+    sample = {
+        "input_ids": torch.tensor([1, 2, 3]),
+        "labels": torch.tensor([2, 3, 4]),
+        "positions": torch.tensor([0, 1, 2]),
+        "padding_mask": torch.tensor([False, True, False]),
+    }
+    packed = multimodal_sample_to_packing_input(sample)
+    packed["input_ids_segment_ids"] = np.ones(3, dtype=np.int64)
+    output = packing_output_to_multimodal_sample(packed, max_context_length=4)
+    assert output["padding_mask"].tolist() == [False, True, False]
+    assert output["labels"].tolist() == [2, IGNORE_INDEX, 4]
+    assert sample["labels"].tolist() == [2, 3, 4]
+
+
+def test_multimodal_grain_packing_restores_source_padding(mm_tokenizer, monkeypatch):
+    import grain.python as grain
+
+    from llmtuner.datasets.multimodal import packing
+
+    samples = [
+        {
+            "input_ids": torch.tensor([1, 2, 3]),
+            "labels": torch.tensor([10 + index * 3, 11 + index * 3, 12 + index * 3]),
+            "positions": torch.tensor([0, 1, 2]),
+            "padding_mask": torch.tensor([False, True, False]),
+        }
+        for index in range(5)
+    ]
+    monkeypatch.setattr(
+        packing,
+        "build_dataset",
+        lambda *args, **kwargs: grain.MapDataset.source(samples),
+    )
+    context = make_context(mm_tokenizer, num_tokens_per_batch=8, max_context_length=8)
+
+    def graph():
+        return packing.build_multimodal_packing(
+            None,
+            context=context,
+            iteration_policy=make_policy(repeat=False, shuffle=False),
+            num_packing_bins=2,
+        )
+
+    iterator = iter(graph())
+    restored = None
+    try:
+        first = next(iterator)
+        state = iterator.get_state()
+        remaining = list(iterator)
+        restored = iter(graph())
+        restored.set_state(state)
+        actual = list(restored)
+        assert len(actual) == len(remaining)
+        for left, right in zip(actual, remaining, strict=True):
+            for key in ("input_ids", "labels", "positions", "padding_mask"):
+                torch.testing.assert_close(left[key], right[key], rtol=0, atol=0)
+        targets = []
+        for row in [first, *remaining]:
+            assert torch.all(row["labels"][row["padding_mask"]] == IGNORE_INDEX)
+            targets.extend(row["labels"][~row["padding_mask"]].tolist())
+        expected = [10 + index * 3 + offset for index in range(5) for offset in (0, 2)]
+        assert sorted(targets) == expected
+    finally:
+        iterator.close()
+        if restored is not None:
+            restored.close()
+
+
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_multimodal_packing_resumes_legacy_feature_schema(
+    mm_tokenizer, monkeypatch, shuffle
+):
+    import grain.python as grain
+
+    from llmtuner.datasets.multimodal import packing
+
+    samples = [
+        {
+            "input_ids": torch.tensor([index + 1] * 3),
+            "labels": torch.tensor([index + 10] * 3),
+            "positions": torch.arange(3),
+        }
+        for index in range(7)
+    ]
+    monkeypatch.setattr(
+        packing,
+        "build_dataset",
+        lambda *args, **kwargs: grain.MapDataset.source(samples),
+    )
+    context = make_context(mm_tokenizer, num_tokens_per_batch=8, max_context_length=8)
+    convert = packing.multimodal_sample_to_packing_input
+    pack = grain.experimental.FirstFitPackIterDataset
+
+    def legacy_convert(sample):
+        result = convert(sample)
+        result.pop("padding_mask")
+        return result
+
+    def legacy_pack(parent, **kwargs):
+        kwargs["length_struct"].pop("padding_mask")
+        kwargs["padding_struct"].pop("padding_mask")
+        return pack(parent, **kwargs)
+
+    def graph():
+        return packing.build_multimodal_packing(
+            None,
+            context=context,
+            num_packing_bins=2,
+            iteration_policy=make_policy(repeat=False, shuffle=shuffle),
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(packing, "multimodal_sample_to_packing_input", legacy_convert)
+        patch.setattr(grain.experimental, "FirstFitPackIterDataset", legacy_pack)
+        legacy = iter(graph())
+    current = None
+    try:
+        next(legacy)
+        saved = legacy.get_state()
+        expected = list(legacy)
+        current = iter(graph())
+        current.set_state(saved)
+        actual = list(current)
+        assert len(actual) == len(expected)
+        for left, right in zip(actual, expected, strict=True):
+            for key in ("input_ids", "labels", "positions", "padding_mask"):
+                torch.testing.assert_close(left[key], right[key], rtol=0, atol=0)
+    finally:
+        legacy.close()
+        if current is not None:
+            current.close()

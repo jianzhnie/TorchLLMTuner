@@ -96,3 +96,27 @@ def test_has_reflects_a_flipped_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     capabilities.probe.cache_clear()
     assert has("functorch_activation_memory_budget") is True
+
+
+@pytest.mark.parametrize("target", ["cpu", "meta"])
+def test_grouped_mm_probe_uses_training_device_and_expert_weight_layout(
+    monkeypatch, target
+):
+    import torch
+
+    calls = []
+    monkeypatch.setattr(
+        capabilities, "get_current_device", lambda: torch.device(target), raising=False
+    )
+
+    def grouped_mm(inputs, weights, *, offs):
+        calls.append((inputs.device, weights.device, offs.device, weights.stride()))
+        assert inputs.device == weights.device == offs.device == torch.device(target)
+        assert inputs.dtype == weights.dtype == torch.bfloat16
+        assert offs.dtype == torch.int32
+        assert weights.stride()[-2:] == (1, 8)
+        return torch.empty_like(inputs)
+
+    monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising=False)
+    assert capabilities.grouped_mm_runs()
+    assert len(calls) == 1

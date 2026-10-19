@@ -545,3 +545,57 @@ def test_apply_tp_rejects_mesh_degree_mismatch_before_mutation():
             model, mesh, ParallelConfig(tensor_parallel_size=2), plan={"0": "colwise"}
         )
     assert model[0] is original
+
+
+def test_tp_constructor_failure_preserves_modules_and_allows_retry(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.tensor_parallel import tensor_parallel as tp_module
+
+    class FailingProjection(nn.Module):
+        def __init__(self, weight, **kwargs):
+            super().__init__()
+            raise RuntimeError("projection construction failed")
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
+    model[0].eval()
+    original_modules = list(model)
+    original_parameters = list(model.parameters())
+    original_values = [parameter.detach().clone() for parameter in original_parameters]
+    mesh = {
+        "tp": SimpleNamespace(
+            get_group=lambda: None, size=lambda: 2, get_local_rank=lambda: 0
+        )
+    }
+    monkeypatch.setattr(tp_module, "supports_symm_mem", lambda mesh: False)
+    moe_calls = []
+    monkeypatch.setattr(
+        tp_module,
+        "realize_moe_blocks_tp",
+        lambda *args, **kwargs: moe_calls.append(args),
+    )
+    cfg = ParallelConfig(tensor_parallel_size=2)
+    with pytest.raises(RuntimeError, match="projection construction failed"):
+        apply_tp(
+            model,
+            mesh,
+            cfg,
+            plan={
+                "0": colwise(),
+                "1": ShardingConfig(kind="rowwise", implementation=FailingProjection),
+            },
+        )
+    assert list(model) == original_modules
+    assert not moe_calls
+    for actual, original, value in zip(
+        model.parameters(), original_parameters, original_values, strict=True
+    ):
+        assert actual is original
+        torch.testing.assert_close(actual, value, rtol=0, atol=0)
+    apply_tp(model, mesh, cfg, plan={"0": colwise(), "1": rowwise()})
+    assert isinstance(model[0], ColumnParallelLinear)
+    assert isinstance(model[1], RowParallelLinear)
+    assert not model[0].training
+    assert model[1].training
+    assert model[0].weight.shape == (2, 4)
+    assert model[1].weight.shape == (4, 2)

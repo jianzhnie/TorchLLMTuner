@@ -393,3 +393,59 @@ def test_every_layer_of_every_part_is_updated() -> None:
 def test_moe_rejects_invalid_balance_coefficient(coeff):
     with pytest.raises(ValueError, match="load_balance_coeff must be finite"):
         _moe(coeff=coeff)
+
+
+def test_shared_bias_uses_joint_counts_once_and_drains_both_layers():
+    first, second = _moe(), _moe()
+    second.expert_bias_E = first.expert_bias_E
+    first.tokens_per_expert_E.copy_(torch.tensor([8.0, 0, 0, 0]))
+    second.tokens_per_expert_E.copy_(torch.tensor([0.0, 3, 3, 3]))
+    # Joint counts [8, 3, 3, 3]: one centered sign update.
+    update_expert_bias([first, second])
+    torch.testing.assert_close(
+        first.expert_bias_E, torch.tensor([-0.15, 0.05, 0.05, 0.05])
+    )
+    assert torch.count_nonzero(first.tokens_per_expert_E) == 0
+    assert torch.count_nonzero(second.tokens_per_expert_E) == 0
+
+
+def test_shared_bias_rejects_conflicting_coefficients_before_mutation():
+    first, second = _moe(coeff=0.1), _moe(coeff=0.2)
+    second.expert_bias_E = first.expert_bias_E
+    first.tokens_per_expert_E.fill_(2)
+    with pytest.raises(ValueError, match="identical load_balance_coeff"):
+        update_expert_bias([first, second])
+    assert torch.count_nonzero(first.expert_bias_E) == 0
+    torch.testing.assert_close(first.tokens_per_expert_E, torch.full((4,), 2.0))
+
+
+def test_shared_quantile_bias_uses_joint_histogram_and_original_bias():
+    from llmtuner.models.common.moe.bias_update import update_quantile_expert_bias
+    from llmtuner.models.common.moe.routing import QuantileBalancedTopKRouter
+
+    layers = [
+        MoE(
+            4,
+            RoutedExperts(GroupedExperts(8, 8, 4), LocalTokenDispatcher(4, 2)),
+            QuantileBalancedTopKRouter(4, 8, 2, num_bins=8),
+            load_balance_coeff=None,
+        )
+        for _ in range(2)
+    ]
+    first, second = layers
+    first.expert_bias_E.copy_(torch.tensor([-0.3, -0.1, 0.1, 0.3]))
+    second.expert_bias_E = first.expert_bias_E
+    h1 = first.router.quantile_balancer.required_bias_histogram_EB
+    h2 = second.router.quantile_balancer.required_bias_histogram_EB
+    h1.copy_(torch.arange(32).reshape(4, 8) % 7)
+    h2.copy_(h1.flip(1) * 2)
+    expected = first.router.quantile_balancer.estimate_expert_bias(
+        h1 + h2, first.expert_bias_E.clone()
+    )
+    first.tokens_per_expert_E.fill_(3)
+    second.tokens_per_expert_E.fill_(4)
+    update_quantile_expert_bias(layers)
+    torch.testing.assert_close(first.expert_bias_E, expected)
+    assert not h1.any() and not h2.any()
+    assert not first.tokens_per_expert_E.any()
+    assert not second.tokens_per_expert_E.any()

@@ -175,7 +175,7 @@ def test_frozen_parameters_are_not_required_in_a_group() -> None:
 
 def test_each_model_part_gets_its_own_inner_optimizer() -> None:
     """PP puts each stage's parameters in its own optimizer, hook count aside."""
-    parts = [_model(), _model()]
+    parts = [nn.ModuleDict({"first": _model()}), nn.ModuleDict({"second": _model()})]
     container = OptimizersContainer(_cfg(_catch_all()), model_parts=parts)
     assert len(container) == 2
     assert list(container) == container.optimizers
@@ -285,7 +285,11 @@ def test_a_step_hook_fires_once_per_container_step_not_per_optimizer() -> None:
     rolled-up aux losses.
     """
     container = OptimizersContainer(
-        _cfg(_catch_all()), model_parts=[_model(), _model()]
+        _cfg(_catch_all()),
+        model_parts=[
+            nn.ModuleDict({"first": _model()}),
+            nn.ModuleDict({"second": _model()}),
+        ],
     )
     assert len(container) == 2
 
@@ -406,8 +410,110 @@ def test_all_model_parts_are_validated_before_building_optimizers(
                 optimizer_name="AdamW",
                 optimizer_kwargs={"lr": 0.1},
             ),
-            _catch_all(),
+            ParamGroupConfig(pattern=r"^[01]\.", optimizer_name="AdamW"),
         )
-        error = "matched no parameters"
+        error = "unassigned"
     with pytest.raises(ValueError, match=error):
         OptimizersContainer(config, model_parts=parts)
+
+
+def test_parameter_group_pattern_matches_a_shared_parameter_alias():
+    model = nn.Module()
+    model.first = nn.Linear(2, 2, bias=False)
+    model.second = nn.Linear(2, 2, bias=False)
+    model.second.weight = model.first.weight
+    config = _cfg(
+        ParamGroupConfig(
+            pattern=r"^second\.weight$",
+            optimizer_name="AdamW",
+            optimizer_kwargs={"lr": 0.01},
+        )
+    )
+    container = OptimizersContainer(config, model_parts=[model])
+    group = container.optimizers[0].param_groups[0]
+    assert len(group["params"]) == 1
+    assert group["params"][0] is model.first.weight
+    assert group["param_names"] == ["first.weight"]
+    model.first.weight.grad = torch.ones_like(model.first.weight)
+    container.step()
+    assert len(container.optimizers[0].state) == 1
+
+    from copy import deepcopy
+
+    restored_model = deepcopy(model)
+    restored = OptimizersContainer(
+        _cfg(
+            ParamGroupConfig(
+                pattern=r"^first\.weight$",
+                optimizer_name="AdamW",
+                optimizer_kwargs={"lr": 0.5},
+            )
+        ),
+        model_parts=[restored_model],
+    )
+    restored.load_state_dict(deepcopy(container.state_dict()))
+    model.first.weight.grad = torch.full_like(model.first.weight, 2)
+    restored_model.first.weight.grad = model.first.weight.grad.clone()
+    container.step()
+    restored.step()
+    torch.testing.assert_close(model.first.weight, restored_model.first.weight)
+    assert restored_model.first.weight is restored_model.second.weight
+
+
+def test_cross_part_checkpoint_name_collision_fails_before_optimizer_creation(
+    monkeypatch,
+):
+    def unexpected(*args, **kwargs):
+        pytest.fail("Checkpoint FQN conflicts must fail before optimizer creation")
+
+    monkeypatch.setattr(torch.optim, "AdamW", unexpected)
+    with pytest.raises(ValueError, match="checkpoint FQNs.*weight"):
+        OptimizersContainer(
+            _cfg(_catch_all()), model_parts=[nn.Linear(2, 2), nn.Linear(2, 2)]
+        )
+
+
+def test_patterns_can_target_different_local_model_parts():
+    first = nn.Module()
+    first.register_parameter("first_weight", nn.Parameter(torch.tensor([1.0])))
+    second = nn.Module()
+    second.register_parameter("second_weight", nn.Parameter(torch.tensor([2.0])))
+    config = _cfg(
+        ParamGroupConfig(
+            pattern="^first_weight$",
+            optimizer_name="AdamW",
+            optimizer_kwargs={"lr": 0.01},
+        ),
+        ParamGroupConfig(
+            pattern="^second_weight$",
+            optimizer_name="AdamW",
+            optimizer_kwargs={"lr": 0.02},
+        ),
+    )
+    optimizer = OptimizersContainer(config, model_parts=[first, second])
+    assert len(optimizer) == 2
+    assert [inner.param_groups[0]["lr"] for inner in optimizer] == [0.01, 0.02]
+    reference_parameters = [nn.Parameter(torch.tensor([value])) for value in (1.0, 2.0)]
+    references = [
+        torch.optim.AdamW([parameter], lr=rate)
+        for parameter, rate in zip(reference_parameters, (0.01, 0.02), strict=True)
+    ]
+    for parameter in (first.first_weight, second.second_weight, *reference_parameters):
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    for reference in references:
+        reference.step()
+    for actual, expected in zip(
+        (first.first_weight, second.second_weight), reference_parameters, strict=True
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_duplicate_rules_remain_invalid_across_multiple_local_parts():
+    parts = []
+    for name in ("first_weight", "second_weight"):
+        part = nn.Module()
+        part.register_parameter(name, nn.Parameter(torch.ones(1)))
+        parts.append(part)
+    with pytest.raises(ValueError, match="matched no parameters"):
+        OptimizersContainer(_cfg(_catch_all(), _catch_all()), model_parts=parts)

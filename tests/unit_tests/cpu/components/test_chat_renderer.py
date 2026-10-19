@@ -336,3 +336,20 @@ def test_build_dataloader_without_the_package_fails_loudly(tmp_path, monkeypatch
             dp_world_size=1,
             num_tokens_per_batch=32,
         )
+
+
+@pytest.mark.parametrize("tokens", [[], [1]])
+def test_renderer_rejects_output_without_a_prediction_pair(
+    tokenizer, fake_renderers, monkeypatch, tokens
+):
+    from llmtuner.errors import ConfigError
+
+    def render(*args, **kwargs):
+        return types.SimpleNamespace(
+            token_ids=tokens, loss_mask=[True] * len(tokens), multi_modal_data=None
+        )
+
+    monkeypatch.setattr(sys.modules["renderers"], "build_training_sample", render)
+    processor = _renderer_processor(tokenizer, fake_renderers)
+    with pytest.raises(ConfigError, match="at least two tokens"):
+        processor({"messages": MULTI_TURN}, np.random.default_rng(0))

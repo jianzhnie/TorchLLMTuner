@@ -57,3 +57,44 @@ class TestDeriveDistinctSeed:
         for coordinates in [[(4, 4)], [(-1, 4)], [(0, 0)], [(1, True)]]:
             with pytest.raises(ValueError, match="seed coordinate"):
                 derive_distinct_seed(1, coordinates)
+
+
+def test_dtensor_rng_initialization_disables_global_sync_without_reseeding(monkeypatch):
+    from types import SimpleNamespace
+
+    from torch.distributed.tensor import _random
+
+    from llmtuner.utils.seeding import initialize_dtensor_rng
+
+    calls = []
+    mesh = SimpleNamespace(device_type="cuda")
+    tracker = object()
+    monkeypatch.setattr(_random, "_rng_tracker", None)
+    monkeypatch.setattr(_random, "is_rng_supported_mesh", lambda mesh: True)
+
+    def create(mesh, *, run_state_sync):
+        calls.append((mesh, run_state_sync))
+        return tracker
+
+    monkeypatch.setattr(_random, "OffsetBasedRNGTracker", create)
+    before = torch.get_rng_state().clone()
+    initialize_dtensor_rng(mesh)
+    initialize_dtensor_rng(mesh)
+    assert calls == [(mesh, False)]
+    assert _random._rng_tracker is tracker
+    assert torch.equal(torch.get_rng_state(), before)
+
+
+def test_dtensor_rng_initialization_skips_cpu_and_missing_mesh(monkeypatch):
+    from types import SimpleNamespace
+
+    from torch.distributed.tensor import _random
+
+    from llmtuner.utils.seeding import initialize_dtensor_rng
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("CPU does not support the DTensor RNG tracker")
+
+    monkeypatch.setattr(_random, "OffsetBasedRNGTracker", unexpected)
+    initialize_dtensor_rng(None)
+    initialize_dtensor_rng(SimpleNamespace(device_type="cpu"))
