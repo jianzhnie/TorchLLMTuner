@@ -214,6 +214,23 @@ def test_invalid_label_shape_fails_before_head_and_preserves_gradients(shape):
     assert lm_head.bias.grad is gradients[2]
 
 
+@pytest.mark.parametrize("num_chunks", [True, False, 1.5, "2", None])
+def test_invalid_chunk_count_is_rejected_before_head(num_chunks):
+    hidden, labels, _ = _inputs()
+
+    def unexpected_head(inputs):
+        pytest.fail("invalid chunk count reached lm_head")
+
+    with pytest.raises(ValueError, match="num_chunks"):
+        chunked_lm_head_cross_entropy(
+            unexpected_head,
+            hidden.requires_grad_(True),
+            labels,
+            num_chunks=num_chunks,
+            grad_scale=1.0,
+        )
+
+
 def test_invalid_inputs_raise() -> None:
     hidden, labels, lm_head = _inputs()
     with pytest.raises(ValueError, match="num_chunks"):
