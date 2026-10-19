@@ -1230,3 +1230,103 @@ def test_checkpoint_layout_failure_rolls_back_auxiliary_registration():
     for layer, block in zip(model.layers, original, strict=True):
         assert layer.mlp is block
         assert not getattr(layer, "moe_enabled", False)
+
+
+@pytest.mark.parametrize("native_path", [False, True])
+def test_ep_rebinds_fused_fsdp_exclusions_hooks_and_unit_paths(native_path):
+    from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel.plan import FSDPPatternReferences
+
+    model = _model(_config(norm_topk_prob=True))
+    block = model.layers[0].mlp
+    path = next(
+        name for name, module in model.named_modules() if module is block.experts
+    )
+    if native_path:
+        path = path.removesuffix("experts") + "routed_experts.inner_experts"
+    original = block.experts.gate_up_proj
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_implementation="custom",
+            fsdp_apply_modules={
+                path: {"ignored_params": {original}, "hook_module": block.experts}
+            },
+        )
+    )
+    references = FSDPPatternReferences(model, cfg)
+    swap_hf_moe_blocks(model, on_replacement=references.record_replacements)
+    grouped = model.layers[0].mlp.routed_experts.inner_experts
+    rebound = references.bind(model)
+    target_path = next(
+        name for name, module in model.named_modules() if module is grouped
+    )
+    assert set(rebound.fsdp_config.fsdp_apply_modules) == {target_path}
+    options = rebound.fsdp_config.fsdp_apply_modules[target_path]
+    assert options["ignored_params"] == {grouped.w1_EFD, grouped.w3_EFD}
+    assert options["hook_module"] is grouped
+    assert cfg.fsdp_config.fsdp_apply_modules[path]["ignored_params"] == {original}
+    assert cfg.fsdp_config.fsdp_apply_modules[path]["hook_module"] is block.experts
+
+
+def test_replacement_observer_error_keeps_original_blocks_and_aux_counts():
+    model = _model(_config(norm_topk_prob=True))
+    originals = [layer.mlp for layer in model.layers]
+    counts = dict(AuxLoss._group_counts)
+    failure = RuntimeError("reference observer failed")
+
+    def reject(modules, parameters):
+        assert all(block in modules for block in originals)
+        assert all(block.experts.gate_up_proj in parameters for block in originals)
+        assert all(
+            layer.mlp is original
+            for layer, original in zip(model.layers, originals, strict=True)
+        )
+        raise failure
+
+    with pytest.raises(RuntimeError) as caught:
+        swap_hf_moe_blocks(model, on_replacement=reject)
+    assert caught.value is failure
+    assert AuxLoss._group_counts == counts
+    assert all(
+        layer.mlp is original
+        for layer, original in zip(model.layers, originals, strict=True)
+    )
+
+
+@pytest.mark.parametrize("native_path", [False, True])
+@pytest.mark.parametrize("wildcard", [False, True])
+def test_ep_rebinds_ignored_module_subtree_without_object_overrides(
+    native_path, wildcard
+):
+    from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel.plan import (
+        FSDPPatternReferences,
+        _resolve_pattern_units,
+    )
+
+    model = _model(_config(norm_topk_prob=True))
+    source = model.layers[0].mlp.experts
+    path = next(name for name, module in model.named_modules() if module is source)
+    if native_path:
+        path = path.removesuffix("experts") + "routed_experts.inner_experts"
+    if wildcard:
+        path = path.replace(".layers.0.", ".layers.*.")
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(fsdp_apply_modules={"": {}}, fsdp_ignored_modules=[path])
+    )
+    references = FSDPPatternReferences(model, cfg)
+    swap_hf_moe_blocks(model, on_replacement=references.record_replacements)
+    grouped = model.layers[0].mlp.routed_experts.inner_experts
+    rebound = references.bind(model)
+    _, _, exclusions = _resolve_pattern_units(model, rebound)
+    expected = (
+        {
+            parameter
+            for layer in model.layers
+            for parameter in layer.mlp.routed_experts.inner_experts.parameters()
+        }
+        if wildcard
+        else set(grouped.parameters())
+    )
+    assert exclusions == expected
+    assert cfg.fsdp_config.fsdp_ignored_modules == [path]

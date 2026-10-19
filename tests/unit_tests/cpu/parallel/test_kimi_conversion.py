@@ -137,3 +137,110 @@ def test_meta_kimi_conversion_reconstructs_empty_routing_counters():
     materialize_meta_model(model, torch.device("cpu"))
     assert block.tokens_per_expert_E.dtype == torch.float32
     assert torch.equal(block.tokens_per_expert_E, torch.zeros(4))
+
+
+@pytest.mark.parametrize("whole_module", [False, True])
+def test_kimi_fsdp_references_preserve_complete_stacked_exclusions(whole_module):
+    from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel.plan import (
+        FSDPPatternReferences,
+        _resolve_pattern_units,
+    )
+
+    model = make_model()
+    source = model.layers[0].block_sparse_moe
+    originals = {expert.w1.weight for expert in source.experts}
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={
+                "": {} if whole_module else {"ignored_params": originals}
+            },
+            fsdp_ignored_modules=(
+                ["layers.0.block_sparse_moe.experts"] if whole_module else []
+            ),
+        )
+    )
+    references = FSDPPatternReferences(model, cfg)
+    swap_hf_moe_blocks(model, on_replacement=references.record_replacements)
+    grouped = model.layers[0].block_sparse_moe.routed_experts.inner_experts
+    rebound = references.bind(model)
+    if whole_module:
+        _, _, ignored = _resolve_pattern_units(model, rebound)
+        assert ignored == set(grouped.parameters())
+    else:
+        assert rebound.fsdp_config.fsdp_apply_modules[""]["ignored_params"] == {
+            grouped.w1_EFD
+        }
+        assert cfg.fsdp_config.fsdp_apply_modules[""]["ignored_params"] == originals
+
+
+@pytest.mark.parametrize("module_exclusion", [False, True])
+def test_kimi_partial_stacked_exclusion_rejected_before_installation(module_exclusion):
+    from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
+    from llmtuner.errors import UnsupportedCombinationError
+    from llmtuner.parallel.fully_shard_parallel.plan import FSDPPatternReferences
+
+    model = make_model()
+    source = model.layers[0].block_sparse_moe
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={
+                "": {}
+                if module_exclusion
+                else {"ignored_params": {source.experts[0].w1.weight}}
+            },
+            fsdp_ignored_modules=(
+                ["layers.0.block_sparse_moe.experts.0"] if module_exclusion else []
+            ),
+        )
+    )
+    references = FSDPPatternReferences(model, cfg)
+    with pytest.raises(UnsupportedCombinationError, match="part of a stacked"):
+        swap_hf_moe_blocks(model, on_replacement=references.record_replacements)
+    assert model.layers[0].block_sparse_moe is source
+
+
+@pytest.mark.parametrize("explicit_root", [False, True])
+@pytest.mark.parametrize("frozen_bias", [False, True])
+def test_kimi_gate_module_exclusion_keeps_moved_bias_outside_router(
+    explicit_root, frozen_bias
+):
+    from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
+    from llmtuner.parallel.fully_shard_parallel.plan import (
+        FSDPPatternReferences,
+        _resolve_pattern_units,
+    )
+
+    model = make_model()
+    source = model.layers[0].block_sparse_moe
+    source.gate.e_score_correction_bias.requires_grad_(not frozen_bias)
+    gate_parameters = set(source.gate.parameters())
+    units = {"layers.0.block_sparse_moe.experts": {}}
+    if explicit_root:
+        units[""] = {"reshard_after_forward": False}
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules=units,
+            fsdp_ignored_modules=["layers.0.block_sparse_moe.gate"],
+        )
+    )
+    references = FSDPPatternReferences(model, cfg)
+    swap_hf_moe_blocks(model, on_replacement=references.record_replacements)
+    converted = model.layers[0].block_sparse_moe
+    rebound = references.bind(model)
+    _, units, ignored = _resolve_pattern_units(model, rebound)
+    assert ignored == {converted.router.gate.weight}
+    assert units[""]["ignored_params"] == {converted.expert_bias_E}
+    assert converted.expert_bias_E.requires_grad is not frozen_bias
+    for options in units.values():
+        assert ignored | options["ignored_params"] == gate_parameters
+    assert cfg.fsdp_config.fsdp_ignored_modules == ["layers.0.block_sparse_moe.gate"]
+    if explicit_root:
+        assert cfg.fsdp_config.fsdp_apply_modules[""] == {
+            "reshard_after_forward": False
+        }
+        assert (
+            rebound.fsdp_config.fsdp_apply_modules[""]["reshard_after_forward"] is False
+        )
+    else:
+        assert "" not in cfg.fsdp_config.fsdp_apply_modules

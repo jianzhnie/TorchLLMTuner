@@ -101,8 +101,12 @@ def build(*args, **kwargs):
         or cfg.parallel.context_parallel_kv_allgather_size != 2
         or cfg.parallel.expert_parallel_size != 2
         or cfg.parallel.cp_config.context_parallel_load_balancer is not None
+        or cfg.parallel.fsdp_config.fsdp_reduce_dtype != "float32"
     ):
-        raise ValueError("Rounded reference requires contiguous TP2/KVCP2/EP2")
+        raise ValueError(
+            "Rounded reference requires contiguous TP2/KVCP2/EP2 "
+            "with float32 FSDP reduction"
+        )
     model = original(*args, **kwargs)
     count += 1
     if count == 2:
