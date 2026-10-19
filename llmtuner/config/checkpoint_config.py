@@ -190,6 +190,13 @@ class CheckpointConfig:
                 f"initial_load_path, got {self.initial_load_path}"
             )
 
+        if self.create_seed_checkpoint and self.load_only:
+            raise ConfigError(
+                "checkpoint.create_seed_checkpoint requires "
+                "checkpoint.load_only=False: "
+                "load_only disables the seed checkpoint write."
+            )
+
         if self.load_only and self.enable_first_step_checkpoint:
             logger.warning(
                 "checkpoint.load_only is True; enable_first_step_checkpoint "

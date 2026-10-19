@@ -406,12 +406,14 @@ def synchronize_local_errors(
     Every group member must enter in the same order. The body must not contain
     collectives: this boundary cannot recover blocked/killed peers or a failure
     inside communication. Local exceptions retain their identity and traceback;
-    successful peers receive a RuntimeError naming the failed phase.
+    successful peers receive a RuntimeError naming the failed phase. Local
+    interrupts and exits also participate before being re-raised; killed peers
+    and interrupts inside the coordination collective cannot be recovered.
     """
-    error: Exception | None = None
+    error: BaseException | None = None
     try:
         yield
-    except Exception as caught:
+    except BaseException as caught:
         error = caught
     ready = error is None
     if get_world_size(group) > 1:

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ...accelerator.collectives import all_reduce
+from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...accelerator.distributed import get_comm_device, get_world_size
 from ...components.loss import IGNORE_INDEX
 from ...datasets.contracts import (
@@ -83,16 +83,18 @@ def fetch_batch(
     precedence over exhaustion. Model execution and a blocked loader are outside
     this contract; original fetch exceptions remain on the rank that raised them.
     """
-    error: Exception | None = None
+    error: BaseException | None = None
     status = 2  # ready; 1 means exhausted, 0 means a fetch/structure failure
     try:
         batch = next(data_iterator)
         labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
         labels.numel()
+        if not isinstance(batch, Batch) and batch.get("num_valid_tokens") is not None:
+            count_valid_tokens(batch)
     except (DataloaderExhaustedError, StopIteration) as ex:
         error = ex
         status = 1
-    except Exception as ex:
+    except BaseException as ex:
         error = ex
         status = 0
 
@@ -152,6 +154,14 @@ def count_valid_tokens(batch: Batch | TrainerBatch) -> int:
         # silently lacks the key still produces a correct denominator.
         labels = batch["labels"]
         num_valid_tokens = int((labels != IGNORE_INDEX).sum())
+    if (
+        isinstance(num_valid_tokens, bool)
+        or not isinstance(num_valid_tokens, int)
+        or not 0 <= num_valid_tokens <= batch["labels"].numel()
+    ):
+        raise ValueError(
+            "num_valid_tokens must be an integer between 0 and the number of labels"
+        )
     return num_valid_tokens
 
 
@@ -182,10 +192,11 @@ def microbatch(self: Trainer, batch: Batch | TrainerBatch) -> dict[str, Any]:
     sequence_shards = (
         1 if parallel_dims is None else parallel_dims.cp * parallel_dims.tp
     )
-    self.ntokens_seen += labels.numel() // sequence_shards
     num_valid_tokens = self.count_valid_tokens(batch)
 
     num_routing_tokens = count_routing_tokens(batch)
+    # Commit accounting only after both counters have been validated.
+    self.ntokens_seen += labels.numel() // sequence_shards
 
     return {
         "batch": batch,
@@ -220,8 +231,12 @@ def preprocess(
         batch = {
             key: value for key, value in batch.items() if key != "num_valid_tokens"
         }
-    return self.example_model.preprocess_inputs(
-        self.to_device(batch),
-        parallel_dims=self.parallel_dims,
-        max_context_length=self.cfg.max_seq_len,
-    )
+    # HF preprocessing builds local masks and slices already-replicated inputs;
+    # attention collectives start only in model execution after this boundary.
+    with synchronize_local_errors("Training batch preprocessing"):
+        result = self.example_model.preprocess_inputs(
+            self.to_device(batch),
+            parallel_dims=self.parallel_dims,
+            max_context_length=self.cfg.max_seq_len,
+        )
+    return result

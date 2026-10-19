@@ -104,8 +104,8 @@ def finalize_validation(
     """Reduce the pass's sums and report the average, with loud empty-pass errors.
 
     Two outcomes are loud errors rather than a silently skipped report: a pass
-    that read zero batches (the dataset supplied less than one batch of tokens
-    on this rank, which concat-then-split packing turns into no rows at all),
+    that read zero batches (the source is empty or processing and filtering
+    leave no usable samples on this rank),
     and a pass over zero valid tokens (every label masked), which has no
     average to report. Under PP only the last stage holds losses; other stages
     run the identical loop and coordinate reporting errors without emitting metrics.
@@ -115,11 +115,10 @@ def finalize_validation(
     with synchronize_local_errors("Validation result preflight"):
         if num_steps == 0:
             raise ValueError(
-                "Validation ran zero batches on this rank. This happens when "
-                "the validation dataset supplies fewer than one batch of "
-                "tokens on this rank, because concat-then-split packing drops "
-                "partially filled batches. Decrease the per-rank batch size or "
-                "use a larger validation dataset."
+                "Validation ran zero batches on this rank. Check that the "
+                "validation source is nonempty and that processing and "
+                "filtering leave usable samples. Finite text packing retains "
+                "and pads partial final batches."
             )
         num_global_valid_tokens = int(total_global_valid_tokens.item())
         if num_global_valid_tokens == 0:

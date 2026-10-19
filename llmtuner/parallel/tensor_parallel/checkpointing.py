@@ -107,7 +107,7 @@ def _prepare_state(state, model_parts, *, loading: bool):
                 )
             if packed and parameter.shape[dim] % 2:
                 raise ValueError(f"TP checkpoint {key!r} needs equal gate/up halves")
-    except Exception as error:
+    except BaseException as error:
         local_error = error
     peer_error = None
     for group in groups:

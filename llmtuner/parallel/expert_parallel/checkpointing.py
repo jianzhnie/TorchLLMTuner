@@ -191,7 +191,7 @@ def gather_expert_state(
         # Stable ordering also covers models with several overlapping EP groups.
         groups.sort(key=lambda group: tuple(dist.get_process_group_ranks(group)))
     out = dict(state_dict)
-    local_error: Exception | None = None
+    local_error: BaseException | None = None
     entries = []
     manifests = {}
     try:
@@ -214,7 +214,7 @@ def gather_expert_state(
                 for key, owner, _ in entries
                 if owner is group
             ]
-    except Exception as error:
+    except BaseException as error:
         local_error = error
     peer_error: Exception | None = None
     for group in groups:

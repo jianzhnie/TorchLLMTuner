@@ -29,7 +29,12 @@ from torch.distributed.tensor import DTensor
 from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.validation_config import ValidationConfig
 
-from ..accelerator.collectives import all_reduce, clip_grad_norm_, set_pg_timeouts
+from ..accelerator.collectives import (
+    all_reduce,
+    clip_grad_norm_,
+    set_pg_timeouts,
+    synchronize_local_errors,
+)
 from ..accelerator.spmd import spmd_context
 from ..components.checkpointer.distributed_checkpoint import (
     DistributedCheckpointManager,
@@ -957,7 +962,8 @@ class Trainer:
             # ``batch_generator`` wraps the bare source so every fetch carries
             # its token and loading-time accounting; the loop below sees only
             # batches. One exception type crosses that boundary.
-            data_iterator = self.batch_generator(self.data_iterator())
+            with synchronize_local_errors("Training input initialization"):
+                data_iterator = self.batch_generator(self.data_iterator())
             # Entered around the loop rather than around a single step: the
             # torch profiler's schedule counts iterations across the whole run
             # and only dumps a trace at the end of a cycle, so a per-step
