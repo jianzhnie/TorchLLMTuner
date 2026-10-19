@@ -117,6 +117,7 @@ class RandomTokenDataLoader(BaseDataLoader):
                 f"dp_world_size={dp_world_size}"
             )
         self._dp_world_size = dp_world_size
+        self._rank_id = str(dp_rank)
         rows_per_rank = batch_size // dp_world_size
         start = dp_rank * rows_per_rank
         self._rows = slice(start, start + rows_per_rank)
@@ -141,7 +142,11 @@ class RandomTokenDataLoader(BaseDataLoader):
         # See ``_position``: the position is what a resume needs.
         return {
             "dp_world_size": self._dp_world_size,
-            "steps": self._position,
+            "steps": (
+                {self._rank_id: self._position}
+                if self._dp_world_size > 1
+                else self._position
+            ),
             "batch_layout": {
                 "seed": self._source.seed,
                 "vocab_size": self._source.vocab_size,
@@ -170,6 +175,10 @@ class RandomTokenDataLoader(BaseDataLoader):
         if "steps" not in state_dict:
             raise ValueError("checkpoint is missing synthetic loader steps")
         resume_at = state_dict["steps"]
+        if isinstance(resume_at, dict):
+            if self._rank_id not in resume_at:
+                raise ValueError("checkpoint is missing synthetic loader rank steps")
+            resume_at = resume_at[self._rank_id]
         if (
             not isinstance(resume_at, int)
             or isinstance(resume_at, bool)
@@ -190,5 +199,7 @@ class RandomTokenDataLoader(BaseDataLoader):
         if not state_dict:
             return
         resume_at = state_dict["steps"]
+        if isinstance(resume_at, dict):
+            resume_at = resume_at[self._rank_id]
         self._iterator = self._source.iter_from(resume_at)
         self._position = resume_at
