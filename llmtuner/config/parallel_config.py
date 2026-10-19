@@ -44,6 +44,13 @@ class FSDPConfig:
     fsdp_reshard_after_forward: Literal["default", "always", "never"] = "default"
     """FSDP2 parameter resharding policy after forward."""
 
+    fsdp_reduce_dtype: Literal["float32", "bfloat16", "float64"] = "float32"
+    """Gradient communication dtype, independent of model parameter dtype.
+
+    FP32 is the default; BF16 trades reduction precision for bandwidth. FP64
+    supports high precision models and numerical checks when the backend allows it.
+    """
+
     fsdp_cpu_offload: bool = False
     """Offload FSDP2 parameters and gradients to CPU between computations."""
 
@@ -89,6 +96,10 @@ class FSDPConfig:
                 "parallel.fsdp_reshard_after_forward must be one of "
                 "'default'/'always'/'never', got "
                 f"{self.fsdp_reshard_after_forward!r}"
+            )
+        if self.fsdp_reduce_dtype not in ("float32", "bfloat16", "float64"):
+            raise ConfigError(
+                "parallel.fsdp_reduce_dtype must be float32/bfloat16/float64"
             )
         if self.fsdp_symm_mem_scope not in ("all", "dense"):
             raise ConfigError(
@@ -472,16 +483,6 @@ class ParallelConfig:
         ):
             raise UnsupportedCombinationError(
                 "the Ulysses CP axis requires context_parallel_load_balancer=None"
-            )
-        if (
-            self.ep_config.fixed_router
-            and self.expert_parallel_size == 1
-            and self.tensor_parallel_size > 1
-        ):
-            raise UnsupportedCombinationError(
-                "parallel.ep_config.fixed_router with expert_parallel_size=1 "
-                "requires tensor_parallel_size=1; fixed routing is not yet "
-                "adapted to the HF feature-sharded TP expert layout"
             )
         if (
             self.ep_config.ep_token_dispatcher != "alltoall"

@@ -22,7 +22,8 @@ class ParamGroupConfig:
 
     optimizer_kwargs: dict[str, Any] = field(default_factory=dict)
     "Per-group optimizer arguments; omitted values use optimizer defaults, not "
-    "enclosing config values."
+    "enclosing config values. Unknown options are rejected during construction; "
+    "initial_lr is allowed as scheduler metadata."
 
 
 @dataclass
