@@ -400,6 +400,63 @@ class Trainer:
             self, batch, global_valid_tokens=global_valid_tokens
         )
 
+    def _allreduce_fsdp_excluded_grads(self) -> None:
+        """Sum gradients of parameters left outside FSDP across their replicas.
+
+        Dense parameters share DP/CP replicas; EP expert slices share only the
+        sparse replica axes. TP's remaining replicated-gradient reduction runs
+        separately. Presence agreement keeps an unused local parameter from
+        skipping a peer's reduction, without creating gradients when all peers
+        leave that parameter unused.
+        """
+        if self.parallel_dims is None:
+            return
+        expert_ids = (
+            {
+                id(parameter)
+                for part in self.model_parts
+                for module in part.modules()
+                if isinstance(module, MoE)
+                for parameter in module.routed_experts.inner_experts.parameters()
+            }
+            if self.parallel_dims.ep_enabled
+            else set()
+        )
+        meshes = {
+            False: [
+                self.parallel_dims.get_optional_mesh(axis) for axis in ("dp", "cp")
+            ],
+            True: [
+                self.parallel_dims.get_optional_mesh(axis)
+                for axis in ("dp_replicate", "efsdp")
+            ],
+        }
+        seen = set()
+        for part in self.model_parts:
+            for parameter in part.parameters():
+                if (
+                    id(parameter) in seen
+                    or not parameter.requires_grad
+                    or isinstance(parameter, DTensor)
+                ):
+                    continue
+                seen.add(id(parameter))
+                for mesh in meshes[id(parameter) in expert_ids]:
+                    if mesh is None or mesh.size() <= 1:
+                        continue
+                    group = mesh.get_group()
+                    present = torch.tensor(
+                        int(parameter.grad is not None),
+                        device=parameter.device,
+                        dtype=torch.int32,
+                    )
+                    all_reduce(present, group=group)
+                    if present.item() == 0:
+                        continue
+                    if parameter.grad is None:
+                        parameter.grad = torch.zeros_like(parameter)
+                    all_reduce(parameter.grad, group=group)
+
     def _allreduce_replicated_tp_grads(self) -> None:
         """Sum the gradients of TP-*replicated* parameters across the TP group.
 
@@ -642,6 +699,8 @@ class Trainer:
                 else:
                     accumulated_loss.add_(detached_loss)
 
+        # FSDP exclusions retain ordinary local gradients after accumulation.
+        self._allreduce_fsdp_excluded_grads()
         # After the last backward, before clipping: replicated parameters under
         # TP hold token-partial gradients that nothing else reduces.
         self._allreduce_replicated_tp_grads()
@@ -852,7 +911,9 @@ class Trainer:
         # above; this reduces them for logging. Single-process runs skip the
         # collection (there is no mesh to reduce over and no second rank's
         # contribution); the injection itself is unaffected.
-        if AuxLoss.has_pending_counts() and self.parallel_dims is not None:
+        # PP stages without local auxiliary losses must still join metric-key
+        # agreement. Constructor registries can differ across processes.
+        if self.parallel_dims is not None:
             metrics.update(
                 collect_aux_loss_metrics(
                     self.parallel_dims, model_parts=self.model_parts
