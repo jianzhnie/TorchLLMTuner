@@ -128,7 +128,7 @@ parallelize 说明与阶段表同步。
 | `llmtuner/components/optimizer/lr_scheduler.py` | 已阅读 | wsd_factor、LRSchedulersContainer、build_lr_scheduler；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/optimizer/optimizer.py` | 已阅读 | fused_kernel_device_types、OptimizersContainer；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/optimizer/state_dict.py` | 已阅读 | init_optim_state、get_flat_optim_state_dict、load_flat_optim_state_dict、optim_state_dict_to_fqn_keys、unflatten_optim_state_dict；检查训练服务状态、错误路径、持久化及资源生命周期。 |
-| `llmtuner/components/profiler.py` | 已阅读 | MemoryProfiler、Profiler、caused_by_oom；检查训练服务状态、错误路径、持久化及资源生命周期。 |
+| `llmtuner/components/profiler.py` | 已阅读；CPU运行验证 | MemoryProfiler、Profiler、caused_by_oom；第138批验证完整cycle与退出trace分别保留；设备snapshot仍需验收。 |
 | `llmtuner/components/tokenizer/__init__.py` | 已阅读 | 包入口及公开导出；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/tokenizer/base.py` | 已阅读 | BaseTokenizer；检查训练服务状态、错误路径、持久化及资源生命周期。 |
 | `llmtuner/components/tokenizer/huggingface.py` | 已阅读 | HuggingFaceTokenizer；检查训练服务状态、错误路径、持久化及资源生命周期。 |
@@ -13426,6 +13426,7523 @@ KIMI-EP-PREFLIGHT-01 门禁（2026-10-15）：
 - 适用pre-commit最终通过，日志
   `/tmp/llmtuner-router-contract-final-gates-18.log`，diff检查通过。
   无生产修改、不操作index或commit/push。
+
+### TRAINER-TRIAXIS-NORM-ACTIVATION-PROBE-19 — 关联15，开放
+
+- 脚本新增显式probe选项，在生产与独立HF参考首层input_layernorm、
+  self_attn.q_norm/k_norm记录输出。对生产输入norm按TP再CP拼序列；
+  Q/K norm按TP拼头、CP拼序列，比较首microbatch更新前激活。
+  不替换生产forward/backward，不修改既有数值断言。
+- custom noaux adam none fp32_router probe，四CPU/Gloo rank端口29980，
+  首microbatch input norm完整形状(256,64)、Q/K norm(256,8,8)，三个节点
+  所有rank最大绝对误差均0。后续原权重断言仍失败、exit1，日志
+  `/tmp/llmtuner-activation-probe-final-19.log`。
+- 首次probe将带batch轴输出错误沿dim0拼接，导致shape错误，原日志
+  `/tmp/llmtuner-activation-probe-19.log`保留；修正为去掉singleton batch轴
+  后运行上述完整结果。适用pre-commit最终通过，日志
+  `/tmp/llmtuner-activation-probe-final2-gates-19.log`，diff检查通过。
+- 证据排除范围仅首批首层三个节点的前向值，不证明其反向梯度或第二批、
+  后续attention/RoPE/MoE一致。参考仍为显式FP32 gate诊断变体，不能
+  当作原HF oracle验收。下一步需记录这些节点的输出梯度及attention输出，
+  定位第一个非零前反向差异；15保持开放。
+  无生产修改、不操作index或commit/push。
+
+### TRAINER-TRIAXIS-NORM-GRADIENT-PROBE-20 — 关联15，开放
+
+- 扩展显式probe：每次forward建立独立记录，tensor hook只保存输出梯度
+  并返回None，不改变反向值。按对应forward记录首microbatch梯度，避免
+  HF一次backward与生产逐microbatch backward的执行顺序差异导致错配。
+  按既有TP头/序列及CP序列布局重建比较。
+- custom noaux adam none fp32_router probe、四CPU/Gloo rank、端口29981，
+  exit1仍为原AdamW权重失败，日志 `/tmp/llmtuner-gradient-probe-20.log`。
+  首层input norm、Q norm、K norm前向max abs均0，输出梯度差分别
+  1.6124072210873738e-11、6.1267767762103725e-12、
+  8.939345601645735e-12。此为显式FP32 gate参考变体的首批诊断。
+- 结论：梯度差在反传至这些节点时已经存在，不能将其直接归因于norm
+  或视为并行错误证明。尚需下游attention/MoE及反向输入的逐层比较，
+  原HF/AdamW验收仍失败，不放宽容差或改eps。
+- pre-commit首轮格式及一处超长，修正后适用项全部通过，日志
+  `/tmp/llmtuner-gradient-probe-final-gates-20.log`；diff检查通过。
+  无生产修改、不操作index、未commit/push；15保持开放。
+
+### TRAINER-TRIAXIS-DOWNSTREAM-CE-PRECISION-21 — 关联15，开放
+
+- probe扩展首层self_attn、post_attention_layernorm和mlp输出及其梯度，
+  tuple输出取首tensor。四rank custom noaux adam none fp32_router probe，
+  端口29982，exit1日志 `/tmp/llmtuner-downstream-probe-21.log`：首批
+  attention前向差3.47e-17、post-attention norm与mlp前向差0；梯度差
+  分别1.38e-9、2.00e-12、1.40e-9。原AdamW权重失败保持。
+- 静态核对 `components/loss.py` 生产CE显式pred.float()，本测试参考此前
+  对FP64 logits直接CE，精度契约不同。将独立F.cross_entropy参考改为
+  logits.float()，保留参考独立公式、原容差/eps与生产实现；这是参考目标
+  精度修正，旧失败证据不删除，gate精度诊断仍为显式选项。
+- 修正后相同场景端口29983，日志 `/tmp/llmtuner-ce-contract-21.log`，
+  首批mlp输出梯度差降为0；但首步k_proj仍失败，rank1/3最大绝对差
+  1.8110687727349029e-6，原1e-6验收仍未通过、exit1。
+  因此CE精度解释一部分下游梯度差，尚未消除整体差异，不能标记15完成。
+- 格式自动修改审阅后适用pre-commit通过，日志
+  `/tmp/llmtuner-ce-contract-final-gates-21.log`，diff检查通过。
+  无生产修改、不操作index或commit/push。下一步核对逐microbatch分片CE
+  反向舍入及后续层节点，区分分片/求和顺序与实现偏差。
+
+### TRAINER-TRIAXIS-TWO-LAYER-TWO-BATCH-PROBE-22 — 关联15，开放
+
+- 显式probe扩展两个decoder层及两个microbatch，记录键包含layer编号，
+  以forward索引对应value/gradient，保留生产与参考各自原执行顺序。
+  每层覆盖input norm、Q/K norm、attention、post-attention norm及MoE。
+- custom noaux adam none fp32_router probe，四CPU/Gloo rank，单批版本
+  端口29984日志 `/tmp/llmtuner-two-layer-probe-22.log`，双批端口29985日志
+  `/tmp/llmtuner-two-batch-probe-22.log`，两次exit1，原权重断言保持。
+- CE精度修正后的首批两层attention/MoE输出梯度均0，Q/K norm输出梯度
+  残差约1e-19或0；第二批第二层MoE输出梯度也0，post-attention norm输出
+  梯度差1.6940658945086007e-20。更新仍在首层k_proj和第二层q_proj失败。
+  这表明接近一致的模块输出梯度仍不能直接证明参数梯度/Adam更新等价；
+  下一步应比较norm内部FP32反向及投影权重梯度，不能继续仅比较输出值。
+- 记录只支持上述节点/批次的数值定位，不宣称所有探针已零差；多rank日志
+  存在交错，需保留原日志并在后续诊断结构化汇总。参考仍为显式FP32 gate
+  变体，原HF及aux/full场景未被本对照替代。
+- 格式自动调整审阅后适用pre-commit最终通过，日志
+  `/tmp/llmtuner-two-batch-probe-final-gates-22.log`；diff检查通过。
+  无生产修改、不操作index或commit/push，15及全局目标保持开放。
+
+### TRAINER-TRIAXIS-NORM-INPUT-REDUCE-DTYPE-23 — 关联15，开放
+
+- probe增加Q/K norm输入值及tensor input hook梯度，两层两批逐一重建。
+  所有rank仍参与相同gather，仅rank0打印汇总，减少日志交错。
+- custom noaux adam none fp32_router probe，四CPU/Gloo rank端口29986，
+  exit1原权重断言保留，日志 `/tmp/llmtuner-norm-input-23.log`。
+  两层、两批Q/K norm输入值及输入梯度全部max abs=0。
+  因此当前证据不支持将剩余差异归因于这些norm内部反向。
+- 追踪生产FSDP入口 `fully_shard_parallel.py`：保留参数param_dtype，
+  但显式reduce_dtype=torch.float32，随后传入MixedPrecisionPolicy。
+  FP64参数fixture不意味着FP64梯度归约；当前完整HF参考未模拟此处精度。
+  这是可核实契约差异，尚未量化其对失败索引的贡献，不能直接当作完整根因。
+- 下一步逐失败索引比较FP32梯度归约/还原及microbatch累计顺序，验证是否
+  完整解释参数梯度误差；不得用更改生产reduce_dtype或放宽容差替代原验收。
+- 格式自动调整审阅后适用pre-commit通过，日志
+  `/tmp/llmtuner-norm-input-final-gates-23.log`，diff检查通过。
+  无生产修改、不操作index或commit/push，15与全局目标保持开放。
+
+### TRAINER-TRIAXIS-REDUCE-DTYPE-QUANTIFICATION-24 — 关联15，开放
+
+- 显式probe/noaux增加每microbatch独立autograd.grad的k_proj梯度参考，
+  每批loss/296，retain_graph后仍执行原完整reference backward；另构造
+  每批完整梯度float→double再相加的诊断值，不替换验收目标或生产梯度。
+- custom noaux adam none fp32_router probe，四CPU/Gloo rank端口29987，
+  exit1原AdamW断言保持，日志 `/tmp/llmtuner-reduce-dtype-24.log`。
+  rank0/2首层k_proj：生产对FP64参考max abs3.7120648568866876e-10，
+  对逐批完整梯度FP32舍入参考max abs4.656612873077393e-10。
+- 简单舍入完整梯度未重现生产梯度，不能据reduce_dtype静态值推断根因。
+  该诊断缺少各CP rank局部梯度及实际归约顺序，不等同FSDP梯度归约；
+  下一步应以生产通信组重建各rank局部贡献的舍入、求和与累计。
+  未调容差/eps或改变生产dtype，原15保持开放。
+- autograd.grad会触发probe tensor hook，但最终reference backward覆盖
+  同forward记录的梯度；不采用额外诊断反向的中间值作为最终比较证据。
+- 格式自动修改审阅后适用pre-commit通过，日志
+  `/tmp/llmtuner-reduce-dtype-final-gates-24.log`，diff检查通过。
+  无生产修改、不操作index或commit/push。
+
+### TRAINER-TRIAXIS-LOCAL-WGRAD-ROUNDING-25 — 关联15，部分归因完成
+
+- 从独立完整HF参考的已验证激活/梯度构造两层Q/K局部权重梯度：按CP切
+  sequence、TP切heads，逐批dy.T@x，转FP32并在真实CP组all_reduce，
+  转回FP64后累积两批；没有调用生产TP线性或FSDP梯度实现。
+- custom四rank端口29988日志 `/tmp/llmtuner-local-wgrad-25.log`，native
+  29989日志 `/tmp/llmtuner-local-wgrad-native-25.log`，参数分别
+  custom/native noaux adam none fp32_router probe。两个实现所有rank、
+  两层Q/K权重梯度与该独立局部贡献公式max abs均0；native进一步以
+  atol=rtol=0断言通过。脚本最终仍exit1于原全局HF权重断言，未掩盖失败。
+- 结合23的norm输入梯度零差及16的同梯度Adam公式残差，当前诊断场景的
+  Q/K参数梯度差可由CP局部贡献先FP32舍入再求和解释；完整参考FP64
+  先求和再舍入不是同一数值契约。此证据尚不覆盖全部专家参数、aux/full、
+  默认HF gate精度和后续步；不能将15或整个AdamW组合标为完成。
+- 后续需建立明确描述精度/布局的独立参考，覆盖原目标场景与后续状态；
+  不改生产dtype、eps或原验收容差，旧失败记录继续保留。
+- 适用pre-commit通过 `/tmp/llmtuner-local-wgrad-final-gates-25.log`，
+  diff检查通过。无生产修改、不操作index、未commit/push。
+
+### TRAINER-TRIAXIS-AC-LOCAL-ADAM-FORMULA-26 — 关联15，部分归因
+
+- probe跳过in_checkpoint_recompute中的重复forward记录，保留原forward
+  tensor梯度hook；实际AC decoder body计数仍独立，不由此跳过生产计算。
+- custom noaux adam full fp32_router probe、四rank端口29990，日志
+  `/tmp/llmtuner-ac-probe-26.log`：两层Q/K梯度与独立局部归约公式全零差，
+  full AC未改变该结论；最终仍exit1于原HF权重比较。
+- native相同参数端口29991，日志
+  `/tmp/llmtuner-ac-adam-formula-native-26.log`：新增独立首步AdamW状态/
+  更新公式，以归约重建梯度推算exp_avg=0.1g、exp_avg_sq=0.001g²及
+  更新后权重。两层Q/K均通过梯度atol/rtol0、权重atol2e-17/rtol0、
+  m/v atol1e-18/rtol1e-12；此为额外严格公式检查，原1e-6完整HF验收
+  未变且仍失败exit1。
+- 结论仅覆盖首步noaux/full/显式FP32 gate参考下的Q/K，支持此范围
+  “局部舍入归约→Adam状态→参数更新”契约一致；不能替代专家、aux、
+  默认HF gate、后续步或恢复验收，15继续开放。
+- 格式调整审阅后适用pre-commit通过，日志
+  `/tmp/llmtuner-ac-formula-final-gates-26.log`，diff检查通过。
+  无生产修改、不操作index或commit/push。
+
+### TRAINER-TRIAXIS-AUX-LOCAL-CONTRACT-27 — 关联15，开放
+
+- 将26的精确Q/K重建用于custom aux adam full fp32_router probe，四CPU/
+  Gloo rank端口29992，日志 `/tmp/llmtuner-aux-local-wgrad-27.log`，exit1。
+  首层Q权重梯度零容差断言失败，rank1片2048元素中1344不同，max abs
+  4.656612873077393e-10；此次未到达后续原权重验收，不记作相同终点。
+- probe已显示参考输入不同：首层Q norm两批输入梯度差5.8207660913e-11；
+  K norm两批分别5.8207660913e-11、1.1641532183e-10；其输出梯度差
+  约2e-12。noaux曾零差的前提在aux不成立，不能用相同局部公式声称aux
+  梯度应完全一致。26结论保留noaux边界，未弱化严格断言。
+- 生产RouterGateLinear backward把汇合grad_output转FP32；辅助损失通过
+  AuxLossInjection提供独立梯度，完整HF参考用显式CE+aux相加。
+  后续需检查FP32 gate处主/辅梯度合并与舍入顺序，区分数学等价与位级
+  运算差异；这是待验证方向，不作为已确认根因或生产bug。
+- 为精确重建断言补充layer/projection/aux/AC上下文，保留错误终点。
+  格式自动修改审阅后适用pre-commit全部通过，日志
+  `/tmp/llmtuner-aux-local-final-gates-27.log`，diff检查通过。
+  本轮无生产修改、不操作index或commit/push。15和全局验收继续开放。
+
+### TRAINER-TRIAXIS-AUX-NORMALIZATION-REFERENCE-28 — 关联15，开放
+
+- 静态逐项比较生产MicrobatchWiseLoadBalanceLoss：counts使用L1 normalize
+  后乘专家数；softmax scores另行L1 normalize，再求各专家score sum。
+  原独立参考以counts*E/(KT)、softmax mean及每批路由比例表达相同实数
+  目标，但FP32反向路径不同。参考补齐两次显式normalize与sum/step路由
+  分母，仍独立使用HF gate输出、bincount与PyTorch运算，不调用生产aux。
+- custom aux adam full fp32_router probe，四CPU/Gloo rank端口29993，
+  日志 `/tmp/llmtuner-aux-normalize-28.log`，exit1仍为首层Q局部梯度严格
+  重建失败。两批首层Q norm输入梯度差仍5.820766091346741e-11。
+  因此补齐normalize没有消除当前差异，不将该数值契约差异误记为根因。
+- 后续需比较生产router score/probability及其CE/aux梯度分量，包含
+  分布式sum和系数/分母的FP32缩放顺序。原权重验收尚未执行到通过，
+  无容差/eps/生产修改，保留所有既有失败证据。
+- 格式自动修改审阅后适用pre-commit通过，日志
+  `/tmp/llmtuner-aux-normalize-final-gates-28.log`，diff检查通过。
+  不操作index或commit/push，15及全局目标继续开放。
+
+### TRAINER-TRIAXIS-GATE-OUTPUT-GRADIENT-29 — 关联15，开放
+
+- probe映射生产mlp.router.gate与独立HF mlp.gate，统一记录gate logits
+  tensor，tuple取首项，仍跳过AC replay重复记录；生产梯度不作修改。
+- custom aux adam full fp32_router probe，四CPU/Gloo rank端口29994，
+  日志 `/tmp/llmtuner-gate-probe-29.log`。两层两批logits均max abs0；
+  logits梯度差按layer0批0/1、layer1批0/1为4.092726157978177e-12、
+  3.637978807091713e-12、7.275957614183426e-12、3.637978807091713e-12。
+  最终exit1于严格Q/K局部重建，未达到后续全局权重断言。
+- noaux同配置控制端口29995，日志 `/tmp/llmtuner-gate-probe-control-29.log`，
+  两层两批gate logits梯度均0差，局部Q/K公式通过，最终仍在原完整HF
+  权重断言exit1。此证据将aux相关微小差异定位到gate输出反向边界，
+  不支持gate前向投影值错误，不等于已证明aux数值根因或完成原验收。
+- 下一步检查独立aux目标的FP32系数/分母缩放位置及softmax多分支反向
+  合并顺序，不改生产dtype/eps/容差，不将数学等价视为位级等价。
+- 适用pre-commit最终通过 `/tmp/llmtuner-gate-probe-final-gates-29.log`，
+  diff检查通过。无生产修改、不操作index或commit/push；15继续开放。
+
+### TRAINER-TRIAXIS-AUX-SHARED-SOFTMAX-30 — 关联15，部分归因
+
+- 先对齐FP32辅助目标缩放：raw*(0.01*reciprocal(int denominator))，
+  指标另保留raw/denominator。custom aux/full/FP32 gate probe端口29996
+  仍exit1，gate梯度差不变；日志 `/tmp/llmtuner-aux-scale-30.log`。
+- 进一步核对计算图：生产CE路由与aux共享同一softmax概率；参考原来从
+  logits重算softmax，两分支在logits才合并梯度。显式FP32 gate诊断改为
+  保存本次forward概率，HF gate hook附带该tensor，aux独立公式复用它；
+  默认HF gate无此tensor时仍独立重算，不修改默认gate实现。
+- custom aux adam full fp32_router probe端口29997，日志
+  `/tmp/llmtuner-shared-softmax-30.log`：两层两批gate logits梯度全0差，
+  两层Q/K局部梯度重建及首步Adam状态/权重严格公式断言全部通过。
+  最终exit1仍为原完整HF专家w1_EFD权重比较，未宣称完整验收。
+- 结论：此诊断中aux gate梯度差来自共享/重复softmax导致FP32反向合并
+  位置不同；仅缩放顺序不足以解释。原独立数学目标未变，保留旧失败证据，
+  无生产dtype/eps/容差修改。专家梯度归约与后续步、默认HF参考仍待验收。
+- 适用pre-commit最终通过，日志
+  `/tmp/llmtuner-shared-softmax-final-gates-30.log`，diff检查通过。
+  无生产修改、不操作index或commit/push，15及全局目标继续开放。
+
+### TRAINER-TRIAXIS-EXPERT-LOCAL-REPLAY-31 — 关联15，部分验证
+
+- 显式probe记录生产inner_experts每批实际输入、expert counts与输出梯度，
+  跳过AC replay重复forward。首步使用更新前权重clone，独立逐专家
+  F.linear→SiLU*up→F.linear，autograd.grad获取三组权重梯度，按FP32
+  CP all_reduce、FP64两批累积，打印与生产重建梯度的max abs。
+- custom noaux adam full fp32_router probe，四CPU/Gloo rank端口29998，
+  日志 `/tmp/llmtuner-expert-probe-31.log`：两层w1/w3/w2、所有rank局部
+  重放梯度max abs均0。原完整HF权重检查仍失败exit1，未修改原验收。
+- 范围：这是生产dispatcher边界上的独立专家计算/归约参考，输入和输出
+  梯度来自生产，不能证明token选择、排列、combine或完整HF专家等价，
+  不能用此零差关闭15。后续需要独立HF选择映射到实际token序列，检查
+  排序与主/辅梯度权重；aux场景与后续步仍开放。
+- 适用pre-commit最终通过，日志
+  `/tmp/llmtuner-expert-probe-final-gates-31.log`，diff检查通过。
+  无生产修改、不操作index或commit/push；全局目标保持开放。
+
+### TRAINER-TRIAXIS-DISPATCH-TOKEN-MULTISET-32 — 关联15，部分验证
+
+- 保存独立HF每批每层top-k选择，配合完整post-attention norm激活，
+  仅依据CP连续片与EP专家范围构造每个expert期望token。与生产inner
+  expert输入按counts分段逐一比较，lexicographic排序保留重复次数，
+  shape与atol/rtol0断言，不使用生产dispatch索引作为参考。
+- custom noaux adam full fp32_router probe，四CPU/Gloo rank端口29999，
+  日志 `/tmp/llmtuner-dispatch-reference-32.log`：两层、两批、每个本地
+  expert输入token集合与重复次数全部精确通过；局部专家重放梯度仍0差。
+  最终仍exit1于原完整HF权重断言，不记为完整脚本通过。
+- 此证据独立覆盖输入token归属/多重集合，不覆盖内部排序、combine
+  权重、输出反向映射或aux/后续step。下一步需要token身份与权重对照，
+  不能以输入集合正确推断dispatch/combine完整正确。15继续开放。
+- 格式调整审阅后适用pre-commit最终通过，日志
+  `/tmp/llmtuner-dispatch-reference-final-gates-32.log`，diff检查通过。
+  无生产修改、不操作index或commit/push，全局目标保持开放。
+
+### TRAINER-TRIAXIS-COMBINE-WEIGHTED-GRADIENT-33 — 关联15，部分验证
+
+- 独立保存HF路由top-k weights，按CP/EP及token身份，对每个专家构造
+  期望输出梯度=HF MoE输出梯度*该token对应路由权重。以输入行的
+  lexicographic排列对应实际梯度，保留重复次数；使用atol1e-18/rtol1e-12
+  检查combine反向，不调用生产combine索引或权重作为参考。
+- custom full AC、FP32 gate参考，noaux/aux两种场景四CPU/Gloo rank，
+  端口30000/30001，日志 `/tmp/llmtuner-combine-reference-33.log`、
+  `/tmp/llmtuner-combine-reference-aux-33.log`。两层两批所有expert输入
+  集合及加权输出梯度断言均通过，专家局部重放梯度全部0差。
+- 两次最终仍exit1于原完整HF权重比较；aux首个专家w1_EFD仅1/12288
+  元素失败，max abs2.020802345722994e-6，不能把局部检查通过当作
+  原1e-6整体验收。尚需独立专家局部计算排序与FP32归约精度参考。
+- 此处输入按值匹配，当前fixture不含歧义重复行，未证明任意重复激活
+  下的身份匹配；不覆盖其他dispatcher、native、后续步或恢复。
+  后续可使用明确token id验证重复身份，不扩展本证据范围。
+- 适用pre-commit最终通过，日志
+  `/tmp/llmtuner-combine-reference-final-gates-33.log`，diff检查通过。
+  无生产修改、不操作index或commit/push；15与全局目标保持开放。
+
+### TRAINER-TRIAXIS-INDEPENDENT-EXPERT-ADAM-34 — 关联15，部分归因
+
+- 专家局部重放改用独立HF激活、选择、路由权重及MoE输出梯度。根据
+  已验证输入行匹配，反转lexicographic排序恢复实际排列；重放的计算值
+  不再取生产input/dy，生产只提供顺序和counts验证边界。参数仍为首步
+  更新前fixture权重，未调用生产专家forward/backward。
+- custom aux adam full fp32_router probe，四rank端口30002，日志
+  `/tmp/llmtuner-independent-expert-34.log`：两层w1/w3/w2梯度仍全部零差。
+  native相同参数端口30003日志 `/tmp/llmtuner-independent-expert-native-34.log`，
+  增加梯度atol/rtol0、独立首步AdamW权重atol2e-17/rtol0、m/v
+  atol1e-18/rtol1e-12断言，所有专家均通过。
+- 两次最终仍exit1于原完整HF专家权重比较，非完整脚本通过。当前证据
+  支持显式FP32 gate/共享softmax、局部专家排序与FP32 CP归约契约下，
+  首步专家梯度/Adam状态/更新一致；完整HF FP64先求和的参考不是相同
+  舍入路径。尚未覆盖后续步、默认HF精度、独立token-id重复消歧、恢复。
+- 下一步应将已明确的独立数值契约组织为完整多步参考，保留原HF差异
+  对照，不能以本次首步证据关闭15或整个并行矩阵。
+- 格式调整审阅后适用pre-commit通过，日志
+  `/tmp/llmtuner-independent-expert-final-gates-34.log`，diff检查通过。
+  无生产修改、不操作index或commit/push，全局目标继续开放。
+
+### TRAINER-REFERENCE-CUMULATIVE-AND-PROBE-CONTRACT-35
+
+- 累积参考修正后回归原native/custom aux SGD full AC联合场景，四CPU/
+  Gloo rank各三步exit0；27参数梯度/更新/动量、EMA、aux、WSD顺序与
+  body calls=[4,4]全部通过原容差。端口30004/custom、30005/native，日志
+  `/tmp/llmtuner-trainer-cumulative-{custom,native}-35.log`。
+- 审查发现位置参数此前拼错会静默关闭机制；probe精确重建要求FP32 gate
+  参考且首步AdamW状态可用，脚本未明确约束。新增合法选项及多余参数
+  检查，probe必须adam+fp32_router；docstring同步两层两批实际范围。
+  probe对每节点/专家每step记录数强制等于2，明确排除重放记录混入。
+- 新契约真实native aux adam full fp32_router probe端口30006，记录数
+  与局部梯度/Adam公式通过，最终仍exit1于原专家权重比较，日志
+  `/tmp/llmtuner-trainer-probe-records-35.log`；不把预期失败记作组合通过。
+- 适用pre-commit通过 `/tmp/llmtuner-trainer-arguments-gates-35.log`，
+  diff检查通过。本轮仅测试/台账，不重复全CPU套件、不操作index或提交。
+  AdamW完整多步独立数值参考、恢复及目标设备仍开放，原15未关闭。
+
+### TRAINER-EXPERT-TOKEN-IDENTITY-GUARD-36
+
+- 审查发现专家combine梯度按激活值匹配，只在每expert输入行唯一时
+  能推断身份。新增torch.unique逐expert检查，重复行明确要求显式token ID，
+  不将排序后的重复行梯度任意配对。另每step清空expert_records，避免
+  后续step将历史批记录与当前参考混用；首步公式检查范围保持。
+- custom aux adam full fp32_router probe，四CPU/Gloo rank端口30007，
+  日志 `/tmp/llmtuner-token-identity-36.log`。当前两层两批所有expert唯一性
+  及既有combine/局部公式通过，最终仍exit1于原w1_EFD一个元素权重差
+  2.020802345722994e-6。没有将拒绝歧义当作支持重复token场景。
+- 格式修正后适用pre-commit通过，日志
+  `/tmp/llmtuner-token-identity-final2-gates-36.log`；diff检查通过。
+  本轮仅测试/台账，不重复全CPU套件、不操作index或commit/push。
+  原AdamW完整多步参考、显式重复token身份、恢复及目标设备仍开放。
+
+### CUMULATIVE-CPU-AND-RESTORE-REVIEW-37
+
+- 复核生产EMA.load_state_dict空状态路径：先_tracked_groups校验全部
+  live身份/metadata，再copy当前模型；非空状态复用optimizer FQN恢复。
+  scheduler.load_state_dict先准备所有inner base_lrs/last_lrs，再写进度和lr。
+  本次未确认新的实现缺陷，不作无依据生产修改。
+- 当前完整CPU套件exit0：3672 passed、2 skipped、273 warnings，40.41s，
+  命令pytest -q --disable-warnings，日志
+  `/tmp/llmtuner-cumulative-cpu-37.log`；包含近期不等token累积参考测试。
+  compileall覆盖llmtuner及新增三轴脚本，diff HEAD --check通过。
+- 对git ls-files --cached列出的已跟踪文件执行适用pre-commit，明确排除
+  examples/native_alltoall.py，不纳入外部未跟踪文稿；全部hooks通过，
+  日志 `/tmp/llmtuner-cumulative-tracked-gates-37.log`，审阅后未见生产
+  自动修改，不操作index或commit/push。
+- CPU suite与静态门禁不执行torchrun脚本，不能替代15开放的AdamW三轴
+  完整参考、多步状态、恢复或设备验证。现有首步独立局部公式证据保留，
+  不扩大到完整组合已通过；原全局目标继续开放。
+
+### RNG-EMA-CHECKPOINT-EXACT-38：随机恢复覆盖 EMA
+
+- 扩展 `tests/integration_tests/rng_checkpoint_equivalence.py`，在生产
+  OptimizersContainer、scheduler 和 DistributedCheckpointManager 路径中加入
+  EMA（decay=0.75），每步 optimizer/scheduler 后更新。
+- 保存第2步后继续两步随机训练；新建运行时恢复时先精确比较 EMA 保存边界，
+  再比较继续两步后的 EMA、模型、optimizer、scheduler 和 loss，rtol/atol 均为0。
+- macOS CPU/Gloo，两rank，DDP/native FSDP/custom fine-grained FSDP ×
+  sync/async 六种场景全部退出0；原有rank局部恢复失败协调检查保留。
+  命令：`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=2
+  --master_addr=127.0.0.1 --master_port=30008
+  tests/integration_tests/rng_checkpoint_equivalence.py`；
+  日志 `/tmp/llmtuner-rng-ema-38.log`。
+- 本批仅扩展集成验证，未确认新的生产缺陷；新运行时仍处于同一进程，
+  不覆盖新OS进程、Trainer/loader、拓扑变更、多轴或目标加速器恢复。
+  全局完整恢复验收继续开放。
+
+### CHECKPOINT-EMA-COLDSTART-COORDINATION-39：冷启动失败协调
+
+- 根因：`components/checkpointer/distributed_checkpoint.py` 在模型恢复后、
+  EMA未参与加载时直接调用EMA冷启动；本地跟踪对象校验失败会让其他rank
+  继续进入RNG错误协调，造成通信次序不一致。标准及Kimi布局恢复分支均有此缺口。
+- 修复：两处分支的本地EMA冷启动使用同名错误协调边界；DCP和模型加载
+  仍位于边界之外，不承诺collective故障后可以继续训练。
+- 扩展 `rng_checkpoint_equivalence.py`：排除EMA，rank0冷启动注入异常，
+  要求本rank保留原异常、peer收到对应错误，随后barrier及完整重载成功；
+  精确随机恢复和EMA边界比较继续执行。
+- 两rank CPU/Gloo，DDP/native/custom × sync/async 六场景全部退出0：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=2
+  --master_addr=127.0.0.1 --master_port=30010
+  tests/integration_tests/rng_checkpoint_equivalence.py`；
+  日志 `/tmp/llmtuner-ema-coordination-final-39.log`。
+- 初次端口30009运行因测试EMA类与checkpoint键同名失败，保留日志
+  `/tmp/llmtuner-ema-coordination-39.log`；改用EMA_STATE键后重跑通过。
+- 完整CPU：3672 passed、2 skipped（39.49s），日志
+  `/tmp/llmtuner-cpu-39.log`；适用文件pre-commit、compileall及diff检查通过。
+- 标准CPU恢复路径有实测证据；Kimi分支仅静态复核，目标设备、多轴、
+  独立OS进程与完整Trainer/loader恢复仍开放。
+
+### TRAINER-EMA-FRESH-PROCESS-40：完整训练状态跨进程恢复
+
+- 新增 `tests/integration_tests/trainer_ema_process_resume.py`：三个独立
+  Python进程，真实parse_config、Trainer构造、synthetic loader、train循环和DCP；
+  连续4步 vs 初始2步/独立进程恢复到4步。EMA用程序化配置，动态半衰期0.5、
+  step_bias1、每2步更新，触达第2步历史恢复与第4步再次更新。
+- 恢复进程在首次训练更新前比较全状态快照；结束时再与连续训练比较，
+  model/optimizer/scheduler/EMA/loader/trainer及解码RNG递归精确一致，
+  tensor rtol/atol为0。断言EMA键非空、最终step4/ntokens_seen64、scheduler4。
+- `PYTHONPATH=. TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py` exit0；三个worker均exit0。
+  日志 `/tmp/llmtuner-trainer-ema-process-final-40.log`，产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-vnnikpzz`。
+- 首轮测试在train结束后访问已清理checkpointer失败，日志
+  `/tmp/llmtuner-trainer-ema-process-40.log`保留；改为最终生产save返回后、
+  close之前采集快照。未绕过生产保存、自动加载或清理。
+- 适用文件pre-commit、编译、diff检查通过。本轮仅新增集成验证，
+  沿用39完整CPU基线3672 passed/2 skipped。覆盖单CPU/eager/Qwen3/synthetic，
+  不证明随机模型dropout、多rank、多轴、compile、真实语料或加速器恢复。
+  生产实现本轮无修改；完整矩阵和原AdamW数值开放项继续推进。
+
+### TRAINER-EMA-INDEPENDENT-FORMULA-41：恢复验证非空覆盖
+
+- 复核40测试并补强 `trainer_ema_process_resume.py`：明确要求七类状态
+  model/optimizer/scheduler/EMA/trainer/loader/RNG均存在，loader保存游标2、
+  最终游标4；避免两条轨迹同时遗漏组件仍误判通过。
+- 初始进程额外保存训练前EMA；独立按第2步decay=2**(-1/(0.5*2))和
+  第4步decay=2**(-1/(0.5*3))计算lerp，对全部EMA张量rtol/atol0比较，
+  并要求至少一项实际改变，证明动态调度及恢复历史确实参与最终结果。
+- `PYTHONPATH=. TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py` exit0；三独立worker成功，
+  初始/恢复边界和最终完整状态及独立EMA公式全部精确通过。
+  日志 `/tmp/llmtuner-ema-formula-41.log`；产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-a644irjc`。
+- 静态重读 `datasets/dataloader.py` 恢复前版本/DP/布局检查、失败关闭边界，
+  及 `loader_builder.py` corpus identity构造；本轮未确认新生产缺陷。
+  Grain真实语料跨进程恢复和多轴恢复仍未由本测试证明。
+- 适用文件pre-commit、编译和diff检查通过；仅测试/台账改动，保留39完整CPU
+  基线。全局目标及既有数值/硬件缺口继续开放。
+
+### GRAIN-TRAINER-FRESH-PROCESS-42：本地语料完整恢复
+
+- 扩展 `trainer_ema_process_resume.py corpus`，离线WordLevel tokenizer、
+  64条不同内容/长度JSONL，真实Grain loader、shuffle、thread prefetch、
+  concat_then_split单文档packing；Trainer构造/循环/DCP/EMA保持生产路径。
+- 三独立进程连续4步 vs 2步后重启恢复至4步：首次更新前七类状态和最终
+  全状态精确相同；EMA独立公式继续通过。显式要求Grain version1、
+  local-text-v1语料身份、rank游标存在且2至4步推进，布局保持相同。
+- `PYTHONPATH=. TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py corpus` exit0；
+  最终日志 `/tmp/llmtuner-corpus-resume-final-42.log`，产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-0nh2rls5`。
+  首轮同模式也通过，日志 `/tmp/llmtuner-corpus-resume-42.log`。
+- 适用文件pre-commit、编译、diff检查通过；本轮仅测试与记录改动，
+  沿用39完整CPU基线。此证据覆盖单CPU/eager、本地生成文本fixture、
+  max_num_documents1因果attention；不覆盖实际大规模语料、streaming、
+  多文档block attention、多rank、多轴、compile和加速器恢复。
+  无新确认生产缺陷，原全局审查及数值/硬件开放项保持不变。
+
+### DATA-IDENTITY-UPSTREAM-REVIEW-43：语料身份与恢复边界复核
+
+- 重读 `datasets/{sources,composition,dataloader,loader_builder}.py`，并对照
+  本地torchtitan `torchtitan/components/data/loader.py`：collation→thread
+  prefetch→单一checkpointable iterator及version/DP/rank校验语义一致；
+  本仓库将graph构造留在builder，并增加batch layout/语料身份校验和
+  保留原始恢复异常的清理，属于适配差异，无需为形式一致搬回loader。
+- 核对 `components/tokenizer/huggingface.py` 实际资产读取：tokenizer.json、
+  vocab.txt/vocab.json、merges.txt、tokenizer_config.json、chat_template.jinja
+  均在corpus_data_identity摘要范围；source文件按实际解析顺序纳入内容hash，
+  settings纳入seed、shuffle、packing等配置，路径位置与prefetch深度有意排除。
+  摘要是构造时快照，不保证训练过程中外部修改文件的安全。
+- 核对已有回归覆盖变更语料/seed/tokenizer/声明身份/旧checkpoint拒绝，
+  DCP保留旧身份供loader验证、资产迁移路径不改变身份、stream cursor独立、
+  跨epoch恢复、window shuffle缓存恢复及失败关闭。未确认新的生产缺陷，
+  未重复增加测试或无收益重构。
+- `pytest -q tests/unit_tests/cpu/datasets/test_data_pipeline.py
+  --disable-warnings`：349 passed、10 warnings、9.09s、exit0；
+  日志 `/tmp/llmtuner-data-review-43.log`。本轮仅台账更新，适用文档门禁通过。
+  这些CPU用例不替代多rank或设备端到端恢复；全局目标继续开放。
+
+### GRAIN-ASYNC-FRESH-PROCESS-44：从实际异步checkpoint恢复
+
+- 扩展 `trainer_ema_process_resume.py [corpus] [async]`，interval1，
+  非最终保存要求save_future存在；最终保存仍遵循生产同步路径。
+  async初始进程训练至3步，在第2步异步save返回后采集状态，恢复进程
+  明确load_step2，避免错误地从最终同步checkpoint证明异步恢复。
+- 本地JSONL/Grain/EMA、真实Trainer训练循环，三个独立进程：异步第2步
+  恢复边界七类状态精确相同，继续至4步后与连续4步完整状态及独立EMA
+  公式精确相同。初始进程第3步继续训练验证异步快照不被后续更新污染。
+- `PYTHONPATH=. TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py corpus async` exit0；
+  日志 `/tmp/llmtuner-corpus-async-source-44.log`，产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-sais1sn6`。
+- 先前混合生命周期版本也通过，日志 `/tmp/llmtuner-corpus-async-44.log`，
+  但恢复源是最终同步保存；该证据不计为异步源恢复，已由最终版本补齐。
+- 适用文件pre-commit、编译与diff检查通过，仅测试/记录改动，沿用39CPU基线。
+  此为CPU普通async线程保存，不覆盖pinned-memory stager、多rank/多轴、
+  compile、加速器或故障崩溃时的磁盘耐久性；原全局开放项保持开放。
+
+### TRAINER-NONFINITE-STATE-BOUNDARY-45：更新前停止的状态证据
+
+- 重读 `trainer/trainer.py` train_step、_clip_and_check_finite、_check_finite
+  与train循环：有效性检查位于optimizer→scheduler→EMA之前，非有限值为
+  终止错误，不实现静默跳步；与本地torchtitan training_engine描述的更新顺序对照。
+- 新增CPU回归 `test_nonfinite_step_preserves_model_optimizer_scheduler_and_ema`，
+  先真实执行AdamW/scheduler/EMA一次建立动量和历史，再分别注入有限梯度但
+  NaN loss、有限loss但Inf梯度；执行真实train_step及clip/finite检查，要求报错后
+  模型、完整Adam状态、scheduler和EMA与更新前rtol/atol0精确一致。
+- 定向2 passed、141 deselected；完整 `pytest -q --disable-warnings`：
+  3674 passed、2 skipped、277 warnings、40.45s、exit0，日志
+  `/tmp/llmtuner-cpu-45.log`。适用文件pre-commit、compileall、diff检查通过。
+- 本轮无确认生产缺陷，仅补训练调用链缺失的回归证据；测试为单CPU、
+  手工装配Trainer状态和注入forward/backward，未冒充真实模型/多rank有限性验证。
+  非有限反向可能已经改变梯度、消耗数据/RNG，本测试不声称可原地重试或事务回滚。
+  多轴数值、目标设备与全局完成条件继续开放。
+
+### TRAINER-RESOURCE-LIFECYCLE-46：部分初始化与退出复核
+
+- 重读 `trainer/trainer.py` 构造rollback、train finally、close，
+  `trainer/runtime/assembly.py` 资源注册与seeding顺序，
+  `utils/garbage_collection.py` 重叠所有权，及metrics/profiler退出边界。
+- close逐项释放并保留首个错误；成功释放不重复，失败metrics/loader及
+  已初始化checkpointer保留句柄重试。构造失败保留原始异常并恢复执行设置；
+  成功构造有意保持用户选择的全局执行设置，不误判为退出回滚缺陷。
+  profiler context处理部分enter失败、trace关闭失败后仍关闭memory，GC最后
+  owner关闭才恢复原自动收集状态。未确认新缺陷，未增加重复封装。
+- `pytest -q tests/unit_tests/cpu/test_trainer.py
+  tests/unit_tests/cpu/utils/test_utils.py
+  tests/unit_tests/cpu/components/test_profiler.py
+  tests/unit_tests/cpu/components/test_metrics.py --disable-warnings`：
+  334 passed、34 warnings、13.30s、exit0；日志
+  `/tmp/llmtuner-lifecycle-46.log`。覆盖中断/重复close、部分构造、主要异常保留、
+  失败sink/loader重试和重叠GC等已有回归，不能推导设备allocator行为已实测。
+- 本轮仅记录改动，文档pre-commit和diff检查通过；完整CPU基线沿用45。
+  多轴/目标设备及原数值开放项仍未验收，全局审查继续。
+
+### REVIEW-MANIFEST-CONTRACTS-47：当前源码清单与公共契约
+
+- 当前磁盘 `llmtuner/**/*.py` 共178项，与本文逐文件表格的178个唯一路径
+  集合完全一致，缺失0、失效0；重新核对工作区后执行。此为清单证据，
+  不把已阅读状态扩大为所有实现、设备或组合验证完成。
+- 重读 `accelerator/capabilities.py`、`parallel/stages.py`、`errors.py`，
+  核对 `parallel/parallelize.py` 消费STAGE_ORDER：本地part均按
+  TP→EP→CP→AC→compile→FSDP执行，compile按配置跳过，阶段列表为单一来源。
+  能力探测区分导入/签名/实际grouped_mm运行，未知能力名报错、结果缓存；
+  配置、组合和环境错误保留各自类型。未确认新缺陷或必要结构调整。
+- `pytest -q tests/unit_tests/cpu/accelerator/test_capabilities.py
+  tests/unit_tests/cpu/parallel/test_assembly_stages.py
+  tests/unit_tests/cpu/test_errors.py --disable-warnings`：25 passed、2.60s、exit0；
+  日志 `/tmp/llmtuner-manifest-contracts-47.log`。这些probe/装配契约单测
+  不证明grouped_mm目标shape/backward、真实PP或多轴通信等价。
+- 本轮仅台账更新，文档pre-commit与diff检查通过；45完整CPU基线保留，
+  其余数值、迁移和硬件验收缺口继续开放。
+
+### VALIDATION-AND-RESUME-DEFAULT-48：模式恢复及默认场景回归
+
+- 重读 `trainer/runtime/validation.py`：保存staging完成后才切eval；
+  preserve_rng_state覆盖验证主体，finally恢复各子模块原training标志、
+  HF attention mask属性及flex kernel packed标志，临时loader关闭时保留主要异常。
+  token/result/cleanup本地阶段协调与loss collective保持分离。未确认新缺陷。
+- 复核现有测试覆盖成功/失败后的Python/NumPy/torch随机流、混合子模块模式、
+  dataset mask override、KCP packed拒绝、loader构造/关闭失败和非有限结果。
+  运行 `pytest -q tests/unit_tests/cpu/test_validate.py --disable-warnings`，
+  66 passed、3.95s、exit0，日志 `/tmp/llmtuner-validation-48.log`；
+  该证据不替代真实PP/CP设备验证。
+- 44修改最终脚本后重新执行默认同步合成数据场景：
+  `PYTHONPATH=. TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py` exit0；三独立worker成功，
+  恢复边界/最终七类状态及EMA独立公式保持精确。日志
+  `/tmp/llmtuner-synthetic-final-48.log`，产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-3_cri823`。
+- 本轮仅记录更新，文档门禁与diff检查通过；多轴数值、迁移和设备缺口继续开放。
+
+### PP-CP-CURRENT-TRAJECTORY-49：真实Trainer双轴轨迹复验
+
+- 复核 `pp_cp_equivalence.py` 与 `pp_equivalence.py`：真实Trainer构造、
+  PP调度、生产CP分片/KV autograd及FSDP，CPU显式dense-mask SDPA替代attention。
+  逐步比较独立dense参考的loss、norm、裁剪梯度及参数；未放宽原TOL1e-5。
+- 四rank CPU/Gloo，PP2×CP2，TP/EP/DP均1，1F1B、4个PP microbatch、
+  梯度累积2、global_batch8、seq256、4步AdamW，分别custom/native FSDP。
+  两次均exit0、failed ranks0；custom最大loss误差4.768e-7、梯度5.576e-8、
+  参数4.389e-6。native结果保留完整日志，不以容差内结果宣称逐位相同。
+- 命令公共前缀 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=4
+  --master_addr=127.0.0.1 --master_port=30011
+  tests/integration_tests/pp_cp_equivalence.py 1F1B 2`；native添加
+  `LLMTUNER_TEST_FSDP_IMPLEMENTATION=native`并用端口30012。
+  日志 `/tmp/llmtuner-pp-cp-current-49.log`、`/tmp/llmtuner-pp-cp-native-49.log`。
+- 本轮仅记录更新，未修改生产或断言。此场景无额外DP shard轴，不能证明
+  非平凡FSDP分片组合；未覆盖checkpoint/EMA/compile、headtail、生产flex内核、
+  多轴TP/EP或设备性能。原AdamW三轴开放项与完整矩阵验收保持开放。
+
+### PP-CP-MULTIPART-TRAJECTORY-50：多本地stage调度复验
+
+- 续49，运行Interleaved1F1B及ZBVZeroBubble：四rank CPU/Gloo、PP2×CP2、
+  custom FSDP、每rank2个本地part、6layers、4microbatch、累积2、batch8、
+  seq256、4步AdamW。生产Trainer构造/PP/CP通信及SDPA显式替代边界同49。
+- harness校验模型实际分割、part数、首尾stage及embedding/head所有权；
+  V布局PP rank0同时持有首尾stage，metrics rank据真实布局选择。
+  对独立dense参考逐步比较loss/norm/裁剪梯度/参数，原TOL1e-5未改变。
+- 两场景exit0、failed ranks0；Interleaved最大loss4.768e-7、梯度4.284e-8、
+  参数5.452e-6；ZBV最大参数误差9.930e-6，虽在原容差内但接近阈值，
+  不宣称逐位一致或外推到不同dtype/模型。原始详细误差保留日志。
+- 命令公共前缀 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=4
+  --master_addr=127.0.0.1 --master_port=30013
+  tests/integration_tests/pp_cp_equivalence.py Interleaved1F1B 2`；
+  ZBV使用端口30014、参数 `ZBVZeroBubble 2`。日志
+  `/tmp/llmtuner-pp-cp-interleaved-50.log`、`/tmp/llmtuner-pp-cp-v-50.log`。
+- 本轮无生产/测试修改，仅补矩阵证据；文档门禁与diff检查通过。
+  未覆盖非平凡DP shard、TP/EP、EMA/checkpoint/compile、headtail及设备flex内核，
+  全局审查、迁移和原AdamW三轴问题保持开放。
+
+### DISTRIBUTED-EVIDENCE-CONSOLIDATION-51：矩阵记录同步
+
+- 更新 `distributed_implementation_comparison.md`，将38–50实际证据按
+  PP×CP调度、两rank随机恢复、完整Trainer跨进程及异步源恢复归入表格，
+  每行保留实现/轴度数、容差、生产入口与CPU替代、未覆盖边界。
+- 保留既有15–25失败历史，补后续FP32 router/CE/shared softmax参考修正及
+  首步局部重放边界，明确完整AdamW三轴仍在w1_EFD约2.0208e-6处失败，
+  原1e-6未放宽，生产边界重放不能替代完整多步独立参考。
+- 对照当前脚本和49–50日志、36失败日志及40–44台账；无新增运行结果、
+  无生产/测试修改。文档pre-commit与diff检查通过；保持外部工作区和index，
+  无commit/push。矩阵记录更新不构成全局验收完成。
+
+### FSDP-PREFETCH-HOOK-REVIEW-52：窗口及迁移hook复验
+
+- 重读 `fully_shard_parallel/plan.py::set_fsdp_prefetch_windows` 与默认
+  fully_shard入口窗口构造，对照本地FSDPTurbo distributed/fully_shard_parallel/
+  fully_shard_parallel.py::set_modules_to_prefetch：前向后继窗口与反向逆序前驱
+  语义一致；本仓库校验计数/接口/重复模块，并按共享FSDP state去重。
+  空backward列表仍保留PyTorch隐式策略，不声称关闭隐式预取；EP默认一单元
+  显式窗口的行为保留。pattern路径调用方提供顺序，不推断任意动态执行顺序。
+- `pytest -q tests/unit_tests/cpu/parallel/test_fsdp_contract.py --disable-warnings`：
+  110 passed、4.52s、exit0，日志 `/tmp/llmtuner-fsdp-plan-52.log`。
+- 两rank CPU/Gloo，`fine_grained_fsdp_equivalence.py` exit0：显式前后窗口2，
+  两parent hook各多unit，输入是否需梯度、reshard、重计算、multiple groups
+  四个布尔维度16场景，累积2批/3次更新；独立dense输出/梯度/动量及新运行时
+  DCP恢复通过，保留failed-forward reset断言。
+  命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=2
+  --master_addr=127.0.0.1 --master_port=30015
+  tests/integration_tests/fine_grained_fsdp_equivalence.py`，日志
+  `/tmp/llmtuner-fsdp-prefetch-current-52.log`。
+- 未确认新缺陷，仅补证据；不证明设备stream overlap/performance、任意窗口
+  大小的全设备矩阵、outstanding forwards、compile、PP或EMA/loader/RNG恢复。
+  文档门禁与diff检查通过，全局目标继续开放。
+
+### CUSTOM-FSDP-OUTSTANDING-COMPILE-53：多forward与编译状态复验
+
+- 复核fine_grained_state.py前向根context回收、AC重计算PRE_BACKWARD标记、
+  root callback与reset的所有通信context清理；检查集成脚本确实先完成两个
+  forward，再逆序backward，并对新DCP运行时执行同样路径。
+- 两rank CPU/Gloo，`fine_grained_fsdp_equivalence.py --outstanding-forwards`
+  及追加 `--compile-backend aot_eager` 两次各16场景全部exit0；组合维度为
+  input_grad/reshard/recompute/multiple_groups，显式prefetch2、累积2批、3次更新。
+  输出、输入/参数梯度、动量与独立eager dense参考通过，恢复运行时精确比较及
+  failed-forward reset/clean-state断言通过；编译场景要求unique_graphs>0。
+- 公共命令前缀 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=2
+  --master_addr=127.0.0.1 --master_port=30016
+  tests/integration_tests/fine_grained_fsdp_equivalence.py --outstanding-forwards`；
+  编译场景用30017并追加上述backend参数。日志
+  `/tmp/llmtuner-fsdp-outstanding-53.log`、
+  `/tmp/llmtuner-fsdp-outstanding-compile-53.log`。
+- 本轮无新确认缺陷，仅记录实测证据；aot_eager不证明Inductor、设备stream
+  overlap或性能，也不覆盖完整Trainer/loader/EMA/RNG、多轴或任意执行图。
+  文档门禁与diff检查通过，原全局开放项继续保留。
+
+### CUSTOM-FSDP-MIXED-RESTORE-54：混合精度与AMSGrad恢复复验
+
+- 复核 `fine_grained_checkpoint_equivalence.py`、optimizer/state_dict.py
+  AMSGrad状态集合和param_groups重建：新运行时开关可以不同，恢复采用保存
+  配置及对应max_exp_avg_sq状态，不以新运行时初始化默认值覆盖保存语义。
+- 两rank CPU/Gloo，自定义迁移hook FSDP，BF16/FP16 compute、FP32 reduce/
+  主参数，reshard开关×full AC开关×source AMSGrad开关×target开关共32场景，
+  全部exit0。保存2步后新运行时以不同seed构造；更新前model/AdamW/scheduler/
+  EMA零容差一致，第三步输出、梯度及所有状态再次零容差一致。
+- `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=2
+  --master_addr=127.0.0.1 --master_port=30018
+  tests/integration_tests/fine_grained_checkpoint_equivalence.py`；
+  日志 `/tmp/llmtuner-fsdp-mixed-resume-54.log`。
+- 无新确认生产缺陷或代码修改。此为同进程fresh runtime、同步DCP，
+  不覆盖data/trainer/RNG、compile、异步、拓扑变更、多轴、设备数值与性能；
+  不能替代15完整AdamW三轴独立参考。文档门禁和diff检查通过。
+
+### CUMULATIVE-QUALITY-GATES-55：累计工作区门禁
+
+- 重新读取目标和工作区；复核MC2-TP-PUBLIC-01及11928/12809附近历史证据，
+  当前FP16失败已有多轮CPU替身诊断，缺真实Ascend融合内核梯度/更新契约。
+  本轮不重复同一模拟实验，不以其他FSDP/PP通过覆盖该开放项。
+- 对git ls-files --cached列出的现存文件，加本轮新增Trainer恢复脚本，共401项
+  执行pre-commit全部通过；明确排除受保护examples/native_alltoall.py及外部
+  untracked moonep/prompt文档。日志 `/tmp/llmtuner-tracked-gates-55.log`。
+  compileall llmtuner、git diff HEAD --check通过，保护示例无diff。
+- 复核门禁前后status/numstat，无自动修改生产文件；未操作index、commit或push。
+  完整CPU沿用45的3674 passed/2 skipped；后续仅文档与集成证据整理。
+- 当前仍需完成完整AdamW三轴独立参考、KCP compact padding/state exchange、
+  fixed-router EP1×TP>1适配、MC2目标设备契约与Domino设备重叠等既有要求；
+  静态门禁通过不改变这些验收状态，全局目标未完成。
+
+### FIXED-ROUTER-TP-ADAPTER-CONTRACT-56：布局缺口定位
+
+- 续fixed-router EP1×TP>1开放项，追踪ParallelConfig guard→apply_tp
+  resolve_tp_targets/realize_moe_blocks_tp→TPMoeSequenceBoundary→apply_ep
+  swap_hf_moe_blocks/convert_block：EP1走HF专家F维切片，边界执行sequence
+  all-gather→局部专家→SUM reduce-scatter；EP>1则在TP阶段defer专家到EP，
+  两者契约不同，不能直接复用EP>1行为声称EP1原TP布局已适配。
+- 目前转换只搬专家/路由权重，不搬原HF块上的边界类、_tp_seq_group和
+  tp_sharded_param_names。移除guard会同时丢通信与梯度归约分类，输出及专家
+  梯度均存在错误风险。固定(t+k)%E必须在gather后的全token顺序定义，
+  padding与AC重放也要一致；简单在本地sequence切片重新编号并不等价。
+- 下一实现需保留F维切片和双向sequence collectives，迁移新参数名下的
+  shard元数据，区分constant detached gate的grad=None；对独立全专家固定路由
+  参考比较输出、输入/专家梯度和更新，覆盖TP2、padding、AC、FSDP和共享专家。
+  不以复制所有专家或仅删guard替代原布局要求。
+- 当前guard回归 `pytest -q tests/unit_tests/cpu/test_config.py -k
+  fixed_router_ep1_tp_layout --disable-warnings`：1 passed、285 deselected、
+  2.43s；日志 `/tmp/llmtuner-fixed-tp-boundary-56.log`。仅证明拒绝仍在，
+  不是功能迁移完成。本轮记录定位，无生产修改；文档门禁通过，开放项保留。
+
+### FIXED-ROUTER-TP-CHECKPOINT-CONTRACT-57：持久化布局缺口
+
+- 续56追踪apply_tp末尾 `_tp_checkpoint_layouts`：HF专家键分别记录
+  experts.gate_up_proj(dim1,fused=True)和experts.down_proj(dim2)，而原生MoE
+  转换产生routed_experts.inner_experts.w1_EFD/w3_EFD/w2_EDF；只迁移边界和
+  tp_sharded_param_names仍不足，根模型checkpoint布局也须映射至新键名。
+  此为实现前必须覆盖的第三类元数据，不以forward通过当作完整适配。
+- 核对原生MoE staged padding mask在forward/AC重放中保持，若增加sequence
+  gather必须同步gather mask，按全token序列编号固定路由；shared_expert现有
+  tp_enabled拒绝也需独立处理，不能静默丢共享分支。功能适配仍未完成。
+- 修正 `expert_parallel/model_replacement.py` 模块说明：融合权重在dim1
+  分为(E,F,D)，GEMM输出才沿最后轴分割；对照hf_inspection.py的实际切片，
+  消除权重转换说明歧义，无行为变更。适用pre-commit及diff检查通过。
+- 未删除配置guard或声称组合支持，下一实现验收须额外包含新键下的TP
+  checkpoint保存/恢复及首次更新前状态比较。全局目标继续开放。
+
+### Checkpoint TP 预检失败边界复核（批次 58）
+
+- 路径：`llmtuner/parallel/tensor_parallel/checkpointing.py`、
+  `tests/unit_tests/cpu/parallel/test_checkpoint_preflight_interrupts.py`。
+- 核对确认维度合法性检查先于 shape 维度索引，原疑点不成立，生产实现无需修改。
+- 新增六个 CPU 回归场景：保存/加载分别覆盖非法维度、peer 失败和清单不一致；
+  断言预检交换完成后抛出对应异常，且未进入张量 gather 或布局切片 rank 查询。
+- 验证：定向 12 passed；完整 CPU 3680 passed、2 skipped（39.68 秒）；
+  适用 tracked 文件及新增恢复脚本的 pre-commit、compileall、差异检查通过。
+  日志：`/tmp/llmtuner-cpu-58.log`、`/tmp/llmtuner-tracked-gates-58.log`。
+  此处通信使用 mock，只证明本地预检控制流，不能替代
+  多进程 collective 或设备验收；fixed router EP1×TP、多轴 AdamW 数值缺口仍开放。
+
+### Fixed router EP1×TP2 转换缺口实证（批次 59）
+
+- ID：`FIXED-ROUTER-TP-CONVERSION-59`；优先级 P1；状态：已复现、未修复。
+- 路径：`parallel/expert_parallel/model_replacement.py::swap_hf_moe_blocks`、
+  `parallel/tensor_parallel/tensor_parallel.py::realize_moe_blocks_tp`（均相对 `llmtuner/`）。
+- 根因：TP 把 HF 专家 F 维分片并安装 gather/reduce-scatter 边界，随后转换为
+  原生 MoE 时未迁移该边界。转换后 w1 保持 `(8,24,64)`，但直接消费本地 token，
+  缺少输入 gather、输出求和；rank1 固定路由还从局部 token 0 重新编号。
+- 两 rank CPU/Gloo、FP64、8 experts/top2、8 token、随机种子 199、无 AC/aux，
+  参考使用原始完整 HF 权重及独立逐专家 FFN/固定路由公式；绝对误差验收 1e-10。
+  实测边界标记 True→False，rank0/1 输出最大误差分别
+  0.002872313451023154 / 0.004481270572959082，退出 1。
+- 命令：`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2
+  --master_addr=127.0.0.1 --master_port=30019 /tmp/llmtuner-fixed-tp-probe-59.py`。
+  原失败日志保留 `/tmp/llmtuner-fixed-tp-probe-59.log`；持久化验收入口为
+  `tests/integration_tests/fixed_router_tp_equivalence.py`，批次59时预期失败（后续修复见批次60）。
+  持久脚本端口 30020 复跑同样退出 1、误差一致，日志
+  `/tmp/llmtuner-fixed-tp-acceptance-59.log`；两次进程均已结束。
+  新脚本与台账的 pre-commit、差异检查通过；本批无生产代码修改。
+- 普通 ParallelConfig 已拒绝此组合，本脚本明确测试低层变换，不宣称公开支持。
+  下一步迁移序列与 padding 边界、分片参数名称及 checkpoint 布局，补梯度、更新、
+  AC、shared expert、FSDP 和恢复验收后再移除组合限制；不得靠复制专家绕开 TP。
+
+### Fixed router 特征 TP 边界与 checkpoint 布局修复（批次 60）
+
+- 延续 `FIXED-ROUTER-TP-CONVERSION-59`，状态：底层边界已修复，公开组合验收未完成。
+- `block_conversion.py` 新增 FeatureParallelMoE：保留专家 F 分片，输入沿序列 gather、
+  输出 SUM reduce-scatter；padding mask 按 batch/sequence 还原后 gather，保持本地
+  staged mask 不变供 AC 重算复用。迁移 TP 分片名称，避免复制参数归约混入专家分片。
+- `model_replacement.py` 同步迁移 checkpoint 注册：HF packed gate/up 拆成 w1/w3，
+  去掉 packed 标记；down 映射 w2，保留原 owner、分片维度及通信组；构造失败不安装。
+- 原双 rank 探针输出误差下降至 6.51e-19 / 1.08e-18，日志
+  `/tmp/llmtuner-fixed-tp-boundary-60.log`，退出 0。
+- 扩展 `fixed_router_tp_equivalence.py`：2 rank Gloo、FP64、TP2/EP1、其余轴1、
+  eager、aux0、SGD 单更新，2D/3D × full AC 开关 × 显式/staged padding 八种情况；
+  对照独立 full-expert 公式验证输出、输入/专家梯度、更新、有效 token 计数，
+  atol/rtol=1e-10；验证 TP 全量 gather 与 slice 后状态逐位一致。
+- 首次扩展脚本误用展示层路径导致 KeyError，失败日志
+  `/tmp/llmtuner-fixed-tp-gradient-60.log` 保留；改为读取真实 named_modules 路径后，
+  端口30023运行八场景全部通过，日志 `/tmp/llmtuner-fixed-tp-gradient-final-60.log`。
+- 端口30024追加验证全量 gather 权重等于独立完整权重 SGD 更新，八场景通过，
+  日志 `/tmp/llmtuner-fixed-tp-checkpoint-60.log`；相关 CPU 单测 101 passed，
+  全量 CPU 3680 passed、2 skipped（38.78秒），日志 `/tmp/llmtuner-cpu-60.log`。
+  适用 tracked 文件及两个新增集成脚本的 pre-commit、compileall、差异检查通过。
+  公开配置限制继续保留；shared expert、aux 非零、
+  full Trainer、FSDP、多步独立运行时恢复、compile 和目标设备仍需补验，不把
+  当前局部 state gather/slice 称为完整 checkpoint 恢复验收。
+
+### Feature TP 辅助梯度重复注入修复（批次 61）
+
+- ID：`FIXED-ROUTER-TP-AUX-61`；P1；底层已修复，公开组合验收仍开放。
+- 新增非零 aux=0.03 场景后，两 rank router 梯度在 SUM 后为独立参考两倍，
+  最大绝对误差 0.0023173154331743717，相对误差1；原失败日志
+  `/tmp/llmtuner-fixed-tp-aux-before-61.log`（端口30025，退出1）。
+- 根因：完整 token 已由 feature TP gather，每个副本的 AuxLossInjection 都注入
+  完整梯度，输入 gather backward 和 replicated router SUM 再累加这些副本。
+- `MicrobatchWiseLoadBalanceLoss` 接收 token_replication_size，仅对辅助梯度
+  除以副本数，保持原 metric；完整 token 副本不再执行 TP statistics reduction。
+  `convert_block` 仅在 feature TP 边界上设置该度数，其他路径保持默认1。
+- 端口30026，两 rank CPU/Gloo、FP64、TP2/EP1、其余轴1、eager、SGD单更新，
+  2D/3D × full AC开关 × 显式/staged padding × aux0/0.03共16场景通过。
+  保留原输出/专家/输入梯度与更新容差1e-10；router与metric沿用独立参考既有
+  FP32容差atol1e-7/rtol1e-6。日志 `/tmp/llmtuner-fixed-tp-aux-after-61.log`。
+- 新增五个非法副本数输入回归，确认抛错发生在全局aux实例注册前；aux单测
+  41 passed。最终完整CPU 3685 passed、2 skipped（39.01秒），日志
+  `/tmp/llmtuner-cpu-final-61.log`。初次pre-commit发现测试打印行超长，修正后
+  全部适用tracked文件与新增集成脚本通过，日志
+  `/tmp/llmtuner-tracked-gates-final-61.log`；compileall与差异检查通过。
+- 生产Trainer的 replicated router归约在本测试中以显式SUM执行，尚未证明
+  full Trainer、SPMD多轴、shared expert、FSDP、compile或目标设备组合；
+  ParallelConfig限制继续保留。未将当前state gather/slice作为独立进程恢复证据。
+
+### Feature TP 全 padding 与 AC 机制触达（批次 62）
+
+- 延续 `FIXED-ROUTER-TP-CONVERSION-59` / `FIXED-ROUTER-TP-AUX-61`，不改变公开支持范围。
+- `fixed_router_tp_equivalence.py` 增加全 padding：全局有效路由 token 分母为0，
+  aux reference与实际metric/梯度均核对零值；输出和专家计算仍执行，不把 padding
+  当作跳过专家计算。保留原混合padding、显式/staged、2D/3D、aux0/.03、AC开关，
+  两 rank TP2/EP1、FP64、Gloo、SGD单更新共32场景。
+- 端口30027全部通过，日志 `/tmp/llmtuner-fixed-tp-padding-62.log`。追加router
+  hook要求正常forward调用1次、AC调用2次，并验证重算后staged mask保持本地布局。
+  端口30028复跑32场景全部通过、退出0，日志 `/tmp/llmtuner-fixed-tp-replay-62.log`；
+  定向pre-commit与差异检查通过，进程已结束。
+- 低层已feature-shard模型再传入非空EP组尚无组合验收；普通装配在EP>1时不做
+  此专家F分片。后续需独立检查双分片及重叠通信组，不以现有局部脚本宣称支持。
+- 本批仅扩展验收脚本，无生产代码改动；完整CPU结果复用批次61，新增分布式
+  验证单独记录，不用CPU测试数量替代collective与重算机制验证。
+
+### Feature TP shared expert 保留与命名迁移（批次 63）
+
+- 延续 `FIXED-ROUTER-TP-CONVERSION-59`；底层 shared expert 路径推进，公开配置仍拒绝。
+- `convert_block` 仅对已有feature TP边界且EP组为None的shared expert允许转换；
+  已验证的gate/up/down特征分片原样复用，迁移shared_experts参数名称，
+  防止trainer将不同特征分片当作复制参数SUM。TP×EP shared expert原有拒绝保留。
+- checkpoint登记将HF singular shared_expert改为原生shared_experts；plural保持。
+- 集成脚本显式构造三投影共享MLP，独立参考用原始完整权重F.linear/SiLU公式，
+  验证共享分支输出、输入及共享参数梯度；不是DeepSeek真实模型家族的整链验收。
+  TP2/EP1、CPU/Gloo、FP64、SGD单更新、无compile，原32场景×无共享/singular/plural，
+  共96场景端口30029通过，日志 `/tmp/llmtuner-fixed-tp-shared-63.log`。
+- 追加共享checkpoint gather权重与独立完整权重SGD更新比较，继续保留所有原断言，
+  不放宽输出/输入/专家容差1e-10；router和metric保持FP32既有容差。
+- 端口30030最终96场景全部通过、退出0，日志
+  `/tmp/llmtuner-fixed-tp-shared-final-63.log`；完整CPU结果见
+  `/tmp/llmtuner-cpu-63.log`（3685 passed、2 skipped，38.84秒）。
+  适用tracked文件及两个新增脚本pre-commit通过，
+  日志 `/tmp/llmtuner-tracked-gates-63.log`；compileall、差异检查通过。
+- 尚缺真实家族full Trainer、FSDP、compile、多步恢复及设备验收，组合限制未移除。
+
+### TP checkpoint 注册 owner 边界修复（批次 64）
+
+- ID：`TP-SHARED-LOCAL-REGISTRATION-64`；P1；已复现并修复。
+- `model_replacement.py` 迁移singular shared_expert路径时，错误假设相对登记名称
+  也含shared_expert前缀。若登记位于共享模块自身，name为weight，rsplit抛ValueError。
+  这发生在安装replacement之前，但阻止了本应有效的转换。
+- 新增CPU回归直接复现，修复前1 failed；日志
+  `/tmp/llmtuner-shared-owner-before-64.log`。修复只改写含此前缀的祖先相对路径，
+  共享模块被原样复用，其局部weight登记无需改名。
+- 集成脚本增加模型根/MoE块两种owner登记，TP2/EP1、其余轴1、CPU/Gloo、FP64、
+  eager、SGD单更新，原96场景×2=192场景全部通过，端口30031，日志
+  `/tmp/llmtuner-fixed-tp-owner-64.log`；仍核对独立输出、梯度、更新及global gather。
+- 此192场景验证早于上述局部owner修复，根/MoE块路径不受该修复影响；共享模块
+  自身登记通过新增CPU回归验证，不把其当作独立分布式恢复证据。
+- 修复后端口30032再次运行192场景全部通过，退出0，日志
+  `/tmp/llmtuner-fixed-tp-owner-final-64.log`。完整CPU 3686 passed、2 skipped，
+  39.49秒，日志 `/tmp/llmtuner-cpu-64.log`；适用pre-commit、compileall和
+  差异检查通过，日志 `/tmp/llmtuner-tracked-gates-64.log`；运行进程均结束。
+- 未扩展公开配置支持，完整Trainer、FSDP、compile、设备与独立进程恢复仍待验收。
+
+### 被替换专家 owner 的 TP 登记迁移（批次 65）
+
+- ID：`TP-EXPERT-LOCAL-REGISTRATION-65`；P1；已复现并修复。
+- 原因：HF experts自身持有的_tp_checkpoint_layouts在转换后写回旧experts对象，
+  此对象已不在模型树；后续全量TP保存因此无法发现分片登记。
+- CPU回归确认新grouped experts缺少属性；修复前1 failed、1 passed、64 deselected，
+  日志 `/tmp/llmtuner-expert-owner-before-65.log`。修复将owner改为新inner_experts，
+  相对gate_up_proj拆为w1/w3，down_proj改为w2并取消packed，维度与通信组保留。
+- 验收脚本在根/MoE owner基础上添加experts owner：TP2/EP1、CPU/Gloo、FP64、
+  eager、SGD单更新，共288场景；覆盖共享分支两种命名、padding、aux、AC，
+  保留全量权重与独立SGD参考比较及恢复slice逐位校验。
+- 端口30033全部288场景通过、退出0，日志
+  `/tmp/llmtuner-fixed-tp-expert-owner-65.log`；完整CPU 3687 passed、2 skipped，
+  41.04秒，日志 `/tmp/llmtuner-cpu-65.log`。适用pre-commit、compileall与
+  差异检查通过，日志 `/tmp/llmtuner-tracked-gates-65.log`；所有任务结束。
+- 公开组合支持不变，独立进程完整状态恢复、FSDP、compile、设备仍为缺口。
+
+### Feature TP AOTAutograd 与 AC 编译缺口（批次 66）
+
+- ID：`FIXED-ROUTER-TP-AC-COMPILE-66`；P1；开放，未宣称compile全组合支持。
+- `fixed_router_tp_equivalence.py --compile` 新增目标矩阵：TP2/EP1、CPU/Gloo、FP64、
+  aot_eager、3D/staged混合padding、experts owner，aux0/.03 × 无共享/singular/plural
+  × AC开关，共12场景。每场景reset Dynamo并要求unique_graphs>0，保留独立数值、
+  梯度、更新与checkpoint断言；默认eager 288矩阵不变。
+- 端口30034无AC六场景均通过，首个AC场景零编译图失败。端口30035诊断发现
+  测试router hook修改外部Python list导致HOP Unsafe side effect；移除compile模式
+  的测试探针，eager仍检查router调用次数，不修改生产模型、不更改Dynamo设置。
+- 端口30036重跑无AC六场景通过；首个AC场景仍零图，实际graph_break为
+  `aten._local_scalar_dense.default`数据依赖非Tensor输出，退出1。
+  原失败日志 `/tmp/llmtuner-fixed-tp-compile-66.log`、诊断日志
+  `/tmp/llmtuner-fixed-tp-compile-details-66.log`、排除探针后日志
+  `/tmp/llmtuner-fixed-tp-compile-clean-66.log`均保留，进程均结束。
+- 下一步定位checkpoint区域内token dispatch/专家计算的scalar提取及可编译边界，
+  不以取消AC、静默eager回退、修改Dynamo容错开关或跳过图断言宣布通过。
+- 本批无生产修改；定向pre-commit、diff检查通过；CPU单测复用批次65，
+  不把aot_eager局部成功等同Inductor、设备、full Trainer或AC组合验收。
+
+### Feature TP compile 入口初始化与 fullgraph 验收（批次 67）
+
+- 延续 `FIXED-ROUTER-TP-AC-COMPILE-66`。graph_breaks日志定位默认compile+AC
+  的数据依赖为 `models/common/moe/experts.py:212 counts.tolist()`；记录
+  `/tmp/llmtuner-fixed-tp-compile-stack-67.log`，端口30037，退出1。
+- 新增脚本 `--fullgraph`（隐含compile），要求完整图；首跑端口30038在functional
+  collectives版本探测的ImportError回退处失败，日志
+  `/tmp/llmtuner-fixed-tp-fullgraph-67.log`。核对生产apply_tp第989行已在编译前
+  调用functional_collectives，而底层realize脚本遗漏，因此补齐同一初始化。
+- 初始化后端口30039、`--fullgraph`：两rank CPU/Gloo、TP2/EP1、FP64、aot_eager、
+  3D/staged混合padding、experts owner，aux0/.03×无共享/singular/plural×full AC
+  开关12场景全部通过，退出0。日志 `/tmp/llmtuner-fixed-tp-fullgraph-warm-67.log`。
+  每场景reset缓存且要求unique_graphs>0；保留完整输出、输入/专家/router梯度、
+  SGD更新、统计及checkpoint全量参考断言。没有设置capture_scalar_outputs等全局开关。
+- 结论限定：此环境fullgraph允许这些数据依赖通过符号捕获；不能把默认compile
+  的旧零图结果直接归为生产算术bug，也不以fullgraph成功宣称默认模式已修复。
+  默认compile+AC补齐初始化后端口30040仍在首个AC场景零图失败（相同
+  scalar graph break），日志 `/tmp/llmtuner-fixed-tp-default-warm-67.log`，退出1；
+  因而默认模式问题仍开放。Inductor、设备、full Trainer仍未验收。
+- 本批无生产修改，只有测试入口初始化和fullgraph参数；不改变公开配置支持。
+  定向pre-commit、diff检查通过，所有分布式进程已结束。
+
+### 生产 compile 装配契约复核与纠正（批次 68）
+
+- 延续 `FIXED-ROUTER-TP-AC-COMPILE-66`：现有零图失败不足以证明生产缺陷；
+  修正测试装配后目标矩阵通过，full Trainer与设备验收仍开放。
+- 阅读 `parallel/model_compile.py::apply_compile` 与 CompileConfig：生产whole-model
+  为默认非fullgraph；per_block在decoder层fullgraph。原生MoE通过
+  `collect_moe_layers`按layers→mlp发现后自动启用capture_scalar_outputs。
+- 首次仅将裸MoE传给apply_compile（端口30041）仍失败，因为裸块没有decoder
+  layers，未命中MoE检测；日志 `/tmp/llmtuner-fixed-tp-production-compile-68.log`。
+  裸块容器per_block端口30042通过但同样不是完整检测契约，保留日志
+  `/tmp/llmtuner-fixed-tp-production-block-68.log`，不拿它代表生产装配。
+- 测试改为MoEModel.layers[0].mlp结构，AC包decoder，再调用生产apply_compile；
+  断言capture_scalar_outputs由入口启用，无测试手动改Dynamo选项。
+  通信API预解析对齐apply_tp；fullgraph模式使用生产per_block，而非直接torch.compile。
+- 两rank CPU/Gloo、TP2/EP1、FP64、aot_eager、3D/staged混合padding、experts owner、
+  aux0/.03×无共享/singular/plural×AC开关：whole-model端口30043与per_block
+  端口30044各12场景通过、退出0。保留每场景unique_graphs>0及独立参考数值、
+  梯度、SGD更新、统计与checkpoint断言。
+  日志 `/tmp/llmtuner-fixed-tp-production-model-68.log`、
+  `/tmp/llmtuner-fixed-tp-production-layer-68.log`；所有任务结束。
+- 此前default compile失败保留为绕过生产装配的诊断；66号问题在当前CPU目标
+  矩阵上不再指向生产算术或编译bug。尚不能宣称Inductor、真实家族full Trainer、
+  FSDP、独立进程恢复或设备通过，公开组合限制不变。
+- 本批仅修正集成脚本与台账，未改生产；定向pre-commit和差异检查通过，
+  完整CPU复用批次65（本批未改其覆盖的实现）。
+
+### Feature TP 新运行时 DCP 与随机更新恢复（批次 69）
+
+- 新增 `tests/integration_tests/fixed_router_tp_checkpoint.py`，真实
+  DistributedCheckpointManager、OptimizersContainer(AdamW)、scheduler、EMA、RNG状态。
+- 两rank CPU/Gloo、TP2/EP1、其余轴1、FP64、固定router、aux.03、singular共享专家，
+  AC开关×生产whole-model aot_eager开关×sync/async共8场景。
+  原运行时训练2步、保存step2，再继续2步；不同初始化seed的新模型/optimizer/
+  scheduler/EMA从DCP恢复，先比较更新前状态，再对照后续随机输入两步。
+- 输入依赖rank不同的Python/NumPy/torch RNG；router复制梯度显式SUM。异步要求
+  真实save_future，staging后继续更新，close等待保存发布。模型/optimizer/scheduler/
+  EMA以及后续loss均atol=rtol=0逐位一致，端口30045八场景通过、退出0，日志
+  `/tmp/llmtuner-fixed-tp-resume-69.log`。
+- 追加pickle解码的RNG边界检查（Python/NumPy/CPU）与每个新compiled运行时
+  reset Dynamo后unique_graphs>0断言。未降低任何状态或数值断言。
+- 明确范围：同一OS进程中的新运行时，运行真实DCP；不含Trainer、真实dataloader/
+  trainerstate、新OS进程、FSDP、拓扑改变、Inductor或设备。不是完整训练恢复验收。
+- 端口30046最终8场景全部通过，退出0，日志
+  `/tmp/llmtuner-fixed-tp-resume-final-69.log`；所有运行结束。
+  适用tracked文件及三个新增集成脚本pre-commit通过，日志
+  `/tmp/llmtuner-tracked-gates-69.log`；compileall和差异检查通过。CPU实现未改，
+  全量单测复用批次65的3687 passed、2 skipped，不重复运行无关测试。
+- 本批无生产修改，公开组合限制继续保留。
+
+### 混合本地/DTensor EMA 更新修复（批次 70）
+
+- ID：`EMA-MIXED-DTENSOR-70`，P1，已复现并修复；FSDP×TP compile验收仍开放。
+- 扩展fixed_router_tp_checkpoint.py --fsdp：四rank、独立DP2×TP2 mesh，
+  对首个原生MoE应用native fully_shard，保留其他模块本地参数；显式验证router DTensor。
+- 首跑端口30047在EMA foreach_lerp失败，普通Tensor与DTensor混合，日志
+  `/tmp/llmtuner-fixed-tp-fsdp-70.log`。部分FSDP模型属于有效参数布局，不能假设
+  同一model part的全部参数同类型。EMA.step现按类型、device、dtype、mesh和
+  placements分组，每组foreach更新；先完成原有全部身份检查，不更改EMA公式。
+- 端口30048恢复运行：无AC eager/compile的sync/async四场景、AC eager的
+  sync/async两场景均精确恢复通过；随后AC×compiled场景unique_graphs=0失败，日志 `/tmp/llmtuner-fixed-tp-fsdp-after-70.log`，退出1。
+  保留编译图断言，不将eager回退当作通过；后续需检查FSDP/compile装配边界。
+- 当前是低层局部FSDP转换测试，不是Trainer FSDP计划或完整训练恢复；CPU/Gloo、
+  FP64、AdamW、EMA.75、aux.03、共享专家，仍缺设备、真实数据及新OS进程恢复。
+- 完整CPU 3687 passed、2 skipped（44.07秒），日志 `/tmp/llmtuner-cpu-70.log`；
+  全部适用pre-commit、compileall及差异检查通过，日志
+  `/tmp/llmtuner-tracked-gates-70.log`；分布式任务已结束，未commit/push。
+
+### FSDP hook 与 AC 编译区域边界纠正（批次 71）
+
+- 批次70的零图失败经端口30049开启TORCH_LOGS=graph_breaks复现：
+  FSDP _fsdp_common.py:30的禁用编译hook位于checkpoint内部，导致整个AC区域回退。
+  日志 `/tmp/llmtuner-fixed-tp-fsdp-stack-71.log`，退出1，进程已结束。
+- 测试原本shard内部mlp，AC包外层decoder；改为shard已应用AC的decoder，保持
+  AC→compile→FSDP顺序。参数仍由target原引用供真实DCP/optimizer/EMA读取，
+  router DTensor断言与独立DP2/TP2组保留；未改生产实现或放宽图/数值断言。
+- 端口30050四rank CPU/Gloo、DP2×TP2、EP/CP/PP1、FP64、AdamW、EMA.75、aux.03、
+  shared expert，AC×aot_eager×sync/async八场景全部精确恢复通过，退出0。
+  日志 `/tmp/llmtuner-fixed-tp-fsdp-boundary-71.log`。更新前model/optimizer/
+  scheduler/EMA/RNG一致、两次随机更新loss与最终状态逐位一致；compile场景
+  reset后unique_graphs>0，async真实save_future。所有任务已结束。
+- 结论限定为测试边界纠正；不将原失败归为生产bug，也不把局部decoder FSDP
+  视作完整Trainer的专家分片计划、独立参考数值等价、新OS进程或设备验收。
+  公开配置限制继续保留；无生产修改，复用批次70完整CPU结果。
+- 定向pre-commit及差异检查通过，未commit/push。
+
+### 混合EMA逐参数独立更新公式（批次 72）
+
+- 延续 `EMA-MIXED-DTENSOR-70`，补强“恢复一致但可能同错”的数值证据。
+- fixed_router_tp_checkpoint.update在每次EMA更新前逐参数取旧average与当前live tensor，
+  DTensor取对应本地分片，用独立torch.lerp(old,live,.25)计算固定decay=.75参考；
+  真实EMA.step后每个平均值逐位比较，未调用生产foreach分组计算参考。
+- 四rank DP2×TP2、native FSDP decoder、CPU/Gloo/FP64、AdamW、共享专家与aux.03，
+  AC×aot_eager×sync/async八场景通过，端口30051，退出0；原更新前完整状态/RNG、
+  编译图、真实async future和连续/恢复训练断言全部保留。日志
+  `/tmp/llmtuner-fixed-tp-ema-formula-72.log`，进程已结束。
+- 证明范围是每个本地分片及未分片参数EMA公式；仍不替代完整Trainer、真实数据、
+  新OS进程、目标设备或独立完整训练数值oracle。未新增公开支持声明。
+- 本批仅测试与台账修改，定向pre-commit和差异检查通过，复用批次70CPU结果；
+  未commit/push。
+
+### Custom FSDP×feature TP 恢复补验（批次 73）
+
+- 新增fixed_router_tp_checkpoint.py --fsdp --custom-fsdp，使用实际
+  fully_shard_fine_grained包裹AC处理后的decoder；缺少--fsdp时明确CLI报错。
+- 四rank CPU/Gloo、DP2×TP2、EP/CP/PP1、FP64、AdamW、EMA.75、fixed router、aux.03、
+  shared expert；AC×production aot_eager×sync/async八场景通过，端口30052，
+  日志 `/tmp/llmtuner-fixed-tp-custom-73.log`，退出0。
+- 保留DTensor断言、更新前完整model/optimizer/scheduler/EMA/RNG状态、编译图、
+  async save_future、两次随机更新与连续训练逐位对照及EMA逐参数独立公式。
+- 该测试只使用custom FSDP默认decoder上下文，不证明任意模块pattern/prefetch或
+  多hook上下文；也不代表完整Trainer、真实数据、新OS进程或目标设备验收。
+- 本批仅扩展集成脚本与台账，未修改生产实现，公开组合限制不变。
+
+### Custom FSDP 双上下文×feature TP（批次 74）
+
+- 扩展custom FSDP恢复脚本：routed inner_experts独立fully_shard_fine_grained，
+  hook_module为AC处理后的decoder；随后decoder自身分片，形成两个通信上下文。
+  每个原始/恢复运行时更新后直接断言communication_contexts数目为2，
+  不靠可选属性存在与否跳过验证。
+- 四rank DP2×TP2、CPU/Gloo/FP64，AC×aot_eager×sync/async矩阵；原有独立EMA
+  公式、完整状态/RNG恢复、编译图、async future与后续两步逐位比较全部保留。
+- 首跑端口30053八场景通过，日志 `/tmp/llmtuner-fixed-tp-contexts-74.log`；
+  增强上下文必达断言后端口30054复跑八场景全部通过，退出0，日志
+  `/tmp/llmtuner-fixed-tp-contexts-final-74.log`。进程均结束；定向pre-commit
+  和差异检查通过，CPU实现未改，复用批次70全量测试结果。
+- 仍为低层直接调用，不证明pattern入口、任意prefetch窗口或完整Trainer数值
+  等价；公开组合限制不变。仅测试与台账改动，无生产修改。
+
+### Pattern FSDP 入口×TP恢复（批次 75）
+
+- custom恢复脚本改用生产apply_fsdp_by_pattern入口，配置inner_experts独立单元、
+  decoder单元及专家hook_module=decoder，forward/backward prefetch count均2。
+  配置中FSDP DP2，其余并行配置保持1；实际外部TP2由底层变换先构造，
+  不据此宣称ParallelConfig已开放fixed router×TP。
+- 四rank CPU/Gloo、FP64、DP2×TP2、AC×aot_eager×sync/async八场景通过，
+  端口30055，退出0，日志 `/tmp/llmtuner-fixed-tp-pattern-75.log`。
+  保留decoder两个通信上下文、真实DTensor、完整状态/RNG恢复、EMA独立公式、
+  图生成与异步任务断言；所有后续loss与状态逐位一致。
+- pattern路径会设置FSDP归约策略，本脚本只证明连续/恢复一致，不替代与独立
+  dense参考的梯度缩放等价；也未证明prefetch实际overlap或性能。
+- 仅测试入口与台账修改，无生产修改，完整Trainer、新进程及设备仍待验收。
+
+### 并行支持声明与当前证据同步（批次 76）
+
+- 对比文档补充批次59–75矩阵，区分底层独立算术、生产compile入口、新运行时
+  DCP、native/custom FSDP与pattern路径，明确各项轴度数及覆盖边界。
+- ParallelConfig原错误仍声称feature TP未适配，与底层修复现状不符；仅改错误
+  原因为“未完成full Trainer验证”，保留原拒绝条件和UnsupportedCombinationError。
+- 修正文档将TP×EP专家数量分片误写为feature shard的描述，区分EP>1与EP1布局。
+- 定向配置6 passed、280 deselected；完整CPU3687 passed、2 skipped（39.99秒），
+  日志 `/tmp/llmtuner-fixed-config-76.log`、`/tmp/llmtuner-cpu-76.log`；
+  定向pre-commit、compileall和差异检查通过，进程已结束。
+- 历史失败与修正不删除；三轴AdamW、MC2、KCP和Domino设备/性能缺口不关闭。
+  不以恢复一致性代替独立dense梯度/更新等价。
+
+### EP 布局规划失败的注册回滚（批次 77）
+
+- EP-SWAP-LAYOUT-ROLLBACK-77：模型替换先构造 MoE，再迁移 TP checkpoint
+  布局；后者原在回滚区间之外，布局元数据异常会遗留 AuxLoss 注册计数。
+  原模型虽未替换，后续重试的辅助损失指标分母仍会受污染。
+- 将布局规划纳入已有构造回滚区间，全部规划成功后才安装；没有新增封装或通信。
+  回归使用专家自身的不完整布局元数据，修复前明确观察到计数由空增加到2；
+  修复后异常仍传播，注册计数、原模块身份、布局对象和安装标记保持不变。
+- EP 替换测试67 passed；完整CPU3688 passed、2 skipped、274 warnings，
+  38.95秒，退出0，日志 `/tmp/llmtuner-cpu-77.log`。
+  适用tracked文件及三个新增集成脚本pre-commit全部通过，日志
+  `/tmp/llmtuner-precommit-77.log`；排除受保护example及无关未跟踪目录。
+  compileall、Ruff及差异检查通过。本批没有改变通信或数值算法，未新增硬件证据。
+- 全局目标仍未完成；三轴AdamW、完整Trainer fixed-router TP及设备组合缺口继续开放。
+
+### EMA 固定 checkpoint 名称契约（批次 78）
+
+- EMA-FQN-IDENTITY-78：原校验只检查张量身份及元数据；同一参数或选中缓冲区
+  被重命名后仍继续更新，但持久化键沿用构造时名称，与模型 checkpoint 不一致。
+  参数/缓冲区×step/冷启动四项回归均先观察到未抛错，再实施修复。
+- tracked_averages接收具名张量，对照固定param_names按身份检查canonical FQN；
+  全部组验证成功才更新平均值，保持wrapper名称规范化与缓冲区别名选择规则。
+  不更改既有持久化格式；结构变更后须重建EMA。
+- 专项77 passed；完整CPU3692 passed、2 skipped、299 warnings，42.43秒，退出0，
+  日志 `/tmp/llmtuner-cpu-78.log`。
+- 两rank CPU/Gloo、TP2、FP64，fixed_router_tp_checkpoint.py的AC×aot_eager×
+  sync/async八场景均exact，端口30056，退出0，日志
+  `/tmp/llmtuner-ema-names-tp-78.log`；覆盖新运行时AdamW/scheduler/EMA/RNG恢复。
+  该证据不扩展为完整Trainer、设备或FSDP多轴验证。
+- compileall、差异检查及适用文件pre-commit通过。全局未验收项继续开放。
+
+### EMA checkpoint 入口的所有权校验（批次 79）
+
+- EMA-CHECKPOINT-OWNERSHIP-79：批次78只保护更新和冷启动；继承的state_dict及
+  非空load_state_dict仍可绕过固定身份、名称和元数据检查，输出旧FQN或恢复到
+  已脱离模型的张量。保存及非空加载现先复用_tracked_groups完成本地校验。
+- 本地校验位于synchronize_local_errors边界内，随后才调用可能包含TP/EP
+  collective的父实现；空状态冷启动保持本地，由manager既有边界协调。
+  明确API契约：分布式EMA保存及非空加载须所有rank参与，包括复制模型。
+- 参数/缓冲区重命名回归扩展到save/load，检查拒绝前后平均值不变；专项81 passed。
+  两rank真实Gloo中仅rank0重命名：save/load分别传播原错误及peer错误，barrier可达，
+  修复名称后可正常恢复；随后DDP/native FSDP/custom FSDP×sync/async六场景
+  dropout/RNG/EMA恢复逐位一致，端口30057、退出0，日志
+  `/tmp/llmtuner-ema-checkpoint-validation-79.log`。
+- 完整CPU3696 passed、2 skipped、285 warnings，39.01秒，退出0，日志
+  `/tmp/llmtuner-cpu-79.log`；适用文件pre-commit全部通过，日志
+  `/tmp/llmtuner-precommit-79.log`；compileall及差异检查通过。
+- 本批不证明设备通信故障恢复、拓扑变化或未完成的混合并行数值等价；对应项保持开放。
+
+### EMA 加载分支一致性（批次 80）
+
+- EMA-LOAD-BRANCH-80：批次79的非法类型在协调前抛错，空字典也绕过非空加载
+  协调；不同rank输入不一致可能使peer等待。现所有load先协调类型/所有权，
+  再以world MAX检查空/非空模式一致性，拒绝后不修改平均值。
+- 提取有独立本地契约的reset_from_model，DCP两个冷启动路径在既有本地错误
+  协调区间调用它，避免嵌套collective；加载空字典兼容保留但现在要求所有rank参与。
+  模块说明及设计文档记录迁移方式，原冷启动故障测试改在本地重置入口注入。
+- 两rank CPU/Gloo仅rank0输入None、以及仅rank0输入空字典：错误传播正确，
+  barrier可达，保存状态逐位不变。随后DDP/native/custom FSDP×sync/async六项
+  随机训练恢复均exact；端口30058、退出0，日志
+  `/tmp/llmtuner-ema-input-coordination-80.log`。
+- EMA专项81 passed；完整CPU3696 passed、2 skipped、273 warnings，39.46秒，
+  退出0，日志 `/tmp/llmtuner-cpu-80.log`；compileall、差异检查及适用文件
+  pre-commit通过，后者日志 `/tmp/llmtuner-precommit-80.log`。
+- 没有以本地错误协调宣称collective故障可恢复；多轴数值和设备缺口保持开放。
+
+### Optimizer 恢复的跨 rank 校验（批次 81）
+
+- OPTIMIZER-LOAD-PREFLIGHT-81：unflatten只在本地校验Adam状态；rank0形状非法
+  时rank1原会成功返回并可能进入后续EMA通信。两rank回归修复前退出1，rank1
+  明确触发“accepted a peer's malformed checkpoint”，日志
+  `/tmp/llmtuner-optimizer-preflight-before-81.log`（端口30059）。
+- init_optim_state及全部inner optimizer的unflatten纳入本地错误协调区间，
+  TP/EP布局通信留在区间外；所有rank校验通过才应用checkpoint值。
+  加载须所有rank参与，初始化hook必须本地；惰性状态初始化不属于回滚承诺，
+  后续load hook/copy失败仍需完整恢复，未宣称跨optimizer事务性。
+- 两rank CPU/Gloo仅rank0破坏exp_avg形状：保留本地错误、peer收到阶段错误，
+  barrier可达，已初始化状态逐位不变且之后合法加载成功；DDP/native/custom
+  FSDP×sync/async六项随机恢复exact。端口30060、退出0，日志
+  `/tmp/llmtuner-optimizer-preflight-81.log`。
+- 完整CPU3696 passed、2 skipped、288 warnings，39.15秒，退出0，日志
+  `/tmp/llmtuner-cpu-81.log`；compileall及差异检查通过。
+- 设备故障、任意用户通信hook、三轴AdamW和完整Trainer组合验证仍未验收。
+
+### Optimizer 保存的本地失败协调（批次 82）
+
+- OPTIMIZER-SAVE-PREFLIGHT-82：本地init_optim_state或FQN序列化失败原会使peer
+  继续进入EP/TP gather或下一个checkpoint组件。两rank仅rank0重复FQN回归
+  修复前退出1，rank1触发“ignored a peer's serialization failure”，端口30061，
+  日志 `/tmp/llmtuner-optimizer-save-before-82.log`。
+- 将本地初始化、扁平化与重复键校验放入Optimizer checkpoint construction
+  错误协调区间，保持布局通信在外；接口及设计文档明确所有rank参与及本地hook契约。
+- 两rank CPU/Gloo修复后正确传播源错误/peer错误，恢复原FQN后barrier和重试成功，
+  原已初始化状态逐位不变。既有EMA异常、optimizer加载异常及DDP/native/custom
+  FSDP×sync/async六项随机恢复均通过，端口30062，退出0，日志
+  `/tmp/llmtuner-optimizer-save-82.log`。
+- 完整CPU3696 passed、2 skipped、271 warnings，39.45秒，退出0，日志
+  `/tmp/llmtuner-cpu-82.log`；compileall、差异检查及适用文件pre-commit通过，
+  后者日志 `/tmp/llmtuner-precommit-82.log`。
+- 不承诺任意通信hook或进程失联可恢复；下轮回到未验收的多轴数值及完整训练恢复，
+  不以本批错误协调证据关闭这些缺口。
+
+### 新增 checkpoint 协调的组合与新进程复核（批次 83）
+
+- 复核批次77–82累积改动，macOS arm64、torch2.14.0 CPU/Gloo。生产代码本批
+  无新增修改；上轮为确认缺陷修复，本轮补实际组合及完整Trainer恢复证据。
+- 四rank DP2×TP2、custom fine-grained FSDP pattern入口、FP64，
+  fixed_router_tp_checkpoint.py --fsdp --custom-fsdp，端口30063；AC×aot_eager×
+  sync/async八场景全部exact，退出0，日志 `/tmp/llmtuner-custom-tp-checkpoint-83.log`。
+  两个communication contexts、DTensor、异步future、EMA独立公式及新运行时
+  model/optimizer/scheduler/EMA/RNG逐位恢复断言均保留。
+- PYTHONPATH=. python tests/integration_tests/trainer_ema_process_resume.py corpus async
+  退出0，日志 `/tmp/llmtuner-trainer-corpus-async-83.log`。真实Trainer构造/训练、
+  本地JSONL/Grain packing、异步中间保存及三个独立OS进程恢复再次通过，
+  七类状态在加载边界及继续训练后完全一致；动态EMA独立公式通过。
+- 该两组证据不能拼接成“分布式完整Trainer新进程恢复”已通过：前者是低层新运行时，
+  后者为单rank完整Trainer。公开fixed-router EP1×TP限制继续保留，原三轴
+  AdamW多步独立参考及重复token身份仍开放，下一步应补完整数值参考。
+- 本批仅更新证据；CPU套件复用批次82（3696 passed、2 skipped），文档格式及
+  diff检查通过，没有重复运行无关单测或更改容差。
+
+### 完整 Trainer 的 DP2 新进程恢复（批次 84）
+
+- trainer_ema_process_resume.py增加dp2选项；每个continuous/initial/resume作业
+  使用torch.distributed.run --standalone --nproc_per_node=2独立启动，真实Trainer
+  负责native FSDP构造、优化器、数据和checkpoint，不绕过装配或训练循环。
+- 快照按rank独立保存，递归materialize DTensor后精确比较；原七类状态、加载前
+  边界检查、动态EMA独立公式与async future断言保留。明确断言world size及
+  模型实际含DTensor，检查每rank的Grain DP游标前进与本地有效token计数。
+- CPU/Gloo、native FSDP DP2、eager、JSONL/Grain/single-doc packing，sync及
+  async两模式均退出0，三个独立作业中各rank完整状态与连续训练逐位一致。
+  命令：PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py corpus [async] dp2。
+  日志 `/tmp/llmtuner-trainer-dp2-{sync,async-final}-84.log`。
+- 首次DP2通过后新增实际分片断言并复跑；单rank复跑暴露测试直接调用未初始化
+  进程组的错误，改为未初始化时按world1校验，未改变生产实现。
+- 单rank合成数据复跑退出0，日志 `/tmp/llmtuner-trainer-single-final-84.log`；
+  定向pre-commit、compileall及diff检查通过。纯测试改动复用批次82完整CPU结果。
+- 本批新增完整分布式Trainer新进程恢复的DP2证据，范围不扩展到TP/CP/EP/PP、
+  compile、custom FSDP、拓扑变化或设备；三轴AdamW仍开放。
+
+### 自定义 FSDP 完整 Trainer 新进程恢复（批次 85）
+
+- 完整恢复脚本增加custom选项并传入每个worker配置；必须与dp2一起使用。
+  额外断言实际FineGrainedFSDPState，保留DTensor、每rank七类状态、数据游标、
+  更新前边界、动态EMA独立公式与async future全部既有断言。
+- CPU/Gloo、Qwen3、custom FSDP DP2、eager、JSONL/Grain packing，三个
+  独立两rank作业：sync/async各退出0，所有rank在加载边界及续训后状态精确。
+  命令沿用批次84并追加custom；日志 `/tmp/llmtuner-trainer-custom-{sync,async}-85.log`。
+- 共享worker参数调整后，单ranknative合成数据回归退出0，日志
+  `/tmp/llmtuner-trainer-native-regression-85.log`。没有生产修改或容差变化；
+  pre-commit、compileall与diff检查通过，CPU全量复用批次82。
+- 比较文档补充84–85证据及限制；默认custom装配成功不证明任意hook迁移、
+  任意prefetch窗口、compile、拓扑变化或目标设备。三轴AdamW等开放项继续保留。
+
+### 编译完整 Trainer 的 DP2 新进程恢复（批次 86）
+
+- 恢复脚本增加compile选项，通过training.compile及compile_config.backend=aot_eager
+  进入生产完整模型compile装配；每个worker训练后强制unique_graphs>0，避免
+  设置开关却未实际编译。原生/custom两实现均保留实际DTensor/custom state断言。
+- CPU/Gloo、DP2、Qwen3、JSONL/Grain packing、async中间保存，native/custom
+  各三个独立两rank作业均退出0；加载前七类状态、继续至step4、动态EMA独立
+  公式全部精确。命令：PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py corpus async dp2 [custom] compile。
+  日志 `/tmp/llmtuner-trainer-{native,custom}-compile-86.log`。
+- 快照重建DTensor全量并逐rank比较；本地布局没有独立快照验证。编译连续/恢复
+  一致不等同于eager/compile独立算术等价，不覆盖Inductor或目标设备。
+- 本批仅测试与文档，定向pre-commit、compileall及diff检查通过；完整CPU复用82。
+  三轴AdamW、其他并行轴、拓扑变化和设备缺口保持开放。
+
+### 完整恢复的本地 DTensor 布局证据（批次 87）
+
+- TEST-TRAINER-LOCAL-SHARDS-87：84–86快照只比较DTensor重建后的完整值，
+  未独立核对本地分片布局；这是测试证据缺口，未确认生产恢复缺陷。
+- 快照新增local_shards验证数据，记录每个DTensor的本地值、global shape/stride、
+  placements、mesh rank矩阵和axis名称。完整七类训练状态断言保留，附加本地
+  快照参与加载边界/最终状态的零容差比较；DP2强制model/optimizer/EMA各有证据。
+- CPU/Gloo、native/custom FSDP DP2、aot_eager、async、JSONL/Grain，两模式
+  各三个独立两rank作业退出0，所有完整值和本地布局精确一致。命令沿用86，
+  日志 `/tmp/llmtuner-trainer-local-shards-{native,custom}-87.log`。
+- 单rank回归退出0，日志 `/tmp/llmtuner-trainer-local-shards-single-87.log`；
+  定向pre-commit、compileall及diff检查通过，纯测试修改复用82完整CPU结果。
+- 本地快照是测试辅助数据，不写入训练checkpoint，不改变恢复格式或容差。
+  单rank快照要求该附加数据为空；全局开放项不因此关闭。
+
+### Full AC×编译完整 Trainer 新进程恢复（批次 88）
+
+- 阅读trainer计数加载、GC重叠作用域所有权及validation清理；计数已有严格校验，
+  GC已有共享所有权及异常恢复，未为这些合理实现新增修改。
+- 完整恢复脚本增加ac选项，通过training.activation_checkpoint_mode=full进入
+  生产AC装配，每个worker强制两个CheckpointWrapper存在；compile图必达及
+  native/custom实际FSDP状态、本地布局和七类状态比较全部保留。
+- CPU/Gloo、native/custom FSDP DP2、full AC、aot_eager、async、JSONL/Grain，
+  各三个独立两rank作业退出0，加载边界与续训后全量及本地状态精确，EMA公式通过。
+  命令沿用86追加ac；日志 `/tmp/llmtuner-trainer-ac-{native,custom}-88.log`。
+- 本批只改测试与证据，定向pre-commit、compileall及diff检查通过，完整CPU复用82。
+  wrapper存在和恢复通过不证明重计算性能，也不替代不同AC策略、Inductor、其他轴
+  或设备验证；原三轴AdamW多步独立参考等开放项继续保留。
+
+### 验证模式设置的 rank 局部失败（批次 89）
+
+- VALIDATION-MODE-SETUP-89：batch预处理已复用Training batch preprocessing协调，
+  无需再次包裹；validate的mask策略设置与part.eval原未协调，局部异常可能让
+  peer进入后续loader/fetch collective。将这些本地操作纳入独立错误边界，
+  保留finally直接恢复每个module原始training标记及mask/kernel策略。
+- 四rank真实Gloo，DP2×CP2、DP2×TP2：rank0的train(False)先修改模式再抛出
+  原ValueError；peer收到阶段错误，所有rank无前向及loader创建，混合训练模式
+  恢复、barrier可达，同实例随后验证通过独立完整批CE参考，容差1e-7不变。
+  命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=4
+  --master_addr=127.0.0.1 --master_port=30064
+  tests/integration_tests/validation_reduction_equivalence.py，退出0，日志
+  `/tmp/llmtuner-validation-mode-89.log`。模型为局部projection，不能替代真实
+  attention或FSDP/TP模型变换验证；任意用户train()内部通信不在本地协调契约内。
+- 完整CPU3696 passed、2 skipped、285 warnings，39.46秒，退出0，日志
+  `/tmp/llmtuner-cpu-89.log`；初次gate发现行宽/闭包绑定后修正并审阅，最终
+  适用文件pre-commit、compileall和diff检查通过。
+- 未将本地设置失败恢复扩展为前向collective故障可恢复；全局未验收项继续开放。
+
+### 训练中验证与完整恢复的状态隔离（批次 90）
+
+- 恢复脚本增加validate选项，生产ValidationConfig(freq=1,steps=2)令每个
+  训练step后运行真实验证；记录成功pass的step并强制等于实际训练区间。
+  每次验证前后直接snapshot并零容差比较七类状态和本地DTensor布局，
+  避免只用最终恢复一致性间接推断RNG/训练游标/参数未被验证改变。
+- CPU/Gloo、native/custom FSDP DP2、full AC、aot_eager、async中间保存、
+  JSONL/Grain packing，三个独立两rank作业各退出0。验证前后完整状态、
+  加载边界、续训后结果及动态EMA独立公式均精确。
+  命令沿用88追加validate；初跑日志 `/tmp/llmtuner-trainer-validation-{native,custom}-90.log`，
+  增强直接隔离断言后最终日志
+  `/tmp/llmtuner-trainer-validation-{native,custom}-final-90.log`，均退出0。
+- 本批只改测试与文档，pre-commit、compileall及diff检查通过，完整CPU复用89。
+  默认RNG隔离没有覆盖外部私有generator、设备stream或并发Trainer；当前模型
+  为dense Qwen3，不能推广到MoE路由统计、PP或其他轴。全局目标保持开放。
+
+### MoE 完整验证与新进程恢复（批次 91）
+
+- 阅读MoE token计数、aux与quantile histogram，均已有training门控；未确认
+  eval更新缺陷。测试增加moe选项，生产Qwen3 MoE、4专家/top2、aux0.03、
+  fixed_router EP1进入生产替换；验证前后额外逐位比较两个非持久token计数buffer。
+- native/custom FSDP DP2、full AC、aot_eager、async、JSONL/Grain，每step真实
+  验证且直接比较七类状态及local shards；三个独立两rank作业最终均退出0，
+  加载边界与续训状态精确，动态EMA独立公式通过。命令沿用90追加moe。
+  日志 `/tmp/llmtuner-trainer-moe-{native,custom}-final-91.log`。
+- 首跑standalone在模型构造前FQDN解析到198.18代理网段，TCPStore重复重试；
+  保留日志 `/tmp/llmtuner-trainer-moe-{native,custom}-91.log` 及custom-loopback日志。
+  核对活进程后发送中断/终止并确认退出1；没有因观察超时重复启动。
+  测试launcher改用c10d动态loopback endpoint、is_host=true及local_addr=127.0.0.1，
+  仅endpoint不足以覆盖worker广播地址，最终两条路径均正常完成。
+- 定向pre-commit、compileall及diff检查通过；纯测试修改复用89完整CPU结果。
+  此为EP1 fixed MoE，不证明EP>1、quantile router、TP或三轴AdamW数值；缺口保留。
+
+### EP2 完整 Trainer 新进程恢复（批次 92）
+
+- 完整恢复脚本增加ep2选项，必须moe+dp2；生产expert_parallel_size=2，
+  明确检查两层各持有2/4个专家及真实EP2 dispatcher group。DP分片度2与EP2
+  按现有拓扑重叠，非DP2×EP2四rank独立轴；efsdp为1，不宣称专家跨DP分片。
+- native/custom FSDP、固定路由Qwen3 MoE aux0.03、full AC、aot_eager、
+  async、JSONL/Grain、每step验证，各三个独立两rank作业退出0。七类状态、
+  本地DTensor布局、非持久计数隔离及EMA独立公式均通过原零容差检查。
+  命令沿用91追加ep2，日志 `/tmp/llmtuner-trainer-ep2-{native,custom}-final-92.log`。
+- 首跑新增必达断言误用dispatcher属性，两个作业退出1；改为token_dispatcher
+  后复跑通过。保留 `/tmp/llmtuner-trainer-ep2-{native,custom}-92.log`，
+  无生产修改。定向pre-commit、compileall及diff检查通过，CPU复用89。
+- 恢复一致不替代独立dense梯度/更新参考，不覆盖quantile、TP/CP/PP、设备或
+  拓扑变化，三轴AdamW保持开放。
+
+### EP2×efsdp2 完整 Trainer 新进程恢复（批次 93）
+
+- 脚本增加互斥dp4选项，world4/global batch4（每rank一条），EP2对应efsdp2。
+  强制专家DTensor、mesh size2及local numel为全局一半，保留每rank全部既有断言。
+  token计数由实际global batch/world推导，不放宽精确状态比较。
+- CPU/Gloo、native/custom FSDP、Qwen3 MoE固定路由aux0.03、full AC、aot_eager、
+  async、JSONL/Grain及每step验证，各三个独立四rank作业退出0。加载前与续训
+  后七类状态、本地布局、验证隔离、EMA公式全部通过，真实专家FSDP分片必达。
+  命令沿用92将dp2替换dp4，日志 `/tmp/llmtuner-trainer-efsdp2-{native,custom}-93.log`。
+- 本批只改测试与文档，定向pre-commit、compileall及diff检查通过；CPU复用89。
+  证明同拓扑恢复一致，不证明独立dense算术、TP/CP/PP、拓扑变化或设备性能。
+  原三轴AdamW数值等未验收项继续开放。
+
+### 验证前快照的存储别名修复（批次 94）
+
+- TEST-SNAPSHOT-ALIAS-94：snapshot的DTensor重建路径已clone，但普通Tensor原样
+  返回；原地验证修改可能同时改变before快照，导致隔离比较漏报。这是测试缺陷，
+  不是生产模型修改证据。90–93普通Tensor验证前后隔离结论需以本批证据补强；
+  独立文件保存/重新加载及DTensor clone的历史恢复结果不因此自动失效。
+- 普通Tensor统一detach().clone()；每个真实worker启动后保留快照、临时给活参数
+  加1，强制快照检测差异，然后finally恢复原值并断言完整状态精确恢复。
+  保留所有原断言，不修改训练算法或数值容差。
+- 单rank dense eager每step验证，以及四rankcustom FSDP EP2×efsdp2、MoE、
+  full AC、aot_eager、async、JSONL/Grain每step验证的三个独立作业均退出0，
+  检测灵敏度、验证隔离及完整新进程恢复通过。日志
+  `/tmp/llmtuner-snapshot-isolation-{single,custom}-94.log`。
+- 定向pre-commit、compileall及diff检查通过；纯测试修改复用89完整CPU结果。
+  尚未复跑本批native多rank模式，不扩展该增强证据到未运行组合。
+
+### Native FSDP 快照隔离补验（批次 95）
+
+- 续接原session29684，确认最终退出0，没有重复启动。日志
+  `/tmp/llmtuner-snapshot-isolation-native-95.log`，产物目录
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-nsb_kxkb`。
+- 命令：`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py corpus async dp4 compile ac validate moe ep2`。
+- CPU/Gloo、native FSDP EP2×efsdp2、full AC、aot_eager、async、真实Grain语料，
+  三个独立四rank作业通过快照灵敏度、验证前后隔离、完整加载边界与续训精确比较。
+  补齐94所列native增强快照证据缺口；不证明独立数值参考、其他并行轴或设备性能。
+
+### MoE 非持久辅助指标的验证隔离（批次 96）
+
+- 阅读routing.py的training门控与AuxLoss的instance_acc、实例step metric、
+  runtime denominator及class级累积状态；未确认生产eval修改缺陷，不改训练算法。
+  原恢复测试只检查tokens_per_expert_E，不能证明其他非持久scratch隔离。
+- 测试新增独立clone快照，零容差比较instance_acc、_step_metric、
+  _runtime_denominator、group_acc、_group_counts及默认_step_denominator；
+  使用(part index, name)避免PP本地parts同名覆盖。固定两层MoE强制4个buffer、
+  2个AuxLoss实例，防止目标机制未触达而空比较通过。
+- CPU单rank：`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py corpus validate moe`，
+  退出0，日志 `/tmp/llmtuner-aux-validation-96.log`。
+- CPU/Gloo native FSDP EP2×efsdp2：同命令参数为
+  `corpus async dp4 compile ac validate moe ep2`，退出0，日志
+  `/tmp/llmtuner-aux-validation-native-96.log`。完整连续/初始/新进程恢复三个
+  四rank作业通过所有原断言与新增非持久状态隔离检查。
+- 本批仅改测试与台账，定向pre-commit、compileall及diff检查通过；完整CPU复用89，
+  未声称新增检查已覆盖custom、quantile、TP/CP/PP或设备。三轴AdamW数值等问题保持开放。
+
+### 可选 checkpoint 后端的 EMA 冷启动失败传播（批次 97）
+
+- TC-EMA-COLD-START-97（失败传播）：torch_checkpointing后端在模型加载且EMA
+  未恢复时调用EMA.load_state_dict({})，其最终本地reset/copy失败未经协调；
+  rank0可抛错而peer成功返回训练。DCP已有独立本地冷启动边界。
+- 改为所有rank进入Checkpoint EMA cold start边界，内部仅调用本地
+  reset_from_model，避免在本地协调区间嵌套EMA collective load。同步架构契约。
+  复制失败仍可能部分修改平均值，不保证原子回滚；修复原因后须完整恢复再继续。
+- 新增torch_checkpointing_cold_start.py，真实双rankGloo、真实EMA与模型，
+  替代可选backend reader。rank0注入ValueError，修复前peer成功返回触发断言，
+  exit1，日志 `/tmp/llmtuner-tc-cold-start-before-97.log`；修复后原异常身份保留、
+  peer阶段错误、barrier及完整load/reseed重试均通过，exit0，日志
+  `/tmp/llmtuner-tc-cold-start-after-97.log`。
+- 命令：`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30066 tests/integration_tests/torch_checkpointing_cold_start.py`；
+  修复前使用30065。该证据不覆盖未安装torch_checkpointing的真实IO/进程生命周期，
+  也不承诺更早模型恢复失败或collective故障可恢复。
+- 完整CPU3696 passed、2 skipped、293 warnings，38.95秒，exit0，日志
+  `/tmp/llmtuner-cpu-97.log`；全部适用已跟踪文件及新增integration脚本的pre-commit
+  exit0（排除受保护example、moonep、prompt），日志 `/tmp/llmtuner-precommit-97.log`。
+  compileall与diff检查通过；其余开放问题未关闭，未commit/push。
+
+### 可选后端本地状态恢复失败边界（批次 98）
+
+- TC-LOCAL-RESTORE-98：核对BaseCheckpointManager已固定optimizer先于scheduler，
+  无需重排。但可选backend逐项load_state_dict时，scheduler/dataloader/
+  train_state/RNG局部异常未经协调，peer可继续后续EMA或训练通信。
+- 阅读当前四类回调确认本地契约，各自加入Checkpoint <key> restoration边界；
+  模型、optimizer、EMA及用户扩展状态可能通信，继续置于边界外。保留既有顺序，
+  不保证已经恢复状态的回滚；用户扩展回调自行承担通信/失败传播契约。
+- 四项单测修复前全部失败，日志 `/tmp/llmtuner-local-restore-before-98.log`。
+  扩展真实双rankGloo脚本，逐类rank0注入原ValueError，peer必须收到阶段错误，
+  每项后barrier可达，再运行97的EMA故障与完整重试，全部exit0。
+  命令：`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30067 tests/integration_tests/torch_checkpointing_cold_start.py`，
+  日志 `/tmp/llmtuner-local-restore-after-98.log`。backend reader替代，不证明
+  可选包真实IO、模型回调或通信故障的可恢复性。
+- 完整CPU3700 passed、2 skipped、275 warnings，38.62秒，exit0，日志
+  `/tmp/llmtuner-cpu-98.log`；全部适用tracked及新增integration脚本pre-commit
+  exit0，日志 `/tmp/llmtuner-precommit-98.log`，排除受保护example、moonep、prompt。
+  compileall及diff检查通过；同步架构说明，未commit/push，其他未验收项保持开放。
+
+### 可选后端的 RNG 最后恢复契约（批次 99）
+
+- TC-RNG-ORDER-99：可选后端按states插入顺序恢复RNG，后续用户Stateful回调
+  可再次抽样，导致返回训练时的默认随机流偏离保存值；DCP已明确最后恢复。
+- 新增真实RNGCheckpointState及抽取7个torch随机数的用户回调回归，RNG故意
+  放在字典首项；修复前真实CPU RNG状态比较失败，exit1，日志
+  `/tmp/llmtuner-rng-order-before-99.log`。现在循环跳过RNG，在其余回调和
+  EMA冷启动完成后，通过本地错误协调恢复，不改变其他状态加载顺序。
+- 完整CPU3701 passed、2 skipped、279 warnings，37.86秒，exit0，日志
+  `/tmp/llmtuner-cpu-99.log`；四类本地恢复失败与EMA重试的双rankGloo脚本
+  再次exit0，日志 `/tmp/llmtuner-local-restore-99.log`，命令沿用98、port30068。
+- 全部适用tracked及四个新增integration文件pre-commit exit0，日志
+  `/tmp/llmtuner-precommit-99.log`，受保护example未改；compileall/diff检查通过。
+  同步架构契约。本批未安装或验证可选backend真实IO，也不覆盖私有generator；
+  其他全局缺口继续开放，未commit/push。
+
+### 可选后端 RNG 跨 rank 无副作用校验（批次 100）
+
+- TC-RNG-PREFLIGHT-100：99保证RNG最后加载，但原来校验与设置在同一协调体，
+  rank0拒绝非法元数据时有效peer已恢复随机流。DCP已有独立validation阶段。
+- 对内置RNGCheckpointState先同步validate_state_dict，全部通过才进入恢复阶段；
+  不改用户Stateful契约，不保证设备setter失败或自定义回调失败原子回滚。
+- 双rank真实Gloo与RNGCheckpointState：rank0保存payload版本改2，双方先推进
+  live torch流；加载失败后要求双方当前流精确不变。修复前rank1断言失败exit1，
+  `/tmp/llmtuner-rng-preflight-before-100.log`；修复后包含98四类故障传播及97
+  EMA重试全部exit0，`/tmp/llmtuner-rng-preflight-after-100.log`。
+  命令沿用99脚本，修复前port30069、修复后30070。reader仍替代，未验证可选IO。
+- 完整CPU3701 passed、2 skipped、290 warnings，38.83秒，exit0，日志
+  `/tmp/llmtuner-cpu-100.log`。全部适用tracked及新增integration脚本pre-commit
+  exit0，`/tmp/llmtuner-precommit-100.log`；compileall/diff检查通过。
+  架构契约已同步，受保护example未修改，未commit/push；全局目标未完成。
+
+### 三轴 AdamW 完整失败轨迹（批次 101，关联15仍开放）
+
+- 原脚本首个权重差异处退出，无法观察后两步。新增显式trajectory诊断模式：
+  原有数值比较及1e-6容差不变，仅延迟AssertionError至三步结束；每个失败保留
+  step/键/梯度标记及误差，最终有任一失败仍exit1。默认模式仍即时抛错，probe
+  首步独立重放未改。诊断不打印虚假OK，逐step列出失败数。
+- native/custom CPU/Gloo四rank、TP2×CP2×EP2重叠拓扑、aux0.01、full AC、
+  FP32 router参考、生产AdamW/scheduler/EMA，均执行完整三步后exit1。
+  rank0/2每步失败数0/1/2，rank1/3为2/5/7；首步专家w1最大绝对差
+  2.0208023457e-6，w2为2.6198375384e-6，step2起包含EMA差异。
+  原容差下本次未报告梯度及optimizer状态失败，不等于逐位正确或完整独立数值验收。
+- 命令：`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30073 tests/integration_tests/trainer_tp_ep_cp_equivalence.py custom aux adam full fp32_router trajectory`；
+  native使用30071。日志 `/tmp/llmtuner-triaxis-trajectory-101.log` 与
+  `/tmp/llmtuner-triaxis-trajectory-custom-101.log`，原失败证据保留。
+- 原custom aux SGD full控制端口30072三步exit0，日志
+  `/tmp/llmtuner-triaxis-control-101.log`，全部27参数比较无失败。
+  定向pre-commit与diff通过；仅测试/文档变更，完整CPU复用100。
+- 新证据确认误差持续到后续权重/EMA，不能用首步公式精确或SGD通过替代验收。
+  下一步仍需反映FP32门控及CP归约契约的多步独立参考；未改变生产精度、算法、
+  原HF基线或默认失败语义，未关闭15，未commit/push。
+
+### 三轴 AdamW 三步独立更新公式（批次 102，关联15仍开放）
+
+- 独立公式参考从实际初始参数及零m/v开始，仅接收每步实际梯度，自己演进
+  0.9/0.999矩、bias correction、eps1e-8及decoupled decay0.1，不使用
+  production optimizer状态作为输入，不逐步用live weight重新播种。明确断言
+  optimizer超参数与独立公式一致；每步全部27参数及m/v必须通过严格比较。
+- native/custom真实四CPU/Gloo rank、TP2/CP2/EP2、aux、full AC、生产
+  Trainer与scheduler/EMA三步均通过独立公式；每rank权重最大残差依次为
+  1.1102230246e-16、1.1102230246e-16、2.2204460493e-16。
+  公式比较atol2e-16/rtol1e-14、m/v atol1e-18/rtol1e-12，用于FP64
+  独立表达式的舍入差；原HF对照1e-6未改，两个作业仍因原轨迹差异exit1。
+- 命令沿用101：custom port30074、native30075，参数
+  `aux adam full fp32_router trajectory`。日志
+  `/tmp/llmtuner-adam-multistep-formula-102.log`、
+  `/tmp/llmtuner-adam-multistep-formula-native-102.log`。
+- 该证据将16的首步同梯度公式检查扩展到所有参数三步，支持当前更新公式及
+  m/v演进契约；实际梯度来自被测训练，不能替代独立模型梯度参考，也未验收15。
+  仍需反映混合精度/CP分片归约的完整多步参考；未改生产算法或放宽原断言。
+- 仅测试/台账修改，定向pre-commit、compileall/diff检查通过，完整CPU复用100。
+  未commit/push，其他开放项保持原范围。
+
+### 训练 fetch 后指标失败传播（批次 103）
+
+- TRAIN-FETCH-METRIC-103：batch_generator已协调loader失败，但成功fetch后
+  add_tokens/add_data_loading_time仍未协调。任一rank回调异常可让peer收到
+  batch并进入token计数或下一次fetch collective，存在挂起风险。
+- 将两个本地指标回调放入Training fetch accounting独立边界；fetch_batch
+  自身通信留在边界外。指标已部分更新不回滚，失败时停止该步，不能直接续用
+  原generator；这不保证loader阻塞或模型通信故障可恢复。
+- data_fetch_coordination增加两种回调×两种出错rank×ValueError/
+  KeyboardInterrupt/SystemExit共12组，要求原异常身份、peer阶段错误及barrier。
+  修复前peer仍yield触发断言exit1，`/tmp/llmtuner-fetch-metric-before-103.log`；
+  修复后全部新增及既有读取/耗尽/验证失败检查exit0，
+  `/tmp/llmtuner-fetch-metric-after-103.log`。torchrun双rankGloo，端口30076/30077。
+- 完整Trainer生产加载器、native FSDP DP2、async、真实Grain语料、每step验证，
+  三个独立作业的连续/新进程恢复与七类状态精确比较exit0；命令
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py corpus async dp2 validate`，
+  日志 `/tmp/llmtuner-fetch-trainer-resume-103.log`。不扩展到未运行并行组合。
+- 完整CPU3701 passed、2 skipped、277 warnings，41.76秒exit0，
+  `/tmp/llmtuner-cpu-103.log`。初次pre-commit行宽/格式失败，自动修正已审阅；
+  最终全部适用文件pre-commit exit0，`/tmp/llmtuner-precommit-final-103.log`。
+  compileall/diff通过，受保护example未改，未commit/push；全局未验收项继续开放。
+
+### 训练 step 上报失败与 checkpoint 通信边界（批次 104）
+
+- TRAIN-REPORT-104：train_step完成后，Trainer.train直接调用本地metrics.log；
+  单rank sink异常可让peer继续checkpointer.save的collective。阅读MetricsProcessor
+  确认该回调为本地上报，在所有rank共同进入的Training metric reporting边界
+  内执行条件日志，不包含checkpoint或其他通信。未拆分trainer.py。
+- 新增training_metric_coordination.py，用真实Trainer.train和双rankGloo，
+  替代step计算/服务以定位编排边界；两出错rank×ValueError/KeyboardInterrupt/
+  SystemExit共6组，要求原异常身份、peer阶段错误、save未调用、close一次、
+  completed step保留1及barrier可达。修复前peer继续触发断言exit1，日志
+  `/tmp/llmtuner-metric-report-before-104.log`；修复后exit0，最终日志
+  `/tmp/llmtuner-metric-report-final-104.log`。torchrun端口30078/30079/30080。
+- 生产完整Trainer native FSDP DP2、async、真实Grain、每step验证和三个新进程
+  连续/初始/恢复作业exit0，七类状态精确；命令同103参数corpus async dp2 validate，
+  日志 `/tmp/llmtuner-report-trainer-resume-104.log`。不推广至未运行设备/并行组合。
+- 完整CPU3701 passed、2 skipped、289 warnings，42.37秒exit0，
+  `/tmp/llmtuner-cpu-104.log`；全部适用tracked及五个新增integration文件
+  pre-commit exit0，`/tmp/llmtuner-precommit-104.log`；compileall/diff通过。
+- 上报可能部分写入sink，不承诺撤销外部日志或回滚已完成optimizer更新；失败
+  后停止后续保存/训练，通过先前完整checkpoint恢复。自定义metrics回调须本地。
+  其他开放问题保留，受保护example未改，未commit/push。
+
+### MC2 count exchange 前的输入失败协调（批次 105）
+
+- MC2-INPUT-PREFLIGHT-105：MC2RoutedExperts的dtype检查及_local_reorder在
+  count exchange前局部执行，rank0非法输入时peer仍进入通信；counts未校验
+  形状、dtype或与路由ID直方图的一致性，非法输入可能产生错误传输尺寸。
+- EP组内独立MC2 input preparation边界协调本地准备，验证输入半精度、
+  路由形状、ID int64/范围、counts int64/专家维数及直方图一致性；count exchange、
+  HCCL上下文解析和融合/专家/FSDP执行均在边界外，不修改融合公式。
+- 扩展mc2_distributed_adapter：rank0注入score形状、input dtype、counts维数、
+  histogram不符、负ID五类故障；count exchange替身一旦被触达即断言失败，
+  要求peer收到阶段错误并barrier。修复前peer进入exchange断言exit1，
+  `/tmp/llmtuner-mc2-preflight-before-105.log`；最终五类及既有四种空token/
+  zero-receive场景三步momentum更新、输出/输入/score/专家梯度全部exit0，
+  `/tmp/llmtuner-mc2-preflight-final-105.log`。
+- 命令：`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30083 tests/integration_tests/mc2_distributed_adapter.py`；
+  修复前port30081，首次通过30082。FP16/Gloo真实all-to-all，融合核仍CPU替身；
+  EP组外失败、通信内部故障、MC2×TP原FP16失败和Ascend设备验收不由本批关闭。
+- 完整CPU3701 passed、2 skipped、282 warnings，39.10秒exit0，
+  `/tmp/llmtuner-cpu-105.log`；全部适用文件pre-commit exit0，
+  `/tmp/llmtuner-precommit-105.log`；compileall/diff通过，未commit/push。
+  新增本地校验含同步开销，未提供目标设备性能结论；全局其他缺口继续开放。
+
+### MC2 stage 错误组装配（批次 106）
+
+- MC2-STAGE-ERROR-GROUP-106：105只覆盖单EP组；parallelize已向apply_ep
+  传入stage-local error_group，但原接线只设置Domino。其他EP子组的MC2实例
+  不能收到该阶段同伴输入失败，仍可能进入后续count/FSDP/TP/CP通信。
+- MC2新增运行时error_group，apply_ep与Domino共同接线；输入准备优先使用该组，
+  standalone未提供时回退EP组。保留torch_npu懒加载，无新增跨PP stage通信。
+- 新增mc2_input_coordination.py：四rank/两个EP2组，真实apply_ep接线、
+  MC2本地准备及协调；swap和通信context替代，count exchange被触达即断言。
+  rank0/3分别非法score，要求其余三个rank阶段错误及barrier。修复前EP外peer
+  到达exchange，exit1，`/tmp/llmtuner-mc2-stage-before-final-106.log`；修复后
+  exit0，`/tmp/llmtuner-mc2-stage-after-106.log`，torchrun四rank端口30085/30086。
+  首次before上下文未替代也exit1，保留30084日志，不作为融合通信证据。
+- 真实双rankGloo MC2既有全部三步输出/梯度/更新及非法输入脚本exit0，
+  `/tmp/llmtuner-mc2-ep-fallback-106.log`，port30087，确认standalone EP回退。
+  该证据不是完整FSDP/TP/CP模型组合，也不证明Ascend融合或通信内部恢复。
+- 完整CPU3701 passed、2 skipped、266 warnings，38.59秒exit0，
+  `/tmp/llmtuner-cpu-106.log`；初次pre-commit自动将isinstance tuple改为union，
+  已审阅，最终全部适用文件pre-commit exit0，`/tmp/llmtuner-precommit-final-106.log`。
+  compileall/diff通过，架构已同步，未commit/push；MC2×TP数值及设备缺口仍开放。
+
+### Domino CUDA dispatch 消费失败的清理范围（批次 107）
+
+- DOMINO-CUDA-DISPATCH-CLEANUP-107：_forward_cuda原try仅覆盖expert/combine，
+  已启动dispatch0/1后的finish_dispatch局部异常会绕过pending传输清理。
+  将两次begin/finish及stream准备移入既有try；pending初始化None，仅清理
+  实际已返回的exchange。异常时先让comm等待compute生产者，再消费已启动结果，
+  最后compute等待comm；不启动替代collective，不改变成功路径调度顺序。
+- 既有CUDA调度替身测试增加finish0/finish1×ValueError/KeyboardInterrupt/
+  SystemExit六例，检查原异常身份、已启动buffer被materialize及跨流等待。
+  修复前6 failed/7 passed，`/tmp/llmtuner-domino-launch-before-107.log`；
+  修复后13 passed，`/tmp/llmtuner-domino-launch-after-107.log`。替身只证明
+  Python所有权/控制流，不能替代CUDA allocator、NCCL或真实stream行为验收。
+- 原双rankCPU/Gloo ep_domino_equivalence.py全部场景exit0，日志
+  `/tmp/llmtuner-domino-control-107.log`，端口30088。该路径不执行_forward_cuda，
+  仅确认既有CPU语义未破坏；真实CUDA故障/overlap/性能仍开放。
+- 完整CPU3707 passed、2 skipped、290 warnings，39.56秒exit0，
+  日志 `/tmp/llmtuner-cpu-107.log`；
+  全部适用文件pre-commit exit0，`/tmp/llmtuner-precommit-107.log`，compileall/diff
+  通过。begin_dispatch若在返回句柄前内部通信失败，或stream API本身失败，
+  不在本地清理可恢复保证内。未commit/push，其他全局缺口保留。
+
+### Fixed router EP1×TP 完整 Trainer 与负轴 collective 修复（批次 108）
+
+- TP-NEGATIVE-AXIS-108：完整DP2×TP2 Qwen3MoE、Grain packing首次在二维
+  padding mask gather(-1)失败，PyTorch2.14 _maybe_view_chunk_cat错误构造
+  [1,16,2,8] view。生产helper现先把负轴转换为非负轴，再调用functional
+  gather/scatter；不替代通信机制，不改forward/gradient数值容差。
+- 新增tp_collective_dimensions.py，真实两rankGloo：2D gather/scatter的
+  0/1/-2/-1轴、batched bool mask及autograd均对照独立cat/chunk参考精确通过，
+  port30089，`/tmp/llmtuner-tp-dimensions-108.log`。原完整Trainer失败日志
+  `/tmp/llmtuner-fixed-tp-trainer-108.log`及其continuous.log保留。
+- 完整恢复脚本增加tp2（限定dp4/moe/EP1），明确检查两层FeatureParallelMoE、
+  fixed router、实际TP2组及FFN特征尺寸8；按DP rank检查游标，保持原七类状态、
+  local shards、验证前后非持久隔离、快照灵敏度及EMA独立公式精确比较。
+- native eager：三个独立四rank作业成功，父进程初跑因旧rank键假设KeyError退出1，
+  `/tmp/llmtuner-fixed-tp-trainer-after-108.log`。修正为rank//TP后，用同一最终
+  verifier对已完成产物6rtkxv2b逐rank全量验收exit0，无重复训练、无略过断言。
+- native/custom full AC+aot_eager：命令
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py corpus async dp4 compile ac validate moe tp2`，
+  custom追加custom。两条完整三个独立OS作业均exit0，日志
+  `/tmp/llmtuner-fixed-tp-trainer-compile-108.log`、
+  `/tmp/llmtuner-fixed-tp-trainer-custom-108.log`，七类状态与布局精确一致。
+- 独立FFN/路由/共享专家288场景原矩阵exit0，port30090，
+  `/tmp/llmtuner-fixed-tp-oracle-108.log`。据此移除公开配置中旧EP1×TP拒绝条件，
+  配置测试改为EP1/2可构造，更新当前比较正文与脚本说明，历史失败记录保留。
+  关闭“无完整CPU Trainer证据”的子缺口，不宣称完整模型独立dense梯度、设备、
+  PP/CP、Inductor或拓扑变化已验收；FIXED-ROUTER-EP1-TP-01其余要求保留。
+- TP-ASYNC-WORK-108（开放）：成功作业退出时仍出现上游unwaited collective
+  registry警告，原低层矩阵也有；状态精确不能证明无资源生命周期缺口，须定位
+  outstanding句柄来源，不能把警告当作设备通信验收通过。
+- 完整CPU3708 passed、2 skipped、291 warnings，56.04秒exit0，
+  `/tmp/llmtuner-cpu-108.log`；全部适用文件pre-commit exit0，
+  `/tmp/llmtuner-precommit-108.log`；compileall/diff通过。未commit/push。
+
+### 第109批：TP 通信生命周期问题的基础原语排查
+
+- 续接 TP-ASYNC-WORK-108，问题保持开放。分支main，macOS26.3 arm64、
+  torch2.14.0；保护已有未提交改动，本批未修改生产代码。
+- 阅读 `parallel/tensor_parallel/linear_ops.py` 及当前安装版本的
+  `all_gather_single_autograd`、`reduce_scatter_single_autograd` 实现：
+  autograd接口转调基础functional collective，返回AsyncCollectiveTensor。
+  不能仅凭存在异步返回值认定缺少wait，需跟踪实际消费路径。
+- 真实双rank Gloo运行 `tp_collective_dimensions.py`，正负轴、bool mask、
+  gather/scatter前向和梯度对独立cat/chunk参考均以零容差通过，退出0，
+  未出现unwaited警告。命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30092 tests/integration_tests/tp_collective_dimensions.py`。
+  日志 `/tmp/llmtuner-tp-dimensions-109.log`。此前port30091同脚本亦退出0。
+- 此负向排查仅说明基础原语的这些消费路径未复现，不能排除MoE、重计算、
+  无消费者分支或完整Trainer生命周期问题；不添加全局wait或替换通信机制。
+  下一步按288场景矩阵逐项定位首次遗留句柄的场景及调用栈。
+
+### 第110批：修复 FeatureParallelMoE 重计算遗留 mask gather
+
+- TP-ASYNC-WORK-108：真实双rank矩阵逐场景观测PyTorch work registry，前144个
+  无重计算场景保持0；启用重计算后，非batched、aux系数0的36场景各增加1，
+  两rank最终各残留36。数值断言全部通过，日志
+  `/tmp/llmtuner-tp-registry-110.log`，诊断脚本
+  `/tmp/llmtuner_tp_registry_110.py`，port30093，退出0。
+- 根因：`FeatureParallelMoE.forward`的一维padding mask gather异步返回，
+  checkpoint early-stop可能在消费mask前停止重计算。batched路径内部cat会先等待，
+  aux启用也改变消费路径；不能用这些通过场景代替无aux的一维mask验收。
+- `parallel/expert_parallel/block_conversion.py`复用token_dispatch.materialize，
+  在进入路由前等待mask gather；不改变activation gather、路由、collective类型、
+  early-stop或数值容差。只处理已有metadata通信，不加入全局drain。
+- 同一诊断port30094退出0，288场景不再增长registry，无unwaited告警，
+  `/tmp/llmtuner-tp-registry-after-110.log`。正式矩阵新增每场景前后registry相等
+  断言（仅安装版本提供该诊断API时执行）。
+- 正式命令前缀与109相同，port30095运行
+  `tests/integration_tests/fixed_router_tp_equivalence.py`：288场景退出0；
+  port30096追加`--compile`：aot_eager 12场景退出0，均含原独立数值、梯度、
+  更新及checkpoint比较，无leak断言失败或unwaited告警。日志
+  `/tmp/llmtuner-fixed-tp-110.log`、`/tmp/llmtuner-fixed-tp-compile-110.log`。
+- 完整CPU：3708 passed、2 skipped、292 warnings，42.70秒，退出0，
+  `/tmp/llmtuner-cpu-110.log`。compileall、git diff HEAD --check通过，
+  全部适用tracked文件及integration脚本pre-commit退出0，
+  `/tmp/llmtuner-precommit-all-110.log`；排除受保护example，未commit/push。
+- 仅关闭上述低层mask重计算残留子问题。完整Trainer的16个残留是否同源仍需
+  实际复验，TP-ASYNC-WORK-108保持开放；CUDA/NPU与Inductor未验证。
+
+### 第111批：完整 Trainer 复验 TP 通信清理
+
+- 续接110，生产代码未再修改。恢复脚本在每个独立worker作业退出后检查日志，
+  若出现`unwaited collective calls`即失败，避免数值状态通过掩盖退出告警。
+- CPU/Gloo torch2.14，四rank DP2×TP2、EP1、Qwen3 fixed MoE aux.03、
+  Grain packing、async、每step验证、full AC+aot_eager。命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py corpus async dp4 compile ac validate moe tp2`；
+  custom追加`custom`。两者均退出0；每者连续、初始、恢复三个独立OS作业，
+  保留全部七类状态、本地DTensor布局、验证隔离、EMA独立公式断言。
+- native日志`/tmp/llmtuner-fixed-tp-trainer-111.log`，产物后缀`_nu9a99g`；
+  custom日志`/tmp/llmtuner-fixed-tp-trainer-custom-111.log`，产物后缀`0r3rrrq5`。
+  六份worker日志均无未等待通信告警，对比108同配置原有告警已消失。
+- 新等待路径额外运行per-block fullgraph矩阵，port30097，脚本
+  `fixed_router_tp_equivalence.py --fullgraph`，同环境前缀，12场景退出0，
+  原数值/更新/状态及registry断言通过，无未等待告警，日志
+  `/tmp/llmtuner-fixed-tp-fullgraph-111.log`。
+- TP-ASYNC-WORK-108在已复现的低层及native/custom完整CPU Trainer范围关闭。
+  不据此宣称所有通信失败可恢复、设备/Inductor或其他组合生命周期已验收。
+  对比文档修正两处过时的fixed-router配置拒绝描述。
+- 本批只改integration断言与文档，复用110同一生产代码完整CPU3708/2skip证据；
+  适用文件pre-commit及diff检查通过，未commit/push，无遗留运行任务。
+
+### 第112批：三轴 AdamW 多步激活差异诊断
+
+- TRAINER-TRIAXIS-ADAMW-NUMERICS-15继续开放。扩展既有trajectory诊断，
+  在每step记录两层、两microbatch的激活及梯度，包含q/k norm输入；
+  probe原严格局部重建检查仍独立保留。每step清理记录，保留原所有数值容差、
+  状态检查与最终失败退出；未修改生产代码。
+- CPU/Gloo四rank、TP2×KVCP2×EP2，命令前缀与111同，torchrun
+  `--nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30098`
+  `tests/integration_tests/trainer_tp_ep_cp_equivalence.py native noaux adam none fp32_router trajectory`，
+  退出1，`/tmp/llmtuner-triaxis-activations-112.log`。port30099使用
+  `native aux adam full fp32_router trajectory`，退出1，
+  `/tmp/llmtuner-triaxis-activations-aux-112.log`。
+- 两条诊断首步两层MoE前向与gate值均一致；noaux首层attention输出最大差约
+  3.47e-17，第二步首层input norm前向差4.81e-7；aux第二步该值1.06e-6。
+  实际梯度驱动的独立Adam公式仍通过，不能据此证明模型梯度参考正确。
+- 观测限制：tensor gradient hooks影响反向执行顺序，aux诊断最终rank0/2各3项、
+  rank1/3各14项失败，与101无hook轨迹不同。保留全部原失败记录，不能将这批
+  failure count视为同一执行的改善或回归，更不能据数值近似关闭问题。
+  下一步隔离前向观测与梯度hook，构建遵守FP32归约及共享softmax契约的独立
+  多步参考；不调整eps、断言或容差。脚本文档明确诊断侵入性。
+- 本批只改诊断测试及台账；适用pre-commit、脚本编译、diff检查通过。
+  无运行任务，未commit/push。
+
+### 第113批：隔离前向观测并纠正112的hook归因
+
+- 新增`forward_trajectory`诊断选项，仅保存detach前向值，不注册tensor梯度hook；
+  保留三步比较、原容差、原状态检查及失败退出。probe/trajectory原行为保留。
+- CPU/Gloo四rank，命令前缀同112，port30100，脚本
+  `trainer_tp_ep_cp_equivalence.py native aux adam full fp32_router forward_trajectory`，
+  退出1，日志`/tmp/llmtuner-triaxis-forward-113.log`。rank0/2各3项、rank1/3各14项
+  失败，第二步首层input norm差仍为1.0610820119216768e-6。
+- 纠正112：重新读取102原日志及101原日志，二者实际最终计数同为3/14，
+  与112和本批一致；此前“与101无hook轨迹不同”的判断来自错误摘要，撤回。
+  没有证据证明本例hook改变数值或执行结果。诊断仍可能侵入执行，不能推广为
+  所有hook均无影响。三个日志完整可解析且共同出现的3条首步Adam诊断字典精确
+  一致；多进程stdout交错导致部分行不可解析，不将该子集视为完整等价证明。
+- 本批排除了“移除梯度hook即可消除当前偏差”的猜测，未确认生产根因，
+  TRAINER-TRIAXIS-ADAMW-NUMERICS-15继续开放。下一步独立参考需要显式表达
+  CP分片FP32梯度归约及MoE共享概率反向契约，不能从观测梯度倒推正确性。
+- 仅测试和文档修改，pre-commit、脚本编译、diff检查通过；未commit/push，
+  无运行任务。
+
+### 第114批：独立 CP/TP 分片 QKV 梯度舍入参考
+
+- 阅读fully_shard_parallel.py的混合精度契约：param dtype取模型dtype，
+  reduce_dtype显式FP32。Trainer的TP复制梯度归约消费FSDP后梯度，不能把
+  dense FP64一次求和当成该分片归约的精确参考。
+- 独立诊断`/tmp/llmtuner_cp_reference_114.py`仅替换第二次_build（oracle）
+  的Q/K/V线性前后向：前向普通F.linear；输入梯度dy@W；权重梯度按CP2 token
+  半区、TP2输出特征半区分别FP64 GEMM，每个CP贡献转FP32再求和，最后恢复
+  FP64。只读取oracle自己的输入/上游梯度，不读取生产梯度或optimizer状态，
+  不修改生产路径、默认HF参考及容差。
+- CPU/Gloo四rank命令前缀同113，port30101，运行上述脚本
+  `native aux adam full fp32_router forward_trajectory`，退出1；日志
+  `/tmp/llmtuner-cp-reference-114.log`。首步K投影诊断中完整可解析的rank0/3
+  layer0及rank1/3 layer1，其整个weight最大差从此前非零变为0。
+  flat_index此时为全零差的argmax=0，不把该坐标梯度与旧argmax坐标直接比较。
+- 该参考确认QKV局部FP32归约可解释一部分首步权重差异，但MoE仍首步失败，
+  第二步首层输入差仍1.0610820119216768e-6，最终rank0/2各3项、rank1/3各14项
+  失败；没有形成完整多步模型独立参考，问题15保持开放。下一步需要独立
+  专家计算及共享softmax/aux反向计算契约，不能仅扩展容差或以QKV局部通过关闭。
+- 本批仅增加审查证据，诊断脚本和日志在/tmp保留，无生产改动；台账差异及
+  pre-commit通过，无运行任务，未commit/push。
+
+### 第115批：独立专家 CP 局部 FP32 归约参考三步通过
+
+- 问题15续接114。先独立拆分oracle专家gate/up GEMM并改为token顺序逐专家
+  计算，仍失败，port30102，`/tmp/llmtuner-moe-reference-115.log`。原始HF
+  top-k slot顺序与token顺序本身不能解释当前失败，不改生产机制。
+- 在该独立参考中，对每专家gate/up/down权重梯度按原token的CP半区分别
+  FP64 GEMM，再分别转FP32求和恢复FP64；保留普通输入梯度，不读生产梯度。
+  配合114的独立QKV分片参考，port30103三步首次退出0，
+  `/tmp/llmtuner-moe-reduce-reference-115.log`。
+- 保存为`tests/integration_tests/triaxis_rounded_reference.py`。只替换oracle
+  构造，入口结束恢复fixture；默认HF参考、生产参数/优化器及所有原断言不变。
+  自定义反向另用普通F.linear autograd的局部贡献验证输出、输入梯度及分片
+  FP32权重梯度，零容差通过；专家包含空左/右半区，QKV含TP特征半区。
+- 真实四rank CPU/Gloo TP2×KVCP2×EP2，full AC、aux.01、AdamW、两不等token
+  microbatch、scheduler、EMA，命令前缀同114，运行
+  `tests/integration_tests/triaxis_rounded_reference.py native aux adam full fp32_router forward_trajectory`，
+  port30104；custom改首参数，port30105。均退出0，每rank每步27参数及原
+  gradient/weight/optimizer/EMA/scheduler检查通过，原1e-6容差未变。
+  日志`/tmp/llmtuner-rounded-reference-native-115.log`、
+  `/tmp/llmtuner-rounded-reference-custom-115.log`；无TRAJECTORY_DIFF或unwaited。
+- 最终文件加入独立autograd自检后再跑custom同命令port30106，退出0，
+  `/tmp/llmtuner-rounded-reference-final-115.log`。本批没有生产代码修改，
+  仅新增参考脚本及文档；适用pre-commit、compileall、diff检查通过。
+- 这解释了未按局部FP32归约的HF参考为何不适合直接要求同样Adam更新容差，
+  但不撤销历史失败。第二步输入仍有约1.06e-6差异，不能宣称位级模型等价。
+  问题15保持开放，待参考契约审定、noaux及其他调度/设备与完整恢复范围验收。
+  新脚本固定CP2/TP2连续分片，不支持任意拓扑；无目标设备flex/Inductor证据。
+  未commit/push，无运行任务。
+
+### 第116批：三轴舍入参考的无aux/无AC及无诊断hook对照
+
+- 加固triaxis_rounded_reference.py契约：模型构造前拒绝非TP2/KVCP2/EP2、
+  非连续CP布局；要求显式fp32_router，成功退出时确认恰好构造production和
+  oracle各一份。逐轴改为1的本地检查均在构造前ValueError，count保持0。
+- CPU/Gloo四rank，同115命令前缀与脚本，均完整三步退出0：
+  port30107 `native noaux adam none fp32_router forward_trajectory`，日志
+  `/tmp/llmtuner-rounded-noaux-116.log`；port30108
+  `native aux adam none fp32_router forward_trajectory`，日志
+  `/tmp/llmtuner-rounded-aux-noac-116.log`。每rank每步27参数、梯度/更新及全部
+  optimizer、EMA、scheduler原检查通过，无AC层body各调用2次。
+- 排除激活诊断hook作为通过前提：port30109
+  `native aux adam full fp32_router`，port30110
+  `custom noaux adam full fp32_router`，均不传probe/trajectory选项，退出0；
+  日志`/tmp/llmtuner-rounded-nohooks-116.log`、
+  `/tmp/llmtuner-rounded-custom-noaux-116.log`。AC body各调用4次，全部原检查
+  保留，无诊断比较失败或未等待通信告警。
+- 该结果补充115的CPU适用范围，不关闭默认HF不同算术契约的历史失败，也不
+  宣称位级梯度等价、任意拓扑、设备attention或Inductor验收。问题15剩余范围
+  保持开放；下一步回到完整训练恢复与其余模块审查，避免重复同类对照。
+- 本批仅参考脚本和文档，生产代码未变，复用110的完整CPU证据；适用文件
+  pre-commit、compileall、diff检查通过。未commit/push，无运行任务。
+
+### 第117批：Quantile 路由完整 Trainer 新进程恢复
+
+- 扩展trainer_ema_process_resume.py的quantile选项，要求moe/ep2且排除tp2。
+  使用真实DeepSeek-V3两MoE层、4专家top2、sigmoid、无group限制、共享专家，
+  quantile配置经公开Trainer装配；非伪造Qwen sigmoid或替换路由机制。
+- 首次EP1命令在公开能力检查拒绝，未进入训练，退出1，
+  `/tmp/llmtuner-quantile-trainer-117.log`；不把该配置失败视为恢复实现问题。
+  修改测试入口约束后按公开支持EP2运行，未放宽生产能力检查。
+- CPU/Gloo两rank，native/custom FSDP、EP2、full AC、async、每step两batch
+  验证、Grain packing、动态EMA。命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py corpus async dp2 ac validate moe ep2 quantile`；
+  custom追加custom。均连续/初始/恢复三个独立OS作业退出0，更新前加载边界与
+  续训结束七类状态及DTensor本地布局精确，原EMA公式与快照灵敏度检查保留。
+- 机制断言：两层QuantileBalancedTopKRouter，EP2物理专家分片；每层bias非零，
+  checkpoint内恰有两个持久bias；histogram不进入state_dict，step后histogram
+  和token统计均清零。验证前后scratch比较新增histogram，持久状态比较保留。
+- native初次EP2通过日志`/tmp/llmtuner-quantile-trainer-ep2-117.log`，产物
+  bsyxgciq；加入非零/清零断言后native最终复验
+  `/tmp/llmtuner-quantile-trainer-final-117.log`，产物br5xjnpk，退出0。
+  custom最终日志`/tmp/llmtuner-quantile-trainer-custom-117.log`，产物wcc9at3z，
+  退出0。脚本逐作业检查无unwaited告警。
+- 补齐CPU quantile完整Trainer恢复子缺口；不宣称独立训练数值等价、compile、
+  PP/CP/TP组合、拓扑变化或目标设备验收。生产代码未改，本批测试和文档，
+  pre-commit、脚本编译、compileall、diff检查通过；未commit/push，无运行任务。
+
+### 第118批：Quantile 编译完整恢复及源码清单核对
+
+- 复用117最终测试，无生产或测试代码改动。CPU/Gloo双rank EP2，真实
+  DeepSeek-V3 quantile sigmoid router、full AC、async、每step验证、Grain
+  packing及动态EMA，启用生产whole-model aot_eager入口；worker要求实际图数>0。
+- 命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py corpus async dp2 compile ac validate moe ep2 quantile`，
+  custom追加custom。均连续/初始/恢复三个独立作业退出0，七类状态、本地布局、
+  EMA独立公式、非零bias持久化、histogram清零/非持久化及验证隔离原断言通过。
+  native日志`/tmp/llmtuner-quantile-compile-118.log`，产物o9r3zc0_；
+  custom日志`/tmp/llmtuner-quantile-compile-custom-118.log`，产物6ivs9n1l。
+  无未等待通信告警；仅补齐CPU aot_eager恢复，不宣称Inductor或设备数值验收。
+- 重新以Path.rglob源码集和Markdown主表首列正则/Counter核对清单：178个
+  Python源文件、178行，missing/stale/duplicate均空，断言退出0。
+  此为清单覆盖证据，不是本批重新逐行阅读，也不关闭历史开放问题。
+- 本批仅台账和比较文档，适用pre-commit及diff检查通过；未commit/push，
+  无运行任务。下一步继续其他模块的实现/失败路径及未验收组合。
+
+### 第119批：保存前 retention 扫描失败协调
+
+- CKPT-RETENTION-PREFLIGHT-119，P1，DCP和torch_checkpointing_backend的
+  _save在进入写入前执行本地purge扫描，异常此前直接离开当前rank，其他rank
+  仍可进入状态序列化/保存协议。扫描内仅本地存储和队列操作，不含collective。
+- 双rank Gloo探针`/tmp/checkpoint_retention_probe_119.py`，rank0扫描注入
+  OSError，writer为不应触达的sentinel。port30112旧实现退出1，peer未停止于
+  preflight，`/tmp/llmtuner-retention-before-119b.log`；port30111早期探针遗漏
+  interval=1，未触达保存，不算复现证据。修复后port30113退出0，原异常身份、
+  peer错误与健康barrier通过，`/tmp/llmtuner-retention-after-119.log`。
+- 两后端仅将保存前purge包在Checkpoint retention preflight本地错误协调内，
+  保存collective在外。扩展checkpoint_save_coordination.py覆盖OSError、
+  KeyboardInterrupt、SystemExit，所有rank写入前停止，健康barrier后真实保存、
+  load重试。完整原有同步/async/PROCESS staging故障矩阵保留。
+- 真实两rank运行该integration脚本port30114，CPU/Gloo，退出0，日志
+  `/tmp/llmtuner-checkpoint-coordination-119.log`。测试故障注入在扫描入口，
+  重试使用真实DCP/本地存储；未模拟真实远程存储故障，也未执行optional包I/O。
+- 正常完整Trainer回归：117 quantile命令追加compile，native FSDP×EP2、
+  full AC、async、验证、EMA，连续/初始/恢复三个独立作业退出0，七类状态
+  原断言通过，`/tmp/llmtuner-retention-trainer-119.log`，产物fjpf8qkp。
+- 全CPU3708 passed、2 skipped、272 warnings，40.56秒，退出0，
+  `/tmp/llmtuner-cpu-119.log`。全部适用tracked及integration脚本pre-commit
+  退出0，`/tmp/llmtuner-precommit-all-119.log`；compileall/diff检查通过。
+- 关闭保存前扫描边界缺陷；不覆盖发布后retention、异步future异常的全局传播
+  或通信失败恢复，这些需单独检查。未commit/push，无运行任务。
+
+### 第120批：同步/最终保存发布后 retention 错误协调
+
+- CKPT-COMPLETED-RETENTION-120，P1：DCP同步_save及last_step、optional后端
+  last_step在发布成功后本地扫描异常，其他rank此前已正常返回，可能继续训练
+  通信。只在这些所有rank均进入的保存入口增加Checkpoint completed retention
+  本地协调，写入/发布通信留在区间外。
+- checkpoint_save_coordination.py新增真实同步/最终完整checkpoint两场景，
+  rank0 completed扫描注入OSError，要求本地原异常身份及peer一致错误；barrier
+  后篡改模型再load刚发布step1，权重零容差恢复，并成功save2。
+  此断言确认retention失败不等于发布数据丢失，失败checkpoint不被当成未发布。
+- 旧实现真实两rankport30115退出1，rank1报告Completed retention failure not
+  coordinated，`/tmp/llmtuner-completed-retention-before-120.log`；修复后同
+  integration脚本port30116退出0，原writer/staging/PROCESS矩阵仍通过，
+  `/tmp/llmtuner-completed-retention-after-120.log`。环境CPU/Gloo，前缀同119。
+- 正常完整Trainer：119命令追加custom，quantile EP2/full AC/aot_eager/async/
+  验证/EMA，三个独立作业退出0，七类状态及本地布局原断言通过，日志
+  `/tmp/llmtuner-completed-retention-trainer-120.log`，产物pu138gqu。
+- 全CPU3708 passed、2 skipped、275 warnings，38.42秒，退出0，
+  `/tmp/llmtuner-cpu-120.log`；全部适用pre-commit退出0，
+  `/tmp/llmtuner-precommit-all-120.log`；compileall/diff通过。
+- 本批关闭同步/最终入口的该缺陷，optional后端仅代码/CPU替身覆盖，未运行
+  真包I/O。异步maybe_wait_for_saving中的completed retention和terminal future
+  异常传播仍需检查；close/析构可非对称调用，不能无条件在那里加collective。
+  未commit/push，无运行任务。
+
+### 第121批：下一次保存入口协调前次异步完成异常
+
+- CKPT-PENDING-SAVE-121，P1：异步future已完成但单rank异常，或完成后的本地
+  retention扫描异常，原_save在进入后续preflight前直接退出，其他rank可能
+  在随后collective挂起。两个后端保存入口改用Base._wait_for_pending_save。
+- helper先在协调区间外执行maybe_wait_for_saving，捕获原异常，再于
+  Checkpoint pending save本地错误区间重新抛出/同步。后台等待可能涉及通信，
+  不放入本地区间；close和析构仍使用原本地等待，不增加不匹配collective。
+- integration新增completed Future故障及completed retention故障，rank0
+  OSError身份保留、rank1一致错误、writer未触达、future和pending retention
+  正确消费，barrier后真实async保存与load重试。future是显式terminal替身，
+  重试使用真实DCP，不声称测试了后台传输中进程死亡或网络故障。
+- CPU/Gloo双rank，port30117以/tmp/checkpoint_pending_before_121.py将helper
+  进程内替换为旧本地等待，运行同integration退出1，peer在后续retention
+  preflight all_reduce发生30秒timeout，日志`/tmp/llmtuner-pending-before-121.log`。
+  port30118最终integration脚本完整矩阵退出0，
+  `/tmp/llmtuner-pending-after-121.log`，未回退工作区。
+- 完整Trainer按120相同custom quantile EP2/full AC/aot_eager/async/验证/EMA
+  三个独立作业退出0，七类状态、本地布局和原断言通过，日志
+  `/tmp/llmtuner-pending-trainer-121.log`，产物8uczp4h6。
+- 全CPU3708 passed、2 skipped、271 warnings，39.28秒exit0，
+  `/tmp/llmtuner-cpu-121.log`。全部适用pre-commit exit0，
+  `/tmp/llmtuner-precommit-all-121.log`；compileall/diff通过。
+- 关闭下一次保存入口上述子缺陷；load前staging/saving等待、Trainer训练步
+  staging等待仍需独立复核。任意close非对称错误、仍运行future的中断及后台
+  collective挂起不在本批恢复证明内。optional包真I/O未验证。
+  未commit/push，无运行任务。
+
+### 第122批：加载前 staging/save 等待错误协调
+
+- CKPT-LOAD-WAIT-122，P1：Base.load在源发现前直接等待staging/saving，
+  单rank完成异常使其他rank继续进入load preflight通信。staging等待改为在
+  本地错误区间外捕获，再以Checkpoint load staging同步异常；saving等待
+  复用121的_wait_for_pending_save。close保持本地清理语义。
+- integration新增两类等待×OSError/KeyboardInterrupt/SystemExit六场景，
+  rank0原异常身份、rank1明确peer错误；源发现sentinel不得触达，健康barrier
+  后真实load重试成功。等待方法为局部故障替身，不冒称真实设备staging故障。
+  原CPU顺序测试保留并适配共享等待方法，失败后仍不得访问存储。
+- 真实双rank Gloo，port30119旧实现同回归退出1，peer在后续协调通信30秒
+  timeout，`/tmp/llmtuner-load-wait-before-122.log`；port30120修复后完整
+  checkpoint_save_coordination.py矩阵退出0，
+  `/tmp/llmtuner-load-wait-after-122.log`，前缀同121。
+- 正常完整恢复：native quantile EP2/full AC/aot_eager/async/验证/EMA，命令
+  同119的compile回归，三个独立作业退出0，七类状态、本地布局与原断言通过，
+  `/tmp/llmtuner-load-wait-trainer-122.log`，产物e1vzmpfs。
+- 完整CPU3708 passed、2 skipped、274 warnings，38.54秒exit0，
+  `/tmp/llmtuner-cpu-122.log`；全部适用pre-commit exit0，
+  `/tmp/llmtuner-precommit-all-122.log`；compileall/diff通过。
+- 关闭load入口上述等待返回异常子问题；后台永不返回、进程死亡、设备故障及
+  非对称close不在恢复证明内。Trainer.train_step中的独立staging等待仍需复核。
+  optional后端真I/O未验证，未commit/push，无运行任务。
+
+### 第123批：训练步 staging 等待失败在模型执行前协调
+
+- TRAIN-STAGING-WAIT-123，P1：Trainer.train_step在模型执行前直接等待
+  checkpoint staging，单rank异常后peer仍可能执行forward及后续通信。
+  与load一致，先在本地错误区间外等待并捕获，再以Training checkpoint staging
+  同步异常。未拆trainer、未修改staging实现或目标通信机制。
+- 新增training_checkpoint_coordination.py，真实train_step和AdamW，batch准备
+  与staging为本地替身。两rank×OSError/KeyboardInterrupt/SystemExit六场景，
+  原异常身份/peer错误、模型执行sentinel未触达、参数零容差不变、optimizer
+  state为空及健康barrier均检查。数据窗口已读取，不声称数据游标或整步回滚。
+- CPU/Gloo真实两rank，port30121旧实现退出1，peer进入forward sentinel，
+  `/tmp/llmtuner-training-staging-before-123.log`；port30122修复后退出0，
+  `/tmp/llmtuner-training-staging-after-123.log`。格式/闭包绑定完善后port30123
+  最终复验，`/tmp/llmtuner-training-staging-final-123.log`。
+- 完整正常恢复：custom quantile EP2/full AC/aot_eager/async/验证/EMA，122
+  相同命令追加custom，三个独立作业退出0，七类状态与local shards原断言通过，
+  `/tmp/llmtuner-training-staging-trainer-123.log`，产物4_tqqful。
+- 完整CPU3708 passed、2 skipped、296 warnings，38.14秒exit0，
+  `/tmp/llmtuner-cpu-123.log`；全部适用pre-commit exit0，
+  `/tmp/llmtuner-precommit-all-123.log`；compileall/diff通过。
+- 关闭本入口局部完成异常子缺陷；实际设备staging、后台任务不返回、进程死亡
+  及网络故障不在证明内，错误后恢复完整checkpoint而非直接继续该窗口。
+  未commit/push。
+
+### 第124批：验证入口 staging 异常协调
+
+- VALIDATION-STAGING-WAIT-124，P1：验证结果reporting已有协调，入口的
+  staging等待却直接抛出局部错误，使peer继续进入mode setup通信。与训练/load
+  一致，后台等待在协调区间外，完成异常以Validation checkpoint staging同步，
+  位于模式切换、RNG保护上下文及loader创建之前。
+- 扩展training_checkpoint_coordination.py，两rank×OSError/KeyboardInterrupt/
+  SystemExit六验证场景，原异常身份/peer错误、eval未触达、model.training和
+  CPU RNG精确不变、健康barrier；前轮训练六场景保留。staging是局部替身，
+  不宣称真实设备stager故障验收。
+- CPU/Gloo双rank，port30124旧实现退出1，peer未收到要求的staging边界错误，
+  后续peer barrier超时，`/tmp/llmtuner-validation-staging-before-124.log`；
+  port30125修复后12场景退出0，`/tmp/llmtuner-validation-staging-after-124.log`。
+- 正常完整native quantile EP2/full AC/aot_eager/async/验证/EMA新进程恢复，
+  同122命令，三个作业退出0，七类状态、本地布局与原断言通过，日志
+  `/tmp/llmtuner-validation-staging-trainer-124.log`，产物ict8s_30。
+- 完整CPU3708 passed、2 skipped、269 warnings，43.68秒exit0，
+  `/tmp/llmtuner-cpu-124.log`；全部适用pre-commit exit0，
+  `/tmp/llmtuner-precommit-all-124.log`；compileall/diff通过。
+- 关闭本地等待完成异常入口缺陷；后台任务不返回、设备与网络故障仍不在恢复
+  证明内。生产及测试改动已保留原工作区内容，未commit/push，无运行任务。
+
+### 第125批：验证预处理失败的四rank清理与状态恢复回归
+
+- 阅读runtime/validation.py全流程、runtime/batch.py.preprocess及pipeline.py
+  prepare_pipeline_inputs：验证复用Trainer.preprocess的Training batch
+  preprocessing协调区间，模型collective在后；PP先协调split，再逐microbatch
+  预处理。未发现需要再次包裹预处理的证据，保留当前生产实现。
+- validation_reduction_equivalence.py增加DP2×CP2和DP2×TP2各三种rank0本地
+  preprocess错误ValueError/KeyboardInterrupt/SystemExit。要求原异常身份与
+  全peer明确错误，模型forward未执行、temporary loader关闭、混合train/eval
+  子模块模式恢复、CPU RNG零容差相等、训练token计数不变及健康barrier。
+  所有故障后仍运行原完整两batch验证，并对照独立dense CE参考。
+- CPU/Gloo真实四rank命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30126 tests/integration_tests/validation_reduction_equivalence.py`，
+  退出0，两个mesh场景均打印validation matches full-batch loss，日志
+  `/tmp/llmtuner-validation-preprocess-125.log`。真实collective和runtime验证
+  流程，模型为本地Projection，不能替代实际TP/CP/FSDP变换、设备或PP调度验收。
+- 本批仅integration回归和台账，生产代码未改，复用124完整CPU3708/2skip
+  证据；适用pre-commit、脚本编译、diff检查通过，无运行任务，未commit/push。
+
+### 第126批：异步 staging 线程池关闭中断后的重试
+
+- STAGER-CLOSE-126：真实 DefaultStager 的 executor.shutdown 被 KeyboardInterrupt
+  中断后，旧实现提前清空 stager 并将 manager 标记关闭；线程仍存活，第二次 close
+  无法回收。独立复现 `/tmp/llmtuner_stager_close_126.py` 退出0，原失败证据
+  `/tmp/llmtuner-stager-close-126.log`；诊断 finally 手工关闭线程池。
+- DCP 先等待 purge/stager 关闭，再释放进程组；普通 Exception 保持原有继续清理
+  策略，中断则保留未关闭的 stager 和通信组。Base.close 对中断保留初始化状态，
+  Trainer 的既有 ownership 检查因此可以保留 manager 供重试。没有新增 collective。
+- 新增真实 DefaultStager 回归，分别注入 KeyboardInterrupt/SystemExit，检查原异常
+  身份、存活线程与资源归属，移除注入后二次 close 必须结束全部 executor 线程，
+  三次 close 幂等。既有 OSError 释放 owned group 的断言保持不变。
+- checkpoint 文件137 passed；完整 CPU3710 passed、2 skipped、283 warnings，
+  39.08秒exit0，`/tmp/llmtuner-cpu-126.log`。全部适用 pre-commit exit0，
+  `/tmp/llmtuner-precommit-all-126.log`；compileall/diff检查通过。
+- 真实 Trainer 新进程恢复：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py corpus async dp2 custom compile ac validate moe ep2 quantile`
+  退出0，加载边界及续训后完整状态精确相等；日志
+  `/tmp/llmtuner-stager-trainer-126.log`，产物yiq7el20。CPU/Gloo、aot_eager
+  证据不替代设备内核或Inductor验收。
+- 范围限于进程内清理被中断后的资源重试；不证明设备/网络故障后的进程组恢复，
+  普通 stager.close OSError 仍为终止清理策略。未commit/push，保留此前工作区改动。
+
+### 第127批：真实双rank Trainer清理中断与进程组归属
+
+- 复核Trainer.close、BaseCheckpointManager.close与DCP._close调用链；126单进程
+  回归未证明真实owned group保留或Trainer的重试行为，新增独立integration覆盖。
+- `checkpoint_cleanup_retry.py` 使用真实DCP管理器、DefaultStager线程池及
+  Trainer.close；仅对executor.shutdown注入KeyboardInterrupt/SystemExit。
+  覆盖两rank同时中断、仅rank0中断、仅rank1中断，共六种场景。
+- 要求异常身份不变；中断rank的Trainer保留manager，其余资源各关闭一次；
+  双rank的stager/owned group仍有owner，真实all_reduce求和为3、barrier通过；
+  重试后线程全部退出、group注销、Trainer引用清空，第三次关闭不重复释放。
+  单rank场景中peer在第一次close期间不调用close，验证没有隐含全rank关闭要求。
+- CPU/Gloo命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30128 tests/integration_tests/checkpoint_cleanup_retry.py`
+  退出0，`/tmp/llmtuner-checkpoint-cleanup-local-127.log`；初版双rank同时中断
+  port30127也退出0，`/tmp/llmtuner-checkpoint-cleanup-127.log`。
+- 本批仅新增integration和台账，无生产变更；复用126完整CPU3710/2skip及
+  Trainer跨进程恢复证据。新增脚本ruff/format、适用pre-commit与diff检查通过。
+  不证明NCCL/NPU或通信故障恢复；普通OSError终止策略保持原契约。
+  未commit/push，保留既有改动，无运行任务。
+
+### 第128批：最终导出目标元数据检查失败协调
+
+- FINAL-DESTINATION-128：Base._create_final_checkpoint_id在本地检查同step恢复点，
+  读取异常会使该rank退出，peer继续进入最终保存/后续collective。路径检查本身
+  无collective；DCP及可选torch_checkpointing的最终保存均调用此共享入口。
+- 双rank失败复现port30129退出1，原始日志
+  `/tmp/llmtuner-final-path-before-128.log`：rank0本地失败，peer未收到目标阶段
+  错误，后续barrier等待超时。新增回归保留原异常身份及peer精确阶段错误要求。
+- 共享方法以Checkpoint final destination协调本地路径与元数据检查；模型
+  state_dict收集、后端close和save均在区间外。方法文档明确要求所有rank调用。
+  本批不宣称跨rank元数据可见性不同但均无异常时的目标一致性已验证。
+- checkpoint_save_coordination.py新增rank0/1×OSError/KeyboardInterrupt/
+  SystemExit六场景，写入不得开始；真实重试最终导出后，原完整恢复点仍可加载，
+  权重零容差相等，model-export/.metadata存在。首次修复后port30130的数值断言
+  失败，原因为测试未给复制模型设置同一seed，DCP组合了不同rank的参数；补充
+  seed128作为复制模型前提，未改断言、容差或生产保存机制，日志
+  `/tmp/llmtuner-final-path-after-128.log`保留。
+- 完整双rank脚本：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30131 tests/integration_tests/checkpoint_save_coordination.py`
+  退出0，`/tmp/llmtuner-final-path-full-128.log`。包含原writer/stager、retention、
+  pending-save与load失败协调全部场景；可选后端实际运行仍受依赖限制。
+- 完整CPU3710 passed、2 skipped、290 warnings，43.10秒exit0，
+  `/tmp/llmtuner-cpu-128.log`；全部适用pre-commit、compileall/diff通过，日志
+  `/tmp/llmtuner-precommit-all-128.log`。
+- Trainer跨进程恢复使用126同命令（corpus async dp2 custom compile ac validate
+  moe ep2 quantile），退出0，加载边界和最终完整状态精确相等；日志
+  `/tmp/llmtuner-final-path-trainer-128.log`，产物jpwngez3。CPU/Gloo/aot_eager
+  不替代设备/Inductor。未commit/push，无运行任务，保留此前改动。
+
+### 第129批：最终导出跨rank元数据可见性分歧
+
+- FINAL-VISIBILITY-129：读取都成功但仅一个rank观察到同step恢复点时，128实现
+  各自返回step-1与step-1/model-export。新增真实双rank路径汇总回归，port30132
+  退出1，日志`/tmp/llmtuner-final-visibility-before-129.log`，两rank均打印不同
+  目标路径断言；在实际写入之前失败，未依赖写入死锁作为检测依据。
+- Base._create_final_checkpoint_id先协调本地probe异常，再在区间外对preserve
+  标记执行MAX归约。任一rank观察到恢复点，全rank统一使用model-export。
+  复用accelerator.collectives.all_reduce处理通信设备，无新增后端专用分支。
+  前提为相同配置、step和共享folder；全rank都不可见的外部恢复点无法由此检测。
+- checkpoint_save_coordination.py覆盖仅rank0或仅rank1观察到恢复点：所有目标
+  路径必须精确相同；先写完整恢复点，再修改真实模型权重并最终导出，分别加载
+  原路径和model-export，以零容差检查旧权重与新权重，确认没有覆盖旧恢复点。
+  可见性probe是定点注入，保存、进程组、磁盘和加载为真实DCP；不声称复现某个
+  特定远程存储的缓存机制。
+- 完整双rank命令（其余参数同128，port30133）退出0，
+  `/tmp/llmtuner-final-visibility-full-129.log`，包含128及原全部失败/重试场景。
+  可选torch_checkpointing共用路径实现，但实际依赖后端仍需单独验收。
+
+- 完整CPU3710 passed、2 skipped、265 warnings，42.76秒exit0，
+  `/tmp/llmtuner-cpu-129.log`；全部适用pre-commit退出0，
+  `/tmp/llmtuner-precommit-all-129.log`；compileall/diff通过。
+- Trainer新进程恢复使用126同命令（corpus async dp2 custom compile ac validate
+  moe ep2 quantile），退出0，完整加载边界与续训结果精确相等；日志
+  `/tmp/llmtuner-final-visibility-trainer-129.log`，产物rzsevik2。证据限于
+  CPU/Gloo/aot_eager，不替代设备内核/Inductor/拓扑变更。未commit/push，
+  无运行任务，保留原工作区改动，全局审查仍未验收完成。
+
+### 第130批：DCP本地训练状态恢复回调的失败协调
+
+- LOCAL-RESTORE-130（P1）：普通DCP将train_state/dataloader作为Stateful对象
+  传入，DCP完成读取后直接调用其load_state_dict；一个rank本地回调失败，peer
+  继续进入scheduler/model阶段可超时。可选后端及Kimi迁移已有对应显式边界，
+  普通DCP遗漏。Trainer.load_state_dict与GrainDataLoader.state_dict/
+  load_state_dict逐项复核为本地状态操作，不含collective。
+- 修复前真实双rankport30134退出1，peer得到Gloo十秒超时而非阶段错误，日志
+  `/tmp/llmtuner-trainer-restore-before-130.log`。仅注入Trainer恢复回调，读取、
+  保存及进程组均真实，故障rank保留原异常身份。
+- distributed_checkpoint.py对dataloader/train_state先协调准备普通state_dict，
+  DCP只填充其值，随后各自在Checkpoint <category> restoration内显式恢复。
+  scheduler仍在optimizer后；model/optimizer/EMA的潜在collective不包入本地
+  错误区间，RNG仍在所有回调之后恢复。不提供部分加载状态的原子回滚保证。
+- checkpoint_save_coordination.py增加rank0/1×ValueError/KeyboardInterrupt/
+  SystemExit六种真实Trainer回调故障，要求原异常及peer精确阶段错误、健康
+  barrier、故障移除后再次load恢复step1/ntokens2。完整脚本port30135退出0，
+  命令其余参数同129，日志`/tmp/llmtuner-local-restore-full-130.log`。
+- 新增两项CPU测试，分别断言dataloader/train_state恢复发生于其指定边界内，
+  原异常身份保持。checkpoint文件139 passed、113 warnings，1.40秒exit0，
+  `/tmp/llmtuner-local-restore-unit-130.log`。新增测试前启动的完整CPU3710
+  passed、2 skipped、268 warnings，39.38秒exit0，`/tmp/llmtuner-cpu-130.log`；
+  新增两项由上述checkpoint全文件测试覆盖。
+- 全部适用pre-commit退出0，`/tmp/llmtuner-precommit-all-130.log`；
+  compileall/diff通过。未commit/push，保留此前工作区改动。
+
+- 真实Trainer新进程恢复使用126同命令（corpus async dp2 custom compile ac
+  validate moe ep2 quantile）退出0，完整加载边界及续训结果精确相等，真实Grain
+  游标正常恢复；日志`/tmp/llmtuner-local-restore-trainer-130.log`，产物g41t2lob。
+  仅CPU/Gloo/aot_eager，设备/Inductor与故障回滚事务不在证明范围。无运行任务。
+
+### 第131批：DCP恢复前scheduler/RNG快照准备失败协调
+
+- LOCAL-PREPARE-131（P1）：130将dataloader/train_state快照纳入本地准备边界，
+  但scheduler.state_dict与RNG.state_dict仍在边界外；单rank失败后peer可能进入
+  DCP读取或下一协调阶段而超时。复核LRSchedulersContainer.state_dict为本地
+  epoch一致性校验，RNGCheckpointState.state_dict为本地随机流读取/序列化。
+- 新增双rank真实保存/加载回归，分别对scheduler或RNG的state_dict定点注入，
+  rank0/1×ValueError/KeyboardInterrupt/SystemExit共12场景。修复前port30136
+  退出1，peer Gloo十秒超时，日志`/tmp/llmtuner-local-prepare-before-131.log`。
+- 将RNG_STATE/LR_SCHEDULER/DATALOADER/TRAIN_STATE统一在已有Checkpoint local
+  state preparation内循环准备普通字典，删除外部重复分支。区间内不包含
+  model/optimizer/EMA或DCP通信。新增回归断言原异常身份、peer精确阶段错误、
+  reader未调用、健康barrier及移除故障后的真实load成功。
+- 完整双rank脚本port30137退出0，其余参数同129，日志
+  `/tmp/llmtuner-local-prepare-full-131.log`，含全部现有writer/stager、保留、
+  final目标、恢复回调与准备回归。模型和IO真实，故障为定点注入；不证明进程
+  被杀或通信内部异常的恢复能力。
+
+- 完整CPU3712 passed、2 skipped、278 warnings，42.83秒exit0，
+  `/tmp/llmtuner-cpu-131.log`。全部适用pre-commit退出0，
+  `/tmp/llmtuner-precommit-all-131.log`；compileall/diff通过。
+- 真实Trainer新进程恢复使用126同命令（corpus async dp2 custom compile ac
+  validate moe ep2 quantile）退出0，完整加载边界及续训结果精确相等；日志
+  `/tmp/llmtuner-local-prepare-trainer-131.log`，产物a1smd97l。CPU/Gloo/aot_eager
+  不替代目标设备、Inductor或拓扑变更验收。未commit/push，无运行任务。
+
+### 第132批：真实FSDP训练非有限值的更新状态不变量
+
+- 复核Trainer.train_step、_clip_and_check_finite、_check_finite及scheduler/EMA
+  step顺序。当前在optimizer更新前检查全局loss与梯度范数，再执行optimizer→
+  scheduler→EMA；既有CPU单测不能独立证明真实FSDP下的rank局部失败传播。
+- 新增trainer_nonfinite_update.py：实际Trainer构造、Qwen3两层模型、synthetic
+  loader、真实Adam/调度器/EMA、前反向、native/custom FSDP。先成功更新一步，
+  显式要求Adam moments非零，EMA保留不同于当前模型的历史，再开始故障测试。
+- DP2×TP1×CP1×PP1×EP1，分别在rank0/1注入返回loss NaN或一个已完成backward
+  的本地参数梯度Inf。两rank都必须报not finite；模型、optimizer、scheduler、
+  EMA及所有DTensor本地分片/布局与失败前精确相等。随后有限值步骤必须实际
+  改变权重并推进scheduler，确认新梯度替换失败窗口。数据/RNG/step回滚不在
+  断言内；未改模型前反向、梯度归约或有限性检查实现。
+- 初版native/custom分别port30138/30139退出0，日志
+  `/tmp/llmtuner-nonfinite-native-132.log`、
+  `/tmp/llmtuner-nonfinite-custom-132.log`；补充非空moments/EMA历史断言后
+  使用port30140/30141复跑最终版本。
+
+- 最终命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30140 tests/integration_tests/trainer_nonfinite_update.py compile ac`
+  退出0，`/tmp/llmtuner-nonfinite-native-final-132.log`；custom同命令改port30141
+  并追加custom，退出0，`/tmp/llmtuner-nonfinite-custom-final-132.log`。两实现
+  均为完整AC+aot_eager，合计8种失败及8次后续有限值更新。
+- 本批无生产变更，复用131完整CPU3712/2skip证据；新增脚本及台账适用
+  pre-commit、脚本编译与diff检查通过。没有发现需要改动的更新顺序逻辑。
+  这些CPU可恢复断言不代表CUDA设备异步assert后可继续运行，也不覆盖PP、TP、
+  CP、EP或设备内核/Inductor。未commit/push，无运行任务，保留既有改动。
+
+### 第133批：FSDP×TP/EP非有限值的真实组合不变量
+
+- 复核collectives.clip_grad_norm_的dense/TP/expert分类及各轴归约，扩展132
+  脚本支持tp2/ep2并遍历实际world的每个故障rank。MoE使用真实Qwen3 MoE、
+  4专家/top2、fixed router、aux0.03；Inf直接写入routed expert已完成backward
+  的本地梯度，loss故障仅替换返回值，未替换模型、反向、通信或有限性检查。
+- DP shard2×TP2、EP/CP/PP1，真实四rank，native/custom分别port30142/30143；
+  DP shard2与EP2共享两rank（efsdp1），TP/CP/PP1，native/custom分别
+  port30144/30145。全部full AC+aot_eager，24种故障及24次后续有限值更新通过。
+  保留132的精确模型/optimizer/scheduler/EMA及本地布局断言和非空历史前提。
+- 命令模板：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30142 tests/integration_tests/trainer_nonfinite_update.py tp2 compile ac`
+  native TP退出0，`/tmp/llmtuner-nonfinite-tp-native-133.log`；custom同命令
+  改port30143并追加custom，退出0，`/tmp/llmtuner-nonfinite-tp-custom-133.log`。
+  EP改为nproc2、ep2和port30144/30145，均退出0，日志
+  `/tmp/llmtuner-nonfinite-ep-native-133.log`与
+  `/tmp/llmtuner-nonfinite-ep-custom-133.log`。
+- 无生产变更，复用131完整CPU3712/2skip；新增回归ruff/format、适用pre-commit、
+  脚本编译及diff检查通过。同步comparison中的故障保护矩阵，区分拓扑重叠。
+  无法据此声称CP/PP、efsdp>1、不同路由、设备内核或Inductor已验证；数据/RNG/
+  step回滚及设备异步assert后的可恢复性不在证明内。未commit/push，无运行任务。
+
+### 第134批：真实HCA CP×FSDP非有限值更新保护
+
+- 扩展trainer_nonfinite_update.py的cp2场景，复用hca_trainer_checkpoint.config
+  的DeepSeek V4模型配置，实际Trainer应用Compressor Ulysses CP2与DP shard2，
+  真实四rank、TP/EP/PP1。attention走compressor_attention.py的SeqToHead/
+  HeadToSeq与compressed windows生产实现，未安装CPU attention替代。
+- 首轮port30146退出1，原因是注入器仅识别llmtuner MoE，而HCA保留HF原生
+  DeepseekV4Experts；loss故障已运行，进入专家梯度故障时目标断言失败，日志
+  `/tmp/llmtuner-nonfinite-cp-native-134.log`保留。按HF定义类型选择原生专家
+  梯度，未删除目标断言、切换为dense梯度或改变生产模型。
+- native port30147及custom port30148均退出0。两组eager、无AC，每组覆盖全部
+  四rank各自的loss NaN及原生expert梯度Inf，共16故障及16次后续有限更新；
+  检查全rank拒绝、模型/optimizer/scheduler/EMA及本地布局精确不变，随后
+  权重实际变化及scheduler推进。既有非零moments与EMA历史前提保持。
+- 命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30147 tests/integration_tests/trainer_nonfinite_update.py cp2`
+  日志`/tmp/llmtuner-nonfinite-cp-native-final-134.log`；custom改port30148并
+  追加custom，日志`/tmp/llmtuner-nonfinite-cp-custom-134.log`。源代码及mesh
+  日志确认dp_shard2/cp2，HF原生专家并未被EP替换。
+- 无生产改动，复用131完整CPU3712/2skip；新增场景ruff/format、适用pre-commit、
+  编译及diff通过，同步comparison。仅HCA Compressor CP，不证明普通Flex CP、
+  KV AllGather、KCP、混合HCA/CSA/sliding、CP下AC/compile或目标设备；不包含
+  数据/RNG/step回滚。未commit/push，无运行任务，保留此前工作区改动。
+
+### 第135批：PP×DP有限性标记全局传播缺口
+
+- PP-FINITE-135：扩展132脚本pp2，实际Qwen3、DP shard2×PP2、四rank、1F1B。
+  初版默认microbatch1被PyTorch正确拒绝，port30149退出1，日志
+  `/tmp/llmtuner-nonfinite-pp-native-135.log`。测试配置改为global batch8、
+  每DP batch4、4个microbatches；未更改调度实现或配置校验。
+- 有效配置port30150仍退出1，`/tmp/llmtuner-nonfinite-pp-native-final-135.log`。
+  故障注入后rank0/2已拒绝并进入状态快照，rank1/3却进入_step_metrics通信。
+  port30151诊断复现退出1，`/tmp/llmtuner-nonfinite-pp-trace-135.log`；
+  `/tmp/llmtuner-pp-nonfinite-stack-{0,1,2,3}-135.log`记录实际线程栈，
+  rank1/3在trainer.py:_step_metrics的all_reduce，rank0/2在optimizer快照。
+- 根因：_clip_and_check_finite仅在末级stage上先归约loss_mesh，再归约pp_mesh；
+  非末级的局部失败标记不能传播至另一条DP副本。生产非末级通常返回固定
+  _pp_loss_sentinel；本例明确为定点标记注入，不能声称正常模型自行产生了
+  NaN sentinel。它违反该方法对任意local loss/norm的global verdict契约。
+- 修复将本地loss与grad norm有限性先合并，再执行一次world MIN；删除
+  stage条件和分步mesh归约，_check_finite文档同步。所有rank已有共同train_step
+  和全局错误边界，此处保持同一world参与；不改梯度范数/clip或optimizer逻辑。
+- 原全部精确断言保留，native/custom PP分别port30152/30153退出0，日志
+  `/tmp/llmtuner-nonfinite-pp-native-after-135.log`与
+  `/tmp/llmtuner-nonfinite-pp-custom-after-135.log`。命令同134的CPU/Gloo环境，
+  脚本`trainer_nonfinite_update.py pp2`，custom追加custom。共16种故障及16次
+  有限值后续更新，eager、无AC；first/last stage均作为故障源。
+- custom TP2+full AC+aot_eager复跑port30154退出0，
+  `/tmp/llmtuner-nonfinite-tp-after-135.log`。完整CPU3712 passed、2 skipped、
+  278 warnings，39.77秒exit0，`/tmp/llmtuner-cpu-135.log`；全部适用pre-commit
+  exit0，`/tmp/llmtuner-precommit-all-135.log`，compileall/diff通过。
+
+- custom HCA CP2回归port30155退出0（eager/noAC），
+  `/tmp/llmtuner-nonfinite-cp-after-135.log`。真实Trainer新进程恢复使用126同命令
+  （corpus async dp2 custom compile ac validate moe ep2 quantile）退出0，加载
+  边界与续训后完整状态精确相等，日志`/tmp/llmtuner-finite-global-trainer-135.log`，
+  产物ka2zrqba。故障回归不替代PP独立数值参考、PP AC/compile、设备内核与
+  CUDA异步assert恢复证明。未commit/push，无运行任务，保留已有改动。
+
+### 第136批：Interleaved PP×FSDP完整新进程恢复复核
+
+- 135修改了训练有限性归约，故复查pp_checkpoint_equivalence.py的前置加载边界、
+  本地DTensor布局比较、warm Adam、RNG/loader可选检查及最终状态验收。使用
+  现有严格测试，无放宽或删除断言；未改生产代码或harness。
+- 场景：四rank、DP shard2×PP2、TP/CP/EP1，dense Qwen3六层，Interleaved1F1B、
+  每rank两个local parts、4 microbatches。native/custom各新启动full和resume，
+  full AC+aot_eager、异步DCP、dynamic EMA；非packed，无CPU attention替代。
+- 环境为CPU/Gloo，PYTHONPATH=.、GLOO_SOCKET_IFNAME=lo0、
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0；额外设置
+  LLMTUNER_TEST_WORLD_SIZE=4、LLMTUNER_TEST_PP_SIZE=2、
+  LLMTUNER_TEST_PP_SCHEDULE=Interleaved1F1B、LLMTUNER_TEST_AC=full、
+  LLMTUNER_TEST_COMPILE_BACKEND=aot_eager、LLMTUNER_TEST_EMA=dynamic、
+  LLMTUNER_TEST_ASYNC_MODE=async、LLMTUNER_TEST_RNG_STATE=1、
+  LLMTUNER_TEST_LOADER_STATE=1和对应LLMTUNER_TEST_FSDP_IMPLEMENTATION。
+- 每phase命令模板：
+  `torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30156 tests/integration_tests/pp_checkpoint_equivalence.py full <artifact-root>/native`
+  native full/resume用port30156/30157，custom用30158/30159，全部退出0；日志
+  `/tmp/llmtuner-pp-{native,custom}-{full,resume}-136.log`。完整产物根
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-pp-resume-136-mk3z81hw`，
+  results.json保存四作业命令与退出码。
+- 显式核验两个实现各四rank的split-state及final-state文件全部存在，resume
+  日志四rank均为pre-update state failures=0，排除旧harness对缺失边界文件的
+  兼容跳过。各local part必须为OptimizedModule且实际unique_graphs>0。
+  最终模型、FQN optimizer、scheduler、EMA、trainer counters、RNG和synthetic
+  loader状态精确一致，resume losses逐位相等，max abs diff=0。
+- 复核ntokens_seen确实由runtime.batch.microbatch更新，并非只比较初始零计数。
+  harness直接驱动Trainer构造与train_step，未宣称运行CLI主循环或真实语料。
+  本批仅文档证据，复用135完整CPU3712/2skip；文档适用pre-commit及diff通过。
+  设备、Inductor、其他调度、拓扑变化与独立dense算术参考仍需各自验收。
+  未commit/push，无运行任务，保留此前工作区改动。
+
+### 第137批：真实CLI的分布式PP异步保存与恢复
+
+- 复核trainer.cli.main生命周期及config.cli_config的PROGRAMMATIC_ONLY：CLI
+  真实调用Trainer.train，finally关闭Trainer与进程组；EMA、validation、compile
+  backend目前只提供程序化配置。本批未扩展生产CLI或用脚本hook代替CLI入口。
+- cli_checkpoint_equivalence.py新增dp2/pp2/custom/async/ac场景；pp2通过
+  torch.distributed.run --module llmtuner执行真正包入口，四rank、DP shard2×PP2、
+  六层dense Qwen3、Interleaved1F1B、4 microbatches、full AC、async DCP、eager。
+  每个实现包含连续3step、initial2step和新进程resume至3step三个独立作业。
+- DCP产物转换后比较全部完整状态，解码world内每rank RNG，而非只处理rank0；
+  显式断言rank集合、world size、step3、ntokens_seen96与scheduler epoch3。
+  ntokens期望按global_batch/DP度数推导；原单进程48断言保持同一公式的原语义，
+  未放宽容差。最终模型、optimizer、scheduler、loader、trainer、所有RNG精确相等。
+- native命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/cli_checkpoint_equivalence.py pp2 async ac`
+  退出0，连续/initial/resume端口30160/30161/30162，日志
+  `/tmp/llmtuner-cli-pp-native-137.log`，产物llmtuner-cli-resume-_jf7krqe。
+  custom同命令追加custom，设置LLMTUNER_TEST_MASTER_PORT=30163，三个端口
+  30163/30164/30165，退出0，日志`/tmp/llmtuner-cli-pp-custom-137.log`，
+  产物llmtuner-cli-resume-_bl89ir9。产物位于本机temp根；三个作业各自log
+  保留在产物内，确认真实AC各local part、Interleaved四stage和异步完成日志。
+- 默认单进程命令`PYTHONPATH=. python tests/integration_tests/cli_checkpoint_equivalence.py`
+  退出0，`/tmp/llmtuner-cli-default-137.log`。无生产变更，复用135完整CPU3712/
+  2skip；脚本及文档适用pre-commit、编译与diff通过。
+- CLI最终状态比较不包含更新前边界快照，不能代替136的四rank独立边界证据。
+  无CLI EMA/validation/compile、真实语料、设备内核、Inductor或拓扑变化声明。
+  未commit/push，无运行任务，保留此前工作区改动。
+
+### 第138批：Profiler失败协调与退出trace保留
+
+- `PROFILER-COORD-138`（P1，已修复/CPU验证）：Trainer.train 的 profiler
+  初始化和 step 导出原为本地调用，一 rank 失败时同伴会继续训练并阻塞于通信。
+  使用 ExitStack 管理已启动的 profiler，并在两个纯本地区间复用
+  synchronize_local_errors；一般 Profiler 工具仍支持 rank 局部使用。
+  区间内不含 collective，不拆分 trainer.py，保留原始异常及 finally 清理。
+- 新增 training_profiler_coordination.py，驱动真实 Trainer.train 循环及 CPU
+  profiler；训练算术和 checkpoint IO 替换为记录器。两rank，初始化/导出阶段、
+  故障rank0/1、OSError/KeyboardInterrupt/SystemExit共12场景，断言原异常身份、
+  同伴阶段错误、step/save次数、句柄释放、GC恢复和健康barrier。
+  修复前port30166出现Gloo超时；修复后30167及最终30171退出0。
+  日志 `/tmp/llmtuner-profiler-{before,after,final}-138.log`。
+- `TRACE-OVERWRITE-138`（P1，已修复/CPU验证）：torch profiler在step导出后
+  退出仍回调同一step，旧路径覆盖完整cycle。记录最后成功导出的step，重复step
+  写入 iteration_<step>_exit，保留正常与异常退出的尾部事件。
+  两项真实CPU回归确认完整trace字节不变且含aten::mm，退出trace含aten::add。
+  使用隔离插件加载HEAD旧实现，两项均在字节保持断言失败，日志
+  `/tmp/llmtuner-profiler-overwrite-before-final-138.log`。此前缺失测试导入的
+  NameError已修正；早期before/unit-after/cpu-final日志不作为缺陷复现证据。
+- cli_checkpoint_equivalence.py新增profile选项：真实CPU/Gloo、DP shard2×PP2、
+  六层Qwen3、Interleaved1F1B四虚拟stage、4 microbatches、full AC、async DCP、
+  eager。native/custom各执行连续3step、initial2step、新进程resume至3step；
+  最终模型、Adam、scheduler、loader、trainer及四rank RNG精确相等。
+  每rank step3完整trace含aten::linear，_exit trace可解析。命令为
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/cli_checkpoint_equivalence.py pp2 async ac profile`，
+  custom追加custom；LLMTUNER_TEST_MASTER_PORT分别30168/30172，三作业占用
+  30168–30170/30172–30174，均退出0。日志
+  `/tmp/llmtuner-cli-profile-{native,custom}-138.log`，产物根分别为本机temp下
+  llmtuner-cli-resume-zmpfubw0及llmtuner-cli-resume-vak_a2fm。
+- 完整CPU最终3714 passed、2 skipped（288 warnings），日志
+  `/tmp/llmtuner-cpu-fixed-138.log`；适用全部文件pre-commit通过，日志
+  `/tmp/llmtuner-precommit-all-138.log`；compileall与diff检查通过。
+  对照本地torchtitan observability/profiler.py：保留训练step命名与rank文件，
+  本地额外保护重复退出导出并在Trainer协调本地失败。未宣称CUDA/NPU profiling、
+  memory snapshot设备验收、Inductor、CLI EMA/validation或拓扑变化已通过。
+  未commit/push，保留既有工作区改动；上述运行任务均已终止。
+
+### 第139批：验证失败的全rank覆盖与退出路径复核
+
+- 复读 Trainer.train/close、Profiler enter/exit、GarbageCollection，以及
+  BaseCheckpointManager.close/_wait_for_pending_save 和完整 runtime/validation.py。
+  核对正常结束、数据耗尽、profiler异常、异步checkpoint收尾及原错误保留。
+  未确认本批新增生产缺陷，不作无收益重组；close仍为本地幂等清理，不能在
+  析构时添加要求全rank到达的collective。设备通信失败仍不保证恢复。
+- `VALIDATION-RANK-COVERAGE-139`（P2，测试覆盖已补齐）：已有验证预处理
+  故障测试仅注入rank0。本批只将该场景扩展为全部四rank，保留此前模式设置
+  故障测试及全部断言；DP2×CP2、DP2×TP2各覆盖rank0–3及ValueError、
+  KeyboardInterrupt、SystemExit，共24个预处理故障场景。每次验证原异常身份、
+  同伴阶段错误、临时loader关闭、模型及冻结子模块模式、RNG逐位恢复、训练token
+  计数不变和健康barrier；之后正常验证仍与完整batch的独立CE参考一致。
+- CPU/Gloo命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30176 tests/integration_tests/validation_reduction_equivalence.py`
+  最终退出0，两种mesh均报告validation matches full-batch loss。扩展前同脚本
+  port30175也退出0。模型是确定性本地投影、显式序列切片；这证明生产验证循环
+  及真实归约，不代替TP/CP模型变换、attention、PP或设备内核验证。
+- targeted profiler/trainer单测208 passed；首次误用不存在的test_validation.py
+  导致pytest退出4、没有运行测试，纠正后才取得上述结果。脚本初次pre-commit
+  发现闭包绑定及行宽问题，已显式绑定failing_rank并格式化，最终适用全部文件
+  pre-commit退出0，日志 `/tmp/llmtuner-precommit-all-139.log`。
+  完整CPU最终3714 passed、2 skipped（285 warnings），日志
+  `/tmp/llmtuner-cpu-139.log`；compileall与diff通过。
+  保留此前工作区改动，未commit/push；本批作业均已结束。
+
+### 第140批：CLI配置链路与step-0 seed新进程验收
+
+- 复读 __main__.py、trainer/cli.py、config/cli_config.py、validation_config.py、
+  observability_config.py、lr_scheduler_config.py和optimizer/lr_scheduler.py。
+  核对parser group顺序、programmatic-only嵌套配置、from_groups装配、seed出口
+  单进程限制、清理错误保留、WSD终点和恢复epoch边界。未确认新增生产缺陷。
+- `CLI-SEED-COVERAGE-140`（P2，已补测试）：cli_checkpoint_equivalence.py新增
+  单进程seed模式。独立CLI进程创建step-0，断言成功输出、DCP metadata存在且
+  没有step-1；随后新CLI进程initial必须报告Resuming from step 0，第三个新进程
+  从step2恢复至3，对照独立连续训练，全部模型/Adam/scheduler/loader/trainer/RNG
+  语义状态精确一致。保持原有默认及DP/PP模式；seed模式目前只允许单进程。
+- 命令 `PYTHONPATH=. TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/cli_checkpoint_equivalence.py seed`
+  退出0；日志 `/tmp/llmtuner-cli-seed-140.log`，产物位于本机temp下
+  llmtuner-cli-resume-40yclqzo，保留seed/continuous/initial/resume四个子进程日志。
+  使用CPU、eager、native DCP、synthetic Qwen3；该场景seed与训练初始化相同，
+  不能单独证明不同初始化权重的覆盖，也不代替分布式seed加载及拓扑变化验收。
+- 脚本最终pre-commit通过（首次仅格式自动修正后重跑），compileall通过。
+  完整CPU3714 passed、2 skipped，日志 `/tmp/llmtuner-cpu-140.log`；
+  适用全部文件pre-commit退出0，日志 `/tmp/llmtuner-precommit-all-140.log`，
+  diff检查通过。本批测试扩展之外不改生产代码；保留此前改动，未commit/push。
+  四个CLI进程与完整CPU作业均已终止，无本批运行任务。
+
+### 第141批：不同初始化的seed加载边界与负对照
+
+- `CLI-SEED-COVERAGE-140`续验：140只验证同初始化的最终恢复，无法独立排除
+  未加载权重。cli_checkpoint_equivalence.py的seed模式新增独立边界进程，使用
+  生产parse_config、Trainer构造及checkpointer.load(0)，不运行optimizer更新。
+  seed42导出、新进程seed43初始化，先断言至少一个模型张量不同，加载后每个
+  模型张量与DCP转换产物精确一致；非模型训练服务state_dict、CPU RNG、step0及
+  ntokens_seen0保持不变。随后原有三个CLI作业及完整最终语义状态比较仍通过。
+- 命令 `PYTHONPATH=. TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/cli_checkpoint_equivalence.py seed`
+  退出0，日志 `/tmp/llmtuner-cli-seed-boundary-141.log`，产物本机temp下
+  llmtuner-cli-resume-jy3yoraa，seed-boundary.log明确报告不同初始权重已替换。
+  该边界使用生产加载入口，但不是CLI训练主循环内的hook；后者由后续作业覆盖。
+- 负对照在独立进程用unittest.mock临时令BaseCheckpointManager.load直接返回True，
+  无工作区回退或生产改动。边界检查在首个模型张量精确比较失败（512/512元素
+  不同、max abs 0.08081957697868347），负对照driver确认失败后退出0；日志
+  `/tmp/llmtuner-seed-negative-141.log`。这排除同初始化造成的空泛通过。
+- 完整CPU3714 passed、2 skipped（277 warnings），日志
+  `/tmp/llmtuner-cpu-141.log`；脚本pre-commit最终通过，最初格式问题已修正。
+  适用全部文件pre-commit退出0，日志 `/tmp/llmtuner-precommit-all-141.log`；
+  compileall与diff通过。仅增强测试证据，无生产修改；CPU/eager/native DCP，
+  不宣称设备、分布式
+  seed、拓扑变化或EMA seed冷启动已验证。所有本批进程已结束，未commit/push。
+
+### 第142批：单进程seed到DP2分片模型的加载
+
+- `CLI-SEED-COVERAGE-140`续验：CLI测试seed模式允许DP2。导出仍由独立单进程
+  CLI生成，删除导出命令的DP shard配置；边界加载改由两个真实torchrun rank
+  执行。重建DTensor完整值后与未分片seed逐张量精确比较，不用本地切片冒充
+  完整模型。每rank先确认seed43初始化与seed42不同，加载后训练服务state_dict、
+  CPU RNG与step/token计数保持不变；边界进程显式关闭Trainer及进程组。
+- 两层dense Qwen3、DP shard2、TP/PP/CP/EP1、CPU/Gloo、eager、同步native DCP；
+  native/custom FSDP分别执行导出、双rank加载边界、连续3step、initial2step、
+  新进程resume至3step。最终全部模型、Adam、scheduler、loader、trainer及
+  两rank RNG语义状态精确一致。该harness尚未开放seed×PP；不能把seed模型
+  重分片加载等同于完整训练状态跨拓扑恢复。
+- 命令模板：
+  `LLMTUNER_TEST_MASTER_PORT=30177 PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/cli_checkpoint_equivalence.py seed dp2`
+  native边界port30180，三个训练作业port30177–30179，退出0，日志
+  `/tmp/llmtuner-cli-seed-dp-native-142.log`，本机temp产物
+  llmtuner-cli-resume-c9dj35xa。custom追加custom并使用baseport30181，边界
+  port30184、训练30181–30183，退出0，日志
+  `/tmp/llmtuner-cli-seed-dp-custom-142.log`，产物llmtuner-cli-resume-83t9ch69。
+  两个实现的边界日志各有两个rank成功消息；本批所有进程均已结束。
+- 完整CPU3714 passed、2 skipped（280 warnings），日志
+  `/tmp/llmtuner-cpu-142.log`；compileall、diff及适用全部文件pre-commit通过，
+  门禁日志 `/tmp/llmtuner-precommit-all-142.log`。
+- 生产代码未修改，保留既有工作区改动，未commit/push。首次pre-commit修正
+  imports、行宽与格式后，脚本最终检查通过。
+
+### 第143批：未分片seed到Interleaved PP×DP的真实加载
+
+- `CLI-SEED-COVERAGE-140`续验：CLI测试seed模式允许DP2×PP2；单进程seed
+  导出命令移除PP degree/schedule/microbatch及DP shard参数，保留六层模型。
+  四rank加载边界使用实际PP本地parts、full AC、FSDP及DCP，模型DTensor重建后
+  与未分片seed对应FQN精确比较。各rank先确认seed43初始化不同，再验证模型
+  加载、非模型训练服务与CPU RNG不变；随后继续真实CLI恢复等价验收。
+- 初次native场景最终比较失败：参考连续训练使用PP stage初始化，而initial
+  分支加载未分片seed，起始权重不同。首差异为optimizer embed_tokens exp_avg，
+  512/512元素不同、max abs0.019863147288560867；日志
+  `/tmp/llmtuner-cli-seed-pp-native-143.log`，产物llmtuner-cli-resume-l4uf16uz，
+  ports30185–30188，退出1。边界加载当时已通过，不把该失败归为生产加载缺陷。
+- 复核runtime/assembly.py与本地torchtitan distributed/utils.py::set_determinism、
+  config/configs.py::DebugConfig：PP stage distinct seed为有意语义。修正参考，
+  两条轨迹都显式指定initial_load_path为同一个seed；既有folder checkpoint仍
+  优先于initial路径。保留所有精确断言和失败证据，未修改生产seed策略。
+- 命令模板：
+  `LLMTUNER_TEST_MASTER_PORT=30189 PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/cli_checkpoint_equivalence.py seed pp2 async ac`
+  native最终退出0，boundary30192，连续/initial/resume用30189–30191；日志
+  `/tmp/llmtuner-cli-seed-pp-native-final-143.log`，产物llmtuner-cli-resume-th5cplmj。
+  custom追加custom、base30193，boundary30196、三个训练30193–30195，退出0，
+  `/tmp/llmtuner-cli-seed-pp-custom-143.log`，产物llmtuner-cli-resume-bw9btnd8。
+  全部产物位于本机temp根，两个boundary日志各有四rank成功消息。
+- CPU/Gloo、dense Qwen3六层、DP shard2×PP2、TP/CP/EP1、Interleaved1F1B四stage、
+  四microbatches、full AC、eager、async DCP。最终模型、Adam、scheduler、loader、
+  trainer及四rank RNG精确一致；不宣称完整训练状态从world1迁移world4，模型
+  seed加载之外的状态均由目标拓扑初始化。设备、Inductor、MoE及EMA仍需验收。
+- 完整CPU3714 passed、2 skipped（287 warnings），日志
+  `/tmp/llmtuner-cpu-143.log`；compileall、diff与适用全部文件pre-commit通过，
+  日志 `/tmp/llmtuner-precommit-all-143.log`。
+  本批仅测试与文档变更，保留既有改动，未commit/push；作业均已结束。
+
+### 第144批：CP入口精简与实际输入整除边界
+
+- 复核问题TRAINER-TRIAXIS-ADAMW-NUMERICS-15的101–116证据与独立舍入参考：
+  已知CPU差异涉及CP局部FP32归约，115/116通过不撤销原HF失败，也不覆盖
+  目标设备及任意拓扑。本批不重复该参考、不修改容差，问题剩余范围继续开放。
+- 重读context_parallel.py、input_sharding.py及HF模型preprocess/_shard_for_cp，
+  查询本机torch2.14 _context_parallel_shard/_context_parallel_buffers源码。
+  前者实际通过distribute_tensor产生可能不等长的Shard；不能假定上游替调用方
+  拒绝不整除。config只校验max_seq_len，公共分片入口仍须检查实际输入长度。
+- `CP-UNEVEN-INPUT-144`（P1，已修复/CPU边界验证）：无load balancer的CP分片
+  之前直接接受长度1/3/15等不能被CP2整除的输入，不等长序列与后续等长通信
+  不符。resolve_load_balancer在任何tensor/BlockMask分片前检查seq_len%CP，
+  原headtail的2×CP约束保留；不进入通信、不改布局和正常数值语义。
+  新增两个fake rank×三个长度共6项回归，分别要求batch和padding入口拒绝。
+  修复前6项均因DID NOT RAISE失败，日志
+  `/tmp/llmtuner-cp-uneven-before-144.log`。这是本地形状契约复现，不宣称已运行
+  会损坏进程组的不等长collective；训练preprocess现有本地错误边界负责传播。
+- CP入口同时复用一次model_config读取，去除四处分支重复查询，并将Ulysses
+  错误提示缩短为约束、顺序原因及kv_allgather解决方式。保留核心同名入口、
+  CP关闭无副作用、可选后端懒导入、KCP/HCA分支和head整除校验。
+- 有效输入回归：真实四rank CPU/Gloo、PP2×CP2、custom FSDP、1F1B、累积2、
+  四microbatches、seq256、四训练step。命令
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30197 tests/integration_tests/pp_cp_equivalence.py 1F1B 2`
+  退出0，`/tmp/llmtuner-pp-cp-144.log`；独立dense参考原tol1e-5未改，max loss差
+  4.768e-7、gradient差5.576e-8、parameter差4.389e-6、failed ranks0。
+  此脚本明确替代attention计算为CPU SDPA，只证明生产分片、mask、collective、
+  autograd及Trainer路径，不能替代设备flex验收。无生产通信算法修改。
+- 最终完整CPU3720 passed、2 skipped（296 warnings），日志
+  `/tmp/llmtuner-cpu-final-144.log`；此前仅入口精简时的3714/2skip保留在
+  `/tmp/llmtuner-cpu-144.log`，不替代新增边界修复后的最终结果。适用全部文件
+  pre-commit、compileall与diff通过，门禁日志 `/tmp/llmtuner-precommit-all-144.log`。
+  架构文档已同步；所有本批作业结束，保留此前改动，未commit/push。
+
+### 第145批：实际CP/TP输入长度错误的跨rank传播
+
+- `CP-UNEVEN-INPUT-144`续验：新增input_sharding_coordination.py，真实四rank
+  CPU/Gloo、CP2×TP2 mesh，通过Trainer.preprocess及真实HF Qwen3 wrapper、
+  device transfer、CP/TP sharders执行。分别在rank0–3注入长度15（CP不可整除）
+  和14（CP可整除，CP局部长度7不可被TP2整除），共8个故障场景。
+- 故障owner必须得到对应cp/tp整除ValueError，同伴必须得到精确的Training
+  batch preprocessing阶段错误；每次健康barrier后重试长度16，独立按cp/tp
+  坐标计算token、label、padding索引及CP完整positions，全部零容差对齐，
+  原始输入未改变。实际预处理本地边界可传播144的拒绝，无attention collective。
+- 命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30199 tests/integration_tests/input_sharding_coordination.py`
+  最终退出0，日志 `/tmp/llmtuner-input-coordination-final-145.log`。首次port30198
+  因夹具未设置trainer.model导致AttributeError，launcher随后报告PermissionError；
+  确认worker均终止后修正夹具重跑，原日志
+  `/tmp/llmtuner-input-coordination-145.log`不作为生产缺陷证据。
+- 本批只新增集成测试和台账，无生产改动；完整CPU复用144同一生产版本的
+  3720 passed/2 skipped证据。未执行attention、并行模型变换或optimizer，
+  不以此宣称完整TP/CP模型或设备验收。适用全部文件pre-commit、compileall
+  与diff通过，日志 `/tmp/llmtuner-precommit-all-145.log`。
+  全部本批作业终止；保留既有改动，未commit/push。
+
+### 第146批：数据计数、目标构造与源码清单复核
+
+- 完整重读datasets/collators.py、synthetic.py，复核contracts.py的TextSequence、
+  DatasetBuildContext/IterationPolicy、Batch定义；追踪components/loss.py的
+  next_token_targets及runtime/batch.py的fetch/count_valid_tokens/
+  count_routing_tokens/microbatch/preprocess和HF模型CP/TP输入调用。
+  未确认本批新增缺陷，不作无收益封装或行为修改。
+- 普通Batch按每行labels[...,1:]计数，与next_token_targets逐行shift相符；
+  packed标签由processor对齐，不重复shift；TextCollator统一屏蔽padding标签，
+  PipelineTextCollator有限末批用全masked空行补齐固定schedule形状。
+  packed num_valid_tokens为collator的受信任计数（范围及整数校验），当前单测
+  明确要求优先使用该值；本批不擅自改成重算或改变已有数据契约。
+  router计数包含masked prompt但排除padding；synthetic loader校验数据布局、
+  DP度数与游标，恢复不能倒退已有iterator，拓扑改变仍需单独迁移验收。
+- 命令 `pytest -q --disable-warnings tests/unit_tests/cpu/test_trainer.py tests/unit_tests/cpu/datasets tests/unit_tests/cpu/components/test_loss.py`
+  退出0，711 passed（110 warnings），日志 `/tmp/llmtuner-data-review-146.log`。
+  本批无生产或测试代码修改，完整CPU复用144同生产版本3720/2skip；
+  相关进程结束，保留既有工作区改动，未commit/push。
+- 按当前文件系统与台账表逐项核对llmtuner/**/*.py：178个源码文件、178条
+  唯一记录，无缺失、重复或陈旧行。此为清单覆盖检查，不能替代逐行阅读或
+  每种硬件/组合的数值、恢复验收；全局完成仍未证明。
+
+### 第147批：初始化中断后的执行设置与host RNG恢复
+
+- 重读utils/seeding.py、Trainer.__init__及相关runtime assembly种子顺序，复核
+  preserve_rng_state、rollback_execution_settings_on_error、DTensor tracker初始化、
+  PP坐标seed派生与训练构造清理的嵌套顺序。未确认本批新生产缺陷。
+  构造失败先执行close，再恢复Python/NumPy/CPU RNG及进程策略；成功构造保留
+  策略。设备RNG和并发修改明确在该rollback契约之外，不扩大恢复声明。
+- `INIT-SYSTEMEXIT-COVERAGE-147`（P2，测试已补）：既有执行设置和host RNG
+  构造失败回归只覆盖ValueError/KeyboardInterrupt。新增SystemExit参数，包含
+  close成功/再次抛错两种情况，仍要求原异常身份与恢复断言全部通过。
+  未改生产实现，未重写其他已存在的测试改动。
+- 初始相关回归命令
+  `pytest -q --disable-warnings tests/unit_tests/cpu/test_pp_distinct_seed.py tests/unit_tests/cpu/utils/test_utils.py tests/unit_tests/cpu/test_trainer.py`
+  203 passed，日志 `/tmp/llmtuner-seeding-review-147.log`。扩展后定向命令
+  `pytest -q --disable-warnings tests/unit_tests/cpu/test_trainer.py -k failed_trainer_construction_restores`
+  9 passed、137 deselected，日志 `/tmp/llmtuner-seeding-interrupt-147.log`。
+  本批CPU检查不代替真实设备DTensor随机操作、设备RNG回滚或跨拓扑恢复验收。
+- 完整CPU3723 passed、2 skipped（297 warnings），退出0，日志
+  `/tmp/llmtuner-cpu-147.log`；适用全部文件pre-commit、compileall及diff通过，
+  门禁日志 `/tmp/llmtuner-precommit-all-147.log`。
+  本批仅测试与台账修改；全部作业结束，保留既有改动，未commit/push。
+
+### 第148批：meta物化、共享身份与初始化失败边界复核
+
+- 完整重读models/hf/materialization.py及runtime/assembly.py的_build_model、
+  _apply_parallelism、optimizer装配前后顺序；核对test_hf_wrapper.py中RoPE重建、
+  持久buffer加载、real buffer保留、内部/外部alias、冻结共享参数及梯度断言。
+  materialization先识别全部非持久meta buffer，再to_empty并恢复alias，未知
+  buffer在存储变化前拒绝；本批未确认新的参数身份或值恢复缺陷。
+- 命令 `pytest -q --disable-warnings tests/unit_tests/cpu/models/test_hf_wrapper.py tests/unit_tests/cpu/components/checkpointer/test_checkpointer.py`
+  退出0，220 passed（114 warnings），日志 `/tmp/llmtuner-materialization-148.log`。
+  无生产/测试代码变更；完整CPU复用147同生产版本3723/2skip。
+- `META-FAILURE-BOUNDARY-148`（P2，待验证）：_apply_parallelism中各part物化
+  直接执行，之后optimizer装配进入分布式路径。需进一步验证单rank物化失败时
+  同伴的行为，并审计DTensor/to_empty和架构构造是否含通信，确定安全协调区间。
+  当前证据只证明调用顺序，尚无故障复现，不宣称已确认死锁或已修复；不得直接
+  把可能通信的整段parallelize包进local-only错误协调。下一步构造真实分片
+  meta故障场景，保留原异常及peer资源清理证据后决定实现。
+- 本批查询本机私有DTensor dispatcher接口时AttributeError，及搜索旧custom_fsdp
+  文件不存在，均为审查定位失败，无生产影响；不当作设备或运行验证。
+  仅台账更新，保留现有改动，未commit/push；本批测试进程已结束。
+
+### 第149批：meta DTensor物化的实际算子审计
+
+- 续接META-FAILURE-BOUNDARY-148，先核对torch.nn.Module.to_empty源码：通过
+  Module._apply执行torch.empty_like；DTensor torch2.14走C++ fast dispatch，
+  因而此前查询旧Python dispatcher方法不能证明调用行为。
+- 新建临时独立诊断 `/tmp/llmtuner_meta_dispatch_149.py`，真实两rank CPU/Gloo，
+  创建全局4×4、local2×4的meta DTensor Shard(0)，注册共享parameter别名，
+  使用生产materialize_meta_model物化到CPU。TorchDispatchMode记录实际算子；
+  两rank均仅观察aten.empty_like与aten.detach，无c10d/collective算子；本地
+  存储2×4、非meta和parameter alias同对象断言通过，最终barrier健康。
+- 命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30200 /tmp/llmtuner_meta_dispatch_149.py`
+  退出0，日志 `/tmp/llmtuner-meta-dispatch-149.log`。这是直接DTensor物化的
+  真实运行证据，未使用fake process group；没有执行FSDP wrapper、RoPE重建、
+  compile wrapper或设备物化，不能据此把所有materialize调用视为无collective。
+- 检查本机torch/distributed/tensor/_ops/_tensor_ops.py，empty_like属于
+  create_like策略。下一步需要实际FSDP wrapper与已支持HF RoPE的物化审计，
+  然后复现单rank失败及确认协调区间。META-FAILURE-BOUNDARY-148保持待验证，
+  不将本批的局部安全证据冒充完整错误传播修复。
+- 本批无生产/测试代码修改，仅台账记录与/tmp诊断；保留现有工作区改动，
+  未commit/push。两个worker及launcher均退出0，无本批运行任务。
+
+### 第150批：实际native/custom FSDP与RoPE物化算子审计
+
+- 续接META-FAILURE-BOUNDARY-148。检查torch2.14 FSDPModule._apply源码：先
+  reshard，调用父类_apply后reset_sharded_param。不能仅凭普通DTensor空张量
+  分配证据推断该wrapper的完整生命周期，故补充真实包装路径诊断。
+- `/tmp/llmtuner_meta_fsdp_150.py`构建一层Qwen3 meta模型，使用生产
+  get_fsdp_strategy(...).get_fully_shard_fn()先包layer再包root，native/custom
+  各执行一次；真实两rank CPU/Gloo、FSDP2。在TorchDispatchMode下执行生产
+  materialize_meta_model，确认参数全部非meta、仍含DTensor、RoPE inv_freq有限。
+  两种实现各rank仅观察empty_like/detach、RoPE arange/pow/reciprocal等本地
+  算子，无c10d/collective算子；最终barrier健康。
+- 命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30202 /tmp/llmtuner_meta_fsdp_150.py`
+  退出0，日志 `/tmp/llmtuner-meta-fsdp-final-150.log`。首次port30201误将strategy
+  对象直接调用，TypeError退出1，日志 `/tmp/llmtuner-meta-fsdp-150.log`；纠正为
+  公开get_fully_shard_fn后重跑，未修改生产代码或掩盖失败。
+- 证据扩展到Qwen3真实FSDP wrapper及RoPE重建；未运行forward/checkpoint load，
+  不证明权重内容或数值等价，也不外推任意架构、compiled/PP part或目标设备。
+  下一步应在实际Trainer构造路径注入物化故障，验证同伴错误及清理，再选择
+  协调位置；META-FAILURE-BOUNDARY-148仍未关闭。
+- 仅新增/tmp诊断及台账证据，无生产/测试代码变更；完整CPU复用147同生产版本
+  3723/2skip。全部诊断进程终止，保留已有工作区改动，未commit/push。
+
+### 第151批：Trainer meta物化失败在optimizer前协调
+
+- `META-FAILURE-BOUNDARY-148`确认生产阶段越界并修复（P1）：_apply_parallelism
+  物化某rank失败时，该rank退出构造，而同伴继续进入optimizer的分布式planning。
+  新回归真实Trainer构造、Qwen3 meta、DP shard2、native/custom FSDP；先完成
+  实际物化，再在指定rank抛ValueError/KeyboardInterrupt/SystemExit。optimizer
+  sentinel只记录是否进入并失败，避免故意制造进程组超时。
+- 修复前port30203退出1，同伴确实进入optimizer sentinel，日志
+  `/tmp/llmtuner-meta-before-151.log`；这是阶段越界复现，非实际optimizer超时
+  复现。新增meta_initialization_coordination.py保留该断言，未弱化故障条件。
+- assembly._apply_parallelism先在边界外完成/捕获所有本地part物化，再进入
+  synchronize_local_errors("Model materialization")只重新抛捕获异常。无物化或
+  collective置于local-only区间；同伴成功物化后也必须等待一致结果，不再进入
+  optimizer。原owner异常身份保留。该协调不能恢复已挂住的内部通信或设备故障。
+- 两rank×两实现×三异常共12场景，port30204退出0，故障owner原异常、同伴
+  精确阶段错误、optimizer未进入及健康barrier均通过，日志
+  `/tmp/llmtuner-meta-after-151.log`。测试初次lint指出循环闭包未显式绑定，已
+  绑定failing_rank/failure/entered并重跑检查通过，生产行为不受该修正影响。
+- 完整CPU3723 passed、2 skipped（285 warnings），日志
+  `/tmp/llmtuner-cpu-151.log`。设备、PP多part物化及compile wrapper的实际失败
+  仍需独立验证；148的已复现CPU阶段越界已处理，不把局部证据外推全硬件。
+- 成功路径port30205退出0，kimi_hf_initial_load.py使用KIMI/MOE/LATENT=1、
+  EP_SIZE=2、PP_SIZE=1、custom FSDP，CPU/Gloo，HF精确权重、logits原容差、
+  两步训练、训练checkpoint保留、HF导出与继续更新断言均通过。命令及环境
+  同该脚本文档，产物本机temp下llmtuner-meta-151-_krrh1hy，日志
+  `/tmp/llmtuner-meta-hf-success-151.log`。
+- 适用全部文件pre-commit、compileall、diff通过，门禁日志
+  `/tmp/llmtuner-precommit-all-151.log`。本批修改assembly、新增集成测试及台账；
+  所有作业终止，保留其他改动，未commit/push。
+
+### 第152批：Interleaved PP多个part的物化失败协调
+
+- 续接META-FAILURE-BOUNDARY-148及151修复，扩展既有
+  meta_initialization_coordination.py：nproc4时DP shard2×PP2，六层Qwen3、
+  Interleaved1F1B四虚拟stage、4 microbatches，每rank两个local parts。
+  在第二个part实际物化结束后注入异常，显式断言全部rank物化调用数为2，
+  避免只覆盖首part或没有触达物化。仍不执行checkpoint读取及训练。
+- native/custom各覆盖rank0–3及ValueError/KeyboardInterrupt/SystemExit，共24
+  故障场景。故障owner原异常身份、同伴精确阶段错误、optimizer sentinel未进入、
+  全rank健康barrier均通过。未改生产实现、放宽断言或绕过PP分割和FSDP包装。
+- 命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30206 tests/integration_tests/meta_initialization_coordination.py`
+  退出0，日志 `/tmp/llmtuner-meta-pp-152.log`。CPU/Gloo、eager、无AC，
+  不代替compiled wrapper、设备内存失败、内部通信故障或PP数值验收。
+- 原两rankDP2模式保留，改为显式检查每rank一个物化part。首次lint指出docstring
+  行宽问题，已修正后通过。生产代码与151相同，完整CPU复用151的3723/2skip。
+- 两rank原模式port30207退出0，12场景及每rank一个part断言通过，日志
+  `/tmp/llmtuner-meta-dp-152.log`。适用全部文件pre-commit、compileall和diff
+  通过，门禁日志 `/tmp/llmtuner-precommit-all-152.log`。
+  本批仅集成脚本与台账改动；所有作业终止，保留既有工作区，未commit/push。
+
+### 第153批：OptimizedModule包装后的meta物化故障
+
+- 复读config/compile_config.py与parallel/model_compile.py，核对whole-model
+  torch.compile与per-block Module.compile身份差异、编译在FSDP之前的顺序和
+  懒执行语义。扩展meta_initialization_coordination.py显式compile选项，使用
+  程序化CompileConfig(backend="aot_eager")，物化入口断言model确为
+  OptimizedModule（eager模式则必须不是），避免配置未生效仍通过。
+- 真实四rank CPU/Gloo、DP shard2×PP2、Interleaved1F1B、六层Qwen3、每rank
+  两part；native/custom各rank0–3及三种异常共24场景，第二part物化后失败。
+  原异常身份、同伴精确阶段错误、全部part调用数、optimizer未进入和barrier
+  健康均通过。命令
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30208 tests/integration_tests/meta_initialization_coordination.py compile`
+  退出0，日志 `/tmp/llmtuner-meta-compiled-153.log`。
+- 测试不执行forward；aot_eager后端已配置且包装真实存在，但未触发Dynamo图
+  捕获或编译，不能据此宣称compiled训练、Inductor或设备验收。148的初始化
+  故障缺口在已测CPU eager/OptimizedModule、DP2/DP2×PP2范围有证据，其他
+  设备/模型/执行故障仍独立保留。未修改生产代码。
+- 两rankDP2 compile模式port30209退出0，12场景通过，日志
+  `/tmp/llmtuner-meta-compiled-dp-153.log`。适用全部文件pre-commit、compileall
+  和diff通过，日志 `/tmp/llmtuner-precommit-all-153.log`；完整CPU复用151
+  同生产版本3723/2skip。本批仅测试及台账变更，保留其他改动，未commit/push；
+  所有本批作业均已结束。
+
+### 第154批：HF meta加载后的实际compiled成功路径
+
+- 续接153仅wrapper证据的缺口。复读model_compile.py、CompileConfig及
+  kimi_hf_initial_load.py调用的_cfg/_train_steps：默认模型为dense Qwen3，
+  显式PP_SIZE=1、custom FSDP、aot_eager，真实两rank CPU/Gloo。
+- 使用/tmp/llmtuner_hf_compiled_154.py通过runpy执行原有HF加载/导出脚本，
+  清空Dynamo counters并在全部步骤结束后逐rank断言unique_graphs>0。
+  未替换生产forward、物化、优化器或checkpoint；未放宽原有容差。
+- 命令 `LLMTUNER_TEST_PP_SIZE=1 LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom LLMTUNER_TEST_COMPILE_BACKEND=aot_eager PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30210 /tmp/llmtuner_hf_compiled_154.py /tmp/llmtuner-hf-compiled-154`
+  退出0，日志/tmp/llmtuner-hf-compiled-154.log；两rank各13个unique_graphs、
+  568 calls_captured。HF初始权重精确、logits原1e-6、两步训练、导出权重
+  精确、训练checkpoint字节保留、运行状态不变和再一步更新均通过。
+- 该证据覆盖实际aot_eager图执行及上述成功路径，不证明compiled/eager更新
+  逐项等价、新进程完整恢复、native FSDP、PP/EP、Inductor或目标设备。
+  Dynamo对masks.py的lru_cache给出忽略缓存包装警告，未观察到本次数值失败。
+- 本批仅/tmp诊断及台账变更，未改生产代码；CPU沿用151同生产版本结果。
+  所有本批作业退出，保留已有工作区，未commit/push。
+
+### 第155批：native FSDP的HF meta编译成功路径
+
+- 续接154，保持同一生产脚本、诊断入口、dense Qwen3及原断言，仅将
+  FSDP实现改为native，使用新的独立目录，避免复用上批checkpoint。
+- 命令 `LLMTUNER_TEST_PP_SIZE=1 LLMTUNER_TEST_FSDP_IMPLEMENTATION=native LLMTUNER_TEST_COMPILE_BACKEND=aot_eager PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30211 /tmp/llmtuner_hf_compiled_154.py /tmp/llmtuner-hf-compiled-native-155`
+  退出0，日志/tmp/llmtuner-hf-compiled-native-155.log。两rank各13个
+  unique_graphs、568 calls_captured；初始权重精确、logits原1e-6、两步训练、
+  导出精确、checkpoint文件字节保留、运行状态不变和再一步更新均通过。
+- 复读materialization.py：buffer重建和alias恢复仍在to_empty前后各自的
+  既定阶段，checkpoint加载负责填充persistent meta buffer。本次未发现
+  需要改动生产代码的缺陷。该结果不证明native/custom更新数值相同、
+  compiled/eager更新等价、完整新进程恢复、PP/EP、Inductor或设备验收。
+- 本批仅台账变更，CPU复用151同生产版本结果；文档适用pre-commit及
+  diff检查通过。所有本批作业结束，保留已有改动，未commit/push。
+
+### 第156批：拓扑不兼容拒绝发生在运行状态修改之后
+
+- 新开放项RESTORE-PREFLIGHT-156（P1）：distributed_checkpoint._load_checkpoint
+  在dcp.load、scheduler/dataloader/train_state和model恢复后才验证RNG拓扑。
+  RNGCheckpointState单独拒绝不兼容且不修改随机流，不代表完整load未修改状态。
+- /tmp/llmtuner_restore_boundary_156.py真实world1 Gloo/DDP、AdamW、EMA及
+  DistributedCheckpointManager，保存一次更新后的完整checkpoint，将保存的
+  RNG world_size明确设为2以注入不兼容元数据；新runtime加载应拒绝。
+  捕获精确world size changed ValueError后，四个目标模型参数均已改变。
+  命令 `PYTHONPATH=. python /tmp/llmtuner_restore_boundary_156.py`退出0，
+  日志/tmp/llmtuner-restore-boundary-156.log。这是管理器状态修改顺序复现，
+  不是实际world2到world1恢复验收，也未证明失败后checkpoint文件损坏。
+- 复读random_state.py、load_planner.py、base.py及数据DP度数检查；现有
+  test_random_state.py 46 passed、4 warnings，仅证明单状态契约。
+- 状态：已复现、未修复。下一步在不让本地协调区间包含collective的前提下，
+  研究仅加载/验证rank-local元数据的前置阶段，并补目标模型、optimizer、
+  scheduler、EMA、数据、trainer和RNG未变的回归；再验证真实多rank拒绝。
+  不通过排除RNG/数据状态将拓扑变化恢复宣称为完整恢复。
+- 本批生产代码未改，仅/tmp诊断和台账；未commit/push，诊断作业结束。
+
+### 第157批：RNG不兼容在DCP写入前拒绝
+
+- 处理RESTORE-PREFLIGHT-156的RNG子项：distributed_checkpoint在普通及
+  Kimi迁移路径之前，仅用RNG state_dict建立opaque bytes目标，独立dcp.load
+  读取后在local-only协调区间validate_state_dict；DCP通信不在该区间。
+  保留末尾RNG验证/恢复，避免恢复中的随机操作改变最终流。旧checkpoint
+  无RNG继续由CheckpointLoadPlanner兼容；不加载RNG的策略不增加该读取。
+- 新CPU回归通过真实manager保存错误world_size/version，再推进目标训练，
+  加载失败后模型、非空AdamW状态、scheduler及Python/NumPy/CPU流精确不变。
+  最终48 passed、8 warnings，日志/tmp/llmtuner-rng-preflight-final-157.log。
+  初版save-only fixture缺少load_state_dict，未被识别为Stateful而pickle失败；
+  补完整协议后通过，保留/tmp/llmtuner-rng-preflight-157.log。
+- 两rank脚本增加RNG preflight validation故障，并保留原末尾validation故障：
+  后者只在第二次validate调用注入。首次运行旧阶段断言失败，日志
+  /tmp/llmtuner-rng-distributed-157.log；同步明确阶段契约后port30213退出0，
+  /tmp/llmtuner-rng-distributed-final-157.log。DDP/native/custom FSDP各sync及
+  async的rank-distinct dropout完整状态和继续更新均精确通过，局部故障协调
+  原异常及peer阶段错误断言保留，不放宽数值。
+- 命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30213 tests/integration_tests/rng_checkpoint_equivalence.py`。
+- 范围限制：独立RNG读取增加一次DCP规划/IO，未测大规模性能；未提供整个
+  checkpoint事务回滚，data DP度数/其他状态非法仍需各自前置验证。
+  RESTORE-PREFLIGHT-156继续开放，真实拓扑变化及所有状态拒绝保护尚未验收。
+- 完整CPU最终3725 passed、2 skipped、308 warnings，37.10s，日志
+  /tmp/llmtuner-cpu-final-157.log；首次完整运行使用未修正fixture为2fail，
+  /tmp/llmtuner-cpu-157.log保留。适用全部文件pre-commit通过，日志
+  /tmp/llmtuner-precommit-all-157.log；compileall及diff通过。生产/测试/台账
+  保留在工作区，未commit/push，所有本批运行任务均已终止。
+
+### 第158批：数据游标元数据前置校验
+
+- 继续RESTORE-PREFLIGHT-156。GrainDataLoader与RandomTokenDataLoader将原有
+  dictionary/version/DP度数/layout/steps校验提取为validate_state_dict，load
+  仍先调用同一校验，之后才set_state/替换iterator。没有变更游标格式、
+  synthetic禁止倒退语义、Grain失败清理或legacy兼容规则。
+- DCP前置读取合并RNG和具备validate_state_dict的数据状态，仍只一次额外
+  读取；逐类别本地验证协调，所有DCP通信在协调区间外。无validator的第三方
+  Stateful仍保留既定恢复路径，未宣称具备无副作用预验证。
+- 新增真实manager回归：保存DP degree/layout/steps错误元数据，推进目标
+  模型、非空AdamW、scheduler和loader，加载失败后四者精确不变。与数据
+  pipeline及RNG测试共400 passed、24 warnings，日志
+  /tmp/llmtuner-data-preflight-158.log。未放宽断言或容差。
+- 两rank RNG恢复脚本port30214退出0，DDP/native/custom各sync/async的
+  失败协调与随机dropout续训精确通过，日志/tmp/llmtuner-rng-distributed-158.log。
+- 新进程full/resume生产Trainer、custom FSDP2、PP1、dynamic EMA、synthetic
+  loader，port30215/30216均退出0。更新前完整状态比较每rank failures=0，
+  两步续训loss最大误差0，最终状态精确，日志/tmp/llmtuner-data-recovery-158.log，
+  目录/tmp/llmtuner-data-preflight-recovery-158。命令为pp_checkpoint_equivalence.py
+  full/resume，环境LLMTUNER_TEST_PP_SIZE=1、FSDP_IMPLEMENTATION=custom、
+  LLMTUNER_TEST_EMA=dynamic、PYTHONPATH=.、GLOO_SOCKET_IFNAME=lo0。
+- 完整CPU3728 passed、2 skipped、314 warnings，39.82s，日志
+  /tmp/llmtuner-cpu-158.log。全部适用pre-commit、compileall、diff通过，日志
+  /tmp/llmtuner-precommit-all-158.log。未commit/push；本批全部作业结束。
+- 尚未证明真实DP度数变化的完整迁移、Grain内部iterator payload有效性、
+  任意回调失败的事务回滚、目标设备或新组合。当前只将可独立验证的RNG与
+  loader元数据拒绝提前；trainer/scheduler/optimizer/EMA仍有独立边界，
+  RESTORE-PREFLIGHT-156保持开放。
+
+### 第159批：多rank loader DP不兼容时的运行状态保护
+
+- 新增checkpoint_data_preflight.py，复用真实DDP/native/custom FSDP runtime、
+  AdamW、scheduler、EMA和DCP管理器；source使用DP2 synthetic loader保存，
+  target加载时使用DP1 loader，两rank world size和模型mesh均保持不变。
+- 三种实现各覆盖全部rank不兼容、仅rank0不兼容两场景。后者rank0必须原始
+  ValueError包含dp_world_size=2，rank1必须精确peer dataloader preflight
+  错误；错误后模型、非空AdamW、scheduler、EMA、loader游标、Python/NumPy/
+  CPU流精确不变，再执行真实barrier。六场景全部通过，不用故障mock替代
+  loader度数检查。测试未装配Trainer计数器，不能外推该字段。
+- 命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30218 tests/integration_tests/checkpoint_data_preflight.py`
+  退出0，日志/tmp/llmtuner-data-preflight-distributed-final-159.log。首次30217
+  运行同样退出0，但lint指出zip缺少strict；显式strict=True后重跑最终版本，
+  首次日志/tmp/llmtuner-data-preflight-distributed-159.log保留。
+- 测试只证明固定world/model topology下DP loader兼容性拒绝，不是world size
+  变化、数据重分片迁移、Grain内部cursor恢复、compile或设备验收。
+  RESTORE-PREFLIGHT-156的其他状态及完整迁移要求仍开放。
+- 未修改生产代码，CPU复用158同生产版本3728/2skip。适用全部文件pre-commit
+  通过，日志/tmp/llmtuner-precommit-all-159.log；compileall、diff通过。
+  本批测试及台账保留工作区，未commit/push，所有本批作业均已退出。
+
+### 第160批：trainer计数在模型写入前校验
+
+- 继续RESTORE-PREFLIGHT-156，Trainer现有step/ntokens_seen整数非负校验
+  提取为validate_state_dict，load仍调用相同规则后同时赋值。未拆trainer，
+  不更改计数格式；DCP单次local preflight读取加入TRAIN_STATE。
+- 新真实manager回归覆盖两个字段各-1/True/1.5，保存非法计数及非空AdamW
+  后再推进目标训练。禁用新增TRAIN_STATE preflight但保留同一校验逻辑时，
+  6场景都在load拒绝后发现模型已变，日志
+  /tmp/llmtuner-trainer-preflight-before-final-160.log；启用后6场景通过，
+  模型、非空AdamW、scheduler和trainer计数精确不变，日志
+  /tmp/llmtuner-trainer-preflight-after-final-160.log。
+- 首次fixture保存空AdamW，随后目标有状态，DCP缺少optimizer.state.0.step
+  先失败，不能证明本问题；保留/tmp/llmtuner-trainer-preflight-before-160.log，
+  已修正为先更新再保存，取得上述有效前后证据，未放宽断言。
+- 完整CPU3734 passed、2 skipped、307 warnings，39.66s，日志
+  /tmp/llmtuner-cpu-160.log。新进程full/resume custom FSDP2、PP1、dynamic
+  EMA、synthetic loader，port30219/30220均退出0，更新前每rank完整状态
+  failures=0，续训loss最大误差0，最终状态精确；日志
+  /tmp/llmtuner-trainer-recovery-160.log，目录/tmp/llmtuner-trainer-preflight-recovery-160。
+  命令pp_checkpoint_equivalence.py full/resume，环境同158的成功恢复配置。
+- 适用全部pre-commit、compileall、diff通过，门禁日志
+  /tmp/llmtuner-precommit-all-160.log；本批生产/回归/台账改动保留工作区，
+  未commit/push，所有本批作业终止。
+- 尚不证明任意optimizer/scheduler/EMA异常的事务回滚、Grain内部payload、
+  真实拓扑变化或目标设备。RESTORE-PREFLIGHT-156保持开放。
+
+### 第161批：可选checkpoint后端的校验顺序与发布版兼容性
+
+- 新开放项TC-PREFLIGHT-161（P1）：torch_checkpointing_backend._load_checkpoint
+  在backend.load及Stateful回调之后才检查RNG，尚无DCP157–160同等前置
+  校验。/tmp/llmtuner_optional_preflight_161.py使用替代reader写入模型live
+  tensors并提供非法RNG版本，确认拒绝发生在参数写入之后；退出0，日志
+  /tmp/llmtuner-optional-preflight-161.log。此为适配器控制流证据，非真实后端IO。
+- 当前环境find_spec(torch_checkpointing)=None。为检查API而非猜测，执行
+  `python -m pip download --no-deps --dest /tmp/llmtuner-torch-checkpointing-161 torch-checkpointing==0.1.0`，
+  下载成功，无环境安装或依赖更改。wheel SHA256
+  1a0944c88adcdbe88f4a68870d0d88b5a1c9e421cc5b604c84eda7c17d719164。
+- 阅读wheel的CheckpointManager.load与schema.build_items：into的payload
+  定义读取项，required schema约束仍适用，支持子集读取。解包到下载目录的source/并
+  临时sys.path调用require_torch_checkpointing，退出1：发布版0.1.0缺少
+  torch_checkpointing.default_resharder，当前适配器不能直接加载。未修改
+  ImportError绕过能力约束，也未把其他版本源码当成已测试依赖。
+- 本地torchtitan适配器同样导入default_resharder，说明当前本地上游所需
+  接口超出该发布版；不能由此证明本仓库已兼容任意torch_checkpointing版本。
+  下一步确认兼容上游版本/来源，再验证真实元数据子集读取，修复可选路径
+  并补前后状态及失败传播回归。运行时默认DCP不受该可选依赖缺口影响。
+- 本批仅/tmp诊断、下载源码及台账；无生产修改，CPU复用160同生产结果。
+  台账适用pre-commit及diff通过；未commit/push，无本批存活作业。
+
+### 第162批：兼容上游真实IO及子集读取缓存契约
+
+- 续接TC-PREFLIGHT-161，按发布包Project-URL克隆上游到
+  /tmp/llmtuner-torch-checkpointing-upstream-162，固定HEAD
+  dcbb3a59cfad1cbeb95994f0d6cb1802c1d91825。临时PYTHONPATH下
+  require_torch_checkpointing返回BackendSymbols，未安装或更改项目依赖。
+- /tmp/llmtuner_optional_real_162.py真实backend同步save/load，wrapper使用
+  load_only=True构造同步配置，直接backend.save生成测试输入；无reader mock。
+  保存Linear/AdamW空状态/scheduler/RNG，非法RNG version=2，修改模型后
+  运行真实wrapper._load_checkpoint，ValueError拒绝时模型已被源checkpoint
+  改写，断言通过。这证明实际同步CPU IO的顺序问题，非完整Trainer或多rank验收。
+- 首次默认filesystem在macOS缺少os.O_DIRECT，退出1，日志
+  /tmp/llmtuner-optional-real-162.log；通过构造参数显式指定上游支持的
+  LocalFileSystemStorageConfig(use_direct_io=False)，未mock或改后端源码。
+- 第二次同一个manager在save/full schema后读RNG子集，退出1，日志
+  /tmp/llmtuner-optional-real-buffered-162.log：metadata_manager缓存拒绝结构
+  变化。修正诊断为独立temporary_backend_manager、同步无barrier、原storage
+  config，真实读取RNG子集后关闭，再运行原manager完整读取，退出0，日志
+  /tmp/llmtuner-optional-real-isolated-162.log。
+- 命令 `PYTHONPATH=/tmp/llmtuner-torch-checkpointing-upstream-162:. python /tmp/llmtuner_optional_real_162.py`。
+  子集读取与正式读取不能直接在一个缓存manager上串联；下一步修复必须使用
+  隔离reader或经验证的缓存契约，并补回归。发布版0.1.0仍不兼容，未用别名
+  绕过DefaultResharder缺失。当前TC-PREFLIGHT-161已获真实IO复现，尚未修复。
+- 本批无生产变更，仅/tmp诊断与台账；CPU复用160同生产版本结果，文档
+  pre-commit及diff通过；未commit/push，无本批存活进程。
+
+### 第163批：可选后端隔离reader的元数据前置校验
+
+- 修复TC-PREFLIGHT-161已复现的顺序问题：普通load在完整state_dict构建前，
+  仅对有validate_state_dict的RNG/data/trainer状态建立本地metadata目标，
+  临时同步backend reader加载并关闭，再逐状态协调验证。使用同一storage
+  config和items={}默认本地spec，不复用正式manager的schema缓存。HF路径
+  仍按model-only契约加载，末尾RNG恢复顺序保留。无collective放入校验区间。
+- 新增三个CPU回归用实际内置状态校验RNG版本、loader DP和trainer负计数，
+  断言subset reader关闭、正式reader未调用、状态不变。两rank既有可选后端
+  控制流脚本为隔离reader显式提供替身，port30221退出0，局部失败传播及EMA
+  重试通过，日志/tmp/llmtuner-optional-coordination-163.log；仍不是实际多rankIO。
+- 上游固定commit与162相同，真实同步CPU IO，buffered storage：
+  /tmp/llmtuner_optional_real_163.py非法RNG拒绝后model changed=False，退出0，
+  日志/tmp/llmtuner-optional-real-after-163.log。原162同场景changed=True。
+  /tmp/llmtuner_optional_success_163.py合法RNG通过独立subset及完整load，
+  模型精确恢复，退出0，日志/tmp/llmtuner-optional-success-163.log。
+  两者PYTHONPATH=/tmp/llmtuner-torch-checkpointing-upstream-162:.，未安装依赖。
+- 全部CPU3737 passed、2 skipped、301 warnings，39.12s，日志
+  /tmp/llmtuner-cpu-163.log。适用全部pre-commit、compileall、diff通过，日志
+  /tmp/llmtuner-precommit-all-163.log。架构文档同步前置校验与边界。
+- 验证范围为适配器单元/两rank替代IO及固定上游的真实单进程同步读取。
+  实际多rank/异步/设备生命周期、非空分片optimizer完整恢复、发布版API适配、
+  临时reader构建/关闭及backend内部故障传播仍待独立验收。TC-PREFLIGHT-161
+  已复现的同步CPU顺序缺陷修复，不将其外推整个可选后端已可生产使用。
+  RESTORE-PREFLIGHT-156的其他状态和完整迁移继续开放。
+- 未commit/push，保留原有工作区及本批代码/回归/文档；所有本批作业终止。
+
+### 第164批：可选后端真实多rank IO的CUDA限制
+
+- 续接163，/tmp/llmtuner_optional_distributed_164.py使用真实两rank Gloo、
+  同一兼容上游commit、LocalFileSystemStorageConfig(use_direct_io=False)，
+  计划DDP/native/custom同步写入非空AdamW与EMA、rank0非法RNG拒绝保护及
+  合法随机dropout恢复。未替换backend reader或通信。
+- 命令 `PYTHONPATH=.:/tmp/llmtuner-torch-checkpointing-upstream-162 GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30222 /tmp/llmtuner_optional_distributed_164.py`
+  退出1，日志/tmp/llmtuner-optional-distributed-164.log。在第一个DDP source
+  checkpoint保存阶段，两rank均于metadata_manager._all_gather_pickled_data
+  的device="cuda"张量构造报Torch not compiled with CUDA enabled；尚未进入
+  subset读取、非法拒绝或恢复数值比较。后续native/custom场景未执行。
+- 核对上游metadata_manager.py:413/420：元数据max size张量固定cuda，随后
+  frombuffer(...).cuda()，没有检查process-group backend或CPU设备；单rank
+  走直接metadata路径所以162–163通过不能外推。此为固定上游的环境/设备
+  限制，不把计划中的多rank断言登记为已验收。
+- 新缺口TC-CUDA-METADATA-164：解除条件为兼容源码、CUDA PyTorch及适用
+  多rank设备/进程组，运行真实保存/读取/继续更新；或确认上游正式提供CPU
+  metadata路径再复验。不修改依赖源码、不mock CUDA collective、不绕过保存。
+- 架构文档注明该限制。当前CPU环境仍可继续其他独立审查，可选后端多rank
+  验收保持开放；未宣称整个任务阻塞或完成。
+- 本批仅/tmp诊断及文档，生产代码与163一致；CPU复用163的3737/2skip，
+  文档pre-commit和diff通过。未commit/push，torchrun已终止，无本批存活任务。
+
+### 第165批：DCP前置校验后的AC/compile/EMA完整快照恢复
+
+- 默认DCP在157–160增加前置读取后，补真实生产Trainer的新进程恢复组合：
+  两rank CPU/Gloo、custom FSDP2、PP1、full AC、whole-model aot_eager、
+  dynamic EMA、synthetic loader。复读_cfg/_train_steps/_runtime_state及
+  split/final比较，确认OptimizedModule及unique_graphs>0断言实际执行。
+- 首组port30223/30224退出0，日志/tmp/llmtuner-preflight-compiled-recovery-165.log，
+  目录/tmp/llmtuner-preflight-compiled-recovery-165。但_runtime_state只有显式
+  RNG_STATE/LOADER_STATE开关才加入这两项，故不能仅凭该组loss和默认状态
+  比较宣称RNG/loader逐项精确。158/160关于“完整状态”的措辞也应按当时
+  默认比较器范围理解，其直接比较不含这两项；loader续训只是间接证据。
+- 第二组显式LLMTUNER_TEST_RNG_STATE=1、LLMTUNER_TEST_LOADER_STATE=1，
+  port30225/30226退出0，日志/tmp/llmtuner-preflight-compiled-rng-recovery-165.log，
+  目录/tmp/llmtuner-preflight-compiled-rng-recovery-165。更新前每rank failures=0，
+  继续两步loss最大误差0，最终快照精确。独立读取两rank split-state确认
+  model/optimizer/scheduler/ema/trainer/ntokens_seen/rng/dataloader均存在；RNG
+  包含Python/NumPy/CPU、device及parallel_degrees，loader cursor steps=2、DP2。
+- 两组命令均为torchrun nproc2运行pp_checkpoint_equivalence.py full/resume，
+  环境PYTHONPATH=.、GLOO_SOCKET_IFNAME=lo0、TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0、
+  LLMTUNER_TEST_PP_SIZE=1、LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom、
+  LLMTUNER_TEST_EMA=dynamic、LLMTUNER_TEST_AC=full、
+  LLMTUNER_TEST_COMPILE_BACKEND=aot_eager，第二组另加上述两项快照开关。
+- 检查本地快照首次未导入DTensor模块导致weights_only读取拒绝，导入
+  torch.distributed.tensor后成功；离线读取DeviceMesh有未初始化PG警告，
+  仅检查字段，不执行forward。实际resume子进程已初始化PG并完成数值比较。
+- 本轮另复读optimizer/lr_scheduler.py及其config：保存common last_epoch、
+  恢复时从已加载optimizer initial_lr重算各组lr，metadata约束与计算阶段
+  分离仍可优化；未据此宣称scheduler所有失败的状态保护已完成。
+- 无生产/测试代码改动，完整CPU复用163同生产版本3737/2skip；文档
+  pre-commit与diff通过。此证据不覆盖Inductor/设备、其他轴或拓扑变化。
+  未commit/push，所有本批作业退出，保留既有工作区。
+
+### 第166批：scheduler进度的恢复前置校验
+
+- CKPT-SCHEDULER-PREFLIGHT-166（P1，属RESTORE-PREFLIGHT-156）：原
+  LRSchedulersContainer在optimizer读取后才拒绝非法/超长last_epoch。
+  新真实DCP manager回归保存非空AdamW及错误epoch(-1/True/1.5/5，总长4)，
+  之后推进目标训练；修复前4场景均因模型参数已改变而失败，日志
+  /tmp/llmtuner-scheduler-preflight-before-166.log，非fixture或缺key失败。
+- 将原有dictionary/epoch类型/非负/总长校验提取为validate_state_dict，
+  load复用；两checkpoint后端的local preflight加入LR_SCHEDULER。仅验证
+  进度，不读取fresh optimizer initial_lr；学习率计算和应用仍在optimizer
+  restore之后，保留saved参数组覆盖当前配置的契约。未改存储格式或WSD曲线。
+- 修复后4场景通过，模型、非空AdamW和scheduler状态精确不变，日志
+  /tmp/llmtuner-scheduler-preflight-after-166.log。可选后端同类metadata
+  单测加入scheduler超过总长场景，断言正式reader未进入及临时reader关闭。
+- 两rank RNG/dropout恢复脚本port30227退出0，DDP/native/custom的sync及
+  async原异常/peer阶段错误与完整继续更新精确断言通过，日志
+  /tmp/llmtuner-rng-distributed-166.log。命令为GLOO_SOCKET_IFNAME=lo0、
+  PYTHONPATH=. torchrun nproc2运行rng_checkpoint_equivalence.py。
+- 固定兼容上游、真实单进程buffered同步IO额外使用本仓库scheduler container，
+  /tmp/llmtuner_optional_scheduler_166.py退出0，合法subset/full模型精确恢复，
+  日志/tmp/llmtuner-optional-scheduler-success-166.log；与163相同临时PYTHONPATH。
+- 完整CPU3742 passed、2 skipped、309 warnings，38.99s，日志
+  /tmp/llmtuner-cpu-166.log。适用全部pre-commit、compileall、diff通过，日志
+  /tmp/llmtuner-precommit-all-166.log；架构文档同步scheduler前置校验契约。
+- 该修复不保证optimizer参数组损坏、lambda计算/设备copy失败或任意回调的
+  事务回滚，不代替拓扑迁移和设备验收。RESTORE-PREFLIGHT-156继续开放。
+  所有本批作业结束，保留已有改动，未commit/push。
+
+### 第167批：optimizer/EMA的恢复校验与跟踪身份复核
+
+- 逐段复读optimizer/state_dict.py完整初始化、FQN转换、unflatten、参数组
+  合并及nested恢复；复核optimizer.py的state_dict/load_state_dict与EMA的
+  构造、tracked_averages/_tracked_groups、step、state/load/reset调用链。
+  配置训练优化器仅Adam/AdamW，EMA持有的专用Optimizer状态预先分配，
+  不将通用helper对任意第三方优化器的行为外推为训练功能支持。
+- init_optim_state保留grad/lr/epsilon/weight_decay及已有状态，失败清理本批
+  新分配状态；Adam step需单值有限非负整数，moment目标形状严格匹配。
+  group各FQN选项不一致时拒绝合并，防止把两种LR静默折叠。FQN/nested
+  冲突检查保留；布局加载先执行TP/EP通信，再进入本地校验并全部通过后应用。
+- EMA以构造时身份及canonical FQN跟踪可训练参数/选中buffer；共享buffer
+  alias只跟踪一次，删除/冻结/替换/改名或元数据变化先拒绝再update/reset。
+  动态decay从trainer step推导，不额外维护会在恢复时归零的隐式更新计数。
+  state/load可能通信，不可将EMA本体加入仅限本地的metadata preflight。
+- targeted命令pytest -q --disable-warnings运行test_ema.py、test_state_dict.py、
+  test_optimizer_container.py，186 passed、2 warnings，日志
+  /tmp/llmtuner-optimizer-review-final-167.log。首次命令误写test_optimizer.py，
+  exit4且无测试运行，日志/tmp/llmtuner-optimizer-review-167.log，纠正路径后
+  取得以上有效结果。检查现有断言覆盖计数损坏、跨optimizer不部分应用、
+  lazy allocation失败重试、共享alias和丢失跟踪对象等具体契约。
+- 本轮未确认新的缺陷，不新增同义包装或无收益重命名。已有load hook或copy
+  失败不具备全局事务回滚；参数组任意损坏、Grain内部payload、拓扑变化与
+  设备验收仍各自开放，186项不能替代全部并行组合数值证据。
+- 仅台账变更，完整CPU复用166同生产版本3742/2skip，文档pre-commit及
+  diff通过。无本批存活作业，保留全部既有改动，未commit/push。
+
+### 第168批：两rank数据/scheduler前置拒绝对称性
+
+- 扩展checkpoint_data_preflight.py已有实际DCP测试，复用同一保存/快照/
+  状态比较实现，不复制另一个harness。source完成两次真实AdamW/EMA更新，
+  保存step2；target完成一次更新保持非空状态且与checkpoint不同。
+- DDP/native/custom FSDP各覆盖dataloader DP度数变化及scheduler总长1小于
+  saved last_epoch2；每类故障分别全rank、仅rank0、仅rank1，共18场景。
+  使用实际loader配置和scheduler.total_steps，不mock校验/读取/collective。
+- 故障owner必须原ValueError包含具体条件，健康peer必须精确对应category
+  preflight错误。拒绝后model/非空AdamW/scheduler/EMA/loader/Python/NumPy/
+  CPU RNG精确不变，后续真实barrier健康。trainer计数未装配，不外推该字段。
+- 命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30228 tests/integration_tests/checkpoint_data_preflight.py`
+  退出0，日志/tmp/llmtuner-local-preflight-distributed-168.log。此为真实CPU/Gloo
+  DCP拒绝保护，不代表拓扑迁移、设备通信故障恢复或可选后端多rankIO通过。
+- 本批仅测试/台账改动，完整CPU复用166同生产版本3742/2skip。适用全部
+  pre-commit、compileall、diff通过，日志/tmp/llmtuner-precommit-all-168.log。
+  无本批存活进程，保留其他已有改动，未commit/push。
+
+### 第169批：三轴AdamW的FP64归约因子对照
+
+- 回到TRAINER-TRIAXIS-ADAMW-NUMERICS-15。复读原失败15–17及独立舍入参考
+  114–116；原fixture权重FP64，apply_fsdp固定reduce_dtype=FP32。此前
+  rounded oracle模拟此舍入，尚缺反向的“改变归约而不改dense反向”控制。
+- /tmp/llmtuner_triaxis_reduction_control_169.py仅在诊断进程截获生产
+  apply_fsdp_to_decoder，先断言param_dtype=FP64/reduce_dtype=FP32，再显式
+  将reduce_dtype改为FP64；退出恢复函数。运行原Trainer脚本，不使用rounded
+  oracle或读取生产梯度构造参考，原HF参考只选择既有fp32_router选项。
+- 原有TP2/KVCP2/EP2、aux.01、AdamW、full AC、不等token累积、scheduler、
+  EMA及所有原1e-6比较保留。native/custom真实四rank CPU/Gloo均完整三步
+  退出0，每rank每步27参数梯度/更新/optimizer/EMA原断言通过，body各4次，
+  第三步独立Adam公式最大残差2.22e-16。
+- 命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30229 /tmp/llmtuner_triaxis_reduction_control_169.py native aux adam full fp32_router`，
+  custom使用30230及首参数custom；日志
+  /tmp/llmtuner-triaxis-reduction-control-169.log、
+  /tmp/llmtuner-triaxis-reduction-custom-169.log。无生产文件改动。
+- 这是改变归约精度的控制实验，进一步支持局部FP32舍入经Adam归一化放大
+  的解释；不将其当原FP32策略通过，不关闭15，不把HF FP64 router参考当成
+  与生产FP32 gate相同契约。现有BF16参数/FP32归约契约及单测保持不变。
+  后续需明确对外精度契约与配置入口，原失败、完整恢复及设备证据继续保留。
+- 本轮仅/tmp诊断和台账，完整CPU复用166同生产3742/2skip。台账
+  pre-commit及diff通过；无存活本批作业，保留既有改动，未commit/push。
+
+### 第170批：显式FSDP归约精度配置
+
+- 对照本地torchtitan config/configs.py的mixed_precision_reduce（BF16/FP32）
+  与distributed/fsdp.py的reduce_dtype输入，确认本仓库原先固定FP32，缺少
+  对外策略入口。新增FSDPConfig.fsdp_reduce_dtype，Literal支持float32/
+  bfloat16/float64，默认float32；非法值配置阶段拒绝，CLI直接解析。
+  FP64是本仓库显式扩展，不冒称与上游Literal相同。
+- apply_fsdp从validated字段解析torch dtype，decoder和pattern路径共用，
+  保留参数dtype推导、BF16参数通信及所有默认语义。不根据模型dtype自动
+  改变归约精度，不以新选项替代旧默认场景失败。配置缺省向后兼容，无
+  checkpoint格式改动；改变精度属于新运行策略，不保证旧轨迹位级延续。
+- CLI默认/FP64解析、非法值及三种dtype策略传递回归；相关405 passed，日志
+  /tmp/llmtuner-fsdp-dtype-170.log。BF16此处仅配置/传递单测，尚无设备数值验收。
+- Trainer三轴脚本增加显式LLMTUNER_TEST_FSDP_REDUCE_DTYPE，默认FP32，
+  复用配置校验；原HF参考、Adam/aux/full AC/EMA及原断言不变。
+  `LLMTUNER_TEST_FSDP_REDUCE_DTYPE=float64 PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30231 tests/integration_tests/trainer_tp_ep_cp_equivalence.py native aux adam full fp32_router`
+  三步退出0，custom使用30232及首参数custom，亦退出0。每rank每步27参数
+  和全部更新/状态比较通过，无169的函数替换，真实配置进入生产入口。
+  日志/tmp/llmtuner-triaxis-dtype-native-170.log、
+  /tmp/llmtuner-triaxis-dtype-custom-170.log。
+- 默认FP32保留：port30233运行triaxis_rounded_reference.py custom aux adam
+  full fp32_router，退出0，日志/tmp/llmtuner-triaxis-dtype-default-170.log。
+  该参考契约同115–116，不关闭默认HF不同算术的15。原有默认值单测保留。
+- 完整CPU3750 passed、2 skipped、318 warnings，50.71s，日志
+  /tmp/llmtuner-cpu-170.log。全部适用pre-commit、compileall、diff通过，日志
+  /tmp/llmtuner-precommit-all-170.log。架构与上游映射文档补充接口及边界。
+- TP/CP/EP真实CPU范围以本批为限；pattern数值、BF16及设备通信/性能仍
+  需独立验收，未放宽容差或修改原HF默认路径。保留所有既有改动，未commit/
+  push，全部本批作业结束。
+
+### 第171批：pattern入口FP64归约数值复核
+
+- 复读apply_fsdp与plan.py策略构造：decoder/pattern共用配置解析值，pattern
+  显式mp_policy override仍按既有契约覆盖common策略；未发现本批生产缺陷。
+- /tmp/llmtuner_pattern_dtype_171.py通过真实ParallelTopology.build_device_mesh
+  与生产apply_fsdp入口配置两个Linear pattern单元，FP64参数/归约，DP shard2，
+  native/custom各连续三步AdamW。独立dense模型处理两rank完整数据，生产模型
+  处理各rank一半数据，以全局元素数归一化；比较每参数完整梯度与更新值，
+  rtol=atol=1e-12，不读取生产梯度构造参考，不替换生产函数。
+- 命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30234 /tmp/llmtuner_pattern_dtype_171.py`，
+  日志/tmp/llmtuner-pattern-dtype-171.log，两引擎全部断言通过，进程退出0。
+- 此证据仅覆盖CPU/Gloo、非共享Linear pattern、FP64归约和AdamW三步；不代表
+  BF16、设备、pattern多轴、共享参数策略或完整恢复验收。不关闭默认FP32的
+  TRAINER-TRIAXIS-ADAMW-NUMERICS-15，其他开放设备/恢复项继续保留。
+- 本批仅临时诊断和台账，无生产代码变更，CPU完整门禁复用170同生产版本。
+  保留全部已有改动，未commit/push；本批分布式作业已退出。
+
+### 第172批：Grain内部游标预校验边界复现
+
+- 上轮171为有效进展：新增真实pattern FP64数值证据。本轮复读
+  datasets/dataloader.py、DCP预检调用链及已安装Grain的prefetch/batch
+  set_state实现，继续RESTORE-PREFLIGHT-156内部payload未验证的开放范围。
+- 稳定子问题GRAIN-CURSOR-PREFLIGHT-172（P1，开放）：使用真实Grain
+  MapDataset.range(12)→to_iter_dataset→batch(2)→ThreadPrefetch迭代器，
+  GrainDataLoader外层版本/DP/layout均有效，但rank游标改成空字典。
+  validate_state_dict接受且不改变游标，实际load_state_dict才抛
+  KeyError('next_index')。生产DCP metadata预检依赖前者，故当前不能保证
+  内部游标错误在模型/optimizer写入之前被拒绝；本轮未重跑完整DCP变更
+  断言，不把直接loader复现当成训练状态损坏的新增实测。
+- 复现 `PYTHONPATH=. python /tmp/llmtuner_grain_cursor_172.py`，退出0，
+  日志/tmp/llmtuner-grain-cursor-172.log；脚本断言预检通过、预检游标未变、
+  实际恢复按预期KeyError，finally关闭真实迭代器。
+- 不硬编码next_index：packing/mix/streaming状态结构不同，且任意第三方
+  DatasetIterator.set_state可能部分写入。下一步评估保留dataset工厂创建
+  独立临时迭代器预检，验证关闭/预取生命周期、随机数隔离和源访问副作用，
+  再补完整DCP非空AdamW/EMA及单rank失败协调回归。不能直接在live iterator
+  上试写并宣称可回滚，也不承诺任意源副作用事务性。
+- 本轮仅诊断及台账，未改生产代码；完整CPU复用170同生产版本。保留已有
+  改动，未commit/push，无存活本批作业。
+
+### 第173批：Grain独立游标探针生命周期实验
+
+- 继续GRAIN-CURSOR-PREFLIGHT-172，检查已安装Grain的ThreadPrefetch
+  __init__/set_state/close：构造只读取parent状态，set_state停止本探针
+  的预取再向parent传递，close递归关闭本探针。不能据此推断任意第三方图。
+- /tmp/llmtuner_grain_probe_173.py用记录__getitem__调用的真实map source，
+  组合to_iter_dataset/batch/thread-prefetch；同一graph分别创建live和独立
+  probe，测试合法游标和缺失next_index两条路径，probe均finally关闭。
+  合法通过、非法原KeyError；逐项断言live状态未变、source.reads为空、
+  probe未启动线程，Python/NumPy/torch CPU RNG保持，live随后首批仍为[0,1]。
+  使用已有preserve_rng_state(cpu)，不访问设备RNG，不修改生产函数。
+- `PYTHONPATH=. python /tmp/llmtuner_grain_probe_173.py`退出0，日志
+  /tmp/llmtuner-grain-probe-173.log。live故意未启动，避免并发预取污染
+  数据源读取计数；因此不支持“运行中预取无干扰”的结论，也未测packing、
+  streaming、私有generator、数据源构造副作用及恶意state setter。
+- 本结果支持基础map图采用独立迭代器探针，但172仍开放。下一步补已启动
+  loader、packing/streaming和失败close测试，再决定保存graph并接入
+  validate_state_dict；完整DCP非空optimizer/EMA拒绝与rank协调仍待验收。
+- 本批仅临时实验和台账，生产版本未变，完整CPU复用170。保留已有改动，
+  未commit/push，无存活本批进程。
+
+### 第174批：Grain内部游标独立预检接入
+
+- 修复GRAIN-CURSOR-PREFLIGHT-172的已复现根因：GrainDataLoader保留已组装
+  dataset graph，在validate_state_dict外层metadata通过后创建独立迭代器，
+  对deepcopy后的rank payload调用set_state，随后关闭。使用既有
+  preserve_rng_state(cpu)隔离host RNG；预检不调用next，不试写live游标。
+  原异常路径即使probe.close失败也保留原异常并记录清理错误；正常路径关闭
+  失败直接拒绝预检。load的live恢复失败清理行为保持。
+- 新回归使用真实文本graph，分别在未启动/已读一批两状态下提交空内部payload。
+  修复前2 failed（DID NOT RAISE），日志/tmp/llmtuner-grain-before-174.log；
+  修复后两项通过，并验证live状态未变、合法游标预检后下一批与独立loader一致。
+  原live setter/close双失败测试补合法真实probe graph，仍验证原错误保留，
+  不因新增预检改变原故障目标。
+- 完整CPU3752 passed、2 skipped、329 warnings，37.66s，日志
+  /tmp/llmtuner-cpu-174.log；全部适用pre-commit、compileall及diff通过，日志
+  /tmp/llmtuner-precommit-all-174.log。架构文档同步预检和副作用边界。
+- 172实现已接入但验收仍开放：完整DCP非空AdamW/EMA无写入拒绝、单rank
+  协调、packing/streaming内部状态及探针关闭失败/RNG专用回归仍需补充。
+  不宣称任意延迟源读取、私有generator、外部副作用可验证或可回滚。
+  不将CPU单测当成设备恢复通过。保留已有改动，未commit/push，本批作业结束。
+
+### 第175批：Grain状态快照别名与完整DCP拒绝保护
+
+- 继续172新增真实DistributedCheckpointManager回归，文本Grain graph，
+  model/非空AdamW/scheduler/EMA各先更新一次，保存非法游标，再更新一次，
+  加载失败后比较全部状态和Python/NumPy/CPU RNG，且live loader仍能next。
+- 首次使用空rank字典导致DCP planner缺失键先拒绝（日志
+  /tmp/llmtuner-grain-dcp-175.log），不能用于验证内部set_state预检。
+  改为保留schema但next_index=-1，触达真实Grain IndexError。
+- 暴露新根因GRAIN-CURSOR-ALIAS-175：state_dict直接返回get_state内字典，
+  DCP metadata读取原地填充destination即改写live cursor。修复前完整断言
+  失败，loader next_index由2变-1（其他状态尚未加载），日志
+  /tmp/llmtuner-grain-dcp-175b.log；这是实际DCP状态污染证据。
+- state_dict改为deepcopy内部cursor，保留原格式；保护预检destination及
+  调用方快照，不改变Grain恢复契约。修复后新增完整DCP回归及174两项共
+  3 passed，日志/tmp/llmtuner-grain-dcp-after-175.log；全部状态精确比较
+  rtol=atol=0，原IndexError保留，live loader读取健康。
+- 完整CPU3753 passed、2 skipped、312 warnings，37.88s，日志
+  /tmp/llmtuner-cpu-175.log；全部适用pre-commit首次仅格式化新测试，已审阅
+  并复检，compileall和diff通过。无checkpoint格式迁移要求。
+- 175已复现缺陷修复并通过单进程DCP验收；172仍待单rank失败协调、
+  packing/streaming及probe清理/RNG故障专用回归，不宣称完整事务保证。
+  保留已有改动，未commit/push，本批全部作业结束。
+
+### 第176批：Grain探针故障与真实多rank预检拒绝
+
+- 新增六项probe故障回归：构造/恢复/关闭×ValueError/KeyboardInterrupt，
+  使用真实底层Grain迭代器的包装探针，在各阶段消费host RNG，setter还修改
+  传入payload；恢复失败同时注入secondary close错误。验证原异常对象保持、
+  原payload/live cursor不变、所有host RNG精确恢复、训练下一批匹配参考，
+  probe不得next。6 passed；含174/175相关回归9 passed，日志
+  /tmp/llmtuner-grain-probe-fault-176.log、/tmp/llmtuner-grain-unit-176.log。
+- 新增tests/integration_tests/grain_checkpoint_preflight.py，真实两rank
+  CPU/Gloo，完整构造GrainDataLoader与TextCollator（输入已tokenized，
+  tokenizer=None不参与调用），真实DCP生产manager，DDP/native/custom
+  三种模型包装×all/rank0/rank1非法负cursor，共9场景。
+- source两步AdamW/EMA保存，target独立运行时一步；rank payload保留schema。
+  故障owner原IndexError，健康peer精确Checkpoint dataloader preflight
+  validation RuntimeError；每rank模型、非空AdamW、scheduler、EMA、loader
+  及Python/NumPy/CPU RNG与加载前精确相同，loader继续next和barrier正常。
+  模型拓扑不变，不测试拓扑迁移；无mock reader或collective绕过。
+- `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30235 tests/integration_tests/grain_checkpoint_preflight.py`
+  退出0，日志/tmp/llmtuner-grain-distributed-176.log，三backend均打印通过。
+- 本批只新增测试/台账，完整CPU复用175同生产版本3753/2skip；适用文件
+  pre-commit及diff通过，首次格式问题已修正和审阅，日志
+  /tmp/llmtuner-precommit-final-176.log。172的多rank局部拒绝与probe故障
+  已有证据，packing/streaming仍待验收，不承诺任意源副作用事务保护。
+  保留已有改动，未commit/push，无存活本批任务。
+
+### 第177批：packing/streaming预检连续性与源重放边界
+
+- 新增8组合真实loader回归：map/streaming×none/concat/document-cap2/
+  first-fit4bins。每例独立构建两个graph，source读取2批后保存，预检、
+  恢复到新loader，再逐批预检并精确比较后续4批；比较live cursor和最初
+  保存snapshot未被修改。document cap同时写入build context和loader layout。
+- 首次fixture错误将max_num_documents_per_row传给builder，4通过/4构造
+  失败，日志/tmp/llmtuner-grain-packing-177.log；按实际context接口修正，
+  8 passed，日志/tmp/llmtuner-grain-packing-after-177.log。该初次失败不属于
+  生产缺陷，不弱化数值或状态断言。
+- 复读packing/iterators.py::set_state，has_remainder时调用next(parent)
+  重建remainder。修正loader docstring与架构文档：probe没有主动next批次，
+  不等于不读取源记录，packing恢复可能重放数据；外部副作用、私有generator
+  不可自动回滚。173仅基础map实验的无读取结论仍保持原限定，不能泛化。
+- 完整CPU3767 passed、2 skipped、330 warnings，39.89s，日志
+  /tmp/llmtuner-cpu-177.log；全部适用pre-commit、compileall、diff通过，日志
+  /tmp/llmtuner-precommit-all-177.log。对175同生产仅更正文档字符串。
+- 172已具备真实map内部错误、完整DCP无写入、两rank局部拒绝、probe故障
+  和上述packing/streaming合法连续性的CPU证据；仍未验证所有第三方图、
+  packing/streaming畸形payload矩阵、设备恢复或源副作用，故不作普遍事务
+  保证，不以本批代替完整目标验收。保留已有改动，未commit/push，作业结束。
+
+### 第178批：畸形packing/streaming游标与初始化析构修复
+
+- 将177扩展为合法/空内部payload两类，共16项，8种map/streaming×packing
+  图均在拒绝后验证live cursor/snapshot不变，并继续比较后续4批数据。
+  原先按推测设置异常种类导致3项fixture失败，日志
+  /tmp/llmtuner-grain-malformed-178.log；复读Grain实现，concat的_CtsState
+  构造为TypeError，其余外层缺字段为KeyError，精确断言修正后16 passed，
+  日志/tmp/llmtuner-grain-malformed-after-178.log，无异常吞噬/容差放宽。
+- 数据完整子集374 passed，日志/tmp/llmtuner-data-178.log，但发现析构
+  unraisable warning，不能仅以pass忽略。PACKING-INIT-CLEANUP-178：
+  DocumentAwareConcatThenSplitIterator先尺寸校验后super初始化，非法
+  构造析构时Grain.close缺_closed。严格warning门禁复现6 failed/6 passed，
+  日志/tmp/llmtuner-packing-cleanup-before-178.log。
+- 将该iterator的super初始化提前，建立父迭代器所有权和关闭状态后再校验。
+  保持原参数ValueError；已有12项尺寸边界测试加filterwarnings(error)，
+  固化析构无secondary错误契约。严格warning下含游标矩阵28 passed，日志
+  /tmp/llmtuner-packing-cleanup-after-178.log，178已确认缺陷修复。
+- 完整CPU3775 passed、2 skipped、305 warnings，38.67s，日志
+  /tmp/llmtuner-cpu-178.log；全部适用pre-commit、compileall、diff通过，日志
+  /tmp/llmtuner-precommit-all-178.log。无接口/格式变更，无存活本批任务。
+- 顺查另一Grain iterator：HuggingFaceCursorIterator初始化中dataset.state_dict
+  或iter(dataset)可先于_iterator赋值失败，close直接读取_iterator；仅静态
+  风险，下一批需复现并确认修复，不在本批宣称通过。任意源副作用与设备恢复
+  缺口保留，172不作无限图/事务保证。保留已有改动，未commit/push。
+
+### 第179批：HF streaming部分初始化关闭修复
+
+- 复现178静态发现：HuggingFaceCursorIterator已完成Grain super初始化，
+  但dataset.state_dict或iter(dataset)抛错时尚无_iterator；close读取该
+  属性再次AttributeError。STREAM-CURSOR-INIT-CLEANUP-179（已修复）。
+- 新6项回归明确保留__new__对象，再调用__init__，覆盖state/iterate×
+  ValueError/KeyboardInterrupt/SystemExit；校验原异常对象、重复close、
+  close后next拒绝。修复前6 failed，日志/tmp/llmtuner-stream-init-before-179.log。
+- close使用可缺省的_iterator查询，未构造时仍执行Grain关闭；已有源迭代器
+  的close行为和finally标记保持，未增加异常吞噬。修复后相关25 passed，
+  日志/tmp/llmtuner-stream-init-after-179.log。测试以直接close断言复现，
+  不依赖GC时序或隐藏unraisable warning。
+- 复核本仓库两种Grain DatasetIterator子类初始化生命周期；HF正常
+  state_dict返回值查验已安装datasets实现使用deepcopy，未复现175的
+  别名根因，不添加冗余复制。第三方source状态所有权仍依赖其实现。
+- 完整CPU3781 passed、2 skipped、327 warnings，39.31s，日志
+  /tmp/llmtuner-cpu-179.log；全部适用pre-commit、compileall、diff通过，日志
+  /tmp/llmtuner-precommit-all-179.log。无接口或状态格式变更，无存活本批
+  作业，保留已有改动，未commit/push。全局设备/多轴/恢复开放项继续保留。
+
+### 第180批：DCP普通shutdown异常保留活跃stager
+
+- 审查DCP/base异步等待与清理，发现DCP-STAGER-SHUTDOWN-180：
+  close_stager对Exception清空引用，_close继续销毁组，base将manager关闭。
+  实际DefaultStager.executor.shutdown抛OSError时线程仍活跃，不能将
+  普通Exception视为已完成清理。扩展既有真实executor回归，修复前
+  OSError1 failed、两个interrupt passed，日志/tmp/llmtuner-stager-before-180.log。
+- stager仅成功关闭后清引用；_close在失败且仍持有stager时保留组并传播。
+  base识别_close后仍保留stager的情形，维持_initialized便于Trainer保留
+  owner重试。未改变collective顺序，close无新增协调collective。
+- 原mock测试“stager失败立即销毁组”与真实活线程安全契约冲突，改为首次
+  故障后组仍注册，第二次成功关闭后组销毁；保留原OSError对象检查并增加
+  两次尝试断言。实际DefaultStager测试验证线程存活→重试后全退出。
+  相关4 passed，日志/tmp/llmtuner-stager-after-180.log。
+- checkpoint_cleanup_retry.py加入OSError，真实2rank CPU/Gloo Trainer.close，
+  3异常×all/rank0/rank1共9场景。shutdown单点故障注入，真实线程/所有权/
+  通信组all_reduce=3、barrier及重试销毁断言不变，全部退出0。
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30236 tests/integration_tests/checkpoint_cleanup_retry.py`，
+  日志/tmp/llmtuner-cleanup-retry-180.log，预期异常trace为测试注入不代表失败。
+- 完整CPU3782 passed、2 skipped、324 warnings，38.64s，日志
+  /tmp/llmtuner-cpu-180.log；适用全部pre-commit、compileall、diff通过，日志
+  /tmp/llmtuner-precommit-all-180.log。不保证线程内部不可恢复故障可继续训练，
+  只保留资源以便关闭重试。保留已有改动，未commit/push，全部本批作业结束。
+
+### 第181批：同step失败发布扩展到完整训练状态
+
+- 复读checkpoint_writer.py、base保留/发现策略、storage/filesystem和DCP
+  writer装配；每次save新writer generation，metadata发布前不删旧generation，
+  retention将模型导出与可恢复训练点分开计数。本批未确认新生产缺陷。
+- 将既有test_failed_same_step_save_preserves_published_model扩展并命名为
+  published_training_state：sync/async×shards写后/publication故障四场景，
+  在原model/非空optimizer/scheduler精确断言上补EMA、synthetic cursor、
+  Trainer step/ntokens_seen和Python/NumPy/CPU RNG，失败后metadata字节不变，
+  恢复旧generation所有新增状态精确匹配；原成功重试发布/读取断言保留。
+- 首次沿用已消费loader被合法no-rewind校验拒绝，4 failed，日志
+  /tmp/llmtuner-publication-fullstate-181.log；按既有契约使用fresh loader，
+  未放宽拒绝规则。四项最终passed，日志
+  /tmp/llmtuner-publication-fullstate-after-181.log。其余runtime对象复用，
+  故这是同manager恢复旧generation状态完整性，不是新进程续训验收。
+- checkpointer文件144 passed、113 warnings，3.10s，日志
+  /tmp/llmtuner-checkpointer-181.log；本批仅测试/台账，无生产改动，完整CPU
+  复用180同生产3782/2skip。pre-commit首次仅修正import/format，已审阅并复检，
+  日志/tmp/llmtuner-precommit-final-181.log，diff通过。保留已有改动，未
+  commit/push，无本批存活任务。并发writer互斥/断电持久性及设备恢复仍非
+  此测试证明范围，不宣称全局完成。
+
+### 第182批：HF导出索引与分片的独立读取验证
+
+- 复读hf_storage.py的indexed reader、generation目录、分片consolidation与
+  os.replace索引发布，以及HF适配调用路径。既有恢复测试走本仓库reader，
+  对外可读性证据偏同源；本批增加独立解析验证，未发现新的生产缺陷。
+- 使用已安装Transformers.utils.hub.get_checkpoint_shard_files解析标准HF
+  index，safetensors.torch.load_file读取解析出的全部分片，不调用本仓库
+  IndexedHuggingFaceStorageReader。检查分片键无重复、加载键等于weight_map、
+  张量等于保存前独立克隆（rtol=atol=0）。当前Transformers不提供旧的
+  modeling_utils.load_sharded_checkpoint，使用实际存在API而非兼容mock。
+- 2项roundtrip覆盖mapping缺省/显式多分片，并保留abandoned.safetensors
+  非索引文件干扰；4项consolidation/publication失败覆盖mapping两种情况，
+  独立reader确认旧generation仍可读，原本仓库reader断言全部保留。
+  6 passed，日志/tmp/llmtuner-hf-independent-182.log。
+- checkpointer文件144 passed、113 warnings，3.68s，日志
+  /tmp/llmtuner-checkpointer-182.log。本批仅测试与台账，完整CPU复用180同
+  生产3782/2skip；pre-commit格式化已审阅复检，日志
+  /tmp/llmtuner-precommit-final-182.log，diff通过。
+- 证据是CPU本地HF索引/权重互操作，不是完整AutoModel.from_pretrained
+  模型配置/生成验收，也不覆盖设备、并发writer或断电持久性。保留已有
+  改动，未commit/push，本批任务结束，全局开放项继续。
+
+### 第183批：标准AutoModel互操作与tied head导出修复
+
+- 继续182，新增真实微型LlamaForCausalLM测试：tied/untied×默认单分片/
+  显式两分片，manager保存后由AutoModelForCausalLM.from_pretrained加载，
+  调用方显式提供模型与generation config，local_files_only，无本仓库reader。
+  参数全量精确比较、head/embedding identity和eager logits精确比较。
+- 原实现4 failed，日志/tmp/llmtuner-hf-automodel-183.log。其中默认单分片
+  tied场景真实DCP/safetensors拒绝shared memory（embedding/lm_head）；
+  其他失败为当前Transformers无generation_config.json时加载异常，属于
+  权重导出不含配置的契约，fixture显式提供generation config，不冒称导出
+  已生成该文件。HF-TIED-EXPORT-183为已确认生产缺陷。
+- HFTransformerStateDictAdapter.to_hf在config声明tie且两键均保留时clone
+  导出head，满足同分片safetensors不接受alias的约束，保留键与数值和live
+  model共享关系。源index已省略head时沿用原省略规则，无额外clone；已保留
+  head的导出有一份head临时副本/存储，不承诺零额外内存。不修改checkpoint
+  格式，不复制整个模型，不依赖偶然将tied键分在不同文件。
+- 四场景最终4 passed，日志/tmp/llmtuner-hf-automodel-after-183.log；完整CPU
+  3786 passed、2 skipped、313 warnings，39.99s，日志/tmp/llmtuner-cpu-183.log。
+  全部适用pre-commit首次格式化新增测试，已审阅复检，compileall/diff通过。
+- CheckpointConfig和架构文档明确last_save_in_hf导出weights/index，模型/
+  generation/tokenizer配置另供。本批不验证独立完整目录自动发现配置、TP/PP
+  或设备分布式tied导出，后续仍需真实多rank分片证据。保留已有改动，未
+  commit/push，全部本批作业退出。
+
+### 第184批：真实分片tied Llama权重的标准HF加载
+
+- 新增tests/integration_tests/hf_tied_export.py：真实ParallelTopology
+  DP shard2，生产apply_fsdp root-pattern入口，native/custom×单/两HF输出
+  分片，LlamaForCausalLM共享embedding/head，CPU/Gloo。
+- 分片前独立克隆全量state与eager logits；分片后逐参数断言DTensor，
+  确认不是degree1/no-op。manager实际DCP写入和跨rankconsolidation，标准
+  AutoModelForCausalLM.from_pretrained直接加载，不用本仓库reader；
+  权重/logits rtol=atol=0，加载模型共享身份正确，源模型导出前后共享保持。
+  模型/generation配置显式另供，不声称独立配置资产导出。
+- 首次port30237退出0，补机制/源共享断言后port30238再次退出0，四场景
+  均exact。命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30238 tests/integration_tests/hf_tied_export.py`，
+  日志/tmp/llmtuner-hf-tied-final-184.log，初始日志
+  /tmp/llmtuner-hf-tied-distributed-184.log。首次格式长行由hook修正并审阅。
+- 本批仅集成脚本及台账，无生产改动，完整CPU复用183同生产3786/2skip。
+  pre-commit、编译与diff通过。固定CPU root-pattern FSDP2的权重/前向
+  互操作不代表TP/PP/设备或新进程完整训练恢复。保留已有改动，未commit/
+  push，全部本批任务退出。
+
+### 第185批：TP2×FSDP2的tied标准HF导出
+
+- 扩展hf_tied_export.py为--tp-size 1/2，TP2时实际world4/DPshard2，
+  通过生产apply_tp默认HF plan→apply_fsdp root-pattern顺序；embedding/
+  head按本仓库契约保持TP复制/共享，decoder投影实际TP切分。
+- 新断言逐个TP layout比较参数与原始dense权重在对应rank的精确切片，
+  FSDP每参数为DTensor且本地numel×2等于逻辑numel；不是只检查注册字段。
+  全量导出权重及独立标准AutoModel的eager logits仍rtol=atol=0，源/加载
+  模型共享身份断言保留。没有运行TP训练forward，不据此宣称训练等价。
+- native/custom×单/两safetensors文件四场景，port30239初版退出0；
+  增加实际切片/DP存储断言后port30240退出0，日志
+  /tmp/llmtuner-hf-tp-fsdp-185.log、/tmp/llmtuner-hf-tp-fsdp-final-185.log。
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30240 tests/integration_tests/hf_tied_export.py --tp-size 2`。
+- 固定CPU/Gloo、FP32、TP2/DP2/PP1/CP1/EP1、无AC/compile/EMA、仅权重
+  导出及标准HF加载；不替代设备、PP、完整训练状态/新进程续训验收。
+  分布式对比文档同步此范围。无生产变更，完整CPU复用183同生产3786/2skip。
+  适用pre-commit、编译、diff通过，日志/tmp/llmtuner-precommit-final-185.log。
+  保留已有改动，未commit/push，无存活本批作业。
+
+### 第186批：AC多未决前向与反向顺序复核
+
+- 转入memory/activation_checkpoint.py与remat_regions.py，复读policy/wrapper/
+  checkpoint_contexts、MoE mask恢复、region命名及装配顺序。上游映射已明确
+  本仓库selective保留逐op策略，而当前torchtitan使用RegionAC预设，不将
+  两者宣称同一实现。未确认新的生产缺陷。
+- 针对selective matmul计数跨前向的静态疑问，先用3个Linear的/tmp脚本
+  做两个未决前向、FIFO/合并反向，梯度精确相同；trace仅作诊断，未替换
+  生产实现或以该简单图证明decoder重计算。日志
+  /tmp/llmtuner-sac-overlap-186.log、/tmp/llmtuner-sac-fifo-186.log。
+- 新正式6回归以真实HFTransformerModel三层Llama，full/selective×FIFO/
+  LIFO/combined，两个前向长度24/21，比较每输出及全部参数梯度rtol=atol=0。
+  每层prehook前向计数2，反向后4，证明目标checkpoint机制实际重放。
+  6 passed，日志/tmp/llmtuner-ac-pending-186.log，不因静态疑问改写策略。
+- memory全部102 passed，6.29s，日志/tmp/llmtuner-memory-186.log；新增测试
+  格式化已审阅，pre-commit/diff通过。无生产变更，完整CPU复用183同生产
+  3786/2skip。本批是CPU eager decoder多前向，非PP调度、设备SAC、region
+  实包或多轴compile验收。保留已有改动，未commit/push，全部作业退出。
+
+### 第187批：AC包装保留eval与混合子模块模式
+
+- AC-WRAPPER-MODE-187：PyTorch ptd_checkpoint_wrapper默认training=True，
+  wrap_full/wrap_selective对eval block直接返回wrapper，导致wrapper模式与
+  原block不一致。直接运行确认wrapper True/child False，不把该元数据缺陷
+  夸大为已观察到的loss错误。
+- 新四回归full/selective×train/eval，block内Dropout故意使用相反模式，
+  Linear.weight冻结；验证wrapper模式、原子模块逐项模式、每参数identity和
+  requires_grad。修复前eval两项failed、train两项passed，日志
+  /tmp/llmtuner-ac-mode-before-187.log。
+- 两个factory在创建wrapper后直接设置wrapped.training=module.training，
+  不调用递归.train，保留原混合子模块状态；region原地forward包装无新增
+  wrapper，不适用此变更。无接口与checkpoint键变化，无薄封装新增。
+  修复后含186多前向相关10 passed，日志/tmp/llmtuner-ac-mode-after-187.log。
+- 完整CPU3796 passed、2 skipped、328 warnings，39.29s，日志
+  /tmp/llmtuner-cpu-187.log；适用全部pre-commit、compileall、diff通过，日志
+  /tmp/llmtuner-precommit-all-187.log。顺读model_compile.py：per-block保留
+  module.compile原地身份，全模型torch.compile包装和其模式另待针对性验证。
+- 本批不改变训练默认True数值路径，不据CPU元数据测试宣称设备/PP组合
+  完整通过。保留已有改动，未commit/push，全部本批作业退出。
+
+### 第188批：AC×compile混合模式与冻结参数真实图验证
+
+- 续接187，复读parallel/model_compile.py整模型包装/逐block原地compile、
+  settings回滚与region flag归属；未确认新的生产缺陷。清理compile测试文档
+  中“当前机器torch2.2.2”过期描述，以实际能力门和CPU图测试范围表述。
+- 新四回归full/selective AC×whole/per_block compile，实际aot_eager，
+  两层Linear/Dropout/Tanh块，root eval但一处Dropout train，首层weight冻结。
+  生产apply_ac→apply_compile，canonical FQN检查每参数identity、requires_grad、
+  原模块模式；固定相同RNG做eager/compiled前向，捕获unique_graphs>0，
+  输出、input grad、全部可训练parameter grad精确比较，冻结grad仍None。
+- 四场景全部passed，日志/tmp/llmtuner-ac-compile-modes-188.log；compile
+  测试文件50 passed、2 skipped、2 warnings，7.36s，日志
+  /tmp/llmtuner-compile-188.log。两skip是本torch已具备micro_pipeline_tp/
+  regional_inductor，故旧版本“能力不存在”测试不可触发，并非新四项skip。
+- 本批仅测试/文档，无生产变更；完整CPU复用187同生产3796/2skip。
+  格式化已审阅复检，pre-commit/diff通过，日志
+  /tmp/llmtuner-precommit-final-188.log。证据为CPU实际aot_eager图，无
+  Inductor设备内核、PP/TP/EP或region实包推论。保留已有改动，未commit/
+  push，全部本批作业结束。
+
+### 第189批：验证模式切换的部分失败恢复
+
+- 复核 `trainer/runtime/validation.py::validate`：逐模块保存 training，finally
+  直接恢复标记；模式切换中途失败也在恢复范围内，无需修改生产实现。
+- 新增 `test_validate_restores_modes_after_partial_eval_setup`：自定义子模块在
+  eval 已改变自身模式后抛出 ValueError/KeyboardInterrupt/SystemExit；此前子模块
+  已切换，后续子模块尚未访问。断言原异常身份、全部混合 training 标记、已覆盖的
+  attention mask 与 Flex packed 状态均恢复，验证循环没有进入。
+- 当前 HEAD `ae4f64a32f427d33e7693bfc3430a08735e2021b` 加既有工作区改动。
+  `pytest -q tests/unit_tests/cpu/test_validate.py --disable-warnings`：69 passed，
+  4.06s，exit0；日志 `/tmp/llmtuner-validation-189.log`。本批仅测试/台账，
+  未改生产代码；全量 CPU 沿用第187批，不声明本轮重跑。
+- 证据范围为单进程 CPU 的模式 setup 失败；跨 rank setup 故障传播及目标设备
+  AC/compile 的验证行为仍须对应集成证据，不从此测试推导。
+
+### 第190批：跨 rank 验证模式 setup 失败传播
+
+- 扩展 `tests/integration_tests/validation_reduction_equivalence.py` 既有模式
+  setup 故障测试：由仅 rank0/ValueError 改为每个 rank 分别触发
+  ValueError、KeyboardInterrupt、SystemExit，且在子模块 train(False) 修改
+  自身标记并消耗 CPU RNG 后抛出。生产 validate 与错误协调实现未改。
+- 真实4rank CPU/Gloo，DP2×CP2、DP2×TP2 两种 mesh，共24个 setup 故障场景：
+  owner 保留异常身份，peer 收到精确协调错误；全部模块模式与 RNG 逐位恢复，
+  未进入验证 forward/loader，随后 all-reduce 得到10并完成 barrier。既有24个
+  preprocessing 故障及两次正常验证同时通过，最终loss仍匹配独立全批参考。
+- 命令：`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=4
+  --master_addr=127.0.0.1 --master_port=30241
+  tests/integration_tests/validation_reduction_equivalence.py`，exit0；日志
+  `/tmp/llmtuner-validation-modes-190.log`。当前HEAD
+  `ae4f64a32f427d33e7693bfc3430a08735e2021b` 加既有工作区改动。
+- 该脚本使用显式序列切片的确定性投影，并非实际 TP/CP/FSDP 模型变换；不将
+  控制流与通信恢复证据扩展为目标设备、AC/compile 或通信故障恢复验收。
+  本批只改测试和台账，完整CPU复用第187批；pre-commit 首次仅格式自动调整，
+  已审阅后重跑，compileall及diff检查通过。
+
+### 第191批：AC×compile 验证切换后训练梯度
+
+- 扩展第188批 `test_compiled_ac_preserves_modes_identity_and_frozen_gradients`，
+  full/selective AC × whole/per-block aot_eager × 验证成功/失败，共8例。
+  调用生产 `validate()` 的模式/RNG guard，验证循环替换为真实 compiled eval
+  forward，并与独立 eager eval 逐位比较；循环主动消耗 CPU RNG 后可抛原异常。
+- 验证结束断言全部 wrapper/子模块模式和 RNG 恢复，随后训练 forward、输入梯度、
+  全部可训练参数梯度仍与 eager 参考逐位相同；冻结参数无梯度，参数身份不变，
+  Dynamo unique_graphs>0。仅替换验证循环，不声称完整数据/loss/归约链已覆盖。
+- 初次8例因新增测试漏导入 SimpleNamespace 失败，日志
+  `/tmp/llmtuner-ac-validation-191.log`；修正测试导入后 compile 文件54 passed、
+  2 skipped、2 warnings、8.63s、exit0，日志
+  `/tmp/llmtuner-compile-validation-191.log`。skip为既有旧版本能力拒绝测试。
+- 当前HEAD `ae4f64a32f427d33e7693bfc3430a08735e2021b` 加既有改动。本批仅测试
+  和记录，生产代码未变，完整CPU沿用第187批；受影响文件pre-commit、compileall、
+  diff检查通过。设备Inductor及实际分布式AC/compile验证仍开放。
+
+### 第192批：完整验证链×custom FSDP×AC/compile 新进程恢复
+
+- 复用并逐项阅读 `trainer_ema_process_resume.py` 的 worker、snapshot、验证
+  guard及最终比较：实际 parse_config→Trainer构造→Grain loader→train/validate
+  →DCP→新进程load。EMA/验证/compile为程序配置，非新增CLI标量支持。
+- macOS26.3 arm64、Python3.13.12、torch2.14.0、CPU/Gloo；DP shard2、
+  TP/PP/CP/EP1、custom FSDP、full AC、whole-model aot_eager、EMA、
+  local JSONL/Grain单文档packing、async中间保存，每训练step验证2batch。
+- 命令：`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py
+  corpus async dp2 custom compile ac validate`，exit0；日志
+  `/tmp/llmtuner-full-validation-resume-192.log`，产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-dkgr20fw`。
+- 三个独立worker任务：连续4步、初始2步、加载后续训至4步。两个rank分别比较
+  step2加载边界及step4完整state：model、optimizer、scheduler、EMA、trainer、
+  dataloader、解码RNG及DTensor本地shard/layout，rtol=atol=0；验证前后完整
+  state相同，验证次数符合每step要求，Dynamo unique_graphs>0，全部通过。
+- 本轮没有新增生产或测试代码；当前HEAD ae4f64a 加既有未提交改动。补充的是
+  完整数据/loss/归约/保存恢复接线证据，不能替代独立dense数值oracle或目标
+  设备Inductor验收；无性能结论。仅台账修改，文档pre-commit及diff检查通过。
+
+### 第193批：配置装配复核与当前工作区全量门禁
+
+- 复核 `config/{training_config,validation_config,cli_config,llmtuner_config}.py`
+  与 `trainer/cli.py`：validation/EMA/compile嵌套配置在PROGRAMMATIC_ONLY
+  中明确排除；from_groups按基类可初始化字段重建配置，未发现本轮字段被CLI
+  静默接受后丢弃。验证次数整数校验已有回归，不重复添加；无生产修改。
+- 当前HEAD `ae4f64a32f427d33e7693bfc3430a08735e2021b` 加全部既有未提交改动，
+  macOS arm64/Python3.13.12/torch2.14.0。全量
+  `TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`
+  最终3807 passed、2 skipped、308 warnings、39.97s、exit0；日志
+  `/tmp/llmtuner-cpu-193.log`，覆盖本轮前189/191新增用例。
+- 对全部现存tracked文件加integration脚本运行pre-commit，排除受保护
+  `examples/native_alltoall.py`、外部未跟踪moonep/及prompt.md，所有适用hook
+  通过且无自动修改；日志 `/tmp/llmtuner-precommit-all-193.log`。
+  compileall与`git diff HEAD --check`通过，台账追加后文档hook再检通过。
+- 全量门禁不等同于并行矩阵/恢复全部验收。仍需清理设计文档中的历史路径描述，
+  并继续独立数值与目标设备证据；不以测试数量宣布完成。未提交/推送。
+
+### 第194批：架构文档与当前目录职责对齐
+
+- 对照实际 `llmtuner/` 文件与入口，重写设计文档目录结构，删除128文件等
+  过时数量。修正trainer/cli与runtime、*_config.py、memory归属、同名并行
+  入口、MoE路由/计算与EP dispatch、utils/seeding等描述；修正能力消费者及
+  跨层配置校验路径。保留上游溯源名称，不进行无收益源码重命名。
+- TEST-RUNNER-LAUNCH-194（开放）：阅读integration/run_all.py确认discover
+  包含所有同目录脚本，但执行统一为torchrun；cli_checkpoint_equivalence.py、
+  trainer_ema_process_resume.py等自身为Python子进程驱动，docstring没有
+  torchrun时仍默认2rank，会重复启动驱动而非按其声明执行。设计文档已明确
+  此限制，下一步修复启动命令解析并补无真实作业的命令构造回归。
+- 本轮仅设计文档/台账变更，文档pre-commit及diff检查通过；全量CPU沿用第193批
+  3807 passed/2 skipped。运行任务已结束，无待轮询session；未commit/push。
+
+### 第195批：修复集成 runner 重复启动 Python 驱动
+
+- TEST-RUNNER-LAUNCH-194：已修复。run_all.py依据docstring中指向自身文件的
+  python命令选择单次sys.executable启动；存在明确torchrun rank命令时仍保留
+  分布式启动与既有默认2rank。list与执行复用launch_command，避免展示不一致。
+  不执行docstring任意shell文本。PP full/resume共享目录逻辑保留。
+- 新增两个真实驱动×list/执行4例：修复前4失败（日志
+  `/tmp/llmtuner-runner-before-195.log`）；修复后runner单测12 passed，exit0
+  （`/tmp/llmtuner-runner-after-195.log`）。保留rank拼写、端口和PP生命周期测试。
+- 实际 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python
+  tests/integration_tests/run_all.py cli_checkpoint_equivalence` exit0，19.0s，
+  单次Python驱动完成新进程CLI连续/恢复完整state严格比较；日志
+  `/tmp/llmtuner-runner-smoke-195.log`。设计文档同步启动契约。
+- 全量 `TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`
+  3811 passed、2 skipped、301 warnings、39.60s、exit0，日志
+  `/tmp/llmtuner-cpu-195.log`。适用全文件pre-commit通过
+  （`/tmp/llmtuner-precommit-all-195.log`）；初次长行格式错误已修正，最终通过。
+  compileall与diff检查通过；仅测试工具/测试/文档修改，未修改训练实现。
+- 多阶段或必需参数脚本的默认执行仍需单独梳理，不宣称run_all已覆盖所有配置；
+  当前HEAD ae4f64a 加既有工作区改动，未commit/push，无运行任务。
+
+### 第196批：异步快照测试的两阶段 runner 接线
+
+- TEST-RUNNER-PHASE-196：确认async_snapshot_equivalence.py复用PP恢复harness，
+  必需full/resume及共享目录；此前runner无参数启动直接usage退出。扩展既有
+  PP两阶段分支至该脚本，full失败不启动resume，临时目录在两阶段后清理。
+- 参数化既有目录生命周期测试至两个脚本×成功/失败；修复前新增2例失败
+  （`/tmp/llmtuner-phases-before-196.log`），修复后runner14 passed，exit0
+  （`/tmp/llmtuner-phases-after-196.log`）。未削弱完整state数值断言。
+- 实际 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python
+  tests/integration_tests/run_all.py --master-port 30242 async_snapshot_equivalence`
+  exit0，16.4s；日志 `/tmp/llmtuner-phases-smoke-196.log`。真实两rank CPU/Gloo，
+  延迟DefaultStager共享CPU快照、PROCESS上传，full/resume独立作业均通过；日志
+  显示snapshot count0首次分配、count2复用缓存。仅CPU staging，无设备拷贝结论。
+- 全文件适用pre-commit通过（排除受保护example/外部内容），日志
+  `/tmp/llmtuner-precommit-all-196.log`。首次测试长行已由format修正并审阅。
+  本批仅runner/测试/台账变更；其他需参数脚本的自动执行仍开放。
+- 完整CPU：`TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q
+  --disable-warnings`，3813 passed、2 skipped、322 warnings、40.09s、exit0，
+  日志 `/tmp/llmtuner-cpu-196.log`。compileall、diff及最终文档hook通过。
+  无运行任务，未commit/push；全局审查和设备矩阵仍未完成。
+
+### 第197批：EMA 混合实数/复数更新及恢复契约
+
+- 复核components/optimizer/ema.py、config/ema_config.py及既有身份/冻结/
+  重命名测试。EMA明确允许complex buffer，但缺少对应公式与恢复覆盖。
+  新增complex64/complex128 buffer与float64参数混合，固定decay0.5，4次更新，
+  step2新EMA实例load后继续；每次按独立加权公式逐位比较全部平均值，恢复后
+  完整state逐位比较。生产实现无需修改。
+- 初次随机FP64初值导致lerp与独立乘加的舍入路径差异2.78e-17，未判为产品bug，
+  保留日志 `/tmp/llmtuner-ema-complex-197.log`。改用二进制精确的初值/增量，
+  继续rtol=atol=0，不放宽容差；两个复数用例与EMA专项83 passed、0.81s、exit0，
+  `/tmp/llmtuner-ema-complex-after-197.log`。
+- 测试文件pre-commit最终通过，首轮仅长行自动格式化，已审阅；本批仅测试/台账，
+  完整CPU复用第196批3813 passed/2 skipped同生产版本，未宣称新增测试在该次运行。
+  当前工作区既有改动保留，无commit/push；证据仅CPU、固定decay与这些dtype，
+  不扩展为DTensor复数或目标设备支持。最终文档hook和diff检查通过。
+
+### 第198批：custom FSDP×PP×AC/compile 非有限更新边界
+
+- 复核trainer.train_step有限值检查→optimizer→scheduler→EMA顺序及scheduler
+  恢复/末步边界；非有限值是显式抛错，不是静默跳过。既有PP eager证据之外，
+  本轮实际运行DP shard2×PP2、TP/CP/EP1、custom FSDP、full AC、whole-model
+  aot_eager、1F1B/4microbatch、EMA0.75、真实Qwen3 forward/backward。
+- 在4个rank分别注入返回loss NaN或post-backward梯度Inf，共8种故障，之前已
+  完成真实Adam/EMA预热。每次所有rank报错，model/optimizer/scheduler/EMA及
+  DTensor本地shard/layout完整state严格不变；barrier后正常step成功，scheduler
+  与trainer.step一致且参数更新。数据/RNG消耗不承诺回滚。
+- 初跑port30243 exit0，日志 `/tmp/llmtuner-nonfinite-compiled-pp-198.log`。
+  发现脚本尚未断言compile触达，新增每rank Dynamo unique_graphs>0；最终命令
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0
+  torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30244
+  tests/integration_tests/trainer_nonfinite_update.py pp2 custom compile ac` exit0，
+  日志 `/tmp/llmtuner-nonfinite-compiled-pp-final-198.log`。
+- 本批仅测试触达断言及台账，生产未改；完整CPU沿用第196批3813/2skip，
+  第197批新增复数EMA另有83专项通过。受影响pre-commit和diff通过。
+  CPU可恢复断言不代表设备assert/collective故障可继续训练；其他设备矩阵仍开放。
+
+### 第199批：有限训练最终保存的EMA与RNG恢复
+
+- 复核trainer.py的预读完整累积窗口及数据耗尽最终保存分支；既有契约明确
+  不完整窗口不更新参数，已消费cursor/token仍保留。合理实现无需改生产代码。
+- 增强既有真实DCP `test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state`：
+  开启EMA0.75，训练前主动推进Python/NumPy/CPU RNG。3个真实synthetic batch，
+  累积2，仅完成1次更新，第3batch消耗后取消窗口；step1最终checkpoint恢复到
+  新Trainer，原有模型/非空Adam/scheduler/cursor/计数断言保留，新增EMA与三个
+  host随机流严格相同。cursor3的下一batch仍匹配独立RandomTokenSource。
+- 定向1 passed（初始版本），最终trainer文件146 passed、33 warnings、9.32s、
+  exit0，`/tmp/llmtuner-trainer-199.log`。首轮format调整import，审阅后最终
+  pre-commit通过；日志 `/tmp/llmtuner-finite-hooks-final-199.log`。
+- 本批仅测试/台账；完整CPU沿用第196批同生产版本3813/2skip，新增用例以各批
+  专项结果为准。单进程新runtime证据不替代新OS进程与多rank耗尽验收；未声称
+  回滚取消窗口的游标。diff及最终文档hook通过，未commit/push，无运行任务。
+
+### 第200批：训练GC本地失败的跨rank传播修复
+
+- TRAINER-GC-COORDINATION-200：静态确认train()的GarbageCollection构造及
+  run(step)此前没有错误协调；一个rank本地GC/日志异常会退出，peer可继续
+  数据fetch/world collective。为两个纯本地阶段增加Training GC initialization/
+  step协调边界，不把GC放入模型通信阶段；默认debug=False，无内部collective。
+- 扩展training_profiler_coordination.py：GC初始化与第二步周期collect分别在
+  rank0/rank1触发OSError/KeyboardInterrupt/SystemExit，12新增场景；owner
+  保留原异常身份，peer精确协调错误，成功peer的GC owner及profiler关闭，
+  自动GC恢复，后续barrier完成。初始化不保存，周期失败只保留此前step1保存。
+  原12个profiler故障场景同时通过。
+- 命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2
+  --master_addr=127.0.0.1 --master_port=30245
+  tests/integration_tests/training_profiler_coordination.py` exit0；日志
+  `/tmp/llmtuner-gc-coordination-200.log`。真实Trainer循环/GC/profiler，训练step
+  与checkpoint IO为替代实现；不声称参数数值或通信故障恢复验收。
+- 适用全文件pre-commit通过 `/tmp/llmtuner-precommit-all-200.log`，保护文件及
+  外部内容排除；compileall/diff通过。保留既有工作区改动，未commit/push。
+- 完整CPU `TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`
+  3815 passed、2 skipped、310 warnings、39.78s、exit0，日志
+  `/tmp/llmtuner-cpu-200.log`；最终台账hook通过。该版本包含第197/199新增测试。
+  无运行任务；其余声明组合和设备验收继续开放。
+
+### 第201批：GC协调修复后的真实CLI PP恢复与materialization复核
+
+- 阅读models/hf/materialization.py及assembly.py调用顺序，复核现有HF wrapper
+  测试：冻结共享参数、持久/非持久buffer别名、未知meta buffer在分配前拒绝
+  均已有直接覆盖；本轮未发现需要修改的实现，不重复增加同义测试。
+- 为第200批生产GC协调修复补正常多轴运行：实际CLI三个独立任务，连续3步、
+  初始2步、新进程恢复至3步；DP shard2×PP2、custom FSDP、full AC、
+  Interleaved1F1B/4microbatch/6层Qwen3、synthetic数据、CPU/Gloo。四rank
+  最终解码完整DCP state严格相同，exit0；无EMA/compile/CP/TP/EP覆盖主张。
+- 命令 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 LLMTUNER_TEST_MASTER_PORT=30246
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/cli_checkpoint_equivalence.py pp2 custom ac`，使用端口
+  30246/30247/30248；日志 `/tmp/llmtuner-cli-gc-pp-201.log`，产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-cli-resume-nt4xjx1f`。
+- upstream map补GC协调相对torchtitan的适配边界。本批仅文档，完整CPU沿用
+  第200批3815 passed/2 skipped同生产代码，文档pre-commit与diff通过。
+  无运行任务，未commit/push；设备矩阵、独立数值oracle及全局验收仍开放。
+
+### 第202批：真实可选renderer的多轮SFT接线
+
+- 阅读datasets/text/{processors,renderer,recipes}.py，确认单轮prefix校验、
+  renderer loss_mask与labels同位移、EOS及超长样本边界。现有单元测试为fake
+  renderer接口，本轮补真实包证据；生产实现无需修改。
+- `python -m pip install --target /tmp/llmtuner-renderers-202 renderers==0.1.11`
+  临时安装真实包和依赖，不修改项目环境/依赖声明。最初no-deps导入缺
+  pydantic_config，安装完整依赖后解除；日志install/deps-202保留。
+- 命令 `PYTHONPATH=/tmp/llmtuner-renderers-202:. python
+  /tmp/llmtuner_real_renderer_202.py`，最终exit0；日志
+  `/tmp/llmtuner-real-renderer-complete-202.log`。真实Qwen3RendererConfig、
+  production RendererTokenizerAdapter/build_chat_renderer/ChatProcessor，
+  两轮user/assistant、ensure_final_stop=True。逐token比较inputs与原始tokens
+  的[:-1]、labels与tokens[1:]加真实mask[1:]，两次assistant词汇均监督、
+  user词汇均不监督，全部严格相同。
+- 临时fixture首次误用tokenizer位置参数，随后缺Qwen3必需特殊token，错误日志
+  real-renderer-{202,after-202,final-202}保留。补齐ChatML/tool/thinking专用token
+  后通过；使用本地WordLevel词表而非真实Qwen词表，角色词为UNK。该证据只覆盖
+  接口/shift/监督接线，不覆盖BPE、工具消息、真实模型训练或其他renderer。
+- 本批仅文档记录；完整CPU复用第200批3815/2skip，文档hook/diff通过。
+  临时依赖仅在显式PYTHONPATH运行中生效，无运行任务，未commit/push。
+
+### 第203批：持久化真实renderer回归
+
+- 将第202批临时诊断转为components/test_chat_renderer.py内真实可选包测试，
+  参数化1/2轮对话；保留完整特殊token的离线WordLevel fixture，直接比较真实
+  renderer tokens/mask与生产processor的shift/labels，逐个验证user不监督、
+  assistant监督。用pytest.importorskip明确依赖门控，不替换fake模块。
+- `PYTHONPATH=/tmp/llmtuner-renderers-202:. pytest -q
+  tests/unit_tests/cpu/components/test_chat_renderer.py -k real_qwen3 --disable-warnings`
+  2 passed、19 deselected、1.67s、exit0，日志 `/tmp/llmtuner-renderer-tests-203.log`。
+  默认环境同文件19 passed、2 skipped、1.86s、exit0，日志
+  `/tmp/llmtuner-renderer-default-203.log`；skip仅新增真实可选包用例。
+- 更新测试模块说明，区分fake接口覆盖与真实包覆盖。首轮format自动修改已
+  审阅，最终pre-commit/diff通过。仅测试/台账，完整CPU复用第200批同生产版本
+  3815/2skip，不将新增2项跳过计入旧结果。BPE/工具消息/真实模型范围仍开放。
+  无运行任务，未commit/push。
+
+### 第204批：修复序列化tokenizer的隐式padding/truncation
+
+- TOKENIZER-BATCH-POLICY-204：确认Tokenizer.from_file保留tokenizer.json
+  padding/truncation策略，即使encode(add_special_tokens=False)仍生效；可在
+  packing前丢弃样本内容，或把pad token当成普通next-token标签。renderer直接
+  调用backend获取offsets也受影响。
+- 加载backend后统一no_padding/no_truncation，由processor/packing/collator
+  负责序列边界。新增真实序列化backend的padding/truncation/both三例，编码
+  完整3词并校验renderer adapter字符offsets。修复前3失败
+  `/tmp/llmtuner-tokenizer-before-204.log`，修复后tokenizer专项50 passed、0.58s，
+  `/tmp/llmtuner-tokenizer-after-204.log`。真实可选Qwen3 renderer2例复跑通过，
+  `/tmp/llmtuner-renderer-after-tokenizer-204.log`。
+- 上游map补长度策略适配说明；不更改BOS/EOS或样本超长处理契约。
+  适用全文件pre-commit通过 `/tmp/llmtuner-precommit-all-204.log`，首轮测试
+  format自动修改已审阅；compileall/diff通过，受保护文件和外部内容未触碰。
+- 完整CPU `TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`
+  3818 passed、4 skipped、309 warnings、40.87s、exit0，日志
+  `/tmp/llmtuner-cpu-204.log`。4skip包含新增两项真实renderer可选包门控，临时
+  依赖环境已另跑通过。最终文档hook通过，未commit/push，无运行任务。
+  全局设备与组合验收仍未完成。
+
+### 第205批：tokenizer行为修复后的数据身份迁移
+
+- TOKENIZER-CURSOR-SEMANTICS-205：第204批关闭序列化padding/truncation后，
+  旧/新实现对相同tokenizer.json可产生不同token流；原corpus identity只hash
+  资产/配置，无法识别该行为变化，直接恢复旧packing游标不可靠。
+- loader_builder.corpus_data_identity仅当tokenizer.json保存非空padding或
+  truncation时向hash设置加入编码语义版本；未配置策略的资产保持原identity。
+  既有loader identity拒绝机制负责阻止不兼容恢复，不修改持久化游标格式。
+- 新增3种资产策略的历史hash比较：用相同资产、配置与去掉语义版本的历史设置
+  计算旧身份，断言受影响资产不同、普通资产相同。定向初版9 passed，最终
+  完整CPU包含最终比较：3821 passed、4 skipped、315 warnings、39.22s、exit0，
+  `/tmp/llmtuner-cpu-205.log`，命令仍为
+  `TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`。
+- upstream map补迁移：受影响旧checkpoint若要精确续训需旧实现；采用新行为
+  应显式重启数据迭代，禁止篡改fingerprint伪装等价。未放宽现有恢复校验。
+- pre-commit首轮测试长行自动格式化已审阅；最终适用检查、compileall/diff通过。
+  保留既有改动，未commit/push，无运行任务；真实设备与其余组合仍待验收。
+
+### 第206批：tokenizer身份迁移的生产loader恢复拒绝
+
+- 加强第205批历史fingerprint比较，使用临时monkeypatch作用域，仅模拟历史
+  hash设置，随后退出作用域并构建真实生产loader及独立reference。避免把
+  fingerprint差异本身当成load入口已拒绝的充分证据。
+- 三例分别为无保存策略、padding、truncation；loader先实际消费1batch，保存
+  当前state并把副本data_identity设为历史值。普通资产成功load，受影响资产
+  load_state_dict明确batch layout拒绝。全部case的live state均与操作前相同，
+  下一batch各字段与reference完全一致，tensor rtol=atol=0；两个loader关闭。
+- 定向3 passed、2.56s、exit0，`/tmp/llmtuner-cursor-identity-206.log`。
+  最终数据pipeline文件383 passed、6 warnings、10.66s、exit0，
+  `/tmp/llmtuner-data-206.log`。命令pytest -q对应文件 --disable-warnings。
+- 本轮仅增强现有测试，无生产变更；完整CPU沿用第205批3821/4skip同生产代码，
+  不声称本轮全量重跑。受影响pre-commit与diff通过，最终台账hook通过。
+  未模拟旧完整token流，不据此宣称旧游标可迁移；多rank DCP拒绝由既有身份
+  preflight测试覆盖一般机制，特定tokenizer组合尚未新增多rank证据。
+  未commit/push，无运行任务；全局验收仍未完成。
+
+### 第207批：真实DCP的tokenizer语义身份拒绝
+
+- 扩展grain_checkpoint_preflight.py可选padding/truncation场景；真实序列化
+  tokenizer资产经生产corpus_data_identity生成current与历史设置hash，写入
+  checkpoint的loader使用legacy，指定target rank使用current。图仍为预分词
+  Grain MapDataset，不模拟旧完整token流或自动迁移。
+- 两rank CPU/Gloo、DDP/native/custom × all/rank0/rank1 mismatch，两个策略共
+  18种场景通过；owner ValueError(batch layout)，peer精确dataloader preflight
+  错误。真实DCP加载前后model/Adam/scheduler/EMA/loader完整state严格不变，
+  Python/NumPy/CPU RNG不变，loader可继续next，barrier完成。
+- 命令均为 `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2
+  --master_addr=127.0.0.1 --master_port=PORT
+  tests/integration_tests/grain_checkpoint_preflight.py [POLICY]`。
+  padding端口30250 exit0，`/tmp/llmtuner-tokenizer-dcp-padding-final-207.log`；
+  truncation端口30251 exit0，`/tmp/llmtuner-tokenizer-dcp-truncation-207.log`。
+  无参数原9种坏cursor场景端口30252复跑exit0，`/tmp/llmtuner-grain-original-207.log`。
+- 初次padding30249因旧torch.testing比较器无法处理新增str身份而失败，保留
+  `/tmp/llmtuner-tokenizer-dcp-padding-207.log`；换用既有assert_state_equal，
+  继续严格tensor/类型/字典检查，未放宽容差。最后仅调整日志显示policy名称。
+- 本批仅集成测试/台账；完整CPU复用第205批3821/4skip同生产实现，受影响
+  pre-commit及diff通过。未commit/push，无运行任务；设备组合与全局验收未完成。
+
+### 第208批：确认多模态基础词表token非原子编码缺陷
+
+- MM-TOKEN-ATOMICITY-208（开放）：阅读components/tokenizer/{base,multimodal}.py
+  与datasets/multimodal/processors.py。处理器先拼接vision_start/image重复串/
+  vision_end再encode，之后按视觉ID屏蔽labels；tokenizer构造仅token_to_id，
+  没有确保该字符串在预分词后仍编码为该ID。
+- 真实tokenizers WordLevel+Whitespace，5个视觉token仅在base vocab，生产
+  MultimodalTokenizer构造成功；编码<vision_start><image><image><vision_end>
+  预期[2,0,0,3]，实际9个UNK(5)，严格断言失败，exit1，日志
+  `/tmp/llmtuner-vision-token-208.log`。这是可复现编码契约失败，尚未修复。
+- 既有test_multimodal_tokens_resolve_from_base_vocabulary只验证ID查询，无法
+  覆盖预分词或相邻占位符；不能继续视为基础词表支持已充分验证。下一动作：
+  先补原子编码回归，保留固定ID及已有AddedToken属性，明确缺失匹配规则时的
+  注册/拒绝策略，再检查declared corpus身份兼容及完整多模态processor调用链。
+- 本批只记录确认缺陷，无生产/测试文件修改；文档hook和diff通过。完整CPU沿用
+  第205批3821/4skip，该绿灯不否定此新增独立失败。未commit/push，无运行任务。
+
+### 第209批：补充多模态已注册标记的原子编码与元数据对照
+
+- 续接 MM-TOKEN-ATOMICITY-208（仍开放，生产代码未修复）。新增
+  `test_multimodal_registered_markers_preserve_atomicity_and_metadata`，使用
+  WordLevel + Whitespace，覆盖 special=False/True、normalized=False、
+  lstrip=True 的 AddedToken。实际编码连续 vision_start/image/image/vision_end，
+  按基础词表独立核对四个 ID，并逐项比较构造前后的完整 AddedToken 元数据和词表。
+- `pytest -q tests/unit_tests/cpu/components/test_tokenizer.py --disable-warnings`
+  最终 52 passed；这是已注册标记的对照证据，不能证明未注册基础词表标记已修复。
+- 下一步：修复未注册标记的匹配契约，同时保留现有显式元数据，并检查处理器标签及
+  数据 identity 的跨版本游标迁移。当前无生产代码修改，未重跑完整 CPU/分布式矩阵。
+
+### 第210批：修复基础词表多模态标记的匹配与游标版本
+
+- MM-TOKEN-ATOMICITY-208：生产修复已实现。为未注册的词表标记添加
+  normalized=False/special=True 的 AddedToken，保持原 ID；已有元数据不覆盖。
+  构造时验证每种标记重复编码及 vision_start/image/image/vision_end 相邻编码，
+  不兼容的显式匹配规则报错。既有基础词表回归改用真实 Whitespace 分词器并
+  断言四个预期 ID 和不变的词表大小，覆盖原失败机制。
+- corpus_data_identity 对多模态添加 atomic-markers-v1，防止相同资产的旧游标
+  静默用于变化后的 token 流；文本 identity 不变。新增两种数据类型的历史指纹
+  对照测试。此策略保守失效全部多模态旧游标；精确旧恢复须旧实现，新实现须
+  显式重启迭代，已在 upstream map 说明，不篡改游标身份。
+- 定向 tokenizer/data 回归 437 passed，日志 /tmp/llmtuner-targeted-210.log。
+  第一轮完整 CPU 3823 passed、4 skipped（新增 identity 测试收集前启动），
+  /tmp/llmtuner-cpu-210.log；最终工作树完整 CPU 3825 passed、4 skipped、329 warnings，40.29s，
+  /tmp/llmtuner-cpu-final-210.log，退出码0。
+  适用全文件 pre-commit 通过（排除受保护文件和外部 moonep/prompt），
+  /tmp/llmtuner-precommit-210.log；compileall、HEAD diff check 通过。
+- 待补验收：真实图片处理器标签对照、显式不兼容匹配规则拒绝路径，以及新语义
+  指纹经实际多模态 loader/DCP 恢复拒绝的端到端证据；不以当前单测替代这些条件。
+
+### 第211批：真实图片监督与多模态指纹DCP拒绝证据
+
+- 续接 MM-TOKEN-ATOMICITY-208：新增未注册基础词表 + WordLevel/Whitespace
+  的真实64x64 PNG处理回归。独立按16x16 patch、2x2 merge计算四个图像token，
+  精确核对 input_ids、shifted labels、五个视觉目标IGNORE_INDEX、文本监督、
+  positions及THWC图片输出，不用处理器自身编码结果作为参考。
+- 新增显式single_word=True不兼容匹配规则的拒绝测试，不覆盖元数据绕过失败。
+  首次图片测试误将输出布局写成CHW而失败，核对image.py实际返回THWC后修正
+  测试契约；失败日志 /tmp/llmtuner-mm-211.log 保留。最终 tokenizer+multimodal
+  234 passed、21 warnings，2.10s，/tmp/llmtuner-mm-final-211.log，退出0。
+- 扩展 grain_checkpoint_preflight.py atomic 模式，以生产 obelics 指纹与仅移除
+  multimodal_encoding 的历史指纹对照。两rank CPU/Gloo，DDP/native/custom FSDP
+  各覆盖全部rank/rank0/rank1不匹配，真实DCP恢复在写入前拒绝；精确验证模型、
+  optimizer、scheduler、EMA、loader及Python/NumPy/Torch RNG不变，后续取样和
+  barrier正常。命令：PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun
+  --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30253
+  tests/integration_tests/grain_checkpoint_preflight.py atomic。
+  /tmp/llmtuner-atomic-dcp-211.log，退出0。数据图仍为预tokenized Grain，不能
+  宣称实际多模态生产loader的图片packing与完整续训恢复已验证。
+- 本批只改测试/文档；复用同一生产实现第210批完整CPU 3825 passed、4 skipped。
+  受影响测试pre-commit通过，/tmp/llmtuner-hooks-211.log；生产缺陷修复已覆盖
+  编码、真实图片监督和DCP身份拒绝，实际多模态loader端到端验收仍待补。
+
+### 第212批：生产多模态loader游标恢复与新packing边界缺陷
+
+- 新增 test_multimodal_factory_restores_packed_images_and_rejects_old_identity，
+  从build_dataloader生产入口加载本地真实PNG+不同caption，使用未注册基础词表
+  标记、真实处理器、FirstFit packing和collator。取两批后将状态加载至新loader，
+  恢复前状态精确一致，随后三批全部字段（含图片patch/grid）对照连续loader相等，
+  图像token实际存在且不作为监督目标。此处是新运行时，未声称新OS进程模型续训。
+- 同测试历史identity分支：构造source时仅移除multimodal_encoding语义键，
+  生产factory生成的旧指纹被新loader拒绝；目标状态不变，下一批与全新oracle
+  精确一致。配合211批DCP证据覆盖实际图片loader局部恢复拒绝。
+- MM-PACK-BUDGET-212（开放）：测试首次使用num_tokens_per_batch=32、
+  max_context_length=256，真实图片样本67 token被context过滤放行，随后Grain
+  PackedBatch报feature_length67 > max_length32。根因候选是multimodal/packing.py
+  只按max_context_length过滤，没有同时考虑batch容量；需核对预期配置契约、
+  与文本FirstFit策略及游标迁移，再修复。失败日志
+  /tmp/llmtuner-media-cursor-212.log保留。恢复测试改用有效容量128验证独立恢复
+  契约，不能以此关闭32 token失败。
+- test_multimodal_build.py最终8 passed、678 warnings，4.38s，退出0，
+  /tmp/llmtuner-media-cursor-final-212.log。受影响测试pre-commit通过，
+  /tmp/llmtuner-hooks-212.log。本批无生产修改，完整CPU仍引用210批
+  3825 passed、4 skipped；下一步优先修复MM-PACK-BUDGET-212。
+
+### 第213批：修复整文档多模态packing的批容量边界
+
+- MM-PACK-BUDGET-212：修复根因为multimodal/packing.py只按context上限过滤。
+  现按min(max_context_length,num_tokens_per_batch)过滤整文档，保持媒体span与
+  patch对应关系，不切断图片。不适用文本FirstFit的可分块契约。
+- 新增三个边界回归：context/batch=16/8、8/16、8/8，各输入limit+1、limit、
+  limit-1长度文档，并精确核对有效labels、媒体身份及固定row长度；不得只验证
+  不抛异常。修复前16/8失败，其余两项通过，退出1，
+  /tmp/llmtuner-pack-before-213.log；修复后包含在577项数据测试中全部通过。
+- 多模态identity升级atomic-markers-bounded-packing-v2；回归比较历史无语义键、
+  v1和当前指纹，文本保持一致，多模态拒绝旧语义。旧图可能有效迭代若干批后
+  才遇到超容量文档，新图会过滤，因而即使资产相同也不得静默复用v1游标。
+  upstream map同步迁移方式：旧实现精确恢复，或新实现显式重启数据迭代。
+- 数据专项577 passed、479 warnings，14.21s，退出0，/tmp/llmtuner-data-213.log；
+  完整CPU3832 passed、4 skipped、706 warnings，46.54s，退出0，
+  /tmp/llmtuner-cpu-213.log。适用全文件pre-commit通过（排除受保护文件及外部
+  moonep/prompt），/tmp/llmtuner-hooks-213.log；compileall、HEAD diff check通过。
+- 下一步继续检查文本FirstFit在batch<context时的分块上限及对应游标语义。
+  本批没有通信/布局修改，未新增硬件并行验证；多模态完整模型新进程续训仍不由
+  此数据层修复证明。
+
+### 第214批：文本FirstFit分块容量与游标语义修复
+
+- TEXT-PACK-BUDGET-214：文本FirstFit原先仅按context分块，context16/batch8
+  的11token文档在max_num_documents=None/1均触发Grain容量异常。现按
+  min(context,row capacity)切块，保留所有input/labels及padding语义，采用
+  文本可分块契约，不照搬多模态整文档过滤。修复前2 failed、6 passed，
+  /tmp/llmtuner-text-before-214.log，退出1。
+- 扩展finite packing回归，对concat/first-fit、document cap None/1和context4/16
+  精确核对全部11个目标与有效token数，batch恒为8；新增生产factory恢复测试，
+  context16/batch8，新loader加载完整状态后连续三批与source精确一致。
+- 文本FirstFit identity新增bounded-first-fit-v1；历史指纹拒绝，目标完整状态与
+  下一批保持不变。此版本保守失效所有旧FirstFit游标，迁移方式见upstream map。
+  ConcatThenSplit不受本次fingerprint变化影响。
+- 新恢复测试初次因缺少局部json导入失败，Ruff同样捕获F821，日志
+  /tmp/llmtuner-data-214.log、/tmp/llmtuner-hooks-214.log保留；修复测试导入后
+  定向9 passed，1.81s，/tmp/llmtuner-text-final-214.log，退出0。
+  第一轮全CPU3836 passed、4 skipped（未收集新增恢复用例），
+  /tmp/llmtuner-cpu-214.log。最终全CPU3837 passed、4 skipped、913 warnings，77.72s，
+  /tmp/llmtuner-cpu-final-214.log，退出0。compileall、HEAD diff check通过。
+- 适用全文件pre-commit最终通过，/tmp/llmtuner-hooks-final-214.log；排除受保护
+  文件及外部moonep/prompt。核对Grain实际FlatMapIterDataset只使用flat_map，不
+  应将MapDataset的max_fan_out限制误报为本路径问题。无新增通信/硬件验证。
+
+### 第215批：生产文本FirstFit图的分布式DCP身份拒绝
+
+- 扩展grain_checkpoint_preflight.py first_fit模式，生产corpus_data_identity
+  对照仅移除text_packing的历史指纹；先在预tokenized图验证，退出0，
+  /tmp/llmtuner-firstfit-dcp-215.log（port30254）。随后使用实际build_dataloader、
+  本地JSONL、真实tokenizer/processor/FirstFit图，context16、batch8、DP2；
+  构造时核对loader实际batch_layout指纹，未用手工替换loader状态绕过factory。
+- 命令：PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2
+  --master_addr=127.0.0.1 --master_port=30255
+  tests/integration_tests/grain_checkpoint_preflight.py first_fit。
+  最终退出0，/tmp/llmtuner-firstfit-factory-dcp-215.log。DDP/native/custom FSDP
+  各覆盖all/rank0/rank1不匹配，实际DCP保存、预校验拒绝，模型/optimizer/
+  scheduler/EMA/loader状态及Python/NumPy/Torch RNG精确不变；下一批和barrier正常。
+- 历史图不执行，只模拟旧语义指纹；模型update使用既有runtime的独立输入，
+  不是FirstFit batch驱动的完整模型续训。无拓扑变化或GPU/NPU证据。
+- 本批仅测试与文档修改，复用214批相同生产实现完整CPU3837 passed、4 skipped。
+  受影响脚本pre-commit通过，/tmp/llmtuner-hooks-215.log。修改共享脚本后还复跑
+  默认malformed-cursor模式，退出0，port30256，
+  /tmp/llmtuner-preflight-default-215.log；三种backend的all/rank0/rank1均通过。
+  compileall、HEAD diff check通过。
+
+### 第216批：真实FirstFit数据驱动的CLI新进程续训
+
+- 扩展cli_checkpoint_equivalence.py first_fit模式：本地JSONL真实caption token，
+  生产tokenizer/processor/FirstFit/loader、Trainer更新与DCP恢复。每文档31词，
+  加BOS/EOS后32个shifted targets，context8下完整8token块，保留原脚本精确
+  ntokens_seen oracle，不通过放宽计数断言适配测试。
+- 首次dp2 custom ac first_fit失败：默认多文档block_causal被CPU SDPA明确拒绝，
+  不是数值错误。/tmp/llmtuner-cli-firstfit-216.log及artifact
+  /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-cli-resume-x0b6uvlw
+  保留。first_fit CPU模式显式max_num_documents=1，实际单文档chunk row契约
+  允许causal attention，未伪造block mask或宣称多文档注意力已验证。
+- 最终命令：PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  LLMTUNER_TEST_MASTER_PORT=30260 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0
+  python tests/integration_tests/cli_checkpoint_equivalence.py dp2 custom ac first_fit。
+  日志/tmp/llmtuner-cli-firstfit-final-216.log，退出0；连续3步对照初始2步后
+  新进程恢复至3步，最终完整语义checkpoint状态精确一致（零容差）。
+  artifact /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-cli-resume-c5gv9_8u。
+  未新增恢复后首个更新前的完整状态比较，不能用最终一致替代该边界验收。此例为DPshard2、
+  custom FSDP、full AC、eager、无EMA/compile；context8/batch8，批容量小于context
+  的边界另见214/215批，不把本例算作该边界生产CLI覆盖。
+- 修正tests/data_fixtures.py过时docstring：多模态基础词表标记已可由wrapper注册，
+  不再声称只在added_tokens_decoder中可见。本批无生产修改，CPU完整测试复用
+  214批3837 passed、4 skipped。受影响文件pre-commit通过，
+  /tmp/llmtuner-hooks-final-216.log；HEAD diff check通过。
+
+### 第217批：FirstFit真实训练的完整加载边界与编译续训
+
+- trainer_ema_process_resume.py新增first_fit模式：自动构造本地JSONL和真实
+  tokenizer，worker选择生产FirstFit；每文档16词加EOS、无BOS，形成16个
+  shifted目标，context8切为两个完整块，不放宽既有ntokens_seen精确oracle。
+  corpus默认模式不变；first_fit仍使用max_num_documents=1以符合CPU SDPA契约。
+- 实际运行：PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py first_fit dp2 custom
+  compile ac validate async。父进程另设置LLMTUNER_TEST_MASTER_PORT=30263，
+  但此脚本实际使用c10d动态端口（rdzv_endpoint=127.0.0.1:0），不将该环境变量
+  记为实际端口。/tmp/llmtuner-firstfit-boundary-217.log，最终退出0。
+- DPshard2、custom fine-grained FSDP真实runtime、full AC、aot_eager whole-model
+  compile、EMA每2步更新、每步两批validation、异步中间DCP。连续4步对照初始2步
+  后新进程恢复至4步：逐rank完整model/optimizer/scheduler/EMA/train_state/
+  dataloader/RNG及local DTensor shards，在恢复后首次更新前和最终状态均零容差
+  精确一致；validation前后状态保持契约。artifact：
+  /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-gfmokmkn。
+- 此例context8/batch8，不代替小batch边界、多文档attention、PP/TP/EP组合或
+  GPU/NPU内核验证。生产代码未变，复用214批CPU3837 passed、4 skipped。
+  受影响脚本pre-commit通过，/tmp/llmtuner-hooks-217.log；compileall、HEAD
+  diff check结果随本批交付核对。
+
+### 第218批：多模态标记角色重复的构造校验
+
+- MM-TOKEN-ROLE-218：阅读tokenizer/multimodal.py、multimodal/collator.py及
+  mrope.py的token-ID识别。原构造允许不同字段使用相同字符串；image/video重复
+  时MRoPE同一run同时计入两种媒体，pad与vision重复时padding可被识别为视觉
+  token，边界与image重复也会被当作视觉内容。不能以各字符串单独原子编码通过
+  证明角色可区分。
+- 构造新增五种字符串互异校验，注册规则前拒绝歧义；更新类契约及upstream map。
+  有效配置token流不变，无额外游标版本变化。非法旧配置须匹配模型实际词表，
+  不通过重分配既有ID迁移。
+- 新增全部10种两两重复回归，修复前10 failed（未抛异常），退出1，
+  /tmp/llmtuner-marker-before-218.log。完整CPU修复后3847 passed、4 skipped、835 warnings，42.20s，
+  /tmp/llmtuner-cpu-218.log，退出0。
+- 适用全文件pre-commit通过，/tmp/llmtuner-hooks-218.log，排除受保护文件及
+  外部moonep/prompt；compileall、HEAD diff check通过。下步继续核对不同字符串
+  但底层资产ID别名的拒绝边界，以及剩余训练/并行审查项。
+
+### 第219批：确认并修复不同标记字符串的底层ID别名
+
+- MM-TOKEN-ID-219：直接编辑tokenizer.json model.vocab，将video标记ID设置为
+  image标记ID，但保留两个不同字符串。真实Tokenizer.from_file同时返回两个
+  字符串的相同ID，MultimodalTokenizer原先接受，原子编码检查也通过。因此
+  第218批字符串互异校验不足以证明下游角色可区分。
+- 新回归先断言后端两种标记均存在且ID相同，再要求构造拒绝。修复前明确
+  DID NOT RAISE，/tmp/llmtuner-alias-before-219.log，退出1。初始诊断采用
+  backend.save时后端会丢弃一个别名，变成缺失token错误，故正式回归直接编辑
+  资产，避免用不同失败机制充当证据。
+- 生产实现注册AddedToken前校验五个ID互异，损坏资产明确报错；不自动重新
+  分配ID或改变模型词表。有效配置token流不变，无额外游标版本变化。上游
+  适配文档同步契约。完整CPU修复后3848 passed、4 skipped、984 warnings，93.74s，
+  /tmp/llmtuner-cpu-219.log，退出0。
+- 适用全文件pre-commit通过，/tmp/llmtuner-hooks-219.log，排除受保护文件和
+  外部moonep/prompt；compileall、HEAD diff check通过。本批不涉及通信变换，
+  未新增分布式测试；下一步回到训练入口失败协调与剩余模块审查。
+
+### 第220批：checkpoint保存后日志失败的跨rank协调
+
+- TRAINER-CHECKPOINT-REPORT-220：train正常step保存后logger.info在协调区间外。
+  对单rank注入日志OSError，owner离开训练，peer继续至profiler协调，最终两侧
+  Gloo 10000ms timeout。实际两rank失败日志/tmp/llmtuner-report-before-220.log，
+  退出1；不能把日志“通常不抛错”当成失败传播保证。
+- 修复正常step先完成checkpointer.save，再让全部rank进入Training checkpoint
+  reporting本地错误协调，区间只执行日志、不含save collective。故障rank保留
+  原异常实例，peer获得精确边界错误，避免进入后续validation/step collective。
+- 扩展training_profiler_coordination.py，在真实Trainer.train/Profiler/GC下增加
+  report×rank0/rank1×OSError/KeyboardInterrupt/SystemExit六种故障，连同既有
+  profiler/GC共30种情况；step计算与checkpoint IO仍替身。验证step、save次数、
+  checkpointer/metrics/profiler关闭、自动GC恢复及后续barrier。port30267实际
+  torchrun两rank退出0，/tmp/llmtuner-report-after-220.log。
+- 第一轮pre-commit捕获测试期望消息过长E501，保留/tmp/llmtuner-hooks-220.log；
+  改为清晰的boundary变量后适用全文件pre-commit通过，
+  /tmp/llmtuner-hooks-final-220.log。完整CPU3848 passed、4 skipped、823 warnings，42.07s，
+  /tmp/llmtuner-cpu-220.log，退出0；compileall、HEAD diff check通过。
+- 尚待继续复核：恢复成功日志、数据耗尽warning及提前终止保存日志同类边界；
+  不宣称当前修复覆盖这些路径。上游适配说明同步，未改变checkpoint格式。
+
+### 第221批：恢复与耗尽报告失败协调及取消step计数
+
+- TRAINER-REPORT-221：恢复成功logger.info在首个输入协调之前，单rank日志故障
+  使peer进入错误边界后等待超时；新增真实两rank复现，port30268退出1，
+  /tmp/llmtuner-report-before-221.log。数据耗尽warning和提前结束保存结果日志
+  同样缺少局部错误协调；warning还位于self.step回退之前，失败时留下取消step。
+- load返回后全部rank进入Training resume reporting；耗尽时先回退取消step，
+  再进入Training exhaustion reporting；提前结束save返回后进入Training
+  exhausted checkpoint reporting。load/save保持在本地区间外，避免collective
+  嵌入局部错误协调。正常保存报告维持220批边界。
+- training_profiler_coordination.py新增三种报告phase，共新增18种rank/异常
+  组合，连同原有共48种。step/save IO为替身，真实Trainer循环/GC/Profiler。
+  每种检查owner原异常身份、peer精确报告错误、取消step回退、save次数、资源
+  清理、GC恢复和后续barrier。实际port30269两rank全部通过，退出0，
+  /tmp/llmtuner-report-after-221.log。恢复替身只返回True，不代替真实DCP加载。
+- 全文件适用pre-commit通过，/tmp/llmtuner-hooks-221.log；排除受保护文件和
+  外部moonep/prompt。完整CPU3848 passed、4 skipped、711 warnings，42.62s，
+  /tmp/llmtuner-cpu-221.log，退出0；compileall、HEAD diff check通过。无checkpoint格式变化，上游适配
+  说明同步。下一步继续检查组件内部初始化及结束日志的失败传播边界。
+
+### 第222批：训练报告协调改动后的真实恢复回归与加载边界续审
+
+- 对220/221批Trainer报告协调的最终生产实现执行真实训练正常路径回归：
+  PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0
+  python tests/integration_tests/trainer_ema_process_resume.py first_fit dp2 custom
+  compile ac validate async。动态c10d端口；退出0，
+  /tmp/llmtuner-firstfit-report-regression-222.log。DPshard2/custom FSDP/full AC/
+  aot_eager/EMA/逐步验证/异步中间保存，真实FirstFit数据，连续4步对照2步后
+  新OS进程恢复至4步，逐rank加载后首次更新前及终态完整state零容差一致。
+  artifact /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-078blvrt。
+  本次有实际保存及恢复日志，验证新增报告边界未破坏正常完整恢复契约。
+- 续读checkpointer/base.py::load及Trainer.close。CKPT-LOAD-LOCAL-222（待确认）：
+  load源一致性all_gather之后、_load_checkpoint之前的logger.info，以及加载后
+  GarbageCollection.collect/结束logger.info均不在本地错误协调区间；源码显示
+  它们可在进入/离开加载collective边界时发生rank本地异常。尚未通过两rank注入
+  复现，不将候选等同确认缺陷。下一动作复用checkpoint_save_coordination的
+  真实manager/存储，分别注入开始日志、结束GC、结束日志，检查状态与后续barrier。
+- 本批仅新增审查记录，生产无变化；复用221批完整CPU3848 passed、4 skipped及
+  全文件适用pre-commit证据。新文档按范围检查，HEAD diff check通过。既有
+  多文档attention、设备内核及开放数值差异仍未因此关闭。
+
+### 第223批：真实DCP加载的本地报告与GC故障修复
+
+- CKPT-LOAD-LOCAL-222：已确认并修复。新增checkpoint_load_coordination.py，
+  真实DCP manager、Linear、已更新AdamW和scheduler、本地checkpoint。加载开始
+  日志单rank故障修复前导致peer未得到协调错误，另一侧barrier超时，port30270
+  退出1，/tmp/llmtuner-load-before-223.log。
+- BaseCheckpointManager.load开始报告、加载后GC、结束报告分别加入本地错误
+  协调，实际_load_checkpoint保持区间外；不将后端通信包入本地协调。
+  开始报告失败时未调用真实reader且model/optimizer/scheduler仍为加载前状态；
+  加载后GC/报告失败时reader已完成，三个状态精确等于保存值，不伪称事务回滚。
+- port30271真实两rank测试3phase×2rank×3异常（OSError/KI/SystemExit），18种
+  均通过，owner原异常身份、peer精确边界消息、状态与reader次数、后续barrier
+  及每次真实load重试均验证。/tmp/llmtuner-load-after-223.log，退出0。
+  未包含FSDP/TP等变换、EMA/数据/RNG，这些仍由其他专项证据覆盖。
+- 新脚本初次静态检查发现闭包B023与消息E501，修正参数绑定与消息换行；适用
+  全文件pre-commit最终通过，/tmp/llmtuner-hooks-223.log，排除受保护文件与
+  外部moonep/prompt。完整CPU3848 passed、4 skipped，最终统计见
+  /tmp/llmtuner-cpu-223.log，退出0；compileall、HEAD diff check通过。新增脚本不由pytest自动收集。
+- upstream map同步失败边界：不提供后端reader中途失败回滚，不能据此宣称通信
+  故障后可复用进程组。下一步继续清理异常时原始错误与资源所有权的审查。
+
+### 第224批：清理日志失败不得中断资源释放或掩盖主异常
+
+- TRAINER-CLEANUP-REPORT-224：Trainer.close在资源关闭异常后直接logger.exception，
+  sink再失败会跳过后续loader/GC释放并掩盖首个关闭错误；train finally的清理
+  报告也能替换已有训练异常。先记录首个关闭错误，再尽力报告并继续全部释放；
+  train保留已有训练异常，日志失败不替换它。失败资源所有权和重试规则不变。
+- 新增6种回归，覆盖logger抛OSError/KI/SystemExit×close/train两条路径，检查
+  主异常实例身份、后续释放顺序、失败metrics保留及成功资源清空。修复前日志
+  /tmp/llmtuner-cleanup-before-224.log：OSError用例失败，KI使pytest中断，退出2。
+  修复后trainer专项152 passed、33 warnings，12.12s，
+  /tmp/llmtuner-trainer-224.log。只在已有异常处理报告处抑制日志故障。
+- 全文件适用pre-commit通过，/tmp/llmtuner-hooks-224.log（排除受保护文件及
+  外部moonep/prompt）。完整CPU3851 passed、4 skipped，/tmp/llmtuner-cpu-224.log，退出0；
+  新增第二组3例在专项中通过，未被该轮完整测试收集；compileall和diff check通过；本批为本地清理逻辑，无新增collective。
+  后续需继续检查CLI和其他组件的同类二次异常处理边界，不能以Trainer修复替代。
+
+### 第225批：CLI清理报告失败保留主异常
+
+- CLI-CLEANUP-REPORT-225：cli.main的resource/group cleanup异常报告能再次抛错，
+  替换已有训练错误或首个关闭错误。新增primary=train/close×logger抛OSError/
+  KI/SystemExit六例，检查原异常实例和destroy调用；修复前OSError两例失败，
+  /tmp/llmtuner-cli-before-225.log，退出1。
+- 两处异常报告改为尽力执行，已有主异常保持传播，finally仍尝试销毁进程组。
+  正常路径无主错误时close/destroy错误继续直接传播，不吞掉实际清理故障。
+  测试使用CLI真实编排和替身Trainer/group，不代替真实分布式销毁验证。
+- 本批完整CPU3860 passed、4 skipped，/tmp/llmtuner-cpu-225.log，退出0；
+  覆盖224批后补用例。适用全文件pre-commit通过，/tmp/llmtuner-hooks-225.log，
+  排除受保护文件和外部moonep/prompt；compileall、HEAD diff check通过。无持久化格式
+  或collective顺序变化；下一步继续检查构造失败清理和组件自己的异常报告。
+
+### 第226批：构造清理报告的第三次异常保留装配错误
+
+- TRAINER-CONSTRUCTION-REPORT-226：构造assembly失败后close也失败，外层
+  logger.exception再次异常会替换assembly原始错误。新增三种日志故障回归
+  （OSError/KI/SystemExit），检查assembly原异常实例及后续metrics释放。
+  修复前OSError用例失败，/tmp/llmtuner-constructor-before-226.log，退出1。
+- Trainer.__init__清理报告改为尽力执行，保持外层bare raise对应原装配异常；
+  close仍释放剩余资源，不改execution/compile设置回滚上下文。正常路径日志
+  行为不受影响，未新增包装函数或拆分trainer。
+- 适用全文件pre-commit通过，/tmp/llmtuner-hooks-226.log，排除受保护文件与
+  外部moonep/prompt；完整CPU3863 passed、4 skipped、728 warnings，50.25s，
+  /tmp/llmtuner-cpu-226.log，退出0；compileall、HEAD diff check通过。该回归替身装配阶段，不代替真实
+  多rank部分初始化或设备资源清理验证。下一步继续审查其他组件的异常释放。
+
+### 第227批：Profiler清理报告故障不得跳过内存资源释放
+
+- PROFILER-CLEANUP-REPORT-227：真实Profiler.__exit__在trace关闭异常后直接日志，
+  sink再异常会跳过OOM snapshot与memory.close，并替换原错误。新增六例
+  report=OSError/KI/SystemExit×普通退出/OOM，检查首个trace错误身份、OOM保留、
+  snapshot失败后仍关闭memory及清理顺序。修复前OSError两例失败，退出1，
+  /tmp/llmtuner-profiler-before-227.log。
+- trace/snapshot/memory关闭及部分启动trace清理四处异常报告改为尽力执行，
+  继续原清理与资源重试契约；正常路径日志行为不变。新故障注入只覆盖exit
+  路径，部分启动日志故障还需专门覆盖，不用源码同构替代验证。
+- 完整CPU3869 passed、4 skipped、716 warnings，42.88s，
+  /tmp/llmtuner-cpu-227.log，退出0；compileall、HEAD diff check通过。适用全文件pre-commit通过，/tmp/llmtuner-hooks-227.log，
+  排除受保护文件及外部moonep/prompt；两rank真实Trainer/Profiler报告协调
+  回归port30272全部48场景通过，退出0，
+  /tmp/llmtuner-profiler-coordination-227.log。新单测memory后端为替身，无GPU allocator证据。
+
+### 第228批：Profiler部分启动的日志故障专项证据
+
+- 补齐227批未覆盖分支：新增trace.__enter__失败、trace.__exit__再次失败、
+  logger.exception再抛OSError/KI/SystemExit三例，走真实Profiler.__enter__与
+  build_torch_profiler编排。精确检查最初启动异常实例、start/stop/report顺序、
+  trace/memory引用清空与_entered恢复。底层trace替身，不声称实际GPU资源释放。
+- profiler完整专项74 passed、3 warnings，0.83s，退出0，
+  /tmp/llmtuner-profiler-228.log；受影响文件pre-commit通过，
+  /tmp/llmtuner-hooks-228.log。生产代码无变化，复用227批完整CPU3869 passed、
+  4 skipped的同实现证据。
+- 续读BaseCheckpointManager.close发现待确认CKPT-CLEANUP-REPORT-228：第二个
+  release失败时logger.exception位于live-future/stager保留检查之前。若日志再
+  失败，可能替换首个错误并跳过后续_close；尚需故障注入确认。下一步复用实际
+  manager验证多个release错误和日志错误的优先级、资源保留及close重试。
+
+### 第229批：checkpoint连续清理失败的日志优先级修复
+
+- CKPT-CLEANUP-REPORT-228已确认：staging失败后saving再次失败，错误日志再抛
+  OSError会替换首个ValueError并跳过_close。修复前定向失败，
+  /tmp/llmtuner-checkpoint-before-229.log，退出1。
+- BaseCheckpointManager.close追加失败报告改为尽力执行，继续live-future/stager
+  所有权检查和后续释放，保留首个错误；不改变未完成future时停止释放的规则。
+  新增logger抛OSError/KI/SystemExit三例，真实close编排、替身release，检查
+  原异常身份、完整调用顺序、初始化标记及重复close幂等。
+- 适用全文件pre-commit通过，/tmp/llmtuner-hooks-229.log，排除受保护文件和
+  外部moonep/prompt。完整CPU3875 passed、4 skipped、1037 warnings，81.67s，
+  /tmp/llmtuner-cpu-229.log，退出0；真实两rankcheckpoint_cleanup_retry（port30273）
+  退出0，/tmp/llmtuner-cleanup-retry-229.log；compileall、HEAD diff check通过。
+  该分布式回归用实际staging线程与group检验已有中断后资源保留契约，不代表
+  新增的双release+日志失败已在真实线程后端注入；两者证据范围分开。
+- DCP子类自身的additional cleanup日志与构造清理日志仍待审查，不能以base
+  修复覆盖它们。下一步确认子类资源关闭错误与日志错误叠加的行为。
+
+### 第230批：DCP子类追加清理日志保留首个错误
+
+- DCP-CLEANUP-REPORT-230：DCP._close在两个group destroy依次失败时，追加报告
+  再抛错替换首个资源错误。新增实际_close编排、替身group destroy三例，注入
+  logger的OSError/KI/SystemExit，检查两个group均尝试释放且首个错误实例保留。
+  修复前OSError失败，/tmp/llmtuner-dcp-before-230.log，退出1。
+- 两处additional DCP resource cleanup报告改为尽力执行；不改变正常释放或
+  stager失败时保留group的规则。第一个报告位置在现有分支下是否可达需继续
+  核对，当前专项仅覆盖group释放循环，不宣称两处均有动态覆盖。
+- DCP-GROUP-OWNERSHIP-230（待确认）：_close在destroy前将pg/staging_pg清空，
+  销毁失败后可能失去仍注册组的所有权；需真实进程组注入销毁调用前异常，确认
+  注册状态、可用性和重试，不以替身group测试证明真实资源泄露。
+- 完整CPU3878 passed、4 skipped、884 warnings，72.17s，
+  /tmp/llmtuner-cpu-230.log，退出0；适用全文件pre-commit通过，
+  /tmp/llmtuner-hooks-230.log；compileall、HEAD diff check通过。不涉及checkpoint格式变化。下一步
+  优先检查group销毁失败时的所有权及构造cleanup日志边界。
+
+### 第231批：DCP构造清理报告保留原始异常
+
+- DCP-CONSTRUCTION-REPORT-231：构造异常进入_close后，若清理再次失败且
+  logger.exception抛错，会替换原始构造异常。将报告改为尽力执行，保留原始异常实例。
+- 扩展真实单rank Gloo组构造回归，第二次new_group失败，实际_close释放已创建组后
+  注入清理错误，再分别注入日志OSError/KeyboardInterrupt/SystemExit。验证原始
+  构造异常身份、组注册已删除、默认组barrier可用；不代表真实后端shutdown故障。
+  修复前1 failed、1 passed后被KI中断，退出2，
+  /tmp/llmtuner-construction-before-231.log。
+- 完整CPU3881 passed、4 skipped、709 warnings，43.13s，退出0，
+  /tmp/llmtuner-cpu-231.log；适用全文件pre-commit、compileall、HEAD diff检查通过，
+  /tmp/llmtuner-hooks-231.log。未改checkpoint持久化格式，未commit/push。
+- DCP-GROUP-OWNERSHIP-230仍开放：当前PyTorch2.14子组destroy先shutdown再删除
+  注册，注册存在不能证明后端尚可用。下一步用真实两rank组区分调用前异常和
+  shutdown中断，检验所有权与重试边界，不能无条件重试已部分销毁的组。
+
+### 第232批：DCP销毁前失败保留真实进程组所有权
+
+- DCP-GROUP-OWNERSHIP-230：真实双rank Gloo复现destroy调用前异常后manager.pg
+  丢失，修复前port30274退出1，/tmp/llmtuner-group-before-232.log。
+- _close按字段逐个销毁，仅成功或失败后确认注册已移除时清空引用；仍注册时保留
+  所有权。base.close在子类仍持有stager/pg/staging_pg时保留初始化状态。
+  不改变其他组继续释放、首个异常保留和追加日志尽力执行规则。
+- checkpoint_cleanup_retry新增9场景（全部/rank0/rank1 × OSError/KI/SystemExit），
+  注入真实destroy调用前异常，检查原始异常身份、manager状态、注册、真实组
+  all_reduce结果3、重试仅销毁一次、重复close无操作及注册移除。与原9个真实
+  stager executor中断场景同跑，port30275退出0，/tmp/llmtuner-group-after-232.log。
+- 边界：注册存在不证明部分shutdown后的通信可恢复；此类故障保留所有权以供
+  诊断，可能需要进程退出。不宣称通信故障恢复，CUDA/NCCL未验证。
+- 完整CPU3881 passed、4 skipped、722 warnings，41.80s，退出0，
+  /tmp/llmtuner-cpu-232.log；适用全文件hooks、compileall和HEAD diff检查通过，
+  /tmp/llmtuner-hooks-232.log。未commit/push。
+
+### 第233批：DCP销毁完成后异常的双组边界验证
+
+- DCP-GROUP-COMPLETED-233：扩展checkpoint_cleanup_retry，使用实际两个Gloo组，
+  原始destroy完成后再注入异常。覆盖staging_pg/pg × 全部/rank0/rank1 ×
+  OSError/KI/SystemExit，共18新增场景。检查原始异常身份、两组均尝试销毁、
+  两引用均清空、注册删除、重复close不再次destroy，以及默认组barrier。
+- 与原18个stager中断/销毁前失败场景同跑，共36场景；
+  PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --master_port=30276
+  --nproc_per_node=2 tests/integration_tests/checkpoint_cleanup_retry.py，退出0，
+  /tmp/llmtuner-group-completed-233.log。生产代码无需调整。
+- 仅新增集成测试与台账；完整CPU复用同一生产实现第232批3881 passed/4 skipped
+  证据。本批不覆盖shutdown中途部分关闭、真实通信故障或CUDA/NCCL。
+- 本批pre-commit首次发现输出字符串超长，缩短后最终全部通过，
+  /tmp/llmtuner-hooks-final-233.log；HEAD diff检查通过。
+- 下一步继续检查异步保存等待及purge线程生命周期；全局审查仍未完成。
+
+### 第234批：purge后台日志失败不终止后续保留策略
+
+- PURGE-REPORT-234：purge_thread在删除前/后日志、删除失败warning或退出日志
+  抛错时终止；后续任务与退出哨兵可能留在队列。四处报告改为尽力执行，维持
+  既有删除Exception跳过策略，不改变删除操作自身BaseException的传播。
+- 新增真实daemon线程、queue和临时目录12例（四个位置 × OSError/KI/SystemExit），
+  检查无线程错误、后续目录实际删除、失败目录保留、退出哨兵消费和线程结束。
+  修复前12 failed，退出1，/tmp/llmtuner-purge-before-234.log；不涉及remote后端。
+- 本批适用全文件pre-commit、compileall、HEAD diff检查通过，
+  /tmp/llmtuner-hooks-234.log。完整CPU3893 passed、4 skipped、951 warnings，
+  71.48s，退出0，/tmp/llmtuner-cpu-234.log；未commit/push。
+- 下一步检查async completion callback的日志失败是否影响上游Future完成，
+  以及purge线程join中断后生命周期；不以本批覆盖所有后台失败。
+
+### 第235批：异步保存完成日志不向worker传播中断
+
+- DCP-CALLBACK-REPORT-235：log_save_completion的日志KI/SystemExit经Future回调
+  传播到执行完成通知的worker。将该纯报告回调改为尽力执行；Future状态及主线程
+  maybe_wait_for_saving对原始上传异常/取消的处理保持完整。
+- 新增真实Future和ThreadPoolExecutor九例（成功/失败/取消 × OSError/KI/SystemExit），
+  实际manager.save注册回调，写入方法返回可控Future；检查通知任务不抛错、后续
+  executor任务可完成、报告一次、原始上传错误身份/取消状态、等待后future清空。
+  修复前6 failed/3 passed，/tmp/llmtuner-callback-before-235.log，退出1；
+  普通OSError已被Future拦截，新增修复针对BaseException逃逸，不宣称六例证明真实
+  DCP subprocess死亡。初始KI直传播试跑退出2后改成显式捕获以完成全部场景。
+- 完整CPU3902 passed、4 skipped、694 warnings，47.72s，退出0，
+  /tmp/llmtuner-cpu-235.log。真实新进程恢复命令：PYTHONPATH=.
+  GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py first_fit dp2 custom compile ac
+  validate async，退出0，/tmp/llmtuner-ema-async-235.log；artifact
+  /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-0vbsk27w。
+  实际DP2/custom FSDP/compile/AC/EMA/validation/async保存，新进程更新前完整状态及
+  续训后状态精确一致。此正常流程回归不含日志故障注入，不替代目标设备验证。
+- 适用全文件hooks、compileall、HEAD diff通过，/tmp/llmtuner-hooks-235.log。
+  未commit/push；下一步核查purge join中断后的所有权与重试。
+
+### 第236批：purge join普通异常保留关闭重试
+
+- PURGE-JOIN-236：DCP._close的purge join抛普通异常时，若无stager/group，base.close
+  会清除_initialized，即使实际删除线程仍活着，后续close不能等待它。base增加
+  活purge线程检查，在关闭失败时保留初始化状态；不改变正常join或其他资源释放。
+- 新增实际manager保留线程、Event阻塞实际目录删除、join故障三例。检查原始异常
+  身份、活线程与manager所有权、解除阻塞后close等待完成、目录删除及重复close。
+  初始fixture keep_latest_k=1被配置正确拒绝，3失败日志
+  /tmp/llmtuner-purge-join-before-236.log；改为合法2后，修复前1 failed/2 passed，
+  /tmp/llmtuner-purge-join-valid-before-236.log，退出1。普通OSError暴露缺陷，
+  KI/SystemExit原路径已保留状态；未声称真实信号中断thread.join的CPython行为。
+- 全文件hooks首轮仅格式化新增测试的空行，复核后相关hooks通过，
+  /tmp/llmtuner-hooks-final-236.log；compileall、HEAD diff通过。完整CPU
+  3905 passed、4 skipped、672 warnings，43.69s，退出0，/tmp/llmtuner-cpu-236.log。
+- 后续继续审查其他checkpoint实现资源所有权与训练调用链；未commit/push。
+
+### 第237批：torch_checkpointing关闭编排保留首个错误
+
+- TC-CLOSE-FIRST-237：_close嵌套finally使保存等待错误被join或backend.close错误
+  替换。改为逐项尝试，保留首个异常，追加错误日志尽力执行；仍尝试全部释放。
+- 新增三例（ValueError/KI/SystemExit首错），实际_close编排配替身等待、线程和后端，
+  检查首错实例与wait/sentinel/join/close顺序。修复前三例失败，退出1，
+  /tmp/llmtuner-backend-close-before-237.log。不宣称真实后端线程/通信故障恢复。
+- 首轮hooks格式化超长logger行，复核后全文件hooks通过，
+  /tmp/llmtuner-hooks-final-237.log；compileall、HEAD diff通过；完整CPU
+  3908 passed、4 skipped、670 warnings，42.28s，退出0，/tmp/llmtuner-cpu-237.log。
+- TC-BACKEND-OWNERSHIP-237（待确认）：_manager.close普通异常后backend是否仍活，
+  base.close能否重试，需从实际兼容上游资源状态与真实运行确认，不以替身证明。
+  未commit/push，全局审查未完成。
+
+### 第238批：真实可选后端关闭失败后不可重试的上游证据
+
+- TC-BACKEND-OWNERSHIP-237由待确认转为已复现开放缺陷。固定兼容上游
+  dcbb3a59cfad1cbeb95994f0d6cb1802c1d91825，checkpoint_manager.py:319–335在
+  saver.close前设置_closed=True，失败后公开close直接返回。
+- /tmp/llmtuner_optional_cleanup_238.py构造真实TorchCheckpointingManager与异步
+  staging executor，实际线程任务完成后，仅注入executor.shutdown调用前OSError。
+  检查原始异常身份、backend._closed=True、外层_initialized=False、线程仍存活，
+  外层/上游公开close重试后线程仍活且可执行新任务。诊断finally直接调用实际
+  saver/loader/metadata.close清场，确认线程全退出；未改依赖或生产实现。
+- 命令PYTHONPATH=.:/tmp/llmtuner-torch-checkpointing-upstream-162 python
+  /tmp/llmtuner_optional_cleanup_238.py，退出0，
+  /tmp/llmtuner-optional-cleanup-final-238.log。首次诊断缺main guard引起spawn重复
+  执行及bootstrap警告，旧日志/tmp/llmtuner-optional-cleanup-238.log不作为清场证据；
+  添加guard后最终单次诊断完成，无该警告。CPU忽略pin_memory警告符合设备限制。
+- 解除条件：兼容上游公开close可逐资源保留失败状态，实际线程/子进程/通信故障
+  下验证重试及完整释放。不能只保留外层_initialized、重置上游私有_closed，或
+  将诊断私有清场搬到生产作为恢复承诺。文档明确当前失败后需退出进程。
+- 本批仅诊断和文档，完整CPU复用同生产实现第237批3908 passed/4 skipped；
+  全局审查仍有其他可执行项，不将此上游限制标记为整个目标阻塞。未commit/push。
+
+### 第239批：可选后端构造与临时reader错误报告边界
+
+- TC-CLEANUP-REPORT-239：构造失败清理和temporary_backend_manager操作失败清理的
+  logger.exception仍可能覆盖原始错误。两处日志尽力执行；成功操作后单独close
+  失败仍传播，不改变上游close资源恢复能力。
+- 扩展既有构造四例和临时load/save六例，分别加入无报告故障/OSError/KI/SystemExit，
+  共40例，新增30例；保留原始错误身份、close次数、构造guard以及仅close失败契约。
+  修复前仅OSError报告专项6 failed/4 passed，退出1，
+  /tmp/llmtuner-optional-reports-before-239.log；测试使用后端替身，不冒称真实IO故障。
+- 同固定兼容上游复跑真实同步subset/full reader恢复，命令
+  PYTHONPATH=.:/tmp/llmtuner-torch-checkpointing-upstream-162 python
+  /tmp/llmtuner_optional_success_163.py，退出0，/tmp/llmtuner-optional-success-239.log。
+  模型完整恢复精确一致；保留上游storage配置未来变更警告，不代表多rank或异步验收。
+- 全文件hooks首次只格式化测试内嵌函数空行，复核后相关hooks通过，
+  /tmp/llmtuner-hooks-final-239.log；compileall、HEAD diff通过。完整CPU
+  3938 passed、4 skipped、758 warnings，42.85s，退出0，/tmp/llmtuner-cpu-239.log。
+- TC-BACKEND-OWNERSHIP-237和TC-CUDA-METADATA-164保持开放；下一步回到训练
+  主链的状态更新与异常边界，未commit/push。
+
+### 第240批：scheduler更新失败在EMA/指标前协调退出
+
+- TRAINER-SCHEDULER-COORD-240：optimizer.step后scheduler.step本地错误未协调，
+  peer进入EMA/指标collective。内置LambdaLR仅本地更新，在Training scheduler
+  update区间协调错误；optimizer hooks仍在区间外，不包含collective。
+- 新增真实DP2/native FSDP Trainer、AdamW、EMA与指标生产路径脚本
+  training_update_coordination.py；仅替换scheduler故障调用，覆盖rank0/rank1 ×
+  OSError/KI/SystemExit。检查owner原错、peer协调报错、EMA精确未变、两rank AdamW
+  已更新一次、scheduler在owner为0/peer为1、默认组barrier可用。
+  明确不是事务回滚；更新已提交且scheduler可能部分推进，必须完整恢复后再训练。
+- 初始port30277/30278遭遇旧Inductor PCH缓存失效，未触达目标故障，日志
+  /tmp/llmtuner-update-before-240.log和/tmp/llmtuner-update-diagnostic-240.log。
+  加TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0后，port30279修复前退出1，
+  peer的EMA发生变化，owner Gloo等待10秒超时，/tmp/llmtuner-update-valid-before-240.log。
+  修复后port30280六例全部通过，退出0，/tmp/llmtuner-update-after-240.log。
+- 全文件hooks首轮格式化脚本及发现超长输出，缩短后相关hooks通过，
+  /tmp/llmtuner-hooks-final-240.log；compileall、HEAD diff通过。完整CPU3938 passed、
+  4 skipped、904 warnings，80.56s，退出0，/tmp/llmtuner-cpu-240.log。
+- 正常路径新进程恢复：PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py first_fit dp2 custom compile ac
+  validate async，退出0，/tmp/llmtuner-ema-update-240.log；artifact
+  /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-jw7rvuz8。
+  更新前完整状态和连续训练对照终态精确一致；不代表失败后部分状态可直接续训。
+  未commit/push。
+- 下一步审查EMA更新自身的失败边界，先确认DTensor foreach是否可能引入通信，
+  不把该步骤未经分析放入本地错误协调区间；硬件与多轴缺口仍开放。
+
+### 第241批：EMA固定布局、本地更新和失败协调
+
+- EMA-LAYOUT-241：tracked_averages仅检查全局shape/dtype/device，接受相同shape的
+  Shard参数与Replicate平均值。真实双rank探针/tmp/llmtuner_ema_layout_241.py，
+  port30281退出0，两rank均接受错误布局并各计一次隐式collective，
+  /tmp/llmtuner-ema-layout-before-241.log。有效相同布局基线计数0。
+- 增加DTensor类型、mesh、placements及本地shape校验；保持平均值DTensor与持久化
+  格式，线性EMA更新直接操作已匹配本地存储，显式不发起通信。Trainer的EMA更新
+  使用独立Training EMA update错误协调区间；区间内无collective。
+- 新增ema_layout_equivalence真实两rank、长度1/5/8 × Shard/Replicate/Partial，
+  含空/不均匀shard，全部与完整张量加权参考精确一致，CommDebugMode更新计数0；
+  plain/DTensor及不匹配placements在修改前拒绝且计数0。初次参考fixture与
+  distribute_tensor输入别名导致参考随live更新，port30282退出1，
+  /tmp/llmtuner-ema-layout-after-241.log；改为更新前独立clone参考，不改容差后
+  port30284退出0，/tmp/llmtuner-ema-layout-final-241.log。
+- training_update_coordination扩展scheduler/EMA × rank0/rank1 × OSError/KI/SystemExit，
+  共12实际DP2/native FSDP/AdamW场景；owner EMA未变、healthy EMA失败阶段可已更新，
+  optimizer均已更新，scheduler进度符合阶段，peer收到协调异常并默认组barrier通过。
+  port30285退出0，/tmp/llmtuner-update-ema-final-241.log。EMA传播没有单独回退旧实现
+  动态复现，不以scheduler的旧失败日志代替；新测试验证当前控制流。
+- 完整CPU3938 passed、4 skipped、705 warnings，46.40s，退出0，
+  /tmp/llmtuner-cpu-241.log。正常first_fit dp2 custom compile ac validate async新进程
+  恢复退出0，/tmp/llmtuner-ema-resume-241.log；更新前完整状态/续训终态精确一致，
+  artifact /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-_uwfumlo。
+- hooks首轮修正脚本格式及超长行，最终相关hooks通过，
+  /tmp/llmtuner-hooks-final-241.log；compileall、HEAD diff通过。未commit/push。
+  CUDA/NPU及EMA多轴布局数值验证仍须独立补齐，不以1D CPU布局测试外推。
+
+### 第242批：EMA本地更新的TP/EP完整恢复复验
+
+- 续接241实现，生产代码不变。真实4rank完整Trainer分别运行DP2×TP2及
+  dense DP4/EP2/efsdp2；custom FSDP、MoE固定路由、aux0.03、full AC、aot_eager、
+  EMA动态调度、每step两批validation、async中间保存，比较新进程加载前完整状态
+  与连续训练终态及本地DTensor布局。三轴DP×TP×EP同时恢复脚本仍明确不支持，
+  不放宽其参数限制，也不拼接两场景声称三轴验收。
+- TP命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python
+  tests/integration_tests/trainer_ema_process_resume.py dp4 moe tp2 custom compile ac
+  validate async，退出0，/tmp/llmtuner-ema-tp-242.log；artifact
+  /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-aney957m。
+  此次尚未加入每次EMA通信计数，不将完整状态一致外推通信数为0。
+- 为实际EMA.step加入CommDebugMode，断言通信0并检查每个训练step确实调用EMA，
+  保留动态EMA独立公式、快照独立存储探针和恢复完整状态断言。EP同命令将tp2
+  替换ep2，退出0，/tmp/llmtuner-ema-ep-242.log；artifact
+  /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-2peoqr19。
+  每step实际EMA通信0，更新前完整状态与续训终态精确。相关hooks通过，
+  /tmp/llmtuner-hooks-242.log。
+- 本批仅测试与文档；完整CPU复用同一生产实现241批3938 passed/4 skipped。
+  不宣称设备性能、CUDA/NPU或拓扑变化恢复通过，未commit/push。
+
+### 第243批：训练步学习率快照与日志决策失败协调
+
+- TRAINER-SETUP-COORD-243：get_metrics/should_log本地异常后peer继续进入数据
+  同步。新增Training step reporting setup区间，仅读取本地内置scheduler指标与
+  日志决策，不含collective；optimizer.zero_grad和模型运算未移入区间。
+- training_update_coordination扩展至lr snapshot/log decision/scheduler/EMA四阶段，
+  rank0/rank1 × OSError/KI/SystemExit，共24真实DP2/native FSDP/AdamW/EMA场景。
+  准备阶段检查参数精确未变、optimizer步数未推进、scheduler为0、EMA精确未变；
+  更新后失败保持既有部分提交契约。所有场景原始错误身份/peer边界及barrier通过。
+- 修复前port30286退出1，peer错误边界不符、owner Gloo10秒超时，
+  /tmp/llmtuner-step-setup-before-243.log。修复后port30287退出0，
+  /tmp/llmtuner-step-setup-after-243.log。脚本不含恢复重试，失败后完整恢复要求不变。
+- 全文件hooks首轮格式化新断言并发现输出超长，缩短后相关hooks通过，
+  /tmp/llmtuner-hooks-final-243.log；compileall、HEAD diff通过。完整CPU
+  3938 passed、4 skipped、810 warnings，42.90s，退出0，/tmp/llmtuner-cpu-243.log。
+  未commit/push；下一步检查microbatch本地预处理与已有数据错误协调的边界。
+
+### 第244批：批次入口复核及验证loader报告失败保留原错
+
+- 复读runtime/batch.py全部实现，追踪Trainer.batch_generator/microbatch/preprocess/
+  forward_backward_step及PP调用。fetch、metric accounting、valid/routing token计数、
+  设备搬运和HF预处理已有各自协调区间；未确认需要改动的批次实现，不作形式重构。
+- VALIDATION-CLEANUP-REPORT-244：close_validation_dataloader在验证异常且close
+  再失败时，get_logger/exception仍可能替换原错。报告改为尽力执行，不在失败展开
+  增加通信；成功验证后close错误仍传播。
+- 扩展普通validation和pipeline控制流回归，共16例，新增12例；报告注入无故障/
+  OSError/KI/SystemExit，检查原错身份、关闭次数、普通路径model.training恢复。
+  pipeline仅是模拟iteration/control flow，不能代表真实PP运行。
+  修复前普通路径OSError专项1 failed/1 passed，退出1，
+  /tmp/llmtuner-validation-report-before-244.log；pipeline未单独回退旧实现动态复现。
+- 现有真实双rank data_fetch_coordination完整复跑，port30288退出0，
+  /tmp/llmtuner-data-coordination-244.log，覆盖已有loader/计数/HF预处理/PP split/
+  CP和TP序列预处理/验证result边界，不包含本次日志故障的多rank注入。
+- 全文件hooks首次只格式化测试的内嵌函数和参数，复核后相关hooks通过，
+  /tmp/llmtuner-hooks-final-244.log；compileall、HEAD diff通过。完整CPU
+  3950 passed、4 skipped、805 warnings，43.12s，退出0，/tmp/llmtuner-cpu-244.log。
+  未commit/push；后续继续核对validation模式、RNG及mask恢复的失败组合。
+
+### 第245批：验证RNG上下文进入失败在forward前协调
+
+- VALIDATION-RNG-ENTRY-245：preserve_rng_state进入在mode setup协调外，单rank RNG
+  状态读取失败后peer仍进入验证。用ExitStack拥有原RNG上下文，在Validation RNG
+  setup局部区间内enter_context，所有rank确认后才切换模式与forward；无collective
+  放入区间。正常/异常退出仍由原上下文恢复，不改checkpoint RNG格式。
+- 新增validation_rng_coordination，实际DP2/native FSDP Trainer，只在rank0/rank1的
+  torch.get_rng_state注入OSError/KI/SystemExit。检查原错身份、peer边界、各模块
+  training标志，以及Python/NumPy状态字节与CPU RNG精确不变，默认组barrier。
+  修复前port30289退出1，peer错误边界不符，owner等待10秒超时，
+  /tmp/llmtuner-validation-rng-before-245.log；修复后port30290六例退出0，
+  /tmp/llmtuner-validation-rng-after-245.log。无真实设备RNG故障或私有generator覆盖。
+- 全文件hooks首轮仅格式化脚本，复核后相关hooks通过，
+  /tmp/llmtuner-hooks-final-245.log；compileall、HEAD diff通过；完整CPU
+  3950 passed、4 skipped、759 warnings，43.19s，退出0，/tmp/llmtuner-cpu-245.log。
+- 正常验证+新增世界协调点的DP2×TP2/custom/compile/AC/EMA/async完整新进程恢复
+  复跑退出0，并使用242新加的实际EMA逐次通信0断言；日志
+  /tmp/llmtuner-validation-tp-resume-245.log，artifact
+  /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-l89uig6_。
+  更新前完整状态与续训终态精确一致，实际EMA每次调用通信0；不外推CUDA/三轴。
+  未commit/push；RNG退出本身的失败协调仍须独立复核。
+
+### 第246批：RNG隔离退出保留原错并尝试两个host恢复
+
+- RNG-RESTORE-246：preserve_rng_state的Python恢复异常会跳过NumPy；torch fork
+  或host恢复错误也会替换操作原始异常。保存操作首错，捕获fork退出错误，分别
+  尝试Python和NumPy恢复，结束后抛首错。保留torch.random.fork_rng公共接口，
+  不重写设备RNG机制，不含collective。
+- 新增test_rng_isolation真实Python/NumPy/CPU流18例（torch/python/numpy恢复点 ×
+  正常/失败操作 × OSError/KI/SystemExit），检查异常实例、三个恢复调用顺序、
+  未失败随机源精确恢复，并在finally真实复位全部流防止污染其他测试。
+  修复前12 failed/6 passed，退出1，/tmp/llmtuner-rng-restore-before-246.log。
+- 原有双rank真实Trainer RNG进入失败六例复跑port30291退出0，
+  /tmp/llmtuner-validation-rng-246.log。不代表退出失败已经跨rank协调；245未关闭
+  的Validation RNG exit边界仍待处理。失败随机源不保证恢复，设备fork内部restore
+  顺序也不由本修复改写，不能继续故障运行时。
+- 全文件hooks首轮格式化新测试超长表达式，复核后相关hooks通过，
+  /tmp/llmtuner-hooks-final-246.log；compileall、HEAD diff通过。完整CPU
+  3968 passed、4 skipped、768 warnings，43.96s，退出0，/tmp/llmtuner-cpu-246.log。
+  未commit/push；下一步验证正常验证结束时RNG退出局部失败的peer传播。
+
+### 第247批：验证成功后RNG退出局部失败协调
+
+- VALIDATION-RNG-EXIT-247：真实验证正常结束，单rank RNG restore失败后peer正常
+  返回validate。成功pass在模式恢复后显式close已拥有RNG上下文，捕获本地错误再
+  经Validation RNG cleanup区间协调；失败pass直接展开原ExitStack，不增加可能
+  不匹配的通信。ExitStack已消费回调，正常退出不重复restore。
+- 扩展validation_rng_coordination为setup/cleanup × rank0/rank1 × OSError/KI/SystemExit，
+  共12例。cleanup在真实loader关闭后才注入torch.set_rng_state故障，实际FSDP
+  forward/验证指标未替换。检查owner原错、peer边界、模式/host流、healthy CPU流，
+  以及清理restore调用一次；故障CPU源只在测试清场手工复位，不声称故障自动恢复。
+- 修复前port30292退出1，healthy caught=None证明未被协调，
+  /tmp/llmtuner-validation-rng-exit-before-247.log；修复后port30293十二例退出0，
+  /tmp/llmtuner-validation-rng-exit-after-247.log。加入restore次数断言后的最终
+  port30294退出0，/tmp/llmtuner-validation-rng-exit-final-247.log。
+- 全文件hooks首轮只格式化新脚本断言，相关hooks复核通过，
+  /tmp/llmtuner-hooks-final-247.log；compileall、HEAD diff通过。完整CPU
+  3968 passed、4 skipped、694 warnings，41.88s，退出0，/tmp/llmtuner-cpu-247.log。
+  未commit/push；实际设备RNG内部恢复失败和验证模式恢复故障仍须独立审查。
+
+### 第248批：Grain游标恢复失败时保留原始异常
+
+- GRAIN-CURSOR-REPORT-248：临时probe或live iterator恢复失败后，关闭失败的
+  日志输出可能再次抛出异常，覆盖原始恢复错误。两处日志改为尽力报告；成功路径
+  的close错误仍向外传播，不增加通信，也不承诺live恢复失败后的事务回滚。
+- 修正上轮测试中SimpleNamespace的局部导入。修复前有效复现为4 failed、4 passed，
+  随后日志KeyboardInterrupt中断pytest，退出2；记录
+  `/tmp/llmtuner-cursor-report-before-fixed-248.log`，此前NameError结果不作为缺陷证据。
+- 真实Grain图的probe覆盖构造/恢复/关闭、ValueError/KeyboardInterrupt及四种
+  日志结果，检查payload、live cursor、Python/NumPy/Torch RNG及下一batch不变。
+  新增6例live恢复：实际set_state和close后注入错误，确认关闭一次并保留原始异常；
+  不将其解释为失败后状态回滚。定向30 passed，退出0，
+  `/tmp/llmtuner-cursor-report-after-248.log`。
+- 完整CPU：3992 passed、4 skipped、978 warnings，85.42s，退出0，
+  `/tmp/llmtuner-cpu-248.log`。适用全文件hooks最终退出0，
+  `/tmp/llmtuner-hooks-all-final-248.log`；排除受保护文件及外部moonep/prompt。
+  首次hooks发现长行并格式化测试，已修正及复核；compileall和HEAD diff通过。
+- 本批没有collective或布局修改，未新增torchrun；设备组合和上游backend缺口仍开放。
+
+### 第249批：当前RNG与游标实现的Grain DP2×TP2完整恢复验收
+
+- 本批没有修改生产代码。复核trainer_ema_process_resume的真实机制断言、快照
+  独立存储、零容差递归比较及EMA独立动态公式，运行当前248批代码的真实四rank
+  JSONL/tokenizer/Grain concat packing，不复用此前synthetic恢复结果代替数据游标。
+- macOS26.3 arm64、Python3.13、PyTorch2.14.0、CPU/Gloo；dense DP shard2、TP2、
+  EP/PP/CP1、custom fine-grained FSDP、Qwen3 MoE fixed router/aux0.03、full AC、
+  aot_eager、dynamic EMA、每步两批验证、异步中间DCP。命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py dp4 moe tp2 custom compile ac validate async corpus`。
+- continuous/initial/resume分别经torch.distributed.run启动新worker；initial运行至
+  step3，resume明确加载异步step2。四rank加载边界的model/Adam/scheduler/EMA/
+  trainer/Grain cursor/RNG与保存点精确相等，续训至step4的完整终态与连续运行精确
+  相等，包括DTensor本地storage、global shape/stride、placements及mesh。
+- 每worker确认实际FineGrainedFSDPState、两个FeatureParallelMoE、两层AC wrapper
+  和compile图；每次实际EMA.step通信计数0，调用序列与动态平均公式通过。
+  每次验证前后完整快照及aux scratch不变；Grain游标确实随训练推进。
+- 退出0，日志`/tmp/llmtuner-grain-tp-resume-249.log`；全部worker日志与状态产物：
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-2u82nglu`。
+  各worker无unwaited collective提示。仅证明本配置的连续/恢复等价，不能代替
+  独立dense训练数值参考、TP+EP同时启用、PP/CP、设备内核或拓扑变化验证。
+- 纯记录变更复用248批相同生产代码CPU3992 passed/4 skipped及全文件hooks证据；
+  本批文档hooks、compileall、HEAD diff检查通过，未commit/push。
+
+### 第250批：FirstFit与quantile EP2×expert-FSDP2完整恢复验收
+
+- 本批不修改生产代码。重新阅读routing.py的quantile观察/估计和bias_update.py的
+  optimizer pre-hook：histogram为非持久scratch，按token分片轴归约，更新后清空；
+  eval及AC recompute不重复观察。阅读不能替代独立数值/设备验证。
+- 当前llmtuner共178个Python文件，逐文件表格的178个唯一路径与文件集合一致，
+  无missing/stale或标记待审查的表格条目；只确认清单覆盖，不据此关闭验收缺口。
+- macOS26.3 arm64、Python3.13、PyTorch2.14.0、CPU/Gloo；四rank dense DP shard4、
+  EP2、expert FSDP2、TP/PP/CP1、custom fine-grained FSDP、DeepSeek-V3 sigmoid
+  quantile router、真实JSONL/tokenizer/Grain FirstFit、full AC、aot_eager、dynamic
+  EMA、每步两批验证、异步中间DCP。命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py dp4 moe ep2 quantile custom compile ac validate async first_fit`。
+- continuous/initial/resume分别启动全新四worker；initial运行至step3，resume加载
+  异步step2后训练至step4。四rank加载前更新边界及续训终态的model/Adam/scheduler/
+  EMA/trainer/Grain cursor/RNG和DTensor本地storage/布局均零容差一致。
+- 脚本确认实际EP2 dispatcher、expert本地shard、FineGrainedFSDPState、两层AC和
+  compile图；持久expert bias确实非零、checkpoint无histogram、更新后scratch为空。
+  验证前后完整训练快照及aux scratch不变，EMA逐步调用、独立动态公式和每次通信0
+  均通过。FirstFit输入16词加EOS，覆盖满chunk恢复，不代表所有padding/余数窗口。
+- 退出0，`/tmp/llmtuner-firstfit-quantile-ep-resume-250.log`；全部worker日志/状态产物：
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-myc9u590`。
+  此证据仅证明该配置恢复一致，不证明独立dense算术等价、TP+EP/CP/PP、CUDA/NPU、
+  通信故障原地恢复或拓扑变化；相关缺口继续开放。
+- 生产代码与248批相同，复用CPU3992 passed/4 skipped及全文件hooks；本批文档
+  hooks、compileall、HEAD diff通过。未commit/push，无遗留运行任务。
+
+### 第251批：装配失败后的执行策略回滚不被二次异常中断
+
+- ASSEMBLY-ROLLBACK-251：复核CLI配置视图、TrainingConfig、LLMTunerConfig和
+  seeding调用链。发现rollback_execution_settings_on_error顺序恢复时，单个RNG或
+  deterministic setter失败会覆盖原始装配错误，并跳过剩余策略与环境变量恢复。
+- 将捕获的恢复动作依原顺序独立尝试，始终重新抛出原始装配异常；不引入collective，
+  成功装配仍保留运行策略。回滚是best effort，失败的setting和设备RNG不保证恢复，
+  不能据此继续使用失败runtime或宣称原地通信恢复。
+- 新增真实Python/NumPy/Torch RNG及执行开关12例：四个恢复点 ×
+  OSError/KeyboardInterrupt/SystemExit。修复前12 failed、退出1，
+  `/tmp/llmtuner-assembly-rollback-before-251.log`。最终加强测试同时更改并检查
+  cuDNN两开关、fill_uninitialized_memory、anomaly/check_nan与环境变量，
+  验证剩余恢复调用顺序、健康RNG精确和原始异常实例，finally真实清场。
+- 最终定向30 passed、退出0，`/tmp/llmtuner-assembly-rollback-after-251.log`。
+  完整CPU4004 passed、4 skipped、820 warnings，44.48s，退出0，
+  `/tmp/llmtuner-cpu-251.log`；完整套件启动后只加强新增测试断言，最终断言由定向
+  测试复核。首次hooks格式化两文件并报告长行，最终适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-all-final-251.log`；compileall、HEAD diff通过。
+- 仅本地失败回滚变更，本批未新增torchrun；249/250正常完整恢复证据发生在本批
+  生产变更前，不升级为本批新端到端证明。设备和多轴缺口仍开放。未commit/push。
+
+### 第252批：真实CLI的FirstFit×Interleaved PP×seed导入联合恢复
+
+- 核对143批seed×PP和216批FirstFit×DP证据，二者不能自动合并为联合配置。
+  复核CLI恢复脚本、PP核心入口和当前checkpoint调用链，本批不修改生产代码。
+- 实际命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/cli_checkpoint_equivalence.py pp2 custom async ac seed first_fit`。
+  macOS26.3 arm64、Python3.13、PyTorch2.14.0、CPU/Gloo；Qwen3六层，DP shard2×PP2、
+  TP/CP/EP1、Interleaved1F1B四stage/四microbatches、custom FSDP、full AC、eager、
+  async DCP；实际本地JSONL/tokenizer/Grain FirstFit，max_num_documents1满chunk。
+- 单进程真实CLI导出step0，四rank边界作业以不同seed43初始化，加载未分片权重后
+  对应FQN精确相等，非模型训练服务与CPU RNG不变。四个成功消息因并发stdout合并
+  为两行，按字符串实例计数为4，不能用匹配行数误报只有两rank验收。
+- continuous/initial/resume三个独立torch.distributed.run --module llmtuner作业：
+  连续3步对照先运行2步、再新进程恢复至3步；两条轨迹都从同一个seed权重开始。
+  最终完整checkpoint（模型、Adam、scheduler、Grain cursor、trainer、四rank RNG）
+  零容差一致，ntokens_seen及scheduler绝对预期通过，退出0。
+- 日志`/tmp/llmtuner-cli-pp-firstfit-seed-252.log`；产物及各worker日志：
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-cli-resume-0t1fkm_k`。
+  本次未设置LLMTUNER_TEST_MASTER_PORT，实际用脚本默认30160–30162和boundary30163。
+- step0仅迁移模型，不能宣称完整训练状态world1→world4迁移；step2恢复后首个更新前
+  完整状态边界未由本脚本比较，仍开放。无EMA/validation/compile、设备kernel、
+  不满chunk、其他schedule或拓扑变化完整恢复证明。
+- 纯记录变更复用251批相同生产代码CPU4004 passed/4 skipped及全文件hooks；
+  本批文档hooks、compileall、HEAD diff检查通过。未commit/push，无遗留运行任务。
+
+### 第253批：FirstFit×DP2×PP2恢复后首个更新前完整边界
+
+- 扩展trainer_ema_process_resume.py的pp2模式，dp4下使用六层dense Qwen3、DP shard2、
+  PP2、Interleaved1F1B四stage/四microbatches、每rank两个model parts。脚本暂不组合
+  MoE/TP/EP；这是harness边界，不是新增产品能力限制。生产代码无修改。
+- 保留完整状态零容差比较、快照非别名自检、EMA独立动态公式及每次实际更新通信0。
+  新增实际schedule类和本地parts断言；AC wrapper按每rank三层核对。按真实PP/DP坐标
+  计算loader rank和token计数预期，不放宽任何数值容差。
+- 命令：
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py dp4 pp2 custom compile ac validate async first_fit`。
+  macOS26.3 arm64、Python3.13、PyTorch2.14.0、CPU/Gloo；custom FSDP、full AC、
+  aot_eager、dynamic EMA、每步两批验证、异步中间DCP、真实JSONL/tokenizer/FirstFit。
+- continuous/initial/resume为独立四worker作业，动态loopback rendezvous；initial至
+  step3，resume显式加载异步step2。四rank加载后首个更新前model/Adam/scheduler/
+  EMA/trainer/Grain cursor/RNG与保存点精确相等，step4完整终态与连续运行精确相等，
+  包括DTensor本地tensor、shape/stride、placements和mesh。最终每rank ntokens_seen128；
+  模型/EMA键数rank0/1各34、rank2/3各35，本地布局记录分别136/140，均非空。
+- 退出0，`/tmp/llmtuner-firstfit-pp-boundary-253.log`；产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-7vgzc8cw`。
+  原默认单进程synthetic模式复跑退出0，`/tmp/llmtuner-resume-default-253.log`，产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-bx9t98s5`。
+- 本项补上FirstFit×PP配置的更新前完整状态证据，但不能替代252批实际CLI路径的
+  同一配置（252含step0导入、eager且无EMA/validation）；不将不同配置合并验收。
+  未覆盖目标设备、任意padding/余数、其他schedule、Inductor或拓扑变化。
+- 完整CPU4004 passed、4 skipped、861 warnings，44.38s，退出0，
+  `/tmp/llmtuner-cpu-253.log`；全文件hooks已退出0，
+  `/tmp/llmtuner-hooks-all-253.log`；首次局部hooks格式化表达式，复核最终通过。
+  compileall、HEAD diff及最终文档hooks通过。未commit/push，无遗留运行任务。
+
+### 第254批：参数组选项拼写错误不再静默使用默认超参数
+
+- OPTIMIZER-GROUP-OPTIONS-254：从CLI/config追踪参数组、scheduler恢复和EMA后复核
+  当前torchtitan HEAD01b1b69e的components/optim实现，保留既有WSD默认/短schedule
+  拒绝差异。确认PyTorch的Adam/AdamW接受任意group metadata，导致用户把lr写成
+  learning_rate等时无异常，实际仍用默认lr0.001，配置被静默忽略。
+- 构造inner optimizer后、接入container前，按实际optimizer.defaults校验组字段，
+  保留管理字段params/param_names及scheduler的initial_lr；未知选项明确ValueError。
+  无硬编码版本选项表；不会将初始参数更新为测试替代值。不新增collective，本地
+  校验处于既有Optimizer initialization错误协调边界。参数组选项说明同步更新。
+  额外用户metadata不属于此配置的optimizer参数契约，应删除或保存在独立对象；
+  旧checkpoint未知字段不在当前live组schema中时不会因此新增必需键。
+- Adam/AdamW × learning_rate/weight_decays/beta六例在修复前全部失败（未抛错），
+  initial_lr保留例通过：6 failed/1 passed，退出1，
+  `/tmp/llmtuner-group-options-before-254.log`。修复后optimizer container/scheduler
+  定向98 passed，退出0，`/tmp/llmtuner-group-options-after-254.log`；拒绝路径检查
+  模型参数精确不变，既有有效参数组与状态往返测试保留。
+- 扩展pp_optimizer_groups.py的unknown_options故障：只有rank0配置learning_rate，
+  其余rank正常。真实四rank CPU/Gloo、PP2×DP2、world初始化协调，rank0收到原始
+  ValueError、其他三rank收到Optimizer initialization failed on another rank，
+  barrier继续；原AdamW独立更新对照和planning/重复参数/PP子组故障检查均通过。
+  命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30295 tests/integration_tests/pp_optimizer_groups.py`，
+  退出0，`/tmp/llmtuner-pp-group-options-254.log`。不是完整Trainer恢复或设备验证。
+- 完整CPU4011 passed、4 skipped、964 warnings，45.02s，退出0，
+  `/tmp/llmtuner-cpu-254.log`。首次hooks报告长行并格式化两文件，最终适用全文件
+  hooks退出0，`/tmp/llmtuner-hooks-all-final-254.log`；compileall、HEAD diff通过。
+  未commit/push，无遗留运行任务；硬件及完整恢复其他缺口保持开放。
+
+### 第255批：全部参数冻结时仅追踪buffer的EMA
+
+- EMA-BUFFER-ONLY-255：EMA已为选中buffer构建EMAStateOptimizer和平均值，但父
+  Optimizer接口仅接收trainable parameters；全部参数冻结而buffer_patterns有效时，
+  构造仍以empty parameter list失败，与声明的buffer跟踪能力冲突。
+- 将EMA父接口的tensor集合改为实际全部被追踪的参数与buffer；训练optimizer不改
+  分组逻辑。共享接口参数类型使用Sequence[Tensor]，同时兼容Parameter列表和buffer。
+  既有平均值、FQN checkpoint键、布局校验和本地foreach更新机制保持。
+- 新增FP32/FP64真实nn.Linear全冻结、浮点expert_bias buffer测试：构造、两次更新
+  的独立lerp公式、全新EMA完整恢复、续更一致及冻结参数不变。修复前2 failed，
+  退出1，`/tmp/llmtuner-buffer-only-ema-before-255.log`；最终EMA专项85 passed，
+  退出0，`/tmp/llmtuner-buffer-only-ema-after-255.log`。
+- ema_layout_equivalence.py扩展参数/仅buffer两种跟踪域 × size1/5/8 ×
+  Shard/Replicate/Partial共18配置，包含真实空/不均匀本地分片。两rank CPU/Gloo
+  实际更新与独立dense加权参考精确一致，每次更新与布局拒绝通信0，拒绝时目标
+  storage不变。命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30296 tests/integration_tests/ema_layout_equivalence.py`，
+  退出0，`/tmp/llmtuner-buffer-only-ema-layout-255.log`。
+- 本项不证明整个Trainer可训练全冻结的PP stage，也不覆盖无任何跟踪tensor的EMA、
+  设备buffer、完整多轴恢复或性能。多rank仅验证本地更新和拒绝，buffer-only加载
+  恢复由CPU单测验证，不能把两者合并为分布式DCP验收。
+- 完整CPU4013 passed、4 skipped、1123 warnings，117.44s，退出0，
+  `/tmp/llmtuner-cpu-255.log`。首次hooks格式化测试和新签名/脚本，最终适用全文件
+  hooks退出0，`/tmp/llmtuner-hooks-all-final-255.log`；最终文档hooks、compileall与
+  HEAD diff通过。未commit/push，无遗留运行任务。
+
+### 第256批：EMA空跟踪rank的真实DCP恢复
+
+- EMA-EMPTY-RANK-256：255批buffer-only修复后继续核对空跟踪域。全部冻结、无参数
+  module或无本地parts时，EMA仍无法建立父Optimizer接口。更正为PyTorch支持的显式
+  空param group，不创建dummy tensor；训练optimizer的规则匹配策略不在本批改动。
+- 修正构造后，真实DCP load再次失败：rank0合法无任何EMA tensor，rank1有状态，
+  原跨rank空/非空检查一律拒绝。现在空跟踪rank在恢复模式投票中为中性，只比较
+  有跟踪tensor的rank；若任何owner选择恢复，所有rank共同进入父容器的checkpoint
+  协调，防止空rank提前返回而遗漏world collective。有owner真实缺失状态仍拒绝。
+- CPU frozen/parameterless/no-parts三例修复前3 failed，退出1，
+  `/tmp/llmtuner-empty-ema-before-256.log`。双rank baseline先协调收集构造错误再
+  退出1，`/tmp/llmtuner-empty-ema-dcp-before-256.log`，避免以构造失败制造peer挂起。
+  仅修正构造后的load baseline两rank均报empty on only some ranks，退出1，
+  `/tmp/llmtuner-empty-ema-load-before-256.log`，均保留为独立失败证据。
+- ema_layout_equivalence.py新增真实torch.distributed.checkpoint.save/load Stateful EMA，
+  分别rank0/rank1为空跟踪域，加载边界对照独立deepcopy快照、后续更新对照lerp，
+  均零容差通过；未替换DCP或EMA loader。既有18布局配置和通信0断言仍通过。
+  CPU/Gloo两rank，port30299，退出0，`/tmp/llmtuner-empty-ema-dcp-after-256.log`；产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-empty-ema-aji27t1m`、
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-empty-ema-h8w3tkfg`。
+- 复跑rng_checkpoint_equivalence.py，port30300、两rank、退出0，
+  `/tmp/llmtuner-empty-ema-guard-256.log`：两rank都有tensor但只有一方空输入仍被拒绝，
+  stale ownership/非法输入保护通过；DDP/native FSDP/custom FSDP各sync/async的
+  实际manager、dropout、RNG、Adam/scheduler/EMA续训精确一致。不是新进程Trainer或
+  完整冻结PP stage验收；本项DCP空rank证据只覆盖EMA本身，设备与多轴缺口仍开放。
+- 完整CPU4016 passed、4 skipped、704 warnings，54.35s，退出0，
+  `/tmp/llmtuner-cpu-256.log`。首次hooks格式化测试与脚本，最终适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-all-final-256.log`；compileall、HEAD diff通过。未commit/push，
+  无遗留运行任务。
+
+### 第257批：生产manager的空EMA rank与排除加载
+
+- 复核base/distributed_checkpoint/torch_checkpointing_backend的EMA装配、Stateful
+  恢复及model恢复后reset_from_model路径。本批只新增独立集成脚本
+  tests/integration_tests/ema_checkpoint_ownership.py，不修改生产实现。
+- 实际DistributedCheckpointManager、CPU/Gloo两rank、rank0/rank1为空EMA scope ×
+  disabled/async保存 × 保留/排除EMA加载，共8组合通过。训练模型在两rank使用相同
+  seed与输入并执行同样Adam更新，EMA故意只拥有其中一个rank的模型part；不是实际
+  PP schedule或全冻结stage。无dummy tensor、无替换manager/DCP/EMA加载路径。
+- 先真实梯度更新，EMA依独立0.5 lerp参考验证；保存非零Adam moments和进度。
+  async场景确认save_future存在并等待staging，然后继续更新并关闭writer。
+  新runtime使用seed99，先确认模型不同，再加载step1；更新前模型、Adam、scheduler
+  与保存点零容差一致。正常加载EMA历史精确；exclude_from_loading=[ema]时平均值
+  等于恢复后的模型，随后更新再次与独立公式一致。正常恢复终态完整匹配连续运行，
+  排除EMA场景仅模型/Adam/scheduler匹配连续轨迹，EMA按冷启动独立参考验收。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30301 tests/integration_tests/ema_checkpoint_ownership.py`，
+  退出0，`/tmp/llmtuner-ema-owner-manager-257.log`；每组产物路径由日志逐项保留，
+  起始llmtuner-ema-owner-il0_tamd，最终llmtuner-ema-owner-2ma4h90d。
+  run_all.py --list ema_checkpoint_ownership确认自动发现并使用两rank launcher。
+- 新runtime在相同worker进程中构造；未比较RNG/数据游标/trainer counters，也不是
+  新进程Trainer、FSDP/TP/PP/CP/EP完整恢复或optional torch_checkpointing后端证明。
+  这些边界独立保留，不把静态可读性当作设备或backend验证。
+- 完整CPU4016 passed、4 skipped、840 warnings，44.00s，退出0，
+  `/tmp/llmtuner-cpu-257.log`。新脚本局部hooks退出0，`/tmp/llmtuner-hooks-257.log`；
+  适用全文件hooks退出0，`/tmp/llmtuner-hooks-all-final-257.log`，compileall及HEAD
+  diff通过。未commit/push，无遗留运行任务。
+
+### 第258批：最近optimizer/EMA修改后的完整PP续训复验
+
+- 复读原始目标、开发规范及当前257批记录，保留既有工作区修改。本批不改生产代码，
+  补验254–256批修改后的完整Trainer恢复，避免沿用修改前253批结果。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py dp4 pp2 custom compile ac validate async first_fit`，
+  退出0，`/tmp/llmtuner-pp-resume-258.log`；产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-0ytx14ls`。
+- CPU/Gloo四rank、DP2×PP2、custom FSDP、Interleaved1F1B、compile/AC、验证、
+  async checkpoint及真实first_fit数据路径。新进程加载step2，更新前七类状态
+  （模型、optimizer、scheduler、EMA、trainer、数据、RNG）及本地DTensor布局精确
+  匹配保存点；step4终态精确匹配连续训练，EMA独立公式与每次更新通信0断言通过。
+- 本项不覆盖空EMA scope、全冻结PP stage、TP/EP/CP组合、拓扑变化或CUDA/NPU。
+  未新增源码修改，完整CPU及全文件hooks沿用257批结果，不宣称本批重新执行。
+  compileall与HEAD diff检查通过；文档局部hooks结果见本批交付。未commit/push。
+
+### 第259批：最近optimizer/EMA修改后的quantile EP完整续训
+
+- 重读原始目标并核对工作区，继续审查optimizer/scheduler与MoE验证状态隔离调用链。
+  本批未发现需要修改的生产缺陷；不将空EMA支持外推为全冻结PP stage训练支持。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py dp4 moe ep2 quantile custom compile ac validate async first_fit`，
+  退出0，`/tmp/llmtuner-ep-resume-259.log`；产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-a1d01izb`。
+- CPU/Gloo四rank，dense DP shard4、EP2/efsdp2，DeepSeek-V3 sigmoid quantile、
+  custom FSDP、full AC、aot_eager、每step验证、async保存与first_fit真实Grain路径。
+  新进程step2更新前七类训练状态及本地DTensor布局精确匹配保存点，step4终态
+  精确匹配连续训练；EMA独立公式及每次更新通信0断言通过。expert bias非零并
+  持久化，临时histogram与token计数清空，验证前后辅助损失及路由临时状态不变。
+- 这是254–256批生产修改后的复验；不覆盖TP/CP/PP、任意padding窗口、拓扑变化、
+  设备dispatcher或Inductor性能。全局目标及既有设备/上游缺口保持开放。
+- 仅更新审查与矩阵文档，复用257批完整CPU和全文件hooks，不称本批重跑；
+  HEAD diff检查通过，文档局部pre-commit通过。未commit/push，无遗留运行任务。
+
+### 第260批：最近optimizer/EMA修改后的fixed router TP完整续训
+
+- 复读原始目标，复核EMA固定ownership、optimizer FQN状态还原及RNG拓扑约束。
+  本批未发现新的生产缺陷，未修改源码；补齐254–256批修改后的TP路径回归。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py dp4 moe tp2 custom compile ac validate async corpus`，
+  退出0，`/tmp/llmtuner-tp-resume-260.log`；产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-6hgit69r`。
+- CPU/Gloo四rank、DP2×TP2、Qwen3 MoE fixed router EP1/aux.03、custom FSDP、
+  full AC、aot_eager、每step验证、async checkpoint、本地JSONL/Grain concat。
+  生产TP专家投影和通信组必达；新进程加载step2时七类状态与local DTensor布局
+  精确匹配保存点，step4终态精确匹配连续训练。动态间隔EMA独立公式及每次更新
+  通信0通过，验证不改变七类训练状态与MoE辅助临时状态。
+- 当前RNGCheckpointState明确检查world size及各并行度，loader检查DP度数；
+  不兼容变化须显式排除对应状态，不保证完整随机流/数据连续性。低层FSDP重分片
+  测试不能作为完整Trainer跨拓扑恢复证明。本项也不覆盖CP/PP/EP、目标设备、
+  Inductor或独立dense训练数值参考，既有缺口继续开放。
+- 本批仅更新记录与矩阵文档，完整CPU和全文件hooks复用257批，未重跑；
+  文档局部pre-commit、HEAD diff检查通过。未commit/push，无遗留运行任务。
+
+### 第261批：RNG兼容性预检拒绝时保留live状态
+
+- 沿DistributedCheckpointManager._load_checkpoint复核本地preflight先于live DCP写入、
+  scheduler晚于optimizer恢复、RNG最后恢复的调用顺序。本批未确认新的生产缺陷。
+- 扩展checkpoint_data_preflight.py：在真实目标RNGCheckpointState上设置不兼容的
+  world_size或parallel_degrees记录，分别全部rank/rank0/rank1不匹配。真实进程组
+  和模型布局不变，不替换manager、DCP或validator，也不宣称真实拓扑迁移。
+- DDP/native/custom FSDP × 四种拒绝原因（loader、scheduler、RNG world、RNG
+  topology）× 三种故障分布，共36场景；其中新增18场景。保存前真实执行两次更新，
+  目标用不同seed并执行更新，确保live Adam/EMA非空且不同于checkpoint。
+  owner收到具体ValueError，健康peer收到对应preflight协调RuntimeError，随后
+  barrier正常；模型、optimizer、scheduler、EMA、loader及Python/NumPy/Torch随机
+  流与加载前精确一致。未覆盖Trainer counters、设备RNG或通信失败的原子回滚。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30302 tests/integration_tests/checkpoint_data_preflight.py`，
+  退出0，`/tmp/llmtuner-rng-preflight-261.log`。局部hooks修正一处长行后通过；适用
+  全文件hooks退出0，`/tmp/llmtuner-hooks-all-261.log`；compileall、HEAD diff通过。
+- 完整CPU4016 passed、4 skipped、825 warnings，44.20s，退出0，
+  `/tmp/llmtuner-cpu-261.log`；最终台账局部hooks通过。未commit/push，无遗留运行任务。
+
+### 第262批：真实DCP损坏Trainer计数器的预检拒绝
+
+- 复读原始目标，沿Trainer.validate_state_dict及manager local preflight追踪计数器
+  校验；现有实现能拒绝非负整数契约之外的值，本批无需生产修复。
+- 新增trainer_state_preflight.py，使用Trainer.__new__仅建立真实Stateful计数器
+  owner，不构造完整Trainer运行时。真实DDP/native/custom FSDP、manager和DCP，
+  保存含损坏step/ntokens_seen的fixture；不替换validator、reader或DCP回调。
+- 三实现 × 两字段 × -1/True/1.5，共18场景。源模型先真实更新两步，目标不同seed
+  并先真实更新，确保非空Adam/EMA状态不同。两rank从同一损坏record均收到具体
+  ValueError，后续barrier正常；模型、optimizer、scheduler、EMA、loader、Trainer
+  counters及Python/NumPy/Torch随机流与加载前零容差一致。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30303 tests/integration_tests/trainer_state_preflight.py`，
+  退出0，`/tmp/llmtuner-trainer-preflight-262.log`；run_all.py --list确认自动发现与
+  两rank launcher。局部hooks修正docstring长行后通过，适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-all-262.log`；compileall、HEAD diff通过。
+- 不覆盖单rank损坏record、设备状态、通信失败回滚、完整Trainer装配或跨组件
+  进度一致性；既有完整恢复与硬件缺口保持原范围。
+- 完整CPU4016 passed、4 skipped、745 warnings，43.16s，退出0，
+  `/tmp/llmtuner-cpu-262.log`；最终文档hooks通过。未commit/push，无遗留运行任务。
+
+### 第263批：load参数局部非法导致collective超时
+
+- CHECKPOINT-LOAD-ARGS-263：BaseCheckpointManager.load在首个错误协调阶段之前
+  校验step。单rank传入None/True/-2/1.5时直接ValueError，健康peer继续进入
+  staging协调，collective序列分叉。实际两rank baseline退出1，两个rank的Gloo
+  send/recv均超时10000ms，`/tmp/llmtuner-load-arguments-before-263.log`，port30304。
+- 将纯本地参数校验放入独立Checkpoint load arguments错误协调阶段，先于staging、
+  待完成保存及source IO；不在该局部区间加入collective或状态写入。单进程仍抛
+  原ValueError；未初始化/关闭checkpoint的提前返回策略保持。
+- 扩展checkpoint_load_coordination.py，四种非法step × rank0/rank1共8场景，
+  故障rank收到原ValueError，健康rank精确收到协调RuntimeError；模型、AdamW、
+  scheduler状态不变，随后barrier及实际正常DCP重载成功。原报告/GC/完成报告
+  × 两rank × 三种异常的18故障场景和重试保留并通过。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30306 tests/integration_tests/checkpoint_load_coordination.py`，
+  最终退出0，`/tmp/llmtuner-load-arguments-final-263.log`；首次修复后port30305亦
+  退出0，`/tmp/llmtuner-load-arguments-after-263.log`。不是设备通信故障恢复证明。
+- 局部hooks修正长行后通过，适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-all-263.log`；compileall、HEAD diff通过。共享base修复适用
+  两后端，但optional后端真实多rank仍受既有上游CUDA metadata限制，未据此关闭。
+- 完整CPU4016 passed、4 skipped、702 warnings，43.10s，退出0，
+  `/tmp/llmtuner-cpu-263.log`；最终文档/源码局部hooks通过。未commit/push，无运行任务。
+
+### 第264批：save参数局部非法的collective超时与布尔契约
+
+- CHECKPOINT-SAVE-ARGS-264：沿保存入口复查确认save也在跨rank协调前检查step。
+  两rank真实baseline（单rank传None）退出1，Gloo send/recv超时10000ms，port30307，
+  `/tmp/llmtuner-save-arguments-before-264.log`。last_step原先接受任意真值，字符串
+  false会误走最终保存；现在明确要求bool，避免错误发布策略。
+- 将step/last_step校验放入Checkpoint save arguments纯本地错误协调阶段，先于
+  _should_save与后端操作。不放入collective或状态写入。代价：每次启用的save调用
+  增加一次错误协调，包括未到保存间隔的调用；未测目标设备开销，不宣称无性能影响。
+- checkpoint_load_coordination.py新增四非法step及三非法last_step × 两故障rank，
+  共14场景；owner原ValueError、peer精确协调RuntimeError，模型/AdamW/scheduler
+  不变，后续barrier及正常DCP读取成功。既有8个load参数及18个报告/GC场景仍通过。
+  port30308退出0，`/tmp/llmtuner-save-arguments-after-264.log`。
+- 复跑完整checkpoint_save_coordination.py，首次退出1，
+  `/tmp/llmtuner-save-protocol-264.log`：旧测试假定调度器准备失败前DCP调用0次，
+  但当前生产会先读取RNG preflight metadata。修正为精确检查仅一笔rng_state子集
+  读取、无完整读取；RNG自身准备失败仍必须读取0次，并检查实际协调阶段。不绕过
+  生产预检。最终port30310退出0，`/tmp/llmtuner-save-protocol-final-264.log`，
+  原同步/异步/PROCESS staging、retention、同step发布与失败后重试场景保留。
+- 完整CPU4016 passed、4 skipped、892 warnings，44.89s，退出0，
+  `/tmp/llmtuner-cpu-264.log`；适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-all-264.log`，修改后源码/脚本局部hooks再次通过；compileall、
+  HEAD diff通过。optional后端设备/生命周期缺口不关闭。未commit/push，无运行任务。
+
+### 第265批：异步启动后GC失败丢失worker Future
+
+- CHECKPOINT-ASYNC-GC-265：真实async_save返回后，原实现先GC再登记save_future。
+  若GC局部失败，worker可能仍写入，但manager无法等待它。两rank baseline退出1，
+  聚合观测为[(False, OSError), (True, NoneType)]，port30311，
+  `/tmp/llmtuner-async-gc-before-265.log`；不是仅凭静态推断的资源风险。
+- threaded async路径先登记save_future与_pending_retention，再执行可能失败的GC；
+  DCP保存路径的GC（同步/HF保存后及异步启动前后）使用独立本地错误协调，
+  防止peer继续进入下一通信阶段。GC内部不得执行collective；后台Future callback
+  仍只本地best-effort日志。异常不保证未发布checkpoint，原worker可继续写入。
+- 新增checkpoint_gc_coordination.py，真实manager/DCP/Future，注入仅GC操作。
+  disabled后GC、async前GC、async后GC × 两rank × OSError/KeyboardInterrupt/
+  SystemExit共18场景。owner保留异常身份，peer精确协调RuntimeError，live模型/
+  AdamW/scheduler不变。启动后失败两rank均保留Future，实际wait后句柄清空；
+  恢复已写checkpoint与原状态精确一致，再次实际保存成功。启动前失败无Future，
+  正常重试保存后再验证恢复。不替换DCP或以mock Future代替worker。
+- 最终命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30314 tests/integration_tests/checkpoint_gc_coordination.py`，
+  退出0，`/tmp/llmtuner-gc-final-265.log`。最初async后GC六场景port30312退出0，
+  `/tmp/llmtuner-async-gc-after-265.log`。完整checkpoint_save_coordination.py
+  port30313退出0，`/tmp/llmtuner-save-protocol-265.log`。
+- 完整CPU4016 passed、4 skipped、767 warnings，44.31s，退出0，
+  `/tmp/llmtuner-cpu-265.log`；适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-all-265.log`，最终脚本局部hooks通过；compileall、HEAD diff通过。
+  本项不覆盖HF GC故障、pinned/device staging的GC故障、OS崩溃耐久性或optional后端，
+  未测新增同步开销。未commit/push，无遗留运行任务。
+
+### 第266批：DCP保存报告局部异常导致rank分叉
+
+- CHECKPOINT-SAVE-REPORT-266：复读目标并追踪保存协议，发现DCP保存开始与
+  完成报告未协调；自定义handler异常或进程中断使owner提前离开，peer继续writer
+  collective。真实baseline退出1，Gloo send超时10000ms，port30315，
+  `/tmp/llmtuner-save-report-before-266.log`。
+- 为DCP保存开始、普通完成、最终完成三处本地报告各加独立错误协调；Future
+  ownership与GC修复保持，异步worker callback仍不执行collective。完成报告
+  失败不撤销已发布checkpoint。额外同步开销未测，不称设备性能不变。
+- 扩展checkpoint_load_coordination.py三处报告 × 两rank × OSError/
+  KeyboardInterrupt/SystemExit共18场景，注入仅logger.info，真实save/load保持。
+  owner原异常身份、peer精确阶段RuntimeError，模型/AdamW/scheduler不变，后续
+  实际load成功；此前参数和load报告/GC场景均保留。port30316退出0，
+  `/tmp/llmtuner-save-report-after-266.log`。
+- 局部hooks修正测试长行后通过，适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-all-266.log`；compileall、HEAD diff通过。本项不代表所有
+  内部日志调用均已覆盖，HF导出内部、设备及optional后端仍须独立审查。
+- GC句柄保护18场景port30317退出0，`/tmp/llmtuner-gc-guard-266.log`；
+  run_all确认该脚本自动发现。完整CPU4016 passed、4 skipped、934 warnings，
+  86.91s，退出0，`/tmp/llmtuner-cpu-266.log`。最终文档/代码局部hooks通过。
+  未commit/push，无遗留运行任务，全局目标保持未完成。
+
+### 第267批：最终保存本地准备与模式报告失败
+
+- CHECKPOINT-FINAL-PREPARE-267：复读目标，沿_save_last_step追踪发现模型导出
+  dtype转换及model-only/full模式报告未协调，peer可继续进入writer collective。
+  新增模型导出报告故障的真实baseline退出1，Gloo send超时10000ms，port30318，
+  `/tmp/llmtuner-final-prepare-before-267.log`。
+- ModelCheckpointState.state_dict通信保持在本地协调区间外；其后dtype转换与
+  model-only报告进入Checkpoint final model preparation。full分支仅日志进入
+  Checkpoint final state reporting，随后_flatten_model_state通信仍在区间外。
+  转换失败可能已创建临时副本，但不修改live权重，不承诺分配失败的设备恢复。
+- checkpoint_load_coordination.py增加两模式报告 × 两rank × 三异常共12场景，
+  只注入logger，真实manager/save/load保持。owner原异常身份，peer精确阶段错误，
+  live模型/AdamW/scheduler不变，原恢复点实际重载成功；之前各类故障仍通过。
+  port30319退出0，`/tmp/llmtuner-final-prepare-after-267.log`。本项未实际注入
+  dtype转换分配失败，不能将日志故障证据当作设备OOM验证。
+- hf_checkpoint_equivalence.py真实CPU/Gloo两rank、native/custom FSDP、单/双
+  输出shard、consolidation/publication失败后保留旧权重并成功重写和fresh DTensor
+  模型精确加载，port30320退出0，`/tmp/llmtuner-hf-final-267.log`。不是HF转换
+  分配失败、设备或远程存储验证。
+- 局部hooks修正长行后通过；适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-all-267.log`；compileall、HEAD diff通过。未测新增同步开销。
+- 完整CPU4016 passed、4 skipped、990 warnings，90.91s，退出0，
+  `/tmp/llmtuner-cpu-267.log`；最终文档hooks通过。HF adapter.to_hf存在PP key
+  gather，后续不能将整个adapter转换放入仅限本地协调区间。未commit/push，无运行任务。
+
+### 第268批：HF本地键映射冲突的rank一致拒绝
+
+- HF-EXPORT-KEY-MAPPING-268：复读目标并确认上轮复现已终止。adapter.to_hf在
+  本地去除model前缀时可抛键冲突；peer则正常返回或进入indexed全局键gather。
+  baseline首个非indexed场景聚合为ValueError/NoneType，退出1，
+  `/tmp/llmtuner-hf-adapter-before-268.log`，port30321；该baseline未执行到indexed
+  超时场景，不将其描述为实际复现的挂起。
+- 仅本地dict键映射进入HF export key mapping错误协调；Kimi tensor转换与
+  PP全局coverage gather均保持在区间外。所有分布式rank须共同调用to_hf，包含
+  无source index路径。新增同步开销未测；后续clone/转换失败不由本次修复覆盖。
+- 新增hf_adapter_coordination.py，真实CPU/Gloo两rank/adapter/collective，
+  indexed与非indexed × 两故障rank四场景。owner具体ValueError、peer精确协调
+  RuntimeError，源mapping/tensor不变；随后健康disjoint keys全局覆盖通过，
+  返回本地tensor身份保持。仅普通Tensor字典，非实际PP schedule或FSDP runtime。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30322 tests/integration_tests/hf_adapter_coordination.py`，
+  退出0，`/tmp/llmtuner-hf-adapter-after-268.log`。真实hf_tied_export.py两rank、
+  native/custom FSDP、单/双shard导出、标准HF加载与logits精确，port30323退出0，
+  `/tmp/llmtuner-hf-tied-268.log`；非TP/PP或设备导出证据。
+- 适用全文件hooks退出0，`/tmp/llmtuner-hooks-all-268.log`；compileall、HEAD diff
+  通过。不关闭Kimi转换、clone失败、真实PP或目标设备缺口。
+- 首次完整CPU为2 failed、4014 passed、4 skipped，58.05s，
+  `/tmp/llmtuner-cpu-268.log`：旧PP key-set单测伪装初始化进程组却仅mock gather，
+  新增协调读取world size时失败。将该两例明确限制为key-set逻辑，局部mock协调
+  context；真实错误传播由上述四场景独立验证，未mock集成目标机制。最终适用全文件
+  hooks退出0，`/tmp/llmtuner-hooks-all-final-268.log`；run_all确认新脚本两rank发现。
+- 最终完整CPU4016 passed、4 skipped、752 warnings，81.91s，退出0，
+  `/tmp/llmtuner-cpu-final-268.log`；最终文档hooks及HEAD diff通过。未commit/push，
+  无遗留运行任务，全局目标未完成。
+
+### 第269批：adapter修改后的真实TP×FSDP tied HF导出
+
+- 复读原始目标并复核adapter与Kimi转换调用链。Kimi导出对可能为DTensor的权重
+  执行unbind，不能将整个转换直接纳入只允许本地操作的协调区间；本批不作未经
+  验证的包裹修复，Kimi异常传播缺口保持开放。未修改生产代码或测试。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30324 tests/integration_tests/hf_tied_export.py --tp-size 2`，
+  退出0，`/tmp/llmtuner-hf-tp-269.log`。CPU/Gloo四rank、TP2×DP shard2，
+  native/custom FSDP × 单/双输出shard四组合。实际TP参数切片与独立原始权重
+  chunk零容差一致，FSDP参数DTensor本地存储确为二分之一，权重共享身份保持。
+- 生产manager最终HF导出后，标准AutoModelForCausalLM加载；全部权重和logits
+  与变换前dense模型精确一致，加载后embedding/head仍共享。验证268批adapter
+  新增协调在该真实多轴导出路径可用，不是完整训练/恢复或性能验收。
+- indexed标志只设置输出shard mapping，adapter._hf_keys仍为None；不把该场景
+  称为source index coverage gather验证。未覆盖PP、Kimi、设备、故障注入或
+  source index存在时的多轴coverage；对应缺口继续保留。
+- 本批仅更新台账，完整CPU/全文件hooks沿用268批最终结果；文档局部hooks及
+  HEAD diff通过。未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第270批：真实TP×FSDP导出的全局源键覆盖
+
+- 复读原始目标，补齐269批明确遗漏的adapter._hf_keys全局检查：扩展既有
+  hf_tied_export.py的indexed场景，设置独立变换前dense state的完整源键集合，
+  保持输出双shard映射；生产源码不改，既有无源键集合场景仍保留。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30325 tests/integration_tests/hf_tied_export.py --tp-size 2`，
+  退出0，`/tmp/llmtuner-hf-source-index-270.log`。CPU/Gloo、TP2×DP shard2，
+  native/custom FSDP各单/双输出shard四场景通过；indexed=True实际触发全局
+  coverage gather，标准HF重载权重与logits零容差一致，训练与重载共享身份保持。
+- 测试直接设置预期源键集合，未从磁盘读取source index；不证明真实PP分离键、
+  Kimi、源index缺失/错误或设备能力，相关缺口保持。268批普通Tensor分离键
+  测试仍仅作为其限定机制证据，不拼接为真实PP导出验收。
+- 局部与适用全文件hooks通过，`/tmp/llmtuner-hooks-all-270.log`；compileall、
+  HEAD diff通过。
+- 完整CPU4016 passed、4 skipped、733 warnings，58.90s，退出0，
+  `/tmp/llmtuner-cpu-270.log`；最终文档hooks通过。未commit/push，无运行任务。
+
+### 第271批：磁盘HF源index装配到TP×FSDP导出
+
+- 复读目标，扩展hf_tied_export.py，替换270批直接赋值私有源键/分片mapping的
+  测试装配：rank0写入真实model.safetensors.index.json，各rank通过adapter构造
+  读取。使用alpha/zeta非编号文件名，独立断言完整源键及连续1/2分片编号映射。
+  非indexed场景仍保留，生产源码不改。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30326 tests/integration_tests/hf_tied_export.py --tp-size 2`，
+  退出0，`/tmp/llmtuner-hf-disk-index-271.log`；CPU/Gloo TP2×DP shard2、
+  native/custom FSDP × 有/无源index四场景，实际键coverage gather、最终HF
+  导出、标准HF重载、全部权重/logits精确及共享身份断言通过。
+- index为独立dense模型预期键生成的fixture，仅读取源元数据，不读取alpha/zeta
+  源权重文件；实际输出权重由生产writer写出并真实重载。不是完整源权重初始化、
+  PP、Kimi、设备或源index故障传播验收，保留对应缺口。
+- 首次hooks格式化测试，最终局部与适用全文件hooks通过，
+  `/tmp/llmtuner-hooks-all-271.log`；compileall、HEAD diff通过。
+- 完整CPU4016 passed、4 skipped、785 warnings，53.62s，退出0，
+  `/tmp/llmtuner-cpu-271.log`；最终文档hooks通过。未commit/push，无运行任务。
+
+### 第272批：HF reader与adapter输入职责复核
+
+- 复读原始目标，复核models/hf/state_dict_adapter.py与checkpointer/hf_storage.py，
+  以及DCP _load_checkpoint的HF转换→reader→from_hf→模型恢复调用链。本批未确认
+  新的生产缺陷，未修改代码或增加重复测试。
+- adapter构造只读取index键集合及导出分组，允许源shard尚未存在；实际reader
+  read_metadata在打开shard前拒绝非safetensors、绝对路径及含..的路径，并逐tensor
+  使用weight_map指定文件，避免同名额外tensor覆盖所需权重。嵌套generation相对
+  路径为生产发布格式，不应为统一文件名而拒绝。文件缺失/损坏仍由真实IO报错。
+- 执行`TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q tests/unit_tests/cpu/models/test_state_dict_adapter.py --disable-warnings`，
+  23 passed、11 warnings，4.28s，退出0，`/tmp/llmtuner-hf-reader-review-272.log`。
+  其中真实safetensors/DCP读取验证按index选文件，四种文件名分组往返及tied权重
+  导入/导出通过；key集合模拟单测仍仅覆盖其本地契约，真实rank证据沿用268/271。
+- 上述专项不覆盖恶意metadata offsets、设备IO、源index rank局部损坏后的初始化
+  传播或完整HF初始化/PP训练，不能据此宣称reader输入全域验收。Kimi转换及clone
+  失败边界仍开放。纯记录更新，完整CPU/全文件hooks沿用271批；文档hooks与
+  HEAD diff通过。未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第273批：Trainer装配HF源index局部失败的协调
+
+- CHECKPOINT-ADAPTER-BUILD-273：复读目标，沿assembly._build_checkpointer发现
+  HF adapter作为manager参数表达式求值，发生在manager本身的preflight前。
+  单rank源index JSON损坏时，该rank提前抛错，peer进入manager collective；
+  baseline退出1、Gloo recv超时10000ms，port30327，
+  `/tmp/llmtuner-adapter-build-before-273.log`。
+- assembly新增Checkpoint services preparation本地错误协调，只包含loader前置
+  条件、运行时状态登记与adapter文件读取；manager构造及可能的模型通信保持在
+  区间外。准备失败不会给trainer登记checkpointer，重试可重新准备。未改变源
+  index语义、格式或权重；未承诺后续manager构造任意故障的原子回滚。
+- 新增checkpoint_adapter_construction.py，真实helper/adapter文件IO/DCP manager，
+  最小trainer owner及DDP模型，不替换目标函数。损坏JSON/空weight_map × 两故障
+  rank共4场景，owner具体ValueError/JSONDecodeError、peer精确协调RuntimeError，
+  无checkpointer登记；修正磁盘index后实际构造与关闭成功，barrier继续。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30328 tests/integration_tests/checkpoint_adapter_construction.py`，
+  退出0，`/tmp/llmtuner-adapter-build-after-273.log`。不是完整Trainer装配、源权重
+  读取、PP/TP/EP、设备或Kimi转换失败验证。
+- 局部hooks格式化并修正长行后通过，适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-all-273.log`；compileall、HEAD diff通过。
+- 完整CPU4016 passed、4 skipped、766 warnings，58.07s，退出0，
+  `/tmp/llmtuner-cpu-273.log`；最终文档hooks通过，run_all确认自动发现两rank脚本。
+  未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第274批：保存协议与装配修复后的完整PP恢复
+
+- 复读目标，针对263–268及273批checkpoint参数、报告、GC/Future与adapter
+  装配同步顺序变化，复验完整Trainer路径；不沿用258批修改前的PP恢复结果。
+  复核Trainer构造失败close及原异常保留链路，未确认新的生产缺陷。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py dp4 pp2 custom compile ac validate async first_fit`，
+  退出0，`/tmp/llmtuner-pp-protocol-274.log`；产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-ridll158`。
+- CPU/Gloo四rank、DP2×PP2、custom FSDP、Interleaved1F1B每rank两parts、full AC、
+  aot_eager、每step验证、async中间保存及真实first_fit/Grain。连续/初始/恢复三个
+  独立OS作业；step2更新前七类状态和local DTensor布局精确匹配保存点，step4
+  终态精确匹配连续运行。EMA独立公式、实际编译图、AC/FSDP机制、有效token计数
+  与每次EMA更新通信0断言保留并通过。
+- 不覆盖HF导出、源index故障、其他并行轴、设备、拓扑变化或性能。本批不改代码，
+  完整CPU及全文件hooks沿用273批结果；文档局部hooks和HEAD diff通过。未commit/
+  push，无遗留运行任务，全局目标仍未完成。
+
+### 第275批：Kimi checkpoint转换与通信边界复核
+
+- 重新读取原始目标和dev-guide，沿HF adapter、DCP保存/源HF加载、Kimi模型及
+  optimizer转换、EP checkpoint聚合链路复核。未修改生产代码；不将整个Kimi
+  转换包装进本地错误协调区间，避免潜在DTensor操作中的collective违反边界。
+- convert_kimi_expert_state导出执行unbind，导入执行stack；optimizer转换还包含
+  索引、clone及torch.equal。普通tensor专项不证明DTensor布局下这些操作无通信。
+  gather_expert_state会对匹配的EP expert状态先full_tensor再聚合，但adapter直接
+  调用及其他状态路径仍需分别证明，不能由该局部聚合推导所有输入都是普通tensor。
+- 执行`TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q tests/unit_tests/cpu/models/test_kimi_checkpoint.py tests/unit_tests/cpu/models/test_kimi_optimizer_migration.py tests/unit_tests/cpu/models/test_kimi_dcp_layout.py --disable-warnings`：
+  30 passed、35 warnings，8.96s，退出0。覆盖既有普通/latent模型转换、meta模板、
+  映射拒绝及optimizer迁移契约；不证明真实多rank非对称失败协调、设备或PP恢复。
+- Kimi转换及tied-head clone失败传播仍开放；下一步应明确真实DTensor布局与
+  通信前置验证阶段，再以真实rank非对称错误复现推进，不能仅据静态阅读宣称修复。
+  本批仅更新台账，完整CPU及全文件hooks沿用273批，完整PP恢复沿用274批。
+  未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第276批：Kimi HF转换metadata失败协调
+
+- CHECKPOINT-KIMI-MAPPING-276：真实两Gloo rank复现单rank grouped expert数量错误。
+  故障rank提前抛错，peer进入HF前缀映射协调，随后故障rank的测试结果gather与其
+  通信失配；baseline port30329退出1，Gloo send超时10000ms，
+  `/tmp/llmtuner-kimi-before-276.log`。不将测试结果gather描述为生产DCP写入。
+- convert_kimi_expert_state先规划键映射及split/stack目标并验证元数据，再执行
+  张量操作。新增可选coordinate_errors默认False，HF adapter双向转换启用；独立
+  工具保持非SPMD契约。只协调键、维数、expert数量/完整性及键冲突，unbind/stack
+  保持在区间外。输出键与tensor语义保持，源dict不写入；不改变持久化格式。
+- 新增kimi_adapter_coordination.py：真实adapter/collective，导出expert数量错误与
+  导入缺expert × 两故障rank共4场景，owner ValueError、peer精确Kimi阶段
+  RuntimeError，健康重试及barrier通过。同组增加实际DTensor Replicate/Shard(1)
+  双向转换，与独立dense切片及完整权重精确比较通过；不是完整Trainer或EP训练。
+- 最终命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30331 tests/integration_tests/kimi_adapter_coordination.py`，
+  退出0，`/tmp/llmtuner-kimi-final-276.log`。早期普通tensor四场景port30330也退出0，
+  `/tmp/llmtuner-kimi-after-276.log`。runner自动发现两rank脚本。
+- 完整CPU4016 passed、4 skipped、969 warnings，71.04s，退出0，
+  `/tmp/llmtuner-cpu-276.log`。适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-276.log`；新增DTensor测试后局部hooks再次通过。
+  compileall、HEAD diff通过；设计文档同步更新。
+- 张量通信内部失败、stack shape不兼容、其他DTensor布局、optimizer转换非对称
+  失败及tied-head clone失败仍开放，新增同步开销未测。无设备或完整恢复新证据。
+  未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第277批：Kimi重复expert索引与形状预检
+
+- CHECKPOINT-KIMI-DUPLICATE-277：模型与optimizer导入使用int(index)后直接登记
+  dict，0与00两个不同源FQN会静默覆盖同一expert。修复为登记前拒绝重复数值
+  索引，包含optimizer state及param_groups，不改变正常输出格式。模型导入另在
+  metadata阶段拒绝同projection不同形状，避免直到区间外stack才局部失败。
+- 新增CPU7例：模型重复索引两种顺序、模型形状错误、optimizer两种顺序×两类
+  状态。修复前7 failed、11 passed，7.63s，退出1，
+  `/tmp/llmtuner-kimi-before-277.log`；不将其中形状RuntimeError称为静默丢失。
+- 扩展真实kimi_adapter_coordination.py：shape/duplicate × 两故障rank四新场景，
+  owner具体ValueError、peer精确Kimi协调RuntimeError；随后健康导入与barrier
+  成功。保留此前四场景及Replicate/Shard(1)真实DTensor独立dense精确往返。
+  命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30332 tests/integration_tests/kimi_adapter_coordination.py`，
+  退出0，`/tmp/llmtuner-kimi-after-277.log`。
+- 完整CPU4023 passed、4 skipped、849 warnings，55.05s，退出0，
+  `/tmp/llmtuner-cpu-277.log`。适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-277.log`；compileall及HEAD diff通过，设计文档已同步。
+- 不证明optimizer转换多rank失败协调、张量通信故障、其他布局、设备或完整
+  Trainer恢复。已有通信内部故障及clone失败项继续开放。未commit/push，
+  无遗留运行任务，全局目标未完成。
+
+### 第278批：真实DCP Kimi optimizer/EMA转换拒绝与重试
+
+- 复核kimi_layout.load_changed_kimi_layout：源迁移模板来自实际DCP读取的完整
+  CPU tensor，optimizer/EMA转换已位于Kimi checkpoint layout conversion本地
+  协调区间内，目标DTensor模板获取与place通信在区间外。因此该生产路径无需
+  给独立optimizer转换函数另加collective；不能由此证明任意直接调用都协调。
+- 新增kimi_layout_preflight.py，真实DCP save/load及小型latent MoE，不替换
+  converter/reader/状态写入。先真实AdamW更新并登记EMA，再写入optimizer/EMA
+  × duplicate/shape四种坏checkpoint；两个rank读取同一坏输入，均收到具体
+  ValueError。拒绝后model、optimizer、EMA全部state_dict及host torch RNG精确
+  保持；同一目标对象随后加载独立健康checkpoint成功，barrier继续。
+- 健康重试后模型输出与源布局独立执行对照1e-6；grouped w1的exp_avg及ema_params
+  与源individual expert值按索引独立stack精确一致。不宣称此选定key比较证明
+  所有optimizer字段终态精确，也未执行后续训练更新或完整Trainer恢复。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30333 tests/integration_tests/kimi_layout_preflight.py`，
+  退出0，`/tmp/llmtuner-kimi-preflight-278.log`；runner发现两rank脚本。
+- 两rank均读相同损坏数据，不是非对称文件损坏、FSDP/EP mesh、设备或通信故障
+  验证。本批仅增加集成脚本与台账，生产/CPU测试未变；完整CPU沿用277批
+  4023 passed、4 skipped。适用全文件hooks、compileall和HEAD diff检查通过。
+  首轮hooks为工作区新增.gitignore的moonep/条目补末尾换行，保留该外部条目，
+  审阅后重跑通过。未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第279批：Kimi真实Trainer HF加载与导出组合复验
+
+- 针对276/277的Kimi adapter协调及转换规划改动，运行实际Trainer构造、meta
+  materialization、初始HF加载、训练及HF导出，未以普通tensor转换测试替代。
+  本批没有新的生产代码或测试改动。
+- 两rank命令环境`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 LLMTUNER_TEST_KIMI=1 LLMTUNER_TEST_KIMI_MOE=1 LLMTUNER_TEST_KIMI_LATENT=1 LLMTUNER_TEST_EP_SIZE=2 LLMTUNER_TEST_PP_SIZE=1 LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom`，
+  `python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30334 tests/integration_tests/kimi_hf_initial_load.py WORKDIR`，
+  退出0，`/tmp/llmtuner-kimi-hf-279.log`。WORKDIR为
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-kimi-hf-279-gmei37wa`。
+  CPU/Gloo、FP32、dense dp_shard2、EP2/efsdp1、TP/PP/CP1、alltoall、latent MoE，
+  eager、AC关闭。原HF checkpoint由同脚本独立未转换模型真实写入safetensors。
+- 四rank同环境增加`LLMTUNER_TEST_AC=full LLMTUNER_TEST_COMPILE_BACKEND=aot_eager`，
+  nproc4、port30335，退出0，`/tmp/llmtuner-kimi-hf4-279.log`；WORKDIR
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-kimi-hf4-279-6an8qzu9`。
+  dense dp_shard4、EP2/efsdp2，其余轴1；full AC实际装配到两层，训练helper断言
+  OptimizedModule及unique_graphs>0。不是Inductor设备内核或AC性能验证。
+- 两场景均逐key精确核对初始加载权重；独立原模型logits对照1e-6；实际训练两步，
+  保存完整训练checkpoint，再在独立model-export目录导出HF。导出前后原checkpoint
+  文件sha256保持，运行时快照保持；磁盘导出权重与训练后快照精确一致，原HF
+  模型strict加载后logits对照1e-6，再确认训练权重不变并继续一次更新成功。
+- 不覆盖新进程完整恢复、拓扑变化、PP/TP/CP、设备、失败注入或性能；不能把
+  HF权重初始化称为optimizer/RNG全状态恢复。记录中重复root日志符合当前应用
+  handler传播契约，未因此修改logger。完整CPU/代码hooks沿用277/278；本批
+  文档hooks及HEAD diff通过。未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第280批：HF tied-head clone局部失败协调
+
+- CHECKPOINT-HF-CLONE-280：复读目标，检查当前PyTorch DTensor clone的保持布局
+  策略；真实两rank Replicate/Shard(0)/Partial(sum) clone均记录通信0、local
+  storage不别名、full_tensor与独立dense精确一致。该证据限定当前PyTorch实现，
+  不据此推导任意Tensor subclass或未来版本均无通信。
+- baseline通过patch仅使指定普通tensor的clone抛错，真实adapter两rank返回
+  OSError/NoneType，断言失败退出1，port30336，
+  `/tmp/llmtuner-hf-clone-before-280.log`。未诱发实际OOM，也未观察DCP超时。
+- adapter对tied配置新增HF export tied weights阶段，所有rank参与，包括缺少
+  tied键的PP式局部dict；仅实际持有两键时clone。tensor clone不含collective，
+  global coverage gather仍在区间外。源权重不变，导出保留独立storage。
+- 新hf_clone_coordination.py真实Gloo/adapter，双方持有head或一方仅持other ×
+  两故障rank × OSError/KeyboardInterrupt/SystemExit共12场景通过；owner保留
+  异常identity，peer精确阶段RuntimeError；健康重试及barrier通过。port30337，
+  `/tmp/llmtuner-hf-clone-after-280.log`，退出0；不是完整PP模型或设备OOM验证。
+- 四rank真实HF导出命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30338 tests/integration_tests/hf_tied_export.py --tp-size 2`，
+  退出0，`/tmp/llmtuner-hf-tied-280.log`。TP2×FSDP2，native/custom×一/两shard，
+  真实源index构造及coverage、标准HF重载权重/logits精确一致，ties保留。
+- 完整CPU4023 passed、4 skipped、951 warnings，61.40s，退出0，
+  `/tmp/llmtuner-cpu-280.log`；适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-280.log`。compileall、HEAD diff与文档hooks通过。
+- 运行期间外部更新HEAD为7b00b21并暂存多个测试文件；本agent未操作index、
+  commit或push，保留外部变动。最终检查确认HEAD含本批adapter协调实现，当前
+  测试路径含已验证脚本。设备分配故障、其他tensor布局/子类及同步性能仍未验证。
+  无遗留运行任务，全局目标未完成。
+
+### 第281批：数据packing恢复回滚后的清理报告保护
+
+- DATA-PACKING-CLEANUP-281：回到数据主链，复核loader_builder、GrainDataLoader、
+  HF source cursor及DocumentAwareConcatThenSplitIterator，检查数据身份、游标
+  验证及清理。确认packing set_state原错误→parent rollback失败→logger异常会
+  跳过self.close并掩盖原错；cleanup失败后的报告也可能覆盖原错。
+- 扩展既有回归为原始ValueError/KeyboardInterrupt × 无报告错误/OSError/
+  KeyboardInterrupt/SystemExit × close成功/失败16例。修复前先出现2 failed、
+  2 passed，随后未保护的报告KeyboardInterrupt中断pytest，退出2，2.34s，
+  `/tmp/llmtuner-packing-before-281.log`；不是16例全执行或真实线程泄漏证据。
+- 两个报告点分别保护BaseException，确保尝试close并保留最初恢复异常identity。
+  不新建封装，不改正常packing、父游标回滚策略或持久化格式。close本身失败时
+  仅保证尝试与原错误保留，不保证底层资源已释放。
+- 修复后专项16 passed、412 deselected，2.27s，退出0，
+  `/tmp/llmtuner-packing-after-281.log`。实际Grain packing iterator与parent，
+  仅注入恢复、rollback、报告及close错误；断言原异常identity、close调用一次、
+  实际父子closed及拒绝后续next。未宣称分布式/设备故障或prefetch线程验证。
+- 对照本地torchtitan components/data/loader.py load/close契约及packing归属，
+  本地增加的rollback/报告保护是失败生命周期适配；未将其误标为上游现成逻辑。
+- 完整CPU4037 passed、4 skipped、1116 warnings，92.84s，退出0，
+  `/tmp/llmtuner-cpu-281.log`。适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-281.log`；compileall、HEAD diff及最终文档hooks通过。
+  当前外部HEAD f5ec685，保留已有工作区；本agent未commit/push或改index。
+  无遗留运行任务，全局目标未完成。
+
+### 第282批：packing remainder游标的可变状态所有权
+
+- DATA-PACKING-ALIAS-282：DocumentAwareConcatThenSplitIterator有remainder时，
+  get_state直接返回内部_remainder_parent_state；set_state又直接缓存调用方
+  state[parent]。外部修改已导出或已接受payload会污染下一次checkpoint的parent
+  位置，导致后续恢复失败或错误重放。GrainDataLoader外层deepcopy不能修复
+  set_state内部保留输入别名这一边界。
+- 新增export/restore两例，真实Grain map parent及packing：消费首行，取得或恢复
+  checkpoint后清空外部parent字典，断言内部state不变；新iterator恢复后与原
+  iterator下一行均应为独立已知token[3,4]。首轮测试误用局部assert辅助函数，
+  退出1；完整CPU首轮也因这两处NameError失败，日志保留
+  `/tmp/llmtuner-packing-alias-before-282.log`、`/tmp/llmtuner-cpu-282.log`，
+  不将其当作生产bug证据。
+- 修正断言后，暂时仅撤回本批ownership改动（保留281清理修复），运行两例再
+  在finally恢复源码：2 failed、428 deselected，2.11s，退出1，
+  `/tmp/llmtuner-packing-alias-baseline-282.log`，实际因parent字典被清空而失败。
+  最终实现读取parent前复制快照、导出复制、恢复输入独立保留及独立传给parent；
+  rollback快照也独立。无状态格式/版本迁移。相关25例通过，
+  `/tmp/llmtuner-packing-alias-final-282.log`，2.80s。
+- 完整CPU最终4039 passed、4 skipped、740 warnings，49.68s，退出0，
+  `/tmp/llmtuner-cpu-final-282.log`。适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-282.log`；compileall、HEAD diff及文档hooks通过。
+- 实际新进程恢复命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py corpus async`，
+  退出0，`/tmp/llmtuner-packing-resume-282.log`，产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-p1hh3gi1`。
+  单CPU、eager、无AC、真实JSONL/Grain、max_documents1文档感知concat、async中间
+  保存，连续/初始/恢复三独立OS作业；加载边界及最终Trainer/EMA完整快照精确。
+  未覆盖多rank、设备、其他packing或性能；metadata复制成本未测。
+- HF cursor复核中确认当前datasets.state_dict自身deepcopy，未据表面调用缺少
+  deepcopy额外改动其实现。设计文档已同步；未commit/push，无遗留运行任务，
+  全局目标未完成。
+
+### 第283批：关闭后的packing恢复不得访问parent
+
+- DATA-PACKING-CLOSED-283：DocumentAwareConcatThenSplitIterator.__next__已有
+  closed检查，set_state却没有。真实Grain parent下，无remainder的保存点可在
+  close后恢复成功；带remainder时恢复也先访问/修改parent才因next失败，随后
+  执行rollback。与HF cursor已有的入口关闭检查不一致。
+- 两例分别保存未消费/有remainder状态，关闭后调用恢复，记录真实parent
+  set_state调用，要求入口ValueError且零访问、状态不变。修复前2 failed、
+  430 deselected，2.26s，退出1，`/tmp/llmtuner-packing-closed-before-283.log`。
+  在set_state入口加入既有_assert_not_closed，不改变打开状态的恢复或格式。
+- 修复后closed、ownership及rollback报告专项20 passed、412 deselected，
+  1.64s，退出0，`/tmp/llmtuner-packing-closed-after-283.log`；保留真实父子
+  closed及重复close断言。不将spy观测parent调用称为分布式IO故障注入。
+- 完整CPU4041 passed、4 skipped、947 warnings，82.10s，退出0，
+  `/tmp/llmtuner-cpu-283.log`。适用全文件hooks退出0，
+  `/tmp/llmtuner-hooks-283.log`；compileall、HEAD diff及文档hooks通过。
+- 不涉及collective/mesh/数值变化；新进程普通打开游标恢复证据沿用282批，未重跑
+  设备或分布式恢复。get_state仍允许关闭后只读观测，不新加无必要的读取限制。
+  未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第284批：数据组合复核与文档packing多rank完整恢复
+
+- 复读目标，复核composition.py及packing/build.py：map transforms/filter后
+  global shuffle→按余数均分的连续DP slice→repeat，concat先有限子图合并再
+  应用全局策略；mix校验正有限Real及可表示比例，finite停止首个耗尽child是
+  已公开契约，不将其误判为保证完整遍历。未确认新生产缺陷，未修改代码。
+- 数据组合/concat/unevenDP/shuffle专项42 passed、390 deselected，6.02s，
+  退出0，`/tmp/llmtuner-data-composition-284.log`；包括权重数值边界拒绝、
+  streaming混合、concat等价及uneven repeated epoch覆盖，不证明所有外部源。
+- 针对281–283的文档packing生命周期/ownership变动，执行
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py dp4 pp2 custom compile ac validate async corpus`，
+  退出0，`/tmp/llmtuner-pp-corpus-284.log`；产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-1s9ll3lj`。
+- CPU/Gloo四rank、DP2×PP2、custom FSDP、Interleaved1F1B四stages每rank两parts、
+  full AC、aot_eager、每step验证、真实JSONL/Grain/max_documents1文档concat、
+  async中间checkpoint。连续/初始/恢复三个独立OS作业；加载边界和终态完整
+  状态及local DTensor layouts精确，沿用独立EMA公式/通信0、token及机制断言。
+  已检查三作业日志与四rank快照产物，不仅依赖driver单行摘要。
+- 不覆盖first_fit新回归、其他并行轴、设备、finiteDP或性能。完整CPU及代码
+  hooks沿用283批4041 passed、4 skipped与适用全文件hooks；本批文档hooks及
+  HEAD diff通过。未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第285批：验证模式、RNG与token/loss归约复核
+
+- 复读原始目标，复核trainer/runtime/validation.py及utils/seeding.py：验证前
+  等待checkpoint staging，逐module保存training而非仅根模式，保存mask/kernel
+  policy，ExitStack捕获RNG；模式finally恢复、临时loader清理与成功路径RNG
+  cleanup协调各有边界。本批未确认新的生产缺陷，不新增重复保护或拆分trainer。
+- CPU命令`TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q tests/unit_tests/cpu -k 'validation or preserve_rng' --disable-warnings`，
+  117 passed、3928 deselected、2 warnings，4.12s，退出0，
+  `/tmp/llmtuner-validation-review-285.log`。不是完整CPU重跑，完整结果沿用283。
+- 真实Trainer/FSDP两rank validation_rng_coordination.py，故障rank0/1 ×
+  OSError/KeyboardInterrupt/SystemExit × setup/cleanup共12场景；实际RNG
+  capture/setter局部注入，assert mode/host RNG/loader关闭边界，均通过。命令
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30339 tests/integration_tests/validation_rng_coordination.py`，
+  退出0，`/tmp/llmtuner-validation-rng-285.log`。失败的RNG源由测试显式恢复，
+  不将setter本身失败后的stream称为自动完整恢复。
+- validation_reduction_equivalence.py真实四rank Gloo DP2×CP2、DP2×TP2 meshes，
+  生产validation循环/collective配确定性局部projection及显式序列slice，独立
+  full-batch summed CE/valid token参考1e-7通过；验证临时loader关闭、root train
+  与子module eval保留、训练ntokens_seen不变。port30340，退出0，
+  `/tmp/llmtuner-validation-reductions-285.log`；其余环境同上，不需要设备。
+- 上述归约测试不是实际CP attention、TP模型变换或FSDP多轴数值证明；实际PP
+  训练验证及新进程恢复沿用284。全局设备/多轴及数值开放项未关闭。本批纯记录，
+  文档hooks与HEAD diff通过；未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第286批：训练有效token累积与非有限更新边界复核
+
+- 复读目标，复核Trainer.train_step/forward_backward、reduction meshes及
+  _clip_and_check_finite：全累积窗口有效token先DP归约，每组summed loss共用
+  denominator；TP复制梯度在clip前归约，loss/norm世界一致有限性检查先于
+  optimizer→scheduler→EMA。零有效token在forward前拒绝。未确认新生产缺陷。
+- 实际Trainer CPU/Gloo FSDP2 accumulation_equivalence.py，三步AdamW，rank及
+  accumulation group掩码不同，独立逐forward summed loss/全局token参考，
+  loss、梯度和更新参数均通过原容差atol2e-6/rtol2e-5。port30341退出0，
+  `/tmp/llmtuner-accumulation-286.log`。
+- 同脚本四rank HSDP replicate2×shard2：生产路径仅最后组replica归约，参考每组
+  backward均归约，三步结果同样通过。port30343退出0，
+  `/tmp/llmtuner-hsdp-accumulation-286.log`。两场景均真实模型/FSDP非mock，不
+  宣称独立dense或FP64 oracle，也未扩展到custom、TP/CP/EP/PP组合。
+- trainer_nonfinite_update.py真实Trainer两rank native FSDP2，loss NaN/局部
+  gradient Inf × 两故障rank共四场景；更新前统一拒绝，模型/optimizer/scheduler/
+  EMA/local layouts快照保持；新梯度健康更新继续。port30342退出0，
+  `/tmp/llmtuner-nonfinite-286.log`。只注入返回loss或backward后gradient，未模拟
+  设备assert；数据/RNG不回滚，不能宣称整步事务或CUDA可恢复。
+- 上述命令环境`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=N --master_addr=127.0.0.1 --master_port=PORT tests/integration_tests/SCRIPT.py`，
+  N/PORT/SCRIPT分别为2/30341/accumulation_equivalence、4/30343/accumulation_equivalence、
+  2/30342/trainer_nonfinite_update。本批不改代码，完整CPU/代码hooks沿用283；
+  文档hooks、HEAD diff通过。未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第287批：多轴范数计数、低精度与空梯度复核
+
+- 复读目标，沿Trainer._clip_and_check_finite复核accelerator.collectives的dense/
+  TP/expert分组：EP ownership优先避免同参数重复计数，复制dense不跨TP/EP重复
+  累加，PP按stage归约；低精度在本地范数计算前提升FP32，DTensor norm物化后
+  统一裁剪。未确认新生产缺陷，未改代码。
+- parallel_grad_norm_equivalence.py两rank真实Gloo：PP/TP/EP各轴FP16 overflow、
+  foreach两分支，真实Shard DTensor FP16/BF16，空grad及无参数peer参与，独立
+  FP64 full vector norm与裁剪参考通过。port30345退出0，
+  `/tmp/llmtuner-norm2-287.log`。原norm/clip容差保留，未放宽。
+- 同脚本四rank真实PP2×TP2、PP2×EP2 meshes，复制dense与分片贡献独立full-vector
+  参考，L1/L2/Inf范数及裁剪rtol1e-14通过；单shard NaN全局拒绝且梯度未改。
+  port30344退出0，`/tmp/llmtuner-norm4-287.log`。仅norm原语与手工grad，不是
+  完整模型布局、实际PP反向或设备内核验证。
+- 命令环境`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=N --master_addr=127.0.0.1 --master_port=PORT tests/integration_tests/parallel_grad_norm_equivalence.py`，
+  N/PORT分别2/30345与4/30344。
+- 最初CPU筛选-k 'clip_grad or grad_norm'未选中测试，4045 deselected、exit5，
+  `/tmp/llmtuner-norm-unit-287.log`，不是通过证据。改用明确路径
+  `TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q tests/unit_tests/cpu/accelerator/test_collectives.py tests/unit_tests/cpu/test_trainer.py -k 'norm or clip' --disable-warnings`：
+  18 passed、157 deselected，3.92s，退出0，`/tmp/llmtuner-norm-unit-final-287.log`。
+- 完整CPU及代码hooks沿用283批，设备/多轴整模开放项未关闭。本批文档hooks与
+  HEAD diff通过；未commit/push，无遗留运行任务，全局目标未完成。
+
+### 第288批：CLI配置入口与seed→分布式恢复复核
+
+- 复读目标，核对pyproject console script、__main__、trainer/cli.py及
+  config/cli_config.py：两入口共用main，显式关闭args-file隐式通道；scalar视图
+  隐藏nested/programmatic字段且校验陈旧表项；from_groups按既定组装配。
+  main保留训练/清理原异常并最终销毁进程组。未确认新的生产缺陷，未改代码。
+- 配置专项`TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q tests/unit_tests/cpu/test_config.py tests/unit_tests/cpu/test_parallel_plan_config.py --disable-warnings`，
+  312 passed，5.13s，退出0，`/tmp/llmtuner-cli-config-288.log`。最初查找不存在的
+  config_io.py后确认实际文件是cli_config.py，未为不存在接口添加兼容壳。
+- 实际CLI命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/cli_checkpoint_equivalence.py seed dp2 custom async first_fit`，
+  退出0，`/tmp/llmtuner-cli-seed-288.log`，产物
+  `/var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-cli-resume-zkxaqifd`。
+  单进程step0 seed生成及独立加载边界、双rank custom FSDP训练，真实JSONL/
+  FirstFit、async中间保存；连续与恢复独立进程完整语义checkpoint状态精确。
+- 本场景无TP/PP/CP/EP、EMA/validation/compile，其programmatic-only限制在
+  脚本docstring明确；不将其称为所有CLI功能或目标设备验收。完整CPU和代码
+  hooks沿用283；本批文档hooks、HEAD diff通过。未commit/push，无遗留运行
+  任务，全局目标未完成。
+
+### 第289批：共享/冻结参数分组与pattern FSDP复核
+
+- 复读目标，检查optimizer.py实际分组实现（无独立param_groups.py）：仅训练参数
+  参与，任意alias匹配但按identity单次登记，checkpoint采用首注册canonical FQN，
+  wrapper键冲突、漏参及跨本地parts重复登记明确拒绝。未确认新缺陷，不做无收益
+  文件拆分。CPU optimizer目录296 passed、2 warnings，2.04s，退出0，
+  `/tmp/llmtuner-optimizer-289.log`。
+- pp_optimizer_groups.py真实两rank PP mesh，stage专属rule及独立AdamW更新精确
+  对照，unused rule拒绝，单rank planning/initialization/unknown_options失败
+  协调均通过。port30346退出0，`/tmp/llmtuner-pp-groups-289.log`。小模块与真实
+  optimizer，不是完整PP schedule或完全冻结stage训练证明。
+- pattern_fsdp_equivalence.py --prefetch-window 5真实两rank，native/custom引擎、
+  多种共享/alias pattern units、expert HSDP override及三步SGD独立dense参考
+  通过；保持原容差，未改实现。port30347退出0，
+  `/tmp/llmtuner-pattern-shared-289.log`。不是custom multi-context或设备性能证据。
+- torchrun环境`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=PORT tests/integration_tests/SCRIPT.py [ARGS]`，
+  PORT/SCRIPT为30346/pp_optimizer_groups和30347/pattern_fsdp_equivalence，后者
+  ARGS为--prefetch-window 5。未做全域共享参数恢复验收；完整CPU与代码hooks沿用
+  283。本批文档hooks与HEAD diff通过，未commit/push，无遗留运行任务，目标未完成。
+
+### 第290批：完全冻结PP本地stage的装配阻断复现
+
+- 重新读取原始目标和dev-guide，复核optimizer.py、lr_scheduler.py及
+  runtime/assembly.py::_build_optimizer_stack。optimizer仅收集requires_grad参数，
+  PP规则跨rank匹配，因此本地完全冻结时可合法得到零inner optimizer；scheduler
+  显式要求非空，两者契约在实际装配处不一致。
+- **PP-FROZEN-SCHEDULER-290（P2，开放）**：两rank CPU/Gloo真实PP mesh，rank0
+  Linear全部冻结、rank1可训练，使用生产OptimizersContainer、build_lr_scheduler
+  和装配同名synchronize_local_errors边界。rank0优化器数量0并抛ValueError
+  “needs at least one optimizer”，rank1数量1并收到peer RuntimeError；双方随后
+  barrier通过。确认装配阻断，未观察到该边界死锁；不是完整Trainer/PP schedule证明。
+- 复现命令：`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30348 /tmp/llmtuner-frozen-pp-290.py`，
+  输出重定向`/tmp/llmtuner-frozen-pp-290.log`，退出0（脚本断言预期失败）。临时
+  脚本仅作诊断，尚无仓库回归。scheduler单测命令
+  `pytest -q tests/unit_tests/cpu/components/optimizer/test_lr_scheduler.py --disable-warnings`，
+  51 passed、1.08s、退出0，不能证明冻结stage支持。
+- 下一步：核对实际PP schedule对冻结/无参数stage的反向契约；实现无虚假参数的
+  持久化scheduler进度，保留现有last_epoch格式、越界和不同inner进度拒绝语义。
+  验收须包含真实PP前后向、冻结权重不变、可训练stage独立参考更新，以及新进程
+  完整恢复。不能仅删除非空检查或以拒绝冻结架构替代目标支持。
+- 本批未修改生产代码；原有packing与文档改动及prompt.md保留。全套CPU/代码门禁
+  仍以283为最近证据，不声明本批重新运行。无遗留进程，未commit/push，目标未完成。
+
+### 第291批：空optimizer scheduler进度与冻结PP前后向
+
+- 续接PP-FROZEN-SCHEDULER-290：lr_scheduler.py允许零inner optimizer，独立记录
+  无参数stage的last_epoch；step/load维护进度，保存格式仍仅last_epoch。非空时仍从
+  实际LambdaLR读取共同进度并拒绝分歧；不引入虚假参数或optimizer，空metrics为{}。
+- 单测新增空/非空source×target四种进度恢复，覆盖三步保存、加载后继续至终点、
+  空字典no-op、越界step/load不改变进度；非空恢复学习率与连续运行参考相同。
+  修复前3 failed/1 passed（退出1，/tmp/llmtuner-scheduler-before-291.log），
+  修复后scheduler目录单文件55 passed、0.94s、退出0。
+- 新增tests/integration_tests/pp_frozen_stage_equivalence.py：真实两rank CPU/Gloo
+  ComposablePipelineStage+Schedule1F1B，两microbatch，分别冻结首stage和末stage，
+  各三步生产OptimizersContainer/调度更新。与独立完整dense FP64模型比较输出、
+  summed loss/full-batch分母、梯度、AdamW参数，atol=rtol=1e-12；冻结参数逐位不变。
+  两场景两rank均通过。命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30349 tests/integration_tests/pp_frozen_stage_equivalence.py`，
+  退出0，/tmp/llmtuner-frozen-pp-291.log。环境Python3.13.12/PyTorch2.14.0/
+  macOS26.3 arm64。未测试FSDP、compile、其他schedule或全局完全冻结模型。
+- 问题290装配根因已修复；整体条目仍开放，下一步用完整Trainer验证真实LLM冻结
+  本地stage、新进程模型/optimizer/scheduler/EMA/游标/RNG恢复及连续训练对照。
+  此处低层两Linear训练和调度状态恢复不能替代该验收。
+- 全部适用已跟踪文件及未跟踪tests运行pre-commit（排除受保护示例、prompt.md、
+  moonep/），退出0，/tmp/llmtuner-hooks-291.log；审阅自动格式化，仅新integration
+  脚本调整行宽。compileall与HEAD diff检查通过。完整CPU命令
+  `TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4045 passed、4 skipped、1283 warnings、144.21s，退出0，
+  /tmp/llmtuner-cpu-291.log。全部运行任务已结束。
+- 保留原有packing、文档、.gitignore和prompt改动；本批未stage/commit/push。
+
+### 第292批：冻结PP stage完整Trainer新进程恢复
+
+- 扩展pp_checkpoint_equivalence.py，环境变量LLMTUNER_TEST_FROZEN_PP_STAGE=0/1
+  在生产split_model_into_stages调用前按实际assignment冻结对应模块，随后仍使用
+  原始模型分割、并行变换、Trainer、optimizer、scheduler及DCP路径。仅支持两rank
+  PP2/1F1B；每步断言冻结rank零inner optimizer、全参数requires_grad=False、grad
+  为None、权重逐位不变及scheduler进度等于Trainer.step。
+- 首段冻结full退出0；初次resume退出1，原测试要求每rank均有Adam moments，
+  但该rank设计上无训练参数。日志/tmp/llmtuner-frozen-resume-292.log显示两rank
+  pre-update state failures=0，唯一FAIL为rank0 optimizer state is empty；不是
+  生产恢复缺陷。仅对明确冻结rank改为零optimizer及严格空state断言；可训练rank
+  仍要求非空、非零moments，所有保存点/最终状态比较保留。
+- 环境Python3.13.12/PyTorch2.14.0/macOS arm64 CPU/Gloo，Qwen3两层，PP2，
+  1F1B四microbatch，global_batch8/seq32，四步AdamW，step2保存，独立torchrun
+  进程恢复后再两步。EMA dynamic、RNG与loader快照均开启。首段和末段冻结两组
+  full/resume均最终退出0：加载后更新前完整状态精确一致；最终模型、optimizer、
+  scheduler、EMA、trainer/token、loader和host RNG精确一致，loss尾段最大差异0。
+- 通用命令前缀`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 LLMTUNER_TEST_FROZEN_PP_STAGE=STAGE LLMTUNER_TEST_EMA=dynamic LLMTUNER_TEST_RNG_STATE=1 LLMTUNER_TEST_LOADER_STATE=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 OMP_NUM_THREADS=1 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=PORT tests/integration_tests/pp_checkpoint_equivalence.py PHASE ROOT`。
+  首段STAGE0：full30350/resume最终30353，ROOT=/tmp/llmtuner-frozen-first-292，
+  日志/tmp/llmtuner-frozen-full-292.log与/tmp/llmtuner-frozen-resume-final-292.log；
+  首次失败resume30351，保留原日志。首段full未显式设置OMP，torchrun默认置1。
+  末段STAGE1：full30352/resume30354，ROOT=/tmp/llmtuner-frozen-last-292，日志
+  /tmp/llmtuner-frozen-last-full-292.log和/tmp/llmtuner-frozen-last-resume-292.log。
+- 首段另外配置LLMTUNER_TEST_AC=full、LLMTUNER_TEST_COMPILE_BACKEND=aot_eager，
+  full30355/resume30356，ROOT=/tmp/llmtuner-frozen-compiled-292；日志
+  /tmp/llmtuner-frozen-compiled-full-292.log与/tmp/llmtuner-frozen-compiled-resume-292.log，
+  均退出0。既有断言验证每个part为OptimizedModule及非零compiled graphs；两rank
+  加载边界failures=0，所有最终比较通过，loss差异0。非CUDA Inductor性能证明。
+- PP-FROZEN-SCHEDULER-290：装配缺陷和CPU PP2 eager新进程完整恢复验收已完成；
+  首段fullAC/aot_eager恢复也有证据。末段compile、FSDP/其他轴、interleaved与
+  全局完全冻结模型不在本批结论内，不将配置中fsdp=native标签视作DP1实际FSDP。
+- 完整CPU `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4045 passed、4 skipped、841 warnings、54.73s，退出0，/tmp/llmtuner-cpu-292.log。
+  适用全部文件hooks退出0，/tmp/llmtuner-hooks-292.log，排除受保护示例、prompt.md
+  和moonep/；格式化后审阅仅测试调整。compileall与HEAD diff通过，文档另跑hooks。
+  原有改动保留，无运行任务，未stage/commit/push，全局目标仍未完成。
+
+### 第293批：冻结PP stage × custom FSDP2完整恢复
+
+- 续接292，pp_checkpoint_equivalence.py冻结场景扩至四rank；仍限制PP2/1F1B，
+  真实assignment冻结后走原生产分割与变换。四rank额外断言dp_shard=2、所有
+  本地part为FSDPModule且全部参数为DTensor，避免仅凭配置标签宣称FSDP覆盖。
+- 四rank CPU/Gloo PP2×custom FSDP2，分别冻结首stage和末stage。每组独立
+  full/resume两个torchrun进程，四步AdamW、step2保存后继续两步；dynamic EMA、
+  loader/RNG状态均启用。冻结rank零inner optimizer/空state、参数无grad且逐位
+  不变；可训练rank非零moments；scheduler随Trainer进度推进。所有加载边界完整
+  状态比较failures=0，最终模型、optimizer、scheduler、EMA、trainer/token、
+  loader与host RNG精确一致，loss尾段最大差异0。四个作业均退出0，无失败重启。
+- 命令通用前缀`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 LLMTUNER_TEST_WORLD_SIZE=4 LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom LLMTUNER_TEST_EMA=dynamic LLMTUNER_TEST_RNG_STATE=1 LLMTUNER_TEST_LOADER_STATE=1 LLMTUNER_TEST_FROZEN_PP_STAGE=STAGE python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=PORT tests/integration_tests/pp_checkpoint_equivalence.py PHASE ROOT`。
+  STAGE0 full30357/resume30358，STAGE1 full30359/resume30360；
+  ROOT=/tmp/llmtuner-frozen-fsdp-stage{STAGE}-293；日志
+  /tmp/llmtuner-frozen-fsdp-stage{STAGE}-{PHASE}-293.log。
+  环境沿用292：Python3.13.12/PyTorch2.14.0/macOS arm64 CPU。
+- 本批只扩展集成验收，无生产代码修改。使用连续运行作为恢复参考，不是四rank
+  独立dense数值参考；独立dense梯度/更新证据仍仅291两Linear PP2。没有覆盖
+  native FSDP、HSDP、TP/CP/EP、其他schedule、四rank AC/compile或目标设备性能。
+- 适用全部文件pre-commit退出0，/tmp/llmtuner-hooks-293.log，排除受保护示例、
+  prompt.md、moonep/，审阅格式化仅测试行宽。compileall、HEAD diff通过；完整CPU
+  `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4045 passed、4 skipped、727 warnings、42.44s，退出0，/tmp/llmtuner-cpu-293.log。
+  全部任务已结束；原有改动保留，未stage/commit/push，全局目标未完成。
+
+### 第294批：交错PP本地parts混合冻结恢复
+
+- 复读目标及当前状态，复核scheduler失败/恢复校验，未确认额外生产缺陷。
+  扩展pp_checkpoint_equivalence.py至Interleaved1F1B；冻结仍按实际全局stage
+  assignment发生在生产分割前。原测试将stage owner等同全rank冻结，仅适用1F1B，
+  本批改为逐part计算trainable parts并核对inner optimizer数量，仅保存实际冻结
+  参数快照；全rank冻结才要求空optimizer checkpoint。保留非空rank非零moments、
+  冻结grad=None、权重逐位不变与完整状态比较，不以混合part为由跳过数值断言。
+- 实际四rank CPU/Gloo，PP2×custom FSDP2，Interleaved1F1B四stage/每rank两个
+  parts，六层Qwen3，冻结stage0（rank0/1所有该stage参数冻结，另一本地part可训练）。
+  每步确认每个part的optimizer归属，真实FSDPModule/DTensor/dp_shard2不变量保留。
+  四步AdamW、step2保存、独立进程resume两步，dynamic EMA、loader/RNG快照启用。
+- full与resume均退出0，所有四rank加载后更新前完整状态failures=0，最终模型、
+  optimizer、scheduler、EMA、trainer/token、loader及host RNG与连续运行精确一致，
+  尾段loss差异0。恢复参考是同配置连续运行，不是多轴独立dense参考。未覆盖全rank
+  冻结的interleaved、多轴AC/compile、ZBV或设备kernel。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 LLMTUNER_TEST_WORLD_SIZE=4 LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom LLMTUNER_TEST_PP_SCHEDULE=Interleaved1F1B LLMTUNER_TEST_EMA=dynamic LLMTUNER_TEST_RNG_STATE=1 LLMTUNER_TEST_LOADER_STATE=1 LLMTUNER_TEST_FROZEN_PP_STAGE=0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=PORT tests/integration_tests/pp_checkpoint_equivalence.py PHASE /tmp/llmtuner-frozen-interleaved-294`。
+  full30361/resume30362；日志/tmp/llmtuner-frozen-interleaved-{PHASE}-294.log；
+  Python3.13.12/PyTorch2.14.0/macOS arm64。独立进程句柄均已正常结束。
+- 适用全部文件hooks退出0，/tmp/llmtuner-hooks-294.log；排除受保护示例、prompt.md、
+  moonep/，审阅格式化。compileall及HEAD diff通过；完整CPU
+  `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4045 passed、4 skipped、845 warnings、42.67s，退出0，/tmp/llmtuner-cpu-294.log。
+  无遗留运行任务；原有生产改动保留，本批无生产代码改动，未stage/commit/push，
+  全局目标未完成。
+
+### 第295批：checkpoint元数据预检与恢复顺序复核
+
+- 复读原目标，核对当前工作区，阅读random_state.py、load_planner.py及
+  distributed_checkpoint.py::_load；核对RNG拓扑字段严格整数验证、临时host
+  generator校验、rank专属bytes键、legacy缺失RNG分支，compiled键冲突及AMSGrad
+  目标适配。元数据预读先于live tensor写入，scheduler在optimizer组之后恢复，
+  RNG在模型/EMA后恢复；未确认新的生产缺陷，不添加无收益封装。
+- RNG单测命令`pytest -q tests/unit_tests/cpu/components/checkpointer/test_random_state.py --disable-warnings`，
+  61 passed、34 warnings、2.95s、退出0，/tmp/llmtuner-rng-final-295.log。
+  初始误指定不存在test_load_planner.py，退出4且未执行测试，保留
+  /tmp/llmtuner-rng-planner-295.log；不把该结果视为代码缺陷或有效验证。
+- 实际两rank CPU/Gloo执行trainer_state_preflight.py，DDP/native/custom FSDP
+  ×step/ntokens_seen×-1/True/1.5共18场景，真实DCP保存非法计数后manager.load
+  拒绝；模型/optimizer/scheduler/EMA/loader/Trainer及Python/NumPy/CPU RNG
+  保持恢复前状态，双方barrier通过。命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30363 tests/integration_tests/trainer_state_preflight.py`，
+  退出0，/tmp/llmtuner-counter-preflight-295.log。
+- 范围：Trainer仅用作Stateful计数owner，不是完整Trainer训练；双方读取相同非法
+  记录，不证明合法但rank间不同的计数能被检测。设备RNG payload与setter失败、
+  通信故障和跨拓扑恢复仍不由CPU证据关闭。全局相关缺口保持开放。
+- 本批仅更新台账，无生产/测试改动，完整CPU和代码hooks沿用294，不重复全套。
+  原有工作区改动保留；无遗留运行任务，未stage/commit/push，全局目标未完成。
+
+### 第296批：保存参数跨rank一致性校验
+
+- 复读原目标并核对当前base.py：load已有resolved source及state categories的
+  all_gather_object一致性检查，不能继续沿用“完全没有load一致性检查”的旧结论。
+  save仍仅验证本地curr_step/last_step类型，合法但不同值会进入不同cadence/final
+  分支。确认CHECKPOINT-SAVE-ARGUMENTS-296：缺少执行前跨rank参数校验。
+- 新增checkpoint_save_coordination.py::check_save_argument_agreement：真实两rank
+  manager，分别传step=rank+1和last_step=(rank==0)，仅拦截_save避免未修复时进入
+  分歧collective，要求统一拒绝且backend未调用。修复前两rank均报断言
+  “rank-divergent save arguments accepted”，诊断torchrun退出1，日志
+  /tmp/llmtuner-save-before-296.log。此证据证明参数被接受，不宣称已复现死锁。
+- base.py::save在本地参数错误协调之后、_save之前all_gather_object核对
+  (curr_step,last_step)，不同则各rank RuntimeError。collective位于本地错误边界外。
+  新测试拒绝两种分歧后实际save(1,last_step=True)成功，barrier通过。
+  不修改持久化格式；每次启用manager.save调用增加一次world object collective，
+  性能未测。仍要求所有rank共同调用，未解决enable、interval、load_only及backend
+  配置不一致，也不证明任意通信故障可恢复。
+- 修复后完整checkpoint_save_coordination.py真实两rank，sync/async、writer与
+  staging失败、保留/重试及load源分歧既有场景均通过，退出0，日志
+  /tmp/llmtuner-save-after-296.log。命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30365 tests/integration_tests/checkpoint_save_coordination.py`。
+  修复前同前缀port30364执行/tmp/llmtuner-save-agreement-296.py，仅调用新增函数。
+- 完整CPU `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4045 passed、4 skipped、917 warnings、43.55s，退出0，/tmp/llmtuner-cpu-296.log。
+  全部适用文件hooks退出0，/tmp/llmtuner-hooks-296.log，排除受保护示例、prompt.md、
+  moonep/；compileall及HEAD diff通过。环境Python3.13.12/PyTorch2.14.0/macOS
+  arm64 CPU/Gloo。原有改动保留，无运行任务，未stage/commit/push，全局目标未完成。
+
+### 第297批：保存参数collective后完整PP/FSDP异步训练恢复
+
+- 复读目标与当前状态，核对Trainer.train中的正常每步save与数据耗尽final save
+  调用位置；均在既有错误协调之后由参与训练rank调用。296新增参数一致性
+  collective在cadence判断前执行，本批验证其与实际生产异步保存和训练通信组合。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/trainer_ema_process_resume.py dp4 pp2 custom compile ac validate async corpus`，
+  退出0，/tmp/llmtuner-save-trainer-297.log。环境Python3.13.12/PyTorch2.14.0/
+  macOS arm64 CPU/Gloo。artifact根目录
+  /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-ema-process-resume-xnv2_srn。
+- 三个独立OS作业continuous/initial/resume，各四rank；PP2×custom FSDP2，
+  Interleaved1F1B四stage/本地两parts，fullAC、aot_eager、每步validation、真实
+  JSONL/Grain单文档concat packing、async中间保存/同步final。加载边界逐rank
+  完整状态与保存点精确相同，最终模型/optimizer/scheduler/EMA/loader/trainer/RNG
+  与连续训练精确相同，含local DTensor shard与布局；EMA独立公式、实际变化、token
+  与机制断言通过。检查三个作业log无Traceback和unwaited collective calls。
+- 本批未发现新生产缺陷，未修改测试或生产代码。结论是该CPU组合新增保存校验后
+  的真实训练恢复，不覆盖保存配置不一致、设备内核/Inductor性能、跨拓扑或多轴
+  独立dense数值参考；相关缺口继续开放。完整CPU与代码hooks沿用296，本批文档
+  hooks与HEAD diff检查通过。全部作业结束，保留原有改动，未stage/commit/push，
+  全局目标未完成。
+
+### 第298批：相同保存参数下的cadence决策分歧
+
+- 复读目标并续接296：相同curr_step/last_step遇到不同interval/load_only仍可导致
+  _should_save分歧。base.py::save本地参数校验阶段计算should_save，复用已有world
+  all_gather_object一并核对决策，不额外增加collective；分歧在backend之前统一拒绝。
+  CHECKPOINT-SAVE-POLICY-298的本次决策边界已修复，不宣称所有配置一致性完成。
+- check_save_argument_agreement新增interval和load_only分歧，backend拦截用于
+  避免实际分支通信挂起。测试初始未显式指定interval，导致step3双方均不保存，
+  错误地要求拒绝；port30367全脚本退出1，保留/tmp/llmtuner-policy-after-298.log，
+  此失败属测试设置错误。早期port30366日志也不能作为有效根因复现。
+- 修正fixture基准interval=1，rank0改为2或load_only=True。临时仅移除新增决策
+  拒绝block并finally恢复源码，port30369真实两rank诊断退出1，两rank断言
+  rank-divergent save policy accepted，/tmp/llmtuner-policy-baseline-298.log；
+  该证据证明分歧被接受，不是实际死锁。修复后的完整协调脚本port30368退出0，
+  /tmp/llmtuner-policy-final-298.log，两种分歧均拒绝、backend未调用，复原配置后
+  实际保存及既有sync/async、retention、失败重试全部通过。
+- 通用命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=PORT SCRIPT`，
+  最终SCRIPT=tests/integration_tests/checkpoint_save_coordination.py；baseline
+  SCRIPT=/tmp/llmtuner-save-agreement-296.py仅调用新增检查函数。
+- 全套CPU `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4045 passed、4 skipped、761 warnings、43.45s，退出0，/tmp/llmtuner-cpu-298.log。
+  适用全文件hooks退出0，/tmp/llmtuner-hooks-298.log；fixture最终修正后重跑目标
+  hooks通过，compileall和HEAD diff通过。环境沿用Python3.13/PyTorch2.14 CPU/Gloo。
+- enable/初始化差异仍可能在一致性阶段之前返回；相同决策但不同保存路径、模式或
+  backend配置亦未覆盖。本批不保证这些输入正确，需继续审查。已有工作区改动保留，
+  无运行任务，未stage/commit/push，全局目标未完成。
+
+### 第299批：保存目的地与最终导出配置一致性
+
+- 复读目标，阅读base.py最终路径保护、GenerationFileSystemWriter发布及
+  torch_checkpointing_backend.py::_save。共同入口仅检查参数和保存决策，仍允许
+  同一save中各rank采用不同目录/最终模型导出分支，不能依赖DCP writer自动纠正。
+- CHECKPOINT-SAVE-CONFIG-299：save本地阶段构建本次生效配置（后端类的module与
+  qualname、folder、可用async_mode、仅final时的model_only/HF/export_dtype），
+  复用现有all_gather_object核对；不保存时配置为None。差异在backend IO前统一
+  拒绝，不增加collective次数。不改变checkpoint格式或保留策略。
+- checkpoint_save_coordination.py新增单rank folder/model_only/HF选项分歧；
+  backend拦截保证未修复时不会真正执行分歧collective。修复前诊断port30370
+  退出1，两rank均断言rank-divergent save configuration accepted，日志
+  /tmp/llmtuner-config-before-299.log。仅证明不同配置被接受，未直接复现挂起。
+  修复后完整两rank协调脚本port30371退出0，/tmp/llmtuner-config-after-299.log，
+  三种分歧backend未调用，复原后真实save成功；既有sync/async等全脚本通过。
+- 通用命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=PORT SCRIPT`，
+  before SCRIPT=/tmp/llmtuner-save-agreement-296.py，after为
+  tests/integration_tests/checkpoint_save_coordination.py。Python3.13/PyTorch2.14
+  macOS arm64 CPU/Gloo。没有单独注入backend class/async_mode/dtype分歧，
+  不将代码字段覆盖表述为这些场景均有运行证明。
+- enable/初始化早退、backend内部私有配置、不同路径别名指向同一存储的识别及
+  arbitrary states注册差异仍未覆盖；要求有效目录字符串一致。新增比较性能未测。
+  不放入本地错误边界任何collective。全套适用hooks退出0，
+  /tmp/llmtuner-hooks-299.log；compileall及HEAD diff通过。完整CPU命令
+  `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4045 passed、4 skipped、963 warnings、42.33s，退出0，/tmp/llmtuner-cpu-299.log。
+  全部运行任务已结束。
+  已有改动保留，未stage/commit/push，全局目标未完成。
+
+### 第300批：保存async模式与dtype分歧运行证据
+
+- 复读目标并核对当前base/backend实现，续接299剩余测试项。只扩展
+  checkpoint_save_coordination.py配置分歧列表，新增单rank async_mode=ASYNC
+  与export_dtype=float16。生产校验未修改；backend调用仍拦截，双方要求统一错误
+  且_save未调用，字段finally恢复后实际final保存成功并barrier。
+- 完整两rank协调脚本port30372退出0，/tmp/llmtuner-save-config-300.log；初始
+  dtype使用float64，随后改为配置真实支持的float16，避免以非法配置作为验收。
+  最终port30373诊断仅调用check_save_argument_agreement，退出0，
+  /tmp/llmtuner-save-config-final-300.log，覆盖参数、cadence、folder、final选项、
+  async模式与支持的dtype分歧，随后实际写入正常float32 final artifact。
+- 命令通用前缀`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=PORT SCRIPT`，
+  30372 SCRIPT=tests/integration_tests/checkpoint_save_coordination.py；30373
+  SCRIPT=/tmp/llmtuner-save-agreement-296.py。Python3.13/PyTorch2.14/macOS CPU/Gloo。
+  此处只验证拒绝协议，不是异构async作业或float16实际导出数值等价证明；不同
+  backend类尚未注入，enable/初始化早退与backend私有配置分歧仍开放。
+- 完整CPU `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4045 passed、4 skipped、832 warnings、43.84s，退出0，/tmp/llmtuner-cpu-300.log。
+  dtype最终改为float16不改变CPU收集项；最终全适用文件hooks退出0，
+  /tmp/llmtuner-hooks-300.log，排除受保护示例、prompt.md和moonep/；compileall与
+  HEAD diff通过。无生产改动，无遗留任务，保留已有改动，未stage/commit/push。
+  全局目标仍未完成。
+
+### 第301批：CLI入口与配置装配回归复核
+
+- 复读原目标与当前状态，回到__main__.py、trainer/cli.py、config/cli_config.py、
+  llmtuner_config.py及pyproject脚本入口。module与llmtuner-train均指向cli.main，
+  HfArgumentParser显式look_for_args_file=False，PARSER_GROUPS与from_groups
+  对应；嵌套配置重建不修改调用方实例，训练引擎延迟导入，CLI负责close及进程组
+  销毁并保留主异常。未确认新行为缺陷；纠正from_groups过时“nine groups”注释，
+  不引入硬编码组数，也不改准确公共名称。
+- `OMP_NUM_THREADS=1 pytest -q tests/unit_tests/cpu/test_config.py tests/unit_tests/cpu/test_parallel_plan_config.py --disable-warnings`，
+  312 passed、5.02s、退出0，/tmp/llmtuner-cli-unit-301.log。
+- `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python tests/integration_tests/cli_checkpoint_equivalence.py seed dp2 custom async first_fit`，
+  退出0，/tmp/llmtuner-cli-301.log。新进程seed step0导出、加载边界、两rank custom
+  FSDP训练，真实本地JSONL/Grain FirstFit与async checkpoint；脚本完整semantic
+  checkpoint状态恢复后精确相同。artifact根目录
+  /var/folders/lv/pf690zrn1k55fm2chddvpkx40000gn/T/llmtuner-cli-resume-io_is6tz。
+- 该证据在299保存配置比较后取得，不以旧运行代替；不覆盖EMA、validation、
+  compile或其他轴。代码仅docstring变化，完整CPU沿用300，目标hooks/compileall与
+  HEAD diff通过。无运行任务，原有改动保留，未stage/commit/push，全局目标未完成。
+
+### 第302批：数据装配与Grain游标失败生命周期复核
+
+- 复读目标、核对工作区；实际实现为datasets/dataloader.py（无loader.py），阅读
+  loader_builder.py、dataloader.py及packing/iterators.py。核对图构建/分片与
+  batching职责、临时probe游标预检、host RNG隔离、close失败保留原错误，以及
+  packing rollback失败时的best-effort关闭。未确认新缺陷，不做无收益拆分。
+- `OMP_NUM_THREADS=1 pytest -q tests/unit_tests/cpu/datasets/test_data_pipeline.py --disable-warnings`，
+  432 passed、6 warnings、12.51s、退出0，/tmp/llmtuner-data-302.log。
+  复核既有probe测试确实覆盖construct/restore/close及日志异常，不以mock测试
+  代替分布式生产预检；没有声称所有上游资源释放均可保证。
+- `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30374 tests/integration_tests/grain_checkpoint_preflight.py`，
+  退出0，/tmp/llmtuner-grain-preflight-302.log。真实DDP/native/custom FSDP与DCP，
+  双rank/仅rank0/仅rank1非法Grain游标均在live训练状态写入前拒绝，既有状态及
+  host RNG不变检查通过。非完整Trainer运行，不覆盖延迟外部IO、device RNG或
+  first_fit历史数据指纹模式（本次无附加参数）。
+- 本批仅台账更新，无生产或测试修改；完整CPU/全文件hooks沿用300，文档hooks及
+  HEAD diff通过。全部运行结束，已有改动保留，未stage/commit/push，全局目标未完成。
+
+### 第303批：标签shift、padding与有效token分母复核
+
+- 复读目标，阅读collators.py、packing/conversions.py、trainer/runtime/batch.py
+  及models/hf/model.py输入预处理。普通Batch按行next-token shift，packed dict
+  标签已对齐直接使用；padding_mask强制屏蔽labels，有效token在CP/TP分片前计数
+  且跨DP归约。显式collator count按既有契约使用，不为重复扫描擅改该接口。
+  未确认新生产缺陷，不做无收益重构。
+- 初始未设置本机既有环境选项：目标单测3 failed/24 passed，分布式作业退出1，
+  日志/tmp/llmtuner-token-contract-303.log与/tmp/llmtuner-accumulation-303.log。
+  clang明确报Inductor precompiled header源头mtime改变（1791601801→1792381764），
+  非loss数值失败。等待原进程结束后以既有关闭PCH缓存选项重跑，未改代码/断言。
+- `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q tests/unit_tests/cpu/test_trainer.py tests/unit_tests/cpu/models/test_hf_wrapper.py -k 'token or padding or preprocess or shift' --disable-warnings`，
+  27 passed、215 deselected、7.44s、退出0，/tmp/llmtuner-token-contract-final-303.log。
+- `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30376 tests/integration_tests/accumulation_equivalence.py`，
+  退出0，/tmp/llmtuner-accumulation-final-303.log：真实Trainer.train_step及native
+  FSDP，两rank/microbatch不等mask，三步AdamW loss、grad与更新对照通过，原容差
+  atol2e-6/rtol2e-5；参考每次backward归约，生产仅最后累积归约，并非独立dense。
+  首次失败port30375；Python3.13/PyTorch2.14/macOS CPU/Gloo。
+- 无生产/测试改动；完整CPU及代码hooks沿用300，文档hooks与HEAD diff通过。
+  PCH环境问题不计入已修复仓库缺陷，CP/TP/PP完整多轴数值验收不由此关闭。
+  无运行任务，已有改动保留，未stage/commit/push，全局目标未完成。
+
+### 第304批：重新确认三轴默认归约数值开放项
+
+- 复读目标及169–171批证据，回到TRAINER-TRIAXIS-ADAMW-NUMERICS-15，核对
+  当前生产fsdp_reduce_dtype默认及真实Trainer三轴fixture。没有放宽原断言或
+  用恢复一致性替代独立参考验收。
+- 当前源码下custom aux adam full fp32_router，TP2/KVCP2/EP2四rank CPU/Gloo，
+  原始HF参考（仅既有FP32 gate契约选项）默认FP32 FSDP归约仍失败，退出1。
+  首个已输出失败step1 gradient=False，FQN
+  model.model.layers.0.mlp.routed_experts.inner_experts.w1_EFD，FP64参数，
+  shape(4,48,64)，比较1/12288元素超差，最大绝对差2.020802345722994e-6，
+  index(0,2,7)，相对差0.00020130205604109434，原atol/rtol均1e-6。
+  rank1/3失败；其他rank输出同梯度Adam公式误差1.3877787807814457e-17。
+  诊断不证明所有误差只有一个根因。torchrun失败后终止peers并有loky semaphore
+  清理警告，未宣称通信故障原地恢复。
+- 同参数仅显式LLMTUNER_TEST_FSDP_REDUCE_DTYPE=float64，对照退出0，三步每rank
+  27参数梯度/权重/状态比较及fullAC body断言通过，第三步Adam公式最大残差
+  2.220446049250313e-16。该控制进一步支持归约舍入放大解释，不替代默认策略验收。
+- 通用命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=PORT tests/integration_tests/trainer_tp_ep_cp_equivalence.py custom aux adam full fp32_router`，
+  原始30377，/tmp/llmtuner-triaxis-original-304.log；FP64对照30378，额外环境字段
+  如上，/tmp/llmtuner-triaxis-fp64-304.log。Python3.13/PyTorch2.14/macOS arm64。
+- 15继续开放，需对默认FP32归约与独立dense参考的精度契约作明确验收，不能把
+  显式FP64运行当原场景已修复。未修改生产/测试，完整CPU与代码hooks沿用300，
+  文档hooks及HEAD diff通过；全部作业结束，已有改动保留，未stage/commit/push。
+
+### 第305批：独立舍入参考的精度契约约束
+
+- 复读目标及304失败，逐段审查triaxis_rounded_reference.py：CPLinear独立按
+  CP token半区、TP feature半区计算FP64局部GEMM后FP32 SUM，ExpertLinear按
+  原token所属CP半区计算；不读取生产grad构造参考。验证函数另用局部autograd
+  对照输入/weight梯度，包含空专家半区。该fixture特定contiguous TP2/KVCP2/EP2，
+  不能外推其他划分或任意设备。
+- 发现参考入口只限制拓扑，没有限制生产fsdp_reduce_dtype。新增仅允许float32
+  校验，避免把固定FP32舍入参考用于FP64/BF16归约配置。直接用_cfg设置两种
+  不支持dtype调用build，均在生产model构造前ValueError；退出0。不改变生产
+  精度策略、参考算术或原始HF验收，15继续开放。
+- 修改前port30379四rank默认归约rounded参考三步通过；日志
+  /tmp/llmtuner-rounded-305.log。修改后同场景port30380亦三步退出0，日志
+  /tmp/llmtuner-rounded-final-305.log；全部作业结束。
+  命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=PORT tests/integration_tests/triaxis_rounded_reference.py custom aux adam full fp32_router`。
+  三步grad/参数/optimizer/EMA比较保留原1e-6容差，fullAC、不等token累积和aux.01。
+- 该证据与304原始失败/FP64成功控制共同定位精度契约差异，不关闭默认原HF数值
+  失败，也不宣称多轴完成。仅集成诊断入口约束变更；CPU收集内容和生产版本不变，
+  完整CPU沿用300。目标hooks及HEAD diff通过，原有改动保留，未stage/commit/push。
+
+### 第306批：空scheduler非法恢复状态不变性
+
+- 复读目标及当前实现，核对WSD配置边界、LRSchedulersContainer构造/step/load
+  以及Trainer optimizer→scheduler顺序与错误协调。未确认新生产缺陷。
+- 扩展现有两组回归到空/非空optimizer：非法last_epoch(-1/True/False/1.5/字符串)
+  与非dict payload均拒绝，并保持进度及metrics。补强为先推进两步，确认异常后
+  不会误重置到零；不创建dummy optimizer来替代空stage。本批增加12个CPU用例。
+- 全套命令`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4057 passed、4 skipped、839 warnings、43.73s，退出0，/tmp/llmtuner-cpu-306.log。
+  全套启动后再补强上述非零进度前置，最终文件另运行
+  `OMP_NUM_THREADS=1 pytest -q tests/unit_tests/cpu/components/optimizer/test_lr_scheduler.py --disable-warnings`，
+  67 passed、0.83s、退出0，/tmp/llmtuner-scheduler-306.log；不将全套日志冒称为
+  最后测试补强后的完整重跑。生产代码未变，未新增通信或布局变换，不重复torchrun。
+- 全适用文件hooks退出0，/tmp/llmtuner-hooks-306.log；最终补强后目标hooks通过。
+  compileall及HEAD diff通过，文档另跑hooks。无遗留任务，既有改动保留，
+  未stage/commit/push，全局目标和三轴原始数值项仍未完成。
+
+### 第307批：PP多part变换对象传递与schedule绑定
+
+- 重新读取原始目标及dev-guide，复核parallel/stages.py、parallelize.py与
+  fully_shard_parallel/plan.py。当前PP先分割，再按统一顺序变换各part，随后
+  重新绑定stage.submod并建立schedule；本批未确认新的生产缺陷，不作无收益改名。
+- 现有顺序测试主要覆盖dense路径。新增PP两本地part的替换对象契约测试，分别
+  覆盖compile开/关：每个变换返回新模块，检查后续阶段接收完整历史、TP/CP使用
+  stage dense mesh、FSDP配置传递，以及schedule构造时stage引用最终part。
+  此测试mock具体变换及PP切分，仅证明装配契约，不替代真实collective或数值验收。
+- 修改前目标两文件120 passed，/tmp/llmtuner-fsdp-plan-307.log；新增后装配文件
+  10 passed。完整最终语义测试命令
+  `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4059 passed、4 skipped、796 warnings、43.05s、退出0，/tmp/llmtuner-cpu-307.log。
+- 首次目标hooks发现长行并由formatter修正，已审阅格式diff；全部适用改动文件
+  hooks随后退出0，/tmp/llmtuner-hooks-final-307.log，排除受保护example、prompt.md
+  和moonep目录。compileall与HEAD diff检查通过；本批仅测试与台账修改。
+  无遗留运行任务，已有改动保留，未stage/commit/push；三轴数值项15与全局目标
+  仍未完成，下一步继续审查变换后的参数身份及pattern配置跨阶段映射。
+
+### 第308批：TP替换导致FSDP单元排除项引用过期（开放）
+
+- 复读原始目标，续查parallelize.py→tensor_parallel.py→fully_shard_parallel/plan.py。
+  确认新问题FSDP-PATTERN-STALE-OVERRIDES-308（P1）：programmatic
+  fsdp_apply_modules的ignored_params保存Parameter身份，TP dense realizer替换
+  Parameter后装配继续把原集合传给FSDP，排除项不再命中。PP配置虽在切分后绑定
+  copied参数，但绑定发生在TP之前，仍存在相同风险；EP转换还可能改变FQN，尚需
+  单独验证，不以dense复现冒称已覆盖。
+- CPU直接复现：Sequential(Linear(4,4,bias=False))、_tp_config={'0':'colwise'}，
+  unit '0'排除其weight；apply_tp后旧shape(4,4)、新shape(2,4)，配置仍含旧对象，
+  不含新对象。断言失败退出1，/tmp/llmtuner-fsdp-stale-exclusion-308.log。
+- 真实4rank CPU/Gloo、native FSDP、TP2/DP-shard2，生产
+  parallelize_hf_transformers入口：四rank子unit的_fsdp_param_group均非None，
+  排除未生效，退出1。对照仅拆开原装配中的apply_tp/apply_fsdp，在二者间把同一
+  排除项重绑到当前weight，四rank子unit group均None，退出0。该对照定位身份
+  传递问题，尚非生产修复，也非训练数值/恢复验证。
+- 两作业共用诊断脚本/tmp/llmtuner-fsdp-stale-exclusion-308.py，命令
+  `PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=PORT /tmp/llmtuner-fsdp-stale-exclusion-308.py`。
+  生产port30382，/tmp/llmtuner-fsdp-ownership-before-308.log；对照额外环境
+  REBIND_CONTROL=1、port30383，/tmp/llmtuner-fsdp-ownership-control-308.log。
+  Python3.13/PyTorch2.14/macOS arm64，两个作业均结束，finally销毁进程组。
+- 初次port30381的诊断使用“weight不应成为DTensor”断言，退出1但不作为缺陷证据：
+  ignored_params仅约束对应unit，根FSDP仍可接管该参数。原始日志
+  /tmp/llmtuner-fsdp-stale-exclusion-distributed-308.log保留；最终改为检查子unit
+  ownership，并以重绑控制证实。不把这一诊断修正计为生产修复。
+- 验收条件：在dense/PP装配跨TP及其他身份变换后保留per-unit参数排除和hook
+  语义；保持原配置不变、共享别名及mesh/policy身份，补回归和实际torchrun验证。
+  下一步确定稳定FQN绑定及EP参数重组时的映射契约，禁止静默丢弃失配项。
+  本批仅台账变更，完整CPU及代码hooks沿用307；文档hooks和HEAD diff通过。
+  无运行任务，未stage/commit/push；本问题、三轴数值15及全局目标保持开放。
+
+### 第309批：FSDP override稳定路径重绑及独立dense验证
+
+- 上批为progress：真实TP2/FSDP2复现已改变下一动作。本批复读目标，实施
+  FSDPPatternReferences：在dense/PP本地part变换前捕获模块/Parameter注册别名，
+  进入FSDP前按canonical FQN绑定新对象；AC/compile wrapper取外层逻辑边界。
+  原配置不写入、mesh/policy保留身份、所有参数别名均参与。原对象仍注册于新路径
+  时允许身份回退；全部路径/对象消失则明确拒绝，不再静默丢失排除项。
+- FSDP-PATTERN-STALE-OVERRIDES-308状态：稳定FQN替换路径已修复；EP fused
+  参数拆分/合并的显式映射与真实PP组合验收仍开放，不用拒绝替代迁移完成。
+  新增6个引用契约CPU用例（含compile参数化），以及dense/PP装配重绑2用例。
+  最终目标两文件130 passed，/tmp/llmtuner-pattern-unit-final-309.log。
+- 原四rank生产入口诊断port30384修复后退出0，四rank子unit均无parameter group，
+  /tmp/llmtuner-fsdp-ownership-after-309.log。新增仓库脚本
+  tests/integration_tests/fsdp_pattern_references.py：TP2/DP-shard2，native/custom，
+  eager/whole-model aot_eager四场景，三步独立dense输出、grad、SGD更新对照，
+  FP64参数与显式float64归约，atol=rtol=1e-12。未读取生产grad构造参考。
+- 通用命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=PORT tests/integration_tests/fsdp_pattern_references.py IMPLEMENTATION [compile]`。
+  native eager30386、custom eager30387、native compile30388、custom compile30389
+  均退出0，各rank三步通过；日志/tmp/llmtuner-pattern-native-final-309.log、
+  /tmp/llmtuner-pattern-custom-309.log、/tmp/llmtuner-pattern-native-compiled-309.log、
+  /tmp/llmtuner-pattern-custom-compiled-309.log。Python3.13/PyTorch2.14/macOS CPU/Gloo。
+- 初始新增数值脚本port30385退出1（/tmp/llmtuner-pattern-native-309.log），原因是
+  harness错误假设所有参数grad均为DTensor。实际native在本fixture中将ignored
+  weight保留为普通Tensor，根unit没有接管。最终脚本先比较其独立DP局部梯度，
+  再由测试调用方显式DP SUM，其他FSDP参数继续核对归约后梯度。该同步是被排除
+  参数调用方的责任，未注入生产路径；不能冒称Trainer自动处理任意排除参数。
+  此结果细化308“根可能接管”边界；不把harness修正记作生产缺陷修复。
+- 完整CPU命令`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4067 passed、4 skipped、714 warnings、45.13s、退出0，/tmp/llmtuner-cpu-309.log。
+  全适用文件hooks通过，/tmp/llmtuner-hooks-309.log；首次format改动已审阅，最终
+  文档与脚本docstring仅说明修订另跑hooks。compileall及HEAD diff通过。
+- 同步design中的override身份与梯度责任契约。本批没有完整Trainer恢复、真实PP
+  或目标设备验收，三轴默认归约数值15继续开放。全部作业终止且无遗留运行任务，
+  保留既有改动，未stage/commit/push；下一步补EP参数拆分映射和PP实际入口验证。
+
+### 第310批：EP融合参数与模块引用映射、PP组合恢复
+
+- 上批为progress：稳定FQN重绑已落地。本批复读目标及当前状态，沿EP转换根因
+  继续实现。swap_hf_moe_blocks新增可选观察者，在全部规划成功、安装block前
+  发布原模块→目标模块、原融合Parameter→一个或两个Parameter的映射；无需观察
+  时不构造额外原参数表。观察者异常复用规划失败回滚，不安装任何block，恢复
+  AuxLoss计数。apply_ep仅传递观察者，不引入collective或FSDP依赖。
+- FSDPPatternReferences接收显式映射，重绑融合gate/up的两个排除目标、down、
+  专家模块及router hook；把原已匹配unit路径映射到新模块路径。TP完成后刷新
+  快照再接收EP映射。原始未匹配pattern保留到FSDP入口校验，允许直接配置native
+  EP路径，避免为支持旧路径而拒绝既有新路径配置。原配置仍保持不变。
+- 新增融合引用回归，参数化旧路径/native路径；新增观察者失败的block身份与aux
+  计数不变性回归。最终目标三文件200 passed，退出0，
+  /tmp/llmtuner-pattern-unit-final-310.log。无观察者的独立基线bind退出1，
+  /tmp/llmtuner-ep-references-baseline-310.log，明确ignored_params原路径消失；
+  未临时回退或修改正在测试的生产文件来构造该基线。
+- 新增tests/integration_tests/ep_fsdp_pattern_references.py，真实HF Qwen3MoE、
+  world4、EP2、dense DP-shard4、expert-FSDP2、custom、CPU/Gloo，从生产
+  parallelize入口验证：融合gate/up排除后w1/w3保留为普通Tensor，w2为DTensor，
+  hook指向转换后的grouped模块；按独立原权重EP切片零容差核对w1/w3，配置不变。
+  这是参数归属/复制验证，无forward或完整训练，不替代被排除梯度的调用方同步。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30393 tests/integration_tests/ep_fsdp_pattern_references.py`，
+  最终退出0，/tmp/llmtuner-ep-fsdp-references-final-310.log；此前30390亦退出0，
+  /tmp/llmtuner-ep-fsdp-references-310.log。Python3.13/PyTorch2.14/macOS arm64。
+- 真实Trainer PP2/customFSDP2，Interleaved1F1B六layer、每rank多part，relocated
+  attention hooks、fullAC、whole aot_eager、dynamicEMA。独立full/resume两个四rank
+  进程作业退出0，完整恢复检查通过、loss最大差0；工作目录
+  /tmp/llmtuner-pattern-pp-310，日志/tmp/llmtuner-pattern-pp-full-310.log、
+  /tmp/llmtuner-pattern-pp-resume-310.log。命令环境
+  LLMTUNER_TEST_WORLD_SIZE=4 LLMTUNER_TEST_PP_SIZE=2
+  LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom LLMTUNER_TEST_RELOCATED_HOOKS=1
+  LLMTUNER_TEST_AC=full LLMTUNER_TEST_COMPILE_BACKEND=aot_eager
+  LLMTUNER_TEST_EMA=dynamic LLMTUNER_TEST_PP_SCHEDULE=Interleaved1F1B
+  LLMTUNER_TEST_NUM_LAYERS=6，其他环境同上，port30391/30392，脚本
+  tests/integration_tests/pp_checkpoint_equivalence.py full/resume加工作目录。
+  PP运行发生在最后“保留native未匹配pattern”补强之前；该补强后最终CPU及EP
+  实际入口另跑通过，不将先前PP日志冒称为最后版本完整重跑。非PP×TP排除数值验收。
+- 最终完整CPU：`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4070 passed、4 skipped、831 warnings、43.67s、退出0，
+  /tmp/llmtuner-cpu-complete-310.log。早期4068/4069结果保留于
+  /tmp/llmtuner-cpu-310.log及/tmp/llmtuner-cpu-final-310.log；最终文件不依赖旧结果。
+  适用全部文件hooks最终通过，compileall和HEAD diff通过；初次format修改已审阅。
+- 308状态继续部分修复：fused EP映射有实际证据，Kimi个别专家堆叠的部分排除、
+  任意共享模块转换、被重命名的fsdp_ignored_modules以及最终版本PP×TP实际排除
+  验证仍开放。三轴默认归约数值15不由本批关闭。同步design契约，全部进程已结束，
+  无遗留运行任务，保留其他改动，未stage/commit/push，全局目标未完成。
+
+### 第311批：融合EP转换后完整ignored模块子树重绑
+
+- 上批为progress：EP对象映射及实际FSDP归属已建立。本批复读目标，检查原专家
+  模块被替换后fsdp_ignored_modules的路径。新增回归先跑旧实现：旧HF专家路径
+  失败，直接native路径通过，1 failed/1 passed、退出1，
+  /tmp/llmtuner-ignored-before-311.log。具体ValueError为原experts路径matched no
+  module，未把错误拒绝误报为静默数值损坏。问题FSDP-IGNORED-MODULE-RENAME-311。
+- FSDPPatternReferences现在记录已匹配排除模块及尚未匹配的pattern：最终按显式
+  EP映射或保留对象身份定位新路径，由既有resolver收集整个目标子树参数。
+  路径不存在且无映射时保留原pattern供最终严格校验，不静默丢弃；native目标路径
+  仍可延迟匹配。无ignored_params/hook对象override、只有ignored_modules的配置
+  也启用引用跟踪。原cfg不改写，精确路径与跨层通配符均有回归。
+- 修改后初始目标202 passed（/tmp/llmtuner-ignored-after-311.log），最终加入通配符
+  参数化后目标三文件204 passed、10.61s、退出0，
+  /tmp/llmtuner-ignored-unit-final-311.log。不以CPU单测代替真实FSDP参数管理验证。
+- 扩展ep_fsdp_pattern_references.py的--ignore-modules模式：真实world4、EP2、
+  dense DP-shard4、expert-FSDP2、custom，生产parallelize入口中原experts路径
+  排除整棵新grouped专家子树。w1/w2/w3均为普通Tensor，对原融合gate/up及down
+  的独立EP权重切片比较atol=rtol=0通过，原排除配置不变。port30394退出0，
+  /tmp/llmtuner-ep-ignored-modules-311.log。不是forward/梯度/完整恢复验证。
+- 同一最终脚本默认参数排除模式port30395亦退出0，
+  /tmp/llmtuner-ep-parameter-exclusions-311.log；w1/w3排除但w2仍为DTensor、
+  relocated hook指向grouped模块，确认新分支没有弱化原有模式断言。
+  命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=PORT tests/integration_tests/ep_fsdp_pattern_references.py [--ignore-modules]`。
+  Python3.13/PyTorch2.14/macOS arm64 CPU/Gloo，两作业均结束并销毁进程组。
+- 最终完整CPU：`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4074 passed、4 skipped、976 warnings、43.49s、退出0，/tmp/llmtuner-cpu-311.log。
+  适用全部文件hooks通过，/tmp/llmtuner-hooks-311.log；初次长行由formatter修正并
+  审阅。compileall及HEAD diff通过，文档同步design与distributed comparison，
+  文档另跑hooks。未改断言容差，没有把排除参数的梯度同步注入生产测试替身。
+- 311问题在融合HF专家转换及现有映射范围修复；308总体仍有Kimi个别专家堆叠、
+  部分参数排除与grouped布局、任意共享模块转换和实际PP×TP排除验证缺口。
+  三轴默认归约数值15和全局目标保持开放。无遗留运行任务，保留其他改动，
+  未stage/commit/push；下一步审查Kimi多对一堆叠的排除语义，避免扩大排除范围。
+
+### 第312批：Kimi多对一堆叠排除映射与部分排除边界
+
+- 上批为progress：完整融合专家模块排除已修复。本批复读原始目标，检查Kimi
+  individual expert→grouped参数的多对一关系。新增四个回归先跑原实现，全部失败，
+  4 failed/16 deselected、退出1，/tmp/llmtuner-kimi-exclusion-before-312.log：完整
+  投影/整个ModuleList缺映射，部分参数/单个expert模块排除也未在安装前拒绝。
+  问题KIMI-STACKED-FSDP-EXCLUSIONS-312（P2，装配契约及布局适配缺口）。
+- Kimi转换在有观察者时发布每个源expert的w1/w2/w3→对应grouped Parameter映射，
+  ModuleList→grouped模块映射。FSDP引用观察者建立每个目标的完整源贡献集合，
+  联合全局ignored_modules与各unit的ignored_params检查：覆盖全部源投影才可
+  排除整个target；覆盖一部分时抛UnsupportedCombinationError，不扩大排除范围。
+  该检查发生在安装block前，复用aux计数回滚；使用全局源专家集合，EP非owner
+  rank同样拒绝，避免依据局部切片产生不同控制流。
+- 目前支持完整投影及整个expert子树排除；部分源expert排除仍需要保留独立参数
+  的布局adapter，明确拒绝不等于该功能已实现。Kimi gate另有correction-bias
+  Parameter迁移到router.gate之外，所以不套用融合HF gate的简单模块映射，避免
+  漏掉原gate子树的一部分参数。此模块级语义仍开放，不能静默扩大或缩小排除。
+- 目标Kimi/EP/FSDP三个CPU文件212 passed、10.01s、退出0，
+  /tmp/llmtuner-kimi-exclusion-after-312.log。随后保护Kimi gate特殊情况，最终
+  完整CPU再跑：`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4078 passed、4 skipped、738 warnings、50.53s、退出0，/tmp/llmtuner-cpu-final-312.log。
+  先前4078/945warnings日志/tmp/llmtuner-cpu-312.log保留，不代替最终结果。
+- 新增tests/integration_tests/kimi_fsdp_pattern_references.py，真实EP2、dense
+  DP-shard4、expert-FSDP2、custom、world4 CPU/Gloo。完整w1投影排除时w1普通
+  Tensor、w2/w3 DTensor；整个ModuleList排除后三者均普通Tensor。独立stack原
+  individual权重再取EP切片，所有目标atol=rtol=0。partial模式所有rank在安装前
+  拒绝，原block/源参数身份不变，错误处理区间外的barrier通过。不含forward、
+  梯度、Trainer恢复或真实通信故障恢复验证。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30397 tests/integration_tests/kimi_fsdp_pattern_references.py`，
+  最终退出0，/tmp/llmtuner-kimi-exclusions-final-312.log；此前port30396同三模式
+  通过，/tmp/llmtuner-kimi-exclusions-312.log。Python3.13/PyTorch2.14/macOS arm64。
+- 全适用文件hooks退出0，/tmp/llmtuner-hooks-312.log；首次formatter修正长行已
+  审阅。compileall、HEAD diff和最终文档hooks通过，同步design契约。HEAD仍
+  f5ec685；本批开始即发现外部已暂存既有生产改动，本批未写索引，新增修复保持
+  未暂存diff，未撤销/重置他人暂存内容，也未commit/push。
+- 全部运行结束，无遗留任务。308总体、Kimi部分堆叠排除、gate子树迁移、任意共享
+  模块转换、实际PP×TP排除与三轴默认归约数值15仍开放，全局目标未完成。
+  下一步处理gate子树中跨owner迁移的Parameter排除语义及最终global排除边界。
+
+### 第313批：Kimi gate子树参数跨owner迁移后的精确排除
+
+- 上批为progress：Kimi完整堆叠映射与部分排除边界已有证据。本批复读目标，
+  复现原gate模块排除失败：weight进入router.gate，但correction-bias Parameter
+  以相同身份注册到MoE.expert_bias_E，单一模块路径无法表达原整个子树。新增
+  回归在旧实现1 failed/20 deselected、退出1，/tmp/llmtuner-kimi-gate-before-313.log。
+  问题KIMI-GATE-SUBTREE-EXCLUSION-313（P2，模型变换后排除配置失效）。
+- 引用快照现在同时记录原排除子树的Parameter集合，复用同一个参数绑定契约。
+  目标模块子树未覆盖的迁移参数，补入所有unit以及显式/隐式根unit的ignored_params。
+  保留原根unit的mesh/policy/reshard等选项及原cfg；不把迁移参数的新父模块整棵
+  排除。因此可以启用Kimi gate→router.gate模块映射，同时保留根部bias的排除。
+  绑定过程无collective、无持久化schema变化，不改原requires_grad。
+- 最终CPU新增覆盖显式/隐式根unit×可训练/冻结bias四种场景：源gate两个参数
+  都排除，其他专家参数不扩大排除，根选项与原cfg不变。目标Kimi文件24 passed、
+  3.46s、退出0，/tmp/llmtuner-kimi-gate-unit-final-313.log；初始目标四文件225
+  passed日志/tmp/llmtuner-kimi-gate-after-313.log保留，不代替最后四种参数化。
+- 初次完整CPU1 failed/4079 passed（/tmp/llmtuner-cpu-313.log），原因是新增测试
+  把resolved units覆盖原units局部变量，导致检查错了对象；最终改为检查原cfg。
+  初次真实port30398退出1（/tmp/llmtuner-kimi-gate-313.log），原因是harness错误
+  假定bias默认冻结。实际models/kimi/moe.py定义为requires_grad=True，目标契约
+  是保持原状态，最终脚本先捕获原flag再比较，CPU另覆盖显式冻结；没有改变生产
+  bias策略或弱化参数归属/值断言。这两次失败不记作已修复的生产缺陷。
+- 最终四rankCPU/Gloo：Kimi EP2、dense DP-shard4、expert-FSDP2、custom，从
+  生产parallelize入口运行projection/module/gate/partial四种模式。gate模式
+  weight和bias均为普通Parameter、与源保持身份及requires_grad，所有w1/w2/w3
+  仍为DTensor；专家值对独立源stack后的EP切片atol=rtol=0。其余三个既有模式
+  断言全部保留，拒绝后barrier通过。无forward/梯度或完整Trainer恢复，不把
+  参数归属验证当成自动排除梯度同步或通信故障恢复证明。
+- 命令`PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30399 tests/integration_tests/kimi_fsdp_pattern_references.py`，
+  最终退出0，/tmp/llmtuner-kimi-gate-final-313.log。Python3.13/PyTorch2.14/macOS arm64。
+- 最终完整CPU：`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings`，
+  4082 passed、4 skipped、679 warnings、49.65s、退出0，/tmp/llmtuner-cpu-final-313.log。
+  全适用文件hooks退出0，/tmp/llmtuner-hooks-final-313.log；首轮format修正已审阅。
+  compileall、HEAD diff及最终文档hooks通过，design说明精确的跨owner排除契约。
+- 工作期间外部提交推进HEAD到39ea352（此前f5ec685），既有部分测试也被外部暂存；
+  以工作树为准继续，未调整索引、撤销暂存或commit/push。全部运行已结束，无
+  遗留任务。313在当前已知布局范围修复，308总体仍有部分堆叠排除、任意共享
+  模块转换、实际PP×TP排除与完整训练同步验证缺口；三轴数值15继续开放，全局
+  目标未完成。下一步审查排除参数在真实训练中的梯度同步与optimizer归属契约。
+
+### 第314批：FSDP排除参数的混合梯度范数与副本同步（继续验证）
+
+- FSDP-EXCLUDED-MIXED-NORM-314：真实两rank Trainer（Qwen3/native FSDP2，
+  embedding全局排除）在首次optimizer更新前因普通Tensor和DTensor混合进入
+  foreach norm报错。原始失败日志/tmp/llmtuner-excluded-trainer-314.log，退出1。
+  collectives按DTensor mesh/普通Tensor分组，先物化每组标量范数，再组合。
+- FSDP-EXCLUDED-REPLICA-GRAD-314：只修范数后，同一Trainer的排除embedding
+  梯度副本max abs差0.2612060308456421，336/512元素不符，原容差1e-6；
+  /tmp/llmtuner-excluded-trainer-norm-fixed-314.log退出1。新增Trainer归约在累积后、
+  TP归约与裁剪前，对普通dense参数执行DP/CP SUM，普通EP专家参数使用
+  dp_replicate/efsdp副本轴；先协调梯度存在性，全组未使用保持None。
+  后两类轴的选择尚需真实多轴/专家训练证明，不能据DP2结果关闭完整组合验收。
+- 真实复现port30402退出0，/tmp/llmtuner-excluded-trainer-reduced-314.log，
+  两rank排除梯度差0。新增trainer_fsdp_excluded_gradients.py保留实际Trainer、
+  前反向及AdamW，仅装配seam用于按真实embedding路径配置排除项；DP2/三步/
+  accumulation2/max_norm0.5检查梯度和更新后权重副本一致，非独立dense oracle。
+  首次port30404脚本误设steps1，step2由scheduler正确拒绝，退出1，
+  /tmp/llmtuner-trainer-exclusions-regression-314.log；改steps3后port30405退出0，
+  /tmp/llmtuner-trainer-exclusions-final-314.log。最终整理main入口与imports通过。
+- parallel_grad_norm_equivalence.py新增普通Tensor与两个独立真实DTensor mesh
+  混合测试，p1/2/inf、foreach False/True，以独立完整向量计算范数及裁剪参考，
+  rtol1e-14/atol0；port30403退出0，/tmp/llmtuner-mixed-norm-314.log。
+  同命令原有低精度/空rank/PP/TP/EP范数测试亦通过，不证明完整模型组合。
+- 环境macOS arm64/CPU Gloo/Python3.13/PyTorch2.14，命令共同前缀
+  PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=<上述端口>；
+  durable脚本位于tests/integration_tests/，30402使用/tmp复现脚本。
+- 完整CPU 4082 passed、4 skipped、723 warnings，52.11s，退出0，
+  /tmp/llmtuner-cpu-314-initial.log；适用变更文件pre-commit退出0，
+  /tmp/llmtuner-hooks-314.log；compileall与git diff HEAD --check通过。
+  未修改index、未commit/push；保留原有staged变更及prompt.md。
+- 314仍开放：独立dense完整训练数值参考、局部/全组未使用梯度、稀疏梯度、
+  EP/TP/CP组合及FSDP排除但仍为DTensor的参数归属。原15数值问题、硬件
+  及完整全局验收缺口继续保留。本批不是全局完成声明。
+
+### 第315批：排除参数独立参考、未使用梯度及TP组合验收
+
+- 续接314，生产实现未再修改。新增fsdp_excluded_gradient_equivalence.py，
+  CPU/Gloo两rank FP64/native或custom FSDP，使用生产parallelizer及Trainer归约，
+  独立未分片模型计算两rank完整目标，三步比较输出、梯度、显式全向量范数、
+  独立裁剪及AdamW更新，rtol/atol1e-12。排除optional参数step0仅rank0使用、
+  step1全组不使用、step2双方使用；另一个排除参数始终不使用，保持grad None，
+  含weight_decay0.1验证未使用参数不被误更新。native port30406/custom30407
+  均退出0，/tmp/llmtuner-exclusion-oracle-{native,custom}-315.log。
+  本项直接调用Trainer方法，不宣称完整Trainer循环或真实MoE覆盖。
+- fsdp_pattern_references.py移除测试手工DP SUM，改用Trainer实际排除参数归约，
+  保持原局部梯度及完整dense三步SGD参考、容差1e-12。四rank TP2/FSDP2，
+  native eager30408、custom eager30409、native aot_eager30411、custom
+  aot_eager30412全部退出0；日志/tmp/llmtuner-exclusion-tp-{native,custom}-315.log
+  及/tmp/llmtuner-exclusion-tp-{native,custom}-compile-315.log。
+  验证的是普通Tensor形式的TP局部分片排除参数，非任意DTensor排除或完整Trainer。
+- trainer_fsdp_excluded_gradients.py增强为真实Qwen3 Trainer独立未分片参考：
+  仅在原生产并行装配前复制原模型，构造全部rank确定性批次，显式next-token
+  CE sum/28，独立累积和裁剪公式；比较每步全参数裁剪后梯度、AdamW更新及
+  排除embedding副本，FP32容差1e-6，三步/累积2/max_norm0.5。
+  native port30413/custom30414退出0，日志/tmp/llmtuner-trainer-exclusion-oracle-final-315.log
+  和/tmp/llmtuner-trainer-exclusion-custom-oracle-315.log。初次30410脚本误从
+  optimizer容器读取lr而KeyError退出1，/tmp/llmtuner-trainer-exclusion-oracle-315.log；
+  修正为实际inner optimizer param_group，非生产缺陷。参考复制初值并使用原模型
+  forward，不调用生产loss或归约；学习率取实际当前值，不独立证明scheduler。
+- 上述命令共同前缀PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=<2或4> --master_addr=127.0.0.1 --master_port=<上述端口>，
+  脚本路径tests/integration_tests/，末尾参数为实现与可选compile。
+  macOS arm64/Python3.13/PyTorch2.14，PP/CP/EP为1，无AC、无恢复验证。
+- 最终CPU4082 passed、4 skipped、827 warnings，47.03s、退出0，
+  /tmp/llmtuner-cpu-final-315.log；compileall和diff检查通过；适用文件hooks
+  /tmp/llmtuner-hooks-final-315.log。设计文档及并行矩阵同步证据范围。
+  HEAD被外部推进至46b13b7，已有两文件staged变更保留；本批未操作index或提交。
+- 314中dense独立参考、单rank/全组未使用梯度与上述限定TP组合已补证；
+  EP/CP、稀疏梯度、仍为DTensor的排除参数及完整恢复继续开放。
+  原15数值失败及硬件/全局验收缺口不变。
+
+### 第316批：EP专家排除梯度的独立训练参考及CP失败边界
+
+- 续接FSDP-EXCLUDED-REPLICA-GRAD-314，无新增生产代码修改。
+  ep_fsdp_pattern_references.py增加--train：四rank真实Qwen3MoE alltoall，
+  custom dense DP4 / EP2 / expert FSDP2，完整未替换HF模型为独立参考；
+  每rank不同8token序列，平方logits sum/4，三步输出、全参数梯度、全局范数、
+  显式裁剪及SGD更新比较，FP32原容差rtol/atol1e-6。参考专家投影按EP归属
+  独立切片；使用Trainer实际归约方法，验证efsdp副本同步而不混加不同专家。
+  这项不是完整Trainer循环；aux loss显式0，PP/TP/CP1，无AC/compile/恢复。
+- 原投影排除（w1/w3普通、w2 DTensor）port30417退出0，
+  /tmp/llmtuner-ep-exclusion-training-final-316.log；全原专家模块排除
+  （w1/w2/w3普通）port30418退出0，/tmp/llmtuner-ep-subtree-training-final-316.log。
+  最终只增强错误信息后，整专家排除port30428再次退出0，
+  /tmp/llmtuner-ep-subtree-training-complete-316.log。
+- 诊断对照移除生产归约调用，保留真实前反向及参考，port30419/30424均退出1，
+  /tmp/llmtuner-ep-exclusion-control-316.log及详细版
+  /tmp/llmtuner-ep-exclusion-control-detail-316.log。首步key
+  model.model.layers.0.mlp.routed_experts.inner_experts.w1_EFD，普通FP32
+  shape(2,8,16)，rank0 max abs0.0029611242935061455、256/256元素不符，
+  rank2 max abs0.0032817802857607603，原1e-6，证明测试能发现缺失同步。
+- 初始脚本两处契约修正：30415默认HF aux系数非0，未设置step denominator而拒绝，
+  /tmp/llmtuner-ep-exclusion-training-316.log；独立目标只含平方logits，故显式
+  设置aux=0，非辅助loss验证。30416在optimizer后读带autograd历史的split view
+  被PyTorch拒绝，/tmp/llmtuner-ep-exclusion-training-aux0-316.log；参考权重先
+  detach再切片，保留同一存储的更新后数值。均为harness错误，不作生产缺陷。
+- 尝试真实Trainer DP2×CP2：30420/30421因脚本使用废弃context_parallel_size
+  字段失败，修正为两个实际轴字段；30422 KV/native及30423 Ulysses/custom
+  被生产CPU SDPA后端检查明确拒绝，日志
+  /tmp/llmtuner-exclusion-cp-{kv,ulysses}-final-316.log。随后在装配seam显式选择
+  真实eager Flex（参考保留SDPA）、seq256且无attention替换，30425/30426仍退出1，
+  /tmp/llmtuner-exclusion-cp-{kv,ulysses}-flex-316.log：
+  NotImplementedError: FlexAttention does not support backward on CPU。
+  这不是归约数值失败，也不构成CP训练通过证据。诊断脚本保留
+  /tmp/llmtuner-exclusion-cp-probe-316.py；仓库DP2回归未保留不可执行的CPU CP入口。
+  需支持Flex backward的设备重验，不能用SDPA替换内核关闭该验收。
+- 最终DP2真实Trainer回归port30427退出0，/tmp/llmtuner-exclusion-dp-final-316.log；
+  脚本以实际seq_len显式构造分母并比较全部副本，原三步梯度及更新断言保留。
+  所有torchrun共同前缀PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=<4，30427为2> --master_addr=127.0.0.1 --master_port=<上述端口>。
+  EP脚本在tests/integration_tests/，诊断对照在/tmp/，环境macOS arm64/
+  Python3.13/PyTorch2.14 CPU/Gloo。真实训练参考沿用同一HF模型forward但不调用
+  生产并行、loss、归约或裁剪，不能解释为独立验证HF算子本身。
+- 最终完整CPU4082 passed、4 skipped、683 warnings，49.09s，退出0，
+  /tmp/llmtuner-cpu-final-316.log；compileall及diff检查通过；最终适用文件hooks
+  /tmp/llmtuner-hooks-final-316.log。设计与矩阵同步已通过EP和未通过CP的边界。
+  未改index、未commit/push，保留已有staged改动和prompt.md。
+- 314新增限定EP2/efsdp2训练证据；dp_replicate×efsdp组合、EP×TP/CP、
+  完整Trainer EP排除、稀疏梯度、DTensor形式排除、CP目标设备及完整恢复继续开放；
+  原15和全局验收缺口不变，未宣布完成。
+
+### 第317批：完整Trainer EP排除、辅助loss及新进程恢复
+
+- 继续314/316，未新增生产修改。trainer_fsdp_excluded_gradients.py扩展custom ep：
+  四rank dense DP4/EP2/efsdp2，真实Qwen3MoE、alltoall，原fused gate/up在变换
+  前配置单元ignored_params及原专家hook；w1/w3普通、w2 DTensor有明确断言。
+  独立原HF参考计算全部8行、两次累积的shifted CE，router forward hook仅采集
+  原始logits/top-k索引，显式softmax、bincount及E*counts/sum(counts)计算辅助
+  目标，系数0.03/全局64 routed tokens；不调用生产aux注入或归约。
+  三步AdamW比较全参数裁剪后梯度及更新，rtol/atol1e-6，不放宽；普通专家副本
+  仅在efsdp组比较，不把不同EP切片相加。学习率取实际inner optimizer当前值，
+  初值来自原模型复制，模型forward共享HF实现，因此非独立scheduler/HF算子验证。
+- port30429 eager退出0，/tmp/llmtuner-trainer-ep-exclusions-317.log；
+  port30430 full AC+aot_eager退出0，
+  /tmp/llmtuner-trainer-ep-exclusions-ac-compile-317.log，保留真实compile非零图
+  和aux实例系数0.03断言。名称映射只在参考中移除透明包装字段。
+  DP原回归初次30431误给dense Qwen3设置experts_implementation=eager而被
+  正确拒绝，/tmp/llmtuner-trainer-dp-exclusions-317.log；改为仅MoE设eager后
+  port30432退出0，/tmp/llmtuner-trainer-dp-exclusions-final-317.log。
+- pp_checkpoint_equivalence.py新增LLMTUNER_TEST_EXCLUDED_EXPERTS=1场景，
+  按原专家路径配置每层fused gate/up排除，保留已有DTensor断言并增加普通
+  w1/w3和DTensor w2归属检查，默认场景仍要求全部专家FSDP管理。
+  完整四rank Trainer/custom FSDP/EP2/efsdp2、全AC+aot_eager、累积2、dynamic
+  EMA、原HF非零aux loss，连续4步、第2步完整DCP，再新torchrun进程恢复2步。
+  30433 full/30434 resume均退出0，/tmp/llmtuner-ep-exclusion-{full,resume}-317.log，
+  /tmp/llmtuner-ep-exclusion-resume-317产物。该初次命令缺loader显式快照。
+- 补开LLMTUNER_TEST_LOADER_STATE=1重新完整full/resume，30435/30436均退出0，
+  /tmp/llmtuner-ep-exclusion-loader-{full,resume}-317.log，产物
+  /tmp/llmtuner-ep-exclusion-loader-resume-317。四rank更新前state failures=0；
+  模型、optimizer、scheduler、EMA、trainer、数据游标及Python/NumPy/CPU RNG
+  在加载边界精确一致，DTensor的shape/placements/mesh和本地值保持原断言。
+  最终模型/optimizer/EMA及连续轨迹检查通过，恢复后loss差0；连续loss为
+  [4.876204490661621,4.856256008148193,4.870203018188477,4.868518352508545]。
+  恢复参考来自连续生产运行，数值独立参考由上面的三步脚本提供，不混同二者。
+- 恢复命令共同环境：LLMTUNER_TEST_EXCLUDED_EXPERTS=1
+  LLMTUNER_TEST_WORLD_SIZE=4 LLMTUNER_TEST_PP_SIZE=1 LLMTUNER_TEST_MOE=1
+  LLMTUNER_TEST_EP_SIZE=2 LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom
+  LLMTUNER_TEST_EMA=dynamic LLMTUNER_TEST_AC=full
+  LLMTUNER_TEST_COMPILE_BACKEND=aot_eager LLMTUNER_TEST_ACCUMULATION=2
+  LLMTUNER_TEST_RNG_STATE=1，最终两命令另加LLMTUNER_TEST_LOADER_STATE=1。
+  全部命令加PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=<4，DP回归为2> --master_addr=127.0.0.1 --master_port=<上述>，
+  tests/integration_tests/<脚本>，恢复参数full/resume及上面产物路径。
+  环境macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo；TP/CP/PP均1。
+- 完整CPU4082 passed、4 skipped、712 warnings，48.42s，退出0，
+  /tmp/llmtuner-cpu-final-317.log；最终适用hooks/tmp/llmtuner-hooks-final-317.log，
+  compileall/diff通过。保留外部staged改动与prompt.md，未提交或推送。
+- 已补限定完整Trainer EP排除和AC/compile及完整新进程恢复证据；仍不覆盖
+  任意pattern、EP×TP/CP、HSDP、稀疏梯度、DTensor形式排除、拓扑变化、
+  CUDA/NPU或性能。原15和全局其余缺口继续开放。
+
+### 第318批：HSDP排除参数与EP双副本轴独立参考
+
+- 继续314/317，未改生产代码。fsdp_excluded_gradient_equivalence.py增加四rank
+  hsdp模式，native/custom replicate2/shard2，真实二维DTensor mesh(2,2)和DP4
+  显式断言。独立FP64 dense三步AdamW、全参数梯度、范数、裁剪和更新仍用
+  原1e-12；排除参数step0仅rank0使用、step1全组未使用、step2全部使用，
+  始终unused参数保留None且weight_decay0.1下不误更新。
+  初次30437/30438均退出0，/tmp/llmtuner-exclusions-hsdp-{native,custom}-318.log；
+  增加非空布局断言后30441/30442最终均退出0，
+  /tmp/llmtuner-exclusions-hsdp-{native,custom}-final-318.log。
+- trainer_fsdp_excluded_gradients.py新增hsdp参数（与ep明确互斥），四rank
+  replicate2/shard2、排除embedding、累积2/max_norm0.5、full AC+aot_eager，
+  独立原HF模型shifted CE、裁剪、三步全参数梯度及AdamW更新1e-6通过。
+  保留所有副本一致、真实编译非零图及二维mesh断言；lr取实际inner optimizer
+  当前值，初值复制，不独立证明scheduler或HF算子。30439退出0，
+  /tmp/llmtuner-trainer-exclusions-hsdp-318.log；最终30443退出0，
+  /tmp/llmtuner-exclusions-trainer-hsdp-final-318.log。此项无checkpoint恢复。
+- ep_fsdp_pattern_references.py新增--replicate，八rank dense replicate2/shard4、
+  expert replicate2/efsdp2/EP2；各副本轴大小与dense DP8显式断言。真实Qwen3MoE
+  alltoall，排除原gate/up，w1/w3普通，w2二维FSDP管理；直接调用Trainer排除
+  参数归约，独立原HF参考累计8个不同rank序列目标（平方logits sum/world），
+  三步输出、全参数梯度、全局范数、显式裁剪及SGD更新原1e-6通过。
+  该场景验证dp_replicate与efsdp先后SUM不漏不重复；不是完整Trainer循环。
+  aux=0、TP/CP/PP1、无AC/compile/EMA/恢复。
+  初次30440退出0，/tmp/llmtuner-ep-exclusions-replicate-318.log；最终加轴断言
+  30444退出0，/tmp/llmtuner-exclusions-ep-replicate-final-318.log。
+- 命令共同前缀PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=<4或8> --master_addr=127.0.0.1 --master_port=<上述端口>，
+  tests/integration_tests/fsdp_excluded_gradient_equivalence.py native|custom hsdp；
+  tests/integration_tests/trainer_fsdp_excluded_gradients.py custom hsdp ac compile；
+  tests/integration_tests/ep_fsdp_pattern_references.py --train --replicate。
+  环境macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。无数值失败或容差调整。
+- 完整CPU4082 passed、4 skipped、765 warnings，55.19s，退出0，
+  /tmp/llmtuner-cpu-final-318.log；最终适用文件hooks
+  /tmp/llmtuner-hooks-final-318.log，compileall/diff通过。设计与并行矩阵同步。
+  HEAD46b13b7，原staged两文件及prompt.md保留，未提交或推送。
+- HSDP的限定dense数值及专家双副本轴已补证；完整八rankTrainer、HSDP恢复、
+  EP×TP/CP、DTensor形式排除、稀疏梯度、目标设备及原15仍开放。
+  全局审查与其余完整验收仍未完成。
+
+### 第319批：DCP构造期启用与异步通信组一致性
+
+- CHECKPOINT-CONSTRUCTOR-AGREEMENT-319：DCP构造器在config.enable=False时
+  直接返回；启用rank继续本地错误协调，async模式还会创建额外通信组。
+  相异enable/async使各rank进入不同collective序列。新增构造期默认进程组
+  all_gather_object比较(enable, enabled时async_mode)，在提前返回和资源初始化
+  前统一拒绝冲突；collective在本地错误协调区间之外。多rank构造器现在明确
+  需要所有默认组成员参与。全禁用仍不创建存储/线程/额外通信组，但参加一致性检查。
+- 两rank真实Gloo原始复现30445退出1，/tmp/llmtuner-constructor-before-319.log，
+  禁用rank错误接受并由脚本断言失败；不把该快速退出说成实测超时死锁。
+  修复后同复现30446退出0，/tmp/llmtuner-constructor-after-319.log。
+  异步冲突30447退出0，/tmp/llmtuner-constructor-async-319.log。
+- 新增checkpoint_constructor_agreement.py，最终30448退出0，
+  /tmp/llmtuner-constructor-final-319.log；依次检查enable冲突、async冲突，
+  每项拒绝后barrier成功，最后一致禁用save/load均False。无storage IO或通信
+  替身。原checkpoint_load_coordination.py 30449退出0，
+  /tmp/llmtuner-load-coordination-319.log，保留实际DCP读写、失败传播及重试。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m
+  torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1
+  --master_port=<上述> <脚本>；最初脚本/tmp/checkpoint-constructor-319.py，
+  durable脚本tests/integration_tests/。环境macOS arm64/Python3.13/PyTorch2.14。
+- 首轮完整CPU1 failed/4081 passed/4 skipped，/tmp/llmtuner-cpu-final-319.log；
+  memory存储策略单测伪造dist初始化与world2但未模拟新all_gather_object，导致
+  缺真实默认组。该纯策略单测补齐一致配置的gather模拟，不改变memory拒绝断言；
+  真collective证据由上述torchrun提供。最终全量结果及hooks见本批追加记录。
+- 最终完整CPU4082 passed、4 skipped、849 warnings，44.93s，退出0，
+  /tmp/llmtuner-cpu-final-fixed-319.log；适用文件hooks
+  /tmp/llmtuner-hooks-final-319.log，compileall/diff通过。未改index或commit/push，
+  保留原暂存变更及prompt.md。
+- 本批只约束DCP构造enable/async，不证明任意backend配置一致、跨backend
+  选择、构造失败后外部调用部分对象save/load或通信故障恢复。optional
+  torch_checkpointing构造仍需独立修复/验证。原15与全局其余缺口保留。
+
+### 第320批：共享checkpoint构造协议与跨backend拒绝
+
+- 续接CHECKPOINT-CONSTRUCTOR-AGREEMENT-319。原DCP专有检查不能保护
+  TorchCheckpointingManager：该后端直接进入Base初始化和ModelCheckpointState
+  collective，enable差异仍提前返回，跨backend也可能进入不同序列。
+  把同一协议移入BaseCheckpointManager._validate_constructor_configuration，
+  两后端在任何Base模型状态收集/早退/optional import前调用，协议同时携带
+  backend module/qualname、enable与DCP async模式。保持同一默认组、检查一次，
+  无collective放入本地错误协调区间。disabled optional backend无需安装依赖。
+- checkpoint_constructor_agreement.py新增optional_enable与backend冲突，保留
+  原DCP enable/async项；每次统一RuntimeError后实际barrier，再验证两后端
+  一致禁用的save/load=False、close幂等且barrier成功。
+  初始30450退出0，/tmp/llmtuner-constructor-backends-320.log；最终扩展两后端
+  禁用检查30452退出0，/tmp/llmtuner-constructor-backends-final-320.log。
+  此测试没有optional backend或collective替身，不证明可选包实际IO。
+- 真实checkpoint_load_coordination.py port30451退出0，
+  /tmp/llmtuner-load-coordination-320.log，实际DCP保存/加载、失败传播及重试保留。
+  命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m
+  torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1
+  --master_port=<上述> tests/integration_tests/<上述脚本>。
+  环境macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。
+- 完整CPU4082 passed、4 skipped、748 warnings，45.67s、退出0，
+  /tmp/llmtuner-cpu-final-320.log；适用文件hooks/tmp/llmtuner-hooks-final-320.log，
+  compileall/diff通过。设计同步两个backend共同的参与契约与验证边界。
+  既有暂存改动及prompt.md保留，未操作index或commit/push。
+- 任意backend服务/存储配置差异、optional真实IO/子进程生命周期以及外部
+  非对称调用save/load仍需审查，默认组未参加构造的rank不能由协议自行补齐。
+  原15数值与全局其余验收保持开放。
+
+### 第321批：optional backend本地服务失败的全rank清理
+
+- CHECKPOINT-OPTIONAL-SERVICES-321：TorchCheckpointingManager backend已构建后，
+  保留线程启动和日志初始化只有本地try/except；单rank失败时peer仍可进入
+  initialized状态，下一次通信顺序分歧。将仅含本地queue/thread/logger的阶段
+  放入synchronize_local_errors，backend.build继续在边界外，避免把可能通信的
+  backend构造放入本地错误区。双方失败后走原清理，保留本地原始异常。
+- 新增checkpoint_service_coordination.py，真实两rank Gloo、真实保留线程，
+  optional符号/配置构造/存储与backend manager为明确替身，验证本仓库服务
+  失败传播和清理，不能证明optional包IO或子进程生命周期。
+  依次在rank0/1注入日志OSError或thread.start OSError，要求失败rank保留原
+  异常、peer收到RuntimeError、双方manager.close恰好一次、线程停止、对象
+  未initialized、再次close无重复、随后barrier成功。
+- 原版30453退出1，/tmp/llmtuner-services-before-321.log，peer错误接受构造；
+  其finally清理又因替身缺lock报AttributeError，保留该次所有证据，不把二次
+  替身错误归为生产缺陷。修复后30454/30455日志失败模式均退出0，
+  /tmp/llmtuner-services-after-321.log与/tmp/llmtuner-services-final-321.log；
+  最终四场景30456退出0，/tmp/llmtuner-services-thread-final-321.log。
+  最终脚本提取单case函数以正确绑定闭包并通过B023，未抑制lint规则。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m
+  torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1
+  --master_port=<上述> tests/integration_tests/checkpoint_service_coordination.py。
+  macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo，未安装optional backend。
+- 完整CPU4082 passed、4 skipped、668 warnings，46.96s，退出0，
+  /tmp/llmtuner-cpu-final-321.log；最终适用文件hooks
+  /tmp/llmtuner-hooks-final-321.log，compileall/diff通过。未改index或提交/推送，
+  既有staged改动与prompt.md保留。
+- backend.build内部部分资源归属及跨rank失败、可选依赖加载/配置前置错误传播、
+  optional包真实IO与子进程仍需继续审查，不据本替身验证宣称已验收。
+  原15数值与全局其余缺口不变。
+
+### 第322批：optional依赖加载失败的通信失配
+
+- CHECKPOINT-OPTIONAL-PREFLIGHT-322：构造器完成Base模型状态准备后，optional
+  import、remote路径和缺HF adapter检查仍为本地分支；单rank失败使peer继续
+  backend构造/服务通信。新增Checkpoint backend preflight本地错误协调边界，
+  仅含依赖符号加载、字段赋值、路径/adapter检查。backend配置、storage创建和
+  build仍在边界外，不能假定任意可选构造不通信。HF adapter检查提前到资源
+  创建前，减少本地配置错误后的残留风险。
+- checkpoint_service_coordination.py增加dependency阶段，分别rank0/1依赖加载
+  注入OSError；要求peer统一失败、未创建backend manager、对象未initialized、
+  幂等close与随后真实barrier。原logging/thread四场景保留。
+  原版30457退出1，/tmp/llmtuner-preflight-before-322.log，两rank Gloo真实
+  timeout10000ms；local错误rank与peer服务阶段进入不同collective序列。
+  修复后30458六场景退出0，/tmp/llmtuner-preflight-final-322.log。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m
+  torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1
+  --master_port=<30457/30458> tests/integration_tests/checkpoint_service_coordination.py。
+  实际Gloo与线程，optional backend符号、配置、storage和manager明确为替身；
+  仅证明本仓库前置错误协调，不证明真实optional IO/子进程或任意import副作用。
+  环境macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。
+- 最终CPU4082 passed、4 skipped、748 warnings，47.32s，退出0，
+  /tmp/llmtuner-cpu-final-322.log；适用文件hooks/tmp/llmtuner-hooks-final-322.log，
+  compileall/diff通过。原staged与prompt.md保留，未操作index/commit/push。
+- 可选backend配置/storage/build内部失败和资源归属继续开放；本批尚未实测
+  rank局部remote路径或HF adapter缺失，只静态确认与依赖加载共用边界。
+  原15和全局其余验收缺口不变。
+
+### 第323批：optional backend构造结果协调与已返回资源归属
+
+- CHECKPOINT-OPTIONAL-BUILD-323：本地依赖检查后，save配置/storage创建及
+  manager.build仍可能单rank抛错，peer已获得manager却进入服务协调，造成不同
+  phase的collective失配。现在在原边界外完成构造尝试并捕获BaseException，
+  随后单独协调结果。局部失败保留原异常，成功peer在服务启动前关闭已返回manager。
+  只对有_manager的对象调用内部_close，避免未获得资源时触碰不存在的字段。
+  没有把backend factory或storage调用放进本地错误协调body。
+- checkpoint_service_coordination.py扩展build和storage失败，保留依赖/日志/
+  thread场景；两rank分别注入失败，检查原异常、peer错误、已获得manager仅
+  关闭一次、未获得时不关闭、不initialized、线程停止及随后barrier。
+  build原版30459退出1，/tmp/llmtuner-build-before-323.log，真实Gloo10秒超时；
+  修复后30460退出0，/tmp/llmtuner-build-final-323.log；最终十场景30461退出0，
+  /tmp/llmtuner-build-storage-final-323.log。依赖/配置/storage/manager为明确替身，
+  collective与retention线程真实，不证明optional包实际IO或子进程。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m
+  torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1
+  --master_port=<30459/30460/30461> tests/integration_tests/checkpoint_service_coordination.py。
+  环境macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。
+- 最终CPU4082 passed、4 skipped、733 warnings，46.63s，退出0，
+  /tmp/llmtuner-cpu-final-323.log；适用文件hooks/tmp/llmtuner-hooks-final-323.log，
+  compileall/diff通过。原staged与prompt.md保留，未改index或commit/push。
+- 重要边界：只有各rank factory均已返回或抛错，外层结果协调才能运行；一个
+  rank仍阻塞在backend内部collective不能由此解除。build抛错前未返回的内部
+  资源仍属backend契约，storage自身部分初始化/释放也未独立验收。禁止把本项
+  作为通信故障恢复或optional真实包生命周期通过证据。原15与全局缺口继续开放。
+
+### 第324批：checkpoint构造协议补齐load_only
+
+- CHECKPOINT-CONSTRUCTOR-LOADONLY-324：load_only决定可选后端同步/异步配置，
+  但原共享构造协议未比较该字段。启用时纳入一致性元组，禁用时与async_mode
+  一样屏蔽为None，避免未使用配置导致误拒绝。
+- checkpoint_constructor_agreement.py新增DCP与optional_load_only冲突，保留
+  enable、async、optional_enable和backend冲突及两后端一致禁用场景。
+  原版30462退出1，/tmp/llmtuner-loadonly-before-324.log，双方错误接受冲突；
+  此证据不表示实测死锁。修复后30463退出0，
+  /tmp/llmtuner-loadonly-final-324.log，六类冲突均在资源/依赖加载前拒绝。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m
+  torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1
+  --master_port=<30462/30463> tests/integration_tests/checkpoint_constructor_agreement.py。
+  环境macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo，真实collective，
+  不证明可选后端实际IO与子进程行为。
+- 完整CPU4082 passed、4 skipped、783 warnings，47.52s，
+  /tmp/llmtuner-cpu-final-324.log，进程最终退出0；适用文件pre-commit、compileall、
+  diff检查均退出0（/tmp/llmtuner-hooks-final-324.log）。原staged改动与prompt.md
+  保留，未提交或推送。
+  全局审查、原15数值问题及目标设备/组合验收仍开放。
+
+### 第325批：optional预热失败传播与成功状态一致性
+
+- CHECKPOINT-OPTIONAL-PREWARM-325：跳过保存时仍会序列化状态并预热；单rank
+  失败原先令peer成功返回且标记`_prewarmed`，后续可能
+  分支失配。现在在本地错误边界外执行状态回调和backend预热，捕获结果后协调；
+  全部成功后才设置`_prewarmed`为True。失败侧保留原异常，peer抛阶段错误。
+- 新增checkpoint_prewarm_coordination.py，使用真实Gloo和明确的manager/state
+  替身，从公开save入口验证state/backend失败各两rank、失败标记、barrier、重试及
+  已预热时不重复调用。初稿State缺load_state_dict，未满足Stateful协议，30464/65
+  的失败不能作为修复证据；补齐协议后30466退出0，
+  /tmp/llmtuner-prewarm-final-325.log。仅在进程内替换回原_save预热语句的对照
+  30467退出1，/tmp/llmtuner-prewarm-original-325.log，健康peer错误接受失败；
+  对照脚本/tmp/llmtuner-prewarm-original-325.py，不修改工作区源码。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=<30466/30467>
+  <上述集成/对照脚本>；环境macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。
+- 完整CPU4082 passed、4 skipped、881 warnings，47.32s，退出0，
+  /tmp/llmtuner-cpu-final-325.log。适用文件pre-commit、compileall和diff检查通过，
+  hooks日志/tmp/llmtuner-hooks-final-325.log。保留既有暂存与未暂存改动，未提交/推送。
+- 该协议要求各rank回调均已返回或抛错，不能解除状态回调或backend内部通信阻塞。
+  实际optional依赖缺失；不证明真实IO、部分预热后的backend重试安全、硬件性能，
+  也不处理调用方运行中直接修改`_prewarmed`等字段。全局缺口及原15继续开放。
+
+### 第326批：DCP保存前本地Stateful回调协调
+
+- CHECKPOINT-DCP-LOCAL-SAVE-326 / P1：PyTorch2.14的save/async_save在保存协议
+  前调用_stateful_to_state_dict；scheduler、loader、trainer、RNG的本地state_dict
+  单rank失败会让peer继续进入DCP。此前仅load准备阶段协调这些本地状态。
+  现在_save_checkpoint的非HF路径浅复制输入并在独立本地错误阶段物化这四类
+  Stateful，随后才创建writer/进入DCP。model/optimizer/EMA和任意用户状态可能
+  通信，保留原路径，不放入该边界；不改变持久化键、状态内容与恢复顺序。
+- 新增checkpoint_save_state_preparation.py，真实scheduler/RNG各两rank失败，
+  同步/线程async/最终full共12场景，检查原异常身份、peer阶段错误、DCP API未调用、
+  无save_future与已发布metadata、barrier、正常重试保存及加载；实际DCP/存储，
+  save/async_save仅wrap观察。原版30468退出1，
+  /tmp/llmtuner-state-prepare-before-326.log，失败rank已调用dcp.save，不是超时证据。
+  最初修复测试30469误查未加config.folder的路径，退出1；改用manager.folder，
+  30470全部退出0，/tmp/llmtuner-state-prepare-final-326.log。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=<30468/30469/30470>
+  tests/integration_tests/checkpoint_save_state_preparation.py。
+  macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。loader/trainer共享已读本地契约，
+  本批新增故障注入仅scheduler/RNG，不宣称任意第三方同名回调均无通信。
+- 既有checkpoint_save_coordination.py完整双rank回归30471退出0，
+  /tmp/llmtuner-save-coordination-final-326.log，命令同上替换port/script；
+  覆盖原writer/retention、加载失败、staging与retry路径。架构文档合并重复的
+  constructor段落并区分本地前置、backend返回结果和服务阶段。
+- 完整CPU4082 passed、4 skipped、841 warnings，47.65s，退出0，
+  /tmp/llmtuner-cpu-final-326.log。适用文件pre-commit、compileall、diff检查均退出0，
+  hooks日志/tmp/llmtuner-hooks-final-326.log。未修改index、提交或推送。
+  全局目标、原15、模型/优化器/EMA回调内部失败及
+  目标硬件/组合缺口继续开放；此测试不作为新进程完整训练恢复证明。
+
+### 第327批：保存准备改动后的真实多轴新进程恢复
+
+- 续接326，检查保存前物化本地状态是否影响optimizer/EMA、loader和RNG恢复。
+  复用pp_checkpoint_equivalence.py的full/resume两次独立torchrun；无新增源码修改。
+  四rank custom FSDP、dense DP4、EP2/efsdp2、PP1、专家gate/up排除FSDP，
+  full AC、aot_eager、accumulation2、dynamic EMA、真实loader/RNG checkpoint。
+- 两阶段30472/30473均退出0；日志/tmp/llmtuner-state-preparation-full-327.log及
+  /tmp/llmtuner-state-preparation-resume-327.log；共享输出目录
+  /tmp/llmtuner-state-preparation-resume-327。四rank更新前完整状态failures=0，
+  最终model/optimizer/scheduler/EMA/trainer/loader/RNG检查通过；续训loss差0。
+  连续loss=[4.876204490661621,4.856256008148193,4.870203018188477,
+  4.868518352508545]，恢复后匹配最后两步。
+- 命令环境PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0；LLMTUNER_TEST_WORLD_SIZE=4、
+  PP_SIZE=1、MOE=1、EP_SIZE=2、FSDP_IMPLEMENTATION=custom、EMA=dynamic、
+  AC=full、COMPILE_BACKEND=aot_eager、ACCUMULATION=2、RNG_STATE=1、
+  LOADER_STATE=1、EXCLUDED_EXPERTS=1（各字段均带LLMTUNER_TEST_前缀）。
+  python -m torch.distributed.run --nproc_per_node=4 --master_addr=127.0.0.1
+  --master_port=<30472/30473> tests/integration_tests/pp_checkpoint_equivalence.py
+  <full/resume> /tmp/llmtuner-state-preparation-resume-327。
+- macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。连续训练是恢复参考，不能证明
+  该组合独立dense数值等价，也不能替代CUDA/NPU或其他轴与异步模式验收。
+  复读scheduler/optimizer/EMA序列化，确认当前回调通信边界；发现Trainer aux指标
+  入口仍由进程级has_pending_counts门控，需继续验证空PP stage的非对称registry。
+  本批仅记录实际恢复证据，原15与全局未验收项保持开放。
+
+### 第328批：Trainer辅助损失指标入口的空PP stage一致性
+
+- AUX-METRICS-REGISTRY-328 / P1：collect_aux_loss_metrics已支持空stage协商，
+  Trainer._step_metrics仍用进程级AuxLoss.has_pending_counts门控，registry为空的
+  stage跳过收集，peer进入PP指标通信。移除此入口门控；有parallel_dims的stage
+  一律进入收集器，指标键/实例数由当前model_parts决定，空模型返回空指标。
+- 扩展aux_loss_runtime_metrics.py，从实际Trainer._step_metrics入口验证PP2、
+  stage0有AuxLoss且stage1无本地AuxLoss/registry；独立预设raw指标3，双方mean3，
+  CE2，随后barrier。之前直接调用收集器的异构/空stage检查保留。
+  原版30474退出1，/tmp/llmtuner-aux-trainer-before-328.log，空stage KeyError，
+  peer被launcher终止，此结果不是实测timeout。修复后30475退出0，
+  /tmp/llmtuner-aux-trainer-final-328.log。真实Gloo/PP mesh/Trainer指标入口，
+  topology使用明确的mesh查询适配，未运行本测试中的完整训练与pipeline schedule。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1 python -m
+  torch.distributed.run --nproc_per_node=2 --master_addr=127.0.0.1
+  --master_port=<30474/30475> tests/integration_tests/aux_loss_runtime_metrics.py。
+  macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。不证明目标设备多轴完整训练。
+- 完整CPU最终退出0：4082 passed, 4 skipped, 759 warnings in 46.46s；日志
+  /tmp/llmtuner-cpu-final-328.log。适用文件pre-commit、compileall、diff检查通过，
+  /tmp/llmtuner-hooks-final-328.log；保留既有改动，未操作index/commit/push。
+- train_step的路由token分母仍有registry门控，该处涉及DP组内一致性，继续审查；
+  本批不据此宣称AuxLoss全局状态已完全隔离。原15和其他全局缺口仍开放。
+
+### 第329批：路由分母DP范围与独立辅助损失数值复核
+
+- 续接328，阅读Trainer.train_step路由分母、AuxLoss注册/set_step_denominator及
+  expert_parallel/model_replacement失败回滚。路由分母只在DP mesh求和，不跨PP；
+  因此空PP stage本身不会重现指标收集的PP通信失配。生产构造注册AuxLoss，
+  替换规划失败则恢复原registry快照，并非从成功模型删除计数。进程级状态和
+  任意第三方直接修改registry仍不具备普遍安全证明，保留其边界；本轮未确认
+  新缺陷，不为表面统一引入每步额外通信或替换有效实现。
+- 实际四rankcustom FSDP、denseDP4、EP2/efsdp2、专家gate/up排除FSDP、fullAC、
+  aot_eager、accumulation2、aux_coef0.03、三步AdamW；使用原始HF模型的独立
+  CE和router概率/topk/bincount辅助目标、独立全梯度范数及裁剪，比较所有梯度
+  和更新，原atol/rtol1e-6保持。30476退出0，
+  /tmp/llmtuner-routing-denominator-reference-329.log。实际compile图计数非零，
+  预设复制参数梯度和更新一致；使用当前inner LR，不作为scheduler独立证明。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30476
+  tests/integration_tests/trainer_fsdp_excluded_gradients.py custom ep ac compile。
+  macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。参考初值从变换前HF模型复制；
+  本项不证明所有masked/ragged token、PP/CP/TP组合或目标硬件。
+- 本批只更新审查证据，无源码改动；不复跑与该文档修改无关的CPU suite。
+  全局审查、原15数值问题和registry跨任意外部生命周期的安全性仍未完成验收。
+
+### 第330批：不均匀有效标签及空CE rank的独立多轴梯度参考
+
+- 逐段复读runtime/batch.py的fetch状态优先级、batch_generator记账、microbatch
+  token计数与train_step预读累积窗口。fetch对所有world rank协调，错误优先于耗尽；
+  模型前先读完整窗口，train捕获耗尽后退回未完成step再按final策略保存。
+  本轮未确认需修改的生产实现；实际底层loader永久阻塞仍在协议边界外。
+- trainer_fsdp_excluded_gradients.py新增masked参数：rank0的两组CE标签全部
+  IGNORE_INDEX，其他rank按rank/group使用不同prompt前缀；独立参考直接从shift后
+  标签重算全局有效数，不调用生产counter。辅助目标仍覆盖全部输入token，不能用
+  CE有效数归一化。保留原普通路径，梯度/更新原atol/rtol1e-6不变。
+- 真实四rankcustom FSDP、DP4/EP2/efsdp2、gate/up排除、fullAC、aot_eager、
+  accumulation2、aux0.03、三步AdamW；所有参数梯度与更新通过独立原HF参考，
+  replica检查及非零compile图计数通过。30477退出0，
+  /tmp/llmtuner-masked-routing-reference-330.log。命令PYTHONPATH=.
+  GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30477
+  tests/integration_tests/trainer_fsdp_excluded_gradients.py custom ep ac compile masked。
+- 既有data_fetch_coordination.py双rank30478退出0，
+  /tmp/llmtuner-fetch-coordination-final-330.log；相同环境/命令改为nproc2/port30478
+  及该脚本，覆盖非对称耗尽、decode/结构错误、异常优先、token/preprocess失败及
+  validation清理。该脚本并非完整Trainer optimizer/不足窗口恢复证明。
+- 完整CPU4082 passed、4 skipped、657 warnings，50.27s，最终退出0，
+  /tmp/llmtuner-cpu-final-330.log。适用文件pre-commit、compileall、diff通过，
+  /tmp/llmtuner-hooks-final-330.log；未操作index、commit/push，保留既有改动。
+- macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。本次数值检查是普通Batch的
+  label masking，不包含packed padding/真实变长输入及PP/CP/TP混合；同样不证明
+  scheduler曲线独立性或CUDA/NPU。原15与其他全局验收缺口保持开放。
+
+### 第331批：非对称有限数据与不足累积窗口的新进程恢复
+
+- 新增finite_training_checkpoint.py，真实Trainer.train/原checkpointable随机loader、
+  native FSDP2、DP2、accumulation2、EMA0.75、full final DCP。rank0用islice限制
+  三批，rank1限制四批；第二窗口读取时rank0耗尽，peer已推进第四批但不再yield。
+  双方step=1、ntokens_seen=24，loader分别steps3/4；只发布step1，无step2。
+- full退出前通过close观察点保存独立状态快照，复用既有_runtime_state和严格
+  _compare_loaded_state比较器；另一torchrun构造新Trainer后load1，更新前完整
+  state逐项比较。full30479退出0，/tmp/llmtuner-finite-full-331.log；
+  resume30480退出1，rank0的finite.dataloader.steps不同，
+  /tmp/llmtuner-finite-resume-331.log，共享目录/tmp/llmtuner-finite-checkpoint-331。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=<30479/30480>
+  tests/integration_tests/finite_training_checkpoint.py <full/resume>
+  /tmp/llmtuner-finite-checkpoint-331。macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。
+- 完整CPU4082 passed、4 skipped、860 warnings，47.80s，退出0，
+  /tmp/llmtuner-cpu-final-331.log；新增文件/台账pre-commit、compileall和diff通过。
+  CPU单测通过不覆盖下述新失败回归；未操作index、commit/push。
+- FINITE-LOADER-RANK-STATE-331 / P1 OPEN：非对称耗尽后的rank局部loader.steps
+  未完整恢复。当前DCP共享标量可能去重了rank0=3/rank1=4，需检查loader持久化
+  格式及每rank ownership，补迁移方案并以本脚本严格恢复通过作为验收条件。
+  不回滚已消费输入，不放宽比较或将原数据改成同游标。其他状态未报告差异不代表
+  完整恢复通过；尚无继续训练轨迹。PP/TP/CP/EP、真实语料、目标设备仍开放。
+  本轮未修改生产代码；新增失败回归保留，全局与原15仍开放。
+
+### 第332批：synthetic DP 游标独立持久化与旧格式迁移
+
+- FINITE-LOADER-RANK-STATE-331 / P1：修复并通过原验收。DP>1 的
+  `steps` 改为 `{str(dp_rank): position}`，避免 DCP 对共享标量去重；DP1
+  保持标量。直接加载仍接受旧标量，DCP planner 将旧标量映射到当前 rank
+  的字典位置。新版缺失当前 rank 键严格失败，不回退到其他 rank。
+- 旧 checkpoint 已丢失的 rank 差异无法恢复；迁移仅保留其实际保存的共享
+  游标，并给出警告。未回滚已消费输入，未修改比较容差或错误协调边界。
+- 原 finite_training_checkpoint.py full/resume 两个独立 torchrun 均退出0，
+  端口30481/30482，共享目录 `/tmp/llmtuner-finite-checkpoint-332`；日志
+  `/tmp/llmtuner-finite-full-332.log`、`/tmp/llmtuner-finite-resume-332.log`。
+  native FSDP2/DP2、累积2、EMA0.75；step1、tokens24，rank游标3/4，
+  恢复前完整 runtime state 严格比较通过。环境沿用第331批。
+- CPU 新增真实 DCP 回归：当前 rank 读写、缺 peer 键拒绝、旧标量向两个
+  rank 迁移及后续 batch 相等。同步现有 CPU/EMA process harness 的格式断言。
+  初轮 CPU 1 failed、4082 passed、4 skipped：旧 DP2 测试断言标量，已更新
+  为明确 rank1 字典；不是数值容差调整。最终完整 CPU 4083 passed、
+  4 skipped、751 warnings，51.54s，退出0；日志
+  `/tmp/llmtuner-cpu-final-332b.log`。适用7文件 pre-commit 最终退出0
+  （`/tmp/llmtuner-hooks-final-332b.log`），compileall、diff HEAD --check通过。
+- 此验收仅关闭已复现的 rank 游标丢失；尚未以本有限数据脚本证明继续训练
+  轨迹、其他并行组合或目标设备。全局审查及原数值问题15继续开放。
+
+### 第333批：有限数据耗尽后恢复的继续训练轨迹
+
+- 扩展 finite_training_checkpoint.py：full 在真实 Trainer.train 数据耗尽、
+  final DCP 保存完成后，于 close 观察点先保存边界快照，再保留同一运行时、
+  不回滚已消费输入，直接通过 train_step 继续两个 optimizer step。另一个
+  torchrun 恢复 step1，先比较完整边界状态，再继续两步，比较 loss 及最终
+  模型/optimizer/scheduler/EMA/trainer/loader/RNG。张量使用 torch.equal，
+  metadata 类型和值完全相等；没有容差放宽。
+- full30483、resume30484 均退出0，根目录
+  `/tmp/llmtuner-finite-checkpoint-333`，日志
+  `/tmp/llmtuner-finite-full-333.log`、`/tmp/llmtuner-finite-resume-333.log`。
+  两rank继续loss完全一致 `[3.470820665359497, 3.4474387168884277]`，最终
+  完整state比较无差异。命令沿第332批，端口和目录替换为本批；CPU/Gloo、
+  native FSDP2/DP2、accumulation2、EMA0.75，AC/compile关闭。
+- 本批未改变生产实现；同步设计文档的格式与迁移限制。此处连续参考使用
+  同一机制，证明恢复连续性，不是独立 dense 数值 oracle，也不是耗尽后
+  自动重启数据源的产品行为；续训显式恢复原无限 synthetic iterator。
+  多轴数值问题15及其他设备/组合仍开放。
+- 最终 CPU 4083 passed、4 skipped、864 warnings，47.57s，退出0，
+  `/tmp/llmtuner-cpu-final-333.log`；适用文件pre-commit退出0，
+  `/tmp/llmtuner-hooks-final-333.log`，compileall与diff检查通过。
+  首次hook修复测试print行格式，已审阅并重跑；未commit/push。
+
+### 第334批：synthetic 损坏游标的预检查隔离
+
+- 审查 distributed_checkpoint.py 的本地 metadata 预检查及 synthetic.py 的
+  rank 游标校验。保留生产实现，新增真实 DCP/实际 manager CPU 回归：
+  rank0 负游标、布尔游标、缺当前rank、旧标量倒退四种情况。
+  已消费两批后拒绝加载，loader state 与后续 batch 均和未加载参考一致，
+  live model 参数不变；观察真实 dcp.load 调用，确认仅一次 metadata 读取，
+  尚未进入包含 model 的完整 reader。观察包装不替代 DCP。
+- 首版夹具未保存 lr_scheduler，宽泛异常断言产生假阳性；加强为具体错误
+  `steps|resume at batch` 后，全量3 failed、4084 passed、4 skipped，
+  `/tmp/llmtuner-cpu-final-334.log`。补齐 scheduler.last_epoch=0 后，
+  targeted四项退出0，`/tmp/llmtuner-cursor-preflight-334b.log`。
+  保留失败证据，不将首轮四项通过计作游标校验有效证据。
+- CPU2.14 无进程组，本测试不证明多rank错误传播；沿用既有独立分布式证据，
+  不据此扩大到新设备/组合。未修改生产机制、容差或collective区间。
+- 最终CPU 4087 passed、4 skipped、741 warnings，48.52s，退出0；日志
+  `/tmp/llmtuner-cpu-final-334b.log`。适用pre-commit、compileall、diff检查
+  通过（`/tmp/llmtuner-hooks-final-334.log`）。本代理未执行stage/commit/push；
+  工作期间外部HEAD推进到c7b7d31，生产游标改动现已在该提交中，保留当前状态。
+
+
+### 第335批：synthetic rank 游标损坏的跨 rank 失败传播
+
+- 扩展 finite_training_checkpoint.py 的 invalid 阶段。真实 Trainer/native
+  FSDP2/DP2，dcp.save 保留全部 manager states，仅将rank0 synthetic
+  游标改为-1，rank1游标有效。调用实际 manager加载实现，两个rank均拒绝，
+  模型/optimizer/scheduler/EMA/trainer/loader/RNG与加载前精确相等，随后
+  barrier完成并退出0。无collective替身，未新增本地错误协调区间。
+- 初次30485退出1：rank1正确收到“dataloader preflight validation failed
+  on another rank”，测试误要求peer也含本地“steps”；修正为按rank检查各自
+  错误契约。失败日志 `/tmp/llmtuner-invalid-cursor-335.log` 保留。
+  最终30486退出0，`/tmp/llmtuner-invalid-cursor-335b.log`，目录
+  `/tmp/llmtuner-invalid-cursor-335b`。
+- 命令沿第333批torchrun，phase=invalid、端口30486，目录替换为上项。
+  CPU/Gloo、macOS arm64/Python3.13/PyTorch2.14、EMA0.75、accumulation2，
+  AC/compile关闭。本测试验证一次rank局部语义错误的协调，不覆盖collective
+  内部故障或进程死亡恢复；不扩大声明到目标设备或其他组合。
+- 完整CPU4087 passed、4 skipped、718 warnings，48.57s，退出0；
+  `/tmp/llmtuner-cpu-final-335.log`。适用pre-commit最终退出0，
+  `/tmp/llmtuner-hooks-final-335b.log`，compileall与diff检查通过。
+  本批不改生产代码，未stage/commit/push。
+
+### 第336批：三轴原始验收的 native/custom 同配置对照
+
+- 续接 TRAINER-TRIAXIS-ADAMW-NUMERICS-15，当前工作树重新运行原始 HF
+  参考验收，再仅替换 FSDP implementation=native。两者均使用默认FP32
+  reduce、FP64参数/FP32router、TP2/KVCP2/EP2、aux.01、AdamW、fullAC。
+  不使用rounded参考或显式FP64归约作为替代验收。
+- custom30487退出1，`/tmp/llmtuner-triaxis-original-336.log`；native30488
+  退出1，`/tmp/llmtuner-triaxis-native-336.log`。均在step1权重（gradient=False）
+  model.model.layers.0.mlp.routed_experts.inner_experts.w1_EFD失败，FP64、
+  shape(4,48,64)，1/12288元素，index(0,2,7)，maxabs
+  2.020802345722994e-6、maxrel0.00020130205604109434，原atol/rtol1e-6。
+  rank1/3失败，由launcher终止其他peer，未证明通信故障恢复。
+- 命令沿第304批，仅端口30487/30488、实现custom/native；环境仍CPU/Gloo、
+  macOS arm64/Python3.13/PyTorch2.14、OMP_NUM_THREADS=1，
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0。
+- 本证据排除“仅custom路径产生该首个误差”的归因；不证明其他参数或后续步
+  无缺陷，不改变既有默认归约精度。问题15继续OPEN：仍需独立明确的精度契约
+  或根因修复及原验收有效证据。未改生产或测试，沿用第335批有效CPU门禁，
+  本批仅文档验证，不重复运行无关CPU suite。运行任务均终止。
+
+### 第337批：验证流程状态与错误边界复核
+
+- 逐段复核trainer.validate委派、runtime/validation.py、batch.preprocess及
+  seeding.preserve_rng_state调用关系。验证使用临时loader；完整token分母在
+  CP/TP切片前统计；模式/attention mask/flex packed标记于finally恢复，
+  RNG由ExitStack保护；预处理本地错误边界在forward collective之前。
+  未确认需改动的生产缺陷，未增加无收益包装或拆分文件。
+- validation_reduction_equivalence.py四rank30489退出0，日志
+  `/tmp/llmtuner-validation-337.log`。DP2×CP2和DP2×TP2显式切片projection
+  对独立完整batch CE参考通过；含rank局部eval模式切换、预处理失败及恢复，
+  后续barrier/正常验证通过。参考atol/rtol1e-7。这不覆盖真实attention或
+  TP/FSDP模型变换，不能替代模型并行验收。
+- validation_rng_coordination.py两rank30490退出0，日志
+  `/tmp/llmtuner-validation-rng-337.log`。真实Trainer/FSDP/loader，rank0/1
+  × OSError/KeyboardInterrupt/SystemExit × RNG setup/cleanup，故障仅注入
+  RNG调用；模式恢复、host RNG隔离、peer停止和barrier通过。失败CPU RNG
+  只在测试清理中手动恢复，不宣称setter故障时可自动恢复随机源。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=<4/2> --master_addr=127.0.0.1 --master_port=<30489/30490>
+  tests/integration_tests/<对应脚本>。Python3.13/PyTorch2.14/macOS arm64 CPU/Gloo。
+  本批只更新审查证据，完整CPU沿用335，原问题15与目标设备缺口继续开放。
+- pp_validation_equivalence.py真实PP2两rank30491退出0，日志
+  `/tmp/llmtuner-validation-pp-337.log`，同上述命令更换脚本/端口。schedule.eval
+  对同microbatch边界的非PP参考验证loss通过；既有梯度、optimizer、scheduler、
+  token计数与训练模式检查通过。CPU/Gloo证据不扩大到GPU/NPU。
+
+
+### 第338批：非有限更新的 custom FSDP×TP×AC/compile 边界
+
+- 复核train_step的loss/grad_norm世界MIN判定与optimizer→scheduler→EMA顺序。
+  所有rank在本地断言前参与同一全局判定，未发现需改动的生产实现。
+- 运行trainer_nonfinite_update.py custom tp2 ac compile，四rank30492
+  退出0，`/tmp/llmtuner-nonfinite-tp-338.log`。DP2×TP2、custom FSDP、
+  fixed-routing MoE、full AC、aot_eager compile、EMA0.75。先完成真实Adam
+  warmup与非平凡EMA历史，再逐rank注入NaN loss或post-backward Inf专家梯度；
+  两种×四rank均拒绝更新，完整model/optimizer/scheduler/EMA/local_shards
+  相等，barrier及下一次有效训练步通过，并确认compile图实际生成。
+- 命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30492
+  tests/integration_tests/trainer_nonfinite_update.py custom tp2 ac compile。
+  Python3.13/PyTorch2.14/macOS arm64 CPU/Gloo。
+- 只验证更新状态不变；不回滚数据消费、RNG或trainer手动step计数。CPU错误
+  可恢复，不外推CUDA异步设备断言（可能使进程失效）。不替代其他并行组合、
+  动态路由或目标设备验收，问题15仍开放。本批仅更新证据，沿用335完整CPU
+  门禁；文档hooks/diff通过，未stage/commit/push，运行任务已退出。
+
+### 第339批：逐文件清单精确核对与通用工具复查
+
+- 对当前178个llmtuner/**/*.py与逐文件Markdown表第一列做精确集合比较：
+  表格178行、178唯一路径，missing/stale/duplicate均为空。不是全文子串
+  命中判断，也不将路径覆盖升级为语义/硬件验收完成。
+- 复读utils/lazy_exports.py、module_names.py、dtypes.py、
+  garbage_collection.py、utils/__init__.py及seeding.preserve_rng_state。
+  检查懒导出未知属性语义、完整wrapper segment规范化、dtype别名、GC跨实例
+  所有权及乱序close/初始化失败恢复；未确认需修复缺陷，保留现有模块边界。
+  RNG失败优先级及设备流限制沿337的明确边界，不重复扩大验证声明。
+- `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q
+  tests/unit_tests/cpu/utils --disable-warnings`退出0，118 passed，1.44s；
+  `/tmp/llmtuner-utils-339.log`。纯复核无生产改动，完整CPU沿335。
+  本批文档hooks与diff检查通过，未stage/commit/push，运行任务已退出。
+  全局语义验收、多轴原问题15与硬件缺口仍未完成。
+
+### 第340批：Kimi SiTU 显式零 beta 被默认值吞掉
+
+- KIMI-SITU-ZERO-BETA-340 / P2：model.py KimiMLP、moe.py KimiExpertMLP
+  及kimi_conversion.py均用`activation_situ_beta or 1.0`，把显式0静默转成1，
+  绕过SituGLU已有finite/positive校验。改为仅None使用1.0，合法配置不变，
+  显式零按既有契约拒绝；无新封装、重命名或通信变化。
+- 新增dense/expert构造两项及EP转换一项回归，原实现3 failed，
+  `/tmp/llmtuner-situ-baseline-340.log`。转换失败检查原模块及所有参数身份
+  不变；回归通过作为修复验收，完整CPU与真实EP结果补记如下。
+- 首轮pre-commit发现测试长行并格式化，已审阅自动修改后重跑通过，
+  `/tmp/llmtuner-hooks-final-340.log`。目标设备/其他并行组合不据此验收。
+- 最终完整CPU4090 passed、4 skipped、813 warnings，52.83s，退出0，
+  `/tmp/llmtuner-cpu-final-340.log`。真实kimi_ep_equivalence.py两rank30493
+  退出0，`/tmp/llmtuner-kimi-ep-340.log`：latent开关×SiLU/SiTU×空rank0开关
+  八组，原始逐专家参考的输出/梯度比较通过，沿用原容差。
+  命令PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30493
+  tests/integration_tests/kimi_ep_equivalence.py；CPU/Gloo FP32，TP/PP/CP1。
+- 本问题修复验收通过；compileall、diff检查通过。全局与原15继续开放，
+  未stage/commit/push，运行任务均退出。
+
+
+### 第341批：Kimi latent expert 宽度默认值与边界
+
+- KIMI-LATENT-WIDTH-341 / P2：KimiSparseMoE以`width or hidden_size`
+  把显式零宽度改成hidden_size，但仍按非None创建latent投影，静默改变架构。
+  在KimiLinearConfig拒绝非正整数、bool和非整数latent宽度；None仍表示禁用，
+  MoE明确用None判断默认值。合法正数与持久化参数名不变，无状态迁移需要。
+- 新增0/-1/True/1.5四项回归，原实现4 failed，退出1，
+  `/tmp/llmtuner-width-baseline-341.log`。修复在模型分配之前报具体字段错误，
+  不依赖torch.Linear的偶然异常；与340的SiTU改动共同运行完整CPU门禁。
+- 本批环境macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo，目标设备不外推。
+- 最终完整CPU4094 passed、4 skipped、725 warnings，49.17s，退出0，
+  `/tmp/llmtuner-cpu-final-341.log`。kimi_ep_equivalence.py两rank30494
+  八组输出/梯度对照退出0，`/tmp/llmtuner-kimi-ep-341.log`，命令沿340更换
+  端口。合法latent/shared/SiTU、空及不等token语义保持原断言。
+  适用pre-commit、compileall和diff检查通过；问题341修复验收通过，
+  原15及全局其余项仍开放。未stage/commit/push，运行任务均退出。
+
+
+### 第342批：Kimi gate 整数契约在参数分配前校验
+
+- KIMI-GATE-INTEGER-342 / P2：KimiMoEGate只检查范围/整除，布尔计数可能
+  通过，整数值float在部分字段通过构造后才于reshape/topk失败，num_experts
+  float则落入torch.empty的偶然TypeError。为num_experts、
+  num_experts_per_token、num_expert_group、topk_group统一校验正整数且非bool，
+  在取模及参数分配前报具体字段ValueError；删除重复group正数判断。
+- 新增四字段×True/1.0/0/-1，共16项回归。原实现10 failed、6 passed，
+  `/tmp/llmtuner-gate-baseline-342.log`。失败含接受非法值、torch分配TypeError
+  及字段提示不明，不能称16项原先均被接受。原整除/组容量规则保留。
+- 对照本地FSDPTurbo modeling_kimi_linear.py:MoEGate，group选择同样以组数
+  关系控制，不在缺少独立规格时按配置名字重写路由算法。use_grouped_topk/
+  topk_method字段的完整语义仍需上游规格，不据此次整数修复宣称其全部生效。
+- 环境Python3.13/PyTorch2.14/macOS arm64，CPU门禁命令沿341。
+  未修改通信、数值算法或持久化格式；原15及目标设备缺口继续开放。
+- 完整CPU4110 passed、4 skipped、675 warnings，46.75s，退出0，
+  `/tmp/llmtuner-cpu-final-342.log`。删除冗余检查后的Kimi MoE专项28 passed，
+  `/tmp/llmtuner-kimi-final-342.log`。适用pre-commit最终退出0，
+  `/tmp/llmtuner-hooks-final-342.log`；compileall、diff通过。
+  本批无collective变化，复用341真实EP数值证据，未重复启动同等分布式测试。
+  问题342修复验收通过；未stage/commit/push，运行任务已退出。
+
+
+### 第343批：Kimi MoE 层选择配置与实际装配
+
+- KIMI-MOE-LAYER-SELECTION-343 / P2：first_k_dense_replace及moe_layer_freq
+  无整数/范围校验，零频率导致decoder装配取模异常，负/小数可造成非预期
+  MoE层布局。配置层要求dense prefix为非负整数、频率为正整数，拒绝bool；
+  保留上游以绝对layer_idx取模的既有布局，不按prefix重新起算周期。
+- 七项非法配置回归原实现均失败，`/tmp/llmtuner-layer-baseline-343.log`。
+  新增真实KimiTextDecoder四层装配检查：dense prefix1、freq2，只有layer2
+  为MoE，KDA attention真实构造，无工厂替身。未改变合法配置的参数/状态键。
+- 本批不改通信与数值实现，目标设备和组合缺口不由配置验证关闭。
+- 最终完整CPU4118 passed、4 skipped、705 warnings，47.80s，退出0，
+  `/tmp/llmtuner-cpu-final-343.log`，环境/命令沿342。适用pre-commit最终
+  通过，`/tmp/llmtuner-hooks-final-343.log`，已审阅格式自动修改；compileall、
+  diff通过。问题343修复验收通过；原15与全局其他要求保持开放。
+  未stage/commit/push，保留既有index及工作区变化，运行任务已退出。
+
+
+### 第344批：Kimi 实际训练的 AC/compile 完整恢复
+
+- 续接340–343配置修复，运行真实Trainer Kimi KDA latent/shared MoE、
+  group-limited E4/top2、EP2/alltoall、custom FSDP2、TP/PP/CP1，full AC、
+  aot_eager compile、动态EMA、RNG及真实checkpointable loader。
+  full在step2保存DCP并连续训练到step4；另一torchrun新runtime load最新。
+- full30495、resume30496均退出0，目录`/tmp/llmtuner-kimi-resume-344`，
+  日志`/tmp/llmtuner-kimi-full-344.log`、`/tmp/llmtuner-kimi-resume-344.log`。
+  两rank pre-update完整state failures0，最终模型/optimizer/scheduler/EMA/
+  trainer/loader/RNG严格比较通过，连续loss
+  `[4.859193801879883,4.879417419433594,4.875622749328613,4.871465682983398]`，
+  续训两步loss差0。compile包装与非零图计数检查通过；保留原验收断言。
+- 环境LLMTUNER_TEST_KIMI=1、KIMI_MOE=1、KIMI_LATENT=1、EP_SIZE=2、
+  PP_SIZE=1、FSDP_IMPLEMENTATION=custom、EMA=dynamic、RNG_STATE=1、
+  LOADER_STATE=1、AC=full、COMPILE_BACKEND=aot_eager（均同LLMTUNER_TEST_前缀）。
+  PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=<30495/30496>
+  tests/integration_tests/pp_checkpoint_equivalence.py <full/resume>
+  /tmp/llmtuner-kimi-resume-344。macOS arm64/Python3.13/PyTorch2.14 CPU/Gloo。
+- 本批证明同拓扑恢复连续性，不是独立dense数值oracle，不覆盖EP度数变化、
+  hybrid/KCP/TP或目标设备。未修改代码，复用343完整CPU；文档hooks/diff通过，
+  原15和其他迁移验收仍开放。未stage/commit/push，运行任务均退出。
+
+### 第345批：Kimi EP2→EP1 的 AC/compile 迁移与数据游标
+
+- 审查kimi_layout.py源metadata/完整CPU目标模板及跨layout装载链，补齐
+  kimi_ep_layout_resume.py原先遗漏的更新前dataloader状态比较（仅开启
+  LOADER_STATE时），继续使用独立split-state快照，不从加载后目标构造参考。
+- 复用344的step2 EP2源checkpoint，新的torchrun以EP1装配，其他Kimi latent/
+  shared、custom FSDP2、fullAC/aot_eager compile、动态EMA配置相同。
+  更新前模型/optimizer/EMA/trainer/scheduler/loader精确比较及后续两步loss
+  原atol/rtol1e-6均通过，两rank30497退出0，
+  `/tmp/llmtuner-kimi-layout-345.log`。显式exclude RNG，跨EP变化不保证随机流
+  连续；未比较更新后全部参数，不能外推完整跨拓扑数值相等。
+- 命令沿344，EP_SIZE=1、脚本kimi_ep_layout_resume.py，参数
+  /tmp/llmtuner-kimi-resume-344，无phase；端口30497。CPU/Gloo同版本环境。
+  本批只扩展测试，不改生产迁移及精度策略。全局与原15仍开放。
+- 完整CPU4118 passed、4 skipped、778 warnings，46.17s，退出0，
+  `/tmp/llmtuner-cpu-final-345.log`。适用pre-commit、compileall、diff检查
+  通过，`/tmp/llmtuner-hooks-final-345.log`。未stage/commit/push，任务均退出。
+
+
+### 第346批：Kimi 迁移转换与后续恢复的不同失败边界
+
+- 复读kimi_layout.py：源目标模板构建与distribute_tensor在本地错误协调区间
+  外；转换区间内只做CPU转换、模型/optimizer/EMA shape/key校验。模型写入
+  在转换成功后，scheduler/loader/trainer callback单独协调，RNG最后恢复。
+  不宣称callback失败具有整次加载事务回滚，未确认新生产缺陷。
+- kimi_layout_preflight.py两rank30498退出0，
+  `/tmp/llmtuner-kimi-preflight-346.log`。真实DCP与Kimi MoE，optimizer/EMA
+  × duplicate expert index/shape四种损坏均在写入前拒绝，模型/optimizer/EMA
+  及CPU RNG与前态完全一致，barrier后健康checkpoint加载及输出/状态通过。
+  两rank读取相同损坏文件，无真实EP mesh或完整Trainer，不作为非对称故障证据。
+- kimi_scheduler_restore_coordination.py两rank30499退出0，
+  `/tmp/llmtuner-kimi-scheduler-346.log`。individual↔grouped两方向局部
+  scheduler callback注入失败均通知peer并完成barrier。模型可能已装载，
+  不把错误传播成功误报为参数未改变或原地自动恢复。
+- 命令公共前缀PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=<30498/30499>
+  tests/integration_tests/<对应脚本>；Python3.13/PyTorch2.14/macOS arm64 CPU/Gloo。
+  本批仅审查证据，无代码改动，完整CPU复用345，文档hooks/diff通过。
+  原15、其他组合/设备及全局验收保持开放；未stage/commit/push，任务均退出。
+
+### 第347批：packing 复查及数据预检查新失败
+
+- 复读datasets/packing/build.py、conversions.py、iterators.py，检查有限尾行、
+  文档positions、padding标签、remainder replay及失败回滚；未确认packing新缺陷。
+  `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q
+  tests/unit_tests/cpu/datasets/test_data_pipeline.py --disable-warnings`退出0，
+  432 passed、6 warnings，11.60s，`/tmp/llmtuner-packing-347.log`。
+- DATA-PREFLIGHT-CURSOR-SCHEMA-347 / P2 OPEN：新版DP2 rank-key steps源加载到
+  degree1目的时，DCP先发现缺`dataloader.steps`，抛CheckpointException，
+  既有checkpoint_data_preflight.py期望的degree ValueError未触达。
+  目前只确认预检查错误顺序/异常契约发生变化；不能据此认定已写坏模型，
+  也不把整个跨rank矩阵视为通过。需决定在schema规划前验证degree或提供
+  明确的兼容拒绝语义，再重跑完整DDP/native/custom矩阵且确认live state不变。
+- 真实两rank30500退出1，`/tmp/llmtuner-data-preflight-347.log`。命令
+  PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 OMP_NUM_THREADS=1
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m torch.distributed.run
+  --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30500
+  tests/integration_tests/checkpoint_data_preflight.py；CPU/Gloo同346版本。
+  本轮无生产/测试变更，新增失败保持开放，原15与全局目标未完成。
+
+### 第348批：在游标规划前拒绝不兼容 DP degree
+
+- DATA-PREFLIGHT-CURSOR-SCHEMA-347 / P2 修复：DCP manager的metadata预检查
+  先单独读取loader.dp_world_size，调用共享require_same_dp_degree，再规划完整
+  rank游标。读取collective在本地错误区间外，degree校验在既有命名边界协调。
+  不引入游标丢弃、partial load或拓扑自动迁移；代价为有degree loader多一次
+  小metadata读取。没有degree的自定义state沿用原加载路径。
+- 原checkpoint_data_preflight.py两rank30501退出0，
+  `/tmp/llmtuner-data-preflight-348.log`，DDP/native/custom × loader/scheduler/
+  RNG world/topology ×双方/仅rank0/仅rank1不兼容，原具体错误断言及live
+  model/optimizer/EMA/scheduler/loader/RNG不变检查通过，随后barrier完成。
+  命令同347替换端口30501。此前30500失败证据保留。
+- 健康finite checkpoint-333以新torchrun30502 resume，
+  `/tmp/llmtuner-finite-resume-348.log`；完整边界及两步继续状态/精确loss通过，
+  验证新预检查不阻止非对称rank游标3/4的有效恢复。未生成新的源参考。
+- 完整CPU4118 passed、4 skipped、816 warnings，51.02s，退出0，
+  `/tmp/llmtuner-cpu-final-348.log`。更新先前回归的读取次数断言为degree及
+  完整metadata两次，仍断言两次都不含model。首次hooks格式化已审阅。
+  环境CPU/Gloo/Python3.13/PyTorch2.14，其他设备与原15继续开放。
+
+### 第349批：MC2 stage 错误组装配遗漏
+
+- MC2-STAGE-ERROR-GROUP-349 / P1：parallelize.py只为Domino选择loss mesh
+  error_group，MC2虽在apply_ep/MC2RoutedExperts支持该组，却从生产入口收到
+  None，退回单EP subgroup；EP小于stage范围时局部输入失败不能通知其他
+  共享后续FSDP/TP/CP通信的rank。将组选择条件扩展到MC2，不改kernel/通信算法。
+- 新增生产assembly入口CPU回归，Domino/MC2各一项观察apply_ep接收到的组，
+  原实现MC2失败、Domino通过，`/tmp/llmtuner-mc2-baseline-349.log`。
+  此测试替换变换函数，仅证明组传递，不宣称真实NPU MC2数值或生命周期通过。
+- 完整CPU4120 passed、4 skipped、877 warnings，53.59s，退出0，
+  `/tmp/llmtuner-cpu-final-349.log`；适用pre-commit、compileall、diff通过，
+  `/tmp/llmtuner-hooks-349.log`。原15与全局目标保持开放。
+- mc2_input_coordination.py四rank30503退出0，
+  `/tmp/llmtuner-mc2-input-349.log`：真实Gloo两个EP子组、显式stage error组的
+  输入失败传播通过。该脚本替换swap及ops加载，不执行融合kernel，验证apply_ep
+  后半段组安装和MC2本地预检查，不能替代生产assembly或目标设备端到端测试。
+  公共torchrun环境沿348，nproc4、port30503、脚本如上；未stage/commit/push。
+
+
+### 第350批：MC2 autograd 与通信上下文边界复核
+
+- 复核 mc2_ops.py、mc2_dispatch.py 及本地 FSDPTurbo 的
+  ops/npu/grouped_matmul_mc2.py：正反向 transpose、send/recv 反转、
+  rank-major counts 到专家梯度总量的转换与上游一致；本批未确认新的实现缺陷。
+- HCCL get_hccl_comm_name 在本地输入协调区间外。无法在当前环境确认其
+  通信器初始化是否触发跨 rank 操作，因此未将其包入禁止 collective 的本地
+  错误区间；通信初始化及内部故障的恢复边界仍需 Ascend 实机验证。
+- 两 rank Gloo mc2_distributed_adapter.py，port30504，退出0，日志
+  /tmp/llmtuner-mc2-adapter-350.log：普通、空发送rank、零接收、全空四种
+  分布均通过三步 momentum 更新、输出及梯度比较；同时运行 rank0 非法
+  shape/dtype/counts/histogram/ids 的协调断言。保留脚本原有容差。
+- 此脚本使用真实 all-to-all 和生产 autograd，但替换融合算子与通信上下文；
+  参考专家复用基础实现，不能证明 Ascend 内核、HCCL 初始化或 MC2×TP 通过。
+  单测 test_mc2_ops.py 9 passed，日志 /tmp/llmtuner-mc2-unit-350.log。
+  环境沿349：CPU/Gloo、Python3.13、PyTorch2.14，OMP_NUM_THREADS=1、
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0、PYTHONPATH=.、
+  GLOO_SOCKET_IFNAME=lo0。仅更新审查记录，未提交或推送；原15等缺口保持开放。
+
+### 第351批：三轴 AdamW 无 backward hook 的三步轨迹
+
+- 继续 TRAINER-TRIAXIS-ADAMW-NUMERICS-15，复核原始验收及304/305/336
+  证据后运行既有 forward_trajectory。保留默认FP32 FSDP归约、FP64参数、
+  FP32 router参考及原1e-6断言；该选项只安装前向记录，不安装tensor梯度hook。
+- 四rank custom、TP2/KVCP2/EP2、aux.01、AdamW、fullAC、不等token累积，
+  CPU/Gloo/Python3.13/PyTorch2.14。命令：
+  `OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=30505 tests/integration_tests/trainer_tp_ep_cp_equivalence.py custom aux adam full fp32_router forward_trajectory`。
+  最终退出1，日志 `/tmp/llmtuner-triaxis-forward-351.log`；任务已结束。
+- 第一更新首差仍为layer0 w1_EFD，shape(4,48,64)，index(0,2,7)，
+  最大绝对差2.020802345722994e-6；该位置实际梯度-4.2637111619114876e-9，
+  参考-4.2678237395401934e-9，同梯度独立Adam公式残差约1.39e-17。
+  初始router logits及MoE输出记录一致，不能由此推断整个反向等价。
+- 三步保留全部比较后失败：rank1/3各14项，rank0/2各3项；第三步layer0
+  w2_EDF权重最大差2.6112953628518176e-6，EMA差1.5118205069636348e-6。
+  第二步输入norm已出现约1e-6级差异，不能只验初始loss或单步optimizer状态。
+- 本批新增完整三步前向轨迹证据，未修改实现、参考或容差；归约舍入放大解释
+  获支持但不关闭原验收。后续需明确FP64参数/显式FP32归约的精度契约并满足
+  原始接受条件，不能以FP64归约控制或舍入参考替代。仅文档变更，diff检查通过，
+  未stage/commit/push，现有工作区改动保留。
+
+### 第352批：配置边界与 profiler schedule 消费复核
+
+- 逐段复核 validation_config.py、compile_config.py、ema_config.py、
+  optimizer_config.py、lr_scheduler_config.py、observability_config.py，
+  并追踪 components/profiler.py 的可选参数传递、恢复step偏移和清理。
+  本批未确认新的运行时缺陷，不为统一外观重组已有明确职责。
+- 修正 profiler_skip_first_wait 字段说明：PyTorch2.14 schedule 实际按
+  `!= 0` 跳过首周期wait，并非指定跳过等待次数；None使用默认0，后续周期
+  仍等待。保留参数类型、校验和运行行为，仅修改docstring。
+- 相关CPU命令：`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 pytest -q --disable-warnings tests/unit_tests/cpu/test_config.py tests/unit_tests/cpu/components/test_profiler.py tests/unit_tests/cpu/components/optimizer/test_optimizer_config.py`，
+  412 passed、3 warnings、5.23s，退出0，/tmp/llmtuner-config-profiler-352.log。
+  测试包含配置拒绝及profiler生命周期，但不代表CUDA/XPU allocator实机验证。
+- 仅说明文字变化，适用pre-commit通过，/tmp/llmtuner-hooks-352.log；
+  compileall与HEAD差异检查通过，未重跑全套训练测试。工作区原改动保留，
+  未stage/commit/push；三轴原15及设备组合等验收缺口仍开放。
+
+### 第353批：异步 DCP 发布与关闭重试复核
+
+- 当前HEAD由外部推进至315c406，已核对工作区；未撤销外部提交或既有测试改动。
+  阅读base.py的pending save/close、distributed_checkpoint.py异步future所有权、
+  checkpoint_writer.py generation与metadata发布。未确认新的实现缺陷。
+- 两rank真实Gloo/DCP async生命周期脚本退出0，port30506，日志
+  /tmp/llmtuner-async-lifecycle-353.log。两轮新manager恢复后继续一步的模型、
+  optimizer精确一致，scheduler一致；新model-only导出不遮蔽step1训练恢复点，
+  重复close释放专用进程组，主组仍可all_reduce。
+  命令：`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30506 tests/integration_tests/async_checkpoint_lifecycle_equivalence.py`。
+- test_checkpointer.py全文件207 passed、127 warnings、5.32s，退出0，日志
+  /tmp/llmtuner-checkpointer-353.log，使用同OMP/TORCHINDUCTOR环境与pytest -q
+  --disable-warnings。阅读确认同step失败重写测试真实写分片/metadata，断言旧metadata
+  不变并恢复model/optimizer/scheduler/EMA/loader/trainer/Python/NumPy/torch RNG；
+  重试后发布新generation。故障注入是单进程证据，不能外推多rank故障一致性。
+- 该分布式生命周期使用普通复制参数，无FSDP/PP/EP、无loader/RNG/EMA，
+  不能独立证明完整Trainer恢复；也不覆盖pinned process staging、设备transport、
+  对象存储原子替换、并发写入或断电durability。保留这些边界，原15继续开放。
+  本批只增审查记录，diff检查通过；任务均结束，未stage/commit/push。
+
+### 第354批：真实 CLI seed 导出与入口失败清理
+
+- 复核__main__.py→trainer/cli.py→cli_config.py→LLMTunerConfig.from_groups：
+  parser使用显式分组、关闭隐式args文件；种子导出在Trainer构造前验证单设备及
+  enable；finally保留主错误并继续Trainer/进程组清理。未确认新的实现缺陷。
+- 真实子进程命令：`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 python -m llmtuner --create_seed_checkpoint --enable --dump_folder /tmp/llmtuner-cli-seed-354 --implementation for-loop`，
+  退出0，/tmp/llmtuner-cli-seed-354.log；日志确认step0模型导出、purge线程关闭。
+  独立FileSystemReader读取产物metadata成功，21个条目均属于model；该检查仅证明
+  metadata可读和分类，不宣称逐张量等价或训练完整恢复。产物在/tmp，未加入仓库。
+- 精确入口单测命令（同OMP/TORCHINDUCTOR环境）：`pytest -q --disable-warnings tests/unit_tests/cpu/test_trainer.py -k test_cli_`，18 passed、143 deselected、
+  4.65s，退出0，/tmp/llmtuner-cli-targeted-354.log。覆盖显式参数/禁args文件、
+  seed预检、HF配置读取和主错误/清理错误保留。早先`-k 'cli or entry'`还匹配
+  clip测试，24 passed，/tmp/llmtuner-cli-unit-354.log，不将24项全部归为CLI。
+- CPU/macOS/Python3.13/PyTorch2.14，未使用torchrun，无并行或目标设备证据；
+  此seed路径不触发attention backward，不能替代完整CLI训练或Flex验收。
+  本批只更新记录，diff检查通过，任务均结束；未stage/commit/push。
+
+### 第355批：pattern FSDP 共享状态与超长预取窗口
+
+- 复核module_patterns.py、fully_shard_parallel/plan.py的pattern解析、共享参数
+  references绑定、ignored模块和prefetch去重，并读取TP入口的plan合并、first-match
+  与MoE子树排除。TP无匹配的整体计划会拒绝，但本批未证明每个显式pattern均被
+  使用；不能把FSDP严格匹配语义无条件套到含可选模块的HF默认TP计划。
+- 双rank CPU/Gloo实际pattern_fsdp_equivalence.py --prefetch-window 5退出0，
+  /tmp/llmtuner-pattern-prefetch-355.log，native/custom各13布局共26项，三步SGD
+  与dense参考比较，保留atol2e-6/rtol2e-5；覆盖decoder/显式pattern、共享边界、
+  交叉共享、嵌套及alias、单专家HSDP(2,1)覆盖和grouped-state窗口。
+  窗口5超过fixture单元数；按state去重避免共享成员覆盖窗口。
+- 命令：`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=30507 tests/integration_tests/pattern_fsdp_equivalence.py --prefetch-window 5`。
+  Python3.13/PyTorch2.14/FP32；无TP/PP/CP/EP、AC/compile/EMA或custom多context，
+  不构成任意pattern与混合并行矩阵的完整验收，也不证明GPU prefetch性能收益。
+- 三个CPU文件test_module_patterns.py、test_fsdp_contract.py、test_parallel_plan_config.py
+  148 passed、5.02s，退出0，/tmp/llmtuner-pattern-unit-355.log；同OMP环境，
+  pytest -q --disable-warnings显式列出上述文件。本批未确认新缺陷，仅更新记录，
+  HEAD差异检查通过。当前HEAD723ebba由外部提交推进，既有改动保留；任务已结束，
+  未stage/commit/push。原15及其余设备/组合验收缺口保持开放。
+
+### 第356批：显式 TP override 未匹配被默认计划遮蔽
+
+- TP-OVERRIDE-UNMATCHED-356 / P2：resolve_tp_targets将用户colwise/rowwise
+  patterns合入模型计划后仅检查整体有目标；默认计划有效时，拼错的显式覆盖被
+  静默忽略，实际使用默认sharding。新增两项回归均在原实现失败，日志
+  /tmp/llmtuner-tp-pattern-before-356.log；断言报错前保持原模块身份。
+- 在合并前复用resolve_module_patterns逐个检查configured_plan是否匹配模块，
+  错误指出TP override及原pattern；不对含可选条目的模型默认计划强加此规则，
+  不改变first-match、通信或分片。此校验只证明名字匹配，不证明目标类型与
+  first-match后该规则一定生效；更广pattern组合仍需逐项验收。
+- 完整CPU4122 passed、4 skipped、691 warnings、52.59s，退出0，
+  /tmp/llmtuner-cpu-356.log；环境OMP_NUM_THREADS=1及
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0，pytest -q --disable-warnings。
+  适用pre-commit、compileall及HEAD diff通过，/tmp/llmtuner-hooks-356.log，
+  已审阅实现/测试diff，无hook额外改写。
+- 两rank实际TP脚本tp_equivalence.py退出0，port30508，日志
+  /tmp/llmtuner-tp-356.log；同OMP/TORCHINDUCTOR环境加PYTHONPATH=.及
+  GLOO_SOCKET_IFNAME=lo0，torchrun --nproc_per_node=2 --master_addr=127.0.0.1
+  --master_port=30508。CPU/Gloo非CUDA融合路径，模型默认计划回归，不能宣称
+  任意override或TP×PP组合通过。Python3.13/PyTorch2.14，任务均结束。
+  保留原有工作区改动，未stage/commit/push；原15等开放验收不变。
+
+### 第357批：TP override 校验在 PP 拆分前执行
+
+- TP-OVERRIDE-PP-SCOPE-357 / P2：356新增逐pattern校验若在每个本地part
+  执行，会将仅属于另一stage的有效配置拒绝。PP生产入口改为拆分前对完整
+  模型校验；resolve_tp_targets在pp>1不重复执行全局覆盖校验。直接低层
+  apply_tp的PP part调用依赖调用方完成全局校验，不宣称该低层调用独立拒绝typo。
+- 新增CPU回归：有效默认本地计划允许另一stage的override；assembly在
+  apply_pp前拒绝全局未匹配pattern，且不进入拆分。相关64项通过，
+  /tmp/llmtuner-tp-pp-357.log。最终完整CPU4124 passed、4 skipped、857 warnings、
+  49.35s，退出0，/tmp/llmtuner-cpu-final-357.log；初次全套在第二项新增前收集，
+  4123通过，不代替最终结果。环境OMP_NUM_THREADS=1及
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0，pytest -q --disable-warnings。
+- 实际PP2×TP2、1F1B、2microbatch Trainer脚本：默认计划port30509退出0；
+  加入首尾stage显式colwise/rowwise覆盖后，首次30510因测试pattern遗漏HF
+  wrapper前缀而按预期报未匹配，日志
+  /tmp/llmtuner-pp-tp-overrides-357.log。修正fixture为*layers.0.self_attn.q_proj
+  和*layers.1.self_attn.o_proj，30511退出0，
+  /tmp/llmtuner-pp-tp-overrides-final-357.log，默认日志
+  /tmp/llmtuner-pp-tp-357.log。未绕过生产验证或替换attention机制。
+- 命令同355公共torchrun环境，nproc4、上述端口，脚本
+  tests/integration_tests/pp_tp_trainer.py。CPU/Gloo/Python3.13/PyTorch2.14。
+  检查各stage finite正loss与close后主组可用，无独立dense输出/梯度oracle，
+  不证明所有PP/TP覆盖布局数值等价；覆盖风格与默认相同，不证明任意style转换。
+- 适用hooks、compileall、diff通过，日志
+  /tmp/llmtuner-hooks-final-357.log及/tmp/llmtuner-hooks-integration-357.log。
+  已审阅改动，任务均结束，未stage/commit/push；原15等开放项保留。
+
+### 第358批：rank 独立随机流恢复及真实 MPS RNG
+
+- 复核checkpointer/random_state.py与utils/seeding.py：rank-qualified opaque
+  payload避免DCP合并不同流，恢复校验world/device/topology，host临时generator
+  校验不推进live stream；设备恢复先于host恢复。未确认新的实现缺陷。
+- 实际检测当前MPS可用，并运行`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 PYTHONPATH=. python tests/integration_tests/device_rng_equivalence.py mps`，
+  退出0，/tmp/llmtuner-mps-rng-358.log。真实MPS默认generator精确继续，非法
+  device RNG状态拒绝后device/CPU/Python/NumPy不变；不是模拟设备。
+  仅关闭本fixture的MPS默认流往返证据缺口，不代表MPS训练或DTensor随机算子。
+- 两rank CPU/Gloo rng_checkpoint_equivalence.py，port30512，退出0，
+  /tmp/llmtuner-rng-resume-358.log；DDP/nativeFSDP/customFSDP×sync/async六场景，
+  rank不同Python/NumPy/torch种子、真实dropout与AdamW。恢复前边界model/
+  optimizer/scheduler/EMA/RNG精确比较，两步随机继续loss及最终状态精确一致；
+  custom三个hook-owned context。rank局部scheduler/model/RNG回调故障协调
+  和既有optimizer/EMA预检亦执行；不将故障协调等同所有状态事务回滚。
+- 公共torchrun环境沿357，nproc2、master127.0.0.1、port30512、脚本如上。
+  此脚本不构造完整Trainer，不含loader/trainer游标、PP/TP/CP/EP拓扑变更，
+  无CUDA/NPU、pinned process staging证据。Python3.13/PyTorch2.14/macOS。
+- RNG CPU文件61 passed、34 warnings、4.37s，退出0，
+  /tmp/llmtuner-rng-unit-358.log；同OMP/TORCHINDUCTOR环境，pytest -q
+  --disable-warnings tests/unit_tests/cpu/components/checkpointer/test_random_state.py。
+  本批只补审查证据，diff通过，无需重复完整代码门禁；全部任务结束，
+  既有工作区保留，未stage/commit/push，原15及其他组合验收保持开放。
+
+### 第359批：HSDP 累积与有限窗口新进程恢复
+
+- 复核trainer.py累积窗口读取/DP有效token分母、runtime/batch.py全world
+  fetch协调、训练耗尽回退step与final save。窗口不完整时不前向/更新，但已消费
+  loader游标和输入计数不回滚；该契约与有限数据恢复测试一致。未确认新缺陷。
+- accumulation_equivalence.py四rank CPU/Gloo，HSDP replicate2/shard2，
+  port30513退出0，/tmp/llmtuner-hsdp-accumulation-359.log。真实Trainer三步
+  AdamW、不等rank/微批mask，有效token分母及最后微批replica归约，与每次backward
+  归约的手工参考比较loss/梯度/更新通过，保留atol2e-6/rtol2e-5。参考复用模型
+  和前向，验证累积语义，不是独立attention或任意多轴数值参考。
+- 在新目录/tmp/llmtuner-finite-359运行finite_training_checkpoint.py full，
+  两rank port30514退出0，/tmp/llmtuner-finite-full-359.log：rank0/1有限输入3/4，
+  累积2，只提交step1、tokens24，保存各自游标3/4；无step2 checkpoint。
+  full进程在捕获耗尽边界后继续同runtime两步作为参考。
+- 独立torchrun resume同目录，port30515退出0，/tmp/llmtuner-finite-resume-359.log。
+  更新前完整状态精确比较，后续两步状态及loss精确一致，loss为
+  [3.470820665359497,3.4474387168884277]。不是从旧批次产物重用参考。
+- 命令公共前缀：`OMP_NUM_THREADS=1 TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0 PYTHONPATH=. GLOO_SOCKET_IFNAME=lo0 torchrun --master_addr=127.0.0.1`，
+  分别--nproc_per_node=4/2/2、--master_port=30513/30514/30515、上述脚本及phase目录。
+  Python3.13/PyTorch2.14/macOS，有限恢复无TP/PP/CP/EP、AC/compile；不外推设备
+  或拓扑迁移。本批未重跑invalid phase，其历史证据保留。
+- 只补文档，HEAD差异检查通过，无生产/测试改动；全部作业结束，未stage/commit/
+  push。原15与目标设备矩阵仍开放，不以本批恢复等价关闭独立数值问题。
+
+### 第360批：chunk 数量类型校验与 loss 分布式边界
+
+- CHUNK-COUNT-TYPE-360 / P2：chunked_lm_head_cross_entropy仅检查num_chunks<1，
+  True被当成1进入head，其他非整数触发底层TypeError。新增五个非法值回归，
+  原实现4 failed/1 passed，/tmp/llmtuner-chunks-before-360.log；入口统一拒绝
+  bool及非int，保留正整数和chunk算法，断言非法输入不触达head。
+- 完整CPU4129 passed、4 skipped、880 warnings、45.98s，退出0，
+  /tmp/llmtuner-cpu-360.log；适用hooks、compileall、diff通过，
+  /tmp/llmtuner-hooks-360.log，已审阅diff。环境OMP_NUM_THREADS=1、
+  TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0，pytest -q --disable-warnings。
+- 两rank真实chunked_loss_equivalence.py在修复前30517、修复后30518均退出0，
+  /tmp/llmtuner-chunked-fsdp-360.log及/tmp/llmtuner-chunked-final-360.log，
+  FSDP2四步Trainer loss/最终参数对照full-logits参考，最大差4.768e-7/1.490e-8，
+  保留原容差。无TP环境变量，不计为TP分支验证。
+- vocab_parallel_loss_equivalence.py两rank30516退出0，
+  /tmp/llmtuner-vocab-loss-360.log，保留原值/梯度断言；阅读发现其V<tp拒绝
+  case只让空shard rank调用，其他rank不进入，不能证明集体调用的失败协调。
+  LOSS-EMPTY-VOCAB-COORDINATION-360 / OPEN：需用全rank入口复现并检查
+  global vocab不足时每rank共同拒绝，避免非空rank进入CE collective；本批不关闭。
+- 分布式公共环境沿359（PYTHONPATH=.、GLOO_SOCKET_IFNAME=lo0等），nproc2、
+  上述port、对应tests/integration_tests脚本。CPU/Gloo/Python3.13/PyTorch2.14，
+  不外推CUDA融合、任意混合轴或全部loss边界。全部任务结束，未stage/commit/push。
+
+### 第361批：显式 vocab CE 共同拒绝空 shard 拓扑
+
+- LOSS-EMPTY-VOCAB-COORDINATION-360 / 部分修复：LossParallelCrossEntropy
+  原先只以本地宽度0拒绝，非空rank可继续通信。现先校验vocab_shard_bounds，
+  再按共享global_vocab_size<tp_world_size在每rank拒绝，不增加collective。
+  两个CPU回归用禁止collective的桩覆盖空/非空rank。
+- 另确认包装入口的分派歧义：V1/TP2的非空rank宽度等于完整V，会走合法的
+  full-vocab dense分支。将原测试改为全rank调用wrapper后30519退出1，明确
+  rank0未拒绝，/tmp/llmtuner-empty-vocab-before-361.log；并非hang复现。
+  为保留已声明的full-vocab输入能力，本批不改变形状分派契约。该wrapper歧义
+  保持OPEN，后续需明确显式布局契约，不能以底层修复宣称包装层完全解决。
+- 集成拒绝case现在由全部rank调用显式LossParallelCrossEntropy，并保留原有
+  正常输入wrapper数值/梯度测试。30520及最终30521退出0，日志
+  /tmp/llmtuner-empty-vocab-final-361.log、/tmp/llmtuner-vocab-final-361.log。
+  命令公共环境沿360，torchrun nproc2、127.0.0.1、对应port，脚本
+  tests/integration_tests/vocab_parallel_loss_equivalence.py。
+- 最终全套CPU4131 passed、4 skipped、701 warnings、44.18s，退出0，
+  /tmp/llmtuner-cpu-final-361.log；较早4129未包含新增两项，不替代最终结果。
+  OMP_NUM_THREADS=1、TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS=0，pytest -q
+  --disable-warnings。hooks首次格式化测试签名已审阅，重跑全部通过，
+  /tmp/llmtuner-hooks-final-361.log；compileall与HEAD diff通过。
+  CPU/Gloo/Python3.13/PyTorch2.14，无设备端证据。任务均结束，未stage/commit/push。
 
 训练指标输入边界复核：`flops_per_token` 与其 attention 辅助函数现在拒绝
 负数、布尔值和非整数序列长度；窗口大小必须为正整数。`MetricsProcessor`

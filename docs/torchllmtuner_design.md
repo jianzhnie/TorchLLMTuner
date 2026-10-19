@@ -175,57 +175,51 @@ import trainer 或读取全局 run config；跨 models/parallel 的依赖必须�
 引擎层（TP/CP fused kernel、FSDP、`spmd_context`、checkpoint 的 PG 生命周期）直连
 `torch.distributed` 与 `_functional_collectives` 等私有 API。
 
-目录结构（128 个 Python 文件）：
+当前目录按职责组织如下（列出关键入口，不固定文件数量）：
 
-```
+```text
 llmtuner/
-  __init__.py / __main__.py / errors.py
-                                包面 + CLI 入口（python -m llmtuner）+ 三类异常
-  config/       14 文件         model/parallel/optimizer/checkpoint/data/
-                                training/root.py（聚合根 + from_groups 嫁接）
-                                observability/activation_checkpoint/compile/
-                                validation（按域拆分的嵌套配置）
-                                + field_checks.py（各组共用的字段下限校验）
-                                + cli.py（CLI 视图，把 CLI 载不动的字段挡在
-                                --help 之外）+ __init__(全量再导出)
-  trainer/      7 文件          trainer.py（训练循环与稳定接口）/ train.py（CLI）/
-                                builder.py（装配顺序）/ batch.py（输入与计数）/
-                                pipeline.py（PP 分批与调度执行）/
-                                validate.py（验证流程）
-  models/      23 文件          hf/{model,factory,flops,state_dict_adapter}.py（HF 适配：
-                                包装/构造/FLOPs/checkpoint 键）
-                                + common/{rope,activation,linear,feed_forward,
-                                embedding,cast_linear,multimodal,scatter_add,
-                                aux_loss,tp_projections}.py + attention/（qkv+masks）
-                                + moe/（block/router/experts/dispatcher/
-                                load_balance/balancing）
-  parallel/    24 文件          tensor_parallel/(tp+apply+linear)
-                                fully_shard/ pipeline_parallel/ context_parallel/
-                                expert_parallel/(swap+probe+convert+ckpt)
-                                activation_checkpoint.py compile.py compatibility.py
-                                stages.py（装配 stage 表）attention_heads.py
-                                remat_regions.py
-                                topology.py parallelize.py
-  accelerator/  6 文件          device.py（设备发现/backend 选择）
-                                capabilities.py（能力注册表）
-                                collectives.py（归约/超时/grad norm）
-                                spmd.py（SPMD mesh 作用域 + 轴查询, 最底层）
-                                + distributed.py（vendored mmengine.dist 引导/查询面；collective 在 collectives.py）
-                                （mesh 构建在 parallel/topology.py，单轨）
-  components/  14 文件          loss / checkpointer(DCP; 含 checkpoint_keys
-                                与 filesystem) / metrics / profiler / tokenizer
-                                / optimizer
-  datasets/    18 文件          Grain 数据图 + synthetic.py + contracts.py (Batch)
-                                + packing/ + {text(含 renderer),multimodal}
-  utils/        5 文件          logging / gc / lazy_exports / monitoring
-                                （filesystem 与 checkpoint_keys 归
-                                components/checkpointer/；seed 归 trainer/）
-
-tests/unit_tests/cpu/ 镜像包结构：accelerator/ components/(含 checkpointer/、
-optimizer/) datasets/ models/ parallel/ utils/，目录名 = 被测包名；
-tests/integration_tests/ 下 30 个 torchrun 脚本由 run_all.py 统一驱动（目录 glob
-自动发现，无清单）。
+  __main__.py                   python -m llmtuner，转交 trainer/cli.py
+  config/                       *_config.py；llmtuner_config.py 聚合配置
+                                cli_config.py 定义 CLI 标量视图与程序专用字段
+  trainer/
+    cli.py                      参数解析与进程组生命周期
+    trainer.py                  训练循环、optimizer step 与稳定接口
+    runtime/                    assembly.py、batch.py、pipeline.py、
+                                validation.py、reductions.py
+  models/
+    hf/                         HF 构造、包装、存储分配与 state-dict 适配
+    common/moe/                 layer、gate、routing、experts、bias_update、
+                                auxiliary_loss；专家计算与路由行为
+  parallel/
+    topology.py                 mesh 与 rank ownership
+    stages.py / parallelize.py  变换顺序与统一装配
+    compatibility.py           组合能力裁决
+    model_compile.py           编译变换
+    module_patterns.py         模块 pattern 解析
+    tensor_parallel/           tensor_parallel.py 入口；linear_ops、checkpointing
+    fully_shard_parallel/      fully_shard_parallel.py 入口；plan、fine_grained*
+    pipeline_parallel/         pipeline_parallel.py 入口；partition
+    context_parallel/          context_parallel.py 入口；attention、input_sharding、KCP
+    expert_parallel/           expert_parallel.py 入口；模型替换、token dispatch、
+                                后端通信与 checkpoint 适配
+  memory/                       activation_checkpoint.py、remat_regions.py
+  accelerator/                  device、distributed、collectives、spmd、
+                                capabilities、tensor_tree
+  components/                   loss、metrics、profiler、tokenizer；
+                                checkpointer/ 与 optimizer/ 服务
+  datasets/                     contracts、sources、composition、loader_builder、
+                                dataloader、synthetic；packing/、text/、multimodal/
+  utils/                        logging、seeding、garbage_collection、monitoring、
+                                dtypes、module_names、lazy_exports
 ```
+
+CPU 单测位于 `tests/unit_tests/cpu/`，按模块组织。集成脚本位于
+`tests/integration_tests/`，应按各脚本 docstring 中的命令、rank 数和参数运行；
+其中既有直接 `torchrun` 脚本，也有自行启动新进程的 Python 驱动。
+`run_all.py` 通过目录 glob 发现脚本，依据 docstring 中自身命令选择 Python
+驱动或 torchrun，并保留分布式脚本声明的 rank 数。需要额外参数、环境变量或
+多阶段执行的脚本仍须核对各自运行要求，不能用默认启动代替组合矩阵。
 
 ## 3.1 异常约定（llmtuner/errors.py）
 
@@ -252,10 +246,10 @@ torch 版本/环境探测（`hasattr` 私有 knob、守卫 import）集中于单
 
 | 条目 | 探测 | 引入 | 消费方 |
 |---|---|---|---|
-| `dynamo_capture_scalar_outputs` | hasattr `torch._dynamo.config` | torch 2.7 | compile.py（MoE dispatch 编译） |
-| `inductor_micro_pipeline_tp` | hasattr `torch._inductor.config` | torch 2.8 | compile.py（async TP） |
-| `fx_regional_inductor` | import `torch.fx.passes.regional_inductor` | torch 2.10 | compile.py（aot_eager×flex） |
-| `symm_mem` | import `torch.distributed._symmetric_memory` | torch 2.8（CUDA） | compile.py、tp.py、linear.py |
+| `dynamo_capture_scalar_outputs` | hasattr `torch._dynamo.config` | torch 2.7 | model_compile.py（MoE dispatch 编译） |
+| `inductor_micro_pipeline_tp` | hasattr `torch._inductor.config` | torch 2.8 | model_compile.py（async TP） |
+| `fx_regional_inductor` | import `torch.fx.passes.regional_inductor` | torch 2.10 | model_compile.py（aot_eager×flex） |
+| `symm_mem` | import `torch.distributed._symmetric_memory` | torch 2.8（CUDA） | model_compile.py、tensor_parallel/tensor_parallel.py、tensor_parallel/linear_ops.py |
 | `functorch_activation_memory_budget` | hasattr `torch._functorch.config` | torch 2.6 | activation_checkpoint.py（memory_budget） |
 | `dynamo_lru_cache` | `torch._C._dynamo.eval_frame._set_lru_cache` | 私有 knob（2.2.2 缺失） | activation_checkpoint.py（SAC+PP workaround） |
 | `torch_grouped_mm` | 实跑探测（bf16 哑调用） | torch 2.7 | moe/experts.py |
@@ -264,7 +258,7 @@ torch 版本/环境探测（`hasattr` 私有 knob、守卫 import）集中于单
 不纳入的：可选**包**（renderers/torchao/torchvision）保持本站 `ImportError`
 惯例；`device.py` 的设备发现是"缺席即静默"的可用性探测（另一种语义，且
 device.py 本身就是设备注册表）；DTensor/flex_attention/spmd_types 是无回退
-硬 import，没有可探测的降级路径；`linear.py` 的 functional-collectives
+硬 import，没有可探测的降级路径；`tensor_parallel/linear_ops.py` 的 functional-collectives
 改名回退是版本兼容 shim，不是守卫。
 
 ## 3.3 跨层组合裁决单一来源（parallel/compatibility.py）
@@ -272,8 +266,8 @@ device.py 本身就是设备注册表）；DTensor/flex_attention/spmd_types 是
 分工：**config 期能判的组合校验住在各 config 的
 `__post_init__`**（`config/parallel_config.py` 的 deepep/hybridep、
 dispatcher@ep=1、ptrr、ulysses×load balancer、sequence_parallel；
-`config/activation_checkpoint.py` 的 region AC（`preserve_rng_state=True`
-即拒）、memory_budget×compile；`config/root.py` 的
+`config/activation_checkpoint_config.py` 的 region AC（`preserve_rng_state=True`
+即拒）；`config/training_config.py` 的 memory_budget×compile；`config/llmtuner_config.py` 的
 cp 整除 seq_len、async_tp×{compile,tp}），与其余字段校验同处、同序触发——
 这些判定只需要配置本身，不应绕道 parallel 层。
 
@@ -485,7 +479,8 @@ NotImplementedError。边界 collective 的真多卡前后向等价性**环境�
 分片不得切割），kernel 按 mask 的 Q 长度区分全长文档 mask 与 Q 分片 causal mask。输入
 分片由 wrapper 的
 preprocessing 路径调用：`context_parallel/input_sharding.py` 的 `shard_batch_for_cp`
-（封装 torch 私有 `_context_parallel_shard`，支持 headtail load balancer）把
+（封装 torch 私有 `_context_parallel_shard`，支持 headtail load balancer）。分片前检查实际序列长度能被 CP 度数整除，
+避免 torch 允许的不等长 shard 进入等长通信；headtail 还要求整除 2×CP。该入口把
 input_ids/labels/positions 同步切片；BlockMask 只沿 Q 维分片
 （`shard_attention_mask_for_cp`）。loss/token 归约走含 cp 轴的 `loss` mesh。
 
@@ -553,6 +548,9 @@ metadata，并保持原 batch 不变。
   `OptimizersContainer` 序列化为扁平 FQN 字典（无论 PP 与否都是同一格式）。
 - `synthetic.py`：`RandomTokenSource` 确定性合成语料——`(seed, step)` 唯一决定
   batch，等价性测试和 smoke run 不需要真实数据集。
+  `RandomTokenDataLoader` 在 DP>1 时保存 rank 专属 `steps` 字典，保留非对称
+  数据耗尽后的独立位置；DP1 仍保存标量。旧标量可迁移到当前 rank，但旧文件
+  已丢失的 rank 差异无法还原，加载时会警告。新格式缺当前 rank 键严格拒绝。
 
 ## 6. 一次训练步骤的数据流
 
@@ -795,6 +793,10 @@ manager 使用自己的 completion future 保留实际错误。
 真实 CPU shared-memory/PROCESS 故障和重试、延迟 staging/custom FSDP/动态 EMA
 恢复已验证；设备 pinning、NCCL/HCCL、collective 故障及进程终止仍须分别验证。
 
+DCP stager 关闭失败时保留 stager 和所属通信组，manager/Trainer 保留 owner
+供后续关闭重试；此规则同时适用于普通 `OSError` 和进程中断。只有 stager
+成功关闭才释放其引用和组，避免活跃线程访问已销毁的通信资源。
+
 ### Profiler 清理失败
 
 停止 allocator history 成功后才清除 active 标记。若 backend shutdown 失败，
@@ -844,3 +846,322 @@ norm 类型。默认 native 后端为 residual norm 输入建立共享存储 vie
 同步编译装配失败恢复本次修改的 scalar capture、regional 标志、block compiled
 callable 和 async TP pass。PyTorch 对称内存组注册保留其进程级所有权；延迟
 tracing、进程级编译缓存及成功 Trainer 共存的全局开关隔离不在此回滚契约内。
+
+
+## EMA checkpoint 调用边界
+
+EMA 固定跟踪构造时的张量身份、规范化 FQN、shape、dtype 和 device。
+DTensor 还须匹配 mesh、placements 和本地 shape；类型或布局变化在更新前拒绝。
+逐步 EMA 在匹配的本地存储上执行 foreach lerp，不触发重分片或 collective。
+Trainer 在本地 scheduler 和 EMA 更新后分别协调错误，避免 peer 进入后续指标
+通信。optimizer 已完成的更新以及部分 rank 的 scheduler/EMA 更新不会回滚，
+失败后须完整恢复，不能直接继续该运行时。
+`state_dict()` 与 `load_state_dict()` 在分布式环境须所有 rank 同序调用。
+加载先协调输入类型及所有权检查，再确认各 rank 均为空状态或均为非空状态；
+拒绝混合分支后才进入 TP/EP 状态通信。空字典仍表示从当前模型重置平均值。
+
+`reset_from_model()` 提供本地重置，由 DCP 及可选 torch_checkpointing manager 的错误协调区间调用；
+该区间不含 collective。已有直接调用 `load_state_dict({})` 的分布式代码
+须所有 rank 参与；需要本地操作时改用 `reset_from_model()` 并由调用方协调错误。
+通信故障或不可达 peer 不在本地错误协调的恢复保证内。
+
+Optimizer 的 `state_dict()` 与 `load_state_dict()` 同样须所有 rank 参与。
+保存先协调本地惰性状态初始化和 FQN 序列化，再执行 TP/EP gather；加载先做
+布局通信，再协调本地状态校验，最后应用 checkpoint 值。初始化与序列化 hook
+必须本地执行；load hook 或 tensor copy 失败后的部分恢复需通过完整 checkpoint
+重新恢复，不能直接继续训练。惰性初始化可能留下合法零步状态，不承诺全局回滚。
+
+可选 `torch_checkpointing` 后端按基类装配顺序恢复状态，保留 optimizer 先于
+scheduler 的要求。scheduler、dataloader、trainer 和 RNG 的加载回调必须只执行
+本地操作，各自通过错误协调后才进入后续状态。模型、optimizer、EMA 和用户扩展
+状态可能执行通信，不放入这些本地协调区间。用户扩展状态自行负责失败传播；
+恢复中途失败不保证回滚已加载的状态，须完整恢复后才能继续训练。
+
+所有启用checkpoint的rank须共同调用load。step参数先在独立本地错误协调阶段
+校验，单rank非法参数会同步拒绝，避免其他rank进入staging或source读取后挂起；
+未初始化或禁用checkpoint的rank不参与该协议，配置须保持一致。
+save同样在后端判断保存间隔前协调step及last_step参数错误；last_step必须为bool。
+因此每次启用save调用（包括跳过保存的step）增加一次错误协调；未测设备开销。
+该协议仍要求各rank共同调用，且有效step、保存策略和启用配置一致。
+
+DCP 与可选后端在完整状态读取前，先读取具有 `validate_state_dict` 的内置
+RNG、dataloader、trainer 和 scheduler 进度元数据，协调本地校验，避免已知错误在
+模型或 optimizer 写入后才被拒绝。可选后端使用独立临时 reader，避免其
+缓存的 schema 在子集读取与完整读取间冲突。scheduler 前置校验不读取
+optimizer 参数组，学习率仍在 optimizer 恢复后从 initial_lr 重算。
+Grain loader 返回内部游标的独立深拷贝，避免 checkpoint reader 原地填充
+状态时改写 live cursor；在独立临时迭代器上调用 `set_state` 检查内部游标，关闭探针并
+隔离 host RNG，不改变 live iterator。探针不主动读取下一批，但 packing 的
+`set_state` 可能重放源记录以重建 remainder；此检查不能验证延迟读取错误，
+也不回滚第三方数据源或私有 generator 的副作用。
+无 validator 的扩展状态和后续 tensor copy 故障不具备事务回滚保证。
+可选后端此路径需要兼容的上游 API；已检查的发布版 0.1.0 缺少
+`default_resharder`，不能直接用于当前适配器。
+已检查的兼容上游提交 `dcbb3a59cfad1cbeb95994f0d6cb1802c1d91825` 在多 rank
+元数据聚合中直接使用 CUDA 张量；CPU/Gloo 环境无法完成这一路径。
+单进程同步 I/O 或替代 reader 的协调测试不能证明其真实多 rank 恢复。
+该提交的 `CheckpointManager.close()` 在释放 saver、loader 和 metadata 前设置
+`_closed=True`。真实异步 staging executor 的 shutdown 调用前失败时，线程仍可
+运行，但再次调用公开 close 不会继续清理；本仓库外层重试也不能修复这一状态。
+此故障后的恢复保持未支持，应终止运行并退出进程，不继续训练。需要兼容上游
+提供可重试的逐资源关闭契约后，再验证线程、子进程及通信资源均已释放；不在
+生产适配器中重置私有标志或手动拆解上游内部资源。
+
+可选后端的 RNG 在所有其他状态回调和 EMA 冷启动完成后恢复，避免用户回调
+消耗已恢复的默认随机流；不依赖传入状态字典中 RNG 的插入位置。
+
+恢复内置 `RNGCheckpointState` 前，各 rank 先协调无副作用的 payload 校验，
+全部通过才设置默认生成器，避免某个 rank 拒绝输入时其他 rank 已倒回随机流。
+这不保证设备 RNG setter 故障或用户自定义 RNG 回调失败时的原子回滚。
+
+MC2 与 Domino 复用 EP 装配传入的 stage 错误组协调本地输入准备，避免一个
+EP 子组拒绝输入时，同 stage 的其他子组继续后续 FSDP/TP/CP 通信。
+独立调用未提供该组时仅协调 EP 组；不跨 PP stage 插入全局 collective，
+不保证融合内核或通信内部故障可恢复。
+
+Fixed router 的 EP1×TP 路径保留特征分片专家，在 MoE 边界 gather 序列与
+padding mask，计算后 SUM reduce-scatter。TP collective helper 在调用上游
+functional collective 前规范化负轴，避免 PyTorch 2.14 的 gather view 优化
+误处理二维 mask。CPU DP2×TP2 完整 Trainer 验证/恢复证据见并行比较批次108；
+公共配置已移除旧拒绝条件，设备及未运行并行矩阵仍需验收。
+mask gather在进入路由前materialize，避免checkpoint重计算early-stop在消费
+metadata前停止而遗留通信。批次110–111覆盖低层eager/compile/fullgraph矩阵
+及native/custom完整CPU Trainer退出，保留数值、完整状态及通信清理检查。
+
+保存前的checkpoint retention扫描是本地存储操作，两个后端均在
+`Checkpoint retention preflight`中协调失败，防止其他rank继续进入写入协议。
+保存通信不放入该本地错误区间；后台删除失败仍由purge worker记录，
+本边界不保证通信故障或发布后retention失败可以恢复。
+同步保存和最终保存发布后另以`Checkpoint completed retention`协调本地扫描
+错误。发布成功但retention失败时checkpoint仍可加载；异步future完成及任意
+时刻调用close的协调契约需要分别验证，不能在析构路径无条件加入collective。
+下一次保存入口通过`_wait_for_pending_save`先等待后台任务，再在独立的
+`Checkpoint pending save`本地错误区间传播等待或completed retention异常，
+阻止其他rank开始新写入。后台等待位于协调区间外；close仍使用本地等待，
+不保证后台通信挂起、进程死亡或任意非对称调用可恢复。
+load也先等待staging，再以`Checkpoint load staging`传播本地完成异常，随后
+复用pending-save等待协调；任一失败均阻止所有rank进入恢复源发现和状态加载。
+等待本身仍在本地错误区间外，此协议依赖后台等待最终返回。
+训练步在model forward前同样先等待staging，再以`Training checkpoint staging`
+传播完成异常，防止其他rank执行模型。此时当前数据窗口已读取，梯度与路由临时
+统计已重置，故障后应从完整checkpoint恢复，不承诺数据游标或整步原子回滚。
+验证入口在模式切换前也以`Validation checkpoint staging`传播等待异常；
+此边界失败时不创建验证loader、不调用eval，也不改变RNG状态。
+
+### FSDP 梯度归约精度
+
+`parallel.fsdp_config.fsdp_reduce_dtype`（CLI：`--fsdp_reduce_dtype`）控制
+native/custom FSDP 的梯度通信 dtype，decoder 与 pattern 入口共用该策略。
+支持 `float32`、`bfloat16`、`float64`，默认 `float32`；模型参数 dtype 仍由
+模型构造决定。BF16 归约会降低精度，FP64 需要后端支持，均不自动选择。
+
+FP64 参数配合默认 FP32 归约时，梯度局部贡献会发生舍入；不能把 dense FP64
+一次求和作为精确参考，Adam 可能放大小梯度差异。数值诊断可显式使用
+`--fsdp_reduce_dtype float64`，但这不能代替默认 FP32 策略的验收。当前三轴
+CPU/Gloo 的 native/custom FP64 归约已通过三步独立参考比较；BF16 仅有配置
+与策略传递单测，目标设备的数值、通信支持及性能仍须单独验证。
+
+### FSDP programmatic overrides 与参数身份
+
+`fsdp_apply_modules` 的 `ignored_params` 和 `hook_module` 是对象引用。
+装配在本地模型（PP 为切分后的 part）变换前记录注册路径，在进入 FSDP 前按
+逻辑 FQN 重绑；AC/compile 的透明 wrapper 不改变逻辑路径。配置采用浅层复制，
+原配置、mesh 和 policy 对象不变，共享参数的各注册别名均参与解析。
+
+EP 转换在安装新 block 前发布显式映射：融合 gate/up 对应两个新参数，down
+对应一个新参数，原专家模块及 router 对应转换后的模块。装配用该映射重绑排除项、
+hook 和已匹配的单元路径；也允许配置直接选择尚未创建的 native EP 路径，最终
+匹配校验仍在 FSDP 入口执行。观察者失败时不会安装已规划的 block，并恢复 aux
+计数。TP 后先刷新引用，再接收 EP 映射，避免组合时继续引用 TP 前的参数。
+
+`fsdp_ignored_modules` 同样参与引用追踪：原路径已匹配的模块在 EP 转换后映射
+到目标模块，按新子树收集完整排除参数；精确路径和跨层通配符均可使用。原本选择
+native EP 布局的路径保留到最终校验；没有任何对象 override 时也会启用该映射。
+配置本身不改写，无法映射的排除项保留为明确的最终匹配错误。
+
+Kimi 的独立专家参数堆叠时会发布多对一映射：排除同一投影的全部源专家可对应
+一个完整 grouped 参数；排除整个专家 ModuleList 可映射到 grouped 专家子树。
+若单元级参数排除或全局模块排除只覆盖堆叠参数的一部分源专家，当前布局不能
+保留原义，观察者会在安装 block 前明确拒绝，防止把部分排除扩大为整组排除。
+各 rank 都按完整源专家集合检查，不依赖其 EP 局部切片。
+
+原排除子树的参数也独立记录。Kimi gate 的 weight 迁移到 router.gate，
+`e_score_correction_bias` 则保留身份并注册为 MoE 的 `expert_bias_E`。重绑后，
+目标子树没有覆盖的迁移参数会加入各单元及根单元的 `ignored_params`，保留已有
+根单元选项；不把这些参数的新父模块整棵排除。原配置保持不变，参数的原始
+`requires_grad`（可训练或冻结）也不改变。
+
+保留对象但改变路径时可按身份绑定；无已知映射则明确报错。个别专家的部分排除
+需要保留独立参数的布局适配，任意共享模块转换也仍需完善。已有真实 EP2/FSDP
+参数切片、归属及拒绝后 barrier 验证，不能据此宣称任意 EP pattern、通信故障恢复
+或完整训练同步已验证。
+
+`ignored_params` 约束对应 FSDP 单元。被排除参数的后续归属须以最终运行时为准，
+不能假设根单元必然接管。Trainer 在梯度累积后、TP 归约及裁剪前同步普通
+Tensor 梯度：dense 使用 DP/CP 副本轴，EP 专家使用 dp_replicate/efsdp 轴，
+全组未使用的参数保留 None。native/custom FSDP2 的 DP2 排除参数已有
+三步 FP64 dense 参考，覆盖单rank使用、全组未使用、裁剪及 AdamW 更新。
+真实 Trainer 的 Qwen3 排除 embedding、累积2与裁剪也有三步 FP32 独立模型
+梯度/AdamW更新对照；参考使用显式 shifted CE 和独立裁剪公式，学习率取实际
+optimizer当前值，因此不单独证明scheduler正确。
+`fsdp_pattern_references.py` 直接调用并行API和Trainer归约方法，TP2×FSDP2
+native/custom eager/aot_eager的三步FP64 dense参考通过；它不运行完整Trainer。
+EP2/efsdp2（dense DP4）已有真实Qwen3MoE alltoall的三步独立HF参考：
+排除gate/up或整个原专家子树时，生产Trainer归约方法、全参数梯度、全局范数、
+裁剪和SGD更新均通过1e-6；这项直接调用归约方法，不运行完整Trainer。
+另有完整Trainer四rank EP2/efsdp2的三步AdamW独立参考：排除原gate/up、
+累积2、max_norm0.5、路由aux系数0.03，分别eager与full AC+aot_eager通过1e-6。
+参考原始HF模型以router logits与top-k结果显式计算辅助目标，不调用生产aux注入。
+关闭归约的诊断对照首步专家梯度失败，保证归约验证非空。
+相同EP2/efsdp2排除路径另有full AC+aot_eager、累积2、dynamic EMA的完整
+新进程恢复：更新前模型/optimizer/scheduler/EMA/trainer/游标/RNG精确比较，
+恢复两步loss与连续运行差0，最终模型与optimizer/EMA通过原精确断言。
+该证据只覆盖固定拓扑，不支持跨拓扑连续性或任意排除布局的推断。
+CP训练组合仍未通过：CPU默认SDPA被CP明确拒绝，显式选择真实Flex后又受上游
+CPU backward不支持限制，不能用前向或替换attention的结果证明训练正确。
+dense HSDP replicate2/shard2的排除参数已有native/custom三步FP64参考，
+以及custom full AC+aot_eager完整Trainer三步FP32参考。另有八rank
+replicate2/efsdp2/EP2真实alltoall的三步独立HF输出、梯度、范数及SGD更新参考，
+验证两个专家副本轴的连续SUM；该八rank测试直接调用Trainer归约，aux=0，
+不是完整Trainer或新进程恢复。以上均保留原容差。
+稀疏梯度及被排除但仍为DTensor的参数也仍需验证。
+
+### HF 权重导出与共享 head
+
+`checkpoint.last_save_in_hf` 输出 safetensors 权重和索引，不复制模型、generation
+或 tokenizer 配置；标准 Transformers 加载时需另行提供这些配置。适配器保留
+源索引的 head 省略规则。若 tied embedding/head 两键均导出，则为 head 创建
+独立临时张量，避免同一 safetensors 分片拒绝共享存储；训练模型的参数身份不变，
+加载模型按配置恢复权重共享。该副本会增加导出时的临时存储与内存。
+
+
+### EMA的buffer独立跟踪
+
+EMA的底层Optimizer接口包含所有被追踪的参数与buffer。因此，即使模型全部参数
+冻结，仍可通过`buffer_patterns`对浮点或复数buffer进行平均与状态恢复。平均值
+继续使用同一FQN格式保存，不为冻结参数创建EMA state。
+
+没有选中tensor的EMA使用显式空param group，保存空state；分布式恢复时该rank
+不参与判断owner是否缺少状态，但仍参与父容器的恢复协调。若实际拥有tensor的
+rank之间收到空/非空状态不一致，仍明确拒绝。这不代表Trainer已支持所有全冻结
+PP stage配置。
+
+CPU dtype及双rank DTensor本地布局验证见`docs/file_review.md`第255批，空rank
+真实DCP恢复和缺失状态保护见第256批。
+
+
+EMA的空跟踪rank还通过了实际DistributedCheckpointManager的同步/异步保存及
+保留/排除EMA恢复测试。排除EMA时，manager先恢复模型，再本地重建平均值；所有
+rank仍经过manager的冷启动错误协调。第257批的8组合验证加载边界和后续更新，
+使用相同worker内的新runtime，不替代新进程Trainer或其他并行轴验收。
+
+
+### DCP保存期间的GC与worker归属
+
+threaded async保存先登记返回的Future和待执行保留策略，再进行本地GC。
+GC失败时manager仍拥有worker句柄，调用者须等待写入或close后再处理恢复；
+报错不表示checkpoint没有发布。同步保存后、异步启动前后及HF保存后的GC
+通过本地错误协调传播异常，GC内部不得通信。两rank CPU真实故障回归见
+审查台账第265批；未证明设备开销、HF故障路径或进程崩溃恢复。
+
+
+DCP保存入口的开始、普通完成和最终完成报告分别协调本地日志异常。
+开始报告失败时不进入实际写入，完成报告失败时checkpoint可能已发布，不能据此
+删除恢复点。后台worker的完成日志仍为本地best-effort，不能调用全局协调。
+CPU两rank故障与实际恢复证据见审查台账第266批；不代表所有内部报告均已验收。
+
+
+最终model-only保存先取得可能包含通信的模型state_dict，再在本地错误协调阶段
+转换export dtype并报告保存模式；full保存的模式报告单独协调，随后才构建完整
+模型状态。局部区间不含state_dict通信。第267批覆盖两分支报告失败和真实HF
+发布/重载回归，不证明设备分配失败的恢复或同步开销。
+
+
+HF adapter.to_hf的本地前缀映射单独协调键冲突，所有分布式rank须共同调用，
+包含没有source index的路径；PP全局coverage gather及Kimi tensor转换保持在
+局部区间外。第268批验证普通Tensor键冲突和真实FSDP tied导出，不证明其他转换
+或clone异常均已协调，也未测新增同步成本。
+
+
+Trainer构造checkpointer前，以独立本地准备阶段登记状态并读取HF adapter源index。
+任一rank的JSON/weight_map解析失败会在manager构造通信前共同拒绝；manager本身
+保持在该区间外。第273批覆盖真实文件故障及修正后的重试，不覆盖完整源权重读取。
+
+
+Kimi HF adapter的双向转换启用独立metadata preflight：先验证键映射、rank、expert
+数量及完整性，再执行unbind/stack。只有前者进入本地错误协调，张量操作保持在
+区间外；独立转换工具默认不协调，保留非SPMD调用。第276批验证两rank普通tensor
+非对称输入拒绝与重试，以及Replicate/Shard(1) DTensor精确往返。不覆盖张量操作
+内部失败、其他布局、optimizer转换失败或tied-head clone失败；同步成本未实测。
+
+
+Kimi individual expert键按数值索引归并时，模型和optimizer转换均拒绝重复索引
+（如0与00），防止输入顺序决定覆盖结果；模型导入还在metadata preflight检查
+同一projection的expert形状一致。正常键及持久化输出格式不变。第277批覆盖
+两种输入顺序、optimizer state/param_groups及模型双rank非对称拒绝；optimizer
+转换本身的跨rank失败协调仍需独立验证。
+
+
+HF tied权重导出在独立本地阶段clone head：tied配置下所有rank参与，即使本地
+没有head/embedding两键。当前PyTorch DTensor clone保持placements，不需要
+重分布；第280批真实Replicate/Shard/Partial验证通信0，并验证普通tensor局部
+异常传播与TP2×FSDP2标准HF重载。未验证实际设备OOM或新增同步性能。
+
+
+文档感知concat packing恢复失败时先回滚parent游标；回滚失败则关闭iterator，
+避免继续读取已变更的流。回滚及关闭的日志报告均为best effort，不能阻断close
+尝试或覆盖原始恢复异常。第281批覆盖日志及关闭同时失败，不保证底层close
+自身失败后资源已释放，也未改变token排列或checkpoint格式。
+
+
+DocumentAwareConcatThenSplitIterator在读取parent下一样本前取得独立游标快照，
+get_state返回独立parent字典，set_state保留独立恢复输入。外部修改checkpoint
+payload不能改变未消费文档对应的内部恢复位置。第282批覆盖导出/恢复两边界；
+状态键与版本不变。任意第三方parent游标的完整可复制性仍由其契约负责。
+
+### 冻结的本地 PP stage 与调度进度
+
+完全冻结的本地 stage 可拥有零个内部 optimizer。学习率容器仍按训练步推进并保存
+`last_epoch`，返回空学习率指标；保持与非空 stage 相同的 checkpoint 进度格式。
+CPU PP2/1F1B 已验证分别冻结首段或末段时的完整 Trainer 保存、新进程加载和继续
+训练，首段另覆盖 full AC 与 aot_eager。加载前后及最终完整状态精确一致；该证据
+不涵盖其他并行轴、调度或 CUDA/NPU，详见审查台账第291–292批。
+
+四rank CPU PP2 × custom FSDP2 另验证首段/末段冻结的相同恢复契约，实际检查
+FSDPModule、DTensor 参数和分片度2；保存点与最终状态精确一致。此项采用连续训练
+作为恢复参考，不构成多轴独立 dense 数值等价证明，见审查台账第293批。
+
+
+### Checkpoint构造与失败协调
+
+分布式manager构造由默认进程组全部成员参加。两个后端首先比较backend类、
+`enable`、启用时的`load_only`及DCP的`async_mode`，然后才允许禁用分支返回、
+模型状态收集、依赖加载或异步进程组创建。一致禁用不创建存储和后台资源。
+
+optional backend按以下阶段构造：
+
+1. 协调本地依赖加载、remote路径限制和缺失HF adapter检查。
+2. 在本地错误边界外尝试配置、storage及manager构造，再协调返回结果。
+3. 协调retention线程启动和初始化日志；全部成功后设置`_initialized`。
+
+任一阶段失败时，清理已获得的manager与线程。协议要求构造调用均已返回或抛错；
+不能解除backend内部collective阻塞，也不能回收未交付的内部资源。真实Gloo加
+backend替身验证本仓库异常传播与清理，不证明可选包IO、子进程和任意配置安全。
+构造一致性也不覆盖运行中直接修改字段。详细证据见审查台账第319–324批。
+
+### Checkpoint保存前准备
+
+optional backend跳过保存时，在本地错误边界外序列化状态并预热，返回后协调
+结果，仅全部成功才标记已预热。CPU/Gloo加替身验证失败传播和编排状态；真实
+backend部分预热失败后的重试安全仍需验证，见审查台账第325批。
+
+DCP在非HF保存路径创建writer前协调scheduler、loader、trainer、RNG的本地
+Stateful序列化，将已物化状态传给DCP。模型、优化器、EMA和任意用户状态可能
+通信，不在该本地边界内；保存格式不变。真实CPU/Gloo回归覆盖scheduler/RNG、
+sync/threaded async/full final及重试，见审查台账第326批。此证据不能替代
+任意第三方回调检查或目标硬件完整训练恢复验收。
+
+
+Trainer的AuxLoss指标收集不受进程级构造registry门控：具有parallel_dims的
+stage统一进入收集器，由当前model_parts协商PP指标键与实例数，空stage也参与。
+CPU/Gloo回归触达真实Trainer指标入口；不等同于完整PP训练及设备验收，见第328批。
