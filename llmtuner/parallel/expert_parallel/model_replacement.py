@@ -68,12 +68,16 @@ only adds, and is refused at the point the shared expert is found.
 
 from __future__ import annotations
 
+import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from llmtuner.config.parallel_config import (
+    validate_expert_dispatcher,
+    validate_router_aux_loss_coefficient,
+)
 from llmtuner.errors import UnsupportedCombinationError
 
-from ...config.parallel_config import validate_expert_dispatcher
 from ...models.common.aux_loss import AuxLoss
 from ...models.common.moe.layer import MoE
 from ...utils.logging import get_logger
@@ -116,7 +120,8 @@ def swap_hf_moe_blocks(
             scores and no group-limited routing.
         fixed_router: use deterministic balanced expert selection for debug runs.
         token_dispatcher: EP dispatch backend (``"alltoall"`` default,
-            ``"torchao"`` optional-import adapter, ``"deepep"``/``"hybridep"``
+            ``"torchao"`` optional-import adapter, ``"mc2"`` Ascend fusion,
+            ``"domino"`` two-slice pipeline, ``"deepep"``/``"hybridep"``
             registered gaps refused here). See
             ``ParallelConfig.ep_token_dispatcher``.
         torchao_pad_multiple: padding multiple for the ``"torchao"`` backend.
@@ -156,6 +161,7 @@ def swap_hf_moe_blocks(
         if router_aux_loss_coef is not None
         else getattr(hf_config, "router_aux_loss_coef", None)
     )
+    validate_router_aux_loss_coefficient(aux_loss_coeff)
     # The load-balance coefficient belongs to a *native* llmtuner run; an HF
     # checkpoint has no equivalent field. It is therefore derived from the
     # probed bias: a block that carries ``e_score_correction_bias`` is one the
@@ -184,10 +190,35 @@ def swap_hf_moe_blocks(
             "in parallel/expert_parallel/hf_inspection.py."
         )
 
+    module_paths = list(model.named_modules(remove_duplicate=False))
+    replaced_roots = [
+        f"{path}.{attr}" if path else attr
+        for path, module in module_paths
+        for layer, attr, _ in candidates
+        if module is layer
+    ]
+    external_parameters: dict[int, list[str]] = {}
+    for path, module in module_paths:
+        if any(path == root or path.startswith(f"{root}.") for root in replaced_roots):
+            continue
+        for name, parameter in module.named_parameters(
+            recurse=False, remove_duplicate=False
+        ):
+            fqn = f"{path}.{name}" if path else name
+            external_parameters.setdefault(id(parameter), []).append(fqn)
+
     replacements: list[tuple[nn.Module, str, MoE]] = []
+    converted_blocks: dict[int, MoE] = {}
+    converted_parameters: dict[int, tuple[nn.Parameter, ...]] = {}
+    converted_biases: dict[int, torch.Tensor] = {}
     aux_group_counts = dict(AuxLoss._group_counts)
     try:
         for layer, attr, block in candidates:
+            # Repeated layer slots may reference one physical HF block. Preserve
+            # that sharing rather than cloning trainable weights and statistics.
+            if id(block) in converted_blocks:
+                replacements.append((layer, attr, converted_blocks[id(block)]))
+                continue
             router_gate = router_of(block)
             load_balance_coeff = (
                 float(default_coeff)
@@ -204,10 +235,57 @@ def swap_hf_moe_blocks(
                 torchao_pad_multiple=torchao_pad_multiple,
                 tp_enabled=tp_enabled,
             )
+            # Distinct blocks may tie only a projection. The fused gate/up
+            # source maps to two parameters, which must be reused as a pair.
+            # Bind after dtype/device conversion, before installing any block.
+            grouped = moe.routed_experts.inner_experts
+            for owner, names, source in (
+                (moe.router.gate, ("weight",), router_gate.weight),
+                (grouped, ("w1_EFD", "w3_EFD"), block.experts.gate_up_proj),
+                (grouped, ("w2_EDF",), block.experts.down_proj),
+            ):
+                shared = converted_parameters.get(id(source))
+                if shared is None:
+                    targets = tuple(getattr(owner, name) for name in names)
+                    # Unchanged layouts can keep the original Parameter, also
+                    # preserving consumers outside the converted MoE subtree.
+                    # Split gate/up and EP-sharded projections have new layouts.
+                    if (
+                        len(targets) == 1
+                        and isinstance(source, nn.Parameter)
+                        and type(source) is type(targets[0])
+                        and source.shape == targets[0].shape
+                        and source.dtype == targets[0].dtype
+                        and source.device == targets[0].device
+                    ):
+                        setattr(owner, names[0], source)
+                        targets = (source,)
+                    external = external_parameters.get(id(source), [])
+                    if external and not (len(targets) == 1 and targets[0] is source):
+                        raise UnsupportedCombinationError(
+                            f"MoE conversion changes the layout of a parameter "
+                            f"also registered outside converted blocks at {external}; "
+                            "split or EP-sharded expert aliases require an adapted "
+                            "external consumer. Register aliases to the converted "
+                            "expert parameters after EP conversion."
+                        )
+                    converted_parameters[id(source)] = targets
+                else:
+                    for name, parameter in zip(names, shared, strict=True):
+                        setattr(owner, name, parameter)
+            # Shared bias consumers contribute counts or histograms to one
+            # policy-specific update in bias_update.py.
+            source_bias = getattr(router_gate, "e_score_correction_bias", None)
+            if isinstance(source_bias, torch.Tensor) and moe.expert_bias_E is not None:
+                if id(source_bias) not in converted_biases:
+                    converted_biases[id(source_bias)] = moe.expert_bias_E
+                else:
+                    moe.expert_bias_E = converted_biases[id(source_bias)]
             # The router already owns the deterministic balanced selection used by
             # equivalence/debug runs; expose the FSDPTurbo plan flag without
             # duplicating routing logic in each dispatcher.
             moe.router._debug_force_load_balance = fixed_router
+            converted_blocks[id(block)] = moe
             replacements.append((layer, attr, moe))
     except BaseException:
         # Failed construction must not inflate auxiliary-loss metric divisors.

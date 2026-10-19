@@ -6,11 +6,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from llmtuner.parallel.expert_parallel.domino_dispatch import DominoRoutedExperts
+
 from ...accelerator.distributed import get_rank, get_world_size
+from ...errors import UnsupportedCombinationError
 from ...models.common.aux_loss import AuxLoss
 from ...models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
 from ...models.common.moe.experts import (
-    DominoRoutedExperts,
     GroupedExperts,
     RoutedExperts,
 )
@@ -71,6 +73,10 @@ def convert_block(
     tp_enabled: bool = False,
 ) -> MoE:
     """Build the llmtuner MoE for one HF block and move its weights over."""
+    if token_dispatcher == "mc2" and tp_enabled:
+        raise UnsupportedCombinationError(
+            "MC2 with TP requires a fused expert projection layout adapter"
+        )
     ep_size = 1 if ep_group is None else get_world_size(ep_group)
     ep_rank = 0 if ep_group is None else get_rank(ep_group)
 
@@ -156,6 +162,10 @@ def convert_block(
     routed_experts_cls = (
         DominoRoutedExperts if token_dispatcher == "domino" else RoutedExperts
     )
+    if token_dispatcher == "mc2":
+        from .mc2_dispatch import MC2RoutedExperts
+
+        routed_experts_cls = MC2RoutedExperts
     moe = MoE(
         num_experts=num_experts,
         routed_experts=routed_experts_cls(grouped, dispatcher),

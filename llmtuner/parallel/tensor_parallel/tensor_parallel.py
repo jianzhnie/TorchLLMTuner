@@ -741,7 +741,7 @@ def resolve_tp_targets(
     # dispatch), so no sequence-boundary collectives are installed either.
     moe_deferred_to_ep = plan_declares_moe and cfg.ep_size > 1
     moe_blocks: list[tuple[str, nn.Module]] = []
-    already_bracketed = False
+    bracketed_paths: list[str] = []
     if plan_declares_moe and not moe_deferred_to_ep:
         from ..expert_parallel.hf_inspection import is_hf_moe_block
 
@@ -749,15 +749,15 @@ def resolve_tp_targets(
             if getattr(module, "_tp_moe_boundary", False):
                 # Already bracketed by an earlier apply_tp pass (the engine is
                 # idempotent per module): still counts as realized MoE TP.
-                already_bracketed = True
+                bracketed_paths.append(module_path)
                 continue
             # Blocks the probe refuses (GPT-OSS's transposed, bias-bearing
             # experts) raise out of it here, before any weight is touched.
             if is_hf_moe_block(module):
                 moe_blocks.append((module_path, module))
-        if not moe_blocks and not already_bracketed:
+        if not moe_blocks and not bracketed_paths:
             compatibility.tp_moe_specs_without_block(cfg.tp_size, model)
-    if moe_blocks:
+    if moe_blocks or bracketed_paths:
         # MoE-block internals never take the dense realizer path: the routed
         # experts are stacked parameters (no nn.Linear to match), and the
         # shared expert is sharded featurewise by ``shard_shared_expert_for_tp``
@@ -766,9 +766,14 @@ def resolve_tp_targets(
         # wrapping those in ColumnParallelLinear on top of the feature shard
         # would double-shard the weight (F/tp**2 at the wrong offset) and
         # double-gather the sequence, silently computing the wrong values.
-        moe_prefixes = tuple(f"{p}." for p, _ in moe_blocks)
+        # Already realized blocks retain plain Linear shared projections;
+        # exclude their subtrees on reapplication as well.
+        moe_prefixes = tuple(
+            f"{p}." if p else ""
+            for p in [*bracketed_paths, *(p for p, _ in moe_blocks)]
+        )
         targets = [t for t in targets if not t[0].startswith(moe_prefixes)]
-    nothing_sharded = not targets and not moe_blocks and not already_bracketed
+    nothing_sharded = not targets and not moe_blocks and not bracketed_paths
     if nothing_sharded and not moe_deferred_to_ep:
         raise ValueError(
             f"apply_tp with tp={cfg.tp_size}: the plan patterns "
@@ -933,8 +938,10 @@ def apply_tp(
     if use_symm_mem:
         enable_symm_mem(group)
 
-    realize_moe_blocks_tp(moe_blocks, tp_size=tp_size, tp_rank=tp_rank, group=group)
-
+    # Prepare every dense replacement before changing the model. A failing
+    # custom constructor must not leave earlier projections or MoE blocks sharded.
+    # Constructors are responsible for avoiding side effects on their inputs.
+    replacements: list[tuple[nn.Module, str, nn.Module]] = []
     # Deepest paths first, so replacing a module never hides an inner target.
     attention_parents: dict[str, nn.Module] = {}
     for module_path, inner, spec in sorted(targets, key=lambda t: -t[0].count(".")):
@@ -961,6 +968,10 @@ def apply_tp(
             use_symm_mem=use_symm_mem,
         )
         wrapped.train(inner.training)
+        replacements.append((parent, attr, wrapped))
+
+    realize_moe_blocks_tp(moe_blocks, tp_size=tp_size, tp_rank=tp_rank, group=group)
+    for parent, attr, wrapped in replacements:
         setattr(parent, attr, wrapped)
 
     for parent in attention_parents.values():

@@ -76,21 +76,32 @@ def expert_shard_map(
     model_parts: list[nn.Module],
 ) -> dict[str, dist.ProcessGroup]:
     """Map each EP-sharded expert parameter FQN to its EP process group."""
-    shard_map: dict[str, dist.ProcessGroup] = {}
+    parameter_groups: dict[int, dist.ProcessGroup] = {}
     for model in model_parts:
-        for module_path, module in model.named_modules():
+        for module in model.modules():
             group = getattr(module, EP_GROUP_ATTR, None)
             if group is None:
                 continue
-            for name, _ in module.named_parameters(recurse=False):
-                fqn = f"{module_path}.{name}" if module_path else name
-                fqn = canonical_fqn(fqn)
-                if fqn in shard_map and shard_map[fqn] is not group:
+            for parameter in module.parameters(recurse=False):
+                previous = parameter_groups.setdefault(id(parameter), group)
+                if previous is not group:
                     raise ValueError(
-                        f"EP checkpoint FQN {fqn!r} belongs to different "
+                        "Shared EP checkpoint parameters belong to different "
                         "expert process groups"
                     )
-                shard_map[fqn] = group
+    shard_map: dict[str, dist.ProcessGroup] = {}
+    for model in model_parts:
+        for name, parameter in model.named_parameters(remove_duplicate=False):
+            group = parameter_groups.get(id(parameter))
+            if group is None:
+                continue
+            fqn = canonical_fqn(name)
+            if fqn in shard_map and shard_map[fqn] is not group:
+                raise ValueError(
+                    f"EP checkpoint FQN {fqn!r} belongs to different "
+                    "expert process groups"
+                )
+            shard_map[fqn] = group
     return shard_map
 
 
@@ -100,7 +111,7 @@ def index_checkpoint_parameters(
     """Index live parameters without silently overwriting canonical FQNs."""
     params: dict[str, torch.Tensor] = {}
     for model in model_parts:
-        for fqn, param in model.named_parameters():
+        for fqn, param in model.named_parameters(remove_duplicate=False):
             name = canonical_fqn(fqn)
             if name in params and params[name] is not param:
                 raise ValueError(
@@ -172,19 +183,80 @@ def gather_expert_state(
     """
     if not shard_map:
         return state_dict
-    params = index_checkpoint_parameters(model_parts)
+    # Every member must know its EP group even if this snapshot has no expert
+    # entries (for example, optimizer state not initialized on one rank).
+    groups = list(dict.fromkeys(shard_map.values()))
+    distributed = dist.is_initialized()
+    if distributed:
+        # Stable ordering also covers models with several overlapping EP groups.
+        groups.sort(key=lambda group: tuple(dist.get_process_group_ranks(group)))
     out = dict(state_dict)
-    for key, group, _ in iter_expert_state_entries(
-        state_dict, shard_map=shard_map, params=params, direction="save"
-    ):
-        value = out[key]
-        if DTensor is not None and isinstance(value, DTensor):
-            # Per-EP-rank materialization of the efsdp-sharded weight.
-            value = value.full_tensor()
-        world = get_world_size(group)
-        gathered = value.new_empty((world * value.shape[0],) + value.shape[1:])
-        dist.all_gather_into_tensor(gathered, value.contiguous(), group=group)
-        out[key] = gathered
+    local_error: Exception | None = None
+    entries = []
+    manifests = {}
+    try:
+        params = index_checkpoint_parameters(model_parts)
+        entries = sorted(
+            iter_expert_state_entries(
+                state_dict, shard_map=shard_map, params=params, direction="save"
+            ),
+            key=lambda entry: entry[0],
+        )
+        for group in groups:
+            manifests[group] = [
+                (
+                    key,
+                    tuple(out[key].shape),
+                    str(out[key].dtype),
+                    str(out[key].layout),
+                    isinstance(out[key], DTensor) if DTensor is not None else False,
+                )
+                for key, owner, _ in entries
+                if owner is group
+            ]
+    except Exception as error:
+        local_error = error
+    peer_error: Exception | None = None
+    for group in groups:
+        if distributed and get_world_size(group) > 1:
+            # Metadata exchange must precede full_tensor() and tensor gathers.
+            # Include local validation failures so peers never enter those
+            # collectives while this rank is already unwinding.
+            reports: list[Any] = [None] * get_world_size(group)
+            dist.all_gather_object(
+                reports,
+                (local_error is None, manifests.get(group, [])),
+                group=group,
+            )
+            if not all(ready for ready, _ in reports):
+                peer_error = RuntimeError(
+                    "EP checkpoint preparation failed on another rank"
+                )
+                continue
+            if any(manifest != reports[0][1] for _, manifest in reports[1:]):
+                peer_error = ValueError(
+                    "EP checkpoint entries differ across ranks: expert keys, "
+                    "shapes, dtypes, layouts and tensor kinds must match"
+                )
+                continue
+        elif local_error is not None:
+            continue
+        # Complete healthy groups even if a different group failed; otherwise
+        # members belonging only to a healthy group could be left in a gather.
+        for key, owner, _ in entries:
+            if owner is not group:
+                continue
+            value = out[key]
+            if DTensor is not None and isinstance(value, DTensor):
+                value = value.full_tensor()
+            world = get_world_size(group)
+            gathered = value.new_empty((world * value.shape[0],) + value.shape[1:])
+            dist.all_gather_into_tensor(gathered, value.contiguous(), group=group)
+            out[key] = gathered
+    if local_error is not None:
+        raise local_error
+    if peer_error is not None:
+        raise peer_error
     return out
 
 

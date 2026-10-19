@@ -374,7 +374,12 @@ class LinearReduceScatter(torch.autograd.Function):
         # dim, which is the shape callers actually pass.
         grad_y_2d = grad_y.flatten(0, -2)
         x_2d = x_shard_k.flatten(0, -2)
-        grad_w_shard_k = torch.mm(grad_y_2d.T, x_2d, out_dtype=torch.float32)
+        # out_dtype is supported only for CUDA fp16/bf16 inputs. Full
+        # precision inputs use ordinary matmul, preserving fp64 when present.
+        if grad_y_2d.dtype in (torch.float16, torch.bfloat16):
+            grad_w_shard_k = torch.mm(grad_y_2d.T, x_2d, out_dtype=torch.float32)
+        else:
+            grad_w_shard_k = torch.mm(grad_y_2d.T, x_2d)
         if grad_w_shard_k.dtype != w_shard_k.dtype:
             grad_w_shard_k = grad_w_shard_k.to(dtype=w_shard_k.dtype)
 
