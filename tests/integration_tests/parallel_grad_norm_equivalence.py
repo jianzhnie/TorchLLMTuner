@@ -89,6 +89,54 @@ def main():
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("norm",))
+        # FSDP exclusions coexist with sharded gradients. Count the ordinary
+        # replica once, and materialize each independent mesh before combining.
+        second_mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("other",))
+        vectors = [
+            torch.tensor([3.0, 4.0], dtype=torch.float64),
+            torch.tensor([5.0, 12.0], dtype=torch.float64),
+            torch.tensor([8.0, 15.0], dtype=torch.float64),
+        ]
+        for order in (1.0, 2.0, float("inf")):
+            for foreach in (False, True):
+                parameters = [
+                    torch.nn.Parameter(torch.zeros_like(vectors[0])),
+                    *[
+                        torch.nn.Parameter(
+                            distribute_tensor(
+                                torch.zeros_like(vector), layout, [Shard(0)]
+                            )
+                        )
+                        for vector, layout in zip(
+                            vectors[1:], (mesh, second_mesh), strict=True
+                        )
+                    ],
+                ]
+                parameters[0].grad = vectors[0].clone()
+                for parameter, vector, layout in zip(
+                    parameters[1:], vectors[1:], (mesh, second_mesh), strict=True
+                ):
+                    parameter.grad = distribute_tensor(vector, layout, [Shard(0)])
+                expected = torch.linalg.vector_norm(torch.cat(vectors), order)
+                norm = clip_grad_norm_(
+                    parameters,
+                    2.0,
+                    norm_type=order,
+                    foreach=foreach,
+                    error_if_nonfinite=True,
+                )
+                torch.testing.assert_close(norm, expected, rtol=1e-14, atol=0)
+                for parameter, vector in zip(parameters, vectors, strict=True):
+                    gradient = parameter.grad
+                    if hasattr(gradient, "full_tensor"):
+                        gradient = gradient.full_tensor()
+                    torch.testing.assert_close(
+                        gradient,
+                        vector * (2.0 / (expected + 1e-6)),
+                        rtol=1e-14,
+                        atol=0,
+                    )
+        print(f"rank={rank} mixed Tensor/DTensor independent-mesh clipping passed")
         reference = torch.tensor([300.0, 400.0], dtype=torch.float64)
         expected_norm = torch.linalg.vector_norm(reference)
         for axis in ("pp", "tp", "ep"):

@@ -4,14 +4,15 @@ PYTHONPATH=. torchrun --nproc_per_node=4 \
     tests/integration_tests/fsdp_pattern_references.py native
 
 CPU/Gloo, TP2 x FSDP2. The child unit must not manage the excluded column
-weight. This test explicitly reduces its local gradients when it remains a
-plain Tensor, as required of callers managing exclusions.
+weight. Exercise Trainer's excluded-gradient reducer against the dense oracle.
+This calls the reducer directly, not the complete Trainer loop.
 Optional second argument: compile.
 """
 
 import copy
 import sys
 from datetime import timedelta
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -22,6 +23,7 @@ from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.parallel.topology import ParallelTopology
+from llmtuner.trainer.trainer import Trainer
 
 
 def main():
@@ -90,9 +92,9 @@ def main():
                 torch.testing.assert_close(
                     excluded_weight.grad, local_grad, atol=1e-12, rtol=1e-12
                 )
-                dist.all_reduce(
-                    excluded_weight.grad, group=dims.get_mesh("dp").get_group()
-                )
+            Trainer._allreduce_fsdp_excluded_grads(
+                SimpleNamespace(parallel_dims=dims, model_parts=[model])
+            )
             sum(value.square().sum() for value in expected).backward()
             for index, (actual, dense) in enumerate(
                 zip(model.parameters(), reference.parameters(), strict=True)

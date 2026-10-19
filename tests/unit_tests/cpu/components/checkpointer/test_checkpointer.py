@@ -1881,6 +1881,11 @@ def test_memory_checkpoint_rejects_separate_processes_before_group_setup(
     if mode == "distributed":
         monkeypatch.setattr(dist, "is_initialized", lambda: True)
         monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+        monkeypatch.setattr(
+            dist,
+            "all_gather_object",
+            lambda output, value: output.__setitem__(slice(None), [value, value]),
+        )
         # This unit simulates storage policy only; real coordination is covered
         # by trainer_initialization_coordination.py with an actual Gloo group.
         monkeypatch.setattr(

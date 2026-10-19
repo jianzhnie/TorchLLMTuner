@@ -4,6 +4,7 @@ PYTHONPATH=. torchrun --nproc_per_node=2 \
     tests/integration_tests/aux_loss_runtime_metrics.py
 """
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import torch
@@ -15,10 +16,12 @@ from llmtuner.models.common.aux_loss import (
     collect_aux_loss_metrics,
     rollup_aux_loss_metrics,
 )
+from llmtuner.trainer.runtime.reductions import TrainingReductionMeshes
+from llmtuner.trainer.trainer import Trainer
 
 
 def main():
-    dist.init_process_group("gloo")
+    dist.init_process_group("gloo", timeout=timedelta(seconds=10))
     try:
         rank = dist.get_rank()
         assert dist.get_world_size() == 2
@@ -57,6 +60,26 @@ def main():
         assert collect_aux_loss_metrics(topology, model_parts=[empty_stage]) == {
             "aux_loss/mean": 3.0
         }
+        # Exercise the actual Trainer entry with an empty constructor registry
+        # on the stage that owns no auxiliary loss.
+        trainer = Trainer.__new__(Trainer)
+        trainer.parallel_dims = topology
+        trainer.model_parts = [empty_stage]
+        trainer.pp_has_last_stage = rank == 1
+        trainer.ntokens_seen = 4
+        metrics = trainer._step_metrics(
+            accumulated_loss=torch.tensor(8.0 if rank == 1 else 0.0),
+            global_valid_tokens=torch.tensor(4),
+            local_valid_tokens=4,
+            local_valid_tokens_tensor=torch.tensor(4),
+            reduction_meshes=TrainingReductionMeshes(
+                dp_mesh=None, pp_mesh=mesh, loss_mesh=None, sequence_mesh=None
+            ),
+            grad_norm=torch.tensor(1.0),
+            lr_metrics={},
+        )
+        assert metrics["loss"] == 2.0
+        assert metrics["aux_loss/mean"] == 3.0
         dist.barrier()
         print(f"rank={rank}: current PP layer mean=2, old model counts excluded")
     finally:
