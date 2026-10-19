@@ -112,6 +112,42 @@ def main():
             ops = DistributedOps()
             with patch.object(mc2_dispatch, "load_mc2_ops", lambda ops=ops: ops):
                 model = mc2_dispatch.MC2RoutedExperts(experts, dispatcher)
+            if not (empty_rank or zero_receives or all_empty):
+                for failure in ("shape", "dtype", "counts", "histogram", "ids"):
+                    bad_scores = (
+                        weights[:-1] if rank == 0 and failure == "shape" else weights
+                    )
+                    bad_inputs = x.float() if rank == 0 and failure == "dtype" else x
+                    counts = torch.bincount(ids[sl].flatten(), minlength=4)
+                    bad_ids = ids[sl].clone()
+                    if rank == 0:
+                        if failure == "counts":
+                            counts = counts[:-1]
+                        elif failure == "histogram":
+                            counts[0] += 1
+                        elif failure == "ids":
+                            bad_ids[0, 0] = -1
+                    with (
+                        patch.object(
+                            mc2_dispatch,
+                            "mc2_communication_context",
+                            return_value=(ops, "test", 2),
+                        ),
+                        patch.object(
+                            dispatcher,
+                            "prepare_dispatch_counts",
+                            side_effect=AssertionError("count exchange entered"),
+                        ),
+                    ):
+                        caught = None
+                        try:
+                            model(bad_inputs, bad_scores, bad_ids, counts)
+                        except (ValueError, RuntimeError) as error:
+                            caught = error
+                        assert caught is not None
+                        if rank == 1:
+                            assert "MC2 input preparation" in str(caught)
+                    dist.barrier()
             optimizer = torch.optim.SGD(experts.parameters(), lr=0.01, momentum=0.9)
             reference_optimizer = torch.optim.SGD(
                 reference_experts.parameters(), lr=0.01, momentum=0.9

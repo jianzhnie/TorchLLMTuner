@@ -580,6 +580,36 @@ def test_metadata_change_is_rejected_before_any_average_mutation(operation, chan
         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("operation", ["step", "cold_start", "save", "load"])
+@pytest.mark.parametrize("kind", ["parameter", "buffer"])
+def test_renamed_tensor_is_rejected_before_any_average_mutation(operation, kind):
+    model = nn.Linear(2, 2)
+    model.register_buffer("history", torch.zeros(2))
+    ema = EMA(model_parts=[model], decay=0.5, buffer_patterns=["history"])
+    before = {name: value.clone() for name, value in _ema_params(ema).items()}
+    saved = {name: value.clone() for name, value in ema.state_dict().items()}
+    with torch.no_grad():
+        model.weight.add_(1)
+    name = "bias" if kind == "parameter" else "history"
+    tensor = getattr(model, name)
+    delattr(model, name)
+    if kind == "parameter":
+        model.register_parameter("renamed_bias", tensor)
+    else:
+        model.register_buffer("renamed_history", tensor)
+    with pytest.raises(RuntimeError, match="checkpoint name changed"):
+        if operation == "step":
+            ema.step(1)
+        elif operation == "cold_start":
+            ema.load_state_dict({})
+        elif operation == "save":
+            ema.state_dict()
+        else:
+            ema.load_state_dict(saved)
+    for name, value in _ema_params(ema).items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
 def test_dynamic_ema_sparse_firings_resume_parameter_and_buffer_against_formula():
     import copy
 
@@ -632,3 +662,108 @@ def test_dynamic_ema_sparse_firings_resume_parameter_and_buffer_against_formula(
             resumed = EMA(model_parts=[resumed_model], **options)
             resumed.load_state_dict(copy.deepcopy(continuous.state_dict()))
     assert resumed is not None
+
+
+@pytest.mark.parametrize("complex_dtype", [torch.complex64, torch.complex128])
+def test_mixed_real_complex_buffer_ema_resume_matches_independent_formula(
+    complex_dtype,
+):
+    import copy
+
+    model = nn.Linear(2, 2, dtype=torch.float64)
+    # Dyadic values keep both independent formula and lerp exactly representable.
+    with torch.no_grad():
+        model.weight.fill_(0.5)
+        model.bias.fill_(-0.25)
+    model.register_buffer(
+        "history", torch.tensor([1 + 2j, -3 + 4j], dtype=complex_dtype)
+    )
+    options = dict(decay=0.5, buffer_patterns=["history$"])
+    ema = EMA(model_parts=[model], **options)
+    expected = {
+        name: tensor.detach().clone()
+        for name, tensor in [*model.named_parameters(), *model.named_buffers()]
+    }
+    resumed_model = resumed = None
+    for step in range(1, 5):
+        with torch.no_grad():
+            model.weight.fill_(step * 0.25)
+            model.bias.fill_(-step * 0.5)
+            model.history.copy_(
+                torch.tensor([step + 2j, -3 - step * 1j], dtype=complex_dtype)
+            )
+        live = dict([*model.named_parameters(), *model.named_buffers()])
+        for name in expected:
+            expected[name] = expected[name] * 0.5 + live[name].detach() * 0.5
+        ema.step(step)
+        state = ema.state_dict()
+        for name, tensor in expected.items():
+            torch.testing.assert_close(
+                state[f"state.{name}.ema_params"], tensor, rtol=0, atol=0
+            )
+        if resumed is not None:
+            resumed_model.load_state_dict(model.state_dict())
+            resumed.step(step)
+            torch.testing.assert_close(resumed.state_dict(), state, rtol=0, atol=0)
+        if step == 2:
+            resumed_model = copy.deepcopy(model)
+            resumed = EMA(model_parts=[resumed_model], **options)
+            resumed.load_state_dict(copy.deepcopy(state))
+            torch.testing.assert_close(resumed.state_dict(), state, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_buffer_only_ema_with_all_parameters_frozen_can_update_and_resume(dtype):
+    from copy import deepcopy
+
+    model = torch.nn.Linear(2, 2, dtype=dtype).requires_grad_(False)
+    model.register_buffer("expert_bias", torch.tensor([0.2, -0.2], dtype=dtype))
+    frozen = {name: value.detach().clone() for name, value in model.named_parameters()}
+    ema = EMA(model_parts=[model], decay=0.5, buffer_patterns=["expert_bias$"])
+    assert len(ema.param_groups[0]["params"]) == 1
+    assert ema.param_groups[0]["params"][0] is model.expert_bias
+    assert set(ema.state_dict()) == {"state.expert_bias.ema_params"}
+    initial = model.expert_bias.clone()
+    model.expert_bias.add_(1)
+    ema.step(1)
+    expected = initial.lerp(model.expert_bias, 0.5)
+    torch.testing.assert_close(
+        ema.state_dict()["state.expert_bias.ema_params"], expected, rtol=0, atol=0
+    )
+    restored_model = deepcopy(model)
+    restored = EMA(
+        model_parts=[restored_model], decay=0.5, buffer_patterns=["expert_bias$"]
+    )
+    restored.load_state_dict(deepcopy(ema.state_dict()))
+    for current in (model, restored_model):
+        current.expert_bias.sub_(0.25)
+    ema.step(2)
+    restored.step(2)
+    expected = expected.lerp(model.expert_bias, 0.5)
+    for current in (ema, restored):
+        torch.testing.assert_close(
+            current.state_dict()["state.expert_bias.ema_params"],
+            expected,
+            rtol=0,
+            atol=0,
+        )
+    for current in (model, restored_model):
+        for name, parameter in current.named_parameters():
+            assert not parameter.requires_grad
+            torch.testing.assert_close(parameter, frozen[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("parts", ["frozen", "parameterless", "none"])
+def test_empty_ema_scope_can_step_checkpoint_and_cold_start(parts):
+    model = torch.nn.Linear(2, 2).requires_grad_(False)
+    model_parts = {
+        "frozen": [model],
+        "parameterless": [torch.nn.Identity()],
+        "none": [],
+    }[parts]
+    ema = EMA(model_parts=model_parts, decay=0.5)
+    assert ema.param_groups[0]["params"] == []
+    assert ema.state_dict() == {}
+    ema.step(1)
+    ema.load_state_dict({})
+    assert ema.state_dict() == {}

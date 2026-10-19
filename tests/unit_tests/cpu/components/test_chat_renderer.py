@@ -1,13 +1,10 @@
 """Optional renderers-library path: gating, adapter, and processor semantics.
 
-The ``renderers`` package is not installed in this environment, so the
-library seam is exercised against a fake module injected into
-``sys.modules`` -- the fake reproduces the interface llmtuner calls
-(``create_renderer``, ``build_training_sample``, top-level config classes
-with a ``name``), not the real renderers' token-level output. Numerical
-parity with the real library is unverified until the dependency lands and
-these tests are re-run against it; the gating test (no package installed)
-runs for real.
+Most cases inject a fake module into ``sys.modules`` to exercise dependency
+errors and the adapter contract without installing the optional package.
+The real Qwen3 cases use ``pytest.importorskip`` and a local WordLevel tokenizer;
+run them with renderers==0.1.11 installed. They check actual render/shift/mask
+composition, without claiming real Qwen BPE or model-training equivalence.
 """
 
 from __future__ import annotations
@@ -353,3 +350,52 @@ def test_renderer_rejects_output_without_a_prediction_pair(
     processor = _renderer_processor(tokenizer, fake_renderers)
     with pytest.raises(ConfigError, match="at least two tokens"):
         processor({"messages": MULTI_TURN}, np.random.default_rng(0))
+
+
+@pytest.mark.parametrize("turns", [1, 2])
+def test_real_qwen3_renderer_preserves_shifted_supervision(tmp_path, turns):
+    """Real optional library with a local WordLevel fixture, without Hub access."""
+    renderers = pytest.importorskip("renderers")
+    special_tokens = [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<tool_call>",
+        "</tool_call>",
+        "<tool_response>",
+        "</tool_response>",
+        "<think>",
+        "</think>",
+    ]
+    path = write_tokenizer(
+        str(tmp_path),
+        extra_vocab={token: 70 + index for index, token in enumerate(special_tokens)},
+    )
+    tokenizer = HuggingFaceTokenizer(tokenizer_path=path)
+    renderer = build_chat_renderer(
+        tokenizer=tokenizer, renderer_name="Qwen3RendererConfig"
+    )
+    messages = [
+        {"role": "user", "content": "lorem"},
+        {"role": "assistant", "content": "ipsum"},
+        {"role": "user", "content": "w1"},
+        {"role": "assistant", "content": "w2"},
+    ][: 2 * turns]
+    rendered = renderers.build_training_sample(
+        renderer, messages, ensure_final_stop=True
+    )
+    processor = ChatProcessor(
+        context=make_context(tokenizer, max_context_length=256),
+        messages_fn=lambda sample: sample["messages"],
+        renderer=renderer,
+    )
+    sequence = processor({"messages": messages}, np.random.default_rng(0))
+    assert sequence is not None
+    expected = np.asarray(rendered.token_ids[1:], dtype=np.int64)
+    expected[~np.asarray(rendered.loss_mask[1:], dtype=bool)] = IGNORE_INDEX
+    np.testing.assert_array_equal(sequence.input_ids, rendered.token_ids[:-1])
+    np.testing.assert_array_equal(sequence.labels, expected)
+    for message in messages:
+        token_ids = tokenizer.encode(message["content"], add_bos=False, add_eos=False)
+        assert len(token_ids) == 1
+        assert (token_ids[0] in sequence.labels) == (message["role"] == "assistant")

@@ -42,6 +42,32 @@ def main():
         assert dist.get_world_size() == 2
         batch = Batch(input_ids=torch.ones(1, 4), labels=torch.ones(1, 4))
         for failing_rank in (0, 1):
+            for method in ("add_tokens", "add_data_loading_time"):
+                for error_type in (ValueError, KeyboardInterrupt, SystemExit):
+                    original = error_type("training fetch metric failed")
+                    metrics = Metrics()
+
+                    def fail(*args, original=original):
+                        raise original
+
+                    if rank == failing_rank:
+                        setattr(metrics, method, fail)
+                    iterator = batch_generator(
+                        SimpleNamespace(metrics=metrics), [batch]
+                    )
+                    caught = None
+                    try:
+                        next(iterator)
+                    except BaseException as error:
+                        caught = error
+                    assert caught is not None, "peer yielded after metric failure"
+                    if rank == failing_rank:
+                        assert caught is original
+                    else:
+                        assert isinstance(caught, RuntimeError)
+                        assert "Training fetch accounting" in str(caught)
+                    dist.barrier()
+        for failing_rank in (0, 1):
             host_batch = {"input": torch.ones(4), "labels": torch.ones(4)}
             if rank == failing_rank:
                 del host_batch["input"]

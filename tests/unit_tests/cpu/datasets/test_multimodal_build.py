@@ -283,3 +283,100 @@ def test_base_tokenizer_import_does_not_load_optional_implementations():
         [sys.executable, "-c", source], capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("historical_identity", [False, True])
+def test_multimodal_factory_restores_packed_images_and_rejects_old_identity(
+    tmp_path, monkeypatch, historical_identity
+):
+    from copy import deepcopy
+
+    import torch
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+
+    from llmtuner.datasets import loader_builder
+    from llmtuner.datasets.multimodal.processors import (
+        MultimodalProcessor,
+        process_cc12m_sample,
+    )
+    from llmtuner.datasets.multimodal.recipes import MULTIMODAL_DATASETS
+    from tests.integration_tests.cli_checkpoint_equivalence import assert_state_equal
+
+    corpus = tmp_path / "pairs.jsonl"
+    encoded = base64.b64encode(png_bytes(64, 64)).decode()
+    corpus.write_text(
+        "".join(
+            json.dumps({"txt": f"w{i} hello", "jpg": {"bytes": encoded}}) + "\n"
+            for i in range(12)
+        )
+    )
+    monkeypatch.setitem(
+        MULTIMODAL_DATASETS,
+        "cc12m-cursor-test",
+        SingleDataset(
+            source=Base64JsonlSource(patterns=(str(corpus),)),
+            processor=partial(MultimodalProcessor, process_sample=process_cc12m_sample),
+            post_filters=(lambda sample: sample is not None,),
+        ),
+    )
+    tokenizer_path = tmp_path / "tokenizer"
+    tokenizer_path.mkdir()
+    vocab = {"[UNK]": 0, "hello": 1}
+    vocab.update({f"w{i}": i + 2 for i in range(12)})
+    vocab.update({token: i + 14 for i, token in enumerate(MM_TOKENS)})
+    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    backend.save(str(tokenizer_path / "tokenizer.json"))
+    config = DataloaderConfig(
+        dataset="cc12m-cursor-test",
+        tokenizer_path=str(tokenizer_path),
+        mm_pad_token=PAD_TOKEN,
+        data_identity="immutable-local-png-snapshot",
+        num_packing_bins=2,
+        max_num_documents=2,
+    )
+    dumps = loader_builder.json.dumps
+
+    def legacy_settings(settings, **kwargs):
+        settings = settings.copy()
+        settings.pop("multimodal_encoding", None)
+        return dumps(settings, **kwargs)
+
+    loaders = []
+    try:
+        with monkeypatch.context() as context:
+            if historical_identity:
+                context.setattr(loader_builder.json, "dumps", legacy_settings)
+            source = _build(config, num_tokens=128)
+            loaders.append(source)
+        reference = _build(config, num_tokens=128)
+        target = _build(config, num_tokens=128)
+        loaders.extend((reference, target))
+        for _ in range(2):
+            assert_state_equal(next(iter(source)), next(iter(reference)))
+        saved = deepcopy(source.state_dict())
+        assert saved["batch_layout"]["data_identity"]
+        before = deepcopy(target.state_dict())
+        if historical_identity:
+            with pytest.raises(ValueError, match="batch layout"):
+                target.load_state_dict(saved)
+            assert_state_equal(target.state_dict(), before)
+            # Rejection leaves the actual media iterator at its original cursor.
+            oracle = _build(config, num_tokens=128)
+            loaders.append(oracle)
+            assert_state_equal(next(iter(target)), next(iter(oracle)))
+        else:
+            target.load_state_dict(saved)
+            assert_state_equal(target.state_dict(), saved)
+            for _ in range(3):
+                actual, expected = next(iter(target)), next(iter(reference))
+                assert_state_equal(actual, expected)
+                assert actual["pixel_values"].numel() > 0
+                assert actual["grid_thw"].numel() > 0
+                assert torch.any(actual["input"] == vocab[IMAGE_TOKEN])
+                assert not torch.any(actual["labels"] == vocab[IMAGE_TOKEN])
+    finally:
+        for loader in loaders:
+            loader.close()

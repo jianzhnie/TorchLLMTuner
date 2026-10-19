@@ -489,6 +489,50 @@ def test_validate_restores_mixed_module_modes(monkeypatch, fail) -> None:
     assert not model.frozen.training
 
 
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt, SystemExit])
+def test_validate_restores_modes_after_partial_eval_setup(monkeypatch, error_type):
+    from llmtuner.trainer.runtime import validation as validation_runtime
+
+    original = error_type("eval setup failed")
+
+    class FailingEval(torch.nn.Module):
+        def train(self, mode=True):
+            super().train(mode)
+            if not mode:
+                raise original
+            return self
+
+    model = _EchoModel()
+    model.add_module("frozen", torch.nn.Dropout())
+    model.add_module("failing", FailingEval())
+    model.add_module("untouched", torch.nn.Dropout())
+    model.frozen.eval()
+    trainer, _ = _make_trainer(
+        monkeypatch,
+        validation=ValidationConfig(steps=1, dataset="local_jsonl"),
+        loader=_ListLoader([]),
+        model=model,
+    )
+    config = SimpleNamespace(attn_mask_type="causal")
+    model.model = SimpleNamespace(config=config)
+    kernel = torch.nn.Module()
+    kernel.packed = False
+    model._titan_flex_kernel = kernel
+    modes = {module: module.training for module in model.modules()}
+
+    def unexpected(*args):
+        pytest.fail("validation loop ran after eval setup failed")
+
+    monkeypatch.setattr(validation_runtime, "run_validation_loop", unexpected)
+    with pytest.raises(error_type) as caught:
+        trainer.validate(1)
+
+    assert caught.value is original
+    assert {module: module.training for module in model.modules()} == modes
+    assert config.attn_mask_type == "causal"
+    assert kernel.packed is False
+
+
 @pytest.mark.parametrize("fail", [False, True])
 @pytest.mark.parametrize("original", ["missing", None, "causal", "block_causal"])
 @pytest.mark.parametrize("max_documents", [None, 1])
@@ -559,9 +603,23 @@ def test_kcp_rejects_packed_validation_before_loop(monkeypatch):
 
 
 @pytest.mark.parametrize("forward_fails", [False, True])
+@pytest.mark.parametrize("report_error", [None, OSError, KeyboardInterrupt, SystemExit])
 def test_validation_preserves_forward_error_when_close_fails(
-    monkeypatch, forward_fails
+    monkeypatch, forward_fails, report_error
 ):
+    from llmtuner.trainer.runtime import validation as validation_runtime
+
+    if report_error is not None:
+
+        def report(*args, **kwargs):
+            raise report_error("validation cleanup logger failed")
+
+        monkeypatch.setattr(
+            validation_runtime,
+            "get_logger",
+            lambda name: SimpleNamespace(exception=report),
+        )
+
     loader = _ListLoader([_batch(2)])
 
     def close():
@@ -609,10 +667,22 @@ def test_pipeline_microbatch_split_rejects_incomplete_rows(rows, packed_dict):
 
 
 @pytest.mark.parametrize("iteration_fails", [False, True])
+@pytest.mark.parametrize("report_error", [None, OSError, KeyboardInterrupt, SystemExit])
 def test_pipeline_validation_cleanup_preserves_iteration_error(
-    monkeypatch, iteration_fails
+    monkeypatch, iteration_fails, report_error
 ):
     import llmtuner.trainer.runtime.validation as validation_module
+
+    if report_error is not None:
+
+        def report(*args, **kwargs):
+            raise report_error("pipeline validation cleanup logger failed")
+
+        monkeypatch.setattr(
+            validation_module,
+            "get_logger",
+            lambda name: SimpleNamespace(exception=report),
+        )
 
     original = ValueError("iteration failed")
     closed = []

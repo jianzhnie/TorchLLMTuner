@@ -1130,20 +1130,18 @@ def test_sft_fields_reject_invalid_names(field, value):
         DataloaderConfig(**options, **{field: value})
 
 
-def test_fixed_router_ep1_tp_layout_rejected_before_transform():
+@pytest.mark.parametrize("ep_size", [1, 2])
+def test_fixed_router_accepts_feature_tp_and_expert_parallel(ep_size):
     from llmtuner.config.parallel_config import ExpertParallelConfig, ParallelConfig
-    from llmtuner.errors import UnsupportedCombinationError
 
-    with pytest.raises(UnsupportedCombinationError, match="feature-sharded TP"):
-        ParallelConfig(
-            tensor_parallel_size=2,
-            ep_config=ExpertParallelConfig(fixed_router=True),
-        )
-    ParallelConfig(
+    config = ParallelConfig(
         tensor_parallel_size=2,
-        expert_parallel_size=2,
+        expert_parallel_size=ep_size,
         ep_config=ExpertParallelConfig(fixed_router=True),
     )
+    assert config.tp_size == 2
+    assert config.ep_size == ep_size
+    assert config.ep_config.fixed_router
 
 
 def test_seed_checkpoint_rejects_load_only_configuration():
@@ -1152,3 +1150,17 @@ def test_seed_checkpoint_rejects_load_only_configuration():
 
     with pytest.raises(ConfigError, match="create_seed_checkpoint.*load_only"):
         CheckpointConfig(enable=True, create_seed_checkpoint=True, load_only=True)
+
+
+@pytest.mark.parametrize("value", [None, True, 32, "float16", "invalid"])
+def test_fsdp_rejects_unknown_reduction_dtype(value):
+    with pytest.raises(ConfigError, match="fsdp_reduce_dtype"):
+        FSDPConfig(fsdp_reduce_dtype=value)
+
+
+def test_cli_resolves_fsdp_reduction_dtype():
+    from llmtuner.trainer.cli import parse_config
+
+    assert FSDPConfig().fsdp_reduce_dtype == "float32"
+    config = parse_config(["--fsdp_reduce_dtype", "float64"])
+    assert config.parallel.fsdp_config.fsdp_reduce_dtype == "float64"

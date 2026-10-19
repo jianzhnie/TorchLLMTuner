@@ -618,3 +618,11 @@ def test_runtime_denominators_are_isolated_and_discard_failed_step_metrics():
         loss.inject(raw, carrier=carrier).sum().backward()
         torch.testing.assert_close(raw.grad, torch.tensor(1.0 / denominator))
         torch.testing.assert_close(loss.instance_acc, torch.tensor(4.0 / denominator))
+
+
+@pytest.mark.parametrize("replicas", [0, -1, True, 1.5, None])
+def test_invalid_token_replication_size_does_not_register_loss(replicas):
+    before = dict(AuxLoss._group_counts)
+    with pytest.raises(ValueError, match="positive integer"):
+        MicrobatchWiseLoadBalanceLoss(coeff=0.03, token_replication_size=replicas)
+    assert dict(AuxLoss._group_counts) == before

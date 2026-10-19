@@ -961,3 +961,78 @@ def test_full_checkpoint_compiles_with_dispatch_recompute_context():
     for got, want in zip(compiled.parameters(), reference.parameters(), strict=True):
         torch.testing.assert_close(got.grad, want.grad)
     assert counters["stats"]["unique_graphs"] > 0
+
+
+@pytest.mark.parametrize("mode", ["full", "selective"])
+@pytest.mark.parametrize("backward_order", ["fifo", "lifo", "combined"])
+def test_checkpoint_preserves_multiple_pending_decoder_forwards(mode, backward_order):
+    reference = _model()
+    actual = apply_ac(
+        _model(), mode, selective=SelectiveACConfig() if mode == "selective" else None
+    )
+    counts = [0] * _NUM_LAYERS
+    handles = []
+    for index, layer in enumerate(actual.layers):
+
+        def count(module, args, index=index):
+            counts[index] += 1
+
+        handles.append(
+            layer._checkpoint_wrapped_module.register_forward_pre_hook(count)
+        )
+    try:
+        ids, _ = _batch()
+        expected_losses, actual_losses = [], []
+        for index, length in enumerate((_SEQ, _SEQ - 3)):
+            inputs = (ids[:length] + index) % _VOCAB
+            positions = torch.arange(length)
+            expected = reference(inputs, positions=positions)
+            output = actual(inputs, positions=positions)
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            expected_losses.append(expected.square().sum())
+            actual_losses.append(output.square().sum())
+        assert counts == [2] * _NUM_LAYERS
+        if backward_order == "combined":
+            sum(expected_losses).backward()
+            sum(actual_losses).backward()
+        else:
+            order = (0, 1) if backward_order == "fifo" else (1, 0)
+            for index in order:
+                expected_losses[index].backward()
+                actual_losses[index].backward()
+        assert counts == [4] * _NUM_LAYERS
+        reference_parameters = dict(reference.named_parameters())
+        for name, parameter in actual.named_parameters():
+            canonical = name.replace("._checkpoint_wrapped_module", "")
+            assert parameter.grad is not None
+            torch.testing.assert_close(
+                parameter.grad, reference_parameters[canonical].grad, rtol=0, atol=0
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@pytest.mark.parametrize("mode", ["full", "selective"])
+@pytest.mark.parametrize("training", [False, True])
+def test_checkpoint_wrapper_preserves_mixed_modes_and_frozen_parameters(mode, training):
+    block = torch.nn.Sequential(
+        torch.nn.Linear(4, 4), torch.nn.Dropout(0.25), torch.nn.Linear(4, 4)
+    )
+    block.train(training)
+    block[1].train(not training)
+    block[0].weight.requires_grad_(False)
+    parameters = list(block.parameters())
+    modes = {name: module.training for name, module in block.named_modules()}
+    frozen = [parameter.requires_grad for parameter in parameters]
+    wrapped = (
+        ac_mod.wrap_full(block)
+        if mode == "full"
+        else ac_mod.wrap_selective(block, SelectiveACConfig())
+    )
+    assert wrapped.training is training
+    assert [id(parameter) for parameter in wrapped.parameters()] == [
+        id(parameter) for parameter in parameters
+    ]
+    assert [parameter.requires_grad for parameter in wrapped.parameters()] == frozen
+    assert {name: module.training for name, module in block.named_modules()} == modes

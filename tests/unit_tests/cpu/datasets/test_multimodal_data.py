@@ -1285,3 +1285,89 @@ def test_multimodal_packing_resumes_legacy_feature_schema(
         legacy.close()
         if current is not None:
             current.close()
+
+
+def test_unregistered_visual_markers_preserve_image_tokens_and_shifted_labels(
+    tmp_path, image_bytes
+):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+
+    vocab = {"[UNK]": 0, "hello": 1}
+    vocab.update({token: index + 2 for index, token in enumerate(MM_TOKENS)})
+    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    assert backend.get_added_tokens_decoder() == {}
+    backend.save(str(tmp_path / "tokenizer.json"))
+    tokenizer = MultimodalTokenizer(
+        tokenizer_path=str(tmp_path),
+        image_token=IMAGE_TOKEN,
+        video_token=VIDEO_TOKEN,
+        vision_start_token=VISION_START,
+        vision_end_token=VISION_END,
+        pad_token="[PAD]",
+    )
+    result = process_multimodal_sample(
+        [None, "hello hello"],
+        [image_bytes, None],
+        tokenizer=tokenizer,
+        **MM_KWARGS,
+    )
+    assert result is not None
+    # 64x64 PNG, 16x16 patches and 2x2 spatial merging yield four image tokens.
+    expected = [vocab[VISION_START]] + [vocab[IMAGE_TOKEN]] * 4
+    expected += [vocab[VISION_END], vocab["hello"], vocab["hello"]]
+    assert result["input_ids"].tolist() == expected[:-1]
+    assert result["labels"].tolist() == [IGNORE_INDEX] * 5 + [1, 1]
+    assert result["positions"].tolist() == list(range(7))
+    assert len(result["pixel_values"]) == 1
+    assert tuple(result["pixel_values"][0].shape) == (1, 64, 64, 3)
+
+
+@pytest.mark.parametrize("context_length,batch_length", [(16, 8), (8, 16), (8, 8)])
+def test_multimodal_packing_filters_documents_against_both_limits(
+    mm_tokenizer, monkeypatch, context_length, batch_length
+):
+    import grain.python as grain
+
+    from llmtuner.datasets.multimodal import packing
+
+    limit = min(context_length, batch_length)
+    samples = [
+        {
+            "input_ids": torch.full((length,), index + 1),
+            "labels": torch.full((length,), index + 11),
+            "positions": torch.arange(length),
+            "pixel_values": [torch.full((1, 2, 2, 3), index)],
+        }
+        for index, length in enumerate((limit + 1, limit, limit - 1))
+    ]
+    monkeypatch.setattr(
+        packing,
+        "build_dataset",
+        lambda *args, **kwargs: grain.MapDataset.source(samples),
+    )
+    graph = packing.build_multimodal_packing(
+        None,
+        context=make_context(
+            mm_tokenizer,
+            num_tokens_per_batch=batch_length,
+            max_context_length=context_length,
+        ),
+        iteration_policy=make_policy(),
+        num_packing_bins=2,
+    )
+    iterator = iter(graph)
+    try:
+        rows = list(iterator)
+    finally:
+        iterator.close()
+    labels = []
+    media = []
+    for row in rows:
+        labels.extend(row["labels"][~row["padding_mask"]].tolist())
+        media.extend(int(image.flatten()[0]) for image in row["pixel_values"])
+        assert row["input_ids"].numel() == batch_length
+    assert sorted(labels) == [12] * limit + [13] * (limit - 1)
+    assert sorted(media) == [1, 2]

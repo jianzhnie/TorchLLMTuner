@@ -1,4 +1,4 @@
-"""Run the integration tests: one torchrun invocation per script.
+"""Run integration scripts with their documented Python or torchrun launcher.
 
 Each ``*_equivalence.py`` (and sibling) script in this directory carries its
 own launch command in its module docstring (``PYTHONPATH=. torchrun
@@ -13,7 +13,8 @@ Usage (from the repo root):
     python tests/integration_tests/run_all.py ac_equivalence   # one script
     python tests/integration_tests/run_all.py ac_equivalence.py tp_equivalence
 
-Every script runs with ``PYTHONPATH=.`` and its own torchrun process; the
+Every script runs with ``PYTHONPATH=.``; Python drivers launch once, while
+distributed scripts use torchrun; the
 exit code is non-zero if any script fails, and a pass/fail table is printed
 at the end either way.
 
@@ -53,6 +54,30 @@ def _torchrun_args(script: Path) -> list[str]:
     return ["--nproc_per_node=2"]
 
 
+def launch_command(script: Path, master_port: int) -> list[str]:
+    """Keep self-launching Python drivers outside an outer rank launcher.
+
+    Match the script's own documented command, not prose mentioning Python.
+    Scripts with both device-local and distributed examples retain torchrun.
+    """
+    docstring = ast.get_docstring(ast.parse(script.read_text())) or ""
+    python_driver = re.search(
+        rf"\bpython(?:3)?\s+(?:[\w./-]+/)?{re.escape(script.name)}(?=\s|$)",
+        docstring,
+    )
+    path = str(script.relative_to(REPO_ROOT))
+    if python_driver and not _TORCHRUN_RE.search(docstring):
+        return [sys.executable, path]
+    return [
+        "torchrun",
+        "--nnodes=1",
+        "--master-addr=127.0.0.1",
+        f"--master-port={master_port}",
+        *_torchrun_args(script),
+        path,
+    ]
+
+
 def discover() -> list[Path]:
     """Every runnable script in this directory, sorted by name."""
     return sorted(
@@ -78,7 +103,7 @@ def main() -> int:
     parser.add_argument(
         "--list",
         action="store_true",
-        help="List the discovered scripts and their torchrun args, then exit.",
+        help="List the discovered scripts and launch commands, then exit.",
     )
     args = parser.parse_args()
     if not 1 <= args.master_port <= 65535:
@@ -95,7 +120,8 @@ def main() -> int:
 
     if args.list:
         for script in scripts:
-            print(f"{script.name:45s} torchrun {' '.join(_torchrun_args(script))}")
+            command = " ".join(launch_command(script, args.master_port))
+            print(f"{script.name:45s} {command}")
         print(f"{len(scripts)} scripts")
         return 0
 
@@ -103,17 +129,10 @@ def main() -> int:
     env["PYTHONPATH"] = str(REPO_ROOT)
     results: list[tuple[str, bool, float]] = []
     for script in scripts:
-        cmd = [
-            "torchrun",
-            "--nnodes=1",
-            "--master-addr=127.0.0.1",
-            f"--master-port={args.master_port}",
-            *_torchrun_args(script),
-            str(script.relative_to(REPO_ROOT)),
-        ]
+        cmd = launch_command(script, args.master_port)
         print(f"=== {' '.join(cmd)}", flush=True)
         start = time.monotonic()
-        if script.stem == "pp_checkpoint_equivalence":
+        if script.stem in {"pp_checkpoint_equivalence", "async_snapshot_equivalence"}:
             # Separate processes must share the same checkpoint and trajectory.
             with tempfile.TemporaryDirectory(
                 prefix="llmtuner-pp-checkpoint-"

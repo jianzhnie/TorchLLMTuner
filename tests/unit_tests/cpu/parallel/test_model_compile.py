@@ -19,9 +19,9 @@ These tests pin, on CPU with no process group:
   carries token-choice MoE blocks, unset for a dense one), with the global
   restored afterwards.
 
-The model-level tests need the flex/spmd import surface, which this
-machine's torch (2.2.2) only provides under the stub preamble; without it
-they skip rather than error, so the default-collected suite is unchanged.
+Model-level tests are gated on the required flex/SPMD import surface. Actual
+CPU aot_eager graphs also check AC composition, mixed train/eval modes,
+parameter identity and frozen gradients against an eager reference.
 """
 
 from __future__ import annotations
@@ -604,3 +604,131 @@ def test_failed_async_compile_restores_inductor_pass(
         assert inductor_config._micro_pipeline_tp is initial
     finally:
         inductor_config._micro_pipeline_tp = original
+
+
+@requires_runtime
+@pytest.mark.parametrize("per_block", [False, True])
+@pytest.mark.parametrize("mode", ["full", "selective"])
+@pytest.mark.parametrize("validation_fails", [False, True])
+def test_compiled_ac_preserves_modes_identity_and_frozen_gradients(
+    monkeypatch, per_block, mode, validation_fails
+):
+    import copy
+    from types import SimpleNamespace
+
+    from torch._dynamo.utils import counters
+
+    from llmtuner.config.activation_checkpoint_config import SelectiveACConfig
+    from llmtuner.memory.activation_checkpoint import apply_ac
+    from llmtuner.utils.module_names import canonical_fqn
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.Sequential(
+                *[
+                    torch.nn.Sequential(
+                        torch.nn.Linear(4, 4),
+                        torch.nn.Dropout(0.25),
+                        torch.nn.Tanh(),
+                        torch.nn.Linear(4, 4),
+                    )
+                    for _ in range(2)
+                ]
+            )
+
+        def forward(self, inputs):
+            return self.layers(inputs)
+
+    torch.manual_seed(188)
+    reference = Model().eval()
+    reference.layers[0][1].train()
+    reference.layers[0][0].weight.requires_grad_(False)
+    original = copy.deepcopy(reference)
+    parameters = dict(original.named_parameters())
+    modes = {name: child.training for name, child in original.named_modules()}
+    actual = apply_ac(
+        original, mode, selective=SelectiveACConfig() if mode == "selective" else None
+    )
+    torch._dynamo.reset()
+    counters.clear()
+    try:
+        actual = apply_compile(
+            actual,
+            compile_config=CompileConfig(backend="aot_eager", per_block=per_block),
+        )
+        assert actual.training is False
+        actual_parameters = {
+            canonical_fqn(name): parameter
+            for name, parameter in actual.named_parameters()
+        }
+        assert actual_parameters.keys() == parameters.keys()
+        assert all(
+            actual_parameters[name] is value for name, value in parameters.items()
+        )
+        for name, child in actual.named_modules():
+            canonical = canonical_fqn(name)
+            if canonical in modes:
+                assert child.training == modes[canonical]
+        # Exercise the production mode/RNG guard around a real compiled eval
+        # forward, then compare the subsequent training backward below.
+        from llmtuner.config.validation_config import ValidationConfig
+        from llmtuner.trainer.runtime import validation
+
+        validation_reference = copy.deepcopy(reference).eval()
+        validation_inputs = torch.arange(12, dtype=torch.float32).reshape(3, 4) / 12
+        saved_modes = {module: module.training for module in actual.modules()}
+        rng = torch.get_rng_state().clone()
+        failure = ValueError("compiled validation failed")
+
+        def run_validation_loop(trainer, config, step):
+            assert not torch.is_grad_enabled()
+            assert all(not module.training for module in actual.modules())
+            torch.testing.assert_close(
+                actual(validation_inputs),
+                validation_reference(validation_inputs),
+                rtol=0,
+                atol=0,
+            )
+            torch.rand(7)
+            if validation_fails:
+                raise failure
+
+        monkeypatch.setattr(validation, "run_validation_loop", run_validation_loop)
+        trainer = SimpleNamespace(
+            cfg=SimpleNamespace(validation=ValidationConfig(steps=1)),
+            checkpointer=None,
+            model_parts=[actual],
+            device=torch.device("cpu"),
+        )
+        if validation_fails:
+            with pytest.raises(ValueError) as caught:
+                validation.validate(trainer, 1)
+            assert caught.value is failure
+        else:
+            validation.validate(trainer, 1)
+        assert {module: module.training for module in actual.modules()} == saved_modes
+        torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+        inputs = torch.randn(3, 4)
+        expected_input = inputs.clone().requires_grad_()
+        actual_input = inputs.clone().requires_grad_()
+        torch.manual_seed(1880)
+        expected = reference(expected_input)
+        torch.manual_seed(1880)
+        output = actual(actual_input)
+        assert counters["stats"]["unique_graphs"] > 0
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        expected.square().sum().backward()
+        output.square().sum().backward()
+        torch.testing.assert_close(
+            actual_input.grad, expected_input.grad, rtol=0, atol=0
+        )
+        for name, value in reference.named_parameters():
+            parameter = actual_parameters[name]
+            assert parameter.requires_grad is value.requires_grad
+            if value.requires_grad:
+                torch.testing.assert_close(parameter.grad, value.grad, rtol=0, atol=0)
+            else:
+                assert parameter.grad is None
+    finally:
+        torch._dynamo.reset()

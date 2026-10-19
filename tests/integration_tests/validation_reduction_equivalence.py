@@ -10,6 +10,7 @@ actual TP/FSDP model transformations.
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -109,6 +110,103 @@ def main():
             validation.create_validation_dataloader = lambda *args, loader=loader: (
                 loader
             )
+            original_train = trainer.model.frozen.train
+            for failing_rank in range(dist.get_world_size()):
+                for error_type in (ValueError, KeyboardInterrupt, SystemExit):
+                    failure = error_type("injected rank-local eval failure")
+
+                    def fail_eval(
+                        mode=True,
+                        original_train=original_train,
+                        failure=failure,
+                        failing_rank=failing_rank,
+                    ):
+                        result = original_train(mode)
+                        torch.rand(3)
+                        if dist.get_rank() == failing_rank and not mode:
+                            raise failure
+                        return result
+
+                    rng = torch.get_rng_state().clone()
+                    modes = {
+                        module: module.training for module in trainer.model.modules()
+                    }
+                    with patch.object(trainer.model.frozen, "train", fail_eval):
+                        try:
+                            trainer.validate(step=7)
+                        except error_type as error:
+                            assert dist.get_rank() == failing_rank and error is failure
+                        except RuntimeError as error:
+                            assert dist.get_rank() != failing_rank
+                            assert str(error) == (
+                                "Validation mode setup failed on another rank"
+                            )
+                        else:
+                            raise AssertionError(
+                                "Validation mode failure was not coordinated"
+                            )
+                    assert {
+                        module: module.training for module in trainer.model.modules()
+                    } == modes
+                    assert trainer.model.calls == 0 and not loader.closed and not logs
+                    torch.testing.assert_close(
+                        torch.get_rng_state(), rng, atol=0, rtol=0
+                    )
+                    # Successful communication after every owner/exception case.
+                    alive = torch.tensor(dist.get_rank() + 1)
+                    dist.all_reduce(alive)
+                    assert int(alive) == 10
+                    dist.barrier()
+            for failing_rank in range(dist.get_world_size()):
+                for error_type in (ValueError, KeyboardInterrupt, SystemExit):
+                    failed_loader = Loader(batches(mesh["dp"].get_local_rank()))
+                    original_preprocess = trainer.model.preprocess_inputs
+                    failure = error_type("injected validation preprocessing failure")
+
+                    def fail_preprocess(
+                        *args,
+                        failure=failure,
+                        original=original_preprocess,
+                        failing_rank=failing_rank,
+                        **kwargs,
+                    ):
+                        if dist.get_rank() == failing_rank:
+                            raise failure
+                        return original(*args, **kwargs)
+
+                    rng = torch.get_rng_state().clone()
+                    with (
+                        patch.object(
+                            trainer.model, "preprocess_inputs", fail_preprocess
+                        ),
+                        patch.object(
+                            validation,
+                            "create_validation_dataloader",
+                            return_value=failed_loader,
+                        ),
+                    ):
+                        try:
+                            trainer.validate(step=7)
+                        except error_type as error:
+                            assert dist.get_rank() == failing_rank and error is failure
+                        except RuntimeError as error:
+                            assert dist.get_rank() != failing_rank
+                            assert str(error) == (
+                                "Training batch preprocessing failed on another rank"
+                            )
+                        else:
+                            raise AssertionError(
+                                "Preprocessing failure was not coordinated"
+                            )
+                    assert (
+                        failed_loader.closed and trainer.model.calls == 0 and not logs
+                    )
+                    assert trainer.model.training and not trainer.model.frozen.training
+                    assert trainer.ntokens_seen == 123
+                    torch.testing.assert_close(
+                        torch.get_rng_state(), rng, atol=0, rtol=0
+                    )
+                    dist.barrier()
             trainer.validate(step=7)
             reference_sum = torch.zeros((), dtype=torch.float64)
             reference_count = 0

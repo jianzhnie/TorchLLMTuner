@@ -1186,3 +1186,47 @@ def test_fixed_router_ep1_public_assembly_runs_constant_routing():
     assert block.routed_experts.inner_experts.w1_EFD.shape == (8, 48, 64)
     actual = block(inputs)
     torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
+
+
+def test_shared_expert_local_checkpoint_registration_survives_conversion():
+    model = _model(_config(norm_topk_prob=True, aux_coeff=0.0))
+    block = model.layers[0].mlp
+    shared = torch.nn.Linear(64, 64, bias=False, dtype=torch.float64)
+    block.shared_expert = shared
+    group = object()
+    shared._tp_checkpoint_layouts = {"weight": (0, False, group)}
+    swap_hf_moe_blocks(model)
+    assert model.layers[0].mlp.shared_experts is shared
+    assert shared._tp_checkpoint_layouts == {"weight": (0, False, group)}
+
+
+def test_expert_local_checkpoint_registration_moves_to_converted_experts():
+    model = _model(_config(norm_topk_prob=True, aux_coeff=0.0))
+    original = model.layers[0].mlp.experts
+    group = object()
+    original._tp_checkpoint_layouts = {
+        "gate_up_proj": (1, True, group),
+        "down_proj": (2, False, group),
+    }
+    swap_hf_moe_blocks(model)
+    grouped = model.layers[0].mlp.routed_experts.inner_experts
+    assert grouped._tp_checkpoint_layouts == {
+        "w1_EFD": (1, False, group),
+        "w3_EFD": (1, False, group),
+        "w2_EDF": (2, False, group),
+    }
+
+
+def test_checkpoint_layout_failure_rolls_back_auxiliary_registration():
+    model = _model(_config(norm_topk_prob=True))
+    original = [layer.mlp for layer in model.layers]
+    layouts = {"gate_up_proj": (1,)}
+    original[0].experts._tp_checkpoint_layouts = layouts
+    before_counts = dict(AuxLoss._group_counts)
+    with pytest.raises(IndexError):
+        swap_hf_moe_blocks(model)
+    assert AuxLoss._group_counts == before_counts
+    assert original[0].experts._tp_checkpoint_layouts is layouts
+    for layer, block in zip(model.layers, original, strict=True):
+        assert layer.mlp is block
+        assert not getattr(layer, "moe_enabled", False)

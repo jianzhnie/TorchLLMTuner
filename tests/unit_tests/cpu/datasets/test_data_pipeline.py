@@ -1246,6 +1246,7 @@ def test_failed_packing_restore_preserves_live_token_stream(parent_position):
     ["max_num_documents_per_row", "max_context_length", "num_tokens_per_row"],
 )
 @pytest.mark.parametrize("direct_iterator", [False, True])
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
 def test_document_packing_rejects_non_positive_dimensions(
     field, value, direct_iterator
 ):
@@ -2074,10 +2075,16 @@ def test_restore_failure_preserves_error_when_iterator_close_fails():
     loader._dp_world_size = 1
     loader._rank_id = "dp_rank_0"
     loader._iterator = SimpleNamespace(set_state=set_state, close=close)
+    loader._dataset = grain.MapDataset.range(1).to_iter_dataset()
     loader._batch_layout = {}
     with pytest.raises(ValueError, match="invalid cursor") as caught:
         loader.load_state_dict(
-            {"version": 1, "dp_world_size": 1, "dp_rank_0": {}, "batch_layout": {}}
+            {
+                "version": 1,
+                "dp_world_size": 1,
+                "dp_rank_0": {"next_index": 0},
+                "batch_layout": {},
+            }
         )
     assert caught.value is original
     assert closed == [True]
@@ -2778,8 +2785,9 @@ def test_finite_concat_packing_preserves_partial_final_row(tokenizer, monkeypatc
 
 @pytest.mark.parametrize("packing", ["concat_then_split", "first_fit"])
 @pytest.mark.parametrize("max_num_documents", [None, 1])
+@pytest.mark.parametrize("context_length", [4, 16])
 def test_finite_packing_loader_preserves_all_targets(
-    tokenizer, monkeypatch, packing, max_num_documents
+    tokenizer, monkeypatch, packing, max_num_documents, context_length
 ):
     from llmtuner.datasets.packing import build
 
@@ -2791,7 +2799,7 @@ def test_finite_packing_loader_preserves_all_targets(
     context = make_context(
         tokenizer,
         num_tokens_per_batch=8,
-        max_context_length=4,
+        max_context_length=context_length,
         max_num_documents=max_num_documents,
     )
     builder = (
@@ -2805,7 +2813,7 @@ def test_finite_packing_loader_preserves_all_targets(
         dp_rank=0,
         dp_world_size=1,
         tokenizer=tokenizer,
-        max_context_length=4,
+        max_context_length=context_length,
         num_tokens_per_batch=8,
         max_num_documents=max_num_documents,
         repeat=False,
@@ -3251,3 +3259,529 @@ def test_sft_supervision_matches_explicit_token_contract(has_eos, limit):
     else:
         assert sequence.input_ids.tolist() == [1, 2, 3, 7, 8]
         assert sequence.labels.tolist() == [IGNORE_INDEX, IGNORE_INDEX, 7, 8, 9]
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_grain_cursor_preflight_rejects_payload_without_changing_live_loader(
+    tokenizer, corpus, started
+):
+    import copy
+
+    dataset = build_dataset(
+        text_dataset(corpus),
+        context=make_context(tokenizer, num_tokens_per_batch=32),
+        iteration_policy=make_policy(repeat=True),
+    )
+    loader = _loader(dataset, tokenizer)
+    reference = _loader(dataset, tokenizer)
+    try:
+        if started:
+            next(iter(loader))
+            next(iter(reference))
+        before = copy.deepcopy(loader.state_dict())
+        invalid = copy.deepcopy(before)
+        invalid[loader._rank_id] = {}
+        with pytest.raises(KeyError):
+            loader.validate_state_dict(invalid)
+        assert loader.state_dict() == before
+        loader.validate_state_dict(before)
+        assert loader.state_dict() == before
+        torch.testing.assert_close(next(iter(loader)), next(iter(reference)))
+    finally:
+        loader.close()
+        reference.close()
+
+
+def test_grain_invalid_cursor_dcp_preflight_preserves_training_state(
+    tmp_path, tokenizer, corpus
+):
+    import copy
+    import random
+    from unittest.mock import patch
+
+    from llmtuner.components.checkpointer.distributed_checkpoint import (
+        DistributedCheckpointManager,
+    )
+    from llmtuner.components.optimizer.ema import EMA
+    from llmtuner.config.checkpoint_config import CheckpointConfig
+
+    dataset = build_dataset(
+        text_dataset(corpus),
+        context=make_context(tokenizer, num_tokens_per_batch=32),
+        iteration_policy=make_policy(repeat=True),
+    )
+    loader = _loader(dataset, tokenizer)
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    ema = EMA(model_parts=[model], decay=0.9)
+    manager = DistributedCheckpointManager(
+        CheckpointConfig(enable=True, interval=1, keep_latest_k=0),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        ema=ema,
+        states={"dataloader": loader},
+        folder=str(tmp_path),
+    )
+
+    def update(step):
+        optimizer.zero_grad()
+        model(torch.full((2, 2), float(step))).square().sum().backward()
+        optimizer.step()
+        scheduler.step()
+        ema.step(step)
+        next(iter(loader))
+
+    try:
+        update(1)
+        malformed = copy.deepcopy(loader.state_dict())
+        malformed[loader._rank_id]["next_index"] = -1
+        with patch.object(loader, "state_dict", return_value=malformed):
+            assert manager.save(1)
+        update(2)
+        before = copy.deepcopy(
+            (
+                model.state_dict(),
+                optimizer.state_dict(),
+                scheduler.state_dict(),
+                ema.state_dict(),
+                loader.state_dict(),
+            )
+        )
+        python_rng = random.getstate()
+        numpy_rng = np.random.get_state()
+        torch_rng = torch.get_rng_state().clone()
+        with pytest.raises(IndexError, match="next_index"):
+            manager.load()
+        after = (
+            model.state_dict(),
+            optimizer.state_dict(),
+            scheduler.state_dict(),
+            ema.state_dict(),
+            loader.state_dict(),
+        )
+        torch.testing.assert_close(after, before, rtol=0, atol=0)
+        assert random.getstate() == python_rng
+        actual_numpy = np.random.get_state()
+        assert actual_numpy[0] == numpy_rng[0]
+        np.testing.assert_array_equal(actual_numpy[1], numpy_rng[1])
+        assert actual_numpy[2:] == numpy_rng[2:]
+        assert torch.equal(torch.get_rng_state(), torch_rng)
+        # Rejection did not close the live iterator.
+        next(iter(loader))
+    finally:
+        manager.close()
+        loader.close()
+
+
+@pytest.mark.parametrize("failure_type", [ValueError, KeyboardInterrupt])
+@pytest.mark.parametrize("phase", ["construct", "restore", "close"])
+@pytest.mark.parametrize("report_error", [None, OSError, KeyboardInterrupt, SystemExit])
+def test_grain_probe_failure_preserves_rng_payload_and_live_iterator(
+    tokenizer, corpus, phase, failure_type, report_error, monkeypatch
+):
+    import copy
+    import random
+    from types import SimpleNamespace
+
+    from llmtuner.datasets import dataloader as module
+
+    if report_error is not None:
+
+        def report(*args, **kwargs):
+            raise report_error("cursor probe cleanup logger failed")
+
+        monkeypatch.setattr(
+            module, "get_logger", lambda name: SimpleNamespace(exception=report)
+        )
+
+    dataset = build_dataset(
+        text_dataset(corpus),
+        context=make_context(tokenizer, num_tokens_per_batch=32),
+        iteration_policy=make_policy(repeat=True),
+    )
+    loader = _loader(dataset, tokenizer)
+    reference = _loader(dataset, tokenizer)
+    graph = loader._dataset
+    error = failure_type(f"probe {phase} failure")
+    closed = []
+
+    def consume_rng():
+        random.random()
+        np.random.random()
+        torch.rand(1)
+
+    class Probe:
+        def __init__(self):
+            self.iterator = iter(graph)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            pytest.fail("preflight must not fetch a batch")
+
+        def set_state(self, state):
+            consume_rng()
+            self.iterator.set_state(state)
+            state["probe_mutation"] = True
+            if phase == "restore":
+                raise error
+
+        def close(self):
+            closed.append(True)
+            self.iterator.close()
+            consume_rng()
+            if phase == "restore":
+                raise RuntimeError("secondary probe close failure")
+            if phase == "close":
+                raise error
+
+    class Graph:
+        def __iter__(self):
+            consume_rng()
+            if phase == "construct":
+                raise error
+            return Probe()
+
+    try:
+        next(iter(loader))
+        next(iter(reference))
+        before = copy.deepcopy(loader.state_dict())
+        payload = copy.deepcopy(before)
+        loader._dataset = Graph()
+        python_rng = random.getstate()
+        numpy_rng = np.random.get_state()
+        torch_rng = torch.get_rng_state().clone()
+        with pytest.raises(failure_type) as caught:
+            loader.validate_state_dict(payload)
+        assert caught.value is error
+        assert closed == ([] if phase == "construct" else [True])
+        assert payload == before
+        assert loader.state_dict() == before
+        assert random.getstate() == python_rng
+        actual_numpy = np.random.get_state()
+        assert actual_numpy[0] == numpy_rng[0]
+        np.testing.assert_array_equal(actual_numpy[1], numpy_rng[1])
+        assert actual_numpy[2:] == numpy_rng[2:]
+        assert torch.equal(torch.get_rng_state(), torch_rng)
+        torch.testing.assert_close(next(iter(loader)), next(iter(reference)))
+    finally:
+        loader.close()
+        reference.close()
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("packing", ["none", "concat", "document", "first_fit"])
+def test_grain_probe_preserves_packed_and_streaming_continuation(
+    tokenizer, corpus, streaming, packing, malformed
+):
+    import copy
+
+    def fresh():
+        source = (streaming_text_dataset if streaming else text_dataset)(corpus)
+        context = make_context(
+            tokenizer,
+            num_tokens_per_batch=32,
+            max_num_documents=2 if packing == "document" else None,
+        )
+        policy = make_policy(repeat=True)
+        if packing == "none":
+            graph = build_dataset(source, context=context, iteration_policy=policy)
+        elif packing == "first_fit":
+            graph = build_first_fit_packing(
+                source, num_packing_bins=4, context=context, iteration_policy=policy
+            )
+        else:
+            graph = build_concat_then_split_packing(
+                source,
+                context=context,
+                iteration_policy=policy,
+            )
+        return _loader(
+            graph,
+            tokenizer,
+            config_kwargs={"max_num_documents": 2 if packing == "document" else None},
+        )
+
+    source = fresh()
+    resumed = fresh()
+    try:
+        for _ in range(2):
+            next(iter(source))
+        saved = source.state_dict()
+        original = copy.deepcopy(saved)
+        if malformed:
+            invalid = copy.deepcopy(saved)
+            invalid[source._rank_id] = {}
+            expected_error = TypeError if packing == "concat" else KeyError
+            with pytest.raises(expected_error):
+                source.validate_state_dict(invalid)
+            torch.testing.assert_close(source.state_dict(), original, rtol=0, atol=0)
+            assert invalid[source._rank_id] == {}
+        source.validate_state_dict(saved)
+        torch.testing.assert_close(source.state_dict(), original, rtol=0, atol=0)
+        resumed.load_state_dict(saved)
+        for _ in range(4):
+            # Probe while live prefetch can already own buffered batches.
+            live_state = copy.deepcopy(source.state_dict())
+            source.validate_state_dict(live_state)
+            torch.testing.assert_close(source.state_dict(), live_state, rtol=0, atol=0)
+            torch.testing.assert_close(
+                next(iter(source)), next(iter(resumed)), rtol=0, atol=0
+            )
+        torch.testing.assert_close(saved, original, rtol=0, atol=0)
+    finally:
+        source.close()
+        resumed.close()
+
+
+@pytest.mark.parametrize("phase", ["state", "iterate"])
+@pytest.mark.parametrize("failure_type", [ValueError, KeyboardInterrupt, SystemExit])
+def test_streaming_cursor_closes_after_partial_initialization(phase, failure_type):
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    error = failure_type(f"source {phase} initialization failed")
+
+    class Source:
+        def state_dict(self):
+            if phase == "state":
+                raise error
+            return {}
+
+        def __iter__(self):
+            raise error
+
+    # Retain the partial object so close can be checked directly rather than
+    # relying on the timing of garbage collection or an unraisable warning.
+    cursor = HuggingFaceCursorIterator.__new__(HuggingFaceCursorIterator)
+    with pytest.raises(failure_type) as caught:
+        cursor.__init__(Source(), repeat=False, shuffle=False)
+    assert caught.value is error
+    cursor.close()
+    cursor.close()
+    with pytest.raises(ValueError, match="closed"):
+        next(cursor)
+
+
+@pytest.mark.parametrize("policy", [None, "padding", "truncation"])
+def test_corpus_identity_versions_changed_serialized_tokenizer_semantics(
+    tmp_path, corpus, monkeypatch, policy
+):
+    from llmtuner.datasets import loader_builder
+
+    tokenizer_path = tmp_path / "tokenizer"
+    write_tokenizer(str(tokenizer_path))
+    tokenizer_json = tokenizer_path / "tokenizer.json"
+    if policy is not None:
+        from tokenizers import Tokenizer
+
+        backend = Tokenizer.from_file(str(tokenizer_json))
+        if policy == "padding":
+            backend.enable_padding(length=32)
+        else:
+            backend.enable_truncation(max_length=4)
+        backend.save(str(tokenizer_json))
+    cfg = _loader_config(
+        DataloaderConfig(
+            dataset="local_jsonl",
+            dataset_path=str(corpus),
+            tokenizer_path=str(tokenizer_path),
+        )
+    )
+    identity = loader_builder.corpus_data_identity(
+        cfg, dataset="local_jsonl", repeat=True
+    )
+    dumps = loader_builder.json.dumps
+
+    def legacy_settings(settings, **kwargs):
+        settings = settings.copy()
+        settings.pop("tokenizer_encoding", None)
+        return dumps(settings, **kwargs)
+
+    # Emulate only the historical fingerprint, not historical tokenization.
+    with monkeypatch.context() as context:
+        context.setattr(loader_builder.json, "dumps", legacy_settings)
+        legacy = loader_builder.corpus_data_identity(
+            cfg, dataset="local_jsonl", repeat=True
+        )
+    assert (identity == legacy) == (policy is None)
+
+    loader = build_dataloader(cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=16)
+    reference = build_dataloader(
+        cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=16
+    )
+    try:
+        next(iter(loader))
+        next(iter(reference))
+        before = loader.state_dict()
+        saved = loader.state_dict()
+        saved["batch_layout"]["data_identity"] = legacy
+        if policy is None:
+            loader.load_state_dict(saved)
+        else:
+            with pytest.raises(ValueError, match="batch layout"):
+                loader.load_state_dict(saved)
+        assert loader.state_dict() == before
+        actual, expected = next(iter(loader)), next(iter(reference))
+        assert actual.keys() == expected.keys()
+        for name in actual:
+            if isinstance(actual[name], torch.Tensor):
+                torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+            else:
+                assert actual[name] == expected[name]
+    finally:
+        loader.close()
+        reference.close()
+
+
+@pytest.mark.parametrize("dataset", ["local_jsonl", "obelics"])
+def test_corpus_identity_versions_atomic_multimodal_markers(
+    tmp_path, corpus, monkeypatch, dataset
+):
+    from llmtuner.datasets import loader_builder
+
+    tokenizer_path = tmp_path / "tokenizer"
+    write_tokenizer(str(tokenizer_path))
+    cfg = _loader_config(
+        DataloaderConfig(
+            dataset=dataset,
+            dataset_path=str(corpus),
+            tokenizer_path=str(tokenizer_path),
+            data_identity="immutable-test-snapshot",
+        )
+    )
+    current = loader_builder.corpus_data_identity(cfg, dataset=dataset, repeat=True)
+    dumps = loader_builder.json.dumps
+
+    def legacy_settings(settings, **kwargs):
+        settings = settings.copy()
+        settings.pop("multimodal_encoding", None)
+        return dumps(settings, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(loader_builder.json, "dumps", legacy_settings)
+        legacy = loader_builder.corpus_data_identity(cfg, dataset=dataset, repeat=True)
+    assert (current == legacy) == (dataset == "local_jsonl")
+
+    def atomic_only_settings(settings, **kwargs):
+        settings = settings.copy()
+        if "multimodal_encoding" in settings:
+            settings["multimodal_encoding"] = "atomic-markers-v1"
+        return dumps(settings, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(loader_builder.json, "dumps", atomic_only_settings)
+        atomic_only = loader_builder.corpus_data_identity(
+            cfg, dataset=dataset, repeat=True
+        )
+    assert (current == atomic_only) == (dataset == "local_jsonl")
+
+
+def test_bounded_first_fit_factory_restores_and_rejects_historical_graph(
+    tmp_path, monkeypatch
+):
+    import json
+    from copy import deepcopy
+
+    from llmtuner.datasets import loader_builder
+    from tests.integration_tests.cli_checkpoint_equivalence import assert_state_equal
+
+    tokenizer_path = tmp_path / "tokenizer"
+    write_tokenizer(str(tokenizer_path))
+    corpus_path = tmp_path / "rows.jsonl"
+    corpus_path.write_text(
+        "".join(json.dumps({"text": "lorem ipsum " * 10}) + "\n" for _ in range(5))
+    )
+    cfg = _loader_config(
+        DataloaderConfig(
+            dataset="local_jsonl",
+            dataset_path=str(corpus_path),
+            tokenizer_path=str(tokenizer_path),
+            packing="first_fit",
+        )
+    )
+    cfg.training.max_seq_len = 16
+
+    def build():
+        return build_dataloader(cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=8)
+
+    loaders = []
+    try:
+        source, target = build(), build()
+        loaders.extend((source, target))
+        next(iter(source))
+        saved = deepcopy(source.state_dict())
+        target.load_state_dict(saved)
+        assert_state_equal(target.state_dict(), saved)
+        for _ in range(3):
+            assert_state_equal(next(iter(target)), next(iter(source)))
+        dumps = loader_builder.json.dumps
+
+        def legacy_settings(settings, **kwargs):
+            settings = settings.copy()
+            settings.pop("text_packing", None)
+            return dumps(settings, **kwargs)
+
+        with monkeypatch.context() as context:
+            context.setattr(loader_builder.json, "dumps", legacy_settings)
+            legacy = loader_builder.corpus_data_identity(
+                cfg, dataset="local_jsonl", repeat=True
+            )
+        assert legacy != saved["batch_layout"]["data_identity"]
+        saved["batch_layout"]["data_identity"] = legacy
+        before = deepcopy(target.state_dict())
+        with pytest.raises(ValueError, match="batch layout"):
+            target.load_state_dict(saved)
+        assert_state_equal(target.state_dict(), before)
+        assert_state_equal(next(iter(target)), next(iter(source)))
+    finally:
+        for loader in loaders:
+            loader.close()
+
+
+@pytest.mark.parametrize("failure_type", [ValueError, KeyboardInterrupt])
+@pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
+def test_grain_live_restore_preserves_error_when_cleanup_reporting_fails(
+    tokenizer, corpus, failure_type, report_error, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from llmtuner.datasets import dataloader as module
+
+    dataset = build_dataset(
+        text_dataset(corpus),
+        context=make_context(tokenizer, num_tokens_per_batch=32),
+        iteration_policy=make_policy(repeat=True),
+    )
+    loader = _loader(dataset, tokenizer)
+    live = loader._iterator
+    payload = loader.state_dict()
+    error = failure_type("live cursor restore failed")
+    closed = []
+
+    def restore(state):
+        live.set_state(state)
+        raise error
+
+    def close():
+        closed.append(True)
+        live.close()
+        raise RuntimeError("secondary live cursor close failure")
+
+    def report(*args, **kwargs):
+        raise report_error("cursor cleanup logger failed")
+
+    loader._iterator = SimpleNamespace(set_state=restore, close=close)
+    monkeypatch.setattr(
+        module, "get_logger", lambda name: SimpleNamespace(exception=report)
+    )
+    try:
+        with pytest.raises(failure_type) as caught:
+            loader.load_state_dict(payload)
+        assert caught.value is error
+        assert closed == [True]
+    finally:
+        live.close()
