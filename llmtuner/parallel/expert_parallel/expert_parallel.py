@@ -26,8 +26,7 @@ def apply_ep(
 ) -> nn.Module:
     """Swap every HF MoE block for the EP-capable llmtuner MoE.
 
-    No-op when ``cfg.ep_size == 1`` (the model is handed back untouched), so the
-    caller needs no degree check of its own.
+    EP=1 keeps the HF model unless fixed_router requests native local routing.
 
     error_group, when supplied, spans every rank sharing later stage-local
     collectives. Domino uses it for failure coordination; standalone callers
@@ -41,9 +40,13 @@ def apply_ep(
     if cfg.ep_size == 1:
         if cfg.ep_config.moe_quantile_balancing:
             compatibility.quantile_requires_ep()
-        return model
+        if not cfg.ep_config.fixed_router:
+            return model
+        # Local fixed routing needs no process group. Never use WORLD merely
+        # because this model runs within a larger DP or PP job.
+        ep_group = None
 
-    if ep_group is None or ep_group.size() != cfg.ep_size:
+    if cfg.ep_size > 1 and (ep_group is None or ep_group.size() != cfg.ep_size):
         raise ValueError(
             f"ep={cfg.ep_size} requires an EP process group of that size, got "
             f"{None if ep_group is None else ep_group.size()}. The group comes "

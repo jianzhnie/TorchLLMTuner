@@ -76,7 +76,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from llmtuner.config.parallel_config import (
-    validate_expert_dispatcher,
+    ExpertParallelConfig,
     validate_router_aux_loss_coefficient,
 )
 from llmtuner.errors import UnsupportedCombinationError
@@ -123,7 +123,7 @@ def swap_hf_moe_blocks(
             optimizer step instead of nudged by the sign rule, and
             ``load_balance_coeff`` is forced off. Requires sigmoid router
             scores and no group-limited routing.
-        fixed_router: use deterministic balanced expert selection for debug runs.
+        fixed_router: use FSDPTurbo fixed assignments and uniform debug weights.
         token_dispatcher: EP dispatch backend (``"alltoall"`` default,
             ``"torchao"`` optional-import adapter, ``"mc2"`` Ascend fusion,
             ``"domino"`` two-slice pipeline, ``"deepep"``/``"hybridep"``
@@ -158,7 +158,13 @@ def swap_hf_moe_blocks(
     # Backend gating, before any probing: ParallelConfig.__post_init__ is the
     # primary gate; this is the defensive copy for callers that reach the swap
     # directly.
-    validate_expert_dispatcher(token_dispatcher)
+    ExpertParallelConfig(
+        router_aux_loss_coef=router_aux_loss_coef,
+        moe_quantile_balancing=quantile_balancing,
+        fixed_router=fixed_router,
+        ep_token_dispatcher=token_dispatcher,
+        ep_torchao_pad_multiple=torchao_pad_multiple,
+    )
 
     hf_config = getattr(getattr(model, "model", None), "config", None)
     aux_loss_coeff = (
@@ -269,7 +275,7 @@ def swap_hf_moe_blocks(
                     token_dispatcher=token_dispatcher,
                     tp_enabled=tp_enabled,
                 )
-                moe.router._debug_force_load_balance = fixed_router
+                moe.router.fixed_router = fixed_router
                 converted_blocks[id(block)] = moe
                 replacements.append((layer, attr, moe))
                 continue
@@ -335,10 +341,9 @@ def swap_hf_moe_blocks(
                     converted_biases[id(source_bias)] = moe.expert_bias_E
                 else:
                     moe.expert_bias_E = converted_biases[id(source_bias)]
-            # The router already owns the deterministic balanced selection used by
-            # equivalence/debug runs; expose the FSDPTurbo plan flag without
-            # duplicating routing logic in each dispatcher.
-            moe.router._debug_force_load_balance = fixed_router
+            # Fixed assignment and constant scores belong to the router,
+            # shared by every dispatcher.
+            moe.router.fixed_router = fixed_router
             converted_blocks[id(block)] = moe
             replacements.append((layer, attr, moe))
     except BaseException:

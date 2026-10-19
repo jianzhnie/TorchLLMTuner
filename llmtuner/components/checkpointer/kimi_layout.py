@@ -22,6 +22,7 @@ from ...models.kimi.checkpoint import (
     convert_kimi_optimizer_state,
 )
 from ...utils.logging import get_logger
+from ...utils.module_names import canonical_fqn
 from .checkpoint_keys import (
     DATALOADER,
     EMA,
@@ -61,10 +62,11 @@ def load_changed_kimi_layout(
     with synchronize_local_errors("Kimi checkpoint source layout"):
         metadata = reader.read_metadata()
         keys = metadata.state_dict_metadata
+        names = [canonical_fqn(key, wrapper_segments=("_orig_mod",)) for key in keys]
         grouped = any(
-            ".block_sparse_moe.routed_experts.inner_experts." in key for key in keys
+            ".block_sparse_moe.routed_experts.inner_experts." in key for key in names
         )
-        individual = any(".block_sparse_moe.experts." in key for key in keys)
+        individual = any(".block_sparse_moe.experts." in key for key in names)
         if grouped and individual:
             raise ValueError(
                 "Kimi checkpoint mixes individual and grouped expert layouts"
@@ -81,11 +83,29 @@ def load_changed_kimi_layout(
         if not isinstance(paths, dict):
             raise ValueError("Kimi layout migration requires checkpoint planner paths")
         selected = {}
+        destinations = {}
         for key, entry in keys.items():
             path = paths[key]
+            # Preserve storage FQNs for DCP reads, but reconstruct the stable
+            # model/optimizer/EMA paths expected by the layout converters.
+            root = canonical_fqn(str(path[0]), wrapper_segments=("_orig_mod",))
+            if root in (OPTIMIZER, EMA) or root.startswith("model."):
+                path = tuple(
+                    canonical_fqn(segment, wrapper_segments=("_orig_mod",))
+                    if isinstance(segment, str)
+                    else segment
+                    for segment in path
+                )
             if path[0] in {OPTIMIZER, EMA} and path[0] not in states:
                 continue
             if path[0] in states or str(path[0]).startswith("model."):
+                destination = tuple(path)
+                if destination in destinations:
+                    raise ValueError(
+                        "Ambiguous compiled Kimi checkpoint keys: "
+                        f"{destinations[destination]!r} and {key!r}"
+                    )
+                destinations[destination] = key
                 selected[key] = path
                 flat[key] = (
                     torch.empty(entry.size, dtype=entry.properties.dtype, device="cpu")
