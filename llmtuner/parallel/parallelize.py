@@ -36,6 +36,7 @@ from .fully_shard_parallel.plan import (
     resolve_pipeline_fsdp_configs,
 )
 from .model_compile import apply_compile
+from .module_patterns import resolve_module_patterns
 from .pipeline_parallel.pipeline_parallel import (
     PipelineParallelSetup,
     apply_pp,
@@ -161,6 +162,15 @@ def parallelize_hf_transformers(
             raise ValueError(
                 "pp > 1 needs global_batch_size for microbatch validation; "
                 "the trainer passes cfg.training.global_batch_size."
+            )
+        if cfg.tp_size > 1:
+            resolve_module_patterns(
+                [name for name, _ in model.named_modules()],
+                patterns=[
+                    *cfg.tp_config.tp_colwise_modules,
+                    *cfg.tp_config.tp_rowwise_modules,
+                ],
+                plan_name="TP override",
             )
         # Split first; use this stage's dense mesh for all local transforms.
         stages, model_parts, has_first_stage, has_last_stage = apply_pp(

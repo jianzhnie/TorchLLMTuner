@@ -212,6 +212,12 @@ class LossParallelCrossEntropy(torch.autograd.Function):
         vocab_start, vocab_end = vocab_shard_bounds(
             global_vocab_size, tp_world_size, tp_rank
         )
+        if global_vocab_size < tp_world_size:
+            raise ValueError(
+                "LossParallelCrossEntropy does not support empty vocab shards. "
+                f"Global vocab {global_vocab_size} is smaller than the TP degree "
+                f"{tp_world_size}."
+            )
         local_vocab_size = max(0, vocab_end - vocab_start)
         if logits.shape[-1] != local_vocab_size:
             raise ValueError(
@@ -334,7 +340,11 @@ def chunked_lm_head_cross_entropy(
     vocabulary-shard contract. FSDP head resharding and gradient synchronization
     are not deferred across chunks, so each chunk can incur extra collectives.
     """
-    if num_chunks < 1:
+    if (
+        not isinstance(num_chunks, int)
+        or isinstance(num_chunks, bool)
+        or num_chunks < 1
+    ):
         raise ValueError(f"num_chunks must be >= 1, got {num_chunks}")
     if hidden_states.ndim != 2:
         raise ValueError(
