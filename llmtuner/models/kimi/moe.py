@@ -78,9 +78,16 @@ class KimiMoEGate(nn.Module):
         self.moe_router_activation_func = config.moe_router_activation_func
         self.num_expert_group = getattr(config, "num_expert_group", 1)
         self.topk_group = getattr(config, "topk_group", 1)
+        for name, value in (
+            ("num_experts", self.num_experts),
+            ("num_experts_per_token", self.top_k),
+            ("num_expert_group", self.num_expert_group),
+            ("topk_group", self.topk_group),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"Kimi {name} must be a positive integer")
         if (
-            self.num_expert_group < 1
-            or self.num_experts % self.num_expert_group
+            self.num_experts % self.num_expert_group
             or not 1 <= self.topk_group <= self.num_expert_group
         ):
             raise ValueError(
@@ -192,7 +199,12 @@ class KimiExpertMLP(nn.Module):
         self.situ = config.hidden_act == "situ"
         self.act_fn = (
             SituGLU(
-                config.activation_situ_beta or 1.0, config.activation_situ_linear_beta
+                (
+                    1.0
+                    if config.activation_situ_beta is None
+                    else config.activation_situ_beta
+                ),
+                config.activation_situ_linear_beta,
             )
             if self.situ
             else ACT2FN[config.hidden_act]
@@ -208,7 +220,11 @@ class KimiSparseMoE(nn.Module):
         super().__init__()
         self.config = config
         self.gate = KimiMoEGate(config)
-        width = config.routed_expert_hidden_size or config.hidden_size
+        width = (
+            config.hidden_size
+            if config.routed_expert_hidden_size is None
+            else config.routed_expert_hidden_size
+        )
         self.experts = nn.ModuleList(
             [
                 KimiExpertMLP(config, width, config.moe_intermediate_size)

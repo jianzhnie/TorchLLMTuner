@@ -52,6 +52,7 @@ from torch.distributed.checkpoint.state_dict_saver import (
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ...accelerator.collectives import synchronize_local_errors
+from ...datasets.contracts import require_same_dp_degree
 from ...errors import UnsupportedCombinationError
 from ...utils.garbage_collection import GarbageCollection
 from . import filesystem
@@ -548,6 +549,21 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     for category, state in preflight_states.items()
                 }
             if preflight_states:
+                loader_metadata = preflight_destination.get(DATALOADER, {})
+                if "dp_world_size" in loader_metadata:
+                    # Cursor structure depends on DP ownership. Reject degree
+                    # changes before planning rank-specific cursor destinations.
+                    degree = {
+                        DATALOADER: {"dp_world_size": loader_metadata["dp_world_size"]}
+                    }
+                    dcp.load(degree, checkpoint_id=checkpoint_id)
+                    with synchronize_local_errors(
+                        "Checkpoint dataloader preflight validation"
+                    ):
+                        require_same_dp_degree(
+                            degree[DATALOADER]["dp_world_size"],
+                            loader_metadata["dp_world_size"],
+                        )
                 preflight_planner = CheckpointLoadPlanner()
                 dcp.load(
                     preflight_destination,

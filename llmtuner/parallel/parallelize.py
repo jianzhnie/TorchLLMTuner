@@ -150,7 +150,7 @@ def parallelize_hf_transformers(
                 f"ep={cfg.ep_size} but parallel_dims has no multi-rank 'ep' axis."
             )
         ep_group = ep_mesh.get_group()
-        if cfg.ep_config.ep_token_dispatcher == "domino":
+        if cfg.ep_config.ep_token_dispatcher in ("domino", "mc2"):
             # The stage-local loss view spans DP/CP/TP, the same ranks that
             # share dense and sparse FSDP communication after expert execution.
             ep_error_group = parallel_dims.get_mesh("loss").get_group()
