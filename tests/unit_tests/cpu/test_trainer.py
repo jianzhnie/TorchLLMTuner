@@ -2253,3 +2253,253 @@ def test_trainer_retries_failed_metrics_cleanup_without_reclosing_other_resource
     trainer.close()
     assert calls == ["metrics", "data", "metrics"]
     assert trainer.metrics is None
+
+
+@pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt])
+def test_failed_trainer_construction_restores_execution_settings(monkeypatch, failure):
+    from llmtuner.trainer import trainer as module
+    from llmtuner.utils.seeding import rollback_execution_settings_on_error
+
+    # The outer failing transaction restores the test process even if an
+    # assertion fails; the inner constructor must restore the selected baseline.
+    class RestoreTestState(BaseException):
+        pass
+
+    with pytest.raises(RestoreTestState), rollback_execution_settings_on_error():
+        torch.use_deterministic_algorithms(False, warn_only=True)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        torch.utils.deterministic.fill_uninitialized_memory = True
+        torch.autograd.set_detect_anomaly(False, check_nan=True)
+        monkeypatch.setenv("PYTHONHASHSEED", "123")
+        monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+        monkeypatch.delenv("HCCL_DETERMINISTIC", raising=False)
+        monkeypatch.delenv("CLOSE_MATMUL_K_SHIFT", raising=False)
+        original = failure("assembly failed after seeding")
+
+        def assemble(self, cfg):
+            self.seed_everything(73, deterministic=True, detect_anomaly=True)
+            raise original
+
+        monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+        with pytest.raises(failure) as caught:
+            Trainer(SimpleNamespace())
+        assert caught.value is original
+        assert not torch.are_deterministic_algorithms_enabled()
+        assert torch.is_deterministic_algorithms_warn_only_enabled()
+        assert not torch.backends.cudnn.deterministic
+        assert torch.backends.cudnn.benchmark
+        assert torch.utils.deterministic.fill_uninitialized_memory
+        assert not torch.is_anomaly_enabled()
+        assert torch.is_anomaly_check_nan_enabled()
+        assert os.environ["PYTHONHASHSEED"] == "123"
+        assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":16:8"
+        assert "HCCL_DETERMINISTIC" not in os.environ
+        assert "CLOSE_MATMUL_K_SHIFT" not in os.environ
+        raise RestoreTestState
+
+
+def test_successful_trainer_construction_keeps_execution_settings(monkeypatch):
+    from llmtuner.trainer import trainer as module
+    from llmtuner.utils.seeding import rollback_execution_settings_on_error
+
+    class RestoreTestState(BaseException):
+        pass
+
+    with pytest.raises(RestoreTestState), rollback_execution_settings_on_error():
+        torch.use_deterministic_algorithms(False)
+        torch.autograd.set_detect_anomaly(False)
+
+        def assemble(self, cfg):
+            self.seed_everything(73, deterministic=True, detect_anomaly=True)
+
+        monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+        Trainer(SimpleNamespace())
+        assert torch.are_deterministic_algorithms_enabled()
+        assert torch.is_anomaly_enabled()
+        assert os.environ["PYTHONHASHSEED"] == "73"
+        raise RestoreTestState
+
+
+@pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_failed_trainer_construction_restores_host_rng(
+    monkeypatch, failure, cleanup_fails
+):
+    import random
+
+    import numpy as np
+
+    from llmtuner.trainer import trainer as module
+
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    cpu_state = torch.get_rng_state()
+    original = failure("assembly failed after random draws")
+
+    def close():
+        random.random()
+        np.random.random()
+        torch.rand(3)
+        if cleanup_fails:
+            raise RuntimeError("cleanup failed after random draws")
+
+    def assemble(self, cfg):
+        self.seed_everything(73, deterministic=False)
+        random.random()
+        np.random.random()
+        torch.rand(3)
+        self.metrics = SimpleNamespace(close=close)
+        raise original
+
+    monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+    try:
+        with pytest.raises(failure) as caught:
+            Trainer(SimpleNamespace())
+        assert caught.value is original
+        assert random.getstate() == python_state
+        current_numpy = np.random.get_state()
+        assert current_numpy[0] == numpy_state[0]
+        np.testing.assert_array_equal(current_numpy[1], numpy_state[1])
+        assert current_numpy[2:] == numpy_state[2:]
+        torch.testing.assert_close(torch.get_rng_state(), cpu_state, rtol=0, atol=0)
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(cpu_state)
+
+
+@pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt])
+def test_failed_trainer_restores_compile_policy_after_successful_compile(
+    monkeypatch, failure
+):
+    import torch._inductor.config as inductor_config
+
+    from llmtuner.config.compile_config import CompileConfig
+    from llmtuner.parallel import model_compile
+    from llmtuner.trainer import trainer as module
+
+    previous_capture = torch._dynamo.config.capture_scalar_outputs
+    previous_async = inductor_config._micro_pipeline_tp
+    original = failure("dataloader construction failed after compile")
+
+    def assemble(self, cfg):
+        self.model_parts = [
+            model_compile.apply_compile(
+                nn.Linear(2, 2),
+                compile_config=cfg.training.compile_config,
+            )
+        ]
+        assert torch._dynamo.config.capture_scalar_outputs
+        # Actual async TP registration needs hardware; inject only this flag
+        # to exercise rollback of a later assembly failure.
+        inductor_config._micro_pipeline_tp = True
+        raise original
+
+    monkeypatch.setattr(model_compile, "collect_moe_layers", lambda model: [object()])
+    monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+    try:
+        torch._dynamo.config.capture_scalar_outputs = False
+        inductor_config._micro_pipeline_tp = False
+        cfg = SimpleNamespace(
+            training=TrainingConfig(
+                compile=True, compile_config=CompileConfig(backend="eager")
+            )
+        )
+        with pytest.raises(failure) as caught:
+            Trainer(cfg)
+        assert caught.value is original
+        assert not torch._dynamo.config.capture_scalar_outputs
+        assert not inductor_config._micro_pipeline_tp
+    finally:
+        torch._dynamo.config.capture_scalar_outputs = previous_capture
+        inductor_config._micro_pipeline_tp = previous_async
+
+
+@pytest.mark.parametrize("optimizer_name", ["Adam", "AdamW"])
+def test_trainer_selected_optimizer_resumes_complete_next_update(
+    tmp_path, optimizer_name
+):
+    from copy import deepcopy
+
+    def config():
+        return LLMTunerConfig(
+            optimizer=OptimizerConfig(
+                optimizer_type=optimizer_name,
+                implementation="for-loop",
+                learning_rate=0.01,
+                weight_decay=0.1,
+            ),
+            training=TrainingConfig(
+                global_batch_size=2,
+                max_seq_len=8,
+                steps=4,
+                dump_folder=str(tmp_path),
+                checkpoint_config=CheckpointConfig(enable=True, interval=1),
+            ),
+        )
+
+    def snapshot(trainer):
+        return deepcopy(
+            {
+                "model": [part.state_dict() for part in trainer.model_parts],
+                "optimizer": trainer.optimizer.state_dict(),
+                "scheduler": trainer.lr_scheduler.state_dict(),
+                "trainer": trainer.state_dict(),
+                "loader": trainer.dataloader.state_dict(),
+            }
+        )
+
+    original = Trainer(config())
+    try:
+        assert type(original.optimizer.optimizers[0]) is getattr(
+            torch.optim, optimizer_name
+        )
+        original.step = 1
+        original.train_step(original.data_iterator())
+        before = snapshot(original)
+        assert original.checkpointer.save(1)
+        original.step = 2
+        original.train_step(original.data_iterator())
+        expected = snapshot(original)
+    finally:
+        original.close()
+    resumed = Trainer(config())
+    try:
+        assert resumed.checkpointer.load(1)
+        torch.testing.assert_close(snapshot(resumed), before, rtol=0, atol=0)
+        resumed.step = 2
+        resumed.train_step(resumed.data_iterator())
+        torch.testing.assert_close(snapshot(resumed), expected, rtol=0, atol=0)
+    finally:
+        resumed.close()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])
+def test_trainer_retains_loader_after_interrupted_iterator_cleanup(failure):
+    from llmtuner.datasets.dataloader import GrainDataLoader
+
+    trainer = Trainer.__new__(Trainer)
+    calls = []
+    error = failure("iterator cleanup interrupted")
+
+    def close_iterator():
+        calls.append("iterator")
+        if calls.count("iterator") == 1:
+            raise error
+
+    loader = GrainDataLoader.__new__(GrainDataLoader)
+    loader._iterator = SimpleNamespace(close=close_iterator)
+    trainer.dataloader = loader
+    trainer.metrics = SimpleNamespace(close=lambda: calls.append("metrics"))
+    trainer.gc_handler = SimpleNamespace(close=lambda: calls.append("gc"))
+    with pytest.raises(failure) as caught:
+        trainer.close()
+    assert caught.value is error
+    assert trainer.dataloader is loader
+    assert trainer.metrics is None
+    assert trainer.gc_handler is None
+    trainer.close()
+    trainer.close()
+    assert calls == ["metrics", "iterator", "gc", "iterator"]
+    assert trainer.dataloader is None

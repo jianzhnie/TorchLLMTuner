@@ -10,6 +10,7 @@ This covers norm reductions, not a full model's parallel layout or device kernel
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard, distribute_tensor
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 
@@ -41,6 +42,68 @@ def main():
                 atol=0,
             )
             print(f"rank={rank} axis={axis} norm={norm.item()} clipped=True")
+
+        # Each local norm is already above FP16's finite range; promoting
+        # only the scalar norm after calculation cannot recover this case.
+        reference = torch.full((2, 4), 40000.0, dtype=torch.float64)
+        expected_norm = torch.linalg.vector_norm(reference)
+        for axis in ("pp", "tp", "ep"):
+            for foreach in (False, True):
+                parameter = torch.nn.Parameter(torch.zeros(4, dtype=torch.float16))
+                parameter.grad = reference[rank].half()
+                kwargs = {f"{axis}_mesh": mesh}
+                if axis == "tp":
+                    kwargs["tp_sharded_parameters"] = [parameter]
+                elif axis == "ep":
+                    kwargs["expert_parameters"] = [parameter]
+                norm = clip_grad_norm_(
+                    [parameter],
+                    max_norm=1.0,
+                    error_if_nonfinite=True,
+                    foreach=foreach,
+                    **kwargs,
+                )
+                assert norm.dtype == torch.float32
+                torch.testing.assert_close(
+                    norm.double(), expected_norm, rtol=1e-7, atol=0
+                )
+                torch.testing.assert_close(
+                    parameter.grad.double(),
+                    reference[rank] / expected_norm,
+                    rtol=1e-3,
+                    atol=0,
+                )
+                print(
+                    f"rank={rank} axis={axis} {foreach=} local-overflow "
+                    f"norm={norm.item()} passed",
+                    flush=True,
+                )
+
+        # A real sharded DTensor must retain its placement through promotion;
+        # full_tensor materializes the global norm before local clipping.
+        for dtype in (torch.float16, torch.bfloat16):
+            full_gradient = torch.full((8,), 40000.0, dtype=dtype)
+            expected_norm = torch.linalg.vector_norm(full_gradient.double())
+            for foreach in (False, True):
+                parameter = torch.nn.Parameter(
+                    distribute_tensor(torch.zeros_like(full_gradient), mesh, [Shard(0)])
+                )
+                parameter.grad = distribute_tensor(full_gradient, mesh, [Shard(0)])
+                norm = clip_grad_norm_(
+                    [parameter], max_norm=1.0, error_if_nonfinite=True, foreach=foreach
+                )
+                assert norm.dtype == torch.float32
+                assert parameter.grad.placements == (Shard(0),)
+                torch.testing.assert_close(
+                    norm.double(), expected_norm, rtol=1e-7, atol=0
+                )
+                torch.testing.assert_close(
+                    parameter.grad.full_tensor().double(),
+                    full_gradient.double() / expected_norm,
+                    rtol=5e-3 if dtype == torch.bfloat16 else 1e-3,
+                    atol=0,
+                )
+                print(f"rank={rank} DTensor {dtype=} {foreach=} passed", flush=True)
 
         # A stage with no local gradient must still join the PP reduction.
         parameter = torch.nn.Parameter(torch.zeros(1))

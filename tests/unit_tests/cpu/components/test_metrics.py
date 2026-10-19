@@ -843,3 +843,37 @@ def test_wandb_logger_uses_owned_run_after_global_run_changes(tmp_path, monkeypa
     assert not other.sent
     with pytest.raises(RuntimeError, match="closed"):
         logger.log({"loss": 3.0}, step=2)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_wandb_logger_creates_run_without_reusing_or_finishing_previous(
+    tmp_path, monkeypatch, existing
+):
+    import sys
+    from types import SimpleNamespace
+
+    previous = _FakeWandB() if existing else None
+    created = _FakeWandB()
+    calls = []
+
+    def initialize(**kwargs):
+        calls.append(kwargs)
+        # Model the SDK's reuse policy: only create_new preserves the prior run
+        # while returning a distinct run owned by this logger.
+        if previous is not None and kwargs.get("reinit") != "create_new":
+            return previous
+        return created
+
+    monkeypatch.setitem(
+        sys.modules, "wandb", SimpleNamespace(init=initialize, run=previous)
+    )
+    logger = WandBLogger(str(tmp_path))
+    assert calls[0]["reinit"] == "create_new"
+    assert logger.run is created
+    logger.log({"loss": 1.0}, step=1)
+    logger.close()
+    assert created.finished
+    assert created.sent == [({"loss": 1.0}, 1)]
+    if previous is not None:
+        assert not previous.finished
+        assert not previous.sent

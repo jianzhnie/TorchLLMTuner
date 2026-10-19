@@ -4,13 +4,17 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=2 \
     tests/integration_tests/trainer_initialization_coordination.py
 
 CPU/Gloo only. After each failed constructor, a barrier checks that peers have
-not entered unmatched model collectives; a fresh Trainer then performs an update.
+not entered unmatched model collectives; each rank also checks host RNG and
+execution-policy rollback. A fresh Trainer then performs an update.
 """
 
+import os
+import random
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -44,6 +48,55 @@ def config():
     )
 
 
+def failed_constructor(cfg):
+    """Assert rollback independently on each rank, including the healthy peer."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    cpu_state = torch.get_rng_state()
+    policy = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.is_anomaly_enabled(),
+        torch.is_anomaly_check_nan_enabled(),
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+        torch.utils.deterministic.fill_uninitialized_memory,
+    )
+    environment = {
+        key: os.environ.get(key)
+        for key in (
+            "PYTHONHASHSEED",
+            "HCCL_DETERMINISTIC",
+            "CLOSE_MATMUL_K_SHIFT",
+            "CUBLAS_WORKSPACE_CONFIG",
+        )
+    }
+    # Enable policies that differ from the caller's baseline, through public
+    # config rather than calling seeding directly in the injected failure.
+    cfg.training.deterministic = True
+    cfg.training.detect_anomaly = True
+    try:
+        Trainer(cfg)
+    except BaseException:
+        assert random.getstate() == python_state
+        actual_numpy = np.random.get_state()
+        assert actual_numpy[0] == numpy_state[0]
+        np.testing.assert_array_equal(actual_numpy[1], numpy_state[1])
+        assert actual_numpy[2:] == numpy_state[2:]
+        torch.testing.assert_close(torch.get_rng_state(), cpu_state, rtol=0, atol=0)
+        assert policy == (
+            torch.are_deterministic_algorithms_enabled(),
+            torch.is_deterministic_algorithms_warn_only_enabled(),
+            torch.is_anomaly_enabled(),
+            torch.is_anomaly_check_nan_enabled(),
+            torch.backends.cudnn.deterministic,
+            torch.backends.cudnn.benchmark,
+            torch.utils.deterministic.fill_uninitialized_memory,
+        )
+        assert environment == {key: os.environ.get(key) for key in environment}
+        raise
+
+
 def main():
     dist.init_process_group("gloo", timeout=timedelta(seconds=30))
     try:
@@ -71,7 +124,7 @@ def main():
                 patch.object(assembly, "_apply_parallelism") as transform,
             ):
                 try:
-                    Trainer(config())
+                    failed_constructor(config())
                 except ValueError as error:
                     assert rank == failing_rank and error is failure
                 except RuntimeError as error:
@@ -102,7 +155,7 @@ def main():
             patch.object(assembly, "_build_checkpointer") as checkpointer,
         ):
             try:
-                Trainer(config())
+                failed_constructor(config())
             except ValueError as error:
                 assert rank == 0 and error is failure
             except RuntimeError as error:
@@ -316,7 +369,7 @@ def main():
 
         with patch.object(assembly, "MetricsProcessor", build_metrics):
             try:
-                Trainer(config())
+                failed_constructor(config())
             except ValueError as error:
                 assert rank == 1 and error is failure
             except RuntimeError as error:

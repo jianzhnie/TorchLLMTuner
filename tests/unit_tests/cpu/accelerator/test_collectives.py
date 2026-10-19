@@ -54,3 +54,32 @@ def test_local_error_boundary_preserves_single_rank_exception(monkeypatch, fails
     else:
         with collectives.synchronize_local_errors("Construction"):
             pass
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+def test_fp16_finite_gradients_use_fp32_norm_before_clipping(foreach):
+    parameter = torch.nn.Parameter(torch.zeros(4, dtype=torch.float16))
+    parameter.grad = torch.full_like(parameter, 40000)
+    reference = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
+    reference.grad = parameter.grad.float()
+    expected_norm = torch.nn.utils.clip_grad_norm_(reference, 1.0, foreach=foreach)
+    actual_norm = collectives.clip_grad_norm_(
+        parameter, 1.0, error_if_nonfinite=True, foreach=foreach
+    )
+    assert actual_norm.dtype == torch.float32
+    torch.testing.assert_close(actual_norm, expected_norm, rtol=0, atol=0)
+    torch.testing.assert_close(parameter.grad, reference.grad.half(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("norm_type", [1.0, 2.0, float("inf")])
+def test_mixed_precision_norm_matches_full_precision_reference(norm_type):
+    parameters = [
+        torch.nn.Parameter(torch.zeros(3, dtype=torch.float16)),
+        torch.nn.Parameter(torch.zeros(2, dtype=torch.float64)),
+    ]
+    parameters[0].grad = torch.tensor([40000.0, -40000.0, 20000.0], dtype=torch.float16)
+    parameters[1].grad = torch.tensor([3.0, -4.0], dtype=torch.float64)
+    reference = torch.cat([p.grad.double() for p in parameters])
+    expected = torch.linalg.vector_norm(reference, norm_type)
+    actual = collectives.clip_grad_norm_(parameters, 0, norm_type=norm_type)
+    torch.testing.assert_close(actual, expected, rtol=1e-7, atol=0)

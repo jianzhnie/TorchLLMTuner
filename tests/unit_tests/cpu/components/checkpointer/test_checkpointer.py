@@ -2128,3 +2128,280 @@ def test_staging_group_construction_failure_releases_upload_group(
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_torch_checkpointing_failed_thread_start_closes_backend(
+    tmp_path, monkeypatch, error_type, cleanup_fails
+):
+    from types import SimpleNamespace
+
+    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+
+    calls = []
+    original = error_type("retention thread start failed")
+
+    def close():
+        calls.append("close")
+        if cleanup_fails:
+            raise OSError("backend close failed")
+
+    backend_manager = SimpleNamespace(close=close)
+    storage = SimpleNamespace(create_storage=lambda: object())
+    manager_config = SimpleNamespace(
+        storage_config=storage, build=lambda: backend_manager
+    )
+    monkeypatch.setattr(tc, "require_torch_checkpointing", lambda: object())
+    monkeypatch.setattr(tc, "async_save_config", lambda backend: object())
+    monkeypatch.setattr(tc, "default_backend_config", lambda *a, **kw: manager_config)
+    monkeypatch.setattr(
+        tc,
+        "BackendCheckpointStorage",
+        lambda storage: SimpleNamespace(remove=lambda path: None),
+    )
+
+    def fail_start(thread):
+        raise original
+
+    monkeypatch.setattr(tc.threading.Thread, "start", fail_start)
+    # Retain the partial instance to check cleanup without relying on GC timing.
+    manager = tc.TorchCheckpointingManager.__new__(tc.TorchCheckpointingManager)
+    with pytest.raises(error_type) as caught:
+        manager.__init__(
+            Config(enable=True, keep_latest_k=2),
+            model_parts=[],
+            optimizer=None,
+            lr_scheduler=None,
+            states={},
+            folder=str(tmp_path),
+        )
+    assert caught.value is original
+    assert calls == ["close"]
+    assert not manager._initialized
+    manager.close()
+    assert calls == ["close"]
+
+
+@pytest.mark.parametrize("operation", ["load", "save"])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt, None])
+def test_temporary_backend_cleanup_preserves_operation_error(
+    tmp_path, monkeypatch, operation, error_type
+):
+    from types import SimpleNamespace
+
+    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+
+    manager, _, model_key = _hf_manager_stub(
+        tmp_path,
+        monkeypatch,
+        files={f"{tmp_path}/model.safetensors.index.json"},
+    )
+    original = error_type("checkpoint operation failed") if error_type else None
+    cleanup_error = OSError("temporary backend close failed")
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(operation)
+        if original is not None:
+            raise original
+
+    def close():
+        calls.append("close")
+        raise cleanup_error
+
+    temporary = SimpleNamespace(load=fail, save=fail, close=close)
+    monkeypatch.setattr(
+        tc,
+        "default_backend_config",
+        lambda *a, **kw: SimpleNamespace(build=lambda: temporary),
+    )
+    with pytest.raises(error_type or OSError) as caught:
+        if operation == "load":
+            manager._load_checkpoint(
+                {model_key: nn.Linear(2, 2)},
+                str(tmp_path),
+                from_hf=True,
+                from_quantized=False,
+            )
+        else:
+            manager.last_save_model_only = False
+            manager.last_save_in_hf = False
+            manager.folder = str(tmp_path)
+            manager._manager = SimpleNamespace(close=lambda: None)
+            manager._save_last_step(2)
+    assert caught.value is (original if original is not None else cleanup_error)
+    assert calls == [operation, "close"]
+
+
+@pytest.mark.parametrize("amsgrad", [False, True])
+@pytest.mark.parametrize("current_amsgrad", [False, True])
+def test_adam_dcp_resume_restores_complete_state_before_next_update(
+    tmp_path, amsgrad, current_amsgrad
+):
+    from copy import deepcopy
+
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.config.optimizer_config import OptimizerConfig, ParamGroupConfig
+
+    def runtime(seed, use_amsgrad):
+        torch.manual_seed(seed)
+        model = nn.Linear(3, 2)
+        optimizer = OptimizersContainer(
+            OptimizerConfig(
+                implementation="for-loop",
+                param_groups=[
+                    ParamGroupConfig(
+                        pattern=".*",
+                        optimizer_name="Adam",
+                        optimizer_kwargs={
+                            "lr": 0.01,
+                            "amsgrad": use_amsgrad,
+                            "weight_decay": 0.1,
+                        },
+                    )
+                ],
+            ),
+            model_parts=[model],
+        )
+        scheduler = build_lr_scheduler(
+            LRSchedulerConfig(), optimizers=optimizer.optimizers, training_steps=4
+        )
+        return model, optimizer, scheduler
+
+    def update(runtime, value):
+        model, optimizer, scheduler = runtime
+        optimizer.zero_grad(set_to_none=True)
+        loss = model(value).square().sum()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        return loss.detach()
+
+    def manager(runtime):
+        model, optimizer, scheduler = runtime
+        return DistributedCheckpointManager(
+            Config(enable=True, interval=1, keep_latest_k=0),
+            model_parts=[model],
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            states={},
+            folder=str(tmp_path),
+        )
+
+    original = runtime(41, amsgrad)
+    update(original, torch.ones(2, 3))
+    expected_optimizer = deepcopy(original[1].state_dict())
+    writer = manager(original)
+    try:
+        assert writer.save(1)
+    finally:
+        writer.close()
+    restored = runtime(987, current_amsgrad)
+    reader = manager(restored)
+    try:
+        assert reader.load(1)
+    finally:
+        reader.close()
+    torch.testing.assert_close(
+        restored[0].state_dict(), original[0].state_dict(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        restored[1].state_dict(), expected_optimizer, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        restored[2].state_dict(), original[2].state_dict(), rtol=0, atol=0
+    )
+    value = torch.full((2, 3), -0.3)
+    torch.testing.assert_close(
+        update(restored, value), update(original, value), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        restored[0].state_dict(), original[0].state_dict(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        restored[1].state_dict(), original[1].state_dict(), rtol=0, atol=0
+    )
+
+
+def test_legacy_compiled_amsgrad_destination_keeps_canonical_name(tmp_path):
+    import torch.distributed.checkpoint as dcp
+
+    from llmtuner.components.checkpointer.load_planner import CheckpointLoadPlanner
+
+    checkpoint = tmp_path / "legacy-amsgrad"
+    saved = {
+        "optimizer.state._orig_mod.weight.exp_avg_sq": torch.tensor([2.0, 3.0]),
+        "optimizer.state._orig_mod.weight.max_exp_avg_sq": torch.tensor([4.0, 5.0]),
+    }
+    saved = {key.removeprefix("optimizer."): value for key, value in saved.items()}
+    destination = {"state.weight.exp_avg_sq": torch.zeros(2)}
+    dcp.save({"optimizer": saved}, checkpoint_id=checkpoint)
+
+    class State:
+        def state_dict(self):
+            return destination
+
+        def load_state_dict(self, state):
+            loaded = dict(state)
+            destination.clear()
+            destination.update(loaded)
+
+    # Stateful callback receives newly planned tensor keys, like production's
+    # optimizer container. A plain input dict only copies back existing keys.
+    dcp.load(
+        {"optimizer": State()},
+        checkpoint_id=checkpoint,
+        planner=CheckpointLoadPlanner(),
+    )
+    assert set(destination) == {
+        "state.weight.exp_avg_sq",
+        "state.weight.max_exp_avg_sq",
+    }
+    torch.testing.assert_close(
+        destination["state.weight.max_exp_avg_sq"], torch.tensor([4.0, 5.0])
+    )
+
+
+def test_amsgrad_new_destination_rejects_ambiguous_compiled_keys(tmp_path):
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer.load_planner import CheckpointLoadPlanner
+
+    saved = {
+        "optimizer": {
+            "state.weight.exp_avg_sq": torch.ones(2),
+            "state._orig_mod.weight.exp_avg_sq": torch.ones(2),
+            "state.weight.max_exp_avg_sq": torch.ones(2),
+            "state._orig_mod.weight.max_exp_avg_sq": torch.zeros(2),
+        }
+    }
+    # Only the newly created maximum state is ambiguous; the regular moment
+    # has one key in the checkpoint and is already allocated by the destination.
+    del saved["optimizer"]["state._orig_mod.weight.exp_avg_sq"]
+    dcp.save(saved, checkpoint_id=tmp_path)
+    with pytest.raises(CheckpointException, match="Ambiguous compiled checkpoint keys"):
+        dcp.load(
+            {"optimizer": {"state.weight.exp_avg_sq": torch.zeros(2)}},
+            checkpoint_id=tmp_path,
+            planner=CheckpointLoadPlanner(),
+        )
+
+
+@pytest.mark.parametrize("saved_size,target_size", [(2, 3), (3, 2)])
+def test_checkpoint_planner_rejects_tensor_shape_mismatch_before_copy(
+    tmp_path, saved_size, target_size
+):
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer.load_planner import CheckpointLoadPlanner
+
+    dcp.save({"weight": torch.ones(saved_size)}, checkpoint_id=tmp_path)
+    target = torch.full((target_size,), -7.0)
+    with pytest.raises(CheckpointException, match="Size mismatch"):
+        dcp.load(
+            {"weight": target}, checkpoint_id=tmp_path, planner=CheckpointLoadPlanner()
+        )
+    torch.testing.assert_close(target, torch.full_like(target, -7.0), rtol=0, atol=0)

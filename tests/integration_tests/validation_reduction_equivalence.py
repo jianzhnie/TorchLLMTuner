@@ -90,6 +90,7 @@ def main():
                 ),
             )
             trainer = Trainer.__new__(Trainer)
+            trainer.checkpointer = None
             trainer.cfg = LLMTunerConfig()
             trainer.cfg.training.validation_config = ValidationConfig(steps=2)
             trainer.parallel_dims = topology

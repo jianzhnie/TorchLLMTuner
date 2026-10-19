@@ -444,3 +444,145 @@ def test_failed_adam_materialization_discards_partial_state_and_can_retry(
     assert optimizer.state[parameter]["step"].item() == 0
     optimizer.step()
     assert optimizer.state[parameter]["step"].item() == 1
+
+
+@pytest.mark.parametrize("optimizer_type", [torch.optim.Adam, torch.optim.AdamW])
+@pytest.mark.parametrize("dtype,epsilon", [(torch.float32, 0.0), (torch.float16, 1e-8)])
+def test_optimizer_materialization_avoids_zero_denominator_weight_corruption(
+    optimizer_type, dtype, epsilon
+):
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0], dtype=dtype))
+    reference = torch.nn.Parameter(parameter.detach().clone())
+    optimizer = optimizer_type([parameter], lr=0.01, eps=epsilon, weight_decay=0)
+    reference_optimizer = optimizer_type(
+        [reference], lr=0.01, eps=epsilon, weight_decay=0
+    )
+    gradient = torch.ones_like(parameter)
+    parameter.grad = gradient
+    init_optim_state(optimizer)
+    torch.testing.assert_close(parameter, reference, rtol=0, atol=0)
+    assert parameter.grad is gradient
+    assert optimizer.param_groups[0]["eps"] == epsilon
+    assert optimizer.param_groups[0]["lr"] == 0.01
+    assert optimizer.state[parameter]["step"].item() == 0
+    reference.grad = gradient.clone()
+    optimizer.step()
+    reference_optimizer.step()
+    torch.testing.assert_close(parameter, reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        optimizer.state[parameter], reference_optimizer.state[reference], rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])
+def test_optimizer_materialization_restores_epsilon_after_step_hook_failure(failure):
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.float16))
+    optimizer = torch.optim.AdamW([parameter], lr=0.01, eps=1e-8, weight_decay=0.3)
+    gradient = torch.ones_like(parameter)
+    parameter.grad = gradient
+    before = parameter.detach().clone()
+    original = failure("post allocation hook failure")
+
+    def fail(*args, **kwargs):
+        raise original
+
+    handle = optimizer.register_step_post_hook(fail)
+    try:
+        with pytest.raises(failure) as caught:
+            init_optim_state(optimizer)
+        assert caught.value is original
+        assert optimizer.param_groups[0]["weight_decay"] == 0.3
+        assert optimizer.param_groups[0]["eps"] == 1e-8
+        assert optimizer.param_groups[0]["lr"] == 0.01
+        assert parameter.grad is gradient
+        assert parameter not in optimizer.state
+        torch.testing.assert_close(parameter, before, rtol=0, atol=0)
+    finally:
+        handle.remove()
+    init_optim_state(optimizer)
+    assert optimizer.state[parameter]["step"].item() == 0
+    torch.testing.assert_close(parameter, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("optimizer_type", [torch.optim.Adam, torch.optim.AdamW])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_optimizer_materialization_ignores_weight_decay_overflow(optimizer_type, dtype):
+    parameter = torch.nn.Parameter(torch.tensor([torch.finfo(dtype).max], dtype=dtype))
+    before = parameter.detach().clone()
+    optimizer = optimizer_type([parameter], lr=0.01, weight_decay=10.0)
+    init_optim_state(optimizer)
+    torch.testing.assert_close(parameter, before, rtol=0, atol=0)
+    assert optimizer.param_groups[0]["weight_decay"] == 10.0
+    assert optimizer.state[parameter]["step"].item() == 0
+    assert torch.count_nonzero(optimizer.state[parameter]["exp_avg"]).item() == 0
+    assert torch.count_nonzero(optimizer.state[parameter]["exp_avg_sq"]).item() == 0
+
+
+@pytest.mark.parametrize(
+    "saved_amsgrad,current_amsgrad", [(True, False), (False, True)]
+)
+def test_adam_restore_uses_saved_amsgrad_state_layout(saved_amsgrad, current_amsgrad):
+    from copy import deepcopy
+
+    from llmtuner.components.optimizer.state_dict import (
+        get_flat_optim_state_dict,
+        load_flat_optim_state_dict,
+    )
+
+    source = torch.nn.Parameter(torch.ones(2))
+    target = torch.nn.Parameter(torch.ones(2))
+    original = torch.optim.AdamW(
+        [{"params": [source], "param_names": ["weight"]}], amsgrad=saved_amsgrad
+    )
+    restored = torch.optim.AdamW(
+        [{"params": [target], "param_names": ["weight"]}], amsgrad=current_amsgrad
+    )
+    source.grad = torch.tensor([0.2, -0.3])
+    original.step()
+    target.data.copy_(source.detach())
+    init_optim_state(restored)
+    load_flat_optim_state_dict(
+        restored, flat_state=deepcopy(get_flat_optim_state_dict(original))
+    )
+    assert restored.param_groups[0]["amsgrad"] is saved_amsgrad
+    assert restored.state[target].keys() == original.state[source].keys()
+    for parameter in (source, target):
+        parameter.grad = torch.tensor([-0.1, 0.4])
+    original.step()
+    restored.step()
+    torch.testing.assert_close(target, source, rtol=0, atol=0)
+    torch.testing.assert_close(
+        restored.state[target], original.state[source], rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "state_name", ["step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq"]
+)
+def test_adam_restore_rejects_nested_substitute_for_required_state(state_name):
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+
+    container = object.__new__(OptimizersContainer)
+    container.model_parts = []
+    container.optimizers = [
+        torch.optim.AdamW(
+            [{"params": [torch.nn.Parameter(torch.ones(2))], "param_names": [name]}],
+            lr=0.1,
+            amsgrad=True,
+        )
+        for name in ("first", "second")
+    ]
+    checkpoint = container.state_dict()
+    checkpoint["param_groups.first.lr"] = 0.9
+    key = f"state.second.{state_name}"
+    checkpoint[f"{key}.unexpected"] = checkpoint.pop(key)
+    original_states = [next(iter(opt.state.values())) for opt in container.optimizers]
+
+    with pytest.raises(KeyError, match=key):
+        container.load_state_dict(checkpoint)
+
+    for optimizer, original_state in zip(
+        container.optimizers, original_states, strict=True
+    ):
+        assert optimizer.param_groups[0]["lr"] == 0.1
+        assert next(iter(optimizer.state.values())) is original_state

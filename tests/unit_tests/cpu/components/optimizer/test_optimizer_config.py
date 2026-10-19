@@ -192,3 +192,19 @@ def test_scheduler_rejects_unknown_decay_type_at_configuration_time():
 def test_optimizer_rejects_unknown_implementation_during_configuration(implementation):
     with pytest.raises(ValueError, match="Unknown optimizer implementation"):
         OptimizerConfig(implementation=implementation)
+
+
+def test_cli_adam_selection_reaches_synthesized_parameter_group():
+    configs = _parser().parse_args_into_dataclasses(["--optimizer_type", "Adam"])
+    optimizer = next(cfg for cfg in configs if isinstance(cfg, OptimizerConfig))
+    assert optimizer.optimizer_type == "Adam"
+    assert optimizer.param_groups[0].optimizer_name == "Adam"
+
+
+def test_explicit_parameter_group_keeps_its_optimizer_choice():
+    from llmtuner.config.optimizer_config import ParamGroupConfig
+
+    group = ParamGroupConfig(pattern=".*", optimizer_name="AdamW")
+    config = OptimizerConfig(optimizer_type="Adam", param_groups=[group])
+    assert config.param_groups[0] is group
+    assert group.optimizer_name == "AdamW"

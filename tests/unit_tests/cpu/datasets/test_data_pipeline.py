@@ -3037,3 +3037,75 @@ def test_local_data_identity_ignores_asset_location(tmp_path, corpus):
         )
         identities.append(corpus_data_identity(cfg, dataset="local_jsonl", repeat=True))
     assert identities[0] == identities[1]
+
+
+@pytest.mark.parametrize("seed", [True, 1.5, "1", None, -(2**63) - 1, 2**64])
+@pytest.mark.parametrize("loader", [False, True])
+def test_synthetic_seed_is_validated_at_construction(seed, loader):
+    from llmtuner.datasets.synthetic import RandomTokenSource
+
+    factory = RandomTokenDataLoader if loader else RandomTokenSource
+    with pytest.raises(ValueError, match="seed must be an integer"):
+        factory(seed=seed, vocab_size=16, batch_size=2, seq_len=4)
+
+
+@pytest.mark.parametrize("seed", [-(2**63), -1, 0, 2**64 - 1])
+def test_synthetic_seed_boundaries_preserve_deterministic_resume(seed):
+    settings = dict(seed=seed, vocab_size=16, batch_size=2, seq_len=4)
+    original = RandomTokenDataLoader(**settings)
+    next(iter(original))
+    state = original.state_dict()
+    expected = next(iter(original))
+    restored = RandomTokenDataLoader(**settings)
+    restored.load_state_dict(state)
+    actual = next(iter(restored))
+    torch.testing.assert_close(actual.input_ids, expected.input_ids, rtol=0, atol=0)
+    torch.testing.assert_close(actual.labels, expected.labels, rtol=0, atol=0)
+
+
+def test_trainer_retries_real_grain_prefetch_join_after_interrupt(
+    tokenizer, monkeypatch
+):
+    from llmtuner.trainer.trainer import Trainer
+
+    sample = TextSequence(
+        input_ids=np.array([1, 2, 3], dtype=np.int64),
+        labels=np.array([2, 3, 4], dtype=np.int64),
+    )
+    loader = _loader(grain.MapDataset.source([sample]).repeat(), tokenizer)
+    trainer = Trainer.__new__(Trainer)
+    trainer.dataloader = loader
+    iterator = iter(loader)
+    try:
+        next(iterator)
+        worker = iterator._prefetch_thread
+        assert worker is not None
+        join = worker.join
+        attempts = []
+        interruption = KeyboardInterrupt("prefetch join interrupted")
+
+        def interrupted_join(*args, **kwargs):
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise interruption
+            return join(*args, **kwargs)
+
+        monkeypatch.setattr(worker, "join", interrupted_join)
+        with pytest.raises(KeyboardInterrupt) as caught:
+            trainer.close()
+        assert caught.value is interruption
+        assert trainer.dataloader is loader
+        assert iterator._prefetch_thread is worker
+        trainer.close()
+        assert trainer.dataloader is None
+        assert iterator._prefetch_thread is None
+        assert not worker.is_alive()
+        assert len(attempts) == 2
+        trainer.close()
+        assert len(attempts) == 2
+        with pytest.raises(ValueError, match="closed"):
+            next(iterator)
+    finally:
+        # Restore join before emergency cleanup even when an assertion fails.
+        monkeypatch.undo()
+        loader.close()

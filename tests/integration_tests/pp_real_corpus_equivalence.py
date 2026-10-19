@@ -289,6 +289,35 @@ def _run(root: str) -> None:
     trainer.validate(trainer.step)
     if any(not part.training for part in trainer.model_parts):
         failures.append(f"rank {rank}: validation did not restore training mode")
+    # A real schedule must unwind on every stage when only the final stage's
+    # metric sink fails. It must also restore each module's training mode/RNG.
+    saved_modes = {
+        module: module.training
+        for part in trainer.model_parts
+        for module in part.modules()
+    }
+    saved_rng = torch.get_rng_state().clone()
+    sink_error = OSError("pipeline validation sink failed")
+
+    def fail_validation_sink(*, loss, step):
+        raise sink_error
+
+    trainer.metrics.log_validation = fail_validation_sink
+    try:
+        trainer.validate(trainer.step)
+    except OSError as error:
+        assert trainer.pp_has_last_stage and error is sink_error
+    except RuntimeError as error:
+        assert not trainer.pp_has_last_stage
+        assert "Validation result reporting" in str(error)
+    else:
+        raise AssertionError("pipeline validation sink failure did not propagate")
+    finally:
+        trainer.metrics.log_validation = capture_validation
+    assert all(module.training == mode for module, mode in saved_modes.items())
+    torch.testing.assert_close(torch.get_rng_state(), saved_rng, rtol=0, atol=0)
+    dist.barrier()
+    print(f"rank={rank}: actual PP validation sink failure coordinated", flush=True)
     local_final_state = {
         name: (value.full_tensor() if isinstance(value, DTensor) else value)
         .detach()

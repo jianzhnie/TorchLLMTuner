@@ -517,3 +517,42 @@ def test_duplicate_rules_remain_invalid_across_multiple_local_parts():
         parts.append(part)
     with pytest.raises(ValueError, match="matched no parameters"):
         OptimizersContainer(_cfg(_catch_all(), _catch_all()), model_parts=parts)
+
+
+@pytest.mark.parametrize("name", ["Adam", "AdamW"])
+def test_flat_optimizer_type_controls_runtime_and_decay_update(name):
+    model = nn.Linear(2, 1, bias=False)
+    reference = nn.Linear(2, 1, bias=False)
+    reference.load_state_dict(model.state_dict())
+    cfg = OptimizerConfig(
+        optimizer_type=name,
+        implementation="for-loop",
+        learning_rate=0.01,
+        weight_decay=0.3,
+    )
+    container = OptimizersContainer(cfg, model_parts=[model])
+    expected_type = getattr(torch.optim, name)
+    assert type(container.optimizers[0]) is expected_type
+    expected = expected_type(
+        reference.parameters(),
+        lr=cfg.learning_rate,
+        weight_decay=cfg.weight_decay,
+        betas=cfg.betas,
+        eps=cfg.eps,
+        foreach=False,
+        fused=False,
+    )
+    for value in (0.2, -0.1):
+        model.weight.grad = torch.full_like(model.weight, value)
+        reference.weight.grad = torch.full_like(reference.weight, value)
+        container.step()
+        expected.step()
+        torch.testing.assert_close(model.weight, reference.weight, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("name", ["SGD", "adam", "", None, True])
+def test_flat_optimizer_type_rejects_unknown_values(name):
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="optimizer_type"):
+        OptimizerConfig(optimizer_type=name)
