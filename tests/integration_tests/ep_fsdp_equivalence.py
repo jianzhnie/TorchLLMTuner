@@ -145,6 +145,7 @@ def _full(t: torch.Tensor) -> torch.Tensor:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pattern-fsdp", action="store_true")
+    parser.add_argument("--fixed-router", action="store_true")
     parser.add_argument("--domino-expert-failure", action="store_true")
     parser.add_argument("--expert-fsdp", action="store_true")
     parser.add_argument("--shared-experts", action="store_true")
@@ -176,7 +177,9 @@ def main() -> None:
         data_parallel_shard_size=4,
         expert_parallel_size=2,
         ep_config=ExpertParallelConfig(
-            ep_token_dispatcher="domino" if args.domino_expert_failure else "alltoall"
+            fixed_router=args.fixed_router,
+            router_aux_loss_coef=0.0 if args.fixed_router else None,
+            ep_token_dispatcher="domino" if args.domino_expert_failure else "alltoall",
         ),
         fsdp_config=FSDPConfig(
             fsdp_implementation=args.fsdp_implementation,
@@ -225,6 +228,22 @@ def main() -> None:
     ref = _model(
         shared_projection=args.shared_projection, shared_experts=args.shared_experts
     )
+    if args.fixed_router:
+        from tests.integration_tests.fixed_router_ep_equivalence import (
+            explicit_reference,
+        )
+
+        for layer in ref.layers:
+            block = layer.mlp
+
+            def fixed_forward(inputs, original=block):
+                flat = inputs.reshape(-1, inputs.shape[-1])
+                output, _, _ = explicit_reference(
+                    original, flat, torch.zeros(flat.shape[0], dtype=torch.bool)
+                )
+                return output.reshape_as(inputs)
+
+            block.forward = fixed_forward
     with spmd_context(None):
         ref_losses = [
             _loss_sum(ref, ids_all[r], labels_all[r]) for r in range(ids_all.shape[0])
@@ -448,11 +467,18 @@ def main() -> None:
                 failures.append(f"rank {rank}: dense mesh ranks {dense_ranks}")
 
         ref_mlp = ref_layer.mlp
-        gate_diff = (_full(gate_w.grad) - ref_mlp.gate.weight.grad).abs().max().item()
-        if gate_diff > TOL:
-            failures.append(
-                f"rank {rank} layer {layer_idx}: router grad diff {gate_diff:.3e}"
+        if args.fixed_router:
+            assert moe.router.fixed_router
+            assert gate_w.grad is None
+            assert ref_mlp.gate.weight.grad is None
+        else:
+            gate_diff = (
+                (_full(gate_w.grad) - ref_mlp.gate.weight.grad).abs().max().item()
             )
+            if gate_diff > TOL:
+                failures.append(
+                    f"rank {rank} layer {layer_idx}: router grad diff {gate_diff:.3e}"
+                )
 
         gate_up_grad = ref_mlp.experts.gate_up_proj.grad  # (E, 2F, D)
         down_grad = ref_mlp.experts.down_proj.grad  # (E, D, F)

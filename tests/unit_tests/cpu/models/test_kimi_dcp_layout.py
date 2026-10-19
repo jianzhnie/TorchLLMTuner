@@ -33,8 +33,9 @@ class OptimizerState:
 
 
 @pytest.mark.parametrize("source_grouped", [False, True])
+@pytest.mark.parametrize("source_compiled", [False, True])
 def test_dcp_kimi_layout_restores_weights_moments_and_next_update(
-    tmp_path, source_grouped
+    tmp_path, source_grouped, source_compiled
 ):
     # Register under model so FQNs match the real HF wrapper schema.
     def build():
@@ -53,9 +54,16 @@ def test_dcp_kimi_layout_restores_weights_moments_and_next_update(
     source_optimizer.optimizer.zero_grad()
     source_ema = EMA(model_parts=[source], decay=0.5)
     source_ema.step(1)
-    state = dict(source.state_dict())
+    saved_model = torch.compile(source, backend="eager") if source_compiled else source
+    state = dict(saved_model.state_dict())
     state["optimizer"] = source_optimizer
     state["ema"] = source_ema
+    if source_compiled:
+        for category in ("optimizer", "ema"):
+            state[category] = {
+                key.replace("model.", "_orig_mod.model.", 1): value
+                for key, value in state[category].state_dict().items()
+            }
     dcp.save(state, checkpoint_id=tmp_path)
     target = build()
     if not source_grouped:
@@ -238,3 +246,72 @@ def test_legacy_cross_layout_checkpoint_without_rng_restores_model(
         atol=1e-6,
         rtol=1e-6,
     )
+
+
+@pytest.mark.parametrize("source_grouped", [False, True])
+def test_cross_layout_rng_missing_current_rank_rejected_before_model_copy(
+    tmp_path, source_grouped
+):
+    from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+
+    source = torch.nn.Module()
+    source.model = make_model(latent=True, shared=1)
+    config = source.model.layers[0].block_sparse_moe.config
+    if source_grouped:
+        swap_hf_moe_blocks(source.model)
+    rng = RNGCheckpointState(torch.device("cpu"))
+    saved = dict(source.state_dict())
+    saved["rng_state"] = {"rank_1": rng.state_dict()[rng.key]}
+    dcp.save(saved, checkpoint_id=tmp_path)
+    target = torch.nn.Module()
+    target.model = make_model(latent=True, shared=1)
+    if not source_grouped:
+        swap_hf_moe_blocks(target.model)
+    snapshot = {key: value.clone() for key, value in target.state_dict().items()}
+    rng_before = torch.get_rng_state().clone()
+    adapter = HFTransformerStateDictAdapter(
+        config, None, kimi_expert_parallel=not source_grouped
+    )
+    with pytest.raises(KeyError, match="rank_0"):
+        load_changed_kimi_layout(
+            str(tmp_path),
+            states={"model": ModelCheckpointState(target), "rng_state": rng},
+            adapter=adapter,
+        )
+    torch.testing.assert_close(torch.get_rng_state(), rng_before, atol=0, rtol=0)
+    for key, value in target.state_dict().items():
+        torch.testing.assert_close(value, snapshot[key], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("category", ["model", "optimizer", "ema"])
+def test_cross_layout_compiled_name_collision_preserves_target(tmp_path, category):
+    source = torch.nn.Module()
+    source.model = make_model(latent=True, shared=1)
+    config = source.model.layers[0].block_sparse_moe.config
+    saved = dict(source.state_dict())
+    model_key = "model.layers.0.block_sparse_moe.shared_experts.down_proj.weight"
+    if category == "model":
+        saved[f"_orig_mod.{model_key}"] = saved[model_key].clone()
+    else:
+        suffix = "exp_avg" if category == "optimizer" else "ema_params"
+        saved[category] = {
+            f"state.{model_key}.{suffix}": saved[model_key].clone(),
+            f"state._orig_mod.{model_key}.{suffix}": saved[model_key].clone(),
+        }
+    dcp.save(saved, checkpoint_id=tmp_path)
+    target = torch.nn.Module()
+    target.model = make_model(latent=True, shared=1)
+    swap_hf_moe_blocks(target.model)
+    states = {"model": ModelCheckpointState(target)}
+    if category != "model":
+        states[category] = (
+            OptimizerState(target)
+            if category == "optimizer"
+            else EMA(model_parts=[target], decay=0.5)
+        )
+    snapshot = {key: value.clone() for key, value in target.state_dict().items()}
+    adapter = HFTransformerStateDictAdapter(config, None, kimi_expert_parallel=True)
+    with pytest.raises(ValueError, match="Ambiguous compiled Kimi checkpoint keys"):
+        load_changed_kimi_layout(str(tmp_path), states=states, adapter=adapter)
+    for key, value in target.state_dict().items():
+        torch.testing.assert_close(value, snapshot[key], atol=0, rtol=0)

@@ -603,7 +603,9 @@ def test_router_rejects_nonfinite_or_nonnumeric_scale_before_gate_allocation(
         router_class(4, 8, 2, route_scale=scale)
 
 
-@pytest.mark.parametrize("field", ["route_norm", "_debug_force_load_balance"])
+@pytest.mark.parametrize(
+    "field", ["route_norm", "_debug_force_load_balance", "fixed_router"]
+)
 @pytest.mark.parametrize("value", [0, 1, "false"])
 def test_router_rejects_truthy_nonboolean_policy(field, value):
     with pytest.raises(ValueError, match=field):
@@ -642,3 +644,24 @@ def test_failed_expert_call_preserves_prior_token_counts(monkeypatch, failed_pat
     torch.testing.assert_close(
         moe.tokens_per_expert_E, prior + expected_counts, rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("route_norm", [False, True])
+@pytest.mark.parametrize("route_scale", [0.0, 3.0])
+def test_fixed_router_matches_fsdp_turbo_assignment_and_uniform_weights(
+    route_norm, route_scale
+):
+    router = TokenChoiceTopKRouter(
+        num_experts=8,
+        dim=4,
+        top_k=2,
+        fixed_router=True,
+        route_norm=route_norm,
+        route_scale=route_scale,
+    )
+    scores, ids, routing = router(torch.randn(5, 4))
+    expected = (torch.arange(5)[:, None] + torch.arange(2)[None, :]) % 8
+    torch.testing.assert_close(ids, expected, atol=0, rtol=0)
+    torch.testing.assert_close(scores, torch.full((5, 2), 0.5), atol=0, rtol=0)
+    assert not scores.requires_grad
+    torch.testing.assert_close(routing.sum(-1), torch.full((5,), 2), atol=0, rtol=0)
