@@ -16,6 +16,7 @@ from llmtuner.accelerator.capabilities import require
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.parallel import compatibility
 from llmtuner.utils.logging import get_logger
+from llmtuner.utils.seeding import preserve_rng_state
 
 from ...accelerator.collectives import all_reduce
 from ...accelerator.spmd import spmd_context
@@ -26,6 +27,7 @@ from ...datasets.contracts import (
     TrainerBatch,
 )
 from ...datasets.loader_builder import build_dataloader
+from .batch import fetch_batch
 from .pipeline import prepare_pipeline_inputs
 from .reductions import resolve_loss_reduction_meshes
 
@@ -188,6 +190,11 @@ def validate(self: Trainer, step: int) -> None:
     validation = self.cfg.validation
     assert validation is not None, "validate() is gated by should_validate"
 
+    # Validation follows save() in the training loop. Eval forward can still
+    # mutate state (for example embedding max_norm); finish the snapshot first.
+    if self.checkpointer is not None:
+        self.checkpointer.maybe_wait_for_staging()
+
     training_modes = {
         module: module.training
         for part in self.model_parts
@@ -211,36 +218,37 @@ def validate(self: Trainer, step: int) -> None:
         if (kernel := getattr(module, "_titan_flex_kernel", None)) is not None
         and hasattr(kernel, "packed")
     }
-    try:
-        if validation.dataset is not None:
-            mask_type = self.cfg.dataloader.attention_mask_type(
-                dataset=validation.dataset
-            )
-            if (
-                mask_type == "block_causal"
-                and self.cfg.parallel.cp_size > 1
-                and self.cfg.parallel.cp_config.context_parallel_strategy == "kcp"
-            ):
-                raise ValueError("KCP does not support packed document validation")
-            for config in mask_configs.values():
-                config.attn_mask_type = mask_type
-            for kernel in kernel_modes:
-                kernel.packed = mask_type == "block_causal"
-        for part in self.model_parts:
-            part.eval()
-        run_validation_loop(self, validation, step)
-    finally:
-        for kernel, packed in kernel_modes.items():
-            kernel.packed = packed
-        for key, config in mask_configs.items():
-            had_mask, original_mask = original_masks[key]
-            if not had_mask:
-                if hasattr(config, "attn_mask_type"):
-                    delattr(config, "attn_mask_type")
-            else:
-                config.attn_mask_type = original_mask
-        for module, training in training_modes.items():
-            module.training = training
+    with preserve_rng_state(self.device):
+        try:
+            if validation.dataset is not None:
+                mask_type = self.cfg.dataloader.attention_mask_type(
+                    dataset=validation.dataset
+                )
+                if (
+                    mask_type == "block_causal"
+                    and self.cfg.parallel.cp_size > 1
+                    and self.cfg.parallel.cp_config.context_parallel_strategy == "kcp"
+                ):
+                    raise ValueError("KCP does not support packed document validation")
+                for config in mask_configs.values():
+                    config.attn_mask_type = mask_type
+                for kernel in kernel_modes:
+                    kernel.packed = mask_type == "block_causal"
+            for part in self.model_parts:
+                part.eval()
+            run_validation_loop(self, validation, step)
+        finally:
+            for kernel, packed in kernel_modes.items():
+                kernel.packed = packed
+            for key, config in mask_configs.items():
+                had_mask, original_mask = original_masks[key]
+                if not had_mask:
+                    if hasattr(config, "attn_mask_type"):
+                        delattr(config, "attn_mask_type")
+                else:
+                    config.attn_mask_type = original_mask
+            for module, training in training_modes.items():
+                module.training = training
 
 
 def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) -> None:
@@ -264,7 +272,7 @@ def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) 
         data_iterator = iter(validation_dataloader)
         while validation.steps == -1 or num_steps < validation.steps:
             try:
-                batch = next(data_iterator)
+                batch = fetch_batch(data_iterator)
             except (DataloaderExhaustedError, StopIteration):
                 break
             global_valid_tokens = count_validation_batch_tokens(

@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from ...accelerator.collectives import all_reduce
+from ...accelerator.distributed import get_comm_device, get_world_size
 from ...components.loss import IGNORE_INDEX
 from ...datasets.contracts import (
     BaseDataLoader,
@@ -72,6 +74,46 @@ def data_iterator(self: Trainer) -> Iterator[Batch | TrainerBatch]:
     return iter(self.dataloader)
 
 
+def fetch_batch(
+    data_iterator: Iterator[Batch | TrainerBatch],
+) -> Batch | TrainerBatch:
+    """Fetch one host batch, coordinating exhaustion/errors before model work.
+
+    All world ranks must call this in the same order. A failed fetch takes
+    precedence over exhaustion. Model execution and a blocked loader are outside
+    this contract; original fetch exceptions remain on the rank that raised them.
+    """
+    error: Exception | None = None
+    status = 2  # ready; 1 means exhausted, 0 means a fetch/structure failure
+    try:
+        batch = next(data_iterator)
+        labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
+        labels.numel()
+    except (DataloaderExhaustedError, StopIteration) as ex:
+        error = ex
+        status = 1
+    except Exception as ex:
+        error = ex
+        status = 0
+
+    # Every model axis participates: a PP stage or sequence peer that
+    # exits alone leaves the others entering unmatched model collectives.
+    # Coordinate before yielding, also before token denominator reductions.
+    if get_world_size() > 1:
+        ready = torch.tensor(status, device=get_comm_device(), dtype=torch.int32)
+        all_reduce(ready, op="min")
+        status = int(ready.item())
+    if status == 0:
+        if error is not None and not isinstance(
+            error, DataloaderExhaustedError | StopIteration
+        ):
+            raise error
+        raise RuntimeError("Data fetch failed on another rank")
+    if status == 1:
+        raise DataloaderExhaustedError() from error
+    return batch
+
+
 def batch_generator(
     self: Trainer, data_iterable: Iterable[Batch | TrainerBatch]
 ) -> Iterator[Batch | TrainerBatch]:
@@ -79,16 +121,12 @@ def batch_generator(
 
     Throughput counts all labels, independently of the loss denominator.
     Raise DataloaderExhaustedError on exhaustion so accumulation cannot train
-    on a partial step."""
+    on a partial step. Coordinate fetch failures across all initialized ranks
+    before yielding a batch; this does not handle failures inside model execution."""
     data_iterator = iter(data_iterable)
     while True:
         data_load_start = perf_counter()
-        try:
-            batch = next(data_iterator)
-        except (DataloaderExhaustedError, StopIteration) as ex:
-            # A real loader signals exhaustion by stopping; the loop catches
-            # one type either way.
-            raise DataloaderExhaustedError() from ex
+        batch = fetch_batch(data_iterator)
         labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
         self.metrics.add_tokens(labels.numel())
         self.metrics.add_data_loading_time(perf_counter() - data_load_start)
