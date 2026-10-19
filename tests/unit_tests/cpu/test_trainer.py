@@ -125,6 +125,7 @@ def test_train_step_rejects_a_fully_masked_window_before_forward() -> None:
     """A zero denominator must fail before any model or optimizer update."""
     trainer = Trainer.__new__(Trainer)
     trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1)
+    trainer.model_parts = [nn.Linear(1, 1)]
     trainer.parallel_dims = None
     trainer.device = torch.device("cpu")
     trainer.optimizer = SimpleNamespace(zero_grad=lambda **kwargs: None)
@@ -1999,6 +2000,7 @@ def test_incomplete_accumulation_window_never_updates_parameters():
 
     trainer = Trainer.__new__(Trainer)
     trainer.cfg = SimpleNamespace(gradient_accumulation_steps=2)
+    trainer.model_parts = [nn.Linear(1, 1)]
     trainer.parallel_dims = None
     trainer.device = torch.device("cpu")
     trainer.ntokens_seen = 0
@@ -2503,3 +2505,47 @@ def test_trainer_retains_loader_after_interrupted_iterator_cleanup(failure):
     trainer.close()
     assert calls == ["metrics", "iterator", "gc", "iterator"]
     assert trainer.dataloader is None
+
+
+@pytest.mark.parametrize("quantile", [False, True])
+def test_new_train_step_discards_previous_routing_window(quantile):
+    from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
+    from llmtuner.models.common.moe.layer import MoE
+    from llmtuner.models.common.moe.routing import (
+        QuantileBalancedTopKRouter,
+        TokenChoiceTopKRouter,
+    )
+    from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
+
+    router = (
+        QuantileBalancedTopKRouter(4, 8, 2)
+        if quantile
+        else TokenChoiceTopKRouter(4, 8, 2)
+    )
+    model = MoE(
+        4,
+        RoutedExperts(GroupedExperts(8, 12, 4), LocalTokenDispatcher(4, 2)),
+        router,
+        load_balance_coeff=None if quantile else 0.01,
+    )
+    model.tokens_per_expert_E.fill_(9)
+    if quantile:
+        model.router.quantile_balancer.required_bias_histogram_EB.fill_(7)
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    before = model.expert_bias_E.clone()
+    trainer = Trainer.__new__(Trainer)
+    trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer.model_parts = [model]
+
+    def stop_after_reset():
+        assert all(parameter.grad is None for parameter in model.parameters())
+        assert not model.tokens_per_expert_E.any()
+        if quantile:
+            assert not model.router.quantile_balancer.required_bias_histogram_EB.any()
+        torch.testing.assert_close(model.expert_bias_E, before, rtol=0, atol=0)
+        raise RuntimeError("checked new window boundary")
+
+    trainer.lr_scheduler = SimpleNamespace(get_metrics=stop_after_reset)
+    with pytest.raises(RuntimeError, match="checked new window boundary"):
+        trainer.train_step(iter(()))

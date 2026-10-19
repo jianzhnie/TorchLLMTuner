@@ -432,3 +432,95 @@ def test_dual_cp_rejects_wrong_axis_degree_before_kernel_setup(monkeypatch, axis
             ),
             parallel_dims=topology,
         )
+
+
+@pytest.mark.parametrize("shape", [(4,), (1, 1, 4, 4), (2, 4), (1, 3)])
+def test_kcp_rejects_nonlocal_mask_before_runtime(monkeypatch, shape):
+    from llmtuner.parallel.context_parallel.kcp import kcp_kda_forward
+
+    def runtime():
+        pytest.fail("Invalid local mask must fail before loading kernels")
+
+    monkeypatch.setattr("llmtuner.parallel.context_parallel.kcp._kcp_runtime", runtime)
+    forward = kcp_kda_forward(lambda *args, **kwargs: None, group=None)
+    with pytest.raises(ValueError, match="attention_mask must match"):
+        forward(None, torch.ones(1, 4, 8), attention_mask=torch.ones(shape))
+
+
+def test_kcp_rejects_empty_sequence_before_runtime(monkeypatch):
+    from llmtuner.parallel.context_parallel.kcp import kcp_kda_forward
+
+    def runtime():
+        pytest.fail("Empty CP sequence must fail before loading kernels")
+
+    monkeypatch.setattr("llmtuner.parallel.context_parallel.kcp._kcp_runtime", runtime)
+    forward = kcp_kda_forward(lambda *args, **kwargs: None, group=None)
+    with pytest.raises(ValueError, match="nonempty local sequence"):
+        forward(None, torch.empty(1, 0, 8))
+
+
+@pytest.mark.parametrize("q_lora_rank", [None, 4])
+def test_kcp_checks_mla_heads_before_installation(monkeypatch, q_lora_rank):
+    from llmtuner.parallel.context_parallel import kcp
+    from tests.unit_tests.cpu.parallel.test_kimi_conversion import make_model
+
+    model = make_model(latent=True, shared=1)
+    from llmtuner.models.kimi.latent_attention import KimiLatentAttention
+
+    config = model.layers[0].block_sparse_moe.config
+    config.q_lora_rank = q_lora_rank
+    config.qk_rope_head_dim = 2
+    config.qk_nope_head_dim = 2
+    config.kv_lora_rank = 4
+    config.v_head_dim = 2
+    config.mla_use_nope = True
+    model.add_module("hybrid_attention", KimiLatentAttention(config, 0))
+
+    from types import SimpleNamespace
+
+    kda = torch.nn.Module()
+    for name in ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias"):
+        setattr(kda, name, None)
+    model.add_module("kda", kda)
+    monkeypatch.setattr(kcp, "_kcp_runtime", lambda: ())
+    group = SimpleNamespace(size=lambda: config.num_attention_heads + 1)
+    with pytest.raises(ValueError, match="heads must be divisible"):
+        kcp.apply_kcp(model, SimpleNamespace(get_group=lambda: group))
+    assert not hasattr(model.hybrid_attention, "_kcp_attention")
+
+
+def test_kcp_installs_mla_callable_without_changing_parameter_names(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.latent_attention import KimiLatentAttention
+    from llmtuner.parallel.context_parallel import kcp
+
+    config = KimiLinearConfig(
+        hidden_size=12,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        q_lora_rank=4,
+        kv_lora_rank=4,
+        qk_nope_head_dim=3,
+        qk_rope_head_dim=1,
+        v_head_dim=3,
+        mla_use_nope=True,
+    )
+    model = torch.nn.Module()
+    model.mla = KimiLatentAttention(config, 0)
+    model.kda = torch.nn.Module()
+    for name in ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias"):
+        setattr(model.kda, name, None)
+    before = dict(model.named_parameters())
+    monkeypatch.setattr(kcp, "_kcp_runtime", lambda: ())
+    first = SimpleNamespace(size=lambda: 2)
+    assert kcp.apply_kcp(model, SimpleNamespace(get_group=lambda: first)) == 1
+    original = model.mla._kcp_attention
+    assert callable(original)
+    second = SimpleNamespace(size=lambda: 2)
+    assert kcp.apply_kcp(model, SimpleNamespace(get_group=lambda: second)) == 1
+    assert model.mla._kcp_attention is not original
+    after = dict(model.named_parameters())
+    assert before.keys() == after.keys()
+    assert all(after[name] is parameter for name, parameter in before.items())

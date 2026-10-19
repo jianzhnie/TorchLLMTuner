@@ -193,3 +193,12 @@ def test_rng_checkpoint_rejects_noninteger_parallel_degree(axis, value):
         with pytest.raises(ValueError, match="parallel topology"):
             checkpoint.load_state_dict({checkpoint.key: pickle.dumps(payload)})
         assert torch.equal(torch.get_rng_state(), before)
+
+
+def test_rng_checkpoint_validation_does_not_advance_live_stream():
+    checkpoint = RNGCheckpointState(torch.device("cpu"))
+    saved = checkpoint.state_dict()
+    torch.rand(7)
+    before = torch.get_rng_state().clone()
+    checkpoint.validate_state_dict(saved)
+    assert torch.equal(torch.get_rng_state(), before)

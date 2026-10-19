@@ -75,9 +75,19 @@ Set LLMTUNER_TEST_ASYNC_MODE=async in both phases for CPU-compatible threaded
 DCP upload; the full phase closes the Trainer before inspecting the checkpoint.
 The pinned process stager requires its target-device environment.
 
+Set LLMTUNER_TEST_KIMI=1 with LLMTUNER_TEST_PP_SIZE=1 on two ranks for
+local dense Kimi KDA/custom-FSDP checkpoint recovery. This does not cover
+Kimi MoE, hybrid attention, KCP, or TP. Add LLMTUNER_TEST_EMA=dynamic
+to check the EMA state as well. LLMTUNER_TEST_KIMI_MOE=1 enables local
+E4/top2 group-limited Kimi experts and one shared expert. Add
+LLMTUNER_TEST_EP_SIZE=2 for native alltoall EP2/custom-FSDP recovery.
+LLMTUNER_TEST_KIMI_LATENT=1 adds width32 latent projections and RMSNorm.
+
 Set LLMTUNER_TEST_MOE=1 and LLMTUNER_TEST_EP_SIZE=2 on four ranks
 (LLMTUNER_TEST_WORLD_SIZE=4, LLMTUNER_TEST_PP_SIZE=1) for real qwen3_moe
-EP2/FSDP4 recovery. Add LLMTUNER_TEST_SHARED_LAYERS=1 to share Q projections
+EP2/FSDP4 recovery. Add LLMTUNER_TEST_TP_SIZE=2 for TP2/EP2 with
+custom FSDP on the same four ranks (dense DP2, sparse efsdp2).
+Add LLMTUNER_TEST_SHARED_LAYERS=1 to share Q projections
 across the two MoE layers; all phases must use the same configuration.
 
 Set LLMTUNER_TEST_SHARED_ROOT_EXPERT=1 with the MoE/EP scenario to register
@@ -121,7 +131,11 @@ from llmtuner.config import (
 )
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.optimizer_config import ParamGroupConfig
-from llmtuner.config.parallel_config import FSDPConfig, PipelineParallelConfig
+from llmtuner.config.parallel_config import (
+    ExpertParallelConfig,
+    FSDPConfig,
+    PipelineParallelConfig,
+)
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.module_names import canonical_fqn
 
@@ -195,12 +209,73 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
     data_root = os.path.join(workdir, f"data-rank-{os.environ.get('RANK', '0')}")
     schedule = os.environ.get("LLMTUNER_TEST_PP_SCHEDULE", "1F1B")
     moe = os.environ.get("LLMTUNER_TEST_MOE") == "1"
+    kimi = os.environ.get("LLMTUNER_TEST_KIMI") == "1"
+    quantile = os.environ.get("LLMTUNER_TEST_QUANTILE") == "1"
     return LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3_moe" if moe else "qwen3",
+            model_name_or_path=(
+                "deepseek_v3"
+                if quantile
+                else "kimi_linear"
+                if kimi
+                else "qwen3_moe"
+                if moe
+                else "qwen3"
+            ),
             experts_implementation="eager" if moe else "native",
             norm_backend=os.environ.get("LLMTUNER_TEST_NORM_BACKEND", "native"),
             arch_overrides={
+                "n_routed_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 48,
+                "n_shared_experts": 1,
+                "n_group": 1,
+                "topk_group": 1,
+                "first_k_dense_replace": 0,
+                "q_lora_rank": 16,
+                "kv_lora_rank": 16,
+                "qk_nope_head_dim": 8,
+                "qk_rope_head_dim": 8,
+                "v_head_dim": 16,
+            }
+            if quantile
+            else {
+                **(
+                    {"attn_res_block_size": int(os.environ["LLMTUNER_TEST_ATTN_RES"])}
+                    if "LLMTUNER_TEST_ATTN_RES" in os.environ
+                    else {}
+                ),
+                "linear_attn_config": {
+                    "kda_layers": [1, 2],
+                    "full_attn_layers": [],
+                    "head_dim": 16,
+                    "num_heads": 4,
+                    "short_conv_kernel_size": 3,
+                },
+                **(
+                    {
+                        "routed_expert_hidden_size": (
+                            32
+                            if os.environ.get("LLMTUNER_TEST_KIMI_LATENT") == "1"
+                            else None
+                        ),
+                        "latent_moe_use_norm": os.environ.get(
+                            "LLMTUNER_TEST_KIMI_LATENT"
+                        )
+                        == "1",
+                        "num_experts": 4,
+                        "num_experts_per_token": 2,
+                        "moe_intermediate_size": 48,
+                        "num_shared_experts": 1,
+                        "num_expert_group": 2,
+                        "topk_group": 1,
+                    }
+                    if os.environ.get("LLMTUNER_TEST_KIMI_MOE") == "1"
+                    else {}
+                ),
+            }
+            if kimi
+            else {
                 "num_experts": 8,
                 "num_experts_per_tok": 2,
                 "moe_intermediate_size": 48,
@@ -218,6 +293,12 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
         parallel=ParallelConfig(
             tensor_parallel_size=int(os.environ.get("LLMTUNER_TEST_TP_SIZE", "1")),
             expert_parallel_size=int(os.environ.get("LLMTUNER_TEST_EP_SIZE", "1")),
+            ep_config=ExpertParallelConfig(
+                moe_quantile_balancing=quantile,
+                ep_token_dispatcher=os.environ.get(
+                    "LLMTUNER_TEST_DISPATCHER", "alltoall"
+                ),
+            ),
             pipeline_parallel_size=int(os.environ.get("LLMTUNER_TEST_PP_SIZE", "2")),
             context_parallel_kv_allgather_size=int(
                 os.environ.get("LLMTUNER_TEST_CP_SIZE", "1")
@@ -251,6 +332,9 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
         ),
         training=TrainingConfig(
             global_batch_size=GLOBAL_BATCH,
+            gradient_accumulation_steps=int(
+                os.environ.get("LLMTUNER_TEST_ACCUMULATION", "1")
+            ),
             max_seq_len=SEQ,
             steps=TOTAL_STEPS,
             seed=SEED,
@@ -312,6 +396,19 @@ def _train_steps(trainer: Trainer, data_iterator, num_steps: int) -> list[float]
 
 
 def _assert_shared_layers(trainer: Trainer) -> None:
+    if os.environ.get("LLMTUNER_TEST_DISPATCHER") == "domino":
+        from llmtuner.parallel.expert_parallel.domino_dispatch import (
+            DominoRoutedExperts,
+        )
+
+        routed = [
+            module
+            for part in trainer.model_parts
+            for module in part.modules()
+            if isinstance(module, DominoRoutedExperts)
+        ]
+        assert routed, "requested Domino must reach the production implementation"
+        assert all(module.error_group is not None for module in routed)
     if os.environ.get("LLMTUNER_TEST_NORM_BACKEND") == "aten":
         from llmtuner.models.hf.normalization import forward_aten_rms_norm
 
@@ -363,7 +460,8 @@ def _assert_shared_layers(trainer: Trainer) -> None:
             assert isinstance(expert, DTensor)
             assert isinstance(router, DTensor)
             assert expert.device_mesh.size() == dense_degree // ep_size
-            assert router.device_mesh.size() == dense_degree
+            # Physical TP parameters carry only the dedicated DP/CP mesh.
+            assert router.device_mesh.size() == dense_degree // trainer.parallel_dims.tp
     if os.environ.get("LLMTUNER_TEST_SHARED_ROOT") == "1":
         model = trainer.model_parts[0]
         first = list(model.layers)[0]
@@ -381,7 +479,28 @@ def _assert_shared_layers(trainer: Trainer) -> None:
 
 
 def _runtime_state(trainer: Trainer) -> dict:
+    rng = {}
+    if os.environ.get("LLMTUNER_TEST_RNG_STATE") == "1":
+        import pickle
+
+        from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+
+        snapshot = RNGCheckpointState(trainer.device, topology=trainer.parallel_dims)
+        rng = pickle.loads(snapshot.state_dict()[snapshot.key])
+        # NumPy arrays need tensor comparison rather than ambiguous array ==.
+        numpy_state = rng["numpy"]
+        rng["numpy"] = (
+            numpy_state[0],
+            torch.from_numpy(numpy_state[1].copy()),
+            *numpy_state[2:],
+        )
     return {
+        **({"rng": rng} if rng else {}),
+        **(
+            {"dataloader": trainer.dataloader.state_dict()}
+            if os.environ.get("LLMTUNER_TEST_LOADER_STATE") == "1"
+            else {}
+        ),
         "model": {
             canonical_fqn(key): value.detach().cpu().clone()
             for part in trainer.model_parts
@@ -481,7 +600,126 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
     )
     failures: list[str] = []
 
+    if os.environ.get("LLMTUNER_TEST_FAILED_UPDATE") == "1":
+        assert trainer.checkpointer.load(-1)
+        data_iterator = trainer.data_iterator()
+        trainer.step += 1
+        committed = False
+        original_step = trainer.optimizer.step
+
+        def fail_after_update(*args, **kwargs):
+            nonlocal committed
+            original_step(*args, **kwargs)
+            committed = True
+            raise RuntimeError("injected failure after optimizer commit")
+
+        with patch.object(trainer.optimizer, "step", fail_after_update):
+            try:
+                trainer.train_step(data_iterator)
+            except RuntimeError as error:
+                assert str(error) == "injected failure after optimizer commit"
+            else:
+                raise AssertionError("injected optimizer failure was not raised")
+        assert committed, "fault must occur after a real parameter update"
+        trainer.close()
+        dist.barrier()
+        # Discard the mutated runtime; normal checkpoint load must recover
+        # weights, moments, data position, counters, EMA and random streams.
+        trainer = Trainer(_cfg(workdir, packed=packed))
+        print(f"rank {trainer.rank}: discarded failed runtime after optimizer commit")
+
+    if os.environ.get("LLMTUNER_TEST_FAILED_EXPERT") == "1":
+        from llmtuner.parallel.expert_parallel.domino_dispatch import (
+            DominoRoutedExperts,
+        )
+
+        assert trainer.checkpointer.load(-1)
+        routed = next(
+            module
+            for part in trainer.model_parts
+            for module in part.modules()
+            if isinstance(module, DominoRoutedExperts)
+        )
+        original_run = routed._run_experts
+        original_linear = torch.nn.functional.linear
+        injected = False
+        expert_calls = 0
+        fail_call = int(os.environ.get("LLMTUNER_TEST_FAILED_EXPERT_CALL", "1"))
+        assert fail_call >= 1
+
+        def fail_linear(*args, **kwargs):
+            nonlocal injected
+            if trainer.rank == 0 and not injected and expert_calls == fail_call:
+                injected = True
+                raise ValueError("injected Trainer local expert failure")
+            return original_linear(*args, **kwargs)
+
+        def run_with_fault(*args, **kwargs):
+            nonlocal expert_calls
+            expert_calls += 1
+            if fail_call > 2 and expert_calls == fail_call:
+                assert any(
+                    parameter.grad is not None
+                    for part in trainer.model_parts
+                    for parameter in part.parameters()
+                ), "failure must follow an accumulated backward"
+            assert kwargs["coordinate_experts"]
+            with patch("torch.nn.functional.linear", fail_linear):
+                return original_run(*args, **kwargs)
+
+        trainer.step += 1
+        with patch.object(routed, "_run_experts", run_with_fault):
+            try:
+                trainer.train_step(trainer.data_iterator())
+            except (ValueError, RuntimeError) as error:
+                if trainer.rank == 0:
+                    assert isinstance(error, ValueError)
+                    assert "injected Trainer local expert failure" in str(error)
+                else:
+                    assert "Domino expert computation failed on another rank" in str(
+                        error
+                    )
+            else:
+                raise AssertionError("single-rank expert failure was not propagated")
+        trainer.close()
+        dist.barrier()
+        trainer = Trainer(_cfg(workdir, packed=packed))
+        print(
+            f"rank {trainer.rank}: discarded runtime after single-rank expert failure"
+        )
+
     loaded = trainer.checkpointer.load(-1)
+    if os.environ.get("LLMTUNER_TEST_EMPTY_SCRATCH") == "1":
+        from llmtuner.models.common.aux_loss import AuxLoss
+        from llmtuner.models.common.moe.layer import MoE
+        from llmtuner.models.common.moe.routing import QuantileBalancedTopKRouter
+
+        moe_count = aux_count = quantile_count = 0
+        for part in trainer.model_parts:
+            for module in part.modules():
+                if isinstance(module, MoE):
+                    moe_count += 1
+                    assert not module.tokens_per_expert_E.any()
+                    if isinstance(module.router, QuantileBalancedTopKRouter):
+                        quantile_count += 1
+                        histogram = (
+                            module.router.quantile_balancer.required_bias_histogram_EB
+                        )
+                        assert not histogram.any()
+                if isinstance(module, AuxLoss):
+                    aux_count += 1
+                    assert not module.instance_acc.any()
+                    assert module._step_metric is None
+                    assert module._runtime_denominator is None
+        assert moe_count > 0
+        if os.environ.get("LLMTUNER_TEST_QUANTILE") == "1":
+            assert quantile_count == moe_count
+        else:
+            assert aux_count > 0, "scratch checks must reach real aux losses"
+        print(
+            f"rank {trainer.rank}: restored scratch empty "
+            f"(moe={moe_count}, aux={aux_count})"
+        )
     _assert_shared_layers(trainer)
     if not loaded:
         failures.append(f"rank {trainer.rank}: no checkpoint was loaded")
