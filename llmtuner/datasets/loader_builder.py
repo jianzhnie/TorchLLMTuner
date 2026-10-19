@@ -69,6 +69,25 @@ def corpus_data_identity(config: LLMTunerConfig, *, dataset: str, repeat: bool) 
         "repeat": repeat,
         "data": data_settings,
     }
+    if dataset not in {"local_jsonl", "local_jsonl_sft"} and dataset not in DATASETS:
+        # Registering previously unregistered visual markers changes packed
+        # samples with unchanged assets. Old media cursors cannot be reused.
+        settings["multimodal_encoding"] = "atomic-markers-bounded-packing-v2"
+    elif config.dataloader.packing == "first_fit":
+        # Chunk boundaries now respect row capacity as well as context length.
+        # Grain's pending chunk offsets from the old graph are not portable.
+        settings["text_packing"] = "bounded-first-fit-v1"
+    tokenizer_json = Path(config.dataloader.tokenizer_path) / "tokenizer.json"
+    if tokenizer_json.is_file():
+        with tokenizer_json.open(encoding="utf-8") as handle:
+            tokenizer_settings = json.load(handle)
+        if any(
+            tokenizer_settings.get(name) is not None
+            for name in ("padding", "truncation")
+        ):
+            # Older loaders inherited saved batch policies. Their cursor can
+            # describe a different packed token stream even with identical files.
+            settings["tokenizer_encoding"] = "unrestricted-samples-v1"
     digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode())
     local_text = dataset in {"local_jsonl", "local_jsonl_sft"}
     if not local_text and config.dataloader.data_identity is None:

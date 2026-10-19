@@ -45,8 +45,11 @@ def build_multimodal_packing(
         context=context,
         iteration_policy=iteration_policy,
     )
+    # Media spans cannot be split without rebuilding their patch alignment.
+    # Whole documents must fit both the context window and a packed row.
+    max_document_length = min(context.max_context_length, context.num_tokens_per_batch)
     dataset_graph = dataset_graph.filter(
-        lambda sample: len(sample["input_ids"]) <= context.max_context_length
+        lambda sample: len(sample["input_ids"]) <= max_document_length
     )
     dataset_graph = dataset_graph.map(multimodal_sample_to_packing_input)
     dataset_graph = as_iter_dataset(dataset_graph, context=context)

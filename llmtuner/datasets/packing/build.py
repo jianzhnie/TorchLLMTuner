@@ -115,7 +115,9 @@ def build_first_fit_packing(
     dataset_graph = grain.experimental.FlatMapIterDataset(
         dataset_graph,
         SplitTextSequenceDocuments(
-            max_context_length=context.max_context_length,
+            max_context_length=min(
+                context.max_context_length, context.num_tokens_per_batch
+            ),
         ),
     )
     dataset_graph = dataset_graph.map(

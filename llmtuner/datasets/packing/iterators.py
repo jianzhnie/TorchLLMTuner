@@ -57,10 +57,12 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
         max_context_length: int,
         num_tokens_per_row: int,
     ) -> None:
+        # Grain's destructor calls close even when construction fails. Set up
+        # its lifecycle before validation can raise.
+        super().__init__(parent)
         require_positive_integer("max_num_documents_per_row", max_num_documents_per_row)
         require_positive_integer("max_context_length", max_context_length)
         require_positive_integer("num_tokens_per_row", num_tokens_per_row)
-        super().__init__(parent)
         self._max_num_documents_per_row = max_num_documents_per_row
         self._max_context_length = max_context_length
         self._num_tokens_per_row = num_tokens_per_row

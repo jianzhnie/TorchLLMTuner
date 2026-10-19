@@ -363,7 +363,9 @@ class HuggingFaceCursorIterator(grain.DatasetIterator):
         if self._closed:
             return
         try:
-            close = getattr(self._iterator, "close", None)
+            # Construction may fail before the source iterator is assigned.
+            iterator = getattr(self, "_iterator", None)
+            close = getattr(iterator, "close", None)
             if close is not None:
                 close()
         finally:
