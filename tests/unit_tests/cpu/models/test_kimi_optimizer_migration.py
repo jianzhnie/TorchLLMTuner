@@ -100,3 +100,21 @@ def test_optimizer_migration_rejects_incomplete_expert_moments():
             num_experts=2,
             to_hf=False,
         )
+
+
+@pytest.mark.parametrize("category", ["state", "param_groups"])
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_kimi_optimizer_rejects_duplicate_numeric_expert_indices(
+    category, reverse_order
+):
+    prefix = f"{category}.model.layers.0.block_sparse_moe.experts."
+    field = "exp_avg" if category == "state" else "lr"
+    entries = [
+        (prefix + f"0.w1.weight.{field}", torch.ones(2, 3)),
+        (prefix + f"00.w1.weight.{field}", torch.zeros(2, 3)),
+        (prefix + f"1.w1.weight.{field}", torch.ones(2, 3)),
+    ]
+    if reverse_order:
+        entries.reverse()
+    with pytest.raises(ValueError, match="duplicate expert index"):
+        convert_kimi_optimizer_state(dict(entries), num_experts=2, to_hf=False)
