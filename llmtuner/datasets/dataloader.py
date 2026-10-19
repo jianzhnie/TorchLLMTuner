@@ -52,6 +52,7 @@ class GrainDataLoader(BaseDataLoader):
         read_options: grain.ReadOptions | None = None,
         num_prefetch_batches: int = 2,
         max_num_documents: int | None = None,
+        data_identity: str | None = None,
     ) -> None:
         """Batch an already composed graph without changing its data ownership.
 
@@ -60,8 +61,15 @@ class GrainDataLoader(BaseDataLoader):
         Runtime context configures the collator and map-to-iterator reads;
         max_num_documents also belongs to the checkpoint's batch-layout identity.
         Prefetch depth must be a positive integer, matching DataloaderConfig.
+        ``data_identity`` is an optional stable fingerprint supplied by the
+        graph owner. When set, restoration requires the same saved identity;
+        a checkpoint without it is rejected rather than assumed equivalent.
         """
         validate_dp_coordinates(dp_rank=dp_rank, dp_world_size=dp_world_size)
+        if data_identity is not None and (
+            not isinstance(data_identity, str) or not data_identity.strip()
+        ):
+            raise ValueError("data_identity must be a nonempty string or None")
         require_positive_integer("num_prefetch_batches", num_prefetch_batches)
         validate_loader_iteration(repeat=repeat, dp_world_size=dp_world_size)
         if read_options is None:
@@ -92,6 +100,10 @@ class GrainDataLoader(BaseDataLoader):
             "num_rows_per_batch": num_rows_per_batch,
             "max_num_documents": max_num_documents,
         }
+        # The graph's owner supplies identity: a loader cannot infer source
+        # contents, tokenizer behavior or recipe semantics from a Grain graph.
+        if data_identity is not None:
+            self._batch_layout["data_identity"] = data_identity
 
         # TODO(data-multiprocessing): CPU-heavy processing should use multiple
         # processes rather than only threads. Grain can divide map-style data among
@@ -126,6 +138,8 @@ class GrainDataLoader(BaseDataLoader):
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if not isinstance(state_dict, dict):
+            raise ValueError("GrainDataLoader checkpoint state must be a dictionary")
         if not state_dict:
             return
         version = state_dict.get("version")
