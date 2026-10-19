@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import torch
 
+from llmtuner.accelerator.collectives import synchronize_local_errors
 from llmtuner.errors import EnvironmentUnsupportedError
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
 from llmtuner.parallel.expert_parallel.mc2_ops import (
@@ -67,6 +68,7 @@ class MC2RoutedExperts(RoutedExperts):
                 "MC2 requires an all-to-all EP dispatcher"
             )
         super().__init__(grouped_experts, dispatcher)
+        self.error_group: torch.distributed.ProcessGroup | None = None
 
     def forward(
         self,
@@ -78,13 +80,36 @@ class MC2RoutedExperts(RoutedExperts):
         dispatcher = self.token_dispatcher
         if dispatcher.ep_group is None:
             raise EnvironmentUnsupportedError("MC2 requires an EP process group")
+        # Local input failures must be agreed before peers exchange counts or
+        # enter a fused collective. Expert/FSDP calls remain outside this region.
+        with synchronize_local_errors(
+            "MC2 input preparation",
+            group=self.error_group
+            if self.error_group is not None
+            else dispatcher.ep_group,
+        ):
+            if inputs.dtype not in (torch.float16, torch.bfloat16):
+                raise EnvironmentUnsupportedError(
+                    "MC2 requires float16 or bfloat16 inputs"
+                )
+            routed, indices, sorted_scores = dispatcher._local_reorder(
+                inputs, scores, expert_ids
+            )
+            if expert_ids.dtype != torch.int64:
+                raise ValueError("Expert IDs must have dtype torch.int64")
+            if expert_ids.numel() and (
+                (expert_ids < 0).any() or (expert_ids >= dispatcher.num_experts).any()
+            ):
+                raise ValueError("Expert IDs must be in [0, num_experts)")
+            if counts.shape != (dispatcher.num_experts,) or counts.dtype != torch.int64:
+                raise ValueError("MC2 counts must be int64 with shape (num_experts,)")
+            expected_counts = torch.bincount(
+                expert_ids.reshape(-1), minlength=dispatcher.num_experts
+            )
+            if not torch.equal(counts, expected_counts):
+                raise ValueError("MC2 counts must match the expert ID histogram")
         ops, comm_name, world_size = mc2_communication_context(
             dispatcher.ep_group, inputs.device
-        )
-        if inputs.dtype not in (torch.float16, torch.bfloat16):
-            raise EnvironmentUnsupportedError("MC2 requires float16 or bfloat16 inputs")
-        routed, indices, sorted_scores = dispatcher._local_reorder(
-            inputs, scores, expert_ids
         )
         prepared = dispatcher.prepare_dispatch_counts(counts.unsqueeze(0))[0]
         send_counts = counts.cpu().tolist()

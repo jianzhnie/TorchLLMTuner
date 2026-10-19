@@ -312,26 +312,27 @@ class DominoRoutedExperts(RoutedExperts):
             comm_stream = torch.cuda.Stream(device=device)
             self._comm_streams[device] = comm_stream
 
-        first = dispatcher.begin_dispatch(
-            *slices[0], prepared_counts=prepared_counts[0]
-        )
-        input0, counts0, metadata0 = dispatcher.finish_dispatch(first)
-
-        # Wait for slice/count producers, then launch slice 1 on the comm stream.
-        # This wait is queued before expert0, so it cannot serialize expert0
-        # behind slice 1 communication.
-        comm_stream.wait_stream(compute_stream)
-        for tensor in (*slices[1], prepared_counts[1].counts):
-            tensor.record_stream(comm_stream)
-        with torch.cuda.stream(comm_stream):
-            second = dispatcher.begin_dispatch(
-                *slices[1], prepared_counts=prepared_counts[1]
-            )
-            input1, counts1, metadata1 = dispatcher.finish_dispatch(second)
-            ready = comm_stream.record_event()
-
+        first = second = None
         output0 = output1 = None
         try:
+            first = dispatcher.begin_dispatch(
+                *slices[0], prepared_counts=prepared_counts[0]
+            )
+            input0, counts0, metadata0 = dispatcher.finish_dispatch(first)
+
+            # Wait for slice/count producers, then launch slice 1 on the comm stream.
+            # This wait is queued before expert0, so it cannot serialize expert0
+            # behind slice 1 communication.
+            comm_stream.wait_stream(compute_stream)
+            for tensor in (*slices[1], prepared_counts[1].counts):
+                tensor.record_stream(comm_stream)
+            with torch.cuda.stream(comm_stream):
+                second = dispatcher.begin_dispatch(
+                    *slices[1], prepared_counts=prepared_counts[1]
+                )
+                input1, counts1, metadata1 = dispatcher.finish_dispatch(second)
+                ready = comm_stream.record_event()
+
             expert_output0 = self._run_experts(
                 input0, counts0, dispatcher, coordinate_experts=coordinate_experts
             )
@@ -369,13 +370,14 @@ class DominoRoutedExperts(RoutedExperts):
             # Consume already enqueued dispatch/combine results on their stream.
             # No replacement collective is launched on the failing path.
             cleanup_error = None
+            comm_stream.wait_stream(compute_stream)
             with torch.cuda.stream(comm_stream):
-                for tensor in (
-                    first.routed_input,
-                    second.routed_input,
-                    output0,
-                    output1,
-                ):
+                pending_tensors = [
+                    exchange.routed_input
+                    for exchange in (first, second)
+                    if exchange is not None
+                ]
+                for tensor in (*pending_tensors, output0, output1):
                     if tensor is None:
                         continue
                     try:

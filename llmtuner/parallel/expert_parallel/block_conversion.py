@@ -21,6 +21,7 @@ from ...models.common.moe.routing import (
     TokenChoiceTopKRouter,
 )
 from .. import compatibility
+from ..tensor_parallel.linear_ops import all_gather_along, reduce_scatter_along
 from .checkpointing import mark_experts_ep_sharded
 from .hf_inspection import (
     fused_experts_of,
@@ -35,8 +36,30 @@ from .hf_inspection import (
 from .token_dispatch import (
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
+    materialize,
 )
 from .torchao_dispatch import TorchAOTokenDispatcher
+
+
+class FeatureParallelMoE(MoE):
+    """Keep feature-sharded experts between TP sequence collectives.
+
+    Routing sees the gathered token order on every rank. The staged mask stays
+    local so activation checkpoint replay gathers the same microbatch again.
+    """
+
+    def forward(
+        self, x: torch.Tensor, *, padding_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        mask = self._pending_padding_mask if padding_mask is None else padding_mask
+        gathered = all_gather_along(x, -2, self._tp_seq_group)
+        if mask is not None:
+            mask = mask.reshape(x.shape[:-1])
+            # Checkpoint replay may stop before routing consumes this metadata.
+            # Drain its gather now so early-stop cannot abandon an async work.
+            mask = materialize(all_gather_along(mask, -1, self._tp_seq_group))
+        output = super().forward(gathered, padding_mask=mask)
+        return reduce_scatter_along(output, -2, self._tp_seq_group)
 
 
 def restore_fp32_state_buffers(module: nn.Module) -> None:
@@ -82,7 +105,12 @@ def convert_block(
     _, shared = resolve_shared_expert(block)
     if shared is not None and hasattr(block, "shared_expert_gate"):
         compatibility.shared_expert_gate(block)
-    if shared is not None and tp_enabled:
+    feature_parallel = bool(getattr(block, "_tp_moe_boundary", False))
+    if (
+        shared is not None
+        and tp_enabled
+        and not (feature_parallel and ep_group is None)
+    ):
         compatibility.shared_expert_tp_ep(block)
     experts = fused_experts_of(block)
     assert experts is not None  # the probe established this
@@ -115,7 +143,14 @@ def convert_block(
         "route_norm": read_route_norm(block, router_gate),
         "route_scale": read_route_scale(block, router_gate),
         "aux_loss": (
-            MicrobatchWiseLoadBalanceLoss(coeff=aux_loss_coeff)
+            MicrobatchWiseLoadBalanceLoss(
+                coeff=aux_loss_coeff,
+                token_replication_size=(
+                    block._tp_seq_group.size()
+                    if getattr(block, "_tp_moe_boundary", False)
+                    else 1
+                ),
+            )
             if aux_loss_coeff
             else None
         ),
@@ -166,7 +201,8 @@ def convert_block(
         from .mc2_dispatch import MC2RoutedExperts
 
         routed_experts_cls = MC2RoutedExperts
-    moe = MoE(
+    moe_cls = FeatureParallelMoE if feature_parallel else MoE
+    moe = moe_cls(
         num_experts=num_experts,
         routed_experts=routed_experts_cls(grouped, dispatcher),
         router=router,
@@ -203,4 +239,16 @@ def convert_block(
     # Reuse the HF shared expert after initializing the new subtree. Casting
     # or setting the mode recursively must not mutate this original module.
     moe.shared_experts = shared
+    if feature_parallel:
+        moe._tp_seq_group = block._tp_seq_group
+        moe._tp_moe_boundary = True
+        moe.tp_sharded_param_names = {
+            f"routed_experts.inner_experts.{name}"
+            for name in ("w1_EFD", "w3_EFD", "w2_EDF")
+        }
+        if shared is not None:
+            moe.tp_sharded_param_names.update(
+                f"shared_experts.{name}.weight"
+                for name in ("gate_proj", "up_proj", "down_proj")
+            )
     return moe

@@ -81,9 +81,16 @@ def resolve_load_balancer(load_balancer: str | None, seq_len: int, cp_mesh: Devi
     them independently and still agree on the rearrangement.
     """
     require_torch_input_sharding()
+    cp_size = cp_mesh.size()
+    # DTensor permits uneven shards, but CP attention communicates equal-sized
+    # sequence partitions. Reject before sharding can create rank-local shapes.
+    if seq_len % cp_size != 0:
+        raise ValueError(
+            f"sequence length {seq_len} is not divisible by cp={cp_size}; "
+            "seq_len must be a multiple of the CP degree."
+        )
     if load_balancer is None:
         return None
-    cp_size = cp_mesh.size()
     if load_balancer == "headtail":
         if _HeadTailLoadBalancer is None:
             raise ImportError(
