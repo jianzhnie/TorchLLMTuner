@@ -95,6 +95,13 @@ def run(workdir):
             ("scheduler", trainer.lr_scheduler.state_dict(), expected["scheduler"]),
         ):
             _compare_loaded_state(actual, wanted, failures, label)
+        if os.environ.get("LLMTUNER_TEST_LOADER_STATE") == "1":
+            _compare_loaded_state(
+                trainer.dataloader.state_dict(),
+                expected["dataloader"],
+                failures,
+                "dataloader",
+            )
         assert not failures, failures
         losses = _train_steps(trainer, trainer.data_iterator(), EXTRA_STEPS)
         with open(os.path.join(workdir, "losses_full.json")) as stream:

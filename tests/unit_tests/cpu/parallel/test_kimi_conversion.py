@@ -244,3 +244,17 @@ def test_kimi_gate_module_exclusion_keeps_moved_bias_outside_router(
         )
     else:
         assert "" not in cfg.fsdp_config.fsdp_apply_modules
+
+
+def test_kimi_conversion_rejects_zero_situ_beta_before_installation():
+    model = make_model(activation="situ")
+    source = model.layers[0].block_sparse_moe
+    source.config.activation_situ_beta = 0.0
+    parameters = dict(model.named_parameters())
+    with pytest.raises(ValueError, match="beta must be finite and positive"):
+        swap_hf_moe_blocks(model)
+    assert model.layers[0].block_sparse_moe is source
+    assert all(
+        dict(model.named_parameters())[key] is value
+        for key, value in parameters.items()
+    )

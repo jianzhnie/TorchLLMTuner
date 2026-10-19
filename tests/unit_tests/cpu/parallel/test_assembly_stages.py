@@ -225,3 +225,34 @@ def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline):
         assert cfg.fsdp_config.fsdp_apply_modules[str(index)]["ignored_params"] == {
             parameter
         }
+
+
+@pytest.mark.parametrize("dispatcher", ["domino", "mc2"])
+def test_fused_ep_dispatch_receives_stage_wide_error_group(monkeypatch, dispatcher):
+    from types import SimpleNamespace
+
+    model = nn.Linear(2, 2)
+    ep_group, loss_group = object(), object()
+    ep_mesh = SimpleNamespace(get_group=lambda: ep_group)
+    loss_mesh = SimpleNamespace(get_group=lambda: loss_group)
+    dims = SimpleNamespace(
+        pp_enabled=False,
+        get_optional_mesh=lambda name: ep_mesh if name == "ep" else None,
+        get_mesh=lambda name: loss_mesh,
+    )
+    cfg = ParallelConfig(expert_parallel_size=2)
+    cfg.ep_config.ep_token_dispatcher = dispatcher
+    observed = {}
+    for name in STAGE_ORDER:
+        monkeypatch.setattr(parallelize, f"apply_{name}", lambda part, **kwargs: part)
+
+    def apply_ep(part, **kwargs):
+        observed.update(kwargs)
+        return part
+
+    monkeypatch.setattr(parallelize, "apply_ep", apply_ep)
+    parallelize.parallelize_hf_transformers(
+        model, cfg=cfg, mesh=None, parallel_dims=dims
+    )
+    assert observed["ep_group"] is ep_group
+    assert observed["error_group"] is loss_group

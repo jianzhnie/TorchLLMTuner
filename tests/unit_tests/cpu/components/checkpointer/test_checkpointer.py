@@ -3204,7 +3204,8 @@ def test_synthetic_cursor_preflight_preserves_live_model_and_stream(
             manager._load_checkpoint(
                 manager.states, str(checkpoint), from_hf=False, from_quantized=False
             )
-        assert len(reads) == 1 and "model" not in reads[0]
+        assert len(reads) == 2
+        assert all("model" not in keys for keys in reads)
         assert loader.state_dict() == before
         for key, value in model.state_dict().items():
             assert torch.equal(value, expected[key])

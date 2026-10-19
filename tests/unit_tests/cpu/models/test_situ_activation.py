@@ -37,3 +37,15 @@ def test_kimi_dense_and_expert_mlp_use_situ_without_global_hf_registration():
         model(inputs).sum().backward()
         assert torch.isfinite(inputs.grad).all()
         assert all(p.grad is not None for p in model.parameters())
+
+
+@pytest.mark.parametrize("expert", [False, True])
+def test_kimi_situ_rejects_explicit_zero_beta(expert):
+    config = KimiLinearConfig(
+        hidden_size=8, intermediate_size=12, hidden_act="situ", activation_situ_beta=0.0
+    )
+    with pytest.raises(ValueError, match="beta must be finite and positive"):
+        if expert:
+            KimiExpertMLP(config, 8, 12)
+        else:
+            KimiMLP(config)
