@@ -48,7 +48,9 @@ def _tokens(rank: int) -> torch.Tensor:
     return torch.randn(T, D, generator=torch.Generator().manual_seed(100 + rank))
 
 
-def _forward_backward(weight: torch.Tensor, x_TD: torch.Tensor) -> torch.Tensor:
+def _forward_backward(
+    weight: torch.Tensor, x_TD: torch.Tensor, *, reference: bool = False
+) -> torch.Tensor:
     """One training-style router forward with the aux loss, then backward.
 
     Returns the accumulated value (the loss, since coeff/denominator are
@@ -64,9 +66,18 @@ def _forward_backward(weight: torch.Tensor, x_TD: torch.Tensor) -> torch.Tensor:
     )
     carrier_TK = probs_TE.gather(-1, topk_ids_TK)
 
+    if reference:
+        # Independent full-stream formula: no production AuxLoss or injection.
+        # Every token routes to K experts and probabilities sum to one.
+        counts = routing_map_TE.sum(dim=0).to(probs_TE.dtype)
+        frequency = E * counts / (K * x_TD.size(0))
+        raw_sum = (frequency * probs_TE.sum(dim=0)).sum()
+        (carrier_TK.sum() + COEFF * raw_sum).backward()
+        return raw_sum.detach()
+
     loss = MicrobatchWiseLoadBalanceLoss(coeff=COEFF)
     AuxLoss.set_step_denominator(torch.tensor(1.0))
-    loss(scores_TE, routing_map_TE, carrier=carrier_TK).sum().backward()
+    loss(probs_TE, routing_map_TE, carrier=carrier_TK).sum().backward()
     return loss.instance_acc.clone()
 
 
@@ -85,7 +96,9 @@ def main() -> None:
 
     # -- single-process reference over the concatenated token stream ----------
     ref_weight = _weights().requires_grad_()
-    ref_value = _forward_backward(ref_weight, torch.cat([_tokens(0), _tokens(1)]))
+    ref_value = _forward_backward(
+        ref_weight, torch.cat([_tokens(0), _tokens(1)]), reference=True
+    )
     ref_grad = ref_weight.grad.clone()
 
     # -- cp=2: the token-partial reduction is a live collective ----------------

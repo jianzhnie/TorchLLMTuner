@@ -146,20 +146,25 @@ def main():
         dist.barrier()
         # Inject an error inside the standard local body, leaving module/hook
         # eligibility unchanged. Fail the first projection of either slice.
-        for failed_slice in (0, 1):
+        for failed_slice, failed_rank, error_type in product(
+            (0, 1), (0, 1), (ValueError, KeyboardInterrupt, SystemExit)
+        ):
             original_linear = torch.nn.functional.linear
             linear_calls = 0
+            original_error = error_type("injected local expert projection failure")
 
             def fail_linear(
                 *args,
                 failure_at=1 + 6 * failed_slice,
                 original=original_linear,
+                source_rank=failed_rank,
+                failure=original_error,
                 **kwargs,
             ):
                 nonlocal linear_calls
                 linear_calls += 1
-                if rank == 0 and linear_calls == failure_at:
-                    raise ValueError("injected local expert projection failure")
+                if rank == source_rank and linear_calls == failure_at:
+                    raise failure
                 return original(*args, **kwargs)
 
             try:
@@ -170,11 +175,12 @@ def main():
                         torch.tensor([[0, 1], [2, 3]], device=device),
                         torch.ones(4, dtype=torch.int64, device=device),
                     )
-            except (ValueError, RuntimeError) as error:
-                if rank == 0:
-                    assert isinstance(error, ValueError), str(error)
+            except BaseException as error:
+                if rank == failed_rank:
+                    assert error is original_error, str(error)
                     assert "injected local expert projection failure" in str(error)
                 else:
+                    assert isinstance(error, RuntimeError), repr(error)
                     assert "Domino expert computation failed on another rank" in str(
                         error
                     )
@@ -201,7 +207,8 @@ def main():
             dist.barrier()
             if rank == 0:
                 print(
-                    f"Domino expert slice{failed_slice}: rejection and backward retry",
+                    f"Domino expert slice{failed_slice}, rank{failed_rank}, "
+                    f"{error_type.__name__}: rejection and backward retry",
                     flush=True,
                 )
         generator = torch.Generator().manual_seed(19)

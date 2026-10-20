@@ -10,7 +10,8 @@ Every train step is followed by a validation pass driven through
 ``schedule.eval`` (upstream's Validator seam). The check pins: the pass runs
 on both ranks without hanging, the logged validation loss is finite and
 positive, matches an unpipelined model with the same microbatch boundaries,
-and the model returns to train mode afterwards.
+and the model returns to train mode afterwards. Optimizer state, scheduler
+progress, training token counts and existing gradients stay unchanged.
 
 Environment note: needs torch >= 2.12 (the pipelining surface; the eval
 driver is gated by the ``pipelining_microbatch_drivers`` capability). Verified
@@ -18,6 +19,8 @@ on torch 2.14 with two CPU/Gloo ranks; GPU/NPU execution is not covered.
 """
 
 from __future__ import annotations
+
+from copy import deepcopy
 
 import torch
 import torch.distributed as dist
@@ -154,7 +157,30 @@ def main() -> None:
         trainer.train_step(data_iterator)
         if trainer.should_validate(trainer.step):
             expected.append(_reference_validation(trainer))
+            optimizer_state = deepcopy(trainer.optimizer.state_dict())
+            scheduler_state = deepcopy(trainer.lr_scheduler.state_dict())
+            tokens_seen = trainer.ntokens_seen
+            gradients = {
+                name: None if parameter.grad is None else parameter.grad.clone()
+                for part in trainer.model_parts
+                for name, parameter in part.named_parameters()
+            }
             trainer.validate(trainer.step)
+            torch.testing.assert_close(
+                trainer.optimizer.state_dict(), optimizer_state, rtol=0, atol=0
+            )
+            assert trainer.lr_scheduler.state_dict() == scheduler_state
+            assert trainer.ntokens_seen == tokens_seen
+            torch.testing.assert_close(
+                {
+                    name: parameter.grad
+                    for part in trainer.model_parts
+                    for name, parameter in part.named_parameters()
+                },
+                gradients,
+                rtol=0,
+                atol=0,
+            )
     trainer.close()
 
     # The pass ran once per step (freq=1), on the rank(s) that hold the loss.
