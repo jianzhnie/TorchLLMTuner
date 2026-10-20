@@ -40,6 +40,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
 
 import llmtuner.parallel.fully_shard_parallel.fully_shard_parallel as fsdp_module
+from llmtuner.accelerator.capabilities import has
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
 from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
@@ -52,6 +53,17 @@ from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
 
 _DIM = 8
 _HIDDEN = 16
+
+# The three expert-placement cases below read the decision off the
+# ``shard_placement_fn`` the MoE branch builds, which only exists where FSDP can
+# take a per-parameter mesh (torch >= 2.12). On older builds ``apply_fsdp``
+# expresses the same placement with a nested unit instead and builds no such
+# callback, so there is nothing for the spy to capture.
+requires_per_param_mesh = pytest.mark.skipif(
+    not has("fsdp_per_param_mesh"),
+    reason="per-parameter FSDP meshes need torch>=2.12 (capability "
+    "fsdp_per_param_mesh); older builds use the nested-unit fallback",
+)
 
 
 @pytest.fixture(scope="module")
@@ -141,6 +153,7 @@ def _expert_placement(
     return captured["fn"](expert_param).placement
 
 
+@requires_per_param_mesh
 def test_equal_size_and_experts_shards_the_expert_axis(
     single_rank_group, monkeypatch
 ) -> None:
@@ -150,6 +163,7 @@ def test_equal_size_and_experts_shards_the_expert_axis(
     assert placement == Shard(0)
 
 
+@requires_per_param_mesh
 def test_size_below_experts_shards_the_expert_axis(
     single_rank_group, monkeypatch
 ) -> None:
@@ -159,6 +173,7 @@ def test_size_below_experts_shards_the_expert_axis(
     assert placement == Shard(0)
 
 
+@requires_per_param_mesh
 def test_size_above_experts_shards_the_feature_axis(
     single_rank_group, monkeypatch
 ) -> None:

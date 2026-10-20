@@ -62,6 +62,7 @@ from ..common.attention.masks import (
 from ..common.moe.layer import collect_moe_layers
 from .attention_backend import (
     ATTENTION_BACKEND,
+    CP_SDPA_BACKEND,
     available_attention_backend,
     register_attention_backend,
     uses_deepseek_sparse_attention,
@@ -595,8 +596,32 @@ class HFTransformerModel(nn.Module):
             extra_kwargs["padding_mask"] = padding_mask
         return inputs, labels, extra_kwargs
 
+    def _mask_dtype(self) -> torch.dtype:
+        """Dtype for a dense attention mask: the one the hidden states carry.
+
+        The embedding is the natural source, but only the first pipeline stage
+        holds one -- later stages replace ``tok_embeddings`` with
+        ``nn.Identity`` -- so fall back to the head, then to the decoder's own
+        parameters. All of them are the config's dtype, which is what makes any
+        of them a valid answer.
+        """
+        for module in (self.tok_embeddings, self.lm_head):
+            weight = getattr(module, "weight", None)
+            if weight is not None:
+                return weight.dtype
+        for parameter in self.parameters():
+            return parameter.dtype
+        raise ValueError(
+            "cannot derive a dense attention mask's dtype: the model holds no "
+            "embedding, head or parameter on this stage"
+        )
+
     def get_attention_masks(self, positions: torch.Tensor) -> BlockMask | torch.Tensor:
         """Build this batch's attention mask: a flex BlockMask, or a dense one.
+
+        A dense mask's dtype has to match the hidden states it is added to;
+        ``_mask_dtype`` answers that without assuming the stage holds an
+        embedding (pipeline stages after the first are ``nn.Identity`` there).
 
         ``attn_mask_type`` selects between plain causal and causal-plus-same-
         document. The latter is the packed path: samples share one sequence, so
@@ -615,7 +640,7 @@ class HFTransformerModel(nn.Module):
         if self.uses_dsa:
             return build_dense_attention_mask(
                 positions,
-                dtype=self.tok_embeddings.weight.dtype,
+                dtype=self._mask_dtype(),
                 block_causal=block_causal,
             )
         if block_causal:
@@ -869,6 +894,32 @@ class HFTransformerModel(nn.Module):
             # that contract and describe a different query/key layout.
             return {"attention_mask": None}
 
+        if self.model.config._attn_implementation == CP_SDPA_BACKEND:
+            # The CP sdpa kernel (context_parallel/sdpa_attention.py) builds the
+            # mask it needs from the CP offsets: this rank's queries against the
+            # gathered full sequence. Handing the decoder a BlockMask here would
+            # both waste the build and invite a Q-sharded mask into a call that
+            # already attended the full sequence.
+            #
+            # Exception: the *ulysses* sdpa kernel attends the full sequence
+            # after its head swap, so a packed corpus's document mask applies
+            # unsharded -- exactly as it does for flex, and it is the one thing
+            # that mask cannot be derived from a length. Build it here; the
+            # kernel ANDs it with nothing, because it is already causal.
+            if (
+                getattr(self.model.config, "_cp_sdpa_ulysses", False)
+                and getattr(self.model.config, "attn_mask_type", "causal")
+                == "block_causal"
+            ):
+                return {
+                    "attention_mask": build_dense_attention_mask(
+                        positions,
+                        dtype=self._mask_dtype(),
+                        block_causal=True,
+                    )
+                }
+            return {"attention_mask": None}
+
         if attention_masks is None:
             if self.cp_mesh is None:
                 attention_masks = self.get_attention_masks(positions=positions)
@@ -880,11 +931,16 @@ class HFTransformerModel(nn.Module):
         if self.model.config._attn_implementation == ATTENTION_BACKEND:
             return {"attention_mask": attention_masks, "is_causal": False}
 
-        # Every other backend wants a tensor mask (or none). There is no generic
-        # conversion from a BlockMask, and one is not wanted: the only llmtuner
-        # case that needs a tensor mask is packing, which the flex fallback
-        # cannot express anyway. Fail loudly rather than run with the mask
-        # silently dropped -- that would turn the packed path into full attention.
+        # Every other backend wants a tensor mask (or none), so a packed corpus
+        # -- the one case whose mask is not a function of the length alone --
+        # is materialized as a dense additive ``[1, 1, T, T]`` mask: causal AND
+        # same-document, which is what the BlockMask computes for flex. That is
+        # O(T**2) memory per forward (32 MiB of bf16 at T=4096), so flex remains
+        # the better path where it exists; this fallback is what lets a packed
+        # corpus run on a backend without it (NPU). DeepSeek-style sparse
+        # attention already gets the same dense mask for the same reason (see
+        # ``get_attention_masks``), so the two paths cannot disagree about what
+        # "block_causal" allows.
         #
         # Packing is detected from ``attn_mask_type``, not from scanning
         # ``positions`` for restarts: a restart scan misses a boundary after a
@@ -892,15 +948,17 @@ class HFTransformerModel(nn.Module):
         # would let sdpa run plain causal attention across the boundary with no
         # complaint. The flag is derived from the corpus at config build time
         # (``build_model_config_for``), so it cannot disagree with the batch.
+        #
+        # The mask is built at ``positions``' length, which under TP sequence
+        # parallelism is the *gathered* length the TP boundary attends over.
         if getattr(self.model.config, "attn_mask_type", "causal") == "block_causal":
-            raise ValueError(
-                f"Attention backend {self.model.config._attn_implementation!r} "
-                "cannot express the mask for a packed sequence: this run's "
-                "corpus is packed (attn_mask_type='block_causal'), and a "
-                "tensor-mask backend has no way to keep attention from "
-                "crossing a document boundary. Sequence packing requires CUDA "
-                "and the flex attention kernel."
-            )
+            return {
+                "attention_mask": build_dense_attention_mask(
+                    positions,
+                    dtype=self._mask_dtype(),
+                    block_causal=True,
+                )
+            }
 
         # A single causal document. Hand the decoder NOTHING and let HF follow its
         # own path: it builds a 4D mask only when it must (sliding-window layers,

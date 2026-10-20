@@ -18,6 +18,59 @@ from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
 from tests.integration_tests.ep_wiring_equivalence import _model
 
 
+def _expert_projections(experts, expert):
+    """One expert's (gate, up, down) weights, in either HF layout.
+
+    transformers 5.x keeps two stacked parameters; 4.x keeps one module per
+    expert. Both spellings return the per-expert ``(F, D)``/``(D, F)`` weights.
+    """
+    gate_up = getattr(experts, "gate_up_proj", None)
+    if gate_up is not None:
+        gate, up = gate_up[expert].chunk(2, dim=0)
+        return gate, up, experts.down_proj[expert]
+    member = experts[expert]
+    gate_name, up_name, down_name = (
+        ("gate_proj", "up_proj", "down_proj")
+        if hasattr(member, "gate_proj")
+        else ("w1", "w3", "w2")
+    )
+    return (
+        getattr(member, gate_name).weight,
+        getattr(member, up_name).weight,
+        getattr(member, down_name).weight,
+    )
+
+
+def _stacked_expert_tensors(experts, *, grad: bool):
+    """(gate, up, down) as stacked ``(E, F, D)``/``(E, D, F)`` tensors.
+
+    The fused layout reads its parameter (or its grad) directly; the per-expert
+    layout stacks the experts' weights (or grads) in expert order.
+    """
+    gate_up = getattr(experts, "gate_up_proj", None)
+    if gate_up is not None:
+        stacked = gate_up.grad if grad else gate_up.detach()
+        gate, up = stacked.chunk(2, dim=1)
+        down = experts.down_proj.grad if grad else experts.down_proj.detach()
+        return gate, up, down
+    names = (
+        ("gate_proj", "up_proj", "down_proj")
+        if hasattr(experts[0], "gate_proj")
+        else ("w1", "w3", "w2")
+    )
+    return tuple(
+        torch.stack(
+            [
+                getattr(e, name).weight.grad
+                if grad
+                else getattr(e, name).weight.detach()
+                for e in experts
+            ]
+        )
+        for name in names
+    )
+
+
 def explicit_reference(block, inputs, mask):
     """Use original HF weights and independent fixed selection/FFN equations."""
     count, dim = inputs.shape
@@ -28,9 +81,9 @@ def explicit_reference(block, inputs, mask):
     output = inputs * 0
     for expert in range(experts):
         token, slot = torch.where(ids == expert)
-        gate, up = block.experts.gate_up_proj[expert].chunk(2, dim=0)
+        gate, up, down = _expert_projections(block.experts, expert)
         hidden = F.silu(F.linear(inputs[token], gate)) * F.linear(inputs[token], up)
-        values = F.linear(hidden, block.experts.down_proj[expert])
+        values = F.linear(hidden, down)
         output = output.index_add(0, token, values * selected[token, slot, None])
     counts = torch.bincount(ids[~mask].flatten(), minlength=experts)
     frequencies = counts.float() / counts.sum().clamp_min(1) * experts
@@ -112,6 +165,10 @@ def main():
             try:
                 runner = wrap_full(block) if recompute else block
                 actual = runner(actual_inputs, padding_mask=mask)
+                # 4.x blocks return ``(hidden, router_logits)``; the swapped
+                # block preserves that arity with None for the internal scores.
+                if isinstance(actual, tuple):
+                    actual = actual[0]
                 (actual * weights).sum().backward()
             finally:
                 hook.remove()
@@ -141,21 +198,16 @@ def main():
                 assert block.router.aux_loss is None
                 assert block.router.gate.weight.grad is None
                 assert reference.gate.weight.grad is None
-            gate_grad, up_grad = reference.experts.gate_up_proj.grad.chunk(2, dim=1)
-            expected_gradients = (gate_grad, up_grad, reference.experts.down_proj.grad)
+            gate_grad, up_grad, down_grad = _stacked_expert_tensors(
+                reference.experts, grad=True
+            )
+            expected_gradients = (gate_grad, up_grad, down_grad)
             actual_parameters = (
                 block.routed_experts.inner_experts.w1_EFD,
                 block.routed_experts.inner_experts.w3_EFD,
                 block.routed_experts.inner_experts.w2_EDF,
             )
-            gate_weight, up_weight = reference.experts.gate_up_proj.detach().chunk(
-                2, dim=1
-            )
-            reference_weights = (
-                gate_weight,
-                up_weight,
-                reference.experts.down_proj.detach(),
-            )
+            reference_weights = _stacked_expert_tensors(reference.experts, grad=False)
             expected_updates = []
             for parameter, source, wanted in zip(
                 actual_parameters, reference_weights, expected_gradients, strict=True

@@ -18,9 +18,10 @@ from collections.abc import Iterator
 from threading import local
 from typing import Any
 
-import spmd_types as spmd
 import torch
 from torch.distributed.device_mesh import DeviceMesh
+
+from .spmd_backend import spmd
 
 # TODO: Remove after spmd_types fixes deepcopy for its variadic tuple subclass.
 # PartitionSpec is immutable, so sharing it across a model deepcopy is safe.

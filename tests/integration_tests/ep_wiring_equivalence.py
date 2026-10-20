@@ -78,6 +78,34 @@ def _data(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     return ids, torch.arange(TOKENS)
 
 
+def _ref_gate_up(block) -> torch.Tensor:
+    """The reference experts' gate/up weights as ``(E, 2F, D)``.
+
+    transformers 5.x holds them fused; 4.x holds one module per expert. Read in
+    HF's own terms, so the comparison is anchored on HF rather than on
+    llmtuner's own probe.
+    """
+    experts = block.experts
+    gate_up = getattr(experts, "gate_up_proj", None)
+    if gate_up is not None:
+        return gate_up
+    gate_name, up_name = (
+        ("gate_proj", "up_proj") if hasattr(experts[0], "gate_proj") else ("w1", "w3")
+    )
+    return torch.stack(
+        [
+            torch.cat(
+                [
+                    getattr(expert, gate_name).weight,
+                    getattr(expert, up_name).weight,
+                ],
+                dim=0,
+            )
+            for expert in experts
+        ]
+    )
+
+
 def main() -> None:
     dist.init_process_group("gloo")
     rank = dist.get_rank()
@@ -123,8 +151,9 @@ def main() -> None:
             )
         lo = rank * num_local
         # transformers 5.x keeps all experts fused in gate_up_proj (E, 2F, D);
-        # the gate is the first F slice along dim 1 (mirrors ep.py's probe).
-        gate_up = layer_ref.mlp.experts.gate_up_proj
+        # 4.x keeps one module per expert. Read in HF's own terms either way,
+        # so the comparison stays anchored on what HF computes with.
+        gate_up = _ref_gate_up(layer_ref.mlp)
         f = gate_up.shape[1] // 2
         for e in range(num_local):
             hf_w = gate_up[lo + e, :f]

@@ -40,6 +40,7 @@ from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.harness import device as harness_device
 
 STEPS = 2
 MICROBATCHES = 2
@@ -212,7 +213,9 @@ def main() -> None:
         for f in failures:
             print(f"  FAIL {f}")
         print("all checks passed" if not failures else "CHECKS FAILED")
-    verdict = torch.tensor(len(failures), dtype=torch.int64)
+    # The verdict crosses an HCCL group when the trainer runs on the accelerator,
+    # so it has to live on that device; a CPU tensor here is a backend error.
+    verdict = torch.tensor(len(failures), dtype=torch.int64, device=harness_device())
     dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
     dist.destroy_process_group()
     assert int(verdict) == 0, f"{int(verdict)} check(s) failed -- see last stage output"

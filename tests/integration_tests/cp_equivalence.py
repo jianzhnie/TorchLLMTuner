@@ -36,6 +36,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.parallel.context_parallel.attention import cp_all_to_all
+from tests.integration_tests.harness import backend, init_distributed, moved
 
 SEQ = 16
 NUM_HEADS = 4
@@ -53,7 +54,7 @@ def _tensors(rank: int, cp_size: int, seed: int = 0):
     full = torch.randn(SEQ, NUM_HEADS, HEAD_SIZE, generator=g)
     lo = rank * (SEQ // cp_size)
     shard = full[lo : lo + SEQ // cp_size]
-    return full, shard
+    return moved(full), moved(shard)
 
 
 def _attention(q_THK, k_THK, v_THV) -> torch.Tensor:
@@ -93,13 +94,13 @@ def _head_to_seq(x_THK, group):
 
 
 def main() -> None:
-    dist.init_process_group("gloo")
+    device = init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 2, f"this check assumes 2 ranks, got {world}"
     assert SEQ % world == 0
 
-    mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("cp",))
+    mesh = init_device_mesh(device.type, (world,), mesh_dim_names=("cp",))
     group = mesh.get_group()
     failures = []
 
@@ -161,11 +162,14 @@ def main() -> None:
         )
 
     # Every rank must agree that every check passed, not just report its own.
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=device)
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
 
     if rank == 0:
-        print(f"seq={SEQ} heads={NUM_HEADS} head_dim={HEAD_SIZE} cp_size={world}")
+        print(
+            f"seq={SEQ} heads={NUM_HEADS} head_dim={HEAD_SIZE} cp_size={world} "
+            f"device={device.type} backend={backend()}"
+        )
         print(f"KV all-gather  max abs diff = {kv_diff:.3e}")
         print(f"Ulysses        max abs diff = {ulysses_diff:.3e}")
         print(f"Ulysses round trip          = {round_trip:.3e}")

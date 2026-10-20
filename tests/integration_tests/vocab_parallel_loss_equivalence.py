@@ -56,6 +56,13 @@ from llmtuner.components.loss import (
     cross_entropy_loss,
     vocab_shard_bounds,
 )
+from tests.integration_tests.harness import (
+    device as harness_device,
+)
+from tests.integration_tests.harness import (
+    init_distributed,
+    moved,
+)
 
 T = 64  # tokens per rank's local shard
 SEED = 42
@@ -86,7 +93,7 @@ def _full_logits(vocab: int) -> torch.Tensor:
     so this is seeded rather than drawn, and the randn is fully consumed.
     """
     torch.manual_seed(SEED + vocab)
-    return torch.randn(T, vocab, dtype=torch.float32)
+    return moved(torch.randn(T, vocab, dtype=torch.float32))
 
 
 def _check_sharded_loss(
@@ -99,7 +106,7 @@ def _check_sharded_loss(
     logits = _full_logits(vocab)
     # A mix of real targets and IGNORE_INDEX, so both masks are exercised.
     torch.manual_seed(SEED)
-    labels = torch.randint(0, vocab, (T,), dtype=torch.long)
+    labels = moved(torch.randint(0, vocab, (T,), dtype=torch.long))
     labels[::7] = IGNORE_INDEX
 
     ref_logits = logits.detach().clone().requires_grad_(True)
@@ -186,7 +193,7 @@ def _check_shape_dispatch(rank: int, group: dist.ProcessGroup, *, vocab: int) ->
     """
     logits = _full_logits(vocab).requires_grad_(True)
     torch.manual_seed(SEED)
-    labels = torch.randint(0, vocab, (T,), dtype=torch.long)
+    labels = moved(torch.randint(0, vocab, (T,), dtype=torch.long))
 
     got = cross_entropy_loss(logits, labels, tp_group=group, global_vocab_size=vocab)
     want = F.cross_entropy(
@@ -215,7 +222,7 @@ def _check_rejections(rank: int, group: dist.ProcessGroup, *, vocab: int) -> Non
 
 
 def main() -> None:
-    dist.init_process_group("gloo")
+    init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 2, f"this check is written for 2 ranks, got {world}"
@@ -249,7 +256,7 @@ def main() -> None:
     _check_rejections(rank, group, vocab=1)
 
     # Every rank must agree every check passed, not just report its own.
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=harness_device())
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
 
     if rank == 0:

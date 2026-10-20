@@ -87,6 +87,7 @@ def test_rows_reject_with_their_entry_type() -> None:
         (compatibility.chunked_loss_pp, (2, 2), "chunked_loss_num_chunks=2"),
         (compatibility.ep_hf_initial_load, (2,), "initial_load_in_hf"),
         (compatibility.chunked_loss_validation, (2,), "chunked_loss_num_chunks=2"),
+        (compatibility.chunked_loss_fsdp, (2,), "chunked_loss_num_chunks=2"),
         (compatibility.pp_weight_tying, (), "tied word embeddings"),
         (compatibility.dsa_pp, (), "DSA"),
         (compatibility.shared_expert_tp, ("layers.0.mlp", _Block()), "shared expert"),

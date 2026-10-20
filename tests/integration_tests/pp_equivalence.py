@@ -71,6 +71,8 @@ from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.harness import device as harness_device
+from tests.integration_tests.harness import moved, moved_batch
 
 STEPS = 4
 MICROBATCHES = 4
@@ -177,7 +179,10 @@ def _reference_trajectory(
     instead of being driven through a schedule.
     """
     torch.manual_seed(cfg.seed)
-    model = HFTransformerModel(build_model_config_for(cfg))
+    # Run the oracle on the same device as the pipeline arm: the property
+    # under test is pipeline == no-pipeline, and a CPU oracle would mix
+    # cross-device kernel rounding into the tolerance budget.
+    model = moved(HFTransformerModel(build_model_config_for(cfg)))
     # PP deliberately derives a different initialization seed per stage.
     # Rebuild the single-process oracle from those actual initial weights;
     # otherwise even the first forward compares different models.
@@ -207,7 +212,9 @@ def _reference_trajectory(
     snapshots = []
     for _ in range(cfg.steps):
         optimizer.zero_grad(set_to_none=True)
-        step_batches = [next(batches) for _ in range(cfg.gradient_accumulation_steps)]
+        step_batches = [
+            moved_batch(next(batches)) for _ in range(cfg.gradient_accumulation_steps)
+        ]
         target_batches = [
             model.preprocess_inputs(batch, parallel_dims=None)[1].reshape(
                 cfg.global_batch_size, cfg.max_seq_len
@@ -233,7 +240,10 @@ def _reference_trajectory(
         optimizer.step()
         snapshots.append(
             {
-                name: (parameter.grad.detach().clone(), parameter.detach().clone())
+                name: (
+                    parameter.grad.detach().cpu().clone(),
+                    parameter.detach().cpu().clone(),
+                )
                 for name, parameter in model.named_parameters()
             }
         )
@@ -242,6 +252,9 @@ def _reference_trajectory(
 
 
 def main() -> None:
+    # ``Trainer`` starts the process group for the device llmtuner selects, so
+    # this script only borrows the device to place its own cross-rank tallies.
+    local_device = harness_device()
     schedule = sys.argv[1] if len(sys.argv) > 1 else "1F1B"
     if schedule not in SCENARIOS:
         raise ValueError(
@@ -305,7 +318,7 @@ def main() -> None:
     local_numel = sum(
         p.numel() for part in trainer.model_parts for p in part.parameters()
     )
-    total_numel = torch.tensor([local_numel])
+    total_numel = torch.tensor([local_numel], device=local_device)
     dist.all_reduce(total_numel, op=dist.ReduceOp.SUM)
     reference_numel = sum(
         p.numel() for p in HFTransformerModel(build_model_config_for(cfg)).parameters()
@@ -344,6 +357,7 @@ def main() -> None:
                 name: tuple(
                     (value.full_tensor() if isinstance(value, DTensor) else value)
                     .detach()
+                    .cpu()
                     .clone()
                     for value in (parameter.grad, parameter)
                 )
@@ -365,7 +379,7 @@ def main() -> None:
         # disagree here -- and it is logged beside a loss normalized by the
         # whole batch, so the two would contradict each other. Reduced inside
         # the loop because the process group is gone once the run ends.
-        tally = torch.tensor([metrics["n_tokens_seen"]])
+        tally = torch.tensor([metrics["n_tokens_seen"]], device=local_device)
         dist.all_reduce(tally, op=dist.ReduceOp.MAX)
         if int(tally[0]) != metrics["n_tokens_seen"]:
             failures.append(
@@ -382,7 +396,10 @@ def main() -> None:
     reference, reference_norms, reference_snapshots = _reference_trajectory(
         cfg, initial_state, dp_size=dp_size
     )
-    maximum_state_errors = torch.zeros(2, dtype=torch.float64)
+    # The all_reduce below runs on the harness backend (hccl on NPU), which
+    # cannot take CPU tensors -- allocate the tally on the device. float32:
+    # NPU has no fp64 collectives, and a diagnostic max needs no more.
+    maximum_state_errors = torch.zeros(2, dtype=torch.float32, device=harness_device())
     for step, (actual, expected) in enumerate(
         zip(pp_snapshots, reference_snapshots, strict=True), 1
     ):
@@ -443,7 +460,7 @@ def main() -> None:
             )
 
     # Every rank must agree that every check passed, not just report its own.
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=local_device)
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
     dist.all_reduce(maximum_state_errors, op=dist.ReduceOp.MAX)
     rank_failures = [None] * trainer.world_size

@@ -37,6 +37,7 @@ from llmtuner.config import ParallelConfig, SelectiveACConfig
 from llmtuner.memory.activation_checkpoint import apply_ac
 from llmtuner.parallel.fully_shard_parallel import apply_fsdp
 from llmtuner.parallel.topology import ParallelTopology
+from tests.integration_tests.harness import init_distributed, moved
 
 AC_MODES = ("full", "selective")
 
@@ -75,7 +76,7 @@ class TinyTokenDecoder(nn.Module):
 def _build_model(seed: int = 0) -> TinyTokenDecoder:
     """Deterministically initialized decoder; identical on every rank."""
     torch.manual_seed(seed)
-    return TinyTokenDecoder()
+    return moved(TinyTokenDecoder())
 
 
 def _data(step: int, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -83,7 +84,7 @@ def _data(step: int, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     g = torch.Generator().manual_seed(1000 * rank + step)
     ids = torch.randint(VOCAB, (SEQ,), generator=g)
     labels = torch.randint(VOCAB, (SEQ,), generator=g)
-    return ids, labels
+    return moved(ids), moved(labels)
 
 
 def _loss_sum(
@@ -102,7 +103,7 @@ def _full(t: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
-    dist.init_process_group("gloo")
+    device = init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 2, f"this check assumes 2 ranks, got {world}"
@@ -188,7 +189,7 @@ def main() -> None:
         results[mode] = {"losses": losses, "param_diff": param_diff}
 
     # Every rank must agree that every check passed, not just report its own.
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=device)
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
 
     if rank == 0:

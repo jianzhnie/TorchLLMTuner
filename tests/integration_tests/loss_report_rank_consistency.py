@@ -28,6 +28,7 @@ from llmtuner.config import (
     TrainingConfig,
 )
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.harness import device as harness_device
 
 SEQ = 32
 VOCAB = 128
@@ -90,7 +91,8 @@ def main() -> None:
     if gathered[0]["loss"] <= 0:
         failures.append(f"rank 0 carried the whole loss; got {gathered[0]}")
 
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    # Crosses an HCCL group on the accelerator: it has to live on that device.
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=harness_device())
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
 
     if rank == 0:

@@ -17,7 +17,7 @@ harnesses' job.
 
 from __future__ import annotations
 
-from tests.caps import require_env
+from tests.caps import require_env, skip_without
 
 require_env("spmd_types")
 
@@ -41,17 +41,24 @@ def test_apply_cp_is_a_no_op_when_cp_is_off() -> None:
     assert apply_cp(model, mesh=None, cfg=cfg) is model
 
 
-def test_apply_cp_requires_the_flex_backend() -> None:
-    """CP expresses the sharded mask as a BlockMask, which only flex consumes.
+def test_apply_cp_rejects_the_dual_axis_form_without_flex() -> None:
+    """One CP axis at a time on sdpa; two composed masks stay on flex.
 
-    A plain module has no HF config at all, so it fails the backend check --
-    the same check that stops a CPU-run model (whose wrapper selected 'sdpa')
-    from silently computing attention over its own shard only.
+    Both single-axis strategies have an sdpa kernel (kv_allgather rebuilds the
+    mask from the CP offsets, ulysses swaps heads and needs only the ordinary
+    causal one), so the strategy name is no longer the thing that is refused --
+    the *composition* is. A plain module has no HF config at all, so its backend
+    reads as non-flex, which is the same reason a CPU-run model (whose wrapper
+    selected 'sdpa') takes this branch. The refusal happens before any mesh is
+    consulted, so no process group is needed to pin it.
     """
 
-    cfg = ParallelConfig(context_parallel_kv_allgather_size=2)
+    cfg = ParallelConfig(
+        context_parallel_kv_allgather_size=2,
+        context_parallel_ulysses_size=2,
+    )
 
-    with pytest.raises(RuntimeError, match="attention backend"):
+    with pytest.raises(RuntimeError, match="only with a single CP axis"):
         apply_cp(torch.nn.Linear(4, 4), mesh=None, cfg=cfg)
 
 
@@ -78,12 +85,20 @@ def fake_cp_mesh():
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("strategy", ["kv_allgather", "ulysses"])
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        pytest.param("kv_allgather", marks=skip_without("flex_cp")),
+        "ulysses",
+    ],
+)
 def test_the_known_strategies_are_accepted(fake_cp_mesh, strategy: str) -> None:
     """Both strategies the package advertises must actually construct.
 
     Non-vacuity: this is the accepting half of the pair below, so a kernel that
-    rejected everything cannot pass both.
+    rejected everything cannot pass both. The kv path is the one that imports
+    torch's private ``flex_cp_allgather``; the ulysses path needs no private op
+    and so runs on every build.
     """
     kernel = CPFlexKernel(cp_mesh=fake_cp_mesh, strategy=strategy)
 
@@ -101,10 +116,15 @@ def test_an_unknown_strategy_is_refused(fake_cp_mesh) -> None:
         CPFlexKernel(cp_mesh=fake_cp_mesh, strategy="ring")
 
 
-def test_the_default_strategy_is_kv_allgather(fake_cp_mesh) -> None:
+def test_the_default_strategy_is_kv_allgather() -> None:
+    """``ParallelConfig``'s default; the kernel half lives below."""
+    assert ParallelConfig().cp_config.context_parallel_strategy == "kv_allgather"
+
+
+@skip_without("flex_cp")
+def test_the_kernel_default_strategy_is_kv_allgather(fake_cp_mesh) -> None:
     """The default has to match ``ParallelConfig``'s, or a caller that relies on
     both defaults gets whichever the other object happened to pick."""
-    assert ParallelConfig().cp_config.context_parallel_strategy == "kv_allgather"
     assert CPFlexKernel(cp_mesh=fake_cp_mesh).strategy == "kv_allgather"
 
 

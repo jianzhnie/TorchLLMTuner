@@ -26,12 +26,14 @@ way torchtitan does it.
 **No tyro.** The config is a plain dataclass (see ``base.py``), and
 ``purge_exempt`` is a plain callable.
 
-Runtime assembly currently selects DCP; this manager is available to direct callers.
+Runtime assembly selects this manager when ``checkpoint.backend`` is
+``'torch_checkpointing'`` (the default, ``'dcp'``, selects the DCP manager).
 CPU tests exercise policy, load/export adapters, future ownership, and constructor
-cleanup with backend substitutes. They do not verify the optional package's I/O,
-subprocess lifecycle, compatibility, or performance. Before enabling this backend
-in a production run, validate a complete save/load round trip with the installed
-package and the intended distributed topology.
+cleanup with backend substitutes, and round-trip a checkpoint through the real
+package where it is installed (skipped otherwise). They do not verify distributed
+topologies, cross-version compatibility, or performance. Before enabling this
+backend in a production run, validate a complete save/load round trip with the
+installed package and the intended distributed topology.
 """
 
 from __future__ import annotations
@@ -119,7 +121,17 @@ def require_torch_checkpointing():
             CheckpointSaverConfig,
             SyncCheckpointSaverConfig,
         )
-        from torch_checkpointing.default_resharder import DefaultResharder
+
+        try:
+            from torch_checkpointing.default_resharder import DefaultResharder
+        except ImportError:
+            # The published torch_checkpointing (0.1.0) has no
+            # ``default_resharder``: ``resharding.Resharder`` is an ABC there and
+            # the DTensor implementation is the concrete one, which is what the
+            # item specs below need to instantiate.
+            from torch_checkpointing.dtensor_resharder import (
+                DTensorResharder as DefaultResharder,
+            )
 
         try:
             from torch_checkpointing.metadata_serialization import (
@@ -447,16 +459,24 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 if self.load_only
                 else async_save_config(backend)
             )
+            # Resolve the storage config before the backend manager is built,
+            # and hand the SAME object to both: a ``None`` here would let the
+            # backend fall back to its own default, which asks for direct I/O.
+            # Direct I/O is off because the backend only falls back when
+            # ``os.open`` *rejects* ``O_DIRECT`` -- a filesystem that accepts
+            # the open and then fails the write (the container's overlay mount
+            # does: ``OSError`` errno 22 out of ``close``) takes the whole save
+            # down instead. The HF-consolidation path below already asks for
+            # the same thing.
+            storage_config = storage_config or backend.LocalFileSystemStorageConfig(
+                use_direct_io=False
+            )
             manager_config = default_backend_config(
                 backend,
                 save_config,
                 storage_config=storage_config,
             )
             self._manager_config = manager_config
-            storage_config = (
-                self._manager_config.storage_config
-                or backend.LocalFileSystemStorageConfig()
-            )
             self._storage = BackendCheckpointStorage(storage_config.create_storage())
             self._prewarmed = False
 
@@ -699,7 +719,15 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             self._purge_stale_checkpoints(
                 saving_step=curr_step,
                 staging_dir_prefix=(
-                    self._manager_config.save.writer_config.temp_dir_prefix
+                    # Absent on the published torch_checkpointing (0.1.0), whose
+                    # writer config carries no staging prefix; the parameter is
+                    # optional and the DCP manager omits it too, so the purge
+                    # simply has no staging directory to protect there.
+                    getattr(
+                        self._manager_config.save.writer_config,
+                        "temp_dir_prefix",
+                        None,
+                    )
                 ),
             )
 
@@ -709,7 +737,11 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 self._purge_stale_checkpoints(
                     saving_step=curr_step,
                     staging_dir_prefix=(
-                        self._manager_config.save.writer_config.temp_dir_prefix
+                        getattr(
+                            self._manager_config.save.writer_config,
+                            "temp_dir_prefix",
+                            None,
+                        )
                     ),
                     completed=True,
                 )
@@ -722,7 +754,11 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             self._pending_retention = {
                 "saving_step": curr_step,
                 "staging_dir_prefix": (
-                    self._manager_config.save.writer_config.temp_dir_prefix
+                    getattr(
+                        self._manager_config.save.writer_config,
+                        "temp_dir_prefix",
+                        None,
+                    )
                 ),
             }
 

@@ -22,6 +22,7 @@ from torch.nn import ModuleDict
 from llmtuner.config.parallel_config import ParallelConfig
 
 from ...accelerator import distributed
+from ...accelerator.capabilities import has as capability
 from ...utils.logging import get_logger
 from ..topology import ParallelTopology
 from .fine_grained import get_fsdp_strategy
@@ -195,6 +196,34 @@ def build_fsdp_placement_fn(
         return ShardPlacementResult(placement=Shard(0), mesh_info=dp_mesh_info)
 
     return placement
+
+
+def shard_experts_on_their_own_mesh(
+    shard_fn: Callable[..., Any],
+    experts: nn.Module,
+    *,
+    edp_mesh: DeviceMesh,
+    fsdp_config: dict[str, Any],
+    reshard_after_forward: bool | int,
+) -> set[nn.Parameter]:
+    """Shard a MoE experts child on the sparse mesh as its own FSDP unit.
+
+    The nested form of what ``build_fsdp_placement_fn`` expresses on torch >=
+    2.12, where one ``fully_shard`` takes a placement function that returns both
+    a ``Shard`` and a mesh, so a single unit can own parameters on two meshes.
+    torch 2.9's ``shard_placement_fn`` returns only the ``Shard`` and has no
+    mesh slot, so the same split is expressed structurally instead: the experts
+    child becomes its own FSDP unit on the sparse mesh, and the caller keeps
+    the enclosing unit off those parameters via ``ignored_params``.
+
+    Returns the child's parameters read *after* sharding: FSDP2 replaces the
+    parameter objects it converts (they come back as DTensors), and
+    ``ignored_params`` matches by identity, so the pre-shard objects would not
+    match anything.
+    """
+    experts_config = dict(fsdp_config, mesh=edp_mesh)
+    shard_fn(experts, **experts_config, reshard_after_forward=reshard_after_forward)
+    return set(experts.parameters())
 
 
 def enable_fsdp_symm_mem(model: nn.Module, scope: str | None = "all") -> None:
@@ -394,9 +423,20 @@ def apply_fsdp_to_decoder(
                     )
     if ep_degree > 1 and expert_placements:
         assert edp_mesh is not None
-        expert_placement_fn = build_fsdp_placement_fn(
-            expert_placements, dp_mesh=dp_mesh, edp_mesh=edp_mesh
-        )
+        # One fully_shard unit has to own parameters on two meshes here: the
+        # experts on the sparse (efsdp) mesh, the rest on the dense one.
+        # torch >= 2.12 expresses that with a placement function returning both
+        # a Shard and a mesh; older torch's ``shard_placement_fn`` returns only
+        # the Shard, so EP x FSDP would shard the experts over the dense mesh
+        # -- mixing ranks of different EP coordinates, which no loss curve
+        # reveals. Without the capability, ``shard_unit`` expresses the same
+        # split structurally through ``shard_experts_on_their_own_mesh``.
+        if capability("fsdp_per_param_mesh"):
+            expert_placement_fn = build_fsdp_placement_fn(
+                expert_placements, dp_mesh=dp_mesh, edp_mesh=edp_mesh
+            )
+        else:
+            expert_placement_fn = None
     else:
 
         def expert_placement_fn(parameter: nn.Parameter) -> Shard | None:
@@ -447,13 +487,37 @@ def apply_fsdp_to_decoder(
         )
         # One state has one reshard policy. Retain any boundary unit's request
         # to keep parameters available through its last forward consumer.
+        reshard = all(units[owner][1] for owner in owners)
         options = dict(fsdp_config)
         if expert_units.intersection(owners):
-            options["shard_placement_fn"] = expert_placement_fn
+            if expert_placement_fn is not None:
+                options["shard_placement_fn"] = expert_placement_fn
+            else:
+                # Nested-unit fallback (torch < 2.12): shard every experts
+                # child on the sparse mesh as its own FSDP unit first, then
+                # keep the group off the sharded parameters.
+                assert edp_mesh is not None
+                ignored: set[nn.Parameter] = set()
+                expert_children = dict.fromkeys(
+                    module.moe.routed_experts.inner_experts
+                    for module in modules
+                    if getattr(module, "moe_enabled", False)
+                )
+                for experts in expert_children:
+                    ignored.update(
+                        shard_experts_on_their_own_mesh(
+                            shard_fn,
+                            experts,
+                            edp_mesh=edp_mesh,
+                            fsdp_config=fsdp_config,
+                            reshard_after_forward=reshard,
+                        )
+                    )
+                options["ignored_params"] = ignored
         shard_fn(
             modules[0] if len(modules) == 1 else modules,
             **options,
-            reshard_after_forward=all(units[owner][1] for owner in owners),
+            reshard_after_forward=reshard,
         )
         sharded_units.update(owners)
 

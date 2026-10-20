@@ -23,13 +23,16 @@ require_env("spmd_types")
 import pytest
 import torch
 import torch.nn as nn
+from transformers import AutoConfig
 
 from llmtuner.config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     MOE_PLAN_SPECS,
     resolve_tp_sharding_plan,
+    resolve_tp_targets,
     shard_experts_for_tp,
 )
 
@@ -601,3 +604,62 @@ def test_tp_preserves_tied_shared_gate_up_projection(same_module, rank):
     torch.testing.assert_close(shared.gate_proj.weight, original.chunk(2, 0)[rank])
     assert shared.gate_proj.out_features == 4
     assert shared.up_proj.out_features == 4
+
+
+@pytest.mark.parametrize("ep", [1, 2])
+def test_the_dense_plan_leaves_moe_internals_to_the_expert_axis(ep: int) -> None:
+    """The dense realizers must not match anything inside a MoE block.
+
+    transformers 5.x declares the MoE specs (``moe_tp_experts`` /
+    ``packed_colwise``) in Qwen3Moe's tp plan even with
+    ``experts_implementation="eager"`` -- the eager forward still reads the
+    stacked expert parameters -- so resolve always finds the blocks: with
+    ``ep=1`` they go to the MoE-TP realization, with ``ep>1`` the realization
+    is deferred to the ``apply_ep`` swap. The exclusion of block internals
+    from the dense targets is all that keeps the experts out of the dense
+    realizers in the deferred case; when the guard used to be skipped there,
+    each rank entered the swap holding F/tp of its own experts, the swap moved
+    those partial weights into ``GroupedExperts``, and the per-expert
+    realizers whose collectives would have summed the halves were gone: every
+    expert contributed half of its output, silently. Measured against the
+    unsharded model (4 ranks, fp64, before/after): the MoE block output was
+    off by 76% of its own magnitude, and ``tp_ep_cp_equivalence`` failed at
+    5.147e-02.
+    """
+    config = AutoConfig.for_model(
+        "qwen3_moe",
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=48,
+        num_hidden_layers=2,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        num_experts=8,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+        max_position_embeddings=256,
+        experts_implementation="eager",
+    )
+    model = HFTransformerModel(config).eval()
+    cfg = ParallelConfig(tensor_parallel_size=2, expert_parallel_size=ep)
+
+    targets, moe_blocks = resolve_tp_targets(model, cfg=cfg)
+
+    inside_moe = [
+        path
+        for path, _, _ in targets
+        if ".mlp.experts" in path or path.rsplit(".", 1)[-1] in {"gate", "gate_proj"}
+    ]
+    assert not inside_moe, f"the dense plan reached into the MoE block: {inside_moe}"
+    # The plan declares MoE specs, so with ep=1 the blocks are realized by the
+    # MoE-TP path; with ep>1 they are left whole for the EP swap. Either way
+    # the exclusion above is the only thing standing between the experts and
+    # the dense realizers.
+    assert [path for path, _ in moe_blocks] == (
+        [] if ep > 1 else [f"model.model.layers.{index}.mlp" for index in range(2)]
+    )
+    # Non-vacuity: the attention projections still resolve, so a plan that
+    # matched nothing (which would silently train a replicated model, and is
+    # itself a loud error) cannot pass this.
+    assert any("self_attn.q_proj" in path for path, _, _ in targets)

@@ -250,7 +250,16 @@ def selective_policy(
     save_ops: set, mm_recompute_shapes: set[tuple[int, int]]
 ) -> Callable:
     """Build the per-op policy the selective context consults (upstream's
-    ``_get_custom_policy``)."""
+    ``_get_custom_policy``).
+
+    The matmul-alternation counters live on the returned closure, so the
+    caller must build one policy per ``context_fn`` invocation (i.e. per
+    checkpoint frame), as upstream does. A policy shared across pending
+    forwards keeps counting across them: with an odd number of matmuls per
+    forward the second frame's parity flips, and its backward-time replay then
+    disagrees with the decisions its forward saved by, silently replaying the
+    wrong tensors.
+    """
     meta = {"forward_mm_count": 0, "recompute_mm_count": 0}
 
     def wrapped_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
@@ -294,10 +303,14 @@ def wrap_selective(
     mm_shapes = mm_recompute_shapes(
         module, base_fqn=base_fqn, fqns=cfg.force_recompute_mm_shapes_by_fqns
     )
-    policy = selective_policy(save_ops, mm_shapes)
+    # One policy per context_fn invocation (per checkpoint frame), not per
+    # block: the policy's matmul-alternation counters must restart for each
+    # forward so its backward-time replay re-derives the same save decisions.
     wrapped = ptd_checkpoint_wrapper(
         module,
-        context_fn=lambda: checkpoint_contexts(policy, module),
+        context_fn=lambda: checkpoint_contexts(
+            selective_policy(save_ops, mm_shapes), module
+        ),
         preserve_rng_state=cfg.preserve_rng_state,
         determinism_check=cfg.determinism_check,
         early_stop=True,

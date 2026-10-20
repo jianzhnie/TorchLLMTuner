@@ -23,6 +23,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.utils.module_names import canonical_fqn
 
+from ...accelerator.capabilities import require
 from ..module_patterns import compile_module_pattern, resolve_module_patterns
 from .fine_grained import get_fsdp_strategy, validate_fsdp_hook_target
 
@@ -655,6 +656,14 @@ def apply_fsdp_by_pattern(
         ) and "shard_placement_fn" not in options:
             if cfg.ep_size > 1:
                 assert edp_mesh is not None
+                # Same two-mesh-in-one-unit requirement as the decoder path;
+                # refuse rather than let the placement function's import fail
+                # obscurely. The pattern path has no nested-unit fallback: its
+                # units are pattern-selected, not block-bounded.
+                require(
+                    "fsdp_per_param_mesh",
+                    feature="expert parallelism combined with pattern-selected FSDP",
+                )
                 options["shard_placement_fn"] = build_fsdp_placement_fn(
                     expert_placements, dp_mesh=options["mesh"], edp_mesh=edp_mesh
                 )

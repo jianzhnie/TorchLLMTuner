@@ -758,9 +758,9 @@ def resolve_tp_targets(
     moe_deferred_to_ep = plan_declares_moe and cfg.ep_size > 1
     moe_blocks: list[tuple[str, nn.Module]] = []
     bracketed_paths: list[str] = []
-    if plan_declares_moe and not moe_deferred_to_ep:
-        from ..expert_parallel.hf_inspection import is_hf_moe_block
+    from ..expert_parallel.hf_inspection import is_hf_moe_block
 
+    if plan_declares_moe and not moe_deferred_to_ep:
         for module_path, module in model.named_modules():
             if getattr(module, "_tp_moe_boundary", False):
                 # Already bracketed by an earlier apply_tp pass (the engine is
@@ -773,20 +773,41 @@ def resolve_tp_targets(
                 moe_blocks.append((module_path, module))
         if not moe_blocks and not bracketed_paths:
             compatibility.tp_moe_specs_without_block(cfg.tp_size, model)
-    if moe_blocks or bracketed_paths:
-        # MoE-block internals never take the dense realizer path: the routed
-        # experts are stacked parameters (no nn.Linear to match), and the
-        # shared expert is sharded featurewise by ``shard_shared_expert_for_tp``
-        # below, collective-free inside the sequence boundary. HF plans like
-        # DeepSeek-V3's still declare ``shared_experts.*_proj: colwise`` --
-        # wrapping those in ColumnParallelLinear on top of the feature shard
-        # would double-shard the weight (F/tp**2 at the wrong offset) and
-        # double-gather the sequence, silently computing the wrong values.
-        # Already realized blocks retain plain Linear shared projections;
-        # exclude their subtrees on reapplication as well.
+
+    # MoE-block internals never take the dense realizer path. The routed
+    # experts are stacked parameters on the fused layout (no nn.Linear to
+    # match) but a layout that keeps them as per-expert ``nn.Linear``s
+    # (transformers 4.x with ``experts_implementation="eager"``) exposes them
+    # to the default plan's ``mlp.experts.*`` patterns, and the shared expert
+    # is sharded featurewise by ``shard_shared_expert_for_tp`` below,
+    # collective-free inside the sequence boundary. HF plans like
+    # DeepSeek-V3's still declare ``shared_experts.*_proj: colwise`` --
+    # wrapping either in a dense realizer double-shards the weight (F/tp**2 at
+    # the wrong offset) and double-gathers the sequence, silently computing
+    # the wrong values.
+    #
+    # This has to hold whenever the block's experts are owned by *someone* --
+    # also when the plan declares no MoE spec at all, or when the MoE
+    # realization itself is deferred to ``apply_ep`` (``tp x ep``: EP owns the
+    # routed experts). Missing that case left the eager per-expert projections
+    # matched by the dense plan: they were F-sharded (F -> F/tp) and then the
+    # EP swap moved those partial weights into ``GroupedExperts``, dropping the
+    # realizers whose collectives would have summed the partials. Every expert
+    # then contributed half of its output, silently.
+    #
+    # Already realized blocks retain plain Linear shared projections; exclude
+    # their subtrees on reapplication as well.
+    moe_block_paths = [path for path, _ in moe_blocks]
+    moe_block_paths.extend(
+        path
+        for path, module in model.named_modules()
+        if path not in moe_block_paths
+        and is_hf_moe_block(module)
+        and not getattr(module, "_tp_moe_boundary", False)
+    )
+    if moe_block_paths or bracketed_paths:
         moe_prefixes = tuple(
-            f"{p}." if p else ""
-            for p in [*bracketed_paths, *(p for p, _ in moe_blocks)]
+            f"{p}." if p else "" for p in [*bracketed_paths, *moe_block_paths]
         )
         targets = [t for t in targets if not t[0].startswith(moe_prefixes)]
     nothing_sharded = not targets and not moe_blocks and not bracketed_paths

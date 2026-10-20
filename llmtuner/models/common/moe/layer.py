@@ -45,14 +45,18 @@ from .routing import QuantileBalancedTopKRouter, TokenChoiceTopKRouter
 
 __all__ = ["MOE_LAYER_ATTRS", "collect_moe_layers", "MoE"]
 
-# The decoder-layer attributes that may hold a MoE block. Every model family
-# transformers 5.x supports keeps it on ``mlp``, dense layers included -- a
-# dense ``mlp`` is simply not a MoE and is skipped. The swap for an HF model
-# replaces the block in the attribute it was found under, so this list is shared
-# with it rather than duplicated: the two must agree or the expert-bias hook
-# silently finds no layers on a real swapped model. Kimi uses
-# ``block_sparse_moe`` for its sparse layers.
-MOE_LAYER_ATTRS = ("mlp", "block_sparse_moe")
+# The decoder-layer attributes that may hold a MoE block. transformers 5.x
+# keeps it on ``mlp`` for every family (dense layers included -- a dense
+# ``mlp`` is simply not a MoE and is skipped); 4.x spells Mixtral's and
+# GraniteMoe's ``block_sparse_moe`` and DeepSeek's/GLM4's ``moe``, and Kimi
+# uses ``block_sparse_moe`` for its sparse layers. The order is only a
+# fallback: the probe prefers whichever attribute actually holds a MoE,
+# because DeepSeek layers carry a dense ``mlp`` *and* a sparse ``moe``.
+# The swap for an HF model replaces the block in the attribute it was found
+# under, so this list is shared with it rather than duplicated: the two must
+# agree or the expert-bias hook silently finds no layers on a real swapped
+# model.
+MOE_LAYER_ATTRS = ("mlp", "block_sparse_moe", "moe")
 
 
 class MoE(nn.Module):
@@ -156,6 +160,13 @@ class MoE(nn.Module):
         # A plain attribute, not a buffer: it is per-microbatch input, never
         # module state, and must stay out of the state_dict.
         self._pending_padding_mask: torch.Tensor | None = None
+        # Whether the host HF layer unpacks ``(hidden_states, router_logits)``
+        # from this block. transformers has no single convention -- 4.x Mixtral,
+        # OLMoE and GraniteMoe unpack, Qwen2/3-MoE tolerate either and DeepSeek
+        # takes a bare tensor -- so the swap reads it off the block it replaces
+        # (``hf_inspection.returns_router_logits``) and records it here. The
+        # block's own arity is what the host was written against.
+        self.returns_router_logits = False
 
     @torch.no_grad()
     def update_expert_bias(self) -> None:
@@ -230,8 +241,14 @@ class MoE(nn.Module):
                     None if padding_mask is None else padding_mask.reshape(-1)
                 ),
             )
-            return out.reshape(*lead, out.shape[-1])
-        return self._forward_tokens(x, padding_mask_T=padding_mask)
+            out = out.reshape(*lead, out.shape[-1])
+        else:
+            out = self._forward_tokens(x, padding_mask_T=padding_mask)
+        # Reproduce the replaced HF block's return arity. The second element is
+        # ``None``: llmtuner's router consumes its scores internally, and the
+        # swap refuses a config that would make HF read them (see
+        # ``model_replacement``).
+        return (out, None) if self.returns_router_logits else out
 
     def _forward_tokens(
         self,

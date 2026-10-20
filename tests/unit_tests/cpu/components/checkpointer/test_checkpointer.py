@@ -495,6 +495,82 @@ def test_an_enabled_torch_checkpointing_manager_without_the_backend_raises() -> 
         )
 
 
+def test_the_checkpoint_backend_selector_accepts_both_and_rejects_typos() -> None:
+    """``checkpoint.backend`` picks the manager; a typo must not fall through.
+
+    A silently-ignored value here would leave the run on the DCP manager while
+    the caller believed it had selected the other backend.
+    """
+    import pytest
+
+    from llmtuner.config.checkpoint_config import CheckpointConfig
+    from llmtuner.errors import ConfigError
+
+    assert CheckpointConfig().backend == "dcp"
+    selected = CheckpointConfig(backend="torch_checkpointing")
+    assert selected.backend == "torch_checkpointing"
+    with pytest.raises(ConfigError, match="checkpoint.backend"):
+        CheckpointConfig(backend="torchcheckpointing")
+
+
+def test_the_torch_checkpointing_backend_round_trips_a_checkpoint(tmp_path) -> None:
+    """The port's backend-dependent paths, exercised now that the package exists.
+
+    The module docstring is explicit that nothing above the import guard had ever
+    run and that the first real use should start by round-tripping a checkpoint;
+    this is that round trip. It skips when the optional package is absent, the
+    same way the import-guard test above does, so the suite stays runnable on a
+    machine without it.
+    """
+    import importlib.util
+
+    import pytest
+
+    if importlib.util.find_spec("torch_checkpointing") is None:
+        pytest.skip("torch_checkpointing is not installed")
+
+    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+        TorchCheckpointingManager,
+    )
+
+    model = nn.Linear(3, 2)
+    expected = {key: value.clone() for key, value in model.state_dict().items()}
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    config = Config(enable=True, interval=1, keep_latest_k=0)
+    manager = TorchCheckpointingManager(
+        config,
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states={},
+        folder=str(tmp_path),
+    )
+    try:
+        assert manager.save(1)
+    finally:
+        manager.close()
+
+    with torch.no_grad():
+        model.weight.fill_(0)
+        model.bias.fill_(0)
+
+    resumed = TorchCheckpointingManager(
+        config,
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states={},
+        folder=str(tmp_path),
+    )
+    try:
+        assert resumed.load(1)
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value, expected[key])
+    finally:
+        resumed.close()
+
+
 def test_an_enabled_manager_registers_the_lr_scheduler(monkeypatch) -> None:
     """The scheduler must ride along under ``LR_SCHEDULER``, like the DCP manager.
 
@@ -2263,7 +2339,10 @@ def test_torch_checkpointing_failed_thread_start_closes_backend(
     manager_config = SimpleNamespace(
         storage_config=storage, build=lambda: backend_manager
     )
-    monkeypatch.setattr(tc, "require_torch_checkpointing", lambda: object())
+    # __init__ resolves the storage config through the backend before building
+    # the manager config, so the fake backend must carry the factory.
+    backend = SimpleNamespace(LocalFileSystemStorageConfig=lambda **kwargs: storage)
+    monkeypatch.setattr(tc, "require_torch_checkpointing", lambda: backend)
     monkeypatch.setattr(tc, "async_save_config", lambda backend: object())
     monkeypatch.setattr(tc, "default_backend_config", lambda *a, **kw: manager_config)
     monkeypatch.setattr(

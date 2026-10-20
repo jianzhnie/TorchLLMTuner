@@ -88,6 +88,13 @@ CAPS: dict[str, Callable[[], bool]] = {
     "flex_attention": lambda: _importable_attr(
         "torch.nn.attention.flex_attention", "create_block_mask"
     ),
+    # torch's private flex context-parallel ops (the ``CPFlexKernel`` kv path
+    # imports ``flex_cp_allgather`` from here; absent before torch 2.12 even
+    # when ``flex_attention`` itself is present)
+    "flex_cp": lambda: _importable_attr(
+        "torch.distributed.tensor.experimental._context_parallel._cp_custom_ops",
+        "flex_cp_allgather",
+    ),
     # torch.distributed.pipelining (PipelineStage, schedules)
     "pipelining": lambda: importable("torch.distributed.pipelining"),
     # torch.distributed.checkpoint's HF storage surface the checkpointer reads

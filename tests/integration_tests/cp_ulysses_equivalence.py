@@ -34,8 +34,8 @@ Three layers of checks:
   for the strategy that is actually allowed to take a balancer.
 
 Forward-only, like ``cp_wiring_equivalence.py``: torch's flex attention has no
-CPU backward. Everything runs in float64 so the comparison is arithmetic, not
-noise.
+CPU backward. On CPU everything runs in float64 so the comparison is
+arithmetic, not noise; the accelerator arm runs fp32 (see ``DTYPE``/``TOL``).
 """
 
 from __future__ import annotations
@@ -67,12 +67,24 @@ from llmtuner.parallel.context_parallel.attention import (
     HeadToSeq,
     SeqToHead,
 )
+from tests.integration_tests.harness import (
+    backend,
+    init_distributed,
+    moved,
+)
+from tests.integration_tests.harness import (
+    device as harness_device,
+)
 
 SEQ = 256  # torch's CP BlockMask path requires Q_LEN % (cp * 128) == 0
 VOCAB = 128
 
 # float64 comparisons: wiring differences are O(1), arithmetic noise is O(1e-13).
-TOL = 1e-9
+# fp64 exists on CPU only on this stack, so the accelerator arm runs fp32 with
+# the tolerance that precision implies.
+DEVICE = harness_device()
+DTYPE = torch.float64 if DEVICE.type == "cpu" else torch.float32
+TOL = 1e-9 if DEVICE.type == "cpu" else 1e-5
 
 
 def _cfg(num_kv_heads: int = 4) -> LLMTunerConfig:
@@ -99,10 +111,11 @@ def _cfg(num_kv_heads: int = 4) -> LLMTunerConfig:
 def _build_model(cfg: LLMTunerConfig, *, flex: bool, seed: int = 0):
     """Deterministically initialized tiny qwen3; identical on every rank."""
     torch.manual_seed(seed)
-    model = HFTransformerModel(build_model_config_for(cfg)).to(torch.float64)
+    model = moved(HFTransformerModel(build_model_config_for(cfg)).to(DTYPE))
     if flex:
-        # The machine-level fallback picks sdpa off CUDA; CP needs the flex
-        # path, so the test opts in explicitly.
+        # The machine-level fallback picks sdpa off CUDA; a flex CP run has to
+        # opt in explicitly. On the accelerator the CP sdpa kernels are the
+        # ones this build supports (see sdpa_attention.py).
         model.model.config._attn_implementation = "flex_torchtitan"
     return model.eval()
 
@@ -112,13 +125,13 @@ def _data(seed: int = 0):
     ids = torch.randint(VOCAB, (SEQ,), generator=g)
     labels = torch.randint(VOCAB, (SEQ,), generator=g)
     positions = torch.arange(SEQ)
-    return ids, labels, positions
+    return moved(ids), moved(labels), moved(positions)
 
 
 def _causal_additive_mask(t: int) -> torch.Tensor:
-    """A dense causal additive (1, 1, t, t) float64 mask."""
-    causal = torch.tril(torch.ones(t, t, dtype=torch.bool))
-    additive = torch.zeros(t, t, dtype=torch.float64)
+    """A dense causal additive (1, 1, t, t) mask in the run's ``DTYPE``."""
+    causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=DEVICE))
+    additive = torch.zeros(t, t, dtype=DTYPE, device=DEVICE)
     return additive.masked_fill(~causal, float("-inf"))[None, None]
 
 
@@ -160,7 +173,9 @@ def _run_ulysses(
     failures: list[str],
 ) -> dict[str, float]:
     cfg = _cfg(num_kv_heads)
-    model = _build_model(cfg, flex=True)
+    # flex is CUDA-only; on the accelerator ``apply_cp`` attaches the sdpa
+    # ulysses kernel instead (its swap needs no BlockMask).
+    model = _build_model(cfg, flex=DEVICE.type == "cpu")
     ref = _build_model(cfg, flex=False)
     apply_cp(model, mesh=mesh, cfg=cfg.parallel)
 
@@ -193,7 +208,10 @@ def _run_ulysses(
         loss_local = F.cross_entropy(logits_local, labels_sh, reduction="sum")
         loss_ref = F.cross_entropy(ref_logits, labels, reduction="sum")
     dist.all_reduce(loss_local, group=mesh["cp"].get_group())
-    loss_diff = abs(loss_local.item() - loss_ref.item())
+    # Compare the MEAN loss, not the summed one: the sum is O(1e3) here, so an
+    # fp32 accumulation residual of 1e-7 relative is already 1e-4 absolute and
+    # would sit above TOL for reasons that have nothing to do with the wiring.
+    loss_diff = abs(loss_local.item() - loss_ref.item()) / labels.numel()
     if loss_diff > TOL:
         failures.append(f"{name}: loss diff {loss_diff:.3e}")
 
@@ -207,8 +225,8 @@ def _check_all_to_all(cp_mesh, failures: list[str]) -> dict[str, float]:
     group = cp_mesh.get_group()
     b, h, s, d = 2, 4, 16, 8
     g = torch.Generator().manual_seed(0)
-    full = torch.randn(b, h, s, d, generator=g, dtype=torch.float64)
-    w_full = torch.randn(b, h, s, d, generator=g, dtype=torch.float64)
+    full = moved(torch.randn(b, h, s, d, generator=g, dtype=DTYPE))
+    w_full = moved(torch.randn(b, h, s, d, generator=g, dtype=DTYPE))
 
     # The contiguous token shard (ulysses runs without a load balancer).
     lo, hi = rank * s // cp, (rank + 1) * s // cp
@@ -376,7 +394,6 @@ def _check_ulysses_under_a_load_balancer(mesh, failures: list[str]) -> dict[str,
         SEQ,
         device=torch.device("cpu"),
         BLOCK_SIZE=128,
-        separate_full_blocks=True,
     )
     sharded_mask = shard_attention_mask_for_cp(full_mask, mesh["cp"], "headtail")
 
@@ -399,30 +416,55 @@ def _check_ulysses_under_a_load_balancer(mesh, failures: list[str]) -> dict[str,
     return {"vs_permuted": diff, "permutation_gap": gap}
 
 
+def _head_tail_balancer_available() -> bool:
+    """Whether torch exposes the private head/tail load balancer (2.12+)."""
+    from importlib.util import find_spec
+
+    try:
+        return (
+            find_spec(
+                "torch.distributed.tensor.experimental._context_parallel._load_balancer"
+            )
+            is not None
+        )
+    except ModuleNotFoundError:
+        return False
+
+
 def main() -> None:
-    dist.init_process_group("gloo")
+    init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 2, f"this check assumes 2 ranks, got {world}"
 
-    mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("cp",))
+    mesh = init_device_mesh(DEVICE.type, (world,), mesh_dim_names=("cp",))
     failures: list[str] = []
     stats: dict[str, dict[str, float]] = {}
+    skipped: list[str] = []
 
     stats["all_to_all"] = _check_all_to_all(mesh["cp"], failures)
     stats["ulysses/mha"] = _run_ulysses("ulysses/mha", 4, mesh, failures)
     stats["ulysses/gqa"] = _run_ulysses("ulysses/gqa", 2, mesh, failures)
-    stats["ulysses_load_balancer"] = _check_ulysses_under_a_load_balancer(
-        mesh, failures
-    )
+    if _head_tail_balancer_available():
+        stats["ulysses_load_balancer"] = _check_ulysses_under_a_load_balancer(
+            mesh, failures
+        )
+    else:
+        skipped.append(
+            "ulysses+head_tail: torch's private _HeadTailLoadBalancer is "
+            "absent in this build"
+        )
     _check_refusals(mesh, failures)
 
     # Every rank must agree that every check passed, not just report its own.
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=DEVICE)
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
 
     if rank == 0:
-        print(f"seq={SEQ} cp_size={world} dtype=float64 tol={TOL:.0e}")
+        print(
+            f"seq={SEQ} cp_size={world} dtype={DTYPE} tol={TOL:.0e} "
+            f"device={DEVICE.type} backend={backend()}"
+        )
         a2a = stats["all_to_all"]
         print(
             f"all-to-all fwd={a2a['forward']:.3e} bwd={a2a['backward']:.3e} "
@@ -431,11 +473,14 @@ def main() -> None:
         for name in ("ulysses/mha", "ulysses/gqa"):
             s = stats[name]
             print(f"{name:20s} logits={s['logits']:.3e} loss={s['loss']:.3e}")
-        lb = stats["ulysses_load_balancer"]
-        print(
-            f"ulysses + headtail: vs permuted={lb['vs_permuted']:.3e} "
-            f"(permutation gap={lb['permutation_gap']:.3e})"
-        )
+        if "ulysses_load_balancer" in stats:
+            lb = stats["ulysses_load_balancer"]
+            print(
+                f"ulysses + headtail: vs permuted={lb['vs_permuted']:.3e} "
+                f"(permutation gap={lb['permutation_gap']:.3e})"
+            )
+        for note in skipped:
+            print(f"  skipped: {note}")
         print(f"failed ranks   = {int(local_ok.item())}")
         if failures:
             for f in failures:

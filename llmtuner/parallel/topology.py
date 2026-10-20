@@ -211,11 +211,21 @@ class ParallelTopology:
             Keep all axes backed by usable process groups so mesh slicing works
             consistently across PyTorch versions and parallel combinations.
             """
-            return world_mesh._unflatten(
-                0,
-                dim_sizes,
-                dim_names,
-            )
+            # ``DeviceMesh._unflatten`` is private and only present from torch
+            # 2.12 on. On older builds (torch 2.9, the Ascend/torch_npu stack)
+            # rebuild the identical row-major n-D layout over the same world
+            # ranks with the public ``init_device_mesh``. Each view then carries
+            # its own process groups instead of sharing the world mesh's, which
+            # matches the "DeviceMesh recreates process groups for each view"
+            # behaviour already relied on above.
+            unflatten = getattr(world_mesh, "_unflatten", None)
+            if unflatten is not None:
+                return unflatten(
+                    0,
+                    dim_sizes,
+                    dim_names,
+                )
+            return init_device_mesh(device_type, dim_sizes, mesh_dim_names=dim_names)
 
         logger.info(
             f"Building device mesh with parallelism: "

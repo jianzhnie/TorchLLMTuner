@@ -55,6 +55,8 @@ def resolve_training_reduction_meshes(
         parallel_dims.get_optional_mesh(sequence_axes) if sequence_axes else None
     )
     if sequence_mesh is not None and len(sequence_axes) > 1:
+        # The reduction sites hand this mesh to one all_reduce, and
+        # ``DeviceMesh.get_group`` refuses a mesh with more than one dimension.
         sequence_mesh = sequence_mesh._flatten("sequence_loss")
     return TrainingReductionMeshes(
         dp_mesh=dp_mesh,

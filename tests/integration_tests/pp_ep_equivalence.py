@@ -36,6 +36,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
+from llmtuner.accelerator.spmd import spmd_context
 from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
 from llmtuner.config import (
     LLMTunerConfig,
@@ -55,6 +56,7 @@ from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.expert_parallel import swap_hf_moe_blocks
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.module_names import canonical_fqn
+from tests.integration_tests.harness import device, moved, moved_batch
 
 STEPS = 4
 MICROBATCHES = 4
@@ -130,7 +132,10 @@ def _reference_trajectory(
     model from ``cfg.seed`` would compare different parameters.
     """
     torch.manual_seed(cfg.seed)
-    model = HFTransformerModel(build_model_config_for(cfg))
+    # The oracle shares the accelerator with the trainer arm: the swapped MoE
+    # blocks wire their auxiliary-loss buffers on the accelerator device, so a
+    # CPU-resident oracle would mix devices inside the router.
+    model = moved(HFTransformerModel(build_model_config_for(cfg)))
     swap_hf_moe_blocks(model)
     merged: dict[str, torch.Tensor] = {}
     for key in {key for state in initial_states for key in state}:
@@ -164,7 +169,7 @@ def _reference_trajectory(
     snapshots = []
     for _ in range(cfg.steps):
         optimizer.zero_grad(set_to_none=True)
-        batch = next(batches)
+        batch = moved_batch(next(batches))
         AuxLoss.set_step_denominator(torch.tensor(batch.input_ids.numel()))
         targets = model.preprocess_inputs(batch, parallel_dims=None)[1].reshape(
             cfg.global_batch_size, cfg.max_seq_len
@@ -181,7 +186,10 @@ def _reference_trajectory(
         optimizer.step()
         snapshots.append(
             {
-                name: (parameter.grad.detach().clone(), parameter.detach().clone())
+                name: (
+                    parameter.grad.detach().cpu().clone(),
+                    parameter.detach().cpu().clone(),
+                )
                 for name, parameter in model.named_parameters()
             }
         )
@@ -294,7 +302,14 @@ def main() -> None:
         actual_snapshots.append(merged)
     trainer.close()
 
-    reference, expected_snapshots = _reference_trajectory(cfg, initial_states)
+    # The oracle is the *unparallelized* path, so it must not see this run's
+    # meshes: the trainer's context leaves the mesh registry populated (only
+    # the mesh *stack* is restored), and the swapped MoE blocks read the sparse
+    # EP mesh from it -- which turns their token dispatch into mesh-aware
+    # (DTensor) ops that then reject the oracle's CPU batch. Same guard as
+    # ``ep_fsdp_equivalence`` uses for its reference.
+    with spmd_context(None):
+        reference, expected_snapshots = _reference_trajectory(cfg, initial_states)
     for step, (actual, expected) in enumerate(
         zip(actual_snapshots, expected_snapshots, strict=True)
     ):
@@ -320,7 +335,7 @@ def main() -> None:
         for f in failures:
             print(f"  FAIL {f}")
         print("all checks passed" if not failures else "CHECKS FAILED")
-    verdict = torch.tensor(len(failures), dtype=torch.int64)
+    verdict = torch.tensor(len(failures), dtype=torch.int64, device=device())
     dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
     assert int(verdict) == 0, f"{int(verdict)} check(s) failed -- see rank 0 output"
 

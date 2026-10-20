@@ -24,6 +24,7 @@ from llmtuner.config import (
     TrainingConfig,
 )
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.harness import device as harness_device
 
 
 def _cfg() -> LLMTunerConfig:
@@ -58,7 +59,8 @@ def main() -> None:
         if "pipeline" not in str(ex):
             failures.append(f"unexpected message: {ex}")
 
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    # Crosses an HCCL group on the accelerator: it has to live on that device.
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=harness_device())
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
     if dist.get_rank() == 0:
         for f in failures:

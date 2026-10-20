@@ -70,6 +70,7 @@ from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.parallel.topology import ParallelTopology
+from tests.integration_tests.harness import init_distributed, moved
 
 NUM_EXPERTS = 8
 TOP_K = 2
@@ -113,7 +114,7 @@ def _model(
         first, second = (layer.mlp.experts for layer in model.layers)
         second.gate_up_proj = first.gate_up_proj
         second.down_proj = first.down_proj
-    return model
+    return moved(model)
 
 
 def _data() -> tuple[torch.Tensor, torch.Tensor]:
@@ -129,17 +130,50 @@ def _data() -> tuple[torch.Tensor, torch.Tensor]:
     labels = torch.randint(
         128, (4, TOKENS_PER_RANK), generator=torch.Generator().manual_seed(2000)
     )
-    return ids, labels
+    return moved(ids), moved(labels)
 
 
 def _loss_sum(model, ids_T, labels_T) -> torch.Tensor:
     """Summed CE over one packed 1-D sequence (the wrapper's input shape)."""
-    positions = torch.arange(ids_T.shape[0])
+    positions = torch.arange(ids_T.shape[0], device=ids_T.device)
     return F.cross_entropy(model(ids_T, positions=positions), labels_T, reduction="sum")
 
 
 def _full(t: torch.Tensor) -> torch.Tensor:
     return t.full_tensor() if isinstance(t, DTensor) else t
+
+
+def _ref_expert_grads(block) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference gate/up and down gradients as ``(E, 2F, D)`` and ``(E, D, F)``.
+
+    transformers 5.x holds the experts fused; 4.x holds one module per expert.
+    Read in HF's own terms so the comparison stays anchored on what HF computed.
+    """
+    experts = block.experts
+    gate_up = getattr(experts, "gate_up_proj", None)
+    if gate_up is not None:
+        return gate_up.grad, experts.down_proj.grad
+    names = (
+        ("gate_proj", "up_proj", "down_proj")
+        if hasattr(experts[0], "gate_proj")
+        else ("w1", "w3", "w2")
+    )
+    gate_name, up_name, down_name = names
+    return (
+        torch.stack(
+            [
+                torch.cat(
+                    [
+                        getattr(expert, gate_name).weight.grad,
+                        getattr(expert, up_name).weight.grad,
+                    ],
+                    dim=0,
+                )
+                for expert in experts
+            ]
+        ),
+        torch.stack([getattr(expert, down_name).weight.grad for expert in experts]),
+    )
 
 
 def main() -> None:
@@ -168,7 +202,7 @@ def main() -> None:
         from llmtuner.parallel.fully_shard_parallel.fine_grained_state import (
             FineGrainedFSDPState,
         )
-    dist.init_process_group("gloo")
+    device = init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 4, f"this check assumes 4 ranks, got {world}"
@@ -205,7 +239,7 @@ def main() -> None:
                 cfg=cfg,
                 mesh=parallel_dims.spmd_dense_mesh(),
                 parallel_dims=parallel_dims,
-                device=torch.device("cpu"),
+                device=device,
             )
         except UnsupportedCombinationError as error:
             assert "external_expert" in str(error)
@@ -284,7 +318,7 @@ def main() -> None:
             cfg=cfg,
             mesh=parallel_dims.spmd_dense_mesh(),
             parallel_dims=parallel_dims,
-            device=torch.device("cpu"),
+            device=device,
         )
     if args.converted_root_expert:
         expert = model.layers[0].mlp.routed_experts.inner_experts.w2_EDF
@@ -480,8 +514,7 @@ def main() -> None:
                     f"rank {rank} layer {layer_idx}: router grad diff {gate_diff:.3e}"
                 )
 
-        gate_up_grad = ref_mlp.experts.gate_up_proj.grad  # (E, 2F, D)
-        down_grad = ref_mlp.experts.down_proj.grad  # (E, D, F)
+        gate_up_grad, down_grad = _ref_expert_grads(ref_mlp)  # (E, 2F, D), (E, D, F)
         checks = [
             (
                 "w1",
@@ -503,7 +536,7 @@ def main() -> None:
                 )
 
     # Every rank must agree that every check passed, not just report its own.
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=device)
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
 
     if rank == 0:

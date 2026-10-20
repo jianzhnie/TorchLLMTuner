@@ -108,6 +108,26 @@ def _pipelining_has_eval() -> bool:
     return "return_outputs" in inspect.signature(step).parameters
 
 
+def _fsdp_unshard_is_a_context_manager() -> bool:
+    """Whether an FSDP unshard can be held open across several backwards.
+
+    Chunked loss backwards the sharded ``lm_head`` once per chunk; keeping the
+    unshard alive for the whole loop is what makes that work. torch 2.9's
+    ``UnshardHandle`` only has ``wait()``, so the unshard cannot be held and the
+    second chunk runs against released storage. Probed on the handle class
+    rather than on a version number: the context-manager form is the capability,
+    whenever it arrives.
+    """
+    if not importable(
+        "torch.distributed.fsdp._fully_shard._fully_shard", "_UnshardHandleImpl"
+    )():
+        return False
+    import torch.distributed.fsdp._fully_shard._fully_shard as fully_shard_module
+
+    handle = fully_shard_module._UnshardHandleImpl
+    return hasattr(handle, "__enter__") and hasattr(handle, "__exit__")
+
+
 def grouped_mm_runs() -> bool:
     """Whether ``torch._grouped_mm`` can run here.
 
@@ -200,6 +220,36 @@ CAPABILITIES: dict[str, Capability] = {
         hint="Upgrade torch, or use activation_checkpoint_mode='full'/'selective'.",
         consumers="memory/activation_checkpoint.py (mode='memory_budget')",
     ),
+    # -- FSDP (consumers: fully_shard_parallel, trainer/runtime/assembly) ------
+    "fsdp_unshard_context": Capability(
+        _fsdp_unshard_is_a_context_manager,
+        what="an FSDP unshard that stays open for the duration of a ``with`` "
+        "block (``UnshardHandle.__enter__``), so several chunk backwards can "
+        "share one unsharded ``lm_head``",
+        since="no released torch through 2.12 (``UnshardHandle`` still has "
+        "only ``wait()``); the probe, not a version number, decides",
+        hint="Absent: chunked_loss_num_chunks > 1 is refused under FSDP; run "
+        "with chunked_loss_num_chunks=1 (no released torch carries the "
+        "context-manager unshard yet).",
+        consumers="trainer/runtime/assembly.py (chunked loss + FSDP guard)",
+    ),
+    "fsdp_per_param_mesh": Capability(
+        importable(
+            "torch.distributed.fsdp._fully_shard._fsdp_common",
+            "ShardPlacementResult",
+        ),
+        what="torch.distributed.fsdp._fully_shard._fsdp_common."
+        "ShardPlacementResult -- a placement function that also names a mesh, so "
+        "ONE fully_shard unit can place parameters on two different meshes",
+        since="torch 2.12 (2.9's shard_placement_fn returns Optional[Shard] and "
+        "has no mesh slot)",
+        hint="Absent: the EP > 1 decoder path shards the experts in their own "
+        "nested FSDP unit on the sparse mesh instead "
+        "(fully_shard_parallel.shard_experts_on_their_own_mesh); the "
+        "pattern-selected path has no such fallback and refuses.",
+        consumers="parallel/fully_shard_parallel/fully_shard_parallel.py "
+        "(EP > 1 decoder path), plan.py (pattern-selected units)",
+    ),
     "dynamo_lru_cache": Capability(
         dynamo_lru_cache_knob,
         what="torch._C._dynamo.eval_frame._set_lru_cache",
@@ -215,10 +265,13 @@ CAPABILITIES: dict[str, Capability] = {
         what="torch.distributed.pipelining microbatch drivers "
         "(_PipelineSchedule.eval(arg_mbs=...) and "
         "_step_microbatches(return_outputs=...))",
-        since="torch main/2.10+ (2.9's eval swallows the microbatch kwargs)",
-        hint="Upgrade torch, or run with pipeline_parallel_size=1.",
-        consumers="pipeline_parallel/pipeline_parallel.py (PP assembly), "
-        "trainer/runtime/{pipeline,validation}.py (PP train/eval drivers)",
+        since="no released torch through 2.12 (2.9's and 2.12's eval both "
+        "swallow the microbatch kwargs); the probe reads the signature",
+        hint="Optional: when absent, PP falls back to the drivers in "
+        "parallel/pipeline_parallel/microbatch_drivers.py, which reproduce the "
+        "schedule setup torch's own step() performs.",
+        consumers="trainer/runtime/{pipeline,validation}.py (chooses the native "
+        "microbatch driver or the fallback)",
     ),
     # -- model kernels (consumer: models/common/moe/experts.py) ----------------
     "torch_grouped_mm": Capability(
