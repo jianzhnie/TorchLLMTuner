@@ -453,3 +453,19 @@ def test_container_step_rejects_divergent_progress_before_changing_rates():
         optimizer.step()
     container.step()
     assert container.state_dict() == {"last_epoch": 2}
+
+
+@pytest.mark.parametrize("state", [None, [], "", 0, False, [1], "invalid"])
+def test_scheduler_rejects_non_dictionary_state_without_changing_rates(state):
+    optimizer = _optimizer(0.4)
+    scheduler = build_lr_scheduler(
+        LRSchedulerConfig(warmup_steps=3), optimizers=[optimizer], training_steps=10
+    )
+    before = scheduler.state_dict().copy()
+    rates = scheduler.get_metrics().copy()
+    with pytest.raises(
+        ValueError, match="scheduler checkpoint state must be a dictionary"
+    ):
+        scheduler.load_state_dict(state)
+    assert scheduler.state_dict() == before
+    assert scheduler.get_metrics() == rates

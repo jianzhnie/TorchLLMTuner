@@ -74,7 +74,12 @@ def main():
     try:
         rank = dist.get_rank()
         assert dist.get_world_size() == 2
-        for empty_rank, zero_receives in ((False, False), (True, False), (False, True)):
+        for empty_rank, zero_receives, all_empty in (
+            (False, False, False),
+            (True, False, False),
+            (False, True, False),
+            (False, False, True),
+        ):
             torch.manual_seed(5)
             reference_experts = GroupedExperts(4, 3, 4, use_grouped_mm=False).half()
             for parameter in reference_experts.parameters():
@@ -94,50 +99,91 @@ def main():
                 ids[:] = torch.tensor([0, 1])
             boundary = 0 if empty_rank else 2
             sl = slice(0, boundary) if rank == 0 else slice(boundary, 5)
+            if all_empty:
+                inputs, scores, ids = inputs[:0], scores[:0], ids[:0]
+                sl = slice(0, 0)
             x = inputs[sl].clone().requires_grad_()
             weights = scores[sl].clone().requires_grad_()
             ref_x = inputs.clone().requires_grad_()
             ref_weights = scores.clone().requires_grad_()
             reference = RoutedExperts(reference_experts, LocalTokenDispatcher(4, 2))
-            expected = reference(
-                ref_x, ref_weights, ids, torch.bincount(ids.flatten(), minlength=4)
-            )
             dispatcher = AllToAllTokenDispatcher(4, 2)
             dispatcher.set_ep_group(ep_group=dist.group.WORLD)
             ops = DistributedOps()
-            with (
-                patch.object(mc2_dispatch, "load_mc2_ops", lambda ops=ops: ops),
-                patch.object(
-                    mc2_dispatch,
-                    "mc2_communication_context",
-                    lambda *args, ops=ops: (ops, "test", 2),
-                ),
-            ):
+            with patch.object(mc2_dispatch, "load_mc2_ops", lambda ops=ops: ops):
                 model = mc2_dispatch.MC2RoutedExperts(experts, dispatcher)
-                actual = model(
-                    x, weights, ids[sl], torch.bincount(ids[sl].flatten(), minlength=4)
+            optimizer = torch.optim.SGD(experts.parameters(), lr=0.01, momentum=0.9)
+            reference_optimizer = torch.optim.SGD(
+                reference_experts.parameters(), lr=0.01, momentum=0.9
+            )
+            original_ids = ids.clone()
+            for step in range(3):
+                # Exercise loss of all local routes after momentum exists,
+                # then restore the original destinations on the next update.
+                ids.copy_(original_ids)
+                if step == 1 and not (empty_rank or zero_receives or all_empty):
+                    ids[:] = torch.tensor([0, 1])
+                optimizer.zero_grad(set_to_none=True)
+                reference_optimizer.zero_grad(set_to_none=True)
+                for leaf in (x, weights, ref_x, ref_weights):
+                    leaf.grad = None
+                expected = reference(
+                    ref_x, ref_weights, ids, torch.bincount(ids.flatten(), minlength=4)
                 )
-                actual.float().sum().backward()
-            expected.float().sum().backward()
-            for got, wanted in (
-                (actual, expected[sl]),
-                (x.grad, ref_x.grad[sl]),
-                (weights.grad, ref_weights.grad[sl]),
-            ):
-                torch.testing.assert_close(got, wanted, atol=5e-4, rtol=1e-2)
-            for got, wanted in zip(
-                experts.parameters(), reference_experts.parameters(), strict=True
-            ):
-                torch.testing.assert_close(
-                    got.grad,
-                    wanted.grad[rank * 2 : (rank + 1) * 2],
-                    atol=5e-4,
-                    rtol=1e-2,
-                )
+                with (
+                    patch.object(mc2_dispatch, "load_mc2_ops", lambda ops=ops: ops),
+                    patch.object(
+                        mc2_dispatch,
+                        "mc2_communication_context",
+                        lambda *args, ops=ops: (ops, "test", 2),
+                    ),
+                ):
+                    actual = model(
+                        x,
+                        weights,
+                        ids[sl],
+                        torch.bincount(ids[sl].flatten(), minlength=4),
+                    )
+                    actual.float().sum().backward()
+                expected.float().sum().backward()
+                for got, wanted in (
+                    (actual, expected[sl]),
+                    (x.grad, ref_x.grad[sl]),
+                    (weights.grad, ref_weights.grad[sl]),
+                ):
+                    torch.testing.assert_close(got, wanted, atol=5e-4, rtol=1e-2)
+                for got, wanted in zip(
+                    experts.parameters(), reference_experts.parameters(), strict=True
+                ):
+                    torch.testing.assert_close(
+                        got.grad,
+                        wanted.grad[rank * 2 : (rank + 1) * 2],
+                        atol=5e-4,
+                        rtol=1e-2,
+                    )
+                optimizer.step()
+                reference_optimizer.step()
+                for got, wanted in zip(
+                    experts.parameters(), reference_experts.parameters(), strict=True
+                ):
+                    torch.testing.assert_close(
+                        got,
+                        wanted[rank * 2 : (rank + 1) * 2],
+                        atol=5e-4,
+                        rtol=1e-2,
+                    )
+                    torch.testing.assert_close(
+                        optimizer.state[got]["momentum_buffer"],
+                        reference_optimizer.state[wanted]["momentum_buffer"][
+                            rank * 2 : (rank + 1) * 2
+                        ],
+                        atol=5e-4,
+                        rtol=1e-2,
+                    )
             if rank == 0:
                 print(
-                    f"MC2 adapter {empty_rank=} {zero_receives=}: "
-                    "output and gradients passed"
+                    f"MC2 adapter {empty_rank=} {zero_receives=} {all_empty=}: "
+                    "three momentum updates, outputs and gradients passed"
                 )
     finally:
         dist.destroy_process_group()

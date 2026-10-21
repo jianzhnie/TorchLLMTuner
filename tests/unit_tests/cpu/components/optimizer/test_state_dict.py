@@ -586,3 +586,70 @@ def test_adam_restore_rejects_nested_substitute_for_required_state(state_name):
     ):
         assert optimizer.param_groups[0]["lr"] == 0.1
         assert next(iter(optimizer.state.values())) is original_state
+
+
+@pytest.mark.parametrize("optimizer_type", [torch.optim.Adam, torch.optim.AdamW])
+def test_fqn_restore_matches_update_after_parameter_group_reordering(optimizer_type):
+    from llmtuner.components.optimizer.state_dict import (
+        get_flat_optim_state_dict,
+        load_flat_optim_state_dict,
+    )
+
+    source = {
+        name: torch.nn.Parameter(torch.tensor([value]))
+        for name, value in (("left", 1.0), ("right", 2.0))
+    }
+    target = {
+        name: torch.nn.Parameter(value.detach().clone())
+        for name, value in source.items()
+    }
+
+    def build(parameters, names, rate):
+        return optimizer_type(
+            [
+                {
+                    "params": [parameters[name]],
+                    "param_names": [name],
+                    "lr": rate * (index + 1),
+                }
+                for index, name in enumerate(names)
+            ],
+            foreach=False,
+        )
+
+    original = build(source, ("left", "right"), 0.01)
+    restored = build(target, ("right", "left"), 0.3)
+    for index, parameter in enumerate(source.values()):
+        parameter.grad = torch.full_like(parameter, index + 0.5)
+    original.step()
+    with torch.no_grad():
+        for name in source:
+            target[name].copy_(source[name])
+    init_optim_state(restored)
+    # A persisted checkpoint owns independent tensors. Native load_state_dict
+    # may retain same-device tensor storage from an in-memory state dictionary.
+    import copy
+
+    load_flat_optim_state_dict(
+        restored, flat_state=copy.deepcopy(get_flat_optim_state_dict(original))
+    )
+    torch.testing.assert_close(
+        get_flat_optim_state_dict(restored),
+        get_flat_optim_state_dict(original),
+        rtol=0,
+        atol=0,
+    )
+    for name in source:
+        gradient = torch.full_like(source[name], -0.75 if name == "left" else 1.25)
+        source[name].grad = gradient.clone()
+        target[name].grad = gradient.clone()
+    original.step()
+    restored.step()
+    for name in source:
+        torch.testing.assert_close(target[name], source[name], rtol=0, atol=0)
+    torch.testing.assert_close(
+        get_flat_optim_state_dict(restored),
+        get_flat_optim_state_dict(original),
+        rtol=0,
+        atol=0,
+    )

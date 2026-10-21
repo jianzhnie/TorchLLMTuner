@@ -16,7 +16,11 @@ from torch.distributed.device_mesh import init_device_mesh
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.datasets.contracts import Batch, DataloaderExhaustedError
 from llmtuner.trainer.runtime.batch import batch_generator, fetch_batch
-from llmtuner.trainer.runtime.validation import finalize_validation, run_validation_loop
+from llmtuner.trainer.runtime.validation import (
+    count_validation_batch_tokens,
+    finalize_validation,
+    run_validation_loop,
+)
 from llmtuner.trainer.trainer import Trainer
 
 
@@ -37,6 +41,39 @@ def main():
         rank = dist.get_rank()
         assert dist.get_world_size() == 2
         batch = Batch(input_ids=torch.ones(1, 4), labels=torch.ones(1, 4))
+        token_mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("validation_dp",))
+        for failing_rank in (0, 1):
+            local_batch = (
+                Batch(input_ids=torch.ones(()), labels=torch.ones(()))
+                if rank == failing_rank
+                else batch
+            )
+            trainer = SimpleNamespace(
+                metrics=Metrics(),
+                device=torch.device("cpu"),
+                count_valid_tokens=Trainer.count_valid_tokens,
+            )
+            # Scalar labels pass fetch's numel check, but fail token counting.
+            # Peers must reject the batch before entering the DP all-reduce.
+            try:
+                count_validation_batch_tokens(trainer, local_batch, dp_mesh=token_mesh)
+            except IndexError:
+                assert rank == failing_rank
+            except RuntimeError as error:
+                assert rank != failing_rank
+                assert (
+                    str(error) == "Validation token accounting failed on another rank"
+                )
+            else:
+                raise AssertionError("validation token failure was not coordinated")
+            dist.barrier()
+            print(
+                f"rank={rank}: validation token failure rank {failing_rank} coordinated"
+            )
+        # A coordinated local failure must leave the group usable.
+        tokens = count_validation_batch_tokens(trainer, batch, dp_mesh=token_mesh)
+        assert tokens.item() == 6
+        dist.barrier()
         for failure in (
             "exhaustion",
             "exception",
@@ -346,6 +383,70 @@ def main():
                 assert logs == []
             dist.barrier()
             print(f"rank={rank} validation {failure}: closed and coordinated")
+        for failing_rank in (0, 1):
+            for error_type in (ValueError, KeyboardInterrupt, SystemExit):
+                for phase in ("count", "metrics"):
+                    original = error_type(f"validation token {phase} failed")
+                    closed = []
+
+                    class TokenFailureLoader:
+                        def __iter__(self):
+                            return iter([batch])
+
+                        def close(self, closed=closed):
+                            closed.append(True)
+
+                    def fail_locally(
+                        *args, original=original, failing_rank=failing_rank
+                    ):
+                        if rank == failing_rank:
+                            raise original
+                        return 3
+
+                    original_count = trainer.count_valid_tokens
+                    original_metrics = trainer.metrics
+                    trainer.metrics = Metrics()
+                    if phase == "count":
+                        trainer.count_valid_tokens = fail_locally
+                    else:
+                        trainer.metrics.add_tokens = fail_locally
+                    try:
+                        with (
+                            patch(
+                                "llmtuner.trainer.runtime.validation.create_validation_dataloader",
+                                return_value=TokenFailureLoader(),
+                            ),
+                            patch.object(trainer, "preprocess") as preprocess,
+                            patch(
+                                "llmtuner.trainer.runtime.validation.finalize_validation"
+                            ) as finalize,
+                        ):
+                            try:
+                                run_validation_loop(
+                                    trainer, ValidationConfig(steps=1), step=8
+                                )
+                            except (ValueError, KeyboardInterrupt, SystemExit) as error:
+                                assert rank == failing_rank and error is original
+                            except RuntimeError as error:
+                                assert rank != failing_rank
+                                assert str(error) == (
+                                    "Validation token accounting failed on another rank"
+                                )
+                            else:
+                                raise AssertionError(
+                                    "token failure escaped coordination"
+                                )
+                            preprocess.assert_not_called()
+                            finalize.assert_not_called()
+                    finally:
+                        trainer.count_valid_tokens = original_count
+                        trainer.metrics = original_metrics
+                    assert closed == [True]
+                    dist.barrier()
+                    print(
+                        f"rank={rank}: validation {phase} {error_type.__name__} "
+                        f"on rank {failing_rank} closed before model execution"
+                    )
         for phase in ("construction", "iteration"):
             closed = []
             original = ValueError(f"validation {phase} failed")

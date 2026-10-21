@@ -3192,3 +3192,62 @@ def test_uneven_dp_slices_cover_each_repeated_epoch(length, degree, shuffle):
         ]
         assert actual == [next(expected) for _ in range(length)]
         assert sorted(actual) == list(range(length))
+
+
+def test_jsonl_byte_offsets_preserve_multifile_unicode_rows(tmp_path):
+    from llmtuner.datasets.sources import IndexedJsonlDataSource
+
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    first.write_bytes(
+        '\r\n{"text":"你好🌍","id":0}\r\n \t\r\n{"text":"é","id":1}'.encode()
+    )
+    second.write_bytes('\n{"text":"日本語","id":2}\n{"text":"끝","id":3}\n'.encode())
+    expected = [
+        {"text": "你好🌍", "id": 0},
+        {"text": "é", "id": 1},
+        {"text": "日本語", "id": 2},
+        {"text": "끝", "id": 3},
+    ]
+    # Explicit pattern order is the corpus order, independent of filenames.
+    source = IndexedJsonlDataSource((str(second), str(first)))
+    ordered = expected[2:] + expected[:2]
+    assert len(source) == 4
+    for index in (3, 0, 2, 1, -1, -4):
+        assert source[index] == ordered[index]
+    for index in (-5, 4):
+        with pytest.raises(IndexError):
+            source[index]
+    # Reconstruction must yield the same index without retaining decoded rows.
+    rebuilt = IndexedJsonlDataSource((str(second), str(first)))
+    assert list(rebuilt) == ordered
+
+
+@pytest.mark.parametrize("has_eos", [False, True])
+@pytest.mark.parametrize("limit", [4, 5])
+def test_sft_supervision_matches_explicit_token_contract(has_eos, limit):
+    class Tokenizer:
+        eos_id = 9
+
+        def apply_chat_template(self, messages, *, add_generation_prompt):
+            return "prompt" if add_generation_prompt else "conversation"
+
+        def encode(self, text, *, add_bos, add_eos):
+            assert add_bos and not add_eos
+            if text == "prompt":
+                return [1, 2, 3]
+            return [1, 2, 3, 7, 8] + ([9] if has_eos else [])
+
+    processor = ChatProcessor(
+        context=make_context(Tokenizer(), max_context_length=limit),
+        messages_fn=lambda sample: sample["messages"],
+    )
+    sequence = processor(
+        {"messages": [{"role": "user"}, {"role": "assistant"}]},
+        np.random.default_rng(0),
+    )
+    if limit == 4:
+        assert sequence is None
+    else:
+        assert sequence.input_ids.tolist() == [1, 2, 3, 7, 8]
+        assert sequence.labels.tolist() == [IGNORE_INDEX, IGNORE_INDEX, 7, 8, 9]

@@ -4,6 +4,7 @@ Run with torchrun --nproc_per_node=2. Does not execute KDA Ascend kernels.
 """
 
 from copy import deepcopy
+from unittest.mock import patch
 
 from tests.caps import require_env
 
@@ -85,6 +86,32 @@ def main():
                 for padding in (False, True):
                     for additive in (False, True):
                         run_case(query_rank, gate, padding, additive)
+        # Locally valid shards must agree before any shaped payload exchange.
+        for axis in ("batch", "heads", "sequence", "query_dim", "value_dim"):
+            geometry = dict(batch=1, heads=4, sequence=3, query_dim=4, value_dim=3)
+            if dist.get_rank() == 1:
+                geometry[axis] += 2 if axis == "heads" else 1
+            b, h, s, d, v = geometry.values()
+            query = torch.randn(b, h, s, d)
+            value = torch.randn(b, h, s, v)
+            with patch.object(
+                dist,
+                "all_gather",
+                side_effect=AssertionError("payload exchange reached"),
+            ) as payload:
+                try:
+                    kcp_mla_attention(dist.group.WORLD)(
+                        None, query, query, value, None, scaling=0.5
+                    )
+                except ValueError as error:
+                    assert "matching batch, heads, sequence and head dimensions" in str(
+                        error
+                    )
+                else:
+                    raise AssertionError("MLA geometry mismatch was not rejected")
+                payload.assert_not_called()
+            dist.barrier()
+            print(f"rank {dist.get_rank()}: MLA {axis} mismatch rejected", flush=True)
         # A mask error on one rank must be shared before peers enter all-to-all.
         query = torch.randn(1, 4, 3, 4)
         mask = torch.ones(1, 1, 3, 3, dtype=torch.bool).tril()

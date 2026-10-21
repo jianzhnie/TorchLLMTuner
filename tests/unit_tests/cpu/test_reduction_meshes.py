@@ -1,6 +1,7 @@
 """Train and validation mesh ownership, without constructing process groups."""
 
 from itertools import product
+from unittest.mock import Mock
 
 import pytest
 
@@ -21,7 +22,7 @@ class Topology:
             "loss": object() if dp or cp or tp else None,
             "cp": object() if cp else None,
             "tp": object() if tp else None,
-            ("cp", "tp"): object() if cp and tp else None,
+            ("cp", "tp"): Mock() if cp and tp else None,
         }
 
     def get_optional_mesh(self, axes):
@@ -36,14 +37,20 @@ def test_training_and_validation_choose_the_same_loss_meshes(dp, cp, tp, pp):
     meshes = resolve_training_reduction_meshes(topology)
     token_mesh, loss_mesh = resolve_loss_reduction_meshes(topology)
 
-    assert meshes.dp is token_mesh is topology.meshes["dp"]
-    assert meshes.loss is loss_mesh is topology.meshes["loss"]
-    assert meshes.pp is topology.meshes["pp"]
+    assert meshes.dp_mesh is token_mesh is topology.meshes["dp"]
+    assert meshes.loss_mesh is loss_mesh is topology.meshes["loss"]
+    assert meshes.pp_mesh is topology.meshes["pp"]
     axes = ("cp", "tp") if cp and tp else "cp" if cp else "tp" if tp else None
-    assert meshes.sequence is (None if axes is None else topology.meshes[axes])
+    if cp and tp:
+        topology.meshes[axes]._flatten.assert_called_once_with("sequence_loss")
+        assert meshes.sequence_mesh is topology.meshes[axes]._flatten.return_value
+    else:
+        assert meshes.sequence_mesh is (None if axes is None else topology.meshes[axes])
 
 
 def test_single_process_requires_no_meshes():
     assert resolve_loss_reduction_meshes(None) == (None, None)
     meshes = resolve_training_reduction_meshes(None)
-    assert (meshes.dp, meshes.pp, meshes.loss, meshes.sequence) == (None,) * 4
+    assert (meshes.dp_mesh, meshes.pp_mesh, meshes.loss_mesh, meshes.sequence_mesh) == (
+        None,
+    ) * 4
