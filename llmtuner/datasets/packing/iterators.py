@@ -14,6 +14,7 @@ import grain.python as grain
 import numpy as np
 
 from ...components.loss import IGNORE_INDEX
+from ...utils.logging import get_logger
 from ..contracts import TextSequence, require_positive_integer
 
 
@@ -222,7 +223,18 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
         except BaseException:
             # Replaying the remainder advances the parent. Invalid state must
             # not change the live stream's next token or consume its sample.
-            self._parent.set_state(previous_parent_state)
+            try:
+                self._parent.set_state(previous_parent_state)
+            except BaseException:
+                get_logger(__name__).exception(
+                    "Packing cursor rollback failed; closing the iterator"
+                )
+                try:
+                    self.close()
+                except BaseException:
+                    get_logger(__name__).exception(
+                        "Packing iterator cleanup failed after rollback failure"
+                    )
             raise
 
         self._remainder = remainder
