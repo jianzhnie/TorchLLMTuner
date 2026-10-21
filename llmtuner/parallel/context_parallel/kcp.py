@@ -183,6 +183,15 @@ def kcp_mla_attention(group):
     ):
         with synchronize_local_errors("KCP MLA local mask validation", group=group):
             batch, heads, local_sequence, _ = query.shape
+            if (
+                key.ndim != 4
+                or value.ndim != 4
+                or key.shape != query.shape
+                or value.shape[:3] != query.shape[:3]
+            ):
+                raise ValueError(
+                    "KCP MLA requires aligned Q/K/V batch, heads and sequence"
+                )
             if local_sequence == 0:
                 raise ValueError("KCP MLA requires a nonempty local sequence")
             if heads % group.size():
@@ -220,6 +229,21 @@ def kcp_mla_attention(group):
                     (attention_mask == 0) | torch.isneginf(attention_mask)
                 ):
                     raise ValueError("KCP MLA cannot discard additive attention bias")
+        # Both mask gathering and Ulysses all-to-all require equal payload
+        # geometry. Compare fixed-size metadata before exchanging those tensors.
+        if get_world_size(group) > 1:
+            metadata = torch.tensor(
+                [batch, heads, local_sequence, query.shape[-1], value.shape[-1]],
+                dtype=torch.int64,
+                device=get_comm_device(group),
+            )
+            bounds = torch.stack((metadata, -metadata))
+            dist.all_reduce(bounds, op=dist.ReduceOp.MIN, group=group)
+            if not torch.equal(bounds[0], -bounds[1]):
+                raise ValueError(
+                    "KCP MLA requires matching batch, heads, sequence and "
+                    "head dimensions on every CP rank"
+                )
         masks = [torch.empty_like(valid) for _ in range(group.size())]
         dist.all_gather(masks, valid.contiguous(), group=group)
         valid = torch.cat(masks, dim=-1)

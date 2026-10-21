@@ -179,6 +179,8 @@ class LRSchedulersContainer(Stateful):
         stored, per scheduler, from its optimizer groups' restored
         ``initial_lr`` values.
         """
+        if not isinstance(state_dict, dict):
+            raise ValueError("scheduler checkpoint state must be a dictionary")
         if not state_dict:
             return
         last_epoch = state_dict["last_epoch"]
