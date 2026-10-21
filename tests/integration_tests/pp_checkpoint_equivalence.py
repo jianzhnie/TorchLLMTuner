@@ -63,6 +63,9 @@ Set LLMTUNER_TEST_COMPILE_BACKEND=aot_eager in both phases to exercise
 whole-model compilation; asserts OptimizedModule and nonzero compiled graphs.
 Set LLMTUNER_TEST_PP_SIZE=1 and LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom
 in both phases to check a real Trainer with FSDP2 over the same two ranks.
+Set LLMTUNER_TEST_FORWARD_PREFETCH and LLMTUNER_TEST_BACKWARD_PREFETCH
+in both phases to verify explicit FSDP prefetch windows across resume.
+Set LLMTUNER_TEST_NUM_LAYERS=3 for two later decoder units with PP disabled.
 For PP2 × FSDP2 use four ranks with LLMTUNER_TEST_WORLD_SIZE=4,
 LLMTUNER_TEST_PP_SIZE=2 and LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom.
 Set LLMTUNER_TEST_PP_SCHEDULE=Interleaved1F1B or ZBVZeroBubble in both
@@ -289,7 +292,12 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
             vocab_size=VOCAB,
             hidden_size=64,
             intermediate_size=128,
-            num_hidden_layers=2 if schedule in {"1F1B", "GPipe"} else 6,
+            num_hidden_layers=int(
+                os.environ.get(
+                    "LLMTUNER_TEST_NUM_LAYERS",
+                    "2" if schedule in {"1F1B", "GPipe"} else "6",
+                )
+            ),
             num_attention_heads=4,
             num_key_value_heads=4,
         ),
@@ -311,7 +319,13 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
             fsdp_config=FSDPConfig(
                 fsdp_implementation=os.environ.get(
                     "LLMTUNER_TEST_FSDP_IMPLEMENTATION", "native"
-                )
+                ),
+                fsdp_forward_prefetch_count=int(
+                    os.environ.get("LLMTUNER_TEST_FORWARD_PREFETCH", "0")
+                ),
+                fsdp_backward_prefetch_count=int(
+                    os.environ.get("LLMTUNER_TEST_BACKWARD_PREFETCH", "0")
+                ),
             ),
             pp_config=PipelineParallelConfig(
                 pipeline_parallel_schedule=schedule, num_pp_microbatches=MICROBATCHES
@@ -784,6 +798,15 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
         map_location="cpu",
         weights_only=True,
     )
+    final_runtime = _runtime_state(trainer)
+    for key in ("rng", "dataloader"):
+        if key in final_runtime or key in final_state:
+            _compare_loaded_state(
+                {key: final_runtime[key]} if key in final_runtime else {},
+                {key: final_state[key]} if key in final_state else {},
+                failures,
+                f"rank {trainer.rank}.final",
+            )
     actual_parameters = {
         canonical_fqn(key): value.detach().cpu()
         for part in trainer.model_parts

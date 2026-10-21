@@ -16,6 +16,23 @@ def test_invalid_operation_is_rejected_for_single_rank(monkeypatch):
         collectives.all_reduce(torch.tensor([1]), op="invalid")
 
 
+def test_strided_reduction_uses_contiguous_buffer_and_preserves_other_columns(
+    monkeypatch,
+):
+    monkeypatch.setattr(collectives, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(collectives, "get_default_group", lambda: None)
+    monkeypatch.setattr(collectives, "get_comm_device", lambda group: "cpu")
+
+    def reduce(data, **kwargs):
+        assert data.is_contiguous()
+        data.add_(torch.tensor([2.0, 3.0]))
+
+    monkeypatch.setattr(collectives.dist, "all_reduce", reduce)
+    storage = torch.tensor([[1.0, 17.0], [2.0, 19.0]])
+    collectives.all_reduce(storage[:, 0])
+    torch.testing.assert_close(storage, torch.tensor([[3.0, 17.0], [5.0, 19.0]]))
+
+
 def test_partial_to_invariant_reduces_forward_without_reducing_backward(monkeypatch):
     group = object()
     calls = []
