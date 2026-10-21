@@ -109,6 +109,26 @@ def main():
                 raise AssertionError("fetch failure lost to exhaustion")
             dist.barrier()
             print(f"rank={rank} {error_type.__name__}: precedes exhaustion")
+        # A malformed decoded batch must also beat peer exhaustion. Test both
+        # owners so status precedence cannot accidentally depend on rank zero.
+        for failing_rank in (0, 1):
+            for invalid in ({}, {"labels": batch.labels, "num_valid_tokens": -1}):
+
+                def malformed_source(invalid=invalid, failing_rank=failing_rank):
+                    if rank == failing_rank:
+                        yield invalid
+
+                try:
+                    fetch_batch(malformed_source())
+                except (KeyError, ValueError):
+                    assert rank == failing_rank
+                except RuntimeError as error:
+                    assert rank != failing_rank
+                    assert str(error) == "Data fetch failed on another rank"
+                else:
+                    raise AssertionError("malformed batch lost to exhaustion")
+                dist.barrier()
+            print(f"rank={rank}: malformed rank {failing_rank} precedes exhaustion")
         for error_type in (ValueError, KeyboardInterrupt, SystemExit):
             failure = error_type("training iterator initialization failed")
             closed = []

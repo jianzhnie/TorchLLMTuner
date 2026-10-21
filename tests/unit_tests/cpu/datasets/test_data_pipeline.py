@@ -721,35 +721,36 @@ def test_loader_emits_the_trainer_batch_contract(tokenizer, corpus):
     assert batch["num_valid_tokens"] == int((batch["labels"] != IGNORE_INDEX).sum())
 
 
-def test_loader_resume_reproduces_the_following_batches_exactly(tokenizer, corpus):
-    """The loading position has to survive a checkpoint, or a resumed run
-    replays or skips a slice of the epoch. Comparing the *next* batches (not the
-    state dict) is the part that matters: a state that round-trips but restores
-    to the wrong place still passes a state-equality check.
-    """
+@pytest.mark.parametrize("source_prefetch,target_prefetch", [(2, 2), (1, 4), (4, 1)])
+def test_loader_resume_reproduces_the_following_batches_exactly(
+    tokenizer, corpus, source_prefetch, target_prefetch
+):
+    """Restore consumed progress, including labels/masks, across queue depths."""
 
-    def fresh():
+    def fresh(prefetch):
         dataset = build_dataset(
             text_dataset(corpus),
             context=make_context(tokenizer, num_tokens_per_batch=32),
             iteration_policy=make_policy(shuffle=True, repeat=True),
         )
-        return _loader(dataset, tokenizer)
-
-    ahead, behind = fresh(), fresh()
-    ahead_iterator, behind_iterator = iter(ahead), iter(behind)
-    next(ahead_iterator)
-    next(ahead_iterator)
-    next(behind_iterator)  # one batch behind
-
-    behind.load_state_dict(ahead.state_dict())
-    for _ in range(3):
-        assert (
-            next(ahead_iterator)["input"].tolist()
-            == next(behind_iterator)["input"].tolist()
+        return _loader(
+            dataset, tokenizer, config_kwargs={"num_prefetch_batches": prefetch}
         )
-    ahead.close()
-    behind.close()
+
+    ahead, behind = fresh(source_prefetch), fresh(target_prefetch)
+    try:
+        ahead_iterator, behind_iterator = iter(ahead), iter(behind)
+        next(ahead_iterator)
+        next(ahead_iterator)
+        next(behind_iterator)  # restore an already active, one-batch-behind iterator
+        behind.load_state_dict(ahead.state_dict())
+        for _ in range(3):
+            torch.testing.assert_close(
+                next(behind_iterator), next(ahead_iterator), rtol=0, atol=0
+            )
+    finally:
+        ahead.close()
+        behind.close()
 
 
 def test_loader_rejects_resuming_across_a_changed_dp_size(tokenizer, corpus):
@@ -3109,3 +3110,85 @@ def test_trainer_retries_real_grain_prefetch_join_after_interrupt(
         # Restore join before emergency cleanup even when an assertion fails.
         monkeypatch.undo()
         loader.close()
+
+
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt])
+def test_packing_failed_rollback_preserves_original_error_and_closes(
+    monkeypatch, error_type
+):
+    from llmtuner.datasets.packing.iterators import (
+        DocumentAwareConcatThenSplitIterDataset,
+    )
+
+    graph = DocumentAwareConcatThenSplitIterDataset(
+        _SequenceIterDataset(
+            [TextSequence(input_ids=np.arange(5), labels=np.arange(5))]
+        ),
+        max_num_documents_per_row=2,
+        max_context_length=2,
+        num_tokens_per_row=2,
+    )
+    iterator = iter(graph)
+    next(iterator)
+    saved = iterator.get_state()
+    failure = error_type("original restore failure")
+    calls = []
+
+    def fail_restore(state):
+        calls.append(state)
+        if len(calls) == 1:
+            raise failure
+        raise OSError("rollback failed")
+
+    monkeypatch.setattr(iterator._parent, "set_state", fail_restore)
+    with pytest.raises(error_type) as caught:
+        iterator.set_state(saved)
+    assert caught.value is failure
+    assert len(calls) == 2
+    assert iterator._closed and iterator._parent._closed
+    with pytest.raises(ValueError, match="closed"):
+        next(iterator)
+
+
+@pytest.mark.parametrize("length,degree", [(7, 3), (11, 4)])
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_uneven_dp_slices_cover_each_repeated_epoch(length, degree, shuffle):
+    from llmtuner.datasets.composition import apply_iteration_policy
+
+    source = grain.MapDataset.source(list(range(length)))
+    reference = apply_iteration_policy(
+        source, iteration_policy=make_policy(shuffle=shuffle, repeat=True)
+    )
+    expected = iter(reference)
+    shards = []
+    sizes = []
+    for rank in range(degree):
+        finite = apply_iteration_policy(
+            source,
+            iteration_policy=make_policy(
+                shuffle=shuffle, dp_world_size=degree, dp_rank=rank
+            ),
+        )
+        sizes.append(len(finite))
+        shards.append(
+            iter(
+                apply_iteration_policy(
+                    source,
+                    iteration_policy=make_policy(
+                        shuffle=shuffle,
+                        repeat=True,
+                        dp_world_size=degree,
+                        dp_rank=rank,
+                    ),
+                )
+            )
+        )
+    assert sum(sizes) == length and max(sizes) - min(sizes) == 1
+    for _ in range(3):
+        actual = [
+            next(cursor)
+            for cursor, size in zip(shards, sizes, strict=True)
+            for _ in range(size)
+        ]
+        assert actual == [next(expected) for _ in range(length)]
+        assert sorted(actual) == list(range(length))
