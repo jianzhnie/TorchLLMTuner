@@ -386,7 +386,9 @@ def all_reduce(
 
     input_device = get_tensor_tree_device(data)
     backend_device = get_comm_device(group)
-    data_on_device = move_tensor_tree(data, backend_device)
+    # c10d backends may treat strided views as contiguous storage. Keep the
+    # communication buffer contiguous, then copy back using the original stride.
+    data_on_device = move_tensor_tree(data, backend_device).contiguous()
 
     if op == "mean":
         dist.all_reduce(data_on_device, op=_REDUCE_OPS["sum"], group=group)

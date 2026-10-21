@@ -83,8 +83,10 @@ def _move(data: Any, device: torch.device, out: Any = None) -> Any:
         items = dict(zip(data, moved, strict=True))
         if isinstance(data, MutableMapping):
             result = copy(data)
-            result.clear()
-            result.update(items)
+            # Keep existing keys and use the mapping's assignment protocol.
+            # ModelOutput forbids update() and synchronizes attributes here.
+            for key, value in items.items():
+                result[key] = value
             return result
         return type(data)(items)
     if isinstance(data, tuple) and hasattr(data, "_fields"):
