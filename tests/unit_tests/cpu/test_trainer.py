@@ -2621,3 +2621,98 @@ def test_failed_assembly_restores_activation_memory_budget(monkeypatch, error_ty
         assert functorch_config.activation_memory_budget == original
     finally:
         functorch_config.activation_memory_budget = original
+
+
+def test_trainer_unequal_token_accumulation_matches_summed_loss_reference(tmp_path):
+    from copy import deepcopy
+
+    def config(accumulation):
+        return LLMTunerConfig(
+            optimizer=OptimizerConfig(
+                learning_rate=0.01,
+                implementation="for-loop",
+            ),
+            training=TrainingConfig(
+                global_batch_size=2,
+                max_seq_len=8,
+                gradient_accumulation_steps=accumulation,
+                steps=4,
+                dump_folder=str(tmp_path / str(accumulation)),
+            ),
+        )
+
+    generator = torch.Generator().manual_seed(43)
+    inputs = torch.randint(0, 16, (4, 8), generator=generator)
+    labels = inputs.clone()
+    labels[2:, 3:] = IGNORE_INDEX
+    batches = [
+        Batch(input_ids=inputs[:2], labels=labels[:2]),
+        Batch(input_ids=inputs[2:], labels=labels[2:]),
+    ]
+    assert [Trainer.count_valid_tokens(batch) for batch in batches] == [14, 4]
+
+    accumulated = Trainer(config(2))
+    try:
+        initial = deepcopy(accumulated.model.state_dict())
+        accumulated.should_log = lambda: True
+        accumulated.step = 1
+        actual_metrics = accumulated.train_step(iter(batches))
+        actual_model = deepcopy(accumulated.model.state_dict())
+        actual_gradients = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in accumulated.model.named_parameters()
+            if parameter.grad is not None
+        }
+        actual_optimizer = deepcopy(accumulated.optimizer.state_dict())
+        actual_scheduler = deepcopy(accumulated.lr_scheduler.state_dict())
+        actual_tokens = accumulated.ntokens_seen
+    finally:
+        accumulated.close()
+
+    reference = Trainer(config(1))
+    try:
+        reference.model.load_state_dict(initial)
+        reference.should_log = lambda: True
+        reference.step = 1
+        reference.optimizer.zero_grad(set_to_none=True)
+        losses = []
+        for batch in batches:
+            tokens, targets, kwargs = reference.model.preprocess_inputs(
+                batch, parallel_dims=reference.parallel_dims, max_context_length=8
+            )
+            logits = reference.model(tokens, **kwargs)
+            losses.append(
+                F.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    targets.reshape(-1),
+                    ignore_index=IGNORE_INDEX,
+                    reduction="sum",
+                )
+            )
+        # One backward on the summed graph, independent of Trainer's per-batch
+        # normalization and accumulation loop. The token total is known above.
+        reference_loss = torch.stack(losses).sum() / 18
+        reference_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            reference.model.parameters(), reference.cfg.max_norm, foreach=True
+        )
+        reference.optimizer.step()
+        reference.lr_scheduler.step()
+        expected_gradients = {
+            name: parameter.grad
+            for name, parameter in reference.model.named_parameters()
+            if parameter.grad is not None
+        }
+        for actual, expected in (
+            (actual_model, reference.model.state_dict()),
+            (actual_gradients, expected_gradients),
+            (actual_optimizer, reference.optimizer.state_dict()),
+        ):
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-7)
+        assert actual_scheduler == reference.lr_scheduler.state_dict()
+        assert actual_tokens == 32
+        assert actual_metrics["loss"] == pytest.approx(
+            float(reference_loss.detach()), rel=1e-6
+        )
+    finally:
+        reference.close()

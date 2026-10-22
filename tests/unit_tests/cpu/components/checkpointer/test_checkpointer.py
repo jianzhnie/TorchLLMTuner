@@ -2405,3 +2405,58 @@ def test_checkpoint_planner_rejects_tensor_shape_mismatch_before_copy(
             {"weight": target}, checkpoint_id=tmp_path, planner=CheckpointLoadPlanner()
         )
     torch.testing.assert_close(target, torch.full_like(target, -7.0), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("protocol", ["memory", "file"])
+@pytest.mark.parametrize("async_mode", ["disabled", "async"])
+def test_fsspec_retention_drains_deletions_and_keeps_latest_loadable(
+    tmp_path, protocol, async_mode
+):
+    from uuid import uuid4
+
+    import torch.distributed.checkpoint as dcp
+
+    from llmtuner.components.checkpointer import filesystem
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.config import OptimizerConfig
+
+    folder = (
+        f"memory://llmtuner-retention/{uuid4().hex}"
+        if protocol == "memory"
+        else (tmp_path / "uri-retention").as_uri()
+    )
+    model = nn.Linear(2, 2)
+    optimizer = OptimizersContainer(OptimizerConfig(), model_parts=[model])
+    manager = DistributedCheckpointManager(
+        Config(
+            enable=True,
+            folder=folder,
+            interval=1,
+            keep_latest_k=2,
+            async_mode=async_mode,
+        ),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer.optimizers[0]),
+        states={},
+        folder=str(tmp_path),
+    )
+    try:
+        for step in range(1, 4):
+            with torch.no_grad():
+                model.weight.fill_(step)
+                model.bias.fill_(-step)
+            assert manager.save(step)
+            manager.maybe_wait_for_saving()
+        expected = {key: value.clone() for key, value in model.state_dict().items()}
+        # close must drain the actual retention worker; no sleeps or mocked
+        # deletion queue can establish that obsolete remote shards disappeared.
+        manager.close()
+        assert sorted(filesystem.listdir(folder)) == ["step-2", "step-3"]
+        assert not manager.purge_thread.is_alive()
+        target = {key: torch.zeros_like(value) for key, value in expected.items()}
+        dcp.load(target, checkpoint_id=filesystem.join(folder, "step-3"))
+        torch.testing.assert_close(target, expected, rtol=0, atol=0)
+    finally:
+        manager.close()
+        filesystem.rmtree(folder)
