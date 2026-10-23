@@ -68,7 +68,10 @@ class CheckpointConfig:
     """
 
     last_save_in_hf: bool = False
-    """Whether the final model-only checkpoint uses Hugging Face safetensors."""
+    """Export final model weights and index as Hugging Face safetensors.
+
+    Model, generation and tokenizer configuration assets are supplied separately.
+    """
 
     export_dtype: Literal["float16", "bfloat16", "float32"] = "float32"
     """Model dtype used by a final model-only checkpoint."""
