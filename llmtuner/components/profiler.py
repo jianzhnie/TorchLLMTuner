@@ -226,7 +226,10 @@ class Profiler:
                 trace.__exit__(exc_type, exc_val, exc_tb)
             except BaseException as error:
                 first_error = error
-                logger.exception("Failed to stop trace profiler")
+                try:
+                    logger.exception("Failed to stop trace profiler")
+                except BaseException:
+                    pass  # Preserve the primary error and continue resource cleanup.
         if memory is not None and caused_by_oom(exc_val):
             try:
                 # Attempt the OOM snapshot even when trace export failed.
@@ -234,7 +237,10 @@ class Profiler:
             except BaseException as error:
                 if first_error is None:
                     first_error = error
-                logger.exception("Failed to write OOM memory snapshot")
+                try:
+                    logger.exception("Failed to write OOM memory snapshot")
+                except BaseException:
+                    pass  # Preserve the primary error and continue resource cleanup.
         if memory is not None:
             try:
                 memory.close()
@@ -244,7 +250,10 @@ class Profiler:
                 self.memory_profiler = memory
                 if first_error is None:
                     first_error = error
-                logger.exception("Failed to stop allocator memory history")
+                try:
+                    logger.exception("Failed to stop allocator memory history")
+                except BaseException:
+                    pass  # Preserve the primary error and continue resource cleanup.
         if exc_val is None and first_error is not None:
             raise first_error
         return False
@@ -269,13 +278,17 @@ class Profiler:
         trace_dir = os.path.join(self._base_folder, cfg.save_traces_folder)
         rank = get_distributed_rank()
         start_step = self._global_step
+        last_trace_step: int | None = None
 
         def trace_handler(prof):
+            nonlocal last_trace_step
             global_step = start_step + prof.step_num
-            directory = os.path.join(
-                trace_dir,
-                PROFILE_ITER_DIR.format(step=global_step),
-            )
+            directory_name = PROFILE_ITER_DIR.format(step=global_step)
+            if global_step == last_trace_step:
+                # Exiting an active cycle can export again without step_num
+                # advancing. Keep both the completed cycle and its exit tail.
+                directory_name += "_exit"
+            directory = os.path.join(trace_dir, directory_name)
             os.makedirs(directory, exist_ok=True)
 
             logger.info("Dumping profiler traces at step %d", global_step)
@@ -283,6 +296,7 @@ class Profiler:
             prof.export_chrome_trace(
                 os.path.join(directory, PROFILE_FILE.format(rank=rank))
             )
+            last_trace_step = global_step
             logger.info(
                 "Finished dumping profiler traces in %.2f seconds",
                 time.monotonic() - begin,
@@ -338,7 +352,10 @@ class Profiler:
             try:
                 torch_profiler.__exit__(*sys.exc_info())
             except BaseException:
-                logger.exception("Failed to stop partially started trace profiler")
+                try:
+                    logger.exception("Failed to stop partially started trace profiler")
+                except BaseException:
+                    pass  # Preserve the primary error and continue resource cleanup.
             raise
         return torch_profiler
 

@@ -42,13 +42,14 @@ import queue
 import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+from ...accelerator.collectives import synchronize_local_errors
 from ...utils.garbage_collection import GarbageCollection
 from . import filesystem
 
@@ -60,7 +61,16 @@ from .base import (
     BaseCheckpointManager,
     purge_thread,
 )
-from .checkpoint_keys import EMA, MODEL, OPTIMIZER
+from .checkpoint_keys import (
+    DATALOADER,
+    EMA,
+    LR_SCHEDULER,
+    MODEL,
+    OPTIMIZER,
+    RNG_STATE,
+    TRAIN_STATE,
+)
+from .random_state import RNGCheckpointState
 
 logger = get_logger(__name__)
 
@@ -317,7 +327,10 @@ def temporary_backend_manager(config: Any) -> Iterator[Any]:
         try:
             manager.close()
         except BaseException:
-            logger.exception("Temporary checkpoint backend cleanup failed")
+            try:
+                logger.exception("Temporary checkpoint backend cleanup failed")
+            except BaseException:
+                pass  # Preserve the original checkpoint operation failure.
         raise
     else:
         manager.close()
@@ -462,7 +475,10 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             try:
                 self._close()
             except BaseException:
-                logger.exception("Backend cleanup failed during construction")
+                try:
+                    logger.exception("Backend cleanup failed during construction")
+                except BaseException:
+                    pass  # Preserve the original construction failure.
             raise
 
         # Public methods become usable only after all owned services are ready.
@@ -516,6 +532,34 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # values and resume from a model that is not the one that was saved.
         # exclude_from_loading is applied by _states_to_load, so anything still
         # in ``states`` here is genuinely required.
+        if not from_hf:
+            with synchronize_local_errors("Checkpoint local preflight preparation"):
+                preflight_states = {
+                    key: states[key]
+                    for key in (RNG_STATE, DATALOADER, TRAIN_STATE, LR_SCHEDULER)
+                    if key in states
+                    and callable(getattr(states[key], "validate_state_dict", None))
+                }
+                preflight_destination = {
+                    key: state.state_dict() for key, state in preflight_states.items()
+                }
+            if preflight_states:
+                # The backend caches schema metadata per manager. A subset read
+                # must not invalidate the full reader's cached model layout.
+                preflight_config = default_backend_config(
+                    self._backend,
+                    sync_save_config(self._backend, use_barrier=False),
+                    storage_config=self._manager_config.storage_config,
+                    items={},
+                )
+                with temporary_backend_manager(preflight_config) as reader:
+                    reader.load(checkpoint_id, into=preflight_destination, strict=True)
+                for key, state in preflight_states.items():
+                    phase = "RNG" if key == RNG_STATE else key
+                    with synchronize_local_errors(
+                        f"Checkpoint {phase} preflight validation"
+                    ):
+                        state.validate_state_dict(preflight_destination[key])
         state_dict = self._stateful_to_state_dict(states)
         if from_hf:
             assert self.sd_adapter is not None
@@ -558,8 +602,19 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 strict=True,
             )
             for key, target in states.items():
+                if key == RNG_STATE:
+                    continue  # Restore after all callbacks and EMA reseeding below.
                 if self._is_stateful(target):
-                    target.load_state_dict(state_dict[key])
+                    # These built-in states restore locally. Coordinate each
+                    # callback before a peer can reach later EMA/TP/EP work.
+                    # Model, optimizer, EMA and user states may communicate;
+                    # their callbacks must stay outside local error regions.
+                    with (
+                        synchronize_local_errors(f"Checkpoint {key} restoration")
+                        if key in {LR_SCHEDULER, DATALOADER, TRAIN_STATE}
+                        else nullcontext()
+                    ):
+                        target.load_state_dict(state_dict[key])
                 elif loaded[key] is not target:
                     raise TypeError(
                         f"Cannot restore non-Stateful checkpoint state {key!r} of type "
@@ -568,8 +623,20 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # Same EMA contract as the DCP backend: if the model was restored but
         # the EMA was excluded, cold-start it from the loaded weights instead
         # of resuming with its construction-time values.
-        if MODEL in states and EMA in self.states and EMA not in states:
-            self.states[EMA].load_state_dict({})
+        # Reseeding only copies local tensors. Coordinate failures before any
+        # peer returns to training; do not nest EMA's collective load API here.
+        with synchronize_local_errors("Checkpoint EMA cold start"):
+            if MODEL in states and EMA in self.states and EMA not in states:
+                self.states[EMA].reset_from_model()
+        if not from_hf and RNG_STATE in states:
+            # User callbacks and model hooks can draw from default generators.
+            # Restore those streams last, matching the DCP backend contract.
+            with synchronize_local_errors("Checkpoint RNG validation"):
+                rng_state = states[RNG_STATE]
+                if isinstance(rng_state, RNGCheckpointState):
+                    rng_state.validate_state_dict(state_dict[RNG_STATE])
+            with synchronize_local_errors("Checkpoint rng_state restoration"):
+                states[RNG_STATE].load_state_dict(state_dict[RNG_STATE])
 
     @staticmethod
     def _is_stateful(obj: Any) -> bool:
@@ -599,22 +666,26 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # into the async save subprocess, so without it every forwarded backend
         # metric reports step=None.
         self._backend.checkpoint_logging_context.update(step=curr_step)
-        self.maybe_wait_for_saving()
+        self._wait_for_pending_save()
         # Always preserve the current step's published and staging directories.
-        self._purge_stale_checkpoints(
-            saving_step=curr_step,
-            staging_dir_prefix=(
-                self._manager_config.save.writer_config.temp_dir_prefix
-            ),
-        )
+        with synchronize_local_errors("Checkpoint retention preflight"):
+            self._purge_stale_checkpoints(
+                saving_step=curr_step,
+                staging_dir_prefix=(
+                    self._manager_config.save.writer_config.temp_dir_prefix
+                ),
+            )
 
         if last_step:
             self._save_last_step(curr_step)
-            self._purge_stale_checkpoints(
-                saving_step=curr_step,
-                staging_dir_prefix=self._manager_config.save.writer_config.temp_dir_prefix,
-                completed=True,
-            )
+            with synchronize_local_errors("Checkpoint completed retention"):
+                self._purge_stale_checkpoints(
+                    saving_step=curr_step,
+                    staging_dir_prefix=(
+                        self._manager_config.save.writer_config.temp_dir_prefix
+                    ),
+                    completed=True,
+                )
         else:
             self.save_future = self._manager.save(
                 self._create_checkpoint_id(curr_step),
@@ -690,17 +761,32 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 self.save_future = save_future
 
     def _close(self) -> None:
-        try:
-            self.maybe_wait_for_saving()
-        finally:
+        def close_purge_worker() -> None:
+            if self.purge_thread is not None and self.purge_thread.is_alive():
+                self.purge_queue.put(None)
+                self.purge_thread.join()
+
+        first_error: BaseException | None = None
+        for release in (
+            self.maybe_wait_for_saving,
+            close_purge_worker,
+            # The backend close is idempotent after _save_last_step.
+            self._manager.close,
+        ):
             try:
-                if self.purge_thread is not None and self.purge_thread.is_alive():
-                    self.purge_queue.put(None)
-                    self.purge_thread.join()
-            finally:
-                # _save_last_step may already have closed the manager; the
-                # backend's close() returns immediately when it has.
-                self._manager.close()
+                release()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                else:
+                    try:
+                        logger.exception(
+                            "Additional checkpoint backend cleanup failure"
+                        )
+                    except BaseException:
+                        pass  # Preserve the first cleanup error.
+        if first_error is not None:
+            raise first_error
 
     def _save_last_step(self, curr_step: int) -> None:
         if self.last_save_model_only:

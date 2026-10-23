@@ -8,7 +8,10 @@ The tracked scope is fixed at construction: trainable parameters and selected
 floating-point or complex buffers. Updates validate tensor identity before
 changing any average. Dynamic decay derives its firing count from the trainer
 step, so checkpoint resume preserves aging without a separate EMA counter.
-Loading an empty state reseeds all averages from the restored model.
+Loading an empty state reseeds all averages from the restored model. Saving and
+loading state require all distributed ranks: input and ownership checks are
+coordinated before checkpoint collectives. The checkpoint manager uses local
+reset_from_model under its own cold-start error coordination.
 
 Configuration is passed as constructor arguments instead of upstream's
 Configurable interface. Averages stay on their tensors' devices; the upstream
@@ -21,8 +24,11 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
+from ...accelerator.collectives import all_reduce, synchronize_local_errors
+from ...accelerator.distributed import get_world_size
 from ...config.ema_config import validate_ema_schedule
 from ...utils.logging import get_logger
 from ...utils.module_names import canonical_fqn
@@ -61,8 +67,11 @@ class EMAStateOptimizer(Optimizer):
             "EMA.step(current_step) instead."
         )
 
-    def tracked_averages(self, tensors: list[torch.Tensor]) -> list[torch.Tensor]:
+    def tracked_averages(
+        self, named_tensors: list[tuple[str, torch.Tensor]]
+    ) -> list[torch.Tensor]:
         """Resolve fixed-identity EMA state without inserting missing entries."""
+        tensors = [tensor for _, tensor in named_tensors]
         # State is keyed by tensor identity and the tracked set is fixed at
         # construction, so a tensor that appeared or
         # was replaced since then has no entry. state is a defaultdict, so
@@ -92,8 +101,33 @@ class EMAStateOptimizer(Optimizer):
                 "outside buffer_patterns after EMA construction is not supported. "
                 "Build the EMA after the model is final."
             )
+        checkpoint_names = {
+            id(tensor): name
+            for group in self.param_groups
+            for tensor, name in zip(group["params"], group["param_names"], strict=True)
+        }
+        for name, tensor in named_tensors:
+            if canonical_fqn(name) != checkpoint_names[id(tensor)]:
+                raise RuntimeError(
+                    "EMA tracked tensor checkpoint name changed: "
+                    f"{checkpoint_names[id(tensor)]!r} -> {name!r}. "
+                    "Build EMA after model names are final."
+                )
         averages = [self.state[t]["ema_params"] for t in tensors]
         for tensor, average in zip(tensors, averages, strict=True):
+            if isinstance(tensor, DTensor) != isinstance(average, DTensor) or (
+                isinstance(tensor, DTensor)
+                and (
+                    tensor.device_mesh != average.device_mesh
+                    or tensor.placements != average.placements
+                    or tensor.to_local().shape != average.to_local().shape
+                )
+            ):
+                raise RuntimeError(
+                    "EMA tracked tensor layout changed after construction. "
+                    "Live tensors and averages must have matching DTensor meshes, "
+                    "placements and local shapes. Rebuild EMA after layout changes."
+                )
             if (
                 tensor.shape != average.shape
                 or tensor.dtype != average.dtype
@@ -238,7 +272,15 @@ class EMA(OptimizersContainer):
                 ", ".join(low_precision),
             )
 
-        self._initialize_optimizer_interface(all_params)
+        # Buffers are tracked tensors too. A buffer-only EMA must remain usable
+        # even when the model has no trainable parameters.
+        tracked_tensors = [
+            tensor
+            for optimizer in self.optimizers
+            for group in optimizer.param_groups
+            for tensor in group["params"]
+        ]
+        self._initialize_optimizer_interface(tracked_tensors)
 
     def zero_grad(self, *args, **kwargs) -> None:
         pass  # never called by the training loop; no-op for safety
@@ -272,8 +314,25 @@ class EMA(OptimizersContainer):
             else 2.0 ** (-1.0 / (self.half_life_fraction * num_updates))
         )
         for averages, tensors in self._tracked_groups():
-            if tensors:
-                torch._foreach_lerp_(averages, tensors, 1.0 - decay)
+            compatible = {}
+            for average, tensor in zip(averages, tensors, strict=True):
+                layout = (
+                    (tensor.device_mesh, tensor.placements)
+                    if isinstance(tensor, DTensor)
+                    else None
+                )
+                key = (type(tensor), tensor.device, tensor.dtype, layout)
+                grouped_averages, grouped_tensors = compatible.setdefault(key, ([], []))
+                # EMA is linear within each fixed shard. Updating local storage
+                # avoids DTensor redistribution and keeps this step collective-free.
+                grouped_averages.append(
+                    average.to_local() if isinstance(average, DTensor) else average
+                )
+                grouped_tensors.append(
+                    tensor.to_local() if isinstance(tensor, DTensor) else tensor
+                )
+            for grouped_averages, grouped_tensors in compatible.values():
+                torch._foreach_lerp_(grouped_averages, grouped_tensors, 1.0 - decay)
 
     def _selected_buffers(self, model: nn.Module) -> list[tuple[str, torch.Tensor]]:
         """Match all aliases and track each buffer once under its first name."""
@@ -293,28 +352,59 @@ class EMA(OptimizersContainer):
         for ema_opt, model in zip(
             self._param_optimizers, self.model_parts, strict=True
         ):
-            params: list[torch.Tensor] = [
-                p for p in model.parameters() if p.requires_grad
+            params = [
+                (name, p) for name, p in model.named_parameters() if p.requires_grad
             ]
-            groups.append((ema_opt.tracked_averages(params), params))
+            groups.append((ema_opt.tracked_averages(params), [p for _, p in params]))
         for ema_opt, model in zip(
             # Empty when buffer_patterns is unset: shorter than model_parts.
             self._buffer_optimizers,
             self.model_parts,
             strict=False,
         ):
-            buffers = [buffer for _, buffer in self._selected_buffers(model)]
-            groups.append((ema_opt.tracked_averages(buffers), buffers))
+            buffers = self._selected_buffers(model)
+            groups.append(
+                (ema_opt.tracked_averages(buffers), [buffer for _, buffer in buffers])
+            )
         return groups
 
     # -- checkpointing ----------------------------------------------------------
 
+    def state_dict(self) -> dict[str, Any]:
+        """Validate fixed ownership before collectively building checkpoint state.
+
+        All distributed ranks must participate, including replicated models.
+        Only local validation belongs inside the error coordination boundary.
+        """
+        with synchronize_local_errors("EMA checkpoint validation"):
+            self._tracked_groups()
+        return super().state_dict()
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        if not isinstance(state_dict, dict):
-            raise ValueError("EMA checkpoint state must be a dictionary")
-        if state_dict:
+        with synchronize_local_errors("EMA checkpoint validation"):
+            if not isinstance(state_dict, dict):
+                raise ValueError("EMA checkpoint state must be a dictionary")
+            has_tracked_tensors = any(tensors for _, tensors in self._tracked_groups())
+        restore = bool(state_dict)
+        if get_world_size() > 1:
+            # A rank with no tracked tensors is neutral: its legitimately empty
+            # state must not be confused with missing state on an owning rank.
+            modes = torch.tensor(
+                [has_tracked_tensors and restore, has_tracked_tensors and not restore],
+                dtype=torch.int32,
+            )
+            all_reduce(modes, op="max")
+            if bool(modes.all()):
+                raise ValueError("EMA checkpoint state is empty on only some ranks")
+            restore = bool(modes[0])
+        if restore:
+            # Empty ranks must still join the parent's checkpoint coordination.
             super().load_state_dict(state_dict)
-            return
+        elif has_tracked_tensors:
+            self.reset_from_model()
+
+    def reset_from_model(self) -> None:
+        """Reseed averages locally; distributed callers coordinate failures."""
         # The checkpoint had no EMA data (excluded via exclude_from_loading,
         # or predates this feature) -- cold-start from the just-loaded model
         # weights (and buffers, if buffer_patterns is set).

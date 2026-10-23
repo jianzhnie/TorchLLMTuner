@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -225,6 +225,20 @@ class OptimizersContainer(Optimizer, Stateful):
             for part_idx, groups_by_opt_name in enumerate(model_group_plans):
                 for opt_name, groups in groups_by_opt_name.items():
                     optimizer = optimizer_factories[opt_name](groups.param_groups)
+                    # PyTorch accepts arbitrary group metadata, so misspelled
+                    # update options otherwise silently leave defaults active.
+                    # initial_lr is the scheduler's intentional group metadata.
+                    for group in optimizer.param_groups:
+                        unknown = (
+                            group.keys()
+                            - optimizer.defaults.keys()
+                            - {"params", "param_names", "initial_lr"}
+                        )
+                        if unknown:
+                            raise ValueError(
+                                f"{opt_name} optimizer_kwargs contain unknown options: "
+                                f"{sorted(unknown)}"
+                            )
                     self.optimizers.append(optimizer)
                     self._log_optimizer(optimizer, part_idx, groups.patterns)
 
@@ -444,19 +458,24 @@ class OptimizersContainer(Optimizer, Stateful):
         Side effect: if an inner optimizer has not stepped yet,
         ``init_optim_state`` materializes its state first (a zero-gradient,
         zero-lr step) so DCP has tensors to read, and to write into on load. It
-        leaves parameters alone, and is a no-op once state exists.
+        leaves parameters alone, and is a no-op once state exists. All
+        distributed ranks must participate: local serialization errors are
+        coordinated before any TP/EP checkpoint gathering. State-dict and
+        initialization hooks must not communicate inside this local phase.
         """
         result: dict[str, Any] = {}
-        for optimizer in self.optimizers:
-            init_optim_state(optimizer)
-            optimizer_state = get_flat_optim_state_dict(optimizer)
-            duplicated = result.keys() & optimizer_state.keys()
-            if duplicated:
-                raise ValueError(
-                    "Optimizer checkpoint keys overlap across inner optimizers: "
-                    f"{sorted(duplicated)}. Model parts must use unique parameter FQNs."
-                )
-            result.update(optimizer_state)
+        with synchronize_local_errors("Optimizer checkpoint construction"):
+            for optimizer in self.optimizers:
+                init_optim_state(optimizer)
+                optimizer_state = get_flat_optim_state_dict(optimizer)
+                duplicated = result.keys() & optimizer_state.keys()
+                if duplicated:
+                    raise ValueError(
+                        "Optimizer checkpoint keys overlap across inner optimizers: "
+                        f"{sorted(duplicated)}. Model parts must use unique "
+                        "parameter FQNs."
+                    )
+                result.update(optimizer_state)
         # Expert optimizer states are rank-heterogeneous like the expert
         # weights themselves; gather them to the full tensors the checkpoint
         # stores (parallel/expert_parallel/checkpointing.py).
@@ -470,6 +489,13 @@ class OptimizersContainer(Optimizer, Stateful):
         )
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore checkpoint values after all ranks validate local state.
+
+        All distributed ranks must participate. Validation failure prevents
+        applying checkpoint values; lazy optimizer state may be initialized.
+        Exceptions from load hooks or tensor copies are not atomic and require
+        restoring the complete training checkpoint before continuing.
+        """
         # init_optim_state must run first: the unflattening step reads each
         # optimizer's live state to learn which state tensors to expect, so a
         # fresh optimizer would find nothing to write into.
@@ -478,22 +504,30 @@ class OptimizersContainer(Optimizer, Stateful):
             shard_map=expert_shard_map(self.model_parts),
             model_parts=self.model_parts,
         )
-        for optimizer in self.optimizers:
-            init_optim_state(optimizer)
-        # Validate every inner state before applying any checkpoint values.
-        optimizer_states = [
-            unflatten_optim_state_dict(optimizer, flat_state=state_dict)
-            for optimizer in self.optimizers
-        ]
+        # TP/EP layout communication above stays outside this local boundary.
+        # Every rank must validate before peers apply state and enter the next
+        # checkpoint component's collectives. State initialization hooks must
+        # be local; communication inside hooks cannot be coordinated here.
+        with synchronize_local_errors("Optimizer checkpoint validation"):
+            for optimizer in self.optimizers:
+                init_optim_state(optimizer)
+            optimizer_states = [
+                unflatten_optim_state_dict(optimizer, flat_state=state_dict)
+                for optimizer in self.optimizers
+            ]
         for optimizer, optimizer_state in zip(
             self.optimizers, optimizer_states, strict=True
         ):
             optimizer.load_state_dict(optimizer_state)
 
-    def _initialize_optimizer_interface(self, all_params: list[nn.Parameter]) -> None:
+    def _initialize_optimizer_interface(
+        self, all_params: Sequence[torch.Tensor]
+    ) -> None:
         # ``Optimizer.__init__`` is what populates ``param_groups`` and sets up
         # the hook machinery that ``register_step_pre_hook`` needs. The empty
         # options dict is deliberate: the container's own ``param_groups`` is
         # only a view over the inner optimizers' parameters, and each inner
         # optimizer already holds the hyperparameters for its groups.
-        Optimizer.__init__(self, all_params, {})
+        # An empty tensor scope still needs the hook/container interface;
+        # an explicit empty group is supported by torch without dummy tensors.
+        Optimizer.__init__(self, all_params or [{"params": []}], {})

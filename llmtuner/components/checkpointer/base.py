@@ -26,7 +26,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ...accelerator import distributed
-from ...accelerator.collectives import synchronize_local_errors
+from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...utils.garbage_collection import GarbageCollection
 from ...utils.logging import get_logger
 from . import filesystem
@@ -73,7 +73,10 @@ def purge_thread(
             path = purge_queue.get()
             if path is None:
                 return
-            logger.info("Checkpointer is deleting %s.", path)
+            try:
+                logger.info("Checkpointer is deleting %s.", path)
+            except BaseException:
+                pass  # A broken log sink must not stop the retention worker.
             begin = time.monotonic()
             # A single failed deletion (a transient remote error, say) must not
             # kill this daemon thread; otherwise keep_latest_k would silently
@@ -81,17 +84,26 @@ def purge_thread(
             try:
                 remove_path(path)
             except Exception as error:  # noqa: BLE001 - one path must not stop the loop
-                logger.warning(
-                    "Checkpointer failed to delete %s: %s. Skipping.", path, error
-                )
+                try:
+                    logger.warning(
+                        "Checkpointer failed to delete %s: %s. Skipping.", path, error
+                    )
+                except BaseException:
+                    pass  # Continue processing later paths even if reporting fails.
                 continue
-            logger.info(
-                "Checkpointer deleted %s in %.2f seconds.",
-                path,
-                time.monotonic() - begin,
-            )
+            try:
+                logger.info(
+                    "Checkpointer deleted %s in %.2f seconds.",
+                    path,
+                    time.monotonic() - begin,
+                )
+            except BaseException:
+                pass  # Deletion succeeded; keep draining the queue.
     finally:
-        logger.info("Destroying the purge thread.")
+        try:
+            logger.info("Destroying the purge thread.")
+        except BaseException:
+            pass  # Shutdown reporting must not create a worker failure.
 
 
 EXPORT_DTYPE_MAP: dict[str, torch.dtype] = {
@@ -247,14 +259,22 @@ class BaseCheckpointManager(ABC):
         if not getattr(self, "_initialized", False) or not self.enable:
             return False
 
-        if not isinstance(step, int) or isinstance(step, bool) or step < -1:
-            raise ValueError(
-                f"checkpoint load step must be an integer >= -1, got {step!r}"
-            )
+        with synchronize_local_errors("Checkpoint load arguments"):
+            if not isinstance(step, int) or isinstance(step, bool) or step < -1:
+                raise ValueError(
+                    f"checkpoint load step must be an integer >= -1, got {step!r}"
+                )
         # Loading mutates the same live state that staging reads. Finish the
         # snapshot and its publication before discovering a restore source.
-        self.maybe_wait_for_staging()
-        self.maybe_wait_for_saving()
+        staging_failure: BaseException | None = None
+        try:
+            self.maybe_wait_for_staging()
+        except BaseException as error:
+            staging_failure = error
+        with synchronize_local_errors("Checkpoint load staging"):
+            if staging_failure is not None:
+                raise staging_failure
+        self._wait_for_pending_save()
         with synchronize_local_errors("Checkpoint load preflight"):
             resolved = self._resolve_load_source(step)
             states = (
@@ -277,7 +297,8 @@ class BaseCheckpointManager(ABC):
         if resolved is None:
             return False
         assert states is not None
-        logger.info("Loading the checkpoint from %s.", resolved.checkpoint_id)
+        with synchronize_local_errors("Checkpoint load reporting"):
+            logger.info("Loading the checkpoint from %s.", resolved.checkpoint_id)
         begin = time.monotonic()
         self._load_checkpoint(
             states,
@@ -285,11 +306,13 @@ class BaseCheckpointManager(ABC):
             from_hf=resolved.from_hf,
             from_quantized=resolved.from_quantized,
         )
-        GarbageCollection.collect("GC collection for checkpoint loading.")
-        logger.info(
-            "Finished loading the checkpoint in %.2f seconds.",
-            time.monotonic() - begin,
-        )
+        with synchronize_local_errors("Checkpoint load cleanup"):
+            GarbageCollection.collect("GC collection for checkpoint loading.")
+        with synchronize_local_errors("Checkpoint load completion reporting"):
+            logger.info(
+                "Finished loading the checkpoint in %.2f seconds.",
+                time.monotonic() - begin,
+            )
         return True
 
     def _resolve_load_source(self, step: int) -> CheckpointLoadSource | None:
@@ -397,15 +420,20 @@ class BaseCheckpointManager(ABC):
         """Persist state for ``curr_step``."""
         if not getattr(self, "_initialized", False) or not self.enable:
             return False
-        if (
-            not isinstance(curr_step, int)
-            or isinstance(curr_step, bool)
-            or curr_step < 0
-        ):
-            raise ValueError(
-                "checkpoint save step must be a non-negative integer, "
-                f"got {curr_step!r}"
-            )
+        with synchronize_local_errors("Checkpoint save arguments"):
+            if (
+                not isinstance(curr_step, int)
+                or isinstance(curr_step, bool)
+                or curr_step < 0
+            ):
+                raise ValueError(
+                    "checkpoint save step must be a non-negative integer, "
+                    f"got {curr_step!r}"
+                )
+            if not isinstance(last_step, bool):
+                raise ValueError(
+                    f"checkpoint save last_step must be a boolean, got {last_step!r}"
+                )
         return self._save(curr_step, last_step)
 
     def maybe_wait_for_staging(self) -> None:
@@ -437,7 +465,10 @@ class BaseCheckpointManager(ABC):
                 if first_error is None:
                     first_error = error
                 else:
-                    logger.exception("Additional checkpoint cleanup failure")
+                    try:
+                        logger.exception("Additional checkpoint cleanup failure")
+                    except BaseException:
+                        pass  # Keep the first failure and finish resource checks.
                 # An interrupted result() retains its live future. Its worker
                 # still owns the stager/process group, so leave the manager open
                 # for another close attempt instead of releasing those resources.
@@ -449,9 +480,45 @@ class BaseCheckpointManager(ABC):
                     )
                 ):
                     raise first_error from None
+                if release == self._close and any(
+                    getattr(self, name, None) is not None
+                    for name in ("stager", "staging_pg", "pg")
+                ):
+                    # Keep failed resource ownership available to the caller.
+                    # A partially shut down backend may require process exit.
+                    raise first_error from None
+                purge_worker = getattr(self, "purge_thread", None)
+                if (
+                    release == self._close
+                    and purge_worker is not None
+                    and purge_worker.is_alive()
+                ):
+                    # A failed join does not mean queued deletions have ended.
+                    # Keep close available to wait for this worker on retry.
+                    raise first_error from None
+                if not isinstance(error, Exception):
+                    # Cleanup itself can be interrupted before workers exit.
+                    # Preserve initialization so the owner can retry close().
+                    raise first_error from None
         self._initialized = False
         if first_error is not None:
             raise first_error
+
+    def _wait_for_pending_save(self) -> None:
+        """Drain a previous save and agree before saving or loading state.
+
+        Only call from a save/load boundary entered by all ranks. Background work
+        may communicate, so wait outside the local error coordination region.
+        Keep close() local: destructors need not run on every rank together.
+        """
+        failure: BaseException | None = None
+        try:
+            self.maybe_wait_for_saving()
+        except BaseException as error:
+            failure = error
+        with synchronize_local_errors("Checkpoint pending save"):
+            if failure is not None:
+                raise failure
 
     def maybe_wait_for_saving(self) -> None:
         """Block until the last asynchronous save completes.
@@ -496,9 +563,22 @@ class BaseCheckpointManager(ABC):
         return filesystem.join(folder, f"step-{step}")
 
     def _create_final_checkpoint_id(self, step: int) -> str:
-        """Keep a same-step training checkpoint intact when exporting weights."""
-        checkpoint_id = self._create_checkpoint_id(step)
-        if self.last_save_model_only and self._is_resumable_checkpoint(checkpoint_id):
+        """Resolve the final path on all ranks, preserving a resumable checkpoint."""
+        # Storage inspection is local; agree on failures before a peer enters
+        # the synchronous writer (or retires its asynchronous backend).
+        with synchronize_local_errors("Checkpoint final destination"):
+            checkpoint_id = self._create_checkpoint_id(step)
+            preserve = torch.tensor(
+                int(
+                    self.last_save_model_only
+                    and self._is_resumable_checkpoint(checkpoint_id)
+                ),
+                dtype=torch.int32,
+            )
+        # A shared store can have temporarily different metadata visibility.
+        # Any rank observing a recovery point is enough to protect it globally.
+        all_reduce(preserve, op="max")
+        if preserve.item():
             export_id = filesystem.join(checkpoint_id, "model-export")
             logger.info(
                 "Preserving training checkpoint %s; writing final weights to %s.",

@@ -71,6 +71,7 @@ from .checkpoint_keys import (
     OPTIMIZER,
     RNG_STATE,
     SAFETENSORS_INDEX,
+    TRAIN_STATE,
 )
 from .checkpoint_writer import GenerationFileSystemWriter
 from .hf_storage import save_hf_checkpoint
@@ -330,7 +331,10 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             try:
                 self._close()
             except BaseException:
-                logger.exception("DCP cleanup failed during construction")
+                try:
+                    logger.exception("DCP cleanup failed during construction")
+                except BaseException:
+                    pass  # Preserve the original construction failure.
             raise
 
         logger.info(
@@ -358,23 +362,57 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             releases.append(self.purge_thread.join)
 
         if self.stager is not None:
-            stager, self.stager = self.stager, None
-            releases.append(stager.close)
-        staging_pg, self.staging_pg = getattr(self, "staging_pg", None), None
-        if staging_pg is not None and dist.is_initialized():
-            releases.append(lambda: dist.destroy_process_group(staging_pg))
-        pg, self.pg = self.pg, None
-        if pg is not None and dist.is_initialized():
-            releases.append(lambda: dist.destroy_process_group(pg))
+
+            def close_stager() -> None:
+                self.stager.close()
+                self.stager = None
+
+            releases.append(close_stager)
         first_error: BaseException | None = None
         for release in releases:
             try:
                 release()
-            except BaseException as error:
+            except Exception as error:
+                if self.stager is not None:
+                    # A failed shutdown can leave staging threads alive even
+                    # for ordinary exceptions. Retain their groups for retry.
+                    raise
                 if first_error is None:
                     first_error = error
                 else:
-                    logger.exception("Additional DCP resource cleanup failure")
+                    try:
+                        logger.exception("Additional DCP resource cleanup failure")
+                    except BaseException:
+                        pass  # Preserve the first resource cleanup failure.
+        # A failed join/close may leave a worker alive. Keep its stager
+        # and communication groups owned until a subsequent close succeeds.
+        for name in ("staging_pg", "pg"):
+            group = getattr(self, name, None)
+            if group is None:
+                continue
+            if not dist.is_initialized():
+                setattr(self, name, None)
+                continue
+            try:
+                dist.destroy_process_group(group)
+            except BaseException as error:
+                # A failure before shutdown leaves a live owned group. A
+                # failure after registry removal has already released it.
+                # Registration alone does not promise backend usability after
+                # a partial shutdown; retain ownership without claiming recovery.
+                try:
+                    dist.get_process_group_ranks(group)
+                except KeyError:
+                    setattr(self, name, None)
+                if first_error is None:
+                    first_error = error
+                else:
+                    try:
+                        logger.exception("Additional DCP resource cleanup failure")
+                    except BaseException:
+                        pass  # Preserve the first resource cleanup failure.
+            else:
+                setattr(self, name, None)
         if first_error is not None:
             raise first_error
 
@@ -419,7 +457,8 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 self.sd_adapter.fqn_to_index_mapping,
             )
             if enable_garbage_collection:
-                GarbageCollection.collect("GC collection invoked by checkpointer.")
+                with synchronize_local_errors("Checkpoint garbage collection"):
+                    GarbageCollection.collect("GC collection invoked by checkpointer.")
             return None
 
         # Writer construction only resolves local storage/path policy. Agree
@@ -458,7 +497,8 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             )
 
         if enable_garbage_collection:
-            GarbageCollection.collect("GC collection invoked by checkpointer.")
+            with synchronize_local_errors("Checkpoint garbage collection"):
+                GarbageCollection.collect("GC collection invoked by checkpointer.")
 
         return ret
 
@@ -480,13 +520,41 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             ValueError: if ``from_hf`` is set without an ``sd_adapter``.
         """
         if not from_hf:
+            # Read only local compatibility records before DCP can write into
+            # live model/optimizer tensors, including Kimi layout migrations.
+            with synchronize_local_errors("Checkpoint local preflight preparation"):
+                preflight_states = {
+                    category: states[category]
+                    for category in (RNG_STATE, DATALOADER, TRAIN_STATE, LR_SCHEDULER)
+                    if category in states
+                    and callable(getattr(states[category], "validate_state_dict", None))
+                }
+                preflight_destination = {
+                    category: state.state_dict()
+                    for category, state in preflight_states.items()
+                }
+            if preflight_states:
+                preflight_planner = CheckpointLoadPlanner()
+                dcp.load(
+                    preflight_destination,
+                    checkpoint_id=checkpoint_id,
+                    planner=preflight_planner,
+                )
+                for category, state in preflight_states.items():
+                    phase = "RNG" if category == RNG_STATE else category
+                    with synchronize_local_errors(
+                        f"Checkpoint {phase} preflight validation"
+                    ):
+                        if category != RNG_STATE or preflight_planner.has_rng_state:
+                            state.validate_state_dict(preflight_destination[category])
             from .kimi_layout import load_changed_kimi_layout
 
             if load_changed_kimi_layout(
                 checkpoint_id, states=states, adapter=self.sd_adapter
             ):
-                if MODEL in states and EMA in self.states and EMA not in states:
-                    self.states[EMA].load_state_dict({})
+                with synchronize_local_errors("Checkpoint EMA cold start"):
+                    if MODEL in states and EMA in self.states and EMA not in states:
+                        self.states[EMA].reset_from_model()
                 return
         state_dict = self._flatten_model_state(states)
 
@@ -511,10 +579,14 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             # contract. Restore the scheduler only after optimizer groups load.
             scheduler = states.get(LR_SCHEDULER)
             rng_state = states.get(RNG_STATE)
-            if rng_state is not None:
-                state_dict[RNG_STATE] = rng_state.state_dict()
-            if scheduler is not None:
-                state_dict[LR_SCHEDULER] = scheduler.state_dict()
+            # DCP invokes Stateful callbacks after its own coordinated IO.
+            # These local callbacks need a separate boundary before peers can
+            # enter model/EMA communication. Keep collective-bearing states
+            # (optimizer and EMA) on their existing restoration path.
+            with synchronize_local_errors("Checkpoint local state preparation"):
+                for category in (RNG_STATE, LR_SCHEDULER, DATALOADER, TRAIN_STATE):
+                    if category in states:
+                        state_dict[category] = states[category].state_dict()
             planner = CheckpointLoadPlanner()
             dcp.load(
                 state_dict,
@@ -524,6 +596,10 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             with synchronize_local_errors("Checkpoint scheduler restoration"):
                 if scheduler is not None:
                     scheduler.load_state_dict(state_dict[LR_SCHEDULER])
+            for category in (DATALOADER, TRAIN_STATE):
+                with synchronize_local_errors(f"Checkpoint {category} restoration"):
+                    if category in states:
+                        states[category].load_state_dict(state_dict[category])
 
             # The model states were flattened into the top-level dict by
             # ``_flatten_model_state``, so DCP writes into those flat
@@ -540,8 +616,9 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         # also how EMA gets turned on mid-run against a checkpoint that
         # predates it). MODEL is never excludable, so its presence means model
         # weights were actually restored to reseed from.
-        if MODEL in states and EMA in self.states and EMA not in states:
-            self.states[EMA].load_state_dict({})
+        with synchronize_local_errors("Checkpoint EMA cold start"):
+            if MODEL in states and EMA in self.states and EMA not in states:
+                self.states[EMA].reset_from_model()
         if not from_hf:
             # All ranks must reject invalid streams before any peer resumes.
             # These phases are local only; DCP and model collectives stay above.
@@ -567,8 +644,9 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         if not self._should_save(curr_step, last_step):
             return False
 
-        self.maybe_wait_for_saving()
-        self._purge_stale_checkpoints(saving_step=curr_step)
+        self._wait_for_pending_save()
+        with synchronize_local_errors("Checkpoint retention preflight"):
+            self._purge_stale_checkpoints(saving_step=curr_step)
 
         begin = time.monotonic()
         checkpoint_phase = (
@@ -576,14 +654,17 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             if self.async_mode == DistributedCheckpointAsyncMode.DISABLED
             else "staging"
         )
-        logger.info(f"{checkpoint_phase.capitalize()} the checkpoint.")
+        with synchronize_local_errors("Checkpoint save reporting"):
+            logger.info(f"{checkpoint_phase.capitalize()} the checkpoint.")
 
         if last_step:
             self._save_last_step(curr_step)
-            self._purge_stale_checkpoints(saving_step=curr_step, completed=True)
-            logger.info(
-                f"Last step checkpoint completed in {time.monotonic() - begin:.2f}s"
-            )
+            with synchronize_local_errors("Checkpoint completed retention"):
+                self._purge_stale_checkpoints(saving_step=curr_step, completed=True)
+            with synchronize_local_errors("Checkpoint save final reporting"):
+                logger.info(
+                    f"Last step checkpoint completed in {time.monotonic() - begin:.2f}s"
+                )
             return True
 
         checkpoint_id = self._create_checkpoint_id(curr_step)
@@ -594,7 +675,8 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM,
             DistributedCheckpointAsyncMode.ASYNC,
         ):
-            GarbageCollection.collect("GC collection invoked by checkpointer.")
+            with synchronize_local_errors("Checkpoint garbage collection"):
+                GarbageCollection.collect("GC collection invoked by checkpointer.")
             if self.async_mode == DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM:
                 # All ranks enter even when a peer retained its stager after a
                 # previous failed preparation. No save worker has started yet.
@@ -631,12 +713,15 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                         f"AsyncSaveResponse, got {type(result).__name__}"
                     )
             else:
-                GarbageCollection.collect("GC collection invoked by checkpointer.")
                 if not isinstance(result, Future):
                     raise TypeError(
                         f"ASYNC save must return a Future, got {type(result).__name__}"
                     )
+                # Own the live worker before any fallible post-launch cleanup.
                 self.save_future = result
+                self._pending_retention = {"saving_step": curr_step}
+                with synchronize_local_errors("Checkpoint garbage collection"):
+                    GarbageCollection.collect("GC collection invoked by checkpointer.")
 
         else:
             self._save_checkpoint(
@@ -654,32 +739,37 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             assert self.save_future is not None
 
             def log_save_completion(future: Future) -> None:
-                if future.cancelled():
-                    logger.warning(
-                        "Checkpoint write for step %d was cancelled.", curr_step
+                try:
+                    if future.cancelled():
+                        logger.warning(
+                            "Checkpoint write for step %d was cancelled.", curr_step
+                        )
+                        return
+                    error = future.exception()
+                    if error is not None:
+                        logger.error(
+                            "Checkpoint write for step %d failed: %s", curr_step, error
+                        )
+                        return
+                    logger.info(
+                        "Finished writing the checkpoint for step %d in %.2f "
+                        "seconds (async total).",
+                        curr_step,
+                        time.monotonic() - async_save_started_at,
                     )
-                    return
-                error = future.exception()
-                if error is not None:
-                    logger.error(
-                        "Checkpoint write for step %d failed: %s", curr_step, error
-                    )
-                    return
-                logger.info(
-                    "Finished writing the checkpoint for step %d in %.2f "
-                    "seconds (async total).",
-                    curr_step,
-                    time.monotonic() - async_save_started_at,
-                )
+                except BaseException:
+                    pass  # Reporting must not escape into the upload worker.
 
             self.save_future.add_done_callback(log_save_completion)
 
         if async_save_started_at is None:
-            self._purge_stale_checkpoints(saving_step=curr_step, completed=True)
-        logger.info(
-            f"Finished {checkpoint_phase} the checkpoint in "
-            f"{time.monotonic() - begin:.2f} seconds."
-        )
+            with synchronize_local_errors("Checkpoint completed retention"):
+                self._purge_stale_checkpoints(saving_step=curr_step, completed=True)
+        with synchronize_local_errors("Checkpoint save completion reporting"):
+            logger.info(
+                f"Finished {checkpoint_phase} the checkpoint in "
+                f"{time.monotonic() - begin:.2f} seconds."
+            )
         return True
 
     def _maybe_wait_for_staging(self) -> None:
@@ -808,20 +898,24 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         if self.last_save_model_only:
             states = self.states[MODEL].state_dict()
 
-            states = {
-                k: v.to(self.export_dtype)
-                if isinstance(v, torch.Tensor)
-                and v.is_floating_point()
-                and v.dtype != self.export_dtype
-                else v
-                for k, v in states.items()
-            }
-            logger.info(
-                f"Saving a model only checkpoint in {self.export_dtype} "
-                f"at last step, step {curr_step}."
-            )
+            # state_dict above may communicate; conversion and reporting are
+            # local and must succeed on every rank before writer construction.
+            with synchronize_local_errors("Checkpoint final model preparation"):
+                states = {
+                    k: v.to(self.export_dtype)
+                    if isinstance(v, torch.Tensor)
+                    and v.is_floating_point()
+                    and v.dtype != self.export_dtype
+                    else v
+                    for k, v in states.items()
+                }
+                logger.info(
+                    f"Saving a model only checkpoint in {self.export_dtype} "
+                    f"at last step, step {curr_step}."
+                )
         else:
-            logger.info(f"Saving a full checkpoint at last step, step {curr_step}.")
+            with synchronize_local_errors("Checkpoint final state reporting"):
+                logger.info(f"Saving a full checkpoint at last step, step {curr_step}.")
             states = self._flatten_model_state()
 
         self._save_checkpoint(

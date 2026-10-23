@@ -171,14 +171,8 @@ class LRSchedulersContainer(Stateful):
             )
         return {"last_epoch": last_epoch}
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Restore ``last_epoch`` on every scheduler.
-
-        ``LambdaLR`` is stateless apart from that -- the lr is a pure function of
-        ``(last_epoch, base_lr)`` -- so ``_last_lr`` is recomputed rather than
-        stored, per scheduler, from its optimizer groups' restored
-        ``initial_lr`` values.
-        """
+    def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Validate saved progress without reading or changing optimizer groups."""
         if not isinstance(state_dict, dict):
             raise ValueError("scheduler checkpoint state must be a dictionary")
         if not state_dict:
@@ -196,6 +190,19 @@ class LRSchedulersContainer(Stateful):
                 f"({self.total_steps}); restore with a schedule covering the "
                 "checkpoint's progress"
             )
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore ``last_epoch`` on every scheduler.
+
+        ``LambdaLR`` is stateless apart from that -- the lr is a pure function of
+        ``(last_epoch, base_lr)`` -- so ``_last_lr`` is recomputed rather than
+        stored, per scheduler, from its optimizer groups' restored
+        ``initial_lr`` values.
+        """
+        self.validate_state_dict(state_dict)
+        if not state_dict:
+            return
+        last_epoch = state_dict["last_epoch"]
         restored = []
         for scheduler in self.schedulers:
             base_lrs = [
