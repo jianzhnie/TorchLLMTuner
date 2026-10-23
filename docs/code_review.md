@@ -856,7 +856,7 @@ microbatch及既有硬件/可选后端验证项仍未完成。
 
 ## 旧 DCP layout 定向迁移（2026-10-13）
 
-- 标准 DCP 加载增加 `DataloaderLayoutLoadPlanner`。仅当检查点含 loader
+- 标准 DCP 加载增加 `CheckpointLoadPlanner`。仅当检查点含 loader
   version 且整组 batch_layout 字段缺失时，从请求的加载计划移除新增
   layout 字段并警告旧布局无法验证。其他字段仍由默认严格 planner 检查。
 - 真实 DCP 回归：旧 loader cursor 和模型权重成功加载；缺失模型权重

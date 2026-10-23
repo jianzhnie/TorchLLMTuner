@@ -649,7 +649,11 @@ torch≥2.12 多卡复跑。
 6. EP × checkpoint 已支持（`parallel/expert_parallel/checkpointing.py`）：保存时把各 rank 的
    专家切片沿专家维 all-gather 成完整 `(E, ...)` 张量写入，加载时每 rank 重新切出
    自己的区间——存储布局与 EP 度数无关，换 ep 续训重切同一全量张量；覆盖 model、
-   optimizer 与 EMA 的扁平字典，专家数不匹配会 raise。
+   optimizer 与 EMA 的扁平字典，专家数不匹配会 raise。保存前在各 EP 子组交换
+   状态键、shape、dtype、layout 与 tensor 类型；局部准备失败或子组 manifest
+   不一致时，在 DTensor materialization 和张量 gather 前退出。通信按键排序，
+   不以 world 比较不同 PP stage 的状态。此边界不覆盖上游 state_dict hook、
+   collective 内错误、空 shard map 或 rank 对组归属的分歧。
 7. 最新 `vllm-ascend` 镜像的 Torch 2.10 缺少新版 FSDP per-parameter mesh result，
    Transformers 5.14 也超出项目声明范围，因此 EP×FSDP placement 不能在该镜像完整
    验证。
@@ -771,3 +775,72 @@ random 语料或 `max_num_documents=1` 用 `"causal"`，其余用 `"block_causal
 该 flag，所以它测试的是孤立的 mask 机制，而不是真实运行经过的 seam。
 `tests/unit_tests/cpu/models/test_hf_wrapper.py::test_the_mask_type_follows_the_corpus_rather_than_being_configured`
 钉住了这个 seam。
+
+### Checkpoint 加载职责
+
+`components/checkpointer/load_planner.py::CheckpointLoadPlanner` 集中处理 DCP
+严格加载及受支持的旧 RNG、dataloader layout 和 compiled 名称格式，验证缺失键
+与名称冲突。`distributed_checkpoint.py` 负责 checkpoint I/O、异步生命周期及
+状态装配，通过定义模块使用 planner。加载兼容规则不再混入 manager 类所在文件。
+
+### 异步 staging 失败传播
+
+Pinned/PROCESS 模式使用独立 Gloo staging 组，和训练组及上传初始化组分开。
+`CoordinatedStager` 等待本地快照完成后协调成功状态，所有 rank 成功才将快照
+交给上传执行器；同步抛错和异步 future 异常均传播到 staging/upload 等待点。
+manager 保留底层 stager 所有权，完成等待后释放资源；构造第二个组失败时释放
+已创建的上传组。PyTorch 2.14 对已经失败的 staging future 可能误报完成，
+manager 使用自己的 completion future 保留实际错误。
+
+真实 CPU shared-memory/PROCESS 故障和重试、延迟 staging/custom FSDP/动态 EMA
+恢复已验证；设备 pinning、NCCL/HCCL、collective 故障及进程终止仍须分别验证。
+
+### Profiler 清理失败
+
+停止 allocator history 成功后才清除 active 标记。若 backend shutdown 失败，
+`Profiler` 保留 memory profiler，调用方可重试退出；清理失败仍保留原训练异常。
+该契约的 CPU 故障注入已覆盖普通退出和 OOM，真实设备行为需在对应后端验证。
+
+### 本地初始化失败边界
+
+运行时装配通过 `accelerator/collectives.py::synchronize_local_errors` 在本地
+HF config/模型构建后执行 world 成功状态归约，再进入模型并行
+变换。某 rank 构建失败时，该 rank 保留原异常，其余 rank 在变换前收到明确错误，
+避免进入不匹配的 collective。该边界不恢复建组失败、挂起/被杀进程或 collective
+内部故障。`tests/integration_tests/trainer_initialization_coordination.py` 覆盖真实两 rank
+非对称失败及同组新建 Trainer 更新。
+
+同一边界用于 dataloader 构建：任一 rank 失败后，所有 peer 在 checkpointer
+构造之前退出，已创建的 loader 由 Trainer 构造失败清理关闭。该工具只用于
+不含 collective 的本地阶段，不能包裹整个并行变换来宣称内部故障已协调。
+
+Optimizer 分离两类通信组：PP rule-match 使用 pipeline mesh 的组，参数规划
+与实例构造错误使用 `initialization_group`。Trainer 提供 world 组，使一个 PP
+子组的局部错误也传播到其他 DP 副本；独立 container 未指定时沿用 PP 组。
+scheduler、EMA 和 optimizer hooks 的本地构建由独立 world 阶段边界协调。
+
+Metrics/FLOPs 构建同样属于本地初始化阶段。world 协调完成前不返回 Trainer；
+任一 rank 失败时，成功 peer 已创建的 metrics owner 由构造失败清理关闭，
+防止 peer 独自进入训练 collective。外部后端挂起与内部通信失败仍不在此契约内。
+
+
+## Qwen3 归一化的执行边界
+
+`models/hf/model_setup.py` 在并行变换之前适配精确的 HF Qwen3/Qwen3 MoE
+norm 类型。默认 native 后端为 residual norm 输入建立共享存储 view，协调
+分支梯度合并边界；保持参数和 state-dict 键，舍入轨迹可能与未适配的旧运行不同。
+
+`model.norm_backend=aten` 显式选择 `models/hf/normalization.py` 的 CPU
+前后向算子边界，覆盖全部已知家族 norm，包括 Q/K 和最终 norm。工厂必须
+传递配置，测试检查实际 forward 绑定。算子注册归模块生命周期所有，可被多个
+模型复用；不属于某个 Trainer 的可注销资源。仅支持一阶梯度及 fp16/bf16/fp32
+输入。保留 ATen 归约限制融合，因此该路径用于有明确数值需求的运行。
+
+后端重设只用于构造阶段，清理本适配拥有的 hook/forward，保留用户 hook。
+已分片或编译模型不能通过修改配置热切换；恢复时由调用方显式选择运行配置。
+权重格式兼容不等于旧舍入轨迹逐位延续。分布式证据及范围见
+[并行比较](distributed_implementation_comparison.md)。
+
+同步编译装配失败恢复本次修改的 scalar capture、regional 标志、block compiled
+callable 和 async TP pass。PyTorch 对称内存组注册保留其进程级所有权；延迟
+tracing、进程级编译缓存及成功 Trainer 共存的全局开关隔离不在此回滚契约内。
