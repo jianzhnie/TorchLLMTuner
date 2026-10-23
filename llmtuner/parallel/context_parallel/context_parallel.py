@@ -41,19 +41,10 @@ def _require_ulysses_compatible(
     load_balancer = cfg.cp_config.context_parallel_load_balancer
     if load_balancer is not None:
         raise ValueError(
-            "Ulysses CP requires context_parallel_load_balancer=None: the "
-            "all-to-all is an even split of an evenly-sharded tensor, and "
-            "every rank ends up attending the full sequence in whatever "
-            "order the shards arrived in. A load balancer rearranges the "
-            "sequence into head and tail chunks, so that order is no "
-            "longer the original one and -- unlike the seq_len x seq_len "
-            "causal mask, a function of tokens -- flex only takes a mask "
-            "built over the attended order. The kernel therefore attends "
-            "the rearranged corpus, a permuted model that trains and "
-            "produces plausible numbers with nothing raised. "
-            "strategy='kv_allgather' is what supports this: it gathers the "
-            "rearranged shards back into the very order the mask was "
-            "sharded in, so the rearrangement lands in the mask and cancels."
+            "Ulysses CP requires context_parallel_load_balancer=None: "
+            "load balancing permutes tokens but the Ulysses mask expects "
+            "original sequence order. Use context_parallel_strategy='kv_allgather' "
+            "for load-balanced CP."
         )
     if (
         getattr(model_config, "attn_mask_type", "causal") == "block_causal"
@@ -118,12 +109,12 @@ def apply_cp(
     if cfg.cp_size == 1:
         return model
 
+    model_config = getattr(getattr(model, "model", None), "config", None)
     if cfg.cp_config.context_parallel_strategy == "kcp":
         if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
             raise ValueError("KCP requires a cp mesh")
         if mesh["cp"].size() != cfg.cp_size:
             raise ValueError("KCP mesh degree does not match the configured CP degree")
-        model_config = getattr(getattr(model, "model", None), "config", None)
         if getattr(model_config, "attn_mask_type", "causal") == "block_causal":
             raise ValueError("KCP does not support packed document attention")
         from .kcp import apply_kcp
@@ -137,7 +128,6 @@ def apply_cp(
         logger.info("Applied KCP to %d KDA modules", patched)
         return model
 
-    model_config = getattr(getattr(model, "model", None), "config", None)
     if getattr(model_config, "model_type", None) == "deepseek_v4":
         if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
             raise ValueError("DeepSeek V4 HCA CP requires a cp mesh")
@@ -152,8 +142,7 @@ def apply_cp(
     # Transformers attention registration dependencies.
     from ...models.hf.attention_backend import ATTENTION_BACKEND
 
-    impl = getattr(getattr(model, "model", None), "config", None)
-    impl = getattr(impl, "_attn_implementation", None)
+    impl = getattr(model_config, "_attn_implementation", None)
     if impl != ATTENTION_BACKEND:
         raise RuntimeError(
             f"CP requires the {ATTENTION_BACKEND!r} attention backend, but "
@@ -207,7 +196,6 @@ def apply_cp(
             f"apply_cp expects a HFTransformerModel (with .layers); got "
             f"{type(model).__name__}."
         )
-    model_config = getattr(getattr(model, "model", None), "config", None)
     packed = getattr(model_config, "attn_mask_type", "causal") == "block_causal"
     attentions = []
     for idx, layer in enumerate(layers):

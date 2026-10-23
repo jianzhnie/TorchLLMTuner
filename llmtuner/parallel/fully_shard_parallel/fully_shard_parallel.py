@@ -572,7 +572,7 @@ def apply_fsdp(
         param_dtype = next(iter(param_dtypes))
     except StopIteration:
         param_dtype = torch.get_default_dtype()
-    reduce_dtype = torch.float32
+    reduce_dtype = getattr(torch, cfg.fsdp_config.fsdp_reduce_dtype)
 
     if cfg.fsdp_config.fsdp_apply_modules:
         apply_fsdp_by_pattern(

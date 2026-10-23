@@ -29,7 +29,7 @@ def apply_ep(
     EP=1 keeps the HF model unless fixed_router requests native local routing.
 
     error_group, when supplied, spans every rank sharing later stage-local
-    collectives. Domino uses it for failure coordination; standalone callers
+    collectives. Domino and MC2 use it for failure coordination; standalone callers
     without it coordinate only their EP group.
 
     The swap moves weights, so it must happen before FSDP wraps the model.
@@ -66,8 +66,10 @@ def apply_ep(
     # Failures must reach all ranks sharing later FSDP/TP/CP collectives,
     # not only the ranks in one token-exchange group.
     if error_group is not None:
+        from .mc2_dispatch import MC2RoutedExperts
+
         for module in model.modules():
-            if isinstance(module, DominoRoutedExperts):
+            if isinstance(module, DominoRoutedExperts | MC2RoutedExperts):
                 module.error_group = error_group
     logger.info(
         "Applied EP (%s dispatch): swapped %d MoE blocks, degree %d",

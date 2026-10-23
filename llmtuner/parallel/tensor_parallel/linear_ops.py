@@ -126,6 +126,10 @@ def all_gather_along(
     leading dims, any gather dim -- unlike the fused symm-mem ops, which are
     strictly 2D.
     """
+    # PyTorch 2.14's gather view optimization assumes a nonnegative axis.
+    # In particular, a batched padding mask with -1 can produce an invalid view.
+    if dim < 0:
+        dim += x.ndim
     all_gather, _ = functional_collectives()
     return all_gather(x.contiguous(), dim, group)
 
@@ -140,6 +144,8 @@ def reduce_scatter_along(
     TP (see ``tensor_parallel.py``). The block's output is partial over the
     TP group and must return to a sequence shard.
     """
+    if dim < 0:
+        dim += x.ndim
     _, reduce_scatter = functional_collectives()
     return reduce_scatter(x.contiguous(), "sum", dim, group)
 
