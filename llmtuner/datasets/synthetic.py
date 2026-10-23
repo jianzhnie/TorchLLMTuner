@@ -150,7 +150,8 @@ class RandomTokenDataLoader(BaseDataLoader):
             },
         }
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Check cursor metadata without changing the live iterator."""
         if not isinstance(state_dict, dict):
             raise ValueError(
                 "RandomTokenDataLoader checkpoint state must be a dictionary"
@@ -183,5 +184,11 @@ class RandomTokenDataLoader(BaseDataLoader):
                 f"cannot resume at batch {resume_at}: this loader has already "
                 f"yielded {self._position}. A fresh loader is required."
             )
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.validate_state_dict(state_dict)
+        if not state_dict:
+            return
+        resume_at = state_dict["steps"]
         self._iterator = self._source.iter_from(resume_at)
         self._position = resume_at

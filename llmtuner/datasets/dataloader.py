@@ -10,13 +10,16 @@ the iterator while preserving the original error.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from copy import deepcopy
 from typing import Any
 
 import grain.python as grain
+import torch
 from grain import experimental as grain_experimental
 
 from ..components.tokenizer.base import BaseTokenizer
 from ..utils.logging import get_logger
+from ..utils.seeding import preserve_rng_state
 from .collators import CollatorFactory, TextCollator
 from .composition import as_iter_dataset
 from .contracts import (
@@ -124,6 +127,7 @@ class GrainDataLoader(BaseDataLoader):
         dataset = grain_experimental.ThreadPrefetchIterDataset(
             dataset, prefetch_buffer_size=num_prefetch_batches
         )
+        self._dataset = dataset
         self._iterator = iter(dataset)
 
     def __iter__(self) -> Iterator[TrainerBatch]:
@@ -134,10 +138,18 @@ class GrainDataLoader(BaseDataLoader):
             "version": 1,
             "dp_world_size": self._dp_world_size,
             "batch_layout": self._batch_layout.copy(),
-            self._rank_id: self._iterator.get_state(),
+            # Grain may return its own mutable cursor dictionary. Checkpoint
+            # readers fill destinations in place, so never expose that alias.
+            self._rank_id: deepcopy(self._iterator.get_state()),
         }
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Check metadata and restore a disposable cursor, leaving the live one alone.
+
+        This checks what the graph's set_state accepts. Restoring packing state
+        may replay source records even without fetching a batch here. Deferred
+        read errors and external source side effects are outside this check.
+        """
         if not isinstance(state_dict, dict):
             raise ValueError("GrainDataLoader checkpoint state must be a dictionary")
         if not state_dict:
@@ -159,15 +171,41 @@ class GrainDataLoader(BaseDataLoader):
                 f"checkpoint has {saved_layout}, "
                 f"current loader has {self._batch_layout}"
             )
+        with preserve_rng_state(torch.device("cpu")):
+            probe = iter(self._dataset)
+            try:
+                probe.set_state(deepcopy(state_dict[self._rank_id]))
+            except BaseException:
+                try:
+                    probe.close()
+                except BaseException:
+                    try:
+                        get_logger(__name__).exception(
+                            "Dataloader probe cleanup failed "
+                            "after cursor validation failed"
+                        )
+                    except BaseException:
+                        pass  # Preserve the original cursor validation error.
+                raise
+            else:
+                probe.close()
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.validate_state_dict(state_dict)
+        if not state_dict:
+            return
         try:
             self._iterator.set_state(state_dict[self._rank_id])
         except BaseException:
             try:
                 self.close()
             except BaseException:
-                get_logger(__name__).exception(
-                    "Dataloader cleanup failed after state restoration failed"
-                )
+                try:
+                    get_logger(__name__).exception(
+                        "Dataloader cleanup failed after state restoration failed"
+                    )
+                except BaseException:
+                    pass  # Preserve the original cursor restoration error.
             raise
 
     def close(self) -> None:
