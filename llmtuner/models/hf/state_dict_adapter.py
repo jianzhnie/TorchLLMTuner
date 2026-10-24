@@ -14,6 +14,7 @@ from typing import Any
 
 import torch.distributed as dist
 
+from ...accelerator.collectives import synchronize_local_errors
 from ...components.checkpointer.checkpoint_keys import SAFETENSORS_INDEX
 from ...components.checkpointer.hf_storage import IndexedHuggingFaceStorageReader
 
@@ -86,12 +87,15 @@ class HFTransformerStateDictAdapter:
             state_dict = convert_kimi_expert_state(
                 state_dict, num_experts=self.model_config.num_experts, to_hf=True
             )
-        hf_state = {}
-        for key, value in state_dict.items():
-            hf_key = key.removeprefix("model.")
-            if hf_key in hf_state:
-                raise ValueError(f"HF checkpoint key mapping collision: {hf_key!r}")
-            hf_state[hf_key] = value
+        # Only dictionary mapping is local. Kimi tensor conversion above and
+        # the global PP coverage gather below stay outside this boundary.
+        with synchronize_local_errors("HF export key mapping"):
+            hf_state = {}
+            for key, value in state_dict.items():
+                hf_key = key.removeprefix("model.")
+                if hf_key in hf_state:
+                    raise ValueError(f"HF checkpoint key mapping collision: {hf_key!r}")
+                hf_state[hf_key] = value
         if self._hf_keys is not None:
             requested = set(hf_state)
             if dist.is_available() and dist.is_initialized():
@@ -115,6 +119,15 @@ class HFTransformerStateDictAdapter:
                     f"missing={sorted(missing)[:8]}, "
                     f"unexpected={sorted(unexpected)[:8]}"
                 )
+        if (
+            getattr(self.model_config, "tie_word_embeddings", False)
+            and "model.embed_tokens.weight" in hf_state
+            and "lm_head.weight" in hf_state
+        ):
+            # Safetensors cannot serialize aliases within one shard. Preserve
+            # both exported keys without changing the model's parameter ties;
+            # the HF model restores sharing according to its configuration.
+            hf_state["lm_head.weight"] = hf_state["lm_head.weight"].clone()
         return hf_state
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:

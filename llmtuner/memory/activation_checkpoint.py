@@ -295,7 +295,7 @@ def wrap_selective(
         module, base_fqn=base_fqn, fqns=cfg.force_recompute_mm_shapes_by_fqns
     )
     policy = selective_policy(save_ops, mm_shapes)
-    return ptd_checkpoint_wrapper(
+    wrapped = ptd_checkpoint_wrapper(
         module,
         context_fn=lambda: checkpoint_contexts(policy, module),
         preserve_rng_state=cfg.preserve_rng_state,
@@ -303,6 +303,9 @@ def wrap_selective(
         early_stop=True,
         debug=cfg.debug,
     )
+    # Match the wrapped block without recursively resetting mixed child modes.
+    wrapped.training = module.training
+    return wrapped
 
 
 def full_policy(_ctx, _op, *_args, **_kwargs) -> CheckpointPolicy:
@@ -385,12 +388,14 @@ def wrap_full(module: nn.Module, *, preserve_rng_state: bool = True) -> nn.Modul
     llmtuner does not expose them for this mode (registered in the symbol
     guide). ``early_stop`` matches upstream #4836.
     """
-    return ptd_checkpoint_wrapper(
+    wrapped = ptd_checkpoint_wrapper(
         module,
         context_fn=lambda: checkpoint_contexts(full_policy, module),
         preserve_rng_state=preserve_rng_state,
         early_stop=True,
     )
+    wrapped.training = module.training
+    return wrapped
 
 
 def disable_dynamo_lru_cache() -> None:

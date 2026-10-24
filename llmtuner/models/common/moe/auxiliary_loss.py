@@ -63,14 +63,22 @@ class MicrobatchWiseLoadBalanceLoss(AuxLoss):
 
     Args:
         coeff: scales the injected gradient, as for any ``AuxLoss``.
+        token_replication_size: feature ranks holding the same gathered tokens.
     """
 
-    def __init__(self, *, coeff: float) -> None:
+    def __init__(self, *, coeff: float, token_replication_size: int = 1) -> None:
+        if (
+            not isinstance(token_replication_size, int)
+            or isinstance(token_replication_size, bool)
+            or token_replication_size < 1
+        ):
+            raise ValueError("token_replication_size must be a positive integer")
         # "batch" (dp) rather than "loss" (dp, cp and tp): the value is already
         # the same on every CP coordinate by construction -- and on every TP
         # one, since llmtuner's TP is sequence-parallel -- so summing over
         # either would count it more than once per layer.
         super().__init__(coeff=coeff, reduce_mesh="batch")
+        self.token_replication_size = token_replication_size
 
     def _reduce_token_partials(
         self, partial_E: torch.Tensor, axes: tuple[str, ...]
@@ -124,11 +132,13 @@ class MicrobatchWiseLoadBalanceLoss(AuxLoss):
         # token stream, so only the axes that shard one stream are summed over.
         # ``tp`` belongs under EP for the same reason as upstream: EP borrows
         # ranks from TP, so an EP'd MoE sees a tp-partial token stream. Under
-        # MoE-under-TP (tp>1, ep=1) no reduction is needed: the block-boundary
-        # all-gather means the router already sees the full token stream, and
-        # the aux loss only exists on the llmtuner MoE stack, which the TP path
-        # does not install.
-        axes = ("cp", "tp") if spmd_sparse_mesh() is not None else ("cp",)
+        # MoE-under-TP (tp>1, ep=1) already gathers the full token stream.
+        # Those replicas must not reduce identical statistics over TP again.
+        axes = (
+            ("cp", "tp")
+            if spmd_sparse_mesh() is not None and self.token_replication_size == 1
+            else ("cp",)
+        )
 
         # Eq. 18: per-expert routing counts, then f_i = E * counts_i /
         # sum_j counts_j, so sum_i f_i = E. The map is cast to float before the
@@ -150,4 +160,9 @@ class MicrobatchWiseLoadBalanceLoss(AuxLoss):
 
         # Eq. 17: L_bal = sum_i f_i * p_i
         loss = (f_E * p_E).sum()
+        if self.token_replication_size > 1:
+            # Every feature rank injects the full auxiliary objective. Input
+            # gather backward and replicated-router gradient reduction sum
+            # those copies; divide only the gradient, preserving the metric.
+            loss = loss.detach() + (loss - loss.detach()) / self.token_replication_size
         return self.inject(loss, carrier=carrier)
