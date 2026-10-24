@@ -153,8 +153,17 @@ def _apply_parallelism(
         trainer.model_parts = [orchestration]
 
     if load_hf_weights:
-        for model_part in trainer.model_parts:
-            materialize_meta_model(model_part, trainer.device)
+        materialization_error: BaseException | None = None
+        try:
+            for model_part in trainer.model_parts:
+                materialize_meta_model(model_part, trainer.device)
+        except BaseException as error:
+            materialization_error = error
+        # FSDP _apply may manage communication state. Finish materialization
+        # outside the local-only boundary, then agree before optimizer setup.
+        with synchronize_local_errors("Model materialization"):
+            if materialization_error is not None:
+                raise materialization_error
 
 
 def _build_optimizer_stack(trainer: Trainer) -> None:

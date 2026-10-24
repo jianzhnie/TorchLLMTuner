@@ -130,7 +130,10 @@ def main() -> None:
         except BaseException:
             if training_error is None:
                 raise
-            logger.exception("Resource cleanup failed after an entry-point error")
+            try:
+                logger.exception("Resource cleanup failed after an entry-point error")
+            except BaseException:
+                pass  # Keep the primary entry-point error when reporting fails.
         finally:
             cleanup_error = sys.exc_info()[1]
             try:
@@ -139,9 +142,12 @@ def main() -> None:
             except BaseException:
                 if training_error is None and cleanup_error is None:
                     raise
-                logger.exception(
-                    "Process-group cleanup failed after an entry-point error"
-                )
+                try:
+                    logger.exception(
+                        "Process-group cleanup failed after an entry-point error"
+                    )
+                except BaseException:
+                    pass  # Preserve the active training or resource cleanup error.
 
 
 if __name__ == "__main__":

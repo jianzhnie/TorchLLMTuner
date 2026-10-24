@@ -5,6 +5,7 @@ import os
 import random
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from functools import partial
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -40,18 +41,37 @@ def preserve_rng_state(device: torch.device) -> Iterator[None]:
 
     This does not snapshot private generators owned by loaders. PyTorch 2.14
     regular DTensor random ops use the device default stream saved here.
+    Both host restores are attempted even after a restore failure. An operation
+    error takes precedence over cleanup errors; failed RNGs are not recovered.
     """
     python_state = random.getstate()
     numpy_state = np.random.get_state()
+    first_error: BaseException | None = None
     try:
         with torch.random.fork_rng(
             devices=[] if device.type == "cpu" else [device],
             device_type=device.type,
         ):
-            yield
+            try:
+                yield
+            except BaseException as error:
+                first_error = error
+                raise
+    except BaseException as error:
+        if first_error is None:
+            first_error = error
     finally:
-        random.setstate(python_state)
-        np.random.set_state(numpy_state)
+        for restore, state in (
+            (random.setstate, python_state),
+            (np.random.set_state, numpy_state),
+        ):
+            try:
+                restore(state)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+    if first_error is not None:
+        raise first_error
 
 
 @contextmanager
@@ -60,7 +80,9 @@ def rollback_execution_settings_on_error() -> Iterator[None]:
 
     Successful assembly keeps its settings for lazy compilation and training.
     Host RNG streams are restored after cleanup as well. Device RNG streams and
-    concurrently modified policies are outside this contract.
+    concurrently modified policies are outside this contract. Each rollback is
+    attempted independently; failed restores cannot replace the assembly error
+    and do not guarantee that the failed setting was recovered.
     """
     python_state = random.getstate()
     numpy_state = np.random.get_state()
@@ -84,19 +106,40 @@ def rollback_execution_settings_on_error() -> Iterator[None]:
     try:
         yield
     except BaseException:
-        random.setstate(python_state)
-        np.random.set_state(numpy_state)
-        torch.set_rng_state(cpu_state)
-        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
-        torch.backends.cudnn.deterministic = cudnn_deterministic
-        torch.backends.cudnn.benchmark = cudnn_benchmark
-        torch.utils.deterministic.fill_uninitialized_memory = fill_memory
-        torch.autograd.set_detect_anomaly(anomaly, check_nan=check_nan)
-        for name, value in environment.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        # Rollback is best effort: one failed restore must not hide the assembly
+        # error or prevent independent process settings from being restored.
+        restores = [
+            partial(random.setstate, python_state),
+            partial(np.random.set_state, numpy_state),
+            partial(torch.set_rng_state, cpu_state),
+            partial(
+                torch.use_deterministic_algorithms,
+                deterministic,
+                warn_only=warn_only,
+            ),
+            partial(
+                setattr, torch.backends.cudnn, "deterministic", cudnn_deterministic
+            ),
+            partial(setattr, torch.backends.cudnn, "benchmark", cudnn_benchmark),
+            partial(
+                setattr,
+                torch.utils.deterministic,
+                "fill_uninitialized_memory",
+                fill_memory,
+            ),
+            partial(torch.autograd.set_detect_anomaly, anomaly, check_nan=check_nan),
+        ]
+        restores.extend(
+            partial(os.environ.pop, name, None)
+            if value is None
+            else partial(os.environ.__setitem__, name, value)
+            for name, value in environment.items()
+        )
+        for restore in restores:
+            try:
+                restore()
+            except BaseException:
+                pass  # Preserve the assembly error, including interrupts.
         raise
 
 
