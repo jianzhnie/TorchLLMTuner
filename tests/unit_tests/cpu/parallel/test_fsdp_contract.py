@@ -174,8 +174,10 @@ def test_accessors_do_not_add_duplicate_parameters(tied: bool) -> None:
     assert len(list(wrapper.parameters())) == len(list(wrapper.model.parameters()))
 
 
+@pytest.mark.parametrize("reduce_dtype", ["float32", "bfloat16", "float64"])
 def test_apply_fsdp_preserves_parameter_dtype_for_mixed_precision(
     monkeypatch: pytest.MonkeyPatch,
+    reduce_dtype: str,
 ) -> None:
     """BF16 construction must not be silently widened by the FSDP policy."""
 
@@ -199,11 +201,12 @@ def test_apply_fsdp_preserves_parameter_dtype_for_mixed_precision(
         {"pp_enabled": False, "ep": 1},
     )()
     config = ParallelConfig()
+    config.fsdp_config.fsdp_reduce_dtype = reduce_dtype
 
     apply.apply_fsdp(model, config, parallel_dims)
 
     assert captured["param_dtype"] is torch.bfloat16
-    assert captured["reduce_dtype"] is torch.float32
+    assert captured["reduce_dtype"] is getattr(torch, reduce_dtype)
 
 
 def test_apply_fsdp_forwards_cpu_offload_policy(

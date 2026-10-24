@@ -116,7 +116,7 @@ def test_domino_launches_both_slices_before_consuming_tokens(monkeypatch):
     [(None, ValueError)]
     + [
         (index, error)
-        for index in (0, 1)
+        for index in (0, 1, "finish0", "finish1")
         for error in (ValueError, KeyboardInterrupt, SystemExit)
     ],
 )
@@ -180,9 +180,16 @@ def test_domino_cuda_schedule_waits_before_cross_stream_consumption(
         events.append((active[0].name, "launch"))
         return SimpleNamespace(args=args, routed_input=args[0])
 
+    finish_calls = 0
+
     def finish(pending):
+        nonlocal finish_calls
+        index = finish_calls
+        finish_calls += 1
         args = pending.args
         events.append((active[0].name, "consume"))
+        if failed_slice == f"finish{index}":
+            raise expected_error
         inputs, counts, metadata = local.dispatch(*args)
         return (
             inputs,
@@ -240,6 +247,14 @@ def test_domino_cuda_schedule_waits_before_cross_stream_consumption(
         with pytest.raises(error_type) as caught:
             domino._forward_cuda(slices, prepared, dispatcher, coordinate_experts=True)
         assert caught.value is expected_error
+        if isinstance(failed_slice, str):
+            assert len(drained) == (1 if failed_slice == "finish0" else 2)
+            assert drained[0] is slices[0][0]
+            if failed_slice == "finish1":
+                assert drained[1] is slices[1][0]
+            assert not combined_outputs
+            assert ("compute", "wait_stream", "comm") in events
+            return
         assert len(drained) == 2 + failed_slice
         assert drained[0] is slices[0][0]
         assert drained[1] is slices[1][0]

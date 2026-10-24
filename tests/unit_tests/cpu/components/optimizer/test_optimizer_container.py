@@ -607,3 +607,25 @@ def test_partial_optimizer_failure_requires_checkpoint_restore(monkeypatch):
             torch.testing.assert_close(actual[name], expected, rtol=0, atol=0)
         else:
             assert actual[name] == expected
+
+
+@pytest.mark.parametrize("optimizer_name", ["Adam", "AdamW"])
+@pytest.mark.parametrize("option", ["learning_rate", "weight_decays", "beta"])
+def test_unknown_group_options_are_rejected(optimizer_name, option):
+    model = _model()
+    before = {
+        name: value.detach().clone() for name, value in model.state_dict().items()
+    }
+    group = ParamGroupConfig(
+        pattern=".*", optimizer_name=optimizer_name, optimizer_kwargs={option: 0.1}
+    )
+    with pytest.raises(ValueError, match=f"{optimizer_name}.*{option}"):
+        OptimizersContainer(_cfg(group), model_parts=[model])
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
+def test_group_initial_lr_is_preserved_for_scheduler():
+    group = _catch_all(lr=0.1, initial_lr=0.2)
+    container = OptimizersContainer(_cfg(group), model_parts=[_model()])
+    assert container.optimizers[0].param_groups[0]["initial_lr"] == 0.2

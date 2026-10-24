@@ -1037,7 +1037,7 @@ def test_async_checkpoint_completion_reports_actual_outcome(
         manager.close()
 
 
-def test_async_checkpoint_close_releases_owned_group_after_stager_failure(tmp_path):
+def test_async_checkpoint_close_retains_group_until_stager_retry_succeeds(tmp_path):
     from types import SimpleNamespace
 
     import pytest
@@ -1064,13 +1064,22 @@ def test_async_checkpoint_close_releases_owned_group_after_stager_failure(tmp_pa
         assert dist.get_process_group_ranks(group) == [0]
         original = OSError("stager close failed")
 
+        attempts = []
+
         def close():
-            raise original
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise original
 
         manager.stager = SimpleNamespace(close=close)
         with pytest.raises(OSError) as caught:
             manager.close()
         assert caught.value is original
+        assert manager.pg is group and manager.stager is not None
+        assert manager._initialized
+        assert dist.get_process_group_ranks(group) == [0]
+        manager.close()
+        assert attempts == [True, True]
         assert manager.pg is None and manager.stager is None
         with pytest.raises(KeyError):
             dist.get_process_group_ranks(group)
@@ -1464,33 +1473,56 @@ def test_resumability_scan_only_tolerates_disappearing_metadata(monkeypatch, err
 
 @pytest.mark.parametrize("async_mode", ["disabled", "async"])
 @pytest.mark.parametrize("failure_phase", ["shards", "publication"])
-def test_failed_same_step_save_preserves_published_model(
+def test_failed_same_step_save_preserves_published_training_state(
     tmp_path, monkeypatch, async_mode, failure_phase
 ):
+    import random
     from copy import deepcopy
 
+    import numpy as np
     from torch.distributed.checkpoint import FileSystemWriter
     from torch.distributed.checkpoint.api import CheckpointException
 
     from llmtuner.components.checkpointer import checkpoint_writer
+    from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+    from llmtuner.components.optimizer.ema import EMA
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
     from llmtuner.config import OptimizerConfig
+    from llmtuner.datasets.synthetic import RandomTokenDataLoader
+    from llmtuner.trainer.trainer import Trainer
 
     model = nn.Linear(2, 2)
     optimizer = OptimizersContainer(OptimizerConfig(), model_parts=[model])
     scheduler = _schedule(optimizer.optimizers[0])
+    ema = EMA(model_parts=[model], decay=0.9)
+    loader = RandomTokenDataLoader(seed=42, vocab_size=8, batch_size=2, seq_len=4)
+    trainer = Trainer.__new__(Trainer)
+    trainer.step, trainer.ntokens_seen = 1, 8
     manager = DistributedCheckpointManager(
         Config(enable=True, interval=1, keep_latest_k=0, async_mode=async_mode),
         model_parts=[model],
         optimizer=optimizer,
         lr_scheduler=scheduler,
-        states={},
+        ema=ema,
+        states={
+            "dataloader": loader,
+            "train_state": trainer,
+            "rng_state": RNGCheckpointState(torch.device("cpu")),
+        },
         folder=str(tmp_path),
     )
     try:
         model(torch.ones(2, 2)).sum().backward()
         optimizer.step()
         scheduler.step()
+        ema.step(1)
+        next(iter(loader))
+        expected_ema = deepcopy(ema.state_dict())
+        expected_loader = deepcopy(loader.state_dict())
+        expected_trainer = deepcopy(trainer.state_dict())
+        expected_python_rng = random.getstate()
+        expected_numpy_rng = np.random.get_state()
+        expected_torch_rng = torch.get_rng_state().clone()
         expected = {key: value.clone() for key, value in model.state_dict().items()}
         expected_optimizer = deepcopy(optimizer.state_dict())
         expected_scheduler = deepcopy(scheduler.state_dict())
@@ -1502,6 +1534,12 @@ def test_failed_same_step_save_preserves_published_model(
             model.weight.add_(5)
         optimizer.step()
         scheduler.step()
+        ema.step(2)
+        next(iter(loader))
+        trainer.step, trainer.ntokens_seen = 2, 16
+        random.random()
+        np.random.random()
+        torch.rand(3)
         write_data = FileSystemWriter._write_data
 
         def fail_after_writing(self, *args, **kwargs):
@@ -1521,12 +1559,24 @@ def test_failed_same_step_save_preserves_published_model(
                 manager.save(1)
                 manager.maybe_wait_for_saving()
         assert (checkpoint / ".metadata").read_bytes() == metadata
+        # Synthetic iterators deliberately reject rewind after consumption.
+        loader = RandomTokenDataLoader(seed=42, vocab_size=8, batch_size=2, seq_len=4)
+        manager.states["dataloader"] = loader
         assert manager.load(1)
         torch.testing.assert_close(model.state_dict(), expected, rtol=0, atol=0)
         torch.testing.assert_close(
             optimizer.state_dict(), expected_optimizer, rtol=0, atol=0
         )
         assert scheduler.state_dict() == expected_scheduler
+        torch.testing.assert_close(ema.state_dict(), expected_ema, rtol=0, atol=0)
+        assert loader.state_dict() == expected_loader
+        assert trainer.state_dict() == expected_trainer
+        assert random.getstate() == expected_python_rng
+        actual_numpy_rng = np.random.get_state()
+        assert actual_numpy_rng[0] == expected_numpy_rng[0]
+        np.testing.assert_array_equal(actual_numpy_rng[1], expected_numpy_rng[1])
+        assert actual_numpy_rng[2:] == expected_numpy_rng[2:]
+        assert torch.equal(torch.get_rng_state(), expected_torch_rng)
         # A retry must publish a fresh generation and remain readable by the
         # ordinary DCP reader, without deleting the earlier generation's files.
         with torch.no_grad():
@@ -1571,6 +1621,24 @@ def _read_hf_export_into_fresh_model(tmp_path, model, adapter):
         manager.close()
 
 
+def _read_hf_export_with_transformers(export):
+    from safetensors.torch import load_file
+    from transformers.utils.hub import get_checkpoint_shard_files
+
+    files, metadata = get_checkpoint_shard_files(
+        str(export),
+        str(export / "model.safetensors.index.json"),
+        local_files_only=True,
+    )
+    tensors = {}
+    for filename in files:
+        shard = load_file(filename)
+        assert not (tensors.keys() & shard.keys())
+        tensors.update(shard)
+    assert tensors.keys() == metadata["weight_map"].keys()
+    return tensors
+
+
 @pytest.mark.parametrize("indexed", [False, True])
 def test_hf_export_roundtrip_without_process_group(tmp_path, indexed):
     from types import SimpleNamespace
@@ -1607,6 +1675,12 @@ def test_hf_export_roundtrip_without_process_group(tmp_path, indexed):
         torch.testing.assert_close(
             _read_hf_export_into_fresh_model(tmp_path, model, adapter),
             expected,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            _read_hf_export_with_transformers(tmp_path / "checkpoint" / "step-1"),
+            {key.removeprefix("model."): value for key, value in expected.items()},
             rtol=0,
             atol=0,
         )
@@ -1670,6 +1744,12 @@ def test_failed_hf_export_rewrite_preserves_published_weights(
         torch.testing.assert_close(
             _read_hf_export_into_fresh_model(tmp_path, model, manager.sd_adapter),
             expected,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            _read_hf_export_with_transformers(tmp_path / "checkpoint" / "step-1"),
+            {key.removeprefix("model."): value for key, value in expected.items()},
             rtol=0,
             atol=0,
         )
@@ -1967,6 +2047,9 @@ def test_load_synchronizes_snapshot_before_state_or_storage_access(failed_phase)
         maybe_wait_for_saving=lambda: synchronize("saving"),
         _resolve_load_source=resolve,
     )
+    manager._wait_for_pending_save = lambda: (
+        BaseCheckpointManager._wait_for_pending_save(manager)
+    )
     if failed_phase:
         with pytest.raises(RuntimeError, match=f"{failed_phase} failed"):
             BaseCheckpointManager.load(manager)
@@ -2085,10 +2168,13 @@ def test_compiled_checkpoint_migration_keeps_missing_keys_strict(tmp_path):
         )
 
 
+@pytest.mark.parametrize("report_error", [None, OSError, KeyboardInterrupt, SystemExit])
 def test_staging_group_construction_failure_releases_upload_group(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, report_error
 ):
     import torch.distributed as dist
+
+    from llmtuner.components.checkpointer import distributed_checkpoint as module
 
     assert not dist.is_initialized()
     dist.init_process_group(
@@ -2109,6 +2195,18 @@ def test_staging_group_construction_failure_releases_upload_group(
         return group
 
     monkeypatch.setattr(dist, "new_group", create_group)
+    if report_error is not None:
+        close = DistributedCheckpointManager._close
+
+        def close_then_fail(manager):
+            close(manager)
+            raise RuntimeError("construction cleanup failed after releasing groups")
+
+        def report(*args, **kwargs):
+            raise report_error("construction cleanup reporting failed")
+
+        monkeypatch.setattr(DistributedCheckpointManager, "_close", close_then_fail)
+        monkeypatch.setattr(module.logger, "exception", report)
     try:
         model = nn.Linear(2, 2)
         optimizer = torch.optim.AdamW(model.parameters())
@@ -2132,12 +2230,20 @@ def test_staging_group_construction_failure_releases_upload_group(
 
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
 @pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("report_error", [None, OSError, KeyboardInterrupt, SystemExit])
 def test_torch_checkpointing_failed_thread_start_closes_backend(
-    tmp_path, monkeypatch, error_type, cleanup_fails
+    tmp_path, monkeypatch, error_type, cleanup_fails, report_error
 ):
     from types import SimpleNamespace
 
     from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+
+    if report_error is not None:
+
+        def report(*args, **kwargs):
+            raise report_error("construction cleanup logger failed")
+
+        monkeypatch.setattr(tc.logger, "exception", report)
 
     calls = []
     original = error_type("retention thread start failed")
@@ -2185,12 +2291,20 @@ def test_torch_checkpointing_failed_thread_start_closes_backend(
 
 @pytest.mark.parametrize("operation", ["load", "save"])
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt, None])
+@pytest.mark.parametrize("report_error", [None, OSError, KeyboardInterrupt, SystemExit])
 def test_temporary_backend_cleanup_preserves_operation_error(
-    tmp_path, monkeypatch, operation, error_type
+    tmp_path, monkeypatch, operation, error_type, report_error
 ):
     from types import SimpleNamespace
 
     from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+
+    if report_error is not None:
+
+        def report(*args, **kwargs):
+            raise report_error("temporary cleanup logger failed")
+
+        monkeypatch.setattr(tc.logger, "exception", report)
 
     manager, _, model_key = _hf_manager_stub(
         tmp_path,
@@ -2460,3 +2574,521 @@ def test_fsspec_retention_drains_deletions_and_keeps_latest_loadable(
     finally:
         manager.close()
         filesystem.rmtree(folder)
+
+
+@pytest.mark.parametrize(
+    "key", ["lr_scheduler", "dataloader", "train_state", "rng_state"]
+)
+def test_optional_backend_coordinates_local_state_restore(tmp_path, monkeypatch, key):
+    from contextlib import contextmanager
+
+    from torch.distributed.checkpoint.stateful import Stateful
+
+    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+
+    manager, _, _ = _hf_manager_stub(
+        tmp_path, monkeypatch, files={f"{tmp_path}/metadata.pkl"}
+    )
+    active = []
+
+    @contextmanager
+    def coordinate(stage):
+        active.append(stage)
+        try:
+            yield
+        finally:
+            active.pop()
+
+    class LocalState(Stateful):
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state):
+            assert active == [f"Checkpoint {key} restoration"]
+            raise ValueError("local restore failed")
+
+    monkeypatch.setattr(tc, "synchronize_local_errors", coordinate)
+    with pytest.raises(ValueError, match="local restore failed"):
+        manager._load_checkpoint(
+            {key: LocalState()}, str(tmp_path), from_hf=False, from_quantized=False
+        )
+
+
+def test_optional_backend_restores_rng_after_user_callbacks(tmp_path, monkeypatch):
+    from torch.distributed.checkpoint.stateful import Stateful
+
+    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+    from llmtuner.components.checkpointer.checkpoint_keys import RNG_STATE
+    from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+    from llmtuner.utils.seeding import preserve_rng_state
+
+    manager, _, _ = _hf_manager_stub(
+        tmp_path, monkeypatch, files={f"{tmp_path}/metadata.pkl"}
+    )
+    rng = RNGCheckpointState(torch.device("cpu"))
+
+    class RandomCallback(Stateful):
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state):
+            torch.rand(7)
+
+    monkeypatch.setattr(
+        tc.TorchCheckpointingManager,
+        "_stateful_to_state_dict",
+        staticmethod(lambda states: {k: v.state_dict() for k, v in states.items()}),
+    )
+    with preserve_rng_state(torch.device("cpu")):
+        before = torch.get_rng_state().clone()
+        manager._load_checkpoint(
+            {RNG_STATE: rng, "custom": RandomCallback()},
+            str(tmp_path),
+            from_hf=False,
+            from_quantized=False,
+        )
+        assert torch.equal(torch.get_rng_state(), before)
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit, OSError])
+def test_interrupted_stager_close_retains_live_executor(
+    tmp_path, monkeypatch, error_type
+):
+    from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
+
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    manager = DistributedCheckpointManager(
+        Config(enable=True, keep_latest_k=0, async_mode="async"),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=str(tmp_path),
+    )
+    stager = DefaultStager(
+        StagingOptions(
+            use_pinned_memory=False,
+            use_shared_memory=False,
+            use_async_staging=True,
+        )
+    )
+    manager.stager = stager
+    executor = stager._staging_executor
+    assert executor is not None
+    executor.submit(lambda: None).result()
+    original = error_type("interrupted executor shutdown")
+    try:
+        with monkeypatch.context() as patch:
+
+            def interrupt(*args, **kwargs):
+                raise original
+
+            patch.setattr(executor, "shutdown", interrupt)
+            with pytest.raises(error_type) as caught:
+                manager.close()
+        assert caught.value is original
+        assert manager.stager is stager
+        assert manager._initialized
+        assert any(thread.is_alive() for thread in executor._threads)
+        manager.close()
+        assert manager.stager is None
+        assert not manager._initialized
+        assert all(not thread.is_alive() for thread in executor._threads)
+        manager.close()
+    finally:
+        stager.close()
+        manager.close()
+
+
+@pytest.mark.parametrize("category", ["dataloader", "train_state"])
+def test_dcp_coordinates_local_state_restoration(tmp_path, monkeypatch, category):
+    from contextlib import contextmanager
+
+    from llmtuner.components.checkpointer import distributed_checkpoint as module
+
+    active = []
+    failure = ValueError("local state restore failed")
+
+    class LocalState:
+        def state_dict(self):
+            return {"value": 1}
+
+        def load_state_dict(self, state):
+            assert state == {"value": 1}
+            assert active == [f"Checkpoint {category} restoration"]
+            raise failure
+
+    @contextmanager
+    def coordinate(phase):
+        active.append(phase)
+        try:
+            yield
+        finally:
+            active.pop()
+
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    manager = DistributedCheckpointManager(
+        Config(enable=True, interval=1, keep_latest_k=0),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={category: LocalState()},
+        folder=str(tmp_path),
+    )
+    try:
+        assert manager.save(1)
+        monkeypatch.setattr(module, "synchronize_local_errors", coordinate)
+        with pytest.raises(ValueError) as caught:
+            manager.load(1)
+        assert caught.value is failure
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize(
+    "key", ["rng_state", "dataloader", "train_state", "lr_scheduler"]
+)
+def test_optional_backend_validates_local_metadata_before_full_reader(
+    tmp_path, monkeypatch, key
+):
+    import pickle
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+    from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+    from llmtuner.datasets.synthetic import RandomTokenDataLoader
+    from llmtuner.trainer.trainer import Trainer
+
+    manager, calls, _ = _hf_manager_stub(
+        tmp_path, monkeypatch, files={f"{tmp_path}/metadata.pkl"}
+    )
+    if key == "rng_state":
+        state = RNGCheckpointState(torch.device("cpu"))
+        invalid = state.state_dict()
+        payload = pickle.loads(invalid[state.key])
+        payload["version"] = 2
+        invalid[state.key] = pickle.dumps(payload)
+    elif key == "dataloader":
+        state = RandomTokenDataLoader(seed=42, vocab_size=8, batch_size=2, seq_len=4)
+        invalid = state.state_dict()
+        invalid["dp_world_size"] = 2
+    elif key == "lr_scheduler":
+        optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(2))])
+        state = build_lr_scheduler(
+            LRSchedulerConfig(), optimizers=[optimizer], training_steps=4
+        )
+        invalid = {"last_epoch": 5}
+    else:
+        state = Trainer.__new__(Trainer)
+        state.step = 3
+        state.ntokens_seen = 12
+        invalid = {"step": -1, "ntokens_seen": 8}
+    before = deepcopy(state.state_dict())
+    reader_calls = []
+
+    def load(path, *, into, strict):
+        assert set(into) == {key}
+        assert strict
+        reader_calls.append("subset")
+        into[key] = invalid
+
+    reader = SimpleNamespace(load=load, close=lambda: reader_calls.append("close"))
+    monkeypatch.setattr(
+        tc,
+        "default_backend_config",
+        lambda *a, **kw: SimpleNamespace(build=lambda: reader),
+    )
+    with pytest.raises(ValueError):
+        manager._load_checkpoint(
+            {key: state}, str(tmp_path), from_hf=False, from_quantized=False
+        )
+    assert reader_calls == ["subset", "close"]
+    assert "native_load" not in calls
+    if key != "rng_state":
+        assert state.state_dict() == before
+    else:
+        # Pickle encodings can differ; compare the actual CPU generator.
+        assert torch.equal(
+            pickle.loads(before[state.key])["cpu"], torch.get_rng_state()
+        )
+
+
+@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize("indexed", [False, True])
+def test_hf_export_loads_with_automodel_and_preserves_logits(tmp_path, tied, indexed):
+    from copy import deepcopy
+
+    from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
+
+    from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+
+    config = LlamaConfig(
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        tie_word_embeddings=tied,
+        attention_dropout=0.0,
+    )
+    config._attn_implementation = "eager"
+    original = LlamaForCausalLM(config).float().eval()
+    wrapper = nn.ModuleDict({"model": original})
+    optimizer = torch.optim.AdamW(wrapper.parameters())
+    adapter = HFTransformerStateDictAdapter(config, None)
+    if indexed:
+        adapter.fqn_to_index_mapping = {
+            name: index % 2 + 1 for index, name in enumerate(original.state_dict())
+        }
+    manager = DistributedCheckpointManager(
+        Config(enable=True, last_save_in_hf=True, keep_latest_k=0),
+        model_parts=[wrapper],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=str(tmp_path),
+        sd_adapter=adapter,
+    )
+    try:
+        inputs = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]])
+        with torch.no_grad():
+            expected = original(inputs).logits
+        assert manager.save(1, last_step=True)
+        # The manager exports weights; the caller supplies the model config.
+        restored = AutoModelForCausalLM.from_pretrained(
+            str(tmp_path / "checkpoint" / "step-1"),
+            config=deepcopy(config),
+            local_files_only=True,
+            dtype=torch.float32,
+            generation_config=deepcopy(original.generation_config),
+        ).eval()
+        torch.testing.assert_close(
+            restored.state_dict(), original.state_dict(), rtol=0, atol=0
+        )
+        assert (restored.lm_head.weight is restored.model.embed_tokens.weight) == tied
+        with torch.no_grad():
+            actual = restored(inputs).logits
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
+def test_checkpoint_close_survives_secondary_error_reporting(monkeypatch, report_error):
+    from llmtuner.components.checkpointer import base
+
+    manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
+    manager._initialized = True
+    manager.enable = True
+    calls = []
+    original = ValueError("primary staging failure")
+
+    def staging():
+        calls.append("staging")
+        raise original
+
+    def saving():
+        calls.append("saving")
+        raise RuntimeError("secondary saving failure")
+
+    def report(*args, **kwargs):
+        raise report_error("secondary report failure")
+
+    manager.maybe_wait_for_staging = staging
+    manager.maybe_wait_for_saving = saving
+    manager._close = lambda: calls.append("cleanup")
+    monkeypatch.setattr(base.logger, "exception", report)
+    with pytest.raises(ValueError) as caught:
+        manager.close()
+    assert caught.value is original
+    assert calls == ["staging", "saving", "cleanup"]
+    assert not manager._initialized
+    manager.close()
+    assert calls == ["staging", "saving", "cleanup"]
+
+
+@pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
+def test_dcp_group_cleanup_preserves_first_error_when_reporting_fails(
+    monkeypatch, report_error
+):
+    from llmtuner.components.checkpointer import distributed_checkpoint as module
+
+    manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
+    manager.stager = None
+    staging_group, save_group = object(), object()
+    manager.staging_pg = staging_group
+    manager.pg = save_group
+    calls = []
+    failure = ValueError("primary group shutdown failure")
+
+    def destroy(group):
+        calls.append(group)
+        if group is staging_group:
+            raise failure
+        raise RuntimeError("secondary group shutdown failure")
+
+    def report(*args, **kwargs):
+        raise report_error("secondary cleanup report failure")
+
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(module.dist, "destroy_process_group", destroy)
+    monkeypatch.setattr(module.logger, "exception", report)
+    with pytest.raises(ValueError) as caught:
+        manager._close()
+    assert caught.value is failure
+    assert calls == [staging_group, save_group]
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+@pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
+def test_async_completion_report_failure_does_not_escape_worker(
+    tmp_path, monkeypatch, outcome, report_error
+):
+    from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+
+    from llmtuner.components.checkpointer import distributed_checkpoint as module
+
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    manager = DistributedCheckpointManager(
+        Config(enable=True, interval=1, keep_latest_k=0, async_mode="async"),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=str(tmp_path),
+    )
+    future = Future()
+    monkeypatch.setattr(manager, "_save_checkpoint", lambda *args, **kwargs: future)
+    original = ValueError("original upload failure")
+    assert manager.save(2)
+    reports = []
+
+    def report(*args, **kwargs):
+        reports.append(args)
+        raise report_error("completion logger failed")
+
+    for method in ("info", "warning", "error"):
+        monkeypatch.setattr(module.logger, method, report)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            if outcome == "success":
+                task = executor.submit(future.set_result, None)
+            elif outcome == "failure":
+                task = executor.submit(future.set_exception, original)
+            else:
+                task = executor.submit(future.cancel)
+            escaped = None
+            try:
+                task.result(timeout=5)
+            except BaseException as error:
+                escaped = error
+            assert escaped is None
+            assert executor.submit(lambda: 42).result(timeout=5) == 42
+        assert len(reports) == 1
+        if outcome == "failure":
+            with pytest.raises(ValueError) as caught:
+                manager.maybe_wait_for_saving()
+            assert caught.value is original
+        elif outcome == "cancelled":
+            with pytest.raises(CancelledError):
+                manager.maybe_wait_for_saving()
+        else:
+            manager.maybe_wait_for_saving()
+        assert manager.save_future is None
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt, SystemExit])
+def test_purge_join_failure_retains_live_worker_until_retry(
+    tmp_path, monkeypatch, error_type
+):
+    import threading
+
+    started, finish = threading.Event(), threading.Event()
+    remove = FilesystemCheckpointStorage.remove
+
+    def blocked_remove(storage, path):
+        started.set()
+        assert finish.wait(timeout=10)
+        remove(storage, path)
+
+    monkeypatch.setattr(FilesystemCheckpointStorage, "remove", blocked_remove)
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    manager = DistributedCheckpointManager(
+        Config(enable=True, keep_latest_k=2, async_mode="disabled"),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=str(tmp_path),
+    )
+    path = tmp_path / "obsolete"
+    path.mkdir()
+    worker = manager.purge_thread
+    failure = error_type("purge join interrupted before worker exits")
+    try:
+        manager.purge_queue.put(str(path))
+        assert started.wait(timeout=5)
+        with monkeypatch.context() as scoped:
+
+            def fail_join():
+                raise failure
+
+            scoped.setattr(worker, "join", fail_join)
+            with pytest.raises(error_type) as caught:
+                manager.close()
+            assert caught.value is failure
+        assert worker.is_alive()
+        assert manager.purge_thread is worker
+        assert manager._initialized
+        finish.set()
+        manager.close()
+        assert not worker.is_alive()
+        assert not manager._initialized
+        assert not path.exists()
+        manager.close()
+    finally:
+        finish.set()
+        worker.join(timeout=5)
+        manager.close()
+
+
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt, SystemExit])
+def test_backend_close_preserves_first_error_and_attempts_all_releases(error_type):
+    from types import SimpleNamespace
+
+    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+        TorchCheckpointingManager,
+    )
+
+    manager = TorchCheckpointingManager.__new__(TorchCheckpointingManager)
+    calls = []
+    original = error_type("original save wait failure")
+
+    def wait():
+        calls.append("wait")
+        raise original
+
+    def join():
+        calls.append("join")
+        raise OSError("secondary purge join failure")
+
+    def close():
+        calls.append("close")
+        raise RuntimeError("secondary backend close failure")
+
+    manager.maybe_wait_for_saving = wait
+    manager.purge_thread = SimpleNamespace(is_alive=lambda: True, join=join)
+    manager.purge_queue = SimpleNamespace(put=lambda value: calls.append("sentinel"))
+    manager._manager = SimpleNamespace(close=close)
+    with pytest.raises(error_type) as caught:
+        manager._close()
+    assert caught.value is original
+    assert calls == ["wait", "sentinel", "join", "close"]

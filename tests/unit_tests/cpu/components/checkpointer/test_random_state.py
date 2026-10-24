@@ -202,3 +202,234 @@ def test_rng_checkpoint_validation_does_not_advance_live_stream():
     before = torch.get_rng_state().clone()
     checkpoint.validate_state_dict(saved)
     assert torch.equal(torch.get_rng_state(), before)
+
+
+@pytest.mark.parametrize("field,value", [("world_size", 2), ("version", 2)])
+def test_manager_rejects_incompatible_rng_before_mutating_training_state(
+    tmp_path, field, value
+):
+    from copy import deepcopy
+
+    from llmtuner.components.checkpointer.distributed_checkpoint import (
+        DistributedCheckpointManager,
+    )
+    from llmtuner.config.checkpoint_config import CheckpointConfig
+
+    with preserve_rng_state(torch.device("cpu")):
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+        rng = RNGCheckpointState(torch.device("cpu"))
+        manager = DistributedCheckpointManager(
+            CheckpointConfig(enable=True, interval=1, keep_latest_k=0),
+            model_parts=[model],
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            states={"rng_state": rng},
+            folder=str(tmp_path),
+        )
+        try:
+            model(torch.ones(2, 2)).sum().backward()
+            optimizer.step()
+            scheduler.step()
+            saved_rng = rng.state_dict()
+            payload = pickle.loads(saved_rng[rng.key])
+            payload[field] = value
+
+            # Keep the normal manager save path; inject only saved metadata.
+            class IncompatibleRNG:
+                def state_dict(self):
+                    return {rng.key: pickle.dumps(payload)}
+
+                def load_state_dict(self, state):
+                    raise AssertionError("Save-only incompatible RNG fixture")
+
+            manager.states["rng_state"] = IncompatibleRNG()
+            assert manager.save(1)
+            manager.states["rng_state"] = rng
+            optimizer.zero_grad()
+            model(torch.full((2, 2), 3.0)).sum().backward()
+            optimizer.step()
+            scheduler.step()
+            before_model = deepcopy(model.state_dict())
+            before_optimizer = deepcopy(optimizer.state_dict())
+            before_scheduler = deepcopy(scheduler.state_dict())
+            before_python = random.getstate()
+            before_numpy = np.random.get_state()
+            before_cpu = torch.get_rng_state().clone()
+            with pytest.raises(ValueError, match="RNG checkpoint"):
+                manager.load()
+            torch.testing.assert_close(model.state_dict(), before_model, rtol=0, atol=0)
+            torch.testing.assert_close(
+                optimizer.state_dict(), before_optimizer, rtol=0, atol=0
+            )
+            assert scheduler.state_dict() == before_scheduler
+            assert random.getstate() == before_python
+            after_numpy = np.random.get_state()
+            np.testing.assert_array_equal(after_numpy[1], before_numpy[1])
+            assert after_numpy[0] == before_numpy[0]
+            assert after_numpy[2:] == before_numpy[2:]
+            assert torch.equal(torch.get_rng_state(), before_cpu)
+        finally:
+            manager.close()
+
+
+@pytest.mark.parametrize("mismatch", ["dp_degree", "batch_layout", "steps"])
+def test_manager_rejects_invalid_data_cursor_before_model_or_optimizer_load(
+    tmp_path, mismatch
+):
+    from copy import deepcopy
+
+    from llmtuner.components.checkpointer.distributed_checkpoint import (
+        DistributedCheckpointManager,
+    )
+    from llmtuner.config.checkpoint_config import CheckpointConfig
+    from llmtuner.datasets.synthetic import RandomTokenDataLoader
+
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    loader = RandomTokenDataLoader(seed=42, vocab_size=8, batch_size=2, seq_len=4)
+    manager = DistributedCheckpointManager(
+        CheckpointConfig(enable=True, interval=1, keep_latest_k=0),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states={"dataloader": loader},
+        folder=str(tmp_path),
+    )
+    try:
+        saved = loader.state_dict()
+        if mismatch == "dp_degree":
+            saved["dp_world_size"] = 2
+        elif mismatch == "batch_layout":
+            saved["batch_layout"]["seq_len"] = 8
+        else:
+            saved["steps"] = -1
+        # Real DCP save, with only the loader metadata deliberately malformed.
+        from unittest.mock import patch
+
+        with patch.object(loader, "state_dict", return_value=saved):
+            assert manager.save(1)
+        model(torch.ones(2, 2)).sum().backward()
+        optimizer.step()
+        scheduler.step()
+        next(iter(loader))
+        before_model = deepcopy(model.state_dict())
+        before_optimizer = deepcopy(optimizer.state_dict())
+        before_scheduler = deepcopy(scheduler.state_dict())
+        before_loader = deepcopy(loader.state_dict())
+        with pytest.raises(ValueError):
+            manager.load()
+        torch.testing.assert_close(model.state_dict(), before_model, rtol=0, atol=0)
+        torch.testing.assert_close(
+            optimizer.state_dict(), before_optimizer, rtol=0, atol=0
+        )
+        assert scheduler.state_dict() == before_scheduler
+        assert loader.state_dict() == before_loader
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("field", ["step", "ntokens_seen"])
+@pytest.mark.parametrize("value", [-1, True, 1.5])
+def test_manager_rejects_invalid_trainer_counters_before_live_state_changes(
+    tmp_path, field, value
+):
+    from copy import deepcopy
+
+    from llmtuner.components.checkpointer.distributed_checkpoint import (
+        DistributedCheckpointManager,
+    )
+    from llmtuner.config.checkpoint_config import CheckpointConfig
+    from llmtuner.trainer.trainer import Trainer
+
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    trainer = Trainer.__new__(Trainer)
+    trainer.step = 1
+    trainer.ntokens_seen = 8
+    setattr(trainer, field, value)
+    manager = DistributedCheckpointManager(
+        CheckpointConfig(enable=True, interval=1, keep_latest_k=0),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states={"train_state": trainer},
+        folder=str(tmp_path),
+    )
+    try:
+        model(torch.ones(2, 2)).sum().backward()
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+        assert manager.save(1)
+        trainer.step = 2
+        trainer.ntokens_seen = 16
+        model(torch.ones(2, 2)).sum().backward()
+        optimizer.step()
+        scheduler.step()
+        before_model = deepcopy(model.state_dict())
+        before_optimizer = deepcopy(optimizer.state_dict())
+        before_scheduler = deepcopy(scheduler.state_dict())
+        before_trainer = trainer.state_dict()
+        with pytest.raises(ValueError, match=f"trainer {field}"):
+            manager.load()
+        torch.testing.assert_close(model.state_dict(), before_model, rtol=0, atol=0)
+        torch.testing.assert_close(
+            optimizer.state_dict(), before_optimizer, rtol=0, atol=0
+        )
+        assert scheduler.state_dict() == before_scheduler
+        assert trainer.state_dict() == before_trainer
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("epoch", [-1, True, 1.5, 5])
+def test_manager_rejects_invalid_scheduler_progress_before_live_writes(tmp_path, epoch):
+    from copy import deepcopy
+    from unittest.mock import patch
+
+    from llmtuner.components.checkpointer.distributed_checkpoint import (
+        DistributedCheckpointManager,
+    )
+    from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
+    from llmtuner.config.checkpoint_config import CheckpointConfig
+    from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
+
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = build_lr_scheduler(
+        LRSchedulerConfig(), optimizers=[optimizer], training_steps=4
+    )
+    manager = DistributedCheckpointManager(
+        CheckpointConfig(enable=True, interval=1, keep_latest_k=0),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states={},
+        folder=str(tmp_path),
+    )
+    try:
+        model(torch.ones(2, 2)).sum().backward()
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+        with patch.object(scheduler, "state_dict", return_value={"last_epoch": epoch}):
+            assert manager.save(1)
+        model(torch.full((2, 2), 3.0)).sum().backward()
+        optimizer.step()
+        scheduler.step()
+        before_model = deepcopy(model.state_dict())
+        before_optimizer = deepcopy(optimizer.state_dict())
+        before_scheduler = deepcopy(scheduler.state_dict())
+        with pytest.raises(ValueError, match="scheduler last_epoch"):
+            manager.load()
+        torch.testing.assert_close(model.state_dict(), before_model, rtol=0, atol=0)
+        torch.testing.assert_close(
+            optimizer.state_dict(), before_optimizer, rtol=0, atol=0
+        )
+        assert scheduler.state_dict() == before_scheduler
+    finally:
+        manager.close()

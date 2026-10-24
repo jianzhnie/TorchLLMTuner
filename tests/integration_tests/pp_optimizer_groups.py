@@ -73,12 +73,13 @@ def main():
             else:
                 raise AssertionError("globally unused rule was accepted")
             dist.barrier()
-        for phase in ("planning", "initialization"):
+        for phase in ("planning", "initialization", "unknown_options"):
             invalid_model = torch.nn.Module()
             invalid_model.register_parameter(
                 "weight", torch.nn.Parameter(torch.ones(1))
             )
             parts = [invalid_model]
+            config = OptimizerConfig(implementation="for-loop")
             if rank == 0:
                 if phase == "planning":
                     wrapped = torch.nn.Module()
@@ -86,22 +87,27 @@ def main():
                         "weight", torch.nn.Parameter(torch.zeros(1))
                     )
                     invalid_model.add_module("_orig_mod", wrapped)
-                else:
+                elif phase == "initialization":
                     parts.append(invalid_model)
+                else:
+                    config.param_groups[0].optimizer_kwargs["learning_rate"] = 0.25
             try:
                 OptimizersContainer(
-                    OptimizerConfig(implementation="for-loop"),
+                    config,
                     model_parts=parts,
                     pipeline_mesh=mesh,
                     **initialization,
                 )
             except ValueError as error:
                 assert rank == 0
-                assert (
-                    "collide after wrapper removal" in str(error)
-                    if phase == "planning"
-                    else "assigned 1 parameter(s) to more than one group" in str(error)
-                )
+                expected = {
+                    "planning": "collide after wrapper removal",
+                    "initialization": "assigned 1 parameter(s) to more than one group",
+                    "unknown_options": "AdamW optimizer_kwargs contain unknown options",
+                }[phase]
+                assert expected in str(error)
+                if phase == "unknown_options":
+                    assert "learning_rate" in str(error)
             except RuntimeError as error:
                 assert rank != 0
                 label = (

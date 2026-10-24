@@ -4,7 +4,8 @@
         tests/integration_tests/rng_checkpoint_equivalence.py
 
 Each rank uses different Python, NumPy and torch streams. Checks resumed loss,
-parameters and optimizer state exactly after two additional stochastic updates.
+parameters, optimizer, scheduler and EMA state exactly after two additional
+stochastic updates.
 Runs sync and async saves; advances training after staging and before close.
 Custom FSDP relocates both linear units to the root hook, producing three
 hook-owned contexts. Uses the actual DistributedCheckpointManager; Trainer
@@ -27,11 +28,13 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel
 
+from llmtuner.components.checkpointer.checkpoint_keys import EMA as EMA_STATE
 from llmtuner.components.checkpointer.checkpoint_keys import MODEL, RNG_STATE
 from llmtuner.components.checkpointer.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config.checkpoint_config import CheckpointConfig
@@ -73,11 +76,12 @@ def runtime(seed, mesh=None, *, custom=False):
     scheduler = build_lr_scheduler(
         LRSchedulerConfig(), optimizers=optimizer.optimizers, training_steps=4
     )
-    return model, execution_model, optimizer, scheduler
+    ema = EMA(model_parts=[model], decay=0.75)
+    return model, execution_model, optimizer, scheduler, ema
 
 
 def manager(runtime, folder, *, async_mode="disabled"):
-    model, _, optimizer, scheduler = runtime
+    model, _, optimizer, scheduler, ema = runtime
     return DistributedCheckpointManager(
         CheckpointConfig(
             enable=True, interval=1, keep_latest_k=0, async_mode=async_mode
@@ -85,13 +89,14 @@ def manager(runtime, folder, *, async_mode="disabled"):
         model_parts=[model],
         optimizer=optimizer,
         lr_scheduler=scheduler,
+        ema=ema,
         states={RNG_STATE: RNGCheckpointState(torch.device("cpu"))},
         folder=folder,
     )
 
 
 def update(runtime):
-    _, execution_model, optimizer, scheduler = runtime
+    _, execution_model, optimizer, scheduler, ema = runtime
     optimizer.zero_grad(set_to_none=True)
     inputs = torch.arange(16).float().reshape(4, 4) / 16
     inputs = inputs * (0.5 + random.random() + np.random.random())
@@ -99,6 +104,7 @@ def update(runtime):
     loss.backward()
     optimizer.step()
     scheduler.step()
+    ema.step(scheduler.state_dict()["last_epoch"])
     return loss.detach().clone()
 
 
@@ -107,6 +113,118 @@ def main():
     try:
         rank = dist.get_rank()
         assert dist.get_world_size() == 2
+        # A stale rank must stop every peer before EMA enters state gathering.
+        probe = torch.nn.Linear(2, 2)
+        probe_ema = EMA(model_parts=[probe], decay=0.75)
+        saved_probe = deepcopy(probe_ema.state_dict())
+        before_probe = [
+            value["ema_params"].clone()
+            for optimizer in probe_ema.optimizers
+            for value in optimizer.state.values()
+        ]
+        if rank == 0:
+            probe.renamed_bias = probe.bias
+            del probe.bias
+        for operation in ("save", "load"):
+            try:
+                if operation == "save":
+                    probe_ema.state_dict()
+                else:
+                    probe_ema.load_state_dict(saved_probe)
+            except RuntimeError as error:
+                expected = (
+                    "checkpoint name changed"
+                    if rank == 0
+                    else "EMA checkpoint validation failed on another rank"
+                )
+                assert expected in str(error), str(error)
+            else:
+                raise AssertionError(f"EMA {operation} accepted stale ownership")
+            actual_probe = [
+                value["ema_params"]
+                for optimizer in probe_ema.optimizers
+                for value in optimizer.state.values()
+            ]
+            torch.testing.assert_close(actual_probe, before_probe, atol=0, rtol=0)
+            dist.barrier()
+        if rank == 0:
+            probe.bias = probe.renamed_bias
+            del probe.renamed_bias
+        probe_ema.load_state_dict(saved_probe)
+        torch.testing.assert_close(probe_ema.state_dict(), saved_probe, atol=0, rtol=0)
+        for invalid in (None, {}):
+            state = invalid if rank == 0 else saved_probe
+            try:
+                probe_ema.load_state_dict(state)
+            except (ValueError, RuntimeError) as error:
+                expected = (
+                    "empty on only some ranks"
+                    if invalid == {}
+                    else (
+                        "must be a dictionary"
+                        if rank == 0
+                        else "EMA checkpoint validation failed on another rank"
+                    )
+                )
+                assert expected in str(error), str(error)
+            else:
+                raise AssertionError("EMA accepted inconsistent rank-local input")
+            dist.barrier()
+            torch.testing.assert_close(
+                probe_ema.state_dict(), saved_probe, atol=0, rtol=0
+            )
+        if rank == 0:
+            print("EMA stale ownership and divergent inputs: coordinated", flush=True)
+        probe_optimizer = OptimizersContainer(
+            OptimizerConfig(learning_rate=0.01, implementation="for-loop"),
+            model_parts=[probe],
+        )
+        saved_optimizer = deepcopy(probe_optimizer.state_dict())
+        invalid_optimizer = deepcopy(saved_optimizer)
+        if rank == 0:
+            key = next(key for key in invalid_optimizer if key.endswith(".exp_avg"))
+            invalid_optimizer[key] = torch.zeros(3)
+        try:
+            probe_optimizer.load_state_dict(invalid_optimizer)
+        except (ValueError, RuntimeError) as error:
+            expected = (
+                "has shape"
+                if rank == 0
+                else "Optimizer checkpoint validation failed on another rank"
+            )
+            assert expected in str(error), str(error)
+        else:
+            raise AssertionError("Optimizer accepted a peer's malformed checkpoint")
+        dist.barrier()
+        torch.testing.assert_close(
+            probe_optimizer.state_dict(), saved_optimizer, atol=0, rtol=0
+        )
+        probe_optimizer.load_state_dict(saved_optimizer)
+        if rank == 0:
+            print("Optimizer rank-local malformed state: coordinated", flush=True)
+        group = probe_optimizer.optimizers[0].param_groups[0]
+        original_names = list(group["param_names"])
+        if rank == 0:
+            group["param_names"][1] = group["param_names"][0]
+        try:
+            probe_optimizer.state_dict()
+        except (ValueError, RuntimeError) as error:
+            expected = (
+                "Duplicate optimizer parameter FQN"
+                if rank == 0
+                else "Optimizer checkpoint construction failed on another rank"
+            )
+            assert expected in str(error), str(error)
+        else:
+            raise AssertionError("Optimizer ignored a peer's serialization failure")
+        finally:
+            group["param_names"] = original_names
+        dist.barrier()
+        torch.testing.assert_close(
+            probe_optimizer.state_dict(), saved_optimizer, atol=0, rtol=0
+        )
+        if rank == 0:
+            print("Optimizer rank-local serialization failure: coordinated", flush=True)
         context = TemporaryDirectory() if rank == 0 else nullcontext(None)
         with context as root:
             paths = [root]
@@ -133,6 +251,7 @@ def main():
                     checkpoint_model = deepcopy(original[0].state_dict())
                     checkpoint_optimizer = deepcopy(original[2].state_dict())
                     checkpoint_scheduler = deepcopy(original[3].state_dict())
+                    checkpoint_ema = deepcopy(original[4].state_dict())
                     checkpoint_rng = writer.states[RNG_STATE].state_dict()
                     assert writer.save(2)
                     if mode == "async":
@@ -152,16 +271,25 @@ def main():
                             "validate_state_dict",
                             "model validation",
                         ),
+                        (rng, "validate_state_dict", "RNG preflight validation"),
                         (rng, "validate_state_dict", "RNG validation"),
                         (rng, "load_state_dict", "RNG restoration"),
                     ):
                         original_method = getattr(target, method)
                         failure = ValueError(f"injected rank-local {phase}")
+                        calls = []
 
                         def fail_local(
-                            state, original_method=original_method, failure=failure
+                            state,
+                            original_method=original_method,
+                            failure=failure,
+                            calls=calls,
+                            phase=phase,
                         ):
-                            if rank == 0:
+                            calls.append(True)
+                            if rank == 0 and not (
+                                phase == "RNG validation" and len(calls) == 1
+                            ):
                                 raise failure
                             return original_method(state)
 
@@ -182,7 +310,7 @@ def main():
                                     )
                             else:
                                 raise AssertionError("load failure was not coordinated")
-                        if phase == "RNG validation":
+                        if phase in {"RNG validation", "RNG preflight validation"}:
                             assert random.getstate() == before[0]
                             numpy_state = np.random.get_state()
                             assert numpy_state[0] == before[1][0]
@@ -190,6 +318,31 @@ def main():
                             assert numpy_state[2:] == before[1][2:]
                             assert torch.equal(torch.get_rng_state(), before[2])
                         dist.barrier()
+                    reader.exclude_from_loading = [EMA_STATE]
+                    failure = ValueError("injected rank-local EMA cold start")
+                    original_ema_reset = resumed[4].reset_from_model
+
+                    def fail_ema_local(
+                        failure=failure, original_ema_reset=original_ema_reset
+                    ):
+                        if rank == 0:
+                            raise failure
+                        return original_ema_reset()
+
+                    with patch.object(resumed[4], "reset_from_model", fail_ema_local):
+                        try:
+                            reader.load(2)
+                        except (ValueError, RuntimeError) as error:
+                            if rank == 0:
+                                assert error is failure
+                            else:
+                                assert str(error) == (
+                                    "Checkpoint EMA cold start failed on another rank"
+                                )
+                        else:
+                            raise AssertionError("EMA failure was not coordinated")
+                    dist.barrier()
+                    reader.exclude_from_loading = []
                     assert reader.load(2)
                     # Check the actual restored boundary before a stochastic
                     # update can hide a missing or stale checkpoint component.
@@ -200,6 +353,9 @@ def main():
                         resumed[2].state_dict(), checkpoint_optimizer, rtol=0, atol=0
                     )
                     assert resumed[3].state_dict() == checkpoint_scheduler
+                    torch.testing.assert_close(
+                        resumed[4].state_dict(), checkpoint_ema, rtol=0, atol=0
+                    )
                     saved_rng = pickle.loads(checkpoint_rng[rng.key])
                     restored_rng = pickle.loads(rng.state_dict()[rng.key])
                     for key in saved_rng:
@@ -224,6 +380,9 @@ def main():
                     resumed[2].state_dict(), original[2].state_dict(), rtol=0, atol=0
                 )
                 assert resumed[3].state_dict() == original[3].state_dict()
+                torch.testing.assert_close(
+                    resumed[4].state_dict(), original[4].state_dict(), rtol=0, atol=0
+                )
                 dist.barrier()
                 if rank == 0:
                     print(f"{backend}/{mode}: rank-distinct dropout resume exact")

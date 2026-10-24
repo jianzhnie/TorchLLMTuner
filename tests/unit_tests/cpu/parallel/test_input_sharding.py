@@ -65,3 +65,18 @@ def test_cp_then_tp_preserves_token_fields(rank, load_balancer):
             torch.testing.assert_close(source, snapshot)
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("rank", (0, 1))
+@pytest.mark.parametrize("length", (1, 3, 15))
+def test_cp_rejects_uneven_sequence_before_sharding(rank, length):
+    dist.init_process_group("fake", store=FakeStore(), rank=rank, world_size=2)
+    try:
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("cp",))
+        tokens = torch.arange(length)
+        with pytest.raises(ValueError, match="not divisible by cp=2"):
+            shard_batch_for_cp(tokens, tokens + 1, tokens, mesh, None)
+        with pytest.raises(ValueError, match="not divisible by cp=2"):
+            shard_padding_mask_for_cp(tokens == 0, mesh, None)
+    finally:
+        dist.destroy_process_group()

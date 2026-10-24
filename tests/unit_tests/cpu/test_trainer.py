@@ -121,6 +121,71 @@ def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_
     torch.testing.assert_close(snapshot, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("invalid", ["loss", "gradient"])
+def test_nonfinite_step_preserves_model_optimizer_scheduler_and_ema(invalid):
+    from copy import deepcopy
+
+    model = nn.Linear(2, 1)
+    optimizer = OptimizersContainer(
+        OptimizerConfig(learning_rate=0.01, implementation="for-loop"),
+        model_parts=[model],
+    )
+    scheduler = build_lr_scheduler(
+        LRSchedulerConfig(), optimizers=optimizer.optimizers, training_steps=4
+    )
+    ema = EMA(model_parts=[model], decay=0.75)
+    # Populate moments and EMA history so accidental updates cannot hide in
+    # empty optimizer state or an EMA still equal to its initial weights.
+    model(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    scheduler.step()
+    ema.step(1)
+    before = deepcopy(
+        (
+            model.state_dict(),
+            optimizer.state_dict(),
+            scheduler.state_dict(),
+            ema.state_dict(),
+        )
+    )
+    trainer = Trainer.__new__(Trainer)
+    trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1, max_norm=1.0)
+    trainer.parallel_dims = None
+    trainer.device = torch.device("cpu")
+    trainer.model_parts = [model]
+    trainer.optimizer = optimizer
+    trainer.lr_scheduler = scheduler
+    trainer.ema = ema
+    trainer.step = 2
+    trainer.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+    trainer.should_log = lambda: False
+    trainer.microbatch = lambda batch: {
+        "batch": batch,
+        "num_valid_tokens": 1,
+        "num_routing_tokens": 1,
+    }
+    trainer._allreduce_replicated_tp_grads = lambda: None
+
+    def forward_backward(*args, **kwargs):
+        loss = model(torch.ones(1, 2)).sum()
+        loss.backward()
+        if invalid == "gradient":
+            model.weight.grad.fill_(float("inf"))
+            return loss.detach()
+        return loss.detach().new_tensor(float("nan"))
+
+    trainer.forward_backward_step = forward_backward
+    with pytest.raises(RuntimeError, match="not finite"):
+        trainer.train_step(iter([None]))
+    after = (
+        model.state_dict(),
+        optimizer.state_dict(),
+        scheduler.state_dict(),
+        ema.state_dict(),
+    )
+    torch.testing.assert_close(after, before, rtol=0, atol=0)
+
+
 def test_train_step_rejects_a_fully_masked_window_before_forward() -> None:
     """A zero denominator must fail before any model or optimizer update."""
     trainer = Trainer.__new__(Trainer)
@@ -2171,8 +2236,13 @@ def test_data_exhaustion_saves_last_completed_step(monkeypatch, completed_steps)
 def test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state(
     tmp_path,
 ):
+    import random
     from copy import deepcopy
     from itertools import islice
+
+    import numpy as np
+
+    from llmtuner.config.ema_config import EMAConfig
 
     def config():
         return LLMTunerConfig(
@@ -2180,6 +2250,7 @@ def test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state(
                 global_batch_size=2,
                 max_seq_len=8,
                 gradient_accumulation_steps=2,
+                ema_config=EMAConfig(decay=0.75),
                 steps=8,
                 dump_folder=str(tmp_path),
                 checkpoint_config=CheckpointConfig(
@@ -2194,6 +2265,10 @@ def test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state(
     # model, one is consumed in the canceled final accumulation window.
     original.data_iterator = lambda: islice(iter(loader), 3)
     try:
+        # Restore must recover advanced host streams, not just the constructor seed.
+        random.random()
+        np.random.random(3)
+        torch.rand(5)
         original.train()
         assert original.step == 1
         assert original.ntokens_seen == 48
@@ -2201,6 +2276,10 @@ def test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state(
         expected_model = deepcopy(original.model.state_dict())
         expected_optimizer = deepcopy(original.optimizer.state_dict())
         expected_scheduler = deepcopy(original.lr_scheduler.state_dict())
+        expected_ema = deepcopy(original.ema.state_dict())
+        expected_python = random.getstate()
+        expected_numpy = np.random.get_state()
+        expected_torch = torch.get_rng_state().clone()
         expected_trainer = original.state_dict()
         expected_loader = loader.state_dict()
     finally:
@@ -2218,6 +2297,17 @@ def test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state(
             resumed.optimizer.state_dict(), expected_optimizer, rtol=0, atol=0
         )
         assert resumed.lr_scheduler.state_dict() == expected_scheduler
+        torch.testing.assert_close(
+            resumed.ema.state_dict(), expected_ema, rtol=0, atol=0
+        )
+        assert random.getstate() == expected_python
+        actual_numpy = np.random.get_state()
+        assert actual_numpy[0] == expected_numpy[0]
+        np.testing.assert_array_equal(actual_numpy[1], expected_numpy[1])
+        assert actual_numpy[2:] == expected_numpy[2:]
+        torch.testing.assert_close(
+            torch.get_rng_state(), expected_torch, rtol=0, atol=0
+        )
         assert resumed.state_dict() == expected_trainer
         assert resumed.dataloader.state_dict() == expected_loader
         next_batch = next(resumed.data_iterator())
@@ -2257,7 +2347,7 @@ def test_trainer_retries_failed_metrics_cleanup_without_reclosing_other_resource
     assert trainer.metrics is None
 
 
-@pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt])
+@pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt, SystemExit])
 def test_failed_trainer_construction_restores_execution_settings(monkeypatch, failure):
     from llmtuner.trainer import trainer as module
     from llmtuner.utils.seeding import rollback_execution_settings_on_error
@@ -2323,7 +2413,7 @@ def test_successful_trainer_construction_keeps_execution_settings(monkeypatch):
         raise RestoreTestState
 
 
-@pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt])
+@pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 def test_failed_trainer_construction_restores_host_rng(
     monkeypatch, failure, cleanup_fails
@@ -2716,3 +2806,135 @@ def test_trainer_unequal_token_accumulation_matches_summed_loss_reference(tmp_pa
         )
     finally:
         reference.close()
+
+
+@pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
+def test_cleanup_report_failure_preserves_error_and_releases_resources(
+    monkeypatch, report_error
+):
+    from llmtuner.trainer import trainer as module
+
+    trainer = Trainer.__new__(Trainer)
+    calls = []
+    failure = ValueError("primary metrics cleanup failure")
+
+    def close_metrics():
+        calls.append("metrics")
+        raise failure
+
+    def report(*args, **kwargs):
+        raise report_error("cleanup logging failed")
+
+    trainer.metrics = SimpleNamespace(close=close_metrics)
+    for name in ("dataloader", "gc_handler"):
+        setattr(
+            trainer, name, SimpleNamespace(close=lambda name=name: calls.append(name))
+        )
+    monkeypatch.setattr(module.logger, "exception", report)
+    with pytest.raises(ValueError) as caught:
+        trainer.close()
+    assert caught.value is failure
+    assert calls == ["metrics", "dataloader", "gc_handler"]
+    assert trainer.metrics is not None
+    assert trainer.dataloader is None and trainer.gc_handler is None
+
+
+@pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
+def test_training_error_survives_cleanup_and_report_failures(monkeypatch, report_error):
+    from llmtuner.trainer import trainer as module
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.cfg = SimpleNamespace(checkpoint=SimpleNamespace(load_step=-1))
+    failure = ValueError("primary training failure")
+
+    def load(step):
+        raise failure
+
+    def close():
+        raise RuntimeError("cleanup failure")
+
+    def report(*args, **kwargs):
+        raise report_error("cleanup report failure")
+
+    trainer.checkpointer = SimpleNamespace(load=load)
+    trainer.close = close
+    monkeypatch.setattr(module.logger, "exception", report)
+    with pytest.raises(ValueError) as caught:
+        trainer.train()
+    assert caught.value is failure
+
+
+@pytest.mark.parametrize("primary_phase", ["train", "close"])
+@pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
+def test_cli_preserves_primary_error_when_cleanup_reporting_fails(
+    monkeypatch, primary_phase, report_error
+):
+    from llmtuner.trainer import cli
+
+    failure = ValueError("primary CLI failure")
+    calls = []
+
+    class FakeTrainer:
+        def __init__(self, cfg):
+            pass
+
+        def train(self):
+            if primary_phase == "train":
+                raise failure
+
+        def close(self):
+            if primary_phase == "close":
+                raise failure
+            raise RuntimeError("secondary close failure")
+
+    def destroy():
+        calls.append("destroy")
+        raise RuntimeError("secondary group cleanup failure")
+
+    def report(*args, **kwargs):
+        raise report_error("secondary report failure")
+
+    monkeypatch.setattr(
+        cli,
+        "parse_config",
+        lambda: SimpleNamespace(
+            checkpoint=SimpleNamespace(create_seed_checkpoint=False)
+        ),
+    )
+    monkeypatch.setattr("llmtuner.trainer.trainer.Trainer", FakeTrainer)
+    monkeypatch.setattr(cli.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(cli.dist, "destroy_process_group", destroy)
+    monkeypatch.setattr(cli.logger, "exception", report)
+    with pytest.raises(ValueError) as caught:
+        cli.main()
+    assert caught.value is failure
+    assert calls == ["destroy"]
+
+
+@pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
+def test_construction_preserves_assembly_error_when_cleanup_reporting_fails(
+    monkeypatch, report_error
+):
+    from llmtuner.trainer import trainer as module
+
+    failure = ValueError("primary assembly failure")
+    calls = []
+
+    def assemble(self, cfg):
+        def close():
+            calls.append("checkpointer")
+            raise RuntimeError("secondary cleanup failure")
+
+        self.checkpointer = SimpleNamespace(close=close)
+        self.metrics = SimpleNamespace(close=lambda: calls.append("metrics"))
+        raise failure
+
+    def report(*args, **kwargs):
+        raise report_error("secondary reporting failure")
+
+    monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+    monkeypatch.setattr(module.logger, "exception", report)
+    with pytest.raises(ValueError) as caught:
+        module.Trainer(SimpleNamespace())
+    assert caught.value is failure
+    assert calls == ["checkpointer", "metrics"]

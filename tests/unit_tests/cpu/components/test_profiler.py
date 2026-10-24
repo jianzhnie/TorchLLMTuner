@@ -861,3 +861,110 @@ def test_failed_snapshot_does_not_publish_partial_file(
             assert destination.read_bytes() == b"previous complete snapshot"
     finally:
         profiler.close()
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_exit_trace_preserves_completed_cycle_and_tail(tmp_path, interrupted):
+    import gzip
+    import json
+
+    from llmtuner.config.observability_config import ProfilerConfig
+
+    cfg = ProfilerConfig(
+        enable_profiling=True,
+        profile_freq=1,
+        profiler_active=1,
+        profiler_warmup=0,
+    )
+    failure = RuntimeError("training stopped after the completed trace cycle")
+    try:
+        with Profiler(cfg, base_folder=str(tmp_path)) as profiler:
+            torch.ones(2, 2) @ torch.ones(2, 2)
+            profiler.step()
+            completed = tmp_path / "profiling/traces/iteration_1/rank0_trace.json.gz"
+            before = completed.read_bytes()
+            assert "aten::mm" in {
+                event.get("name")
+                for event in json.loads(gzip.decompress(before))["traceEvents"]
+            }
+            torch.ones(2).add(1)
+            if interrupted:
+                raise failure
+    except RuntimeError as error:
+        assert interrupted and error is failure
+    assert completed.read_bytes() == before
+    tail = tmp_path / "profiling/traces/iteration_1_exit/rank0_trace.json.gz"
+    assert "aten::add" in {
+        event.get("name")
+        for event in json.loads(gzip.decompress(tail.read_bytes()))["traceEvents"]
+    }
+
+
+@pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("oom", [False, True])
+def test_profiler_cleanup_survives_broken_error_reporter(
+    monkeypatch, report_error, oom
+):
+    from types import SimpleNamespace
+
+    calls = []
+    failure = RuntimeError("primary trace shutdown failure")
+
+    def stop(*args):
+        calls.append("trace")
+        raise failure
+
+    def report(*args, **kwargs):
+        raise report_error("secondary logging failure")
+
+    def snapshot(**kwargs):
+        calls.append("snapshot")
+        raise OSError("secondary snapshot failure")
+
+    profiler = Profiler(Config())
+    profiler.torch_profiler = SimpleNamespace(__exit__=stop)
+    profiler.memory_profiler = SimpleNamespace(
+        step=snapshot, close=lambda: calls.append("memory")
+    )
+    monkeypatch.setattr(profiler_module.logger, "exception", report)
+    if oom:
+        original = torch.OutOfMemoryError("primary training OOM")
+        assert profiler.__exit__(type(original), original, None) is False
+    else:
+        with pytest.raises(RuntimeError) as caught:
+            profiler.__exit__(None, None, None)
+        assert caught.value is failure
+    assert calls == (["trace", "snapshot", "memory"] if oom else ["trace", "memory"])
+    assert profiler.memory_profiler is None
+
+
+@pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
+def test_partial_trace_entry_preserves_start_error_when_reporting_fails(
+    monkeypatch, tmp_path, report_error
+):
+    calls = []
+    failure = RuntimeError("primary trace startup failure")
+
+    class Trace:
+        def __enter__(self):
+            calls.append("start")
+            raise failure
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            calls.append("stop")
+            assert exc_value is failure
+            raise ValueError("secondary trace shutdown failure")
+
+    def report(*args, **kwargs):
+        calls.append("report")
+        raise report_error("secondary log failure")
+
+    monkeypatch.setattr(torch.profiler, "profile", lambda **kwargs: Trace())
+    monkeypatch.setattr(profiler_module.logger, "exception", report)
+    profiler = Profiler(Config(enable_profiling=True), base_folder=str(tmp_path))
+    with pytest.raises(RuntimeError) as caught:
+        profiler.__enter__()
+    assert caught.value is failure
+    assert calls == ["start", "stop", "report"]
+    assert profiler.torch_profiler is None and profiler.memory_profiler is None
+    assert not profiler._entered

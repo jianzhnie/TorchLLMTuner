@@ -56,10 +56,9 @@ def write_tokenizer(dirpath: str, *, extra_vocab: dict[str, int] | None = None) 
 
     Built from scratch rather than downloaded so no test needs the Hub.
 
-    ``extra_vocab`` entries are registered as *added* tokens, not merely as
-    vocabulary entries. ``MultimodalTokenizer`` validates its five vision
-    placeholders against ``get_added_tokens_decoder()``, so a token that is only
-    in the base vocabulary is invisible to it.
+    ``extra_vocab`` entries are also registered as added tokens, preserving their
+    fixed IDs and making them atomic before a wrapper loads the assets. Tests
+    for unregistered multimodal vocabulary entries build their backend directly.
     """
     from tokenizers import AddedToken
 

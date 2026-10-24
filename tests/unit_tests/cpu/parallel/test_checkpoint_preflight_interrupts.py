@@ -48,3 +48,50 @@ def test_checkpoint_preflight_reports_interrupt_before_reraising(
         call(state, **kwargs)
     assert caught.value is original
     assert reports == [(False, [])]
+
+
+@pytest.mark.parametrize("loading", [False, True])
+@pytest.mark.parametrize("failure", ["invalid_dimension", "peer_error", "manifest"])
+def test_tp_checkpoint_preflight_rejects_invalid_plan_before_tensor_collectives(
+    monkeypatch, loading, failure
+):
+    model = nn.Linear(2, 2, bias=False)
+    group = object()
+    dimension = 2 if failure == "invalid_dimension" else 0
+    model._tp_checkpoint_layouts = {"weight": (dimension, False, group)}
+    reports = []
+
+    def exchange(output, report, *, group):
+        reports.append(report)
+        peer = report
+        if failure == "peer_error":
+            peer = (False, [])
+        elif failure == "manifest":
+            peer = (True, [])
+        output[:] = [report, peer]
+
+    def unexpected_collective(*args, **kwargs):
+        pytest.fail("Invalid checkpoint plan reached tensor communication")
+
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0, 1])
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda _: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", exchange)
+    monkeypatch.setattr(torch.distributed, "all_gather", unexpected_collective)
+    monkeypatch.setattr(torch.distributed, "get_rank", unexpected_collective)
+    call = tp.load_tensor_parallel_state if loading else tp.gather_tensor_parallel_state
+    state = {"weight": torch.ones(4 if loading else 2, 2)}
+    expected_type, expected_message = {
+        "invalid_dimension": (ValueError, "Invalid TP checkpoint dimension"),
+        "peer_error": (
+            RuntimeError,
+            "TP checkpoint preparation failed on another rank",
+        ),
+        "manifest": (
+            ValueError,
+            "TP checkpoint entries or layouts differ across ranks",
+        ),
+    }[failure]
+    with pytest.raises(expected_type, match=expected_message):
+        call(state, model_parts=[model])
+    assert len(reports) == 1
+    assert reports[0][0] is (failure != "invalid_dimension")

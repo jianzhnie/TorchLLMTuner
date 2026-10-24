@@ -119,3 +119,56 @@ def test_purge_continues_after_local_delete_failure(monkeypatch, tmp_path):
     assert warnings[0][1] == str(failed)
     assert isinstance(warnings[0][2], PermissionError)
     assert pending.empty()
+
+
+@pytest.mark.parametrize("phase", ["begin", "failure", "end", "shutdown"])
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt, SystemExit])
+def test_purge_survives_logging_failure(tmp_path, monkeypatch, phase, error_type):
+    import queue
+    import threading
+
+    from llmtuner.components.checkpointer import base
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    pending = queue.Queue()
+    for path in (str(first), str(second), None):
+        pending.put(path)
+    deleted = []
+    errors = []
+
+    def remove(path):
+        if phase == "failure" and path == str(first):
+            raise OSError("transient delete failure")
+        filesystem.rmtree(path)
+        deleted.append(path)
+
+    def report(message, *args, **kwargs):
+        matches = {
+            "begin": "Checkpointer is deleting",
+            "failure": "Checkpointer failed to delete",
+            "end": "Checkpointer deleted",
+            "shutdown": "Destroying the purge thread",
+        }
+        if message.startswith(matches[phase]):
+            raise error_type("purge logger failed")
+
+    def run():
+        try:
+            base.purge_thread(pending, remove)
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(base.logger, "info", report)
+    monkeypatch.setattr(base.logger, "warning", report)
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert errors == []
+    assert not second.exists()
+    assert first.exists() == (phase == "failure")
+    assert str(second) in deleted
+    assert pending.empty()

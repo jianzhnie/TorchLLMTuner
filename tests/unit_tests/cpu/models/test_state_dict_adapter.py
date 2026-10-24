@@ -75,6 +75,13 @@ def test_hf_index_checks_global_pipeline_keys(monkeypatch, complete):
     adapter._hf_keys = {"model.layers.0.weight", "model.layers.1.weight"}
     local_weight = torch.randn(2, 2)
     local = {"model.model.layers.0.weight": local_weight}
+    # This unit test supplies only the key-gather result, not a process group.
+    # Real error coordination is exercised by hf_adapter_coordination.py.
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(
+        adapter_module, "synchronize_local_errors", lambda phase: nullcontext()
+    )
     monkeypatch.setattr(adapter_module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(adapter_module.dist, "get_world_size", lambda: 2)
 
