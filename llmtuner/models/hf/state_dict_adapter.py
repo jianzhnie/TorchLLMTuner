@@ -85,7 +85,10 @@ class HFTransformerStateDictAdapter:
             from ..kimi.checkpoint import convert_kimi_expert_state
 
             state_dict = convert_kimi_expert_state(
-                state_dict, num_experts=self.model_config.num_experts, to_hf=True
+                state_dict,
+                num_experts=self.model_config.num_experts,
+                to_hf=True,
+                coordinate_errors=True,
             )
         # Only dictionary mapping is local. Kimi tensor conversion above and
         # the global PP coverage gather below stay outside this boundary.
@@ -143,7 +146,10 @@ class HFTransformerStateDictAdapter:
             from ..kimi.checkpoint import convert_kimi_expert_state
 
             state = convert_kimi_expert_state(
-                state, num_experts=self.model_config.num_experts, to_hf=False
+                state,
+                num_experts=self.model_config.num_experts,
+                to_hf=False,
+                coordinate_errors=True,
             )
         return state
 

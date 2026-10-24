@@ -226,15 +226,27 @@ def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> 
     and base learning rates; optimizer state alone cannot restore the schedule.
     """
     cfg = trainer.cfg
-    if trainer.dataloader is None:
-        raise RuntimeError(
-            "Trainer dataloader must be initialized before building the checkpointer"
+    with synchronize_local_errors("Checkpoint services preparation"):
+        if trainer.dataloader is None:
+            raise RuntimeError(
+                "Trainer dataloader must be initialized before "
+                "building the checkpointer"
+            )
+        states: dict[str, Any] = {
+            TRAIN_STATE: trainer,
+            DATALOADER: trainer.dataloader,
+            RNG_STATE: RNGCheckpointState(
+                trainer.device, topology=trainer.parallel_dims
+            ),
+        }
+        sd_adapter = HFTransformerStateDictAdapter(
+            hf_model_config,
+            cfg.checkpoint.initial_load_path or cfg.hf_model,
+            kimi_expert_parallel=(
+                getattr(hf_model_config, "model_type", None) == "kimi_linear"
+                and cfg.parallel.ep_size > 1
+            ),
         )
-    states: dict[str, Any] = {
-        TRAIN_STATE: trainer,
-        DATALOADER: trainer.dataloader,
-        RNG_STATE: RNGCheckpointState(trainer.device, topology=trainer.parallel_dims),
-    }
     trainer.checkpointer = DistributedCheckpointManager(
         cfg.checkpoint,
         model_parts=trainer.model_parts,
@@ -243,14 +255,7 @@ def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> 
         ema=trainer.ema,
         states=states,
         folder=cfg.dump_folder,
-        sd_adapter=HFTransformerStateDictAdapter(
-            hf_model_config,
-            cfg.checkpoint.initial_load_path or cfg.hf_model,
-            kimi_expert_parallel=(
-                getattr(hf_model_config, "model_type", None) == "kimi_linear"
-                and cfg.parallel.ep_size > 1
-            ),
-        ),
+        sd_adapter=sd_adapter,
     )
 
 

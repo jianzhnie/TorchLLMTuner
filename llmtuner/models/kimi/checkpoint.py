@@ -7,9 +7,12 @@ These transforms operate on full expert tensors, including meta load templates.
 from __future__ import annotations
 
 import re
+from contextlib import nullcontext
 from typing import Any
 
 import torch
+
+from ...accelerator.collectives import synchronize_local_errors
 
 _BLOCK = re.compile(r"^(.*\.block_sparse_moe\.)(.*)$")
 _PROJECTIONS = {"w1_EFD": "w1", "w2_EDF": "w2", "w3_EFD": "w3"}
@@ -17,76 +20,116 @@ _LATENT = ("routed_expert_down_proj.", "routed_expert_norm.", "routed_expert_up_
 
 
 def convert_kimi_expert_state(
-    state: dict[str, Any], *, num_experts: int, to_hf: bool
+    state: dict[str, Any],
+    *,
+    num_experts: int,
+    to_hf: bool,
+    coordinate_errors: bool = False,
 ) -> dict[str, Any]:
-    """Map native grouped weights and replicated state without dropping keys."""
+    """Map grouped weights and replicated state without dropping keys.
+
+    ``coordinate_errors`` requires all world ranks to participate. It coordinates
+    metadata validation only; failures inside tensor communication remain fatal.
+    """
     result = {}
     stacks: dict[str, dict[int, torch.Tensor]] = {}
+    splits: list[tuple[list[str], torch.Tensor]] = []
 
     def put(key, value):
         if key in result:
             raise ValueError(f"Kimi checkpoint key mapping collision: {key!r}")
         result[key] = value
 
-    for key, value in state.items():
-        match = _BLOCK.match(key)
-        if match is None:
-            put(key, value)
-            continue
-        prefix, suffix = match.groups()
-        if to_hf:
-            if suffix.startswith("routed_experts.inner_experts."):
-                role = suffix.removeprefix("routed_experts.inner_experts.")
-                if role in _PROJECTIONS:
-                    if not isinstance(value, torch.Tensor) or value.ndim != 3:
-                        raise ValueError(f"Kimi grouped weight {key!r} must be rank 3")
-                    if value.shape[0] != num_experts:
-                        raise ValueError(
-                            f"Kimi grouped weight {key!r} must contain all "
-                            f"{num_experts} experts; gather EP shards before export"
-                        )
-                    for index, weight in enumerate(value.unbind(0)):
-                        put(
-                            f"{prefix}experts.{index}.{_PROJECTIONS[role]}.weight",
-                            weight,
-                        )
-                    continue
-            if suffix == "router.gate.weight":
-                suffix = "gate.weight"
-            elif suffix == "expert_bias_E":
-                suffix = "gate.e_score_correction_bias"
-            elif suffix.startswith(tuple(f"routed_experts.{name}" for name in _LATENT)):
-                suffix = suffix.removeprefix("routed_experts.")
-        else:
-            expert = re.fullmatch(r"experts\.(\d+)\.(w[123])\.weight", suffix)
-            if expert:
-                index, projection = expert.groups()
-                index = int(index)
-                if not 0 <= index < num_experts:
-                    raise ValueError(
-                        f"Kimi checkpoint expert index out of range: {key}"
-                    )
-                if not isinstance(value, torch.Tensor) or value.ndim != 2:
-                    raise ValueError(f"Kimi individual weight {key!r} must be rank 2")
-                role = next(
-                    role for role, name in _PROJECTIONS.items() if name == projection
-                )
-                target = f"{prefix}routed_experts.inner_experts.{role}"
-                stacks.setdefault(target, {})[index] = value
+    # Validate only keys and tensor metadata before any tensor operation.
+    # DTensor unbind/stack below may communicate and must stay outside.
+    with (
+        synchronize_local_errors("Kimi checkpoint mapping")
+        if coordinate_errors
+        else nullcontext()
+    ):
+        for key, value in state.items():
+            match = _BLOCK.match(key)
+            if match is None:
+                put(key, value)
                 continue
-            if suffix == "gate.weight":
-                suffix = "router.gate.weight"
-            elif suffix == "gate.e_score_correction_bias":
-                suffix = "expert_bias_E"
-            elif suffix.startswith(_LATENT):
-                suffix = f"routed_experts.{suffix}"
-        put(prefix + suffix, value)
+            prefix, suffix = match.groups()
+            if to_hf:
+                if suffix.startswith("routed_experts.inner_experts."):
+                    role = suffix.removeprefix("routed_experts.inner_experts.")
+                    if role in _PROJECTIONS:
+                        if not isinstance(value, torch.Tensor) or value.ndim != 3:
+                            raise ValueError(
+                                f"Kimi grouped weight {key!r} must be rank 3"
+                            )
+                        if value.shape[0] != num_experts:
+                            raise ValueError(
+                                f"Kimi grouped weight {key!r} must contain all "
+                                f"{num_experts} experts; gather EP shards before export"
+                            )
+                        keys = [
+                            f"{prefix}experts.{index}.{_PROJECTIONS[role]}.weight"
+                            for index in range(num_experts)
+                        ]
+                        for target in keys:
+                            put(target, None)
+                        splits.append((keys, value))
+                        continue
+                if suffix == "router.gate.weight":
+                    suffix = "gate.weight"
+                elif suffix == "expert_bias_E":
+                    suffix = "gate.e_score_correction_bias"
+                elif suffix.startswith(
+                    tuple(f"routed_experts.{name}" for name in _LATENT)
+                ):
+                    suffix = suffix.removeprefix("routed_experts.")
+            else:
+                expert = re.fullmatch(r"experts\.(\d+)\.(w[123])\.weight", suffix)
+                if expert:
+                    index, projection = expert.groups()
+                    index = int(index)
+                    if not 0 <= index < num_experts:
+                        raise ValueError(
+                            f"Kimi checkpoint expert index out of range: {key}"
+                        )
+                    if not isinstance(value, torch.Tensor) or value.ndim != 2:
+                        raise ValueError(
+                            f"Kimi individual weight {key!r} must be rank 2"
+                        )
+                    role = next(
+                        role
+                        for role, name in _PROJECTIONS.items()
+                        if name == projection
+                    )
+                    target = f"{prefix}routed_experts.inner_experts.{role}"
+                    experts = stacks.setdefault(target, {})
+                    if index in experts:
+                        raise ValueError(
+                            f"Kimi checkpoint duplicate expert index {index} "
+                            f"for {target}"
+                        )
+                    experts[index] = value
+                    continue
+                if suffix == "gate.weight":
+                    suffix = "router.gate.weight"
+                elif suffix == "gate.e_score_correction_bias":
+                    suffix = "expert_bias_E"
+                elif suffix.startswith(_LATENT):
+                    suffix = f"routed_experts.{suffix}"
+            put(prefix + suffix, value)
+        for target, experts in stacks.items():
+            if set(experts) != set(range(num_experts)):
+                raise ValueError(
+                    f"Kimi checkpoint is missing individual experts for {target}"
+                )
+            shape = experts[0].shape
+            if any(value.shape != shape for value in experts.values()):
+                raise ValueError(f"Kimi expert weight shapes disagree for {target}")
+            put(target, None)
+    for keys, value in splits:
+        for target, weight in zip(keys, value.unbind(0), strict=True):
+            result[target] = weight
     for target, experts in stacks.items():
-        if set(experts) != set(range(num_experts)):
-            raise ValueError(
-                f"Kimi checkpoint is missing individual experts for {target}"
-            )
-        put(target, torch.stack([experts[index] for index in range(num_experts)]))
+        result[target] = torch.stack([experts[index] for index in range(num_experts)])
     return result
 
 
@@ -158,7 +201,12 @@ def convert_kimi_optimizer_state(
                     f"{category}.{prefix}routed_experts.inner_experts."
                     f"{reverse[projection]}.{field}"
                 )
-                pending.setdefault((target, category), {})[index] = value
+                values = pending.setdefault((target, category), {})
+                if index in values:
+                    raise ValueError(
+                        f"Kimi optimizer duplicate expert index {index} for {target}"
+                    )
+                values[index] = value
                 continue
             suffix = suffix.replace("gate.weight.", "router.gate.weight.", 1)
             if suffix.startswith("gate.e_score_correction_bias."):
