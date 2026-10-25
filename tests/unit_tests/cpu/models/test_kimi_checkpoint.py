@@ -90,3 +90,30 @@ def test_kimi_mapping_rejects_key_collisions():
             num_experts=4,
             to_hf=True,
         )
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_kimi_import_rejects_duplicate_numeric_expert_indices(reverse_order):
+    prefix = "model.layers.0.block_sparse_moe.experts."
+    entries = [
+        (prefix + "0.w1.weight", torch.ones(2, 3)),
+        (prefix + "00.w1.weight", torch.zeros(2, 3)),
+        (prefix + "1.w1.weight", torch.ones(2, 3)),
+    ]
+    if reverse_order:
+        entries.reverse()
+    with pytest.raises(ValueError, match="duplicate expert index"):
+        convert_kimi_expert_state(dict(entries), num_experts=2, to_hf=False)
+
+
+def test_kimi_import_rejects_inconsistent_shapes_before_stacking():
+    prefix = "model.layers.0.block_sparse_moe.experts."
+    with pytest.raises(ValueError, match="expert weight shapes disagree"):
+        convert_kimi_expert_state(
+            {
+                prefix + "0.w1.weight": torch.ones(2, 3),
+                prefix + "1.w1.weight": torch.ones(4, 3),
+            },
+            num_experts=2,
+            to_hf=False,
+        )

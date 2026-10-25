@@ -7,9 +7,11 @@ For TP2 x FSDP2 use four ranks and append --tp-size 2.
 """
 
 import argparse
+import json
 from contextlib import nullcontext
 from copy import deepcopy
 from datetime import timedelta
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
@@ -105,14 +107,29 @@ def main():
                     assert model.lm_head.weight is model.model.embed_tokens.weight
                     wrapper = torch.nn.ModuleDict({"model": model})
                     optimizer = torch.optim.AdamW(wrapper.parameters())
-                    adapter = HFTransformerStateDictAdapter(config, None)
+                    assets = None
                     if indexed:
-                        # Source-index coverage is separate from output shard
-                        # placement. Exercise the real global key gather too.
-                        adapter._hf_keys = set(expected_state)
-                        adapter.fqn_to_index_mapping = {
-                            name: index % 2 + 1
+                        assets = Path(paths[0]) / f"source-{engine}"
+                        weight_map = {
+                            name: (
+                                "alpha.safetensors"
+                                if index % 2 == 0
+                                else "zeta.safetensors"
+                            )
                             for index, name in enumerate(expected_state)
+                        }
+                        if dist.get_rank() == 0:
+                            assets.mkdir()
+                            (assets / "model.safetensors.index.json").write_text(
+                                json.dumps({"weight_map": weight_map})
+                            )
+                        dist.barrier()
+                    adapter = HFTransformerStateDictAdapter(config, assets)
+                    if indexed:
+                        assert adapter._hf_keys == set(expected_state)
+                        assert adapter.fqn_to_index_mapping == {
+                            name: (1 if filename == "alpha.safetensors" else 2)
+                            for name, filename in weight_map.items()
                         }
                     folder = f"{paths[0]}/{engine}-{indexed}"
                     manager = DistributedCheckpointManager(
