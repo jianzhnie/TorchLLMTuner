@@ -434,6 +434,41 @@ class BaseCheckpointManager(ABC):
                 raise ValueError(
                     f"checkpoint save last_step must be a boolean, got {last_step!r}"
                 )
+            should_save = self._should_save(curr_step, last_step)
+            save_configuration = (
+                (
+                    type(self).__module__,
+                    type(self).__qualname__,
+                    self.folder,
+                    getattr(self, "async_mode", None),
+                    self.last_save_model_only if last_step else None,
+                    self.last_save_in_hf if last_step else None,
+                    self.export_dtype if last_step else None,
+                )
+                if should_save
+                else None
+            )
+        if distributed.get_world_size() > 1:
+            # Valid local arguments can still select different cadence or final
+            # export branches. Agree before backend IO or any early return.
+            arguments = (curr_step, last_step, should_save, save_configuration)
+            gathered = [None] * distributed.get_world_size()
+            dist.all_gather_object(gathered, arguments)
+            if any(candidate[:2] != arguments[:2] for candidate in gathered):
+                raise RuntimeError(
+                    "Checkpoint ranks supplied inconsistent save arguments; "
+                    "curr_step and last_step must agree on every rank"
+                )
+            if any(candidate[2] != should_save for candidate in gathered):
+                raise RuntimeError(
+                    "Checkpoint ranks selected inconsistent save policy decisions; "
+                    "check interval, load_only and first-step configuration"
+                )
+            if any(candidate[3] != save_configuration for candidate in gathered):
+                raise RuntimeError(
+                    "Checkpoint ranks supplied inconsistent save configuration; "
+                    "check backend, folder, async mode and final export options"
+                )
         return self._save(curr_step, last_step)
 
     def maybe_wait_for_staging(self) -> None:

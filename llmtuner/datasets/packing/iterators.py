@@ -8,6 +8,7 @@ document boundaries.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 import grain.python as grain
@@ -127,7 +128,7 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
         (``self._finished`` set). Empty sequences are skipped internally.
         """
         while self._remainder is None:
-            parent_state = self._parent.get_state()
+            parent_state = deepcopy(self._parent.get_state())
             try:
                 sequence = next(self._parent)
             except StopIteration:
@@ -186,13 +187,14 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             assert self._remainder_parent_state is not None
             parent_state = self._remainder_parent_state
         return {
-            "parent": parent_state,
+            "parent": deepcopy(parent_state),
             "has_remainder": self._remainder is not None,
             "remainder_offset": self._remainder_offset,
             "finished": self._finished,
         }
 
     def set_state(self, state: dict[str, Any]) -> None:
+        self._assert_not_closed()
         has_remainder = state["has_remainder"]
         finished = state["finished"]
         offset = state["remainder_offset"]
@@ -206,10 +208,11 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             or (has_remainder and finished)
         ):
             raise ValueError("packing checkpoint has inconsistent remainder state")
-        previous_parent_state = self._parent.get_state()
+        previous_parent_state = deepcopy(self._parent.get_state())
+        parent_state = deepcopy(state["parent"])
         remainder = None
         try:
-            self._parent.set_state(state["parent"])
+            self._parent.set_state(deepcopy(parent_state))
             if has_remainder:
                 try:
                     remainder = next(self._parent)
@@ -228,19 +231,25 @@ class DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             try:
                 self._parent.set_state(previous_parent_state)
             except BaseException:
-                get_logger(__name__).exception(
-                    "Packing cursor rollback failed; closing the iterator"
-                )
+                try:
+                    get_logger(__name__).exception(
+                        "Packing cursor rollback failed; closing the iterator"
+                    )
+                except BaseException:
+                    pass  # Reporting must not prevent cleanup or replace the error.
                 try:
                     self.close()
                 except BaseException:
-                    get_logger(__name__).exception(
-                        "Packing iterator cleanup failed after rollback failure"
-                    )
+                    try:
+                        get_logger(__name__).exception(
+                            "Packing iterator cleanup failed after rollback failure"
+                        )
+                    except BaseException:
+                        pass  # Preserve the original cursor restoration error.
             raise
 
         self._remainder = remainder
-        self._remainder_parent_state = state["parent"] if has_remainder else None
+        self._remainder_parent_state = parent_state if has_remainder else None
         self._remainder_offset = offset
         self._finished = finished
 

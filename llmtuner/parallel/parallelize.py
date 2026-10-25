@@ -31,7 +31,10 @@ from ..memory.activation_checkpoint import apply_ac
 from .context_parallel.context_parallel import apply_cp
 from .expert_parallel.expert_parallel import apply_ep
 from .fully_shard_parallel.fully_shard_parallel import apply_fsdp
-from .fully_shard_parallel.plan import resolve_pipeline_fsdp_configs
+from .fully_shard_parallel.plan import (
+    FSDPPatternReferences,
+    resolve_pipeline_fsdp_configs,
+)
 from .model_compile import apply_compile
 from .pipeline_parallel.pipeline_parallel import (
     PipelineParallelSetup,
@@ -78,6 +81,16 @@ def parallelize_hf_transformers(
         part_cfg: ParallelConfig | None = None,
     ) -> nn.Module:
         """Bind stage options once, then transform the model in declared order."""
+        fsdp_cfg = cfg if part_cfg is None else part_cfg
+        references = (
+            FSDPPatternReferences(part, fsdp_cfg)
+            if fsdp_cfg.fsdp_config.fsdp_ignored_modules
+            or any(
+                options.get("hook_module") is not None or options.get("ignored_params")
+                for options in fsdp_cfg.fsdp_config.fsdp_apply_modules.values()
+            )
+            else None
+        )
         runners = {
             "tp": partial(apply_tp, mesh=dense_mesh, cfg=cfg),
             "ep": partial(
@@ -99,13 +112,25 @@ def parallelize_hf_transformers(
             ),
             "fsdp": partial(
                 apply_fsdp,
-                cfg=cfg if part_cfg is None else part_cfg,
+                cfg=fsdp_cfg,
                 parallel_dims=parallel_dims,
             ),
         }
         for name in STAGE_ORDER:
             if name != "compile" or compile:
-                part = runners[name](part)
+                if name == "ep" and references is not None:
+                    # TP may already have replaced Parameters before EP's
+                    # explicit split/rename mapping is emitted.
+                    references = FSDPPatternReferences(part, references.bind(part))
+                    part = runners[name](
+                        part, on_replacement=references.record_replacements
+                    )
+                elif name == "fsdp" and references is not None:
+                    part = apply_fsdp(
+                        part, cfg=references.bind(part), parallel_dims=parallel_dims
+                    )
+                else:
+                    part = runners[name](part)
         return part
 
     # EP groups come from the sparse mesh in both assembly paths. Under PP
