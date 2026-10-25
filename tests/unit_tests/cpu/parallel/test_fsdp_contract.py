@@ -1388,3 +1388,99 @@ def test_symm_mem_selects_states_by_actual_moe_ownership(layout, scope):
     expected = {dense_state} if scope == "dense" else {dense_state, expert_state}
     assert set(calls) == expected
     assert len(calls) == len(expected)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_fsdp_references_follow_replacement_and_transparent_wrappers(compiled):
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+    )
+
+    from llmtuner.parallel.fully_shard_parallel.plan import FSDPPatternReferences
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False))
+    original = model[0]
+    policy = object()
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={
+                "0": {
+                    "ignored_params": {original.weight},
+                    "hook_module": original,
+                    "mesh": policy,
+                }
+            }
+        )
+    )
+    references = FSDPPatternReferences(model, cfg)
+    replacement = nn.Linear(4, 2, bias=False)
+    model[0] = checkpoint_wrapper(replacement)
+    wrapper = model[0]
+    if compiled:
+        model = torch.compile(model, backend="eager")
+    rebound = references.bind(model).fsdp_config.fsdp_apply_modules["0"]
+    assert rebound["ignored_params"] == {replacement.weight}
+    assert rebound["hook_module"] is wrapper
+    assert rebound["mesh"] is policy
+    original_options = cfg.fsdp_config.fsdp_apply_modules["0"]
+    assert original_options["ignored_params"] == {original.weight}
+    assert original_options["hook_module"] is original
+
+
+def test_fsdp_references_follow_all_parameter_aliases():
+    from llmtuner.parallel.fully_shard_parallel.plan import FSDPPatternReferences
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
+    model[1].weight = model[0].weight
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"": {"ignored_params": {model[0].weight}}}
+        )
+    )
+    references = FSDPPatternReferences(model, cfg)
+    model[0] = nn.Linear(4, 2, bias=False)
+    model[1] = nn.Linear(4, 2, bias=False)
+    exclusions = references.bind(model).fsdp_config.fsdp_apply_modules[""][
+        "ignored_params"
+    ]
+    assert exclusions == {model[0].weight, model[1].weight}
+
+
+@pytest.mark.parametrize("override", ["hook_module", "ignored_params"])
+def test_fsdp_references_reject_removed_objects_instead_of_dropping_them(override):
+    from llmtuner.parallel.fully_shard_parallel.plan import FSDPPatternReferences
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False))
+    value = model[0] if override == "hook_module" else {model[0].weight}
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(fsdp_apply_modules={"": {override: value}})
+    )
+    references = FSDPPatternReferences(model, cfg)
+    model[0] = nn.Identity()
+    if override == "hook_module":
+        # A same-path replacement has a valid module mapping. Remove the path
+        # completely to exercise a conversion that cannot retain the target.
+        del model[0]
+    with pytest.raises(ValueError, match=f"{override} lost its registered paths"):
+        references.bind(model)
+
+
+def test_fsdp_references_keep_objects_retained_under_new_paths():
+    from llmtuner.parallel.fully_shard_parallel.plan import FSDPPatternReferences
+
+    model = nn.Module()
+    model.gate = nn.Linear(4, 4, bias=False)
+    original = model.gate
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={
+                "": {"ignored_params": {original.weight}, "hook_module": original}
+            }
+        )
+    )
+    references = FSDPPatternReferences(model, cfg)
+    model.router = original
+    del model.gate
+    rebound = references.bind(model).fsdp_config.fsdp_apply_modules[""]
+    assert rebound["ignored_params"] == {original.weight}
+    assert rebound["hook_module"] is original

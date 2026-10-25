@@ -443,6 +443,77 @@ def check_load_wait_failure(root):
         manager.close()
 
 
+def check_save_argument_agreement(root):
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    manager = checkpoint.DistributedCheckpointManager(
+        CheckpointConfig(enable=True, interval=1, keep_latest_k=0),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1),
+        states={},
+        folder=str(root / "argument-agreement"),
+    )
+    try:
+        for step, last in ((dist.get_rank() + 1, False), (1, dist.get_rank() == 0)):
+            # Intercept the backend so the unfixed case fails promptly rather
+            # than entering different collective sequences.
+            with patch.object(manager, "_save", return_value=True) as save:
+                try:
+                    manager.save(step, last_step=last)
+                except RuntimeError as error:
+                    assert "inconsistent save arguments" in str(error)
+                else:
+                    raise AssertionError("rank-divergent save arguments accepted")
+                save.assert_not_called()
+            dist.barrier()
+        for field, value in (("interval", 2), ("load_only", True)):
+            original = getattr(manager, field)
+            if dist.get_rank() == 0:
+                setattr(manager, field, value)
+            try:
+                with patch.object(manager, "_save", return_value=True) as save:
+                    try:
+                        manager.save(3)
+                    except RuntimeError as error:
+                        assert "inconsistent save policy" in str(error)
+                    else:
+                        raise AssertionError("rank-divergent save policy accepted")
+                    save.assert_not_called()
+                dist.barrier()
+            finally:
+                setattr(manager, field, original)
+        for field, value in (
+            ("folder", str(root / "other-destination")),
+            ("last_save_model_only", not manager.last_save_model_only),
+            ("last_save_in_hf", not manager.last_save_in_hf),
+            ("export_dtype", torch.float16),
+            ("async_mode", checkpoint.DistributedCheckpointAsyncMode.ASYNC),
+        ):
+            original = getattr(manager, field)
+            if dist.get_rank() == 0:
+                setattr(manager, field, value)
+            try:
+                with patch.object(manager, "_save", return_value=True) as save:
+                    try:
+                        manager.save(1, last_step=True)
+                    except RuntimeError as error:
+                        assert "inconsistent save configuration" in str(error)
+                    else:
+                        raise AssertionError(
+                            "rank-divergent save configuration accepted"
+                        )
+                    save.assert_not_called()
+                dist.barrier()
+            finally:
+                setattr(manager, field, original)
+        # Agreement must allow an actual publication after rejected calls.
+        assert manager.save(1, last_step=True)
+        dist.barrier()
+    finally:
+        manager.close()
+
+
 def check_load_preflight(root):
     rank = dist.get_rank()
     model = torch.nn.Linear(2, 2)
@@ -835,6 +906,7 @@ def main():
             check_completed_retention(root)
             check_pending_save_failure(root)
             check_load_wait_failure(root)
+            check_save_argument_agreement(root)
             check_load_preflight(root)
             for failing_rank in (0, 1):
                 check_stager_failure(root, failing_rank)

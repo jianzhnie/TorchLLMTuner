@@ -358,11 +358,19 @@ def test_scheduler_restore_uses_optimizer_restored_initial_lr():
     assert _step(resumed) == pytest.approx(_step(original))
 
 
+@pytest.mark.parametrize("empty", [False, True])
 @pytest.mark.parametrize("epoch", [-1, True, False, 1.5, "2"])
-def test_invalid_scheduler_epoch_leaves_schedule_unchanged(epoch):
+def test_invalid_scheduler_epoch_leaves_schedule_unchanged(epoch, empty):
     scheduler = build_lr_scheduler(
-        LRSchedulerConfig(warmup_steps=4), optimizers=[_optimizer()], training_steps=8
+        LRSchedulerConfig(warmup_steps=4),
+        optimizers=[] if empty else [_optimizer()],
+        training_steps=8,
     )
+    for _ in range(2):
+        for inner in scheduler:
+            inner.optimizer.step()
+        scheduler.step()
+    assert scheduler.state_dict() == {"last_epoch": 2}
     before = scheduler.state_dict()
     lr_before = scheduler.get_metrics()
     with pytest.raises(ValueError, match="nonnegative integer"):
@@ -455,12 +463,20 @@ def test_container_step_rejects_divergent_progress_before_changing_rates():
     assert container.state_dict() == {"last_epoch": 2}
 
 
+@pytest.mark.parametrize("empty", [False, True])
 @pytest.mark.parametrize("state", [None, [], "", 0, False, [1], "invalid"])
-def test_scheduler_rejects_non_dictionary_state_without_changing_rates(state):
+def test_scheduler_rejects_non_dictionary_state_without_changing_rates(state, empty):
     optimizer = _optimizer(0.4)
     scheduler = build_lr_scheduler(
-        LRSchedulerConfig(warmup_steps=3), optimizers=[optimizer], training_steps=10
+        LRSchedulerConfig(warmup_steps=3),
+        optimizers=[] if empty else [optimizer],
+        training_steps=10,
     )
+    for _ in range(2):
+        for inner in scheduler:
+            inner.optimizer.step()
+        scheduler.step()
+    assert scheduler.state_dict() == {"last_epoch": 2}
     before = scheduler.state_dict().copy()
     rates = scheduler.get_metrics().copy()
     with pytest.raises(
@@ -469,3 +485,49 @@ def test_scheduler_rejects_non_dictionary_state_without_changing_rates(state):
         scheduler.load_state_dict(state)
     assert scheduler.state_dict() == before
     assert scheduler.get_metrics() == rates
+
+
+@pytest.mark.parametrize("source_empty", [False, True])
+@pytest.mark.parametrize("target_empty", [False, True])
+def test_scheduler_progress_survives_empty_pipeline_stage(source_empty, target_empty):
+    source = build_lr_scheduler(
+        LRSchedulerConfig(warmup_steps=2, decay_ratio=0.5),
+        optimizers=[] if source_empty else [_optimizer(0.2)],
+        training_steps=6,
+    )
+    for _ in range(3):
+        for scheduler in source:
+            scheduler.optimizer.step()
+        source.step()
+    assert source.state_dict() == {"last_epoch": 3}
+    target = build_lr_scheduler(
+        LRSchedulerConfig(warmup_steps=2, decay_ratio=0.5),
+        optimizers=[] if target_empty else [_optimizer(0.2)],
+        training_steps=6,
+    )
+    target.load_state_dict(source.state_dict())
+    assert target.state_dict() == source.state_dict()
+    if target_empty:
+        assert len(target) == 0
+        assert list(target) == []
+        assert target.get_metrics() == {}
+    else:
+        reference = build_lr_scheduler(
+            LRSchedulerConfig(warmup_steps=2, decay_ratio=0.5),
+            optimizers=[_optimizer(0.2)],
+            training_steps=6,
+        )
+        _advance(reference, 3)
+        assert target.get_metrics() == reference.get_metrics()
+    target.load_state_dict({})
+    assert target.state_dict() == {"last_epoch": 3}
+    for _ in range(3):
+        for scheduler in target:
+            scheduler.optimizer.step()
+        target.step()
+    assert target.state_dict() == {"last_epoch": 6}
+    with pytest.raises(ValueError, match="beyond total_steps"):
+        target.step()
+    with pytest.raises(ValueError, match="exceeds total_steps"):
+        target.load_state_dict({"last_epoch": 7})
+    assert target.state_dict() == {"last_epoch": 6}

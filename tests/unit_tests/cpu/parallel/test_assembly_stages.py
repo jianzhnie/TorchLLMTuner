@@ -98,3 +98,130 @@ def test_assembly_executes_stages_in_order(monkeypatch, compile_enabled):
         if compile_enabled
         else ["tp", "ep", "cp", "ac", "fsdp"]
     )
+
+
+@pytest.mark.parametrize("compile_enabled", [False, True])
+def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
+    monkeypatch, compile_enabled
+):
+    from types import SimpleNamespace
+
+    model = nn.Linear(2, 2)
+    parts = [nn.Linear(2, 2), nn.Linear(2, 2)]
+    stages = [SimpleNamespace(submod=part) for part in parts]
+    expected_order = [
+        name for name in STAGE_ORDER if name != "compile" or compile_enabled
+    ]
+    seen = []
+    dense_mesh = object()
+    cfg = ParallelConfig()
+    dims = SimpleNamespace(
+        pp_enabled=True,
+        get_optional_mesh=lambda name: None,
+        spmd_dense_mesh=lambda: dense_mesh,
+    )
+    monkeypatch.setattr(
+        parallelize, "apply_pp", lambda *args, **kwargs: (stages, parts, True, True)
+    )
+
+    def runner(name):
+        def apply(part, **kwargs):
+            history = getattr(part, "history", [])
+            assert name == expected_order[len(history)]
+            if name in {"tp", "cp"}:
+                assert kwargs["mesh"] is dense_mesh
+            if name == "fsdp":
+                assert kwargs["cfg"] is cfg
+            replacement = nn.Identity()
+            replacement.history = [*history, name]
+            seen.append(name)
+            return replacement
+
+        return apply
+
+    for name in STAGE_ORDER:
+        monkeypatch.setattr(parallelize, f"apply_{name}", runner(name))
+
+    schedule = object()
+
+    def build_schedule(bound_stages, **kwargs):
+        assert bound_stages is stages
+        for stage, part in zip(stages, parts, strict=True):
+            assert stage.submod is part
+            assert part.history == expected_order
+        return schedule
+
+    monkeypatch.setattr(parallelize, "build_pipeline_schedule", build_schedule)
+    result = parallelize.parallelize_hf_transformers(
+        model,
+        cfg=cfg,
+        mesh=None,
+        parallel_dims=dims,
+        compile=compile_enabled,
+        global_batch_size=4,
+    )
+    assert result.schedule is schedule
+    assert result.model_parts is parts
+    assert seen == expected_order * 2
+
+
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline):
+    import copy
+    from types import SimpleNamespace
+
+    from llmtuner.config.parallel_config import FSDPConfig
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
+    originals = list(model.parameters())
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={
+                str(index): {"ignored_params": {parameter}}
+                for index, parameter in enumerate(originals)
+            }
+        )
+    )
+    parts = [copy.deepcopy(model), copy.deepcopy(model)]
+    del parts[0][1]
+    parts[1]._modules.pop("0")
+    stages = [SimpleNamespace(submod=part) for part in parts]
+    dims = SimpleNamespace(
+        pp_enabled=True,
+        get_optional_mesh=lambda name: None,
+        spmd_dense_mesh=lambda: None,
+    )
+    monkeypatch.setattr(
+        parallelize, "apply_pp", lambda *args, **kwargs: (stages, parts, True, True)
+    )
+    monkeypatch.setattr(parallelize, "build_pipeline_schedule", lambda *a, **kw: None)
+    for name in ("ep", "cp", "ac"):
+        monkeypatch.setattr(parallelize, f"apply_{name}", lambda part, **kw: part)
+
+    def replace_parameters(part, **kwargs):
+        for child in part.children():
+            child.weight = nn.Parameter(child.weight.detach().clone())
+        return part
+
+    calls = []
+
+    def check_fsdp(part, *, cfg, **kwargs):
+        for name, options in cfg.fsdp_config.fsdp_apply_modules.items():
+            assert options["ignored_params"] == {part.get_submodule(name).weight}
+        calls.append(part)
+        return part
+
+    monkeypatch.setattr(parallelize, "apply_tp", replace_parameters)
+    monkeypatch.setattr(parallelize, "apply_fsdp", check_fsdp)
+    parallelize.parallelize_hf_transformers(
+        model,
+        cfg=cfg,
+        mesh=None,
+        parallel_dims=dims if pipeline else None,
+        global_batch_size=4,
+    )
+    assert len(calls) == (2 if pipeline else 1)
+    for index, parameter in enumerate(originals):
+        assert cfg.fsdp_config.fsdp_apply_modules[str(index)]["ignored_params"] == {
+            parameter
+        }

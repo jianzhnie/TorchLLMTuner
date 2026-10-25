@@ -13,6 +13,12 @@ with independently packed pipeline microbatches. On CPU that variant uses the
 explicit dense-mask SDPA substitute from the real-corpus harness, rather than
 the production CUDA flex kernel.
 
+Set ``LLMTUNER_TEST_FROZEN_PP_STAGE=0`` or ``1`` in both phases to freeze
+all parameters of that stage before partitioning (two or four ranks, PP2,
+1F1B/Interleaved1F1B). Checks optimizer counts per trainable local part and
+unchanged frozen weights. An interleaved rank can own both a frozen and a
+trainable part.
+
 Set ``LLMTUNER_TEST_LEGACY_LAYOUT=1`` for the full phase to save the historical
 loader format without batch layout metadata, then resume normally to exercise
 the manager's strict planner migration on both ranks.
@@ -395,6 +401,34 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
 def _train_steps(trainer: Trainer, data_iterator, num_steps: int) -> list[float]:
     """Drive ``num_steps`` optimizer steps; return the last-stage losses."""
     losses = []
+    frozen_stage = os.environ.get("LLMTUNER_TEST_FROZEN_PP_STAGE")
+    frozen_parameters = {}
+    if frozen_stage is not None:
+        owns_frozen_stage = trainer.parallel_dims.get_mesh(
+            "pp"
+        ).get_local_rank() == int(frozen_stage)
+        trainable_parts = sum(
+            any(parameter.requires_grad for parameter in part.parameters())
+            for part in trainer.model_parts
+        )
+        assert len(trainer.optimizer) == trainable_parts
+        frozen_parameters = {
+            name: parameter.detach().clone()
+            for part in trainer.model_parts
+            for name, parameter in part.named_parameters()
+            if not parameter.requires_grad
+        }
+        assert bool(frozen_parameters) == owns_frozen_stage
+        if trainer.world_size == 4:
+            from torch.distributed.fsdp import FSDPModule
+
+            assert trainer.parallel_dims.dp_shard == 2
+            assert all(isinstance(part, FSDPModule) for part in trainer.model_parts)
+            assert all(
+                isinstance(parameter, DTensor)
+                for part in trainer.model_parts
+                for parameter in part.parameters()
+            )
     for _ in range(num_steps):
         trainer.step += 1
         metrics = trainer.train_step(data_iterator)
@@ -407,6 +441,13 @@ def _train_steps(trainer: Trainer, data_iterator, num_steps: int) -> list[float]
             )
             assert counters["stats"]["unique_graphs"] > 0
         _assert_shared_layers(trainer)
+        if frozen_stage is not None:
+            assert trainer.lr_scheduler.state_dict() == {"last_epoch": trainer.step}
+            for part in trainer.model_parts:
+                for name, parameter in part.named_parameters():
+                    if name in frozen_parameters:
+                        assert parameter.grad is None
+                        assert _equal_rank_state(parameter, frozen_parameters[name])
         assert metrics is not None  # log_freq=1: every step reports
         if not trainer.parallel_dims.pp_enabled or trainer.pp_has_last_stage:
             losses.append(metrics["loss"])
@@ -782,7 +823,17 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
         for key, value in optim_state.items()
         if key.startswith("state.") and key.endswith("exp_avg")
     }
-    if not moments:
+    frozen_stage = os.environ.get("LLMTUNER_TEST_FROZEN_PP_STAGE")
+    frozen_local = frozen_stage is not None and all(
+        not parameter.requires_grad
+        for part in trainer.model_parts
+        for parameter in part.parameters()
+    )
+    if frozen_local:
+        assert len(trainer.optimizer) == 0
+        assert optim_state == {}
+        assert not moments
+    elif not moments:
         failures.append(f"rank {trainer.rank}: optimizer state is empty")
     elif not any(float(moment.abs().sum()) > 0 for moment in moments.values()):
         failures.append(f"rank {trainer.rank}: optimizer moments are all zero")
@@ -952,6 +1003,30 @@ def _run() -> None:
 
 
 def main() -> None:
+    frozen_stage = os.environ.get("LLMTUNER_TEST_FROZEN_PP_STAGE")
+    if frozen_stage is not None:
+        if (
+            frozen_stage not in {"0", "1"}
+            or int(os.environ.get("WORLD_SIZE", "2")) not in {2, 4}
+            or os.environ.get("LLMTUNER_TEST_PP_SIZE", "2") != "2"
+            or os.environ.get("LLMTUNER_TEST_PP_SCHEDULE", "1F1B")
+            not in {"1F1B", "Interleaved1F1B"}
+        ):
+            raise ValueError(
+                "Frozen stage scenario requires 2/4 ranks, PP2, 1F1B/Interleaved1F1B"
+            )
+        from llmtuner.parallel.pipeline_parallel import pipeline_parallel
+
+        split = pipeline_parallel.split_model_into_stages
+
+        def split_frozen(model, mesh, schedule, device, assignments, **kwargs):
+            for name in assignments[int(frozen_stage)]:
+                model.get_submodule(name).requires_grad_(False)
+            return split(model, mesh, schedule, device, assignments, **kwargs)
+
+        with patch.object(pipeline_parallel, "split_model_into_stages", split_frozen):
+            _run()
+        return
     if os.environ.get("LLMTUNER_TEST_RELOCATED_HOOKS") == "1":
         if os.environ.get("LLMTUNER_TEST_FSDP_IMPLEMENTATION") != "custom":
             raise ValueError("Relocated-hook checkpoint scenario requires custom FSDP")

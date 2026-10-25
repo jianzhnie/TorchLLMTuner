@@ -3121,8 +3121,10 @@ def test_trainer_retries_real_grain_prefetch_join_after_interrupt(
 
 
 @pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt])
+@pytest.mark.parametrize("report_error", [None, OSError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
 def test_packing_failed_rollback_preserves_original_error_and_closes(
-    monkeypatch, error_type
+    monkeypatch, error_type, report_error, cleanup_failure
 ):
     from llmtuner.datasets.packing.iterators import (
         DocumentAwareConcatThenSplitIterDataset,
@@ -3148,11 +3150,33 @@ def test_packing_failed_rollback_preserves_original_error_and_closes(
             raise failure
         raise OSError("rollback failed")
 
+    from types import SimpleNamespace
+
+    from llmtuner.datasets.packing import iterators as module
+
+    def report(*args, **kwargs):
+        if report_error is not None:
+            raise report_error("rollback reporting failed")
+
+    close = iterator.close
+    cleanup_calls = []
+
+    def cleanup():
+        cleanup_calls.append(True)
+        close()
+        if cleanup_failure:
+            raise OSError("packing close failed")
+
     monkeypatch.setattr(iterator._parent, "set_state", fail_restore)
+    monkeypatch.setattr(iterator, "close", cleanup)
+    monkeypatch.setattr(
+        module, "get_logger", lambda name: SimpleNamespace(exception=report)
+    )
     with pytest.raises(error_type) as caught:
         iterator.set_state(saved)
     assert caught.value is failure
     assert len(calls) == 2
+    assert cleanup_calls == [True]
     assert iterator._closed and iterator._parent._closed
     with pytest.raises(ValueError, match="closed"):
         next(iterator)
@@ -3785,3 +3809,85 @@ def test_grain_live_restore_preserves_error_when_cleanup_reporting_fails(
         assert closed == [True]
     finally:
         live.close()
+
+
+@pytest.mark.parametrize("boundary", ["export", "restore"])
+def test_document_packing_owns_cached_parent_checkpoint(boundary):
+    from copy import deepcopy
+
+    from llmtuner.datasets.packing.iterators import (
+        DocumentAwareConcatThenSplitIterDataset,
+    )
+
+    graph = DocumentAwareConcatThenSplitIterDataset(
+        _SequenceIterDataset(
+            [
+                TextSequence(input_ids=np.arange(1, 7), labels=np.arange(2, 8)),
+                TextSequence(input_ids=np.arange(11, 17), labels=np.arange(12, 18)),
+            ]
+        ),
+        max_num_documents_per_row=1,
+        max_context_length=4,
+        num_tokens_per_row=2,
+    )
+    iterator = iter(graph)
+    restored = iter(graph)
+    try:
+        np.testing.assert_array_equal(next(iterator).input_ids, [1, 2])
+        exported = iterator.get_state()
+        expected = deepcopy(exported)
+        if boundary == "restore":
+            iterator.set_state(exported)
+        # A checkpoint consumer may edit or reuse its payload. Neither exported
+        # state nor accepted state may alias the cached pre-remainder cursor.
+        exported["parent"].clear()
+        actual = iterator.get_state()
+        assert actual == expected
+        restored.set_state(actual)
+        np.testing.assert_array_equal(next(restored).input_ids, [3, 4])
+        np.testing.assert_array_equal(next(iterator).input_ids, [3, 4])
+    finally:
+        iterator.close()
+        restored.close()
+
+
+@pytest.mark.parametrize("saved_rows", [0, 1])
+def test_closed_document_packing_rejects_restore_before_touching_parent(
+    saved_rows, monkeypatch
+):
+    from llmtuner.datasets.packing.iterators import (
+        DocumentAwareConcatThenSplitIterDataset,
+    )
+
+    graph = DocumentAwareConcatThenSplitIterDataset(
+        _SequenceIterDataset(
+            [
+                TextSequence(input_ids=np.arange(1, 7), labels=np.arange(2, 8)),
+                TextSequence(input_ids=np.arange(11, 17), labels=np.arange(12, 18)),
+            ]
+        ),
+        max_num_documents_per_row=1,
+        max_context_length=4,
+        num_tokens_per_row=2,
+    )
+    iterator = iter(graph)
+    for _ in range(saved_rows):
+        next(iterator)
+    saved = iterator.get_state()
+    next(iterator)
+    iterator.close()
+    before = iterator.get_state()
+    calls = []
+    restore = iterator._parent.set_state
+
+    def restore_parent(state):
+        calls.append(state)
+        return restore(state)
+
+    monkeypatch.setattr(iterator._parent, "set_state", restore_parent)
+    with pytest.raises(ValueError, match="closed"):
+        iterator.set_state(saved)
+    assert calls == []
+    assert iterator.get_state() == before
+    assert iterator._closed and iterator._parent._closed
+    iterator.close()
