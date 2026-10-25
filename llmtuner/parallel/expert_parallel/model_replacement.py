@@ -293,6 +293,18 @@ def swap_hf_moe_blocks(
                     tp_enabled=tp_enabled,
                 )
                 moe.router.fixed_router = fixed_router
+                if on_replacement is not None:
+                    grouped = moe.routed_experts.inner_experts
+                    for expert in block.experts:
+                        for source_name, target_name in (
+                            ("w1", "w1_EFD"),
+                            ("w2", "w2_EDF"),
+                            ("w3", "w3_EFD"),
+                        ):
+                            source = getattr(expert, source_name).weight
+                            converted_parameters[id(source)] = (
+                                getattr(grouped, target_name),
+                            )
                 converted_blocks[id(block)] = moe
                 replacements.append((layer, attr, moe))
                 continue
@@ -433,8 +445,11 @@ def swap_hf_moe_blocks(
             for _, _, block in candidates:
                 moe = converted_blocks[id(block)]
                 module_targets[block] = moe
+                module_targets[block.experts] = moe.routed_experts.inner_experts
                 if not isinstance(block, KimiSparseMoE):
-                    module_targets[block.experts] = moe.routed_experts.inner_experts
+                    # Kimi's gate also owns a correction-bias Parameter which
+                    # moves outside router.gate. Mapping only that subtree
+                    # would silently drop part of a module exclusion.
                     module_targets[router_of(block)] = moe.router.gate
             on_replacement(
                 module_targets,
