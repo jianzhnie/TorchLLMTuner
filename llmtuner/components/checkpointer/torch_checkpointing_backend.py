@@ -396,6 +396,8 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         sd_adapter: Any | None = None,
         storage_config: Any | None = None,
     ) -> None:
+        # Reject disagreement before model-state collectives or optional imports.
+        self._validate_constructor_configuration(config)
         super().__init__(
             config,
             model_parts=model_parts,
@@ -408,72 +410,86 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         if not self.enable:
             return
 
-        backend = require_torch_checkpointing()
-        self._backend = backend
+        with synchronize_local_errors("Checkpoint backend preflight"):
+            backend = require_torch_checkpointing()
+            self._backend = backend
 
-        self.save_future: Future[Any] | None = None
-        self.purge_thread: threading.Thread | None = None
+            self.save_future: Future[Any] | None = None
+            self.purge_thread: threading.Thread | None = None
 
-        # Checked here, not only in the storage adapter: a save runs no path
-        # probe when retention is off, so it would otherwise reach the backend
-        # and be mangled by ``Path`` rather than failing.
-        for label, candidate in (
-            ("checkpoint.folder", self.folder),
-            ("checkpoint.initial_load_path", config.initial_load_path),
-        ):
-            if candidate and filesystem.is_remote(candidate):
+            # Checked here, not only in the storage adapter: a save runs no path
+            # probe when retention is off, so it would otherwise reach the backend
+            # and be mangled by ``Path`` rather than failing.
+            for label, candidate in (
+                ("checkpoint.folder", self.folder),
+                ("checkpoint.initial_load_path", config.initial_load_path),
+            ):
+                if candidate and filesystem.is_remote(candidate):
+                    raise ValueError(
+                        f"{label} is a remote URI ({candidate!r}); remote URIs are "
+                        "not yet supported by torch_checkpointing. Use the DCP "
+                        "checkpoint manager for remote storage."
+                    )
+
+            self.sd_adapter = sd_adapter
+            if self.last_save_in_hf and self.sd_adapter is None:
                 raise ValueError(
-                    f"{label} is a remote URI ({candidate!r}); remote URIs are "
-                    "not yet supported by torch_checkpointing. Use the DCP "
-                    "checkpoint manager for remote storage."
+                    "checkpoint.last_save_in_hf is True, "
+                    "but sd_adapter is not provided."
                 )
 
-        save_config = (
-            sync_save_config(backend, use_barrier=False)
-            if self.load_only
-            else async_save_config(backend)
-        )
-        manager_config = default_backend_config(
-            backend,
-            save_config,
-            storage_config=storage_config,
-        )
-        self._manager_config = manager_config
-        storage_config = (
-            self._manager_config.storage_config
-            or backend.LocalFileSystemStorageConfig()
-        )
-        self._storage = BackendCheckpointStorage(storage_config.create_storage())
-        self._prewarmed = False
-
-        self.sd_adapter = sd_adapter
-        if self.last_save_in_hf and self.sd_adapter is None:
-            raise ValueError(
-                "checkpoint.last_save_in_hf is True, but sd_adapter is not provided."
+        # Backend factories may communicate. Finish each rank's attempt before
+        # coordinating the outcome; never call them inside a local error body.
+        construction_error: BaseException | None = None
+        try:
+            save_config = (
+                sync_save_config(backend, use_barrier=False)
+                if self.load_only
+                else async_save_config(backend)
             )
+            manager_config = default_backend_config(
+                backend,
+                save_config,
+                storage_config=storage_config,
+            )
+            self._manager_config = manager_config
+            storage_config = (
+                self._manager_config.storage_config
+                or backend.LocalFileSystemStorageConfig()
+            )
+            self._storage = BackendCheckpointStorage(storage_config.create_storage())
+            self._prewarmed = False
 
-        self._manager = self._manager_config.build()
+            self._manager = self._manager_config.build()
+
+        except BaseException as error:
+            construction_error = error
 
         try:
-            if self.keep_latest_k > 0:
-                self.purge_queue: queue.Queue[str | None] = queue.Queue()
-                self.purge_thread = threading.Thread(
-                    target=purge_thread,
-                    args=(self.purge_queue, self._storage.remove),
-                    daemon=True,
-                )
-                self.purge_thread.start()
+            with synchronize_local_errors("Checkpoint backend construction"):
+                if construction_error is not None:
+                    raise construction_error
+            with synchronize_local_errors("Checkpoint services construction"):
+                if self.keep_latest_k > 0:
+                    self.purge_queue: queue.Queue[str | None] = queue.Queue()
+                    self.purge_thread = threading.Thread(
+                        target=purge_thread,
+                        args=(self.purge_queue, self._storage.remove),
+                        daemon=True,
+                    )
+                    self.purge_thread.start()
 
-            logger.info(
-                "Checkpointing active. Checkpoints will be loaded from and saved "
-                f"to {self.folder}"
-            )
+                logger.info(
+                    "Checkpointing active. Checkpoints will be loaded from and saved "
+                    f"to {self.folder}"
+                )
 
         except BaseException:
             # Public close is guarded until initialization completes. Release
             # the already-built backend explicitly if local service setup fails.
             try:
-                self._close()
+                if hasattr(self, "_manager"):
+                    self._close()
             except BaseException:
                 try:
                     logger.exception("Backend cleanup failed during construction")
@@ -657,7 +673,18 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # Prewarm on a step we are not saving, so the first real save does not
         # pay for pinned-buffer allocation.
         if not should_save and self._should_prewarm():
-            self._manager.prewarm_staging(self._stateful_to_state_dict(self.states))
+            failure: BaseException | None = None
+            try:
+                self._manager.prewarm_staging(self._stateful_to_state_dict(self.states))
+            except BaseException as error:
+                failure = error
+            # State callbacks and backend staging may communicate: coordinate
+            # their returned outcomes, never enclose them in a local boundary.
+            # Mark success only after every rank completed prewarming so a
+            # failed attempt leaves all ranks eligible for a retry.
+            with synchronize_local_errors("Checkpoint prewarm"):
+                if failure is not None:
+                    raise failure
             self._prewarmed = True
         if not should_save:
             return False

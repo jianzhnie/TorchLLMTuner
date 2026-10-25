@@ -167,6 +167,27 @@ class BaseCheckpointManager(ABC):
     parsed into something that would then collide with ``step-7``.
     """
 
+    def _validate_constructor_configuration(
+        self, config: CheckpointConfig, *, async_mode: str | None = None
+    ) -> None:
+        """Agree on backend and collective setup before any local early return."""
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return
+        configuration = (
+            type(self).__module__,
+            type(self).__qualname__,
+            config.enable,
+            async_mode if config.enable else None,
+            config.load_only if config.enable else None,
+        )
+        configurations = [None] * dist.get_world_size()
+        dist.all_gather_object(configurations, configuration)
+        if any(item != configurations[0] for item in configurations):
+            raise RuntimeError(
+                "Checkpoint constructor configuration differs across ranks: "
+                f"{configurations}"
+            )
+
     def __init__(
         self,
         config: CheckpointConfig,

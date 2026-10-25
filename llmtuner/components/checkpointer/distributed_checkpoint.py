@@ -49,6 +49,7 @@ from torch.distributed.checkpoint.state_dict_saver import (
     AsyncCheckpointerType,
     AsyncSaveResponse,
 )
+from torch.distributed.checkpoint.stateful import Stateful
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...errors import UnsupportedCombinationError
@@ -209,6 +210,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         folder: str,
         sd_adapter: Any | None = None,
     ) -> None:
+        self._validate_constructor_configuration(config, async_mode=config.async_mode)
         if not config.enable:
             super().__init__(
                 config,
@@ -445,6 +447,18 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             followed by disk I/O.
         """
         ret: Future | AsyncSaveResponse | None = None
+
+        if not to_hf:
+            # DCP invokes Stateful callbacks before its coordinated save. These
+            # built-in states are local: materialize them together so a failed
+            # callback cannot leave peers entering the writer protocol. Model,
+            # optimizer, EMA and user callbacks may communicate and stay out.
+            with synchronize_local_errors("Checkpoint local save preparation"):
+                state_dict = dict(state_dict)
+                for category in (LR_SCHEDULER, DATALOADER, TRAIN_STATE, RNG_STATE):
+                    state = state_dict.get(category)
+                    if isinstance(state, Stateful):
+                        state_dict[category] = state.state_dict()
 
         if to_hf:
             if self.sd_adapter is None:

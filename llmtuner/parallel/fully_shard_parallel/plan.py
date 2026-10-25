@@ -63,6 +63,11 @@ class FSDPPatternReferences:
             ignored.update(
                 child for module in matches.values() for child in module.modules()
             )
+        self.ignored_parameters = {
+            parameter
+            for module in ignored
+            for parameter in module.parameters(recurse=False)
+        }
         canonical_names = {module: name for name, module in self.unit_modules.items()}
         self.unit_options: dict[str, dict[str, Any]] = {}
         for pattern, options in cfg.fsdp_config.fsdp_apply_modules.items():
@@ -121,6 +126,33 @@ class FSDPPatternReferences:
         }
         current_modules = set(modules.values())
         current_parameters = set(parameters.values())
+
+        def bind_parameters(
+            exclusions: set[nn.Parameter], context: str
+        ) -> set[nn.Parameter]:
+            rebound = set()
+            for parameter in exclusions:
+                targets = {
+                    parameters[path]
+                    for path in self.parameter_paths.get(parameter, ())
+                    if path in parameters
+                }
+                targets.update(
+                    target
+                    for target in self.parameter_targets.get(parameter, ())
+                    if target in current_parameters
+                )
+                if parameter in current_parameters:
+                    targets.add(parameter)
+                if not targets:
+                    raise ValueError(
+                        f"{context}: ignored_params lost its registered paths "
+                        "during model transformation; configure exclusions "
+                        "on the converted model"
+                    )
+                rebound.update(targets)
+            return rebound
+
         overrides = {}
         for name, source in self.unit_options.items():
             pattern = canonical_fqn(name)
@@ -150,28 +182,9 @@ class FSDPPatternReferences:
                     )
             exclusions = options.get("ignored_params")
             if isinstance(exclusions, set):
-                rebound = set()
-                for parameter in exclusions:
-                    targets = {
-                        parameters[path]
-                        for path in self.parameter_paths.get(parameter, ())
-                        if path in parameters
-                    }
-                    targets.update(
-                        target
-                        for target in self.parameter_targets.get(parameter, ())
-                        if target in current_parameters
-                    )
-                    if parameter in current_parameters:
-                        targets.add(parameter)
-                    if not targets:
-                        raise ValueError(
-                            f"FSDP pattern {pattern!r}: ignored_params lost its "
-                            "registered paths during model transformation; "
-                            "configure exclusions on the converted model"
-                        )
-                    rebound.update(targets)
-                options["ignored_params"] = rebound
+                options["ignored_params"] = bind_parameters(
+                    exclusions, f"FSDP pattern {pattern!r}"
+                )
             overrides[pattern] = options
         ignored_names = []
         for name, source_module in self.ignored_modules.items():
@@ -182,6 +195,26 @@ class FSDPPatternReferences:
                     (path for path, module in modules.items() if module is target), name
                 )
             ignored_names.append(name)
+        # A source subtree can split across owners (Kimi gate weight and
+        # correction bias). Preserve moved parameters without excluding the
+        # target parameter's entire new parent subtree.
+        module_exclusions = {
+            parameter
+            for pattern in ignored_names
+            for name, module in modules.items()
+            if compile_module_pattern(pattern).fullmatch(name)
+            for parameter in module.parameters()
+        }
+        moved_exclusions = (
+            bind_parameters(self.ignored_parameters, "FSDP ignored modules")
+            - module_exclusions
+        )
+        if moved_exclusions:
+            overrides.setdefault("", {})
+            for options in overrides.values():
+                exclusions = options.get("ignored_params")
+                if exclusions is None or isinstance(exclusions, set):
+                    options["ignored_params"] = (exclusions or set()) | moved_exclusions
         return replace(
             self.cfg,
             fsdp_config=replace(

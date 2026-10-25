@@ -446,11 +446,7 @@ def swap_hf_moe_blocks(
                 moe = converted_blocks[id(block)]
                 module_targets[block] = moe
                 module_targets[block.experts] = moe.routed_experts.inner_experts
-                if not isinstance(block, KimiSparseMoE):
-                    # Kimi's gate also owns a correction-bias Parameter which
-                    # moves outside router.gate. Mapping only that subtree
-                    # would silently drop part of a module exclusion.
-                    module_targets[router_of(block)] = moe.router.gate
+                module_targets[router_of(block)] = moe.router.gate
             on_replacement(
                 module_targets,
                 {

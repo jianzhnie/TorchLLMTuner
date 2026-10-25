@@ -214,33 +214,45 @@ def clip_grad_norm_(
     ]
 
     def _local_norm(grads: list[torch.Tensor]) -> torch.Tensor:
-        # Check only after every mesh reduction, so one bad local shard does
-        # not raise while its peers are still waiting in a collective.
-        if any(grad.dtype in (torch.float16, torch.bfloat16) for grad in grads):
-            # Keep only scalar FP32 norms, rather than retaining FP32 copies
-            # of every gradient at once. DTensor preserves the reduction layout.
-            norms = [
-                torch.linalg.vector_norm(
-                    grad,
-                    norm_type,
-                    dtype=torch.float32
-                    if grad.dtype in (torch.float16, torch.bfloat16)
-                    else None,
-                )
-                for grad in grads
-            ]
-            norm = torch.nn.utils.get_total_norm(norms, norm_type, False, foreach)
-        else:
-            norm = torch.nn.utils.get_total_norm(grads, norm_type, False, foreach)
-        if isinstance(norm, DTensor):
-            norm = norm.full_tensor()
-        # Squaring a finite fp16 norm (e.g. 300) already overflows. Mesh
-        # accumulation must use at least fp32 before taking p-th powers.
-        if (
-            pp_mesh is not None or tp_mesh is not None or ep_mesh is not None
-        ) and norm.dtype in (torch.float16, torch.bfloat16):
-            norm = norm.float()
-        return norm
+        # FSDP exclusions remain plain tensors. Reduce each DTensor mesh's
+        # scalar norm before combining it with replicated local contributions;
+        # foreach cannot mix tensors/DTensors or independent meshes.
+        groups: dict[int | None, list[torch.Tensor]] = {}
+        for grad in grads:
+            key = id(grad.device_mesh) if isinstance(grad, DTensor) else None
+            groups.setdefault(key, []).append(grad)
+        group_norms = []
+        for grads in groups.values():
+            # Check only after every mesh reduction, so one bad local shard does
+            # not raise while its peers are still waiting in a collective.
+            if any(grad.dtype in (torch.float16, torch.bfloat16) for grad in grads):
+                # Keep only scalar FP32 norms, rather than retaining FP32 copies
+                # of every gradient at once. DTensor preserves the reduction layout.
+                norms = [
+                    torch.linalg.vector_norm(
+                        grad,
+                        norm_type,
+                        dtype=torch.float32
+                        if grad.dtype in (torch.float16, torch.bfloat16)
+                        else None,
+                    )
+                    for grad in grads
+                ]
+                norm = torch.nn.utils.get_total_norm(norms, norm_type, False, foreach)
+            else:
+                norm = torch.nn.utils.get_total_norm(grads, norm_type, False, foreach)
+            if isinstance(norm, DTensor):
+                norm = norm.full_tensor()
+            # Squaring a finite fp16 norm (e.g. 300) already overflows. Mesh
+            # accumulation must use at least fp32 before taking p-th powers.
+            if (
+                pp_mesh is not None or tp_mesh is not None or ep_mesh is not None
+            ) and norm.dtype in (torch.float16, torch.bfloat16):
+                norm = norm.float()
+            group_norms.append(norm)
+        if len(group_norms) == 1:
+            return group_norms[0]
+        return torch.nn.utils.get_total_norm(group_norms, norm_type, False, foreach)
 
     if tp_mesh is not None or ep_mesh is not None:
         dense_norm = _local_norm(dense_grads)
