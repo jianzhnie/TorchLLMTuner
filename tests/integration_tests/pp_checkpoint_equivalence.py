@@ -101,6 +101,9 @@ EP2/FSDP4 recovery. Add LLMTUNER_TEST_TP_SIZE=2 for TP2/EP2 with
 custom FSDP on the same four ranks (dense DP2, sparse efsdp2).
 Add LLMTUNER_TEST_SHARED_LAYERS=1 to share Q projections
 across the two MoE layers; all phases must use the same configuration.
+Set LLMTUNER_TEST_EXCLUDED_EXPERTS=1 with custom FSDP/EP2/PP1 to exclude
+each original fused gate/up projection and test ordinary expert gradient and
+checkpoint state together. Both phases must use the same exclusion setting.
 
 Set LLMTUNER_TEST_SHARED_ROOT_EXPERT=1 with the MoE/EP scenario to register
 an alias to the converted local expert down projection at the wrapper root,
@@ -525,9 +528,16 @@ def _assert_shared_layers(trainer: Trainer) -> None:
             assert isinstance(layer.mlp, MoE)
             expert = layer.mlp.routed_experts.inner_experts.w1_EFD
             router = layer.mlp.router.gate.weight
-            assert isinstance(expert, DTensor)
+            if os.environ.get("LLMTUNER_TEST_EXCLUDED_EXPERTS") == "1":
+                assert not isinstance(expert, DTensor)
+                grouped = layer.mlp.routed_experts.inner_experts
+                assert not isinstance(grouped.w3_EFD, DTensor)
+                assert isinstance(grouped.w2_EDF, DTensor)
+                assert grouped.w2_EDF.device_mesh.size() == dense_degree // ep_size
+            else:
+                assert isinstance(expert, DTensor)
+                assert expert.device_mesh.size() == dense_degree // ep_size
             assert isinstance(router, DTensor)
-            assert expert.device_mesh.size() == dense_degree // ep_size
             # Physical TP parameters carry only the dedicated DP/CP mesh.
             assert router.device_mesh.size() == dense_degree // trainer.parallel_dims.tp
     if os.environ.get("LLMTUNER_TEST_SHARED_ROOT") == "1":
@@ -1003,6 +1013,32 @@ def _run() -> None:
 
 
 def main() -> None:
+    if os.environ.get("LLMTUNER_TEST_EXCLUDED_EXPERTS") == "1":
+        if (
+            os.environ.get("LLMTUNER_TEST_FSDP_IMPLEMENTATION") != "custom"
+            or os.environ.get("LLMTUNER_TEST_EP_SIZE") != "2"
+            or os.environ.get("LLMTUNER_TEST_PP_SIZE") != "1"
+            or os.environ.get("LLMTUNER_TEST_MOE") != "1"
+        ):
+            raise ValueError("Excluded experts require custom FSDP/EP2/PP1/MoE")
+        from llmtuner.trainer.runtime import assembly
+
+        apply_parallelism = assembly._apply_parallelism
+
+        def exclude_experts(trainer, model, **kwargs):
+            names = {module: name for name, module in model.named_modules()}
+            trainer.cfg.parallel.fsdp_config.fsdp_apply_modules = {
+                names[layer.mlp.experts]: {
+                    "ignored_params": {layer.mlp.experts.gate_up_proj},
+                    "hook_module": layer.mlp.experts,
+                }
+                for layer in model.layers
+            }
+            apply_parallelism(trainer, model, **kwargs)
+
+        with patch.object(assembly, "_apply_parallelism", exclude_experts):
+            _run()
+        return
     frozen_stage = os.environ.get("LLMTUNER_TEST_FROZEN_PP_STAGE")
     if frozen_stage is not None:
         if (
