@@ -2279,7 +2279,7 @@ def test_synthetic_resume_updates_existing_iterators():
         batch = next(expected)
         torch.testing.assert_close(actual.input_ids, batch.input_ids)
         torch.testing.assert_close(actual.labels, batch.labels)
-        assert loader.state_dict()["steps"] == cursor
+        assert loader.state_dict()["steps"] == {"1": cursor}
 
 
 @pytest.mark.parametrize(

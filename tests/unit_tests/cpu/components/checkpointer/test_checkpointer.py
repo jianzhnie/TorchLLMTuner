@@ -3097,3 +3097,119 @@ def test_backend_close_preserves_first_error_and_attempts_all_releases(error_typ
         manager._close()
     assert caught.value is original
     assert calls == ["wait", "sentinel", "join", "close"]
+
+
+def test_synthetic_rank_cursor_checkpoint_and_legacy_migration(tmp_path):
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer.load_planner import CheckpointLoadPlanner
+    from llmtuner.datasets.synthetic import RandomTokenDataLoader
+
+    def loader(rank):
+        return RandomTokenDataLoader(
+            seed=42,
+            vocab_size=8,
+            batch_size=2,
+            seq_len=4,
+            dp_rank=rank,
+            dp_world_size=2,
+        )
+
+    source = loader(0)
+    next(iter(source))
+    state = source.state_dict()
+    # A missing peer cursor is corrupt new state, never a legacy fallback.
+    checkpoint = tmp_path / "rank-local"
+    dcp.save({"dataloader": state}, checkpoint_id=checkpoint)
+    restored = loader(0)
+    target = {"dataloader": restored.state_dict()}
+    dcp.load(target, checkpoint_id=checkpoint, planner=CheckpointLoadPlanner())
+    restored.load_state_dict(target["dataloader"])
+    assert restored.state_dict()["steps"] == {"0": 1}
+    with pytest.raises(CheckpointException, match="dataloader.steps.1"):
+        dcp.load(
+            {"dataloader": loader(1).state_dict()},
+            checkpoint_id=checkpoint,
+            planner=CheckpointLoadPlanner(),
+        )
+    legacy = tmp_path / "legacy-synthetic"
+    state["steps"] = 7
+    dcp.save({"dataloader": state}, checkpoint_id=legacy)
+    for rank in (0, 1):
+        restored = loader(rank)
+        target = {"dataloader": restored.state_dict()}
+        dcp.load(target, checkpoint_id=legacy, planner=CheckpointLoadPlanner())
+        restored.load_state_dict(target["dataloader"])
+        assert restored.state_dict()["steps"] == {str(rank): 7}
+        reference = loader(rank)
+        reference.load_state_dict(state)
+        torch.testing.assert_close(
+            next(iter(restored)).input_ids, next(iter(reference)).input_ids
+        )
+
+
+@pytest.mark.parametrize("cursor", [{"0": -1}, {"0": True}, {"1": 3}, 1])
+def test_synthetic_cursor_preflight_preserves_live_model_and_stream(
+    tmp_path, monkeypatch, cursor
+):
+    from copy import deepcopy
+
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.datasets.synthetic import RandomTokenDataLoader
+
+    settings = dict(seed=42, vocab_size=8, batch_size=2, seq_len=4, dp_world_size=2)
+    loader = RandomTokenDataLoader(**settings)
+    reference = RandomTokenDataLoader(**settings)
+    for _ in range(2):
+        next(iter(loader))
+        next(iter(reference))
+    before = deepcopy(loader.state_dict())
+    invalid = deepcopy(before)
+    invalid["steps"] = cursor
+    checkpoint = tmp_path / "invalid-cursor"
+    dcp.save(
+        {
+            "dataloader": invalid,
+            "lr_scheduler": {"last_epoch": 0},
+            "model": {"weight": torch.full((2, 2), 99.0)},
+        },
+        checkpoint_id=checkpoint,
+    )
+    model = nn.Linear(2, 2)
+    expected = deepcopy(model.state_dict())
+    reads = []
+    original_load = dcp.load
+
+    def observe_load(state, **kwargs):
+        reads.append(set(state))
+        return original_load(state, **kwargs)
+
+    monkeypatch.setattr(dcp, "load", observe_load)
+    optimizer = torch.optim.AdamW(model.parameters())
+    manager = DistributedCheckpointManager(
+        Config(enable=True, interval=1),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={"dataloader": loader},
+        folder=str(tmp_path / "manager"),
+    )
+    try:
+        with pytest.raises(
+            (ValueError, CheckpointException), match="steps|resume at batch"
+        ):
+            manager._load_checkpoint(
+                manager.states, str(checkpoint), from_hf=False, from_quantized=False
+            )
+        assert len(reads) == 1 and "model" not in reads[0]
+        assert loader.state_dict() == before
+        for key, value in model.state_dict().items():
+            assert torch.equal(value, expected[key])
+        assert torch.equal(
+            next(iter(loader)).input_ids, next(iter(reference)).input_ids
+        )
+    finally:
+        manager.close()

@@ -579,7 +579,9 @@ def main():
             )
             assert rank_id in initial["dataloader"]
         else:
-            assert initial["dataloader"]["steps"] == 2
+            assert initial["dataloader"]["steps"] == (
+                {str(dp_rank): 2} if world_size // (tp_size * pp_size) > 1 else 2
+            )
         assert_state_equal(boundary, initial)
         continuous = torch.load(root / f"continuous{rank}.pt", weights_only=False)
         resumed = torch.load(root / f"resume{rank}.pt", weights_only=False)
@@ -600,7 +602,9 @@ def main():
             )
             assert continuous["dataloader"][rank_id] != initial["dataloader"][rank_id]
         else:
-            assert continuous["dataloader"]["steps"] == 4
+            assert continuous["dataloader"]["steps"] == (
+                {str(dp_rank): 4} if world_size // (tp_size * pp_size) > 1 else 4
+            )
         assert_state_equal(resumed, continuous)
         before = torch.load(root / f"initial_boundary{rank}.pt", weights_only=False)
         # Independent schedule and averaging formula. Compare against the actual
