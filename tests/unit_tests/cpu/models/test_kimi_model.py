@@ -136,3 +136,35 @@ def test_kimi_decoder_rejects_cache_instead_of_silently_ignoring_it():
         decoder(input_ids=torch.tensor([[1, 2]]), past_key_values=object())
     with pytest.raises(ValueError, match="position_ids"):
         decoder(input_ids=torch.tensor([[1, 2]]), position_ids=torch.arange(3)[None])
+
+
+def test_kimi_moe_layer_selection_matches_configured_dense_prefix_and_frequency():
+    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.model import KimiTextDecoder
+
+    config = KimiLinearConfig(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=12,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_experts=4,
+        num_experts_per_token=2,
+        moe_intermediate_size=12,
+        first_k_dense_replace=1,
+        moe_layer_freq=2,
+        linear_attn_config={
+            "kda_layers": [1, 2, 3, 4],
+            "full_attn_layers": [],
+            "head_dim": 4,
+            "num_heads": 2,
+            "short_conv_kernel_size": 3,
+        },
+    )
+    model = KimiTextDecoder(config)
+    assert [hasattr(layer, "block_sparse_moe") for layer in model.layers] == [
+        False,
+        False,
+        True,
+        False,
+    ]

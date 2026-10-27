@@ -112,3 +112,46 @@ def test_kimi_router_accepts_noncontiguous_and_empty_batches(empty):
     actual.sum().backward()
     assert torch.isfinite(base.grad).all()
     assert all(p.grad is not None for p in model.experts.parameters())
+
+
+@pytest.mark.parametrize("width", [0, -1, True, 1.5])
+def test_kimi_rejects_invalid_latent_expert_width(width):
+    with pytest.raises(ValueError, match="routed_expert_hidden_size"):
+        KimiLinearConfig(routed_expert_hidden_size=width)
+
+
+@pytest.mark.parametrize(
+    "field", ["num_experts", "num_experts_per_token", "num_expert_group", "topk_group"]
+)
+@pytest.mark.parametrize("value", [True, 1.0, 0, -1])
+def test_kimi_router_rejects_invalid_integer_configuration(field, value):
+    from llmtuner.models.kimi.moe import KimiMoEGate
+
+    settings = dict(
+        hidden_size=8,
+        num_experts=4,
+        num_experts_per_token=1,
+        num_expert_group=1,
+        topk_group=1,
+    )
+    settings[field] = value
+    config = KimiLinearConfig(**settings)
+    with pytest.raises(ValueError, match=field):
+        KimiMoEGate(config)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("moe_layer_freq", 0),
+        ("moe_layer_freq", -1),
+        ("moe_layer_freq", True),
+        ("moe_layer_freq", 1.5),
+        ("first_k_dense_replace", -1),
+        ("first_k_dense_replace", True),
+        ("first_k_dense_replace", 1.5),
+    ],
+)
+def test_kimi_rejects_invalid_moe_layer_selection(field, value):
+    with pytest.raises(ValueError, match=field):
+        KimiLinearConfig(**{field: value})
