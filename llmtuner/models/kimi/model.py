@@ -81,7 +81,12 @@ class KimiMLP(nn.Module):
         self.situ = config.hidden_act == "situ"
         self.act_fn = (
             SituGLU(
-                config.activation_situ_beta or 1.0, config.activation_situ_linear_beta
+                (
+                    1.0
+                    if config.activation_situ_beta is None
+                    else config.activation_situ_beta
+                ),
+                config.activation_situ_linear_beta,
             )
             if self.situ
             else ACT2FN[config.hidden_act]

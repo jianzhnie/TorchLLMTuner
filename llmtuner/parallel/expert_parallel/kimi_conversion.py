@@ -80,7 +80,14 @@ def convert_kimi_block(
     local_count = count // size
     start = rank * local_count
     activation = (
-        SituGLU(config.activation_situ_beta or 1.0, config.activation_situ_linear_beta)
+        SituGLU(
+            (
+                1.0
+                if config.activation_situ_beta is None
+                else config.activation_situ_beta
+            ),
+            config.activation_situ_linear_beta,
+        )
         if config.hidden_act == "situ"
         else SwiGLU()
     )

@@ -72,7 +72,9 @@ class ProfilerConfig:
     """How many iterations to skip before the schedule starts."""
 
     profiler_skip_first_wait: int | None = None
-    """How many waits to skip at the start of the first cycle."""
+    """Skip the first cycle's wait when nonzero; 0 keeps it.
+    None uses torch.profiler.schedule's default (0). Later cycles still wait.
+    """
 
     profiler_active: int = 1
     """Iterations the profiler is active for, per cycle."""

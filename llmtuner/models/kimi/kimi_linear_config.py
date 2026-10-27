@@ -113,6 +113,12 @@ class KimiLinearConfig(PretrainedConfig):
         if self.moe_router_activation_func not in ("softmax", "sigmoid"):
             raise ValueError("moe_router_activation_func must be softmax or sigmoid")
         self.moe_intermediate_size = moe_intermediate_size
+        for name, value, minimum in (
+            ("first_k_dense_replace", first_k_dense_replace, 0),
+            ("moe_layer_freq", moe_layer_freq, 1),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
         self.first_k_dense_replace = first_k_dense_replace
         self.moe_layer_freq = moe_layer_freq
         self.use_grouped_topk = use_grouped_topk
@@ -125,6 +131,14 @@ class KimiLinearConfig(PretrainedConfig):
         self.activation_situ_beta = activation_situ_beta
         self.activation_situ_linear_beta = activation_situ_linear_beta
         self.max_position_embeddings = max_position_embeddings
+        if routed_expert_hidden_size is not None and (
+            not isinstance(routed_expert_hidden_size, int)
+            or isinstance(routed_expert_hidden_size, bool)
+            or routed_expert_hidden_size <= 0
+        ):
+            raise ValueError(
+                "routed_expert_hidden_size must be a positive integer or None"
+            )
         self.routed_expert_hidden_size = routed_expert_hidden_size
         self.topk_method = topk_method
 
