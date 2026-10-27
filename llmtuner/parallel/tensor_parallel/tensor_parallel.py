@@ -57,7 +57,7 @@ from ...accelerator.capabilities import has
 from ...models.common.moe.experts import GroupedExperts
 from .. import compatibility
 from ..attention_heads import require_heads_divisible_by
-from ..module_patterns import module_name_matches
+from ..module_patterns import module_name_matches, resolve_module_patterns
 from .linear_ops import (
     AllGatherLinear,
     LinearReduceScatter,
@@ -705,6 +705,14 @@ def resolve_tp_targets(
         )
     raw_plan = model_tp_config(model) if plan is None else plan
     if configured_plan:
+        # Pipeline assembly validates against the complete model before split:
+        # an override may intentionally select only another stage's modules.
+        if cfg.pp_size == 1:
+            resolve_module_patterns(
+                [name for name, _ in model.named_modules()],
+                patterns=list(configured_plan),
+                plan_name="TP override",
+            )
         # Matching uses the first pattern; explicit overrides must come first.
         raw_plan = {
             **configured_plan,
