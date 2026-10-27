@@ -25,6 +25,18 @@ class CheckpointLoadPlanner(DefaultLoadPlanner):
         # A flat planner otherwise shares this dictionary with its caller.
         self.state_dict = dict(self.state_dict)
         self.compiled_destinations: dict[str, str] = {}
+        # Older synthetic loaders stored one shared cursor. Map that scalar to
+        # this rank's destination; new rank-qualified checkpoints remain strict.
+        steps_key = f"{DATALOADER}.steps"
+        if steps_key in saved_keys and self.flatten_state_dict:
+            for key in list(self.state_dict):
+                if key.startswith(steps_key + "."):
+                    self.state_dict[steps_key] = self.state_dict.pop(key)
+                    self.mappings[steps_key] = self.mappings.pop(key)
+                    logger.warning(
+                        "Legacy synthetic checkpoint has one shared cursor; "
+                        "rank-local positions cannot be recovered."
+                    )
         saved_names: dict[str, str] = {}
         for saved_key in saved_keys:
             name = canonical_fqn(saved_key, wrapper_segments=("_orig_mod",))
