@@ -1744,3 +1744,121 @@ decay，并允许短 schedule 在末值继续；llmtuner 保留默认恒定 lr�
 两者沿用 optimizer 更新后推进调度与虚拟末 step。CPU 标量/tensor lr 恢复已有
 单测，设备 capturable/fused 及 host 缓存性能不能由此推断；本轮无行为迁移。
 参见 `docs/file_review.md` 的 `OPTIMIZER-SCHEDULE-RESTORE-REVIEW-04`。
+
+### Profiler 生命周期适配（第138批）
+
+第138批适配：保留上游 iteration_<step>/rank<rank>_trace.json.gz 命名；
+同step退出回调另写 iteration_<step>_exit，避免覆盖完整cycle。Trainer在纯本地
+profiler初始化与step外围协调失败，ExitStack释放已启动句柄；通用Profiler不
+隐式加入collective。CPU/Gloo证据见 docs/file_review.md，设备profiling仍待验收。
+
+
+### FSDP 归约 dtype 配置补充
+
+本地 torchtitan 的 `config/configs.py::Training.mixed_precision_reduce`
+将 BF16/FP32 选择传至 `distributed/fsdp.py` 的 MixedPrecisionPolicy。
+本仓库对应 `FSDPConfig.fsdp_reduce_dtype`，位于并行策略层，默认 FP32，
+由 `apply_fsdp` 同时传至 decoder/pattern 计划及 native/custom 引擎。
+另提供显式 FP64 归约用于高精度模型与诊断；该选项超出上述上游 Literal，
+不得宣称上游已提供相同 FP64 配置。参数 dtype 继续取模型实际 dtype。
+
+### AC wrapper 的模式保持（第 187 批）
+
+`wrap_full` / `wrap_selective` 使用 PyTorch checkpoint wrapper 后，额外继承原
+block 的 `training` 标志。直接赋值避免递归 `train()` 重置混合子模块模式；
+参数身份与冻结状态保持。这是本仓库对 wrapper 默认 training=True 的适配，
+不改变上游 checkpoint 策略或默认训练模式。
+
+### 训练 GC 生命周期的本地失败协调（第200批）
+
+`trainer/trainer.py::train` 在 GC helper 初始化与周期 `run` 外增加
+`synchronize_local_errors`。这是本仓库对 rank 局部 GC/日志异常的适配：先让
+所有 rank 同意本地阶段成功，再进入下一次数据或模型通信。helper 本身沿用
+`tools/utils.py` 的显式收集思路，并维护本仓库的进程级 GC owner 恢复契约。
+默认非 debug GC 阶段不包含 collective；此协调不承诺通信故障恢复。
+真实两 rank OSError/KeyboardInterrupt/SystemExit 的 owner/peer 传播与清理见
+`training_profiler_coordination.py` 和 `docs/file_review.md` 第200批。
+
+### tokenizer 序列长度策略（第204批）
+
+`components/tokenizer/huggingface.py` 加载 backend 后显式关闭序列 padding 与
+truncation。原始样本编码和 renderer offsets 保留完整内容，长度及补齐由
+processor/packing/collator 负责；避免继承 tokenizer.json 的批处理策略造成
+训练 token 静默丢失或 pad 标签参与监督。BOS/EOS 的显式添加策略保持原契约。
+
+保存了非空 padding/truncation 策略的 tokenizer.json 会在 corpus fingerprint
+中加入编码语义版本。相同文件由旧行为生成的 checkpoint 数据游标不可精确恢复，
+会按既有 data_identity 校验拒绝；需要旧数据流时使用旧实现，需要新行为时应
+显式重新开始数据迭代，不能通过改写 checkpoint fingerprint 伪装等价恢复。
+未配置这些策略的资产保持既有 identity，避免无关 checkpoint 被整体失效。
+
+### 多模态标记原子编码适配（MM-TOKEN-ATOMICITY-208）
+
+`components/tokenizer/multimodal.py` 为基础词表中未注册匹配规则的视觉标记
+注册 AddedToken（保留 ID，normalized=False），保留已有显式匹配与解码元数据。
+构造时验证重复标记及连续视觉标记的编码，拒绝不满足契约的配置。
+这是对本仓库字符串占位符处理路径的修复，未据此宣称上游存在相同缺陷。
+多模态 corpus identity 使用 `atomic-markers-bounded-packing-v2` 语义版本；旧多模态游标需使用
+旧实现精确恢复，切换新实现须显式重启数据迭代，不得伪造指纹继续旧游标。
+文本数据指纹不因该适配变化。该版本对多模态数据采用保守失效策略，即已有
+注册标记的资产也需要重启数据迭代。
+
+多模态 whole-document packing 同时按 context window 和 packed row 容量过滤，
+不拆分视觉token与patch对应关系。v2也拒绝v1游标：batch容量小于context时，
+旧图可能在部分有效批次后遇到超长文档失败，新图会过滤该文档，迭代语义不同。
+文本FirstFit可拆分文档，另按其自身契约审查，不直接套用多模态过滤策略。
+
+### 文本 FirstFit 分块容量适配
+
+`datasets/packing/build.py` 的文本 FirstFit 将分块上限设为 context 与 packed row
+容量的较小值，完整保留输入和目标，不沿用多模态的超限整文档过滤。
+`corpus_data_identity` 为文本 FirstFit 添加 `bounded-first-fit-v1` 语义标记，
+防止旧图的 pending chunk offset 用于不同的分块边界。所有旧 FirstFit 指纹均
+保守失效；精确恢复须旧实现，切换新实现需显式重启数据迭代。ConcatThenSplit
+不因本次修改而改变指纹。该修复针对本仓库的context与batch可独立配置接口，
+未据此推断上游存在同样问题。
+
+多模态五种标记须使用不同字符串，避免图像/视频/边界/padding角色重叠。
+`MultimodalTokenizer` 在注册视觉匹配规则前拒绝角色重复。此项收紧非法配置
+校验，不改变有效配置的token流或持久化格式；旧配置若复用标记，须改用模型
+实际支持的独立标记及对应词表ID，不能直接重新分配既有模型的词表含义。
+
+多模态标记不仅字符串须不同，加载后的五个词表ID也须互异。tokenizer.json可能
+包含不同字符串共享ID的损坏词表，且后端仍可对它们分别原子编码；因此在注册
+匹配规则前单独校验ID，不能依靠原子编码检测该问题。有效资产的行为不变。
+
+### checkpoint日志失败传播
+
+`Trainer.train` 的正常step保存结果日志放入 `Training checkpoint reporting`
+本地错误协调区间，避免单rank日志sink异常使其他rank进入validation或下一步
+collective。`checkpointer.save` 可通信，必须保持在该本地区间之外；所有rank均
+进入报告协调，即使某rank没有日志可写。此项不声称通信自身失败后可以恢复进程组。
+
+训练恢复成功、数据耗尽、提前结束保存的报告也分别使用本地错误协调。
+数据耗尽时先回退未完成step，再输出warning；日志失败不应保留虚假的完成计数。
+load/save仍在协调区间之外。本次只保证进入报告边界后的本地失败传播，不覆盖
+checkpoint后端内部通信失败或第三方logger含collective的非本地实现。
+
+### checkpoint加载本地报告与GC边界
+
+`BaseCheckpointManager.load` 对开始日志、加载后GC、完成日志分别协调本地错误；
+实际后端加载可通信，保持在这些区间之外。开始日志失败时不进入加载；加载后
+GC/日志失败时已恢复的状态保留，所有rank一起抛错，调用方可处理后重试。
+这不提供后端加载中途失败的事务回滚，也不保证通信故障后的进程组可恢复。
+
+Trainer异常清理的日志属于尽力报告：logger本身失败不得阻断其余资源释放，
+也不得替换首个资源关闭错误或已有训练错误。失败资源仍遵循原有所有权保留及
+重试规则。仅在处理已有异常的报告位置抑制日志异常，正常路径日志错误仍传播。
+
+
+### 参数组选项的显式校验（第254批）
+
+当前本地torchtitan HEAD `01b1b69e3881397db5dcd4f96d3c5ffa6a79384d` 的
+`components/optim/optimizer.py` 使用各optimizer配置字段表达更新选项。本仓库保留
+`ParamGroupConfig.optimizer_kwargs` 字典入口，但PyTorch会将未知group键视为额外
+metadata，拼错的学习率或衰减选项因而可能静默失效。
+
+本仓库在inner optimizer构造后按其实际`defaults`检查字段，显式保留
+`params`、`param_names`和scheduler的`initial_lr`，未知更新选项在初始化阶段报错。
+校验复用既有局部错误协调边界，无新增collective或更新行为。CPU Adam/AdamW及
+四rank PP2×DP2非对称错误验证见台账254批；不代表目标设备或完整恢复验收。

@@ -177,7 +177,7 @@ efsdp = dp_shard × cp × tp / ep
 | 维度 | FSDPTurbo | TorchLLMTuner |
 |---|---|---|
 | 选层 | 用户提供模块通配符和逐模块 plan | 默认 HF decoder 分层；可用 `fsdp_apply_modules` 选择 pattern 单元及逐单元覆盖 |
-| 忽略参数 | `ignored_modules`/`ignored_params` | `fsdp_ignored_modules` 排除完整子树；EP 参数使用 placement callback |
+| 忽略参数 | `ignored_modules`/`ignored_params` | `fsdp_ignored_modules` 排除完整子树；融合 EP 转换后重绑原模块路径与参数引用，EP 参数使用 placement callback；CPU 参数归属验证不代表自动同步排除参数梯度 |
 | 实现后端 | native 或 custom fine-grained FSDP | native 或适配 PyTorch 2.14 的 custom 参数组/state/hook；设备验证仍有缺口 |
 | dtype | 配置显式提供 param/reduce/output dtype | 参数 dtype 来自模型构建，reduce 固定 FP32；混合参数 dtype 明确拒绝 |
 | prefetch | 可配置前后预取层数 | 支持显式窗口并按共享 state 去重；decoder EP 在 count=0 时默认相邻单元 |
@@ -324,7 +324,8 @@ TorchLLMTuner 先 probe HF MoE block，再转换为公共 MoE 实现：
 - aux-loss 在训练 forward 注入梯度；optimizer pre-hook 汇总指标，并执行
   sign-based 或 quantile bias 更新；
 - checkpoint adapter gather/load 逻辑专家张量，使恢复不绑定物理 EP shard；
-- TP × EP 的 expert feature shard 和 sequence boundary 有独立实现。
+- EP>1 时 TP 将专家处理交给 EP，专家按数量维分片并消费本地序列；
+  EP=1 的特征维 TP 则使用序列 gather/reduce-scatter 边界，两者不能混为同一布局。
 
 审查结果：
 
@@ -396,7 +397,7 @@ PP split
 | TP × FSDP | 已实现，待目标设备验证 | 有多进程等价性测试 |
 | CP × TP | 已实现，待目标设备验证 | 联合 sequence 整除和 loss mesh |
 | EP × FSDP | 已实现，待目标设备验证 | sparse mesh 与 expert placement |
-| TP × EP | 已实现，待目标设备验证 | expert feature shard 与 boundary |
+| TP × EP | 已接线，SGD限定CPU参考通过；多轴AdamW验收开放 | EP>1按专家数量分片；EP1特征分片为另一布局，fixed router的CPU DP2×TP2完整恢复已通过，设备及其他轴组合仍需验收 |
 | PP × TP/CP/EP/FSDP | 已接线 | 各 stage 使用相同 stage order；设备组合测试按环境运行 |
 | TP × EP × CP | 已接线 | mesh 与输入/loss 路径完整；依赖支持的模型和设备 |
 
@@ -444,6 +445,8 @@ PP split
 | root MoE TP2 全参数梯度与更新 | `tp_moe_equivalence.py` 默认 FP32 router 与 `--router-fp64`，两 rank CPU/Gloo、FP64 专家与 shared MLP；首次/重复 apply_tp，生产 Trainer 复制梯度归约、一次 SGD | 独立手动分片图比较输入及全部参数梯度和更新；FP64 router 额外比较 dense router 梯度；FP32 partial/dense 的舍入差异保留；非完整 HF/FSDP/AC/设备验证 |
 | PP 验证日志失败传播 | `pp_real_corpus_equivalence.py`，PP2/native 两 rank 与 PP2×KV-CP2/custom 四 rank、1F1B、packed corpus | 正常有限验证对照完整模型；末阶段 sink 失败传给所有 stage，module 模式/CPU RNG 精确恢复，后续 barrier 成功；CPU SDPA 替代 attention，不证明设备或其他 schedule |
 | MoE balancing hook | `quantile_bias_equivalence.py`，4 rank，DP×CP、DP×TP 有/无 EP；真实 optimizer hook 更新 bias 与清理统计 | 独立 rank 求和参考；包含大整数 histogram；未执行 Trainer 装配、router forward 或参数更新 |
+| Quantile完整Trainer恢复（批次117） | `trainer_ema_process_resume.py corpus async dp2 ac validate moe ep2 quantile`，native/custom FSDP，真实DeepSeek-V3 sigmoid router、EP2、full AC、动态EMA；连续/初始/恢复三个独立作业，七类状态及本地布局精确 | CPU/Gloo；bias非零且持久化、histogram非持久且清零、验证隔离；不证明compile、其他轴、目标设备或拓扑变化 |
+| Quantile编译恢复（批次118） | 上述命令追加compile，native/custom各三个独立作业；生产aot_eager图数断言与完整状态比较通过 | CPU/Gloo；不证明eager/compile算术等价、Inductor、其他轴或目标设备 |
 | MoE AC 与编译 | CPU 单测 full/selective，多 outstanding forward、不同/无 mask；Dynamo eager 比较输出和梯度 | 回放保存对应 mask、抑制重复统计，异常清理；未验证 Inductor、region 或设备并行编译 |
 
 执行集成脚本时设置 `PYTHONPATH=.`，用文档所列 rank 数启动。当前 macOS
@@ -1195,8 +1198,8 @@ FIXED-ROUTER-ENTRY-01 记录公开转换API在模型修改前复用配置校验�
 现扩展aux系数0/0.03共32场景，验证无aux时gate.grad=None、SGD保持gate不变。
 另四rank DP shard4/EP2/efsdp2、native/custom FSDP各一次真实backward，
 独立HF专家算式的loss/专家梯度1e-4检查通过，router无梯度且mesh归属正确。
-不覆盖TP复制梯度、设备、FSDP多步或恢复；EP1/TP1已启用本地固定路由并扩展至48场景；EP1/TP>1当前明确拒绝，
-特征分片适配仍开放，详见FIXED-ROUTER-EP1-01与FIXED-ROUTER-EP1-TP-01。
+该历史证据不覆盖TP复制梯度、设备、FSDP多步或恢复；EP1/TP1已启用本地固定路由。
+批次108补齐EP1/TP2完整Trainer的CPU恢复证据并移除原公开配置限制；目标设备仍待验收。
 
 
 Fixed router EP1 的完整 Trainer 恢复证据见 FIXED-ROUTER-TRAINER-RESUME-01：
@@ -1425,3 +1428,347 @@ AdamW因素对照（`TRAINER-TRIAXIS-ADAMW-FACTOR-CONTROLS-17`）中，关闭AC
 保持原aux专家差异不变；关闭aux后full/none均在首步k_proj单元素失败，
 误差2.44e-6。AC不是当前首步差异的必要条件，aux不是整体失败的唯一来源。
 三组控制均未验收通过，未修改原容差或以控制替代原组合要求。
+
+
+Q/K梯度精度归因（`TRAINER-TRIAXIS-LOCAL-WGRAD-ROUNDING-25`）：native/
+custom在noaux/none AC/显式FP32 gate参考下，两层Q/K梯度均与独立局部
+`dy.T@x→FP32→CP sum→FP64→累积`公式零差。不能用完整梯度最后舍入
+替代该契约。原完整HF AdamW权重断言仍失败，专家、aux/full及后续步验收开放。
+
+### 当前训练与恢复证据补充（批次 38–50）
+
+以下是限定场景的实测结果。历史诊断按发生顺序保留，本表不将局部通过升级为
+完整组合或目标设备验收；各命令、日志和失败记录见 `file_review.md` 对应 ID。
+
+| 场景 | 路径与配置 | 当前结果 | 未覆盖边界 |
+| --- | --- | --- | --- |
+| PP2 × KV-CP2，1F1B | 四 CPU/Gloo rank，native/custom FSDP，累积2、4 microbatch、4步 AdamW | 两实现通过原1e-5容差；最大梯度误差5.576e-8，参数4.389e-6（49） | DP shard=1；无TP/EP、EMA、恢复、compile |
+| PP2 × KV-CP2，Interleaved1F1B | custom FSDP，每rank2个part、6层，其余同上 | 最大梯度误差4.284e-8，参数5.452e-6；通过（50） | 同上；不外推至native多part场景 |
+| PP2 × KV-CP2，ZBVZeroBubble | custom FSDP，V布局首尾stage同rank，每rank2个part | 最大梯度误差8.900e-8，参数9.930e-6；通过但接近1e-5阈值（50） | 同上；未证明其他dtype或模型精度 |
+| DDP/native/custom FSDP随机恢复 | 两CPU rank，sync/async，真实AdamW、scheduler、EMA与dropout | 保存边界及后续两步状态精确；保留rank局部失败协调回归（38–39） | 同进程新运行时，无Trainer/loader、拓扑变化 |
+| 完整Trainer跨进程恢复 | 单CPU/eager，Qwen3，synthetic或本地JSONL/Grain，动态间隔EMA | 三独立进程；更新前七类状态、最终状态及独立EMA公式精确（40–42、48） | 无多rank/多轴、compile、设备内核；语料为生成fixture |
+| 完整Trainer从异步源恢复 | 本地JSONL/Grain，interval1；初始运行至3步，明确恢复异步第2步 | 首次更新前及后续至4步完整状态精确，实际future存在（44） | 最终保存仍同步；无pinned-memory、崩溃耐久性验证 |
+
+PP×CP三行均使用显式CPU dense-mask SDPA替代attention计算；CP序列分片、
+KV通信/autograd、PP调度与Trainer装配仍为生产实现。这些结果不能证明生产
+flex内核正确性或通信重叠性能。
+
+完整Trainer恢复的七类状态为模型、optimizer、scheduler、EMA、loader、trainer
+和解码后的RNG；检查恢复后的首次更新前边界，避免只比较最终权重掩盖漏载。
+EMA另外用独立半衰期及lerp公式核对，避免两条轨迹同时未更新却误判一致。
+
+#### AdamW三轴诊断的当前边界
+
+前述15–25为历史诊断。后续参考修正为生产FP32 router、FP32 CE、共享softmax
+及独立aux公式；Q/K和专家的首步局部梯度重放与生产结果可精确一致，专家输入
+身份检查拒绝重复行歧义（详见台账26–36）。这解释了部分数值契约差异，尚未
+建立完整多步独立参考：aux/full AC的完整HF权重比较仍在专家 `w1_EFD` 上以
+原1e-6容差失败，最大差异约2.0208e-6。局部重放使用生产边界顺序/计数，不能
+替代完整独立参考；TP2×KV-CP2×EP2的生产AdamW验收继续保持开放。
+
+
+### 三轴独立 FP32 归约参考（批次115）
+
+三轴数值补充（批次115）：`triaxis_rounded_reference.py` 使用独立dense参考，
+将QKV与专家权重梯度按CP token半区计算并执行FP32求和，QKV还按TP特征半区
+计算。CPU/Gloo TP2×KVCP2×EP2、native/custom FSDP、full AC、aux.01、AdamW
+三步训练在原1e-6容差下通过，包括梯度、权重、optimizer、scheduler和EMA。
+该参考不读取生产梯度；默认HF参考仍保留失败，不能混称两种算术契约。
+此证据限定固定拓扑和CPU替代attention，不证明位级等价、目标设备或完整恢复；
+问题15仍待参考契约审定及其余范围验收，详见逐文件台账。
+批次116另通过native无aux/无AC、native有aux/无AC，以及未启用激活诊断hook
+的native有aux/full AC、custom无aux/full AC；均为三步原容差比较。参考入口
+明确拒绝非连续TP2/KVCP2/EP2配置，并要求显式选择FP32 router参考。
+
+### Fixed router 特征 TP：实现进展与公开边界（批次 59–75）
+
+批次59–75期间 `ParallelConfig` 拒绝 fixed_router=True、EP=1、TP>1；
+批次108通过公开Trainer的CPU DP2×TP2完整流程后移除该限制。
+下表前六行仍是低层机制证据，不能单独证明完整训练；未列出的轴为1，
+前六行环境为CPU/Gloo、FP64。目标设备及未运行组合仍待独立验收。
+
+| 路径 | 已取得证据 | 保留边界 |
+| --- | --- | --- |
+| HF→原生 MoE 特征 TP 转换 | 保留序列 gather/SUM reduce-scatter、padding、专家特征分片及 checkpoint 名称；两 rank TP2，288种 eager 场景对照独立 FFN 公式 | 显式构造共享 MLP，非真实家族完整训练 |
+| 辅助损失 | 按 gathered token 副本数缩放梯度，metric保持原值；aux0/.03、混合/全padding、AC验证 | 非多轴SPMD统计验收 |
+| 生产 compile 入口 | whole-model/per-block aot_eager各12场景；实际生成图，数值、更新、状态验证通过 | 非Inductor/目标设备；早期裸块测试遗漏MoE发现契约，失败记录保留 |
+| 新运行时 DCP 恢复 | AdamW、scheduler、EMA、RNG，AC×compile×sync/async八场景；更新前与后续两步逐位一致 | 同OS进程新运行时，无Trainer/loader状态、新OS进程或拓扑变化 |
+| Native FSDP×TP | 四rank DP2×TP2；上述八场景恢复通过 | decoder局部分片，不证明完整Trainer计划或独立dense缩放等价 |
+| Custom FSDP×TP | 双hook上下文，以及pattern入口配置前后向prefetch窗口2，八场景恢复通过；EMA逐参数独立公式 | 不证明任意窗口、真实通信重叠或性能 |
+| 完整 Trainer（批次108） | 四rank DP2×TP2、EP1、Qwen3 fixed MoE aux.03、真实Grain packing、async、每step验证；native eager及native/custom full AC+aot_eager，连续/初始/恢复三个独立OS作业，七类状态与local shard精确，EMA独立公式 | CPU；不证明完整模型独立dense梯度参考、PP/CP、拓扑变化、Inductor或设备性能 |
+
+测试入口为 `tests/integration_tests/fixed_router_tp_equivalence.py`（默认eager，
+可加 `--compile` 或 `--fullgraph`）及 `fixed_router_tp_checkpoint.py`
+（默认两rank TP2，可用四rank `--fsdp`，custom再加 `--custom-fsdp`）。
+命令、失败与最终日志详见 `file_review.md` 对应批次；恢复一致性不替代独立训练
+数值参考。EMA混合Tensor/DTensor更新按类型和布局分组，避免foreach类型混用。
+
+批次108已补齐真实Trainer、模型家族、数据管线、完整状态和独立进程恢复的
+上述CPU证据；声明设备与dtype仍需验收。三轴AdamW开放项、
+MC2设备数值、KCP及Domino设备/性能缺口不因本节局部通过而关闭。
+
+### 完整 Trainer 的分布式新进程恢复补充（批次 84–85）
+
+`trainer_ema_process_resume.py corpus [async] dp2 [custom]` 使用三个独立
+两rank作业，分别连续训练、生成checkpoint和恢复续训。CPU/Gloo、Qwen3、
+本地JSONL/Grain packing；原生与自定义FSDP各sync/async两场景通过。
+每rank七类状态在加载边界及续训后逐位一致，动态EMA有独立公式断言，
+实际DTensor分片必达；custom额外验证FineGrainedFSDPState。
+日志与命令见 `docs/file_review.md` 批次84–85。
+
+该证据补齐单轴DP2的完整Trainer新进程恢复，不覆盖TP/CP/EP/PP组合、
+compile、设备、拓扑变化、任意hook迁移或prefetch窗口。前文单rank历史
+证据的范围保持原样，不能将低层多轴恢复与此项拼接为完整多轴验收。
+
+批次86追加 `compile` 选项：native/custom FSDP各在CPU aot_eager完整模型
+编译及异步保存下，通过三个独立DP2作业恢复；每个worker强制编译图数大于零，
+七类状态及动态EMA公式精确。仅证明各自编译运行的连续/恢复一致，不证明
+eager/compile算术等价、Inductor或设备内核。日志见审查台账批次86。
+
+批次87补充上述native/custom DP2编译异步恢复的本地布局比较：模型、optimizer、
+EMA每个DTensor的local tensor、global shape/stride、placements和mesh均在
+加载边界及续训后精确一致；完整值比较同时保留。该快照只用于测试，训练
+checkpoint格式不变，也不构成拓扑变化恢复的证据。
+
+批次88追加 `ac`，native/custom FSDP DP2均通过full AC＋aot_eager＋异步
+完整Trainer新进程恢复；实际两个CheckpointWrapper及编译图必达，七类状态与
+本地布局精确。范围仍为CPU同拓扑DP2；不宣称AC性能、其他策略或多轴已验收。
+
+批次90追加 `validate`：每个训练step后执行两批真实验证，在native/custom
+FSDP DP2＋full AC＋aot_eager＋async组合下，各三个独立作业完整恢复通过。
+每次验证前后直接比较七类训练状态及本地布局，均未改变；不是仅比较两个
+可能同样错误的恢复结果。范围为dense Qwen3/CPU默认RNG流，不扩展到MoE、
+PP、设备stream、私有generator或并发Trainer隔离。
+
+批次91以 `moe` 选项覆盖Qwen3 MoE（4专家/top2、aux0.03、fixed router EP1）。
+native/custom FSDP DP2＋AC＋aot_eager＋异步保存＋每step验证的完整新进程恢复
+通过；每次验证不改变七类训练状态、本地布局或两个非持久token计数。仅EP1，
+不能推广EP>1或quantile router。测试launcher显式使用loopback rendezvous，
+规避本机FQDN被解析至代理网段的环境问题。
+
+批次92追加 `ep2`：生产EP2与DP shard2在两rank拓扑重叠（efsdp1），
+不是四rank独立DP×EP。native/custom FSDP、full AC、aot_eager、异步保存、
+每step验证的完整Trainer新进程恢复通过；实际专家分片及EP通信组必达。
+恢复一致性不能替代独立dense算术参考，也不证明efsdp>1或其他并行轴。
+
+批次93使用 `dp4 ep2` 补充efsdp2：三个独立四rank完整Trainer作业，
+native/custom FSDP各在AC＋aot_eager＋async＋每step验证下恢复精确。
+专家实际DTensor mesh2及本地半分片必达；dense DP shard4、EP2、efsdp2，
+TP/CP/PP均1。该恢复证据不替代独立dense梯度和更新等价验证。
+
+批次94修正验证快照的普通Tensor别名：此前只有DTensor路径clone，普通Tensor
+原地修改可能漏报。现在所有张量独立复制，并在每个worker实际修改/恢复活参数
+验证快照检测能力；单rank及custom EP2×efsdp2编译完整恢复复跑通过。90–93的
+普通Tensor验证隔离声明应结合本项限制理解，不能仅凭旧快照认为完全已验证。
+
+### EMA 本地更新后的恢复复验（批次242）
+
+CPU/Gloo、custom FSDP、MoE fixed router/aux0.03、full AC、aot_eager、
+动态 EMA、每步验证和异步中间 DCP 下，以下组合重新通过三个独立作业的
+加载边界完整状态与连续训练终态精确对照：
+
+| rank 数 | dense DP shard | TP | EP | expert FSDP | EMA 通信计数 |
+| --- | --- | --- | --- | --- | --- |
+| 4 | 2 | 2 | 1 | 2 | 批次245复跑每次调用实测 0 |
+| 4 | 4 | 1 | 2 | 2 | 每次调用实测 0 |
+
+EP 场景新增 `CommDebugMode` 包围实际 `EMA.step()`，并检查逐步调用序列；
+统计不包含 Trainer 外层错误协调及 checkpoint 通信。完整状态、布局、动态
+EMA 公式和验证隔离断言均保留。命令、日志和产物见审查台账242批。
+批次245在新增验证 RNG 进入错误协调后，复跑上述 DP2×TP2 全组合，加载
+边界与续训终态仍精确一致，并补齐 TP 场景每次 EMA 更新通信计数为 0。
+批次249在当前 RNG/Grain 游标修复后，以真实本地 JSONL、tokenizer 和 Grain
+concat packing 再跑 DP2×TP2 的 custom/full AC/aot_eager/EMA/验证/async DCP
+组合。四 rank 在新进程加载边界及续训终态的七类状态和本地布局均零容差一致，
+实际 EMA 每次更新通信计数为 0；命令与产物见审查台账249批。
+此证据不覆盖 TP2+EP2 同时启用、CP/PP、CUDA/NPU、拓扑变化或独立 dense
+训练算术等价；不能把两个场景合并为三轴恢复证明。
+
+### FirstFit×PP完整加载边界（批次253）
+
+`trainer_ema_process_resume.py dp4 pp2 custom compile ac validate async first_fit`
+在CPU/Gloo四rank、DP shard2×PP2、Interleaved1F1B四stage/四microbatches下通过。
+六层dense Qwen3、custom FSDP、full AC、aot_eager、动态EMA、每步验证与真实FirstFit
+共同启用；四rank恢复step2后首次更新前的七类状态及本地布局与保存点精确一致，
+step4完整终态与连续训练零容差一致。实际EMA每次更新通信0，独立动态公式通过。
+
+本项通过Trainer生产构造及train循环，不是252批实际CLI含seed导入配置的同次
+边界证明。TP/CP/EP1，满chunk语料；不覆盖目标设备、其他schedule或拓扑变化。
+命令、产物和默认模式回归见台账253批。
+
+### CLI的FirstFit×PP×seed联合恢复（批次252）
+
+当前代码在CPU/Gloo四rank、DP shard2×PP2、Interleaved1F1B四stage/四microbatches、
+custom FSDP、full AC、async DCP、eager下，真实FirstFit语料结合step0模型导入通过。
+独立四rank边界检查确认seed43初始权重被未分片seed替换，非模型状态与CPU RNG不变；
+连续3步与先2步后新进程续训至3步的完整checkpoint零容差一致。
+
+该组合把143批seed×PP和216批FirstFit×DP的独立证据连接到同一实际CLI运行。
+step0是模型迁移；step2加载后首次更新前的完整状态未被本脚本比较。TP/CP/EP1，
+无EMA/validation/compile；不覆盖目标设备、余数packing或完整状态拓扑迁移。
+命令、端口及日志见台账252批。
+
+### FirstFit与quantile完整恢复补验（批次250）
+
+CPU/Gloo四rank、dense DP shard4/EP2/expert FSDP2、custom FSDP、DeepSeek-V3
+sigmoid quantile、真实Grain FirstFit、full AC、aot_eager、动态EMA、每步验证及
+async DCP组合通过连续/初始/恢复三个独立作业。加载step2后更新前完整状态与
+保存点精确一致，续训step4的七类状态及本地DTensor布局与连续训练零容差一致。
+实际expert bias非零、histogram不持久且更新后清空、验证隔离与EMA独立公式均通过，
+每次实际EMA更新通信计数为0。命令和产物见台账250批。
+
+TP/PP/CP均为1；FirstFit使用满chunk语料。此结果不覆盖目标设备、任意padding/
+余数窗口、独立dense训练算术等价、通信故障原地恢复或拓扑变化。
+
+### 非有限值更新保护的补充验证（批次132–133）
+
+`tests/integration_tests/trainer_nonfinite_update.py` 通过真实 Trainer、Qwen3
+模型、Adam、scheduler 和 EMA 检查单 rank 故障后的状态不变量。以下均为
+CPU/Gloo、full AC、aot_eager，native/custom FSDP 分别运行通过：
+
+| 配置 | ranks | 模型与故障目标 | 每种 FSDP 的故障场景 |
+| --- | --- | --- | --- |
+| DP shard2，TP/CP/PP/EP1 | 2 | dense；返回 loss NaN 或本地梯度 Inf | 4 |
+| DP shard2，TP2，CP/PP/EP1 | 4 | fixed-router MoE；loss NaN 或 routed-expert 梯度 Inf | 8 |
+| DP shard2，EP2，TP/CP/PP1 | 2 | fixed-router MoE；loss NaN 或 routed-expert 梯度 Inf | 4 |
+
+最后一行 EP 与 dense DP 共享两 rank，专家 FSDP 度数为1，不是四 rank 的独立
+DP×EP。每个 rank 都分别作为故障源；失败前已有非零 Adam moments 和 EMA
+历史。故障后模型、optimizer、scheduler、EMA 及本地分片精确不变，所有 rank
+都报非有限值，后续有限值步骤可更新权重与推进调度器。
+
+这是更新状态保护的证据，不是独立 dense 数值等价或完整恢复证明；不覆盖数据、
+RNG 和 step 回滚。CPU 断言后可继续运行不能推广到 CUDA 异步设备断言。CP、PP、
+设备内核、Inductor、其他路由器和 efsdp>1 的此类故障测试仍需单独验证。
+
+批次134补充 DeepSeek V4 HCA 的真实 Compressor Ulysses CP：DP shard2×CP2、
+四 rank、TP/PP/EP1，native/custom FSDP 均通过同类故障保护回归。本组为 eager、
+无 AC，未替换 attention kernel。每种实现覆盖所有四 rank 的 loss NaN 和 HF
+原生专家梯度 Inf，共16种故障及16次有限值后续更新；所有更新状态及本地分片
+保持原精确断言。本项不覆盖普通 HF Flex CP、KV AllGather、KCP、CSA/sliding
+混合层，亦不补足 CP 下 AC/compile、设备和完整恢复的其他验收要求。
+
+批次135补充 DP shard2×PP2 的真实 1F1B 调度（4 microbatches，四 rank）：
+native/custom FSDP 均在 eager、无 AC 下通过全部 rank 的 loss 标记和本地梯度
+非有限值测试，共16种故障及16次后续有限值更新。非末级 loss 测试明确针对
+有限性标记不变量：生产路径通常返回固定 sentinel，不代表复现了正常前向
+自行生成 NaN sentinel。旧逻辑只将该标记传到同一 PP 链，其他 DP 副本仍可
+更新；现在将 local loss 和 grad norm 合成后做一次 world MIN，保证统一拒绝。
+完整 CPU 回归及 custom FSDP 的 DP2×TP2、DP2×HCA CP2 故障回归亦通过。
+
+批次136在有限性归约改动后，复跑 DP shard2×PP2 的 Interleaved1F1B 完整恢复：
+四 rank、6层 dense Qwen3、每 rank 两个本地 parts、4 microbatches、full AC、
+aot_eager、async DCP、dynamic EMA。native/custom 各以独立 full/resume 作业
+运行通过，四 rank 的加载边界快照均存在且更新前比较无差异；最终参数、Adam、
+scheduler、EMA、trainer counters、RNG 和 synthetic loader 状态精确相等，续训
+loss 与连续训练逐位一致。证据包含实际编译图和各 local part 的编译检查。
+本项通过 Trainer 构造与 train_step 驱动既有恢复 harness，不等同于 CLI 主循环、
+真实语料、设备内核、Inductor 或其他 PP schedule 已一并验证。
+
+批次137扩展真实 CLI 恢复脚本 `cli_checkpoint_equivalence.py`：`pp2 async ac`
+使用 torch.distributed.run --module llmtuner 启动连续、提前结束、恢复三个独立
+四 rank 作业，DP shard2×PP2、Interleaved1F1B、4 microbatches、full AC、async
+DCP、eager。native/custom 均通过最终完整 checkpoint 精确比较，含全部四 rank
+解码后的 RNG、模型、Adam、scheduler、loader 和非零 trainer token 计数。
+该测试不替换 Trainer，也不通过 hook 调用 train_step；CLI main 实际调用 train，
+并负责进程组退出。EMA/validation/compile backend 仍是程序化配置，没有为本项
+测试添加 CLI 功能。默认单进程回归也通过；本项不提供 CLI 更新前加载边界快照，
+需结合136的独立边界检查理解，不能据此单独宣称完整恢复要求均已满足。
+
+### 补充验收：tied HF 权重导出（第 184–185 批）
+
+`tests/integration_tests/hf_tied_export.py` 使用生产 TP/FSDP 入口，将共享
+embedding/head 的微型 Llama 权重导出后交给标准 AutoModel 加载。
+
+| 环境 | TP | DP shard | FSDP | 文件数 | 结果 |
+| --- | --- | --- | --- | --- | --- |
+| CPU/Gloo，FP32，2 ranks | 1 | 2 | native/custom | 1/2 | 权重、共享身份、logits 精确匹配 |
+| CPU/Gloo，FP32，4 ranks | 2 | 2 | native/custom | 1/2 | 同上；TP 切片、FSDP 本地存储减半已断言 |
+
+所有场景 PP/CP/EP=1，无 AC/compile/EMA，仅验证权重导出和标准 HF 加载。
+配置由调用方另供；不代表完整训练恢复、TP 训练数值或目标设备验收。
+
+
+### 最近 optimizer/EMA 修改后的恢复复验（批次258–260）
+
+以下均为当前工作区、CPU/Gloo、custom FSDP、full AC、aot_eager、每step验证、
+async中间checkpoint及真实Grain数据（258–259为first_fit，260为concat）；
+连续、初始、恢复为独立OS作业。
+七类状态与本地DTensor布局在step2加载边界和step4终态精确一致，EMA另有独立公式。
+
+| 组合 | 实际机制 | 证据 |
+| --- | --- | --- |
+| 四rank DP2×PP2 | dense Qwen3，Interleaved1F1B，每rank两个parts | 第258批，`/tmp/llmtuner-pp-resume-258.log`，退出0 |
+| 四rank dense DP4、EP2/efsdp2 | DeepSeek-V3 sigmoid quantile，非零expert bias持久化、临时histogram清空及验证隔离 | 第259批，`/tmp/llmtuner-ep-resume-259.log`，退出0 |
+| 四rank DP2×TP2、EP1 | Qwen3 fixed MoE aux.03，实际专家特征分片；本项使用concat/Grain而非first_fit | 第260批，`/tmp/llmtuner-tp-resume-260.log`，退出0 |
+
+这是254–256批optimizer/EMA修改后的限定配置回归，不证明独立dense梯度等价、
+空EMA或全冻结PP stage、拓扑变化、其他轴组合、目标设备dispatcher及性能。
+完整命令和产物见`docs/file_review.md`；历史证据按原版本和范围保留。
+
+
+### Kimi HF实际Trainer复验（第279批）
+
+当前转换与错误协调实现经CPU/Gloo实际HF初始化、训练和导出验证：
+
+| dense FSDP | EP / expert FSDP | AC / compile | 结果 |
+| --- | --- | --- | --- |
+| custom dp_shard2 | 2 / 1 | none / eager | 原HF加载、导出逐key精确，logits 1e-6，继续更新通过 |
+| custom dp_shard4 | 2 / 2 | full / aot_eager | 同上；实际编译包装与非零图断言通过 |
+
+两场景均FP32、latent Kimi MoE、alltoall，TP/PP/CP为1。导出保持完整训练
+checkpoint文件哈希与运行时状态。命令、日志及产物见file_review第279批；此处
+验证HF权重初始化与导出，不代表新进程全状态恢复、设备内核或性能验收。
+
+
+### FSDP排除参数的训练归约（第315批）
+
+CPU/Gloo、PyTorch2.14；以下各项PP/CP/EP均为1。
+
+| 组合与实现 | 实际入口与参考 | 验证范围 |
+| --- | --- | --- |
+| DP2，native/custom | 真实Qwen3 Trainer；独立未分片模型与显式shifted CE | 三步AdamW、累积2、裁剪、全参数梯度/更新1e-6及embedding副本一致 |
+| DP2，native/custom | 并行API与Trainer归约；FP64 dense参考 | 三步AdamW、单rank使用/全组未使用参数、范数与更新1e-12 |
+| TP2×DP2，native/custom，eager/aot_eager | 并行API与Trainer归约；FP64 dense参考 | 三步SGD、TP分片排除参数、梯度和更新1e-12；不是完整Trainer循环 |
+
+脚本为trainer_fsdp_excluded_gradients.py、fsdp_excluded_gradient_equivalence.py、
+fsdp_pattern_references.py，位于tests/integration_tests/。真实Trainer参考沿用
+实际当前学习率，不独立证明scheduler。EP/CP组合、稀疏梯度、被排除但仍为
+DTensor的参数及完整恢复仍需独立验收；此表不扩展设备或性能支持声明。
+
+
+### EP排除参数训练对照与CP边界（第316批）
+
+四rank CPU/Gloo、custom dense DP4 / EP2 / expert FSDP2，真实Qwen3MoE
+alltoall。ep_fsdp_pattern_references.py --train，以及附加--ignore-modules，
+分别排除原gate/up投影和整个专家子树；三步输出、全参数梯度、范数、裁剪及
+SGD更新对照独立原始HF模型均通过1e-6。直接调用Trainer归约方法，aux loss=0，
+PP/TP/CP1、无AC/compile/EMA/恢复。禁用归约的诊断对照在首步w1梯度失败，
+rank0 max abs0.0029611242935061455、shape(2,8,16)，原容差1e-6。
+
+另行尝试真实Trainer DP2×CP2，KV/native及Ulysses/custom均未取得训练证据：
+默认CPU SDPA被CP拒绝；显式真实Flex则因上游不支持CPU backward退出1。
+失败日志与诊断脚本见file_review第316批，需支持Flex backward的设备重验；
+不把EP2/efsdp2或CPU CP前向结果扩展为该组合训练通过。
+
+
+### 完整Trainer EP排除与恢复（第317批）
+
+custom dense DP4、EP2/efsdp2，Qwen3MoE alltoall，原gate/up投影排除、
+累积2、裁剪0.5、aux0.03。真实Trainer三步AdamW对照原HF独立CE及显式辅助
+目标，eager和full AC+aot_eager均以1e-6通过全参数梯度和更新。
+同轴完整新进程DCP恢复加dynamic EMA、RNG和数据游标边界比较通过，
+四rank更新前failures0，恢复两步loss差0。脚本及完整命令见file_review第317批。
+这是固定拓扑的限定排除路径；不证明任意pattern、EP×TP/CP、目标设备或性能。
+
+
+### HSDP排除参数与双专家副本轴（第318批）
+
+CPU/Gloo四rank dense replicate2/shard2：native/custom FSDP三步FP64独立
+AdamW参考通过1e-12，覆盖单rank使用与全组未使用排除参数；custom完整Trainer
+full AC+aot_eager、累积2、裁剪0.5的三步全参数梯度/AdamW参考通过1e-6。
+八rank replicate2/efsdp2/EP2、custom FSDP、真实Qwen3MoE alltoall，排除
+原gate/up时三步独立HF输出、梯度、范数、裁剪与SGD更新通过1e-6；直接调用
+Trainer归约，aux=0，无AC/compile/恢复。各轴大小与二维DTensor mesh有显式
+断言。具体命令及最终日志见file_review第318批，不能据此扩展为完整八rank
+Trainer或HSDP恢复通过。
