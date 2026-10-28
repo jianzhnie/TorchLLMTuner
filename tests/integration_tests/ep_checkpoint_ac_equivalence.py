@@ -21,10 +21,23 @@ from llmtuner.components.optimizer import EMA, OptimizersContainer
 from llmtuner.config import OptimizerConfig
 from llmtuner.models.common.moe.experts import GroupedExperts
 from llmtuner.parallel.expert_parallel.checkpointing import mark_experts_ep_sharded
+from tests.integration_tests.harness import (
+    device as harness_device,
+)
+from tests.integration_tests.harness import (
+    init_distributed,
+    moved,
+)
+
+# fp64 keeps the checkpoint contents exact on CPU; the Ascend stack has no fp64
+# kernels (``aclnnInplaceLerps``/``aclnnMatmul`` reject DT_DOUBLE), so the
+# accelerator arm runs fp32. Every check below is an exact state-dict
+# comparison, which holds in either dtype.
+DTYPE = torch.float64 if harness_device().type == "cpu" else torch.float32
 
 
 def build(rank, *, wrapped, ep):
-    model = GroupedExperts(8, 12, 2 if ep else 4, use_grouped_mm=False).double()
+    model = moved(GroupedExperts(8, 12, 2 if ep else 4, use_grouped_mm=False).to(DTYPE))
     with torch.no_grad():
         for index, parameter in enumerate(model.parameters()):
             parameter.fill_(index + rank * 10 + 1)
@@ -41,7 +54,7 @@ def build(rank, *, wrapped, ep):
 
 
 def main():
-    dist.init_process_group("gloo")
+    init_distributed()
     folder = None
     try:
         assert dist.get_world_size() == 2

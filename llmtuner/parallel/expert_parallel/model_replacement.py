@@ -89,7 +89,13 @@ from ...models.common.moe.layer import MoE
 from ...models.kimi.moe import KimiSparseMoE
 from ...utils.logging import get_logger
 from .block_conversion import convert_block
-from .hf_inspection import is_hf_moe_block, moe_block_of, router_of
+from .hf_inspection import (
+    is_hf_moe_block,
+    moe_block_of,
+    per_expert_projection_names,
+    returns_router_logits,
+    router_of,
+)
 from .kimi_conversion import convert_kimi_block
 
 logger = get_logger(__name__)
@@ -195,7 +201,7 @@ def swap_hf_moe_blocks(
 
     # Probe every layer before constructing replacements: a later unsupported
     # expert layout must not leave earlier layers converted.
-    candidates: list[tuple[nn.Module, str, nn.Module]] = []
+    candidates: list[tuple[nn.Module, str, nn.Module, bool]] = []
     for layer in layers:
         attr, block = moe_block_of(layer)
         # Dense layers of a mixed model (Qwen3Moe's decoder_sparse_step, and the
@@ -204,7 +210,20 @@ def swap_hf_moe_blocks(
             isinstance(block, KimiSparseMoE) or is_hf_moe_block(block)
         ):
             continue
-        candidates.append((layer, attr, block))
+        wants_router_logits = returns_router_logits(block)
+        # The replacement has no router logits to hand back (llmtuner's router
+        # keeps its scores internal), so a config that asks HF to consume them
+        # would get ``None`` where it expects a tensor. Refuse rather than
+        # answer with a value that is wrong in a way no loss curve shows.
+        if wants_router_logits and getattr(hf_config, "output_router_logits", False):
+            raise UnsupportedCombinationError(
+                f"{type(block).__name__} returns router logits and its config "
+                "enables output_router_logits, but the swapped-in llmtuner MoE "
+                "keeps its router scores internal, so it could only hand back "
+                "None. Turn output_router_logits off -- llmtuner runs its own "
+                "load-balancing loss -- before swapping."
+            )
+        candidates.append((layer, attr, block, wants_router_logits))
 
     if not candidates:
         raise UnsupportedCombinationError(
@@ -219,7 +238,7 @@ def swap_hf_moe_blocks(
     replaced_roots = [
         f"{path}.{attr}" if path else attr
         for path, module in module_paths
-        for layer, attr, _ in candidates
+        for layer, attr, _, _ in candidates
         if module is layer
     ]
     external_parameters: dict[int, list[str]] = {}
@@ -246,13 +265,13 @@ def swap_hf_moe_blocks(
     # them before constructing any replacement, including cross-block aliases.
     kimi_expert_ids = {
         id(parameter)
-        for _, _, block in candidates
+        for _, _, block, _ in candidates
         if isinstance(block, KimiSparseMoE)
         for parameter in block.experts.parameters()
     }
     owners: dict[int, tuple[int, str]] = {}
     checked_kimi_blocks: set[int] = set()
-    for _, _, block in candidates:
+    for _, _, block, _ in candidates:
         if not isinstance(block, KimiSparseMoE) or id(block) in checked_kimi_blocks:
             continue
         checked_kimi_blocks.add(id(block))
@@ -277,7 +296,7 @@ def swap_hf_moe_blocks(
                     f"at {path}.{name}; expert aliases require a layout adapter"
                 )
     try:
-        for layer, attr, block in candidates:
+        for layer, attr, block, wants_router_logits in candidates:
             # Repeated layer slots may reference one physical HF block. Preserve
             # that sharing rather than cloning trainable weights and statistics.
             if id(block) in converted_blocks:
@@ -325,43 +344,95 @@ def swap_hf_moe_blocks(
                 tp_enabled=tp_enabled,
             )
             # Distinct blocks may tie only a projection. The fused gate/up
-            # source maps to two parameters, which must be reused as a pair.
-            # Bind after dtype/device conversion, before installing any block.
+            # source maps to two parameters, which must be reused as a pair; a
+            # per-expert (4.x) block ties each of its E projection weights to
+            # the one stacked parameter they were converted into. Bind after
+            # dtype/device conversion, before installing any block.
             grouped = moe.routed_experts.inner_experts
-            for owner, names, source in (
-                (moe.router.gate, ("weight",), router_gate.weight),
-                (grouped, ("w1_EFD", "w3_EFD"), block.experts.gate_up_proj),
-                (grouped, ("w2_EDF",), block.experts.down_proj),
-            ):
-                shared = converted_parameters.get(id(source))
-                if shared is None:
+            projection_names = per_expert_projection_names(block.experts)
+            if projection_names is None:
+                projections: list[
+                    tuple[nn.Module, tuple[str, ...], tuple[torch.Tensor, ...]]
+                ] = [
+                    (moe.router.gate, ("weight",), (router_gate.weight,)),
+                    (grouped, ("w1_EFD", "w3_EFD"), (block.experts.gate_up_proj,)),
+                    (grouped, ("w2_EDF",), (block.experts.down_proj,)),
+                ]
+            else:
+                gate_name, up_name, down_name = projection_names
+                members = list(block.experts)
+                projections = [
+                    (moe.router.gate, ("weight",), (router_gate.weight,)),
+                    (
+                        grouped,
+                        ("w1_EFD",),
+                        tuple(getattr(e, gate_name).weight for e in members),
+                    ),
+                    (
+                        grouped,
+                        ("w3_EFD",),
+                        tuple(getattr(e, up_name).weight for e in members),
+                    ),
+                    (
+                        grouped,
+                        ("w2_EDF",),
+                        tuple(getattr(e, down_name).weight for e in members),
+                    ),
+                ]
+            for owner, names, sources in projections:
+                previous = [converted_parameters.get(id(s)) for s in sources]
+                if all(entry is None for entry in previous):
                     targets = tuple(getattr(owner, name) for name in names)
                     # Unchanged layouts can keep the original Parameter, also
                     # preserving consumers outside the converted MoE subtree.
-                    # Split gate/up and EP-sharded projections have new layouts.
+                    # Split gate/up, stacked per-expert and EP-sharded
+                    # projections have new layouts.
                     if (
-                        len(targets) == 1
-                        and isinstance(source, nn.Parameter)
-                        and type(source) is type(targets[0])
-                        and source.shape == targets[0].shape
-                        and source.dtype == targets[0].dtype
-                        and source.device == targets[0].device
+                        len(sources) == 1
+                        and len(targets) == 1
+                        and isinstance(sources[0], nn.Parameter)
+                        and type(sources[0]) is type(targets[0])
+                        and sources[0].shape == targets[0].shape
+                        and sources[0].dtype == targets[0].dtype
+                        and sources[0].device == targets[0].device
                     ):
-                        setattr(owner, names[0], source)
-                        targets = (source,)
-                    external = external_parameters.get(id(source), [])
-                    if external and not (len(targets) == 1 and targets[0] is source):
-                        raise UnsupportedCombinationError(
-                            f"MoE conversion changes the layout of a parameter "
-                            f"also registered outside converted blocks at {external}; "
-                            "split or EP-sharded expert aliases require an adapted "
-                            "external consumer. Register aliases to the converted "
-                            "expert parameters after EP conversion."
+                        setattr(owner, names[0], sources[0])
+                        targets = (sources[0],)
+                    for source in sources:
+                        external = external_parameters.get(id(source), [])
+                        if external and not (
+                            len(targets) == 1 and targets[0] is source
+                        ):
+                            raise UnsupportedCombinationError(
+                                "MoE conversion changes the layout of a "
+                                "parameter also registered outside converted "
+                                f"blocks at {external}; split, stacked or "
+                                "EP-sharded expert aliases require an adapted "
+                                "external consumer. Register aliases to the "
+                                "converted expert parameters after EP conversion."
+                            )
+                        converted_parameters[id(source)] = targets
+                    continue
+                shared = previous[0]
+                consistent = shared is not None and len(shared) == len(names)
+                for entry in previous:
+                    if (
+                        entry is None
+                        or len(entry) != len(shared or ())
+                        or any(
+                            a is not b for a, b in zip(entry, shared or (), strict=True)
                         )
-                    converted_parameters[id(source)] = targets
-                else:
-                    for name, parameter in zip(names, shared, strict=True):
-                        setattr(owner, name, parameter)
+                    ):
+                        consistent = False
+                if not consistent:
+                    raise UnsupportedCombinationError(
+                        "MoE conversion cannot preserve a partially shared expert "
+                        "projection: stacking binds the whole projection to one "
+                        "grouped parameter, so a shared projection must be shared "
+                        "whole, with the same owner, by every converted block."
+                    )
+                for name, parameter in zip(names, shared, strict=True):
+                    setattr(owner, name, parameter)
             # Shared bias consumers contribute counts or histograms to one
             # policy-specific update in bias_update.py.
             source_bias = getattr(router_gate, "e_score_correction_bias", None)
@@ -373,6 +444,9 @@ def swap_hf_moe_blocks(
             # Fixed assignment and constant scores belong to the router,
             # shared by every dispatcher.
             moe.router.fixed_router = fixed_router
+            # Keep the host layer's unpacking contract intact: the block it was
+            # written against returns a tuple on 4.x Mixtral/OLMoE/GraniteMoe.
+            moe.returns_router_logits = wants_router_logits
             converted_blocks[id(block)] = moe
             replacements.append((layer, attr, moe))
         # TP registers physical HF slices before this swap. Gate/up becomes two
@@ -387,7 +461,7 @@ def swap_hf_moe_blocks(
             expert_owner = next(
                 (
                     converted_blocks[id(block)].routed_experts.inner_experts
-                    for _, _, block in candidates
+                    for _, _, block, _ in candidates
                     if not isinstance(block, KimiSparseMoE) and owner is block.experts
                 ),
                 None,
@@ -442,7 +516,7 @@ def swap_hf_moe_blocks(
 
         if on_replacement is not None:
             module_targets = {}
-            for _, _, block in candidates:
+            for _, _, block, _ in candidates:
                 moe = converted_blocks[id(block)]
                 module_targets[block] = moe
                 module_targets[block.experts] = moe.routed_experts.inner_experts

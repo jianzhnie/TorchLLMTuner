@@ -7,7 +7,33 @@ from transformers.configuration_utils import PretrainedConfig
 
 from ...config.model_config import LM_HEAD_COMPUTE_DTYPES
 from ...utils.dtypes import get_dtype
+from ...utils.logging import get_logger
 from ..common.cast_linear import build_cast_linear
+
+logger = get_logger(__name__)
+
+# Config attributes that mean "this model routes tokens to a pool of experts".
+# Spelled differently per family (Mixtral/GraniteMoe, Qwen2/3-MoE, DeepSeek), so
+# the probe accepts any of them rather than guessing one family's name.
+MOE_CONFIG_ATTRIBUTES = (
+    "num_local_experts",
+    "num_experts",
+    "n_routed_experts",
+    "moe_intermediate_size",
+)
+
+
+def is_moe_config(config: PretrainedConfig) -> bool:
+    """Whether ``config`` declares a mixture-of-experts model.
+
+    Structurally probed, like the rest of llmtuner's HF adaptation, so a new
+    family only has to carry one of the usual attribute names.
+    """
+    for name in MOE_CONFIG_ATTRIBUTES:
+        value = getattr(config, name, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return True
+    return False
 
 
 def _isolate_norm_input(module, args, kwargs):
@@ -131,17 +157,43 @@ def configure_experts_implementation(
     ``native`` preserves the model's built-in kernel. Other choices require
     Transformers' settable experts implementation API. Under EP, llmtuner
     replaces the MoE block after construction.
+
+    Transformers before 5.x has no such API: its MoE blocks always run HF's
+    per-expert ``F.linear`` loop, which is exactly the kernel ``"eager"`` names.
+    That request is therefore already satisfied there and is accepted as a
+    no-op; ``"grouped_mm"`` / ``"batched_mm"`` name kernels this build does not
+    carry, so they still fail rather than silently run something else.
     """
     impl = getattr(config, "experts_implementation", "native")
     if impl == "native":
         return
-    can_set = getattr(model_cls, "_can_set_experts_implementation", None)
     if impl not in ("grouped_mm", "batched_mm", "eager"):
         raise ValueError(
             f"experts_implementation must be one of 'native', "
             f"'grouped_mm', 'batched_mm', 'eager', got '{impl}'"
         )
-    if can_set is None or not can_set():
+    can_set = getattr(model_cls, "_can_set_experts_implementation", None)
+    if can_set is None:
+        # No settable-experts API in this transformers. Only the request the
+        # built-in kernel already satisfies can be honored.
+        if impl == "eager" and is_moe_config(config):
+            logger.info(
+                "%s has no settable experts implementation (transformers < 5); "
+                "its built-in experts path is the per-expert loop, so "
+                "experts_implementation='eager' is already in effect.",
+                model_cls.__name__,
+            )
+            return
+        raise ValueError(
+            f"{model_cls.__name__} does not support a settable experts "
+            f"implementation, so experts_implementation='{impl}' cannot be "
+            "honored. Set experts_implementation='native' to use the HF "
+            "model's built-in experts kernel. This transformers build has no "
+            "_can_set_experts_implementation at all -- that API first ships "
+            "with transformers 5, and below it a MoE block always runs the "
+            "per-expert loop, which is what 'eager' names."
+        )
+    if not can_set():
         raise ValueError(
             f"{model_cls.__name__} does not support a settable experts "
             f"implementation, so experts_implementation='{impl}' cannot "

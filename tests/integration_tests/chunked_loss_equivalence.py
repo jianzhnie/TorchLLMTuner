@@ -51,6 +51,13 @@ from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.harness import (
+    device as harness_device,
+)
+from tests.integration_tests.harness import (
+    moved,
+    moved_batch,
+)
 
 STEPS = 4
 GLOBAL_BATCH = 8
@@ -106,7 +113,7 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> tuple[list[float], dict]:
     second group's rows different positions and a different causal boundary.
     """
     torch.manual_seed(cfg.seed)
-    model = HFTransformerModel(build_model_config_for(cfg))
+    model = moved(HFTransformerModel(build_model_config_for(cfg)))
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
@@ -122,7 +129,7 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> tuple[list[float], dict]:
     losses = []
     for _ in range(cfg.steps):
         optimizer.zero_grad(set_to_none=True)
-        batch = next(batches)
+        batch = moved_batch(next(batches))
         num_valid = int(
             (
                 model.preprocess_inputs(batch, parallel_dims=None)[1] != IGNORE_INDEX
@@ -202,7 +209,7 @@ def main() -> None:
             failures.append(f"rank {rank}: no parameter was FSDP-sharded -- vacuous")
 
     # Every rank must agree that every check passed, not just report its own.
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=harness_device())
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
 
     if rank == 0:

@@ -342,16 +342,35 @@ def test_validate_reports_token_normalized_loss_and_restores_train_mode(
 
 
 class _FakePPSchedule:
-    """Records the eval call; each microbatch's loss is a known constant."""
+    """Records the eval driver call; each microbatch's loss is a known constant.
+
+    Exposes both seams: the native ``eval(arg_mbs=...)`` microbatch driver
+    (torch 2.10+) and the older ``_step_microbatches`` entry the fallback driver
+    in ``parallel/pipeline_parallel/microbatch_drivers.py`` uses. One fake, so
+    this test covers whichever seam the running torch carries.
+    """
 
     def __init__(self, per_mb_loss: float):
         self.per_mb_loss = per_mb_loss
         self.eval_calls: list[dict[str, Any]] = []
+        self._has_backward = True
+        self._stage = SimpleNamespace(
+            has_backward=True, clear_runtime_states=lambda: None
+        )
 
     def eval(self, *, arg_mbs, kwarg_mbs, target_mbs, losses):
         self.eval_calls.append(
             {"arg_mbs": arg_mbs, "kwarg_mbs": kwarg_mbs, "target_mbs": target_mbs}
         )
+        self._record_losses(losses, target_mbs)
+
+    def _step_microbatches(self, arg_mbs, kwarg_mbs, target_mbs, losses):
+        self.eval_calls.append(
+            {"arg_mbs": arg_mbs, "kwarg_mbs": kwarg_mbs, "target_mbs": target_mbs}
+        )
+        self._record_losses(losses, target_mbs)
+
+    def _record_losses(self, losses, target_mbs) -> None:
         assert losses is not None
         n = len(target_mbs)
         losses.extend(torch.tensor(self.per_mb_loss) for _ in range(n))
@@ -697,7 +716,6 @@ def test_pipeline_validation_cleanup_preserves_iteration_error(
             closed.append(True)
             raise RuntimeError("close failed")
 
-    monkeypatch.setattr(validation_module, "require", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         validation_module, "resolve_loss_reduction_meshes", lambda dims: (None, None)
     )
@@ -732,7 +750,6 @@ def test_validation_closes_loader_after_token_allocation_failure(monkeypatch, pi
     def fail_allocation(*args, **kwargs):
         raise original
 
-    monkeypatch.setattr(validation_module, "require", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         validation_module, "resolve_loss_reduction_meshes", lambda dims: (None, None)
     )

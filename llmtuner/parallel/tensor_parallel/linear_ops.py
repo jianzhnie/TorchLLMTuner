@@ -27,9 +27,10 @@ exactly the duals the Functions below implement by hand. It exists so TP runs
 
 from __future__ import annotations
 
-import spmd_types as spmd
 import torch
 import torch.distributed as dist
+
+from llmtuner.accelerator.spmd_backend import spmd
 
 
 def ensure_symm_mem_ops():

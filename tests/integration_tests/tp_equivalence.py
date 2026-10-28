@@ -39,6 +39,7 @@ from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     RowParallelLinear,
 )
 from llmtuner.parallel.topology import ParallelTopology, build_device_mesh
+from tests.integration_tests.harness import backend, init_distributed, moved
 
 SEQ = 16
 VOCAB = 64
@@ -63,14 +64,14 @@ def _model(seed: int = 0) -> HFTransformerModel:
             "num_key_value_heads": 4,
         },
     )
-    return HFTransformerModel(config)
+    return moved(HFTransformerModel(config))
 
 
 def _batch(seed: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
     g = torch.Generator().manual_seed(seed)
     ids = torch.randint(0, VOCAB, (SEQ,), generator=g)
     labels = torch.randint(0, VOCAB, (SEQ,), generator=g)
-    return ids, labels
+    return moved(ids), moved(labels)
 
 
 def _loss_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -79,7 +80,7 @@ def _loss_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
-    dist.init_process_group("gloo")
+    device = init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 2, f"this check assumes 2 ranks, got {world}"
@@ -120,7 +121,9 @@ def main() -> None:
     # RoPE/attention see the assembled full sequence after the in-projection
     # all-gather, so positions stay full-length.
     positions = extra.get("positions")
-    if positions is None or not torch.equal(positions, torch.arange(SEQ)):
+    if positions is None or not torch.equal(
+        positions, torch.arange(SEQ, device=device)
+    ):
         failures.append(f"positions not full-length under TP: {positions}")
 
     logits_tp = model(inputs, **extra)
@@ -171,11 +174,14 @@ def main() -> None:
             failures.append(f"{path}: weight grad diff {diff:.3e}")
 
     # Every rank must agree that every check passed, not just report its own.
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=device)
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
 
     if rank == 0:
-        print(f"seq={SEQ} vocab={VOCAB} tp_size={world} backend=gloo (fallback path)")
+        print(
+            f"seq={SEQ} vocab={VOCAB} tp_size={world} "
+            f"device={device.type} backend={backend()}"
+        )
         print(f"swapped projections = {len(tp_modules)}")
         print(f"logits         max abs diff = {fwd_diff:.3e}")
         print(f"weight grads   max abs diff = {max(grad_diffs):.3e}")

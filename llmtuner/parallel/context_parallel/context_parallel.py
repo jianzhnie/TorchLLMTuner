@@ -12,6 +12,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...utils.logging import get_logger
 from ..attention_heads import require_heads_divisible_by
 from .attention import CPFlexKernel, DualCPFlexKernel
+from .sdpa_attention import CPSdpaKernel, CPSdpaUlyssesKernel
 
 if TYPE_CHECKING:
     from ..topology import ParallelTopology
@@ -140,16 +141,33 @@ def apply_cp(
 
     # Import the HF backend only when CP is enabled; disabled CP needs no
     # Transformers attention registration dependencies.
-    from ...models.hf.attention_backend import ATTENTION_BACKEND
+    from ...models.hf.attention_backend import ATTENTION_BACKEND, CP_SDPA_BACKEND
 
     impl = getattr(model_config, "_attn_implementation", None)
-    if impl != ATTENTION_BACKEND:
+    # Two ways to carry the redistribution, chosen by what the device has. Flex
+    # is CUDA-only (see available_attention_backend), so on NPU CP runs on sdpa
+    # through the CPSdpa kernels -- which exist precisely because the sdpa
+    # fallback has no BlockMask to express a sharded mask with. Both strategies
+    # have one: kv_allgather rebuilds the mask from the CP offsets, ulysses
+    # attends the full sequence after the swap and so needs only the ordinary
+    # causal mask. What sdpa still cannot express is the *dual-axis* form (its
+    # two masks compose in a way only the flex kernels write down) and a load
+    # balancer under ulysses (the rearrangement lands in the query order, which
+    # no length-derived mask can describe).
+    sdpa_backend = impl != ATTENTION_BACKEND
+    dual_axes_requested = (
+        cfg.context_parallel_kv_allgather_size > 1
+        and cfg.context_parallel_ulysses_size > 1
+    )
+    if sdpa_backend and dual_axes_requested:
         raise RuntimeError(
-            f"CP requires the {ATTENTION_BACKEND!r} attention backend, but "
-            f"this model runs {impl!r}. CP expresses the sharded attention mask "
-            "as a BlockMask, which only the flex path consumes -- the same "
-            "reason the sdpa fallback cannot run packed sequences. On a "
-            "CPU-only machine the wrapper selects 'sdpa', so CP needs CUDA."
+            f"CP runs on the {impl!r} backend only with a single CP axis: the "
+            "sdpa kernels each rebuild one mask (kv_allgather from the CP "
+            "offsets, ulysses as the plain causal one), and the dual-axis form "
+            "composes two that only the flex kernels express. Use "
+            "context_parallel_kv_allgather_size or "
+            "context_parallel_ulysses_size alone (either is supported on this "
+            "backend), or run on a device with flex attention."
         )
     if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
         raise ValueError(
@@ -197,6 +215,31 @@ def apply_cp(
             f"{type(model).__name__}."
         )
     packed = getattr(model_config, "attn_mask_type", "causal") == "block_causal"
+    if sdpa_backend:
+        # Bind the model to the CP sdpa interface *before* the layers are
+        # walked, so every attention module this loop covers is reached through
+        # it. The kernel owns both the redistribution and the mask, which is why
+        # the wrapper needs to hand this layer nothing (see
+        # HFTransformerModel._apply_attention).
+        model_config._attn_implementation = CP_SDPA_BACKEND
+        if strategy == "ulysses":
+            if load_balancer is not None:
+                raise RuntimeError(
+                    "ulysses CP takes no load balancer: the rearrangement it "
+                    "would introduce lands in the query order, and this "
+                    "kernel's mask is the plain causal one (the flex kernel "
+                    "expresses the permuted form through its BlockMask). Run "
+                    "with context_parallel_load_balancer=None, or use the "
+                    "kv_allgather strategy, which is correct with a balancer."
+                )
+            cp_sdpa_kernel = CPSdpaUlyssesKernel(cp_mesh=cp_mesh, packed=packed)
+        else:
+            cp_sdpa_kernel = CPSdpaKernel(cp_mesh=cp_mesh, packed=packed)
+        # The wrapper reads this to decide whether the layer needs a mask handed
+        # over: the kv kernel builds its own from the offsets, while the ulysses
+        # kernel consumes a packed corpus's dense document mask (it attends the
+        # full sequence, so the unsharded structure applies directly).
+        model_config._cp_sdpa_ulysses = strategy == "ulysses"
     attentions = []
     for idx, layer in enumerate(layers):
         for name in _ATTN_MODULE_NAMES:
@@ -210,15 +253,19 @@ def apply_cp(
                 "to the probe in apply_cp."
             )
         attentions.append(attn_mod)
-    kernels = []
-    for _ in attentions:
-        if dual_axes:
-            kernel = DualCPFlexKernel(kv_mesh=kv_mesh, ulysses_mesh=ulysses_mesh)
-        else:
-            kernel = CPFlexKernel(cp_mesh=cp_mesh, strategy=strategy, packed=packed)
-        kernels.append(kernel)
-    for attn_mod, kernel in zip(attentions, kernels, strict=True):
-        attn_mod._titan_flex_kernel = kernel
+    if sdpa_backend:
+        for attn_mod in attentions:
+            attn_mod._titan_cp_sdpa_kernel = cp_sdpa_kernel
+    else:
+        kernels = []
+        for _ in attentions:
+            if dual_axes:
+                kernel = DualCPFlexKernel(kv_mesh=kv_mesh, ulysses_mesh=ulysses_mesh)
+            else:
+                kernel = CPFlexKernel(cp_mesh=cp_mesh, strategy=strategy, packed=packed)
+            kernels.append(kernel)
+        for attn_mod, kernel in zip(attentions, kernels, strict=True):
+            attn_mod._titan_flex_kernel = kernel
 
     cp_options = {
         "load_balancer": load_balancer,

@@ -20,6 +20,7 @@ from llmtuner.config import (
 )
 from llmtuner.config.parallel_config import PipelineParallelConfig, TensorParallelConfig
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.harness import device as harness_device
 
 
 def main() -> None:
@@ -67,7 +68,7 @@ def main() -> None:
     assert all(value == gathered[0] for value in gathered), gathered
 
     trainer.close()
-    probe = torch.ones(1)
+    probe = torch.ones(1, device=harness_device())
     dist.all_reduce(probe)
     assert probe.item() == trainer.world_size
     if trainer.rank == 0:

@@ -22,6 +22,48 @@ from torch.distributed._functional_collectives import all_to_all_single
 
 from ...accelerator import distributed
 from ...models.common.scatter_add import deterministic_scatter_add
+from ...utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# torch ships two functional all-to-alls. ``all_to_all_single`` has NO autograd
+# kernel -- calling it on a tensor that needs grad makes torch warn that the
+# backward "may lead to silently incorrect behavior", and in practice the
+# exchange simply drops the gradient. ``all_to_all_single_autograd`` is the
+# differentiable one, whose backward is the reciprocal exchange.
+#
+# The count exchange below is under ``torch.no_grad()`` and may use either; the
+# dispatch and combine exchanges carry gradients -- back to the expert weights
+# and forward into the router scores -- so they must use the differentiable
+# form. On a build that lacks it, EP training cannot move the experts at all,
+# which is why the fallback below says so out loud instead of quietly training
+# an untrained expert stack.
+try:
+    from torch.distributed._functional_collectives import (
+        all_to_all_single_autograd as _differentiable_all_to_all,
+    )
+except ImportError:  # pragma: no cover - depends on the torch build
+    _differentiable_all_to_all = None
+
+
+def _grad_carrying_all_to_all(
+    tensor: torch.Tensor,
+    output_splits: list[int] | None,
+    input_splits: list[int] | None,
+    *,
+    group,
+) -> torch.Tensor:
+    """One all-to-all that backprop can flow through; see the note above."""
+    if _differentiable_all_to_all is None:
+        logger.warning(
+            "This torch has no all_to_all_single_autograd, so the EP dispatch "
+            "and combine exchanges cannot carry gradients: the expert weights "
+            "will not be updated. Run with expert_parallel_size=1, or upgrade "
+            "torch."
+        )
+        return all_to_all_single(tensor, output_splits, input_splits, group=group)
+    return _differentiable_all_to_all(tensor, output_splits, input_splits, group=group)
+
 
 __all__ = [
     "LocalDispatchMetadata",
@@ -339,11 +381,8 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
     ) -> torch.Tensor:
         """Send routed tokens to the ranks holding their chosen experts."""
         assert self.ep_group is not None
-        return all_to_all_single(
-            routed_input_ND,
-            output_splits,
-            input_splits,
-            group=self.ep_group,
+        return _grad_carrying_all_to_all(
+            routed_input_ND, output_splits, input_splits, group=self.ep_group
         )
 
     def _combine_token_exchange(
@@ -356,11 +395,8 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
         assert self.ep_group is not None
         # The split lists are swapped relative to dispatch: what was received
         # there is sent here.
-        return all_to_all_single(
-            routed_output_RD,
-            input_splits,
-            output_splits,
-            group=self.ep_group,
+        return _grad_carrying_all_to_all(
+            routed_output_RD, input_splits, output_splits, group=self.ep_group
         )
 
     def dispatch(

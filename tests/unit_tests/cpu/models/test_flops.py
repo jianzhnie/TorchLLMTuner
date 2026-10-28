@@ -170,6 +170,12 @@ def test_a_moe_layer_counts_only_its_top_k_experts() -> None:
         num_key_value_heads=kv_heads,
         head_dim=head_dim,
         num_local_experts=num_experts,
+        # The same count under the family's other spelling. transformers 5.x
+        # renamed Qwen3Moe's field to ``num_local_experts``; 4.x still declares
+        # ``num_experts``, and the estimator reads whichever the config
+        # declares first -- so give both the same value rather than let the
+        # other one keep its (much larger) default.
+        num_experts=num_experts,
         num_experts_per_tok=top_k,
         moe_intermediate_size=expert_width,
     )
@@ -414,10 +420,16 @@ def test_an_uniform_window_caps_every_layer() -> None:
 
 
 def test_a_linear_attention_layer_suppresses_the_count() -> None:
-    """Qwen3-Next's delta-rule layers project through kernels whose parameter
-    term is not derivable from these generic fields, so the whole count is
-    suppressed rather than approximated."""
-    arch = _arch("qwen3_next", max_position_embeddings=64)
+    """A hybrid stack's linear-attention layers suppress the whole count.
+
+    Motivated by Qwen3-Next's delta-rule layers, which project through kernels
+    whose parameter term is not derivable from these generic fields. Spelled on
+    a dense family rather than through that config class: ``qwen3_next`` only
+    exists in newer transformers, and what is under test is the layer-type rule
+    -- the same reason the neighbouring test sets ``layer_types`` by hand.
+    """
+    arch = _arch("llama", num_hidden_layers=4)
+    arch.layer_types = ["full_attention", "linear_attention"] * 2
 
     assert flops_per_token(arch, seq_len=64) == 0
 

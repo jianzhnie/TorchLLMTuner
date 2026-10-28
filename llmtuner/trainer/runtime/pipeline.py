@@ -17,6 +17,10 @@ from ...accelerator.spmd import spmd_context
 from ...components.loss import IGNORE_INDEX
 from ...datasets.contracts import Batch, TrainerBatch, require_positive_integer
 from ...parallel import compatibility
+from ...parallel.pipeline_parallel.microbatch_drivers import (
+    run_microbatches,
+    schedule_stages,
+)
 
 if TYPE_CHECKING:
     from ..trainer import Trainer
@@ -145,10 +149,7 @@ def run_pipeline_step(
         # must be initialized explicitly before calling it.
         trainer.pp_schedule._llmtuner_global_valid_tokens = global_valid_tokens
         if capability("pipelining_microbatch_drivers"):
-            stages = getattr(trainer.pp_schedule, "_stages", None)
-            if stages is None:
-                stages = [trainer.pp_schedule._stage]
-            for stage in stages:
+            for stage in schedule_stages(trainer.pp_schedule):
                 stage.has_backward = trainer.pp_schedule._has_backward
                 stage.clear_runtime_states()
             trainer.pp_schedule._step_microbatches(
@@ -159,13 +160,15 @@ def run_pipeline_step(
                 return_outputs=False,
             )
         else:
-            trainer.pp_schedule.step(
-                arg_mbs=inputs.args if trainer.pp_has_first_stage else None,
-                kwarg_mbs=inputs.kwargs,
-                target_mbs=inputs.targets,
+            # Older torch has no microbatch-form driver: 2.9's ``step`` takes
+            # whole-batch inputs and would swallow these keywords into the model
+            # call. Drive ``_step_microbatches`` directly instead.
+            run_microbatches(
+                trainer.pp_schedule,
+                args=inputs.args if trainer.pp_has_first_stage else None,
+                kwargs=inputs.kwargs,
+                targets=inputs.targets,
                 losses=losses,
-                loss_kwargs={"global_valid_tokens": global_valid_tokens},
-                return_outputs=False,
             )
 
     if trainer.pp_has_last_stage:

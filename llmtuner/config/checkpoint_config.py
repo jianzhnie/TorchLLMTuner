@@ -40,6 +40,14 @@ class CheckpointConfig:
     memory:// is limited to single-process synchronous or threaded saves.
     """
 
+    backend: Literal["dcp", "torch_checkpointing"] = "dcp"
+    """Which manager writes the checkpoints.
+
+    ``torch_checkpointing`` needs the optional package of the same name, whose
+    absence raises an actionable ImportError at construction; ``dcp`` (the
+    default) needs only ``torch.distributed.checkpoint``.
+    """
+
     interval: int = 500
     """Checkpointing interval in steps."""
 
@@ -112,6 +120,11 @@ class CheckpointConfig:
     def __post_init__(self) -> None:
         if not self.folder.strip():
             raise ConfigError("checkpoint.folder must not be empty.")
+        if self.backend not in ("dcp", "torch_checkpointing"):
+            raise ConfigError(
+                "checkpoint.backend must be 'dcp' or 'torch_checkpointing', "
+                f"got {self.backend!r}"
+            )
         require_integer_at_least(self, "interval", group="checkpoint")
         if not isinstance(self.load_step, int) or isinstance(self.load_step, bool):
             raise ConfigError(

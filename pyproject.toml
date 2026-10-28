@@ -29,7 +29,7 @@ dependencies = [
     # (`gate_up_proj` / `down_proj`) is a 5.x shape, and the pin matches
     # torchtitan's transformers_modeling_backend experiment, which this
     # aligns with.
-    "transformers>=5.9,<5.10",
+    "transformers>=5.11,<5.12",
     # Direct import in utils/logging.py (reached from trainer/config.py) --
     # undeclared until now, and pulled in only transitively by transformers.
     "colorama>=0.4",

@@ -39,6 +39,7 @@ from llmtuner.parallel.context_parallel import (
 from llmtuner.parallel.expert_parallel import apply_ep
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology
+from tests.integration_tests.harness import backend, device, init_distributed, moved
 
 SEQ = 256  # torch's CP BlockMask path requires Q_LEN % (cp * 128) == 0
 VOCAB = 128
@@ -48,9 +49,13 @@ TP = 2
 CP = 2
 EP = 2
 WORLD = TP * CP  # EP tiles the existing ranks; it is not an extra axis
-# Expert computation is float64, but routing scores deliberately use FP32;
-# match the HF-versus-EP tolerance used by ep_wiring_equivalence.py.
-TOL = 1e-6
+# Expert computation is float64 on CPU, but routing scores deliberately use
+# FP32; match the HF-versus-EP tolerance used by ep_wiring_equivalence.py. The
+# Ascend stack has no fp64 matmul (aclnnMatmul rejects DT_DOUBLE), so an
+# accelerator arm runs fp32 and takes the tolerance that precision implies.
+DEVICE = device()
+DTYPE = torch.float64 if DEVICE.type == "cpu" else torch.float32
+TOL = 1e-6 if DEVICE.type == "cpu" else 1e-4
 IGNORE_INDEX = -100
 
 
@@ -86,14 +91,14 @@ def _build(cfg: LLMTunerConfig, *, seed: int = 0) -> HFTransformerModel:
     torch.manual_seed(seed)
     config = build_model_config_for(cfg)
     config.experts_implementation = "eager"
-    return HFTransformerModel(config).to(torch.float64).eval()
+    return moved(HFTransformerModel(config).to(DTYPE).eval())
 
 
 def _data(seed: int = 0):
     g = torch.Generator().manual_seed(seed)
     ids = torch.randint(VOCAB, (SEQ,), generator=g)
     labels = torch.randint(VOCAB, (SEQ,), generator=g)
-    return ids, labels, torch.arange(SEQ)
+    return moved(ids), moved(labels), moved(torch.arange(SEQ))
 
 
 def _gather(x: torch.Tensor, mesh) -> torch.Tensor:
@@ -126,7 +131,7 @@ def _diff(what: str, got: torch.Tensor, want: torch.Tensor, failures) -> float:
 
 
 def main() -> None:
-    dist.init_process_group("gloo")
+    init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == WORLD, f"this check assumes {WORLD} ranks, got {world}"
@@ -140,9 +145,11 @@ def main() -> None:
 
     model = _build(cfg)
     ref = _build(cfg)
-    # The production CPU default is SDPA, which CP correctly rejects. As in
-    # the CP wiring harness, explicitly select eager flex for this forward test.
-    model.model.config._attn_implementation = "flex_torchtitan"
+    # On CPU this forward test runs on eager flex (the reference keeps SDPA); on
+    # an accelerator flex does not exist, so the model keeps the wrapper's
+    # default backend and ``apply_cp`` selects the sdpa CP kernel instead.
+    if DEVICE.type == "cpu":
+        model.model.config._attn_implementation = "flex_torchtitan"
 
     # The assembly order from parallelize.py's STAGES table: tp -> ep -> cp.
     model = apply_tp(model, tp_mesh, cfg.parallel)
@@ -200,7 +207,11 @@ def main() -> None:
         )
     dist.all_reduce(loss_local, group=cp_mesh.get_group())
     dist.all_reduce(loss_local, group=tp_mesh.get_group())
-    loss_diff = abs(loss_local.item() - loss_ref.item())
+    # Mean loss, not the summed one: see the same comparison in
+    # ``cp_tp_equivalence`` -- an fp32 residual on a ~1e3-summed loss is 1e-4
+    # absolute, which says nothing about the wiring.
+    num_valid = int((labels != IGNORE_INDEX).sum())
+    loss_diff = abs(loss_local.item() - loss_ref.item()) / num_valid
     if loss_diff > TOL:
         failures.append(f"reduced loss diff {loss_diff:.3e}")
 
@@ -217,12 +228,13 @@ def main() -> None:
     if rank == 0:
         print(
             f"tp={TP} cp={CP} ep={EP} world={world} seq={SEQ} "
-            f"experts={NUM_EXPERTS} dtype=float64"
+            f"experts={NUM_EXPERTS} dtype={DTYPE} tol={TOL:.0e} "
+            f"device={DEVICE.type} backend={backend()}"
         )
         for f in failures:
             print(f"  FAIL {f}")
         print("all checks passed" if not failures else "CHECKS FAILED")
-    verdict = torch.tensor(len(failures), dtype=torch.int64)
+    verdict = torch.tensor(len(failures), dtype=torch.int64, device=DEVICE)
     dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
     assert int(verdict) == 0, f"{int(verdict)} check(s) failed -- see rank 0 output"
 

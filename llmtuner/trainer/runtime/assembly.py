@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from ...accelerator.capabilities import has as capability
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.device import (
     device_type,
@@ -39,6 +40,9 @@ from ...components.checkpointer.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from ...components.checkpointer.random_state import RNGCheckpointState
+from ...components.checkpointer.torch_checkpointing_backend import (
+    TorchCheckpointingManager,
+)
 from ...components.metrics import MetricsProcessor
 from ...components.optimizer.ema import EMA
 from ...components.optimizer.lr_scheduler import build_lr_scheduler
@@ -89,6 +93,13 @@ def _build_model(
         compatibility.chunked_loss_pp(
             trainer._chunked_loss_num_chunks, trainer.parallel_dims.pp
         )
+    if (
+        trainer._chunked_loss_num_chunks > 1
+        and trainer.parallel_dims is not None
+        and trainer.parallel_dims.dp_shard_enabled
+        and not capability("fsdp_unshard_context")
+    ):
+        compatibility.chunked_loss_fsdp(trainer._chunked_loss_num_chunks)
     hf_model_config = build_model_config_for(cfg)
     # Programmatic Trainer callers need the same resolved geometry as the CLI.
     # In particular, synthetic token generation must use the real vocabulary,
@@ -147,7 +158,20 @@ def _apply_parallelism(
         trainer.pp_has_last_stage = orchestration.has_last_stage
         # Only the last stage computes CE. Other stages return a finite zero
         # for the step check and contribute nothing to the PP loss reduction.
-        trainer._pp_loss_sentinel = torch.zeros((1,), device=trainer.device)
+        #
+        # Shape and dtype must match what the last stage produces exactly -- a
+        # 0-dim float32, since the last stage returns ``sum(micro_losses) *
+        # global_valid_tokens`` (float32 times an int64 count). The sentinel is
+        # what enters the same all-reduce over the PP group, and a collective
+        # matches buffers by byte length: ``(1,)`` in the process default dtype
+        # is 2 bytes under a bfloat16 default against the last stage's 4, which
+        # silently corrupted the reduced value (a negative "sum" and a max of
+        # -3e27 were both observed on the NPU). Under the float32 default the
+        # two happened to be the same width, which is why this only showed up
+        # once the default dtype was bf16.
+        trainer._pp_loss_sentinel = torch.zeros(
+            (), dtype=torch.float32, device=trainer.device
+        )
     else:
         trainer.model = orchestration
         trainer.model_parts = [orchestration]
@@ -247,7 +271,16 @@ def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> 
                 and cfg.parallel.ep_size > 1
             ),
         )
-    trainer.checkpointer = DistributedCheckpointManager(
+    # One manager per backend, same contract (see components/checkpointer). The
+    # torch_checkpointing one raises an actionable ImportError when its optional
+    # package is missing, which is why the choice is a plain branch here rather
+    # than a capability probe.
+    manager_cls = (
+        TorchCheckpointingManager
+        if cfg.checkpoint.backend == "torch_checkpointing"
+        else DistributedCheckpointManager
+    )
+    trainer.checkpointer = manager_cls(
         cfg.checkpoint,
         model_parts=trainer.model_parts,
         optimizer=trainer.optimizer,

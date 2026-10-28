@@ -7,10 +7,11 @@ FP32 accumulation, while other devices promote operands before the GEMM.
 
 from __future__ import annotations
 
-import spmd_types as spmd
 import torch
 import torch.nn as nn
 from torch.autograd.function import once_differentiable
+
+from ....accelerator.spmd_backend import spmd
 
 __all__ = ["RouterGateLinear"]
 

@@ -30,13 +30,24 @@ from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.harness import (
+    device as harness_device,
+)
+from tests.integration_tests.harness import (
+    init_distributed,
+    moved,
+)
 
 VOCAB = 128
 TOKENS = 64
-TOL = 1e-9
+# fp64 keeps the residual arithmetic on CPU; the Ascend stack has no fp64
+# kernels, so the accelerator arm runs fp32 with the tolerance that implies.
+DEVICE = harness_device()
+DTYPE = torch.float64 if DEVICE.type == "cpu" else torch.float32
+TOL = 1e-9 if DEVICE.type == "cpu" else 1e-5
 # HF DeepSeek RMSNorm computes in float32 even for float64 model weights;
 # backward summation order across token shards therefore has fp32 noise.
-GRAD_TOL = 1e-6
+GRAD_TOL = 1e-6 if DTYPE == torch.float64 else 1e-4
 
 
 def _config() -> AutoConfig:
@@ -65,11 +76,11 @@ def _config() -> AutoConfig:
 
 def _model() -> HFTransformerModel:
     torch.manual_seed(0)
-    return HFTransformerModel(_config()).to(torch.float64).eval()
+    return moved(HFTransformerModel(_config()).to(DTYPE).eval())
 
 
 def main() -> None:
-    dist.init_process_group("gloo")
+    init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 2, f"this check assumes 2 ranks, got {world}"
@@ -82,8 +93,10 @@ def main() -> None:
     model = _model()
     ref = _model()
 
-    ids = torch.randint(VOCAB, (TOKENS,), generator=torch.Generator().manual_seed(7))
-    positions = torch.arange(TOKENS)
+    ids = moved(
+        torch.randint(VOCAB, (TOKENS,), generator=torch.Generator().manual_seed(7))
+    )
+    positions = moved(torch.arange(TOKENS))
     with torch.no_grad():
         ref_logits = ref(ids, positions=positions)
 
@@ -148,13 +161,16 @@ def main() -> None:
         )
 
     if rank == 0:
-        print(f"shared-expert tp={world} tokens={TOKENS} tol={TOL:.0e}")
+        print(
+            f"shared-expert tp={world} tokens={TOKENS} dtype={DTYPE} "
+            f"tol={TOL:.0e} device={DEVICE.type}"
+        )
         print(f"tp-joined vs reference max diff = {diff:.3e}")
         print(f"attention/shared-expert gradient max diff = {grad_diff:.3e}")
         for f in failures:
             print(f"  FAIL {f}")
         print("all checks passed" if not failures else "CHECKS FAILED")
-    verdict = torch.tensor(len(failures), dtype=torch.int64)
+    verdict = torch.tensor(len(failures), dtype=torch.int64, device=DEVICE)
     dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
     assert int(verdict) == 0, f"{int(verdict)} check(s) failed -- see rank 0 output"
 

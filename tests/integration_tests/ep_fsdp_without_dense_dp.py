@@ -20,10 +20,12 @@ from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.parallel.topology import ParallelTopology
+from tests.integration_tests.ep_fsdp_equivalence import _ref_expert_grads
+from tests.integration_tests.harness import init_distributed, moved
 
 
 def main() -> None:
-    dist.init_process_group("gloo")
+    device = init_distributed()
     assert dist.get_world_size() == 4
     cfg = LLMTunerConfig(
         model=ModelConfig(
@@ -52,14 +54,14 @@ def main() -> None:
     dims = ParallelTopology.from_config(cfg.parallel, 4)
     dims.build_device_mesh()
     torch.manual_seed(0)
-    model = HFTransformerModel(build_model_config_for(cfg)).to(torch.float32)
+    model = moved(HFTransformerModel(build_model_config_for(cfg)).to(torch.float32))
     reference = copy.deepcopy(model)
     model = parallelize_hf_transformers(
         model,
         cfg=cfg.parallel,
         mesh=dims.spmd_dense_mesh(),
         parallel_dims=dims,
-        device=torch.device("cpu"),
+        device=device,
     )
     expert = model.layers[0].mlp.routed_experts.inner_experts.w1_EFD
     assert isinstance(expert, DTensor)
@@ -68,7 +70,7 @@ def main() -> None:
     generator = torch.Generator().manual_seed(7)
     ids = torch.randint(0, 128, (32,), generator=generator)
     labels = torch.randint(0, 128, (32,), generator=generator)
-    batch = {"input": ids, "labels": labels}
+    batch = {"input": moved(ids), "labels": moved(labels)}
     with spmd_context(None):
         ref_inputs, ref_labels, ref_kwargs = reference.preprocess_inputs(
             batch, parallel_dims=None
@@ -83,14 +85,17 @@ def main() -> None:
     token_slice = slice(tp_rank * 8, (tp_rank + 1) * 8)
     torch.testing.assert_close(logits, ref_logits[token_slice], rtol=1e-4, atol=1e-5)
     grouped = model.layers[0].mlp.routed_experts.inner_experts
-    ref_experts = reference.layers[0].mlp.experts
     ep_rank = dims.get_mesh("ep").get_local_rank()
     expert_slice = slice(ep_rank * 4, (ep_rank + 1) * 4)
+    # Read the reference gradients in HF's own terms: 5.x fuses the experts into
+    # ``gate_up_proj``/``down_proj``, 4.x keeps one module per expert, and this
+    # script is otherwise anchored on what HF computed.
+    ref_gate_up, ref_down = _ref_expert_grads(reference.layers[0].mlp)
     max_grad_diff = 0.0
     for parameter, expected in (
-        (grouped.w1_EFD, ref_experts.gate_up_proj.grad[expert_slice, :48]),
-        (grouped.w3_EFD, ref_experts.gate_up_proj.grad[expert_slice, 48:]),
-        (grouped.w2_EDF, ref_experts.down_proj.grad[expert_slice]),
+        (grouped.w1_EFD, ref_gate_up[expert_slice, :48]),
+        (grouped.w3_EFD, ref_gate_up[expert_slice, 48:]),
+        (grouped.w2_EDF, ref_down[expert_slice]),
     ):
         actual = parameter.grad.full_tensor()
         assert actual.abs().max() > 0
@@ -100,7 +105,8 @@ def main() -> None:
         [
             float((logits.detach() - ref_logits.detach()[token_slice]).abs().max()),
             max_grad_diff,
-        ]
+        ],
+        device=device,
     )
     dist.all_reduce(differences, op=dist.ReduceOp.MAX)
     if dist.get_rank() == 0:

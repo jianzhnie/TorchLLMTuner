@@ -220,31 +220,48 @@ def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
     loss_containers: list[list[torch.Tensor]] = []
     gradients: list[torch.Tensor] = []
 
-    def schedule_step(**kwargs) -> None:
-        losses = kwargs["losses"]
-        loss_containers.append(losses)
-        for value in (1.0, 2.0):
-            activation = torch.tensor(value, requires_grad=True)
-            # PP losses are normalized before the schedule runs backward. The
-            # trainer multiplies their detached sum by the global denominator
-            # to recover the raw reporting sum.
-            loss = (
-                activation.square().view(())
-                / kwargs["loss_kwargs"]["global_valid_tokens"]
-            )
-            loss.backward()
-            assert activation.grad is not None
-            gradients.append(activation.grad.detach().clone())
-            activation_refs.append(weakref.ref(activation))
-            loss_refs.append(weakref.ref(loss))
-            losses.append(loss)
+    class _FakeStage:
+        """The stage attributes the fallback driver primes before stepping."""
+
+        def __init__(self) -> None:
+            self.has_backward = True
+
+        def clear_runtime_states(self) -> None:
+            pass
+
+    class _FakeSchedule:
+        """Schedule shaped like torch 2.9's: one stage, no microbatch eval form.
+
+        The fallback driver reaches for ``_has_backward`` / ``_stage`` and then
+        ``_step_microbatches``, which is the same seam the real schedule offers.
+        """
+
+        def __init__(self) -> None:
+            self._has_backward = True
+            self._stage = _FakeStage()
+            self._llmtuner_global_valid_tokens: torch.Tensor | None = None
+
+        def _step_microbatches(self, args, kwargs_mbs, targets, losses) -> None:
+            loss_containers.append(losses)
+            for value in (1.0, 2.0):
+                activation = torch.tensor(value, requires_grad=True)
+                # PP losses are normalized before the schedule runs backward.
+                # The trainer multiplies their detached sum by the global
+                # denominator to recover the raw reporting sum.
+                loss = activation.square().view(()) / self._llmtuner_global_valid_tokens
+                loss.backward()
+                assert activation.grad is not None
+                gradients.append(activation.grad.detach().clone())
+                activation_refs.append(weakref.ref(activation))
+                loss_refs.append(weakref.ref(loss))
+                losses.append(loss)
 
     trainer = cast(
         Trainer,
         SimpleNamespace(
             pp_has_first_stage=True,
             pp_has_last_stage=True,
-            pp_schedule=SimpleNamespace(step=schedule_step),
+            pp_schedule=_FakeSchedule(),
             parallel_dims=None,
             param_context=nullcontext,
             pp_microbatches=lambda batch: [batch, batch],
@@ -2767,8 +2784,14 @@ def test_trainer_unequal_token_accumulation_matches_summed_loss_reference(tmp_pa
         reference.optimizer.zero_grad(set_to_none=True)
         losses = []
         for batch in batches:
+            # preprocess_inputs reads whatever device the batch is on; the
+            # trainer's own path moves it first (runtime/batch.py:preprocess),
+            # and the reference must do the same now that the device need not
+            # be CPU.
             tokens, targets, kwargs = reference.model.preprocess_inputs(
-                batch, parallel_dims=reference.parallel_dims, max_context_length=8
+                reference.to_device(batch),
+                parallel_dims=reference.parallel_dims,
+                max_context_length=8,
             )
             logits = reference.model(tokens, **kwargs)
             losses.append(

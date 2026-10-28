@@ -44,6 +44,7 @@ from llmtuner.parallel.expert_parallel import swap_hf_moe_blocks
 from llmtuner.parallel.expert_parallel.block_conversion import (
     restore_fp32_state_buffers,
 )
+from llmtuner.parallel.expert_parallel.hf_inspection import is_hf_moe_block
 
 TOL = 1e-6
 
@@ -97,6 +98,198 @@ def _data(seed: int = 7) -> tuple[torch.Tensor, torch.Tensor]:
     return ids, torch.arange(40)
 
 
+# The decoder-layer attributes a MoE block can live under. transformers 5.x
+# keeps every family on ``mlp``; 4.x spells Mixtral's and GraniteMoe's
+# ``block_sparse_moe`` and DeepSeek's/GLM4's ``moe`` -- and a DeepSeek layer
+# carries a *dense* ``mlp`` as well, so the MoE-shaped one has to win.
+BLOCK_ATTRS = ("mlp", "block_sparse_moe", "moe")
+
+
+def _hf_block(layer: torch.nn.Module) -> torch.nn.Module:
+    """The layer's MoE block, under whichever attribute this HF build uses."""
+    fallback = None
+    for name in BLOCK_ATTRS:
+        block = getattr(layer, name, None)
+        if block is None:
+            continue
+        if is_hf_moe_block(block):
+            return block
+        fallback = fallback or block
+    if fallback is None:
+        raise AssertionError("layer holds no MoE block attribute")
+    return fallback
+
+
+def _hf_block_attr(layer: torch.nn.Module) -> str:
+    """The attribute name holding the layer's block, without probing its layout.
+
+    Used where the layout has been deliberately broken and a probe would raise
+    instead of answering.
+    """
+    for name in BLOCK_ATTRS:
+        if getattr(layer, name, None) is not None:
+            return name
+    raise AssertionError("layer holds no MoE block attribute")
+
+
+def _hf_experts(block: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+    """HF's expert weights as ``(gate_up_EF2FD, down_EDF)``, in HF's own terms.
+
+    Read straight off the HF block rather than through llmtuner's probe, so a
+    comparison against it stays anchored on what HF computes with: 5.x keeps two
+    stacked parameters, 4.x keeps one module per expert.
+    """
+    experts = block.experts
+    gate_up = getattr(experts, "gate_up_proj", None)
+    if gate_up is not None:
+        return gate_up, experts.down_proj
+    for gate_name, up_name, down_name in (
+        ("gate_proj", "up_proj", "down_proj"),
+        ("w1", "w3", "w2"),
+    ):
+        if hasattr(experts[0], gate_name):
+            return (
+                torch.stack(
+                    [
+                        torch.cat(
+                            [
+                                getattr(expert, gate_name).weight,
+                                getattr(expert, up_name).weight,
+                            ],
+                            dim=0,
+                        )
+                        for expert in experts
+                    ]
+                ),
+                torch.stack([getattr(expert, down_name).weight for expert in experts]),
+            )
+    raise AssertionError(f"unrecognized HF expert layout on {type(experts).__name__}")
+
+
+def _hf_expert_activation(block: torch.nn.Module):
+    """The activation HF's experts apply, wherever this build keeps it."""
+    experts = block.experts
+    act_fn = getattr(experts, "act_fn", None)
+    return act_fn if act_fn is not None else experts[0].act_fn
+
+
+def _hf_gate_up_parameters(block: torch.nn.Module) -> list[torch.Tensor]:
+    """The gate/up projections HF holds, as parameters, in either layout."""
+    experts = block.experts
+    gate_up = getattr(experts, "gate_up_proj", None)
+    if gate_up is not None:
+        return [gate_up]
+    names = (
+        ("gate_proj", "up_proj") if hasattr(experts[0], "gate_proj") else ("w1", "w3")
+    )
+    return [getattr(expert, name).weight for expert in experts for name in names]
+
+
+def _hf_down_parameters(block: torch.nn.Module) -> list[torch.Tensor]:
+    """The down projections HF holds, as parameters, in either layout."""
+    experts = block.experts
+    down = getattr(experts, "down_proj", None)
+    if down is not None:
+        return [down]
+    name = "down_proj" if hasattr(experts[0], "down_proj") else "w2"
+    return [getattr(expert, name).weight for expert in experts]
+
+
+def _tie_expert_projection(
+    dst_block: torch.nn.Module, src_block: torch.nn.Module, projection: str
+) -> None:
+    """Tie one expert projection across two blocks, in either HF layout.
+
+    A fused (5.x) block shares the stacked parameter directly; a per-expert
+    (4.x) block ties each expert's weight, which the swap then binds to the one
+    stacked parameter they were converted into.
+    """
+    dst, src = dst_block.experts, src_block.experts
+    if hasattr(src, "gate_up_proj"):
+        setattr(dst, projection, getattr(src, projection))
+        return
+    if projection == "gate_up_proj":
+        names = (
+            ("gate_proj", "up_proj") if hasattr(src[0], "gate_proj") else ("w1", "w3")
+        )
+    else:
+        names = ("down_proj",) if hasattr(src[0], "down_proj") else ("w2",)
+    for dst_expert, src_expert in zip(dst, src, strict=True):
+        for name in names:
+            getattr(dst_expert, name).weight = getattr(src_expert, name).weight
+
+
+def _hf_projection_parameters(
+    block: torch.nn.Module, projection: str
+) -> list[torch.Tensor]:
+    """HF's original parameters for one projection, as a flat unique list."""
+    experts = block.experts
+    if getattr(experts, "gate_up_proj", None) is not None:
+        return [getattr(experts, projection)]
+    gate_name, up_name, down_name = (
+        ("gate_proj", "up_proj", "down_proj")
+        if hasattr(experts[0], "gate_proj")
+        else ("w1", "w3", "w2")
+    )
+    names = (gate_name, up_name) if projection == "gate_up_proj" else (down_name,)
+    return [getattr(e, name).weight for name in names for e in experts]
+
+
+def _hf_projection_tensor(
+    block: torch.nn.Module, projection: str, *, grad: bool = False
+) -> torch.Tensor:
+    """HF's projection as one ``(E, 2F, D)``/``(E, D, F)`` tensor, or its grad.
+
+    Reads the layout HF actually uses: the fused parameter directly, or the
+    per-expert weights stacked in ``GroupedExperts``' order (gate half, up
+    half) -- the same convention ``_hf_experts`` documents.
+    """
+    experts = block.experts
+    fused = getattr(experts, "gate_up_proj", None)
+    if fused is not None:
+        tensor = fused if projection == "gate_up_proj" else experts.down_proj
+        return tensor.grad if grad else tensor
+    gate_name, up_name, down_name = (
+        ("gate_proj", "up_proj", "down_proj")
+        if hasattr(experts[0], "gate_proj")
+        else ("w1", "w3", "w2")
+    )
+    if projection == "gate_up_proj":
+        pieces = [
+            torch.cat(
+                [g.grad if grad else g, u.grad if grad else u],
+                dim=0,
+            )
+            for e in experts
+            for g, u in [(getattr(e, gate_name).weight, getattr(e, up_name).weight)]
+        ]
+    else:
+        pieces = [
+            p.grad if grad else p
+            for e in experts
+            for p in [getattr(e, down_name).weight]
+        ]
+    return torch.stack(pieces)
+
+
+def _misshape_hf_experts(block: torch.nn.Module, hidden: int) -> None:
+    """Break the gate/up width pairing the reader checks, in either layout.
+
+    The shape check is what stands between a bad layout and a quiet half-copy,
+    so it has to be reachable on both the fused (5.x) and per-expert (4.x)
+    spellings.
+    """
+    experts = block.experts
+    with torch.no_grad():
+        if hasattr(experts, "gate_up_proj"):
+            # An odd output dim: not 2F.
+            experts.gate_up_proj = torch.nn.Parameter(torch.zeros(8, 7, hidden))
+        else:
+            first = experts[0]
+            name = "gate_proj" if hasattr(first, "gate_proj") else "w1"
+            getattr(first, name).weight = torch.nn.Parameter(torch.zeros(7, hidden))
+
+
 @pytest.mark.parametrize("norm_topk_prob", [False, True])
 def test_swapped_model_matches_hf_output(norm_topk_prob: bool) -> None:
     """Same weights, same tokens: the swap must not change the forward.
@@ -112,7 +305,7 @@ def test_swapped_model_matches_hf_output(norm_topk_prob: bool) -> None:
     swapped = _model(config)
 
     assert swap_hf_moe_blocks(swapped) == 2
-    assert all(isinstance(layer.mlp, MoE) for layer in swapped.layers)
+    assert all(isinstance(_hf_block(layer), MoE) for layer in swapped.layers)
 
     ids, positions = _data()
     with torch.no_grad():
@@ -135,15 +328,15 @@ def test_swap_moves_the_weights_verbatim() -> None:
     swapped = _model(config)
     swap_hf_moe_blocks(swapped)
 
-    hf_block = ref.layers[0].mlp
-    moe = swapped.layers[0].mlp
+    hf_block = _hf_block(ref.layers[0])
+    moe = _hf_block(swapped.layers[0])
     grouped = moe.routed_experts.inner_experts
     assert torch.equal(moe.router.gate.weight, hf_block.gate.weight)
-    gate_up = hf_block.experts.gate_up_proj
+    gate_up, down = _hf_experts(hf_block)
     hidden = gate_up.shape[1] // 2
     assert torch.equal(grouped.w1_EFD, gate_up[:, :hidden])
     assert torch.equal(grouped.w3_EFD, gate_up[:, hidden:])
-    assert torch.equal(grouped.w2_EDF, hf_block.experts.down_proj)
+    assert torch.equal(grouped.w2_EDF, down)
 
 
 def test_the_gate_and_up_halves_are_not_interchangeable() -> None:
@@ -160,19 +353,16 @@ def test_the_gate_and_up_halves_are_not_interchangeable() -> None:
     swapped = _model(config)
     swap_hf_moe_blocks(swapped)
 
-    hf_experts = ref.layers[0].mlp.experts
-    grouped = swapped.layers[0].mlp.routed_experts.inner_experts
-    act = ref.layers[0].mlp.experts.act_fn
+    hf_block = _hf_block(ref.layers[0])
+    grouped = _hf_block(swapped.layers[0]).routed_experts.inner_experts
+    act = _hf_expert_activation(hf_block)
+    gate_up, down = _hf_experts(hf_block)
 
     x = torch.randn(6, config.hidden_size, dtype=torch.float64)
     with torch.no_grad():
         for e in range(config.num_experts):
-            gate, up = torch.nn.functional.linear(x, hf_experts.gate_up_proj[e]).chunk(
-                2, dim=-1
-            )
-            expected = torch.nn.functional.linear(
-                act(gate) * up, hf_experts.down_proj[e]
-            )
+            gate, up = torch.nn.functional.linear(x, gate_up[e]).chunk(2, dim=-1)
+            expected = torch.nn.functional.linear(act(gate) * up, down[e])
             got = torch.nn.functional.linear(
                 act(x @ grouped.w1_EFD[e].T) * (x @ grouped.w3_EFD[e].T),
                 grouped.w2_EDF[e],
@@ -204,7 +394,7 @@ def test_swap_preserves_eval_mode() -> None:
     eval-built model's blocks (the aux loss would fire without a denominator)."""
     swapped = _model(_config(norm_topk_prob=True))
     swap_hf_moe_blocks(swapped)
-    assert not any(layer.mlp.training for layer in swapped.layers)
+    assert not any(_hf_block(layer).training for layer in swapped.layers)
 
     ids, positions = _data()
     with torch.no_grad():
@@ -660,19 +850,26 @@ def test_deepseek_v2_does_not_renormalize() -> None:
 
 
 def test_mixtral_swaps_in_place() -> None:
-    """Mixtral's block lives on ``mlp`` like every other family in 5.x.
+    """The replacement must land in the slot HF's own decoder layer calls.
 
-    It used to be ``block_sparse_moe``; a swap that still looked there would
-    find no MoE at all on a Mixtral and refuse the model outright.
+    Which slot that is depends on the transformers line: 5.x moved every family
+    onto ``mlp``, 4.x keeps Mixtral on ``block_sparse_moe``. Writing to a
+    different attribute would leave the original block in place and route around
+    the swap entirely, so the assertion is that the layer's MoE slot holds a
+    llmtuner block and that a forward still reaches it.
     """
     model = _mixtral_model()
-    assert type(model.layers[0].mlp).__name__ == "MixtralSparseMoeBlock"
+    assert type(_hf_block(model.layers[0])).__name__ == "MixtralSparseMoeBlock"
 
     assert swap_hf_moe_blocks(model) == 2
 
     for layer in model.layers:
-        assert isinstance(layer.mlp, MoE)
-        assert not hasattr(layer, "block_sparse_moe")
+        assert isinstance(_hf_block(layer), MoE)
+
+    ids, positions = _data()
+    with torch.no_grad():
+        out = model(ids, positions=positions)
+    assert out.shape == (40, 128)
 
 
 def test_mixtral_matches_hf_output() -> None:
@@ -779,10 +976,7 @@ def test_a_block_with_the_wrong_expert_layout_is_rejected() -> None:
     than as an index error somewhere deeper.
     """
     model = _deepseek_model()
-    with torch.no_grad():
-        model.layers[1].mlp.experts.gate_up_proj = torch.nn.Parameter(
-            torch.zeros(8, 7, 64)  # an odd output dim: not 2F
-        )
+    _misshape_hf_experts(_hf_block(model.layers[1]), hidden=64)
 
     with pytest.raises(ValueError, match="unrecognized expert weight shapes"):
         swap_hf_moe_blocks(model)
@@ -790,16 +984,24 @@ def test_a_block_with_the_wrong_expert_layout_is_rejected() -> None:
 
 def test_late_invalid_expert_layout_does_not_replace_earlier_layers() -> None:
     model = _model(_config(norm_topk_prob=True))
-    blocks_before = [layer.mlp for layer in model.layers]
+    # Attribute names, not probes: the block about to be misshaped can no
+    # longer answer a layout probe, and the point is that it is still *there*.
+    attrs_before = [_hf_block_attr(layer) for layer in model.layers]
+    blocks_before = [
+        getattr(layer, name)
+        for layer, name in zip(model.layers, attrs_before, strict=True)
+    ]
     counts_before = dict(AuxLoss._group_counts)
-    model.layers[1].mlp.experts.gate_up_proj = torch.nn.Parameter(torch.zeros(8, 7, 64))
+    _misshape_hf_experts(_hf_block(model.layers[1]), hidden=64)
 
     with pytest.raises(ValueError, match="unrecognized expert weight shapes"):
         swap_hf_moe_blocks(model)
 
     assert all(
-        layer.mlp is block
-        for layer, block in zip(model.layers, blocks_before, strict=True)
+        getattr(layer, name) is block
+        for layer, name, block in zip(
+            model.layers, attrs_before, blocks_before, strict=True
+        )
     )
     assert all(not getattr(layer, "moe_enabled", False) for layer in model.layers)
     assert dict(AuxLoss._group_counts) == counts_before
@@ -885,8 +1087,10 @@ def test_the_fp32_restore_covers_the_bias_buffer() -> None:
 def test_ep_conversion_preserves_parameter_freezing():
     model = _model(_config(norm_topk_prob=True))
     for layer in model.layers:
-        layer.mlp.gate.weight.requires_grad_(False)
-        layer.mlp.experts.gate_up_proj.requires_grad_(False)
+        block = _hf_block(layer)
+        block.gate.weight.requires_grad_(False)
+        for weight in _hf_gate_up_parameters(block):
+            weight.requires_grad_(False)
     assert swap_hf_moe_blocks(model) == 2
     for layer in model.layers:
         assert not layer.mlp.router.gate.weight.requires_grad
@@ -1010,46 +1214,54 @@ def test_swap_preserves_projection_sharing_and_accumulated_gradients(projection)
         if projection == "router":
             blocks[1].gate.weight = blocks[0].gate.weight
         else:
-            setattr(
-                blocks[1].experts, projection, getattr(blocks[0].experts, projection)
-            )
+            _tie_expert_projection(blocks[1], blocks[0], projection)
     original = reference.layers[0].mlp
     assert swap_hf_moe_blocks(swapped) == 2
     first, second = [layer.mlp for layer in swapped.layers]
     if projection == "router":
         actual = first.router.gate.weight
         assert actual is second.router.gate.weight
-        expected = original.gate.weight
         actual_parts = [actual]
+        expected_params = [original.gate.weight]
     elif projection == "gate_up_proj":
         a = first.routed_experts.inner_experts
         b = second.routed_experts.inner_experts
         assert a.w1_EFD is b.w1_EFD and a.w3_EFD is b.w3_EFD
-        expected = original.experts.gate_up_proj
         actual_parts = [a.w1_EFD, a.w3_EFD]
+        expected_params = _hf_projection_parameters(original, projection)
     else:
         actual = first.routed_experts.inner_experts.w2_EDF
         assert actual is second.routed_experts.inner_experts.w2_EDF
-        expected = original.experts.down_proj
         actual_parts = [actual]
+        expected_params = _hf_projection_parameters(original, projection)
     ids, positions = _data()
     reference_output = reference(ids, positions=positions)
     swapped_output = swapped(ids, positions=positions)
     torch.testing.assert_close(swapped_output, reference_output, atol=TOL, rtol=TOL)
     reference_output.square().mean().backward()
     swapped_output.square().mean().backward()
+    expected_grad = (
+        expected_params[0].grad
+        if projection == "router"
+        else _hf_projection_tensor(original, projection, grad=True)
+    )
     actual_grad = (
         torch.cat([p.grad for p in actual_parts], dim=1)
         if len(actual_parts) == 2
         else actual_parts[0].grad
     )
-    torch.testing.assert_close(actual_grad, expected.grad, atol=1e-7, rtol=1e-5)
+    torch.testing.assert_close(actual_grad, expected_grad, atol=1e-7, rtol=1e-5)
     torch.optim.SGD(actual_parts, lr=0.1).step()
-    torch.optim.SGD([expected], lr=0.1).step()
+    torch.optim.SGD(expected_params, lr=0.1).step()
     actual_value = (
         torch.cat(actual_parts, dim=1) if len(actual_parts) == 2 else actual_parts[0]
     )
-    torch.testing.assert_close(actual_value, expected, atol=TOL, rtol=TOL)
+    expected_value = (
+        expected_params[0]
+        if projection == "router"
+        else _hf_projection_tensor(original, projection)
+    )
+    torch.testing.assert_close(actual_value, expected_value, atol=TOL, rtol=TOL)
 
 
 @pytest.mark.parametrize("projection", ["router", "down_proj"])
@@ -1057,11 +1269,22 @@ def test_swap_preserves_parameter_shared_with_unconverted_module(projection):
     model = _model(_config(norm_topk_prob=True, aux_coeff=0.0))
     original = model.layers[0].mlp
     parameter = (
-        original.gate.weight if projection == "router" else original.experts.down_proj
+        original.gate.weight
+        if projection == "router"
+        else _hf_down_parameters(original)[0]
     )
     consumer = torch.nn.Module()
     consumer.register_parameter("weight", parameter)
     model.extra_consumer = consumer
+    if projection == "down_proj" and len(_hf_down_parameters(original)) > 1:
+        # A per-expert (4.x) down projection is stacked on conversion, so an
+        # external alias to one expert's weight cannot be preserved -- the same
+        # refusal the fused layout applies to its split gate/up alias.
+        with pytest.raises(UnsupportedCombinationError, match="extra_consumer"):
+            swap_hf_moe_blocks(model)
+        assert model.layers[0].mlp is original
+        assert consumer.weight is parameter
+        return
     swap_hf_moe_blocks(model)
     converted = model.layers[0].mlp
     actual = (
@@ -1135,7 +1358,7 @@ def test_shared_quantile_bias_survives_conversion_and_state_restore():
 def test_swap_rejects_external_fused_expert_alias_before_installation(whole_block):
     model = _model(_config(norm_topk_prob=True, aux_coeff=0.0))
     original_blocks = [layer.mlp for layer in model.layers]
-    original = original_blocks[0].experts.gate_up_proj
+    original = _hf_gate_up_parameters(original_blocks[0])[0]
     if whole_block:
         model.external_expert = original_blocks[0]
     else:
@@ -1185,6 +1408,11 @@ def test_fixed_router_ep1_public_assembly_runs_constant_routing():
     assert block.router.fixed_router
     assert block.routed_experts.inner_experts.w1_EFD.shape == (8, 48, 64)
     actual = block(inputs)
+    # 4.x Qwen3Moe unpacks ``(hidden, router_logits)`` from its block; the swap
+    # preserves that arity, handing back None for the internal scores.
+    if isinstance(actual, tuple):
+        actual, router_logits = actual
+        assert router_logits is None
     torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
 
 
@@ -1244,12 +1472,12 @@ def test_ep_rebinds_fused_fsdp_exclusions_hooks_and_unit_paths(native_path):
     )
     if native_path:
         path = path.removesuffix("experts") + "routed_experts.inner_experts"
-    original = block.experts.gate_up_proj
+    originals = set(_hf_gate_up_parameters(block))
     cfg = ParallelConfig(
         fsdp_config=FSDPConfig(
             fsdp_implementation="custom",
             fsdp_apply_modules={
-                path: {"ignored_params": {original}, "hook_module": block.experts}
+                path: {"ignored_params": originals, "hook_module": block.experts}
             },
         )
     )
@@ -1264,7 +1492,7 @@ def test_ep_rebinds_fused_fsdp_exclusions_hooks_and_unit_paths(native_path):
     options = rebound.fsdp_config.fsdp_apply_modules[target_path]
     assert options["ignored_params"] == {grouped.w1_EFD, grouped.w3_EFD}
     assert options["hook_module"] is grouped
-    assert cfg.fsdp_config.fsdp_apply_modules[path]["ignored_params"] == {original}
+    assert cfg.fsdp_config.fsdp_apply_modules[path]["ignored_params"] == originals
     assert cfg.fsdp_config.fsdp_apply_modules[path]["hook_module"] is block.experts
 
 
@@ -1276,7 +1504,11 @@ def test_replacement_observer_error_keeps_original_blocks_and_aux_counts():
 
     def reject(modules, parameters):
         assert all(block in modules for block in originals)
-        assert all(block.experts.gate_up_proj in parameters for block in originals)
+        assert all(
+            weight in parameters
+            for block in originals
+            for weight in _hf_gate_up_parameters(block)
+        )
         assert all(
             layer.mlp is original
             for layer, original in zip(model.layers, originals, strict=True)

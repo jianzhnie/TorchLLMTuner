@@ -10,6 +10,17 @@ training step, so this cannot silently fall back to random weights.
 
 Launch through ``examples/train_qwen3_8b_npu.sh``. The default topology is
 8-way FSDP with full activation checkpointing and BF16 model construction.
+
+``LLMTUNER_TENSOR_PARALLEL_SIZE`` / ``LLMTUNER_PIPELINE_PARALLEL_SIZE`` /
+``LLMTUNER_NUM_PP_MICROBATCHES`` / ``LLMTUNER_CONTEXT_PARALLEL_SIZE`` select
+other topologies without editing this file; they default to 1 (pure FSDP),
+except the microbatch count, which follows ``pipeline_parallel_size`` since the
+schedule rejects fewer microbatches than stages. The data-parallel shard degree
+keeps its ``-1`` "cover the rest of the world" meaning, so the explicit sizes
+multiply up to the world size: ``dp_shard * tp * pp * cp == world``. Context
+parallelism shards the sequence across ranks and is served by the sdpa
+KV-allgather kernel, which requires ``max_seq_len`` to be a multiple of the
+context-parallel size.
 """
 
 from __future__ import annotations
@@ -27,6 +38,7 @@ from llmtuner.config import (
     ModelConfig,
     OptimizerConfig,
     ParallelConfig,
+    PipelineParallelConfig,
     TrainingConfig,
 )
 
@@ -40,6 +52,23 @@ def qwen3_8b_npu_config() -> LLMTunerConfig:
     model_path = os.environ.get("LLMTUNER_QWEN3_8B_PATH", MODEL_PATH)
     dataset_path = os.environ.get("LLMTUNER_DATASET_PATH", DATASET_PATH)
     save_checkpoint = os.environ.get("LLMTUNER_SAVE_CHECKPOINT", "1") == "1"
+    tensor_parallel_size = int(os.environ.get("LLMTUNER_TENSOR_PARALLEL_SIZE", "1"))
+    pipeline_parallel_size = int(os.environ.get("LLMTUNER_PIPELINE_PARALLEL_SIZE", "1"))
+    # One microbatch per stage is the floor the schedule accepts, and the only
+    # default that works unasked: pp=2 with a single microbatch is rejected by
+    # torch's 1F1B schedule constructor (n_microbatches >= num_stages).
+    num_pp_microbatches = int(
+        os.environ.get(
+            "LLMTUNER_NUM_PP_MICROBATCHES", str(max(1, pipeline_parallel_size))
+        )
+    )
+    # CP splits the sequence across ranks; the kv_allgather strategy is the one
+    # the sdpa kernel implements (see parallel/context_parallel/sdpa_attention).
+    context_parallel_size = int(os.environ.get("LLMTUNER_CONTEXT_PARALLEL_SIZE", "1"))
+    # Deterministic kernels cost throughput; the default matches the shape of
+    # this example (a training run, not a bit-reproducibility harness). Turn it
+    # on when comparing per-step loss curves against another implementation.
+    deterministic = os.environ.get("LLMTUNER_DETERMINISTIC", "0") == "1"
     if not os.path.isfile(os.path.join(model_path, "config.json")):
         raise FileNotFoundError(f"Qwen3-8B config.json not found under {model_path}")
     if not os.path.isfile(dataset_path):
@@ -49,6 +78,10 @@ def qwen3_8b_npu_config() -> LLMTunerConfig:
         model=ModelConfig(model_name_or_path=model_path),
         parallel=ParallelConfig(
             data_parallel_shard_size=-1,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            context_parallel_kv_allgather_size=context_parallel_size,
+            pp_config=PipelineParallelConfig(num_pp_microbatches=num_pp_microbatches),
         ),
         optimizer=OptimizerConfig(
             learning_rate=1e-5,
@@ -59,7 +92,7 @@ def qwen3_8b_npu_config() -> LLMTunerConfig:
             max_seq_len=int(os.environ.get("LLMTUNER_MAX_SEQ_LEN", "4096")),
             steps=int(os.environ.get("LLMTUNER_STEPS", "100")),
             seed=42,
-            deterministic=False,
+            deterministic=deterministic,
             activation_checkpoint_mode="full",
             checkpoint_config=CheckpointConfig(
                 enable=True,
@@ -79,7 +112,15 @@ def qwen3_8b_npu_config() -> LLMTunerConfig:
                 prompt_field="problem",
                 response_field="solution",
                 packing="first_fit",
-                max_num_documents=1,
+                # 1 = one document per sequence (plain causal attention, no mask
+                # materialized). A larger value packs several documents into a
+                # sequence, which needs the block-causal document mask; that is
+                # built densely on this backend (see
+                # HFTransformerModel._apply_attention) instead of via flex,
+                # which Ascend does not have.
+                max_num_documents=int(
+                    os.environ.get("LLMTUNER_MAX_NUM_DOCUMENTS", "1")
+                ),
             ),
             metrics_config=MetricsConfig(log_freq=1),
             dump_folder=os.environ.get(

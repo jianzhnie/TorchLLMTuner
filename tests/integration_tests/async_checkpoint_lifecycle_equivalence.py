@@ -20,11 +20,13 @@ from llmtuner.components.checkpointer.distributed_checkpoint import (
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config import CheckpointConfig, LRSchedulerConfig, OptimizerConfig
+from tests.integration_tests.harness import device as harness_device
+from tests.integration_tests.harness import init_distributed, moved
 
 
 def step(model, optimizer, scheduler):
     optimizer.zero_grad(set_to_none=True)
-    inputs = torch.arange(12).float().reshape(4, 3) / 11
+    inputs = moved(torch.arange(12).float().reshape(4, 3) / 11)
     model(inputs).square().mean().backward()
     optimizer.step()
     scheduler.step()
@@ -50,7 +52,7 @@ def assert_group_released(group):
 
 
 def main():
-    dist.init_process_group("gloo")
+    init_distributed()
     active = []
     try:
         assert dist.get_world_size() == 2
@@ -62,7 +64,7 @@ def main():
             root = paths[0]
             for cycle in range(2):
                 torch.manual_seed(42 + cycle)
-                model = torch.nn.Linear(3, 2)
+                model = moved(torch.nn.Linear(3, 2))
                 optimizer = OptimizersContainer(
                     OptimizerConfig(learning_rate=0.01, implementation="for-loop"),
                     model_parts=[model],
@@ -88,7 +90,7 @@ def main():
                 assert manager.save_future is None
                 dist.barrier()
                 step(model, optimizer, scheduler)
-                resumed_model = torch.nn.Linear(3, 2)
+                resumed_model = moved(torch.nn.Linear(3, 2))
                 resumed_optimizer = OptimizersContainer(
                     OptimizerConfig(learning_rate=0.3, implementation="for-loop"),
                     model_parts=[resumed_model],
@@ -120,7 +122,7 @@ def main():
                     atol=0,
                 )
                 assert resumed_scheduler.state_dict() == scheduler.state_dict()
-                probe = torch.tensor(rank + 1)
+                probe = torch.tensor(rank + 1, device=harness_device())
                 dist.all_reduce(probe)
                 assert probe.item() == 3
                 if rank == 0:

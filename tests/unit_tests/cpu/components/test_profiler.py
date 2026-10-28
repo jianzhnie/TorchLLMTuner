@@ -26,7 +26,7 @@ from llmtuner.components.profiler import (
     caused_by_oom,
 )
 from llmtuner.config import ProfilerConfig as Config
-from llmtuner.utils.monitoring import record_memory_history
+from llmtuner.utils.monitoring import memory_module, record_memory_history
 
 # -- config -------------------------------------------------------------------
 
@@ -385,17 +385,29 @@ def test_a_worker_directory_is_nested_under_the_step(
 # -- the device probes underneath --------------------------------------------
 
 
-def test_a_cpu_run_reports_that_it_cannot_record_history() -> None:
-    """torchtitan's non-CUDA branch calls ``torch.memory``, which is not a real
-    module -- so this raises AttributeError there rather than returning False."""
+def test_a_device_without_allocator_history_reports_that_it_cannot_record() -> None:
+    """The report must follow the *device* module, not CUDA specifically.
+
+    torchtitan's non-CUDA branch calls ``torch.memory``, which is not a real
+    module -- so this raises AttributeError there rather than returning False.
+    llmtuner asks the training device's own memory module instead, which is what
+    the assertion mirrors: an NPU run *can* record history (torch_npu ships the
+    allocator hook), a CPU run cannot.
+    """
     started = record_memory_history(max_entries=100)
 
-    assert started == torch.cuda.is_available()
+    assert started == (memory_module() is not None)
 
 
-def test_a_memory_profiler_off_cuda_warns_and_writes_nothing(tmp_path, caplog) -> None:
+def test_a_memory_profiler_without_allocator_history_warns_and_writes_nothing(
+    tmp_path, caplog
+) -> None:
     """Said once, when the run asked for snapshots, rather than silently
-    producing empty files for the rest of it."""
+    producing empty files for the rest of it.
+
+    Keyed on the device's memory module rather than on CUDA: an NPU run has
+    allocator history to write (see the test above).
+    """
     profiler = MemoryProfiler(
         step_num=0,
         freq=1,
@@ -408,7 +420,7 @@ def test_a_memory_profiler_off_cuda_warns_and_writes_nothing(tmp_path, caplog) -
     for _ in range(3):
         profiler.step()
 
-    if torch.cuda.is_available():
+    if memory_module() is not None:
         assert profiler._records_history
     else:
         assert not profiler._records_history

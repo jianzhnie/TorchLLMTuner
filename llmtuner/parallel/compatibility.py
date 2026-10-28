@@ -116,6 +116,33 @@ def chunked_loss_validation(chunks: int) -> None:
     )
 
 
+def chunked_loss_fsdp(chunks: int) -> None:
+    """Several chunk backwards do not survive an FSDP2-sharded ``lm_head`` here.
+
+    Each chunk runs the head, backwards it, and then one final backward
+    propagates the assembled hidden-state gradients through the decoder. That
+    works for one chunk; from two on, the second chunk's head use runs against
+    parameter storage FSDP has already released, and the failure surfaces as
+    "The tensor has a non-zero number of elements, but its data is not allocated
+    yet" on NPU and as a hard SIGSEGV under gloo. Disabling reshard-after-forward
+    does not change it, so the release is not that hook.
+
+    Keeping the head unsharded across the loop is the fix this repository would
+    want, and its API does not exist here: torch 2.9's ``FSDPModule.unshard()``
+    returns an ``UnshardHandle`` with only ``wait()``, no context-manager form to
+    hold the unshard open around the loop.
+    """
+    raise UnsupportedCombinationError(
+        f"chunked_loss_num_chunks={chunks} with FSDP is not supported: each "
+        "chunk backwards the sharded lm_head separately, and this torch's FSDP2 "
+        "releases the unsharded head storage after the first chunk's backward, "
+        "so the second chunk runs against unallocated memory (NPU: 'The tensor "
+        "has a non-zero number of elements, but its data is not allocated yet'; "
+        "gloo: SIGSEGV). Run with chunked_loss_num_chunks=1, or with a torch "
+        "whose FSDPModule.unshard() can be held open as a context manager."
+    )
+
+
 def ep_hf_initial_load(ep: int) -> None:
     """The HF checkpoint carries the pre-swap expert layout
     (``gate_up_proj``/``down_proj``); the swapped model holds
@@ -360,6 +387,12 @@ ENTRIES: tuple[CompatibilityRule, ...] = (
         "assembly",
         UnsupportedCombinationError,
         "trainer/runtime/validation.py::check_validation_feasibility",
+    ),
+    CompatibilityRule(
+        chunked_loss_fsdp,
+        "assembly",
+        UnsupportedCombinationError,
+        "trainer/runtime/assembly.py::_build_model",
     ),
     CompatibilityRule(
         pp_weight_tying,

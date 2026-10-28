@@ -323,29 +323,46 @@ def test_flex_backend_passes_an_explicit_mask_through(
     assert kwargs["attention_mask"] is sentinel
 
 
-def test_non_flex_backend_rejects_a_packed_sequence(model: HFTransformerModel) -> None:
-    """Packing cannot be expressed by the fallback; it must fail, not go unmasked.
+def test_non_flex_backend_gets_a_dense_document_mask(model: HFTransformerModel) -> None:
+    """Packing on a tensor backend: materialize the document structure.
 
-    Packedness is corpus-derived (``attn_mask_type``), not inferred from the
-    positions: the guard keys off the same flag ``get_attention_masks`` builds
-    the document mask from.
+    A tensor backend has no BlockMask, so the packed case is served by a dense
+    additive mask (causal AND same-document). The alternative -- dropping the
+    mask -- would silently turn packing into full cross-document attention, and
+    refusing it outright (the earlier behaviour) made a packed corpus
+    unrunnable on any backend without flex, which is every Ascend build.
+
+    Packedness is corpus-derived (``attn_mask_type``), the same flag
+    ``get_attention_masks`` builds the document mask from.
     """
     model.model.config.attn_mask_type = "block_causal"
     packed = torch.tensor([0, 1, 2, 0, 1, 2])
 
-    with pytest.raises(ValueError, match="packed sequence"):
-        model._apply_attention(packed, None)
+    kwargs = model._apply_attention(packed, None)
+
+    mask = kwargs["attention_mask"]
+    assert mask is not None
+    assert tuple(mask.shape) == (1, 1, 6, 6)
+    allowed = mask == 0
+    # Causal inside the first document...
+    assert bool(allowed[0, 0, 2, 1])
+    assert not bool(allowed[0, 0, 1, 2])
+    # ...and sealed off from the second one, in both directions.
+    assert not bool(allowed[0, 0, 3:, :3].any())
+    assert not bool(allowed[0, 0, :3, 3:].any())
+    # Non-vacuity: the second document still attends its own earlier tokens.
+    assert bool(allowed[0, 0, 4, 3])
 
 
-def test_non_flex_backend_rejects_a_length_one_document_boundary(
+def test_the_dense_document_mask_respects_a_length_one_boundary(
     model: HFTransformerModel,
 ) -> None:
     """A boundary after a length-1 document has no descending position edge.
 
     ``[0, 0, 1, 2]`` is two documents (lengths 1 and 3) with no restart for a
-    ``positions[1:] < positions[:-1]`` scan to find. Keying the guard off that
-    scan would let sdpa attend across the boundary silently; keying it off
-    ``attn_mask_type`` catches it.
+    ``positions[1:] < positions[:-1]`` scan to find. The mask is built from the
+    ``attn_mask_type`` flag plus the document ids derived the same way the flex
+    modifiers derive them, so the boundary is honoured either way.
     """
     model.model.config.attn_mask_type = "block_causal"
     boundary_after_length_one = torch.tensor([0, 0, 1, 2])
@@ -353,8 +370,11 @@ def test_non_flex_backend_rejects_a_length_one_document_boundary(
         (boundary_after_length_one[1:] < boundary_after_length_one[:-1]).any()
     )
 
-    with pytest.raises(ValueError, match="packed sequence"):
-        model._apply_attention(boundary_after_length_one, None)
+    mask = model._apply_attention(boundary_after_length_one, None)["attention_mask"]
+
+    allowed = mask == 0
+    assert not bool(allowed[0, 0, 1, 0])  # the length-1 document stays alone
+    assert bool(allowed[0, 0, 2, 1]) and bool(allowed[0, 0, 3, 1])
 
 
 # -- the config path the trainer uses ------------------------------------------

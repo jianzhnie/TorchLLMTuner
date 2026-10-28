@@ -153,6 +153,7 @@ from llmtuner.config.parallel_config import (
 )
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.module_names import canonical_fqn
+from tests.integration_tests.harness import device as harness_device
 
 SPLIT_STEP = 2  # N: checkpoint taken after this many steps
 EXTRA_STEPS = 2  # M: steps trained after the checkpoint (both runs)
@@ -940,7 +941,8 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
                 f"vs uninterrupted {want!r} (diff {diff:.3e})"
             )
 
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    # Crosses an HCCL group on the accelerator: it has to live on that device.
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=harness_device())
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
     rank_failures = [None] * trainer.world_size
     dist.all_gather_object(rank_failures, failures)

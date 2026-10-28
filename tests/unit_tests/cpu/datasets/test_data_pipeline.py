@@ -1666,8 +1666,15 @@ def _loader_config(
 
 
 def test_dataloader_rejects_an_unknown_corpus_at_build_time() -> None:
-    """The registry check lives in ``build_dataloader``, not in the config."""
-    with pytest.raises(ValueError, match="unknown dataset"):
+    """The registry check lives in ``build_dataloader``, not in the config.
+
+    Which error does the rejecting depends on the environment. A name the text
+    registry does not know raises ``ValueError``; a build without the multimodal
+    extras cannot rule the name out, because the registry it would consult does
+    not import, and raises the ``ImportError`` that says so. Both name the
+    offending corpus and both happen at build time, which is the contract here.
+    """
+    with pytest.raises((ValueError, ImportError), match="not-a-dataset"):
         build_dataloader(
             _loader_config(
                 DataloaderConfig(dataset="not-a-dataset", tokenizer_path="/tmp/tok")

@@ -5,6 +5,8 @@
 
 Runs native/custom engines with shard and replicate meshes on CPU/Gloo,
 including shard-to-replicate and replicate-to-shard checkpoint restoration.
+The custom (fine-grained) engine needs torch 2.14 private APIs; where they are
+absent its cases skip with a printed note and only the native engine runs.
 Custom here uses default module hooks; relocated hooks and multiple contexts
 are not exercised. Uses rank-distinct batches, a decaying LR, and fresh objects.
 Checks loss, all gradients, final parameters, Adam moments/counters, and LR.
@@ -50,6 +52,9 @@ from llmtuner.config.optimizer_config import OptimizerConfig
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import apply_fsdp
 from llmtuner.parallel.topology import ParallelTopology
+from llmtuner.utils.seeding import set_deterministic_algorithms
+from tests.caps import CAPS
+from tests.integration_tests.harness import backend, device, init_distributed
 
 STEPS = 6
 RESUME_STEP = 2
@@ -283,7 +288,8 @@ def check_case(
     if rank == 0:
         print(
             f"{mode}->{resume_mode}/{implementation}: "
-            f"AdamW resume atol={resume_atol}; dense oracle atol={ATOL}"
+            f"AdamW resume atol={resume_atol}; dense oracle atol={ATOL} "
+            f"[device={device().type} backend={backend()}]"
         )
 
 
@@ -302,7 +308,13 @@ def main():
         help="Exercise the save subprocess with shared CPU staging (no device pinning)",
     )
     args = parser.parse_args()
-    dist.init_process_group("gloo")
+    init_distributed()
+    # The same-layout cases below assert bit-equality between the continuous
+    # run and the resumed one (``resume_atol = 0``), which is only a statement
+    # about the checkpoint if the kernels themselves are deterministic: the
+    # default NPU reductions are not, and differ by ~1 ULP between two runs
+    # with identical state.
+    set_deterministic_algorithms()
     try:
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
@@ -314,9 +326,17 @@ def main():
             if args.checkpoint_root:
                 subfolder = f"equivalence-{Path(paths[0]).name}"
                 checkpoint_root = f"{args.checkpoint_root.rstrip('/')}/{subfolder}"
+            # The custom (fine-grained) engine imports torch 2.14 private APIs
+            # at module scope; on older torch only the native implementation
+            # can run. Gate instead of failing the whole sweep.
+            implementations = ["native"]
+            if CAPS["fine_grained_fsdp"]():
+                implementations.append("custom")
+            elif rank == 0:
+                print("SKIP custom implementation: fine_grained_fsdp unavailable")
             for mode in ("shard", "ddp"):
                 for resume_mode in ("shard", "ddp"):
-                    for implementation in ("native", "custom"):
+                    for implementation in implementations:
                         check_case(
                             mode,
                             resume_mode,

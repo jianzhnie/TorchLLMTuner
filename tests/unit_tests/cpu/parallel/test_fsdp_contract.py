@@ -925,6 +925,7 @@ def test_pipeline_patterns_rebind_copied_hooks_and_excluded_parameters():
 
 @pytest.mark.parametrize("recompute", [False, True])
 def test_custom_fsdp_recompute_enters_backward_lifecycle(monkeypatch, recompute):
+    require_env("fine_grained_fsdp")
     from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
     from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
 

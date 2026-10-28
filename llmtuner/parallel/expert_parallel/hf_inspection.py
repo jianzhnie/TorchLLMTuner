@@ -19,9 +19,10 @@ releases:
   ``nn.Linear`` (DeepSeek-V2) or a bespoke module holding the same ``(E, D)``
   weight plus, for DeepSeek-V3/GLM4, an ``e_score_correction_bias`` buffer.
   Identified by its *weight tensor*, not its type (``router_of``).
-* **The expert weights.** Always ``gate_up_proj (E, 2F, D)`` and
-  ``down_proj (E, D, F)``, split by ``chunk(2, dim=-1)`` after the gate+up
-  GEMM. Identified by shape (``fused_experts_of``).
+* **The expert weights.** Fused layouts use ``gate_up_proj (E, 2F, D)`` and
+  ``down_proj (E, D, F)``. ``fused_experts_of`` splits the gate/up weight on
+  its output-feature axis (dim 1), yielding two ``(E, F, D)`` views. The HF
+  forward instead splits the gate/up GEMM output on its last axis.
 
 Where a family keeps its routing attributes also moved in 5.x: ``top_k``,
 ``n_group``, ``topk_group``, ``norm_topk_prob``, ``scoring_func`` and
@@ -67,13 +68,27 @@ only adds, and is refused at the point the shared expert is found.
 
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
 from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 
 from ...models.common.moe.layer import MOE_LAYER_ATTRS
+from ...models.kimi.moe import KimiSparseMoE
+from ...utils.logging import get_logger
 from .. import compatibility
+
+logger = get_logger(__name__)
+
+try:
+    # transformers 5.x spells the gated activation as its own module; it computes
+    # the same ``torch.nn.functional.silu``.
+    from transformers.activations import SiLUActivation
+except ImportError:  # transformers < 5 uses torch.nn.SiLU directly
+    SiLUActivation = nn.SiLU
 
 __all__ = [
     "FusedExperts",
@@ -81,6 +96,7 @@ __all__ = [
     "ignores_norm_topk_prob",
     "is_hf_moe_block",
     "moe_block_of",
+    "per_expert_projection_names",
     "read_expert_groups",
     "read_route_norm",
     "read_route_scale",
@@ -88,6 +104,7 @@ __all__ = [
     "resolve_shared_expert",
     "resolve_top_k",
     "router_of",
+    "returns_router_logits",
 ]
 
 
@@ -116,6 +133,124 @@ class FusedExperts(NamedTuple):
     up_EFD: torch.Tensor
     down_EDF: torch.Tensor
     num_experts: int
+
+
+# The three separate projections a pre-5.x expert module carries, per family
+# spelling: (gate, up, down). Mixtral/GraniteMoe name them ``w1``/``w3``/``w2``
+# -- ``act_fn(w1(x)) * w3(x)`` then ``w2`` -- the rest use the descriptive names.
+PER_EXPERT_PROJECTIONS = (
+    ("gate_proj", "up_proj", "down_proj"),
+    ("w1", "w3", "w2"),
+)
+
+
+def _has_projection_weight(module: object) -> bool:
+    """Whether ``module`` is an expert projection: a 2-D ``weight``, by shape.
+
+    Not ``isinstance(nn.Linear)``: by the time this probe runs under TP the
+    projections may already be llmtuner's parallel linears, which carry the
+    same ``(out, in)`` weight but are not HF's class.
+    """
+    weight = getattr(module, "weight", None)
+    return isinstance(weight, torch.Tensor) and weight.dim() == 2
+
+
+def per_expert_projection_names(experts: nn.Module) -> tuple[str, str, str] | None:
+    """The (gate, up, down) attribute spelling of a per-expert module list.
+
+    Returns ``None`` for the fused 5.x layout (two stacked tensors) and for
+    anything that is not a recognized per-expert list; callers that find a
+    spelling here can rely on ``fused_experts_of`` having accepted the block.
+    """
+    if not isinstance(experts, (nn.ModuleList, nn.Sequential, list, tuple)):
+        return None
+    members = list(experts)
+    if not members:
+        return None
+    first = members[0]
+    for names in PER_EXPERT_PROJECTIONS:
+        if all(_has_projection_weight(getattr(first, name, None)) for name in names):
+            return names
+    return None
+
+
+def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None:
+    """Read a pre-5.x per-expert module list as the fused 5.x parameters.
+
+    transformers 5.x collapsed "one module per expert" into two stacked
+    parameters; the 4.x line still holds one
+    ``Qwen3MoeMLP(gate_proj, up_proj, down_proj)`` -- or
+    ``MixtralBlockSparseTop2MLP(w1, w3, w2)`` -- per expert. Stacking those three
+    projections into ``(E, 2F, D)`` / ``(E, D, F)`` here keeps the swap, the
+    weight move and the tests on the single layout they already share, instead
+    of teaching each of them a second one.
+
+    Returns ``None`` for a list that is not one of the recognized spellings, so
+    the caller keeps its "no MoE block here" behaviour.
+    """
+    if not isinstance(experts, (nn.ModuleList, nn.Sequential, list, tuple)):
+        return None
+    members = list(experts)
+    if not members:
+        return None
+    first = members[0]
+    for gate_name, up_name, down_name in PER_EXPERT_PROJECTIONS:
+        # Identified by their ``(out, in)`` weight, not by class: under TP these
+        # projections are llmtuner's parallel linears, under EP-swap ordering
+        # they are still HF's ``nn.Linear``, and the shapes are what the reader
+        # actually needs.
+        if not all(
+            _has_projection_weight(getattr(first, name, None))
+            for name in (gate_name, up_name, down_name)
+        ):
+            continue
+        act_fn = getattr(first, "act_fn", None)
+        if act_fn is not None and not isinstance(act_fn, nn.SiLU | SiLUActivation):
+            raise NotImplementedError(
+                f"Expert activation {type(act_fn).__name__} is not SiLU; the "
+                "swap would silently change the experts' nonlinearity. Wire the "
+                "activation through GroupedExperts first."
+            )
+        hidden, dim = getattr(first, gate_name).weight.shape
+        down_dim, down_hidden = getattr(first, down_name).weight.shape
+        if down_dim != dim or down_hidden != hidden:
+            raise ValueError(
+                f"unrecognized expert weight shapes: {gate_name} "
+                f"{tuple(getattr(first, gate_name).weight.shape)}, {down_name} "
+                f"{tuple(getattr(first, down_name).weight.shape)}. Expected "
+                f"(F, D) and (D, F)."
+            )
+        gates: list[torch.Tensor] = []
+        ups: list[torch.Tensor] = []
+        downs: list[torch.Tensor] = []
+        for expert in members:
+            gate = getattr(expert, gate_name).weight
+            up = getattr(expert, up_name).weight
+            down = getattr(expert, down_name).weight
+            if gate.shape != (hidden, dim) or up.shape != (hidden, dim):
+                raise ValueError(
+                    f"expert {gate_name}/{up_name} shapes differ across the "
+                    f"list: got {tuple(gate.shape)} and {tuple(up.shape)}, "
+                    f"expected {(hidden, dim)} for all {len(members)} experts."
+                )
+            if down.shape != (down_dim, down_hidden):
+                raise ValueError(
+                    f"expert {down_name} shape differs across the list: got "
+                    f"{tuple(down.shape)}, expected {(down_dim, down_hidden)}."
+                )
+            gates.append(gate)
+            ups.append(up)
+            downs.append(down)
+        # First half gate, second half up: the split ``chunk(2, dim=-1)`` in the
+        # 5.x forward, and the same convention ``GroupedExperts`` reads.
+        gate_up = torch.cat([torch.stack(gates), torch.stack(ups)], dim=1)
+        return FusedExperts(
+            gate_EFD=gate_up[:, :hidden],
+            up_EFD=gate_up[:, hidden:],
+            down_EDF=torch.stack(downs),
+            num_experts=len(members),
+        )
+    return None
 
 
 def fused_experts_of(block: nn.Module) -> FusedExperts | None:
@@ -149,7 +284,8 @@ def fused_experts_of(block: nn.Module) -> FusedExperts | None:
     gate_up = getattr(experts, "gate_up_proj", None)
     down = getattr(experts, "down_proj", None)
     if not isinstance(gate_up, torch.Tensor) or not isinstance(down, torch.Tensor):
-        return None
+        # Pre-5.x layout: one module per expert instead of two stacked tensors.
+        return _fused_experts_of_per_expert_list(experts)
     if gate_up.dim() != 3 or down.dim() != 3:
         return None
     if gate_up.shape[0] != down.shape[0]:
@@ -158,10 +294,6 @@ def fused_experts_of(block: nn.Module) -> FusedExperts | None:
     # silu today, but the probe must say so rather than let a future HF family
     # with a different gated activation be swapped in silently.
     act_fn = getattr(experts, "act_fn", None)
-    # transformers 5.x exposes its own SiLUActivation module rather than
-    # torch.nn.SiLU. It computes the same torch.nn.functional.silu operation.
-    from transformers.activations import SiLUActivation
-
     if act_fn is not None and not isinstance(act_fn, nn.SiLU | SiLUActivation):
         raise NotImplementedError(
             f"Expert activation {type(act_fn).__name__} is not SiLU; the swap "
@@ -326,22 +458,73 @@ def read_route_scale(block: nn.Module, router: nn.Module) -> float:
     return 1.0
 
 
+def returns_router_logits(block: nn.Module) -> bool:
+    """Whether ``block``'s forward returns ``(hidden_states, router_logits)``.
+
+    transformers has no single convention here, and it varies by *family*, not
+    by spelling: 4.x Mixtral's host unpacks a tuple from ``block_sparse_moe``,
+    OLMoE's unpacks one from ``mlp``, while Qwen3Moe's tolerates either and
+    DeepSeek's takes a bare tensor from ``moe``. Neither the attribute name nor
+    the class name separates them, so the answer is read off the block itself --
+    from the AST of its ``forward``, not by running it.
+
+    Preserving the block's own arity is correct by construction: HF's host layer
+    is written against HF's own block, so reproducing the return shape keeps the
+    host's contract intact whatever the transformers version does.
+
+    Reading the source rather than calling the block matters: a runtime probe
+    would have to pick a dtype/device for a throwaway input, and models that
+    deliberately mix dtypes (tests do) would make it fail inside an unrelated
+    ``Linear``.
+
+    Falls back to ``False`` (bare tensor, what most families and every 5.x block
+    return) when the source cannot be read, e.g. an installed-and-stripped
+    build; that case is logged rather than assumed silently.
+    """
+    try:
+        source = textwrap.dedent(inspect.getsource(type(block).forward))
+    except (OSError, TypeError):
+        logger.warning(
+            "Cannot read %s.forward to learn whether it returns router logits; "
+            "assuming a bare tensor, which is what the 5.x families do.",
+            type(block).__name__,
+        )
+        return False
+    for node in ast.walk(ast.parse(source)):
+        # ``return a, b`` and ``return (a, b)`` are both ast.Tuple.
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple):
+            return True
+    return False
+
+
 def moe_block_of(layer: nn.Module) -> tuple[str, nn.Module | None]:
     """The layer's MoE block and the attribute it is held under.
 
-    Every supported family keeps it on ``mlp``. The attribute name is returned
-    alongside the block because the swap has to *replace* the attribute, so the
-    replacement must land in the same slot.
+    The attribute is returned alongside the block because the swap has to
+    *replace* the attribute, so the replacement must land in the same slot.
+    Which attribute that is varies: 5.x keeps the block on ``mlp`` for every
+    family, while 4.x uses ``block_sparse_moe`` (Mixtral, GraniteMoe) or ``moe``
+    (DeepSeek, GLM4). DeepSeek layers additionally carry a *dense* ``mlp``, so
+    the probe prefers whichever attribute actually holds a MoE and only falls
+    back to the first one present.
 
     ``MOE_LAYER_ATTRS`` is shared with the expert-bias hook in
     ``models/common/moe/layer.py`` -- that hook rediscovers these blocks after the
     swap, so the two must agree on where a MoE can live.
     """
+    fallback: tuple[str, nn.Module | None] = (MOE_LAYER_ATTRS[0], None)
     for name in MOE_LAYER_ATTRS:
         block = getattr(layer, name, None)
-        if block is not None:
+        if block is None:
+            continue
+        # KimiSparseMoE is llmtuner's own block spelling, not the generic HF
+        # shape: the fused-experts probe refuses its SituGLU activation, so it
+        # must be recognized directly, the same way swap_hf_moe_blocks does.
+        if isinstance(block, KimiSparseMoE) or is_hf_moe_block(block):
             return name, block
-    return MOE_LAYER_ATTRS[0], None
+        if fallback[1] is None:
+            fallback = (name, block)
+    return fallback
 
 
 def read_expert_groups(

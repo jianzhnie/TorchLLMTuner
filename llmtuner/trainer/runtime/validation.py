@@ -13,9 +13,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from llmtuner.accelerator.capabilities import require
+from llmtuner.accelerator.capabilities import has as capability
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.parallel import compatibility
+from llmtuner.parallel.pipeline_parallel.microbatch_drivers import (
+    run_eval_microbatches,
+)
 from llmtuner.utils.logging import get_logger
 from llmtuner.utils.seeding import preserve_rng_state
 
@@ -291,11 +294,6 @@ def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) 
     """Read, score, and finalize one validation pass for dense or PP models."""
     parallel_dims = self.parallel_dims
     pipeline = parallel_dims is not None and parallel_dims.pp_enabled
-    if pipeline:
-        require(
-            "pipelining_microbatch_drivers",
-            feature="validation with pipeline parallelism",
-        )
     dp_mesh, loss_mesh = resolve_loss_reduction_meshes(parallel_dims)
     validation_dataloader: BaseDataLoader | None = None
     try:
@@ -369,12 +367,22 @@ def evaluate_pipeline_batch(
         self.pp_schedule._llmtuner_global_valid_tokens = torch.ones(
             (), dtype=torch.float32
         )
-        self.pp_schedule.eval(
-            arg_mbs=inputs.args if self.pp_has_first_stage else None,
-            kwarg_mbs=inputs.kwargs,
-            target_mbs=inputs.targets,
-            losses=losses,
-        )
+        args = inputs.args if self.pp_has_first_stage else None
+        if capability("pipelining_microbatch_drivers"):
+            self.pp_schedule.eval(
+                arg_mbs=args,
+                kwarg_mbs=inputs.kwargs,
+                target_mbs=inputs.targets,
+                losses=losses,
+            )
+        else:
+            run_eval_microbatches(
+                self.pp_schedule,
+                args=args,
+                kwargs=inputs.kwargs,
+                targets=inputs.targets,
+                losses=losses,
+            )
     if losses is None:
         return None
     return torch.stack([loss.detach() for loss in losses]).sum()

@@ -60,6 +60,7 @@ from llmtuner.parallel.context_parallel import (
 )
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology
+from tests.integration_tests.harness import backend, device, init_distributed, moved
 
 SEQ = 256  # torch's CP BlockMask path requires Q_LEN % (cp * 128) == 0
 VOCAB = 128
@@ -67,7 +68,12 @@ HEADS = 8  # divisible by tp * cp == 4
 TP = 2
 CP = 2
 WORLD = TP * CP
-TOL = 1e-9
+# fp64 keeps the residual arithmetic rather than precision on CPU. The Ascend
+# stack has no fp64 matmul at all (aclnnMatmul rejects DT_DOUBLE), so an
+# accelerator arm runs fp32 and the tolerance has to match that precision.
+DEVICE = device()
+DTYPE = torch.float64 if DEVICE.type == "cpu" else torch.float32
+TOL = 1e-9 if DEVICE.type == "cpu" else 1e-5
 IGNORE_INDEX = -100
 
 
@@ -95,7 +101,7 @@ def _cfg(strategy: str, *, heads: int = HEADS) -> LLMTunerConfig:
 
 def _build(cfg: LLMTunerConfig, *, flex: bool, seed: int = 0) -> HFTransformerModel:
     torch.manual_seed(seed)
-    model = HFTransformerModel(build_model_config_for(cfg)).to(torch.float64)
+    model = moved(HFTransformerModel(build_model_config_for(cfg)).to(DTYPE))
     if flex:
         model.model.config._attn_implementation = "flex_torchtitan"
     return model.eval()
@@ -105,13 +111,13 @@ def _data(seed: int = 0):
     g = torch.Generator().manual_seed(seed)
     ids = torch.randint(VOCAB, (SEQ,), generator=g)
     labels = torch.randint(VOCAB, (SEQ,), generator=g)
-    return ids, labels, torch.arange(SEQ)
+    return moved(ids), moved(labels), moved(torch.arange(SEQ))
 
 
 def _additive_causal(n: int) -> torch.Tensor:
     """A dense (1, 1, n, n) additive causal mask, for the sdpa reference."""
-    causal = torch.tril(torch.ones(n, n, dtype=torch.bool))
-    additive = torch.zeros(n, n, dtype=torch.float64)
+    causal = torch.tril(torch.ones(n, n, dtype=torch.bool, device=DEVICE))
+    additive = torch.zeros(n, n, dtype=DTYPE, device=DEVICE)
     return additive.masked_fill(~causal, float("-inf"))[None, None]
 
 
@@ -165,7 +171,10 @@ def _tp_wrapper_count(model: HFTransformerModel) -> int:
 
 def _run_strategy(name, *, strategy, cp_mesh, tp_mesh, failures) -> dict[str, float]:
     cfg = _cfg(strategy)
-    model = _build(cfg, flex=True)
+    # flex is CUDA-only, so on the accelerator the CP kernel is the sdpa one
+    # (``apply_cp`` picks it for ``kv_allgather``); forcing flex there would
+    # only reach the private-op guard. The reference arm never needs flex.
+    model = _build(cfg, flex=DEVICE.type == "cpu")
     ref = _build(cfg, flex=False)
 
     # TP then CP, the order parallelize_hf_transformers uses.
@@ -239,7 +248,11 @@ def _run_strategy(name, *, strategy, cp_mesh, tp_mesh, failures) -> dict[str, fl
         )
     dist.all_reduce(loss_local, group=cp_mesh.get_group())
     dist.all_reduce(loss_local, group=tp_mesh.get_group())
-    loss_diff = abs(loss_local.item() - loss_ref.item())
+    # Compare the MEAN loss, not the summed one: the sum is ~2.4e3 here, so an
+    # fp32 accumulation residual of 1e-7 relative is already 1e-4 absolute and
+    # would sit above TOL for reasons that have nothing to do with the wiring.
+    num_valid = int((labels != IGNORE_INDEX).sum())
+    loss_diff = abs(loss_local.item() - loss_ref.item()) / num_valid
     if loss_diff > TOL:
         failures.append(f"{name}: reduced loss diff {loss_diff:.3e}")
 
@@ -257,7 +270,7 @@ def _run_strategy(name, *, strategy, cp_mesh, tp_mesh, failures) -> dict[str, fl
             f"{full_count} // (cp*tp={CP * TP})"
         )
     for axis_name, mesh in (("cp", cp_mesh), ("tp", tp_mesh)):
-        tally = torch.tensor(local_count, dtype=torch.int64)
+        tally = torch.tensor(local_count, dtype=torch.int64, device=DEVICE)
         dist.all_reduce(tally, group=mesh.get_group())
         if int(tally) != local_count * mesh.size():
             failures.append(
@@ -306,7 +319,7 @@ def _check_ulysses_headcount_guard(cp_mesh, tp_mesh, failures) -> None:
 
 
 def main() -> None:
-    dist.init_process_group("gloo")
+    init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == WORLD, f"this check assumes {WORLD} ranks, got {world}"
@@ -320,6 +333,8 @@ def main() -> None:
     failures: list[str] = []
     stats: dict[str, dict[str, float]] = {}
 
+    # Both strategies run here: flex carries ulysses on CPU, and the sdpa
+    # ulysses kernel (sdpa_attention.py) carries it where flex does not exist.
     for strategy in ("kv_allgather", "ulysses"):
         stats[strategy] = _run_strategy(
             strategy,
@@ -330,8 +345,16 @@ def main() -> None:
         )
     _check_ulysses_headcount_guard(cp_mesh, tp_mesh, failures)
 
+    # Report on the failing rank: several checks below are rank-local (the CP
+    # no-op non-vacuity one only runs past the first CP block), so "rank 0 saw
+    # nothing" is not the same as "nothing failed".
+    if failures:
+        print(f"[rank {rank}] FAIL " + "; ".join(failures), flush=True)
     if rank == 0:
-        print(f"tp={TP} cp={CP} world={world} seq={SEQ} heads={HEADS} dtype=float64")
+        print(
+            f"tp={TP} cp={CP} world={world} seq={SEQ} heads={HEADS} "
+            f"dtype={DTYPE} tol={TOL:.0e} device={DEVICE.type} backend={backend()}"
+        )
         for strategy, row in stats.items():
             print(
                 f"  {strategy:12s} " + "  ".join(f"{k}={v:.3e}" for k, v in row.items())
@@ -341,7 +364,7 @@ def main() -> None:
         print(f"failed ranks   = {len(failures)}")
         print("all checks passed" if not failures else "CHECKS FAILED")
     # Every rank must agree on failure, not just rank 0.
-    verdict = torch.tensor(len(failures), dtype=torch.int64)
+    verdict = torch.tensor(len(failures), dtype=torch.int64, device=DEVICE)
     dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
     assert int(verdict) == 0, f"{int(verdict)} check(s) failed -- see rank 0 output"
 

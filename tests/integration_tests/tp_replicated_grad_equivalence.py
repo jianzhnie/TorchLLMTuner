@@ -43,6 +43,12 @@ from llmtuner.parallel.tensor_parallel.tensor_parallel import (
 )
 from llmtuner.parallel.topology import ParallelTopology, build_device_mesh
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.harness import (
+    backend,
+    device,
+    init_distributed,
+    moved,
+)
 
 SEQ = 16
 VOCAB = 64
@@ -66,14 +72,14 @@ def _model(seed: int = 0) -> HFTransformerModel:
             "num_key_value_heads": 4,
         },
     )
-    return HFTransformerModel(config)
+    return moved(HFTransformerModel(config))
 
 
 def _batch(seed: int) -> tuple[torch.Tensor, torch.Tensor]:
     g = torch.Generator().manual_seed(seed)
     ids = torch.randint(0, VOCAB, (SEQ,), generator=g)
     labels = torch.randint(0, VOCAB, (SEQ,), generator=g)
-    return ids, labels
+    return moved(ids), moved(labels)
 
 
 def _loss_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -81,7 +87,7 @@ def _loss_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
-    dist.init_process_group("gloo")
+    init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 2, f"this check assumes 2 ranks, got {world}"
@@ -181,11 +187,13 @@ def main() -> None:
             f"({max_prereduce_diff:.3e}) -- the reduction repaired nothing"
         )
 
-    local_ok = torch.tensor([0.0 if not failures else 1.0])
+    local_ok = torch.tensor([0.0 if not failures else 1.0], device=device())
     dist.all_reduce(local_ok, op=dist.ReduceOp.MAX)
 
     if rank == 0:
-        print(f"seq={SEQ} vocab={VOCAB} tp_size={world} steps={STEPS} backend=gloo")
+        print(
+            f"seq={SEQ} vocab={VOCAB} tp_size={world} steps={STEPS} backend={backend()}"
+        )
         print(f"replicated params  = {len(replicated)}")
         print(f"shard loss     max abs diff = {max_loss_diff:.3e}")
         print(f"replicated grad  max abs diff = {max_grad_diff:.3e}")

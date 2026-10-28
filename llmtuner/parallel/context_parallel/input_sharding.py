@@ -24,6 +24,14 @@ original order, so callers must not assume they are. The rearrangement is
 consistent across every tensor sharded with the same balancer parameters, and
 the gathered K/V come out in the same rearranged order, which is what keeps
 the sharded BlockMask's indexing correct.
+
+``_context_parallel_shard`` only exists from torch 2.12 on. The contiguous
+*unbalanced* tensor partition has an exact public-API equivalent -- chunk along
+the sequence dim and take this rank's chunk, in mesh rank order -- which
+``_shard_buffers`` falls back to when the private helper is missing (the case
+on the torch 2.9 Ascend/``torch_npu`` stack). Load-balanced partitions and
+``BlockMask`` Q-sharding have no such equivalent and keep requiring the private
+helper, loudly.
 """
 
 from __future__ import annotations
@@ -63,14 +71,76 @@ except ImportError:  # pragma: no cover - exercised only on torch builds without
 
 
 def require_torch_input_sharding() -> None:
-    """Report a missing shard helper before attempting to call it."""
+    """Report a missing shard helper before attempting to call it.
+
+    Only the paths without a public-API equivalent call this: a load-balanced
+    partition, or ``BlockMask`` Q-sharding. Plain contiguous tensor partitions
+    go through :func:`_shard_buffers`, which falls back instead.
+    """
     if _context_parallel_shard is None:
         raise ImportError(
             "TP/CP input sharding requires torch's private helper "
             "``torch.distributed.tensor.experimental._context_parallel."
             "_context_parallel_shard``, which this torch build does not provide. "
-            "Install a compatible torch build or disable TP/CP input sharding."
+            "Install a compatible torch build or disable TP/CP input sharding. "
+            "The contiguous (unbalanced) tensor partition does not need it and "
+            "is handled by the public-API fallback."
         )
+
+
+def _contiguous_sequence_partition(
+    buffers: list[torch.Tensor],
+    seq_dims: list[int],
+    mesh: DeviceMesh,
+) -> tuple[torch.Tensor, ...]:
+    """Public-API equivalent of torch's contiguous ``_context_parallel_shard``.
+
+    Chunk every buffer along its sequence dim and keep this rank's chunk. Mesh
+    rank order is the order the fused TP collectives reassemble the sequence in
+    (``tensor_parallel/linear_ops.py``) and the order the CP K/V gather assumes,
+    so this is the same partition torch's private helper produces when no load
+    balancer is attached.
+    """
+    size = mesh.size()
+    coord = mesh.get_local_rank()
+    partitions = []
+    for buffer, dim in zip(buffers, seq_dims, strict=True):
+        length = buffer.shape[dim]
+        if length % size != 0:
+            raise ValueError(
+                f"sequence dim {dim} has length {length}, not divisible by the "
+                f"mesh size {size}"
+            )
+        partitions.append(torch.chunk(buffer, size, dim=dim)[coord])
+    return tuple(partitions)
+
+
+def _shard_buffers(
+    *,
+    mesh: DeviceMesh,
+    buffers: list[torch.Tensor],
+    seq_dims: list[int],
+    load_balancer: object | None,
+) -> tuple[torch.Tensor, ...]:
+    """Partition token buffers across ``mesh``, using torch's helper when present.
+
+    Torch's private helper wins whenever it exists, so the partition stays
+    upstream-exact on builds that have it. The fallback covers only the
+    contiguous unbalanced partition; a load balancer still needs the helper
+    (its rearrangement is not reproducible from public APIs here).
+    """
+    if _context_parallel_shard is not None:
+        return tuple(
+            _context_parallel_shard(
+                mesh=mesh,
+                buffers=buffers,
+                seq_dims=seq_dims,
+                load_balancer=load_balancer,
+            )
+        )
+    if load_balancer is not None:
+        require_torch_input_sharding()
+    return _contiguous_sequence_partition(buffers, seq_dims, mesh)
 
 
 def resolve_load_balancer(load_balancer: str | None, seq_len: int, cp_mesh: DeviceMesh):
@@ -80,7 +150,6 @@ def resolve_load_balancer(load_balancer: str | None, seq_len: int, cp_mesh: Devi
     trainer sharding the batch and the wrapper sharding the BlockMask construct
     them independently and still agree on the rearrangement.
     """
-    require_torch_input_sharding()
     cp_size = cp_mesh.size()
     # DTensor permits uneven shards, but CP attention communicates equal-sized
     # sequence partitions. Reject before sharding can create rank-local shapes.
@@ -138,13 +207,12 @@ def shard_batch_for_cp(
         trainer does not need to undo it.
     """
     balancer = resolve_load_balancer(load_balancer, input_ids.shape[0], cp_mesh)
-    sharded = _context_parallel_shard(
+    return _shard_buffers(
         mesh=cp_mesh,
         buffers=[input_ids, labels, positions],
         seq_dims=[0, 0, 0],
         load_balancer=balancer,
     )
-    return tuple(sharded)
 
 
 def shard_padding_mask_for_cp(
@@ -163,7 +231,7 @@ def shard_padding_mask_for_cp(
     rank.
     """
     balancer = resolve_load_balancer(load_balancer, padding_mask.shape[0], cp_mesh)
-    return _context_parallel_shard(
+    return _shard_buffers(
         mesh=cp_mesh,
         buffers=[padding_mask],
         seq_dims=[0],
@@ -187,20 +255,17 @@ def _shard_tp_buffers(
     buffers: list[torch.Tensor], tp_mesh: DeviceMesh
 ) -> tuple[torch.Tensor, ...]:
     """Apply one contiguous sequence partition to related token buffers."""
-    require_torch_input_sharding()
     seq_len = buffers[0].shape[0]
     if seq_len % tp_mesh.size() != 0:
         raise ValueError(
             f"sequence length {seq_len} is not divisible by "
             f"tp={tp_mesh.size()}; seq_len must be a multiple of the TP degree."
         )
-    return tuple(
-        _context_parallel_shard(
-            mesh=tp_mesh,
-            buffers=buffers,
-            seq_dims=[0] * len(buffers),
-            load_balancer=None,
-        )
+    return _shard_buffers(
+        mesh=tp_mesh,
+        buffers=buffers,
+        seq_dims=[0] * len(buffers),
+        load_balancer=None,
     )
 
 
@@ -267,8 +332,11 @@ def shard_attention_mask_for_cp(
         raise TypeError(
             f"CP can only shard BlockMask attention masks, got {type(mask).__name__}."
         )
+    # No public-API fallback: rebuilding a rank's BlockMask from the full-length
+    # one is torch's ``_create_cp_block_mask``, not a slice.
+    require_torch_input_sharding()
     balancer = resolve_load_balancer(load_balancer, mask.seq_lengths[0], cp_mesh)
-    return _context_parallel_shard(
+    return _shard_buffers(
         mesh=cp_mesh,
         buffers=[mask],
         seq_dims=[MASK_Q_SEQ_DIM],

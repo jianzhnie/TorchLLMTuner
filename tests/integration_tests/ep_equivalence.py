@@ -27,6 +27,7 @@ from llmtuner.parallel.expert_parallel.token_dispatch import (
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
 )
+from tests.integration_tests.harness import init_distributed, moved
 
 NUM_EXPERTS = 8
 TOP_K = 2
@@ -42,7 +43,7 @@ def _weights(seed: int = 0):
     w3 = torch.randn(NUM_EXPERTS, HIDDEN, DIM, generator=g)
     w2 = torch.randn(NUM_EXPERTS, DIM, HIDDEN, generator=g)
     gate = torch.randn(NUM_EXPERTS, DIM, generator=g)
-    return w1, w3, w2, gate
+    return moved(w1), moved(w3), moved(w2), moved(gate)
 
 
 def _build(*, ep_group, ep_rank: int, ep_size: int, w) -> MoE:
@@ -67,16 +68,18 @@ def _build(*, ep_group, ep_rank: int, ep_size: int, w) -> MoE:
         dispatcher = AllToAllTokenDispatcher(NUM_EXPERTS, TOP_K)
         dispatcher.set_ep_group(ep_group=ep_group)
 
-    return MoE(
-        num_experts=NUM_EXPERTS,
-        routed_experts=RoutedExperts(experts, dispatcher),
-        router=router,
-        load_balance_coeff=None,
-    ).eval()
+    return moved(
+        MoE(
+            num_experts=NUM_EXPERTS,
+            routed_experts=RoutedExperts(experts, dispatcher),
+            router=router,
+            load_balance_coeff=None,
+        ).eval()
+    )
 
 
 def main() -> None:
-    dist.init_process_group("gloo")
+    local_device = init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 2, f"this check assumes 2 ranks, got {world}"
@@ -86,7 +89,7 @@ def main() -> None:
     # to the expert-owning rank twice and double the output, which is a property
     # of the setup, not a bug in the dispatcher.
     torch.manual_seed(1000 + rank)
-    x = torch.randn(TOKENS, DIM)
+    x = moved(torch.randn(TOKENS, DIM))
     w = _weights()
 
     # Reference: this rank's tokens through all experts, no communication.
@@ -107,6 +110,11 @@ def main() -> None:
     # path are compared against it, so a difference between them can be
     # attributed to reduction order rather than to a routing mistake: if either
     # path had sent a token to the wrong expert, it would sit far from this.
+    #
+    # On an accelerator without fp64 (this Ascend stack) the ``double()`` upcast
+    # is executed in fp32, so these two numbers are indicative rather than the
+    # fp64 yardstick they are on CPU; the assertion below is fp32-based and does
+    # not depend on them.
     with torch.no_grad():
         exact = _build(ep_group=None, ep_rank=0, ep_size=1, w=w).double()(x.double())
     ref_err = (ref.double() - exact).abs().max().item()
@@ -125,7 +133,7 @@ def main() -> None:
         # disagreement must be no worse than that noise.
 
     # The gather is the real point: every rank must agree, not just rank 0.
-    diff_t = torch.tensor(rel)
+    diff_t = torch.tensor(rel, device=local_device)
     dist.all_reduce(diff_t, op=dist.ReduceOp.MAX)
     if rank == 0:
         print(f"max rel error across ranks = {diff_t.item():.3e}")
