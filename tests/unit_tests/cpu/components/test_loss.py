@@ -64,6 +64,25 @@ def test_vocab_parallel_rejects_reduction_before_process_group_access(
         LossParallelCrossEntropy.apply(logits, labels, object(), 9, reduction)
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_vocab_parallel_rejects_empty_shard_topology_before_collectives(
+    monkeypatch, rank
+):
+    import llmtuner.components.loss as loss_module
+
+    monkeypatch.setattr(loss_module.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(loss_module.distributed, "get_rank", lambda group: rank)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid vocabulary topology reached a collective")
+
+    monkeypatch.setattr(loss_module.funcol, "all_reduce", unexpected)
+    with pytest.raises(ValueError, match="empty vocab shards"):
+        LossParallelCrossEntropy.apply(
+            torch.zeros(3, 1 - rank), torch.zeros(3, dtype=torch.long), object(), 1
+        )
+
+
 def _logits_and_labels(seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     logits = torch.randn(6, 9)

@@ -148,6 +148,35 @@ def test_tp_target_resolution_reads_the_model_plan_once(overrides) -> None:
     assert moe_blocks == []
 
 
+@pytest.mark.parametrize("field", ["tp_colwise_modules", "tp_rowwise_modules"])
+def test_configured_tp_pattern_typo_is_not_hidden_by_valid_model_plan(field):
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_targets
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False))
+    original = model[0]
+    cfg = ParallelConfig(
+        tensor_parallel_size=2,
+        tp_config=TensorParallelConfig(**{field: ["missing.*"]}),
+    )
+    with pytest.raises(ValueError, match="TP override pattern.*matched no module"):
+        resolve_tp_targets(model, cfg=cfg, plan={"0": "colwise"})
+    assert model[0] is original
+
+
+def test_pipeline_part_permits_override_owned_by_another_stage():
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_targets
+
+    part = nn.Sequential(nn.Linear(4, 4, bias=False))
+    cfg = ParallelConfig(
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+        tp_config=TensorParallelConfig(tp_rowwise_modules=["other_stage.projection"]),
+    )
+    targets, _ = resolve_tp_targets(part, cfg=cfg, plan={"0": "colwise"})
+    assert targets[0][0] == "0"
+    assert targets[0][2].kind == "colwise"
+
+
 @pytest.mark.parametrize("cls", [ColumnParallelLinear, RowParallelLinear])
 @pytest.mark.parametrize("shape", [(), (4,), (1, 2, 3, 4)])
 def test_tp_projection_rejects_unsupported_rank_before_communication(

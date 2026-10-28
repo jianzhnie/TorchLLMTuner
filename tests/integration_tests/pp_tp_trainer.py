@@ -18,7 +18,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
-from llmtuner.config.parallel_config import PipelineParallelConfig
+from llmtuner.config.parallel_config import PipelineParallelConfig, TensorParallelConfig
 from llmtuner.trainer.trainer import Trainer
 
 
@@ -37,6 +37,10 @@ def main() -> None:
             pipeline_parallel_size=2,
             tensor_parallel_size=2,
             data_parallel_shard_size=1,
+            tp_config=TensorParallelConfig(
+                tp_colwise_modules=["*layers.0.self_attn.q_proj"],
+                tp_rowwise_modules=["*layers.1.self_attn.o_proj"],
+            ),
             pp_config=PipelineParallelConfig(
                 pipeline_parallel_schedule="1F1B", num_pp_microbatches=2
             ),

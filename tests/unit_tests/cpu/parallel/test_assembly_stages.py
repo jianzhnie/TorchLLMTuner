@@ -45,6 +45,32 @@ def test_fsdp_wraps_last() -> None:
     assert STAGE_ORDER[-1] == "fsdp"
 
 
+def test_pipeline_validates_tp_override_before_splitting(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.config.parallel_config import TensorParallelConfig
+
+    cfg = ParallelConfig(
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+        tp_config=TensorParallelConfig(tp_colwise_modules=["missing.*"]),
+    )
+    topology = SimpleNamespace(pp_enabled=True, get_optional_mesh=lambda name: None)
+
+    def unexpected_split(*args, **kwargs):
+        pytest.fail("invalid global pattern reached pipeline splitting")
+
+    monkeypatch.setattr(parallelize, "apply_pp", unexpected_split)
+    with pytest.raises(ValueError, match="TP override pattern.*matched no module"):
+        parallelize.parallelize_hf_transformers(
+            nn.Sequential(nn.Linear(4, 4)),
+            cfg=cfg,
+            mesh=None,
+            parallel_dims=topology,
+            global_batch_size=2,
+        )
+
+
 def test_sharding_wrappers_come_before_ac_and_compile() -> None:
     tp, ep, cp, ac, compile_ = (
         STAGE_ORDER.index(n) for n in ("tp", "ep", "cp", "ac", "compile")

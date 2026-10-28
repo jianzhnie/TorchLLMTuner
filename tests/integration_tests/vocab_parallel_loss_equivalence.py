@@ -200,26 +200,13 @@ def _check_shape_dispatch(rank: int, group: dist.ProcessGroup, *, vocab: int) ->
 
 
 def _check_rejections(rank: int, group: dist.ProcessGroup, *, vocab: int) -> None:
-    """An empty shard is refused rather than silently computing nothing.
-
-    With ``V < tp`` the bounds clamp, so *some* rank ends up with a zero-width
-    slice -- ``vocab_shard_bounds(1, 2, 1)`` is ``(1, 1)`` -- and that rank has
-    no classes to answer for.
-
-    Only that rank calls. The others must *not*, deliberately: the reason this
-    cannot deadlock is that the empty rank raises before the first collective,
-    so no one is left waiting on a reduction it will never join. Having the
-    other ranks call the same function here would be the hang, not the test.
-    """
+    """All ranks reject a topology containing an empty vocabulary shard."""
     world = dist.get_world_size(group)
     start, end = vocab_shard_bounds(vocab, world, rank)
-    if end - start != 0:
-        return
-
-    local = torch.randn(T, 0, requires_grad=True)
+    local = torch.randn(T, end - start, requires_grad=True)
     labels = torch.zeros(T, dtype=torch.long)
     try:
-        cross_entropy_loss(local, labels, tp_group=group, global_vocab_size=vocab)
+        LossParallelCrossEntropy.apply(local, labels, group, vocab, "sum")
     except ValueError as error:
         if "empty vocab shards" not in str(error):
             _fail(rank, f"empty shard raised the wrong error: {error}")
