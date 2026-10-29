@@ -107,6 +107,84 @@ def test_projection_config_reaches_model_without_global_class_changes(projection
     assert torch.isfinite(model(torch.arange(8))).all()
 
 
+def test_qwen3_moe_fused_fp32_rotary_and_torch_norm_execute() -> None:
+    from llmtuner.models.hf.model_setup import forward_torch_rms_norm
+
+    config = AutoConfig.for_model(
+        "qwen3_moe",
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        num_experts=4,
+        num_experts_per_tok=2,
+    )
+    config.qkv_projection = "fused"
+    config.rotary_compute_dtype = "float32"
+    config.norm_backend = "torch"
+    model = HFTransformerModel(config).to(torch.bfloat16)
+    attention = model.layers[0].self_attn
+
+    assert attention.forward.__func__ is forward_fused_qkv_attention
+    assert model.layers[0].input_layernorm.forward.__func__ is (forward_torch_rms_norm)
+    hidden = torch.randn(2, 3, 32).bfloat16()
+    expected_norm = torch.nn.functional.rms_norm(
+        hidden, (32,), model.layers[0].input_layernorm.weight, 1e-6
+    )
+    torch.testing.assert_close(
+        model.layers[0].input_layernorm(hidden), expected_norm, atol=0, rtol=0
+    )
+    assert torch.isfinite(model(torch.arange(8))).all()
+
+
+def test_qwen3_moe_torchtitan_experts_execute_and_backpropagate() -> None:
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
+
+    from llmtuner.models.hf.model_setup import forward_torchtitan_moe
+
+    config = AutoConfig.for_model(
+        "qwen3_moe",
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        num_experts=4,
+        num_experts_per_tok=2,
+    )
+    config.experts_implementation = "torchtitan"
+    original_forward = Qwen3MoeSparseMoeBlock.forward
+    model = HFTransformerModel(config).to(torch.bfloat16)
+    moe = model.layers[0].mlp
+
+    assert moe.forward.__func__ is forward_torchtitan_moe
+    assert Qwen3MoeSparseMoeBlock.forward is original_forward
+    logits = model(torch.arange(8))
+    assert torch.isfinite(logits).all()
+    logits.float().square().sum().backward()
+    assert torch.isfinite(moe.experts.gate_up_proj.grad).all()
+    assert torch.isfinite(moe.experts.down_proj.grad).all()
+    assert moe.experts.gate_up_proj.grad.dtype == torch.bfloat16
+
+
+def test_explicit_flex_backend_reaches_model() -> None:
+    from llmtuner.models.hf.attention_backend import ATTENTION_BACKEND
+
+    config = make_config()
+    config.model.attention_backend = "flex"
+    model = HFTransformerModel(build_model_config_for(config))
+    assert model.model.config._attn_implementation == ATTENTION_BACKEND
+    with torch.no_grad():
+        assert torch.isfinite(model(torch.arange(8))).all()
+
+
 def test_fused_installation_preserves_parameter_identity_keys_and_is_idempotent():
     model = HFTransformerModel(build_model_config_for(make_config("separate")))
     parameters = {name: id(parameter) for name, parameter in model.named_parameters()}
@@ -185,7 +263,7 @@ def test_fused_projection_rejects_unadapted_tensor_parallelism_before_mesh_acces
 def test_fused_projection_rejects_other_model_families():
     config = make_config()
     config.model.model_name_or_path = "llama"
-    with pytest.raises(UnsupportedCombinationError, match="Qwen3 dense"):
+    with pytest.raises(UnsupportedCombinationError, match="Qwen3 or Qwen3-MoE"):
         HFTransformerModel(build_model_config_for(config))
 
 
@@ -289,3 +367,19 @@ def test_fused_attention_executes_fullgraph_aot_with_matching_gradients():
         torch.testing.assert_close(
             parameter.grad, dict(reference.named_parameters())[name].grad
         )
+
+
+def test_fp32_rotary_rejects_scaled_frequencies():
+    from types import SimpleNamespace
+
+    from llmtuner.models.hf.qkv_projection import apply_configured_rotary
+
+    module = SimpleNamespace(
+        config=SimpleNamespace(
+            rotary_compute_dtype="float32",
+            rope_parameters={"rope_type": "linear", "factor": 2.0},
+        )
+    )
+    query = torch.randn(1, 2, 3, 8)
+    with pytest.raises(UnsupportedCombinationError, match="without scaling"):
+        apply_configured_rotary(module, query, query, None, None, torch.arange(3))

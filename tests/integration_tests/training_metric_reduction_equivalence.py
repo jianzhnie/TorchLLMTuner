@@ -4,9 +4,12 @@ Run with PYTHONPATH=. torchrun --nproc_per_node=4. Explicit scalar shard
 losses test reporting only; no model transformations or backward are covered.
 """
 
+import os
+
 import torch
 import torch.distributed as dist
 
+from llmtuner.accelerator.collectives import all_reduce
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.runtime.reductions import resolve_training_reduction_meshes
@@ -69,18 +72,33 @@ def main():
                 )
                 if metrics is None:
                     continue  # globally empty steps are rejected before reporting
-                expected = sum(map(sum, shard_sums)) / sum(counts)
+                reference = os.environ.get(
+                    "LLMTUNER_TEST_METRICS_REFERENCE", "sum_then_divide"
+                )
+                if reference == "per_rank":
+                    expected_tensor = torch.tensor(
+                        shard_sums[dp][coordinate], dtype=dtype, device=device
+                    ) / sum(counts)
+                    all_reduce(expected_tensor, group=meshes.loss_mesh.get_group())
+                    expected = expected_tensor.item()
+                elif reference == "sum_then_divide":
+                    expected = sum(map(sum, shard_sums)) / sum(counts)
+                else:
+                    raise ValueError(f"Unknown metrics reference: {reference}")
                 maximum = max(
                     sum(losses) / count if count else 0
                     for losses, count in zip(shard_sums, counts, strict=True)
                 )
-                assert metrics == {
-                    "loss": expected,
-                    "max_loss": maximum,
-                    "grad_norm": 2.0,
-                    "n_tokens_seen": 28.0,
-                    "lr/SGD": 0.1,
-                }, metrics
+                torch.testing.assert_close(
+                    metrics,
+                    {
+                        "loss": expected,
+                        "max_loss": maximum,
+                        "grad_norm": 2.0,
+                        "n_tokens_seen": 28.0,
+                        "lr/SGD": 0.1,
+                    },
+                )
                 dist.barrier()
                 if dist.get_rank() == 0:
                     print(f"CP{cp}/TP{tp} {empty_dp=}: independent metrics passed")

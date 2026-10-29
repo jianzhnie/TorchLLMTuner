@@ -1272,3 +1272,39 @@ def test_kcp_attention_seam_does_not_build_flex_mask(model, backend):
     model.model.config.attn_mask_type = "block_causal"
     with pytest.raises(ValueError, match="packed document"):
         model._apply_attention(torch.arange(8), None)
+
+
+def test_qwen3_moe_router_keeps_scores_and_gate_in_fp32() -> None:
+    from transformers import AutoConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeTopKRouter
+
+    from llmtuner.models.hf.model_setup import stabilize_moe_router
+
+    config = AutoConfig.for_model(
+        "qwen3_moe",
+        hidden_size=32,
+        num_experts=8,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+    )
+    router = Qwen3MoeTopKRouter(config).to(torch.bfloat16)
+    weight = router.weight.detach().clone()
+    model = torch.nn.Module()
+    model.config = config
+    model.router = router
+    stabilize_moe_router(model)
+    hidden = torch.randn(5, 32).bfloat16()
+
+    logits, scores, indices = router(hidden)
+    expected_logits = torch.nn.functional.linear(hidden.float(), weight.float())
+    probabilities = expected_logits.softmax(dim=-1)
+    expected_scores, expected_indices = probabilities.topk(2, dim=-1, sorted=False)
+    expected_scores = expected_scores / (
+        expected_scores.sum(dim=-1, keepdim=True) + 1e-20
+    )
+
+    assert logits.dtype == scores.dtype == torch.float32
+    torch.testing.assert_close(logits, expected_logits, atol=0, rtol=0)
+    torch.testing.assert_close(scores, expected_scores, atol=0, rtol=0)
+    assert torch.equal(indices, expected_indices)
+    assert router.weight.dtype == torch.bfloat16

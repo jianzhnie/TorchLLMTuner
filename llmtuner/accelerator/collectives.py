@@ -163,6 +163,21 @@ def _offloaded_gradient_norm(grad: DTensor, norm_type: float) -> torch.Tensor:
     return power if math.isinf(norm_type) else power.pow(1.0 / norm_type)
 
 
+def _clip_offloaded_gradients(
+    gradients: Iterable[DTensor], *, max_norm: float, total_norm: torch.Tensor
+) -> set[int]:
+    """Scale CPU-offloaded gradients using one host copy of the global factor."""
+    gradients = tuple(gradients)
+    if not gradients:
+        return set()
+
+    coefficient = (max_norm / (total_norm + 1e-6)).clamp(max=1).cpu()
+    with torch.no_grad():
+        for gradient in gradients:
+            gradient.to_local().mul_(coefficient)
+    return {id(gradient) for gradient in gradients}
+
+
 def clip_grad_norm_(
     parameters: torch.Tensor | Iterable[torch.Tensor],
     max_norm: float,
@@ -405,26 +420,25 @@ def clip_grad_norm_(
                 continue
             mesh_key = id(grad.device_mesh) if isinstance(grad, DTensor) else None
             clip_groups.setdefault(mesh_key, []).append(parameter)
+        offloaded_gradients = [
+            parameter.grad
+            for group_parameters in clip_groups.values()
+            for parameter in group_parameters
+            if isinstance(parameter.grad, DTensor)
+            and parameter.grad.device.type == "cpu"
+            and parameter.grad.device_mesh.device_type != "cpu"
+        ]
+        offloaded_ids = _clip_offloaded_gradients(
+            offloaded_gradients, max_norm=max_norm, total_norm=total_norm
+        )
         for group_parameters in clip_groups.values():
-            offloaded = [
-                parameter.grad
+            group_parameters = [
+                parameter
                 for parameter in group_parameters
-                if isinstance(parameter.grad, DTensor)
-                and parameter.grad.device.type == "cpu"
-                and parameter.grad.device_mesh.device_type != "cpu"
+                if id(parameter.grad) not in offloaded_ids
             ]
-            if offloaded:
-                coefficient = (max_norm / (total_norm + 1e-6)).clamp(max=1).cpu()
-                with torch.no_grad():
-                    for gradient in offloaded:
-                        gradient.to_local().mul_(coefficient)
-                group_parameters = [
-                    parameter
-                    for parameter in group_parameters
-                    if id(parameter.grad) not in {id(grad) for grad in offloaded}
-                ]
-                if not group_parameters:
-                    continue
+            if not group_parameters:
+                continue
             torch.nn.utils.clip_grads_with_norm_(
                 group_parameters,
                 max_norm,

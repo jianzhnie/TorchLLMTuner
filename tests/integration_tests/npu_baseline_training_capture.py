@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import sys
 from pathlib import Path
 from types import MethodType
 
@@ -17,6 +18,18 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.utils._python_dispatch import TorchDispatchMode
+
+from tests.integration_tests.npu_trainer_alignment_config import (
+    QWEN3_30B,
+    baseline_cli_args,
+    call_after_load,
+    configure_baseline_30b,
+    input_fingerprints,
+    is_qwen3_30b,
+    mesh_manifest,
+    optimizer_manifest,
+    selected_model,
+)
 
 
 def _snapshot(value):
@@ -169,20 +182,55 @@ def observe_first_step_modules(trainer, modules):
     return captured, handles
 
 
+def validate_hf_snapshot(snapshot, hf_assets_path):
+    index_path = Path(hf_assets_path) / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    weight_map = index["weight_map"]
+    if set(snapshot) != set(weight_map):
+        raise ValueError(
+            "Initial HF canonical key mismatch: "
+            f"missing={sorted(set(weight_map) - set(snapshot))[:8]}, "
+            f"unexpected={sorted(set(snapshot) - set(weight_map))[:8]}"
+        )
+    from safetensors import safe_open
+
+    for filename in sorted(set(weight_map.values())):
+        names = [name for name, source in weight_map.items() if source == filename]
+        with safe_open(
+            str(Path(hf_assets_path) / filename), framework="pt", device="cpu"
+        ) as tensors:
+            for name in names:
+                expected = tensors.get_tensor(name)
+                actual = snapshot[name]
+                if actual.shape != expected.shape or actual.dtype != expected.dtype:
+                    raise ValueError(
+                        f"Initial HF metadata mismatch for {name}: "
+                        f"{actual.shape}/{actual.dtype} != "
+                        f"{expected.shape}/{expected.dtype}"
+                    )
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def main() -> None:
     importlib.import_module("torchtitan_npu")
     from torchtitan.config import ConfigManager
     from torchtitan.tools.logging import init_logger
 
     init_logger()
-    config = ConfigManager().parse_args()
+    alignment_model = selected_model()
+    config = ConfigManager().parse_args(baseline_cli_args(sys.argv[1:]))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    disabled_balancing = (
+        configure_baseline_30b(config, world) if alignment_model == QWEN3_30B else []
+    )
     root = Path(config.dump_folder) / "alignment-capture"
     rank = int(os.environ.get("RANK", "0"))
     if rank == 0:
         root.mkdir(parents=True, exist_ok=False)
     trainer = config.build()
+    assert dist.get_world_size() == world
     dist.barrier()
-    if dist.get_world_size() > 1:
+    if world > 1:
         root = root / f"rank{rank}"
         root.mkdir(exist_ok=False)
     assert len(trainer.model_parts) == 1
@@ -190,6 +238,10 @@ def main() -> None:
     spec = config.model_spec
     adapter = spec.state_dict_adapter(spec.model, config.hf_assets_path)
     initial_path = os.environ.get("LLMTUNER_ALIGNMENT_INITIAL_HF")
+    if alignment_model == QWEN3_30B and initial_path:
+        raise ValueError(
+            "30B initial weights must come from the configured real HF load"
+        )
     if initial_path:
         initial = torch.load(initial_path, weights_only=True)
         mapped = adapter.from_hf(dict(initial))
@@ -209,14 +261,73 @@ def main() -> None:
         actual = adapter.to_hf(_snapshot(model.state_dict()))
         for name, value in initial.items():
             torch.testing.assert_close(actual[name], value, atol=0, rtol=0)
-    torch.save(adapter.to_hf(_snapshot(model.state_dict())), root / "initial-hf.pt")
-    (root / "config.json").write_text(json.dumps(config.to_dict(), indent=2))
+    config_dict = config.to_dict()
+    (root / "config.json").write_text(json.dumps(config_dict, indent=2))
+    manifest = {
+        "rank": rank,
+        "world_size": world,
+        "alignment_model": alignment_model or "debugmodel",
+        "hf_assets_path": config.hf_assets_path,
+        "actual_mesh": mesh_manifest(trainer.parallel_dims),
+        "disabled_balancing": disabled_balancing,
+        "module_trace_enabled": alignment_model != QWEN3_30B
+        and os.environ.get("LLMTUNER_ALIGNMENT_MODULE_TRACE") == "1",
+        "dispatch_trace_enabled": alignment_model != QWEN3_30B
+        and os.environ.get("LLMTUNER_ALIGNMENT_DISPATCH_TRACE") == "1",
+    }
+    if alignment_model == QWEN3_30B:
+        assert is_qwen3_30b(config_dict)
+        assert trainer.parallel_dims.dp_replicate == 1
+        assert trainer.parallel_dims.dp_shard == 8
+        assert trainer.parallel_dims.tp == trainer.parallel_dims.ep == 1
+        assert trainer.parallel_dims.pp == trainer.parallel_dims.cp == 1
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (root / "optimizer.json").write_text(
+        json.dumps(optimizer_manifest(trainer), indent=2)
+    )
+    initial_captured = []
+
+    def capture_initial():
+        initial_hf = adapter.to_hf(_snapshot(model.state_dict()))
+        if alignment_model == QWEN3_30B:
+            validate_hf_snapshot(initial_hf, config.hf_assets_path)
+        torch.save(initial_hf, root / "initial-hf.pt")
+        initial_captured.append(True)
+        (root / "initial-load.json").write_text(
+            json.dumps(
+                {
+                    "snapshot_point": (
+                        "after checkpointer.load, before first train_step"
+                    ),
+                    "loaded_from_hf": alignment_model == QWEN3_30B,
+                    "trainer_step": trainer.step,
+                    "canonical_tensor_count": len(initial_hf),
+                    "all_values_checked": alignment_model == QWEN3_30B,
+                },
+                indent=2,
+            )
+        )
+
+    original_load = trainer.checkpointer.load
+
+    def observe_load(self, *args, **kwargs):
+        if alignment_model == QWEN3_30B:
+            assert not initial_captured
+        result = call_after_load(original_load, capture_initial, *args, **kwargs)
+        if alignment_model == QWEN3_30B:
+            assert result and trainer.step == 0
+        return result
+
+    trainer.checkpointer.load = MethodType(observe_load, trainer.checkpointer)
     captured = []
     consumed = []
     measured = []
     module_trace = {}
     module_handles = []
-    if os.environ.get("LLMTUNER_ALIGNMENT_MODULE_TRACE") == "1":
+    if (
+        alignment_model != QWEN3_30B
+        and os.environ.get("LLMTUNER_ALIGNMENT_MODULE_TRACE") == "1"
+    ):
         modules = {"embedding": model.tok_embeddings, "norm": model.norm}
         for index, layer in model.layers.items():
             for name, attribute in (
@@ -266,6 +377,7 @@ def main() -> None:
     def observe_train_step(self, *args, **kwargs):
         if (
             self.step == 1
+            and alignment_model != QWEN3_30B
             and os.environ.get("LLMTUNER_ALIGNMENT_DISPATCH_TRACE") == "1"
         ):
             with ProjectionDispatchCapture() as dispatch_capture:
@@ -279,23 +391,25 @@ def main() -> None:
                 handle.remove()
         if self.step in trace_steps:
             gradients = _snapshot(
-                {name: parameter.grad for name, parameter in model.named_parameters()}
+                {
+                    name: parameter.grad
+                    for name, parameter in model.named_parameters()
+                    if alignment_model != QWEN3_30B or name.endswith("norm.weight")
+                }
             )
-            for name, module in model.named_modules():
-                split = getattr(module, "_split_qkv_on_save", None)
-                if split is not None:
-                    split(module, gradients, f"{name}.", {})
+            if alignment_model != QWEN3_30B:
+                for name, module in model.named_modules():
+                    split = getattr(module, "_split_qkv_on_save", None)
+                    if split is not None:
+                        split(module, gradients, f"{name}.", {})
             gradients = adapter.to_hf(gradients)
             assert all(value is not None for value in gradients.values())
-            torch.save(
-                {
-                    "weights_after_update": adapter.to_hf(
-                        _snapshot(model.state_dict())
-                    ),
-                    "clipped_gradients": gradients,
-                },
-                root / f"trace-step-{self.step}.pt",
-            )
+            trace = {"clipped_gradients": gradients}
+            if alignment_model != QWEN3_30B:
+                trace["weights_after_update"] = adapter.to_hf(
+                    _snapshot(model.state_dict())
+                )
+            torch.save(trace, root / f"trace-step-{self.step}.pt")
         return result
 
     trainer.train_step = MethodType(observe_train_step, trainer)
@@ -315,12 +429,16 @@ def main() -> None:
     ]
     try:
         trainer.train()
+        assert initial_captured == [True]
         assert trainer.step == config.training.steps
         assert len(captured) == config.training.steps
         assert len(consumed) == config.training.steps
         torch.save(captured, root / "forward-batches.pt")
         torch.save(consumed, root / "consumed-batches.pt")
         torch.save(measured, root / "step-metrics.pt")
+        (root / "input-hashes.json").write_text(
+            json.dumps(input_fingerprints(consumed, captured), indent=2)
+        )
         torch.save(adapter.to_hf(_snapshot(model.state_dict())), root / "final-hf.pt")
         print(f"PASS real baseline Trainer capture: {len(captured)} steps at {root}")
     finally:

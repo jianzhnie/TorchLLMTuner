@@ -13,7 +13,9 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
     apply_rotary_pos_emb,
     eager_attention_forward,
+    rotate_half,
 )
+from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeAttention
 
 from llmtuner.errors import UnsupportedCombinationError
 
@@ -76,6 +78,35 @@ def fused_qkv_projection(
     )
 
 
+def apply_configured_rotary(module, query, key, cosine, sine, position_ids):
+    if getattr(module.config, "rotary_compute_dtype", None) != "float32":
+        return apply_rotary_pos_emb(query, key, cosine, sine)
+    if position_ids is None:
+        raise ValueError("FP32 RoPE requires explicit position_ids")
+    if module.config.rope_parameters.get("rope_type", "default") != "default":
+        raise UnsupportedCombinationError(
+            "FP32 RoPE currently requires default RoPE without scaling"
+        )
+    head_dim = query.shape[-1]
+    theta = module.config.rope_parameters["rope_theta"]
+    frequencies = 1.0 / (
+        theta
+        ** (
+            torch.arange(0, head_dim, 2, device=query.device, dtype=torch.float32)
+            / head_dim
+        )
+    )
+    angles = position_ids.float().unsqueeze(-1) * frequencies
+    angles = torch.cat((angles, angles), dim=-1).unsqueeze(1)
+    cosine = angles.cos()
+    sine = angles.sin()
+    query_dtype = query.dtype
+    key_dtype = key.dtype
+    query = (query.float() * cosine) + (rotate_half(query.float()) * sine)
+    key = (key.float() * cosine) + (rotate_half(key.float()) * sine)
+    return query.to(query_dtype), key.to(key_dtype)
+
+
 def forward_fused_qkv_attention(
     module: nn.Module,
     hidden_states: torch.Tensor,
@@ -90,7 +121,9 @@ def forward_fused_qkv_attention(
     key = module.k_norm(key).transpose(1, 2)
     value = value.transpose(1, 2)
     cosine, sine = position_embeddings
-    query, key = apply_rotary_pos_emb(query, key, cosine, sine)
+    query, key = apply_configured_rotary(
+        module, query, key, cosine, sine, kwargs.get("position_ids")
+    )
     if past_key_values is not None:
         key, value = past_key_values.update(key, value, module.layer_idx)
     attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
@@ -115,15 +148,18 @@ def apply_fused_qkv_projection(model: nn.Module) -> None:
     """Install only on validated Qwen3 instances, before parallel transforms."""
     if getattr(model.config, "qkv_projection", "separate") != "fused":
         raise ValueError("model.qkv_projection must be 'fused' for fused installation")
-    if model.config.model_type != "qwen3":
+    if model.config.model_type not in ("qwen3", "qwen3_moe"):
         raise UnsupportedCombinationError(
-            "model.qkv_projection='fused' currently requires the Qwen3 dense model."
+            "model.qkv_projection='fused' requires Qwen3 or Qwen3-MoE."
         )
+    attention_type = (
+        Qwen3Attention if model.config.model_type == "qwen3" else Qwen3MoeAttention
+    )
     attention_modules = [layer.self_attn for layer in model.model.layers]
     for module in attention_modules:
-        if type(module) is not Qwen3Attention:
+        if type(module) is not attention_type:
             raise UnsupportedCombinationError(
-                "model.qkv_projection='fused' requires native Qwen3Attention instances."
+                "model.qkv_projection='fused' requires native Qwen3 attention."
             )
         if "forward" in module.__dict__ and (
             getattr(module.forward, "__func__", None) is not forward_fused_qkv_attention

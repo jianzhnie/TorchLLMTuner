@@ -162,7 +162,7 @@ def per_expert_projection_names(experts: nn.Module) -> tuple[str, str, str] | No
     anything that is not a recognized per-expert list; callers that find a
     spelling here can rely on ``fused_experts_of`` having accepted the block.
     """
-    if not isinstance(experts, (nn.ModuleList, nn.Sequential, list, tuple)):
+    if not isinstance(experts, nn.ModuleList | nn.Sequential | list | tuple):
         return None
     members = list(experts)
     if not members:
@@ -188,7 +188,7 @@ def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None
     Returns ``None`` for a list that is not one of the recognized spellings, so
     the caller keeps its "no MoE block here" behaviour.
     """
-    if not isinstance(experts, (nn.ModuleList, nn.Sequential, list, tuple)):
+    if not isinstance(experts, nn.ModuleList | nn.Sequential | list | tuple):
         return None
     members = list(experts)
     if not members:

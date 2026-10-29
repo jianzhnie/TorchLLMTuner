@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+
 import torch
 from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
@@ -86,6 +88,31 @@ def eager_flex_attention_adapter(module, query, key, value, attention_mask, **kw
     return output.transpose(1, 2).contiguous(), None
 
 
+FLEX_INDUCTOR_CONFIGS = {
+    "wrap_inductor_compiled_regions": True,
+    "max_autotune": True,
+    "coordinate_descent_tuning": True,
+    "triton.cudagraphs": False,
+}
+
+
+def allow_npu_flex_attention() -> None:
+    module = importlib.import_module("torch.nn.attention.flex_attention")
+    if not hasattr(module, "_validate_device") or hasattr(
+        module, "_llmtuner_original_validate_device"
+    ):
+        return
+    original = module._validate_device
+
+    def validate_device(query, key, value):
+        if all(tensor.device.type == "npu" for tensor in (query, key, value)):
+            return
+        original(query, key, value)
+
+    module._llmtuner_original_validate_device = original
+    module._validate_device = validate_device
+
+
 def available_attention_backend() -> str:
     """Return the attention backend supported by the current device."""
     return ATTENTION_BACKEND if torch.cuda.is_available() else "sdpa"
@@ -93,8 +120,46 @@ def available_attention_backend() -> str:
 
 def flex_attention_adapter(module, query, key, value, attention_mask, **kwargs):
     """Adapt the Hugging Face attention interface to llmtuner flex kernels."""
+    if kwargs.get("dropout", 0.0) != 0.0:
+        from ...errors import UnsupportedCombinationError
+
+        raise UnsupportedCombinationError("Flex attention does not support dropout")
     kernel = getattr(module, "_titan_flex_kernel", None)
     if kernel is None:
+        from torch.nn.attention.flex_attention import (
+            AuxRequest,
+            BlockMask,
+            flex_attention,
+        )
+
+        explicit_flex = getattr(module.config, "attention_backend", None) == "flex"
+        if explicit_flex and query.device.type == "npu":
+            allow_npu_flex_attention()
+        num_heads = query.shape[1]
+        if (
+            explicit_flex
+            and isinstance(attention_mask, BlockMask)
+            and not num_heads & (num_heads - 1)
+            and kwargs.get("sliding_window") is None
+            and kwargs.get("softcap") is None
+            and kwargs.get("s_aux") is None
+        ):
+            with maybe_regional_inductor(
+                FLEX_INDUCTOR_CONFIGS,
+                enabled=getattr(module, "_regional_inductor_enabled", False),
+            ):
+                output, _ = flex_attention(
+                    query,
+                    key,
+                    value,
+                    score_mod=None,
+                    block_mask=attention_mask,
+                    scale=kwargs.get("scaling"),
+                    enable_gqa=True,
+                    return_aux=AuxRequest(lse=False),
+                    kernel_options=kwargs.get("kernel_options", {}),
+                )
+            return output.transpose(1, 2).contiguous(), None
         with maybe_regional_inductor(
             {}, enabled=getattr(module, "_regional_inductor_enabled", False)
         ):

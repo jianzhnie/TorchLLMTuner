@@ -35,6 +35,7 @@ and the patch then queries ``torch_npu.npu.current_device()``, which fails with
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -57,12 +58,12 @@ def backend() -> str:
     return "gloo" if device().type == "cpu" else get_distributed_backend()
 
 
-def init_distributed() -> torch.device:
+def init_distributed(*, timeout: timedelta | None = None) -> torch.device:
     """Start the matching process group, bind the device, return the device."""
     dev = device()
     if dev.type != "cpu":
         getattr(torch, dev.type).set_device(dev)
-    dist.init_process_group(backend())
+    dist.init_process_group(backend(), timeout=timeout)
     return dev
 
 

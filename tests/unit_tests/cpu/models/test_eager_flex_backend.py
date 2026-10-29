@@ -14,6 +14,7 @@ from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
 from llmtuner.models.hf.attention_backend import (
     EAGER_FLEX_BACKEND,
+    allow_npu_flex_attention,
     eager_flex_attention_adapter,
 )
 from llmtuner.models.hf.factory import build_model_config_for
@@ -85,6 +86,26 @@ def test_eager_flex_adapter_rejects_dropout_and_attention_biases():
         eager_flex_attention_adapter(None, query, query, query, torch.ones(1, 1, 7, 7))
 
 
+def test_npu_flex_device_validation_preserves_other_device_checks(monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    module = importlib.import_module("torch.nn.attention.flex_attention")
+
+    def reject(*args):
+        raise ValueError("rejected")
+
+    monkeypatch.setattr(module, "_validate_device", reject)
+    monkeypatch.delattr(module, "_llmtuner_original_validate_device", raising=False)
+    allow_npu_flex_attention()
+    npu_tensor = SimpleNamespace(device=SimpleNamespace(type="npu"))
+    cpu_tensor = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+    allow_npu_flex_attention()
+    module._validate_device(npu_tensor, npu_tensor, npu_tensor)
+    with pytest.raises(ValueError, match="rejected"):
+        module._validate_device(cpu_tensor, cpu_tensor, cpu_tensor)
+
+
 @pytest.mark.parametrize("mode", ["full", "selective"])
 def test_eager_flex_ac_replay_preserves_gradients(mode):
     from llmtuner.config.activation_checkpoint_config import SelectiveACConfig
@@ -112,3 +133,35 @@ def test_eager_flex_ac_replay_preserves_gradients(mode):
         actual_gradients, expected_gradients, strict=True
     ):
         torch.testing.assert_close(actual_gradient, expected_gradient, atol=0, rtol=0)
+
+
+def test_flex_adapter_rejects_dropout_before_dispatch():
+    from llmtuner.models.hf.attention_backend import flex_attention_adapter
+
+    query = torch.randn(1, 2, 7, 8)
+    with pytest.raises(UnsupportedCombinationError, match="dropout"):
+        flex_attention_adapter(None, query, query, query, None, dropout=0.1)
+
+
+@pytest.mark.parametrize("extra", [{"softcap": 2.0}, {"s_aux": torch.ones(2)}])
+def test_explicit_flex_preserves_score_modifiers(monkeypatch, extra):
+    from types import SimpleNamespace
+
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    from llmtuner.models.hf import attention_backend
+
+    query = torch.randn(1, 2, 7, 8)
+    mask = create_block_mask(lambda b, h, q, k: q >= k, 1, None, 7, 7, device="cpu")
+    module = SimpleNamespace(config=SimpleNamespace(attention_backend="flex"))
+    observed = {}
+
+    def fallback(*args, **kwargs):
+        observed.update(kwargs)
+        return query, None
+
+    monkeypatch.setattr(attention_backend, "flex_attention_forward", fallback)
+    attention_backend.flex_attention_adapter(module, query, query, query, mask, **extra)
+    assert observed.keys() >= extra.keys()
+    for name, value in extra.items():
+        assert observed[name] is value

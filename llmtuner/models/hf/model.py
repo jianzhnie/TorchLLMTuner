@@ -57,7 +57,7 @@ from ..common.attention.masks import (
     build_dense_attention_mask,
     create_attention_mask,
     get_causal_mask_mod,
-    get_document_mask_mod,
+    get_efficient_causal_mask_mod_for_packed_document,
 )
 from ..common.moe.layer import collect_moe_layers
 from .attention_backend import (
@@ -74,6 +74,8 @@ from .model_setup import (
     apply_cast_lm_head,
     configure_experts_implementation,
     resolve_submodule_name,
+    stabilize_moe_experts,
+    stabilize_moe_router,
     stabilize_residual_norm_gradients,
     validate_head_config,
 )
@@ -106,7 +108,10 @@ class HFTransformerModel(nn.Module):
             if config.model_type == "deepseek_v4"
             else available_attention_backend()
         )
-        if getattr(config, "attention_backend", "auto") == "eager_flex":
+        attention_backend = getattr(config, "attention_backend", "auto")
+        if attention_backend == "flex":
+            config._attn_implementation = ATTENTION_BACKEND
+        elif attention_backend == "eager_flex":
             if config.model_type != "qwen3":
                 raise ValueError(
                     "model.attention_backend='eager_flex' requires dense Qwen3"
@@ -118,6 +123,8 @@ class HFTransformerModel(nn.Module):
         configure_experts_implementation(config, model_cls=model_cls)
         self.model = model_cls(config=config)
         stabilize_residual_norm_gradients(self.model)
+        stabilize_moe_router(self.model)
+        stabilize_moe_experts(self.model)
         self.model.config._attn_implementation = config._attn_implementation
 
         if getattr(config, "qkv_projection", "separate") != "separate":
@@ -673,7 +680,7 @@ class HFTransformerModel(nn.Module):
         if block_causal:
             mask_mod = and_masks(
                 get_causal_mask_mod(),
-                get_document_mask_mod(positions),
+                get_efficient_causal_mask_mod_for_packed_document(positions),
             )
         else:
             mask_mod = get_causal_mask_mod()

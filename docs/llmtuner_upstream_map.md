@@ -2021,8 +2021,7 @@ TP2/EP2/KVCP2、full/selective AC及aux/padding不等长累积证据见NPU状态
 
 `models/hf/qkv_projection.py` 为B类适配。KV-group内Q-heads/K/V的打包与拆分
 语义参考基线 `torchtitan/models/common/attention.py::FusedQKVLinear`，attention
-外围顺序对照安装版 Transformers 的
-`transformers/models/qwen3/modeling_qwen3.py::Qwen3Attention.forward`。
+外围顺序对照安装版 Transformers 的 Qwen3/Qwen3-MoE attention forward。
 不同于基线单一wqkv参数，本适配保持HF的q_proj/k_proj/v_proj独立参数及键名，
 每次forward以可微cat临时拼接，保留现有optimizer/FSDP参数所有权。仅绑定模型
 实例，无全局HF类替换、跨投影cache或torchtitan-npu运行时依赖。
@@ -2030,6 +2029,20 @@ TP2/EP2/KVCP2、full/selective AC及aux/padding不等长累积证据见NPU状态
 不能直接绕过，分别在配置/装配或调用时拒绝。默认separate不变。FP32/低精度
 CPU数学参考、AOT及实际NPU训练/恢复的证明范围见NPU状态文档，不把QKV单项
 正式化等同于联合norm、Flex、RoPE的完整生产迁移。
+
+### Qwen3-MoE torchtitan 数值对齐选项（2026-10-27）
+
+为消除真实30B基线与HF候选的系统性差异，新增显式对齐选项，默认配置不变：
+`norm_backend=torch`复用`torch.nn.functional.rms_norm`；`rotary_compute_dtype=
+float32`保持CosSinRoPE的FP32应用及输入dtype返回；`attention_backend=flex`
+固定baseline实际eager Flex的BlockMask、GQA和`AuxRequest(lse=False)`，并仅在
+显式选择时为NPU放开设备校验，其他设备仍执行原生检查；
+`experts_implementation=torchtitan`复用本地stable dispatcher、分离gate/up/down
+grouped GEMM，按`absorb_router_scores=True`在down前以FP32吸收路由分数并转回
+BF16，最后仅做deterministic scatter-add。Qwen3-MoE router gate及top-k权重固定
+FP32，保持参数和checkpoint键不变。packed mask复用同源高效
+document modifier。以上均为B类适配，不引入torchtitan-npu运行时依赖；CPU执行
+测试和30B实测证据分别记录于NPU状态文档，不以配置或局部测试宣称完全对齐。
 
 ### HF Qwen3 联合残差归一化（2026-10-23）
 

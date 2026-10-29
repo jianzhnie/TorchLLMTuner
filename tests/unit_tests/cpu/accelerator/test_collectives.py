@@ -36,6 +36,32 @@ def test_offloaded_invalid_norm_order_is_rejected(order):
         collectives._offloaded_gradient_norm(SimpleNamespace(), order)
 
 
+def test_offloaded_gradients_share_one_global_clipping_factor(monkeypatch):
+    gradients = [torch.tensor([3.0, 4.0]), torch.tensor([0.0, 5.0])]
+    wrapped = [
+        SimpleNamespace(to_local=lambda value=value: value) for value in gradients
+    ]
+    total_norm = torch.tensor(10.0)
+    cpu_calls = []
+    original_cpu = torch.Tensor.cpu
+
+    def count_cpu(tensor, *args, **kwargs):
+        cpu_calls.append(tensor)
+        return original_cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", count_cpu)
+
+    offloaded_ids = collectives._clip_offloaded_gradients(
+        wrapped, max_norm=2.0, total_norm=total_norm
+    )
+
+    assert len(cpu_calls) == 1
+    coefficient = (2.0 / (total_norm + 1e-6)).clamp(max=1)
+    assert offloaded_ids == {id(gradient) for gradient in wrapped}
+    for actual, original in zip(gradients, ([3.0, 4.0], [0.0, 5.0]), strict=True):
+        torch.testing.assert_close(actual, torch.tensor(original) * coefficient)
+
+
 def test_mean_rejects_integer_data_before_collective(monkeypatch):
     monkeypatch.setattr(collectives, "get_world_size", lambda group: 2)
     with pytest.raises(TypeError, match="floating or complex"):

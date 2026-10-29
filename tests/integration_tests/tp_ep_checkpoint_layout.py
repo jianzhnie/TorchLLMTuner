@@ -83,19 +83,26 @@ try:
     torch.testing.assert_close(complete["dense"], dense_full, atol=0, rtol=0)
     torch.testing.assert_close(complete["experts.weight"], expert_full, atol=0, rtol=0)
     saved_chunks = {key: value.detach().clone() for key, value in chunks.items()}
-    invalid = dict(saved_chunks)
-    invalid["experts.weight"] = saved_chunks["dense"]
     before = {key: value.clone() for key, value in separate.state_dict().items()}
-    try:
-        restore_disjoint_tp_ep_state(
-            invalid, local_state=separate.state_dict(), model_parts=[separate]
-        )
-    except ValueError as error:
-        assert "chunk layout differs" in str(error)
-    else:
-        raise AssertionError("Invalid expert layout must fail before copying")
-    for key, value in separate.state_dict().items():
-        torch.testing.assert_close(value, before[key], atol=0, rtol=0)
+    for failing_rank in range(dist.get_world_size()):
+        invalid = dict(saved_chunks)
+        if rank == failing_rank:
+            invalid["experts.weight"] = saved_chunks["dense"]
+        try:
+            restore_disjoint_tp_ep_state(
+                invalid, local_state=separate.state_dict(), model_parts=[separate]
+            )
+        except ValueError as error:
+            assert rank == failing_rank
+            assert "chunk layout differs" in str(error)
+        except RuntimeError as error:
+            assert rank != failing_rank
+            assert "Joint TP/EP checkpoint restore failed on another rank" in str(error)
+        else:
+            raise AssertionError("Invalid expert layout must fail before copying")
+        for key, value in separate.state_dict().items():
+            torch.testing.assert_close(value, before[key], atol=0, rtol=0)
+        dist.barrier()
     missing = dict(saved_chunks)
     del missing["experts.weight"]
     try:

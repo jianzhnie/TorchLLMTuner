@@ -17,7 +17,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 from ...utils.module_names import canonical_fqn
-from ..expert_parallel.checkpointing import expert_shard_map
+from ..expert_parallel.checkpointing import EP_GROUP_ATTR, expert_shard_map
 
 TPLayout = tuple[int, bool, dist.ProcessGroup]
 
@@ -28,7 +28,9 @@ def shard_disjoint_tp_ep_state(
     """Describe dense TP and expert EP chunks with disjoint parameter ownership."""
     from ..expert_parallel.checkpointing import shard_expert_state
 
-    with _coordinate_chunk_errors(model_parts, "Joint TP/EP checkpoint ownership"):
+    with _coordinate_chunk_errors(
+        model_parts, "Joint TP/EP checkpoint ownership", include_expert_groups=True
+    ):
         validate_disjoint_tp_ep_checkpoint_ownership(model_parts)
     # TP touches only its registered parameters. Expert entries remain in their
     # local shape until the EP transform assigns global expert coordinates.
@@ -48,7 +50,9 @@ def restore_disjoint_tp_ep_state(
     from ...components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
 
     destinations = shard_disjoint_tp_ep_state(local_state, model_parts=model_parts)
-    with _coordinate_chunk_errors(model_parts, "Joint TP/EP checkpoint restore"):
+    with _coordinate_chunk_errors(
+        model_parts, "Joint TP/EP checkpoint restore", include_expert_groups=True
+    ):
         pending = _validate_chunk_destinations(state, destinations)
     for destination, source in pending:
         destination.copy_(source)
@@ -79,27 +83,39 @@ def validate_disjoint_tp_ep_checkpoint_ownership(
 
 
 @contextmanager
-def _coordinate_chunk_errors(model_parts, phase):
-    """Finish all owning groups' error reports before raising a local error."""
-    groups = sorted(
-        {
-            layout[2]
-            for model in model_parts
-            for module in model.modules()
-            for layout in module.__dict__.get("_tp_checkpoint_layouts", {}).values()
-        },
-        key=lambda group: tuple(dist.get_process_group_ranks(group)),
-    )
+def _coordinate_chunk_errors(model_parts, phase, *, include_expert_groups=False):
+    """Coordinate local errors across the selected TP and EP ownership groups."""
     error = None
     try:
         yield
     except BaseException as caught:
         error = caught
+    groups = {
+        layout[2]
+        for model in model_parts
+        for module in model.modules()
+        for layout in module.__dict__.get("_tp_checkpoint_layouts", {}).values()
+    }
+    if include_expert_groups:
+        groups.update(
+            group
+            for model in model_parts
+            for module in model.modules()
+            if (group := getattr(module, EP_GROUP_ATTR, None)) is not None
+        )
+    groups = sorted(
+        groups, key=lambda group: tuple(dist.get_process_group_ranks(group))
+    )
     failed = error is not None
-    for group in groups:
-        reports = [None] * dist.get_world_size(group)
-        dist.all_gather_object(reports, not failed, group=group)
-        failed = failed or not all(reports)
+    # Joint owners form overlapping TP/EP groups. Repeated reports propagate
+    # a failure through that component without involving unrelated PP stages.
+    # The world size bounds its diameter; use the same bound on every owner.
+    rounds = dist.get_world_size() if include_expert_groups and groups else 1
+    for _ in range(rounds):
+        for group in groups:
+            reports = [None] * dist.get_world_size(group)
+            dist.all_gather_object(reports, not failed, group=group)
+            failed = failed or not all(reports)
     if error is not None:
         raise error
     if failed:

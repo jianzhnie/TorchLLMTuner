@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import torch
 import torch.nn as nn
 from transformers.configuration_utils import PretrainedConfig
 
@@ -9,6 +10,8 @@ from ...config.model_config import LM_HEAD_COMPUTE_DTYPES
 from ...utils.dtypes import get_dtype
 from ...utils.logging import get_logger
 from ..common.cast_linear import build_cast_linear
+from ..common.moe.gate import RouterGateLinearFunction
+from ..common.scatter_add import deterministic_scatter_add
 
 logger = get_logger(__name__)
 
@@ -44,24 +47,27 @@ def _isolate_norm_input(module, args, kwargs):
     return args, {**kwargs, "hidden_states": value.view_as(value)}
 
 
-def stabilize_residual_norm_gradients(model: nn.Module) -> None:
-    """Select known Qwen3 residual gradient boundaries before parallel transforms.
+def forward_torch_rms_norm(module: nn.Module, hidden_states: torch.Tensor):
+    return torch.nn.functional.rms_norm(
+        hidden_states,
+        (module.weight.numel(),),
+        module.weight,
+        module.variance_epsilon,
+    )
 
-    Without the view, eager may accumulate the residual between RMSNorm's two
-    backward contributions. AOT instead sums those contributions inside its
-    graph. The view makes both merge the norm gradient before the residual,
-    without copying activation data. Joint mode additionally owns norm/residual
-    gradients through a paired operator and retains the view hooks. Neither mode
-    changes registered parameters or checkpoint keys.
-    """
+
+def stabilize_residual_norm_gradients(model: nn.Module) -> None:
+    """Select normalization arithmetic and known residual gradient boundaries."""
     model_type = getattr(model.config, "model_type", None)
     backend = getattr(model.config, "norm_backend", "native")
-    if backend not in ("native", "aten", "joint"):
-        raise ValueError("model.norm_backend must be 'native', 'aten', or 'joint'")
+    if backend not in ("native", "torch", "aten", "joint"):
+        raise ValueError(
+            "model.norm_backend must be 'native', 'torch', 'aten', or 'joint'"
+        )
     if backend == "joint" and model_type != "qwen3":
         raise ValueError("model.norm_backend='joint' requires dense Qwen3")
-    if backend == "aten" and model_type not in ("qwen3", "qwen3_moe"):
-        raise ValueError("model.norm_backend='aten' requires qwen3 or qwen3_moe")
+    if backend in ("aten", "torch") and model_type not in ("qwen3", "qwen3_moe"):
+        raise ValueError(f"model.norm_backend='{backend}' requires qwen3 or qwen3_moe")
     if model_type == "qwen3":
         from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
@@ -91,6 +97,10 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
 
             if getattr(module.forward, "__func__", None) is forward_aten_rms_norm:
                 del module.forward
+        if backend != "torch" and getattr(module.forward, "__func__", None) is (
+            forward_torch_rms_norm
+        ):
+            del module.forward
         if backend != "joint" and getattr(module.forward, "__module__", None) == (
             f"{__package__}.residual_normalization"
         ):
@@ -110,14 +120,16 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
                     is forward_joint_residual_block
                 ):
                     del layer.forward
-    if backend == "aten":
+    if backend in ("aten", "torch"):
         from types import MethodType
 
-        from .normalization import forward_aten_rms_norm
-
+        if backend == "aten":
+            from .normalization import forward_aten_rms_norm as norm_forward
+        else:
+            norm_forward = forward_torch_rms_norm
         for module in model.modules():
             if type(module) is norm_type:
-                module.forward = MethodType(forward_aten_rms_norm, module)
+                module.forward = MethodType(norm_forward, module)
         return
     for layer in model.model.layers:
         for name in ("input_layernorm", "post_attention_layernorm"):
@@ -130,6 +142,28 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
         from .residual_normalization import apply_joint_residual_norm
 
         apply_joint_residual_norm(model)
+
+
+def forward_fp32_topk_router(module: nn.Module, hidden_states: torch.Tensor):
+    hidden_states = hidden_states.reshape(-1, module.hidden_dim)
+    router_logits = RouterGateLinearFunction.apply(hidden_states, module.weight)
+    probabilities = torch.nn.functional.softmax(router_logits, dim=-1)
+    scores, indices = torch.topk(probabilities, module.top_k, dim=-1, sorted=False)
+    if module.norm_topk_prob:
+        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+    return router_logits, scores, indices
+
+
+def stabilize_moe_router(model: nn.Module) -> None:
+    if getattr(model.config, "model_type", None) != "qwen3_moe":
+        return
+    from types import MethodType
+
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeTopKRouter
+
+    for module in model.modules():
+        if type(module) is Qwen3MoeTopKRouter:
+            module.forward = MethodType(forward_fp32_topk_router, module)
 
 
 def resolve_submodule_name(
@@ -175,6 +209,67 @@ def validate_head_config(config: PretrainedConfig) -> None:
         )
 
 
+def forward_torchtitan_moe(module: nn.Module, hidden_states: torch.Tensor):
+    if hidden_states.dtype != torch.bfloat16:
+        raise TypeError("experts_implementation='torchtitan' requires BF16 inputs")
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states = hidden_states.reshape(-1, hidden_dim)
+    _, scores, expert_ids = module.gate(hidden_states)
+    counts = torch.nn.functional.one_hot(
+        expert_ids, num_classes=module.experts.num_experts
+    ).sum(dim=(0, 1))
+    dispatcher = module._llmtuner_local_dispatcher
+    routed, counts, metadata = dispatcher.dispatch(
+        hidden_states, scores, expert_ids, counts
+    )
+    offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+    gate, up = module.experts.gate_up_proj.chunk(2, dim=1)
+    gate = gate.contiguous()
+    up = up.contiguous()
+    gate_values = torch._grouped_mm(
+        routed.bfloat16(), gate.bfloat16().transpose(-2, -1), offs=offsets
+    )
+    up_values = torch._grouped_mm(
+        routed.bfloat16(), up.bfloat16().transpose(-2, -1), offs=offsets
+    )
+    hidden = module.experts.act_fn(gate_values) * up_values
+    hidden = (hidden.float() * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)).to(
+        hidden.dtype
+    )
+    routed_output = torch._grouped_mm(
+        hidden,
+        module.experts.down_proj.bfloat16().transpose(-2, -1),
+        offs=offsets,
+    ).type_as(routed)
+    output = deterministic_scatter_add(
+        torch.zeros_like(hidden_states),
+        metadata.token_indices_experts_sorted_N.reshape(-1, 1).expand(-1, hidden_dim),
+        routed_output,
+    )
+    return output.reshape(batch_size, sequence_length, hidden_dim)
+
+
+def stabilize_moe_experts(model: nn.Module) -> None:
+    if getattr(model.config, "experts_implementation", "native") != "torchtitan":
+        return
+    from types import MethodType
+
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
+
+    from ...parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
+
+    modules = [
+        module for module in model.modules() if type(module) is Qwen3MoeSparseMoeBlock
+    ]
+    if not modules:
+        raise ValueError("Qwen3-MoE torchtitan experts require routed MoE blocks")
+    for module in modules:
+        module._llmtuner_local_dispatcher = LocalTokenDispatcher(
+            module.experts.num_experts, module.gate.top_k
+        )
+        module.forward = MethodType(forward_torchtitan_moe, module)
+
+
 def configure_experts_implementation(
     config: PretrainedConfig, *, model_cls: type
 ) -> None:
@@ -193,10 +288,15 @@ def configure_experts_implementation(
     impl = getattr(config, "experts_implementation", "native")
     if impl == "native":
         return
+    if impl == "torchtitan":
+        if config.model_type != "qwen3_moe":
+            raise ValueError("experts_implementation='torchtitan' requires Qwen3-MoE")
+        config._experts_implementation = "eager"
+        return
     if impl not in ("grouped_mm", "batched_mm", "eager"):
         raise ValueError(
             f"experts_implementation must be one of 'native', "
-            f"'grouped_mm', 'batched_mm', 'eager', got '{impl}'"
+            f"'grouped_mm', 'batched_mm', 'eager', 'torchtitan', got '{impl}'"
         )
     can_set = getattr(model_cls, "_can_set_experts_implementation", None)
     if can_set is None:

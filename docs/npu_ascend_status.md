@@ -1,5 +1,331 @@
 # Ascend NPU 验证状态
 
+## 2026-10-28：30B 完整 replay 退出 0，八 rank 最终权重证据齐备
+
+meta13误用仅前向trace目录，启动读取config时退出，未执行训练。改用完整capture
+`outputs/p4-30b-capture-partial2-20261026/alignment-capture`后，meta14完成真实
+训练但rank0在最终权重阶段被SIGKILL；容器`oom_kill=2`。根因是初态核验后仍
+保留每rank完整CPU `initial`，与最终权重加载及专家融合叠加形成主机内存峰值。
+现仅在30B初态核验完成后释放`initial/candidate_initial`引用，训练及比较不变。
+
+meta15在10.1.0.18以原八rank配置复验，launcher退出0，所有rank均生成
+`diagnostic.json`、`candidate-final-local.pt`和`weight-diagnostics.json`，共24个
+最终产物。日志为`p4_30b_candidate_meta15_replay_20261028.log`。八rank的
+logits与loss均逐值一致；grad_norm AE=0.0022571087、RE=0.0006506980，
+满足本配置既定阈值。最终每rank比较531个本地分片张量，无NaN指标；
+weight mean_ae最大为8.6784363e-05，cos最小为0.9995933213，137–175个
+张量逐值一致。汇总为`outputs/p4-30b-candidate-meta15-summary-20261028.json`。
+
+这关闭了本配置完整前反向及最终权重产物缺口，不将非逐值一致的权重称为完全
+相同。关键权重名称、时点和独立阈值仍需用户确认，因此不宣称P4全部通过；
+P0–P4其余范围也不由此单步单布局结果外推。
+
+## 2026-10-27：对齐代码结构审查与验证补强
+
+本轮不改变已验证的数值计算顺序。30B replay的初态和最终权重统一复用
+`iter_local_state`，按实际DTensor mesh/placement比较本地分片，避免全量
+all-gather；新增双方key集合检查，缺失或多余张量不再被静默忽略。QKV安装
+改用单一attention类型，MoE的deterministic scatter-add移到模块级导入，
+训练指标集成测试改用`torch.testing.assert_close`处理浮点归约误差。
+
+完整CPU套件实测`4360 passed, 13 skipped, 268 warnings`（152.04秒）。
+`tp_dp_checkpoint_reshard.py`、四rank CPU/Gloo
+`training_metric_reduction_equivalence.py`和`tp_ep_checkpoint_layout.py`均通过，
+覆盖TP×DP跨布局模型/optimizer恢复、指标归约及TP×EP模型/optimizer/EMA恢复。
+一次指标脚本的NPU附带运行因浮点精确相等断言失败，且节点有其他八卡训练、
+每卡约46–47GiB HBM占用并伴随HCCL错误；不计为NPU通过证据，不重跑占用节点。
+30B完整反传、optimizer更新及最终权重仍未产生完整结果，继续blocked；既有
+八rank前向逐值一致不能外推为完整训练对齐。
+
+## 2026-10-27：meta12 设备竞争，主动停止并清理 replay
+
+meta12在10.1.0.122启动后，该节点又出现其他训练任务，双方HBM需求合计
+超过容量。为避免干扰其他任务，停止本地watcher并终止容器内本次replay的
+8个进程，已核实全部退出。未生成最终诊断或权重，不计为数值失败。
+其他训练仍在占用约43–47GiB HBM，当前不重复启动；保持前向八rank逐值
+一致、首步标量达标和本地分片验证方案，完整反传及最终权重继续blocked。
+
+## 2026-10-27：meta11 再次 OOM，当前无可用节点
+
+meta11在Flex前向/反向阶段再次因NPU OOM退出，日志显示当前进程分配
+16.41GiB，设备容量被其他任务占用，未进入最终权重验证。该结果不计为
+数值失败。2026-10-27后续核查时`available_nodes.txt`为空，
+`unavailable_nodes.txt`含16个节点，当前没有可合法启动8卡replay的资源。
+不擅自恢复节点列表、抢占设备或降低模型/反传要求。前向八rank逐值一致、
+CPU全套和相关pre-commit证据保持有效；完整反传及最终权重仍blocked，
+等待用户提供空闲节点。
+
+## 2026-10-27：meta10 设备竞争导致 Flex backward OOM
+
+meta10在Flex backward申请2.50GiB时NPU OOM，日志显示当前进程仅分配
+17.65GiB，但该卡总容量已被其他任务占用约41GiB。失败不是切片、数值断言或
+本地权重比较导致，未生成最终权重。随后核查所有候选节点均有训练进程；
+10.1.0.71虽有较多剩余HBM，但实测也有8个其他训练进程，未抢占设备。
+新的meta11仅在宿主机进程检查为0时启动，保持模型、序列、反传和全部
+验收阈值不变，不通过降低配置规避资源问题。
+
+## 2026-10-27：最终权重改以本地分片验证，避免聚合通信失败
+
+meta9的真实首步训练和rank1/rank5正式诊断均显示logits/loss差值为0，
+grad_norm AE=0.0022571087、RE=0.0006506980，达到既定阈值。但最终
+`DTensor.full_tensor()`阶段rank5出现HCCL watchdog/ACL stream错误，rank1随后
+出现507001，launcher终止；其余rank未生成完整诊断和最终权重。该次记为
+验证通信失败，不记数值失败或完整replay通过，日志
+`p4_30b_candidate_meta9_replay_20261027.log`。
+
+replay现仅对30B改为读取各rank本地DTensor分片，按实际mesh/placement从
+baseline切出对应分片，并将baseline专家权重映射为相同fused表达后比较，
+避免数千次全量all-gather和专家编号错位。输出改为`candidate-final-local.pt`及
+带namespace的`weight-diagnostics.json`；debugmodel原路径不变。CPU DTensor
+坐标切片测试通过，相关pre-commit通过。新meta10待空闲节点复验，最终权重
+结果仍未产生。
+
+## 2026-10-27：30B 前向八 rank 逐值对齐，进入完整反传复验
+
+仅前向诊断`npu_model_forward_trace.py`在同一初态、输入和FSDP布局下比较
+真实torchtitan-npu与候选，不执行反向或optimizer。逐层证据定位并修复：
+replay初态加载时序、普通causal错误用于两文档输入、`rotary_compute_dtype`
+未由工厂传入HF config、原生Flex的NPU设备拒绝，以及baseline
+`absorb_router_scores=True`所要求的pre-down FP32分数吸收。combine不再
+重复加权，scatter-add保持确定性。
+
+最终candidate8/baseline5在rank0的embedding、Q/K/V、layer0 attention、
+post_norm、前三次grouped GEMM的输入/权重/offset/输出、MoE、layer0/1、
+final_norm和logits全部逐值相同。其余rank的logits/final_norm也全部相同，
+官方metrics的mean_ae/mean_re均为0；汇总
+`outputs/p4-30b-forward-all-ranks-metrics-20261027.json`的
+`all_ranks_exact=true`。这证明30B前向数值对齐，不提前证明反传、grad_norm、
+optimizer更新或最终权重。完整replay已启动。最终CPU套件为
+**4358 passed、13 skipped、268 warnings**，日志
+`torchtitan_alignment_final_cpu_suite_20261027.log`；本轮相关文件的全部
+pre-commit hooks通过，完整pre-commit仍不以此替代。
+
+## 2026-10-27：30B 全语义对齐实测与逐层前向定位
+
+对照真实torchtitan-npu执行路径，新增显式对齐配置：FP32 router gate/top-k、
+融合QKV、FP32 RoPE、torch RMSNorm、eager Flex及packed document mask、
+stable dispatch、分离gate/up/down grouped GEMM、FP32路由加权和deterministic
+scatter-add。默认native/auto配置不变。来源映射同步维护于
+`docs/llmtuner_upstream_map.md`。
+
+meta7的8个rank均通过HF初态逐值核验，但原生Flex设备校验拒绝NPU，未进入训练；
+随后按baseline实际eager Flex补丁实现显式NPU兼容，而非复制其未生效的静态
+compile配置。meta8完成真实首步训练，loss=0.57522、grad_norm=3.4398，但
+诊断阶段超过2小时预算并由launcher SIGKILL，无最终权重证据。离线官方metrics
+显示logits仍未达标：各rank mean_ae 0.08079–0.11042、mean_re
+0.18729–0.27684、cos 0.99755–0.99853；loss AE=0.0003876090、
+RE=0.0006733900通过，grad_norm AE=0.0289263725、RE=0.0083391344失败。
+结果见`outputs/p4-30b-candidate-meta8-partial-metrics-20261027.json`，P4未通过。
+
+replay分布式收尾已去掉冗余loss-from-logits NPU all-reduce，正式logits、记录
+loss和grad_norm阈值不变，单卡交叉检查保留。当前新增仅前向诊断
+`npu_model_forward_trace.py`，以同一初态和输入采集两侧逐层输出，定位最早
+分叉；诊断不替代正式训练验收。完整CPU回归为**4358 passed、13 skipped、
+268 warnings**，日志`torchtitan_alignment_cpu_suite_20261027.log`；后续新增
+device/trace修改仍需再跑最终门禁。
+
+## 2026-10-27：FP32 路由修正与 replay 初态加载时序修复
+
+静态对照确认baseline的router gate及top-k权重保持FP32，而候选HF Qwen3-MoE
+路径使用BF16 gate并将top-k权重转回BF16。正式HF构造路径现复用现有
+`RouterGateLinearFunction`，使Qwen3-MoE的gate、softmax、top-k及归一化权重
+保持FP32，top-k顺序与baseline一致；参数dtype、参数身份和checkpoint键不变，
+其他模型族路径不变。新增CPU数值测试通过，完整CPU套件在10.1.0.37退出0，
+**4354 passed、13 skipped、267 warnings**，日志
+`outputs/qwen3-30b-npu/logs/fp32_router_cpu_suite_20261027.log`。
+该结果不证明30B logits差异已消除，原P4失败保持，须重新实测。
+
+随后meta5 replay在训练前初态核验失败，未执行训练。日志
+`p4_30b_candidate_meta5_replay_20261027.log`显示独立lm_head几乎全值不同；
+定位为replay在`trainer.train()`之前核验，却未先调用`checkpointer.load()`，
+因此读到随机初态，并非HF checkpoint损坏。现已在30B初态核验前显式执行同一
+HF加载并断言step0，不恢复整权重二次分发，不跳过任何逐值断言。最新版本尚需
+完整复跑；再次检查时全部16个候选节点均被其他任务占用，未抢占设备。
+全仓Ruff、format、diff及compileall通过，完整pre-commit仍未获通过。
+
+## 2026-10-27：30B 候选首步 logits 未达标，完整 replay 仍待完成
+
+复核`p4_30b_candidate_meta_replay_20261026.log`及8个rank已保存产物：候选真实
+Trainer完成1 step，loss与grad_norm均满足原阈值，但最终权重聚合超过默认HCCL
+timeout，随后launcher以store timeout退出，未生成candidate-final和权重诊断。
+该次不能记为完整replay通过。修正后的30B进程组启动timeout为2小时，且删除
+重复的初态分发；最新版本尚未获得空闲8卡复跑。
+
+使用官方`metrics.py`离线比较已保存首步logits，8个rank全部未达到原阈值：
+mean_ae为0.10784–0.13188（要求≤0.02），mean_re为0.28607–0.35168
+（要求≤0.02），cos为0.99678–0.99829（要求≥0.9999）。loss各rank
+AE=0.0007190704、RE=0.0012492353，grad_norm各rankAE=0.0013875961、
+RE=0.0004000277，均达标。逐rank结果保存于
+`outputs/p4-30b-candidate-meta-partial-metrics-20261027.json`；P4首步logits
+状态为失败，关键权重标准仍blocked，不把标量达标外推为整项通过。
+
+replay现保留baseline logits的单例batch维重塑，并在最终权重聚合及阈值断言前
+写出diagnostic.json，避免后续聚合或数值失败丢失比较结果。初态所有键、shape、
+dtype和值以及输入hash已在此运行核验一致。静态配置对照显示baseline采用融合
+QKV/FlexAttention，候选采用独立QKV/SDPA，专家计算顺序亦不同；这些是待实测
+定位的候选差异，尚未据此宣称根因。2026-10-27检查available_nodes全部16个节点，
+宿主机均已有8卡Python进程，未启动新NPU任务。Ruff、format、diff及compileall
+通过；完整pytest和pre-commit未在本轮重跑。
+
+## 2026-10-26：30B 真实 baseline Trainer capture 完成
+
+30B P4适配新增显式`LLMTUNER_ALIGNMENT_MODEL=qwen3_30b_a3b`路径，默认
+debugmodel不变。实际预检修正了基线数据加载、TrainingConfig字段、
+`partial_dtensor`和HCCL timeout兼容；基线及候选配置均通过真实构建。
+LIMO question/solution、BF16、seq4096、global batch8、纯FSDP shard8、
+TP/EP/PP/CP=1、fullAC、非chunked CE、for-loop、seed42/deterministic均已固定，
+48层MoE的load balance aux全部关闭。静态预检保存于
+`outputs/p4-30b-preflight-20261026.json`。
+
+在10.1.0.18以8个NPU运行真实baseline `Trainer.train()`，完成1 step，
+loss=0.57561、grad_norm=3.4688，8个rank均打印
+`PASS real baseline Trainer capture`。日志为
+`outputs/qwen3-30b-npu/logs/p4_30b_baseline_capture_partial2_20261026.log`。
+初态在真实`checkpointer.load()`返回后、首个train_step前保存；每rank保存
+config/mesh/optimizer、initial-hf、consumed/forward batches、input hashes、
+step-metrics和final-hf。未采集trace-step-1以控制全量权重加梯度的主机内存峰值，
+关键权重阈值和首步快照仍不得据此宣称完成。
+
+这是30B真实基线训练及产物证据，不是跨框架数值对齐通过；候选replay及
+logits/loss/grad_norm阈值比较仍待完成。
+
+## 2026-10-26：无诊断 compile 恢复与 CP1 联合分片恢复通过
+
+无诊断脚本的`codegen1 + barrier1`独立resume在10.1.0.18复验通过：两rank
+恢复前状态失败数均为0，恢复loss与连续训练最大差0，日志无
+`CHECK ACCURACY FAILED`：
+`outputs/qwen3-30b-npu/logs/pp2_codegen1_barrier1_noprobe_resume_retry_20261026.log`。
+结合此前full，当前辅助PP2的代码生成、训练及恢复均不依赖Inductor诊断monkeypatch；
+仍不直接外推30B compile。
+
+CP1 TP2/EP2联合分片full的停滞经栈定位到多轮TP/EP错误协调。单轮对照可完成，
+但简单增加全局barrier会在嵌套边界造成另一处集合顺序错误，未采用。最终联合
+路径改为world上的一次错误汇总，TP-only保留原子组单轮协议，避免子组多轮
+通信。CPU/Gloo的`tp_ep_checkpoint_layout.py`（含逐rank错误注入）通过。
+随后NPU4、CP1、full AC、dynamic EMA/RNG/loader、两个joint sharded开关的
+full/resume均通过，恢复前四rank状态失败数为0，恢复loss最大差0：
+`outputs/qwen3-30b-npu/logs/joint_worldcoord_{full,resume}_20261026.log`。
+这关闭此前CP1联合分片EMA恢复失败；范围仍限该小模型和配置。
+
+## 2026-10-26：CPU 质量复验与 metrics 归约顺序诊断
+
+在10.1.0.37以当前工作树重跑完整CPU单元套件，exit 0，结果为
+**4344 passed、13 skipped、273 warnings**，日志
+`outputs/qwen3-30b-npu/logs/current_worktree_cpu_suite_retry_20261026.log`。
+这替代此前伴随NPU 507018的无效门禁运行，不替代分布式NPU验收。
+隔离快照pre-commit除原有`hf_inspection.py`两处Ruff自动修正外其余hooks通过；
+未回写无关文件，完整pre-commit仍未获通过。
+
+metrics测试新增可选`LLMTUNER_TEST_METRICS_REFERENCE=per_rank`，默认
+sum_then_divide参考及原精确标准不变。CPU两种参考均通过。NPU对照在10.1.0.29
+显示生产值`0.7500000596046448`、独立per-rank参考`0.75`，相差1 ULP；
+独立参考复用相同逐rank标量除法和loss mesh归约后仍出现该差异，不再重复
+同一用例。日志为`metrics_per_rank_reference_values_20261026.log`。
+该结果支持归约顺序/集合归约数值近似解释，但原精确标准未获用户变更，
+仍保留失败/标准待确认，不自行改成近似通过。
+
+## 2026-10-26：无诊断 codegen/barrier 补丁进展与后续失败记录
+
+在gather1基础上制作`torch_npu-2.12.0+llmtuner.codegen1`，正式加入concat/
+squeeze FX API、多reduction空间循环与分轴求和、单reduction轴序、deterministic
+候选选择及CantSplit兼容修复，13项代码生成/单元测试通过。另制作
+`triton_ascend-3.2.1+llmtuner.barrier1`，仅将未显式配置时的
+`inject_barrier_all`默认值设为True，显式False仍可关闭；4项选项测试通过。
+两项均为独立wheel/runtime，未修改容器全局依赖。哈希分别见
+`outputs/torch_npu-2.12.0-llmtuner-codegen1/provenance.json`和
+`outputs/triton-ascend-3.2.1-llmtuner.barrier1/SHA256SUMS`。
+
+使用两个补丁runtime，直接从`pp_checkpoint_equivalence.py`启动，不再加载
+任何Inductor诊断probe。PP2 full完成4步及step-2保存，loss与既有gather配对
+逐项相同，日志零`CHECK ACCURACY FAILED`：
+`outputs/qwen3-30b-npu/logs/pp2_codegen1_barrier1_noprobe_full_20261026.log`。
+这证明无monkeypatch的代码生成和full训练路径，不替代独立恢复验收。
+
+后续运行暂未完成，均保留原状态，不改判通过：
+
+- 独立resume在10.1.0.90恢复后进入训练时，rank1报NPU OOM（尝试分配超过1EB），
+  日志`pp2_codegen1_barrier1_noprobe_resume_20261026.log`；full结果不因此失效，
+  但完整compile恢复仍待复验。
+- CP1 TP2/EP2 joint sharded full/resume两次分别在300秒和900秒预算超时，
+  尚未进入数值比较，日志`current_code_joint_full{,_retry}_20261026.log`；
+  不作为数值失败或恢复通过。
+- 完整CPU套件为4333 passed、13 skipped、11 failed，失败伴随NPU 507018设备错误，
+  日志`current_worktree_cpu_suite_20261026.log`。该次不是有效质量门禁通过，
+  需在稳定设备环境重跑并区分设备失败与代码断言。
+- metrics新增可选`LLMTUNER_TEST_METRICS_REFERENCE=per_rank`诊断，保留默认
+  sum_then_divide参考及原精确标准；CPU两种参考均通过。NPU诊断仍有1 ULP差异，
+  且当时伴随集合通信/端口冲突，不能宣称该项验收通过或自行改变阈值。
+
+用户要求暂停设备任务并于50分钟后恢复。当前无后台NPU任务；恢复时先检查节点
+占用，不复用失败进程或覆盖上述日志。
+
+## 2026-10-26：TP2×EP2×KVCP2 full-AC 精确恢复复验通过
+
+在10.1.0.69、NPU0–3，以当前工作树和原正式配置复跑NPU4、TP2/EP2/KVCP2、
+native FP32、非packed seq256、full AC、dynamic EMA、RNG/loader及RoPE状态检查，
+未插入诊断hook或放宽断言。full完成4步并保存step-2，独立resume恢复后执行
+step3/4；四rank恢复前状态失败数均为0，恢复loss与连续训练最大差0，
+`all checks passed`。日志为
+`outputs/qwen3-8b-npu/logs/current_code_fullac_{full,resume}_20261026.log`，
+两个torchrun均退出0。
+
+这关闭此前同配置full-AC精确冷恢复失败，不再以局部重放或带hook成功配对作为
+证据。其范围仍限该小型MoE和本次配置，不外推CP1联合分片恢复、compile或30B。
+当前SPMD重放上下文、checkpoint及相关生产修复均保留，未修改测试阈值。
+
+## 2026-10-26：版本化 gather 补丁的整模型训练与完整恢复
+
+基于原torch-npu 2.12.0 wheel制作隔离补丁
+`/home/jianzhnie/llmtuner/wheels/local/torch_npu-2.12.0+llmtuner.gather1-cp312-cp312-manylinux_2_28_aarch64.whl`，
+仅在`NPUIndexTritonKernel.codegen_kernel`返回前对严格匹配的三处负偏移
+masked load改为连续加载后寄存器`tl.gather`。部分匹配、错误R2或布局显式拒绝，
+不修改llmtuner生产入口、容器全局依赖或原始FX归档。代码生成5项测试通过；
+源/补丁哈希见`outputs/torch_npu-2.12.0-llmtuner-gather1/provenance.json`。
+
+直接执行归档生成源码的`fx11_replay_probe.py`不会调用`codegen_kernel`，因此
+不能用于证明该依赖补丁生效；该次保留原误差日志
+`fx11_gather1_production_replay_20261026.log`。随后在10.1.0.69、NPU0/1、
+独立runtime和全新缓存中从`npu_inductor_barrier_probe.py`重新编译整模型，
+不启用`LLMTUNER_FX11_GATHER`。实际生成代码含3处`tl.gather`且原负偏移为0；
+目标后缀11的ttadapter为0个`memref.load`、11个`memref.copy`，未退化为
+嵌套标量加载。
+
+| 配置 | 结果 | 状态 | 日志 |
+| --- | --- | --- | --- |
+| PP2 / gather1 / full | 4步及step-2保存；loss与原gather诊断逐项相同；零`CHECK ACCURACY FAILED` | 通过（辅助模型） | `outputs/qwen3-30b-npu/logs/pp2_gather1_production_full_20261026.log` |
+| 独立resume | 更新前模型/optimizer/scheduler/trainer失败数均0；恢复loss最大差0；零精度检查失败 | 通过（辅助模型） | `outputs/qwen3-30b-npu/logs/pp2_gather1_production_resume_20261026.log` |
+| dynamic EMA/RNG/loader full+resume | 两rank全部状态比较通过；恢复loss最大差0；零精度检查失败 | 通过（辅助模型） | `outputs/qwen3-30b-npu/logs/pp2_gather1_production_state_{full,resume}_20261026.log` |
+
+该结果正式化了诊断中的gather变换并关闭其后缀11缺口，仅限当前依赖版本和
+辅助PP2配置。barrier、concat/squeeze、多reduction、单reduction轴序、
+deterministic/CantSplit等诊断仍在链中，不能宣称无monkeypatch生产compile、
+30B目标或P3全部通过。下一步逐项正式化并移除这些包装后复验。
+
+## 2026-10-26：P0 四拓扑证据复核与 KCP 设备普查
+
+本轮仅复核已有运行产物，未重复四组30B训练或恢复。四组均已有两步训练、
+独立进程恢复及10步端到端计时证据；预热排除step1–3，step6离群窗口保留
+step5 checkpoint开销，不解释为纯计算吞吐。
+
+| dp_shard / TP / EP | 独立恢复完整状态比较 | 预热后 min / median / mean / P95 / max（秒） |
+| --- | --- | --- |
+| 8 / 1 / 1 | 19697 chunks，0 failures | 7.305 / 7.625 / 10.488 / 21.940 / 28.010 |
+| 4 / 2 / 1 | 17917 chunks，0 failures | 8.079 / 8.398 / 11.919 / 25.895 / 33.305 |
+| 4 / 2 / 4 | 18541 chunks，0 failures | 6.183 / 6.269 / 8.662 / 18.076 / 23.068 |
+| 8 / 1 / 8 | 21473 chunks，0 failures | 4.871 / 4.934 / 7.353 / 16.801 / 21.836 |
+
+恢复比较日志为`outputs/p0_matrix_<配置>_resume_state_compare_20261026.log`；
+10步日志为`outputs/p0_matrix_10_<配置>_20261026.log`，checkpoint位于
+`outputs/qwen3-30b-npu/p0_matrix_10_20261026/<配置>/checkpoint/`。
+这些结果不关闭P4跨布局数值验收。新增长日志未单独记录外层launcher退出码，
+严格登记时应关联原调度退出记录，不仅凭日志末尾推定退出码。
+
+另对`available_nodes.txt`全部12个候选节点执行只读设备名查询，实测均为
+Ascend910_9392：10.1.0.116、10.1.0.12、10.1.0.14、10.1.0.179、
+10.1.0.18、10.1.0.194、10.1.0.29、10.1.0.37、10.1.0.42、10.1.0.69、
+10.1.0.71、10.1.0.90。未发现KCP真实CP内核要求的arch3.5兼容设备，
+KCP及DP×KCP继续保持`blocked`；不重复预期架构拒绝测试。
+
 ## 2026-10-26：可用节点上的 gather 整模型 full/resume 配对
 
 `available_nodes.txt`列出的节点为10.1.0.37、10.1.0.69、10.1.0.90。
