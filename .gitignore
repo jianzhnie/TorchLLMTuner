@@ -221,3 +221,4 @@ outputs/tb/
 outputs/
 torch_compile_debug/
 moonep/
+*.txt
