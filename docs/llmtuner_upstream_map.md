@@ -1,9 +1,65 @@
 # llmtuner → torchtitan 对应关系表
 
+HF CPU offload 初始化适配（2026-10-24）：
+`models/hf/materialization.py::materialize_meta_model` 增加独立
+parameter_device，`trainer/runtime/assembly.py` 在 CPU offload 下
+选择 CPU 参数存储，运行时 buffer 仍使用计算设备，保留别名恢复。
+这是本地 B 类适配，遵循 PyTorch FSDP CPUOffloadPolicy 的 CPU
+参数初始化契约，不属于 torchtitan 直接移植。验收范围见状态文档。
+
+CPU offload梯度裁剪补充（2026-10-24）：
+`accelerator/collectives.py::_offloaded_gradient_norm`及CPU局部梯度
+缩放为本地B类适配，依据现有PyTorch DTensor的Replicate/Shard
+布局和本项目通信设备选择，仅归约范数标量；不是torchtitan直接
+移植。不支持Partial布局。四卡FP32 HSDP三种范数及裁剪回归
+证据和未验证范围见`npu_ascend_status.md`，不外推完整训练支持。
+
+EMA 联合 TP/EP 分片 checkpoint 适配：本仓库 EMA 复用
+`components/optimizer/optimizer.py` 的 FQN 状态转换及
+`parallel/tensor_parallel/checkpointing.py` 的 disjoint TP/EP chunk 协议，
+属于 B 类布局适配；移除 EMA 构造期的旧联合模式拒绝，保留运行时参数
+所有权重叠校验。四进程 Gloo 冷恢复与下一步动态 EMA 更新的精确验证
+见 NPU 状态文档，不外推为目标模型 NPU 训练验收。
+
 [llmtuner](../llmtuner) 使用普通 dataclass 配置与 HF 模型适配，覆盖
 TP / FSDP / CP / EP / PP 的装配、训练和 checkpoint。模块清单及当前数量以
 [逐文件审查台账](file_review.md) 为准；本表记录上游机制对应关系与本项目适配。
 历史 AST 相似度和批次结果仅对应其记录时的版本，不代表当前逐行一致。
+
+### 分片 checkpoint 表示（2026-10-23）
+
+`parallel/tensor_parallel/checkpointing.py` 的
+`shard_disjoint_tp_ep_state` / `restore_disjoint_tp_ep_state` 为本地适配（B）：
+组合已有TP与EP的全局chunk表示，限定两者参数身份不重叠；恢复前统一
+校验chunk布局和dtype，再复制至调用方存储。模型及optimizer wrapper
+复用该路径，不属于torchtitan直接移植。验证范围见状态矩阵。
+
+`parallel/expert_parallel/checkpointing.py::shard_expert_state`为本地适配（B），
+用已有ChunkedCheckpointTensor表达EP专家轴偏移，并通过PyTorch DTensor
+compute_local_shape_and_global_offset保留FSDP内部所有权；不收集完整专家。
+plain EP2 HF读取已验证，DTensor及生产wrapper接入尚未验证。
+
+`hf_expert_storage.py` 的native_ep_layout虚拟reader为本地适配（B），依据
+HF Qwen3 MoE专家gate/up/down形状和本项目model_replacement.py到GroupedExperts
+w1_EFD/w3_EFD/w2_EDF的同方向映射，将单专家文件暴露为DCP专家轴chunk。
+不属于torchtitan代码直接移植，尚未解锁完整EP HF初始化路径。
+
+`models/hf/state_dict_adapter.py::to_hf_export`为本地适配（B）：遵循HF
+Qwen3逐专家二维投影布局，将完整原生专家堆叠按专家轴拆分，不转置。
+元数据协调与张量操作分离沿用本仓库Kimi checkpoint转换的机制；
+Qwen3加载模板仍由虚拟reader使用，不与标准导出键混用。
+
+`components/checkpointer/chunked_tensor.py` 是本项目适配（B）：通过已安装
+PyTorch 2.12 的 DTensor checkpoint 协议 `__create_write_items__`、
+`__create_chunk_list__`、`__get_tensor_shard__` 描述全局索引和多个局部视图。
+参考实现位于 `torch/distributed/tensor/_api.py`，planner 接口位于
+`torch/distributed/checkpoint/planner.py`、`planner_helpers.py`、`utils.py`。
+非连续 packed gate/up 多 chunk 及其 snapshot/copy 校验为本地新增适配，
+不是 torchtitan 的直接移植。TP 的新增 `shard_tensor_parallel_state` 复用
+PyTorch `tensor/_utils.py::compute_local_shape_and_global_offset` 读取DP布局，
+再由本地逻辑转换packed TP全局索引；尚未切换管理器默认路径，范围见状态矩阵。
+`restore_sharded_tensor_parallel_state` 是该表示的本地逆转换：调用方提供DP布局
+目标，复制前验证全部chunk shape/offset及dtype，保留目标storage和placement。
 
 ### Qwen3 归一化适配来源
 
@@ -18,6 +74,13 @@ TP / FSDP / CP / EP / PP 的装配、训练和 checkpoint。模块清单及当�
 [并行实现比较](distributed_implementation_comparison.md#当前生产归一化与编译状态2026-10-15)。
 
 ## 怎么用这张表
+
+TorchAO适配补充（2026-10-22）：`TorchAOTokenDispatcher._permute` 按实际padded
+counts之和裁剪TorchAO最坏情况预分配缓冲区及对应indices，保留input_shape与
+sentinel逆置换语义，使GroupedExperts的counts精确覆盖输入。求和取主机标量会
+同步设备，不宣称无同步编译路径。下文旧条目的“本机无torchao、数值未覆盖”是
+历史环境记录；当前Ascend真实依赖的dispatch和FP32完整MoE前反向证据以
+`npu_ascend_status.md`为准，不外推至FP8/MXFP8量化grouped GEMM。
 
 **先查表，再动手。** 不要在 llmtuner 源码里加 `# upstream: <path> @ <sha>` 之类的来源
 标注——那种标注试过又被退了，因为 sha 会腐烂而表不会。
@@ -844,6 +907,18 @@ step 1 恢复 optimizer、scheduler、dataloader 和 train state 后完成并保
 
 #### 5.3 FSDP2
 
+PP 边界适配（2026-10-22）：`apply_fsdp_to_decoder` 在构造 embedding/norm/head
+分片单元时排除精确类型为 `nn.Identity` 的占位模块。上游阶段删除语义在本仓库
+由 Identity 表达，不应将这些无参数、可能不执行 forward 的占位对象加入联合
+FSDP 单元；其余模块（包括自定义 Identity 子类）保持原有处理。CPU tied/untied
+首尾阶段单测及四卡 NPU PP2×native FSDP2 两种调度证据见 `npu_ascend_status.md`。
+
+HSDP×CP 子网适配（2026-10-22）：`resolve_fsdp_mesh` 将 dp_shard/cp 轴扁平化后，
+用 `DeviceMesh.from_group` 复用拓扑既有 replicate/shard 组。不能在不同 PP 子网
+上各自重新构造带新通信组的 DeviceMesh：各rank局部rank表不同，却进入全局
+进程组创建序列，NPU实测会造成HCCL AllGather冲突。保持replicate在首轴、
+dp_shard×cp在次轴的上游语义；失败复现与修复验证详见状态记录。
+
 | llmtuner 符号 | TorchTitan 对应符号 | 差异与正确性 |
 |---|---|---|
 | `resolve_fsdp_mesh`, `resolve_sparse_fsdp_mesh` | `distributed/fsdp.py` mesh dims | llmtuner 把多轴 mesh 重建为 FSDP 可理解的 1D/2D mesh，**通过（适配）** |
@@ -933,7 +1008,7 @@ import 并保留 `__all__` 再导出（单一来源，配置校验与 `apply_ac`
 | logger 类与 `LoggerContainer` | 同文件 | optional TensorBoard/W&B 延迟导入，**通过**；镜像需安装对应包。`WandBLogger.log` 带 `commit=True`（上游 e0e35fe5a），防显式 step 被合并 |
 | `MetricsProcessor` | 同名上游类 | 去 Configurable；按真实 step window 算吞吐/MFU，log frequency 构造时校验，**通过（适配）**。训练/校验两条日志的 key 集合与 `tps`/`tflops`/`time_metrics`/`memory` 公式与上游一致；差异为形状——上游自由函数 `compute_training_performance_metrics` 的载荷内联进 `_derive`/`DerivedMetrics`，MFU 抑制条件由 `has_quantization` 换成 `gpu_peak_flops == 0 or num_flops_per_token == 0`（无量化路径的等价替代，见模块 docstring），`_build_metric_logger` 去掉 `ft_*` 并只吞 ImportError；`should_log` 不写 `step_last_log`（无副作用，容忍先 log 后 should_log）。模块全程不碰 `torch.distributed` |
 | `get_metrics_rank`, `ensure_pp_loss_visible` | 上游 `_get_metrics_rank` / PP warning | llmtuner 明确 PP schedule 可见性：rank 查询去私有化为 `get_metrics_rank`，`ensure_pp_loss_visible` 增加 `not pp_enabled` 提前返回（上游无该守卫，只靠唯一调用点门控，语义等价），**通过** |
-| `Profiler`, `MemoryProfiler` | `observability/profiler.py` | 去 Configurable，schedule 与 OOM 处理保留；`caused_by_oom` 与上游 773e16e75 语义等价（含防环与隐式链）。activity 列表按 resolved device：cuda 加 CUDA，xpu 加 XPU，其余设备仅 CPU；用例 `test_the_trace_activity_follows_the_resolved_device` 覆盖 cpu/cuda/xpu。`leaf_folder` 保留为直接构造 MemoryProfiler 的输出子目录，训练入口传空串，worker 子目录有 CPU 测试；不代表实现 torchft。裁剪 CUDA-graph annotations（随 D10 无图路径）、`structured_logger` span、`active()` builder；memory history 经 `utils/monitoring` 的 device 探针（上游非 CUDA 分支调不存在的 `torch.memory`），**通过（适配）** |
+| `Profiler`, `MemoryProfiler` | `observability/profiler.py` | 去 Configurable，保留 schedule、OOM 防环及隐式链处理。CPU/CUDA/XPU 使用 torch.profiler；NPU 使用 torch_npu.profiler 的 CPU+NPU activity 与 schedule，输出 JSON 和 raw 采集目录。CPU 参数回归及真实 NPU Trainer 数值/设备事件验证见 NPU 状态文档。`leaf_folder` 保留 MemoryProfiler 子目录，不代表 torchft；memory history 仍由 `utils/monitoring` 探测。裁剪 CUDA-graph annotations、structured_logger span 和 active builder。 |
 | `BaseTokenizer`, `HuggingFaceTokenizer`（`components/tokenizer/`） | `components/tokenizer.py` | A1；encode 强制 `add_special_tokens=False` 后自行处理 BOS/EOS。`apply_chat_template` 接受 `Sequence[Mapping]`（上游 4a0d8dab3 多轮 SFT 配套），**通过**。`apply_chat_template` 自动注入 `bos_token`/`eos_token` kwargs 与默认 `add_generation_prompt=True`（上游 backend tokenizer 同源）；SFT 全量渲染在 `datasets/text/processors.py` 显式传 `add_generation_prompt=False` |
 | `MultimodalTokenizer` | 同文件多模态 tokenizer | 组合 text/vision token 契约，**通过** |
 
@@ -1084,9 +1159,9 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `components/metrics.py` | monitor、logger、`MetricsProcessor` | A2，`observability/metrics.py` |
 | `components/optimizer/lr_scheduler.py` | WSD factor、scheduler container/build | A2，同文件 |
 | `components/optimizer/optimizer.py` | `OptimizersContainer` | A2，同文件 |
-| `components/optimizer/ema.py` | 在线 EMA 平均，复用 flat FQN state-dict 契约 | A2，同文件（上游 1b9eef3bd） |
+| `components/optimizer/ema.py` | 在线 EMA 平均，复用 flat FQN state-dict 契约 | A2，同文件（上游 1b9eef3bd）；torch 2.12 的 Partial DTensor clone 会改为 Replicate，初始化改为本地 shard 克隆后按原 mesh/placements/shape/stride 重建；NPU 多布局及空 rank DCP 恢复通过，详见 NPU 状态文档 |
 | `components/optimizer/state_dict.py` | optimizer state 初始化与 flat/FQN 转换 | A1，本地改名 state_dict.py |
-| `components/profiler.py` | `Profiler`, `MemoryProfiler` | A2，`observability/profiler.py` |
+| `components/profiler.py` | `Profiler`, `MemoryProfiler` | A2，`observability/profiler.py`；NPU 显式使用 torch_npu.profiler 的 CPU+NPU activities、原生 schedule 与 JSON trace，避免仅收集 CPU；真实 Trainer profiling 前后参数完全一致且导出设备事件，详见 NPU 状态文档 |
 | `components/tokenizer/` | tokenizer 三类 | A1，同文件 |
 | `datasets/loader_builder.py` | `build_dataloader` | C，config build 替代品 |
 | `datasets/collators.py` | `Collator`, `TextCollator` | A2，`components/data/collators.py` |
@@ -1130,7 +1205,7 @@ helper 在前文涉及关键算法时单列。成组条目（`config/`、`traine
 | `accelerator/collectives.py` | reductions、timeouts、grad norm | A2（部分），`distributed/utils.py` 的两个 vendored 符号；外加 mmengine 来源的 in-place `all_reduce`（原 `accelerator/dist.py`，已并入）和 torchtitan MoE 语义的 `PartialToInvariantAllReduce`（从本地模型 loss 文件迁入） |
 | `parallel/context_parallel/context_parallel.py` | `apply_cp` | C，独立 HF 编排层 |
 | `parallel/context_parallel/attention.py` | `CPFlexKernel` 与 seq/head autograd | C，CP flex attention 组合实现 |
-| `parallel/context_parallel/input_sharding.py` | CP/TP batch 和 mask sharding | C，独立输入分片层 |
+| `parallel/context_parallel/input_sharding.py` | CP/TP batch 和 mask sharding | C，独立输入分片层；NPU BlockMask 使用本仓库 eager builder，保持 torch `_create_cp_block_mask` 的 Q offset、KV 全长与 headtail 索引语义，避免其强制 Inductor 编译；CPU/CUDA 仍调用 torch 原路径。验证证据见 `docs/npu_ascend_status.md` |
 | `accelerator/distributed.py`、`accelerator/tensor_tree.py` | 前者负责 init_dist 多 launcher 与 rank/group 查询；后者负责嵌套张量设备搬运，旧导入路径继续可用 | C，vendored 自 OpenMMLab `mmengine.dist`（非 torchtitan 来源），已去 mmengine 化；原同包 `dist.py` 的无消费者面（object collectives、gather/broadcast、collect_results 等）已删，唯一在用的 `all_reduce` 并入 `collectives.py` |
 | `parallel/expert_parallel/apply.py` | `apply_ep` | B，模型 EP parallelize |
 | `parallel/expert_parallel/model_replacement.py`（编排）+ `probe.py`（探测）+ `convert.py`（转换） | HF MoE 探测、权重搬运与 swap | B，transformers backend `moe_replacement.py` |
@@ -1851,6 +1926,19 @@ Trainer异常清理的日志属于尽力报告：logger本身失败不得阻断�
 重试规则。仅在处理已有异常的报告位置抑制日志异常，正常路径日志错误仍传播。
 
 
+### NPU packed Ulysses 全局 mask 修复（2026-10-22）
+
+B 类适配，延续 Ulysses×varlen 的全局文档元数据契约：
+`models/hf/model.py::_shard_for_cp` 在 token 分片前为非 flex Ulysses 构造
+全长 dense document mask，`_apply_attention` 将其交给 CP SDPA，不再从局部
+positions 重建。KV packed 拒绝、双 CP 轴拒绝均不变；不据此声明支持。
+
+CPU 回归覆盖跨文档屏蔽及 mask 对象传递；双卡 NPU 使用生产 CP SDPA，独立
+dense 参考验证 logits、mean loss、所有模型参数梯度和文档屏蔽非空泛性。
+四卡真实 Trainer 的 PP2×Ulysses2/full AC/dynamic EMA/packed JSONL DCP
+连续4步与2+2恢复精确一致，含各 rank RNG/loader 状态。命令、失败迭代和
+覆盖边界见 `docs/npu_ascend_status.md`；不外推至 KV packed、双轴或全部组合。
+
 ### 参数组选项的显式校验（第254批）
 
 当前本地torchtitan HEAD `01b1b69e3881397db5dcd4f96d3c5ffa6a79384d` 的
@@ -1862,3 +1950,164 @@ metadata，拼错的学习率或衰减选项因而可能静默失效。
 `params`、`param_names`和scheduler的`initial_lr`，未知更新选项在初始化阶段报错。
 校验复用既有局部错误协调边界，无新增collective或更新行为。CPU Adam/AdamW及
 四rank PP2×DP2非对称错误验证见台账254批；不代表目标设备或完整恢复验收。
+
+### torch_checkpointing 0.1.0 NPU metadata通信适配（2026-10-23）
+
+`components/checkpointer/checkpointing_metadata.py`为B类适配，语义来源是安装的
+torch_checkpointing 0.1.0 `metadata_manager.py::DefaultMetadataManager._all_gather_pickled_data`。
+保留pickle、8字节长度前缀、最大长度归约、补齐与按group rank聚合的协议；
+通信张量从硬编码CUDA改为本仓库get_comm_device(process_group)。仅NPU分布式、
+精确版本0.1.0及原DefaultMetadataManager实例生效，通过实例绑定替换通信方法，
+不修改依赖类、全局CUDA API、resharder、缓存、序列化、staging或writer语义。
+常驻及临时manager均在构造后适配，临时实例在已有清理边界内适配。
+CPU协议/隔离回归及真实双卡NPU连续4步对比2+2恢复证据见
+`docs/npu_ascend_status.md`；不推广到其他依赖版本、拓扑或性能结论。
+
+### 确定性策略先于分布式初始化（2026-10-23）
+
+`trainer/runtime/assembly.py::assemble_trainer_runtime`为C类生命周期修正：
+deterministic=True时，在进程组创建前复用`utils/seeding.py::set_deterministic_algorithms`，
+提前建立NPU通信/矩阵确定性环境；随机种子及PP rank偏移仍在拓扑解析后设置。
+不修改确定性阈值、seed值或并行装配顺序。构造失败由原有
+rollback_execution_settings_on_error恢复进程级设置。外部已创建进程组的调用者
+仍须自行在通信初始化前设置确定性策略；Trainer不能追溯重建外部通信组。
+四卡FSDP固定EMA及双卡动态EMA的真实恢复验证见NPU状态文档。
+
+### PP×FSDP validation梯度保持（2026-10-23）
+
+`trainer/runtime/validation.py`在验证前保存参数的grad引用并在finally恢复，
+属于B类适配。已安装torch2.12的pipelining/schedules.py在train/eval模式
+切换时重新初始化metadata，随后调用stage.py中
+`PipelineStage._post_metadata_inference_cleanup`，该方法对FSDP参数显式
+清空grad。保留上游必要的reshard/metadata清理，只在本仓库拥有的validation
+生命周期边界恢复原有训练状态，不复制梯度、不更换参数、不全局修改torch。
+成功/异常退出CPU测试及真实四卡PP2×FSDP2验证见NPU状态文档。
+
+### packed Ulysses dense mask直接构造（2026-10-23）
+
+`models/hf/model.py::_shard_for_cp`为B类后端适配：非flex的Ulysses路径直接调用
+已有`build_dense_attention_mask`，不再先构造随后丢弃的BlockMask。全局positions、
+block_causal=True、mask dtype和输入分片时序保持原样；flex Ulysses及KV-allgather
+路径不变，不改PyTorch的稀疏索引排序或转置实现。已安装torch2.12
+`torch/nn/attention/flex_attention.py::_dense_to_ordered`对int32执行stable argsort，
+在当前NPU触发AiCPU；修正点是本仓库未消费该稀疏布局，不是替换上游排序算法。
+定向CPU、NPU前反向及真实恢复验证范围以NPU状态文档为准。
+
+### Chunked loss原生FSDP root boundary所有权（2026-10-23）
+
+`parallel/fully_shard_parallel/fully_shard_parallel.py`的root_owned_boundaries
+属于C类生命周期策略，沿用本仓库既有参数身份所有权合并算法，未移植或替换
+torch FSDP内部代码。chunked训练时把实际embedding/norm/head参数加入root所有者，
+其跨层alias按原合并算法传递；最后仅对root调用fully_shard，避免为root的共享
+消费者额外注册独立forward/backward hooks。root既有reshard_after_forward=False
+保证外部head chunks可访问同一参数，decoder backward统一完成梯度归约。
+普通非chunked布局不变。不使用unshard context探针作为正确性证明，不全局patch，
+不换绑或手工累加生产梯度。`parallelize.py`显式传递training chunk数，
+`compatibility.py`仅允许原生默认布局、无offload/compile及混合模型并行的路径。
+参考对照、实际共享参数所有权和真实Trainer冷恢复范围见NPU状态文档。
+
+### AC重放线程的SPMD上下文恢复（2026-10-23）
+
+`accelerator/spmd.py::capture_spmd_context`及
+`memory/activation_checkpoint.py::checkpoint_contexts`属于B类运行时适配：
+保持既有PartialToInvariant归约语义，不修改上游aux公式或torch checkpoint。
+在原forward捕获dense/sparse/current mesh，在每次重放线程进入时恢复，并在退出
+（包括异常）后恢复该线程原状态。NPU autograd工作线程不继承Python thread-local，
+此前AC重放时mesh为空，aux统计丢失CP/TP归约；CPU同线程测试无法覆盖该问题。
+保留现有mask快照和metric重放抑制，不增加梯度副本或修改容差。真实4卡
+TP2/EP2/KVCP2、full/selective AC及aux/padding不等长累积证据见NPU状态文档。
+
+### HF Qwen3 独立参数的融合 QKV 入口（2026-10-23）
+
+`models/hf/qkv_projection.py` 为B类适配。KV-group内Q-heads/K/V的打包与拆分
+语义参考基线 `torchtitan/models/common/attention.py::FusedQKVLinear`，attention
+外围顺序对照安装版 Transformers 的
+`transformers/models/qwen3/modeling_qwen3.py::Qwen3Attention.forward`。
+不同于基线单一wqkv参数，本适配保持HF的q_proj/k_proj/v_proj独立参数及键名，
+每次forward以可微cat临时拼接，保留现有optimizer/FSDP参数所有权。仅绑定模型
+实例，无全局HF类替换、跨投影cache或torchtitan-npu运行时依赖。
+`model.qkv_projection`经工厂传递及构造期应用；独立TP投影通信与投影模块hook
+不能直接绕过，分别在配置/装配或调用时拒绝。默认separate不变。FP32/低精度
+CPU数学参考、AOT及实际NPU训练/恢复的证明范围见NPU状态文档，不把QKV单项
+正式化等同于联合norm、Flex、RoPE的完整生产迁移。
+
+### HF Qwen3 联合残差归一化（2026-10-23）
+
+`models/hf/residual_normalization.py` 的归一化及 cast 语义为 B 类适配，对照
+安装版 `transformers/models/qwen3/modeling_qwen3.py::Qwen3RMSNorm.forward`
+及 `Qwen3DecoderLayer.forward`。成对输出、残差 clone 与 FP32 梯度合并边界
+`(direct + residual) + indirect` 为 C 类本仓库数值策略，并非移植的上游算子。
+低精度保持原生 norm 梯度 cast 后再加残差的顺序。通过正式配置选择、实例绑定，
+不依赖 torchtitan-npu，不修改全局 HF 类，不改变参数身份及 state-dict 键。
+用户 norm hook/自定义 forward 不兼容时拒绝，保留本适配拥有的 view hook。
+仅支持一阶梯度，clone 存在内存成本；CPU AOT 与 NPU 实测范围见状态文档，
+不将其等同于 Flex/RoPE 正式迁移或全部并行组合已支持。
+
+### HF Qwen3 目标设备 RoPE 初始化（2026-10-23）
+
+`models/hf/materialization.py::initialize_rotary_on_device` 为 B 类适配，
+复用安装版 Transformers
+`transformers/models/qwen3/modeling_qwen3.py::Qwen3RotaryEmbedding` 的默认
+频率构造公式，不复制硬编码 theta/head_dim 或依赖 torchtitan-npu。
+`model.rotary_init_device=target` 在 Trainer 普通构造搬运后或 meta materialize
+后显式重建两个非持久频率 buffer 及其相关状态，保留参数、注册 buffer alias
+和 state-dict 键。默认 constructor 保持原行为；该选择意在显式控制设备舍入，
+不保证跨设备逐位相同。仅接受原生 dense Qwen3 default RoPE；缩放及自定义
+类型未适配时拒绝。与基线设备构造语义的数值证据见 NPU 状态文档。
+
+### 显式 eager Flex HOP 入口（2026-10-23，尚未接入 Trainer）
+
+`models/common/attention/eager_flex.py` 为 B 类运行时适配。执行体复用安装版
+PyTorch `torch._higher_order_ops.flex_attention.flex_attention` 及
+`torch.nn.attention.flex_attention._apply_kernel_options`，不复制数学前后向。
+参考本地基线 `torchtitan_npu/extensions/torchtitan/eager_flex.py` 选用的 eager
+Flex 路径，但不采用其全局 `_validate_device` 覆写或 compile-debug 开关。
+显式限制CPU/NPU、三种浮点精度、同批次及GQA；BlockMask须与输入长度/设备
+一致。模型compile拒绝，private API缺失时报环境不支持，不回退到SDPA。
+此阶段仅为已测试leaf；HF配置、mask适配及Trainer生命周期尚未接入，不能
+宣称原P4诊断Flex依赖已消除。12种NPU局部前后向证据见状态文档。
+
+后续HF接入：`model.attention_backend=eager_flex` 经工厂传递，在HF wrapper
+选择独立接口，`models/hf/attention_backend.py::eager_flex_attention_adapter`
+复用HF SDPA mask生成并转换为BlockMask；属于B类接口适配，不复制基线全局
+注册方式。保留原sdpa接口，拒绝dropout、bias、非等长缓存及未适配TP/CP/compile。
+此前leaf阶段说明为历史范围，不代表接入后的验收已自动通过；见状态日志。
+
+`memory/activation_checkpoint.py::checkpoint_contexts` 的重放模式子类显式声明
+`supports_higher_order_operators=True`，属于B类PyTorch dispatch适配。基类仍
+使用安装版 `torch/utils/checkpoint.py::_CachedTorchDispatchMode` 的既有policy
+与storage规则，未跳过保存/重算决策。PyTorch HOP对原始mode类型的规则不会
+自动覆盖本仓库子类，eager Flex在fullAC replay首次暴露此缺口；CPU精确梯度
+及NPU冷恢复证据见状态文档，不将该标志当作所有HOP均已验证的证明。
+
+### 重复 map 分片首轮非空探测（2026-10-23）
+
+`datasets/composition.py::apply_iteration_policy` 的repeat前非空检查为C类本仓库
+数据安全策略，不移植或覆写Grain内部实现。复用其索引过滤后返回None的契约，
+在既有shuffle/DP切片后探测初始分片，首个有效值即停止，全空则明确拒绝。
+探测不推进迭代游标，复用本仓库preserve_rng_state保护Python/NumPy/CPU Torch
+状态；不增加固定跳过比例阈值，不改变filter/packing及源权重。不覆盖后续随机
+epoch或streaming空源，额外构造期处理成本及验证范围见设计和NPU状态文档。
+
+### 双轴 SDPA CP（2026-10-23）
+
+`parallel/context_parallel/sdpa_attention.py::DualCPSdpaKernel` 为B类适配：
+复用本仓库 `DualCPFlexKernel` 的先Ulysses换头、后KV聚合顺序，使用现有
+`_GatherSequence` 的反向求和契约及PyTorch SDPA替代Flex调用。因果查询偏移
+由KV轴rank确定，packed路径从完整布尔文档mask裁切查询行。`apply_cp` 按双轴
+拓扑选择该内核，HF wrapper在token切分前建立完整文档mask并传入；缺失mask
+明确拒绝，不从局部positions重建全局文档。保留Ulysses头整除和load-balancer
+拒绝检查。独立内核、模型参数梯度及Trainer恢复的实测范围见NPU状态文档，
+不外推至未验证的精度、混合拓扑或大模型。
+
+### Qwen3 MoE 逐专家 HF 权重读取（2026-10-23）
+
+`components/checkpointer/hf_expert_storage.py` 属于 B 类布局适配：读取源
+checkpoint 的 `experts.N.{gate,up,down}_proj.weight`，按 Transformers 5.11.0
+`models/qwen3_moe/modeling_qwen3_moe.py::Qwen3MoeExperts` 的布局提供虚拟
+`gate_up_proj[E,2I,H]`、`down_proj[E,H,I]`。gate 在前、up 在后，不转置权重。
+复用 PyTorch 2.12 `distributed/checkpoint/hf_storage.py` 的 metadata chunk、
+LoadPlanner 与分片读取协议，仅将每次源二维切片增加专家维；不聚合整模型、
+不改写源 safetensors。HF adapter 将源键覆盖检查映射到同一逻辑布局，保留
+严格覆盖和缺失专家/投影拒绝。CPU indexed/single-file DCP 读取精确对齐，
+真实 NPU FSDP 及其他混合布局的证据以状态文档为准，不由 CPU 测试外推。

@@ -13,6 +13,77 @@ ATTENTION_BACKEND = "flex_torchtitan"
 # The interface a CP run uses when flex is not available (NPU): sdpa plus the
 # layer's CP kernel, which owns the redistribution and the mask.
 CP_SDPA_BACKEND = "sdpa_cp"
+EAGER_FLEX_BACKEND = "llmtuner_eager_flex"
+
+
+def eager_flex_attention_adapter(module, query, key, value, attention_mask, **kwargs):
+    """Consume HF dense masks through explicit eager Flex without global patches."""
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    from llmtuner.errors import UnsupportedCombinationError
+    from llmtuner.models.common.attention.eager_flex import eager_flex_attention
+
+    if kwargs.get("dropout", 0.0) != 0.0:
+        raise UnsupportedCombinationError(
+            "eager Flex does not implement attention dropout"
+        )
+    batch, heads, query_length, _ = query.shape
+    key_length = key.shape[-2]
+    if query_length != key_length:
+        raise UnsupportedCombinationError(
+            "eager Flex HF adapter requires self-attention without KV cache"
+        )
+    if attention_mask is None:
+        dense = torch.ones(
+            query_length, key_length, dtype=torch.bool, device=query.device
+        ).tril()[None, None]
+    else:
+        if attention_mask.ndim != 4:
+            raise ValueError("eager Flex HF adapter requires a four-dimensional mask")
+        dense = attention_mask[..., :query_length, :key_length]
+        if dense.dtype != torch.bool:
+            if not torch.all(
+                (dense == 0)
+                | torch.isneginf(dense)
+                | (dense == torch.finfo(dense.dtype).min)
+            ):
+                raise UnsupportedCombinationError(
+                    "eager Flex accepts boolean or zero/blocked masks, "
+                    "not attention biases"
+                )
+            dense = dense == 0
+    if (
+        dense.shape[-2:] != (query_length, key_length)
+        or dense.shape[0] not in (1, batch)
+        or dense.shape[1] not in (1, heads)
+    ):
+        raise ValueError(
+            "eager Flex mask must broadcast to Q/K batch, heads and lengths"
+        )
+
+    def mask_mod(batch_index, head, query_index, key_index):
+        return (
+            (query_index < query_length)
+            & (key_index < key_length)
+            & dense[
+                0 if dense.shape[0] == 1 else batch_index,
+                0 if dense.shape[1] == 1 else head,
+                query_index.clamp(max=query_length - 1),
+                key_index.clamp(max=key_length - 1),
+            ]
+        )
+
+    mask = create_block_mask(
+        mask_mod,
+        batch,
+        None if dense.shape[1] == 1 else heads,
+        query_length,
+        key_length,
+        device=query.device,
+        _compile=False,
+    )
+    output = eager_flex_attention(query, key, value, mask, scale=kwargs.get("scaling"))
+    return output.transpose(1, 2).contiguous(), None
 
 
 def available_attention_backend() -> str:
@@ -63,6 +134,12 @@ def register_attention_backend() -> None:
     """Register llmtuner's attention adapters with Hugging Face."""
     AttentionInterface.register(ATTENTION_BACKEND, flex_attention_adapter)
     AttentionInterface.register(CP_SDPA_BACKEND, cp_sdpa_attention_adapter)
+    AttentionInterface.register(EAGER_FLEX_BACKEND, eager_flex_attention_adapter)
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+
+    ALL_MASK_ATTENTION_FUNCTIONS.register(
+        EAGER_FLEX_BACKEND, ALL_MASK_ATTENTION_FUNCTIONS["sdpa"]
+    )
 
 
 __all__ = [

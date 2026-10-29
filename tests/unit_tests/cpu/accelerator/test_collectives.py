@@ -1,7 +1,39 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
+from torch.distributed.tensor import Partial, Replicate
 
 from llmtuner.accelerator import collectives
+
+
+@pytest.mark.parametrize("order", [1.0, 2.0, float("inf")])
+@pytest.mark.parametrize("empty", [False, True])
+def test_offloaded_local_norm_promotes_low_precision(order, empty):
+    local = (
+        torch.empty(0, dtype=torch.float16)
+        if empty
+        else torch.full((4,), 40000.0, dtype=torch.float16)
+    )
+    gradient = SimpleNamespace(placements=(Replicate(),), to_local=lambda: local)
+    actual = collectives._offloaded_gradient_norm(gradient, order)
+    expected = (
+        torch.tensor(0.0) if empty else torch.linalg.vector_norm(local.float(), order)
+    )
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected)
+
+
+def test_offloaded_partial_gradient_is_rejected_before_reading_storage():
+    gradient = SimpleNamespace(placements=(Partial(),))
+    with pytest.raises(ValueError, match="Replicate/Shard"):
+        collectives._offloaded_gradient_norm(gradient, 2.0)
+
+
+@pytest.mark.parametrize("order", [0.0, -1.0, float("nan")])
+def test_offloaded_invalid_norm_order_is_rejected(order):
+    with pytest.raises(ValueError, match="positive norm_type"):
+        collectives._offloaded_gradient_norm(SimpleNamespace(), order)
 
 
 def test_mean_rejects_integer_data_before_collective(monkeypatch):

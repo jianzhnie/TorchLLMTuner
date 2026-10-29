@@ -8,6 +8,7 @@ Parameter replacement and canonical AC/compile wrapper names.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -19,6 +20,90 @@ from ...utils.module_names import canonical_fqn
 from ..expert_parallel.checkpointing import expert_shard_map
 
 TPLayout = tuple[int, bool, dist.ProcessGroup]
+
+
+def shard_disjoint_tp_ep_state(
+    state: dict[str, Any], *, model_parts: list[nn.Module]
+) -> dict[str, Any]:
+    """Describe dense TP and expert EP chunks with disjoint parameter ownership."""
+    from ..expert_parallel.checkpointing import shard_expert_state
+
+    with _coordinate_chunk_errors(model_parts, "Joint TP/EP checkpoint ownership"):
+        validate_disjoint_tp_ep_checkpoint_ownership(model_parts)
+    # TP touches only its registered parameters. Expert entries remain in their
+    # local shape until the EP transform assigns global expert coordinates.
+    result = shard_tensor_parallel_state(state, model_parts=model_parts)
+    return shard_expert_state(
+        result, shard_map=expert_shard_map(model_parts), model_parts=model_parts
+    )
+
+
+def restore_disjoint_tp_ep_state(
+    state: dict[str, Any],
+    *,
+    local_state: dict[str, Any],
+    model_parts: list[nn.Module],
+) -> dict[str, Any]:
+    """Validate all disjoint TP/EP chunks before restoring local storage."""
+    from ...components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+
+    destinations = shard_disjoint_tp_ep_state(local_state, model_parts=model_parts)
+    with _coordinate_chunk_errors(model_parts, "Joint TP/EP checkpoint restore"):
+        pending = _validate_chunk_destinations(state, destinations)
+    for destination, source in pending:
+        destination.copy_(source)
+    result = dict(state)
+    for key, destination in destinations.items():
+        if isinstance(destination, ChunkedCheckpointTensor):
+            result[key] = local_state[key]
+    return result
+
+
+def validate_disjoint_tp_ep_checkpoint_ownership(
+    model_parts: list[nn.Module],
+) -> None:
+    """Reject overlapping TP and EP parameter ownership before chunk creation."""
+    layouts, parameters = _index_layouts(model_parts)
+    experts = expert_shard_map(model_parts)
+    expert_ids = {id(parameters[name]) for name in experts if name in parameters}
+    overlapping = [
+        name
+        for name in layouts
+        if name in parameters and id(parameters[name]) in expert_ids
+    ]
+    if overlapping:
+        raise ValueError(
+            "Joint checkpoint chunks require disjoint TP and EP parameters: "
+            + ", ".join(sorted(overlapping))
+        )
+
+
+@contextmanager
+def _coordinate_chunk_errors(model_parts, phase):
+    """Finish all owning groups' error reports before raising a local error."""
+    groups = sorted(
+        {
+            layout[2]
+            for model in model_parts
+            for module in model.modules()
+            for layout in module.__dict__.get("_tp_checkpoint_layouts", {}).values()
+        },
+        key=lambda group: tuple(dist.get_process_group_ranks(group)),
+    )
+    error = None
+    try:
+        yield
+    except BaseException as caught:
+        error = caught
+    failed = error is not None
+    for group in groups:
+        reports = [None] * dist.get_world_size(group)
+        dist.all_gather_object(reports, not failed, group=group)
+        failed = failed or not all(reports)
+    if error is not None:
+        raise error
+    if failed:
+        raise RuntimeError(f"{phase} failed on another rank")
 
 
 def _index_layouts(model_parts: list[nn.Module]):
@@ -172,6 +257,110 @@ def gather_tensor_parallel_state(
                 pieces = [torch.cat([half[i] for half in halves], dim) for i in (0, 1)]
             result[key] = torch.cat(pieces, dim=dim)
     return result
+
+
+def shard_tensor_parallel_state(
+    state: dict[str, Any], *, model_parts: list[nn.Module]
+) -> dict[str, Any]:
+    """Describe global TP coordinates without gathering TP or DP tensor data.
+
+    EP expert entries must already follow the existing global expert-axis
+    contract. This representation is not yet the default manager save path.
+    """
+    entries = _prepare_state(state, model_parts, loading=False)
+    with _coordinate_chunk_errors(model_parts, "TP checkpoint chunk construction"):
+        result = _build_chunked_state(state, entries)
+    return result
+
+
+def _build_chunked_state(state, entries):
+    from torch.distributed.tensor import Partial
+    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+
+    from ...components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+
+    result = dict(state)
+    for key, (dim, packed, group), _ in entries:
+        value = state[key]
+        shape = list(value.shape)
+        offsets = [0] * value.ndim
+        local = value
+        if isinstance(value, DTensor):
+            if any(isinstance(placement, Partial) for placement in value.placements):
+                raise ValueError("TP checkpoint cannot serialize partial DP values")
+            _, offsets = compute_local_shape_and_global_offset(
+                value.shape, value.device_mesh, value.placements
+            )
+            offsets = list(offsets)
+            local = value._local_tensor
+        world, rank = dist.get_world_size(group), dist.get_rank(group)
+        width = shape[dim] // (2 if packed else 1)
+        shape[dim] *= world
+        chunks = []
+        start, stop = offsets[dim], offsets[dim] + local.shape[dim]
+        half_count = (2 if packed else 1) if local.numel() else 0
+        for half in range(half_count):
+            lower, upper = max(start, half * width), min(stop, (half + 1) * width)
+            if lower >= upper:
+                continue
+            chunk_offset = list(offsets)
+            chunk_offset[dim] = (
+                half * width * world + rank * width + lower - half * width
+            )
+            chunk = local.narrow(dim, lower - start, upper - lower)
+            chunks.append((chunk_offset, chunk))
+        result[key] = ChunkedCheckpointTensor(
+            shape, chunks, dtype=value.dtype, device=value.device
+        )
+    return result
+
+
+def restore_sharded_tensor_parallel_state(
+    state: dict[str, Any],
+    *,
+    local_state: dict[str, Any],
+    model_parts: list[nn.Module],
+) -> dict[str, Any]:
+    """Copy checkpoint chunks into caller-owned local TP/DP destinations.
+
+    Validate every local layout before copying any value. The caller supplies
+    parameter-shaped destinations, including the existing EP-axis convention.
+    Destination storage and DTensor placements are preserved.
+    """
+    from ...components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+
+    destinations = shard_tensor_parallel_state(local_state, model_parts=model_parts)
+    with _coordinate_chunk_errors(model_parts, "TP checkpoint chunk restore"):
+        pending = _validate_chunk_destinations(state, destinations)
+    for destination, source in pending:
+        destination.copy_(source)
+    result = dict(state)
+    for key, destination in destinations.items():
+        if isinstance(destination, ChunkedCheckpointTensor):
+            result[key] = local_state[key]
+    return result
+
+
+def _validate_chunk_destinations(state, destinations):
+    from ...components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+
+    pending = []
+    for key, destination in destinations.items():
+        if not isinstance(destination, ChunkedCheckpointTensor):
+            continue
+        source = state.get(key)
+        if not isinstance(source, ChunkedCheckpointTensor):
+            raise ValueError(f"TP checkpoint {key!r} requires chunked source storage")
+        source_layout = [(offset, value.shape) for offset, value in source.chunks]
+        target_layout = [(offset, value.shape) for offset, value in destination.chunks]
+        if source.shape != destination.shape or source_layout != target_layout:
+            raise ValueError(
+                f"TP checkpoint {key!r} chunk layout differs from destination"
+            )
+        if source.dtype != destination.dtype:
+            raise ValueError(f"TP checkpoint {key!r} dtype differs from destination")
+        pending.append((destination, source))
+    return pending
 
 
 def load_tensor_parallel_state(

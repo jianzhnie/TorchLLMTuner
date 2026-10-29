@@ -1,19 +1,21 @@
-"""Four CPU/Gloo ranks: TP2/KVCP2/EP2/FSDP against independent HF training.
+"""Four ranks: TP2/KVCP2/EP2/FSDP against independent HF training.
 
 Run with torchrun --nproc_per_node=4, followed by this script and
-optional native/custom (default custom). Uses the explicit dense-mask SDPA
-substitute from pp_cp_equivalence; production CP communication/autograd,
-TP, EP all-to-all and FSDP remain active. Pass a second argument "aux"
+optional native/custom (default custom). CPU uses the explicit dense-mask SDPA
+substitute from pp_cp_equivalence; NPU uses production CP SDPA. Production CP
+communication/autograd, TP, EP all-to-all and FSDP remain active. Pass "aux"
 to include the sequence-wise balance objective with coefficient 0.01.
 Append "padding" after "aux" to mask an entire rank and an interior span,
 while retaining prompt tokens in the routing denominator.
 Append full/selective after padding to enable production activation checkpointing.
 Append an accumulation count after the AC mode to sum distinct microbatches.
 Append uneven after count 2 to test unequal valid-token microbatches.
-No production flex-kernel or target-device acceptance.
+The CPU arm does not exercise a production flex kernel. This model/SGD test
+does not replace a full Trainer or cross-framework alignment test.
 """
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -22,10 +24,13 @@ from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.spmd import spmd_context
 from llmtuner.models.common.aux_loss import AuxLoss
+from llmtuner.models.hf.attention_backend import CP_SDPA_BACKEND
+from llmtuner.parallel.context_parallel.sdpa_attention import CPSdpaKernel
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.module_names import canonical_fqn
+from tests.integration_tests.harness import init_distributed
 from tests.integration_tests.pp_cp_equivalence import cpu_cp_attention
 from tests.integration_tests.tp_ep_cp_equivalence import (
     SEQ,
@@ -68,7 +73,7 @@ def full(value):
 
 
 def main():
-    dist.init_process_group("gloo")
+    device = init_distributed()
     try:
         assert dist.get_world_size() == 4
         cfg = _cfg()
@@ -88,7 +93,7 @@ def main():
         tp = topology.get_mesh("tp")
         cp = topology.get_mesh("cp")
         ep = topology.get_mesh("ep")
-        with cpu_cp_attention():
+        with cpu_cp_attention() if device.type == "cpu" else nullcontext():
             model = _build(cfg).train()
             oracle = _build(cfg).train()
             model = parallelize_hf_transformers(
@@ -96,11 +101,17 @@ def main():
                 cfg=cfg.parallel,
                 mesh=topology.spmd_dense_mesh(),
                 parallel_dims=topology,
-                device=torch.device("cpu"),
+                device=device,
                 activation_checkpoint=ac_mode,
                 selective_ac=cfg.training.selective_ac,
             )
             assert any(isinstance(p, DTensor) for p in model.parameters())
+            if device.type == "npu":
+                assert model.model.config._attn_implementation == CP_SDPA_BACKEND
+                assert all(
+                    isinstance(layer.self_attn._titan_cp_sdpa_kernel, CPSdpaKernel)
+                    for layer in model.layers
+                )
             if ac_mode != "none":
                 from torch.distributed.algorithms._checkpoint import checkpoint_wrapper
 
@@ -143,7 +154,7 @@ def main():
                     ids, labels, positions = _data(
                         seed=step * accumulation + microbatch
                     )
-                    padding = torch.zeros(SEQ, dtype=torch.bool)
+                    padding = torch.zeros(SEQ, dtype=torch.bool, device=device)
                     if padded:
                         tail = 96 if uneven and microbatch == 1 else 64
                         padding[-tail:] = True
@@ -169,7 +180,7 @@ def main():
                     assert [(b[4], b[5]) for b in batches] == [(184, 168), (152, 128)]
                     assert (total_routed, total_supervised) == (336, 296)
                 AuxLoss.set_step_denominator(
-                    torch.tensor(total_routed), model_parts=[model]
+                    torch.tensor(total_routed, device=device), model_parts=[model]
                 )
                 for microbatch, batch in enumerate(batches):
                     (
@@ -238,7 +249,7 @@ def main():
                         )
                     assert len(oracle_routes) == 2
                     for index, value in enumerate(reference_aux_layers):
-                        expected_aux_totals[index] += value.detach().double()
+                        expected_aux_totals[index] += value.detach().cpu().double()
                     if aux_coefficient:
                         actual_aux_layers = [
                             module
@@ -250,7 +261,7 @@ def main():
                             actual_aux_layers, expected_aux_totals, strict=True
                         ):
                             torch.testing.assert_close(
-                                actual.instance_acc.double(),
+                                actual.instance_acc.detach().cpu().double(),
                                 target.double(),
                                 atol=1e-6,
                                 rtol=1e-6,
@@ -284,7 +295,7 @@ def main():
                             actual_aux_layers, expected_aux_totals, strict=True
                         ):
                             torch.testing.assert_close(
-                                actual.instance_acc.double(),
+                                actual.instance_acc.detach().cpu().double(),
                                 target.double(),
                                 atol=1e-6,
                                 rtol=1e-6,
@@ -305,9 +316,9 @@ def main():
                         target,
                         atol=1e-6,
                         rtol=1e-6,
-                        msg=lambda error,
-                        step=step,
-                        key=key: f"step={step} gradient {key}: {error}",
+                        msg=lambda error, step=step, key=key: (
+                            f"step={step} gradient {key}: {error}"
+                        ),
                     )
                     count += 1
                 assert count == 27, count
@@ -330,9 +341,9 @@ def main():
                         target,
                         atol=1e-6,
                         rtol=1e-6,
-                        msg=lambda error,
-                        step=step,
-                        key=key: f"step={step} parameter {key}: {error}",
+                        msg=lambda error, step=step, key=key: (
+                            f"step={step} parameter {key}: {error}"
+                        ),
                     )
                     expected_momentum = oracle_view(
                         oracle_momentum,
@@ -346,12 +357,14 @@ def main():
                         expected_momentum,
                         atol=1e-6,
                         rtol=1e-6,
-                        msg=lambda error,
-                        step=step,
-                        key=key: f"step={step} momentum {key}: {error}",
+                        msg=lambda error, step=step, key=key: (
+                            f"step={step} momentum {key}: {error}"
+                        ),
                     )
                 print(
                     f"rank={dist.get_rank()} {implementation} aux={aux_coefficient} "
+                    f"device={device} backend={dist.get_backend()} "
+                    f"dtype={next(model.parameters()).dtype} "
                     f"padding={padded} ac={ac_mode} accumulation={accumulation} "
                     f"uneven={uneven} "
                     f"step={step + 1}: "

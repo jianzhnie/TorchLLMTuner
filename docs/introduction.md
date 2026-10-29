@@ -249,6 +249,8 @@ python -m examples.train_deepseek_v3
 ```
 
 昇腾 NPU 多卡示例见 `examples/train_qwen3_8b_npu.sh`。
+设置 `LLMTUNER_ENABLE_TENSORBOARD=1` 可持久化逐步指标（需安装 TensorBoard），
+包括端到端 step 耗时；默认关闭，事件写入运行输出目录的 `tb/`。
 
 ## 8. 并行组合与边界
 

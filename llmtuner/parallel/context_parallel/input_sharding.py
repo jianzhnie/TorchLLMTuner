@@ -40,6 +40,8 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.attention.flex_attention import BlockMask
 
+from llmtuner.models.common.attention.masks import create_attention_mask
+
 from .. import compatibility
 
 __all__ = [
@@ -336,6 +338,34 @@ def shard_attention_mask_for_cp(
     # one is torch's ``_create_cp_block_mask``, not a slice.
     require_torch_input_sharding()
     balancer = resolve_load_balancer(load_balancer, mask.seq_lengths[0], cp_mesh)
+    if cp_mesh.device_type == "npu":
+        query_length, key_length = mask.seq_lengths
+        local_length = query_length // cp_mesh.size()
+        if query_length % (cp_mesh.size() * 128):
+            raise NotImplementedError(
+                "CP BlockMask query length must be divisible by CP size * 128"
+            )
+        offset = cp_mesh.get_local_rank() * local_length
+        indices = (
+            balancer._generate_indices(restore=False) if balancer is not None else None
+        )
+
+        def local_mask(batch, head, query, key):
+            query = query + offset
+            if indices is not None:
+                batch_index = 0 if indices.size(0) == 1 else batch
+                query = indices[batch_index, query]
+                key = indices[batch_index, key]
+            return mask.mask_mod(batch, head, query, key)
+
+        return create_attention_mask(
+            local_mask,
+            B=mask.shape[0],
+            H=mask.shape[1],
+            Q_LEN=local_length,
+            KV_LEN=key_length,
+            device=cp_mesh.device_type,
+        )
     return _shard_buffers(
         mesh=cp_mesh,
         buffers=[mask],

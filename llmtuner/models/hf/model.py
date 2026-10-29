@@ -63,11 +63,13 @@ from ..common.moe.layer import collect_moe_layers
 from .attention_backend import (
     ATTENTION_BACKEND,
     CP_SDPA_BACKEND,
+    EAGER_FLEX_BACKEND,
     available_attention_backend,
     register_attention_backend,
     uses_deepseek_sparse_attention,
 )
 from .factory import resolve_model_class, unwrap_text_config
+from .materialization import validate_rotary_initialization
 from .model_setup import (
     apply_cast_lm_head,
     configure_experts_implementation,
@@ -92,6 +94,7 @@ class HFTransformerModel(nn.Module):
         super().__init__()
 
         config = unwrap_text_config(config)
+        validate_rotary_initialization(config)
         # DSA models take a dense additive mask instead of a flex BlockMask;
         # resolved once here rather than per forward. The mask family is decided
         # in ``get_attention_masks``, which is the one place that knows both the
@@ -103,6 +106,12 @@ class HFTransformerModel(nn.Module):
             if config.model_type == "deepseek_v4"
             else available_attention_backend()
         )
+        if getattr(config, "attention_backend", "auto") == "eager_flex":
+            if config.model_type != "qwen3":
+                raise ValueError(
+                    "model.attention_backend='eager_flex' requires dense Qwen3"
+                )
+            config._attn_implementation = EAGER_FLEX_BACKEND
         register_attention_backend()
 
         model_cls = resolve_model_class(config)
@@ -110,6 +119,11 @@ class HFTransformerModel(nn.Module):
         self.model = model_cls(config=config)
         stabilize_residual_norm_gradients(self.model)
         self.model.config._attn_implementation = config._attn_implementation
+
+        if getattr(config, "qkv_projection", "separate") != "separate":
+            from .qkv_projection import apply_fused_qkv_projection
+
+            apply_fused_qkv_projection(self.model)
 
         apply_cast_lm_head(self.model, config)
 
@@ -368,15 +382,28 @@ class HFTransformerModel(nn.Module):
         # not cut. Both decisions are config-keyed, hence rank-symmetric.
         attention_masks = None
         if packed:
-            attention_masks = self.get_attention_masks(positions=positions)
-            if self._cp_strategy != "ulysses":
-                attention_masks = shard_attention_mask_for_cp(
-                    attention_masks,
-                    getattr(self, "_cp_mask_mesh", cp_mesh),
-                    self._cp_load_balancer,
+            if (
+                self._cp_strategy == "ulysses"
+                or getattr(self.model.config, "_cp_sdpa_dual", False)
+                or self.model.config._attn_implementation == CP_SDPA_BACKEND
+            ) and self.model.config._attn_implementation != ATTENTION_BACKEND:
+                attention_masks = build_dense_attention_mask(
+                    positions, dtype=self._mask_dtype(), block_causal=True
                 )
-            if self.model.config._attn_implementation != ATTENTION_BACKEND:
-                attention_masks = None
+                if self._cp_strategy != "ulysses" or getattr(
+                    self.model.config, "_cp_sdpa_dual", False
+                ):
+                    attention_masks = attention_masks == 0
+            else:
+                attention_masks = self.get_attention_masks(positions=positions)
+                if self._cp_strategy != "ulysses":
+                    attention_masks = shard_attention_mask_for_cp(
+                        attention_masks,
+                        getattr(self, "_cp_mask_mesh", cp_mesh),
+                        self._cp_load_balancer,
+                    )
+                if self.model.config._attn_implementation != ATTENTION_BACKEND:
+                    attention_masks = None
         inputs, labels, positions = shard_batch_for_cp(
             inputs,
             labels,
@@ -740,10 +767,9 @@ class HFTransformerModel(nn.Module):
                 boundaries. Drives RoPE. Defaults to ``arange``, which is correct
                 only when the sequence is a single document. Under CP, the
                 matching shard of the full positions.
-            attention_masks: a prebuilt BlockMask. Only the flex backend consumes
-                it (see ``_apply_attention``); with sdpa the decoder is left to
-                its own causal default. Under CP, a full-length mask already
-                Q-sharded by ``shard_attention_mask_for_cp``.
+            attention_masks: a prebuilt BlockMask for flex or a dense tensor
+                for packed Ulysses CP SDPA. Ulysses retains the full sequence
+                mask; KV all-gather flex uses a Q-sharded BlockMask.
             padding_mask: ``(T,)`` boolean, true for padding, sharded exactly
                 like ``input_ids``. Staged onto every swapped-in MoE block
                 (``MoE.set_padding_mask``) so the blocks' load-balancing
@@ -895,6 +921,17 @@ class HFTransformerModel(nn.Module):
             return {"attention_mask": None}
 
         if self.model.config._attn_implementation == CP_SDPA_BACKEND:
+            if (
+                getattr(self.model.config, "_cp_sdpa_dual", False)
+                or self._cp_strategy == "kv_allgather"
+            ) and getattr(
+                self.model.config, "attn_mask_type", "causal"
+            ) == "block_causal":
+                if not isinstance(attention_masks, torch.Tensor):
+                    raise ValueError(
+                        "Packed KV SDPA CP requires the full preprocessed document mask"
+                    )
+                return {"attention_mask": attention_masks}
             # The CP sdpa kernel (context_parallel/sdpa_attention.py) builds the
             # mask it needs from the CP offsets: this rank's queries against the
             # gathered full sequence. Handing the decoder a BlockMask here would
@@ -905,17 +942,21 @@ class HFTransformerModel(nn.Module):
             # after its head swap, so a packed corpus's document mask applies
             # unsharded -- exactly as it does for flex, and it is the one thing
             # that mask cannot be derived from a length. Build it here; the
-            # kernel ANDs it with nothing, because it is already causal.
+            # kernel adds no causal mask, only an optional sliding window.
             if (
                 getattr(self.model.config, "_cp_sdpa_ulysses", False)
                 and getattr(self.model.config, "attn_mask_type", "causal")
                 == "block_causal"
             ):
                 return {
-                    "attention_mask": build_dense_attention_mask(
-                        positions,
-                        dtype=self._mask_dtype(),
-                        block_causal=True,
+                    "attention_mask": (
+                        attention_masks
+                        if isinstance(attention_masks, torch.Tensor)
+                        else build_dense_attention_mask(
+                            positions,
+                            dtype=self._mask_dtype(),
+                            block_causal=True,
+                        )
                     )
                 }
             return {"attention_mask": None}

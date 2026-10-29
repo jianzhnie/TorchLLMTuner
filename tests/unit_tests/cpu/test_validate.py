@@ -477,6 +477,45 @@ def test_validate_raises_on_zero_valid_tokens(
 
 
 @pytest.mark.parametrize("fail", [False, True])
+def test_validate_restores_existing_and_absent_gradients(monkeypatch, fail):
+    from llmtuner.trainer.runtime import validation as validation_runtime
+
+    model = _EchoModel()
+    model.register_parameter("existing", torch.nn.Parameter(torch.ones(3)))
+    model.register_parameter("absent", torch.nn.Parameter(torch.ones(2)))
+    existing_gradient = torch.tensor([2.0, 3.0, 4.0])
+    model.existing.grad = existing_gradient
+    other_part = torch.nn.Linear(3, 2, bias=False)
+    other_gradient = torch.ones_like(other_part.weight)
+    other_part.weight.grad = other_gradient
+    trainer, _ = _make_trainer(
+        monkeypatch,
+        validation=ValidationConfig(steps=1),
+        loader=_ListLoader([]),
+        model=model,
+    )
+    trainer.model_parts.append(other_part)
+
+    def clear_gradients(*args):
+        model.existing.grad = None
+        model.absent.grad = torch.ones_like(model.absent)
+        other_part.weight.grad = None
+        if fail:
+            raise RuntimeError("metadata initialization failed")
+
+    monkeypatch.setattr(validation_runtime, "run_validation_loop", clear_gradients)
+    if fail:
+        with pytest.raises(RuntimeError, match="metadata initialization failed"):
+            trainer.validate(1)
+    else:
+        trainer.validate(1)
+    assert model.existing.grad is existing_gradient
+    assert model.absent.grad is None
+    assert other_part.weight.grad is other_gradient
+    torch.testing.assert_close(model.existing.grad, torch.tensor([2.0, 3.0, 4.0]))
+
+
+@pytest.mark.parametrize("fail", [False, True])
 def test_validate_restores_mixed_module_modes(monkeypatch, fail) -> None:
     from llmtuner.trainer.runtime import validation as validation_runtime
 

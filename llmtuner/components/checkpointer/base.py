@@ -233,6 +233,8 @@ class BaseCheckpointManager(ABC):
         self.states = {
             MODEL: ModelCheckpointState(
                 model_parts,
+                sharded_expert_parallel=config.sharded_expert_parallel,
+                sharded_tensor_parallel=config.sharded_tensor_parallel,
                 initialization_group=distributed.get_default_group()
                 if distributed.is_distributed()
                 else None,

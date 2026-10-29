@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
+import torch
 import torch.distributed as dist
 
 from ...accelerator.collectives import synchronize_local_errors
@@ -28,10 +30,17 @@ class HFTransformerStateDictAdapter:
         hf_assets_path: str | None,
         *,
         kimi_expert_parallel: bool = False,
+        qwen3_expert_parallel: bool = False,
     ) -> None:
         # Composite HF models store the trained decoder's weight ties here.
         self.model_config = getattr(model_config, "text_config", model_config)
         self.kimi_expert_parallel = kimi_expert_parallel
+        self.qwen3_expert_parallel = qwen3_expert_parallel
+        if (
+            qwen3_expert_parallel
+            and getattr(self.model_config, "model_type", None) != "qwen3_moe"
+        ):
+            raise ValueError("qwen3_expert_parallel requires qwen3_moe model config")
         if (
             kimi_expert_parallel
             and getattr(self.model_config, "model_type", None) != "kimi_linear"
@@ -40,6 +49,7 @@ class HFTransformerStateDictAdapter:
         self.hf_assets_path = hf_assets_path
         self._hf_keys: set[str] | None = None
         self.fqn_to_index_mapping: dict[str, int] | None = None
+        self.hf_export_fqn_to_index_mapping: dict[str, int] | None = None
 
         if hf_assets_path is None:
             return
@@ -53,6 +63,7 @@ class HFTransformerStateDictAdapter:
 
                 with safe_open(tensor_path, framework="pt") as tensors:
                     self._hf_keys = set(tensors.keys())
+                self._normalize_expert_keys()
             return
         with open(index_path, encoding="utf-8") as stream:
             index = json.load(stream)
@@ -79,6 +90,37 @@ class HFTransformerStateDictAdapter:
         self.fqn_to_index_mapping = {
             key: shard_indices[filename] for key, filename in weight_map.items()
         }
+        self.hf_export_fqn_to_index_mapping = dict(self.fqn_to_index_mapping)
+        self._normalize_expert_keys()
+        if not self.qwen3_expert_parallel:
+            self.hf_export_fqn_to_index_mapping = self.fqn_to_index_mapping
+
+    def _normalize_expert_keys(self) -> None:
+        if (
+            getattr(self.model_config, "model_type", None) == "qwen3_moe"
+            and self._hf_keys is not None
+        ):
+            from ...components.checkpointer.hf_expert_storage import (
+                grouped_expert_key,
+                native_ep_expert_key,
+            )
+
+            grouped_keys = set()
+            grouped_indices = {}
+            for key in self._hf_keys:
+                mapped = grouped_expert_key(key)
+                target = mapped[0] if mapped is not None else key
+                if self.qwen3_expert_parallel:
+                    target = native_ep_expert_key(key)
+                grouped_keys.add(target)
+                if self.fqn_to_index_mapping is not None:
+                    grouped_indices[target] = min(
+                        grouped_indices.get(target, self.fqn_to_index_mapping[key]),
+                        self.fqn_to_index_mapping[key],
+                    )
+            self._hf_keys = grouped_keys
+            if self.fqn_to_index_mapping is not None:
+                self.fqn_to_index_mapping = grouped_indices
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         if self.kimi_expert_parallel:
@@ -96,6 +138,8 @@ class HFTransformerStateDictAdapter:
             hf_state = {}
             for key, value in state_dict.items():
                 hf_key = key.removeprefix("model.")
+                if self.qwen3_expert_parallel:
+                    hf_key = hf_key.replace(".mlp.router.gate.", ".mlp.gate.")
                 if hf_key in hf_state:
                     raise ValueError(f"HF checkpoint key mapping collision: {hf_key!r}")
                 hf_state[hf_key] = value
@@ -143,7 +187,15 @@ class HFTransformerStateDictAdapter:
             and getattr(self.model_config, "tie_word_embeddings", False)
         ):
             hf_state_dict["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"]
-        state = {f"model.{key}": value for key, value in hf_state_dict.items()}
+        state = {
+            "model."
+            + (
+                key.replace(".mlp.gate.", ".mlp.router.gate.")
+                if self.qwen3_expert_parallel
+                else key
+            ): value
+            for key, value in hf_state_dict.items()
+        }
         if self.kimi_expert_parallel:
             from ..kimi.checkpoint import convert_kimi_expert_state
 
@@ -154,6 +206,69 @@ class HFTransformerStateDictAdapter:
                 coordinate_errors=True,
             )
         return state
+
+    def to_hf_export(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Produce standard HF expert keys rather than virtual reader templates."""
+        from ...components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+
+        state = self.to_hf(state_dict)
+        if not self.qwen3_expert_parallel:
+            return state
+        roles = {
+            "w1_EFD": "gate_proj",
+            "w3_EFD": "up_proj",
+            "w2_EDF": "down_proj",
+        }
+        result = {}
+        pending = []
+        with synchronize_local_errors("Qwen3 HF export expert mapping"):
+            for key, value in state.items():
+                match = re.fullmatch(
+                    r"(.+\.mlp\.)routed_experts\.inner_experts\.(w[123]_[A-Z]+)",
+                    key,
+                )
+                if match is None:
+                    targets = [key]
+                else:
+                    prefix, role = match.groups()
+                    if role not in roles:
+                        raise ValueError(f"Unknown Qwen3 expert projection: {key}")
+                    if (
+                        not isinstance(value, torch.Tensor)
+                        or value.ndim != 3
+                        or value.shape[0] != self.model_config.num_experts
+                    ):
+                        raise ValueError(
+                            f"Qwen3 HF export requires full expert stack: {key}"
+                        )
+                    targets = [
+                        f"{prefix}experts.{index}.{roles[role]}.weight"
+                        for index in range(self.model_config.num_experts)
+                    ]
+                for target in targets:
+                    if target in result:
+                        raise ValueError(f"Qwen3 HF export key collision: {target}")
+                    result[target] = value if match is None else None
+                if match is not None:
+                    pending.append((targets, value))
+        for targets, value in pending:
+            if isinstance(value, ChunkedCheckpointTensor):
+                for target in targets:
+                    del result[target]
+                for offset, local in value.chunks:
+                    for index in range(local.shape[0]):
+                        target = targets[offset[0] + index]
+                        chunks = []
+                        if target in result:
+                            chunks.extend(result[target].chunks)
+                        chunks.append((offset[1:], local[index]))
+                        result[target] = ChunkedCheckpointTensor(
+                            value.shape[1:], chunks
+                        )
+                continue
+            for target, weight in zip(targets, value.unbind(0), strict=True):
+                result[target] = weight
+        return result
 
     def get_hf_storage_reader(
         self,
@@ -167,4 +282,15 @@ class HFTransformerStateDictAdapter:
         if thread_count is None:
             # Two workers overlap shard reads without heavy storage pressure.
             thread_count = 2
+        if getattr(self.model_config, "model_type", None) == "qwen3_moe":
+            from ...components.checkpointer.hf_expert_storage import (
+                GroupedExpertHuggingFaceStorageReader,
+            )
+
+            return GroupedExpertHuggingFaceStorageReader(
+                path,
+                num_experts=self.model_config.num_experts,
+                thread_count=thread_count,
+                native_ep_layout=self.qwen3_expert_parallel,
+            )
         return IndexedHuggingFaceStorageReader(path, thread_count=thread_count)

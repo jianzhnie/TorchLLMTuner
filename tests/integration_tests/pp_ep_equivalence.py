@@ -10,6 +10,9 @@ to exercise decoder checkpoint replay. `--aux-coefficient 0.3` magnifies
 the router auxiliary gradient relative to the default coefficient 0.001.
 Add `--compile-backend aot_eager` to compile every local stage while retaining
 the independent eager, uncheckpointed reference and existing tolerances.
+Add `--dispatcher torchao` to exercise real padded dispatch in Trainer steps.
+Set LLMTUNER_TEST_WORLD_SIZE=8 and LLMTUNER_TEST_GLOBAL_BATCH=16 for DP4.
+Add LLMTUNER_TEST_DP_REPLICATE_SIZE=2 for replicate2 x shard2.
 
 The pipeline (pp=2) composes with expert parallelism (ep=2): the sparse mesh
 carries a pp axis, so each stage's ranks form their own EP group, and the MoE
@@ -30,10 +33,12 @@ Environment note: needs torch >= 2.12 for the pipelining/SPMD surface.
 from __future__ import annotations
 
 import argparse
+import math
+import os
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.accelerator.spmd import spmd_context
@@ -60,14 +65,15 @@ from tests.integration_tests.harness import device, moved, moved_batch
 
 STEPS = 4
 MICROBATCHES = 4
-GLOBAL_BATCH = 8
+GLOBAL_BATCH = int(os.environ.get("LLMTUNER_TEST_GLOBAL_BATCH", "8"))
 SEQ = 32
 VOCAB = 128
 NUM_EXPERTS = 8
 SEED = 42
 PP = 2
 EP = 2
-WORLD = 4  # pp * dp_shard = 2 * 2; the sparse region (2 ranks/stage) fits ep=2
+WORLD = int(os.environ.get("LLMTUNER_TEST_WORLD_SIZE", "4"))
+DP_REPLICATE = int(os.environ.get("LLMTUNER_TEST_DP_REPLICATE_SIZE", "1"))
 
 # Looser than the dense PP check: EP's dispatch permutes tokens, so the fp32
 # summation order differs from the reference's; nothing here is reassociated
@@ -102,6 +108,7 @@ def _cfg(
             pipeline_parallel_size=PP,
             expert_parallel_size=EP,
             data_parallel_shard_size=-1,
+            data_parallel_replicate_size=DP_REPLICATE,
             pp_config=PipelineParallelConfig(
                 pipeline_parallel_schedule="1F1B", num_pp_microbatches=MICROBATCHES
             ),
@@ -156,7 +163,8 @@ def _reference_trajectory(
     )
     # DP splits the global batch across EP ranks before PP forms its local
     # microbatches. Attention sees one row per forward on each rank here.
-    rows_per_mb = cfg.global_batch_size // (MICROBATCHES * EP)
+    dp_size = WORLD // PP
+    rows_per_mb = cfg.global_batch_size // (MICROBATCHES * dp_size)
     batches = iter(
         RandomTokenSource(
             seed=cfg.seed,
@@ -176,7 +184,7 @@ def _reference_trajectory(
         )
         num_valid = int((targets != IGNORE_INDEX).sum())
         loss_sum = None
-        for mb in range(MICROBATCHES * EP):
+        for mb in range(MICROBATCHES * dp_size):
             row = slice(mb * rows_per_mb, (mb + 1) * rows_per_mb)
             logits = model(batch.input_ids[row].reshape(-1))
             loss = cross_entropy_loss(logits, targets[row].reshape(-1))
@@ -204,12 +212,17 @@ def main() -> None:
     )
     parser.add_argument("--aux-coefficient", type=float, default=0.001)
     parser.add_argument("--compile-backend", choices=("aot_eager",))
+    parser.add_argument(
+        "--dispatcher", choices=("alltoall", "torchao"), default="alltoall"
+    )
     args = parser.parse_args()
     cfg = _cfg(
         activation_checkpoint=args.activation_checkpoint,
         aux_coefficient=args.aux_coefficient,
         compile_backend=args.compile_backend,
     )
+    cfg.parallel.ep_config.ep_token_dispatcher = args.dispatcher
+    cfg.parallel.ep_config.__post_init__()
     failures: list[str] = []
 
     trainer = Trainer(cfg)
@@ -217,6 +230,36 @@ def main() -> None:
     assert trainer.world_size == WORLD, (
         f"this check assumes {WORLD} ranks, got {trainer.world_size}"
     )
+    assert WORLD in {4, 8}
+    assert trainer.parallel_dims.dp_replicate == DP_REPLICATE
+    assert trainer.parallel_dims.dp_shard == WORLD // (PP * DP_REPLICATE)
+    for part in trainer.model_parts:
+        if DP_REPLICATE > 1:
+            for parameter in part.parameters():
+                assert isinstance(parameter, DTensor)
+                mesh = parameter.device_mesh
+                replica_axis = mesh.mesh_dim_names.index("dp_replicate")
+                assert mesh.size(replica_axis) == DP_REPLICATE
+                assert isinstance(parameter.placements[replica_axis], Replicate)
+        if trainer.parallel_dims.dp_shard > 1:
+            assert any(
+                isinstance(parameter, DTensor)
+                and parameter.to_local().numel() < parameter.numel()
+                for parameter in part.parameters()
+            )
+    coordinates = [None] * WORLD
+    dist.all_gather_object(
+        coordinates,
+        (
+            trainer.parallel_dims.get_mesh("pp").get_local_rank(),
+            trainer.parallel_dims.get_mesh("ep").get_local_rank(),
+        ),
+    )
+    representative_ranks = [
+        coordinates.index((pp_rank, ep_rank))
+        for pp_rank in range(PP)
+        for ep_rank in range(EP)
+    ]
 
     # -- non-vacuity: the model is split, and the experts are sharded --------
     num_layers_held = sum(len(part.layers) for part in trainer.model_parts)
@@ -237,6 +280,14 @@ def main() -> None:
                 assert moe.router.aux_loss is not None
                 assert moe.router.aux_loss.coeff == args.aux_coefficient
             held = moe.routed_experts.inner_experts.num_experts
+            if args.dispatcher == "torchao":
+                from llmtuner.parallel.expert_parallel.torchao_dispatch import (
+                    TorchAOTokenDispatcher,
+                )
+
+                assert isinstance(
+                    moe.routed_experts.token_dispatcher, TorchAOTokenDispatcher
+                )
             if held != num_local:
                 failures.append(
                     f"rank {rank} part {part_idx} layer {layer_idx}: holds "
@@ -257,8 +308,28 @@ def main() -> None:
             local_initial_state[canonical_fqn(key)] = value.detach().cpu().clone()
     initial_states = [None] * trainer.world_size
     dist.all_gather_object(initial_states, local_initial_state)
+    for rank_index, state in enumerate(initial_states):
+        representative = initial_states[coordinates.index(coordinates[rank_index])]
+        torch.testing.assert_close(state, representative, rtol=0, atol=0)
+    initial_states = [initial_states[index] for index in representative_ranks]
 
     # -- the trajectory ------------------------------------------------------
+    replay_calls = [0]
+    if args.activation_checkpoint != "none":
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointWrapper,
+        )
+
+        wrapped_layers = [
+            layer for part in trainer.model_parts for layer in part.layers
+        ]
+        assert all(isinstance(layer, CheckpointWrapper) for layer in wrapped_layers)
+
+        def count_forward(module, inputs):
+            replay_calls[0] += 1
+
+        for layer in wrapped_layers:
+            layer._checkpoint_wrapped_module.register_forward_pre_hook(count_forward)
     data_iterator = trainer.data_iterator()
     pp_ep_losses = []
     actual_snapshots = []
@@ -287,6 +358,10 @@ def main() -> None:
                 local[canonical_fqn(name)] = tuple(values)
         gathered = [None] * WORLD
         dist.all_gather_object(gathered, local)
+        for rank_index, state in enumerate(gathered):
+            representative = gathered[coordinates.index(coordinates[rank_index])]
+            torch.testing.assert_close(state, representative, rtol=TOL, atol=TOL)
+        gathered = [gathered[index] for index in representative_ranks]
         merged = {}
         for name in {key for state in gathered for key in state}:
             entries = [state[name] for state in gathered if name in state]
@@ -325,11 +400,18 @@ def main() -> None:
                         f"rank {rank} step {step + 1} {name} {kind}: {error}"
                     )
     for step, (got, want) in enumerate(zip(pp_ep_losses, reference, strict=True)):
+        assert math.isfinite(got) and math.isfinite(want)
         if abs(got - want) > TOL:
             failures.append(f"rank {rank} step {step + 1}: loss {got} vs {want}")
+    if args.activation_checkpoint != "none":
+        assert replay_calls[0] >= 2 * STEPS * MICROBATCHES * num_layers_held
 
     if rank == 0:
-        print(f"pp={PP} ep={EP} world={WORLD} steps={STEPS} tol={TOL:.0e}")
+        print(
+            f"pp={PP} ep={EP} world={WORLD} steps={STEPS} tol={TOL:.0e} "
+            f"dispatcher={args.dispatcher}"
+            f" ac={args.activation_checkpoint} decoder_calls={replay_calls[0]}"
+        )
         print(f"pp+ep losses = {[f'{x:.6f}' for x in pp_ep_losses]}")
         print(f"reference    = {[f'{x:.6f}' for x in reference]}")
         for f in failures:

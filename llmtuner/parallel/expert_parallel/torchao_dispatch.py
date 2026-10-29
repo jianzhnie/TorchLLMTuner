@@ -53,9 +53,9 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
     skips the all-to-all and applies only the local padded permute (the EP=1
     debug/numerics path upstream supports).
 
-    The padded-permute numerics are unverified on this (macOS/CPU) machine --
-    no torchao, no CUDA -- and await a re-run on the CUDA target with the real
-    package installed.
+    The adapter trims unused allocation capacity beyond the padded expert
+    segments, keeping the expert compute contract exact. Resolving that size
+    materializes the padded count sum on the host.
     """
 
     def __init__(self, num_experts: int, top_k: int, *, pad_multiple: int) -> None:
@@ -162,10 +162,13 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
             e,
             self.pad_multiple,
         )
+        covered_rows = int(num_global_tokens_per_local_expert_padded_e.sum().item())
+        if covered_rows > routed_input_RD.shape[0]:
+            raise ValueError("TorchAO padded counts exceed the routed buffer capacity")
         return (
             input_shape,
-            routed_input_RD,
-            permuted_indices,
+            routed_input_RD[:covered_rows],
+            permuted_indices[:covered_rows],
             num_global_tokens_per_local_expert_padded_e,
         )
 

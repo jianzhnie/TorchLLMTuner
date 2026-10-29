@@ -38,6 +38,7 @@ independent, replication-safe layout; a sharded write plan is future work.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import nullcontext
 from typing import Any, Literal
 
 import torch
@@ -299,3 +300,101 @@ def load_expert_state(
             )
         out[key] = local
     return out
+
+
+def shard_expert_state(
+    state_dict: dict[str, Any],
+    *,
+    shard_map: dict[str, dist.ProcessGroup],
+    model_parts: list[nn.Module],
+) -> dict[str, Any]:
+    """Describe EP ownership for DCP without allocating full expert tensors.
+
+    FSDP ownership inside each EP slice is retained in the global offsets.
+    Scalar optimizer state remains replicated, matching the full-state path.
+    """
+    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+
+    from ...components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+
+    result = dict(state_dict)
+    params = index_checkpoint_parameters(model_parts)
+    for key, group, _ in iter_expert_state_entries(
+        state_dict, shard_map=shard_map, params=params, direction="save"
+    ):
+        value = state_dict[key]
+        shape = list(value.shape)
+        if DTensor is not None and isinstance(value, DTensor):
+            if any(placement.is_partial() for placement in value.placements):
+                raise ValueError(f"EP checkpoint cannot serialize Partial state: {key}")
+            _, offset = compute_local_shape_and_global_offset(
+                value.shape, value.device_mesh, value.placements
+            )
+            offset = list(offset)
+            local = value.to_local()
+        else:
+            offset = [0] * value.ndim
+            local = value
+        offset[0] += get_rank(group) * shape[0]
+        shape[0] *= get_world_size(group)
+        chunks = [(offset, local)] if local.numel() else []
+        result[key] = ChunkedCheckpointTensor(
+            shape, chunks, dtype=value.dtype, device=value.device
+        )
+    return result
+
+
+def restore_sharded_expert_state(
+    state_dict: dict[str, Any],
+    *,
+    local_state: dict[str, Any],
+    shard_map: dict[str, dist.ProcessGroup],
+    model_parts: list[nn.Module],
+    coordinate_errors: bool = False,
+) -> dict[str, Any]:
+    """Copy global expert checkpoint views into the caller's local ownership.
+
+    With ``coordinate_errors=True`` all world ranks must participate. Only local
+    preparation is coordinated; tensor copy failures are not transactional.
+    """
+    from ...accelerator.collectives import synchronize_local_errors
+    from ...components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+
+    pending = []
+    result = dict(state_dict)
+    with (
+        synchronize_local_errors("EP checkpoint restore preparation")
+        if coordinate_errors
+        else nullcontext()
+    ):
+        targets = shard_expert_state(
+            local_state, shard_map=shard_map, model_parts=model_parts
+        )
+        for key, target in targets.items():
+            if not isinstance(target, ChunkedCheckpointTensor):
+                continue
+            source = state_dict[key]
+            if not isinstance(source, torch.Tensor) or source.shape != target.shape:
+                raise ValueError(f"EP checkpoint global shape mismatch: {key}")
+            if source.dtype != target.dtype:
+                raise ValueError(f"EP checkpoint dtype mismatch: {key}")
+            if isinstance(source, ChunkedCheckpointTensor):
+                if [(offset, value.shape) for offset, value in source.chunks] != [
+                    (offset, value.shape) for offset, value in target.chunks
+                ]:
+                    raise ValueError(f"EP checkpoint local ownership mismatch: {key}")
+            pending.append((key, target, source))
+    with torch.no_grad():
+        for key, target, source in pending:
+            if isinstance(source, ChunkedCheckpointTensor):
+                target.copy_(source)
+            else:
+                for offset, local in target.chunks:
+                    view = source
+                    for dim, (start, size) in enumerate(
+                        zip(offset, local.shape, strict=True)
+                    ):
+                        view = view.narrow(dim, start, size)
+                    local.copy_(view)
+            result[key] = local_state[key]
+    return result

@@ -633,8 +633,18 @@ torch≥2.12 多卡复跑。
    PP × 真实语料已支持（positions 随 microbatch 穿管，
    `pp_real_corpus_equivalence.py` 同样待复跑）。
    chunked loss × validation 拒绝（validation 只走全量 logits，训练能活的配置会在
-   首次 eval OOM）；EP × `initial_load_in_hf` 拒绝（HF checkpoint 是 swap 前的专家
-   布局，adapter 不做专家布局转换，加载会静默留垃圾权重）。
+   首次 eval OOM）。EP × `initial_load_in_hf` 按模型布局校验：Qwen3MoE
+   须启用 `checkpoint.sharded_expert_parallel`，TP>1 时还须启用
+   `checkpoint.sharded_tensor_parallel`，通过 HF adapter 转换专家布局并
+   恢复本地分片；Kimi Linear 使用独立布局适配。其他 EP 模型仍拒绝，
+   避免未转换的专家权重残留未初始化值。具体运行证据及适用范围见
+   `docs/npu_ascend_status.md`。
+   chunked loss × FSDP 的原生默认 decoder 布局使用 root-owned boundaries：
+   embedding/norm/head 及与其共享参数的层由 root 统一管理，参数在外部 chunk
+   backward 期间保持可用，最终 decoder backward 才归约全部贡献；不改参数身份。
+   非 chunked 默认分组不变。自定义 patterns、CPU offload、compile 及混合
+   TP/CP/EP/PP 仍由 `chunked_loss_fsdp` 明确拒绝。NPU FP32 的绑定/非绑定权重、
+   全logits参考及真实Trainer冷恢复证据见 `docs/npu_ascend_status.md`，不推广到未测配置。
 2. ptrr load balancer 未实现；Ulysses 不与 load balancer 组合（packed/varlen 受支持，
    文档 mask 全长透传，见 §5.4 与
    `tests/integration_tests/cp_ulysses_varlen_equivalence.py`）。
@@ -774,6 +784,21 @@ random 语料或 `max_num_documents=1` 用 `"causal"`，其余用 `"block_causal
 `tests/unit_tests/cpu/models/test_hf_wrapper.py::test_the_mask_type_follows_the_corpus_rather_than_being_configured`
 钉住了这个 seam。
 
+### 重复 map 分片的非空检查
+
+`datasets/composition.py::apply_iteration_policy` 保持全局shuffle→DP连续切片→
+repeat顺序。在repeat之前对初始本地分片做索引探测，找到首个非None样本立即
+停止；整片均被过滤则抛出带DP坐标、行数及长度/过滤排查提示的ConfigError。
+Grain map过滤保留None槽位，直接repeat后转iterator可能永远等不到batch，
+因此不能只检查原始行数非零。探测不推进loader游标，并保存/恢复Python、NumPy
+及CPU Torch RNG；不修改接受规则、不截断SFT响应、不物化整份样本集合。
+
+代价是构造时额外读取/处理至首个有效索引（最坏扫描整个本地分片），即不再
+保证重复map图的完全惰性。该检查只证明初始epoch的分片非空；不证明后续
+shuffle/stochastic过滤epoch或streaming源永不耗尽。有限repeat=False图保留
+空结果语义，不做该探测。mix各重复map子源分别检查，空子源明确拒绝，而非
+静默改变源权重。自定义map处理器仍须遵守按索引可重入的Grain语义。
+
 ### Checkpoint 加载职责
 
 `components/checkpointer/load_planner.py::CheckpointLoadPlanner` 集中处理 DCP
@@ -826,7 +851,57 @@ Metrics/FLOPs 构建同样属于本地初始化阶段。world 协调完成前不
 防止 peer 独自进入训练 collective。外部后端挂起与内部通信失败仍不在此契约内。
 
 
+## Qwen3 融合 QKV 的显式选择
+
+`model.qkv_projection=fused` 在 HF 模型构造时绑定实例级 attention forward，
+以 KV-group 顺序拼接现有 Q/K/V 权重并执行一次 GEMM；默认 `separate` 不变。
+不创建新 Parameter，不改参数名、state-dict 键或全局 HF 类，不跨 forward 缓存
+投影结果。每次调用的权重拼接有临时显存开销，不等于零复制的融合参数存储。
+Q/K norm、RoPE、attention interface、cache 更新及输出投影沿用原 Qwen3 语义。
+
+当前仅接受 dense Qwen3 的原生 attention 和 plain Linear 投影，支持一致的
+Q/K/V bias 配置。融合不调用三个独立 Linear.forward，因此显式拒绝投影的用户
+forward 覆写及模块前后向 hook，不静默绕过；attention 和 norm 的 hook 保留。
+TP 投影带独立通信边界，尚未适配该融合入口，配置期及 TP 装配期均拒绝组合。
+默认 separate 路径的既有并行支持不变。运行中的已分片/编译模型不得热切换。
+
+融合改变反向 GEMM 归约边界，尤其低精度下不同于三个已舍入梯度再相加；不承诺
+与 separate 逐位相同。CPU 测试使用 FP64 数学参考验证输入梯度，并检查参数
+身份、meta materialization、状态恢复及局部 AOT 图。实际 NPU 验证配置及剩余
+边界以 `npu_ascend_status.md` 为准；该选项本身不代表整个 P4 数值对齐完成。
+
 ## Qwen3 归一化的执行边界
+
+### 显式 eager Flex 后端
+
+`model.attention_backend=auto` 保持既有选择；`eager_flex` 为dense Qwen3选择
+独立HF接口 `llmtuner_eager_flex`，不覆写全局sdpa注册。其mask接口复用HF
+SDPA布尔掩码生成，adapter将因果/packed mask转为BlockMask后调用本仓库
+eager Flex HOP leaf。不导入基线包、不修改PyTorch设备校验或debug全局开关。
+这不是融合核：eager数学路径会物化scores及mask，仍可能出现AiCPU argsort。
+支持CPU/NPU三种浮点精度与GQA；不支持dropout、attention bias或KV cache。
+当前TP/CP、模型compile在配置或装配期拒绝，不静默覆盖既有collective边界；
+auto路径既有支持不变。生产百步、冷恢复和质量门禁以状态文档实际证据为准。
+
+### RoPE 运行时频率初始化
+
+`model.rotary_init_device=constructor` 保留 HF 构造时计算的频率及既有搬运行为。
+显式选择 `target` 时，Trainer 在普通模型搬到目标设备后、并行变换之前，或在
+meta 模型分片并 materialize 后，在实际训练设备重建频率。不硬编码 head_dim
+或 theta，使用安装版 HF Qwen3RotaryEmbedding 的初始化公式；同时更新
+`inv_freq`、`original_inv_freq`、频率相关缓存及 attention scaling，保留注册
+buffer 在重建入口处的共享引用，不改变参数与 state-dict 键。重建频率为 FP32，与参数精度
+无关。此设置改变频率构造的舍入轨迹，不保证沿用旧训练轨迹。
+
+目前 target 仅支持原生 dense Qwen3 的 default RoPE，其他家族、缩放 RoPE
+及自定义 rotary 子类明确拒绝。它是 Trainer 的构造期策略，不是在 forward
+中反复重建或全局替换 HF 类。直接操作 HFTransformerModel 的调用方须自行调用
+`models/hf/materialization.py::initialize_rotary_on_device`；单独 `.to()` 不执行
+该策略。实际 NPU 对齐及恢复范围见状态文档，不据此宣称 Flex 正式迁移完成。
+此 helper 不修复调用前已被普通 `.to()` 分裂的任意跨模块 buffer alias；meta
+materialization 则在重建前按已有别名恢复流程处理共享引用。
+
+### 残差归一化后端
 
 `models/hf/model_setup.py` 在并行变换之前适配精确的 HF Qwen3/Qwen3 MoE
 norm 类型。默认 native 后端为 residual norm 输入建立共享存储 view，协调
@@ -838,7 +913,18 @@ norm 类型。默认 native 后端为 residual norm 输入建立共享存储 vie
 模型复用；不属于某个 Trainer 的可注销资源。仅支持一阶梯度及 fp16/bf16/fp32
 输入。保留 ATen 归约限制融合，因此该路径用于有明确数值需求的运行。
 
-后端重设只用于构造阶段，清理本适配拥有的 hook/forward，保留用户 hook。
+`model.norm_backend=joint` 通过 `models/hf/residual_normalization.py` 为 dense
+Qwen3 的两处 residual norm 提供成对输出（归一化结果、残差副本），由实例级
+decoder forward 消费。Q/K 与最终 norm 保持 native；不替换全局 HF 类、参数或
+state-dict 键。FP32 反向固定为 `(direct + residual) + indirect`；fp16/bf16
+先按原生 cast 边界合并 norm 梯度，再加残差，避免改变低精度舍入语义。
+仅支持一阶梯度及 fp16/bf16/fp32 输入。残差 clone 增加内存，不承诺性能收益。
+仅接受原生 Qwen3 decoder/norm 类型；norm 用户前后向 hook 和实例 forward
+覆写明确拒绝，适配拥有的输入 view hook 保留。注册的 DTensor 规则覆盖复制及
+外轴分片，不构成所有 TP/CP/PP 组合的验证证据。
+
+后端重设只用于构造阶段，清理本适配拥有的 hook/forward，不删除用户 hook；
+joint 对不兼容 hook 显式报错。
 已分片或编译模型不能通过修改配置热切换；恢复时由调用方显式选择运行配置。
 权重格式兼容不等于旧舍入轨迹逐位延续。分布式证据及范围见
 [并行比较](distributed_implementation_comparison.md)。
@@ -1165,3 +1251,14 @@ sync/threaded async/full final及重试，见审查台账第326批。此证据�
 Trainer的AuxLoss指标收集不受进程级构造registry门控：具有parallel_dims的
 stage统一进入收集器，由当前model_parts协商PP指标键与实例数，空stage也参与。
 CPU/Gloo回归触达真实Trainer指标入口；不等同于完整PP训练及设备验收，见第328批。
+
+### 双轴 SDPA CP 的全局文档 mask
+
+KV×Ulysses双轴CP按KV外层、Ulysses内层排列token。SDPA内核先在Ulysses组内
+交换sequence/head，再沿KV轴聚合K/V；查询偏移为KV local rank乘交换后查询
+长度，而非总CP rank乘该长度。反向先跨KV求和归还本地K/V，再逆Ulysses交换。
+packed输入在token切分前建立完整四维boolean文档mask，保留至attention入口，
+由内核裁切KV查询行；缺失全局mask明确报错，不从已切分positions猜测文档。
+普通causal输入仍由内核按偏移生成mask。完整dense文档mask占用O(T²)空间，
+不等于Flash/Flex稀疏内核性能；Ulysses头整除及禁用load-balancer的约束不变。
+目标设备、精度、组合及恢复验证范围以NPU状态矩阵为准。

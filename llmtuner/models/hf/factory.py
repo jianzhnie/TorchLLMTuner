@@ -120,6 +120,9 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
     # build time, and None (the default) means no cast.
     config.compute_dtype = getattr(cfg, "compute_dtype", None)
     config.norm_backend = cfg.norm_backend
+    config.qkv_projection = cfg.qkv_projection
+    config.rotary_init_device = cfg.rotary_init_device
+    config.attention_backend = cfg.attention_backend
     return config
 
 
@@ -141,6 +144,9 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
         "experts_implementation",
         "compute_dtype",
         "norm_backend",
+        "qkv_projection",
+        "rotary_init_device",
+        "attention_backend",
     ):
         if hasattr(config, name):
             setattr(text_config, name, getattr(config, name))

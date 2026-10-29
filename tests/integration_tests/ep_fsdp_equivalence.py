@@ -5,6 +5,9 @@ Run under torchrun with 4 ranks (from the repo root):
     PYTHONPATH=. torchrun --nproc_per_node=4 \
         tests/integration_tests/ep_fsdp_equivalence.py
 
+Use --dp-replicate 2 on four or eight ranks to validate HSDP replication.
+Use --dispatcher torchao for padded dispatch through full expert computation.
+
 Add ``--converted-root-expert`` to register a root alias to the local down
 projection after real EP conversion and before FSDP. This checks shared identity,
 sparse placement and expert gradients through root-owned FSDP management.
@@ -50,6 +53,7 @@ assignment is exactly what the missing flags broke.
 from __future__ import annotations
 
 import argparse
+import math
 from unittest.mock import patch
 
 import torch
@@ -117,7 +121,7 @@ def _model(
     return moved(model)
 
 
-def _data() -> tuple[torch.Tensor, torch.Tensor]:
+def _data(world_size: int = 4) -> tuple[torch.Tensor, torch.Tensor]:
     """The global batch ``(dp, T)``; identical on every rank, row-sliced later.
 
     One row per rank: dp shards a batch, and each row is an independent
@@ -125,10 +129,14 @@ def _data() -> tuple[torch.Tensor, torch.Tensor]:
     restart at 0 -- slicing one long sequence across ranks would not be dp).
     """
     ids = torch.randint(
-        128, (4, TOKENS_PER_RANK), generator=torch.Generator().manual_seed(1000)
+        128,
+        (world_size, TOKENS_PER_RANK),
+        generator=torch.Generator().manual_seed(1000),
     )
     labels = torch.randint(
-        128, (4, TOKENS_PER_RANK), generator=torch.Generator().manual_seed(2000)
+        128,
+        (world_size, TOKENS_PER_RANK),
+        generator=torch.Generator().manual_seed(2000),
     )
     return moved(ids), moved(labels)
 
@@ -178,6 +186,10 @@ def _ref_expert_grads(block) -> tuple[torch.Tensor, torch.Tensor]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dp-replicate", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--dispatcher", choices=("alltoall", "torchao"), default="alltoall"
+    )
     parser.add_argument("--pattern-fsdp", action="store_true")
     parser.add_argument("--fixed-router", action="store_true")
     parser.add_argument("--domino-expert-failure", action="store_true")
@@ -191,6 +203,8 @@ def main() -> None:
         "--fsdp-implementation", choices=("native", "custom"), default="native"
     )
     args = parser.parse_args()
+    if args.domino_expert_failure and args.dispatcher != "alltoall":
+        parser.error("--domino-expert-failure cannot override --dispatcher")
     if args.relocated_expert_hooks and (
         not args.expert_fsdp or args.fsdp_implementation != "custom"
     ):
@@ -205,15 +219,19 @@ def main() -> None:
     device = init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
-    assert world == 4, f"this check assumes 4 ranks, got {world}"
+    assert world in (4, 8), f"expected four or eight ranks, got {world}"
+    assert not args.domino_expert_failure or world == 4
 
     cfg = ParallelConfig(
-        data_parallel_shard_size=4,
+        data_parallel_shard_size=world // args.dp_replicate,
+        data_parallel_replicate_size=args.dp_replicate,
         expert_parallel_size=2,
         ep_config=ExpertParallelConfig(
             fixed_router=args.fixed_router,
             router_aux_loss_coef=0.0 if args.fixed_router else None,
-            ep_token_dispatcher="domino" if args.domino_expert_failure else "alltoall",
+            ep_token_dispatcher=(
+                "domino" if args.domino_expert_failure else args.dispatcher
+            ),
         ),
         fsdp_config=FSDPConfig(
             fsdp_implementation=args.fsdp_implementation,
@@ -258,7 +276,7 @@ def main() -> None:
     # The wrapper takes one packed 1-D sequence per call, so the reference runs
     # the batch's rows one at a time and sums -- the same total as one batched
     # call, and exactly what dp sharding splits.
-    ids_all, labels_all = _data()
+    ids_all, labels_all = _data(world)
     ref = _model(
         shared_projection=args.shared_projection, shared_experts=args.shared_experts
     )
@@ -324,7 +342,7 @@ def main() -> None:
         expert = model.layers[0].mlp.routed_experts.inner_experts.w2_EDF
         assert model.external_expert is expert
         assert isinstance(expert, DTensor)
-        assert expert.device_mesh.size() == 2
+        assert expert.device_mesh.size() == world // cfg.ep_size
 
     if args.shared_projection:
         assert model.layers[0].self_attn.q_proj.weight is (
@@ -426,6 +444,7 @@ def main() -> None:
 
     all_reduce(loss_sum, group=loss_mesh.get_group())
     got_loss = float(loss_sum.detach())
+    assert math.isfinite(got_loss) and math.isfinite(ref_loss)
     if abs(got_loss - ref_loss) > TOL:
         failures.append(f"rank {rank}: loss {got_loss:.6f} vs reference {ref_loss:.6f}")
 
@@ -433,6 +452,7 @@ def main() -> None:
         actual = _full(model.layers[0].self_attn.q_proj.weight.grad)
         expected = ref.layers[0].self_attn.q_proj.weight.grad
         difference = (actual - expected).abs().max().item()
+        assert math.isfinite(difference)
         if difference > TOL:
             failures.append(f"rank {rank}: shared Q gradient diff {difference:.3e}")
 
@@ -447,6 +467,14 @@ def main() -> None:
         if not isinstance(moe, MoE):
             failures.append(f"rank {rank} layer {layer_idx}: mlp was not swapped")
             continue
+        if args.dispatcher == "torchao":
+            from llmtuner.parallel.expert_parallel.torchao_dispatch import (
+                TorchAOTokenDispatcher,
+            )
+
+            assert isinstance(
+                moe.routed_experts.token_dispatcher, TorchAOTokenDispatcher
+            )
 
         # Non-vacuity, the BUG-1 pin: the flags FSDP's MoE branch reads, and
         # the mesh each parameter actually landed on.
@@ -472,13 +500,13 @@ def main() -> None:
             )
         w1 = grouped.w1_EFD
         gate_w = moe.router.gate.weight
-        if not isinstance(w1, DTensor) or w1.device_mesh.size() != 2:
+        if not isinstance(w1, DTensor) or w1.device_mesh.size() != world // cfg.ep_size:
             failures.append(
                 f"rank {rank} layer {layer_idx}: expert weights not on the "
                 f"efsdp mesh (got {type(w1).__name__}, mesh "
                 f"{None if not isinstance(w1, DTensor) else w1.device_mesh.size()})"
             )
-        if not isinstance(gate_w, DTensor) or gate_w.device_mesh.size() != 4:
+        if not isinstance(gate_w, DTensor) or gate_w.device_mesh.size() != world:
             gate_mesh = (
                 gate_w.device_mesh.size() if isinstance(gate_w, DTensor) else None
             )
@@ -488,6 +516,9 @@ def main() -> None:
             )
 
         if isinstance(w1, DTensor):
+            if args.dp_replicate > 1:
+                assert w1.device_mesh["dp_replicate"].size() == args.dp_replicate
+                assert w1.placements[0].is_replicate()
             expert_ranks = w1.device_mesh.mesh.reshape(-1).tolist()
             expected_ranks = list(range(ep_rank, world, cfg.ep_size))
             if expert_ranks != expected_ranks:
@@ -496,6 +527,9 @@ def main() -> None:
                     f"want {expected_ranks}"
                 )
         if isinstance(gate_w, DTensor):
+            if args.dp_replicate > 1:
+                assert gate_w.device_mesh["dp_replicate"].size() == args.dp_replicate
+                assert gate_w.placements[0].is_replicate()
             dense_ranks = gate_w.device_mesh.mesh.reshape(-1).tolist()
             if dense_ranks != list(range(world)):
                 failures.append(f"rank {rank}: dense mesh ranks {dense_ranks}")
@@ -509,6 +543,7 @@ def main() -> None:
             gate_diff = (
                 (_full(gate_w.grad) - ref_mlp.gate.weight.grad).abs().max().item()
             )
+            assert math.isfinite(gate_diff)
             if gate_diff > TOL:
                 failures.append(
                     f"rank {rank} layer {layer_idx}: router grad diff {gate_diff:.3e}"
@@ -530,6 +565,7 @@ def main() -> None:
         ]
         for name, got, want in checks:
             diff = (got - want).abs().max().item()
+            assert math.isfinite(diff), (layer_idx, name)
             if diff > TOL:
                 failures.append(
                     f"rank {rank} layer {layer_idx}: {name} grad diff {diff:.3e}"
@@ -542,8 +578,11 @@ def main() -> None:
     if rank == 0:
         print(
             f"tokens/rank={TOKENS_PER_RANK} experts={NUM_EXPERTS} "
-            f"ep=2 dp_shard=4 (efsdp=2) tol={TOL:.0e} "
+            f"ep=2 dp_shard={parallel_dims.dp_shard} "
+            f"dp_replicate={args.dp_replicate} "
+            f"efsdp={parallel_dims.dp_shard // cfg.ep_size} tol={TOL:.0e} "
             f"implementation={args.fsdp_implementation} pattern={args.pattern_fsdp}"
+            f" dispatcher={cfg.ep_config.ep_token_dispatcher}"
         )
         print(f"loss: ep+fsdp={got_loss:.6f} ref={ref_loss:.6f}")
         print(f"failed ranks = {int(local_ok.item())}")

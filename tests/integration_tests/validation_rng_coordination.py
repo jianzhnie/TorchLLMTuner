@@ -6,7 +6,6 @@ RNG calls are faulted only during capture or after the real loader closes.
 
 import pickle
 import random
-from datetime import timedelta
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -17,6 +16,7 @@ import torch.distributed as dist
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.trainer.cli import parse_config
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.harness import init_distributed
 
 
 def check_failure(failing_rank, error_type, phase):
@@ -125,7 +125,7 @@ def check_failure(failing_rank, error_type, phase):
 
 
 def main():
-    dist.init_process_group("gloo", timeout=timedelta(seconds=10))
+    init_distributed()
     try:
         assert dist.get_world_size() == 2
         for rank in (0, 1):

@@ -190,7 +190,7 @@ def should_validate(self: Trainer, step: int) -> bool:
 
 @torch.no_grad()
 def validate(self: Trainer, step: int) -> None:
-    """Evaluate without gradients, restoring model modes and mask policy.
+    """Evaluate without gradients, restoring modes, gradients and mask policy.
 
     Report summed next-token cross-entropy divided by the global valid-token
     count, using the same DP token and loss-mesh reductions as training. Only
@@ -219,6 +219,11 @@ def validate(self: Trainer, step: int) -> None:
         module: module.training
         for part in self.model_parts
         for module in part.modules()
+    }
+    parameter_gradients = {
+        parameter: parameter.grad
+        for part in self.model_parts
+        for parameter in part.parameters()
     }
     mask_configs = {
         id(config): config
@@ -266,6 +271,8 @@ def validate(self: Trainer, step: int) -> None:
                     part.eval()
             run_validation_loop(self, validation, step)
         finally:
+            for parameter, gradient in parameter_gradients.items():
+                parameter.grad = gradient
             for kernel, packed in kernel_modes.items():
                 kernel.packed = packed
             for key, config in mask_configs.items():

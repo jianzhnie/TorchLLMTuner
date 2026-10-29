@@ -110,6 +110,96 @@ def test_meta_materialization_leaves_persistent_buffers_for_checkpoint() -> None
     torch.testing.assert_close(restored.weight, reference.weight)
 
 
+def test_meta_materialization_separates_parameter_and_buffer_devices() -> None:
+    with torch.device("meta"):
+        model = torch.nn.Linear(3, 2)
+        model.register_buffer("calibration", torch.empty(2))
+    model.register_parameter("weight_alias", model.weight)
+    model.register_buffer("calibration_alias", model.calibration)
+    model.register_buffer("runtime_scale", torch.ones(2), persistent=False)
+    model.register_buffer("scale_alias", model.runtime_scale, persistent=False)
+
+    # Meta stands in for a distinct buffer device; this checks allocation and
+    # aliases only, without claiming accelerator execution or buffer values.
+    materialize_meta_model(
+        model, torch.device("meta"), parameter_device=torch.device("cpu")
+    )
+
+    assert model.weight.device.type == "cpu"
+    assert model.bias.device.type == "cpu"
+    assert model.weight_alias is model.weight
+    assert model.calibration.device.type == "meta"
+    assert model.calibration_alias is model.calibration
+    assert model.runtime_scale.device.type == "meta"
+    assert model.scale_alias is model.runtime_scale
+
+
+@pytest.mark.parametrize("offload_weight", [False, True])
+def test_meta_materialization_moves_only_non_offloaded_parameters(
+    monkeypatch, offload_weight
+) -> None:
+    with torch.device("meta"):
+        model = torch.nn.Linear(3, 2)
+        model.register_buffer("calibration", torch.empty(5))
+    model.register_parameter("weight_alias", model.weight)
+    model.register_buffer("calibration_alias", model.calibration)
+    model.register_buffer("runtime_scale", torch.ones(4), persistent=False)
+    model.register_buffer("scale_alias", model.runtime_scale, persistent=False)
+    weight, bias = model.weight, model.bias
+    original_to = torch.Tensor.to
+    moves = []
+
+    def tracked_to(tensor, *args, **kwargs):
+        moves.append(tuple(tensor.shape))
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", tracked_to)
+    materialize_meta_model(
+        model,
+        torch.device("cpu"),
+        parameter_device=torch.device("cpu", 0),
+        offloaded_parameters={model.weight} if offload_weight else set(),
+    )
+
+    parameter_shapes = {(2, 3), (2,)}
+    moved_parameter_shapes = {shape for shape in moves if shape in parameter_shapes}
+    assert moved_parameter_shapes == ({(2,)} if offload_weight else parameter_shapes)
+    assert model.weight is weight and model.weight_alias is weight
+    assert model.bias is bias
+    assert model.calibration.device.type == "cpu"
+    assert model.calibration_alias is model.calibration
+    torch.testing.assert_close(model.runtime_scale, torch.ones(4))
+    assert model.scale_alias is model.runtime_scale
+
+
+@pytest.mark.parametrize("offloaded", [False, True])
+def test_meta_materialization_preserves_dtensor_layout(offloaded) -> None:
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    mesh = DeviceMesh("cpu", [0], mesh_dim_names=("dp",), _init_backend=False, _rank=0)
+    model = torch.nn.Module()
+    local = torch.empty((2, 3), device="meta")
+    model.register_parameter(
+        "weight", torch.nn.Parameter(DTensor.from_local(local, mesh, [Shard(0)]))
+    )
+    model.register_parameter("weight_alias", model.weight)
+    weight = model.weight
+
+    materialize_meta_model(
+        model,
+        torch.device("meta" if offloaded else "cpu"),
+        parameter_device=torch.device("cpu", 0),
+        offloaded_parameters={model.weight} if offloaded else set(),
+    )
+
+    assert model.weight is weight and model.weight_alias is weight
+    assert model.weight.device.type == "cpu"
+    assert model.weight.to_local().device.type == "cpu"
+    assert model.weight.device_mesh == mesh
+    assert model.weight.placements == (Shard(0),)
+
+
 def test_meta_materialization_preserves_real_nonpersistent_buffers() -> None:
     with torch.device("meta"):
         model = torch.nn.Linear(3, 2)
@@ -148,6 +238,20 @@ def test_meta_materialization_restores_alias_of_reconstructed_rope_buffer(
     if external_alias:
         assert model.external_alias is rotary.inv_freq
     torch.testing.assert_close(rotary.inv_freq, torch.arange(4))
+
+
+def test_meta_materialization_rebuilds_aux_loss_accumulator() -> None:
+    from llmtuner.models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
+
+    with torch.device("meta"):
+        model = torch.nn.Module()
+        model.loss = MicrobatchWiseLoadBalanceLoss(coeff=0.02)
+    materialize_meta_model(model, torch.device("cpu"))
+    assert model.loss.instance_acc.device.type == "cpu"
+    assert model.loss.instance_acc.dtype == torch.float32
+    assert model.loss.instance_acc.shape == ()
+    assert model.loss.instance_acc.item() == 0
+    assert "loss.instance_acc" not in model.state_dict()
 
 
 def test_unknown_meta_buffer_is_rejected_before_materialization() -> None:
@@ -321,6 +425,88 @@ def test_flex_backend_passes_an_explicit_mask_through(
     kwargs = model._apply_attention(torch.arange(16), sentinel)
 
     assert kwargs["attention_mask"] is sentinel
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("strategy", ["ulysses", "dual", "kv_allgather"])
+def test_packed_cp_preserves_global_document_mask(model, monkeypatch, dtype, strategy):
+    from llmtuner.models.hf.attention_backend import CP_SDPA_BACKEND
+
+    model.model.config._attn_implementation = CP_SDPA_BACKEND
+    dual = strategy == "dual"
+    model.model.config._cp_sdpa_ulysses = strategy == "ulysses"
+    model.model.config._cp_sdpa_dual = dual
+    model.model.config.attn_mask_type = "block_causal"
+    model._cp_strategy = "kv_allgather" if dual else strategy
+    model.to(dtype)
+    positions = torch.tensor([0, 1, 2, 0, 1, 2, 3, 4])
+
+    def reject_sparse_mask(*args, **kwargs):
+        pytest.fail("dense Ulysses must not construct or shard a sparse mask")
+
+    def shard(inputs, labels, positions, mesh, **kwargs):
+        return inputs[:4], labels[:4], positions[:4]
+
+    monkeypatch.setattr(model, "get_attention_masks", reject_sparse_mask)
+    monkeypatch.setattr(
+        "llmtuner.models.hf.model.shard_attention_mask_for_cp", reject_sparse_mask
+    )
+    monkeypatch.setattr("llmtuner.models.hf.model.shard_batch_for_cp", shard)
+    _, _, local_positions, _, mask = model._shard_for_cp(
+        object(),
+        packed=True,
+        inputs=torch.arange(8),
+        labels=torch.arange(8),
+        positions=positions,
+        padding_mask=None,
+    )
+    assert mask.shape == (1, 1, 8, 8)
+    if strategy != "ulysses":
+        assert mask.dtype == torch.bool
+        assert not mask[0, 0, 3, 2]
+        assert mask[0, 0, 4, 3]
+        assert not mask[0, 0, 3, 4]
+        with pytest.raises(ValueError, match="full preprocessed document mask"):
+            model._apply_attention(local_positions, None)
+    else:
+        assert mask.dtype == dtype
+        assert torch.isneginf(mask[0, 0, 3, 2])
+        assert mask[0, 0, 4, 3] == 0
+        assert torch.isneginf(mask[0, 0, 3, 4])
+    actual = model._apply_attention(local_positions, mask)["attention_mask"]
+    assert actual is mask
+
+
+def test_packed_flex_ulysses_preserves_sparse_mask(model, monkeypatch):
+    model.model.config._attn_implementation = ATTENTION_BACKEND
+    model._cp_strategy = "ulysses"
+    positions = torch.tensor([0, 1, 2, 0, 1, 2, 3, 4])
+    sentinel = object()
+
+    def sparse_mask(*, positions):
+        assert positions.shape == (8,)
+        return sentinel
+
+    def reject_dense_mask(*args, **kwargs):
+        pytest.fail("flex Ulysses must retain the full sparse mask")
+
+    def shard(inputs, labels, positions, mesh, **kwargs):
+        return inputs[:4], labels[:4], positions[:4]
+
+    monkeypatch.setattr(model, "get_attention_masks", sparse_mask)
+    monkeypatch.setattr(
+        "llmtuner.models.hf.model.build_dense_attention_mask", reject_dense_mask
+    )
+    monkeypatch.setattr("llmtuner.models.hf.model.shard_batch_for_cp", shard)
+    _, _, _, _, mask = model._shard_for_cp(
+        object(),
+        packed=True,
+        inputs=torch.arange(8),
+        labels=torch.arange(8),
+        positions=positions,
+        padding_mask=None,
+    )
+    assert mask is sentinel
 
 
 def test_non_flex_backend_gets_a_dense_document_mask(model: HFTransformerModel) -> None:

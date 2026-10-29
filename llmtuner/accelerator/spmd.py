@@ -14,7 +14,7 @@ here.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from threading import local
 from typing import Any
 
@@ -29,6 +29,7 @@ setattr(spmd.PartitionSpec, "__deepcopy__", lambda self, memo: self)  # noqa: B0
 
 __all__ = [
     "current_spmd_mesh",
+    "capture_spmd_context",
     "set_current_spmd_mesh",
     "set_spmd_meshes",
     "spmd_context",
@@ -44,7 +45,7 @@ _MESH_TLS = local()
 
 def set_spmd_meshes(
     *,
-    dense_mesh: DeviceMesh,
+    dense_mesh: DeviceMesh | None,
     sparse_mesh: DeviceMesh | None,
 ) -> None:
     """Register the SPMD meshes for dense and sparse runtime regions."""
@@ -62,6 +63,26 @@ def spmd_dense_mesh() -> DeviceMesh:
 def spmd_sparse_mesh() -> DeviceMesh | None:
     """Return the registered sparse SPMD mesh, if EP is enabled."""
     return getattr(_MESH_TLS, "sparse_mesh", None)
+
+
+def capture_spmd_context() -> Callable[[], contextlib.AbstractContextManager[None]]:
+    """Capture mesh state and return a reusable context factory for replay threads."""
+    dense_mesh = getattr(_MESH_TLS, "dense_mesh", None)
+    sparse_mesh = spmd_sparse_mesh()
+    current_mesh = current_spmd_mesh()
+
+    @contextlib.contextmanager
+    def restore() -> Iterator[None]:
+        previous_dense = getattr(_MESH_TLS, "dense_mesh", None)
+        previous_sparse = spmd_sparse_mesh()
+        set_spmd_meshes(dense_mesh=dense_mesh, sparse_mesh=sparse_mesh)
+        try:
+            with set_current_spmd_mesh(current_mesh):
+                yield
+        finally:
+            set_spmd_meshes(dense_mesh=previous_dense, sparse_mesh=previous_sparse)
+
+    return restore
 
 
 def spmd_mesh_stack() -> list[DeviceMesh | None]:

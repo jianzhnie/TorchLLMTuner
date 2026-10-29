@@ -150,6 +150,29 @@ def _check_sharded_loss(
             f"{_max_diff(per_token.detach().sum(), ref.detach()):.3e})",
         )
 
+    # A nonuniform upstream vector exposes broadcasting and token-mask errors
+    # that a summed loss (all-one upstream gradient) cannot detect.
+    upstream = moved(torch.linspace(-1.5, 2.0, T, dtype=torch.float32))
+    per_token.backward(upstream)
+    weighted_reference = logits.detach().clone().requires_grad_(True)
+    weighted_loss = F.cross_entropy(
+        weighted_reference, labels, reduction="none", ignore_index=IGNORE_INDEX
+    )
+    weighted_loss.backward(upstream)
+    expected_gradient = weighted_reference.grad[:, start:end]
+    if not _agree(local2.grad, expected_gradient):
+        _fail(
+            rank,
+            f"{name}: weighted per-token grad max diff "
+            f"{_max_diff(local2.grad, expected_gradient):.3e}",
+        )
+    assert torch.count_nonzero(local2.grad[labels == IGNORE_INDEX]).item() == 0
+    print(
+        f"rank {rank}: {name} weighted per-token grad max diff "
+        f"{_max_diff(local2.grad, expected_gradient):.3e}",
+        flush=True,
+    )
+
     # compute_logprobs returns -NLL on the sharded path.
     local3 = logits[:, start:end].detach().clone().requires_grad_(True)
     logprobs = compute_logprobs(local3, labels, tp_group=group, global_vocab_size=vocab)

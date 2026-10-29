@@ -2,15 +2,76 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
+from llmtuner.errors import UnsupportedCombinationError
+
+from ..common.aux_loss import AuxLoss
 from ..common.moe.layer import MoE
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 __all__ = ["materialize_meta_model"]
 
 
-def materialize_meta_model(model: nn.Module, device: torch.device) -> None:
+def validate_rotary_initialization(config: PretrainedConfig) -> None:
+    """Reject target-device initialization outside its implemented contract."""
+    policy = getattr(config, "rotary_init_device", "constructor")
+    if policy not in ("constructor", "target"):
+        raise ValueError("model.rotary_init_device must be 'constructor' or 'target'")
+    if policy == "constructor":
+        return
+    if config.model_type != "qwen3" or config.rope_parameters["rope_type"] != "default":
+        raise UnsupportedCombinationError(
+            "model.rotary_init_device='target' requires dense Qwen3 default RoPE"
+        )
+
+
+def initialize_rotary_on_device(model: nn.Module, device: torch.device) -> None:
+    """Rebuild opted-in Qwen3 runtime frequencies before training starts."""
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+
+    replacements: dict[int, torch.Tensor] = {}
+    updates = []
+    for module in model.modules():
+        config = getattr(module, "config", None)
+        if config is None or getattr(config, "rotary_init_device", "constructor") != (
+            "target"
+        ):
+            continue
+        validate_rotary_initialization(config)
+        if not isinstance(module, Qwen3RotaryEmbedding):
+            continue
+        if type(module) is not Qwen3RotaryEmbedding:
+            raise UnsupportedCombinationError(
+                "target RoPE initialization requires native Qwen3RotaryEmbedding"
+            )
+        fresh = Qwen3RotaryEmbedding(config, device=device)
+        for name in ("inv_freq", "original_inv_freq"):
+            replacements[id(getattr(module, name))] = getattr(fresh, name)
+        updates.append((module, fresh))
+    for module in model.modules():
+        for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False):
+            replacement = replacements.get(id(buffer))
+            if replacement is not None:
+                setattr(module, name, replacement)
+    for module, fresh in updates:
+        module.attention_scaling = fresh.attention_scaling
+        module.max_seq_len_cached = fresh.max_seq_len_cached
+        module.original_max_seq_len = fresh.original_max_seq_len
+
+
+def materialize_meta_model(
+    model: nn.Module,
+    device: torch.device,
+    *,
+    parameter_device: torch.device | None = None,
+    offloaded_parameters: set[nn.Parameter] | None = None,
+) -> None:
     """Materialize an already-parallelized HF model without a full copy.
 
     FSDP turns meta parameters into sharded meta ``DTensor`` objects; calling
@@ -24,12 +85,14 @@ def materialize_meta_model(model: nn.Module, device: torch.device) -> None:
     # leaving meta. Record aliases before allocation so tied parameters and
     # buffers remain one object when optimizers capture them afterwards.
     tensor_paths: dict[int, list[tuple[nn.Module, str]]] = {}
+    parameters: dict[tuple[nn.Module, str], nn.Parameter] = {}
     meta_buffers: list[tuple[nn.Module, str]] = []
     restored_buffers: dict[tuple[nn.Module, str], torch.Tensor] = {}
     for module in model.modules():
         for name, parameter in module.named_parameters(
             recurse=False, remove_duplicate=False
         ):
+            parameters[module, name] = parameter
             tensor_paths.setdefault(id(parameter), []).append((module, name))
         for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False):
             tensor_paths.setdefault(id(buffer), []).append((module, name))
@@ -42,6 +105,10 @@ def materialize_meta_model(model: nn.Module, device: torch.device) -> None:
 
     rope_modules = {module for module, name in meta_buffers if name == "inv_freq"}
     for module, name in meta_buffers:
+        if isinstance(module, AuxLoss) and name == "instance_acc":
+            restored_buffers[module, name] = torch.zeros(
+                (), dtype=torch.float32, device=device
+            )
         if isinstance(module, MoE) and name == "tokens_per_expert_E":
             # Per-step routing statistics start empty and are intentionally
             # excluded from HF weights and native checkpoint state.
@@ -79,7 +146,24 @@ def materialize_meta_model(model: nn.Module, device: torch.device) -> None:
         )
     # Persistent meta buffers are populated by the checkpoint load. Unknown
     # non-persistent buffers have now failed before model storage is changed.
-    model.to_empty(device=device)
+    model.to_empty(device=parameter_device or device)
+    for (module, name), parameter in parameters.items():
+        allocated = getattr(module, name)
+        if allocated is not parameter:
+            torch.utils.swap_tensors(parameter, allocated)
+            setattr(module, name, parameter)
+    # Offloaded parameters stay on CPU; buffers execute with the model.
+    if parameter_device is not None and parameter_device != device:
+        if offloaded_parameters is not None:
+            for parameter in model.parameters():
+                if parameter not in offloaded_parameters:
+                    parameter.data = parameter.data.to(device)
+        for module in model.modules():
+            for name, buffer in module.named_buffers(
+                recurse=False, remove_duplicate=False
+            ):
+                if (module, name) not in restored_buffers:
+                    setattr(module, name, buffer.to(device))
     for (module, name), value in restored_buffers.items():
         setattr(module, name, value)
     for paths in tensor_paths.values():
@@ -88,3 +172,4 @@ def materialize_meta_model(model: nn.Module, device: torch.device) -> None:
             tensor = getattr(owner, name)
             for alias_owner, alias_name in paths[1:]:
                 setattr(alias_owner, alias_name, tensor)
+    initialize_rotary_on_device(model, device)

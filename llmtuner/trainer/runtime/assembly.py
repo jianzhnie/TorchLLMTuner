@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ...accelerator.capabilities import has as capability
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.device import (
     device_type,
@@ -56,7 +55,10 @@ from ...models.hf.factory import (
     unwrap_text_config,
 )
 from ...models.hf.flops import flops_per_token
-from ...models.hf.materialization import materialize_meta_model
+from ...models.hf.materialization import (
+    initialize_rotary_on_device,
+    materialize_meta_model,
+)
 from ...models.hf.model import HFTransformerModel
 from ...models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 from ...parallel import compatibility
@@ -97,9 +99,18 @@ def _build_model(
         trainer._chunked_loss_num_chunks > 1
         and trainer.parallel_dims is not None
         and trainer.parallel_dims.dp_shard_enabled
-        and not capability("fsdp_unshard_context")
     ):
-        compatibility.chunked_loss_fsdp(trainer._chunked_loss_num_chunks)
+        compatibility.chunked_loss_fsdp(
+            trainer._chunked_loss_num_chunks,
+            fsdp_config=cfg.parallel.fsdp_config,
+            hybrid_parallel=(
+                trainer.parallel_dims.tp_enabled
+                or trainer.parallel_dims.cp_enabled
+                or trainer.parallel_dims.ep_enabled
+                or trainer.parallel_dims.pp_enabled
+            ),
+            compile=cfg.training.compile,
+        )
     hf_model_config = build_model_config_for(cfg)
     # Programmatic Trainer callers need the same resolved geometry as the CLI.
     # In particular, synthetic token generation must use the real vocabulary,
@@ -118,6 +129,11 @@ def _build_model(
         and trainer.parallel_dims is not None
         and trainer.parallel_dims.ep_enabled
         and getattr(text_config, "model_type", None) != "kimi_linear"
+        and not (
+            getattr(text_config, "model_type", None) == "qwen3_moe"
+            and cfg.checkpoint.sharded_expert_parallel
+            and (cfg.parallel.tp_size == 1 or cfg.checkpoint.sharded_tensor_parallel)
+        )
     ):
         compatibility.ep_hf_initial_load(trainer.parallel_dims.ep)
     if load_hf_weights:
@@ -125,7 +141,20 @@ def _build_model(
             model = HFTransformerModel(hf_model_config)
     else:
         model = HFTransformerModel(hf_model_config).to(trainer.device)
+        initialize_rotary_on_device(model, trainer.device)
     return model, hf_model_config, load_hf_weights
+
+
+def _fsdp_managed_parameters(model: torch.nn.Module) -> set[torch.nn.Parameter]:
+    from torch.distributed.fsdp import FSDPModule
+
+    return {
+        fsdp_param.sharded_param
+        for module in model.modules()
+        if isinstance(module, FSDPModule)
+        for group in module._get_fsdp_state()._fsdp_param_groups
+        for fsdp_param in group.fsdp_params
+    }
 
 
 def _apply_parallelism(
@@ -146,6 +175,7 @@ def _apply_parallelism(
         memory_budget_ac=cfg.training.memory_budget_ac,
         region_ac=cfg.training.region_ac,
         global_batch_size=cfg.training.global_batch_size,
+        chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
     )
     if isinstance(orchestration, PipelineParallelSetup):
         # pp > 1: no single model survives the split -- this rank holds its
@@ -180,7 +210,15 @@ def _apply_parallelism(
         materialization_error: BaseException | None = None
         try:
             for model_part in trainer.model_parts:
-                materialize_meta_model(model_part, trainer.device)
+                if cfg.parallel.fsdp_config.fsdp_cpu_offload:
+                    materialize_meta_model(
+                        model_part,
+                        trainer.device,
+                        parameter_device=torch.device("cpu"),
+                        offloaded_parameters=_fsdp_managed_parameters(model_part),
+                    )
+                else:
+                    materialize_meta_model(model_part, trainer.device)
         except BaseException as error:
             materialization_error = error
         # FSDP _apply may manage communication state. Finish materialization
@@ -195,6 +233,8 @@ def _build_optimizer_stack(trainer: Trainer) -> None:
     cfg = trainer.cfg
     trainer.optimizer = OptimizersContainer(
         cfg.optimizer,
+        sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
+        sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
         model_parts=trainer.model_parts,
         initialization_group=get_default_group() if is_distributed() else None,
         pipeline_mesh=(
@@ -218,6 +258,8 @@ def _build_optimizer_stack(trainer: Trainer) -> None:
         trainer.ema = (
             EMA(
                 model_parts=trainer.model_parts,
+                sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
+                sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
                 decay=ema_config.decay,
                 half_life_fraction=ema_config.half_life_fraction,
                 start_step=ema_config.start_step,
@@ -266,6 +308,11 @@ def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> 
         sd_adapter = HFTransformerStateDictAdapter(
             hf_model_config,
             cfg.checkpoint.initial_load_path or cfg.hf_model,
+            qwen3_expert_parallel=(
+                getattr(hf_model_config, "model_type", None) == "qwen3_moe"
+                and cfg.parallel.ep_size > 1
+                and cfg.checkpoint.sharded_expert_parallel
+            ),
             kimi_expert_parallel=(
                 getattr(hf_model_config, "model_type", None) == "kimi_linear"
                 and cfg.parallel.ep_size > 1
@@ -294,6 +341,8 @@ def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> 
 
 def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
     trainer.cfg = cfg
+    if cfg.deterministic:
+        seeding.set_deterministic_algorithms()
     if not is_distributed() and "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         init_dist_pytorch(get_distributed_backend())
     trainer.rank, trainer.world_size, trainer.local_rank = get_env_dist_info()

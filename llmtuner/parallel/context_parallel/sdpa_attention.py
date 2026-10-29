@@ -29,6 +29,9 @@ derivable: ``kv_allgather`` rebuilds the causal mask from the CP offsets (its
 forward cost is a single gather), while ``ulysses`` attends the full sequence
 after the head swap, so the plain causal mask -- or the wrapper's full-length
 document mask for a packed corpus -- applies unsharded.
+
+The dual-axis kernel exchanges Ulysses heads before gathering KV, and slices a
+full document mask at the KV-axis query offset.
 """
 
 from __future__ import annotations
@@ -41,7 +44,12 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from .attention import HeadToSeq, SeqToHead
 
-__all__ = ["CPSdpaKernel", "CPSdpaUlyssesKernel", "causal_mask_for_local_queries"]
+__all__ = [
+    "CPSdpaKernel",
+    "CPSdpaUlyssesKernel",
+    "DualCPSdpaKernel",
+    "causal_mask_for_local_queries",
+]
 
 # q/k/v arrive HF-shaped: (batch, heads, seq, dim); the CP input sharding split
 # the sequence axis, dim 2 of this layout.
@@ -114,6 +122,73 @@ def full_length_causal_mask(length: int, device: torch.device) -> torch.Tensor:
     return (cols <= rows).view(1, 1, length, length)
 
 
+def _validate_attention_modifiers(kwargs: dict) -> int | None:
+    if kwargs.get("dropout", 0.0) != 0.0:
+        raise NotImplementedError("SDPA CP does not support attention dropout")
+    unsupported = [
+        name for name in ("softcap", "s_aux") if kwargs.get(name) is not None
+    ]
+    if unsupported:
+        raise NotImplementedError(
+            f"SDPA CP does not support attention modifiers: {unsupported}"
+        )
+    window = kwargs.get("sliding_window")
+    if window is not None and (
+        isinstance(window, bool) or not isinstance(window, int) or window < 1
+    ):
+        raise ValueError(
+            f"SDPA CP sliding_window must be a positive integer or None, got {window!r}"
+        )
+    return window
+
+
+def _prepare_block_mask(
+    block_mask,
+    *,
+    packed: bool,
+    local_len: int,
+    full_len: int,
+    query_offset: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if block_mask is None:
+        if packed:
+            raise ValueError(
+                "SDPA CP received no document mask for a packed corpus; "
+                "a full document mask is required"
+            )
+        return None
+    if (
+        not isinstance(block_mask, torch.Tensor)
+        or block_mask.dtype != torch.bool
+        or block_mask.dim() != 4
+    ):
+        raise ValueError("SDPA CP requires a four-dimensional boolean mask")
+    if block_mask.shape[-2:] != (full_len, full_len):
+        raise ValueError("SDPA CP document mask must span the full sequence")
+    if block_mask.device != device:
+        raise ValueError("SDPA CP document mask must be on the query device")
+    if query_offset == 0 and local_len == full_len:
+        return block_mask
+    return block_mask[..., query_offset : query_offset + local_len, :]
+
+
+def _apply_sliding_window(
+    mask: torch.Tensor,
+    *,
+    query_offset: int,
+    window: int | None,
+    device: torch.device,
+) -> torch.Tensor:
+    if window is None:
+        return mask
+    local_len, full_len = mask.shape[-2:]
+    rows = torch.arange(local_len, device=device).unsqueeze(1) + query_offset
+    cols = torch.arange(full_len, device=device).unsqueeze(0)
+    sliding = (cols <= rows) & (rows - cols < window)
+    return mask & sliding.view(1, 1, local_len, full_len)
+
+
 class CPSdpaKernel(nn.Module):
     """Redistribute q/k/v for CP, attend with sdpa, hand the shard back.
 
@@ -125,13 +200,7 @@ class CPSdpaKernel(nn.Module):
 
     def __init__(self, *, cp_mesh: DeviceMesh, packed: bool = False) -> None:
         super().__init__()
-        if packed:
-            raise NotImplementedError(
-                "The sdpa CP kernel does not express a packed corpus's document "
-                "mask: sdpa takes a dense boolean mask and the document "
-                "structure would have to be materialized as one. Run packing "
-                "with the flex backend (CUDA), or cp=1."
-            )
+        self.packed = packed
         self.cp_size = cp_mesh.size()
         self.cp_rank = cp_mesh.get_local_rank()
         self._cp_group = cp_mesh.get_group()
@@ -164,10 +233,26 @@ class CPSdpaKernel(nn.Module):
 
     def forward(self, query, key, value, *, module=None, block_mask=None, **kwargs):
         """Gather K/V, attend the local queries against them, return the shard."""
+        window = _validate_attention_modifiers(kwargs)
+        local_len = query.shape[_SEQ_DIM]
+        full_len = key.shape[_SEQ_DIM] * self.cp_size
+        query_offset = self.cp_rank * local_len
+        mask = _prepare_block_mask(
+            block_mask,
+            packed=self.packed,
+            local_len=local_len,
+            full_len=full_len,
+            query_offset=query_offset,
+            device=query.device,
+        )
+        if mask is None:
+            mask = self._mask(local_len, full_len, query.device)
+        mask = _apply_sliding_window(
+            mask, query_offset=query_offset, window=window, device=query.device
+        )
         ranks = self._ranks()
         key = _GatherSequence.apply(key, self._cp_group, ranks)
         value = _GatherSequence.apply(value, self._cp_group, ranks)
-        mask = self._mask(query.shape[_SEQ_DIM], key.shape[_SEQ_DIM], query.device)
         out = F.scaled_dot_product_attention(
             query,
             key,
@@ -179,6 +264,59 @@ class CPSdpaKernel(nn.Module):
         )
         # HF's interface contract is (batch, seq, heads, dim).
         return out.transpose(1, 2)
+
+
+class DualCPSdpaKernel(CPSdpaKernel):
+    """Exchange heads within Ulysses, then gather KV across contiguous KV blocks."""
+
+    def __init__(
+        self,
+        *,
+        kv_mesh: DeviceMesh,
+        ulysses_mesh: DeviceMesh,
+        packed: bool = False,
+    ) -> None:
+        super().__init__(cp_mesh=kv_mesh)
+        self.packed = packed
+        self._ulysses_size = ulysses_mesh.size()
+        self._ulysses_group = ulysses_mesh.get_group()
+
+    def forward(self, query, key, value, *, module=None, block_mask=None, **kwargs):
+        window = _validate_attention_modifiers(kwargs)
+        local_len = query.shape[_SEQ_DIM] * self._ulysses_size
+        full_len = key.shape[_SEQ_DIM] * self._ulysses_size * self.cp_size
+        query_offset = self.cp_rank * local_len
+        mask = _prepare_block_mask(
+            block_mask,
+            packed=self.packed,
+            local_len=local_len,
+            full_len=full_len,
+            query_offset=query_offset,
+            device=query.device,
+        )
+        if mask is None:
+            mask = self._mask(local_len, full_len, query.device)
+        mask = _apply_sliding_window(
+            mask, query_offset=query_offset, window=window, device=query.device
+        )
+
+        query = SeqToHead.apply(query.contiguous(), self._ulysses_group)
+        key = SeqToHead.apply(key.contiguous(), self._ulysses_group)
+        value = SeqToHead.apply(value.contiguous(), self._ulysses_group)
+        ranks = self._ranks()
+        key = _GatherSequence.apply(key, self._cp_group, ranks)
+        value = _GatherSequence.apply(value, self._cp_group, ranks)
+        output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=mask,
+            dropout_p=0.0,
+            scale=kwargs.get("scaling"),
+            enable_gqa=query.shape[1] != key.shape[1],
+        )
+        output = HeadToSeq.apply(output.contiguous(), self._ulysses_group)
+        return output.transpose(1, 2)
 
 
 class CPSdpaUlyssesKernel(nn.Module):
@@ -194,9 +332,8 @@ class CPSdpaUlyssesKernel(nn.Module):
     same exchange the flex kernel drives, with the same backward. Only the final
     attention call differs, which is what makes this expressible without flex.
 
-    Refusals that stay in ``apply_cp``: a load balancer (the rearrangement lands
-    in the mask's query order, which a length-derived mask cannot express) and
-    the dual-axis form (its mask is not written for sdpa).
+    A load balancer remains refused in ``apply_cp`` because its rearrangement
+    changes query order. Dual-axis redistribution uses ``DualCPSdpaKernel``.
     """
 
     def __init__(self, *, cp_mesh: DeviceMesh, packed: bool = False) -> None:
@@ -217,23 +354,25 @@ class CPSdpaUlyssesKernel(nn.Module):
 
     def forward(self, query, key, value, *, module=None, block_mask=None, **kwargs):
         """Swap to heads, attend the full sequence, swap back to this rank's shard."""
+        window = _validate_attention_modifiers(kwargs)
+        length = query.shape[_SEQ_DIM] * self.cp_size
+        mask = _prepare_block_mask(
+            block_mask,
+            packed=self.packed,
+            local_len=length,
+            full_len=length,
+            query_offset=0,
+            device=query.device,
+        )
+        if mask is None:
+            mask = self._causal(length, query.device)
+        mask = _apply_sliding_window(
+            mask, query_offset=0, window=window, device=query.device
+        )
+
         q = SeqToHead.apply(query.contiguous(), self._cp_group)
         k = SeqToHead.apply(key.contiguous(), self._cp_group)
         v = SeqToHead.apply(value.contiguous(), self._cp_group)
-
-        length = q.shape[_SEQ_DIM]
-        if block_mask is not None and block_mask.dim() == 4:
-            # A packed corpus's document mask, built full-length by the wrapper:
-            # it already carries causality and the document split.
-            mask = block_mask
-        else:
-            if self.packed:
-                raise ValueError(
-                    "ulysses CP received no document mask for a packed corpus: "
-                    "the document structure cannot be recovered from a length "
-                    "alone. The wrapper builds it full-length for this kernel."
-                )
-            mask = self._causal(length, q.device)
 
         out = F.scaled_dot_product_attention(
             q,

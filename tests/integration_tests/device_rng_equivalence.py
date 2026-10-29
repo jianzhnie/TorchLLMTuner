@@ -12,6 +12,7 @@ explicit device argument. CUDA uses LOCAL_RANK and independent rank seeds.
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import pickle
 import random
@@ -78,21 +79,26 @@ def check_invalid_state(checkpoint, saved, device: torch.device) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "device", choices=("cpu", "mps", "cuda"), default="cpu", nargs="?"
+        "device", choices=("cpu", "mps", "cuda", "npu"), default="cpu", nargs="?"
     )
     args = parser.parse_args()
     if args.device == "mps" and not torch.backends.mps.is_available():
         parser.error("MPS is unavailable")
-    if args.device == "cuda":
-        if not torch.cuda.is_available():
-            parser.error("CUDA is unavailable")
-        device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
-        torch.cuda.set_device(device)
+    if args.device in ("cuda", "npu"):
+        if args.device == "npu":
+            importlib.import_module("torch_npu")
+
+        module = torch.get_device_module(args.device)
+        if not module.is_available():
+            parser.error(f"{args.device} is unavailable")
+        device = torch.device(args.device, int(os.environ.get("LOCAL_RANK", "0")))
+        module.set_device(device)
     else:
         device = torch.device(args.device)
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if distributed:
-        dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
+        backend = {"cuda": "nccl", "npu": "hccl"}.get(device.type, "gloo")
+        dist.init_process_group(backend)
     try:
         check_device_rng(device)
         print(f"PASS {device}: exact RNG continuation and rejected-state isolation")

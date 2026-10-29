@@ -26,7 +26,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from llmtuner.config.parallel_config import FSDPConfig
 
 from llmtuner.errors import (
     ConfigError,
@@ -60,6 +63,21 @@ class CompatibilityRule:
 
 
 # == assembly phase: verdicts called from the guard sites =================
+
+
+def fused_qkv_tp() -> None:
+    """The HF fused projection must not bypass independent TP projection collectives."""
+    raise UnsupportedCombinationError(
+        "model.qkv_projection='fused' does not yet support tensor parallelism; "
+        "use separate projections until fused collective boundaries are adapted."
+    )
+
+
+def eager_flex_parallel(family: str) -> None:
+    """Eager Flex must not silently replace TP/CP mask and collective boundaries."""
+    raise UnsupportedCombinationError(
+        f"eager Flex {family} mask/collective boundaries are not adapted; use auto"
+    )
 
 
 def validation_once_requires_dp1(dp_world_size: int) -> None:
@@ -116,30 +134,41 @@ def chunked_loss_validation(chunks: int) -> None:
     )
 
 
-def chunked_loss_fsdp(chunks: int) -> None:
-    """Several chunk backwards do not survive an FSDP2-sharded ``lm_head`` here.
+def chunked_loss_fsdp(
+    chunks: int,
+    *,
+    fsdp_config: FSDPConfig | None = None,
+    hybrid_parallel: bool = False,
+    compile: bool = False,
+) -> None:
+    """Reject chunked training without a validated FSDP head lifecycle.
 
-    Each chunk runs the head, backwards it, and then one final backward
-    propagates the assembled hidden-state gradients through the decoder. That
-    works for one chunk; from two on, the second chunk's head use runs against
-    parameter storage FSDP has already released, and the failure surfaces as
-    "The tensor has a non-zero number of elements, but its data is not allocated
-    yet" on NPU and as a hard SIGSEGV under gloo. Disabling reshard-after-forward
-    does not change it, so the release is not that hook.
-
-    Keeping the head unsharded across the loop is the fix this repository would
-    want, and its API does not exist here: torch 2.9's ``FSDPModule.unshard()``
-    returns an ``UnshardHandle`` with only ``wait()``, no context-manager form to
-    hold the unshard open around the loop.
+    The decoder and the external chunk loop may share one FSDP unit through
+    final normalization or tied embedding/head parameters. Repeated backwards
+    must preserve storage, parameter identity and all gradient contributions.
+    An unshard API alone does not establish those correctness guarantees.
     """
+    if (
+        fsdp_config is not None
+        and fsdp_config.fsdp_implementation == "native"
+        and not fsdp_config.fsdp_apply_modules
+        and not fsdp_config.fsdp_ignored_modules
+        and not fsdp_config.fsdp_cpu_offload
+        and not hybrid_parallel
+        and not compile
+    ):
+        return
     raise UnsupportedCombinationError(
         f"chunked_loss_num_chunks={chunks} with FSDP is not supported: each "
-        "chunk backwards the sharded lm_head separately, and this torch's FSDP2 "
-        "releases the unsharded head storage after the first chunk's backward, "
-        "so the second chunk runs against unallocated memory (NPU: 'The tensor "
-        "has a non-zero number of elements, but its data is not allocated yet'; "
-        "gloo: SIGSEGV). Run with chunked_loss_num_chunks=1, or with a torch "
-        "whose FSDPModule.unshard() can be held open as a context manager."
+        "chunk backwards lm_head outside the decoder forward. Shared FSDP "
+        "units can expose sharded or released parameter storage, and retaining "
+        "storage alone does not guarantee correct tied embedding/head gradients. "
+        "Run with chunked_loss_num_chunks=1. Enabling this combination requires "
+        "native decoder FSDP with root-owned boundaries, no module patterns, "
+        "CPU offload, TP/CP/EP/PP or compilation. Other layouts require "
+        "a validated head ownership and forward/backward lifecycle, including "
+        "shared-parameter gradient reduction and checkpoint restore; an unshard "
+        "context-manager API alone is not sufficient."
     )
 
 
@@ -358,6 +387,18 @@ def shared_expert_tp_ep(block: object) -> None:
 
 
 ENTRIES: tuple[CompatibilityRule, ...] = (
+    CompatibilityRule(
+        eager_flex_parallel,
+        "assembly",
+        UnsupportedCombinationError,
+        "parallel/context_parallel/context_parallel.py::apply_cp",
+    ),
+    CompatibilityRule(
+        fused_qkv_tp,
+        "assembly",
+        UnsupportedCombinationError,
+        "parallel/tensor_parallel/tensor_parallel.py::apply_tp",
+    ),
     CompatibilityRule(
         validation_once_requires_dp1,
         "assembly",

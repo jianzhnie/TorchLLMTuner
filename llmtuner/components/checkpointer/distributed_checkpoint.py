@@ -467,9 +467,15 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             if async_mode != DistributedCheckpointAsyncMode.DISABLED:
                 raise ValueError("HF exports require synchronous checkpoint saving")
             save_hf_checkpoint(
-                self.sd_adapter.to_hf(state_dict),
+                getattr(self.sd_adapter, "to_hf_export", self.sd_adapter.to_hf)(
+                    state_dict
+                ),
                 checkpoint_id,
-                self.sd_adapter.fqn_to_index_mapping,
+                getattr(
+                    self.sd_adapter,
+                    "hf_export_fqn_to_index_mapping",
+                    self.sd_adapter.fqn_to_index_mapping,
+                ),
             )
             if enable_garbage_collection:
                 with synchronize_local_errors("Checkpoint garbage collection"):

@@ -1,11 +1,10 @@
-"""Two CPU ranks: EMA updates fixed local layouts without communication.
+"""Two ranks: EMA updates fixed local layouts without communication.
 
 Also verifies real DCP restore with one rank owning no tracked EMA tensors.
 Run with PYTHONPATH=. torchrun --nproc_per_node=2.
 """
 
 from copy import deepcopy
-from datetime import timedelta
 from pathlib import Path
 from tempfile import mkdtemp
 
@@ -23,10 +22,11 @@ from torch.distributed.tensor import (
 from torch.distributed.tensor.debug import CommDebugMode
 
 from llmtuner.components.optimizer.ema import EMA
+from tests.integration_tests.harness import device, init_distributed
 
 
 def check_layout(mesh, placement, size, *, buffer_only=False):
-    initial = torch.arange(size, dtype=torch.float32)
+    initial = torch.arange(size, dtype=torch.float32, device=device())
     if isinstance(placement, Partial):
         weight = DTensor.from_local(initial / 2, mesh, [placement], run_check=False)
     else:
@@ -34,7 +34,8 @@ def check_layout(mesh, placement, size, *, buffer_only=False):
     model = torch.nn.Module()
     if buffer_only:
         model.register_parameter(
-            "frozen", torch.nn.Parameter(torch.ones(1), requires_grad=False)
+            "frozen",
+            torch.nn.Parameter(torch.ones(1, device=device()), requires_grad=False),
         )
         model.register_buffer("weight", weight)
     else:
@@ -53,6 +54,12 @@ def check_layout(mesh, placement, size, *, buffer_only=False):
             dist.get_rank() + 1 if isinstance(placement, Partial) else 2
         )
     live = model.weight.full_tensor()
+    print(
+        f"rank={dist.get_rank()} size={size} buffer_only={buffer_only} "
+        f"live={model.weight.placements}/{tuple(model.weight.to_local().shape)} "
+        f"average={average.placements}/{tuple(average.to_local().shape)}",
+        flush=True,
+    )
     with CommDebugMode() as debug:
         ema.step(1)
     assert debug.get_total_counts() == 0
@@ -86,7 +93,9 @@ def check_layout(mesh, placement, size, *, buffer_only=False):
 
 
 def check_empty_rank_checkpoint(empty_rank):
-    model = torch.nn.Linear(2, 2).requires_grad_(dist.get_rank() != empty_rank)
+    model = (
+        torch.nn.Linear(2, 2).to(device()).requires_grad_(dist.get_rank() != empty_rank)
+    )
     error = None
     try:
         ema = EMA(model_parts=[model], decay=0.5)
@@ -123,10 +132,10 @@ def check_empty_rank_checkpoint(empty_rank):
 
 
 def main():
-    dist.init_process_group("gloo", timeout=timedelta(seconds=30))
+    selected_device = init_distributed()
     try:
         assert dist.get_world_size() == 2
-        mesh = init_device_mesh("cpu", (2,))
+        mesh = init_device_mesh(selected_device.type, (2,))
         for size in (1, 5, 8):
             for placement in (Shard(0), Replicate(), Partial()):
                 for buffer_only in (False, True):

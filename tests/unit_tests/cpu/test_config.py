@@ -393,6 +393,25 @@ def test_min_lr_factor_is_half_open_at_one() -> None:
 # -- CheckpointConfig --------------------------------------------------------
 
 
+def test_sharded_expert_checkpoint_requires_dcp():
+    assert CheckpointConfig(sharded_expert_parallel=True).sharded_expert_parallel
+    with pytest.raises(ConfigError, match="requires backend='dcp'"):
+        CheckpointConfig(backend="torch_checkpointing", sharded_expert_parallel=True)
+
+
+def test_joint_sharded_checkpoint_requires_dcp() -> None:
+    config = CheckpointConfig(
+        sharded_tensor_parallel=True, sharded_expert_parallel=True
+    )
+    assert config.sharded_tensor_parallel and config.sharded_expert_parallel
+    with pytest.raises(ConfigError, match="requires backend='dcp'"):
+        CheckpointConfig(
+            backend="torch_checkpointing",
+            sharded_tensor_parallel=True,
+            sharded_expert_parallel=True,
+        )
+
+
 def test_a_whitespace_folder_is_not_a_folder() -> None:
     with pytest.raises(ValueError, match="checkpoint.folder must not be empty"):
         CheckpointConfig(folder="   ")
@@ -634,6 +653,7 @@ def test_model_config_validates_architecture_numbers() -> None:
         {"num_attention_heads": 4, "num_key_value_heads": 8},
         {"compute_dtype": "float8"},
         {"experts_implementation": "bogus"},
+        {"qkv_projection": "bogus"},
     ):
         with pytest.raises(ConfigError, match="model"):
             ModelConfig(**overrides)

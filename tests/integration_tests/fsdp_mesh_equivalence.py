@@ -6,6 +6,8 @@ Run under torchrun with 2 ranks, one mode per invocation (from the repo root):
         tests/integration_tests/fsdp_mesh_equivalence.py ddp
     PYTHONPATH=. torchrun --nproc_per_node=2 \
         tests/integration_tests/fsdp_mesh_equivalence.py shard
+    PYTHONPATH=. torchrun --nproc_per_node=4 \
+        tests/integration_tests/fsdp_mesh_equivalence.py hsdp
 
 Append ``custom`` after the mode to exercise the fine-grained state engine
 with default module hooks. Relocated hooks/multiple contexts are not tested.
@@ -44,6 +46,7 @@ keep only its own batch's gradient).
 
 from __future__ import annotations
 
+import math
 import sys
 
 import torch
@@ -73,7 +76,7 @@ TOL = 1e-4
 # more than noise, otherwise the equivalence checks could pass vacuously.
 NONVACUITY = 1e-3
 
-MODES = ("ddp", "shard")
+MODES = ("ddp", "shard", "hsdp")
 
 
 class TinyTokenDecoder(nn.Module):
@@ -138,10 +141,13 @@ def main() -> None:
     device = init_distributed()
     rank = dist.get_rank()
     world = dist.get_world_size()
-    assert world == 2, f"this check assumes 2 ranks, got {world}"
+    expected_world = 4 if mode == "hsdp" else 2
+    assert world == expected_world, f"{mode} needs {expected_world} ranks, got {world}"
 
     if mode == "ddp":
         cfg = ParallelConfig(data_parallel_replicate_size=2)
+    elif mode == "hsdp":
+        cfg = ParallelConfig(data_parallel_replicate_size=2, data_parallel_shard_size=2)
     else:
         cfg = ParallelConfig(data_parallel_shard_size=2)
     cfg.fsdp_config.fsdp_implementation = implementation
@@ -175,7 +181,7 @@ def main() -> None:
     if not isinstance(model, FSDPModule):
         failures.append(f"apply_fsdp left the model unwrapped in {mode} mode")
 
-    if mode == "shard":
+    if mode in ("shard", "hsdp"):
         # Proof of actual sharding, not replication: the embedding weight is
         # a DTensor whose local shard is half the global rows.
         w = model.tok_embeddings.weight
@@ -197,7 +203,7 @@ def main() -> None:
             # The reduced (global) gradient must equal the reference's.
             for name, p in model.named_parameters():
                 grad_diff = (_full(p.grad) - ref_step0_grads[name]).abs().max().item()
-                if grad_diff > TOL:
+                if not math.isfinite(grad_diff) or grad_diff > TOL:
                     failures.append(f"step0 grad {name}: diff {grad_diff:.3e}")
         opt.step()
         # The trainer's loss reporting: sum over the dp loss mesh.
@@ -206,16 +212,17 @@ def main() -> None:
         losses.append(float(reduced))
 
     for step, (got, want) in enumerate(zip(losses, ref_losses, strict=True)):
-        if abs(got - want) > TOL:
+        if not (math.isfinite(got) and math.isfinite(want)) or abs(got - want) > TOL:
             failures.append(f"step{step} loss: got {got:.6f}, want {want:.6f}")
 
-    param_diff = max(
+    param_diffs = [
         (_full_param(p) - _full_param(rp)).abs().max().item()
         for (name, p), (_, rp) in zip(
             model.named_parameters(), ref.named_parameters(), strict=True
         )
-    )
-    if param_diff > TOL:
+    ]
+    param_diff = max(param_diffs)
+    if not all(math.isfinite(value) for value in param_diffs) or param_diff > TOL:
         failures.append(f"final params: max abs diff {param_diff:.3e}")
 
     # -- non-vacuity: without cross-rank reduction the replicas diverge -----
@@ -226,7 +233,10 @@ def main() -> None:
     local_gap = (probe - ref_step0_grads["layers.0.weight"]).abs().max()
     gaps = [torch.zeros_like(local_gap) for _ in range(world)]
     dist.all_gather(gaps, local_gap)
-    if min(g.item() for g in gaps) < NONVACUITY:
+    if (
+        not all(math.isfinite(g.item()) for g in gaps)
+        or min(g.item() for g in gaps) < NONVACUITY
+    ):
         failures.append(
             f"non-vacuity: local grad matches global ({[g.item() for g in gaps]})"
         )

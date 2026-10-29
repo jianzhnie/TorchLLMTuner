@@ -72,6 +72,7 @@ from .checkpoint_keys import (
     RNG_STATE,
     TRAIN_STATE,
 )
+from .checkpointing_metadata import adapt_npu_metadata_gather
 from .random_state import RNGCheckpointState
 
 logger = get_logger(__name__)
@@ -334,6 +335,7 @@ def temporary_backend_manager(config: Any) -> Iterator[Any]:
     """Own a short-lived backend without masking a failed checkpoint operation."""
     manager = config.build()
     try:
+        adapt_npu_metadata_gather(manager)
         yield manager
     except BaseException:
         try:
@@ -481,6 +483,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             self._prewarmed = False
 
             self._manager = self._manager_config.build()
+            adapt_npu_metadata_gather(self._manager)
 
         except BaseException as error:
             construction_error = error
@@ -883,7 +886,8 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         pre_finalize_callback: Callable[[str, Any], None] | None = None
         if self.last_save_in_hf:
             assert self.sd_adapter is not None
-            states = {MODEL: self.sd_adapter.to_hf(states[MODEL])}
+            convert = getattr(self.sd_adapter, "to_hf_export", self.sd_adapter.to_hf)
+            states = {MODEL: convert(states[MODEL])}
             # Ranks write safetensors shards into a nested directory; the
             # pre-finalize callback consolidates them up into checkpoint_id, so
             # the published checkpoint is HF-layout rather than sharded.
@@ -899,7 +903,11 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 resharder=model_spec.resharder,
                 required=model_spec.required,
             )
-            fqn_to_index_mapping = self.sd_adapter.fqn_to_index_mapping
+            fqn_to_index_mapping = getattr(
+                self.sd_adapter,
+                "hf_export_fqn_to_index_mapping",
+                self.sd_adapter.fqn_to_index_mapping,
+            )
             hf_storage_config = (
                 storage_config
                 or self._backend.LocalFileSystemStorageConfig(use_direct_io=False)

@@ -11,6 +11,37 @@ import pytest
 from llmtuner.parallel import compatibility
 
 
+def test_chunked_fsdp_accepts_native_decoder_ownership():
+    from llmtuner.config.parallel_config import FSDPConfig
+
+    compatibility.chunked_loss_fsdp(4, fsdp_config=FSDPConfig())
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"fsdp_implementation": "custom"},
+        {"fsdp_apply_modules": {"layers.*": {}}},
+        {"fsdp_cpu_offload": True},
+    ],
+)
+def test_chunked_fsdp_rejects_unvalidated_ownership(options):
+    from llmtuner.config.parallel_config import FSDPConfig
+    from llmtuner.errors import UnsupportedCombinationError
+
+    with pytest.raises(UnsupportedCombinationError, match="root-owned boundaries"):
+        compatibility.chunked_loss_fsdp(4, fsdp_config=FSDPConfig(**options))
+
+
+@pytest.mark.parametrize("option", ["hybrid_parallel", "compile"])
+def test_chunked_fsdp_rejects_unvalidated_execution(option):
+    from llmtuner.config.parallel_config import FSDPConfig
+    from llmtuner.errors import UnsupportedCombinationError
+
+    with pytest.raises(UnsupportedCombinationError, match="root-owned boundaries"):
+        compatibility.chunked_loss_fsdp(4, fsdp_config=FSDPConfig(), **{option: True})
+
+
 def test_every_row_has_a_verdict_reason_and_guard() -> None:
     for row in compatibility.ENTRIES:
         assert row.name == row.fn.__name__
@@ -78,6 +109,8 @@ def test_rows_reject_with_their_entry_type() -> None:
         pass
 
     cases = [
+        (compatibility.eager_flex_parallel, ("CP",), "mask/collective"),
+        (compatibility.fused_qkv_tp, (), "tensor parallelism"),
         (compatibility.validation_once_requires_dp1, (4,), "data-parallel"),
         (
             compatibility.validation_once_requires_finite_corpus,

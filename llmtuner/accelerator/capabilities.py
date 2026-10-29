@@ -111,12 +111,10 @@ def _pipelining_has_eval() -> bool:
 def _fsdp_unshard_is_a_context_manager() -> bool:
     """Whether an FSDP unshard can be held open across several backwards.
 
-    Chunked loss backwards the sharded ``lm_head`` once per chunk; keeping the
-    unshard alive for the whole loop is what makes that work. torch 2.9's
-    ``UnshardHandle`` only has ``wait()``, so the unshard cannot be held and the
-    second chunk runs against released storage. Probed on the handle class
-    rather than on a version number: the context-manager form is the capability,
-    whenever it arrives.
+    Probe API shape, not numerical correctness. A context manager alone does
+    not validate shared head ownership, repeated-backward gradient reduction,
+    or checkpoint restoration. torch 2.9's handle only has ``wait()``; inspect
+    the handle class rather than guessing from the torch version.
     """
     if not importable(
         "torch.distributed.fsdp._fully_shard._fully_shard", "_UnshardHandleImpl"
@@ -224,13 +222,13 @@ CAPABILITIES: dict[str, Capability] = {
     "fsdp_unshard_context": Capability(
         _fsdp_unshard_is_a_context_manager,
         what="an FSDP unshard that stays open for the duration of a ``with`` "
-        "block (``UnshardHandle.__enter__``), so several chunk backwards can "
-        "share one unsharded ``lm_head``",
+        "block (``UnshardHandle.__enter__``); this probes API shape, not "
+        "chunked-training correctness",
         since="no released torch through 2.12 (``UnshardHandle`` still has "
         "only ``wait()``); the probe, not a version number, decides",
         hint="Absent: chunked_loss_num_chunks > 1 is refused under FSDP; run "
-        "with chunked_loss_num_chunks=1 (no released torch carries the "
-        "context-manager unshard yet).",
+        "with chunked_loss_num_chunks=1. A future context-manager API still "
+        "requires validation of head ownership, gradients and restore.",
         consumers="trainer/runtime/assembly.py (chunked loss + FSDP guard)",
     ),
     "fsdp_per_param_mesh": Capability(

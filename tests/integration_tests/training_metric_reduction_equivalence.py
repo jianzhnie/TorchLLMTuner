@@ -11,10 +11,12 @@ from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.runtime.reductions import resolve_training_reduction_meshes
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.harness import init_distributed
 
 
 def main():
-    dist.init_process_group("gloo")
+    device = init_distributed()
+    dtype = torch.float64 if device.type == "cpu" else torch.float32
     try:
         assert dist.get_world_size() == 4
         for cp, tp in ((2, 2), (2, 1), (1, 2)):
@@ -42,24 +44,24 @@ def main():
                     for d, count in enumerate(counts)
                 ]
                 trainer = Trainer.__new__(Trainer)
-                trainer.device = torch.device("cpu")
+                trainer.device = device
                 trainer.parallel_dims = topology
                 trainer.ntokens_seen = 7
                 trainer.model_parts = []
                 metrics = (
                     trainer._step_metrics(
                         accumulated_loss=torch.tensor(
-                            shard_sums[dp][coordinate], dtype=torch.float64
+                            shard_sums[dp][coordinate], dtype=dtype, device=device
                         ),
                         global_valid_tokens=torch.tensor(
-                            sum(counts), dtype=torch.float64
+                            sum(counts), dtype=dtype, device=device
                         ),
                         local_valid_tokens=counts[dp],
                         local_valid_tokens_tensor=torch.tensor(
-                            counts[dp], dtype=torch.float64
+                            counts[dp], dtype=dtype, device=device
                         ),
                         reduction_meshes=meshes,
-                        grad_norm=torch.tensor(2.0),
+                        grad_norm=torch.tensor(2.0, device=device),
                         lr_metrics={"lr/SGD": 0.1},
                     )
                     if sum(counts)

@@ -2,8 +2,8 @@
 
 Enter ``Profiler`` around the training loop and call ``step`` after each
 iteration. It owns trace collection, periodic snapshots, and an OOM snapshot
-on exit. Trace activities follow the resolved device: CPU plus CUDA or XPU
-when selected; other devices collect CPU traces. Allocator history uses
+on exit. Trace activities follow the resolved device: CPU plus CUDA, XPU or
+NPU when selected; other devices collect CPU traces. Allocator history uses
 ``utils/monitoring`` and unavailable history disables snapshot output.
 
 Upstream sources and adaptation details are in ``docs/llmtuner_upstream_map.md``.
@@ -293,9 +293,10 @@ class Profiler:
 
             logger.info("Dumping profiler traces at step %d", global_step)
             begin = time.monotonic()
-            prof.export_chrome_trace(
-                os.path.join(directory, PROFILE_FILE.format(rank=rank))
-            )
+            filename = PROFILE_FILE.format(rank=rank)
+            if device_type == "npu":
+                filename = filename.removesuffix(".gz")
+            prof.export_chrome_trace(os.path.join(directory, filename))
             last_trace_step = global_step
             logger.info(
                 "Finished dumping profiler traces in %.2f seconds",
@@ -321,7 +322,20 @@ class Profiler:
         # What remains of the cycle after warmup and active. The config's
         # validation guarantees this is not negative.
         wait = cfg.profile_freq - (cfg.profiler_active + cfg.profiler_warmup)
-        activities = [torch.profiler.ProfilerActivity.CPU]
+        on_trace_ready = trace_handler
+        profiler_api = torch.profiler
+        if device_type == "npu":
+            from torch_npu import profiler as profiler_api
+
+            raw_trace_handler = profiler_api.tensorboard_trace_handler(
+                os.path.join(trace_dir, "raw"), analyse_flag=False
+            )
+
+            def on_trace_ready(prof):
+                raw_trace_handler(prof)
+                trace_handler(prof)
+
+        activities = [profiler_api.ProfilerActivity.CPU]
         if device_type == "cuda":
             activities.append(torch.profiler.ProfilerActivity.CUDA)
         elif device_type == "xpu":
@@ -330,17 +344,19 @@ class Profiler:
             # accelerators, so following the resolved device is what keeps a
             # trace from being CPU-only on a device the run actually uses.
             activities.append(torch.profiler.ProfilerActivity.XPU)
+        elif device_type == "npu":
+            activities.append(profiler_api.ProfilerActivity.NPU)
 
-        schedule = torch.profiler.schedule(
+        schedule = profiler_api.schedule(
             wait=wait,
             warmup=cfg.profiler_warmup,
             active=cfg.profiler_active,
             **optional_params,
         )
-        torch_profiler = torch.profiler.profile(
+        torch_profiler = profiler_api.profile(
             activities=activities,
             schedule=lambda step: schedule(start_step + step),
-            on_trace_ready=trace_handler,
+            on_trace_ready=on_trace_ready,
             record_shapes=True,
         )
         try:

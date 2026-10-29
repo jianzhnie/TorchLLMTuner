@@ -915,6 +915,14 @@ def apply_tp(
     """
     if cfg.tp_size <= 1:
         return model
+    if any(
+        getattr(getattr(module, "config", None), "attention_backend", "auto")
+        == "eager_flex"
+        for module in model.modules()
+    ):
+        compatibility.eager_flex_parallel("TP")
+    if any(getattr(module, "_llmtuner_fused_qkv", False) for module in model.modules()):
+        compatibility.fused_qkv_tp()
     if mesh is None:
         raise ValueError(f"tp={cfg.tp_size} requires a device mesh with a 'tp' axis")
 

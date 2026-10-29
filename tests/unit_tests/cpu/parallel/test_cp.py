@@ -41,24 +41,13 @@ def test_apply_cp_is_a_no_op_when_cp_is_off() -> None:
     assert apply_cp(model, mesh=None, cfg=cfg) is model
 
 
-def test_apply_cp_rejects_the_dual_axis_form_without_flex() -> None:
-    """One CP axis at a time on sdpa; two composed masks stay on flex.
-
-    Both single-axis strategies have an sdpa kernel (kv_allgather rebuilds the
-    mask from the CP offsets, ulysses swaps heads and needs only the ordinary
-    causal one), so the strategy name is no longer the thing that is refused --
-    the *composition* is. A plain module has no HF config at all, so its backend
-    reads as non-flex, which is the same reason a CPU-run model (whose wrapper
-    selected 'sdpa') takes this branch. The refusal happens before any mesh is
-    consulted, so no process group is needed to pin it.
-    """
-
+def test_apply_cp_rejects_dual_axes_without_a_mesh() -> None:
     cfg = ParallelConfig(
         context_parallel_kv_allgather_size=2,
         context_parallel_ulysses_size=2,
     )
 
-    with pytest.raises(RuntimeError, match="only with a single CP axis"):
+    with pytest.raises(ValueError, match="requires a device mesh"):
         apply_cp(torch.nn.Linear(4, 4), mesh=None, cfg=cfg)
 
 
@@ -416,7 +405,8 @@ def test_cp_missing_late_attention_preserves_earlier_kernel(monkeypatch, failure
 
 
 @pytest.mark.parametrize("axis", ["cp_kv", "cp_ulysses"])
-def test_dual_cp_rejects_wrong_axis_degree_before_kernel_setup(monkeypatch, axis):
+@pytest.mark.parametrize("flex", [False, True])
+def test_dual_cp_rejects_wrong_axis_degree_before_kernel_setup(monkeypatch, axis, flex):
     from types import SimpleNamespace
 
     from llmtuner.models.hf.attention_backend import ATTENTION_BACKEND
@@ -436,7 +426,9 @@ def test_dual_cp_rejects_wrong_axis_degree_before_kernel_setup(monkeypatch, axis
 
     model = SimpleNamespace(
         model=SimpleNamespace(
-            config=SimpleNamespace(_attn_implementation=ATTENTION_BACKEND)
+            config=SimpleNamespace(
+                _attn_implementation=ATTENTION_BACKEND if flex else "sdpa"
+            )
         )
     )
     topology = SimpleNamespace(

@@ -96,6 +96,8 @@ def qwen3_8b_npu_config() -> LLMTunerConfig:
             activation_checkpoint_mode="full",
             checkpoint_config=CheckpointConfig(
                 enable=True,
+                interval=int(os.environ.get("LLMTUNER_CHECKPOINT_INTERVAL", "500")),
+                load_step=int(os.environ.get("LLMTUNER_CHECKPOINT_LOAD_STEP", "-1")),
                 load_only=not save_checkpoint,
                 initial_load_path=model_path,
                 initial_load_model_only=True,
@@ -109,8 +111,8 @@ def qwen3_8b_npu_config() -> LLMTunerConfig:
                 dataset="local_jsonl_sft",
                 dataset_path=dataset_path,
                 tokenizer_path=model_path,
-                prompt_field="problem",
-                response_field="solution",
+                prompt_field=os.environ.get("LLMTUNER_PROMPT_FIELD", "problem"),
+                response_field=os.environ.get("LLMTUNER_RESPONSE_FIELD", "solution"),
                 packing="first_fit",
                 # 1 = one document per sequence (plain causal attention, no mask
                 # materialized). A larger value packs several documents into a
@@ -122,7 +124,11 @@ def qwen3_8b_npu_config() -> LLMTunerConfig:
                     os.environ.get("LLMTUNER_MAX_NUM_DOCUMENTS", "1")
                 ),
             ),
-            metrics_config=MetricsConfig(log_freq=1),
+            metrics_config=MetricsConfig(
+                log_freq=1,
+                enable_tensorboard=os.environ.get("LLMTUNER_ENABLE_TENSORBOARD", "0")
+                == "1",
+            ),
             dump_folder=os.environ.get(
                 "LLMTUNER_DUMP_FOLDER",
                 "/home/jianzhnie/llmtuner/llm/TorchLLMTuner/outputs/qwen3-8b-npu",

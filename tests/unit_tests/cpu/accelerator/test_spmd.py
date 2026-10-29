@@ -21,13 +21,19 @@ from tests.caps import require_env
 require_env("spmd_types")
 
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import pytest
 
 from llmtuner.accelerator.spmd import (
+    capture_spmd_context,
     current_spmd_mesh,
     spmd_context,
     spmd_mesh_group,
     spmd_mesh_size,
+    spmd_sparse_mesh,
 )
 
 
@@ -65,3 +71,34 @@ def test_context_restores_the_previous_state_on_exit() -> None:
         assert current_spmd_mesh() is None
 
     assert current_spmd_mesh() is None
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_captured_context_restores_meshes_on_replay_thread(monkeypatch, raises):
+    from llmtuner.accelerator import spmd as module
+
+    monkeypatch.setattr(module.spmd, "set_current_mesh", lambda mesh: nullcontext())
+    dense, sparse = object(), object()
+    topology = SimpleNamespace(
+        spmd_dense_mesh=lambda: dense, spmd_sparse_mesh=lambda: sparse
+    )
+    with spmd_context(topology):
+        replay = capture_spmd_context()
+
+    def run():
+        assert current_spmd_mesh() is None
+        for _ in range(2):
+            try:
+                with replay():
+                    assert current_spmd_mesh() is dense
+                    assert module.spmd_dense_mesh() is dense
+                    assert spmd_sparse_mesh() is sparse
+                    if raises:
+                        raise RuntimeError("replay")
+            except RuntimeError:
+                assert raises
+            assert current_spmd_mesh() is None
+            assert spmd_sparse_mesh() is None
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(run).result()

@@ -1,10 +1,10 @@
-"""Two CPU/Gloo ranks: compiled TP collective gradients match analytic values.
+"""Two ranks: compiled TP collective gradients match analytic values.
 
 Run with torchrun --nproc_per_node=2. Resolve capabilities before compilation,
 as apply_tp does, and exercise the production wrappers with fullgraph capture.
 """
 
-from datetime import timedelta
+import os
 
 import torch
 import torch.distributed as dist
@@ -14,6 +14,7 @@ from llmtuner.parallel.tensor_parallel.linear_ops import (
     functional_collectives,
     reduce_scatter_along,
 )
+from tests.integration_tests.harness import init_distributed
 
 
 def gather_loss(inputs):
@@ -24,20 +25,23 @@ def scatter_loss(inputs):
     return reduce_scatter_along(inputs, 0, dist.group.WORLD).square().sum()
 
 
-dist.init_process_group("gloo", timeout=timedelta(seconds=30))
+device = init_distributed()
 try:
     assert dist.get_world_size() == 2
     functional_collectives()
+    compile_backend = os.environ.get("LLMTUNER_TEST_COMPILE_BACKEND", "aot_eager")
     for operation, rows, gradient in ((gather_loss, 2, 4), (scatter_loss, 4, 4)):
-        compiled = torch.compile(operation, backend="aot_eager", fullgraph=True)
+        compiled = torch.compile(operation, backend=compile_backend, fullgraph=True)
         for forward in (operation, compiled):
-            inputs = torch.ones(rows, 3, requires_grad=True)
+            inputs = torch.ones(rows, 3, device=device, requires_grad=True)
             forward(inputs).backward()
             torch.testing.assert_close(
                 inputs.grad, torch.full_like(inputs, gradient), rtol=0, atol=0
             )
         print(
-            f"rank {dist.get_rank()}: {operation.__name__} gradients exact", flush=True
+            f"rank {dist.get_rank()}: backend={compile_backend} "
+            f"{operation.__name__} gradients exact",
+            flush=True,
         )
 finally:
     dist.destroy_process_group()

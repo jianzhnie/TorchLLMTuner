@@ -51,6 +51,12 @@ class CheckpointConfig:
     interval: int = 500
     """Checkpointing interval in steps."""
 
+    sharded_expert_parallel: bool = False
+    """Use local expert chunks for DCP model, optimizer and EMA state."""
+
+    sharded_tensor_parallel: bool = False
+    """Use local TP chunks for DCP model, optimizer and EMA state."""
+
     initial_load_path: str | None = None
     """Optional checkpoint path used when the output checkpoint folder is empty."""
 
@@ -118,6 +124,14 @@ class CheckpointConfig:
     "torch_checkpointing."
 
     def __post_init__(self) -> None:
+        if self.sharded_tensor_parallel and self.backend != "dcp":
+            raise ConfigError(
+                "checkpoint.sharded_tensor_parallel requires backend='dcp'"
+            )
+        if self.sharded_expert_parallel and self.backend != "dcp":
+            raise ConfigError(
+                "checkpoint.sharded_expert_parallel requires backend='dcp'"
+            )
         if not self.folder.strip():
             raise ConfigError("checkpoint.folder must not be empty.")
         if self.backend not in ("dcp", "torch_checkpointing"):

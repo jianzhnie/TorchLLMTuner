@@ -2,6 +2,10 @@
 
 Run under torchrun with 2 ranks, in two phases that share a workdir:
 
+Set LLMTUNER_TEST_CHECKPOINT_BACKEND=torch_checkpointing in both phases
+to test that optional backend; the default remains dcp. Both phases assert
+the actual manager type, and full checks the selected backend metadata.
+
     D=$(mktemp -d)
     torchrun --nproc_per_node=2 \\
         tests/integration_tests/pp_checkpoint_equivalence.py full "$D"
@@ -119,6 +123,25 @@ boundary ownership through training and recovery.
 
 Set LLMTUNER_TEST_SHARED_LAYERS=1 with LLMTUNER_TEST_PP_SIZE=1 to tie the
 first two decoder Q projections before FSDP and check grouped-state recovery.
+Set LLMTUNER_TEST_REQUIRE_SHARDED=1 to require real FSDP parameter shards on
+every local pipeline part, including after restore and each optimizer step.
+Set LLMTUNER_TEST_CHUNKS=3 with LLMTUNER_TEST_PP_SIZE=1 for the root-owned
+chunked head path. Set LLMTUNER_TEST_TIED_WEIGHTS=0 or 1 to explicitly select
+embedding/head identity for the standard Qwen decoder configuration.
+Set LLMTUNER_TEST_QKV_PROJECTION=fused for the configured Qwen3 fused projection.
+Set LLMTUNER_TEST_NORM_BACKEND=joint for configured dense Qwen3 residual norms.
+Set LLMTUNER_TEST_ROTARY_INIT_DEVICE=target for training-device RoPE initialization.
+Set LLMTUNER_TEST_ROTARY_STATE=1 to compare runtime RoPE frequencies and scaling
+exactly before resumed updates and after continuation, including nonpersistent state.
+Set LLMTUNER_TEST_ATTENTION_BACKEND=eager_flex for the explicit CPU/NPU math backend.
+For NPU dual-axis SDPA, use LLMTUNER_TEST_CP_SIZE=2 and
+LLMTUNER_TEST_ULYSSES_SIZE=2, with four ranks for PP1 or eight for PP2.
+Set LLMTUNER_TEST_DP_REPLICATE_SIZE=2 to add a real replica axis;
+PP1 with dual CP then requires eight ranks and retains CP parameter shards.
+For an existing corpus, set LLMTUNER_TEST_CORPUS_PATH and
+LLMTUNER_TEST_TOKENIZER_PATH with --packed. Set LLMTUNER_TEST_DATASET=local_jsonl_sft
+and LLMTUNER_TEST_PROMPT_FIELD/RESPONSE_FIELD for paired SFT columns. Set
+LLMTUNER_TEST_VOCAB_SIZE to the tokenizer model's padded vocabulary size.
 """
 
 from __future__ import annotations
@@ -147,6 +170,7 @@ from llmtuner.config import (
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.optimizer_config import ParamGroupConfig
 from llmtuner.config.parallel_config import (
+    ContextParallelConfig,
     ExpertParallelConfig,
     FSDPConfig,
     PipelineParallelConfig,
@@ -161,7 +185,7 @@ TOTAL_STEPS = SPLIT_STEP + EXTRA_STEPS
 MICROBATCHES = 4
 GLOBAL_BATCH = 8
 SEQ = int(os.environ.get("LLMTUNER_TEST_SEQ_LEN", "32"))
-VOCAB = 128
+VOCAB = int(os.environ.get("LLMTUNER_TEST_VOCAB_SIZE", "128"))
 SEED = 42
 
 FULL_LOSSES_FILE = "losses_full.json"
@@ -177,6 +201,27 @@ def _equal_rank_state(
     mismatch collectives across stages. All ranks validate their local shards;
     the final world reduction aggregates failures after all comparisons.
     """
+    from llmtuner.components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+
+    if isinstance(actual, ChunkedCheckpointTensor) or isinstance(
+        expected, ChunkedCheckpointTensor
+    ):
+        if not (
+            isinstance(actual, ChunkedCheckpointTensor)
+            and isinstance(expected, ChunkedCheckpointTensor)
+            and actual.shape == expected.shape
+            and actual.dtype == expected.dtype
+            and len(actual.chunks) == len(expected.chunks)
+        ):
+            print(f"{label}: checkpoint chunk metadata differs")
+            return False
+        return all(
+            offset == expected_offset
+            and _equal_rank_state(value, reference, label=f"{label}@{tuple(offset)}")
+            for (offset, value), (expected_offset, reference) in zip(
+                actual.chunks, expected.chunks, strict=True
+            )
+        )
     if isinstance(actual, DTensor) != isinstance(expected, DTensor):
         print(f"{label}: tensor types differ: {type(actual)} vs {type(expected)}")
         return False
@@ -240,6 +285,11 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
             ),
             experts_implementation="eager" if moe else "native",
             norm_backend=os.environ.get("LLMTUNER_TEST_NORM_BACKEND", "native"),
+            qkv_projection=os.environ.get("LLMTUNER_TEST_QKV_PROJECTION", "separate"),
+            rotary_init_device=os.environ.get(
+                "LLMTUNER_TEST_ROTARY_INIT_DEVICE", "constructor"
+            ),
+            attention_backend=os.environ.get("LLMTUNER_TEST_ATTENTION_BACKEND", "auto"),
             arch_overrides={
                 "n_routed_experts": 8,
                 "num_experts_per_tok": 2,
@@ -298,7 +348,11 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
                 "norm_topk_prob": True,
             }
             if moe
-            else {},
+            else (
+                {"tie_word_embeddings": os.environ["LLMTUNER_TEST_TIED_WEIGHTS"] == "1"}
+                if "LLMTUNER_TEST_TIED_WEIGHTS" in os.environ
+                else {}
+            ),
             vocab_size=VOCAB,
             hidden_size=64,
             intermediate_size=128,
@@ -325,7 +379,18 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
             context_parallel_kv_allgather_size=int(
                 os.environ.get("LLMTUNER_TEST_CP_SIZE", "1")
             ),
+            context_parallel_ulysses_size=int(
+                os.environ.get("LLMTUNER_TEST_ULYSSES_SIZE", "1")
+            ),
+            cp_config=ContextParallelConfig(
+                context_parallel_strategy=os.environ.get(
+                    "LLMTUNER_TEST_CP_STRATEGY", "kv_allgather"
+                )
+            ),
             data_parallel_shard_size=-1,
+            data_parallel_replicate_size=int(
+                os.environ.get("LLMTUNER_TEST_DP_REPLICATE_SIZE", "1")
+            ),
             fsdp_config=FSDPConfig(
                 fsdp_implementation=os.environ.get(
                     "LLMTUNER_TEST_FSDP_IMPLEMENTATION", "native"
@@ -364,6 +429,7 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
                 os.environ.get("LLMTUNER_TEST_ACCUMULATION", "1")
             ),
             max_seq_len=SEQ,
+            chunked_loss_num_chunks=int(os.environ.get("LLMTUNER_TEST_CHUNKS", "1")),
             steps=TOTAL_STEPS,
             seed=SEED,
             deterministic=True,
@@ -374,12 +440,21 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
             activation_checkpoint_mode=os.environ.get("LLMTUNER_TEST_AC", "none"),
             dump_folder=workdir,
             checkpoint_config=CheckpointConfig(
+                backend=os.environ.get("LLMTUNER_TEST_CHECKPOINT_BACKEND", "dcp"),
                 enable=True,
                 folder="checkpoint",
                 interval=SPLIT_STEP,
                 async_mode=os.environ.get("LLMTUNER_TEST_ASYNC_MODE", "disabled"),
                 # No retention policy to exercise: keep the purge thread out.
                 keep_latest_k=0,
+                sharded_tensor_parallel=os.environ.get(
+                    "LLMTUNER_TEST_SHARDED_TENSOR_CHECKPOINT", "0"
+                )
+                == "1",
+                sharded_expert_parallel=os.environ.get(
+                    "LLMTUNER_TEST_SHARDED_EXPERT_CHECKPOINT", "0"
+                )
+                == "1",
             ),
             metrics_config=MetricsConfig(log_freq=1),
             ema_config=EMAConfig(
@@ -390,9 +465,19 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
             else None,
             dataloader_config=(
                 DataloaderConfig(
-                    dataset="local_jsonl",
-                    tokenizer_path=os.path.join(data_root, "tokenizer"),
-                    dataset_path=os.path.join(data_root, "rows.jsonl"),
+                    dataset=os.environ.get("LLMTUNER_TEST_DATASET", "local_jsonl"),
+                    tokenizer_path=os.environ.get(
+                        "LLMTUNER_TEST_TOKENIZER_PATH",
+                        os.path.join(data_root, "tokenizer"),
+                    ),
+                    dataset_path=os.environ.get(
+                        "LLMTUNER_TEST_CORPUS_PATH",
+                        os.path.join(data_root, "rows.jsonl"),
+                    ),
+                    prompt_field=os.environ.get("LLMTUNER_TEST_PROMPT_FIELD", "prompt"),
+                    response_field=os.environ.get(
+                        "LLMTUNER_TEST_RESPONSE_FIELD", "response"
+                    ),
                     shuffle=False,
                 )
                 if packed
@@ -435,7 +520,43 @@ def _train_steps(trainer: Trainer, data_iterator, num_steps: int) -> list[float]
             )
     for _ in range(num_steps):
         trainer.step += 1
-        metrics = trainer.train_step(data_iterator)
+        replay_counts = []
+        replay_handles = []
+        if os.environ.get("LLMTUNER_TEST_REQUIRE_RECOMPUTE") == "1":
+            from llmtuner.models.common.aux_loss import in_checkpoint_recompute
+
+            assert trainer.cfg.training.activation_checkpoint_mode in {
+                "full",
+                "selective",
+            }
+            for part in trainer.model_parts:
+                for layer in part.layers:
+                    counts = [0, 0]
+                    replay_counts.append(counts)
+
+                    def count_forward(module, inputs, counts=counts):
+                        counts[int(in_checkpoint_recompute.get())] += 1
+
+                    replay_handles.append(
+                        layer._checkpoint_wrapped_module.register_forward_pre_hook(
+                            count_forward
+                        )
+                    )
+        try:
+            metrics = trainer.train_step(data_iterator)
+        finally:
+            for handle in replay_handles:
+                handle.remove()
+        if os.environ.get("LLMTUNER_TEST_REQUIRE_RECOMPUTE") == "1":
+            assert replay_counts, "recompute verification requires local layers"
+            assert all(
+                forward > 0 and replay > 0 for forward, replay in replay_counts
+            ), f"decoder forward/recompute counts: {replay_counts}"
+            print(
+                f"rank {trainer.rank}: step {trainer.step} decoder "
+                f"forward/recompute counts={replay_counts}",
+                flush=True,
+            )
         if "LLMTUNER_TEST_COMPILE_BACKEND" in os.environ:
             from torch._dynamo.eval_frame import OptimizedModule
             from torch._dynamo.utils import counters
@@ -459,6 +580,159 @@ def _train_steps(trainer: Trainer, data_iterator, num_steps: int) -> list[float]
 
 
 def _assert_shared_layers(trainer: Trainer) -> None:
+    if trainer.cfg.training.activation_checkpoint_mode in {"full", "selective"}:
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointWrapper,
+        )
+
+        layers = [layer for part in trainer.model_parts for layer in part.layers]
+        assert layers, "AC verification requires local decoder layers"
+        assert all(isinstance(layer, CheckpointWrapper) for layer in layers), (
+            "requested AC must wrap every local decoder layer"
+        )
+    if (
+        trainer.cfg.parallel.context_parallel_kv_allgather_size > 1
+        and trainer.cfg.parallel.context_parallel_ulysses_size == 1
+        and trainer.cfg.parallel.cp_config.context_parallel_strategy == "kv_allgather"
+        and harness_device().type == "npu"
+    ):
+        from llmtuner.models.hf.attention_backend import CP_SDPA_BACKEND
+        from llmtuner.parallel.context_parallel.sdpa_attention import CPSdpaKernel
+
+        for part in trainer.model_parts:
+            assert part.model.config._attn_implementation == CP_SDPA_BACKEND
+            kernels = [
+                module for module in part.modules() if type(module) is CPSdpaKernel
+            ]
+            assert kernels, "single-axis KV must use the production SDPA kernel"
+            assert all(kernel.cp_size == trainer.parallel_dims.cp for kernel in kernels)
+    replica_size = int(os.environ.get("LLMTUNER_TEST_DP_REPLICATE_SIZE", "1"))
+    if replica_size > 1:
+        from torch.distributed.tensor import Replicate, Shard
+
+        assert trainer.parallel_dims.dp_replicate == replica_size
+        replicated_parameters = [
+            parameter
+            for part in trainer.model_parts
+            for parameter in part.parameters()
+            if isinstance(parameter, DTensor)
+            and "dp_replicate" in parameter.device_mesh.mesh_dim_names
+        ]
+        assert replicated_parameters, "replica axis must reach actual parameters"
+        for parameter in replicated_parameters:
+            mesh = parameter.device_mesh
+            replica_axis = mesh.mesh_dim_names.index("dp_replicate")
+            assert mesh.size(replica_axis) == replica_size
+            assert isinstance(parameter.placements[replica_axis], Replicate)
+        if trainer.parallel_dims.cp > 1:
+            assert any(
+                any(isinstance(placement, Shard) for placement in parameter.placements)
+                and parameter.to_local().numel() < parameter.numel()
+                for parameter in replicated_parameters
+            ), "replicated CP scenario must retain actual parameter shards"
+    if (
+        trainer.cfg.parallel.context_parallel_kv_allgather_size > 1
+        and trainer.cfg.parallel.context_parallel_ulysses_size > 1
+        and harness_device().type == "npu"
+    ):
+        from llmtuner.models.hf.attention_backend import CP_SDPA_BACKEND
+        from llmtuner.parallel.context_parallel.sdpa_attention import DualCPSdpaKernel
+
+        assert all(
+            part.model.config._attn_implementation == CP_SDPA_BACKEND
+            and part.model.config._cp_sdpa_dual
+            and any(isinstance(module, DualCPSdpaKernel) for module in part.modules())
+            for part in trainer.model_parts
+        )
+    if os.environ.get("LLMTUNER_TEST_ATTENTION_BACKEND") == "eager_flex":
+        from llmtuner.models.hf.attention_backend import EAGER_FLEX_BACKEND
+
+        assert all(
+            part.model.config._attn_implementation == EAGER_FLEX_BACKEND
+            for part in trainer.model_parts
+        )
+    if os.environ.get("LLMTUNER_TEST_ROTARY_INIT_DEVICE") == "target":
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+
+        rotary_modules = [
+            module
+            for part in trainer.model_parts
+            for module in part.modules()
+            if type(module) is Qwen3RotaryEmbedding
+        ]
+        assert rotary_modules, "target RoPE scenario must contain real rotary modules"
+        for rotary in rotary_modules:
+            assert rotary.config.rotary_init_device == "target"
+            expected = Qwen3RotaryEmbedding(rotary.config, device=trainer.device)
+            for name in ("inv_freq", "original_inv_freq"):
+                actual = getattr(rotary, name)
+                assert actual.device == trainer.device
+                assert actual.dtype == torch.float32
+                torch.testing.assert_close(
+                    actual, getattr(expected, name), atol=0, rtol=0
+                )
+    if os.environ.get("LLMTUNER_TEST_NORM_BACKEND") == "joint":
+        from llmtuner.models.hf.residual_normalization import (
+            forward_joint_residual_block,
+            forward_joint_residual_norm,
+        )
+
+        blocks = [
+            module
+            for part in trainer.model_parts
+            for module in part.modules()
+            if getattr(module.forward, "__func__", None) is forward_joint_residual_block
+        ]
+        assert len(blocks) == sum(len(part.layers) for part in trainer.model_parts)
+        assert blocks, "joint residual norm scenario must contain real decoder blocks"
+        assert all(
+            getattr(norm.forward, "__func__", None) is forward_joint_residual_norm
+            for block in blocks
+            for norm in (block.input_layernorm, block.post_attention_layernorm)
+        ), "requested joint norms must reach the production implementation"
+    if os.environ.get("LLMTUNER_TEST_QKV_PROJECTION") == "fused":
+        from llmtuner.models.hf.qkv_projection import forward_fused_qkv_attention
+
+        attentions = [
+            layer.self_attn for part in trainer.model_parts for layer in part.layers
+        ]
+        assert attentions, "fused QKV scenario must contain real attention layers"
+        assert all(
+            getattr(module.forward, "__func__", None) is forward_fused_qkv_attention
+            for module in attentions
+        ), "requested fused QKV must reach the production implementation"
+    root_owned = trainer.cfg.training.chunked_loss_num_chunks > 1
+    if root_owned:
+        for part in trainer.model_parts:
+            root_parameters = {
+                id(parameter.sharded_param)
+                for group in part._get_fsdp_state()._fsdp_param_groups
+                for parameter in group.fsdp_params
+            }
+            for boundary in (part.tok_embeddings, part.norm, part.lm_head):
+                assert all(
+                    id(parameter) in root_parameters
+                    for parameter in boundary.parameters()
+                )
+            if "LLMTUNER_TEST_TIED_WEIGHTS" in os.environ:
+                assert part.enable_weight_tying == (
+                    os.environ["LLMTUNER_TEST_TIED_WEIGHTS"] == "1"
+                )
+    if os.environ.get("LLMTUNER_TEST_REQUIRE_SHARDED") == "1":
+        from torch.distributed.fsdp import FSDPModule
+        from torch.distributed.tensor import Shard
+
+        assert trainer.parallel_dims.dp_shard >= 2
+        for part in trainer.model_parts:
+            assert isinstance(part, FSDPModule)
+            parameters = list(part.parameters())
+            assert parameters
+            for parameter in parameters:
+                assert isinstance(parameter, DTensor)
+                assert any(
+                    isinstance(placement, Shard) for placement in parameter.placements
+                )
+                assert parameter.to_local().numel() < parameter.numel()
     if os.environ.get("LLMTUNER_TEST_FIXED_ROUTER") == "1":
         from llmtuner.models.common.moe.layer import MoE
 
@@ -549,7 +823,12 @@ def _assert_shared_layers(trainer: Trainer) -> None:
         model = trainer.model_parts[0]
         first = list(model.layers)[0]
         assert first.input_layernorm.weight is model.norm.weight
-        assert first._get_fsdp_state() is model.norm._get_fsdp_state()
+        if root_owned:
+            assert all(
+                id(parameter) in root_parameters for parameter in first.parameters()
+            )
+        else:
+            assert first._get_fsdp_state() is model.norm._get_fsdp_state()
     if os.environ.get("LLMTUNER_TEST_SHARED_LAYERS") != "1":
         return
     first, second = list(trainer.model_parts[0].layers)[:2]
@@ -573,8 +852,30 @@ def _runtime_state(trainer: Trainer) -> dict:
             torch.from_numpy(numpy_state[1].copy()),
             *numpy_state[2:],
         )
-    return {
+    state = {
         **({"rng": rng} if rng else {}),
+        **(
+            {
+                "rotary_runtime": {
+                    canonical_fqn(f"{name}.{attribute}"): (
+                        value.detach().cpu().clone()
+                        if isinstance(value, torch.Tensor)
+                        else value
+                    )
+                    for part in trainer.model_parts
+                    for name, module in part.named_modules()
+                    if name.endswith("rotary_emb")
+                    for attribute in (
+                        "inv_freq",
+                        "original_inv_freq",
+                        "attention_scaling",
+                    )
+                    if (value := getattr(module, attribute, None)) is not None
+                }
+            }
+            if os.environ.get("LLMTUNER_TEST_ROTARY_STATE") == "1"
+            else {}
+        ),
         **(
             {"dataloader": trainer.dataloader.state_dict()}
             if os.environ.get("LLMTUNER_TEST_LOADER_STATE") == "1"
@@ -591,6 +892,9 @@ def _runtime_state(trainer: Trainer) -> dict:
         "scheduler": trainer.lr_scheduler.state_dict(),
         "ema": trainer.ema.state_dict() if trainer.ema is not None else {},
     }
+    if os.environ.get("LLMTUNER_TEST_ROTARY_STATE") == "1":
+        assert state["rotary_runtime"], "requested RoPE audit found no runtime state"
+    return state
 
 
 def _compare_loaded_state(actual, expected, failures: list[str], path: str) -> None:
@@ -611,8 +915,30 @@ def _compare_loaded_state(actual, expected, failures: list[str], path: str) -> N
         failures.append(f"{path}: loaded metadata differs before any update")
 
 
+def _assert_checkpoint_backend(trainer: Trainer) -> str:
+    from llmtuner.components.checkpointer.distributed_checkpoint import (
+        DistributedCheckpointManager,
+    )
+    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+        TorchCheckpointingManager,
+    )
+
+    backend = os.environ.get("LLMTUNER_TEST_CHECKPOINT_BACKEND", "dcp")
+    expected = {
+        "dcp": DistributedCheckpointManager,
+        "torch_checkpointing": TorchCheckpointingManager,
+    }[backend]
+    assert isinstance(trainer.checkpointer, expected), (
+        f"requested {backend}, got {type(trainer.checkpointer).__name__}"
+    )
+    if backend == "torch_checkpointing":
+        return trainer.checkpointer._backend.METADATA_FILE_NAME
+    return ".metadata"
+
+
 def _phase_full(workdir: str, *, packed: bool = False) -> None:
     trainer = Trainer(_cfg(workdir, packed=packed))
+    metadata_file = _assert_checkpoint_backend(trainer)
     assert trainer.world_size == int(os.environ.get("LLMTUNER_TEST_WORLD_SIZE", "2")), (
         f"unexpected world size: {trainer.world_size}"
     )
@@ -656,8 +982,8 @@ def _phase_full(workdir: str, *, packed: bool = False) -> None:
     ):
         with open(os.path.join(workdir, FULL_LOSSES_FILE), "w") as f:
             json.dump(losses, f)
-        assert os.path.isfile(os.path.join(checkpoint_dir, ".metadata")), (
-            f"no DCP checkpoint at {checkpoint_dir}"
+        assert os.path.isfile(os.path.join(checkpoint_dir, metadata_file)), (
+            f"no checkpoint metadata {metadata_file} at {checkpoint_dir}"
         )
 
     print(
@@ -674,6 +1000,7 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
     if "LLMTUNER_TEST_RESUME_LR" in os.environ:
         cfg.optimizer.learning_rate = float(os.environ["LLMTUNER_TEST_RESUME_LR"])
     trainer = Trainer(cfg)
+    _assert_checkpoint_backend(trainer)
     assert trainer.world_size == int(os.environ.get("LLMTUNER_TEST_WORLD_SIZE", "2")), (
         f"unexpected world size: {trainer.world_size}"
     )
@@ -846,7 +1173,11 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
         assert not moments
     elif not moments:
         failures.append(f"rank {trainer.rank}: optimizer state is empty")
-    elif not any(float(moment.abs().sum()) > 0 for moment in moments.values()):
+    elif not any(
+        float(chunk.abs().sum()) > 0
+        for moment in moments.values()
+        for _, chunk in getattr(moment, "chunks", (((), moment),))
+    ):
         failures.append(f"rank {trainer.rank}: optimizer moments are all zero")
 
     # The loader's read position came back with the checkpoint (DATALOADER is
@@ -861,7 +1192,7 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
         weights_only=True,
     )
     final_runtime = _runtime_state(trainer)
-    for key in ("rng", "dataloader"):
+    for key in ("rng", "dataloader", "rotary_runtime"):
         if key in final_runtime or key in final_state:
             _compare_loaded_state(
                 {key: final_runtime[key]} if key in final_runtime else {},
@@ -980,9 +1311,24 @@ def _run() -> None:
     packed = sys.argv[3:] == ["--packed"]
     if sys.argv[3:] and not packed:
         raise SystemExit("only --packed is accepted after WORKDIR")
+    from llmtuner.components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+
+    torch.serialization.add_safe_globals([ChunkedCheckpointTensor])
     run_phase = _phase_full if phase == "full" else _phase_resume
     os.makedirs(workdir, exist_ok=True)
     if packed:
+        external_corpus = os.environ.get("LLMTUNER_TEST_CORPUS_PATH")
+        external_tokenizer = os.environ.get("LLMTUNER_TEST_TOKENIZER_PATH")
+        if bool(external_corpus) != bool(external_tokenizer):
+            raise ValueError(
+                "external packed corpus requires both corpus and tokenizer"
+            )
+        if external_corpus and (
+            not os.path.isfile(external_corpus) or not os.path.isdir(external_tokenizer)
+        ):
+            raise ValueError(
+                "external packed corpus/tokenizer paths must exist locally"
+            )
         from llmtuner.accelerator.device import device_type
         from llmtuner.models.hf.model import HFTransformerModel
         from tests.integration_tests.pp_real_corpus_equivalence import (
@@ -990,7 +1336,7 @@ def _run() -> None:
             _write_corpus,
         )
 
-        if phase == "full":
+        if phase == "full" and not external_corpus:
             data_root = os.path.join(
                 workdir, f"data-rank-{os.environ.get('RANK', '0')}"
             )

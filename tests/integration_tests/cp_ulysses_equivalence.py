@@ -55,6 +55,7 @@ from llmtuner.config import (
 from llmtuner.config.parallel_config import ContextParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.attention.masks import get_causal_mask_mod
+from llmtuner.models.hf.attention_backend import CP_SDPA_BACKEND
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.context_parallel import (
@@ -67,6 +68,7 @@ from llmtuner.parallel.context_parallel.attention import (
     HeadToSeq,
     SeqToHead,
 )
+from llmtuner.parallel.context_parallel.sdpa_attention import CPSdpaUlyssesKernel
 from tests.integration_tests.harness import (
     backend,
     init_distributed,
@@ -400,9 +402,15 @@ def _check_ulysses_under_a_load_balancer(mesh, failures: list[str]) -> dict[str,
     model = _build_model(_cfg(), flex=True)
     model.set_cp_mesh(mesh["cp"], load_balancer="headtail")
     for layer in model.layers:
-        layer.self_attn._titan_flex_kernel = CPFlexKernel(
-            cp_mesh=mesh["cp"], strategy="ulysses"
-        )
+        if DEVICE.type == "npu":
+            model.model.config._attn_implementation = CP_SDPA_BACKEND
+            layer.self_attn._titan_cp_sdpa_kernel = CPSdpaUlyssesKernel(
+                cp_mesh=mesh["cp"]
+            )
+        else:
+            layer.self_attn._titan_flex_kernel = CPFlexKernel(
+                cp_mesh=mesh["cp"], strategy="ulysses"
+            )
     with torch.no_grad():
         out = model(ids_ht, positions=pos_ht, attention_masks=sharded_mask)
 

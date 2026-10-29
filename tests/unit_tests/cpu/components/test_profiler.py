@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import os
 import pickle
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -27,6 +29,57 @@ from llmtuner.components.profiler import (
 )
 from llmtuner.config import ProfilerConfig as Config
 from llmtuner.utils.monitoring import memory_module, record_memory_history
+
+
+@pytest.fixture(autouse=True)
+def cpu_trace_backend(monkeypatch):
+    monkeypatch.setattr(profiler_module, "device_type", "cpu")
+
+
+def test_npu_trace_combines_native_and_json_handlers(tmp_path, monkeypatch):
+    recorded = {"calls": []}
+
+    class NativeProfile:
+        def __init__(self, **kwargs):
+            recorded.update(kwargs)
+            self.step_num = 1
+
+        def __enter__(self):
+            return self
+
+        def export_chrome_trace(self, path):
+            recorded["calls"].append(("json", self))
+            recorded["path"] = path
+
+    def tensorboard_trace_handler(path, **kwargs):
+        recorded["raw"] = path
+        recorded["raw_options"] = kwargs
+
+        def handle(trace):
+            recorded["calls"].append(("raw", trace))
+
+        return handle
+
+    native_api = SimpleNamespace(
+        ProfilerActivity=SimpleNamespace(CPU="native_cpu", NPU="native_npu"),
+        profile=NativeProfile,
+        schedule=lambda **kwargs: lambda step: step,
+        tensorboard_trace_handler=tensorboard_trace_handler,
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(profiler=native_api))
+    monkeypatch.setattr(profiler_module, "device_type", "npu")
+    profiler = Profiler(
+        Config(enable_profiling=True, profile_freq=1, profiler_warmup=0),
+        base_folder=str(tmp_path),
+    )
+    trace = profiler.build_torch_profiler()
+    recorded["on_trace_ready"](trace)
+    assert recorded["activities"] == ["native_cpu", "native_npu"]
+    assert recorded["path"].endswith("iteration_1/rank0_trace.json")
+    assert recorded["raw"].endswith("profiling/traces/raw")
+    assert recorded["raw_options"] == {"analyse_flag": False}
+    assert recorded["calls"] == [("raw", trace), ("json", trace)]
+
 
 # -- config -------------------------------------------------------------------
 

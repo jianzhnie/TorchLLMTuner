@@ -4,9 +4,9 @@
 the optional-dependency seam is exercised against a fake ``torchao`` module
 injected into ``sys.modules`` -- the fake reproduces the interface llmtuner calls
 (``torchao.prototype.moe_training.ep.permute.permute_and_pad``, sentinel-row
-padding semantics), not the real kernel's output. Numerical parity with real
-torchao is unverified until the dependency lands and these tests are re-run
-against it; the gating tests (no package installed) run for real.
+padding semantics), not the real kernel's output. These unit tests do not prove
+parity with real TorchAO kernels; target-device integration tests provide that
+separate evidence. The missing-package gating checks do not require TorchAO.
 """
 
 from tests.caps import require_env
@@ -226,6 +226,38 @@ def _routing(num_tokens=6, dim=4, num_experts=4, top_k=2, seed=0):
         torch.ones(num_tokens * top_k, dtype=torch.long),
     )
     return x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
+
+
+def test_torchao_dispatch_trims_unused_capacity(fake_torchao):
+    inputs, scores, expert_ids, counts = _routing()
+    inputs.requires_grad_()
+    dispatcher = TorchAOTokenDispatcher(num_experts=4, top_k=2, pad_multiple=4)
+    original = dispatcher._permute_and_pad
+
+    def overallocated(*args):
+        shape, routed, indices, padded_counts, offsets = original(*args)
+        extra = torch.full((8,), shape[0] - 1, dtype=indices.dtype)
+        return (
+            shape,
+            torch.cat((routed, routed.new_zeros(8, routed.shape[1]))),
+            torch.cat((indices, extra)),
+            padded_counts,
+            offsets,
+        )
+
+    dispatcher._permute_and_pad = overallocated
+    routed, padded_counts, metadata = dispatcher.dispatch(
+        inputs, scores, expert_ids, counts
+    )
+    assert routed.shape[0] == padded_counts.sum().item()
+    assert metadata.permuted_indices.numel() == routed.shape[0]
+    actual = dispatcher.combine(routed * 2, metadata, inputs)
+    expected = inputs * (2 * scores.sum(-1, keepdim=True))
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    torch.testing.assert_close(
+        inputs.grad, (2 * scores.sum(-1, keepdim=True)).expand_as(inputs)
+    )
 
 
 def test_torchao_ep1_dispatch_pads_groups_to_multiple(fake_torchao):

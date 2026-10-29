@@ -37,7 +37,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from ..utils.logging import get_logger
 from .device import device_module
@@ -135,6 +135,34 @@ def set_pg_timeouts(
     set_timeout(timeout)
 
 
+def _offloaded_gradient_norm(grad: DTensor, norm_type: float) -> torch.Tensor:
+    """Reduce scalar norms without moving CPU gradient storage to the device."""
+    if not (norm_type > 0):
+        raise ValueError("CPU-offloaded gradient norms require a positive norm_type")
+    if any(not isinstance(p, Replicate | Shard) for p in grad.placements):
+        raise ValueError(
+            "CPU-offloaded gradient norms require Replicate/Shard placements; "
+            f"got {grad.placements}"
+        )
+    local = grad.to_local()
+    dtype = torch.float32 if local.dtype in (torch.float16, torch.bfloat16) else None
+    if local.numel() == 0:
+        norm = torch.zeros((), dtype=dtype or local.dtype, device=local.device)
+    else:
+        norm = torch.linalg.vector_norm(local, norm_type, dtype=dtype)
+    power = norm if math.isinf(norm_type) else norm.pow(norm_type)
+    for axis, placement in enumerate(grad.placements):
+        if isinstance(placement, Shard):
+            group = grad.device_mesh.get_group(axis)
+            power = power.to(get_comm_device(group))
+            dist.all_reduce(
+                power,
+                op=dist.ReduceOp.MAX if math.isinf(norm_type) else dist.ReduceOp.SUM,
+                group=group,
+            )
+    return power if math.isinf(norm_type) else power.pow(1.0 / norm_type)
+
+
 def clip_grad_norm_(
     parameters: torch.Tensor | Iterable[torch.Tensor],
     max_norm: float,
@@ -217,12 +245,32 @@ def clip_grad_norm_(
         # FSDP exclusions remain plain tensors. Reduce each DTensor mesh's
         # scalar norm before combining it with replicated local contributions;
         # foreach cannot mix tensors/DTensors or independent meshes.
-        groups: dict[int | None, list[torch.Tensor]] = {}
+        groups: dict[tuple[int | None, torch.device], list[torch.Tensor]] = {}
         for grad in grads:
-            key = id(grad.device_mesh) if isinstance(grad, DTensor) else None
+            key = (
+                id(grad.device_mesh) if isinstance(grad, DTensor) else None,
+                grad.device,
+            )
             groups.setdefault(key, []).append(grad)
         group_norms = []
         for grads in groups.values():
+            if any(
+                isinstance(grad, DTensor)
+                and grad.device.type == "cpu"
+                and grad.device_mesh.device_type != "cpu"
+                for grad in grads
+            ):
+                norms = [_offloaded_gradient_norm(grad, norm_type) for grad in grads]
+                device = get_comm_device(grads[0].device_mesh.get_group(0))
+                group_norms.append(
+                    torch.nn.utils.get_total_norm(
+                        [norm.to(device) for norm in norms],
+                        norm_type,
+                        False,
+                        foreach,
+                    )
+                )
+                continue
             # Check only after every mesh reduction, so one bad local shard does
             # not raise while its peers are still waiting in a collective.
             if any(grad.dtype in (torch.float16, torch.bfloat16) for grad in grads):
@@ -252,6 +300,12 @@ def clip_grad_norm_(
             group_norms.append(norm)
         if len(group_norms) == 1:
             return group_norms[0]
+        if group_norms:
+            norm_device = next(
+                (norm.device for norm in group_norms if norm.device.type != "cpu"),
+                group_norms[0].device,
+            )
+            group_norms = [norm.to(norm_device) for norm in group_norms]
         return torch.nn.utils.get_total_norm(group_norms, norm_type, False, foreach)
 
     if tp_mesh is not None or ep_mesh is not None:
@@ -268,6 +322,10 @@ def clip_grad_norm_(
                 (tp_mesh if tp_mesh is not None else ep_mesh).get_group()
             ),
         )
+        if device.type == "cpu":
+            device = get_comm_device(
+                (tp_mesh if tp_mesh is not None else ep_mesh).get_group()
+            )
         dense_norm = dense_norm.to(device)
         tp_norm = tp_norm.to(device)
         expert_norm = expert_norm.to(device)
@@ -315,6 +373,8 @@ def clip_grad_norm_(
             if parameters
             else get_comm_device(pp_mesh.get_group()),
         )
+        if device.type == "cpu":
+            device = get_comm_device(pp_mesh.get_group())
         total_norm = total_norm.to(device)
         if math.isinf(norm_type):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
@@ -346,6 +406,25 @@ def clip_grad_norm_(
             mesh_key = id(grad.device_mesh) if isinstance(grad, DTensor) else None
             clip_groups.setdefault(mesh_key, []).append(parameter)
         for group_parameters in clip_groups.values():
+            offloaded = [
+                parameter.grad
+                for parameter in group_parameters
+                if isinstance(parameter.grad, DTensor)
+                and parameter.grad.device.type == "cpu"
+                and parameter.grad.device_mesh.device_type != "cpu"
+            ]
+            if offloaded:
+                coefficient = (max_norm / (total_norm + 1e-6)).clamp(max=1).cpu()
+                with torch.no_grad():
+                    for gradient in offloaded:
+                        gradient.to_local().mul_(coefficient)
+                group_parameters = [
+                    parameter
+                    for parameter in group_parameters
+                    if id(parameter.grad) not in {id(grad) for grad in offloaded}
+                ]
+                if not group_parameters:
+                    continue
             torch.nn.utils.clip_grads_with_norm_(
                 group_parameters,
                 max_norm,

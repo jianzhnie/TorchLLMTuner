@@ -8,7 +8,7 @@
 `AutoConfig.for_model` 构造小模型），并行化的硬活集中在 `parallel/`：声明式
 TP、专家并行的 HF MoE 置换、CP 内核、PP 调度、FSDP2 包装，全部按一张显式的
 装配顺序表（`parallel/stages.py`）组合，不支持的组合在配置期或装配期
-loud-raise（单一裁决来源 `parallel/matrix.py`），绝不静默退化。
+loud-raise（组合裁决集中在 `parallel/compatibility.py`），绝不静默退化。
 
 > GitHub 仓库名为 `TorchLLMTuner`，Python 包名为 `llmtuner`。
 
@@ -18,10 +18,13 @@ loud-raise（单一裁决来源 `parallel/matrix.py`），绝不静默退化。
   EP 开启时专家与 dense 参数走分离的稀疏/稠密网格。
 - **TP**：序列并行构造（HF tp_plan 驱动，`ColumnParallelLinear` / `RowParallelLinear`
   自带通信边界）；MoE-under-TP（专家 F 维分片 + 块边界 AG/RS）；可选逐 block
-  compile、async TP、regional inductor（`parallel/compile.py`）。
+  compile、async TP、regional inductor（`parallel/model_compile.py`）。
 - **PP**：1F1B / Interleaved1F1B；first-stage modules 并入；validation 走 schedule
   的 eval 通路；打包真实语料的 positions 随 microbatch 穿管。
-- **CP**：`kv_allgather` 与 `ulysses` 双策略，varlen/packed 支持，headtail 负载均衡。
+- **CP**：`kv_allgather` 与 `ulysses` 双策略，headtail 负载均衡；
+  Ulysses 支持 varlen/packed。单轴 KV 的 SDPA 路径支持连续分片下的
+  packed 文档掩码，packed 与负载均衡组合仍明确拒绝；单轴及双轴
+  KV×Ulysses 的具体验证范围见 `docs/npu_ascend_status.md`。
 - **EP**：HF MoE 块置换为原生栈（权重搬运逐位精确）；AllToAll dispatcher（可选
   TorchAO padded-permute 后端）；aux-loss-free bias 与 quantile 负载均衡；
   EP 感知的 checkpoint（存全量专家张量，resume 不受 EP 度数约束）。
@@ -76,12 +79,13 @@ DeepSeek-V3 例子里 `n_routed_experts` / `q_lora_rank` 这类字段走
 | 位置 | 职责 |
 |---|---|
 | `llmtuner/config/` | 分组配置（Model/Parallel/Optimizer/Checkpoint/Data/Training + `LLMTunerConfig` 聚合根），每组自校验 |
-| `llmtuner/parallel/` | 并行五族（`tensor_parallel` / `expert_parallel` / `context_parallel` / `pipeline_parallel` / `fully_shard`）+ `stages.py`（装配顺序表）、`matrix.py`（组合裁决）、`compile.py`、`activation_checkpoint.py`、`parallel_dims.py` |
+| `llmtuner/parallel/` | 并行五族（`tensor_parallel` / `expert_parallel` / `context_parallel` / `pipeline_parallel` / `fully_shard_parallel`）+ `stages.py`（装配顺序）、`compatibility.py`（组合裁决）、`model_compile.py`、`topology.py` |
+| `llmtuner/memory/` | activation checkpoint 与其他内存优化 |
 | `llmtuner/models/` | `hf/`（HF wrapper 五部件契约、config 工厂、state-dict 适配）+ `common/`（MoE 栈、loss 件、上游对照实现） |
 | `llmtuner/components/` | loss / optimizer+EMA / lr_scheduler / checkpointer / metrics / profiler / tokenizer |
 | `llmtuner/datasets/` | Grain 数据层（sources、loader、packing、text、multimodal、random 语料） |
 | `llmtuner/accelerator/` | 设备/进程组/集合通信抽象 + `capabilities.py`（环境能力探测） |
-| `llmtuner/trainer/` | `Trainer` 主循环 + builder/batch/pp_steps/validate 拆分 + CLI 入口 |
+| `llmtuner/trainer/` | `trainer.py`（训练与验证编排）、`runtime/`（运行时装配与校验）及 CLI 入口 |
 | `llmtuner/errors.py` | 三类异常：`ConfigError` / `UnsupportedCombinationError` / `EnvironmentUnsupportedError` |
 
 架构契约与组合边界详见 `docs/torchllmtuner_design.md`；与 TorchTitan 的逐项
@@ -107,8 +111,16 @@ state-dict FQN），全部 non-vacuous。
 - 多进程训练需要 CUDA/NCCL 或 NPU/HCCL；CPU+gloo 只能跑单进程与声明层测试。
 - TP 融合算子走 symmetric memory（CUDA）；CPU 上只验证声明层与权重切分。
 - DeepEP/HybridEP dispatcher 是登记的缺口（CUDA-only，配置期 loud-raise）。
-- 部分组合仍未支持（chunked loss×PP、PP×tied embeddings、EP×HF 初始加载等），
+- 部分组合仍未支持（chunked loss×PP、PP×tied embeddings 等），
   全部 loud-raise 且文案带解锁条件——完整矩阵见 `docs/torchllmtuner_design.md`。
+- EP 的 HF 初始加载按模型布局校验：Qwen3MoE 须启用
+  `checkpoint.sharded_expert_parallel`，TP>1 时还须启用
+  `checkpoint.sharded_tensor_parallel`；Kimi Linear 使用独立布局适配。
+  其他 EP 模型仍明确拒绝；实际验证范围见 `docs/npu_ascend_status.md`。
+- chunked loss×原生默认布局 FSDP 的 NPU FP32 路径已验证绑定/非绑定权重；
+  embedding、norm、head 及其别名由 root 持有，直到 decoder backward 才归约。
+  此路径不支持自定义 FSDP patterns、CPU offload、TP/CP/EP/PP 或 compile；
+  保留完整边界权重会增加驻留内存，配置与验证范围见 `docs/npu_ascend_status.md`。
 
 ## License
 

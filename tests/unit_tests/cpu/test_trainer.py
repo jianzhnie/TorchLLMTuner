@@ -1899,6 +1899,45 @@ def test_preprocess_filters_metadata_without_changing_source():
     assert seen[0]["labels"] is labels
 
 
+def test_fsdp_managed_parameters_is_empty_without_fsdp_modules():
+    from llmtuner.trainer.runtime.assembly import _fsdp_managed_parameters
+
+    assert _fsdp_managed_parameters(nn.Linear(3, 2)) == set()
+
+
+def test_fsdp_managed_parameters_reads_actual_shared_state():
+    from torch.distributed.fsdp import FSDPModule
+
+    from llmtuner.trainer.runtime.assembly import _fsdp_managed_parameters
+
+    class Unit(FSDPModule, nn.Linear):
+        def __new__(cls, state):
+            return object.__new__(cls)
+
+        def __init__(self, state):
+            nn.Linear.__init__(self, 3, 2)
+            self.state = state
+
+        def _get_fsdp_state(self):
+            return self.state
+
+    state = SimpleNamespace(_fsdp_param_groups=[])
+    first, second = Unit(state), Unit(state)
+    state._fsdp_param_groups = [
+        SimpleNamespace(
+            fsdp_params=[
+                SimpleNamespace(sharded_param=first.weight),
+                SimpleNamespace(sharded_param=first.weight),
+            ]
+        ),
+        SimpleNamespace(fsdp_params=[SimpleNamespace(sharded_param=second.bias)]),
+    ]
+    model = nn.ModuleList([first, second])
+    model.unmanaged = nn.Linear(3, 2)
+
+    assert _fsdp_managed_parameters(model) == {first.weight, second.bias}
+
+
 def test_assembly_uses_live_process_group_rank_and_size(monkeypatch):
     from llmtuner.trainer.runtime import assembly
 
@@ -1915,7 +1954,33 @@ def test_assembly_uses_live_process_group_rank_and_size(monkeypatch):
 
     monkeypatch.setattr(assembly, "resolve_parallel_topology", topology)
     with pytest.raises(RuntimeError, match="stop after rank resolution"):
-        assembly.assemble_trainer_runtime(trainer, SimpleNamespace())
+        assembly.assemble_trainer_runtime(trainer, SimpleNamespace(deterministic=False))
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_assembly_sets_determinism_before_creating_process_group(
+    monkeypatch, deterministic
+):
+    from llmtuner.trainer.runtime import assembly
+
+    calls = []
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(assembly, "is_distributed", lambda: False)
+    monkeypatch.setattr(assembly, "get_distributed_backend", lambda: "hccl")
+    monkeypatch.setattr(
+        assembly.seeding, "set_deterministic_algorithms", lambda: calls.append("policy")
+    )
+
+    def initialize(backend):
+        assert calls == (["policy"] if deterministic else [])
+        raise RuntimeError("stop before process group creation")
+
+    monkeypatch.setattr(assembly, "init_dist_pytorch", initialize)
+    with pytest.raises(RuntimeError, match="stop before process group creation"):
+        assembly.assemble_trainer_runtime(
+            SimpleNamespace(), SimpleNamespace(deterministic=deterministic)
+        )
 
 
 def test_programmatic_trainer_uses_resolved_override_vocabulary():

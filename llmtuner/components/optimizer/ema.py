@@ -59,7 +59,18 @@ class EMAStateOptimizer(Optimizer):
             )
         super().__init__([{"params": tensors, "param_names": names}], {})
         for t in tensors:
-            self.state[t]["ema_params"] = t.detach().clone()
+            if isinstance(t, DTensor):
+                average = DTensor.from_local(
+                    t.to_local().detach().clone(),
+                    device_mesh=t.device_mesh,
+                    placements=t.placements,
+                    run_check=False,
+                    shape=t.shape,
+                    stride=t.stride(),
+                )
+            else:
+                average = t.detach().clone()
+            self.state[t]["ema_params"] = average
 
     def step(self, closure=None) -> None:
         raise RuntimeError(
@@ -183,7 +194,11 @@ class EMA(OptimizersContainer):
         step_bias: int = 0,
         update_every_n_steps: int = 1,
         buffer_patterns: Sequence[str] = (),
+        sharded_expert_parallel: bool = False,
+        sharded_tensor_parallel: bool = False,
     ) -> None:
+        self.sharded_tensor_parallel = sharded_tensor_parallel
+        self.sharded_expert_parallel = sharded_expert_parallel
         self.decay = decay
         self.half_life_fraction = half_life_fraction
         self.start_step = start_step

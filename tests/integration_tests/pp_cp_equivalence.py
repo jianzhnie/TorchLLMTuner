@@ -1,4 +1,4 @@
-"""PP2 × CP2 training against an independent dense model on CPU/Gloo.
+"""PP2 × CP2 training against an independent dense model on the selected device.
 
 Run with four ranks, optionally selecting a schedule and accumulation count:
 
@@ -7,7 +7,9 @@ Run with four ranks, optionally selecting a schedule and accumulation count:
 
 Real Trainer, CP sharding/masks, KV collective/autograd and FSDP run unchanged.
 Only attention computation uses dense-mask SDPA; production flex kernels and
-target-device behavior are not validated. FSDP defaults to custom; set
+target-device behavior are not validated on that CPU path. NPU uses the real
+SDPA CP kernel without substitutes and defaults to native FSDP.
+On CPU FSDP defaults to custom; set
 LLMTUNER_TEST_FSDP_IMPLEMENTATION=native to exercise the native implementation.
 For headtail numerical diagnosis, set LLMTUNER_TEST_CP_LOAD_BALANCER=headtail
 and LLMTUNER_TEST_CP_FP64_DIAGNOSTIC=1. That explicitly substitutes FP64 model
@@ -19,7 +21,7 @@ order. The original unpermuted reference remains the default.
 """
 
 import os
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -119,13 +121,19 @@ def cpu_cp_attention():
 
 
 if __name__ == "__main__":
-    if device_type != "cpu":
-        raise RuntimeError("This explicit SDPA substitute requires CPU/Gloo")
     # Set scenario defaults before importing the shared harness's constants.
     os.environ.setdefault("LLMTUNER_TEST_WORLD_SIZE", "4")
     os.environ.setdefault("LLMTUNER_TEST_CP_SIZE", "2")
     os.environ.setdefault("LLMTUNER_TEST_SEQ_LEN", "256")
-    os.environ.setdefault("LLMTUNER_TEST_FSDP_IMPLEMENTATION", "custom")
+    os.environ.setdefault(
+        "LLMTUNER_TEST_FSDP_IMPLEMENTATION",
+        "custom" if device_type == "cpu" else "native",
+    )
+    if device_type != "cpu" and (
+        os.environ.get("LLMTUNER_TEST_CP_FP64_DIAGNOSTIC") == "1"
+        or os.environ.get("LLMTUNER_TEST_CP_REORDER_REFERENCE") == "1"
+    ):
+        raise RuntimeError("FP64/reordered diagnostics require the CPU substitute")
     if os.environ.get("LLMTUNER_TEST_CP_REORDER_REFERENCE") == "1" and (
         os.environ.get("LLMTUNER_TEST_CP_LOAD_BALANCER") != "headtail"
     ):
@@ -134,7 +142,8 @@ if __name__ == "__main__":
         _validate_reordered_reference()
     from tests.integration_tests.pp_equivalence import main
 
-    with ExitStack() as diagnostics, cpu_cp_attention():
+    attention_context = cpu_cp_attention() if device_type == "cpu" else nullcontext()
+    with ExitStack() as diagnostics, attention_context:
         if os.environ.get("LLMTUNER_TEST_CP_FP64_DIAGNOSTIC") == "1":
             original_init = HFTransformerModel.__init__
 

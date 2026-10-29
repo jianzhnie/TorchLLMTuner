@@ -4,7 +4,52 @@ import pytest
 import torch
 from torch import nn
 
+from llmtuner.components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
 from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+
+
+def test_chunked_model_cache_refresh_preserves_storage_and_live_parameter():
+    model = nn.Linear(2, 2, bias=False)
+    transpose = [False]
+
+    def export_chunk(module, state, prefix, metadata):
+        value = state[prefix + "weight"]
+        state[prefix + "weight"] = ChunkedCheckpointTensor(
+            (4, 4), [((0, 0), value.t() if transpose[0] else value)]
+        )
+
+    model.register_state_dict_post_hook(export_chunk)
+    wrapper = ModelCheckpointState(model)
+    first = wrapper.state_dict()["weight"]
+    assert wrapper.state_dict()["weight"] is first
+    before = model.weight.detach().clone()
+    transpose[0] = True
+    refreshed = wrapper.state_dict()["weight"]
+    assert refreshed is not first
+    torch.testing.assert_close(model.weight, before, atol=0, rtol=0)
+    torch.testing.assert_close(refreshed.chunks[0][1], before.t(), atol=0, rtol=0)
+    assert wrapper.state_dict()["weight"] is refreshed
+
+
+@pytest.mark.parametrize("failure", ["offset", "dtype"])
+def test_chunked_model_preflight_rejects_invalid_chunks_without_copying(failure):
+    model = nn.Linear(2, 2, bias=False)
+
+    def export_chunk(module, state, prefix, metadata):
+        state[prefix + "weight"] = ChunkedCheckpointTensor(
+            (4, 4), [((0, 0), state[prefix + "weight"])]
+        )
+
+    model.register_state_dict_post_hook(export_chunk)
+    wrapper = ModelCheckpointState(model)
+    before = model.weight.detach().clone()
+    offset = (2, 2) if failure == "offset" else (0, 0)
+    dtype = torch.float64 if failure == "dtype" else torch.float32
+    bad = ChunkedCheckpointTensor((4, 4), [(offset, torch.zeros(2, 2, dtype=dtype))])
+    message = "chunk layout" if failure == "offset" else "dtype"
+    with pytest.raises(ValueError, match=message):
+        wrapper.validate_state_dict({"weight": bad})
+    torch.testing.assert_close(model.weight, before, atol=0, rtol=0)
 
 
 def test_compiled_model_checkpoint_uses_original_names_and_restores_both_directions():

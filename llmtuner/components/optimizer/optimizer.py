@@ -32,10 +32,16 @@ from ...parallel.expert_parallel.checkpointing import (
     expert_shard_map,
     gather_expert_state,
     load_expert_state,
+    restore_sharded_expert_state,
+    shard_expert_state,
 )
 from ...parallel.tensor_parallel.checkpointing import (
     gather_tensor_parallel_state,
     load_tensor_parallel_state,
+    restore_disjoint_tp_ep_state,
+    restore_sharded_tensor_parallel_state,
+    shard_disjoint_tp_ep_state,
+    shard_tensor_parallel_state,
 )
 from ...utils.logging import get_logger
 from ...utils.module_names import canonical_fqn
@@ -131,6 +137,8 @@ class OptimizersContainer(Optimizer, Stateful):
 
     optimizers: list[Optimizer]
     model_parts: list[nn.Module]
+    sharded_tensor_parallel: bool = False
+    sharded_expert_parallel: bool = False
 
     def __init__(
         self,
@@ -139,10 +147,14 @@ class OptimizersContainer(Optimizer, Stateful):
         model_parts: list[nn.Module],
         pipeline_mesh: DeviceMesh | None = None,
         initialization_group: ProcessGroup | None = None,
+        sharded_tensor_parallel: bool = False,
+        sharded_expert_parallel: bool = False,
     ) -> None:
         all_params: list[nn.Parameter] = []
         self.optimizers = []
         self.model_parts = list(model_parts)
+        self.sharded_tensor_parallel = sharded_tensor_parallel
+        self.sharded_expert_parallel = sharded_expert_parallel
 
         pipeline_group = (
             pipeline_mesh.get_group()
@@ -479,8 +491,18 @@ class OptimizersContainer(Optimizer, Stateful):
         # Expert optimizer states are rank-heterogeneous like the expert
         # weights themselves; gather them to the full tensors the checkpoint
         # stores (parallel/expert_parallel/checkpointing.py).
-        return gather_tensor_parallel_state(
-            gather_expert_state(
+        if self.sharded_tensor_parallel and self.sharded_expert_parallel:
+            return shard_disjoint_tp_ep_state(result, model_parts=self.model_parts)
+        transform = (
+            shard_tensor_parallel_state
+            if self.sharded_tensor_parallel
+            else gather_tensor_parallel_state
+        )
+        expert_transform = (
+            shard_expert_state if self.sharded_expert_parallel else gather_expert_state
+        )
+        return transform(
+            expert_transform(
                 result,
                 shard_map=expert_shard_map(self.model_parts),
                 model_parts=self.model_parts,
@@ -499,11 +521,61 @@ class OptimizersContainer(Optimizer, Stateful):
         # init_optim_state must run first: the unflattening step reads each
         # optimizer's live state to learn which state tensors to expect, so a
         # fresh optimizer would find nothing to write into.
-        state_dict = load_expert_state(
-            load_tensor_parallel_state(state_dict, model_parts=self.model_parts),
-            shard_map=expert_shard_map(self.model_parts),
-            model_parts=self.model_parts,
-        )
+        from ..checkpointer.chunked_tensor import ChunkedCheckpointTensor
+
+        if self.sharded_tensor_parallel and self.sharded_expert_parallel:
+            local_state = {}
+            with synchronize_local_errors(
+                "Optimizer joint chunk destination construction"
+            ):
+                for optimizer in self.optimizers:
+                    init_optim_state(optimizer)
+                    local_state.update(get_flat_optim_state_dict(optimizer))
+            state_dict = restore_disjoint_tp_ep_state(
+                state_dict, local_state=local_state, model_parts=self.model_parts
+            )
+        elif self.sharded_expert_parallel:
+            local_state = {}
+            with synchronize_local_errors("Optimizer EP destination construction"):
+                for optimizer in self.optimizers:
+                    init_optim_state(optimizer)
+                    local_state.update(get_flat_optim_state_dict(optimizer))
+            state_dict = restore_sharded_expert_state(
+                state_dict,
+                local_state=local_state,
+                shard_map=expert_shard_map(self.model_parts),
+                model_parts=self.model_parts,
+                coordinate_errors=True,
+            )
+            state_dict = load_tensor_parallel_state(
+                state_dict, model_parts=self.model_parts
+            )
+        elif self.sharded_tensor_parallel and any(
+            isinstance(value, ChunkedCheckpointTensor) for value in state_dict.values()
+        ):
+            local_state = {}
+            with synchronize_local_errors("Optimizer chunk destination construction"):
+                for optimizer in self.optimizers:
+                    init_optim_state(optimizer)
+                    local_state.update(get_flat_optim_state_dict(optimizer))
+            local_state = gather_expert_state(
+                local_state,
+                shard_map=expert_shard_map(self.model_parts),
+                model_parts=self.model_parts,
+            )
+            state_dict = restore_sharded_tensor_parallel_state(
+                state_dict, local_state=local_state, model_parts=self.model_parts
+            )
+        else:
+            state_dict = load_tensor_parallel_state(
+                state_dict, model_parts=self.model_parts
+            )
+        if not self.sharded_expert_parallel:
+            state_dict = load_expert_state(
+                state_dict,
+                shard_map=expert_shard_map(self.model_parts),
+                model_parts=self.model_parts,
+            )
         # TP/EP layout communication above stays outside this local boundary.
         # Every rank must validate before peers apply state and enter the next
         # checkpoint component's collectives. State initialization hooks must

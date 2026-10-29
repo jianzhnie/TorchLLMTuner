@@ -100,6 +100,21 @@ class LLMTunerConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.model.attention_backend == "eager_flex" and (
+            self.parallel.tp_size > 1
+            or self.parallel.cp_size > 1
+            or self.training.compile
+        ):
+            raise ConfigError(
+                "model.attention_backend='eager_flex' currently requires "
+                "tp_size=1, cp_size=1 and compile=False; use auto for those paths."
+            )
+        if self.model.qkv_projection == "fused" and self.parallel.tp_size > 1:
+            raise ConfigError(
+                "model.qkv_projection='fused' does not yet support tensor parallelism; "
+                "use 'separate' until fused projection collective boundaries "
+                "are adapted."
+            )
         # Cross-group check: the sequence is sharded CP first, TP second, so
         # the real invariant is (T/cp) % tp == 0 -- which, for the contiguous
         # splits both sharders perform, is exactly max_seq_len % (cp * tp) == 0.
@@ -180,6 +195,18 @@ class LLMTunerConfig:
     @property
     def norm_backend(self) -> str:
         return self.model.norm_backend
+
+    @property
+    def qkv_projection(self) -> str:
+        return self.model.qkv_projection
+
+    @property
+    def rotary_init_device(self) -> str:
+        return self.model.rotary_init_device
+
+    @property
+    def attention_backend(self) -> str:
+        return self.model.attention_backend
 
     @property
     def compute_dtype(self) -> str | None:

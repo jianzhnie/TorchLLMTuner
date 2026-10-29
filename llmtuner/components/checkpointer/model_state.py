@@ -20,11 +20,18 @@ from ...parallel.expert_parallel.checkpointing import (
     expert_shard_map,
     gather_expert_state,
     load_expert_state,
+    restore_sharded_expert_state,
+    shard_expert_state,
 )
 from ...parallel.tensor_parallel.checkpointing import (
     gather_tensor_parallel_state,
     load_tensor_parallel_state,
+    restore_disjoint_tp_ep_state,
+    restore_sharded_tensor_parallel_state,
+    shard_disjoint_tp_ep_state,
+    shard_tensor_parallel_state,
 )
+from .chunked_tensor import ChunkedCheckpointTensor
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -64,7 +71,11 @@ class ModelCheckpointState(Stateful):
         model: nn.Module | Sequence[nn.Module],
         *,
         initialization_group: ProcessGroup | None = None,
+        sharded_tensor_parallel: bool = False,
+        sharded_expert_parallel: bool = False,
     ) -> None:
+        self.sharded_tensor_parallel = sharded_tensor_parallel
+        self.sharded_expert_parallel = sharded_expert_parallel
         # Managers opt into a world boundary before any EP collection. Direct
         # state wrappers can be rank-local and retain that default contract.
         with (
@@ -116,10 +127,18 @@ class ModelCheckpointState(Stateful):
                         f"{sorted(duplicates)}. Model parts must use distinct FQNs."
                     )
                 flat.update(part_state)
-        return gather_tensor_parallel_state(
-            gather_expert_state(
-                flat, shard_map=self._ep_shards, model_parts=self.model
-            ),
+        if self.sharded_tensor_parallel and self.sharded_expert_parallel:
+            return shard_disjoint_tp_ep_state(flat, model_parts=self.model)
+        transform = (
+            shard_tensor_parallel_state
+            if self.sharded_tensor_parallel
+            else gather_tensor_parallel_state
+        )
+        expert_transform = (
+            shard_expert_state if self.sharded_expert_parallel else gather_expert_state
+        )
+        return transform(
+            expert_transform(flat, shard_map=self._ep_shards, model_parts=self.model),
             model_parts=self.model,
         )
 
@@ -136,6 +155,11 @@ class ModelCheckpointState(Stateful):
             )
         for key, value in current_state.items():
             cached = self.cached_state_dict.get(key)
+            if isinstance(value, ChunkedCheckpointTensor) and isinstance(
+                cached, ChunkedCheckpointTensor
+            ):
+                self.cached_state_dict[key] = cached.refresh_from(value)
+                continue
             if (
                 not isinstance(value, torch.Tensor)
                 or not isinstance(cached, torch.Tensor)
@@ -190,13 +214,71 @@ class ModelCheckpointState(Stateful):
                     f"Model checkpoint {key!r} has shape {tuple(value.shape)}, "
                     f"expected {tuple(expected.shape)}"
                 )
+            if isinstance(expected, ChunkedCheckpointTensor) and isinstance(
+                value, ChunkedCheckpointTensor
+            ):
+                if value.dtype != expected.dtype:
+                    raise ValueError(
+                        f"Model checkpoint {key!r} dtype differs from destination"
+                    )
+                expected_layout = [
+                    (offset, tensor.shape) for offset, tensor in expected.chunks
+                ]
+                actual_layout = [
+                    (offset, tensor.shape) for offset, tensor in value.chunks
+                ]
+                if actual_layout != expected_layout:
+                    raise ValueError(
+                        f"Model checkpoint {key!r} chunk layout differs "
+                        "from destination"
+                    )
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.validate_state_dict(state_dict)
+        if self.sharded_tensor_parallel and self.sharded_expert_parallel:
+            local_state = {}
+            for model in self.model:
+                local_state.update(model.state_dict())
+            state_dict = restore_disjoint_tp_ep_state(
+                state_dict, local_state=local_state, model_parts=self.model
+            )
+            for model in self.model:
+                model.load_state_dict(state_dict, strict=False)
+            self.cached_state_dict = self._get_state_dict()
+            return
+        if self.sharded_expert_parallel:
+            local_state = {}
+            for model in self.model:
+                local_state.update(model.state_dict())
+            state_dict = restore_sharded_expert_state(
+                state_dict,
+                local_state=local_state,
+                shard_map=self._ep_shards,
+                model_parts=self.model,
+            )
+            state_dict = load_tensor_parallel_state(state_dict, model_parts=self.model)
+            for model in self.model:
+                model.load_state_dict(state_dict, strict=False)
+            self.cached_state_dict = self._get_state_dict()
+            return
+        if self.sharded_tensor_parallel and any(
+            isinstance(value, ChunkedCheckpointTensor) for value in state_dict.values()
+        ):
+            local_state = {}
+            for model in self.model:
+                local_state.update(model.state_dict())
+            local_state = gather_expert_state(
+                local_state, shard_map=self._ep_shards, model_parts=self.model
+            )
+            state_dict = restore_sharded_tensor_parallel_state(
+                state_dict, local_state=local_state, model_parts=self.model
+            )
+        else:
+            state_dict = load_tensor_parallel_state(state_dict, model_parts=self.model)
         # Each PP part consumes its own keys from the combined model state.
         # Other parts' keys are ignored; checkpoint state categories are separate.
         state_dict = load_expert_state(
-            load_tensor_parallel_state(state_dict, model_parts=self.model),
+            state_dict,
             shard_map=self._ep_shards,
             model_parts=self.model,
         )

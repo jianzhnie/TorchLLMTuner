@@ -28,6 +28,7 @@ query and key.
 from __future__ import annotations
 
 import argparse
+import math
 
 import torch
 import torch.distributed as dist
@@ -35,8 +36,8 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.parallel.context_parallel.sdpa_attention import CPSdpaKernel
+from tests.integration_tests.harness import init_distributed
 
-TOL = 1e-12
 HEAD_DIM = 8
 
 
@@ -45,17 +46,26 @@ def main() -> None:
     parser.add_argument("--seq", type=int, default=16)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--kv-heads", type=int, default=2)
+    parser.add_argument("--sliding-window", type=int, default=None)
     args = parser.parse_args()
 
-    dist.init_process_group("gloo")
+    device = init_distributed()
+    dtype = torch.float64 if device.type == "cpu" else torch.float32
+    tolerance = 1e-12 if device.type == "cpu" else 1e-5
     rank = dist.get_rank()
     world = dist.get_world_size()
-    mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("cp",))
+    if args.seq <= 0 or args.seq % world:
+        raise ValueError("sequence length must be positive and divisible by CP size")
+    mesh = init_device_mesh(device.type, (world,), mesh_dim_names=("cp",))
 
     torch.manual_seed(0)
-    q_full = torch.randn(1, args.heads, args.seq, HEAD_DIM, dtype=torch.float64)
-    k_full = torch.randn(1, args.kv_heads, args.seq, HEAD_DIM, dtype=torch.float64)
-    v_full = torch.randn(1, args.kv_heads, args.seq, HEAD_DIM, dtype=torch.float64)
+    q_full = torch.randn(1, args.heads, args.seq, HEAD_DIM, dtype=dtype, device=device)
+    k_full = torch.randn(
+        1, args.kv_heads, args.seq, HEAD_DIM, dtype=dtype, device=device
+    )
+    v_full = torch.randn(
+        1, args.kv_heads, args.seq, HEAD_DIM, dtype=dtype, device=device
+    )
 
     local = args.seq // world
     lo = rank * local
@@ -65,9 +75,17 @@ def main() -> None:
 
     gqa = args.heads != args.kv_heads
     kernel = CPSdpaKernel(cp_mesh=mesh)
-    out = kernel(q, k, v)
+    out = kernel(q, k, v, sliding_window=args.sliding_window)
     out.sum().backward()
 
+    attention_mask = None
+    if args.sliding_window is not None:
+        indices = torch.arange(args.seq, device=device)
+        rows = indices[:, None]
+        cols = indices[None, :]
+        attention_mask = ((cols <= rows) & (rows - cols < args.sliding_window))[
+            None, None
+        ]
     qr = q_full.clone().requires_grad_(True)
     kr = k_full.clone().requires_grad_(True)
     vr = v_full.clone().requires_grad_(True)
@@ -76,10 +94,20 @@ def main() -> None:
         # so this rank's query rows are dim 1. The gradients below stay
         # HF-shaped (batch, heads, seq, dim) and slice dim 2 instead.
         ref = F.scaled_dot_product_attention(
-            qr, kr, vr, is_causal=True, enable_gqa=gqa
+            qr,
+            kr,
+            vr,
+            attn_mask=attention_mask,
+            is_causal=args.sliding_window is None,
+            enable_gqa=gqa,
         ).transpose(1, 2)[:, lo : lo + local]
     F.scaled_dot_product_attention(
-        qr, kr, vr, is_causal=True, enable_gqa=gqa
+        qr,
+        kr,
+        vr,
+        attn_mask=attention_mask,
+        is_causal=args.sliding_window is None,
+        enable_gqa=gqa,
     ).sum().backward()
 
     with torch.no_grad():
@@ -89,14 +117,19 @@ def main() -> None:
             "k grad": (k.grad - kr.grad[:, :, lo : lo + local]).abs().max().item(),
             "v grad": (v.grad - vr.grad[:, :, lo : lo + local]).abs().max().item(),
         }
-    failed = [name for name, diff in diffs.items() if diff > TOL]
-    bad = torch.tensor([1.0 if failed else 0.0])
+    failed = [
+        name
+        for name, diff in diffs.items()
+        if not math.isfinite(diff) or diff > tolerance
+    ]
+    bad = torch.tensor([1.0 if failed else 0.0], device=device)
     dist.all_reduce(bad, op=dist.ReduceOp.MAX)
 
     if rank == 0:
         print(
             f"seq={args.seq} heads={args.heads} kv_heads={args.kv_heads} "
-            f"cp={world} tol={TOL:g}"
+            f"cp={world} sliding_window={args.sliding_window} "
+            f"tol={tolerance:g} device={device}"
         )
         for name, diff in diffs.items():
             print(f"  {name:<8} max abs diff = {diff:.3e}")

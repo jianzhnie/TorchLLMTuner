@@ -14,8 +14,8 @@ the final parameters.
 Two variants, selected by env var:
 
 * default (``CHUNKED_LOSS_EQ_TP`` unset): dp_shard=2, so the chunked backward
-  composes with FSDP2 -- the lm_head's gradient is reduce-scattered once per
-  chunk, which must sum to the same sharded gradient the plain path produces.
+  composes with FSDP2 -- the root-owned head accumulates gradients across
+  chunks before the decoder backward reduces the combined gradients.
   Parameters are compared through ``full_tensor()``.
 * ``CHUNKED_LOSS_EQ_TP=2``: tp=2, dp_shard=1. Each rank's hidden states are a
   T/tp sequence shard (the sequence-parallelism premise); chunking that local
@@ -25,7 +25,8 @@ Two variants, selected by env var:
   trajectory only (the TP weight-layout comparison is tp_equivalence.py's
   job, not this one's).
 
-Everything runs in fp32 on CPU/gloo.
+Set CHUNKED_LOSS_EQ_TIED=1 to share embedding/head parameters. Runs in FP32
+on the selected harness device (CPU/gloo or NPU/HCCL).
 """
 
 from __future__ import annotations
@@ -73,6 +74,8 @@ DP_SHARD = 2 // TP
 # per-chunk reduce-scatters), which sit at ~1e-6 relative.
 LOSS_TOL = 1e-4
 PARAM_TOL = 1e-4
+GRAD_ATOL = 1e-5
+GRAD_RTOL = 1e-4
 
 
 def _cfg() -> LLMTunerConfig:
@@ -85,6 +88,9 @@ def _cfg() -> LLMTunerConfig:
             num_hidden_layers=2,
             num_attention_heads=4,
             num_key_value_heads=4,
+            arch_overrides={
+                "tie_word_embeddings": os.environ.get("CHUNKED_LOSS_EQ_TIED") == "1"
+            },
         ),
         parallel=ParallelConfig(
             tensor_parallel_size=TP,
@@ -103,7 +109,9 @@ def _cfg() -> LLMTunerConfig:
     )
 
 
-def _reference_trajectory(cfg: LLMTunerConfig) -> tuple[list[float], dict]:
+def _reference_trajectory(
+    cfg: LLMTunerConfig,
+) -> tuple[list[float], dict, list[dict[str, torch.Tensor]]]:
     """The same training, un-chunked and unparallelized: one process, full batch.
 
     Mirrors the trainer's non-PP step arithmetic exactly. As in
@@ -127,6 +135,7 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> tuple[list[float], dict]:
     )
     rows_per_dp = cfg.global_batch_size // DP_SHARD
     losses = []
+    gradients = []
     for _ in range(cfg.steps):
         optimizer.zero_grad(set_to_none=True)
         batch = moved_batch(next(batches))
@@ -146,10 +155,16 @@ def _reference_trajectory(cfg: LLMTunerConfig) -> tuple[list[float], dict]:
         # Normalized BEFORE backward, as the trainer does.
         (loss_sum / num_valid).backward()
         clip_grad_norm_(model.parameters(), max_norm=cfg.max_norm, foreach=True)
+        gradients.append(
+            {
+                name: parameter.grad.detach().clone()
+                for name, parameter in model.named_parameters()
+            }
+        )
         optimizer.step()
         losses.append(float(loss_sum / num_valid))
     params = {name: p.detach().clone() for name, p in model.named_parameters()}
-    return losses, params
+    return losses, params, gradients
 
 
 def _full(t: torch.Tensor) -> torch.Tensor:
@@ -163,20 +178,38 @@ def main() -> None:
 
     # Trainer init owns the process group (torchrun env).
     trainer = Trainer(cfg)
+    assert trainer.model_parts[0].enable_weight_tying == (
+        os.environ.get("CHUNKED_LOSS_EQ_TIED") == "1"
+    )
     rank = trainer.rank
     world = trainer.world_size
     assert world == TP * DP_SHARD == 2, f"this check assumes 2 ranks, got {world}"
 
-    reference, ref_params = _reference_trajectory(cfg)
+    reference, ref_params, ref_gradients = _reference_trajectory(cfg)
 
     # -- the trajectory, through the real Trainer, chunked ---------------------
     data_iterator = trainer.data_iterator()
     losses = []
-    for _ in range(STEPS):
+    max_grad_diff = 0.0
+    for step in range(STEPS):
         trainer.step += 1
         metrics = trainer.train_step(data_iterator)
         assert metrics is not None  # log_freq=1: every step reports
         losses.append(metrics["loss"])
+        if TP == 1:
+            for name, parameter in trainer.model_parts[0].named_parameters():
+                if parameter.grad is None:
+                    failures.append(f"rank {rank}: step {step + 1} missing grad {name}")
+                    continue
+                actual = _full(parameter.grad)
+                expected = ref_gradients[step][name]
+                max_grad_diff = max(
+                    max_grad_diff, (actual - expected).abs().max().item()
+                )
+                if not torch.allclose(actual, expected, atol=GRAD_ATOL, rtol=GRAD_RTOL):
+                    failures.append(
+                        f"rank {rank}: step {step + 1} gradient {name} differs"
+                    )
 
     max_loss_diff = 0.0
     for step, (got, want) in enumerate(zip(losses, reference, strict=True), 1):
@@ -222,6 +255,7 @@ def main() -> None:
         print(f"loss   max abs diff = {max_loss_diff:.3e}")
         if TP == 1:
             print(f"params max abs diff = {max_param_diff:.3e}")
+            print(f"gradients max abs diff = {max_grad_diff:.3e}")
         print(f"failed ranks     = {int(local_ok.item())}")
         for f in failures:
             print(f"  FAIL {f}")

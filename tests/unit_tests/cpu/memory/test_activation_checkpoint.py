@@ -37,6 +37,8 @@ require_env(
 
 
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -396,7 +398,8 @@ def test_the_pp_path_checkpoints_every_stage_chunk(monkeypatch) -> None:
         lambda schedule_stages, **kwargs: None,
     )
     monkeypatch.setattr(
-        "llmtuner.parallel.parallelize.apply_fsdp", lambda m, cfg, parallel_dims: m
+        "llmtuner.parallel.parallelize.apply_fsdp",
+        lambda model, cfg, parallel_dims, chunked_loss_num_chunks: model,
     )
 
     setup = parallelize_hf_transformers(
@@ -428,7 +431,8 @@ def test_the_pp_path_is_a_no_op_when_ac_is_off(monkeypatch) -> None:
         lambda schedule_stages, **kwargs: None,
     )
     monkeypatch.setattr(
-        "llmtuner.parallel.parallelize.apply_fsdp", lambda m, cfg, parallel_dims: m
+        "llmtuner.parallel.parallelize.apply_fsdp",
+        lambda model, cfg, parallel_dims, chunked_loss_num_chunks: model,
     )
 
     setup = parallelize_hf_transformers(
@@ -833,6 +837,34 @@ def test_full_ac_matches_uncheckpointed_bitwise_on_moe() -> None:
         assert p.grad is not None, f"{name} got no gradient under full AC"
         ref_name = name.replace("._checkpoint_wrapped_module", "")
         assert torch.equal(p.grad, ref_grads[ref_name]), f"{name} grad differs"
+
+
+def test_checkpoint_replay_restores_spmd_on_backward_thread(monkeypatch):
+    from llmtuner.accelerator import spmd as mesh_module
+    from llmtuner.memory.activation_checkpoint import checkpoint_contexts, full_policy
+
+    monkeypatch.setattr(
+        mesh_module.spmd, "set_current_mesh", lambda mesh: nullcontext()
+    )
+    dense, sparse = object(), object()
+    topology = SimpleNamespace(
+        spmd_dense_mesh=lambda: dense, spmd_sparse_mesh=lambda: sparse
+    )
+    with mesh_module.spmd_context(topology):
+        _, replay = checkpoint_contexts(full_policy)
+
+    def run():
+        assert mesh_module.current_spmd_mesh() is None
+        for _ in range(2):
+            with replay:
+                assert mesh_module.current_spmd_mesh() is dense
+                assert mesh_module.spmd_dense_mesh() is dense
+                assert mesh_module.spmd_sparse_mesh() is sparse
+            assert mesh_module.current_spmd_mesh() is None
+            assert mesh_module.spmd_sparse_mesh() is None
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(run).result()
 
 
 @pytest.mark.parametrize("layers", [None, [], {}])

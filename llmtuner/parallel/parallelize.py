@@ -28,6 +28,7 @@ from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.parallel_config import ParallelConfig
 
 from ..memory.activation_checkpoint import apply_ac
+from .compatibility import chunked_loss_fsdp
 from .context_parallel.context_parallel import apply_cp
 from .expert_parallel.expert_parallel import apply_ep
 from .fully_shard_parallel.fully_shard_parallel import apply_fsdp
@@ -63,6 +64,7 @@ def parallelize_hf_transformers(
     memory_budget_ac: MemoryBudgetACConfig | None = None,
     region_ac: RegionACConfig | None = None,
     global_batch_size: int | None = None,
+    chunked_loss_num_chunks: int = 1,
 ) -> nn.Module | PipelineParallelSetup:
     """Transform a model using parallel config and explicit training options.
 
@@ -74,6 +76,10 @@ def parallelize_hf_transformers(
     ``PipelineParallelSetup`` containing local parts, stages, and schedule.
     Other runs return the transformed module.
     """
+
+    if chunked_loss_num_chunks > 1 and compile and parallel_dims is not None:
+        if parallel_dims.dp_cp_enabled:
+            chunked_loss_fsdp(chunked_loss_num_chunks, compile=True)
 
     def apply_stages(
         part: nn.Module,
@@ -115,6 +121,7 @@ def parallelize_hf_transformers(
                 apply_fsdp,
                 cfg=fsdp_cfg,
                 parallel_dims=parallel_dims,
+                chunked_loss_num_chunks=chunked_loss_num_chunks,
             ),
         }
         for name in STAGE_ORDER:
@@ -128,7 +135,10 @@ def parallelize_hf_transformers(
                     )
                 elif name == "fsdp" and references is not None:
                     part = apply_fsdp(
-                        part, cfg=references.bind(part), parallel_dims=parallel_dims
+                        part,
+                        cfg=references.bind(part),
+                        parallel_dims=parallel_dims,
+                        chunked_loss_num_chunks=chunked_loss_num_chunks,
                     )
                 else:
                     part = runners[name](part)

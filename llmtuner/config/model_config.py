@@ -45,9 +45,27 @@ class ModelConfig:
     norm_backend: str = field(
         default="native",
         metadata={
-            "help": "Qwen3 RMSNorm: native or aten (CPU first-order ATen "
-            "boundaries for eager/Inductor reproducibility; slower)."
+            "help": "Qwen3 RMSNorm: native, aten (CPU first-order boundaries), "
+            "or joint (dense Qwen3 first-order norm/residual boundary)."
         },
+    )
+    qkv_projection: str = field(
+        default="separate",
+        metadata={
+            "help": "Qwen3 QKV projection: separate or fused. Fused uses one GEMM "
+            "with the existing parameters; tensor parallelism is not yet supported."
+        },
+    )
+    rotary_init_device: str = field(
+        default="constructor",
+        metadata={
+            "help": "RoPE initialization: constructor (HF default) or target "
+            "(rebuild dense Qwen3 default frequencies on the training device)."
+        },
+    )
+    attention_backend: str = field(
+        default="auto",
+        metadata={"help": "Attention backend: auto or eager_flex (CPU/NPU math Flex)."},
     )
     compute_dtype: str | None = field(
         default=None,
@@ -78,8 +96,18 @@ class ModelConfig:
                 setattr(self, name, getattr(architecture, name))
 
     def __post_init__(self) -> None:
-        if self.norm_backend not in ("native", "aten"):
-            raise ConfigError("model.norm_backend must be 'native' or 'aten'.")
+        if self.attention_backend not in ("auto", "eager_flex"):
+            raise ConfigError("model.attention_backend must be 'auto' or 'eager_flex'.")
+        if self.rotary_init_device not in ("constructor", "target"):
+            raise ConfigError(
+                "model.rotary_init_device must be 'constructor' or 'target'."
+            )
+        if self.qkv_projection not in ("separate", "fused"):
+            raise ConfigError("model.qkv_projection must be 'separate' or 'fused'.")
+        if self.norm_backend not in ("native", "aten", "joint"):
+            raise ConfigError(
+                "model.norm_backend must be 'native', 'aten', or 'joint'."
+            )
         # Architecture numbers must be sane before any model build: an invalid
         # value here used to surface deep inside HF's for_model or the
         # wrapper's forward, long after the config was accepted.

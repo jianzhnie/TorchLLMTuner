@@ -45,18 +45,21 @@ def _isolate_norm_input(module, args, kwargs):
 
 
 def stabilize_residual_norm_gradients(model: nn.Module) -> None:
-    """Give known Qwen3 residual norms a shared-storage gradient merge boundary.
+    """Select known Qwen3 residual gradient boundaries before parallel transforms.
 
     Without the view, eager may accumulate the residual between RMSNorm's two
     backward contributions. AOT instead sums those contributions inside its
     graph. The view makes both merge the norm gradient before the residual,
-    without copying activation data or changing parameters and checkpoint keys.
-    Apply at construction in both execution modes, before parallel transforms.
+    without copying activation data. Joint mode additionally owns norm/residual
+    gradients through a paired operator and retains the view hooks. Neither mode
+    changes registered parameters or checkpoint keys.
     """
     model_type = getattr(model.config, "model_type", None)
     backend = getattr(model.config, "norm_backend", "native")
-    if backend not in ("native", "aten"):
-        raise ValueError("model.norm_backend must be 'native' or 'aten'")
+    if backend not in ("native", "aten", "joint"):
+        raise ValueError("model.norm_backend must be 'native', 'aten', or 'joint'")
+    if backend == "joint" and model_type != "qwen3":
+        raise ValueError("model.norm_backend='joint' requires dense Qwen3")
     if backend == "aten" and model_type not in ("qwen3", "qwen3_moe"):
         raise ValueError("model.norm_backend='aten' requires qwen3 or qwen3_moe")
     if model_type == "qwen3":
@@ -79,7 +82,7 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
                 del module._forward_pre_hooks[key]
                 module._forward_pre_hooks_with_kwargs.pop(key, None)
         if (
-            backend == "native"
+            backend != "aten"
             and "forward" in module.__dict__
             and getattr(module.forward, "__module__", None)
             == f"{__package__}.normalization"
@@ -88,6 +91,25 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
 
             if getattr(module.forward, "__func__", None) is forward_aten_rms_norm:
                 del module.forward
+        if backend != "joint" and getattr(module.forward, "__module__", None) == (
+            f"{__package__}.residual_normalization"
+        ):
+            from .residual_normalization import forward_joint_residual_norm
+
+            if getattr(module.forward, "__func__", None) is forward_joint_residual_norm:
+                del module.forward
+    if backend != "joint":
+        for layer in model.model.layers:
+            if getattr(layer.forward, "__module__", None) == (
+                f"{__package__}.residual_normalization"
+            ):
+                from .residual_normalization import forward_joint_residual_block
+
+                if (
+                    getattr(layer.forward, "__func__", None)
+                    is forward_joint_residual_block
+                ):
+                    del layer.forward
     if backend == "aten":
         from types import MethodType
 
@@ -104,6 +126,10 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
                 norm._forward_pre_hooks.values()
             ):
                 norm.register_forward_pre_hook(_isolate_norm_input, with_kwargs=True)
+    if backend == "joint":
+        from .residual_normalization import apply_joint_residual_norm
+
+        apply_joint_residual_norm(model)
 
 
 def resolve_submodule_name(

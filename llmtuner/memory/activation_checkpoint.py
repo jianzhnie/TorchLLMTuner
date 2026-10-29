@@ -103,6 +103,7 @@ from llmtuner.config.activation_checkpoint_config import (
 )
 
 from ..accelerator.capabilities import has
+from ..accelerator.spmd import capture_spmd_context
 from ..errors import EnvironmentUnsupportedError
 from ..models.common.aux_loss import AuxLoss, in_checkpoint_recompute
 from ..utils.logging import get_logger
@@ -337,6 +338,7 @@ def full_policy(_ctx, _op, *_args, **_kwargs) -> CheckpointPolicy:
 def checkpoint_contexts(policy: Callable, module: nn.Module | None = None):
     """Keep checkpoint's op policy while marking its backward-time replay."""
     forward_context, recompute_context = create_selective_checkpoint_contexts(policy)
+    replay_spmd_context = capture_spmd_context()
     # HF stages masks outside decoder layers. Multiple outstanding forwards
     # must retain their own masks until their checkpoint backward executes.
     from llmtuner.models.common.moe.layer import MoE
@@ -358,13 +360,16 @@ def checkpoint_contexts(policy: Callable, module: nn.Module | None = None):
         for child, mask in masks:
             child.set_padding_mask(mask)
         try:
-            yield
+            with replay_spmd_context():
+                yield
         finally:
             for child, mask in current_masks:
                 child.set_padding_mask(mask)
             in_checkpoint_recompute.reset(token)
 
     class RecomputeContext(type(recompute_context)):
+        supports_higher_order_operators = True
+
         # Checkpoint may replay again for a retained graph. Generator context
         # managers are single-use, so create one for each entry.
         def __enter__(self):

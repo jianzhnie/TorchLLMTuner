@@ -70,6 +70,88 @@ _HIDDEN = 8
 _NUM_LAYERS = 3
 
 
+def test_hsdp_cp_mesh_reuses_existing_groups(monkeypatch):
+    from types import SimpleNamespace
+
+    replicate_group = object()
+    shard_group = object()
+    selections = []
+
+    class Submesh:
+        mesh = torch.arange(4).reshape(2, 1, 2)
+        device_type = "cpu"
+
+        def __getitem__(self, axes):
+            selections.append(axes)
+            if axes == "dp_replicate":
+                return SimpleNamespace(get_group=lambda: replicate_group)
+            assert axes == ("dp_shard", "cp")
+
+            def flatten(name):
+                assert name == "dp_shard_cp"
+                return SimpleNamespace(get_group=lambda: shard_group)
+
+            return SimpleNamespace(_flatten=flatten)
+
+    def optional_mesh(axes):
+        assert axes == ["dp_replicate", "dp_shard", "cp"]
+        return Submesh()
+
+    captured = {}
+
+    def from_group(groups, device_type, *, mesh, mesh_dim_names):
+        captured.update(groups=groups, device_type=device_type, names=mesh_dim_names)
+        torch.testing.assert_close(mesh, torch.arange(4).reshape(2, 2))
+        return "reused_mesh"
+
+    monkeypatch.setattr(apply.DeviceMesh, "from_group", staticmethod(from_group))
+    topology = SimpleNamespace(
+        cp_enabled=True,
+        dp_replicate_enabled=True,
+        get_optional_mesh=optional_mesh,
+    )
+    assert apply.resolve_fsdp_mesh(topology) == "reused_mesh"
+    assert captured == {
+        "groups": [replicate_group, shard_group],
+        "device_type": "cpu",
+        "names": ("dp_replicate", "dp_shard_cp"),
+    }
+    assert selections == [("dp_shard", "cp"), "dp_replicate"]
+
+
+@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize("first_stage", [False, True])
+def test_decoder_fsdp_excludes_pipeline_identity_boundaries(
+    monkeypatch, tied, first_stage
+):
+    from types import SimpleNamespace
+
+    model = nn.Module()
+    model.enable_weight_tying = tied
+    model.tok_embeddings = nn.Embedding(8, 4) if first_stage else nn.Identity()
+    model.norm = nn.Identity() if first_stage else nn.LayerNorm(4)
+    model.lm_head = nn.Identity() if first_stage else nn.Linear(4, 8)
+    model.layers = nn.ModuleList([nn.Linear(4, 4)])
+    calls = []
+    monkeypatch.setattr(
+        apply, "fully_shard", lambda modules, **kwargs: calls.append(modules)
+    )
+    monkeypatch.setattr(apply, "enable_fsdp_symm_mem", lambda *args: None)
+    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda *args: None)
+    apply.apply_fsdp_to_decoder(
+        model,
+        SimpleNamespace(mesh_dim_names=("dp_shard",)),
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        pp_enabled=True,
+    )
+    boundary = calls[0] if isinstance(calls[0], list) else [calls[0]]
+    expected = [model.tok_embeddings] if first_stage else [model.norm, model.lm_head]
+    assert boundary == expected
+    assert calls[1:] == [model.layers[0], model]
+    assert all(type(module) is not nn.Identity for module in boundary)
+
+
 def _wrapper(*, tied: bool = False) -> HFTransformerModel:
     config = build_model_config(
         "llama",
@@ -85,6 +167,36 @@ def _wrapper(*, tied: bool = False) -> HFTransformerModel:
         },
     )
     return HFTransformerModel(config)
+
+
+@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize("shared_layer", [False, True])
+def test_chunked_boundaries_and_actual_aliases_are_owned_by_root(
+    monkeypatch, tied, shared_layer
+):
+    from types import SimpleNamespace
+
+    model = _wrapper(tied=tied)
+    model.model.config.tie_word_embeddings = not tied
+    if shared_layer:
+        model.norm.weight = model.layers[0].input_layernorm.weight
+    calls = []
+    monkeypatch.setattr(
+        apply, "fully_shard", lambda module, **options: calls.append((module, options))
+    )
+    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda *args: None)
+    apply.apply_fsdp_to_decoder(
+        model,
+        SimpleNamespace(mesh_dim_names=("dp_shard",)),
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        pp_enabled=False,
+        root_owned_boundaries=True,
+    )
+    expected_layers = list(model.layers)[1:] if shared_layer else list(model.layers)
+    assert [module for module, _ in calls] == [*expected_layers, model]
+    assert calls[-1][1]["reshard_after_forward"] is False
+    assert model.enable_weight_tying == tied
 
 
 # -- container layout --------------------------------------------------------

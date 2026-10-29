@@ -24,6 +24,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...accelerator import distributed
 from ...accelerator.capabilities import has as capability
 from ...utils.logging import get_logger
+from ..compatibility import chunked_loss_fsdp
 from ..topology import ParallelTopology
 from .fine_grained import get_fsdp_strategy
 from .plan import apply_fsdp_by_pattern, set_fsdp_prefetch_windows
@@ -100,13 +101,12 @@ def resolve_fsdp_mesh(parallel_dims: ParallelTopology) -> DeviceMesh:
     if len(shard_axes) == 1:
         # 2-D (dp_replicate, dp_shard): HSDP as torch reads it by default.
         return submesh
-    # 3-D (dp_replicate, dp_shard, cp): DeviceMesh has no partial flatten, so
-    # rebuild from the rank tensor. Row-major reshape keeps dp_replicate on
-    # dim 0 and folds (dp_shard, cp) into a single shard dim 1.
     flat_ranks = submesh.mesh.reshape(submesh.mesh.size(0), -1)
-    return DeviceMesh(
+    shard_mesh = submesh[tuple(shard_axes)]._flatten("dp_shard_cp")
+    return DeviceMesh.from_group(
+        [submesh[replicate_axis].get_group(), shard_mesh.get_group()],
         submesh.device_type,
-        flat_ranks,
+        mesh=flat_ranks,
         mesh_dim_names=(replicate_axis, "dp_shard_cp"),
     )
 
@@ -311,6 +311,7 @@ def apply_fsdp_to_decoder(
     forward_prefetch_count: int = 0,
     backward_prefetch_count: int = 0,
     fsdp_implementation: str = "native",
+    root_owned_boundaries: bool = False,
 ) -> None:
     """Apply FSDP in place to a decoder-style transformer model.
 
@@ -344,6 +345,10 @@ def apply_fsdp_to_decoder(
         symm_mem_scope (str | None): Symmetric-memory scope passed to
             ``enable_fsdp_symm_mem``: ``None`` disables it, ``"all"`` covers
             every FSDP module, ``"dense"`` skips MoE (sparse) blocks.
+        root_owned_boundaries (bool): Keep embedding, norm, head and their
+            aliased consumers in the root unit. Its unsharded parameters stay
+            available for external chunked-head backwards until the decoder
+            backward reduces the complete gradients.
 
     Upstream additionally takes ``dp_mesh_dims``/``edp_mesh_dims``: the
     explicit declaration of which axes of a multi-dimensional SPMD mesh are
@@ -355,6 +360,10 @@ def apply_fsdp_to_decoder(
     ``resolve_fsdp_mesh``).
     """
     strategy = get_fsdp_strategy(fsdp_implementation)
+    if root_owned_boundaries and (
+        fsdp_implementation != "native" or cpu_offload or pp_enabled or ep_degree > 1
+    ):
+        raise ValueError("root-owned boundaries require native decoder-only FSDP")
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
@@ -382,17 +391,20 @@ def apply_fsdp_to_decoder(
     boundary = [
         module
         for module in (model.tok_embeddings, model.norm, model.lm_head)
-        if module is not None
+        if module is not None and type(module) is not nn.Identity
     ]
     final_reshard = reshard_after_forward_policy == "always"
     if model.enable_weight_tying:
         if boundary:
             units.append((boundary, final_reshard))
     else:
-        if model.tok_embeddings is not None:
+        if model.tok_embeddings in boundary:
             units.append(([model.tok_embeddings], reshard_after_forward))
-        if model.norm is not None and model.lm_head is not None:
-            units.append(([model.norm, model.lm_head], final_reshard))
+        final_modules = [
+            module for module in (model.norm, model.lm_head) if module in boundary
+        ]
+        if final_modules:
+            units.append((final_modules, final_reshard))
     boundary_count = len(units)
     units.extend(
         ([block], reshard_after_forward)
@@ -459,6 +471,10 @@ def apply_fsdp_to_decoder(
         if module not in nested_modules
         for parameter in module.parameters(recurse=False)
     }
+    if root_owned_boundaries:
+        root_parameters.update(
+            parameter for module in boundary for parameter in module.parameters()
+        )
     root_index = len(units)
     units.append(([model], False))
     groups = {index: {index} for index in range(len(units))}
@@ -485,6 +501,8 @@ def apply_fsdp_to_decoder(
         modules = list(
             dict.fromkeys(module for owner in owners for module in units[owner][0])
         )
+        if root_owned_boundaries and root_index in owners:
+            modules = [model]
         # One state has one reshard policy. Retain any boundary unit's request
         # to keep parameters available through its last forward consumer.
         reshard = all(units[owner][1] for owner in owners)
@@ -581,6 +599,8 @@ def apply_fsdp(
     model: torch.nn.Module,
     cfg: ParallelConfig,
     parallel_dims: ParallelTopology | None = None,
+    *,
+    chunked_loss_num_chunks: int = 1,
 ) -> torch.nn.Module:
     """Fully-shard ``model`` (FSDP2). No-op when no DP/CP axis is active.
 
@@ -616,6 +636,17 @@ def apply_fsdp(
     # size 1 while the remaining expert-FSDP (efsdp) axis is still multi-rank.
     if storage_mesh.size() == 1 and (edp_mesh is None or edp_mesh.size() == 1):
         return model
+    if chunked_loss_num_chunks > 1:
+        chunked_loss_fsdp(
+            chunked_loss_num_chunks,
+            fsdp_config=cfg.fsdp_config,
+            hybrid_parallel=(
+                parallel_dims.tp_enabled
+                or parallel_dims.cp_enabled
+                or parallel_dims.ep_enabled
+                or parallel_dims.pp_enabled
+            ),
+        )
 
     # Preserve the dtype selected at model construction. Hard-coding float32
     # here silently makes FSDP all-gather BF16 parameters as FP32, doubling the
@@ -670,6 +701,7 @@ def apply_fsdp(
         forward_prefetch_count=cfg.fsdp_config.fsdp_forward_prefetch_count,
         backward_prefetch_count=cfg.fsdp_config.fsdp_backward_prefetch_count,
         fsdp_implementation=cfg.fsdp_config.fsdp_implementation,
+        root_owned_boundaries=chunked_loss_num_chunks > 1,
     )
     # ``apply_fsdp_to_decoder`` already calls ``disable_fsdp_gradient_division``
     # and, when asked, ``enable_fsdp_symm_mem``; do not repeat them here.

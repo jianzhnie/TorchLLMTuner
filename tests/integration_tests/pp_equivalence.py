@@ -11,6 +11,15 @@ Append an accumulation count after the schedule (for example 1F1B 2).
 Set LLMTUNER_TEST_OPTIMIZER_GROUPS=1 for embedding/head/stage-specific rules.
 Use four ranks with LLMTUNER_TEST_WORLD_SIZE=4 and
 LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom for PP2 × custom FSDP2.
+Set LLMTUNER_TEST_DP_REPLICATE_SIZE=2 to test replicated DP independently.
+For eight-rank HSDP2x2 x PP2, also set LLMTUNER_TEST_GLOBAL_BATCH=16
+so every DP rank has at least four rows for the four microbatches.
+Set LLMTUNER_TEST_AC=full or selective to compare checkpointed stages
+against the uncheckpointed dense reference.
+Set LLMTUNER_TEST_REQUIRE_RECOMPUTE=1 with full/selective AC to require
+nonzero original-forward and recompute calls per local decoder at every step.
+Set LLMTUNER_TEST_CP_STRATEGY=ulysses, LLMTUNER_TEST_ULYSSES_SIZE=2 and
+LLMTUNER_TEST_CP_SIZE=1 for the single-axis Ulysses path.
 The dense reference uses the same per-DP-rank microbatch boundaries.
 
 A tiny offline qwen3 (random init, fixed seed) goes through the real
@@ -48,7 +57,7 @@ import sys
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
@@ -71,12 +80,13 @@ from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer
+from llmtuner.utils.module_names import canonical_fqn
 from tests.integration_tests.harness import device as harness_device
 from tests.integration_tests.harness import moved, moved_batch
 
 STEPS = 4
 MICROBATCHES = 4
-GLOBAL_BATCH = 8
+GLOBAL_BATCH = int(os.environ.get("LLMTUNER_TEST_GLOBAL_BATCH", "8"))
 SEQ = int(os.environ.get("LLMTUNER_TEST_SEQ_LEN", "32"))
 VOCAB = 128
 SEED = 42
@@ -121,12 +131,21 @@ def _cfg(schedule: str) -> LLMTunerConfig:
             context_parallel_kv_allgather_size=int(
                 os.environ.get("LLMTUNER_TEST_CP_SIZE", "1")
             ),
+            context_parallel_ulysses_size=int(
+                os.environ.get("LLMTUNER_TEST_ULYSSES_SIZE", "1")
+            ),
             cp_config=ContextParallelConfig(
+                context_parallel_strategy=os.environ.get(
+                    "LLMTUNER_TEST_CP_STRATEGY", "kv_allgather"
+                ),
                 context_parallel_load_balancer=os.environ.get(
                     "LLMTUNER_TEST_CP_LOAD_BALANCER"
-                )
+                ),
             ),
             data_parallel_shard_size=-1,
+            data_parallel_replicate_size=int(
+                os.environ.get("LLMTUNER_TEST_DP_REPLICATE_SIZE", "1")
+            ),
             fsdp_config=FSDPConfig(
                 fsdp_implementation=os.environ.get(
                     "LLMTUNER_TEST_FSDP_IMPLEMENTATION", "native"
@@ -158,6 +177,7 @@ def _cfg(schedule: str) -> LLMTunerConfig:
             steps=STEPS,
             seed=SEED,
             deterministic=True,
+            activation_checkpoint_mode=os.environ.get("LLMTUNER_TEST_AC", "none"),
             metrics_config=MetricsConfig(log_freq=1),
         ),
     )
@@ -270,6 +290,16 @@ def main() -> None:
 
     # Trainer init owns the process group (torchrun env); pp=2 over 2 ranks.
     trainer = Trainer(cfg)
+    if cfg.training.activation_checkpoint_mode in {"full", "selective"}:
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointWrapper,
+        )
+
+        assert all(
+            isinstance(layer, CheckpointWrapper)
+            for part in trainer.model_parts
+            for layer in part.layers
+        ), "requested AC must wrap every local decoder layer"
     rank = trainer.rank
     assert trainer.world_size == int(os.environ.get("LLMTUNER_TEST_WORLD_SIZE", "2")), (
         f"unexpected world size: {trainer.world_size}"
@@ -277,6 +307,31 @@ def main() -> None:
     pp_rank = trainer.parallel_dims.get_mesh("pp").get_local_rank()
     _, dp_size = trainer.dp_rank_world_size()
     replicas = trainer.world_size // cfg.parallel.pp_size
+    assert (
+        trainer.parallel_dims.dp_replicate == cfg.parallel.data_parallel_replicate_size
+    )
+    if trainer.parallel_dims.dp_replicate > 1:
+        for part in trainer.model_parts:
+            parameters = list(part.parameters())
+            assert parameters
+            for parameter in parameters:
+                assert isinstance(parameter, DTensor)
+                mesh = parameter.device_mesh
+                assert "dp_replicate" in mesh.mesh_dim_names
+                replica_axis = mesh.mesh_dim_names.index("dp_replicate")
+                assert (
+                    mesh.size(replica_axis) == cfg.parallel.data_parallel_replicate_size
+                )
+                assert isinstance(parameter.placements[replica_axis], Replicate)
+    if trainer.parallel_dims.dp_shard > 1:
+        sharded_parameters = [
+            parameter
+            for part in trainer.model_parts
+            for parameter in part.parameters()
+            if isinstance(parameter, DTensor)
+            and parameter.to_local().numel() < parameter.numel()
+        ]
+        assert sharded_parameters, "no parameter was actually FSDP-sharded"
 
     # -- non-vacuity: this rank holds its stages and only their layers -------
     assert len(trainer.model_parts) == stages_per_rank
@@ -329,6 +384,23 @@ def main() -> None:
             f"the replicated logical model has {reference_numel * replicas}"
         )
 
+    if os.environ.get("LLMTUNER_TEST_TRACE_STATE_MESH") == "1":
+        for part in trainer.model_parts:
+            for name, value in part.state_dict().items():
+                if isinstance(value, DTensor):
+                    mesh = value.device_mesh
+                    groups = [
+                        dist.get_process_group_ranks(mesh.get_group(axis))
+                        for axis in range(mesh.ndim)
+                    ]
+                    print(
+                        f"STATE_MESH rank={rank} name={name} "
+                        f"shape={tuple(value.shape)} "
+                        f"local={tuple(value.to_local().shape)} "
+                        f"mesh={mesh.mesh.tolist()} groups={groups} "
+                        f"placements={value.placements}",
+                        flush=True,
+                    )
     local_initial_state = {
         key: (value.full_tensor() if isinstance(value, DTensor) else value)
         .detach()
@@ -350,11 +422,43 @@ def main() -> None:
     pp_snapshots = []
     for step in range(STEPS):
         trainer.step += 1
-        metrics = trainer.train_step(data_iterator)
+        replay_counts = []
+        replay_handles = []
+        if os.environ.get("LLMTUNER_TEST_REQUIRE_RECOMPUTE") == "1":
+            from llmtuner.models.common.aux_loss import in_checkpoint_recompute
+
+            assert cfg.training.activation_checkpoint_mode in {"full", "selective"}
+            for part in trainer.model_parts:
+                for layer in part.layers:
+                    counts = [0, 0]
+                    replay_counts.append(counts)
+
+                    def count_forward(module, inputs, counts=counts):
+                        counts[int(in_checkpoint_recompute.get())] += 1
+
+                    replay_handles.append(
+                        layer._checkpoint_wrapped_module.register_forward_pre_hook(
+                            count_forward
+                        )
+                    )
+        try:
+            metrics = trainer.train_step(data_iterator)
+        finally:
+            for handle in replay_handles:
+                handle.remove()
+        if os.environ.get("LLMTUNER_TEST_REQUIRE_RECOMPUTE") == "1":
+            assert replay_counts and all(
+                forward > 0 and replay > 0 for forward, replay in replay_counts
+            ), f"decoder forward/recompute counts: {replay_counts}"
+            print(
+                f"rank {rank}: step {trainer.step} decoder "
+                f"forward/recompute counts={replay_counts}",
+                flush=True,
+            )
         assert metrics is not None  # log_freq=1: every step reports
         pp_snapshots.append(
             {
-                name: tuple(
+                canonical_fqn(name): tuple(
                     (value.full_tensor() if isinstance(value, DTensor) else value)
                     .detach()
                     .cpu()
@@ -467,6 +571,15 @@ def main() -> None:
     dist.all_gather_object(rank_failures, failures)
 
     if rank == 0:
+        print(
+            f"world={trainer.world_size} dp_shard={trainer.parallel_dims.dp_shard} "
+            f"dp_replicate={trainer.parallel_dims.dp_replicate} "
+            f"cp={trainer.parallel_dims.cp} "
+            f"cp_kv={trainer.parallel_dims.cp_kv} "
+            f"cp_ulysses={trainer.parallel_dims.cp_ulysses} "
+            f"fsdp={cfg.parallel.fsdp_config.fsdp_implementation} "
+            f"ac={cfg.training.activation_checkpoint_mode}"
+        )
         print(
             f"pp=2 schedule={schedule} steps={STEPS} microbatches={MICROBATCHES} "
             f"global_batch={GLOBAL_BATCH} seq={SEQ} tol={TOL:.0e}"

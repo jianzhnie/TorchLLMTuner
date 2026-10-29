@@ -21,6 +21,10 @@ from numbers import Real
 from typing import Any, TypeAlias, TypeVar, cast
 
 import grain.python as grain
+import torch
+
+from llmtuner.errors import ConfigError
+from llmtuner.utils.seeding import preserve_rng_state
 
 from .contracts import (
     DatasetBuildContext,
@@ -244,6 +248,16 @@ def apply_iteration_policy(
         shard_stop += 1
     dataset = dataset[shard_start:shard_stop]
     if iteration_policy.repeat:
+        with preserve_rng_state(torch.device("cpu")):
+            has_usable_sample = any(
+                dataset[index] is not None for index in range(len(dataset))
+            )
+        if not has_usable_sample:
+            raise ConfigError(
+                f"repeated map dataset has no usable samples in the initial "
+                f"DP shard (rank {dp_rank}/{dp_world_size}, {len(dataset)} rows); "
+                "check sample filters, SFT lengths/max_seq_len and DP sharding"
+            )
         dataset = dataset.repeat()
     return dataset
 
