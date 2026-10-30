@@ -2,138 +2,151 @@
 
 ## 1. 项目定位
 
-TorchLLMTuner 是一个基于 PyTorch `DeviceMesh` 的大模型混合并行训练框架，Python 包名为 `llmtuner`。项目直接适配 Hugging Face Transformers 模型，并将 FSDP2、张量并行（TP）、流水线并行（PP）、上下文并行（CP）和专家并行（EP）组织在一套显式、可校验的训练流程中。
+TorchLLMTuner 是基于 PyTorch `DeviceMesh` 的大模型混合并行训练框架，Python
+包名为 `llmtuner`。项目直接适配 Hugging Face Transformers 模型，将 FSDP2、
+张量并行（TP）、流水线并行（PP）、上下文并行（CP）和专家并行（EP）组织在
+一套显式、可校验的训练流程中。
 
-项目的实现语义与 TorchTitan 对齐，并针对 Hugging Face 模型的结构和状态字典增加适配层。并行变换集中在 `llmtuner/parallel/`，训练生命周期由 `llmtuner/trainer/` 统一编排。无法保证数学语义或运行安全的组合会在配置或装配阶段抛出明确异常，避免静默降级。
+实现语义以 TorchTitan 为参考，并针对 HF 模型结构和状态字典提供适配层。
+并行变换集中在 `llmtuner/parallel/`，训练生命周期由 `llmtuner/trainer/`
+编排。无法保证数学语义或运行安全的组合会在配置或装配阶段明确报错，避免
+静默降级。
 
-TorchLLMTuner 适合以下场景：
+适用于：
 
 - 使用 Hugging Face Causal LM 开展单机或多机训练；
 - 研究和验证 FSDP2、TP、PP、CP、EP 及其组合；
-- 需要清晰了解模型构建、并行化、训练、验证和检查点的完整执行路径；
-- 在 CPU、CUDA 或昇腾 NPU 环境中复用统一的设备与分布式接口。
+- 跟踪模型构建、并行化、训练、验证和 checkpoint 的完整执行路径；
+- 在 CUDA 或昇腾 NPU 上复用统一的设备与分布式接口，并使用 CPU 完成
+  单进程运行和适用的逻辑测试。
 
-> 仓库名是 `TorchLLMTuner`，安装后的包名和命令名分别是 `llmtuner` 与 `llmtuner-train`。
+> 仓库名为 `TorchLLMTuner`；安装后的 Python 包名和命令名分别为
+> `llmtuner` 与 `llmtuner-train`。
 
 ## 2. 核心能力
 
 ### 2.1 混合并行
 
-| 并行方式 | 当前实现 |
+| 并行方式 | 实现概述 |
 |---|---|
-| FSDP2 / HSDP | 使用 PyTorch composable `fully_shard`；支持 DP shard、DP replicate、混合精度、reshard 策略和 CPU offload；在 EP 场景中区分稠密与稀疏参数网格。 |
-| TP | 基于 DTensor 和模型 TP plan 对 embedding、attention、MLP、LM head 及支持的 MoE 结构进行分片；当前实现始终使用序列并行语义。 |
-| PP | 使用 `torch.distributed.pipelining` 切分模型并构建 schedule；支持 PyTorch 已注册的 schedule、显式 stage 切分和 microbatch。 |
-| CP | 支持 `kv_allgather` 与 `ulysses` 两种策略；支持 packed/varlen 输入以及可选的 `headtail` 负载均衡。 |
-| EP | 将已识别的 Hugging Face MoE block 转换为项目内 MoE 实现；支持 All-to-All dispatcher、可选 TorchAO dispatcher、专家感知的状态字典和负载均衡。 |
+| FSDP2 / HSDP | 使用 composable `fully_shard`；支持 DP shard、DP replicate、混合精度、reshard 和 CPU offload；EP 下区分 dense 与 sparse mesh。 |
+| TP | 由 HF TP plan 驱动，使用序列并行语义的通信线性层；支持适用的 dense 与 MoE 布局。 |
+| PP | 使用 `torch.distributed.pipelining` 切分 stage 并构建 schedule；已接入 1F1B 和 Interleaved1F1B。 |
+| CP | 支持 `kv_allgather` 与 `ulysses`；支持适用的 packed/varlen 输入和可选 `headtail` 负载均衡。 |
+| EP | 将可识别的 HF MoE block 转换为原生 MoE 实现；支持 AllToAll、可选 TorchAO dispatcher、专家状态字典和负载均衡。 |
 
-并行度满足以下世界规模关系：
+dense world size 满足：
 
 ```text
 WORLD_SIZE = dp_replicate × dp_shard × cp × tp × pp
 ```
 
-EP 复用现有的 `dp_shard × cp × tp` 稀疏区域，不额外乘入 `WORLD_SIZE`。因此还需满足：
+EP 复用 `dp_shard × cp × tp` 稀疏区域，不额外乘入 world size：
 
 ```text
 (dp_shard × cp × tp) % ep == 0
 efsdp = (dp_shard × cp × tp) / ep
 ```
 
-`data_parallel_shard_size=-1` 时，框架会根据 `WORLD_SIZE` 和其他并行度推导 `dp_shard`。
+`data_parallel_shard_size=-1` 时，框架根据 world size 和其他并行度推导
+`dp_shard`。实际拓扑仍以运行时 mesh 和 rank 分组为准。
 
-### 2.2 训练与内存能力
+### 2.2 训练与内存管理
 
-- 激活检查点：`full`、`selective`、`memory_budget` 和 `region`；
-- 分块语言模型损失和 vocab parallel loss；
-- 梯度累积、梯度裁剪、学习率调度及参数组；
-- 在线 EMA；
-- 确定性训练和异常检测；
-- 训练中验证；
-- DCP 和 Torch checkpointing 检查点后端；
-- 模型、优化器、调度器、数据加载器和训练状态的恢复；
-- TensorBoard、Weights & Biases、性能分析和显存快照。
+- activation checkpointing：`full`、`selective`、`memory_budget` 和 `region`；
+- chunked loss 与 vocab-parallel loss；
+- 梯度累积、梯度裁剪、学习率调度和参数组；
+- 在线 EMA、训练中 validation、确定性模式和异常检测；
+- DCP 与可选 `torch_checkpointing` 后端；
+- 模型、optimizer、scheduler、dataloader 和训练状态恢复；
+- TensorBoard、Weights & Biases、profiler 和显存快照。
+
+各项能力有各自的模型、拓扑和环境约束；列出功能不等于所有组合均已通过验收。
 
 ### 2.3 模型与数据
 
-- 通过 `AutoConfig` / `AutoModelForCausalLM` 接入 Hugging Face 模型；
-- 支持从模型标识自动补全架构参数，也可用 `arch_overrides` 覆盖特定字段；
-- HF 状态字典与并行后模型之间的适配；
-- 基于 Grain 的数据流水线；
-- 随机数据、JSONL、Hugging Face dataset 和文本 packing；
-- 多模态处理、packing 与 batch 构建；当前 `HFTransformerModel` 是文本 decoder
-  适配器，不消费图片、视频或 MRoPE 输入，遇到这些字段会明确报错；完整视觉训练
-  仍需实现消费媒体及位置元数据的模型适配器；
-- chat template 和可选的多轮 renderer。
+- 通过 `AutoConfig` / `AutoModelForCausalLM` 接入 HF 模型；
+- 自动补全模型架构参数，或通过 `arch_overrides` 覆盖离线构造的字段；
+- 适配 HF 状态字典与并行后的模型状态；
+- 使用 Grain 构建数据流水线；
+- 支持随机数据、JSONL、Hugging Face dataset 和文本 packing；
+- 提供多模态处理、packing 与 batch 构建；
+- 支持 chat template 和可选多轮 renderer。
 
-具体模型能否启用 TP 或 EP 取决于其模块布局、TP plan 和 MoE 专家结构。框架在探测到未知或不安全的布局时会拒绝应用对应并行策略。
+当前 `HFTransformerModel` 是文本 decoder 适配器，不消费图片、视频或 MRoPE
+输入，遇到这些字段会明确报错。完整视觉训练仍需要消费媒体和位置元数据的
+模型适配器，不能以多模态数据管线可用代替模型训练可用。
+
+TP 或 EP 是否可用于某个模型，取决于模块布局、TP plan 和专家结构。
+未知或无法等价转换的布局会被拒绝。
 
 ## 3. 总体架构
 
 ```mermaid
 flowchart TD
     CLI[CLI / HfArgumentParser] --> CFG[LLMTunerConfig]
-    CFG --> BUILD[trainer.builder]
-    BUILD --> DIST[设备发现、进程组、ParallelTopology、DeviceMesh]
+    CFG --> TRAINER[Trainer]
+    TRAINER --> DIST[设备、进程组、ParallelTopology、DeviceMesh]
     DIST --> MODEL[HFTransformerModel]
     MODEL --> PAR[parallelize_hf_transformers]
-    PAR --> TP[Tensor Parallel]
-    TP --> EP[Expert Parallel]
-    EP --> CP[Context Parallel]
+    PAR --> TP[TP]
+    TP --> EP[EP]
+    EP --> CP[CP]
     CP --> AC[Activation Checkpoint]
     AC --> COMPILE[torch.compile 可选]
     COMPILE --> FSDP[FSDP2]
-    FSDP --> RUNTIME[Trainer 训练与验证循环]
+    FSDP --> RUNTIME[训练与验证循环]
     RUNTIME --> OPT[Optimizer / LR Scheduler / EMA]
     RUNTIME --> DATA[Grain DataLoader]
-    RUNTIME --> CKPT[DistributedCheckpointManager]
+    RUNTIME --> CKPT[Checkpoint Manager]
     RUNTIME --> METRICS[Metrics / Profiler]
 ```
 
-并行装配顺序是代码契约，由 `llmtuner/parallel/stages.py` 唯一声明：
+装配顺序由 `llmtuner/parallel/stages.py` 唯一声明：
 
 ```text
-TP → EP → CP → Activation Checkpoint → Compile → FSDP
+TP → EP → CP → Activation Checkpoint → Compile（可选）→ FSDP
 ```
 
-FSDP 最后应用，使其包装位于其他模型变换之外。PP 是模型切分步骤：启用 PP 时，框架先生成本 rank 的 pipeline stage，再对每个 stage chunk 应用相同的装配顺序，最后构建 pipeline schedule。
+FSDP 最后应用，使其包装位于其他模型变换之外。启用 PP 时，框架先生成当前
+rank 的 pipeline stage，再对每个 model part 应用相同顺序，最后构建 schedule。
 
 ## 4. 训练流程
 
-命令行入口为 `llmtuner/trainer/cli.py`，稳定训练接口为 `llmtuner/trainer/trainer.py`。一次训练按以下顺序执行：
+命令行入口为 `llmtuner/trainer/cli.py`，训练编排位于
+`llmtuner/trainer/trainer.py`：
 
-1. **解析配置**：命令行字段解析成独立配置组，再聚合为 `LLMTunerConfig`；
-2. **初始化分布式环境**：选择 CPU、CUDA 或 NPU 后端，建立进程组；
-3. **解析并行维度**：校验世界规模、并行度和跨模块组合约束；
-4. **设置随机性**：在模型与数据加载器创建前设置随机种子，PP stage 使用不同派生种子；
-5. **构建设备网格**：创建 dense、sparse、dataloader、loss 等 mesh view；
-6. **构建模型**：创建 `HFTransformerModel`，按需在 meta device 上初始化；
-7. **应用并行策略**：按固定 stage 表执行 TP、EP、CP、AC、compile 和 FSDP；
-8. **构建训练组件**：创建优化器、LR scheduler、EMA、数据加载器、检查点与指标组件；
-9. **执行训练循环**：准备 batch，前向与反向，归约 token/loss，裁剪梯度并更新参数；
-10. **验证与保存**：按配置运行验证、周期检查点和最终检查点；
-11. **释放资源**：关闭模型侧资源，并由命令行入口销毁进程组。
+1. 解析配置组并聚合为 `LLMTunerConfig`；
+2. 初始化设备、进程组和随机性；
+3. 校验并行度并构建 `ParallelTopology` 与 mesh views；
+4. 创建 `HFTransformerModel`，按需在 meta device 上初始化；
+5. 按 stage 表执行并行变换；
+6. 创建 optimizer、scheduler、EMA、dataloader、checkpoint 和指标组件；
+7. 准备 batch，执行前向与反向，归一化 loss，裁剪梯度并更新参数；
+8. 按配置运行 validation、周期保存和最终保存；
+9. 关闭训练资源，并由命令行入口销毁进程组。
 
-PP 使用独立的 schedule 执行路径；非 PP 训练直接调用模型前向。两条路径共用 batch 语义、loss 归一化、优化器步骤、指标和检查点状态。
+PP 由 schedule 驱动 microbatch；非 PP 直接调用模型前向。两条路径共用 batch
+语义、loss 归一化、优化器步骤、指标和 checkpoint 状态。
 
 ## 5. 配置体系
 
-配置按职责拆分在 `llmtuner/config/`，所有配置模块使用 `_config.py` 后缀：
+配置按职责拆分在 `llmtuner/config/`，模块使用 `_config.py` 后缀。
 
 | 配置 | 主要职责 |
 |---|---|
-| `ModelConfig` | 模型来源、离线小模型形状、计算 dtype、架构覆盖项 |
-| `ParallelConfig` | DP/FSDP、TP、PP、CP、EP 及 dispatcher、schedule 等选项 |
+| `ModelConfig` | 模型来源、离线模型形状、计算 dtype、架构覆盖项 |
+| `ParallelConfig` | DP/FSDP、TP、PP、CP、EP 及 dispatcher、schedule |
 | `OptimizerConfig` | AdamW、参数组、学习率和权重衰减 |
-| `LRSchedulerConfig` | warmup、衰减类型、总步数与最小学习率比例 |
-| `TrainingConfig` | batch、序列长度、训练步数、梯度累积、AC、compile 等 |
+| `LRSchedulerConfig` | warmup、衰减、总步数与最小学习率比例 |
+| `TrainingConfig` | batch、序列长度、步数、梯度累积、AC 和 compile |
 | `DataloaderConfig` | 数据源、tokenizer、packing、文本与多模态字段 |
 | `CheckpointConfig` | 保存、恢复、异步模式及 HF 导入导出 |
-| `MetricsConfig` / `ProfilerConfig` | 日志、TensorBoard、W&B、profiling 与显存快照 |
+| `MetricsConfig` / `ProfilerConfig` | 日志、TensorBoard、W&B、profiling 和显存快照 |
 | `ValidationConfig` | 验证频率、步数与数据集 |
-| `LLMTunerConfig` | 聚合所有配置并执行跨配置组校验 |
+| `LLMTunerConfig` | 聚合配置并执行跨组校验 |
 
-当前 CLI 使用扁平参数，配置组字段直接映射为 `--字段名`。可通过以下命令查看完整参数：
+CLI 使用扁平参数，标量配置字段映射为 `--字段名`。查看完整参数：
 
 ```bash
 python -m llmtuner --help
@@ -147,8 +160,8 @@ llmtuner-train --help
 
 - Python 3.10 或更高版本；
 - PyTorch 2.12 或更高版本；
-- Transformers 5.9.x；
-- 其余依赖见 `pyproject.toml`。
+- Transformers 5.11.x；
+- 其余依赖及精确版本约束见 `pyproject.toml`。
 
 ```bash
 git clone https://github.com/jianzhnie/TorchLLMTuner.git
@@ -156,7 +169,7 @@ cd TorchLLMTuner
 pip install -e .
 ```
 
-开发环境可安装测试和代码检查工具：
+开发环境：
 
 ```bash
 pip install -e '.[dev]'
@@ -167,15 +180,11 @@ pre-commit install
 
 ### 7.1 单进程训练
 
-默认使用随机 token 数据和一个小型离线模型，无需下载权重：
+默认使用随机 token 数据和小型离线模型，无需下载权重：
 
 ```bash
 python -m llmtuner --steps 20
-```
-
-等价的安装后命令：
-
-```bash
+# 或安装后
 llmtuner-train --steps 20
 ```
 
@@ -188,7 +197,7 @@ torchrun --nproc_per_node=2 -m llmtuner \
   --steps 20
 ```
 
-也可以使用 `--data_parallel_shard_size -1` 自动占用除其他并行维度外的剩余 rank。
+也可使用 `--data_parallel_shard_size -1`，自动分配其他并行维度之外的 rank。
 
 ### 7.3 TP 与混合并行
 
@@ -201,7 +210,7 @@ torchrun --nproc_per_node=2 -m llmtuner \
   --steps 20
 ```
 
-八卡 FSDP × TP × PP 示例：
+八卡 FSDP × TP × PP：
 
 ```bash
 torchrun --nproc_per_node=8 -m llmtuner \
@@ -213,9 +222,10 @@ torchrun --nproc_per_node=8 -m llmtuner \
   --max_seq_len 128
 ```
 
-这里 `2 × 2 × 2 = 8`。启用 CP 时，`max_seq_len` 必须能被 `cp × tp` 整除。
+这里 `dp_shard × tp × pp = 2 × 2 × 2 = 8`。启用 CP 时，`max_seq_len`
+必须能被 `cp × tp` 整除。
 
-### 7.4 检查点
+### 7.4 Checkpoint
 
 ```bash
 python -m llmtuner \
@@ -225,7 +235,9 @@ python -m llmtuner \
   --dump_folder ./outputs
 ```
 
-`--enable` 是 `CheckpointConfig.enable` 的扁平 CLI 形式。输出目录、加载路径、异步保存方式和 HF 导出选项可通过 `--help` 查询。
+`--enable` 是 `CheckpointConfig.enable` 的扁平 CLI 形式。加载路径、异步保存
+和 HF 导出选项可通过 `--help` 查询。最终 model-only 或 HF 导出物不包含完整
+训练状态，不能用于精确续训。
 
 ### 7.5 真实数据
 
@@ -237,7 +249,8 @@ python -m llmtuner \
   --steps 20
 ```
 
-默认字段名及 packing 策略由 `DataloaderConfig` 定义。使用真实模型或 tokenizer 时，需要保证本地路径或 Hugging Face Hub 访问可用。
+默认字段和 packing 策略由 `DataloaderConfig` 定义。使用真实模型或 tokenizer
+时，需要保证本地文件或 Hugging Face Hub 访问可用。
 
 ### 7.6 示例脚本
 
@@ -249,163 +262,79 @@ python -m examples.train_deepseek_v3
 ```
 
 昇腾 NPU 多卡示例见 `examples/train_qwen3_8b_npu.sh`。
-设置 `LLMTUNER_ENABLE_TENSORBOARD=1` 可持久化逐步指标（需安装 TensorBoard），
-包括端到端 step 耗时；默认关闭，事件写入运行输出目录的 `tb/`。
+设置 `LLMTUNER_ENABLE_TENSORBOARD=1` 可保存逐步指标（需安装 TensorBoard），
+包括端到端 step 耗时；事件写入运行输出目录的 `tb/`。
 
-## 8. 并行组合与边界
+## 8. 组合校验与已知边界
 
-框架允许能够保持现有数学语义的混合并行组合，并通过三层校验降低运行中失败的概率：
+框架通过三层校验降低运行中失败的概率：
 
-1. 各配置类的 `__post_init__` 校验字段和值域；
-2. `LLMTunerConfig` 与 `ParallelTopology` 校验跨配置约束和 mesh 代数；
-3. `parallel/compatibility.py` 及模型布局 probe 校验运行时组合与模型结构。
+1. 配置类的 `__post_init__` 校验字段和仅依赖配置的组合；
+2. `LLMTunerConfig` 与 `ParallelTopology` 校验跨组约束和 mesh 代数；
+3. `parallel/compatibility.py` 与模型布局 probe 校验运行时组合和模型结构。
 
-当前需要特别注意的边界包括：
+常见边界：
 
-- TP>1 只能使用序列并行路径，`enable_sequence_parallel=False` 不受支持；TP=1 时该开关不影响执行；
+- TP>1 只能使用序列并行路径；`enable_sequence_parallel=False` 不受支持；
 - `max_seq_len` 必须能被 `cp × tp` 整除；
-- chunked loss 当前不能与 PP 或 validation 同时启用；
+- chunked loss 不能与 PP 或 validation 同时启用；
 - PP 不支持跨首尾 stage 的 tied word embedding；
-- packed token 流不能在 PP 中被多个 microbatch 从文档中间切开；
-- EP 从 HF 初始检查点加载前还不能转换专家布局，应从 llmtuner 检查点恢复或从头训练；
-- `deepep` 与 `hybridep` dispatcher 是已登记的能力缺口；默认使用 `alltoall`；
-- CP 的 `ptrr` 负载均衡尚未实现；`ulysses` 要求关闭 CP 负载重排；
-- `memory_budget` AC 需要启用 compile，`region` AC 需要可选的 `torch_remat`；
-- 特定 MoE 路由器、共享专家或带 bias 的专家布局可能被模型 probe 拒绝。
+- 一维 packed token 流不能在 PP 中切分为多个 microbatch；
+- EP 的 HF 初始加载依赖模型专用 sharded adapter；Qwen3MoE、Kimi Linear
+  和其他布局的支持条件不同，未适配布局会被拒绝；
+- `deepep` 与 `hybridep` 是已登记的能力缺口，默认 dispatcher 为 `alltoall`；
+- CP 的 `ptrr` 尚未实现，`ulysses` 不与 load balancer 组合；
+- `memory_budget` AC 需要 compile，`region` AC 需要可选 `torch_remat`；
+- 特定路由器、共享专家或带 bias 的专家布局可能被模型 probe 拒绝。
 
-这些限制以源码中的错误消息为准。错误会说明不支持的原因以及可用的替代配置。
+这里只列出常见限制，完整裁决以配置校验、`parallel/compatibility.py`
+和实际错误信息为准。
 
 ## 9. 代码结构
 
 ```text
 llmtuner/
-├── accelerator/              # 设备、进程组、collective、SPMD 上下文
-├── components/               # loss、optimizer、EMA、checkpoint、metrics、profiler
-├── config/                   # 分组配置、CLI 视图和聚合根配置
-├── datasets/                 # Grain 数据图、packing、文本与多模态处理
-├── memory/                   # activation checkpoint 与 rematerialization 策略
+├── accelerator/               # 设备、进程组、collective、SPMD 上下文
+├── components/                # loss、optimizer/EMA、checkpoint、metrics、profiler
+├── config/                    # 分组配置、CLI 视图和聚合配置
+├── datasets/                  # Grain 数据图、packing、文本与多模态处理
+├── memory/                    # activation checkpoint 与 rematerialization
 ├── models/
-│   ├── hf/                   # HF wrapper、模型工厂和状态字典适配
-│   └── common/               # attention、MoE、embedding、RoPE 等公共模型构件
+│   ├── hf/                    # HF wrapper、模型工厂和状态字典适配
+│   ├── common/                # attention、MoE、embedding、RoPE 等公共构件
+│   └── kimi/                  # Kimi Linear 专用模型与布局适配
 ├── parallel/
-│   ├── tensor_parallel/      # TP 入口与通信线性层
-│   ├── expert_parallel/      # EP 入口、模型转换、probe 和 checkpoint 适配
-│   ├── context_parallel/     # CP 入口、输入分片和 kernel
-│   ├── pipeline_parallel/    # PP 入口、模型切分和 schedule
-│   ├── fully_shard_parallel/ # FSDP2 入口
-│   ├── topology.py      # 并行维度与 DeviceMesh
-│   ├── stages.py             # 并行装配顺序
-│   ├── compatibility.py             # 不支持组合的统一裁决
-│   └── parallelize.py        # 混合并行总入口
-├── trainer/                  # 装配、batch、PP step、验证和训练循环
-└── utils/                    # 日志、随机性、GC、监控等通用工具
+│   ├── tensor_parallel/       # TP 入口与通信线性层
+│   ├── expert_parallel/       # EP 模型转换、dispatch 和 checkpoint 适配
+│   ├── context_parallel/      # CP 输入分片与 attention kernel
+│   ├── pipeline_parallel/     # PP 模型切分和 schedule
+│   ├── fully_shard_parallel/  # FSDP2/HSDP 入口与参数处理
+│   ├── topology.py            # 并行维度与 DeviceMesh
+│   ├── stages.py              # 并行装配顺序
+│   ├── compatibility.py       # 跨层组合裁决
+│   └── parallelize.py         # 混合并行总入口
+├── trainer/                   # 装配、训练、validation 和运行时辅助逻辑
+└── utils/                     # 日志、随机性、GC 和监控等工具
 ```
 
-各并行模块的主入口分别是：
-
-- `parallel/tensor_parallel/tensor_parallel.py`
-- `parallel/expert_parallel/expert_parallel.py`
-- `parallel/context_parallel/context_parallel.py`
-- `parallel/pipeline_parallel/pipeline_parallel.py`
-- `parallel/fully_shard_parallel/fully_shard_parallel.py`
-
-包级 `__init__.py` 只负责稳定导出；跨模块调用优先使用包级公共接口。
-
-### 文件日志
-
-通过 `get_logger` 为模块添加文件输出，原有控制台日志继续保留：
-
-```python
-from llmtuner.utils.logging import get_logger
-
-logger = get_logger(__name__, log_file="outputs/train.log")
-logger.info("训练开始")
-```
-
-文件使用 UTF-8、无颜色格式，包含时间、rank、模块与日志级别。默认追加
-（`file_mode="a"`），显式传入 `file_mode="w"` 时在首次写入前覆盖旧内容。
-父目录自动创建；同一路径的模块共享 handler，重复配置不会重复写入或再次
-截断。已配置路径不能切换打开模式；省略 `log_file` 不会移除现有文件输出。
-
-文件只由 rank 0 写入，与控制台的 `set_log_ranks` 设置独立；其他 rank 的
-ERROR 日志仍输出到控制台。文件输出通过 Python API 配置，未新增 CLI 参数。
+各并行族由同名模块提供公共入口，例如
+`parallel/tensor_parallel/tensor_parallel.py`。包级 `__init__.py` 只暴露有意
+公开的 API；实现代码从定义符号的叶子模块导入，避免不必要的引擎依赖。
 
 ## 10. 测试与开发
 
-CPU 单元测试：
-
 ```bash
-pytest -q
-```
-
-代码检查：
-
-```bash
+pytest -q --disable-warnings
+ruff check llmtuner tests
+ruff format --check llmtuner tests
 pre-commit run --all-files
 ```
 
-`tests/integration_tests/` 中包含需要 `torchrun` 和对应设备数量的并行数值等价性脚本，覆盖 TP、FSDP、CP、PP、EP 及部分组合。它们不由默认的 pytest 收集，需要根据脚本要求在分布式环境中单独运行。
+`tests/integration_tests/` 包含需要 `torchrun` 和相应设备的数值等价性脚本，
+不由默认 pytest 收集。运行前应核对脚本 docstring 中的命令、rank 数和参数。
+CPU 或 mock 测试通过不能外推为目标设备或其他并行组合通过。
 
-更详细的架构约束和上游映射分别见：
+更多内容：
 
-- `docs/torchllmtuner_design.md`
-- `docs/llmtuner_upstream_map.md`
-
-### 本地文本数据的恢复身份
-
-`local_jsonl` 和 `local_jsonl_sft` 的 loader 会保存数据身份指纹，包含数据配置、
-seed、重复策略、匹配 JSONL 文件的内容及 tokenizer 相关文件的内容。
-同路径替换内容也会改变指纹；相同内容放在不同rank目录时身份保持一致。
-目录路径和prefetch深度不影响指纹，恢复前身份不匹配会拒绝加载数据游标。
-内容哈希会增加构建时的读取成本，且不保护构建后对文件的修改。
-
-缺少身份字段的旧本地文本 checkpoint 不能直接恢复 loader。
-如果明确要保留模型和优化器状态、重新开始数据流，可通过
-`checkpoint.exclude_from_loading` 排除 `dataloader`；这不是精确续训。
-自定义 Grain 图可向 `GrainDataLoader` 传入 `data_identity`，由调用方保证其含义。
-注册数据集及远端数据目前没有自动内容身份校验，仍须保证来源和处理配置不变。
-
-配置驱动的注册或远端数据可设置 `dataloader.data_identity`（CLI：
-`--data_identity dataset-commit:abc/recipe-v1`），声明数据快照和配方版本。
-loader 将该标识与数据配置、seed、重复策略及本地 tokenizer 资产内容共同
-生成恢复指纹，变化时在恢复游标前拒绝加载。未设置时保持原有行为。
-此标识不会下载或检查远端内容；调用方须固定实际来源版本，并在数据内容或
-配方语义变化时更新标识。相同标识不能证明远端内容相同。
-本地文本设置此字段时仍保留 JSONL 内容哈希；synthetic 数据不接受该字段。
-
-### 有限训练数据耗尽
-
-训练会在前向之前读取完整梯度累积窗口。任一 rank 耗尽数据时，所有 rank
-协调取消不足的窗口，不执行该窗口的参数更新；数据游标及 `ntokens_seen`
-仍反映已读取的数据，不回滚为最后一次更新前的位置。
-
-如果已有完成的训练 step，数据耗尽会按最后完成的 step 强制触发最终保存策略，
-即使它未达到配置的训练步数或保存间隔。checkpoint 禁用时不会写入文件；
-最终保存配置为 model-only 或 HF 导出时，产物不能替代完整训练状态用于精确恢复。
-尚未完成任何 step 的新运行不会因数据耗尽创建 step-0 checkpoint。
-
-### CPU 归一化后端
-
-`model.norm_backend` 默认为 `native`。Qwen3/Qwen3 MoE 可显式选择 `aten`
-（CLI：`--norm_backend aten`），使用 ATen RMSNorm 前后向边界控制 eager 与
-Inductor 的归约差异。该选项只支持 CPU、float16/bfloat16/float32 输入和
-一阶梯度；默认 native 保留编译融合。参数身份及 checkpoint 权重键保持不变，
-后端属于运行配置，恢复时应明确设置。旧运行的逐位训练轨迹不能由权重兼容推出。
-
-aten 会牺牲融合性能，不建议作为通用加速后端。已验证 CPU/Gloo 下特定
-custom FSDP、full activation checkpoint、dynamic EMA 的同模式及
-Inductor → eager 严格恢复；这不代表所有模型、布局或并行组合均已验证。
-
-生产 ATen RMSNorm 另有 CPU/Gloo 的 2-rank 和 2×2 mesh DTensor 前后向验证，
-覆盖复制、序列分片及隐藏维重分布，含实际 Inductor 编译；可运行
-`tests/integration_tests/aten_norm_dtensor_equivalence.py` 复核。
-该算子级结果不替代完整 TP/FSDP 训练组合或混合精度验证。
-
-### 编译与低精度重计算
-
-Inductor 默认可省略融合算子间的低精度转换。BF16 checkpoint 重计算因此可能
-与 eager 产生不同梯度，即使输出一致。需要保留 eager 转换语义时，可在启动前
-设置 `TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1`。已验证双 rank custom
-FSDP 的小型混合精度 Block 矩阵；该设置可能影响性能，不保证全部模型或设备
-逐位一致。复核入口：`fine_grained_mixed_precision.py --local-probe` 及
-`--checkpoint --compile-backend inductor`；原始融合路径差异保留在审查台账。
+- 架构与运行时契约：`docs/torchllmtuner_design.md`
+- TorchTitan 来源与符号映射：`docs/llmtuner_upstream_map.md`
