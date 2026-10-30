@@ -7,6 +7,25 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_discovery_excludes_support_modules_without_dropping_runnable_scripts():
+    runner = Path(__file__).parents[2] / "integration_tests" / "run_all.py"
+    spec = importlib.util.spec_from_file_location("integration_runner", runner)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    names = {path.name for path in module.discover()}
+    assert not names.intersection(
+        {
+            "alignment_history.py",
+            "alignment_module_trace.py",
+            "harness.py",
+            "npu_trainer_alignment_config.py",
+        }
+    )
+    # Some real tests execute at module scope rather than through a main guard.
+    assert {"tp_moe_equivalence.py", "tp_checkpoint_coordination.py"} <= names
+    assert "npu_trainer_alignment_replay.py" in names
+
+
 @pytest.mark.parametrize(
     "command",
     [

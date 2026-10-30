@@ -177,3 +177,37 @@ def test_mixed_precision_norm_matches_full_precision_reference(norm_type):
     expected = torch.linalg.vector_norm(reference, norm_type)
     actual = collectives.clip_grad_norm_(parameters, 0, norm_type=norm_type)
     torch.testing.assert_close(actual, expected, rtol=1e-7, atol=0)
+
+
+def test_parameter_precision_norm_matches_native_rounding():
+    from llmtuner.accelerator.collectives import clip_grad_norm_
+
+    torch.manual_seed(71)
+    parameters = [
+        torch.nn.Parameter(torch.zeros(257, dtype=torch.bfloat16)) for _ in range(3)
+    ]
+    for parameter in parameters:
+        parameter.grad = torch.randn_like(parameter)
+    expected = sum(
+        torch.linalg.vector_norm(p.grad).float().square() for p in parameters
+    ).sqrt()
+    observed = clip_grad_norm_(parameters, 0, norm_precision="parameter")
+    torch.testing.assert_close(observed, expected, atol=0, rtol=0)
+
+
+def test_parameter_precision_norm_rejects_infinite_order():
+    from llmtuner.accelerator.collectives import clip_grad_norm_
+
+    with pytest.raises(ValueError, match="finite positive"):
+        clip_grad_norm_([], 1, norm_type=float("inf"), norm_precision="parameter")
+
+
+@pytest.mark.parametrize("precision", ["parameter", "float32"])
+def test_norm_precision_clips_with_reported_coefficient(precision):
+    parameter = torch.nn.Parameter(torch.zeros(257, dtype=torch.bfloat16))
+    torch.manual_seed(17)
+    gradient = torch.randn_like(parameter)
+    parameter.grad = gradient.clone()
+    norm = collectives.clip_grad_norm_([parameter], 0.5, norm_precision=precision)
+    expected = gradient * (0.5 / (norm + 1e-6)).clamp(max=1).to(gradient.device)
+    torch.testing.assert_close(parameter.grad, expected, atol=0, rtol=0)

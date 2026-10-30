@@ -30,7 +30,6 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from fsdp_mesh_equivalence import SEQ, _build_model, _data, _full, _loss_sum
 from torch.distributed.checkpoint import FileSystemWriter
 from torch.distributed.checkpoint.api import CheckpointException
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
@@ -54,6 +53,13 @@ from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import apply_fs
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.utils.seeding import set_deterministic_algorithms
 from tests.caps import CAPS
+from tests.integration_tests.fsdp_mesh_equivalence import (
+    SEQ,
+    _build_model,
+    _data,
+    _full,
+    _loss_sum,
+)
 from tests.integration_tests.harness import backend, device, init_distributed
 
 STEPS = 6

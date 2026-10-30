@@ -15,6 +15,12 @@ the last schedule step. CPU uses dense-mask SDPA as an explicit test substitute
 for the production flex kernel; GPU/NPU execution requires separate validation.
 For PP2 × KV-CP2, set LLMTUNER_TEST_CP_SIZE=2 and run four ranks.
 Set LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom to exercise the custom engine.
+Set LLMTUNER_TEST_PP_SCHEDULE=Interleaved1F1B to exercise two virtual stages
+per rank over six decoder layers with the same packed-corpus reference.
+Set LLMTUNER_TEST_LIMO_PATH and LLMTUNER_TEST_TOKENIZER_PATH to use the first
+two original LIMO question/solution pairs with the real Qwen tokenizer.
+This arm tests plain-text causal packing, not SFT prompt masking or pretrained
+30B weights; the decoder remains a randomly initialized small test model.
 That CPU scenario retains actual CP masks/collectives and substitutes only
 attention arithmetic, with sequence length 256 and a proportionally larger corpus.
 
@@ -22,7 +28,9 @@ attention arithmetic, with sequence length 256 and a proportionally larger corpu
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import tempfile
 from unittest.mock import patch
@@ -56,9 +64,16 @@ MICROBATCHES = 4
 GLOBAL_BATCH = 8
 CP = int(os.environ.get("LLMTUNER_TEST_CP_SIZE", "1"))
 SEQ = 256 if CP > 1 else 64
-VOCAB = 128
+LIMO_PATH = os.environ.get("LLMTUNER_TEST_LIMO_PATH")
+TOKENIZER_PATH = os.environ.get("LLMTUNER_TEST_TOKENIZER_PATH")
+if LIMO_PATH and not TOKENIZER_PATH:
+    raise ValueError("LLMTUNER_TEST_LIMO_PATH requires LLMTUNER_TEST_TOKENIZER_PATH")
+VOCAB = 151936 if LIMO_PATH else 128
 SEED = 42
 PP = 2
+SCHEDULE = os.environ.get("LLMTUNER_TEST_PP_SCHEDULE", "1F1B")
+if SCHEDULE not in {"1F1B", "Interleaved1F1B"}:
+    raise ValueError(f"unsupported packed-corpus PP schedule: {SCHEDULE!r}")
 WORLD = PP * CP
 NUM_ROWS = 48 * (SEQ // 64)  # Keep the finite corpus above a full token batch.
 TOL = 1e-5
@@ -86,8 +101,28 @@ def _write_corpus(root: str) -> tuple[str, str]:
     import os
 
     tokenizer_path = os.path.join(root, "tokenizer")
-    write_tokenizer(tokenizer_path)
     corpus_path = os.path.join(root, "rows.jsonl")
+    if LIMO_PATH:
+        with open(LIMO_PATH, "rb") as source:
+            original = source.read()
+        rows = original.splitlines()[:2]
+        assert len(rows) == 2, "LIMO check requires two original records"
+        with open(corpus_path, "w") as handle:
+            for raw in rows:
+                record = json.loads(raw)
+                assert record["question"] and record["solution"]
+                handle.write(
+                    json.dumps({"text": record["question"] + "\n" + record["solution"]})
+                    + "\n"
+                )
+        print(
+            f"real_corpus=LIMO rows=0:2 source_sha256="
+            f"{hashlib.sha256(original).hexdigest()} tokenizer={TOKENIZER_PATH} "
+            "objective=plain_text_causal auxiliary_small_model=True",
+            flush=True,
+        )
+        return TOKENIZER_PATH, corpus_path
+    write_tokenizer(tokenizer_path)
     with open(corpus_path, "w") as handle:
         for i in range(NUM_ROWS):
             handle.write(
@@ -103,7 +138,7 @@ def _cfg(tokenizer_path: str, corpus_path: str) -> LLMTunerConfig:
             vocab_size=VOCAB,
             hidden_size=64,
             intermediate_size=128,
-            num_hidden_layers=4,
+            num_hidden_layers=6 if SCHEDULE == "Interleaved1F1B" else 4,
             num_attention_heads=4,
             num_key_value_heads=4,
         ),
@@ -117,7 +152,7 @@ def _cfg(tokenizer_path: str, corpus_path: str) -> LLMTunerConfig:
                 )
             ),
             pp_config=PipelineParallelConfig(
-                pipeline_parallel_schedule="1F1B", num_pp_microbatches=MICROBATCHES
+                pipeline_parallel_schedule=SCHEDULE, num_pp_microbatches=MICROBATCHES
             ),
         ),
         optimizer=OptimizerConfig(learning_rate=3e-4, weight_decay=0.0),
@@ -251,6 +286,11 @@ def _run(root: str) -> None:
 
     # -- non-vacuity: the model is split, and the corpus is really packed -----
     num_layers_held = sum(len(part.layers) for part in trainer.model_parts)
+    expected_parts = 2 if SCHEDULE == "Interleaved1F1B" else 1
+    assert len(trainer.model_parts) == expected_parts, (
+        SCHEDULE,
+        len(trainer.model_parts),
+    )
     if num_layers_held >= cfg.num_hidden_layers:
         failures.append(
             f"rank {rank}: holds {num_layers_held} of {cfg.num_hidden_layers} "
@@ -338,7 +378,11 @@ def _run(root: str) -> None:
     if trainer.pp_has_last_stage:
         if len(validation_reports) != 1:
             failures.append(f"rank {rank}: expected one finite validation report")
-        elif abs(validation_reports[0] - reference_validation) > TOL:
+        elif (
+            not math.isfinite(validation_reports[0])
+            or not math.isfinite(reference_validation)
+            or abs(validation_reports[0] - reference_validation) > TOL
+        ):
             failures.append(
                 f"rank {rank}: validation {validation_reports[0]} "
                 f"vs {reference_validation}"
@@ -347,12 +391,12 @@ def _run(root: str) -> None:
     for name, actual in local_final_state.items():
         diff = float((actual - final_state[name]).abs().max())
         max_parameter_diff = max(max_parameter_diff, diff)
-        if diff > TOL:
+        if not math.isfinite(diff) or diff > TOL:
             failures.append(f"rank {rank}: final parameter {name} diff {diff:.3e}")
     max_diff = torch.tensor(max_parameter_diff, device=trainer.device)
     dist.all_reduce(max_diff, op=dist.ReduceOp.MAX)
     for step, (got, want) in enumerate(zip(pp_losses, reference, strict=True)):
-        if abs(got - want) > TOL:
+        if not math.isfinite(got) or not math.isfinite(want) or abs(got - want) > TOL:
             failures.append(f"rank {rank} step {step + 1}: loss {got} vs {want}")
 
     verdict = torch.tensor(len(failures), dtype=torch.int64, device=trainer.device)
@@ -362,7 +406,11 @@ def _run(root: str) -> None:
     if rank == 0:
         if trainer.device.type == "cpu":
             print("CPU attention uses dense-mask SDPA; CUDA flex is not verified.")
-        print(f"pp={PP} cp={CP} corpus=local_jsonl(packed) steps={STEPS} tol={TOL:.0e}")
+        print(
+            f"pp={PP} cp={CP} schedule={SCHEDULE} "
+            f"corpus={'LIMO-prefix' if LIMO_PATH else 'generated'}(packed) "
+            f"steps={STEPS} tol={TOL:.0e}"
+        )
         print(f"pp losses  = {[f'{x:.6f}' for x in pp_losses]}")
         print(f"reference  = {[f'{x:.6f}' for x in reference]}")
         print(f"final parameter max diff = {float(max_diff):.3e}")

@@ -26,6 +26,8 @@ backward.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -161,7 +163,7 @@ def main() -> None:
                         .max()
                         .item()
                     )
-                    if grad_diff > TOL:
+                    if not math.isfinite(grad_diff) or grad_diff > TOL:
                         failures.append(
                             f"[{mode}] step0 grad {name}: diff {grad_diff:.3e}"
                         )
@@ -171,20 +173,25 @@ def main() -> None:
             losses.append(float(reduced))
 
         for step, (got, want) in enumerate(zip(losses, ref_losses, strict=True)):
-            if abs(got - want) > TOL:
+            if (
+                not math.isfinite(got)
+                or not math.isfinite(want)
+                or abs(got - want) > TOL
+            ):
                 failures.append(
                     f"[{mode}] step{step} loss: got {got:.6f}, want {want:.6f}"
                 )
 
-        param_diff = max(
+        param_diffs = [
             (_full(p).detach() - rp.detach()).abs().max().item()
             for (name, p), (_, rp) in zip(
                 sorted(model.named_parameters(), key=lambda kv: _plain_name(kv[0])),
                 sorted(ref.named_parameters(), key=lambda kv: kv[0]),
                 strict=True,
             )
-        )
-        if param_diff > TOL:
+        ]
+        param_diff = max(param_diffs)
+        if not all(math.isfinite(diff) for diff in param_diffs) or param_diff > TOL:
             failures.append(f"[{mode}] final params: max abs diff {param_diff:.3e}")
         results[mode] = {"losses": losses, "param_diff": param_diff}
 

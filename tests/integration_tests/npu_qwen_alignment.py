@@ -25,11 +25,31 @@ from llmtuner.config.training_config import TrainingConfig
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from tests.caps import require_env
+from tests.integration_tests.npu_trainer_alignment_config import (
+    alignment_runtime_manifest,
+)
+
+
+def _git_revision(repository: Path) -> str:
+    """Read a checkout revision inside containers with mismatched file owners."""
+    repository = repository.resolve()
+    return subprocess.check_output(
+        [
+            "git",
+            "-c",
+            f"safe.directory={repository}",
+            "-C",
+            str(repository),
+            "rev-parse",
+            "HEAD",
+        ],
+        text=True,
+    ).strip()
 
 
 def _baseline() -> tuple[torch.nn.Module, object]:
     importlib.import_module("torchtitan_npu")
-    from torchtitan.models.common import CosSinRoPE, Embedding, Linear
+    from torchtitan.models.common import Embedding, Linear, RoPE
     from torchtitan.models.common.attention import ScaledDotProductAttention
     from torchtitan.models.qwen3 import _build_qwen3_layers, _qwen3_norm
     from torchtitan.models.qwen3.model import Qwen3Model
@@ -42,19 +62,24 @@ def _baseline() -> tuple[torch.nn.Module, object]:
         n_kv_heads=2,
         head_dim=16,
         hidden_dim=128,
-        fuse_qkv=False,
-        attn_backend="flex",
-        rope=CosSinRoPE.Config(dim=16, max_seq_len=32, theta=1000000.0),
+        inner_attention=ScaledDotProductAttention.Config(),
     )
-    for layer in layers:
-        layer.attention.inner_attention = ScaledDotProductAttention.Config()
     config = Qwen3Model.Config(
         vocab_size=128,
         dim=64,
         norm=_qwen3_norm(64),
         enable_weight_tying=False,
-        tok_embeddings=Embedding.Config(num_embeddings=128, embedding_dim=64),
-        lm_head=Linear.Config(in_features=64, out_features=128),
+        tok_embeddings=Embedding.Config(
+            num_embeddings=128,
+            embedding_dim=64,
+            param_init={"weight": torch.nn.init.normal_},
+        ),
+        output=Linear.Config(
+            in_features=64,
+            out_features=128,
+            param_init={"weight": torch.nn.init.normal_},
+        ),
+        rope=RoPE.Config(dim=16, max_seq_len=32, theta=1000000.0, backend="cos_sin"),
         layers=layers,
     )
     model = config.build().to("npu")
@@ -127,12 +152,16 @@ def main() -> None:
         "input_seed": 1234,
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         "loss_reduction": "mean over 32 explicitly supplied targets, no shift",
-        "candidate_commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
-        "baseline_commit": subprocess.check_output(
-            ["git", "-C", str(args.baseline), "rev-parse", "HEAD"], text=True
-        ).strip(),
+        "candidate_commit": _git_revision(Path(__file__).resolve().parents[2]),
+        "baseline_commit": _git_revision(args.baseline),
+        "runtime": alignment_runtime_manifest(
+            (
+                "torchtitan",
+                "torchtitan.models.qwen3.model",
+                "torchtitan_npu",
+                "llmtuner.models.hf.model",
+            )
+        ),
         "metric_source": str(metric_path),
         "candidate_config": candidate.model.config.to_dict(),
         "optimizer": reference_optimizer.defaults,

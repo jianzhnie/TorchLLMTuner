@@ -8,14 +8,18 @@ from torch import nn
 
 from llmtuner.parallel.expert_parallel.checkpointing import EP_GROUP_ATTR
 from llmtuner.parallel.tensor_parallel.checkpointing import _coordinate_chunk_errors
+from tests.integration_tests.harness import init_distributed
 
 
 def main():
-    dist.init_process_group("gloo")
+    init_distributed()
     try:
-        group = dist.new_group([0, 1])
+        assert dist.get_world_size() == 4
+        # With two ranks per node these peers span the node boundary. Ranks
+        # 1/3 must reach the final world barrier without joining this preflight.
+        group = dist.new_group([0, 2])
         rank = dist.get_rank()
-        if rank in (0, 1):
+        if rank in (0, 2):
             model = nn.Module()
             setattr(model, EP_GROUP_ATTR, group)
             expected = ValueError if rank == 0 else RuntimeError
@@ -30,6 +34,7 @@ def main():
             else:
                 raise AssertionError("checkpoint failure was not propagated")
         dist.barrier()
+        print(f"PASS rank={rank}: joint subset failure coordinated", flush=True)
     finally:
         dist.destroy_process_group()
 

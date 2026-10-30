@@ -75,6 +75,7 @@ def _torch_param_names() -> bool:
 
 # name -> probe. The name is what the marker and the skip reason print.
 CAPS: dict[str, Callable[[], bool]] = {
+    "torch_npu": lambda: importable("torch_npu"),
     # torch.distributed.tensor.DTensor (the DTensor/DTensorSpec import surface)
     "dtensor": lambda: _importable_attr("torch.distributed.tensor", "DTensor"),
     "fine_grained_fsdp": lambda: importable(

@@ -12,6 +12,7 @@ import argparse
 import dataclasses
 import importlib
 import json
+import math
 import os
 import runpy
 from datetime import timedelta
@@ -24,14 +25,25 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.seeding import set_deterministic_algorithms
+from tests.integration_tests.alignment_history import (
+    AlignmentHistory,
+    capture_artifact_path,
+    load_alignment_history,
+)
 from tests.integration_tests.npu_trainer_alignment_config import (
     QWEN3_30B,
+    alignment_runtime_manifest,
+    baseline_allow_hf32,
+    baseline_learning_rate,
     build_candidate_30b_config,
+    captured_attention,
     construction_dtype,
     debug_candidate_config,
+    effective_forward_positions,
     input_fingerprints,
     is_qwen3_30b,
     iter_local_state,
+    localize_parallel_reference,
     map_candidate_to_canonical_hf,
     map_capture_to_candidate_hf,
     mesh_manifest,
@@ -40,6 +52,8 @@ from tests.integration_tests.npu_trainer_alignment_config import (
     selected_model,
     summed_cross_entropy,
     validate_baseline_30b_dict,
+    validate_capture_hf32,
+    validate_capture_runtime,
 )
 
 
@@ -56,7 +70,7 @@ class CapturedLoader:
             yield {
                 "input": values["input_dict"]["input"],
                 "labels": values["labels"],
-                "positions": forward["kwargs"]["positions"],
+                "positions": effective_forward_positions(forward),
             }
 
     def state_dict(self):
@@ -70,12 +84,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--weight-atol", type=float, default=1e-5)
+    parser.add_argument("--weight-rtol", type=float, default=1e-4)
     parser.add_argument(
         "--metrics",
         type=Path,
         default=Path("../torchtitan-npu/scripts/numerical_alignment/utils/metrics.py"),
     )
     args = parser.parse_args()
+    if any(
+        not math.isfinite(value) or value < 0
+        for value in (args.weight_atol, args.weight_rtol)
+    ):
+        parser.error("weight tolerances must be finite and non-negative")
     world = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     set_deterministic_algorithms()
@@ -97,18 +118,29 @@ def main() -> None:
             "Capture and replay must use the same explicit alignment model"
         )
     if captured_30b:
+        validate_capture_runtime(json.loads((root / "manifest.json").read_text()))
         validate_baseline_30b_dict(baseline_config, world)
         architecture = read_hf_architecture(baseline_config["hf_assets_path"])
     else:
         architecture = None
         assert baseline_config["training"]["mixed_precision_param"] == "float32"
-    allow_hf32 = baseline_config["training"]["extension"]["allow_hf32"]
+    allow_hf32 = baseline_allow_hf32(baseline_config)
+    if captured_30b:
+        validate_capture_hf32(
+            json.loads((root / "manifest.json").read_text()), allow_hf32
+        )
     for backend in (torch.npu.matmul, torch.npu.conv, torch.npu.aclnn):
         backend.allow_hf32 = allow_hf32
     batches = torch.load(root / "consumed-batches.pt", weights_only=False)
-    forwards = torch.load(root / "forward-batches.pt", weights_only=False)
+    forwards = load_alignment_history(root, "forward-batches")
     baseline_metrics = torch.load(root / "step-metrics.pt", weights_only=False)
     for forward in forwards:
+        if (
+            captured_30b
+            and captured_attention(baseline_config)["mask_type"] == "causal"
+        ):
+            assert not forward["kwargs"].get("attention_masks")
+            continue
         positions = forward["kwargs"]["positions"]
         captured_mask = forward["kwargs"]["attention_masks"]["dense_token_mask"]
         length = positions.numel()
@@ -181,6 +213,9 @@ def main() -> None:
                 "rank": rank,
                 "world_size": world,
                 "alignment_model": alignment_model or "debugmodel",
+                "runtime": alignment_runtime_manifest(
+                    ("llmtuner", "llmtuner.trainer.trainer")
+                ),
                 "hf_assets_path": baseline_config["hf_assets_path"],
                 "actual_mesh": mesh_manifest(trainer.parallel_dims),
                 "aux_loss_disabled": (
@@ -191,6 +226,15 @@ def main() -> None:
                     else None
                 ),
                 "chunked_loss_num_chunks": config.training.chunked_loss_num_chunks,
+                "trace_layers": os.environ.get("LLMTUNER_ALIGNMENT_TRACE_LAYERS"),
+                "gradient_trace_enabled": os.environ.get(
+                    "LLMTUNER_ALIGNMENT_GRADIENT_TRACE"
+                )
+                == "1",
+                "weight_tolerances": {
+                    "atol": args.weight_atol,
+                    "rtol": args.weight_rtol,
+                },
             },
             indent=2,
         )
@@ -253,14 +297,22 @@ def main() -> None:
         from torch.distributed.fsdp import FSDPModule
 
         assert isinstance(model, FSDPModule)
-        assert trainer.parallel_dims.dp_shard == world
+        assert trainer.parallel_dims.dp_shard == (
+            config.parallel.data_parallel_shard_size if captured_30b else world
+        )
     if captured_30b:
         assert trainer.parallel_dims.dp_replicate == 1
-        assert trainer.parallel_dims.tp == trainer.parallel_dims.ep == 1
+        assert trainer.parallel_dims.tp == config.parallel.tensor_parallel_size
+        assert trainer.parallel_dims.ep == config.parallel.expert_parallel_size
         assert trainer.parallel_dims.pp == trainer.parallel_dims.cp == 1
         assert trainer.checkpointer.load(trainer.cfg.checkpoint.load_step)
         assert trainer.step == 0
-    initial = torch.load(root / "initial-hf.pt", weights_only=True)
+    initial = torch.load(
+        capture_artifact_path(args.capture, root, "initial-hf.pt"),
+        map_location="cpu",
+        mmap=True,
+        weights_only=True,
+    )
     captured_initial_count = len(initial)
     if captured_30b:
         assert model.model.lm_head.weight is not model.model.model.embed_tokens.weight
@@ -270,6 +322,7 @@ def main() -> None:
             set(model.model.state_dict()),
             architecture["num_experts"],
         )
+        initial = localize_parallel_reference(initial, model, parameter_prefix="model.")
     else:
         assert model.model.lm_head.weight is model.model.model.embed_tokens.weight
         assert "lm_head.weight" not in initial
@@ -349,11 +402,30 @@ def main() -> None:
             json.dumps(ordered_names, indent=2)
         )
         print("Diagnostic: gradient norm uses baseline mapped parameter order")
+    gradient_trace = os.environ.get("LLMTUNER_ALIGNMENT_GRADIENT_TRACE") == "1"
+    if gradient_trace:
+        from tests.integration_tests.alignment_gradient_trace import (
+            observe_gradient_clipping,
+        )
+
+        trainer_module.clip_grad_norm_ = observe_gradient_clipping(
+            trainer_module.clip_grad_norm_, trainer, args.output
+        )
     trainer.dataloader.close()
     trainer.dataloader = CapturedLoader(batches, forwards)
     module_trace = {}
     module_handles = []
-    if os.environ.get("LLMTUNER_ALIGNMENT_MODULE_TRACE") == "1":
+    if selection := os.environ.get("LLMTUNER_ALIGNMENT_TRACE_LAYERS"):
+        from tests.integration_tests.alignment_module_trace import (
+            selected_trace_modules,
+        )
+        from tests.integration_tests.npu_baseline_training_capture import (
+            observe_first_step_modules,
+        )
+
+        modules = selected_trace_modules(trainer, baseline=False, selection=selection)
+        module_trace, module_handles = observe_first_step_modules(trainer, modules)
+    elif os.environ.get("LLMTUNER_ALIGNMENT_MODULE_TRACE") == "1":
         from tests.integration_tests.npu_baseline_training_capture import (
             observe_first_step_modules,
         )
@@ -448,7 +520,7 @@ def main() -> None:
 
         AttentionInterface.register("sdpa", baseline_flex)
         print("Diagnostic: actual baseline FlexAttention under HF sdpa mask dispatch")
-    logits = []
+    logits = AlignmentHistory(args.output / "candidate-logits", writable=True)
     step_metrics = []
     observed_global_valid_tokens = []
     original_forward_backward = trainer.forward_backward_step
@@ -457,7 +529,9 @@ def main() -> None:
         index = len(observed_global_valid_tokens)
         assert index < len(batches)
         actual = kwargs["global_valid_tokens"]
-        expected = batches[index]["kwargs"]["global_valid_tokens"]
+        expected = torch.as_tensor(
+            batches[index]["kwargs"]["global_valid_tokens"], dtype=actual.dtype
+        )
         torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
         observed_global_valid_tokens.append(actual.detach().cpu().clone())
         return original_forward_backward(*args, **kwargs)
@@ -508,11 +582,12 @@ def main() -> None:
 
     handle = model.register_forward_hook(observe_forward)
     try:
+        if captured_30b:
+            torch.npu.empty_cache()
         trainer.train()
         assert trainer.step == steps
         assert len(logits) == steps
         assert len(observed_global_valid_tokens) == steps
-        torch.save(logits, args.output / "candidate-logits.pt")
         torch.save(
             observed_global_valid_tokens,
             args.output / "global-valid-tokens.pt",
@@ -526,7 +601,13 @@ def main() -> None:
         for actual, forward, batch, measured, baseline_measured in zip(
             logits, forwards, batches, step_metrics, baseline_metrics, strict=True
         ):
-            expected = forward["logits"].reshape_as(actual)
+            expected = forward["logits"]
+            if captured_30b and trainer.parallel_dims.tp > 1:
+                tp_mesh = trainer.parallel_dims.get_mesh("tp")
+                expected = expected.flatten(0, -2).chunk(
+                    trainer.parallel_dims.tp, dim=0
+                )[tp_mesh.get_local_rank()]
+            expected = expected.reshape_as(actual)
             if captured_30b:
                 assert not any("aux" in name for name in measured)
             assert torch.isfinite(actual).all().item()
@@ -537,13 +618,15 @@ def main() -> None:
                 expected_loss = summed_cross_entropy(
                     expected, batch["kwargs"]["labels"]
                 )
-                expected_loss /= batch["kwargs"]["global_valid_tokens"].item()
+                expected_loss /= torch.as_tensor(
+                    batch["kwargs"]["global_valid_tokens"]
+                ).item()
                 loss_metrics = metric_functions["compare_tensors"](
                     torch.tensor(measured["loss"]), expected_loss
                 )
             reference_values = baseline_measured["args"]
             reference_extra = baseline_measured["kwargs"]["extra_metrics"]
-            assert measured["lr/AdamW"] == reference_extra["lr/AdamW"]
+            assert measured["lr/AdamW"] == baseline_learning_rate(reference_extra)
             assert measured["n_tokens_seen"] == reference_extra["n_tokens_seen"]
             recorded_loss = metric_functions["compare_tensors"](
                 torch.tensor(measured["loss"]), torch.tensor(reference_values[1])
@@ -566,22 +649,39 @@ def main() -> None:
                 {"logits_max_ae_per_step": errors, "comparisons": comparisons}, indent=2
             )
         )
-        for step, comparison in enumerate(comparisons, start=1):
-            result = comparison["logits"]
-            assert not metric_functions["failed_logits_metrics"](result), result
-            for metric_name in ("loss_from_logits", "loss", "grad_norm"):
-                compared = comparison[metric_name]
-                if compared is None:
-                    continue
-                context = {"step": step, "metric": metric_name, **compared}
-                assert compared["mean_ae"] <= 0.02, context
-                assert compared["mean_re"] <= 0.005, context
-                assert compared["max_re"] <= 0.005, context
+        weight_failures = {}
+
+        def compare_weight(name, value, expected):
+            try:
+                if (
+                    not torch.isfinite(value).all()
+                    or not torch.isfinite(expected).all()
+                ):
+                    raise AssertionError("Final weights contain non-finite values")
+                torch.testing.assert_close(
+                    value, expected, atol=args.weight_atol, rtol=args.weight_rtol
+                )
+            except AssertionError as error:
+                weight_failures[name] = str(error)
+            return (
+                metric_functions["compare_tensors"](value, expected)
+                if value.numel()
+                else {"empty_shard": True}
+            )
+
         if captured_30b:
             baseline_final = map_capture_to_candidate_hf(
-                torch.load(root / "final-hf.pt", weights_only=True),
+                torch.load(
+                    capture_artifact_path(args.capture, root, "final-hf.pt"),
+                    map_location="cpu",
+                    mmap=True,
+                    weights_only=True,
+                ),
                 set(model.model.state_dict()),
                 architecture["num_experts"],
+            )
+            baseline_final = localize_parallel_reference(
+                baseline_final, model, parameter_prefix="model."
             )
             candidate_local = {}
             weight_metrics = {}
@@ -589,9 +689,7 @@ def main() -> None:
                 model.model.state_dict(), baseline_final
             ):
                 candidate_local[name] = value
-                weight_metrics[name] = metric_functions["compare_tensors"](
-                    value, expected
-                )
+                weight_metrics[name] = compare_weight(name, value, expected)
             torch.save(candidate_local, args.output / "candidate-final-local.pt")
             (args.output / "weight-diagnostics.json").write_text(
                 json.dumps(
@@ -605,21 +703,53 @@ def main() -> None:
         else:
             candidate_final = snapshot_state(model.model.state_dict())
             torch.save(candidate_final, args.output / "candidate-final.pt")
-            baseline_final = torch.load(root / "final-hf.pt", weights_only=True)
+            baseline_final = torch.load(
+                capture_artifact_path(args.capture, root, "final-hf.pt"),
+                map_location="cpu",
+                mmap=True,
+                weights_only=True,
+            )
             if set(candidate_final) != set(baseline_final):
                 raise ValueError("Final HF canonical key sets differ")
             weight_metrics = {}
             for name, expected in baseline_final.items():
                 observed = candidate_final[name]
-                weight_metrics[name] = metric_functions["compare_tensors"](
-                    observed, expected
-                )
+                weight_metrics[name] = compare_weight(name, observed, expected)
             (args.output / "weight-diagnostics.json").write_text(
                 json.dumps(weight_metrics, indent=2)
             )
+        (args.output / "weight-acceptance.json").write_text(
+            json.dumps(
+                {
+                    "passed": not weight_failures,
+                    "atol": args.weight_atol,
+                    "rtol": args.weight_rtol,
+                    "failures": weight_failures,
+                },
+                indent=2,
+            )
+        )
+        if dist.is_initialized():
+            # Preserve every rank's diagnostics before an acceptance failure
+            # makes torchrun terminate the remaining workers.
+            dist.barrier()
+        for step, comparison in enumerate(comparisons, start=1):
+            result = comparison["logits"]
+            assert not metric_functions["failed_logits_metrics"](result), result
+            for metric_name in ("loss_from_logits", "loss", "grad_norm"):
+                compared = comparison[metric_name]
+                if compared is None:
+                    continue
+                context = {"step": step, "metric": metric_name, **compared}
+                assert compared["mean_ae"] <= 0.02, context
+                assert compared["mean_re"] <= 0.005, context
+                assert compared["max_re"] <= 0.005, context
+        assert not weight_failures, (
+            f"Final weights exceed predeclared tolerances: {list(weight_failures)[:8]}"
+        )
         print(f"Real candidate Trainer replay complete; logits max AE={errors}")
     finally:
-        if reorder_norm:
+        if reorder_norm or gradient_trace:
             trainer_module.clip_grad_norm_ = original_clip
         handle.remove()
         trainer.close()

@@ -11,6 +11,10 @@ import torch
 import torch.nn.functional as functional
 
 from llmtuner.utils.seeding import set_deterministic_algorithms
+from tests.integration_tests.alignment_history import (
+    capture_artifact_path,
+    load_alignment_history,
+)
 
 
 def replay_attention(
@@ -144,11 +148,14 @@ def main() -> None:
         weights = {
             name: tensor.to("npu")
             for name, tensor in torch.load(
-                root / "initial-hf.pt", weights_only=True
+                capture_artifact_path(args.baseline, root, "initial-hf.pt"),
+                map_location="cpu",
+                mmap=True,
+                weights_only=True,
             ).items()
             if name.startswith("model.layers.7.self_attn.")
         }
-        forward = torch.load(root / "forward-batches.pt", weights_only=False)[0]
+        forward = load_alignment_history(root, "forward-batches")[0]
         positions = forward["kwargs"]["positions"].flatten()
         cache = baseline["layer7.rope.cache"][positions].to("npu")
         mask = forward["kwargs"]["attention_masks"]["dense_token_mask"]

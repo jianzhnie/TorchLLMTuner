@@ -1,4 +1,4 @@
-"""Four Gloo ranks: EP2 x DP2 with an empty local DP expert shard."""
+"""Four CPU or accelerator ranks: EP2 x DP2 with an empty local expert shard."""
 
 import tempfile
 from datetime import timedelta
@@ -12,16 +12,17 @@ from torch.distributed.tensor import Shard, distribute_tensor
 
 from llmtuner.components.checkpointer.model_state import ModelCheckpointState
 from llmtuner.parallel.expert_parallel.checkpointing import mark_experts_ep_sharded
+from tests.integration_tests.harness import init_distributed
 
 
 def main() -> None:
-    dist.init_process_group("gloo", timeout=timedelta(seconds=90))
+    device = init_distributed(timeout=timedelta(seconds=90))
     try:
         assert dist.get_world_size() == 4
-        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep", "dp"))
+        mesh = init_device_mesh(device.type, (2, 2), mesh_dim_names=("ep", "dp"))
         ep_rank = mesh["ep"].get_local_rank()
         dp_rank = mesh["dp"].get_local_rank()
-        full = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 1, 8)
+        full = torch.arange(4 * 8, dtype=torch.float32, device=device).reshape(4, 1, 8)
         ep_slice = full.chunk(2, dim=0)[ep_rank].contiguous()
 
         def build_model():

@@ -40,6 +40,8 @@ arithmetic, not noise; the accelerator arm runs fp32 (see ``DTYPE``/``TOL``).
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -192,7 +194,7 @@ def _run_ulysses(
 
     gathered = _gather_cp(logits_local, mesh["cp"])
     logit_diff = (gathered - ref_logits).abs().max().item()
-    if logit_diff > TOL:
+    if not math.isfinite(logit_diff) or logit_diff > TOL:
         failures.append(f"{name}: logits max abs diff {logit_diff:.3e}")
 
     # Non-vacuity: shard-against-itself attention must differ materially.
@@ -214,7 +216,7 @@ def _run_ulysses(
     # fp32 accumulation residual of 1e-7 relative is already 1e-4 absolute and
     # would sit above TOL for reasons that have nothing to do with the wiring.
     loss_diff = abs(loss_local.item() - loss_ref.item()) / labels.numel()
-    if loss_diff > TOL:
+    if not math.isfinite(loss_diff) or loss_diff > TOL:
         failures.append(f"{name}: loss diff {loss_diff:.3e}")
 
     return {"logits": logit_diff, "loss": loss_diff}
@@ -239,7 +241,7 @@ def _check_all_to_all(cp_mesh, failures: list[str]) -> dict[str, float]:
     head_lo, head_hi = rank * h // cp, (rank + 1) * h // cp
     want = full[:, head_lo:head_hi]
     fwd_diff = (swapped - want).abs().max().item()
-    if fwd_diff > TOL:
+    if not math.isfinite(fwd_diff) or fwd_diff > TOL:
         failures.append(f"all-to-all forward: max abs diff {fwd_diff:.3e}")
     if swapped.shape != (b, h // cp, s, d):
         failures.append(f"all-to-all forward: shape {tuple(swapped.shape)}")
@@ -249,12 +251,12 @@ def _check_all_to_all(cp_mesh, failures: list[str]) -> dict[str, float]:
     # head slice instead.
     (swapped * w_full[:, head_lo:head_hi]).sum().backward()
     grad_diff = (shard.grad - w_full[:, :, lo:hi]).abs().max().item()
-    if grad_diff > TOL:
+    if not math.isfinite(grad_diff) or grad_diff > TOL:
         failures.append(f"all-to-all backward: grad diff {grad_diff:.3e}")
 
     restored = HeadToSeq.apply(swapped.detach(), group)
     rt_diff = (restored - shard.detach()).abs().max().item()
-    if rt_diff > TOL:
+    if not math.isfinite(rt_diff) or rt_diff > TOL:
         failures.append(f"all-to-all round trip: {rt_diff:.3e}")
 
     return {"forward": fwd_diff, "backward": grad_diff, "round_trip": rt_diff}
@@ -415,7 +417,7 @@ def _check_ulysses_under_a_load_balancer(mesh, failures: list[str]) -> dict[str,
         out = model(ids_ht, positions=pos_ht, attention_masks=sharded_mask)
 
     diff = (out - wrong).abs().max().item()
-    if diff > TOL:
+    if not math.isfinite(diff) or diff > TOL:
         failures.append(
             f"ulysses + headtail: {diff:.3e} from the permuted-corpus run, "
             "expected the two to agree exactly"

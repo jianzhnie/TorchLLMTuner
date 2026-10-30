@@ -19,9 +19,16 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from tests.integration_tests.alignment_history import (
+    AlignmentHistory,
+    save_shared_snapshot,
+)
 from tests.integration_tests.npu_trainer_alignment_config import (
     QWEN3_30B,
+    alignment_runtime_manifest,
+    baseline_allow_hf32,
     baseline_cli_args,
+    baseline_config_snapshot,
     call_after_load,
     configure_baseline_30b,
     input_fingerprints,
@@ -111,7 +118,7 @@ class ProjectionDispatchCapture(TorchDispatchMode):
         return output
 
 
-def observe_first_step_modules(trainer, modules):
+def observe_first_step_modules(trainer, modules, *, partial_path=None):
     """Capture local activations and output gradients without changing autograd."""
     captured = {}
     handles = []
@@ -133,6 +140,8 @@ def observe_first_step_modules(trainer, modules):
                 def save_input_gradient(gradient, key=f"{name}.{suffix}_gradient"):
                     captured[f"{key}_layout"] = _local_tensor_layout(gradient)
                     captured[key] = _snapshot(gradient)
+                    if partial_path is not None and name == "final_norm":
+                        torch.save(captured, partial_path)
 
                 item.register_hook(save_input_gradient)
         captured[f"{name}.output"] = _snapshot(value)
@@ -172,6 +181,8 @@ def observe_first_step_modules(trainer, modules):
             def save_gradient(gradient):
                 captured[f"{name}.gradient_layout"] = _local_tensor_layout(gradient)
                 captured[f"{name}.gradient"] = _snapshot(gradient)
+                if partial_path is not None and name == "final_norm":
+                    torch.save(captured, partial_path)
 
             value.register_hook(save_gradient)
 
@@ -224,9 +235,14 @@ def main() -> None:
         configure_baseline_30b(config, world) if alignment_model == QWEN3_30B else []
     )
     root = Path(config.dump_folder) / "alignment-capture"
+    shared_root = root
     rank = int(os.environ.get("RANK", "0"))
     if rank == 0:
         root.mkdir(parents=True, exist_ok=False)
+    if alignment_model == QWEN3_30B:
+        allow_hf32 = baseline_allow_hf32(baseline_config_snapshot(config))
+        for backend in (torch.npu.matmul, torch.npu.conv, torch.npu.aclnn):
+            backend.allow_hf32 = allow_hf32
     trainer = config.build()
     assert dist.get_world_size() == world
     dist.barrier()
@@ -261,25 +277,40 @@ def main() -> None:
         actual = adapter.to_hf(_snapshot(model.state_dict()))
         for name, value in initial.items():
             torch.testing.assert_close(actual[name], value, atol=0, rtol=0)
-    config_dict = config.to_dict()
+    config_dict = baseline_config_snapshot(config)
     (root / "config.json").write_text(json.dumps(config_dict, indent=2))
     manifest = {
+        "runtime": alignment_runtime_manifest(
+            ("torchtitan", "torchtitan.trainer", "torchtitan_npu")
+        ),
         "rank": rank,
         "world_size": world,
+        "capture_artifact_layout": "shared-hf-v1",
+        "shared_artifact_writer_rank": 0,
         "alignment_model": alignment_model or "debugmodel",
         "hf_assets_path": config.hf_assets_path,
         "actual_mesh": mesh_manifest(trainer.parallel_dims),
         "disabled_balancing": disabled_balancing,
-        "module_trace_enabled": alignment_model != QWEN3_30B
-        and os.environ.get("LLMTUNER_ALIGNMENT_MODULE_TRACE") == "1",
+        "module_trace_enabled": bool(os.environ.get("LLMTUNER_ALIGNMENT_TRACE_LAYERS"))
+        or (
+            alignment_model != QWEN3_30B
+            and os.environ.get("LLMTUNER_ALIGNMENT_MODULE_TRACE") == "1"
+        ),
+        "trace_layers": os.environ.get("LLMTUNER_ALIGNMENT_TRACE_LAYERS"),
+        "gradient_trace_enabled": os.environ.get("LLMTUNER_ALIGNMENT_GRADIENT_TRACE")
+        == "1",
         "dispatch_trace_enabled": alignment_model != QWEN3_30B
         and os.environ.get("LLMTUNER_ALIGNMENT_DISPATCH_TRACE") == "1",
     }
     if alignment_model == QWEN3_30B:
         assert is_qwen3_30b(config_dict)
         assert trainer.parallel_dims.dp_replicate == 1
-        assert trainer.parallel_dims.dp_shard == 8
-        assert trainer.parallel_dims.tp == trainer.parallel_dims.ep == 1
+        assert (
+            trainer.parallel_dims.dp_shard
+            == config.parallelism.data_parallel_shard_degree
+        )
+        assert trainer.parallel_dims.tp == config.parallelism.tensor_parallel_degree
+        assert trainer.parallel_dims.ep == config.parallelism.expert_parallel_degree
         assert trainer.parallel_dims.pp == trainer.parallel_dims.cp == 1
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     (root / "optimizer.json").write_text(
@@ -289,9 +320,13 @@ def main() -> None:
 
     def capture_initial():
         initial_hf = adapter.to_hf(_snapshot(model.state_dict()))
-        if alignment_model == QWEN3_30B:
-            validate_hf_snapshot(initial_hf, config.hf_assets_path)
-        torch.save(initial_hf, root / "initial-hf.pt")
+        save_shared_snapshot(
+            initial_hf,
+            shared_root / "initial-hf.pt",
+            validate=(lambda state: validate_hf_snapshot(state, config.hf_assets_path))
+            if alignment_model == QWEN3_30B
+            else None,
+        )
         initial_captured.append(True)
         (root / "initial-load.json").write_text(
             json.dumps(
@@ -316,15 +351,27 @@ def main() -> None:
         result = call_after_load(original_load, capture_initial, *args, **kwargs)
         if alignment_model == QWEN3_30B:
             assert result and trainer.step == 0
+            # Full-tensor observation must not retain its free gather buffers
+            # in the allocator before the near-capacity training workload.
+            torch.npu.empty_cache()
         return result
 
     trainer.checkpointer.load = MethodType(observe_load, trainer.checkpointer)
-    captured = []
+    captured = AlignmentHistory(root / "forward-batches", writable=True)
     consumed = []
     measured = []
     module_trace = {}
     module_handles = []
-    if (
+    if selection := os.environ.get("LLMTUNER_ALIGNMENT_TRACE_LAYERS"):
+        from tests.integration_tests.alignment_module_trace import (
+            selected_trace_modules,
+        )
+
+        modules = selected_trace_modules(trainer, baseline=True, selection=selection)
+        module_trace, module_handles = observe_first_step_modules(
+            trainer, modules, partial_path=root / "module-trace-step-1.partial.pt"
+        )
+    elif (
         alignment_model != QWEN3_30B
         and os.environ.get("LLMTUNER_ALIGNMENT_MODULE_TRACE") == "1"
     ):
@@ -373,6 +420,19 @@ def main() -> None:
         if value
     }
     original_train_step = trainer.train_step
+    gradient_clip_owner = None
+    if os.environ.get("LLMTUNER_ALIGNMENT_GRADIENT_TRACE") == "1":
+        from torchtitan.trainer import dist_utils
+
+        from tests.integration_tests.alignment_gradient_trace import (
+            observe_gradient_clipping,
+        )
+
+        gradient_clip_owner = dist_utils
+        original_gradient_clip = dist_utils.clip_grad_norm_
+        dist_utils.clip_grad_norm_ = observe_gradient_clipping(
+            original_gradient_clip, trainer, root
+        )
 
     def observe_train_step(self, *args, **kwargs):
         if (
@@ -421,7 +481,9 @@ def main() -> None:
         values = _snapshot(output)
         assert isinstance(values, torch.Tensor)
         assert torch.isfinite(values).all().item()
-        captured[-1]["logits"] = values
+        observation = captured[-1]
+        observation["logits"] = values
+        captured[-1] = observation
 
     handles = [
         model.register_forward_pre_hook(before_forward, with_kwargs=True),
@@ -433,15 +495,17 @@ def main() -> None:
         assert trainer.step == config.training.steps
         assert len(captured) == config.training.steps
         assert len(consumed) == config.training.steps
-        torch.save(captured, root / "forward-batches.pt")
+        final_hf = adapter.to_hf(_snapshot(model.state_dict()))
+        save_shared_snapshot(final_hf, shared_root / "final-hf.pt")
         torch.save(consumed, root / "consumed-batches.pt")
         torch.save(measured, root / "step-metrics.pt")
         (root / "input-hashes.json").write_text(
             json.dumps(input_fingerprints(consumed, captured), indent=2)
         )
-        torch.save(adapter.to_hf(_snapshot(model.state_dict())), root / "final-hf.pt")
         print(f"PASS real baseline Trainer capture: {len(captured)} steps at {root}")
     finally:
+        if gradient_clip_owner is not None:
+            gradient_clip_owner.clip_grad_norm_ = original_gradient_clip
         for handle in handles:
             handle.remove()
         trainer.close()

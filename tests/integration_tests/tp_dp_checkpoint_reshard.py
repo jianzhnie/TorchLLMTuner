@@ -1,4 +1,4 @@
-"""CPU/Gloo DCP restore from TP2 x DP2 into TP2 x DP1.
+"""CPU or accelerator DCP restore from TP2 x DP2 into TP2 x DP1.
 
 Run with ``PYTHONPATH=. python tests/integration_tests/tp_dp_checkpoint_reshard.py``.
 The driver launches separate four-rank save and two-rank load jobs so each job
@@ -23,6 +23,8 @@ from torch.distributed.tensor import Shard, distribute_tensor
 from llmtuner.components.checkpointer.model_state import ModelCheckpointState
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config.optimizer_config import OptimizerConfig, ParamGroupConfig
+from tests.integration_tests.harness import device as harness_device
+from tests.integration_tests.harness import init_distributed
 
 
 def build_optimizer(model: nn.Module, *, cold: bool = False) -> OptimizersContainer:
@@ -43,7 +45,9 @@ def build_optimizer(model: nn.Module, *, cold: bool = False) -> OptimizersContai
 
 
 def reference_after_two_steps() -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    parameter = nn.Parameter(torch.arange(8 * 4, dtype=torch.float32).reshape(8, 4))
+    parameter = nn.Parameter(
+        torch.arange(8 * 4, dtype=torch.float32, device=harness_device()).reshape(8, 4)
+    )
     optimizer = torch.optim.AdamW([parameter], lr=0.01, weight_decay=0.01)
     parameter.grad = torch.ones_like(parameter)
     optimizer.step()
@@ -59,14 +63,14 @@ def reference_after_two_steps() -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 
 
 def worker(mode: str, checkpoint: str) -> None:
-    dist.init_process_group("gloo", timeout=timedelta(seconds=90))
+    device = init_distributed(timeout=timedelta(seconds=90))
     try:
         saving = mode == "save"
         dp_size = 2 if saving else 1
         assert dist.get_world_size() == dp_size * 2
-        mesh = init_device_mesh("cpu", (dp_size, 2), mesh_dim_names=("dp", "tp"))
+        mesh = init_device_mesh(device.type, (dp_size, 2), mesh_dim_names=("dp", "tp"))
         tp_rank = mesh["tp"].get_local_rank()
-        full = torch.arange(8 * 4, dtype=torch.float32).reshape(8, 4)
+        full = torch.arange(8 * 4, dtype=torch.float32, device=device).reshape(8, 4)
         tp_local = full.chunk(2, dim=1)[tp_rank].contiguous()
         initial = torch.zeros_like(tp_local) if not saving else tp_local
 

@@ -46,6 +46,8 @@ wrapper would otherwise select sdpa, which ``apply_cp`` rejects.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.distributed as dist
 
@@ -253,7 +255,7 @@ def _run_strategy(name, *, strategy, cp_mesh, tp_mesh, failures) -> dict[str, fl
     # would sit above TOL for reasons that have nothing to do with the wiring.
     num_valid = int((labels != IGNORE_INDEX).sum())
     loss_diff = abs(loss_local.item() - loss_ref.item()) / num_valid
-    if loss_diff > TOL:
+    if not math.isfinite(loss_diff) or loss_diff > TOL:
         failures.append(f"{name}: reduced loss diff {loss_diff:.3e}")
 
     # -- the denominator property -------------------------------------------
@@ -287,7 +289,7 @@ def _diff(what: str, got: torch.Tensor, want: torch.Tensor, failures) -> float:
         failures.append(f"{what}: shape {tuple(got.shape)} vs {tuple(want.shape)}")
         return float("inf")
     diff = (got - want).abs().max().item()
-    if diff > TOL:
+    if not math.isfinite(diff) or diff > TOL:
         failures.append(f"{what}: max abs diff {diff:.3e}")
     return diff
 

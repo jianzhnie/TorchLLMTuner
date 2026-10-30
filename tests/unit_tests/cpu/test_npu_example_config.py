@@ -106,3 +106,34 @@ def test_30b_example_uses_target_model_and_preserves_training_state(
     assert config.parallel.data_parallel_shard_size == -1
     assert config.training.dataloader_config.prompt_field == "question"
     assert config.training.dataloader_config.response_field == "solution"
+
+
+@pytest.mark.parametrize("enabled", ["0", "1"])
+def test_30b_example_selects_global_context_rows(monkeypatch, enabled):
+    monkeypatch.setenv("LLMTUNER_GLOBAL_CONTEXT_ROWS", enabled)
+    config = qwen3_30b_npu_config()
+    assert config.dataloader.global_context_rows == (enabled == "1")
+    assert config.dataloader.attention_mask_type() == (
+        "block_causal" if enabled == "1" else "causal"
+    )
+
+
+@pytest.mark.parametrize(("tp", "ep"), [(1, 1), (2, 1), (1, 8), (2, 4)])
+def test_30b_parallel_defaults_select_sharded_hf_loading(monkeypatch, tp, ep):
+    monkeypatch.setenv("LLMTUNER_TENSOR_PARALLEL_SIZE", str(tp))
+    monkeypatch.setenv("LLMTUNER_EXPERT_PARALLEL_SIZE", str(ep))
+    monkeypatch.delenv("LLMTUNER_SHARDED_TENSOR_CHECKPOINT", raising=False)
+    monkeypatch.delenv("LLMTUNER_SHARDED_EXPERT_CHECKPOINT", raising=False)
+    checkpoint = qwen3_30b_npu_config().training.checkpoint_config
+    assert checkpoint.sharded_expert_parallel == (ep > 1)
+    assert checkpoint.sharded_tensor_parallel == (tp > 1)
+
+
+def test_30b_preserves_explicit_checkpoint_layout(monkeypatch):
+    monkeypatch.setenv("LLMTUNER_EXPERT_PARALLEL_SIZE", "4")
+    monkeypatch.setenv("LLMTUNER_TENSOR_PARALLEL_SIZE", "2")
+    monkeypatch.setenv("LLMTUNER_SHARDED_EXPERT_CHECKPOINT", "0")
+    monkeypatch.setenv("LLMTUNER_SHARDED_TENSOR_CHECKPOINT", "0")
+    checkpoint = qwen3_30b_npu_config().training.checkpoint_config
+    assert not checkpoint.sharded_expert_parallel
+    assert not checkpoint.sharded_tensor_parallel

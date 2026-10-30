@@ -461,18 +461,12 @@ def test_packed_cp_preserves_global_document_mask(model, monkeypatch, dtype, str
         padding_mask=None,
     )
     assert mask.shape == (1, 1, 8, 8)
-    if strategy != "ulysses":
-        assert mask.dtype == torch.bool
-        assert not mask[0, 0, 3, 2]
-        assert mask[0, 0, 4, 3]
-        assert not mask[0, 0, 3, 4]
-        with pytest.raises(ValueError, match="full preprocessed document mask"):
-            model._apply_attention(local_positions, None)
-    else:
-        assert mask.dtype == dtype
-        assert torch.isneginf(mask[0, 0, 3, 2])
-        assert mask[0, 0, 4, 3] == 0
-        assert torch.isneginf(mask[0, 0, 3, 4])
+    assert mask.dtype == torch.bool
+    assert not mask[0, 0, 3, 2]
+    assert mask[0, 0, 4, 3]
+    assert not mask[0, 0, 3, 4]
+    with pytest.raises(ValueError, match="full preprocessed document mask"):
+        model._apply_attention(local_positions, None)
     actual = model._apply_attention(local_positions, mask)["attention_mask"]
     assert actual is mask
 

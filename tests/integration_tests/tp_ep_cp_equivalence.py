@@ -6,15 +6,15 @@ Run under torchrun with 4 ranks:
         tests/integration_tests/tp_ep_cp_equivalence.py
 
 A tiny qwen3_moe runs with tensor_parallel_size=2,
-context_parallel_kv_allgather_size=2 and expert_parallel_size=2 on 4 gloo ranks:
+context_parallel_kv_allgather_size=2 and expert_parallel_size=2 on 4 ranks:
 TP shards the dense projections, the
 EP swap owns the routed experts, CP shards the sequence. Each rank's logits
 are this rank's T/(cp*tp) sequence slice; joining them over tp and then cp
 must reproduce the unsharded HF model's logits, and the summed loss must
 reduce to the reference's.
 
-Environment note: uses CPU eager flex for the parallel forward and SDPA for
-the reference. CPU flex backward and GPU/NPU kernels are not exercised.
+CPU uses eager flex for the parallel forward; accelerators use the SDPA CP
+kernel. The reference uses SDPA. This checks forward and loss, not backward.
 
 Non-vacuity: TP must have swapped projections (wrapper count), each rank must
 hold only its half of the experts, and the CP gather must matter (a rank
@@ -22,6 +22,8 @@ whose tokens have predecessors must not match a no-op run).
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.distributed as dist
@@ -125,7 +127,7 @@ def _diff(what: str, got: torch.Tensor, want: torch.Tensor, failures) -> float:
         failures.append(f"{what}: shape {tuple(got.shape)} vs {tuple(want.shape)}")
         return float("inf")
     diff = (got - want).abs().max().item()
-    if diff > TOL:
+    if not math.isfinite(diff) or diff > TOL:
         failures.append(f"{what}: max abs diff {diff:.3e}")
     return diff
 
@@ -212,7 +214,7 @@ def main() -> None:
     # absolute, which says nothing about the wiring.
     num_valid = int((labels != IGNORE_INDEX).sum())
     loss_diff = abs(loss_local.item() - loss_ref.item()) / num_valid
-    if loss_diff > TOL:
+    if not math.isfinite(loss_diff) or loss_diff > TOL:
         failures.append(f"reduced loss diff {loss_diff:.3e}")
 
     # The batch is replicated across cp and tp: the token count must not be

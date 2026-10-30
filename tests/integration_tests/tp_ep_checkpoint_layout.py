@@ -1,4 +1,4 @@
-"""Run with four CPU/Gloo ranks: TP2/EP2 packed checkpoint layout."""
+"""Four ranks on CPU/Gloo or accelerators: TP2/EP2 checkpoint layouts."""
 
 import tempfile
 from datetime import timedelta
@@ -25,8 +25,9 @@ from llmtuner.parallel.tensor_parallel.checkpointing import (
     shard_disjoint_tp_ep_state,
     validate_disjoint_tp_ep_checkpoint_ownership,
 )
+from tests.integration_tests.harness import init_distributed
 
-dist.init_process_group("gloo", timeout=timedelta(seconds=30))
+device = init_distributed(timeout=timedelta(seconds=90))
 try:
     rank = dist.get_rank()
     groups = {
@@ -36,7 +37,7 @@ try:
     tp = groups[(0, 1) if rank < 2 else (2, 3)]
     ep = groups[(0, 2) if rank % 2 == 0 else (1, 3)]
     model = nn.Module()
-    full = torch.arange(4 * 8 * 3, dtype=torch.float32).reshape(4, 8, 3)
+    full = torch.arange(4 * 8 * 3, dtype=torch.float32, device=device).reshape(4, 8, 3)
     expert = full.chunk(2, 0)[rank // 2]
     local = torch.cat([half.chunk(2, 1)[rank % 2] for half in expert.chunk(2, 1)], 1)
     model.register_parameter("weight", nn.Parameter(local.clone()))
@@ -60,10 +61,10 @@ try:
         torch.testing.assert_close(state[key], local, rtol=0, atol=0)
     print(f"rank {rank}: packed TP/EP global state and restore exact", flush=True)
     separate = nn.Module()
-    dense_full = torch.arange(24.0).reshape(8, 3)
+    dense_full = torch.arange(24.0, device=device).reshape(8, 3)
     separate.dense = nn.Parameter(dense_full.chunk(2, 0)[rank % 2].clone())
     separate.experts = nn.Module()
-    expert_full = torch.arange(96.0).reshape(4, 8, 3)
+    expert_full = torch.arange(96.0, device=device).reshape(4, 8, 3)
     separate.experts.weight = nn.Parameter(expert_full.chunk(2, 0)[rank // 2].clone())
     separate._tp_checkpoint_layouts = {"dense": (0, False, tp)}
     mark_experts_ep_sharded(separate.experts, ep)

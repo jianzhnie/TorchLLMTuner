@@ -80,11 +80,15 @@ def launch_command(script: Path, master_port: int) -> list[str]:
 
 def discover() -> list[Path]:
     """Every runnable script in this directory, sorted by name."""
-    return sorted(
-        p
-        for p in SCRIPT_DIR.glob("*.py")
-        if p.name not in ("__init__.py", "run_all.py")
-    )
+    support_modules = {
+        "__init__.py",
+        "alignment_history.py",
+        "alignment_module_trace.py",
+        "harness.py",
+        "npu_trainer_alignment_config.py",
+        "run_all.py",
+    }
+    return sorted(p for p in SCRIPT_DIR.glob("*.py") if p.name not in support_modules)
 
 
 def main() -> int:

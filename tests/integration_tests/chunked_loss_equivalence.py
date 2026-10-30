@@ -31,6 +31,7 @@ on the selected harness device (CPU/gloo or NPU/HCCL).
 
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -148,8 +149,8 @@ def _reference_trajectory(
         for d in range(DP_SHARD):
             rows = slice(d * rows_per_dp, (d + 1) * rows_per_dp)
             sub = Batch(input_ids=batch.input_ids[rows], labels=batch.labels[rows])
-            inputs, targets, _ = model.preprocess_inputs(sub, parallel_dims=None)
-            logits = model(inputs)
+            inputs, targets, kwargs = model.preprocess_inputs(sub, parallel_dims=None)
+            logits = model(inputs, **kwargs)
             loss = cross_entropy_loss(logits, targets)
             loss_sum = loss if loss_sum is None else loss_sum + loss
         # Normalized BEFORE backward, as the trainer does.
@@ -215,7 +216,7 @@ def main() -> None:
     for step, (got, want) in enumerate(zip(losses, reference, strict=True), 1):
         diff = abs(got - want)
         max_loss_diff = max(max_loss_diff, diff)
-        if diff > LOSS_TOL:
+        if not math.isfinite(diff) or diff > LOSS_TOL:
             failures.append(
                 f"rank {rank}: step {step} loss {got:.6f} vs reference "
                 f"{want:.6f} (diff {diff:.3e})"
@@ -236,7 +237,7 @@ def main() -> None:
                 saw_fsdp_shard = True
             diff = (full - want).abs().max().item()
             max_param_diff = max(max_param_diff, diff)
-            if diff > PARAM_TOL:
+            if not math.isfinite(diff) or diff > PARAM_TOL:
                 failures.append(f"rank {rank}: param {name} diff {diff:.3e}")
         if not saw_fsdp_shard:
             failures.append(f"rank {rank}: no parameter was FSDP-sharded -- vacuous")

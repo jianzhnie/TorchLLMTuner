@@ -2755,6 +2755,7 @@ def test_interrupted_stager_close_retains_live_executor(
             use_pinned_memory=False,
             use_shared_memory=False,
             use_async_staging=True,
+            use_non_blocking_copy=False,
         )
     )
     manager.stager = stager

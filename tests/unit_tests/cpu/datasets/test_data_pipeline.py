@@ -2526,7 +2526,8 @@ def test_streaming_graph_cursors_keep_independent_checkpoint_positions():
 
 
 @pytest.mark.parametrize("shuffle", [False, True])
-def test_streaming_cursor_resumes_across_repeated_epochs(shuffle):
+@pytest.mark.parametrize("consumed", [2, 3, 5, 8])
+def test_streaming_cursor_resumes_across_repeated_epochs(shuffle, consumed):
     from datasets import IterableDataset
 
     from llmtuner.datasets.sources import HuggingFaceStreamingIterDataset
@@ -2539,14 +2540,24 @@ def test_streaming_cursor_resumes_across_repeated_epochs(shuffle):
         IterableDataset.from_generator(rows), repeat=True, shuffle=shuffle
     )
     cursor = iter(graph)
-    assert [next(cursor)["index"] for _ in range(5)] == [0, 1, 2, 0, 1]
+    assert [next(cursor)["index"] for _ in range(consumed)] == [
+        index % 3 for index in range(consumed)
+    ]
     saved = cursor.get_state()
-    assert saved["epoch"] == 1
+    epoch = (consumed - 1) // 3
+    assert saved["epoch"] == epoch
     restored = iter(graph)
     restored.set_state(saved)
     expected = [next(cursor) for _ in range(8)]
     assert [next(restored) for _ in range(8)] == expected
-    assert saved["epoch"] == 1
+    assert saved["epoch"] == epoch
+    # A resumed cursor must itself remain checkpointable, across more repeats.
+    saved_again = restored.get_state()
+    restored_again = iter(graph)
+    restored_again.set_state(saved_again)
+    assert [next(restored_again) for _ in range(8)] == [
+        next(restored) for _ in range(8)
+    ]
 
 
 def test_grain_window_shuffle_restores_stream_and_buffer_progress():
@@ -3898,3 +3909,71 @@ def test_closed_document_packing_rejects_restore_before_touching_parent(
     assert iterator.get_state() == before
     assert iterator._closed and iterator._parent._closed
     iterator.close()
+
+
+@pytest.mark.parametrize("world", [1, 2, 4, 8])
+def test_global_context_loader_preserves_inputs_and_resume_across_dp(
+    tmp_path, corpus, world
+):
+    tokenizer_path = write_tokenizer(str(tmp_path / "tokenizer"))
+    cfg = _loader_config(
+        DataloaderConfig(
+            dataset="local_jsonl",
+            dataset_path=str(corpus),
+            tokenizer_path=tokenizer_path,
+            packing="first_fit",
+            max_num_documents=1,
+            global_context_rows=True,
+            num_prefetch_batches=1,
+        ),
+        global_batch_size=8,
+        max_seq_len=16,
+    )
+    assert cfg.dataloader.attention_mask_type() == "block_causal"
+
+    def fresh(rank, degree):
+        return build_dataloader(
+            cfg,
+            dp_rank=rank,
+            dp_world_size=degree,
+            num_tokens_per_batch=128 // degree,
+        )
+
+    reference = fresh(0, 1)
+    loaders = [fresh(rank, world) for rank in range(world)]
+    restored = fresh(0, world)
+    try:
+        reference_iter = iter(reference)
+        iterators = [iter(loader) for loader in loaders]
+        for step in range(3):
+            expected = next(reference_iter)
+            actual = [next(iterator) for iterator in iterators]
+            for key in ("input", "labels", "positions", "padding_mask"):
+                torch.testing.assert_close(
+                    torch.cat([batch[key] for batch in actual]),
+                    expected[key],
+                    rtol=0,
+                    atol=0,
+                )
+            assert (
+                sum(batch["num_valid_tokens"] for batch in actual)
+                == expected["num_valid_tokens"]
+            )
+            if step == 0:
+                restored.load_state_dict(loaders[0].state_dict())
+                restored_iter = iter(restored)
+            else:
+                replayed = next(restored_iter)
+                for key in ("input", "labels", "positions", "padding_mask"):
+                    torch.testing.assert_close(
+                        replayed[key], actual[0][key], rtol=0, atol=0
+                    )
+    finally:
+        for loader in [reference, *loaders, restored]:
+            loader.close()
+
+
+def test_global_context_rows_rejects_synthetic_data_before_building_loader():
+    cfg = _loader_config(DataloaderConfig(global_context_rows=True))
+    with pytest.raises(ValueError, match="requires a text corpus dataset"):
+        build_dataloader(cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=32)

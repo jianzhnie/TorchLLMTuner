@@ -29,7 +29,8 @@ the two tp ranks hold DIFFERENT slices; FSDP parameters are DTensors whose
 local shard is half the global tensor. A combination that silently skipped
 either reduction would diverge from the reference within the tolerances below.
 
-Everything runs in fp32 on CPU/gloo (the fallback path of the TP collectives).
+Runs in FP32 on the device/backend selected by the integration harness,
+including NPU/HCCL; CPU/Gloo uses the fallback TP collectives.
 Set TP_FSDP_EQ_DP_SHARD=1 and TP_FSDP_EQ_DP_REPLICATE=2 for replicated DP;
 set both to 2 and launch eight ranks for HSDP.
 Set TP_FSDP_EQ_EP=2 for a Qwen3 MoE fixture with real Trainer/AdamW and
