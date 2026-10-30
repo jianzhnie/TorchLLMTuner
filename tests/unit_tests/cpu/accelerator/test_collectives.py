@@ -195,11 +195,56 @@ def test_parameter_precision_norm_matches_native_rounding():
     torch.testing.assert_close(observed, expected, atol=0, rtol=0)
 
 
+def test_packed_parameter_precision_matches_packed_norm_and_clipping():
+    from llmtuner.accelerator.collectives import clip_grad_norm_
+
+    torch.manual_seed(42)
+    parameters = [
+        torch.nn.Parameter(torch.zeros(2, 4, 8, dtype=torch.bfloat16)) for _ in range(2)
+    ]
+    for parameter in parameters:
+        parameter.grad = torch.randn_like(parameter) * 0.01
+    originals = [p.grad.clone() for p in parameters]
+    expected = torch.cat(originals, dim=1).norm().float()
+    actual = clip_grad_norm_(
+        parameters,
+        0.01,
+        norm_precision="parameter",
+        packed_parameters=[tuple(parameters)],
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    coefficient = (0.01 / (expected + 1e-6)).clamp(max=1)
+    for parameter, original in zip(parameters, originals, strict=True):
+        torch.testing.assert_close(
+            parameter.grad, original * coefficient, atol=0, rtol=0
+        )
+
+
 def test_parameter_precision_norm_rejects_infinite_order():
     from llmtuner.accelerator.collectives import clip_grad_norm_
 
     with pytest.raises(ValueError, match="finite positive"):
         clip_grad_norm_([], 1, norm_type=float("inf"), norm_precision="parameter")
+
+
+def test_packed_norm_rejects_overlapping_groups_before_clipping():
+    from llmtuner.accelerator.collectives import clip_grad_norm_
+
+    parameters = [torch.nn.Parameter(torch.zeros(2, 4, 8)) for _ in range(3)]
+    for parameter in parameters:
+        parameter.grad = torch.ones_like(parameter)
+    with pytest.raises(ValueError, match="disjoint"):
+        clip_grad_norm_(
+            parameters,
+            0.01,
+            norm_precision="parameter",
+            packed_parameters=[
+                (parameters[0], parameters[1]),
+                (parameters[1], parameters[2]),
+            ],
+        )
+    for parameter in parameters:
+        torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
 
 
 @pytest.mark.parametrize("precision", ["parameter", "float32"])

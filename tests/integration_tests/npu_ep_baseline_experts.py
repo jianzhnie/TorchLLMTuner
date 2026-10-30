@@ -1,4 +1,4 @@
-"""Two ranks: score-aware EP expert output and VJP against real baseline GMM."""
+"""Score-aware EP output and VJP against real baseline GMM on 2/4/8 ranks."""
 
 import argparse
 import importlib
@@ -8,19 +8,22 @@ import torch
 import torch.distributed as dist
 
 from llmtuner.parallel.expert_parallel.npu_baseline_experts import (
+    NpuBaselineAllToAllTokenDispatcher,
     NpuBaselineGroupedExperts,
     NpuBaselineRoutedExperts,
 )
-from llmtuner.parallel.expert_parallel.token_dispatch import AllToAllTokenDispatcher
 from tests.caps import require_env
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", action="store_true")
+    parser.add_argument("--baseline-dispatch", action="store_true")
     parser.add_argument("--empty-owner", action="store_true")
     parser.add_argument("--random-routing", action="store_true")
-    parser.add_argument("--empty-origin", action="store_true")
+    origin = parser.add_mutually_exclusive_group()
+    origin.add_argument("--empty-origin", action="store_true")
+    origin.add_argument("--uneven-origin", action="store_true")
     parser.add_argument("--top-k", type=int, choices=(2, 8), default=2)
     args = parser.parse_args()
     require_env("torch_npu")
@@ -30,12 +33,14 @@ def main():
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl")
     try:
-        assert dist.get_world_size() == 2
+        world = dist.get_world_size()
+        assert world in (2, 4, 8)
         rank = dist.get_rank()
         for backend in (torch.npu.matmul, torch.npu.conv, torch.npu.aclnn):
             backend.allow_hf32 = False
         torch.manual_seed(37)
         experts = 16 if args.top_k == 8 else 4
+        assert experts % world == 0, "expert count must divide evenly across ranks"
         tokens = 64 if args.random_routing else 16
         weights = [
             (
@@ -43,13 +48,13 @@ def main():
             ).requires_grad_()
             for _ in range(3)
         ]
-        block = NpuBaselineGroupedExperts(128, 128, experts // 2).to(
+        block = NpuBaselineGroupedExperts(128, 128, experts // world).to(
             device="npu", dtype=torch.bfloat16
         )
         with torch.no_grad():
             for parameter, full in zip(block.parameters(), weights, strict=True):
-                parameter.copy_(full.chunk(2)[rank])
-        dispatcher = AllToAllTokenDispatcher(experts, args.top_k)
+                parameter.copy_(full.chunk(world)[rank])
+        dispatcher = NpuBaselineAllToAllTokenDispatcher(experts, args.top_k)
         dispatcher.set_ep_group(ep_group=dist.group.WORLD)
         model = NpuBaselineRoutedExperts(block, dispatcher)
         torch.manual_seed(91 + rank)
@@ -69,13 +74,17 @@ def main():
                 .indices
             )
         counts = torch.nn.functional.one_hot(ids, experts).sum((0, 1))
-        global_inputs = [torch.empty_like(inputs) for _ in range(2)]
-        global_scores = [torch.empty_like(scores) for _ in range(2)]
+        global_inputs = [torch.empty_like(inputs) for _ in range(world)]
+        global_scores = [torch.empty_like(scores) for _ in range(world)]
         dist.all_gather(global_inputs, inputs)
         dist.all_gather(global_scores, scores)
-        global_expert_ids = [torch.empty_like(ids) for _ in range(2)]
+        global_expert_ids = [torch.empty_like(ids) for _ in range(world)]
         dist.all_gather(global_expert_ids, ids)
-        sizes = [tokens, 0] if args.empty_origin else [tokens, tokens]
+        sizes = [tokens] * world
+        if args.empty_origin:
+            sizes[-1] = 0
+        if args.uneven_origin:
+            sizes = [max(1, tokens - i * 7) for i in range(world)]
         global_inputs = [
             value[:size] for value, size in zip(global_inputs, sizes, strict=True)
         ]
@@ -136,7 +145,60 @@ def main():
                 actual, reference.split(sizes)[rank], atol=0, rtol=0
             )
         for actual, reference in zip(actual_grads[2:], expected_grads[2:], strict=True):
-            torch.testing.assert_close(actual, reference.chunk(2)[rank], atol=0, rtol=0)
+            torch.testing.assert_close(
+                actual, reference.chunk(world)[rank], atol=0, rtol=0
+            )
+        if args.baseline_dispatch:
+            from types import SimpleNamespace
+
+            import torch_npu
+            from torch.distributed.device_mesh import init_device_mesh
+            from torch.distributed.tensor.parallel import parallelize_module
+            from torchtitan.models.common.moe import GroupedExperts
+            from torchtitan_npu.converters.kernels.gmm import NpuGroupedExpertConverter
+            from torchtitan_npu.converters.kernels.moe_dispatch import NpuExpertParallel
+
+            root = torch.nn.Module()
+            root.experts = GroupedExperts.Config(
+                dim=128, hidden_dim=128, num_experts=experts
+            ).build()
+            root.to(device="npu", dtype=torch.bfloat16)
+            NpuGroupedExpertConverter(SimpleNamespace(name="qwen3")).convert(root)
+            with torch.no_grad():
+                root.experts.w13.copy_(torch.cat((w1, w3), dim=1))
+                root.experts.w2.copy_(w2)
+            mesh = init_device_mesh("npu", (world,), mesh_dim_names=("ep",))
+            parallelize_module(root.experts, mesh, NpuExpertParallel())
+            baseline_x = inputs.clone().requires_grad_()
+            baseline_scores = scores.clone().requires_grad_()
+            routed_x, indices = torch_npu.npu_moe_token_permute(baseline_x, ids)
+            routed_scores, _ = torch_npu.npu_moe_token_permute(
+                baseline_scores.flatten()[:, None], ids.reshape(-1, 1)
+            )
+            baseline_output = root.experts(routed_x, counts, routed_scores)
+            baseline_output = (
+                torch_npu.npu_moe_token_unpermute(baseline_output, indices, None)
+                .reshape(sizes[rank], args.top_k, 128)
+                .sum(1)
+            )
+            baseline_grads = torch.autograd.grad(
+                baseline_output,
+                (baseline_x, baseline_scores, root.experts.w13, root.experts.w2),
+                probe.split(sizes)[rank],
+            )
+            torch.testing.assert_close(observed, baseline_output, atol=0, rtol=0)
+            for actual, reference in zip(
+                actual_grads[:2], baseline_grads[:2], strict=True
+            ):
+                torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+            packed_grad = baseline_grads[2].to_local()
+            gate_grad, up_grad = packed_grad.chunk(2, dim=1)
+            down_grad = baseline_grads[3].to_local()
+            for actual, reference in zip(
+                actual_grads[2:], (gate_grad, up_grad, down_grad), strict=True
+            ):
+                torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+            print(f"PASS rank={rank} actual baseline EP hooks output and all VJPs")
         print(f"PASS rank={rank} score-aware EP baseline output and all VJPs exact")
     finally:
         dist.destroy_process_group()

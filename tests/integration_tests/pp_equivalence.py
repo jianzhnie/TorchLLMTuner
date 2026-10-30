@@ -31,11 +31,8 @@ stages per rank, paired front-to-back so rank 0 holds the first AND the last
 stage). The loss on the rank holding the last stage must track, step for
 step, a reference computed on the whole model with no pipeline.
 
-What the reference is, and why it is not just the ``pp=1`` trainer: the
-trainer's non-PP body flattens the whole batch into ONE causal sequence, while
-the PP body runs each micro-batch as its own sequence (pipeline stages are
-separate forward calls; attention cannot cross a micro-batch boundary). The
-reference therefore applies the *same* row chunking on one process -- same
+The reference applies the same row chunking and input preprocessing on one
+process, preserving independent rows' attention masks and positions -- same
 batches, same per-micro-batch summed CE, same clip and AdamW -- so any
 divergence is attributable to the pipeline machinery (stage split, p2p
 activations/grads, schedule, cross-stage grad-norm reduction), not to a
@@ -248,8 +245,14 @@ def _reference_trajectory(
         for batch, targets in zip(step_batches, target_batches, strict=True):
             for mb in range(reference_microbatches):
                 row = slice(mb * rows_per_mb, (mb + 1) * rows_per_mb)
-                logits = model(batch.input_ids[row].reshape(-1))
-                loss = cross_entropy_loss(logits, targets[row].reshape(-1))
+                # Preserve independent row boundaries and their position/mask
+                # metadata, just as the pipeline's microbatch preprocessing does.
+                inputs, mb_targets, kwargs = model.preprocess_inputs(
+                    {"input": batch.input_ids[row], "labels": targets[row]},
+                    parallel_dims=None,
+                )
+                logits = model(inputs, **kwargs)
+                loss = cross_entropy_loss(logits, mb_targets)
                 (loss / num_valid).backward()
                 loss_sum = (
                     loss.detach() if loss_sum is None else loss_sum + loss.detach()

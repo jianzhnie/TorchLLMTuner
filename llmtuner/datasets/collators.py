@@ -173,3 +173,13 @@ class PipelineTextCollator(Collator):
             result[key] = output
         result["num_valid_tokens"] = sum(batch["num_valid_tokens"] for batch in batches)
         return result
+
+
+class ContextRowsCollator(PipelineTextCollator):
+    """Flatten independent context rows with their document positions intact."""
+
+    def __call__(self, rows: Sequence[TextSequence]) -> TrainerBatch:
+        result = super().__call__(rows)
+        for key in ("input", "labels", "positions", "padding_mask"):
+            result[key] = result[key].reshape(-1)
+        return result

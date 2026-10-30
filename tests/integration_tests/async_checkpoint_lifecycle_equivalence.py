@@ -1,13 +1,15 @@
-"""Real DCP async round-trip and group teardown on two CPU/Gloo ranks.
+"""Real DCP async round-trip and group teardown on two device-selected ranks.
 
     PYTHONPATH=. torchrun --nproc_per_node=2 \
         tests/integration_tests/async_checkpoint_lifecycle_equivalence.py
 
-Uses replicated parameters and the production optimizer/scheduler containers.
-Pinned-memory/process staging and
-GPU/NPU checkpoint transports require separate hardware validation.
+Uses the production optimizer/scheduler containers. Add --fsdp for sharded
+parameters and --async-mode async_with_pinned_mem for process uploads with
+pinned staging. The harness selects CPU/Gloo or NPU/HCCL. Cross-node runs
+require a shared TMPDIR; accelerator staging requires an accelerator run.
 """
 
+import argparse
 from contextlib import nullcontext
 from tempfile import TemporaryDirectory
 
@@ -32,9 +34,11 @@ def step(model, optimizer, scheduler):
     scheduler.step()
 
 
-def manager_for(model, optimizer, scheduler, folder):
+def manager_for(model, optimizer, scheduler, folder, *, async_mode="async"):
     return DistributedCheckpointManager(
-        CheckpointConfig(enable=True, interval=1, keep_latest_k=0, async_mode="async"),
+        CheckpointConfig(
+            enable=True, interval=1, keep_latest_k=0, async_mode=async_mode
+        ),
         model_parts=[model],
         optimizer=optimizer,
         lr_scheduler=scheduler,
@@ -52,10 +56,30 @@ def assert_group_released(group):
 
 
 def main():
-    init_distributed()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fsdp", action="store_true")
+    parser.add_argument(
+        "--async-mode", choices=("async", "async_with_pinned_mem"), default="async"
+    )
+    args = parser.parse_args()
+    device = init_distributed()
     active = []
     try:
         assert dist.get_world_size() == 2
+        mesh = None
+        if args.fsdp:
+            from torch.distributed.device_mesh import init_device_mesh
+
+            mesh = init_device_mesh(device.type, (2,), mesh_dim_names=("dp_shard",))
+
+        def build_model():
+            model = moved(torch.nn.Linear(3, 2))
+            if mesh is not None:
+                from torch.distributed.fsdp import fully_shard
+
+                fully_shard(model, mesh=mesh)
+            return model
+
         rank = dist.get_rank()
         context = TemporaryDirectory() if rank == 0 else nullcontext(None)
         with context as root:
@@ -64,7 +88,7 @@ def main():
             root = paths[0]
             for cycle in range(2):
                 torch.manual_seed(42 + cycle)
-                model = moved(torch.nn.Linear(3, 2))
+                model = build_model()
                 optimizer = OptimizersContainer(
                     OptimizerConfig(learning_rate=0.01, implementation="for-loop"),
                     model_parts=[model],
@@ -77,7 +101,9 @@ def main():
                 step(model, optimizer, scheduler)
                 saved_model = {k: v.clone() for k, v in model.state_dict().items()}
                 folder = f"{root}/cycle_{cycle}"
-                manager = manager_for(model, optimizer, scheduler, folder)
+                manager = manager_for(
+                    model, optimizer, scheduler, folder, async_mode=args.async_mode
+                )
                 active.append(manager)
                 group = manager.pg
                 assert group is not None
@@ -90,7 +116,7 @@ def main():
                 assert manager.save_future is None
                 dist.barrier()
                 step(model, optimizer, scheduler)
-                resumed_model = moved(torch.nn.Linear(3, 2))
+                resumed_model = build_model()
                 resumed_optimizer = OptimizersContainer(
                     OptimizerConfig(learning_rate=0.3, implementation="for-loop"),
                     model_parts=[resumed_model],
@@ -101,7 +127,11 @@ def main():
                     training_steps=8,
                 )
                 resumed = manager_for(
-                    resumed_model, resumed_optimizer, resumed_scheduler, folder
+                    resumed_model,
+                    resumed_optimizer,
+                    resumed_scheduler,
+                    folder,
+                    async_mode=args.async_mode,
                 )
                 active.append(resumed)
                 resumed_group = resumed.pg
@@ -126,7 +156,10 @@ def main():
                 dist.all_reduce(probe)
                 assert probe.item() == 3
                 if rank == 0:
-                    print(f"cycle {cycle}: async resume and group teardown match")
+                    print(
+                        f"cycle {cycle}: {args.async_mode} fsdp={args.fsdp} "
+                        "resume and group teardown match"
+                    )
             dist.barrier()
     finally:
         for manager in active:

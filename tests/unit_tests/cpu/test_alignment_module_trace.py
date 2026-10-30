@@ -33,6 +33,12 @@ def test_selection_excludes_logits_embedding_and_other_layers(modules):
     assert selected["layer1"] is modules["layer1"]
 
 
+def test_boundary_selection_excludes_inner_modules(modules, monkeypatch):
+    monkeypatch.setenv("LLMTUNER_ALIGNMENT_TRACE_BOUNDARIES_ONLY", "1")
+    selected = selected_trace_modules(None, baseline=True, selection="0,1")
+    assert set(selected) == {"final_norm", "layer0", "layer1"}
+
+
 def test_final_selection_avoids_traversing_decoder():
     from types import SimpleNamespace
 
@@ -103,10 +109,14 @@ def test_candidate_trace_resolves_native_ep_router():
     from tests.integration_tests.npu_model_forward_trace import trace_modules
 
     marker = object()
-    attention = SimpleNamespace(q_norm=marker, k_norm=marker, o_proj=marker)
+    gate = torch.nn.Linear(4, 2)
+    projection = torch.nn.Linear(4, 4)
+    attention = SimpleNamespace(
+        q_norm=marker, k_norm=marker, o_proj=marker, q_proj=projection
+    )
     layer = SimpleNamespace(
         self_attn=attention,
-        mlp=SimpleNamespace(router=marker),
+        mlp=SimpleNamespace(router=SimpleNamespace(gate=gate)),
         input_layernorm=marker,
         post_attention_layernorm=marker,
     )
@@ -118,4 +128,7 @@ def test_candidate_trace_resolves_native_ep_router():
         model=SimpleNamespace(model=SimpleNamespace(rotary_emb=marker)),
     )
     modules = trace_modules(SimpleNamespace(model_parts=[model]), baseline=False)
-    assert modules["layer0.router"] is marker
+    assert modules["layer0.router"] is layer.mlp.router
+    assert modules["layer0.router_gate"] is gate
+    assert modules["layer0.wq"] is projection
+    assert "layer0.wk" not in modules

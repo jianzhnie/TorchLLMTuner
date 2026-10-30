@@ -297,6 +297,13 @@ def main() -> None:
             and os.environ.get("LLMTUNER_ALIGNMENT_MODULE_TRACE") == "1"
         ),
         "trace_layers": os.environ.get("LLMTUNER_ALIGNMENT_TRACE_LAYERS"),
+        "trace_boundaries_only": os.environ.get(
+            "LLMTUNER_ALIGNMENT_TRACE_BOUNDARIES_ONLY"
+        )
+        == "1",
+        "gradient_trace_layers": os.environ.get(
+            "LLMTUNER_ALIGNMENT_GRADIENT_LAYERS", "0"
+        ),
         "gradient_trace_enabled": os.environ.get("LLMTUNER_ALIGNMENT_GRADIENT_TRACE")
         == "1",
         "dispatch_trace_enabled": alignment_model != QWEN3_30B

@@ -131,6 +131,10 @@ class HFTransformerModel(nn.Module):
             from .qkv_projection import apply_fused_qkv_projection
 
             apply_fused_qkv_projection(self.model)
+        elif getattr(config, "rotary_compute_dtype", None) == "float32":
+            from .qkv_projection import apply_fp32_rotary_projection
+
+            apply_fp32_rotary_projection(self.model)
 
         apply_cast_lm_head(self.model, config)
 
@@ -397,9 +401,7 @@ class HFTransformerModel(nn.Module):
                 attention_masks = build_dense_attention_mask(
                     positions, dtype=self._mask_dtype(), block_causal=True
                 )
-                if self._cp_strategy != "ulysses" or getattr(
-                    self.model.config, "_cp_sdpa_dual", False
-                ):
+                if self.model.config._attn_implementation == CP_SDPA_BACKEND:
                     attention_masks = attention_masks == 0
             else:
                 attention_masks = self.get_attention_masks(positions=positions)
@@ -559,6 +561,9 @@ class HFTransformerModel(nn.Module):
             # load-balancing statistics (see forward's ``padding_mask``).
             padding_mask = input_dict.get("padding_mask")
 
+        row_length = (
+            inputs.shape[-1] if inputs.ndim == 2 and inputs.shape[0] > 1 else None
+        )
         inputs, labels = inputs.reshape(-1), labels.reshape(-1)
         if positions is not None:
             positions = positions.reshape(-1)
@@ -602,6 +607,38 @@ class HFTransformerModel(nn.Module):
         cp_mesh = (
             None if parallel_dims is None else parallel_dims.get_optional_mesh("cp")
         )
+        row_attention_mask = None
+        if row_length is not None and cp_mesh is not None:
+            # KV SDPA slices a full boolean mask with the same contiguous Q
+            # offsets used by input sharding. Other kernels/load balancers
+            # need their own row-aware mask transport before accepting this.
+            if (
+                self.model.config._attn_implementation != CP_SDPA_BACKEND
+                or self._cp_strategy != "kv_allgather"
+                or self._cp_load_balancer is not None
+                or getattr(self.model.config, "_cp_sdpa_dual", False)
+            ):
+                raise UnsupportedCombinationError(
+                    "CP with multiple independent batch rows requires row-aware mask "
+                    "sharding; use KV SDPA without load balancing or one row per "
+                    "microbatch with gradient accumulation."
+                )
+            token_indices = torch.arange(inputs.numel(), device=inputs.device)
+            row_positions = token_indices.remainder(row_length)
+            if positions is None:
+                positions = row_positions
+            row_ids = token_indices // row_length
+            row_attention_mask = (
+                build_dense_attention_mask(
+                    positions if packed else row_positions,
+                    dtype=self._mask_dtype(),
+                    block_causal=True,
+                )
+                == 0
+            )
+            row_attention_mask = row_attention_mask & (
+                row_ids[:, None] == row_ids[None, :]
+            )
         inputs, labels, positions, padding_mask, attention_masks = self._shard_for_cp(
             cp_mesh,
             packed=packed,
@@ -610,6 +647,38 @@ class HFTransformerModel(nn.Module):
             positions=positions,
             padding_mask=padding_mask,
         )
+        if row_attention_mask is not None:
+            attention_masks = row_attention_mask
+        if row_length is not None and cp_mesh is None:
+            # Flattening independent batch rows must not let later rows attend
+            # earlier rows, even when the configured corpus mask is causal.
+            row_positions = torch.arange(inputs.numel(), device=inputs.device)
+            row_positions = row_positions.remainder(row_length)
+            if positions is None:
+                positions = row_positions
+            if self.model.config._attn_implementation != ATTENTION_BACKEND:
+                attention_masks = build_dense_attention_mask(
+                    row_positions if not packed else positions,
+                    dtype=self._mask_dtype(),
+                    block_causal=True,
+                )
+            else:
+                mask_mod = and_masks(
+                    get_causal_mask_mod(),
+                    get_efficient_causal_mask_mod_for_packed_document(
+                        row_positions if not packed else positions
+                    ),
+                )
+                attention_masks = create_attention_mask(
+                    mask_mod,
+                    B=1,
+                    H=None,
+                    Q_LEN=inputs.numel(),
+                    KV_LEN=inputs.numel(),
+                    device=inputs.device,
+                    BLOCK_SIZE=128,
+                    separate_full_blocks=True,
+                )
         if attention_masks is not None:
             extra_kwargs["attention_masks"] = attention_masks
 
@@ -928,6 +997,8 @@ class HFTransformerModel(nn.Module):
             return {"attention_mask": None}
 
         if self.model.config._attn_implementation == CP_SDPA_BACKEND:
+            if isinstance(attention_masks, torch.Tensor):
+                return {"attention_mask": attention_masks}
             if (
                 getattr(self.model.config, "_cp_sdpa_dual", False)
                 or self._cp_strategy == "kv_allgather"
@@ -948,25 +1019,25 @@ class HFTransformerModel(nn.Module):
             # Exception: the *ulysses* sdpa kernel attends the full sequence
             # after its head swap, so a packed corpus's document mask applies
             # unsharded -- exactly as it does for flex, and it is the one thing
-            # that mask cannot be derived from a length. Build it here; the
+            # that mask cannot be derived from a length. Preprocess it before
+            # positions are sharded; local positions lose document boundaries. The
             # kernel adds no causal mask, only an optional sliding window.
             if (
                 getattr(self.model.config, "_cp_sdpa_ulysses", False)
                 and getattr(self.model.config, "attn_mask_type", "causal")
                 == "block_causal"
             ):
-                return {
-                    "attention_mask": (
-                        attention_masks
-                        if isinstance(attention_masks, torch.Tensor)
-                        else build_dense_attention_mask(
-                            positions,
-                            dtype=self._mask_dtype(),
-                            block_causal=True,
-                        )
+                if not isinstance(attention_masks, torch.Tensor):
+                    raise ValueError(
+                        "Packed Ulysses SDPA CP requires the full preprocessed "
+                        "document mask"
                     )
-                }
+                return {"attention_mask": attention_masks}
             return {"attention_mask": None}
+
+        if self.cp_mesh is None and isinstance(attention_masks, torch.Tensor):
+            if self.model.config._attn_implementation != ATTENTION_BACKEND:
+                return {"attention_mask": attention_masks}
 
         if attention_masks is None:
             if self.cp_mesh is None:

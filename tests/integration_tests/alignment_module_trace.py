@@ -1,5 +1,6 @@
 """Bounded, explicit layer selection for full-training backward diagnostics."""
 
+import os
 import re
 
 
@@ -26,5 +27,12 @@ def selected_trace_modules(trainer, *, baseline, selection):
         name: module
         for name, module in modules.items()
         if name == "final_norm"
-        or any(name == f"layer{i}" or name.startswith(f"layer{i}.") for i in indices)
+        or any(
+            name == f"layer{i}"
+            or (
+                os.environ.get("LLMTUNER_ALIGNMENT_TRACE_BOUNDARIES_ONLY") != "1"
+                and name.startswith(f"layer{i}.")
+            )
+            for i in indices
+        )
     }

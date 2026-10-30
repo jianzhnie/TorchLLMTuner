@@ -2,13 +2,14 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 from llmtuner.parallel.expert_parallel.npu_baseline_experts import (
+    NpuBaselineAllToAllTokenDispatcher,
     NpuBaselineRoutedExperts,
 )
-from llmtuner.parallel.expert_parallel.token_dispatch import AllToAllTokenDispatcher
 
 
 class ScoreKernel(nn.Module):
@@ -16,8 +17,16 @@ class ScoreKernel(nn.Module):
         return inputs * routing_scores
 
 
+def test_baseline_permutation_rejects_cpu_instead_of_silently_changing_vjp():
+    dispatcher = NpuBaselineAllToAllTokenDispatcher(4, 2)
+    inputs = torch.randn(3, 4, requires_grad=True)
+    ids = torch.tensor([[0, 1], [1, 2], [2, 3]])
+    with pytest.raises(TypeError, match="requires NPU"):
+        dispatcher._local_reorder(inputs, torch.ones(3, 2), ids)
+
+
 def test_score_transport_reorders_and_weights_exactly_once(monkeypatch):
-    dispatcher = AllToAllTokenDispatcher(4, 2)
+    dispatcher = NpuBaselineAllToAllTokenDispatcher(4, 2)
     ids = torch.tensor([[3, 0], [2, 1], [0, 3]])
     order = torch.argsort(ids.flatten(), stable=True)
     permutation = torch.tensor([2, 0, 5, 1, 4, 3])
@@ -50,7 +59,7 @@ def test_score_transport_reorders_and_weights_exactly_once(monkeypatch):
 
 
 def test_empty_origin_tokens_preserve_output_shape_and_gradients(monkeypatch):
-    dispatcher = AllToAllTokenDispatcher(4, 2)
+    dispatcher = NpuBaselineAllToAllTokenDispatcher(4, 2)
     indices = torch.empty(0, dtype=torch.long)
     counts = torch.zeros(4, dtype=torch.long)
 

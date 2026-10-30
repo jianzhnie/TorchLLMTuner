@@ -631,7 +631,8 @@ class Trainer:
         # A fully masked accumulation window has no average loss. Assert the
         # DP-reduced count on every rank before entering forward/backward, so
         # no stage updates on an undefined (zero-divided) gradient. The device
-        # assertion avoids a host synchronization on ordinary steps.
+        # assertion avoids a host synchronization where the backend implements
+        # it asynchronously; torch-npu 2.12 reports a CPU fallback here.
         torch._assert_async(
             global_valid_tokens > 0,
             "Training step has zero valid tokens; cannot normalize the loss.",
@@ -777,6 +778,19 @@ class Trainer:
             else None
         )
         tp_sharded_ids = tp_sharded_param_ids(self.model_parts) if tp_mesh else set()
+        norm_options = {}
+        if getattr(self.cfg, "grad_norm_precision", "float32") != "float32":
+            norm_options["norm_precision"] = self.cfg.grad_norm_precision
+            from ..parallel.expert_parallel.npu_baseline_experts import (
+                NpuBaselineGroupedExperts,
+            )
+
+            norm_options["packed_parameters"] = [
+                (module.w1_EFD, module.w3_EFD)
+                for part in self.model_parts
+                for module in part.modules()
+                if isinstance(module, NpuBaselineGroupedExperts)
+            ]
         grad_norm = clip_grad_norm_(
             parameters,
             max_norm=self.cfg.max_norm,
@@ -790,6 +804,7 @@ class Trainer:
                 if tp_mesh is not None
                 else None
             ),
+            **norm_options,
         )
 
         # Finiteness is reduced to ONE flag before it is asserted, and every
@@ -930,11 +945,12 @@ class Trainer:
         is why it happens in the caller -- a rank that skipped it would hang the
         others, and the check would no longer be rank-uniform.
 
-        ``torch._assert_async`` is private, but it is the right tool: it queues
-        the check on the device instead of synchronizing the host, so it costs
-        nothing per step and does not break CUDA-graph capture. A failed CUDA
-        assertion invalidates the process, which is why the reference
-        implementation accepts it.
+        ``torch._assert_async`` queues a device check on backends that support
+        it, including CUDA graph capture. torch-npu 2.12 reports a CPU fallback
+        for this operator, so NPU execution may synchronize the host. Preserve
+        the check on that path: correctness takes precedence over its cost.
+        A failed CUDA assertion invalidates the process, which is why the
+        reference implementation accepts it.
         """
         torch._assert_async(
             step_is_finite,

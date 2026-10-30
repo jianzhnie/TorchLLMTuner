@@ -36,3 +36,20 @@ def test_observer_preserves_real_clip_and_preclip_evidence(tmp_path):
         record["after"][name]["sample"], parameter.grad.flatten()
     )
     torch.testing.assert_close(record["returned_norm"], norm)
+
+
+def test_gradient_trace_selects_exact_layer_indices(monkeypatch, tmp_path):
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList(
+        [torch.nn.Linear(2, 2, bias=False) for _ in range(11)]
+    )
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    monkeypatch.setenv("LLMTUNER_ALIGNMENT_GRADIENT_LAYERS", "1,10")
+    trainer = SimpleNamespace(model_parts=[model], step=1)
+    observed = observe_gradient_clipping(
+        torch.nn.utils.clip_grad_norm_, trainer, tmp_path
+    )
+    observed(model.parameters(), 1.0)
+    record = torch.load(tmp_path / "gradient-clip-step-1.pt", weights_only=True)
+    assert set(record["before"]) == {"part0.layers.1.weight", "part0.layers.10.weight"}

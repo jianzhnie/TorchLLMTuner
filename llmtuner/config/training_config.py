@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Literal
 
 from llmtuner.config.activation_checkpoint_config import (
     VALID_AC_MODES,
@@ -96,6 +97,13 @@ class TrainingConfig:
         metadata={
             "help": "Gradient-norm clip threshold. A non-positive value disables "
             "clipping but still reports grad_norm."
+        },
+    )
+    grad_norm_precision: Literal["float32", "parameter"] = field(
+        default="float32",
+        metadata={
+            "help": "Compute per-gradient norms in FP32 (default), or in the "
+            "gradient dtype before FP32 power reduction to match TorchTitan-NPU."
         },
     )
     gc_freq: int = field(
@@ -194,6 +202,10 @@ class TrainingConfig:
         return self.validation_config
 
     def __post_init__(self) -> None:
+        if self.grad_norm_precision not in ("float32", "parameter"):
+            raise ConfigError(
+                "training.grad_norm_precision must be float32 or parameter"
+            )
         for name in ("compile", "deterministic", "detect_anomaly"):
             value = getattr(self, name)
             if not isinstance(value, bool):

@@ -83,6 +83,9 @@ def trace_modules(trainer, baseline: bool):
         modules[f"layer{index}.router"] = (
             moe.router if baseline or hasattr(moe, "router") else moe.gate
         )
+        router_gate = getattr(modules[f"layer{index}.router"], "gate", None)
+        if isinstance(router_gate, torch.nn.Module):
+            modules[f"layer{index}.router_gate"] = router_gate
         modules[f"layer{index}"] = layer
         modules[f"layer{index}.input_norm"] = (
             layer.attention_norm if baseline else layer.input_layernorm
@@ -99,6 +102,15 @@ def trace_modules(trainer, baseline: bool):
             for name in ("wq", "wk", "wv"):
                 modules[f"layer{index}.{name}"] = getattr(attention, name)
             modules[f"layer{index}.inner_attention"] = attention.inner_attention
+        else:
+            for name, attribute in (
+                ("wq", "q_proj"),
+                ("wk", "k_proj"),
+                ("wv", "v_proj"),
+            ):
+                projection = getattr(attention, attribute, None)
+                if isinstance(projection, torch.nn.Module):
+                    modules[f"layer{index}.{name}"] = projection
     if not baseline:
         modules["rotary_cache"] = model.model.model.rotary_emb
     return modules

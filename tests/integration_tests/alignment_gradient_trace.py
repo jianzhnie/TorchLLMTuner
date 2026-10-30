@@ -6,6 +6,7 @@ Samples are diagnostic, not a replacement for full-state acceptance.
 
 from __future__ import annotations
 
+import os
 from functools import wraps
 from math import prod
 from pathlib import Path
@@ -56,11 +57,15 @@ def local_gradient_record(gradient, *, sample_size=8192):
 
 
 def observe_gradient_clipping(original, trainer, root: Path):
+    selection = os.environ.get("LLMTUNER_ALIGNMENT_GRADIENT_LAYERS", "0")
+    if not selection or any(not item.isdecimal() for item in selection.split(",")):
+        raise ValueError("gradient trace layers must be comma-separated indices")
+    prefixes = tuple(f"layers.{int(item)}." for item in selection.split(","))
     names = {
         id(parameter): f"part{index}.{name}"
         for index, model in enumerate(trainer.model_parts)
         for name, parameter in model.named_parameters()
-        if "layers.0." in name
+        if any(prefix in name for prefix in prefixes)
     }
 
     @wraps(original)

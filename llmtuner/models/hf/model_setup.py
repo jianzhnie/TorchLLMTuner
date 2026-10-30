@@ -56,17 +56,27 @@ def forward_torch_rms_norm(module: nn.Module, hidden_states: torch.Tensor):
     )
 
 
+def forward_npu_rms_norm(module: nn.Module, hidden_states: torch.Tensor):
+    if hidden_states.device.type != "npu":
+        raise RuntimeError("model.norm_backend='npu' requires NPU tensors")
+    import torch_npu
+
+    return torch_npu.npu_rms_norm(
+        hidden_states, module.weight, module.variance_epsilon
+    )[0]
+
+
 def stabilize_residual_norm_gradients(model: nn.Module) -> None:
     """Select normalization arithmetic and known residual gradient boundaries."""
     model_type = getattr(model.config, "model_type", None)
     backend = getattr(model.config, "norm_backend", "native")
-    if backend not in ("native", "torch", "aten", "joint"):
+    if backend not in ("native", "torch", "aten", "joint", "npu"):
         raise ValueError(
-            "model.norm_backend must be 'native', 'torch', 'aten', or 'joint'"
+            "model.norm_backend must be 'native', 'torch', 'aten', 'joint', or 'npu'"
         )
     if backend == "joint" and model_type != "qwen3":
         raise ValueError("model.norm_backend='joint' requires dense Qwen3")
-    if backend in ("aten", "torch") and model_type not in ("qwen3", "qwen3_moe"):
+    if backend in ("aten", "torch", "npu") and model_type not in ("qwen3", "qwen3_moe"):
         raise ValueError(f"model.norm_backend='{backend}' requires qwen3 or qwen3_moe")
     if model_type == "qwen3":
         from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
@@ -87,6 +97,10 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
             if hook is _isolate_norm_input:
                 del module._forward_pre_hooks[key]
                 module._forward_pre_hooks_with_kwargs.pop(key, None)
+        if backend != "npu" and getattr(module.forward, "__func__", None) is (
+            forward_npu_rms_norm
+        ):
+            del module.forward
         if (
             backend != "aten"
             and "forward" in module.__dict__
@@ -120,11 +134,13 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
                     is forward_joint_residual_block
                 ):
                     del layer.forward
-    if backend in ("aten", "torch"):
+    if backend in ("aten", "torch", "npu"):
         from types import MethodType
 
         if backend == "aten":
             from .normalization import forward_aten_rms_norm as norm_forward
+        elif backend == "npu":
+            norm_forward = forward_npu_rms_norm
         else:
             norm_forward = forward_torch_rms_norm
         for module in model.modules():
@@ -218,29 +234,47 @@ def forward_torchtitan_moe(module: nn.Module, hidden_states: torch.Tensor):
     counts = torch.nn.functional.one_hot(
         expert_ids, num_classes=module.experts.num_experts
     ).sum(dim=(0, 1))
-    dispatcher = module._llmtuner_local_dispatcher
-    routed, counts, metadata = dispatcher.dispatch(
-        hidden_states, scores, expert_ids, counts
-    )
+    npu_dispatch = hidden_states.device.type == "npu"
+    if npu_dispatch:
+        import torch_npu
+
+        routed, permutation = torch_npu.npu_moe_token_permute(hidden_states, expert_ids)
+        routed_scores, _ = torch_npu.npu_moe_token_permute(
+            scores.reshape(-1, 1), expert_ids.reshape(-1, 1)
+        )
+    else:
+        dispatcher = module._llmtuner_local_dispatcher
+        routed, counts, metadata = dispatcher.dispatch(
+            hidden_states, scores, expert_ids, counts
+        )
+        routed_scores = metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
     offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
-    gate, up = module.experts.gate_up_proj.chunk(2, dim=1)
-    gate = gate.contiguous()
-    up = up.contiguous()
-    gate_values = torch._grouped_mm(
-        routed.bfloat16(), gate.bfloat16().transpose(-2, -1), offs=offsets
+    projected = torch._grouped_mm(
+        routed.bfloat16(),
+        module.experts.gate_up_proj.bfloat16().transpose(-2, -1),
+        offs=offsets,
     )
-    up_values = torch._grouped_mm(
-        routed.bfloat16(), up.bfloat16().transpose(-2, -1), offs=offsets
-    )
-    hidden = module.experts.act_fn(gate_values) * up_values
-    hidden = (hidden.float() * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)).to(
-        hidden.dtype
-    )
+    if projected.device.type == "npu":
+        import torch_npu
+
+        hidden = torch_npu.npu_swiglu(projected, dim=-1)
+    else:
+        gate_values, up_values = projected.chunk(2, dim=-1)
+        hidden = module.experts.act_fn(gate_values) * up_values
+    # The NPU baseline's npu_gmm converter scores the SwiGLU output in BF16
+    # before the down projection. FP32 scoring followed by a cast differs.
+    hidden = hidden * routed_scores.to(hidden.dtype)
     routed_output = torch._grouped_mm(
         hidden,
         module.experts.down_proj.bfloat16().transpose(-2, -1),
         offs=offsets,
     ).type_as(routed)
+    if npu_dispatch:
+        # Restore top-k slot order before reducing, as the baseline converter
+        # does. Expert-order scatter can change BF16 summation rounding.
+        output = torch_npu.npu_moe_token_unpermute(routed_output, permutation, None)
+        output = output.view(-1, expert_ids.shape[-1], hidden_dim).sum(dim=1)
+        return output.reshape(batch_size, sequence_length, hidden_dim)
     output = deterministic_scatter_add(
         torch.zeros_like(hidden_states),
         metadata.token_indices_experts_sorted_N.reshape(-1, 1).expand(-1, hidden_dim),
@@ -252,6 +286,8 @@ def forward_torchtitan_moe(module: nn.Module, hidden_states: torch.Tensor):
 def stabilize_moe_experts(model: nn.Module) -> None:
     if getattr(model.config, "experts_implementation", "native") != "torchtitan":
         return
+    if getattr(model.config, "hidden_act", None) != "silu":
+        raise ValueError("Qwen3-MoE torchtitan experts require hidden_act='silu'")
     from types import MethodType
 
     from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock

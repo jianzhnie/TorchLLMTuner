@@ -55,13 +55,15 @@ def _grad_carrying_all_to_all(
 ) -> torch.Tensor:
     """One all-to-all that backprop can flow through; see the note above."""
     if _differentiable_all_to_all is None:
-        logger.warning(
-            "This torch has no all_to_all_single_autograd, so the EP dispatch "
-            "and combine exchanges cannot carry gradients: the expert weights "
-            "will not be updated. Run with expert_parallel_size=1, or upgrade "
-            "torch."
+        if not torch.is_grad_enabled() or not tensor.requires_grad:
+            return all_to_all_single(tensor, output_splits, input_splits, group=group)
+        from ...errors import EnvironmentUnsupportedError
+
+        raise EnvironmentUnsupportedError(
+            "EP training requires torch.distributed._functional_collectives."
+            "all_to_all_single_autograd; install a compatible PyTorch build. "
+            "The non-autograd collective cannot preserve expert/router gradients."
         )
-        return all_to_all_single(tensor, output_splits, input_splits, group=group)
     return _differentiable_all_to_all(tensor, output_splits, input_splits, group=group)
 
 
@@ -186,13 +188,19 @@ class LocalTokenDispatcher:
             token_indices_experts_sorted_N
         ]
         token_indices_experts_sorted_N = token_indices_experts_sorted_N // self.top_k
-        routed_input_ND = x_TD[token_indices_experts_sorted_N]
+        routed_input_ND = self._permute_tokens(
+            x_TD, token_indices_experts_sorted_N, topk_expert_ids_TK
+        )
 
         return (
             routed_input_ND,
             token_indices_experts_sorted_N,
             topk_scores_experts_sorted_N,
         )
+
+    def _permute_tokens(self, inputs, token_indices, expert_ids):
+        """Gather tokens; backend adapters may own the repeated-index VJP."""
+        return inputs[token_indices]
 
     def dispatch(
         self,

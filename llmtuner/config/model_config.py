@@ -45,7 +45,7 @@ class ModelConfig:
     norm_backend: str = field(
         default="native",
         metadata={
-            "help": "Qwen3 RMSNorm: native, torch, aten (CPU first-order "
+            "help": "Qwen3 RMSNorm: native, torch, npu, aten (CPU first-order "
             "boundaries), or joint (dense Qwen3 first-order norm/residual)."
         },
     )
@@ -67,8 +67,12 @@ class ModelConfig:
         default=None,
         metadata={
             "help": "RoPE application dtype: float32 or None for the HF default. "
-            "FP32 application requires fused QKV on Qwen3/Qwen3-MoE."
+            "FP32 application supports Qwen3/Qwen3-MoE."
         },
+    )
+    rotary_cache_dtype: str | None = field(
+        default=None,
+        metadata={"help": "Optional BF16 cos/sin quantization before FP32 RoPE."},
     )
     attention_backend: str = field(
         default="auto",
@@ -113,17 +117,17 @@ class ModelConfig:
             raise ConfigError(
                 "model.rotary_init_device must be 'constructor' or 'target'."
             )
+        if self.rotary_cache_dtype not in (None, "bfloat16"):
+            raise ConfigError("model.rotary_cache_dtype must be bfloat16 or None.")
+        if self.rotary_cache_dtype and self.rotary_compute_dtype != "float32":
+            raise ConfigError("model.rotary_cache_dtype requires FP32 RoPE.")
         if self.rotary_compute_dtype not in (None, "float32"):
             raise ConfigError("model.rotary_compute_dtype must be float32 or None.")
-        if self.rotary_compute_dtype == "float32" and self.qkv_projection != "fused":
-            raise ConfigError(
-                "model.rotary_compute_dtype='float32' requires fused QKV."
-            )
         if self.qkv_projection not in ("separate", "fused"):
-            raise ConfigError("model.qkv_projection must be 'separate' or 'fused'.")
-        if self.norm_backend not in ("native", "torch", "aten", "joint"):
+            raise ConfigError("model.qkv_projection must be separate or fused.")
+        if self.norm_backend not in ("native", "torch", "aten", "joint", "npu"):
             raise ConfigError(
-                "model.norm_backend must be 'native', 'torch', 'aten', or 'joint'."
+                "model.norm_backend must be native, torch, aten, joint, or npu."
             )
         # Architecture numbers must be sane before any model build: an invalid
         # value here used to surface deep inside HF's for_model or the

@@ -15,7 +15,12 @@ from typing import TYPE_CHECKING, Protocol
 
 import grain.python as grain
 
-from .collators import CollatorFactory, PipelineTextCollator, TextCollator
+from .collators import (
+    CollatorFactory,
+    ContextRowsCollator,
+    PipelineTextCollator,
+    TextCollator,
+)
 from .contracts import (
     BaseDataLoader,
     DatasetBuildContext,
@@ -29,6 +34,7 @@ from .packing.build import (
     build_concat_then_split_packing,
     build_first_fit_packing,
 )
+from .packing.global_rows import GlobalRowsIterDataset
 from .sources import file_patterns_to_paths
 from .synthetic import RandomTokenDataLoader
 from .text.recipes import (
@@ -55,6 +61,8 @@ def corpus_data_identity(config: LLMTunerConfig, *, dataset: str, repeat: bool) 
     This is a construction-time snapshot, not a file mutation lock.
     """
     data_settings = asdict(config.dataloader)
+    if not data_settings["global_context_rows"]:
+        data_settings.pop("global_context_rows")
     # Ranks may stage identical assets in different local directories. DCP
     # shares loader metadata, so paths cannot define content identity.
     for name in ("dataset_path", "tokenizer_path", "num_prefetch_batches"):
@@ -255,6 +263,8 @@ def build_dataloader(
     max_context_length = config.max_seq_len
     dataset_name = dataloader_config.dataset if dataset is None else dataset
     if dataset_name == "random":
+        if dataloader_config.global_context_rows:
+            raise ValueError("global_context_rows requires a text corpus dataset")
         return RandomTokenDataLoader(
             seed=config.seed,
             vocab_size=config.vocab_size,
@@ -282,6 +292,21 @@ def build_dataloader(
     if num_tokens_per_batch % num_microbatches:
         raise ValueError("token batch must be divisible by num_pp_microbatches")
     packing_tokens_per_batch = num_tokens_per_batch // num_microbatches
+    global_rows = dataloader_config.global_context_rows
+    if global_rows:
+        if (
+            is_multimodal
+            or config.parallel.pipeline_parallel_size > 1
+            or config.gradient_accumulation_steps != 1
+            or not repeat
+        ):
+            raise ValueError(
+                "global_context_rows currently requires repeated text, PP=1 "
+                "and gradient_accumulation_steps=1"
+            )
+        if num_tokens_per_batch % max_context_length:
+            raise ValueError("global_context_rows requires whole context rows")
+        packing_tokens_per_batch = max_context_length
 
     data_identity = (
         corpus_data_identity(config, dataset=dataset_name, repeat=repeat)
@@ -330,6 +355,11 @@ def build_dataloader(
         if num_microbatches > 1
         else resolved.collator
     )
+    if global_rows:
+        collator = partial(
+            ContextRowsCollator,
+            num_microbatches=num_tokens_per_batch // max_context_length,
+        )
     # Apply ordering and sharding to the graph before loader batching/prefetch.
     graph = resolved.build_packing(
         resolved.recipe,
@@ -338,11 +368,18 @@ def build_dataloader(
             seed=config.seed,
             shuffle=dataloader_config.shuffle,
             repeat=repeat,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
+            dp_rank=0 if global_rows else dp_rank,
+            dp_world_size=1 if global_rows else dp_world_size,
             streaming_shuffle_buffer_size=dataloader_config.streaming_shuffle_buffer_size,
         ),
     )
+    if global_rows:
+        graph = GlobalRowsIterDataset(
+            graph,
+            global_rows=num_tokens_per_batch * dp_world_size // max_context_length,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+        )
     return GrainDataLoader(
         graph,
         dp_world_size=dp_world_size,

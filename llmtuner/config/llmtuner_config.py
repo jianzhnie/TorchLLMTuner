@@ -265,6 +265,10 @@ class LLMTunerConfig:
         return self.training.max_norm
 
     @property
+    def grad_norm_precision(self) -> str:
+        return self.training.grad_norm_precision
+
+    @property
     def dump_folder(self) -> str:
         return self.training.dump_folder
 

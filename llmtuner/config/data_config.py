@@ -69,6 +69,10 @@ class DataloaderConfig:
             "shuffle streaming rows within each rank."
         },
     )
+    global_context_rows: bool = field(
+        default=False,
+        metadata={"help": "Pack a shared global text stream before DP row assignment"},
+    )
     streaming_shuffle_buffer_size: int = field(
         default=1_000,
         metadata={"help": "Streaming rows retained per rank for approximate shuffle"},
@@ -131,11 +135,14 @@ class DataloaderConfig:
         corpus = self.dataset if dataset is None else dataset
         return (
             "causal"
-            if corpus == "random" or self.max_num_documents == 1
+            if corpus == "random"
+            or (self.max_num_documents == 1 and not self.global_context_rows)
             else "block_causal"
         )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.global_context_rows, bool):
+            raise ConfigError("dataloader.global_context_rows must be bool")
         if self.data_identity is not None and (
             not isinstance(self.data_identity, str) or not self.data_identity.strip()
         ):

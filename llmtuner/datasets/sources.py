@@ -281,6 +281,22 @@ def file_patterns_to_paths(patterns: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(paths)
 
 
+class _CheckpointableHFIterableDataset(datasets.IterableDataset):
+    """Keep HF's checkpoint attached to the iterable used after a restore.
+
+    HF initializes its dataset checkpoint before loading the iterable checkpoint.
+    Some iterable implementations replace their state dictionary during that load,
+    leaving the dataset pointing at an unused dictionary (notably at epoch zero).
+    This adapter owns that private HF lifecycle boundary; no training code should
+    access HF's internal cursor state directly.
+    """
+
+    def _prepare_ex_iterable_for_iteration(self, *args, **kwargs):
+        iterable = super()._prepare_ex_iterable_for_iteration(*args, **kwargs)
+        self._state_dict["examples_iterable"] = iterable._state_dict
+        return iterable
+
+
 class HuggingFaceCursorIterator(grain.DatasetIterator):
     """Expose an HF stream cursor to Grain checkpoint recursion.
 
@@ -297,11 +313,17 @@ class HuggingFaceCursorIterator(grain.DatasetIterator):
         shuffle: bool,
     ) -> None:
         super().__init__()
+        if type(dataset) is datasets.IterableDataset:
+            # Preserve formatting, sharding, epoch, and any pending restore.
+            # The caller already gives this cursor its own deep-copied source.
+            adapted = object.__new__(_CheckpointableHFIterableDataset)
+            adapted.__dict__.update(dataset.__dict__)
+            dataset = adapted
         self._dataset = dataset
         self._repeat = repeat
         self._shuffle = shuffle
         self._epoch = 0
-        self._initial_state = dataset.state_dict()
+        self._initial_state = deepcopy(dataset.state_dict())
         self._iterator = iter(dataset)
 
     def __next__(self) -> dict[str, Any]:

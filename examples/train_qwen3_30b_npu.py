@@ -53,6 +53,7 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
     save_checkpoint = os.environ.get("LLMTUNER_SAVE_CHECKPOINT", "1") == "1"
     cpu_offload = os.environ.get("LLMTUNER_FSDP_CPU_OFFLOAD", "0") == "1"
     tensor_parallel_size = int(os.environ.get("LLMTUNER_TENSOR_PARALLEL_SIZE", "1"))
+    expert_parallel_size = int(os.environ.get("LLMTUNER_EXPERT_PARALLEL_SIZE", "1"))
     pipeline_parallel_size = int(os.environ.get("LLMTUNER_PIPELINE_PARALLEL_SIZE", "1"))
     # One microbatch per stage is the floor the schedule accepts, and the only
     # default that works unasked: pp=2 with a single microbatch is rejected by
@@ -85,9 +86,7 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
             data_parallel_shard_size=int(
                 os.environ.get("LLMTUNER_DATA_PARALLEL_SHARD_SIZE", "-1")
             ),
-            expert_parallel_size=int(
-                os.environ.get("LLMTUNER_EXPERT_PARALLEL_SIZE", "1")
-            ),
+            expert_parallel_size=expert_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
             context_parallel_kv_allgather_size=context_parallel_size,
@@ -113,11 +112,21 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
             activation_checkpoint_mode="full",
             checkpoint_config=CheckpointConfig(
                 enable=True,
+                # Keep training checkpoints local: full TP gather can exhaust
+                # device memory before HF initial loading even begins.
                 sharded_tensor_parallel=(
-                    os.environ.get("LLMTUNER_SHARDED_TENSOR_CHECKPOINT", "0") == "1"
+                    os.environ.get(
+                        "LLMTUNER_SHARDED_TENSOR_CHECKPOINT",
+                        "1" if tensor_parallel_size > 1 else "0",
+                    )
+                    == "1"
                 ),
                 sharded_expert_parallel=(
-                    os.environ.get("LLMTUNER_SHARDED_EXPERT_CHECKPOINT", "0") == "1"
+                    os.environ.get(
+                        "LLMTUNER_SHARDED_EXPERT_CHECKPOINT",
+                        "1" if expert_parallel_size > 1 else "0",
+                    )
+                    == "1"
                 ),
                 interval=int(os.environ.get("LLMTUNER_CHECKPOINT_INTERVAL", "500")),
                 load_step=int(os.environ.get("LLMTUNER_CHECKPOINT_LOAD_STEP", "-1")),
@@ -137,6 +146,12 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
                 prompt_field=os.environ.get("LLMTUNER_PROMPT_FIELD", "question"),
                 response_field=os.environ.get("LLMTUNER_RESPONSE_FIELD", "solution"),
                 packing="first_fit",
+                # Keep the global packed rows identical across DP degrees.
+                # Requires PP=1 and accumulation=1; multiple local rows use
+                # block-causal attention to preserve their isolation.
+                global_context_rows=(
+                    os.environ.get("LLMTUNER_GLOBAL_CONTEXT_ROWS", "0") == "1"
+                ),
                 # 1 = one document per sequence (plain causal attention, no mask
                 # materialized). A larger value packs several documents into a
                 # sequence, which needs the block-causal document mask; that is
@@ -167,7 +182,12 @@ def main() -> None:
             "Run it through examples/train_qwen3_30b_npu.sh."
         )
     torch.set_default_dtype(torch.bfloat16)
-    Trainer(qwen3_30b_npu_config()).train()
+    trainer_class = Trainer
+    if os.environ.get("LLMTUNER_AUDIT_TRAINING", "0") == "1":
+        from examples.npu_training_audit import AuditedNPUTrainer
+
+        trainer_class = AuditedNPUTrainer
+    trainer_class(qwen3_30b_npu_config()).train()
 
 
 if __name__ == "__main__":

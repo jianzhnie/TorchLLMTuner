@@ -56,6 +56,32 @@ class ComposablePipelineStage(PipelineStage):
     state attached to the module and preserves custom lifecycle callbacks.
     """
 
+    def _send_meta(self, meta, dst_stage: int) -> None:
+        if self.device.type != "npu":
+            return super()._send_meta(meta, dst_stage)
+        # Torch 2.12 batches the object's size and payload P2P. Cross-node
+        # HCCL fails that path; sequential object P2P preserves the protocol.
+        torch.distributed.send_object_list(
+            [meta],
+            dst=self._resolve_peer_global_rank(dst_stage),
+            group=self.group,
+            device=self.device,
+            use_batch=False,
+        )
+
+    def _recv_meta(self, src_stage: int):
+        if self.device.type != "npu":
+            return super()._recv_meta(src_stage)
+        objects = [None]
+        torch.distributed.recv_object_list(
+            objects,
+            src=self._resolve_peer_global_rank(src_stage),
+            group=self.group,
+            device=self.device,
+            use_batch=False,
+        )
+        return objects[0]
+
     def perform_reduce_grad(self, grad_scale_factor: int) -> None:
         from torch.distributed.fsdp import FSDPModule
 

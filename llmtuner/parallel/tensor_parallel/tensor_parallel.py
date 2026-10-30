@@ -273,7 +273,12 @@ class GatherSequenceFirst:
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
         gathered = all_gather_along(hidden_states, -2, self._tp_seq_group)
-        return super().forward(gathered, *args, **kwargs)
+        original = self.__dict__.get("_tp_attention_original_forward")
+        return (
+            original(gathered, *args, **kwargs)
+            if original is not None
+            else super().forward(gathered, *args, **kwargs)
+        )
 
 
 def looks_like_attention(module: nn.Module) -> bool:
@@ -299,7 +304,12 @@ class ReplicatedAttentionSequenceBoundary:
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
         gathered = all_gather_along(hidden_states, -2, self._tp_seq_group)
-        output = super().forward(gathered, *args, **kwargs)
+        original = self.__dict__.get("_tp_attention_original_forward")
+        output = (
+            original(gathered, *args, **kwargs)
+            if original is not None
+            else super().forward(gathered, *args, **kwargs)
+        )
         attention = output[0] if isinstance(output, tuple) else output
         local = attention.chunk(self._tp_seq_group.size(), dim=-2)[
             self._tp_seq_group.rank()
@@ -341,7 +351,12 @@ class TPMoeSequenceBoundary:
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
         gathered = all_gather_along(hidden_states, -2, self._tp_seq_group)
-        out = super().forward(gathered, *args, **kwargs)
+        original = self.__dict__.get("_tp_moe_original_forward")
+        out = (
+            original(gathered, *args, **kwargs)
+            if original is not None
+            else super().forward(gathered, *args, **kwargs)
+        )
         # This probe sits between the two collectives; it is only safe because
         # the block's output TYPE is structural -- identical on every rank of
         # the TP group -- so either all ranks raise here or none do. Never let
@@ -893,6 +908,11 @@ def realize_moe_blocks_tp(
         )
         block._tp_seq_group = group
         block._tp_moe_boundary = True
+        # An explicitly selected kernel can install forward on the instance
+        # (e.g. torchtitan NPU experts). It would shadow the boundary mixin and
+        # silently bypass both sequence collectives after the class swap.
+        if "forward" in block.__dict__:
+            block._tp_moe_original_forward = block.__dict__.pop("forward")
         block.__class__ = type(
             f"TPMoe{type(block).__name__}",
             (TPMoeSequenceBoundary, type(block)),
@@ -1065,6 +1085,8 @@ def apply_tp(
         if getattr(parent, "_tp_seq_group", None) is not None:
             continue  # already gathered (apply_tp is idempotent per module)
         parent._tp_seq_group = group
+        if "forward" in parent.__dict__:
+            parent._tp_attention_original_forward = parent.__dict__.pop("forward")
         parent.__class__ = type(
             f"TPGather{type(parent).__name__}",
             (GatherSequenceFirst, type(parent)),
@@ -1073,6 +1095,8 @@ def apply_tp(
 
     for attention in replicated_attention:
         attention._tp_seq_group = group
+        if "forward" in attention.__dict__:
+            attention._tp_attention_original_forward = attention.__dict__.pop("forward")
         attention.__class__ = type(
             f"TPReplicated{type(attention).__name__}",
             (ReplicatedAttentionSequenceBoundary, type(attention)),

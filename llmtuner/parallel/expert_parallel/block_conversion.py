@@ -129,7 +129,23 @@ def convert_block(
     lo = ep_rank * num_local
 
     num_expert_groups, num_limited_groups = read_expert_groups(block, router_gate)
-    if token_dispatcher == "mc2":
+    from ...accelerator.device import device_type
+    from ...models.hf.model_setup import forward_torchtitan_moe
+
+    original_forward = block.__dict__.get("_tp_moe_original_forward", block.forward)
+    baseline_npu = (
+        device_type == "npu"
+        and getattr(original_forward, "__func__", None) is forward_torchtitan_moe
+    )
+    if baseline_npu and token_dispatcher != "alltoall":
+        raise ValueError(
+            "torchtitan NPU experts with EP require token_dispatcher='alltoall'"
+        )
+    if baseline_npu:
+        from .npu_baseline_experts import NpuBaselineGroupedExperts
+
+        grouped = NpuBaselineGroupedExperts(dim, hidden, num_local)
+    elif token_dispatcher == "mc2":
         from .mc2_dispatch import MC2GroupedExperts
 
         grouped = MC2GroupedExperts(dim, hidden, num_local)
@@ -186,7 +202,12 @@ def convert_block(
     elif ep_group is None:
         dispatcher = LocalTokenDispatcher(num_experts, top_k)
     else:
-        dispatcher = AllToAllTokenDispatcher(num_experts, top_k)
+        if baseline_npu:
+            from .npu_baseline_experts import NpuBaselineAllToAllTokenDispatcher
+
+            dispatcher = NpuBaselineAllToAllTokenDispatcher(num_experts, top_k)
+        else:
+            dispatcher = AllToAllTokenDispatcher(num_experts, top_k)
     if ep_group is not None:
         dispatcher.set_ep_group(ep_group=ep_group)
         # Flag the stacked expert weights as expert-dim-sharded over the EP
@@ -201,6 +222,14 @@ def convert_block(
         from .mc2_dispatch import MC2RoutedExperts
 
         routed_experts_cls = MC2RoutedExperts
+    if baseline_npu and ep_group is not None:
+        from .npu_baseline_experts import NpuBaselineRoutedExperts
+
+        routed_experts_cls = NpuBaselineRoutedExperts
+    elif baseline_npu:
+        # Local conversion needs the generic local dispatch contract until the
+        # score-aware local adapter is implemented.
+        raise ValueError("torchtitan NPU expert conversion requires an EP group")
     moe_cls = FeatureParallelMoE if feature_parallel else MoE
     moe = moe_cls(
         num_experts=num_experts,

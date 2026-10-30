@@ -227,6 +227,13 @@ def main() -> None:
                 ),
                 "chunked_loss_num_chunks": config.training.chunked_loss_num_chunks,
                 "trace_layers": os.environ.get("LLMTUNER_ALIGNMENT_TRACE_LAYERS"),
+                "trace_boundaries_only": os.environ.get(
+                    "LLMTUNER_ALIGNMENT_TRACE_BOUNDARIES_ONLY"
+                )
+                == "1",
+                "gradient_trace_layers": os.environ.get(
+                    "LLMTUNER_ALIGNMENT_GRADIENT_LAYERS", "0"
+                ),
                 "gradient_trace_enabled": os.environ.get(
                     "LLMTUNER_ALIGNMENT_GRADIENT_TRACE"
                 )

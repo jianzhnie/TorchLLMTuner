@@ -1,4 +1,4 @@
-"""Instance-local Qwen3 fused projection with separate parameter ownership."""
+"""Instance-local Qwen3 projection and rotary precision overrides."""
 
 from __future__ import annotations
 
@@ -100,8 +100,29 @@ def apply_configured_rotary(module, query, key, cosine, sine, position_ids):
     angles = torch.cat((angles, angles), dim=-1).unsqueeze(1)
     cosine = angles.cos()
     sine = angles.sin()
+    if getattr(module.config, "rotary_cache_dtype", None) == "bfloat16":
+        # Preserve the baseline buffer quantization while applying RoPE in FP32.
+        cosine = cosine.bfloat16().float()
+        sine = sine.bfloat16().float()
     query_dtype = query.dtype
     key_dtype = key.dtype
+    if query.device.type == "npu" and (
+        getattr(module.config, "rotary_cache_dtype", None) == "bfloat16"
+    ):
+        import torch_npu
+
+        # Match both the baseline rotary kernel and its backward reduction.
+        # An algebraically equivalent eager rotation can match BF16 forward
+        # exactly while rounding its input gradient differently.
+        cosine = cosine.transpose(1, 2)
+        sine = sine.transpose(1, 2)
+        query = torch_npu.npu_rotary_mul(
+            query.transpose(1, 2).float(), cosine, sine
+        ).transpose(1, 2)
+        key = torch_npu.npu_rotary_mul(
+            key.transpose(1, 2).float(), cosine, sine
+        ).transpose(1, 2)
+        return query.to(query_dtype), key.to(key_dtype)
     query = (query.float() * cosine) + (rotate_half(query.float()) * sine)
     key = (key.float() * cosine) + (rotate_half(key.float()) * sine)
     return query.to(query_dtype), key.to(key_dtype)
@@ -115,8 +136,14 @@ def forward_fused_qkv_attention(
     past_key_values: Any = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Keep Qwen3 attention semantics around a stateless fused projection."""
-    query, key, value = fused_qkv_projection(module, hidden_states)
+    """Keep Qwen3 attention semantics with configured QKV and rotary precision."""
+    if getattr(module.config, "qkv_projection", "separate") == "fused":
+        query, key, value = fused_qkv_projection(module, hidden_states)
+    else:
+        query, key, value = (
+            projection(hidden_states).unflatten(-1, (-1, module.head_dim))
+            for projection in (module.q_proj, module.k_proj, module.v_proj)
+        )
     query = module.q_norm(query).transpose(1, 2)
     key = module.k_norm(key).transpose(1, 2)
     value = value.transpose(1, 2)
@@ -172,3 +199,28 @@ def apply_fused_qkv_projection(model: nn.Module) -> None:
     for module in attention_modules:
         module.forward = MethodType(forward_fused_qkv_attention, module)
         module._llmtuner_fused_qkv = True
+
+
+def apply_fp32_rotary_projection(model: nn.Module) -> None:
+    """Keep separate Q/K/V autograd branches while selecting FP32 RoPE."""
+    if getattr(model.config, "qkv_projection", "separate") != "separate":
+        raise ValueError("FP32 rotary installation requires separate Q/K/V")
+    if getattr(model.config, "rotary_compute_dtype", None) != "float32":
+        raise ValueError(
+            "FP32 rotary installation requires rotary_compute_dtype=float32"
+        )
+    if model.config.model_type not in ("qwen3", "qwen3_moe"):
+        raise UnsupportedCombinationError("FP32 RoPE requires Qwen3 or Qwen3-MoE")
+    attention_type = (
+        Qwen3Attention if model.config.model_type == "qwen3" else Qwen3MoeAttention
+    )
+    modules = [layer.self_attn for layer in model.model.layers]
+    for module in modules:
+        if type(module) is not attention_type or (
+            "forward" in module.__dict__
+            and getattr(module.forward, "__func__", None)
+            is not forward_fused_qkv_attention
+        ):
+            raise UnsupportedCombinationError("FP32 RoPE requires native attention")
+    for module in modules:
+        module.forward = MethodType(forward_fused_qkv_attention, module)

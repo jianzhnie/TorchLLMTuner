@@ -178,6 +178,47 @@ def _clip_offloaded_gradients(
     return {id(gradient) for gradient in gradients}
 
 
+def _parameter_precision_norm(
+    grads: list[torch.Tensor],
+    norm_type: float,
+    packed_gradients: dict[int, tuple[torch.Tensor, ...]] | None = None,
+) -> torch.Tensor:
+    """Match NPU baseline local norm rounding before FP32 mesh power reduction."""
+    groups = {}
+    for grad in grads:
+        key = (
+            (grad.device_mesh, tuple(grad.placements))
+            if isinstance(grad, DTensor)
+            else (None, ())
+        )
+        groups.setdefault(key, []).append(grad)
+    total = None
+    for (mesh, placements), group in groups.items():
+        device = (
+            get_comm_device(mesh.get_group(0)) if mesh is not None else group[0].device
+        )
+        power = torch.zeros((), device=device, dtype=torch.float32)
+        for grad in group:
+            packed = (packed_gradients or {}).get(id(grad))
+            if packed is not None:
+                if not packed:
+                    continue
+                grad = torch.cat(packed, dim=1)
+            local = grad.to_local() if isinstance(grad, DTensor) else grad
+            # Cast AFTER the native norm, preserving its low-precision rounding.
+            norm = torch.linalg.vector_norm(local, norm_type).float()
+            power.add_(norm.to(device).pow(norm_type))
+        for axis, placement in enumerate(placements):
+            if isinstance(placement, Shard):
+                all_reduce(power, group=mesh.get_group(axis))
+            elif not isinstance(placement, Replicate):
+                raise ValueError(
+                    "parameter norm precision requires Shard/Replicate gradients"
+                )
+        total = power if total is None else total + power.to(total.device)
+    return torch.tensor(0.0) if total is None else total.pow(1.0 / norm_type)
+
+
 def clip_grad_norm_(
     parameters: torch.Tensor | Iterable[torch.Tensor],
     max_norm: float,
@@ -189,6 +230,8 @@ def clip_grad_norm_(
     expert_parameters: Iterable[torch.Tensor] | None = None,
     tp_mesh=None,
     tp_sharded_parameters: Iterable[torch.Tensor] | None = None,
+    norm_precision: str = "float32",
+    packed_parameters: Iterable[tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> torch.Tensor:
     """Clip the gradient norm of an iterable of parameters, over the whole model.
 
@@ -214,6 +257,12 @@ def clip_grad_norm_(
         tp_mesh: tensor-parallel mesh for local TP weight shards.
         tp_sharded_parameters: parameters physically sharded across TP ranks.
             Required exactly when ``tp_mesh`` is provided.
+        norm_precision: ``float32`` promotes low-precision per-gradient norms;
+            ``parameter`` preserves their native dtype rounding before FP32
+            power reduction, matching the NPU baseline for finite positive p.
+        packed_parameters: gate/up parameter pairs treated as one axis-1 packed
+            tensor for ``parameter`` norm rounding. Scaling still uses the
+            original parameters; the default FP32 norm is unaffected.
 
     Returns:
         The total norm of the parameter gradients (viewed as one vector).
@@ -221,6 +270,14 @@ def clip_grad_norm_(
     Nonfinite checks run after the global norm is assembled, before clipping.
     """
     norm_type = float(norm_type)
+    if norm_precision not in ("float32", "parameter"):
+        raise ValueError("norm_precision must be float32 or parameter")
+    if norm_precision == "parameter" and (
+        not math.isfinite(norm_type) or norm_type <= 0
+    ):
+        raise ValueError(
+            "parameter norm precision requires a finite positive norm_type"
+        )
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     else:
@@ -255,8 +312,42 @@ def clip_grad_norm_(
     expert_grads = [
         p.grad for p in parameters if id(p) in expert_ids and p.grad is not None
     ]
+    packed_gradients = {}
+    parameter_ids = {id(p) for p in parameters}
+    for first, second in packed_parameters or ():
+        if id(first) not in parameter_ids or id(second) not in parameter_ids:
+            raise ValueError("Packed norm parameters must belong to the clipped set")
+        if first.grad is None or second.grad is None:
+            raise ValueError("Packed norm parameters require both gradients")
+        if id(first.grad) in packed_gradients or id(second.grad) in packed_gradients:
+            raise ValueError("Packed norm parameter groups must be disjoint")
+        if first.grad.shape != second.grad.shape or first.grad.ndim != 3:
+            raise ValueError(
+                "Packed gate/up norm requires equal three-dimensional shapes"
+            )
+        if (
+            first.grad.dtype != second.grad.dtype
+            or first.grad.device != second.grad.device
+        ):
+            raise ValueError("Packed norm gradients must share dtype and device")
+        if isinstance(first.grad, DTensor) != isinstance(second.grad, DTensor):
+            raise ValueError("Packed norm gradients must share tensor layout")
+        if isinstance(first.grad, DTensor) and (
+            first.grad.device_mesh != second.grad.device_mesh
+            or first.grad.placements != second.grad.placements
+        ):
+            raise ValueError("Packed norm gradients must share mesh and placements")
+        if (id(first) in expert_ids, id(first) in tp_ids) != (
+            id(second) in expert_ids,
+            id(second) in tp_ids,
+        ):
+            raise ValueError("Packed norm parameters must share reduction ownership")
+        packed_gradients[id(first.grad)] = (first.grad, second.grad)
+        packed_gradients[id(second.grad)] = ()
 
     def _local_norm(grads: list[torch.Tensor]) -> torch.Tensor:
+        if norm_precision == "parameter":
+            return _parameter_precision_norm(grads, norm_type, packed_gradients)
         # FSDP exclusions remain plain tensors. Reduce each DTensor mesh's
         # scalar norm before combining it with replicated local contributions;
         # foreach cannot mix tensors/DTensors or independent meshes.

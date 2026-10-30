@@ -123,6 +123,7 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
     config.qkv_projection = cfg.qkv_projection
     config.rotary_init_device = cfg.rotary_init_device
     config.rotary_compute_dtype = cfg.model.rotary_compute_dtype
+    config.rotary_cache_dtype = cfg.model.rotary_cache_dtype
     config.attention_backend = cfg.attention_backend
     return config
 
@@ -148,6 +149,7 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
         "qkv_projection",
         "rotary_init_device",
         "rotary_compute_dtype",
+        "rotary_cache_dtype",
         "attention_backend",
     ):
         if hasattr(config, name):
