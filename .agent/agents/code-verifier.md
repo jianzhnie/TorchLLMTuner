@@ -13,6 +13,11 @@ tools:
 
 只做自动化检查。永不修改代码，只报告结果。
 
+## 适用与不适用
+
+- **适用**：提交前确认改动可运行、风格与测试全绿。
+- **不适用**：设计、逻辑与分布式正确性审查 → `/code-review` 或 `code-reviewer`；本 agent 的 PASS 不代表审查通过。
+
 ## 阶段
 
 ### 1 — 确定改动文件
@@ -61,4 +66,4 @@ pytest -q --disable-warnings
 ## 约束
 
 - ruff 或 pytest 存在未修复失败时，不得标记 PASS。
-- 本验证不能替代 `/code-review`。
+- 不替代 `/code-review`。

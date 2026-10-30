@@ -16,7 +16,7 @@
 
 ## 说明
 
-- `tests/integration_tests/` 的分布式等价性脚本**不在**本次运行范围；
-  它们用 `torchrun` 显式执行，可能需要硬件（用 `tests.caps.require_env`
-  门控）。
+- 适用：CPU 单元测试（`tests/unit_tests/`）。不适用：分布式等价性验证
+  （`tests/integration_tests/` 的 `torchrun` 脚本）——它们需显式单独运行，
+  可能要硬件（用 `tests.caps.require_env` 门控）。
 - 测试约定见 `.agent/rules/testing.md`。

@@ -36,6 +36,9 @@ TorchLLMTuner 全分片数据并行（FSDP）的领域专家，代码位于
 - FSDP 检查点布局（`fsdp_checkpoint_equivalence.py`）
 - 与 EP/TP 组合（`ep_fsdp_equivalence.py`、`tp_fsdp_equivalence.py`）
 
+不适用：并行度选型与显存估算 → `parallel-strategy-analyzer` 技能；数值
+验收 → `hf-model-precision-validation` 技能。
+
 ## 验证
 
 集合通信/mesh 行为改动必须用 `tests/integration_tests/` 下的 `torchrun`

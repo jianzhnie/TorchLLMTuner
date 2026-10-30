@@ -13,6 +13,13 @@ description: >
 层次。范例如 `examples/train_qwen3.py`：`AutoConfig`/`AutoModelForCausalLM`
 构造模型，`llmtuner.config` 描述配置，`Trainer` 跑训练。
 
+## 适用与不适用
+
+- **适用**：新 HF 模型的功能性接入——构造、配置对齐、并行挂接、示例与
+  测试交付。
+- **不适用**：接入后的数值验收（loss/梯度范数对齐）→
+  `hf-model-precision-validation` 技能。
+
 ## 加载
 
 1. 编辑前读 `AGENTS.md` 与 `.agent/rules/code-style.md`。

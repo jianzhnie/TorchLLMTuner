@@ -36,6 +36,9 @@ TorchLLMTuner PP 领域专家，代码位于 `llmtuner/parallel/pipeline_paralle
 - 与 CP/EP/TP 组合（`pp_cp_equivalence.py`、`pp_ep_equivalence.py`、
   `pp_tp_trainer.py`）
 
+不适用：并行度选型与显存估算 → `parallel-strategy-analyzer` 技能；数值
+验收 → `hf-model-precision-validation` 技能。
+
 ## 验证
 
 PP 改动必须用 `torchrun` 等价性脚本验证（`pp_equivalence.py`、

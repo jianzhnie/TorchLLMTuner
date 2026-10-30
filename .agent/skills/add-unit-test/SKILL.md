@@ -11,6 +11,14 @@ description: >
 `tests/unit_tests/cpu/` 的流程指南。硬约束在 `.agent/rules/testing.md`，
 本技能是 how-to。
 
+## 适用与不适用
+
+- **适用**：为纯 CPU 逻辑写测试、提升覆盖率、mock 分布式/硬件行为。
+- **不适用**：集合通信或 mesh 行为 → `tests/integration_tests/` 的
+  `torchrun` 等价性脚本（编写约定见 `hf-model-precision-validation` 技能的
+  `references/equivalence-scripts.md`）；并行配置的数值验收 →
+  `hf-model-precision-validation` 技能。
+
 ## 硬约束（简版）
 
 - 运行器：**pytest**（`pytest -q --disable-warnings`）。风格为 plain
@@ -41,5 +49,5 @@ description: >
 
 ## 范围外
 
-- 集合通信/mesh 行为 → `tests/integration_tests/` 的 `torchrun` 脚本
-- 数值验收 → 技能 `hf-model-precision-validation`
+- 分布式 `torchrun` 脚本本身的新增 → 遵循
+  `hf-model-precision-validation/references/equivalence-scripts.md` 的约定

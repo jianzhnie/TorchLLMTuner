@@ -19,6 +19,13 @@ description: >
 - 选择或调整并行度；排查 OOM；对比两个配置；在启动前估算集合通信量或
   流水线 bubble。
 
+## 不适用
+
+- 实施配置改动或规划代码变更（改哪些文件、什么顺序）→ `planner` agent。
+- 实现并行维度的代码 → 各 `*-dev-expert` agent。
+- 启动或调参真实训练任务——本技能只产出建议与配置片段，不执行训练。
+- 数值验收 → `hf-model-precision-validation` 技能。
+
 ## 分析流程（每个阶段前加载对应 workflow 文件）
 
 ```text

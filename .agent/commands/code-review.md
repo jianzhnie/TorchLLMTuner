@@ -3,6 +3,9 @@
 对照仓库规则审查当前改动。先加载 `.agent/rules/code-style.md`，其违规视为
 阻断性问题。
 
+适用：提交前的完整审查。不适用：只想确认改动能跑（pytest/ruff）→
+`code-verifier` agent；只想快速自查风格 → `simple-code-reviewer` agent。
+
 ## 用法
 
 ```bash

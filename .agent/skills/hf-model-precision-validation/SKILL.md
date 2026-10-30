@@ -11,6 +11,12 @@ description: >
 证明同一模型状态与同一全局 batch 在不同并行配置下产生对齐的 **loss** 与
 **FP32 全局梯度范数**。仅 loss 一致不算 PASS。
 
+## 适用与不适用
+
+- **适用**：HF 模型接入或并行配置的数值验收；等价性用例的发散诊断。
+- **不适用**：模型的功能性接入（构造、配置对齐、并行挂接）→
+  `hf-model-integration` 技能；纯 CPU 逻辑测试 → `add-unit-test` 技能。
+
 ## 硬规则
 
 - `.agent/rules/testing.md`——集成脚本经 `torchrun` 运行，用

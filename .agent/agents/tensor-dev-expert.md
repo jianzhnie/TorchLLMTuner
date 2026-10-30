@@ -36,6 +36,9 @@ TorchLLMTuner TP 领域专家，代码位于 `llmtuner/parallel/tensor_parallel/
 - 与 CP/EP/FSDP 组合（`cp_tp_equivalence.py`、`tp_fsdp_equivalence.py`、
   `tp_moe_equivalence.py`）
 
+不适用：并行度选型与显存估算 → `parallel-strategy-analyzer` 技能；数值
+验收 → `hf-model-precision-validation` 技能。
+
 ## 验证
 
 集合通信行为改动必须用 `torchrun` 等价性脚本验证（`tp_equivalence.py`、

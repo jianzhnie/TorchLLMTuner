@@ -41,6 +41,9 @@ TorchLLMTuner EP/MoE 领域专家，代码位于
 - 与 FSDP/TP/PP 组合（`ep_fsdp_equivalence.py`、`tp_ep_cp_equivalence.py`、
   `pp_ep_equivalence.py`）
 
+不适用：并行度选型与显存估算 → `parallel-strategy-analyzer` 技能；数值
+验收 → `hf-model-precision-validation` 技能。
+
 ## 验证
 
 EP 改动必须用 `torchrun` 等价性脚本验证（`ep_equivalence.py`、
