@@ -88,8 +88,8 @@ description: 审查、修改和重构 TorchLLMTuner 的 llmtuner 代码时，指
 - **恢复与退出**：检查模型、优化器、scheduler、数据游标和 trainer 状态一致性；
   同时覆盖部分初始化失败、验证模式恢复和资源清理。
 
-当参考 torchtitan 或 FSDPTurbo 时，先查看 `docs/llmtuner_upstream_map.md`、
-`docs/torchllmtuner_design.md` 和相关源文件。用户指定本地上游路径时使用该路径；
+当参考 torchtitan 或 FSDPTurbo 时，先查看 `docs/torchtitan_comparison.md`、
+`docs/fsdpturbo_comparison.md`、`docs/torchllmtuner_design.md` 和相关源文件。用户指定本地上游路径时使用该路径；
 否则先确认实际可用位置。对齐数值、布局、通信和生命周期语义，适配本仓库的
 HF 与普通 dataclass 架构。记录来源路径、适配差异和未验证条件。
 
@@ -105,7 +105,7 @@ HF 与普通 dataclass 架构。记录来源路径、适配差异和未验证条
   不为统一外观重命名已准确的公共 API。
 - 重命名或搬运后同步更新实现导入、公共导出、测试、示例和文档，搜索旧引用。
   用户要求删除旧名时移除别名和兼容壳；上游来源记录中的原始名称保留。
-- 全局审查更新 `docs/file_review.md`；移动、合并、删除文件后核对清单，
+- 全局审查后核对文件清单；移动、合并、删除文件后同步更新相关文档，
   将“已阅读”“静态检查通过”“硬件数值验证”分开记录。
 
 ## 5. 验证与交付
