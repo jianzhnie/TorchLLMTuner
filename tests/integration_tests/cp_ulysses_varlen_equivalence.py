@@ -70,7 +70,7 @@ from llmtuner.parallel.context_parallel.attention import HeadToSeq, SeqToHead
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import apply_fsdp
 from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology
-from llmtuner.trainer.trainer import Trainer
+from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 from tests.integration_tests.harness import device, init_distributed, moved
 
 SEQ = 256  # torch's CP BlockMask path requires Q_LEN % (cp * 128) == 0
@@ -246,7 +246,7 @@ def _run_ulysses_packed(
                 assert parameter.device_mesh.size(axis) == 2
                 assert isinstance(parameter.placements[axis], Replicate)
     mask_builder = mock.patch(
-        "llmtuner.models.hf.model.create_attention_mask",
+        "llmtuner.models.hf.attention_masks.create_attention_mask",
         _uncompiled_create_attention_mask,
     )
     with mask_builder if DEVICE.type == "cpu" else nullcontext():
@@ -349,7 +349,7 @@ def _run_ulysses_packed(
                 parameter.grad.div_(DP)
             assert dp_gradient_gap > NONVACUITY, dp_gradient_gap
         if tp_mesh is not None:
-            Trainer._allreduce_replicated_tp_grads(
+            allreduce_replicated_tp_grads(
                 SimpleNamespace(parallel_dims=parallel_dims, model_parts=[model])
             )
         for (name, parameter), (ref_name, reference) in zip(

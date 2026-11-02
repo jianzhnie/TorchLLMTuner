@@ -7,7 +7,7 @@ import torch
 def test_torchtitan_moe_scores_before_down_projection(monkeypatch):
     from types import SimpleNamespace
 
-    from llmtuner.models.hf.model_setup import forward_torchtitan_moe
+    from llmtuner.models.hf.expert_kernels import forward_torchtitan_moe
 
     torch.manual_seed(37)
     inputs = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)
@@ -59,7 +59,7 @@ def test_torchtitan_moe_scores_before_down_projection(monkeypatch):
 def test_torchtitan_moe_rejects_non_silu_activation():
     from types import SimpleNamespace
 
-    from llmtuner.models.hf.model_setup import stabilize_moe_experts
+    from llmtuner.models.hf.expert_kernels import stabilize_moe_experts
 
     model = SimpleNamespace(
         config=SimpleNamespace(experts_implementation="torchtitan", hidden_act="gelu")

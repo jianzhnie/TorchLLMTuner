@@ -95,7 +95,7 @@ def test_kv_sdpa_multirow_mask_keeps_full_keys_and_row_positions(monkeypatch, pa
         get_optional_mesh=lambda name: cp if name == "cp" else None
     )
 
-    def shard(mesh, **kwargs):
+    def shard(model, mesh, **kwargs):
         assert mesh is cp
         return (
             kwargs["inputs"][4:],
@@ -105,7 +105,7 @@ def test_kv_sdpa_multirow_mask_keeps_full_keys_and_row_positions(monkeypatch, pa
             None,
         )
 
-    monkeypatch.setattr(model, "_shard_for_cp", shard)
+    monkeypatch.setattr("llmtuner.models.hf.input_preparation._shard_for_cp", shard)
     tokens = torch.arange(8).reshape(2, 4)
     batch = {"input": tokens, "labels": tokens}
     if packed:

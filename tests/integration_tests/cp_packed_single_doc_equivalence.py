@@ -10,7 +10,7 @@ whose positions are a plain monotonic arange -- there is no restart for a
 ``positions[1:] < positions[:-1]`` scan to find. ``preprocess_inputs`` used to
 decide "packed, prebuild the mask" by exactly that scan, so this batch shape
 took the no-mask CP branch and the forward raised in
-``_get_cp_attention_masks`` (block_causal cannot be rebuilt from a positions
+``get_cp_attention_masks`` (block_causal cannot be rebuilt from a positions
 shard). The decision is now keyed off ``attn_mask_type``.
 
 This pins the fixed path: a single-document packed row
@@ -26,6 +26,7 @@ covers the multi-document packed row.
 
 from __future__ import annotations
 
+import inspect
 from unittest import mock
 
 import torch
@@ -83,6 +84,8 @@ def _uncompiled_create_attention_mask(*args, **kwargs):
     """The production mask builder minus ``torch.compile`` (CPU inductor bug)."""
     from torch.nn.attention.flex_attention import create_block_mask
 
+    if "separate_full_blocks" not in inspect.signature(create_block_mask).parameters:
+        kwargs.pop("separate_full_blocks", None)
     return create_block_mask(*args, **kwargs)
 
 
@@ -129,7 +132,7 @@ def main() -> None:
     failures: list[str] = []
 
     with mock.patch(
-        "llmtuner.models.hf.model.create_attention_mask",
+        "llmtuner.models.hf.attention_masks.create_attention_mask",
         _uncompiled_create_attention_mask,
     ):
         inputs, out_labels, extra = model.preprocess_inputs(
@@ -139,7 +142,7 @@ def main() -> None:
 
     # THE pin: the seam must have prebuilt and Q-sharded the mask even though
     # the positions carry no restart. Without it the flex forward would raise
-    # in ``_get_cp_attention_masks``.
+    # in ``get_cp_attention_masks``.
     if "attention_masks" not in extra:
         failures.append(
             "preprocess_inputs built no mask for a single-document packed row"

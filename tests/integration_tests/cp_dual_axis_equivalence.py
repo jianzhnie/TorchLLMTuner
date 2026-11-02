@@ -134,7 +134,7 @@ def main():
             apply_cp(model, mesh=mesh, cfg=cfg.parallel, parallel_dims=topology)
             with (
                 patch(
-                    "llmtuner.models.hf.model.create_attention_mask",
+                    "llmtuner.models.hf.attention_masks.create_attention_mask",
                     _uncompiled_create_attention_mask,
                 ),
                 torch.no_grad(),

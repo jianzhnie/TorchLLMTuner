@@ -342,7 +342,7 @@ class TPMoeSequenceBoundary:
 
     The router is deliberately untouched: its weight stays replicated, every
     rank computes the identical routing on the gathered stream, and the
-    trainer's ``_allreduce_replicated_tp_grads`` sums its gradient (each rank's
+    trainer's ``allreduce_replicated_tp_grads`` sums its gradient (each rank's
     copy earns a different partial through the sharded expert outputs).
 
     Installed by ``__class__`` swap (like ``GatherSequenceFirst``), so module
@@ -569,7 +569,7 @@ def resolve_tp_sharding_plan(
         elif spec in {"replicated_with_grad_allreduce", "colwise_gather_output"}:
             # Nothing for apply_tp to do: the projection stays whole on every
             # rank. The ``_with_grad_allreduce`` half is already implemented --
-            # _allreduce_replicated_tp_grads sums exactly these parameters'
+            # allreduce_replicated_tp_grads sums exactly these parameters'
             # gradients -- so this entry only has to be understood, not acted
             # on. Recorded as None rather than dropped so match still stops
             # here instead of falling through to a broader later pattern.
@@ -646,7 +646,7 @@ def tp_sharded_param_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
     """Ids of parameters whose gradients must NOT be summed over the TP group.
 
     Everything not in this set is treated as TP-replicated by
-    ``Trainer._allreduce_replicated_tp_grads`` and summed (each rank's copy
+    ``allreduce_replicated_tp_grads`` and summed (each rank's copy
     earns a token-partial gradient over its T/tp sequence shard). Three kinds
     of parameters are instead complete on their own rank, and summing them
     across TP would corrupt them:

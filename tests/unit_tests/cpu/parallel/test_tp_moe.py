@@ -29,8 +29,10 @@ from llmtuner.config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.tensor_parallel import apply_tp
+from llmtuner.parallel.tensor_parallel import tensor_parallel as tp_engine
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     MOE_PLAN_SPECS,
+    TPMoeSequenceBoundary,
     resolve_tp_sharding_plan,
     resolve_tp_targets,
     shard_experts_for_tp,
@@ -663,3 +665,13 @@ def test_the_dense_plan_leaves_moe_internals_to_the_expert_axis(ep: int) -> None
     # matched nothing (which would silently train a replicated model, and is
     # itself a loud error) cannot pass this.
     assert any("self_attn.q_proj" in path for path, _, _ in targets)
+
+
+def test_tp_moe_non_tensor_output_uses_combination_error(monkeypatch):
+    monkeypatch.setattr(tp_engine, "all_gather_along", lambda tensor, *args: tensor)
+    block = TPMoeSequenceBoundary()
+    block._tp_seq_group = None
+    block._tp_moe_original_forward = lambda hidden: (hidden, hidden)
+
+    with pytest.raises(UnsupportedCombinationError, match="not a bare"):
+        block.forward(torch.ones(1, 2, 4))

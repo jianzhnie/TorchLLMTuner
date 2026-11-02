@@ -102,7 +102,6 @@ class RoPE(nn.Module, ABC):
     def _precompute_cache(self) -> torch.Tensor:
         """Build the reusable cache for all positions up to ``max_context_length``."""
 
-    @abstractmethod
     def _reshape_cache(
         self,
         query: torch.Tensor,
@@ -114,6 +113,7 @@ class RoPE(nn.Module, ABC):
             query: Query tensor with shape ``[T, N, H]``.
             positions: Optional position IDs with shape ``[T]``.
         """
+        return reshape_for_broadcast(self.cache, query.shape[0], positions=positions)
 
     @staticmethod
     @abstractmethod
@@ -206,14 +206,6 @@ class ComplexRoPE(RoPE):
         # complex64; the imaginary part carries the rotation angle.
         return torch.polar(torch.ones_like(freqs), freqs)
 
-    def _reshape_cache(
-        self,
-        query: torch.Tensor,
-        positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return the complex cache shaped ``(T, 1, dim / 2)`` for broadcast."""
-        return reshape_for_broadcast(self.cache, query.shape[0], positions=positions)
-
     @staticmethod
     def apply_rotary_emb(
         query: torch.Tensor,
@@ -280,14 +272,6 @@ class CosSinRoPE(RoPE):
         cos = theta.cos()
         sin = theta.sin()
         return torch.cat([cos, sin], dim=-1)
-
-    def _reshape_cache(
-        self,
-        query: torch.Tensor,
-        positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return the cos/sin cache shaped ``(T, 1, dim * 2)`` for broadcast."""
-        return reshape_for_broadcast(self.cache, query.shape[0], positions=positions)
 
     @staticmethod
     def apply_rotary_emb(

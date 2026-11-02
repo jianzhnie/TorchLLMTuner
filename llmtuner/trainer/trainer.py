@@ -31,7 +31,6 @@ from llmtuner.config.validation_config import ValidationConfig
 
 from ..accelerator.collectives import (
     all_reduce,
-    clip_grad_norm_,
     set_pg_timeouts,
     synchronize_local_errors,
 )
@@ -53,24 +52,18 @@ from ..datasets.contracts import (
     DataloaderExhaustedError,
     TrainerBatch,
 )
-from ..models.common.aux_loss import (
-    AuxLoss,
-    collect_aux_loss_metrics,
-)
+from ..models.common.aux_loss import AuxLoss
 from ..models.common.moe.layer import MoE
 from ..models.common.moe.routing import QuantileBalancedTopKRouter
-from ..parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
 from ..utils.logging import get_logger
 from ..utils.seeding import rollback_execution_settings_on_error, seed_everything
-from .runtime import assembly, pipeline
+from .runtime import assembly, gradients, pipeline
 from .runtime import batch as batch_runtime
+from .runtime import metrics as metrics_runtime
 from .runtime import validation as validation_runtime
-from .runtime.reductions import (
-    TrainingReductionMeshes,
-    resolve_training_reduction_meshes,
-)
+from .runtime.reductions import resolve_training_reduction_meshes
 
 # Rank-aware: the helper attaches a handler whose filter passes below-ERROR
 # lines only on the log ranks (rank 0 by default), so a torchrun run logs one
@@ -400,103 +393,8 @@ class Trainer:
             self, batch, global_valid_tokens=global_valid_tokens
         )
 
-    def _allreduce_fsdp_excluded_grads(self) -> None:
-        """Sum gradients of parameters left outside FSDP across their replicas.
-
-        Dense parameters share DP/CP replicas; EP expert slices share only the
-        sparse replica axes. TP's remaining replicated-gradient reduction runs
-        separately. Presence agreement keeps an unused local parameter from
-        skipping a peer's reduction, without creating gradients when all peers
-        leave that parameter unused.
-        """
-        if self.parallel_dims is None:
-            return
-        expert_ids = (
-            {
-                id(parameter)
-                for part in self.model_parts
-                for module in part.modules()
-                if isinstance(module, MoE)
-                for parameter in module.routed_experts.inner_experts.parameters()
-            }
-            if self.parallel_dims.ep_enabled
-            else set()
-        )
-        meshes = {
-            False: [
-                self.parallel_dims.get_optional_mesh(axis) for axis in ("dp", "cp")
-            ],
-            True: [
-                self.parallel_dims.get_optional_mesh(axis)
-                for axis in ("dp_replicate", "efsdp")
-            ],
-        }
-        seen = set()
-        for part in self.model_parts:
-            for parameter in part.parameters():
-                if (
-                    id(parameter) in seen
-                    or not parameter.requires_grad
-                    or isinstance(parameter, DTensor)
-                ):
-                    continue
-                seen.add(id(parameter))
-                for mesh in meshes[id(parameter) in expert_ids]:
-                    if mesh is None or mesh.size() <= 1:
-                        continue
-                    group = mesh.get_group()
-                    present = torch.tensor(
-                        int(parameter.grad is not None),
-                        device=parameter.device,
-                        dtype=torch.int32,
-                    )
-                    all_reduce(present, group=group)
-                    if present.item() == 0:
-                        continue
-                    if parameter.grad is None:
-                        parameter.grad = torch.zeros_like(parameter)
-                    all_reduce(parameter.grad, group=group)
-
-    def _allreduce_replicated_tp_grads(self) -> None:
-        """Sum the gradients of TP-*replicated* parameters across the TP group.
-
-        Under tensor parallelism every rank enters the forward holding only its
-        own ``T / tp`` sequence shard (the sequence-parallelism premise), so a
-        parameter that is not itself TP-sharded -- the token embedding, the
-        RMSNorms, the LM head -- accumulates a gradient over just this rank's
-        tokens. No collective inside the TP modules covers them (the fused
-        GEMMs reduce only their own sharded weights' gradients), so without
-        this all-reduce the copies train on ``1/tp`` of the tokens and drift
-        apart. The sharded weights are identified by ``tp_sharded_param_ids``
-        (which resolves the blocks' recorded parameter names to current ids):
-        the dense TP realizer classes, MoE-under-TP's in-place-sharded expert
-        parameters (ep=1), and EP's per-rank expert slices (tp x ep);
-        everything else in the model is replicated.
-
-        Sum, not average: each rank's partial gradient covers a disjoint set of
-        tokens, and the true gradient is the total. No-op when tp == 1.
-        """
-        tp_mesh = (
-            None
-            if self.parallel_dims is None
-            else self.parallel_dims.get_optional_mesh("tp")
-        )
-        if tp_mesh is None:
-            return
-        sharded_ids = tp_sharded_param_ids(self.model_parts)
-        group = tp_mesh.get_group()
-        for part in self.model_parts:
-            for param in part.parameters():
-                if param.grad is None or id(param) in sharded_ids:
-                    continue
-                grad = param.grad
-                # FSDP2 parameters carry DTensor gradients; reducing the local
-                # shard in place is the reduction, since every rank of a TP
-                # group holds the same shard of the same parameter.
-                if isinstance(grad, DTensor):
-                    all_reduce(grad.to_local(), group=group)
-                else:
-                    all_reduce(grad, group=group)
+    def before_gradient_clipping(self) -> None:
+        """Run diagnostics after gradient reduction and before clipping."""
 
     def param_context(self):
         """The context a forward/backward runs inside.
@@ -701,13 +599,15 @@ class Trainer:
                     accumulated_loss.add_(detached_loss)
 
         # FSDP exclusions retain ordinary local gradients after accumulation.
-        self._allreduce_fsdp_excluded_grads()
+        gradients.allreduce_fsdp_excluded_grads(self)
         # After the last backward, before clipping: replicated parameters under
         # TP hold token-partial gradients that nothing else reduces.
-        self._allreduce_replicated_tp_grads()
+        gradients.allreduce_replicated_tp_grads(self)
 
-        grad_norm = self._clip_and_check_finite(
-            reduction_meshes=reduction_meshes, loss_is_finite=loss_is_finite
+        grad_norm = gradients.clip_and_check_finite(
+            self,
+            reduction_meshes=reduction_meshes,
+            loss_is_finite=loss_is_finite,
         )
 
         self.optimizer.step()
@@ -735,7 +635,8 @@ class Trainer:
         # Dividing by the step's global valid-token count reports the same
         # average that normalized the gradients, independent of DP rank and
         # accumulation boundaries.
-        return self._step_metrics(
+        return metrics_runtime.build_step_metrics(
+            self,
             accumulated_loss=accumulated_loss,
             global_valid_tokens=global_valid_tokens,
             local_valid_tokens=local_valid_tokens,
@@ -743,220 +644,6 @@ class Trainer:
             reduction_meshes=reduction_meshes,
             grad_norm=grad_norm,
             lr_metrics=lr_metrics,
-        )
-
-    def _clip_and_check_finite(
-        self,
-        *,
-        reduction_meshes: TrainingReductionMeshes,
-        loss_is_finite: torch.Tensor,
-    ) -> torch.Tensor:
-        """Clip gradients, then fold loss and grad-norm finiteness into one flag.
-
-        The finiteness reductions are entered by EVERY rank -- gating them on
-        a local predicate would hang the peers -- which is why this block runs
-        before the optimizer step and returns only ``grad_norm`` (already
-        world-reduced by ``clip_grad_norm_``).
-        """
-        pp_mesh = reduction_meshes.pp_mesh
-        parameters = [p for part in self.model_parts for p in part.parameters()]
-        expert_parameters = [
-            p
-            for part in self.model_parts
-            for module in part.modules()
-            if isinstance(module, MoE)
-            for p in module.routed_experts.inner_experts.parameters()
-        ]
-        ep_mesh = (
-            self.parallel_dims.get_optional_mesh("ep")
-            if self.parallel_dims is not None and self.parallel_dims.ep_enabled
-            else None
-        )
-        tp_mesh = (
-            self.parallel_dims.get_optional_mesh("tp")
-            if self.parallel_dims is not None and self.parallel_dims.tp_enabled
-            else None
-        )
-        tp_sharded_ids = tp_sharded_param_ids(self.model_parts) if tp_mesh else set()
-        norm_options = {}
-        if getattr(self.cfg, "grad_norm_precision", "float32") != "float32":
-            norm_options["norm_precision"] = self.cfg.grad_norm_precision
-            from ..parallel.expert_parallel.npu_baseline_experts import (
-                NpuBaselineGroupedExperts,
-            )
-
-            norm_options["packed_parameters"] = [
-                (module.w1_EFD, module.w3_EFD)
-                for part in self.model_parts
-                for module in part.modules()
-                if isinstance(module, NpuBaselineGroupedExperts)
-            ]
-        grad_norm = clip_grad_norm_(
-            parameters,
-            max_norm=self.cfg.max_norm,
-            foreach=True,
-            pp_mesh=pp_mesh,
-            ep_mesh=ep_mesh,
-            expert_parameters=expert_parameters if ep_mesh is not None else None,
-            tp_mesh=tp_mesh,
-            tp_sharded_parameters=(
-                [p for p in parameters if id(p) in tp_sharded_ids]
-                if tp_mesh is not None
-                else None
-            ),
-            **norm_options,
-        )
-
-        # Finiteness is reduced to ONE flag before it is asserted, and every
-        # rank enters the reduction. Asserting on the local loss instead would
-        # let a rank whose own shard happened to come out finite sail past a
-        # step that another rank already knows is garbage -- and the parameter
-        # update that follows is collective, so the disagreement is not
-        # recoverable. int32, not bool: NCCL has no bool reduction.
-        step_is_finite = loss_is_finite
-        step_is_finite.logical_and_(torch.isfinite(grad_norm).all())
-        # A PP-only reduction cannot propagate an earlier stage's verdict to
-        # other DP replicas. Use one world verdict for every local loss and
-        # norm, including stages normally returning a finite loss sentinel.
-        all_reduce(step_is_finite, op="min")
-
-        self._check_finite(step_is_finite)
-        return grad_norm
-
-    def _step_metrics(
-        self,
-        *,
-        accumulated_loss: torch.Tensor,
-        global_valid_tokens: torch.Tensor,
-        local_valid_tokens: int,
-        local_valid_tokens_tensor: torch.Tensor,
-        reduction_meshes: TrainingReductionMeshes,
-        grad_norm: torch.Tensor,
-        lr_metrics: dict[str, float],
-    ) -> dict[str, float]:
-        """Assemble the logging step's metrics dict.
-
-        Every collective here is unconditional (see the comment at the loss
-        reduction): ranks enter them regardless of what their own shard saw.
-        """
-        dp_mesh = reduction_meshes.dp_mesh
-        pp_mesh = reduction_meshes.pp_mesh
-        loss_mesh = reduction_meshes.loss_mesh
-        # CP/TP hold disjoint slices of the same DP batch; restore the complete
-        # local loss before computing the worst per-DP-rank average.
-        sequence_mesh = reduction_meshes.sequence_mesh
-        # Only the last stage computes CE. Other stages carry a finite
-        # sentinel for the step check; it must not enter reported metrics.
-        if pp_mesh is not None and not self.pp_has_last_stage:
-            accumulated_loss = torch.zeros_like(accumulated_loss)
-        loss = accumulated_loss / global_valid_tokens
-
-        if loss_mesh is not None:
-            # The collectives are entered UNCONDITIONALLY: gating them on a
-            # local predicate (this rank saw no valid tokens this window) would
-            # let that rank skip a reduction the others enter, hanging the
-            # step. Only the per-rank division needs the guard -- a rank with
-            # no valid tokens contributes 0 to the max.
-            local_loss_sum = accumulated_loss.clone()
-            if sequence_mesh is not None:
-                all_reduce(local_loss_sum, group=sequence_mesh.get_group())
-            local_avg = (
-                local_loss_sum / local_valid_tokens_tensor
-                if local_valid_tokens > 0
-                else torch.zeros_like(accumulated_loss)
-            )
-            loss_sum = loss.clone()
-            local_max = local_avg.clone()
-            all_reduce(loss_sum, group=loss_mesh.get_group())
-            # The sequence axes were summed above, so each sequence group now
-            # holds one complete local-DP loss.  The maximum is over DP ranks
-            # only, matching torchtitan's definition and avoiding counting
-            # sequence shards as separate examples.
-            if dp_mesh is not None:
-                all_reduce(local_max, op="max", group=dp_mesh.get_group())
-            # Cumulative tokens seen, summed over the ranks holding *distinct*
-            # tokens: ``ntokens_seen`` is a count of labels this rank actually
-            # fed a step, and CP and TP each take their own slice of that
-            # sequence, so one rank's slice is a strict subset. ``loss_mesh`` is
-            # the group those slices partition -- the same one the loss average
-            # above spans. ``dp_mesh`` is its subgroup: summing over dp alone
-            # would under-count by ``cp * tp``, exactly as it would for the loss.
-            # (The two coincide when CP and TP are off, which is why one mesh
-            # serves both.)
-            #
-            # Unlike ``global_valid_tokens``, which counts only the *predictable*
-            # labels (the loss denominator), this counts every label -- the data
-            # consumed. Both are per-step sums over the same meshes, so they
-            # differ by exactly the final position of each document.
-            #
-            # One host sync per logging step, not per step: the tensor is int64
-            # and nothing downstream needs it on the device.
-            ntokens_seen_tensor = torch.tensor(
-                self.ntokens_seen, dtype=torch.int64, device=self.device
-            )
-            all_reduce(ntokens_seen_tensor, group=loss_mesh.get_group())
-            global_ntokens_seen = float(ntokens_seen_tensor)
-        else:
-            # Both tensors are reduced across PP below. They must not alias:
-            # the second all-reduce would otherwise sum the first result again.
-            loss_sum = loss
-            local_max = loss.clone()
-            global_ntokens_seen = float(self.ntokens_seen)
-        if pp_mesh is not None:
-            # Each PP group contains one rank from every stage at the same
-            # DP/CP/TP coordinate. Send the last stage's loss to its peers so
-            # callers can inspect correct metrics on every rank.
-            all_reduce(loss_sum, group=pp_mesh.get_group())
-            all_reduce(local_max, group=pp_mesh.get_group())
-        global_avg_loss = float(loss_sum)
-        global_max_loss = float(local_max)
-        metrics = {
-            "loss": global_avg_loss,
-            "max_loss": global_max_loss,
-            "grad_norm": float(grad_norm),
-            "n_tokens_seen": global_ntokens_seen,
-        }
-        # The snapshot from the top of the step: reported, not checkpointed.
-        # The schedule is deterministic in the step number (see
-        # load_state_dict), so a resumed run's lr is a pure function of counters
-        # that already round-trip; a saved copy could only go stale against
-        # them.
-        metrics.update(lr_metrics)
-        # Aux-loss step registers are rolled up by the optimizer step pre-hook
-        # above; this reduces them for logging. Single-process runs skip the
-        # collection (there is no mesh to reduce over and no second rank's
-        # contribution); the injection itself is unaffected.
-        # PP stages without local auxiliary losses must still join metric-key
-        # agreement. Constructor registries can differ across processes.
-        if self.parallel_dims is not None:
-            metrics.update(
-                collect_aux_loss_metrics(
-                    self.parallel_dims, model_parts=self.model_parts
-                )
-            )
-        return metrics
-
-    def _check_finite(self, step_is_finite: torch.Tensor) -> None:
-        """Stop before the optimizer update if anything went non-finite.
-
-        ``step_is_finite`` is already the *global* verdict: ``train_step`` folds
-        this rank's loss and grad_norm into it, then reduces it across all
-        ranks. The reduction is what every rank participates in, which
-        is why it happens in the caller -- a rank that skipped it would hang the
-        others, and the check would no longer be rank-uniform.
-
-        ``torch._assert_async`` queues a device check on backends that support
-        it, including CUDA graph capture. torch-npu 2.12 reports a CPU fallback
-        for this operator, so NPU execution may synchronize the host. Preserve
-        the check on that path: correctness takes precedence over its cost.
-        A failed CUDA assertion invalidates the process, which is why the
-        reference implementation accepts it.
-        """
-        torch._assert_async(
-            step_is_finite,
-            f"Loss or gradient norm is not finite at step {self.step}. "
-            "Stopping before the optimizer update, since every later number "
-            "would be garbage.",
         )
 
     # -- validation (bodies live in runtime/validation.py) ----------------------

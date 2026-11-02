@@ -23,7 +23,7 @@ from llmtuner.config.parallel_config import ExpertParallelConfig, ParallelConfig
 from llmtuner.parallel.expert_parallel import mc2_dispatch
 from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
 from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp
-from llmtuner.trainer.trainer import Trainer
+from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 from tests.integration_tests.ep_wiring_equivalence import _model
 from tests.integration_tests.mc2_distributed_adapter import DistributedOps
 
@@ -170,7 +170,7 @@ def main():
                 parallel_dims=SimpleNamespace(get_optional_mesh=lambda name: mesh),
                 model_parts=[model],
             )
-            Trainer._allreduce_replicated_tp_grads(runtime)
+            allreduce_replicated_tp_grads(runtime)
             outputs.append(output)
         torch.testing.assert_close(outputs[1], outputs[0], atol=5e-4, rtol=1e-2)
         if boundaries:

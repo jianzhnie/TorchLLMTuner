@@ -81,7 +81,7 @@ DeepSeek-V3 例子里 `n_routed_experts` / `q_lora_rank` 这类字段走
 | `llmtuner/config/` | 分组配置（Model/Parallel/Optimizer/Checkpoint/Data/Training + `LLMTunerConfig` 聚合根），每组自校验 |
 | `llmtuner/parallel/` | 并行五族（`tensor_parallel` / `expert_parallel` / `context_parallel` / `pipeline_parallel` / `fully_shard_parallel`）+ `stages.py`（装配顺序）、`compatibility.py`（组合裁决）、`model_compile.py`、`topology.py` |
 | `llmtuner/memory/` | activation checkpoint 与其他内存优化 |
-| `llmtuner/models/` | `hf/`（HF wrapper 五部件契约、config 工厂、state-dict 适配）+ `common/`（MoE 栈、loss 件、上游对照实现） |
+| `llmtuner/models/` | `architecture.py`（自定义架构注册）+ `hf/`（构造、五部件 wrapper、输入切分、mask、state-dict 适配）+ `common/`（通用模型构件） |
 | `llmtuner/components/` | loss / optimizer+EMA / lr_scheduler / checkpointer / metrics / profiler / tokenizer |
 | `llmtuner/datasets/` | Grain 数据层（sources、loader、packing、text、multimodal、random 语料） |
 | `llmtuner/accelerator/` | 设备/进程组/集合通信抽象 + `capabilities.py`（环境能力探测） |

@@ -16,6 +16,7 @@ from llmtuner.models.common.aux_loss import (
     collect_aux_loss_metrics,
     rollup_aux_loss_metrics,
 )
+from llmtuner.trainer.runtime.metrics import build_step_metrics
 from llmtuner.trainer.runtime.reductions import TrainingReductionMeshes
 from llmtuner.trainer.trainer import Trainer
 
@@ -67,7 +68,8 @@ def main():
         trainer.model_parts = [empty_stage]
         trainer.pp_has_last_stage = rank == 1
         trainer.ntokens_seen = 4
-        metrics = trainer._step_metrics(
+        metrics = build_step_metrics(
+            trainer,
             accumulated_loss=torch.tensor(8.0 if rank == 1 else 0.0),
             global_valid_tokens=torch.tensor(4),
             local_valid_tokens=4,

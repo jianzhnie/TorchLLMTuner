@@ -2,6 +2,7 @@
 
 Two halves, and the split is the one that matters when reading code:
 
+* ``architecture.py`` -- the lightweight registration seam for custom HF types.
 * ``hf/`` -- the adaptation layer: ``factory.py`` builds the HF config and
   resolves the model class, ``model.py`` holds the ``HFTransformerModel`` the
   trainer drives, ``flops.py`` counts the MFU denominator, and

@@ -288,7 +288,7 @@ def main() -> None:
         assert replaced_norms == 33, replaced_norms
         print(f"Diagnostic: replaced {replaced_norms} HF norms with torch RMSNorm")
     if os.environ.get("LLMTUNER_ALIGNMENT_REMOVE_NORM_VIEWS") == "1":
-        from llmtuner.models.hf.model_setup import _isolate_norm_input
+        from llmtuner.models.hf.normalization_setup import _isolate_norm_input
 
         removed_hooks = 0
         for module in model.modules():

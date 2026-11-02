@@ -28,7 +28,7 @@ from llmtuner.models.hf.attention_backend import CP_SDPA_BACKEND
 from llmtuner.parallel.context_parallel.sdpa_attention import CPSdpaKernel
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.parallel.topology import ParallelTopology
-from llmtuner.trainer.trainer import Trainer
+from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 from llmtuner.utils.module_names import canonical_fqn
 from tests.integration_tests.harness import init_distributed
 from tests.integration_tests.pp_cp_equivalence import cpu_cp_attention
@@ -300,7 +300,7 @@ def main():
                                 atol=1e-6,
                                 rtol=1e-6,
                             )
-                Trainer._allreduce_replicated_tp_grads(runtime)
+                allreduce_replicated_tp_grads(runtime)
                 count = 0
                 for key, parameter in model.named_parameters():
                     assert parameter.grad is not None, key

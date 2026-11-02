@@ -16,6 +16,7 @@ from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
+from ..architecture import get_model_architecture, registered_model_architectures
 from .attention_backend import ATTENTION_BACKEND
 
 if TYPE_CHECKING:
@@ -43,26 +44,29 @@ def build_model_config(
     empty dict to use architecture defaults. ``None`` loads the config from a
     local checkpoint directory or Hub identifier.
     """
+    architecture = get_model_architecture(model_name_or_path)
     # Some HF composite constructors modify nested configuration dictionaries.
     overrides = deepcopy(arch_overrides) if arch_overrides is not None else {}
     if arch_overrides is not None:
         overrides.setdefault("max_position_embeddings", seq_len)
-        if model_name_or_path == "kimi_linear":
-            from ..kimi.kimi_linear_config import KimiLinearConfig
-
-            config = KimiLinearConfig(**overrides)
-        else:
+        if architecture is None:
             config = AutoConfig.for_model(model_name_or_path, **overrides)
+        else:
+            config = architecture.config_factory(**overrides)
         if hasattr(config, "text_config"):
             config.text_config.max_position_embeddings = max(
                 config.text_config.max_position_embeddings, seq_len
             )
         return config
 
-    # Register only the lightweight local config; model/kernel imports stay lazy.
-    from ..kimi.kimi_linear_config import KimiLinearConfig
-
-    AutoConfig.register("kimi_linear", KimiLinearConfig, exist_ok=True)
+    # Saved configs identify their architecture by model_type, not by this path.
+    # Register lightweight local configs; model/kernel imports stay lazy.
+    for custom_architecture in registered_model_architectures():
+        AutoConfig.register(
+            custom_architecture.model_type,
+            custom_architecture.config_type_loader(),
+            exist_ok=True,
+        )
     config = AutoConfig.from_pretrained(model_name_or_path)
     text_config = getattr(config, "text_config", config)
     text_config.max_position_embeddings = max(
@@ -86,7 +90,8 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
     # Only registered architecture names select offline construction. Missing
     # paths and Hub IDs belong to from_pretrained, which owns their validation.
     offline = not os.path.exists(cfg.hf_model) and (
-        cfg.hf_model in CONFIG_MAPPING or cfg.hf_model == "kimi_linear"
+        cfg.hf_model in CONFIG_MAPPING
+        or get_model_architecture(cfg.hf_model) is not None
     )
     overrides = (
         {
@@ -172,10 +177,9 @@ def resolve_model_class(config: PretrainedConfig) -> type[PreTrainedModel]:
     ``Auto`` mapping, which covers configs whose architecture name does not match
     the installed class name.
     """
-    if config.model_type == "kimi_linear":
-        from ..kimi.model import KimiLinearForCausalLM
-
-        return KimiLinearForCausalLM
+    architecture = get_model_architecture(config.model_type)
+    if architecture is not None:
+        return architecture.model_class_loader()
 
     import transformers
     from transformers import PreTrainedModel

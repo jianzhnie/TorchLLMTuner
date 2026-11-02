@@ -19,7 +19,7 @@ from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.models.hf.model_setup import (
+from llmtuner.models.hf.normalization_setup import (
     _isolate_norm_input,
     stabilize_residual_norm_gradients,
 )

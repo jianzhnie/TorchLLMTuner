@@ -316,7 +316,7 @@ def test_qwen3_plan_resolves_rather_than_raising_on_its_qk_norms() -> None:
     injecting the entry into the real plan rather than by asserting on whatever
     the installed version happens to declare. The branch's meaning is what the
     test is for: a norm entry resolves to ``None`` (left whole on every rank,
-    its gradient summed by ``Trainer._allreduce_replicated_tp_grads``), while
+    its gradient summed by ``allreduce_replicated_tp_grads``), while
     the projections still resolve to real realizers.
     """
     from llmtuner.models.hf.factory import build_model_config

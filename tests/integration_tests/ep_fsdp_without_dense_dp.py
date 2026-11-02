@@ -26,7 +26,7 @@ from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.parallel.topology import ParallelTopology
-from llmtuner.trainer.trainer import Trainer
+from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 from tests.integration_tests.ep_fsdp_equivalence import _ref_expert_grads
 from tests.integration_tests.harness import init_distributed, moved
 
@@ -161,7 +161,7 @@ def main() -> None:
         torch.testing.assert_close(
             global_loss, reference_global_loss, rtol=1e-4, atol=1e-5
         )
-        Trainer._allreduce_replicated_tp_grads(
+        allreduce_replicated_tp_grads(
             SimpleNamespace(parallel_dims=dims, model_parts=[model])
         )
         tp_rank = dims.get_mesh("tp").get_local_rank()

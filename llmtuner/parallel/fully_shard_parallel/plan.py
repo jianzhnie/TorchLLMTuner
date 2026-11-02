@@ -28,6 +28,14 @@ from ..module_patterns import compile_module_pattern, resolve_module_patterns
 from .fine_grained import get_fsdp_strategy, validate_fsdp_hook_target
 
 
+def _named_module_paths(model: nn.Module) -> dict[str, nn.Module]:
+    """Index physical module paths and their transparent-wrapper aliases."""
+    paths = dict(model.named_modules(remove_duplicate=False))
+    for name, module in tuple(paths.items()):
+        paths.setdefault(canonical_fqn(name), module)
+    return paths
+
+
 class FSDPPatternReferences:
     """Keep programmatic overrides bound across module/parameter replacement.
 
@@ -48,9 +56,7 @@ class FSDPPatternReferences:
         for name, parameter in model.named_parameters(remove_duplicate=False):
             self.parameter_paths.setdefault(parameter, []).append(canonical_fqn(name))
         self.unit_modules = dict(model.named_modules())
-        module_paths = dict(model.named_modules(remove_duplicate=False))
-        for name, module in tuple(module_paths.items()):
-            module_paths.setdefault(canonical_fqn(name), module)
+        module_paths = _named_module_paths(model)
         self.ignored_modules: dict[str, nn.Module | None] = {}
         ignored = set()
         for pattern in cfg.fsdp_config.fsdp_ignored_modules:
@@ -272,15 +278,10 @@ def _resolve_pattern_units(
     model: nn.Module, cfg: ParallelConfig
 ) -> tuple[dict[str, nn.Module], dict[str, dict[str, Any]], set[nn.Parameter]]:
     named_modules = dict(model.named_modules())
-    module_paths = dict(model.named_modules(remove_duplicate=False))
     # Keep physical paths available, while accepting the model's paths before
     # AC/whole-model compile inserted transparent wrappers. The outer module
     # wins at a wrapper boundary so selecting a block still selects its wrapper.
-    for name, module in tuple(module_paths.items()):
-        logical_name = canonical_fqn(
-            name, wrapper_segments=("_checkpoint_wrapped_module", "_orig_mod")
-        )
-        module_paths.setdefault(logical_name, module)
+    module_paths = _named_module_paths(model)
     ignored_roots = resolve_module_patterns(
         list(module_paths),
         patterns=cfg.fsdp_config.fsdp_ignored_modules,

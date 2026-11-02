@@ -69,7 +69,7 @@ class GradientDiagnosticTrainer(AuditedNPUTrainer):
             # Per-rank exclusive creation avoids a shared-directory race.
             self._gradient_output.touch(exist_ok=False)
 
-    def _clip_and_check_finite(self, **kwargs):
+    def before_gradient_clipping(self):
         with synchronize_local_errors("Pre-clipping gradient diagnostic"):
             records = local_gradient_records(
                 self.model_parts, tp_sharded_param_ids(self.model_parts)
@@ -81,7 +81,6 @@ class GradientDiagnosticTrainer(AuditedNPUTrainer):
                     )
                     + "\n"
                 )
-        return super()._clip_and_check_finite(**kwargs)
 
 
 def main() -> None:

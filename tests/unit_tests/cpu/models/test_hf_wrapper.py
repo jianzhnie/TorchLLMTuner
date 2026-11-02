@@ -449,10 +449,16 @@ def test_packed_cp_preserves_global_document_mask(model, monkeypatch, dtype, str
 
     monkeypatch.setattr(model, "get_attention_masks", reject_sparse_mask)
     monkeypatch.setattr(
-        "llmtuner.models.hf.model.shard_attention_mask_for_cp", reject_sparse_mask
+        "llmtuner.models.hf.input_preparation.shard_attention_mask_for_cp",
+        reject_sparse_mask,
     )
-    monkeypatch.setattr("llmtuner.models.hf.model.shard_batch_for_cp", shard)
-    _, _, local_positions, _, mask = model._shard_for_cp(
+    monkeypatch.setattr(
+        "llmtuner.models.hf.input_preparation.shard_batch_for_cp", shard
+    )
+    from llmtuner.models.hf.input_preparation import _shard_for_cp
+
+    _, _, local_positions, _, mask = _shard_for_cp(
+        model,
         object(),
         packed=True,
         inputs=torch.arange(8),
@@ -489,10 +495,16 @@ def test_packed_flex_ulysses_preserves_sparse_mask(model, monkeypatch):
 
     monkeypatch.setattr(model, "get_attention_masks", sparse_mask)
     monkeypatch.setattr(
-        "llmtuner.models.hf.model.build_dense_attention_mask", reject_dense_mask
+        "llmtuner.models.hf.input_preparation.build_dense_attention_mask",
+        reject_dense_mask,
     )
-    monkeypatch.setattr("llmtuner.models.hf.model.shard_batch_for_cp", shard)
-    _, _, _, _, mask = model._shard_for_cp(
+    monkeypatch.setattr(
+        "llmtuner.models.hf.input_preparation.shard_batch_for_cp", shard
+    )
+    from llmtuner.models.hf.input_preparation import _shard_for_cp
+
+    _, _, _, _, mask = _shard_for_cp(
+        model,
         object(),
         packed=True,
         inputs=torch.arange(8),
@@ -1134,7 +1146,7 @@ def test_residual_norm_boundary_preserves_identity_state_and_hf_numerics(model_t
     from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
     from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
-    from llmtuner.models.hf.model_setup import stabilize_residual_norm_gradients
+    from llmtuner.models.hf.normalization_setup import stabilize_residual_norm_gradients
 
     norm_type = Qwen3RMSNorm if model_type == "qwen3" else Qwen3MoeRMSNorm
     layer = nn.Module()
@@ -1197,7 +1209,7 @@ def test_norm_backend_reaches_constructed_model(backend):
 def test_aten_norm_backend_builds_with_stable_state_and_compiles(model):
     import copy
 
-    from llmtuner.models.hf.model_setup import stabilize_residual_norm_gradients
+    from llmtuner.models.hf.normalization_setup import stabilize_residual_norm_gradients
 
     reference = copy.deepcopy(model)
     keys = set(model.state_dict())
@@ -1220,7 +1232,7 @@ def test_aten_norm_backend_rejects_unsupported_model():
 
     from torch import nn
 
-    from llmtuner.models.hf.model_setup import stabilize_residual_norm_gradients
+    from llmtuner.models.hf.normalization_setup import stabilize_residual_norm_gradients
 
     module = nn.Module()
     module.config = SimpleNamespace(model_type="llama", norm_backend="aten")
@@ -1229,11 +1241,11 @@ def test_aten_norm_backend_rejects_unsupported_model():
 
 
 def test_norm_backend_reapplication_removes_only_owned_adaptations(model):
-    from llmtuner.models.hf.model_setup import (
+    from llmtuner.models.hf.normalization import forward_aten_rms_norm
+    from llmtuner.models.hf.normalization_setup import (
         _isolate_norm_input,
         stabilize_residual_norm_gradients,
     )
-    from llmtuner.models.hf.normalization import forward_aten_rms_norm
 
     norm = model.model.model.layers[0].input_layernorm
     native_forward = type(norm).forward
@@ -1272,7 +1284,7 @@ def test_qwen3_moe_router_keeps_scores_and_gate_in_fp32() -> None:
     from transformers import AutoConfig
     from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeTopKRouter
 
-    from llmtuner.models.hf.model_setup import stabilize_moe_router
+    from llmtuner.models.hf.expert_kernels import stabilize_moe_router
 
     config = AutoConfig.for_model(
         "qwen3_moe",

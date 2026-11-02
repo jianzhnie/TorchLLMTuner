@@ -29,6 +29,7 @@ from llmtuner.config import ParallelConfig
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology
+from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 from llmtuner.trainer.trainer import Trainer
 from tests.integration_tests.harness import (
     device as harness_device,
@@ -140,7 +141,7 @@ def main() -> None:
     trainer = Trainer.__new__(Trainer)
     trainer.parallel_dims = dims
     trainer.model_parts = [model]
-    trainer._allreduce_replicated_tp_grads()
+    allreduce_replicated_tp_grads(trainer)
     grad_diff = 0.0
     for index, layer in enumerate(model.layers):
         reference = ref.layers[index]

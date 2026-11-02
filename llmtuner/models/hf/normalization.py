@@ -10,12 +10,6 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 
 
-def _forward(x, w, eps):
-    value = x.float()
-    scale = torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + eps)
-    return w * (value * scale).to(x.dtype)
-
-
 @torch.library.custom_op("llmtuner::rms_norm_backward", mutates_args=())
 def norm_backward(
     x: torch.Tensor, w: torch.Tensor, g: torch.Tensor, eps: float
@@ -45,7 +39,9 @@ def _(x, w, g, eps):
 
 @torch.library.custom_op("llmtuner::rms_norm", mutates_args=())
 def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-    return _forward(x, w, eps)
+    value = x.float()
+    scale = torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + eps)
+    return w * (value * scale).to(x.dtype)
 
 
 @rms_norm.register_fake

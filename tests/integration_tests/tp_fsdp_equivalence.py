@@ -20,7 +20,7 @@ Two seams are pinned at once:
   the count is taken from the unsharded batch.
 * the gradient wiring: TP-sharded weights reduce inside the fused GEMMs,
   TP-replicated ones (embedding, norms, head) through the trainer's
-  ``_allreduce_replicated_tp_grads``, and FSDP reduces/shards everything over
+  ``allreduce_replicated_tp_grads``, and FSDP reduces/shards everything over
   dp_shard -- which must NOT include the tp axis, or replicas' partial
   gradients would be averaged instead of summed.
 

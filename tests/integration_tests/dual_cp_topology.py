@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import and_masks, create_block_mask
 
 from llmtuner.models.common.attention.masks import get_document_mask_mod
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.hf.attention_masks import get_cp_attention_masks
 from llmtuner.parallel.context_parallel.input_sharding import (
     shard_attention_mask_for_cp,
 )
@@ -82,7 +82,7 @@ def main() -> None:
             _cp_load_balancer=None,
             get_attention_masks=build_mask,
         )
-        rebuilt = HFTransformerModel._get_cp_attention_masks(
+        rebuilt = get_cp_attention_masks(
             stub, positions=torch.arange(rank * 128, (rank + 1) * 128)
         )
         assert rebuilt.seq_lengths == (256, 512)

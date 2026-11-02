@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 from contextlib import nullcontext
+from itertools import chain
 
 import torch
 import torch.distributed as dist
@@ -133,6 +134,59 @@ def main() -> None:
                 )
             )
             iterator = trainer.data_iterator()
+            first_training_batch = next(iterator)
+            first_reference_batch = next(reference_batches)
+            if isinstance(first_training_batch, dict):
+                raise AssertionError("synthetic training expected a Batch object")
+            torch.testing.assert_close(
+                first_training_batch.input_ids,
+                first_reference_batch.input_ids,
+                atol=0,
+                rtol=0,
+                msg="trainer and reference received different token batches",
+            )
+            torch.testing.assert_close(
+                first_training_batch.labels,
+                first_reference_batch.labels,
+                atol=0,
+                rtol=0,
+                msg="trainer and reference received different label batches",
+            )
+            reference_inputs, reference_labels, reference_kwargs = (
+                oracle.preprocess_inputs(
+                    moved_batch(first_reference_batch), parallel_dims=None
+                )
+            )
+            cp_rank = trainer.parallel_dims.get_mesh("cp").get_local_rank()
+            expected_inputs = reference_inputs.chunk(2)[cp_rank].chunk(2)[tp_rank]
+            expected_labels = reference_labels.chunk(2)[cp_rank].chunk(2)[tp_rank]
+            actual_inputs, actual_labels, actual_kwargs = model.preprocess_inputs(
+                moved_batch(first_training_batch), parallel_dims=trainer.parallel_dims
+            )
+            torch.testing.assert_close(
+                actual_inputs,
+                expected_inputs,
+                atol=0,
+                rtol=0,
+                msg="TP/CP preprocessing produced different input tokens",
+            )
+            torch.testing.assert_close(
+                actual_labels,
+                expected_labels,
+                atol=0,
+                rtol=0,
+                msg="TP/CP preprocessing produced different target tokens",
+            )
+            expected_positions = reference_kwargs["positions"].chunk(2)[cp_rank]
+            torch.testing.assert_close(
+                actual_kwargs["positions"],
+                expected_positions,
+                atol=0,
+                rtol=0,
+                msg="TP/CP preprocessing produced different rotary positions",
+            )
+            iterator = chain((first_training_batch,), iterator)
+            reference_batches = chain((first_reference_batch,), reference_batches)
             for step in range(1, STEPS + 1):
                 optimizer.zero_grad(set_to_none=True)
                 inputs, labels, _ = oracle.preprocess_inputs(

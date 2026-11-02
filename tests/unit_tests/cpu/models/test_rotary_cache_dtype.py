@@ -45,7 +45,7 @@ def test_cache_precision_requires_fp32_application():
 
 
 def test_npu_norm_rejects_cpu_input():
-    from llmtuner.models.hf.model_setup import forward_npu_rms_norm
+    from llmtuner.models.hf.normalization_setup import forward_npu_rms_norm
 
     module = SimpleNamespace(weight=torch.ones(8), variance_epsilon=1e-6)
     with pytest.raises(RuntimeError, match="requires NPU"):

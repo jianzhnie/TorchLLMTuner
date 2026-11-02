@@ -35,30 +35,13 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh
-from torch.nn.attention.flex_attention import BlockMask, and_masks
+from torch.nn.attention.flex_attention import BlockMask
 from transformers.configuration_utils import PretrainedConfig
 
-from llmtuner.errors import UnsupportedCombinationError
-
 from ...accelerator.distributed import get_rank
-from ...components.loss import next_token_targets
 from ...datasets.contracts import Batch, TrainerBatch
-from ...parallel.context_parallel.input_sharding import (
-    shard_attention_mask_for_cp,
-    shard_batch_for_cp,
-    shard_batch_for_tp,
-    shard_padding_mask_for_cp,
-    shard_padding_mask_for_tp,
-)
 from ...parallel.topology import ParallelTopology
 from ...utils.logging import get_logger
-from ..common.attention.masks import (
-    build_dense_attention_mask,
-    create_attention_mask,
-    get_causal_mask_mod,
-    get_efficient_causal_mask_mod_for_packed_document,
-)
 from ..common.moe.layer import collect_moe_layers
 from .attention_backend import (
     ATTENTION_BACKEND,
@@ -68,17 +51,16 @@ from .attention_backend import (
     register_attention_backend,
     uses_deepseek_sparse_attention,
 )
+from .expert_kernels import stabilize_moe_experts, stabilize_moe_router
 from .factory import resolve_model_class, unwrap_text_config
 from .materialization import validate_rotary_initialization
 from .model_setup import (
     apply_cast_lm_head,
     configure_experts_implementation,
     resolve_submodule_name,
-    stabilize_moe_experts,
-    stabilize_moe_router,
-    stabilize_residual_norm_gradients,
     validate_head_config,
 )
+from .normalization_setup import stabilize_residual_norm_gradients
 
 logger = get_logger(__name__)
 
@@ -343,125 +325,6 @@ class HFTransformerModel(nn.Module):
         # discovers remaining state through its actual registered parent.
         yield "model", self.model
 
-    def _shard_for_cp(
-        self,
-        cp_mesh: DeviceMesh | None,
-        *,
-        packed: bool,
-        inputs: torch.Tensor,
-        labels: torch.Tensor,
-        positions: torch.Tensor | None,
-        padding_mask: torch.Tensor | None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        BlockMask | torch.Tensor | None,
-    ]:
-        """Steps 3-4 of ``preprocess_inputs``: mask full-length, then CP-shard.
-
-        Returns ``(inputs, labels, positions, padding_mask, attention_masks)``;
-        the last is ``None`` when no mask was built (CP on but not packed, or
-        the attention backend consumes masks on its own).
-        """
-        if cp_mesh is None:
-            attention_masks = None
-            if positions is not None:
-                mask = self.get_attention_masks(positions=positions)
-                if self.model.config._attn_implementation == ATTENTION_BACKEND:
-                    attention_masks = mask
-            return inputs, labels, positions, padding_mask, attention_masks
-
-        if positions is None:
-            # The forward's own ``arange`` default would restart at 0 on
-            # every rank; the shard needs positions that describe the whole
-            # sequence.
-            positions = torch.arange(inputs.numel(), device=inputs.device)
-        # A causal-only mask (a single document) can be rebuilt from this
-        # rank's positions shard, which is what ``_get_cp_attention_masks``
-        # does. Packed cannot: ``positions`` is about to be sharded and the
-        # document structure is not recoverable from a shard of it, so the
-        # full-length mask is built first. What happens to it next depends
-        # on the strategy: kv_allgather attends gathered full-length K/V
-        # against local queries, so the mask is Q-sharded to match (the GQA
-        # head count still divides by cp -- sharding Q does not change how
-        # many Q heads a rank owns); ulysses all-to-all's the FULL sequence
-        # onto every rank before attention, so the document mask stays
-        # full-length and unsharded -- the varlen semantics, where the
-        # document structure is global metadata that the token shard must
-        # not cut. Both decisions are config-keyed, hence rank-symmetric.
-        attention_masks = None
-        if packed:
-            if (
-                self._cp_strategy == "ulysses"
-                or getattr(self.model.config, "_cp_sdpa_dual", False)
-                or self.model.config._attn_implementation == CP_SDPA_BACKEND
-            ) and self.model.config._attn_implementation != ATTENTION_BACKEND:
-                attention_masks = build_dense_attention_mask(
-                    positions, dtype=self._mask_dtype(), block_causal=True
-                )
-                if self.model.config._attn_implementation == CP_SDPA_BACKEND:
-                    attention_masks = attention_masks == 0
-            else:
-                attention_masks = self.get_attention_masks(positions=positions)
-                if self._cp_strategy != "ulysses":
-                    attention_masks = shard_attention_mask_for_cp(
-                        attention_masks,
-                        getattr(self, "_cp_mask_mesh", cp_mesh),
-                        self._cp_load_balancer,
-                    )
-                if self.model.config._attn_implementation != ATTENTION_BACKEND:
-                    attention_masks = None
-        inputs, labels, positions = shard_batch_for_cp(
-            inputs,
-            labels,
-            positions,
-            cp_mesh,
-            load_balancer=self._cp_load_balancer,
-        )
-        if padding_mask is not None:
-            # The mask describes the same token stream, so it takes the
-            # same shard (load-balancer rearrangement included).
-            padding_mask = shard_padding_mask_for_cp(
-                padding_mask, cp_mesh, self._cp_load_balancer
-            )
-        return inputs, labels, positions, padding_mask, attention_masks
-
-    def _shard_for_tp(
-        self,
-        tp_mesh: DeviceMesh | None,
-        *,
-        inputs: torch.Tensor,
-        labels: torch.Tensor,
-        positions: torch.Tensor | None,
-        padding_mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Step 4b of ``preprocess_inputs``: the TP (sequence-parallel) shard.
-
-        Only the token-carrying tensors are cut; positions keep the CP-shard
-        (or, with CP off, full) length because attention and RoPE see the
-        sequence after the in-projection all-gather.
-        """
-        if tp_mesh is None:
-            return inputs, labels, positions, padding_mask
-        # Sequence parallelism premise (step 4b): cut the token-carrying
-        # tensors along the TP axis. Positions are NOT cut -- after the
-        # in-projection all-gather, RoPE and attention see the assembled
-        # sequence, so they keep the CP-shard (or, with CP off, full) length.
-        # Synthesize them full-length when the batch did not carry any: the
-        # forward's own ``arange`` default would be sized to the TP-sharded
-        # input and restart at 0 on every rank.
-        if positions is None:
-            positions = torch.arange(inputs.numel(), device=inputs.device)
-        if padding_mask is not None:
-            # Cut BEFORE the batch tensors: the mask's length still matches
-            # the pre-shard ``inputs``, which is what the divisibility
-            # check must measure.
-            padding_mask = shard_padding_mask_for_tp(padding_mask, tp_mesh)
-        inputs, labels = shard_batch_for_tp(inputs, labels, tp_mesh)
-        return inputs, labels, positions, padding_mask
-
     def preprocess_inputs(
         self,
         input_dict: Batch | TrainerBatch,
@@ -469,356 +332,20 @@ class HFTransformerModel(nn.Module):
         parallel_dims: ParallelTopology | None,
         max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Turn a dataloader batch into ``(inputs, labels, extra_kwargs)``.
+        """Normalize and shard a batch through the model input pipeline."""
+        from .input_preparation import preprocess_inputs
 
-        The seam torchtitan's trainer calls, and the reason it is on the model
-        rather than in the loop: every step below is a statement about *this*
-        architecture's input contract, and one of them needs the full-length
-        positions that only exist before the sequence is sharded.
-
-        1. **Normalize the batch shape.** The two loaders disagree about what a
-           batch is -- the synthetic one yields ``(B, T)`` rows of one document
-           each, a Grain one a flat packed stream -- so they are reconciled
-           here. ``num_valid_tokens`` is *not* read: the trainer pops it before
-           this call, because the loss denominator has to be the pre-shard count
-           and reduced across DP before the first backward.
-        2. **Collapse the batch dim**, turning ``(B, T)`` into the flat ``(B*T,)``
-           the forward takes.
-        3. **Build the attention mask**, when the batch carries ``positions``.
-           This has to happen before step 5: the document structure of a packed
-           batch is a global property, so the mask is built over the FULL
-           sequence and only then Q-sharded.
-        4. **Shard for context parallelism**, positions included, so RoPE
-           follows each token to its rank.
-        4b. **Shard for tensor parallelism** (sequence parallelism): the fused
-           TP GEMMs all-gather the sequence inside each projection, so the
-           forward must be entered holding only this rank's ``T / tp`` slice --
-           otherwise the gather concatenates ``tp`` copies of the full sequence
-           and every sharded weight gradient comes out ``tp`` times too large.
-           Only the token-carrying tensors (``inputs``, ``labels``) are cut:
-           after the in-projection gather, attention and RoPE see the assembled
-           sequence (the CP shard, or the full sequence with CP off), so
-           ``positions`` and the mask keep their CP/full length. This matches
-           torchtitan's joint ``(CP, TP)`` sequence sharding
-           (``hf_sharding.py``'s ``PartitionSpec(DP, (CP, TP), None)``): the CP
-           shard composed with a contiguous TP slice of it is exactly the joint
-           (CP outer, TP inner) split.
-        5. **Return the leftover dict as ``extra_kwargs``.** Those are splatted
-           into ``forward``, so anything left here must be one of its keyword
-           parameters -- ``positions``, ``attention_masks`` and
-           ``padding_mask``, and nothing else.
-
-        ``positions`` is optional: the synthetic source has none and the forward
-        falls back to its own ``arange``, which is right for a single document
-        but must not be relied on for a packed one. The CP load-balancer
-        setting is latched onto this wrapper by the context-parallel entry
-        point (see ``set_cp_mesh``).
-
-        The reference also takes ``max_num_documents``, to size a fixed-shape
-        varlen mask for CUDA graph capture. It is not accepted here because
-        there is no path for it to take: llmtuner's CP path goes through
-        ``create_attention_mask`` (a flex ``BlockMask``), which rebuilds from
-        the positions shard and takes no capacity bound, and the packing
-        collator already caps segments at one row. Accepting it would mean a
-        parameter the trainer passes and this method silently discards.
-
-        Tensors arrive on the trainer's device; the trainer moves them before
-        calling, so this is pure structure and stays device-free.
-        """
-        extra_kwargs: dict[str, Any] = {}
-        positions = None
-        padding_mask = None
-
-        if isinstance(input_dict, Batch):
-            # Rows are independent documents of length T.
-            labels = next_token_targets(
-                input_dict.labels.reshape(-1), seq_len=input_dict.labels.shape[-1]
-            )
-            inputs = input_dict.input_ids
-        else:
-            # This wrapper calls a text decoder, with no vision encoder or
-            # media/three-axis RoPE input path. Never train on placeholders
-            # while silently discarding the media they describe.
-            for field in (
-                "pixel_values",
-                "pixel_values_videos",
-                "grid_thw",
-                "grid_thw_videos",
-                "mrope_positions",
-            ):
-                if input_dict.get(field) is not None:
-                    raise UnsupportedCombinationError(
-                        f"HFTransformerModel cannot consume {field}: its text "
-                        "decoder does not implement multimodal inputs. Use a "
-                        "text dataset or a model adapter that consumes media "
-                        "and its positional metadata."
-                    )
-            # Packed stream: the collator already shifted and masked the labels
-            # at every document boundary, so for this path the shift is a read.
-            inputs, labels = input_dict["input"], input_dict["labels"]
-            positions = input_dict.get("positions")
-            # True-for-padding, from the collator; consumed by the MoE blocks'
-            # load-balancing statistics (see forward's ``padding_mask``).
-            padding_mask = input_dict.get("padding_mask")
-
-        row_length = (
-            inputs.shape[-1] if inputs.ndim == 2 and inputs.shape[0] > 1 else None
-        )
-        inputs, labels = inputs.reshape(-1), labels.reshape(-1)
-        if positions is not None:
-            positions = positions.reshape(-1)
-        if padding_mask is not None:
-            padding_mask = padding_mask.reshape(-1).to(torch.bool)
-
-        for name, value in (
-            ("labels", labels),
-            ("positions", positions),
-            ("padding_mask", padding_mask),
-        ):
-            if value is not None and value.numel() != inputs.numel():
-                raise ValueError(
-                    f"{name} has {value.numel()} tokens, but input has "
-                    f"{inputs.numel()}; batch token fields must have equal lengths"
-                )
-
-        # Whether the mask must be prebuilt full-length: a packed corpus
-        # (``block_causal``) carries a document structure that is not
-        # recoverable from a CP positions shard, so the mask must exist before
-        # the shard below. This is decided by ``attn_mask_type``, NOT by
-        # scanning ``positions`` for restarts: a restart scan misses the two
-        # shapes a real packed corpus produces -- a document that fills the
-        # whole row (the packing collator splits overlong documents into
-        # single-document rows, whose positions are a plain arange) and a
-        # boundary after a length-1 document (positions ``[0, 0, ...]`` have no
-        # descending edge). The first would crash the CP forward for lack of a
-        # prebuilt mask; the second would disarm the sdpa packed-guard and let
-        # attention cross the boundary silently.
-        packed = positions is not None and (
-            getattr(self.model.config, "attn_mask_type", "causal") == "block_causal"
-        )
-
-        # Built before the CP shard, always from the FULL-length positions --
-        # which is exactly why this lives here and not in the loop: after the
-        # shard below, no rank holds a positions vector that can describe the
-        # document structure. The prebuilt mask is then handed to the forward
-        # below where the kernel can consume it (the CP/ulysses path keys its
-        # dispatch off its Q length); otherwise ``_apply_attention`` rebuilds
-        # one from ``positions``.
-        cp_mesh = (
-            None if parallel_dims is None else parallel_dims.get_optional_mesh("cp")
-        )
-        row_attention_mask = None
-        if row_length is not None and cp_mesh is not None:
-            # KV SDPA slices a full boolean mask with the same contiguous Q
-            # offsets used by input sharding. Other kernels/load balancers
-            # need their own row-aware mask transport before accepting this.
-            if (
-                self.model.config._attn_implementation != CP_SDPA_BACKEND
-                or self._cp_strategy != "kv_allgather"
-                or self._cp_load_balancer is not None
-                or getattr(self.model.config, "_cp_sdpa_dual", False)
-            ):
-                raise UnsupportedCombinationError(
-                    "CP with multiple independent batch rows requires row-aware mask "
-                    "sharding; use KV SDPA without load balancing or one row per "
-                    "microbatch with gradient accumulation."
-                )
-            token_indices = torch.arange(inputs.numel(), device=inputs.device)
-            row_positions = token_indices.remainder(row_length)
-            if positions is None:
-                positions = row_positions
-            row_ids = token_indices // row_length
-            row_attention_mask = (
-                build_dense_attention_mask(
-                    positions if packed else row_positions,
-                    dtype=self._mask_dtype(),
-                    block_causal=True,
-                )
-                == 0
-            )
-            row_attention_mask = row_attention_mask & (
-                row_ids[:, None] == row_ids[None, :]
-            )
-        inputs, labels, positions, padding_mask, attention_masks = self._shard_for_cp(
-            cp_mesh,
-            packed=packed,
-            inputs=inputs,
-            labels=labels,
-            positions=positions,
-            padding_mask=padding_mask,
-        )
-        if row_attention_mask is not None:
-            attention_masks = row_attention_mask
-        if row_length is not None and cp_mesh is None:
-            # Flattening independent batch rows must not let later rows attend
-            # earlier rows, even when the configured corpus mask is causal.
-            row_positions = torch.arange(inputs.numel(), device=inputs.device)
-            row_positions = row_positions.remainder(row_length)
-            if positions is None:
-                positions = row_positions
-            if self.model.config._attn_implementation != ATTENTION_BACKEND:
-                attention_masks = build_dense_attention_mask(
-                    row_positions if not packed else positions,
-                    dtype=self._mask_dtype(),
-                    block_causal=True,
-                )
-            else:
-                mask_mod = and_masks(
-                    get_causal_mask_mod(),
-                    get_efficient_causal_mask_mod_for_packed_document(
-                        row_positions if not packed else positions
-                    ),
-                )
-                attention_masks = create_attention_mask(
-                    mask_mod,
-                    B=1,
-                    H=None,
-                    Q_LEN=inputs.numel(),
-                    KV_LEN=inputs.numel(),
-                    device=inputs.device,
-                    BLOCK_SIZE=128,
-                    separate_full_blocks=True,
-                )
-        if attention_masks is not None:
-            extra_kwargs["attention_masks"] = attention_masks
-
-        tp_mesh = (
-            None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
-        )
-        inputs, labels, positions, padding_mask = self._shard_for_tp(
-            tp_mesh,
-            inputs=inputs,
-            labels=labels,
-            positions=positions,
-            padding_mask=padding_mask,
-        )
-
-        if positions is not None:
-            extra_kwargs["positions"] = positions
-        if padding_mask is not None:
-            extra_kwargs["padding_mask"] = padding_mask
-        return inputs, labels, extra_kwargs
-
-    def _mask_dtype(self) -> torch.dtype:
-        """Dtype for a dense attention mask: the one the hidden states carry.
-
-        The embedding is the natural source, but only the first pipeline stage
-        holds one -- later stages replace ``tok_embeddings`` with
-        ``nn.Identity`` -- so fall back to the head, then to the decoder's own
-        parameters. All of them are the config's dtype, which is what makes any
-        of them a valid answer.
-        """
-        for module in (self.tok_embeddings, self.lm_head):
-            weight = getattr(module, "weight", None)
-            if weight is not None:
-                return weight.dtype
-        for parameter in self.parameters():
-            return parameter.dtype
-        raise ValueError(
-            "cannot derive a dense attention mask's dtype: the model holds no "
-            "embedding, head or parameter on this stage"
+        return preprocess_inputs(
+            self,
+            input_dict,
+            parallel_dims=parallel_dims,
+            max_context_length=max_context_length,
         )
 
     def get_attention_masks(self, positions: torch.Tensor) -> BlockMask | torch.Tensor:
-        """Build this batch's attention mask: a flex BlockMask, or a dense one.
+        from .attention_masks import get_attention_masks
 
-        A dense mask's dtype has to match the hidden states it is added to;
-        ``_mask_dtype`` answers that without assuming the stage holds an
-        embedding (pipeline stages after the first are ``nn.Identity`` there).
-
-        ``attn_mask_type`` selects between plain causal and causal-plus-same-
-        document. The latter is the packed path: samples share one sequence, so
-        attention must not cross a document boundary (positions reset to 0
-        there). Both cases return a BlockMask -- with no mask at all flex would
-        compute full attention.
-
-        A DSA model gets a dense 4D additive mask instead: its own attention
-        code reads the mask as a tensor (see ``uses_dsa``). ``attn_mask_type``
-        means the same thing there -- plain causal vs causal-and-same-document
-        -- so the two families cannot disagree about what "block_causal" allows.
-        """
-        block_causal = (
-            getattr(self.model.config, "attn_mask_type", "causal") == "block_causal"
-        )
-        if self.uses_dsa:
-            return build_dense_attention_mask(
-                positions,
-                dtype=self._mask_dtype(),
-                block_causal=block_causal,
-            )
-        if block_causal:
-            mask_mod = and_masks(
-                get_causal_mask_mod(),
-                get_efficient_causal_mask_mod_for_packed_document(positions),
-            )
-        else:
-            mask_mod = get_causal_mask_mod()
-
-        num_tokens = positions.shape[0]
-        return create_attention_mask(
-            mask_mod,
-            B=1,
-            H=None,
-            Q_LEN=num_tokens,
-            KV_LEN=num_tokens,
-            device=positions.device,
-            BLOCK_SIZE=128,
-            separate_full_blocks=True,
-        )
-
-    def _get_cp_attention_masks(self, positions: torch.Tensor) -> BlockMask:
-        """Build the BlockMask for a CP forward: full-length, strategy-shaped.
-
-        Under CP, ``positions`` is this rank's shard of the sequence (possibly
-        load-balancer-rearranged), so it cannot describe the full document
-        structure: the mask is built over the FULL sequence. kv_allgather then
-        needs it sharded along its Q axis, matching how the CP kernel's
-        gathered K/V stay full-length. Ulysses needs it as built: its
-        all-to-all reassembles the full sequence before attention, and the
-        kernel would only discard a Q-sharded mask and rebuild this very one.
-        ``get_attention_masks`` builds the full mask from an arange -- valid
-        because only the causal mod is taken here.
-
-        Packed batches (``block_causal``) cannot take this path: the document
-        mask needs the full positions, which only the caller has. Build the
-        full-length mask with ``get_attention_masks(full_positions)`` and pass
-        it as ``attention_masks`` -- Q-sharded by ``shard_attention_mask_for_cp``
-        for kv_allgather, full-length and unsharded for ulysses.
-        """
-        if self.uses_dsa:
-            # A dense mask is built, not modded, and CP shards masks by
-            # rewriting a BlockMask's indices (shard_attention_mask_for_cp takes
-            # a BlockMask and nothing else). Sharding the dense tensor instead
-            # would mean slicing Q and keeping KV full by hand -- unverified,
-            # and silently wrong if the load balancer permutes the shard, so it
-            # is refused rather than guessed at.
-            raise UnsupportedCombinationError(
-                "Context parallel with a DSA (dense-mask) model is not "
-                "implemented: the CP mask path shards a flex BlockMask, and a "
-                "dense additive mask has to be sliced by hand. Unlock by "
-                "sharding the dense mask Q-axis (load balancer included) and "
-                "re-validating numerics on multiple ranks."
-            )
-        if getattr(self.model.config, "attn_mask_type", "causal") == "block_causal":
-            raise ValueError(
-                "Context parallel with packed sequences needs a prebuilt mask: "
-                "build the full-length BlockMask with get_attention_masks from "
-                "the FULL positions and pass it to forward as attention_masks "
-                "-- Q-sharded with shard_attention_mask_for_cp under "
-                "'kv_allgather', or full-length (unsharded) under 'ulysses', "
-                "whose all-to-all reassembles the full sequence on every rank. "
-                "The positions this forward receives are already CP-sharded and "
-                "cannot describe the full document structure."
-            )
-        cp_size = self.cp_mesh.size()
-        full_len = positions.shape[0] * cp_size
-        full_positions = torch.arange(full_len, device=positions.device)
-        mask = self.get_attention_masks(positions=full_positions)
-        if self._cp_strategy == "ulysses":
-            return mask
-        return shard_attention_mask_for_cp(
-            mask, getattr(self, "_cp_mask_mesh", self.cp_mesh), self._cp_load_balancer
-        )
+        return get_attention_masks(self, positions)
 
     # -- forward ---------------------------------------------------------------
 
@@ -1043,7 +570,9 @@ class HFTransformerModel(nn.Module):
             if self.cp_mesh is None:
                 attention_masks = self.get_attention_masks(positions=positions)
             else:
-                attention_masks = self._get_cp_attention_masks(positions)
+                from .attention_masks import get_cp_attention_masks
+
+                attention_masks = get_cp_attention_masks(self, positions)
 
         # is_causal is the flex-only spelling: it selects which mod the BlockMask
         # runs, so it is withheld from every other backend (see below).
@@ -1071,10 +600,12 @@ class HFTransformerModel(nn.Module):
         # The mask is built at ``positions``' length, which under TP sequence
         # parallelism is the *gathered* length the TP boundary attends over.
         if getattr(self.model.config, "attn_mask_type", "causal") == "block_causal":
+            from .attention_masks import build_dense_attention_mask, mask_dtype
+
             return {
                 "attention_mask": build_dense_attention_mask(
                     positions,
-                    dtype=self._mask_dtype(),
+                    dtype=mask_dtype(self),
                     block_causal=True,
                 )
             }

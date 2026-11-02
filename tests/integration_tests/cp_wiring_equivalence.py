@@ -41,6 +41,7 @@ each rank's own shard only.
 
 from __future__ import annotations
 
+import inspect
 from unittest import mock
 
 import torch
@@ -293,6 +294,8 @@ def _uncompiled_create_attention_mask(*args, **kwargs):
     """
     from torch.nn.attention.flex_attention import create_block_mask
 
+    if "separate_full_blocks" not in inspect.signature(create_block_mask).parameters:
+        kwargs.pop("separate_full_blocks", None)
     return create_block_mask(*args, **kwargs)
 
 
@@ -342,7 +345,7 @@ def _check_preprocess_inputs_matches(mesh, failures: list[str]) -> float:
             return mesh["cp"] if name == "cp" else None
 
     with mock.patch(
-        "llmtuner.models.hf.model.create_attention_mask",
+        "llmtuner.models.hf.attention_masks.create_attention_mask",
         _uncompiled_create_attention_mask,
     ):
         inputs, out_labels, extra = model.preprocess_inputs(

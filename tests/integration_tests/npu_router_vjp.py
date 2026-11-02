@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import torch
 
-from llmtuner.models.hf.model_setup import forward_fp32_topk_router
+from llmtuner.models.hf.expert_kernels import forward_fp32_topk_router
 from llmtuner.utils.seeding import set_deterministic_algorithms
 from tests.caps import require_env
 

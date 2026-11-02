@@ -21,7 +21,7 @@ Two variants, selected by env var:
   T/tp sequence shard (the sequence-parallelism premise); chunking that local
   shard composes with the sum reduction, and the replicated lm_head's
   token-partial gradient is summed by the trainer's
-  ``_allreduce_replicated_tp_grads``. This variant compares the loss
+  ``allreduce_replicated_tp_grads``. This variant compares the loss
   trajectory only (the TP weight-layout comparison is tp_equivalence.py's
   job, not this one's).
 

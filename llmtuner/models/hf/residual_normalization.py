@@ -123,7 +123,7 @@ def forward_joint_residual_norm(
 
 
 def _validate_norm_hooks(module: nn.Module) -> None:
-    from .model_setup import _isolate_norm_input
+    from .normalization_setup import _isolate_norm_input
 
     if (
         any(

@@ -21,7 +21,7 @@ from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.parallel.topology import ParallelTopology
-from llmtuner.trainer.trainer import Trainer
+from llmtuner.trainer.runtime.gradients import allreduce_fsdp_excluded_grads
 
 
 class Model(nn.Module):
@@ -88,7 +88,7 @@ def main():
                     torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
                     (actual.square().sum() / 16).backward()
             sum(losses).backward()
-            Trainer._allreduce_fsdp_excluded_grads(runtime)
+            allreduce_fsdp_excluded_grads(runtime)
             for name, parameter in model.named_parameters():
                 expected = dict(reference.named_parameters())[name]
                 if expected.grad is None:

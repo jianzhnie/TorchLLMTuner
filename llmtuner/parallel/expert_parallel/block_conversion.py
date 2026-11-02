@@ -130,7 +130,7 @@ def convert_block(
 
     num_expert_groups, num_limited_groups = read_expert_groups(block, router_gate)
     from ...accelerator.device import device_type
-    from ...models.hf.model_setup import forward_torchtitan_moe
+    from ...models.hf.expert_kernels import forward_torchtitan_moe
 
     original_forward = block.__dict__.get("_tp_moe_original_forward", block.forward)
     baseline_npu = (

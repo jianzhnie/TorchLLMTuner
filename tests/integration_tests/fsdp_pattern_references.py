@@ -23,7 +23,7 @@ from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.parallel.topology import ParallelTopology
-from llmtuner.trainer.trainer import Trainer
+from llmtuner.trainer.runtime.gradients import allreduce_fsdp_excluded_grads
 
 
 def main():
@@ -92,7 +92,7 @@ def main():
                 torch.testing.assert_close(
                     excluded_weight.grad, local_grad, atol=1e-12, rtol=1e-12
                 )
-            Trainer._allreduce_fsdp_excluded_grads(
+            allreduce_fsdp_excluded_grads(
                 SimpleNamespace(parallel_dims=dims, model_parts=[model])
             )
             sum(value.square().sum() for value in expected).backward()

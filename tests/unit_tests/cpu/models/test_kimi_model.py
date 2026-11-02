@@ -2,8 +2,22 @@
 
 import torch
 
+from llmtuner.config import LLMTunerConfig, ModelConfig
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
+
+
+def test_registered_kimi_architecture_builds_from_training_config():
+    from llmtuner.models.hf.factory import build_model_config_for, resolve_model_class
+    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.model import KimiLinearForCausalLM
+
+    config = build_model_config_for(
+        LLMTunerConfig(model=ModelConfig(model_name_or_path="kimi_linear"))
+    )
+
+    assert isinstance(config, KimiLinearConfig)
+    assert resolve_model_class(config) is KimiLinearForCausalLM
 
 
 def test_kimi_dense_kda_wrapper_training_and_state_roundtrip():

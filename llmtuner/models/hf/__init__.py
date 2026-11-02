@@ -6,12 +6,15 @@ Main modules:
   hub id or local checkpoint) and resolves the ``ForCausalLM`` class.
 * ``materialization.py`` -- allocates meta model storage after parallelism,
   rebuilds runtime buffers, and restores shared parameter and buffer aliases.
-* ``model_setup.py`` -- validates attention heads and experts kernels, resolves
-  decoder submodule names, and applies the optional lm-head dtype cast.
+* ``model_setup.py`` -- generic structure probes, head validation, and optional
+  experts/lm-head construction settings. Qwen-specific policies live in
+  ``normalization_setup.py`` and ``expert_kernels.py``.
+* ``input_preparation.py`` -- normalizes batches and applies CP/TP input shards.
 * ``attention_backend.py`` -- selects and registers the HF attention adapter.
+* ``attention_masks.py`` -- builds dense, Flex, and CP attention masks.
 * ``model.py`` -- ``HFTransformerModel``: the five-part contract
-  (``tok_embeddings`` / ``layers`` / ``norm`` / ``lm_head`` / ``rotary_emb``),
-  the packed-document attention wiring, and the forward the trainer calls.
+  (``tok_embeddings`` / ``layers`` / ``norm`` / ``lm_head`` / ``rotary_emb``)
+  and the decoder forward the trainer calls.
   This is the consumer of everything else here, and its name follows upstream's
   ``experiments/transformers_modeling_backend/model.py``.
 * ``flops.py`` -- training FLOPs per token, the MFU denominator. Pure

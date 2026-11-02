@@ -22,7 +22,7 @@ from torch.nn import functional as F
 
 from llmtuner.config import ParallelConfig
 from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp
-from llmtuner.trainer.trainer import Trainer
+from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 
 PARSER = argparse.ArgumentParser()
 PARSER.add_argument("--router-fp64", action="store_true")
@@ -183,7 +183,7 @@ try:
         torch.testing.assert_close(
             local_x.grad, oracle_grad.chunk(2, dim=1)[rank], rtol=1e-9, atol=1e-10
         )
-        Trainer._allreduce_replicated_tp_grads(trainer)
+        allreduce_replicated_tp_grads(trainer)
         for name, parameter in model.named_parameters():
             torch.testing.assert_close(
                 parameter.grad, expected_gradients[name], rtol=1e-9, atol=1e-10

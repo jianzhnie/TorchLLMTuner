@@ -46,7 +46,7 @@ def isolated_backward(*, norm_override=None):
     from llmtuner.config.compile_config import CompileConfig
     from llmtuner.models.hf.factory import build_model_config
     from llmtuner.models.hf.model import HFTransformerModel
-    from llmtuner.models.hf.model_setup import _isolate_norm_input
+    from llmtuner.models.hf.normalization_setup import _isolate_norm_input
     from llmtuner.parallel.model_compile import apply_compile
 
     torch.set_num_threads(1)
@@ -857,8 +857,11 @@ def run():
                 global_valid_tokens=global_valid_tokens,
             )
 
-        clip = trainer._clip_and_check_finite
         from torch.distributed.fsdp._fully_shard import _fsdp_param_group
+
+        from llmtuner.trainer.runtime import gradients
+
+        clip = gradients.clip_and_check_finite
 
         reduce = _fsdp_param_group.foreach_reduce
         reductions = {}
@@ -909,7 +912,7 @@ def run():
         with (
             patch.object(trainer.optimizer, "step", observed_update),
             patch.object(trainer, "_forward_backward_body", observed_body),
-            patch.object(trainer, "_clip_and_check_finite", observed_clip),
+            patch.object(gradients, "clip_and_check_finite", observed_clip),
             patch.object(trainer, "loss_sum", observed_loss),
             patch.object(_fsdp_param_group, "foreach_reduce", observed_reduce),
         ):

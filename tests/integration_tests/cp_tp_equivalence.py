@@ -12,7 +12,7 @@ harness ran both axes at once, so every one of those couplings was unverified.
   is ``H / (tp * cp)`` -- not ``H / cp``.
 * ``shard_batch_for_tp`` slices the *CP shard*, so a TP slice must land inside
   this rank's CP block rather than across the whole sequence.
-* ``_allreduce_replicated_tp_grads`` sums the gradients of TP-replicated
+* ``allreduce_replicated_tp_grads`` sums the gradients of TP-replicated
   parameters (embedding, norms, head), which under CP are also CP-partial.
 * The trainer's loss mesh is ``(dp, cp, tp)``, while the denominator is a
   dp-only sum of the *unsharded* batch's token count.

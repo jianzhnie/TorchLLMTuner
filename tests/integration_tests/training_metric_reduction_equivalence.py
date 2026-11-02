@@ -12,6 +12,7 @@ import torch.distributed as dist
 from llmtuner.accelerator.collectives import all_reduce
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.parallel.topology import ParallelTopology
+from llmtuner.trainer.runtime.metrics import build_step_metrics
 from llmtuner.trainer.runtime.reductions import resolve_training_reduction_meshes
 from llmtuner.trainer.trainer import Trainer
 from tests.integration_tests.harness import init_distributed
@@ -52,7 +53,8 @@ def main():
                 trainer.ntokens_seen = 7
                 trainer.model_parts = []
                 metrics = (
-                    trainer._step_metrics(
+                    build_step_metrics(
+                        trainer,
                         accumulated_loss=torch.tensor(
                             shard_sums[dp][coordinate], dtype=dtype, device=device
                         ),

@@ -10,7 +10,7 @@ This pins the other half of the seam the sequence-parallelism premise opens:
 parameters TP does not shard (the token embedding, the RMSNorms, the LM head)
 see only this rank's ``T / tp`` token shard per forward, so their gradients
 are partial and nothing inside the TP modules reduces them. The trainer's
-``_allreduce_replicated_tp_grads`` (called after backward, before clipping)
+``allreduce_replicated_tp_grads`` (called after backward, before clipping)
 sums them across the TP group.
 
 The check trains both sides with SGD for a few steps and compares, per step:
@@ -42,6 +42,7 @@ from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     RowParallelLinear,
 )
 from llmtuner.parallel.topology import ParallelTopology, build_device_mesh
+from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 from llmtuner.trainer.trainer import Trainer
 from tests.integration_tests.harness import (
     backend,
@@ -148,7 +149,7 @@ def main() -> None:
         # gradient covers only its own token shard.
         pre = replicated["model.model.embed_tokens.weight"].grad.clone()
 
-        trainer._allreduce_replicated_tp_grads()
+        allreduce_replicated_tp_grads(trainer)
 
         want_loss = _loss_sum(
             logits_ref[rank * half : (rank + 1) * half],

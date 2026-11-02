@@ -71,9 +71,10 @@ llmtuner/
   trainer/
     cli.py                      参数解析与进程组生命周期
     trainer.py                  训练、验证、优化器更新和状态恢复编排
-    runtime/                    装配、batch、PP、validation 和归约辅助逻辑
+    runtime/                    装配、batch、PP、validation、梯度、指标和归约
   models/
-    hf/                         HF 构造、包装、物化与 state-dict 适配
+    architecture.py             自定义 HF 架构的轻量注册接缝
+    hf/                         HF 构造、包装、输入/mask、物化与 state-dict 适配
     common/                     通用 attention、MoE、投影和嵌入构件
     kimi/                       Kimi Linear 专用模型与布局适配
   parallel/
@@ -181,7 +182,28 @@ Trainer 装配时解析 HF 架构并同步模型尺寸；CLI 解析本身不读�
    `tok_embeddings / layers / norm / lm_head / rotary_emb`。
    这只是遍历视图，不重注册模块，也不改变 state-dict key。
 3. **TP plan**：`tp_plan` 将 HF `_tp_plan` 重写为 wrapper 内的实际模块路径。
-   plan 是纯数据，因此不需要额外的模型 registry。
+   plan 是纯数据，不需要模型基类或递归物化协议。
+
+`input_preparation.py` 负责 batch 规范化与 CP/TP 输入切分，`attention_masks.py`
+负责 dense/Flex/CP mask，`model_setup.py` 只保留通用构造探测；模型专用策略位于
+独立 kernel/setup 模块。`models/architecture.py` 是自定义 HF 架构的注册接缝，
+model-class loader 保持惰性，不让配置解析导入完整模型。原生 HF 架构无需注册，
+自定义架构按下列方式注册一次：
+
+```python
+from llmtuner.models.architecture import (
+    ModelArchitecture,
+    register_model_architecture,
+)
+
+register_model_architecture(
+    ModelArchitecture.from_types(
+        "my_model",
+        config_type=MyModelConfig,
+        model_class_loader=lambda: MyModelForCausalLM,
+    )
+)
+```
 
 HF checkpoint 键转换由 state-dict adapter 负责，不能隐藏在 `named_children()` 中。
 
@@ -308,6 +330,8 @@ DataLoader -> Batch
 PP 下由 schedule 驱动 microbatch forward/backward。validation 使用 eval 模式和
 `no_grad`，复用对应的单模型或 PP 驱动，不更新参数，也不推进训练 token 计数。
 有限数据、零有效 token 以及 DP>1 时的 `validation.steps=-1` 有各自明确约束。
+梯度归约、裁剪与指标分别由 `trainer/runtime/gradients.py` 和 `metrics.py`
+实现；裁剪前诊断通过 `Trainer.before_gradient_clipping()` 扩展，不覆盖训练步。
 
 ### 6.2 数据与 mask
 

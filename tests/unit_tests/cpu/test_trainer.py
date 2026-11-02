@@ -89,7 +89,7 @@ def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_
         )
 
     trainer = Trainer.__new__(Trainer)
-    trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1)
+    trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1, max_norm=1.0)
     trainer.parallel_dims = None
     trainer.device = torch.device("cpu")
     trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -97,14 +97,13 @@ def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_
     trainer.checkpointer = SimpleNamespace(maybe_wait_for_staging=finish_staging)
     trainer.model_parts = [model]
     trainer.ema = None
+    trainer.step = 0
     trainer.should_log = lambda: False
     trainer.microbatch = lambda batch: {
         "batch": batch,
         "num_valid_tokens": 1,
         "num_routing_tokens": 1,
     }
-    trainer._allreduce_replicated_tp_grads = lambda: None
-    trainer._clip_and_check_finite = lambda **kwargs: torch.tensor(1.0)
 
     def forward_backward(*args, **kwargs):
         inputs = (
@@ -164,7 +163,6 @@ def test_nonfinite_step_preserves_model_optimizer_scheduler_and_ema(invalid):
         "num_valid_tokens": 1,
         "num_routing_tokens": 1,
     }
-    trainer._allreduce_replicated_tp_grads = lambda: None
 
     def forward_backward(*args, **kwargs):
         loss = model(torch.ones(1, 2)).sum()

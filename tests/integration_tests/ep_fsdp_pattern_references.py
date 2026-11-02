@@ -25,7 +25,7 @@ from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.parallel.topology import ParallelTopology
-from llmtuner.trainer.trainer import Trainer
+from llmtuner.trainer.runtime.gradients import allreduce_fsdp_excluded_grads
 
 
 def check_training(model, reference, dims):
@@ -49,7 +49,7 @@ def check_training(model, reference, dims):
                 torch.testing.assert_close(output, expected, atol=1e-6, rtol=1e-6)
                 (output.square().sum() / world).backward()
         sum(losses).backward()
-        Trainer._allreduce_fsdp_excluded_grads(runtime)
+        allreduce_fsdp_excluded_grads(runtime)
         source = reference.layers[0].mlp.experts
         weights = source.gate_up_proj.detach().chunk(2, dim=0)[ep_rank].chunk(2, dim=1)
         gradients = source.gate_up_proj.grad.chunk(2, dim=0)[ep_rank].chunk(2, dim=1)
