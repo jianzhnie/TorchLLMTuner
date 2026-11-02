@@ -62,6 +62,9 @@ agent 定义与可复用技能。agents 采用 thin proxy 模式 —— agent �
 | `skills/dev-guide/SKILL.md` | 仓库开发指南（本仓库原有） |
 | `skills/karpathy-guidelines/SKILL.md` | Karpathy 风格开发准则（本仓库原有） |
 | `skills/add-unit-test/SKILL.md` | `tests/unit_tests/cpu/` 单测编写 how-to：pytest 风格、命名、mock 分布式通信 |
+| `skills/code-refactor/SKILL.md` | 系统性重构入口：按模块分批优化 `llmtuner/` 结构，行为不变前提下去冗余、消除浅包装 |
+| `skills/code-refactor/references/principles-and-boundaries.md` | 各层职责边界与七条重构原则（行为不变优先，命名与归位规则） |
+| `skills/code-refactor/references/verification.md` | 每模块验证：五条门禁命令、模块级全面测试、四项完成判据 |
 | `skills/parallel-strategy-analyzer/SKILL.md` | 并行策略推荐入口：三阶段流程，输出 FSDP/TP/PP/CP/EP 组合与配置 |
 | `skills/parallel-strategy-analyzer/references/io-contract.md` | 策略分析的输入表与输出契约 |
 | `skills/parallel-strategy-analyzer/references/memory-estimation.md` | 显存估算公式（模型状态、激活、五种 AC 模式、CPU offload） |
