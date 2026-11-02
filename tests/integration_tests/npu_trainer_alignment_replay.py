@@ -177,7 +177,6 @@ def main() -> None:
             "LLMTUNER_ALIGNMENT_REMOVE_NORM_VIEWS",
             "LLMTUNER_ALIGNMENT_BASELINE_NORM_ORDER",
             "LLMTUNER_ALIGNMENT_MODULE_TRACE",
-            "LLMTUNER_ALIGNMENT_INNER_TRACE",
             "LLMTUNER_ALIGNMENT_FLEX_ATTENTION",
         )
         if any(os.environ.get(name) == "1" for name in debug_only_switches):
@@ -455,27 +454,35 @@ def main() -> None:
             ):
                 modules[f"layer{index}.{name}"] = getattr(layer.self_attn, attribute)
         module_trace, module_handles = observe_first_step_modules(trainer, modules)
-        if os.environ.get("LLMTUNER_ALIGNMENT_INNER_TRACE") == "1":
-            from transformers.integrations.sdpa_attention import sdpa_attention_forward
-            from transformers.modeling_utils import AttentionInterface
+    if os.environ.get("LLMTUNER_ALIGNMENT_INNER_TRACE") == "1":
+        if not module_handles:
+            raise ValueError("Inner attention trace requires module tracing")
+        from transformers.integrations.sdpa_attention import sdpa_attention_forward
+        from transformers.modeling_utils import AttentionInterface
 
-            def traced_sdpa(module, query, key, value, attention_mask, **kwargs):
-                if trainer.step == 1:
-                    prefix = f"layer{module.layer_idx}.inner_attention"
-                    for suffix, tensor in (
-                        ("input", query),
-                        ("input1", key),
-                        ("input2", value),
-                    ):
-                        module_trace[f"{prefix}.{suffix}"] = (
-                            tensor.transpose(1, 2).detach().cpu().clone()
-                        )
-                return sdpa_attention_forward(
-                    module, query, key, value, attention_mask, **kwargs
-                )
+        def traced_sdpa(module, query, key, value, attention_mask, **kwargs):
+            prefix = f"layer{module.layer_idx}.inner_attention"
+            capture = trainer.step == 1 and (
+                not selection or f"layer{module.layer_idx}.attention" in modules
+            )
+            if capture:
+                for suffix, tensor in (
+                    ("input", query),
+                    ("input1", key),
+                    ("input2", value),
+                ):
+                    module_trace[f"{prefix}.{suffix}"] = (
+                        tensor.transpose(1, 2).detach().cpu().clone()
+                    )
+            output = sdpa_attention_forward(
+                module, query, key, value, attention_mask, **kwargs
+            )
+            if capture:
+                module_trace[f"{prefix}.output"] = output[0].detach().cpu().clone()
+            return output
 
-            assert model.model.config._attn_implementation == "sdpa"
-            AttentionInterface.register("sdpa", traced_sdpa)
+        assert model.model.config._attn_implementation == "sdpa"
+        AttentionInterface.register("sdpa", traced_sdpa)
     if os.environ.get("LLMTUNER_ALIGNMENT_FLEX_ATTENTION") == "1":
         importlib.import_module("torchtitan_npu")
         from torch.nn.attention.flex_attention import create_block_mask, flex_attention

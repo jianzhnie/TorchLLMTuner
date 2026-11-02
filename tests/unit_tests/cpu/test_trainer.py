@@ -1182,9 +1182,10 @@ def test_preprocess_inputs_shifts_the_synthetic_labels_within_a_row() -> None:
     assert int((labels == IGNORE_INDEX).sum()) == 3
     # And the surviving pairs are the intra-row ones.
     assert torch.equal(labels.reshape(-1, 4)[:, :3], batch.labels[:, 1:])
-    # The synthetic source carries no positions, so the forward's own arange
-    # default applies -- right for one document, and not for a packed one.
-    assert extra_kwargs == {}
+    # Independent rows restart positions and carry an isolation mask; otherwise
+    # flattening the batch would let later rows attend to earlier documents.
+    assert extra_kwargs.keys() == {"positions", "attention_masks"}
+    torch.testing.assert_close(extra_kwargs["positions"], torch.arange(4).repeat(3))
 
 
 def test_preprocess_inputs_reads_the_grain_batch_without_consuming_it() -> None:

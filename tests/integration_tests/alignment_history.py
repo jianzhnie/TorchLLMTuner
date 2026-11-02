@@ -41,13 +41,21 @@ class AlignmentHistory(Sequence):
             return [self[item] for item in range(*index.indices(self.count))]
         index = self._index(index)
         return torch.load(
-            self.root / f"step-{index + 1}.pt", map_location="cpu", weights_only=False
+            self.root / f"step-{index + 1}.pt",
+            map_location="cpu",
+            weights_only=False,
+            mmap=True,
         )
 
     def __setitem__(self, index: int, value: Any) -> None:
         if not self.writable:
             raise TypeError("Alignment history is read-only")
-        torch.save(value, self.root / f"step-{self._index(index) + 1}.pt")
+        path = self.root / f"step-{self._index(index) + 1}.pt"
+        temporary = path.with_name(f".{path.name}.tmp")
+        # Readers may still hold mmap views of the previous observation.
+        # Truncating that inode in place can SIGBUS while serializing value.
+        torch.save(value, temporary)
+        temporary.replace(path)
 
     def append(self, value: Any) -> None:
         if not self.writable:

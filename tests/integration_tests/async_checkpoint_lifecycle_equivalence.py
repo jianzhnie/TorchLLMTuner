@@ -6,7 +6,10 @@
 Uses the production optimizer/scheduler containers. Add --fsdp for sharded
 parameters and --async-mode async_with_pinned_mem for process uploads with
 pinned staging. The harness selects CPU/Gloo or NPU/HCCL. Cross-node runs
-require a shared TMPDIR; accelerator staging requires an accelerator run.
+require --checkpoint-root on a shared filesystem. Keep TMPDIR local: PROCESS
+workers use it for host-local multiprocessing sockets. Accelerator staging
+requires an accelerator run; requesting pinned memory does not prove the
+installed PyTorch stager actually supports accelerator-pinned memory.
 """
 
 import argparse
@@ -61,6 +64,10 @@ def main():
     parser.add_argument(
         "--async-mode", choices=("async", "async_with_pinned_mem"), default="async"
     )
+    parser.add_argument(
+        "--checkpoint-root",
+        help="Shared parent for checkpoint artifacts; TMPDIR stays local",
+    )
     args = parser.parse_args()
     device = init_distributed()
     active = []
@@ -81,7 +88,11 @@ def main():
             return model
 
         rank = dist.get_rank()
-        context = TemporaryDirectory() if rank == 0 else nullcontext(None)
+        context = (
+            TemporaryDirectory(dir=args.checkpoint_root)
+            if rank == 0
+            else nullcontext(None)
+        )
         with context as root:
             paths = [root]
             dist.broadcast_object_list(paths, src=0)

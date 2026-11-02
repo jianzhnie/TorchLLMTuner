@@ -1,7 +1,9 @@
-"""Diagnose converted baseline MoE with production sequence-parallel hooks.
+"""Diagnose converted MoE with the plugin's sequence-sharded parallel plan.
 
 This diagnostic records differences; exit zero means the probe completed,
 not that cross-framework numerical acceptance passed. No baseline source is patched.
+Qwen3 currently uses the upstream llama4 MoE plan, so this probe does not
+reproduce its complete production assembly or output redistribution boundary.
 """
 
 import argparse
@@ -16,7 +18,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from tests.caps import require_env
 
@@ -24,7 +26,11 @@ from tests.caps import require_env
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--replicated-input-control", action="store_true")
+    parser.add_argument("--expert-parallel", action="store_true")
     args = parser.parse_args()
+    if args.expert_parallel and args.replicated_input_control:
+        parser.error("replicated-input control currently covers TP-only experts")
     require_env("torch_npu")
     importlib.import_module("torchtitan_npu")
     from torchtitan.models.common.linear import Linear
@@ -41,7 +47,7 @@ def main():
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl")
     try:
-        assert dist.get_world_size() == 2
+        assert dist.get_world_size() == (4 if args.expert_parallel else 2)
         rank = dist.get_rank()
         for backend in (torch.npu.matmul, torch.npu.conv, torch.npu.aclnn):
             backend.allow_hf32 = False
@@ -91,9 +97,66 @@ def main():
             ]
             return partials[0] + partials[1]
 
-        oracle.experts.forward = MethodType(feature_partial_reference, oracle.experts)
-        mesh = init_device_mesh("npu", (2,), mesh_dim_names=("tp",))
-        apply_sequence_sharded_moe_ep_tp(root, mesh, None, None, None)
+        if not args.expert_parallel:
+            oracle.experts.forward = MethodType(
+                feature_partial_reference, oracle.experts
+            )
+        full_mesh = init_device_mesh(
+            "npu",
+            (2, 2) if args.expert_parallel else (2,),
+            mesh_dim_names=("dp", "tp") if args.expert_parallel else ("tp",),
+        )
+        mesh = full_mesh["tp"]
+        ep_mesh = full_mesh["dp", "tp"]._flatten("ep") if args.expert_parallel else None
+        if args.replicated_input_control:
+            # Diagnostic only: feed every feature shard the same full sequence,
+            # then select the original local sequence at the output boundary.
+            # Do not patch the installed baseline or call this production parity.
+            from torch.distributed.tensor.parallel import (
+                PrepareModuleInputOutput,
+                parallelize_module,
+            )
+            from torchtitan.distributed.expert_parallel import TensorParallel
+
+            parallelize_module(
+                block,
+                mesh,
+                {
+                    "moe": PrepareModuleInputOutput(
+                        input_layouts=(Shard(1),),
+                        desired_input_layouts=(Replicate(),),
+                        use_local_input=True,
+                        output_layouts=(Replicate(),),
+                        desired_output_layouts=(Shard(1),),
+                    )
+                },
+            )
+            parallelize_module(block.moe.experts, mesh, TensorParallel())
+        else:
+            if args.expert_parallel:
+                from torchtitan_npu.converters.kernels.moe_dispatch import (
+                    NpuMoeDispatchParallelizePlanUpdater,
+                )
+                from torchtitan_npu.models.common import moe_parallelize
+
+                real_parallelize = moe_parallelize.parallelize_module
+
+                def converted_parallelize(*args, **kwargs):
+                    kwargs["parallelize_plan"] = (
+                        NpuMoeDispatchParallelizePlanUpdater.update(
+                            kwargs["parallelize_plan"]
+                        )
+                    )
+                    return real_parallelize(*args, **kwargs)
+
+                # Reproduce the converter container's production plan update.
+                moe_parallelize.parallelize_module = converted_parallelize
+                try:
+                    apply_sequence_sharded_moe_ep_tp(root, mesh, ep_mesh, None, None)
+                finally:
+                    moe_parallelize.parallelize_module = real_parallelize
+            else:
+                apply_sequence_sharded_moe_ep_tp(root, mesh, None, None, None)
         expert_shapes = []
         block.moe.experts.register_forward_pre_hook(
             lambda module, inputs: expert_shapes.append(list(inputs[0].shape))
@@ -109,11 +172,12 @@ def main():
                     actual = actual.to_local()
                 expected = oracle(local)
             delta = (actual.float() - expected.float()).abs()
-            if not distinct:
+            if not distinct or args.replicated_input_control:
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
             report.append(
                 dict(
                     distinct_tokens=distinct,
+                    replicated_input_control=args.replicated_input_control,
                     exact=torch.equal(actual, expected),
                     max_ae=delta.max().item(),
                     mean_ae=delta.mean().item(),
