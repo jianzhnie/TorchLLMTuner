@@ -65,7 +65,7 @@ efsdp = (dp_shard × cp × tp) / ep
 
 ### 2.3 模型与数据
 
-- 通过 `AutoConfig` / `AutoModelForCausalLM` 接入 HF 模型；
+- 通过 `AutoConfig` 或本地自定义 config 解析具体 `ForCausalLM` 类；
 - 自动补全模型架构参数，或通过 `arch_overrides` 覆盖离线构造的字段；
 - 适配 HF 状态字典与并行后的模型状态；
 - 使用 Grain 构建数据流水线；
@@ -76,6 +76,12 @@ efsdp = (dp_shard × cp × tp) / ep
 当前 `HFTransformerModel` 是文本 decoder 适配器，不消费图片、视频或 MRoPE
 输入，遇到这些字段会明确报错。完整视觉训练仍需要消费媒体和位置元数据的
 模型适配器，不能以多模态数据管线可用代替模型训练可用。
+
+Transformers 原生架构无需注册。自定义 HF 架构可通过
+`models/architecture.py` 的 `ModelArchitecture` 和
+`register_model_architecture()` 注册 config 构造与模型类解析器；模型类保持惰性
+加载，本地保存的配置按 `model_type` 恢复。专用输入、mask、norm 或 MoE 策略
+分别放在 HF 适配层的对应模块，不需要修改 Trainer 或并行装配表。
 
 TP 或 EP 是否可用于某个模型，取决于模块布局、TP plan 和专家结构。
 未知或无法等价转换的布局会被拒绝。
@@ -300,7 +306,8 @@ llmtuner/
 ├── datasets/                  # Grain 数据图、packing、文本与多模态处理
 ├── memory/                    # activation checkpoint 与 rematerialization
 ├── models/
-│   ├── hf/                    # HF wrapper、模型工厂和状态字典适配
+│   ├── architecture.py        # 自定义 HF 架构的轻量注册接缝
+│   ├── hf/                    # 构造、wrapper、输入/mask、专用策略和状态适配
 │   ├── common/                # attention、MoE、embedding、RoPE 等公共构件
 │   └── kimi/                  # Kimi Linear 专用模型与布局适配
 ├── parallel/
@@ -313,7 +320,9 @@ llmtuner/
 │   ├── stages.py              # 并行装配顺序
 │   ├── compatibility.py       # 跨层组合裁决
 │   └── parallelize.py         # 混合并行总入口
-├── trainer/                   # 装配、训练、validation 和运行时辅助逻辑
+├── trainer/
+│   ├── trainer.py             # 训练、验证、优化器更新与状态恢复编排
+│   └── runtime/               # 装配、batch、PP、validation、梯度与指标
 └── utils/                     # 日志、随机性、GC 和监控等工具
 ```
 
@@ -337,4 +346,4 @@ CPU 或 mock 测试通过不能外推为目标设备或其他并行组合通过�
 更多内容：
 
 - 架构与运行时契约：`docs/torchllmtuner_design.md`
-- TorchTitan 来源与符号映射：`docs/llmtuner_upstream_map.md`
+- TorchTitan 与 TorchTitan-NPU 对比：`docs/torchtitan_comparison.md`

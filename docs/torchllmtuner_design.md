@@ -4,7 +4,7 @@ TorchLLMTuner 是直接基于 Hugging Face `transformers` 的大模型并行训�
 Python 包名为 `llmtuner`，支持 FSDP2 / HSDP、TP、PP、CP 和 EP。
 
 本文说明长期有效的架构、模块职责与运行时契约，不记录逐次修复或单次实验结果。
-TorchTitan 来源与 A/B/C/D 分类见 [上游映射](llmtuner_upstream_map.md)；
+TorchTitan 与 TorchTitan-NPU 的定位差异见[对比文档](torchtitan_comparison.md)；
 具体运行的验证范围以对应测试、日志和验收记录为准。
 
 ## 1. 设计目标

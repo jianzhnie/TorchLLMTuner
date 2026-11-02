@@ -10,7 +10,7 @@
 
 | 仓库 | 当前提交 | 定位 |
 |---|---|---|
-| TorchLLMTuner | `eb21191` | 独立的 HF 混合并行训练框架 |
+| TorchLLMTuner | `cbead0d` | 独立的 HF 混合并行训练框架 |
 | TorchTitan | `0f9fd2bd6` | PyTorch 原生的大规模生成式模型训练平台 |
 | TorchTitan-NPU | `0a10bfc` | 基于固定 TorchTitan 版本的 Ascend NPU 插件 |
 
@@ -36,10 +36,10 @@ TorchLLMTuner 工作区可能包含未提交修改；另外两个仓库检查时
 - **TorchTitan-NPU 是上游插件**：复用 TorchTitan 的 Trainer、配置树、模型
   协议和并行基础设施，通过 patch、extension、显式 override、模型模块和
   NPU 算子完成 Ascend 适配。它不是独立训练栈。
-- **TorchLLMTuner 是独立精简实现**：以 HF `AutoModelForCausalLM` 为默认模型
-  来源，移除 TorchTitan 的配置物化和模型基类协议，用聚合 dataclass、普通
-  `apply_*` 函数和固定 stage 表组织训练。范围更集中，但模型、RL、低精度与
-  设备优化覆盖不及前两者。
+- **TorchLLMTuner 是独立精简实现**：以 HF config 和具体 `ForCausalLM` 类为
+  默认模型来源，移除 TorchTitan 的配置物化和模型基类协议，用聚合 dataclass、
+  普通 `apply_*` 函数和固定 stage 表组织训练。范围更集中，但模型、RL、低精度
+  与设备优化覆盖不及前两者。
 
 选择建议：
 
@@ -132,8 +132,8 @@ TorchTitan-NPU 保留上游抽象，因而能复用其训练语义和扩展点�
 
 | 维度 | TorchLLMTuner | TorchTitan | TorchTitan-NPU |
 |---|---|---|---|
-| 默认模型来源 | HF `AutoModelForCausalLM` | 仓库内原生模型定义；HF backend 属实验 | 上游原生模型 + NPU 专用模型 |
-| 模型覆盖 | 取决于 HF wrapper、TP plan、MoE 布局和专用 adapter | Llama、Qwen、DeepSeek、gpt-oss、Kimi、Muse、FLUX 等 | 重点包括 DeepSeek-V3.2/V4/V4.1、Qwen3.5 及上游已适配模型 |
+| 默认模型来源 | HF config 与具体 `ForCausalLM` 类 | 仓库内原生模型定义；HF backend 属实验 | 上游原生模型 + NPU 专用模型 |
+| 模型覆盖 | 取决于 HF wrapper、架构注册、TP plan、MoE 布局和专用 adapter | Llama、Qwen、DeepSeek、gpt-oss、Kimi、Muse、FLUX 等 | 重点包括 DeepSeek-V3.2/V4/V4.1、Qwen3.5 及上游已适配模型 |
 | 文本预训练/SFT | 支持统一训练入口和数据管线 | 完整 recipes 和模型训练路径 | 继承并提供 NPU recipes |
 | 多模态 | 有数据处理；当前 HF wrapper 是文本 decoder，不消费媒体/MRoPE | 原生支持多种文本、视觉、音频和生成模型，按模型而异 | 提供特定图文/视频模型适配，不能外推到全部上游模型 |
 | LoRA / MTP / Muon | 无与上游同等的完整通用能力 | 已提供对应训练能力 | 提供特定模型 LoRA、MTP 和 Muon 扩展 |
@@ -254,7 +254,8 @@ Transformers、SPMD、checkpoint 和设备 runtime 的版本组合。
 |---|---|---|---|
 | 训练入口 | `llmtuner/trainer/cli.py`、`trainer.py` | `torchtitan/train.py`、`trainer.py`、`training_engine.py` | `torchtitan_npu/train.py` + 上游入口 |
 | 配置 | `llmtuner/config/` | `torchtitan/config/`、`torchtitan_recipes/` | `torchtitan_npu/config/` + 上游 recipes |
-| 模型 | `models/hf/`、`common/`、`kimi/` | `torchtitan/models/` | `torchtitan_npu/models/` + 上游模型 |
+| 模型 | `models/architecture.py`、`models/hf/`、`common/`、`kimi/` | `torchtitan/models/` | `torchtitan_npu/models/` + 上游模型 |
+| 梯度与训练指标 | `trainer/runtime/gradients.py`、`metrics.py` | Trainer / TrainingEngine 对应模块 | 继承上游并按 NPU 扩展 |
 | 并行 | `llmtuner/parallel/` | `torchtitan/distributed/` | 上游 distributed + extensions/override/models |
 | 设备算子 | `accelerator/` 与少量模型专用实现 | PyTorch/CUDA 生态和模型组件 | `torchtitan_npu/ops/` |
 | 数据 | `llmtuner/datasets/` | `torchtitan/components/data/` | 上游 + NPU 模型/override dataloader |

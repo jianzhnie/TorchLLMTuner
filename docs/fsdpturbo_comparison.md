@@ -10,7 +10,7 @@
 | 仓库 | 版本 | 当前提交 |
 |---|---:|---|
 | FSDPTurbo | `0.1.0` | `1dae0be` |
-| TorchLLMTuner | `0.1.0` | `eb21191` |
+| TorchLLMTuner | `0.1.0` | `cbead0d` |
 
 提交号用于定位代码来源；工作区可能还包含未提交修改。两个项目均处于早期
 开发阶段，本文结论只适用于此次检查的实现。
@@ -212,7 +212,8 @@ trainer = Trainer(cfg)
 trainer.train()
 ```
 
-- 通过 `AutoConfig` 和 `AutoModelForCausalLM` 构建模型；
+- 通过 `AutoConfig` 或本地自定义 config 解析具体 `ForCausalLM` 类；
+- 原生 HF 架构无需注册，自定义架构由 `models/architecture.py` 轻量注册；
 - `HFTransformerModel` 提供五部件视图和统一 forward；
 - TP 使用 HF `_tp_plan`，EP probe 检查 router、experts 和 shared expert 布局；
 - 未识别或无法等价转换的布局会明确失败；
@@ -311,7 +312,8 @@ TorchLLMTuner 对训练状态拥有更强控制，便于统一 PP、梯度累积
 | 内存优化 | `memory/` | `memory/`、`components/loss.py` |
 | 量化 | `quantization/` | 无对应目录 |
 | 设备算子 | `ops/` | 主要依赖 PyTorch 原语 |
-| 模型适配 | `models/`、examples modeling | `models/hf/`、`models/common/`、`models/kimi/` |
+| 模型适配 | `models/`、examples modeling | `models/architecture.py`、`models/hf/`、`models/common/`、`models/kimi/` |
+| 梯度与训练指标 | 用户训练循环或 `BaseTrainer` | `trainer/runtime/gradients.py`、`metrics.py` |
 | 数据 | `training/dataloader.py` | `datasets/` |
 | Checkpoint | `training/checkpoint.py` | `components/checkpointer/` |
 | 指标与 Profiler | `training/monitor.py`、`profiler.py` | `components/metrics.py`、`profiler.py` |
@@ -384,7 +386,7 @@ TorchLLMTuner 对训练状态拥有更强控制，便于统一 PP、梯度累积
 
 ### 15.1 从 FSDPTurbo 迁移
 
-1. 确认模型能由 `AutoModelForCausalLM` 构造，并满足 HF wrapper 契约；
+1. 确认模型能由 HF config 和具体 `ForCausalLM` 类构造，并满足 wrapper 契约；
 2. 先移除量化、swap、custom FSDP 和模型 patch，建立单进程精度基线；
 3. 按目标 world size 重新设计 DP、TP、PP、CP 和 EP；
 4. 先分别验证单并行族，再增加组合；
