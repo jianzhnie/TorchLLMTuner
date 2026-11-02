@@ -37,8 +37,8 @@ def test_owning_shard_freezes_only_its_local_padding_row(monkeypatch):
         monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: group)
         # tp group of size 1: offset 0, the shard owns every row, so a global
         # padding_idx of 7 maps to local row 7.
-        monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 1)
-        monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 0)
+        monkeypatch.setattr(embedding_mod, "get_world_size", lambda g: 1)
+        monkeypatch.setattr(embedding_mod, "get_rank", lambda g: 0)
 
         emb = VocabParallelEmbedding(num_embeddings=8, embedding_dim=4, padding_idx=7)
         emb.weight = torch.nn.Parameter(
@@ -63,8 +63,8 @@ def test_non_owning_shard_passes_no_local_padding_idx(monkeypatch):
         monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: group)
         # tp group of size 2, this rank is 1: vocab 8 -> chunk 4, offset 4,
         # local rows [4, 8). Global padding_idx 3 lives on rank 0.
-        monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 2)
-        monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 1)
+        monkeypatch.setattr(embedding_mod, "get_world_size", lambda g: 2)
+        monkeypatch.setattr(embedding_mod, "get_rank", lambda g: 1)
 
         emb = VocabParallelEmbedding(num_embeddings=8, embedding_dim=4, padding_idx=3)
         emb.weight = torch.nn.Parameter(
@@ -87,8 +87,8 @@ def test_non_owning_shard_passes_no_local_padding_idx(monkeypatch):
 @pytest.mark.parametrize("options", [{"scale_grad_by_freq": True}, {"max_norm": 1.0}])
 def test_foreign_tokens_do_not_change_local_embedding_state(monkeypatch, options):
     monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: object())
-    monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 2)
-    monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 1)
+    monkeypatch.setattr(embedding_mod, "get_world_size", lambda g: 2)
+    monkeypatch.setattr(embedding_mod, "get_rank", lambda g: 1)
     embedding = VocabParallelEmbedding(8, 3, **options)
     weight = torch.full((4, 3), 2.0)
     embedding.weight = torch.nn.Parameter(weight.clone())
@@ -111,8 +111,8 @@ def test_foreign_tokens_do_not_change_local_embedding_state(monkeypatch, options
 @pytest.mark.parametrize("shape", [(8, 3), (3, 3), (4, 2)])
 def test_wrong_vocab_shard_shape_is_rejected_before_renormalization(monkeypatch, shape):
     monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: object())
-    monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 2)
-    monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 1)
+    monkeypatch.setattr(embedding_mod, "get_world_size", lambda g: 2)
+    monkeypatch.setattr(embedding_mod, "get_rank", lambda g: 1)
     embedding = VocabParallelEmbedding(8, 3, max_norm=1.0)
     embedding.weight = torch.nn.Parameter(torch.full(shape, 2.0))
     original = embedding.weight.detach().clone()
@@ -123,8 +123,8 @@ def test_wrong_vocab_shard_shape_is_rejected_before_renormalization(monkeypatch,
 
 def test_empty_vocab_shard_returns_zero_with_empty_gradient(monkeypatch):
     monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: object())
-    monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 4)
-    monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 3)
+    monkeypatch.setattr(embedding_mod, "get_world_size", lambda g: 4)
+    monkeypatch.setattr(embedding_mod, "get_rank", lambda g: 3)
     embedding = VocabParallelEmbedding(2, 3)
     embedding.weight = torch.nn.Parameter(torch.empty(0, 3))
     output = embedding(torch.tensor([[0, 1]]))
@@ -139,8 +139,8 @@ def test_invalid_global_tokens_fail_before_weight_renormalization(
     monkeypatch, invalid_token
 ):
     monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: object())
-    monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: 2)
-    monkeypatch.setattr(embedding_mod.distributed, "get_rank", lambda g: 1)
+    monkeypatch.setattr(embedding_mod, "get_world_size", lambda g: 2)
+    monkeypatch.setattr(embedding_mod, "get_rank", lambda g: 1)
     embedding = VocabParallelEmbedding(8, 3, max_norm=1.0)
     embedding.weight = torch.nn.Parameter(torch.full((4, 3), 2.0))
     original = embedding.weight.detach().clone()
@@ -156,16 +156,14 @@ def test_summed_vocab_shards_match_full_embedding_and_gradients(
     from llmtuner.components.loss import vocab_shard_bounds
 
     monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: object())
-    monkeypatch.setattr(embedding_mod.distributed, "get_world_size", lambda g: tp_size)
+    monkeypatch.setattr(embedding_mod, "get_world_size", lambda g: tp_size)
     reference = torch.nn.Embedding(vocab_size, 3, padding_idx=vocab_size - 1)
     inputs = torch.tensor([list(range(vocab_size)) + [0, 0]])
     expected = reference(inputs)
     shards = []
     outputs = []
     for rank in range(tp_size):
-        monkeypatch.setattr(
-            embedding_mod.distributed, "get_rank", lambda g, rank=rank: rank
-        )
+        monkeypatch.setattr(embedding_mod, "get_rank", lambda g, rank=rank: rank)
         start, end = vocab_shard_bounds(vocab_size, tp_size, rank)
         shard = VocabParallelEmbedding(vocab_size, 3, padding_idx=vocab_size - 1)
         shard.weight = torch.nn.Parameter(reference.weight.detach()[start:end].clone())

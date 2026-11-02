@@ -334,7 +334,7 @@ def test_batched_dispatch_counts_preserve_slice_and_rank_order(monkeypatch):
     # Received wire layout: source rank, slice, local expert.
     received = torch.tensor([[[1, 2], [3, 4]], [[5, 6], [7, 8]], [[9, 10], [11, 12]]])
     calls = []
-    monkeypatch.setattr(token_dispatch.distributed, "get_world_size", lambda _: 3)
+    monkeypatch.setattr(token_dispatch, "get_world_size", lambda _: 3)
 
     def exchange(tensor, output_splits, input_splits, *, group):
         calls.append(tensor.clone())

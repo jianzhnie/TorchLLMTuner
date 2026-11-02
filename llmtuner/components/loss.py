@@ -19,7 +19,7 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 import torch.nn.functional as F
 
-from ..accelerator import distributed
+from ..accelerator.distributed import get_rank, get_world_size
 
 __all__ = [
     "IGNORE_INDEX",
@@ -207,8 +207,8 @@ class LossParallelCrossEntropy(torch.autograd.Function):
         # This rank's slice of the vocabulary, by the same bounds the
         # vocab-parallel embedding uses -- the two must agree or the embedding
         # and the loss disagree about which rank owns which token.
-        tp_world_size = distributed.get_world_size(tp_group)
-        tp_rank = distributed.get_rank(tp_group)
+        tp_world_size = get_world_size(tp_group)
+        tp_rank = get_rank(tp_group)
         vocab_start, vocab_end = vocab_shard_bounds(
             global_vocab_size, tp_world_size, tp_rank
         )

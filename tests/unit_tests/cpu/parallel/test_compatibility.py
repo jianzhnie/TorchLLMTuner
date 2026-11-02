@@ -80,6 +80,14 @@ def test_guards_point_at_functions_that_call_the_verdict() -> None:
     for row in compatibility.ENTRIES:
         path, qualified_name = row.guard.split("::")
         node = ast.parse((root / path).read_text())
+        imported_verdicts = {
+            alias.asname or alias.name
+            for statement in node.body
+            if isinstance(statement, ast.ImportFrom)
+            and statement.module == "llmtuner.parallel.compatibility"
+            for alias in statement.names
+            if alias.name == row.name
+        }
         for name in qualified_name.split("."):
             matches = [
                 child
@@ -93,10 +101,18 @@ def test_guards_point_at_functions_that_call_the_verdict() -> None:
             node = matches[0]
         assert any(
             isinstance(child, ast.Call)
-            and isinstance(child.func, ast.Attribute)
-            and isinstance(child.func.value, ast.Name)
-            and child.func.value.id == "compatibility"
-            and child.func.attr == row.name
+            and (
+                (
+                    isinstance(child.func, ast.Attribute)
+                    and isinstance(child.func.value, ast.Name)
+                    and child.func.value.id == "compatibility"
+                    and child.func.attr == row.name
+                )
+                or (
+                    isinstance(child.func, ast.Name)
+                    and child.func.id in imported_verdicts
+                )
+            )
             for child in ast.walk(node)
         ), row.guard
 

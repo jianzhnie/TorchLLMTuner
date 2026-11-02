@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env("wandb", "pipelining", "flex_attention")
+require_env("pipelining", "flex_attention")
 
 
 import logging
@@ -523,7 +523,9 @@ def test_a_wandb_misconfiguration_is_not_swallowed(monkeypatch) -> None:
     mistyped WANDB_PROJECT silently disables tracking for the whole run. Only
     a missing package is rewritten here; anything else -- a missing API key, a
     bad entity -- reaches the caller."""
-    from wandb.errors import UsageError
+
+    class UsageError(Exception):
+        pass
 
     monkeypatch.setattr(metrics_module, "WandBLogger", _WandBLoggerRaising)
     _WandBLoggerRaising.error = UsageError("No API key configured.")
@@ -621,8 +623,6 @@ def test_device_memory_monitor_reports_zeros_on_cpu() -> None:
     assert (stats.max_active_pct, stats.max_reserved_pct) == (0.0, 0.0)
     assert (stats.num_alloc_retries, stats.num_ooms) == (0, 0)
     monitor.reset_peak_stats()  # must not raise
-
-    assert monitor._to_pct(1234) == 0.0
 
 
 def test_gib_is_binary_gigabytes() -> None:

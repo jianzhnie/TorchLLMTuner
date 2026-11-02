@@ -21,8 +21,8 @@ from torch.nn import ModuleDict
 
 from llmtuner.config.parallel_config import ParallelConfig
 
-from ...accelerator import distributed
 from ...accelerator.capabilities import has as capability
+from ...accelerator.distributed import get_backend, is_distributed
 from ...utils.logging import get_logger
 from ..compatibility import chunked_loss_fsdp
 from ..topology import ParallelTopology
@@ -678,7 +678,7 @@ def apply_fsdp(
             reduce_dtype=reduce_dtype,
             edp_mesh=edp_mesh,
         )
-        if distributed.is_distributed() and distributed.get_backend() != "nccl":
+        if is_distributed() and get_backend() != "nccl":
             force_sum_grad_reduction(model)
         return model
 
@@ -707,7 +707,7 @@ def apply_fsdp(
     # and, when asked, ``enable_fsdp_symm_mem``; do not repeat them here.
 
     # gloo implements no PREMUL_SUM; NCCL does, and there it is the faster path.
-    if distributed.is_distributed() and distributed.get_backend() != "nccl":
+    if is_distributed() and get_backend() != "nccl":
         force_sum_grad_reduction(model)
 
     return model

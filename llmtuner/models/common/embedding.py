@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...accelerator import distributed
+from ...accelerator.distributed import get_rank, get_world_size
 from ...accelerator.spmd import spmd_mesh_group
 from ...components.loss import vocab_shard_bounds
 
@@ -52,12 +52,12 @@ class VocabParallelEmbedding(nn.Embedding):
                 self.sparse,
             )
 
-        tp_size = distributed.get_world_size(tp_group)
+        tp_size = get_world_size(tp_group)
         # Same bounds the vocab-parallel loss uses -- the two must agree on
         # which rank owns which token (and the helper clamps the shard start to
         # the vocabulary, which the hand-rolled ``rank * chunk_size`` did not).
         offset, end = vocab_shard_bounds(
-            self.num_embeddings, tp_size, distributed.get_rank(tp_group)
+            self.num_embeddings, tp_size, get_rank(tp_group)
         )
         expected_shape = (end - offset, self.embedding_dim)
         if tuple(self.weight.shape) != expected_shape:

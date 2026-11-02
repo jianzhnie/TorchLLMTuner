@@ -15,7 +15,11 @@ import torch
 
 from llmtuner.accelerator.capabilities import has as capability
 from llmtuner.config.validation_config import ValidationConfig
-from llmtuner.parallel import compatibility
+from llmtuner.parallel.compatibility import (
+    chunked_loss_validation,
+    validation_once_requires_dp1,
+    validation_once_requires_finite_corpus,
+)
 from llmtuner.parallel.pipeline_parallel.microbatch_drivers import (
     run_eval_microbatches,
 )
@@ -167,14 +171,14 @@ def check_validation_feasibility(
     real corpus because the synthetic random source never ends.
     """
     if chunked_loss_num_chunks > 1:
-        compatibility.chunked_loss_validation(chunked_loss_num_chunks)
+        chunked_loss_validation(chunked_loss_num_chunks)
     if validation.steps != -1:
         return
     if dp_world_size > 1:
-        compatibility.validation_once_requires_dp1(dp_world_size)
+        validation_once_requires_dp1(dp_world_size)
     dataset = training_dataset if validation.dataset is None else validation.dataset
     if dataset == "random":
-        compatibility.validation_once_requires_finite_corpus()
+        validation_once_requires_finite_corpus()
 
 
 def should_validate(self: Trainer, step: int) -> bool:

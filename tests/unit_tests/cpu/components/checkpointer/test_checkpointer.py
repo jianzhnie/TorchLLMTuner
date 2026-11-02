@@ -466,14 +466,16 @@ def test_a_disabled_torch_checkpointing_manager_never_touches_the_backend() -> N
     assert manager.enable is False
 
 
-def test_an_enabled_torch_checkpointing_manager_without_the_backend_raises() -> None:
+def test_an_enabled_torch_checkpointing_manager_without_the_backend_raises(
+    monkeypatch,
+) -> None:
     """The failure must be an actionable ImportError, not a bare ModuleNotFoundError.
 
     ``torch_checkpointing`` is optional, so a missing install is an expected
     state rather than a bug: the message has to name the alternative (the DCP
     manager) instead of surfacing whichever submodule happened to import first.
     """
-    import importlib.util
+    import builtins
 
     import pytest
 
@@ -481,8 +483,14 @@ def test_an_enabled_torch_checkpointing_manager_without_the_backend_raises() -> 
         TorchCheckpointingManager,
     )
 
-    if importlib.util.find_spec("torch_checkpointing") is not None:
-        pytest.skip("backend is installed; the guard cannot fire")
+    original_import = builtins.__import__
+
+    def import_without_backend(name, *args, **kwargs):
+        if name == "torch_checkpointing" or name.startswith("torch_checkpointing."):
+            raise ModuleNotFoundError("No module named 'torch_checkpointing'")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_backend)
 
     with pytest.raises(ImportError, match="not installed"):
         TorchCheckpointingManager(

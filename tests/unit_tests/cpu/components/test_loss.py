@@ -56,8 +56,8 @@ def test_vocab_parallel_rejects_reduction_before_process_group_access(
     def unexpected_call(*args, **kwargs):
         pytest.fail("invalid reduction reached distributed communication")
 
-    monkeypatch.setattr(loss_module.distributed, "get_world_size", unexpected_call)
-    monkeypatch.setattr(loss_module.distributed, "get_rank", unexpected_call)
+    monkeypatch.setattr(loss_module, "get_world_size", unexpected_call)
+    monkeypatch.setattr(loss_module, "get_rank", unexpected_call)
     monkeypatch.setattr(loss_module.funcol, "all_reduce", unexpected_call)
     logits, labels = _logits_and_labels()
     with pytest.raises(ValueError, match="reduction must be"):
@@ -70,8 +70,8 @@ def test_vocab_parallel_rejects_empty_shard_topology_before_collectives(
 ):
     import llmtuner.components.loss as loss_module
 
-    monkeypatch.setattr(loss_module.distributed, "get_world_size", lambda group: 2)
-    monkeypatch.setattr(loss_module.distributed, "get_rank", lambda group: rank)
+    monkeypatch.setattr(loss_module, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(loss_module, "get_rank", lambda group: rank)
 
     def unexpected(*args, **kwargs):
         pytest.fail("invalid vocabulary topology reached a collective")

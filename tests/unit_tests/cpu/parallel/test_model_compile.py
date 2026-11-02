@@ -226,11 +226,8 @@ def test_async_tp_rejects_invalid_mesh_before_registration(monkeypatch, ndim, si
 
 
 @requires_runtime
-@pytest.mark.skipif(
-    has("inductor_micro_pipeline_tp"),
-    reason="this torch carries _micro_pipeline_tp; the loud-raise is unreachable",
-)
-def test_async_tp_on_unsupported_torch_loud_raises() -> None:
+def test_async_tp_on_unsupported_torch_loud_raises(monkeypatch) -> None:
+    monkeypatch.setattr(compile_mod, "has", lambda capability: False)
     with pytest.raises(NotImplementedError, match="_micro_pipeline_tp"):
         apply_compile(
             _model(),
@@ -255,14 +252,10 @@ def test_flex_model_rejects_unknown_backend(monkeypatch) -> None:
 
 
 @requires_runtime
-@pytest.mark.skipif(
-    __import__("importlib").util.find_spec("torch.fx.passes.regional_inductor")
-    is not None,
-    reason="this torch carries regional_inductor; the loud-raise is unreachable",
-)
 def test_regional_inductor_on_unsupported_torch_loud_raises(monkeypatch) -> None:
     model = _model()
     monkeypatch.setattr(type(model), "uses_flex_attention", property(lambda self: True))
+    monkeypatch.setattr(compile_mod, "has", lambda capability: False)
     with pytest.raises(NotImplementedError, match="regional_inductor"):
         apply_compile(model, compile_config=CompileConfig(backend="aot_eager"))
 

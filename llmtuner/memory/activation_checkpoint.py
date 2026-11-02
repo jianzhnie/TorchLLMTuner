@@ -82,6 +82,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
+from types import ModuleType
 
 import torch
 import torch._functorch.config
@@ -445,8 +446,9 @@ def disable_dynamo_lru_cache() -> None:
 
 
 def apply_memory_budget(cfg: MemoryBudgetACConfig) -> None:
-    """Set the one global ``"memory_budget"`` consists of (upstream's
-    ``MemoryBudgetAC.apply``).
+    """Set the process-global activation-memory budget.
+
+    This matches upstream's ``MemoryBudgetAC.apply``.
 
     The partitioner reads ``activation_memory_budget`` at compile time, so on
     a torch without that knob setting it would be a silent no-op -- refuse
@@ -467,7 +469,7 @@ def apply_memory_budget(cfg: MemoryBudgetACConfig) -> None:
     logger.info("Selected %s memory budget option", cfg.memory_budget)
 
 
-def require_torch_remat():
+def require_torch_remat() -> ModuleType:
     """Import the optional ``torch_remat`` package, or fail with the unlock.
 
     Imported here rather than at module scope for the same reason the

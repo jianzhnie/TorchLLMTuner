@@ -25,8 +25,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ...accelerator import distributed
 from ...accelerator.collectives import all_reduce, synchronize_local_errors
+from ...accelerator.distributed import (
+    get_default_group,
+    get_world_size,
+    is_distributed,
+    is_main_process,
+)
 from ...utils.garbage_collection import GarbageCollection
 from ...utils.logging import get_logger
 from . import filesystem
@@ -235,9 +240,7 @@ class BaseCheckpointManager(ABC):
                 model_parts,
                 sharded_expert_parallel=config.sharded_expert_parallel,
                 sharded_tensor_parallel=config.sharded_tensor_parallel,
-                initialization_group=distributed.get_default_group()
-                if distributed.is_distributed()
-                else None,
+                initialization_group=get_default_group() if is_distributed() else None,
             ),
             OPTIMIZER: optimizer,
             LR_SCHEDULER: lr_scheduler,
@@ -305,12 +308,12 @@ class BaseCheckpointManager(ABC):
                 if resolved is None
                 else self._states_to_load(model_only=resolved.model_only)
             )
-        if distributed.get_world_size() > 1:
+        if get_world_size() > 1:
             # Source discovery is local IO: successful ranks can still disagree
             # about visibility or latest step. Agree before any rank returns or
             # enters the reader's collective state restoration.
             selection = (resolved, sorted(states) if states is not None else None)
-            selections = [None] * distributed.get_world_size()
+            selections = [None] * get_world_size()
             dist.all_gather_object(selections, selection)
             if any(candidate != selection for candidate in selections):
                 raise RuntimeError(
@@ -471,11 +474,11 @@ class BaseCheckpointManager(ABC):
                 if should_save
                 else None
             )
-        if distributed.get_world_size() > 1:
+        if get_world_size() > 1:
             # Valid local arguments can still select different cadence or final
             # export branches. Agree before backend IO or any early return.
             arguments = (curr_step, last_step, should_save, save_configuration)
-            gathered = [None] * distributed.get_world_size()
+            gathered = [None] * get_world_size()
             dist.all_gather_object(gathered, arguments)
             if any(candidate[:2] != arguments[:2] for candidate in gathered):
                 raise RuntimeError(
@@ -692,7 +695,7 @@ class BaseCheckpointManager(ABC):
         """
         return (
             self.keep_latest_k > 0
-            and distributed.is_main_process()
+            and is_main_process()
             and self._storage.isdir(self.folder)
         )
 

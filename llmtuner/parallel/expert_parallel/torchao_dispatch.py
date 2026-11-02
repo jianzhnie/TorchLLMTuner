@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import torch
 
-from ...accelerator import distributed
+from ...accelerator.distributed import get_world_size
 from .token_dispatch import (
     AllToAllDispatchMetadata,
     AllToAllTokenDispatcher,
@@ -144,9 +144,7 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         """Padded expert-major permute via torchao's ``permute_and_pad``."""
         # ep_size=1 when EP is disabled: permute_and_pad then only pads token
         # groups (rank-major == expert-major for a single rank).
-        ep_size = (
-            1 if self.ep_group is None else distributed.get_world_size(self.ep_group)
-        )
+        ep_size = 1 if self.ep_group is None else get_world_size(self.ep_group)
         e = num_global_tokens_per_local_expert_E.shape[0] // ep_size
 
         (

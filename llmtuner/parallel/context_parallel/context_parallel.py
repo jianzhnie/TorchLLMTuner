@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from llmtuner.config.parallel_config import ParallelConfig
-from llmtuner.parallel import compatibility
+from llmtuner.parallel.compatibility import eager_flex_parallel
 
 from ...utils.logging import get_logger
 from ..attention_heads import require_heads_divisible_by
@@ -113,7 +113,7 @@ def apply_cp(
 
     model_config = getattr(getattr(model, "model", None), "config", None)
     if getattr(model_config, "attention_backend", "auto") == "eager_flex":
-        compatibility.eager_flex_parallel("CP")
+        eager_flex_parallel("CP")
     if cfg.cp_config.context_parallel_strategy == "kcp":
         if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
             raise ValueError("KCP requires a cp mesh")

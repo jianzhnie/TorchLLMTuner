@@ -142,7 +142,6 @@ class LLMTunerConfig:
             )
         if (
             self.training.compile_config.enable_async_tensor_parallel
-            and self.training.compile
             and self.parallel.tp_size < 2
         ):
             raise ConfigError(
