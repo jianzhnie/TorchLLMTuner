@@ -27,6 +27,10 @@
 | loss / 归约 | `chunked_loss_equivalence.py`、`vocab_parallel_loss_equivalence.py`、`reduce_equivalence.py`、`parallel_grad_norm_equivalence.py`、`training_metric_reduction_equivalence.py`、`validation_reduction_equivalence.py` |
 | 检查点 | `hf_checkpoint_equivalence.py`、`hf_checkpoint_pp.py`、`rng_checkpoint_equivalence.py`、`ema_layout_equivalence.py`、`tp_dp_checkpoint_layout.py`、`tp_ep_checkpoint_layout.py`、`ep_dp_checkpoint_layout.py` |
 | NPU 专用 | `npu_*` 系列（如 `npu_moe_kernel_equivalence.py`、`npu_grad_norm_precision.py`）——由 `require_env("torch_npu")` 门控 |
+| NPU 显存与恢复 | `npu_virtual_optimizer_checkpoint.py`、`npu_activation_swap.py`、`npu_memory_policies_checkpoint.py` |
+| NPU 编译与诊断 | `npu_compile_sdc.py`、`npu_native_sdc.py`、`npu_checkpoint_metrics_compile.py` |
+| DistMuon/FlexShard | `dist_muon_checkpoint.py`、`dist_muon_redistribution.py`、`npu_dist_muon_30b.py` |
+| NPU 性能观测 | `npu_ep_profile.py`、`mc2_steady.py`、`npu_selective_ac_profile.py`、`npu_fused_ops_benchmark.py`；性能脚本不等同于数值等价证明 |
 
 ## 新增等价用例
 

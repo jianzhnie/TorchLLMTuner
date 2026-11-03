@@ -4,7 +4,7 @@
 set -euo pipefail
 
 INPUT=$(cat)
-FILE_PATH=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_input',{}).get('file_path',''))" 2>/dev/null)
+FILE_PATH=$(echo "$INPUT" | python3 -c "import sys,json; data=json.load(sys.stdin).get('tool_input',{}); print(data.get('path') or data.get('file_path') or '')" 2>/dev/null)
 
 if [ -z "$FILE_PATH" ] || [ ! -f "$FILE_PATH" ]; then
     exit 0

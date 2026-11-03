@@ -15,7 +15,7 @@ agent 定义与可复用技能。agents 采用 thin proxy 模式 —— agent �
 
 | 文件 | 说明 |
 |---|---|
-| `hooks/enforce-code-style.sh` | 编辑 `.py` 后自动执行 `ruff check --fix` + `ruff format`；ruff 不在 PATH 时静默跳过 |
+| `hooks/enforce-code-style.sh` | 编辑 `.py` 后自动执行 `ruff check --fix` + `ruff format`；兼容 `path`/`file_path` 参数，ruff 不在 PATH 时静默跳过 |
 | `hooks/check-related-files.sh` | 按被编辑路径输出中文提醒（parallel→集成测试、config→examples、models→memory、datasets→单测），不阻断 |
 
 ## commands/ — 斜杠命令

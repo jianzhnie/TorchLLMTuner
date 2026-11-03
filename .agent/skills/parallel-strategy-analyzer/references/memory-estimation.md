@@ -51,10 +51,25 @@ act_per_layer ≈ 14·s·b·h + 5·s²·b·n_h + 6·s·b·d_ff   （字节）
 | `region` | 块级重计算、保留声明的 region（需 `torch_remat`，torch ≥ 2.10） | 介于 full 与 selective 之间 |
 | `memory_budget` | compile 分割器按 [0,1] 预算取舍；**要求 `training.compile=True`** | 可调 |
 
+## NPU 显存策略
+
+以下机制不纳入通用的 `16B/参数` 估算，须单独列出驻留位置和传输成本：
+
+- `optimizer.state_residency="npu_virtual"`：Adam/AdamW 的 moments 使用
+  Host-backed、NPU 可访问存储；估算时从长期 HBM 占用中分离 moments，同时记录
+  Host 内存。不能与 FSDP CPU offload 组合，DCP 恢复语义需实测。
+- `training.activation_swap=True`：将 decoder 保存的激活交换到 pinned Host，
+  适用于 NPU eager + `activation_checkpoint_mode="none"`；full AC 跳过交换，
+  selective/region AC 和 compile 不支持。报告 HBM 节省、Host 峰值及
+  H2D/D2H 开销，不只报告是否可运行。
+- DistMuon/FlexShard：分别估算存储 shard、计算布局、重分片 bucket 和
+  Newton–Schulz 临时空间，不能直接套用 AdamW 的 16B/参数。
+
 ## 其他显存
 
 集合通信缓冲 + 框架开销：每卡预留约 1.5–2.5 GB（FSDP all-gather 缓冲、
-EP all-to-all 暂存、PP P2P 缓冲）。
+EP all-to-all 暂存、PP P2P 缓冲）。该值仅为初始估算；NPU 大模型需用 profiler
+分别测量通信 workspace、编译缓存和主机侧 pinned 缓冲。
 
 ## 升级顺序
 

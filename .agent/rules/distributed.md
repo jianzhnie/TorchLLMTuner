@@ -77,3 +77,18 @@ paths:
   （`trainer_tp_ep_cp_equivalence.py`、`tp_ep_cp_training_equivalence.py`）。
 - 分布式行为不能仅靠 CPU 推理验证——集合通信正确性必须经 `torchrun`
   验证（硬件由 `tests.caps.require_env` 门控）。
+
+## Ascend 资源与组合约束
+
+- `activation_swap` 位于 AC 与 compile 之间，仅支持 NPU eager；与
+  selective/region AC 互斥，full AC 下不执行交换。检查保存张量的所有权、
+  异步流/event、异常清理以及 H2D/D2H 字节数，不能用普通 forward wrapper
+  隐藏重放生命周期。
+- `npu_virtual` optimizer state 与 FSDP CPU offload 互斥。修改参数、梯度或
+  moments 驻留策略时，同时检查 DCP writer、DTensor 本地 shard、空 shard、
+  重复加载及恢复后继续训练。
+- NPU inductor 使用 AscendC 时必须在导入 PyTorch 前固定
+  `TORCHINDUCTOR_NPU_BACKEND=ascendc`。编译通过不等于融合成功；对比 eager、
+  `aot_eager` 与 inductor 时记录数值、fallback、重编译、峰值 HBM 和稳态吞吐。
+- MC2/Domino、compile SDC、DistMuon 与 offload 的组合不得由单项支持推断为
+  整体支持；沿用 `compatibility.py` 的显式拒绝并运行目标拓扑集成脚本。

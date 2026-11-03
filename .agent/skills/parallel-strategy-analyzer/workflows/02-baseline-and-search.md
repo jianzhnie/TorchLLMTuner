@@ -50,3 +50,9 @@ MoE → 加 expert_parallel_size（需整除专家数）；ep × tp 尽量落在
   replicate、节点内 shard）。
 - **FSDP 引擎**：`fsdp_config.fsdp_implementation` 为 `native`（默认）或
   `custom`——除非用户已在跑 custom 引擎，否则推荐 `native`。
+- **Ascend 显存策略按瓶颈选择**：moments 是长期瓶颈时评估
+  `optimizer.state_residency="npu_virtual"`，不得再叠加 FSDP CPU offload；
+  激活是主要瓶颈时评估 `training.activation_swap=True`，但仅限 eager + AC
+  `none`。先记录参数、梯度、moments、激活、Host 内存和传输时间，再推荐策略。
+- **DistMuon 不作为默认替代**：只有 AdamW 基线稳定且用户明确要求时，才评估
+  DistMuon/FlexShard；配置需给出计算布局、重分片 bucket 和 checkpoint 成本。

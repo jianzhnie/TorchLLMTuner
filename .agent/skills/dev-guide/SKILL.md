@@ -73,8 +73,22 @@ description: 审查、修改和重构 TorchLLMTuner 的 llmtuner 代码时，指
 从 `trainer/trainer.py` 追踪相关调用链，按本次修改范围检查以下不变量：
 
 - **装配顺序**：以 `parallel/stages.py` 为单一来源，保持
-  `TP → EP → CP → activation checkpoint → compile → FSDP`。
+  `TP → EP → CP → activation checkpoint → activation swap → compile → FSDP`。
   PP 先分割模型，再对本地 model parts 应用既定阶段顺序。
+- **Ascend 显存策略**：`training.activation_swap` 的 saved-tensor hooks 只支持
+  NPU eager，与 compile、selective/region AC 互斥；full AC 下跳过交换。
+  检查 pinned Host 缓冲、异步 H2D/D2H event、异常中止和峰值 Host 内存。
+  `optimizer.state_residency="npu_virtual"` 只适用于受支持的 Adam/AdamW
+  moments，不能与 FSDP CPU offload 混用；同步 DCP 的保存、重复恢复及恢复后
+  继续训练必须一起验证。
+- **Ascend 编译与诊断**：NPU inductor 需要在导入 PyTorch 前设置
+  `TORCHINDUCTOR_NPU_BACKEND=ascendc`，并检查 `npu_ascendc_codegen` 能力。
+  import 或启动成功不代表发生融合；性能验收需记录 fallback、重编译和稳态
+  数据。`compile_config.enable_sdc` 当前检查编译区域输出的有限性，不等同于
+  完整的梯度、HCCL 或故障注入检测。
+- **DistMuon/FlexShard**：参数存储布局与 optimizer 计算布局分别核对；
+  `compute_sharding_by_fqn` 必须覆盖实际 DistMuon 参数，并在恢复时保持匹配。
+  重分片 bucket、Newton–Schulz 数值、状态 FQN 和 checkpoint 大小需共同验收。
 - **拓扑与归约**：检查 dense/sparse/loss/data mesh 的用途、rank ownership、
   collective group、形状和整除条件；EP 轴与其他轴的关系以 topology 实现为准，
   不凭并行度乘积猜测。检查复制参数梯度和 token 统计是否重复归约。

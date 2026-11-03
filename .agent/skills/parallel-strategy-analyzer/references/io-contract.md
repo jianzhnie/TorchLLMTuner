@@ -39,6 +39,8 @@
 6. **配置片段**——只用真实 `llmtuner.config` 字段
    （见 `workflows/03-cost-and-config.md`）
 7. **前 3 个备选**——显存/bubble/通信取舍对比表
+8. **NPU 资源与验证**——适用时分别列出 HBM、Host 内存、H2D/D2H、编译
+   fallback/重编译和 checkpoint 恢复验证；禁止把小模型实测收益外推为固定比例
 
 ## 局限性
 
