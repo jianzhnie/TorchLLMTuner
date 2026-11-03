@@ -10,6 +10,17 @@ training step, so this cannot silently fall back to random weights.
 
 Launch through ``examples/train_qwen3_30b_npu.sh``. The default topology is
 8-way FSDP with full activation checkpointing and BF16 model construction.
+``LLMTUNER_COMPILE_BACKEND`` selects eager (default), ``aot_eager`` or
+``inductor``; the launch script selects AscendC before importing torch for the
+latter. ``LLMTUNER_COMPILE_PER_BLOCK=0`` selects whole-model compile.
+``LLMTUNER_OPTIMIZER_STATE_RESIDENCY=npu_virtual`` selects Host-backed Adam
+moments and the supported for-loop optimizer instead of device/fused defaults.
+``LLMTUNER_ACTIVATION_CHECKPOINT_MODE`` overrides full AC, and
+``LLMTUNER_ACTIVATION_SWAP=1`` enables pinned-Host activation exchange.
+``LLMTUNER_SDC_EAGER=1`` enables native gradient/HCCL checks before torch-npu
+is imported; it does not enable compiled checksum instrumentation.
+``LLMTUNER_EP_TOKEN_DISPATCHER`` selects alltoall (default), mc2 or domino
+when ``LLMTUNER_EXPERT_PARALLEL_SIZE`` is greater than one.
 
 ``LLMTUNER_TENSOR_PARALLEL_SIZE`` / ``LLMTUNER_PIPELINE_PARALLEL_SIZE`` /
 ``LLMTUNER_NUM_PP_MICROBATCHES`` / ``LLMTUNER_CONTEXT_PARALLEL_SIZE`` select
@@ -32,7 +43,9 @@ import torch
 from llmtuner import Trainer
 from llmtuner.config import (
     CheckpointConfig,
+    CompileConfig,
     DataloaderConfig,
+    ExpertParallelConfig,
     LLMTunerConfig,
     MetricsConfig,
     ModelConfig,
@@ -52,6 +65,12 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
     dataset_path = os.environ.get("LLMTUNER_DATASET_PATH", DATASET_PATH)
     save_checkpoint = os.environ.get("LLMTUNER_SAVE_CHECKPOINT", "1") == "1"
     cpu_offload = os.environ.get("LLMTUNER_FSDP_CPU_OFFLOAD", "0") == "1"
+    state_residency = os.environ.get("LLMTUNER_OPTIMIZER_STATE_RESIDENCY", "device")
+    compile_backend = os.environ.get("LLMTUNER_COMPILE_BACKEND", "eager")
+    if compile_backend not in ("eager", "aot_eager", "inductor"):
+        raise ValueError(
+            "LLMTUNER_COMPILE_BACKEND must be eager, aot_eager, or inductor"
+        )
     tensor_parallel_size = int(os.environ.get("LLMTUNER_TENSOR_PARALLEL_SIZE", "1"))
     expert_parallel_size = int(os.environ.get("LLMTUNER_EXPERT_PARALLEL_SIZE", "1"))
     pipeline_parallel_size = int(os.environ.get("LLMTUNER_PIPELINE_PARALLEL_SIZE", "1"))
@@ -91,17 +110,33 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
             pipeline_parallel_size=pipeline_parallel_size,
             context_parallel_kv_allgather_size=context_parallel_size,
             pp_config=PipelineParallelConfig(num_pp_microbatches=num_pp_microbatches),
+            ep_config=ExpertParallelConfig(
+                ep_token_dispatcher=os.environ.get(
+                    "LLMTUNER_EP_TOKEN_DISPATCHER", "alltoall"
+                )
+            ),
             fsdp_config=FSDPConfig(
                 fsdp_cpu_offload=cpu_offload,
                 fsdp_cpu_offload_pin_memory=(
                     os.environ.get("LLMTUNER_FSDP_CPU_OFFLOAD_PIN_MEMORY", "1") == "1"
+                ),
+                fsdp_forward_prefetch_count=int(
+                    os.environ.get("LLMTUNER_FSDP_FORWARD_PREFETCH_COUNT", "0")
+                ),
+                fsdp_backward_prefetch_count=int(
+                    os.environ.get("LLMTUNER_FSDP_BACKWARD_PREFETCH_COUNT", "0")
                 ),
             ),
         ),
         optimizer=OptimizerConfig(
             learning_rate=1e-5,
             weight_decay=0.1,
-            implementation="for-loop" if cpu_offload else "fused",
+            implementation=(
+                "for-loop"
+                if cpu_offload or state_residency == "npu_virtual"
+                else "fused"
+            ),
+            state_residency=state_residency,
         ),
         training=TrainingConfig(
             global_batch_size=int(os.environ.get("LLMTUNER_GLOBAL_BATCH_SIZE", "8")),
@@ -109,7 +144,16 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
             steps=int(os.environ.get("LLMTUNER_STEPS", "100")),
             seed=42,
             deterministic=deterministic,
-            activation_checkpoint_mode="full",
+            compile=compile_backend != "eager",
+            compile_config=CompileConfig(
+                backend=compile_backend if compile_backend != "eager" else "inductor",
+                per_block=os.environ.get("LLMTUNER_COMPILE_PER_BLOCK", "1") == "1",
+                enable_sdc=os.environ.get("LLMTUNER_SDC_COMPILE", "0") == "1",
+            ),
+            activation_checkpoint_mode=os.environ.get(
+                "LLMTUNER_ACTIVATION_CHECKPOINT_MODE", "full"
+            ),
+            activation_swap=os.environ.get("LLMTUNER_ACTIVATION_SWAP", "0") == "1",
             checkpoint_config=CheckpointConfig(
                 enable=True,
                 # Keep training checkpoints local: full TP gather can exhaust
@@ -129,6 +173,7 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
                     == "1"
                 ),
                 interval=int(os.environ.get("LLMTUNER_CHECKPOINT_INTERVAL", "500")),
+                async_mode=os.environ.get("LLMTUNER_CHECKPOINT_ASYNC_MODE", "disabled"),
                 load_step=int(os.environ.get("LLMTUNER_CHECKPOINT_LOAD_STEP", "-1")),
                 load_only=not save_checkpoint,
                 initial_load_path=model_path,

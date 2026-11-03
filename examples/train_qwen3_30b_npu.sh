@@ -17,6 +17,15 @@ export LLMTUNER_MAX_SEQ_LEN="${LLMTUNER_MAX_SEQ_LEN:-4096}"
 export LLMTUNER_STEPS="${LLMTUNER_STEPS:-100}"
 export LLMTUNER_DUMP_FOLDER="${LLMTUNER_DUMP_FOLDER:-$repo_root/outputs/qwen3-30b-npu}"
 export LLMTUNER_SAVE_CHECKPOINT="${LLMTUNER_SAVE_CHECKPOINT:-1}"
+export LLMTUNER_COMPILE_BACKEND="${LLMTUNER_COMPILE_BACKEND:-eager}"
+if [[ "$LLMTUNER_COMPILE_BACKEND" == "inductor" ]]; then
+  # torchrun imports torch in its children, so select AscendC before launch.
+  export TORCHINDUCTOR_NPU_BACKEND="${TORCHINDUCTOR_NPU_BACKEND:-ascendc}"
+fi
+if [[ "${LLMTUNER_SDC_EAGER:-0}" == "1" ]]; then
+  # Native SDC must be selected before torch-npu is imported.
+  export NPU_ASD_CONFIG="${NPU_ASD_CONFIG:-enable:true,with_checksum:false}"
+fi
 
 mkdir -p "$LLMTUNER_DUMP_FOLDER/logs"
 log_file="$LLMTUNER_DUMP_FOLDER/logs/train_$(date +%Y%m%d_%H%M%S).log"
