@@ -76,6 +76,7 @@ from typing import NamedTuple
 import torch
 import torch.nn as nn
 
+from ...errors import UnsupportedCombinationError
 from ...models.common.moe.layer import MOE_LAYER_ATTRS
 from ...models.kimi.moe import KimiSparseMoE
 from ...utils.logging import get_logger
@@ -204,13 +205,6 @@ def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None
             for name in (gate_name, up_name, down_name)
         ):
             continue
-        act_fn = getattr(first, "act_fn", None)
-        if act_fn is not None and not isinstance(act_fn, nn.SiLU | SiLUActivation):
-            raise NotImplementedError(
-                f"Expert activation {type(act_fn).__name__} is not SiLU; the "
-                "swap would silently change the experts' nonlinearity. Wire the "
-                "activation through GroupedExperts first."
-            )
         hidden, dim = getattr(first, gate_name).weight.shape
         down_dim, down_hidden = getattr(first, down_name).weight.shape
         if down_dim != dim or down_hidden != hidden:
@@ -224,6 +218,19 @@ def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None
         ups: list[torch.Tensor] = []
         downs: list[torch.Tensor] = []
         for expert in members:
+            act_fn = getattr(expert, "act_fn", None)
+            if act_fn is not None and not isinstance(act_fn, nn.SiLU | SiLUActivation):
+                raise NotImplementedError(
+                    f"Expert activation {type(act_fn).__name__} is not SiLU; "
+                    "the swap would silently change the experts' nonlinearity. "
+                    "Wire the activation through GroupedExperts first."
+                )
+            for name in (gate_name, up_name, down_name):
+                if getattr(getattr(expert, name), "bias", None) is not None:
+                    raise NotImplementedError(
+                        f"Expert projection {name} has bias; GroupedExperts "
+                        "cannot preserve projection bias during conversion."
+                    )
             gate = getattr(expert, gate_name).weight
             up = getattr(expert, up_name).weight
             down = getattr(expert, down_name).weight
@@ -241,13 +248,22 @@ def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None
             gates.append(gate)
             ups.append(up)
             downs.append(down)
-        # First half gate, second half up: the split ``chunk(2, dim=-1)`` in the
-        # 5.x forward, and the same convention ``GroupedExperts`` reads.
-        gate_up = torch.cat([torch.stack(gates), torch.stack(ups)], dim=1)
+        for name, weights in zip(
+            (gate_name, up_name, down_name), (gates, ups, downs), strict=True
+        ):
+            if len({weight.requires_grad for weight in weights}) != 1:
+                raise UnsupportedCombinationError(
+                    "EP cannot stack experts with different requires_grad flags "
+                    f"for {name}; grouped parameters require uniform freezing."
+                )
+        # Keep projections separate: concatenating gate/up merges their
+        # requires_grad flags and can unfreeze an otherwise frozen projection.
+        # Construction may run under no_grad; copying weights must not infer
+        # parameter trainability from the caller's autograd recording mode.
         return FusedExperts(
-            gate_EFD=gate_up[:, :hidden],
-            up_EFD=gate_up[:, hidden:],
-            down_EDF=torch.stack(downs),
+            gate_EFD=torch.stack(gates).requires_grad_(gates[0].requires_grad),
+            up_EFD=torch.stack(ups).requires_grad_(ups[0].requires_grad),
+            down_EDF=torch.stack(downs).requires_grad_(downs[0].requires_grad),
             num_experts=len(members),
         )
     return None

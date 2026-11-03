@@ -38,8 +38,10 @@ same slot the whole-model compile it replaces occupied.
 from __future__ import annotations
 
 import contextlib
+import os
 import warnings
 from collections.abc import Callable, Iterator
+from functools import wraps
 
 import torch
 import torch.nn as nn
@@ -49,6 +51,7 @@ from llmtuner.config.compile_config import CompileConfig
 from llmtuner.errors import EnvironmentUnsupportedError
 
 from ..accelerator.capabilities import has
+from ..accelerator.device import device_type
 from ..models.common.moe.layer import collect_moe_layers
 from ..utils.logging import get_logger
 
@@ -83,6 +86,54 @@ def rollback_compile_settings_on_error() -> Iterator[None]:
         raise
 
 
+def validate_compile_backend(backend: str) -> None:
+    """Validate the NPU Codegen selected before importing the training stack."""
+    if backend != "inductor" or device_type != "npu":
+        return
+    selected = os.environ.get("TORCHINDUCTOR_NPU_BACKEND")
+    if selected != "ascendc":
+        raise EnvironmentUnsupportedError(
+            "NPU compile backend='inductor' requires "
+            "TORCHINDUCTOR_NPU_BACKEND=ascendc. Set it in the launch shell "
+            "before importing torch, or use backend='aot_eager'."
+        )
+    if not has("npu_ascendc_codegen"):
+        raise EnvironmentUnsupportedError(
+            "NPU compile backend='inductor' requires the built-in "
+            "torch_npu._inductor.ascendc Codegen and matching CANN AutoFuse "
+            "runtime. Install the pinned runtime, or use backend='aot_eager'."
+        )
+    logger.info("NPU Inductor Codegen: ascendc")
+
+
+def _check_finite_output(output, name: str) -> None:
+    if isinstance(output, torch.Tensor):
+        if not torch.isfinite(output).all().item():
+            raise FloatingPointError(f"Non-finite compiled output at {name}")
+    elif isinstance(output, tuple | list):
+        for value in output:
+            _check_finite_output(value, name)
+    elif isinstance(output, dict):
+        for value in output.values():
+            _check_finite_output(value, name)
+
+
+def wrap_sdc_forward(module: nn.Module, name: str) -> nn.Module:
+    target = (
+        "_compiled_call_impl" if module._compiled_call_impl is not None else "forward"
+    )
+    original = getattr(module, target)
+
+    @wraps(original)
+    def checked(*args, **kwargs):
+        output = original(*args, **kwargs)
+        _check_finite_output(output, name)
+        return output
+
+    setattr(module, target, checked)
+    return module
+
+
 def apply_compile(
     model: nn.Module,
     *,
@@ -107,6 +158,7 @@ def apply_compile(
         raise TypeError("per_block compile requires a model with a .layers module")
 
     # Resolve registered/custom backends before changing module or global flags.
+    validate_compile_backend(compile_config.backend)
     from torch._dynamo.backends.registry import lookup_backend
 
     lookup_backend(compile_config.backend)
@@ -155,11 +207,16 @@ def apply_compile(
                 # and the state dict.
                 compiled_blocks.append((block, block._compiled_call_impl))
                 block.compile(backend=backend, fullgraph=True)
+                if compile_config.enable_sdc:
+                    wrap_sdc_forward(block, f"decoder layer {layer_id}")
                 logger.info(f"Compiling decoder layer {layer_id} (fullgraph)")
             return model
 
         logger.info(f"Compiling the whole model (backend={backend!r})")
-        return torch.compile(model, backend=backend)
+        compiled = torch.compile(model, backend=backend)
+        if compile_config.enable_sdc:
+            return wrap_sdc_forward(compiled, "model")
+        return compiled
     except BaseException:
         if previous_async_tp is not None:
             inductor_config._micro_pipeline_tp = previous_async_tp

@@ -177,4 +177,5 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         permuted_indices: torch.Tensor,
     ) -> torch.Tensor:
         """Reverse the padded permute and strip the sentinel row it added."""
-        return super()._unpermute(routed_output_RD, input_shape, permuted_indices)[:-1]
+        unpermuted = super()._unpermute(routed_output_RD, input_shape, permuted_indices)
+        return unpermuted[: input_shape[0] - 1]

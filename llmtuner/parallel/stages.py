@@ -20,7 +20,7 @@ __all__ = [
     "StageName",
 ]
 
-StageName = Literal["tp", "ep", "cp", "ac", "compile", "fsdp"]
+StageName = Literal["tp", "ep", "cp", "ac", "activation_swap", "compile", "fsdp"]
 
 
 # The order IS the contract (see parallelize.py's docstring).
@@ -40,10 +40,11 @@ STAGES: tuple[Stage, ...] = (
     ),
     Stage(
         "ep",
-        "After TP: the swap consumes TP's dense sharding and owns the routed "
-        "experts. On the PP path too: the sparse mesh carries a pp axis, so "
-        "each stage's ranks form their own EP group and the swap runs per "
-        "stage chunk (upstream: pipeline() parallelizes each model part).",
+        "After TP: expert replacement consumes TP's dense sharding and owns "
+        "the routed experts. On the PP path too: the sparse mesh carries a pp "
+        "axis, so each stage's ranks form their own EP group and expert "
+        "conversion runs per stage chunk (upstream: pipeline() parallelizes "
+        "each model part).",
     ),
     Stage(
         "cp",
@@ -59,6 +60,12 @@ STAGES: tuple[Stage, ...] = (
         "``parallelize_llama``. On the PP path too: upstream hands "
         "``ac_config`` to each model part's own ``parallelize`` call, so each "
         "stage's chunk is checkpointed on its own layers.",
+    ),
+    Stage(
+        "activation_swap",
+        "Outside AC to preserve the recompute lifecycle; caller-owned "
+        "checkpoint inputs stay resident. Before FSDP and incompatible "
+        "with compile.",
     ),
     Stage(
         "compile",

@@ -1,8 +1,8 @@
 """Apply parallel and memory transformations to Hugging Face models.
 
 Both dense and pipeline paths follow ``stages.STAGE_ORDER``:
-TP → EP → CP → activation checkpoint → compile → FSDP. PP splits the model
-first, transforms each local part, then binds the pipeline schedule.
+TP → EP → CP → activation checkpoint → activation swap → compile → FSDP. PP
+splits the model first, transforms each local part, then binds the pipeline schedule.
 
 Dense runs return a module; PP runs return ``PipelineParallelSetup``. Weight
 ties are retained and handled by FSDP grouping. EP replaces supported HF MoE
@@ -26,8 +26,10 @@ from llmtuner.config.activation_checkpoint_config import (
 )
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.config.training_config import validate_activation_swap_options
 
-from ..memory.activation_checkpoint import apply_ac
+from ..memory.activation_checkpoint import apply_ac, validate_ac_options
+from ..memory.activation_swap import apply_activation_swap
 from .compatibility import chunked_loss_fsdp
 from .context_parallel.context_parallel import apply_cp
 from .expert_parallel.expert_parallel import apply_ep
@@ -60,6 +62,7 @@ def parallelize_hf_transformers(
     compile: bool = False,
     compile_config: CompileConfig | None = None,
     activation_checkpoint: str = "none",
+    activation_swap: bool = False,
     selective_ac: SelectiveACConfig | None = None,
     memory_budget_ac: MemoryBudgetACConfig | None = None,
     region_ac: RegionACConfig | None = None,
@@ -76,6 +79,19 @@ def parallelize_hf_transformers(
     ``PipelineParallelSetup`` containing local parts, stages, and schedule.
     Other runs return the transformed module.
     """
+
+    validate_activation_swap_options(
+        activation_swap=activation_swap,
+        compile=compile,
+        activation_checkpoint=activation_checkpoint,
+    )
+    validate_ac_options(
+        activation_checkpoint,
+        selective=selective_ac,
+        memory_budget=memory_budget_ac,
+        region=region_ac,
+        compile_enabled=compile,
+    )
 
     if chunked_loss_num_chunks > 1 and compile and parallel_dims is not None:
         if parallel_dims.dp_cp_enabled:
@@ -114,6 +130,7 @@ def parallelize_hf_transformers(
                 region=region_ac,
                 compile_enabled=compile,
             ),
+            "activation_swap": apply_activation_swap,
             "compile": partial(
                 apply_compile, compile_config=compile_config, tp_mesh=tp_mesh
             ),
@@ -124,8 +141,11 @@ def parallelize_hf_transformers(
                 chunked_loss_num_chunks=chunked_loss_num_chunks,
             ),
         }
+        activation_swap_enabled = activation_swap and activation_checkpoint != "full"
         for name in STAGE_ORDER:
-            if name != "compile" or compile:
+            if (name != "compile" or compile) and (
+                name != "activation_swap" or activation_swap_enabled
+            ):
                 if name == "ep" and references is not None:
                     # TP may already have replaced Parameters before EP's
                     # explicit split/rename mapping is emitted.

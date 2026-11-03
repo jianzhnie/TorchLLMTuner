@@ -132,6 +132,11 @@ def all_gather_along(
     if dim < 0:
         dim += x.ndim
     all_gather, _ = functional_collectives()
+    if torch.compiler.is_compiling() and dim != 0:
+        # Nonzero-axis upstream helpers call skipped Python view utilities.
+        # Move the collective axis explicitly so checkpoint regions stay traceable.
+        gathered = all_gather(x.movedim(dim, 0).contiguous(), 0, group)
+        return gathered.movedim(0, dim)
     return all_gather(x.contiguous(), dim, group)
 
 
@@ -148,6 +153,9 @@ def reduce_scatter_along(
     if dim < 0:
         dim += x.ndim
     _, reduce_scatter = functional_collectives()
+    if torch.compiler.is_compiling() and dim != 0:
+        scattered = reduce_scatter(x.movedim(dim, 0).contiguous(), "sum", 0, group)
+        return scattered.movedim(0, dim)
     return reduce_scatter(x.contiguous(), "sum", dim, group)
 
 
