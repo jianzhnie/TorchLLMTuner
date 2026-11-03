@@ -46,6 +46,7 @@ from ...components.metrics import MetricsProcessor
 from ...components.optimizer.ema import EMA
 from ...components.optimizer.lr_scheduler import build_lr_scheduler
 from ...components.optimizer.optimizer import OptimizersContainer
+from ...components.optimizer.state_residency import validate_checkpoint_configuration
 from ...models.common.aux_loss import register_aux_loss_metrics_hook
 from ...models.common.moe.bias_update import (
     register_moe_balancing_hook,
@@ -171,6 +172,7 @@ def _apply_parallelism(
         compile=cfg.training.compile,
         compile_config=cfg.training.compile_config,
         activation_checkpoint=cfg.training.activation_checkpoint_mode,
+        activation_swap=cfg.training.activation_swap,
         selective_ac=cfg.training.selective_ac,
         memory_budget_ac=cfg.training.memory_budget_ac,
         region_ac=cfg.training.region_ac,
@@ -293,6 +295,10 @@ def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> 
     """
     cfg = trainer.cfg
     with synchronize_local_errors("Checkpoint services preparation"):
+        if cfg.checkpoint.enable and cfg.optimizer.state_residency == "npu_virtual":
+            validate_checkpoint_configuration(
+                cfg.checkpoint.backend, cfg.checkpoint.async_mode
+            )
         if trainer.dataloader is None:
             raise RuntimeError(
                 "Trainer dataloader must be initialized before "
