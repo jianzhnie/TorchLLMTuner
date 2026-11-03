@@ -147,15 +147,20 @@ def get_peak_flops(device_name: str) -> float:
     """Peak BF16 tensor throughput in FLOPS for a known accelerator.
 
     Used to turn a measured tokens/s into a model-FLOPs-utilization percentage.
-    The figures are datasheet numbers, so they describe the chip rather than the
-    run: a smaller-model run reports a low MFU and that is the correct answer,
-    not a measurement error.
+    The figures describe a peak reference rather than measured training throughput.
+    Ascend 910C uses the project's agreed 376 TFLOPS per-device BF16 reference;
+    other entries use their documented hardware specifications. A smaller-model
+    run can therefore correctly report a low MFU.
 
     Returns 0.0 for a device with no entry, rather than a plausible-looking
     substitute. MFU is a ratio against this number, so a guess would be reported
     as a fact -- and the caller suppresses MFU entirely when it is 0.
     """
     name = device_name.casefold()
+
+    if "ascend910_9392" in name or "910c" in name:
+        # Project reporting convention, shared with the NPU benchmark recipe.
+        return 376e12
 
     # Sorted so that a more specific name is tested before a substring of it:
     # "GB300" contains "B300", and "MI250X" must not be caught by "MI250".
