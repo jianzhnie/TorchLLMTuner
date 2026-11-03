@@ -18,6 +18,12 @@ from llmtuner.config.optimizer_config import (
     OptimizerConfig,
     ParamGroupConfig,
 )
+from llmtuner.config.optimizer_layout import (
+    BlockShard,
+    BucketConfig,
+    ComputeLayout,
+    Owned,
+)
 from llmtuner.config.parallel_config import (
     ContextParallelConfig,
     ExpertParallelConfig,
@@ -37,7 +43,10 @@ __all__ = [
     "ContextParallelConfig",
     "ExpertParallelConfig",
     "CheckpointConfig",
+    "BlockShard",
+    "BucketConfig",
     "CompileConfig",
+    "ComputeLayout",
     "DataloaderConfig",
     "EMAConfig",
     "LLMTunerConfig",
@@ -46,6 +55,7 @@ __all__ = [
     "MetricsConfig",
     "ModelConfig",
     "OptimizerConfig",
+    "Owned",
     "ParallelConfig",
     "ParamGroupConfig",
     "ProfilerConfig",

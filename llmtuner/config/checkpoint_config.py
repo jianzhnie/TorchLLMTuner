@@ -120,7 +120,8 @@ class CheckpointConfig:
     """Whether to permit loads while disabling all saves."""
 
     async_mode: Literal["disabled", "async", "async_with_pinned_mem"] = "disabled"
-    "DCP save mode: synchronous, threaded async, or pinned-memory async; ignored by "
+    "DCP save mode: synchronous, threaded async, or async with requested pinned-memory "
+    "staging; backend support varies and PyTorch may ignore pinning. Ignored by "
     "torch_checkpointing."
 
     def __post_init__(self) -> None:

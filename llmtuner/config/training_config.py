@@ -24,6 +24,31 @@ from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.errors import ConfigError
 
 
+def validate_activation_swap_options(
+    *, activation_swap: bool, compile: bool, activation_checkpoint: str
+) -> None:
+    """Check saved-tensor hook compatibility before any model transformation.
+
+    Shared by aggregate config validation and direct parallel assembly. Full
+    checkpointing skips swap; selective and region policies own competing hooks.
+    """
+    for name, value in (("activation_swap", activation_swap), ("compile", compile)):
+        if not isinstance(value, bool):
+            raise ConfigError(f"{name} must be bool, got {value!r}")
+    if activation_swap and compile:
+        raise ConfigError(
+            "activation_swap=True requires compile=False because saved-tensor "
+            "copy hooks are Python runtime boundaries, not compile regions."
+        )
+    if activation_swap and activation_checkpoint in ("selective", "region"):
+        raise ConfigError(
+            f"activation_swap=True is incompatible with activation_checkpoint="
+            f"{activation_checkpoint!r}; checkpoint saved-tensor hooks prevent "
+            "activation swap from releasing and restoring tensors. "
+            "Set training.activation_checkpoint_mode='none'; full mode skips swap."
+        )
+
+
 @dataclass
 class TrainingConfig:
     """Training loop hyperparameters and reproducibility."""
@@ -53,6 +78,14 @@ class TrainingConfig:
             "help": "Activation checkpointing: none, full, selective, memory_budget "
             "(requires compile), or region (requires torch_remat). Applied "
             "after TP/EP/CP and before compile/FSDP."
+        },
+    )
+    activation_swap: bool = field(
+        default=False,
+        metadata={
+            "help": "Swap saved decoder activations to pinned Host memory on NPU. "
+            "Works with AC mode 'none'; full AC skips swapping, while selective "
+            "and region AC are incompatible. Also incompatible with compile."
         },
     )
     selective_ac: SelectiveACConfig = field(
@@ -206,7 +239,7 @@ class TrainingConfig:
             raise ConfigError(
                 "training.grad_norm_precision must be float32 or parameter"
             )
-        for name in ("compile", "deterministic", "detect_anomaly"):
+        for name in ("compile", "deterministic", "detect_anomaly", "activation_swap"):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ConfigError(f"training.{name} must be bool, got {value!r}")

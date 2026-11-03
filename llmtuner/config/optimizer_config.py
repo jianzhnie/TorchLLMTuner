@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
+from llmtuner.config.optimizer_layout import BucketConfig, ComputeLayout
 from llmtuner.errors import ConfigError
 
 
@@ -18,7 +19,7 @@ class ParamGroupConfig:
     """Regex matched against parameter FQNs, e.g. ``r".*\\.bias$"``, ``r".*"``."""
 
     optimizer_name: str
-    """Optimizer class for this group's parameters: ``"Adam"`` or ``"AdamW"``."""
+    """Optimizer for this group: ``Adam``, ``AdamW``, or ``DistMuon``."""
 
     optimizer_kwargs: dict[str, Any] = field(default_factory=dict)
     "Per-group optimizer arguments; omitted values use optimizer defaults, not "
@@ -28,7 +29,7 @@ class ParamGroupConfig:
 
 @dataclass
 class OptimizerConfig:
-    """Default Adam/AdamW options and explicit parameter groups."""
+    """Default AdamW options plus explicit Adam, AdamW, or DistMuon groups."""
 
     optimizer_type: Literal["Adam", "AdamW"] = field(
         default="AdamW", metadata={"help": "Optimizer class"}
@@ -56,6 +57,14 @@ class OptimizerConfig:
             "supported device."
         },
     )
+    state_residency: Literal["device", "npu_virtual"] = field(
+        default="device",
+        metadata={
+            "help": "Adam moment storage: device or Host-backed NPU virtual memory. "
+            "npu_virtual requires native DCP checkpoints and is incompatible with "
+            "FSDP CPU offload."
+        },
+    )
     param_groups: list[ParamGroupConfig] = field(
         default_factory=list,
         metadata={
@@ -63,6 +72,17 @@ class OptimizerConfig:
             "one catch-all group built from the flat scalars above. No CLI flag "
             "-- nested dataclass lists cannot be parsed; set it from code."
         },
+    )
+    compute_sharding_by_fqn: dict[str, ComputeLayout] = field(
+        default_factory=dict,
+        metadata={
+            "help": "DistMuon per-parameter compute layouts. Required for every "
+            "DistMuon parameter and rebuilt with matching values before restore."
+        },
+    )
+    bucket_configs: list[BucketConfig] = field(
+        default_factory=list,
+        metadata={"help": "DistMuon packed redistribution buckets."},
     )
     lr_scheduler_config: LRSchedulerConfig = field(
         default_factory=LRSchedulerConfig,
@@ -79,6 +99,11 @@ class OptimizerConfig:
             raise ConfigError(
                 f"Unknown optimizer implementation {self.implementation!r}; "
                 "expected one of 'fused', 'foreach', 'for-loop'."
+            )
+        if self.state_residency not in ("device", "npu_virtual"):
+            raise ConfigError(
+                "optimizer.state_residency must be 'device' or 'npu_virtual', "
+                f"got {self.state_residency!r}"
             )
         # ``list`` is what the parser can build from two CLI values, but the
         # optimizer wants a tuple and the field must not be mutable: an

@@ -32,11 +32,18 @@ class CompileConfig:
             "and TP > 1."
         },
     )
+    enable_sdc: bool = field(
+        default=False,
+        metadata={
+            "help": "Check compiled block outputs for non-finite values; adds "
+            "synchronization and is intended for diagnostics."
+        },
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str) or not self.backend.strip():
             raise ConfigError("compile.backend must be a non-empty string.")
-        for name in ("per_block", "enable_async_tensor_parallel"):
+        for name in ("per_block", "enable_async_tensor_parallel", "enable_sdc"):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigError(f"compile.{name} must be a boolean.")
         if self.enable_async_tensor_parallel and self.backend != "inductor":

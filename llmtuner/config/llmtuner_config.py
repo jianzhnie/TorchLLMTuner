@@ -20,7 +20,10 @@ from llmtuner.config.parallel_config import (
     PipelineParallelConfig,
     TensorParallelConfig,
 )
-from llmtuner.config.training_config import TrainingConfig
+from llmtuner.config.training_config import (
+    TrainingConfig,
+    validate_activation_swap_options,
+)
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.errors import ConfigError
 from llmtuner.utils.logging import get_logger
@@ -100,6 +103,16 @@ class LLMTunerConfig:
         )
 
     def __post_init__(self) -> None:
+        if (
+            self.optimizer.state_residency == "npu_virtual"
+            and self.parallel.fsdp_config.fsdp_cpu_offload
+        ):
+            raise ConfigError(
+                "optimizer.state_residency='npu_virtual' is incompatible with "
+                "parallel.fsdp_config.fsdp_cpu_offload=True: virtual moments "
+                "require NPU parameter tensors, while FSDP CPU offload moves "
+                "parameters to the host."
+            )
         if self.model.attention_backend == "eager_flex" and (
             self.parallel.tp_size > 1
             or self.parallel.cp_size > 1
@@ -126,6 +139,11 @@ class LLMTunerConfig:
                 f"max_seq_len ({self.training.max_seq_len}) must be divisible by "
                 f"cp * tp ({self.parallel.cp_size} * {self.parallel.tp_size})"
             )
+        validate_activation_swap_options(
+            activation_swap=self.training.activation_swap,
+            compile=self.training.compile,
+            activation_checkpoint=self.training.activation_checkpoint_mode,
+        )
         # Async TP is a compiled-TP optimization: without compile there is no
         # inductor pass to pipeline the collectives, and without TP there are
         # no collectives. Reject both halves here so the error names the flag
@@ -254,6 +272,10 @@ class LLMTunerConfig:
     @property
     def detect_anomaly(self) -> bool:
         return self.training.detect_anomaly
+
+    @property
+    def activation_swap(self) -> bool:
+        return self.training.activation_swap
 
     @property
     def pipeline_parallel_schedule(self) -> str:
