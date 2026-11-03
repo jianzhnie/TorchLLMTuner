@@ -120,6 +120,7 @@ __all__ = [
     "apply_ac",
     "full_policy",
     "require_torch_remat",
+    "validate_ac_options",
     "wrap_full",
     "wrap_region",
 ]
@@ -574,6 +575,46 @@ def wrap_region(
     return block
 
 
+def validate_ac_options(
+    mode: str,
+    *,
+    selective: SelectiveACConfig | None = None,
+    memory_budget: MemoryBudgetACConfig | None = None,
+    region: RegionACConfig | None = None,
+    compile_enabled: bool = False,
+) -> None:
+    """Validate policy options without transforming models or changing global flags."""
+    if mode not in VALID_AC_MODES:
+        raise ValueError(
+            f"Unknown activation checkpointing mode {mode!r}; expected one of "
+            f"{VALID_AC_MODES}."
+        )
+    if mode == "selective" and selective is None:
+        raise ValueError(
+            "mode='selective' needs the SelectiveACConfig that carries its "
+            "save set and rng/determinism settings; pass "
+            "selective=cfg.training.selective_ac."
+        )
+    if mode == "region" and region is None:
+        raise ValueError(
+            "mode='region' needs the RegionACConfig that carries its save "
+            "patterns; pass region=cfg.training.region_ac."
+        )
+    if mode == "memory_budget":
+        if memory_budget is None:
+            raise ValueError(
+                "mode='memory_budget' needs the MemoryBudgetACConfig that "
+                "carries the budget; pass "
+                "memory_budget=cfg.training.memory_budget_ac."
+            )
+        if not compile_enabled:
+            raise ValueError(
+                "mode='memory_budget' requires compile: the budget is "
+                "consumed by the compile partitioner, so without "
+                "torch.compile it would silently do nothing."
+            )
+
+
 def apply_ac(
     model: nn.Module,
     mode: str = "none",
@@ -615,37 +656,16 @@ def apply_ac(
     ``"memory_budget"`` the same call site is what guarantees the global is
     set before the compile it governs.
     """
+    validate_ac_options(
+        mode,
+        selective=selective,
+        memory_budget=memory_budget,
+        region=region,
+        compile_enabled=compile_enabled,
+    )
     if mode == "none":
         return model
-    if mode not in VALID_AC_MODES:
-        raise ValueError(
-            f"Unknown activation checkpointing mode {mode!r}; expected one of "
-            f"{VALID_AC_MODES}."
-        )
-    if mode == "selective" and selective is None:
-        raise ValueError(
-            "mode='selective' needs the SelectiveACConfig that carries its "
-            "save set and rng/determinism settings; pass "
-            "selective=cfg.training.selective_ac."
-        )
-    if mode == "region" and region is None:
-        raise ValueError(
-            "mode='region' needs the RegionACConfig that carries its save "
-            "patterns; pass region=cfg.training.region_ac."
-        )
     if mode == "memory_budget":
-        if memory_budget is None:
-            raise ValueError(
-                "mode='memory_budget' needs the MemoryBudgetACConfig that "
-                "carries the budget; pass "
-                "memory_budget=cfg.training.memory_budget_ac."
-            )
-        if not compile_enabled:
-            raise ValueError(
-                "mode='memory_budget' requires compile: the budget is "
-                "consumed by the compile partitioner, so without "
-                "torch.compile it would silently do nothing."
-            )
         apply_memory_budget(memory_budget)
         return model
 
