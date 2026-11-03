@@ -109,6 +109,15 @@ def main():
             reference = RoutedExperts(reference_experts, LocalTokenDispatcher(4, 2))
             dispatcher = AllToAllTokenDispatcher(4, 2)
             dispatcher.set_ep_group(ep_group=dist.group.WORLD)
+            count_exchanges = 0
+            prepare_dispatch_counts = dispatcher.prepare_dispatch_counts
+
+            def count_exchange(counts, prepare_counts=prepare_dispatch_counts):
+                nonlocal count_exchanges
+                count_exchanges += 1
+                return prepare_counts(counts)
+
+            dispatcher.prepare_dispatch_counts = count_exchange
             ops = DistributedOps()
             with patch.object(mc2_dispatch, "load_mc2_ops", lambda ops=ops: ops):
                 model = mc2_dispatch.MC2RoutedExperts(experts, dispatcher)
@@ -174,12 +183,14 @@ def main():
                         lambda *args, ops=ops: (ops, "test", 2),
                     ),
                 ):
+                    exchanges_before_forward = count_exchanges
                     actual = model(
                         x,
                         weights,
                         ids[sl],
                         torch.bincount(ids[sl].flatten(), minlength=4),
                     )
+                    assert count_exchanges == exchanges_before_forward + 1
                     actual.float().sum().backward()
                 expected.float().sum().backward()
                 for got, wanted in (

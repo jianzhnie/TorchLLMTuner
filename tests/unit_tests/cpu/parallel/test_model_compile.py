@@ -73,6 +73,49 @@ _SEQ = 24
 _NUM_LAYERS = 3
 
 
+@pytest.fixture(autouse=True)
+def cpu_compile_device():
+    with pytest.MonkeyPatch.context() as patch:
+        if _IMPORT_ERROR is None:
+            patch.setattr(compile_mod, "device_type", "cpu")
+        yield
+
+
+@requires_runtime
+@pytest.mark.parametrize("selected", [None, "invalid"])
+def test_npu_inductor_requires_launch_backend(monkeypatch, selected):
+    from llmtuner.errors import EnvironmentUnsupportedError
+
+    monkeypatch.setattr(compile_mod, "device_type", "npu")
+    monkeypatch.delenv("TORCHINDUCTOR_NPU_BACKEND", raising=False)
+    if selected is not None:
+        monkeypatch.setenv("TORCHINDUCTOR_NPU_BACKEND", selected)
+    with pytest.raises(EnvironmentUnsupportedError, match="before importing torch"):
+        compile_mod.validate_compile_backend("inductor")
+
+
+@requires_runtime
+@pytest.mark.parametrize("available", [False, True])
+def test_npu_inductor_checks_codegen_capability(monkeypatch, available):
+    from llmtuner.errors import EnvironmentUnsupportedError
+
+    monkeypatch.setattr(compile_mod, "device_type", "npu")
+    monkeypatch.setenv("TORCHINDUCTOR_NPU_BACKEND", "ascendc")
+    probes = []
+
+    def probe(name):
+        probes.append(name)
+        return available
+
+    monkeypatch.setattr(compile_mod, "has", probe)
+    if available:
+        compile_mod.validate_compile_backend("inductor")
+    else:
+        with pytest.raises(EnvironmentUnsupportedError, match="matching CANN"):
+            compile_mod.validate_compile_backend("inductor")
+    assert probes == ["npu_ascendc_codegen"]
+
+
 def _model(seed: int = 0):
     torch.manual_seed(seed)
     config = build_model_config(
@@ -725,3 +768,16 @@ def test_compiled_ac_preserves_modes_identity_and_frozen_gradients(
                 assert parameter.grad is None
     finally:
         torch._dynamo.reset()
+
+
+@requires_runtime
+def test_compile_sdc_accepts_finite_outputs_and_rejects_nan():
+    module = torch.nn.Identity()
+    compile_mod.wrap_sdc_forward(module, "test block")
+    value = torch.ones(2, 3)
+    assert module(value) is value
+
+    module.forward = lambda value: value
+    compile_mod.wrap_sdc_forward(module, "fault injection")
+    with pytest.raises(FloatingPointError, match="fault injection"):
+        module(torch.tensor([1.0, float("nan")]))

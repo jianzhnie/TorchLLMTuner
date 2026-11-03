@@ -297,6 +297,26 @@ def test_optimizer_container_rejects_checkpoint_keys_shared_between_optimizers()
         container.state_dict()
 
 
+@pytest.mark.parametrize("tp,ep", [(False, True), (True, True), (True, False)])
+def test_sharded_restore_rejects_duplicate_local_fqns(tp, ep):
+    from llmtuner.components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+
+    container = object.__new__(OptimizersContainer)
+    container.model_parts = []
+    container.sharded_tensor_parallel = tp
+    container.sharded_expert_parallel = ep
+    container.optimizers = []
+    for _ in range(2):
+        parameter = torch.nn.Parameter(torch.ones(2))
+        container.optimizers.append(
+            torch.optim.AdamW([{"params": [parameter], "param_names": ["weight"]}])
+        )
+    chunk = ChunkedCheckpointTensor((2,), [((0,), torch.zeros(2))])
+    with pytest.raises(ValueError, match="overlap across inner optimizers"):
+        container.load_state_dict({"state.weight.exp_avg": chunk})
+
+
 def test_container_validates_all_checkpoint_states_before_loading_any():
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
 

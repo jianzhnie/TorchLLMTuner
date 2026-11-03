@@ -54,6 +54,21 @@ def test_30b_offload_selects_cpu_optimizer(
     assert config.training.checkpoint_config.last_save_model_only is False
 
 
+def test_30b_offload_configures_prefetch(monkeypatch):
+    monkeypatch.setenv("LLMTUNER_FSDP_FORWARD_PREFETCH_COUNT", "2")
+    monkeypatch.setenv("LLMTUNER_FSDP_BACKWARD_PREFETCH_COUNT", "1")
+    fsdp = qwen3_30b_npu_config().parallel.fsdp_config
+    assert fsdp.fsdp_forward_prefetch_count == 2
+    assert fsdp.fsdp_backward_prefetch_count == 1
+
+
+def test_30b_virtual_optimizer_selects_supported_kernel(monkeypatch):
+    monkeypatch.setenv("LLMTUNER_OPTIMIZER_STATE_RESIDENCY", "npu_virtual")
+    optimizer = qwen3_30b_npu_config().optimizer
+    assert optimizer.state_residency == "npu_virtual"
+    assert optimizer.implementation == "for-loop"
+
+
 def test_30b_example_configures_hsdp_replication(monkeypatch):
     monkeypatch.setenv("LLMTUNER_DATA_PARALLEL_REPLICATE_SIZE", "2")
     config = qwen3_30b_npu_config()
@@ -71,12 +86,27 @@ def test_30b_example_configures_dp_shard8_ep8(monkeypatch):
     assert config.parallel.tensor_parallel_size == 1
 
 
+@pytest.mark.parametrize("dispatcher", ["alltoall", "mc2", "domino"])
+def test_30b_selects_ep_dispatcher(monkeypatch, dispatcher):
+    monkeypatch.setenv("LLMTUNER_EP_TOKEN_DISPATCHER", dispatcher)
+    monkeypatch.setenv("LLMTUNER_EXPERT_PARALLEL_SIZE", "8")
+    monkeypatch.setenv("LLMTUNER_DATA_PARALLEL_SHARD_SIZE", "8")
+    config = qwen3_30b_npu_config()
+    assert config.parallel.ep_config.ep_token_dispatcher == dispatcher
+
+
 def test_npu_example_configures_checkpoint_resume(monkeypatch):
     monkeypatch.setenv("LLMTUNER_CHECKPOINT_INTERVAL", "5")
     monkeypatch.setenv("LLMTUNER_CHECKPOINT_LOAD_STEP", "5")
     config = qwen3_8b_npu_config()
     assert config.training.checkpoint_config.interval == 5
     assert config.training.checkpoint_config.load_step == 5
+
+
+def test_30b_configures_async_checkpoint(monkeypatch):
+    monkeypatch.setenv("LLMTUNER_CHECKPOINT_ASYNC_MODE", "async_with_pinned_mem")
+    checkpoint = qwen3_30b_npu_config().training.checkpoint_config
+    assert checkpoint.async_mode == "async_with_pinned_mem"
 
 
 @pytest.mark.parametrize("enabled", ["0", "1"])
@@ -137,3 +167,30 @@ def test_30b_preserves_explicit_checkpoint_layout(monkeypatch):
     checkpoint = qwen3_30b_npu_config().training.checkpoint_config
     assert not checkpoint.sharded_expert_parallel
     assert not checkpoint.sharded_tensor_parallel
+
+
+@pytest.mark.parametrize(
+    ("backend", "enabled"),
+    [("eager", False), ("aot_eager", True), ("inductor", True)],
+)
+def test_30b_selects_compile_backend(monkeypatch, backend, enabled):
+    monkeypatch.setenv("LLMTUNER_COMPILE_BACKEND", backend)
+    training = qwen3_30b_npu_config().training
+    assert training.compile is enabled
+    assert training.compile_config.per_block is True
+    if enabled:
+        assert training.compile_config.backend == backend
+
+
+def test_30b_rejects_unknown_compile_backend(monkeypatch):
+    monkeypatch.setenv("LLMTUNER_COMPILE_BACKEND", "unknown")
+    with pytest.raises(ValueError, match="LLMTUNER_COMPILE_BACKEND"):
+        qwen3_30b_npu_config()
+
+
+def test_30b_selects_activation_swap_without_checkpointing(monkeypatch):
+    monkeypatch.setenv("LLMTUNER_ACTIVATION_CHECKPOINT_MODE", "none")
+    monkeypatch.setenv("LLMTUNER_ACTIVATION_SWAP", "1")
+    training = qwen3_30b_npu_config().training
+    assert training.activation_checkpoint_mode == "none"
+    assert training.activation_swap

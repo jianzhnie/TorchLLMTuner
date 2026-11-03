@@ -1445,6 +1445,40 @@ def test_expert_local_checkpoint_registration_moves_to_converted_experts():
     }
 
 
+@pytest.mark.parametrize("owner_kind", ["model", "layer", "block"])
+def test_ancestor_checkpoint_registration_preserves_relative_paths(owner_kind):
+    model = _model(_config(norm_topk_prob=True, aux_coeff=0.0))
+    layer = model.layers[0]
+    block = layer.mlp
+    block.shared_expert = torch.nn.Linear(64, 64, bias=False, dtype=torch.float64)
+    owner = {"model": model, "layer": layer, "block": block}[owner_kind]
+    prefix = next(
+        name + "." if name else ""
+        for name, module in owner.named_modules()
+        if module is block
+    )
+    group = object()
+    layouts = {
+        f"{prefix}experts.gate_up_proj": (1, True, group),
+        f"{prefix}experts.down_proj": (2, False, group),
+        f"{prefix}shared_expert.weight": (0, False, group),
+        f"{prefix}gate.weight": (0, False, group),
+    }
+    owner._tp_checkpoint_layouts = layouts
+
+    swap_hf_moe_blocks(model)
+
+    target = layer.mlp if owner_kind == "block" else owner
+    assert target._tp_checkpoint_layouts == {
+        f"{prefix}routed_experts.inner_experts.w1_EFD": (1, False, group),
+        f"{prefix}routed_experts.inner_experts.w3_EFD": (1, False, group),
+        f"{prefix}routed_experts.inner_experts.w2_EDF": (2, False, group),
+        f"{prefix}shared_experts.weight": (0, False, group),
+        f"{prefix}gate.weight": (0, False, group),
+    }
+    assert layouts[f"{prefix}experts.gate_up_proj"] == (1, True, group)
+
+
 def test_checkpoint_layout_failure_rolls_back_auxiliary_registration():
     model = _model(_config(norm_topk_prob=True))
     original = [layer.mlp for layer in model.layers]

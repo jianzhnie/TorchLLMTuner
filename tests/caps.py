@@ -108,6 +108,8 @@ CAPS: dict[str, Callable[[], bool]] = {
     ),
     # Weights & Biases logger
     "wandb": lambda: importable("wandb"),
+    # TensorBoard writer used by the optional metrics sink.
+    "tensorboard": lambda: importable("tensorboard"),
     # torch optimizer state_dicts carry param_names (newer torch)
     "torch_param_names": _torch_param_names,
     # torch._functorch.partitioners (selective-AC default op list)

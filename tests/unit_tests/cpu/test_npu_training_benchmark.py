@@ -5,7 +5,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from examples.npu_training_benchmark import BenchmarkNPUTrainer, summarize_timings
+from examples.npu_training_benchmark import (
+    BenchmarkNPUTrainer,
+    compile_counter_delta,
+    compute_utilization,
+    summarize_resident_memory,
+    summarize_timings,
+)
 from llmtuner.trainer.trainer import Trainer
 
 
@@ -14,6 +20,37 @@ def records(durations):
         {"step": step, "seconds": seconds, "metrics": {"loss": 0.5}}
         for step, seconds in enumerate(durations, 1)
     ]
+
+
+def test_compile_counter_delta_is_scoped_to_one_step():
+    before = {"frames": {"layer": 3}, "recompile_reasons": {"shape": 2}}
+    after = {"frames": {"layer": 4}, "recompile_reasons": {"shape": 2}}
+    assert compile_counter_delta(before, after) == {
+        "frames": {"layer": 1},
+        "recompile_reasons": {"shape": 0},
+    }
+
+
+def test_compute_utilization_uses_global_peak_compute():
+    assert compute_utilization(
+        tokens_per_second=1_000_000,
+        flops_per_token=376_000_000,
+        peak_flops_per_device=376e12,
+        world_size=8,
+    ) == {
+        "tflops": 376.0,
+        "peak_tflops": 3008.0,
+        "utilization_percent": 12.5,
+    }
+
+
+def test_compute_utilization_does_not_guess_unknown_geometry():
+    assert compute_utilization(
+        tokens_per_second=1_000_000,
+        flops_per_token=0,
+        peak_flops_per_device=376e12,
+        world_size=8,
+    ) == {"tflops": None, "peak_tflops": None, "utilization_percent": None}
 
 
 def test_uses_slowest_rank_per_step_and_discards_warmup():
@@ -102,9 +139,14 @@ def test_timer_preserves_iterator_and_metrics_without_auditing(monkeypatch):
         ),
         raising=False,
     )
+    monkeypatch.setattr(
+        "examples.npu_training_benchmark.compile_counter_snapshot", lambda: {}
+    )
     assert observer.train_step(iterator) is metrics
     assert calls == ["sync", "barrier", "sync", "reset", "train", "sync"]
-    assert observer.benchmark_rows == [{"step": 2, "seconds": 3.0, "metrics": metrics}]
+    assert observer.benchmark_rows == [
+        {"step": 2, "seconds": 3.0, "metrics": metrics, "compile_counters": {}}
+    ]
 
 
 def test_failed_step_does_not_receive_a_success_record(monkeypatch):
@@ -160,3 +202,21 @@ def test_rejects_existing_reports_and_implicit_resume(tmp_path, existing):
     )
     with pytest.raises(ValueError, match="fresh"):
         BenchmarkNPUTrainer(cfg, warmup=1)
+
+
+def test_resident_memory_counts_local_parameters_gradients_and_optimizer_state():
+    model = torch.nn.Linear(2, 3, bias=False)
+    optimizer = torch.optim.AdamW(model.parameters())
+    model(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+
+    result = summarize_resident_memory(model, [optimizer])
+
+    expected = model.weight.numel() * model.weight.element_size()
+    assert expected > 0
+    assert result["parameters"] == expected
+    assert result["gradients"] == expected
+    assert result["optimizer_state"]["exp_avg"] == expected
+    assert result["optimizer_state"]["exp_avg_sq"] == expected
+    optimizer.zero_grad(set_to_none=True)
+    assert summarize_resident_memory(model, [optimizer])["gradients"] == 0

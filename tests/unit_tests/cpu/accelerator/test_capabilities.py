@@ -7,6 +7,7 @@ from llmtuner.accelerator.capabilities import CAPABILITIES, has, require
 from llmtuner.errors import EnvironmentUnsupportedError
 
 ALL_NAMES = [
+    "npu_ascendc_codegen",
     "dynamo_capture_scalar_outputs",
     "inductor_micro_pipeline_tp",
     "fx_regional_inductor",

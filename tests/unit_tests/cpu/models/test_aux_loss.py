@@ -24,6 +24,7 @@ depend on the carrier, ``_TraceableLoss`` does not return it downstream.
 
 from __future__ import annotations
 
+import copy
 import sys
 
 from tests.caps import require_env
@@ -126,6 +127,51 @@ def test_checkpoint_recompute_keeps_router_gradient_without_double_metric(mode):
     assert float(block.aux.instance_acc) == pytest.approx(expected_metric)
     assert block.linear.weight.grad is not None
     assert torch.isfinite(block.linear.weight.grad).all()
+
+
+@pytest.mark.parametrize("mode", ["full", "selective"])
+@pytest.mark.parametrize("backward_passes", [1, 2])
+def test_compiled_checkpoint_preserves_aux_gradient_and_metric(mode, backward_passes):
+    torch._dynamo.reset()
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(3, 3)
+            self.aux = _TraceableLoss(coeff=0.3)
+
+        def forward(self, x):
+            y = self.linear(x)
+            return self.aux(y, carrier=y)
+
+    torch.manual_seed(7)
+    reference = Block()
+    block = copy.deepcopy(reference)
+    AuxLoss.set_step_denominator(torch.tensor(6.0))
+    wrapped = (
+        wrap_full(block)
+        if mode == "full"
+        else wrap_selective(block, SelectiveACConfig())
+    )
+    compiled = torch.compile(wrapped, backend="aot_eager", fullgraph=True)
+    for _ in range(2):
+        x = torch.randn(2, 3)
+        expected = reference(x)
+        actual = compiled(x)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for backward in range(backward_passes):
+            retain = backward + 1 < backward_passes
+            expected.square().sum().backward(retain_graph=retain)
+            actual.square().sum().backward(retain_graph=retain)
+        torch.testing.assert_close(
+            block.aux.instance_acc, reference.aux.instance_acc, rtol=0, atol=0
+        )
+        for actual_parameter, expected_parameter in zip(
+            block.parameters(), reference.parameters(), strict=True
+        ):
+            torch.testing.assert_close(
+                actual_parameter.grad, expected_parameter.grad, rtol=0, atol=0
+            )
 
 
 def test_region_checkpoint_retains_aux_metric_region(monkeypatch):

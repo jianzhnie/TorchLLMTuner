@@ -343,6 +343,67 @@ def test_quantile_histogram_accumulation_exceeds_int32_without_wrapping():
     assert histogram.sum().item() == 4294967296
 
 
+@pytest.mark.parametrize("mode", ["full", "selective"])
+@pytest.mark.parametrize("padding", [None, [False, True, False], [True] * 3])
+def test_compiled_quantile_observation_survives_checkpoint_replay(mode, padding):
+    import copy
+
+    from llmtuner.config.activation_checkpoint_config import SelectiveACConfig
+    from llmtuner.memory.activation_checkpoint import wrap_full, wrap_selective
+    from llmtuner.models.common.moe.routing import QuantileBalancer
+
+    torch._dynamo.reset()
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 2)
+            self.balancer = QuantileBalancer(2, 1, 8)
+            self.register_buffer("bias", torch.tensor([-0.1, 0.1]))
+
+        def forward(self, inputs, mask):
+            scores = self.linear(inputs).sigmoid()
+            self.balancer.observe(
+                scores, scores.mean(-1, keepdim=True), self.bias, padding_mask_T=mask
+            )
+            return scores.square()
+
+    torch.manual_seed(41)
+    reference = Block()
+    candidate = copy.deepcopy(reference)
+    wrapped = (
+        wrap_full(candidate)
+        if mode == "full"
+        else wrap_selective(candidate, SelectiveACConfig())
+    )
+    compiled = torch.compile(wrapped, backend="aot_eager", fullgraph=True)
+    mask = None if padding is None else torch.tensor(padding)
+    for _ in range(2):
+        inputs = torch.randn(3, 2)
+        expected = reference(inputs, mask)
+        actual = compiled(inputs, mask)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for retain in (True, False):
+            expected.sum().backward(retain_graph=retain)
+            actual.sum().backward(retain_graph=retain)
+        torch.testing.assert_close(
+            candidate.balancer.required_bias_histogram_EB,
+            reference.balancer.required_bias_histogram_EB,
+            rtol=0,
+            atol=0,
+        )
+        for actual_parameter, expected_parameter in zip(
+            candidate.parameters(), reference.parameters(), strict=True
+        ):
+            torch.testing.assert_close(
+                actual_parameter.grad, expected_parameter.grad, rtol=0, atol=0
+            )
+    expected_tokens = 3 if padding is None else padding.count(False)
+    assert (
+        int(candidate.balancer.required_bias_histogram_EB.sum()) == 4 * expected_tokens
+    )
+
+
 def test_empty_quantile_observations_preserve_existing_bias_exactly():
     from llmtuner.models.common.moe.routing import QuantileBalancer
 

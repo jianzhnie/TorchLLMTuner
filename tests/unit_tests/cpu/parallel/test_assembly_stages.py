@@ -12,6 +12,7 @@ import pytest
 from torch import nn
 
 import llmtuner.parallel as parallel_api
+from llmtuner.config.activation_checkpoint_config import MemoryBudgetACConfig
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.parallel import parallelize
 from llmtuner.parallel.stages import (
@@ -21,7 +22,15 @@ from llmtuner.parallel.stages import (
 
 
 def test_the_full_order_is_the_documented_contract() -> None:
-    assert STAGE_ORDER == ("tp", "ep", "cp", "ac", "compile", "fsdp")
+    assert STAGE_ORDER == (
+        "tp",
+        "ep",
+        "cp",
+        "ac",
+        "activation_swap",
+        "compile",
+        "fsdp",
+    )
 
 
 def test_parallel_public_entries_resolve_to_their_defining_modules():
@@ -41,8 +50,61 @@ def test_parallel_public_entries_resolve_to_their_defining_modules():
         assert implementation.__module__ == f"llmtuner.parallel.{source}"
 
 
+@pytest.mark.parametrize("flag", ["activation_swap", "compile"])
+@pytest.mark.parametrize("invalid", [1, "false", None])
+def test_direct_assembly_rejects_non_boolean_execution_flags(flag, invalid):
+    from llmtuner.errors import ConfigError
+
+    model = nn.Linear(2, 2)
+    forward = model.forward
+    options = {"activation_swap": False, "compile": False}
+    options[flag] = invalid
+    with pytest.raises(ConfigError, match=rf"{flag} must be bool"):
+        parallelize.parallelize_hf_transformers(
+            model, cfg=ParallelConfig(), mesh=None, parallel_dims=None, **options
+        )
+    assert model.forward == forward
+    assert model._compiled_call_impl is None
+
+
 def test_fsdp_wraps_last() -> None:
     assert STAGE_ORDER[-1] == "fsdp"
+
+
+@pytest.mark.parametrize(
+    "mode,options,match",
+    [
+        ("unknown-mode", {}, "Unknown activation checkpointing mode"),
+        ("selective", {}, "SelectiveACConfig"),
+        ("region", {}, "RegionACConfig"),
+        ("memory_budget", {}, "MemoryBudgetACConfig"),
+        (
+            "memory_budget",
+            {"memory_budget_ac": MemoryBudgetACConfig()},
+            "requires compile",
+        ),
+    ],
+)
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_invalid_ac_options_fail_before_parallel_transforms(
+    monkeypatch, mode, options, match, pipeline
+):
+    from types import SimpleNamespace
+
+    def unexpected_transform(*args, **kwargs):
+        pytest.fail("invalid AC options reached a model transformation")
+
+    monkeypatch.setattr(parallelize, "apply_tp", unexpected_transform)
+    monkeypatch.setattr(parallelize, "apply_pp", unexpected_transform)
+    with pytest.raises(ValueError, match=match):
+        parallelize.parallelize_hf_transformers(
+            nn.Linear(2, 2),
+            cfg=ParallelConfig(),
+            mesh=None,
+            parallel_dims=(SimpleNamespace(pp_enabled=True) if pipeline else None),
+            activation_checkpoint=mode,
+            **options,
+        )
 
 
 def test_pipeline_validates_tp_override_before_splitting(monkeypatch):
@@ -136,7 +198,9 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
     parts = [nn.Linear(2, 2), nn.Linear(2, 2)]
     stages = [SimpleNamespace(submod=part) for part in parts]
     expected_order = [
-        name for name in STAGE_ORDER if name != "compile" or compile_enabled
+        name
+        for name in STAGE_ORDER
+        if name != "activation_swap" and (name != "compile" or compile_enabled)
     ]
     seen = []
     dense_mesh = object()
@@ -166,7 +230,10 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
         return apply
 
     for name in STAGE_ORDER:
-        monkeypatch.setattr(parallelize, f"apply_{name}", runner(name))
+        function = (
+            "apply_activation_swap" if name == "activation_swap" else f"apply_{name}"
+        )
+        monkeypatch.setattr(parallelize, function, runner(name))
 
     schedule = object()
 
@@ -270,7 +337,10 @@ def test_fused_ep_dispatch_receives_stage_wide_error_group(monkeypatch, dispatch
     cfg.ep_config.ep_token_dispatcher = dispatcher
     observed = {}
     for name in STAGE_ORDER:
-        monkeypatch.setattr(parallelize, f"apply_{name}", lambda part, **kwargs: part)
+        function = (
+            "apply_activation_swap" if name == "activation_swap" else f"apply_{name}"
+        )
+        monkeypatch.setattr(parallelize, function, lambda part, **kwargs: part)
 
     def apply_ep(part, **kwargs):
         observed.update(kwargs)
@@ -282,3 +352,47 @@ def test_fused_ep_dispatch_receives_stage_wide_error_group(monkeypatch, dispatch
     )
     assert observed["ep_group"] is ep_group
     assert observed["error_group"] is loss_group
+
+
+def test_full_ac_skips_activation_swap(monkeypatch):
+    calls = []
+    monkeypatch.setattr(parallelize, "apply_ac", lambda part, **kwargs: part)
+    monkeypatch.setattr(
+        parallelize,
+        "apply_activation_swap",
+        lambda part: calls.append(part) or part,
+    )
+    parallelize.parallelize_hf_transformers(
+        nn.Linear(2, 2),
+        cfg=ParallelConfig(),
+        mesh=None,
+        parallel_dims=None,
+        activation_checkpoint="full",
+        activation_swap=True,
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("compile_enabled", "ac_mode", "message"),
+    [
+        (True, "none", "requires compile=False"),
+        (False, "selective", "incompatible with activation_checkpoint='selective'"),
+        (False, "region", "incompatible with activation_checkpoint='region'"),
+    ],
+)
+def test_activation_swap_rejects_unsupported_direct_api_combinations(
+    compile_enabled, ac_mode, message
+):
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match=message):
+        parallelize.parallelize_hf_transformers(
+            nn.Linear(2, 2),
+            cfg=ParallelConfig(),
+            mesh=None,
+            parallel_dims=None,
+            compile=compile_enabled,
+            activation_checkpoint=ac_mode,
+            activation_swap=True,
+        )

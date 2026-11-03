@@ -177,6 +177,29 @@ def test_joint_model_preserves_weights_and_global_hf_classes(projection):
     assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters())
 
 
+@pytest.mark.parametrize("backend", ["torch", "aten", "npu"])
+def test_norm_transition_preserves_custom_forward_and_existing_hooks(backend):
+    from types import MethodType
+
+    model = make_model("native")
+    norm = model.layers[-1].post_attention_layernorm
+
+    def custom_forward(self, value):
+        return value * self.weight
+
+    norm.forward = MethodType(custom_forward, norm)
+    before = [
+        (module, module.__dict__.get("forward"), dict(module._forward_pre_hooks))
+        for module in model.model.modules()
+    ]
+    model.model.config.norm_backend = backend
+    with pytest.raises(UnsupportedCombinationError, match="custom RMSNorm forward"):
+        stabilize_residual_norm_gradients(model.model)
+    for module, forward, hooks in before:
+        assert module.__dict__.get("forward") is forward
+        assert module._forward_pre_hooks == hooks
+
+
 def test_joint_backend_reapplication_cleans_only_owned_adaptations():
     model = make_model("native")
     handle = model.layers[0].self_attn.q_norm.register_forward_pre_hook(
@@ -217,6 +240,32 @@ def test_joint_backend_preflight_rejects_norm_hook_contract_changes(kind):
         with pytest.raises(UnsupportedCombinationError, match="hook contracts"):
             apply_joint_residual_norm(model.model)
         assert all("forward" not in layer.__dict__ for layer in model.layers)
+    finally:
+        handle.remove()
+
+
+@pytest.mark.parametrize("backend", ["native", "torch", "aten"])
+def test_failed_joint_transition_preserves_existing_adaptations(backend):
+    model = make_model(backend)
+    norm = model.layers[1].post_attention_layernorm
+    handle = norm.register_forward_hook(lambda *args: None)
+    before = {
+        name: (
+            module.__dict__.get("forward"),
+            dict(module._forward_pre_hooks),
+            dict(module._forward_pre_hooks_with_kwargs),
+        )
+        for name, module in model.named_modules()
+    }
+    try:
+        model.model.config.norm_backend = "joint"
+        with pytest.raises(UnsupportedCombinationError):
+            stabilize_residual_norm_gradients(model.model)
+        for name, module in model.named_modules():
+            forward, hooks, keyword_hooks = before[name]
+            assert module.__dict__.get("forward") is forward
+            assert dict(module._forward_pre_hooks) == hooks
+            assert dict(module._forward_pre_hooks_with_kwargs) == keyword_hooks
     finally:
         handle.remove()
 

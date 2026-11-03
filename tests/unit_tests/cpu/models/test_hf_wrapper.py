@@ -664,6 +664,7 @@ def test_unregistered_model_identifier_uses_pretrained_resolution(
     monkeypatch, identifier
 ):
     from transformers import AutoConfig
+    from transformers.configuration_utils import PretrainedConfig
 
     from llmtuner.config import ModelConfig
 
@@ -673,11 +674,19 @@ def test_unregistered_model_identifier_uses_pretrained_resolution(
         calls.append(name)
         return AutoConfig.for_model("qwen3")
 
+    metadata_calls = []
+
+    def load_metadata(name):
+        metadata_calls.append(name)
+        return {"model_type": "qwen3"}, {}
+
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", load_metadata)
     monkeypatch.setattr(AutoConfig, "from_pretrained", load_config)
     config = build_model_config_for(
         LLMTunerConfig(model=ModelConfig(model_name_or_path=identifier))
     )
     assert calls == [identifier]
+    assert metadata_calls == [identifier]
     assert config.model_type == "qwen3"
 
 

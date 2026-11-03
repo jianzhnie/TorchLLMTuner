@@ -1,11 +1,12 @@
 """Staging failures must finish both caller and upload futures."""
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
 
-from llmtuner.components.checkpointer.distributed_checkpoint import CoordinatedStager
+from llmtuner.components.checkpointer.staging import CoordinatedStager
 
 
 @pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt, SystemExit])
@@ -91,3 +92,27 @@ def test_staging_success_preserves_snapshot_and_completion_boundary(mode):
     stager.synchronize_staging()
     stager.close()
     assert closed == [True]
+
+
+def test_staging_completion_does_not_wait_for_upload_callback():
+    source = Future()
+    stager = CoordinatedStager(SimpleNamespace(stage=lambda state: source), None)
+    upload = stager.stage({})
+    started, release = Event(), Event()
+
+    def upload_callback(future):
+        started.set()
+        assert release.wait(timeout=5)
+
+    upload.add_done_callback(upload_callback)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        staged = executor.submit(source.set_result, {"weight": 1})
+        try:
+            assert started.wait(timeout=5)
+            assert stager.completion.done(), (
+                "staging completion waits on upload callback"
+            )
+            stager.synchronize_staging()
+        finally:
+            release.set()
+            staged.result(timeout=5)

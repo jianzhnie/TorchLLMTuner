@@ -96,11 +96,17 @@ def test_separate_qkv_fp32_rope_preserves_projection_calls():
         handle.remove()
 
 
-def test_fp32_rotary_rejects_custom_forward_before_modifying_any_layer():
+@pytest.mark.parametrize("projection", ["separate", "fused"])
+def test_attention_adapter_rejects_custom_forward_before_modifying_any_layer(
+    projection,
+):
     from transformers import AutoConfig
     from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
 
-    from llmtuner.models.hf.qkv_projection import apply_fp32_rotary_projection
+    from llmtuner.models.hf.qkv_projection import (
+        apply_fp32_rotary_projection,
+        apply_fused_qkv_projection,
+    )
 
     config = AutoConfig.for_model(
         "qwen3",
@@ -109,7 +115,7 @@ def test_fp32_rotary_rejects_custom_forward_before_modifying_any_layer():
         num_key_value_heads=1,
         head_dim=8,
     )
-    config.qkv_projection = "separate"
+    config.qkv_projection = projection
     config.rotary_compute_dtype = "float32"
     first, second = (Qwen3Attention(config, layer_idx=i) for i in range(2))
     second.forward = lambda *args, **kwargs: None
@@ -120,5 +126,8 @@ def test_fp32_rotary_rejects_custom_forward_before_modifying_any_layer():
         ),
     )
     with pytest.raises(UnsupportedCombinationError, match="native attention"):
-        apply_fp32_rotary_projection(wrapper)
+        if projection == "fused":
+            apply_fused_qkv_projection(wrapper)
+        else:
+            apply_fp32_rotary_projection(wrapper)
     assert "forward" not in first.__dict__

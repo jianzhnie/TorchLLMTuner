@@ -66,18 +66,37 @@ def main() -> None:
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.fill_(0.01)
-        tokens = torch.arange(8, device=device) % 32
-        output = model(tokens)
-        assert output.device == device
-        assert torch.isfinite(output).all().item()
-        output.float().mean().backward()
+        transfers = {"h2d_bytes": 0, "d2h_bytes": 0}
+        original_to = torch.Tensor.to
+
+        def measured_to(self, *args, **kwargs):
+            result = original_to(self, *args, **kwargs)
+            if result.device != self.device:
+                key = "h2d_bytes" if self.device.type == "cpu" else "d2h_bytes"
+                transfers[key] += self.numel() * self.element_size()
+            return result
+
+        torch.Tensor.to = measured_to
+        try:
+            tokens = torch.arange(8, device=device) % 32
+            output = model(tokens)
+            assert output.device == device
+            assert torch.isfinite(output).all().item()
+            output.float().mean().backward()
+        finally:
+            torch.Tensor.to = original_to
+        assert transfers["h2d_bytes"] > 0
+        assert transfers["d2h_bytes"] > 0
         assert all(
             parameter.grad is None or torch.isfinite(parameter.grad).all().item()
             for parameter in model.parameters()
         )
         dist.barrier()
         if dist.get_rank() == 0:
-            print("PASS: partial FSDP meta CPU-offload forward/backward on NPU")
+            print(
+                "PASS: partial FSDP meta CPU-offload forward/backward on NPU; "
+                f"transfers={transfers}"
+            )
     finally:
         dist.destroy_process_group()
 

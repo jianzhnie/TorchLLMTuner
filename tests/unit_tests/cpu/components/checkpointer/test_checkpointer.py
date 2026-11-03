@@ -34,6 +34,23 @@ from llmtuner.config import LRSchedulerConfig
 # -- checkpoint step validation ----------------------------------------------
 
 
+def test_host_state_preparation_preserves_namedtuple_and_mapping_metadata():
+    from collections import OrderedDict, namedtuple
+
+    from llmtuner.components.checkpointer.distributed_checkpoint import _state_on_cpu
+
+    Record = namedtuple("Record", ("tensor", "label"))
+    source = OrderedDict(record=Record(torch.ones(2), "cursor"), empty=[])
+    result = _state_on_cpu(source)
+
+    assert type(result) is OrderedDict
+    assert type(result["record"]) is Record
+    assert result["record"].label == "cursor"
+    assert result["record"].tensor.device.type == "cpu"
+    assert result["empty"] == []
+    assert source["record"].tensor is result["record"].tensor
+
+
 @pytest.mark.parametrize(
     "dirname,expected",
     [
@@ -119,6 +136,39 @@ def test_retention_only_queues_canonical_abandoned_staging_directories(
         assert all((checkpoint_folder / name).is_dir() for name in names)
     finally:
         manager.close()
+
+
+def test_pinned_async_uses_thread_executor_without_process_group(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+
+    from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType
+
+    import llmtuner.components.checkpointer.distributed_checkpoint as checkpoint
+    from llmtuner.components.checkpointer.checkpoint_keys import OPTIMIZER
+
+    captured = {}
+    future = Future()
+
+    def async_save(state_dict, **kwargs):
+        captured.update(kwargs)
+        return future
+
+    monkeypatch.setattr(checkpoint.dcp, "async_save", async_save)
+    manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
+    manager.states = {OPTIMIZER: SimpleNamespace(state_residency="device")}
+    manager.stager = object()
+    manager.staging_pg = None
+    manager.pg = None
+    manager._stager_used = False
+
+    manager._save_checkpoint(
+        {},
+        str(tmp_path / "checkpoint"),
+        async_mode=checkpoint.DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM,
+    )
+
+    assert captured["async_checkpointer_type"] == AsyncCheckpointerType.THREAD
 
 
 # -- config validation --------------------------------------------------------

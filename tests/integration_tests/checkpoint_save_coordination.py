@@ -6,7 +6,9 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=2 \
 CPU/Gloo, synchronous and threaded async DCP, real local checkpoint storage.
 """
 
+import os
 from concurrent.futures import Future
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -20,6 +22,53 @@ from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 
 from llmtuner.components.checkpointer import distributed_checkpoint as checkpoint
 from llmtuner.config.checkpoint_config import CheckpointConfig
+
+
+def check_host_preparation_failure(root):
+    """A local host-copy failure must stop peers before DCP and permit retry."""
+    rank = dist.get_rank()
+    for failing_rank in (0, 1):
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters())
+        # Select only the writer policy: this CPU test does not emulate NPU
+        # allocation or claim virtual-storage numerical equivalence.
+        optimizer.state_residency = "npu_virtual"
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
+        folder = root / f"host-preparation-{failing_rank}"
+        manager = checkpoint.DistributedCheckpointManager(
+            CheckpointConfig(enable=True, interval=1, keep_latest_k=0),
+            model_parts=[model],
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            states={},
+            folder=str(folder),
+        )
+        original = checkpoint._state_on_cpu
+
+        def copy_state(value, failing_rank=failing_rank, original=original):
+            if rank == failing_rank:
+                raise OSError("injected host-copy failure")
+            return original(value)
+
+        try:
+            with patch.object(checkpoint, "_state_on_cpu", copy_state):
+                try:
+                    manager.save(1)
+                except OSError as error:
+                    assert rank == failing_rank
+                    assert "injected host-copy failure" in str(error)
+                except RuntimeError as error:
+                    assert rank != failing_rank
+                    assert "Checkpoint host state preparation failed" in str(error)
+                else:
+                    raise AssertionError("host-copy failure was not propagated")
+            dist.barrier()
+            assert not (folder / "checkpoint/step-1/.metadata").exists()
+            assert manager.save(1)
+            assert (folder / "checkpoint/step-1/.metadata").is_file()
+        finally:
+            manager.close()
+        dist.barrier()
 
 
 def check_local_preparation_failure(root):
@@ -799,7 +848,12 @@ def main():
     try:
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
-        with TemporaryDirectory() as local_root:
+        shared_root = os.environ.get("CHECKPOINT_TEST_ROOT")
+        context = nullcontext(shared_root) if shared_root else TemporaryDirectory()
+        with context as local_root:
+            if shared_root:
+                Path(shared_root).mkdir(parents=True, exist_ok=True)
+                dist.barrier()
             roots = [local_root if rank == 0 else None]
             dist.broadcast_object_list(roots)
             root = Path(roots[0])
@@ -898,6 +952,7 @@ def main():
                         "old snapshot, retry and completed retention passed",
                         flush=True,
                     )
+            check_host_preparation_failure(root)
             check_local_preparation_failure(root)
             check_trainer_restore_failure(root)
             check_final_path_visibility(root)

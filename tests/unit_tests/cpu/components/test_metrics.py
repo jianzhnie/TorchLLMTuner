@@ -216,6 +216,7 @@ def test_tflops_is_flops_per_token_times_throughput() -> None:
 def test_mfu_is_none_when_the_device_peak_is_unknown() -> None:
     """A ratio against an unknown denominator is not a measurement."""
     processor = _processor()
+    processor.gpu_peak_flops = 0.0
     assert processor.gpu_peak_flops == 0.0
 
     assert _derive(processor).mfu is None
@@ -229,6 +230,16 @@ def test_mfu_is_computed_against_the_device_peak() -> None:
 
     # mfu = 100 * flops_per_token * tps / peak = 100 * 1000 * 1000 / 1000
     assert _derive(processor).mfu == pytest.approx(100_000.0, rel=1e-3)
+
+
+def test_mfu_uses_the_ascend_910c_dense_bf16_peak() -> None:
+    processor = _processor()
+    processor.gpu_peak_flops = get_peak_flops("Ascend910_9392")
+    processor.add_tokens(376_000_000_000)
+    processor.time_last_log -= 1.0
+
+    assert _derive(processor).tflops == pytest.approx(376.0, rel=1e-3)
+    assert _derive(processor).mfu == pytest.approx(100.0, rel=1e-3)
 
 
 def test_mfu_is_none_when_the_model_geometry_is_unknown() -> None:
@@ -338,6 +349,7 @@ def test_mfu_is_omitted_from_the_report_when_it_is_not_known() -> None:
     """MFU is not merely shown as N/A: the key is absent, so a reader charting
     it gets a gap rather than a zero."""
     processor = _processor()
+    processor.gpu_peak_flops = 0.0
     assert processor.gpu_peak_flops == 0.0
     sink = _RecordingLogger()
     processor.logger = sink
@@ -477,6 +489,7 @@ def test_a_processor_with_nothing_enabled_logs_to_a_no_op() -> None:
 
 
 def test_only_the_metrics_rank_records_unless_all_ranks_are_asked_for() -> None:
+    require_env("tensorboard")
     processor = MetricsProcessor(
         Config(enable_tensorboard=True),
         parallel_dims=_FakeParallelTopology(pp=1, world_size=1),
@@ -541,6 +554,7 @@ def test_a_wandb_misconfiguration_is_not_swallowed(monkeypatch) -> None:
 def test_tensorboard_writes_one_scalar_per_metric(tmp_path) -> None:
     """The one sink with a real writer behind it, checked for the tagged key
     name rather than for the file landing on disk."""
+    require_env("tensorboard")
     writer = TensorBoardLogger(str(tmp_path), tag="run1")
 
     seen: list[tuple[str, float, int]] = []
@@ -706,6 +720,8 @@ def test_the_config_switch_wins_over_a_willing_terminal(monkeypatch) -> None:
 @pytest.mark.parametrize(
     "name, expected",
     [
+        ("Ascend910_9392", 376e12),
+        ("Ascend 910C", 376e12),
         ("NVIDIA A100-SXM4-80GB", 312e12),
         ("NVIDIA A6000", 154.85e12),
         ("NVIDIA H100 NVL", 835e12),

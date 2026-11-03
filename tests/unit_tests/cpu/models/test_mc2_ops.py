@@ -77,10 +77,10 @@ def test_mc2_fused_adapter_gradients_match_independent_linear_reference(counts):
     expected = torch.cat(expected)
     ops = EmulatedOps()
     gate, up = AllToAllGroupedMatmul.apply(
-        inputs, weights, ops, "test", 1, counts, counts
+        inputs, weights, ops, "test", 1, counts, counts, None
     ).chunk(2, dim=-1)
     actual = GroupedMatmulAllToAll.apply(
-        F.silu(gate) * up, down, ops, "test", 1, counts, counts
+        F.silu(gate) * up, down, ops, "test", 1, counts, counts, None
     )
     cotangent = torch.randn_like(expected)
     (actual * cotangent).sum().backward()
@@ -92,12 +92,10 @@ def test_mc2_fused_adapter_gradients_match_independent_linear_reference(counts):
         strict=True,
     ):
         torch.testing.assert_close(got.grad, want.grad)
-    assert ops.calls == [
-        ("dispatch", True),
-        ("combine", True),
-        ("dispatch", False),
-        ("combine", False),
-    ]
+    expected_calls = [("dispatch", True), ("combine", True)]
+    if all(count > 0 for count in counts):
+        expected_calls.extend([("dispatch", False), ("combine", False)])
+    assert ops.calls == expected_calls
 
 
 def test_mc2_missing_package_has_install_hint(monkeypatch):
@@ -112,7 +110,10 @@ def test_mc2_missing_fused_ops_are_rejected(monkeypatch):
         load_mc2_ops()
 
 
-def test_mc2_routed_experts_preserve_separate_weights_and_router_gradients(monkeypatch):
+@pytest.mark.parametrize("zero_receives", [False, True])
+def test_mc2_routed_experts_preserve_separate_weights_and_router_gradients(
+    monkeypatch, zero_receives
+):
     from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
     from llmtuner.parallel.expert_parallel import mc2_dispatch
     from llmtuner.parallel.expert_parallel.token_dispatch import (
@@ -149,6 +150,17 @@ def test_mc2_routed_experts_preserve_separate_weights_and_router_gradients(monke
             )
         ],
     )
+    if zero_receives:
+        monkeypatch.setattr(
+            dispatcher,
+            "_dispatch_token_exchange",
+            lambda routed, output_splits, input_splits: routed,
+        )
+        monkeypatch.setattr(
+            dispatcher,
+            "_combine_token_exchange",
+            lambda routed, input_splits, output_splits: routed,
+        )
     actual_model = mc2_dispatch.MC2RoutedExperts(experts, dispatcher)
     reference_model = RoutedExperts(reference_experts, LocalTokenDispatcher(2, 2))
     inputs = torch.randn(3, 4, dtype=torch.float16, requires_grad=True)
@@ -156,10 +168,15 @@ def test_mc2_routed_experts_preserve_separate_weights_and_router_gradients(monke
     ref_inputs = inputs.detach().clone().requires_grad_()
     ref_scores = scores.detach().clone().requires_grad_()
     ids = torch.tensor([[0, 1], [1, 0], [0, 1]])
+    if zero_receives:
+        ids.zero_()
     counts = torch.bincount(ids.flatten(), minlength=2)
     actual = actual_model(inputs, scores, ids, counts)
     expected = reference_model(ref_inputs, ref_scores, ids, counts)
-    assert hooks == ["pre", "post"]
+    assert hooks == ([] if zero_receives else ["pre", "post"])
+    assert ops.calls == (
+        [] if zero_receives else [("dispatch", True), ("combine", True)]
+    )
     assert [id(parameter) for parameter in experts.parameters()] == parameter_ids
     actual.square().sum().backward()
     expected.square().sum().backward()
