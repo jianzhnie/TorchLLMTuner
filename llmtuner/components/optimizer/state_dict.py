@@ -8,6 +8,7 @@ learning rates, existing state, and the first real Adam step.
 """
 
 import math
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -16,7 +17,30 @@ __all__ = [
     "init_optim_state",
     "get_flat_optim_state_dict",
     "load_flat_optim_state_dict",
+    "collect_local_optimizer_state",
 ]
+
+
+def collect_local_optimizer_state(
+    optimizers: Iterable[torch.optim.Optimizer],
+) -> dict[str, Any]:
+    """Materialize and merge local FQN state without layout communication.
+
+    Callers coordinate local errors before entering TP/EP layout collectives.
+    Optimizer initialization and state-dict hooks must not communicate here.
+    """
+    result: dict[str, Any] = {}
+    for optimizer in optimizers:
+        init_optim_state(optimizer)
+        state = get_flat_optim_state_dict(optimizer)
+        duplicated = result.keys() & state.keys()
+        if duplicated:
+            raise ValueError(
+                "Optimizer checkpoint keys overlap across inner optimizers: "
+                f"{sorted(duplicated)}. Model parts must use unique parameter FQNs."
+            )
+        result.update(state)
+    return result
 
 
 def init_optim_state(optim: torch.optim.Optimizer) -> None:
@@ -37,6 +61,9 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     the materialized state is then reset, so the first real update is still Adam
     step 1. Existing gradients and optimizer state are preserved.
 
+    DistMuon explicitly initializes local momentum instead: a synthetic step
+    would execute layout collectives inside checkpoint's local error boundary.
+
     No-op when every parameter that requires a gradient already has state.
 
     An ``OptimizersContainer`` is itself an ``Optimizer``, so wrapping this in a
@@ -44,6 +71,12 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     multi-optimizer case: the reset branch below is type-gated on Adam, and
     would be skipped silently if a container were handed in whole.
     """
+    from .flex_shard.dist_muon import DistMuon
+
+    if isinstance(optim, DistMuon):
+        optim.initialize_state()
+        return
+
     params = [
         param for param_group in optim.param_groups for param in param_group["params"]
     ]

@@ -7,8 +7,10 @@ optimizers, while the container exposes their parameters to clipping and hooks.
 
 Checkpoint state is materialized and flattened by ``state_dict.py``. Expert
 states are gathered/sliced through the EP checkpoint adapter. Fused kernel
-selection falls back according to device support. DistMuon, bf16 optimizer
-states, and upstream optimizer factory metadata are not implemented here.
+selection falls back according to device support. DistMuon is implemented in
+``flex_shard`` and selected through explicit parameter-group configuration;
+bf16 optimizer states and upstream optimizer factory metadata are not
+implemented here.
 """
 
 from __future__ import annotations
@@ -45,10 +47,15 @@ from ...parallel.tensor_parallel.checkpointing import (
 )
 from ...utils.logging import get_logger
 from ...utils.module_names import canonical_fqn
+from .flex_shard.dist_muon import DistMuon
 from .state_dict import (
-    get_flat_optim_state_dict,
+    collect_local_optimizer_state,
     init_optim_state,
     unflatten_optim_state_dict,
+)
+from .state_residency import (
+    install_state_residency,
+    validate_virtual_optimizer_groups,
 )
 
 if TYPE_CHECKING:
@@ -155,6 +162,7 @@ class OptimizersContainer(Optimizer, Stateful):
         self.model_parts = list(model_parts)
         self.sharded_tensor_parallel = sharded_tensor_parallel
         self.sharded_expert_parallel = sharded_expert_parallel
+        self.state_residency = config.state_residency
 
         pipeline_group = (
             pipeline_mesh.get_group()
@@ -225,9 +233,26 @@ class OptimizersContainer(Optimizer, Stateful):
                                 "Model parts must use unique parameter FQNs."
                             )
                         checkpoint_names.update(names)
+
+            def build_dist_muon(groups: list[dict]) -> DistMuon:
+                ns_devices = {group.get("ns_device") for group in groups}
+                if len(ns_devices) != 1:
+                    raise ValueError(
+                        "DistMuon ns_device must be identical across parameter groups"
+                    )
+                for group in groups:
+                    group.pop("ns_device", None)
+                return DistMuon(
+                    groups,
+                    compute_sharding_by_fqn=config.compute_sharding_by_fqn,
+                    bucket_configs=config.bucket_configs,
+                    ns_device=ns_devices.pop(),
+                )
+
             optimizer_factories: dict[str, Callable[..., Optimizer]] = {
                 "Adam": torch.optim.Adam,
                 "AdamW": torch.optim.AdamW,
+                "DistMuon": build_dist_muon,
             }
             for groups_by_opt_name in model_group_plans:
                 for name in groups_by_opt_name:
@@ -251,6 +276,12 @@ class OptimizersContainer(Optimizer, Stateful):
                                 f"{opt_name} optimizer_kwargs contain unknown options: "
                                 f"{sorted(unknown)}"
                             )
+                    if opt_name == "DistMuon" and config.state_residency != "device":
+                        raise ValueError(
+                            "DistMuon requires optimizer.state_residency='device'; "
+                            "npu_virtual currently supports Adam/AdamW moments only."
+                        )
+                    install_state_residency(optimizer, config.state_residency)
                     self.optimizers.append(optimizer)
                     self._log_optimizer(optimizer, part_idx, groups.patterns)
 
@@ -354,11 +385,14 @@ class OptimizersContainer(Optimizer, Stateful):
                 continue
 
             optimizer_groups = groups[param_group_config.optimizer_name]
+            group_impl_kwargs = (
+                {} if param_group_config.optimizer_name == "DistMuon" else impl_kwargs
+            )
             optimizer_groups.param_groups.append(
                 {
                     "params": params,
                     "param_names": param_names,
-                    **impl_kwargs,
+                    **group_impl_kwargs,
                     **param_group_config.optimizer_kwargs,
                 }
             )
@@ -475,19 +509,8 @@ class OptimizersContainer(Optimizer, Stateful):
         coordinated before any TP/EP checkpoint gathering. State-dict and
         initialization hooks must not communicate inside this local phase.
         """
-        result: dict[str, Any] = {}
         with synchronize_local_errors("Optimizer checkpoint construction"):
-            for optimizer in self.optimizers:
-                init_optim_state(optimizer)
-                optimizer_state = get_flat_optim_state_dict(optimizer)
-                duplicated = result.keys() & optimizer_state.keys()
-                if duplicated:
-                    raise ValueError(
-                        "Optimizer checkpoint keys overlap across inner optimizers: "
-                        f"{sorted(duplicated)}. Model parts must use unique "
-                        "parameter FQNs."
-                    )
-                result.update(optimizer_state)
+            result = collect_local_optimizer_state(self.optimizers)
         # Expert optimizer states are rank-heterogeneous like the expert
         # weights themselves; gather them to the full tensors the checkpoint
         # stores (parallel/expert_parallel/checkpointing.py).
@@ -524,22 +547,16 @@ class OptimizersContainer(Optimizer, Stateful):
         from ..checkpointer.chunked_tensor import ChunkedCheckpointTensor
 
         if self.sharded_tensor_parallel and self.sharded_expert_parallel:
-            local_state = {}
             with synchronize_local_errors(
                 "Optimizer joint chunk destination construction"
             ):
-                for optimizer in self.optimizers:
-                    init_optim_state(optimizer)
-                    local_state.update(get_flat_optim_state_dict(optimizer))
+                local_state = collect_local_optimizer_state(self.optimizers)
             state_dict = restore_disjoint_tp_ep_state(
                 state_dict, local_state=local_state, model_parts=self.model_parts
             )
         elif self.sharded_expert_parallel:
-            local_state = {}
             with synchronize_local_errors("Optimizer EP destination construction"):
-                for optimizer in self.optimizers:
-                    init_optim_state(optimizer)
-                    local_state.update(get_flat_optim_state_dict(optimizer))
+                local_state = collect_local_optimizer_state(self.optimizers)
             state_dict = restore_sharded_expert_state(
                 state_dict,
                 local_state=local_state,
@@ -553,11 +570,8 @@ class OptimizersContainer(Optimizer, Stateful):
         elif self.sharded_tensor_parallel and any(
             isinstance(value, ChunkedCheckpointTensor) for value in state_dict.values()
         ):
-            local_state = {}
             with synchronize_local_errors("Optimizer chunk destination construction"):
-                for optimizer in self.optimizers:
-                    init_optim_state(optimizer)
-                    local_state.update(get_flat_optim_state_dict(optimizer))
+                local_state = collect_local_optimizer_state(self.optimizers)
             local_state = gather_expert_state(
                 local_state,
                 shard_map=expert_shard_map(self.model_parts),
@@ -587,6 +601,16 @@ class OptimizersContainer(Optimizer, Stateful):
                 unflatten_optim_state_dict(optimizer, flat_state=state_dict)
                 for optimizer in self.optimizers
             ]
+            for optimizer, optimizer_state in zip(
+                self.optimizers, optimizer_states, strict=True
+            ):
+                if isinstance(optimizer, DistMuon):
+                    optimizer.validate_param_groups(optimizer_state["param_groups"])
+            if getattr(self, "state_residency", "device") == "npu_virtual":
+                # Check every optimizer before any load hook applies values.
+                # Keep policy failures inside the rank-coordinated boundary.
+                for optimizer_state in optimizer_states:
+                    validate_virtual_optimizer_groups(optimizer_state["param_groups"])
         for optimizer, optimizer_state in zip(
             self.optimizers, optimizer_states, strict=True
         ):

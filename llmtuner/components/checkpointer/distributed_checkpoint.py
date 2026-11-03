@@ -38,6 +38,7 @@ import queue
 import threading
 import time
 from concurrent.futures import Future
+from copy import copy
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -78,71 +79,32 @@ from .checkpoint_keys import (
 from .checkpoint_writer import GenerationFileSystemWriter
 from .hf_storage import save_hf_checkpoint
 from .load_planner import CheckpointLoadPlanner
+from .staging import CoordinatedStager
 from .storage import FilesystemCheckpointStorage
 
 logger = get_logger(__name__)
-
-
-class CoordinatedStager:
-    """Agree on local staging success before any upload worker can save.
-
-    The manager owns the underlying stager and the dedicated Gloo group. A
-    callback may communicate from a staging thread, so this group must never
-    be reused for training or the PROCESS executor's initialization broadcast.
-    """
-
-    should_synchronize_after_execute = False
-
-    def __init__(self, stager: Any, group: dist.ProcessGroup | None) -> None:
-        self.stager = stager
-        self.group = group
-        self.completion: Future[None] = Future()
-
-    def stage(self, state_dict: dict[str, Any]) -> Future:
-        try:
-            staged = self.stager.stage(state_dict)
-        except BaseException as error:
-            staged = Future()
-            staged.set_exception(error)
-        if not isinstance(staged, Future):
-            value = staged
-            staged = Future()
-            staged.set_result(value)
-        coordinated: Future = Future()
-
-        def finish(source: Future) -> None:
-            try:
-                with synchronize_local_errors("Checkpoint staging", group=self.group):
-                    snapshot = source.result()
-            except BaseException as error:
-                self.completion.set_exception(error)
-                if not isinstance(error, Exception):
-                    # PyTorch 2.14 staging callbacks catch Exception only.
-                    # Keep the original interrupt for the training thread,
-                    # but finish the upload future without killing a worker.
-                    upload_error = RuntimeError("Checkpoint staging interrupted")
-                    upload_error.__cause__ = error
-                    coordinated.set_exception(upload_error)
-                else:
-                    coordinated.set_exception(error)
-            else:
-                coordinated.set_result(snapshot)
-                self.completion.set_result(None)
-
-        staged.add_done_callback(finish)
-        return coordinated
-
-    def synchronize_staging(self) -> None:
-        self.completion.result()
-
-    def close(self) -> None:
-        self.stager.close()
 
 
 class DistributedCheckpointAsyncMode(str, enum.Enum):
     DISABLED = "disabled"
     ASYNC = "async"
     ASYNC_WITH_PINNED_MEM = "async_with_pinned_mem"
+
+
+def _state_on_cpu(value: Any) -> Any:
+    """Move checkpoint tensor leaves without changing container metadata."""
+    if isinstance(value, torch.Tensor):
+        return value.cpu()
+    if isinstance(value, dict):
+        result = copy(value)
+        for key, child in value.items():
+            result[key] = _state_on_cpu(child)
+        return result
+    if isinstance(value, tuple) and hasattr(value, "_fields"):
+        return type(value)(*(_state_on_cpu(child) for child in value))
+    if isinstance(value, list | tuple):
+        return type(value)(_state_on_cpu(child) for child in value)
+    return value
 
 
 class DistributedCheckpointManager(BaseCheckpointManager):
@@ -482,10 +444,26 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     GarbageCollection.collect("GC collection invoked by checkpointer.")
             return None
 
-        # Writer construction only resolves local storage/path policy. Agree
-        # on success before any peer starts the DCP save protocol.
+        virtual_optimizer_save = (
+            getattr(self.states[OPTIMIZER], "state_residency", "device")
+            == "npu_virtual"
+            and async_mode == DistributedCheckpointAsyncMode.DISABLED
+        )
+        if virtual_optimizer_save:
+            # Device-to-host copies are local. Coordinate allocation/copy errors
+            # before any peer enters the distributed writer protocol.
+            with synchronize_local_errors("Checkpoint host state preparation"):
+                state_dict = {
+                    category: value if category == OPTIMIZER else _state_on_cpu(value)
+                    for category, value in state_dict.items()
+                }
+
+        # Agree on writer construction before peers enter the DCP save protocol.
         with synchronize_local_errors("Checkpoint writer construction"):
-            storage_writer = GenerationFileSystemWriter(checkpoint_id)
+            writer_options = (
+                {"per_thread_copy_ahead": 0} if virtual_optimizer_save else {}
+            )
+            storage_writer = GenerationFileSystemWriter(checkpoint_id, **writer_options)
 
         if async_mode == DistributedCheckpointAsyncMode.ASYNC:
             ret = dcp.async_save(
@@ -496,17 +474,24 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             )
         elif async_mode == DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM:
             stager = CoordinatedStager(self.stager, self.staging_pg)
+            self._stager_used = True
+            # The process executor reads rank information from the default PG.
+            # Standalone trainers have no PG, so keep their upload asynchronous
+            # with the thread executor instead.
+            checkpointer_type = (
+                AsyncCheckpointerType.PROCESS
+                if dist.is_initialized()
+                else AsyncCheckpointerType.THREAD
+            )
             ret = dcp.async_save(
                 state_dict,
                 storage_writer=storage_writer,
                 checkpoint_id=checkpoint_id,
                 process_group=self.pg,
-                async_checkpointer_type=AsyncCheckpointerType.PROCESS,
+                async_checkpointer_type=checkpointer_type,
                 async_stager=stager,
             )
-            if isinstance(stager, CoordinatedStager) and isinstance(
-                ret, AsyncSaveResponse
-            ):
+            if isinstance(ret, AsyncSaveResponse):
                 # PyTorch 2.14 marks an already-completed staging future as
                 # successful without checking its exception. Keep our result.
                 ret.staging_completion = stager.completion
@@ -717,6 +702,13 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 # All ranks enter even when a peer retained its stager after a
                 # previous failed preparation. No save worker has started yet.
                 with synchronize_local_errors("Checkpoint stager construction"):
+                    # Previous upload/staging has been joined above. Some torch
+                    # releases clear DefaultStager's copy dispatch after staging,
+                    # so only unused instances may be retained across attempts.
+                    if self.stager is not None and getattr(self, "_stager_used", False):
+                        self.stager.close()
+                        self.stager = None
+                        self._stager_used = False
                     if self.stager is None:
                         self.stager = DefaultStager(
                             StagingOptions(
@@ -734,7 +726,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 async_mode=self.async_mode,
             )
             if self.async_mode == DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM:
-                # No GC needed on this path: the staging buffers are reused.
+                # The manager owns staging resources until the upload is joined.
                 if isinstance(result, AsyncSaveResponse):
                     self.staging_future = result.staging_completion
                     self.save_future = result.upload_completion
