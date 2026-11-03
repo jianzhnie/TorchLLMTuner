@@ -251,6 +251,11 @@ def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None
         for name, weights in zip(
             (gate_name, up_name, down_name), (gates, ups, downs), strict=True
         ):
+            if len({id(weight) for weight in weights}) != len(weights):
+                raise UnsupportedCombinationError(
+                    "EP cannot stack a shared individual expert parameter "
+                    f"for {name}; stacked rows cannot preserve expert weight tying."
+                )
             if len({weight.requires_grad for weight in weights}) != 1:
                 raise UnsupportedCombinationError(
                     "EP cannot stack experts with different requires_grad flags "
