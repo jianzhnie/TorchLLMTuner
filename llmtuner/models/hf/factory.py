@@ -16,7 +16,7 @@ from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-from ..architecture import get_model_architecture, registered_model_architectures
+from ..architecture import get_model_architecture
 from .attention_backend import ATTENTION_BACKEND
 
 if TYPE_CHECKING:
@@ -55,22 +55,28 @@ def build_model_config(
             config = architecture.config_factory(**overrides)
         if hasattr(config, "text_config"):
             config.text_config.max_position_embeddings = max(
-                config.text_config.max_position_embeddings, seq_len
+                getattr(config.text_config, "max_position_embeddings", seq_len), seq_len
             )
         return config
 
-    # Saved configs identify their architecture by model_type, not by this path.
-    # Register lightweight local configs; model/kernel imports stay lazy.
-    for custom_architecture in registered_model_architectures():
+    # Resolve only the selected architecture's hooks before constructing any
+    # config. HF may still cache an older class after an exist_ok replacement.
+    metadata, _ = PretrainedConfig.get_config_dict(model_name_or_path)
+    architecture = get_model_architecture(metadata.get("model_type", ""))
+    if architecture is not None:
+        # Refresh even an existing HF entry: exist_ok registry replacement must
+        # also take effect when loading a saved configuration.
         AutoConfig.register(
-            custom_architecture.model_type,
-            custom_architecture.config_type_loader(),
+            architecture.model_type,
+            architecture.config_type_loader(),
             exist_ok=True,
         )
     config = AutoConfig.from_pretrained(model_name_or_path)
     text_config = getattr(config, "text_config", config)
+    # Custom configs need not declare a positional limit. Match offline
+    # construction, which supplies the requested length when it is absent.
     text_config.max_position_embeddings = max(
-        text_config.max_position_embeddings, seq_len
+        getattr(text_config, "max_position_embeddings", seq_len), seq_len
     )
     return config
 

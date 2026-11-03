@@ -1,13 +1,13 @@
-"""The model layer: the HF adaptation, and the model vocabulary it is built on.
+"""Model registration, HF adaptation, and reusable model components.
 
-Two halves, and the split is the one that matters when reading code:
+Responsibilities are split across three layers:
 
 * ``architecture.py`` -- the lightweight registration seam for custom HF types.
 * ``hf/`` -- the adaptation layer: ``factory.py`` builds the HF config and
   resolves the model class, ``model.py`` holds the ``HFTransformerModel`` the
   trainer drives, ``flops.py`` counts the MFU denominator, and
-  ``state_dict_adapter.py`` maps the checkpoint FQNs. Only this half knows about
-  Hugging Face.
+  ``state_dict_adapter.py`` maps the checkpoint FQNs. Runtime Hugging Face
+  adaptation belongs here.
 * ``common/`` -- the model vocabulary, vendored from torchtitan
   ``models/common/``: attention pieces (``attention/``), MoE (``moe/``),
   feed-forward, linear, embedding, RoPE, activations, the aux-loss carrier and

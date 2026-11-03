@@ -53,8 +53,14 @@ def register_model_architecture(
     architecture: ModelArchitecture, *, exist_ok: bool = False
 ) -> None:
     """Register construction hooks without importing model implementations."""
-    if not architecture.model_type:
+    if (
+        not isinstance(architecture.model_type, str)
+        or not architecture.model_type.strip()
+    ):
         raise ValueError("model_type must be a non-empty string")
+    for name in ("config_factory", "config_type_loader", "model_class_loader"):
+        if not callable(getattr(architecture, name)):
+            raise TypeError(f"Model architecture {name} must be callable")
     previous = _ARCHITECTURES.get(architecture.model_type)
     if previous is not None and not exist_ok:
         raise ValueError(

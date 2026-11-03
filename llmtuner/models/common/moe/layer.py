@@ -38,7 +38,7 @@ from numbers import Real
 import torch
 import torch.nn as nn
 
-from llmtuner.models.common.aux_loss import in_checkpoint_recompute
+from llmtuner.models.common.aux_loss import accumulate_forward_metric
 
 from .experts import RoutedExperts
 from .routing import QuantileBalancedTopKRouter, TokenChoiceTopKRouter
@@ -276,7 +276,7 @@ class MoE(nn.Module):
             out_TD = out_TD + self.shared_experts(x_TD)
         # Commit this block's observations only after both expert paths succeed.
         # Earlier accumulated microbatches remain owned by the optimizer step.
-        if self.training and not in_checkpoint_recompute.get():
+        if self.training:
             with torch.no_grad():
                 # Count the original forward only: selective replay and early
                 # stopping need not replay every microbatch equally.
@@ -288,7 +288,7 @@ class MoE(nn.Module):
                     if padding_mask_T is None
                     else (routing_map_TE & ~padding_mask_T.unsqueeze(-1)).sum(dim=0)
                 )
-                self.tokens_per_expert_E.add_(valid_counts_E)
+                accumulate_forward_metric(self.tokens_per_expert_E, valid_counts_E)
 
         return out_TD
 

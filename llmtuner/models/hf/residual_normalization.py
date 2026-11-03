@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import MethodType
 from typing import Any
 
@@ -165,8 +166,10 @@ def forward_joint_residual_block(
     return residual + module.mlp(hidden_states)
 
 
-def apply_joint_residual_norm(model: nn.Module) -> None:
-    """Install paired norm/block forwards only after validating every instance."""
+def validate_joint_residual_norm(
+    model: nn.Module, *, allowed_norm_forwards: tuple[Callable, ...] = ()
+) -> None:
+    """Validate the whole decoder before changing normalization policy."""
     if getattr(model.config, "norm_backend", "native") != "joint":
         raise ValueError("model.norm_backend must be 'joint' for joint installation")
     if model.config.model_type != "qwen3":
@@ -187,13 +190,19 @@ def apply_joint_residual_norm(model: nn.Module) -> None:
             if type(module) is not Qwen3RMSNorm or (
                 "forward" in module.__dict__
                 and getattr(module.forward, "__func__", None)
-                is not forward_joint_residual_norm
+                not in (forward_joint_residual_norm, *allowed_norm_forwards)
             ):
                 raise UnsupportedCombinationError(
                     "model.norm_backend='joint' requires native residual "
                     "RMSNorm modules"
                 )
             _validate_norm_hooks(module)
+
+
+def apply_joint_residual_norm(model: nn.Module) -> None:
+    """Install paired norm/block forwards only after validating every instance."""
+    validate_joint_residual_norm(model)
+    layers = list(model.model.layers)
     for layer in layers:
         layer.forward = MethodType(forward_joint_residual_block, layer)
         for module in (layer.input_layernorm, layer.post_attention_layernorm):

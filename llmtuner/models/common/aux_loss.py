@@ -44,6 +44,30 @@ in_checkpoint_recompute: ContextVar[bool] = ContextVar(
 )
 
 
+@torch.library.custom_op("llmtuner::accumulate_forward_metric", mutates_args={"acc"})
+def _accumulate_forward_metric(acc: torch.Tensor, value: torch.Tensor) -> None:
+    if not in_checkpoint_recompute.get():
+        acc.add_(value)
+
+
+@_accumulate_forward_metric.register_fake
+def _accumulate_forward_metric_fake(acc: torch.Tensor, value: torch.Tensor) -> None:
+    pass
+
+
+def accumulate_forward_metric(acc: torch.Tensor, value: torch.Tensor) -> None:
+    """Commit detached observations without tracing the runtime replay context.
+
+    Compiled graphs declare the buffer mutation explicitly; eager keeps its
+    direct update without custom-op dispatch. Call under no_grad with values
+    that do not participate in differentiation.
+    """
+    if torch.compiler.is_compiling():
+        _accumulate_forward_metric(acc, value)
+    elif not in_checkpoint_recompute.get():
+        acc.add_(value)
+
+
 class AuxLossInjection(torch.autograd.Function):
     """Identity forward that injects an aux-loss gradient on the backward pass.
 
@@ -206,9 +230,8 @@ class AuxLoss(nn.Module):
         injected = raw_sum * (self.coeff * scale)
         # Accumulate the metric in the forward. The no_grad mask keeps the
         # buffer out of the autograd graph.
-        if not in_checkpoint_recompute.get():
-            with torch.no_grad():
-                self.instance_acc.add_(raw_sum * scale)
+        with torch.no_grad():
+            accumulate_forward_metric(self.instance_acc, (raw_sum * scale).detach())
         return AuxLossInjection.apply(carrier, injected)
 
 

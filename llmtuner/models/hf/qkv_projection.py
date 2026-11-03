@@ -171,14 +171,10 @@ def forward_fused_qkv_attention(
     return module.o_proj(output), weights
 
 
-def apply_fused_qkv_projection(model: nn.Module) -> None:
-    """Install only on validated Qwen3 instances, before parallel transforms."""
-    if getattr(model.config, "qkv_projection", "separate") != "fused":
-        raise ValueError("model.qkv_projection must be 'fused' for fused installation")
+def _qwen3_attention_modules(model: nn.Module, *, feature: str) -> list[nn.Module]:
+    """Validate shared forward ownership before either adapter changes modules."""
     if model.config.model_type not in ("qwen3", "qwen3_moe"):
-        raise UnsupportedCombinationError(
-            "model.qkv_projection='fused' requires Qwen3 or Qwen3-MoE."
-        )
+        raise UnsupportedCombinationError(f"{feature} requires Qwen3 or Qwen3-MoE.")
     attention_type = (
         Qwen3Attention if model.config.model_type == "qwen3" else Qwen3MoeAttention
     )
@@ -186,15 +182,26 @@ def apply_fused_qkv_projection(model: nn.Module) -> None:
     for module in attention_modules:
         if type(module) is not attention_type:
             raise UnsupportedCombinationError(
-                "model.qkv_projection='fused' requires native Qwen3 attention."
+                f"{feature} requires native attention modules from Qwen3."
             )
         if "forward" in module.__dict__ and (
             getattr(module.forward, "__func__", None) is not forward_fused_qkv_attention
         ):
             raise UnsupportedCombinationError(
-                "model.qkv_projection='fused' cannot replace a custom "
+                f"{feature} requires native attention; cannot replace a custom "
                 "attention forward."
             )
+    return attention_modules
+
+
+def apply_fused_qkv_projection(model: nn.Module) -> None:
+    """Install only on validated Qwen3 instances, before parallel transforms."""
+    if getattr(model.config, "qkv_projection", "separate") != "fused":
+        raise ValueError("model.qkv_projection must be 'fused' for fused installation")
+    attention_modules = _qwen3_attention_modules(
+        model, feature="model.qkv_projection='fused'"
+    )
+    for module in attention_modules:
         _validate_projections(module)
     for module in attention_modules:
         module.forward = MethodType(forward_fused_qkv_attention, module)
@@ -209,18 +216,6 @@ def apply_fp32_rotary_projection(model: nn.Module) -> None:
         raise ValueError(
             "FP32 rotary installation requires rotary_compute_dtype=float32"
         )
-    if model.config.model_type not in ("qwen3", "qwen3_moe"):
-        raise UnsupportedCombinationError("FP32 RoPE requires Qwen3 or Qwen3-MoE")
-    attention_type = (
-        Qwen3Attention if model.config.model_type == "qwen3" else Qwen3MoeAttention
-    )
-    modules = [layer.self_attn for layer in model.model.layers]
-    for module in modules:
-        if type(module) is not attention_type or (
-            "forward" in module.__dict__
-            and getattr(module.forward, "__func__", None)
-            is not forward_fused_qkv_attention
-        ):
-            raise UnsupportedCombinationError("FP32 RoPE requires native attention")
+    modules = _qwen3_attention_modules(model, feature="FP32 RoPE")
     for module in modules:
         module.forward = MethodType(forward_fused_qkv_attention, module)

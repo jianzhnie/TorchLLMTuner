@@ -431,6 +431,64 @@ class QuantileBalancedTopKRouter(TokenChoiceTopKRouter):
         return topk_plus_one_expert_ids_TK1[:, : self.top_k].contiguous()
 
 
+def _observe_quantile_histogram(
+    histogram_EB: torch.Tensor,
+    scores_TE: torch.Tensor,
+    cutoff_T1: torch.Tensor,
+    expert_bias_E: torch.Tensor,
+    padding_mask_T: torch.Tensor | None,
+) -> None:
+    if in_checkpoint_recompute.get():
+        return
+    if padding_mask_T is not None:
+        valid_mask_T = ~padding_mask_T
+        scores_TE = scores_TE[valid_mask_T]
+        cutoff_T1 = cutoff_T1[valid_mask_T]
+    lower_bound = expert_bias_E.min() - 1.0
+    num_bins = histogram_EB.shape[1]
+    bin_width = (expert_bias_E.max() - expert_bias_E.min() + 2.0) / num_bins
+    required_bias_TE = cutoff_T1 - scores_TE
+    bin_indices_TE = torch.floor((required_bias_TE - lower_bound) / bin_width).to(
+        torch.int64
+    )
+    bin_indices_ET = bin_indices_TE.clamp_(0, num_bins - 1).transpose(0, 1)
+    histogram_EB.scatter_add_(
+        1,
+        bin_indices_ET,
+        torch.ones_like(
+            bin_indices_ET,
+            dtype=histogram_EB.dtype,
+        ),
+    )
+
+
+@torch.library.custom_op(
+    "llmtuner::observe_quantile_histogram", mutates_args={"histogram_EB"}
+)
+def _compiled_observe_quantile_histogram(
+    histogram_EB: torch.Tensor,
+    scores_TE: torch.Tensor,
+    cutoff_T1: torch.Tensor,
+    expert_bias_E: torch.Tensor,
+    padding_mask_T: torch.Tensor | None,
+) -> None:
+    # Dynamic padding filtering and replay-state lookup stay at runtime.
+    _observe_quantile_histogram(
+        histogram_EB, scores_TE, cutoff_T1, expert_bias_E, padding_mask_T
+    )
+
+
+@_compiled_observe_quantile_histogram.register_fake
+def _observe_quantile_histogram_fake(
+    histogram_EB: torch.Tensor,
+    scores_TE: torch.Tensor,
+    cutoff_T1: torch.Tensor,
+    expert_bias_E: torch.Tensor,
+    padding_mask_T: torch.Tensor | None,
+) -> None:
+    pass
+
+
 class QuantileBalancer(nn.Module):
     """Accumulate and recover histogram-based quantile bias updates.
 
@@ -482,26 +540,19 @@ class QuantileBalancer(nn.Module):
         Padding tokens are filtered out first: a bias estimated from tokens
         that carry no loss would balance the wrong distribution.
         """
-        if not self.training or in_checkpoint_recompute.get():
+        if not self.training:
             return
-        if padding_mask_T is not None:
-            valid_mask_T = ~padding_mask_T
-            scores_TE = scores_TE[valid_mask_T]
-            cutoff_T1 = cutoff_T1[valid_mask_T]
-        lower_bound = expert_bias_E.min() - 1.0
-        bin_width = (expert_bias_E.max() - expert_bias_E.min() + 2.0) / self.num_bins
-        required_bias_TE = cutoff_T1 - scores_TE
-        bin_indices_TE = torch.floor((required_bias_TE - lower_bound) / bin_width).to(
-            torch.int64
+        observe = (
+            _compiled_observe_quantile_histogram
+            if torch.compiler.is_compiling()
+            else _observe_quantile_histogram
         )
-        bin_indices_ET = bin_indices_TE.clamp_(0, self.num_bins - 1).transpose(0, 1)
-        self.required_bias_histogram_EB.scatter_add_(
-            1,
-            bin_indices_ET,
-            torch.ones_like(
-                bin_indices_ET,
-                dtype=self.required_bias_histogram_EB.dtype,
-            ),
+        observe(
+            self.required_bias_histogram_EB,
+            scores_TE,
+            cutoff_T1,
+            expert_bias_E,
+            padding_mask_T,
         )
 
     def estimate_expert_bias(
