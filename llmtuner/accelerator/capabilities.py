@@ -200,6 +200,13 @@ CAPABILITIES: dict[str, Capability] = {
         hint="Upgrade torch, use backend='inductor', or run without compile.",
         consumers="parallel/model_compile.py (aot_eager backend on flex models)",
     ),
+    "npu_ascendc_codegen": Capability(
+        importable("torch_npu._inductor.ascendc"),
+        what="torch_npu._inductor.ascendc and the matching CANN AutoFuse runtime",
+        since="torch_npu with the built-in AscendC Inductor backend",
+        hint="Install the matching torch_npu/CANN runtime, or use aot_eager/eager.",
+        consumers="parallel/model_compile.py (NPU inductor backend)",
+    ),
     # -- symmetric memory (consumers: parallel/model_compile.py, tensor_parallel) ----
     "symm_mem": Capability(
         importable("torch.distributed._symmetric_memory", "enable_symm_mem_for_group"),
