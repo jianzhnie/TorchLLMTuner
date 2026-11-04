@@ -106,6 +106,15 @@ def validate_compile_backend(backend: str) -> None:
     logger.info("NPU Inductor Codegen: ascendc")
 
 
+def validate_compile_environment(config: CompileConfig | None) -> None:
+    """Resolve the selected backend before parallel transforms modify the model."""
+    backend = "inductor" if config is None else config.backend
+    validate_compile_backend(backend)
+    from torch._dynamo.backends.registry import lookup_backend
+
+    lookup_backend(backend)
+
+
 def _check_finite_output(output, name: str) -> None:
     if isinstance(output, torch.Tensor):
         if not torch.isfinite(output).all().item():
@@ -158,10 +167,7 @@ def apply_compile(
         raise TypeError("per_block compile requires a model with a .layers module")
 
     # Resolve registered/custom backends before changing module or global flags.
-    validate_compile_backend(compile_config.backend)
-    from torch._dynamo.backends.registry import lookup_backend
-
-    lookup_backend(compile_config.backend)
+    validate_compile_environment(compile_config)
     has_moe = bool(collect_moe_layers(model))
     if has_moe:
         # Token-choice dispatch sizes its expert splits from the routing,

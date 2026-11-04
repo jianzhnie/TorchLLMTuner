@@ -410,7 +410,10 @@ def _resolve_shared_fsdp_units(
     # ownership before any transformation replaces the original Parameters.
     groups = {name: {name} for name in [*unit_names, ""]}
     parameter_owners: dict[nn.Parameter, set[str]] = {}
-    for module_name, module in model.named_modules():
+    # An aliased child may execute under several selected parents. Walking only
+    # its canonical path would hide the other owners and split shared storage
+    # across independent FSDP states.
+    for module_name, module in model.named_modules(remove_duplicate=False):
         owner = next(
             (
                 name

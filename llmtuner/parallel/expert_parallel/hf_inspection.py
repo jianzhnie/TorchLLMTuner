@@ -251,6 +251,11 @@ def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None
         for name, weights in zip(
             (gate_name, up_name, down_name), (gates, ups, downs), strict=True
         ):
+            if len({(weight.dtype, weight.device) for weight in weights}) != 1:
+                raise UnsupportedCombinationError(
+                    "EP cannot stack experts with different dtypes or devices "
+                    f"for {name}; one grouped parameter requires uniform storage."
+                )
             if len({id(weight) for weight in weights}) != len(weights):
                 raise UnsupportedCombinationError(
                     "EP cannot stack a shared individual expert parameter "
@@ -374,7 +379,30 @@ def is_hf_moe_block(module: nn.Module) -> bool:
     experts = fused_experts_of(module)
     if experts is None:
         return False
-    return has_router_weight(router_of(module)) and resolve_top_k(module) is not None
+    router = router_of(module)
+    if not has_router_weight(router) or resolve_top_k(module) is None:
+        return False
+    projection_devices = {
+        experts.gate_EFD.device,
+        experts.up_EFD.device,
+        experts.down_EDF.device,
+    }
+    if projection_devices != {router.weight.device}:
+        raise UnsupportedCombinationError(
+            "EP cannot convert a MoE whose router and routed expert "
+            "projections are on different devices; move the complete MoE "
+            "block to one device before conversion."
+        )
+    _, shared = resolve_shared_expert(module)
+    if shared is not None and any(
+        parameter.device != router.weight.device for parameter in shared.parameters()
+    ):
+        raise UnsupportedCombinationError(
+            "EP cannot convert a MoE whose shared expert parameters are on a "
+            "different device from its router; move the complete MoE block "
+            "to one device before conversion."
+        )
+    return True
 
 
 def resolve_shared_expert(block: nn.Module) -> tuple[str, nn.Module | None]:

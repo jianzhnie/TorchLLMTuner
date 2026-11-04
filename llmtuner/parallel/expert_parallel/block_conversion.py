@@ -241,11 +241,21 @@ def convert_block(
         load_balance_coeff=load_balance_coeff,
     )
 
-    # Match the block's dtype/device before the copies so they are exact, and
-    # keep its mode: a fresh module defaults to training=True, which would
-    # flip eval-built models (aux-loss injection, token counting) back on.
-    moe.to(dtype=router_gate.weight.dtype, device=router_gate.weight.device)
+    # Allocate the large expert subtree in its source dtype directly, avoiding
+    # temporary FP32 expert storage when only the router needs FP32.
+    moe.to(dtype=experts.gate_EFD.dtype, device=router_gate.weight.device)
+    router.to(dtype=router_gate.weight.dtype, device=router_gate.weight.device)
+    # Routers may intentionally stay FP32 while expert GEMMs use BF16.
+    # Allocate each projection in its source dtype before copying: casting
+    # through the router dtype can otherwise change precision and memory use.
+    for target, source in (
+        (grouped.w1_EFD, experts.gate_EFD),
+        (grouped.w3_EFD, experts.up_EFD),
+        (grouped.w2_EDF, experts.down_EDF),
+    ):
+        target.data = target.data.to(device=source.device, dtype=source.dtype)
     restore_fp32_state_buffers(moe)
+    # Preserve eval mode too: new modules otherwise default to training.
     moe.train(block.training)
     router.gate.weight.requires_grad_(router_gate.weight.requires_grad)
     grouped.w1_EFD.requires_grad_(experts.gate_EFD.requires_grad)

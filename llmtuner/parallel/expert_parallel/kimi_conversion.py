@@ -104,12 +104,20 @@ def convert_kimi_block(
         ("w3", "w3_EFD"),
     ):
         source = [getattr(expert, source_name).weight for expert in block.experts]
+        if len({(weight.dtype, weight.device) for weight in source}) != 1:
+            raise UnsupportedCombinationError(
+                "Kimi EP cannot stack experts with different dtypes or devices "
+                f"for {source_name}; one grouped parameter requires uniform storage"
+            )
         if len({weight.requires_grad for weight in source}) != 1:
             raise UnsupportedCombinationError(
                 "Kimi EP cannot stack experts with different requires_grad flags "
                 f"for {source_name}"
             )
         target = getattr(experts, target_name)
+        # Different projections may retain different precision under autocast.
+        # Copying every projection into w1's dtype would change optimizer state.
+        target.data = target.data.to(device=source[0].device, dtype=source[0].dtype)
         target.requires_grad_(source[0].requires_grad)
         with torch.no_grad():
             target.copy_(torch.stack(source[start : start + local_count]))

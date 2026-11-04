@@ -10,6 +10,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...utils.logging import get_logger
 from .. import compatibility
 from .domino_dispatch import DominoRoutedExperts
+from .mc2_ops import validate_mc2_world_size
 from .model_replacement import MoEReplacementObserver, swap_hf_moe_blocks
 
 logger = get_logger(__name__)
@@ -41,6 +42,8 @@ def apply_ep(
     tokens cross ranks by all-to-all; the two are orthogonal to the CP
     attention kernel, so CP and EP compose freely.
     """
+    if cfg.ep_config.ep_token_dispatcher == "mc2":
+        validate_mc2_world_size(cfg.ep_size)
     if cfg.ep_size == 1:
         if cfg.ep_config.moe_quantile_balancing:
             compatibility.quantile_requires_ep()

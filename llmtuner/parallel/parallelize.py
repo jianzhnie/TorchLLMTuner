@@ -28,17 +28,21 @@ from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.config.training_config import validate_activation_swap_options
 
+from ..accelerator.collectives import synchronize_local_errors
 from ..memory.activation_checkpoint import apply_ac, validate_ac_options
 from ..memory.activation_swap import apply_activation_swap
 from .compatibility import chunked_loss_fsdp
 from .context_parallel.context_parallel import apply_cp
 from .expert_parallel.expert_parallel import apply_ep
-from .fully_shard_parallel.fully_shard_parallel import apply_fsdp
+from .fully_shard_parallel.fully_shard_parallel import (
+    apply_fsdp,
+    validate_fsdp_environment,
+)
 from .fully_shard_parallel.plan import (
     FSDPPatternReferences,
     resolve_pipeline_fsdp_configs,
 )
-from .model_compile import apply_compile
+from .model_compile import apply_compile, validate_compile_environment
 from .module_patterns import resolve_module_patterns
 from .pipeline_parallel.pipeline_parallel import (
     PipelineParallelSetup,
@@ -92,6 +96,12 @@ def parallelize_hf_transformers(
         region=region_ac,
         compile_enabled=compile,
     )
+    validate_fsdp_environment(cfg, parallel_dims)
+    # Backend registration and optional codegen imports are rank-local. Stop
+    # every peer before any model transform if one environment is unavailable.
+    if compile:
+        with synchronize_local_errors("Parallel compile environment validation"):
+            validate_compile_environment(compile_config)
 
     if chunked_loss_num_chunks > 1 and compile and parallel_dims is not None:
         if parallel_dims.dp_cp_enabled:

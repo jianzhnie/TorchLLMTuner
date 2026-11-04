@@ -14,6 +14,18 @@ import torch.distributed as dist
 
 from llmtuner.errors import EnvironmentUnsupportedError
 
+MC2_SUPPORTED_WORLD_SIZES = (8, 16, 32, 64)
+
+
+def validate_mc2_world_size(world_size: int) -> None:
+    """Reject EP degrees unsupported by Ascend's grouped all-to-all kernels."""
+    if world_size not in MC2_SUPPORTED_WORLD_SIZES:
+        supported = ", ".join(map(str, MC2_SUPPORTED_WORLD_SIZES))
+        raise EnvironmentUnsupportedError(
+            f"MC2 requires an EP world size in {{{supported}}}, got {world_size}; "
+            "use a supported EP degree or select the alltoall dispatcher."
+        )
+
 
 def load_mc2_ops():
     """Require the real fused operators; never substitute unfused collectives."""
@@ -36,13 +48,15 @@ def mc2_communication_context(group: dist.ProcessGroup, device: torch.device):
     """Resolve the HCCL name using the group's global rank, as upstream does."""
     if device.type != "npu":
         raise EnvironmentUnsupportedError("MC2 requires NPU tensors and an HCCL group")
+    world_size = dist.get_world_size(group)
+    validate_mc2_world_size(world_size)
     ops = load_mc2_ops()
     rank = dist.get_global_rank(group, dist.get_rank(group))
     backend = group._get_backend(device)
     get_name = getattr(backend, "get_hccl_comm_name", None)
     if not callable(get_name):
         raise EnvironmentUnsupportedError("MC2 requires HCCL get_hccl_comm_name")
-    return ops, get_name(rank), dist.get_world_size(group)
+    return ops, get_name(rank), world_size
 
 
 def _expert_counts(counts: list[int], world_size: int, device: torch.device):

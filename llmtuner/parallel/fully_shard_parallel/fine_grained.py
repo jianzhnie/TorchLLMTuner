@@ -31,6 +31,18 @@ def validate_fsdp_hook_target(
         raise ValueError("hook_module must implement forward, not be a container")
 
 
+def load_custom_fsdp_engine() -> Callable:
+    """Resolve optional private APIs before any model transformations."""
+    try:
+        from .fine_grained_state import apply_fine_grained_fsdp
+    except ImportError as error:
+        raise EnvironmentUnsupportedError(
+            "custom FSDP requires PyTorch 2.14 compatible private FSDP APIs; "
+            "install a compatible PyTorch build or select fsdp_implementation='native'"
+        ) from error
+    return apply_fine_grained_fsdp
+
+
 def fully_shard_fine_grained(
     module: nn.Module | list[nn.Module],
     *,
@@ -51,13 +63,7 @@ def fully_shard_fine_grained(
     validate_fsdp_hook_target(
         [module] if isinstance(module, nn.Module) else module, hook_module
     )
-    try:
-        from .fine_grained_state import apply_fine_grained_fsdp
-    except ImportError as error:
-        raise EnvironmentUnsupportedError(
-            "custom FSDP requires PyTorch 2.14 compatible private FSDP APIs; "
-            "install a compatible PyTorch build or select fsdp_implementation='native'"
-        ) from error
+    apply_fine_grained_fsdp = load_custom_fsdp_engine()
     return apply_fine_grained_fsdp(
         module,
         hook_module=hook_module,

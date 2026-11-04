@@ -22,11 +22,12 @@ from torch.nn import ModuleDict
 from llmtuner.config.parallel_config import ParallelConfig
 
 from ...accelerator.capabilities import has as capability
+from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_backend, is_distributed
 from ...utils.logging import get_logger
 from ..compatibility import chunked_loss_fsdp
 from ..topology import ParallelTopology
-from .fine_grained import get_fsdp_strategy
+from .fine_grained import get_fsdp_strategy, load_custom_fsdp_engine
 from .plan import apply_fsdp_by_pattern, set_fsdp_prefetch_windows
 
 logger = get_logger(__name__)
@@ -128,6 +129,25 @@ def resolve_sparse_fsdp_mesh(parallel_dims: ParallelTopology) -> DeviceMesh | No
     submesh = parallel_dims.get_optional_mesh(axes)
     assert submesh is not None  # efsdp is kept alive whenever ep > 1
     return submesh
+
+
+def validate_fsdp_environment(
+    cfg: ParallelConfig, parallel_dims: ParallelTopology | None
+) -> None:
+    """Reject an unavailable custom engine before parallel assembly mutates weights.
+
+    A single-rank FSDP no-op must not acquire optional engine dependencies.
+    """
+    if cfg.fsdp_config.fsdp_implementation != "custom" or parallel_dims is None:
+        return
+    dense_mesh = resolve_fsdp_mesh(parallel_dims)
+    sparse_mesh = resolve_sparse_fsdp_mesh(parallel_dims)
+    if dense_mesh.size() > 1 or (sparse_mesh is not None and sparse_mesh.size() > 1):
+        # Mesh resolution may create process groups, so only the local import
+        # belongs inside this error boundary. All assembly ranks must stop
+        # before transformations if one host lacks the optional private APIs.
+        with synchronize_local_errors("Custom FSDP environment validation"):
+            load_custom_fsdp_engine()
 
 
 def iter_fsdp_modules(model: nn.Module) -> Iterator[FSDPModule]:
@@ -457,18 +477,22 @@ def apply_fsdp_to_decoder(
     # Root-owned registrations may alias a parameter inside a decoder unit.
     # Exclude every planned layer subtree when collecting the remaining owners;
     # recursively inspecting the root would incorrectly merge all units.
-    nested_modules = {
-        descendant
-        for module in [
-            *boundary,
-            *[block for _, block in iter_transformer_layers(model.layers)],
-        ]
-        for descendant in module.modules()
+    nested_roots = {
+        *boundary,
+        *[block for _, block in iter_transformer_layers(model.layers)],
     }
+    nested_paths = []
+    root_modules = []
+    for path, module in model.named_modules(remove_duplicate=False):
+        if any(path == root or path.startswith(f"{root}.") for root in nested_paths):
+            continue
+        if module in nested_roots:
+            nested_paths.append(path)
+        else:
+            root_modules.append(module)
     root_parameters = {
         parameter
-        for module in model.modules()
-        if module not in nested_modules
+        for module in root_modules
         for parameter in module.parameters(recurse=False)
     }
     if root_owned_boundaries:
