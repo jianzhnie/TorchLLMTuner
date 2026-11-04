@@ -347,3 +347,54 @@ def test_caller_owned_storage_does_not_create_unused_host_copies(
     metrics = activation_swap.activation_swap_metrics()
     assert metrics["copies_d2h"] == metrics["copies_h2d"] == 0, metrics
     assert metrics["host_bytes_current"] == baseline, metrics
+
+
+def test_host_budget_shared_across_forwards_and_reusable_after_cleanup(cpu_copies):
+    gc.collect()
+    activation_swap.reset_activation_swap_metrics()
+    budget = activation_swap._HostBudget(limit=24)
+    first = activation_swap._ForwardSwapState(budget=budget)
+    second = activation_swap._ForwardSwapState(budget=budget)
+    packed = first.pack(torch.ones(2, 3))
+    retained = second.pack(torch.full((2, 3), 2.0))
+    assert isinstance(retained, torch.Tensor)
+    assert budget.current == 24
+    assert len(second.packed) == 0
+    assert activation_swap.activation_swap_metrics()["host_bytes_peak"] == 24
+    first.release(outputs=())
+    torch.testing.assert_close(activation_swap._unpack(packed), torch.ones(2, 3))
+    # CPU .to(cpu) aliases the Host tensor, unlike the real H2D transfer.
+    # Keep the reservation until every such owner is gone.
+    del packed, first
+    gc.collect()
+    assert budget.current == 0
+    assert isinstance(second.pack(retained), activation_swap._SwappedActivation)
+    del second
+    gc.collect()
+    assert budget.current == 0
+
+
+def test_host_budget_reservation_released_when_allocation_fails(
+    cpu_copies, monkeypatch
+):
+    budget = activation_swap._HostBudget(limit=24)
+    state = activation_swap._ForwardSwapState(budget=budget)
+    baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+
+    def fail(*args, **kwargs):
+        raise MemoryError("pinned allocation failed")
+
+    monkeypatch.setattr(torch, "empty_like", fail)
+    with pytest.raises(MemoryError, match="pinned allocation"):
+        state.pack(torch.ones(2, 3))
+    assert budget.current == 0
+    assert activation_swap.activation_swap_metrics()["host_bytes_current"] == baseline
+
+
+@pytest.mark.parametrize("limit", [-1, True, 1.5, "1024"])
+def test_activation_swap_rejects_invalid_host_budget(limit):
+    from llmtuner.config import TrainingConfig
+    from llmtuner.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="activation_swap_max_host_bytes"):
+        TrainingConfig(activation_swap_max_host_bytes=limit)

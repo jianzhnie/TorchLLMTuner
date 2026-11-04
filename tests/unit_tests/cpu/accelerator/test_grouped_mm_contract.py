@@ -57,3 +57,21 @@ def test_invalid_empty_metadata_is_rejected(
                 run()
         else:
             run()
+
+
+@pytest.mark.parametrize(
+    ("left_shape", "right_shape"),
+    [((0, 8), (3, 8, 16)), ((8, 0), (0, 16)), ((3, 8, 16), (16, 0))],
+)
+def test_empty_fake_matches_runtime_metadata(left_shape, right_shape):
+    left = torch.empty(left_shape, dtype=torch.bfloat16)
+    right = torch.empty(right_shape, dtype=torch.bfloat16)
+    offsets = torch.zeros(3, dtype=torch.int32)
+    actual = aligned_npu_grouped_mm(left, right, offsets)
+    with FakeTensorMode() as mode:
+        fake = aligned_npu_grouped_mm(
+            mode.from_tensor(left), mode.from_tensor(right), mode.from_tensor(offsets)
+        )
+    assert fake.shape == actual.shape
+    assert fake.stride() == actual.stride()
+    assert fake.dtype == actual.dtype

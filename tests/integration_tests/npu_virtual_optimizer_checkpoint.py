@@ -19,10 +19,34 @@ from llmtuner.config import (
     OptimizerConfig,
     TrainingConfig,
 )
+from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.trainer.trainer import Trainer
 
 
 def check_closure_moment_allocation() -> None:
+    for option in ("amsgrad", "capturable", "differentiable", "fused"):
+        for keyword in (False, True):
+            value = torch.nn.Parameter(torch.tensor([1.0, -0.5], device="npu"))
+            initial = value.detach().clone()
+            guarded = torch.optim.AdamW([value], foreach=False)
+            install_state_residency(guarded, "npu_virtual")
+
+            def unsupported_closure(value=value, guarded=guarded, option=option):
+                value.square().sum().backward()
+                guarded.param_groups[0][option] = True
+
+            try:
+                if keyword:
+                    guarded.step(closure=unsupported_closure)
+                else:
+                    guarded.step(unsupported_closure)
+            except UnsupportedCombinationError as error:
+                assert option in str(error)
+            else:
+                raise AssertionError(f"closure bypassed virtual guard: {option}")
+            assert not guarded.state
+            torch.testing.assert_close(value, initial, rtol=0, atol=0)
+
     parameter = torch.nn.Parameter(torch.tensor([1.0, -0.5], device="npu"))
     reference = torch.nn.Parameter(parameter.detach().clone())
     optimizer = torch.optim.AdamW([parameter], lr=0.01, foreach=False)

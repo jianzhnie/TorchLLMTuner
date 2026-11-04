@@ -25,7 +25,11 @@ from llmtuner.trainer.trainer import Trainer
 
 
 def _run(
-    directory: Path, swap: bool, ac_mode: str, sync_release: bool = False
+    directory: Path,
+    swap: bool,
+    ac_mode: str,
+    sync_release: bool = False,
+    max_host_bytes: int = 0,
 ) -> tuple[dict[str, torch.Tensor], int, int, dict[str, float | int]]:
     activation_swap.reset_activation_swap_metrics()
     tp_size = int(os.environ.get("NPU_SWAP_TP_SIZE", "1"))
@@ -45,6 +49,7 @@ def _run(
             activation_checkpoint_mode=ac_mode,
             activation_swap=swap,
             activation_swap_sync_release=sync_release,
+            activation_swap_max_host_bytes=max_host_bytes,
             checkpoint_config=CheckpointConfig(enable=False),
         ),
     )
@@ -233,6 +238,40 @@ def verify_owned_storage_skips() -> None:
         print(f"PASS activation swap owned storage {source}: {metrics}")
 
 
+def verify_host_budget() -> None:
+    class Layer(torch.nn.Module):
+        def forward(self, value):
+            return value.sin().square()
+
+    gc.collect()
+    activation_swap.reset_activation_swap_metrics()
+    baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([Layer(), Layer()])
+    activation_swap.apply_activation_swap(model, max_host_bytes=4096)
+    values = [
+        torch.linspace(-1, 1, 1024, device="npu").requires_grad_() for _ in range(2)
+    ]
+    references = [value.detach().clone().requires_grad_() for value in values]
+    outputs = [layer(value) for layer, value in zip(model.layers, values, strict=True)]
+    metrics = activation_swap.activation_swap_metrics()
+    assert metrics["copies_d2h"] == 1, metrics
+    assert metrics["host_bytes_current"] == baseline + 4096, metrics
+    assert metrics["host_bytes_peak"] == baseline + 4096, metrics
+    sum(output.sum() for output in outputs).backward()
+    sum(value.sin().square().sum() for value in references).backward()
+    for value, reference in zip(values, references, strict=True):
+        torch.testing.assert_close(value.grad, reference.grad, rtol=0, atol=0)
+        assert value.grad.count_nonzero().item() > 0
+    del outputs, model
+    gc.collect()
+    torch.npu.synchronize()
+    metrics = activation_swap.activation_swap_metrics()
+    assert metrics["host_bytes_current"] == baseline, metrics
+    assert metrics["copies_h2d"] == 1, metrics
+    print(f"PASS activation swap shared Host budget: {metrics}")
+
+
 def main() -> None:
     if not torch.npu.is_available():
         raise RuntimeError("activation swap integration requires a visible NPU")
@@ -278,9 +317,18 @@ def main() -> None:
     for name, value in synchronous.items():
         torch.testing.assert_close(value, asynchronous[name], rtol=0, atol=0, msg=name)
     print("PASS activation_swap_sync_release: updates match asynchronous release")
+    bounded, _, released, metrics = _run(
+        root / "none" / "bounded", swap=True, ac_mode="none", max_host_bytes=1
+    )
+    for name, value in bounded.items():
+        torch.testing.assert_close(value, asynchronous[name], rtol=0, atol=0, msg=name)
+    assert released == 0, released
+    assert metrics["copies_d2h"] == metrics["copies_h2d"] == 0, metrics
+    print("PASS activation swap configuration budget: retained-device updates exact")
     verify_discarded_graph_cleanup()
     verify_retained_graph_reuse()
     verify_owned_storage_skips()
+    verify_host_budget()
 
 
 if __name__ == "__main__":
