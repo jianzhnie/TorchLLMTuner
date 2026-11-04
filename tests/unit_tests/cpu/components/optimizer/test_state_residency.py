@@ -584,3 +584,24 @@ def test_virtual_load_rejects_malformed_state_before_host_allocation(
     source.step()
     target.step()
     torch.testing.assert_close(target_parameter, parameter, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("counter", [float("nan"), float("inf"), -1, True, "1"])
+def test_virtual_load_rejects_invalid_step_before_host_allocation(monkeypatch, counter):
+    monkeypatch.setattr(
+        "llmtuner.components.optimizer.state_residency.device_type", "npu"
+    )
+    value = torch.nn.Parameter(torch.ones(2))
+    source = torch.optim.AdamW([value], foreach=False)
+    value.grad = torch.ones_like(value)
+    source.step()
+    checkpoint = deepcopy(source.state_dict())
+    checkpoint["state"][0]["step"] = counter
+    target_value = torch.nn.Parameter(torch.ones(2))
+    target = torch.optim.AdamW([target_value], foreach=False)
+    calls = []
+    install_state_residency(target, "npu_virtual", allocator=_allocator(calls))
+    with pytest.raises(ValueError, match="Invalid Adam step"):
+        target.load_state_dict(checkpoint)
+    assert not calls
+    assert not target.state

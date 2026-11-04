@@ -202,6 +202,11 @@ def test_fused_downshifts_where_torch_ships_no_fused_kernel(monkeypatch) -> None
     the flag rides in the param group here, so the bare flag used to survive
     construction and kill the first ``step()`` with a NotImplementedError."""
     monkeypatch.setattr(optimizer_module, "device_type", "cpu")
+    # Current PyTorch ships CPU fused AdamW. Exercise an explicitly missing
+    # capability rather than relying on the historical CPU kernel list.
+    monkeypatch.setattr(
+        optimizer_module, "fused_kernel_device_types", lambda: frozenset({"cuda"})
+    )
 
     container = OptimizersContainer(
         _cfg(_catch_all(), implementation="fused"), model_parts=[_model()]
