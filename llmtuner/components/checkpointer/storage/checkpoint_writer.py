@@ -23,7 +23,7 @@ from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner import SavePlan
 from torch.distributed.checkpoint.storage import WriteResult
 
-from ...errors import UnsupportedCombinationError
+from ....errors import UnsupportedCombinationError
 from . import filesystem
 
 

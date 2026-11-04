@@ -9,9 +9,9 @@ from torch.distributed.checkpoint._nested_dict import set_element
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.planner import ReadItem
 
-from ...utils.logging import get_logger
-from ...utils.module_names import canonical_fqn
-from .checkpoint_keys import DATALOADER, OPTIMIZER, RNG_STATE
+from ....utils.logging import get_logger
+from ....utils.module_names import canonical_fqn
+from ..core.checkpoint_keys import DATALOADER, OPTIMIZER, RNG_STATE
 
 logger = get_logger(__name__)
 

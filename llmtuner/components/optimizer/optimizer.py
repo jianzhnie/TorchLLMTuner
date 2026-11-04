@@ -547,7 +547,7 @@ class OptimizersContainer(Optimizer, Stateful):
         # init_optim_state must run first: the unflattening step reads each
         # optimizer's live state to learn which state tensors to expect, so a
         # fresh optimizer would find nothing to write into.
-        from ..checkpointer.chunked_tensor import ChunkedCheckpointTensor
+        from ..checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 
         if self.sharded_tensor_parallel and self.sharded_expert_parallel:
             with synchronize_local_errors(

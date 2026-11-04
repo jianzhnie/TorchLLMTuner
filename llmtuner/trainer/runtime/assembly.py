@@ -30,18 +30,18 @@ from ...accelerator.distributed import (
     init_dist_pytorch,
     is_distributed,
 )
-from ...components.checkpointer.checkpoint_keys import (
+from ...components.checkpointer.backends.distributed_checkpoint import (
+    DistributedCheckpointManager,
+)
+from ...components.checkpointer.backends.torch_checkpointing_backend import (
+    TorchCheckpointingManager,
+)
+from ...components.checkpointer.core.checkpoint_keys import (
     DATALOADER,
     RNG_STATE,
     TRAIN_STATE,
 )
-from ...components.checkpointer.distributed_checkpoint import (
-    DistributedCheckpointManager,
-)
-from ...components.checkpointer.random_state import RNGCheckpointState
-from ...components.checkpointer.torch_checkpointing_backend import (
-    TorchCheckpointingManager,
-)
+from ...components.checkpointer.core.random_state import RNGCheckpointState
 from ...components.metrics import MetricsProcessor
 from ...components.optimizer.ema import EMA
 from ...components.optimizer.lr_scheduler import build_lr_scheduler

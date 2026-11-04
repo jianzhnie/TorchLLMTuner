@@ -16,14 +16,14 @@ from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.tensor import DTensor, distribute_tensor
 
-from ...accelerator.collectives import synchronize_local_errors
-from ...models.kimi.checkpoint import (
+from ....accelerator.collectives import synchronize_local_errors
+from ....models.kimi.checkpoint import (
     convert_kimi_expert_state,
     convert_kimi_optimizer_state,
 )
-from ...utils.logging import get_logger
-from ...utils.module_names import canonical_fqn
-from .checkpoint_keys import (
+from ....utils.logging import get_logger
+from ....utils.module_names import canonical_fqn
+from ..core.checkpoint_keys import (
     DATALOADER,
     EMA,
     LR_SCHEDULER,

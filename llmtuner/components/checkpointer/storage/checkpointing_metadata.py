@@ -11,8 +11,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from ...accelerator.distributed import get_comm_device
-from ...utils.logging import get_logger
+from ....accelerator.distributed import get_comm_device
+from ....utils.logging import get_logger
 
 logger = get_logger(__name__)
 

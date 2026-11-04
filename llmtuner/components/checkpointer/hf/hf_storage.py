@@ -29,8 +29,8 @@ from torch.distributed.checkpoint.metadata import (
 )
 from torch.distributed.checkpoint.utils import _DistWrapper
 
-from . import filesystem
-from .checkpoint_keys import SAFETENSORS_INDEX
+from ..core.checkpoint_keys import SAFETENSORS_INDEX
+from ..storage import filesystem
 
 
 class IndexedHuggingFaceStorageReader(HuggingFaceStorageReader):

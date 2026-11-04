@@ -52,21 +52,18 @@ from torch.distributed.checkpoint.state_dict_saver import (
 )
 from torch.distributed.checkpoint.stateful import Stateful
 
-from ...accelerator.collectives import synchronize_local_errors
-from ...datasets.contracts import require_same_dp_degree
-from ...errors import UnsupportedCombinationError
-from ...utils.garbage_collection import GarbageCollection
-from . import filesystem
+from ....accelerator.collectives import synchronize_local_errors
+from ....datasets.contracts import require_same_dp_degree
+from ....errors import UnsupportedCombinationError
+from ....utils.garbage_collection import GarbageCollection
+from ..storage import filesystem
 
 if TYPE_CHECKING:
-    from ...config.checkpoint_config import CheckpointConfig
+    from ....config.checkpoint_config import CheckpointConfig
 
-from ...utils.logging import get_logger
-from .base import (
-    BaseCheckpointManager,
-    purge_thread,
-)
-from .checkpoint_keys import (
+from ....utils.logging import get_logger
+from ..core.base import BaseCheckpointManager, purge_thread
+from ..core.checkpoint_keys import (
     DATALOADER,
     EMA,
     LR_SCHEDULER,
@@ -76,12 +73,12 @@ from .checkpoint_keys import (
     SAFETENSORS_INDEX,
     TRAIN_STATE,
 )
-from .checkpoint_writer import GenerationFileSystemWriter
-from .hf_storage import save_hf_checkpoint
-from .load_planner import CheckpointLoadPlanner
-from .staging import CoordinatedStager
-from .state_adaptation import adapt_hf_model_state
-from .storage import FilesystemCheckpointStorage
+from ..core.state_adaptation import adapt_hf_model_state
+from ..hf.hf_storage import save_hf_checkpoint
+from ..storage.checkpoint_writer import GenerationFileSystemWriter
+from ..storage.load_planner import CheckpointLoadPlanner
+from ..storage.staging import CoordinatedStager
+from ..storage.storage import FilesystemCheckpointStorage
 
 logger = get_logger(__name__)
 
@@ -569,7 +566,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     ):
                         if category != RNG_STATE or preflight_planner.has_rng_state:
                             state.validate_state_dict(preflight_destination[category])
-            from .kimi_layout import load_changed_kimi_layout
+            from ..hf.kimi_layout import load_changed_kimi_layout
 
             if load_changed_kimi_layout(
                 checkpoint_id, states=states, adapter=self.sd_adapter

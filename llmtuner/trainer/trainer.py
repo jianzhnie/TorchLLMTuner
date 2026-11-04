@@ -35,7 +35,7 @@ from ..accelerator.collectives import (
     synchronize_local_errors,
 )
 from ..accelerator.spmd import spmd_context
-from ..components.checkpointer.distributed_checkpoint import (
+from ..components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from ..components.loss import (

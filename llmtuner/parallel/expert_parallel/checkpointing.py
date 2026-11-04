@@ -315,7 +315,7 @@ def shard_expert_state(
     """
     from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
-    from ...components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+    from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 
     result = dict(state_dict)
     params = index_checkpoint_parameters(model_parts)
@@ -358,7 +358,7 @@ def restore_sharded_expert_state(
     preparation is coordinated; tensor copy failures are not transactional.
     """
     from ...accelerator.collectives import synchronize_local_errors
-    from ...components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+    from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 
     pending = []
     result = dict(state_dict)

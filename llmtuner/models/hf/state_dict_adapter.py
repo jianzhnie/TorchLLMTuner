@@ -17,8 +17,8 @@ import torch
 import torch.distributed as dist
 
 from ...accelerator.collectives import synchronize_local_errors
-from ...components.checkpointer.checkpoint_keys import SAFETENSORS_INDEX
-from ...components.checkpointer.hf_storage import IndexedHuggingFaceStorageReader
+from ...components.checkpointer.core.checkpoint_keys import SAFETENSORS_INDEX
+from ...components.checkpointer.hf.hf_storage import IndexedHuggingFaceStorageReader
 
 
 class HFTransformerStateDictAdapter:
@@ -100,7 +100,7 @@ class HFTransformerStateDictAdapter:
             getattr(self.model_config, "model_type", None) == "qwen3_moe"
             and self._hf_keys is not None
         ):
-            from ...components.checkpointer.hf_expert_storage import (
+            from ...components.checkpointer.hf.hf_expert_storage import (
                 grouped_expert_key,
                 native_ep_expert_key,
             )
@@ -212,7 +212,9 @@ class HFTransformerStateDictAdapter:
 
     def to_hf_export(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Produce standard HF expert keys rather than virtual reader templates."""
-        from ...components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+        from ...components.checkpointer.core.chunked_tensor import (
+            ChunkedCheckpointTensor,
+        )
 
         state = self.to_hf(state_dict)
         if not self.qwen3_expert_parallel:
@@ -286,7 +288,7 @@ class HFTransformerStateDictAdapter:
             # Two workers overlap shard reads without heavy storage pressure.
             thread_count = 2
         if getattr(self.model_config, "model_type", None) == "qwen3_moe":
-            from ...components.checkpointer.hf_expert_storage import (
+            from ...components.checkpointer.hf.hf_expert_storage import (
                 GroupedExpertHuggingFaceStorageReader,
             )
 

@@ -6,12 +6,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
-from llmtuner.components.checkpointer import filesystem
-from llmtuner.components.checkpointer.checkpoint_keys import (
+from llmtuner.components.checkpointer.core.checkpoint_keys import (
     LR_SCHEDULER,
     MODEL,
     OPTIMIZER,
 )
+from llmtuner.components.checkpointer.storage import filesystem
 from llmtuner.config.field_checks_config import require_integer_at_least
 from llmtuner.errors import ConfigError
 from llmtuner.utils.logging import get_logger

@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from ...accelerator.collectives import synchronize_local_errors
+from ....accelerator.collectives import synchronize_local_errors
 
 
 def adapt_hf_model_state(

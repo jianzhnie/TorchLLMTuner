@@ -51,19 +51,16 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ...accelerator.collectives import synchronize_local_errors
-from ...utils.garbage_collection import GarbageCollection
-from . import filesystem
+from ....accelerator.collectives import synchronize_local_errors
+from ....utils.garbage_collection import GarbageCollection
+from ..storage import filesystem
 
 if TYPE_CHECKING:
-    from ...config.checkpoint_config import CheckpointConfig
+    from ....config.checkpoint_config import CheckpointConfig
 
-from ...utils.logging import get_logger
-from .base import (
-    BaseCheckpointManager,
-    purge_thread,
-)
-from .checkpoint_keys import (
+from ....utils.logging import get_logger
+from ..core.base import BaseCheckpointManager, purge_thread
+from ..core.checkpoint_keys import (
     DATALOADER,
     EMA,
     LR_SCHEDULER,
@@ -72,9 +69,9 @@ from .checkpoint_keys import (
     RNG_STATE,
     TRAIN_STATE,
 )
-from .checkpointing_metadata import adapt_npu_metadata_gather
-from .random_state import RNGCheckpointState
-from .state_adaptation import adapt_hf_model_state
+from ..core.random_state import RNGCheckpointState
+from ..core.state_adaptation import adapt_hf_model_state
+from ..storage.checkpointing_metadata import adapt_npu_metadata_gather
 
 logger = get_logger(__name__)
 
@@ -922,7 +919,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             # written to. Consolidation repacks the per-rank shards into
             # HF-layout files in the checkpoint directory.
             def pre_finalize_callback(staged: str, _event_logger) -> None:  # noqa: F811
-                from ...accelerator.distributed import barrier
+                from ....accelerator.distributed import barrier
 
                 # All ranks must finish writing before any rank consolidates.
                 barrier()

@@ -15,10 +15,10 @@ import numpy as np
 import torch
 from torch.distributed.checkpoint.stateful import Stateful
 
-from ...accelerator.distributed import get_rank, get_world_size
+from ....accelerator.distributed import get_rank, get_world_size
 
 if TYPE_CHECKING:
-    from ...parallel.topology import ParallelTopology
+    from ....parallel.topology import ParallelTopology
 
 
 class RNGCheckpointState(Stateful):

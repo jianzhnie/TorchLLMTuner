@@ -25,22 +25,22 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ...accelerator.collectives import all_reduce, synchronize_local_errors
-from ...accelerator.distributed import (
+from ....accelerator.collectives import all_reduce, synchronize_local_errors
+from ....accelerator.distributed import (
     get_default_group,
     get_world_size,
     is_distributed,
     is_main_process,
 )
-from ...utils.garbage_collection import GarbageCollection
-from ...utils.logging import get_logger
-from . import filesystem
+from ....utils.garbage_collection import GarbageCollection
+from ....utils.logging import get_logger
+from ..storage import filesystem
+from ..storage.storage import CheckpointStorage
 from .checkpoint_keys import EMA, LR_SCHEDULER, MODEL, OPTIMIZER
 from .model_state import ModelCheckpointState
-from .storage import CheckpointStorage
 
 if TYPE_CHECKING:
-    from ...config.checkpoint_config import CheckpointConfig
+    from ....config.checkpoint_config import CheckpointConfig
 
 logger = get_logger(__name__)
 

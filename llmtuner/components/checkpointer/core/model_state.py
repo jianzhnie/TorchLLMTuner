@@ -15,15 +15,15 @@ import torch.nn as nn
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 
-from ...accelerator.collectives import synchronize_local_errors
-from ...parallel.expert_parallel.checkpointing import (
+from ....accelerator.collectives import synchronize_local_errors
+from ....parallel.expert_parallel.checkpointing import (
     expert_shard_map,
     gather_expert_state,
     load_expert_state,
     restore_sharded_expert_state,
     shard_expert_state,
 )
-from ...parallel.tensor_parallel.checkpointing import (
+from ....parallel.tensor_parallel.checkpointing import (
     gather_tensor_parallel_state,
     load_tensor_parallel_state,
     restore_disjoint_tp_ep_state,

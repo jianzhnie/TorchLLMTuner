@@ -1,27 +1,22 @@
 """Checkpointing: the manager contract, and the backends that implement it.
 
-Ported from torchtitan's ``components/checkpointer/``. Three layers:
+Ported from torchtitan's ``components/checkpointer/``. Four packages:
 
-* ``base`` -- the contract (``BaseCheckpointManager``) plus the policies every
-  backend shares: retention, step discovery, async draining, load selection.
-  Nothing here knows how bytes are written.
-* ``distributed_checkpoint`` -- ``DistributedCheckpointManager``, backed by
-  ``torch.distributed.checkpoint``.
-  This is the one llmtuner runs. It shards under FSDP, saves asynchronously, and
-  loads in place.
-* ``torch_checkpointing_backend`` -- ``TorchCheckpointingManager``, backed by the
-  ``torch_checkpointing`` package. That package is not a llmtuner dependency and
-  is not installed in the development environment, so this module imports (its
-  backend imports are deferred) but constructing the manager raises
-  ``ImportError`` with an install hint. Not ported for completeness alone: it is
-  the third of torchtitan's backends, and installing the package is the only
-  step needed to use it.
+* ``core`` -- manager contracts, state keys and state adaptation. ``core.base``
+  owns retention, step discovery, async draining and load selection without
+  knowing how bytes are written.
+* ``backends`` -- the DCP and optional torch-checkpointing managers. DCP shards
+  under FSDP, saves asynchronously and loads in place. The optional backend
+  defers its package imports and raises an install hint when constructed.
+* ``storage`` -- filesystem paths, DCP readers/writers, planners and staging.
+* ``hf`` -- Hugging Face storage and model-specific expert layouts.
 
-``model_state`` adapts model parts to the checkpoint state interface.
-``storage`` defines the path-operation contract and filesystem adapter.
+``core.model_state`` adapts model parts to the checkpoint state interface.
+``storage.storage`` defines the path-operation contract;
+``storage.filesystem`` provides the filesystem adapter.
 Model name normalization lives in ``utils/module_names.py``.
 
-State keys. A checkpoint uses the names defined in ``checkpoint_keys``: ``model``,
+State keys. A checkpoint uses the names defined in ``core.checkpoint_keys``: ``model``,
 ``optimizer``, ``lr_scheduler``, ``dataloader``, ``train_state``, ``ema``.
 llmtuner fills in the first two plus whatever the caller passes in ``states``:
 
@@ -50,34 +45,35 @@ llmtuner fills in the first two plus whatever the caller passes in ``states``:
   as optimizer state. A load that restores the model but not this key -- an
   ``exclude_from_loading=["ema"]`` load, or any model-only load -- cold-starts
   the average from the just-loaded weights (see
-  ``distributed_checkpoint.DistributedCheckpointManager``).
+  ``backends.distributed_checkpoint.DistributedCheckpointManager``).
 """
 
 from ...utils.lazy_exports import resolve_export
 
-# Lazy (PEP 562): ``checkpoint_keys`` / ``filesystem`` live in this package and
+# Lazy (PEP 562): ``core.checkpoint_keys`` / ``storage.filesystem`` are lightweight
 # are read by ``llmtuner/config``, which must stay importable without the
-# torch.distributed surface ``base``/``distributed_checkpoint`` pulls in
+# torch.distributed surface ``core.base``/``backends.distributed_checkpoint`` pulls in
 # (DTensor and friends are absent on older torch). Eager re-exports would make
 # any submodule import pay
 # for the backends.
 _EXPORT_SOURCES = {
-    "BaseCheckpointManager": "base",
-    "CheckpointStorage": "storage",
-    "ModelCheckpointState": "model_state",
+    "BaseCheckpointManager": "core.base",
+    "CheckpointStorage": "storage.storage",
+    "ModelCheckpointState": "core.model_state",
     # The state keys are resolved from their own dependency-free module rather
     # than through ``base``: the keys belong there, and a re-export chain was
     # one more place for the two to disagree.
-    "DATALOADER": "checkpoint_keys",
-    "EMA": "checkpoint_keys",
-    "LR_SCHEDULER": "checkpoint_keys",
-    "MODEL": "checkpoint_keys",
-    "OPTIMIZER": "checkpoint_keys",
-    "RNG_STATE": "checkpoint_keys",
-    "SAFETENSORS_INDEX": "checkpoint_keys",
-    "TRAIN_STATE": "checkpoint_keys",
-    "DistributedCheckpointAsyncMode": "distributed_checkpoint",
-    "DistributedCheckpointManager": "distributed_checkpoint",
+    "DATALOADER": "core.checkpoint_keys",
+    "EMA": "core.checkpoint_keys",
+    "LR_SCHEDULER": "core.checkpoint_keys",
+    "MODEL": "core.checkpoint_keys",
+    "OPTIMIZER": "core.checkpoint_keys",
+    "RNG_STATE": "core.checkpoint_keys",
+    "SAFETENSORS_INDEX": "core.checkpoint_keys",
+    "TRAIN_STATE": "core.checkpoint_keys",
+    "DistributedCheckpointAsyncMode": "backends.distributed_checkpoint",
+    "DistributedCheckpointManager": "backends.distributed_checkpoint",
+    "filesystem": "storage.filesystem",
 }
 
 __all__ = sorted(_EXPORT_SOURCES)

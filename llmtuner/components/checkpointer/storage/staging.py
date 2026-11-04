@@ -7,7 +7,7 @@ from typing import Any
 
 import torch.distributed as dist
 
-from ...accelerator.collectives import synchronize_local_errors
+from ....accelerator.collectives import synchronize_local_errors
 
 __all__ = ["CoordinatedStager"]
 
