@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import torch.distributed as dist
 
-from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+from llmtuner.components.checkpointer.backends import torch_checkpointing_backend as tc
 from llmtuner.config.checkpoint_config import CheckpointConfig
 
 

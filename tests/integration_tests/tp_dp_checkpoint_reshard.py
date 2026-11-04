@@ -21,7 +21,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config.optimizer_config import OptimizerConfig, ParamGroupConfig
 from llmtuner.parallel.expert_parallel.checkpointing import mark_experts_ep_sharded

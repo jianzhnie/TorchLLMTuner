@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
 from llmtuner.utils.seeding import preserve_rng_state
 
 
@@ -76,7 +76,7 @@ def test_rng_restore_rejects_changed_parallel_degrees(changed_axis):
 def test_legacy_dcp_without_rng_keeps_live_stream_and_restores_model(tmp_path):
     import torch.distributed.checkpoint as dcp
 
-    from llmtuner.components.checkpointer.load_planner import (
+    from llmtuner.components.checkpointer.storage.load_planner import (
         CheckpointLoadPlanner,
     )
 
@@ -95,7 +95,7 @@ def test_dcp_with_rng_rejects_missing_rank_instead_of_treating_it_as_legacy(tmp_
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer.load_planner import (
+    from llmtuner.components.checkpointer.storage.load_planner import (
         CheckpointLoadPlanner,
     )
 
@@ -210,7 +210,7 @@ def test_manager_rejects_incompatible_rng_before_mutating_training_state(
 ):
     from copy import deepcopy
 
-    from llmtuner.components.checkpointer.distributed_checkpoint import (
+    from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
         DistributedCheckpointManager,
     )
     from llmtuner.config.checkpoint_config import CheckpointConfig
@@ -280,7 +280,7 @@ def test_manager_rejects_invalid_data_cursor_before_model_or_optimizer_load(
 ):
     from copy import deepcopy
 
-    from llmtuner.components.checkpointer.distributed_checkpoint import (
+    from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
         DistributedCheckpointManager,
     )
     from llmtuner.config.checkpoint_config import CheckpointConfig
@@ -338,7 +338,7 @@ def test_manager_rejects_invalid_trainer_counters_before_live_state_changes(
 ):
     from copy import deepcopy
 
-    from llmtuner.components.checkpointer.distributed_checkpoint import (
+    from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
         DistributedCheckpointManager,
     )
     from llmtuner.config.checkpoint_config import CheckpointConfig
@@ -391,7 +391,7 @@ def test_manager_rejects_invalid_scheduler_progress_before_live_writes(tmp_path,
     from copy import deepcopy
     from unittest.mock import patch
 
-    from llmtuner.components.checkpointer.distributed_checkpoint import (
+    from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
         DistributedCheckpointManager,
     )
     from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler

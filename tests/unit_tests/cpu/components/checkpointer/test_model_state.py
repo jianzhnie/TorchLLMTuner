@@ -4,8 +4,8 @@ import pytest
 import torch
 from torch import nn
 
-from llmtuner.components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 
 
 def test_chunked_model_cache_refresh_preserves_storage_and_live_parameter():

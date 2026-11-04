@@ -23,7 +23,9 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 
-from llmtuner.components.checkpointer import distributed_checkpoint as checkpoint
+from llmtuner.components.checkpointer.backends import (
+    distributed_checkpoint as checkpoint,
+)
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from tests.integration_tests.harness import init_distributed
 
@@ -76,7 +78,7 @@ def check_host_preparation_failure(root):
 
 
 def check_local_preparation_failure(root):
-    from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+    from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
 
     for category in ("lr_scheduler", "rng_state"):
         for failing_rank in (0, 1):

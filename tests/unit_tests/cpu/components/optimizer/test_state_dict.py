@@ -342,7 +342,9 @@ def test_optimizer_container_rejects_checkpoint_keys_shared_between_optimizers()
 
 @pytest.mark.parametrize("tp,ep", [(False, True), (True, True), (True, False)])
 def test_sharded_restore_rejects_duplicate_local_fqns(tp, ep):
-    from llmtuner.components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+    from llmtuner.components.checkpointer.core.chunked_tensor import (
+        ChunkedCheckpointTensor,
+    )
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
 
     container = object.__new__(OptimizersContainer)

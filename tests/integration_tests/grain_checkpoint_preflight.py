@@ -23,7 +23,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
-from llmtuner.components.checkpointer.checkpoint_keys import DATALOADER
+from llmtuner.components.checkpointer.core.checkpoint_keys import DATALOADER
 from llmtuner.config.data_config import DataloaderConfig
 from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.datasets.contracts import TextSequence

@@ -20,7 +20,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
-from llmtuner.components.checkpointer.checkpoint_keys import DATALOADER, TRAIN_STATE
+from llmtuner.components.checkpointer.core.checkpoint_keys import (
+    DATALOADER,
+    TRAIN_STATE,
+)
 from llmtuner.trainer.trainer import Trainer
 from tests.integration_tests.checkpoint_data_preflight import loader
 from tests.integration_tests.rng_checkpoint_equivalence import manager, runtime, update

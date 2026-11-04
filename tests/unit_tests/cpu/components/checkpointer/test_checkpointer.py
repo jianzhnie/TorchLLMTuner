@@ -21,8 +21,8 @@ import torch.nn as nn
 from llmtuner.components.checkpointer import (
     DistributedCheckpointManager,
 )
-from llmtuner.components.checkpointer.base import BaseCheckpointManager
-from llmtuner.components.checkpointer.storage import (
+from llmtuner.components.checkpointer.core.base import BaseCheckpointManager
+from llmtuner.components.checkpointer.storage.storage import (
     CheckpointStorage,
     FilesystemCheckpointStorage,
 )
@@ -37,7 +37,9 @@ from llmtuner.config import LRSchedulerConfig
 def test_host_state_preparation_preserves_namedtuple_and_mapping_metadata():
     from collections import OrderedDict, namedtuple
 
-    from llmtuner.components.checkpointer.distributed_checkpoint import _state_on_cpu
+    from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
+        _state_on_cpu,
+    )
 
     Record = namedtuple("Record", ("tensor", "label"))
     source = OrderedDict(record=Record(torch.ones(2), "cursor"), empty=[])
@@ -144,8 +146,10 @@ def test_pinned_async_uses_thread_executor_without_process_group(monkeypatch, tm
 
     from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType
 
-    import llmtuner.components.checkpointer.distributed_checkpoint as checkpoint
-    from llmtuner.components.checkpointer.checkpoint_keys import OPTIMIZER
+    from llmtuner.components.checkpointer.backends import (
+        distributed_checkpoint as checkpoint,
+    )
+    from llmtuner.components.checkpointer.core.checkpoint_keys import OPTIMIZER
 
     captured = {}
     future = Future()
@@ -266,7 +270,7 @@ def _schedule(optimizer):
 
 
 def test_manager_owns_states_and_orders_core_restore_dependencies(tmp_path):
-    from llmtuner.components.checkpointer.checkpoint_keys import (
+    from llmtuner.components.checkpointer.core.checkpoint_keys import (
         LR_SCHEDULER,
         MODEL,
         OPTIMIZER,
@@ -501,7 +505,7 @@ def test_a_disabled_torch_checkpointing_manager_never_touches_the_backend() -> N
     machine without the backend; if the import moved above the guard, every
     caller would need the package installed just to not use it.
     """
-    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+    from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
         TorchCheckpointingManager,
     )
 
@@ -529,7 +533,7 @@ def test_an_enabled_torch_checkpointing_manager_without_the_backend_raises(
 
     import pytest
 
-    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+    from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
         TorchCheckpointingManager,
     )
 
@@ -587,7 +591,7 @@ def test_the_torch_checkpointing_backend_round_trips_a_checkpoint(tmp_path) -> N
     if importlib.util.find_spec("torch_checkpointing") is None:
         pytest.skip("torch_checkpointing is not installed")
 
-    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+    from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
         TorchCheckpointingManager,
     )
 
@@ -642,9 +646,11 @@ def test_an_enabled_manager_registers_the_lr_scheduler(monkeypatch) -> None:
     """
     import pytest
 
-    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
-    from llmtuner.components.checkpointer.base import BaseCheckpointManager
-    from llmtuner.components.checkpointer.checkpoint_keys import LR_SCHEDULER
+    from llmtuner.components.checkpointer.backends import (
+        torch_checkpointing_backend as tc,
+    )
+    from llmtuner.components.checkpointer.core.base import BaseCheckpointManager
+    from llmtuner.components.checkpointer.core.checkpoint_keys import LR_SCHEDULER
 
     captured_states = {}
     initialize = BaseCheckpointManager.__init__
@@ -728,8 +734,10 @@ _HF_METADATA = object()
 def _hf_manager_stub(tmp_path, monkeypatch, *, files=(), hf_metadata=_HF_METADATA):
     import types
 
-    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
-    from llmtuner.components.checkpointer.checkpoint_keys import MODEL
+    from llmtuner.components.checkpointer.backends import (
+        torch_checkpointing_backend as tc,
+    )
+    from llmtuner.components.checkpointer.core.checkpoint_keys import MODEL
 
     calls: dict[str, object] = {}
     fake_hf_manager = types.SimpleNamespace(
@@ -884,7 +892,9 @@ def test_native_load_restores_stateful_and_rejects_foreign_objects(
     import pytest
     from torch.distributed.checkpoint.stateful import Stateful
 
-    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+    from llmtuner.components.checkpointer.backends import (
+        torch_checkpointing_backend as tc,
+    )
 
     manager, calls, MODEL = _hf_manager_stub(
         tmp_path, monkeypatch, files={f"{tmp_path}/metadata.pkl"}
@@ -945,8 +955,10 @@ def test_optimizer_initialization_restores_grads_and_lr_on_error(monkeypatch):
 def test_torch_checkpointing_hf_final_save_builds_item_specs(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
-    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
-    from llmtuner.components.checkpointer.checkpoint_keys import MODEL
+    from llmtuner.components.checkpointer.backends import (
+        torch_checkpointing_backend as tc,
+    )
+    from llmtuner.components.checkpointer.core.checkpoint_keys import MODEL
 
     saved = []
     manager = tc.TorchCheckpointingManager.__new__(tc.TorchCheckpointingManager)
@@ -1029,7 +1041,7 @@ def test_failed_staging_future_is_consumed_once():
 
     import pytest
 
-    from llmtuner.components.checkpointer.distributed_checkpoint import (
+    from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
         DistributedCheckpointAsyncMode,
     )
 
@@ -1089,7 +1101,7 @@ def test_legacy_loader_layout_planner_keeps_model_keys_strict(tmp_path):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer.load_planner import (
+    from llmtuner.components.checkpointer.storage.load_planner import (
         CheckpointLoadPlanner,
     )
 
@@ -1115,7 +1127,7 @@ def test_partial_loader_layout_metadata_is_rejected(tmp_path):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer.load_planner import (
+    from llmtuner.components.checkpointer.storage.load_planner import (
         CheckpointLoadPlanner,
     )
 
@@ -1368,7 +1380,7 @@ def test_torch_checkpointing_wait_retains_only_active_writes(outcome):
     from concurrent.futures import Future
     from types import SimpleNamespace
 
-    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+    from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
         TorchCheckpointingManager,
     )
 
@@ -1398,7 +1410,7 @@ def test_dcp_interrupted_wait_retains_active_future(phase):
     from concurrent.futures import Future
     from types import SimpleNamespace
 
-    from llmtuner.components.checkpointer.distributed_checkpoint import (
+    from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
         DistributedCheckpointAsyncMode,
     )
 
@@ -1431,7 +1443,7 @@ def test_dcp_interrupted_wait_retains_active_future(phase):
 def test_interrupted_close_preserves_resources_until_future_finishes(phase):
     from concurrent.futures import Future
 
-    from llmtuner.components.checkpointer.distributed_checkpoint import (
+    from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
         DistributedCheckpointAsyncMode,
     )
 
@@ -1570,7 +1582,7 @@ def test_final_model_export_does_not_evict_last_resumable_checkpoint(tmp_path):
 def test_flattened_model_keys_cannot_overwrite_training_state():
     from types import SimpleNamespace
 
-    from llmtuner.components.checkpointer.checkpoint_keys import MODEL, OPTIMIZER
+    from llmtuner.components.checkpointer.core.checkpoint_keys import MODEL, OPTIMIZER
 
     manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
     optimizer_state = object()
@@ -1662,8 +1674,8 @@ def test_failed_same_step_save_preserves_published_training_state(
     from torch.distributed.checkpoint import FileSystemWriter
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer import checkpoint_writer
-    from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+    from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
+    from llmtuner.components.checkpointer.storage import checkpoint_writer
     from llmtuner.components.optimizer.ema import EMA
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
     from llmtuner.config import OptimizerConfig
@@ -1877,7 +1889,7 @@ def test_failed_hf_export_rewrite_preserves_published_weights(
     from torch.distributed.checkpoint import _consolidate_hf_safetensors
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer import hf_storage
+    from llmtuner.components.checkpointer.hf import hf_storage
     from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 
     model = nn.ModuleDict({"model": nn.Linear(2, 2)})
@@ -1951,7 +1963,7 @@ def test_fsspec_same_step_failure_preserves_checkpoint(
     )
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer import checkpoint_writer, filesystem
+    from llmtuner.components.checkpointer.storage import checkpoint_writer, filesystem
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
     from llmtuner.config import OptimizerConfig
 
@@ -2032,7 +2044,7 @@ def test_generation_writer_rejects_non_atomic_fsspec_protocol(monkeypatch):
         FileSystem as FsspecFileSystem,
     )
 
-    from llmtuner.components.checkpointer.checkpoint_writer import (
+    from llmtuner.components.checkpointer.storage.checkpoint_writer import (
         GenerationFileSystemWriter,
     )
     from llmtuner.errors import UnsupportedCombinationError
@@ -2100,7 +2112,7 @@ def test_remote_lost_publication_acknowledgement_leaves_consistent_checkpoint(
 
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer import filesystem
+    from llmtuner.components.checkpointer.storage import filesystem
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
     from llmtuner.config import OptimizerConfig
 
@@ -2248,7 +2260,7 @@ def test_load_synchronizes_snapshot_before_state_or_storage_access(failed_phase)
 def test_compiled_checkpoint_planner_restores_tensors_and_group_options(tmp_path):
     import torch.distributed.checkpoint as dcp
 
-    from llmtuner.components.checkpointer.load_planner import (
+    from llmtuner.components.checkpointer.storage.load_planner import (
         CheckpointLoadPlanner,
     )
 
@@ -2286,7 +2298,7 @@ def test_compiled_checkpoint_planner_rejects_ambiguous_names(tmp_path):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer.load_planner import (
+    from llmtuner.components.checkpointer.storage.load_planner import (
         CheckpointLoadPlanner,
     )
 
@@ -2307,7 +2319,7 @@ def test_compiled_checkpoint_planner_rejects_ambiguous_names(tmp_path):
 def test_compiled_checkpoint_flat_scalar_keeps_canonical_target(tmp_path, flatten):
     import torch.distributed.checkpoint as dcp
 
-    from llmtuner.components.checkpointer.load_planner import (
+    from llmtuner.components.checkpointer.storage.load_planner import (
         CheckpointLoadPlanner,
     )
 
@@ -2338,7 +2350,7 @@ def test_compiled_checkpoint_migration_keeps_missing_keys_strict(tmp_path):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer.load_planner import (
+    from llmtuner.components.checkpointer.storage.load_planner import (
         CheckpointLoadPlanner,
     )
 
@@ -2358,7 +2370,9 @@ def test_staging_group_construction_failure_releases_upload_group(
 ):
     import torch.distributed as dist
 
-    from llmtuner.components.checkpointer import distributed_checkpoint as module
+    from llmtuner.components.checkpointer.backends import (
+        distributed_checkpoint as module,
+    )
 
     assert not dist.is_initialized()
     dist.init_process_group(
@@ -2420,7 +2434,9 @@ def test_torch_checkpointing_failed_thread_start_closes_backend(
 ):
     from types import SimpleNamespace
 
-    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+    from llmtuner.components.checkpointer.backends import (
+        torch_checkpointing_backend as tc,
+    )
 
     if report_error is not None:
 
@@ -2484,7 +2500,9 @@ def test_temporary_backend_cleanup_preserves_operation_error(
 ):
     from types import SimpleNamespace
 
-    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+    from llmtuner.components.checkpointer.backends import (
+        torch_checkpointing_backend as tc,
+    )
 
     if report_error is not None:
 
@@ -2628,7 +2646,9 @@ def test_adam_dcp_resume_restores_complete_state_before_next_update(
 def test_legacy_compiled_amsgrad_destination_keeps_canonical_name(tmp_path):
     import torch.distributed.checkpoint as dcp
 
-    from llmtuner.components.checkpointer.load_planner import CheckpointLoadPlanner
+    from llmtuner.components.checkpointer.storage.load_planner import (
+        CheckpointLoadPlanner,
+    )
 
     checkpoint = tmp_path / "legacy-amsgrad"
     saved = {
@@ -2668,7 +2688,9 @@ def test_amsgrad_new_destination_rejects_ambiguous_compiled_keys(tmp_path):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer.load_planner import CheckpointLoadPlanner
+    from llmtuner.components.checkpointer.storage.load_planner import (
+        CheckpointLoadPlanner,
+    )
 
     saved = {
         "optimizer": {
@@ -2697,7 +2719,9 @@ def test_checkpoint_planner_rejects_tensor_shape_mismatch_before_copy(
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer.load_planner import CheckpointLoadPlanner
+    from llmtuner.components.checkpointer.storage.load_planner import (
+        CheckpointLoadPlanner,
+    )
 
     dcp.save({"weight": torch.ones(saved_size)}, checkpoint_id=tmp_path)
     target = torch.full((target_size,), -7.0)
@@ -2717,7 +2741,7 @@ def test_fsspec_retention_drains_deletions_and_keeps_latest_loadable(
 
     import torch.distributed.checkpoint as dcp
 
-    from llmtuner.components.checkpointer import filesystem
+    from llmtuner.components.checkpointer.storage import filesystem
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
     from llmtuner.config import OptimizerConfig
 
@@ -2771,7 +2795,9 @@ def test_optional_backend_coordinates_local_state_restore(tmp_path, monkeypatch,
 
     from torch.distributed.checkpoint.stateful import Stateful
 
-    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
+    from llmtuner.components.checkpointer.backends import (
+        torch_checkpointing_backend as tc,
+    )
 
     manager, _, _ = _hf_manager_stub(
         tmp_path, monkeypatch, files={f"{tmp_path}/metadata.pkl"}
@@ -2804,9 +2830,11 @@ def test_optional_backend_coordinates_local_state_restore(tmp_path, monkeypatch,
 def test_optional_backend_restores_rng_after_user_callbacks(tmp_path, monkeypatch):
     from torch.distributed.checkpoint.stateful import Stateful
 
-    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
-    from llmtuner.components.checkpointer.checkpoint_keys import RNG_STATE
-    from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+    from llmtuner.components.checkpointer.backends import (
+        torch_checkpointing_backend as tc,
+    )
+    from llmtuner.components.checkpointer.core.checkpoint_keys import RNG_STATE
+    from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
     from llmtuner.utils.seeding import preserve_rng_state
 
     manager, _, _ = _hf_manager_stub(
@@ -2893,7 +2921,9 @@ def test_interrupted_stager_close_retains_live_executor(
 def test_dcp_coordinates_local_state_restoration(tmp_path, monkeypatch, category):
     from contextlib import contextmanager
 
-    from llmtuner.components.checkpointer import distributed_checkpoint as module
+    from llmtuner.components.checkpointer.backends import (
+        distributed_checkpoint as module,
+    )
 
     active = []
     failure = ValueError("local state restore failed")
@@ -2945,8 +2975,10 @@ def test_optional_backend_validates_local_metadata_before_full_reader(
     from copy import deepcopy
     from types import SimpleNamespace
 
-    from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
-    from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+    from llmtuner.components.checkpointer.backends import (
+        torch_checkpointing_backend as tc,
+    )
+    from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
     from llmtuner.datasets.synthetic import RandomTokenDataLoader
     from llmtuner.trainer.trainer import Trainer
 
@@ -3067,7 +3099,7 @@ def test_hf_export_loads_with_automodel_and_preserves_logits(tmp_path, tied, ind
 
 @pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
 def test_checkpoint_close_survives_secondary_error_reporting(monkeypatch, report_error):
-    from llmtuner.components.checkpointer import base
+    from llmtuner.components.checkpointer.core import base
 
     manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
     manager._initialized = True
@@ -3103,7 +3135,9 @@ def test_checkpoint_close_survives_secondary_error_reporting(monkeypatch, report
 def test_dcp_group_cleanup_preserves_first_error_when_reporting_fails(
     monkeypatch, report_error
 ):
-    from llmtuner.components.checkpointer import distributed_checkpoint as module
+    from llmtuner.components.checkpointer.backends import (
+        distributed_checkpoint as module,
+    )
 
     manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
     manager.stager = None
@@ -3138,7 +3172,9 @@ def test_async_completion_report_failure_does_not_escape_worker(
 ):
     from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 
-    from llmtuner.components.checkpointer import distributed_checkpoint as module
+    from llmtuner.components.checkpointer.backends import (
+        distributed_checkpoint as module,
+    )
 
     model = nn.Linear(2, 2)
     optimizer = torch.optim.AdamW(model.parameters())
@@ -3252,7 +3288,7 @@ def test_purge_join_failure_retains_live_worker_until_retry(
 def test_backend_close_preserves_first_error_and_attempts_all_releases(error_type):
     from types import SimpleNamespace
 
-    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+    from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
         TorchCheckpointingManager,
     )
 
@@ -3286,7 +3322,9 @@ def test_synthetic_rank_cursor_checkpoint_and_legacy_migration(tmp_path):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.api import CheckpointException
 
-    from llmtuner.components.checkpointer.load_planner import CheckpointLoadPlanner
+    from llmtuner.components.checkpointer.storage.load_planner import (
+        CheckpointLoadPlanner,
+    )
     from llmtuner.datasets.synthetic import RandomTokenDataLoader
 
     def loader(rank):

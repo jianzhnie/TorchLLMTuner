@@ -13,8 +13,10 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
-from llmtuner.components.checkpointer.hf_storage import IndexedHuggingFaceStorageReader
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.hf.hf_storage import (
+    IndexedHuggingFaceStorageReader,
+)
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config.optimizer_config import OptimizerConfig, ParamGroupConfig
 from llmtuner.parallel.tensor_parallel.checkpointing import (

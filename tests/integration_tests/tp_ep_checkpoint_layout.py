@@ -8,7 +8,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch import nn
 
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config.optimizer_config import OptimizerConfig, ParamGroupConfig

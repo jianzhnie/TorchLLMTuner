@@ -16,7 +16,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.components.optimizer import EMA, OptimizersContainer
 from llmtuner.config import OptimizerConfig
 from llmtuner.models.common.moe.experts import GroupedExperts

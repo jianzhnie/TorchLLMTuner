@@ -15,7 +15,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter

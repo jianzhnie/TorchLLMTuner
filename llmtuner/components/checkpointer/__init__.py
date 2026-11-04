@@ -48,6 +48,8 @@ llmtuner fills in the first two plus whatever the caller passes in ``states``:
   ``backends.distributed_checkpoint.DistributedCheckpointManager``).
 """
 
+from importlib import import_module
+
 from ...utils.lazy_exports import resolve_export
 
 # Lazy (PEP 562): ``core.checkpoint_keys`` / ``storage.filesystem`` are lightweight
@@ -81,6 +83,8 @@ __all__ = sorted(_EXPORT_SOURCES)
 
 def __getattr__(name: str):
     """Resolve backend names on first touch (PEP 562 lazy re-export)."""
+    if name == "filesystem":
+        return import_module(f"{__name__}.storage.filesystem")
     return resolve_export(__name__, _EXPORT_SOURCES, name)
 
 

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from llmtuner.components.checkpointer.staging import CoordinatedStager
+from llmtuner.components.checkpointer.storage.staging import CoordinatedStager
 
 
 @pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt, SystemExit])

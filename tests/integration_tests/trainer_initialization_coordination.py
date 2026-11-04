@@ -176,7 +176,7 @@ def main():
         )
         # Storage preflight must finish on every rank before model state or
         # the async checkpoint communication group is constructed.
-        from llmtuner.components.checkpointer.distributed_checkpoint import (
+        from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
             DistributedCheckpointManager,
         )
         from llmtuner.config.checkpoint_config import CheckpointConfig

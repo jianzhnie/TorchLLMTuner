@@ -10,7 +10,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.parallel.expert_parallel.checkpointing import mark_experts_ep_sharded
 from tests.integration_tests.harness import init_distributed
 

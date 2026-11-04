@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
 from llmtuner.utils.seeding import preserve_rng_state
 
 

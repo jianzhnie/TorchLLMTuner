@@ -13,8 +13,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
 
-from llmtuner.components.checkpointer.hf_storage import save_hf_checkpoint
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.hf.hf_storage import save_hf_checkpoint
 from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 from llmtuner.parallel.expert_parallel.checkpointing import (
     expert_shard_map,

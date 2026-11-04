@@ -223,7 +223,7 @@ try:
     # Exercise the production packed/shared checkpoint transforms with real DCP.
     import torch.distributed.checkpoint as dcp
 
-    from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+    from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
     from llmtuner.config.optimizer_config import OptimizerConfig
 

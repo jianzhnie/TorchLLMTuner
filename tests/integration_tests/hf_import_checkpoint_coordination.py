@@ -15,10 +15,10 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
 
-from llmtuner.components.checkpointer.checkpoint_keys import MODEL
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
+from llmtuner.components.checkpointer.core.checkpoint_keys import MODEL
 from llmtuner.config import CheckpointConfig
 from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 from tests.integration_tests.harness import init_distributed

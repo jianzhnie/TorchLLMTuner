@@ -2,7 +2,7 @@ from contextlib import contextmanager
 
 import pytest
 
-import llmtuner.components.checkpointer.state_adaptation as state_adaptation
+import llmtuner.components.checkpointer.core.state_adaptation as state_adaptation
 
 
 class _Adapter:

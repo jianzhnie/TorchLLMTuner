@@ -3,7 +3,13 @@ from dataclasses import dataclass
 
 import pytest
 
-from llmtuner.components.checkpointer import filesystem
+from llmtuner.components.checkpointer.storage import filesystem
+
+
+def test_package_filesystem_export_is_the_storage_module():
+    from llmtuner.components.checkpointer import filesystem as exported
+
+    assert exported is filesystem
 
 
 def test_uri_scheme_selects_remote_storage():
@@ -92,7 +98,7 @@ def test_local_checkpoint_delete_ignores_missing_paths(tmp_path):
 
 
 def test_purge_continues_after_local_delete_failure(monkeypatch, tmp_path):
-    from llmtuner.components.checkpointer import base
+    from llmtuner.components.checkpointer.core import base
 
     failed = tmp_path / "blocked"
     subsequent = tmp_path / "next"
@@ -127,7 +133,7 @@ def test_purge_survives_logging_failure(tmp_path, monkeypatch, phase, error_type
     import queue
     import threading
 
-    from llmtuner.components.checkpointer import base
+    from llmtuner.components.checkpointer.core import base
 
     first = tmp_path / "first"
     second = tmp_path / "second"

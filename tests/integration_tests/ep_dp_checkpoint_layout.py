@@ -13,10 +13,10 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config.checkpoint_config import CheckpointConfig

@@ -8,7 +8,7 @@ import torch
 from torch.distributed.checkpoint import FileSystemWriter
 from torch.distributed.tensor import DTensor, Replicate
 
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointAsyncMode,
     DistributedCheckpointManager,
 )
@@ -333,7 +333,8 @@ def test_virtual_checkpoint_writer_disables_copy_ahead(monkeypatch, tmp_path):
         return "saved"
 
     monkeypatch.setattr(
-        "llmtuner.components.checkpointer.distributed_checkpoint.dcp.save", save
+        "llmtuner.components.checkpointer.backends.distributed_checkpoint.dcp.save",
+        save,
     )
     manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
     manager.states = {"optimizer": SimpleNamespace(state_residency="npu_virtual")}

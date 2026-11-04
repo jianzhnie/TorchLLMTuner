@@ -21,7 +21,7 @@ from safetensors.torch import load_file, save_file
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import LlamaConfig
 
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from llmtuner.config import CheckpointConfig

@@ -16,7 +16,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from llmtuner.components.optimizer.ema import EMA

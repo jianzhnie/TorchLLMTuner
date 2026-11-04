@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
 from llmtuner.models.kimi.moe import KimiSparseMoE

@@ -53,7 +53,7 @@ def assert_state_equal(actual, expected, path="checkpoint"):
 
 def check_seed_loading(args, seed_file):
     """Check the load boundary with deliberately different initial weights."""
-    from llmtuner.components.checkpointer.checkpoint_keys import MODEL
+    from llmtuner.components.checkpointer.core.checkpoint_keys import MODEL
     from llmtuner.trainer.cli import parse_config
     from llmtuner.trainer.trainer import Trainer
 

@@ -8,10 +8,10 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
-from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
     TorchCheckpointingManager,
 )
 from llmtuner.config.checkpoint_config import CheckpointConfig

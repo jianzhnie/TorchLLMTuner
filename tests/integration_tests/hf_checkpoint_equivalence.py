@@ -22,10 +22,10 @@ from fsdp_checkpoint_equivalence import topology_for
 from fsdp_mesh_equivalence import _build_model, _full
 from torch.distributed.checkpoint.api import CheckpointException
 
-from llmtuner.components.checkpointer import hf_storage
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
+from llmtuner.components.checkpointer.hf import hf_storage
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config.checkpoint_config import CheckpointConfig

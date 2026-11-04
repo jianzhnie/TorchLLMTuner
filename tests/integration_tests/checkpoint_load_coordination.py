@@ -14,10 +14,11 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
-from llmtuner.components.checkpointer import base, distributed_checkpoint
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends import distributed_checkpoint
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
+from llmtuner.components.checkpointer.core import base
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.utils.garbage_collection import GarbageCollection
 from tests.integration_tests.cli_checkpoint_equivalence import assert_state_equal

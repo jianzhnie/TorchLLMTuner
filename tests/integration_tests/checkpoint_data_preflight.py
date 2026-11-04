@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
-from llmtuner.components.checkpointer.checkpoint_keys import DATALOADER, RNG_STATE
+from llmtuner.components.checkpointer.core.checkpoint_keys import DATALOADER, RNG_STATE
 from llmtuner.datasets.synthetic import RandomTokenDataLoader
 from tests.integration_tests.rng_checkpoint_equivalence import manager, runtime, update
 

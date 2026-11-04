@@ -35,12 +35,12 @@ from torch.distributed.checkpoint.api import CheckpointException
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.tensor import DTensor
 
-from llmtuner.components.checkpointer import distributed_checkpoint
-from llmtuner.components.checkpointer.checkpoint_writer import (
-    GenerationFileSystemWriter,
-)
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends import distributed_checkpoint
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
+)
+from llmtuner.components.checkpointer.storage.checkpoint_writer import (
+    GenerationFileSystemWriter,
 )
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.components.optimizer.optimizer import OptimizersContainer

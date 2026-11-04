@@ -17,8 +17,8 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
-from llmtuner.components.checkpointer.kimi_layout import load_changed_kimi_layout
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.hf.kimi_layout import load_changed_kimi_layout
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks

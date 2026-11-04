@@ -4,8 +4,8 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 
-from llmtuner.components.checkpointer.kimi_layout import load_changed_kimi_layout
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.hf.kimi_layout import load_changed_kimi_layout
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.state_dict import (
     get_flat_optim_state_dict,
@@ -216,7 +216,7 @@ def test_saved_amsgrad_validated_before_model_with_fresh_non_amsgrad(
 def test_legacy_cross_layout_checkpoint_without_rng_restores_model(
     tmp_path, source_grouped
 ):
-    from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+    from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
 
     source = torch.nn.Module()
     source.model = make_model(latent=True, shared=1)
@@ -252,7 +252,7 @@ def test_legacy_cross_layout_checkpoint_without_rng_restores_model(
 def test_cross_layout_rng_missing_current_rank_rejected_before_model_copy(
     tmp_path, source_grouped
 ):
-    from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+    from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
 
     source = torch.nn.Module()
     source.model = make_model(latent=True, shared=1)

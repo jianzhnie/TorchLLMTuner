@@ -3,7 +3,7 @@ import torch
 from torch.distributed.checkpoint.metadata import MetadataIndex
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from llmtuner.components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+from llmtuner.components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 
 
 def test_chunks_keep_noncontiguous_live_storage():

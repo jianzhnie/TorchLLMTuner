@@ -12,8 +12,10 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
-from llmtuner.components.checkpointer import distributed_checkpoint as checkpoint
-from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+from llmtuner.components.checkpointer.backends import (
+    distributed_checkpoint as checkpoint,
+)
+from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
 from llmtuner.config.checkpoint_config import CheckpointConfig
 
 

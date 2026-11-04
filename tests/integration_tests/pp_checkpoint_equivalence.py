@@ -201,7 +201,9 @@ def _equal_rank_state(
     mismatch collectives across stages. All ranks validate their local shards;
     the final world reduction aggregates failures after all comparisons.
     """
-    from llmtuner.components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+    from llmtuner.components.checkpointer.core.chunked_tensor import (
+        ChunkedCheckpointTensor,
+    )
 
     if isinstance(actual, ChunkedCheckpointTensor) or isinstance(
         expected, ChunkedCheckpointTensor
@@ -841,7 +843,9 @@ def _runtime_state(trainer: Trainer) -> dict:
     if os.environ.get("LLMTUNER_TEST_RNG_STATE") == "1":
         import pickle
 
-        from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+        from llmtuner.components.checkpointer.core.random_state import (
+            RNGCheckpointState,
+        )
 
         snapshot = RNGCheckpointState(trainer.device, topology=trainer.parallel_dims)
         rng = pickle.loads(snapshot.state_dict()[snapshot.key])
@@ -916,10 +920,10 @@ def _compare_loaded_state(actual, expected, failures: list[str], path: str) -> N
 
 
 def _assert_checkpoint_backend(trainer: Trainer) -> str:
-    from llmtuner.components.checkpointer.distributed_checkpoint import (
+    from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
         DistributedCheckpointManager,
     )
-    from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+    from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
         TorchCheckpointingManager,
     )
 
@@ -1311,7 +1315,9 @@ def _run() -> None:
     packed = sys.argv[3:] == ["--packed"]
     if sys.argv[3:] and not packed:
         raise SystemExit("only --packed is accepted after WORKDIR")
-    from llmtuner.components.checkpointer.chunked_tensor import ChunkedCheckpointTensor
+    from llmtuner.components.checkpointer.core.chunked_tensor import (
+        ChunkedCheckpointTensor,
+    )
 
     torch.serialization.add_safe_globals([ChunkedCheckpointTensor])
     run_phase = _phase_full if phase == "full" else _phase_resume

@@ -3341,7 +3341,7 @@ def test_grain_invalid_cursor_dcp_preflight_preserves_training_state(
     import random
     from unittest.mock import patch
 
-    from llmtuner.components.checkpointer.distributed_checkpoint import (
+    from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
         DistributedCheckpointManager,
     )
     from llmtuner.components.optimizer.ema import EMA

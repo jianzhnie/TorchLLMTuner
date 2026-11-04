@@ -17,7 +17,7 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from llmtuner.config.checkpoint_config import CheckpointConfig

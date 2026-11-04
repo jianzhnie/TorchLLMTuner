@@ -19,7 +19,7 @@ from tempfile import TemporaryDirectory
 import torch
 import torch.distributed as dist
 
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler

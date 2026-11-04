@@ -16,8 +16,11 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
-from llmtuner.components.checkpointer import torch_checkpointing_backend as tc
-from llmtuner.components.checkpointer.checkpoint_keys import (
+from llmtuner.components.checkpointer.backends import torch_checkpointing_backend as tc
+from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
+    TorchCheckpointingManager,
+)
+from llmtuner.components.checkpointer.core.checkpoint_keys import (
     DATALOADER,
     EMA,
     LR_SCHEDULER,
@@ -25,10 +28,7 @@ from llmtuner.components.checkpointer.checkpoint_keys import (
     RNG_STATE,
     TRAIN_STATE,
 )
-from llmtuner.components.checkpointer.random_state import RNGCheckpointState
-from llmtuner.components.checkpointer.torch_checkpointing_backend import (
-    TorchCheckpointingManager,
-)
+from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
 from llmtuner.components.optimizer.ema import EMA as MovingAverage
 
 

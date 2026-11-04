@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import load_file, save_file
 
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.trainer.trainer import Trainer

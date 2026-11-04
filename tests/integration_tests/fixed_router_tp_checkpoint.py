@@ -19,7 +19,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 
-from llmtuner.components.checkpointer.checkpoint_keys import RNG_STATE
+from llmtuner.components.checkpointer.core.checkpoint_keys import RNG_STATE
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.components.optimizer.optimizer import OptimizersContainer

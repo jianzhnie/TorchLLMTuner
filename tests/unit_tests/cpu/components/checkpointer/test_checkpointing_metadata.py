@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from llmtuner.components.checkpointer import checkpointing_metadata as metadata
+from llmtuner.components.checkpointer.storage import checkpointing_metadata as metadata
 
 
 def test_gather_metadata_preserves_variable_length_rank_payloads(monkeypatch):

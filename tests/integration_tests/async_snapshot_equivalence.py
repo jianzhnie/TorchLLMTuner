@@ -23,7 +23,7 @@ import torch
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.tensor import DTensor
 
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from llmtuner.models.hf.model import HFTransformerModel

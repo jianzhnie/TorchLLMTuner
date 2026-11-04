@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
-from llmtuner.components.checkpointer.state_adaptation import adapt_hf_model_state
+from llmtuner.components.checkpointer.core.state_adaptation import adapt_hf_model_state
 from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 
 

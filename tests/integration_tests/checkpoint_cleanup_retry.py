@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from llmtuner.config.checkpoint_config import CheckpointConfig

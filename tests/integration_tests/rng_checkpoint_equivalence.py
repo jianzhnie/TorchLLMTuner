@@ -28,12 +28,12 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel
 
-from llmtuner.components.checkpointer.checkpoint_keys import EMA as EMA_STATE
-from llmtuner.components.checkpointer.checkpoint_keys import MODEL, RNG_STATE
-from llmtuner.components.checkpointer.distributed_checkpoint import (
+from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
-from llmtuner.components.checkpointer.random_state import RNGCheckpointState
+from llmtuner.components.checkpointer.core.checkpoint_keys import EMA as EMA_STATE
+from llmtuner.components.checkpointer.core.checkpoint_keys import MODEL, RNG_STATE
+from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.components.optimizer.optimizer import OptimizersContainer

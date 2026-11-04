@@ -13,7 +13,7 @@ import sys
 import torch
 from torch.distributed.tensor import DTensor
 
-from llmtuner.components.checkpointer.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.models.kimi.checkpoint import (
     convert_kimi_expert_state,
     convert_kimi_optimizer_state,

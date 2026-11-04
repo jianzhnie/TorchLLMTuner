@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import torch.distributed as dist
 
-from llmtuner.components.checkpointer.torch_checkpointing_backend import (
+from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
     TorchCheckpointingManager,
 )
 

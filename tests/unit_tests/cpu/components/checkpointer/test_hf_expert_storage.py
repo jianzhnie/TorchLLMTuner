@@ -7,7 +7,7 @@ import torch.distributed.checkpoint as dcp
 from safetensors.torch import save_file
 from torch.distributed.checkpoint.metadata import MetadataIndex
 
-from llmtuner.components.checkpointer.hf_expert_storage import (
+from llmtuner.components.checkpointer.hf.hf_expert_storage import (
     GroupedExpertHuggingFaceStorageReader,
 )
 from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
