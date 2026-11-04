@@ -1,7 +1,9 @@
 """Activation checkpointing: recompute each decoder layer during backward.
 
 Vendored in shape from torchtitan's ``distributed/activation_checkpoint.py``.
-Full and region policies follow upstream; selective and memory-budget modes
+Region policies follow upstream; full AC retains NPU reduce-scatter outputs
+to keep replay consistent with nondeterministic low-precision reductions.
+Selective and memory-budget modes
 retain earlier upstream implementations. Current torchtitan SelectiveAC uses a
 RegionAC preset, while this module intentionally keeps per-op SAC (see
 ``docs/llmtuner_upstream_map.md``):
@@ -13,8 +15,9 @@ RegionAC preset, while this module intentionally keeps per-op SAC (see
   through a selective checkpoint context carrying a constant
   ``PREFER_RECOMPUTE`` policy (``_full_ac_policy``), which is what lets torch
   still *save* an op whose output cannot be recomputed -- a registered effect --
-  rather than replay it blindly; ``wrap_full``/``full_policy`` here are the same
-  two pieces.
+  rather than replay it blindly. Unlike upstream's constant policy, full AC
+  here also saves NPU reduce-scatter outputs: replaying HCCL can otherwise
+  change downstream MoE routing and its data-dependent tensor shapes.
 
 * ``"selective"`` (upstream ``SelectiveAC``) is per-op: a ``context_fn`` policy
   is asked about every op inside the layer and answers ``MUST_SAVE`` for the
@@ -324,16 +327,20 @@ def wrap_selective(
     return wrapped
 
 
-def full_policy(_ctx, _op, *_args, **_kwargs) -> CheckpointPolicy:
-    """Prefer recompute for every op, letting torch keep registered effects.
+def full_policy(_ctx, op, *args, **_kwargs) -> CheckpointPolicy:
+    """Recompute activations while preserving NPU reduction results.
 
-    Upstream's ``_full_ac_policy``, verbatim: the policy that module-level full
-    AC hands to the *selective* checkpoint context. ``PREFER_RECOMPUTE`` still
-    lets torch fall back to saving an op whose output cannot be recomputed (a
-    registered effect), which is what this constant policy buys over running the
-    wrapper with no policy at all -- the two arguments are the op's context and
-    handle and are unused, as upstream's are.
+    HCCL reduce-scatter can round differently on replay even with identical
+    local inputs. Norms amplify that difference enough to change MoE routing,
+    invalidating backward's token buckets. Save the reduction output without
+    changing forward arithmetic, process-global determinism, or gradients.
+    Other ops retain upstream's PREFER_RECOMPUTE policy and effect handling.
     """
+    if (
+        op == torch.ops._c10d_functional.reduce_scatter_tensor.default
+        and args[0].device.type == "npu"
+    ):
+        return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.PREFER_RECOMPUTE
 
 

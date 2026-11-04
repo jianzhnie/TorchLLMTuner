@@ -78,18 +78,23 @@ def _release_host_bytes(num_bytes: int) -> None:
 
 
 class _ForwardSwapState:
-    def __init__(self) -> None:
+    def __init__(self, protected: Any = ()) -> None:
         self.d2h_stream = _stream_api().Stream()
         self.h2d_stream = _stream_api().Stream()
         self.packed: list[_SwappedActivation] = []
-        self.protected_storages: set[int] = set()
+        self.protected_storages: set[int] = {
+            value.untyped_storage()._cdata
+            for value in _flatten(protected)
+            if isinstance(value, torch.Tensor)
+        }
 
     def pack(self, tensor: torch.Tensor) -> torch.Tensor | _SwappedActivation:
         global _copies_d2h, _d2h_bytes, _host_bytes_current, _host_bytes_peak
-        if not _should_swap(tensor):
+        storage_id = tensor.untyped_storage()._cdata
+        if storage_id in self.protected_storages or not _should_swap(tensor):
             # A saved view can be unpacked before its swappable base. Keep
             # that shared storage alive rather than exposing a zero-sized base.
-            self.protected_storages.add(tensor.untyped_storage()._cdata)
+            self.protected_storages.add(storage_id)
             return tensor.detach()
         start, end = (_new_event(), _new_event()) if _metrics_enabled else (None, None)
         host_tensor = torch.empty_like(tensor, device="cpu", pin_memory=True)
@@ -253,24 +258,29 @@ def apply_activation_swap(model: nn.Module) -> nn.Module:
         def swapped_forward(*args, __forward=forward, __layer=layer, **kwargs):
             if not torch.is_grad_enabled():
                 return __forward(*args, **kwargs)
-            state = _ForwardSwapState()
+            # Inputs and persistent state already remain on device. Avoid
+            # allocating Host copies which release() would never consume.
+            state = _ForwardSwapState(
+                (args, kwargs, tuple(__layer.parameters()), tuple(__layer.buffers()))
+            )
             try:
                 with torch.autograd.graph.saved_tensors_hooks(state.pack, _unpack):
                     outputs = __forward(*args, **kwargs)
+                # Inputs and persistent state are owned outside this invocation.
+                # Saved views or detached aliases must not release their storage.
+                state.release(
+                    (
+                        outputs,
+                        args,
+                        kwargs,
+                        tuple(__layer.parameters()),
+                        tuple(__layer.buffers()),
+                    )
+                )
             except BaseException:
+                # Release can also fail after D2H copies have been submitted.
                 state.abort()
                 raise
-            # Inputs and persistent state are owned outside this invocation.
-            # Saved views or detached aliases must not release their storage.
-            state.release(
-                (
-                    outputs,
-                    args,
-                    kwargs,
-                    tuple(__layer.parameters()),
-                    tuple(__layer.buffers()),
-                )
-            )
             return outputs
 
         swapped_forward._activation_swap_enabled = True
