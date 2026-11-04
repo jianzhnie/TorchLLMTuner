@@ -25,7 +25,7 @@ from llmtuner.trainer.trainer import Trainer
 
 
 def _run(
-    directory: Path, swap: bool, ac_mode: str
+    directory: Path, swap: bool, ac_mode: str, sync_release: bool = False
 ) -> tuple[dict[str, torch.Tensor], int, int, dict[str, float | int]]:
     activation_swap.reset_activation_swap_metrics()
     tp_size = int(os.environ.get("NPU_SWAP_TP_SIZE", "1"))
@@ -44,6 +44,7 @@ def _run(
             dump_folder=str(directory),
             activation_checkpoint_mode=ac_mode,
             activation_swap=swap,
+            activation_swap_sync_release=sync_release,
             checkpoint_config=CheckpointConfig(enable=False),
         ),
     )
@@ -265,6 +266,18 @@ def main() -> None:
             f"peak_allocated_baseline={baseline_memory}, swapped={swapped_memory}; "
             f"transfers={metrics}"
         )
+    asynchronous, _, _, _ = _run(
+        root / "none" / "asynchronous", swap=True, ac_mode="none"
+    )
+    synchronous, _, _, _ = _run(
+        root / "none" / "synchronous",
+        swap=True,
+        ac_mode="none",
+        sync_release=True,
+    )
+    for name, value in synchronous.items():
+        torch.testing.assert_close(value, asynchronous[name], rtol=0, atol=0, msg=name)
+    print("PASS activation_swap_sync_release: updates match asynchronous release")
     verify_discarded_graph_cleanup()
     verify_retained_graph_reuse()
     verify_owned_storage_skips()

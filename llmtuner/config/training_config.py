@@ -88,6 +88,13 @@ class TrainingConfig:
             "and region AC are incompatible. Also incompatible with compile."
         },
     )
+    activation_swap_sync_release: bool = field(
+        default=False,
+        metadata={
+            "help": "Wait for activation D2H copies on the compute stream before "
+            "continuing forward. Used only when activation_swap=True."
+        },
+    )
     selective_ac: SelectiveACConfig = field(
         default_factory=SelectiveACConfig,
         metadata={
@@ -239,7 +246,13 @@ class TrainingConfig:
             raise ConfigError(
                 "training.grad_norm_precision must be float32 or parameter"
             )
-        for name in ("compile", "deterministic", "detect_anomaly", "activation_swap"):
+        for name in (
+            "compile",
+            "deterministic",
+            "detect_anomaly",
+            "activation_swap",
+            "activation_swap_sync_release",
+        ):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ConfigError(f"training.{name} must be bool, got {value!r}")

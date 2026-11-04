@@ -12,6 +12,54 @@ def test_package_filesystem_export_is_the_storage_module():
     assert exported is filesystem
 
 
+def test_local_module_import_does_not_require_fsspec(tmp_path, monkeypatch):
+    import builtins
+    import importlib.util
+
+    original_import = builtins.__import__
+
+    def without_fsspec(name, *args, **kwargs):
+        if name == "fsspec" or name.startswith("fsspec."):
+            raise ModuleNotFoundError("remote filesystem unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_fsspec)
+    spec = importlib.util.spec_from_file_location(
+        "local_filesystem", filesystem.__file__
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.isdir(tmp_path)
+    with pytest.raises(ModuleNotFoundError, match="remote filesystem unavailable"):
+        module.resolve("memory://checkpoint")
+
+
+def test_local_writer_does_not_import_remote_backend(tmp_path, monkeypatch):
+    import builtins
+    import importlib.util
+
+    from llmtuner.components.checkpointer.storage import checkpoint_writer
+
+    original_import = builtins.__import__
+
+    def without_remote_writer(name, *args, **kwargs):
+        if name == "torch.distributed.checkpoint._fsspec_filesystem":
+            raise ModuleNotFoundError("remote writer unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_remote_writer)
+    spec = importlib.util.spec_from_file_location(
+        "llmtuner.components.checkpointer.storage.local_writer_probe",
+        checkpoint_writer.__file__,
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    writer = module.GenerationFileSystemWriter(tmp_path / "checkpoint")
+    assert writer.path == tmp_path / "checkpoint"
+    with pytest.raises(ModuleNotFoundError, match="remote writer unavailable"):
+        module.GenerationFileSystemWriter("memory://checkpoint")
+
+
 def test_uri_scheme_selects_remote_storage():
     assert filesystem.is_remote("gs://bucket/path")
     assert filesystem.is_remote("s3://bucket/path")

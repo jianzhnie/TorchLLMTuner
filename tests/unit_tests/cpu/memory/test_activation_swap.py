@@ -12,9 +12,10 @@ from llmtuner.errors import EnvironmentUnsupportedError
 class _Stream:
     def __init__(self):
         self.synchronized = False
+        self.waited_streams = []
 
     def wait_stream(self, stream):
-        pass
+        self.waited_streams.append(stream)
 
     def synchronize(self):
         self.synchronized = True
@@ -161,6 +162,16 @@ def test_failed_forward_synchronizes_pending_d2h(cpu_copies):
     state.abort()
 
     assert state.d2h_stream.synchronized
+
+
+def test_sync_release_waits_for_d2h_on_compute_stream(cpu_copies):
+    state = activation_swap._ForwardSwapState(sync_release=True)
+    state.pack(torch.ones(2, 3))
+
+    state.release(outputs=())
+
+    current = activation_swap._stream_api().current_stream()
+    assert current.waited_streams == [state.d2h_stream]
 
 
 def test_failed_release_synchronizes_pending_d2h(cpu_copies, monkeypatch):

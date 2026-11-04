@@ -172,6 +172,7 @@ def _apply_parallelism(
         compile_config=cfg.training.compile_config,
         activation_checkpoint=cfg.training.activation_checkpoint_mode,
         activation_swap=cfg.training.activation_swap,
+        activation_swap_sync_release=cfg.training.activation_swap_sync_release,
         selective_ac=cfg.training.selective_ac,
         memory_budget_ac=cfg.training.memory_budget_ac,
         region_ac=cfg.training.region_ac,

@@ -11,12 +11,17 @@ wheel_root="${WHEEL_ROOT:-/home/jianzhnie/llmtuner/wheels}"
 # tf513 is the only accepted Transformers package; tf511 is retained only for
 # shared dependency files that are present in the older extracted snapshot.
 transformers_root="${TRANSFORMERS_ROOT:-$wheel_root/tf513:$wheel_root/tf511}"
+# Override these when the host path is mounted at a different path on a node or
+# inside its container.  By default the shared filesystem uses the same paths.
+remote_wheel_root="${REMOTE_WHEEL_ROOT:-$wheel_root}"
+remote_transformers_root="${REMOTE_TRANSFORMERS_ROOT:-$transformers_root}"
 transformers_version_prefix="${TRANSFORMERS_VERSION_PREFIX:-5.13.}"
 torch_version_prefix="${TORCH_VERSION_PREFIX:-2.12.}"
 torch_npu_version_prefix="${TORCH_NPU_VERSION_PREFIX:-$torch_version_prefix}"
 runtime_python_version="${RUNTIME_PYTHON_VERSION:-3.12}"
 require_npu="${REQUIRE_NPU:-1}"
 preflight_only="${PREFLIGHT_ONLY:-0}"
+verify_wheel_hashes="${VERIFY_WHEEL_HASHES:-1}"
 ssh_timeout="${SSH_CONNECT_TIMEOUT:-8}"
 install_jobs="${INSTALL_JOBS:-4}"
 log_folder="${INSTALL_LOG_FOLDER:-$repo_root/outputs/environment_install_$(date +%Y%m%d_%H%M%S)}"
@@ -33,6 +38,16 @@ fi
 
 if [[ "$preflight_only" != 0 && "$preflight_only" != 1 ]]; then
   echo "PREFLIGHT_ONLY must be 0 or 1" >&2
+  exit 1
+fi
+
+if [[ "$verify_wheel_hashes" != 0 && "$verify_wheel_hashes" != 1 ]]; then
+  echo "VERIFY_WHEEL_HASHES must be 0 or 1" >&2
+  exit 1
+fi
+
+if [[ ! "$ssh_timeout" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SSH_CONNECT_TIMEOUT must be a positive integer" >&2
   exit 1
 fi
 
@@ -144,30 +159,41 @@ for relative_path in "${wheels[@]}"; do
   fi
 done
 
+if (( verify_wheel_hashes )) && ! command -v sha256sum >/dev/null 2>&1; then
+  echo "sha256sum is required when VERIFY_WHEEL_HASHES=1" >&2
+  exit 1
+fi
+
+declare -a wheel_specs=()
+for relative_path in "${wheels[@]}"; do
+  wheel_hash="-"
+  if (( verify_wheel_hashes )); then
+    wheel_hash="$(sha256sum "$(wheel "$relative_path")" | awk '{print $1}')"
+  fi
+  wheel_specs+=("$relative_path|$wheel_hash")
+done
+
 echo "Local preflight passed: ${#nodes[@]} node(s), ${#wheels[@]} wheel(s),"
 echo "Transformers=${transformers_root}, Python=${runtime_python_version},"
 echo "Torch=${torch_version_prefix}, Torch-NPU=${torch_npu_version_prefix},"
-echo "NPU required=${require_npu}."
+echo "NPU required=${require_npu}, wheel hashes=${verify_wheel_hashes}."
 if (( preflight_only )); then
   exit 0
 fi
 
-install_args=()
-for relative_path in "${wheels[@]}"; do
-  install_args+=("$wheel_root/$relative_path")
-done
-
 remote_script=$(cat <<'REMOTE'
 set -euo pipefail
 container_name="$1"
-transformers_root="$2"
-transformers_version_prefix="$3"
-torch_version_prefix="$4"
-torch_npu_version_prefix="$5"
-runtime_python_version="$6"
-require_npu="$7"
-shift 7
-python_args=("$@")
+remote_wheel_root="$2"
+transformers_root="$3"
+transformers_version_prefix="$4"
+torch_version_prefix="$5"
+torch_npu_version_prefix="$6"
+runtime_python_version="$7"
+require_npu="$8"
+verify_wheel_hashes="$9"
+shift 9
+wheel_specs=("$@")
 
 if [[ "$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null)" != true ]]; then
   echo "container is not running: $container_name" >&2
@@ -176,9 +202,38 @@ fi
 
 first_transformers_root="${transformers_root%%:*}"
 docker exec "$container_name" test -d "$first_transformers_root/transformers"
-for wheel_path in "${python_args[@]}"; do
+python_args=()
+for wheel_spec in "${wheel_specs[@]}"; do
+  relative_path="${wheel_spec%%|*}"
+  expected_hash="${wheel_spec#*|}"
+  if [[ "$relative_path" == "$wheel_spec" || -z "$relative_path" ]]; then
+    echo "invalid wheel specification: $wheel_spec" >&2
+    exit 1
+  fi
+  wheel_path="$remote_wheel_root/$relative_path"
   docker exec "$container_name" test -f "$wheel_path"
+  python_args+=("$wheel_path")
 done
+
+if [[ "$verify_wheel_hashes" == 1 ]]; then
+  docker exec -i "$container_name" python - "$remote_wheel_root" "${wheel_specs[@]}" <<'PY'
+import hashlib
+import sys
+
+root, *specs = sys.argv[1:]
+for spec in specs:
+    relative_path, expected = spec.split("|", 1)
+    digest = hashlib.sha256()
+    with open(f"{root}/{relative_path}", "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected:
+        raise SystemExit(
+            f"wheel hash mismatch for {relative_path}: {actual} != {expected}"
+        )
+PY
+fi
 
 docker exec "$container_name" python -m pip install \
   --disable-pip-version-check --no-input --no-deps --no-index \
@@ -192,9 +247,11 @@ docker exec \
   -e EXPECTED_TORCH_NPU_PREFIX="$torch_npu_version_prefix" \
   -e EXPECTED_PYTHON_VERSION="$runtime_python_version" \
   -e REQUIRE_NPU="$require_npu" \
+  -e EXPECTED_TRANSFORMERS_ROOT="$first_transformers_root" \
   "$container_name" python -c '
 import os
 import sys
+from pathlib import Path
 
 import datasets
 import grain
@@ -212,6 +269,10 @@ assert torch_npu.__version__.startswith(
 assert transformers.__version__.startswith(
     os.environ["EXPECTED_TRANSFORMERS_PREFIX"]
 ), transformers.__version__
+expected_transformers_root = Path(os.environ["EXPECTED_TRANSFORMERS_ROOT"])
+assert Path(transformers.__file__).resolve().is_relative_to(
+    expected_transformers_root.resolve()
+), transformers.__file__
 
 npu_available = bool(torch.npu.is_available())
 npu_count = torch.npu.device_count() if npu_available else 0
@@ -241,6 +302,14 @@ batch_logs=()
 failed=0
 printf 'node\texit_code\tlog\n' >"$log_folder/summary.tsv"
 
+cleanup() {
+  local pid
+  for pid in "${pids[@]:-}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup INT TERM EXIT
+
 wait_batch() {
   local index result node log_file
   for index in "${!pids[@]}"; do
@@ -266,10 +335,11 @@ for node in "${nodes[@]}"; do
   log_name="${node//[^[:alnum:]._-]/_}"
   log_file="$log_folder/$log_name.log"
   ssh -o BatchMode=yes -o ConnectTimeout="$ssh_timeout" "$node" \
-    "bash -s -- $(printf '%q ' "$container_name" "$transformers_root" \
+    "bash -s -- $(printf '%q ' "$container_name" "$remote_wheel_root" \
+      "$remote_transformers_root" \
       "$transformers_version_prefix" "$torch_version_prefix" \
       "$torch_npu_version_prefix" "$runtime_python_version" "$require_npu" \
-      "${install_args[@]}")" \
+      "$verify_wheel_hashes" "${wheel_specs[@]}")" \
     <<<"$remote_script" >"$log_file" 2>&1 &
   pids+=("$!")
   batch_nodes+=("$node")

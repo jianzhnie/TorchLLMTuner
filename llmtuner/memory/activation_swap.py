@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import weakref
 from dataclasses import dataclass
 from functools import wraps
@@ -78,7 +77,8 @@ def _release_host_bytes(num_bytes: int) -> None:
 
 
 class _ForwardSwapState:
-    def __init__(self, protected: Any = ()) -> None:
+    def __init__(self, protected: Any = (), *, sync_release: bool = False) -> None:
+        self.sync_release = sync_release
         self.d2h_stream = _stream_api().Stream()
         self.h2d_stream = _stream_api().Stream()
         self.packed: list[_SwappedActivation] = []
@@ -131,7 +131,7 @@ class _ForwardSwapState:
             for value in _flatten(outputs)
             if isinstance(value, torch.Tensor)
         }
-        if os.environ.get("LLMTUNER_ACTIVATION_SWAP_SYNC_RELEASE") == "1":
+        if self.sync_release:
             _stream_api().current_stream().wait_stream(self.d2h_stream)
         for packed in self.packed:
             storage = packed.device_tensor.untyped_storage()
@@ -236,7 +236,7 @@ def reset_activation_swap_metrics() -> None:
         _metrics_enabled = True
 
 
-def apply_activation_swap(model: nn.Module) -> nn.Module:
+def apply_activation_swap(model: nn.Module, *, sync_release: bool = False) -> nn.Module:
     """Swap saved decoder activations to pinned Host memory between NPU uses."""
     if device_type != "npu":
         raise EnvironmentUnsupportedError(
@@ -261,7 +261,8 @@ def apply_activation_swap(model: nn.Module) -> nn.Module:
             # Inputs and persistent state already remain on device. Avoid
             # allocating Host copies which release() would never consume.
             state = _ForwardSwapState(
-                (args, kwargs, tuple(__layer.parameters()), tuple(__layer.buffers()))
+                (args, kwargs, tuple(__layer.parameters()), tuple(__layer.buffers())),
+                sync_release=sync_release,
             )
             try:
                 with torch.autograd.graph.saved_tensors_hooks(state.pack, _unpack):

@@ -1637,13 +1637,11 @@ def test_same_step_final_export_preserves_complete_checkpoint(tmp_path):
 def test_resumability_scan_only_tolerates_disappearing_metadata(monkeypatch, error):
     from types import SimpleNamespace
 
-    from torch.distributed.checkpoint import _storage_utils
-
     def read_metadata():
         raise error
 
     monkeypatch.setattr(
-        _storage_utils,
+        "llmtuner.components.checkpointer.backends.distributed_checkpoint."
         "_storage_setup",
         lambda *args, **kwargs: SimpleNamespace(read_metadata=read_metadata),
     )

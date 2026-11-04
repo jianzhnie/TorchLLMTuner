@@ -278,6 +278,10 @@ class LLMTunerConfig:
         return self.training.activation_swap
 
     @property
+    def activation_swap_sync_release(self) -> bool:
+        return self.training.activation_swap_sync_release
+
+    @property
     def pipeline_parallel_schedule(self) -> str:
         return self.parallel.pp_config.pipeline_parallel_schedule
 
