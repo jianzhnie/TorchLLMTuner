@@ -60,9 +60,8 @@ def build_dataloader(self: Trainer) -> BaseDataLoader:
         self.cfg,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
-        # Per rank, not global: the Grain loader splits every dataset's
-        # rows across ``dp_world_size`` ranks itself, so this many tokens
-        # per rank is this many tokens per rank of the global batch.
+        # The dataset builder owns DP sharding; the loader batches the local
+        # graph. Its token budget must therefore use this rank's batch size.
         num_tokens_per_batch=batch_size_per_rank * self.cfg.max_seq_len,
     )
 
