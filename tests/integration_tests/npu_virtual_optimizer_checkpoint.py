@@ -22,6 +22,36 @@ from llmtuner.config import (
 from llmtuner.trainer.trainer import Trainer
 
 
+def check_closure_moment_allocation() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -0.5], device="npu"))
+    reference = torch.nn.Parameter(parameter.detach().clone())
+    optimizer = torch.optim.AdamW([parameter], lr=0.01, foreach=False)
+    expected = torch.optim.AdamW([reference], lr=0.01, foreach=False)
+    install_state_residency(optimizer, "npu_virtual")
+
+    def closure(optim, value):
+        optim.zero_grad(set_to_none=True)
+        loss = value.square().sum()
+        loss.backward()
+        return loss
+
+    for _ in range(3):
+        optimizer.step(closure=lambda: closure(optimizer, parameter))
+        expected.step(lambda: closure(expected, reference))
+        torch.testing.assert_close(parameter, reference, rtol=0, atol=0)
+        for name in ("exp_avg", "exp_avg_sq"):
+            # Materialize on NPU: raw swapped-storage CPU copies do not
+            # necessarily observe the values read by device kernels.
+            torch.testing.assert_close(
+                optimizer.state[parameter][name].clone(),
+                expected.state[reference][name],
+                rtol=0,
+                atol=0,
+            )
+    torch.npu.synchronize()
+    print("PASS NPU virtual closure: three updates and device moments exact")
+
+
 def check_failed_moment_copy_retry() -> None:
     for failed_name in ("exp_avg", "exp_avg_sq"):
         parameter = torch.nn.Parameter(torch.tensor([1.0, -0.5], device="npu"))
@@ -170,6 +200,7 @@ def _compare(actual, expected) -> None:
 def main() -> None:
     root = Path(sys.argv[1])
     root.mkdir(parents=True, exist_ok=True)
+    check_closure_moment_allocation()
     check_failed_moment_copy_retry()
     initial = _run(str(root / "initial"), "npu_virtual", 2)
     assert (root / "initial/checkpoint/step-2/.metadata").is_file()

@@ -672,7 +672,11 @@ def map_capture_to_candidate_hf(
 
 
 def localize_parallel_reference(
-    state: dict[str, Any], model: Any, *, parameter_prefix: str = ""
+    state: dict[str, Any],
+    model: Any,
+    *,
+    parameter_prefix: str = "",
+    selected_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     """Slice canonical CPU references using the live physical TP/EP ownership.
 
@@ -693,6 +697,8 @@ def localize_parallel_reference(
             if not name.startswith(parameter_prefix):
                 raise ValueError(f"TP parameter outside reference namespace: {name}")
             name = name.removeprefix(parameter_prefix)
+        if selected_keys is not None and name not in selected_keys:
+            continue
         if name not in state:
             raise ValueError(f"Missing TP reference {name}")
         value = state[name]
@@ -713,12 +719,40 @@ def localize_parallel_reference(
             if not name.startswith(parameter_prefix):
                 raise ValueError(f"EP parameter outside reference namespace: {name}")
             name = name.removeprefix(parameter_prefix)
+        if selected_keys is not None and name not in selected_keys:
+            continue
         if name not in state:
             raise ValueError(f"Missing EP reference {name}")
         state[name] = state[name].chunk(dist.get_world_size(group), 0)[
             dist.get_rank(group)
         ]
     return state
+
+
+def iter_captured_local_state(state: dict[str, Any], model: Any, num_experts: int):
+    """Materialize one canonical expert projection at a time, retaining coverage.
+
+    Source tensors can be mmap-backed. Avoid packing the entire 30B reference
+    on every rank before comparing its local shards.
+    """
+    consumed = set()
+    for name, value in model.model.state_dict().items():
+        mapped = map_capture_to_candidate_hf(dict(state), {name}, num_experts)
+        if name not in mapped:
+            raise ValueError(f"Missing captured reference {name}")
+        consumed.update(state.keys() - mapped.keys())
+        if name in state:
+            consumed.add(name)
+        reference = localize_parallel_reference(
+            {name: mapped[name]},
+            model,
+            parameter_prefix="model.",
+            selected_keys={name},
+        )
+        yield from iter_local_state({name: value}, reference)
+    unexpected = state.keys() - consumed
+    if unexpected:
+        raise ValueError(f"Unused captured reference keys: {sorted(unexpected)[:8]}")
 
 
 def map_candidate_to_canonical_hf(state: dict):

@@ -25,10 +25,20 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.seeding import set_deterministic_algorithms
+from tests.integration_tests.alignment_attention_control import (
+    batched_attention_control,
+)
 from tests.integration_tests.alignment_history import (
     AlignmentHistory,
     capture_artifact_path,
     load_alignment_history,
+)
+from tests.integration_tests.alignment_norm_control import (
+    install_norm_partition_control,
+)
+from tests.integration_tests.alignment_output_control import (
+    install_output_layout_control,
+    local_token_logits,
 )
 from tests.integration_tests.npu_trainer_alignment_config import (
     QWEN3_30B,
@@ -42,6 +52,7 @@ from tests.integration_tests.npu_trainer_alignment_config import (
     effective_forward_positions,
     input_fingerprints,
     is_qwen3_30b,
+    iter_captured_local_state,
     iter_local_state,
     localize_parallel_reference,
     map_candidate_to_canonical_hf,
@@ -82,6 +93,9 @@ class CapturedLoader:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--batched-attention-control", action="store_true")
+    parser.add_argument("--output-layout-control", action="store_true")
+    parser.add_argument("--norm-partition-control", action="store_true")
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--weight-atol", type=float, default=1e-5)
@@ -92,6 +106,10 @@ def main() -> None:
         default=Path("../torchtitan-npu/scripts/numerical_alignment/utils/metrics.py"),
     )
     args = parser.parse_args()
+    if args.norm_partition_control and not (
+        args.batched_attention_control and args.output_layout_control
+    ):
+        parser.error("norm partition control requires attention and output controls")
     if any(
         not math.isfinite(value) or value < 0
         for value in (args.weight_atol, args.weight_rtol)
@@ -209,11 +227,20 @@ def main() -> None:
     (args.output / "manifest.json").write_text(
         json.dumps(
             {
+                "batched_attention_control": args.batched_attention_control,
+                "output_layout_control": args.output_layout_control,
+                "norm_partition_control": args.norm_partition_control,
                 "rank": rank,
                 "world_size": world,
                 "alignment_model": alignment_model or "debugmodel",
                 "runtime": alignment_runtime_manifest(
-                    ("llmtuner", "llmtuner.trainer.trainer")
+                    (
+                        "llmtuner",
+                        "llmtuner.trainer.trainer",
+                        "tests.integration_tests.alignment_attention_control",
+                        "tests.integration_tests.alignment_output_control",
+                        "tests.integration_tests.alignment_norm_control",
+                    )
                 ),
                 "hf_assets_path": baseline_config["hf_assets_path"],
                 "actual_mesh": mesh_manifest(trainer.parallel_dims),
@@ -311,7 +338,6 @@ def main() -> None:
         assert trainer.parallel_dims.tp == config.parallel.tensor_parallel_size
         assert trainer.parallel_dims.ep == config.parallel.expert_parallel_size
         assert trainer.parallel_dims.pp == trainer.parallel_dims.cp == 1
-        assert trainer.checkpointer.load(trainer.cfg.checkpoint.load_step)
         assert trainer.step == 0
     initial = torch.load(
         capture_artifact_path(args.capture, root, "initial-hf.pt"),
@@ -365,26 +391,49 @@ def main() -> None:
         model.model.load_state_dict(sharded_initial, strict=True)
     else:
         model.model.load_state_dict(initial, strict=True)
-    for _name, parameter, expected in iter_local_state(
-        model.model.state_dict(), initial
-    ):
-        torch.testing.assert_close(parameter, expected, atol=0, rtol=0)
-    (args.output / "initial-verification.json").write_text(
-        json.dumps(
-            {
-                "namespace": "HF canonical, including native fused HF experts",
-                "strict": True,
-                "all_keys_shapes_dtypes_values_checked": True,
-                "captured_tensor_count": captured_initial_count,
-                "candidate_tensor_count": len(initial),
-                "independent_lm_head": captured_30b,
-            },
-            indent=2,
+
+    def verify_initial_state():
+        for _name, parameter, expected in iter_local_state(
+            model.model.state_dict(), initial
+        ):
+            torch.testing.assert_close(parameter, expected, atol=0, rtol=0)
+        (args.output / "initial-verification.json").write_text(
+            json.dumps(
+                {
+                    "namespace": "HF canonical, including native fused HF experts",
+                    "strict": True,
+                    "verified_after_training_load": captured_30b,
+                    "all_keys_shapes_dtypes_values_checked": True,
+                    "captured_tensor_count": captured_initial_count,
+                    "candidate_tensor_count": len(initial),
+                    "independent_lm_head": captured_30b,
+                },
+                indent=2,
+            )
         )
-    )
+
     if captured_30b:
-        del initial, candidate_initial
-    trainer_module = importlib.import_module("llmtuner.trainer.trainer")
+        original_load = trainer.checkpointer.load
+
+        def load_and_verify(*load_args, **load_kwargs):
+            loaded = original_load(*load_args, **load_kwargs)
+            if not loaded or trainer.step != 0:
+                raise ValueError(
+                    "Alignment requires a successfully loaded initial state"
+                )
+            verify_initial_state()
+            # Release model-sized reference shards before forward/backward.
+            initial.clear()
+            trainer.checkpointer.load = original_load
+            return loaded
+
+        # Trainer.train owns the real load. Verify its result, rather than
+        # loading twice and checking only the state preceding the second load.
+        trainer.checkpointer.load = load_and_verify
+        del candidate_initial
+    else:
+        verify_initial_state()
+    trainer_module = importlib.import_module("llmtuner.trainer.runtime.gradients")
     original_clip = trainer_module.clip_grad_norm_
     reorder_norm = os.environ.get("LLMTUNER_ALIGNMENT_BASELINE_NORM_ORDER") == "1"
     if reorder_norm:
@@ -537,6 +586,45 @@ def main() -> None:
     logits = AlignmentHistory(args.output / "candidate-logits", writable=True)
     step_metrics = []
     observed_global_valid_tokens = []
+    if args.batched_attention_control:
+        from transformers.modeling_utils import AttentionInterface
+
+        if model.model.config._attn_implementation != "sdpa":
+            raise ValueError("Attention shape control requires SDPA")
+        geometries = []
+        for forward in forwards:
+            geometry = tuple(forward["args"][0].shape)
+            if len(geometry) != 2:
+                raise ValueError("Attention control requires rectangular documents")
+            positions = effective_forward_positions(forward).reshape(geometry)
+            expected = torch.arange(geometry[1], device=positions.device)
+            if not torch.equal(positions, expected.expand_as(positions)):
+                raise ValueError("Attention control requires unpadded documents")
+            geometries.append(geometry)
+
+        def controlled_sdpa(module, query, key, value, attention_mask, **kwargs):
+            return batched_attention_control(
+                query,
+                key,
+                value,
+                attention_mask,
+                geometries[trainer.step - 1],
+                **kwargs,
+            )
+
+        AttentionInterface.register("sdpa", controlled_sdpa)
+        print("Diagnostic only: batched attention geometry for training and AC replay")
+
+    if args.output_layout_control:
+        install_output_layout_control(trainer)
+        print("Diagnostic only: vocab-parallel output/loss arithmetic")
+
+    if args.norm_partition_control:
+        install_norm_partition_control(
+            trainer, lambda: tuple(forwards[trainer.step - 1]["args"][0].shape)
+        )
+        print("Diagnostic only: per-batch TP norm weight-gradient partition")
+
     original_forward_backward = trainer.forward_backward_step
 
     def observe_forward_backward(self, *args, **kwargs):
@@ -592,6 +680,8 @@ def main() -> None:
     trainer.train_step = MethodType(observe_step, trainer)
 
     def observe_forward(module, inputs, output):
+        if args.output_layout_control:
+            output = local_token_logits(output, trainer.parallel_dims.get_mesh("tp"))
         logits.append(output.detach().cpu().clone())
 
     handle = model.register_forward_hook(observe_forward)
@@ -684,23 +774,16 @@ def main() -> None:
             )
 
         if captured_30b:
-            baseline_final = map_capture_to_candidate_hf(
-                torch.load(
-                    capture_artifact_path(args.capture, root, "final-hf.pt"),
-                    map_location="cpu",
-                    mmap=True,
-                    weights_only=True,
-                ),
-                set(model.model.state_dict()),
-                architecture["num_experts"],
-            )
-            baseline_final = localize_parallel_reference(
-                baseline_final, model, parameter_prefix="model."
+            baseline_final = torch.load(
+                capture_artifact_path(args.capture, root, "final-hf.pt"),
+                map_location="cpu",
+                mmap=True,
+                weights_only=True,
             )
             candidate_local = {}
             weight_metrics = {}
-            for name, value, expected in iter_local_state(
-                model.model.state_dict(), baseline_final
+            for name, value, expected in iter_captured_local_state(
+                baseline_final, model, architecture["num_experts"]
             ):
                 candidate_local[name] = value
                 weight_metrics[name] = compare_weight(name, value, expected)

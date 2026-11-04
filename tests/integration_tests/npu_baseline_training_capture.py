@@ -39,7 +39,7 @@ from tests.integration_tests.npu_trainer_alignment_config import (
 )
 
 
-def _snapshot(value):
+def _snapshot(value, *, writer_rank_only=False):
     from torch.nn.attention.flex_attention import BlockMask
 
     if isinstance(value, BlockMask):
@@ -51,16 +51,50 @@ def _snapshot(value):
             torch.arange(queries, device=device)[None, None, :, None],
             torch.arange(keys, device=device)[None, None, None, :],
         )
-        return {"kind": "BlockMask", "dense_token_mask": _snapshot(dense_mask)}
+        return {
+            "kind": "BlockMask",
+            "dense_token_mask": _snapshot(
+                dense_mask, writer_rank_only=writer_rank_only
+            ),
+        }
     if isinstance(value, DTensor):
         value = value.full_tensor()
     if isinstance(value, torch.Tensor):
+        if writer_rank_only and dist.is_initialized() and dist.get_rank() != 0:
+            return None
         return value.detach().cpu().clone()
     if isinstance(value, dict):
-        return {name: _snapshot(item) for name, item in value.items()}
+        return {
+            name: _snapshot(item, writer_rank_only=writer_rank_only)
+            for name, item in value.items()
+        }
     if isinstance(value, tuple | list):
-        return type(value)(_snapshot(item) for item in value)
+        return type(value)(
+            _snapshot(item, writer_rank_only=writer_rank_only) for item in value
+        )
     return value
+
+
+def shared_hf_snapshot(model, adapter):
+    """Return writer-owned HF state and a tensor count shared by all ranks."""
+    state = _snapshot(model.state_dict(), writer_rank_only=True)
+    distributed = dist.is_initialized()
+    result = None
+    error = None
+    count = 0
+    if not distributed or dist.get_rank() == 0:
+        try:
+            result = adapter.to_hf(state)
+            count = len(result)
+        except Exception as exception:
+            error = f"{type(exception).__name__}: {exception}"
+    if distributed:
+        status = [error, count]
+        dist.broadcast_object_list(status, src=0)
+        error, count = status
+    if error is not None:
+        raise RuntimeError(f"Failed to convert shared HF snapshot: {error}")
+    return result, count
 
 
 def _local_tensor_layout(value):
@@ -279,10 +313,21 @@ def main() -> None:
             torch.testing.assert_close(actual[name], value, atol=0, rtol=0)
     config_dict = baseline_config_snapshot(config)
     (root / "config.json").write_text(json.dumps(config_dict, indent=2))
+    source_modules = ["torchtitan", "torchtitan.trainer", "torchtitan_npu"]
+    if alignment_model == QWEN3_30B:
+        source_modules.extend(
+            (
+                "torchtitan.models.llama4.parallelize",
+                "torchtitan.distributed.tensor_parallel",
+                "torchtitan_npu.converters.kernels.gmm",
+                "torchtitan_npu.converters.kernels.moe_dispatch",
+                "torchtitan_npu.patches.torchtitan.expert_parallel",
+                __name__,
+            )
+        )
+    runtime = alignment_runtime_manifest(source_modules)
     manifest = {
-        "runtime": alignment_runtime_manifest(
-            ("torchtitan", "torchtitan.trainer", "torchtitan_npu")
-        ),
+        "runtime": runtime,
         "rank": rank,
         "world_size": world,
         "capture_artifact_layout": "shared-hf-v1",
@@ -326,7 +371,7 @@ def main() -> None:
     initial_captured = []
 
     def capture_initial():
-        initial_hf = adapter.to_hf(_snapshot(model.state_dict()))
+        initial_hf, canonical_tensor_count = shared_hf_snapshot(model, adapter)
         save_shared_snapshot(
             initial_hf,
             shared_root / "initial-hf.pt",
@@ -343,7 +388,7 @@ def main() -> None:
                     ),
                     "loaded_from_hf": alignment_model == QWEN3_30B,
                     "trainer_step": trainer.step,
-                    "canonical_tensor_count": len(initial_hf),
+                    "canonical_tensor_count": canonical_tensor_count,
                     "all_values_checked": alignment_model == QWEN3_30B,
                 },
                 indent=2,
@@ -502,7 +547,9 @@ def main() -> None:
         assert trainer.step == config.training.steps
         assert len(captured) == config.training.steps
         assert len(consumed) == config.training.steps
-        final_hf = adapter.to_hf(_snapshot(model.state_dict()))
+        if alignment_runtime_manifest(source_modules) != runtime:
+            raise RuntimeError("Baseline sources or runtime changed during capture")
+        final_hf, _ = shared_hf_snapshot(model, adapter)
         save_shared_snapshot(final_hf, shared_root / "final-hf.pt")
         torch.save(consumed, root / "consumed-batches.pt")
         torch.save(measured, root / "step-metrics.pt")

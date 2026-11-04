@@ -220,3 +220,76 @@ def test_resident_memory_counts_local_parameters_gradients_and_optimizer_state()
     assert result["optimizer_state"]["exp_avg_sq"] == expected
     optimizer.zero_grad(set_to_none=True)
     assert summarize_resident_memory(model, [optimizer])["gradients"] == 0
+
+
+def test_source_metadata_identifies_dirty_and_untracked_code(tmp_path):
+    import subprocess
+
+    from examples.npu_training_benchmark import source_metadata
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "Test")
+    source = tmp_path / "llmtuner"
+    source.mkdir()
+    tracked = source / "model.py"
+    tracked.write_text("version = 1\n")
+    git("add", ".")
+    git("commit", "-m", "initial")
+    clean = source_metadata(tmp_path)
+    assert clean["git_dirty"] is False
+    tracked.write_text("version = 2\n")
+    changed = source_metadata(tmp_path)
+    assert changed["git_dirty"] is True
+    assert changed["git_commit"] == clean["git_commit"]
+    assert changed["git_diff_sha256"] != clean["git_diff_sha256"]
+    git("add", ".")
+    assert source_metadata(tmp_path)["git_diff_sha256"] == changed["git_diff_sha256"]
+    extra = source / "kernel.py"
+    extra.write_text("version = 3\n")
+    first = source_metadata(tmp_path)["untracked_source_sha256"]
+    extra.write_text("version = 4\n")
+    second = source_metadata(tmp_path)["untracked_source_sha256"]
+    assert first["llmtuner/kernel.py"] != second["llmtuner/kernel.py"]
+
+
+def test_runtime_provenance_rejects_midrun_source_or_environment_change():
+    from examples.npu_training_benchmark import validate_runtime_consistency
+
+    before = {"git_commit": "abc", "git_diff_sha256": "123", "packages": {"torch": "2"}}
+    validate_runtime_consistency(before, dict(before))
+    for key, value in (
+        ("git_commit", "def"),
+        ("git_diff_sha256", "456"),
+        ("packages", {"torch": "3"}),
+    ):
+        with pytest.raises(RuntimeError, match=key):
+            validate_runtime_consistency(before, {**before, key: value})
+
+
+def test_rank_runtime_validation_allows_hosts_but_rejects_code_drift():
+    from examples.npu_training_benchmark import validate_rank_runtimes
+
+    reference = {
+        "git_commit": "abc",
+        "git_diff_sha256": "123",
+        "untracked_source_sha256": {},
+        "packages": {"torch": "2"},
+        "python": "3.12",
+        "platform": "host-a",
+    }
+    other = {**reference, "platform": "host-b"}
+    validate_rank_runtimes([{"rank": 1, "runtime": other}], reference)
+    for key in ("git_commit", "git_diff_sha256", "python"):
+        with pytest.raises(RuntimeError, match=f"rank 1 runtime mismatch: {key}"):
+            validate_rank_runtimes(
+                [{"rank": 1, "runtime": {**other, key: "different"}}], reference
+            )
+    with pytest.raises(RuntimeError, match="untracked_source_sha256"):
+        validate_rank_runtimes(
+            [{"rank": 2, "runtime": {**other, "untracked_source_sha256": {"x": "y"}}}],
+            reference,
+        )

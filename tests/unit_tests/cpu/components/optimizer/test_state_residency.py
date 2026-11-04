@@ -439,3 +439,148 @@ def test_failed_load_copy_keeps_virtual_destinations_for_retry(
         parameters, reference_parameters, strict=True
     ):
         torch.testing.assert_close(parameter, reference_parameter, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("keyword", [False, True])
+def test_virtual_moments_created_by_closure_use_allocator(monkeypatch, keyword):
+    monkeypatch.setattr(
+        "llmtuner.components.optimizer.state_residency.device_type", "npu"
+    )
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -0.5]))
+    reference = torch.nn.Parameter(parameter.detach().clone())
+    optimizer = torch.optim.AdamW([parameter], lr=0.01, foreach=False)
+    expected = torch.optim.AdamW([reference], lr=0.01, foreach=False)
+    calls = []
+    install_state_residency(optimizer, "npu_virtual", allocator=_allocator(calls))
+
+    def closure():
+        optimizer.zero_grad(set_to_none=True)
+        loss = parameter.square().sum()
+        loss.backward()
+        return loss
+
+    def reference_closure():
+        expected.zero_grad(set_to_none=True)
+        loss = reference.square().sum()
+        loss.backward()
+        return loss
+
+    for _ in range(2):
+        loss = optimizer.step(closure=closure) if keyword else optimizer.step(closure)
+        expected_loss = expected.step(reference_closure)
+        torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+        torch.testing.assert_close(parameter, reference, rtol=0, atol=0)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("keyword", [False, True])
+@pytest.mark.parametrize("option", ["amsgrad", "capturable", "differentiable", "fused"])
+def test_virtual_revalidates_groups_after_closure(monkeypatch, keyword, option):
+    monkeypatch.setattr(
+        "llmtuner.components.optimizer.state_residency.device_type", "npu"
+    )
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -0.5]))
+    initial = parameter.detach().clone()
+    optimizer = torch.optim.AdamW([parameter], foreach=False)
+    calls = []
+    install_state_residency(optimizer, "npu_virtual", allocator=_allocator(calls))
+
+    def closure():
+        parameter.square().sum().backward()
+        optimizer.param_groups[0][option] = True
+
+    with pytest.raises(UnsupportedCombinationError, match=option):
+        if keyword:
+            optimizer.step(closure=closure)
+        else:
+            optimizer.step(closure)
+    assert not calls
+    assert not optimizer.state
+    torch.testing.assert_close(parameter, initial, rtol=0, atol=0)
+
+
+def test_virtual_revalidates_groups_before_step(monkeypatch):
+    monkeypatch.setattr(
+        "llmtuner.components.optimizer.state_residency.device_type", "npu"
+    )
+    parameter = torch.nn.Parameter(torch.ones(2))
+    optimizer = torch.optim.AdamW([parameter])
+    calls = []
+    install_state_residency(optimizer, "npu_virtual", allocator=_allocator(calls))
+    optimizer.param_groups[0]["amsgrad"] = True
+    parameter.grad = torch.ones_like(parameter)
+    with pytest.raises(UnsupportedCombinationError, match="amsgrad"):
+        optimizer.step()
+    assert not calls
+    assert not optimizer.state
+
+
+def test_virtual_rejects_non_adam_optimizer(monkeypatch):
+    monkeypatch.setattr(
+        "llmtuner.components.optimizer.state_residency.device_type", "npu"
+    )
+    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.ones(2))], lr=0.1)
+    with pytest.raises(UnsupportedCombinationError, match="Adam/AdamW only"):
+        install_state_residency(optimizer, "npu_virtual")
+    assert not optimizer._optimizer_step_pre_hooks
+
+
+@pytest.mark.parametrize("mismatch", ["group_count", "parameter_count"])
+def test_invalid_virtual_load_rejects_layout_before_allocation(monkeypatch, mismatch):
+    monkeypatch.setattr(
+        "llmtuner.components.optimizer.state_residency.device_type", "npu"
+    )
+    parameter = torch.nn.Parameter(torch.ones(2))
+    optimizer = torch.optim.AdamW([parameter], foreach=False)
+    calls = []
+    install_state_residency(optimizer, "npu_virtual", allocator=_allocator(calls))
+    checkpoint = deepcopy(optimizer.state_dict())
+    if mismatch == "group_count":
+        checkpoint["param_groups"].append(deepcopy(checkpoint["param_groups"][0]))
+    else:
+        checkpoint["param_groups"][0]["params"].append(1)
+
+    with pytest.raises(ValueError, match="parameter group"):
+        optimizer.load_state_dict(checkpoint)
+    assert not calls
+    assert not optimizer.state
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    assert len(calls) == 2
+    assert optimizer.state[parameter]["step"].item() == 1
+
+
+@pytest.mark.parametrize("invalid", ["broadcast", "missing_moment", "step"])
+def test_virtual_load_rejects_malformed_state_before_host_allocation(
+    monkeypatch, invalid
+):
+    monkeypatch.setattr(
+        "llmtuner.components.optimizer.state_residency.device_type", "npu"
+    )
+    parameter = torch.nn.Parameter(torch.ones(2, 3))
+    source = torch.optim.AdamW([parameter], foreach=False)
+    parameter.grad = torch.ones_like(parameter)
+    source.step()
+    checkpoint = deepcopy(source.state_dict())
+    target_parameter = torch.nn.Parameter(parameter.detach().clone())
+    target = torch.optim.AdamW([target_parameter], foreach=False)
+    calls = []
+    install_state_residency(target, "npu_virtual", allocator=_allocator(calls))
+    malformed = deepcopy(checkpoint)
+    if invalid == "broadcast":
+        malformed["state"][0]["exp_avg"] = torch.ones(1, 3)
+    elif invalid == "missing_moment":
+        del malformed["state"][0]["exp_avg_sq"]
+    else:
+        malformed["state"][0]["step"] = torch.ones(2)
+    with pytest.raises(ValueError, match="Invalid Adam"):
+        target.load_state_dict(malformed)
+    assert not calls
+    assert not target.state
+    target.load_state_dict(checkpoint)
+    assert len(calls) == 2
+    parameter.grad = torch.full_like(parameter, 0.25)
+    target_parameter.grad = parameter.grad.clone()
+    source.step()
+    target.step()
+    torch.testing.assert_close(target_parameter, parameter, rtol=0, atol=0)

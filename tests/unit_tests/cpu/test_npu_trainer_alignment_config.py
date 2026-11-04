@@ -684,3 +684,40 @@ def test_reference_localization_reads_wrapper_owned_tp_layout(monkeypatch):
     )
     torch.testing.assert_close(result["projection.weight"], full[4:])
     assert result["projection.weight"].shape == wrapper.model.projection.weight.shape
+
+
+def test_streamed_reference_preserves_every_fused_projection_and_source():
+    from tests.integration_tests.npu_trainer_alignment_config import (
+        iter_captured_local_state,
+    )
+
+    experts = torch.nn.Module()
+    experts.gate_up_proj = torch.nn.Parameter(torch.arange(48.0).reshape(2, 6, 4))
+    experts.down_proj = torch.nn.Parameter(torch.arange(24.0).reshape(2, 4, 3))
+    layer = torch.nn.Module()
+    layer.mlp = torch.nn.Module()
+    layer.mlp.experts = experts
+    hf = torch.nn.Module()
+    hf.layers = torch.nn.ModuleList([layer])
+    wrapped = torch.nn.Module()
+    wrapped.model = hf
+    canonical = map_candidate_to_canonical_hf(dict(hf.state_dict()))
+    keys = set(canonical)
+    rows = list(iter_captured_local_state(canonical, wrapped, 2))
+    assert {name for name, _, _ in rows} == set(hf.state_dict())
+    assert set(canonical) == keys
+    for _, observed, reference in rows:
+        torch.testing.assert_close(observed, reference, rtol=0, atol=0)
+
+
+def test_streamed_reference_rejects_unconsumed_canonical_weights():
+    from tests.integration_tests.npu_trainer_alignment_config import (
+        iter_captured_local_state,
+    )
+
+    wrapped = torch.nn.Module()
+    wrapped.model = torch.nn.Linear(3, 2, bias=False)
+    state = dict(wrapped.model.state_dict())
+    state["unexpected.weight"] = torch.zeros(1)
+    with pytest.raises(ValueError, match="Unused captured reference keys"):
+        list(iter_captured_local_state(state, wrapped, 2))

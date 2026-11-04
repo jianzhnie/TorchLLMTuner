@@ -85,8 +85,9 @@ def save_shared_snapshot(
 ) -> None:
     """Publish on rank zero and propagate write/validation failures to every rank.
 
-    Build ``value`` on every rank before calling: gathering DTensors may itself
-    require collectives. This function only coordinates the shared file write.
+    All ranks must participate in any collectives used to build ``value``.
+    Only rank zero needs to retain the result; other ranks may pass ``None``.
+    This function only coordinates the shared file write.
     """
     distributed = dist.is_initialized()
     error = None
