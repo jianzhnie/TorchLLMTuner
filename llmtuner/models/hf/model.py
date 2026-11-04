@@ -65,10 +65,6 @@ from .attention_masks import (
 from .expert_kernels import stabilize_moe_experts, stabilize_moe_router
 from .factory import resolve_model_class, unwrap_text_config
 from .input_preparation import preprocess_inputs
-from .qkv_projection import (
-    apply_fp32_rotary_projection,
-    apply_fused_qkv_projection,
-)
 from .materialization import validate_rotary_initialization
 from .model_setup import (
     apply_cast_lm_head,
@@ -77,6 +73,10 @@ from .model_setup import (
     validate_head_config,
 )
 from .normalization_setup import stabilize_residual_norm_gradients
+from .qkv_projection import (
+    apply_fp32_rotary_projection,
+    apply_fused_qkv_projection,
+)
 
 logger = get_logger(__name__)
 
@@ -345,8 +345,6 @@ class HFTransformerModel(nn.Module):
         max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Normalize and shard a batch through the model input pipeline."""
-        from .input_preparation import preprocess_inputs
-
         return preprocess_inputs(
             self,
             input_dict,
@@ -355,8 +353,6 @@ class HFTransformerModel(nn.Module):
         )
 
     def get_attention_masks(self, positions: torch.Tensor) -> BlockMask | torch.Tensor:
-        from .attention_masks import get_attention_masks
-
         return get_attention_masks(self, positions)
 
     # -- forward ---------------------------------------------------------------
@@ -411,8 +407,6 @@ class HFTransformerModel(nn.Module):
             positions = torch.arange(local_seq_len, device=input_ids.device)
 
         if self.cp_mesh is not None and self._cp_strategy == "compressor_ulysses":
-            from ...accelerator.collectives import synchronize_local_errors
-
             with synchronize_local_errors(
                 "HCA CP wrapper input", group=self.cp_mesh.get_group()
             ):
@@ -430,11 +424,6 @@ class HFTransformerModel(nn.Module):
             # HF builds masks before attention gathers the TP token shards.
             # Build against the full attention sequence, preserving HF's causal
             # and sliding-window rules in eager and compiled execution alike.
-            from transformers.masking_utils import (
-                create_causal_mask,
-                create_sliding_window_causal_mask,
-            )
-
             mask_inputs = input_ids.new_empty(
                 (1, positions.numel(), 1), dtype=torch.float32
             )
@@ -582,8 +571,6 @@ class HFTransformerModel(nn.Module):
             if self.cp_mesh is None:
                 attention_masks = self.get_attention_masks(positions=positions)
             else:
-                from .attention_masks import get_cp_attention_masks
-
                 attention_masks = get_cp_attention_masks(self, positions)
 
         # is_causal is the flex-only spelling: it selects which mod the BlockMask
@@ -612,8 +599,6 @@ class HFTransformerModel(nn.Module):
         # The mask is built at ``positions``' length, which under TP sequence
         # parallelism is the *gathered* length the TP boundary attends over.
         if getattr(self.model.config, "attn_mask_type", "causal") == "block_causal":
-            from .attention_masks import build_dense_attention_mask, mask_dtype
-
             return {
                 "attention_mask": build_dense_attention_mask(
                     positions,

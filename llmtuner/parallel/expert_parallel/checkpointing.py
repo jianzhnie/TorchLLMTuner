@@ -45,14 +45,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_rank, get_world_size
 from ...utils.module_names import canonical_fqn
 
 try:  # torch >= 2.4; the FSDP path (DTensor expert weights) needs it.
     from torch.distributed.tensor import DTensor, distribute_tensor
-from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
-
-from ...accelerator.collectives import synchronize_local_errors
+    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 except ImportError:  # pragma: no cover - old torch, plain-tensor path only
     DTensor = None
     distribute_tensor = None

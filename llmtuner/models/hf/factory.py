@@ -12,11 +12,11 @@ import os
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
-from transformers import AutoConfig
 import transformers
+from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from ..architecture import get_model_architecture
 from .attention_backend import ATTENTION_BACKEND
