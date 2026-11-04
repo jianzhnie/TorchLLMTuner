@@ -454,10 +454,11 @@ class MetricsProcessor:
 
     @property
     def _non_data_parallel_size(self) -> int:
-        """Ranks that hold a copy of the whole model rather than a data shard.
+        """Number of CP/TP/PP ranks sharing one data-parallel token stream.
 
-        Throughput is per device, so the token count is divided by how many
-        devices contributed to it -- one per data-parallel replica group.
+        Fetch accounting records the full local batch before CP/TP partitioning.
+        Divide by this degree to report per-device throughput. EP overlays the
+        dense topology and must not introduce another divisor.
         """
         if self.parallel_dims is None:
             return 1
@@ -559,10 +560,10 @@ class MetricsProcessor:
 
         tps = self.ntokens_since_last_log / (time_delta * self._non_data_parallel_size)
         tflops = self.num_flops_per_token * tps / 1e12
-        # MFU is a ratio against a datasheet dense-BF16 peak, so it is only
-        # meaningful where the hardware actually achieves that. Where the peak
-        # is unknown the measurement is suppressed rather than reported against
-        # a guess -- see get_peak_flops.
+        # MFU uses the per-device BF16 peak reference from get_peak_flops;
+        # Ascend 910C uses the project's agreed 376 TFLOPS convention. This
+        # reference is not measured training throughput. Unknown peaks suppress
+        # MFU rather than substitute a guess.
         # The model's own geometry is the other input, and it is missing in the
         # same way: a config that does not expose the sizes the formula needs
         # makes num_flops_per_token 0, and 0 into a non-zero peak reports a

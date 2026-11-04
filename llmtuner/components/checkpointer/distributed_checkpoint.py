@@ -80,6 +80,7 @@ from .checkpoint_writer import GenerationFileSystemWriter
 from .hf_storage import save_hf_checkpoint
 from .load_planner import CheckpointLoadPlanner
 from .staging import CoordinatedStager
+from .state_adaptation import adapt_hf_model_state
 from .storage import FilesystemCheckpointStorage
 
 logger = get_logger(__name__)
@@ -587,13 +588,16 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 )
 
             hf_state_dict = self.sd_adapter.to_hf(state_dict)
-            hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
-                checkpoint_id, from_quantized=from_quantized
-            )
+            with synchronize_local_errors("HF checkpoint reader preparation"):
+                hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
+                    checkpoint_id, from_quantized=from_quantized
+                )
 
             dcp.load(hf_state_dict, storage_reader=hf_storage_reader)
 
-            state_dict = self.sd_adapter.from_hf(hf_state_dict)
+            state_dict = adapt_hf_model_state(
+                self.sd_adapter, states.get(MODEL), hf_state_dict
+            )
             states[MODEL].load_state_dict(state_dict)
         else:
             # DCP's Stateful callback order is not an optimizer-before-scheduler
@@ -894,9 +898,11 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 uses the instance's own ``states``.
         """
         states = self.states if states is None else states
-        sd = {k: v for k, v in states.items() if k != MODEL}
-        if MODEL in states:
-            model_state = states[MODEL].state_dict()
+        # Model state construction may communicate (TP/EP layout conversion).
+        # Only the subsequent local merge belongs in the error boundary.
+        model_state = states[MODEL].state_dict() if MODEL in states else {}
+        with synchronize_local_errors("Checkpoint model state flattening"):
+            sd = {k: v for k, v in states.items() if k != MODEL}
             collisions = sd.keys() & model_state.keys()
             if collisions:
                 raise ValueError(

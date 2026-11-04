@@ -74,6 +74,7 @@ from .checkpoint_keys import (
 )
 from .checkpointing_metadata import adapt_npu_metadata_gather
 from .random_state import RNGCheckpointState
+from .state_adaptation import adapt_hf_model_state
 
 logger = get_logger(__name__)
 
@@ -633,7 +634,9 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                     strict=True,
                     metadata_format=hf_metadata_format,
                 )
-            states[MODEL].load_state_dict(self.sd_adapter.from_hf(hf_state))
+            model_state = states[MODEL]
+            native_state = adapt_hf_model_state(self.sd_adapter, model_state, hf_state)
+            model_state.load_state_dict(native_state)
         else:
             loaded = self._manager.load(
                 checkpoint_id,

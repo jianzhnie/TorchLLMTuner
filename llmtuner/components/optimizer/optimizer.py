@@ -50,7 +50,6 @@ from ...utils.module_names import canonical_fqn
 from .flex_shard.dist_muon import DistMuon
 from .state_dict import (
     collect_local_optimizer_state,
-    init_optim_state,
     unflatten_optim_state_dict,
 )
 from .state_residency import (
@@ -538,6 +537,10 @@ class OptimizersContainer(Optimizer, Stateful):
 
         All distributed ranks must participate. Validation failure prevents
         applying checkpoint values; lazy optimizer state may be initialized.
+        Local load and DistMuon plan-rebuild errors are coordinated across the
+        world before any rank validates a rebuilt plan over its optimizer mesh.
+        Other load hooks must be collective-free. Plan validation errors retain
+        their mesh-local collective contract.
         Exceptions from load hooks or tensor copies are not atomic and require
         restoring the complete training checkpoint before continuing.
         """
@@ -595,8 +598,9 @@ class OptimizersContainer(Optimizer, Stateful):
         # checkpoint component's collectives. State initialization hooks must
         # be local; communication inside hooks cannot be coordinated here.
         with synchronize_local_errors("Optimizer checkpoint validation"):
-            for optimizer in self.optimizers:
-                init_optim_state(optimizer)
+            # Dense restore needs the same FQN uniqueness checks as sharded
+            # destination construction, before any inner optimizer is loaded.
+            collect_local_optimizer_state(self.optimizers)
             optimizer_states = [
                 unflatten_optim_state_dict(optimizer, flat_state=state_dict)
                 for optimizer in self.optimizers
@@ -611,10 +615,50 @@ class OptimizersContainer(Optimizer, Stateful):
                 # Keep policy failures inside the rank-coordinated boundary.
                 for optimizer_state in optimizer_states:
                     validate_virtual_optimizer_groups(optimizer_state["param_groups"])
-        for optimizer, optimizer_state in zip(
-            self.optimizers, optimizer_states, strict=True
-        ):
-            optimizer.load_state_dict(optimizer_state)
+        # DistMuon plan construction and buffer allocation are local, but its
+        # final validation communicates over optimizer mesh groups. Defer that
+        # collective until every rank has completed local loading.
+        communicating_load = torch.tensor(
+            int(any(isinstance(optimizer, DistMuon) for optimizer in self.optimizers)),
+            device=get_comm_device(),
+            dtype=torch.int32,
+        )
+        all_reduce(communicating_load, op="max")
+        muon_optimizers = [
+            optimizer
+            for optimizer in self.optimizers
+            if isinstance(optimizer, DistMuon)
+        ]
+        for optimizer in muon_optimizers:
+            optimizer._defer_load_plan_validation = True
+        try:
+            # Ordinary hooks and deferred DistMuon rebuilds must not
+            # communicate here. Loading is not atomic on local failure.
+            with synchronize_local_errors("Optimizer checkpoint application"):
+                for optimizer, optimizer_state in zip(
+                    self.optimizers, optimizer_states, strict=True
+                ):
+                    optimizer.load_state_dict(optimizer_state)
+        finally:
+            for optimizer in muon_optimizers:
+                optimizer._defer_load_plan_validation = False
+
+        if communicating_load.item():
+            # PP stages without local experts skip these subgroup collectives.
+            # Mesh participants must expose matching optimizer plans/order.
+            plan_error: BaseException | None = None
+            for optimizer in muon_optimizers:
+                try:
+                    optimizer._validate_plan_across_ranks()
+                except BaseException as error:
+                    if plan_error is None:
+                        plan_error = error
+            # Subgroup validation may fail on only some pipeline/replica groups.
+            # Rejoin the world before any rank advances to the next checkpoint
+            # component. The failed load is not rolled back.
+            with synchronize_local_errors("Optimizer mesh plan validation"):
+                if plan_error is not None:
+                    raise plan_error
 
     def _initialize_optimizer_interface(
         self, all_params: Sequence[torch.Tensor]

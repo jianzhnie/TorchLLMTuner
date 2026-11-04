@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+from torch.distributed.tensor import DTensor
 
 __all__ = [
     "init_optim_state",
@@ -171,6 +172,11 @@ def get_flat_optim_state_dict(optim: torch.optim.Optimizer) -> dict[str, Any]:
     flat: dict[str, Any] = {}
     for fqn, state in fqn_sd["state"].items():
         _flatten_state(state, prefix=f"state.{fqn}", out=flat)
+    conflicts = _conflicting_state_paths(flat)
+    if conflicts:
+        raise ValueError(
+            f"Conflicting nested optimizer state paths: {sorted(conflicts)}"
+        )
     for param_group in fqn_sd["param_groups"]:
         for fqn in param_group["params"]:
             for key, value in param_group.items():
@@ -190,6 +196,65 @@ def load_flat_optim_state_dict(
     single flat dict covering several optimizers can be passed to each of them.
     """
     optim.load_state_dict(unflatten_optim_state_dict(optim, flat_state=flat_state))
+
+
+def validate_optimizer_state_tensor(
+    value: Any, expected: torch.Tensor, *, key: str
+) -> None:
+    """Validate destination storage locally, after TP/EP layout conversion.
+
+    Loading may cast dtype or move devices, but must not silently change
+    distributed ownership. This phase must not redistribute tensors.
+    """
+    if not isinstance(value, torch.Tensor):
+        raise ValueError(f"Optimizer state {key!r} must be a tensor")
+    if value.shape != expected.shape:
+        raise ValueError(
+            f"Optimizer state {key!r} has shape {tuple(value.shape)}, "
+            f"expected {tuple(expected.shape)}"
+        )
+    if isinstance(value, DTensor) != isinstance(expected, DTensor):
+        raise ValueError(
+            f"Optimizer state {key!r} has incompatible distributed tensor layout"
+        )
+    if isinstance(value, DTensor) and (
+        value.device_mesh != expected.device_mesh
+        or value.placements != expected.placements
+        or value.to_local().shape != expected.to_local().shape
+    ):
+        raise ValueError(
+            f"Optimizer state {key!r} must match the destination DTensor "
+            "mesh, placements and local shape"
+        )
+
+
+def validate_optimizer_step_counter(value: Any, *, key: str) -> None:
+    """Validate Adam's local scalar counter without DTensor scalar dispatch."""
+    counter = value
+    if isinstance(counter, DTensor):
+        if any(not placement.is_replicate() for placement in counter.placements):
+            raise ValueError(
+                f"Optimizer state {key!r} counter DTensor must be fully replicated"
+            )
+        counter = counter.to_local()
+    if isinstance(counter, torch.Tensor):
+        if counter.numel() != 1:
+            raise ValueError(
+                f"Optimizer state {key!r} counter must contain exactly one value"
+            )
+        counter = counter.item()
+    if (
+        isinstance(counter, bool)
+        or not isinstance(counter, int | float)
+        or counter < 0
+        or (
+            isinstance(counter, float)
+            and (not math.isfinite(counter) or not counter.is_integer())
+        )
+    ):
+        raise ValueError(
+            f"Optimizer state {key!r} counter must be a finite nonnegative integer"
+        )
 
 
 def optim_state_dict_to_fqn_keys(optim_sd: dict[str, Any]) -> dict[str, Any]:
@@ -242,7 +307,11 @@ def unflatten_optim_state_dict(
     """
     state: dict[int, dict[str, Any]] = {}
     param_groups: list[dict[str, Any]] = []
+    # A direct value and descendants cannot both describe the same state node.
+    # Index conflicts once rather than scanning the full checkpoint per tensor.
+    conflicting_paths = _conflicting_state_paths(flat_state)
     param_id = 0
+    seen_fqns: set[str] = set()
     for param_group in optim.param_groups:
         fqns = param_group["param_names"]
         params = param_group["params"]
@@ -251,6 +320,9 @@ def unflatten_optim_state_dict(
         )
         ids: list[int] = []
         for fqn, param in zip(fqns, params, strict=True):
+            if fqn in seen_fqns:
+                raise ValueError(f"Duplicate optimizer parameter FQN: {fqn!r}")
+            seen_fqns.add(fqn)
             ids.append(param_id)
             if param in optim.state:
                 param_state: dict[str, Any] = {}
@@ -263,51 +335,26 @@ def unflatten_optim_state_dict(
                 for state_name in expected_state:
                     flat_key = f"state.{fqn}.{state_name}"
                     if flat_key in flat_state:
+                        if flat_key in conflicting_paths:
+                            raise ValueError(
+                                "Conflicting nested optimizer state paths under "
+                                f"{flat_key!r}"
+                            )
                         value = flat_state[flat_key]
                         expected = expected_state[state_name]
                         if (
                             isinstance(optim, torch.optim.Adam | torch.optim.AdamW)
                             and state_name == "step"
                         ):
-                            counter = value
-                            if isinstance(counter, torch.Tensor):
-                                if counter.numel() != 1:
-                                    raise ValueError(
-                                        f"Optimizer state {flat_key!r} counter must "
-                                        "contain exactly one value"
-                                    )
-                                counter = counter.item()
-                            if (
-                                isinstance(counter, bool)
-                                or not isinstance(counter, int | float)
-                                or counter < 0
-                                or (
-                                    isinstance(counter, float)
-                                    and (
-                                        not math.isfinite(counter)
-                                        or not counter.is_integer()
-                                    )
-                                )
-                            ):
-                                raise ValueError(
-                                    f"Optimizer state {flat_key!r} counter must be "
-                                    "a finite nonnegative integer"
-                                )
+                            validate_optimizer_step_counter(value, key=flat_key)
                         # Adam moments must match the destination parameter layout.
                         # Optimizer.load_state_dict casts tensors but does not check
                         # shapes, so malformed moments otherwise fail on the first
                         # update after other optimizers have already been restored.
                         if isinstance(expected, torch.Tensor) and state_name != "step":
-                            if not isinstance(value, torch.Tensor):
-                                raise ValueError(
-                                    f"Optimizer state {flat_key!r} must be a tensor"
-                                )
-                            if value.shape != expected.shape:
-                                raise ValueError(
-                                    f"Optimizer state {flat_key!r} has shape "
-                                    f"{tuple(value.shape)}, expected "
-                                    f"{tuple(expected.shape)}"
-                                )
+                            validate_optimizer_state_tensor(
+                                value, expected, key=flat_key
+                            )
                         param_state[state_name] = value
                     else:
                         # Only dictionary-valued state may use nested keys.
@@ -375,6 +422,18 @@ def _restore_param_group(
                     f"{fqn!r}: checkpoint group option {key!r} differs"
                 )
     return new_group
+
+
+def _conflicting_state_paths(flat_state: dict[str, Any]) -> set[str]:
+    """Find values also used as dictionary parents in a dotted-key layout."""
+    conflicts: set[str] = set()
+    for key in flat_state:
+        parent = key.rpartition(".")[0]
+        while parent:
+            if parent in flat_state:
+                conflicts.add(parent)
+            parent = parent.rpartition(".")[0]
+    return conflicts
 
 
 def _flatten_state(state: dict[str, Any], *, prefix: str, out: dict[str, Any]) -> None:

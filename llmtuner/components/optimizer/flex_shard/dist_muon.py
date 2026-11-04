@@ -769,7 +769,6 @@ def _after_load_state_dict(optimizer: Optimizer) -> None:
     # construction, and those values affect compute planning and buffer sizes.
     muon.validate_param_groups(muon.param_groups)
     muon._initialize_plan(muon._parameter_compute_layouts)
-    muon._validate_plan_across_ranks()
     muon._redistribution_runtime.reserve_buffers(
         muon._bucket_plans,
         local_tensor_spec=muon._local_tensor_spec,
@@ -777,6 +776,8 @@ def _after_load_state_dict(optimizer: Optimizer) -> None:
     # A previously used optimizer must validate the restored momentum and
     # incoming gradients again before its first resumed update.
     muon._first_step_validated = False
+    if not getattr(muon, "_defer_load_plan_validation", False):
+        muon._validate_plan_across_ranks()
 
 
 def _local_storage_signature(tensor: Tensor) -> tuple[Any, ...]:
