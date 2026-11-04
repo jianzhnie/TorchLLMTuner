@@ -1,4 +1,4 @@
-"""Training FLOPs per token: the MFU denominator.
+"""Training FLOPs per token: the model-work term in MFU's numerator.
 
 One node of the ``hf`` package. The arithmetic is pure -- it reads an HF config
 and returns a number -- which is why it lives apart from ``factory.py``, whose
@@ -82,7 +82,7 @@ def flops_per_token(arch: PretrainedConfig, *, seq_len: int) -> int:
       once for the forward pass and twice for the backward. That ``3 * 2 = 6``
       is where the familiar ``6N`` comes from. Norms, biases and attention
       sinks are not matmuls and are not counted; upstream's parameter walk does
-      include them, which understates its own ``6N`` term by well under a
+      include them, which overstates its own ``6N`` term by well under a
       percent.
     * Attention adds :func:`quadratic_attention_flops_per_token` per layer, the
       two attention contractions that the parameter term above does not cover.

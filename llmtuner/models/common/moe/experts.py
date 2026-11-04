@@ -31,6 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ....accelerator.capabilities import has
+from ....accelerator.grouped_mm import aligned_npu_grouped_mm
 from ..activation import SwiGLU
 
 if TYPE_CHECKING:
@@ -192,18 +193,47 @@ class GroupedExperts(nn.Module):
         Empty input still runs an empty linear operation to retain the input
         and weight gradient paths required by distributed dispatch backward.
         """
-        if x_TD.shape[0] == 0:
+        # Whole-block EP tracing receives an unbacked token dimension. Keep
+        # the eager fast path out of that graph; the compiled kernel/fallback
+        # handles empty inputs without guarding on the received token count.
+        if not torch.compiler.is_compiling() and x_TD.shape[0] == 0:
             # A rank with no expert tokens must still traverse dispatch in
             # backward. Empty linear keeps the input and weight graph alive
             # and produces zero parameter gradients without any expert work.
             return F.linear(x_TD, weight_EOI[0].to(x_TD.dtype))
 
-        if self.use_grouped_mm and x_TD.dtype == torch.bfloat16:
-            return torch._grouped_mm(
-                x_TD.bfloat16(),
-                weight_EOI.bfloat16().transpose(-2, -1),
-                offs=offsets_E,
-            ).type_as(x_TD)
+        grouped_layout_supported = True
+        if (
+            self.use_grouped_mm
+            and x_TD.dtype == torch.bfloat16
+            and x_TD.device.type == "npu"
+        ):
+            # NPU grouped_mm requires every non-unit BF16 stride to be
+            # 16-byte aligned. Zero-stride broadcasts are not valid grouped_mm
+            # layouts even though zero is divisible by the alignment; small
+            # valid expert widths (e.g. F=12) also use the linear fallback.
+            # The output width also becomes a row stride in backward.
+            grouped_layout_supported = weight_EOI.shape[-2] % 8 == 0 and all(
+                stride > 0 and (stride == 1 or stride % 8 == 0)
+                for stride in (*x_TD.stride(), *weight_EOI.stride())
+            )
+            if not torch.compiler.is_compiling():
+                # Compiled NPU execution checks addresses inside its runtime
+                # op: Dynamo cannot trace storage_offset() in fullgraph.
+                grouped_layout_supported = grouped_layout_supported and (
+                    x_TD.storage_offset() % 8 == 0
+                    and weight_EOI.storage_offset() % 8 == 0
+                )
+        if (
+            self.use_grouped_mm
+            and x_TD.dtype == torch.bfloat16
+            and grouped_layout_supported
+        ):
+            left = x_TD.bfloat16()
+            right = weight_EOI.bfloat16().transpose(-2, -1)
+            if x_TD.device.type == "npu" and torch.compiler.is_compiling():
+                return aligned_npu_grouped_mm(left, right, offsets_E).type_as(x_TD)
+            return torch._grouped_mm(left, right, offs=offsets_E).type_as(x_TD)
 
         counts = offsets_E.clone()
         counts[1:] = offsets_E[1:] - offsets_E[:-1]

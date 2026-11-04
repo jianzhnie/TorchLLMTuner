@@ -187,15 +187,18 @@ class HFTransformerStateDictAdapter:
             and getattr(self.model_config, "tie_word_embeddings", False)
         ):
             hf_state_dict["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"]
-        state = {
-            "model."
-            + (
+        # Plain key mapping is local: callers may invoke it on only one rank.
+        # Kimi's tensor-layout conversion below retains its collective contract.
+        state = {}
+        for key, value in hf_state_dict.items():
+            target = "model." + (
                 key.replace(".mlp.gate.", ".mlp.router.gate.")
                 if self.qwen3_expert_parallel
                 else key
-            ): value
-            for key, value in hf_state_dict.items()
-        }
+            )
+            if target in state:
+                raise ValueError(f"HF checkpoint key mapping collision: {target!r}")
+            state[target] = value
         if self.kimi_expert_parallel:
             from ..kimi.checkpoint import convert_kimi_expert_state
 

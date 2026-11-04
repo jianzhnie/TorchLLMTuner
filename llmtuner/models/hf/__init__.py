@@ -17,7 +17,8 @@ Main modules:
   and the decoder forward the trainer calls.
   This is the consumer of everything else here, and its name follows upstream's
   ``experiments/transformers_modeling_backend/model.py``.
-* ``flops.py`` -- training FLOPs per token, the MFU denominator. Pure
+* ``flops.py`` -- training FLOPs per token, the model-work term in MFU's
+  numerator. Pure
   arithmetic over an HF config, kept apart from the building; the trainer's
   runtime assembly passes the already resolved text config directly to
   ``flops_per_token``.

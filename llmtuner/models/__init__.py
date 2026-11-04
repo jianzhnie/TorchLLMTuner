@@ -5,7 +5,8 @@ Responsibilities are split across three layers:
 * ``architecture.py`` -- the lightweight registration seam for custom HF types.
 * ``hf/`` -- the adaptation layer: ``factory.py`` builds the HF config and
   resolves the model class, ``model.py`` holds the ``HFTransformerModel`` the
-  trainer drives, ``flops.py`` counts the MFU denominator, and
+  trainer drives, ``flops.py`` counts model FLOPs per token for the MFU
+  numerator, and
   ``state_dict_adapter.py`` maps the checkpoint FQNs. Runtime Hugging Face
   adaptation belongs here.
 * ``common/`` -- the model vocabulary, vendored from torchtitan

@@ -123,11 +123,14 @@ class KimiMoEGate(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         # compute gating score
         hidden_states = hidden_states.reshape(-1, h)
-        logits = F.linear(
-            hidden_states.type(torch.float32),
-            self.weight.type(torch.float32),
-            None,
-        )
+        # Explicit casts alone do not prevent autocast from lowering linear.
+        # Keep routing precision consistent with the native EP router.
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            logits = F.linear(
+                hidden_states.type(torch.float32),
+                self.weight.type(torch.float32),
+                None,
+            )
         if self.moe_router_activation_func == "sigmoid":
             scores = logits.sigmoid()
         elif self.moe_router_activation_func == "softmax":
@@ -261,7 +264,12 @@ class KimiSparseMoE(nn.Module):
         for index, expert in enumerate(self.experts):
             tokens, slots = (ids == index).nonzero(as_tuple=True)
             values = expert(inputs.index_select(0, tokens))
-            values = values * scores[tokens, slots, None].to(values.dtype)
+            # Preserve FP32 routing scores through the multiplication, matching
+            # EP combine; rounding scores first changes expert-output gradients.
+            compute_dtype = torch.promote_types(values.dtype, scores.dtype)
+            values = (values.to(compute_dtype) * scores[tokens, slots, None]).to(
+                values.dtype
+            )
             output = output.index_add(0, tokens, values)
         if hasattr(self, "routed_expert_norm"):
             output = self.routed_expert_norm(output)
