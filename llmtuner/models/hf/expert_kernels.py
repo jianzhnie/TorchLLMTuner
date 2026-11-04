@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from types import MethodType
+
 import torch
 import torch.nn as nn
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeSparseMoeBlock,
+    Qwen3MoeTopKRouter,
+)
 
+from ...parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 from ..common.moe.gate import RouterGateLinearFunction
 from ..common.scatter_add import deterministic_scatter_add
 
@@ -22,10 +29,6 @@ def forward_fp32_topk_router(module: nn.Module, hidden_states: torch.Tensor):
 def stabilize_moe_router(model: nn.Module) -> None:
     if getattr(model.config, "model_type", None) != "qwen3_moe":
         return
-    from types import MethodType
-
-    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeTopKRouter
-
     for module in model.modules():
         if type(module) is Qwen3MoeTopKRouter:
             module.forward = MethodType(forward_fp32_topk_router, module)
@@ -90,12 +93,6 @@ def stabilize_moe_experts(model: nn.Module) -> None:
         return
     if getattr(model.config, "hidden_act", None) != "silu":
         raise ValueError("Qwen3-MoE torchtitan experts require hidden_act='silu'")
-    from types import MethodType
-
-    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
-
-    from ...parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
-
     modules = [
         module for module in model.modules() if type(module) is Qwen3MoeSparseMoeBlock
     ]

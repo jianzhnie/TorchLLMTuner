@@ -14,10 +14,15 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor, Partial, distribute_tensor
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from ...utils.module_names import canonical_fqn
-from ..expert_parallel.checkpointing import EP_GROUP_ATTR, expert_shard_map
+from ..expert_parallel.checkpointing import (
+    EP_GROUP_ATTR,
+    expert_shard_map,
+    shard_expert_state,
+)
 
 TPLayout = tuple[int, bool, dist.ProcessGroup]
 
@@ -26,8 +31,6 @@ def shard_disjoint_tp_ep_state(
     state: dict[str, Any], *, model_parts: list[nn.Module]
 ) -> dict[str, Any]:
     """Describe dense TP and expert EP chunks with disjoint parameter ownership."""
-    from ..expert_parallel.checkpointing import shard_expert_state
-
     with _coordinate_chunk_errors(
         model_parts, "Joint TP/EP checkpoint ownership", include_expert_groups=True
     ):
@@ -290,9 +293,6 @@ def shard_tensor_parallel_state(
 
 
 def _build_chunked_state(state, entries):
-    from torch.distributed.tensor import Partial
-    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
-
     from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 
     result = dict(state)

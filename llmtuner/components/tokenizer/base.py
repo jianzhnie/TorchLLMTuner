@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
+
+import jinja2
+import jinja2.ext
+import jinja2.sandbox
 
 
 class BaseTokenizer(ABC):
@@ -39,9 +44,6 @@ class BaseTokenizer(ABC):
 
     def set_chat_template(self, template: str) -> None:
         """Compile and store a Jinja chat template."""
-        import jinja2
-        import jinja2.ext
-        import jinja2.sandbox
 
         def raise_exception(msg):
             raise jinja2.exceptions.TemplateError(msg)
@@ -58,8 +60,6 @@ class BaseTokenizer(ABC):
             )
 
         def strftime_now(fmt):
-            from datetime import datetime
-
             return datetime.now().strftime(fmt)
 
         env = jinja2.sandbox.ImmutableSandboxedEnvironment(

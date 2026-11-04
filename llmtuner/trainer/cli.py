@@ -112,7 +112,7 @@ def main() -> None:
             # Mirrors torchtitan ``train.py``: a seed checkpoint is the unsharded
             # step-0 model, so it must be written from a single process (any
             # sharding would bake one rank's shard layout into the artifact), and
-            # loading treats step-0 as model-only (see ``checkpointer/base.py``).
+            # Loading treats step-0 as model-only (checkpointer/core/base.py).
             if trainer.checkpointer.save(curr_step=0, last_step=True):
                 print("Created seed checkpoint at step 0")
         else:

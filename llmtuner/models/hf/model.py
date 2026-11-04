@@ -37,7 +37,12 @@ import torch
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 from transformers.configuration_utils import PretrainedConfig
+from transformers.masking_utils import (
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
 
+from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_rank
 from ...datasets.contracts import Batch, TrainerBatch
 from ...parallel.topology import ParallelTopology
@@ -51,8 +56,19 @@ from .attention_backend import (
     register_attention_backend,
     uses_deepseek_sparse_attention,
 )
+from .attention_masks import (
+    build_dense_attention_mask,
+    get_attention_masks,
+    get_cp_attention_masks,
+    mask_dtype,
+)
 from .expert_kernels import stabilize_moe_experts, stabilize_moe_router
 from .factory import resolve_model_class, unwrap_text_config
+from .input_preparation import preprocess_inputs
+from .qkv_projection import (
+    apply_fp32_rotary_projection,
+    apply_fused_qkv_projection,
+)
 from .materialization import validate_rotary_initialization
 from .model_setup import (
     apply_cast_lm_head,
@@ -110,12 +126,8 @@ class HFTransformerModel(nn.Module):
         self.model.config._attn_implementation = config._attn_implementation
 
         if getattr(config, "qkv_projection", "separate") != "separate":
-            from .qkv_projection import apply_fused_qkv_projection
-
             apply_fused_qkv_projection(self.model)
         elif getattr(config, "rotary_compute_dtype", None) == "float32":
-            from .qkv_projection import apply_fp32_rotary_projection
-
             apply_fp32_rotary_projection(self.model)
 
         apply_cast_lm_head(self.model, config)

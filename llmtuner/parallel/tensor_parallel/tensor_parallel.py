@@ -43,6 +43,7 @@ usual), no fused QKV (HF keeps q/k/v as separate projections), no FP8.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -633,8 +634,6 @@ def enable_symm_mem(group) -> None:
     automatically for the TP group. CUDA-only -- call only when
     ``supports_symm_mem`` held for the mesh.
     """
-    import warnings
-
     from torch.distributed._symmetric_memory import enable_symm_mem_for_group
 
     with warnings.catch_warnings():

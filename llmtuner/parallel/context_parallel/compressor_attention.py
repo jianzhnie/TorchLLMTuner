@@ -9,9 +9,12 @@ Outputs follow the HF [batch, local_sequence, heads, dim] layout.
 
 from __future__ import annotations
 
+from types import MethodType
+
 import torch
 import torch.distributed as dist
 from torch.nn import functional as F
+from transformers.modeling_outputs import MoeModelOutputWithPast
 
 from ...accelerator.collectives import synchronize_local_errors
 from .attention import HeadToSeq, SeqToHead
@@ -277,8 +280,6 @@ def compressor_decoder_forward(
     Each attention owns global causal masks; the decoder never creates a cache.
     The installer must validate layer types and coordinate input failures.
     """
-    from transformers.modeling_outputs import MoeModelOutputWithPast
-
     if use_cache or past_key_values is not None or attention_mask is not None:
         raise ValueError(
             "Compressor CP decoder requires stateless internally masked training"
@@ -309,8 +310,6 @@ def compressor_decoder_forward(
 
 def apply_compressor_context_parallel(model, *, cp_mesh, cfg):
     """Install stateless HCA/CSA CP after validating the complete local decoder."""
-    from types import MethodType
-
     decoder = model.model.model
     layers = list(decoder.layers)
     if cfg.cp_config.context_parallel_strategy != "ulysses":

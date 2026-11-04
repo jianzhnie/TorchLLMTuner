@@ -35,6 +35,7 @@ from collections.abc import Callable
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import (
     ScheduleDualPipeV,
@@ -83,8 +84,6 @@ class ComposablePipelineStage(PipelineStage):
         return objects[0]
 
     def perform_reduce_grad(self, grad_scale_factor: int) -> None:
-        from torch.distributed.fsdp import FSDPModule
-
         if not isinstance(self.submod, FSDPModule):
             super().perform_reduce_grad(grad_scale_factor)
             return

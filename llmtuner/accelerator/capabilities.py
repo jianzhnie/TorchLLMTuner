@@ -24,6 +24,7 @@ flex_attention) have nothing to probe.
 from __future__ import annotations
 
 import importlib
+import inspect
 from collections.abc import Callable
 from functools import cache
 
@@ -92,8 +93,6 @@ def _pipelining_has_eval() -> bool:
     """
     if not importable("torch.distributed.pipelining.schedules", "_PipelineSchedule")():
         return False
-    import inspect
-
     import torch.distributed.pipelining.schedules as schedules
 
     evaluate = getattr(schedules._PipelineSchedule, "eval", None)

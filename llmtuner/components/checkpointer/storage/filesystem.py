@@ -22,12 +22,8 @@ def is_remote(path: str | os.PathLike[str]) -> bool:
 
 
 def resolve(path: str | os.PathLike[str]):
-    """Return ``(fs, path)`` for a remote URI via fsspec.
-
-    Imported lazily so a pure-local environment never needs fsspec at all, and
-    so a missing backend driver (``gcsfs`` for ``gs://``, say) surfaces
-    fsspec's own ``ImportError`` at the point of use rather than at import time.
-    """
+    """Return ``(fs, path)`` for a remote URI via fsspec."""
+    # Local path operations must not load remote filesystem dependencies.
     from fsspec.core import url_to_fs
 
     return url_to_fs(os.fspath(path))

@@ -45,6 +45,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
+from torch.distributed.checkpoint._storage_utils import _storage_setup
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict_saver import (
     AsyncCheckpointerType,
@@ -75,6 +76,7 @@ from ..core.checkpoint_keys import (
 )
 from ..core.state_adaptation import adapt_hf_model_state
 from ..hf.hf_storage import save_hf_checkpoint
+from ..hf.kimi_layout import load_changed_kimi_layout
 from ..storage.checkpoint_writer import GenerationFileSystemWriter
 from ..storage.load_planner import CheckpointLoadPlanner
 from ..storage.staging import CoordinatedStager
@@ -566,8 +568,6 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     ):
                         if category != RNG_STATE or preflight_planner.has_rng_state:
                             state.validate_state_dict(preflight_destination[category])
-            from ..hf.kimi_layout import load_changed_kimi_layout
-
             if load_changed_kimi_layout(
                 checkpoint_id, states=states, adapter=self.sd_adapter
             ):
@@ -861,8 +861,6 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         if self._parse_step(os.path.basename(checkpoint_dir)) == 0:
             # Seed checkpoints intentionally restore only model state.
             return True
-        from torch.distributed.checkpoint._storage_utils import _storage_setup
-
         reader = _storage_setup(None, checkpoint_dir, reader=True)
         assert reader is not None
         try:

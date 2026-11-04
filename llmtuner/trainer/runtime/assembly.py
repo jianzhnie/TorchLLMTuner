@@ -16,6 +16,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 import torch
+from torch.distributed.fsdp import FSDPModule
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.device import (
@@ -147,8 +148,6 @@ def _build_model(
 
 
 def _fsdp_managed_parameters(model: torch.nn.Module) -> set[torch.nn.Parameter]:
-    from torch.distributed.fsdp import FSDPModule
-
     return {
         fsdp_param.sharded_param
         for module in model.modules()

@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_comm_device, get_world_size
+from .attention import HeadToSeq, SeqToHead
 
 
 def _kcp_runtime():
@@ -176,7 +177,6 @@ def kcp_mla_attention(group):
     ulysses_attention.py. Exchange autograd uses the existing CP primitives;
     output returns in the HF [batch, sequence, heads, value_dim] convention.
     """
-    from .attention import HeadToSeq, SeqToHead
 
     def forward(
         module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs

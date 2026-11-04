@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from torch.distributed.tensor import _random
 
 from ..accelerator.device import device_module, device_type
 from .logging import get_logger
@@ -29,8 +30,6 @@ def initialize_dtensor_rng(mesh: DeviceMesh | None) -> None:
     """
     if mesh is None or mesh.device_type == "cpu":
         return
-    from torch.distributed.tensor import _random
-
     if _random.is_rng_supported_mesh(mesh) and _random._rng_tracker is None:
         _random._rng_tracker = _random.OffsetBasedRNGTracker(mesh, run_state_sync=False)
 

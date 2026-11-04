@@ -33,7 +33,7 @@ class GenerationFileSystemWriter(FileSystemWriter):
     def __init__(self, path: str | os.PathLike[str], **kwargs: Any) -> None:
         super().__init__(path, **kwargs)
         if filesystem.is_remote(path):
-            # Keep fsspec optional on local saves, including worker imports.
+            # Keep remote storage imports outside local save/worker startup.
             from torch.distributed.checkpoint._fsspec_filesystem import (
                 FileSystem as FsspecFileSystem,
             )

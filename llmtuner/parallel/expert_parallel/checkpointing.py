@@ -50,6 +50,9 @@ from ...utils.module_names import canonical_fqn
 
 try:  # torch >= 2.4; the FSDP path (DTensor expert weights) needs it.
     from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+
+from ...accelerator.collectives import synchronize_local_errors
 except ImportError:  # pragma: no cover - old torch, plain-tensor path only
     DTensor = None
     distribute_tensor = None
@@ -313,8 +316,6 @@ def shard_expert_state(
     FSDP ownership inside each EP slice is retained in the global offsets.
     Scalar optimizer state remains replicated, matching the full-state path.
     """
-    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
-
     from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 
     result = dict(state_dict)
@@ -357,7 +358,6 @@ def restore_sharded_expert_state(
     With ``coordinate_errors=True`` all world ranks must participate. Only local
     preparation is coordinated; tensor copy failures are not transactional.
     """
-    from ...accelerator.collectives import synchronize_local_errors
     from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 
     pending = []

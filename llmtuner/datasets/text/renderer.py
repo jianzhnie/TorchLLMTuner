@@ -17,6 +17,7 @@ predicts token ``j + 1``.
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -98,8 +99,6 @@ def build_chat_renderer(*, tokenizer: HuggingFaceTokenizer, renderer_name: str) 
     tokenizer does not provide, and both would silently produce different
     tokens, so they are refused like upstream refuses them.
     """
-    import importlib
-
     try:
         renderers = importlib.import_module("renderers")
     except ImportError as exc:

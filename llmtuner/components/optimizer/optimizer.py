@@ -47,6 +47,7 @@ from ...parallel.tensor_parallel.checkpointing import (
 )
 from ...utils.logging import get_logger
 from ...utils.module_names import canonical_fqn
+from ..checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 from .flex_shard.dist_muon import DistMuon
 from .state_dict import (
     collect_local_optimizer_state,
@@ -547,8 +548,6 @@ class OptimizersContainer(Optimizer, Stateful):
         # init_optim_state must run first: the unflattening step reads each
         # optimizer's live state to learn which state tensors to expect, so a
         # fresh optimizer would find nothing to write into.
-        from ..checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
-
         if self.sharded_tensor_parallel and self.sharded_expert_parallel:
             with synchronize_local_errors(
                 "Optimizer joint chunk destination construction"

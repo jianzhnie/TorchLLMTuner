@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+from torch._dynamo.eval_frame import OptimizedModule
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 
@@ -90,8 +91,6 @@ class ModelCheckpointState(Stateful):
                 raise TypeError("Every checkpoint model part must be an nn.Module")
             # Own the collection: caller-side list edits must not invalidate the
             # EP shard map or change the set of modules being checkpointed.
-            from torch._dynamo.eval_frame import OptimizedModule
-
             # Compilation changes execution, not checkpoint ownership or names.
             self.model = [
                 part._orig_mod if isinstance(part, OptimizedModule) else part

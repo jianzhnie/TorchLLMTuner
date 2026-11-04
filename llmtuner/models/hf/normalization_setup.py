@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import MethodType
 
 import torch
 import torch.nn as nn
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
 from llmtuner.errors import UnsupportedCombinationError
 
@@ -70,12 +73,8 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
     if backend in ("aten", "torch", "npu") and model_type not in ("qwen3", "qwen3_moe"):
         raise ValueError(f"model.norm_backend='{backend}' requires qwen3 or qwen3_moe")
     if model_type == "qwen3":
-        from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
-
         norm_type = Qwen3RMSNorm
     elif model_type == "qwen3_moe":
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
-
         norm_type = Qwen3MoeRMSNorm
     else:
         return
@@ -123,8 +122,6 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
                 ):
                     del layer.forward
     if backend in ("aten", "torch", "npu"):
-        from types import MethodType
-
         if backend == "aten":
             from .normalization import forward_aten_rms_norm as norm_forward
         elif backend == "npu":

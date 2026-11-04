@@ -13,7 +13,9 @@ from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from transformers import AutoConfig
+import transformers
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from ..architecture import get_model_architecture
@@ -166,10 +168,6 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
         if hasattr(config, name):
             setattr(text_config, name, getattr(config, name))
     if not getattr(text_config, "architectures", None):
-        from transformers.models.auto.modeling_auto import (
-            MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
-        )
-
         cls_name = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get(text_config.model_type, "")
         if cls_name:
             text_config.architectures = [cls_name]
@@ -187,19 +185,13 @@ def resolve_model_class(config: PretrainedConfig) -> type[PreTrainedModel]:
     if architecture is not None:
         return architecture.model_class_loader()
 
-    import transformers
-    from transformers import PreTrainedModel
-    from transformers.models.auto.modeling_auto import (
-        MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
-    )
-
     for name in (config.architectures or []) + [
         MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get(getattr(config, "model_type", ""), ""),
     ]:
         if not name:
             continue
         cls = getattr(transformers, name, None)
-        if isinstance(cls, type) and issubclass(cls, PreTrainedModel):
+        if isinstance(cls, type) and issubclass(cls, transformers.PreTrainedModel):
             return cls
 
     raise ImportError(

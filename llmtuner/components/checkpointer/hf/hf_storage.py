@@ -11,6 +11,8 @@ from uuid import uuid4
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from safetensors import safe_open
+from safetensors.torch import _getdtype
 from torch.distributed.checkpoint import (
     HuggingFaceStorageReader,
     HuggingFaceStorageWriter,
@@ -47,9 +49,6 @@ class IndexedHuggingFaceStorageReader(HuggingFaceStorageReader):
         index_path = Path(self.path) / SAFETENSORS_INDEX
         if not index_path.is_file():
             return super().read_metadata()
-        from safetensors import safe_open
-        from safetensors.torch import _getdtype
-
         with index_path.open(encoding="utf-8") as stream:
             index = json.load(stream)
         weight_map = index.get("weight_map") if isinstance(index, dict) else None

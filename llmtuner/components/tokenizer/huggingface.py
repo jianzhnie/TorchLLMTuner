@@ -7,7 +7,8 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from tokenizers import AddedToken, Tokenizer
+from tokenizers import AddedToken, Tokenizer, decoders, pre_tokenizers, processors
+from tokenizers.models import BPE, WordLevel
 
 from ...utils.logging import get_logger
 from .base import BaseTokenizer
@@ -183,18 +184,11 @@ class HuggingFaceTokenizer(BaseTokenizer):
                 f"{vocab_source} token IDs must be unique and contiguous from zero"
             )
 
-        from tokenizers import pre_tokenizers
-
         if not os.path.exists(merges_txt_path):
-            from tokenizers.models import WordLevel
-
             logger.info("Loading WordLevel tokenizer from %s", vocab_source)
             tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
             tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
             return tokenizer
-
-        from tokenizers import decoders, processors
-        from tokenizers.models import BPE
 
         logger.info("Loading BPE tokenizer from %s + merges.txt", vocab_source)
         merges = []

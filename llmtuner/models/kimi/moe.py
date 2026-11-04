@@ -48,8 +48,10 @@ The local reference is differentiable; EP conversion is a separate migration.
 """
 
 import math
+from copy import deepcopy
 
 import torch
+import torch.nn.init as init
 from torch import nn
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
@@ -115,8 +117,6 @@ class KimiMoEGate(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        import torch.nn.init as init
-
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, hidden_states):
@@ -245,8 +245,6 @@ class KimiSparseMoE(nn.Module):
                 self.routed_expert_norm = KimiRMSNorm(width, config.rms_norm_eps)
         self.shared_experts = None
         if config.num_shared_experts:
-            from copy import deepcopy
-
             from .model import KimiMLP
 
             shared_config = deepcopy(config)

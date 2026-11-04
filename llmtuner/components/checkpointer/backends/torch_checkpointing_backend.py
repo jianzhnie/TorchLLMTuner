@@ -50,8 +50,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
+from torch.distributed.checkpoint.state_dict_saver import _stateful_to_state_dict
+from torch.distributed.checkpoint.stateful import Stateful
 
 from ....accelerator.collectives import synchronize_local_errors
+from ....accelerator.distributed import barrier
 from ....utils.garbage_collection import GarbageCollection
 from ..storage import filesystem
 
@@ -91,7 +94,7 @@ CHECKPOINTING_LOGGER_NAME = "torch_checkpointing"
 _INSTALL_HINT = (
     "the torch_checkpointing backend is not installed. Install it, or use the "
     "DCP checkpoint manager "
-    "(components/checkpointer/distributed_checkpoint.py), which needs only "
+    "(components/checkpointer/backends/distributed_checkpoint.py), which needs only "
     "torch.distributed.checkpoint."
 )
 
@@ -679,16 +682,10 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
     @staticmethod
     def _is_stateful(obj: Any) -> bool:
-        from torch.distributed.checkpoint.stateful import Stateful
-
         return isinstance(obj, Stateful)
 
     @staticmethod
     def _stateful_to_state_dict(states: dict[str, Any]) -> dict[str, Any]:
-        from torch.distributed.checkpoint.state_dict_saver import (
-            _stateful_to_state_dict,
-        )
-
         return _stateful_to_state_dict(states)
 
     def _save(self, curr_step: int, last_step: bool = False) -> bool:
@@ -918,9 +915,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             # to its final path, passing the directory the shards were actually
             # written to. Consolidation repacks the per-rank shards into
             # HF-layout files in the checkpoint directory.
-            def pre_finalize_callback(staged: str, _event_logger) -> None:  # noqa: F811
-                from ....accelerator.distributed import barrier
-
+            def pre_finalize_callback(staged: str, _event_logger) -> None:
                 # All ranks must finish writing before any rank consolidates.
                 barrier()
                 self._backend.consolidate_hf_safetensors_checkpoint(

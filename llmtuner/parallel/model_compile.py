@@ -44,6 +44,9 @@ from collections.abc import Callable, Iterator
 from functools import wraps
 
 import torch
+import torch._dynamo.config as dynamo_config
+import torch._functorch.config as functorch_config
+import torch._inductor.config as inductor_config
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -67,10 +70,6 @@ def rollback_compile_settings_on_error() -> Iterator[None]:
     Successful runtimes retain these settings for lazy tracing. Symmetric-memory
     group registration and concurrent policy changes are outside this scope.
     """
-    import torch._dynamo.config as dynamo_config
-    import torch._functorch.config as functorch_config
-    import torch._inductor.config as inductor_config
-
     capture = getattr(dynamo_config, "capture_scalar_outputs", None)
     async_tp = getattr(inductor_config, "_micro_pipeline_tp", None)
     memory_budget = getattr(functorch_config, "activation_memory_budget", None)
@@ -184,8 +183,6 @@ def apply_compile(
     if compile_config.enable_async_tensor_parallel and has(
         "inductor_micro_pipeline_tp"
     ):
-        import torch._inductor.config as inductor_config
-
         previous_async_tp = inductor_config._micro_pipeline_tp
     previous_capture = torch._dynamo.config.capture_scalar_outputs if has_moe else None
     regional_flags = [
@@ -259,8 +256,6 @@ def maybe_enable_async_tp(
             "tensor_parallel_size > 1 with a real process group: async TP "
             "pipelines the TP collectives, and there is no TP group here."
         )
-
-    import torch._inductor.config as inductor_config
 
     if not has("inductor_micro_pipeline_tp"):
         raise EnvironmentUnsupportedError(

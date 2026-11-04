@@ -121,8 +121,6 @@ def available_attention_backend() -> str:
 def flex_attention_adapter(module, query, key, value, attention_mask, **kwargs):
     """Adapt the Hugging Face attention interface to llmtuner flex kernels."""
     if kwargs.get("dropout", 0.0) != 0.0:
-        from ...errors import UnsupportedCombinationError
-
         raise UnsupportedCombinationError("Flex attention does not support dropout")
     kernel = getattr(module, "_titan_flex_kernel", None)
     if kernel is None:

@@ -24,6 +24,7 @@ from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.utils.module_names import canonical_fqn
 
 from ...accelerator.capabilities import require
+from ...models.common.moe.experts import GroupedExperts
 from ..module_patterns import compile_module_pattern, resolve_module_patterns
 from .fine_grained import get_fsdp_strategy, validate_fsdp_hook_target
 
@@ -562,8 +563,6 @@ def apply_fsdp_by_pattern(
     )
 
     expert_placements: dict[nn.Parameter, Shard] = {}
-    from ...models.common.moe.experts import GroupedExperts
-
     if cfg.ep_size > 1:
         if edp_mesh is None:
             raise ValueError("pattern FSDP with EP requires a sparse FSDP mesh")
