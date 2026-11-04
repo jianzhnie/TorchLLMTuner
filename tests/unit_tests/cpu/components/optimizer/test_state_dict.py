@@ -22,6 +22,49 @@ def test_flatten_rejects_colliding_nested_state_keys(reverse_order):
 
 @pytest.mark.parametrize("reverse_order", [False, True])
 @pytest.mark.parametrize("parent_value", [2, {}])
+def test_flatten_rejects_parent_and_descendant_state_keys(reverse_order, parent_value):
+    from llmtuner.components.optimizer.state_dict import get_flat_optim_state_dict
+
+    parameter = torch.nn.Parameter(torch.ones(2))
+    optimizer = torch.optim.SGD(
+        [{"params": [parameter], "param_names": ["weight"]}], lr=0.1
+    )
+    entries = [("cache", parent_value), ("cache.leaf", 1)]
+    original = dict(reversed(entries) if reverse_order else entries)
+    optimizer.state[parameter] = original
+    with pytest.raises(ValueError, match="Conflicting nested optimizer state paths"):
+        get_flat_optim_state_dict(optimizer)
+    assert optimizer.state[parameter] is original
+    assert list(original.items()) == (
+        list(reversed(entries)) if reverse_order else entries
+    )
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+@pytest.mark.parametrize("parent_value", [2, {}])
+def test_restore_rejects_direct_state_and_subtree(reverse_order, parent_value):
+    from llmtuner.components.optimizer.state_dict import (
+        get_flat_optim_state_dict,
+        load_flat_optim_state_dict,
+    )
+
+    parameter = torch.nn.Parameter(torch.ones(2))
+    optimizer = torch.optim.SGD(
+        [{"params": [parameter], "param_names": ["weight"]}], lr=0.1
+    )
+    original = {"cache": {"leaf": 1}}
+    optimizer.state[parameter] = original
+    flat = get_flat_optim_state_dict(optimizer)
+    entries = [("state.weight.cache", parent_value), *flat.items()]
+    checkpoint = dict(reversed(entries) if reverse_order else entries)
+    with pytest.raises(ValueError, match="Conflicting nested optimizer state paths"):
+        load_flat_optim_state_dict(optimizer, flat_state=checkpoint)
+    assert optimizer.state[parameter] is original
+    assert original == {"cache": {"leaf": 1}}
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+@pytest.mark.parametrize("parent_value", [2, {}])
 def test_restore_rejects_conflicting_nested_paths_without_mutating_state(
     reverse_order, parent_value
 ):
@@ -673,3 +716,88 @@ def test_fqn_restore_matches_update_after_parameter_group_reordering(optimizer_t
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize("separate_groups", [False, True])
+def test_flat_restore_rejects_duplicate_live_fqns_without_mutation(separate_groups):
+    from llmtuner.components.optimizer.state_dict import (
+        get_flat_optim_state_dict,
+        load_flat_optim_state_dict,
+    )
+
+    first = torch.nn.Parameter(torch.ones(2))
+    second = torch.nn.Parameter(torch.full((2,), 2.0))
+    groups = (
+        [
+            {"params": [first], "param_names": ["first"]},
+            {"params": [second], "param_names": ["second"]},
+        ]
+        if separate_groups
+        else [{"params": [first, second], "param_names": ["first", "second"]}]
+    )
+    optimizer = torch.optim.AdamW(groups, foreach=False)
+    init_optim_state(optimizer)
+    optimizer.state[first]["exp_avg"].fill_(3)
+    optimizer.state[second]["exp_avg"].fill_(7)
+    checkpoint = get_flat_optim_state_dict(optimizer)
+    originals = [optimizer.state[p] for p in (first, second)]
+    optimizer.param_groups[-1]["param_names"][-1] = "first"
+    with pytest.raises(ValueError, match="Duplicate optimizer parameter FQN"):
+        load_flat_optim_state_dict(optimizer, flat_state=checkpoint)
+    assert optimizer.state[first] is originals[0]
+    assert optimizer.state[second] is originals[1]
+    torch.testing.assert_close(optimizer.state[first]["exp_avg"], torch.full((2,), 3.0))
+    torch.testing.assert_close(
+        optimizer.state[second]["exp_avg"], torch.full((2,), 7.0)
+    )
+
+
+def test_dense_container_restore_rejects_fqns_shared_between_inner_optimizers():
+    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+
+    container = object.__new__(OptimizersContainer)
+    container.model_parts = []
+    container.sharded_tensor_parallel = False
+    container.sharded_expert_parallel = False
+    container.optimizers = []
+    for name, value in (("first", 3.0), ("second", 7.0)):
+        parameter = torch.nn.Parameter(torch.ones(2))
+        optimizer = torch.optim.AdamW(
+            [{"params": [parameter], "param_names": [name]}], foreach=False
+        )
+        init_optim_state(optimizer)
+        optimizer.state[parameter]["exp_avg"].fill_(value)
+        container.optimizers.append(optimizer)
+    checkpoint = container.state_dict()
+    originals = [next(iter(opt.state.values())) for opt in container.optimizers]
+    container.optimizers[1].param_groups[0]["param_names"] = ["first"]
+    with pytest.raises(ValueError, match="overlap across inner optimizers"):
+        container.load_state_dict(checkpoint)
+    for optimizer, original, value in zip(
+        container.optimizers, originals, (3.0, 7.0), strict=True
+    ):
+        assert next(iter(optimizer.state.values())) is original
+        torch.testing.assert_close(original["exp_avg"], torch.full((2,), value))
+
+
+@pytest.mark.parametrize("optimizer_type", [torch.optim.Adam, torch.optim.AdamW])
+@pytest.mark.parametrize("counter", [0, 2, 2.0, torch.tensor(2.0), torch.tensor([2.0])])
+def test_adam_restore_preserves_supported_scalar_counters(optimizer_type, counter):
+    from llmtuner.components.optimizer.state_dict import (
+        get_flat_optim_state_dict,
+        load_flat_optim_state_dict,
+    )
+
+    parameter = torch.nn.Parameter(torch.ones(2))
+    optimizer = optimizer_type(
+        [{"params": [parameter], "param_names": ["weight"]}], foreach=False
+    )
+    init_optim_state(optimizer)
+    checkpoint = get_flat_optim_state_dict(optimizer)
+    checkpoint["state.weight.step"] = counter
+    expected = counter.item() if isinstance(counter, torch.Tensor) else counter
+    load_flat_optim_state_dict(optimizer, flat_state=checkpoint)
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    assert optimizer.state[parameter]["step"].item() == expected + 1
+    assert torch.isfinite(parameter).all()

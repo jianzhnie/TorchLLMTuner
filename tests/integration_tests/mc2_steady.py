@@ -26,7 +26,12 @@ def main() -> None:
         rank = dist.get_rank()
         num_experts = world_size * 2
         num_tokens = world_size * 64
+        torch.manual_seed(19 + rank)
         model = MC2GroupedExperts(128, 256, 2).to(dtype=torch.bfloat16, device=device)
+        # GroupedExperts leaves storage empty for checkpoint/conversion callers.
+        # A standalone benchmark must initialize it before measuring any kernels.
+        for parameter in model.parameters():
+            torch.nn.init.normal_(parameter, std=0.05)
         dispatcher = AllToAllTokenDispatcher(num_experts, 2)
         dispatcher.set_ep_group(ep_group=dist.group.WORLD)
         model = MC2RoutedExperts(model, dispatcher)
@@ -56,6 +61,17 @@ def main() -> None:
             expected = "fused" if fused else "fallback"
             assert metrics[expected] == 25, metrics
             elapsed = sum(durations) / len(durations)
+            # Keep validation outside the measured region. Empty expert owners
+            # legitimately have zero gradients in the fallback case.
+            assert torch.isfinite(output).all().item()
+            assert output.count_nonzero().item() > 0
+            nonzero_gradients = torch.zeros((), dtype=torch.int32, device=device)
+            for parameter in model.parameters():
+                assert parameter.grad is not None
+                assert torch.isfinite(parameter.grad).all().item()
+                nonzero_gradients += parameter.grad.count_nonzero().to(torch.int32)
+            dist.all_reduce(nonzero_gradients)
+            assert nonzero_gradients.item() > 0
             print(
                 f"MC2 {expected}: {elapsed * 1000:.3f} ms/step rank={rank}",
                 flush=True,

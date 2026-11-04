@@ -1,7 +1,8 @@
 """Expert-parallel wiring: the single-rank guards.
 
 The swap and multi-rank all-to-all live in
-``tests/test_ep_model_replacement.py`` and ``tests/ep_wiring_equivalence.py``.
+``tests/unit_tests/cpu/parallel/test_ep_model_replacement.py`` and
+``tests/integration_tests/ep_wiring_equivalence.py``.
 What can be checked without a mesh is the
 refusal path: EP is wired, so without the sparse mesh's EP group it must refuse
 loudly rather than silently swap to a replicated (local) dispatcher -- and with
@@ -18,7 +19,8 @@ require_env("spmd_types")
 import pytest
 import torch
 
-from llmtuner.config import ParallelConfig
+from llmtuner.config import ExpertParallelConfig, ParallelConfig
+from llmtuner.errors import EnvironmentUnsupportedError
 from llmtuner.parallel.expert_parallel import apply_ep
 
 
@@ -39,6 +41,22 @@ def test_apply_ep_requires_an_ep_group_when_ep_is_on() -> None:
         apply_ep(torch.nn.Linear(4, 4), cfg)
 
 
+@pytest.mark.parametrize("world_size", [8, 16, 32, 64])
+def test_mc2_accepts_supported_world_sizes(world_size):
+    from llmtuner.parallel.expert_parallel.mc2_ops import validate_mc2_world_size
+
+    validate_mc2_world_size(world_size)
+
+
+def test_mc2_rejects_unsupported_world_size_before_ep_conversion():
+    cfg = ParallelConfig(
+        expert_parallel_size=2,
+        ep_config=ExpertParallelConfig(ep_token_dispatcher="mc2"),
+    )
+    with pytest.raises(EnvironmentUnsupportedError, match="world size in"):
+        apply_ep(torch.nn.Linear(4, 4), cfg)
+
+
 def test_expert_layout_rejects_inconsistent_down_width():
     from llmtuner.parallel.expert_parallel.hf_inspection import fused_experts_of
 
@@ -48,6 +66,42 @@ def test_expert_layout_rejects_inconsistent_down_width():
     block.experts.down_proj = torch.nn.Parameter(torch.randn(2, 6, 3))
     with pytest.raises(ValueError, match="unrecognized expert weight shapes"):
         fused_experts_of(block)
+
+
+@pytest.mark.parametrize("reordered", [False, True])
+def test_legacy_shared_projection_conversion_checks_expert_order(reordered):
+    from llmtuner.errors import UnsupportedCombinationError
+    from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList()
+    for _ in range(2):
+        layer = torch.nn.Module()
+        block = torch.nn.Module()
+        block.top_k = 2
+        block.gate = torch.nn.Linear(8, 4, bias=False)
+        block.experts = torch.nn.ModuleList()
+        for _ in range(4):
+            expert = torch.nn.Module()
+            expert.gate_proj = torch.nn.Linear(8, 12, bias=False)
+            expert.up_proj = torch.nn.Linear(8, 12, bias=False)
+            expert.down_proj = torch.nn.Linear(12, 8, bias=False)
+            block.experts.append(expert)
+        layer.mlp = block
+        model.layers.append(layer)
+    first, second = [layer.mlp for layer in model.layers]
+    members = list(first.experts)
+    second.experts = torch.nn.ModuleList(members[::-1] if reordered else members)
+    if reordered:
+        with pytest.raises(UnsupportedCombinationError, match="expert order"):
+            swap_hf_moe_blocks(model, router_aux_loss_coef=0.0)
+        assert model.layers[0].mlp is first
+        assert model.layers[1].mlp is second
+    else:
+        assert swap_hf_moe_blocks(model, router_aux_loss_coef=0.0) == 2
+        grouped = [layer.mlp.routed_experts.inner_experts for layer in model.layers]
+        for name in ("w1_EFD", "w3_EFD", "w2_EDF"):
+            assert getattr(grouped[0], name) is getattr(grouped[1], name)
 
 
 @pytest.mark.parametrize(
@@ -88,6 +142,7 @@ def test_legacy_expert_inspection_preserves_freezing_without_grad_tracking(names
         "frozen_gate",
         "frozen_up",
         "mixed_freezing",
+        "mixed_dtype",
         "shared_expert_projection",
     ],
 )
@@ -120,6 +175,13 @@ def test_legacy_expert_contract_checks_later_experts(names, invalid):
 
         getattr(block.experts[1], names[0]).weight.requires_grad_(False)
         with pytest.raises(UnsupportedCombinationError, match="requires_grad"):
+            fused_experts_of(block)
+        return
+    if invalid == "mixed_dtype":
+        from llmtuner.errors import UnsupportedCombinationError
+
+        getattr(block.experts[1], names[0]).to(dtype=torch.bfloat16)
+        with pytest.raises(UnsupportedCombinationError, match="different dtypes"):
             fused_experts_of(block)
         return
     if invalid == "shared_expert_projection":

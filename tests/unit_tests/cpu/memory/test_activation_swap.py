@@ -163,6 +163,30 @@ def test_failed_forward_synchronizes_pending_d2h(cpu_copies):
     assert state.d2h_stream.synchronized
 
 
+def test_failed_release_synchronizes_pending_d2h(cpu_copies, monkeypatch):
+    monkeypatch.setattr(activation_swap, "device_type", "npu")
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList(
+        [torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.SiLU())]
+    )
+    activation_swap.apply_activation_swap(model)
+    states = []
+    failure = RuntimeError("activation release failed")
+
+    def fail_release(state, outputs):
+        assert state.packed
+        states.append(state)
+        raise failure
+
+    monkeypatch.setattr(activation_swap._ForwardSwapState, "release", fail_release)
+    with pytest.raises(RuntimeError) as caught:
+        model.layers[0](torch.ones(1, 2, requires_grad=True))
+
+    assert caught.value is failure
+    assert len(states) == 1
+    assert states[0].d2h_stream.synchronized
+
+
 def test_layer_preserves_caller_owned_input(cpu_copies, monkeypatch):
     class Square(torch.nn.Module):
         def forward(self, value):
@@ -267,3 +291,48 @@ def test_activation_swap_must_be_boolean():
 
     with pytest.raises(ConfigError, match="activation_swap must be bool"):
         TrainingConfig(activation_swap=1)
+
+
+@pytest.mark.parametrize(
+    "saved_source", ["input", "buffer", "detached_alias", "parameter_alias"]
+)
+def test_caller_owned_storage_does_not_create_unused_host_copies(
+    cpu_copies, monkeypatch, saved_source
+):
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("scale", torch.full((6,), 3.0))
+            self.weight = torch.nn.Parameter(torch.full((6,), 5.0))
+
+        def forward(self, value):
+            if saved_source == "input":
+                return value.square()
+            if saved_source == "buffer":
+                return value * self.scale
+            if saved_source == "parameter_alias":
+                return value * self.weight.detach()
+            return value * value.detach()
+
+    monkeypatch.setattr(activation_swap, "device_type", "npu")
+    gc.collect()
+    activation_swap.reset_activation_swap_metrics()
+    baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([Block()])
+    activation_swap.apply_activation_swap(model)
+    value = torch.arange(6, dtype=torch.float32, requires_grad=True)
+    model.layers[0](value).sum().backward()
+    expected = (
+        2 * value.detach()
+        if saved_source == "input"
+        else torch.full_like(value, 5.0)
+        if saved_source == "parameter_alias"
+        else torch.full_like(value, 3.0)
+        if saved_source == "buffer"
+        else value.detach()
+    )
+    torch.testing.assert_close(value.grad, expected, rtol=0, atol=0)
+    metrics = activation_swap.activation_swap_metrics()
+    assert metrics["copies_d2h"] == metrics["copies_h2d"] == 0, metrics
+    assert metrics["host_bytes_current"] == baseline, metrics

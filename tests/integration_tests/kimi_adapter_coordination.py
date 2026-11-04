@@ -15,6 +15,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
+from llmtuner.components.checkpointer.state_adaptation import adapt_hf_model_state
 from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 
 
@@ -131,12 +132,48 @@ def main():
                 torch.testing.assert_close(
                     value.full_tensor(), dense[index], rtol=0, atol=0
                 )
-            restored = adapter.from_hf(exported)
+
+            class Destination:
+                def validate_state_dict(self, state):
+                    value = next(iter(state.values()))
+                    assert isinstance(value, DTensor)
+                    assert value.shape == dense.shape
+
+            restored = adapt_hf_model_state(adapter, Destination(), exported)
             value = restored[next(iter(grouped))]
             assert isinstance(value, DTensor)
             torch.testing.assert_close(value.full_tensor(), dense, rtol=0, atol=0)
             if rank == 0:
                 print(f"PASS DTensor {placement=}", flush=True)
+
+            class InvalidDestination:
+                def validate_state_dict(self, state):
+                    if rank == 1:
+                        raise ValueError("injected Kimi destination failure")
+
+            caught = None
+            try:
+                adapt_hf_model_state(adapter, InvalidDestination(), exported)
+            except (ValueError, RuntimeError) as error:
+                caught = error
+            outcomes = [None, None]
+            dist.all_gather_object(outcomes, (type(caught).__name__, str(caught)))
+            assert outcomes[1][0] == "ValueError", outcomes
+            assert "injected Kimi destination failure" in outcomes[1][1], outcomes
+            assert outcomes[0][0] == "RuntimeError", outcomes
+            assert (
+                "HF checkpoint model validation failed on another rank"
+                in outcomes[0][1]
+            )
+            retry = adapt_hf_model_state(adapter, Destination(), exported)
+            torch.testing.assert_close(
+                retry[next(iter(grouped))].full_tensor(), dense, rtol=0, atol=0
+            )
+            if rank == 0:
+                print(
+                    f"PASS Kimi helper destination failure/retry {placement=}",
+                    flush=True,
+                )
     finally:
         dist.destroy_process_group()
 

@@ -1303,15 +1303,21 @@ def test_qwen3_moe_router_keeps_scores_and_gate_in_fp32() -> None:
         norm_topk_prob=True,
     )
     router = Qwen3MoeTopKRouter(config).to(torch.bfloat16)
-    weight = router.weight.detach().clone()
+    generator = torch.Generator().manual_seed(17)
+    with torch.no_grad():
+        router.weight.copy_(torch.randn(8, 32, generator=generator))
+    weight = router.weight.detach().clone().requires_grad_()
     model = torch.nn.Module()
     model.config = config
     model.router = router
     stabilize_moe_router(model)
-    hidden = torch.randn(5, 32).bfloat16()
+    hidden = torch.randn(5, 32, generator=generator).bfloat16().requires_grad_()
+    reference_hidden = hidden.detach().clone().requires_grad_()
 
     logits, scores, indices = router(hidden)
-    expected_logits = torch.nn.functional.linear(hidden.float(), weight.float())
+    expected_logits = torch.nn.functional.linear(
+        reference_hidden.float(), weight.float()
+    )
     probabilities = expected_logits.softmax(dim=-1)
     expected_scores, expected_indices = probabilities.topk(2, dim=-1, sorted=False)
     expected_scores = expected_scores / (
@@ -1319,7 +1325,21 @@ def test_qwen3_moe_router_keeps_scores_and_gate_in_fp32() -> None:
     )
 
     assert logits.dtype == scores.dtype == torch.float32
+    assert logits.count_nonzero() > 0
+    assert indices.unique().numel() > config.num_experts_per_tok
     torch.testing.assert_close(logits, expected_logits, atol=0, rtol=0)
     torch.testing.assert_close(scores, expected_scores, atol=0, rtol=0)
     assert torch.equal(indices, expected_indices)
     assert router.weight.dtype == torch.bfloat16
+
+    # A normalized score sum is constant and would make this check vacuous.
+    upstream = torch.randn(scores.shape, generator=generator)
+    (scores * upstream).sum().backward()
+    (expected_scores * upstream).sum().backward()
+    for actual, expected in (
+        (hidden.grad, reference_hidden.grad),
+        (router.weight.grad, weight.grad),
+    ):
+        assert actual.dtype == torch.bfloat16
+        assert torch.isfinite(actual).all() and actual.count_nonzero() > 0
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)

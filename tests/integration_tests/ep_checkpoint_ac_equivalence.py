@@ -53,6 +53,24 @@ def build(rank, *, wrapped, ep):
     return model, optimizer, ema
 
 
+def advance(model, optimizer, ema, *, rank, ep):
+    """Apply the same logical gradient under either expert ownership layout."""
+    optimizer.zero_grad()
+    for index, parameter in enumerate(model.parameters()):
+        gradient = (
+            (
+                torch.arange(4, device=parameter.device, dtype=parameter.dtype)
+                + index
+                + 0.25
+            )
+            .reshape(4, 1, 1)
+            .expand(4, *parameter.shape[1:])
+        )
+        parameter.grad = (gradient.chunk(2)[rank] if ep else gradient).clone()
+    optimizer.step()
+    ema.step(2)
+
+
 def main():
     init_distributed()
     folder = None
@@ -81,6 +99,17 @@ def main():
         }
         assert all(value.shape[0] == 4 for value in expected["model"].values())
         dcp.save(states, checkpoint_id=folder)
+        advance(model, optimizer, ema, rank=rank, ep=True)
+        expected_next = {
+            category: {
+                key: value.clone() if isinstance(value, torch.Tensor) else value
+                for key, value in state.state_dict().items()
+            }
+            for category, state in states.items()
+        }
+        # An exact comparison alone also passes if both update paths are no-ops.
+        for key, value in expected_next["model"].items():
+            assert not torch.equal(value, expected["model"][key]), key
         for wrapped, ep in ((True, True), (False, True), (False, False)):
             restored_model, restored_optimizer, restored_ema = build(
                 rank, wrapped=wrapped, ep=ep
@@ -103,6 +132,21 @@ def main():
             if rank == 0:
                 print(
                     f"EP DCP restore wrapped={wrapped}, ep={2 if ep else 1}: exact",
+                    flush=True,
+                )
+            advance(restored_model, restored_optimizer, restored_ema, rank=rank, ep=ep)
+            for category, state in restored.items():
+                actual = state.state_dict()
+                assert actual.keys() == expected_next[category].keys()
+                for key, value in actual.items():
+                    target = expected_next[category][key]
+                    if isinstance(value, torch.Tensor):
+                        torch.testing.assert_close(value, target, rtol=0, atol=0)
+                    else:
+                        assert value == target
+            if rank == 0:
+                print(
+                    f"EP resumed update wrapped={wrapped}, ep={2 if ep else 1}: exact",
                     flush=True,
                 )
         dist.barrier()

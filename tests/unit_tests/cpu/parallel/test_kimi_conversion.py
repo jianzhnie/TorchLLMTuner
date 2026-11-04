@@ -32,6 +32,40 @@ def make_model(*, latent=False, shared=0, activation="silu", top_k=2):
     return model
 
 
+def test_kimi_conversion_preserves_projection_dtypes():
+    model = make_model().to(dtype=torch.bfloat16)
+    source = model.layers[0].block_sparse_moe
+    for expert in source.experts:
+        expert.w2.float()
+    expected = torch.stack([expert.w2.weight.detach() for expert in source.experts])
+    assert swap_hf_moe_blocks(model) == 1
+    grouped = model.layers[0].block_sparse_moe.routed_experts.inner_experts
+    assert grouped.w1_EFD.dtype == grouped.w3_EFD.dtype == torch.bfloat16
+    assert grouped.w2_EDF.dtype == torch.float32
+    torch.testing.assert_close(grouped.w2_EDF, expected, rtol=0, atol=0)
+
+
+def test_kimi_gate_preserves_fp32_routing_under_autocast():
+    torch.manual_seed(17)
+    gate = make_model().layers[0].block_sparse_moe.gate
+    inputs = torch.randn(2, 8, 8, dtype=torch.bfloat16)
+    expected_ids, expected_scores = gate(inputs)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual_ids, actual_scores = gate(inputs)
+    assert actual_scores.dtype == torch.float32
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(actual_scores, expected_scores, rtol=0, atol=0)
+
+
+def test_kimi_conversion_rejects_different_dtypes_within_stacked_projection():
+    model = make_model()
+    source = model.layers[0].block_sparse_moe
+    source.experts[1].w2.to(dtype=torch.bfloat16)
+    with pytest.raises(NotImplementedError, match="different dtypes"):
+        swap_hf_moe_blocks(model)
+    assert model.layers[0].block_sparse_moe is source
+
+
 @pytest.mark.parametrize("latent,shared", [(False, 0), (False, 1), (True, 1)])
 @pytest.mark.parametrize("activation", ["silu", "situ"])
 @pytest.mark.parametrize("top_k", [1, 2])

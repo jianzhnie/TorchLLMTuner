@@ -4,8 +4,11 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=2 \
     tests/integration_tests/checkpoint_save_coordination.py
 
 CPU/Gloo, synchronous and threaded async DCP, real local checkpoint storage.
+Use --writer-only for the device-selected real DCP writer-failure cases;
+the remaining CPU-only policy/stager isolation cases are not executed then.
 """
 
+import argparse
 import os
 from concurrent.futures import Future
 from contextlib import nullcontext
@@ -22,6 +25,7 @@ from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 
 from llmtuner.components.checkpointer import distributed_checkpoint as checkpoint
 from llmtuner.config.checkpoint_config import CheckpointConfig
+from tests.integration_tests.harness import init_distributed
 
 
 def check_host_preparation_failure(root):
@@ -844,7 +848,14 @@ def check_staging_failure(root, failing_rank, asynchronous, error_type):
 
 
 def main():
-    dist.init_process_group("gloo", timeout=timedelta(seconds=30))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--writer-only", action="store_true")
+    args = parser.parse_args()
+    if args.writer_only:
+        device = init_distributed(timeout=timedelta(seconds=90))
+    else:
+        dist.init_process_group("gloo", timeout=timedelta(seconds=30))
+        device = torch.device("cpu")
     try:
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
@@ -861,7 +872,7 @@ def main():
                 for failing_rank in (0, 1):
                     folder = root / f"{mode}-{failing_rank}"
                     torch.manual_seed(12)
-                    model = torch.nn.Linear(2, 2)
+                    model = torch.nn.Linear(2, 2, device=device)
                     optimizer = torch.optim.AdamW(model.parameters())
                     scheduler = torch.optim.lr_scheduler.LambdaLR(
                         optimizer, lambda _: 1
@@ -952,6 +963,9 @@ def main():
                         "old snapshot, retry and completed retention passed",
                         flush=True,
                     )
+            if args.writer_only:
+                dist.barrier()
+                return
             check_host_preparation_failure(root)
             check_local_preparation_failure(root)
             check_trainer_restore_failure(root)

@@ -1,5 +1,6 @@
 """Ascend NPU: activation exchange and AC numerical compatibility."""
 
+import gc
 import os
 import sys
 from contextlib import nullcontext
@@ -11,9 +12,15 @@ from llmtuner.config import (
     CheckpointConfig,
     LLMTunerConfig,
     ModelConfig,
+    ParallelConfig,
     TrainingConfig,
 )
 from llmtuner.memory import activation_swap
+from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+    ColumnParallelLinear,
+    ColwiseLinearNoGather,
+    RowParallelLinear,
+)
 from llmtuner.trainer.trainer import Trainer
 
 
@@ -21,7 +28,9 @@ def _run(
     directory: Path, swap: bool, ac_mode: str
 ) -> tuple[dict[str, torch.Tensor], int, int, dict[str, float | int]]:
     activation_swap.reset_activation_swap_metrics()
+    tp_size = int(os.environ.get("NPU_SWAP_TP_SIZE", "1"))
     config = LLMTunerConfig(
+        parallel=ParallelConfig(tensor_parallel_size=tp_size),
         model=ModelConfig(
             vocab_size=64,
             hidden_size=32,
@@ -39,6 +48,14 @@ def _run(
         ),
     )
     trainer = Trainer(config)
+    if tp_size > 1:
+        assert any(
+            isinstance(
+                module, ColumnParallelLinear | ColwiseLinearNoGather | RowParallelLinear
+            )
+            for part in trainer.model_parts
+            for module in part.modules()
+        ), "activation swap TP test has no TP projections"
     initial = {
         name: value.detach().cpu().clone()
         for name, value in trainer.example_model.state_dict().items()
@@ -90,6 +107,131 @@ def _run(
         trainer.close()
 
 
+def verify_discarded_graph_cleanup() -> None:
+    class SavedActivationLayer(torch.nn.Module):
+        def __init__(self, fail):
+            super().__init__()
+            self.fail = fail
+
+        def forward(self, value):
+            hidden = value.sin()
+            output = hidden.square()
+            if self.fail:
+                raise RuntimeError("intentional activation-swap forward failure")
+            return output
+
+    for fail in (False, True):
+        gc.collect()
+        activation_swap.reset_activation_swap_metrics()
+        baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([SavedActivationLayer(fail)])
+        activation_swap.apply_activation_swap(model)
+        value = torch.linspace(-1, 1, 1024, device="npu").requires_grad_()
+        if fail:
+            try:
+                model.layers[0](value)
+            except RuntimeError as error:
+                assert str(error) == "intentional activation-swap forward failure"
+            else:
+                raise AssertionError("the failing forward did not raise")
+        else:
+            output = model.layers[0](value)
+            assert torch.isfinite(output).all().item()
+            assert output.count_nonzero().item() > 0
+            del output
+        del model, value
+        gc.collect()
+        torch.npu.synchronize()
+        metrics = activation_swap.activation_swap_metrics()
+        assert metrics["copies_d2h"] > 0, metrics
+        assert metrics["d2h_bytes"] > 0, metrics
+        assert metrics["h2d_bytes"] == 0, metrics
+        assert metrics["host_bytes_current"] == baseline, metrics
+        print(f"PASS activation swap discarded graph fail={fail}: {metrics}")
+
+
+def verify_retained_graph_reuse() -> None:
+    class SavedActivationLayer(torch.nn.Module):
+        def forward(self, value):
+            return value.sin().square()
+
+    gc.collect()
+    activation_swap.reset_activation_swap_metrics()
+    baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([SavedActivationLayer()])
+    activation_swap.apply_activation_swap(model)
+    value = torch.linspace(-1, 1, 1024, device="npu").requires_grad_()
+    reference = value.detach().clone().requires_grad_()
+    output = model.layers[0](value).sum()
+    expected = reference.sin().square().sum()
+    output.backward(retain_graph=True)
+    expected.backward(retain_graph=True)
+    torch.testing.assert_close(value.grad, reference.grad, rtol=0, atol=0)
+    assert value.grad.count_nonzero().item() > 0
+    first = activation_swap.activation_swap_metrics()
+    assert first["copies_h2d"] > 0, first
+    output.backward()
+    expected.backward()
+    torch.testing.assert_close(value.grad, reference.grad, rtol=0, atol=0)
+    second = activation_swap.activation_swap_metrics()
+    # Unpack may be called again, but the reloaded device tensor is reusable.
+    assert second["copies_h2d"] == first["copies_h2d"], (first, second)
+    assert second["h2d_bytes"] == first["h2d_bytes"], (first, second)
+    del output, expected, value, reference, model
+    gc.collect()
+    torch.npu.synchronize()
+    final = activation_swap.activation_swap_metrics()
+    assert final["host_bytes_current"] == baseline, final
+    print(f"PASS activation swap retained graph: {final}")
+
+
+def verify_owned_storage_skips() -> None:
+    class OwnedStorageLayer(torch.nn.Module):
+        def __init__(self, source):
+            super().__init__()
+            self.source = source
+            self.register_buffer("scale", torch.full((1024,), 3.0))
+            self.weight = torch.nn.Parameter(torch.full((1024,), 5.0))
+
+        def forward(self, value):
+            if self.source == "input":
+                return value.square()
+            if self.source == "buffer":
+                return value * self.scale
+            if self.source == "parameter_alias":
+                return value * self.weight.detach()
+            return value * value.detach()
+
+    for source in ("input", "buffer", "detached_alias", "parameter_alias"):
+        gc.collect()
+        activation_swap.reset_activation_swap_metrics()
+        baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([OwnedStorageLayer(source)])
+        model.to("npu")
+        activation_swap.apply_activation_swap(model)
+        value = torch.linspace(-1, 1, 1024, device="npu").requires_grad_()
+        model.layers[0](value).sum().backward()
+        expected = (
+            2 * value.detach()
+            if source == "input"
+            else torch.full_like(value, 5.0)
+            if source == "parameter_alias"
+            else torch.full_like(value, 3.0)
+            if source == "buffer"
+            else value.detach()
+        )
+        torch.testing.assert_close(value.grad, expected, rtol=0, atol=0)
+        assert value.grad.count_nonzero().item() > 0
+        torch.npu.synchronize()
+        metrics = activation_swap.activation_swap_metrics()
+        assert metrics["copies_d2h"] == metrics["copies_h2d"] == 0, metrics
+        assert metrics["host_bytes_current"] == baseline, metrics
+        print(f"PASS activation swap owned storage {source}: {metrics}")
+
+
 def main() -> None:
     if not torch.npu.is_available():
         raise RuntimeError("activation swap integration requires a visible NPU")
@@ -123,6 +265,9 @@ def main() -> None:
             f"peak_allocated_baseline={baseline_memory}, swapped={swapped_memory}; "
             f"transfers={metrics}"
         )
+    verify_discarded_graph_cleanup()
+    verify_retained_graph_reuse()
+    verify_owned_storage_skips()
 
 
 if __name__ == "__main__":

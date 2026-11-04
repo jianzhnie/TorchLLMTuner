@@ -294,10 +294,26 @@ def test_selective_wraps_every_layer() -> None:
     assert all(isinstance(layer, CheckpointWrapper) for layer in model.layers)
 
 
-def test_full_policy_prefers_recompute_for_every_op() -> None:
-    """Upstream's ``_full_ac_policy`` is a constant: recompute all, save effects."""
+def test_full_policy_prefers_recompute_for_ordinary_ops() -> None:
     assert (
         ac_mod.full_policy(object(), object(), "arg", kw="v")
+        is CheckpointPolicy.PREFER_RECOMPUTE
+    )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "npu"])
+def test_full_policy_preserves_only_npu_reduce_scatter(device) -> None:
+    inputs = SimpleNamespace(device=SimpleNamespace(type=device))
+    policy = ac_mod.full_policy(
+        None, torch.ops._c10d_functional.reduce_scatter_tensor.default, inputs
+    )
+    assert policy is (
+        CheckpointPolicy.MUST_SAVE
+        if device == "npu"
+        else CheckpointPolicy.PREFER_RECOMPUTE
+    )
+    assert (
+        ac_mod.full_policy(None, torch.ops.aten.mm.default, inputs)
         is CheckpointPolicy.PREFER_RECOMPUTE
     )
 

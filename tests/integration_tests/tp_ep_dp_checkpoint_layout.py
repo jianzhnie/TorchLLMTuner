@@ -1,4 +1,7 @@
-"""Eight CPU/Gloo ranks: dense DP4/TP2 and sparse FSDP2/EP4 DCP restore."""
+"""Eight ranks: dense DP4/TP2 and sparse FSDP2/EP4 DCP/HF model restore.
+
+Use the shared harness for CPU/Gloo or accelerator backend selection.
+"""
 
 import tempfile
 from datetime import timedelta
@@ -19,16 +22,17 @@ from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 from llmtuner.parallel.expert_parallel.checkpointing import mark_experts_ep_sharded
 from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
 from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp
+from tests.integration_tests.harness import init_distributed
 
 
 def main():
-    dist.init_process_group("gloo", timeout=timedelta(seconds=90))
+    device = init_distributed(timeout=timedelta(seconds=90))
     try:
         assert dist.get_world_size() == 8
-        dense = init_device_mesh("cpu", (4, 2), mesh_dim_names=("dp", "tp"))
-        sparse = init_device_mesh("cpu", (2, 4), mesh_dim_names=("efsdp", "ep"))
-        dense_full = torch.arange(128.0).reshape(16, 8)
-        expert_full = torch.arange(512.0).reshape(8, 8, 8)
+        dense = init_device_mesh(device.type, (4, 2), mesh_dim_names=("dp", "tp"))
+        sparse = init_device_mesh(device.type, (2, 4), mesh_dim_names=("efsdp", "ep"))
+        dense_full = torch.arange(128.0, device=device).reshape(16, 8)
+        expert_full = torch.arange(512.0, device=device).reshape(8, 8, 8)
         model = nn.Module()
         model.dense = nn.Parameter(
             distribute_tensor(
@@ -132,7 +136,7 @@ def main():
             tensor_parallel_size=2,
             expert_parallel_size=4,
         )
-        actual = apply_tp(actual, dense["tp"], parallel)
+        actual = apply_tp(actual.to(device), dense["tp"], parallel)
         actual = apply_ep(actual, parallel, ep_group=sparse["ep"].get_group())
         actual_wrapper = ModelCheckpointState(
             actual, sharded_tensor_parallel=True, sharded_expert_parallel=True
@@ -161,6 +165,8 @@ def main():
         for key, value in actual.state_dict().items():
             torch.testing.assert_close(value, actual_expected[key], atol=0, rtol=0)
         dist.barrier()
+        if dist.get_rank() == 0:
+            print("PASS DP4/TP2 sparse FSDP2/EP4 DCP and HF model restoration")
     finally:
         dist.destroy_process_group()
 

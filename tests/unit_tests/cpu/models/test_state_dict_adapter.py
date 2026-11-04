@@ -141,6 +141,21 @@ def test_hf_key_mapping_rejects_collisions():
         adapter.to_hf({"model.weight": torch.ones(1), "weight": torch.zeros(1)})
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_qwen3_import_rejects_router_key_collisions(reverse):
+    adapter = HFTransformerStateDictAdapter(
+        SimpleNamespace(model_type="qwen3_moe"), None, qwen3_expert_parallel=True
+    )
+    entries = [
+        ("model.layers.0.mlp.gate.weight", torch.ones(2, 2)),
+        ("model.layers.0.mlp.router.gate.weight", torch.zeros(2, 2)),
+    ]
+    source = dict(reversed(entries) if reverse else entries)
+    with pytest.raises(ValueError, match="key mapping collision"):
+        adapter.from_hf(source)
+    assert list(source) == [key for key, _ in (entries[::-1] if reverse else entries)]
+
+
 def test_hf_reader_selects_each_tensor_from_its_indexed_file(tmp_path):
     import torch.distributed.checkpoint as dcp
     from safetensors.torch import save_file

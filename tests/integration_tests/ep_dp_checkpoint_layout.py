@@ -1,4 +1,7 @@
-"""Four Gloo ranks: EP2 x DP2 checkpoint offsets and model restoration."""
+"""Four ranks: EP2 x DP2 checkpoint offsets, optimizer/EMA and cold resume.
+
+The shared harness selects CPU/Gloo or the installed accelerator backend.
+"""
 
 import tempfile
 from datetime import timedelta
@@ -23,16 +26,19 @@ from llmtuner.parallel.expert_parallel.checkpointing import (
     mark_experts_ep_sharded,
     restore_sharded_expert_state,
 )
+from tests.integration_tests.harness import init_distributed
 
 
 def main() -> None:
-    dist.init_process_group("gloo", timeout=timedelta(seconds=90))
+    device = init_distributed(timeout=timedelta(seconds=90))
     try:
         assert dist.get_world_size() == 4
-        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep", "dp"))
+        mesh = init_device_mesh(device.type, (2, 2), mesh_dim_names=("ep", "dp"))
         ep_rank = mesh["ep"].get_local_rank()
         dp_rank = mesh["dp"].get_local_rank()
-        full = torch.arange(4 * 6 * 8, dtype=torch.float32).reshape(4, 6, 8)
+        full = torch.arange(4 * 6 * 8, dtype=torch.float32, device=device).reshape(
+            4, 6, 8
+        )
         for dim in (0, 1, 2):
             model = nn.Module()
             model.experts = nn.Module()

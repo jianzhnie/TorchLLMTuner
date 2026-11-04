@@ -30,6 +30,7 @@ from llmtuner.components.metrics import (
 from llmtuner.config import (
     MetricsConfig as Config,
 )
+from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.utils.monitoring import (
     Color,
     NoColor,
@@ -200,6 +201,44 @@ def test_throughput_is_not_divided_without_parallel_dims() -> None:
     processor.time_last_log -= 1.0
 
     assert _derive(processor).tps == pytest.approx(4000, rel=1e-3)
+
+
+@pytest.mark.parametrize(
+    "dp_shard,tp,ep,cp,pp",
+    [
+        (8, 1, 1, 1, 1),
+        (4, 2, 1, 1, 1),
+        (4, 2, 4, 1, 1),
+        (8, 1, 8, 1, 1),
+        (1, 2, 2, 2, 2),
+    ],
+)
+def test_real_topologies_report_the_same_global_work_per_device(
+    dp_shard, tp, ep, cp, pp
+) -> None:
+    topology = ParallelTopology(
+        dp_replicate=1,
+        dp_shard=dp_shard,
+        tp=tp,
+        ep=ep,
+        cp=cp,
+        pp=pp,
+        world_size=8,
+    )
+    processor = MetricsProcessor(
+        Config(), parallel_dims=topology, num_flops_per_token=1_000_000
+    )
+    try:
+        # One global batch of 8192 tokens over two seconds on eight devices.
+        # Fetch counts each DP shard before TP/CP partitioning or PP execution.
+        processor.add_tokens(8192 // dp_shard)
+        processor.gpu_peak_flops = 376e12
+        processor.time_last_log -= 2.0
+        derived = _derive(processor)
+        assert derived.tps == pytest.approx(512, rel=1e-3)
+        assert derived.mfu == pytest.approx(100 * 8192e6 / (2 * 8 * 376e12), rel=1e-3)
+    finally:
+        processor.close()
 
 
 def test_tflops_is_flops_per_token_times_throughput() -> None:

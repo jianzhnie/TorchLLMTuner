@@ -27,8 +27,15 @@ from llmtuner.parallel.tensor_parallel.checkpointing import (
 )
 from tests.integration_tests.harness import init_distributed
 
+
+def assign_gradients(module, gradients):
+    for name, parameter in module.named_parameters():
+        parameter.grad = gradients[name].clone()
+
+
 device = init_distributed(timeout=timedelta(seconds=90))
 try:
+    assert dist.get_world_size() == 4
     rank = dist.get_rank()
     groups = {
         tuple(ranks): dist.new_group(ranks)
@@ -177,14 +184,25 @@ try:
         sharded_tensor_parallel=True,
         sharded_expert_parallel=True,
     )
-    for parameter in separate.parameters():
-        parameter.grad = torch.ones_like(parameter)
+    first_gradients = {
+        "dense": ((dense_full + 1) / 100).chunk(2, 0)[rank % 2],
+        "experts.weight": ((expert_full + 1) / 100).chunk(2, 0)[rank // 2],
+    }
+    next_gradients = {
+        "dense": (dense_full.cos() + 2).chunk(2, 0)[rank % 2],
+        "experts.weight": (expert_full.cos() + 2).chunk(2, 0)[rank // 2],
+    }
+    assign_gradients(separate, first_gradients)
     optimizer.step()
     optimizer.zero_grad()
+    for name, parameter in separate.named_parameters():
+        moment = optimizer.optimizers[0].state[parameter]["exp_avg"]
+        peers = [torch.empty_like(moment) for _ in range(2)]
+        dist.all_gather(peers, moment, group=tp if name == "dense" else ep)
+        assert not torch.equal(peers[0], peers[1]), name
     training_state = {"model": wrapper, "optimizer": optimizer}
     dcp.save(training_state, checkpoint_id=paths[0] + "-training")
-    for parameter in separate.parameters():
-        parameter.grad = torch.full_like(parameter, 0.25)
+    assign_gradients(separate, next_gradients)
     optimizer.step()
     optimizer.zero_grad()
     expected = {key: value.clone() for key, value in separate.state_dict().items()}
@@ -211,8 +229,7 @@ try:
     optimizer = cold_optimizer
     training_state["optimizer"] = optimizer
     dcp.load(training_state, checkpoint_id=paths[0] + "-training")
-    for parameter in separate.parameters():
-        parameter.grad = torch.full_like(parameter, 0.25)
+    assign_gradients(separate, next_gradients)
     optimizer.step()
     optimizer.zero_grad()
     for key, value in separate.state_dict().items():
@@ -220,9 +237,10 @@ try:
     for key, value in optimizer.state_dict().items():
         reference = expected_optimizer[key]
         if hasattr(value, "chunks"):
-            for (_, actual), (_, saved) in zip(
+            for (offset, actual), (saved_offset, saved) in zip(
                 value.chunks, reference.chunks, strict=True
             ):
+                assert offset == saved_offset
                 torch.testing.assert_close(actual, saved, atol=0, rtol=0)
         elif isinstance(value, torch.Tensor):
             torch.testing.assert_close(value, reference, atol=0, rtol=0)
@@ -282,8 +300,7 @@ try:
         model_parts=[separate],
         sharded_expert_parallel=True,
     )
-    for parameter in separate.parameters():
-        parameter.grad = torch.ones_like(parameter)
+    assign_gradients(separate, first_gradients)
     ep_only_optimizer.step()
     ep_only_optimizer.zero_grad()
     ep_only_path = paths[0] + "-ep-only-training"
@@ -291,8 +308,7 @@ try:
         {"model": ep_only_wrapper, "optimizer": ep_only_optimizer},
         checkpoint_id=ep_only_path,
     )
-    for parameter in separate.parameters():
-        parameter.grad = torch.full_like(parameter, 0.25)
+    assign_gradients(separate, next_gradients)
     ep_only_optimizer.step()
     ep_only_optimizer.zero_grad()
     expected = {key: value.clone() for key, value in separate.state_dict().items()}
@@ -329,8 +345,7 @@ try:
         {"model": cold_wrapper, "optimizer": cold_optimizer},
         checkpoint_id=ep_only_path,
     )
-    for parameter in cold_separate.parameters():
-        parameter.grad = torch.full_like(parameter, 0.25)
+    assign_gradients(cold_separate, next_gradients)
     cold_optimizer.step()
     cold_optimizer.zero_grad()
     for key, value in cold_separate.state_dict().items():

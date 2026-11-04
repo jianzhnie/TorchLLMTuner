@@ -19,10 +19,11 @@ from llmtuner.parallel.expert_parallel.checkpointing import (
     gather_expert_state,
     mark_experts_ep_sharded,
 )
+from tests.integration_tests.harness import init_distributed
 
 
 def main():
-    dist.init_process_group("gloo", timeout=timedelta(seconds=30))
+    device = init_distributed(timeout=timedelta(seconds=90))
     try:
         world = dist.get_world_size()
         assert world in (2, 4)
@@ -34,10 +35,12 @@ def main():
             for failing_rank in (0, 1):
                 model = torch.nn.Module()
                 name = f"stage{stage}_weight"
-                model.register_parameter(name, torch.nn.Parameter(torch.zeros(1, 2)))
+                model.register_parameter(
+                    name, torch.nn.Parameter(torch.zeros(1, 2, device=device))
+                )
                 mark_experts_ep_sharded(model, group)
                 parts = [model]
-                state = {name: torch.full((1, 2), float(rank))}
+                state = {name: torch.full((1, 2), float(rank), device=device)}
                 state[f"state.{name}.ema_params"] = state[name].clone()
                 failed = rank % 2 == failing_rank
                 if failed:
@@ -46,22 +49,28 @@ def main():
                     elif case == "empty":
                         state.clear()
                     elif case == "dtype":
-                        state[name] = state[name].double()
+                        state[name] = state[name].to(torch.bfloat16)
                     elif case == "shape":
-                        model._parameters[name] = torch.nn.Parameter(torch.zeros(2, 2))
+                        model._parameters[name] = torch.nn.Parameter(
+                            torch.zeros(2, 2, device=device)
+                        )
                         state = {
-                            name: torch.zeros(2, 2),
-                            f"state.{name}.ema_params": torch.zeros(2, 2),
+                            name: torch.zeros(2, 2, device=device),
+                            f"state.{name}.ema_params": torch.zeros(
+                                2, 2, device=device
+                            ),
                         }
                     elif case == "local_shape":
-                        state[name] = torch.zeros(3, 2)
+                        state[name] = torch.zeros(3, 2, device=device)
                     else:
                         duplicate = torch.nn.Module()
                         duplicate.register_parameter(
-                            name, torch.nn.Parameter(torch.zeros(1, 2))
+                            name, torch.nn.Parameter(torch.zeros(1, 2, device=device))
                         )
                         parts.append(duplicate)
-                with patch.object(dist, "all_gather_into_tensor") as gather:
+                with patch.object(
+                    dist, "all_gather_into_tensor", wraps=dist.all_gather_into_tensor
+                ) as gather:
                     try:
                         gather_expert_state(
                             state,
@@ -85,7 +94,7 @@ def main():
                 dist.barrier()
         for error_type in (KeyboardInterrupt, SystemExit):
             for failing_rank in (0, 1):
-                model = torch.nn.Linear(2, 2, bias=False)
+                model = torch.nn.Linear(2, 2, bias=False, device=device)
                 mark_experts_ep_sharded(model, group)
                 original = error_type("interrupted EP checkpoint planning")
                 index_parameters = checkpointing.index_checkpoint_parameters
@@ -104,7 +113,11 @@ def main():
                     patch.object(
                         checkpointing, "index_checkpoint_parameters", interrupted_index
                     ),
-                    patch.object(dist, "all_gather_into_tensor") as gather,
+                    patch.object(
+                        dist,
+                        "all_gather_into_tensor",
+                        wraps=dist.all_gather_into_tensor,
+                    ) as gather,
                 ):
                     try:
                         gather_expert_state(
@@ -126,22 +139,28 @@ def main():
         # A fresh valid snapshot on the same EP groups must still work.
         model = torch.nn.Module()
         name = f"stage{stage}_weight"
-        model.register_parameter(name, torch.nn.Parameter(torch.zeros(1, 2)))
+        model.register_parameter(
+            name, torch.nn.Parameter(torch.zeros(1, 2, device=device))
+        )
         mark_experts_ep_sharded(model, group)
         result = gather_expert_state(
-            {name: torch.full((1, 2), float(rank))},
+            {name: torch.full((1, 2), float(rank), device=device)},
             shard_map=expert_shard_map([model]),
             model_parts=[model],
         )
-        expected = torch.tensor([[2.0 * stage] * 2, [2.0 * stage + 1] * 2])
+        expected = torch.tensor(
+            [[2.0 * stage] * 2, [2.0 * stage + 1] * 2], device=device
+        )
         torch.testing.assert_close(result[name], expected, rtol=0, atol=0)
         if world == 4:
             from torch.distributed.device_mesh import init_device_mesh
             from torch.distributed.tensor import Shard, distribute_tensor
 
-            mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("efsdp", "ep"))
+            mesh = init_device_mesh(device.type, (2, 2), mesh_dim_names=("efsdp", "ep"))
             ep_rank = mesh["ep"].get_local_rank()
-            logical = torch.tensor([[10.0 * ep_rank] * 2, [10.0 * ep_rank + 1] * 2])
+            logical = torch.tensor(
+                [[10.0 * ep_rank] * 2, [10.0 * ep_rank + 1] * 2], device=device
+            )
             sharded = torch.nn.Module()
             sharded.weight = torch.nn.Parameter(
                 distribute_tensor(logical, mesh["efsdp"], [Shard(0)])
@@ -154,7 +173,9 @@ def main():
             )
             torch.testing.assert_close(
                 full["weight"],
-                torch.tensor([[0.0] * 2, [1.0] * 2, [10.0] * 2, [11.0] * 2]),
+                torch.tensor(
+                    [[0.0] * 2, [1.0] * 2, [10.0] * 2, [11.0] * 2], device=device
+                ),
                 rtol=0,
                 atol=0,
             )

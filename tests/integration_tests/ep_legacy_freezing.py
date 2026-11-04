@@ -52,6 +52,56 @@ def main():
         for names in (("gate_proj", "up_proj", "down_proj"), ("w1", "w3", "w2")):
             torch.manual_seed(31)
             reference = LegacyBlock(names).to(device)
+            mixed_model = nn.Module()
+            mixed_model.layers = nn.ModuleList([nn.Module()])
+            mixed_block = copy.deepcopy(reference)
+            mixed_model.layers[0].mlp = mixed_block
+            getattr(mixed_block.experts[1], names[0]).to(dtype=torch.bfloat16)
+            original_parameters = tuple(mixed_model.parameters())
+            try:
+                swap_hf_moe_blocks(
+                    mixed_model, ep_group=dist.group.WORLD, router_aux_loss_coef=0.0
+                )
+            except UnsupportedCombinationError as error:
+                assert "different dtypes" in str(error), str(error)
+            else:
+                raise AssertionError(
+                    "heterogeneous expert dtypes were silently stacked"
+                )
+            assert mixed_model.layers[0].mlp is mixed_block
+            assert all(
+                before is after
+                for before, after in zip(
+                    original_parameters, mixed_model.parameters(), strict=True
+                )
+            )
+            for reordered in (False, True):
+                shared_model = nn.Module()
+                shared_model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+                first = copy.deepcopy(reference)
+                second = copy.deepcopy(reference)
+                members = list(first.experts)
+                second.experts = nn.ModuleList(members[::-1] if reordered else members)
+                shared_model.layers[0].mlp = first
+                shared_model.layers[1].mlp = second
+                try:
+                    swap_hf_moe_blocks(
+                        shared_model,
+                        ep_group=dist.group.WORLD,
+                        router_aux_loss_coef=0.0,
+                    )
+                except UnsupportedCombinationError as error:
+                    assert reordered and "expert order" in str(error)
+                    assert shared_model.layers[0].mlp is first
+                    assert shared_model.layers[1].mlp is second
+                else:
+                    assert not reordered
+                    grouped = [
+                        layer.mlp.routed_experts.inner_experts
+                        for layer in shared_model.layers
+                    ]
+                    for name in ("w1_EFD", "w3_EFD", "w2_EDF"):
+                        assert getattr(grouped[0], name) is getattr(grouped[1], name)
             model = nn.Module()
             layer = nn.Module()
             layer.mlp = copy.deepcopy(reference)

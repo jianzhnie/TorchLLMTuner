@@ -13,6 +13,7 @@ from torch import nn
 
 import llmtuner.parallel as parallel_api
 from llmtuner.config.activation_checkpoint_config import MemoryBudgetACConfig
+from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.parallel import parallelize
 from llmtuner.parallel.stages import (
@@ -107,6 +108,85 @@ def test_invalid_ac_options_fail_before_parallel_transforms(
         )
 
 
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_unavailable_fsdp_engine_fails_before_model_transforms(monkeypatch, pipeline):
+    from types import SimpleNamespace
+
+    from llmtuner.errors import EnvironmentUnsupportedError
+
+    def unavailable(*args):
+        raise EnvironmentUnsupportedError("custom engine unavailable")
+
+    def unexpected_transform(*args, **kwargs):
+        pytest.fail("unavailable FSDP engine reached a model transformation")
+
+    monkeypatch.setattr(parallelize, "validate_fsdp_environment", unavailable)
+    monkeypatch.setattr(parallelize, "apply_tp", unexpected_transform)
+    monkeypatch.setattr(parallelize, "apply_pp", unexpected_transform)
+    with pytest.raises(EnvironmentUnsupportedError, match="custom engine unavailable"):
+        parallelize.parallelize_hf_transformers(
+            nn.Linear(2, 2),
+            cfg=ParallelConfig(),
+            mesh=None,
+            parallel_dims=SimpleNamespace(pp_enabled=pipeline),
+        )
+
+
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_invalid_compile_backend_fails_before_parallel_transforms(
+    monkeypatch, pipeline
+):
+    from types import SimpleNamespace
+
+    from torch._dynamo.exc import InvalidBackend
+
+    def unexpected_transform(*args, **kwargs):
+        pytest.fail("invalid compile backend reached a model transformation")
+
+    monkeypatch.setattr(parallelize, "apply_tp", unexpected_transform)
+    monkeypatch.setattr(parallelize, "apply_pp", unexpected_transform)
+    with pytest.raises(InvalidBackend):
+        parallelize.parallelize_hf_transformers(
+            nn.Linear(2, 2),
+            cfg=ParallelConfig(),
+            mesh=None,
+            parallel_dims=SimpleNamespace(pp_enabled=pipeline),
+            compile=True,
+            compile_config=CompileConfig(backend="llmtuner_nonexistent_backend"),
+        )
+
+
+def test_unsupported_mc2_degree_fails_in_ep_stage_before_conversion(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.config.parallel_config import ExpertParallelConfig
+    from llmtuner.errors import EnvironmentUnsupportedError
+    from llmtuner.parallel.expert_parallel import expert_parallel
+
+    def unexpected_conversion(*args, **kwargs):
+        pytest.fail("unsupported MC2 degree reached MoE conversion")
+
+    monkeypatch.setattr(expert_parallel, "swap_hf_moe_blocks", unexpected_conversion)
+    with pytest.raises(EnvironmentUnsupportedError, match="world size in"):
+        parallelize.parallelize_hf_transformers(
+            nn.Linear(2, 2),
+            cfg=ParallelConfig(
+                expert_parallel_size=2,
+                ep_config=ExpertParallelConfig(ep_token_dispatcher="mc2"),
+            ),
+            mesh=None,
+            parallel_dims=SimpleNamespace(
+                pp_enabled=False,
+                get_optional_mesh=lambda name: (
+                    SimpleNamespace(get_group=lambda: object())
+                    if name == "ep"
+                    else None
+                ),
+                get_mesh=lambda name: SimpleNamespace(get_group=lambda: object()),
+            ),
+        )
+
+
 def test_pipeline_validates_tp_override_before_splitting(monkeypatch):
     from types import SimpleNamespace
 
@@ -179,6 +259,7 @@ def test_assembly_executes_stages_in_order(monkeypatch, compile_enabled):
         mesh=None,
         parallel_dims=None,
         compile=compile_enabled,
+        compile_config=CompileConfig(backend="aot_eager"),
     )
     assert result is model
     assert calls == (
@@ -251,6 +332,7 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
         mesh=None,
         parallel_dims=dims,
         compile=compile_enabled,
+        compile_config=CompileConfig(backend="aot_eager"),
         global_batch_size=4,
     )
     assert result.schedule is schedule
@@ -333,7 +415,7 @@ def test_fused_ep_dispatch_receives_stage_wide_error_group(monkeypatch, dispatch
         get_optional_mesh=lambda name: ep_mesh if name == "ep" else None,
         get_mesh=lambda name: loss_mesh,
     )
-    cfg = ParallelConfig(expert_parallel_size=2)
+    cfg = ParallelConfig(expert_parallel_size=8 if dispatcher == "mc2" else 2)
     cfg.ep_config.ep_token_dispatcher = dispatcher
     observed = {}
     for name in STAGE_ORDER:

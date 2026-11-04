@@ -713,6 +713,10 @@ class _FakeAdapter:
 class _RecordingModelState:
     def __init__(self) -> None:
         self.loaded = None
+        self.validated = None
+
+    def validate_state_dict(self, state) -> None:
+        self.validated = state
 
     def load_state_dict(self, state) -> None:
         self.loaded = state
@@ -831,6 +835,47 @@ def test_hf_load_round_trips_through_the_adapter(tmp_path, monkeypatch) -> None:
     assert "native_load" not in calls
     # from_hf's output lands on the live model state.
     assert model_state.loaded == {"back": model_state}
+    assert model_state.validated == model_state.loaded
+
+
+@pytest.mark.parametrize("failure_phase", ["adaptation", "validation"])
+def test_hf_load_failure_closes_reader_and_allows_retry(
+    tmp_path, monkeypatch, failure_phase
+) -> None:
+    manager, calls, MODEL = _hf_manager_stub(
+        tmp_path,
+        monkeypatch,
+        files={f"{tmp_path}/model.safetensors.index.json"},
+    )
+    model_state = _RecordingModelState()
+    failure = ValueError(f"HF {failure_phase} failed")
+    target = manager.sd_adapter if failure_phase == "adaptation" else model_state
+    method = "from_hf" if failure_phase == "adaptation" else "validate_state_dict"
+    original = getattr(target, method)
+
+    def fail(state):
+        assert calls["closed"] is True
+        raise failure
+
+    monkeypatch.setattr(target, method, fail)
+    with pytest.raises(ValueError, match=f"HF {failure_phase} failed") as caught:
+        manager._load_checkpoint(
+            {MODEL: model_state}, str(tmp_path), from_hf=True, from_quantized=False
+        )
+    assert caught.value is failure
+    assert model_state.loaded is None
+    assert "native_load" not in calls
+    if failure_phase == "adaptation":
+        assert model_state.validated is None
+
+    monkeypatch.setattr(target, method, original)
+    calls.clear()
+    manager._load_checkpoint(
+        {MODEL: model_state}, str(tmp_path), from_hf=True, from_quantized=False
+    )
+    assert calls["closed"] is True
+    assert model_state.loaded == {"back": model_state}
+    assert model_state.validated is model_state.loaded
 
 
 def test_native_load_restores_stateful_and_rejects_foreign_objects(

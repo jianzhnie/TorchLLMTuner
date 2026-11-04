@@ -1,4 +1,4 @@
-"""Two CPU/Gloo ranks: local load reporting and GC failures stay coordinated.
+"""Two CPU or accelerator ranks: load/reporting/GC failures stay coordinated.
 
 Run with torchrun --nproc_per_node=2. Uses real DCP save/load and AdamW state;
 also checks asymmetric invalid save/load arguments before staging or source IO.
@@ -21,10 +21,11 @@ from llmtuner.components.checkpointer.distributed_checkpoint import (
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.utils.garbage_collection import GarbageCollection
 from tests.integration_tests.cli_checkpoint_equivalence import assert_state_equal
+from tests.integration_tests.harness import init_distributed
 
 
 def main():
-    dist.init_process_group("gloo", timeout=timedelta(seconds=10))
+    device = init_distributed(timeout=timedelta(seconds=90))
     try:
         rank = dist.get_rank()
         assert dist.get_world_size() == 2
@@ -32,10 +33,10 @@ def main():
             roots = [root]
             dist.broadcast_object_list(roots, src=0)
             torch.manual_seed(123)
-            model = torch.nn.Linear(2, 2)
+            model = torch.nn.Linear(2, 2, device=device)
             optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
-            model(torch.ones(2, 2)).square().sum().backward()
+            model(torch.ones(2, 2, device=device)).square().sum().backward()
             optimizer.step()
             scheduler.step()
             states = (model, optimizer, scheduler)

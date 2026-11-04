@@ -119,6 +119,11 @@ def main():
                 group = manager.pg
                 assert group is not None
                 assert manager.save(1)
+                # Training may resume once the snapshot is staged, without
+                # waiting for upload/close. Mutate parameters, moments and the
+                # decaying schedule before loading the older checkpoint.
+                manager.maybe_wait_for_staging()
+                step(model, optimizer, scheduler)
                 # A newer native model-only export must not hide the resume.
                 assert manager.save(2, last_step=True)
                 manager.close()
@@ -126,7 +131,6 @@ def main():
                 assert_group_released(group)
                 assert manager.save_future is None
                 dist.barrier()
-                step(model, optimizer, scheduler)
                 resumed_model = build_model()
                 resumed_optimizer = OptimizersContainer(
                     OptimizerConfig(learning_rate=0.3, implementation="for-loop"),
@@ -148,7 +152,9 @@ def main():
                 resumed_group = resumed.pg
                 assert resumed._find_load_step() == 1
                 assert resumed.load(-1)
-                torch.testing.assert_close(resumed_model.state_dict(), saved_model)
+                torch.testing.assert_close(
+                    resumed_model.state_dict(), saved_model, rtol=0, atol=0
+                )
                 resumed.close()
                 assert_group_released(resumed_group)
                 # Verify the restored optimizer and schedule by continuing one step.

@@ -3,13 +3,15 @@
 Run: PYTHONPATH=. torchrun --nproc_per_node=2 \
     tests/integration_tests/accumulation_equivalence.py
 
-Exercise actual Trainer.train_step, CPU/Gloo FSDP, three AdamW updates.
+Exercise actual Trainer.train_step, device-selected FSDP, three AdamW updates.
+The Trainer selects CPU/Gloo or NPU/HCCL from the installed runtime.
 Use --nproc_per_node=4 for HSDP replicate=2/shard=2; the manual reference
 reduces every backward, while train_step reduces replicas only on the last.
 Masks differ across ranks and accumulation groups; compare reported loss,
 post-backward gradients and updated parameters against a manual loss-sum run.
 Keep separate forwards: Batch rows flatten into one causal stream, so joining
 microbatches changes attention context and is not an equivalent reference.
+Set ACCUMULATION_SWAP=1 on NPU to swap only the accumulated path's activations.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
+from llmtuner.accelerator.distributed import get_comm_device
 from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.config.optimizer_config import OptimizerConfig
@@ -55,6 +58,9 @@ def config(accumulation: int) -> LLMTunerConfig:
             seed=42,
             max_norm=0,
             gradient_accumulation_steps=accumulation,
+            activation_swap=(
+                accumulation > 1 and os.environ.get("ACCUMULATION_SWAP") == "1"
+            ),
         ),
     )
 
@@ -64,6 +70,11 @@ def local(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
+    swap = os.environ.get("ACCUMULATION_SWAP") == "1"
+    if swap:
+        from llmtuner.memory.activation_swap import reset_activation_swap_metrics
+
+        reset_activation_swap_metrics()
     accumulated = Trainer(config(2))
     combined = None
     try:
@@ -84,6 +95,7 @@ def main() -> None:
             denominator = torch.tensor(
                 sum(int((batch.labels[:, 1:] != -100).sum()) for batch in batches),
                 dtype=torch.int64,
+                device=get_comm_device(),
             )
             dist.all_reduce(denominator)
             sums = []
@@ -102,7 +114,7 @@ def main() -> None:
             combined.lr_scheduler.step()
             metrics = accumulated.train_step(iter(batches))
             torch.testing.assert_close(
-                torch.tensor(metrics["loss"]),
+                torch.tensor(metrics["loss"], device=reference_loss.device),
                 reference_loss,
                 atol=2e-6,
                 rtol=2e-5,
@@ -121,6 +133,14 @@ def main() -> None:
                     atol=2e-6,
                     rtol=2e-5,
                 )
+        if swap:
+            from llmtuner.memory.activation_swap import activation_swap_metrics
+
+            transfers = activation_swap_metrics()
+            assert transfers["copies_d2h"] > 0, transfers
+            assert transfers["copies_h2d"] > 0, transfers
+            assert transfers["host_bytes_current"] == 0, transfers
+            print(f"PASS accumulated activation swap: {transfers}")
         if dist.get_rank() == 0:
             print("PASS unequal-token accumulation: losses, gradients, AdamW updates")
     finally:

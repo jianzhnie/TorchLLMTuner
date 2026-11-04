@@ -1,10 +1,15 @@
-"""Qwen3-30B: DistMuon attention updates, checkpoint and continued training."""
+"""Qwen3-30B DistMuon attention-update smoke test.
+
+Checkpoint settings follow the example; this script does not assert recovery.
+"""
 
 import os
 import time
 from collections import defaultdict
 
 import torch
+import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from examples.train_qwen3_30b_npu import qwen3_30b_npu_config
 from llmtuner.components.optimizer.flex_shard import (
@@ -167,6 +172,25 @@ def main():
         }
         assert parameter_dtypes == {torch.bfloat16}, parameter_dtypes
         print(f"30B parameter dtypes: {parameter_dtypes}", flush=True)
+        observed = {}
+        for part in trainer.model_parts:
+            for name, parameter in part.named_parameters():
+                name = canonical_fqn(name)
+                if ".layers.0.self_attn." in name and name.endswith(
+                    ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight")
+                ):
+                    local = (
+                        parameter.to_local()
+                        if isinstance(parameter, DTensor)
+                        else parameter
+                    )
+                    observed[name.rsplit(".", 2)[-2]] = (
+                        parameter,
+                        local.detach().cpu().clone(),
+                    )
+        assert set(observed) == {"q_proj", "k_proj", "v_proj", "o_proj"}, sorted(
+            observed
+        )
         trainer.train()
         assert trainer.step == config.training.steps
         if profile is not None:
@@ -174,10 +198,28 @@ def main():
         for part in trainer.model_parts:
             for parameter in part.parameters():
                 assert torch.isfinite(parameter).all().item()
-        assert any(
-            optimizer.__class__.__name__ == "DistMuon"
+        muons = [
+            optimizer
             for optimizer in trainer.optimizer.optimizers
-        )
+            if isinstance(optimizer, DistMuon)
+        ]
+        assert muons
+        changed = []
+        for name, (parameter, initial) in sorted(observed.items()):
+            local = (
+                parameter.to_local() if isinstance(parameter, DTensor) else parameter
+            )
+            changed.append(int(not torch.equal(initial, local.detach().cpu())))
+            owners = [optimizer for optimizer in muons if parameter in optimizer.state]
+            assert len(owners) == 1, name
+            momentum = owners[0].state[parameter]["momentum_buffer"]
+            if isinstance(momentum, DTensor):
+                momentum = momentum.to_local()
+            assert torch.isfinite(momentum).all().item(), name
+            assert momentum.count_nonzero().item() > 0, name
+        changed = torch.tensor(changed, device=f"npu:{torch.npu.current_device()}")
+        dist.all_reduce(changed)
+        assert (changed > 0).all().item(), changed
         print(
             f"PASS 30B DistMuon step={trainer.step} "
             f"parameters={counts['dist_muon_parameters']} "

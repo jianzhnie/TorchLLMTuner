@@ -202,6 +202,28 @@ def test_chunked_boundaries_and_actual_aliases_are_owned_by_root(
 # -- container layout --------------------------------------------------------
 
 
+def test_decoder_keeps_a_root_alias_to_a_layer_child_in_the_root_state(monkeypatch):
+    from types import SimpleNamespace
+
+    model = _wrapper()
+    model.external_projection = model.layers[0].self_attn.q_proj
+    calls = []
+    monkeypatch.setattr(
+        apply, "fully_shard", lambda module, **options: calls.append((module, options))
+    )
+    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda *args: None)
+    apply.apply_fsdp_to_decoder(
+        model,
+        SimpleNamespace(mesh_dim_names=("dp_shard",)),
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        pp_enabled=False,
+    )
+    assert all(module is not model.layers[0] for module, _ in calls[:-1])
+    assert calls[-1][0] == [model.layers[0], model]
+    assert calls[-1][1]["reshard_after_forward"] is False
+
+
 def test_iter_transformer_layers_accepts_a_hf_module_list() -> None:
     layers = ModuleList([nn.Linear(4, 4) for _ in range(3)])
 
@@ -1377,6 +1399,26 @@ def test_fsdp_ignored_pattern_resolves_shared_module_alias():
     assert ignored == set(shared.parameters())
 
 
+def test_pattern_fsdp_groups_parents_of_an_aliased_child():
+    from llmtuner.parallel.fully_shard_parallel.plan import (
+        _resolve_pattern_units,
+        _resolve_shared_fsdp_units,
+    )
+
+    shared = nn.Linear(2, 2)
+    model = nn.Sequential(nn.Sequential(shared), nn.Sequential(shared))
+    cfg = ParallelConfig(fsdp_config=FSDPConfig(fsdp_apply_modules={"0": {}, "1": {}}))
+    modules, options, ignored = _resolve_pattern_units(model, cfg)
+    groups = _resolve_shared_fsdp_units(
+        model,
+        named_modules=modules,
+        unit_options=options,
+        ignored_params=ignored,
+        common={"ignored_params": ignored},
+    )
+    assert [names for names, _ in groups] == [["0", "1"], [""]]
+
+
 def test_fsdp_apply_patterns_normalize_shared_module_aliases():
     from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
 
@@ -1597,3 +1639,32 @@ def test_fsdp_references_keep_objects_retained_under_new_paths():
     rebound = references.bind(model).fsdp_config.fsdp_apply_modules[""]
     assert rebound["ignored_params"] == {original.weight}
     assert rebound["hook_module"] is original
+
+
+@pytest.mark.parametrize(
+    "dense_size,sparse_size", [(1, None), (1, 1), (2, None), (1, 2)]
+)
+def test_custom_fsdp_environment_is_checked_only_for_active_sharding(
+    monkeypatch, dense_size, sparse_size
+):
+    from types import SimpleNamespace
+
+    calls = []
+    monkeypatch.setattr(
+        apply,
+        "resolve_fsdp_mesh",
+        lambda dims: SimpleNamespace(size=lambda: dense_size),
+    )
+    monkeypatch.setattr(
+        apply,
+        "resolve_sparse_fsdp_mesh",
+        lambda dims: (
+            None if sparse_size is None else SimpleNamespace(size=lambda: sparse_size)
+        ),
+    )
+    monkeypatch.setattr(apply, "load_custom_fsdp_engine", lambda: calls.append(True))
+    cfg = ParallelConfig(fsdp_config=FSDPConfig(fsdp_implementation="custom"))
+    apply.validate_fsdp_environment(cfg, None)
+    assert calls == []
+    apply.validate_fsdp_environment(cfg, object())
+    assert len(calls) == int(dense_size > 1 or (sparse_size or 1) > 1)

@@ -632,6 +632,63 @@ def test_deepseek_v3_shared_experts_survive_the_swap() -> None:
     assert model.layers[1].mlp.shared_experts is not None
 
 
+@pytest.mark.parametrize("expert_dtype", [torch.bfloat16, torch.float64])
+def test_swap_preserves_expert_dtype_with_fp32_router(expert_dtype) -> None:
+    model = HFTransformerModel(_config(norm_topk_prob=True))
+    expected = []
+    for layer in model.layers:
+        layer.mlp.gate.float()
+        layer.mlp.experts.to(dtype=expert_dtype)
+        expected.append(
+            (
+                layer.mlp.experts.gate_up_proj.detach().clone(),
+                layer.mlp.experts.down_proj.detach().clone(),
+            )
+        )
+
+    assert swap_hf_moe_blocks(model, router_aux_loss_coef=0.0) == len(expected)
+    for layer, (gate_up, down) in zip(model.layers, expected, strict=True):
+        grouped = layer.mlp.routed_experts.inner_experts
+        gate, up = gate_up.chunk(2, dim=1)
+        assert layer.mlp.router.gate.weight.dtype == torch.float32
+        for target, source in (
+            (grouped.w1_EFD, gate),
+            (grouped.w3_EFD, up),
+            (grouped.w2_EDF, down),
+        ):
+            assert target.dtype == expert_dtype
+            torch.testing.assert_close(target, source, rtol=0, atol=0)
+
+
+def test_swap_rejects_router_and_experts_on_different_devices() -> None:
+    model = HFTransformerModel(_config(norm_topk_prob=True))
+    block = model.layers[0].mlp
+    original_counts = dict(AuxLoss._group_counts)
+    block.experts.gate_up_proj = torch.nn.Parameter(
+        block.experts.gate_up_proj.detach().to("meta")
+    )
+    block.experts.down_proj = torch.nn.Parameter(
+        block.experts.down_proj.detach().to("meta")
+    )
+
+    with pytest.raises(UnsupportedCombinationError, match="different devices"):
+        swap_hf_moe_blocks(model, router_aux_loss_coef=0.0)
+
+    assert model.layers[0].mlp is block
+    assert AuxLoss._group_counts == original_counts
+
+
+def test_swap_rejects_shared_expert_on_a_different_device() -> None:
+    model = HFTransformerModel(_config(norm_topk_prob=True))
+    block = model.layers[0].mlp
+    block.shared_expert = torch.nn.Linear(64, 64, bias=False, device="meta")
+
+    with pytest.raises(UnsupportedCombinationError, match="shared expert"):
+        swap_hf_moe_blocks(model, router_aux_loss_coef=0.0)
+
+    assert model.layers[0].mlp is block
+
+
 def test_swap_preserves_shared_expert_buffer_dtype() -> None:
     model = _deepseek_model()
     shared = model.layers[1].mlp.shared_experts
@@ -1596,3 +1653,27 @@ def test_ep_rebinds_ignored_module_subtree_without_object_overrides(
     )
     assert exclusions == expected
     assert cfg.fsdp_config.fsdp_ignored_modules == [path]
+
+
+@pytest.mark.parametrize("bias_dtype", [torch.float32, torch.bfloat16])
+def test_swap_preserves_external_router_bias_or_rejects_before_install(bias_dtype):
+    model = _deepseek_model()
+    blocks = [layer.mlp for layer in model.layers]
+    bias = blocks[1].gate.e_score_correction_bias.to(bias_dtype)
+    blocks[1].gate.e_score_correction_bias = bias
+    model.register_buffer("external_bias", bias)
+    counts = dict(AuxLoss._group_counts)
+    if bias_dtype != torch.float32:
+        with pytest.raises(UnsupportedCombinationError, match="external router bias"):
+            swap_hf_moe_blocks(model)
+        assert all(
+            layer.mlp is block
+            for layer, block in zip(model.layers, blocks, strict=True)
+        )
+        assert AuxLoss._group_counts == counts
+    else:
+        swap_hf_moe_blocks(model)
+        converted = model.layers[1].mlp.expert_bias_E
+        assert converted is model.external_bias
+        converted.add_(1)
+        torch.testing.assert_close(model.external_bias, torch.ones_like(bias))
