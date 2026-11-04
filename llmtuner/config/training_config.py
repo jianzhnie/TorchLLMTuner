@@ -95,6 +95,14 @@ class TrainingConfig:
             "continuing forward. Used only when activation_swap=True."
         },
     )
+    activation_swap_max_host_bytes: int = field(
+        default=0,
+        metadata={
+            "help": "Maximum live swapped activation Host bytes per model part "
+            "and rank (0: unlimited). At capacity keep activations on device. "
+            "Excludes allocator cache, virtual optimizer state and process RSS."
+        },
+    )
     selective_ac: SelectiveACConfig = field(
         default_factory=SelectiveACConfig,
         metadata={
@@ -242,6 +250,9 @@ class TrainingConfig:
         return self.validation_config
 
     def __post_init__(self) -> None:
+        require_integer_at_least(
+            self, "activation_swap_max_host_bytes", minimum=0, group="training"
+        )
         if self.grad_norm_precision not in ("float32", "parameter"):
             raise ConfigError(
                 "training.grad_norm_precision must be float32 or parameter"

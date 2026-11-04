@@ -70,15 +70,29 @@ _copies_d2h = 0
 _copies_h2d = 0
 
 
-def _release_host_bytes(num_bytes: int) -> None:
+@dataclass
+class _HostBudget:
+    limit: int = 0
+    current: int = 0
+
+
+def _release_host_bytes(num_bytes: int, budget: _HostBudget) -> None:
     global _host_bytes_current
     with _metrics_lock:
         _host_bytes_current -= num_bytes
+        budget.current -= num_bytes
 
 
 class _ForwardSwapState:
-    def __init__(self, protected: Any = (), *, sync_release: bool = False) -> None:
+    def __init__(
+        self,
+        protected: Any = (),
+        *,
+        sync_release: bool = False,
+        budget: _HostBudget | None = None,
+    ) -> None:
         self.sync_release = sync_release
+        self.budget = budget if budget is not None else _HostBudget()
         self.d2h_stream = _stream_api().Stream()
         self.h2d_stream = _stream_api().Stream()
         self.packed: list[_SwappedActivation] = []
@@ -96,13 +110,26 @@ class _ForwardSwapState:
             # that shared storage alive rather than exposing a zero-sized base.
             self.protected_storages.add(storage_id)
             return tensor.detach()
-        start, end = (_new_event(), _new_event()) if _metrics_enabled else (None, None)
-        host_tensor = torch.empty_like(tensor, device="cpu", pin_memory=True)
-        host_nbytes = host_tensor.numel() * host_tensor.element_size()
-        weakref.finalize(host_tensor, _release_host_bytes, host_nbytes)
+        host_nbytes = tensor.numel() * tensor.element_size()
+        # Reserve across all layers and outstanding forwards of this model
+        # part, before allocating pinned memory. Exhaustion keeps the original
+        # activation on device; it must never discard a saved tensor.
         with _metrics_lock:
+            if (
+                self.budget.limit
+                and self.budget.current + host_nbytes > self.budget.limit
+            ):
+                return tensor.detach()
+            self.budget.current += host_nbytes
             _host_bytes_current += host_nbytes
             _host_bytes_peak = max(_host_bytes_peak, _host_bytes_current)
+        try:
+            host_tensor = torch.empty_like(tensor, device="cpu", pin_memory=True)
+        except BaseException:
+            _release_host_bytes(host_nbytes, self.budget)
+            raise
+        weakref.finalize(host_tensor, _release_host_bytes, host_nbytes, self.budget)
+        start, end = (_new_event(), _new_event()) if _metrics_enabled else (None, None)
         current = _stream_api().current_stream()
         with _stream_api().stream(self.d2h_stream):
             self.d2h_stream.wait_stream(current)
@@ -236,8 +263,18 @@ def reset_activation_swap_metrics() -> None:
         _metrics_enabled = True
 
 
-def apply_activation_swap(model: nn.Module, *, sync_release: bool = False) -> nn.Module:
-    """Swap saved decoder activations to pinned Host memory between NPU uses."""
+def apply_activation_swap(
+    model: nn.Module, *, sync_release: bool = False, max_host_bytes: int = 0
+) -> nn.Module:
+    """Swap decoder activations within a per-model-part live Host byte budget.
+
+    Zero means unlimited. At capacity, retain activations on device. This bounds
+    live tensor payloads, not allocator caching, process RSS or virtual moments.
+    """
+    if isinstance(max_host_bytes, bool) or not isinstance(max_host_bytes, int):
+        raise TypeError("max_host_bytes must be a nonnegative integer")
+    if max_host_bytes < 0:
+        raise ValueError("max_host_bytes must be a nonnegative integer")
     if device_type != "npu":
         raise EnvironmentUnsupportedError(
             "training.activation_swap=True requires an Ascend NPU with "
@@ -247,6 +284,7 @@ def apply_activation_swap(model: nn.Module, *, sync_release: bool = False) -> nn
     if not isinstance(layers, nn.Module):
         raise TypeError("activation swap requires a model with a .layers module")
 
+    budget = _HostBudget(limit=max_host_bytes)
     layer_count = 0
     for layer in layers.children():
         layer_count += 1
@@ -263,6 +301,7 @@ def apply_activation_swap(model: nn.Module, *, sync_release: bool = False) -> nn
             state = _ForwardSwapState(
                 (args, kwargs, tuple(__layer.parameters()), tuple(__layer.buffers())),
                 sync_release=sync_release,
+                budget=budget,
             )
             try:
                 with torch.autograd.graph.saved_tensors_hooks(state.pack, _unpack):

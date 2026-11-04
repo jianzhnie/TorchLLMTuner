@@ -68,6 +68,7 @@ def parallelize_hf_transformers(
     activation_checkpoint: str = "none",
     activation_swap: bool = False,
     activation_swap_sync_release: bool = False,
+    activation_swap_max_host_bytes: int = 0,
     selective_ac: SelectiveACConfig | None = None,
     memory_budget_ac: MemoryBudgetACConfig | None = None,
     region_ac: RegionACConfig | None = None,
@@ -142,7 +143,9 @@ def parallelize_hf_transformers(
                 compile_enabled=compile,
             ),
             "activation_swap": partial(
-                apply_activation_swap, sync_release=activation_swap_sync_release
+                apply_activation_swap,
+                sync_release=activation_swap_sync_release,
+                max_host_bytes=activation_swap_max_host_bytes,
             ),
             "compile": partial(
                 apply_compile, compile_config=compile_config, tp_mesh=tp_mesh

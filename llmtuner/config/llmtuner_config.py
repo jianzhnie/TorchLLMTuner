@@ -103,6 +103,30 @@ class LLMTunerConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.optimizer.uses_optimizer_swap:
+            checkpoint = self.training.checkpoint_config
+            # Host-local moments cannot enter HCCL full-tensor gather. The
+            # existing chunked adapters preserve local ownership without data
+            # collectives; PP/CP and async modes impose no swap-specific ban.
+            if checkpoint.enable:
+                for degree, sharded, flag in (
+                    (
+                        self.parallel.tp_size,
+                        checkpoint.sharded_tensor_parallel,
+                        "sharded_tensor_parallel",
+                    ),
+                    (
+                        self.parallel.ep_size,
+                        checkpoint.sharded_expert_parallel,
+                        "sharded_expert_parallel",
+                    ),
+                ):
+                    if degree > 1 and not sharded:
+                        raise ConfigError(
+                            f"AdamWSwap Host moments require checkpoint.{flag}=True "
+                            "for TP/EP checkpointing; full-tensor HCCL gather "
+                            "cannot read CPU-local moments."
+                        )
         if (
             self.optimizer.state_residency == "npu_virtual"
             and self.parallel.fsdp_config.fsdp_cpu_offload
@@ -280,6 +304,10 @@ class LLMTunerConfig:
     @property
     def activation_swap_sync_release(self) -> bool:
         return self.training.activation_swap_sync_release
+
+    @property
+    def activation_swap_max_host_bytes(self) -> int:
+        return self.training.activation_swap_max_host_bytes
 
     @property
     def pipeline_parallel_schedule(self) -> str:

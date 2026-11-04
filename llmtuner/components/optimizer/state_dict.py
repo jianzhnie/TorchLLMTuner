@@ -72,9 +72,10 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     multi-optimizer case: the reset branch below is type-gated on Adam, and
     would be skipped silently if a container were handed in whole.
     """
+    from .adamw_swap import AdamWSwap
     from .flex_shard.dist_muon import DistMuon
 
-    if isinstance(optim, DistMuon):
+    if isinstance(optim, DistMuon | AdamWSwap):
         optim.initialize_state()
         return
 

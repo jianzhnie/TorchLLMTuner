@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from llmtuner.config.field_checks_config import require_integer_at_least
 from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 from llmtuner.config.optimizer_layout import BucketConfig, ComputeLayout
 from llmtuner.errors import ConfigError
@@ -19,7 +20,7 @@ class ParamGroupConfig:
     """Regex matched against parameter FQNs, e.g. ``r".*\\.bias$"``, ``r".*"``."""
 
     optimizer_name: str
-    """Optimizer for this group: ``Adam``, ``AdamW``, or ``DistMuon``."""
+    """Optimizer: ``Adam``, ``AdamW``, ``AdamWSwap``, or ``DistMuon``."""
 
     optimizer_kwargs: dict[str, Any] = field(default_factory=dict)
     "Per-group optimizer arguments; omitted values use optimizer defaults, not "
@@ -29,9 +30,9 @@ class ParamGroupConfig:
 
 @dataclass
 class OptimizerConfig:
-    """Default AdamW options plus explicit Adam, AdamW, or DistMuon groups."""
+    """Default AdamW options and explicit optimizer parameter groups."""
 
-    optimizer_type: Literal["Adam", "AdamW"] = field(
+    optimizer_type: Literal["Adam", "AdamW", "AdamWSwap"] = field(
         default="AdamW", metadata={"help": "Optimizer class"}
     )
     learning_rate: float = field(default=3e-4, metadata={"help": "Learning rate"})
@@ -65,6 +66,31 @@ class OptimizerConfig:
             "FSDP CPU offload."
         },
     )
+    swap_max_device_bytes: int = field(
+        default=64 * 1024**2,
+        metadata={
+            "help": "AdamWSwap total staging payload limit across lookahead slots, "
+            "including offloaded parameter/gradient copies; excludes update "
+            "temporaries and allocator cache. Large parameters are sliced."
+        },
+    )
+    swap_prefetch: bool = field(
+        default=False, metadata={"help": "Overlap one lookahead H2D slice with update."}
+    )
+    swap_memory_fraction: float | None = field(
+        default=None,
+        metadata={
+            "help": "Fraction of free accelerator memory for staging; "
+            "also capped by swap_max_device_bytes."
+        },
+    )
+    swap_max_host_bytes: int = field(
+        default=0,
+        metadata={
+            "help": "AdamWSwap owned Host moment payload limit per optimizer "
+            "(0: unlimited); excludes RSS and allocator cache."
+        },
+    )
     param_groups: list[ParamGroupConfig] = field(
         default_factory=list,
         metadata={
@@ -90,9 +116,25 @@ class OptimizerConfig:
     )
 
     def __post_init__(self) -> None:
-        if self.optimizer_type not in ("Adam", "AdamW"):
+        if not isinstance(self.swap_prefetch, bool):
+            raise ConfigError("optimizer.swap_prefetch must be bool")
+        fraction = self.swap_memory_fraction
+        if fraction is not None and (
+            isinstance(fraction, bool)
+            or not isinstance(fraction, int | float)
+            or not math.isfinite(fraction)
+            or not 0 < fraction <= 1
+        ):
+            raise ConfigError("optimizer.swap_memory_fraction must be in (0, 1]")
+        require_integer_at_least(
+            self, "swap_max_device_bytes", minimum=8, group="optimizer"
+        )
+        require_integer_at_least(
+            self, "swap_max_host_bytes", minimum=0, group="optimizer"
+        )
+        if self.optimizer_type not in ("Adam", "AdamW", "AdamWSwap"):
             raise ConfigError(
-                f"optimizer.optimizer_type must be 'Adam' or 'AdamW', "
+                f"optimizer.optimizer_type must be 'Adam', 'AdamW' or 'AdamWSwap', "
                 f"got {self.optimizer_type!r}"
             )
         if self.implementation not in ("fused", "foreach", "for-loop"):
@@ -165,6 +207,19 @@ class OptimizerConfig:
                     },
                 )
             ]
+        if self.uses_optimizer_swap and (
+            self.state_residency != "device" or self.implementation == "foreach"
+        ):
+            raise ConfigError(
+                "AdamWSwap requires state_residency='device' and "
+                "implementation='for-loop' or 'fused'; "
+                "it is independent of npu_virtual."
+            )
+
+    @property
+    def uses_optimizer_swap(self) -> bool:
+        """Whether any configured parameter group selects explicit state exchange."""
+        return any(group.optimizer_name == "AdamWSwap" for group in self.param_groups)
 
     @property
     def lr_scheduler(self) -> LRSchedulerConfig:

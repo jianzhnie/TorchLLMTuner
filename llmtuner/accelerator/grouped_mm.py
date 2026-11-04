@@ -14,6 +14,36 @@ import torch
 __all__ = ["aligned_npu_grouped_mm"]
 
 
+def _validate_metadata(
+    left: torch.Tensor, right: torch.Tensor, offsets: torch.Tensor
+) -> None:
+    """Check shape contracts even when empty operands bypass the native kernel.
+
+    Keep this metadata-only: reading offset values here would synchronize NPU
+    execution and cannot run with FakeTensors or unbacked token dimensions.
+    """
+    if (left.ndim, right.ndim) not in ((2, 3), (2, 2), (3, 2)):
+        raise ValueError("Unsupported grouped GEMM matrix dimensions")
+    if offsets.ndim != 1:
+        raise ValueError("Grouped GEMM offsets must be one-dimensional")
+    if offsets.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Grouped GEMM offsets must use int32 or int64")
+    if left.dtype != right.dtype:
+        raise TypeError("Grouped GEMM operands must have the same dtype")
+    if left.device != right.device or left.device != offsets.device:
+        raise ValueError("Grouped GEMM operands and offsets must share a device")
+    torch._check(
+        left.shape[-1] == right.shape[-2],
+        lambda: "Grouped GEMM contracting dimensions must match",
+    )
+    if left.ndim == 3 or right.ndim == 3:
+        experts = left.shape[0] if left.ndim == 3 else right.shape[0]
+        torch._check(
+            offsets.numel() == experts,
+            lambda: "Grouped GEMM requires one offset per expert",
+        )
+
+
 def _aligned_operand(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.data_ptr() % 16 == 0:
         return tensor
@@ -26,6 +56,16 @@ def _aligned_operand(tensor: torch.Tensor) -> torch.Tensor:
     return aligned
 
 
+def _output_shape(
+    left: torch.Tensor, right: torch.Tensor, offsets: torch.Tensor
+) -> tuple:
+    if left.ndim == 2 and right.ndim == 3:
+        return (left.shape[0], right.shape[-1])
+    if left.ndim == 2 and right.ndim == 2:
+        return (offsets.numel(), left.shape[0], right.shape[-1])
+    return (left.shape[1], right.shape[-1])
+
+
 @torch.library.custom_op("llmtuner::aligned_npu_grouped_mm", mutates_args=())
 def aligned_npu_grouped_mm(
     left: torch.Tensor, right: torch.Tensor, offsets: torch.Tensor
@@ -35,20 +75,13 @@ def aligned_npu_grouped_mm(
     The fresh result never aliases inputs. The same op handles the 2D/3D,
     2D/2D and 3D/2D matrix modes used by native grouped GEMM's derivatives.
     """
+    _validate_metadata(left, right, offsets)
     # EP's received token count can be unbacked during fullgraph tracing.
     # Handle empty contractions at runtime, including the weight-gradient
     # (2D/2D) and its (3D/2D) derivative modes, without a Python shape guard
     # in the traced caller. Native NPU grouped GEMM rejects empty operands.
     if left.numel() == 0 or right.numel() == 0:
-        if left.ndim == 2 and right.ndim == 3:
-            shape = (left.shape[0], right.shape[-1])
-        elif left.ndim == 2 and right.ndim == 2:
-            shape = (offsets.numel(), left.shape[0], right.shape[-1])
-        elif left.ndim == 3 and right.ndim == 2:
-            shape = (left.shape[1], right.shape[-1])
-        else:
-            raise ValueError("Unsupported grouped GEMM matrix dimensions")
-        return left.new_zeros(shape)
+        return left.new_zeros(_output_shape(left, right, offsets))
     return torch._grouped_mm(
         _aligned_operand(left), _aligned_operand(right), offs=offsets
     )
@@ -58,8 +91,11 @@ def aligned_npu_grouped_mm(
 def _fake_grouped_mm(
     left: torch.Tensor, right: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
-    # Reuse native shape/stride inference, including expert/contracting layouts.
-    return torch._grouped_mm(left, right, offs=offsets)
+    # Native Meta rejects empty contraction strides which our runtime handles
+    # without calling the kernel. Infer our own contiguous NPU output contract;
+    # do not branch on a possibly unbacked received-token dimension here.
+    _validate_metadata(left, right, offsets)
+    return left.new_empty(_output_shape(left, right, offsets))
 
 
 def _setup_context(

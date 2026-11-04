@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping
+from functools import wraps
+from numbers import Real
 from typing import Any
 
 import torch
@@ -125,11 +128,37 @@ def install_state_residency(
             "torch_npu.empty_with_swapped_memory; use 'device' on this host."
         )
     validate_virtual_optimizer_groups(optimizer.param_groups)
+    if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+        raise UnsupportedCombinationError(
+            "optimizer.state_residency='npu_virtual' supports Adam/AdamW only"
+        )
 
     def initialize_virtual_moments(
         optim: torch.optim.Optimizer, args: tuple, kwargs: dict
-    ) -> None:
+    ) -> tuple[tuple, dict] | None:
+        # Live groups can change after installation (including add_param_group).
+        validate_virtual_optimizer_groups(optim.param_groups)
         _initialize_moments(optim, allocator, only_with_grad=True)
+        closure = (
+            kwargs.get("closure")
+            if "closure" in kwargs
+            else (args[1] if len(args) > 1 else None)
+        )
+        if closure is None:
+            return None
+
+        @wraps(closure)
+        def initialize_after_closure(*closure_args, **closure_kwargs):
+            result = closure(*closure_args, **closure_kwargs)
+            # Adam invokes closures after step pre-hooks. Gradients created
+            # there must receive virtual moments before Adam's lazy init.
+            validate_virtual_optimizer_groups(optim.param_groups)
+            _initialize_moments(optim, allocator, only_with_grad=True)
+            return result
+
+        if "closure" in kwargs:
+            return args, {**kwargs, "closure": initialize_after_closure}
+        return (args[0], initialize_after_closure, *args[2:]), kwargs
 
     optimizer.register_step_pre_hook(initialize_virtual_moments)
 
@@ -142,6 +171,60 @@ def install_state_residency(
         # load_state_dict replaces group options as well as moments. Reject
         # unsupported checkpoint settings before allocating or mutating state.
         validate_virtual_optimizer_groups(state_dict["param_groups"])
+        # PyTorch checks these after pre-hooks. Do it before materializing
+        # potentially model-sized Host-backed destinations for an invalid load.
+        saved_groups = state_dict["param_groups"]
+        if len(saved_groups) != len(optim.param_groups):
+            raise ValueError(
+                "loaded state dict has a different number of parameter groups"
+            )
+        if any(
+            len(saved["params"]) != len(current["params"])
+            for saved, current in zip(saved_groups, optim.param_groups, strict=True)
+        ):
+            raise ValueError(
+                "loaded state dict contains a parameter group "
+                "that doesn't match the size of optimizer's group"
+            )
+        # copy_ accepts broadcasting, but Adam moments must match the parameter
+        # exactly. Validate before allocating Host storage or replacing state.
+        for saved, current in zip(saved_groups, optim.param_groups, strict=True):
+            for key, parameter in zip(saved["params"], current["params"], strict=True):
+                incoming = state_dict["state"].get(key, {})
+                if not incoming:
+                    continue  # Adam legitimately has no state before its first step.
+                for name in ("exp_avg", "exp_avg_sq"):
+                    moment = incoming.get(name)
+                    if not isinstance(moment, torch.Tensor) or (
+                        moment.shape != parameter.shape
+                    ):
+                        raise ValueError(
+                            f"Invalid Adam state {name!r} for parameter {key!r}: "
+                            f"expected a tensor of shape {tuple(parameter.shape)}"
+                        )
+                    if isinstance(moment, DTensor) != isinstance(parameter, DTensor):
+                        raise ValueError("Virtual Adam moment ownership mismatch")
+                    if isinstance(moment, DTensor) and (
+                        moment.device_mesh != parameter.device_mesh
+                        or moment.placements != parameter.placements
+                        or moment.to_local().shape != parameter.to_local().shape
+                    ):
+                        raise ValueError("Virtual Adam moment ownership mismatch")
+                step = incoming.get("step")
+                if isinstance(step, torch.Tensor):
+                    if step.numel() != 1 or step.is_complex():
+                        raise ValueError("Invalid Adam step: expected a real scalar")
+                    step = step.item()
+                if (
+                    isinstance(step, bool)
+                    or not isinstance(step, Real)
+                    or not math.isfinite(step)
+                    or step < 0
+                ):
+                    raise ValueError(
+                        f"Invalid Adam step for parameter {key!r}: "
+                        "expected a nonnegative finite scalar counter"
+                    )
         # Older virtual checkpoints inherited the default model dtype for
         # counters. Preserve their saved value but prevent further rounding;
         # never modify the caller's checkpoint tensors or nested dictionaries.

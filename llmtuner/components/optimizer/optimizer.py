@@ -28,7 +28,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
 
 from ...accelerator.collectives import all_reduce, synchronize_local_errors
-from ...accelerator.device import device_type
+from ...accelerator.device import device_type, get_current_device
 from ...accelerator.distributed import get_comm_device
 from ...parallel.expert_parallel.checkpointing import (
     expert_shard_map,
@@ -48,6 +48,7 @@ from ...parallel.tensor_parallel.checkpointing import (
 from ...utils.logging import get_logger
 from ...utils.module_names import canonical_fqn
 from ..checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
+from .adamw_swap import AdamWSwap
 from .flex_shard.dist_muon import DistMuon
 from .state_dict import (
     collect_local_optimizer_state,
@@ -90,7 +91,7 @@ def fused_kernel_device_types() -> frozenset[str]:
     have always covered, for the day the private helper moves.
     """
     try:
-        from torch.optim.adam import _get_fused_kernels_supported_devices
+        from torch.optim.optimizer import _get_fused_kernels_supported_devices
     except ImportError:  # pragma: no cover - private helper moved
         return frozenset({"cuda", "xpu"})
     return frozenset(_get_fused_kernels_supported_devices())
@@ -252,6 +253,14 @@ class OptimizersContainer(Optimizer, Stateful):
             optimizer_factories: dict[str, Callable[..., Optimizer]] = {
                 "Adam": torch.optim.Adam,
                 "AdamW": torch.optim.AdamW,
+                "AdamWSwap": lambda groups: AdamWSwap(
+                    groups,
+                    max_device_bytes=config.swap_max_device_bytes,
+                    max_host_bytes=config.swap_max_host_bytes,
+                    prefetch=config.swap_prefetch,
+                    memory_fraction=config.swap_memory_fraction,
+                    update_device=get_current_device(),
+                ),
                 "DistMuon": build_dist_muon,
             }
             for groups_by_opt_name in model_group_plans:
@@ -261,6 +270,29 @@ class OptimizersContainer(Optimizer, Stateful):
 
             for part_idx, groups_by_opt_name in enumerate(model_group_plans):
                 for opt_name, groups in groups_by_opt_name.items():
+                    # The upstream fused-device list is shared by Adam/AdamW,
+                    # but vendor registrations may implement only one. In
+                    # particular, NPU Adam otherwise silently copies to CPU.
+                    if (
+                        opt_name in ("Adam", "AdamW", "AdamWSwap")
+                        and device_type == "npu"
+                    ):
+                        operator = (
+                            "aten::_fused_adam_"
+                            if opt_name == "Adam"
+                            else "aten::_fused_adamw_"
+                        )
+                        if not torch._C._dispatch_has_kernel_for_dispatch_key(
+                            operator, "PrivateUse1"
+                        ):
+                            for group in groups.param_groups:
+                                if group.get("fused"):
+                                    logger.info(
+                                        "%s has no native fused NPU kernel; "
+                                        "using for-loop to avoid CPU fallback.",
+                                        opt_name,
+                                    )
+                                    group["fused"] = False
                     optimizer = optimizer_factories[opt_name](groups.param_groups)
                     # PyTorch accepts arbitrary group metadata, so misspelled
                     # update options otherwise silently leave defaults active.
@@ -608,6 +640,8 @@ class OptimizersContainer(Optimizer, Stateful):
                 self.optimizers, optimizer_states, strict=True
             ):
                 if isinstance(optimizer, DistMuon):
+                    optimizer.validate_param_groups(optimizer_state["param_groups"])
+                if isinstance(optimizer, AdamWSwap):
                     optimizer.validate_param_groups(optimizer_state["param_groups"])
             if getattr(self, "state_residency", "device") == "npu_virtual":
                 # Check every optimizer before any load hook applies values.
