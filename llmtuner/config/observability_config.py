@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from llmtuner.config.field_checks_config import require_integer_at_least
+from llmtuner.config.utils import require_integer_at_least
 from llmtuner.errors import ConfigError
 
 

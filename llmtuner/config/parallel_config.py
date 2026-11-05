@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import torch
 
-from llmtuner.config.field_checks_config import require_integer_at_least
+from llmtuner.config.utils import require_bool, require_integer_at_least
 from llmtuner.errors import (
     ConfigError,
     EnvironmentUnsupportedError,
@@ -282,12 +282,9 @@ class ExpertParallelConfig:
     def __post_init__(self) -> None:
         validate_expert_dispatcher(self.ep_token_dispatcher)
         validate_router_aux_loss_coefficient(self.router_aux_loss_coef)
-        for name in ("fixed_router", "moe_quantile_balancing"):
-            value = getattr(self, name)
-            if not isinstance(value, bool):
-                raise ConfigError(
-                    f"parallel.ep_config.{name} must be bool, got {value!r}"
-                )
+        require_bool(
+            self, "fixed_router", "moe_quantile_balancing", group="parallel.ep_config"
+        )
         require_integer_at_least(
             self, "ep_torchao_pad_multiple", group="parallel.ep_config"
         )

@@ -49,7 +49,14 @@ PARSER_GROUPS: tuple[type, ...] = (
 # every value it is given; ``cli_view`` fails loudly if a name here goes stale.
 PROGRAMMATIC_ONLY: dict[type, frozenset[str]] = {
     ModelConfig: frozenset({"arch_overrides"}),
-    OptimizerConfig: frozenset({"param_groups", "lr_scheduler_config"}),
+    OptimizerConfig: frozenset(
+        {
+            "param_groups",
+            "lr_scheduler_config",
+            "compute_sharding_by_fqn",
+            "bucket_configs",
+        }
+    ),
     CheckpointConfig: frozenset({"purge_exempt"}),
     ParallelConfig: frozenset(
         {"fsdp_config", "tp_config", "pp_config", "cp_config", "ep_config"}

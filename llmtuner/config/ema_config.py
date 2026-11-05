@@ -8,7 +8,7 @@ from typing import Protocol
 
 from ..errors import ConfigError
 from ..utils.logging import get_logger
-from .field_checks_config import require_integer_at_least
+from .utils import require_integer_at_least
 
 logger = get_logger(__name__)
 

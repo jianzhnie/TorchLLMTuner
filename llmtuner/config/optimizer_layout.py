@@ -24,8 +24,9 @@ class Owned:
 
     The owner is selected dynamically from the communication submesh and exists
     only during the compute phase; this is not persistent DTensor storage
-    ownership. Multiple mesh axes using ``Owned`` select one owner rank from
-    their Cartesian product.
+    ownership. The current DistMuon executor supports ownership or redistribution
+    on at most one non-unit mesh axis per parameter; layouts requiring multiple
+    active transport axes are rejected during transition planning.
     """
 
 

@@ -12,7 +12,7 @@ from llmtuner.components.checkpointer.core.checkpoint_keys import (
     OPTIMIZER,
 )
 from llmtuner.components.checkpointer.storage import filesystem
-from llmtuner.config.field_checks_config import require_integer_at_least
+from llmtuner.config.utils import require_integer_at_least
 from llmtuner.errors import ConfigError
 from llmtuner.utils.logging import get_logger
 

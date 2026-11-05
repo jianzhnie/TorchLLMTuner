@@ -6,9 +6,9 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from llmtuner.config.field_checks_config import require_integer_at_least
 from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 from llmtuner.config.optimizer_layout import BucketConfig, ComputeLayout
+from llmtuner.config.utils import require_integer_at_least
 from llmtuner.errors import ConfigError
 
 

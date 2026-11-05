@@ -1,4 +1,11 @@
-"""llmtuner configuration: every dataclass a run is described by."""
+"""Public configuration dataclasses and policy constants.
+
+Each domain module owns its fields, defaults and local validation.
+``llmtuner_config`` assembles groups and checks cross-domain combinations;
+``cli_config`` exposes parser views without changing the Python configuration.
+``utils`` contains dependency-light checks shared by domain modules.
+Implementation code imports the defining module rather than this public index.
+"""
 
 from llmtuner.config.activation_checkpoint_config import (
     VALID_AC_MODES,

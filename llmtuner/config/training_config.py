@@ -18,8 +18,8 @@ from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.data_config import DataloaderConfig
 from llmtuner.config.ema_config import EMAConfig
-from llmtuner.config.field_checks_config import require_integer_at_least
 from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
+from llmtuner.config.utils import require_bool, require_integer_at_least
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.errors import ConfigError
 
@@ -257,16 +257,15 @@ class TrainingConfig:
             raise ConfigError(
                 "training.grad_norm_precision must be float32 or parameter"
             )
-        for name in (
+        require_bool(
+            self,
             "compile",
             "deterministic",
             "detect_anomaly",
             "activation_swap",
             "activation_swap_sync_release",
-        ):
-            value = getattr(self, name)
-            if not isinstance(value, bool):
-                raise ConfigError(f"training.{name} must be bool, got {value!r}")
+            group="training",
+        )
         if (
             not isinstance(self.max_norm, int | float)
             or isinstance(self.max_norm, bool)

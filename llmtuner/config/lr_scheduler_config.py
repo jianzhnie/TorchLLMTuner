@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ..errors import ConfigError
-from .field_checks_config import require_integer_at_least
+from .utils import require_integer_at_least
 
 
 @dataclass(kw_only=True)

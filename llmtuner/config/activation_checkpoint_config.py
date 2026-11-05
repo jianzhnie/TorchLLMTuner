@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from llmtuner.config.utils import require_bool, require_string_patterns
 from llmtuner.errors import ConfigError
 
 VALID_AC_MODES: tuple[str, ...] = (
@@ -16,13 +17,6 @@ VALID_AC_MODES: tuple[str, ...] = (
     "region",
 )
 "Accepted activation-checkpointing modes."
-
-
-def _validate_patterns(value: list[str], *, field_name: str) -> None:
-    if not isinstance(value, list) or any(
-        not isinstance(pattern, str) or not pattern.strip() for pattern in value
-    ):
-        raise ConfigError(f"{field_name} must be a list of nonempty strings")
 
 
 @dataclass(kw_only=True)
@@ -62,14 +56,11 @@ class SelectiveACConfig:
     )
 
     def __post_init__(self) -> None:
-        _validate_patterns(
+        require_string_patterns(
             self.force_recompute_mm_shapes_by_fqns,
             field_name="selective_ac.force_recompute_mm_shapes_by_fqns",
         )
-        for name in ("preserve_rng_state", "debug"):
-            value = getattr(self, name)
-            if not isinstance(value, bool):
-                raise ConfigError(f"selective_ac.{name} must be bool, got {value!r}")
+        require_bool(self, "preserve_rng_state", "debug", group="selective_ac")
         if self.debug:
             raise ConfigError(
                 "selective_ac.debug must stay False: PyTorch checkpoint "
@@ -148,12 +139,8 @@ class RegionACConfig:
 
     def __post_init__(self) -> None:
         for name in ("save_regions", "recompute_regions"):
-            _validate_patterns(getattr(self, name), field_name=f"region_ac.{name}")
-        if not isinstance(self.preserve_rng_state, bool):
-            raise ConfigError(
-                "region_ac.preserve_rng_state must be bool, "
-                f"got {self.preserve_rng_state!r}"
-            )
+            require_string_patterns(getattr(self, name), field_name=f"region_ac.{name}")
+        require_bool(self, "preserve_rng_state", group="region_ac")
         if self.determinism_check not in ("default", "none"):
             raise ConfigError(
                 "region_ac.determinism_check must be 'default' or 'none', got "

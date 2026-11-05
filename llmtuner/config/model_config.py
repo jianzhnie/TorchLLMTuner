@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from llmtuner.config.field_checks_config import require_integer_at_least
+from llmtuner.config.utils import require_integer_at_least
 from llmtuner.errors import ConfigError
 
 LM_HEAD_COMPUTE_DTYPES = ("float32", "float16", "bfloat16")

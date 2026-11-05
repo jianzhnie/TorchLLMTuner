@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..errors import ConfigError
-from .field_checks_config import require_integer_at_least
+from .utils import require_integer_at_least
 
 
 @dataclass(kw_only=True)
