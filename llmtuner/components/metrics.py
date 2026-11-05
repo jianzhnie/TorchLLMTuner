@@ -69,6 +69,7 @@ from ..utils.monitoring import (
     get_device_name,
     get_peak_flops,
 )
+from .compute_metrics import compute_utilization, model_tflops, token_throughput
 
 if TYPE_CHECKING:
     # Annotation-only. ``parallel_dims`` imports the training config, which
@@ -111,10 +112,10 @@ DeviceMemStats = namedtuple(
 class DeviceMemoryMonitor:
     """Peak device-memory sampling over a logging window.
 
-    The trainer resets the peaks after every log, so each report covers exactly
-    the steps since the last one. That is what makes ``max_reserved`` a useful
-    number rather than a high-water mark set once during startup and never
-    revisited.
+    The trainer resets peak counters after every log. Reserved memory includes
+    cached allocator blocks retained from earlier windows; resetting counters
+    does not release those blocks. Use active and reserved metrics separately
+    when comparing tensor residency and allocator capacity.
     """
 
     def __init__(self, device_type: str) -> None:
@@ -179,6 +180,15 @@ class DeviceMemoryMonitor:
             self._to_pct(max_reserved),
             num_retries,
             num_ooms,
+        )
+
+    def get_current_allocated_gib(self) -> float:
+        """Current tensor allocation, distinct from cached reserved memory."""
+        device_module = self._device_module()
+        return (
+            0.0
+            if device_module is None
+            else self._to_gib(device_module.memory_allocated())
         )
 
     def reset_peak_stats(self) -> None:
@@ -407,6 +417,8 @@ class MetricsProcessor:
         dump_folder: str = "./outputs",
         pp_schedule: str = "1F1B",
         num_flops_per_token: int = 0,
+        num_parameters: int | None = None,
+        num_trainable_parameters: int | None = None,
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
     ):
@@ -419,6 +431,8 @@ class MetricsProcessor:
                 "num_flops_per_token must be a non-negative integer, "
                 f"got {num_flops_per_token!r}"
             )
+        self.num_parameters = num_parameters
+        self.num_trainable_parameters = num_trainable_parameters
         self.config = config
         self.parallel_dims = parallel_dims
         self.logger = self._build_metric_logger(
@@ -441,6 +455,14 @@ class MetricsProcessor:
             self.num_flops_per_token = num_flops_per_token
 
             self.ntokens_since_last_log = 0
+            self.valid_tokens_since_last_log = 0
+            self._summary_windows = 0
+            self._summary_loss = 0.0
+            self._summary_steps = 0
+            self._summary_seconds = 0.0
+            self._summary_reported = False
+            self.latest_training_observations: dict[str, float] = {}
+            self._steady_summary_reported = False
             self.data_loading_times: list[float] = []
             self.time_last_log = time.perf_counter()
             self.step_last_log: int | None = None
@@ -483,6 +505,10 @@ class MetricsProcessor:
     def add_tokens(self, num_tokens: int) -> None:
         """Record tokens processed since the last log."""
         self.ntokens_since_last_log += num_tokens
+
+    def add_valid_tokens(self, num_tokens: int) -> None:
+        """Record supervised target tokens separately from padded model inputs."""
+        self.valid_tokens_since_last_log += num_tokens
 
     def _build_metric_logger(
         self,
@@ -558,24 +584,22 @@ class MetricsProcessor:
         """
         time_delta = time.perf_counter() - self.time_last_log
 
-        tps = self.ntokens_since_last_log / (time_delta * self._non_data_parallel_size)
-        tflops = self.num_flops_per_token * tps / 1e12
-        # MFU uses the per-device BF16 peak reference from get_peak_flops;
-        # Ascend 910C uses the project's agreed 376 TFLOPS convention. This
-        # reference is not measured training throughput. Unknown peaks suppress
-        # MFU rather than substitute a guess.
-        # The model's own geometry is the other input, and it is missing in the
-        # same way: a config that does not expose the sizes the formula needs
-        # makes num_flops_per_token 0, and 0 into a non-zero peak reports a
-        # confident 0.00% rather than an unknown. Suppress both -- a wrong
-        # number in a dashboard is worse than an absent one.
-        # https://arxiv.org/abs/2204.02311 for the definition.
-        if self.gpu_peak_flops == 0:
-            mfu = None
-        elif self.num_flops_per_token == 0:
-            mfu = None
-        else:
-            mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
+        tps = token_throughput(
+            self.ntokens_since_last_log,
+            time_delta,
+            replication_degree=self._non_data_parallel_size,
+        )
+        compute = compute_utilization(
+            tokens_per_second=tps,
+            flops_per_token=self.num_flops_per_token,
+            peak_flops_per_device=self.gpu_peak_flops,
+            world_size=1,
+        )
+        # Logs retain model TFLOPS even when the hardware peak is unknown.
+        tflops = compute["tflops"]
+        if tflops is None:
+            tflops = model_tflops(self.num_flops_per_token, tps)
+        mfu = compute["utilization_percent"]
 
         assert self.step_last_log is not None, "should_log must run before log"
         time_end_to_end = time_delta / (step - self.step_last_log)
@@ -602,6 +626,7 @@ class MetricsProcessor:
     def _end_window(self, step: int) -> None:
         """Reset the counters that the next window measures over."""
         self.ntokens_since_last_log = 0
+        self.valid_tokens_since_last_log = 0
         self.data_loading_times.clear()
         self.time_last_log = time.perf_counter()
         self.step_last_log = step
@@ -635,7 +660,17 @@ class MetricsProcessor:
         derived = self._derive(step)
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
+        valid_fraction = (
+            self.valid_tokens_since_last_log / self.ntokens_since_last_log
+            if self.ntokens_since_last_log
+            else 0.0
+        )
+        valid_tps = derived.tps * valid_fraction
+        allocated_gib = self.device_memory_monitor.get_current_allocated_gib()
         metrics: dict[str, Any] = {
+            "throughput/valid_target_tps": valid_tps,
+            "tokens/valid_target_fraction": valid_fraction,
+            "memory/current_allocated(GiB)": allocated_gib,
             "loss_metrics/global_avg_loss": global_avg_loss,
             "loss_metrics/global_max_loss": global_max_loss,
             "grad_norm": grad_norm,
@@ -651,16 +686,85 @@ class MetricsProcessor:
             "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
             "memory/num_ooms": device_mem_stats.num_ooms,
         }
+        if self.num_parameters is not None:
+            metrics["model/parameters"] = self.num_parameters
+        if self.num_trainable_parameters is not None:
+            metrics["model/trainable_parameters"] = self.num_trainable_parameters
         if derived.mfu is not None:
             metrics["mfu(%)"] = derived.mfu
         if extra_metrics:
             metrics.update(extra_metrics)
 
+        # Synchronized per-step observations have a training-only scope. Keep
+        # legacy window fields in the sink for compatibility, but prefer these
+        # explicitly scoped values on the console.
+        observed = extra_metrics or {}
+        console_tps = observed.get("train/tps_per_device", derived.tps)
+        console_time = observed.get(
+            "train/slowest_rank_step_seconds", derived.time_end_to_end
+        )
+        valid_tps = observed.get("train/valid_target_tps_per_device", valid_tps)
+        valid_fraction = observed.get("train/valid_target_fraction", valid_fraction)
+
         self.logger.log(metrics, step)
 
+        self._summary_windows += 1
+        self._summary_loss += global_avg_loss
+        self._summary_steps += step - self.step_last_log
+        self._summary_seconds += derived.time_end_to_end * (step - self.step_last_log)
+        lr_str = (
+            ", ".join(
+                f"{key}={value:.3e}"
+                for key, value in (extra_metrics or {}).items()
+                if key.startswith("lr/")
+            )
+            or "lr=N/A"
+        )
         color = self.color
-        mfu = metrics.get("mfu(%)")
+        mfu = observed.get("train/mfu_percent", metrics.get("mfu(%)"))
         mfu_str = "N/A" if mfu is None else f"{mfu:.2f}%"
+        parameter_str = (
+            "N/A"
+            if self.num_parameters is None
+            else f"{self.num_parameters / 1e9:.6f}B"
+        )
+        trainable_str = (
+            "N/A"
+            if self.num_trainable_parameters is None
+            else f"{self.num_trainable_parameters / 1e9:.6f}B"
+        )
+        details = [f"max_loss: {global_max_loss:.5f}"]
+        loading_seconds = observed.get(
+            "train/data_loading_rank_max_seconds", derived.time_data_loading
+        )
+        loading_percent = observed.get(
+            "train/data_loading_rank_max_percent", derived.time_data_loading_pct
+        )
+        details.append(f"data: {loading_seconds:.3f}s({loading_percent:.1f}%)")
+        if "train/global_valid_targets" in observed:
+            details.append(
+                f"global_tokens: {int(observed['train/global_tokens']):,} "
+                f"valid_targets: {int(observed['train/global_valid_targets']):,}"
+            )
+        details.append(
+            f"alloc_retries: {device_mem_stats.num_alloc_retries} "
+            f"ooms: {device_mem_stats.num_ooms}"
+        )
+        if "steady/samples" in observed:
+            details.append(
+                f"steady[n={int(observed['steady/samples'])}]: "
+                f"p50={observed['steady/step_p50_seconds']:.3f}s "
+                f"p90={observed['steady/step_p90_seconds']:.3f}s "
+                f"tps={observed['steady/tps_per_device']:.1f}/device"
+            )
+            if "steady/mfu_percent" in observed:
+                details.append(f"steady_mfu: {observed['steady/mfu_percent']:.2f}%")
+        details.extend(
+            f"{key}={value:.4g}"
+            for key, value in observed.items()
+            if key.startswith(("aux_loss/", "moe/", "swap/", "checkpoint/"))
+            or ("loss" in key.lower() and key.endswith("/mean"))
+        )
         # A single pre-built message rather than a format string plus arguments:
         # the colour codes are already interpolated, so passing them as logging
         # arguments would leave a line no log handler could re-format.
@@ -670,9 +774,15 @@ class MetricsProcessor:
             f"{color.orange}grad_norm: {grad_norm:7.4f}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
-            f"{color.blue}tps: {round(derived.tps):,}  "
-            f"{color.cyan}tflops: {derived.tflops:,.2f}  "
-            f"{color.magenta}mfu: {mfu_str}{color.reset}"
+            f"step_time: {console_time:.3f}s  {lr_str}  "
+            f"allocated: {allocated_gib:.2f}GiB  "
+            f"peak_active: {device_mem_stats.max_active_gib:.2f}GiB  "
+            f"valid_tps: {valid_tps:,.1f}/device (targets: {valid_fraction:.1%})  "
+            f"params: {parameter_str} (trainable: {trainable_str})  "
+            f"{color.blue}tps: {round(console_tps):,}/device  "
+            f"{color.cyan}tflops: "
+            f"{observed.get('train/tflops_per_device', derived.tflops):,.2f}/device  "
+            f"{color.magenta}mfu: {mfu_str}{color.reset}  " + "  ".join(details)
         )
 
         self._end_window(step)
@@ -691,7 +801,11 @@ class MetricsProcessor:
 
         time_delta = time.perf_counter() - self.time_last_log
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
-        tps = self.ntokens_since_last_log / (time_delta * self._non_data_parallel_size)
+        tps = token_throughput(
+            self.ntokens_since_last_log,
+            time_delta,
+            replication_degree=self._non_data_parallel_size,
+        )
 
         metrics: dict[str, Any] = {
             "validation_metrics/loss": loss,
@@ -723,5 +837,40 @@ class MetricsProcessor:
 
         self._end_window(step)
 
+    def log_resources(self, step: int, metrics: dict[str, float]) -> None:
+        """Publish local counters after checkpoint/save boundaries as well."""
+        if metrics:
+            self.logger.log(metrics, step)
+            logger.info(
+                "Resource observations (rank-local): %s",
+                "  ".join(f"{key}={value:.4g}" for key, value in metrics.items()),
+            )
+
     def close(self) -> None:
+        observed = self.latest_training_observations
+        if not self._steady_summary_reported and "steady/samples" in observed:
+            mfu = observed.get("steady/mfu_percent")
+            logger.info(
+                "Training steady summary (rolling, warmup excluded): "
+                "%d samples, p50=%.4fs, p90=%.4fs, tps=%.1f/device, "
+                "tflops=%.2f/device, mfu=%s",
+                int(observed["steady/samples"]),
+                observed["steady/step_p50_seconds"],
+                observed["steady/step_p90_seconds"],
+                observed["steady/tps_per_device"],
+                observed["steady/tflops_per_device"],
+                "N/A" if mfu is None else f"{mfu:.2f}%",
+            )
+            self._steady_summary_reported = True
+        if not self._summary_reported and self._summary_windows:
+            logger.info(
+                "Training logged-window summary: %d steps, %d loss samples, "
+                "sample_mean_loss=%.6f, mean_step_time=%.4fs "
+                "(logged windows only; may include validation/startup)",
+                self._summary_steps,
+                self._summary_windows,
+                self._summary_loss / self._summary_windows,
+                self._summary_seconds / self._summary_steps,
+            )
+            self._summary_reported = True
         self.logger.close()

@@ -387,6 +387,62 @@ def _is_supported_orthogonal_dim0_shard_redistribution(
     return storage_dim == ndim - 2 and compute_dim == preserved_dim == 0
 
 
+def _resolve_matrix_block_shard(
+    fqn: str,
+    param: DTensor,
+    shardings: Mapping[int, _LoweredComputeSharding],
+    owned_axes: tuple[int, ...],
+) -> BlockShard | None:
+    """Validate matrix-batch ownership and preserve explicit block boundaries."""
+    mesh_axis_names = param.device_mesh.mesh_dim_names
+    assert mesh_axis_names is not None
+    # Unit mesh axes normalize to Replicate but retain their declared blocks.
+    block_shards = tuple(
+        sharding for sharding in shardings.values() if type(sharding) is BlockShard
+    )
+    if not block_shards:
+        return None
+    if param.ndim != 2:
+        raise ValueError(
+            f"Muon parameter {fqn!r} BlockShard currently requires a "
+            f"2D row-concatenated parameter; got shape {tuple(param.shape)}"
+        )
+    normalized_dims = tuple(
+        _normalize_dim(sharding.dim, param.ndim) for sharding in block_shards
+    )
+    if any(dim != 0 for dim in normalized_dims):
+        raise ValueError(
+            f"Muon parameter {fqn!r} matrix-batch BlockShard must shard "
+            "tensor dimension 0"
+        )
+    block_sizes = block_shards[0].block_sizes
+    if any(sharding.block_sizes != block_sizes for sharding in block_shards):
+        raise ValueError(
+            f"Muon parameter {fqn!r} must use the same BlockShard block sizes "
+            "across mesh axes"
+        )
+    block_shard = BlockShard(dim=0, block_sizes=block_sizes)
+    if block_shard.num_blocks(param.shape[0]) == 0:
+        raise ValueError(f"Muon parameter {fqn!r} requires at least one matrix block")
+    _validate_matrix_batch_storage_placements(fqn, param)
+    if owned_axes:
+        raise ValueError(
+            f"Muon owned compute for parameter {fqn!r} requires a 2D matrix"
+        )
+    shard_axes = [
+        mesh_axis_names[storage_mesh_axis]
+        for storage_mesh_axis, sharding in shardings.items()
+        if type(sharding) in (Shard, _StridedShard)
+    ]
+    if shard_axes:
+        raise ValueError(
+            f"Muon parameter {fqn!r} with matrix-batch compute requires "
+            f"BlockShard instead of Shard on mesh axes {shard_axes}"
+        )
+
+    return block_shard
+
+
 def _resolve_storage_to_compute_transition(
     fqn: str,
     param: DTensor,
@@ -441,55 +497,12 @@ def _resolve_storage_to_compute_transition(
         if type(sharding) is Owned
     )
 
-    # Unit mesh axes normalize to Replicate but retain their declared blocks.
-    block_shards = tuple(
-        sharding
-        for sharding in applicable_compute_shardings_by_storage_mesh_axis.values()
-        if type(sharding) is BlockShard
+    block_shard = _resolve_matrix_block_shard(
+        fqn,
+        param,
+        applicable_compute_shardings_by_storage_mesh_axis,
+        applicable_owned_storage_mesh_axes,
     )
-    block_shard = None
-    if block_shards:
-        if param.ndim != 2:
-            raise ValueError(
-                f"Muon parameter {fqn!r} BlockShard currently requires a "
-                f"2D row-concatenated parameter; got shape {tuple(param.shape)}"
-            )
-        normalized_dims = tuple(
-            _normalize_dim(sharding.dim, param.ndim) for sharding in block_shards
-        )
-        if any(dim != 0 for dim in normalized_dims):
-            raise ValueError(
-                f"Muon parameter {fqn!r} matrix-batch BlockShard must shard "
-                "tensor dimension 0"
-            )
-        block_sizes = block_shards[0].block_sizes
-        if any(sharding.block_sizes != block_sizes for sharding in block_shards):
-            raise ValueError(
-                f"Muon parameter {fqn!r} must use the same BlockShard block sizes "
-                "across mesh axes"
-            )
-        block_shard = BlockShard(dim=0, block_sizes=block_sizes)
-        if block_shard.num_blocks(param.shape[0]) == 0:
-            raise ValueError(
-                f"Muon parameter {fqn!r} requires at least one matrix block"
-            )
-        _validate_matrix_batch_storage_placements(fqn, param)
-        if applicable_owned_storage_mesh_axes:
-            raise ValueError(
-                f"Muon owned compute for parameter {fqn!r} requires a 2D matrix"
-            )
-        shard_axes = [
-            mesh_axis_names[storage_mesh_axis]
-            for storage_mesh_axis, sharding in (
-                applicable_compute_shardings_by_storage_mesh_axis.items()
-            )
-            if type(sharding) in (Shard, _StridedShard)
-        ]
-        if shard_axes:
-            raise ValueError(
-                f"Muon parameter {fqn!r} with matrix-batch compute requires "
-                f"BlockShard instead of Shard on mesh axes {shard_axes}"
-            )
 
     replicated_axes = [
         mesh_axis_names[storage_mesh_axis]
@@ -515,9 +528,7 @@ def _resolve_storage_to_compute_transition(
         if type(sharding) is Owned:
             continue
         placement = cast(_AxisComputeSharding, sharding)
-        if type(placement) is Shard:
-            declared_shard_dims.append(_normalize_dim(placement.dim, param.ndim))
-        elif type(placement) is _StridedShard:
+        if type(placement) in (Shard, _StridedShard):
             declared_shard_dims.append(_normalize_dim(placement.dim, param.ndim))
         elif type(placement) is BlockShard:
             declared_shard_dims.append(0)

@@ -681,6 +681,9 @@ class DistributedCheckpointManager(BaseCheckpointManager):
 
         if last_step:
             self._save_last_step(curr_step)
+            self.observation_metrics["checkpoint/local/final_save_seconds"] = (
+                time.monotonic() - begin
+            )
             with synchronize_local_errors("Checkpoint completed retention"):
                 self._purge_stale_checkpoints(saving_step=curr_step, completed=True)
             with synchronize_local_errors("Checkpoint save final reporting"):
@@ -726,11 +729,22 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 checkpoint_id=checkpoint_id,
                 async_mode=self.async_mode,
             )
+            self.observation_metrics["checkpoint/local/async_submission_seconds"] = (
+                time.monotonic() - async_save_started_at
+            )
             if self.async_mode == DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM:
                 # The manager owns staging resources until the upload is joined.
                 if isinstance(result, AsyncSaveResponse):
                     self.staging_future = result.staging_completion
                     self.save_future = result.upload_completion
+
+                    def record_staging_completion(future: Future) -> None:
+                        if not future.cancelled() and future.exception() is None:
+                            self.observation_metrics[
+                                "checkpoint/local/staging_completion_seconds"
+                            ] = time.monotonic() - async_save_started_at
+
+                    self.staging_future.add_done_callback(record_staging_completion)
                 elif isinstance(result, Future):
                     # Synchronous stagers have no staging future; PyTorch
                     # returns the active subprocess upload directly.
@@ -753,11 +767,15 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     GarbageCollection.collect("GC collection invoked by checkpointer.")
 
         else:
+            write_started = time.monotonic()
             self._save_checkpoint(
                 states,
                 checkpoint_id=checkpoint_id,
                 async_mode=DistributedCheckpointAsyncMode.DISABLED,
                 enable_garbage_collection=True,
+            )
+            self.observation_metrics["checkpoint/local/sync_write_seconds"] = (
+                time.monotonic() - write_started
             )
 
         if async_save_started_at is not None:
@@ -785,6 +803,9 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                         "seconds (async total).",
                         curr_step,
                         time.monotonic() - async_save_started_at,
+                    )
+                    self.observation_metrics["checkpoint/local/async_total_seconds"] = (
+                        time.monotonic() - async_save_started_at
                     )
                 except BaseException:
                     pass  # Reporting must not escape into the upload worker.

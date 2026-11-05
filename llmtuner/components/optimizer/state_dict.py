@@ -214,6 +214,11 @@ def validate_optimizer_state_tensor(
             f"Optimizer state {key!r} has shape {tuple(value.shape)}, "
             f"expected {tuple(expected.shape)}"
         )
+    if value.layout != expected.layout:
+        raise ValueError(
+            f"Optimizer state {key!r} has tensor layout {value.layout}, "
+            f"expected {expected.layout}"
+        )
     if isinstance(value, DTensor) != isinstance(expected, DTensor):
         raise ValueError(
             f"Optimizer state {key!r} has incompatible distributed tensor layout"
@@ -316,9 +321,7 @@ def unflatten_optim_state_dict(
     for param_group in optim.param_groups:
         fqns = param_group["param_names"]
         params = param_group["params"]
-        restored_group = _restore_param_group(
-            param_group, param_ids=[], flat_state=flat_state
-        )
+        restored_group = _restore_param_group(param_group, flat_state=flat_state)
         ids: list[int] = []
         for fqn, param in zip(fqns, params, strict=True):
             if fqn in seen_fqns:
@@ -361,12 +364,11 @@ def unflatten_optim_state_dict(
                         # Only dictionary-valued state may use nested keys.
                         # A malformed subtree must not replace a required Adam
                         # tensor/counter and defer failure until the next update.
-                        if not isinstance(expected_state[state_name], dict):
-                            raise KeyError(
-                                f"Optimizer state key {flat_key!r} not found "
-                                "in checkpoint."
-                            )
-                        nested = _restore_nested_state(flat_state, prefix=flat_key)
+                        nested = (
+                            _restore_nested_state(flat_state, prefix=flat_key)
+                            if isinstance(expected_state[state_name], dict)
+                            else None
+                        )
                         if not nested:
                             raise KeyError(
                                 f"Optimizer state key {flat_key!r} not found "
@@ -384,7 +386,7 @@ def unflatten_optim_state_dict(
 
 
 def _restore_param_group(
-    param_group: dict[str, Any], *, param_ids: list[int], flat_state: dict[str, Any]
+    param_group: dict[str, Any], *, flat_state: dict[str, Any]
 ) -> dict[str, Any]:
     """Restore compatible saved options for one current parameter group."""
     fqns = param_group["param_names"]
@@ -392,8 +394,8 @@ def _restore_param_group(
         # No FQN exists to key this group's options in the flat checkpoint.
         # Preserve the live options so even an empty group remains usable
         # by optimizer.step() and learning-rate schedulers after loading.
-        return {**param_group, "params": param_ids, "param_names": list(fqns)}
-    new_group: dict[str, Any] = {"params": param_ids, "param_names": list(fqns)}
+        return {**param_group, "params": [], "param_names": list(fqns)}
+    new_group: dict[str, Any] = {"params": [], "param_names": list(fqns)}
     for key in param_group:
         if key in ("params", "param_names"):
             continue

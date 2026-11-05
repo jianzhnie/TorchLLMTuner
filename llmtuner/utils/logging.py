@@ -10,8 +10,9 @@ rank-0 configuration.
 
 Ancestor handlers owned by this module skip records already emitted to the same
 destination. Optional file destinations use plain formatting and rank 0 only.
-Application handlers still receive propagated records and retain their own
-filtering policy.
+Application file and capture handlers still receive propagated records. Plain
+root console handlers share the rank policy and console deduplication, including
+handlers installed later by dependencies calling ``basicConfig``.
 """
 
 from __future__ import annotations
@@ -110,6 +111,15 @@ class DestinationFilter(logging.Filter):
         self.path = path
 
     def filter(self, record: LogRecord) -> bool:
+        if self.path is None:
+            # Dependencies may call basicConfig after our loggers are created.
+            # Apply the same console policy before propagation reaches root;
+            # leave application file/capture handlers untouched.
+            for handler in logging.getLogger().handlers:
+                if type(handler) is logging.StreamHandler and not any(
+                    isinstance(item, DestinationFilter) for item in handler.filters
+                ):
+                    handler.addFilter(DestinationFilter())
         config = get_logging_state()
         with config.lock:
             state = config.record(record)

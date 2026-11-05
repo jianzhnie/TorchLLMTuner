@@ -1,16 +1,18 @@
 """Compose model-part optimizers and expose one FQN-keyed checkpoint state.
 
 Adapted from torchtitan ``components/optimizer/optimizer.py``. The container
-owns one Adam/AdamW optimizer per model part and optimizer name; parameter
+owns one optimizer per model part and optimizer name; parameter
 patterns use first-match ownership. Step and zero_grad fan out to inner
 optimizers, while the container exposes their parameters to clipping and hooks.
 
 Checkpoint state is materialized and flattened by ``state_dict.py``. Expert
 states are gathered/sliced through the EP checkpoint adapter. Fused kernel
 selection falls back according to device support. DistMuon is implemented in
-``flex_shard`` and selected through explicit parameter-group configuration;
-bf16 optimizer states and upstream optimizer factory metadata are not
-implemented here.
+``flex_shard`` and selected through explicit parameter-group configuration.
+AdamWSwap performs explicit batched state transfers; ``state_residency`` instead
+installs Host-backed moments on native Adam/AdamW. Their storage and checkpoint
+constraints remain separate. Configurable BF16 optimizer-state precision and
+upstream optimizer factory metadata are not implemented here.
 """
 
 from __future__ import annotations
@@ -107,8 +109,7 @@ class OptimizersContainer(Optimizer, Stateful):
     which ``Optimizer.__init__`` merges across the inner optimizers.
 
     ``_initialize_optimizer_interface`` populates ``param_groups`` for gradient
-    clipping. The step
-    pre-hooks (MoE load balancing, the aux-loss roll-up) need the hook machinery
+    clipping. Step pre-hooks (MoE balancing and aux-loss roll-up) need the machinery
     that only ``Optimizer.__init__`` sets up. Calling it with an empty options
     dict gives both without registering any hyperparameters of its own.
 
@@ -125,7 +126,9 @@ class OptimizersContainer(Optimizer, Stateful):
     wins; that is what lets norm and bias parameters take a different weight
     decay from the rest. A ``ValueError`` is raised if a pattern matches nothing
     across all local model parts (a typo'd pattern is otherwise a silent no-op)
-    or if a trainable parameter ends up in no group at all.
+    or if a trainable parameter ends up in no group at all. Shared parameters
+    across local model parts and colliding checkpoint FQNs are rejected before
+    constructing any inner optimizer.
 
     Rules are validated across local parts, or across pipeline ranks when an
     explicit pipeline_mesh is supplied. All pipeline ranks must then construct
@@ -158,7 +161,6 @@ class OptimizersContainer(Optimizer, Stateful):
         sharded_tensor_parallel: bool = False,
         sharded_expert_parallel: bool = False,
     ) -> None:
-        all_params: list[nn.Parameter] = []
         self.optimizers = []
         self.model_parts = list(model_parts)
         self.sharded_tensor_parallel = sharded_tensor_parallel
@@ -209,31 +211,11 @@ class OptimizersContainer(Optimizer, Stateful):
             if error_group is not None
             else nullcontext()
         ):
-            for index, param_group_config in enumerate(config.param_groups):
-                if index not in matched_configs:
-                    raise ValueError(
-                        "optimizer.param_groups pattern "
-                        f"{param_group_config.pattern!r} matched no parameters "
-                        "across model parts in the pipeline"
-                    )
-            for groups_by_opt_name in model_group_plans:
-                for groups in groups_by_opt_name.values():
-                    for group in groups.param_groups:
-                        all_params.extend(group["params"])
-            self._validate_params(all_params)
-            checkpoint_names: set[str] = set()
-            for part_index, groups_by_opt_name in enumerate(model_group_plans):
-                for groups in groups_by_opt_name.values():
-                    for group in groups.param_groups:
-                        names = set(group["param_names"])
-                        collisions = checkpoint_names & names
-                        if collisions:
-                            raise ValueError(
-                                "Optimizer checkpoint FQNs collide across model parts "
-                                f"at part {part_index}: {sorted(collisions)}. "
-                                "Model parts must use unique parameter FQNs."
-                            )
-                        checkpoint_names.update(names)
+            all_params = self._validate_parameter_plan(
+                model_group_plans,
+                param_group_configs=config.param_groups,
+                matched_configs=matched_configs,
+            )
 
             def build_dist_muon(groups: list[dict]) -> DistMuon:
                 ns_devices = {group.get("ns_device") for group in groups}
@@ -464,6 +446,48 @@ class OptimizersContainer(Optimizer, Stateful):
                 kwargs,
             )
 
+    def _validate_parameter_plan(
+        self,
+        model_group_plans: list[dict[str, _OptimizerGroups]],
+        *,
+        param_group_configs: list[ParamGroupConfig],
+        matched_configs: set[int],
+    ) -> list[nn.Parameter]:
+        """Validate rules, ownership and checkpoint names before construction.
+
+        ``matched_configs`` includes rule matches from other pipeline ranks.
+        Parameter identity and checkpoint FQNs are checked across local parts.
+        This phase does not instantiate optimizers or modify model parameters.
+        """
+        all_params: list[nn.Parameter] = []
+        for index, param_group_config in enumerate(param_group_configs):
+            if index not in matched_configs:
+                raise ValueError(
+                    "optimizer.param_groups pattern "
+                    f"{param_group_config.pattern!r} matched no parameters "
+                    "across model parts in the pipeline"
+                )
+        for groups_by_opt_name in model_group_plans:
+            for groups in groups_by_opt_name.values():
+                for group in groups.param_groups:
+                    all_params.extend(group["params"])
+        self._validate_params(all_params)
+        checkpoint_names: set[str] = set()
+        for part_index, groups_by_opt_name in enumerate(model_group_plans):
+            for groups in groups_by_opt_name.values():
+                for group in groups.param_groups:
+                    names = set(group["param_names"])
+                    collisions = checkpoint_names & names
+                    if collisions:
+                        raise ValueError(
+                            "Optimizer checkpoint FQNs collide across model parts "
+                            f"at part {part_index}: {sorted(collisions)}. "
+                            "Model parts must use unique parameter FQNs."
+                        )
+                    checkpoint_names.update(names)
+
+        return all_params
+
     def _validate_params(self, all_params: list[nn.Parameter]) -> None:
         """Every trainable parameter must land in exactly one group.
 
@@ -580,17 +604,20 @@ class OptimizersContainer(Optimizer, Stateful):
         # init_optim_state must run first: the unflattening step reads each
         # optimizer's live state to learn which state tensors to expect, so a
         # fresh optimizer would find nothing to write into.
+        local_state_validated = False
         if self.sharded_tensor_parallel and self.sharded_expert_parallel:
             with synchronize_local_errors(
                 "Optimizer joint chunk destination construction"
             ):
                 local_state = collect_local_optimizer_state(self.optimizers)
+            local_state_validated = True
             state_dict = restore_disjoint_tp_ep_state(
                 state_dict, local_state=local_state, model_parts=self.model_parts
             )
         elif self.sharded_expert_parallel:
             with synchronize_local_errors("Optimizer EP destination construction"):
                 local_state = collect_local_optimizer_state(self.optimizers)
+            local_state_validated = True
             state_dict = restore_sharded_expert_state(
                 state_dict,
                 local_state=local_state,
@@ -606,6 +633,7 @@ class OptimizersContainer(Optimizer, Stateful):
         ):
             with synchronize_local_errors("Optimizer chunk destination construction"):
                 local_state = collect_local_optimizer_state(self.optimizers)
+            local_state_validated = True
             local_state = gather_expert_state(
                 local_state,
                 shard_map=expert_shard_map(self.model_parts),
@@ -629,9 +657,11 @@ class OptimizersContainer(Optimizer, Stateful):
         # checkpoint component's collectives. State initialization hooks must
         # be local; communication inside hooks cannot be coordinated here.
         with synchronize_local_errors("Optimizer checkpoint validation"):
-            # Dense restore needs the same FQN uniqueness checks as sharded
-            # destination construction, before any inner optimizer is loaded.
-            collect_local_optimizer_state(self.optimizers)
+            # Dense restore has not built local destinations yet. Sharded paths
+            # already collected them before layout collectives; flattening them
+            # again here only duplicates work over every optimizer moment.
+            if not local_state_validated:
+                collect_local_optimizer_state(self.optimizers)
             optimizer_states = [
                 unflatten_optim_state_dict(optimizer, flat_state=state_dict)
                 for optimizer in self.optimizers
@@ -639,9 +669,7 @@ class OptimizersContainer(Optimizer, Stateful):
             for optimizer, optimizer_state in zip(
                 self.optimizers, optimizer_states, strict=True
             ):
-                if isinstance(optimizer, DistMuon):
-                    optimizer.validate_param_groups(optimizer_state["param_groups"])
-                if isinstance(optimizer, AdamWSwap):
+                if isinstance(optimizer, DistMuon | AdamWSwap):
                     optimizer.validate_param_groups(optimizer_state["param_groups"])
             if getattr(self, "state_residency", "device") == "npu_virtual":
                 # Check every optimizer before any load hook applies values.

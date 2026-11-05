@@ -75,6 +75,7 @@ from ..core.checkpoint_keys import (
 from ..core.random_state import RNGCheckpointState
 from ..core.state_adaptation import adapt_hf_model_state
 from ..storage.checkpointing_metadata import adapt_npu_metadata_gather
+from ..storage.checkpointing_staging import adapt_npu_staging
 
 logger = get_logger(__name__)
 
@@ -337,6 +338,7 @@ def temporary_backend_manager(config: Any) -> Iterator[Any]:
     manager = config.build()
     try:
         adapt_npu_metadata_gather(manager)
+        adapt_npu_staging(manager)
         yield manager
     except BaseException:
         try:
@@ -485,6 +487,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
             self._manager = self._manager_config.build()
             adapt_npu_metadata_gather(self._manager)
+            adapt_npu_staging(self._manager)
 
         except BaseException as error:
             construction_error = error

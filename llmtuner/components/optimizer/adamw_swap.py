@@ -9,6 +9,7 @@ before releasing storage, so synchronous DCP observes ready Host state.
 from __future__ import annotations
 
 import math
+import time
 from collections import defaultdict
 from copy import deepcopy
 from numbers import Real
@@ -89,6 +90,7 @@ class AdamWSwap(torch.optim.AdamW):
         self.staging_peak_payload_bytes = 0
         self.h2d_bytes = 0
         self.d2h_bytes = 0
+        self.copy_wait_seconds = 0.0
         self.validate_param_groups(self.param_groups)
         for group in self.param_groups:
             for parameter in group["params"]:
@@ -281,7 +283,9 @@ class AdamWSwap(torch.optim.AdamW):
             # In particular, a failed update must not free a pending H2D source
             # or destination while a side stream still uses it.
             if self._copy_stream is not None:
+                started = time.perf_counter()
                 self._copy_stream.synchronize()
+                self.copy_wait_seconds += time.perf_counter() - started
         return loss
 
     def _slice_jobs(self, active):
@@ -360,7 +364,10 @@ class AdamWSwap(torch.optim.AdamW):
                 event = self._copy_stream.record_event()
             self.prefetch_count += 1
         else:
+            started = time.perf_counter()
             buffers = [source.to(device) for source in sources]
+            if backend is not None:
+                self.copy_wait_seconds += time.perf_counter() - started
         payload = sum(buffer.numel() * buffer.element_size() for buffer in buffers)
         self.staging_peak_payload_bytes = max(self.staging_peak_payload_bytes, payload)
         if device.type != "cpu":
@@ -402,6 +409,7 @@ class AdamWSwap(torch.optim.AdamW):
         )
         # Blocking copies complete before dropping the device buffers. Never
         # resize storage while a transfer still references it.
+        started = time.perf_counter()
         for name, moment in zip(names, moments, strict=True):
             _local(state[name]).view(-1)[start:end].copy_(moment)
         payload = sum(moment.numel() * moment.element_size() for moment in moments)
@@ -410,6 +418,7 @@ class AdamWSwap(torch.optim.AdamW):
             payload += value.numel() * value.element_size()
         if device.type != "cpu":
             self.d2h_bytes += payload
+            self.copy_wait_seconds += time.perf_counter() - started
         if end == _local(parameter).numel():
             state["step"].add_(1)
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from llmtuner.config.utils import require_integer_at_least
+from llmtuner.config.utils import require_bool, require_integer_at_least
 from llmtuner.errors import ConfigError
 
 
@@ -15,6 +15,17 @@ class MetricsConfig:
     log_freq: int = 1
     """Console log frequency, in steps. Also the TensorBoard/WandB frequency --
     one window feeds both."""
+
+    metrics_warmup_steps: int = 2
+    """Completed steps excluded from steady statistics after each process start.
+    Increase for compiled workloads until compilation has settled."""
+
+    steady_window_steps: int = 1024
+    """Maximum retained step samples for rolling steady p50/p90."""
+
+    measure_moe_dispatch: bool = False
+    """Opt-in device-event timing of native RoutedExperts forward dispatch.
+    Eager only; fused MC2/Domino paths require profiler traces instead."""
 
     enable_tensorboard: bool = False
     """Whether to write TensorBoard event files."""
@@ -42,6 +53,11 @@ class MetricsConfig:
 
     def __post_init__(self) -> None:
         require_integer_at_least(self, "log_freq", group="metrics")
+        require_integer_at_least(
+            self, "metrics_warmup_steps", minimum=0, group="metrics"
+        )
+        require_integer_at_least(self, "steady_window_steps", group="metrics")
+        require_bool(self, "measure_moe_dispatch", group="metrics")
         if any(
             not isinstance(rank, int) or isinstance(rank, bool) or rank < 0
             for rank in self.log_ranks

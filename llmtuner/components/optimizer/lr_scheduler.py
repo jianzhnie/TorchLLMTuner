@@ -22,7 +22,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
-from ...config.field_checks_config import require_integer_at_least
+from ...config.utils import require_integer_at_least
 from ...utils.logging import get_logger
 
 if TYPE_CHECKING:

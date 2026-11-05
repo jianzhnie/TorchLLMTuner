@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Iterable, Mapping
 from functools import wraps
-from numbers import Real
 from typing import Any
 
 import torch
@@ -13,6 +11,10 @@ from torch.distributed.tensor import DTensor
 
 from ...accelerator.device import device_type
 from ...errors import EnvironmentUnsupportedError, UnsupportedCombinationError
+from .state_dict import (
+    validate_optimizer_state_tensor,
+    validate_optimizer_step_counter,
+)
 
 __all__ = [
     "install_state_residency",
@@ -72,31 +74,36 @@ def _initialize_moments(
     optimizer: torch.optim.Optimizer,
     allocator: Callable[..., torch.Tensor],
     *,
-    only_with_grad: bool,
+    parameters: Iterable[torch.Tensor] | None = None,
 ) -> None:
-    for group in optimizer.param_groups:
-        for parameter in group["params"]:
-            if only_with_grad and parameter.grad is None:
-                continue
-            state: dict[str, Any] = optimizer.state[parameter]
-            # Publish only after every allocation succeeds. A failed allocation
-            # must not leave a nonempty Adam state missing required fields.
-            pending = {}
-            if "step" not in state:
-                # Match Adam's scalar dtype independently of model precision.
-                # A BF16 step counter stops incrementing at 256.
-                step_dtype = (
-                    torch.float64
-                    if torch.get_default_dtype() == torch.float64
-                    else torch.float32
-                )
-                pending["step"] = torch.tensor(
-                    0.0, dtype=step_dtype, device=parameter.device
-                )
-            for name in ("exp_avg", "exp_avg_sq"):
-                if name not in state:
-                    pending[name] = _allocate_moment(parameter, allocator)
-            state.update(pending)
+    """Initialize selected parameters, or live gradients for an ordinary step."""
+    if parameters is None:
+        parameters = (
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+            if parameter.grad is not None
+        )
+    for parameter in parameters:
+        state: dict[str, Any] = optimizer.state[parameter]
+        # Publish only after every allocation succeeds. A failed allocation
+        # must not leave a nonempty Adam state missing required fields.
+        pending = {}
+        if "step" not in state:
+            # Match Adam's scalar dtype independently of model precision.
+            # A BF16 step counter stops incrementing at 256.
+            step_dtype = (
+                torch.float64
+                if torch.get_default_dtype() == torch.float64
+                else torch.float32
+            )
+            pending["step"] = torch.tensor(
+                0.0, dtype=step_dtype, device=parameter.device
+            )
+        for name in ("exp_avg", "exp_avg_sq"):
+            if name not in state:
+                pending[name] = _allocate_moment(parameter, allocator)
+        state.update(pending)
 
 
 def validate_virtual_optimizer_groups(groups: Iterable[Mapping[str, Any]]) -> None:
@@ -109,6 +116,53 @@ def validate_virtual_optimizer_groups(groups: Iterable[Mapping[str, Any]]) -> No
                     f"{option}=True; use the default device residency or disable "
                     "this optimizer option."
                 )
+
+
+def validate_virtual_optimizer_state(
+    optimizer: torch.optim.Optimizer, state_dict: Mapping[str, Any]
+) -> None:
+    """Check restored Adam state before allocating or changing virtual storage."""
+    # load_state_dict replaces group options as well as moments. Reject
+    # unsupported checkpoint settings before allocating or mutating state.
+    validate_virtual_optimizer_groups(state_dict["param_groups"])
+    # PyTorch checks these after pre-hooks. Do it before materializing
+    # potentially model-sized Host-backed destinations for an invalid load.
+    saved_groups = state_dict["param_groups"]
+    if len(saved_groups) != len(optimizer.param_groups):
+        raise ValueError("loaded state dict has a different number of parameter groups")
+    if any(
+        len(saved["params"]) != len(current["params"])
+        for saved, current in zip(saved_groups, optimizer.param_groups, strict=True)
+    ):
+        raise ValueError(
+            "loaded state dict contains a parameter group "
+            "that doesn't match the size of optimizer's group"
+        )
+    # copy_ accepts broadcasting, but Adam moments must match the parameter
+    # exactly. Validate before allocating Host storage or replacing state.
+    for saved, current in zip(saved_groups, optimizer.param_groups, strict=True):
+        for key, parameter in zip(saved["params"], current["params"], strict=True):
+            incoming = state_dict["state"].get(key, {})
+            if not incoming:
+                continue  # Adam legitimately has no state before its first step.
+            for name in ("exp_avg", "exp_avg_sq"):
+                try:
+                    validate_optimizer_state_tensor(
+                        incoming.get(name), parameter, key=f"state.{key}.{name}"
+                    )
+                except ValueError as error:
+                    raise ValueError(
+                        f"Invalid Adam state {name!r} for parameter {key!r}: "
+                        f"Virtual Adam moment ownership or shape mismatch: {error}"
+                    ) from error
+            try:
+                validate_optimizer_step_counter(
+                    incoming.get("step"), key=f"state.{key}.step"
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid Adam step for parameter {key!r}: {error}"
+                ) from error
 
 
 def install_state_residency(
@@ -128,7 +182,7 @@ def install_state_residency(
             "torch_npu.empty_with_swapped_memory; use 'device' on this host."
         )
     validate_virtual_optimizer_groups(optimizer.param_groups)
-    if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+    if not isinstance(optimizer, torch.optim.Adam | torch.optim.AdamW):
         raise UnsupportedCombinationError(
             "optimizer.state_residency='npu_virtual' supports Adam/AdamW only"
         )
@@ -138,7 +192,7 @@ def install_state_residency(
     ) -> tuple[tuple, dict] | None:
         # Live groups can change after installation (including add_param_group).
         validate_virtual_optimizer_groups(optim.param_groups)
-        _initialize_moments(optim, allocator, only_with_grad=True)
+        _initialize_moments(optim, allocator)
         closure = (
             kwargs.get("closure")
             if "closure" in kwargs
@@ -153,7 +207,7 @@ def install_state_residency(
             # Adam invokes closures after step pre-hooks. Gradients created
             # there must receive virtual moments before Adam's lazy init.
             validate_virtual_optimizer_groups(optim.param_groups)
-            _initialize_moments(optim, allocator, only_with_grad=True)
+            _initialize_moments(optim, allocator)
             return result
 
         if "closure" in kwargs:
@@ -168,63 +222,7 @@ def install_state_residency(
         optim: torch.optim.Optimizer, state_dict: dict[str, Any]
     ) -> dict[str, Any]:
         destinations.clear()
-        # load_state_dict replaces group options as well as moments. Reject
-        # unsupported checkpoint settings before allocating or mutating state.
-        validate_virtual_optimizer_groups(state_dict["param_groups"])
-        # PyTorch checks these after pre-hooks. Do it before materializing
-        # potentially model-sized Host-backed destinations for an invalid load.
-        saved_groups = state_dict["param_groups"]
-        if len(saved_groups) != len(optim.param_groups):
-            raise ValueError(
-                "loaded state dict has a different number of parameter groups"
-            )
-        if any(
-            len(saved["params"]) != len(current["params"])
-            for saved, current in zip(saved_groups, optim.param_groups, strict=True)
-        ):
-            raise ValueError(
-                "loaded state dict contains a parameter group "
-                "that doesn't match the size of optimizer's group"
-            )
-        # copy_ accepts broadcasting, but Adam moments must match the parameter
-        # exactly. Validate before allocating Host storage or replacing state.
-        for saved, current in zip(saved_groups, optim.param_groups, strict=True):
-            for key, parameter in zip(saved["params"], current["params"], strict=True):
-                incoming = state_dict["state"].get(key, {})
-                if not incoming:
-                    continue  # Adam legitimately has no state before its first step.
-                for name in ("exp_avg", "exp_avg_sq"):
-                    moment = incoming.get(name)
-                    if not isinstance(moment, torch.Tensor) or (
-                        moment.shape != parameter.shape
-                    ):
-                        raise ValueError(
-                            f"Invalid Adam state {name!r} for parameter {key!r}: "
-                            f"expected a tensor of shape {tuple(parameter.shape)}"
-                        )
-                    if isinstance(moment, DTensor) != isinstance(parameter, DTensor):
-                        raise ValueError("Virtual Adam moment ownership mismatch")
-                    if isinstance(moment, DTensor) and (
-                        moment.device_mesh != parameter.device_mesh
-                        or moment.placements != parameter.placements
-                        or moment.to_local().shape != parameter.to_local().shape
-                    ):
-                        raise ValueError("Virtual Adam moment ownership mismatch")
-                step = incoming.get("step")
-                if isinstance(step, torch.Tensor):
-                    if step.numel() != 1 or step.is_complex():
-                        raise ValueError("Invalid Adam step: expected a real scalar")
-                    step = step.item()
-                if (
-                    isinstance(step, bool)
-                    or not isinstance(step, Real)
-                    or not math.isfinite(step)
-                    or step < 0
-                ):
-                    raise ValueError(
-                        f"Invalid Adam step for parameter {key!r}: "
-                        "expected a nonnegative finite scalar counter"
-                    )
+        validate_virtual_optimizer_state(optim, state_dict)
         # Older virtual checkpoints inherited the default model dtype for
         # counters. Preserve their saved value but prevent further rounding;
         # never modify the caller's checkpoint tensors or nested dictionaries.
@@ -236,11 +234,18 @@ def install_state_residency(
                 torch.bfloat16,
             ):
                 restored_states[key] = {**state, "step": step.to(torch.float32)}
-        _initialize_moments(optim, allocator, only_with_grad=False)
-        for group in optim.param_groups:
-            for parameter in group["params"]:
-                for name in ("exp_avg", "exp_avg_sq"):
-                    destinations.append((parameter, name, optim.state[parameter][name]))
+        restored_parameters = [
+            parameter
+            for saved, current in zip(
+                state_dict["param_groups"], optim.param_groups, strict=True
+            )
+            for key, parameter in zip(saved["params"], current["params"], strict=True)
+            if restored_states.get(key)
+        ]
+        _initialize_moments(optim, allocator, parameters=restored_parameters)
+        for parameter in restored_parameters:
+            for name in ("exp_avg", "exp_avg_sq"):
+                destinations.append((parameter, name, optim.state[parameter][name]))
         return {**state_dict, "state": restored_states}
 
     def restore_virtual_destinations(optim: torch.optim.Optimizer) -> None:

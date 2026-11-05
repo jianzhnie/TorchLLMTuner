@@ -103,6 +103,23 @@ class LLMTunerConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.metrics.measure_moe_dispatch and self.training.compile:
+            raise ConfigError(
+                "metrics.measure_moe_dispatch requires eager execution; "
+                "use profiler traces for compiled dispatch."
+            )
+        if (
+            self.metrics.measure_moe_dispatch
+            and self.parallel.ep_config.ep_token_dispatcher
+            in (
+                "mc2",
+                "domino",
+            )
+        ):
+            raise ConfigError(
+                "metrics.measure_moe_dispatch does not instrument fused MC2/Domino; "
+                "use profiler traces for those dispatchers."
+            )
         if self.optimizer.uses_optimizer_swap:
             checkpoint = self.training.checkpoint_config
             # Host-local moments cannot enter HCCL full-tensor gather. The

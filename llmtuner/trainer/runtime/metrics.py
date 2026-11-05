@@ -14,6 +14,46 @@ if TYPE_CHECKING:
     from ..trainer import Trainer
 
 
+def collect_resource_metrics(trainer: Trainer) -> dict[str, float]:
+    """Rank-local resource counters, explicitly labelled rather than summed.
+
+    Activation events are measured only when activation swap is configured.
+    Byte counters are cumulative; device transfer seconds consume the log window.
+    """
+    from ...components.optimizer.adamw_swap import AdamWSwap
+
+    result = {}
+    if getattr(trainer.cfg, "activation_swap", False):
+        from ...memory.activation_swap import activation_swap_metrics
+
+        result.update(
+            {
+                f"swap/activation_local/{key}": float(value)
+                for key, value in activation_swap_metrics().items()
+            }
+        )
+    optimizers = getattr(trainer.optimizer, "optimizers", ())
+    swaps = [optimizer for optimizer in optimizers if isinstance(optimizer, AdamWSwap)]
+    if swaps:
+        for key in (
+            "h2d_bytes",
+            "d2h_bytes",
+            "host_state_bytes",
+            "staging_peak_payload_bytes",
+            "copy_wait_seconds",
+        ):
+            result[f"swap/optimizer_local/{key}"] = float(
+                sum(getattr(optimizer, key) for optimizer in swaps)
+            )
+    result.update(getattr(trainer.checkpointer, "observation_metrics", {}).copy())
+    timers = getattr(trainer, "dispatch_timers", ())
+    if timers:
+        result["moe/local_forward_dispatch_seconds_window"] = sum(
+            timer.consume_seconds() for timer in timers
+        )
+    return result
+
+
 def build_step_metrics(
     trainer: Trainer,
     *,

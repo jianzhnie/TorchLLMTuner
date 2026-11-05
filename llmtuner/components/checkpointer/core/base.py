@@ -172,6 +172,11 @@ class BaseCheckpointManager(ABC):
     parsed into something that would then collide with ``step-7``.
     """
 
+    @property
+    def observation_metrics(self) -> dict[str, float]:
+        """Lazily available even during interrupted/partial initialization."""
+        return self.__dict__.setdefault("_observation_metrics", {})
+
     def _validate_constructor_configuration(
         self, config: CheckpointConfig, *, async_mode: str | None = None
     ) -> None:
@@ -224,6 +229,7 @@ class BaseCheckpointManager(ABC):
         resumed run's fresh scheduler restarts ``last_epoch`` at 0, so a warmup
         or decay curve restarts on the step after a resume.
         """
+        self._observation_metrics: dict[str, float] = {}
         self.enable = config.enable
         if not self.enable:
             return
@@ -495,13 +501,32 @@ class BaseCheckpointManager(ABC):
                     "Checkpoint ranks supplied inconsistent save configuration; "
                     "check backend, folder, async mode and final export options"
                 )
-        return self._save(curr_step, last_step)
+        started = time.monotonic()
+        saved = False
+        try:
+            saved = self._save(curr_step, last_step)
+            return saved
+        finally:
+            if saved:
+                self.observation_metrics["checkpoint/local/save_call_seconds"] = (
+                    time.monotonic() - started
+                )
+                self.observation_metrics["checkpoint/local/saved_step"] = float(
+                    curr_step
+                )
 
     def maybe_wait_for_staging(self) -> None:
         """Block until asynchronous staging for the last save completes."""
         if not getattr(self, "_initialized", False) or not self.enable:
             return
-        self._maybe_wait_for_staging()
+        started = time.monotonic()
+        try:
+            self._maybe_wait_for_staging()
+        finally:
+            key = "checkpoint/local/staging_wait_seconds_total"
+            self.observation_metrics[key] = self.observation_metrics.get(key, 0.0) + (
+                time.monotonic() - started
+            )
 
     def close(self) -> None:
         """Release background threads and other resources.
@@ -591,12 +616,18 @@ class BaseCheckpointManager(ABC):
             return
         if getattr(self, "save_future", None) is None:
             return
+        started = time.monotonic()
         try:
             self._wait_for_saving()
         except BaseException:
             if getattr(self, "save_future", None) is None:
                 self._pending_retention = None
             raise
+        finally:
+            key = "checkpoint/local/upload_wait_seconds_total"
+            self.observation_metrics[key] = self.observation_metrics.get(key, 0.0) + (
+                time.monotonic() - started
+            )
         retention = getattr(self, "_pending_retention", None)
         self._pending_retention = None
         if retention is not None:
