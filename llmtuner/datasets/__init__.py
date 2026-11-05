@@ -41,34 +41,7 @@ _EXPORT_SOURCES = {
     "build_source": "sources",
 }
 
-__all__ = [
-    "BaseDataLoader",
-    "Collator",
-    "DatasetBuildContext",
-    "DatasetConcat",
-    "DatasetIterationPolicy",
-    "DatasetMix",
-    "DatasetRecipe",
-    "DataloaderExhaustedError",
-    "GrainDataLoader",
-    "GrainDataset",
-    "HAS_PIN_MEMORY",
-    "HuggingFaceRandomAccessSource",
-    "HuggingFaceStreamingSource",
-    "IndexedJsonlSource",
-    "RandomAccessDataSource",
-    "SampleProcessor",
-    "SingleDataset",
-    "TextCollator",
-    "TextSequence",
-    "TrainerBatch",
-    "WeightedDataset",
-    "build_concat_then_split_packing",
-    "build_dataloader",
-    "build_dataset",
-    "build_first_fit_packing",
-    "build_source",
-]
+__all__ = sorted(_EXPORT_SOURCES)
 
 
 def __getattr__(name: str) -> Any:

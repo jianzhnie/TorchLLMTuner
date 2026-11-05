@@ -219,6 +219,58 @@ def _parameter_precision_norm(
     return torch.tensor(0.0) if total is None else total.pow(1.0 / norm_type)
 
 
+def build_packed_gradient_groups(
+    parameters: list[torch.Tensor],
+    packed_parameters: Iterable[tuple[torch.Tensor, torch.Tensor]] | None,
+    *,
+    expert_ids: set[int],
+    tp_ids: set[int],
+) -> dict[int, tuple[torch.Tensor, ...]]:
+    """Validate packed norm groups before any norm collective or scaling.
+
+    The first gradient owns the pair; an empty entry skips the second gradient
+    during norm calculation. Both gradients must therefore have distinct
+    identities, compatible layouts and the same reduction ownership.
+    """
+    packed_gradients: dict[int, tuple[torch.Tensor, ...]] = {}
+    parameter_ids = {id(p) for p in parameters}
+    for first, second in packed_parameters or ():
+        if id(first) not in parameter_ids or id(second) not in parameter_ids:
+            raise ValueError("Packed norm parameters must belong to the clipped set")
+        if first.grad is None or second.grad is None:
+            raise ValueError("Packed norm parameters require both gradients")
+        if (
+            first.grad is second.grad
+            or id(first.grad) in packed_gradients
+            or id(second.grad) in packed_gradients
+        ):
+            raise ValueError("Packed norm parameter groups must be disjoint")
+        if first.grad.shape != second.grad.shape or first.grad.ndim != 3:
+            raise ValueError(
+                "Packed gate/up norm requires equal three-dimensional shapes"
+            )
+        if (
+            first.grad.dtype != second.grad.dtype
+            or first.grad.device != second.grad.device
+        ):
+            raise ValueError("Packed norm gradients must share dtype and device")
+        if isinstance(first.grad, DTensor) != isinstance(second.grad, DTensor):
+            raise ValueError("Packed norm gradients must share tensor layout")
+        if isinstance(first.grad, DTensor) and (
+            first.grad.device_mesh != second.grad.device_mesh
+            or first.grad.placements != second.grad.placements
+        ):
+            raise ValueError("Packed norm gradients must share mesh and placements")
+        if (id(first) in expert_ids, id(first) in tp_ids) != (
+            id(second) in expert_ids,
+            id(second) in tp_ids,
+        ):
+            raise ValueError("Packed norm parameters must share reduction ownership")
+        packed_gradients[id(first.grad)] = (first.grad, second.grad)
+        packed_gradients[id(second.grad)] = ()
+    return packed_gradients
+
+
 def clip_grad_norm_(
     parameters: torch.Tensor | Iterable[torch.Tensor],
     max_norm: float,
@@ -312,38 +364,9 @@ def clip_grad_norm_(
     expert_grads = [
         p.grad for p in parameters if id(p) in expert_ids and p.grad is not None
     ]
-    packed_gradients = {}
-    parameter_ids = {id(p) for p in parameters}
-    for first, second in packed_parameters or ():
-        if id(first) not in parameter_ids or id(second) not in parameter_ids:
-            raise ValueError("Packed norm parameters must belong to the clipped set")
-        if first.grad is None or second.grad is None:
-            raise ValueError("Packed norm parameters require both gradients")
-        if id(first.grad) in packed_gradients or id(second.grad) in packed_gradients:
-            raise ValueError("Packed norm parameter groups must be disjoint")
-        if first.grad.shape != second.grad.shape or first.grad.ndim != 3:
-            raise ValueError(
-                "Packed gate/up norm requires equal three-dimensional shapes"
-            )
-        if (
-            first.grad.dtype != second.grad.dtype
-            or first.grad.device != second.grad.device
-        ):
-            raise ValueError("Packed norm gradients must share dtype and device")
-        if isinstance(first.grad, DTensor) != isinstance(second.grad, DTensor):
-            raise ValueError("Packed norm gradients must share tensor layout")
-        if isinstance(first.grad, DTensor) and (
-            first.grad.device_mesh != second.grad.device_mesh
-            or first.grad.placements != second.grad.placements
-        ):
-            raise ValueError("Packed norm gradients must share mesh and placements")
-        if (id(first) in expert_ids, id(first) in tp_ids) != (
-            id(second) in expert_ids,
-            id(second) in tp_ids,
-        ):
-            raise ValueError("Packed norm parameters must share reduction ownership")
-        packed_gradients[id(first.grad)] = (first.grad, second.grad)
-        packed_gradients[id(second.grad)] = ()
+    packed_gradients = build_packed_gradient_groups(
+        parameters, packed_parameters, expert_ids=expert_ids, tp_ids=tp_ids
+    )
 
     def _local_norm(grads: list[torch.Tensor]) -> torch.Tensor:
         if norm_precision == "parameter":

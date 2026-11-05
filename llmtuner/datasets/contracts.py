@@ -152,7 +152,11 @@ class DatasetIterationPolicy:
 
 @dataclass
 class Batch:
-    """One micro-batch, on CPU: ``input_ids`` and ``labels`` of shape ``(B, T)``."""
+    """Synthetic microbatch with ``input_ids`` and ``labels`` shaped ``(B, T)``.
+
+    Loaders emit host tensors; Trainer transfers them at consumption. Labels
+    are unshifted targets, unlike the aligned labels in ``TrainerBatch``.
+    """
 
     input_ids: torch.Tensor
     labels: torch.Tensor

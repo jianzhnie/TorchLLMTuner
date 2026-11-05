@@ -159,8 +159,9 @@ class PipelineTextCollator(Collator):
                 input_ids=rows[0].input_ids[:0],
                 labels=rows[0].labels[:0],
             )
-            for _ in range(self._num_microbatches - len(batches)):
-                batches.append(self._collator([empty_row]))
+            empty_batch = self._collator([empty_row])
+            # Stack copies each row into independent output storage below.
+            batches.extend([empty_batch] * (self._num_microbatches - len(batches)))
         result: TrainerBatch = {}
         for key in ("input", "labels", "positions", "padding_mask"):
             template = batches[0][key]
