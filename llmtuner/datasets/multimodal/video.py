@@ -1,9 +1,8 @@
 """Video processing utilities for multimodal datasets.
 
-Vendored from torchtitan ``hf_datasets/multimodal/utils/video.py``. ``av`` is
-imported inside ``load_video`` rather than at module scope so the rest of the
-multimodal layer imports without a video backend installed; that was already
-true upstream and is what keeps a text-only or image-only run from needing it.
+Vendored from torchtitan ``hf_datasets/multimodal/utils/video.py``. PyAV is
+optional: importing this module does not require a video backend, while
+``load_video`` reports a missing backend before attempting to open a file.
 """
 
 from __future__ import annotations
@@ -17,6 +16,12 @@ import torchvision.transforms.v2.functional as TVF
 from ...utils.logging import get_logger
 from ..contracts import require_positive_integer
 from .image import smart_resize
+
+try:
+    import av
+except ImportError as error:
+    av = None
+    AV_IMPORT_ERROR = error
 
 logger = get_logger(__name__)
 
@@ -52,13 +57,11 @@ def load_video(
     require_positive_integer("max_frames", max_frames)
     if not 1 <= min_frames <= max_frames:
         raise ValueError("frame bounds must satisfy 1 <= min_frames <= max_frames")
-    try:
-        import av
-    except ImportError as error:
+    if av is None:
         raise ImportError(
             "Video loading requires the optional PyAV backend; "
             "install it with `pip install av`."
-        ) from error
+        ) from AV_IMPORT_ERROR
 
     try:
         with av.open(path) as container:

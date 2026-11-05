@@ -7,6 +7,12 @@ import torch
 from ...models.common.moe.experts import GroupedExperts, RoutedExperts
 from .token_dispatch import AllToAllTokenDispatcher, materialize
 
+try:
+    import torch_npu
+except ImportError as error:
+    torch_npu = None
+    TORCH_NPU_IMPORT_ERROR = error
+
 
 class NpuBaselineAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     """Match the baseline's BF16 reduction for repeated token gradients."""
@@ -16,7 +22,10 @@ class NpuBaselineAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             raise TypeError("torchtitan NPU token permutation requires NPU inputs")
         if inputs.shape[0] == 0:
             return inputs[token_indices]
-        import torch_npu
+        if torch_npu is None:
+            raise ImportError(
+                "torchtitan NPU experts require a working torch-npu installation"
+            ) from TORCH_NPU_IMPORT_ERROR
 
         # Indexing has identical forward values but can round a repeated-index
         # input gradient differently from the baseline permutation kernel.
@@ -30,7 +39,10 @@ class NpuBaselineGroupedExperts(GroupedExperts):
     def forward(self, inputs, counts, *, routing_scores):
         if inputs.device.type != "npu" or inputs.dtype != torch.bfloat16:
             raise TypeError("torchtitan EP experts require BF16 NPU inputs")
-        import torch_npu
+        if torch_npu is None:
+            raise ImportError(
+                "torchtitan NPU experts require a working torch-npu installation"
+            ) from TORCH_NPU_IMPORT_ERROR
 
         offsets = counts.cumsum(0, dtype=torch.int32)
         packed = torch.cat((self.w1_EFD, self.w3_EFD), dim=1)

@@ -15,6 +15,19 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RMS
 from llmtuner.errors import UnsupportedCombinationError
 
 
+def isolate_norm_input(
+    module: nn.Module,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Give normalization its own autograd view while preserving residual storage."""
+    if args:
+        value = args[0]
+        return (value.view_as(value), *args[1:]), kwargs
+    value = kwargs["hidden_states"]
+    return args, {**kwargs, "hidden_states": value.view_as(value)}
+
+
 def _validate_dtype(hidden_states: torch.Tensor) -> None:
     if hidden_states.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError("joint RMSNorm supports float16, bfloat16, and float32 inputs")
@@ -124,11 +137,9 @@ def forward_joint_residual_norm(
 
 
 def _validate_norm_hooks(module: nn.Module) -> None:
-    from .normalization_setup import _isolate_norm_input
-
     if (
         any(
-            hook is not _isolate_norm_input
+            hook is not isolate_norm_input
             for hook in module._forward_pre_hooks.values()
         )
         or module._forward_hooks

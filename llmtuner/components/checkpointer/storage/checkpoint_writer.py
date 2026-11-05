@@ -26,6 +26,16 @@ from torch.distributed.checkpoint.storage import WriteResult
 from ....errors import UnsupportedCombinationError
 from . import filesystem
 
+try:
+    from torch.distributed.checkpoint._fsspec_filesystem import (
+        FileSystem as FsspecFileSystem,
+    )
+except ImportError as error:
+    FsspecFileSystem = None
+    _FSSPEC_IMPORT_ERROR = error
+else:
+    _FSSPEC_IMPORT_ERROR = None
+
 
 class GenerationFileSystemWriter(FileSystemWriter):
     """Write fresh shards; publish local or fsspec metadata without pre-deletion."""
@@ -33,11 +43,10 @@ class GenerationFileSystemWriter(FileSystemWriter):
     def __init__(self, path: str | os.PathLike[str], **kwargs: Any) -> None:
         super().__init__(path, **kwargs)
         if filesystem.is_remote(path):
-            # Keep remote storage imports outside local save/worker startup.
-            from torch.distributed.checkpoint._fsspec_filesystem import (
-                FileSystem as FsspecFileSystem,
-            )
-
+            if FsspecFileSystem is None:
+                raise ImportError(
+                    "Remote DCP checkpoints require PyTorch fsspec filesystem support"
+                ) from _FSSPEC_IMPORT_ERROR
             self.fs = FsspecFileSystem()
             self.path = self.fs.init_path(path)
             protocols = self.fs.fs.protocol

@@ -58,6 +58,7 @@ from ..models.common.moe.bias_update import (
     collect_routing_load_metrics,
     reset_routing_statistics,
 )
+from ..parallel.model_compile import rollback_compile_settings_on_error
 from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
 from ..utils.logging import get_logger
@@ -116,8 +117,6 @@ class Trainer:
         the assembly order there is a contract (see its docstring)."""
         compile_settings = nullcontext()
         if getattr(getattr(cfg, "training", None), "compile", False):
-            from ..parallel.model_compile import rollback_compile_settings_on_error
-
             compile_settings = rollback_compile_settings_on_error()
         with rollback_execution_settings_on_error(), compile_settings:
             try:

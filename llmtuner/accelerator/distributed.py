@@ -1,8 +1,8 @@
 """Process-group bootstrap and rank/world queries (vendored, de-mmengined).
 
 ``init_dist_pytorch`` is the trainer's PG entry point; the slurm/mpi variants
-serve standalone scripts. Rank queries read the environment first (before any
-process group exists) and the live group afterwards.
+serve standalone scripts. Rank queries use the live process group when it exists
+and single-process defaults otherwise; device selection reads launcher variables.
 """
 
 # Copyright (c) OpenMMLab. All rights reserved.
@@ -21,6 +21,45 @@ from torch.distributed import ProcessGroup
 from .device import device_type, get_distributed_backend, set_device
 from .tensor_tree import get_tensor_tree_device as get_tensor_tree_device
 from .tensor_tree import move_tensor_tree as move_tensor_tree
+
+try:
+    import torch_npu
+except ImportError as error:
+    torch_npu = None
+    NPU_IMPORT_ERROR = error
+
+try:
+    import torch_mlu
+except ImportError as error:
+    torch_mlu = None
+    MLU_IMPORT_ERROR = error
+
+try:
+    import torch_musa
+except ImportError as error:
+    torch_musa = None
+    MUSA_IMPORT_ERROR = error
+
+
+try:
+    import deepspeed
+except ImportError as error:
+    deepspeed = None
+    DEEPSPEED_IMPORT_ERROR = error
+
+try:
+    import colossalai
+except ImportError as error:
+    colossalai = None
+    COLOSSALAI_IMPORT_ERROR = error
+
+
+# Importing the extension registers the SageMaker process-group backend.
+try:
+    import smdistributed.dataparallel.torch.torch_smddp as torch_smddp
+except ImportError as error:
+    torch_smddp = None
+    SMDDP_IMPORT_ERROR = error
 
 
 def is_distributed() -> bool:
@@ -70,6 +109,10 @@ def init_dist(launcher, backend="nccl", init_backend="torch", **kwargs) -> None:
             'gloo' and 'mpi'. Defaults to 'nccl'.
         **kwargs: keyword arguments are passed to ``init_process_group``.
     """
+    if launcher not in ("pytorch", "mpi", "slurm"):
+        raise ValueError(f"Invalid launcher type: {launcher}")
+    if launcher != "mpi":
+        validate_init_backend(init_backend)
     if device_type == "cpu" and backend == "nccl":
         # 'nccl' is the default spelling, not a choice: on a CPU-only box it
         # can only fail, so fall back to the derived backend (gloo).
@@ -96,8 +139,19 @@ def init_dist(launcher, backend="nccl", init_backend="torch", **kwargs) -> None:
         init_dist_mpi(backend, **kwargs)
     elif launcher == "slurm":
         init_dist_slurm(backend, init_backend=init_backend, **kwargs)
-    else:
-        raise ValueError(f"Invalid launcher type: {launcher}")
+
+
+def validate_init_backend(init_backend: str) -> None:
+    """Reject invalid bootstrap choices before setting devices or launcher state."""
+    if device_type != "cuda" and init_backend != "torch":
+        raise ValueError(
+            f"init_backend={init_backend!r} is not supported on {device_type}"
+        )
+    if init_backend not in ("torch", "deepspeed", "colossalai"):
+        raise ValueError(
+            'supported "init_backend" values are "torch", "deepspeed" '
+            f'and "colossalai", but got {init_backend}'
+        )
 
 
 def init_dist_pytorch(backend, init_backend="torch", **kwargs) -> None:
@@ -108,10 +162,7 @@ def init_dist_pytorch(backend, init_backend="torch", **kwargs) -> None:
             'nccl', 'gloo' and 'mpi'. Defaults to 'nccl'.
         **kwargs: keyword arguments are passed to ``init_process_group``.
     """
-    if device_type != "cuda" and init_backend != "torch":
-        raise ValueError(
-            f"init_backend={init_backend!r} is not supported on {device_type}"
-        )
+    validate_init_backend(init_backend)
     rank = int(os.environ["RANK"])
     # LOCAL_RANK is set by `torch.distributed.launch` since PyTorch 1.1
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -140,18 +191,19 @@ def init_dist_pytorch(backend, init_backend="torch", **kwargs) -> None:
         if init_backend == "torch":
             torch_dist.init_process_group(backend=backend, **kwargs)
         elif init_backend == "deepspeed":
-            import deepspeed
+            if deepspeed is None:
+                raise ImportError(
+                    "init_backend='deepspeed' requires the deepspeed package"
+                ) from DEEPSPEED_IMPORT_ERROR
 
             deepspeed.init_distributed(dist_backend=backend, **kwargs)
         elif init_backend == "colossalai":
-            import colossalai
+            if colossalai is None:
+                raise ImportError(
+                    "init_backend='colossalai' requires the colossalai package"
+                ) from COLOSSALAI_IMPORT_ERROR
 
             colossalai.launch_from_torch(backend=backend, **kwargs)
-        else:
-            raise ValueError(
-                'supported "init_backend" is "torch" or "deepspeed", '
-                f"but got {init_backend}"
-            )
 
 
 def init_dist_mpi(backend, **kwargs) -> None:
@@ -162,16 +214,18 @@ def init_dist_mpi(backend, **kwargs) -> None:
             'nccl', 'gloo' and 'mpi'. Defaults to 'nccl'.
         **kwargs: keyword arguments are passed to ``init_process_group``.
     """
-    if backend == "smddp":
-        try:
-            import smdistributed.dataparallel.torch.torch_smddp  # noqa: F401
-        except ModuleNotFoundError as e:
-            raise ModuleNotFoundError(
-                "Please use an Amazon SageMaker DLC to access smdistributed: "
-                "https://github.com/aws/deep-learning-containers/blob/master"
-                "/available_images.md#sagemaker-framework-containers"
-                "-sm-support-only"
-            ) from e
+    if backend == "smddp" and torch_smddp is None:
+        error_type = (
+            ModuleNotFoundError
+            if isinstance(SMDDP_IMPORT_ERROR, ModuleNotFoundError)
+            else ImportError
+        )
+        raise error_type(
+            "Please use an Amazon SageMaker DLC to access smdistributed: "
+            "https://github.com/aws/deep-learning-containers/blob/master"
+            "/available_images.md#sagemaker-framework-containers"
+            "-sm-support-only"
+        ) from SMDDP_IMPORT_ERROR
     local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
     if device_type not in ("cpu", "cuda"):
         set_device(torch.device(device_type, local_rank))
@@ -200,10 +254,7 @@ def init_dist_slurm(backend, port=None, init_backend="torch", **kwargs) -> None:
         backend (str): Backend of torch.distributed.
         port (int, optional): Master port. Defaults to None.
     """
-    if device_type != "cuda" and init_backend != "torch":
-        raise ValueError(
-            f"init_backend={init_backend!r} is not supported on {device_type}"
-        )
+    validate_init_backend(init_backend)
     proc_id = int(os.environ["SLURM_PROCID"])
     ntasks = int(os.environ["SLURM_NTASKS"])
     # Not sure when this environment variable could be None, so use a fallback
@@ -250,22 +301,23 @@ def init_dist_slurm(backend, port=None, init_backend="torch", **kwargs) -> None:
         torch.cuda.set_device(local_rank)
 
         if init_backend == "deepspeed":
-            import deepspeed
+            if deepspeed is None:
+                raise ImportError(
+                    "init_backend='deepspeed' requires the deepspeed package"
+                ) from DEEPSPEED_IMPORT_ERROR
 
             deepspeed.init_distributed(dist_backend=backend, **kwargs)
         elif init_backend == "colossalai":
-            import colossalai
+            if colossalai is None:
+                raise ImportError(
+                    "init_backend='colossalai' requires the colossalai package"
+                ) from COLOSSALAI_IMPORT_ERROR
 
             colossalai.launch_from_slurm(
                 backend=backend,
                 host=os.environ["MASTER_ADDR"],
                 port=os.environ["MASTER_PORT"],
                 **kwargs,
-            )
-        else:
-            raise ValueError(
-                'supported "init_backend" is "torch" or "deepspeed", '
-                f"but got {init_backend}"
             )
 
 
@@ -434,19 +486,28 @@ def get_comm_device(group: ProcessGroup | None = None) -> torch.device:
     """
     backend = get_backend(group)
     if backend == "hccl":
-        import torch_npu  # noqa: F401
+        if torch_npu is None:
+            raise ImportError(
+                "HCCL communication requires torch-npu"
+            ) from NPU_IMPORT_ERROR
 
         return torch.device("npu", torch.npu.current_device())
     elif backend == torch_dist.Backend.NCCL:
         return torch.device("cuda", torch.cuda.current_device())
     elif backend == "cncl":
-        import torch_mlu  # noqa: F401
+        if torch_mlu is None:
+            raise ImportError(
+                "CNCL communication requires torch-mlu"
+            ) from MLU_IMPORT_ERROR
 
         return torch.device("mlu", torch.mlu.current_device())
     elif backend == "smddp":
         return torch.device("cuda", torch.cuda.current_device())
     elif backend == "mccl":
-        import torch_musa
+        if torch_musa is None:
+            raise ImportError("MCCL communication requires torch-musa") from (
+                MUSA_IMPORT_ERROR
+            )
 
         return torch.device("musa", torch_musa.current_device())
     elif backend == "xccl":

@@ -580,22 +580,6 @@ def _build_whole_tensor_redistribution_plan(
     )
 
 
-def _build_owned_redistribution_plan(
-    storage_regions: Sequence[_StorageRegionMapping],
-    *,
-    participants: tuple[int, ...],
-    owner_rank: int,
-    logical_shape: tuple[int, ...],
-) -> _RedistributionPlan:
-    """Build mirrored routes to one whole-tensor compute owner."""
-    return _build_whole_tensor_redistribution_plan(
-        storage_regions,
-        participants=participants,
-        compute_participants=(owner_rank,),
-        logical_shape=logical_shape,
-    )
-
-
 def _build_dim0_shard_redistribution_plan(
     storage_regions: Sequence[_StorageRegionMapping],
     *,

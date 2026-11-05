@@ -27,6 +27,7 @@ from collections.abc import Sequence
 import torch.distributed as dist
 from transformers import HfArgumentParser
 
+import llmtuner
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.cli_config import PARSER_GROUPS, cli_view
 from llmtuner.config.data_config import DataloaderConfig
@@ -105,9 +106,9 @@ def main() -> None:
             )
     trainer = None
     try:
-        from .trainer import Trainer
-
-        trainer = Trainer(cfg)
+        # The public lazy export keeps configuration parsing independent of the
+        # training engine while all import statements stay at module scope.
+        trainer = llmtuner.Trainer(cfg)
         if cfg.checkpoint.create_seed_checkpoint:
             # Mirrors torchtitan ``train.py``: a seed checkpoint is the unsharded
             # step-0 model, so it must be written from a single process (any

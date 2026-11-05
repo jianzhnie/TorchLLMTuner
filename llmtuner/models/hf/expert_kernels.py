@@ -15,6 +15,12 @@ from ...parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 from ..common.moe.gate import RouterGateLinearFunction
 from ..common.scatter_add import deterministic_scatter_add
 
+try:
+    import torch_npu
+except ImportError as error:
+    torch_npu = None
+    TORCH_NPU_IMPORT_ERROR = error
+
 
 def forward_fp32_topk_router(module: nn.Module, hidden_states: torch.Tensor):
     hidden_states = hidden_states.reshape(-1, module.hidden_dim)
@@ -45,7 +51,10 @@ def forward_torchtitan_moe(module: nn.Module, hidden_states: torch.Tensor):
     ).sum(dim=(0, 1))
     npu_dispatch = hidden_states.device.type == "npu"
     if npu_dispatch:
-        import torch_npu
+        if torch_npu is None:
+            raise ImportError(
+                "NPU kernels require a working torch-npu installation"
+            ) from (TORCH_NPU_IMPORT_ERROR)
 
         routed, permutation = torch_npu.npu_moe_token_permute(hidden_states, expert_ids)
         routed_scores, _ = torch_npu.npu_moe_token_permute(
@@ -64,7 +73,10 @@ def forward_torchtitan_moe(module: nn.Module, hidden_states: torch.Tensor):
         offs=offsets,
     )
     if projected.device.type == "npu":
-        import torch_npu
+        if torch_npu is None:
+            raise ImportError(
+                "NPU kernels require a working torch-npu installation"
+            ) from (TORCH_NPU_IMPORT_ERROR)
 
         hidden = torch_npu.npu_swiglu(projected, dim=-1)
     else:

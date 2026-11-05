@@ -37,11 +37,15 @@ it untouched. The kernel tells the two apart by the mask's Q length (see
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.nn.attention.flex_attention import flex_attention
+from transformers.integrations import flex_attention as hf_flex
 
 from llmtuner.models.common.attention.masks import (
     create_attention_mask,
@@ -50,7 +54,30 @@ from llmtuner.models.common.attention.masks import (
 
 from ..model_compile import maybe_regional_inductor
 
+try:
+    from torch.distributed.tensor.experimental._context_parallel._cp_custom_ops import (  # noqa: E501
+        flex_cp_allgather,
+    )
+except ImportError as error:
+    flex_cp_allgather = None
+    _CP_ALLGATHER_IMPORT_ERROR = error
+else:
+    _CP_ALLGATHER_IMPORT_ERROR = None
+
 __all__ = ["CPFlexKernel", "DualCPFlexKernel"]
+
+
+def resolve_cp_allgather() -> Callable:
+    """Require the private Flex gather only for kernels that actually use it."""
+    if flex_cp_allgather is None:
+        raise ImportError(
+            "CPFlexKernel relies on torch's private ``flex_cp_allgather`` "
+            "(torch.distributed.tensor.experimental._context_parallel."
+            "_cp_custom_ops), which this torch build does not provide. It "
+            "is present in torch 2.6+; upgrade torch, or set cp=1."
+        ) from _CP_ALLGATHER_IMPORT_ERROR
+    return flex_cp_allgather
+
 
 # q/k/v arrive HF-shaped: (batch, heads, seq, dim). The sequence axis the CP
 # input sharding split is dim 2 of this layout.
@@ -153,18 +180,14 @@ def run_flex(module, q, k, v, block_mask, kwargs) -> torch.Tensor:
     attention kwargs it cannot express.
     """
     if q.is_cuda:
-        from transformers.integrations.flex_attention import (
-            flex_attention_forward,
-        )
-
         with maybe_regional_inductor(
             {}, enabled=getattr(module, "_regional_inductor_enabled", False)
         ):
-            out, _ = flex_attention_forward(module, q, k, v, block_mask, **kwargs)
+            out, _ = hf_flex.flex_attention_forward(
+                module, q, k, v, block_mask, **kwargs
+            )
         return out.transpose(1, 2)
     reject_unrepresentable_attention_kwargs(kwargs)
-    from torch.nn.attention.flex_attention import flex_attention
-
     return flex_attention(
         q,
         k,
@@ -244,18 +267,7 @@ class CPFlexKernel(nn.Module):
         self.packed = packed
         self._cp_group = cp_mesh.get_group()
         if strategy == "kv_allgather":
-            try:
-                from torch.distributed.tensor.experimental._context_parallel._cp_custom_ops import (  # noqa: E501
-                    flex_cp_allgather,
-                )
-            except ImportError as e:  # pragma: no cover - torch version guard
-                raise ImportError(
-                    "CPFlexKernel relies on torch's private ``flex_cp_allgather`` "
-                    "(torch.distributed.tensor.experimental._context_parallel."
-                    "_cp_custom_ops), which this torch build does not provide. It "
-                    "is present in torch 2.6+; upgrade torch, or set cp=1."
-                ) from e
-            self._flex_cp_allgather = flex_cp_allgather
+            self._flex_cp_allgather = resolve_cp_allgather()
             self._cp_pg_name = c10d._get_process_group_name(cp_mesh.get_group())
         # Ulysses rebuilds the full-length causal mask per forward (see the
         # module docstring); cache it per (length, device). The cache lives on
@@ -373,11 +385,7 @@ class DualCPFlexKernel(nn.Module):
 
     def __init__(self, *, kv_mesh: DeviceMesh, ulysses_mesh: DeviceMesh) -> None:
         super().__init__()
-        from torch.distributed.tensor.experimental._context_parallel._cp_custom_ops import (  # noqa: E501
-            flex_cp_allgather,
-        )
-
-        self._flex_cp_allgather = flex_cp_allgather
+        self._flex_cp_allgather = resolve_cp_allgather()
         self._kv_pg_name = c10d._get_process_group_name(kv_mesh.get_group())
         self._ulysses_group = ulysses_mesh.get_group()
 

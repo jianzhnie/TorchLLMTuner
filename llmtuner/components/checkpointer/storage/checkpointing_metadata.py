@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pickle
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from types import MethodType
 from typing import Any
 
@@ -13,6 +13,12 @@ from torch.distributed import ProcessGroup
 
 from ....accelerator.distributed import get_comm_device
 from ....utils.logging import get_logger
+
+try:
+    from torch_checkpointing.metadata_manager import DefaultMetadataManager
+except ImportError as error:
+    DefaultMetadataManager = None
+    BACKEND_IMPORT_ERROR = error
 
 logger = get_logger(__name__)
 
@@ -42,9 +48,17 @@ def _gather_pickled_metadata(
 def adapt_npu_metadata_gather(manager: Any) -> bool:
     if not dist.is_initialized() or get_comm_device().type != "npu":
         return False
-    if version("torch_checkpointing") != "0.1.0":
+    try:
+        release = version("torch_checkpointing")
+    except PackageNotFoundError:
+        # Source installs may expose the module without distribution metadata.
         return False
-    from torch_checkpointing.metadata_manager import DefaultMetadataManager
+    if release != "0.1.0":
+        return False
+    if DefaultMetadataManager is None:
+        raise ImportError(
+            "torch_checkpointing metadata_manager API is unavailable"
+        ) from (BACKEND_IMPORT_ERROR)
 
     metadata = getattr(manager, "_metadata_manager", None)
     if type(metadata) is not DefaultMetadataManager:

@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from ...accelerator.collectives import all_reduce
+from ...components.optimizer.adamw_swap import AdamWSwap
+from ...memory.activation_swap import activation_swap_metrics
 from ...models.common.aux_loss import collect_aux_loss_metrics
 from .reductions import TrainingReductionMeshes
 
@@ -20,12 +22,8 @@ def collect_resource_metrics(trainer: Trainer) -> dict[str, float]:
     Activation events are measured only when activation swap is configured.
     Byte counters are cumulative; device transfer seconds consume the log window.
     """
-    from ...components.optimizer.adamw_swap import AdamWSwap
-
     result = {}
     if getattr(trainer.cfg, "activation_swap", False):
-        from ...memory.activation_swap import activation_swap_metrics
-
         result.update(
             {
                 f"swap/activation_local/{key}": float(value)

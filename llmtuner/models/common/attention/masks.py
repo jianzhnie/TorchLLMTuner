@@ -14,7 +14,7 @@ Two mask families, and the difference is the consumer:
   whose own attention code treats the mask as a plain tensor -- DSA models call
   ``.dim()`` on it and add it to the scores.
 
-The flex import is deliberately lazy (see ``flex_ops``): the modifiers, the
+The flex import is optional (see ``flex_ops``): the modifiers, the
 metadata builder and the dense builder all work without ``torch.nn.attention``,
 so a CPU-only or pre-flex torch can still import this module and run those.
 
@@ -39,6 +39,14 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask
+except ImportError as error:
+    create_block_mask = None
+    _FLEX_IMPORT_ERROR = error
+else:
+    _FLEX_IMPORT_ERROR = None
 
 if TYPE_CHECKING:
     # Annotation-only, and a string at runtime (``from __future__ import
@@ -317,11 +325,13 @@ def create_varlen_metadata_for_document(
 def flex_ops() -> tuple[Callable, Callable, bool]:
     """``(create_block_mask, compiled, supports_separate_full_blocks)``.
 
-    Resolved once, on first use. The import and the ``torch.compile`` are both
-    things a consumer of the dense-mask or metadata helpers should not pay for
-    -- and on a torch build without flex they would fail at import.
+    Compile once, on first use, so dense-mask and metadata consumers do not
+    trigger compilation or require an available Flex implementation.
     """
-    from torch.nn.attention.flex_attention import create_block_mask
+    if create_block_mask is None:
+        raise ImportError("Flex masks require torch.nn.attention.flex_attention") from (
+            _FLEX_IMPORT_ERROR
+        )
 
     supports_separate_full_blocks = (
         "separate_full_blocks" in inspect.signature(create_block_mask).parameters

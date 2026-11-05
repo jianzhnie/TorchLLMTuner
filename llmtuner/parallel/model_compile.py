@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import warnings
 from collections.abc import Callable, Iterator
 from functools import wraps
 
@@ -47,7 +46,10 @@ import torch
 import torch._dynamo.config as dynamo_config
 import torch._functorch.config as functorch_config
 import torch._inductor.config as inductor_config
+import torch.fx.traceback as fx_traceback
 import torch.nn as nn
+from torch._dynamo.backends.common import aot_autograd
+from torch._dynamo.backends.registry import lookup_backend
 from torch.distributed.device_mesh import DeviceMesh
 
 from llmtuner.config.compile_config import CompileConfig
@@ -57,6 +59,13 @@ from ..accelerator.capabilities import has
 from ..accelerator.device import device_type
 from ..models.common.moe.layer import collect_moe_layers
 from ..utils.logging import get_logger
+from .tensor_parallel.linear_ops import enable_symm_mem
+
+try:
+    from torch.fx.passes.regional_inductor import regional_inductor
+except ImportError:
+    # Older torch versions still support ordinary whole-model/block compilation.
+    regional_inductor = None
 
 logger = get_logger(__name__)
 
@@ -109,8 +118,6 @@ def validate_compile_environment(config: CompileConfig | None) -> None:
     """Resolve the selected backend before parallel transforms modify the model."""
     backend = "inductor" if config is None else config.backend
     validate_compile_backend(backend)
-    from torch._dynamo.backends.registry import lookup_backend
-
     lookup_backend(backend)
 
 
@@ -273,13 +280,7 @@ def maybe_enable_async_tp(
         )
     if tp_mesh.ndim != 1 or tp_mesh.size() <= 1:
         raise ValueError("async TP requires a one-dimensional TP mesh with size > 1")
-    from torch.distributed._symmetric_memory import enable_symm_mem_for_group
-
-    group_name = tp_mesh.get_group().group_name
-    # PyTorch owns registration and already returns early for registered groups.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)
-        enable_symm_mem_for_group(group_name)
+    enable_symm_mem(tp_mesh.get_group())
 
     inductor_config._micro_pipeline_tp = True
     logger.info("Async TP is enabled")
@@ -314,7 +315,7 @@ def maybe_regional_inductor_backend(model: nn.Module, backend: str) -> str | Cal
             "or 'aot_eager'."
         )
 
-    if not has("fx_regional_inductor"):
+    if not has("fx_regional_inductor") or regional_inductor is None:
         raise EnvironmentUnsupportedError(
             "compile backend 'aot_eager' on a flex-attention model needs "
             "torch.fx.passes.regional_inductor to scoop the flex region "
@@ -322,9 +323,6 @@ def maybe_regional_inductor_backend(model: nn.Module, backend: str) -> str | Cal
             "not carry. Upgrade torch, use backend='inductor', or run "
             "without compile."
         )
-    from torch._dynamo.backends.common import aot_autograd
-    from torch.fx.passes.regional_inductor import regional_inductor
-
     compiled_backend = aot_autograd(
         fw_compiler=regional_inductor, bw_compiler=regional_inductor
     )
@@ -351,8 +349,6 @@ def maybe_regional_inductor(
     """
     if not enabled:
         return contextlib.nullcontext()
-    import torch.fx.traceback as fx_traceback
-
     return fx_traceback.annotate(
         {"compile_with_inductor": {"inductor_configs": inductor_configs}}
     )

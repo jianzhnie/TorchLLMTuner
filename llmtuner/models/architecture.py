@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from .kimi.kimi_linear_config import KimiLinearConfig
+
+KIMI_MODEL_IMPORT_ERROR = None
+try:
+    from .kimi.model import KimiLinearForCausalLM
+except ImportError as error:
+    KIMI_MODEL_IMPORT_ERROR = error
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig, PreTrainedModel
@@ -30,19 +38,11 @@ class ModelArchitecture:
         return cls(model_type, config_type, lambda: config_type, model_class_loader)
 
 
-def _load_kimi_config_type() -> type[PretrainedConfig]:
-    from .kimi.kimi_linear_config import KimiLinearConfig
-
-    return KimiLinearConfig
-
-
-def _build_kimi_config(**kwargs: Any) -> PretrainedConfig:
-    return _load_kimi_config_type()(**kwargs)
-
-
 def _load_kimi_model_class() -> type[PreTrainedModel]:
-    from .kimi.model import KimiLinearForCausalLM
-
+    if KIMI_MODEL_IMPORT_ERROR is not None:
+        raise ImportError(
+            f"Kimi Linear model dependencies are unavailable: {KIMI_MODEL_IMPORT_ERROR}"
+        ) from KIMI_MODEL_IMPORT_ERROR
     return KimiLinearForCausalLM
 
 
@@ -79,10 +79,9 @@ def registered_model_architectures() -> tuple[ModelArchitecture, ...]:
 
 
 register_model_architecture(
-    ModelArchitecture(
-        model_type="kimi_linear",
-        config_factory=_build_kimi_config,
-        config_type_loader=_load_kimi_config_type,
+    ModelArchitecture.from_types(
+        "kimi_linear",
+        config_type=KimiLinearConfig,
         model_class_loader=_load_kimi_model_class,
     )
 )

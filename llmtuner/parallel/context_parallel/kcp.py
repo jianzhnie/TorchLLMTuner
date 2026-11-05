@@ -14,21 +14,26 @@ import torch.nn.functional as F
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_comm_device, get_world_size
+from ...models.kimi.latent_attention import KimiLatentAttention
 from .attention import HeadToSeq, SeqToHead
+
+try:
+    from fla.modules.conv.causal_conv1d import causal_conv1d
+    from triton_ascend_kernels.attention.fla.kda import chunk_kda
+    from triton_ascend_kernels.attention.fla.kda.cp import build_cp_context
+except ImportError as error:
+    causal_conv1d = chunk_kda = build_cp_context = None
+    KCP_IMPORT_ERROR = error
 
 
 def _kcp_runtime():
-    """Load KCP kernels only when a KDA model actually requests them."""
-    try:
-        from fla.modules.conv.causal_conv1d import causal_conv1d
-        from triton_ascend_kernels.attention.fla.kda import chunk_kda
-        from triton_ascend_kernels.attention.fla.kda.cp import build_cp_context
-    except ImportError as exc:
+    """Require the optional KCP kernel set before applying this strategy."""
+    if any(kernel is None for kernel in (causal_conv1d, chunk_kda, build_cp_context)):
         raise ImportError(
             "KCP requires `fla` and `triton_ascend_kernels` with KDA context "
             "parallel support. Install the Ascend KCP runtime or use another "
             "context_parallel_strategy."
-        ) from exc
+        ) from KCP_IMPORT_ERROR
     return causal_conv1d, chunk_kda, build_cp_context
 
 
@@ -263,8 +268,6 @@ def kcp_mla_attention(group):
 
 def apply_kcp(model: nn.Module, cp_mesh) -> int:
     """Patch every structurally recognized KDA module and return its count."""
-    from ...models.kimi.latent_attention import KimiLatentAttention
-
     required = ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias")
     if any(
         (

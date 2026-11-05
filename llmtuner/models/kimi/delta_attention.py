@@ -44,7 +44,7 @@
 """Kimi Delta Attention training projections and recurrent CPU reference.
 
 Adapted from FSDPTurbo 0af4eca models/kimi/modeling_kimi_linear.py.
-Accelerator execution uses optional production KDA kernels, loaded on demand.
+Accelerator execution requires the matching optional production KDA kernel.
 """
 
 import torch
@@ -54,6 +54,21 @@ from torch.nn import functional as F
 from .causal_convolution import KimiCausalConvolution
 from .kimi_linear_config import KimiLinearConfig
 from .normalization import KimiGatedRMSNorm
+
+NPU_KDA_IMPORT_ERROR = None
+ACCELERATOR_KDA_IMPORT_ERROR = None
+
+try:
+    from triton_ascend_kernels.attention.fla.kda import chunk_kda as npu_chunk_kda
+except ImportError as error:
+    npu_chunk_kda = None
+    NPU_KDA_IMPORT_ERROR = error
+
+try:
+    from fla.ops.kda import chunk_kda as accelerator_chunk_kda
+except ImportError as error:
+    accelerator_chunk_kda = None
+    ACCELERATOR_KDA_IMPORT_ERROR = error
 
 
 def recurrent_kda(q, k, v, g, beta, A_log, dt_bias, lower_bound=None):
@@ -195,9 +210,16 @@ class KimiDeltaAttention(nn.Module):
             )
         else:
             if hidden_states.device.type == "npu":
-                from triton_ascend_kernels.attention.fla.kda import chunk_kda
+                chunk_kda = npu_chunk_kda
+                import_error = NPU_KDA_IMPORT_ERROR
             else:
-                from fla.ops.kda import chunk_kda
+                chunk_kda = accelerator_chunk_kda
+                import_error = ACCELERATOR_KDA_IMPORT_ERROR
+            if chunk_kda is None:
+                raise ImportError(
+                    f"Kimi KDA on {hidden_states.device.type} requires its optional "
+                    "KDA kernel runtime (triton_ascend_kernels on NPU, fla otherwise)"
+                ) from import_error
             output, _ = chunk_kda(
                 q=q,
                 k=k,

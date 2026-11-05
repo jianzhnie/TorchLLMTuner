@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from llmtuner.parallel.expert_parallel.domino_dispatch import DominoRoutedExperts
 
+from ...accelerator.device import device_type
 from ...accelerator.distributed import get_rank, get_world_size
 from ...models.common.aux_loss import AuxLoss
 from ...models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
@@ -20,6 +21,7 @@ from ...models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
+from ...models.hf.expert_kernels import forward_torchtitan_moe
 from .. import compatibility
 from ..tensor_parallel.linear_ops import all_gather_along, reduce_scatter_along
 from .checkpointing import mark_experts_ep_sharded
@@ -32,6 +34,12 @@ from .hf_inspection import (
     resolve_shared_expert,
     resolve_top_k,
     router_of,
+)
+from .mc2_dispatch import MC2GroupedExperts, MC2RoutedExperts
+from .npu_baseline_experts import (
+    NpuBaselineAllToAllTokenDispatcher,
+    NpuBaselineGroupedExperts,
+    NpuBaselineRoutedExperts,
 )
 from .token_dispatch import (
     AllToAllTokenDispatcher,
@@ -129,9 +137,6 @@ def convert_block(
     lo = ep_rank * num_local
 
     num_expert_groups, num_limited_groups = read_expert_groups(block, router_gate)
-    from ...accelerator.device import device_type
-    from ...models.hf.expert_kernels import forward_torchtitan_moe
-
     original_forward = block.__dict__.get("_tp_moe_original_forward", block.forward)
     baseline_npu = (
         device_type == "npu"
@@ -142,12 +147,8 @@ def convert_block(
             "torchtitan NPU experts with EP require token_dispatcher='alltoall'"
         )
     if baseline_npu:
-        from .npu_baseline_experts import NpuBaselineGroupedExperts
-
         grouped = NpuBaselineGroupedExperts(dim, hidden, num_local)
     elif token_dispatcher == "mc2":
-        from .mc2_dispatch import MC2GroupedExperts
-
         grouped = MC2GroupedExperts(dim, hidden, num_local)
     else:
         grouped = GroupedExperts(dim, hidden, num_local)
@@ -203,8 +204,6 @@ def convert_block(
         dispatcher = LocalTokenDispatcher(num_experts, top_k)
     else:
         if baseline_npu:
-            from .npu_baseline_experts import NpuBaselineAllToAllTokenDispatcher
-
             dispatcher = NpuBaselineAllToAllTokenDispatcher(num_experts, top_k)
         else:
             dispatcher = AllToAllTokenDispatcher(num_experts, top_k)
@@ -219,12 +218,8 @@ def convert_block(
         DominoRoutedExperts if token_dispatcher == "domino" else RoutedExperts
     )
     if token_dispatcher == "mc2":
-        from .mc2_dispatch import MC2RoutedExperts
-
         routed_experts_cls = MC2RoutedExperts
     if baseline_npu and ep_group is not None:
-        from .npu_baseline_experts import NpuBaselineRoutedExperts
-
         routed_experts_cls = NpuBaselineRoutedExperts
     elif baseline_npu:
         # Local conversion needs the generic local dispatch contract until the

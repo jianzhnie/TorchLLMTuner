@@ -18,7 +18,20 @@ from transformers.modeling_outputs import MoeModelOutputWithPast
 
 from ...accelerator.collectives import synchronize_local_errors
 from .attention import HeadToSeq, SeqToHead
-from .compression_windows import CompressionWindowExchange
+from .compression_windows import (
+    CompressionWindowExchange,
+    compress_csa_windows,
+    compress_hca_windows,
+    select_csa_windows,
+)
+
+try:
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+        apply_rotary_pos_emb,
+    )
+except ImportError as error:
+    apply_rotary_pos_emb = None
+    DEEPSEEK_IMPORT_ERROR = error
 
 
 def compressor_ulysses_attention(
@@ -174,11 +187,6 @@ def compressor_attention_forward(group):
     modeling_deepseek_v4.py (Apache-2.0). This factory does not install itself;
     the model integration must enforce contiguous inputs and supported layers.
     """
-    from .compression_windows import (
-        compress_csa_windows,
-        compress_hca_windows,
-        select_csa_windows,
-    )
 
     def forward(
         module,
@@ -189,9 +197,10 @@ def compressor_attention_forward(group):
         past_key_values=None,
         **kwargs,
     ):
-        from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-            apply_rotary_pos_emb,
-        )
+        if apply_rotary_pos_emb is None:
+            raise ImportError(
+                "DeepSeek V4 CP requires a compatible transformers build"
+            ) from DEEPSEEK_IMPORT_ERROR
 
         with synchronize_local_errors(
             "Compressor module input validation", group=group

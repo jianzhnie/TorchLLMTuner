@@ -1,54 +1,15 @@
-"""Training metrics: collect them, scale them, and send them somewhere.
+"""Training metric sinks, device-memory sampling, and console reporting.
 
-Vendored from torchtitan's ``observability/metrics.py``. The shape is kept --
-text loggers behind a common ``BaseLogger``, a ``MetricsProcessor`` that owns
-the timing and derivations, device-memory sampling via a
-``DeviceMemoryMonitor`` -- because the split is what makes the derivations
-(throughput, MFU, time per step, data-loading share) testable without a
-TensorBoard writer or a GPU in the room.
+Adapted from torchtitan's ``observability/metrics.py``. Compute arithmetic lives
+in ``compute_metrics``; synchronized per-step and steady-window observations live
+in ``training_observer``. This module retains legacy log-window metrics for
+existing consumers and publishes the synchronized observations when available.
 
-Departures from torchtitan, all subtractions:
-
-* **No fault tolerance.** torchtitan threads ``ft_enable``/``ft_replica_id``
-  into both the log directory layout and the metrics rank. llmtuner has no
-  replica concept, so both are gone rather than carried as dead flags.
-
-* **No ``OptimizersContainer`` / ``model_parts``.** torchtitan reaches into
-  both to compute a per-optimizer-steps metric. llmtuner's loop tracks one step
-  counter, so the metric has no source and no consumer here.
-
-* **No wandb failure swallowing.** torchtitan catches every exception from
-  ``WandBLogger`` and logs it, on the grounds that losing experiment tracking
-  should not kill a run. llmtuner lets it raise -- the checkpointer's config
-  rejects options it cannot honour for the same reason, and a mistyped
-  ``WANDB_PROJECT`` that silently disables tracking is the failure mode this
-  avoids. Only the missing-package case is caught, because that one is an
-  installable dependency rather than a misconfiguration.
-
-* **No ``has_quantization``.** torchtitan suppresses MFU when the run is
-  quantized, since the peak it divides by is a dense BF16 figure. llmtuner has no
-  quantization path, so the flag has no producer and a value it could never be
-  set to is a branch nothing can exercise.
-
-* **Colour is vetoed by the terminal, not only by the config.** See
-  ``utils/monitoring.colors_enabled``.
-
-* **MFU is suppressed when the device is unknown**, rather than assuming A100
-  peak. A ratio measured against the wrong denominator is worse than no ratio,
-  and on a laptop CPU the denominator is not a number at all.
-
-* **A window with no recorded data-loading time reports zero**, rather than
-  dividing by the number of samples it has (which is zero). torchtitan's
-  trainer times every fetch, so it never meets the empty list; anything that
-  logs without one -- a validation pass before the first training step, or a
-  caller that does not instrument its loader -- crashes there.
-
-One addition: ``MetricsProcessor.log`` never calls into ``torch.distributed``.
-torchtitan's ``_get_metrics_rank`` returns rank 0 unconditionally outside the
-PP case, and its logger construction calls ``torch.distributed.get_rank()``
-regardless -- so every rank of a gloo-rendezvoused CPU run builds the same
-logger. llmtuner reads the rank from ``utils/logging``, which already has to
-answer "which rank am I" for the log prefix and handles the single-process case.
+Logging performs no collectives. The trainer synchronizes pipeline loss metrics
+before reporting; writer ownership and console rank filtering are independent.
+Unknown device peaks suppress MFU, and empty loading windows report zero.
+Each external sink owns its resources and propagates configuration/runtime
+failures instead of silently disabling tracking.
 """
 
 from __future__ import annotations
@@ -60,6 +21,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from torch.distributed.pipelining.schedules import (
+    ScheduleDualPipeV,
+    ScheduleZBVZeroBubble,
+    get_schedule_class,
+)
+
+from ..accelerator.device import device_module, device_type
 from ..utils.logging import get_distributed_rank, get_logger
 from ..utils.monitoring import (
     Color,
@@ -70,6 +38,18 @@ from ..utils.monitoring import (
     get_peak_flops,
 )
 from .compute_metrics import compute_utilization, model_tflops, token_throughput
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError as error:
+    SummaryWriter = None
+    TENSORBOARD_IMPORT_ERROR = error
+
+try:
+    import wandb
+except ImportError as error:
+    wandb = None
+    WANDB_IMPORT_ERROR = error
 
 if TYPE_CHECKING:
     # Annotation-only. ``parallel_dims`` imports the training config, which
@@ -127,8 +107,6 @@ class DeviceMemoryMonitor:
         if device_type != "cpu":
             # Clear startup residue from the caching allocator so the first
             # window's max_reserved baseline is the training loop's own.
-            from ..accelerator.device import device_module
-
             device_module.empty_cache()
 
     @staticmethod
@@ -144,8 +122,6 @@ class DeviceMemoryMonitor:
 
     def _device_module(self):
         if self.device_type != "cpu":
-            from ..accelerator.device import device_module
-
             return device_module
         return None
 
@@ -199,8 +175,6 @@ class DeviceMemoryMonitor:
 
 def build_device_memory_monitor() -> DeviceMemoryMonitor:
     """Build a monitor and say which device it is watching."""
-    from ..accelerator.device import device_type
-
     monitor = DeviceMemoryMonitor(device_type)
     if device_type != "cpu":
         logger.info(
@@ -226,9 +200,10 @@ class TensorBoardLogger(BaseLogger):
     """Writes scalars to a TensorBoard event directory."""
 
     def __init__(self, log_dir: str, tag: str | None = None):
-        # Imported here rather than at module scope: tensorboard is a large
-        # import, and a run that logs to stdout only should not pay for it.
-        from torch.utils.tensorboard import SummaryWriter
+        if SummaryWriter is None:
+            raise ImportError(
+                "TensorBoard logging requires the tensorboard package"
+            ) from TENSORBOARD_IMPORT_ERROR
 
         self.tag = tag
         self.writer = SummaryWriter(log_dir, max_queue=1000)
@@ -260,8 +235,10 @@ class WandBLogger(BaseLogger):
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
     ):
-        # Deferred so that a run without wandb enabled does not import it.
-        import wandb
+        if wandb is None:
+            raise ImportError(
+                "WandB logging requires the wandb package"
+            ) from WANDB_IMPORT_ERROR
 
         self.tag = tag
 
@@ -348,12 +325,6 @@ def is_v_schedule(pp_schedule: str) -> bool:
     ScheduleZBVZeroBubble and ScheduleDualPipeV pair stage 0 with stage N-1 on
     rank 0, and a string test would miss the second.
     """
-    from torch.distributed.pipelining.schedules import (
-        ScheduleDualPipeV,
-        ScheduleZBVZeroBubble,
-        get_schedule_class,
-    )
-
     return get_schedule_class(pp_schedule) in (
         ScheduleZBVZeroBubble,
         ScheduleDualPipeV,

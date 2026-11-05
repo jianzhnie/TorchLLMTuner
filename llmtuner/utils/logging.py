@@ -33,6 +33,8 @@ from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from colorama import Fore, Style
 
+from ..accelerator import distributed
+
 
 @dataclass
 class RecordState:
@@ -238,12 +240,10 @@ def get_distributed_rank() -> int:
     separate things, and it needs the first to decide the second.
     """
     try:
-        from ..accelerator.distributed import get_rank, is_distributed
-
         # get_rank() returns 0 before initialization, so check first to retain
         # torchrun's environment rank during startup.
-        if is_distributed():
-            return get_rank()
+        if distributed.is_distributed():
+            return distributed.get_rank()
     except Exception:
         # Logging here would query rank again through the formatter/filter and
         # recurse when distributed discovery fails with DEBUG logging enabled.

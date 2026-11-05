@@ -137,30 +137,39 @@ class TrainingObserver:
         }
         if compute["utilization_percent"] is not None:
             result["train/mfu_percent"] = compute["utilization_percent"]
+        result.update(
+            self.record_steady_step(seconds=seconds, tokens=tokens, world=world)
+        )
+        self.metrics.latest_training_observations = result
+        return result
+
+    def record_steady_step(
+        self, *, seconds: float, tokens: int, world: int
+    ) -> dict[str, float]:
+        """Record a completed step and summarize the bounded post-warmup window."""
         self.completed += 1
         if self.completed > self.metrics.config.metrics_warmup_steps:
             self.samples.append((seconds, tokens))
-        if self.samples:
-            durations = [sample[0] for sample in self.samples]
-            steady_tps = sum(sample[1] for sample in self.samples) / sum(durations)
-            result.update(
-                {
-                    "steady/samples": float(len(self.samples)),
-                    "steady/step_p50_seconds": percentile(durations, 0.5),
-                    "steady/step_p90_seconds": percentile(durations, 0.9),
-                    "steady/tps_per_device": steady_tps / world,
-                    "steady/tflops_per_device": model_tflops(
-                        self.metrics.num_flops_per_token, steady_tps / world
-                    ),
-                }
-            )
-            steady_compute = compute_utilization(
-                tokens_per_second=steady_tps,
-                flops_per_token=self.metrics.num_flops_per_token,
-                peak_flops_per_device=self.metrics.gpu_peak_flops,
-                world_size=world,
-            )
-            if steady_compute["utilization_percent"] is not None:
-                result["steady/mfu_percent"] = steady_compute["utilization_percent"]
-        self.metrics.latest_training_observations = result
+        if not self.samples:
+            return {}
+
+        durations = [sample[0] for sample in self.samples]
+        steady_tps = sum(sample[1] for sample in self.samples) / sum(durations)
+        result = {
+            "steady/samples": float(len(self.samples)),
+            "steady/step_p50_seconds": percentile(durations, 0.5),
+            "steady/step_p90_seconds": percentile(durations, 0.9),
+            "steady/tps_per_device": steady_tps / world,
+            "steady/tflops_per_device": model_tflops(
+                self.metrics.num_flops_per_token, steady_tps / world
+            ),
+        }
+        steady_compute = compute_utilization(
+            tokens_per_second=steady_tps,
+            flops_per_token=self.metrics.num_flops_per_token,
+            peak_flops_per_device=self.metrics.gpu_peak_flops,
+            world_size=world,
+        )
+        if steady_compute["utilization_percent"] is not None:
+            result["steady/mfu_percent"] = steady_compute["utilization_percent"]
         return result

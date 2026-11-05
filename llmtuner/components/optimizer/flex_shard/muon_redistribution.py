@@ -25,7 +25,7 @@ from .muon_layout import (
 from .optimizer_reshard_schedule import (
     _BucketPlanningContext,
     _build_dim0_shard_redistribution_plan,
-    _build_owned_redistribution_plan,
+    _build_whole_tensor_redistribution_plan,
     _dtensor_storage_regions,
     _ParticipantPartition,
     _RedistributionGroup,
@@ -204,10 +204,10 @@ def _build_parameter_redistribution_plan(
     if type(compute_sharding) is Owned:
         assert owner_rank is not None
         assert owner_rank in group.participants
-        return _build_owned_redistribution_plan(
+        return _build_whole_tensor_redistribution_plan(
             storage_regions,
             participants=group.participants,
-            owner_rank=owner_rank,
+            compute_participants=(owner_rank,),
             logical_shape=tuple(compute_layout.param.shape),
         )
 

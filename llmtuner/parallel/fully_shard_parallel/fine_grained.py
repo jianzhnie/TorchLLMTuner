@@ -11,6 +11,13 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_sh
 
 from llmtuner.errors import EnvironmentUnsupportedError
 
+# Native FSDP remains usable when version-specific private APIs are absent.
+CUSTOM_FSDP_IMPORT_ERROR = None
+try:
+    from .fine_grained_state import apply_fine_grained_fsdp
+except (ImportError, EnvironmentUnsupportedError) as error:
+    CUSTOM_FSDP_IMPORT_ERROR = error
+
 if TYPE_CHECKING:
     from torch.distributed.fsdp._fully_shard._fsdp_api import DataParallelMeshDims
     from torch.distributed.fsdp._fully_shard._fsdp_common import ShardPlacementFnResult
@@ -33,13 +40,13 @@ def validate_fsdp_hook_target(
 
 def load_custom_fsdp_engine() -> Callable:
     """Resolve optional private APIs before any model transformations."""
-    try:
-        from .fine_grained_state import apply_fine_grained_fsdp
-    except ImportError as error:
+    if CUSTOM_FSDP_IMPORT_ERROR is not None:
+        if isinstance(CUSTOM_FSDP_IMPORT_ERROR, EnvironmentUnsupportedError):
+            raise CUSTOM_FSDP_IMPORT_ERROR
         raise EnvironmentUnsupportedError(
             "custom FSDP requires PyTorch 2.14 compatible private FSDP APIs; "
             "install a compatible PyTorch build or select fsdp_implementation='native'"
-        ) from error
+        ) from CUSTOM_FSDP_IMPORT_ERROR
     return apply_fine_grained_fsdp
 
 

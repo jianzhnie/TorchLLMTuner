@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 from llmtuner.errors import UnsupportedCombinationError
 
@@ -33,8 +34,6 @@ def validate_rotary_initialization(config: PretrainedConfig) -> None:
 
 def initialize_rotary_on_device(model: nn.Module, device: torch.device) -> None:
     """Rebuild opted-in Qwen3 runtime frequencies before training starts."""
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
-
     replacements: dict[int, torch.Tensor] = {}
     updates = []
     for module in model.modules():

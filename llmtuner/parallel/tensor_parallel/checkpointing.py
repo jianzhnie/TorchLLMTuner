@@ -17,6 +17,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor, Partial, distribute_tensor
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
+from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 from ...utils.module_names import canonical_fqn
 from ..expert_parallel.checkpointing import (
     EP_GROUP_ATTR,
@@ -50,8 +51,6 @@ def restore_disjoint_tp_ep_state(
     model_parts: list[nn.Module],
 ) -> dict[str, Any]:
     """Validate all disjoint TP/EP chunks before restoring local storage."""
-    from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
-
     destinations = shard_disjoint_tp_ep_state(local_state, model_parts=model_parts)
     with _coordinate_chunk_errors(
         model_parts, "Joint TP/EP checkpoint restore", include_expert_groups=True
@@ -293,8 +292,6 @@ def shard_tensor_parallel_state(
 
 
 def _build_chunked_state(state, entries):
-    from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
-
     result = dict(state)
     for key, (dim, packed, group), _ in entries:
         value = state[key]
@@ -343,8 +340,6 @@ def restore_sharded_tensor_parallel_state(
     parameter-shaped destinations, including the existing EP-axis convention.
     Destination storage and DTensor placements are preserved.
     """
-    from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
-
     destinations = shard_tensor_parallel_state(local_state, model_parts=model_parts)
     with _coordinate_chunk_errors(model_parts, "TP checkpoint chunk restore"):
         pending = _validate_chunk_destinations(state, destinations)
@@ -358,8 +353,6 @@ def restore_sharded_tensor_parallel_state(
 
 
 def _validate_chunk_destinations(state, destinations):
-    from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
-
     pending = []
     for key, destination in destinations.items():
         if not isinstance(destination, ChunkedCheckpointTensor):

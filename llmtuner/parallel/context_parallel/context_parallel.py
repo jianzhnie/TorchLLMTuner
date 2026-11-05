@@ -10,9 +10,13 @@ from torch.distributed.device_mesh import DeviceMesh
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.parallel.compatibility import eager_flex_parallel
 
+from ...models.hf.attention_backend import ATTENTION_BACKEND, CP_SDPA_BACKEND
 from ...utils.logging import get_logger
 from ..attention_heads import require_heads_divisible_by
+from ..tensor_parallel.tensor_parallel import ReplicatedAttentionSequenceBoundary
 from .attention import CPFlexKernel, DualCPFlexKernel
+from .compressor_attention import apply_compressor_context_parallel
+from .kcp import apply_kcp
 from .sdpa_attention import CPSdpaKernel, CPSdpaUlyssesKernel, DualCPSdpaKernel
 
 if TYPE_CHECKING:
@@ -66,8 +70,6 @@ def _require_ulysses_compatible(
     # rank's local head count -- equivalently, the global count must divide
     # tp * cp (upstream torchtitan's head_shard_degree in its
     # config/validation.py).
-    from ..tensor_parallel.tensor_parallel import ReplicatedAttentionSequenceBoundary
-
     attentions = [
         getattr(layer, name)
         for layer in getattr(model, "layers", [])
@@ -121,8 +123,6 @@ def apply_cp(
             raise ValueError("KCP mesh degree does not match the configured CP degree")
         if getattr(model_config, "attn_mask_type", "causal") == "block_causal":
             raise ValueError("KCP does not support packed document attention")
-        from .kcp import apply_kcp
-
         patched = apply_kcp(model, mesh["cp"])
         model.set_cp_mesh(
             mesh["cp"],
@@ -138,13 +138,7 @@ def apply_cp(
         cp_mesh = mesh["cp"]
         if cp_mesh.size() != cfg.cp_size:
             raise ValueError("HCA CP mesh degree does not match configuration")
-        from .compressor_attention import apply_compressor_context_parallel
-
         return apply_compressor_context_parallel(model, cp_mesh=cp_mesh, cfg=cfg)
-
-    # Import the HF backend only when CP is enabled; disabled CP needs no
-    # Transformers attention registration dependencies.
-    from ...models.hf.attention_backend import ATTENTION_BACKEND, CP_SDPA_BACKEND
 
     impl = getattr(model_config, "_attn_implementation", None)
     sdpa_backend = impl != ATTENTION_BACKEND

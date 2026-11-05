@@ -26,6 +26,12 @@ from ...components.loss import IGNORE_INDEX
 from ...utils.logging import get_logger
 from ..contracts import DatasetBuildContext, SampleProcessor, TextSequence
 
+try:
+    import renderers
+except ImportError as error:
+    renderers = None
+    RENDERERS_IMPORT_ERROR = error
+
 logger = get_logger(__name__)
 
 __all__ = [
@@ -241,12 +247,15 @@ class ChatProcessor(SampleProcessor):
         shifted with the labels because label ``j`` predicts token
         ``j + 1``.
         """
-        from renderers import build_training_sample
+        if renderers is None:
+            raise ImportError(
+                "Chat rendering requires the optional renderers package"
+            ) from RENDERERS_IMPORT_ERROR
 
         if not messages or messages[-1]["role"] != "assistant":
             raise ValueError("Chat samples must end with an assistant message.")
         # TODO(data-sft-supervision): Support per-turn loss weighting.
-        rendered = build_training_sample(
+        rendered = renderers.build_training_sample(
             self._renderer, messages, ensure_final_stop=True
         )
         if rendered.multi_modal_data is not None:

@@ -43,7 +43,6 @@ usual), no fused QKV (HF keeps q/k/v as separate projections), no FP8.
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -58,15 +57,17 @@ from ...accelerator.capabilities import has
 from ...models.common.moe.experts import GroupedExperts
 from .. import compatibility
 from ..attention_heads import require_heads_divisible_by
+from ..expert_parallel.hf_inspection import is_hf_moe_block, resolve_shared_expert
 from ..module_patterns import module_name_matches, resolve_module_patterns
 from .linear_ops import (
     AllGatherLinear,
     LinearReduceScatter,
     all_gather_along,
     all_gather_linear,
-    functional_collectives,
+    enable_symm_mem,
     linear_reduce_scatter,
     reduce_scatter_along,
+    resolve_autograd_collectives,
 )
 
 __all__ = [
@@ -363,8 +364,6 @@ class TPMoeSequenceBoundary:
         # the TP group -- so either all ranks raise here or none do. Never let
         # a data-dependent type reach this check.
         if not isinstance(out, torch.Tensor):
-            from .. import compatibility
-
             compatibility.tp_moe_non_tensor_output(self, out)
         return reduce_scatter_along(out, -2, self._tp_seq_group)
 
@@ -390,8 +389,6 @@ def shard_shared_expert_for_tp(
     all-reduce excludes them (their gradients are complete per shard, exactly
     like the routed experts').
     """
-    from ..expert_parallel.hf_inspection import resolve_shared_expert
-
     shared_name, shared = resolve_shared_expert(block)
     assert shared is not None  # the caller checked
     names: set[str] = set()
@@ -626,21 +623,6 @@ def supports_symm_mem(tp_mesh: DeviceMesh) -> bool:
     return has("symm_mem")
 
 
-def enable_symm_mem(group) -> None:
-    """Register ``group`` for symmetric-memory collectives.
-
-    ``torch.ops.symm_mem.fused_all_gather_matmul`` (and its reduce-scatter dual)
-    only work on a group registered here; PyTorch does not yet do this
-    automatically for the TP group. CUDA-only -- call only when
-    ``supports_symm_mem`` held for the mesh.
-    """
-    from torch.distributed._symmetric_memory import enable_symm_mem_for_group
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)
-        enable_symm_mem_for_group(group.group_name)
-
-
 def tp_sharded_param_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
     """Ids of parameters whose gradients must NOT be summed over the TP group.
 
@@ -772,8 +754,6 @@ def resolve_tp_targets(
     moe_deferred_to_ep = plan_declares_moe and cfg.ep_size > 1
     moe_blocks: list[tuple[str, nn.Module]] = []
     bracketed_paths: list[str] = []
-    from ..expert_parallel.hf_inspection import is_hf_moe_block
-
     if plan_declares_moe and not moe_deferred_to_ep:
         for module_path, module in model.named_modules():
             if getattr(module, "_tp_moe_boundary", False):
@@ -848,8 +828,6 @@ def realize_moe_blocks_tp(
     sharded featurewise by ``shard_shared_expert_for_tp``, collective-free
     inside the sequence boundary.
     """
-    from ..expert_parallel.hf_inspection import resolve_shared_expert
-
     for module_path, block in moe_blocks:
         _, shared = resolve_shared_expert(block)
         expert_tp_hidden_size(block, tp_size=tp_size)
@@ -985,8 +963,6 @@ def apply_tp(
     # identical column slice, and the shared realizer preserves that identity.
     # Reject all other aliases before any constructor or MoE mutation runs.
     for module_path, block in moe_blocks:
-        from ..expert_parallel.hf_inspection import resolve_shared_expert
-
         shared_name, shared = resolve_shared_expert(block)
         prefix = f"{module_path}." if module_path else ""
         tied_shared_paths = {
@@ -1042,7 +1018,7 @@ def apply_tp(
         enable_symm_mem(group)
 
     # Resolve optional imports before tensor graphs are compiled.
-    functional_collectives()
+    resolve_autograd_collectives()
 
     # Prepare every dense replacement before changing the model. A failing
     # custom constructor must not leave earlier projections or MoE blocks sharded.

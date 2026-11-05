@@ -5,10 +5,9 @@ particular model component: a column-parallel linear that all-gathers its
 sequence shard first, and a row-parallel linear that reduce-scatters its output.
 Attention, FFN and MoE projections can all be built on them.
 
-They are kept out of ``torchtitan/models`` on purpose. Both call
-``torch.ops.symm_mem``, which is CUDA-only and not present in every build, so
-the symmetric-memory import stays local to the functions that need it rather
-than sitting on the import path of every model.
+The fused path calls CUDA-only ``torch.ops.symm_mem``. Optional module imports
+are resolved at file load; missing symmetric-memory support is rejected only
+when the fused path is selected. The collective fallback remains usable.
 
 Both assume they are the only symmetric-memory op in flight on their group. Each
 op brackets itself with barriers, so ranks cannot run ahead of each other, but
@@ -27,33 +26,64 @@ exactly the duals the Functions below implement by hand. It exists so TP runs
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Callable
+from types import ModuleType
+
 import torch
 import torch.distributed as dist
 
 from llmtuner.accelerator.spmd_backend import spmd
 
+try:
+    from torch.distributed import functional_collectives as funcol
+except ImportError:
+    # The public alias is absent in some PyTorch releases.
+    from torch.distributed import _functional_collectives as funcol
 
-def ensure_symm_mem_ops():
-    """Import the symmetric-memory module and return it.
-
-    ``torch.ops.symm_mem.*`` is registered as a side effect of this import, so
-    anything reaching for those ops has to do it first. The import is kept lazy
-    because it is CUDA-only.
-    """
+try:
     import torch.distributed._symmetric_memory as symm_mem
+except ImportError as error:
+    symm_mem = None
+    _symm_mem_import_error = error
+else:
+    _symm_mem_import_error = None
 
+
+def ensure_symm_mem_ops() -> ModuleType:
+    """Require the module that registers the fused symmetric-memory operators."""
+    if symm_mem is None:
+        raise ImportError(
+            "Fused TP linear requires PyTorch symmetric-memory support"
+        ) from _symm_mem_import_error
     return symm_mem
+
+
+def enable_symm_mem(group) -> None:
+    """Register ``group`` for symmetric-memory collectives.
+
+    ``torch.ops.symm_mem.fused_all_gather_matmul`` (and its reduce-scatter dual)
+    only work on a group registered here; PyTorch does not yet do this
+    automatically for the TP group. CUDA-only -- call only when
+    ``supports_symm_mem`` held for the mesh.
+    """
+    backend = ensure_symm_mem_ops()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        backend.enable_symm_mem_for_group(group.group_name)
 
 
 _autograd_collectives = None
 
 
-def functional_collectives():
-    """Import torch's functional collectives, lazily and version-tolerantly.
+def resolve_autograd_collectives() -> tuple[
+    Callable[..., torch.Tensor], Callable[..., torch.Tensor]
+]:
+    """Select and cache torch's complete autograd collective pair.
 
     Resolve this environment-only choice outside compiled tensor graphs.
-    Tracing the failed public import can split an upstream norm from its
-    collective and lose its backward contribution under AOT/FSDP.
+    Tensor tracing must reuse the selected functions without capability probes.
 
     The autograd-covered variants were renamed across torch releases. Current
     builds expose ``*_single_autograd`` or ``*_tensor_autograd`` names. Require
@@ -62,13 +92,6 @@ def functional_collectives():
     global _autograd_collectives
     if _autograd_collectives is not None:
         return _autograd_collectives
-    try:
-        from torch.distributed import functional_collectives as funcol
-    except ImportError:
-        # PyTorch 2.14 exposes the autograd collectives under the private
-        # module name only; the public alias existed in older releases.
-        from torch.distributed import _functional_collectives as funcol
-
     for suffix in ("single_autograd", "tensor_autograd"):
         all_gather = getattr(funcol, f"all_gather_{suffix}", None)
         reduce_scatter = getattr(funcol, f"reduce_scatter_{suffix}", None)
@@ -80,6 +103,10 @@ def functional_collectives():
         "install a torch build providing the *_single_autograd or "
         "*_tensor_autograd pair."
     )
+
+
+# Compatibility name retained for downstream collective warmup calls.
+functional_collectives = resolve_autograd_collectives
 
 
 def all_gather_linear(
@@ -95,7 +122,7 @@ def all_gather_linear(
     backward is a reduce-scatter (the dgrad dual), and the weight gradient falls
     out of the local matmul against the gathered input.
     """
-    all_gather, _ = functional_collectives()
+    all_gather, _ = resolve_autograd_collectives()
     x_full = all_gather(x_shard_m.contiguous(), 0, group)
     return torch.nn.functional.linear(x_full, w_shard_n)
 
@@ -113,7 +140,7 @@ def linear_reduce_scatter(
     dual); the weight gradient is the local matmul against the re-gathered
     output gradient, which autograd produces on its own.
     """
-    _, reduce_scatter = functional_collectives()
+    _, reduce_scatter = resolve_autograd_collectives()
     y_partial = torch.nn.functional.linear(x_shard_k, w_shard_k)
     return reduce_scatter(y_partial.contiguous(), "sum", 0, group)
 
@@ -131,7 +158,7 @@ def all_gather_along(
     # In particular, a batched padding mask with -1 can produce an invalid view.
     if dim < 0:
         dim += x.ndim
-    all_gather, _ = functional_collectives()
+    all_gather, _ = resolve_autograd_collectives()
     if torch.compiler.is_compiling() and dim != 0:
         # Nonzero-axis upstream helpers call skipped Python view utilities.
         # Move the collective axis explicitly so checkpoint regions stay traceable.
@@ -152,7 +179,7 @@ def reduce_scatter_along(
     """
     if dim < 0:
         dim += x.ndim
-    _, reduce_scatter = functional_collectives()
+    _, reduce_scatter = resolve_autograd_collectives()
     if torch.compiler.is_compiling() and dim != 0:
         scattered = reduce_scatter(x.movedim(dim, 0).contiguous(), "sum", 0, group)
         return scattered.movedim(0, dim)

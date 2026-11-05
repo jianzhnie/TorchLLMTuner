@@ -5,17 +5,10 @@ Its class structure, policy wiring, and comments are kept verbatim where they
 carry a reason; three things were altered, and each is a subtraction or a
 necessary adaptation rather than a redesign.
 
-**The backend is not installed here, so its imports are deferred.** Every
-``torch_checkpointing`` and ``torch_checkpointing.*`` import in torchtitan sits
-at module scope. Doing that here would make this file unimportable on any machine
-without the package and would take ``components/checkpointer/__init__.py`` down
-with it. Imports are deferred to
-``require_torch_checkpointing()`` instead, called from ``__init__``. So:
-
-* this module imports fine, and so does the package that re-exports it;
-* constructing a ``TorchCheckpointingManager`` without the backend installed
-  raises ``ImportError`` with the install hint, at the earliest point the
-  dependency is actually needed.
+**The backend is optional.** Module-level imports capture unavailable or
+incompatible dependencies without preventing the default DCP path from loading.
+Constructing a ``TorchCheckpointingManager`` reports the original import error
+with an installation hint. Installed backend extensions load with this module.
 
 **No ``structured_logger``.** torchtitan stamps ``sl.add_step_tag`` and writes a
 ``checkpoint_logging_context`` step into the async save subprocess. Neither
@@ -77,6 +70,74 @@ from ..core.state_adaptation import adapt_hf_model_state
 from ..storage.checkpointing_metadata import adapt_npu_metadata_gather
 from ..storage.checkpointing_staging import adapt_npu_staging
 
+CHECKPOINTING_IMPORT_ERROR = None
+try:
+    from torch_checkpointing.barriers import TCPStoreBarrierConfig
+    from torch_checkpointing.checkpoint_layout import (
+        LayoutInfo,
+        SafetensorsSerialization,
+    )
+    from torch_checkpointing.checkpoint_manager import (
+        CheckpointManager as BackendCheckpointManager,
+    )
+    from torch_checkpointing.checkpoint_writer import CheckpointWriterConfig
+    from torch_checkpointing.config import (
+        AsyncCheckpointSaverConfig,
+        CheckpointSaverConfig,
+        SyncCheckpointSaverConfig,
+    )
+
+    try:
+        from torch_checkpointing.default_resharder import DefaultResharder
+    except ImportError:
+        # The published torch_checkpointing (0.1.0) has no
+        # ``default_resharder``: ``resharding.Resharder`` is an ABC there and
+        # the DTensor implementation is the concrete one, which is what the
+        # item specs below need to instantiate.
+        from torch_checkpointing.dtensor_resharder import (
+            DTensorResharder as DefaultResharder,
+        )
+
+    try:
+        from torch_checkpointing.metadata_serialization import (
+            METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,
+        )
+    except ImportError:
+        # Older torch_checkpointing keeps the name in distributed_metadata.
+        from torch_checkpointing.distributed_metadata import (
+            METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,
+        )
+    from torch_checkpointing.hf.consolidation import (
+        consolidate_hf_safetensors_checkpoint,
+    )
+
+    try:
+        from torch_checkpointing.hf.metadata import (
+            HF_SAFETENSORS_INDEX_FILE_TEMPLATE,
+            HuggingFaceSafetensorsDistributedMetadataFormat,
+        )
+    except ImportError:
+        # Older torch_checkpointing has no hf.metadata module; the HF-load
+        # path checks for None and reports the feature as unavailable.
+        HF_SAFETENSORS_INDEX_FILE_TEMPLATE = None
+        HuggingFaceSafetensorsDistributedMetadataFormat = None
+    from torch_checkpointing.logging_utils import (
+        EventLogger,
+        checkpoint_logging_context,
+    )
+    from torch_checkpointing.schema import ItemSpec
+    from torch_checkpointing.staging import CheckpointStagerConfig
+    from torch_checkpointing.storage.base_storage import (
+        Storage,
+        StorageConfig,
+    )
+    from torch_checkpointing.storage.filesystem import (
+        LocalFileSystemStorageConfig,
+    )
+except ImportError as error:
+    CHECKPOINTING_IMPORT_ERROR = error
+
+
 logger = get_logger(__name__)
 
 
@@ -101,79 +162,11 @@ _INSTALL_HINT = (
 
 
 def require_torch_checkpointing():
-    """Import the backend lazily, or fail with an actionable message.
-
-    torchtitan imports these at module scope. Doing that here would make this
-    module -- and everything that re-exports it -- unimportable wherever the
-    package is absent, which is the common case. Deferring the import to the
-    point of use keeps the failure at the earliest place it is actually needed
-    and lets the rest of the checkpointer subpackage load regardless.
-    """
-    try:
-        from torch_checkpointing.barriers import TCPStoreBarrierConfig
-        from torch_checkpointing.checkpoint_layout import (
-            LayoutInfo,
-            SafetensorsSerialization,
-        )
-        from torch_checkpointing.checkpoint_manager import (
-            CheckpointManager as BackendCheckpointManager,
-        )
-        from torch_checkpointing.checkpoint_writer import CheckpointWriterConfig
-        from torch_checkpointing.config import (
-            AsyncCheckpointSaverConfig,
-            CheckpointSaverConfig,
-            SyncCheckpointSaverConfig,
-        )
-
-        try:
-            from torch_checkpointing.default_resharder import DefaultResharder
-        except ImportError:
-            # The published torch_checkpointing (0.1.0) has no
-            # ``default_resharder``: ``resharding.Resharder`` is an ABC there and
-            # the DTensor implementation is the concrete one, which is what the
-            # item specs below need to instantiate.
-            from torch_checkpointing.dtensor_resharder import (
-                DTensorResharder as DefaultResharder,
-            )
-
-        try:
-            from torch_checkpointing.metadata_serialization import (
-                METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,
-            )
-        except ImportError:
-            # Older torch_checkpointing keeps the name in distributed_metadata.
-            from torch_checkpointing.distributed_metadata import (
-                METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,
-            )
-        from torch_checkpointing.hf.consolidation import (
-            consolidate_hf_safetensors_checkpoint,
-        )
-
-        try:
-            from torch_checkpointing.hf.metadata import (
-                HF_SAFETENSORS_INDEX_FILE_TEMPLATE,
-                HuggingFaceSafetensorsDistributedMetadataFormat,
-            )
-        except ImportError:
-            # Older torch_checkpointing has no hf.metadata module; the HF-load
-            # path checks for None and reports the feature as unavailable.
-            HF_SAFETENSORS_INDEX_FILE_TEMPLATE = None
-            HuggingFaceSafetensorsDistributedMetadataFormat = None
-        from torch_checkpointing.logging_utils import (
-            EventLogger,
-            checkpoint_logging_context,
-        )
-        from torch_checkpointing.schema import ItemSpec
-        from torch_checkpointing.staging import CheckpointStagerConfig
-        from torch_checkpointing.storage.base_storage import (
-            Storage,
-            StorageConfig,
-        )
-        from torch_checkpointing.storage.filesystem import (
-            LocalFileSystemStorageConfig,
-        )
-    except ImportError as error:
-        raise ImportError(f"{_INSTALL_HINT} ({error})") from error
+    """Resolve backend symbols or report an unavailable optional dependency."""
+    if CHECKPOINTING_IMPORT_ERROR is not None:
+        raise ImportError(
+            f"{_INSTALL_HINT} ({CHECKPOINTING_IMPORT_ERROR})"
+        ) from CHECKPOINTING_IMPORT_ERROR
 
     return BackendSymbols(
         TCPStoreBarrierConfig=TCPStoreBarrierConfig,
@@ -201,7 +194,7 @@ def require_torch_checkpointing():
 
 @dataclass(frozen=True, slots=True)
 class BackendSymbols:
-    """The lazily imported ``torch_checkpointing`` names, bundled for transit.
+    """The optional ``torch_checkpointing`` names, bundled for transit.
 
     A frozen dataclass rather than a dict so every attribute access is a static
     name. Required backend symbols are resolved together before manager setup.

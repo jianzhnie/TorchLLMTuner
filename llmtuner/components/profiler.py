@@ -33,6 +33,12 @@ from ..utils.monitoring import (
     stop_memory_history,
 )
 
+try:
+    from torch_npu import profiler as npu_profiler
+except ImportError as error:
+    npu_profiler = None
+    NPU_PROFILER_IMPORT_ERROR = error
+
 logger = get_logger(__name__)
 
 __all__ = ["MemoryProfiler", "Profiler"]
@@ -325,7 +331,11 @@ class Profiler:
         on_trace_ready = trace_handler
         profiler_api = torch.profiler
         if device_type == "npu":
-            from torch_npu import profiler as profiler_api
+            if npu_profiler is None:
+                raise ImportError(
+                    "NPU profiling requires a working torch-npu installation"
+                ) from NPU_PROFILER_IMPORT_ERROR
+            profiler_api = npu_profiler
 
             raw_trace_handler = profiler_api.tensorboard_trace_handler(
                 os.path.join(trace_dir, "raw"), analyse_flag=False

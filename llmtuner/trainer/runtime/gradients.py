@@ -11,6 +11,7 @@ from torch.distributed.tensor import DTensor
 from ...accelerator.collectives import all_reduce, clip_grad_norm_
 from ...accelerator.distributed import get_comm_device
 from ...models.common.moe.layer import MoE
+from ...parallel.expert_parallel.npu_baseline_experts import NpuBaselineGroupedExperts
 from ...parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 from .reductions import TrainingReductionMeshes
 
@@ -152,10 +153,6 @@ def clip_and_check_finite(
     norm_options = {}
     if getattr(trainer.cfg, "grad_norm_precision", "float32") != "float32":
         norm_options["norm_precision"] = trainer.cfg.grad_norm_precision
-        from ...parallel.expert_parallel.npu_baseline_experts import (
-            NpuBaselineGroupedExperts,
-        )
-
         packed_parameters = {}
         for part in trainer.model_parts:
             for module in part.modules():

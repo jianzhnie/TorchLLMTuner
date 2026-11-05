@@ -10,6 +10,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...utils.logging import get_logger
 from .. import compatibility
 from .domino_dispatch import DominoRoutedExperts
+from .mc2_dispatch import MC2RoutedExperts
 from .mc2_ops import validate_mc2_world_size
 from .model_replacement import MoEReplacementObserver, swap_hf_moe_blocks
 
@@ -74,8 +75,6 @@ def apply_ep(
     # Failures must reach all ranks sharing later FSDP/TP/CP collectives,
     # not only the ranks in one token-exchange group.
     if error_group is not None:
-        from .mc2_dispatch import MC2RoutedExperts
-
         for module in model.modules():
             if isinstance(module, DominoRoutedExperts | MC2RoutedExperts):
                 module.error_group = error_group

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
+from torch.distributed.pipelining.schedules import get_schedule_class
 
 from llmtuner.config.utils import require_bool, require_integer_at_least
 from llmtuner.errors import (
@@ -326,9 +327,6 @@ class PipelineParallelConfig:
                 "parallel.pipeline_parallel_schedule_csv is not supported; "
                 "use pipeline_parallel_schedule instead."
             )
-        # Keep schedule discovery lazy to avoid importing pipelining at import time.
-        from torch.distributed.pipelining.schedules import get_schedule_class
-
         try:
             get_schedule_class(self.pipeline_parallel_schedule)
         except ValueError as exc:

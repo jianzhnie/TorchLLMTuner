@@ -7,6 +7,16 @@ from torch.nn.attention.flex_attention import BlockMask
 
 from llmtuner.errors import EnvironmentUnsupportedError, UnsupportedCombinationError
 
+try:
+    from torch._higher_order_ops.flex_attention import flex_attention
+    from torch.nn.attention.flex_attention import _apply_kernel_options
+except ImportError as error:
+    flex_attention = None
+    _apply_kernel_options = None
+    _FLEX_IMPORT_ERROR = error
+else:
+    _FLEX_IMPORT_ERROR = None
+
 
 def _identity(score, batch, head, query, key):
     return score
@@ -54,14 +64,11 @@ def eager_flex_attention(
         raise ValueError("eager Flex BlockMask must share the Q/K/V device")
     if block_mask.q_indices is None and torch.is_grad_enabled():
         raise ValueError("eager Flex backward requires BlockMask query indices")
-    try:
-        from torch._higher_order_ops.flex_attention import flex_attention
-        from torch.nn.attention.flex_attention import _apply_kernel_options
-    except ImportError as error:
+    if flex_attention is None or _apply_kernel_options is None:
         raise EnvironmentUnsupportedError(
             "eager Flex requires PyTorch Flex HOP and kernel-option APIs "
             "(validated with torch 2.12)"
-        ) from error
+        ) from _FLEX_IMPORT_ERROR
     options = _apply_kernel_options(query, key, value, False, None)
     output, _, _ = flex_attention(
         query,

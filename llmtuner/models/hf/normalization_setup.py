@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from types import MethodType
 
 import torch
@@ -12,13 +11,22 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
 from llmtuner.errors import UnsupportedCombinationError
 
+from .normalization import forward_aten_rms_norm
+from .residual_normalization import (
+    apply_joint_residual_norm,
+    forward_joint_residual_block,
+    forward_joint_residual_norm,
+    isolate_norm_input,
+    validate_joint_residual_norm,
+)
 
-def _isolate_norm_input(module, args, kwargs):
-    if args:
-        value = args[0]
-        return (value.view_as(value), *args[1:]), kwargs
-    value = kwargs["hidden_states"]
-    return args, {**kwargs, "hidden_states": value.view_as(value)}
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
+# Retain the former hook name for callers holding ownership checks by identity.
+_isolate_norm_input = isolate_norm_input
 
 
 def forward_torch_rms_norm(module: nn.Module, hidden_states: torch.Tensor):
@@ -33,31 +41,9 @@ def forward_torch_rms_norm(module: nn.Module, hidden_states: torch.Tensor):
 def forward_npu_rms_norm(module: nn.Module, hidden_states: torch.Tensor):
     if hidden_states.device.type != "npu":
         raise RuntimeError("model.norm_backend='npu' requires NPU tensors")
-    import torch_npu
-
     return torch_npu.npu_rms_norm(
         hidden_states, module.weight, module.variance_epsilon
     )[0]
-
-
-def _owned_norm_forwards(model: nn.Module) -> dict[str, Callable]:
-    """Resolve installed adapters without eagerly registering optional operators."""
-    forwards: dict[str, Callable] = {
-        "torch": forward_torch_rms_norm,
-        "npu": forward_npu_rms_norm,
-    }
-    namespaces = {
-        getattr(module.forward, "__module__", None) for module in model.modules()
-    }
-    if f"{__package__}.normalization" in namespaces:
-        from .normalization import forward_aten_rms_norm
-
-        forwards["aten"] = forward_aten_rms_norm
-    if f"{__package__}.residual_normalization" in namespaces:
-        from .residual_normalization import forward_joint_residual_norm
-
-        forwards["joint"] = forward_joint_residual_norm
-    return forwards
 
 
 def stabilize_residual_norm_gradients(model: nn.Module) -> None:
@@ -78,7 +64,12 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
         norm_type = Qwen3MoeRMSNorm
     else:
         return
-    owned_forwards = _owned_norm_forwards(model)
+    owned_forwards = {
+        "aten": forward_aten_rms_norm,
+        "torch": forward_torch_rms_norm,
+        "npu": forward_npu_rms_norm,
+        "joint": forward_joint_residual_norm,
+    }
     if backend in ("aten", "torch", "npu"):
         for module in model.modules():
             if (
@@ -92,8 +83,6 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
                     "RMSNorm forward; use native or adapt it explicitly."
                 )
     if backend == "joint":
-        from .residual_normalization import validate_joint_residual_norm
-
         validate_joint_residual_norm(
             model, allowed_norm_forwards=tuple(owned_forwards.values())
         )
@@ -101,7 +90,7 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
         if type(module) is not norm_type:
             continue
         for key, hook in list(module._forward_pre_hooks.items()):
-            if hook is _isolate_norm_input:
+            if hook is isolate_norm_input:
                 del module._forward_pre_hooks[key]
                 module._forward_pre_hooks_with_kwargs.pop(key, None)
         installed = getattr(module.forward, "__func__", None)
@@ -111,23 +100,10 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
             del module.forward
     if backend != "joint":
         for layer in model.model.layers:
-            if getattr(layer.forward, "__module__", None) == (
-                f"{__package__}.residual_normalization"
-            ):
-                from .residual_normalization import forward_joint_residual_block
-
-                if (
-                    getattr(layer.forward, "__func__", None)
-                    is forward_joint_residual_block
-                ):
-                    del layer.forward
+            if getattr(layer.forward, "__func__", None) is forward_joint_residual_block:
+                del layer.forward
     if backend in ("aten", "torch", "npu"):
-        if backend == "aten":
-            from .normalization import forward_aten_rms_norm as norm_forward
-        elif backend == "npu":
-            norm_forward = forward_npu_rms_norm
-        else:
-            norm_forward = forward_torch_rms_norm
+        norm_forward = owned_forwards[backend]
         for module in model.modules():
             if type(module) is norm_type:
                 module.forward = MethodType(norm_forward, module)
@@ -135,11 +111,9 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
     for layer in model.model.layers:
         for name in ("input_layernorm", "post_attention_layernorm"):
             norm = getattr(layer, name, None)
-            if type(norm) is norm_type and _isolate_norm_input not in (
+            if type(norm) is norm_type and isolate_norm_input not in (
                 norm._forward_pre_hooks.values()
             ):
-                norm.register_forward_pre_hook(_isolate_norm_input, with_kwargs=True)
+                norm.register_forward_pre_hook(isolate_norm_input, with_kwargs=True)
     if backend == "joint":
-        from .residual_normalization import apply_joint_residual_norm
-
         apply_joint_residual_norm(model)

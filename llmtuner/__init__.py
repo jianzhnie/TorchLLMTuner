@@ -15,16 +15,13 @@ Public surface (see docs/torchllmtuner_design.md §3.4 for the full policy):
 the stable face is the two names below plus ``llmtuner.config`` and the CLI.
 """
 
-from llmtuner.config import LLMTunerConfig
 from llmtuner.utils.lazy_exports import resolve_export
 
 __version__ = "0.1.0"
 
-#: Name -> submodule, for the one name this package keeps lazy. ``Trainer`` is
-#: the expensive half: ``trainer.trainer`` pulls in the whole
-#: ``torch.distributed`` stack (DTensor, pipelining), which ``import llmtuner``
-#: must not pay for and older torch builds do not have.
+# Resolve public objects only when requested, keeping leaf imports lightweight.
 _EXPORT_SOURCES = {
+    "LLMTunerConfig": "config.llmtuner_config",
     "Trainer": "trainer.trainer",
 }
 

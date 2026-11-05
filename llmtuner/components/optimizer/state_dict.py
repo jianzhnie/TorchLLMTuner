@@ -14,6 +14,9 @@ from typing import Any
 import torch
 from torch.distributed.tensor import DTensor
 
+from .adamw_swap import AdamWSwap
+from .flex_shard.dist_muon import DistMuon
+
 __all__ = [
     "init_optim_state",
     "get_flat_optim_state_dict",
@@ -72,9 +75,6 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     multi-optimizer case: the reset branch below is type-gated on Adam, and
     would be skipped silently if a container were handed in whole.
     """
-    from .adamw_swap import AdamWSwap
-    from .flex_shard.dist_muon import DistMuon
-
     if isinstance(optim, DistMuon | AdamWSwap):
         optim.initialize_state()
         return

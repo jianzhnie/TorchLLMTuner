@@ -19,6 +19,12 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeAttention
 
 from llmtuner.errors import UnsupportedCombinationError
 
+try:
+    import torch_npu
+except ImportError as error:
+    torch_npu = None
+    TORCH_NPU_IMPORT_ERROR = error
+
 
 def _validate_projections(module: nn.Module) -> None:
     projections = (module.q_proj, module.k_proj, module.v_proj)
@@ -109,7 +115,10 @@ def apply_configured_rotary(module, query, key, cosine, sine, position_ids):
     if query.device.type == "npu" and (
         getattr(module.config, "rotary_cache_dtype", None) == "bfloat16"
     ):
-        import torch_npu
+        if torch_npu is None:
+            raise ImportError(
+                "NPU kernels require a working torch-npu installation"
+            ) from (TORCH_NPU_IMPORT_ERROR)
 
         # Match both the baseline rotary kernel and its backward reduction.
         # An algebraically equivalent eager rotation can match BF16 forward

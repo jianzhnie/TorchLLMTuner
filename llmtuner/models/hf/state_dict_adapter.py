@@ -26,6 +26,7 @@ from ...components.checkpointer.hf.hf_expert_storage import (
     native_ep_expert_key,
 )
 from ...components.checkpointer.hf.hf_storage import IndexedHuggingFaceStorageReader
+from ..kimi.checkpoint import convert_kimi_expert_state
 
 
 class HFTransformerStateDictAdapter:
@@ -124,8 +125,6 @@ class HFTransformerStateDictAdapter:
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         if self.kimi_expert_parallel:
-            from ..kimi.checkpoint import convert_kimi_expert_state
-
             state_dict = convert_kimi_expert_state(
                 state_dict,
                 num_experts=self.model_config.num_experts,
@@ -200,8 +199,6 @@ class HFTransformerStateDictAdapter:
                 raise ValueError(f"HF checkpoint key mapping collision: {target!r}")
             state[target] = value
         if self.kimi_expert_parallel:
-            from ..kimi.checkpoint import convert_kimi_expert_state
-
             state = convert_kimi_expert_state(
                 state,
                 num_experts=self.model_config.num_experts,

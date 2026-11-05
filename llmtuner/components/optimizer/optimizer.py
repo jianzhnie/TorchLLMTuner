@@ -61,6 +61,11 @@ from .state_residency import (
     validate_virtual_optimizer_groups,
 )
 
+try:
+    from torch.optim.optimizer import _get_fused_kernels_supported_devices
+except ImportError:  # Private helper is absent on some supported torch builds.
+    _get_fused_kernels_supported_devices = None
+
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
@@ -92,9 +97,7 @@ def fused_kernel_device_types() -> frozenset[str]:
     its own, is described correctly. The fallback is the pair those kernels
     have always covered, for the day the private helper moves.
     """
-    try:
-        from torch.optim.optimizer import _get_fused_kernels_supported_devices
-    except ImportError:  # pragma: no cover - private helper moved
+    if _get_fused_kernels_supported_devices is None:
         return frozenset({"cuda", "xpu"})
     return frozenset(_get_fused_kernels_supported_devices())
 

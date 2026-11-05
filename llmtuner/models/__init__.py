@@ -2,7 +2,7 @@
 
 Responsibilities are split across three layers:
 
-* ``architecture.py`` -- the lightweight registration seam for custom HF types.
+* ``architecture.py`` -- the registration seam for custom HF types.
 * ``hf/`` -- the adaptation layer: ``factory.py`` builds the HF config and
   resolves the model class, ``model.py`` holds the ``HFTransformerModel`` the
   trainer drives, ``flops.py`` counts model FLOPs per token for the MFU

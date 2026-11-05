@@ -12,6 +12,12 @@ import torch
 from ....accelerator.device import device_type
 from ....utils.logging import get_logger
 
+try:
+    from torch_checkpointing.staging import DefaultStager
+except ImportError as error:
+    DefaultStager = None
+    BACKEND_IMPORT_ERROR = error
+
 logger = get_logger(__name__)
 
 
@@ -37,7 +43,10 @@ def adapt_npu_staging(manager: Any) -> bool:
         return False
     if release != "0.1.0":
         return False
-    from torch_checkpointing.staging import DefaultStager
+    if DefaultStager is None:
+        raise ImportError("torch_checkpointing staging API is unavailable") from (
+            BACKEND_IMPORT_ERROR
+        )
 
     if type(stager) is not DefaultStager or not stager._accelerator_available:
         return False

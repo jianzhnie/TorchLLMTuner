@@ -1,7 +1,7 @@
 """TorchAO padded token dispatch for quantized grouped expert computation.
 
 Extends the shared all-to-all dispatcher with padded permutation and its inverse.
-The optional torchao package is imported only when constructing the dispatcher.
+Missing TorchAO is reported only when constructing this optional dispatcher.
 """
 
 from __future__ import annotations
@@ -14,6 +14,12 @@ from .token_dispatch import (
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
 )
+
+try:
+    from torchao.prototype.moe_training.ep.permute import permute_and_pad
+except ImportError as error:
+    permute_and_pad = None
+    TORCHAO_IMPORT_ERROR = error
 
 __all__ = ["TORCHAO_INSTALL_HINT", "TorchAOTokenDispatcher"]
 
@@ -69,10 +75,8 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
                 f"pad_multiple must be a positive integer, got {pad_multiple!r}"
             )
         self.pad_multiple = pad_multiple
-        try:
-            from torchao.prototype.moe_training.ep.permute import permute_and_pad
-        except ImportError as exc:
-            raise ImportError(TORCHAO_INSTALL_HINT) from exc
+        if permute_and_pad is None:
+            raise ImportError(TORCHAO_INSTALL_HINT) from TORCHAO_IMPORT_ERROR
         self._permute_and_pad = permute_and_pad
 
     def dispatch(

@@ -15,6 +15,14 @@ import torch.distributed as dist
 
 from ...accelerator.collectives import synchronize_local_errors
 
+try:
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+        apply_rotary_pos_emb,
+    )
+except ImportError as error:
+    apply_rotary_pos_emb = None
+    DEEPSEEK_IMPORT_ERROR = error
+
 
 class CompressionWindowExchange(torch.autograd.Function):
     """Variable-size token exchange whose backward restores source ownership."""
@@ -136,11 +144,11 @@ def compress_hca_windows(module, hidden_states, *, group):
     cos, sin = module.rotary_emb(
         entries, position_ids=positions, layer_type=module.rope_layer_type
     )
-    # Keep the model's exact partial-RoPE convention. Import only when this
-    # model-specific path is called, not when generic CP helpers are imported.
-    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-        apply_rotary_pos_emb,
-    )
+    # Keep the model's exact partial-RoPE convention.
+    if apply_rotary_pos_emb is None:
+        raise ImportError(
+            "DeepSeek V4 CP requires a compatible transformers build"
+        ) from DEEPSEEK_IMPORT_ERROR
 
     return apply_rotary_pos_emb(entries.unsqueeze(1), cos, sin), first
 
@@ -210,9 +218,10 @@ def compress_csa_windows(module, hidden_states, *, group):
     cos, sin = module.rotary_emb(
         entries, position_ids=positions, layer_type=module.rope_layer_type
     )
-    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-        apply_rotary_pos_emb,
-    )
+    if apply_rotary_pos_emb is None:
+        raise ImportError(
+            "DeepSeek V4 CP requires a compatible transformers build"
+        ) from DEEPSEEK_IMPORT_ERROR
 
     return apply_rotary_pos_emb(entries.unsqueeze(1), cos, sin), first
 
@@ -251,9 +260,10 @@ def select_csa_windows(module, hidden_states, q_residual, position_ids, *, group
     received = entries.new_empty((sum(counts), batch, width))
     dist.all_to_all_single(received, send, counts, [last - first] * size, group=group)
     keys = received.transpose(0, 1)
-    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-        apply_rotary_pos_emb,
-    )
+    if apply_rotary_pos_emb is None:
+        raise ImportError(
+            "DeepSeek V4 CP requires a compatible transformers build"
+        ) from DEEPSEEK_IMPORT_ERROR
 
     cos, sin = module.rotary_emb(
         hidden_states, position_ids=position_ids, layer_type=module.rope_layer_type

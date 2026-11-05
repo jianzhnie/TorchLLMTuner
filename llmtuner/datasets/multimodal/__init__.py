@@ -1,16 +1,6 @@
-"""Multimodal dataset recipes and their media helpers.
+"""Multimodal dataset recipes and media helpers.
 
-Deliberately empty of imports. Importing a module *from* here pulls in
-torchvision (and, for ``video``, a video backend), so a re-export would make
-``import llmtuner.datasets.multimodal.processors`` -- or anything that walks this
-package -- drag the whole media stack along. ``build_dataloader`` imports the
-two modules it needs inside the branch that has already decided the recipe name
-is multimodal, so a missing torchvision surfaces there, where it can be turned
-into install guidance instead of a bare ``ModuleNotFoundError``.
-
-Whether this module imports eagerly is not itself load-bearing: the text path
-never reaches the multimodal package object, so nothing here runs for it either
-way. What the guard in ``tests/unit_tests/cpu/datasets/
-test_multimodal_build.py`` pins down is the property that matters -- a
-text-only run leaves the media stack out of ``sys.modules`` and installable-free.
+Import concrete helpers from their defining modules. The dataloader assembly
+handles missing optional media dependencies and reports installation guidance
+when a multimodal recipe is selected.
 """

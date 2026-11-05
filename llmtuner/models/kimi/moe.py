@@ -54,10 +54,10 @@ import torch
 import torch.nn.init as init
 from torch import nn
 from torch.nn import functional as F
-from transformers.activations import ACT2FN
 
-from ..common.activation import SituGLU
 from .kimi_linear_config import KimiLinearConfig
+from .mlp import KimiExpertMLP as KimiExpertMLP
+from .mlp import KimiMLP
 from .normalization import KimiRMSNorm
 
 
@@ -193,31 +193,6 @@ class KimiMoEGate(nn.Module):
         return topk_idx, topk_weight
 
 
-class KimiExpertMLP(nn.Module):
-    def __init__(self, config, hidden_size, intermediate_size):
-        super().__init__()
-        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.situ = config.hidden_act == "situ"
-        self.act_fn = (
-            SituGLU(
-                (
-                    1.0
-                    if config.activation_situ_beta is None
-                    else config.activation_situ_beta
-                ),
-                config.activation_situ_linear_beta,
-            )
-            if self.situ
-            else ACT2FN[config.hidden_act]
-        )
-
-    def forward(self, x):
-        gate, up = self.w1(x), self.w3(x)
-        return self.w2(self.act_fn(gate, up) if self.situ else self.act_fn(gate) * up)
-
-
 class KimiSparseMoE(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -245,8 +220,6 @@ class KimiSparseMoE(nn.Module):
                 self.routed_expert_norm = KimiRMSNorm(width, config.rms_norm_eps)
         self.shared_experts = None
         if config.num_shared_experts:
-            from .model import KimiMLP
-
             shared_config = deepcopy(config)
             shared_config.intermediate_size = (
                 config.moe_intermediate_size * config.num_shared_experts

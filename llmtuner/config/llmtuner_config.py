@@ -6,6 +6,9 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import Any
 
+from transformers import AutoConfig
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.data_config import DataloaderConfig
 from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
@@ -372,9 +375,6 @@ class LLMTunerConfig:
 
     def auto_fill_model(self) -> None:
         """Fill architecture fields from a local HF directory or Hub config."""
-        from transformers import AutoConfig
-        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
         mp = self.model.model_name_or_path
         if not os.path.exists(mp) and mp in CONFIG_MAPPING:
             return  # offline architecture name; explicit sizes are authoritative

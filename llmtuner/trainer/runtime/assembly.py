@@ -48,10 +48,13 @@ from ...components.optimizer.ema import EMA
 from ...components.optimizer.lr_scheduler import build_lr_scheduler
 from ...components.optimizer.optimizer import OptimizersContainer
 from ...components.optimizer.state_residency import validate_checkpoint_configuration
+from ...components.training_observer import DispatchTimer, TrainingObserver
+from ...memory.activation_swap import reset_activation_swap_metrics
 from ...models.common.aux_loss import register_aux_loss_metrics_hook
 from ...models.common.moe.bias_update import (
     register_moe_balancing_hook,
 )
+from ...models.common.moe.experts import RoutedExperts
 from ...models.hf.factory import (
     build_model_config_for,
     unwrap_text_config,
@@ -442,13 +445,9 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
                 unwrap_text_config(hf_model_config), seq_len=cfg.max_seq_len
             ),
         )
-    from ...components.training_observer import DispatchTimer, TrainingObserver
-
     trainer.training_observer = TrainingObserver(trainer.metrics, trainer.device)
     trainer.dispatch_timers = []
     if cfg.metrics.measure_moe_dispatch:
-        from ...models.common.moe.experts import RoutedExperts
-
         for part in trainer.model_parts:
             for module in part.modules():
                 # Dedicated fused forward implementations do not use this
@@ -463,8 +462,6 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
                 "was found; dispatch timing is unavailable for this model."
             )
     if cfg.activation_swap:
-        from ...memory.activation_swap import reset_activation_swap_metrics
-
         reset_activation_swap_metrics()
     # The trainer synchronizes PP loss metrics to every stage before logging.
     logging_utils.set_log_ranks(cfg.metrics.log_ranks)

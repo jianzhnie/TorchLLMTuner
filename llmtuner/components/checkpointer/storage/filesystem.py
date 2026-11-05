@@ -1,7 +1,7 @@
 """Checkpoint path operations for local paths and fsspec URIs.
 
 Adapted from torchtitan's tools/filesystem.py. Local operations use os/shutil;
-remote operations resolve fsspec lazily. Paths remain strings to preserve URI
+remote operations require optional fsspec. Paths remain strings to preserve URI
 schemes. Deletion ignores missing paths and propagates other storage failures.
 """
 
@@ -10,6 +10,14 @@ from __future__ import annotations
 import os
 import posixpath
 import shutil
+
+try:
+    from fsspec.core import url_to_fs
+except ImportError as error:
+    url_to_fs = None
+    _FSSPEC_IMPORT_ERROR = error
+else:
+    _FSSPEC_IMPORT_ERROR = None
 
 
 def is_remote(path: str | os.PathLike[str]) -> bool:
@@ -23,9 +31,8 @@ def is_remote(path: str | os.PathLike[str]) -> bool:
 
 def resolve(path: str | os.PathLike[str]):
     """Return ``(fs, path)`` for a remote URI via fsspec."""
-    # Local path operations must not load remote filesystem dependencies.
-    from fsspec.core import url_to_fs
-
+    if url_to_fs is None:
+        raise ImportError("Remote checkpoints require fsspec") from _FSSPEC_IMPORT_ERROR
     return url_to_fs(os.fspath(path))
 
 

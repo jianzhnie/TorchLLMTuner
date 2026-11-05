@@ -27,6 +27,13 @@ from ...accelerator.capabilities import require
 from ...models.common.moe.experts import GroupedExperts
 from ..module_patterns import compile_module_pattern, resolve_module_patterns
 from .fine_grained import get_fsdp_strategy, validate_fsdp_hook_target
+from .policies import (
+    build_fsdp_placement_fn,
+    disable_fsdp_gradient_division,
+    enable_fsdp_symm_mem,
+    fsdp_shard_size,
+    get_fsdp_reshard_after_forward_policy,
+)
 
 
 def _named_module_paths(model: nn.Module) -> dict[str, nn.Module]:
@@ -567,15 +574,6 @@ def apply_fsdp_by_pattern(
         unit_options,
         implementation=cfg.fsdp_config.fsdp_implementation,
     )
-    # The entry module imports this plan; defer runtime-policy imports.
-    from .fully_shard_parallel import (
-        build_fsdp_placement_fn,
-        disable_fsdp_gradient_division,
-        enable_fsdp_symm_mem,
-        fsdp_shard_size,
-        get_fsdp_reshard_after_forward_policy,
-    )
-
     expert_placements: dict[nn.Parameter, Shard] = {}
     if cfg.ep_size > 1:
         if edp_mesh is None:

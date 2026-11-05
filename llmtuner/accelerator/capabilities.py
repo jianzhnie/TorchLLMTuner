@@ -34,20 +34,17 @@ from llmtuner.errors import EnvironmentUnsupportedError
 
 from .device import get_current_device
 
+try:
+    import torch.distributed.pipelining.schedules as pipeline_schedules
+except ImportError:
+    pipeline_schedules = None
+
+try:
+    import torch.distributed.fsdp._fully_shard._fully_shard as fully_shard_module
+except ImportError:
+    fully_shard_module = None
+
 __all__ = ["CAPABILITIES", "has", "is_compiling", "require"]
-
-
-def hasattr_torch(module: str, attr: str) -> Callable[[], bool]:
-    """Probe factory: ``hasattr(<torch submodule attr chain>, attr)``."""
-
-    def probe() -> bool:
-        try:
-            mod = importlib.import_module(module)
-        except ImportError:
-            return False
-        return getattr(mod, attr, None) is not None
-
-    return probe
 
 
 def importable(module: str, attr: str | None = None) -> Callable[[], bool]:
@@ -91,17 +88,14 @@ def _pipelining_has_eval() -> bool:
     seam's ``_step_microbatches(..., return_outputs=...)`` arrived in the same
     window, so both are checked.
     """
-    if not importable("torch.distributed.pipelining.schedules", "_PipelineSchedule")():
-        return False
-    import torch.distributed.pipelining.schedules as schedules
-
-    evaluate = getattr(schedules._PipelineSchedule, "eval", None)
+    schedule = getattr(pipeline_schedules, "_PipelineSchedule", None)
+    evaluate = getattr(schedule, "eval", None)
     if evaluate is None:
         return False
     eval_params = inspect.signature(evaluate).parameters
     if "arg_mbs" not in eval_params:
         return False
-    step = getattr(schedules._PipelineSchedule, "_step_microbatches", None)
+    step = getattr(schedule, "_step_microbatches", None)
     if step is None:
         return False
     return "return_outputs" in inspect.signature(step).parameters
@@ -115,13 +109,7 @@ def _fsdp_unshard_is_a_context_manager() -> bool:
     or checkpoint restoration. torch 2.9's handle only has ``wait()``; inspect
     the handle class rather than guessing from the torch version.
     """
-    if not importable(
-        "torch.distributed.fsdp._fully_shard._fully_shard", "_UnshardHandleImpl"
-    )():
-        return False
-    import torch.distributed.fsdp._fully_shard._fully_shard as fully_shard_module
-
-    handle = fully_shard_module._UnshardHandleImpl
+    handle = getattr(fully_shard_module, "_UnshardHandleImpl", None)
     return hasattr(handle, "__enter__") and hasattr(handle, "__exit__")
 
 
@@ -177,14 +165,14 @@ class Capability:
 CAPABILITIES: dict[str, Capability] = {
     # -- compile-time knobs (consumers: parallel/model_compile.py) -------------------
     "dynamo_capture_scalar_outputs": Capability(
-        hasattr_torch("torch._dynamo.config", "capture_scalar_outputs"),
+        importable("torch._dynamo.config", "capture_scalar_outputs"),
         what="torch._dynamo.config.capture_scalar_outputs",
         since="torch 2.7 (dynamo config flag)",
         hint="Upgrade torch, or run the token-choice MoE without compile.",
         consumers="parallel/model_compile.py (token-choice MoE dispatch compile)",
     ),
     "inductor_micro_pipeline_tp": Capability(
-        hasattr_torch("torch._inductor.config", "_micro_pipeline_tp"),
+        importable("torch._inductor.config", "_micro_pipeline_tp"),
         what="torch._inductor.config._micro_pipeline_tp",
         since="torch 2.8 (inductor micro-pipeline TP pass)",
         hint="Upgrade torch, or run without async TP.",
@@ -218,7 +206,7 @@ CAPABILITIES: dict[str, Capability] = {
     ),
     # -- activation checkpointing (consumer: memory/activation_checkpoint.py)
     "functorch_activation_memory_budget": Capability(
-        hasattr_torch("torch._functorch.config", "activation_memory_budget"),
+        importable("torch._functorch.config", "activation_memory_budget"),
         what="torch._functorch.config.activation_memory_budget",
         since="torch 2.6 (functorch partitioner budget knob)",
         hint="Upgrade torch, or use activation_checkpoint_mode='full'/'selective'.",
@@ -306,7 +294,7 @@ def is_compiling() -> bool:
     a caller asking "am I being traced?" wants to hear. Answered here rather
     than at each call site so the version difference has one home.
     """
-    fn = getattr(torch.compiler, "is_compiling", None)
+    fn = getattr(getattr(torch, "compiler", None), "is_compiling", None)
     return bool(fn()) if fn is not None else False
 
 

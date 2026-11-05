@@ -16,6 +16,12 @@ from .state_dict import (
     validate_optimizer_step_counter,
 )
 
+try:
+    import torch_npu
+except ImportError as error:
+    torch_npu = None
+    TORCH_NPU_IMPORT_ERROR = error
+
 __all__ = [
     "install_state_residency",
     "validate_checkpoint_configuration",
@@ -44,8 +50,15 @@ def validate_checkpoint_configuration(backend: str, async_mode: str) -> None:
 def _empty_with_swapped_memory(
     shape: torch.Size, *, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
-    import torch_npu
-
+    if torch_npu is None:
+        raise EnvironmentUnsupportedError(
+            "Virtual optimizer allocation requires a working torch-npu installation"
+        ) from TORCH_NPU_IMPORT_ERROR
+    if not callable(getattr(torch_npu, "empty_with_swapped_memory", None)):
+        raise EnvironmentUnsupportedError(
+            "Virtual optimizer requires torch_npu.empty_with_swapped_memory; "
+            "install a compatible torch-npu build or select state_residency='device'."
+        )
     return torch_npu.empty_with_swapped_memory(shape, dtype=dtype, device=device)
 
 

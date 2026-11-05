@@ -1,7 +1,8 @@
 """ATen RMSNorm boundaries for explicit CPU reproducible execution.
 
-Imported only when the model requests the aten normalization backend. Operator
-registrations belong to this module's lifetime, not an individual Trainer.
+Operator registrations belong to this module's lifetime, not an individual
+Trainer. Importing an adapter registers its operators; only the configured
+normalization backend is installed on model instances.
 Only first-order gradients are supported.
 """
 

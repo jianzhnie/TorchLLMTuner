@@ -52,51 +52,18 @@ and pipeline transfer of attention-residual history require further integration.
 import torch
 from torch import nn
 from transformers import PreTrainedModel
-from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
 
-from ..common.activation import SituGLU
 from .attention_residual import attention_residual
 from .delta_attention import KimiDeltaAttention
 from .kimi_linear_config import KimiLinearConfig
 from .latent_attention import KimiLatentAttention
+from .mlp import KimiMLP as KimiMLP
+from .moe import KimiSparseMoE
 from .normalization import KimiRMSNorm
-
-
-class KimiMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.gate_proj = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.up_proj = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.down_proj = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=False
-        )
-        self.situ = config.hidden_act == "situ"
-        self.act_fn = (
-            SituGLU(
-                (
-                    1.0
-                    if config.activation_situ_beta is None
-                    else config.activation_situ_beta
-                ),
-                config.activation_situ_linear_beta,
-            )
-            if self.situ
-            else ACT2FN[config.hidden_act]
-        )
-
-    def forward(self, x):
-        gate, up = self.gate_proj(x), self.up_proj(x)
-        return self.down_proj(
-            self.act_fn(gate, up) if self.situ else self.act_fn(gate) * up
-        )
 
 
 class KimiDecoderLayer(nn.Module):
@@ -123,8 +90,6 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
         ):
-            from .moe import KimiSparseMoE
-
             self.block_sparse_moe = KimiSparseMoE(config)
         else:
             self.mlp = KimiMLP(config)

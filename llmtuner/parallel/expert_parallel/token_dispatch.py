@@ -21,6 +21,7 @@ import torch.distributed as dist
 from torch.distributed._functional_collectives import all_to_all_single
 
 from ...accelerator.distributed import get_world_size
+from ...errors import EnvironmentUnsupportedError
 from ...models.common.scatter_add import deterministic_scatter_add
 from ...utils.logging import get_logger
 
@@ -57,8 +58,6 @@ def _grad_carrying_all_to_all(
     if _differentiable_all_to_all is None:
         if not torch.is_grad_enabled() or not tensor.requires_grad:
             return all_to_all_single(tensor, output_splits, input_splits, group=group)
-        from ...errors import EnvironmentUnsupportedError
-
         raise EnvironmentUnsupportedError(
             "EP training requires torch.distributed._functional_collectives."
             "all_to_all_single_autograd; install a compatible PyTorch build. "

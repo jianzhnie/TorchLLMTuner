@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-import importlib
-
 import torch
+import torch.nn.attention.flex_attention as flex_api
+from torch.nn.attention.flex_attention import create_block_mask
 from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import AttentionInterface
 
+from ...errors import UnsupportedCombinationError
 from ...parallel.model_compile import maybe_regional_inductor
+from ..common.attention.eager_flex import eager_flex_attention
+
+try:
+    from torch.nn.attention.flex_attention import AuxRequest, BlockMask, flex_attention
+except ImportError as error:
+    _FLEX_IMPORT_ERROR = error
+else:
+    _FLEX_IMPORT_ERROR = None
 
 ATTENTION_BACKEND = "flex_torchtitan"
 # The interface a CP run uses when flex is not available (NPU): sdpa plus the
@@ -20,11 +30,6 @@ EAGER_FLEX_BACKEND = "llmtuner_eager_flex"
 
 def eager_flex_attention_adapter(module, query, key, value, attention_mask, **kwargs):
     """Consume HF dense masks through explicit eager Flex without global patches."""
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    from llmtuner.errors import UnsupportedCombinationError
-    from llmtuner.models.common.attention.eager_flex import eager_flex_attention
-
     if kwargs.get("dropout", 0.0) != 0.0:
         raise UnsupportedCombinationError(
             "eager Flex does not implement attention dropout"
@@ -97,7 +102,7 @@ FLEX_INDUCTOR_CONFIGS = {
 
 
 def allow_npu_flex_attention() -> None:
-    module = importlib.import_module("torch.nn.attention.flex_attention")
+    module = flex_api
     if not hasattr(module, "_validate_device") or hasattr(
         module, "_llmtuner_original_validate_device"
     ):
@@ -121,16 +126,13 @@ def available_attention_backend() -> str:
 def flex_attention_adapter(module, query, key, value, attention_mask, **kwargs):
     """Adapt the Hugging Face attention interface to llmtuner flex kernels."""
     if kwargs.get("dropout", 0.0) != 0.0:
-        from ...errors import UnsupportedCombinationError
-
         raise UnsupportedCombinationError("Flex attention does not support dropout")
     kernel = getattr(module, "_titan_flex_kernel", None)
     if kernel is None:
-        from torch.nn.attention.flex_attention import (
-            AuxRequest,
-            BlockMask,
-            flex_attention,
-        )
+        if _FLEX_IMPORT_ERROR is not None:
+            raise ImportError(
+                "Flex attention requires PyTorch AuxRequest support"
+            ) from (_FLEX_IMPORT_ERROR)
 
         explicit_flex = getattr(module.config, "attention_backend", None) == "flex"
         if explicit_flex and query.device.type == "npu":
@@ -200,8 +202,6 @@ def register_attention_backend() -> None:
     AttentionInterface.register(ATTENTION_BACKEND, flex_attention_adapter)
     AttentionInterface.register(CP_SDPA_BACKEND, cp_sdpa_attention_adapter)
     AttentionInterface.register(EAGER_FLEX_BACKEND, eager_flex_attention_adapter)
-    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
-
     ALL_MASK_ATTENTION_FUNCTIONS.register(
         EAGER_FLEX_BACKEND, ALL_MASK_ATTENTION_FUNCTIONS["sdpa"]
     )

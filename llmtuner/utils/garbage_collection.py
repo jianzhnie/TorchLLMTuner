@@ -12,7 +12,16 @@ import time
 from threading import RLock
 from typing import ClassVar
 
+from ..accelerator.distributed import is_main_process
 from .logging import get_logger
+
+try:
+    from torch.utils.viz._cycles import warn_tensor_cycles
+except ImportError as error:
+    warn_tensor_cycles = None
+    _CYCLE_IMPORT_ERROR = error
+else:
+    _CYCLE_IMPORT_ERROR = None
 
 logger = get_logger(__name__)
 
@@ -48,10 +57,10 @@ class GarbageCollection:
         try:
             self.collect("Initial GC collection")
             if debug:
-                from torch.utils.viz._cycles import warn_tensor_cycles
-
-                from ..accelerator.distributed import is_main_process
-
+                if warn_tensor_cycles is None:
+                    raise ImportError(
+                        "GC debug mode requires torch.utils.viz._cycles"
+                    ) from _CYCLE_IMPORT_ERROR
                 if is_main_process():
                     warn_tensor_cycles()
         except BaseException:

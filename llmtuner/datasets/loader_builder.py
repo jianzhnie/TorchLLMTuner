@@ -6,15 +6,14 @@ then construct the loader. Synthetic data bypasses tokenizer and packing setup.
 
 from __future__ import annotations
 
-import hashlib
-import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 import grain.python as grain
 
+from ..components.tokenizer.huggingface import HuggingFaceTokenizer
+from ..components.tokenizer.multimodal import MultimodalTokenizer
 from .collators import (
     CollatorFactory,
     ContextRowsCollator,
@@ -29,13 +28,13 @@ from .contracts import (
     validate_dp_coordinates,
     validate_loader_iteration,
 )
+from .corpus_identity import corpus_data_identity as corpus_data_identity
 from .dataloader import GrainDataLoader
 from .packing.build import (
     build_concat_then_split_packing,
     build_first_fit_packing,
 )
 from .packing.global_rows import GlobalRowsIterDataset
-from .sources import file_patterns_to_paths
 from .synthetic import RandomTokenDataLoader
 from .text.recipes import (
     DATASETS,
@@ -43,6 +42,16 @@ from .text.recipes import (
     build_local_jsonl_sft,
     build_local_jsonl_sft_multiturn,
 )
+from .text.renderer import build_chat_renderer
+
+# Media dependencies remain optional for text and synthetic recipes.
+MULTIMODAL_IMPORT_ERROR = None
+try:
+    from .multimodal.collator import MultimodalCollator
+    from .multimodal.packing import build_multimodal_packing
+    from .multimodal.recipes import MULTIMODAL_DATASETS
+except ImportError as error:
+    MULTIMODAL_IMPORT_ERROR = error
 
 if TYPE_CHECKING:
     from ..components.tokenizer.base import BaseTokenizer
@@ -51,84 +60,6 @@ if TYPE_CHECKING:
     from .composition import DatasetRecipe
 
 __all__ = ["build_dataloader"]
-
-
-def corpus_data_identity(config: LLMTunerConfig, *, dataset: str, repeat: bool) -> str:
-    """Fingerprint tokenizer assets, processing policy and source identity.
-
-    Local text includes file contents. Other recipes require a caller-declared
-    snapshot identifier; this cannot infer remote contents or callable semantics.
-    This is a construction-time snapshot, not a file mutation lock.
-    """
-    data_settings = asdict(config.dataloader)
-    if not data_settings["global_context_rows"]:
-        data_settings.pop("global_context_rows")
-    # Ranks may stage identical assets in different local directories. DCP
-    # shares loader metadata, so paths cannot define content identity.
-    for name in ("dataset_path", "tokenizer_path", "num_prefetch_batches"):
-        data_settings.pop(name)
-    if data_settings["data_identity"] is None:
-        # Preserve existing local-text-v1 checkpoint identities.
-        data_settings.pop("data_identity")
-    settings = {
-        "version": 1,
-        "dataset": dataset,
-        "seed": config.seed,
-        "repeat": repeat,
-        "data": data_settings,
-    }
-    if dataset not in {"local_jsonl", "local_jsonl_sft"} and dataset not in DATASETS:
-        # Registering previously unregistered visual markers changes packed
-        # samples with unchanged assets. Old media cursors cannot be reused.
-        settings["multimodal_encoding"] = "atomic-markers-bounded-packing-v2"
-    elif config.dataloader.packing == "first_fit":
-        # Chunk boundaries now respect row capacity as well as context length.
-        # Grain's pending chunk offsets from the old graph are not portable.
-        settings["text_packing"] = "bounded-first-fit-v1"
-    tokenizer_json = Path(config.dataloader.tokenizer_path) / "tokenizer.json"
-    if tokenizer_json.is_file():
-        with tokenizer_json.open(encoding="utf-8") as handle:
-            tokenizer_settings = json.load(handle)
-        if any(
-            tokenizer_settings.get(name) is not None
-            for name in ("padding", "truncation")
-        ):
-            # Older loaders inherited saved batch policies. Their cursor can
-            # describe a different packed token stream even with identical files.
-            settings["tokenizer_encoding"] = "unrestricted-samples-v1"
-    digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode())
-    local_text = dataset in {"local_jsonl", "local_jsonl_sft"}
-    if not local_text and config.dataloader.data_identity is None:
-        raise ValueError("registered corpus identity requires dataloader.data_identity")
-    files = (
-        list(file_patterns_to_paths((config.dataloader.dataset_path,)))
-        if local_text
-        else []
-    )
-    tokenizer_path = Path(config.dataloader.tokenizer_path)
-    for name in (
-        "tokenizer.json",
-        "vocab.txt",
-        "vocab.json",
-        "merges.txt",
-        "tokenizer_config.json",
-        "chat_template.jinja",
-    ):
-        path = tokenizer_path / name
-        digest.update(name.encode())
-        if path.is_file():
-            files.append(str(path))
-        else:
-            digest.update(b"absent")
-    for filename in files:
-        file_digest = hashlib.sha256()
-        with open(filename, "rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                file_digest.update(chunk)
-        digest.update(file_digest.digest())
-    return (
-        "local-text-v1:" if local_text else "declared-corpus-v1:"
-    ) + digest.hexdigest()
 
 
 class _PackingBuilder(Protocol):
@@ -155,12 +86,8 @@ class _ResolvedRecipe:
 def _resolve_multimodal_recipe(
     dataset_name: str, *, num_packing_bins: int
 ) -> _ResolvedRecipe:
-    """Resolve media packing lazily, keeping registries out of configuration."""
-    try:
-        from .multimodal.collator import MultimodalCollator
-        from .multimodal.packing import build_multimodal_packing
-        from .multimodal.recipes import MULTIMODAL_DATASETS
-    except ImportError as exc:
+    """Resolve media packing and diagnose unavailable optional dependencies."""
+    if MULTIMODAL_IMPORT_ERROR is not None:
         raise ImportError(
             f"dataset {dataset_name!r} is not one of the text "
             f"recipes {sorted(DATASETS)}, so it was looked up in the "
@@ -168,7 +95,7 @@ def _resolve_multimodal_recipe(
             "recipes need the optional dependencies torchvision and Pillow "
             "(and av for video): install them with `pip install torchvision "
             "pillow av`, or name a text recipe instead."
-        ) from exc
+        ) from MULTIMODAL_IMPORT_ERROR
     if dataset_name not in MULTIMODAL_DATASETS:
         raise ValueError(
             f"unknown dataset {dataset_name!r}. Expected 'random', "
@@ -195,11 +122,6 @@ def _resolve_text_recipe(
         recipe = build_local_jsonl(path=dataloader_config.dataset_path)
     elif dataset_name == "local_jsonl_sft":
         if dataloader_config.chat_renderer is not None:
-            # Imported here, not at module scope: the renderers package is an
-            # optional dependency, and a run that leaves chat_renderer unset
-            # must not have to install it.
-            from llmtuner.datasets.text.renderer import build_chat_renderer
-
             recipe = build_local_jsonl_sft_multiturn(
                 path=dataloader_config.dataset_path,
                 messages_field=dataloader_config.messages_field,
@@ -318,8 +240,6 @@ def build_dataloader(
     if is_multimodal:
         # Resolved before the tokenizer is constructed, so a bad name fails
         # fast without loading tokenizer assets.
-        from llmtuner.components.tokenizer.multimodal import MultimodalTokenizer
-
         resolved = _resolve_multimodal_recipe(
             dataset_name, num_packing_bins=dataloader_config.num_packing_bins
         )
@@ -334,9 +254,6 @@ def build_dataloader(
         # Media lists require whole-document FirstFit packing; --packing applies
         # only to text. The media collator constructs patches after packing.
     else:
-        # Keep tokenizer dependencies out of the synthetic-data path.
-        from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
-
         tokenizer = HuggingFaceTokenizer(
             tokenizer_path=dataloader_config.tokenizer_path
         )
