@@ -134,6 +134,9 @@ class FSDPPatternReferences:
         }
         current_modules = set(modules.values())
         current_parameters = set(parameters.values())
+        first_module_paths: dict[int, str] = {}
+        for path, module in modules.items():
+            first_module_paths.setdefault(id(module), path)
 
         def bind_parameters(
             exclusions: set[nn.Parameter], context: str
@@ -166,10 +169,7 @@ class FSDPPatternReferences:
             pattern = canonical_fqn(name)
             if pattern not in modules:
                 target = self.module_targets.get(self.unit_modules.get(name))
-                pattern = next(
-                    (path for path, module in modules.items() if module is target),
-                    pattern,
-                )
+                pattern = first_module_paths.get(id(target), pattern)
             options = source.copy()
             hook = options.get("hook_module")
             if isinstance(hook, nn.Module):
@@ -199,20 +199,20 @@ class FSDPPatternReferences:
             name = canonical_fqn(name)
             if name not in modules and source_module is not None:
                 target = self.module_targets.get(source_module, source_module)
-                name = next(
-                    (path for path, module in modules.items() if module is target), name
-                )
+                name = first_module_paths.get(id(target), name)
             ignored_names.append(name)
         # A source subtree can split across owners (Kimi gate weight and
         # correction bias). Preserve moved parameters without excluding the
         # target parameter's entire new parent subtree.
-        module_exclusions = {
-            parameter
-            for pattern in ignored_names
-            for name, module in modules.items()
-            if compile_module_pattern(pattern).fullmatch(name)
-            for parameter in module.parameters()
-        }
+        module_exclusions: set[nn.Parameter] = set()
+        for pattern in ignored_names:
+            compiled = compile_module_pattern(pattern)
+            module_exclusions.update(
+                parameter
+                for name, module in modules.items()
+                if compiled.fullmatch(name)
+                for parameter in module.parameters()
+            )
         moved_exclusions = (
             bind_parameters(self.ignored_parameters, "FSDP ignored modules")
             - module_exclusions
@@ -490,17 +490,13 @@ def _resolve_shared_fsdp_units(
     return grouped_options
 
 
-def apply_fsdp_by_pattern(
-    model: nn.Module,
+def validate_fsdp_pattern_options(
+    named_modules: dict[str, nn.Module],
+    unit_options: dict[str, dict[str, Any]],
     *,
-    dp_mesh: DeviceMesh,
-    cfg: ParallelConfig,
-    param_dtype: torch.dtype,
-    reduce_dtype: torch.dtype,
-    edp_mesh: DeviceMesh | None = None,
+    implementation: str,
 ) -> None:
-    """Apply independently configured FSDP units selected by module patterns."""
-    named_modules, unit_options, ignored_params = _resolve_pattern_units(model, cfg)
+    """Reject invalid unit overrides before any model transformation."""
     for name in [*unit_options, ""]:
         if isinstance(named_modules[name], nn.ModuleList | nn.ModuleDict):
             raise ValueError(
@@ -525,7 +521,7 @@ def apply_fsdp_by_pattern(
             if key not in options:
                 continue
             policy = options[key]
-            if policy is None and cfg.fsdp_config.fsdp_implementation == "custom":
+            if policy is None and implementation == "custom":
                 continue  # The custom engine constructs its default policy.
             if not isinstance(policy, policy_type):
                 raise TypeError(
@@ -550,9 +546,27 @@ def apply_fsdp_by_pattern(
     for name, options in unit_options.items():
         if "hook_module" not in options:
             continue
-        if cfg.fsdp_config.fsdp_implementation == "native":
+        if implementation == "native":
             raise ValueError("native FSDP does not accept a hook_module override")
         validate_fsdp_hook_target([named_modules[name]], options["hook_module"])
+
+
+def apply_fsdp_by_pattern(
+    model: nn.Module,
+    *,
+    dp_mesh: DeviceMesh,
+    cfg: ParallelConfig,
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+    edp_mesh: DeviceMesh | None = None,
+) -> None:
+    """Apply independently configured FSDP units selected by module patterns."""
+    named_modules, unit_options, ignored_params = _resolve_pattern_units(model, cfg)
+    validate_fsdp_pattern_options(
+        named_modules,
+        unit_options,
+        implementation=cfg.fsdp_config.fsdp_implementation,
+    )
     # The entry module imports this plan; defer runtime-policy imports.
     from .fully_shard_parallel import (
         build_fsdp_placement_fn,
@@ -645,6 +659,19 @@ def apply_fsdp_by_pattern(
                 f"factor of shard mesh size {degree}, got {reshard}"
             )
     registration_order = {name: index for index, name in enumerate(named_modules)}
+    if (
+        cfg.ep_size > 1
+        and expert_placements
+        and any(
+            options.get("shard_placement_fn") is None for _, options in grouped_options
+        )
+    ):
+        # Check before wrapping even units with custom placement functions:
+        # a later default unit must not fail after earlier units were mutated.
+        require(
+            "fsdp_per_param_mesh",
+            feature="expert parallelism combined with pattern-selected FSDP",
+        )
     prefetch_units = []
     for names, options in grouped_options:
         if cfg.ep_size == 1 and expert_counts:
@@ -654,19 +681,11 @@ def apply_fsdp_by_pattern(
                 for parameter, count in expert_counts.items()
                 if degree > count
             }
-        if (
-            expert_placements or (cfg.ep_size == 1 and expert_counts)
-        ) and "shard_placement_fn" not in options:
+        if (expert_placements or (cfg.ep_size == 1 and expert_counts)) and options.get(
+            "shard_placement_fn"
+        ) is None:
             if cfg.ep_size > 1:
                 assert edp_mesh is not None
-                # Same two-mesh-in-one-unit requirement as the decoder path;
-                # refuse rather than let the placement function's import fail
-                # obscurely. The pattern path has no nested-unit fallback: its
-                # units are pattern-selected, not block-bounded.
-                require(
-                    "fsdp_per_param_mesh",
-                    feature="expert parallelism combined with pattern-selected FSDP",
-                )
                 options["shard_placement_fn"] = build_fsdp_placement_fn(
                     expert_placements, dp_mesh=options["mesh"], edp_mesh=edp_mesh
                 )

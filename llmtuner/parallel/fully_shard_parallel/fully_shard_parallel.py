@@ -590,16 +590,20 @@ def apply_fsdp_to_decoder(
     forward_window = forward_prefetch_count or (1 if ep_degree > 1 else 0)
     backward_window = backward_prefetch_count or (1 if ep_degree > 1 else 0)
     if forward_window or backward_window:
-        execution_order = [
-            module
-            for module in (
-                model.tok_embeddings,
-                *[block for _, block in iter_transformer_layers(model.layers)],
-                model.norm,
-                model.lm_head,
+        # Aliased layer slots execute repeatedly but configure one FSDP unit.
+        # Keep its first occurrence, as for distinct modules sharing one state.
+        execution_order = list(
+            dict.fromkeys(
+                module
+                for module in (
+                    model.tok_embeddings,
+                    *[block for _, block in iter_transformer_layers(model.layers)],
+                    model.norm,
+                    model.lm_head,
+                )
+                if isinstance(module, FSDPModule)
             )
-            if isinstance(module, FSDPModule)
-        ]
+        )
         set_fsdp_prefetch_windows(
             execution_order,
             forward_count=forward_window,

@@ -170,12 +170,7 @@ def parallelize_hf_transformers(
                         part, on_replacement=references.record_replacements
                     )
                 elif name == "fsdp" and references is not None:
-                    part = apply_fsdp(
-                        part,
-                        cfg=references.bind(part),
-                        parallel_dims=parallel_dims,
-                        chunked_loss_num_chunks=chunked_loss_num_chunks,
-                    )
+                    part = runners[name](part, cfg=references.bind(part))
                 else:
                     part = runners[name](part)
         return part

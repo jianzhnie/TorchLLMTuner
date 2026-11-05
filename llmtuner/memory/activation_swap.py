@@ -6,6 +6,7 @@ import weakref
 from dataclasses import dataclass
 from functools import wraps
 from threading import Lock
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -240,10 +241,14 @@ def activation_swap_metrics() -> dict[str, float | int]:
             "copies_d2h": _copies_d2h,
             "copies_h2d": _copies_h2d,
         }
+    started = perf_counter()
+    d2h_seconds = _event_seconds(d2h_events)
+    h2d_seconds = _event_seconds(h2d_events)
     return {
         **counters,
-        "d2h_seconds": _event_seconds(d2h_events),
-        "h2d_seconds": _event_seconds(h2d_events),
+        "d2h_seconds": d2h_seconds,
+        "h2d_seconds": h2d_seconds,
+        "timing_collection_wait_seconds": perf_counter() - started,
     }
 
 
@@ -287,7 +292,6 @@ def apply_activation_swap(
     budget = _HostBudget(limit=max_host_bytes)
     layer_count = 0
     for layer in layers.children():
-        layer_count += 1
         forward = layer.forward
         if getattr(forward, "_activation_swap_enabled", False):
             continue
@@ -319,11 +323,18 @@ def apply_activation_swap(
                 )
             except BaseException:
                 # Release can also fail after D2H copies have been submitted.
-                state.abort()
+                try:
+                    state.abort()
+                except BaseException:
+                    try:
+                        logger.exception("Activation swap cleanup failed after forward")
+                    except BaseException:
+                        pass  # Preserve the original forward/release failure.
                 raise
             return outputs
 
         swapped_forward._activation_swap_enabled = True
         layer.forward = swapped_forward
+        layer_count += 1
     logger.info("Applied NPU activation swap to %d layers", layer_count)
     return model

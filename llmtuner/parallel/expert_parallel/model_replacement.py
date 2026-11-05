@@ -20,7 +20,8 @@ installation; callers use it to migrate metadata tied to the original objects.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -106,14 +107,16 @@ def _bind_shared_projection(
             )
         return
     shared = previous[0]
-    consistent = shared is not None and len(shared) == len(names)
-    for entry in previous:
-        if (
-            entry is None
-            or len(entry) != len(shared or ())
-            or any(a is not b for a, b in zip(entry, shared or (), strict=True))
-        ):
-            consistent = False
+    consistent = (
+        shared is not None
+        and len(shared) == len(names)
+        and all(
+            entry is not None
+            and len(entry) == len(shared)
+            and all(a is b for a, b in zip(entry, shared, strict=True))
+            for entry in previous
+        )
+    )
     if not consistent:
         raise UnsupportedCombinationError(
             "MoE conversion cannot preserve a partially shared expert "
@@ -203,6 +206,88 @@ def _plan_tp_checkpoint_layouts(
                 )
         converted_layouts.append((converted_blocks.get(id(owner), owner), updated))
     return converted_layouts
+
+
+def _validate_kimi_expert_aliases(
+    candidates: list[tuple[nn.Module, str, nn.Module, bool]],
+    module_paths: list[tuple[str, nn.Module]],
+    external_parameters: dict[int, list[str]],
+) -> None:
+    """Reject expert aliases that stacking cannot preserve, before conversion.
+
+    Repeated references to one block are allowed. Sharing individual expert
+    parameters within or across blocks, or with external consumers, is not.
+    This preflight reads the original model without allocating replacements.
+    """
+    # Stacking a projection cannot preserve individual expert aliases. Reject
+    # them before constructing any replacement, including cross-block aliases.
+    kimi_expert_ids = {
+        id(parameter)
+        for _, _, block, _ in candidates
+        if isinstance(block, KimiSparseMoE)
+        for parameter in block.experts.parameters()
+    }
+    if not kimi_expert_ids:
+        return
+    owners: dict[int, tuple[int, str]] = {}
+    checked_kimi_blocks: set[int] = set()
+    for _, _, block, _ in candidates:
+        if not isinstance(block, KimiSparseMoE) or id(block) in checked_kimi_blocks:
+            continue
+        checked_kimi_blocks.add(id(block))
+        for name, parameter in block.experts.named_parameters(remove_duplicate=False):
+            owner = (id(block), name)
+            previous = owners.setdefault(id(parameter), owner)
+            if previous != owner:
+                raise UnsupportedCombinationError(
+                    "Kimi EP cannot stack a shared individual expert parameter "
+                    f"at experts.{name}; expert aliases require a layout adapter"
+                )
+    owners.clear()
+    for path, module in module_paths:
+        for name, parameter in module.named_parameters(recurse=False):
+            if id(parameter) not in kimi_expert_ids:
+                continue
+            owner = (id(module), name)
+            previous = owners.setdefault(id(parameter), owner)
+            if previous != owner or id(parameter) in external_parameters:
+                raise UnsupportedCombinationError(
+                    f"Kimi EP cannot stack a shared individual expert parameter "
+                    f"at {path}.{name}; expert aliases require a layout adapter"
+                )
+
+
+def _find_moe_candidates(
+    model: nn.Module, layers: Iterable[nn.Module], hf_config: Any
+) -> list[tuple[nn.Module, str, nn.Module, bool]]:
+    """Inspect every decoder layer before allocating replacement modules."""
+    candidates = []
+    for layer in layers:
+        attr, block = moe_block_of(layer)
+        if block is None or not (
+            isinstance(block, KimiSparseMoE) or is_hf_moe_block(block)
+        ):
+            continue
+        wants_router_logits = returns_router_logits(block)
+        if wants_router_logits and getattr(hf_config, "output_router_logits", False):
+            raise UnsupportedCombinationError(
+                f"{type(block).__name__} returns router logits and its config "
+                "enables output_router_logits, but the swapped-in llmtuner MoE "
+                "keeps its router scores internal, so it could only hand back "
+                "None. Turn output_router_logits off -- llmtuner runs its own "
+                "load-balancing loss -- before swapping."
+            )
+        candidates.append((layer, attr, block, wants_router_logits))
+
+    if not candidates:
+        raise UnsupportedCombinationError(
+            f"no HF MoE block found on {type(model).__name__} "
+            f"({type(getattr(model, 'model', model)).__name__}): no layer's "
+            "``mlp`` has the router-gate + fused gate_up_proj/down_proj shape "
+            "this swap recognizes. Add the model family's layout to the probe "
+            "in parallel/expert_parallel/hf_inspection.py."
+        )
+    return candidates
 
 
 def swap_hf_moe_blocks(
@@ -296,40 +381,9 @@ def swap_hf_moe_blocks(
     # frozen zero bias never lands in the checkpoint.
     default_coeff = getattr(hf_config, "load_balance_coeff", 1e-3)
 
-    # Probe every layer before constructing replacements: a later unsupported
-    # expert layout must not leave earlier layers converted.
-    candidates: list[tuple[nn.Module, str, nn.Module, bool]] = []
-    for layer in layers:
-        attr, block = moe_block_of(layer)
-        # Dense layers of a mixed model (Qwen3Moe's decoder_sparse_step, and the
-        # first_k_dense_replace of the DeepSeek/GLM4 families) are left alone.
-        if block is None or not (
-            isinstance(block, KimiSparseMoE) or is_hf_moe_block(block)
-        ):
-            continue
-        wants_router_logits = returns_router_logits(block)
-        # The replacement has no router logits to hand back (llmtuner's router
-        # keeps its scores internal), so a config that asks HF to consume them
-        # would get ``None`` where it expects a tensor. Refuse rather than
-        # answer with a value that is wrong in a way no loss curve shows.
-        if wants_router_logits and getattr(hf_config, "output_router_logits", False):
-            raise UnsupportedCombinationError(
-                f"{type(block).__name__} returns router logits and its config "
-                "enables output_router_logits, but the swapped-in llmtuner MoE "
-                "keeps its router scores internal, so it could only hand back "
-                "None. Turn output_router_logits off -- llmtuner runs its own "
-                "load-balancing loss -- before swapping."
-            )
-        candidates.append((layer, attr, block, wants_router_logits))
-
-    if not candidates:
-        raise UnsupportedCombinationError(
-            f"no HF MoE block found on {type(model).__name__} "
-            f"({type(getattr(model, 'model', model)).__name__}): no layer's "
-            "``mlp`` has the router-gate + fused gate_up_proj/down_proj shape "
-            "this swap recognizes. Add the model family's layout to the probe "
-            "in parallel/expert_parallel/hf_inspection.py."
-        )
+    # Complete preflight before constructing replacements so unsupported later
+    # layers cannot leave earlier ones converted.
+    candidates = _find_moe_candidates(model, layers, hf_config)
 
     module_paths = list(model.named_modules(remove_duplicate=False))
     # Index owners once; retain every registered path for aliased decoder layers.
@@ -366,40 +420,7 @@ def swap_hf_moe_blocks(
     )
     converted_biases: dict[int, torch.Tensor] = {}
     aux_group_counts = dict(AuxLoss._group_counts)
-    # Stacking a projection cannot preserve individual expert aliases. Reject
-    # them before constructing any replacement, including cross-block aliases.
-    kimi_expert_ids = {
-        id(parameter)
-        for _, _, block, _ in candidates
-        if isinstance(block, KimiSparseMoE)
-        for parameter in block.experts.parameters()
-    }
-    owners: dict[int, tuple[int, str]] = {}
-    checked_kimi_blocks: set[int] = set()
-    for _, _, block, _ in candidates:
-        if not isinstance(block, KimiSparseMoE) or id(block) in checked_kimi_blocks:
-            continue
-        checked_kimi_blocks.add(id(block))
-        for name, parameter in block.experts.named_parameters(remove_duplicate=False):
-            owner = (id(block), name)
-            previous = owners.setdefault(id(parameter), owner)
-            if previous != owner:
-                raise UnsupportedCombinationError(
-                    "Kimi EP cannot stack a shared individual expert parameter "
-                    f"at experts.{name}; expert aliases require a layout adapter"
-                )
-    owners.clear()
-    for path, module in module_paths:
-        for name, parameter in module.named_parameters(recurse=False):
-            if id(parameter) not in kimi_expert_ids:
-                continue
-            owner = (id(module), name)
-            previous = owners.setdefault(id(parameter), owner)
-            if previous != owner or id(parameter) in external_parameters:
-                raise UnsupportedCombinationError(
-                    f"Kimi EP cannot stack a shared individual expert parameter "
-                    f"at {path}.{name}; expert aliases require a layout adapter"
-                )
+    _validate_kimi_expert_aliases(candidates, module_paths, external_parameters)
     try:
         for layer, attr, block, wants_router_logits in candidates:
             # Repeated layer slots may reference one physical HF block. Preserve
@@ -455,35 +476,30 @@ def swap_hf_moe_blocks(
             # dtype/device conversion, before installing any block.
             grouped = moe.routed_experts.inner_experts
             projection_names = per_expert_projection_names(block.experts)
+            projections: list[
+                tuple[nn.Module, tuple[str, ...], tuple[torch.Tensor, ...]]
+            ] = [(moe.router.gate, ("weight",), (router_gate.weight,))]
             if projection_names is None:
-                projections: list[
-                    tuple[nn.Module, tuple[str, ...], tuple[torch.Tensor, ...]]
-                ] = [
-                    (moe.router.gate, ("weight",), (router_gate.weight,)),
-                    (grouped, ("w1_EFD", "w3_EFD"), (block.experts.gate_up_proj,)),
-                    (grouped, ("w2_EDF",), (block.experts.down_proj,)),
-                ]
+                projections.extend(
+                    [
+                        (grouped, ("w1_EFD", "w3_EFD"), (block.experts.gate_up_proj,)),
+                        (grouped, ("w2_EDF",), (block.experts.down_proj,)),
+                    ]
+                )
             else:
-                gate_name, up_name, down_name = projection_names
                 members = list(block.experts)
-                projections = [
-                    (moe.router.gate, ("weight",), (router_gate.weight,)),
+                projections.extend(
                     (
                         grouped,
-                        ("w1_EFD",),
-                        tuple(getattr(e, gate_name).weight for e in members),
-                    ),
-                    (
-                        grouped,
-                        ("w3_EFD",),
-                        tuple(getattr(e, up_name).weight for e in members),
-                    ),
-                    (
-                        grouped,
-                        ("w2_EDF",),
-                        tuple(getattr(e, down_name).weight for e in members),
-                    ),
-                ]
+                        (target_name,),
+                        tuple(
+                            getattr(expert, source_name).weight for expert in members
+                        ),
+                    )
+                    for source_name, target_name in zip(
+                        projection_names, ("w1_EFD", "w3_EFD", "w2_EDF"), strict=True
+                    )
+                )
             for owner, names, sources in projections:
                 _bind_shared_projection(
                     owner,

@@ -248,27 +248,26 @@ def convert_block(
     # Routers may intentionally stay FP32 while expert GEMMs use BF16.
     # Allocate each projection in its source dtype before copying: casting
     # through the router dtype can otherwise change precision and memory use.
-    for target, source in (
+    expert_projections = (
         (grouped.w1_EFD, experts.gate_EFD),
         (grouped.w3_EFD, experts.up_EFD),
         (grouped.w2_EDF, experts.down_EDF),
-    ):
+    )
+    for target, source in expert_projections:
         target.data = target.data.to(device=source.device, dtype=source.dtype)
     restore_fp32_state_buffers(moe)
     # Preserve eval mode too: new modules otherwise default to training.
     moe.train(block.training)
     router.gate.weight.requires_grad_(router_gate.weight.requires_grad)
-    grouped.w1_EFD.requires_grad_(experts.gate_EFD.requires_grad)
-    grouped.w3_EFD.requires_grad_(experts.up_EFD.requires_grad)
-    grouped.w2_EDF.requires_grad_(experts.down_EDF.requires_grad)
+    for target, source in expert_projections:
+        target.requires_grad_(source.requires_grad)
     with torch.no_grad():
         router.gate.weight.copy_(router_gate.weight)
         # HF keeps all E experts in two stacked parameters; each rank keeps its
         # own slice of them. ``gate_EFD``/``up_EFD`` are the two halves of
         # ``gate_up_proj`` split along its output dim -- see ``fused_experts_of``.
-        grouped.w1_EFD.copy_(experts.gate_EFD[lo : lo + num_local])
-        grouped.w3_EFD.copy_(experts.up_EFD[lo : lo + num_local])
-        grouped.w2_EDF.copy_(experts.down_EDF[lo : lo + num_local])
+        for target, source in expert_projections:
+            target.copy_(source[lo : lo + num_local])
         # The load-balancing bias is optimization state, not a learned weight:
         # it is copied so a resumed or swapped run keeps the balance the HF
         # model had reached.

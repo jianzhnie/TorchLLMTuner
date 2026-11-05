@@ -23,6 +23,7 @@ instead of E separate ones.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -270,6 +271,7 @@ class RoutedExperts(nn.Module):
         super().__init__()
         self.inner_experts = grouped_experts
         self.token_dispatcher = dispatcher
+        self.dispatch_observer = None
 
     def forward(
         self,
@@ -279,16 +281,21 @@ class RoutedExperts(nn.Module):
         num_local_tokens_per_expert_E: torch.Tensor,
     ) -> torch.Tensor:
         """Dispatch tokens to experts, run them, and combine the results."""
-        (
-            routed_input_RD,
-            num_global_tokens_per_local_expert_e,
-            metadata,
-        ) = self.token_dispatcher.dispatch(
-            x_TD,
-            topk_scores_TK,
-            topk_expert_ids_TK,
-            num_local_tokens_per_expert_E,
-        )
+        with (
+            self.dispatch_observer.measure(x_TD.device)
+            if self.dispatch_observer is not None
+            else nullcontext()
+        ):
+            (
+                routed_input_RD,
+                num_global_tokens_per_local_expert_e,
+                metadata,
+            ) = self.token_dispatcher.dispatch(
+                x_TD,
+                topk_scores_TK,
+                topk_expert_ids_TK,
+                num_local_tokens_per_expert_E,
+            )
         routed_output_RD = self.inner_experts(
             routed_input_RD, num_global_tokens_per_local_expert_e
         )

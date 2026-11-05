@@ -24,25 +24,110 @@ if TYPE_CHECKING:
     from ....parallel.topology import ParallelTopology
 
 
+@torch.no_grad()
+def reset_routing_statistics(model_parts: Sequence[nn.Module]) -> None:
+    """Discard observations before starting a new accumulation window.
+
+    A failed step may not have reached the optimizer hooks that normally drain
+    counters and histograms. These are non-persistent scratch buffers; learned
+    router weights and the persistent expert bias must remain unchanged.
+    """
+    seen: set[int] = set()
+    for part in model_parts:
+        for module in part.modules():
+            if not isinstance(module, MoE) or id(module) in seen:
+                continue
+            seen.add(id(module))
+            module.tokens_per_expert_E.zero_()
+            if isinstance(module.router, QuantileBalancedTopKRouter):
+                module.router.quantile_balancer.required_bias_histogram_EB.zero_()
+
+
 def _reduce_token_statistics(
     statistics: Sequence[torch.Tensor], parallel_dims: ParallelTopology | None
 ) -> tuple[torch.Tensor, ...]:
     """Sum token-partial counts over DP, CP, and TP when EP uses its tokens."""
-    flattened = torch.cat([tensor.reshape(-1) for tensor in statistics])
+    # Shared counters have identical ownership on every rank. Reduce each
+    # object once, then restore the caller's layer order without copying.
+    unique = list({id(tensor): tensor for tensor in statistics}.values())
+    flattened = torch.cat([tensor.reshape(-1) for tensor in unique])
     axes = ["dp", "cp"] + (["tp"] if parallel_dims and parallel_dims.ep_enabled else [])
     for axis in axes:
         mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh(axis)
         if mesh is None:
             continue
         all_reduce(flattened, group=mesh.get_group())
-    return tuple(
-        reduced.reshape(tensor.shape)
+    reduced_by_id = {
+        id(tensor): reduced.reshape(tensor.shape)
         for reduced, tensor in zip(
-            flattened.split([tensor.numel() for tensor in statistics]),
-            statistics,
+            flattened.split([tensor.numel() for tensor in unique]),
+            unique,
             strict=True,
         )
+    }
+    return tuple(reduced_by_id[id(tensor)] for tensor in statistics)
+
+
+def _combine_shared_statistics(
+    indices: list[int],
+    statistics: Sequence[torch.Tensor],
+    reduced: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    """Count each original buffer once, even when multiple layers share it."""
+    contributions: dict[int, torch.Tensor] = {}
+    for index in indices:
+        contributions.setdefault(id(statistics[index]), reduced[index])
+    values = list(contributions.values())
+    return values[0] if len(values) == 1 else torch.stack(values).sum(0)
+
+
+@torch.no_grad()
+def collect_routing_load_metrics(
+    model_parts: Sequence[nn.Module],
+    parallel_dims: ParallelTopology | None,
+    device: torch.device,
+) -> dict[str, float]:
+    """Observe native MoE counters before optimizer hooks drain them.
+
+    Counts use the same ownership reductions as balancing. Scalar aggregation
+    across WORLD handles PP stages with differing numbers of local MoE layers.
+    Repeated data replicas cancel in averages; inactive layers are not counted.
+    """
+    layers = list(
+        {
+            id(layer): layer
+            for part in model_parts
+            for layer in collect_moe_layers(part)
+        }.values()
     )
+    totals = torch.zeros(4, device=device, dtype=torch.float32)
+    if layers:
+        counts = _reduce_token_statistics(
+            [layer.tokens_per_expert_E.detach().clone() for layer in layers],
+            parallel_dims,
+        )
+        for values in counts:
+            mean = values.float().mean()
+            active = (mean > 0).float()
+            totals[0] += active
+            totals[1] += active * (values == 0).float().mean()
+            totals[2] += (
+                active * values.float().std(unbiased=False) / mean.clamp_min(1e-12)
+            )
+            totals[3] = torch.maximum(
+                totals[3], active * values.max() / mean.clamp_min(1e-12)
+            )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(totals[:3])
+        torch.distributed.all_reduce(totals[3:], op=torch.distributed.ReduceOp.MAX)
+    count, empty, cv, maximum = totals.tolist()
+    if not count:
+        return {}
+    return {
+        "moe/empty_expert_fraction": empty / count,
+        "moe/load_cv": cv / count,
+        "moe/max_to_mean_load": maximum,
+    }
 
 
 def update_expert_bias(
@@ -93,23 +178,11 @@ def update_expert_bias(
         if any(unique_layers[i].load_balance_coeff != coefficient for i in indices):
             raise ValueError("Shared expert bias requires identical load_balance_coeff")
 
-    counts = _reduce_token_statistics(
-        [moe.tokens_per_expert_E for moe in unique_layers], parallel_dims
-    )
+    statistics = [moe.tokens_per_expert_E for moe in unique_layers]
+    counts = _reduce_token_statistics(statistics, parallel_dims)
     for indices in groups.values():
         owner = unique_layers[indices[0]]
-        seen_counts: set[int] = set()
-        contributions = []
-        for index in indices:
-            counter_id = id(unique_layers[index].tokens_per_expert_E)
-            if counter_id not in seen_counts:
-                contributions.append(counts[index])
-                seen_counts.add(counter_id)
-        combined = (
-            contributions[0]
-            if len(contributions) == 1
-            else torch.stack(contributions).sum(0)
-        )
+        combined = _combine_shared_statistics(indices, statistics, counts)
         owner.tokens_per_expert_E.copy_(combined)
         owner.update_expert_bias()
         if owner.load_balance_coeff is not None and owner.expert_bias_E is not None:
@@ -158,17 +231,7 @@ def update_quantile_expert_bias(
     reduced_histograms = _reduce_token_statistics(histograms, parallel_dims)
     for indices in groups.values():
         owner = unique_layers[indices[0]]
-        seen_histograms: set[int] = set()
-        contributions = []
-        for index in indices:
-            if id(histograms[index]) not in seen_histograms:
-                contributions.append(reduced_histograms[index])
-                seen_histograms.add(id(histograms[index]))
-        combined = (
-            contributions[0]
-            if len(contributions) == 1
-            else torch.stack(contributions).sum(0)
-        )
+        combined = _combine_shared_statistics(indices, histograms, reduced_histograms)
         owner.expert_bias_E.copy_(
             owner.router.quantile_balancer.estimate_expert_bias(
                 combined, owner.expert_bias_E
