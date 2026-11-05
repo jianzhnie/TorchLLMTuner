@@ -29,11 +29,15 @@ import torch.distributed as dist
 
 from llmtuner.models.common.moe.bias_update import (
     register_moe_balancing_hook,
+    reset_routing_statistics,
     update_expert_bias,
 )
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
 from llmtuner.models.common.moe.layer import MoE, collect_moe_layers
-from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
+from llmtuner.models.common.moe.routing import (
+    QuantileBalancedTopKRouter,
+    TokenChoiceTopKRouter,
+)
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.expert_parallel import swap_hf_moe_blocks
 from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
@@ -419,6 +423,65 @@ def test_shared_bias_rejects_conflicting_coefficients_before_mutation():
     torch.testing.assert_close(first.tokens_per_expert_E, torch.full((4,), 2.0))
 
 
+def test_shared_counter_is_counted_once_with_independent_contribution():
+    first, alias, independent = _moe(), _moe(), _moe()
+    alias.expert_bias_E = independent.expert_bias_E = first.expert_bias_E
+    alias.tokens_per_expert_E = first.tokens_per_expert_E
+    first.tokens_per_expert_E.copy_(torch.tensor([8.0, 0, 0, 0]))
+    independent.tokens_per_expert_E.copy_(torch.tensor([0.0, 12, 12, 12]))
+
+    # [8, 12, 12, 12] must lower experts 1..3. Counting the shared buffer
+    # twice gives [16, 12, 12, 12] and reverses every update direction.
+    update_expert_bias([first, alias, independent])
+
+    torch.testing.assert_close(
+        first.expert_bias_E, torch.tensor([0.15, -0.05, -0.05, -0.05])
+    )
+    for layer in (first, alias, independent):
+        assert not layer.tokens_per_expert_E.any()
+
+
+def test_shared_counter_reduced_once_in_original_order(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.models.common.moe import bias_update
+
+    first = torch.tensor([1.0, 2.0])
+    second = torch.tensor([3.0, 4.0])
+    sizes = []
+    mesh = SimpleNamespace(get_group=lambda: None)
+    topology = SimpleNamespace(
+        ep_enabled=False,
+        get_optional_mesh=lambda axis: mesh if axis == "dp" else None,
+    )
+
+    def reduce(tensor, **kwargs):
+        sizes.append(tensor.numel())
+        tensor.mul_(2)
+
+    monkeypatch.setattr(bias_update, "all_reduce", reduce)
+    result = bias_update._reduce_token_statistics([first, second, first], topology)
+
+    assert sizes == [4]
+    assert result[0] is result[2]
+    torch.testing.assert_close(result[0], first * 2)
+    torch.testing.assert_close(result[1], second * 2)
+    torch.testing.assert_close(first, torch.tensor([1.0, 2.0]))
+
+
+def test_shared_counter_updates_each_independent_bias_owner():
+    first, second = _moe(), _moe()
+    second.tokens_per_expert_E = first.tokens_per_expert_E
+    first.tokens_per_expert_E.copy_(torch.tensor([8.0, 0, 0, 0]))
+
+    update_expert_bias([first, second])
+
+    expected = torch.tensor([-0.15, 0.05, 0.05, 0.05])
+    torch.testing.assert_close(first.expert_bias_E, expected)
+    torch.testing.assert_close(second.expert_bias_E, expected)
+    assert not first.tokens_per_expert_E.any()
+
+
 def test_shared_quantile_bias_uses_joint_histogram_and_original_bias():
     from llmtuner.models.common.moe.bias_update import update_quantile_expert_bias
     from llmtuner.models.common.moe.routing import QuantileBalancedTopKRouter
@@ -449,3 +512,68 @@ def test_shared_quantile_bias_uses_joint_histogram_and_original_bias():
     assert not h1.any() and not h2.any()
     assert not first.tokens_per_expert_E.any()
     assert not second.tokens_per_expert_E.any()
+
+
+def test_shared_histogram_updates_independent_quantile_bias_owners():
+    from llmtuner.models.common.moe.bias_update import update_quantile_expert_bias
+
+    layers = [
+        MoE(
+            4,
+            RoutedExperts(GroupedExperts(8, 8, 4), LocalTokenDispatcher(4, 2)),
+            QuantileBalancedTopKRouter(4, 8, 2, num_bins=8),
+            load_balance_coeff=None,
+        )
+        for _ in range(2)
+    ]
+    histogram = layers[0].router.quantile_balancer.required_bias_histogram_EB
+    histogram.copy_(torch.arange(32).reshape(4, 8) % 7)
+    layers[1].router.quantile_balancer.required_bias_histogram_EB = histogram
+    layers[0].expert_bias_E.copy_(torch.tensor([-0.3, -0.1, 0.1, 0.3]))
+    layers[1].expert_bias_E.copy_(torch.tensor([0.2, -0.4, 0.3, -0.1]))
+    expected = [
+        layer.router.quantile_balancer.estimate_expert_bias(
+            histogram.clone(), layer.expert_bias_E.clone()
+        )
+        for layer in layers
+    ]
+    assert histogram.any()
+    for layer in layers:
+        layer.tokens_per_expert_E.fill_(3)
+
+    update_quantile_expert_bias(layers)
+
+    for layer, bias in zip(layers, expected, strict=True):
+        torch.testing.assert_close(layer.expert_bias_E, bias)
+        assert not layer.tokens_per_expert_E.any()
+    assert not histogram.any()
+
+
+def test_reset_routing_statistics_clears_scratch_but_preserves_bias():
+    sign_layer = _moe()
+    quantile_layer = MoE(
+        _NUM_EXPERTS,
+        RoutedExperts(
+            GroupedExperts(_DIM, 8, _NUM_EXPERTS),
+            LocalTokenDispatcher(_NUM_EXPERTS, _TOP_K),
+        ),
+        QuantileBalancedTopKRouter(_NUM_EXPERTS, _DIM, _TOP_K, num_bins=8),
+        load_balance_coeff=None,
+    )
+    sign_layer.expert_bias_E.copy_(torch.arange(_NUM_EXPERTS))
+    quantile_layer.expert_bias_E.copy_(torch.arange(_NUM_EXPERTS) + 4)
+    sign_layer.tokens_per_expert_E.fill_(3)
+    quantile_layer.tokens_per_expert_E.fill_(5)
+    histogram = quantile_layer.router.quantile_balancer.required_bias_histogram_EB
+    histogram.fill_(7)
+    sign_bias = sign_layer.expert_bias_E.clone()
+    quantile_bias = quantile_layer.expert_bias_E.clone()
+    part = _Holder([sign_layer, quantile_layer])
+
+    reset_routing_statistics([part, part])
+
+    assert not sign_layer.tokens_per_expert_E.any()
+    assert not quantile_layer.tokens_per_expert_E.any()
+    assert not histogram.any()
+    torch.testing.assert_close(sign_layer.expert_bias_E, sign_bias)
+    torch.testing.assert_close(quantile_layer.expert_bias_E, quantile_bias)

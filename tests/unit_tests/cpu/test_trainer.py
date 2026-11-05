@@ -2221,6 +2221,122 @@ def test_parallel_norm_accumulation_does_not_overflow_half_precision(monkeypatch
     )
 
 
+def test_replicated_tp_grad_is_reduced_once_for_shared_model_part_parameter(
+    monkeypatch,
+):
+    from llmtuner.trainer.runtime import gradients
+
+    shared = nn.Parameter(torch.zeros(1))
+    shared.grad = torch.tensor([3.0])
+    first = nn.Module()
+    first.register_parameter("weight", shared)
+    second = nn.Module()
+    second.register_parameter("weight", shared)
+    group = object()
+    mesh = SimpleNamespace(get_group=lambda: group)
+    trainer = SimpleNamespace(
+        parallel_dims=SimpleNamespace(get_optional_mesh=lambda axis: mesh),
+        model_parts=[first, second],
+    )
+    calls = []
+
+    def reduce(tensor, *, group):
+        calls.append(group)
+        tensor.mul_(2)
+
+    monkeypatch.setattr(gradients, "tp_sharded_param_ids", lambda parts: set())
+    monkeypatch.setattr(gradients, "get_comm_device", lambda group: torch.device("cpu"))
+    monkeypatch.setattr(gradients, "all_reduce", reduce)
+    gradients.allreduce_replicated_tp_grads(trainer)
+    assert calls == [group, group]  # One participation vector, one gradient.
+    torch.testing.assert_close(shared.grad, torch.tensor([6.0]))
+
+
+@pytest.mark.parametrize("precision", ["float32", "parameter"])
+@pytest.mark.parametrize("has_expert_gradients", [False, True])
+def test_clip_norm_counts_shared_parameter_across_model_parts_once(
+    monkeypatch, precision, has_expert_gradients
+):
+    from llmtuner.trainer.runtime import gradients
+    from llmtuner.trainer.runtime.reductions import TrainingReductionMeshes
+
+    shared = nn.Parameter(torch.zeros(1))
+    first = nn.Module()
+    first.register_parameter("weight", shared)
+    second = nn.Module()
+    second.register_parameter("weight", shared)
+    from llmtuner.parallel.expert_parallel import npu_baseline_experts
+
+    class PackedExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w1_EFD = nn.Parameter(torch.ones(2, 3, 4))
+            self.w3_EFD = nn.Parameter(torch.ones(2, 3, 4))
+
+    monkeypatch.setattr(
+        npu_baseline_experts, "NpuBaselineGroupedExperts", PackedExperts
+    )
+    if precision == "parameter":
+        first.experts = PackedExperts()
+        second.experts = first.experts
+        if has_expert_gradients:
+            for parameter in first.experts.parameters():
+                parameter.grad = torch.ones_like(parameter)
+    trainer = SimpleNamespace(
+        model_parts=[first, second],
+        parallel_dims=SimpleNamespace(
+            tp_enabled=False,
+            ep_enabled=False,
+            get_optional_mesh=lambda axis: None,
+        ),
+        cfg=SimpleNamespace(max_norm=1.0, grad_norm_precision=precision),
+        before_gradient_clipping=lambda: None,
+    )
+    captured = {}
+
+    def clip(parameters, **kwargs):
+        captured.update(parameters=parameters, **kwargs)
+        return torch.tensor(0.5)
+
+    monkeypatch.setattr(gradients, "clip_grad_norm_", clip)
+    monkeypatch.setattr(gradients, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gradients, "check_finite", lambda *args: None)
+    gradients.clip_and_check_finite(
+        trainer,
+        reduction_meshes=TrainingReductionMeshes(None, None, None, None),
+        loss_is_finite=torch.ones((), dtype=torch.int32),
+    )
+    assert len(captured["parameters"]) == (1 if precision == "float32" else 3)
+    assert captured["parameters"][0] is shared
+    if precision == "parameter":
+        assert len(captured["packed_parameters"]) == int(has_expert_gradients)
+        if has_expert_gradients:
+            gate, up = captured["packed_parameters"][0]
+            assert gate is first.experts.w1_EFD
+            assert up is first.experts.w3_EFD
+    assert captured["expert_parameters"] is None
+
+
+def test_expert_parameter_ids_share_one_moe_ownership_classifier(monkeypatch):
+    from llmtuner.trainer.runtime import gradients
+
+    class FakeMoE(nn.Module):
+        def __init__(self, parameter):
+            super().__init__()
+            self.routed_experts = nn.Module()
+            self.routed_experts.inner_experts = nn.Module()
+            self.routed_experts.inner_experts.register_parameter("weight", parameter)
+
+    shared = nn.Parameter(torch.zeros(1))
+    first = nn.Module()
+    first.moe = FakeMoE(shared)
+    second = nn.Module()
+    second.moe = FakeMoE(shared)
+    monkeypatch.setattr(gradients, "MoE", FakeMoE)
+
+    assert gradients._expert_parameter_ids([first, second]) == {id(shared)}
+
+
 def test_pp_norm_without_gradients_uses_parameter_device(monkeypatch):
     from llmtuner.accelerator import collectives
 
@@ -2426,6 +2542,44 @@ def test_trainer_retries_failed_metrics_cleanup_without_reclosing_other_resource
     trainer.close()
     assert calls == ["metrics", "data", "metrics"]
     assert trainer.metrics is None
+
+
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_trainer_retries_interrupted_checkpoint_cleanup(failure):
+    trainer = Trainer.__new__(Trainer)
+    calls = []
+
+    def close_checkpoint():
+        calls.append("checkpoint")
+        if calls.count("checkpoint") == 1:
+            raise failure("checkpoint close interrupted")
+
+    checkpoint = SimpleNamespace(_initialized=True, close=close_checkpoint)
+    trainer.checkpointer = checkpoint
+    trainer.dataloader = SimpleNamespace(close=lambda: calls.append("data"))
+    with pytest.raises(failure, match="checkpoint close interrupted"):
+        trainer.close()
+    assert trainer.checkpointer is checkpoint
+    assert trainer.dataloader is None
+
+    trainer.close()
+    trainer.close()
+
+    assert calls == ["checkpoint", "data", "checkpoint"]
+    assert trainer.checkpointer is None
+
+
+def test_trainer_closes_checkpoint_before_loader_and_gc_last():
+    trainer = Trainer.__new__(Trainer)
+    calls = []
+    trainer.checkpointer = SimpleNamespace(close=lambda: calls.append("checkpoint"))
+    trainer.metrics = SimpleNamespace(close=lambda: calls.append("metrics"))
+    trainer.dataloader = SimpleNamespace(close=lambda: calls.append("dataloader"))
+    trainer.gc_handler = SimpleNamespace(close=lambda: calls.append("gc"))
+
+    trainer.close()
+
+    assert calls == ["checkpoint", "metrics", "dataloader", "gc"]
 
 
 @pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt, SystemExit])
@@ -2792,6 +2946,56 @@ def test_failed_assembly_restores_activation_memory_budget(monkeypatch, error_ty
         assert functorch_config.activation_memory_budget == original
     finally:
         functorch_config.activation_memory_budget = original
+
+
+def test_train_step_releases_consumed_host_batches(tmp_path):
+    trainer = Trainer(
+        LLMTunerConfig(
+            optimizer=OptimizerConfig(implementation="for-loop"),
+            training=TrainingConfig(
+                global_batch_size=1,
+                max_seq_len=8,
+                gradient_accumulation_steps=3,
+                steps=1,
+                dump_folder=str(tmp_path),
+            ),
+        )
+    )
+    references = []
+
+    class Batches:
+        def __next__(self):
+            inputs = torch.arange(8).reshape(1, 8) + len(references)
+            references.append(weakref.ref(inputs))
+            return Batch(input_ids=inputs, labels=inputs.clone())
+
+    original_forward_backward = trainer.forward_backward_step
+    consumed = 0
+
+    def forward_backward(microbatch, **kwargs):
+        nonlocal consumed
+        assert len(references) == 3, "read all counts before the first forward"
+        assert all(reference() is None for reference in references[:consumed])
+        assert all(reference() is not None for reference in references[consumed:])
+        result = original_forward_backward(microbatch, **kwargs)
+        consumed += 1
+        return result
+
+    try:
+        trainer.should_log = lambda: False
+        trainer.forward_backward_step = forward_backward
+
+        def before_clipping():
+            assert consumed == 3
+            assert all(reference() is None for reference in references)
+
+        trainer.before_gradient_clipping = before_clipping
+        trainer.step = 1
+        assert trainer.train_step(Batches()) is None
+        assert consumed == 3
+        assert all(reference() is None for reference in references)
+    finally:
+        trainer.close()
 
 
 def test_trainer_unequal_token_accumulation_matches_summed_loss_reference(tmp_path):

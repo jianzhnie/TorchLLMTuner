@@ -248,6 +248,25 @@ def test_packed_norm_rejects_overlapping_groups_before_clipping():
 
 
 @pytest.mark.parametrize("precision", ["parameter", "float32"])
+@pytest.mark.parametrize("shared_gradient", [False, True])
+def test_packed_norm_rejects_aliases_within_one_group(precision, shared_gradient):
+    first = torch.nn.Parameter(torch.zeros(2, 4, 8))
+    first.grad = torch.ones_like(first)
+    second = first
+    if shared_gradient:
+        second = torch.nn.Parameter(torch.zeros_like(first))
+        second.grad = first.grad
+    with pytest.raises(ValueError, match="disjoint"):
+        collectives.clip_grad_norm_(
+            [first, second],
+            0.01,
+            norm_precision=precision,
+            packed_parameters=[(first, second)],
+        )
+    torch.testing.assert_close(first.grad, torch.ones_like(first), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("precision", ["parameter", "float32"])
 def test_norm_precision_clips_with_reported_coefficient(precision):
     parameter = torch.nn.Parameter(torch.zeros(257, dtype=torch.bfloat16))
     torch.manual_seed(17)

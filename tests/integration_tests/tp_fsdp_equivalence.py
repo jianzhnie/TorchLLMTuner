@@ -156,14 +156,11 @@ def _reference_trajectory(
 ) -> tuple[list[float], list[float], dict]:
     """The same training with no parallelism: one process, the whole batch.
 
-    Mirrors the trainer's non-PP step arithmetic exactly. One subtlety: dp
-    sharding turns the global batch into per-group flattened sequences (each
-    group's rows collapse into one causal sequence with its own arange
-    positions), so the reference must run the DP groups as SEPARATE forwards
-    and sum -- a single flat forward over the union would give the second
-    group's rows different positions and a different causal boundary. The
-    target shift is row-local, so the full-batch targets still double as the
-    token count.
+    Mirrors the trainer's non-PP step arithmetic and per-DP batch geometry.
+    Preprocessing flattens each group's rows but retains independent row
+    boundaries through positions and attention masks. Forward must consume
+    that metadata as well as token IDs, just as the trainer does. The target
+    shift is row-local, so full-batch targets give the global token count.
     """
     torch.manual_seed(cfg.seed)
     model = moved(HFTransformerModel(build_model_config_for(cfg)))
@@ -193,8 +190,8 @@ def _reference_trajectory(
         for d in range(DP_SIZE):
             rows = slice(d * rows_per_dp, (d + 1) * rows_per_dp)
             sub = Batch(input_ids=batch.input_ids[rows], labels=batch.labels[rows])
-            inputs, targets, _ = model.preprocess_inputs(sub, parallel_dims=None)
-            logits = model(inputs)
+            inputs, targets, kwargs = model.preprocess_inputs(sub, parallel_dims=None)
+            logits = model(inputs, **kwargs)
             loss = cross_entropy_loss(logits, targets)
             loss_sum = loss if loss_sum is None else loss_sum + loss
         # Normalized BEFORE backward, as the trainer does, so the clip below

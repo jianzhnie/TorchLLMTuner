@@ -174,7 +174,11 @@ def test_sync_release_waits_for_d2h_on_compute_stream(cpu_copies):
     assert current.waited_streams == [state.d2h_stream]
 
 
-def test_failed_release_synchronizes_pending_d2h(cpu_copies, monkeypatch):
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("reporting_fails", [False, True])
+def test_failed_release_preserves_error_and_attempts_d2h_cleanup(
+    cpu_copies, monkeypatch, cleanup_fails, reporting_fails
+):
     monkeypatch.setattr(activation_swap, "device_type", "npu")
     model = torch.nn.Module()
     model.layers = torch.nn.ModuleList(
@@ -190,12 +194,28 @@ def test_failed_release_synchronizes_pending_d2h(cpu_copies, monkeypatch):
         raise failure
 
     monkeypatch.setattr(activation_swap._ForwardSwapState, "release", fail_release)
+    aborted = []
+    original_abort = activation_swap._ForwardSwapState.abort
+
+    def abort(state):
+        aborted.append(state)
+        if cleanup_fails:
+            raise RuntimeError("D2H cleanup failed")
+        original_abort(state)
+
+    def fail_reporting(*args, **kwargs):
+        raise RuntimeError("cleanup reporting failed")
+
+    monkeypatch.setattr(activation_swap._ForwardSwapState, "abort", abort)
+    if reporting_fails:
+        monkeypatch.setattr(activation_swap.logger, "exception", fail_reporting)
     with pytest.raises(RuntimeError) as caught:
         model.layers[0](torch.ones(1, 2, requires_grad=True))
 
     assert caught.value is failure
     assert len(states) == 1
-    assert states[0].d2h_stream.synchronized
+    assert aborted == states
+    assert states[0].d2h_stream.synchronized is not cleanup_fails
 
 
 def test_layer_preserves_caller_owned_input(cpu_copies, monkeypatch):

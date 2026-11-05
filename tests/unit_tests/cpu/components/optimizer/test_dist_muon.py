@@ -51,6 +51,28 @@ def _config(residency="device"):
     )
 
 
+@pytest.mark.parametrize(
+    ("shape", "dim", "message"),
+    [
+        ((4, 4), 1, "must shard tensor dimension 0"),
+        ((0, 4), 0, "requires at least one matrix block"),
+        ((2, 2, 4), 0, "requires a 2D row-concatenated parameter"),
+    ],
+)
+def test_block_compute_rejects_invalid_matrix_geometry(shape, dim, message):
+    from llmtuner.components.optimizer.flex_shard.muon_layout import (
+        _resolve_storage_to_compute_transition,
+    )
+    from llmtuner.config.optimizer_layout import BlockShard
+
+    mesh = DeviceMesh("cpu", [0], mesh_dim_names=("dp_shard",))
+    parameter = DTensor.from_local(torch.zeros(shape), mesh, (Shard(0),))
+    layout = ComputeLayout({"dp_shard": BlockShard(dim=dim, block_sizes=(2,))})
+
+    with pytest.raises(ValueError, match=message):
+        _resolve_storage_to_compute_transition("weight", parameter, layout)
+
+
 def test_checkpoint_state_initialization_does_not_execute_a_muon_step():
     from llmtuner.components.optimizer.state_dict import init_optim_state
 

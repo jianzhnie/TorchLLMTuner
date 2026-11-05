@@ -1795,9 +1795,11 @@ def test_pipeline_loader_matches_independently_packed_microbatches(
 
 
 @pytest.mark.parametrize("max_context_length", [3, 16])
+@pytest.mark.parametrize("num_microbatches", [2, 4])
 def test_pipeline_collator_pads_a_finite_partial_schedule_without_repeating_tokens(
     tokenizer,
     max_context_length,
+    num_microbatches,
 ):
     from dataclasses import replace
 
@@ -1805,25 +1807,29 @@ def test_pipeline_collator_pads_a_finite_partial_schedule_without_repeating_toke
 
     context = replace(
         make_context(tokenizer),
-        num_tokens_per_batch=16,
+        num_tokens_per_batch=8 * num_microbatches,
         max_context_length=max_context_length,
     )
-    collator = PipelineTextCollator(context=context, num_microbatches=2)
+    collator = PipelineTextCollator(context=context, num_microbatches=num_microbatches)
     row = TextSequence(
         input_ids=np.asarray([1, 2, 3]), labels=np.asarray([2, 3, IGNORE_INDEX])
     )
     batch = collator([row])
-    assert batch["input"].shape == (2, 8)
+    assert batch["input"].shape == (num_microbatches, 8)
     assert batch["num_valid_tokens"] == 2
     assert batch["input"][0, :3].tolist() == [1, 2, 3]
-    assert batch["padding_mask"][1].all()
-    assert (batch["labels"][1] == IGNORE_INDEX).all()
-    assert batch["input"][1].eq(0).all()
+    assert batch["padding_mask"][1:].all()
+    assert (batch["labels"][1:] == IGNORE_INDEX).all()
+    assert batch["input"][1:].eq(0).all()
     torch.testing.assert_close(
         batch["positions"][1], torch.arange(8) % max_context_length
     )
     assert int((~batch["padding_mask"]).sum()) == 3
     np.testing.assert_array_equal(row.labels, [2, 3, IGNORE_INDEX])
+    # Reusing the empty source batch must not alias the stacked output rows.
+    batch["input"][1].fill_(9)
+    assert batch["input"][2:].eq(0).all()
+    assert batch["input"][0, :3].tolist() == [1, 2, 3]
 
 
 @pytest.mark.parametrize(

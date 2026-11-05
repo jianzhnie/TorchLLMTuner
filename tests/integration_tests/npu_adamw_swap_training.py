@@ -52,13 +52,13 @@ def snapshot(value):
         return value.detach().cpu().clone()
     if isinstance(value, dict):
         return {key: snapshot(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [snapshot(item) for item in value]
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
-    if value is None or isinstance(value, (str, bytes, bool, int, float)):
+    if value is None or isinstance(value, str | bytes | bool | int | float):
         return value
     raise TypeError(f"Unsupported snapshot type {type(value)}")
 

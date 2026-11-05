@@ -68,7 +68,10 @@ def configuration(strategy: str) -> LLMTunerConfig:
         ),
         optimizer=OptimizerConfig(learning_rate=3e-4, weight_decay=0.0),
         training=TrainingConfig(
-            global_batch_size=4,
+            # Ulysses does not support multiple independent rows in one
+            # flattened sequence; retain that explicit boundary while still
+            # exercising its real attention and training path.
+            global_batch_size=1 if strategy == "ulysses" else 4,
             max_seq_len=128,
             steps=STEPS,
             seed=42,
@@ -177,7 +180,12 @@ def main() -> None:
                 rtol=0,
                 msg="TP/CP preprocessing produced different target tokens",
             )
-            expected_positions = reference_kwargs["positions"].chunk(2)[cp_rank]
+            reference_positions = reference_kwargs.get("positions")
+            if reference_positions is None:
+                reference_positions = torch.arange(
+                    reference_inputs.numel(), device=reference_inputs.device
+                )
+            expected_positions = reference_positions.chunk(2)[cp_rank]
             torch.testing.assert_close(
                 actual_kwargs["positions"],
                 expected_positions,
@@ -189,10 +197,10 @@ def main() -> None:
             reference_batches = chain((first_reference_batch,), reference_batches)
             for step in range(1, STEPS + 1):
                 optimizer.zero_grad(set_to_none=True)
-                inputs, labels, _ = oracle.preprocess_inputs(
+                inputs, labels, kwargs = oracle.preprocess_inputs(
                     moved_batch(next(reference_batches)), parallel_dims=None
                 )
-                logits = oracle(inputs)
+                logits = oracle(inputs, **kwargs)
                 reference_loss = torch.nn.functional.cross_entropy(
                     logits.reshape(-1, logits.shape[-1]), labels.reshape(-1)
                 )

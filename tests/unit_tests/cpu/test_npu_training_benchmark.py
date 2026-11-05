@@ -1,5 +1,6 @@
 """Check timing aggregation and call boundaries; these are not NPU benchmarks."""
 
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,140 @@ from examples.npu_training_benchmark import (
     summarize_timings,
 )
 from llmtuner.trainer.trainer import Trainer
+
+
+@pytest.mark.parametrize("failed_release", [None, "close", "destroy", "both"])
+def test_initial_provenance_failure_closes_trainer_and_process_group(
+    monkeypatch, failed_release
+):
+    from examples import npu_training_benchmark as benchmark
+
+    calls = []
+
+    def release(name):
+        calls.append(name)
+        if failed_release in (name, "both"):
+            raise RuntimeError(f"{name} failed")
+
+    monkeypatch.setattr(
+        benchmark.torch,
+        "npu",
+        SimpleNamespace(is_available=lambda: True),
+        raising=False,
+    )
+    monkeypatch.setattr(benchmark.torch, "set_default_dtype", lambda dtype: None)
+    monkeypatch.setattr(benchmark, "qwen3_30b_npu_config", lambda: object())
+    monkeypatch.setattr(
+        benchmark,
+        "BenchmarkNPUTrainer",
+        lambda *args, **kwargs: SimpleNamespace(close=lambda: release("close")),
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "synchronize_local_errors",
+        lambda label: nullcontext(),
+    )
+
+    def fail_metadata():
+        raise RuntimeError("provenance failed")
+
+    monkeypatch.setattr(benchmark, "runtime_metadata", fail_metadata)
+    monkeypatch.setattr(
+        benchmark.dist,
+        "destroy_process_group",
+        lambda: release("destroy"),
+    )
+    with pytest.raises(RuntimeError, match="provenance failed"):
+        benchmark.main()
+    assert calls == ["close", "destroy"]
+
+
+def test_trainer_construction_failure_still_destroys_process_group(monkeypatch):
+    from examples import npu_training_benchmark as benchmark
+
+    calls = []
+    monkeypatch.setattr(
+        benchmark.torch,
+        "npu",
+        SimpleNamespace(is_available=lambda: True),
+        raising=False,
+    )
+    monkeypatch.setattr(benchmark.torch, "set_default_dtype", lambda dtype: None)
+    monkeypatch.setattr(benchmark, "qwen3_30b_npu_config", lambda: object())
+
+    def fail_construction(*args, **kwargs):
+        raise RuntimeError("trainer construction failed")
+
+    monkeypatch.setattr(benchmark, "BenchmarkNPUTrainer", fail_construction)
+    monkeypatch.setattr(
+        benchmark.dist,
+        "destroy_process_group",
+        lambda: calls.append("destroy"),
+    )
+    with pytest.raises(RuntimeError, match="trainer construction failed"):
+        benchmark.main()
+    assert calls == ["destroy"]
+
+
+def test_local_report_failure_is_coordinated_before_gather(monkeypatch):
+    from examples import npu_training_benchmark as benchmark
+
+    calls = []
+    boundaries = []
+
+    @contextmanager
+    def coordinated(label):
+        boundaries.append(label)
+        try:
+            yield
+        finally:
+            boundaries.pop()
+
+    def fail_memory_report():
+        assert boundaries == ["Benchmark local report collection"]
+        raise RuntimeError("memory report failed")
+
+    trainer = SimpleNamespace(
+        metrics=SimpleNamespace(num_flops_per_token=1, gpu_peak_flops=1),
+        device="npu:0",
+        benchmark_rows=[],
+        train=lambda: calls.append("train"),
+        close=lambda: calls.append("close"),
+    )
+    config = SimpleNamespace(
+        parallel=SimpleNamespace(
+            ep_config=SimpleNamespace(ep_token_dispatcher="alltoall")
+        ),
+        activation_swap=False,
+    )
+    monkeypatch.setattr(
+        benchmark.torch,
+        "npu",
+        SimpleNamespace(
+            is_available=lambda: True, max_memory_allocated=fail_memory_report
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(benchmark.torch, "set_default_dtype", lambda dtype: None)
+    monkeypatch.setattr(benchmark, "qwen3_30b_npu_config", lambda: config)
+    monkeypatch.setattr(benchmark, "BenchmarkNPUTrainer", lambda *a, **kw: trainer)
+    monkeypatch.setattr(benchmark, "runtime_metadata", lambda: {})
+    monkeypatch.setattr(benchmark, "synchronize_local_errors", coordinated)
+    monkeypatch.setattr(benchmark.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(benchmark.dist, "get_backend", lambda: "hccl")
+    monkeypatch.setattr(benchmark.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(
+        benchmark.dist,
+        "all_gather_object",
+        lambda *args: pytest.fail("gather entered after local report failure"),
+    )
+    monkeypatch.setattr(
+        benchmark.dist, "destroy_process_group", lambda: calls.append("destroy")
+    )
+    with pytest.raises(RuntimeError, match="memory report failed"):
+        benchmark.main()
+    assert calls == ["train", "close", "destroy"]
+    assert boundaries == []
 
 
 def records(durations):
@@ -255,6 +390,26 @@ def test_source_metadata_identifies_dirty_and_untracked_code(tmp_path):
     second = source_metadata(tmp_path)["untracked_source_sha256"]
     assert first["llmtuner/kernel.py"] != second["llmtuner/kernel.py"]
 
+    native_source = source / "custom_kernel.CPP"
+    native_source.write_text("void kernel() {}\n")
+    native_hashes = source_metadata(tmp_path)["untracked_source_sha256"]
+    assert "llmtuner/custom_kernel.CPP" in native_hashes
+    config = tmp_path / "examples" / "npu_config.YML"
+    config.parent.mkdir()
+    config.write_text("sequence_length: 4096\n")
+    config_hashes = source_metadata(tmp_path)["untracked_source_sha256"]
+    assert "examples/npu_config.YML" in config_hashes
+
+    binary = tmp_path / "llmtuner" / "weights.bin"
+    binary.write_bytes(b"\x00\xff\x80")
+    git("add", ".")
+    git("commit", "-m", "add binary fixture")
+    binary_clean = source_metadata(tmp_path)
+    binary.write_bytes(b"\x00\xfe\x81")
+    binary_changed = source_metadata(tmp_path)
+    assert binary_changed["git_dirty"] is True
+    assert binary_changed["git_diff_sha256"] != binary_clean["git_diff_sha256"]
+
 
 def test_runtime_provenance_rejects_midrun_source_or_environment_change():
     from examples.npu_training_benchmark import validate_runtime_consistency
@@ -270,6 +425,34 @@ def test_runtime_provenance_rejects_midrun_source_or_environment_change():
             validate_runtime_consistency(before, {**before, key: value})
 
 
+def test_accelerator_provenance_includes_device_soc_and_cann(tmp_path, monkeypatch):
+    from examples import npu_training_benchmark as benchmark
+
+    version_file = tmp_path / "opp" / "version.info"
+    version_file.parent.mkdir()
+    version_file.write_text('Version="9.1.0"\n')
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(tmp_path / "stale"))
+    monkeypatch.setenv("ASCEND_TOOLKIT_HOME", str(tmp_path))
+    assert benchmark.cann_version() == "9.1.0"
+
+    monkeypatch.setattr(benchmark, "device_type", "npu")
+    monkeypatch.setattr(
+        benchmark,
+        "device_module",
+        SimpleNamespace(
+            current_device=lambda: 3,
+            get_device_name=lambda device: f"Ascend910_{device}",
+            get_soc_version=lambda: 251,
+        ),
+    )
+    assert benchmark.accelerator_metadata() == {
+        "type": "npu",
+        "name": "Ascend910_3",
+        "soc_version": "251",
+        "cann_version": "9.1.0",
+    }
+
+
 def test_rank_runtime_validation_allows_hosts_but_rejects_code_drift():
     from examples.npu_training_benchmark import validate_rank_runtimes
 
@@ -279,11 +462,17 @@ def test_rank_runtime_validation_allows_hosts_but_rejects_code_drift():
         "untracked_source_sha256": {},
         "packages": {"torch": "2"},
         "python": "3.12",
+        "accelerator": {
+            "type": "npu",
+            "name": "Ascend910_9392",
+            "soc_version": "251",
+            "cann_version": "9.1.0",
+        },
         "platform": "host-a",
     }
     other = {**reference, "platform": "host-b"}
     validate_rank_runtimes([{"rank": 1, "runtime": other}], reference)
-    for key in ("git_commit", "git_diff_sha256", "python"):
+    for key in ("git_commit", "git_diff_sha256", "python", "accelerator"):
         with pytest.raises(RuntimeError, match=f"rank 1 runtime mismatch: {key}"):
             validate_rank_runtimes(
                 [{"rank": 1, "runtime": {**other, key: "different"}}], reference

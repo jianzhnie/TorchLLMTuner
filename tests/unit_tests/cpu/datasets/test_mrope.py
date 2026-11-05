@@ -4,6 +4,46 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+import torch
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_mrope_preserves_token_dtype_and_contiguous_coordinates(dtype):
+    from llmtuner.datasets.multimodal.mrope import build_mrope_positions
+
+    result = build_mrope_positions(
+        torch.tensor([1, 2, 2, 1], dtype=dtype),
+        torch.tensor([[1, 1, 2]]),
+        None,
+        None,
+        spatial_merge_size=1,
+        patch_order="block",
+        image_token_id=2,
+        video_token_id=3,
+    )
+    assert result.is_contiguous()
+    torch.testing.assert_close(
+        result, torch.tensor([[0, 0, 0], [1, 1, 1], [1, 1, 2], [3, 3, 3]], dtype=dtype)
+    )
+
+
+def test_single_token_mrope_preserves_row_major_stride():
+    from llmtuner.datasets.multimodal.mrope import build_mrope_positions
+
+    result = build_mrope_positions(
+        torch.tensor([1]),
+        None,
+        None,
+        None,
+        spatial_merge_size=1,
+        patch_order="block",
+        image_token_id=2,
+        video_token_id=3,
+    )
+    assert result.stride() == (3, 1)
+    torch.testing.assert_close(result, torch.zeros((1, 3), dtype=torch.int64))
+
 
 def test_dataset_lazy_exports_resolve_to_defining_modules():
     from importlib import import_module
@@ -14,6 +54,16 @@ def test_dataset_lazy_exports_resolve_to_defining_modules():
     for name, source in data_api._EXPORT_SOURCES.items():
         leaf = import_module(f"llmtuner.datasets.{source}")
         assert getattr(data_api, name) is getattr(leaf, name)
+
+
+def test_dataset_package_index_matches_star_import_contract():
+    import llmtuner.datasets as data_api
+
+    assert set(dir(data_api)) >= set(data_api.__all__)
+    namespace = {}
+    exec("from llmtuner.datasets import *", namespace)
+    assert set(data_api.__all__) <= namespace.keys()
+    assert all(namespace[name] is getattr(data_api, name) for name in data_api.__all__)
 
 
 def test_mrope_import_and_text_coordinates_without_optional_backends():

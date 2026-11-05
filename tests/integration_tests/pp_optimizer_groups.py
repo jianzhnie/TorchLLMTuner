@@ -51,7 +51,9 @@ def main():
             f"stage_{stage_rank}_weight"
         ]
         reference = torch.nn.Parameter(parameter.detach().clone())
-        reference_optimizer = torch.optim.AdamW([reference], lr=0.01 * (stage_rank + 1))
+        reference_optimizer = torch.optim.AdamW(
+            [reference], lr=0.01 * (stage_rank + 1), foreach=False
+        )
         parameter.grad = torch.ones_like(parameter)
         reference.grad = torch.ones_like(reference)
         optimizer.step()

@@ -67,6 +67,9 @@ def main():
         )
         candidates = {
             "plain": torch.ones(shape, device=device),
+            # Invalid checkpoint metadata can be rejected without sparse NPU
+            # kernels or copying the malformed tensor onto the device.
+            "sparse": torch.ones(shape, device="cpu").to_sparse(),
             "replicated": replicated,
             "wrong_mesh": wrong_mesh,
             "wrong_local_shape": wrong_local_shape,
@@ -130,6 +133,8 @@ def main():
             dist.all_gather_object(outcomes, (type(error).__name__, str(error)))
             assert outcomes[0][0] == "ValueError", (kind, outcomes)
             assert key in outcomes[0][1], outcomes
+            if kind == "sparse":
+                assert "tensor layout" in outcomes[0][1], outcomes
             if all_counter_ranks:
                 assert outcomes[1][0] == "ValueError", outcomes
             else:

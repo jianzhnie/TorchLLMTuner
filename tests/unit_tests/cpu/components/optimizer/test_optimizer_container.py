@@ -357,6 +357,57 @@ def test_state_round_trips_into_a_fresh_container() -> None:
         assert torch.equal(restored[key], value)
 
 
+def test_sharded_optimizer_restore_collects_local_state_once(monkeypatch):
+    from copy import deepcopy
+
+    model = _model()
+    source = OptimizersContainer(_cfg(_catch_all()), model_parts=[model])
+    source.zero_grad(set_to_none=True)
+    model(torch.ones(2, 8)).pow(2).mean().backward()
+    source.step()
+    saved_state = deepcopy(source.state_dict())
+
+    fresh_model = _model()
+    target = OptimizersContainer(_cfg(_catch_all()), model_parts=[fresh_model])
+    target.sharded_expert_parallel = True
+    calls = 0
+    collect = optimizer_module.collect_local_optimizer_state
+
+    def count_collect(optimizers):
+        nonlocal calls
+        calls += 1
+        return collect(optimizers)
+
+    monkeypatch.setattr(
+        optimizer_module, "collect_local_optimizer_state", count_collect
+    )
+    monkeypatch.setattr(optimizer_module, "expert_shard_map", lambda parts: {})
+    monkeypatch.setattr(
+        optimizer_module,
+        "restore_sharded_expert_state",
+        lambda state, **kwargs: state,
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "load_tensor_parallel_state",
+        lambda state, **kwargs: state,
+    )
+
+    target.load_state_dict(saved_state)
+
+    assert calls == 1
+    for source_parameter, target_parameter in zip(
+        model.parameters(), fresh_model.parameters(), strict=True
+    ):
+        for state_name in ("exp_avg", "exp_avg_sq", "step"):
+            torch.testing.assert_close(
+                source.optimizers[0].state[source_parameter][state_name],
+                target.optimizers[0].state[target_parameter][state_name],
+                rtol=0,
+                atol=0,
+            )
+
+
 def test_container_owns_model_part_collection():
     model = _model()
     parts = [model]

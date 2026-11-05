@@ -159,6 +159,38 @@ def test_virtual_moments_keep_swap_destinations_after_load(monkeypatch):
     assert len(target_calls) == 2
 
 
+def test_virtual_load_keeps_uninitialized_parameters_lazy(monkeypatch):
+    monkeypatch.setattr(
+        "llmtuner.components.optimizer.state_residency.device_type", "npu"
+    )
+    source_parameters = [torch.nn.Parameter(torch.ones(2)) for _ in range(2)]
+    source = torch.optim.AdamW(source_parameters, lr=0.01, foreach=False)
+    source_parameters[0].grad = torch.full_like(source_parameters[0], 0.25)
+    source.step()
+    checkpoint = deepcopy(source.state_dict())
+    assert 0 in checkpoint["state"]
+    assert 1 not in checkpoint["state"]
+
+    target_parameters = [
+        torch.nn.Parameter(parameter.detach().clone())
+        for parameter in source_parameters
+    ]
+    target = torch.optim.AdamW(target_parameters, lr=0.01, foreach=False)
+    calls = []
+    install_state_residency(target, "npu_virtual", allocator=_allocator(calls))
+    target.load_state_dict(checkpoint)
+
+    assert len(calls) == 2
+    assert "exp_avg" in target.state[target_parameters[0]]
+    assert not target.state[target_parameters[1]]
+
+    for parameter in target_parameters:
+        parameter.grad = torch.full_like(parameter, -0.5)
+    target.step()
+    assert len(calls) == 4
+    assert target.state[target_parameters[1]]["step"].item() == 1
+
+
 @pytest.mark.parametrize("option", ["amsgrad", "differentiable", "capturable", "fused"])
 def test_virtual_load_rejects_unsupported_checkpoint_options(monkeypatch, option):
     monkeypatch.setattr(
@@ -179,9 +211,10 @@ def test_virtual_load_rejects_unsupported_checkpoint_options(monkeypatch, option
     assert not optimizer.param_groups[0].get(option, False)
     # A rejected load must leave the optimizer usable for a valid retry.
     optimizer.load_state_dict(deepcopy(optimizer.state_dict()))
+    assert not calls
     parameter.grad = torch.ones_like(parameter)
     optimizer.step()
-    assert len(calls) == 4
+    assert len(calls) == 2
     assert torch.isfinite(parameter).all()
 
 
@@ -499,6 +532,29 @@ def test_virtual_revalidates_groups_after_closure(monkeypatch, keyword, option):
     torch.testing.assert_close(parameter, initial, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("moment", ["exp_avg", "exp_avg_sq"])
+def test_virtual_load_rejects_sparse_moment_before_allocation(monkeypatch, moment):
+    monkeypatch.setattr(
+        "llmtuner.components.optimizer.state_residency.device_type", "npu"
+    )
+    parameter = torch.nn.Parameter(torch.ones(2))
+    optimizer = torch.optim.AdamW([parameter])
+    calls = []
+    install_state_residency(optimizer, "npu_virtual", allocator=_allocator(calls))
+    checkpoint = optimizer.state_dict()
+    checkpoint["state"][0] = {
+        "step": torch.tensor(1.0),
+        "exp_avg": torch.ones(2),
+        "exp_avg_sq": torch.ones(2),
+    }
+    checkpoint["state"][0][moment] = checkpoint["state"][0][moment].to_sparse()
+    with pytest.raises(ValueError, match="tensor layout"):
+        optimizer.load_state_dict(checkpoint)
+    assert not calls
+    assert not optimizer.state
+    assert checkpoint["state"][0][moment].layout == torch.sparse_coo
+
+
 def test_virtual_revalidates_groups_before_step(monkeypatch):
     monkeypatch.setattr(
         "llmtuner.components.optimizer.state_residency.device_type", "npu"
@@ -586,7 +642,10 @@ def test_virtual_load_rejects_malformed_state_before_host_allocation(
     torch.testing.assert_close(target_parameter, parameter, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("counter", [float("nan"), float("inf"), -1, True, "1"])
+@pytest.mark.parametrize(
+    "counter",
+    [float("nan"), float("inf"), -1, True, "1", 1.5, torch.tensor(1.5)],
+)
 def test_virtual_load_rejects_invalid_step_before_host_allocation(monkeypatch, counter):
     monkeypatch.setattr(
         "llmtuner.components.optimizer.state_residency.device_type", "npu"

@@ -7,6 +7,7 @@ CPU/Gloo, TP2 x FSDP2. The child unit must not manage the excluded column
 weight. Exercise Trainer's excluded-gradient reducer against the dense oracle.
 This calls the reducer directly, not the complete Trainer loop.
 Optional second argument: compile.
+On an NPU host, set ASCEND_RT_VISIBLE_DEVICES="" to select CPU meshes.
 """
 
 import copy
@@ -62,8 +63,11 @@ def main():
         base = model._orig_mod if compiled else model
         assert base[0]._get_fsdp_state()._fsdp_param_group is None
         assert cfg.fsdp_config.fsdp_apply_modules["0"]["ignored_params"] == {original}
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-        dense_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+        # Keep the CPU oracle independent of vendor optimizer auto-detection.
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+        dense_optimizer = torch.optim.SGD(
+            reference.parameters(), lr=0.01, foreach=False
+        )
         for step in range(3):
             inputs = [
                 (torch.arange(16, dtype=torch.float64).reshape(1, 4, 4) / 16)

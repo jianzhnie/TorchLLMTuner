@@ -23,30 +23,9 @@ from llmtuner.config import LLMTunerConfig, OptimizerConfig
 
 def _parser() -> HfArgumentParser:
     """The production parser group list, so the flags are the real ones."""
-    from llmtuner.config import (
-        CheckpointConfig,
-        DataloaderConfig,
-        LRSchedulerConfig,
-        MetricsConfig,
-        ModelConfig,
-        ParallelConfig,
-        ProfilerConfig,
-        TrainingConfig,
-    )
+    from llmtuner.config.cli_config import PARSER_GROUPS, cli_view
 
-    return HfArgumentParser(
-        [
-            ModelConfig,
-            ParallelConfig,
-            OptimizerConfig,
-            LRSchedulerConfig,
-            TrainingConfig,
-            CheckpointConfig,
-            DataloaderConfig,
-            MetricsConfig,
-            ProfilerConfig,
-        ]
-    )
+    return HfArgumentParser([cli_view(group) for group in PARSER_GROUPS])
 
 
 def test_defaults_reproduce_torch_adamw() -> None:
@@ -106,8 +85,11 @@ def test_noniterable_betas_report_configuration_error(betas):
 
 def test_flags_parse_and_the_flat_view_reaches_them() -> None:
     """The whole chain: flag -> nested config -> property -> optimizer group."""
-    (_, _, optimizer, *_rest) = _parser().parse_args_into_dataclasses(
+    configs = _parser().parse_args_into_dataclasses(
         args=["--betas", "0.9", "0.95", "--eps", "1e-6"]
+    )
+    optimizer = next(
+        config for config in configs if isinstance(config, OptimizerConfig)
     )
     cfg = LLMTunerConfig(optimizer=optimizer)
 
@@ -126,7 +108,10 @@ def test_flags_parse_and_the_flat_view_reaches_them() -> None:
 
 
 def test_omitting_the_flags_leaves_the_defaults() -> None:
-    (_, _, optimizer, *_rest) = _parser().parse_args_into_dataclasses(args=[])
+    configs = _parser().parse_args_into_dataclasses(args=[])
+    optimizer = next(
+        config for config in configs if isinstance(config, OptimizerConfig)
+    )
     cfg = LLMTunerConfig(optimizer=optimizer)
 
     assert cfg.betas == (0.9, 0.999)

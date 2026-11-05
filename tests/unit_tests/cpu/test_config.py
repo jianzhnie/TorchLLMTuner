@@ -806,6 +806,8 @@ def test_the_fields_the_cli_cannot_carry_are_not_offered_as_flags() -> None:
     for hidden in (
         "arch_overrides",
         "param_groups",
+        "compute_sharding_by_fqn",
+        "bucket_configs",
         "purge_exempt",
         "fsdp_apply_modules",
         "module_fqns_per_model_part",

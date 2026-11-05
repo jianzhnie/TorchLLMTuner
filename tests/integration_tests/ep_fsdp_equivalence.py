@@ -191,6 +191,7 @@ def main() -> None:
         "--dispatcher", choices=("alltoall", "torchao"), default="alltoall"
     )
     parser.add_argument("--pattern-fsdp", action="store_true")
+    parser.add_argument("--none-expert-placement", action="store_true")
     parser.add_argument("--fixed-router", action="store_true")
     parser.add_argument("--domino-expert-failure", action="store_true")
     parser.add_argument("--expert-fsdp", action="store_true")
@@ -203,6 +204,8 @@ def main() -> None:
         "--fsdp-implementation", choices=("native", "custom"), default="native"
     )
     args = parser.parse_args()
+    if args.none_expert_placement and not args.pattern_fsdp:
+        parser.error("--none-expert-placement requires --pattern-fsdp")
     if args.domino_expert_failure and args.dispatcher != "alltoall":
         parser.error("--domino-expert-failure cannot override --dispatcher")
     if args.relocated_expert_hooks and (
@@ -236,10 +239,16 @@ def main() -> None:
         fsdp_config=FSDPConfig(
             fsdp_implementation=args.fsdp_implementation,
             fsdp_apply_modules={
-                "model.model.layers.{*}.mlp.routed_experts.inner_experts": {}
+                "model.model.layers.{*}.mlp.routed_experts.inner_experts": {
+                    "shard_placement_fn": None
+                }
             }
-            if args.expert_fsdp
-            else ({"model.model.layers.{*}": {}} if args.pattern_fsdp else {}),
+            if args.none_expert_placement
+            else (
+                {"model.model.layers.{*}.mlp.routed_experts.inner_experts": {}}
+                if args.expert_fsdp
+                else ({"model.model.layers.{*}": {}} if args.pattern_fsdp else {})
+            ),
         ),
     )
     parallel_dims = ParallelTopology.from_config(cfg, world)

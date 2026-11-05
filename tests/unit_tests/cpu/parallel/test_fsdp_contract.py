@@ -1280,6 +1280,145 @@ def test_pattern_fsdp_with_ep_requires_sparse_mesh_before_mutation(monkeypatch):
     assert calls == []
 
 
+def test_pattern_ep_capability_failure_precedes_custom_unit_sharding(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.models.common.moe.experts import GroupedExperts
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(
+        nn.Linear(4, 4), GroupedExperts(4, 8, 1, use_grouped_mm=False)
+    )
+    cfg = ParallelConfig(
+        expert_parallel_size=2,
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"0": {"shard_placement_fn": lambda _: None}, "1": {}}
+        ),
+    )
+    calls = []
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: lambda *args, **kwargs: calls.append(args)
+        ),
+    )
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("per-parameter mesh unavailable")
+
+    monkeypatch.setattr(plan, "require", unavailable)
+    mesh = SimpleNamespace(size=lambda: 2, mesh_dim_names=("dp_shard",))
+    with pytest.raises(RuntimeError, match="per-parameter mesh unavailable"):
+        plan.apply_fsdp_by_pattern(
+            model,
+            dp_mesh=mesh,
+            edp_mesh=mesh,
+            cfg=cfg,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+        )
+    assert calls == []
+
+
+def test_pattern_ep_none_placement_requires_default_capability_before_sharding(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from llmtuner.models.common.moe.experts import GroupedExperts
+    from llmtuner.parallel.fully_shard_parallel import plan
+
+    model = nn.Sequential(
+        nn.Linear(4, 4), GroupedExperts(4, 8, 1, use_grouped_mm=False)
+    )
+    cfg = ParallelConfig(
+        expert_parallel_size=2,
+        fsdp_config=FSDPConfig(fsdp_apply_modules={"1": {"shard_placement_fn": None}}),
+    )
+    calls = []
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: lambda *args, **kwargs: calls.append(args)
+        ),
+    )
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("per-parameter mesh unavailable")
+
+    monkeypatch.setattr(plan, "require", unavailable)
+    mesh = SimpleNamespace(size=lambda: 2, mesh_dim_names=("dp_shard",))
+    with pytest.raises(RuntimeError, match="per-parameter mesh unavailable"):
+        plan.apply_fsdp_by_pattern(
+            model,
+            dp_mesh=mesh,
+            edp_mesh=mesh,
+            cfg=cfg,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+        )
+    assert calls == []
+
+
+def test_pattern_ep_none_placement_uses_generated_expert_placement(monkeypatch):
+    from types import SimpleNamespace
+
+    from torch.distributed.tensor import Shard
+
+    from llmtuner.models.common.moe.experts import GroupedExperts
+    from llmtuner.parallel.fully_shard_parallel import (
+        fully_shard_parallel,
+        plan,
+    )
+
+    model = nn.Sequential(GroupedExperts(4, 8, 1, use_grouped_mm=False))
+    cfg = ParallelConfig(
+        expert_parallel_size=2,
+        fsdp_config=FSDPConfig(fsdp_apply_modules={"0": {"shard_placement_fn": None}}),
+    )
+    shard_calls = []
+
+    def generated_placement(parameter):
+        return Shard(1)
+
+    monkeypatch.setattr(
+        plan,
+        "get_fsdp_strategy",
+        lambda _: SimpleNamespace(
+            get_fully_shard_fn=lambda: (
+                lambda module, **options: shard_calls.append(options)
+            )
+        ),
+    )
+    monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *a, **kw: None)
+    monkeypatch.setattr(plan, "require", lambda *a, **kw: None)
+    monkeypatch.setattr(fully_shard_parallel, "fsdp_shard_size", lambda _: 2)
+    monkeypatch.setattr(
+        fully_shard_parallel,
+        "build_fsdp_placement_fn",
+        lambda *args, **kwargs: generated_placement,
+    )
+    mesh = SimpleNamespace(size=lambda: 2, mesh_dim_names=("dp_shard",))
+
+    plan.apply_fsdp_by_pattern(
+        model,
+        dp_mesh=mesh,
+        edp_mesh=mesh,
+        cfg=cfg,
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+    )
+
+    assert len(shard_calls) == 2  # The selected expert unit and its root unit.
+    assert all(
+        options["shard_placement_fn"] is generated_placement for options in shard_calls
+    )
+    for parameter in model[0].parameters():
+        assert generated_placement(parameter) == Shard(1)
+
+
 def test_shared_pattern_units_reject_conflicting_policies_before_sharding(monkeypatch):
     from llmtuner.parallel.fully_shard_parallel import plan
 
@@ -1618,6 +1757,35 @@ def test_fsdp_references_reject_removed_objects_instead_of_dropping_them(overrid
         del model[0]
     with pytest.raises(ValueError, match=f"{override} lost its registered paths"):
         references.bind(model)
+
+
+@pytest.mark.parametrize("ignored", [False, True])
+def test_fsdp_references_follow_renamed_replacement_with_shared_aliases(ignored):
+    from llmtuner.parallel.fully_shard_parallel.plan import FSDPPatternReferences
+
+    model = nn.ModuleDict({"original": nn.Linear(4, 4, bias=False)})
+    original = model["original"]
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"": {}} if ignored else {"original": {}},
+            fsdp_ignored_modules=["original"] if ignored else [],
+        )
+    )
+    references = FSDPPatternReferences(model, cfg)
+    replacement = nn.Linear(4, 4, bias=False)
+    references.record_replacements(
+        {original: replacement}, {original.weight: (replacement.weight,)}
+    )
+    del model["original"]
+    model["first"] = replacement
+    model["alias"] = replacement
+    rebound = references.bind(model).fsdp_config
+    if ignored:
+        assert rebound.fsdp_ignored_modules == ["first"]
+        assert rebound.fsdp_apply_modules == {"": {}}
+    else:
+        assert rebound.fsdp_apply_modules == {"first": {}}
+        assert rebound.fsdp_ignored_modules == []
 
 
 def test_fsdp_references_keep_objects_retained_under_new_paths():
