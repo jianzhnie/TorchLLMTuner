@@ -932,3 +932,50 @@ def test_wandb_logger_creates_run_without_reusing_or_finishing_previous(
     if previous is not None:
         assert not previous.finished
         assert not previous.sent
+
+
+def test_training_log_includes_logical_parameter_counts_and_compute_scope():
+    processor = MetricsProcessor(
+        Config(),
+        parallel_dims=None,
+        num_flops_per_token=1000,
+        num_parameters=123456,
+        num_trainable_parameters=120000,
+    )
+    processor.add_tokens(4096)
+    processor.gpu_peak_flops = 376e12
+    with _capturing() as capture:
+        processor.log(1, global_avg_loss=1.0, global_max_loss=1.0, grad_norm=0.5)
+    message = " ".join(capture.messages())
+    assert "params: 0.000123B (trainable: 0.000120B)" in message
+    assert "tps:" in message and "tflops:" in message and "mfu:" in message
+    assert "/device" in message
+    processor.close()
+
+
+def test_valid_target_throughput_and_summary_have_explicit_scope():
+    processor = _processor()
+    processor.add_tokens(100)
+    processor.add_valid_tokens(25)
+    logged = []
+    processor.logger.log = lambda values, step: logged.append(values)
+    with _capturing() as capture:
+        processor.log(
+            1,
+            global_avg_loss=2.0,
+            global_max_loss=2.0,
+            grad_norm=0.5,
+            extra_metrics={"lr/AdamW": 0.001},
+        )
+        processor.close()
+        processor.close()
+    values = logged[0]
+    assert values["tokens/valid_target_fraction"] == 0.25
+    assert values["throughput/valid_target_tps"] == pytest.approx(
+        values["throughput(tps)"] * 0.25
+    )
+    assert values["memory/current_allocated(GiB)"] == 0
+    messages = capture.messages()
+    assert any("lr/AdamW=1.000e-03" in message for message in messages)
+    assert sum("Training logged-window summary" in message for message in messages) == 1
+    assert processor.valid_tokens_since_last_log == 0

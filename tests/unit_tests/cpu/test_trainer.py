@@ -89,6 +89,7 @@ def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_
         )
 
     trainer = Trainer.__new__(Trainer)
+    trainer.metrics = SimpleNamespace(add_valid_tokens=lambda count: None)
     trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1, max_norm=1.0)
     trainer.parallel_dims = None
     trainer.device = torch.device("cpu")
@@ -148,6 +149,7 @@ def test_nonfinite_step_preserves_model_optimizer_scheduler_and_ema(invalid):
         )
     )
     trainer = Trainer.__new__(Trainer)
+    trainer.metrics = SimpleNamespace(add_valid_tokens=lambda count: None)
     trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1, max_norm=1.0)
     trainer.parallel_dims = None
     trainer.device = torch.device("cpu")
@@ -187,6 +189,7 @@ def test_nonfinite_step_preserves_model_optimizer_scheduler_and_ema(invalid):
 def test_train_step_rejects_a_fully_masked_window_before_forward() -> None:
     """A zero denominator must fail before any model or optimizer update."""
     trainer = Trainer.__new__(Trainer)
+    trainer.metrics = SimpleNamespace(add_valid_tokens=lambda count: None)
     trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1)
     trainer.model_parts = [nn.Linear(1, 1)]
     trainer.parallel_dims = None
@@ -2157,7 +2160,9 @@ def test_incomplete_accumulation_window_never_updates_parameters():
     trainer.lr_scheduler = SimpleNamespace(get_metrics=lambda: {})
     trainer.should_log = lambda: False
     trainer.metrics = SimpleNamespace(
-        add_tokens=lambda count: None, add_data_loading_time=lambda duration: None
+        add_tokens=lambda count: None,
+        add_valid_tokens=lambda count: None,
+        add_data_loading_time=lambda duration: None,
     )
     trainer.forward_backward_step = lambda *args, **kwargs: pytest.fail(
         "an incomplete window must not enter forward/backward"

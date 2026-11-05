@@ -269,6 +269,31 @@ def _schedule(optimizer):
     )
 
 
+def test_real_dcp_save_records_scoped_timings_and_retains_last_save(tmp_path):
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    model(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    manager = DistributedCheckpointManager(
+        Config(enable=True, interval=2, enable_first_step_checkpoint=False),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=str(tmp_path),
+    )
+    try:
+        assert manager.save(2)
+        recorded = manager.observation_metrics.copy()
+        assert recorded["checkpoint/local/save_call_seconds"] > 0
+        assert recorded["checkpoint/local/sync_write_seconds"] > 0
+        assert recorded["checkpoint/local/saved_step"] == 2
+        assert not manager.save(3)
+        assert manager.observation_metrics == recorded
+    finally:
+        manager.close()
+
+
 def test_manager_owns_states_and_orders_core_restore_dependencies(tmp_path):
     from llmtuner.components.checkpointer.core.checkpoint_keys import (
         LR_SCHEDULER,

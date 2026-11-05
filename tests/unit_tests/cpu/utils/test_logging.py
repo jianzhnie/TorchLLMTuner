@@ -29,6 +29,25 @@ def test_parent_and_child_emit_console_record_once(logger_name, capsys, caplog):
     assert sum(r.message == "one console message" for r in caplog.records) == 1
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_root_console_does_not_bypass_rank_filter(
+    logger_name, monkeypatch, capsys, rank
+):
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    monkeypatch.setattr(module, "get_distributed_rank", lambda: rank)
+    monkeypatch.setattr(module.get_logging_state(), "ranks", frozenset({0}))
+    try:
+        module.get_logger(logger_name).info("training result")
+        assert capsys.readouterr().out.count("training result") == (rank == 0)
+        assert "training result" not in stream.getvalue()
+    finally:
+        root.removeHandler(handler)
+        handler.close()
+
+
 def test_retrieval_updates_level_without_duplicate_handlers(logger_name):
     logger = module.get_logger(logger_name)
     handlers = logger.handlers[:]

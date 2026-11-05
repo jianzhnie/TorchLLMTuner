@@ -18,6 +18,8 @@ arithmetically but the code path still runs. That is the same fixture shape
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from tests.caps import require_env
 
 require_env("spmd_types")
@@ -28,6 +30,7 @@ import torch
 import torch.distributed as dist
 
 from llmtuner.models.common.moe.bias_update import (
+    collect_routing_load_metrics,
     register_moe_balancing_hook,
     reset_routing_statistics,
     update_expert_bias,
@@ -50,6 +53,58 @@ except ImportError:  # pragma: no cover - transformers is a runtime dependency
 _NUM_EXPERTS = 4
 _DIM = 8
 _TOP_K = 2
+
+
+def test_dispatch_observation_preserves_real_moe_forward_backward_and_update():
+    from llmtuner.components.training_observer import DispatchTimer
+
+    torch.manual_seed(47)
+    reference = _moe(coeff=None)
+    reference.routed_experts.inner_experts.use_grouped_mm = False
+    with torch.no_grad():
+        for parameter in reference.parameters():
+            parameter.normal_(std=0.1)
+    candidate = deepcopy(reference)
+    timer = DispatchTimer()
+    candidate.routed_experts.dispatch_observer = timer
+    left = torch.randn(7, _DIM, requires_grad=True)
+    right = left.detach().clone().requires_grad_()
+    expected, actual = reference(left), candidate(right)
+    assert expected.abs().sum() > 0
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    expected.square().sum().backward()
+    actual.square().sum().backward()
+    torch.testing.assert_close(right.grad, left.grad, rtol=0, atol=0)
+    for first, second in zip(
+        reference.parameters(), candidate.parameters(), strict=True
+    ):
+        torch.testing.assert_close(first.grad, second.grad, rtol=0, atol=0)
+    torch.optim.SGD(reference.parameters(), lr=0.01).step()
+    torch.optim.SGD(candidate.parameters(), lr=0.01).step()
+    for first, second in zip(
+        reference.parameters(), candidate.parameters(), strict=True
+    ):
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+    assert timer.consume_seconds() > 0
+    assert timer.consume_seconds() == 0
+
+
+def test_load_metrics_observe_nonuniform_counts_without_mutation():
+    layer = _moe()
+    part = _Holder([layer])
+    counts = torch.tensor([0, 2, 6, 0], dtype=layer.tokens_per_expert_E.dtype)
+    layer.tokens_per_expert_E.copy_(counts)
+    result = collect_routing_load_metrics([part], None, torch.device("cpu"))
+    assert result["moe/empty_expert_fraction"] == 0.5
+    assert result["moe/max_to_mean_load"] == 3
+    assert result["moe/load_cv"] == pytest.approx(1.2247449)
+    torch.testing.assert_close(layer.tokens_per_expert_E, counts)
+    layer.tokens_per_expert_E.copy_(torch.tensor([1, 0, 0, 0]))
+    sparse = collect_routing_load_metrics([part], None, torch.device("cpu"))
+    assert sparse["moe/max_to_mean_load"] == 4
+    assert sparse["moe/empty_expert_fraction"] == 0.75
+    layer.tokens_per_expert_E.zero_()
+    assert collect_routing_load_metrics([part], None, torch.device("cpu")) == {}
 
 
 @pytest.fixture(scope="module")

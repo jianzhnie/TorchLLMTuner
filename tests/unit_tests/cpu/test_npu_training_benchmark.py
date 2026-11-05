@@ -9,9 +9,12 @@ import torch
 from examples.npu_training_benchmark import (
     BenchmarkNPUTrainer,
     compile_counter_delta,
-    compute_utilization,
     summarize_resident_memory,
     summarize_timings,
+)
+from llmtuner.components.compute_metrics import (
+    compute_utilization,
+    configured_tokens_per_step,
 )
 from llmtuner.trainer.trainer import Trainer
 
@@ -164,6 +167,27 @@ def test_compile_counter_delta_is_scoped_to_one_step():
         "frames": {"layer": 1},
         "recompile_reasons": {"shape": 0},
     }
+
+
+@pytest.mark.parametrize("accumulation", [1, 4])
+def test_compute_utilization_counts_all_accumulated_batches(accumulation):
+    config = SimpleNamespace(
+        global_batch_size=8,
+        max_seq_len=4096,
+        gradient_accumulation_steps=accumulation,
+    )
+    tokens = configured_tokens_per_step(config)
+    assert tokens == 32768 * accumulation
+    result = compute_utilization(
+        tokens_per_second=tokens / 2,
+        flops_per_token=6 * 7_000_000_000,
+        peak_flops_per_device=376e12,
+        world_size=8,
+    )
+    assert result["tflops"] == pytest.approx(688.128 * accumulation)
+    assert result["utilization_percent"] == pytest.approx(
+        100 * 688.128 * accumulation / 3008
+    )
 
 
 def test_compute_utilization_uses_global_peak_compute():
