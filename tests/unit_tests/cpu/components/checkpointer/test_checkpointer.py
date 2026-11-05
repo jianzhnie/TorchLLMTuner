@@ -21,6 +21,7 @@ import torch.nn as nn
 from llmtuner.components.checkpointer import (
     DistributedCheckpointManager,
 )
+from llmtuner.components.checkpointer.backends import torch_checkpointing_backend
 from llmtuner.components.checkpointer.core.base import BaseCheckpointManager
 from llmtuner.components.checkpointer.storage.storage import (
     CheckpointStorage,
@@ -554,25 +555,14 @@ def test_an_enabled_torch_checkpointing_manager_without_the_backend_raises(
     state rather than a bug: the message has to name the alternative (the DCP
     manager) instead of surfacing whichever submodule happened to import first.
     """
-    import builtins
-
-    import pytest
-
-    from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
-        TorchCheckpointingManager,
+    monkeypatch.setattr(
+        torch_checkpointing_backend,
+        "CHECKPOINTING_IMPORT_ERROR",
+        ModuleNotFoundError("No module named 'torch_checkpointing'"),
     )
 
-    original_import = builtins.__import__
-
-    def import_without_backend(name, *args, **kwargs):
-        if name == "torch_checkpointing" or name.startswith("torch_checkpointing."):
-            raise ModuleNotFoundError("No module named 'torch_checkpointing'")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", import_without_backend)
-
     with pytest.raises(ImportError, match="not installed"):
-        TorchCheckpointingManager(
+        torch_checkpointing_backend.TorchCheckpointingManager(
             Config(enable=True),
             model_parts=[],
             optimizer=None,
@@ -603,11 +593,8 @@ def test_the_checkpoint_backend_selector_accepts_both_and_rejects_typos() -> Non
 def test_the_torch_checkpointing_backend_round_trips_a_checkpoint(tmp_path) -> None:
     """The port's backend-dependent paths, exercised now that the package exists.
 
-    The module docstring is explicit that nothing above the import guard had ever
-    run and that the first real use should start by round-tripping a checkpoint;
-    this is that round trip. It skips when the optional package is absent, the
-    same way the import-guard test above does, so the suite stays runnable on a
-    machine without it.
+    Exercise the installed backend through save, close, independent manager
+    construction, and load. Skip only when the optional package is absent.
     """
     import importlib.util
 
@@ -3458,3 +3445,19 @@ def test_synthetic_cursor_preflight_preserves_live_model_and_stream(
         )
     finally:
         manager.close()
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        ModuleNotFoundError("torch_checkpointing"),
+        ImportError("incompatible backend API"),
+    ],
+)
+def test_optional_checkpoint_backend_preserves_import_failure(monkeypatch, cause):
+    monkeypatch.setattr(
+        torch_checkpointing_backend, "CHECKPOINTING_IMPORT_ERROR", cause
+    )
+    with pytest.raises(ImportError, match="DCP checkpoint manager") as failure:
+        torch_checkpointing_backend.require_torch_checkpointing()
+    assert failure.value.__cause__ is cause

@@ -107,7 +107,7 @@ def main():
                     return dumps(settings, **kwargs)
 
                 with patch(
-                    "llmtuner.datasets.loader_builder.json.dumps", legacy_settings
+                    "llmtuner.datasets.corpus_identity.json.dumps", legacy_settings
                 ):
                     legacy = corpus_data_identity(config, dataset=dataset, repeat=True)
                 assert current != legacy
@@ -119,7 +119,7 @@ def main():
                 # the old identity; executing the old oversized graph would fail.
                 with (
                     patch(
-                        "llmtuner.datasets.loader_builder.json.dumps", legacy_settings
+                        "llmtuner.datasets.corpus_identity.json.dumps", legacy_settings
                     )
                     if identity == legacy
                     else nullcontext()

@@ -95,6 +95,7 @@ def fake_renderers(monkeypatch):
     )
     module.build_training_sample = _fake_build_training_sample
     monkeypatch.setitem(sys.modules, "renderers", module)
+    monkeypatch.setattr("llmtuner.datasets.text.processors.renderers", module)
     return module
 
 

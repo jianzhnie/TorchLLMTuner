@@ -45,6 +45,7 @@ from llmtuner.datasets import (
     build_dataloader,
     build_dataset,
     build_first_fit_packing,
+    corpus_identity,
 )
 from llmtuner.datasets.synthetic import RandomTokenDataLoader
 from llmtuner.datasets.text.processors import ChatProcessor
@@ -3642,7 +3643,7 @@ def test_corpus_identity_versions_changed_serialized_tokenizer_semantics(
     identity = loader_builder.corpus_data_identity(
         cfg, dataset="local_jsonl", repeat=True
     )
-    dumps = loader_builder.json.dumps
+    dumps = corpus_identity.json.dumps
 
     def legacy_settings(settings, **kwargs):
         settings = settings.copy()
@@ -3651,7 +3652,7 @@ def test_corpus_identity_versions_changed_serialized_tokenizer_semantics(
 
     # Emulate only the historical fingerprint, not historical tokenization.
     with monkeypatch.context() as context:
-        context.setattr(loader_builder.json, "dumps", legacy_settings)
+        context.setattr(corpus_identity.json, "dumps", legacy_settings)
         legacy = loader_builder.corpus_data_identity(
             cfg, dataset="local_jsonl", repeat=True
         )
@@ -3702,7 +3703,7 @@ def test_corpus_identity_versions_atomic_multimodal_markers(
         )
     )
     current = loader_builder.corpus_data_identity(cfg, dataset=dataset, repeat=True)
-    dumps = loader_builder.json.dumps
+    dumps = corpus_identity.json.dumps
 
     def legacy_settings(settings, **kwargs):
         settings = settings.copy()
@@ -3710,7 +3711,7 @@ def test_corpus_identity_versions_atomic_multimodal_markers(
         return dumps(settings, **kwargs)
 
     with monkeypatch.context() as context:
-        context.setattr(loader_builder.json, "dumps", legacy_settings)
+        context.setattr(corpus_identity.json, "dumps", legacy_settings)
         legacy = loader_builder.corpus_data_identity(cfg, dataset=dataset, repeat=True)
     assert (current == legacy) == (dataset == "local_jsonl")
 
@@ -3721,7 +3722,7 @@ def test_corpus_identity_versions_atomic_multimodal_markers(
         return dumps(settings, **kwargs)
 
     with monkeypatch.context() as context:
-        context.setattr(loader_builder.json, "dumps", atomic_only_settings)
+        context.setattr(corpus_identity.json, "dumps", atomic_only_settings)
         atomic_only = loader_builder.corpus_data_identity(
             cfg, dataset=dataset, repeat=True
         )
@@ -3766,7 +3767,7 @@ def test_bounded_first_fit_factory_restores_and_rejects_historical_graph(
         assert_state_equal(target.state_dict(), saved)
         for _ in range(3):
             assert_state_equal(next(iter(target)), next(iter(source)))
-        dumps = loader_builder.json.dumps
+        dumps = corpus_identity.json.dumps
 
         def legacy_settings(settings, **kwargs):
             settings = settings.copy()
@@ -3774,7 +3775,7 @@ def test_bounded_first_fit_factory_restores_and_rejects_historical_graph(
             return dumps(settings, **kwargs)
 
         with monkeypatch.context() as context:
-            context.setattr(loader_builder.json, "dumps", legacy_settings)
+            context.setattr(corpus_identity.json, "dumps", legacy_settings)
             legacy = loader_builder.corpus_data_identity(
                 cfg, dataset="local_jsonl", repeat=True
             )

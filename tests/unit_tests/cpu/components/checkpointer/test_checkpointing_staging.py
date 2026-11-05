@@ -1,6 +1,5 @@
 """The NPU staging fix changes only the supported manager instance."""
 
-import sys
 from importlib.metadata import PackageNotFoundError
 from types import SimpleNamespace
 
@@ -49,11 +48,7 @@ def test_staging_adapter_waits_once_and_preserves_payload_and_instance(monkeypat
     other = DefaultStager()
     monkeypatch.setattr(staging, "device_type", "npu")
     monkeypatch.setattr(staging, "version", lambda name: "0.1.0")
-    monkeypatch.setitem(
-        sys.modules,
-        "torch_checkpointing.staging",
-        SimpleNamespace(DefaultStager=DefaultStager),
-    )
+    monkeypatch.setattr(staging, "DefaultStager", DefaultStager)
     manager = SimpleNamespace(_saver=SimpleNamespace(_checkpoint_stager=target))
     assert staging.adapt_npu_staging(manager)
     assert not staging.adapt_npu_staging(manager)
@@ -80,11 +75,7 @@ def test_staging_wait_failure_does_not_start_copy(monkeypatch):
     target._staged_state_dict = {"previous": object()}
     monkeypatch.setattr(staging, "device_type", "npu")
     monkeypatch.setattr(staging, "version", lambda name: "0.1.0")
-    monkeypatch.setitem(
-        sys.modules,
-        "torch_checkpointing.staging",
-        SimpleNamespace(DefaultStager=DefaultStager),
-    )
+    monkeypatch.setattr(staging, "DefaultStager", DefaultStager)
     manager = SimpleNamespace(_saver=SimpleNamespace(_checkpoint_stager=target))
     assert staging.adapt_npu_staging(manager)
 

@@ -2270,7 +2270,6 @@ def test_clip_norm_counts_shared_parameter_across_model_parts_once(
     first.register_parameter("weight", shared)
     second = nn.Module()
     second.register_parameter("weight", shared)
-    from llmtuner.parallel.expert_parallel import npu_baseline_experts
 
     class PackedExperts(nn.Module):
         def __init__(self):
@@ -2278,9 +2277,7 @@ def test_clip_norm_counts_shared_parameter_across_model_parts_once(
             self.w1_EFD = nn.Parameter(torch.ones(2, 3, 4))
             self.w3_EFD = nn.Parameter(torch.ones(2, 3, 4))
 
-    monkeypatch.setattr(
-        npu_baseline_experts, "NpuBaselineGroupedExperts", PackedExperts
-    )
+    monkeypatch.setattr(gradients, "NpuBaselineGroupedExperts", PackedExperts)
     if precision == "parameter":
         first.experts = PackedExperts()
         second.experts = first.experts

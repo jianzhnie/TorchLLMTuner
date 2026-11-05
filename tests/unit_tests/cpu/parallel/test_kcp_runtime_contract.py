@@ -121,3 +121,27 @@ def test_kcp_rejects_inconsistent_local_convolution_kernels(monkeypatch):
     module.gate_lower_bound = None
     with pytest.raises(ValueError, match="matching Q/K/V convolution kernels"):
         kcp_kda_forward(lambda: None, None)(module, torch.randn(1, 3, 4))
+
+
+@pytest.mark.parametrize("missing", ["causal_conv1d", "chunk_kda", "build_cp_context"])
+def test_kcp_runtime_rejects_incomplete_kernel_set(monkeypatch, missing):
+    from llmtuner.parallel.context_parallel import kcp
+
+    cause = ModuleNotFoundError(f"missing {missing}")
+    for name in ("causal_conv1d", "chunk_kda", "build_cp_context"):
+        monkeypatch.setattr(kcp, name, None if name == missing else lambda: None)
+    monkeypatch.setattr(kcp, "KCP_IMPORT_ERROR", cause, raising=False)
+    with pytest.raises(ImportError, match="Install the Ascend KCP runtime") as failure:
+        kcp._kcp_runtime()
+    assert failure.value.__cause__ is cause
+
+
+def test_kcp_runtime_preserves_kernel_identity(monkeypatch):
+    from llmtuner.parallel.context_parallel import kcp
+
+    kernels = (lambda: None, lambda: None, lambda: None)
+    for name, kernel in zip(
+        ("causal_conv1d", "chunk_kda", "build_cp_context"), kernels, strict=True
+    ):
+        monkeypatch.setattr(kcp, name, kernel)
+    assert kcp._kcp_runtime() == kernels

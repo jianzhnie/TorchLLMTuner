@@ -30,11 +30,13 @@ def test_local_module_import_does_not_require_fsspec(tmp_path, monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert module.isdir(tmp_path)
-    with pytest.raises(ModuleNotFoundError, match="remote filesystem unavailable"):
+    with pytest.raises(ImportError, match="require fsspec") as exc_info:
         module.resolve("memory://checkpoint")
+    assert isinstance(exc_info.value.__cause__, ModuleNotFoundError)
+    assert str(exc_info.value.__cause__) == "remote filesystem unavailable"
 
 
-def test_local_writer_does_not_import_remote_backend(tmp_path, monkeypatch):
+def test_local_writer_does_not_require_remote_backend(tmp_path, monkeypatch):
     import builtins
     import importlib.util
 
@@ -56,8 +58,10 @@ def test_local_writer_does_not_import_remote_backend(tmp_path, monkeypatch):
     spec.loader.exec_module(module)
     writer = module.GenerationFileSystemWriter(tmp_path / "checkpoint")
     assert writer.path == tmp_path / "checkpoint"
-    with pytest.raises(ModuleNotFoundError, match="remote writer unavailable"):
+    with pytest.raises(ImportError, match="fsspec filesystem support") as exc_info:
         module.GenerationFileSystemWriter("memory://checkpoint")
+    assert isinstance(exc_info.value.__cause__, ModuleNotFoundError)
+    assert str(exc_info.value.__cause__) == "remote writer unavailable"
 
 
 def test_uri_scheme_selects_remote_storage():

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import os
 import pickle
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -66,7 +65,7 @@ def test_npu_trace_combines_native_and_json_handlers(tmp_path, monkeypatch):
         schedule=lambda **kwargs: lambda step: step,
         tensorboard_trace_handler=tensorboard_trace_handler,
     )
-    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(profiler=native_api))
+    monkeypatch.setattr(profiler_module, "npu_profiler", native_api)
     monkeypatch.setattr(profiler_module, "device_type", "npu")
     profiler = Profiler(
         Config(enable_profiling=True, profile_freq=1, profiler_warmup=0),
@@ -1033,3 +1032,16 @@ def test_partial_trace_entry_preserves_start_error_when_reporting_fails(
     assert calls == ["start", "stop", "report"]
     assert profiler.torch_profiler is None and profiler.memory_profiler is None
     assert not profiler._entered
+
+
+def test_missing_npu_profiler_preserves_dependency_failure(tmp_path, monkeypatch):
+    cause = ModuleNotFoundError("missing torch_npu.profiler")
+    monkeypatch.setattr(profiler_module, "device_type", "npu")
+    monkeypatch.setattr(profiler_module, "npu_profiler", None)
+    monkeypatch.setattr(
+        profiler_module, "NPU_PROFILER_IMPORT_ERROR", cause, raising=False
+    )
+    profiler = Profiler(Config(enable_profiling=True), base_folder=str(tmp_path))
+    with pytest.raises(ImportError, match="requires a working torch-npu") as failure:
+        profiler.build_torch_profiler()
+    assert failure.value.__cause__ is cause

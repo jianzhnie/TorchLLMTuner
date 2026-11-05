@@ -33,6 +33,11 @@ def _model() -> nn.Module:
     )
 
 
+def test_fused_kernel_devices_fall_back_when_private_helper_is_missing(monkeypatch):
+    monkeypatch.setattr(optimizer_module, "_get_fused_kernels_supported_devices", None)
+    assert optimizer_module.fused_kernel_device_types() == frozenset({"cuda", "xpu"})
+
+
 def _cfg(
     *groups: ParamGroupConfig, implementation: str = "for-loop"
 ) -> OptimizerConfig:

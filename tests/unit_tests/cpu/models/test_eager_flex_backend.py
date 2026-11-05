@@ -5,17 +5,21 @@ from tests.caps import require_env
 require_env("flex_attention", "spmd_types")
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.nn.attention.flex_attention import create_block_mask
 
 from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
+from llmtuner.models.hf import attention_backend
 from llmtuner.models.hf.attention_backend import (
     EAGER_FLEX_BACKEND,
     allow_npu_flex_attention,
     eager_flex_attention_adapter,
+    flex_attention_adapter,
 )
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
@@ -88,7 +92,6 @@ def test_eager_flex_adapter_rejects_dropout_and_attention_biases():
 
 def test_npu_flex_device_validation_preserves_other_device_checks(monkeypatch):
     import importlib
-    from types import SimpleNamespace
 
     module = importlib.import_module("torch.nn.attention.flex_attention")
 
@@ -136,8 +139,6 @@ def test_eager_flex_ac_replay_preserves_gradients(mode):
 
 
 def test_flex_adapter_rejects_dropout_before_dispatch():
-    from llmtuner.models.hf.attention_backend import flex_attention_adapter
-
     query = torch.randn(1, 2, 7, 8)
     with pytest.raises(UnsupportedCombinationError, match="dropout"):
         flex_attention_adapter(None, query, query, query, None, dropout=0.1)
@@ -145,12 +146,6 @@ def test_flex_adapter_rejects_dropout_before_dispatch():
 
 @pytest.mark.parametrize("extra", [{"softcap": 2.0}, {"s_aux": torch.ones(2)}])
 def test_explicit_flex_preserves_score_modifiers(monkeypatch, extra):
-    from types import SimpleNamespace
-
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    from llmtuner.models.hf import attention_backend
-
     query = torch.randn(1, 2, 7, 8)
     mask = create_block_mask(lambda b, h, q, k: q >= k, 1, None, 7, 7, device="cpu")
     module = SimpleNamespace(config=SimpleNamespace(attention_backend="flex"))
@@ -165,3 +160,26 @@ def test_explicit_flex_preserves_score_modifiers(monkeypatch, extra):
     assert observed.keys() >= extra.keys()
     for name, value in extra.items():
         assert observed[name] is value
+
+
+def test_attached_attention_kernel_does_not_require_aux_request(monkeypatch):
+    missing = ImportError("AuxRequest unavailable")
+    monkeypatch.setattr(attention_backend, "_FLEX_IMPORT_ERROR", missing)
+    query = torch.randn(1, 2, 7, 8, requires_grad=True)
+
+    def kernel(q, k, v, **kwargs):
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    module = SimpleNamespace(_titan_flex_kernel=kernel)
+    actual, auxiliary = attention_backend.flex_attention_adapter(
+        module, query, query, query, None
+    )
+    expected = kernel(query, query, query)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert auxiliary is None
+    assert torch.isfinite(torch.autograd.grad(actual.sum(), query)[0]).all()
+    with pytest.raises(ImportError, match="AuxRequest") as exc_info:
+        attention_backend.flex_attention_adapter(
+            SimpleNamespace(), query, query, query, None
+        )
+    assert exc_info.value.__cause__ is missing

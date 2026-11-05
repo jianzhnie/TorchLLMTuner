@@ -250,3 +250,15 @@ def test_selected_optional_architecture_preserves_dependency_failure(
     with pytest.raises(ImportError) as caught:
         build_model_config(str(tmp_path), seq_len=64)
     assert caught.value is failure
+
+
+def test_kimi_config_remains_available_when_model_dependencies_are_missing(monkeypatch):
+    cause = ImportError("missing Kimi model dependency")
+    monkeypatch.setattr(architecture, "KIMI_MODEL_IMPORT_ERROR", cause)
+    registration = get_model_architecture("kimi_linear")
+    config = registration.config_factory(hidden_size=32)
+    assert config.hidden_size == 32
+    assert isinstance(config, registration.config_type_loader())
+    with pytest.raises(ImportError, match="Kimi Linear model dependencies") as failure:
+        registration.model_class_loader()
+    assert failure.value.__cause__ is cause

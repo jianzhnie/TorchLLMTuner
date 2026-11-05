@@ -1244,9 +1244,9 @@ def test_fsdp_patterns_honor_runtime_policies(monkeypatch, policy, pp, expected)
             get_fully_shard_fn=lambda: lambda module, **kwargs: calls.append(kwargs)
         ),
     )
-    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda _: None)
+    monkeypatch.setattr(plan, "disable_fsdp_gradient_division", lambda _: None)
     monkeypatch.setattr(
-        apply, "enable_fsdp_symm_mem", lambda model, scope: scopes.append(scope)
+        plan, "enable_fsdp_symm_mem", lambda model, scope: scopes.append(scope)
     )
     plan.apply_fsdp_by_pattern(
         model,
@@ -1368,10 +1368,7 @@ def test_pattern_ep_none_placement_uses_generated_expert_placement(monkeypatch):
     from torch.distributed.tensor import Shard
 
     from llmtuner.models.common.moe.experts import GroupedExperts
-    from llmtuner.parallel.fully_shard_parallel import (
-        fully_shard_parallel,
-        plan,
-    )
+    from llmtuner.parallel.fully_shard_parallel import plan
 
     model = nn.Sequential(GroupedExperts(4, 8, 1, use_grouped_mm=False))
     cfg = ParallelConfig(
@@ -1394,9 +1391,9 @@ def test_pattern_ep_none_placement_uses_generated_expert_placement(monkeypatch):
     )
     monkeypatch.setattr(plan, "set_fsdp_prefetch_windows", lambda *a, **kw: None)
     monkeypatch.setattr(plan, "require", lambda *a, **kw: None)
-    monkeypatch.setattr(fully_shard_parallel, "fsdp_shard_size", lambda _: 2)
+    monkeypatch.setattr(plan, "fsdp_shard_size", lambda _: 2)
     monkeypatch.setattr(
-        fully_shard_parallel,
+        plan,
         "build_fsdp_placement_fn",
         lambda *args, **kwargs: generated_placement,
     )

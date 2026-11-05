@@ -24,6 +24,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from llmtuner.models.common.attention import masks
 from llmtuner.models.common.attention.masks import (
     VarlenMetadata,
     build_dense_attention_mask,
@@ -350,3 +351,18 @@ def test_fixed_varlen_metadata_rejects_document_longer_than_kernel_bound():
         create_varlen_metadata_for_document(
             torch.arange(8), max_num_documents=1, max_context_length=4
         )
+
+
+def test_dense_masks_remain_available_without_flex_builder(monkeypatch):
+    monkeypatch.setattr(masks, "create_block_mask", None)
+    masks.flex_ops.cache_clear()
+    try:
+        expected = torch.tensor([[0.0, -torch.inf], [0.0, 0.0]])
+        actual = build_dense_attention_mask(
+            torch.arange(2), dtype=torch.float32, block_causal=False
+        )
+        torch.testing.assert_close(actual[0, 0], expected, rtol=0, atol=0)
+        with pytest.raises(ImportError, match="Flex masks require"):
+            masks.flex_ops()
+    finally:
+        masks.flex_ops.cache_clear()

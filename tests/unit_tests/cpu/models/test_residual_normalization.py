@@ -7,6 +7,8 @@ from tests.caps import require_env
 require_env("flex_attention", "spmd_types")
 
 import copy
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -326,3 +328,27 @@ def test_joint_norm_frozen_weight_and_first_order_only():
     )[0]
     with pytest.raises(RuntimeError, match="autograd|backward"):
         torch.autograd.grad(gradient.sum(), source)
+
+
+def test_residual_norm_import_does_not_depend_on_policy_installation():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "sys.modules['llmtuner.models.hf.normalization_setup'] = None; "
+            "from llmtuner.models.hf.residual_normalization "
+            "import isolate_norm_input; "
+            "import torch; "
+            "value = torch.randn(2, 4, requires_grad=True); "
+            "args, kwargs = isolate_norm_input(None, (value,), {}); "
+            "assert args[0] is not value; "
+            "assert args[0].data_ptr() == value.data_ptr(); "
+            "args[0].sum().backward(); "
+            "torch.testing.assert_close(value.grad, torch.ones_like(value))",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

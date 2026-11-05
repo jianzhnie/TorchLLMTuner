@@ -194,12 +194,23 @@ def fake_torchao(monkeypatch):
     monkeypatch.setitem(
         sys.modules, "torchao.prototype.moe_training.ep.permute", permute_mod
     )
+    monkeypatch.setattr(
+        "llmtuner.parallel.expert_parallel.torchao_dispatch.permute_and_pad",
+        _fake_permute_and_pad,
+    )
     return permute_mod
 
 
 def test_torchao_dispatcher_without_the_package_raises_an_install_hint(monkeypatch):
     """A missing adapter dependency must fail on hosts with or without torchao."""
-    monkeypatch.setitem(sys.modules, "torchao.prototype.moe_training.ep.permute", None)
+    monkeypatch.setattr(
+        "llmtuner.parallel.expert_parallel.torchao_dispatch.permute_and_pad", None
+    )
+    monkeypatch.setattr(
+        "llmtuner.parallel.expert_parallel.torchao_dispatch.TORCHAO_IMPORT_ERROR",
+        ModuleNotFoundError("missing torchao"),
+        raising=False,
+    )
     with pytest.raises(ImportError, match="pip install torchao"):
         TorchAOTokenDispatcher(num_experts=4, top_k=2, pad_multiple=16)
     assert "ep_token_dispatcher='torchao'" in TORCHAO_INSTALL_HINT
@@ -209,7 +220,14 @@ def test_torchao_dispatcher_without_the_package_raises_an_install_hint(monkeypat
 def test_torchao_dispatcher_rejects_bad_pad_multiple_before_import(
     pad_multiple, monkeypatch
 ):
-    monkeypatch.setitem(sys.modules, "torchao.prototype.moe_training.ep.permute", None)
+    monkeypatch.setattr(
+        "llmtuner.parallel.expert_parallel.torchao_dispatch.permute_and_pad", None
+    )
+    monkeypatch.setattr(
+        "llmtuner.parallel.expert_parallel.torchao_dispatch.TORCHAO_IMPORT_ERROR",
+        ModuleNotFoundError("missing torchao"),
+        raising=False,
+    )
     with pytest.raises(ValueError, match="pad_multiple"):
         TorchAOTokenDispatcher(num_experts=4, top_k=2, pad_multiple=pad_multiple)
 

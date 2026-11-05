@@ -304,6 +304,19 @@ def test_regional_inductor_on_unsupported_torch_loud_raises(monkeypatch) -> None
 
 
 @requires_runtime
+def test_missing_regional_backend_preserves_non_flex_compile(monkeypatch) -> None:
+    monkeypatch.setattr(compile_mod, "regional_inductor", None)
+    monkeypatch.setattr(compile_mod, "has", lambda capability: True)
+    model = _model()
+    assert (
+        compile_mod.maybe_regional_inductor_backend(model, "aot_eager") == "aot_eager"
+    )
+    monkeypatch.setattr(type(model), "uses_flex_attention", property(lambda self: True))
+    with pytest.raises(NotImplementedError, match="regional_inductor"):
+        compile_mod.maybe_regional_inductor_backend(model, "aot_eager")
+
+
+@requires_runtime
 def test_maybe_regional_inductor_is_null_when_disabled() -> None:
     with maybe_regional_inductor({}):
         pass  # must be a no-op context on the default path

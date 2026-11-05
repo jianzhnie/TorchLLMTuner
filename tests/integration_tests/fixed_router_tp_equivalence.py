@@ -25,7 +25,7 @@ from llmtuner.parallel.tensor_parallel.checkpointing import (
     gather_tensor_parallel_state,
     load_tensor_parallel_state,
 )
-from llmtuner.parallel.tensor_parallel.linear_ops import functional_collectives
+from llmtuner.parallel.tensor_parallel.linear_ops import resolve_autograd_collectives
 from llmtuner.parallel.tensor_parallel.tensor_parallel import realize_moe_blocks_tp
 from tests.integration_tests.ep_wiring_equivalence import _model
 from tests.integration_tests.fixed_router_ep_equivalence import explicit_reference
@@ -81,7 +81,7 @@ def main():
         rank = dist.get_rank()
         assert dist.get_world_size() == 2
         # apply_tp resolves the version-dependent API before tracing.
-        functional_collectives()
+        resolve_autograd_collectives()
         registry_size = getattr(
             torch._C._distributed_c10d, "_get_work_registry_size", None
         )

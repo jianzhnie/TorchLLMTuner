@@ -123,3 +123,19 @@ def test_grouped_mm_probe_uses_training_device_and_expert_weight_layout(
     monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising=False)
     assert capabilities.grouped_mm_runs()
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("attribute", ["pipeline_schedules", "fully_shard_module"])
+def test_optional_parallel_probe_tolerates_missing_module(monkeypatch, attribute):
+    monkeypatch.setattr(capabilities, attribute, None)
+    probe = (
+        capabilities._pipelining_has_eval
+        if attribute == "pipeline_schedules"
+        else capabilities._fsdp_unshard_is_a_context_manager
+    )
+    assert probe() is False
+
+
+def test_is_compiling_tolerates_missing_compiler_namespace(monkeypatch):
+    monkeypatch.delattr(capabilities.torch, "compiler")
+    assert capabilities.is_compiling() is False

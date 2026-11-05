@@ -9,6 +9,7 @@ An expert unit overrides FSDP2 with HSDP (replicate=2, shard=1), retaining
 the same reduction ranks while changing the parameter shard degree.
 For CUDA append --device cuda to the torchrun command.
 Append --prefetch-window 5 to exercise explicit windows beyond the unit count.
+Use --implementations native on builds without the PyTorch 2.14 custom engine.
 Compare three SGD updates against a dense model over both ranks' batches.
 This does not exercise the custom multi-context engine.
 """
@@ -28,6 +29,7 @@ from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
+from llmtuner.models.common.moe.experts import GroupedExperts
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp_to_decoder,
     enable_fsdp_symm_mem,
@@ -73,9 +75,9 @@ class DecoderLayout(TiedDecoder):
 class ExpertProjection(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        from llmtuner.models.common.moe.experts import GroupedExperts
-
         self.experts = GroupedExperts(4, 8, 1, use_grouped_mm=False)
+        for parameter in self.experts.parameters():
+            nn.init.normal_(parameter, std=0.02)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.experts(
@@ -104,8 +106,6 @@ class SharedMoEBlock(nn.Module):
 
     def __init__(self, projection: nn.Linear) -> None:
         super().__init__()
-        from llmtuner.models.common.moe.experts import GroupedExperts
-
         self.projection = nn.Linear(4, 4)
         self.projection.weight = projection.weight
         self.moe_enabled = True
@@ -116,6 +116,8 @@ class SharedMoEBlock(nn.Module):
         self.moe.routed_experts.inner_experts = GroupedExperts(
             4, 8, 1, use_grouped_mm=False
         )
+        for parameter in self.moe.routed_experts.inner_experts.parameters():
+            nn.init.normal_(parameter, std=0.02)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         experts = self.moe.routed_experts.inner_experts
@@ -207,6 +209,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--prefetch-window", type=int, default=0)
+    parser.add_argument(
+        "--implementations",
+        nargs="+",
+        choices=("native", "custom"),
+        default=("native", "custom"),
+    )
     args = parser.parse_args()
     if args.prefetch_window < 0:
         parser.error("--prefetch-window must be nonnegative")
@@ -225,7 +233,7 @@ def main() -> None:
             device.type, (2, 1), mesh_dim_names=("dp_replicate", "dp_shard")
         )
         rank = dist.get_rank()
-        for implementation in ("native", "custom"):
+        for implementation in args.implementations:
             for factory, patterns in (
                 (DecoderLayout, None),
                 (SharedLayerDecoder, None),

@@ -33,7 +33,7 @@ from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_bloc
 from llmtuner.parallel.fully_shard_parallel.fine_grained import fully_shard_fine_grained
 from llmtuner.parallel.fully_shard_parallel.plan import apply_fsdp_by_pattern
 from llmtuner.parallel.model_compile import apply_compile
-from llmtuner.parallel.tensor_parallel.linear_ops import functional_collectives
+from llmtuner.parallel.tensor_parallel.linear_ops import resolve_autograd_collectives
 from llmtuner.parallel.tensor_parallel.tensor_parallel import realize_moe_blocks_tp
 from tests.integration_tests.ep_wiring_equivalence import _model
 from tests.integration_tests.fixed_router_tp_equivalence import (
@@ -197,7 +197,7 @@ def main():
             mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
             dp_mesh = mesh["dp"]
             tp_group = mesh["tp"].get_group()
-        functional_collectives()
+        resolve_autograd_collectives()
         rank = dist.get_rank()
         context = TemporaryDirectory() if rank == 0 else nullcontext(None)
         with context as root:

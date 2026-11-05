@@ -1,6 +1,5 @@
 """Metadata adaptation preserves rank payloads without changing backend classes."""
 
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -64,11 +63,7 @@ def test_metadata_adapter_is_scoped_to_one_supported_version_instance(monkeypatc
         metadata, "get_comm_device", lambda: SimpleNamespace(type="npu")
     )
     monkeypatch.setattr(metadata, "version", lambda name: "0.1.0")
-    monkeypatch.setitem(
-        sys.modules,
-        "torch_checkpointing.metadata_manager",
-        SimpleNamespace(DefaultMetadataManager=DefaultMetadataManager),
-    )
+    monkeypatch.setattr(metadata, "DefaultMetadataManager", DefaultMetadataManager)
     assert metadata.adapt_npu_metadata_gather(SimpleNamespace(_metadata_manager=target))
     assert target._all_gather_pickled_data.__func__ is metadata._gather_pickled_metadata
     assert other._all_gather_pickled_data(None) == "original"
@@ -77,3 +72,21 @@ def test_metadata_adapter_is_scoped_to_one_supported_version_instance(monkeypatc
         SimpleNamespace(_metadata_manager=other)
     )
     assert other._all_gather_pickled_data(None) == "original"
+
+
+def test_metadata_adapter_skips_missing_distribution_metadata(monkeypatch):
+    from importlib.metadata import PackageNotFoundError
+
+    monkeypatch.setattr(metadata.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        metadata, "get_comm_device", lambda: SimpleNamespace(type="npu")
+    )
+
+    def missing_distribution(name):
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "version", missing_distribution)
+    manager = SimpleNamespace(_metadata_manager=object())
+    original = manager._metadata_manager
+    assert not metadata.adapt_npu_metadata_gather(manager)
+    assert manager._metadata_manager is original

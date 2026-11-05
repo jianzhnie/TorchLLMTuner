@@ -25,7 +25,6 @@ depend on the carrier, ``_TraceableLoss`` does not return it downstream.
 from __future__ import annotations
 
 import copy
-import sys
 
 from tests.caps import require_env
 
@@ -201,7 +200,7 @@ def test_region_checkpoint_retains_aux_metric_region(monkeypatch):
             return self.aux(y, carrier=y)
 
     remat = FakeRemat()
-    monkeypatch.setitem(sys.modules, "torch_remat", remat)
+    monkeypatch.setattr("llmtuner.memory.activation_checkpoint.torch_remat", remat)
     block = wrap_region(Block(), RegionACConfig(), base_fqn="layers.0")
     AuxLoss.set_step_denominator(torch.tensor(2.0))
     block(torch.ones(1, 2)).sum().backward()

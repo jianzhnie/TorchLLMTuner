@@ -1,12 +1,31 @@
 """Kimi SiTU formula and training integration."""
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
 from llmtuner.models.common.activation import SituGLU
 from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-from llmtuner.models.kimi.model import KimiMLP
-from llmtuner.models.kimi.moe import KimiExpertMLP
+from llmtuner.models.kimi.mlp import KimiExpertMLP, KimiMLP
+
+
+def test_kimi_feed_forward_imports_do_not_load_decoder():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "from llmtuner.models.kimi.mlp import KimiMLP, KimiExpertMLP; "
+            "from llmtuner.models.kimi import moe; "
+            "assert 'llmtuner.models.kimi.model' not in sys.modules; "
+            "assert moe.KimiExpertMLP is KimiExpertMLP; "
+            "from llmtuner.models.kimi import model; "
+            "assert model.KimiMLP is KimiMLP",
+        ],
+        check=True,
+    )
 
 
 @pytest.mark.parametrize("linear_beta", [None, 0.0, 1.7])

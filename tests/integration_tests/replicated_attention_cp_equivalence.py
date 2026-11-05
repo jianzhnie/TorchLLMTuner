@@ -3,9 +3,10 @@
 Run: PYTHONPATH=. torchrun --nproc_per_node=4
     tests/integration_tests/replicated_attention_cp_equivalence.py
 
-Checks full-model forward on CPU/Gloo. Two attention heads suffice because
-TP shards only MLPs; Ulysses splits the two replicated heads. CPU flex does
-not support backward, so this script does not establish CP gradient equivalence.
+Checks full-model forward on the harness-selected device/backend. Two heads
+suffice because TP shards only MLPs; Ulysses splits replicated heads. Uses
+float64/Flex on CPU and float32/SDPA on NPU. This forward-only script does not
+establish CP gradient equivalence.
 """
 
 import torch
@@ -18,6 +19,7 @@ from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.context_parallel import apply_cp
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology
+from tests.integration_tests.harness import device, init_distributed, moved
 
 
 def build_model():
@@ -45,11 +47,12 @@ def build_model():
         max_position_embeddings=512,
         experts_implementation="eager",
     )
-    return HFTransformerModel(config).to(torch.float64).eval()
+    dtype = torch.float64 if device().type == "cpu" else torch.float32
+    return moved(HFTransformerModel(config).to(dtype).eval())
 
 
 def main():
-    dist.init_process_group("gloo")
+    init_distributed()
     assert dist.get_world_size() == 4
     cfg = ParallelConfig(
         tensor_parallel_size=2,
@@ -62,9 +65,11 @@ def main():
     dims.build_device_mesh()
     model, reference = build_model(), build_model()
     apply_tp(model, dims.spmd_dense_mesh(), cfg)
-    model.model.config._attn_implementation = "flex_torchtitan"
+    model.model.config._attn_implementation = (
+        "sdpa" if device().type == "npu" else "flex_torchtitan"
+    )
     apply_cp(model, mesh=dims.spmd_dense_mesh(), cfg=cfg, parallel_dims=dims)
-    ids = torch.randint(128, (256,), generator=torch.Generator().manual_seed(7))
+    ids = moved(torch.randint(128, (256,), generator=torch.Generator().manual_seed(7)))
     inputs, _, extra = model.preprocess_inputs(
         {"input": ids, "labels": ids}, parallel_dims=dims
     )
@@ -78,7 +83,10 @@ def main():
     dist.all_reduce(difference, op=dist.ReduceOp.MAX)
     # HF DeepSeek RMSNorm uses fp32 internally; SDPA and eager flex use
     # different arithmetic orders, so float64 weights do not remove fp32 noise.
-    assert difference.item() < 1e-7, difference.item()
+    tolerance = 1e-7 if device().type == "cpu" else 1e-5
+    assert torch.isfinite(difference) and difference.item() < tolerance, (
+        difference.item()
+    )
     if dist.get_rank() == 0:
         print(f"replicated MLA TP=2 CP=2 logits max diff = {difference.item():.3e}")
         print("all checks passed")

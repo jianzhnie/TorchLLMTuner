@@ -30,6 +30,7 @@ from llmtuner.config.parallel_config import ContextParallelConfig
 from llmtuner.parallel.context_parallel import (
     CPFlexKernel,
     apply_cp,
+    attention,
 )
 
 
@@ -103,6 +104,17 @@ def test_an_unknown_strategy_is_refused(fake_cp_mesh) -> None:
     """
     with pytest.raises(NotImplementedError, match="not wired"):
         CPFlexKernel(cp_mesh=fake_cp_mesh, strategy="ring")
+
+
+def test_missing_private_gather_only_rejects_kernels_that_use_it(
+    fake_cp_mesh, monkeypatch
+):
+    monkeypatch.setattr(attention, "flex_cp_allgather", None)
+    assert CPFlexKernel(cp_mesh=fake_cp_mesh, strategy="ulysses").strategy == "ulysses"
+    with pytest.raises(ImportError, match="flex_cp_allgather"):
+        CPFlexKernel(cp_mesh=fake_cp_mesh, strategy="kv_allgather")
+    with pytest.raises(ImportError, match="flex_cp_allgather"):
+        attention.DualCPFlexKernel(kv_mesh=fake_cp_mesh, ulysses_mesh=fake_cp_mesh)
 
 
 def test_the_default_strategy_is_kv_allgather() -> None:

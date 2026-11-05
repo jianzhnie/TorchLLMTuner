@@ -882,13 +882,12 @@ def test_metrics_releases_sinks_when_monitor_construction_fails(monkeypatch):
 
 
 def test_wandb_logger_uses_owned_run_after_global_run_changes(tmp_path, monkeypatch):
-    import sys
     from types import SimpleNamespace
 
     owned = _FakeWandB()
     other = _FakeWandB()
     module = SimpleNamespace(init=lambda **kwargs: owned, run=other)
-    monkeypatch.setitem(sys.modules, "wandb", module)
+    monkeypatch.setattr("llmtuner.components.metrics.wandb", module)
     logger = WandBLogger(str(tmp_path))
     logger.log({"loss": 2.0}, step=1)
     logger.close()
@@ -904,7 +903,6 @@ def test_wandb_logger_uses_owned_run_after_global_run_changes(tmp_path, monkeypa
 def test_wandb_logger_creates_run_without_reusing_or_finishing_previous(
     tmp_path, monkeypatch, existing
 ):
-    import sys
     from types import SimpleNamespace
 
     previous = _FakeWandB() if existing else None
@@ -919,8 +917,9 @@ def test_wandb_logger_creates_run_without_reusing_or_finishing_previous(
             return previous
         return created
 
-    monkeypatch.setitem(
-        sys.modules, "wandb", SimpleNamespace(init=initialize, run=previous)
+    monkeypatch.setattr(
+        "llmtuner.components.metrics.wandb",
+        SimpleNamespace(init=initialize, run=previous),
     )
     logger = WandBLogger(str(tmp_path))
     assert calls[0]["reinit"] == "create_new"
@@ -979,3 +978,26 @@ def test_valid_target_throughput_and_summary_have_explicit_scope():
     assert any("lr/AdamW=1.000e-03" in message for message in messages)
     assert sum("Training logged-window summary" in message for message in messages) == 1
     assert processor.valid_tokens_since_last_log == 0
+
+
+@pytest.mark.parametrize(
+    "dependency,error_name,logger_type,message",
+    [
+        (
+            "SummaryWriter",
+            "TENSORBOARD_IMPORT_ERROR",
+            TensorBoardLogger,
+            "requires the tensorboard package",
+        ),
+        ("wandb", "WANDB_IMPORT_ERROR", WandBLogger, "requires the wandb package"),
+    ],
+)
+def test_optional_sink_dependency_failure_preserves_cause(
+    tmp_path, monkeypatch, dependency, error_name, logger_type, message
+):
+    cause = ModuleNotFoundError(f"missing {dependency}")
+    monkeypatch.setattr(metrics_module, dependency, None)
+    monkeypatch.setattr(metrics_module, error_name, cause, raising=False)
+    with pytest.raises(ImportError, match=message) as failure:
+        logger_type(str(tmp_path))
+    assert failure.value.__cause__ is cause

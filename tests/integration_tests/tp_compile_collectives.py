@@ -12,8 +12,8 @@ import torch.distributed as dist
 
 from llmtuner.parallel.tensor_parallel.linear_ops import (
     all_gather_along,
-    functional_collectives,
     reduce_scatter_along,
+    resolve_autograd_collectives,
 )
 from tests.integration_tests.harness import init_distributed
 
@@ -29,7 +29,7 @@ def scatter_loss(inputs, axis=0):
 device = init_distributed()
 try:
     assert dist.get_world_size() == 2
-    functional_collectives()
+    resolve_autograd_collectives()
     compile_backend = os.environ.get("LLMTUNER_TEST_COMPILE_BACKEND", "aot_eager")
     # Rank-dependent, asymmetric values expose axis permutations that an
     # all-ones gradient check cannot detect. Compare outputs and nonlinear

@@ -36,7 +36,6 @@ require_env(
 )
 
 
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -174,7 +173,7 @@ class _FakeRemat:
 
 def _fake_remat(monkeypatch: pytest.MonkeyPatch) -> _FakeRemat:
     fake = _FakeRemat()
-    monkeypatch.setitem(sys.modules, "torch_remat", fake)
+    monkeypatch.setattr("llmtuner.memory.activation_checkpoint.torch_remat", fake)
     return fake
 
 
@@ -226,7 +225,12 @@ def test_region_without_torch_remat_is_a_loud_import_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The package is optional *and* version-gated: the error names both."""
-    monkeypatch.setitem(sys.modules, "torch_remat", None)
+    monkeypatch.setattr("llmtuner.memory.activation_checkpoint.torch_remat", None)
+    monkeypatch.setattr(
+        "llmtuner.memory.activation_checkpoint.REMAT_IMPORT_ERROR",
+        ModuleNotFoundError("missing torch_remat"),
+        raising=False,
+    )
 
     def unexpected_setup() -> None:
         pytest.fail("missing region dependency must fail before global setup")

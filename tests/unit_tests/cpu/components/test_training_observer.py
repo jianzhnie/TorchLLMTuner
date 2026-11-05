@@ -62,6 +62,25 @@ def test_observer_excludes_warmup_and_between_step_work(monkeypatch):
     assert results[-1]["train/valid_target_fraction"] == 0.3
 
 
+def test_steady_throughput_weights_time_and_counts_across_unequal_steps():
+    metrics = SimpleNamespace(
+        config=MetricsConfig(metrics_warmup_steps=1, steady_window_steps=2),
+        num_flops_per_token=1000,
+        gpu_peak_flops=0,
+    )
+    observer = TrainingObserver(metrics, torch.device("cpu"))
+    assert observer.record_steady_step(seconds=100, tokens=10000, world=2) == {}
+    observer.record_steady_step(seconds=1, tokens=100, world=2)
+    result = observer.record_steady_step(seconds=3, tokens=900, world=2)
+    assert result["steady/tps_per_device"] == 125
+    assert "steady/mfu_percent" not in result
+
+    result = observer.record_steady_step(seconds=2, tokens=100, world=2)
+    assert result["steady/samples"] == 2
+    assert result["steady/tps_per_device"] == 100
+    assert result["steady/step_p50_seconds"] == 2.5
+
+
 @pytest.mark.parametrize(
     "options", [{"metrics_warmup_steps": -1}, {"steady_window_steps": 0}]
 )

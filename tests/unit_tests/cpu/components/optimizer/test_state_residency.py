@@ -664,3 +664,23 @@ def test_virtual_load_rejects_invalid_step_before_host_allocation(monkeypatch, c
         target.load_state_dict(checkpoint)
     assert not calls
     assert not target.state
+
+
+@pytest.mark.parametrize("missing_module", [True, False])
+def test_virtual_allocator_rejects_unavailable_npu_api(monkeypatch, missing_module):
+    from llmtuner.components.optimizer import state_residency
+    from llmtuner.errors import EnvironmentUnsupportedError
+
+    cause = ModuleNotFoundError("missing torch_npu")
+    monkeypatch.setattr(
+        state_residency, "torch_npu", None if missing_module else SimpleNamespace()
+    )
+    monkeypatch.setattr(state_residency, "TORCH_NPU_IMPORT_ERROR", cause, raising=False)
+    with pytest.raises(EnvironmentUnsupportedError) as failure:
+        state_residency._empty_with_swapped_memory(
+            torch.Size([2]), dtype=torch.float32, device=torch.device("cpu")
+        )
+    if missing_module:
+        assert failure.value.__cause__ is cause
+    else:
+        assert "empty_with_swapped_memory" in str(failure.value)

@@ -9,7 +9,7 @@ an exact count or that a mismatch raises or drops.
 
 Runs on CPU with no network: images are generated and encoded as real PNGs, and
 the corpus is written to a tmp dir. No video backend is required -- ``load_video``
-imports ``av`` lazily, and every video path exercised here goes through
+treats ``av`` as optional, and every video path exercised here goes through
 ``process_video`` with a synthetic frame stack.
 """
 
@@ -34,6 +34,7 @@ from llmtuner.datasets import (
     SingleDataset,
     build_dataset,
 )
+from llmtuner.datasets.multimodal import video as video_module
 from llmtuner.datasets.multimodal.collator import MultimodalCollator
 from llmtuner.datasets.multimodal.image import (
     calculate_vision_tokens,
@@ -244,9 +245,13 @@ def test_process_video_resizes_and_normalizes():
 
 
 def test_load_video_without_a_backend_raises_install_hint(tmp_path, monkeypatch):
-    import sys
-
-    monkeypatch.setitem(sys.modules, "av", None)
+    monkeypatch.setattr(video_module, "av", None)
+    monkeypatch.setattr(
+        video_module,
+        "AV_IMPORT_ERROR",
+        ModuleNotFoundError("missing av"),
+        raising=False,
+    )
     """Missing backend is an environment error, rather than a dropped sample."""
     with pytest.raises(ImportError, match="pip install av"):
         load_video(str(tmp_path / "missing.mp4"))
@@ -955,9 +960,13 @@ def test_video_sampling_rejects_invalid_parameters(kwargs):
 @pytest.mark.parametrize("field", ["min_frames", "max_frames"])
 @pytest.mark.parametrize("value", [True, 1.5, "4", None])
 def test_video_frame_counts_fail_before_backend_loading(field, value, monkeypatch):
-    import sys
-
-    monkeypatch.setitem(sys.modules, "av", None)
+    monkeypatch.setattr(video_module, "av", None)
+    monkeypatch.setattr(
+        video_module,
+        "AV_IMPORT_ERROR",
+        ModuleNotFoundError("missing av"),
+        raising=False,
+    )
     with pytest.raises(ValueError, match=f"{field} must be positive integer"):
         load_video("unused.mp4", **{field: value})
 
@@ -966,7 +975,6 @@ def test_video_frame_counts_fail_before_backend_loading(field, value, monkeypatc
 def test_video_sampling_matches_with_and_without_frame_metadata(
     monkeypatch, reported_frames
 ):
-    import sys
     from types import SimpleNamespace
 
     class Container:
@@ -993,8 +1001,10 @@ def test_video_sampling_matches_with_and_without_frame_metadata(
                     )
                 )
 
-    monkeypatch.setitem(
-        sys.modules, "av", SimpleNamespace(open=lambda path: Container())
+    monkeypatch.setattr(
+        video_module,
+        "av",
+        SimpleNamespace(open=lambda path: Container()),
     )
     result = load_video("sample.mp4", fps=2, min_frames=1, max_frames=8)
     assert result is not None

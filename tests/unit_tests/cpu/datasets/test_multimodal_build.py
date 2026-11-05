@@ -37,6 +37,8 @@ from llmtuner.config import (
 from llmtuner.datasets import (
     SingleDataset,
     build_dataloader,
+    corpus_identity,
+    loader_builder,
 )
 from llmtuner.datasets.text.recipes import DATASETS as TEXT_DATASETS
 from tests.data_fixtures import VOCAB, Base64JsonlSource, png_bytes, write_tokenizer
@@ -48,35 +50,6 @@ VISION_END = "<|vision_end|>"
 PAD_TOKEN = "[PAD]"
 
 MM_TOKENS = (IMAGE_TOKEN, VIDEO_TOKEN, VISION_START, VISION_END, PAD_TOKEN)
-
-# Every module the multimodal path pulls in, the subpackage itself included.
-# The names are listed rather than matched with a ``startswith`` on the
-# subpackage prefix so that renaming a module shows up here as a failure
-# instead of as an assertion that silently stops matching anything.
-MM_MODULES = (
-    "llmtuner.datasets.multimodal",
-    "llmtuner.datasets.multimodal.collator",
-    "llmtuner.datasets.multimodal.processors",
-    "llmtuner.datasets.multimodal.recipes",
-    "llmtuner.datasets.multimodal.packing",
-    "llmtuner.datasets.multimodal.image",
-    "llmtuner.datasets.multimodal.placeholders",
-    "llmtuner.datasets.multimodal.video",
-)
-
-# The text recipe module, which the text path *does* import. Listed for the
-# same reason: it keeps the guard meaningful across a rename of the file, which
-# would otherwise leave a stale string matching nothing.
-TEXT_RECIPE_MODULE = "llmtuner.datasets.text.recipes"
-
-
-def _loaded(names: tuple[str, ...]) -> list[str]:
-    """The modules from ``names`` currently imported, for the lazy-import tests."""
-    return [name for name in sys.modules if name in names]
-
-
-def _loaded_mm_modules() -> list[str]:
-    return _loaded(MM_MODULES)
 
 
 def _mm_tokenizer_path(tmp_path) -> str:
@@ -132,7 +105,7 @@ def test_build_dataloader_names_a_multimodal_recipe(tmp_path, monkeypatch):
         seen.update(kwargs)
         return original_build(*args, **kwargs)
 
-    monkeypatch.setattr(packing, "build_multimodal_packing", capture_packing)
+    monkeypatch.setattr(loader_builder, "build_multimodal_packing", capture_packing)
 
     corpus = str(tmp_path / "pairs.jsonl")
     encoded = base64.b64encode(png_bytes(64, 64)).decode()
@@ -198,14 +171,12 @@ def test_unknown_recipe_lists_both_registries(tmp_path):
 def test_missing_multimodal_dependencies_raise_with_install_guidance(
     tmp_path, monkeypatch
 ):
-    """Without torchvision, naming a multimodal recipe must fail with the
-    install hint rather than a bare ModuleNotFoundError -- while the text and
-    random paths keep working, which is the point of the lazy import."""
-    for module in [m for m in sys.modules if m.startswith("torchvision")]:
-        monkeypatch.delitem(sys.modules, module)
-    for module in _loaded_mm_modules():
-        monkeypatch.delitem(sys.modules, module)
-    monkeypatch.setitem(sys.modules, "torchvision", None)
+    """Missing media dependencies must report the installation guidance."""
+    monkeypatch.setattr(
+        loader_builder,
+        "MULTIMODAL_IMPORT_ERROR",
+        ModuleNotFoundError("torchvision"),
+    )
 
     with pytest.raises(ImportError, match="pip install torchvision"):
         _build(
@@ -216,12 +187,12 @@ def test_missing_multimodal_dependencies_raise_with_install_guidance(
         )
 
 
-def test_text_path_does_not_import_the_multimodal_trunk(tmp_path, monkeypatch):
-    """The lazy-import guarantee, checked in an environment that has
-    torchvision: building a text loader must leave the multimodal modules
-    out of ``sys.modules``."""
-    for module in _loaded_mm_modules():
-        monkeypatch.delitem(sys.modules, module)
+def test_text_loader_works_when_media_dependencies_are_unavailable(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        loader_builder, "MULTIMODAL_IMPORT_ERROR", ModuleNotFoundError("torchvision")
+    )
 
     corpus = str(tmp_path / "rows.jsonl")
     with open(corpus, "w") as handle:
@@ -236,28 +207,15 @@ def test_text_path_does_not_import_the_multimodal_trunk(tmp_path, monkeypatch):
         num_tokens=32,
     )
     loader.close()
-    # The half of the guard that is armed whatever the multimodal path does:
-    # the module the text path imports really did load, so a name that stopped
-    # resolving cannot pass this test by matching nothing on both sides.
-    assert _loaded((TEXT_RECIPE_MODULE,)) == [TEXT_RECIPE_MODULE]
-    assert _loaded_mm_modules() == []
     assert isinstance(loader.state_dict(), dict)
 
 
 def test_importing_the_text_path_needs_no_multimodal_dependencies():
-    """The other half of the lazy-import guarantee, in a fresh interpreter:
-    the text path must not drag torchvision in even on the *first* import.
-
-    The test above builds a text loader inside this process, so it can only
-    see a multimodal import that has already been undone -- deleting the
-    module from ``sys.modules`` and watching it not come back. A multimodal
-    import hoisted to module scope in ``build.py`` is not undone before the
-    loader is built, so it slips past that check and past every other test
-    here. It cannot slip past this one, which starts from nothing.
-    """
+    """Text imports succeed even if optional media dependencies are absent."""
     source = (
         "import sys; sys.modules['torchvision'] = None\n"
-        "import llmtuner.datasets, llmtuner.datasets.loader_builder\n"
+        "from llmtuner.datasets import loader_builder\n"
+        "assert isinstance(loader_builder.MULTIMODAL_IMPORT_ERROR, ImportError)\n"
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = str(pathlib.Path(__file__).parents[3])
@@ -296,7 +254,6 @@ def test_multimodal_factory_restores_packed_images_and_rejects_old_identity(
     from tokenizers.models import WordLevel
     from tokenizers.pre_tokenizers import Whitespace
 
-    from llmtuner.datasets import loader_builder
     from llmtuner.datasets.multimodal.processors import (
         MultimodalProcessor,
         process_cc12m_sample,
@@ -337,7 +294,7 @@ def test_multimodal_factory_restores_packed_images_and_rejects_old_identity(
         num_packing_bins=2,
         max_num_documents=2,
     )
-    dumps = loader_builder.json.dumps
+    dumps = corpus_identity.json.dumps
 
     def legacy_settings(settings, **kwargs):
         settings = settings.copy()
@@ -348,7 +305,7 @@ def test_multimodal_factory_restores_packed_images_and_rejects_old_identity(
     try:
         with monkeypatch.context() as context:
             if historical_identity:
-                context.setattr(loader_builder.json, "dumps", legacy_settings)
+                context.setattr(corpus_identity.json, "dumps", legacy_settings)
             source = _build(config, num_tokens=128)
             loaders.append(source)
         reference = _build(config, num_tokens=128)

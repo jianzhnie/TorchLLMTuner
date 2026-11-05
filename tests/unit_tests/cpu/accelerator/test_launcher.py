@@ -162,3 +162,13 @@ def test_unsupported_launcher_engine_fails_before_setup(
         bootstrap("nccl", init_backend=engine)
     assert calls == []
     assert "RANK" not in distributed.os.environ
+
+
+def test_mpi_missing_smddp_rejects_before_launcher_setup(monkeypatch):
+    cause = ModuleNotFoundError("smdistributed")
+    monkeypatch.setattr(distributed, "torch_smddp", None)
+    monkeypatch.setattr(distributed, "SMDDP_IMPORT_ERROR", cause, raising=False)
+    monkeypatch.delenv("OMPI_COMM_WORLD_LOCAL_RANK", raising=False)
+    with pytest.raises(ModuleNotFoundError, match="Amazon SageMaker DLC") as failure:
+        distributed.init_dist_mpi("smddp")
+    assert failure.value.__cause__ is cause
