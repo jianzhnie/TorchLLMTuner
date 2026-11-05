@@ -73,7 +73,7 @@ model part 应用同一顺序。Trainer 负责从初始化到资源释放的完�
 | Chunk batch | 按 batch 维切分指定模块输入 | 无等价实现；梯度累积和 PP microbatch 不是替代 |
 | Chunked loss | 主要由专用模型路径调用 | Trainer 内置，受组合约束 |
 | Activation swap | 已集成 | 已实现 NPU saved-tensor 激活交换，与 AC 生命周期对齐 |
-| Optimizer swap | AdamWSwap | 以 `npu_virtual` Adam moment 驻留为主；AdamWSwap 未实现 |
+| Optimizer swap | AdamWSwap | 独立 `AdamWSwap` 支持 fused、AMSGrad、分批 H2D 预取、CPU-offload、TP/EP chunked checkpoint 与异步保存；真实模型与性能待验收；与 `npu_virtual` 分开配置 |
 | FSDP CPU offload | 已集成 | 已集成，并支持 pin-memory 和双向预取 |
 | DistMuon/FlexShard | 非核心主线 | 已接入参数计算布局、FQN 状态和 NPU 验证 |
 | MXFP8 / W8A16 | 可选集成 | 未实现通用量化训练栈 |

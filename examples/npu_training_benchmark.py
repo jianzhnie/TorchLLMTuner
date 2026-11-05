@@ -8,12 +8,14 @@ torchtitan-npu throughput or an acceptance threshold.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import platform
 import resource
 import subprocess
+import sys
 from dataclasses import asdict
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -27,7 +29,30 @@ from torch.distributed.tensor import DTensor
 
 from examples.train_qwen3_30b_npu import qwen3_30b_npu_config
 from llmtuner.accelerator.collectives import synchronize_local_errors
+from llmtuner.accelerator.device import device_module, device_type
+from llmtuner.components.compute_metrics import (
+    compute_utilization,
+    configured_tokens_per_step,
+    token_throughput,
+)
 from llmtuner.trainer.trainer import Trainer
+
+_PROVENANCE_SUFFIXES = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cu",
+    ".cuh",
+    ".h",
+    ".hpp",
+    ".json",
+    ".py",
+    ".pyi",
+    ".sh",
+    ".toml",
+    ".yaml",
+    ".yml",
+}
 
 
 def summarize_timings(rank_rows: list[list[dict]], *, steps: int, warmup: int) -> dict:
@@ -80,25 +105,6 @@ def compile_counter_delta(before: dict, after: dict) -> dict:
     }
 
 
-def compute_utilization(
-    *,
-    tokens_per_second: float,
-    flops_per_token: int,
-    peak_flops_per_device: float,
-    world_size: int,
-) -> dict[str, float | None]:
-    """Convert global throughput into TFLOPS and peak-compute utilization."""
-    if flops_per_token <= 0 or peak_flops_per_device <= 0 or world_size <= 0:
-        return {"tflops": None, "peak_tflops": None, "utilization_percent": None}
-    tflops = flops_per_token * tokens_per_second / 1e12
-    peak_tflops = peak_flops_per_device * world_size / 1e12
-    return {
-        "tflops": tflops,
-        "peak_tflops": peak_tflops,
-        "utilization_percent": 100 * tflops / peak_tflops,
-    }
-
-
 class BenchmarkNPUTrainer(Trainer):
     def __init__(self, config, *, warmup: int):
         if not 0 <= warmup < config.steps:
@@ -143,18 +149,78 @@ class BenchmarkNPUTrainer(Trainer):
         return metrics
 
 
-def runtime_metadata() -> dict:
-    repo_root = Path(__file__).resolve().parents[1]
+def source_metadata(repo_root: Path) -> dict:
+    """Identify tracked edits and untracked training code without saving contents."""
 
-    def git(*args: str) -> str:
+    def git(*args: str) -> bytes:
         return subprocess.run(
             ["git", *args],
             cwd=repo_root,
             check=True,
             capture_output=True,
-            text=True,
             timeout=10,
-        ).stdout.strip()
+        ).stdout
+
+    patch = git("diff", "HEAD", "--binary", "--no-ext-diff")
+    untracked = {}
+    untracked_files = git("ls-files", "--others", "--exclude-standard", "-z")
+    for name in untracked_files.decode("utf-8").split("\0"):
+        if not name or not name.startswith(("llmtuner/", "examples/", "tests/")):
+            continue
+        path = repo_root / name
+        if path.is_file() and path.suffix.lower() in _PROVENANCE_SUFFIXES:
+            untracked[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        "git_commit": git("rev-parse", "HEAD").decode("ascii").strip(),
+        "git_dirty": bool(patch or untracked),
+        "git_diff_sha256": hashlib.sha256(patch).hexdigest(),
+        "untracked_source_sha256": untracked,
+    }
+
+
+def cann_version() -> str | None:
+    """Read CANN's installed version without invoking a shell command."""
+    roots = dict.fromkeys(
+        Path(value)
+        for name in (
+            "ASCEND_HOME_PATH",
+            "ASCEND_TOOLKIT_HOME",
+            "ASCEND_TOOLKIT_LATEST_HOME",
+        )
+        if (value := os.environ.get(name))
+    )
+    for toolkit_root in roots:
+        for path in (
+            toolkit_root / "opp" / "version.info",
+            toolkit_root / "version.info",
+            toolkit_root / "version.cfg",
+        ):
+            try:
+                lines = path.read_text().splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                key, separator, value = line.partition("=")
+                if separator and key.strip() == "Version":
+                    return value.strip().strip('"') or None
+    return None
+
+
+def accelerator_metadata() -> dict:
+    """Describe the active accelerator and its device-stack version."""
+    if device_type != "npu":
+        return {"type": device_type, "name": device_type}
+    device_index = device_module.current_device()
+    return {
+        "type": device_type,
+        "name": device_module.get_device_name(device_index),
+        "soc_version": str(device_module.get_soc_version()),
+        "cann_version": cann_version(),
+    }
+
+
+def runtime_metadata() -> dict:
+    repo_root = Path(__file__).resolve().parents[1]
 
     def package_version(name: str) -> str | None:
         try:
@@ -165,13 +231,43 @@ def runtime_metadata() -> dict:
     return {
         "python": platform.python_version(),
         "platform": platform.platform(),
+        "accelerator": accelerator_metadata(),
         "packages": {
             name: package_version(name)
             for name in ("torch", "torch-npu", "transformers", "datasets")
         },
-        "git_commit": git("rev-parse", "HEAD"),
-        "git_dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
+        **source_metadata(repo_root),
     }
+
+
+def validate_runtime_consistency(before: dict, after: dict) -> None:
+    """Do not publish timings under a source/environment identity that changed."""
+    if before != after:
+        changed = sorted(
+            key
+            for key in before.keys() | after.keys()
+            if before.get(key) != after.get(key)
+        )
+        raise RuntimeError(
+            "Benchmark runtime changed during execution: " + ", ".join(changed)
+        )
+
+
+def validate_rank_runtimes(records: list[dict], reference: dict) -> None:
+    """Require matching code and dependencies while permitting distinct hosts."""
+    for rank in records:
+        for key in (
+            "git_commit",
+            "git_diff_sha256",
+            "untracked_source_sha256",
+            "packages",
+            "python",
+            "accelerator",
+        ):
+            if rank["runtime"][key] != reference[key]:
+                raise RuntimeError(
+                    f"Benchmark rank {rank['rank']} runtime mismatch: {key}"
+                )
 
 
 def resident_nbytes(tensor: torch.Tensor) -> int:
@@ -207,10 +303,13 @@ def main() -> None:
     config = qwen3_30b_npu_config()
     warmup = int(os.environ.get("LLMTUNER_BENCHMARK_WARMUP", "10"))
     torch.set_default_dtype(torch.bfloat16)
-    trainer = BenchmarkNPUTrainer(config, warmup=warmup)
-    num_flops_per_token = trainer.metrics.num_flops_per_token
-    peak_flops_per_device = trainer.metrics.gpu_peak_flops
+    trainer = None
     try:
+        trainer = BenchmarkNPUTrainer(config, warmup=warmup)
+        with synchronize_local_errors("Benchmark initial runtime provenance"):
+            runtime_before = runtime_metadata()
+            num_flops_per_token = trainer.metrics.num_flops_per_token
+            peak_flops_per_device = trainer.metrics.gpu_peak_flops
         if config.parallel.ep_config.ep_token_dispatcher == "mc2":
             from llmtuner.parallel.expert_parallel.mc2_dispatch import (
                 reset_mc2_dispatch_metrics,
@@ -222,43 +321,51 @@ def main() -> None:
 
             reset_activation_swap_metrics()
         trainer.train()
-        local = {
-            "rank": dist.get_rank(),
-            "device": str(trainer.device),
-            "backend": str(dist.get_backend()),
-            "steps": trainer.benchmark_rows,
-            "peak_allocated_bytes": torch.npu.max_memory_allocated(),
-            "peak_host_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            * 1024,
-            "model_dtypes": sorted(
-                {str(parameter.dtype) for parameter in trainer.model.parameters()}
-            ),
-            "default_dtype": str(torch.get_default_dtype()),
-            "resident_bytes": summarize_resident_memory(
-                trainer.model, trainer.optimizer.optimizers
-            ),
-            "residency_scope": (
-                "rank-local logical tensor bytes; DTensor uses to_local(); "
-                "gradients and optimizer state are snapshots after the final step, "
-                "not allocator peaks or activation/workspace measurements"
-            ),
-            "optimizer_defaults": [
-                optimizer.defaults for optimizer in trainer.optimizer.optimizers
-            ],
-        }
-        if config.parallel.ep_config.ep_token_dispatcher == "mc2":
-            from llmtuner.parallel.expert_parallel.mc2_dispatch import (
-                mc2_dispatch_metrics,
-            )
+        with synchronize_local_errors("Benchmark runtime provenance"):
+            runtime_after = runtime_metadata()
+            validate_runtime_consistency(runtime_before, runtime_after)
+        with synchronize_local_errors("Benchmark local report collection"):
+            local = {
+                "rank": dist.get_rank(),
+                "device": str(trainer.device),
+                "backend": str(dist.get_backend()),
+                "runtime": runtime_before,
+                "steps": trainer.benchmark_rows,
+                "peak_allocated_bytes": torch.npu.max_memory_allocated(),
+                "peak_host_rss_bytes": resource.getrusage(
+                    resource.RUSAGE_SELF
+                ).ru_maxrss
+                * 1024,
+                "model_dtypes": sorted(
+                    {str(parameter.dtype) for parameter in trainer.model.parameters()}
+                ),
+                "default_dtype": str(torch.get_default_dtype()),
+                "resident_bytes": summarize_resident_memory(
+                    trainer.model, trainer.optimizer.optimizers
+                ),
+                "residency_scope": (
+                    "rank-local logical tensor bytes; DTensor uses to_local(); "
+                    "gradients and optimizer state are snapshots after the final step, "
+                    "not allocator peaks or activation/workspace measurements"
+                ),
+                "optimizer_defaults": [
+                    optimizer.defaults for optimizer in trainer.optimizer.optimizers
+                ],
+            }
+            if config.parallel.ep_config.ep_token_dispatcher == "mc2":
+                from llmtuner.parallel.expert_parallel.mc2_dispatch import (
+                    mc2_dispatch_metrics,
+                )
 
-            local["mc2_dispatch"] = mc2_dispatch_metrics()
-        if config.activation_swap:
-            from llmtuner.memory.activation_swap import activation_swap_metrics
+                local["mc2_dispatch"] = mc2_dispatch_metrics()
+            if config.activation_swap:
+                from llmtuner.memory.activation_swap import activation_swap_metrics
 
-            local["activation_swap"] = activation_swap_metrics()
+                local["activation_swap"] = activation_swap_metrics()
         gathered = [None] * dist.get_world_size()
         dist.all_gather_object(gathered, local)
         with synchronize_local_errors("Benchmark report"):
+            validate_rank_runtimes(gathered, runtime_before)
             report = summarize_timings(
                 [rank["steps"] for rank in gathered],
                 steps=config.steps,
@@ -272,18 +379,21 @@ def main() -> None:
                     "rank barrier occurs before the timed interval"
                 ),
                 configured_tokens_per_second=(
-                    config.global_batch_size
-                    * config.max_seq_len
-                    / report["mean_step_seconds"]
+                    token_throughput(
+                        configured_tokens_per_step(config), report["mean_step_seconds"]
+                    )
                 ),
-                token_definition="configured padded tokens, not valid loss tokens",
+                token_definition=(
+                    "global_batch_size * max_seq_len * gradient_accumulation_steps; "
+                    "configured padded tokens, not valid loss tokens"
+                ),
                 peak_allocated_bytes=max(
                     rank["peak_allocated_bytes"] for rank in gathered
                 ),
                 peak_host_rss_bytes=max(
                     rank["peak_host_rss_bytes"] for rank in gathered
                 ),
-                runtime=runtime_metadata() if dist.get_rank() == 0 else None,
+                runtime=runtime_before if dist.get_rank() == 0 else None,
                 rank_records=gathered,
                 configuration=asdict(config),
                 acceptance="measurement only; matched baseline/standard still required",
@@ -300,7 +410,18 @@ def main() -> None:
                     json.dumps(report, indent=2, default=str, allow_nan=False) + "\n"
                 )
     finally:
-        dist.destroy_process_group()
+        active_error = sys.exc_info()[1]
+        cleanup_error = None
+        releases = [] if trainer is None else [trainer.close]
+        releases.append(dist.destroy_process_group)
+        for release in releases:
+            try:
+                release()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if active_error is None and cleanup_error is not None:
+            raise cleanup_error
 
 
 if __name__ == "__main__":

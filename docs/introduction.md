@@ -268,4 +268,3 @@ pre-commit run --all-files
 - 架构与运行时契约：`docs/torchllmtuner_design.md`
 - TorchTitan 系列对比：`docs/torchtitan_comparison.md`
 - FSDPTurbo 对比：`docs/fsdpturbo_comparison.md`
-- Ascend 910C 实施与验证：`docs/ascend_910c_adoption_guide.md`
