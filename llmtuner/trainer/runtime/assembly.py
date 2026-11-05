@@ -408,6 +408,13 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
     # Build the model before optimizer services capture its parameters.
     with synchronize_local_errors("Model construction"):
         model, hf_model_config, load_hf_weights = _build_model(trainer)
+        # Count unique logical parameters before TP/EP/PP/FSDP change ownership.
+        num_parameters = sum(parameter.numel() for parameter in model.parameters())
+        num_trainable_parameters = sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
     _apply_parallelism(trainer, model, load_hf_weights=load_hf_weights)
     _build_optimizer_stack(trainer)
 
@@ -428,10 +435,36 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
             cfg.metrics,
             parallel_dims=trainer.parallel_dims,
             dump_folder=cfg.dump_folder,
+            num_parameters=num_parameters,
+            num_trainable_parameters=num_trainable_parameters,
             pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
             num_flops_per_token=flops_per_token(
                 unwrap_text_config(hf_model_config), seq_len=cfg.max_seq_len
             ),
         )
+    from ...components.training_observer import DispatchTimer, TrainingObserver
+
+    trainer.training_observer = TrainingObserver(trainer.metrics, trainer.device)
+    trainer.dispatch_timers = []
+    if cfg.metrics.measure_moe_dispatch:
+        from ...models.common.moe.experts import RoutedExperts
+
+        for part in trainer.model_parts:
+            for module in part.modules():
+                # Dedicated fused forward implementations do not use this
+                # dispatch boundary and must not report a vacuous zero timer.
+                if type(module) is RoutedExperts:
+                    timer = DispatchTimer()
+                    module.dispatch_observer = timer
+                    trainer.dispatch_timers.append(timer)
+        if not trainer.dispatch_timers:
+            logging_utils.get_logger(__name__).warning(
+                "Dispatch timing requested, but no native RoutedExperts boundary "
+                "was found; dispatch timing is unavailable for this model."
+            )
+    if cfg.activation_swap:
+        from ...memory.activation_swap import reset_activation_swap_metrics
+
+        reset_activation_swap_metrics()
     # The trainer synchronizes PP loss metrics to every stage before logging.
     logging_utils.set_log_ranks(cfg.metrics.log_ranks)

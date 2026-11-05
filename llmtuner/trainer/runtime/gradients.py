@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
 
 from ...accelerator.collectives import all_reduce, clip_grad_norm_
+from ...accelerator.distributed import get_comm_device
 from ...models.common.moe.layer import MoE
 from ...parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 from .reductions import TrainingReductionMeshes
@@ -16,18 +18,35 @@ if TYPE_CHECKING:
     from ..trainer import Trainer
 
 
+def _unique_parameters(
+    model_parts: Iterable[torch.nn.Module],
+) -> Iterator[torch.nn.Parameter]:
+    """Yield registered parameters once, preserving model-part order."""
+    seen: set[int] = set()
+    for part in model_parts:
+        for parameter in part.parameters():
+            if id(parameter) not in seen:
+                seen.add(id(parameter))
+                yield parameter
+
+
+def _expert_parameter_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
+    """Return identities of parameters owned by routed experts."""
+    return {
+        id(parameter)
+        for part in model_parts
+        for module in part.modules()
+        if isinstance(module, MoE)
+        for parameter in module.routed_experts.inner_experts.parameters()
+    }
+
+
 def allreduce_fsdp_excluded_grads(trainer: Trainer) -> None:
     """Sum non-FSDP gradients over their dense or expert replica axes."""
     if trainer.parallel_dims is None:
         return
     expert_ids = (
-        {
-            id(parameter)
-            for part in trainer.model_parts
-            for module in part.modules()
-            if isinstance(module, MoE)
-            for parameter in module.routed_experts.inner_experts.parameters()
-        }
+        _expert_parameter_ids(trainer.model_parts)
         if trainer.parallel_dims.ep_enabled
         else set()
     )
@@ -38,31 +57,24 @@ def allreduce_fsdp_excluded_grads(trainer: Trainer) -> None:
             for axis in ("dp_replicate", "efsdp")
         ],
     }
-    seen = set()
-    for part in trainer.model_parts:
-        for parameter in part.parameters():
-            if (
-                id(parameter) in seen
-                or not parameter.requires_grad
-                or isinstance(parameter, DTensor)
-            ):
+    for parameter in _unique_parameters(trainer.model_parts):
+        if not parameter.requires_grad or isinstance(parameter, DTensor):
+            continue
+        for mesh in meshes[id(parameter) in expert_ids]:
+            if mesh is None or mesh.size() <= 1:
                 continue
-            seen.add(id(parameter))
-            for mesh in meshes[id(parameter) in expert_ids]:
-                if mesh is None or mesh.size() <= 1:
-                    continue
-                group = mesh.get_group()
-                present = torch.tensor(
-                    int(parameter.grad is not None),
-                    device=parameter.device,
-                    dtype=torch.int32,
-                )
-                all_reduce(present, group=group)
-                if present.item() == 0:
-                    continue
-                if parameter.grad is None:
-                    parameter.grad = torch.zeros_like(parameter)
-                all_reduce(parameter.grad, group=group)
+            group = mesh.get_group()
+            present = torch.tensor(
+                int(parameter.grad is not None),
+                device=parameter.device,
+                dtype=torch.int32,
+            )
+            all_reduce(present, group=group)
+            if present.item() == 0:
+                continue
+            if parameter.grad is None:
+                parameter.grad = torch.zeros_like(parameter)
+            all_reduce(parameter.grad, group=group)
 
 
 def allreduce_replicated_tp_grads(trainer: Trainer) -> None:
@@ -76,15 +88,32 @@ def allreduce_replicated_tp_grads(trainer: Trainer) -> None:
         return
     sharded_ids = tp_sharded_param_ids(trainer.model_parts)
     group = tp_mesh.get_group()
-    for part in trainer.model_parts:
-        for param in part.parameters():
-            if param.grad is None or id(param) in sharded_ids:
-                continue
-            grad = param.grad
-            if isinstance(grad, DTensor):
-                all_reduce(grad.to_local(), group=group)
-            else:
-                all_reduce(grad, group=group)
+    parameters = [
+        param
+        for param in _unique_parameters(trainer.model_parts)
+        if param.requires_grad and id(param) not in sharded_ids
+    ]
+    if not parameters:
+        return
+    # Every TP rank owns the same ordered replicated parameters. Agree on
+    # participation once, before any gradient collective, including when a
+    # rank's local branch did not use a parameter.
+    present = torch.tensor(
+        [int(param.grad is not None) for param in parameters],
+        device=get_comm_device(group),
+        dtype=torch.int32,
+    )
+    all_reduce(present, group=group)
+    for param, count in zip(parameters, present.tolist(), strict=True):
+        if count == 0:
+            continue
+        if param.grad is None:
+            param.grad = torch.zeros_like(param)
+        grad = param.grad
+        if isinstance(grad, DTensor):
+            all_reduce(grad.to_local(), group=group)
+        else:
+            all_reduce(grad, group=group)
 
 
 def check_finite(trainer: Trainer, step_is_finite: torch.Tensor) -> None:
@@ -106,14 +135,9 @@ def clip_and_check_finite(
     """Clip gradients and produce one rank-uniform finite-step verdict."""
     trainer.before_gradient_clipping()
     pp_mesh = reduction_meshes.pp_mesh
-    parameters = [p for part in trainer.model_parts for p in part.parameters()]
-    expert_parameters = [
-        p
-        for part in trainer.model_parts
-        for module in part.modules()
-        if isinstance(module, MoE)
-        for p in module.routed_experts.inner_experts.parameters()
-    ]
+    parameters = list(_unique_parameters(trainer.model_parts))
+    expert_ids = _expert_parameter_ids(trainer.model_parts)
+    expert_parameters = [p for p in parameters if id(p) in expert_ids]
     ep_mesh = (
         trainer.parallel_dims.get_optional_mesh("ep")
         if trainer.parallel_dims is not None and trainer.parallel_dims.ep_enabled
@@ -132,12 +156,15 @@ def clip_and_check_finite(
             NpuBaselineGroupedExperts,
         )
 
-        norm_options["packed_parameters"] = [
-            (module.w1_EFD, module.w3_EFD)
-            for part in trainer.model_parts
-            for module in part.modules()
-            if isinstance(module, NpuBaselineGroupedExperts)
-        ]
+        packed_parameters = {}
+        for part in trainer.model_parts:
+            for module in part.modules():
+                if isinstance(module, NpuBaselineGroupedExperts):
+                    pair = (module.w1_EFD, module.w3_EFD)
+                    if all(parameter.grad is None for parameter in pair):
+                        continue
+                    packed_parameters.setdefault(tuple(map(id, pair)), pair)
+        norm_options["packed_parameters"] = list(packed_parameters.values())
     grad_norm = clip_grad_norm_(
         parameters,
         max_norm=trainer.cfg.max_norm,

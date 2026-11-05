@@ -16,6 +16,7 @@ all stages. The process group belongs to the entry point, not ``Trainer.close``.
 from __future__ import annotations
 
 import sys
+from collections import deque
 from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, nullcontext
 from datetime import timedelta
@@ -53,8 +54,10 @@ from ..datasets.contracts import (
     TrainerBatch,
 )
 from ..models.common.aux_loss import AuxLoss
-from ..models.common.moe.layer import MoE
-from ..models.common.moe.routing import QuantileBalancedTopKRouter
+from ..models.common.moe.bias_update import (
+    collect_routing_load_metrics,
+    reset_routing_statistics,
+)
 from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
 from ..utils.logging import get_logger
@@ -397,20 +400,11 @@ class Trainer:
         """Run diagnostics after gradient reduction and before clipping."""
 
     def param_context(self):
-        """The context a forward/backward runs inside.
+        """Context shared by dense/PP forward-backward and validation.
 
-        Currently empty (``nullcontext``), and kept as a named, mockable seam
-        rather than inlined because three bodies share it: the non-PP body, the
-        PP schedule body and validation; the tests substitute ``nullcontext``
-        for it.
-
-        This is *not* where activation checkpointing lives. AC is applied in the
-        parallel layer (``parallel/parallelize.py``'s ``apply_ac`` stage, fed by
-        ``runtime/assembly.py``), where torchtitan applies its ``ac_config`` too --
-        not around the loop body. The one upstream wrapper with no counterpart
-        here is ``spmd.no_typecheck()`` around ``loss.backward()``; it was
-        dropped deliberately (see ``models/common/rope.py``), because it is a
-        type-checker annotation with no runtime effect on this path.
+        The default is empty. Diagnostic integrations wrap this hook to control
+        output capture across all execution paths. Activation checkpointing is
+        installed by the parallel layer, outside this context.
         """
         return nullcontext()
 
@@ -440,16 +434,7 @@ class Trainer:
         # outright rather than zeroing them in place is both cheaper and what
         # makes the accumulated-gradient bookkeeping below trivially correct.
         self.optimizer.zero_grad(set_to_none=True)
-        # A new accumulation window owns fresh routing observations, just as
-        # it owns fresh gradients. The previous window may have failed before
-        # optimizer pre-hooks drained its counters and quantile histograms.
-        with torch.no_grad():
-            for part in self.model_parts:
-                for module in part.modules():
-                    if isinstance(module, MoE):
-                        module.tokens_per_expert_E.zero_()
-                        if isinstance(module.router, QuantileBalancedTopKRouter):
-                            module.router.quantile_balancer.required_bias_histogram_EB.zero_()
+        reset_routing_statistics(self.model_parts)
 
         # Snapshot the lr *before* the schedule advances below. The value
         # reported for a step must be the one the optimizer applied during it;
@@ -459,57 +444,23 @@ class Trainer:
             lr_metrics = self.lr_scheduler.get_metrics()
             should_log = self.should_log()
 
-        # The meshes are resolved once here rather than inline at each
-        # collective, and each reduction gets the group *its* quantity spans.
-        #
-        # The token count is taken from the unsharded batch, so every rank of a
-        # TP or CP group holds the same number: summing over dp (replicate *
-        # shard) is the whole batch's count, once. The groups that would be
-        # wrong are the pure-cp axis (multiplying the count by cp), the tp axis
-        # (TP ranks read the same batch), and the ``loss`` axis (by dp * cp *
-        # tp) -- all over-count a batch no rank ever held in full.
-        #
-        # The loss is summed over each rank's own *slice* of the batch -- rows
-        # under dp, sequence shards under cp and tp -- so it needs the
-        # dp * cp * tp group (the ``loss`` view): that sum reaches every token
-        # exactly once, whereas a dp-only sum would miss the sequence shards
-        # held by the other CP/TP ranks and report an average cp * tp times too
-        # small. The two coincide when CP and TP are off, which is why one mesh
-        # serves both averages. Under PP each stage's subgroup reduces
-        # independently and only the last stage's (the metrics rank's) is ever
-        # logged, so a size-1 loss axis is nothing to reduce over rather than
-        # an error -- hence ``get_optional_mesh`` rather than ``get_mesh``.
-        #
-        # When the loss mesh *is* used is not "is any one parallelism on" but
-        # "is the loss split across ranks at all": with cp or tp on and dp = 1
-        # the sequence is sharded and dp alone is a size-1 group, so skipping
-        # the reduction would report one rank's shard as the whole batch's
-        # loss. Gate on the disjunction of all three, the property torchtitan
-        # gates on (``dp_cp_enabled``) extended by tp for the sequence-parallel
-        # loss shard upstream does not have.
+        # Count replicated loader tokens over DP only; sum sequence-sharded
+        # losses over DP/CP/TP. runtime/reductions.py owns these mesh choices.
+        # PP stages report independently; only the final stage's loss is logged.
         parallel_dims = self.parallel_dims
         reduction_meshes = resolve_training_reduction_meshes(parallel_dims)
         dp_mesh = reduction_meshes.dp_mesh
 
-        # Read the whole step's data up front. The denominator must be known
-        # before the first forward (the loss divides by it there), so every
-        # batch that feeds this step has to have been read by then -- and,
-        # within a batch, the count has to be taken before the sequence is cut
-        # up for CP or PP, both of which turn one whole-batch count into
-        # per-rank slices. Only the tensors the step will consume are kept;
-        # the rest of the batch is dropped here rather than held across the
-        # accumulation window.
-        microbatches: list[dict[str, Any]] = []
+        # Read the entire accumulation window on the host before the first
+        # forward: every group's gradient uses the same global token denominator.
+        # Counting must precede CP/TP sequence sharding and PP microbatch splits.
+        microbatches: deque[dict[str, Any]] = deque()
         local_valid_tokens = 0
         local_routing_tokens = 0
         for _ in range(self.cfg.gradient_accumulation_steps):
-            # ``microbatch`` owns the split of responsibility: it takes the
-            # count (the denominator) and the accounting off the loader's own
-            # batch, before any reshaping, and leaves everything else to the
-            # model. Both of those have to happen here rather than per
-            # micro-batch: the count has to be reduced across DP before the
-            # first backward, and the account is a report about the loader.
+            # Account against the original loader batch; transfer at consumption.
             microbatch = self.microbatch(next(data_iterator))
+            self.metrics.add_valid_tokens(microbatch["num_valid_tokens"])
             microbatches.append(microbatch)
             local_valid_tokens += microbatch["num_valid_tokens"]
             local_routing_tokens += microbatch["num_routing_tokens"]
@@ -571,21 +522,18 @@ class Trainer:
         accumulated_loss: torch.Tensor | None = None
         # int32 is supported by NCCL reductions, unlike bool.
         loss_is_finite = torch.ones((), dtype=torch.int32, device=self.device)
-        for accumulation_index, microbatch in enumerate(microbatches):
-            # HSDP needs the replicate all-reduce once per optimizer step, not
-            # once per accumulation group: every group but the last accumulates
-            # into the local replica, and the flag is turned back on for the
-            # last one, which then reduces the accumulated total. This is
-            # torchtitan's ``forward_backward_microbatch`` toggle; its
-            # ``disable_cuda_graphs`` disjunct is unconditional here because
-            # llmtuner runs no graph path.
+        while microbatches:
+            microbatch = microbatches.popleft()
+            # HSDP accumulates locally until the final group, then all-reduces
+            # the accumulated gradient once for this optimizer step.
             if parallel_dims is not None and parallel_dims.dp_replicate_enabled:
-                is_last = accumulation_index == len(microbatches) - 1
+                is_last = not microbatches
                 for part in self.model_parts:
                     part.set_requires_all_reduce(is_last)
             detached_loss = self.forward_backward_step(
                 microbatch, global_valid_tokens=global_valid_tokens
             )
+            del microbatch
             local_loss = (
                 detached_loss.to_local()
                 if isinstance(detached_loss, DTensor)
@@ -610,14 +558,17 @@ class Trainer:
             loss_is_finite=loss_is_finite,
         )
 
+        routing_metrics = (
+            collect_routing_load_metrics(
+                self.model_parts, self.parallel_dims, self.device
+            )
+            if should_log
+            else {}
+        )
         self.optimizer.step()
-        # After the update, so the lr the optimizer just applied is the one this
-        # schedule produced for the previous step -- which is what makes step 1
-        # run at ``lambda(0)`` rather than ``lambda(1)``. The snapshot taken at
-        # the top of this function is the value handed to the optimizer.
-        # Built-in schedulers only update local rates. Agree on failure before
-        # peers advance EMA or enter metric/checkpoint collectives. The optimizer
-        # update above may already be committed; this does not roll it back.
+        # Advance the scheduler after the optimizer uses the current rate.
+        # Agree on failure before EMA or reporting collectives. The optimizer
+        # update is already committed and cannot be rolled back here.
         with synchronize_local_errors("Training scheduler update"):
             self.lr_scheduler.step()
         with synchronize_local_errors("Training EMA update"):
@@ -635,7 +586,7 @@ class Trainer:
         # Dividing by the step's global valid-token count reports the same
         # average that normalized the gradients, independent of DP rank and
         # accumulation boundaries.
-        return metrics_runtime.build_step_metrics(
+        result = metrics_runtime.build_step_metrics(
             self,
             accumulated_loss=accumulated_loss,
             global_valid_tokens=global_valid_tokens,
@@ -645,6 +596,10 @@ class Trainer:
             grad_norm=grad_norm,
             lr_metrics=lr_metrics,
         )
+        result.update(routing_metrics)
+        with synchronize_local_errors("Training resource observation"):
+            result.update(metrics_runtime.collect_resource_metrics(self))
+        return result
 
     # -- validation (bodies live in runtime/validation.py) ----------------------
 
@@ -769,7 +724,14 @@ class Trainer:
                         self.gc_handler.run(self.step)
 
                     try:
+                        observer = getattr(self, "training_observer", None)
+                        if observer is not None:
+                            observer.begin()
                         step_metrics = self.train_step(data_iterator)
+                        if observer is not None:
+                            observations = observer.end()
+                            if step_metrics is not None:
+                                step_metrics.update(observations)
                     except DataloaderExhaustedError:
                         # The step is abandoned rather than trained on a
                         # partial batch: a batch's worth of tokens either all
@@ -823,6 +785,11 @@ class Trainer:
                     with synchronize_local_errors("Training checkpoint reporting"):
                         if saved:
                             logger.info(f"Saved checkpoint for step {self.step}")
+                            if observer is not None:
+                                self.metrics.log_resources(
+                                    self.step,
+                                    self.checkpointer.observation_metrics.copy(),
+                                )
 
                     # Validation, after the checkpoint save and before the
                     # profiler advances -- the reference's order. The pass is
@@ -869,12 +836,13 @@ class Trainer:
                     pass
 
     def close(self) -> None:
-        """Release everything ``train`` acquired, in reverse order of use.
+        """Release trainer resources in dependency order.
 
-        Successful releases are not repeated. Failed sinks and loaders remain
-        available for retry, including during partial initialization. Attempt
-        every release before propagating the first cleanup error; callers with
-        an active training error preserve it at their exception boundary.
+        Drain checkpoint writes while the loader they may reference is alive,
+        then close reporting and data resources. Restore process-wide GC state
+        last. Successful releases are not repeated; failed owners remain for
+        retry, including during partial initialization. Attempt every release
+        before propagating the first cleanup error.
         """
         first_error: BaseException | None = None
         for name in ("checkpointer", "metrics", "dataloader", "gc_handler"):
