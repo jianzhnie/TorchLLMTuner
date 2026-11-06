@@ -298,14 +298,7 @@ class BaseCheckpointManager(ABC):
                 )
         # Loading mutates the same live state that staging reads. Finish the
         # snapshot and its publication before discovering a restore source.
-        staging_failure: BaseException | None = None
-        try:
-            self.maybe_wait_for_staging()
-        except BaseException as error:
-            staging_failure = error
-        with synchronize_local_errors("Checkpoint load staging"):
-            if staging_failure is not None:
-                raise staging_failure
+        self._wait_for_pending_staging()
         self._wait_for_pending_save()
         with synchronize_local_errors("Checkpoint load preflight"):
             resolved = self._resolve_load_source(step)
@@ -589,6 +582,17 @@ class BaseCheckpointManager(ABC):
         self._initialized = False
         if first_error is not None:
             raise first_error
+
+    def _wait_for_pending_staging(self) -> None:
+        """Drain staging and agree before any rank discovers a restore source."""
+        failure: BaseException | None = None
+        try:
+            self.maybe_wait_for_staging()
+        except BaseException as error:
+            failure = error
+        with synchronize_local_errors("Checkpoint load staging"):
+            if failure is not None:
+                raise failure
 
     def _wait_for_pending_save(self) -> None:
         """Drain a previous save and agree before saving or loading state.

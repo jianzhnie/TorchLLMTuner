@@ -40,11 +40,11 @@ class CheckpointLoadPlanner(DefaultLoadPlanner):
         saved_names: dict[str, str] = {}
         for saved_key in saved_keys:
             name = canonical_fqn(saved_key, wrapper_segments=("_orig_mod",))
-            maximum_base = name.removesuffix(".max_exp_avg_sq") + ".exp_avg_sq"
             if name in self.state_dict or (
                 name.startswith(f"{OPTIMIZER}.state.")
                 and name.endswith(".max_exp_avg_sq")
-                and maximum_base in self.state_dict
+                and name.removesuffix(".max_exp_avg_sq") + ".exp_avg_sq"
+                in self.state_dict
             ):
                 if name in saved_names:
                     raise ValueError(
@@ -100,27 +100,28 @@ class CheckpointLoadPlanner(DefaultLoadPlanner):
         rng_prefix = f"{RNG_STATE}."
         self.has_rng_state = any(key.startswith(rng_prefix) for key in saved_keys)
         if not self.has_rng_state:
-            rng_keys = [key for key in self.state_dict if key.startswith(rng_prefix)]
-            if rng_keys:
-                logger.warning(
-                    "Legacy checkpoint has no RNG state; random training "
-                    "cannot resume with exact stream continuity."
-                )
-                for key in rng_keys:
-                    del self.state_dict[key]
+            self._drop_legacy_keys(
+                rng_prefix,
+                "Legacy checkpoint has no RNG state; random training "
+                "cannot resume with exact stream continuity.",
+            )
         prefix = f"{DATALOADER}.batch_layout."
         if (
             f"{DATALOADER}.version" in saved_keys or f"{DATALOADER}.steps" in saved_keys
         ) and not any(key.startswith(prefix) for key in saved_keys):
-            layout_keys = [key for key in self.state_dict if key.startswith(prefix)]
-            if layout_keys:
-                logger.warning(
-                    "Legacy dataloader checkpoint has no batch layout metadata; "
-                    "its saved layout cannot be validated."
-                )
-                for key in layout_keys:
-                    del self.state_dict[key]
+            self._drop_legacy_keys(
+                prefix,
+                "Legacy dataloader checkpoint has no batch layout metadata; "
+                "its saved layout cannot be validated.",
+            )
         return super().create_local_plan()
+
+    def _drop_legacy_keys(self, prefix: str, warning: str) -> None:
+        keys = [key for key in self.state_dict if key.startswith(prefix)]
+        if keys:
+            logger.warning(warning)
+            for key in keys:
+                del self.state_dict[key]
 
     def load_bytes(self, read_item: ReadItem, value: io.BytesIO) -> None:
         if not self.flatten_state_dict:

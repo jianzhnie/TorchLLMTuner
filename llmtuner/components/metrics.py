@@ -90,12 +90,14 @@ DeviceMemStats = namedtuple(
 
 
 class DeviceMemoryMonitor:
-    """Peak device-memory sampling over a logging window.
+    """Rank-local device allocator sampling over a logging window.
 
     The trainer resets peak counters after every log. Reserved memory includes
     cached allocator blocks retained from earlier windows; resetting counters
     does not release those blocks. Use active and reserved metrics separately
     when comparing tensor residency and allocator capacity.
+    No rank reduction occurs here: memory peaks, retries and OOM counts describe
+    this process's current device, even when step timing uses the slowest rank.
     """
 
     def __init__(self, device_type: str) -> None:
@@ -613,6 +615,10 @@ class MetricsProcessor:
     ) -> None:
         """Report one training step.
 
+        Synchronized training observations supply global token counts and
+        slowest-rank timing. Allocator fields remain local to this logging rank;
+        they are not world maxima and cannot establish all-rank memory bounds.
+
         Args:
             step: the current training step.
             global_avg_loss: total loss over total valid tokens, so it is
@@ -620,7 +626,7 @@ class MetricsProcessor:
             global_max_loss: the worst rank's per-token loss. Equal to
                 ``global_avg_loss`` when averaging over rank means rather than
                 tokens -- see the note in the trainer.
-            grad_norm: gradient norm, measured after clipping.
+            grad_norm: total gradient norm before clipping, returned by clipping.
             extra_metrics: additional numbers the caller wants recorded.
         """
         if self.step_last_log is None:

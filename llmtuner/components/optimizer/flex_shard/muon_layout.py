@@ -158,7 +158,7 @@ def _resolve_storage_to_compute_redistribution_requirement(
         mesh_axis_names = param.device_mesh.mesh_dim_names
         assert mesh_axis_names is not None
         for storage_mesh_axis in sorted(declared_storage_mesh_axes):
-            source_sharding = _normalize_storage_placement(
+            source_sharding = _normalize_placement(
                 param.placements[storage_mesh_axis],
                 ndim=param.ndim,
                 mesh_axis_size=param.device_mesh.size(storage_mesh_axis),
@@ -204,7 +204,7 @@ def _resolve_storage_to_compute_redistribution_requirement(
         for storage_mesh_axis, placement in enumerate(param.placements):
             if storage_mesh_axis == redistribution_storage_mesh_axis:
                 continue
-            storage_sharding = _normalize_storage_placement(
+            storage_sharding = _normalize_placement(
                 placement,
                 ndim=param.ndim,
                 mesh_axis_size=param.device_mesh.size(storage_mesh_axis),
@@ -230,7 +230,7 @@ def _resolve_storage_to_compute_redistribution_requirement(
         else:
             storage_sharding = cast(
                 Replicate | Shard,
-                _normalize_storage_placement(
+                _normalize_placement(
                     param.placements[redistribution_storage_mesh_axis],
                     ndim=param.ndim,
                     mesh_axis_size=param.device_mesh.size(
@@ -335,7 +335,7 @@ def _validate_shard_order_compute_targets(
                 rightward_mesh_axis
             )
             if rightward_sharding is None:
-                rightward_sharding = _normalize_storage_placement(
+                rightward_sharding = _normalize_placement(
                     param.placements[rightward_mesh_axis],
                     ndim=param.ndim,
                     mesh_axis_size=param.device_mesh.size(rightward_mesh_axis),
@@ -532,10 +532,13 @@ def _resolve_storage_to_compute_transition(
             declared_shard_dims.append(_normalize_dim(placement.dim, param.ndim))
         elif type(placement) is BlockShard:
             declared_shard_dims.append(0)
-        target_sharding = _normalize_compute_placement(
-            placement,
-            ndim=param.ndim,
-            mesh_axis_size=param.device_mesh.size(storage_mesh_axis),
+        target_sharding = cast(
+            _AxisComputeSharding,
+            _normalize_placement(
+                placement,
+                ndim=param.ndim,
+                mesh_axis_size=param.device_mesh.size(storage_mesh_axis),
+            ),
         )
         normalized_target_sharding_by_storage_mesh_axis[storage_mesh_axis] = (
             target_sharding
@@ -585,7 +588,7 @@ def _resolve_storage_to_compute_transition(
                         f"{redistribution_axis_name!r}"
                     )
             else:
-                preserved_storage_sharding = _normalize_storage_placement(
+                preserved_storage_sharding = _normalize_placement(
                     placement,
                     ndim=param.ndim,
                     mesh_axis_size=param.device_mesh.size(storage_mesh_axis),
@@ -690,7 +693,7 @@ def _resolve_storage_to_compute_transition(
                 storage_mesh_axis
             ]
         else:
-            target_sharding = _normalize_storage_placement(
+            target_sharding = _normalize_placement(
                 param.placements[storage_mesh_axis],
                 ndim=param.ndim,
                 mesh_axis_size=param.device_mesh.size(storage_mesh_axis),
@@ -757,42 +760,12 @@ def _raise_unsupported_layout(fqn: str) -> NoReturn:
     raise ValueError(f"unsupported storage-to-compute layout for {fqn!r}")
 
 
-def _normalize_compute_placement(
-    placement: _AxisComputeSharding,
-    *,
-    ndim: int,
-    mesh_axis_size: int,
-) -> _AxisComputeSharding:
-    if type(placement) is Replicate:
-        return Replicate()
-    if type(placement) is Shard:
-        normalized_dim = _normalize_dim(placement.dim, ndim)
-        if mesh_axis_size == 1:
-            return Replicate()
-        return Shard(normalized_dim)
-    if type(placement) is _StridedShard:
-        normalized_dim = _normalize_dim(placement.dim, ndim)
-        if mesh_axis_size == 1:
-            return Replicate()
-        if placement.split_factor == 1:
-            return Shard(normalized_dim)
-        return _StridedShard(
-            normalized_dim,
-            split_factor=placement.split_factor,
-        )
-    assert type(placement) is BlockShard
-    normalized_dim = _normalize_dim(placement.dim, ndim)
-    if mesh_axis_size == 1:
-        return Replicate()
-    return BlockShard(normalized_dim, placement.block_sizes)
-
-
-def _normalize_storage_placement(
+def _normalize_placement(
     placement: object,
     *,
     ndim: int,
     mesh_axis_size: int,
-) -> Replicate | Shard | _StridedShard | _UnsupportedStoragePlacement:
+) -> Replicate | Shard | _StridedShard | BlockShard | _UnsupportedStoragePlacement:
     if mesh_axis_size == 1 or type(placement) is Replicate:
         return Replicate()
     if type(placement) is Shard:
@@ -805,6 +778,8 @@ def _normalize_storage_placement(
             normalized_dim,
             split_factor=placement.split_factor,
         )
+    if type(placement) is BlockShard:
+        return BlockShard(_normalize_dim(placement.dim, ndim), placement.block_sizes)
     return _UnsupportedStoragePlacement(
         type_name=type(placement).__name__,
         representation=repr(placement),

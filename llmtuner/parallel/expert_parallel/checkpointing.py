@@ -1,38 +1,24 @@
-"""EP-aware expert-state serialization for checkpoints.
+"""Full-tensor and chunked checkpoint layouts for EP-owned expert state.
 
-The EP swap leaves expert weights as rank-heterogeneous tensors: each rank's
-``GroupedExperts`` holds only its own ``num_local = E / ep`` experts, under the
-same FQN every rank reports. A checkpoint backend that treats same-FQN tensors
-as replicated collapses all ranks onto one expert slice, so EP runs refused
-checkpointing outright (the retired ``ep_checkpoint`` matrix row).
+Expert parameters share FQNs across ranks but own different expert slices.
+Treating those slices as replicas would silently discard expert weights.
 
-The representation chosen here is the full-tensor one: on save, each expert
-entry is all-gathered along the expert dim across the EP group into the
-complete ``(E, F, D)`` / ``(E, D, F)`` tensor (upstream's logical view, where
-the expert weight is one DTensor sharded on the EP axis); on load, every rank
-slices its own ``[ep_rank * num_local, (ep_rank + 1) * num_local)`` piece back
-out -- the same per-rank slicing the swap itself performs. Because the stored
-tensor is the complete expert weight under the original FQN, a checkpoint is
-independent of the EP degree: resuming with a different ``ep`` re-slices the
-same full tensor.
+``gather_expert_state`` materializes each local FSDP slice and gathers the
+complete expert tensor across EP ranks. ``load_expert_state`` slices that
+full tensor and restores the destination parameter's DTensor placement.
+This path allocates full expert tensors on participating ranks.
 
-Two value forms are handled:
+``shard_expert_state`` instead describes local storage as DCP chunks with
+explicit global expert and FSDP coordinates, including empty ownership.
+``restore_sharded_expert_state`` validates destinations before copying either
+chunked state or legacy full tensors into caller-owned local storage. This
+avoids full expert materialization on the chunked save path; it does not
+remove DCP staging or writer allocations.
 
-* plain tensors (EP without FSDP): the live value is the local slice; gather
-  concatenates, load narrows;
-* ``DTensor`` (EP with FSDP2, experts sharded on the efsdp axis): the value is
-  first materialized with ``full_tensor()`` per EP rank, then gathered; on
-  load the slice is re-distributed with the live parameter's own mesh and
-  placements so ``load_state_dict`` can copy it into the sharded parameter.
-
-The transform applies to any flat, FQN-keyed dict: the model wrapper's (key
-``fqn``), the optimizer container's (keys ``state.{fqn}.{state_name}`` -- the
-shape match against the live parameter keeps scalar entries like ``step``
-untouched), and the EMA's (``state.{fqn}.ema_params``).
-
-Known cost: every save materializes the full expert weights on every rank
-(and every load plans against them). That is the price of a degree-
-independent, replication-safe layout; a sharded write plan is future work.
+These transforms operate on flat FQN dictionaries for model, optimizer and
+EMA state. Parameter-shape matching leaves scalar optimizer counters untouched.
+The caller selects the representation and coordinates errors before layout
+collectives; model and optimizer restore lifecycles remain separate.
 """
 
 from __future__ import annotations
@@ -47,7 +33,10 @@ import torch.nn as nn
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_rank, get_world_size
-from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
+from ...components.checkpointer.core.chunked_tensor import (
+    ChunkedCheckpointTensor,
+    chunk_layout,
+)
 from ...utils.module_names import canonical_fqn
 
 try:  # torch >= 2.4; the FSDP path (DTensor expert weights) needs it.
@@ -375,9 +364,7 @@ def restore_sharded_expert_state(
             if source.dtype != target.dtype:
                 raise ValueError(f"EP checkpoint dtype mismatch: {key}")
             if isinstance(source, ChunkedCheckpointTensor):
-                if [(offset, value.shape) for offset, value in source.chunks] != [
-                    (offset, value.shape) for offset, value in target.chunks
-                ]:
+                if chunk_layout(source.chunks) != chunk_layout(target.chunks):
                     raise ValueError(f"EP checkpoint local ownership mismatch: {key}")
             pending.append((key, target, source))
     with torch.no_grad():

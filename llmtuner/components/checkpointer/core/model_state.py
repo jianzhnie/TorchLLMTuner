@@ -32,7 +32,7 @@ from ....parallel.tensor_parallel.checkpointing import (
     shard_disjoint_tp_ep_state,
     shard_tensor_parallel_state,
 )
-from .chunked_tensor import ChunkedCheckpointTensor
+from .chunked_tensor import ChunkedCheckpointTensor, chunk_layout
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -220,24 +220,25 @@ class ModelCheckpointState(Stateful):
                     raise ValueError(
                         f"Model checkpoint {key!r} dtype differs from destination"
                     )
-                expected_layout = [
-                    (offset, tensor.shape) for offset, tensor in expected.chunks
-                ]
-                actual_layout = [
-                    (offset, tensor.shape) for offset, tensor in value.chunks
-                ]
+                expected_layout = chunk_layout(expected.chunks)
+                actual_layout = chunk_layout(value.chunks)
                 if actual_layout != expected_layout:
                     raise ValueError(
                         f"Model checkpoint {key!r} chunk layout differs "
                         "from destination"
                     )
 
+    def _local_state_dict(self) -> dict[str, Any]:
+        return {
+            key: value
+            for model in self.model
+            for key, value in model.state_dict().items()
+        }
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.validate_state_dict(state_dict)
         if self.sharded_tensor_parallel and self.sharded_expert_parallel:
-            local_state = {}
-            for model in self.model:
-                local_state.update(model.state_dict())
+            local_state = self._local_state_dict()
             state_dict = restore_disjoint_tp_ep_state(
                 state_dict, local_state=local_state, model_parts=self.model
             )
@@ -246,9 +247,7 @@ class ModelCheckpointState(Stateful):
             self.cached_state_dict = self._get_state_dict()
             return
         if self.sharded_expert_parallel:
-            local_state = {}
-            for model in self.model:
-                local_state.update(model.state_dict())
+            local_state = self._local_state_dict()
             state_dict = restore_sharded_expert_state(
                 state_dict,
                 local_state=local_state,
@@ -263,9 +262,7 @@ class ModelCheckpointState(Stateful):
         if self.sharded_tensor_parallel and any(
             isinstance(value, ChunkedCheckpointTensor) for value in state_dict.values()
         ):
-            local_state = {}
-            for model in self.model:
-                local_state.update(model.state_dict())
+            local_state = self._local_state_dict()
             local_state = gather_expert_state(
                 local_state, shard_map=self._ep_shards, model_parts=self.model
             )

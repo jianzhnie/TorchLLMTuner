@@ -47,10 +47,11 @@ def _shard_for_cp(
 ]:
     if cp_mesh is None:
         attention_masks = None
-        if positions is not None:
-            mask = model.get_attention_masks(positions=positions)
-            if model.model.config._attn_implementation == ATTENTION_BACKEND:
-                attention_masks = mask
+        if (
+            positions is not None
+            and model.model.config._attn_implementation == ATTENTION_BACKEND
+        ):
+            attention_masks = model.get_attention_masks(positions=positions)
         return inputs, labels, positions, padding_mask, attention_masks
 
     if positions is None:
@@ -195,34 +196,43 @@ def preprocess_inputs(
             == 0
         )
         row_attention_mask = row_attention_mask & (row_ids[:, None] == row_ids[None, :])
-    inputs, labels, positions, padding_mask, attention_masks = _shard_for_cp(
-        model,
-        cp_mesh,
-        packed=packed,
-        inputs=inputs,
-        labels=labels,
-        positions=positions,
-        padding_mask=padding_mask,
-    )
+    attention_masks = None
+    # Without CP, independent rows build their own mask below. A generic Flex
+    # mask here would be discarded before forward.
+    if cp_mesh is not None or row_length is None:
+        inputs, labels, positions, padding_mask, attention_masks = _shard_for_cp(
+            model,
+            cp_mesh,
+            # The full row-aware mask already contains document boundaries.
+            packed=packed and row_attention_mask is None,
+            inputs=inputs,
+            labels=labels,
+            positions=positions,
+            padding_mask=padding_mask,
+        )
     if row_attention_mask is not None:
         attention_masks = row_attention_mask
     if row_length is not None and cp_mesh is None:
-        row_positions = torch.arange(inputs.numel(), device=inputs.device)
-        row_positions = row_positions.remainder(row_length)
-        if positions is None:
-            positions = row_positions
+        if packed:
+            # Batch rows are independent even when RoPE positions continue from
+            # an earlier chunk. Add mask boundaries without changing RoPE.
+            mask_positions = positions.clone()
+            mask_positions[::row_length] = 0
+        else:
+            mask_positions = torch.arange(inputs.numel(), device=inputs.device)
+            mask_positions = mask_positions.remainder(row_length)
+            if positions is None:
+                positions = mask_positions
         if model.model.config._attn_implementation != ATTENTION_BACKEND:
             attention_masks = build_dense_attention_mask(
-                row_positions if not packed else positions,
+                mask_positions,
                 dtype=mask_dtype(model),
                 block_causal=True,
             )
         else:
             mask_mod = and_masks(
                 get_causal_mask_mod(),
-                get_efficient_causal_mask_mod_for_packed_document(
-                    row_positions if not packed else positions
-                ),
+                get_efficient_causal_mask_mod_for_packed_document(mask_positions),
             )
             attention_masks = create_attention_mask(
                 mask_mod,

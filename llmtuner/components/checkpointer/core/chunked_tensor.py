@@ -17,6 +17,12 @@ from torch.distributed.checkpoint.planner import (
 )
 
 
+def chunk_layout(
+    chunks: Sequence[tuple[Sequence[int], torch.Tensor]],
+) -> list[tuple[Sequence[int], torch.Size]]:
+    return [(offset, value.shape) for offset, value in chunks]
+
+
 class ChunkedCheckpointTensor(torch.Tensor):
     """A DCP-only tensor; its global shape does not allocate global storage.
 
@@ -108,8 +114,7 @@ class ChunkedCheckpointTensor(torch.Tensor):
             self.shape != current.shape
             or self.dtype != current.dtype
             or self.device != current.device
-            or [(offset, value.shape) for offset, value in self.chunks]
-            != [(offset, value.shape) for offset, value in current.chunks]
+            or chunk_layout(self.chunks) != chunk_layout(current.chunks)
         ):
             raise ValueError("Checkpoint cache chunk layout changed")
         # Check every cross-chunk alias before writing anything: hooks may swap
@@ -171,11 +176,9 @@ class ChunkedCheckpointTensor(torch.Tensor):
             destination, source = args[:2]
             if not isinstance(source, cls):
                 raise TypeError("Checkpoint copy requires a chunked source")
-            target_layout = [
-                (offset, value.shape) for offset, value in destination.chunks
-            ]
-            source_layout = [(offset, value.shape) for offset, value in source.chunks]
-            if destination.shape != source.shape or target_layout != source_layout:
+            if destination.shape != source.shape or chunk_layout(
+                destination.chunks
+            ) != chunk_layout(source.chunks):
                 raise ValueError("Checkpoint copy requires identical chunk layouts")
             if (
                 destination.dtype == source.dtype

@@ -108,12 +108,7 @@ def _initialize_dist_muon(
     _validate_compute_sharding_configuration(compute_sharding_by_fqn)
 
     for param_group in optimizer.param_groups:
-        group_params = tuple(param_group["params"])
-        raw_param_names = param_group.get("param_names")
-        param_names = () if raw_param_names is None else tuple(raw_param_names)
-        if raw_param_names is None or len(group_params) != len(param_names):
-            raise ValueError("params and param_names must be aligned")
-        for _param, fqn in zip(group_params, param_names, strict=True):
+        for fqn in param_group["param_names"]:
             if fqn not in compute_sharding_by_fqn:
                 raise ValueError(f"missing compute sharding for Muon parameter {fqn!r}")
 

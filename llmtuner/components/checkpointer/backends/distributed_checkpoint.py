@@ -661,7 +661,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         3. ``last_step`` is set, which forces a save regardless of interval.
 
         Returns:
-            Whether a checkpoint was written (or staged, in async modes).
+            Whether a checkpoint was written or an asynchronous save submitted.
         """
         if not self._should_save(curr_step, last_step):
             return False
@@ -673,8 +673,8 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         begin = time.monotonic()
         checkpoint_phase = (
             "saving"
-            if self.async_mode == DistributedCheckpointAsyncMode.DISABLED
-            else "staging"
+            if last_step or self.async_mode == DistributedCheckpointAsyncMode.DISABLED
+            else "submitting"
         )
         with synchronize_local_errors("Checkpoint save reporting"):
             logger.info(f"{checkpoint_phase.capitalize()} the checkpoint.")
@@ -780,9 +780,8 @@ class DistributedCheckpointManager(BaseCheckpointManager):
 
         if async_save_started_at is not None:
             self._pending_retention = {"saving_step": curr_step}
-            # The line below only measured staging: the background write's
-            # duration is otherwise invisible, which is the number that says
-            # whether async checkpointing is actually keeping up.
+            # Submission may return before staging finishes. Report upload
+            # completion separately from the foreground save call.
             assert self.save_future is not None
 
             def log_save_completion(future: Future) -> None:

@@ -167,9 +167,9 @@ def _balance_loads_across_partitions(
             current_secondary,
             cumulative_primary,
             partition,
-        ) = heapq.heappop(partition_loads)
+        ) = partition_loads[0]
         assignments[load_index] = partition
-        heapq.heappush(
+        heapq.heapreplace(
             partition_loads,
             (
                 current_primary + primary,
@@ -261,15 +261,14 @@ def _build_batched_matrix_redistribution_plan(
             and logical_region.shape[1] == matrix_columns,
             "matrix-batch redistribution requires row-sharded 2D storage",
         )
-        tensor_region = _TensorRegion(offsets=(0, 0), shape=logical_region.shape)
-        storage_endpoints.append((holders, logical_region, tensor_region))
+        storage_endpoints.append((holders, logical_region))
         for participant in holders:
             _require_valid_plan(
                 participant in participants
                 and participant not in storage_by_participant,
                 "matrix-batch storage holders must partition participants",
             )
-            storage_by_participant[participant] = (logical_region, tensor_region)
+            storage_by_participant[participant] = logical_region
 
     _require_valid_plan(
         set(storage_by_participant) == set(participants),
@@ -278,8 +277,8 @@ def _build_batched_matrix_redistribution_plan(
     storage_partitions = tuple(
         _ParticipantPartition(
             participant=participant,
-            tensor_shape=storage_by_participant[participant][1].shape,
-            logical_regions=(storage_by_participant[participant][0],),
+            tensor_shape=storage_by_participant[participant].shape,
+            logical_regions=(storage_by_participant[participant],),
         )
         for participant in participants
     )
@@ -313,7 +312,7 @@ def _build_batched_matrix_redistribution_plan(
         )
 
     storage_to_compute_routes = []
-    for source_holders, storage_region, storage_tensor_base in storage_endpoints:
+    for source_holders, storage_region in storage_endpoints:
         storage_row_offset = storage_region.offsets[0]
         storage_row_end = storage_row_offset + storage_region.shape[0]
         for participant, matrix_offset, local_num_matrices in compute_endpoints:
@@ -334,12 +333,7 @@ def _build_batched_matrix_redistribution_plan(
                     shape=(route_rows, matrix_columns),
                 )
                 storage_tensor_region = _TensorRegion(
-                    offsets=(
-                        storage_tensor_base.offsets[0]
-                        + route_row_offset
-                        - storage_row_offset,
-                        0,
-                    ),
+                    offsets=(route_row_offset - storage_row_offset, 0),
                     shape=(route_rows, matrix_columns),
                 )
                 compute_tensor_region = _TensorRegion(

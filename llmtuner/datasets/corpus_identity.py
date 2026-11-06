@@ -22,6 +22,7 @@ def corpus_data_identity(config: LLMTunerConfig, *, dataset: str, repeat: bool) 
     snapshot identifier; this cannot infer remote contents or callable semantics.
     This is a construction-time snapshot, not a file mutation lock.
     """
+    local_text = dataset in {"local_jsonl", "local_jsonl_sft"}
     data_settings = asdict(config.dataloader)
     if not data_settings["global_context_rows"]:
         data_settings.pop("global_context_rows")
@@ -39,7 +40,7 @@ def corpus_data_identity(config: LLMTunerConfig, *, dataset: str, repeat: bool) 
         "repeat": repeat,
         "data": data_settings,
     }
-    if dataset not in {"local_jsonl", "local_jsonl_sft"} and dataset not in DATASETS:
+    if not local_text and dataset not in DATASETS:
         # Registering previously unregistered visual markers changes packed
         # samples with unchanged assets. Old media cursors cannot be reused.
         settings["multimodal_encoding"] = "atomic-markers-bounded-packing-v2"
@@ -47,7 +48,8 @@ def corpus_data_identity(config: LLMTunerConfig, *, dataset: str, repeat: bool) 
         # Chunk boundaries now respect row capacity as well as context length.
         # Grain's pending chunk offsets from the old graph are not portable.
         settings["text_packing"] = "bounded-first-fit-v1"
-    tokenizer_json = Path(config.dataloader.tokenizer_path) / "tokenizer.json"
+    tokenizer_path = Path(config.dataloader.tokenizer_path)
+    tokenizer_json = tokenizer_path / "tokenizer.json"
     if tokenizer_json.is_file():
         with tokenizer_json.open(encoding="utf-8") as handle:
             tokenizer_settings = json.load(handle)
@@ -59,7 +61,6 @@ def corpus_data_identity(config: LLMTunerConfig, *, dataset: str, repeat: bool) 
             # describe a different packed token stream even with identical files.
             settings["tokenizer_encoding"] = "unrestricted-samples-v1"
     digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode())
-    local_text = dataset in {"local_jsonl", "local_jsonl_sft"}
     if not local_text and config.dataloader.data_identity is None:
         raise ValueError("registered corpus identity requires dataloader.data_identity")
     files = (
@@ -67,7 +68,6 @@ def corpus_data_identity(config: LLMTunerConfig, *, dataset: str, repeat: bool) 
         if local_text
         else []
     )
-    tokenizer_path = Path(config.dataloader.tokenizer_path)
     for name in (
         "tokenizer.json",
         "vocab.txt",

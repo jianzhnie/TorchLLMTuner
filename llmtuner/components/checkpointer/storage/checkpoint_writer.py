@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import pickle
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,10 @@ else:
     _FSSPEC_IMPORT_ERROR = None
 
 
+def _protocol_set(protocol: str | tuple[str, ...] | list[str]) -> set[str]:
+    return {protocol} if isinstance(protocol, str) else set(protocol)
+
+
 class GenerationFileSystemWriter(FileSystemWriter):
     """Write fresh shards; publish local or fsspec metadata without pre-deletion."""
 
@@ -49,8 +54,7 @@ class GenerationFileSystemWriter(FileSystemWriter):
                 ) from _FSSPEC_IMPORT_ERROR
             self.fs = FsspecFileSystem()
             self.path = self.fs.init_path(path)
-            protocols = self.fs.fs.protocol
-            protocols = {protocols} if isinstance(protocols, str) else set(protocols)
+            protocols = _protocol_set(self.fs.fs.protocol)
             if not protocols & {"file", "local", "memory", "s3", "s3a", "gs", "gcs"}:
                 raise UnsupportedCombinationError(
                     "Native DCP generation publication requires local atomic "
@@ -59,31 +63,29 @@ class GenerationFileSystemWriter(FileSystemWriter):
                     "file://, memory://, s3:// or gs:// checkpoint folder."
                 )
 
+    def _with_generation_prefix(self, plan: SavePlan) -> SavePlan:
+        return replace(
+            plan,
+            storage_data=replace(
+                plan.storage_data,
+                prefix=f"{self.save_id}_{plan.storage_data.prefix}",
+            ),
+        )
+
     def prepare_local_plan(self, plan: SavePlan) -> SavePlan:
+        # DCP does not reset an explicitly supplied writer on every save.
+        # Reusing it must still leave previously published shards untouched.
+        self.reset()
         plan = super().prepare_local_plan(plan)
-        if not self.use_collectives:
-            plan = replace(
-                plan,
-                storage_data=replace(
-                    plan.storage_data,
-                    prefix=f"{self.save_id}_{plan.storage_data.prefix}",
-                ),
-            )
-        return plan
+        return plan if self.use_collectives else self._with_generation_prefix(plan)
 
     def prepare_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
         # The coordinator's generation is carried in each rank's SavePlan.
         # Independently generated per-rank save_ids need no extra collective.
-        return [
-            replace(
-                plan,
-                storage_data=replace(
-                    plan.storage_data,
-                    prefix=f"{self.save_id}_{plan.storage_data.prefix}",
-                ),
-            )
-            for plan in super().prepare_global_plan(plans)
-        ]
+        plans = super().prepare_global_plan(plans)
+        if not self.use_collectives:
+            return plans  # Local planning already added the generation.
+        return [self._with_generation_prefix(plan) for plan in plans]
 
     def finish(self, metadata: Metadata, results: list[list[WriteResult]]) -> None:
         # Match PyTorch 2.14's metadata format. Build metadata before touching
@@ -105,11 +107,7 @@ class GenerationFileSystemWriter(FileSystemWriter):
         if filesystem.is_remote(self.path):
             remote_fs = self.fs.fs
             assert remote_fs is not None
-            protocols = (
-                {remote_fs.protocol}
-                if isinstance(remote_fs.protocol, str)
-                else set(remote_fs.protocol)
-            )
+            protocols = _protocol_set(remote_fs.protocol)
             if protocols & {"file", "local"}:
                 # LocalFileSystem.pipe_file truncates the destination directly;
                 # file:// needs the same atomic replacement as a plain path.
@@ -124,9 +122,16 @@ class GenerationFileSystemWriter(FileSystemWriter):
         temporary_path = metadata_path.with_name(
             f"{metadata_path.name}.{self.save_id}.tmp"
         )
-        with temporary_path.open("wb") as stream:
-            pickle.dump(metadata, stream)
-            if self.sync_files:
-                stream.flush()
-                os.fsync(stream.fileno())
-        os.replace(temporary_path, metadata_path)
+        try:
+            with temporary_path.open("wb") as stream:
+                pickle.dump(metadata, stream)
+                if self.sync_files:
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            os.replace(temporary_path, metadata_path)
+        except BaseException:
+            # Remove only this writer's unpublished metadata. Cleanup must not
+            # hide the original failure; shard generations retain their owner.
+            with suppress(OSError):
+                temporary_path.unlink(missing_ok=True)
+            raise

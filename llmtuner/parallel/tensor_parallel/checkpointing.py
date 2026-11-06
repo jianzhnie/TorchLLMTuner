@@ -1,9 +1,15 @@
-"""Serialize physical TP slices as full tensors, including DP DTensor shards.
+"""Full-tensor and chunked checkpoint layouts for physical TP slices.
 
-Model, optimizer and EMA share the same path-based layout contract. Full tensor
-materialization costs memory on every TP rank; it prevents DCP treating distinct
-local TP slices as replicas. Registration lives on modules, surviving FSDP's
-Parameter replacement and canonical AC/compile wrapper names.
+Model, optimizer and EMA use module-registered layouts that survive FSDP
+Parameter replacement and canonical AC/compile wrapper names. Full-state
+conversion gathers TP/DP tensor data; chunked conversion records global
+coordinates and local ownership without gathering that data, including packed
+gate/up halves and empty shards. Callers select the representation explicitly.
+
+Restore validates local layouts before copying into caller-owned destinations.
+Joint TP/EP chunks require disjoint parameter ownership and coordinate failures
+across the participating groups. These shared transforms do not combine the
+model, optimizer or EMA loading lifecycles.
 """
 
 from __future__ import annotations
@@ -17,7 +23,10 @@ from torch import nn
 from torch.distributed.tensor import DTensor, Partial, distribute_tensor
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
-from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
+from ...components.checkpointer.core.chunked_tensor import (
+    ChunkedCheckpointTensor,
+    chunk_layout,
+)
 from ...utils.module_names import canonical_fqn
 from ..expert_parallel.checkpointing import (
     EP_GROUP_ATTR,
@@ -283,7 +292,7 @@ def shard_tensor_parallel_state(
     """Describe global TP coordinates without gathering TP or DP tensor data.
 
     EP expert entries must already follow the existing global expert-axis
-    contract. This representation is not yet the default manager save path.
+    contract. Callers select it with the TP-sharded checkpoint policy.
     """
     entries = _prepare_state(state, model_parts, loading=False)
     with _coordinate_chunk_errors(model_parts, "TP checkpoint chunk construction"):
@@ -360,8 +369,8 @@ def _validate_chunk_destinations(state, destinations):
         source = state.get(key)
         if not isinstance(source, ChunkedCheckpointTensor):
             raise ValueError(f"TP checkpoint {key!r} requires chunked source storage")
-        source_layout = [(offset, value.shape) for offset, value in source.chunks]
-        target_layout = [(offset, value.shape) for offset, value in destination.chunks]
+        source_layout = chunk_layout(source.chunks)
+        target_layout = chunk_layout(destination.chunks)
         if source.shape != destination.shape or source_layout != target_layout:
             raise ValueError(
                 f"TP checkpoint {key!r} chunk layout differs from destination"

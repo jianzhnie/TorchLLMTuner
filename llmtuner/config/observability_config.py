@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from llmtuner.config.utils import require_bool, require_integer_at_least
 from llmtuner.errors import ConfigError
@@ -74,6 +75,13 @@ class ProfilerConfig:
     enable_profiling: bool = False
     """Whether to collect Kineto traces."""
 
+    npu_profiler_level: Literal["level0", "level1", "level2"] | None = None
+    """Optional torch-npu collection level; None preserves its default.
+
+    Level1/2 collect additional device and communication details at higher
+    profiling cost. This setting has no effect on other device backends.
+    """
+
     save_traces_folder: str = "profiling/traces"
     """Trace location, relative to the base folder."""
 
@@ -120,6 +128,10 @@ class ProfilerConfig:
     """
 
     def __post_init__(self) -> None:
+        if self.npu_profiler_level not in (None, "level0", "level1", "level2"):
+            raise ConfigError(
+                "profiler.npu_profiler_level must be level0, level1, level2 or None"
+            )
         require_integer_at_least(
             self,
             "profile_freq",

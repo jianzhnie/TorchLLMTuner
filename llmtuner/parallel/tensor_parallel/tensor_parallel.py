@@ -94,6 +94,16 @@ def shard_weight(
     A plain slice with no collective: every rank starts from the same full weight
     (the model is built identically everywhere), so each just drops the rest.
     """
+    if isinstance(tp_size, bool) or not isinstance(tp_size, int) or tp_size < 1:
+        raise ValueError(f"tp_size must be a positive integer, got {tp_size!r}")
+    if (
+        isinstance(tp_rank, bool)
+        or not isinstance(tp_rank, int)
+        or not 0 <= tp_rank < tp_size
+    ):
+        raise ValueError(
+            f"tp_rank must be an integer in [0, {tp_size}), got {tp_rank!r}"
+        )
     if weight.shape[dim] % tp_size != 0:
         raise ValueError(
             f"weight dim {dim} (size {weight.shape[dim]}) is not divisible by "
@@ -102,17 +112,15 @@ def shard_weight(
     return torch.chunk(weight.detach(), tp_size, dim=dim)[tp_rank].contiguous()
 
 
-class ColumnParallelLinear(nn.Module):
-    """Column-parallel projection: output features split across TP ranks.
+class ShardedLinear(nn.Module):
+    """Initialize a weight shard; subclasses define activation communication.
 
-    Stores the weight as ``[out_features / tp, in_features]`` -- HF's own
-    ``[out, in]`` layout cut on dim 0, which is the ``w_shard_n = [N / R, K]``
-    layout ``AllGatherLinear`` contracts for (the op self-transposes).
-
-    forward all-gathers the sequence shard and leaves the activation feature-
-    sharded; backward is the dual (reduce-scatter of the input gradient, local
-    weight gradient).
+    Feature counts describe the original projection, not the local shard.
+    Projections without collectives retain no process-group or runtime flags.
     """
+
+    shard_dim: int
+    uses_collectives = True
 
     def __init__(
         self,
@@ -127,14 +135,30 @@ class ColumnParallelLinear(nn.Module):
         self.in_features = weight.shape[1]
         self.out_features = weight.shape[0]
         self.weight = nn.Parameter(
-            shard_weight(weight, 0, tp_size=tp_size, tp_rank=tp_rank),
+            shard_weight(weight, self.shard_dim, tp_size=tp_size, tp_rank=tp_rank),
             requires_grad=weight.requires_grad
             if isinstance(weight, nn.Parameter)
             else True,
         )
-        self.group = group
-        self.tp_size = tp_size
-        self.use_symm_mem = use_symm_mem
+        if self.uses_collectives:
+            self.group = group
+            self.tp_size = tp_size
+            self.use_symm_mem = use_symm_mem
+
+
+class ColumnParallelLinear(ShardedLinear):
+    """Column-parallel projection: output features split across TP ranks.
+
+    Stores the weight as ``[out_features / tp, in_features]`` -- HF's own
+    ``[out, in]`` layout cut on dim 0, which is the ``w_shard_n = [N / R, K]``
+    layout ``AllGatherLinear`` contracts for (the op self-transposes).
+
+    forward all-gathers the sequence shard and leaves the activation feature-
+    sharded; backward is the dual (reduce-scatter of the input gradient, local
+    weight gradient).
+    """
+
+    shard_dim = 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # The collective primitives are strictly 2D (sequence-major rows), but
@@ -161,7 +185,7 @@ class ColumnParallelLinear(nn.Module):
         return y_2d.reshape(*lead[:-1], lead[-1] * self.tp_size, y_2d.shape[-1])
 
 
-class RowParallelLinear(nn.Module):
+class RowParallelLinear(ShardedLinear):
     """Row-parallel projection: input features split across TP ranks.
 
     Stores the weight as ``[out_features, in_features / tp]`` -- HF's layout cut
@@ -172,27 +196,7 @@ class RowParallelLinear(nn.Module):
     output gradient, local weight gradient).
     """
 
-    def __init__(
-        self,
-        weight: torch.Tensor,
-        *,
-        tp_size: int,
-        tp_rank: int,
-        group,
-        use_symm_mem: bool = True,
-    ) -> None:
-        super().__init__()
-        self.in_features = weight.shape[1]
-        self.out_features = weight.shape[0]
-        self.weight = nn.Parameter(
-            shard_weight(weight, 1, tp_size=tp_size, tp_rank=tp_rank),
-            requires_grad=weight.requires_grad
-            if isinstance(weight, nn.Parameter)
-            else True,
-        )
-        self.group = group
-        self.tp_size = tp_size
-        self.use_symm_mem = use_symm_mem
+    shard_dim = 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Mirror of ColumnParallelLinear.forward: fold to 2D for the collective, then
@@ -218,7 +222,7 @@ class RowParallelLinear(nn.Module):
         return y_2d.reshape(*lead[:-1], lead[-1] // self.tp_size, y_2d.shape[-1])
 
 
-class ColwiseLinearNoGather(nn.Module):
+class ColwiseLinearNoGather(ShardedLinear):
     """Column-parallel projection without the fused sequence all-gather.
 
     Same weight shard as :class:`ColumnParallelLinear` (``[out / tp, in]``) but a plain
@@ -233,25 +237,8 @@ class ColwiseLinearNoGather(nn.Module):
     complete weight gradient for this rank's feature shard.
     """
 
-    def __init__(
-        self,
-        weight: torch.Tensor,
-        *,
-        tp_size: int,
-        tp_rank: int,
-        group,
-        use_symm_mem: bool = True,
-    ) -> None:
-        super().__init__()
-        del group, use_symm_mem  # no collective of its own; kept for the engine
-        self.in_features = weight.shape[1]
-        self.out_features = weight.shape[0]
-        self.weight = nn.Parameter(
-            shard_weight(weight, 0, tp_size=tp_size, tp_rank=tp_rank),
-            requires_grad=weight.requires_grad
-            if isinstance(weight, nn.Parameter)
-            else True,
-        )
+    shard_dim = 0
+    uses_collectives = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.linear(x, self.weight)
@@ -400,12 +387,14 @@ def shard_shared_expert_for_tp(
     # Capture all originals first: gate/up may share a Parameter or the whole
     # Linear module. Never slice an already replaced projection a second time.
     shards: dict[int, nn.Parameter] = {}
-    for name, dim, proj, weight in projections:
+    for _, dim, _, weight in projections:
         if id(weight) not in shards:
             shards[id(weight)] = nn.Parameter(
                 shard_weight(weight, dim, tp_size=tp_size, tp_rank=tp_rank),
                 requires_grad=weight.requires_grad,
             )
+    # Allocation failure must preserve both weights and feature metadata.
+    for name, dim, proj, weight in projections:
         proj.weight = shards[id(weight)]
         if dim == 0:
             proj.out_features = proj.weight.shape[0]
@@ -470,19 +459,20 @@ def shard_experts_for_tp(
     down = experts.down_proj
     hidden = expert_tp_hidden_size(block, tp_size=tp_size)
 
-    def _shard(w: torch.Tensor, dim_: int) -> torch.Tensor:
-        return torch.chunk(w.detach(), tp_size, dim=dim_)[tp_rank].contiguous()
-
-    gate_shard = _shard(gate_up[:, :hidden], 1)
-    up_shard = _shard(gate_up[:, hidden:], 1)
+    gate_shard = shard_weight(gate_up[:, :hidden], 1, tp_size=tp_size, tp_rank=tp_rank)
+    up_shard = shard_weight(gate_up[:, hidden:], 1, tp_size=tp_size, tp_rank=tp_rank)
     with torch.no_grad():
-        experts.gate_up_proj = nn.Parameter(
+        sharded_gate_up = nn.Parameter(
             torch.cat([gate_shard, up_shard], dim=1).contiguous(),
             requires_grad=gate_up.requires_grad,
         )
-        experts.down_proj = nn.Parameter(
-            _shard(down, 2), requires_grad=down.requires_grad
+        sharded_down = nn.Parameter(
+            shard_weight(down, 2, tp_size=tp_size, tp_rank=tp_rank),
+            requires_grad=down.requires_grad,
         )
+    # Finish allocation before replacing either original parameter.
+    experts.gate_up_proj = sharded_gate_up
+    experts.down_proj = sharded_down
     return frozenset({"experts.gate_up_proj", "experts.down_proj"})
 
 

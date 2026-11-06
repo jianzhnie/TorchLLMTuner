@@ -48,7 +48,7 @@ def collect_local_optimizer_state(
 
 
 def init_optim_state(optim: torch.optim.Optimizer) -> None:
-    """Materialize per-parameter optimizer state without changing anything.
+    """Materialize lazy state while preserving parameters and training state.
 
     Two callers need this, for the same underlying reason: PyTorch creates Adam's
     ``exp_avg``/``exp_avg_sq`` lazily, on the first ``step()``.
@@ -64,6 +64,11 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     The step runs with zero gradients and ``lr=0`` so parameters are untouched;
     the materialized state is then reset, so the first real update is still Adam
     step 1. Existing gradients and optimizer state are preserved.
+
+    Native optimizer step hooks run during materialization, before checkpoint
+    loading restores the trainer's step counter. Hooks must not assume every
+    call is a completed training update or enter distributed collectives: this
+    helper runs inside checkpoint's local error-coordination boundary.
 
     DistMuon explicitly initializes local momentum instead: a synthetic step
     would execute layout collectives inside checkpoint's local error boundary.
@@ -132,9 +137,8 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
         if isinstance(optim, torch.optim.Adam | torch.optim.AdamW):
             for param in params_to_initialize:
                 state = optim.state[param]
-                state["step"].zero_()
-                state["exp_avg"].zero_()
-                state["exp_avg_sq"].zero_()
+                for name in ("step", "exp_avg", "exp_avg_sq"):
+                    state[name].zero_()
                 if "max_exp_avg_sq" in state:
                     state["max_exp_avg_sq"].zero_()
 

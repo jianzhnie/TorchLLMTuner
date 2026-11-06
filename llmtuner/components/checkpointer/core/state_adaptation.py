@@ -1,5 +1,6 @@
 """Shared state-dict adaptation at checkpoint format boundaries."""
 
+from contextlib import nullcontext
 from typing import Any
 
 from ....accelerator.collectives import synchronize_local_errors
@@ -16,11 +17,12 @@ def adapt_hf_model_state(
     reader may already have written into live tensors; this is not a rollback
     boundary.
     """
-    if getattr(adapter, "kimi_expert_parallel", False):
+    with (
+        nullcontext()
+        if getattr(adapter, "kimi_expert_parallel", False)
+        else synchronize_local_errors("HF checkpoint state adaptation")
+    ):
         native_state = adapter.from_hf(hf_state)
-    else:
-        with synchronize_local_errors("HF checkpoint state adaptation"):
-            native_state = adapter.from_hf(hf_state)
 
     with synchronize_local_errors("HF checkpoint model validation"):
         validate = getattr(model_state, "validate_state_dict", None)

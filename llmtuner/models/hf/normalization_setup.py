@@ -70,7 +70,8 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
         "npu": forward_npu_rms_norm,
         "joint": forward_joint_residual_norm,
     }
-    if backend in ("aten", "torch", "npu"):
+    replace_norm_forward = backend in ("aten", "torch", "npu")
+    if replace_norm_forward:
         for module in model.modules():
             if (
                 type(module) is norm_type
@@ -86,6 +87,7 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
         validate_joint_residual_norm(
             model, allowed_norm_forwards=tuple(owned_forwards.values())
         )
+    norm_forward = owned_forwards.get(backend)
     for module in model.modules():
         if type(module) is not norm_type:
             continue
@@ -94,19 +96,15 @@ def stabilize_residual_norm_gradients(model: nn.Module) -> None:
                 del module._forward_pre_hooks[key]
                 module._forward_pre_hooks_with_kwargs.pop(key, None)
         installed = getattr(module.forward, "__func__", None)
-        if installed in owned_forwards.values() and installed is not (
-            owned_forwards.get(backend)
-        ):
+        if replace_norm_forward:
+            module.forward = MethodType(norm_forward, module)
+        elif installed in owned_forwards.values() and installed is not norm_forward:
             del module.forward
     if backend != "joint":
         for layer in model.model.layers:
             if getattr(layer.forward, "__func__", None) is forward_joint_residual_block:
                 del layer.forward
-    if backend in ("aten", "torch", "npu"):
-        norm_forward = owned_forwards[backend]
-        for module in model.modules():
-            if type(module) is norm_type:
-                module.forward = MethodType(norm_forward, module)
+    if replace_norm_forward:
         return
     for layer in model.model.layers:
         for name in ("input_layernorm", "post_attention_layernorm"):

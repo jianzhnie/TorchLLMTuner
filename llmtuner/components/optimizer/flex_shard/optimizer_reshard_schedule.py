@@ -493,6 +493,46 @@ def _validate_regions_cover_partition(
         )
 
 
+def _build_storage_partitions(
+    storage_regions: Sequence[_StorageRegionMapping],
+    participants: tuple[int, ...],
+) -> tuple[
+    tuple[_ParticipantPartition, ...],
+    tuple[tuple[tuple[int, ...], _TensorRegion], ...],
+]:
+    participant_set = set(participants)
+    storage_endpoints = []
+    storage_by_participant = {}
+    for raw_holders, logical_region in storage_regions:
+        holders = tuple(raw_holders)
+        _require_valid_plan(
+            bool(holders)
+            and len(set(holders)) == len(holders)
+            and all(holder in participant_set for holder in holders),
+            "storage region holders must be unique redistribution participants",
+        )
+        storage_endpoints.append((holders, logical_region))
+        for holder in holders:
+            _require_valid_plan(
+                holder not in storage_by_participant,
+                "multiple storage regions per participant are not supported",
+            )
+            storage_by_participant[holder] = logical_region
+    _require_valid_plan(
+        set(storage_by_participant) == participant_set,
+        "storage regions must cover every redistribution participant",
+    )
+    storage_partitions = tuple(
+        _ParticipantPartition(
+            participant=participant,
+            tensor_shape=storage_by_participant[participant].shape,
+            logical_regions=(storage_by_participant[participant],),
+        )
+        for participant in participants
+    )
+    return storage_partitions, tuple(storage_endpoints)
+
+
 def _build_whole_tensor_redistribution_plan(
     storage_regions: Sequence[_StorageRegionMapping],
     *,
@@ -511,41 +551,9 @@ def _build_whole_tensor_redistribution_plan(
         "compute participants must be unique redistribution participants",
     )
 
-    storage_mappings = []
-    storage_mapping_by_participant = {}
-    for raw_holders, logical_region in storage_regions:
-        holders = tuple(raw_holders)
-        _require_valid_plan(
-            bool(holders)
-            and len(set(holders)) == len(holders)
-            and all(holder in participant_set for holder in holders),
-            "storage region holders must be unique redistribution participants",
-        )
-        tensor_region = _TensorRegion(
-            offsets=(0,) * len(logical_region.shape),
-            shape=logical_region.shape,
-        )
-        storage_mappings.append((holders, logical_region, tensor_region))
-        for holder in holders:
-            _require_valid_plan(
-                holder not in storage_mapping_by_participant,
-                "multiple storage regions per participant are not supported",
-            )
-            storage_mapping_by_participant[holder] = (logical_region, tensor_region)
-    _require_valid_plan(
-        set(storage_mapping_by_participant) == participant_set,
-        "storage regions must cover every redistribution participant",
+    storage_partitions, storage_endpoints = _build_storage_partitions(
+        storage_regions, participants
     )
-
-    storage_partitions = tuple(
-        _ParticipantPartition(
-            participant=participant,
-            tensor_shape=storage_mapping_by_participant[participant][1].shape,
-            logical_regions=(storage_mapping_by_participant[participant][0],),
-        )
-        for participant in participants
-    )
-
     full_region = _TensorRegion(
         offsets=(0,) * len(logical_shape),
         shape=logical_shape,
@@ -566,10 +574,16 @@ def _build_whole_tensor_redistribution_plan(
     storage_to_compute_routes = tuple(
         _TensorRegionRoute(
             logical_region=logical_region,
-            source=_RouteEndpoint(tensor_region, holders),
+            source=_RouteEndpoint(
+                _TensorRegion(
+                    offsets=(0,) * len(logical_region.shape),
+                    shape=logical_region.shape,
+                ),
+                holders,
+            ),
             destination=_RouteEndpoint(logical_region, compute_participants),
         )
-        for holders, logical_region, tensor_region in storage_mappings
+        for holders, logical_region in storage_endpoints
     )
     return _RedistributionPlan(
         participants=participants,
@@ -594,33 +608,8 @@ def _build_dim0_shard_redistribution_plan(
         and set(shard_participants) == participant_set,
         "shard participants must order the redistribution participants",
     )
-    storage_endpoints = []
-    storage_by_participant = {}
-    for holders, logical_region in storage_regions:
-        _require_valid_plan(
-            bool(holders)
-            and len(set(holders)) == len(holders)
-            and set(holders) <= participant_set,
-            "storage region holders must be unique redistribution participants",
-        )
-        storage_endpoints.append((holders, logical_region))
-        for holder in holders:
-            _require_valid_plan(
-                holder not in storage_by_participant,
-                "multiple storage regions per participant are not supported",
-            )
-            storage_by_participant[holder] = logical_region
-    _require_valid_plan(
-        set(storage_by_participant) == participant_set,
-        "storage regions must cover every redistribution participant",
-    )
-    storage_partitions = tuple(
-        _ParticipantPartition(
-            participant=participant,
-            tensor_shape=storage_by_participant[participant].shape,
-            logical_regions=(storage_by_participant[participant],),
-        )
-        for participant in participants
+    storage_partitions, storage_endpoints = _build_storage_partitions(
+        storage_regions, participants
     )
 
     compute_partitions = []
@@ -804,14 +793,11 @@ def _resolve_routes_to_transfers(
 def _packed_spans_by_parameter(
     indexed_spans: list[tuple[int, _PackedSpan]], num_parameters: int
 ) -> tuple[tuple[_PackedSpan, ...], ...]:
-    return tuple(
-        tuple(
-            span
-            for span_parameter_index, span in indexed_spans
-            if span_parameter_index == parameter_index
-        )
-        for parameter_index in range(num_parameters)
-    )
+    """Group spans in one pass, preserving their packed-buffer order."""
+    grouped: list[list[_PackedSpan]] = [[] for _ in range(num_parameters)]
+    for parameter_index, span in indexed_spans:
+        grouped[parameter_index].append(span)
+    return tuple(tuple(spans) for spans in grouped)
 
 
 def _build_packed_all_to_all_schedule(

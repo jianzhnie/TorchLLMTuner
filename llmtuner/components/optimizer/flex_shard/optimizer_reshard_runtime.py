@@ -510,27 +510,23 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
                     )
                 else:
                     slot = context.slots[redistributed_index % len(context.slots)]
-                    if previous_work is not None and slot is previous_work.slot:
+                    reuses_previous_slot = (
+                        previous_work is not None and slot is previous_work.slot
+                    )
+                    if reuses_previous_slot:
                         self._enqueue_compute_to_storage(
                             previous_work, context, finalize=finalize
                         )
-                        work = self._enqueue_storage_to_compute(
-                            plan,
-                            slot,
-                            context,
-                            prepare=prepare,
+                    work = self._enqueue_storage_to_compute(
+                        plan,
+                        slot,
+                        context,
+                        prepare=prepare,
+                    )
+                    if previous_work is not None and not reuses_previous_slot:
+                        self._enqueue_compute_to_storage(
+                            previous_work, context, finalize=finalize
                         )
-                    else:
-                        work = self._enqueue_storage_to_compute(
-                            plan,
-                            slot,
-                            context,
-                            prepare=prepare,
-                        )
-                        if previous_work is not None:
-                            self._enqueue_compute_to_storage(
-                                previous_work, context, finalize=finalize
-                            )
                     next_plan_to_prefetch = plan_index + 1
 
                 self._compute_bucket(

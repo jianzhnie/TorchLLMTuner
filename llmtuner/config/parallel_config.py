@@ -42,7 +42,7 @@ FSDPSymmMemScope = Literal["all", "dense"]
 class FSDPConfig:
     """Execution policy for FSDP; parallel degrees live in ParallelConfig."""
 
-    fsdp_reshard_after_forward: Literal["default", "always", "never"] = "default"
+    fsdp_reshard_after_forward: FSDPReshardPolicy = "default"
     """FSDP2 parameter resharding policy after forward."""
 
     fsdp_reduce_dtype: Literal["float32", "bfloat16", "float64"] = "float32"
@@ -88,7 +88,7 @@ class FSDPConfig:
     enable_fsdp_symm_mem: bool = False
     """Enable FSDP2 symmetric-memory communication when supported."""
 
-    fsdp_symm_mem_scope: Literal["all", "dense"] = "all"
+    fsdp_symm_mem_scope: FSDPSymmMemScope = "all"
     """Apply symmetric-memory communication to all or dense FSDP modules."""
 
     def __post_init__(self) -> None:

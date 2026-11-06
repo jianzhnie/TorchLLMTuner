@@ -15,6 +15,7 @@ import os
 import pickle
 import sys
 import time
+from contextlib import suppress
 from tempfile import NamedTemporaryFile
 from threading import RLock
 from typing import TYPE_CHECKING, ClassVar
@@ -155,9 +156,12 @@ class MemoryProfiler:
                     read_memory_snapshot(), output, protocol=_SNAPSHOT_PICKLE_PROTOCOL
                 )
             os.replace(temporary_path, output_file)
-        finally:
-            if temporary_path is not None and os.path.exists(temporary_path):
-                os.unlink(temporary_path)
+        except BaseException:
+            # A cleanup failure must not hide the snapshot's original error.
+            if temporary_path is not None:
+                with suppress(OSError):
+                    os.unlink(temporary_path)
+            raise
         logger.info(
             "Finished dumping memory snapshot in %.2f seconds", time.monotonic() - begin
         )
@@ -330,12 +334,21 @@ class Profiler:
         wait = cfg.profile_freq - (cfg.profiler_active + cfg.profiler_warmup)
         on_trace_ready = trace_handler
         profiler_api = torch.profiler
+        profile_options = {}
         if device_type == "npu":
             if npu_profiler is None:
                 raise ImportError(
                     "NPU profiling requires a working torch-npu installation"
                 ) from NPU_PROFILER_IMPORT_ERROR
             profiler_api = npu_profiler
+            if cfg.npu_profiler_level is not None:
+                level = getattr(
+                    profiler_api.ProfilerLevel,
+                    cfg.npu_profiler_level.capitalize(),
+                )
+                profile_options["experimental_config"] = (
+                    profiler_api._ExperimentalConfig(profiler_level=level)
+                )
 
             raw_trace_handler = profiler_api.tensorboard_trace_handler(
                 os.path.join(trace_dir, "raw"), analyse_flag=False
@@ -368,6 +381,7 @@ class Profiler:
             schedule=lambda step: schedule(start_step + step),
             on_trace_ready=on_trace_ready,
             record_shapes=True,
+            **profile_options,
         )
         try:
             torch_profiler.__enter__()

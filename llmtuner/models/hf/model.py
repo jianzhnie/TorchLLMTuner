@@ -493,19 +493,11 @@ class HFTransformerModel(nn.Module):
     def _apply_attention(
         self, positions: torch.Tensor, attention_masks
     ) -> dict[str, Any]:
-        """Cross the ROLE-IN / CONVENTION-OUT seam: decide what to hand the decoder.
+        """Select the decoder's mask representation for the active backend.
 
-        Roles are fixed: this wrapper ALWAYS routes through an attention
-        implementation, and that implementation is ALWAYS fed a mask describing
-        how tokens may attend -- flex consumes it as a ``BlockMask``. How a
-        *backend* wants its mask is a different question (sdpa wants a boolean
-        tensor, and derives causality from the mask's presence), so it is settled
-        here and nowhere else.
-
-        Consequently the mask is built unconditionally, even on the backend that
-        ends up discarding it: not building it would make the two paths differ in
-        more than the backend, and would hide the packing gap this fallback
-        leaves open.
+        Build only the representation consumed by the backend: Flex uses a
+        BlockMask, while tensor backends use a dense document mask for packed
+        input or let the decoder construct its own causal mask.
         """
         if self.cp_mesh is not None and self._cp_strategy == "compressor_ulysses":
             if attention_masks is not None:
@@ -533,11 +525,9 @@ class HFTransformerModel(nn.Module):
             ) and getattr(
                 self.model.config, "attn_mask_type", "causal"
             ) == "block_causal":
-                if not isinstance(attention_masks, torch.Tensor):
-                    raise ValueError(
-                        "Packed KV SDPA CP requires the full preprocessed document mask"
-                    )
-                return {"attention_mask": attention_masks}
+                raise ValueError(
+                    "Packed KV SDPA CP requires the full preprocessed document mask"
+                )
             # The CP sdpa kernel (context_parallel/sdpa_attention.py) builds the
             # mask it needs from the CP offsets: this rank's queries against the
             # gathered full sequence. Handing the decoder a BlockMask here would
@@ -555,19 +545,20 @@ class HFTransformerModel(nn.Module):
                 and getattr(self.model.config, "attn_mask_type", "causal")
                 == "block_causal"
             ):
-                if not isinstance(attention_masks, torch.Tensor):
-                    raise ValueError(
-                        "Packed Ulysses SDPA CP requires the full preprocessed "
-                        "document mask"
-                    )
-                return {"attention_mask": attention_masks}
+                raise ValueError(
+                    "Packed Ulysses SDPA CP requires the full preprocessed "
+                    "document mask"
+                )
             return {"attention_mask": None}
 
         if self.cp_mesh is None and isinstance(attention_masks, torch.Tensor):
             if self.model.config._attn_implementation != ATTENTION_BACKEND:
                 return {"attention_mask": attention_masks}
 
-        if attention_masks is None:
+        if attention_masks is None and (
+            self.cp_mesh is not None
+            or self.model.config._attn_implementation == ATTENTION_BACKEND
+        ):
             if self.cp_mesh is None:
                 attention_masks = self.get_attention_masks(positions=positions)
             else:

@@ -252,10 +252,10 @@ class AdamWSwap(torch.optim.AdamW):
         self.initialize_state(active)
         jobs = iter(self._slice_jobs(active))
         staged = None
+        update_error = None
         try:
             job = next(jobs, None)
-            if job is not None:
-                staged = self._stage(job)
+            staged = self._stage(job) if job is not None else None
             while job is not None:
                 following = next(jobs, None)
                 # Allocation occurs before computing the current slice. Both
@@ -269,6 +269,8 @@ class AdamWSwap(torch.optim.AdamW):
                     self.staging_peak_payload_bytes = max(
                         self.staging_peak_payload_bytes, staged[2] + next_staged[2]
                     )
+                # Drop the completed slot before allocating its replacement.
+                # Assignment evaluates _stage() before releasing its old value.
                 staged = None
                 job = following
                 staged = (
@@ -276,7 +278,8 @@ class AdamWSwap(torch.optim.AdamW):
                     if next_staged is not None
                     else (self._stage(job) if job is not None else None)
                 )
-        except BaseException:
+        except BaseException as error:
+            update_error = error
             self._failed = True
             raise
         finally:
@@ -284,7 +287,15 @@ class AdamWSwap(torch.optim.AdamW):
             # or destination while a side stream still uses it.
             if self._copy_stream is not None:
                 started = time.perf_counter()
-                self._copy_stream.synchronize()
+                try:
+                    self._copy_stream.synchronize()
+                except BaseException as error:
+                    self._failed = True
+                    if update_error is not None:
+                        # Keep the update failure primary while retaining the
+                        # cleanup failure in the exception chain.
+                        raise update_error from error
+                    raise
                 self.copy_wait_seconds += time.perf_counter() - started
         return loss
 
@@ -454,6 +465,8 @@ class AdamWSwap(torch.optim.AdamW):
             for saved, current in zip(groups, self.param_groups, strict=True)
             for key, parameter in zip(saved["params"], current["params"], strict=True)
         }
+        if len(mapping) != sum(len(group["params"]) for group in groups):
+            raise ValueError("AdamWSwap checkpoint has duplicate parameter IDs")
         saved_groups = {
             mapping[key]: group for group in groups for key in group["params"]
         }
@@ -470,6 +483,8 @@ class AdamWSwap(torch.optim.AdamW):
                 if (
                     not isinstance(moment, torch.Tensor)
                     or not moment.is_floating_point()
+                    or moment.layout != torch.strided
+                    or _local(moment).is_meta
                     or moment.shape != parameter.shape
                     or _local(moment).shape != _local(parameter).shape
                     or isinstance(moment, DTensor) != isinstance(parameter, DTensor)
@@ -483,6 +498,12 @@ class AdamWSwap(torch.optim.AdamW):
                 ):
                     raise ValueError("AdamWSwap checkpoint moment ownership mismatch")
             step = incoming["step"]
+            if isinstance(step, DTensor):
+                if any(not placement.is_replicate() for placement in step.placements):
+                    raise ValueError(
+                        "AdamWSwap checkpoint step DTensor must be fully replicated"
+                    )
+                step = step.to_local()
             if isinstance(step, torch.Tensor):
                 if step.numel() != 1 or step.is_complex():
                     raise ValueError("AdamWSwap checkpoint step must be a scalar")
@@ -492,9 +513,10 @@ class AdamWSwap(torch.optim.AdamW):
                 or not isinstance(step, Real)
                 or not math.isfinite(step)
                 or step < 0
+                or step % 1 != 0
             ):
                 raise ValueError(
-                    "AdamWSwap checkpoint step must be nonnegative and finite"
+                    "AdamWSwap checkpoint step must be a finite nonnegative integer"
                 )
             plans.append((parameter, incoming, step))
         additional = sum(
