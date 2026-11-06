@@ -30,7 +30,7 @@ from torch.distributed.tensor import DTensor
 from examples.train_qwen3_30b_npu import qwen3_30b_npu_config
 from llmtuner.accelerator.collectives import synchronize_local_errors
 from llmtuner.accelerator.device import device_module, device_type
-from llmtuner.components.compute_metrics import (
+from llmtuner.components.metrics import (
     compute_utilization,
     configured_tokens_per_step,
     token_throughput,

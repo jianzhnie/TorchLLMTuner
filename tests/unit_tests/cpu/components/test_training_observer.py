@@ -5,12 +5,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from llmtuner.components.training_observer import (
+from llmtuner.config.observability_config import MetricsConfig
+from llmtuner.trainer.runtime.training_observer import (
     DispatchTimer,
     TrainingObserver,
     percentile,
 )
-from llmtuner.config.observability_config import MetricsConfig
 
 
 def test_percentile_interpolates_nonuniform_samples():
@@ -42,7 +42,8 @@ def test_observer_excludes_warmup_and_between_step_work(monkeypatch):
     observer = TrainingObserver(metrics, torch.device("cpu"))
     clock = iter([0, 10, 100, 102, 200, 204, 400, 406])
     monkeypatch.setattr(
-        "llmtuner.components.training_observer.time.perf_counter", lambda: next(clock)
+        "llmtuner.trainer.runtime.training_observer.time.perf_counter",
+        lambda: next(clock),
     )
     results = []
     for _ in range(4):

@@ -2336,7 +2336,7 @@ def test_expert_parameter_ids_share_one_moe_ownership_classifier(monkeypatch):
     second.moe = FakeMoE(shared)
     monkeypatch.setattr(gradients, "MoE", FakeMoE)
 
-    assert gradients._expert_parameter_ids([first, second]) == {id(shared)}
+    assert gradients.expert_parameter_ids([first, second]) == {id(shared)}
 
 
 def test_pp_norm_without_gradients_uses_parameter_device(monkeypatch):

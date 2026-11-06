@@ -21,7 +21,7 @@ import torch
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
-from llmtuner.models.hf.flops import (
+from llmtuner.utils.flops import (
     flops_per_token,
     quadratic_attention_flops_per_token,
 )
@@ -271,7 +271,7 @@ def test_mla_projection_cost_matches_actual_hf_linear_weights(q_lora_rank):
         DeepseekV3Attention,
     )
 
-    from llmtuner.models.hf.flops import attention_param_term
+    from llmtuner.utils.flops import attention_param_term
 
     arch = _arch(
         "deepseek_v3",

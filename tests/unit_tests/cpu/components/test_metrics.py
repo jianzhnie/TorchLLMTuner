@@ -31,6 +31,7 @@ from llmtuner.config import (
     MetricsConfig as Config,
 )
 from llmtuner.parallel.topology import ParallelTopology
+from llmtuner.utils import metric_loggers as logger_module
 from llmtuner.utils.monitoring import (
     Color,
     NoColor,
@@ -887,7 +888,7 @@ def test_wandb_logger_uses_owned_run_after_global_run_changes(tmp_path, monkeypa
     owned = _FakeWandB()
     other = _FakeWandB()
     module = SimpleNamespace(init=lambda **kwargs: owned, run=other)
-    monkeypatch.setattr("llmtuner.components.metrics.wandb", module)
+    monkeypatch.setattr("llmtuner.utils.metric_loggers.wandb", module)
     logger = WandBLogger(str(tmp_path))
     logger.log({"loss": 2.0}, step=1)
     logger.close()
@@ -918,7 +919,7 @@ def test_wandb_logger_creates_run_without_reusing_or_finishing_previous(
         return created
 
     monkeypatch.setattr(
-        "llmtuner.components.metrics.wandb",
+        "llmtuner.utils.metric_loggers.wandb",
         SimpleNamespace(init=initialize, run=previous),
     )
     logger = WandBLogger(str(tmp_path))
@@ -996,8 +997,8 @@ def test_optional_sink_dependency_failure_preserves_cause(
     tmp_path, monkeypatch, dependency, error_name, logger_type, message
 ):
     cause = ModuleNotFoundError(f"missing {dependency}")
-    monkeypatch.setattr(metrics_module, dependency, None)
-    monkeypatch.setattr(metrics_module, error_name, cause, raising=False)
+    monkeypatch.setattr(logger_module, dependency, None)
+    monkeypatch.setattr(logger_module, error_name, cause, raising=False)
     with pytest.raises(ImportError, match=message) as failure:
         logger_type(str(tmp_path))
     assert failure.value.__cause__ is cause

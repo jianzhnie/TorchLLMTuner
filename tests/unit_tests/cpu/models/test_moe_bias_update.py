@@ -56,7 +56,7 @@ _TOP_K = 2
 
 
 def test_dispatch_observation_preserves_real_moe_forward_backward_and_update():
-    from llmtuner.components.training_observer import DispatchTimer
+    from llmtuner.trainer.runtime.training_observer import DispatchTimer
 
     torch.manual_seed(47)
     reference = _moe(coeff=None)

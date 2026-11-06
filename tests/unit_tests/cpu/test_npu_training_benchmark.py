@@ -12,7 +12,7 @@ from examples.npu_training_benchmark import (
     summarize_resident_memory,
     summarize_timings,
 )
-from llmtuner.components.compute_metrics import (
+from llmtuner.components.metrics import (
     compute_utilization,
     configured_tokens_per_step,
 )

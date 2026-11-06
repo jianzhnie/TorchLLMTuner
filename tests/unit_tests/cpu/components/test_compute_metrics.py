@@ -2,7 +2,7 @@
 
 import pytest
 
-from llmtuner.components.compute_metrics import compute_utilization, token_throughput
+from llmtuner.components.metrics import compute_utilization, token_throughput
 
 
 @pytest.mark.parametrize("dp,tp,cp,pp", [(8, 1, 1, 1), (2, 2, 1, 2), (1, 2, 2, 2)])

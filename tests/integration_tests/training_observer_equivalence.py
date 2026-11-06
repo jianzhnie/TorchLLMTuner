@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
-from llmtuner.components.training_observer import TrainingObserver
 from llmtuner.config.observability_config import MetricsConfig
+from llmtuner.trainer.runtime.training_observer import TrainingObserver
 
 
 def main():

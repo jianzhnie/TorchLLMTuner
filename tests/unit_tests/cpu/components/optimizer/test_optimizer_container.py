@@ -38,6 +38,32 @@ def test_fused_kernel_devices_fall_back_when_private_helper_is_missing(monkeypat
     assert optimizer_module.fused_kernel_device_types() == frozenset({"cuda", "xpu"})
 
 
+@pytest.mark.parametrize(
+    "optimizer_name, operator",
+    [
+        ("Adam", "aten::_fused_adam_"),
+        ("AdamW", "aten::_fused_adamw_"),
+        ("AdamWSwap", "aten::_fused_adamw_"),
+    ],
+)
+def test_missing_native_npu_kernel_disables_only_fused_groups(
+    monkeypatch, optimizer_name, operator
+):
+    monkeypatch.setattr(optimizer_module, "device_type", "npu")
+    checked = []
+    monkeypatch.setattr(
+        torch._C,
+        "_dispatch_has_kernel_for_dispatch_key",
+        lambda name, key: checked.append((name, key)) or False,
+    )
+    groups = [{"fused": True}, {"fused": False}, {"foreach": True}]
+
+    optimizer_module.disable_unsupported_fused_npu_updates(optimizer_name, groups)
+
+    assert checked == [(operator, "PrivateUse1")]
+    assert [group.get("fused") for group in groups] == [False, False, None]
+
+
 def _cfg(
     *groups: ParamGroupConfig, implementation: str = "for-loop"
 ) -> OptimizerConfig:
