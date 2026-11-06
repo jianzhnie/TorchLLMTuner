@@ -52,6 +52,14 @@ from transformers.activations import ACT2FN
 from ..common.activation import SituGLU
 
 
+def build_kimi_activation(config) -> nn.Module:
+    """Construct a fresh activation for a dense or individual-expert MLP."""
+    if config.hidden_act != "situ":
+        return ACT2FN[config.hidden_act]
+    beta = 1.0 if config.activation_situ_beta is None else config.activation_situ_beta
+    return SituGLU(beta, config.activation_situ_linear_beta)
+
+
 class KimiMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -65,18 +73,7 @@ class KimiMLP(nn.Module):
             config.intermediate_size, config.hidden_size, bias=False
         )
         self.situ = config.hidden_act == "situ"
-        self.act_fn = (
-            SituGLU(
-                (
-                    1.0
-                    if config.activation_situ_beta is None
-                    else config.activation_situ_beta
-                ),
-                config.activation_situ_linear_beta,
-            )
-            if self.situ
-            else ACT2FN[config.hidden_act]
-        )
+        self.act_fn = build_kimi_activation(config)
 
     def forward(self, x):
         gate, up = self.gate_proj(x), self.up_proj(x)
@@ -92,18 +89,7 @@ class KimiExpertMLP(nn.Module):
         self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.situ = config.hidden_act == "situ"
-        self.act_fn = (
-            SituGLU(
-                (
-                    1.0
-                    if config.activation_situ_beta is None
-                    else config.activation_situ_beta
-                ),
-                config.activation_situ_linear_beta,
-            )
-            if self.situ
-            else ACT2FN[config.hidden_act]
-        )
+        self.act_fn = build_kimi_activation(config)
 
     def forward(self, x):
         gate, up = self.w1(x), self.w3(x)

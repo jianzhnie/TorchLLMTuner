@@ -91,17 +91,17 @@ class GroupedExpertHuggingFaceStorageReader(IndexedHuggingFaceStorageReader):
         for target, sources in groups.items():
             if target in metadata.state_dict_metadata:
                 raise ValueError(f"Mixed fused and individual HF experts: {target}")
-            projections = (
-                (
-                    {"w1_EFD": "gate_proj", "w3_EFD": "up_proj", "w2_EDF": "down_proj"}[
-                        target.rsplit(".", 1)[1]
-                    ],
-                )
-                if self.native_ep_layout
-                else ("down_proj",)
-                if target.endswith(".down_proj")
-                else ("gate_proj", "up_proj")
-            )
+            if self.native_ep_layout:
+                projection = {
+                    "w1_EFD": "gate_proj",
+                    "w3_EFD": "up_proj",
+                    "w2_EDF": "down_proj",
+                }[target.rsplit(".", 1)[1]]
+                projections = (projection,)
+            elif target.endswith(".down_proj"):
+                projections = ("down_proj",)
+            else:
+                projections = ("gate_proj", "up_proj")
             expected = {
                 (expert, projection)
                 for expert in range(self.num_experts)

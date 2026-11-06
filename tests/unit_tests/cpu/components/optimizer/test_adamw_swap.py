@@ -329,6 +329,30 @@ def test_native_checkpoint_and_group_options_restore_before_next_update():
     )
 
 
+def test_invalid_post_load_options_block_save_until_successful_restore():
+    value = torch.nn.Parameter(torch.ones(5))
+    optimizer = AdamWSwap([value], foreach=False)
+    value.grad = torch.full_like(value, 0.25)
+    optimizer.step()
+    saved = deepcopy(optimizer.state_dict())
+
+    def invalidate_options(loaded):
+        loaded.param_groups[0]["eps"] = 0
+
+    hook = optimizer.register_load_state_dict_post_hook(invalidate_options)
+    with pytest.raises(ValueError, match="eps"):
+        optimizer.load_state_dict(saved)
+    with pytest.raises(RuntimeError, match="restore"):
+        optimizer.state_dict()
+    with pytest.raises(RuntimeError, match="restore"):
+        optimizer.step()
+    hook.remove()
+    optimizer.load_state_dict(saved)
+    assert optimizer.state_dict()["param_groups"][0]["eps"] > 0
+    optimizer.step()
+    assert optimizer.state[value]["step"].item() == 2
+
+
 def test_load_copy_failure_retains_owned_host_storage_and_can_retry(monkeypatch):
     value = torch.nn.Parameter(torch.ones(5))
     optimizer = AdamWSwap([value], foreach=False)

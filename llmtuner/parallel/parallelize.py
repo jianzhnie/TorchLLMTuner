@@ -159,20 +159,21 @@ def parallelize_hf_transformers(
         }
         activation_swap_enabled = activation_swap and activation_checkpoint != "full"
         for name in STAGE_ORDER:
-            if (name != "compile" or compile) and (
-                name != "activation_swap" or activation_swap_enabled
-            ):
-                if name == "ep" and references is not None:
-                    # TP may already have replaced Parameters before EP's
-                    # explicit split/rename mapping is emitted.
-                    references = FSDPPatternReferences(part, references.bind(part))
-                    part = runners[name](
-                        part, on_replacement=references.record_replacements
-                    )
-                elif name == "fsdp" and references is not None:
-                    part = runners[name](part, cfg=references.bind(part))
-                else:
-                    part = runners[name](part)
+            if name == "compile" and not compile:
+                continue
+            if name == "activation_swap" and not activation_swap_enabled:
+                continue
+            if name == "ep" and references is not None:
+                # TP may already have replaced Parameters before EP's
+                # explicit split/rename mapping is emitted.
+                references = FSDPPatternReferences(part, references.bind(part))
+                part = runners[name](
+                    part, on_replacement=references.record_replacements
+                )
+            elif name == "fsdp" and references is not None:
+                part = runners[name](part, cfg=references.bind(part))
+            else:
+                part = runners[name](part)
         return part
 
     # EP groups come from the sparse mesh in both assembly paths. Under PP

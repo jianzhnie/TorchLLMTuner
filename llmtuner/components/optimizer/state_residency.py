@@ -206,11 +206,12 @@ def install_state_residency(
         # Live groups can change after installation (including add_param_group).
         validate_virtual_optimizer_groups(optim.param_groups)
         _initialize_moments(optim, allocator)
-        closure = (
-            kwargs.get("closure")
-            if "closure" in kwargs
-            else (args[1] if len(args) > 1 else None)
-        )
+        if "closure" in kwargs:
+            closure = kwargs.get("closure")
+        elif len(args) > 1:
+            closure = args[1]
+        else:
+            closure = None
         if closure is None:
             return None
 

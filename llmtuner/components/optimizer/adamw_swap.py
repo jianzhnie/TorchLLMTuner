@@ -527,27 +527,24 @@ class AdamWSwap(torch.optim.AdamW):
         )
         self._check_host_capacity(additional)
         restored = defaultdict(dict)
-        for parameter, _incoming, step in plans:
-            old = self.state.get(parameter, {})
-            restored[parameter] = {
-                "step": torch.tensor(
-                    step,
-                    dtype=(
-                        torch.float64
-                        if isinstance(_incoming["step"], torch.Tensor)
-                        and _incoming["step"].dtype == torch.float64
-                        else torch.float32
-                    ),
-                ),
-                **{
-                    name: old[name]
-                    if name in old
-                    else _host_moment(
+        for parameter, incoming, step in plans:
+            existing_state = self.state.get(parameter, {})
+            saved_step = incoming["step"]
+            step_dtype = (
+                torch.float64
+                if isinstance(saved_step, torch.Tensor)
+                and saved_step.dtype == torch.float64
+                else torch.float32
+            )
+            restored_state = {"step": torch.tensor(step, dtype=step_dtype)}
+            for name in self._moment_names(saved_groups[parameter]):
+                if name in existing_state:
+                    restored_state[name] = existing_state[name]
+                else:
+                    restored_state[name] = _host_moment(
                         parameter, pin_memory=self._device(parameter).type != "cpu"
                     )
-                    for name in self._moment_names(saved_groups[parameter])
-                },
-            }
+            restored[parameter] = restored_state
         self._failed = True
         for parameter, incoming, _ in plans:
             for name in self._moment_names(saved_groups[parameter]):
@@ -562,6 +559,10 @@ class AdamWSwap(torch.optim.AdamW):
         try:
             for hook in self._optimizer_load_state_dict_post_hooks.values():
                 hook(self)
+            self.validate_param_groups(self.param_groups)
+            for group in self.param_groups:
+                for parameter in group["params"]:
+                    self._validate_parameter(parameter)
         except BaseException:
             self._failed = True
             raise

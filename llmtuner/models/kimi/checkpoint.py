@@ -174,13 +174,15 @@ def convert_kimi_optimizer_state(
                         f"Kimi optimizer tensor {key!r} requires full (E,O,I) state"
                     )
                 for index in range(num_experts):
+                    if tensor_state:
+                        expert_value = value[index]
+                    elif isinstance(value, torch.Tensor):
+                        expert_value = value.clone()
+                    else:
+                        expert_value = value
                     put(
                         f"{category}.{prefix}experts.{index}.{_PROJECTIONS[role]}.weight.{field}",
-                        value[index]
-                        if tensor_state
-                        else value.clone()
-                        if isinstance(value, torch.Tensor)
-                        else value,
+                        expert_value,
                     )
                 continue
             suffix = suffix.replace("router.gate.weight.", "gate.weight.", 1)
