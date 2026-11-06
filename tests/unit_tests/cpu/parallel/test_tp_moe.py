@@ -1,16 +1,14 @@
 """Tests for MoE-under-TP: plan specs, weight sharding, and the fail-fast matrix.
 
 The boundary collectives (``TPMoeSequenceBoundary``'s all-gather /
-reduce-scatter pair) need a real process group, and the fused path needs CUDA;
-neither runs in this environment. What is pinned here is everything around
-them: the plan-spec resolution, the expert-weight shard layout, the
+reduce-scatter pair) need a real process group and are not exercised here.
+This CPU suite covers the plan-spec resolution, the expert-weight shard layout, the
 single-process partial-sum equivalence that the reduce-scatter completes (the
 same math, checked without a group), state-dict FQN stability, the tp=1
 no-op, and every loud-raise of the combination matrix.
 
-The multi-rank forward/backward equivalence against an unsharded reference is
-NOT covered here -- it needs torch >= 2.12 with the distributed stack this
-environment lacks; re-run on a multi-GPU host before trusting the numerics.
+Multi-rank forward/backward equivalence requires separate integration runs on
+the target device; these CPU checks do not establish collective correctness.
 """
 
 from __future__ import annotations
@@ -43,6 +41,35 @@ MOE_PLAN = {
     "layers.*.mlp.experts.down_proj": "rowwise",
     "layers.*.mlp.experts": "moe_tp_experts",
 }
+
+
+@pytest.mark.parametrize("tp_rank", [-1, 2, True, 0.5])
+def test_expert_sharding_rejects_invalid_rank_before_replacing_parameters(tp_rank):
+    block = nn.Module()
+    block.experts = _Experts(num_experts=4, dim=16, hidden=8)
+    originals = dict(block.named_parameters())
+    with pytest.raises(ValueError, match="tp_rank must be an integer"):
+        shard_experts_for_tp(block, tp_size=2, tp_rank=tp_rank)
+    assert all(block.get_parameter(name) is value for name, value in originals.items())
+
+
+def test_expert_sharding_allocation_failure_preserves_parameters(monkeypatch):
+    block = nn.Module()
+    block.experts = _Experts(num_experts=4, dim=16, hidden=8)
+    originals = dict(block.named_parameters())
+    shard_weight = tp_engine.shard_weight
+    allocation_error = RuntimeError("down projection allocation failed")
+
+    def fail_down_projection(weight, dim, **kwargs):
+        if weight is originals["experts.down_proj"]:
+            raise allocation_error
+        return shard_weight(weight, dim, **kwargs)
+
+    monkeypatch.setattr(tp_engine, "shard_weight", fail_down_projection)
+    with pytest.raises(RuntimeError) as caught:
+        shard_experts_for_tp(block, tp_size=2, tp_rank=0)
+    assert caught.value is allocation_error
+    assert all(block.get_parameter(name) is value for name, value in originals.items())
 
 
 class _Experts(nn.Module):
@@ -335,6 +362,37 @@ def test_shared_expert_shards_featurewise_and_partials_sum(plural_fallback) -> N
     # The sharded weights keep the same module paths with halved features.
     assert reference.gate_proj.weight.shape[0] == 32
     assert partials and partials[0].shape == x.shape
+
+
+@pytest.mark.parametrize("failed_projection", ["up_proj", "down_proj"])
+def test_shared_expert_allocation_failure_preserves_model(
+    monkeypatch, failed_projection
+):
+    block = nn.Module()
+    block.shared_expert = _SharedMLP()
+    shared = block.shared_expert
+    originals = dict(shared.named_parameters())
+    features = {
+        name: (module.in_features, module.out_features)
+        for name, module in shared.named_children()
+    }
+    shard_weight = tp_engine.shard_weight
+    allocation_error = RuntimeError("shared projection allocation failed")
+
+    def fail_projection(weight, dim, **kwargs):
+        if weight is originals[f"{failed_projection}.weight"]:
+            raise allocation_error
+        return shard_weight(weight, dim, **kwargs)
+
+    monkeypatch.setattr(tp_engine, "shard_weight", fail_projection)
+    with pytest.raises(RuntimeError) as caught:
+        tp_engine.shard_shared_expert_for_tp(block, tp_size=2, tp_rank=0)
+    assert caught.value is allocation_error
+    assert all(shared.get_parameter(name) is value for name, value in originals.items())
+    assert features == {
+        name: (module.in_features, module.out_features)
+        for name, module in shared.named_children()
+    }
 
 
 @pytest.mark.parametrize("root_block", [False, True])

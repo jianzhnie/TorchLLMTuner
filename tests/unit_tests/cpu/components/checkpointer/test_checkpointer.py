@@ -2253,6 +2253,9 @@ def test_load_synchronizes_snapshot_before_state_or_storage_access(failed_phase)
         maybe_wait_for_saving=lambda: synchronize("saving"),
         _resolve_load_source=resolve,
     )
+    manager._wait_for_pending_staging = lambda: (
+        BaseCheckpointManager._wait_for_pending_staging(manager)
+    )
     manager._wait_for_pending_save = lambda: (
         BaseCheckpointManager._wait_for_pending_save(manager)
     )

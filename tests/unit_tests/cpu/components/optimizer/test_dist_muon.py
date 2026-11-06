@@ -51,6 +51,22 @@ def _config(residency="device"):
     )
 
 
+def test_constructor_validates_names_before_compute_layout_lookup():
+    model = _model()
+    with pytest.raises(ValueError, match="must be aligned"):
+        DistMuon(
+            [{"params": [model.weight]}],
+            compute_sharding_by_fqn={},
+            bucket_configs=[BucketConfig(patterns=("weight",))],
+        )
+    with pytest.raises(ValueError, match="missing compute sharding"):
+        DistMuon(
+            [{"params": [model.weight], "param_names": ["weight"]}],
+            compute_sharding_by_fqn={},
+            bucket_configs=[BucketConfig(patterns=("weight",))],
+        )
+
+
 @pytest.mark.parametrize(
     ("shape", "dim", "message"),
     [

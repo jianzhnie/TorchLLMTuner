@@ -65,6 +65,9 @@ def snapshot(value):
 
 def train(args) -> None:
     world = int(os.environ.get("WORLD_SIZE", "1"))
+    stop_after = args.steps if args.stop_after is None else args.stop_after
+    if not 0 < stop_after <= args.steps:
+        raise ValueError("stop-after must be between 1 and the configured steps")
     config = LLMTunerConfig(
         model=ModelConfig(
             model_name_or_path="qwen3_moe" if args.ep > 1 else "llama",
@@ -128,6 +131,11 @@ def train(args) -> None:
     for group in config.optimizer.param_groups:
         group.optimizer_kwargs["amsgrad"] = args.amsgrad
     trainer = Trainer(config)
+    if stop_after < args.steps:
+        should_continue = trainer.should_continue_training
+        trainer.should_continue_training = lambda: (
+            trainer.step < stop_after and should_continue()
+        )
     if args.tp > 1:
         assert any(
             getattr(part, "_tp_checkpoint_layouts", None)
@@ -177,7 +185,14 @@ def train(args) -> None:
 
     def save_and_record(*save_args, **save_kwargs):
         result = save(*save_args, **save_kwargs)
-        if trainer.step == args.steps:
+        if trainer.step == stop_after:
+            if stop_after < args.steps and args.async_mode != "disabled":
+                assert result and not save_kwargs.get("last_step", False)
+                assert trainer.checkpointer.save_future is not None
+                print(
+                    f"PASS asynchronous checkpoint submitted at step={trainer.step}",
+                    flush=True,
+                )
             for key in ("rng_state", "dataloader"):
                 owner = trainer.checkpointer.states[key]
                 state = owner.state_dict()
@@ -193,7 +208,7 @@ def train(args) -> None:
         trainer.train()
         final = model_snapshot()
         assert starts == [args.expected_start], starts
-        assert trainer.step == args.steps
+        assert trainer.step == stop_after
         assert any(
             not torch.equal(value, initial[part][name])
             for part, state in final.items()
@@ -307,6 +322,11 @@ def suite(args) -> None:
         ("swap-half", True, 2, "swap-resume", 0),
         ("swap-resume", True, 4, "swap-resume", 2),
     ):
+        asynchronous_half = (
+            label.endswith("-half")
+            and args.checkpoint_backend == "dcp"
+            and args.async_mode != "disabled"
+        )
         command = (
             [sys.executable]
             if args.world_size == 1
@@ -325,10 +345,14 @@ def suite(args) -> None:
             "--output",
             str(root / label / "snapshot"),
             "--steps",
-            str(steps),
+            str(4 if asynchronous_half else steps),
             "--expected-start",
             str(start),
         ]
+        if asynchronous_half:
+            # A configured final step forces synchronous DCP saving. Keep the
+            # full training plan and stop after an ordinary interval save instead.
+            command += ["--stop-after", str(steps)]
         command += [
             "--ep",
             str(args.ep),
@@ -425,6 +449,9 @@ def main() -> None:
     worker.add_argument("--directory", type=Path, required=True)
     worker.add_argument("--output", type=Path, required=True)
     worker.add_argument("--steps", type=int, required=True)
+    worker.add_argument(
+        "--stop-after", type=int, help="Stop without changing the configured step plan"
+    )
     worker.add_argument("--expected-start", type=int, required=True)
     worker.add_argument("--swap", action="store_true")
     for subparser in (run, worker):

@@ -79,3 +79,21 @@ def test_hf_state_adaptation_propagates_destination_validation_failure():
         )
 
     assert caught.value is failure
+
+
+@pytest.mark.parametrize("kimi_expert_parallel", [False, True])
+def test_failed_conversion_never_validates_destination(kimi_expert_parallel):
+    failure = ValueError("invalid HF state")
+
+    class FailedAdapter:
+        def from_hf(self, state):
+            raise failure
+
+    adapter = FailedAdapter()
+    adapter.kimi_expert_parallel = kimi_expert_parallel
+    destination = _ModelState()
+    with pytest.raises(ValueError, match="invalid HF state") as caught:
+        state_adaptation.adapt_hf_model_state(adapter, destination, {"hf.weight": 1})
+
+    assert caught.value is failure
+    assert destination.validated is None

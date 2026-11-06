@@ -17,6 +17,7 @@ from torch.distributed.tensor import (
 )
 from torch.distributed.tensor.debug import CommDebugMode
 
+from llmtuner.components.optimizer.adamw_swap import AdamWSwap
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config import OptimizerConfig
 from tests.integration_tests.harness import init_distributed
@@ -167,6 +168,41 @@ def main():
             assert torch.equal(local_weight, before)
         assert restored_step.to_local().item() == 1
         print(f"PASS replicated counter load and next update rank={rank}")
+
+        # The direct swap loader is also rank-local: .item() on a Partial
+        # DTensor would silently enter a reduction before caller coordination.
+        swap_parameter = nn.Parameter(torch.ones(3, device=device))
+        swap = AdamWSwap([swap_parameter], foreach=False)
+        swap.initialize_state()
+        swap_checkpoint = deepcopy(swap.state_dict())
+        for counter in (partial_counter, sharded_counter):
+            incoming = deepcopy(swap_checkpoint)
+            incoming["state"][0]["exp_avg"].fill_(99)
+            incoming["state"][0]["step"] = counter
+            error = None
+            with CommDebugMode() as debug:
+                try:
+                    swap.load_state_dict(incoming)
+                except ValueError as caught:
+                    error = caught
+            assert error is not None and "fully replicated" in str(error)
+            assert debug.get_total_counts() == 0, debug.get_comm_counts()
+            torch.testing.assert_close(
+                swap.state[swap_parameter], swap_checkpoint["state"][0], rtol=0, atol=0
+            )
+        incoming = deepcopy(swap_checkpoint)
+        incoming["state"][0]["step"] = DTensor.from_local(
+            torch.tensor(0.0, device=device), mesh, [Replicate()]
+        )
+        with CommDebugMode() as debug:
+            swap.load_state_dict(incoming)
+        assert debug.get_total_counts() == 0, debug.get_comm_counts()
+        assert swap.state[swap_parameter]["step"].device.type == "cpu"
+        swap_parameter.grad = torch.ones_like(swap_parameter)
+        swap.step()
+        assert swap.state[swap_parameter]["step"].item() == 1
+        assert not torch.equal(swap_parameter, torch.ones_like(swap_parameter))
+        print(f"PASS direct AdamWSwap counter layouts without collectives rank={rank}")
     finally:
         dist.destroy_process_group()
 

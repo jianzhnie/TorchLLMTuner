@@ -179,6 +179,35 @@ def test_joint_model_preserves_weights_and_global_hf_classes(projection):
     assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters())
 
 
+def test_norm_backend_transitions_preserve_optimizer_parameters_and_model_mode():
+    model = make_model("native").eval()
+    parameters = dict(model.named_parameters())
+    optimizer = torch.optim.AdamW(model.parameters())
+    saved = copy.deepcopy(model.state_dict())
+    for backend in ("aten", "torch", "joint", "native", "aten", "native"):
+        model.model.config.norm_backend = backend
+        stabilize_residual_norm_gradients(model.model)
+        current = dict(model.named_parameters())
+        assert current.keys() == parameters.keys()
+        assert all(current[name] is value for name, value in parameters.items())
+        assert all(not module.training for module in model.modules())
+        assert len(optimizer.param_groups[0]["params"]) == len(parameters)
+        assert all(
+            actual is expected
+            for actual, expected in zip(
+                optimizer.param_groups[0]["params"], parameters.values(), strict=True
+            )
+        )
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(value, saved[name], rtol=0, atol=0)
+        optimizer.zero_grad(set_to_none=True)
+        model(torch.arange(8)).square().sum().backward()
+        assert all(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in parameters.values()
+        )
+
+
 @pytest.mark.parametrize("backend", ["torch", "aten", "npu"])
 def test_norm_transition_preserves_custom_forward_and_existing_hooks(backend):
     from types import MethodType

@@ -5,16 +5,18 @@ PYTHONPATH=. python tests/integration_tests/npu_profiler_equivalence.py
 
 import argparse
 import json
+import pickle
 from pathlib import Path
 
 import torch
 
 from examples.train_qwen3 import qwen3_config
+from llmtuner.components.profiler import MemoryProfiler
 from llmtuner.config.observability_config import ProfilerConfig
 from llmtuner.trainer.trainer import Trainer
 
 
-def train(root: Path, *, profiling: bool):
+def train(root: Path, *, profiling: bool, memory_snapshots: bool = False):
     config = qwen3_config()
     config.training.steps = 4
     config.training.global_batch_size = 1
@@ -25,6 +27,9 @@ def train(root: Path, *, profiling: bool):
         profiler_active=1,
         profiler_warmup=1,
         profiler_repeat=1,
+        enable_memory_snapshot=memory_snapshots,
+        memory_snapshot_freq=2,
+        memory_snapshot_max_entries=10000,
     )
     trainer = Trainer(config)
     trainer.train()
@@ -38,6 +43,7 @@ def train(root: Path, *, profiling: bool):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", default="outputs/npu-profiler-equivalence")
+    parser.add_argument("--memory-snapshots", action="store_true")
     args = parser.parse_args()
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         raise RuntimeError("This test requires an available NPU")
@@ -45,7 +51,9 @@ def main():
     if root.exists():
         raise FileExistsError(f"Use a fresh output directory: {root}")
     reference = train(root / "reference", profiling=False)
-    actual = train(root / "profiled", profiling=True)
+    actual = train(
+        root / "profiled", profiling=True, memory_snapshots=args.memory_snapshots
+    )
     assert reference.keys() == actual.keys()
     for name in reference:
         torch.testing.assert_close(actual[name], reference[name], rtol=0, atol=0)
@@ -74,6 +82,21 @@ def main():
             and event.get("args", {}).get("Task Type", "").startswith("KERNEL_")
         )
     assert kernels, "Trace has no NPU kernel events"
+    if args.memory_snapshots:
+        snapshot_root = root / "profiled/profiling/memory_snapshot"
+        snapshots = sorted(snapshot_root.rglob("*.pickle"))
+        assert [path.parent.name for path in snapshots] == [
+            "step_000000000002",
+            "step_000000000004",
+        ], snapshots
+        for path in snapshots:
+            with path.open("rb") as stream:
+                snapshot = pickle.load(stream)
+            assert snapshot["segments"], f"Empty allocator segments: {path}"
+            assert any(snapshot["device_traces"]), f"Empty allocator history: {path}"
+        assert not list(snapshot_root.rglob("*.tmp")), "Unpublished snapshot remains"
+        assert not MemoryProfiler._history_owners, "Allocator history owner leaked"
+        print(f"PASS: {len(snapshots)} nonempty NPU allocator snapshots; owners closed")
     print(f"PASS: exact training updates; {len(kernels)} NPU kernels in {traces}")
 
 

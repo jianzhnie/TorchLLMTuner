@@ -4,7 +4,7 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=2 \
     tests/integration_tests/checkpoint_save_coordination.py
 
 CPU/Gloo, synchronous and threaded async DCP, real local checkpoint storage.
-Use --writer-only for the device-selected real DCP writer-failure cases;
+Use --writer-only for device-selected real DCP writer and load-wait failures;
 the remaining CPU-only policy/stager isolation cases are not executed then.
 """
 
@@ -21,13 +21,71 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.api import CheckpointException
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 
 from llmtuner.components.checkpointer.backends import (
     distributed_checkpoint as checkpoint,
 )
+from llmtuner.components.checkpointer.storage import checkpoint_writer
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from tests.integration_tests.harness import init_distributed
+
+
+def check_metadata_publication_failure(root, *, device, upload_group=None):
+    """A coordinator rename failure reaches peers and preserves the old save."""
+    rank = dist.get_rank()
+    mode = "sync" if upload_group is None else "thread-async"
+    folder = root / f"metadata-publication-{mode}"
+    original = torch.tensor([2.0, 7.0], device=device)
+    # Reuse the writer: each save must still allocate a fresh generation.
+    writer = checkpoint_writer.GenerationFileSystemWriter(folder)
+    dcp.save({"weight": original}, storage_writer=writer)
+    metadata = (folder / ".metadata").read_bytes()
+    replace_metadata = checkpoint_writer.os.replace
+
+    def fail_publication(source, destination):
+        if rank == 0 and Path(destination).name == ".metadata":
+            raise OSError("injected distributed metadata publication failure")
+        return replace_metadata(source, destination)
+
+    with patch.object(checkpoint_writer.os, "replace", fail_publication):
+        try:
+            if upload_group is None:
+                dcp.save({"weight": original + 3}, storage_writer=writer)
+            else:
+                future = dcp.async_save(
+                    {"weight": original + 3},
+                    storage_writer=writer,
+                    process_group=upload_group,
+                )
+                future.result()
+        except CheckpointException as error:
+            assert "injected distributed metadata publication failure" in str(error)
+        else:
+            raise AssertionError(
+                "Metadata publication failure did not reach every rank"
+            )
+    dist.barrier()
+    assert (folder / ".metadata").read_bytes() == metadata
+    assert not list(folder.glob(".metadata.*.tmp"))
+    restored = {"weight": torch.zeros_like(original)}
+    dcp.load(restored, checkpoint_id=folder)
+    torch.testing.assert_close(restored["weight"], original, rtol=0, atol=0)
+    if upload_group is None:
+        dcp.save({"weight": original + 3}, storage_writer=writer)
+    else:
+        dcp.async_save(
+            {"weight": original + 3},
+            storage_writer=writer,
+            process_group=upload_group,
+        ).result()
+    dcp.load(restored, checkpoint_id=folder)
+    torch.testing.assert_close(restored["weight"], original + 3, rtol=0, atol=0)
+    print(
+        f"rank={rank} {mode}: metadata failure, old snapshot and retry passed",
+        flush=True,
+    )
 
 
 def check_host_preparation_failure(root):
@@ -451,9 +509,9 @@ def check_pending_save_failure(root):
             manager.close()
 
 
-def check_load_wait_failure(root):
+def check_load_wait_failure(root, *, device=None):
     rank = dist.get_rank()
-    model = torch.nn.Linear(2, 2)
+    model = torch.nn.Linear(2, 2, device=device)
     optimizer = torch.optim.AdamW(model.parameters())
     manager = checkpoint.DistributedCheckpointManager(
         CheckpointConfig(enable=True, interval=1, keep_latest_k=0),
@@ -469,31 +527,32 @@ def check_load_wait_failure(root):
             ("maybe_wait_for_staging", "Checkpoint load staging"),
             ("maybe_wait_for_saving", "Checkpoint pending save"),
         ):
-            for error_type in (OSError, KeyboardInterrupt, SystemExit):
-                failure = error_type("injected load wait failure")
+            for failing_rank in (0, 1):
+                for error_type in (OSError, KeyboardInterrupt, SystemExit):
+                    failure = error_type("injected load wait failure")
 
-                def wait(*, failure=failure):
-                    if rank == 0:
-                        raise failure
+                    def wait(*, failure=failure, failing_rank=failing_rank):
+                        if rank == failing_rank:
+                            raise failure
 
-                with (
-                    patch.object(manager, method, wait),
-                    patch.object(manager, "_resolve_load_source") as resolve,
-                ):
-                    try:
-                        manager.load(1)
-                    except error_type as error:
-                        assert rank == 0 and error is failure
-                    except RuntimeError as error:
-                        assert (
-                            rank == 1
-                            and str(error) == f"{phase} failed on another rank"
-                        )
-                    else:
-                        raise AssertionError("Load wait failure not coordinated")
-                    resolve.assert_not_called()
-                dist.barrier()
-                assert manager.load(1)
+                    with (
+                        patch.object(manager, method, wait),
+                        patch.object(manager, "_resolve_load_source") as resolve,
+                    ):
+                        try:
+                            manager.load(1)
+                        except error_type as error:
+                            assert rank == failing_rank and error is failure
+                        except RuntimeError as error:
+                            assert (
+                                rank != failing_rank
+                                and str(error) == f"{phase} failed on another rank"
+                            )
+                        else:
+                            raise AssertionError("Load wait failure not coordinated")
+                        resolve.assert_not_called()
+                    dist.barrier()
+                    assert manager.load(1)
     finally:
         manager.close()
 
@@ -870,6 +929,14 @@ def main():
             roots = [local_root if rank == 0 else None]
             dist.broadcast_object_list(roots)
             root = Path(roots[0])
+            check_metadata_publication_failure(root, device=device)
+            upload_group = dist.new_group(backend="gloo")
+            try:
+                check_metadata_publication_failure(
+                    root, device=device, upload_group=upload_group
+                )
+            finally:
+                dist.destroy_process_group(upload_group)
             for mode in ("disabled", "async"):
                 for failing_rank in (0, 1):
                     folder = root / f"{mode}-{failing_rank}"
@@ -966,6 +1033,7 @@ def main():
                         flush=True,
                     )
             if args.writer_only:
+                check_load_wait_failure(root, device=device)
                 dist.barrier()
                 return
             check_host_preparation_failure(root)

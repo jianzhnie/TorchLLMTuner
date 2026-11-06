@@ -1343,3 +1343,62 @@ def test_qwen3_moe_router_keeps_scores_and_gate_in_fp32() -> None:
         assert actual.dtype == torch.bfloat16
         assert torch.isfinite(actual).all() and actual.count_nonzero() > 0
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("mask_type", ["causal", "block_causal"])
+def test_non_flex_forward_skips_unused_block_mask(model, monkeypatch, mask_type):
+    model.model.config._attn_implementation = "sdpa"
+    model.model.config.attn_mask_type = mask_type
+
+    def reject_unused_mask(*args, **kwargs):
+        raise AssertionError("tensor backend must not build an unused BlockMask")
+
+    monkeypatch.setattr(model, "get_attention_masks", reject_unused_mask)
+    positions = torch.tensor([0, 1, 0, 1])
+    mask = model._apply_attention(positions, None)["attention_mask"]
+    if mask_type == "causal":
+        assert mask is None
+    else:
+        assert mask.shape == (1, 1, 4, 4)
+        assert mask[0, 0, 3, 2] == 0
+        assert torch.isneginf(mask[0, 0, 3, 1])
+
+
+@pytest.mark.parametrize("first_document_length", [1, 3])
+def test_packed_sdpa_document_matches_independent_forward_and_backward(
+    model: HFTransformerModel, first_document_length: int
+) -> None:
+    model.model.config._attn_implementation = "sdpa"
+    model.model.config.attn_mask_type = "block_causal"
+    first = torch.tensor([7, 11, 19])[:first_document_length]
+    second = torch.tensor([23, 29, 31, 37])
+    positions = torch.cat((torch.arange(first.numel()), torch.arange(second.numel())))
+
+    packed = model(torch.cat((first, second)), positions=positions)[first.numel() :]
+    packed.float().square().sum().backward()
+    packed_gradients = {
+        name: parameter.grad.clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    model.zero_grad(set_to_none=True)
+
+    independent = model(second, positions=torch.arange(second.numel()))
+    independent.float().square().sum().backward()
+    torch.testing.assert_close(packed, independent, rtol=1e-5, atol=1e-7)
+    assert torch.isfinite(packed).all() and packed.count_nonzero() > 0
+    assert packed_gradients
+    assert any(gradient.count_nonzero() > 0 for gradient in packed_gradients.values())
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None
+        torch.testing.assert_close(
+            packed_gradients[name], parameter.grad, rtol=1e-4, atol=1e-6, msg=name
+        )
+    # Tokens exclusive to the preceding document cannot receive embedding grads
+    # when only the second document contributes to the loss.
+    torch.testing.assert_close(
+        packed_gradients["model.model.embed_tokens.weight"][first],
+        torch.zeros_like(model.tok_embeddings.weight[first]),
+        rtol=0,
+        atol=0,
+    )

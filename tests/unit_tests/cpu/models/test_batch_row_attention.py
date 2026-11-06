@@ -3,6 +3,8 @@
 import pytest
 import torch
 
+from llmtuner.models.hf import input_preparation
+from llmtuner.models.hf.attention_backend import ATTENTION_BACKEND
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
 
@@ -95,22 +97,25 @@ def test_kv_sdpa_multirow_mask_keeps_full_keys_and_row_positions(monkeypatch, pa
         get_optional_mesh=lambda name: cp if name == "cp" else None
     )
 
-    def shard(model, mesh, **kwargs):
+    def shard(inputs, labels, positions, mesh, **kwargs):
         assert mesh is cp
-        return (
-            kwargs["inputs"][4:],
-            kwargs["labels"][4:],
-            kwargs["positions"][4:],
-            None,
-            None,
-        )
+        return inputs[4:], labels[4:], positions[4:]
 
-    monkeypatch.setattr("llmtuner.models.hf.input_preparation._shard_for_cp", shard)
+    mask_builds = []
+    build_mask = input_preparation.build_dense_attention_mask
+
+    def counted_mask(*args, **kwargs):
+        mask_builds.append(1)
+        return build_mask(*args, **kwargs)
+
+    monkeypatch.setattr(input_preparation, "shard_batch_for_cp", shard)
+    monkeypatch.setattr(input_preparation, "build_dense_attention_mask", counted_mask)
     tokens = torch.arange(8).reshape(2, 4)
     batch = {"input": tokens, "labels": tokens}
     if packed:
         batch["positions"] = torch.tensor([[0, 1, 0, 1], [0, 1, 2, 3]])
     inputs, _, kwargs = model.preprocess_inputs(batch, parallel_dims=topology)
+    assert len(mask_builds) == 1
     assert inputs.tolist() == [4, 5, 6, 7]
     assert kwargs["positions"].tolist() == [0, 1, 2, 3]
     mask = kwargs["attention_masks"]
@@ -121,3 +126,54 @@ def test_kv_sdpa_multirow_mask_keeps_full_keys_and_row_positions(monkeypatch, pa
         assert not mask[0, 0, 2, :2].any()
     model.cp_mesh = cp
     assert model._apply_attention(kwargs["positions"], mask)["attention_mask"] is mask
+
+
+@pytest.mark.parametrize("backend", ["sdpa", ATTENTION_BACKEND])
+@pytest.mark.parametrize("position_start", [0, 5])
+def test_packed_rows_with_continuation_positions_remain_independent(
+    backend, position_start, monkeypatch
+):
+    config = build_model_config(
+        "qwen3",
+        seq_len=16,
+        arch_overrides={
+            "vocab_size": 64,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+        },
+    )
+    model = HFTransformerModel(config).eval()
+    model.model.config._attn_implementation = backend
+    model.model.config.attn_mask_type = "block_causal"
+
+    def unexpected_generic_mask(**kwargs):
+        pytest.fail("multirow preparation must build only the row-aware mask")
+
+    monkeypatch.setattr(model, "get_attention_masks", unexpected_generic_mask)
+    tokens = torch.tensor([[1, 2, 3], [7, 11, 13]])
+    positions = torch.arange(position_start, position_start + 6).reshape(2, 3)
+    original_positions = positions.clone()
+    inputs, _, kwargs = model.preprocess_inputs(
+        {"input": tokens, "labels": tokens, "positions": positions},
+        parallel_dims=None,
+    )
+    assert torch.equal(positions, original_positions)
+    assert torch.equal(kwargs["positions"], original_positions.flatten())
+    mask = kwargs["attention_masks"]
+    if backend == ATTENTION_BACKEND:
+        batch = head = torch.tensor(0)
+        query = torch.arange(3, 6)[:, None]
+        key = torch.arange(3)[None, :]
+        assert not mask.mask_mod(batch, head, query, key).any()
+        assert mask.mask_mod(batch, head, torch.tensor(5), torch.tensor(3))
+        assert not mask.mask_mod(batch, head, torch.tensor(3), torch.tensor(5))
+        return
+    assert torch.isneginf(mask[..., 3:, :3]).all()
+    with torch.no_grad():
+        packed = model(inputs, **kwargs)[3:]
+        independent = model(tokens[1], positions=positions[1])
+    assert torch.isfinite(packed).all() and packed.count_nonzero() > 0
+    torch.testing.assert_close(packed, independent, rtol=1e-5, atol=1e-7)

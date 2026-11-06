@@ -1,8 +1,11 @@
 """Eight ranks: dense DP4/TP2 and sparse FSDP2/EP4 DCP/HF model restore.
 
 Use the shared harness for CPU/Gloo or accelerator backend selection.
+For multiple nodes, set CHECKPOINT_TEST_ROOT to an existing shared directory;
+rank zero creates a unique checkpoint subdirectory there.
 """
 
+import os
 import tempfile
 from datetime import timedelta
 from pathlib import Path
@@ -14,6 +17,7 @@ from safetensors.torch import save_file
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
+from transformers import AutoConfig
 
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.config.parallel_config import ParallelConfig
@@ -68,7 +72,11 @@ def main():
             key: value.to_local().clone() for key, value in model.state_dict().items()
         }
         paths = [
-            tempfile.mkdtemp(prefix="tp2-ep4-dp-") if dist.get_rank() == 0 else None
+            tempfile.mkdtemp(
+                prefix="tp2-ep4-dp-", dir=os.environ.get("CHECKPOINT_TEST_ROOT")
+            )
+            if dist.get_rank() == 0
+            else None
         ]
         dist.broadcast_object_list(paths)
         dcp.save({"model": wrapper}, checkpoint_id=paths[0])
@@ -91,8 +99,6 @@ def main():
         torch.testing.assert_close(
             complete["model"]["experts.weight"], expert_full, atol=0, rtol=0
         )
-        from transformers import AutoConfig
-
         config = AutoConfig.for_model(
             "qwen3_moe",
             vocab_size=128,

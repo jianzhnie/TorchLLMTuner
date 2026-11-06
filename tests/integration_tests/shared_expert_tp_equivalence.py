@@ -14,8 +14,9 @@ replicated attention/shared-expert gradients must match the unsharded reference
 computed in-process before apply_tp.
 
 Environment note: needs torch >= 2.12 and a transformers that builds
-deepseek_v3 offline. Verified on torch 2.14 with two CPU/Gloo ranks;
-GPU/NPU execution is not covered.
+deepseek_v3 offline. The harness selects CPU/Gloo with FP64 or an accelerator
+with FP32 and the corresponding tolerances below. This checks a tiny model's
+forward/backward equivalence, not large-model training or performance.
 """
 
 from __future__ import annotations

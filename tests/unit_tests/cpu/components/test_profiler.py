@@ -35,7 +35,8 @@ def cpu_trace_backend(monkeypatch):
     monkeypatch.setattr(profiler_module, "device_type", "cpu")
 
 
-def test_npu_trace_combines_native_and_json_handlers(tmp_path, monkeypatch):
+@pytest.mark.parametrize("level", [None, "level0", "level1", "level2"])
+def test_npu_trace_combines_native_and_json_handlers(tmp_path, monkeypatch, level):
     recorded = {"calls": []}
 
     class NativeProfile:
@@ -64,11 +65,18 @@ def test_npu_trace_combines_native_and_json_handlers(tmp_path, monkeypatch):
         profile=NativeProfile,
         schedule=lambda **kwargs: lambda step: step,
         tensorboard_trace_handler=tensorboard_trace_handler,
+        ProfilerLevel=SimpleNamespace(Level0=0, Level1=1, Level2=2),
+        _ExperimentalConfig=lambda **kwargs: kwargs,
     )
     monkeypatch.setattr(profiler_module, "npu_profiler", native_api)
     monkeypatch.setattr(profiler_module, "device_type", "npu")
     profiler = Profiler(
-        Config(enable_profiling=True, profile_freq=1, profiler_warmup=0),
+        Config(
+            enable_profiling=True,
+            profile_freq=1,
+            profiler_warmup=0,
+            npu_profiler_level=level,
+        ),
         base_folder=str(tmp_path),
     )
     trace = profiler.build_torch_profiler()
@@ -78,6 +86,16 @@ def test_npu_trace_combines_native_and_json_handlers(tmp_path, monkeypatch):
     assert recorded["raw"].endswith("profiling/traces/raw")
     assert recorded["raw_options"] == {"analyse_flag": False}
     assert recorded["calls"] == [("raw", trace), ("json", trace)]
+    if level is None:
+        assert "experimental_config" not in recorded
+    else:
+        assert recorded["experimental_config"] == {"profiler_level": int(level[-1])}
+
+
+@pytest.mark.parametrize("level", [False, 1, "Level1", "level3", []])
+def test_invalid_npu_profiler_level_is_rejected(level):
+    with pytest.raises(ValueError, match="npu_profiler_level"):
+        Config(npu_profiler_level=level)
 
 
 # -- config -------------------------------------------------------------------
@@ -490,15 +508,21 @@ def test_the_trace_directory_is_named_for_the_step(tmp_path) -> None:
 
 
 @_NO_WARMUP
-def test_a_trace_is_written_at_the_end_of_the_cycle(tmp_path) -> None:
+@pytest.mark.parametrize("npu_level", [None, "level1"])
+def test_a_trace_is_written_at_the_end_of_the_cycle(
+    tmp_path, monkeypatch, npu_level
+) -> None:
     """A one-iteration cycle with no warmup, so the run below produces exactly
     one trace directory."""
+    # An NPU-specific setting must not require torch-npu on the CPU backend.
+    monkeypatch.setattr(profiler_module, "npu_profiler", None)
     profiler = Profiler(
         Config(
             enable_profiling=True,
             profile_freq=1,
             profiler_warmup=0,
             profiler_active=1,
+            npu_profiler_level=npu_level,
         ),
         global_step=0,
         base_folder=str(tmp_path),
@@ -895,8 +919,10 @@ def test_conflicting_memory_history_capacity_does_not_restart_owner(monkeypatch)
 
 
 @pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("failure_phase", ["serialization", "publication"])
 def test_failed_snapshot_does_not_publish_partial_file(
-    tmp_path, monkeypatch, writable_snapshots, existing
+    tmp_path, monkeypatch, writable_snapshots, existing, cleanup_fails, failure_phase
 ):
     profiler = MemoryProfiler(
         step_num=0,
@@ -912,15 +938,31 @@ def test_failed_snapshot_does_not_publish_partial_file(
     if existing:
         destination.write_bytes(b"previous complete snapshot")
 
-    def fail(value, output, **kwargs):
-        output.write(b"partial")
-        raise RuntimeError("snapshot serialization failed")
+    error = RuntimeError(f"snapshot {failure_phase} failed")
 
-    monkeypatch.setattr(profiler_module.pickle, "dump", fail)
+    def fail(*args, **kwargs):
+        if failure_phase == "serialization":
+            args[1].write(b"partial")
+        raise error
+
+    if failure_phase == "serialization":
+        monkeypatch.setattr(profiler_module.pickle, "dump", fail)
+    else:
+        monkeypatch.setattr(profiler_module.os, "replace", fail)
+    if cleanup_fails:
+
+        def fail_cleanup(path):
+            raise PermissionError("snapshot cleanup failed")
+
+        monkeypatch.setattr(profiler_module.os, "unlink", fail_cleanup)
     try:
-        with pytest.raises(RuntimeError, match="snapshot serialization failed"):
+        with pytest.raises(
+            RuntimeError, match=f"snapshot {failure_phase} failed"
+        ) as caught:
             profiler.step()
-        assert list(directory.iterdir()) == ([destination] if existing else [])
+        assert caught.value is error
+        assert destination.exists() == existing
+        assert len(list(directory.glob("*.tmp"))) == int(cleanup_fails)
         if existing:
             assert destination.read_bytes() == b"previous complete snapshot"
     finally:

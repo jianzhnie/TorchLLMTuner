@@ -1,5 +1,9 @@
-"""Four CPU or accelerator ranks: EP2 x DP2 with an empty local expert shard."""
+"""Four CPU or accelerator ranks: EP2 x DP2 with an empty local expert shard.
 
+For multiple nodes, set CHECKPOINT_TEST_ROOT to an existing shared directory.
+"""
+
+import os
 import tempfile
 from datetime import timedelta
 
@@ -13,6 +17,7 @@ from torch.distributed.tensor import Shard, distribute_tensor
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.parallel.expert_parallel.checkpointing import mark_experts_ep_sharded
 from tests.integration_tests.harness import init_distributed
+from tests.integration_tests.tp_dp_checkpoint_reshard import build_optimizer
 
 
 def main() -> None:
@@ -44,7 +49,10 @@ def main() -> None:
         assert checkpoint.device == model.experts.weight.device
         expected = model.experts.weight.to_local().clone()
         paths = [
-            tempfile.mkdtemp(prefix="empty-expert-checkpoint-")
+            tempfile.mkdtemp(
+                prefix="empty-expert-checkpoint-",
+                dir=os.environ.get("CHECKPOINT_TEST_ROOT"),
+            )
             if dist.get_rank() == 0
             else None
         ]
@@ -69,9 +77,65 @@ def main() -> None:
         torch.testing.assert_close(
             complete["model"]["experts.weight"], full, atol=0, rtol=0
         )
+
+        optimizer = build_optimizer(model, shard_axis="ep")
+        reference = nn.Parameter(full.clone())
+        reference_optimizer = torch.optim.AdamW(
+            [reference], lr=0.01, weight_decay=0.01, foreach=False, fused=False
+        )
+        reference.grad = (full + 1) / 100
+        reference_optimizer.step()
+        model.experts.weight.grad = distribute_tensor(
+            (ep_slice + 1) / 100, mesh["dp"], [Shard(1)]
+        )
+        optimizer.step()
+        optimizer.zero_grad()
+        optimizer_path = paths[0] + "-optimizer"
+        dcp.save(
+            {"model": wrapper, "optimizer": optimizer},
+            checkpoint_id=optimizer_path,
+        )
+        cold = build_model()
+        with torch.no_grad():
+            cold.experts.weight.zero_()
+        cold_wrapper = ModelCheckpointState(cold, sharded_expert_parallel=True)
+        cold_optimizer = build_optimizer(cold, cold=True, shard_axis="ep")
+        assert all(not inner.state for inner in cold_optimizer.optimizers)
+        dcp.load(
+            {"model": cold_wrapper, "optimizer": cold_optimizer},
+            checkpoint_id=optimizer_path,
+        )
+        reference.grad = full.cos() + 2
+        reference_optimizer.step()
+        cold.experts.weight.grad = distribute_tensor(
+            ep_slice.cos() + 2, mesh["dp"], [Shard(1)]
+        )
+        cold_optimizer.step()
+        expected = reference.detach().chunk(2, dim=0)[ep_rank][
+            :, dp_rank : dp_rank + 1, :
+        ]
+        torch.testing.assert_close(
+            cold.experts.weight.to_local(), expected, atol=0, rtol=0
+        )
+        restored_state = cold_optimizer.state_dict()
+        for name, value in reference_optimizer.state[reference].items():
+            actual = restored_state[f"state.experts.weight.{name}"]
+            if name == "step":
+                torch.testing.assert_close(actual, value, atol=0, rtol=0)
+                continue
+            assert (actual.chunks == ()) == (dp_rank == 1)
+            for offset, chunk in actual.chunks:
+                slices = tuple(
+                    slice(start, start + size)
+                    for start, size in zip(offset, chunk.shape, strict=True)
+                )
+                torch.testing.assert_close(chunk, value[slices], atol=0, rtol=0)
         dist.barrier()
         if dist.get_rank() == 0:
-            print("PASS: EP2 x DP2 empty local shard DCP save and cold restore")
+            print(
+                "PASS: EP2 x DP2 empty local shard model/optimizer cold restore "
+                "and next step"
+            )
     finally:
         dist.destroy_process_group()
 

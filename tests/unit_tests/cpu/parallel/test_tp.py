@@ -32,7 +32,20 @@ from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     match_tp_sharding_spec,
     resolve_tp_sharding_plan,
     rowwise,
+    shard_weight,
 )
+
+
+@pytest.mark.parametrize("tp_size", [0, -1, True, 2.0])
+def test_weight_sharding_rejects_invalid_parallel_size(tp_size):
+    with pytest.raises(ValueError, match="tp_size must be a positive integer"):
+        shard_weight(torch.arange(8).reshape(4, 2), 0, tp_size=tp_size, tp_rank=0)
+
+
+@pytest.mark.parametrize("tp_rank", [-1, 2, True, 0.5])
+def test_weight_sharding_rejects_invalid_rank(tp_rank):
+    with pytest.raises(ValueError, match="tp_rank must be an integer"):
+        shard_weight(torch.arange(8).reshape(4, 2), 0, tp_size=2, tp_rank=tp_rank)
 
 
 def test_declaration_factories_pick_the_right_realizer() -> None:

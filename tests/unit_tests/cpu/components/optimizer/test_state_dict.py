@@ -511,6 +511,33 @@ def test_failed_adam_materialization_discards_partial_state_and_can_retry(
     assert optimizer.state[parameter]["step"].item() == 1
 
 
+@pytest.mark.parametrize("missing", ["step", "exp_avg", "exp_avg_sq"])
+def test_adam_materialization_rejects_missing_required_state_and_retries(missing):
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    before = parameter.detach().clone()
+    gradient = torch.ones_like(parameter)
+    parameter.grad = gradient
+    optimizer = torch.optim.AdamW([parameter], lr=0.01)
+
+    def remove_state(optimizer, args, kwargs):
+        del optimizer.state[parameter][missing]
+
+    handle = optimizer.register_step_post_hook(remove_state)
+    try:
+        with pytest.raises(KeyError, match=missing):
+            init_optim_state(optimizer)
+    finally:
+        handle.remove()
+    assert not optimizer.state
+    assert parameter.grad is gradient
+    assert optimizer.param_groups[0]["lr"] == 0.01
+    torch.testing.assert_close(parameter, before, rtol=0, atol=0)
+    init_optim_state(optimizer)
+    assert optimizer.state[parameter]["step"].item() == 0
+    optimizer.step()
+    assert optimizer.state[parameter]["step"].item() == 1
+
+
 @pytest.mark.parametrize("optimizer_type", [torch.optim.Adam, torch.optim.AdamW])
 @pytest.mark.parametrize("dtype,epsilon", [(torch.float32, 0.0), (torch.float16, 1e-8)])
 def test_optimizer_materialization_avoids_zero_denominator_weight_corruption(
