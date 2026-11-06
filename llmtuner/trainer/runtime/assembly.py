@@ -59,7 +59,6 @@ from ...models.hf.factory import (
     build_model_config_for,
     unwrap_text_config,
 )
-from ...models.hf.flops import flops_per_token
 from ...models.hf.materialization import (
     initialize_rotary_on_device,
     materialize_meta_model,
@@ -72,6 +71,7 @@ from ...parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetu
 from ...parallel.topology import build_device_mesh, resolve_parallel_topology
 from ...utils import logging as logging_utils
 from ...utils import seeding
+from ...utils.flops import flops_per_token
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig

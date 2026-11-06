@@ -1,8 +1,7 @@
 """Training FLOPs per token: the model-work term in MFU's numerator.
 
-One node of the ``hf`` package. The arithmetic is pure -- it reads an HF config
-and returns a number -- which is why it lives apart from ``factory.py``, whose
-job is building things. Trainer runtime assembly passes its already resolved
+The arithmetic is pure -- it reads an HF config and returns a number, independent
+of model construction and trainer orchestration. Runtime assembly passes its resolved
 text config to ``flops_per_token``; estimating throughput never rebuilds it.
 
 The convention, matching torchtitan's (``models/utils.py`` plus the HF
