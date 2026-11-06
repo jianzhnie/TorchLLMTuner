@@ -17,6 +17,13 @@ from torch.distributed.checkpoint.metadata import (
 
 from .hf_storage import IndexedHuggingFaceStorageReader
 
+NATIVE_PROJECTIONS = {
+    "gate_proj": "w1_EFD",
+    "up_proj": "w3_EFD",
+    "down_proj": "w2_EDF",
+}
+HF_PROJECTIONS = {name: projection for projection, name in NATIVE_PROJECTIONS.items()}
+
 
 def grouped_expert_key(key: str) -> tuple[str, int, str] | None:
     match = re.fullmatch(
@@ -35,9 +42,7 @@ def native_ep_expert_key(key: str) -> str:
     if mapped is None:
         return key
     projection = mapped[2]
-    role = {"gate_proj": "w1_EFD", "up_proj": "w3_EFD", "down_proj": "w2_EDF"}[
-        projection
-    ]
+    role = NATIVE_PROJECTIONS[projection]
     return key.rsplit("experts.", 1)[0] + "routed_experts.inner_experts." + role
 
 
@@ -92,11 +97,7 @@ class GroupedExpertHuggingFaceStorageReader(IndexedHuggingFaceStorageReader):
             if target in metadata.state_dict_metadata:
                 raise ValueError(f"Mixed fused and individual HF experts: {target}")
             if self.native_ep_layout:
-                projection = {
-                    "w1_EFD": "gate_proj",
-                    "w3_EFD": "up_proj",
-                    "w2_EDF": "down_proj",
-                }[target.rsplit(".", 1)[1]]
+                projection = HF_PROJECTIONS[target.rsplit(".", 1)[1]]
                 projections = (projection,)
             elif target.endswith(".down_proj"):
                 projections = ("down_proj",)

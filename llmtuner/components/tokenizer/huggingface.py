@@ -247,6 +247,36 @@ class HuggingFaceTokenizer(BaseTokenizer):
             )
         return AddedToken(content=token, special=True)
 
+    def _read_explicit_tokens(self) -> tuple[dict[int, AddedToken], dict[str, int]]:
+        added_tokens_decoder = self._hf_config.get("added_tokens_decoder", {})
+        if not isinstance(added_tokens_decoder, dict):
+            raise ValueError("tokenizer config added_tokens_decoder must be an object")
+        explicit_tokens: dict[int, AddedToken] = {}
+        explicit_ids: dict[str, int] = {}
+        for token_id, token_config in added_tokens_decoder.items():
+            if (
+                not isinstance(token_id, str)
+                or not token_id.isascii()
+                or not token_id.isdecimal()
+            ):
+                raise ValueError(f"Invalid added_tokens_decoder ID {token_id!r}")
+            expected_id = int(token_id)
+            token_str = self._get_token_from_config(added_tokens_decoder, token_id)
+            if token_str is None:
+                raise ValueError(
+                    f"added_tokens_decoder entry {token_id!r} must define token content"
+                )
+            if expected_id in explicit_tokens or token_str in explicit_ids:
+                raise ValueError(
+                    f"Duplicate added_tokens_decoder ID or token: {token_id!r}, "
+                    f"{token_str!r}"
+                )
+            explicit_tokens[expected_id] = self._build_added_token(
+                token_str, token_config
+            )
+            explicit_ids[token_str] = expected_id
+        return explicit_tokens, explicit_ids
+
     def _infer_special_tokens(self) -> None:
         """
         Read special tokens from config and add them to the underlying tokenizer.
@@ -281,33 +311,7 @@ class HuggingFaceTokenizer(BaseTokenizer):
                 )
 
         # Process added_tokens_decoder (comprehensive special token definitions)
-        added_tokens_decoder = self._hf_config.get("added_tokens_decoder", {})
-        if not isinstance(added_tokens_decoder, dict):
-            raise ValueError("tokenizer config added_tokens_decoder must be an object")
-        explicit_tokens: dict[int, AddedToken] = {}
-        explicit_ids: dict[str, int] = {}
-        for token_id, token_config in added_tokens_decoder.items():
-            if (
-                not isinstance(token_id, str)
-                or not token_id.isascii()
-                or not token_id.isdecimal()
-            ):
-                raise ValueError(f"Invalid added_tokens_decoder ID {token_id!r}")
-            expected_id = int(token_id)
-            token_str = self._get_token_from_config(added_tokens_decoder, token_id)
-            if token_str is None:
-                raise ValueError(
-                    f"added_tokens_decoder entry {token_id!r} must define token content"
-                )
-            if expected_id in explicit_tokens or token_str in explicit_ids:
-                raise ValueError(
-                    f"Duplicate added_tokens_decoder ID or token: {token_id!r}, "
-                    f"{token_str!r}"
-                )
-            explicit_tokens[expected_id] = self._build_added_token(
-                token_str, token_config
-            )
-            explicit_ids[token_str] = expected_id
+        explicit_tokens, explicit_ids = self._read_explicit_tokens()
 
         # Validate the complete ID plan before modifying the backend. Existing
         # tokens must match; missing tokens can only be appended consecutively.

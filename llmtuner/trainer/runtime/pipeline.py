@@ -35,6 +35,31 @@ class PipelineInputs:
     targets: list[torch.Tensor] | None
 
 
+def split_trainer_batch(
+    batch: TrainerBatch, *, num_microbatches: int, rows_per_microbatch: int
+) -> list[TrainerBatch]:
+    microbatches = []
+    for index in range(num_microbatches):
+        rows = slice(
+            index * rows_per_microbatch,
+            (index + 1) * rows_per_microbatch,
+        )
+        microbatch = {
+            key: value[rows]
+            if num_microbatches > 1
+            and isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            else value
+            for key, value in batch.items()
+        }
+        if "num_valid_tokens" in batch:
+            microbatch["num_valid_tokens"] = int(
+                (microbatch["labels"] != IGNORE_INDEX).sum()
+            )
+        microbatches.append(microbatch)
+    return microbatches
+
+
 def split_pipeline_microbatches(
     batch: Batch | TrainerBatch, *, num_microbatches: int
 ) -> list[Batch | TrainerBatch]:
@@ -81,27 +106,11 @@ def split_pipeline_microbatches(
                     "microbatch for packed media or coordinate layouts."
                 )
     if isinstance(batch, dict):
-        rows_per_microbatch = labels.shape[0] // num_microbatches
-        microbatches = []
-        for index in range(num_microbatches):
-            rows = slice(
-                index * rows_per_microbatch,
-                (index + 1) * rows_per_microbatch,
-            )
-            microbatch = {
-                key: value[rows]
-                if num_microbatches > 1
-                and isinstance(value, torch.Tensor)
-                and value.ndim > 0
-                else value
-                for key, value in batch.items()
-            }
-            if "num_valid_tokens" in batch:
-                microbatch["num_valid_tokens"] = int(
-                    (microbatch["labels"] != IGNORE_INDEX).sum()
-                )
-            microbatches.append(microbatch)
-        return microbatches
+        return split_trainer_batch(
+            batch,
+            num_microbatches=num_microbatches,
+            rows_per_microbatch=labels.shape[0] // num_microbatches,
+        )
 
     input_chunks = batch.input_ids.chunk(num_microbatches, dim=0)
     label_chunks = batch.labels.chunk(num_microbatches, dim=0)

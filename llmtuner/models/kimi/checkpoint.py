@@ -16,6 +16,7 @@ from ...accelerator.collectives import synchronize_local_errors
 
 _BLOCK = re.compile(r"^(.*\.block_sparse_moe\.)(.*)$")
 _PROJECTIONS = {"w1_EFD": "w1", "w2_EDF": "w2", "w3_EFD": "w3"}
+_PROJECTION_ROLES = {name: role for role, name in _PROJECTIONS.items()}
 _LATENT = ("routed_expert_down_proj.", "routed_expert_norm.", "routed_expert_up_proj.")
 
 
@@ -95,11 +96,7 @@ def convert_kimi_expert_state(
                         raise ValueError(
                             f"Kimi individual weight {key!r} must be rank 2"
                         )
-                    role = next(
-                        role
-                        for role, name in _PROJECTIONS.items()
-                        if name == projection
-                    )
+                    role = _PROJECTION_ROLES[projection]
                     target = f"{prefix}routed_experts.inner_experts.{role}"
                     experts = stacks.setdefault(target, {})
                     if index in experts:
@@ -145,7 +142,7 @@ def convert_kimi_optimizer_state(
     """
     result: dict[str, Any] = {}
     pending: dict[tuple[str, str], dict[int, Any]] = {}
-    reverse = {name: role for role, name in _PROJECTIONS.items()}
+    reverse = _PROJECTION_ROLES
 
     def put(key: str, value: Any) -> None:
         if key in result:

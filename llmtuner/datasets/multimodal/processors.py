@@ -93,35 +93,36 @@ def process_multimodal_sample(
     num_image_tokens = []
 
     for idx, img in enumerate(images):
-        if img is not None:
-            # Resize (to multiples of patch_size x merge_size) and normalize images
-            processed_img = process_image(
-                img,
+        if img is None:
+            continue
+        # Resize (to multiples of patch_size x merge_size) and normalize images
+        processed_img = process_image(
+            img,
+            patch_size=patch_size,
+            merge_size=spatial_merge_size,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            image_mean=image_mean,
+            image_std=image_std,
+            resize_fn=resize_fn,
+            max_patches=max_patches,
+            max_patches_per_side=max_patches_per_side,
+        )
+        if processed_img is not None:
+            num_tokens, _, _ = calculate_vision_tokens(
+                num_frames=1,
+                height=processed_img.shape[1],
+                width=processed_img.shape[2],
                 patch_size=patch_size,
-                merge_size=spatial_merge_size,
-                min_pixels=min_pixels,
-                max_pixels=max_pixels,
-                image_mean=image_mean,
-                image_std=image_std,
-                resize_fn=resize_fn,
-                max_patches=max_patches,
-                max_patches_per_side=max_patches_per_side,
+                spatial_merge_size=spatial_merge_size,
+                temporal_patch_size=temporal_patch_size,
             )
-            if processed_img is not None:
-                num_tokens, _, _ = calculate_vision_tokens(
-                    num_frames=1,
-                    height=processed_img.shape[1],
-                    width=processed_img.shape[2],
-                    patch_size=patch_size,
-                    spatial_merge_size=spatial_merge_size,
-                    temporal_patch_size=temporal_patch_size,
-                )
-                processed_images.append(processed_img)
-                num_image_tokens.append(num_tokens)
-                # Keep the accepted image at this aligned position as a placeholder.
-                texts[idx] = None
+            processed_images.append(processed_img)
+            num_image_tokens.append(num_tokens)
+            # Keep the accepted image at this aligned position as a placeholder.
+            texts[idx] = None
 
-    if len(processed_images) != len([_ for _ in images if _ is not None]):
+    if len(processed_images) != sum(img is not None for img in images):
         logger.warning("Cannot process all images for sample. Dropping")
         return None
 

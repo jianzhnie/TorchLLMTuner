@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from ..trainer import Trainer
 
 
-def _unique_parameters(
+def unique_parameters(
     model_parts: Iterable[torch.nn.Module],
 ) -> Iterator[torch.nn.Parameter]:
     """Yield registered parameters once, preserving model-part order."""
@@ -31,7 +31,7 @@ def _unique_parameters(
                 yield parameter
 
 
-def _expert_parameter_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
+def expert_parameter_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
     """Return identities of parameters owned by routed experts."""
     return {
         id(parameter)
@@ -47,7 +47,7 @@ def allreduce_fsdp_excluded_grads(trainer: Trainer) -> None:
     if trainer.parallel_dims is None:
         return
     expert_ids = (
-        _expert_parameter_ids(trainer.model_parts)
+        expert_parameter_ids(trainer.model_parts)
         if trainer.parallel_dims.ep_enabled
         else set()
     )
@@ -58,7 +58,7 @@ def allreduce_fsdp_excluded_grads(trainer: Trainer) -> None:
             for axis in ("dp_replicate", "efsdp")
         ],
     }
-    for parameter in _unique_parameters(trainer.model_parts):
+    for parameter in unique_parameters(trainer.model_parts):
         if not parameter.requires_grad or isinstance(parameter, DTensor):
             continue
         for mesh in meshes[id(parameter) in expert_ids]:
@@ -91,7 +91,7 @@ def allreduce_replicated_tp_grads(trainer: Trainer) -> None:
     group = tp_mesh.get_group()
     parameters = [
         param
-        for param in _unique_parameters(trainer.model_parts)
+        for param in unique_parameters(trainer.model_parts)
         if param.requires_grad and id(param) not in sharded_ids
     ]
     if not parameters:
@@ -127,6 +127,23 @@ def check_finite(trainer: Trainer, step_is_finite: torch.Tensor) -> None:
     )
 
 
+def grad_norm_options(trainer: Trainer) -> dict:
+    if getattr(trainer.cfg, "grad_norm_precision", "float32") == "float32":
+        return {}
+    packed_parameters = {}
+    for part in trainer.model_parts:
+        for module in part.modules():
+            if isinstance(module, NpuBaselineGroupedExperts):
+                pair = (module.w1_EFD, module.w3_EFD)
+                if all(parameter.grad is None for parameter in pair):
+                    continue
+                packed_parameters.setdefault(tuple(map(id, pair)), pair)
+    return {
+        "norm_precision": trainer.cfg.grad_norm_precision,
+        "packed_parameters": list(packed_parameters.values()),
+    }
+
+
 def clip_and_check_finite(
     trainer: Trainer,
     *,
@@ -136,8 +153,8 @@ def clip_and_check_finite(
     """Clip gradients and produce one rank-uniform finite-step verdict."""
     trainer.before_gradient_clipping()
     pp_mesh = reduction_meshes.pp_mesh
-    parameters = list(_unique_parameters(trainer.model_parts))
-    expert_ids = _expert_parameter_ids(trainer.model_parts)
+    parameters = list(unique_parameters(trainer.model_parts))
+    expert_ids = expert_parameter_ids(trainer.model_parts)
     expert_parameters = [p for p in parameters if id(p) in expert_ids]
     ep_mesh = (
         trainer.parallel_dims.get_optional_mesh("ep")
@@ -150,18 +167,7 @@ def clip_and_check_finite(
         else None
     )
     tp_sharded_ids = tp_sharded_param_ids(trainer.model_parts) if tp_mesh else set()
-    norm_options = {}
-    if getattr(trainer.cfg, "grad_norm_precision", "float32") != "float32":
-        norm_options["norm_precision"] = trainer.cfg.grad_norm_precision
-        packed_parameters = {}
-        for part in trainer.model_parts:
-            for module in part.modules():
-                if isinstance(module, NpuBaselineGroupedExperts):
-                    pair = (module.w1_EFD, module.w3_EFD)
-                    if all(parameter.grad is None for parameter in pair):
-                        continue
-                    packed_parameters.setdefault(tuple(map(id, pair)), pair)
-        norm_options["packed_parameters"] = list(packed_parameters.values())
+    norm_options = grad_norm_options(trainer)
     grad_norm = clip_grad_norm_(
         parameters,
         max_norm=trainer.cfg.max_norm,

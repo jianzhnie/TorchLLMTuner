@@ -208,6 +208,114 @@ def generate_llm_fqn_per_model_part(
     return module_names_per_stage
 
 
+def build_stage_from_modules(
+    whole_model: nn.Module,
+    pp_mesh: DeviceMesh,
+    device: torch.device,
+    get_mesh: Callable | None,
+    supports_get_mesh: bool,
+    stage_idx: int,
+    module_names: list[str],
+    num_stages: int,
+) -> tuple[PipelineStage, nn.Module]:
+    model = copy.deepcopy(whole_model)
+    modules_to_keep = set(module_names)
+
+    presented = dict(model.named_children())
+    presented_ids = {id(module) for module in presented.values()}
+    for module_name, module_value in presented.items():
+        # Flattened HF children also expose their registered parent for
+        # complete FSDP traversal. Keep that structural parent: replacing
+        # it would discard the parts selected below and their state keys.
+        if any(
+            id(child) in presented_ids
+            for child in module_value.modules()
+            if child is not module_value
+        ):
+            continue
+        # Assigning a container by its own FQN keeps the complete module;
+        # child FQNs below select only a subset of its layers.
+        if module_name in modules_to_keep:
+            continue
+        # Layer-like containers (e.g. "layers.0", "layers.1").
+        if isinstance(module_value, nn.ModuleDict | nn.ModuleList):
+            layers_to_keep = {
+                name.split(".", 1)[1]
+                for name in modules_to_keep
+                if name.startswith(f"{module_name}.")
+            }
+            if layers_to_keep:
+                if isinstance(module_value, nn.ModuleDict):
+                    for layer_name in list(module_value.keys()):
+                        if layer_name not in layers_to_keep:
+                            del module_value[layer_name]
+                elif isinstance(module_value, nn.ModuleList):
+                    indices_to_keep = {
+                        int(idx) for idx in layers_to_keep if idx.isdigit()
+                    }
+                    # add_module with the ORIGINAL index as the key: a
+                    # plain ``nn.ModuleList(kept)`` would renumber the kept
+                    # layers from 0, and two stages' state-dict keys would
+                    # then collide ("layers.0.*" meaning different layers
+                    # on different ranks) in one shared checkpoint.
+                    kept_layers = nn.ModuleList()
+                    for i, layer in enumerate(module_value):
+                        if i in indices_to_keep:
+                            kept_layers.add_module(str(i), layer)
+                    setattr(model, module_name, kept_layers)
+            else:
+                # This stage uses none of the container's layers.
+                if isinstance(module_value, nn.ModuleDict):
+                    setattr(model, module_name, nn.ModuleDict())
+                elif isinstance(module_value, nn.ModuleList):
+                    setattr(model, module_name, nn.ModuleList())
+        # Simple attributes (e.g. "norm", "lm_head") not owned by this stage
+        # are replaced by an Identity so the forward still runs.
+        else:
+            setattr(model, module_name, nn.Identity())
+
+    # Extra top-level modules the model's ``named_children`` override does
+    # not present (e.g. a multimodal encoder registered beside the decoder
+    # on ``HFTransformerModel``). Apply keep-or-blank against the real
+    # ``_modules`` children: a non-owner
+    # gets an Identity, exactly like the decoder parts above. Without
+    # this, the deep copy would leave a live copy on every stage and two
+    # stages' state-dict keys would collide in one checkpoint. A module
+    # listed in NO stage's FQN list is blanked everywhere -- the model's
+    # ``forward`` must tolerate that (the same contract the decoder parts
+    # already impose).
+    presented = dict(model.named_children())
+    presented_ids = {id(module) for module in presented.values()}
+    # named_children() deduplicates module aliases. Every registered name
+    # needs its own ownership decision, including aliases of kept modules.
+    for module_name, module_value in list(model._modules.items()):
+        if module_value is None:
+            continue
+        if module_name in presented or module_name in modules_to_keep:
+            continue
+        # A container that holds the presented parts (the wrapper's inner
+        # HF model) is what the parts live in, not an extra module --
+        # never blank it.
+        if any(
+            id(m) in presented_ids
+            for m in module_value.modules()
+            if m is not module_value
+        ):
+            continue
+        setattr(model, module_name, nn.Identity())
+
+    stage_kwargs = {"group": pp_mesh.get_group()}
+    # ``get_mesh`` was added after PyTorch 2.10. llmtuner passes None because
+    # its stages exchange plain tensors, so omitting it on older releases
+    # has exactly the same semantics.
+    if supports_get_mesh:
+        stage_kwargs["get_mesh"] = get_mesh
+    stage = ComposablePipelineStage(
+        model, stage_idx, num_stages, device, **stage_kwargs
+    )
+    return stage, model
+
+
 def split_model_into_stages(
     whole_model: nn.Module,
     pp_mesh: DeviceMesh,
@@ -248,106 +356,6 @@ def split_model_into_stages(
     supports_get_mesh = "get_mesh" in inspect.signature(PipelineStage).parameters
     if get_mesh is not None and not supports_get_mesh:
         raise ValueError("this PyTorch PipelineStage does not support get_mesh")
-
-    def _build_stage_from_modules(
-        stage_idx: int, module_names: list[str], num_stages: int
-    ) -> tuple[PipelineStage, nn.Module]:
-        model = copy.deepcopy(whole_model)
-        modules_to_keep = set(module_names)
-
-        presented = dict(model.named_children())
-        presented_ids = {id(module) for module in presented.values()}
-        for module_name, module_value in presented.items():
-            # Flattened HF children also expose their registered parent for
-            # complete FSDP traversal. Keep that structural parent: replacing
-            # it would discard the parts selected below and their state keys.
-            if any(
-                id(child) in presented_ids
-                for child in module_value.modules()
-                if child is not module_value
-            ):
-                continue
-            # Assigning a container by its own FQN keeps the complete module;
-            # child FQNs below select only a subset of its layers.
-            if module_name in modules_to_keep:
-                continue
-            # Layer-like containers (e.g. "layers.0", "layers.1").
-            if isinstance(module_value, nn.ModuleDict | nn.ModuleList):
-                layers_to_keep = {
-                    name.split(".", 1)[1]
-                    for name in modules_to_keep
-                    if name.startswith(f"{module_name}.")
-                }
-                if layers_to_keep:
-                    if isinstance(module_value, nn.ModuleDict):
-                        for layer_name in list(module_value.keys()):
-                            if layer_name not in layers_to_keep:
-                                del module_value[layer_name]
-                    elif isinstance(module_value, nn.ModuleList):
-                        indices_to_keep = {
-                            int(idx) for idx in layers_to_keep if idx.isdigit()
-                        }
-                        # add_module with the ORIGINAL index as the key: a
-                        # plain ``nn.ModuleList(kept)`` would renumber the kept
-                        # layers from 0, and two stages' state-dict keys would
-                        # then collide ("layers.0.*" meaning different layers
-                        # on different ranks) in one shared checkpoint.
-                        kept_layers = nn.ModuleList()
-                        for i, layer in enumerate(module_value):
-                            if i in indices_to_keep:
-                                kept_layers.add_module(str(i), layer)
-                        setattr(model, module_name, kept_layers)
-                else:
-                    # This stage uses none of the container's layers.
-                    if isinstance(module_value, nn.ModuleDict):
-                        setattr(model, module_name, nn.ModuleDict())
-                    elif isinstance(module_value, nn.ModuleList):
-                        setattr(model, module_name, nn.ModuleList())
-            # Simple attributes (e.g. "norm", "lm_head") not owned by this stage
-            # are replaced by an Identity so the forward still runs.
-            else:
-                setattr(model, module_name, nn.Identity())
-
-        # Extra top-level modules the model's ``named_children`` override does
-        # not present (e.g. a multimodal encoder registered beside the decoder
-        # on ``HFTransformerModel``). Apply keep-or-blank against the real
-        # ``_modules`` children: a non-owner
-        # gets an Identity, exactly like the decoder parts above. Without
-        # this, the deep copy would leave a live copy on every stage and two
-        # stages' state-dict keys would collide in one checkpoint. A module
-        # listed in NO stage's FQN list is blanked everywhere -- the model's
-        # ``forward`` must tolerate that (the same contract the decoder parts
-        # already impose).
-        presented = dict(model.named_children())
-        presented_ids = {id(module) for module in presented.values()}
-        # named_children() deduplicates module aliases. Every registered name
-        # needs its own ownership decision, including aliases of kept modules.
-        for module_name, module_value in list(model._modules.items()):
-            if module_value is None:
-                continue
-            if module_name in presented or module_name in modules_to_keep:
-                continue
-            # A container that holds the presented parts (the wrapper's inner
-            # HF model) is what the parts live in, not an extra module --
-            # never blank it.
-            if any(
-                id(m) in presented_ids
-                for m in module_value.modules()
-                if m is not module_value
-            ):
-                continue
-            setattr(model, module_name, nn.Identity())
-
-        stage_kwargs = {"group": pp_mesh.get_group()}
-        # ``get_mesh`` was added after PyTorch 2.10. llmtuner passes None because
-        # its stages exchange plain tensors, so omitting it on older releases
-        # has exactly the same semantics.
-        if supports_get_mesh:
-            stage_kwargs["get_mesh"] = get_mesh
-        stage = ComposablePipelineStage(
-            model, stage_idx, num_stages, device, **stage_kwargs
-        )
-        return stage, model
 
     num_stages = len(module_names_per_stage)
     stages = []
@@ -397,7 +405,12 @@ def split_model_into_stages(
 
     for stage_idx in stage_indices:
         module_names = module_names_per_stage[stage_idx]
-        stage, model_chunk = _build_stage_from_modules(
+        stage, model_chunk = build_stage_from_modules(
+            whole_model,
+            pp_mesh,
+            device,
+            get_mesh,
+            supports_get_mesh,
             stage_idx,
             module_names,
             num_stages,

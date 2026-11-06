@@ -156,6 +156,16 @@ def _has_projection_weight(module: object) -> bool:
     return isinstance(weight, torch.Tensor) and weight.dim() == 2
 
 
+def _validate_silu_activation(experts: nn.Module) -> None:
+    act_fn = getattr(experts, "act_fn", None)
+    if act_fn is not None and not isinstance(act_fn, nn.SiLU | SiLUActivation):
+        raise NotImplementedError(
+            f"Expert activation {type(act_fn).__name__} is not SiLU; the swap "
+            "would silently change the experts' nonlinearity. Wire the "
+            "activation through GroupedExperts first."
+        )
+
+
 def per_expert_projection_names(experts: nn.Module) -> tuple[str, str, str] | None:
     """The (gate, up, down) attribute spelling of a per-expert module list.
 
@@ -218,13 +228,7 @@ def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None
         ups: list[torch.Tensor] = []
         downs: list[torch.Tensor] = []
         for expert in members:
-            act_fn = getattr(expert, "act_fn", None)
-            if act_fn is not None and not isinstance(act_fn, nn.SiLU | SiLUActivation):
-                raise NotImplementedError(
-                    f"Expert activation {type(act_fn).__name__} is not SiLU; "
-                    "the swap would silently change the experts' nonlinearity. "
-                    "Wire the activation through GroupedExperts first."
-                )
+            _validate_silu_activation(expert)
             for name in (gate_name, up_name, down_name):
                 if getattr(getattr(expert, name), "bias", None) is not None:
                     raise NotImplementedError(
@@ -319,13 +323,7 @@ def fused_experts_of(block: nn.Module) -> FusedExperts | None:
     # GroupedExperts hard-codes SwiGLU; every supported family activates with
     # silu today, but the probe must say so rather than let a future HF family
     # with a different gated activation be swapped in silently.
-    act_fn = getattr(experts, "act_fn", None)
-    if act_fn is not None and not isinstance(act_fn, nn.SiLU | SiLUActivation):
-        raise NotImplementedError(
-            f"Expert activation {type(act_fn).__name__} is not SiLU; the swap "
-            "would silently change the experts' nonlinearity. Wire the "
-            "activation through GroupedExperts first."
-        )
+    _validate_silu_activation(experts)
     if hasattr(experts, "gate_up_proj_bias") or hasattr(experts, "down_proj_bias"):
         compatibility.gpt_oss_layout(experts)
     num_experts, double_hidden, dim = gate_up.shape

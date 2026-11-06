@@ -21,6 +21,18 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 from ..architecture import get_model_architecture
 from .attention_backend import ATTENTION_BACKEND
 
+_RUNTIME_CONFIG_FIELDS = (
+    "attn_mask_type",
+    "experts_implementation",
+    "compute_dtype",
+    "norm_backend",
+    "qkv_projection",
+    "rotary_init_device",
+    "rotary_compute_dtype",
+    "rotary_cache_dtype",
+    "attention_backend",
+)
+
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
 
@@ -83,6 +95,18 @@ def build_model_config(
     return config
 
 
+def apply_runtime_config(config: PretrainedConfig, cfg: LLMTunerConfig) -> None:
+    config.attn_mask_type = cfg.dataloader.attention_mask_type()
+    config.experts_implementation = getattr(cfg, "experts_implementation", "native")
+    config.compute_dtype = getattr(cfg, "compute_dtype", None)
+    config.norm_backend = cfg.norm_backend
+    config.qkv_projection = cfg.qkv_projection
+    config.rotary_init_device = cfg.rotary_init_device
+    config.rotary_compute_dtype = cfg.model.rotary_compute_dtype
+    config.rotary_cache_dtype = cfg.model.rotary_cache_dtype
+    config.attention_backend = cfg.attention_backend
+
+
 def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
     """Build architecture and runtime settings for a training run.
 
@@ -125,19 +149,7 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
     # masking. ``max_num_documents=1`` is the deliberate tensor-attention path:
     # one padded SFT document per row needs only ordinary causality, which lets
     # NPU/SDPA train without allowing attention across sample boundaries.
-    config.attn_mask_type = cfg.dataloader.attention_mask_type()
-    # The requested HF experts kernel travels on the config; the wrapper
-    # validates settable-ness against the resolved model class at build time.
-    config.experts_implementation = getattr(cfg, "experts_implementation", "native")
-    # Same ride for the lm_head compute-dtype cast: the wrapper applies it at
-    # build time, and None (the default) means no cast.
-    config.compute_dtype = getattr(cfg, "compute_dtype", None)
-    config.norm_backend = cfg.norm_backend
-    config.qkv_projection = cfg.qkv_projection
-    config.rotary_init_device = cfg.rotary_init_device
-    config.rotary_compute_dtype = cfg.model.rotary_compute_dtype
-    config.rotary_cache_dtype = cfg.model.rotary_cache_dtype
-    config.attention_backend = cfg.attention_backend
+    apply_runtime_config(config, cfg)
     return config
 
 
@@ -154,17 +166,7 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
     text_config._attn_implementation = ATTENTION_BACKEND
     # Runtime settings originate on the composite config. The text model must
     # see the same mask policy and kernels after unwrapping.
-    for name in (
-        "attn_mask_type",
-        "experts_implementation",
-        "compute_dtype",
-        "norm_backend",
-        "qkv_projection",
-        "rotary_init_device",
-        "rotary_compute_dtype",
-        "rotary_cache_dtype",
-        "attention_backend",
-    ):
+    for name in _RUNTIME_CONFIG_FIELDS:
         if hasattr(config, name):
             setattr(text_config, name, getattr(config, name))
     if not getattr(text_config, "architectures", None):

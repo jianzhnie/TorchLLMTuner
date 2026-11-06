@@ -57,7 +57,7 @@ MoEReplacementObserver = Callable[
 ]
 
 
-def _bind_shared_projection(
+def bind_shared_projection(
     owner: nn.Module,
     names: tuple[str, ...],
     sources: tuple[torch.Tensor, ...],
@@ -136,7 +136,7 @@ def _bind_shared_projection(
         setattr(owner, name, parameter)
 
 
-def _plan_tp_checkpoint_layouts(
+def plan_tp_checkpoint_layouts(
     module_paths: list[tuple[str, nn.Module]],
     candidates: list[tuple[nn.Module, str, nn.Module, bool]],
     converted_blocks: dict[int, MoE],
@@ -208,7 +208,7 @@ def _plan_tp_checkpoint_layouts(
     return converted_layouts
 
 
-def _validate_kimi_expert_aliases(
+def validate_kimi_expert_aliases(
     candidates: list[tuple[nn.Module, str, nn.Module, bool]],
     module_paths: list[tuple[str, nn.Module]],
     external_parameters: dict[int, list[str]],
@@ -257,7 +257,7 @@ def _validate_kimi_expert_aliases(
                 )
 
 
-def _find_moe_candidates(
+def find_moe_candidates(
     model: nn.Module, layers: Iterable[nn.Module], hf_config: Any
 ) -> list[tuple[nn.Module, str, nn.Module, bool]]:
     """Inspect every decoder layer before allocating replacement modules."""
@@ -288,6 +288,25 @@ def _find_moe_candidates(
             "in parallel/expert_parallel/hf_inspection.py."
         )
     return candidates
+
+
+def external_state_owners(
+    module_paths: list[tuple[str, nn.Module]], replaced_roots: list[str]
+) -> tuple[dict[int, list[str]], dict[int, list[str]]]:
+    external_parameters: dict[int, list[str]] = {}
+    external_buffers: dict[int, list[str]] = {}
+    for path, module in module_paths:
+        if any(path == root or path.startswith(f"{root}.") for root in replaced_roots):
+            continue
+        for name, parameter in module.named_parameters(
+            recurse=False, remove_duplicate=False
+        ):
+            fqn = f"{path}.{name}" if path else name
+            external_parameters.setdefault(id(parameter), []).append(fqn)
+        for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False):
+            fqn = f"{path}.{name}" if path else name
+            external_buffers.setdefault(id(buffer), []).append(fqn)
+    return external_parameters, external_buffers
 
 
 def swap_hf_moe_blocks(
@@ -383,7 +402,7 @@ def swap_hf_moe_blocks(
 
     # Complete preflight before constructing replacements so unsupported later
     # layers cannot leave earlier ones converted.
-    candidates = _find_moe_candidates(model, layers, hf_config)
+    candidates = find_moe_candidates(model, layers, hf_config)
 
     module_paths = list(model.named_modules(remove_duplicate=False))
     # Index owners once; retain every registered path for aliased decoder layers.
@@ -395,19 +414,9 @@ def swap_hf_moe_blocks(
         for path, module in module_paths
         for attr in candidate_attrs.get(id(module), ())
     ]
-    external_parameters: dict[int, list[str]] = {}
-    external_buffers: dict[int, list[str]] = {}
-    for path, module in module_paths:
-        if any(path == root or path.startswith(f"{root}.") for root in replaced_roots):
-            continue
-        for name, parameter in module.named_parameters(
-            recurse=False, remove_duplicate=False
-        ):
-            fqn = f"{path}.{name}" if path else name
-            external_parameters.setdefault(id(parameter), []).append(fqn)
-        for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False):
-            fqn = f"{path}.{name}" if path else name
-            external_buffers.setdefault(id(buffer), []).append(fqn)
+    external_parameters, external_buffers = external_state_owners(
+        module_paths, replaced_roots
+    )
 
     replacements: list[tuple[nn.Module, str, MoE]] = []
     converted_blocks: dict[int, MoE] = {}
@@ -420,7 +429,7 @@ def swap_hf_moe_blocks(
     )
     converted_biases: dict[int, torch.Tensor] = {}
     aux_group_counts = dict(AuxLoss._group_counts)
-    _validate_kimi_expert_aliases(candidates, module_paths, external_parameters)
+    validate_kimi_expert_aliases(candidates, module_paths, external_parameters)
     try:
         for layer, attr, block, wants_router_logits in candidates:
             # Repeated layer slots may reference one physical HF block. Preserve
@@ -501,7 +510,7 @@ def swap_hf_moe_blocks(
                     )
                 )
             for owner, names, sources in projections:
-                _bind_shared_projection(
+                bind_shared_projection(
                     owner,
                     names,
                     sources,
@@ -539,7 +548,7 @@ def swap_hf_moe_blocks(
             moe.returns_router_logits = wants_router_logits
             converted_blocks[id(block)] = moe
             replacements.append((layer, attr, moe))
-        converted_layouts = _plan_tp_checkpoint_layouts(
+        converted_layouts = plan_tp_checkpoint_layouts(
             module_paths, candidates, converted_blocks, replaced_roots
         )
 

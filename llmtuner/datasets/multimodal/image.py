@@ -366,8 +366,8 @@ def calculate_vision_tokens(
             f"spatial_merge_size={factor}; got ({height}, {width})"
         )
     t_patches = (num_frames + temporal_patch_size - 1) // temporal_patch_size
-    tokens_per_row = width // (patch_size * spatial_merge_size)
-    num_rows = height // (patch_size * spatial_merge_size)
+    tokens_per_row = width // factor
+    num_rows = height // factor
     total_tokens = t_patches * tokens_per_row * num_rows
     return total_tokens, tokens_per_row, num_rows
 

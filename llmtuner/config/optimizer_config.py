@@ -28,6 +28,29 @@ class ParamGroupConfig:
     "initial_lr is allowed as scheduler metadata."
 
 
+def validated_betas(value: list[float]) -> tuple[float, ...]:
+    try:
+        betas = tuple(value)
+    except TypeError as error:
+        raise ConfigError(
+            "optimizer.betas must contain two numeric entries; "
+            "pass both: --betas 0.9 0.95."
+        ) from error
+    if len(betas) != 2:
+        raise ConfigError(
+            f"optimizer.betas must have exactly 2 entries (beta1, beta2), "
+            f"got {len(betas)}: {betas}. Pass both: --betas 0.9 0.95."
+        )
+    if not all(
+        isinstance(beta, int | float)
+        and not isinstance(beta, bool)
+        and 0.0 <= beta < 1.0
+        for beta in betas
+    ):
+        raise ConfigError(f"optimizer.betas must each be in [0, 1), got {betas}")
+    return betas
+
+
 @dataclass
 class OptimizerConfig:
     """Default AdamW options and explicit optimizer parameter groups."""
@@ -153,26 +176,7 @@ class OptimizerConfig:
         # Normalizing here makes that unreachable, and the length
         # check is what turns a typo like ``--betas 0.9`` into an error rather
         # than a one-element betas that torch rejects deep in a step.
-        try:
-            betas = tuple(self.betas)
-        except TypeError as error:
-            raise ConfigError(
-                "optimizer.betas must contain two numeric entries; "
-                "pass both: --betas 0.9 0.95."
-            ) from error
-        if len(betas) != 2:
-            raise ConfigError(
-                f"optimizer.betas must have exactly 2 entries (beta1, beta2), "
-                f"got {len(betas)}: {betas}. Pass both: --betas 0.9 0.95."
-            )
-        if not all(
-            isinstance(beta, int | float)
-            and not isinstance(beta, bool)
-            and 0.0 <= beta < 1.0
-            for beta in betas
-        ):
-            raise ConfigError(f"optimizer.betas must each be in [0, 1), got {betas}")
-        self.betas = betas
+        self.betas = validated_betas(self.betas)
 
         for name in ("learning_rate", "weight_decay", "eps"):
             value = getattr(self, name)

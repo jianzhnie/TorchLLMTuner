@@ -125,14 +125,9 @@ class CheckpointConfig:
     "torch_checkpointing."
 
     def __post_init__(self) -> None:
-        if self.sharded_tensor_parallel and self.backend != "dcp":
-            raise ConfigError(
-                "checkpoint.sharded_tensor_parallel requires backend='dcp'"
-            )
-        if self.sharded_expert_parallel and self.backend != "dcp":
-            raise ConfigError(
-                "checkpoint.sharded_expert_parallel requires backend='dcp'"
-            )
+        for name in ("sharded_tensor_parallel", "sharded_expert_parallel"):
+            if getattr(self, name) and self.backend != "dcp":
+                raise ConfigError(f"checkpoint.{name} requires backend='dcp'")
         if not self.folder.strip():
             raise ConfigError("checkpoint.folder must not be empty.")
         if self.backend not in ("dcp", "torch_checkpointing"):

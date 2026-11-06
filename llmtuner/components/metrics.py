@@ -605,6 +605,48 @@ class MetricsProcessor:
         self.step_last_log = step
         self.device_memory_monitor.reset_peak_stats()
 
+    @staticmethod
+    def training_console_details(
+        global_max_loss: float,
+        observed: dict[str, Any],
+        device_mem_stats: DeviceMemStats,
+        default_loading_seconds: float,
+        default_loading_percent: float,
+    ) -> list[str]:
+        details = [f"max_loss: {global_max_loss:.5f}"]
+        loading_seconds = observed.get(
+            "train/data_loading_rank_max_seconds", default_loading_seconds
+        )
+        loading_percent = observed.get(
+            "train/data_loading_rank_max_percent", default_loading_percent
+        )
+        details.append(f"data: {loading_seconds:.3f}s({loading_percent:.1f}%)")
+        if "train/global_valid_targets" in observed:
+            details.append(
+                f"global_tokens: {int(observed['train/global_tokens']):,} "
+                f"valid_targets: {int(observed['train/global_valid_targets']):,}"
+            )
+        details.append(
+            f"alloc_retries: {device_mem_stats.num_alloc_retries} "
+            f"ooms: {device_mem_stats.num_ooms}"
+        )
+        if "steady/samples" in observed:
+            details.append(
+                f"steady[n={int(observed['steady/samples'])}]: "
+                f"p50={observed['steady/step_p50_seconds']:.3f}s "
+                f"p90={observed['steady/step_p90_seconds']:.3f}s "
+                f"tps={observed['steady/tps_per_device']:.1f}/device"
+            )
+            if "steady/mfu_percent" in observed:
+                details.append(f"steady_mfu: {observed['steady/mfu_percent']:.2f}%")
+        details.extend(
+            f"{key}={value:.4g}"
+            for key, value in observed.items()
+            if key.startswith(("aux_loss/", "moe/", "swap/", "checkpoint/"))
+            or ("loss" in key.lower() and key.endswith("/mean"))
+        )
+        return details
+
     def log(
         self,
         step: int,
@@ -710,37 +752,12 @@ class MetricsProcessor:
             if self.num_trainable_parameters is None
             else f"{self.num_trainable_parameters / 1e9:.6f}B"
         )
-        details = [f"max_loss: {global_max_loss:.5f}"]
-        loading_seconds = observed.get(
-            "train/data_loading_rank_max_seconds", derived.time_data_loading
-        )
-        loading_percent = observed.get(
-            "train/data_loading_rank_max_percent", derived.time_data_loading_pct
-        )
-        details.append(f"data: {loading_seconds:.3f}s({loading_percent:.1f}%)")
-        if "train/global_valid_targets" in observed:
-            details.append(
-                f"global_tokens: {int(observed['train/global_tokens']):,} "
-                f"valid_targets: {int(observed['train/global_valid_targets']):,}"
-            )
-        details.append(
-            f"alloc_retries: {device_mem_stats.num_alloc_retries} "
-            f"ooms: {device_mem_stats.num_ooms}"
-        )
-        if "steady/samples" in observed:
-            details.append(
-                f"steady[n={int(observed['steady/samples'])}]: "
-                f"p50={observed['steady/step_p50_seconds']:.3f}s "
-                f"p90={observed['steady/step_p90_seconds']:.3f}s "
-                f"tps={observed['steady/tps_per_device']:.1f}/device"
-            )
-            if "steady/mfu_percent" in observed:
-                details.append(f"steady_mfu: {observed['steady/mfu_percent']:.2f}%")
-        details.extend(
-            f"{key}={value:.4g}"
-            for key, value in observed.items()
-            if key.startswith(("aux_loss/", "moe/", "swap/", "checkpoint/"))
-            or ("loss" in key.lower() and key.endswith("/mean"))
+        details = self.training_console_details(
+            global_max_loss,
+            observed,
+            device_mem_stats,
+            derived.time_data_loading,
+            derived.time_data_loading_pct,
         )
         # A single pre-built message rather than a format string plus arguments:
         # the colour codes are already interpolated, so passing them as logging

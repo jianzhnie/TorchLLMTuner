@@ -14,6 +14,43 @@ def text_positions(text_len: int, offset: int) -> torch.Tensor:
     return torch.arange(text_len).view(1, -1).expand(3, -1) + offset
 
 
+def validate_inputs(
+    tokens: torch.Tensor,
+    grid_thw: torch.Tensor | None,
+    grid_thw_videos: torch.Tensor | None,
+    positions: torch.Tensor | None,
+    spatial_merge_size: int,
+    patch_order: Literal["block", "raster"],
+) -> None:
+    if (
+        not isinstance(spatial_merge_size, int)
+        or isinstance(spatial_merge_size, bool)
+        or spatial_merge_size < 1
+    ):
+        raise ValueError(
+            f"spatial_merge_size must be positive integer, got {spatial_merge_size!r}"
+        )
+    if tokens.ndim != 1:
+        raise ValueError("MRoPE tokens must be one-dimensional")
+    if positions is not None and positions.shape != tokens.shape:
+        raise ValueError("MRoPE positions must match the one-dimensional token shape")
+    for name, grid in (("grid_thw", grid_thw), ("grid_thw_videos", grid_thw_videos)):
+        if grid is None:
+            continue
+        if grid.ndim != 2 or grid.shape[1] != 3:
+            raise ValueError(f"MRoPE {name} must have shape (num_media, 3)")
+        if grid.dtype not in (torch.int32, torch.int64) or bool((grid <= 0).any()):
+            raise ValueError(f"MRoPE {name} must contain positive integer dimensions")
+    # MRoPE position IDs are laid out in block order; a raster patch order
+    # would desync them from the patch sequence.
+    if patch_order != "block":
+        raise ValueError(f"MRoPE requires patch_order='block', got {patch_order!r}.")
+    if tokens.numel() == 0 and any(
+        grid is not None and grid.numel() for grid in (grid_thw, grid_thw_videos)
+    ):
+        raise ValueError("MRoPE media/grid mismatch: empty tokens have media grids")
+
+
 def build_mrope_positions(
     tokens: torch.Tensor,
     grid_thw: torch.Tensor | None,
@@ -44,35 +81,15 @@ def build_mrope_positions(
     Returns:
         (num_tokens, 3) MRoPE position IDs.
     """
-    if (
-        not isinstance(spatial_merge_size, int)
-        or isinstance(spatial_merge_size, bool)
-        or spatial_merge_size < 1
-    ):
-        raise ValueError(
-            f"spatial_merge_size must be positive integer, got {spatial_merge_size!r}"
-        )
-    if tokens.ndim != 1:
-        raise ValueError("MRoPE tokens must be one-dimensional")
-    if positions is not None and positions.shape != tokens.shape:
-        raise ValueError("MRoPE positions must match the one-dimensional token shape")
-    for name, grid in (("grid_thw", grid_thw), ("grid_thw_videos", grid_thw_videos)):
-        if grid is None:
-            continue
-        if grid.ndim != 2 or grid.shape[1] != 3:
-            raise ValueError(f"MRoPE {name} must have shape (num_media, 3)")
-        if grid.dtype not in (torch.int32, torch.int64) or bool((grid <= 0).any()):
-            raise ValueError(f"MRoPE {name} must contain positive integer dimensions")
-    # MRoPE position IDs are laid out in block order; a raster patch order
-    # would desync them from the patch sequence.
-    if patch_order != "block":
-        raise ValueError(f"MRoPE requires patch_order='block', got {patch_order!r}.")
-
+    validate_inputs(
+        tokens,
+        grid_thw,
+        grid_thw_videos,
+        positions,
+        spatial_merge_size,
+        patch_order,
+    )
     if tokens.numel() == 0:
-        if any(
-            grid is not None and grid.numel() for grid in (grid_thw, grid_thw_videos)
-        ):
-            raise ValueError("MRoPE media/grid mismatch: empty tokens have media grids")
         return tokens.new_empty((0, 3))
 
     # Transformers splits Qwen3.5 video grids into per-frame entries because

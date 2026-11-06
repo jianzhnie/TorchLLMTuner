@@ -102,6 +102,29 @@ def fused_kernel_device_types() -> frozenset[str]:
     return frozenset(_get_fused_kernels_supported_devices())
 
 
+def disable_unsupported_fused_npu_updates(
+    optimizer_name: str, param_groups: list[dict[str, Any]]
+) -> None:
+    if device_type != "npu" or optimizer_name not in ("Adam", "AdamW", "AdamWSwap"):
+        return
+    # The upstream fused-device list is shared by Adam/AdamW, but vendor
+    # registrations may implement only one. In particular, NPU Adam otherwise
+    # silently copies to CPU.
+    operator = (
+        "aten::_fused_adam_" if optimizer_name == "Adam" else "aten::_fused_adamw_"
+    )
+    if torch._C._dispatch_has_kernel_for_dispatch_key(operator, "PrivateUse1"):
+        return
+    for group in param_groups:
+        if group.get("fused"):
+            logger.info(
+                "%s has no native fused NPU kernel; using for-loop to avoid "
+                "CPU fallback.",
+                optimizer_name,
+            )
+            group["fused"] = False
+
+
 class OptimizersContainer(Optimizer, Stateful):
     """One optimizer per (model part, optimizer name), driven as a single one.
 
@@ -255,29 +278,7 @@ class OptimizersContainer(Optimizer, Stateful):
 
             for part_idx, groups_by_opt_name in enumerate(model_group_plans):
                 for opt_name, groups in groups_by_opt_name.items():
-                    # The upstream fused-device list is shared by Adam/AdamW,
-                    # but vendor registrations may implement only one. In
-                    # particular, NPU Adam otherwise silently copies to CPU.
-                    if (
-                        opt_name in ("Adam", "AdamW", "AdamWSwap")
-                        and device_type == "npu"
-                    ):
-                        operator = (
-                            "aten::_fused_adam_"
-                            if opt_name == "Adam"
-                            else "aten::_fused_adamw_"
-                        )
-                        if not torch._C._dispatch_has_kernel_for_dispatch_key(
-                            operator, "PrivateUse1"
-                        ):
-                            for group in groups.param_groups:
-                                if group.get("fused"):
-                                    logger.info(
-                                        "%s has no native fused NPU kernel; "
-                                        "using for-loop to avoid CPU fallback.",
-                                        opt_name,
-                                    )
-                                    group["fused"] = False
+                    disable_unsupported_fused_npu_updates(opt_name, groups.param_groups)
                     optimizer = optimizer_factories[opt_name](groups.param_groups)
                     # PyTorch accepts arbitrary group metadata, so misspelled
                     # update options otherwise silently leave defaults active.

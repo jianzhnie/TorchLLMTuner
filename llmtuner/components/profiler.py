@@ -18,7 +18,7 @@ import time
 from contextlib import suppress
 from tempfile import NamedTemporaryFile
 from threading import RLock
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 from weakref import WeakSet
 
 import torch
@@ -174,6 +174,18 @@ class MemoryProfiler:
                     stop_memory_history()
                 self._history_owners.discard(self)
                 self._records_history = False
+
+
+def profiler_activities(profiler_api: Any) -> list[Any]:
+    activities = [profiler_api.ProfilerActivity.CPU]
+    if device_type == "cuda":
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    elif device_type == "xpu":
+        # Follow the resolved device rather than assuming CUDA or a CPU-only trace.
+        activities.append(torch.profiler.ProfilerActivity.XPU)
+    elif device_type == "npu":
+        activities.append(profiler_api.ProfilerActivity.NPU)
+    return activities
 
 
 class Profiler:
@@ -358,17 +370,7 @@ class Profiler:
                 raw_trace_handler(prof)
                 trace_handler(prof)
 
-        activities = [profiler_api.ProfilerActivity.CPU]
-        if device_type == "cuda":
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-        elif device_type == "xpu":
-            # Upstream's second branch. The device is resolved once in
-            # ``accelerator/device.py``, where ``xpu`` is one of five
-            # accelerators, so following the resolved device is what keeps a
-            # trace from being CPU-only on a device the run actually uses.
-            activities.append(torch.profiler.ProfilerActivity.XPU)
-        elif device_type == "npu":
-            activities.append(profiler_api.ProfilerActivity.NPU)
+        activities = profiler_activities(profiler_api)
 
         schedule = profiler_api.schedule(
             wait=wait,
