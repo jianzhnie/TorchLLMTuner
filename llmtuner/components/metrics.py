@@ -1,15 +1,15 @@
-"""Training metric sinks, device-memory sampling, and console reporting.
+"""Training metric processing, device-memory sampling, and console reporting.
 
 Adapted from torchtitan's ``observability/metrics.py``. Compute arithmetic lives
-in ``compute_metrics``; synchronized per-step and steady-window observations live
-in ``training_observer``. This module retains legacy log-window metrics for
+here; synchronized per-step and steady-window observations live in
+``trainer.runtime.training_observer``. This module retains legacy log-window metrics for
 existing consumers and publishes the synchronized observations when available.
 
 Logging performs no collectives. The trainer synchronizes pipeline loss metrics
 before reporting; writer ownership and console rank filtering are independent.
 Unknown device peaks suppress MFU, and empty loading windows report zero.
-Each external sink owns its resources and propagates configuration/runtime
-failures instead of silently disabling tracking.
+External sinks live in ``metric_loggers`` and are re-exported here for existing
+callers. Each owns its resources and propagates configuration/runtime failures.
 """
 
 from __future__ import annotations
@@ -29,6 +29,12 @@ from torch.distributed.pipelining.schedules import (
 
 from ..accelerator.device import device_module, device_type
 from ..utils.logging import get_distributed_rank, get_logger
+from ..utils.metric_loggers import (
+    BaseLogger,
+    LoggerContainer,
+    TensorBoardLogger,
+    WandBLogger,
+)
 from ..utils.monitoring import (
     Color,
     NoColor,
@@ -37,25 +43,13 @@ from ..utils.monitoring import (
     get_device_name,
     get_peak_flops,
 )
-from .compute_metrics import compute_utilization, model_tflops, token_throughput
-
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except ImportError as error:
-    SummaryWriter = None
-    TENSORBOARD_IMPORT_ERROR = error
-
-try:
-    import wandb
-except ImportError as error:
-    wandb = None
-    WANDB_IMPORT_ERROR = error
 
 if TYPE_CHECKING:
     # Annotation-only. ``parallel_dims`` imports the training config, which
     # imports the checkpointer, so importing it for real here would close a
     # cycle back into the components package that only exists to name a type.
     from ..config.observability_config import MetricsConfig
+    from ..config.training_config import TrainingConfig
     from ..parallel.topology import ParallelTopology
 
 # llmtuner configures handlers per module, rather than on the root logger the
@@ -73,7 +67,64 @@ __all__ = [
     "WandBLogger",
     "build_device_memory_monitor",
     "get_metrics_rank",
+    "compute_utilization",
+    "configured_tokens_per_step",
+    "model_tflops",
+    "token_throughput",
 ]
+
+
+def token_throughput(
+    num_tokens: int, elapsed_seconds: float, *, replication_degree: int = 1
+) -> float:
+    """Normalize counted tokens by time and duplicated TP/CP/PP token streams.
+
+    For rank-local loader counts, replication_degree=TP*CP*PP yields average
+    per-device throughput. For unique global tokens use replication_degree=1.
+    EP overlays the dense mesh and is never another multiplier or divisor.
+    """
+    return num_tokens / (elapsed_seconds * replication_degree)
+
+
+def configured_tokens_per_step(config: TrainingConfig) -> int:
+    """Global padded tokens consumed by one complete optimizer update.
+
+    Each accumulation group reads a full global batch; PP microbatches only
+    split that batch and TP/CP/EP do not introduce independent input tokens.
+    """
+    return (
+        config.global_batch_size
+        * config.max_seq_len
+        * config.gradient_accumulation_steps
+    )
+
+
+def model_tflops(flops_per_token: int, tokens_per_second: float) -> float:
+    """Model TFLOPS for the same global or per-device scope as tokens/s.
+
+    FLOPs/token describes model forward/backward work, excluding AC recompute.
+    Callers own timing synchronization and the throughput's device scope.
+    """
+    return flops_per_token * tokens_per_second / 1e12
+
+
+def compute_utilization(
+    *,
+    tokens_per_second: float,
+    flops_per_token: int,
+    peak_flops_per_device: float,
+    world_size: int,
+) -> dict[str, float | None]:
+    """Convert global throughput into TFLOPS and peak-compute utilization."""
+    if flops_per_token <= 0 or peak_flops_per_device <= 0 or world_size <= 0:
+        return {"tflops": None, "peak_tflops": None, "utilization_percent": None}
+    tflops = model_tflops(flops_per_token, tokens_per_second)
+    peak_tflops = peak_flops_per_device * world_size / 1e12
+    return {
+        "tflops": tflops,
+        "peak_tflops": peak_tflops,
+        "utilization_percent": 100 * tflops / peak_tflops,
+    }
 
 
 DeviceMemStats = namedtuple(
@@ -186,138 +237,6 @@ def build_device_memory_monitor() -> DeviceMemoryMonitor:
             monitor.device_capacity_gib,
         )
     return monitor
-
-
-class BaseLogger:
-    """A sink that takes metrics. Logging nothing is a valid implementation."""
-
-    def log(self, metrics: dict[str, Any], step: int) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
-
-
-class TensorBoardLogger(BaseLogger):
-    """Writes scalars to a TensorBoard event directory."""
-
-    def __init__(self, log_dir: str, tag: str | None = None):
-        if SummaryWriter is None:
-            raise ImportError(
-                "TensorBoard logging requires the tensorboard package"
-            ) from TENSORBOARD_IMPORT_ERROR
-
-        self.tag = tag
-        self.writer = SummaryWriter(log_dir, max_queue=1000)
-        logger.info("TensorBoard logging enabled. Logs will be saved at %s", log_dir)
-
-    def log(self, metrics: dict[str, Any], step: int) -> None:
-        for key, value in metrics.items():
-            tag = key if self.tag is None else f"{self.tag}/{key}"
-            self.writer.add_scalar(tag, value, step)
-
-    def close(self) -> None:
-        self.writer.close()
-
-
-class WandBLogger(BaseLogger):
-    """Streams metrics to Weights & Biases.
-
-    Experiment identity comes from the environment, matching torchtitan. That is
-    deliberate for a launcher-driven tool: ``WANDB_RUN_ID`` and ``WANDB_RESUME_FROM``
-    are how a requeued job rejoins its own run, and reading them from the
-    environment means a launcher can set them without touching the config.
-    Each logger creates and owns a separate run; closing it leaves existing
-    runs alive. This requires WandB support for ``reinit="create_new"``.
-    """
-
-    def __init__(
-        self,
-        log_dir: str,
-        config_dict: dict[str, Any] | None = None,
-        tag: str | None = None,
-    ):
-        if wandb is None:
-            raise ImportError(
-                "WandB logging requires the wandb package"
-            ) from WANDB_IMPORT_ERROR
-
-        self.tag = tag
-
-        os.makedirs(log_dir, exist_ok=True)
-        self.run = wandb.init(
-            reinit="create_new",
-            entity=os.getenv("WANDB_TEAM"),
-            project=os.getenv("WANDB_PROJECT", "llmtuner"),
-            name=os.getenv("WANDB_RUN_NAME"),
-            id=os.getenv("WANDB_RUN_ID"),
-            notes=os.getenv("WANDB_RUN_NOTES"),
-            tags=[
-                tag.strip()
-                for tag in os.getenv("WANDB_RUN_TAGS", "").split(",")
-                if tag.strip()
-            ]
-            or None,
-            group=os.getenv("WANDB_RUN_GROUP"),
-            job_type=os.getenv("WANDB_RUN_JOB_TYPE"),
-            resume_from=os.getenv("WANDB_RESUME_FROM"),
-            fork_from=os.getenv("WANDB_FORK_FROM"),
-            dir=log_dir,
-            config=config_dict,
-        )
-        logger.info("WandB logging enabled")
-
-    def log(self, metrics: dict[str, Any], step: int) -> None:
-        prefixed = {
-            key if self.tag is None else f"{self.tag}/{key}": value
-            for key, value in metrics.items()
-        }
-        # commit=True: without it wandb treats an explicit step as a partial
-        # record and holds it open, so a metric logged once per step can be
-        # merged into (or overwritten by) the next one.
-        if self.run is None:
-            raise RuntimeError("WandBLogger is closed")
-        self.run.log(prefixed, step=step, commit=True)
-
-    def close(self) -> None:
-        if self.run is not None:
-            self.run.finish()
-            self.run = None
-
-
-class LoggerContainer(BaseLogger):
-    """Fans one ``log`` call out to every enabled sink."""
-
-    def __init__(self) -> None:
-        self._loggers: list[BaseLogger] = []
-
-    def add_logger(self, logger_instance: BaseLogger) -> None:
-        self._loggers.append(logger_instance)
-
-    @property
-    def number_of_loggers(self) -> int:
-        return len(self._loggers)
-
-    def log(self, metrics: dict[str, Any], step: int) -> None:
-        for logger_instance in self._loggers:
-            logger_instance.log(metrics, step)
-
-    def close(self) -> None:
-        loggers, self._loggers = self._loggers, []
-        first_error: BaseException | None = None
-        for logger_instance in loggers:
-            try:
-                logger_instance.close()
-            except BaseException as error:
-                # Keep failed owners reachable so Trainer.close can retry;
-                # successfully closed sinks must not be closed a second time.
-                self._loggers.append(logger_instance)
-                if first_error is None:
-                    first_error = error
-                else:
-                    logger.exception("Additional metrics logger cleanup failure")
-        if first_error is not None:
-            raise first_error
 
 
 def is_v_schedule(pp_schedule: str) -> bool:

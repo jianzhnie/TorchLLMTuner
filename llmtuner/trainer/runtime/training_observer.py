@@ -16,8 +16,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ..accelerator.collectives import synchronize_local_errors
-from .compute_metrics import compute_utilization, model_tflops
+from ...accelerator.collectives import synchronize_local_errors
+from ...components.metrics import compute_utilization, model_tflops
 
 
 def percentile(values: list[float], fraction: float) -> float:

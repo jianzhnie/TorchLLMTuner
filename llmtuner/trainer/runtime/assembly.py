@@ -48,7 +48,6 @@ from ...components.optimizer.ema import EMA
 from ...components.optimizer.lr_scheduler import build_lr_scheduler
 from ...components.optimizer.optimizer import OptimizersContainer
 from ...components.optimizer.state_residency import validate_checkpoint_configuration
-from ...components.training_observer import DispatchTimer, TrainingObserver
 from ...memory.activation_swap import reset_activation_swap_metrics
 from ...models.common.aux_loss import register_aux_loss_metrics_hook
 from ...models.common.moe.bias_update import (
@@ -72,6 +71,7 @@ from ...parallel.topology import build_device_mesh, resolve_parallel_topology
 from ...utils import logging as logging_utils
 from ...utils import seeding
 from ...utils.flops import flops_per_token
+from .training_observer import DispatchTimer, TrainingObserver
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
