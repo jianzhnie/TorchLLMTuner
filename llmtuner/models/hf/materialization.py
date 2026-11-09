@@ -2,21 +2,145 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.experimental import implicit_replication
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 from llmtuner.errors import UnsupportedCombinationError
 
+try:
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5TextRotaryEmbedding,
+    )
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeTextRotaryEmbedding,
+    )
+except ImportError:
+    Qwen3_5TextRotaryEmbedding = Qwen3_5MoeTextRotaryEmbedding = None
+
+
 from ..common.aux_loss import AuxLoss
 from ..common.moe.layer import MoE
+from ..kimi.delta_attention import KimiDeltaAttention
+from ..kimi.moe import KimiMoEGate
+from ..kimi.normalization import KimiRMSNorm
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
 __all__ = ["materialize_meta_model"]
+
+
+def _construct_rotary(module_type, config, device):
+    # HF 5.22 removed the device keyword in favor of the active device context.
+    if "device" in inspect.signature(module_type).parameters:
+        return module_type(config, device=device)
+    with torch.device(device):
+        return module_type(config)
+
+
+def initialize_random_hf_model(model: nn.Module) -> None:
+    """Initialize materialized HF parameters, including stable delta decay rates."""
+    # Keep the materialization device's default text-RoPE values. HF's generic
+    # initializer otherwise recomputes them without a device argument on CPU.
+    # Only the exact native classes/default policy are covered; other buffers
+    # and architectures keep the original initializer semantics.
+    preserved = {}
+    native_rotary = tuple(
+        cls
+        for cls in (Qwen3_5TextRotaryEmbedding, Qwen3_5MoeTextRotaryEmbedding)
+        if cls is not None
+    )
+    if model.config.model_type in {"qwen3_5_text", "qwen3_5_moe_text"}:
+        for module in model.modules():
+            if type(module) not in native_rotary:
+                continue
+            if module.config.rope_parameters.get("rope_type", "default") != "default":
+                continue
+            for name in ("inv_freq", "original_inv_freq"):
+                buffer = getattr(module, name)
+                if name not in module._non_persistent_buffers_set or buffer.is_meta:
+                    continue
+                preserved.setdefault(id(buffer), (buffer, buffer.detach().clone()))
+    aliases = [
+        (module, name, buffer)
+        for module in model.modules()
+        for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False)
+        if id(buffer) in preserved
+    ]
+
+    # Preserve all original parameter initialization calls and RNG ordering.
+    def initialize_module(module):
+        if type(module).__name__ in {
+            "Qwen3_5GatedDeltaNet",
+            "Qwen3_5MoeGatedDeltaNet",
+        } and isinstance(module.A_log, DTensor):
+            # New HF creates a tiny global head-vector before copy_. Treat only
+            # this initializer's ordinary tensor as replicated, allowing DTensor
+            # to select the owned shard without gathering any model weights.
+            with implicit_replication():
+                model._init_weights(module)
+        else:
+            model._init_weights(module)
+
+    model.apply(initialize_module)
+    with torch.no_grad():
+        for buffer, value in preserved.values():
+            buffer.copy_(value)
+        for module, name, buffer in aliases:
+            setattr(module, name, buffer)
+    if model.config.model_type == "kimi_linear":
+        with torch.no_grad(), implicit_replication():
+            for module in model.modules():
+                if isinstance(module, KimiRMSNorm):
+                    module.weight.fill_(1)
+                elif isinstance(module, KimiMoEGate):
+                    module.reset_parameters()
+                    module.e_score_correction_bias.zero_()
+                elif isinstance(module, KimiDeltaAttention):
+                    rates = torch.empty_like(module.A_log, dtype=torch.float32)
+                    rates.uniform_(1, 16).log_()
+                    module.A_log.copy_(rates)
+                    module.dt_bias.zero_()
+        return
+    if model.config.model_type == "deepseek_v4":
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+            DeepseekV4HashRouter,
+        )
+
+        with torch.no_grad():
+            for module in model.modules():
+                if isinstance(module, DeepseekV4HashRouter):
+                    # Random training cannot use HF's all-zero checkpoint
+                    # placeholder, which routes every token to expert zero.
+                    scores = torch.rand(
+                        (module.tid2eid.shape[0], module.num_experts),
+                        dtype=torch.float32,
+                        device=module.weight.device,
+                    )
+                    module.tid2eid.copy_(scores.topk(module.top_k, dim=-1).indices)
+        return
+    if model.config.model_type not in {"qwen3_5_text", "qwen3_5_moe_text"}:
+        return
+    with torch.no_grad():
+        for module in model.modules():
+            if type(module).__name__ not in {
+                "Qwen3_5GatedDeltaNet",
+                "Qwen3_5MoeGatedDeltaNet",
+            }:
+                continue
+            # HF samples in the parameter dtype. BF16 uniform can produce zero,
+            # whose logarithm permanently poisons the trainable decay state.
+            # Keep the intended log-uniform construction in FP32, also for
+            # DTensor shards, and exclude zero before copying to storage dtype.
+            rates = torch.empty_like(module.A_log, dtype=torch.float32)
+            rates.uniform_(torch.finfo(torch.float32).tiny, 16).log_()
+            module.A_log.copy_(rates)
 
 
 def validate_rotary_initialization(config: PretrainedConfig) -> None:
@@ -49,7 +173,7 @@ def initialize_rotary_on_device(model: nn.Module, device: torch.device) -> None:
             raise UnsupportedCombinationError(
                 "target RoPE initialization requires native Qwen3RotaryEmbedding"
             )
-        fresh = Qwen3RotaryEmbedding(config, device=device)
+        fresh = _construct_rotary(Qwen3RotaryEmbedding, config, device)
         for name in ("inv_freq", "original_inv_freq"):
             replacements[id(getattr(module, name))] = getattr(fresh, name)
         updates.append((module, fresh))
@@ -102,7 +226,11 @@ def materialize_meta_model(
                 # to_empty replaces real buffers too; preserve constructor state.
                 restored_buffers[module, name] = buffer.to(device)
 
-    rope_modules = {module for module, name in meta_buffers if name == "inv_freq"}
+    rope_modules = {
+        module
+        for module, name in meta_buffers
+        if name == "inv_freq" or name.endswith("_inv_freq")
+    }
     for module, name in meta_buffers:
         if isinstance(module, AuxLoss) and name == "instance_acc":
             restored_buffers[module, name] = torch.zeros(
@@ -117,9 +245,9 @@ def materialize_meta_model(
     for module in rope_modules:
         if not hasattr(module, "config"):
             continue
-        fresh = type(module)(module.config, device=device)
+        fresh = _construct_rotary(type(module), module.config, device)
         for name, value in fresh.named_buffers(recurse=False, remove_duplicate=False):
-            if name in {"inv_freq", "original_inv_freq"}:
+            if name == "inv_freq" or name.endswith("_inv_freq"):
                 restored_buffers[module, name] = value
 
     # A recognized buffer may have arbitrary registered aliases, including

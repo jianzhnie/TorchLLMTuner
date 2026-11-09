@@ -24,8 +24,13 @@ from .attention_backend import ATTENTION_BACKEND
 _RUNTIME_CONFIG_FIELDS = (
     "attn_mask_type",
     "experts_implementation",
+    "router_compute_dtype",
     "compute_dtype",
     "norm_backend",
+    "linear_attention_backend",
+    "gdn_numerical_policy",
+    "gdn_allow_right_padding",
+    "gdn_deterministic_reduction",
     "qkv_projection",
     "rotary_init_device",
     "rotary_compute_dtype",
@@ -98,8 +103,17 @@ def build_model_config(
 def apply_runtime_config(config: PretrainedConfig, cfg: LLMTunerConfig) -> None:
     config.attn_mask_type = cfg.dataloader.attention_mask_type()
     config.experts_implementation = getattr(cfg, "experts_implementation", "native")
+    config.router_compute_dtype = getattr(cfg.model, "router_compute_dtype", None)
     config.compute_dtype = getattr(cfg, "compute_dtype", None)
     config.norm_backend = cfg.norm_backend
+    config.linear_attention_backend = cfg.model.linear_attention_backend
+    config.gdn_numerical_policy = getattr(cfg.model, "gdn_numerical_policy", "native")
+    config.gdn_allow_right_padding = getattr(
+        cfg.model, "gdn_allow_right_padding", False
+    )
+    config.gdn_deterministic_reduction = getattr(
+        cfg.model, "gdn_deterministic_reduction", False
+    )
     config.qkv_projection = cfg.qkv_projection
     config.rotary_init_device = cfg.rotary_init_device
     config.rotary_compute_dtype = cfg.model.rotary_compute_dtype

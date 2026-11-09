@@ -24,6 +24,12 @@ def corpus_data_identity(config: LLMTunerConfig, *, dataset: str, repeat: bool) 
     """
     local_text = dataset in {"local_jsonl", "local_jsonl_sft"}
     data_settings = asdict(config.dataloader)
+    kimi_tokenizer = data_settings["tokenizer_backend"] == "kimi_k3"
+    if not kimi_tokenizer:
+        data_settings.pop("tokenizer_backend")
+    if not data_settings["chat_template_kwargs"]:
+        # Adding an unused option must not invalidate existing data cursors.
+        data_settings.pop("chat_template_kwargs")
     if not data_settings["global_context_rows"]:
         data_settings.pop("global_context_rows")
     # Ranks may stage identical assets in different local directories. DCP
@@ -68,14 +74,17 @@ def corpus_data_identity(config: LLMTunerConfig, *, dataset: str, repeat: bool) 
         if local_text
         else []
     )
-    for name in (
+    tokenizer_assets = (
         "tokenizer.json",
         "vocab.txt",
         "vocab.json",
         "merges.txt",
         "tokenizer_config.json",
         "chat_template.jinja",
-    ):
+    )
+    if kimi_tokenizer:
+        tokenizer_assets += ("tiktoken.model", "tokenization_kimi.py", "encoding_k3.py")
+    for name in tokenizer_assets:
         path = tokenizer_path / name
         digest.update(name.encode())
         if path.is_file():

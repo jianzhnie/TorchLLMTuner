@@ -141,6 +141,7 @@ class LocalTokenDispatcher:
     def __init__(self, num_experts: int, top_k: int) -> None:
         self.num_experts = num_experts
         self.top_k = top_k
+        self.accumulate_in_fp32 = False
 
     def set_ep_group(self, *, ep_group: dist.ProcessGroup | None) -> None:
         """No-op for the EP=1 dispatcher. Subclasses override."""
@@ -253,15 +254,20 @@ class LocalTokenDispatcher:
         Returns:
             out_TD: ``(T, D)`` combined output.
         """
-        out_TD = torch.zeros_like(x_TD)
-
         # Promote low-precision expert outputs for score multiplication while
         # preserving float64 outputs used by high-precision models.
         compute_dtype = torch.promote_types(routed_output_RD.dtype, torch.float32)
+        accumulation_dtype = (
+            compute_dtype if self.accumulate_in_fp32 else routed_output_RD.dtype
+        )
+        out_TD = torch.zeros_like(
+            x_TD,
+            dtype=compute_dtype if self.accumulate_in_fp32 else x_TD.dtype,
+        )
         routed_output_RD = (
             routed_output_RD.to(compute_dtype)
             * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
-        ).to(routed_output_RD.dtype)
+        ).to(accumulation_dtype)
 
         dim = x_TD.shape[-1]
         # A token routed to K experts appears K times at its own index, so this
@@ -271,7 +277,7 @@ class LocalTokenDispatcher:
             metadata.token_indices_experts_sorted_N.reshape(-1, 1).expand(-1, dim),
             routed_output_RD,
         )
-        return out_TD
+        return out_TD.to(x_TD.dtype)
 
 
 class BaseEPTokenDispatcher(LocalTokenDispatcher, ABC):

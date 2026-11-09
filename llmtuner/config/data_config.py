@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from llmtuner.config.utils import require_integer_at_least
 from llmtuner.errors import ConfigError
@@ -28,6 +29,13 @@ class DataloaderConfig:
             "help": "Directory holding the tokenizer. Required unless --dataset random."
         },
     )
+    tokenizer_backend: Literal["huggingface", "kimi_k3"] = field(
+        default="huggingface",
+        metadata={
+            "help": "Tokenizer implementation; kimi_k3 explicitly enables the local "
+            "official remote-code TikTokenTokenizer"
+        },
+    )
     dataset_path: str | None = field(
         default=None,
         metadata={"help": "Corpus path. Required for local_jsonl and local_jsonl_sft."},
@@ -47,6 +55,12 @@ class DataloaderConfig:
     response_field: str = field(
         default="response",
         metadata={"help": "Assistant field used by dataset=local_jsonl_sft."},
+    )
+    chat_template_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Single-turn local SFT template options, e.g. enable_thinking"
+        },
     )
     chat_renderer: str | None = field(
         default=None,
@@ -141,6 +155,29 @@ class DataloaderConfig:
         )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.chat_template_kwargs, dict) or not all(
+            isinstance(key, str) for key in self.chat_template_kwargs
+        ):
+            raise ConfigError(
+                "dataloader.chat_template_kwargs must be a string-key dict"
+            )
+        try:
+            json.dumps(self.chat_template_kwargs, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ConfigError(
+                "chat_template_kwargs must contain finite JSON-compatible values"
+            ) from error
+        if self.chat_template_kwargs:
+            if self.dataset != "local_jsonl_sft" or self.chat_renderer is not None:
+                raise ConfigError(
+                    "chat_template_kwargs requires single-turn local_jsonl_sft"
+                )
+            if {"messages", "add_generation_prompt", "tokenize"} & (
+                self.chat_template_kwargs.keys()
+            ):
+                raise ConfigError(
+                    "chat_template_kwargs cannot override rendering controls"
+                )
         if not isinstance(self.global_context_rows, bool):
             raise ConfigError("dataloader.global_context_rows must be bool")
         if self.data_identity is not None and (
@@ -152,6 +189,10 @@ class DataloaderConfig:
         if self.dataset == "random" and self.data_identity is not None:
             raise ConfigError(
                 "dataloader.data_identity applies only to corpus datasets"
+            )
+        if self.tokenizer_backend not in ("huggingface", "kimi_k3"):
+            raise ConfigError(
+                "dataloader.tokenizer_backend must be huggingface or kimi_k3"
             )
         if not isinstance(self.shuffle, bool):
             raise ConfigError(f"dataloader.shuffle must be bool, got {self.shuffle!r}")

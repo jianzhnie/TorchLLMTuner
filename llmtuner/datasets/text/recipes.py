@@ -48,7 +48,11 @@ def build_local_jsonl(*, path: str) -> SingleDataset:
 
 
 def build_local_jsonl_sft(
-    *, path: str, prompt_field: str, response_field: str
+    *,
+    path: str,
+    prompt_field: str,
+    response_field: str,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> SingleDataset:
     """Build a single-turn supervised-chat recipe from a local JSONL file."""
 
@@ -56,6 +60,7 @@ def build_local_jsonl_sft(
         path=path,
         processor=partial(
             ChatProcessor,
+            chat_template_kwargs=chat_template_kwargs,
             messages_fn=partial(
                 _read_prompt_response,
                 prompt_field=prompt_field,

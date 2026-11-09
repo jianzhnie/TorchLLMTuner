@@ -270,10 +270,17 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         # -- retention policy (the values came from the base class) --
         self.purge_thread: threading.Thread | None = None
         try:
-            if dist.is_initialized() and self.async_mode in (
-                DistributedCheckpointAsyncMode.ASYNC,
-                DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM,
+            if dist.is_initialized() and (
+                self.async_mode
+                in (
+                    DistributedCheckpointAsyncMode.ASYNC,
+                    DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM,
+                )
+                or dist.get_backend() == "hccl"
             ):
+                # DCP exchanges pickled host planning objects. HCCL object
+                # scatter is not reliable on all Ascend runtimes; also use the
+                # owned host group for synchronous NPU save/load planning.
                 self.pg = dist.new_group(backend="gloo")
             if (
                 dist.is_initialized()
@@ -500,6 +507,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 state_dict,
                 storage_writer=storage_writer,
                 checkpoint_id=checkpoint_id,
+                process_group=self.pg,
             )
 
         if enable_garbage_collection:
@@ -547,7 +555,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     degree = {
                         DATALOADER: {"dp_world_size": loader_metadata["dp_world_size"]}
                     }
-                    dcp.load(degree, checkpoint_id=checkpoint_id)
+                    dcp.load(degree, checkpoint_id=checkpoint_id, process_group=self.pg)
                     with synchronize_local_errors(
                         "Checkpoint dataloader preflight validation"
                     ):
@@ -560,6 +568,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     preflight_destination,
                     checkpoint_id=checkpoint_id,
                     planner=preflight_planner,
+                    process_group=self.pg,
                 )
                 for category, state in preflight_states.items():
                     phase = "RNG" if category == RNG_STATE else category
@@ -590,7 +599,9 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     checkpoint_id, from_quantized=from_quantized
                 )
 
-            dcp.load(hf_state_dict, storage_reader=hf_storage_reader)
+            dcp.load(
+                hf_state_dict, storage_reader=hf_storage_reader, process_group=self.pg
+            )
 
             state_dict = adapt_hf_model_state(
                 self.sd_adapter, states.get(MODEL), hf_state_dict
@@ -614,6 +625,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 state_dict,
                 checkpoint_id=checkpoint_id,
                 planner=planner,
+                process_group=self.pg,
             )
             with synchronize_local_errors("Checkpoint scheduler restoration"):
                 if scheduler is not None:

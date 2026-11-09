@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Protocol
 import grain.python as grain
 
 from ..components.tokenizer.huggingface import HuggingFaceTokenizer
+from ..components.tokenizer.kimi import KimiK3Tokenizer
 from ..components.tokenizer.multimodal import MultimodalTokenizer
 from .collators import (
     CollatorFactory,
@@ -135,6 +136,7 @@ def _resolve_text_recipe(
                 path=dataloader_config.dataset_path,
                 prompt_field=dataloader_config.prompt_field,
                 response_field=dataloader_config.response_field,
+                chat_template_kwargs=dataloader_config.chat_template_kwargs,
             )
     else:
         recipe = DATASETS[dataset_name]
@@ -272,9 +274,12 @@ def build_dataloader(
         # Media lists require whole-document FirstFit packing; --packing applies
         # only to text. The media collator constructs patches after packing.
     else:
-        tokenizer = HuggingFaceTokenizer(
-            tokenizer_path=dataloader_config.tokenizer_path
-        )
+        if dataloader_config.tokenizer_backend == "kimi_k3":
+            tokenizer = KimiK3Tokenizer(tokenizer_path=dataloader_config.tokenizer_path)
+        else:
+            tokenizer = HuggingFaceTokenizer(
+                tokenizer_path=dataloader_config.tokenizer_path
+            )
         resolved = _resolve_text_recipe(
             dataloader_config, dataset_name=dataset_name, tokenizer=tokenizer
         )

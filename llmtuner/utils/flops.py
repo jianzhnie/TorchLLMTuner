@@ -97,17 +97,25 @@ def flops_per_token(arch: PretrainedConfig, *, seq_len: int) -> int:
     * Embedding lookups are not matmuls and cost nothing here, but the output
       projection is a matmul and is counted, whether or not its weight is tied
       to the embedding table: tying is a storage decision, not a compute one.
+    * ``qwen3_5_moe_text`` uses its native per-layer MoE and gated attention
+      geometry, including depthwise convolution. GDN is charged as recurrent-
+      equivalent model work, not actual chunk/kernel execution FLOPs; see
+      :func:`qwen3_5_moe_text_flops_per_token` for the counting boundary.
 
     Returns 0 -- suppressing MFU and tflops rather than reporting a wrong
     magnitude -- when the geometry cannot be resolved exactly: a missing size,
     a MoE whose per-layer split or expert width the config does not state, a
     ``layer_types`` list shorter than the layer count, or a layer type whose
-    parameter term is not derivable from the config (``linear_attention`` and
-    friends, whose projections a per-family or model-based count would have to
-    supply).
+    parameter term is not derivable from the config (``linear_attention`` outside
+    the dedicated Qwen3.5 MoE branch, and other unsupported layer families).
     """
     if isinstance(seq_len, bool) or not isinstance(seq_len, int) or seq_len < 0:
         raise ValueError(f"seq_len must be a non-negative integer, got {seq_len!r}")
+
+    if getattr(arch, "model_type", None) == "qwen3_5_moe_text":
+        return qwen3_5_moe_text_flops_per_token(arch, seq_len=seq_len)
+    if getattr(arch, "model_type", None) == "kimi_linear":
+        return kimi_linear_flops_per_token(arch, seq_len=seq_len)
 
     hidden = int_attr(arch, "hidden_size")
     num_layers = int_attr(arch, "num_hidden_layers")
@@ -168,6 +176,93 @@ def flops_per_token(arch: PretrainedConfig, *, seq_len: int) -> int:
         for window in attended
     )
     return 3 * matmul_flops + attention_flops
+
+
+def qwen3_5_moe_text_flops_per_token(arch: PretrainedConfig, *, seq_len: int) -> int:
+    """HF 5.13 native text MoE training model FLOPs per input token.
+
+    Every decoder layer has a router, top-k routed experts, a shared expert
+    and its scalar gate, irrespective of generic dense-prefix/sparse-step
+    metadata. Count all linear projections, including the full-attention Q
+    gate and GDN's z/a/b projections, plus lm_head (even when tied).
+
+    Multiply-adds cost two FLOPs; training costs three times forward. GDN's
+    memory read, rank-one state update and output read each cost 2*K*V per
+    value head in forward, hence 18*H_v*K*V in training. This is the
+    torchtitan recurrent-equivalent convention, NOT actual chunk/kernel FLOPs:
+    chunk-local products, triangular solves and padding overhead are excluded.
+    Depthwise convolution costs 6*channels*kernel_size per token, without
+    discounting boundary zeros. Full attention uses full-square contractions,
+    without discounting causal sparsity, at the supplied uniform seq_len.
+
+    Exclude normalization, biases, nonlinearities, elementwise gates/decay,
+    routing selection/combine, loss, optimizer, communication and all
+    recomputation. All weights are assumed trainable. This covers text only;
+    variable document lengths require a separate step-level attention count.
+    Return zero for missing/invalid native geometry or unresolved layer types.
+    """
+    names = (
+        "hidden_size",
+        "vocab_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_conv_kernel_dim",
+        "num_experts",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+        "shared_expert_intermediate_size",
+    )
+    sizes = [int_attr(arch, name) for name in names]
+    if any(size is None or size <= 0 for size in sizes):
+        return 0
+    (
+        hidden,
+        vocab,
+        layers,
+        heads,
+        kv_heads,
+        head_dim,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        kernel,
+        experts,
+        top_k,
+        expert_width,
+        shared_width,
+    ) = sizes
+    if heads % kv_heads or value_heads % key_heads or top_k > experts:
+        return 0
+    layer_types = getattr(arch, "layer_types", None)
+    if not isinstance(layer_types, list | tuple) or len(layer_types) != layers:
+        return 0
+    if any(kind not in ("linear_attention", "full_attention") for kind in layer_types):
+        return 0
+
+    # Native Qwen3.5 MoE has the same sparse FFN in every decoder layer.
+    moe = hidden * (experts + 3 * top_k * expert_width + 3 * shared_width + 1)
+    key_width = key_heads * key_dim
+    value_width = value_heads * value_dim
+    gdn_projection = hidden * (2 * key_width + 3 * value_width + 2 * value_heads)
+    convolution = (2 * key_width + value_width) * kernel
+    gdn = 6 * (gdn_projection + convolution) + 18 * value_heads * key_dim * value_dim
+    full = 6 * hidden * head_dim * (3 * heads + 2 * kv_heads)
+    full += quadratic_attention_flops_per_token(
+        num_heads=heads,
+        qk_head_dim=head_dim,
+        v_head_dim=head_dim,
+        seq_len=seq_len,
+    )
+    return 6 * (hidden * vocab + layers * moe) + sum(
+        gdn if kind == "linear_attention" else full for kind in layer_types
+    )
 
 
 def int_attr(arch: PretrainedConfig, name: str) -> int | None:
@@ -370,3 +465,95 @@ def attention_windows(
             # is not derivable from these generic fields.
             return None
     return windows
+
+
+def kimi_linear_flops_per_token(arch: PretrainedConfig, *, seq_len: int) -> int:
+    """Local Kimi model FLOPs, using recurrent-equivalent KDA state work."""
+    names = (
+        "hidden_size",
+        "vocab_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+        "kv_lora_rank",
+        "intermediate_size",
+    )
+    values = [int_attr(arch, name) for name in names]
+    if any(value is None or value <= 0 for value in values):
+        return 0
+    hidden, vocab, layers, heads, qk_nope, qk_rope, value_dim, _, dense = values
+    settings = getattr(arch, "linear_attn_config", None)
+    if not isinstance(settings, dict):
+        return 0
+    kda_layers = settings.get("kda_layers")
+    full_layers = settings.get("full_attn_layers")
+    if not isinstance(kda_layers, list) or not isinstance(full_layers, list):
+        return 0
+    if set(kda_layers) & set(full_layers) or set(kda_layers) | set(full_layers) != set(
+        range(1, layers + 1)
+    ):
+        return 0
+    head_dim = int(settings.get("head_dim", 0))
+    kda_heads = int(settings.get("num_heads", 0))
+    kernel = int(settings.get("short_conv_kernel_size", 0))
+    if min(head_dim, kda_heads, kernel) <= 0:
+        return 0
+
+    qk_dim = qk_nope + qk_rope
+    mla = attention_param_term(
+        arch,
+        hidden=hidden,
+        num_heads=heads,
+        qk_head_dim=qk_dim,
+        v_head_dim=value_dim,
+    )
+    if mla is None:
+        return 0
+    if getattr(arch, "mla_use_output_gate", False):
+        mla += 2 * hidden * heads * value_dim
+    mla *= 3
+    mla += quadratic_attention_flops_per_token(
+        num_heads=heads,
+        qk_head_dim=qk_dim,
+        v_head_dim=value_dim,
+        seq_len=seq_len,
+    )
+
+    width = head_dim * kda_heads
+    # Q/K/V/O, factorized decay gate and beta projection.
+    kda_projection = 4 * hidden * width + hidden * head_dim + head_dim * width
+    kda_projection += hidden * kda_heads
+    if settings.get("use_full_rank_gate", False):
+        kda_projection += hidden * width
+    else:
+        kda_projection += hidden * head_dim + head_dim * width
+    kda = 6 * (kda_projection + 3 * width * kernel)
+    kda += 18 * kda_heads * head_dim * head_dim
+    total = 6 * hidden * vocab
+    if getattr(arch, "attn_res_block_size", None) is not None:
+        total += 6 * hidden * (2 * layers + 1)
+
+    experts = int_attr(arch, "num_experts") or 0
+    top_k = int_attr(arch, "num_experts_per_token") or 0
+    expert_width = int_attr(arch, "moe_intermediate_size") or 0
+    shared = int_attr(arch, "num_shared_experts") or 0
+    latent = int_attr(arch, "routed_expert_hidden_size")
+    first_dense = int_attr(arch, "first_k_dense_replace") or 0
+    frequency = int_attr(arch, "moe_layer_freq") or 1
+    for index in range(layers):
+        total += kda if index + 1 in kda_layers else mla
+        if index >= first_dense and index % frequency == 0 and experts:
+            if not 1 <= top_k <= experts or expert_width <= 0:
+                return 0
+            routed_width = hidden if latent is None else latent
+            moe = hidden * experts
+            if latent is not None:
+                moe += 2 * hidden * routed_width
+            moe += 3 * top_k * routed_width * expert_width
+            moe += 3 * shared * hidden * expert_width
+            total += 6 * moe
+        else:
+            total += 18 * hidden * dense
+    return total

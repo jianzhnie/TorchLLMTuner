@@ -106,6 +106,11 @@ class LLMTunerConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.model.experts_implementation == "pre_down" and self.training.compile:
+            raise ConfigError(
+                "model.experts_implementation='pre_down' requires eager execution; "
+                "set training.compile=False or use native experts."
+            )
         if self.metrics.measure_moe_dispatch and self.training.compile:
             raise ConfigError(
                 "metrics.measure_moe_dispatch requires eager execution; "

@@ -64,7 +64,19 @@ from .attention_masks import (
 )
 from .expert_kernels import stabilize_moe_experts, stabilize_moe_router
 from .factory import resolve_model_class, unwrap_text_config
+from .gdn_numerics import (
+    configure_gdn_numerics,
+    validate_gdn_numerical_batch,
+    validate_gdn_numerical_config,
+    validate_gdn_numerical_sequence,
+)
 from .input_preparation import preprocess_inputs
+from .linear_attention import (
+    apply_linear_attention_backend,
+    validate_linear_attention_batch,
+    validate_linear_attention_config,
+    validate_linear_attention_sequence,
+)
 from .materialization import validate_rotary_initialization
 from .model_setup import (
     apply_cast_lm_head,
@@ -94,6 +106,8 @@ class HFTransformerModel(nn.Module):
         super().__init__()
 
         config = unwrap_text_config(config)
+        validate_linear_attention_config(config)
+        validate_gdn_numerical_config(config)
         validate_rotary_initialization(config)
         # DSA models take a dense additive mask instead of a flex BlockMask;
         # resolved once here rather than per forward. The mask family is decided
@@ -120,6 +134,8 @@ class HFTransformerModel(nn.Module):
         model_cls = resolve_model_class(config)
         configure_experts_implementation(config, model_cls=model_cls)
         self.model = model_cls(config=config)
+        configure_gdn_numerics(self.model)
+        apply_linear_attention_backend(self.model)
         stabilize_residual_norm_gradients(self.model)
         stabilize_moe_router(self.model)
         stabilize_moe_experts(self.model)
@@ -345,6 +361,20 @@ class HFTransformerModel(nn.Module):
         max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Normalize and shard a batch through the model input pipeline."""
+        config = self.model.config
+        numerical_policy = getattr(config, "gdn_numerical_policy", "native")
+        allow_right_padding = getattr(config, "gdn_allow_right_padding", False)
+        if getattr(config, "linear_attention_backend", "native") == "npu_triton":
+            validate_linear_attention_batch(
+                input_dict,
+                allow_right_padding=allow_right_padding,
+                validate_metadata=numerical_policy == "native",
+            )
+        if numerical_policy != "native":
+            validate_gdn_numerical_batch(
+                input_dict,
+                allow_right_padding=allow_right_padding,
+            )
         return preprocess_inputs(
             self,
             input_dict,
@@ -394,6 +424,26 @@ class HFTransformerModel(nn.Module):
                 ``components.loss.chunked_lm_head_cross_entropy``) rather than
                 materialize the full ``T * V`` logits.
         """
+        config = self.model.config
+        numerical_policy = getattr(config, "gdn_numerical_policy", "native")
+        allow_right_padding = getattr(config, "gdn_allow_right_padding", False)
+        if getattr(config, "linear_attention_backend", "native") == "npu_triton":
+            validate_linear_attention_sequence(
+                input_ids,
+                positions,
+                attention_masks,
+                padding_mask,
+                allow_right_padding=allow_right_padding,
+                validate_metadata=numerical_policy == "native",
+            )
+        if numerical_policy != "native":
+            validate_gdn_numerical_sequence(
+                input_ids,
+                positions,
+                attention_masks,
+                padding_mask,
+                allow_right_padding=allow_right_padding,
+            )
         if isinstance(self.tok_embeddings, nn.Identity):
             # Non-first pipeline stage: the input IS the previous stage's
             # hidden states, so the embedding lookup is skipped by feeding the
@@ -447,6 +497,16 @@ class HFTransformerModel(nn.Module):
                 )
             else:
                 kwargs["attention_mask"] = masks["full_attention"]
+
+        # Preserve the collator's positions, including restarted padded suffix.
+        # A real HF 2D validity mask prevents its mask builder from mistaking
+        # that suffix for another packed document and reaches GDN validators.
+        # Per-call kwargs (also retained by AC) avoid mutable module mask state.
+        if allow_right_padding:
+            if padding_mask is not None and bool(padding_mask.any()):
+                if kwargs.get("attention_mask") is not None:
+                    raise ValueError("GDN right padding requires native HF 2D masks")
+                kwargs["attention_mask"] = (~padding_mask).unsqueeze(0)
 
         # Stage the padding mask on every MoE block -- including ``None``, so
         # a mask from a previous microbatch can never survive into this one.

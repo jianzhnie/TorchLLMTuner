@@ -122,6 +122,7 @@ class ChatProcessor(SampleProcessor):
         context: DatasetBuildContext,
         messages_fn: Callable[[dict[str, Any]], list[dict[str, str]]],
         renderer: Any | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> None:
         if renderer is None and context.tokenizer.eos_id is None:
             raise ValueError(
@@ -133,6 +134,7 @@ class ChatProcessor(SampleProcessor):
         self._max_context_length = context.max_context_length
         self._messages_fn = messages_fn
         self._renderer = renderer
+        self._chat_template_kwargs = dict(chat_template_kwargs or {})
         self._logged_first_sample = False
 
     @staticmethod
@@ -203,7 +205,7 @@ class ChatProcessor(SampleProcessor):
         # The tokenizer defaults add_generation_prompt=True (torchtitan parity);
         # a full-conversation render must not grow a trailing generation prompt.
         full_text = self._tokenizer.apply_chat_template(
-            messages, add_generation_prompt=False
+            messages, add_generation_prompt=False, **self._chat_template_kwargs
         )
         # Strip extra newline and ensure the sequence ends with EOS without duplicates
         full_text = full_text.rstrip("\n")
@@ -223,7 +225,7 @@ class ChatProcessor(SampleProcessor):
         # Find prompt/response boundary by tokenizing just the user message
         # with add_generation_prompt=True.
         prompt_text = self._tokenizer.apply_chat_template(
-            messages[:1], add_generation_prompt=True
+            messages[:1], add_generation_prompt=True, **self._chat_template_kwargs
         )
         prompt_tokens = self._tokenizer.encode(prompt_text, add_bos=True, add_eos=False)
         require_token_prefix(full_tokens, prompt_tokens)

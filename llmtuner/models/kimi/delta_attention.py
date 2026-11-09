@@ -119,8 +119,10 @@ class KimiDeltaAttention(nn.Module):
         self.f_a_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.f_b_proj = nn.Linear(self.head_dim, width, bias=False)
         self.b_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
-        self.A_log = nn.Parameter(torch.empty(self.num_heads).uniform_(1, 16).log())
-        self.dt_bias = nn.Parameter(torch.zeros(width))
+        self.A_log = nn.Parameter(
+            torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16).log()
+        )
+        self.dt_bias = nn.Parameter(torch.zeros(width, dtype=torch.float32))
         self.use_full_rank_gate = settings.get("use_full_rank_gate", False)
         self.gate_lower_bound = settings.get("gate_lower_bound")
         if self.use_full_rank_gate:

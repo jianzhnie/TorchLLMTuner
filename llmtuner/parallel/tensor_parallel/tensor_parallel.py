@@ -554,6 +554,11 @@ def resolve_tp_sharding_plan(
             resolved[pattern] = colwise()
         elif spec == "rowwise":
             resolved[pattern] = rowwise()
+        elif spec == "embedding_rowwise":
+            # New HF plans include vocabulary sharding. This engine keeps
+            # embeddings replicated, as before: token rows are sequence-sharded
+            # and allreduce_replicated_tp_grads sums their partial gradients.
+            resolved[pattern] = None
         elif spec in {"replicated_with_grad_allreduce", "colwise_gather_output"}:
             # Nothing for apply_tp to do: the projection stays whole on every
             # rank. The ``_with_grad_allreduce`` half is already implemented --

@@ -209,7 +209,19 @@ class KimiTextDecoder(nn.Module):
                 raise ValueError("Kimi padding mask must match [batch, sequence]")
             if not torch.all((attention_mask == 0) | (attention_mask == 1)):
                 raise ValueError("Kimi padding mask must contain only zero or one")
-            valid_tokens = attention_mask.to(device=hidden.device, dtype=torch.bool)
+            mask_tokens = attention_mask.to(device=hidden.device, dtype=torch.bool)
+            if valid_tokens is not None and not torch.equal(valid_tokens, mask_tokens):
+                raise ValueError("Kimi attention_mask and valid_token_mask disagree")
+            valid_tokens = mask_tokens
+        if position_ids is not None and hidden.shape[0] > 1:
+            resets = position_ids[:, 1:] == 0
+            if valid_tokens is not None:
+                resets = resets & valid_tokens[:, 1:]
+            if bool(resets.any()):
+                raise ValueError(
+                    "Kimi packed document resets require a single batch row; "
+                    "batched recurrence boundaries are not implemented"
+                )
         boundaries = None
         if position_ids is not None and hidden.shape[0] == 1:
             resets = position_ids[0] == 0

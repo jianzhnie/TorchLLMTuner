@@ -73,6 +73,11 @@ def configure_experts_implementation(
     impl = getattr(config, "experts_implementation", "native")
     if impl == "native":
         return
+    if impl == "pre_down":
+        if config.model_type != "qwen3_5_moe_text" or config.hidden_act != "silu":
+            raise ValueError("pre_down experts require Qwen3.5 MoE with SiLU")
+        config._experts_implementation = "eager"
+        return
     if impl == "torchtitan":
         if config.model_type != "qwen3_moe":
             raise ValueError("experts_implementation='torchtitan' requires Qwen3-MoE")

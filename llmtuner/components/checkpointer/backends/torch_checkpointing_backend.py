@@ -19,6 +19,12 @@ way torchtitan does it.
 **No tyro.** The config is a plain dataclass (see ``base.py``), and
 ``purge_exempt`` is a plain callable.
 
+CPU models with at least one parameter/buffer use the upstream synchronous
+writer, independent of globally installed accelerators. Their serialized save
+payload must also be CPU-only, including optimizer and custom state; mixed
+device payloads are rejected. Non-CPU models retain asynchronous staging.
+The DCP-only config.async_mode remains ignored by this backend.
+
 Runtime assembly selects this manager when ``checkpoint.backend`` is
 ``'torch_checkpointing'`` (the default, ``'dcp'``, selects the DCP manager).
 CPU tests exercise policy, load/export adapters, future ownership, and constructor
@@ -35,7 +41,7 @@ import logging
 import os
 import queue
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -310,6 +316,22 @@ def writer_config(backend: BackendSymbols, *, use_barrier: bool):
     )
 
 
+def require_cpu_checkpoint_payload(value: Any) -> None:
+    """Validate actual save payload without copying or materializing more state."""
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu":
+            raise ValueError(
+                "CPU-model torch_checkpointing requires CPU optimizer/custom "
+                "state too; accelerator payload needs an accelerator model"
+            )
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            require_cpu_checkpoint_payload(item)
+    elif isinstance(value, tuple | list):
+        for item in value:
+            require_cpu_checkpoint_payload(item)
+
+
 def async_save_config(backend: BackendSymbols):
     return backend.AsyncCheckpointSaverConfig(
         writer_config=writer_config(backend, use_barrier=True),
@@ -452,9 +474,23 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # coordinating the outcome; never call them inside a local error body.
         construction_error: BaseException | None = None
         try:
+            # Upstream async staging detects installed accelerators globally,
+            # then enters a CUDA context even for an entirely CPU model. Use
+            # its real synchronous writer for CPU state; do not create device
+            # streams or patch upstream accelerator detection. Non-CPU models
+            # retain the existing asynchronous staging path.
+            model_tensors = [
+                value
+                for part in model_parts
+                for value in (*part.parameters(), *part.buffers())
+            ]
+            cpu_model = bool(model_tensors) and all(
+                value.device.type == "cpu" for value in model_tensors
+            )
+            self._cpu_synchronous_save = cpu_model and not self.load_only
             save_config = (
                 sync_save_config(backend, use_barrier=False)
-                if self.load_only
+                if self.load_only or cpu_model
                 else async_save_config(backend)
             )
             # Resolve the storage config before the backend manager is built,
@@ -684,6 +720,23 @@ class TorchCheckpointingManager(BaseCheckpointManager):
     def _stateful_to_state_dict(states: dict[str, Any]) -> dict[str, Any]:
         return _stateful_to_state_dict(states)
 
+    def _save_payload(self, states: dict[str, Any]) -> dict[str, Any]:
+        # State callbacks may communicate. Run them outside the local-only
+        # guard, then agree before any rank enters backend save collectives.
+        payload = None
+        failure: BaseException | None = None
+        try:
+            payload = self._stateful_to_state_dict(states)
+        except BaseException as error:
+            failure = error
+        with synchronize_local_errors("Checkpoint payload construction"):
+            if failure is not None:
+                raise failure
+            if getattr(self, "_cpu_synchronous_save", False):
+                require_cpu_checkpoint_payload(payload)
+        assert payload is not None
+        return payload
+
     def _save(self, curr_step: int, last_step: bool = False) -> bool:
         should_save = self._should_save(curr_step, last_step)
         # Prewarm on a step we are not saving, so the first real save does not
@@ -691,7 +744,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         if not should_save and self._should_prewarm():
             failure: BaseException | None = None
             try:
-                self._manager.prewarm_staging(self._stateful_to_state_dict(self.states))
+                self._manager.prewarm_staging(self._save_payload(self.states))
             except BaseException as error:
                 failure = error
             # State callbacks and backend staging may communicate: coordinate
@@ -744,7 +797,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         else:
             self.save_future = self._manager.save(
                 self._create_checkpoint_id(curr_step),
-                self._stateful_to_state_dict(self.states),
+                self._save_payload(self.states),
             )
             self._prewarmed = True
             self._pending_retention = {
@@ -932,7 +985,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         with temporary_backend_manager(manager_config) as manager:
             manager.save(
                 input_checkpoint_id,
-                self._stateful_to_state_dict(states),
+                self._save_payload(states),
             )
         GarbageCollection.collect("GC collection invoked by checkpointer.")
 

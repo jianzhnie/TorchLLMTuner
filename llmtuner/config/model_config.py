@@ -21,6 +21,12 @@ class ModelConfig:
             "help": "HF architecture name, local model directory, or hub id 'org/name'"
         },
     )
+    initialization_device: str = field(
+        default="cpu",
+        metadata={
+            "help": "Random initialization: cpu (legacy) or meta (after sharding)"
+        },
+    )
     vocab_size: int = field(default=128, metadata={"help": "Vocabulary size"})
     hidden_size: int = field(default=64, metadata={"help": "Hidden dimension"})
     intermediate_size: int = field(
@@ -38,8 +44,18 @@ class ModelConfig:
     experts_implementation: str = field(
         default="native",
         metadata={
-            "help": "HF MoE expert kernel: native, grouped_mm, batched_mm, or eager. "
-            "Overrides require model support; ignored under EP > 1."
+            "help": "HF MoE expert kernel: native, grouped_mm, batched_mm, eager, "
+            "torchtitan, or pre_down (Qwen3.5 BF16 score before down projection). "
+            "Overrides require model support; EP replacement rejects pre_down "
+            "and otherwise uses its own expert backend."
+        },
+    )
+    router_compute_dtype: str | None = field(
+        default=None,
+        metadata={
+            "help": "Router compute: float32 or None for existing behavior. "
+            "Qwen3-MoE always uses FP32; Qwen3.5-MoE requires explicit opt-in. "
+            "Parameter storage dtype and checkpoint keys are unchanged."
         },
     )
     norm_backend: str = field(
@@ -47,6 +63,34 @@ class ModelConfig:
         metadata={
             "help": "Qwen3 RMSNorm: native, torch, npu, aten (CPU first-order "
             "boundaries), or joint (dense Qwen3 first-order norm/residual)."
+        },
+    )
+    linear_attention_backend: str = field(
+        default="native",
+        metadata={
+            "help": "Qwen3.5 linear attention recurrence: native or npu_triton "
+            "(opt-in BF16, single-document pure FSDP; no compile or cache)."
+        },
+    )
+    gdn_numerical_policy: str = field(
+        default="native",
+        metadata={
+            "help": "GDN arithmetic: native or split_qkv_fp32_norm (explicit "
+            "BF16 Qwen3.5 projection/norm policy, independent of recurrence)."
+        },
+    )
+    gdn_deterministic_reduction: bool = field(
+        default=False,
+        metadata={
+            "help": "Explicit deterministic GDN gradient reduction; "
+            "requires npu_triton, not full-model determinism acceptance."
+        },
+    )
+    gdn_allow_right_padding: bool = field(
+        default=False,
+        metadata={
+            "help": "Experimental B1 causal right padding; requires "
+            "npu_triton + split_qkv_fp32_norm; masked FSDP/Trainer unverified."
         },
     )
     qkv_projection: str = field(
@@ -72,7 +116,10 @@ class ModelConfig:
     )
     rotary_cache_dtype: str | None = field(
         default=None,
-        metadata={"help": "Optional BF16 cos/sin quantization before FP32 RoPE."},
+        metadata={
+            "help": "Cos/sin cache precision: bfloat16 or Qwen3.5 float32; None "
+            "keeps the configured rotary adapter's default."
+        },
     )
     attention_backend: str = field(
         default="auto",
@@ -109,6 +156,34 @@ class ModelConfig:
                 setattr(self, name, getattr(architecture, name))
 
     def __post_init__(self) -> None:
+        if not isinstance(self.gdn_deterministic_reduction, bool):
+            raise ConfigError("model.gdn_deterministic_reduction must be boolean")
+        if (
+            self.gdn_deterministic_reduction
+            and self.linear_attention_backend != "npu_triton"
+        ):
+            raise ConfigError("gdn_deterministic_reduction requires npu_triton")
+        if not isinstance(self.gdn_allow_right_padding, bool):
+            raise ConfigError("model.gdn_allow_right_padding must be boolean")
+        if self.gdn_allow_right_padding and (
+            self.linear_attention_backend != "npu_triton"
+            or self.gdn_numerical_policy != "split_qkv_fp32_norm"
+        ):
+            raise ConfigError(
+                "gdn_allow_right_padding requires npu_triton + split_qkv_fp32_norm"
+            )
+        if self.gdn_numerical_policy not in ("native", "split_qkv_fp32_norm"):
+            raise ConfigError(
+                "model.gdn_numerical_policy must be native or split_qkv_fp32_norm"
+            )
+        if self.router_compute_dtype not in (None, "float32"):
+            raise ConfigError("model.router_compute_dtype must be float32 or None")
+        if self.linear_attention_backend not in ("native", "npu_triton"):
+            raise ConfigError(
+                "model.linear_attention_backend must be native or npu_triton"
+            )
+        if self.initialization_device not in ("cpu", "meta"):
+            raise ConfigError("model.initialization_device must be cpu or meta")
         if self.attention_backend not in ("auto", "flex", "eager_flex"):
             raise ConfigError(
                 "model.attention_backend must be 'auto', 'flex', or 'eager_flex'."
@@ -117,8 +192,10 @@ class ModelConfig:
             raise ConfigError(
                 "model.rotary_init_device must be 'constructor' or 'target'."
             )
-        if self.rotary_cache_dtype not in (None, "bfloat16"):
-            raise ConfigError("model.rotary_cache_dtype must be bfloat16 or None.")
+        if self.rotary_cache_dtype not in (None, "bfloat16", "float32"):
+            raise ConfigError(
+                "model.rotary_cache_dtype must be bfloat16, float32 or None."
+            )
         if self.rotary_cache_dtype and self.rotary_compute_dtype != "float32":
             raise ConfigError("model.rotary_cache_dtype requires FP32 RoPE.")
         if self.rotary_compute_dtype not in (None, "float32"):
@@ -171,9 +248,10 @@ class ModelConfig:
             "batched_mm",
             "eager",
             "torchtitan",
+            "pre_down",
         ):
             raise ConfigError(
                 f"model.experts_implementation must be one of "
-                f"native/grouped_mm/batched_mm/eager/torchtitan, got "
+                f"native/grouped_mm/batched_mm/eager/torchtitan/pre_down, got "
                 f"{self.experts_implementation!r}"
             )

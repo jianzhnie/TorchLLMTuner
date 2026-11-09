@@ -231,17 +231,16 @@ class KimiSparseMoE(nn.Module):
         inputs = hidden_states.reshape(-1, hidden_states.shape[-1])
         if hasattr(self, "routed_expert_down_proj"):
             inputs = self.routed_expert_down_proj(inputs)
-        output = torch.zeros_like(inputs)
+        compute_dtype = torch.promote_types(inputs.dtype, scores.dtype)
+        output = torch.zeros_like(inputs, dtype=compute_dtype)
         for index, expert in enumerate(self.experts):
             tokens, slots = (ids == index).nonzero(as_tuple=True)
             values = expert(inputs.index_select(0, tokens))
-            # Preserve FP32 routing scores through the multiplication, matching
-            # EP combine; rounding scores first changes expert-output gradients.
-            compute_dtype = torch.promote_types(values.dtype, scores.dtype)
-            values = (values.to(compute_dtype) * scores[tokens, slots, None]).to(
-                values.dtype
-            )
+            # Keep weighted outputs and accumulation in routing precision;
+            # casting each expert separately introduces BF16 rounding errors.
+            values = values.to(compute_dtype) * scores[tokens, slots, None]
             output = output.index_add(0, tokens, values)
+        output = output.to(inputs.dtype)
         if hasattr(self, "routed_expert_norm"):
             output = self.routed_expert_norm(output)
         if hasattr(self, "routed_expert_up_proj"):

@@ -48,6 +48,7 @@ from ...components.optimizer.ema import EMA
 from ...components.optimizer.lr_scheduler import build_lr_scheduler
 from ...components.optimizer.optimizer import OptimizersContainer
 from ...components.optimizer.state_residency import validate_checkpoint_configuration
+from ...errors import UnsupportedCombinationError
 from ...memory.activation_swap import reset_activation_swap_metrics
 from ...models.common.aux_loss import register_aux_loss_metrics_hook
 from ...models.common.moe.bias_update import (
@@ -58,7 +59,10 @@ from ...models.hf.factory import (
     build_model_config_for,
     unwrap_text_config,
 )
+from ...models.hf.gdn_numerics import validate_gdn_numerical_training
+from ...models.hf.linear_attention import validate_linear_attention_training
 from ...models.hf.materialization import (
+    initialize_random_hf_model,
     initialize_rotary_on_device,
     materialize_meta_model,
 )
@@ -121,6 +125,12 @@ def _build_model(
     # In particular, synthetic token generation must use the real vocabulary,
     # including offline arch_overrides and local saved configurations.
     text_config = unwrap_text_config(hf_model_config)
+    validate_linear_attention_training(
+        cfg, text_config, device=trainer.device, parallel_dims=trainer.parallel_dims
+    )
+    validate_gdn_numerical_training(
+        cfg, text_config, device=trainer.device, parallel_dims=trainer.parallel_dims
+    )
     cfg.model.update_architecture(text_config)
     load_hf_weights = bool(
         cfg.checkpoint.enable
@@ -141,7 +151,30 @@ def _build_model(
         )
     ):
         compatibility.ep_hf_initial_load(trainer.parallel_dims.ep)
-    if load_hf_weights:
+    if not load_hf_weights and cfg.model.initialization_device == "meta":
+        if text_config.model_type not in (
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+            "kimi_linear",
+            "deepseek_v4",
+        ):
+            raise UnsupportedCombinationError(
+                "Random meta initialization requires Qwen3.5, DeepSeek V4 or Kimi; "
+                "initialization contract; other architectures need validation."
+            )
+        if any(
+            degree > 1
+            for degree in (
+                cfg.parallel.tp_size,
+                cfg.parallel.pp_size,
+                cfg.parallel.cp_size,
+            )
+        ) or (cfg.parallel.ep_size > 1 and text_config.model_type != "kimi_linear"):
+            raise UnsupportedCombinationError(
+                "Random meta initialization supports local/DP/FSDP and local Kimi "
+                "EP; other TP/EP/PP/CP paths need an ownership-aware initializer."
+            )
+    if load_hf_weights or cfg.model.initialization_device == "meta":
         with torch.device("meta"):
             model = HFTransformerModel(hf_model_config)
     else:
@@ -212,7 +245,7 @@ def _apply_parallelism(
         trainer.model = orchestration
         trainer.model_parts = [orchestration]
 
-    if load_hf_weights:
+    if load_hf_weights or cfg.model.initialization_device == "meta":
         materialization_error: BaseException | None = None
         try:
             for model_part in trainer.model_parts:
@@ -232,6 +265,19 @@ def _apply_parallelism(
         with synchronize_local_errors("Model materialization"):
             if materialization_error is not None:
                 raise materialization_error
+        if not load_hf_weights:
+            initialization_error: BaseException | None = None
+            try:
+                for model_part in trainer.model_parts:
+                    hf_model = model_part.model
+                    # DTensor initialization may communicate. Complete it
+                    # outside the local-only boundary, just like materialization.
+                    initialize_random_hf_model(hf_model)
+            except BaseException as error:
+                initialization_error = error
+            with synchronize_local_errors("Random model initialization"):
+                if initialization_error is not None:
+                    raise initialization_error
 
 
 def _build_optimizer_stack(trainer: Trainer) -> None:
@@ -434,6 +480,7 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
 
     # Metrics use the resolved topology and HF geometry of the model built above.
     with synchronize_local_errors("Metrics construction"):
+        text_config = unwrap_text_config(hf_model_config)
         trainer.metrics = MetricsProcessor(
             cfg.metrics,
             parallel_dims=trainer.parallel_dims,
@@ -441,10 +488,17 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
             num_parameters=num_parameters,
             num_trainable_parameters=num_trainable_parameters,
             pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
-            num_flops_per_token=flops_per_token(
-                unwrap_text_config(hf_model_config), seq_len=cfg.max_seq_len
-            ),
+            num_flops_per_token=flops_per_token(text_config, seq_len=cfg.max_seq_len),
         )
+        if text_config.model_type == "qwen3_5_moe_text":
+            logging_utils.get_logger(__name__).info(
+                "Qwen3.5 model FLOPs: recurrent-equivalent GDN, gated "
+                "projections, active experts and depthwise convolution; "
+                "full-square attention at sequence length %d. Excludes "
+                "recomputation, padding overhead, optimizer and communication; "
+                "this is model MFU, not measured kernel utilization.",
+                cfg.max_seq_len,
+            )
     trainer.training_observer = TrainingObserver(trainer.metrics, trainer.device)
     trainer.dispatch_timers = []
     if cfg.metrics.measure_moe_dispatch:

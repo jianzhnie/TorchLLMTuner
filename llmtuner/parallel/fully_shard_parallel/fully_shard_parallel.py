@@ -24,6 +24,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...accelerator.capabilities import has as capability
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_backend, is_distributed
+from ...models.kimi.delta_attention import KimiDeltaAttention
 from ...utils.logging import get_logger
 from ..compatibility import chunked_loss_fsdp
 from ..topology import ParallelTopology
@@ -274,6 +275,35 @@ def apply_fsdp_to_decoder(
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         reshard_after_forward_policy, pp_enabled
     )
+
+    # KDA owns FP32 decay parameters alongside BF16 projection children. FSDP
+    # requires uniform storage dtype per group, so wrap children first and the
+    # two direct parameters last. This preserves FQNs and gradient reduction.
+    for attention in list(model.modules()):
+        if not isinstance(attention, KimiDeltaAttention):
+            continue
+        if {p.dtype for p in attention.parameters()} == {param_dtype}:
+            continue
+        if fsdp_implementation != "native":
+            raise ValueError("Mixed-dtype Kimi KDA requires native FSDP")
+        children = [child for child in attention.children() if list(child.parameters())]
+        if children:
+            shard_fn(
+                children,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+        decay_config = dict(fsdp_config)
+        decay_config["mp_policy"] = MixedPrecisionPolicy(
+            param_dtype=torch.float32,
+            reduce_dtype=reduce_dtype,
+            cast_forward_inputs=False,
+        )
+        shard_fn(
+            attention,
+            **decay_config,
+            reshard_after_forward=reshard_after_forward,
+        )
 
     # Resolve ownership before any sharding replaces Parameters. Include
     # the decoder boundary units so a layer/norm/head alias is not split into
@@ -550,11 +580,24 @@ def apply_fsdp(
     # Preserve the dtype selected at model construction. Hard-coding float32
     # here silently makes FSDP all-gather BF16 parameters as FP32, doubling the
     # transient parameter and operator footprint in mixed-precision runs.
-    # A single dtype is asserted rather than assumed: with mixed-dtype
-    # parameters FSDP would all-gather the minority dtype AS the first
-    # parameter's dtype, silently downcasting them (upstream has a
-    # param_dtype_override_fn hook for this; llmtuner refuses instead).
-    param_dtypes = {p.dtype for p in model.parameters()}
+    # FSDP requires uniform storage dtype per group. KDA's FP32 decay
+    # parameters get a separate nested group; all remaining parameters must
+    # share the dtype used by the decoder and boundary groups.
+    kda_parameters = {
+        parameter
+        for module in model.modules()
+        if isinstance(module, KimiDeltaAttention)
+        for parameter in (module.A_log, module.dt_bias)
+    }
+    param_dtypes = {p.dtype for p in model.parameters() if p not in kda_parameters}
+    if (
+        any(p.dtype not in param_dtypes for p in kda_parameters)
+        and cfg.fsdp_config.fsdp_apply_modules
+    ):
+        raise ValueError(
+            "Kimi KDA FP32 decay parameters require decoder FSDP wrapping; "
+            "fsdp_apply_modules patterns are not supported"
+        )
     if len(param_dtypes) > 1:
         raise ValueError(
             "FSDP requires a single parameter dtype, got "

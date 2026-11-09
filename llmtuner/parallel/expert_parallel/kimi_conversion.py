@@ -145,6 +145,8 @@ def convert_kimi_block(
         else AllToAllTokenDispatcher(count, block.gate.top_k)
     )
     dispatcher.set_ep_group(ep_group=ep_group)
+    # Official Kimi combines weighted expert outputs before the BF16 cast.
+    dispatcher.accumulate_in_fp32 = True
     if ep_group is not None:
         mark_experts_ep_sharded(experts, ep_group)
     moe = MoE(

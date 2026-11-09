@@ -386,6 +386,12 @@ def swap_hf_moe_blocks(
     )
 
     hf_config = getattr(getattr(model, "model", None), "config", None)
+    if getattr(hf_config, "experts_implementation", "native") == "pre_down":
+        raise UnsupportedCombinationError(
+            "EP MoE replacement cannot preserve experts_implementation='pre_down'; "
+            "use native experts or retain the local/DP/FSDP HF expert path. "
+            "This also applies to single-rank fixed-router replacement."
+        )
     aux_loss_coeff = (
         router_aux_loss_coef
         if router_aux_loss_coef is not None
