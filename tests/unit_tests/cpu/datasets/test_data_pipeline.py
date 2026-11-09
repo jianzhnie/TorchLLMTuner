@@ -3984,3 +3984,34 @@ def test_global_context_rows_rejects_synthetic_data_before_building_loader():
     cfg = _loader_config(DataloaderConfig(global_context_rows=True))
     with pytest.raises(ValueError, match="requires a text corpus dataset"):
         build_dataloader(cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=32)
+
+
+def test_chat_processor_forwards_explicit_template_options(tokenizer):
+    tokenizer.set_chat_template(
+        "{{ 'lorem ' if enable_thinking else 'ipsum ' }}"
+        "{% for message in messages %}{{ message.content }} {% endfor %}"
+    )
+    processor = ChatProcessor(
+        context=make_context(tokenizer, max_context_length=32),
+        messages_fn=lambda sample: sample["messages"],
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    messages = [
+        {"role": "user", "content": "lorem"},
+        {"role": "assistant", "content": "ipsum"},
+    ]
+    sequence = processor({"messages": messages}, np.random.default_rng(0))
+    assert sequence is not None
+    full_text = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=False, enable_thinking=False
+    ).rstrip("\n")
+    tokens = tokenizer.encode(full_text, add_bos=True, add_eos=False)
+    if tokens[-1] != tokenizer.eos_id:
+        tokens.append(tokenizer.eos_id)
+    assert sequence.input_ids.tolist() == tokens[:-1]
+    prompt = tokenizer.apply_chat_template(
+        messages[:1], add_generation_prompt=True, enable_thinking=False
+    )
+    boundary = len(tokenizer.encode(prompt, add_bos=True, add_eos=False)) - 1
+    assert np.all(sequence.labels[:boundary] == IGNORE_INDEX)
+    assert np.any(sequence.labels[boundary:] != IGNORE_INDEX)

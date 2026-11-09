@@ -1186,3 +1186,19 @@ def test_cli_resolves_fsdp_reduction_dtype():
     assert FSDPConfig().fsdp_reduce_dtype == "float32"
     config = parse_config(["--fsdp_reduce_dtype", "float64"])
     assert config.parallel.fsdp_config.fsdp_reduce_dtype == "float64"
+
+
+def test_pre_down_experts_reject_compile_before_model_allocation():
+    with pytest.raises(ConfigError, match="pre_down.*eager"):
+        LLMTunerConfig(
+            model=ModelConfig(experts_implementation="pre_down"),
+            training=TrainingConfig(compile=True),
+        )
+    assert (
+        LLMTunerConfig(
+            model=ModelConfig(experts_implementation="pre_down"),
+            training=TrainingConfig(compile=False),
+        ).model.experts_implementation
+        == "pre_down"
+    )
+    assert LLMTunerConfig(training=TrainingConfig(compile=True)).training.compile

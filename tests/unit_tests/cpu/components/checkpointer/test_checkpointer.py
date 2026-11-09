@@ -590,7 +590,10 @@ def test_the_checkpoint_backend_selector_accepts_both_and_rejects_typos() -> Non
         CheckpointConfig(backend="torchcheckpointing")
 
 
-def test_the_torch_checkpointing_backend_round_trips_a_checkpoint(tmp_path) -> None:
+@pytest.mark.parametrize("async_mode", ["disabled", "async", "async_with_pinned_mem"])
+def test_the_torch_checkpointing_backend_round_trips_a_checkpoint(
+    tmp_path, async_mode
+) -> None:
     """The port's backend-dependent paths, exercised now that the package exists.
 
     Exercise the installed backend through save, close, independent manager
@@ -611,7 +614,7 @@ def test_the_torch_checkpointing_backend_round_trips_a_checkpoint(tmp_path) -> N
     expected = {key: value.clone() for key, value in model.state_dict().items()}
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
-    config = Config(enable=True, interval=1, keep_latest_k=0)
+    config = Config(enable=True, interval=1, keep_latest_k=0, async_mode=async_mode)
     manager = TorchCheckpointingManager(
         config,
         model_parts=[model],
@@ -621,6 +624,9 @@ def test_the_torch_checkpointing_backend_round_trips_a_checkpoint(tmp_path) -> N
         folder=str(tmp_path),
     )
     try:
+        # Real CPU roundtrip must not allocate accelerator staging streams just
+        # because an optional NPU backend is installed in the environment.
+        assert manager._manager._saver.stager is None
         assert manager.save(1)
     finally:
         manager.close()
@@ -685,6 +691,7 @@ def test_an_enabled_manager_registers_the_lr_scheduler(monkeypatch) -> None:
 
     monkeypatch.setattr(tc, "require_torch_checkpointing", _StubBackend)
     monkeypatch.setattr(tc, "async_save_config", _stop)
+    monkeypatch.setattr(tc, "sync_save_config", lambda *args, **kwargs: _stop(args[0]))
 
     sentinel = object()
     states: dict[str, object] = {}
@@ -2476,6 +2483,7 @@ def test_torch_checkpointing_failed_thread_start_closes_backend(
     backend = SimpleNamespace(LocalFileSystemStorageConfig=lambda **kwargs: storage)
     monkeypatch.setattr(tc, "require_torch_checkpointing", lambda: backend)
     monkeypatch.setattr(tc, "async_save_config", lambda backend: object())
+    monkeypatch.setattr(tc, "sync_save_config", lambda *args, **kwargs: object())
     monkeypatch.setattr(tc, "default_backend_config", lambda *a, **kw: manager_config)
     monkeypatch.setattr(
         tc,
@@ -3464,3 +3472,48 @@ def test_optional_checkpoint_backend_preserves_import_failure(monkeypatch, cause
     with pytest.raises(ImportError, match="DCP checkpoint manager") as failure:
         torch_checkpointing_backend.require_torch_checkpointing()
     assert failure.value.__cause__ is cause
+
+
+def test_cpu_checkpoint_payload_rejects_accelerator_custom_state():
+    from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
+        require_cpu_checkpoint_payload,
+    )
+
+    require_cpu_checkpoint_payload({"model": torch.ones(2), "step": 50})
+    with pytest.raises(ValueError, match="optimizer/custom"):
+        require_cpu_checkpoint_payload(
+            {"model": torch.ones(2), "custom": [torch.empty(2, device="meta")]}
+        )
+
+
+def test_cpu_save_payload_validates_stateful_result_without_copy():
+    from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
+        TorchCheckpointingManager,
+    )
+
+    class State:
+        def __init__(self, tensor):
+            self.tensor = tensor
+            self.calls = 0
+
+        def state_dict(self):
+            self.calls += 1
+            return {"tensor": self.tensor}
+
+        def load_state_dict(self, state):
+            self.tensor = state["tensor"]
+
+    manager = TorchCheckpointingManager.__new__(TorchCheckpointingManager)
+    manager._cpu_synchronous_save = True
+    state = State(torch.tensor([1.0, -2.0]))
+    payload = manager._save_payload({"custom": state})
+    assert state.calls == 1
+    assert payload["custom"]["tensor"] is state.tensor
+    state.tensor = torch.empty(2, device="meta")
+    with pytest.raises(ValueError, match="optimizer/custom"):
+        manager._save_payload({"custom": state})
+    assert state.calls == 2
+    # The CPU-only restriction is scoped to the CPU writer, not accelerator
+    # writers. This checks dispatch only, without executing accelerator math.
+    manager._cpu_synchronous_save = False
+    assert manager._save_payload({"custom": state})["custom"]["tensor"].is_meta

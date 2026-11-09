@@ -88,6 +88,11 @@ def test_missing_symmetric_memory_does_not_disable_autograd_collectives():
                 import sys
                 import torch
 
+                # Complete normal accelerator/dependency imports before injecting
+                # the missing optional leaf capability. Otherwise a partially
+                # imported torch_npu may re-register its rendezvous handler.
+                import llmtuner.parallel.tensor_parallel.linear_ops
+                del sys.modules['llmtuner.parallel.tensor_parallel.linear_ops']
                 sys.modules['torch.distributed._symmetric_memory'] = None
                 from llmtuner.parallel.tensor_parallel.linear_ops import (
                     resolve_autograd_collectives,

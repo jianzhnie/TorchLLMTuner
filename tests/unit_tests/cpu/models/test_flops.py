@@ -265,6 +265,127 @@ def test_the_dense_prefix_of_a_mixed_stack_costs_the_dense_width() -> None:
 # -- MLA ----------------------------------------------------------------------
 
 
+def _qwen35_moe() -> PretrainedConfig:
+    return AutoConfig.for_model(
+        "qwen3_5_moe_text",
+        hidden_size=32,
+        vocab_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=3,
+        linear_value_head_dim=5,
+        linear_conv_kernel_dim=4,
+        num_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=7,
+        shared_expert_intermediate_size=11,
+        layer_types=["linear_attention", "full_attention"],
+    )
+
+
+def test_qwen35_native_moe_counts_gates_conv_and_recurrent_work() -> None:
+    arch = _qwen35_moe()
+    # Forward FLOPs from each native projection's input/output dimensions.
+    gdn_forward = 2 * (
+        32 * (2 * 2 * 3 + 4 * 5)  # qkv, before Q/K head repetition
+        + 32 * 4 * 5  # z
+        + 2 * 32 * 4  # a, b
+        + 4 * 5 * 32  # output
+        + (2 * 2 * 3 + 4 * 5) * 4  # depthwise conv
+    )
+    full_forward = 2 * (
+        32 * (2 * 4 * 8)  # Q and output gate
+        + 2 * 32 * 2 * 8  # K, V
+        + 4 * 8 * 32  # output
+    )
+    moe_forward = 2 * (
+        32 * 8  # router, every expert scored
+        + 2 * (2 * 32 * 7 + 7 * 32)  # only top-k experts
+        + 2 * 32 * 11
+        + 11 * 32  # shared expert, every token
+        + 32  # scalar shared gate
+    )
+    expected = (
+        3 * (gdn_forward + full_forward + 2 * moe_forward + 2 * 32 * 64)
+        + 18 * 4 * 3 * 5  # recurrence uses value heads, not key heads
+        + 12 * 4 * 8 * 13  # full-square attention, no causal discount
+    )
+    assert flops_per_token(arch, seq_len=13) == expected
+
+
+@pytest.mark.parametrize("kind", ["linear_attention", "full_attention"])
+def test_qwen35_homogeneous_stacks_have_correct_length_dependence(kind) -> None:
+    arch = _qwen35_moe()
+    arch.layer_types = [kind] * 2
+    delta = flops_per_token(arch, seq_len=65) - flops_per_token(arch, seq_len=13)
+    assert delta == (0 if kind == "linear_attention" else 2 * 12 * 4 * 8 * 52)
+
+
+def test_qwen35_native_moe_ignores_other_families_dense_layer_selectors() -> None:
+    arch = _qwen35_moe()
+    expected = flops_per_token(arch, seq_len=13)
+    arch.first_k_dense_replace = 2
+    arch.decoder_sparse_step = 3
+    arch.moe_layer_freq = 3
+    arch.mlp_only_layers = [0, 1]
+    arch.intermediate_size = 999
+    arch.tie_word_embeddings = True
+    assert flops_per_token(arch, seq_len=13) == expected
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "hidden_size",
+        "vocab_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_conv_kernel_dim",
+        "num_experts",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+        "shared_expert_intermediate_size",
+    ],
+)
+@pytest.mark.parametrize("value", [None, 0, -1, True, 1.5])
+def test_qwen35_invalid_native_geometry_suppresses_flops(field, value) -> None:
+    fields = vars(_qwen35_moe()).copy()
+    fields["model_type"] = "qwen3_5_moe_text"
+    fields[field] = value
+    assert flops_per_token(_Arch(**fields), seq_len=13) == 0
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("num_key_value_heads", 3),
+        ("linear_num_key_heads", 3),
+        ("linear_num_key_heads", 8),
+        ("num_experts_per_tok", 9),
+        ("layer_types", None),
+        ("layer_types", "linear_attention"),
+        ("layer_types", ["linear_attention"]),
+        ("layer_types", ["full_attention"] * 3),
+        ("layer_types", ["linear_attention", "sliding_attention"]),
+    ],
+)
+def test_qwen35_unresolved_native_layout_suppresses_flops(field, value) -> None:
+    fields = vars(_qwen35_moe()).copy()
+    fields["model_type"] = "qwen3_5_moe_text"
+    fields[field] = value
+    assert flops_per_token(_Arch(**fields), seq_len=13) == 0
+
+
 @pytest.mark.parametrize("q_lora_rank", [None, 16])
 def test_mla_projection_cost_matches_actual_hf_linear_weights(q_lora_rank):
     from transformers.models.deepseek_v3.modeling_deepseek_v3 import (

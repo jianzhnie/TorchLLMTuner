@@ -1677,3 +1677,17 @@ def test_swap_preserves_external_router_bias_or_rejects_before_install(bias_dtyp
         assert converted is model.external_bias
         converted.add_(1)
         torch.testing.assert_close(model.external_bias, torch.ones_like(bias))
+
+
+@pytest.mark.parametrize("fixed_router", [False, True])
+def test_pre_down_policy_rejected_before_ep_replacement(fixed_router):
+    config = _config(norm_topk_prob=True)
+    model = HFTransformerModel(config)
+    model.model.config.experts_implementation = "pre_down"
+    original = list(model.layers)
+    parameters = dict(model.named_parameters())
+    with pytest.raises(UnsupportedCombinationError, match="cannot preserve.*pre_down"):
+        swap_hf_moe_blocks(model, fixed_router=fixed_router)
+    assert list(model.layers) == original
+    after = dict(model.named_parameters())
+    assert all(after[key] is p for key, p in parameters.items())
