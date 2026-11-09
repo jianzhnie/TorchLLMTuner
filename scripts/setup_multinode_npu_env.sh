@@ -19,7 +19,15 @@ transformers_version_prefix="${TRANSFORMERS_VERSION_PREFIX:-5.13.}"
 torch_version_prefix="${TORCH_VERSION_PREFIX:-2.12.}"
 torch_npu_version_prefix="${TORCH_NPU_VERSION_PREFIX:-$torch_version_prefix}"
 runtime_python_version="${RUNTIME_PYTHON_VERSION:-3.12}"
+# Set an absolute container path to install without changing its default Python.
+runtime_venv="${RUNTIME_VENV:-}"
+if [[ -n "$runtime_venv" && "$runtime_venv" != /* ]]; then
+  echo "RUNTIME_VENV must be an absolute container path" >&2
+  exit 1
+fi
 require_npu="${REQUIRE_NPU:-1}"
+install_triton="${INSTALL_TRITON:-0}"
+triton_version_prefix="${TRITON_VERSION_PREFIX:-3.2.1}"
 preflight_only="${PREFLIGHT_ONLY:-0}"
 verify_wheel_hashes="${VERIFY_WHEEL_HASHES:-1}"
 ssh_timeout="${SSH_CONNECT_TIMEOUT:-8}"
@@ -33,6 +41,11 @@ fi
 
 if [[ "$require_npu" != 0 && "$require_npu" != 1 ]]; then
   echo "REQUIRE_NPU must be 0 or 1" >&2
+  exit 1
+fi
+
+if [[ "$install_triton" != 0 && "$install_triton" != 1 ]]; then
+  echo "INSTALL_TRITON must be 0 or 1" >&2
   exit 1
 fi
 
@@ -97,6 +110,9 @@ torch_npu_wheel="${TORCH_NPU_WHEEL:-local/torch_npu-2.12.0-cp312-cp312-manylinux
 declare -a wheels=(
   "$torch_wheel"
   "$torch_npu_wheel"
+  "local/sympy-1.14.0-py3-none-any.whl"
+  "local/mpmath-1.3.0-py3-none-any.whl"
+  "local/networkx-3.4.2-py3-none-any.whl"
   "local/typing_extensions-4.16.0-py3-none-any.whl"
   "local/filelock-4.1.1-py3-none-any.whl"
   "local/jinja2-3.1.6-py3-none-any.whl"
@@ -150,7 +166,15 @@ declare -a wheels=(
   "local/einops-0.8.2-py3-none-any.whl"
   "local/six-1.17.0-py2.py3-none-any.whl"
   "local/zipp-4.1.1-py3-none-any.whl"
+  # Torch 2.12 requires setuptools<82.
+  "local/setuptools-81.0.0-py3-none-any.whl"
 )
+
+if (( install_triton )); then
+  # --no-deps requires explicitly installing the Ascend compiler dependency.
+  wheels+=("local/pybind11-3.0.2-py3-none-any.whl")
+  wheels+=("${TRITON_WHEEL:-local/triton_ascend-3.2.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl}")
+fi
 
 for relative_path in "${wheels[@]}"; do
   if [[ ! -f "$(wheel "$relative_path")" ]]; then
@@ -177,6 +201,7 @@ echo "Local preflight passed: ${#nodes[@]} node(s), ${#wheels[@]} wheel(s),"
 echo "Transformers=${transformers_root}, Python=${runtime_python_version},"
 echo "Torch=${torch_version_prefix}, Torch-NPU=${torch_npu_version_prefix},"
 echo "NPU required=${require_npu}, wheel hashes=${verify_wheel_hashes}."
+echo "Triton install=${install_triton}, expected distribution=${triton_version_prefix}*."
 if (( preflight_only )); then
   exit 0
 fi
@@ -193,6 +218,10 @@ runtime_python_version="$7"
 require_npu="$8"
 verify_wheel_hashes="$9"
 shift 9
+runtime_venv="$1"
+install_triton="$2"
+triton_version_prefix="$3"
+shift 3
 wheel_specs=("$@")
 
 if [[ "$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null)" != true ]]; then
@@ -235,10 +264,34 @@ for spec in specs:
 PY
 fi
 
-docker exec "$container_name" python -m pip install \
+runtime_python=python
+if [[ -n "$runtime_venv" ]]; then
+  if ! docker exec "$container_name" test -x "$runtime_venv/bin/python"; then
+    docker exec "$container_name" python -m venv "$runtime_venv"
+  fi
+  runtime_python="$runtime_venv/bin/python"
+fi
+
+docker exec "$container_name" "$runtime_python" -m pip install \
   --disable-pip-version-check --no-input --no-deps --no-index \
   --no-cache-dir --upgrade --force-reinstall \
   "${python_args[@]}"
+
+if [[ -n "$runtime_venv" ]]; then
+  # Keep the extracted offline runtime discoverable in child processes even
+  # when a launcher intentionally replaces PYTHONPATH with the repository.
+  docker exec -i "$container_name" "$runtime_python" - "$transformers_root" <<'PY'
+import site
+import sys
+from pathlib import Path
+
+roots = sys.argv[1].split(":")
+if any(not Path(root).is_absolute() or "\n" in root for root in roots):
+    raise SystemExit("Transformers roots must be absolute, single-line paths")
+target = Path(site.getsitepackages()[0]) / "llmtuner_offline_transformers.pth"
+target.write_text("\n".join(roots) + "\n")
+PY
+fi
 
 docker exec \
   -e PYTHONPATH="$transformers_root" \
@@ -248,9 +301,12 @@ docker exec \
   -e EXPECTED_PYTHON_VERSION="$runtime_python_version" \
   -e REQUIRE_NPU="$require_npu" \
   -e EXPECTED_TRANSFORMERS_ROOT="$first_transformers_root" \
-  "$container_name" python -c '
+  -e INSTALL_TRITON="$install_triton" \
+  -e EXPECTED_TRITON_PREFIX="$triton_version_prefix" \
+  "$container_name" "$runtime_python" -c '
 import os
 import sys
+from importlib import import_module, metadata
 from pathlib import Path
 
 import datasets
@@ -279,6 +335,17 @@ npu_count = torch.npu.device_count() if npu_available else 0
 if os.environ["REQUIRE_NPU"] == "1":
     assert npu_available and npu_count > 0, (npu_available, npu_count)
 
+triton_info = None
+if os.environ["INSTALL_TRITON"] == "1":
+    triton = import_module("triton")
+    triton_version = metadata.version("triton_ascend")
+    assert triton_version.startswith(os.environ["EXPECTED_TRITON_PREFIX"]), triton_version
+    triton_info = {
+        "distribution_version": triton_version,
+        "module_version": triton.__version__,
+        "file": triton.__file__,
+    }
+
 print({
     "python": python_version,
     "torch": torch.__version__,
@@ -289,6 +356,7 @@ print({
     "grain": grain.__version__,
     "npu_available": npu_available,
     "npu_count": npu_count,
+    "triton": triton_info,
 })
 '
 REMOTE
@@ -339,7 +407,8 @@ for node in "${nodes[@]}"; do
       "$remote_transformers_root" \
       "$transformers_version_prefix" "$torch_version_prefix" \
       "$torch_npu_version_prefix" "$runtime_python_version" "$require_npu" \
-      "$verify_wheel_hashes" "${wheel_specs[@]}")" \
+      "$verify_wheel_hashes" "$runtime_venv" "$install_triton" \
+      "$triton_version_prefix" "${wheel_specs[@]}")" \
     <<<"$remote_script" >"$log_file" 2>&1 &
   pids+=("$!")
   batch_nodes+=("$node")
