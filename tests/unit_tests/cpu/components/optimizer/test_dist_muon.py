@@ -76,10 +76,10 @@ def test_constructor_validates_names_before_compute_layout_lookup():
     ],
 )
 def test_block_compute_rejects_invalid_matrix_geometry(shape, dim, message):
-    from llmtuner.components.optimizer.flex_shard.muon_layout import (
+    from llmtuner.components.optimizer.flex_shard.dist_muon import (
         _resolve_storage_to_compute_transition,
     )
-    from llmtuner.config.optimizer_layout import BlockShard
+    from llmtuner.components.optimizer.flex_shard.optimizer_reshard import BlockShard
 
     mesh = DeviceMesh("cpu", [0], mesh_dim_names=("dp_shard",))
     parameter = DTensor.from_local(torch.zeros(shape), mesh, (Shard(0),))
@@ -236,15 +236,15 @@ def test_dist_muon_accepts_batched_matrix_parameters():
 @pytest.mark.parametrize(
     "options",
     [
-        {"lr": float("inf")},
+        {"lr": -1.0},
         {"weight_decay": float("nan")},
-        {"momentum": float("inf")},
-        {"eps": 0.0},
-        {"eps": True},
-        {"ns_steps": True},
-        {"nesterov": 1},
+        {"momentum": -1.0},
+        {"eps": -1.0},
+        {"ns_steps": 1.5},
+        {"ns_steps": 100},
         {"ns_coefficients": None},
-        {"ns_coefficients": (3.0, float("inf"), 2.0)},
+        {"ns_coefficients": ("invalid", -4.0, 2.0)},
+        {"ns_coefficients": ((3.0, -4.0, 2.0),)},
     ],
 )
 def test_dist_muon_rejects_invalid_update_options(options):
@@ -261,7 +261,7 @@ def test_dist_muon_rejects_invalid_checkpoint_options():
     original_groups = deepcopy(optimizer.param_groups)
     state = deepcopy(optimizer.state_dict())
     state["param_groups"][0]["lr"] = 0.5
-    state["param_groups"][0]["eps"] = 0.0
+    state["param_groups"][0]["eps"] = -1.0
     with pytest.raises(ValueError, match="unsupported DistMuon group"):
         optimizer.load_state_dict(state)
     assert optimizer.param_groups[0]["lr"] == original_groups[0]["lr"]
@@ -357,3 +357,34 @@ def test_dist_muon_multiple_groups_update_and_resume_by_fqn():
             rtol=0,
             atol=0,
         )
+
+
+@pytest.mark.parametrize("as_lists", [False, True])
+def test_dist_muon_accepts_per_step_ns_coefficients(as_lists):
+    model = _model()
+    coefficients = ((3.4445, -4.7750, 2.0315), (3.0, -4.0, 2.0))
+    config = _config()
+    config.param_groups[0].optimizer_kwargs.update(
+        ns_steps=2,
+        ns_coefficients=[list(step) for step in coefficients]
+        if as_lists
+        else coefficients,
+    )
+    optimizer = OptimizersContainer(config, model_parts=[model])
+    initial = model.weight.to_local().detach().clone()
+    model.weight.grad = DTensor.from_local(
+        torch.ones_like(initial), model.weight.device_mesh, model.weight.placements
+    )
+    optimizer.step()
+    assert torch.isfinite(model.weight.to_local()).all()
+    assert not torch.equal(initial, model.weight.to_local())
+
+
+def test_dist_muon_accepts_upstream_zero_epsilon():
+    model = _model()
+    config = _config()
+    config.param_groups[0].optimizer_kwargs["eps"] = 0.0
+    optimizer = OptimizersContainer(config, model_parts=[model])
+    model.weight.grad = torch.ones_like(model.weight)
+    optimizer.step()
+    assert torch.isfinite(model.weight.to_local()).all()

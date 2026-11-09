@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch.distributed.tensor import Shard
 
-from llmtuner.config.optimizer_layout import (
+from llmtuner.components.optimizer.flex_shard.optimizer_reshard import (
     BlockShard,
     BucketConfig,
     ComputeLayout,
@@ -18,41 +18,25 @@ def test_bucket_config_normalizes_pattern_sequence():
     assert config.name == "weights"
 
 
-@pytest.mark.parametrize("patterns", ["weight", (), ("",), ("weight", 1)])
-def test_bucket_config_rejects_invalid_patterns(patterns):
-    with pytest.raises(ValueError, match="BucketConfig.patterns"):
-        BucketConfig(patterns=patterns)
+@pytest.mark.parametrize("patterns", [(), ("",), ("", "weight")])
+def test_bucket_config_preserves_upstream_empty_pattern_semantics(patterns):
+    config = BucketConfig(patterns=patterns, name=None)
+    assert config.patterns == patterns
+    assert config.name is None
 
 
-def test_bucket_config_rejects_non_string_name():
-    with pytest.raises(ValueError, match="BucketConfig.name"):
-        BucketConfig(patterns=("weight",), name=None)
+def test_block_shard_boundary_arithmetic_matches_upstream():
+    blocks = BlockShard(dim=0, block_sizes=(2, 4))
+    assert blocks.num_blocks(0) == 0
+    assert blocks.num_blocks(12) == 4
+    assert [blocks.block_start(i) for i in range(5)] == [0, 2, 6, 8, 12]
+    with pytest.raises(ValueError, match="divisible"):
+        blocks.num_blocks(5)
 
 
-@pytest.mark.parametrize("dim_size", [-1, 1.5, True])
-def test_block_shard_rejects_invalid_dimension_size(dim_size):
-    with pytest.raises(ValueError, match="dimension size"):
-        BlockShard(dim=0, block_sizes=(2,)).num_blocks(dim_size)
-
-
-@pytest.mark.parametrize("block_index", [-1, 1.5, False])
-def test_block_shard_rejects_invalid_block_index(block_index):
-    with pytest.raises(ValueError, match="block index"):
-        BlockShard(dim=0, block_sizes=(2,)).block_start(block_index)
-
-
-def test_compute_layout_rejects_non_string_shard_order_names():
-    with pytest.raises(ValueError, match="non-empty mesh axis names"):
-        ComputeLayout(
-            shardings_by_mesh_axis={"dp": Shard(0), "tp": Shard(0)},
-            shard_order_by_tensor_dim={0: (["invalid"], "tp")},
-            compute_dtype=torch.bfloat16,
-        )
-
-
-def test_compute_layout_rejects_empty_mesh_axis_name():
-    with pytest.raises(ValueError, match="mesh axis names must not be empty"):
-        ComputeLayout(shardings_by_mesh_axis={"": Shard(0)})
+def test_compute_layout_preserves_unused_empty_axis_declaration():
+    config = ComputeLayout(shardings_by_mesh_axis={"dp": Shard(0), "": Shard(0)})
+    assert config.shardings_by_mesh_axis[""] == Shard(0)
 
 
 def test_compute_layout_pickle_round_trip_preserves_immutable_mappings():

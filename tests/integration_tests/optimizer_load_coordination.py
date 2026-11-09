@@ -13,9 +13,13 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
+from llmtuner.components.optimizer.flex_shard.optimizer_reshard import (
+    BucketConfig,
+    ComputeLayout,
+    Owned,
+)
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config.optimizer_config import OptimizerConfig, ParamGroupConfig
-from llmtuner.config.optimizer_layout import BucketConfig, ComputeLayout, Owned
 from llmtuner.errors import UnsupportedCombinationError
 
 

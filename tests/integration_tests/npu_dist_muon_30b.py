@@ -3,6 +3,7 @@
 Checkpoint settings follow the example; this script does not assert recovery.
 """
 
+import importlib
 import os
 import time
 from collections import defaultdict
@@ -11,12 +12,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
-from examples.train_qwen3_30b_npu import qwen3_30b_npu_config
 from llmtuner.components.optimizer.flex_shard import (
     BucketConfig,
     ComputeLayout,
     Owned,
-    optimizer_reshard_runtime,
 )
 from llmtuner.components.optimizer.flex_shard.dist_muon import DistMuon
 from llmtuner.config import OptimizerConfig, ParamGroupConfig
@@ -28,10 +27,12 @@ PATTERN = r".*\.(q_proj|k_proj|v_proj|o_proj)\.weight$"
 
 
 def install_profile():
+    from llmtuner.components.optimizer.flex_shard import _optimizer_reshard_runtime
+
     events = defaultdict(list)
     original_step = DistMuon.step
     original_compute = DistMuon._compute_update
-    original_all_to_all = optimizer_reshard_runtime._execute_packed_all_to_all
+    original_all_to_all = _optimizer_reshard_runtime._execute_packed_all_to_all
 
     def timed(name, function, *args, **kwargs):
         start = torch.npu.Event(enable_timing=True)
@@ -63,12 +64,12 @@ def install_profile():
 
     DistMuon.step = step
     DistMuon._compute_update = compute
-    optimizer_reshard_runtime._execute_packed_all_to_all = all_to_all
+    _optimizer_reshard_runtime._execute_packed_all_to_all = all_to_all
 
     def restore():
         DistMuon.step = original_step
         DistMuon._compute_update = original_compute
-        optimizer_reshard_runtime._execute_packed_all_to_all = original_all_to_all
+        _optimizer_reshard_runtime._execute_packed_all_to_all = original_all_to_all
 
     return events, restore
 
@@ -100,11 +101,14 @@ def print_profile(events, trainer):
 
 
 def main():
-    config = qwen3_30b_npu_config()
+    from llmtuner.components.optimizer.flex_shard import _optimizer_reshard_runtime
+
+    recipe = importlib.import_module("examples.train_qwen3_30b_npu")
+    config = recipe.qwen3_30b_npu_config()
     if slots := int(os.environ.get("LLMTUNER_DIST_MUON_SLOTS", "0")):
         if slots < 1:
             raise ValueError("LLMTUNER_DIST_MUON_SLOTS must be positive")
-        optimizer_reshard_runtime._NUM_PIPELINE_SLOTS = slots
+        _optimizer_reshard_runtime._NUM_PIPELINE_SLOTS = slots
     original = assembly._build_optimizer_stack
     counts = {}
 

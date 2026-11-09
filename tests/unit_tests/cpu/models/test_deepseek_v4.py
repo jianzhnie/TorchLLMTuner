@@ -76,7 +76,7 @@ def test_v4_recipe_chat_template_preserves_supervision_boundary():
 
         pytest.skip("Official V4 tokenizer is unavailable")
     tokenizer = HuggingFaceTokenizer(tokenizer_path=str(root))
-    template = Path("examples/deepseek_v4/chat_template.jinja").read_text(
+    template = Path("examples/deepseek_v4_pro/chat_template.jinja").read_text(
         encoding="utf-8"
     )
     tokenizer.set_chat_template(template)

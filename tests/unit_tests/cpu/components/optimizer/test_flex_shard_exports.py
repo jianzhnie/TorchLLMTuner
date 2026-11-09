@@ -9,13 +9,10 @@ def test_layout_config_import_does_not_load_dist_muon_runtime():
             "-c",
             "import llmtuner.config.optimizer_config; "
             "import sys; "
-            "assert not any(name.startswith("
-            "'llmtuner.components.optimizer.flex_shard') "
-            "for name in sys.modules); "
             "assert 'llmtuner.components.optimizer.flex_shard.dist_muon' "
             "not in sys.modules; "
             "assert ('llmtuner.components.optimizer.flex_shard.' "
-            "'optimizer_reshard_runtime') "
+            "'_optimizer_reshard_runtime') "
             "not in sys.modules",
         ],
         check=False,

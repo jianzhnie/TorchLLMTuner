@@ -1,6 +1,6 @@
 """Packed transport grouping preserves ordering and empty parameter slots."""
 
-from llmtuner.components.optimizer.flex_shard.optimizer_reshard_schedule import (
+from llmtuner.components.optimizer.flex_shard._optimizer_reshard_schedule import (
     _packed_spans_by_parameter,
     _PackedSpan,
     _TensorRegion,

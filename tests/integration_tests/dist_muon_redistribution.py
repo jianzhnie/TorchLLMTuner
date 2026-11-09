@@ -182,9 +182,11 @@ def main() -> None:
 
         tp_mesh = DeviceMesh(device.type, [[0, 1]], mesh_dim_names=("dp_shard", "tp"))
         tp_model = torch.nn.Module()
+        # Omission preserves storage Shard, which upstream rejects for a 2D
+        # matrix: its rows may not be treated as independent matrices.
         tp_model.weight = torch.nn.Parameter(
             DTensor.from_local(
-                initial[local_slice, local_slice].clone(),
+                initial[local_slice].clone(),
                 tp_mesh,
                 (Shard(0), Shard(0)),
                 shape=(4, 4),
@@ -193,14 +195,14 @@ def main() -> None:
         )
         try:
             _optimizer(tp_model, Owned())
-        except NotImplementedError as error:
-            assert "ComputeLayout omits" in str(error)
+        except ValueError as error:
+            assert "2D Muon compute cannot use Shard" in str(error)
         else:
-            raise AssertionError("DistMuon accepted an undeclared TP sharding axis")
+            raise AssertionError("DistMuon accepted an incomplete 2D matrix")
 
         print(
             f"rank {rank}: Owned and misaligned BlockShard redistribution "
-            "match references; undeclared TP axis is rejected",
+            "match references; incomplete 2D matrix is rejected",
             flush=True,
         )
     finally:
