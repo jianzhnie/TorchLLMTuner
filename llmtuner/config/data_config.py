@@ -56,6 +56,10 @@ class DataloaderConfig:
         default="response",
         metadata={"help": "Assistant field used by dataset=local_jsonl_sft."},
     )
+    chat_template: str | None = field(
+        default=None,
+        metadata={"help": "Optional Jinja chat template supplied by the recipe"},
+    )
     chat_template_kwargs: dict[str, Any] = field(
         default_factory=dict,
         metadata={

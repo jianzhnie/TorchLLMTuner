@@ -280,6 +280,8 @@ def build_dataloader(
             tokenizer = HuggingFaceTokenizer(
                 tokenizer_path=dataloader_config.tokenizer_path
             )
+        if dataloader_config.chat_template is not None:
+            tokenizer.set_chat_template(dataloader_config.chat_template)
         resolved = _resolve_text_recipe(
             dataloader_config, dataset_name=dataset_name, tokenizer=tokenizer
         )

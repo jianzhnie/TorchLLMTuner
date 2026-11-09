@@ -66,6 +66,12 @@ class KimiGatedRMSNorm(KimiRMSNorm):
     """Normalize each value head before applying its sigmoid output gate."""
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        return super().forward(hidden_states) * gate.float().sigmoid().to(
+        # FLA and native HF gated RMSNorm keep normalization, affine weight
+        # and sigmoid multiplication in FP32, with one final output cast.
+        values = hidden_states.float()
+        normalized = values * torch.rsqrt(
+            values.square().mean(-1, keepdim=True) + self.variance_epsilon
+        )
+        return (normalized * self.weight.float() * gate.float().sigmoid()).to(
             hidden_states.dtype
         )

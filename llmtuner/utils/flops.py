@@ -491,15 +491,25 @@ def kimi_linear_flops_per_token(arch: PretrainedConfig, *, seq_len: int) -> int:
     full_layers = settings.get("full_attn_layers")
     if not isinstance(kda_layers, list) or not isinstance(full_layers, list):
         return 0
+    schedule = kda_layers + full_layers
+    if any(isinstance(index, bool) or not isinstance(index, int) for index in schedule):
+        return 0
+    if len(schedule) != layers or len(set(schedule)) != layers:
+        return 0
     if set(kda_layers) & set(full_layers) or set(kda_layers) | set(full_layers) != set(
         range(1, layers + 1)
     ):
         return 0
-    head_dim = int(settings.get("head_dim", 0))
-    kda_heads = int(settings.get("num_heads", 0))
-    kernel = int(settings.get("short_conv_kernel_size", 0))
-    if min(head_dim, kda_heads, kernel) <= 0:
+    dimensions = [
+        settings.get(name)
+        for name in ("head_dim", "num_heads", "short_conv_kernel_size")
+    ]
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in dimensions
+    ):
         return 0
+    head_dim, kda_heads, kernel = dimensions
 
     qk_dim = qk_nope + qk_rope
     mla = attention_param_term(
