@@ -45,6 +45,29 @@ def test_kimi_conversion_preserves_projection_dtypes():
     torch.testing.assert_close(grouped.w2_EDF, expected, rtol=0, atol=0)
 
 
+def test_bf16_conversion_preserves_fp32_combine():
+    torch.manual_seed(19)
+    model = make_model(top_k=2).bfloat16()
+    source = deepcopy(model.layers[0].block_sparse_moe)
+    inputs = torch.randn(1, 31, 8, dtype=torch.bfloat16, requires_grad=True)
+    other = inputs.detach().clone().requires_grad_()
+    assert swap_hf_moe_blocks(model) == 1
+    converted = model.layers[0].block_sparse_moe
+    # Width 12 is intentionally below grouped-MM's BF16 alignment contract;
+    # this regression isolates combine rather than the grouped kernel.
+    converted.routed_experts.inner_experts.use_grouped_mm = False
+    assert converted.routed_experts.token_dispatcher.accumulate_in_fp32
+    actual, expected = converted(inputs), source(other)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch.testing.assert_close(inputs.grad, other.grad)
+    torch.testing.assert_close(
+        converted.router.gate.weight.grad, source.gate.weight.grad
+    )
+
+
 def test_kimi_gate_preserves_fp32_routing_under_autocast():
     torch.manual_seed(17)
     gate = make_model().layers[0].block_sparse_moe.gate

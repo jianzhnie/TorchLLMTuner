@@ -665,3 +665,133 @@ def test_invalid_moe_projection_geometry_suppresses_flops(field, value):
     arch = _arch("mixtral", num_local_experts=8, num_experts_per_tok=2)
     setattr(arch, field, value)
     assert flops_per_token(arch, seq_len=8) == 0
+
+
+def test_kimi_nonlatent_moe_flops_uses_hidden_width():
+    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+
+    config = KimiLinearConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        kv_lora_rank=4,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=4,
+        num_experts=4,
+        num_experts_per_token=2,
+        num_shared_experts=1,
+        moe_intermediate_size=6,
+        linear_attn_config={
+            "kda_layers": [1],
+            "full_attn_layers": [],
+            "head_dim": 4,
+            "num_heads": 2,
+            "short_conv_kernel_size": 3,
+        },
+    )
+    assert flops_per_token(config, seq_len=8) == 7728
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("latent", [False, True])
+@pytest.mark.parametrize("full_gate", [False, True])
+@pytest.mark.parametrize("attention", ["kda", "mla"])
+def test_kimi_flops_matches_executed_projection_work(
+    sparse, latent, full_gate, attention
+):
+    from torch import nn
+
+    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.model import KimiLinearForCausalLM
+
+    config = KimiLinearConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        kv_lora_rank=4,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=4,
+        mla_use_nope=True,
+        num_experts=4 if sparse else None,
+        num_experts_per_token=2,
+        num_shared_experts=1,
+        moe_intermediate_size=6,
+        routed_expert_hidden_size=4 if latent else None,
+        linear_attn_config={
+            "kda_layers": [1] if attention == "kda" else [],
+            "full_attn_layers": [1] if attention == "mla" else [],
+            "head_dim": 4,
+            "num_heads": 2,
+            "short_conv_kernel_size": 3,
+            "use_full_rank_gate": full_gate,
+        },
+    )
+    model = KimiLinearForCausalLM(config)
+    projection_work = []
+
+    def count_linear(module, args, output):
+        projection_work.append(2 * output.numel() * module.in_features)
+
+    hooks = [
+        module.register_forward_hook(count_linear)
+        for module in model.modules()
+        if isinstance(module, nn.Linear)
+    ]
+    try:
+        model(torch.tensor([[1, 2, 3, 4]]))
+    finally:
+        for hook in hooks:
+            hook.remove()
+    # Router uses functional linear, so it is counted separately. Convolution
+    # and recurrent state contractions are not Linear modules either.
+    expected = 3 * sum(projection_work) // 4
+    if sparse:
+        expected += 6 * 8 * 4
+    if attention == "kda":
+        expected += 6 * 3 * 8 * 3 + 18 * 2 * 4 * 4
+    else:
+        expected += quadratic_attention_flops_per_token(
+            num_heads=2, qk_head_dim=6, v_head_dim=4, seq_len=4
+        )
+    assert flops_per_token(config, seq_len=4) == expected
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("head_dim", None),
+        ("head_dim", "4"),
+        ("num_heads", True),
+        ("short_conv_kernel_size", 0),
+        ("kda_layers", [1, 1]),
+        ("kda_layers", [True]),
+        ("kda_layers", [[1]]),
+    ],
+)
+def test_kimi_flops_rejects_unresolved_geometry(field, value):
+    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+
+    config = KimiLinearConfig(
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        kv_lora_rank=4,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=4,
+        linear_attn_config={
+            "kda_layers": [1],
+            "full_attn_layers": [],
+            "head_dim": 4,
+            "num_heads": 2,
+            "short_conv_kernel_size": 3,
+        },
+    )
+    config.linear_attn_config[field] = value
+    assert flops_per_token(config, seq_len=8) == 0

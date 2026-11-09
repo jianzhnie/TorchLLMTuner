@@ -3486,6 +3486,19 @@ def test_cpu_checkpoint_payload_rejects_accelerator_custom_state():
         )
 
 
+def test_cpu_checkpoint_payload_checks_custom_mappings():
+    from collections import UserDict
+
+    from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
+        require_cpu_checkpoint_payload,
+    )
+
+    with pytest.raises(ValueError, match="optimizer/custom"):
+        require_cpu_checkpoint_payload(
+            UserDict({"state": (torch.empty(2, device="meta"),)})
+        )
+
+
 def test_cpu_save_payload_validates_stateful_result_without_copy():
     from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
         TorchCheckpointingManager,

@@ -280,6 +280,7 @@ def test_bf16_delta_decay_initialization_excludes_log_zero():
     # Exercise the real HF initializer on many BF16 samples without allocating
     # the published model. An unfixed BF16 uniform draw reliably contains zero.
     delta = next(m for m in model.modules() if isinstance(m, Qwen3_5MoeGatedDeltaNet))
+    delta.num_v_heads = 8192
     delta.A_log = torch.nn.Parameter(torch.empty(8192, dtype=torch.bfloat16))
     delta.dt_bias = torch.nn.Parameter(torch.empty(8192, dtype=torch.bfloat16))
     initialize_random_hf_model(model)

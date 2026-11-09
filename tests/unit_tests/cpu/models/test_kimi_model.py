@@ -1,10 +1,48 @@
 """Local Kimi factory and wrapper forward/backward integration."""
 
+import pytest
 import torch
 
 from llmtuner.config import LLMTunerConfig, ModelConfig
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
+
+
+def test_kimi_decoder_rejects_batched_document_resets_and_conflicting_masks():
+    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.model import KimiLinearForCausalLM
+
+    config = KimiLinearConfig(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        linear_attn_config={
+            "kda_layers": [1],
+            "full_attn_layers": [],
+            "head_dim": 4,
+            "num_heads": 2,
+            "short_conv_kernel_size": 3,
+        },
+    )
+    model = KimiLinearForCausalLM(config)
+    tokens = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]])
+    with pytest.raises(ValueError, match="single batch row"):
+        model(tokens, position_ids=torch.tensor([[0, 1, 0, 1], [0, 1, 2, 3]]))
+    with pytest.raises(ValueError, match="disagree"):
+        model(
+            tokens,
+            attention_mask=torch.ones_like(tokens),
+            valid_token_mask=torch.zeros_like(tokens, dtype=torch.bool),
+        )
+    # Position resets in the explicitly masked suffix are padding, not docs.
+    output = model(
+        tokens,
+        position_ids=torch.tensor([[0, 1, 0, 0], [0, 1, 2, 3]]),
+        attention_mask=torch.tensor([[1, 1, 0, 0], [1, 1, 1, 1]]),
+    )
+    assert torch.isfinite(output.logits).all()
 
 
 def test_registered_kimi_architecture_builds_from_training_config():
@@ -182,3 +220,94 @@ def test_kimi_moe_layer_selection_matches_configured_dense_prefix_and_frequency(
         True,
         False,
     ]
+
+
+def test_kimi_meta_materialization_initializes_custom_parameters():
+    from llmtuner.models.hf.materialization import (
+        initialize_random_hf_model,
+        materialize_meta_model,
+    )
+    from llmtuner.models.kimi.delta_attention import KimiDeltaAttention
+    from llmtuner.models.kimi.moe import KimiMoEGate
+    from llmtuner.models.kimi.normalization import KimiRMSNorm
+
+    config = build_model_config(
+        "kimi_linear",
+        seq_len=8,
+        arch_overrides={
+            "vocab_size": 32,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_experts": 4,
+            "num_experts_per_token": 2,
+            "moe_intermediate_size": 6,
+            "linear_attn_config": {
+                "kda_layers": [1],
+                "full_attn_layers": [],
+                "head_dim": 4,
+                "num_heads": 2,
+                "short_conv_kernel_size": 3,
+            },
+        },
+    )
+    config.attn_mask_type = "causal"
+    with torch.device("meta"):
+        model = HFTransformerModel(config)
+    materialize_meta_model(model, torch.device("cpu"))
+    initialize_random_hf_model(model.model)
+    assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
+    assert all(
+        torch.count_nonzero(module.weight) == module.weight.numel()
+        for module in model.modules()
+        if isinstance(module, KimiRMSNorm)
+    )
+    gate = next(module for module in model.modules() if isinstance(module, KimiMoEGate))
+    assert torch.count_nonzero(gate.weight) > 0
+    assert torch.count_nonzero(gate.e_score_correction_bias) == 0
+    attention = next(
+        module for module in model.modules() if isinstance(module, KimiDeltaAttention)
+    )
+    assert torch.all(attention.A_log <= torch.log(torch.tensor(16.0)))
+    assert torch.all(attention.A_log >= 0)
+    assert torch.count_nonzero(attention.dt_bias) == 0
+
+
+def test_kda_decay_parameters_remain_fp32_with_bf16_default():
+    from llmtuner.models.hf.materialization import initialize_random_hf_model
+    from llmtuner.models.kimi.delta_attention import KimiDeltaAttention
+    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.model import KimiLinearForCausalLM
+
+    config = KimiLinearConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        linear_attn_config={
+            "kda_layers": [1],
+            "full_attn_layers": [],
+            "head_dim": 4,
+            "num_heads": 256,
+            "short_conv_kernel_size": 3,
+        },
+    )
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device("meta"):
+            model = KimiLinearForCausalLM(config)
+        model.to_empty(device="cpu")
+        torch.manual_seed(42)
+        initialize_random_hf_model(model)
+    finally:
+        torch.set_default_dtype(previous)
+    attention = next(m for m in model.modules() if isinstance(m, KimiDeltaAttention))
+    assert attention.q_proj.weight.dtype == torch.bfloat16
+    assert attention.A_log.dtype == attention.dt_bias.dtype == torch.float32
+    assert torch.all(
+        (attention.A_log >= 0) & (attention.A_log <= torch.log(torch.tensor(16.0)))
+    )
+    assert torch.count_nonzero(attention.dt_bias) == 0

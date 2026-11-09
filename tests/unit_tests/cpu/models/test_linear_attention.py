@@ -1,5 +1,6 @@
 """CPU contracts for opt-in HF recurrence routing, never kernel acceptance."""
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ from transformers import PretrainedConfig
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
 from llmtuner.models.hf import linear_attention as adapter
+from llmtuner.models.hf import padding_metadata
 from llmtuner.models.hf.factory import apply_runtime_config, unwrap_text_config
 
 
@@ -271,8 +273,13 @@ def test_real_hf_module_only_recurrence_is_replaced(monkeypatch, deterministic):
         ),
     )
     adapter.apply_linear_attention_backend(model)
+    recurrence = getattr(model.gdn, "chunk_gated_delta_rule", None)
+    if recurrence is None:
+        recurrence = inspect.unwrap(model.gdn.forward).__globals__[
+            "torch_chunk_gated_delta_rule"
+        ]
     inputs = [object() for _ in range(5)]
-    assert model.gdn.chunk_gated_delta_rule(*inputs, use_qk_l2norm_in_kernel=True) == (
+    assert recurrence(*inputs, use_qk_l2norm_in_kernel=True) == (
         output,
         None,
     )
@@ -280,7 +287,7 @@ def test_real_hf_module_only_recurrence_is_replaced(monkeypatch, deterministic):
     assert calls[0][1] == ({"deterministic_reduction": True} if deterministic else {})
     for keyword in ("deterministic_reduction", "_configured_deterministic_reduction"):
         with pytest.raises(UnsupportedCombinationError, match="fixed by model"):
-            model.gdn.chunk_gated_delta_rule(
+            recurrence(
                 *inputs, use_qk_l2norm_in_kernel=True, **{keyword: not deterministic}
             )
     assert len(calls) == 1
@@ -320,3 +327,20 @@ def test_deterministic_flag_cannot_be_ignored_on_native_backend():
         UnsupportedCombinationError, match="requires linear_attention_backend"
     ):
         adapter.validate_linear_attention_config(config)
+
+
+def test_sequence_can_reuse_numerical_policy_metadata_validation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        padding_metadata,
+        "validate_gdn_padding_metadata",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    inputs = torch.zeros(64, dtype=torch.long)
+    positions = torch.arange(64)
+    adapter.validate_linear_attention_sequence(inputs, positions, None, None)
+    assert len(calls) == 1
+    adapter.validate_linear_attention_sequence(
+        inputs, positions, None, None, validate_metadata=False
+    )
+    assert len(calls) == 1

@@ -140,7 +140,10 @@ def test_module_stamp_identity_and_original_hf_b1_mask_semantics():
     assert holder.gdn._llmtuner_gdn_allow_right_padding is False
     x = torch.randn(1, 128, 2048).bfloat16()
     keep = (torch.arange(128) < 93)[None, :]
-    assert torch.equal(apply_mask_to_padding_states(x, keep), x)
+    masked = apply_mask_to_padding_states(x, keep)
+    assert torch.equal(masked[:, :93], x[:, :93])
+    # Old HF ignored B1 padding; newer HF also zeros the invalid suffix.
+    assert torch.equal(masked[:, 93:], x[:, 93:]) or not masked[:, 93:].any()
     # CPU remains rejected even with opt-in; no backend/numerical mock.
     holder.config.gdn_allow_right_padding = True
     configure_gdn_numerics(holder)

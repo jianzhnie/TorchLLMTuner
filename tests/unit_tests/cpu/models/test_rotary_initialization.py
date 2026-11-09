@@ -71,7 +71,7 @@ def test_rotary_initialization_preserves_parameters_and_buffer_aliases(policy):
         assert (rotary.inv_freq == 7).all()
         assert (rotary.original_inv_freq == 9).all()
     else:
-        expected = Qwen3RotaryEmbedding(rotary.config, device=torch.device("cpu"))
+        expected = Qwen3RotaryEmbedding(rotary.config)
         torch.testing.assert_close(rotary.inv_freq, expected.inv_freq, atol=0, rtol=0)
         torch.testing.assert_close(
             rotary.original_inv_freq, expected.original_inv_freq, atol=0, rtol=0
@@ -85,7 +85,7 @@ def test_meta_materialization_uses_target_rotary_policy():
         model = HFTransformerModel(config)
     materialize_meta_model(model, torch.device("cpu"))
     rotary = model.model.model.rotary_emb
-    expected = Qwen3RotaryEmbedding(config, device=torch.device("cpu"))
+    expected = Qwen3RotaryEmbedding(config)
     assert not rotary.inv_freq.is_meta
     assert not rotary.original_inv_freq.is_meta
     torch.testing.assert_close(rotary.inv_freq, expected.inv_freq, atol=0, rtol=0)

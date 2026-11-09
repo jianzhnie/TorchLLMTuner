@@ -361,8 +361,9 @@ def test_disabled_checkpoint_does_not_validate_virtual_checkpoint_options():
 def test_virtual_checkpoint_writer_disables_copy_ahead(monkeypatch, tmp_path):
     captured = {}
 
-    def save(state_dict, *, storage_writer, checkpoint_id):
+    def save(state_dict, *, storage_writer, checkpoint_id, process_group):
         captured["writer"] = storage_writer
+        captured["process_group"] = process_group
         return "saved"
 
     monkeypatch.setattr(
@@ -370,6 +371,7 @@ def test_virtual_checkpoint_writer_disables_copy_ahead(monkeypatch, tmp_path):
         save,
     )
     manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
+    manager.pg = object()
     manager.states = {"optimizer": SimpleNamespace(state_residency="npu_virtual")}
     result = manager._save_checkpoint(
         {"weight": torch.ones(1)},
@@ -377,6 +379,7 @@ def test_virtual_checkpoint_writer_disables_copy_ahead(monkeypatch, tmp_path):
         async_mode=DistributedCheckpointAsyncMode.DISABLED,
     )
     assert result == "saved"
+    assert captured["process_group"] is manager.pg
     assert isinstance(captured["writer"], FileSystemWriter)
     assert captured["writer"].per_thread_copy_ahead == 0
 

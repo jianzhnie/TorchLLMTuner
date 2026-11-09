@@ -9,6 +9,39 @@ from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
 from llmtuner.models.kimi.moe import KimiSparseMoE
 
 
+def test_bf16_moe_combines_experts_before_rounding():
+    torch.manual_seed(19)
+    model = KimiSparseMoE(
+        KimiLinearConfig(
+            hidden_size=8,
+            num_experts=4,
+            num_experts_per_token=3,
+            moe_intermediate_size=12,
+        )
+    ).bfloat16()
+    inputs = torch.randn(1, 31, 8, dtype=torch.bfloat16, requires_grad=True)
+    ids, scores = model.gate(inputs)
+    selected = inputs.new_zeros(31, 3, 8)
+    prematurely_rounded = torch.zeros_like(inputs.reshape(-1, 8))
+    for index, expert in enumerate(model.experts):
+        tokens, slots = (ids == index).nonzero(as_tuple=True)
+        values = expert(inputs.reshape(-1, 8).index_select(0, tokens))
+        selected[tokens, slots] = values
+        prematurely_rounded = prematurely_rounded.index_add(
+            0, tokens, (values.float() * scores[tokens, slots, None]).bfloat16()
+        )
+    expected = (selected.float() * scores.unsqueeze(-1)).sum(1).bfloat16()
+    actual = model(inputs).reshape_as(expected)
+    assert torch.count_nonzero(expected != prematurely_rounded) > 0
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    gradient = torch.randn_like(actual)
+    parameters = (inputs, model.gate.weight, model.experts[0].w1.weight)
+    actual_grads = torch.autograd.grad(actual, parameters, gradient, retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, parameters, gradient)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
 @pytest.mark.parametrize(
     "shared,latent,grouped", [(0, False, False), (1, False, True), (1, True, True)]
 )

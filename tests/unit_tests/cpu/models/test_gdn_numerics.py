@@ -58,13 +58,13 @@ def test_native_noop_and_install_identity_idempotency():
     adapter.configure_gdn_numerics(native)
     model = holder()
     before, keys = dict(model.named_parameters()), set(model.state_dict())
-    recurrence = model.gdn.chunk_gated_delta_rule
+    recurrence = getattr(model.gdn, "chunk_gated_delta_rule", None)
     adapter.configure_gdn_numerics(model)
     adapter.configure_gdn_numerics(model)
     assert set(model.state_dict()) == keys
     assert all(dict(model.named_parameters())[k] is p for k, p in before.items())
     assert len(model.gdn._forward_pre_hooks) == 1
-    assert model.gdn.chunk_gated_delta_rule is recurrence
+    assert getattr(model.gdn, "chunk_gated_delta_rule", None) is recurrence
     assert model.gdn.in_proj_qkv.forward.__func__ is adapter.forward_split_qkv
     model.config.gdn_numerical_policy = "native"
     with pytest.raises(UnsupportedCombinationError, match="removed"):
