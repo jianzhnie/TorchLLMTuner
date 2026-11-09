@@ -9,12 +9,12 @@ export PYTHON=/tmp/tlt_npu_env_20261109/bin/python
 export MODEL_PATH=/home/jianzhnie/llmtuner/hfhub/models/deepseek-ai/DeepSeek-V4-Pro
 export DATASET_PATH=/home/jianzhnie/llmtuner/hfhub/datasets/GAIR/LIMO/limo.jsonl
 export OUTPUT_PATH=/tmp/deepseek-v4-pro
-bash examples/deepseek_v4/train_pro.sh --steps 100 --batch 8 --sequence-length 2048
+bash examples/deepseek_v4_pro/train_pro.sh --steps 100 --batch 8 --sequence-length 2048
 ```
 
 `--layers N`仅在完整模型使用全部可用卡仍OOM后减层，并同步截断attention/MLP
 调度，不改变其他结构。DP/TP/EP/PP/CP、AC、compile、optimizer状态驻留和checkpoint
-参数见`examples/deepseek_v4/train.py`；可配置不代表组合已验收。随机meta初始化
+参数见`examples/deepseek_v4_pro/train.py`；可配置不代表组合已验收。随机meta初始化
 目前仅开放local/DP/FSDP，其他拓扑须通过独立初始化与数值验收后开放。
 
 2026-11-09实测：完整61层反向额外申请2.50GiB时OOM，已分配55.36GiB。

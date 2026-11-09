@@ -14,7 +14,7 @@ bash examples/deepseek_v4_flash/train.sh --steps 100 --batch 8 --sequence-length
 
 `--layers N`仅在完整模型使用全部可用卡仍OOM后减层，并同步截断attention/MLP
 调度，不改变其他结构。DP/TP/EP/PP/CP、AC、compile、optimizer状态驻留和checkpoint
-参数见`examples/deepseek_v4/train.py`；可配置不代表组合已验收。随机meta初始化
+参数见`examples/deepseek_v4_pro/train.py`；可配置不代表组合已验收。随机meta初始化
 目前仅开放local/DP/FSDP，其他拓扑须通过独立初始化与数值验收后开放。
 
 2026-11-09实测：完整43层、BF16、FSDP8、full AC、LIMO、sequence2048、batch8

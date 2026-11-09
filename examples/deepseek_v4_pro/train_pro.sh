@@ -9,5 +9,5 @@ exec "${PYTHON:-python}" -m torch.distributed.run \
   --nnodes="${NNODES:-1}" --nproc-per-node="${NPROC_PER_NODE:-8}" \
   --node-rank="${NODE_RANK:-0}" --master-addr="${MASTER_ADDR:-127.0.0.1}" \
   --master-port="${MASTER_PORT:-29531}" \
-  -m examples.deepseek_v4.train --model "$MODEL_PATH" --data "$DATASET_PATH" \
+  -m examples.deepseek_v4_pro.train --model "$MODEL_PATH" --data "$DATASET_PATH" \
   --output "$OUTPUT_PATH" "$@"
