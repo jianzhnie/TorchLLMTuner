@@ -6,13 +6,14 @@
 
 """Flexible storage-to-compute redistribution APIs."""
 
-from llmtuner.config.optimizer_layout import (
+from llmtuner.utils.lazy_exports import resolve_export
+
+from .optimizer_reshard import (
     BlockShard,
     BucketConfig,
     ComputeLayout,
     Owned,
 )
-from llmtuner.utils.lazy_exports import resolve_export
 
 __all__ = [
     "DistMuon",
