@@ -548,3 +548,12 @@ def test_kcp_installs_mla_callable_without_changing_parameter_names(monkeypatch)
     after = dict(model.named_parameters())
     assert before.keys() == after.keys()
     assert all(after[name] is parameter for name, parameter in before.items())
+
+
+def test_cp_dispatches_from_model_backend_contract() -> None:
+    class Model(torch.nn.Module):
+        context_parallel_backend = "compressor"
+
+    cfg = ParallelConfig(context_parallel_kv_allgather_size=2)
+    with pytest.raises(ValueError, match="HCA CP requires a cp mesh"):
+        apply_cp(Model(), mesh=None, cfg=cfg)

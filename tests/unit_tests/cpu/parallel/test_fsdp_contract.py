@@ -322,6 +322,7 @@ def test_apply_fsdp_preserves_parameter_dtype_for_mixed_precision(
     captured: dict[str, object] = {}
     monkeypatch.setattr(apply, "resolve_fsdp_mesh", lambda _dims: _Mesh())
     monkeypatch.setattr(apply, "resolve_sparse_fsdp_mesh", lambda _dims: None)
+    monkeypatch.setattr(apply, "is_distributed", lambda: False)
     monkeypatch.setattr(
         apply,
         "apply_fsdp_to_decoder",
@@ -355,6 +356,7 @@ def test_apply_fsdp_forwards_cpu_offload_policy(
     captured: dict[str, object] = {}
     monkeypatch.setattr(apply, "resolve_fsdp_mesh", lambda _dims: _Mesh())
     monkeypatch.setattr(apply, "resolve_sparse_fsdp_mesh", lambda _dims: None)
+    monkeypatch.setattr(apply, "is_distributed", lambda: False)
     monkeypatch.setattr(
         apply,
         "apply_fsdp_to_decoder",
@@ -371,6 +373,152 @@ def test_apply_fsdp_forwards_cpu_offload_policy(
 
     assert captured["cpu_offload"] is True
     assert captured["cpu_offload_pin_memory"] is False
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.bfloat16])
+def test_separate_dtype_policy_uses_model_storage_dtype(monkeypatch, dtype):
+    class Mesh:
+        mesh_dim_names = ()
+
+    model = nn.Module()
+    model.tok_embeddings = nn.Identity()
+    model.norm = nn.Identity()
+    model.lm_head = nn.Identity()
+    model.enable_weight_tying = False
+    block = nn.Module()
+    block.fsdp_separate_parameter_names = ("scale",)
+    block.scale = nn.Parameter(torch.ones(2, dtype=dtype))
+    block.projection = nn.Linear(2, 2)
+    model.layers = nn.ModuleList([block])
+    calls = []
+    monkeypatch.setattr(
+        apply, "fully_shard", lambda module, **options: calls.append((module, options))
+    )
+    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda model: None)
+    apply.apply_fsdp_to_decoder(
+        model,
+        Mesh(),
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        pp_enabled=False,
+    )
+    policies = [options["mp_policy"] for module, options in calls if module is block]
+    assert len(policies) == 1
+    assert policies[0].param_dtype is dtype
+    assert block.scale.dtype is dtype
+
+
+@pytest.mark.parametrize("names", [("missing",), "scale", ("scale", "other")])
+def test_invalid_separate_parameter_contract_fails_before_sharding(monkeypatch, names):
+    model = nn.Module()
+    model.scale = nn.Parameter(torch.ones(2, dtype=torch.float64))
+    model.fsdp_separate_parameter_names = names
+    original = model.scale
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid model contract reached fully_shard")
+
+    monkeypatch.setattr(apply, "fully_shard", unexpected)
+    with pytest.raises(ValueError, match="direct registered Parameters"):
+        apply.apply_fsdp_to_decoder(
+            model,
+            object(),
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            pp_enabled=False,
+        )
+    assert model.scale is original
+
+
+@pytest.mark.parametrize("alias", ["scale", "projection"])
+def test_separate_dtype_subtree_rejects_external_parameter_alias(monkeypatch, alias):
+    model = nn.Module()
+    block = nn.Module()
+    block.fsdp_separate_parameter_names = ("scale",)
+    block.scale = nn.Parameter(torch.ones(2, dtype=torch.float64))
+    block.projection = nn.Linear(2, 2)
+    model.block = block
+    parameter = block.scale if alias == "scale" else block.projection.weight
+    model.register_parameter("external", parameter)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("external ownership conflict reached fully_shard")
+
+    monkeypatch.setattr(apply, "fully_shard", unexpected)
+    with pytest.raises(ValueError, match="share parameters with external modules"):
+        apply.apply_fsdp_to_decoder(
+            model,
+            object(),
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            pp_enabled=False,
+        )
+    assert model.external is parameter
+
+
+def test_separate_dtype_nested_declarations_fail_before_sharding(monkeypatch):
+    model = nn.Module()
+    model.fsdp_separate_parameter_names = ("scale",)
+    model.scale = nn.Parameter(torch.ones(2, dtype=torch.float64))
+    model.child = nn.Module()
+    model.child.fsdp_separate_parameter_names = ("scale",)
+    model.child.scale = nn.Parameter(torch.ones(2, dtype=torch.float64))
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("nested declarations reached fully_shard")
+
+    monkeypatch.setattr(apply, "fully_shard", unexpected)
+    with pytest.raises(ValueError, match="must not be nested"):
+        apply.apply_fsdp_to_decoder(
+            model,
+            object(),
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            pp_enabled=False,
+        )
+
+
+def test_expert_placement_conflict_precedes_separate_dtype_sharding(monkeypatch):
+    class Mesh:
+        mesh_dim_names = ()
+
+        def size(self):
+            return 4
+
+    model = nn.Module()
+    model.tok_embeddings = model.norm = model.lm_head = nn.Identity()
+    model.enable_weight_tying = False
+    separate = nn.Module()
+    separate.fsdp_separate_parameter_names = ("scale",)
+    separate.scale = nn.Parameter(torch.ones(2, dtype=torch.float64))
+    separate.projection = nn.Linear(2, 2)
+    experts = nn.Linear(2, 2)
+    blocks = []
+    for count in (2, 8):
+        block = nn.Module()
+        block.moe_enabled = True
+        block.moe = nn.Module()
+        block.moe.router = nn.Module()
+        block.moe.router.num_experts = count
+        block.moe.routed_experts = nn.Module()
+        block.moe.routed_experts.inner_experts = experts
+        blocks.append(block)
+    model.layers = nn.ModuleList([separate, *blocks])
+    parameters = list(model.parameters())
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("expert placement conflict reached fully_shard")
+
+    monkeypatch.setattr(apply, "fully_shard", unexpected)
+    with pytest.raises(ValueError, match="conflicting FSDP placements"):
+        apply.apply_fsdp_to_decoder(
+            model,
+            Mesh(),
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            pp_enabled=False,
+        )
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
 
 
 def test_fsdp_prefetch_supports_arbitrary_windows() -> None:
@@ -1018,6 +1166,56 @@ def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
     assert calls[0][1]["mp_policy"] is override_policy
     assert calls[1][0] is model
     assert calls[1][1]["mp_policy"] is not override_policy
+
+
+@pytest.mark.parametrize("pipeline", [False, True])
+@pytest.mark.parametrize("stale", [False, True])
+def test_fsdp_rejects_foreign_or_stale_exclusions_before_rebinding(pipeline, stale):
+    from llmtuner.parallel.fully_shard_parallel.plan import (
+        resolve_pipeline_fsdp_configs,
+        validate_fsdp_pattern_options,
+    )
+
+    model = nn.Sequential(nn.Linear(2, 2))
+    excluded = model[0].weight if stale else nn.Parameter(torch.ones(2, 2))
+    if stale:
+        model[0].weight = nn.Parameter(model[0].weight.detach().clone())
+    parameter = model[0].weight
+    value = parameter.detach().clone()
+    options = {"0": {"ignored_params": {excluded}}}
+    cfg = ParallelConfig(fsdp_config=FSDPConfig(fsdp_apply_modules=options))
+    with pytest.raises(ValueError, match="not registered in the model"):
+        if pipeline:
+            resolve_pipeline_fsdp_configs(model, [model], cfg)
+        else:
+            validate_fsdp_pattern_options(
+                dict(model.named_modules()), options, implementation="native"
+            )
+    assert model[0].weight is parameter
+    torch.testing.assert_close(parameter, value, rtol=0, atol=0)
+    assert options["0"]["ignored_params"] == {excluded}
+
+
+def test_pipeline_exclusions_filter_other_stage_ownership_and_preserve_aliases():
+    import copy
+
+    from llmtuner.parallel.fully_shard_parallel.plan import (
+        resolve_pipeline_fsdp_configs,
+    )
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    model[0].register_parameter("alias", model[0].weight)
+    part = copy.deepcopy(model)
+    part._modules.pop("1")
+    exclusions = {model[0].weight, model[1].weight}
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(fsdp_apply_modules={"0": {"ignored_params": exclusions}})
+    )
+    result = resolve_pipeline_fsdp_configs(model, [part], cfg)
+    local_exclusions = result[0].fsdp_config.fsdp_apply_modules["0"]["ignored_params"]
+    assert local_exclusions == {part[0].weight}
+    assert part[0].alias is part[0].weight
+    assert cfg.fsdp_config.fsdp_apply_modules["0"]["ignored_params"] == exclusions
 
 
 def test_pipeline_patterns_rebind_copied_hooks_and_excluded_parameters():

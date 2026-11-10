@@ -390,6 +390,8 @@ class _FakeParallelTopology:
     """
 
     pp_enabled = True
+    dp_replicate = 1
+    dp_shard = 1
 
     @staticmethod
     def spmd_dense_mesh():

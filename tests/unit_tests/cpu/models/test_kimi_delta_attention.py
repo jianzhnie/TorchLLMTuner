@@ -138,3 +138,20 @@ def test_kimi_recurrence_matches_affine_state_transition_product(lower_bound):
     oracle_gradients = torch.autograd.grad(expected, reference, upstream)
     for actual_grad, expected_grad in zip(gradients, oracle_gradients, strict=True):
         torch.testing.assert_close(actual_grad, expected_grad, atol=3e-6, rtol=3e-6)
+
+
+def test_kda_declares_its_separate_fsdp_dtype_parameters():
+    config = KimiLinearConfig(
+        hidden_size=8,
+        linear_attn_config={
+            "kda_layers": [1],
+            "full_attn_layers": [],
+            "head_dim": 4,
+            "num_heads": 2,
+            "short_conv_kernel_size": 3,
+        },
+    )
+    model = KimiDeltaAttention(config, 0)
+    separate = [getattr(model, name) for name in model.fsdp_separate_parameter_names]
+    assert separate == [model.A_log, model.dt_bias]
+    assert all(parameter.dtype == torch.float32 for parameter in separate)

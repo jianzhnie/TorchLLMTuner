@@ -176,6 +176,43 @@ def test_configured_tp_pattern_typo_is_not_hidden_by_valid_model_plan(field):
     assert model[0] is original
 
 
+@pytest.mark.parametrize("pipeline_size", [1, 2])
+def test_tp_overlapping_overrides_reject_conflicting_styles_before_mutation(
+    pipeline_size,
+):
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_targets
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False))
+    original = model[0]
+    weight = original.weight
+    state = weight.detach().clone()
+    cfg = ParallelConfig(
+        tensor_parallel_size=2,
+        pipeline_parallel_size=pipeline_size,
+        tp_config=TensorParallelConfig(
+            tp_colwise_modules=["*"], tp_rowwise_modules=["0"]
+        ),
+    )
+    with pytest.raises(ValueError, match="conflicting styles for module '0'"):
+        resolve_tp_targets(model, cfg=cfg, plan={"0": "colwise"})
+    assert model[0] is original
+    assert model[0].weight is weight
+    torch.testing.assert_close(weight, state, rtol=0, atol=0)
+
+
+def test_tp_overlapping_overrides_allow_the_same_style():
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_targets
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False))
+    cfg = ParallelConfig(
+        tensor_parallel_size=2,
+        tp_config=TensorParallelConfig(tp_colwise_modules=["*", "0"]),
+    )
+    targets, _ = resolve_tp_targets(model, cfg=cfg, plan={"0": "rowwise"})
+    assert len(targets) == 1
+    assert targets[0][2].kind == "colwise"
+
+
 def test_pipeline_part_permits_override_owned_by_another_stage():
     from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_targets
 
@@ -641,3 +678,19 @@ def test_tp_constructor_failure_preserves_modules_and_allows_retry(monkeypatch):
     assert model[1].training
     assert model[0].weight.shape == (2, 4)
     assert model[1].weight.shape == (4, 2)
+
+
+def test_full_history_attention_uses_structure_not_class_name() -> None:
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+        requires_full_token_history,
+    )
+
+    class RecurrentAttention(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv1d = nn.Conv1d(2, 2, 1)
+            self.A_log = nn.Parameter(torch.ones(1))
+            self.dt_bias = nn.Parameter(torch.zeros(1))
+
+    assert requires_full_token_history(RecurrentAttention())
+    assert not requires_full_token_history(nn.MultiheadAttention(4, 1))

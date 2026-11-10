@@ -288,6 +288,8 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
     cfg = ParallelConfig()
     dims = SimpleNamespace(
         pp_enabled=True,
+        dp_replicate=1,
+        dp_shard=1,
         get_optional_mesh=lambda name: None,
         spmd_dense_mesh=lambda: dense_mesh,
     )
@@ -363,6 +365,8 @@ def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline):
     stages = [SimpleNamespace(submod=part) for part in parts]
     dims = SimpleNamespace(
         pp_enabled=True,
+        dp_replicate=1,
+        dp_shard=1,
         get_optional_mesh=lambda name: None,
         spmd_dense_mesh=lambda: None,
     )

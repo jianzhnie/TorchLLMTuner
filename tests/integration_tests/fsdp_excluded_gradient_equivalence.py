@@ -69,9 +69,13 @@ def main():
             assert dims.get_mesh("dp").size() == 4
             assert dims.get_mesh("dp_replicate").size() == 2
         runtime = SimpleNamespace(parallel_dims=dims, model_parts=[model])
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=0.1)
+        # This is a CPU oracle. Avoid vendor foreach auto-detection initializing
+        # an NPU when this script is run in a torch-npu environment.
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=0.01, weight_decay=0.1, foreach=False
+        )
         dense_optimizer = torch.optim.AdamW(
-            reference.parameters(), lr=0.01, weight_decay=0.1
+            reference.parameters(), lr=0.01, weight_decay=0.1, foreach=False
         )
         for step in range(3):
             optimizer.zero_grad(set_to_none=True)

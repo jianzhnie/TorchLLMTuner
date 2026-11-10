@@ -12,6 +12,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from llmtuner.models.deepseek.deepseek_v4.modeling import DeepseekV4ForCausalLM
+from llmtuner.models.explicit import build_explicit_model
 from llmtuner.models.hf.factory import resolve_model_class
 from llmtuner.models.qwen.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 from tests.unit_tests.cpu.models.test_deepseek_v4 import small_config
@@ -38,7 +39,9 @@ def test_explicit_family_preserves_initialization_forward_and_checkpoint(
     reference = reference_type(deepcopy(config))
     expected_rng = torch.get_rng_state().clone()
     torch.manual_seed(91)
-    owned = owned_type(deepcopy(config))
+    constructor = build_explicit_model if family == "deepseek" else owned_type
+    owned = constructor(deepcopy(config))
+    assert type(owned) is owned_type
     assert (
         owned.config._experts_implementation == reference.config._experts_implementation
     )
@@ -66,7 +69,7 @@ def test_explicit_family_preserves_initialization_forward_and_checkpoint(
             gradients += int(bool(expected.grad.count_nonzero()))
             assert torch.equal(expected.grad, actual.grad), name
     assert gradients > 0
-    restored = owned_type(deepcopy(config))
+    restored = constructor(deepcopy(config))
     restored.load_state_dict(owned.state_dict(), strict=True)
     assert torch.equal(
         restored(input_ids=tokens, use_cache=False).logits, outputs[1].logits

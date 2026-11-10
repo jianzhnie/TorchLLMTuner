@@ -360,8 +360,6 @@ assert 'llmtuner.models.kimi.kimi_k3.model' not in sys.modules
 
 
 def test_explicit_factory_is_opt_in_and_lazy(monkeypatch):
-    from types import SimpleNamespace
-
     from llmtuner.models import explicit
 
     calls = []
@@ -371,11 +369,48 @@ def test_explicit_factory_is_opt_in_and_lazy(monkeypatch):
         calls.append(config)
         return expected
 
-    monkeypatch.setattr(
-        explicit,
-        "import_module",
-        lambda name, package: SimpleNamespace(DeepseekV4ForCausalLM=model_class),
+    registration = ModelArchitecture.from_types(
+        "deepseek_v4",
+        config_type=PretrainedConfig,
+        model_class_loader=lambda: model_class,
     )
+    monkeypatch.setitem(architecture._ARCHITECTURES, "deepseek_v4", registration)
     config = PretrainedConfig(model_type="deepseek_v4")
     assert explicit.build_explicit_model(config) is expected
     assert calls == [config]
+
+
+def test_explicit_and_training_resolution_share_registered_constructor(monkeypatch):
+    from llmtuner.models.explicit import build_explicit_model
+
+    class Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.projection = nn.Linear(2, 2)
+
+    registration = ModelArchitecture.from_types(
+        "deepseek_v4", config_type=PretrainedConfig, model_class_loader=lambda: Model
+    )
+    monkeypatch.setitem(architecture._ARCHITECTURES, "deepseek_v4", registration)
+    config = PretrainedConfig(model_type="deepseek_v4")
+    model = build_explicit_model(config)
+    assert type(model) is resolve_model_class(config)
+    assert model.config is config
+    loss = model.projection(model.projection.weight).square().sum()
+    loss.backward()
+    assert model.projection.weight.grad is not None
+    assert model.projection.weight.grad.abs().sum() > 0
+
+
+def test_explicit_factory_does_not_enable_other_registered_architectures():
+    from llmtuner.models.explicit import build_explicit_model
+
+    assert get_model_architecture("qwen3_moe") is not None
+    with pytest.raises(ValueError, match="No explicit model for 'qwen3_moe'"):
+        build_explicit_model(PretrainedConfig(model_type="qwen3_moe"))
+
+
+@pytest.mark.parametrize("model_type", ["kimi_k3", "qwen3_5", "qwen3_5_moe"])
+def test_composite_explicit_models_remain_outside_automatic_registry(model_type):
+    assert get_model_architecture(model_type) is None
