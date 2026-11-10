@@ -508,8 +508,9 @@ def read_route_scale(block: nn.Module, router: nn.Module) -> float:
 def returns_router_logits(block: nn.Module) -> bool:
     """Whether ``block``'s forward returns ``(hidden_states, router_logits)``.
 
-    transformers has no single convention here, and it varies by *family*, not
-    by spelling: 4.x Mixtral's host unpacks a tuple from ``block_sparse_moe``,
+    Explicit models declare ``router_logits_in_output``. Legacy HF blocks fall
+    back to source inspection because transformers has no single convention:
+    4.x Mixtral's host unpacks a tuple from ``block_sparse_moe``,
     OLMoE's unpacks one from ``mlp``, while Qwen3Moe's tolerates either and
     DeepSeek's takes a bare tensor from ``moe``. Neither the attribute name nor
     the class name separates them, so the answer is read off the block itself --
@@ -528,6 +529,11 @@ def returns_router_logits(block: nn.Module) -> bool:
     return) when the source cannot be read, e.g. an installed-and-stripped
     build; that case is logged rather than assumed silently.
     """
+    declared = getattr(block, "router_logits_in_output", None)
+    if declared is not None:
+        if not isinstance(declared, bool):
+            raise TypeError("router_logits_in_output must be a bool when declared")
+        return declared
     try:
         source = textwrap.dedent(inspect.getsource(type(block).forward))
     except (OSError, TypeError):

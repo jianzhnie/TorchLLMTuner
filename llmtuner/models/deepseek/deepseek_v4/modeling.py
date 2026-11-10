@@ -129,6 +129,8 @@ class DeepseekV4Experts(HFDeepseekV4Experts):
 class DeepseekV4SparseMoeBlock(HFDeepseekV4SparseMoeBlock):
     """Assemble the explicit routed-expert subclass under the native router."""
 
+    router_logits_in_output = False
+
     def __init__(self, config: DeepseekV4Config, layer_idx: int):
         nn.Module.__init__(self)
         self.is_hash = config.mlp_layer_types[layer_idx] == "hash_moe"

@@ -1691,3 +1691,31 @@ def test_pre_down_policy_rejected_before_ep_replacement(fixed_router):
     assert list(model.layers) == original
     after = dict(model.named_parameters())
     assert all(after[key] is p for key, p in parameters.items())
+
+
+def test_router_output_contract_avoids_source_inspection(monkeypatch):
+    from llmtuner.parallel.expert_parallel import hf_inspection
+
+    class ExplicitBlock(torch.nn.Module):
+        router_logits_in_output = False
+
+        def forward(self):
+            return None, None
+
+    def unexpected_source_inspection(_module):
+        raise AssertionError("explicit router contract must bypass AST inspection")
+
+    monkeypatch.setattr(
+        hf_inspection.inspect, "getsource", unexpected_source_inspection
+    )
+    assert not hf_inspection.returns_router_logits(ExplicitBlock())
+
+
+def test_invalid_router_output_contract_is_rejected():
+    from llmtuner.parallel.expert_parallel.hf_inspection import returns_router_logits
+
+    class InvalidBlock(torch.nn.Module):
+        router_logits_in_output = "no"
+
+    with pytest.raises(TypeError, match="must be a bool"):
+        returns_router_logits(InvalidBlock())
