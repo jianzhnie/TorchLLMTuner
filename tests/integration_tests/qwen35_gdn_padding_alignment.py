@@ -37,14 +37,14 @@ from tests.integration_tests.qwen35_gdn_module_alignment import (
     model_registry,
     set_spmd_backend,
 )
-from llmtuner.models.hf.gdn_numerics import (
+from llmtuner.models.qwen3_5.gdn_numerics import (
     _validate_forward,
     configure_gdn_numerics,
     forward_fp32_weight_norm,
     forward_split_qkv,
 )
 
-from llmtuner.models.hf.linear_attention import (
+from llmtuner.models.qwen3_5.linear_attention import (
     apply_linear_attention_backend,
     chunk_gated_delta_rule,
     validate_gdn_inputs,

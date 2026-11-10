@@ -12,11 +12,13 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.models.hf.expert_kernels import (
-    _forward_pre_down_grouped_experts,
-    _validate_pre_down_grouped_inputs,
     stabilize_moe_experts,
 )
 from llmtuner.models.hf.model_setup import configure_experts_implementation
+from llmtuner.models.qwen3_5.experts import (
+    _forward_pre_down_grouped_experts,
+    _validate_pre_down_grouped_inputs,
+)
 
 
 def model(implementation):

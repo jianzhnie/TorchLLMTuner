@@ -33,8 +33,8 @@ from torchtitan_npu.models.qwen3_5 import model_registry
 
 from llmtuner.models.hf.qkv_projection import (
     apply_fp32_rotary_projection,
-    apply_qwen35_fp32_rotary,
 )
+from llmtuner.models.qwen3_5.rotary import apply_qwen35_fp32_rotary
 from tests.integration_tests.qwen35_cross_framework import boundary
 
 ATOL, RTOL = 0.005, 0.02

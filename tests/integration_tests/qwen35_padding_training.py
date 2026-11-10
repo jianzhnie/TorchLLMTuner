@@ -90,7 +90,9 @@ def main() -> None:
             "llmtuner/models/hf/model.py",
             "llmtuner/models/hf/padding_metadata.py",
             "llmtuner/models/hf/linear_attention.py",
+            "llmtuner/models/qwen3_5/linear_attention.py",
             "llmtuner/models/hf/gdn_numerics.py",
+            "llmtuner/models/qwen3_5/gdn_numerics.py",
             "llmtuner/accelerator/gated_delta.py",
         )
     }

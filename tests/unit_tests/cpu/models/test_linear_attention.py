@@ -10,9 +10,9 @@ from transformers import PretrainedConfig
 
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
-from llmtuner.models.hf import linear_attention as adapter
 from llmtuner.models.hf import padding_metadata
 from llmtuner.models.hf.factory import apply_runtime_config, unwrap_text_config
+from llmtuner.models.qwen3_5 import linear_attention as adapter
 
 
 def geometry(**overrides):

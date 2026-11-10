@@ -14,13 +14,13 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
 from llmtuner.models.hf.factory import apply_runtime_config, unwrap_text_config
-from llmtuner.models.hf.gdn_numerics import (
+from llmtuner.models.qwen3_5.gdn_numerics import (
     configure_gdn_numerics,
     validate_gdn_numerical_batch,
     validate_gdn_numerical_config,
     validate_gdn_numerical_sequence,
 )
-from llmtuner.models.hf.linear_attention import (
+from llmtuner.models.qwen3_5.linear_attention import (
     validate_linear_attention_batch,
     validate_linear_attention_config,
     validate_linear_attention_sequence,

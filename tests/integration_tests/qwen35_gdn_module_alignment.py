@@ -40,7 +40,7 @@ from torchtitan_npu.override.qwen3_5.gated_delta import (
     _npu_causal_conv,
 )
 from llmtuner.accelerator.gated_delta import gated_delta_rule
-from llmtuner.models.hf.linear_attention import apply_linear_attention_backend
+from llmtuner.models.qwen3_5.linear_attention import apply_linear_attention_backend
 
 ATOL = 0.005
 RTOL = 0.02

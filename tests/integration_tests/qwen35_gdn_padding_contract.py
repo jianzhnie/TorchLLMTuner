@@ -22,8 +22,8 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.hf.gdn_numerics import configure_gdn_numerics
-from llmtuner.models.hf.linear_attention import validate_gdn_inputs
+from llmtuner.models.qwen3_5.gdn_numerics import configure_gdn_numerics
+from llmtuner.models.qwen3_5.linear_attention import validate_gdn_inputs
 
 
 def source(value):

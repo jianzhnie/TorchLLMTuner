@@ -21,8 +21,8 @@ from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
 from llmtuner.models.hf.qkv_projection import (
     apply_fp32_rotary_projection,
-    apply_qwen35_fp32_rotary,
 )
+from llmtuner.models.qwen3_5.rotary import apply_qwen35_fp32_rotary
 
 
 def make_model(cache):

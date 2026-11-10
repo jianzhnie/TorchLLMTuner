@@ -27,13 +27,13 @@ try:
 except ImportError:
     torch_npu = None
 
-from llmtuner.models.hf.kimi_training import forward_kimi_training
 from llmtuner.models.kimi.attention_residual import attention_residual
 from llmtuner.models.kimi.delta_attention import KimiDeltaAttention, recurrent_kda
 from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
 from llmtuner.models.kimi.latent_attention import KimiLatentAttention
 from llmtuner.models.kimi.moe import KimiSparseMoE
 from llmtuner.models.kimi.normalization import KimiGatedRMSNorm
+from llmtuner.models.kimi.official_moe_training import forward_kimi_training
 
 
 def check_native_kda():

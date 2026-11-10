@@ -17,7 +17,7 @@ except ImportError:
     torch_npu = None
 
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.hf.kimi_training import (
+from llmtuner.models.kimi.official_moe_training import (
     forward_kimi_training,
     install_kimi_moe_training,
 )

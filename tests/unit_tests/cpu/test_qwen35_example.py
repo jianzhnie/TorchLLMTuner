@@ -16,12 +16,12 @@ from llmtuner.config import DataloaderConfig
 from llmtuner.datasets.corpus_identity import corpus_data_identity
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
 from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.linear_attention import validate_linear_attention_training
 from llmtuner.models.hf.materialization import (
     initialize_random_hf_model,
     materialize_meta_model,
 )
 from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.qwen3_5.linear_attention import validate_linear_attention_training
 
 
 def recipe_args(tmp_path, layers=None):

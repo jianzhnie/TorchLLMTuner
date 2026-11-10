@@ -76,8 +76,8 @@ from llmtuner.models.hf.expert_kernels import (
     stabilize_moe_experts,
     stabilize_moe_router,
 )
-from llmtuner.models.hf.gdn_numerics import configure_gdn_numerics
-from llmtuner.models.hf.linear_attention import apply_linear_attention_backend
+from llmtuner.models.qwen3_5.gdn_numerics import configure_gdn_numerics
+from llmtuner.models.qwen3_5.linear_attention import apply_linear_attention_backend
 from llmtuner.models.hf.model_setup import configure_experts_implementation
 from llmtuner.models.hf.qkv_projection import apply_fp32_rotary_projection
 
