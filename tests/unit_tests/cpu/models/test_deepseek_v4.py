@@ -64,6 +64,24 @@ def test_v4_meta_initialization_and_forward_backward():
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
+def test_explicit_v4_model_matches_native_hf_forward() -> None:
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+        DeepseekV4ForCausalLM as NativeDeepseekV4ForCausalLM,
+    )
+
+    from llmtuner.models.deepseek.deepseek_v4.modeling import DeepseekV4ForCausalLM
+
+    config = small_config()
+    native = NativeDeepseekV4ForCausalLM(config).eval()
+    explicit = DeepseekV4ForCausalLM(config).eval()
+    explicit.load_state_dict(native.state_dict(), strict=True)
+    tokens = torch.arange(8) % 64
+    with torch.no_grad():
+        expected = native(input_ids=tokens.unsqueeze(0), use_cache=False).logits
+        actual = explicit(input_ids=tokens.unsqueeze(0), use_cache=False).logits
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_v4_recipe_chat_template_preserves_supervision_boundary():
     from pathlib import Path
 

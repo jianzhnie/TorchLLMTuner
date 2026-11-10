@@ -10,7 +10,7 @@ from transformers import PretrainedConfig
 
 from llmtuner.errors import EnvironmentUnsupportedError
 from llmtuner.models.kimi.kimi_k3 import delta_attention
-from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 
 
 def kda_config():

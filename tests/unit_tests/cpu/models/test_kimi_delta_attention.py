@@ -3,11 +3,11 @@
 import pytest
 import torch
 
+from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.delta_attention import (
     KimiDeltaAttention,
     recurrent_kda,
 )
-from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
 
 
 @pytest.mark.parametrize("full_gate", [False, True])

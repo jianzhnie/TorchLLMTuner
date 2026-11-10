@@ -44,7 +44,7 @@ def test_attention_residual_matches_independent_per_token_reference(history, see
 @pytest.mark.parametrize("seed", range(32))
 @pytest.mark.parametrize("block_size", [1, 2])
 def test_kimi_attention_residual_model_runs_all_parameter_gradients(block_size, seed):
-    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
     from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
 
     config = KimiLinearConfig(

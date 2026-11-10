@@ -2,7 +2,11 @@
 
 import pytest
 
-from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.configuration import (
+    KimiK3Config,
+    KimiK3VisionConfig,
+    KimiLinearConfig,
+)
 
 
 def test_kimi_config_roundtrip_preserves_hybrid_architecture(tmp_path):
@@ -58,3 +62,16 @@ def test_kimi_config_requires_explicit_hybrid_layer_lists(field):
     del attention[field]
     with pytest.raises(ValueError, match=field):
         KimiLinearConfig(linear_attn_config=attention)
+
+
+def test_kimi_k3_composite_config_builds_nested_types() -> None:
+    config = KimiK3Config(
+        text_config={"hidden_size": 32, "num_attention_heads": 2},
+        vision_config={"vt_hidden_size": 64},
+    )
+
+    assert isinstance(config.text_config, KimiLinearConfig)
+    assert isinstance(config.vision_config, KimiK3VisionConfig)
+    assert config.text_config.hidden_size == 32
+    assert config.vision_config.mm_hidden_size == 64
+    assert config.model_type == "kimi_k3"

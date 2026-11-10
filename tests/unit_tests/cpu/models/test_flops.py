@@ -668,7 +668,7 @@ def test_invalid_moe_projection_geometry_suppresses_flops(field, value):
 
 
 def test_kimi_nonlatent_moe_flops_uses_hidden_width():
-    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 
     config = KimiLinearConfig(
         vocab_size=32,
@@ -704,7 +704,7 @@ def test_kimi_flops_matches_executed_projection_work(
 ):
     from torch import nn
 
-    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
     from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
 
     config = KimiLinearConfig(
@@ -775,7 +775,7 @@ def test_kimi_flops_matches_executed_projection_work(
     ],
 )
 def test_kimi_flops_rejects_unresolved_geometry(field, value):
-    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 
     config = KimiLinearConfig(
         hidden_size=8,

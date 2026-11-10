@@ -13,7 +13,7 @@ require_env("spmd_types")
 import torch
 import torch.distributed as dist
 
-from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.latent_attention import KimiLatentAttention
 from llmtuner.parallel.context_parallel.kcp import kcp_kda_forward, kcp_mla_attention
 

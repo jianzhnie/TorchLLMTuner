@@ -357,3 +357,25 @@ assert not any(name == 'transformers' or name.startswith('transformers.')
 assert 'llmtuner.models.kimi.kimi_k3.model' not in sys.modules
 """
     subprocess.run([sys.executable, "-c", source], check=True)
+
+
+def test_explicit_factory_is_opt_in_and_lazy(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.models import explicit
+
+    calls = []
+    expected = object()
+
+    def model_class(config):
+        calls.append(config)
+        return expected
+
+    monkeypatch.setattr(
+        explicit,
+        "import_module",
+        lambda name, package: SimpleNamespace(DeepseekV4ForCausalLM=model_class),
+    )
+    config = PretrainedConfig(model_type="deepseek_v4")
+    assert explicit.build_explicit_model(config) is expected
+    assert calls == [config]

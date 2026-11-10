@@ -9,7 +9,7 @@ from llmtuner.models.hf.model import HFTransformerModel
 
 
 def test_kimi_decoder_rejects_batched_document_resets_and_conflicting_masks():
-    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
     from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
 
     config = KimiLinearConfig(
@@ -47,7 +47,7 @@ def test_kimi_decoder_rejects_batched_document_resets_and_conflicting_masks():
 
 def test_registered_kimi_architecture_builds_from_training_config():
     from llmtuner.models.hf.factory import build_model_config_for, resolve_model_class
-    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
     from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
 
     config = build_model_config_for(
@@ -166,7 +166,7 @@ def test_kimi_wrapper_padding_matches_compacted_sequence():
 def test_kimi_decoder_rejects_cache_instead_of_silently_ignoring_it():
     import pytest
 
-    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
     from llmtuner.models.kimi.kimi_k3.model import KimiTextDecoder
 
     config = KimiLinearConfig(
@@ -191,7 +191,7 @@ def test_kimi_decoder_rejects_cache_instead_of_silently_ignoring_it():
 
 
 def test_kimi_moe_layer_selection_matches_configured_dense_prefix_and_frequency():
-    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
     from llmtuner.models.kimi.kimi_k3.model import KimiTextDecoder
 
     config = KimiLinearConfig(
@@ -276,8 +276,8 @@ def test_kimi_meta_materialization_initializes_custom_parameters():
 
 def test_kda_decay_parameters_remain_fp32_with_bf16_default():
     from llmtuner.models.hf.materialization import initialize_random_hf_model
+    from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
     from llmtuner.models.kimi.kimi_k3.delta_attention import KimiDeltaAttention
-    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
     from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
 
     config = KimiLinearConfig(

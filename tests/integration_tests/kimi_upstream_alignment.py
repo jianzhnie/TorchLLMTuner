@@ -28,11 +28,11 @@ except ImportError:
     torch_npu = None
 
 from llmtuner.models.kimi.kimi_k3.attention_residual import attention_residual
+from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.delta_attention import (
     KimiDeltaAttention,
     recurrent_kda,
 )
-from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.latent_attention import KimiLatentAttention
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
 from llmtuner.models.kimi.kimi_k3.normalization import KimiGatedRMSNorm
