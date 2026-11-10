@@ -24,6 +24,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...accelerator.capabilities import has as capability
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_backend, is_distributed
+from ...errors import UnsupportedCombinationError
 from ...models.kimi.delta_attention import KimiDeltaAttention
 from ...utils.logging import get_logger
 from ..compatibility import chunked_loss_fsdp
@@ -556,14 +557,37 @@ def apply_fsdp(
     function only decides whether to shard at all, fixes the policy values,
     and applies the backend workaround.
     """
+    split_expert_layout = cfg.fsdp_config.fsdp_expert_reduce_layout == "split"
     if parallel_dims is None:
+        if split_expert_layout:
+            raise UnsupportedCombinationError(
+                "split expert reduction requires an actual sharding topology"
+            )
         return model
+
+    if split_expert_layout and (
+        cfg.fsdp_config.fsdp_implementation != "native"
+        or cfg.fsdp_config.fsdp_apply_modules
+        or cfg.fsdp_config.enable_fsdp_symm_mem
+        or parallel_dims.ep_enabled
+        or parallel_dims.tp_enabled
+        or parallel_dims.cp_enabled
+        or parallel_dims.pp_enabled
+        or parallel_dims.dp_replicate_enabled
+    ):
+        raise UnsupportedCombinationError(
+            "split expert reduction requires native plain DP sharding"
+        )
 
     storage_mesh = resolve_fsdp_mesh(parallel_dims)
     edp_mesh = resolve_sparse_fsdp_mesh(parallel_dims)
     # EP borrows ranks from the dense TP/CP/DP shard region. Dense DP can be
     # size 1 while the remaining expert-FSDP (efsdp) axis is still multi-rank.
     if storage_mesh.size() == 1 and (edp_mesh is None or edp_mesh.size() == 1):
+        if split_expert_layout:
+            raise UnsupportedCombinationError(
+                "split expert reduction requires more than one shard rank"
+            )
         return model
     if chunked_loss_num_chunks > 1:
         chunked_loss_fsdp(
@@ -651,5 +675,13 @@ def apply_fsdp(
     # gloo implements no PREMUL_SUM; NCCL does, and there it is the faster path.
     if is_distributed() and get_backend() != "nccl":
         force_sum_grad_reduction(model)
+
+    if split_expert_layout:
+        from .expert_reduction_layout import install_split_expert_reduction
+
+        install_split_expert_reduction(
+            model,
+            workspace_limit_bytes=cfg.fsdp_config.fsdp_expert_reduce_workspace_limit_bytes,
+        )
 
     return model

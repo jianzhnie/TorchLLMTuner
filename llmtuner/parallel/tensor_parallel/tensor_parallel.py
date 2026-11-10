@@ -83,6 +83,18 @@ __all__ = [
 ShardKind = Literal["colwise", "rowwise"]
 
 
+@dataclass(frozen=True)
+class _TPInitializationSpec:
+    """Storage-free original HF initialization and TP ownership coordinates."""
+
+    module_type: type[nn.Module]
+    global_shape: tuple[int, ...]
+    dim: int
+    size: int
+    rank: int
+    packed: bool = False
+
+
 # -- declaration --------------------------------------------------------------
 
 
@@ -134,6 +146,11 @@ class ShardedLinear(nn.Module):
         super().__init__()
         self.in_features = weight.shape[1]
         self.out_features = weight.shape[0]
+        self._tp_init_specs = {
+            "weight": _TPInitializationSpec(
+                nn.Linear, tuple(weight.shape), self.shard_dim, tp_size, tp_rank
+            )
+        }
         self.weight = nn.Parameter(
             shard_weight(weight, self.shard_dim, tp_size=tp_size, tp_rank=tp_rank),
             requires_grad=weight.requires_grad
@@ -289,6 +306,12 @@ class ReplicatedAttentionSequenceBoundary:
     the full sequence and RoPE positions. Its output is replicated, so slice
     tokens without summing; the input gather sums partial gradients in backward.
     Replicated attention parameter gradients are reduced by the trainer.
+
+    Qwen3.5 GDN uses the same boundary with all projections replicated: both
+    the causal convolution and recurrent scan require the full token history.
+    Its attention_mask must describe the gathered sequence (as supplied by HF),
+    and is forwarded unchanged. This boundary adds no parameter-gradient hooks;
+    the trainer performs the single replicated-parameter gradient reduction.
     """
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
@@ -395,6 +418,11 @@ def shard_shared_expert_for_tp(
             )
     # Allocation failure must preserve both weights and feature metadata.
     for name, dim, proj, weight in projections:
+        proj._tp_init_specs = {
+            "weight": _TPInitializationSpec(
+                type(proj), tuple(weight.shape), dim, tp_size, tp_rank
+            )
+        }
         proj.weight = shards[id(weight)]
         if dim == 0:
             proj.out_features = proj.weight.shape[0]
@@ -471,6 +499,14 @@ def shard_experts_for_tp(
             requires_grad=down.requires_grad,
         )
     # Finish allocation before replacing either original parameter.
+    experts._tp_init_specs = {
+        "gate_up_proj": _TPInitializationSpec(
+            type(experts), tuple(gate_up.shape), 1, tp_size, tp_rank, packed=True
+        ),
+        "down_proj": _TPInitializationSpec(
+            type(experts), tuple(down.shape), 2, tp_size, tp_rank
+        ),
+    }
     experts.gate_up_proj = sharded_gate_up
     experts.down_proj = sharded_down
     return frozenset({"experts.gate_up_proj", "experts.down_proj"})
@@ -996,10 +1032,32 @@ def apply_tp(
     replicated_attention = [
         module
         for path, module in model.named_modules()
-        if path.rsplit(".", 1)[-1] == "self_attn"
+        if (
+            path.rsplit(".", 1)[-1] == "self_attn"
+            or (
+                path.rsplit(".", 1)[-1] == "linear_attn"
+                and any(
+                    cls.__name__ in {"Qwen3_5GatedDeltaNet", "Qwen3_5MoeGatedDeltaNet"}
+                    for cls in type(module).__mro__
+                )
+            )
+        )
         and not hasattr(module, "_tp_seq_group")
         and not any(target.startswith(f"{path}.") for target, _, _ in targets)
     ]
+    # GDN's convolution and recurrence need the complete token history, even
+    # though HF's colwise_gather_output projections stay replicated here.
+    # Head-sharded GDN requires a different boundary and is not implemented.
+    for path, module in model.named_modules():
+        if (
+            path.rsplit(".", 1)[-1] == "linear_attn"
+            and any(
+                cls.__name__ in {"Qwen3_5GatedDeltaNet", "Qwen3_5MoeGatedDeltaNet"}
+                for cls in type(module).__mro__
+            )
+            and any(target.startswith(f"{path}.") for target, _, _ in targets)
+        ):
+            raise ValueError("TP linear_attn requires replicated GDN projections")
 
     tp_size = mesh["tp"].size()
     if tp_size != cfg.tp_size:
@@ -1045,6 +1103,15 @@ def apply_tp(
             use_symm_mem=use_symm_mem,
         )
         wrapped.train(inner.training)
+        wrapped._tp_init_specs = {
+            "weight": _TPInitializationSpec(
+                type(inner),
+                tuple(inner.weight.shape),
+                0 if spec.kind == "colwise" else 1,
+                tp_size,
+                tp_rank,
+            )
+        }
         replacements.append((parent, attr, wrapped))
 
     realize_moe_blocks_tp(moe_blocks, tp_size=tp_size, tp_rank=tp_rank, group=group)

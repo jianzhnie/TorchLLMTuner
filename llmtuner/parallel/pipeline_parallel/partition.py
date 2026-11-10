@@ -37,6 +37,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.pipelining import PipelineStage
+from torch.distributed.pipelining._backward import stage_backward
 from torch.distributed.pipelining.schedules import (
     ScheduleDualPipeV,
     ScheduleZBVZeroBubble,
@@ -56,6 +57,33 @@ class ComposablePipelineStage(PipelineStage):
     registered by that specific API. FSDPModule's accessor discovers the actual
     state attached to the module and preserves custom lifecycle callbacks.
     """
+
+    def backward_maybe_with_nosync(
+        self, backward_type, bwd_kwargs: dict, last_backward: bool = False
+    ):
+        if (
+            self.device.type != "npu"
+            or backward_type != "full"
+            or not isinstance(self.submod, FSDPModule)
+        ):
+            return super().backward_maybe_with_nosync(
+                backward_type, bwd_kwargs, last_backward
+            )
+        # Keep upstream's delayed gradient reduction, but release each group's
+        # full parameters before upcasting its accumulated gradient. This does
+        # not change accumulation order; later microbatches gather parameters
+        # again. Split input/weight backward retains the upstream lifecycle.
+        self.submod.set_is_last_backward(False)
+        self.submod.set_reshard_after_backward(True)
+        self.submod.set_requires_gradient_sync(False)
+        return (
+            stage_backward(
+                bwd_kwargs["stage_output"],
+                bwd_kwargs["output_grads"],
+                bwd_kwargs["input_values"],
+            ),
+            None,
+        )
 
     def _send_meta(self, meta, dst_stage: int) -> None:
         if self.device.type != "npu":

@@ -33,6 +33,7 @@ from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import (
     PipelineScheduleMulti,
     PipelineScheduleSingle,
+    Schedule1F1B,
     _PipelineSchedule,
     get_schedule_class,
 )
@@ -43,6 +44,7 @@ from ...components.loss import cross_entropy_loss
 from ...utils.logging import get_logger
 from .. import compatibility
 from ..topology import ParallelTopology
+from .hccl_schedule import hccl_1f1b_schedule_class
 from .partition import generate_llm_fqn_per_model_part, split_model_into_stages
 
 logger = get_logger(__name__)
@@ -434,6 +436,15 @@ def build_pipeline_schedule(
         parallelism.pp_config.pipeline_parallel_schedule
     )
     num_microbatches = parallelism.pp_config.num_pp_microbatches
+    if (
+        stages[0].device.type == "npu"
+        and schedule_class is Schedule1F1B
+        and parallelism.pp_size == 2
+        and len(stages) == 1
+        and dist.get_backend(stages[0].group) == "hccl"
+    ):
+        schedule_class = hccl_1f1b_schedule_class()
+        logger.info("Using ordered HCCL P2P submission for two-rank 1F1B")
     num_total_stages = parallelism.pipeline_parallel_size * len(stages)
     if num_microbatches < num_total_stages:
         logger.warning(
