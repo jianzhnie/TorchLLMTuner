@@ -969,6 +969,26 @@ def test_an_unsettable_experts_implementation_is_rejected() -> None:
         HFTransformerModel(config)
 
 
+def test_native_default_preserves_unadapted_hf_module_forwards() -> None:
+    config = build_model_config(
+        "llama",
+        seq_len=16,
+        arch_overrides={
+            "vocab_size": _VOCAB,
+            "hidden_size": _HIDDEN,
+            "intermediate_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+        },
+    )
+
+    model = HFTransformerModel(config)
+
+    assert all("forward" not in vars(module) for module in model.modules())
+    assert torch.isfinite(model(torch.arange(8))).all()
+
+
 def test_native_experts_implementation_is_the_default_and_builds() -> None:
     """The default leaves the HF model's own experts kernel untouched."""
     from llmtuner.models.hf.factory import resolve_model_class

@@ -168,11 +168,7 @@ class HFTransformerModel(nn.Module):
                 "HF adaptation options (construction only): model=%s, "
                 "attention=%s -> %s, experts=%s, norm=%s, router_dtype=%s, "
                 "linear_attention=%s, gdn_policy=%s, qkv=%s, "
-                "rotary_dtype=%s, rotary_cache=%s, lm_head_dtype=%s. "
-                "Auto attention uses Flex on CUDA and SDPA otherwise; "
-                "DeepSeek V4 defaults to eager. Parallel assembly may change "
-                "dispatch; None leaves an option unspecified, not disabled. "
-                "Kernel execution requires runtime verification.",
+                "rotary_dtype=%s, rotary_cache=%s, lm_head_dtype=%s",
                 config.model_type,
                 attention_backend,
                 self.model.config._attn_implementation,

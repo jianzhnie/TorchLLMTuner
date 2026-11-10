@@ -86,7 +86,8 @@ def configure_experts_implementation(
     if impl not in ("grouped_mm", "batched_mm", "eager"):
         raise ValueError(
             f"experts_implementation must be one of 'native', "
-            f"'grouped_mm', 'batched_mm', 'eager', 'torchtitan', got '{impl}'"
+            f"'grouped_mm', 'batched_mm', 'eager', 'torchtitan', 'pre_down', "
+            f"got '{impl}'"
         )
     can_set = getattr(model_cls, "_can_set_experts_implementation", None)
     if can_set is None:

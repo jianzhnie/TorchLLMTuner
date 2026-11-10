@@ -11,6 +11,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeTopKRouter,
 )
 
+from ...errors import UnsupportedCombinationError
 from ...parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 from ..common.moe.gate import RouterGateLinearFunction
 from ..common.scatter_add import deterministic_scatter_add
@@ -74,9 +75,16 @@ def stabilize_moe_router(model: nn.Module) -> None:
         )
     else:
         return
-    for module in model.modules():
-        if type(module) is router_type:
-            module.forward = MethodType(forward_fp32_topk_router, module)
+    modules = [module for module in model.modules() if type(module) is router_type]
+    for module in modules:
+        if "forward" in vars(module) and (
+            getattr(module.forward, "__func__", None) is not forward_fp32_topk_router
+        ):
+            raise UnsupportedCombinationError(
+                "FP32 router cannot replace an external custom forward"
+            )
+    for module in modules:
+        module.forward = MethodType(forward_fp32_topk_router, module)
 
 
 def forward_torchtitan_moe(module: nn.Module, hidden_states: torch.Tensor):
@@ -186,6 +194,13 @@ def stabilize_moe_experts(model: nn.Module) -> None:
     ]
     if not modules:
         raise ValueError("Qwen3-MoE torchtitan experts require routed MoE blocks")
+    for module in modules:
+        if "forward" in vars(module) and (
+            getattr(module.forward, "__func__", None) is not forward_torchtitan_moe
+        ):
+            raise UnsupportedCombinationError(
+                "torchtitan experts cannot replace an external custom MoE forward"
+            )
     for module in modules:
         module._llmtuner_local_dispatcher = LocalTokenDispatcher(
             module.experts.num_experts, module.gate.top_k
