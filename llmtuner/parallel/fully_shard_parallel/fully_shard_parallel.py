@@ -9,6 +9,7 @@ per-module wrap policy (MoE blocks get the sparse treatment by their
 """
 
 from collections.abc import Callable, Iterator
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -204,6 +205,7 @@ def apply_fsdp_to_decoder(
     backward_prefetch_count: int = 0,
     fsdp_implementation: str = "native",
     root_owned_boundaries: bool = False,
+    error_group: torch.distributed.ProcessGroup | None = None,
 ) -> None:
     """Apply FSDP in place to a decoder-style transformer model.
 
@@ -251,128 +253,188 @@ def apply_fsdp_to_decoder(
     full SPMD mesh, the explicit form is not available here anyway (see
     ``resolve_fsdp_mesh``).
     """
-    strategy = get_fsdp_strategy(fsdp_implementation)
-    if root_owned_boundaries and (
-        fsdp_implementation != "native" or cpu_offload or pp_enabled or ep_degree > 1
+    with (
+        synchronize_local_errors("Decoder FSDP plan validation", group=error_group)
+        if error_group is not None
+        else nullcontext()
     ):
-        raise ValueError("root-owned boundaries require native decoder-only FSDP")
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=param_dtype,
-        reduce_dtype=reduce_dtype,
-        cast_forward_inputs=False,
-    )
-    shard_fn = (
-        fully_shard
-        if fsdp_implementation == "native"
-        else strategy.get_fully_shard_fn()
-    )
-    fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
-    if cpu_offload:
-        fsdp_config["offload_policy"] = CPUOffloadPolicy(
-            pin_memory=cpu_offload_pin_memory
+        strategy = get_fsdp_strategy(fsdp_implementation)
+        if root_owned_boundaries and (
+            fsdp_implementation != "native"
+            or cpu_offload
+            or pp_enabled
+            or ep_degree > 1
+        ):
+            raise ValueError("root-owned boundaries require native decoder-only FSDP")
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            cast_forward_inputs=False,
+        )
+        shard_fn = (
+            fully_shard
+            if fsdp_implementation == "native"
+            else strategy.get_fully_shard_fn()
+        )
+        fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
+        if cpu_offload:
+            fsdp_config["offload_policy"] = CPUOffloadPolicy(
+                pin_memory=cpu_offload_pin_memory
+            )
+
+        reshard_after_forward = get_fsdp_reshard_after_forward_policy(
+            reshard_after_forward_policy, pp_enabled
         )
 
-    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
-        reshard_after_forward_policy, pp_enabled
-    )
-
-    # Models declare parameters that need a separate storage-dtype group. Wrap
-    # their children first and those direct parameters last, preserving FQNs.
-    separate_units = []
-    for attention in model.modules():
-        names = getattr(attention, "fsdp_separate_parameter_names", ())
-        if not names:
-            continue
-        direct = dict(attention.named_parameters(recurse=False))
-        if not isinstance(names, tuple | list) or any(
-            not isinstance(name, str) or name not in direct for name in names
-        ):
-            raise ValueError(
-                "fsdp_separate_parameter_names must name direct registered Parameters"
-            )
-        separate_dtypes = {direct[name].dtype for name in names}
-        if len(separate_dtypes) != 1:
-            raise ValueError("Separate FSDP parameters must share one storage dtype")
-        if {p.dtype for p in attention.parameters()} == {param_dtype}:
-            continue
-        if fsdp_implementation != "native":
-            raise ValueError(
-                "Model-declared separate dtype parameters require native FSDP"
-            )
-        if set(direct) - set(names):
-            raise ValueError(
-                "Mixed-dtype FSDP module must declare all direct parameters "
-                "in fsdp_separate_parameter_names"
-            )
-        separate_units.append((attention, next(iter(separate_dtypes))))
-    if separate_units:
-        parameter_owners_by_module: dict[nn.Parameter, set[nn.Module]] = {}
-        for module in model.modules():
-            for parameter in module.parameters(recurse=False):
-                parameter_owners_by_module.setdefault(parameter, set()).add(module)
-        for module, _ in separate_units:
-            subtree = set(module.modules())
-            if any(
-                parameter_owners_by_module[parameter] - subtree
-                for parameter in module.parameters()
+        # Models declare parameters that need a separate storage-dtype group. Wrap
+        # their children first and those direct parameters last, preserving FQNs.
+        separate_units = []
+        for attention in model.modules():
+            names = getattr(attention, "fsdp_separate_parameter_names", ())
+            if not names:
+                continue
+            direct = dict(attention.named_parameters(recurse=False))
+            if not isinstance(names, tuple | list) or any(
+                not isinstance(name, str) or name not in direct for name in names
             ):
                 raise ValueError(
-                    "Separate-dtype FSDP subtrees cannot share parameters with "
-                    "external modules; declare a common ownership boundary"
+                    "fsdp_separate_parameter_names must name direct "
+                    "registered Parameters"
                 )
-            if any(
-                other is not module and other in subtree for other, _ in separate_units
-            ):
-                raise ValueError("Separate-dtype FSDP declarations must not be nested")
-    # Resolve ownership before any sharding replaces Parameters. Include
-    # the decoder boundary units so a layer/norm/head alias is not split into
-    # independent sharded tensors. Existing tied embedding/head units stay intact.
-    units: list[tuple[list[nn.Module], bool]] = []
-    boundary = [
-        module
-        for module in (model.tok_embeddings, model.norm, model.lm_head)
-        if module is not None and type(module) is not nn.Identity
-    ]
-    final_reshard = reshard_after_forward_policy == "always"
-    if model.enable_weight_tying:
-        if boundary:
-            units.append((boundary, final_reshard))
-    else:
-        if model.tok_embeddings in boundary:
-            units.append(([model.tok_embeddings], reshard_after_forward))
-        final_modules = [
-            module for module in (model.norm, model.lm_head) if module in boundary
-        ]
-        if final_modules:
-            units.append((final_modules, final_reshard))
-    boundary_count = len(units)
-    units.extend(
-        ([block], reshard_after_forward)
-        for _, block in iter_transformer_layers(model.layers)
-    )
-    # Build one placement map before parameter replacement. A shared unit may
-    # span dense and MoE layers, but every expert retains its own mesh/layout.
-    expert_placements: dict[nn.Parameter, Shard] = {}
-    expert_units: set[int] = set()
-    for index, (modules, _) in enumerate(units):
-        for module in modules:
-            if not getattr(module, "moe_enabled", False):
+            separate_dtypes = {direct[name].dtype for name in names}
+            if len(separate_dtypes) != 1:
+                raise ValueError(
+                    "Separate FSDP parameters must share one storage dtype"
+                )
+            if {p.dtype for p in attention.parameters()} == {param_dtype}:
                 continue
-            expert_units.add(index)
-            experts = module.moe.routed_experts.inner_experts
-            num_experts = module.moe.router.num_experts
-            if ep_degree > 1:
-                assert edp_mesh is not None
-                shard_degree = edp_mesh["efsdp"].size() * ep_degree
-            else:
-                shard_degree = fsdp_shard_size(dp_mesh)
-            placement = Shard(1 if shard_degree > num_experts else 0)
-            for parameter in experts.parameters():
-                previous = expert_placements.setdefault(parameter, placement)
-                if previous != placement:
+            if fsdp_implementation != "native":
+                raise ValueError(
+                    "Model-declared separate dtype parameters require native FSDP"
+                )
+            if set(direct) - set(names):
+                raise ValueError(
+                    "Mixed-dtype FSDP module must declare all direct parameters "
+                    "in fsdp_separate_parameter_names"
+                )
+            separate_units.append((attention, next(iter(separate_dtypes))))
+        if separate_units:
+            parameter_owners_by_module: dict[nn.Parameter, set[nn.Module]] = {}
+            for module in model.modules():
+                for parameter in module.parameters(recurse=False):
+                    parameter_owners_by_module.setdefault(parameter, set()).add(module)
+            for module, _ in separate_units:
+                subtree = set(module.modules())
+                if any(
+                    parameter_owners_by_module[parameter] - subtree
+                    for parameter in module.parameters()
+                ):
                     raise ValueError(
-                        "Shared expert parameters have conflicting FSDP placements"
+                        "Separate-dtype FSDP subtrees cannot share parameters with "
+                        "external modules; declare a common ownership boundary"
                     )
+                if any(
+                    other is not module and other in subtree
+                    for other, _ in separate_units
+                ):
+                    raise ValueError(
+                        "Separate-dtype FSDP declarations must not be nested"
+                    )
+        # Resolve ownership before any sharding replaces Parameters. Include
+        # the decoder boundary units so a layer/norm/head alias is not split into
+        # independent sharded tensors. Existing tied embedding/head units stay intact.
+        units: list[tuple[list[nn.Module], bool]] = []
+        boundary = [
+            module
+            for module in (model.tok_embeddings, model.norm, model.lm_head)
+            if module is not None and type(module) is not nn.Identity
+        ]
+        final_reshard = reshard_after_forward_policy == "always"
+        if model.enable_weight_tying:
+            if boundary:
+                units.append((boundary, final_reshard))
+        else:
+            if model.tok_embeddings in boundary:
+                units.append(([model.tok_embeddings], reshard_after_forward))
+            final_modules = [
+                module for module in (model.norm, model.lm_head) if module in boundary
+            ]
+            if final_modules:
+                units.append((final_modules, final_reshard))
+        boundary_count = len(units)
+        units.extend(
+            ([block], reshard_after_forward)
+            for _, block in iter_transformer_layers(model.layers)
+        )
+        # Build one placement map before parameter replacement. A shared unit may
+        # span dense and MoE layers, but every expert retains its own mesh/layout.
+        expert_placements: dict[nn.Parameter, Shard] = {}
+        expert_units: set[int] = set()
+        for index, (modules, _) in enumerate(units):
+            for module in modules:
+                if not getattr(module, "moe_enabled", False):
+                    continue
+                expert_units.add(index)
+                experts = module.moe.routed_experts.inner_experts
+                num_experts = module.moe.router.num_experts
+                if ep_degree > 1:
+                    assert edp_mesh is not None
+                    shard_degree = edp_mesh["efsdp"].size() * ep_degree
+                else:
+                    shard_degree = fsdp_shard_size(dp_mesh)
+                placement = Shard(1 if shard_degree > num_experts else 0)
+                for parameter in experts.parameters():
+                    previous = expert_placements.setdefault(parameter, placement)
+                    if previous != placement:
+                        raise ValueError(
+                            "Shared expert parameters have conflicting FSDP placements"
+                        )
+        # Root-owned registrations may alias a parameter inside a decoder unit.
+        # Exclude every planned layer subtree when collecting the remaining owners;
+        # recursively inspecting the root would incorrectly merge all units.
+        nested_roots = {
+            *boundary,
+            *[block for _, block in iter_transformer_layers(model.layers)],
+        }
+        nested_paths = []
+        root_modules = []
+        for path, module in model.named_modules(remove_duplicate=False):
+            if any(
+                path == root or path.startswith(f"{root}.") for root in nested_paths
+            ):
+                continue
+            if module in nested_roots:
+                nested_paths.append(path)
+            else:
+                root_modules.append(module)
+        root_parameters = {
+            parameter
+            for module in root_modules
+            for parameter in module.parameters(recurse=False)
+        }
+        if root_owned_boundaries:
+            root_parameters.update(
+                parameter for module in boundary for parameter in module.parameters()
+            )
+        root_index = len(units)
+        units.append(([model], False))
+        groups = {index: {index} for index in range(len(units))}
+        parameter_owners: dict[nn.Parameter, int] = {}
+        for index, (modules, _) in enumerate(units):
+            for module in modules:
+                parameters = (
+                    root_parameters if index == root_index else module.parameters()
+                )
+                for parameter in parameters:
+                    previous = parameter_owners.setdefault(parameter, index)
+                    merged = groups[previous] | groups[index]
+                    for owner in merged:
+                        groups[owner] = merged
+        module_units = {
+            module: index
+            for index, (modules, _) in enumerate(units)
+            for module in modules
+        }
     if ep_degree > 1 and expert_placements:
         assert edp_mesh is not None
         # One fully_shard unit has to own parameters on two meshes here: the
@@ -394,48 +456,9 @@ def apply_fsdp_to_decoder(
         def expert_placement_fn(parameter: nn.Parameter) -> Shard | None:
             return expert_placements.get(parameter)
 
-    # Root-owned registrations may alias a parameter inside a decoder unit.
-    # Exclude every planned layer subtree when collecting the remaining owners;
-    # recursively inspecting the root would incorrectly merge all units.
-    nested_roots = {
-        *boundary,
-        *[block for _, block in iter_transformer_layers(model.layers)],
-    }
-    nested_paths = []
-    root_modules = []
-    for path, module in model.named_modules(remove_duplicate=False):
-        if any(path == root or path.startswith(f"{root}.") for root in nested_paths):
-            continue
-        if module in nested_roots:
-            nested_paths.append(path)
-        else:
-            root_modules.append(module)
-    root_parameters = {
-        parameter
-        for module in root_modules
-        for parameter in module.parameters(recurse=False)
-    }
-    if root_owned_boundaries:
-        root_parameters.update(
-            parameter for module in boundary for parameter in module.parameters()
-        )
-    root_index = len(units)
-    units.append(([model], False))
-    groups = {index: {index} for index in range(len(units))}
-    parameter_owners: dict[nn.Parameter, int] = {}
-    for index, (modules, _) in enumerate(units):
-        for module in modules:
-            parameters = root_parameters if index == root_index else module.parameters()
-            for parameter in parameters:
-                previous = parameter_owners.setdefault(parameter, index)
-                merged = groups[previous] | groups[index]
-                for owner in merged:
-                    groups[owner] = merged
-    module_units = {
-        module: index for index, (modules, _) in enumerate(units) for module in modules
-    }
     # Validate all declarations before sharding any child. Storage precision is
     # owned by the model contract, not inferred from a specific model family.
+    separately_sharded_modules: set[nn.Module] = set()
     for attention, separate_dtype in separate_units:
         children = [child for child in attention.children() if list(child.parameters())]
         if children:
@@ -444,6 +467,7 @@ def apply_fsdp_to_decoder(
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward,
             )
+            separately_sharded_modules.update(children)
         decay_config = dict(fsdp_config)
         decay_config["mp_policy"] = MixedPrecisionPolicy(
             param_dtype=separate_dtype,
@@ -455,6 +479,7 @@ def apply_fsdp_to_decoder(
             **decay_config,
             reshard_after_forward=reshard_after_forward,
         )
+        separately_sharded_modules.add(attention)
 
     sharded_units: set[int] = set()
 
@@ -469,6 +494,14 @@ def apply_fsdp_to_decoder(
         )
         if root_owned_boundaries and root_index in owners:
             modules = [model]
+        # A model may declare an entire decoder boundary as a separate group.
+        # Its state was installed above; fully_shard is not reentrant on it.
+        modules = [
+            module for module in modules if module not in separately_sharded_modules
+        ]
+        if not modules:
+            sharded_units.update(owners)
+            return
         # One state has one reshard policy. Retain any boundary unit's request
         # to keep parameters available through its last forward consumer.
         reshard = all(units[owner][1] for owner in owners)
@@ -714,6 +747,9 @@ def apply_fsdp(
         backward_prefetch_count=cfg.fsdp_config.fsdp_backward_prefetch_count,
         fsdp_implementation=cfg.fsdp_config.fsdp_implementation,
         root_owned_boundaries=chunked_loss_num_chunks > 1,
+        error_group=(
+            parallel_dims.get_mesh("loss").get_group() if is_distributed() else None
+        ),
     )
     # ``apply_fsdp_to_decoder`` already calls ``disable_fsdp_gradient_division``
     # and, when asked, ``enable_fsdp_symm_mem``; do not repeat them here.
