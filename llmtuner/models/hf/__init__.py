@@ -8,7 +8,8 @@ Main modules:
   rebuilds runtime buffers, and restores shared parameter and buffer aliases.
 * ``model_setup.py`` -- generic structure probes, head validation, and optional
   experts/lm-head construction settings. Qwen-specific policies live in
-  ``normalization_setup.py`` and ``expert_kernels.py``.
+  ``models.qwen.qwen3`` and ``models.qwen.qwen3_5``; MoE selection remains
+  in ``expert_kernels.py``.
 * ``input_preparation.py`` -- normalizes batches and applies CP/TP input shards.
 * ``attention_backend.py`` -- selects and registers the HF attention adapter.
 * ``attention_masks.py`` -- builds dense, Flex, and CP attention masks.

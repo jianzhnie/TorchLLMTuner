@@ -40,7 +40,7 @@ _RUNTIME_CONFIG_FIELDS = (
 )
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedModel
+    from torch import nn
 
     from ...config.llmtuner_config import LLMTunerConfig
 
@@ -204,12 +204,11 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
     return text_config
 
 
-def resolve_model_class(config: PretrainedConfig) -> type[PreTrainedModel]:
-    """Find the ``ForCausalLM`` class named by the config.
+def resolve_model_class(config: PretrainedConfig) -> type[nn.Module]:
+    """Prefer a model-owned implementation, then resolve the HF model class.
 
-    Prefer the name the config declares; fall back to the ``model_type`` ->
-    ``Auto`` mapping, which covers configs whose architecture name does not match
-    the installed class name.
+    Registered implementations need not inherit PreTrainedModel. The HF
+    fallback prefers the declared class name, then its model-type mapping.
     """
     architecture = get_model_architecture(config.model_type)
     if architecture is not None:

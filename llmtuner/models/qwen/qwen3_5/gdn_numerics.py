@@ -16,7 +16,7 @@ from torch import nn
 
 from ....datasets.contracts import Batch
 from ....errors import UnsupportedCombinationError
-from ...hf.padding_metadata import (
+from .padding_metadata import (
     validate_gdn_forward_metadata,
     validate_gdn_padding_config,
     validate_gdn_sequence_metadata,

@@ -1,49 +1,57 @@
-"""Registration seam for model architectures not shipped by Transformers."""
+"""Model-owned construction hooks, independent of any modeling backend."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-from .kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
-
-KIMI_MODEL_IMPORT_ERROR = None
-try:
-    from .kimi.kimi_k3.model import KimiLinearForCausalLM
-except ImportError as error:
-    KIMI_MODEL_IMPORT_ERROR = error
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig, PreTrainedModel
+    from torch import nn
 
 
 @dataclass(frozen=True)
 class ModelArchitecture:
-    """Lightweight construction hooks for one custom HF architecture."""
+    """Construction hooks for a model and its own configuration type.
+
+    HF integration may require additional config methods, but registration and
+    lookup do not require Transformers or a PreTrainedModel base class.
+    """
 
     model_type: str
-    config_factory: Callable[..., PretrainedConfig]
-    config_type_loader: Callable[[], type[PretrainedConfig]]
-    model_class_loader: Callable[[], type[PreTrainedModel]]
+    config_factory: Callable[..., Any]
+    config_type_loader: Callable[[], type]
+    model_class_loader: Callable[[], type[nn.Module]]
 
     @classmethod
     def from_types(
         cls,
         model_type: str,
         *,
-        config_type: type[PretrainedConfig],
-        model_class_loader: Callable[[], type[PreTrainedModel]],
+        config_type: type,
+        model_class_loader: Callable[[], type[nn.Module]],
     ) -> ModelArchitecture:
         return cls(model_type, config_type, lambda: config_type, model_class_loader)
 
 
-def _load_kimi_model_class() -> type[PreTrainedModel]:
-    if KIMI_MODEL_IMPORT_ERROR is not None:
+def _load_kimi_config_class() -> type:
+    module = import_module(".kimi.kimi_k3.kimi_linear_config", __package__)
+    return module.KimiLinearConfig
+
+
+def _build_kimi_config(**kwargs: Any) -> Any:
+    return _load_kimi_config_class()(**kwargs)
+
+
+def _load_kimi_model_class() -> type[nn.Module]:
+    try:
+        module = import_module(".kimi.kimi_k3.model", __package__)
+    except ImportError as error:
         raise ImportError(
-            f"Kimi Linear model dependencies are unavailable: {KIMI_MODEL_IMPORT_ERROR}"
-        ) from KIMI_MODEL_IMPORT_ERROR
-    return KimiLinearForCausalLM
+            f"Kimi Linear model dependencies are unavailable: {error}"
+        ) from error
+    return module.KimiLinearForCausalLM
 
 
 _ARCHITECTURES: dict[str, ModelArchitecture] = {}
@@ -74,14 +82,15 @@ def get_model_architecture(model_type: str) -> ModelArchitecture | None:
 
 
 def registered_model_architectures() -> tuple[ModelArchitecture, ...]:
-    """Return the custom configs needed when loading saved HF configurations."""
+    """Return registered construction hooks without importing their models."""
     return tuple(_ARCHITECTURES.values())
 
 
 register_model_architecture(
-    ModelArchitecture.from_types(
+    ModelArchitecture(
         "kimi_linear",
-        config_type=KimiLinearConfig,
+        config_factory=_build_kimi_config,
+        config_type_loader=_load_kimi_config_class,
         model_class_loader=_load_kimi_model_class,
     )
 )

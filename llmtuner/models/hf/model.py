@@ -33,6 +33,11 @@ from ...datasets.contracts import Batch, TrainerBatch
 from ...parallel.topology import ParallelTopology
 from ...utils.logging import get_logger
 from ..common.moe.layer import collect_moe_layers
+from ..qwen.qwen3.normalization_setup import stabilize_residual_norm_gradients
+from ..qwen.qwen3.qkv_projection import (
+    apply_fp32_rotary_projection,
+    apply_fused_qkv_projection,
+)
 from ..qwen.qwen3_5.gdn_numerics import (
     configure_gdn_numerics,
     validate_gdn_numerical_batch,
@@ -68,11 +73,6 @@ from .model_setup import (
     configure_experts_implementation,
     resolve_submodule_name,
     validate_head_config,
-)
-from .normalization_setup import stabilize_residual_norm_gradients
-from .qkv_projection import (
-    apply_fp32_rotary_projection,
-    apply_fused_qkv_projection,
 )
 
 logger = get_logger(__name__)

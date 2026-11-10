@@ -21,7 +21,7 @@ from ...models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
-from ...models.hf.expert_kernels import forward_torchtitan_moe
+from ...models.qwen.qwen3.experts import forward_torchtitan_moe
 from .. import compatibility
 from ..tensor_parallel.linear_ops import all_gather_along, reduce_scatter_along
 from .checkpointing import mark_experts_ep_sharded

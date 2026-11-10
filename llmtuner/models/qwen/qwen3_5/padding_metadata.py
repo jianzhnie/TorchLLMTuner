@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import torch
 
-from ...errors import UnsupportedCombinationError
+from ....errors import UnsupportedCombinationError
 
 QWEN35_GDN_GEOMETRY = {
     "model_type": "qwen3_5_moe_text",
