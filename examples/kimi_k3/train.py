@@ -20,7 +20,7 @@ from llmtuner.config import (
     TrainingConfig,
 )
 from llmtuner.errors import ConfigError
-from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 
 
 def load_text_overrides(model: str, layers: int | None = None) -> dict:

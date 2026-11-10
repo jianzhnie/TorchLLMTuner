@@ -1,9 +1,9 @@
 """Model registration, family implementations, HF adaptation, and components.
 
-* ``architecture.py`` registers custom HF config and model construction hooks.
-* ``kimi/kimi_k3/``, ``qwen/qwen3/`` and ``qwen/qwen3_5/`` contain
-  model-specific behavior. Family directories group independent model
-  structures; they do not re-export implementations or import sibling structures.
+* ``architecture.py`` registers model-owned config and construction hooks.
+* ``deepseek/``, ``kimi/`` and ``qwen/`` contain independent model structures.
+  ``explicit.py`` lazily constructs their opt-in HF subclasses without changing
+  the default HF class resolution.
 * ``hf/`` adapts HF decoders to the trainer's input, parallel, initialization,
   and checkpoint contracts. FLOPs estimation lives in ``llmtuner.utils.flops``.
 * ``common/`` contains model-agnostic attention, MoE, feed-forward, embedding,

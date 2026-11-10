@@ -55,7 +55,7 @@ from transformers import PretrainedConfig
 from ....accelerator.device import is_device_type_available
 from ....errors import EnvironmentUnsupportedError
 from .causal_convolution import KimiCausalConvolution
-from .kimi_linear_config import KimiLinearConfig
+from .configuration import KimiLinearConfig
 from .normalization import KimiGatedRMSNorm
 
 NPU_KDA_IMPORT_ERROR = None

@@ -58,8 +58,8 @@ from transformers.modeling_outputs import (
 )
 
 from .attention_residual import attention_residual
+from .configuration import KimiLinearConfig
 from .delta_attention import KimiDeltaAttention
-from .kimi_linear_config import KimiLinearConfig
 from .latent_attention import KimiLatentAttention
 from .mlp import KimiMLP as KimiMLP
 from .moe import KimiSparseMoE
@@ -292,6 +292,7 @@ class KimiLinearForCausalLM(PreTrainedModel):
                     module.weight[module.padding_idx].zero_()
 
     def forward(self, input_ids=None, inputs_embeds=None, labels=None, **kwargs):
+        output_hidden_states = kwargs.pop("output_hidden_states", False)
         hidden = self.model(
             input_ids=input_ids, inputs_embeds=inputs_embeds, **kwargs
         ).last_hidden_state
@@ -303,4 +304,8 @@ class KimiLinearForCausalLM(PreTrainedModel):
                 labels[:, 1:].reshape(-1),
                 ignore_index=-100,
             )
-        return CausalLMOutputWithPast(loss=loss, logits=logits)
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            hidden_states=(hidden,) if output_hidden_states else None,
+        )

@@ -55,7 +55,7 @@ from torch import nn
 from transformers.cache_utils import Cache
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from .kimi_linear_config import KimiLinearConfig
+from .configuration import KimiLinearConfig
 from .normalization import KimiRMSNorm
 
 

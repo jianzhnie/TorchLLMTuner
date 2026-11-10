@@ -55,7 +55,7 @@ import torch.nn.init as init
 from torch import nn
 from torch.nn import functional as F
 
-from .kimi_linear_config import KimiLinearConfig
+from .configuration import KimiLinearConfig
 from .mlp import KimiExpertMLP as KimiExpertMLP
 from .mlp import KimiMLP
 from .normalization import KimiRMSNorm
