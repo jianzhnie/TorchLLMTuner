@@ -44,10 +44,11 @@ cd TorchLLMTuner
 pip install -e .
 ```
 
-核心依赖：`torch>=2.12`、`transformers>=5.9,<5.10`、`spmd_types`、`grain`，
+核心依赖：`torch>=2.12`、`transformers==5.22.2`、`spmd_types`、`grain`，
 以及数据层的一组常用包（见 `pyproject.toml` 注释）。可选：`renderers`（多轮
 chat renderer）、`torchao`（EP padded dispatcher）——未装时启用对应功能会
 得到带安装指引的 `ImportError`。
+Transformers 的锁定依据与 CPU/NPU 安装契约见 [依赖说明](docs/dependency_contract.md)。
 
 ## 快速开始
 

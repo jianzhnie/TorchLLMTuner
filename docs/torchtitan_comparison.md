@@ -110,7 +110,7 @@ TorchTitan-NPU 的优势来自上游训练栈与 NPU 专用执行能力。没有
 
 | 项目 | 关键依赖与验证重点 |
 |---|---|
-| TorchLLMTuner | Python 3.10+、Torch 2.12+、Transformers 5.11.x；CPU 单测、分布式等价脚本、真实 NPU 验证 |
+| TorchLLMTuner | Python 3.10+、Torch 2.12+、Transformers 5.22.2（精确锁定）；CPU 单测、分布式等价脚本、真实 NPU 验证 |
 | TorchTitan | Python 3.11+，推荐近期 PyTorch；CPU/GPU 单测、模型 CI、收敛和性能验证 |
 | TorchTitan-NPU | Python 3.12+、固定 Torch/Torch-NPU/CANN；NPU smoke、模型 integration、loss compare 和数值对齐 |
 

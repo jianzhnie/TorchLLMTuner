@@ -126,7 +126,7 @@ llmtuner-train --help
 
 ## 6. 安装与快速开始
 
-环境要求为 Python 3.10+、PyTorch 2.12+、Transformers 5.11.x；精确依赖见
+环境要求为 Python 3.10+、PyTorch 2.12+、Transformers 5.22.2（精确锁定）；精确依赖见
 `pyproject.toml`。
 
 ```bash

@@ -25,11 +25,11 @@ dependencies = [
     # a per-expert loop, so a <2.14 install still runs correctly -- just without
     # the fused kernel.
     "torch>=2.12",
-    # Pinned to one minor: the MoE expert layout this code probes
-    # (`gate_up_proj` / `down_proj`) is a 5.x shape, and the pin matches
-    # torchtitan's transformers_modeling_backend experiment, which this
-    # aligns with.
-    "transformers>=5.11,<5.12",
+    # Exact validated HF contract: native Qwen3.5 recurrent-mask mapping,
+    # GDN initialization RNG and packed MoE router/expert ownership are checked
+    # against 5.22.2. Older 5.11/5.12 lack the recurrent-mask reference helper;
+    # future releases require revalidation rather than an untested range.
+    "transformers==5.22.2",
     # Direct import in utils/logging.py (reached from trainer/config.py) --
     # undeclared until now, and pulled in only transitively by transformers.
     "colorama>=0.4",

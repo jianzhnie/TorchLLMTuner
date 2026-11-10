@@ -8,17 +8,25 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 nodes_file="${NODES_FILE:-$repo_root/available_nodes.txt}"
 container_name="${CONTAINER_NAME:-hyper-parallel-env}"
 wheel_root="${WHEEL_ROOT:-/home/jianzhnie/llmtuner/wheels}"
-# tf513 is the only accepted Transformers package; tf511 is retained only for
-# shared dependency files that are present in the older extracted snapshot.
-transformers_root="${TRANSFORMERS_ROOT:-$wheel_root/tf513:$wheel_root/tf511}"
-# Override these when the host path is mounted at a different path on a node or
-# inside its container.  By default the shared filesystem uses the same paths.
+# Wheel mode is the production default; extracted mode is explicit legacy use.
+transformers_mode="${TRANSFORMERS_MODE:-wheel}"
+transformers_root="${TRANSFORMERS_ROOT:-}"
 remote_wheel_root="${REMOTE_WHEEL_ROOT:-$wheel_root}"
 remote_transformers_root="${REMOTE_TRANSFORMERS_ROOT:-$transformers_root}"
-transformers_version_prefix="${TRANSFORMERS_VERSION_PREFIX:-5.13.}"
+transformers_version_prefix="${TRANSFORMERS_VERSION_PREFIX:-5.22.2}"
+preflight_python="${PREFLIGHT_PYTHON:-python3}"
+if [[ "$transformers_mode" != wheel && "$transformers_mode" != extracted ]]; then
+  echo "TRANSFORMERS_MODE must be wheel or extracted" >&2
+  exit 1
+fi
+if [[ "$transformers_mode" == wheel && -n "$transformers_root" ]]; then
+  echo "TRANSFORMERS_ROOT requires explicit TRANSFORMERS_MODE=extracted" >&2
+  exit 1
+fi
 torch_version_prefix="${TORCH_VERSION_PREFIX:-2.12.}"
 torch_npu_version_prefix="${TORCH_NPU_VERSION_PREFIX:-$torch_version_prefix}"
 runtime_python_version="${RUNTIME_PYTHON_VERSION:-3.12}"
+runtime_glibc_version="${RUNTIME_GLIBC_VERSION:-2.28}"
 # Set an absolute container path to install without changing its default Python.
 runtime_venv="${RUNTIME_VENV:-}"
 if [[ -n "$runtime_venv" && "$runtime_venv" != /* ]]; then
@@ -84,20 +92,23 @@ for node in "${nodes[@]}"; do
   seen_nodes["$node"]=1
 done
 
-primary_transformers_root="${transformers_root%%:*}"
-primary_transformers_init="$primary_transformers_root/transformers/__init__.py"
-if [[ ! -f "$primary_transformers_init" ]]; then
-  echo "Primary Transformers runtime not found: $primary_transformers_root" >&2
-  echo "Set TRANSFORMERS_ROOT to a mounted extracted Transformers runtime." >&2
-  exit 1
-fi
-transformers_declared_version="$(
-  sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' "$primary_transformers_init" | head -1
-)"
-if [[ "$transformers_declared_version" != "$transformers_version_prefix"* ]]; then
-  echo "Transformers runtime version mismatch: expected $transformers_version_prefix*," >&2
-  echo "found ${transformers_declared_version:-unknown} in $primary_transformers_init" >&2
-  exit 1
+if [[ "$transformers_mode" == extracted ]]; then
+  primary_transformers_root="${transformers_root%%:*}"
+  primary_transformers_init="$primary_transformers_root/transformers/__init__.py"
+  if [[ ! -f "$primary_transformers_init" ]]; then
+    echo "Primary Transformers runtime not found: $primary_transformers_root" >&2
+    echo "Set TRANSFORMERS_ROOT to a mounted extracted Transformers runtime." >&2
+    exit 1
+  fi
+  transformers_declared_version="$(
+    sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' "$primary_transformers_init" | head -1
+  )"
+  if [[ "$transformers_declared_version" != "$transformers_version_prefix"* ]]; then
+    echo "Transformers runtime version mismatch: expected $transformers_version_prefix*," >&2
+    echo "found ${transformers_declared_version:-unknown} in $primary_transformers_init" >&2
+    exit 1
+  fi
+
 fi
 
 wheel() {
@@ -170,6 +181,25 @@ declare -a wheels=(
   "local/setuptools-81.0.0-py3-none-any.whl"
 )
 
+if [[ "$transformers_mode" == wheel ]]; then
+  # Keep shared dependencies, notably datasets-compatible fsspec/numpy.
+  selected=()
+  for relative_path in "${wheels[@]}"; do
+    case "${relative_path##*/}" in
+      huggingface_hub-*|tokenizers-*) continue ;;
+    esac
+    selected+=("$relative_path")
+  done
+  wheels=("${selected[@]}"
+    "transformers5222/transformers-5.22.2-py3-none-any.whl"
+    "transformers5222/huggingface_hub-2.4.0-py3-none-any.whl"
+    "transformers5222/tokenizers-0.23.3-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
+    "transformers5222/httpx2-2.16.0-py3-none-any.whl"
+    "transformers5222/httpcore2-2.16.0-py3-none-any.whl"
+    "transformers5222/truststore-0.10.5-py3-none-any.whl"
+  )
+fi
+
 if (( install_triton )); then
   # --no-deps requires explicitly installing the Ascend compiler dependency.
   wheels+=("local/pybind11-3.0.2-py3-none-any.whl")
@@ -182,6 +212,16 @@ for relative_path in "${wheels[@]}"; do
     exit 1
   fi
 done
+
+validation_args=(--expected-transformers "$transformers_version_prefix"
+  --python-version "$runtime_python_version" --glibc-version "$runtime_glibc_version")
+if [[ "$transformers_mode" == extracted ]]; then
+  validation_args+=(--transformers-root "${transformers_root%%:*}")
+fi
+for relative_path in "${wheels[@]}"; do
+  validation_args+=("$(wheel "$relative_path")")
+done
+"$preflight_python" "$repo_root/scripts/validate_offline_runtime.py" "${validation_args[@]}"
 
 if (( verify_wheel_hashes )) && ! command -v sha256sum >/dev/null 2>&1; then
   echo "sha256sum is required when VERIFY_WHEEL_HASHES=1" >&2
@@ -198,9 +238,10 @@ for relative_path in "${wheels[@]}"; do
 done
 
 echo "Local preflight passed: ${#nodes[@]} node(s), ${#wheels[@]} wheel(s),"
-echo "Transformers=${transformers_root}, Python=${runtime_python_version},"
+echo "Transformers mode=${transformers_mode}, root=${transformers_root:-installed wheel}, Python=${runtime_python_version},"
 echo "Torch=${torch_version_prefix}, Torch-NPU=${torch_npu_version_prefix},"
 echo "NPU required=${require_npu}, wheel hashes=${verify_wheel_hashes}."
+echo "Metadata target: CPython/Linux aarch64, glibc baseline=${runtime_glibc_version}."
 echo "Triton install=${install_triton}, expected distribution=${triton_version_prefix}*."
 if (( preflight_only )); then
   exit 0
@@ -221,7 +262,8 @@ shift 9
 runtime_venv="$1"
 install_triton="$2"
 triton_version_prefix="$3"
-shift 3
+runtime_glibc_version="$4"
+shift 4
 wheel_specs=("$@")
 
 if [[ "$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null)" != true ]]; then
@@ -230,7 +272,9 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null)" 
 fi
 
 first_transformers_root="${transformers_root%%:*}"
-docker exec "$container_name" test -d "$first_transformers_root/transformers"
+if [[ -n "$transformers_root" ]]; then
+  docker exec "$container_name" test -d "$first_transformers_root/transformers"
+fi
 python_args=()
 for wheel_spec in "${wheel_specs[@]}"; do
   relative_path="${wheel_spec%%|*}"
@@ -272,12 +316,28 @@ if [[ -n "$runtime_venv" ]]; then
   runtime_python="$runtime_venv/bin/python"
 fi
 
+# Validate actual interpreter/architecture/libc before mutating target packages.
+docker exec -i "$container_name" "$runtime_python" - \
+  "$runtime_python_version" "$runtime_glibc_version" <<'PY'
+import platform
+import sys
+
+expected_python, baseline = sys.argv[1:]
+assert platform.python_implementation() == "CPython"
+assert platform.system() == "Linux" and platform.machine() == "aarch64"
+assert f"{sys.version_info.major}.{sys.version_info.minor}" == expected_python
+libc, version = platform.libc_ver()
+assert libc == "glibc", (libc, version)
+assert tuple(map(int, version.split("."))) >= tuple(map(int, baseline.split(".")))
+print("ACTUAL_TARGET_PLATFORM", platform.python_version(), libc, version)
+PY
+
 docker exec "$container_name" "$runtime_python" -m pip install \
   --disable-pip-version-check --no-input --no-deps --no-index \
   --no-cache-dir --upgrade --force-reinstall \
   "${python_args[@]}"
 
-if [[ -n "$runtime_venv" ]]; then
+if [[ -n "$runtime_venv" && -n "$transformers_root" ]]; then
   # Keep the extracted offline runtime discoverable in child processes even
   # when a launcher intentionally replaces PYTHONPATH with the repository.
   docker exec -i "$container_name" "$runtime_python" - "$transformers_root" <<'PY'
@@ -290,6 +350,16 @@ if any(not Path(root).is_absolute() or "\n" in root for root in roots):
     raise SystemExit("Transformers roots must be absolute, single-line paths")
 target = Path(site.getsitepackages()[0]) / "llmtuner_offline_transformers.pth"
 target.write_text("\n".join(roots) + "\n")
+PY
+fi
+
+# Remove only this installer's previous extracted-path injection in wheel mode.
+if [[ -z "$transformers_root" ]]; then
+  docker exec -i "$container_name" "$runtime_python" - <<'PY'
+import site
+from pathlib import Path
+for root in site.getsitepackages():
+    (Path(root) / "llmtuner_offline_transformers.pth").unlink(missing_ok=True)
 PY
 fi
 
@@ -325,10 +395,19 @@ assert torch_npu.__version__.startswith(
 assert transformers.__version__.startswith(
     os.environ["EXPECTED_TRANSFORMERS_PREFIX"]
 ), transformers.__version__
-expected_transformers_root = Path(os.environ["EXPECTED_TRANSFORMERS_ROOT"])
-assert Path(transformers.__file__).resolve().is_relative_to(
-    expected_transformers_root.resolve()
-), transformers.__file__
+expected_root = os.environ["EXPECTED_TRANSFORMERS_ROOT"]
+if expected_root:
+    assert Path(transformers.__file__).resolve().is_relative_to(
+        Path(expected_root).resolve()
+    ), transformers.__file__
+else:
+    assert Path(transformers.__file__).resolve().is_relative_to(
+        Path(sys.prefix).resolve()
+    ), transformers.__file__
+if os.environ["EXPECTED_TRANSFORMERS_PREFIX"] == "5.22.2":
+    assert transformers.__version__ == "5.22.2"
+    from transformers.masking_utils import create_recurrent_attention_mask
+
 
 npu_available = bool(torch.npu.is_available())
 npu_count = torch.npu.device_count() if npu_available else 0
@@ -408,7 +487,7 @@ for node in "${nodes[@]}"; do
       "$transformers_version_prefix" "$torch_version_prefix" \
       "$torch_npu_version_prefix" "$runtime_python_version" "$require_npu" \
       "$verify_wheel_hashes" "$runtime_venv" "$install_triton" \
-      "$triton_version_prefix" "${wheel_specs[@]}")" \
+      "$triton_version_prefix" "$runtime_glibc_version" "${wheel_specs[@]}")" \
     <<<"$remote_script" >"$log_file" 2>&1 &
   pids+=("$!")
   batch_nodes+=("$node")
