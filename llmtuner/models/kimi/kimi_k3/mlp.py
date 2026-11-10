@@ -49,7 +49,7 @@ Projection names preserve the dense and expert checkpoint layouts.
 from torch import nn
 from transformers.activations import ACT2FN
 
-from ..common.activation import SituGLU
+from ...common.activation import SituGLU
 
 
 def build_kimi_activation(config) -> nn.Module:

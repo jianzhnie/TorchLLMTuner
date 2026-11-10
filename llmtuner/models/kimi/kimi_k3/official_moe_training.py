@@ -9,7 +9,7 @@ from types import MethodType
 import torch
 from torch import nn
 
-from ...errors import UnsupportedCombinationError
+from ....errors import UnsupportedCombinationError
 
 
 def install_kimi_moe_training(model: nn.Module, *, moe_type: type[nn.Module]) -> int:

@@ -25,7 +25,7 @@ one node must not drag in its siblings (``model`` pulls in the whole Hugging
 Face modeling stack, ``factory`` resolves configuration and model classes), so
 import the leaf you want.
 
-Qwen3.5 GDN numerical and recurrence policies live in ``models.qwen3_5``;
-official Kimi MoE training adaptation lives in ``models.kimi``. Their old HF
+Qwen3.5 GDN numerical and recurrence policies live in ``models.qwen.qwen3_5``;
+official Kimi MoE training adaptation lives in ``models.kimi.kimi_k3``. Their old HF
 module paths provide compatibility imports only.
 """

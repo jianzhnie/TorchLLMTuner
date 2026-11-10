@@ -26,7 +26,7 @@ from ...components.checkpointer.hf.hf_expert_storage import (
     native_ep_expert_key,
 )
 from ...components.checkpointer.hf.hf_storage import IndexedHuggingFaceStorageReader
-from ..kimi.checkpoint import convert_kimi_expert_state
+from ..kimi.kimi_k3.checkpoint import convert_kimi_expert_state
 
 
 class HFTransformerStateDictAdapter:

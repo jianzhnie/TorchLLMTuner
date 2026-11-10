@@ -33,13 +33,13 @@ from ...datasets.contracts import Batch, TrainerBatch
 from ...parallel.topology import ParallelTopology
 from ...utils.logging import get_logger
 from ..common.moe.layer import collect_moe_layers
-from ..qwen3_5.gdn_numerics import (
+from ..qwen.qwen3_5.gdn_numerics import (
     configure_gdn_numerics,
     validate_gdn_numerical_batch,
     validate_gdn_numerical_config,
     validate_gdn_numerical_sequence,
 )
-from ..qwen3_5.linear_attention import (
+from ..qwen.qwen3_5.linear_attention import (
     apply_linear_attention_backend,
     validate_linear_attention_batch,
     validate_linear_attention_config,

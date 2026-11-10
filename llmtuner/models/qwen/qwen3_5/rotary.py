@@ -4,7 +4,7 @@ from types import FunctionType, MethodType
 
 import torch
 
-from ...errors import UnsupportedCombinationError
+from ....errors import UnsupportedCombinationError
 
 try:
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (

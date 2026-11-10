@@ -6,11 +6,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .kimi.kimi_linear_config import KimiLinearConfig
+from .kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
 
 KIMI_MODEL_IMPORT_ERROR = None
 try:
-    from .kimi.model import KimiLinearForCausalLM
+    from .kimi.kimi_k3.model import KimiLinearForCausalLM
 except ImportError as error:
     KIMI_MODEL_IMPORT_ERROR = error
 

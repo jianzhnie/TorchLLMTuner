@@ -17,9 +17,9 @@ from typing import Any
 import torch
 from torch import nn
 
-from ...datasets.contracts import Batch
-from ...errors import EnvironmentUnsupportedError, UnsupportedCombinationError
-from ..hf.padding_metadata import (
+from ....datasets.contracts import Batch
+from ....errors import EnvironmentUnsupportedError, UnsupportedCombinationError
+from ...hf.padding_metadata import (
     validate_gdn_forward_metadata,
     validate_gdn_padding_config,
     validate_gdn_sequence_metadata,

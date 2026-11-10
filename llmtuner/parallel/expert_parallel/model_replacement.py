@@ -35,7 +35,7 @@ from llmtuner.errors import UnsupportedCombinationError
 
 from ...models.common.aux_loss import AuxLoss
 from ...models.common.moe.layer import MoE
-from ...models.kimi.moe import KimiSparseMoE
+from ...models.kimi.kimi_k3.moe import KimiSparseMoE
 from ...utils.logging import get_logger
 from .block_conversion import convert_block
 from .hf_inspection import (

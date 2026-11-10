@@ -25,7 +25,7 @@ from ...accelerator.capabilities import has as capability
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_backend, is_distributed
 from ...errors import UnsupportedCombinationError
-from ...models.kimi.delta_attention import KimiDeltaAttention
+from ...models.kimi.kimi_k3.delta_attention import KimiDeltaAttention
 from ...utils.logging import get_logger
 from ..compatibility import chunked_loss_fsdp
 from ..topology import ParallelTopology

@@ -27,9 +27,9 @@ except ImportError:
 
 from ..common.aux_loss import AuxLoss
 from ..common.moe.layer import MoE
-from ..kimi.delta_attention import KimiDeltaAttention
-from ..kimi.moe import KimiMoEGate
-from ..kimi.normalization import KimiRMSNorm
+from ..kimi.kimi_k3.delta_attention import KimiDeltaAttention
+from ..kimi.kimi_k3.moe import KimiMoEGate
+from ..kimi.kimi_k3.normalization import KimiRMSNorm
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig

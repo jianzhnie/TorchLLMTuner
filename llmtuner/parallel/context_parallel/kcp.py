@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_comm_device, get_world_size
-from ...models.kimi.latent_attention import KimiLatentAttention
+from ...models.kimi.kimi_k3.latent_attention import KimiLatentAttention
 from .attention import HeadToSeq, SeqToHead
 
 try:

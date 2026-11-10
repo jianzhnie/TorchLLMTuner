@@ -52,8 +52,8 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import PretrainedConfig
 
-from ...accelerator.device import is_device_type_available
-from ...errors import EnvironmentUnsupportedError
+from ....accelerator.device import is_device_type_available
+from ....errors import EnvironmentUnsupportedError
 from .causal_convolution import KimiCausalConvolution
 from .kimi_linear_config import KimiLinearConfig
 from .normalization import KimiGatedRMSNorm

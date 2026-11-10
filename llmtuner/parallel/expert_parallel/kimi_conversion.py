@@ -17,7 +17,7 @@ from ...models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
 from ...models.common.moe.experts import GroupedExperts, RoutedExperts
 from ...models.common.moe.layer import MoE
 from ...models.common.moe.routing import TokenChoiceTopKRouter
-from ...models.kimi.moe import KimiSparseMoE
+from ...models.kimi.kimi_k3.moe import KimiSparseMoE
 from .checkpointing import mark_experts_ep_sharded
 from .token_dispatch import AllToAllTokenDispatcher, LocalTokenDispatcher
 

@@ -78,7 +78,7 @@ import torch.nn as nn
 
 from ...errors import UnsupportedCombinationError
 from ...models.common.moe.layer import MOE_LAYER_ATTRS
-from ...models.kimi.moe import KimiSparseMoE
+from ...models.kimi.kimi_k3.moe import KimiSparseMoE
 from ...utils.logging import get_logger
 from .. import compatibility
 

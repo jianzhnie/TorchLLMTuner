@@ -17,7 +17,7 @@ from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 from ....accelerator.collectives import synchronize_local_errors
-from ....models.kimi.checkpoint import (
+from ....models.kimi.kimi_k3.checkpoint import (
     convert_kimi_expert_state,
     convert_kimi_optimizer_state,
 )

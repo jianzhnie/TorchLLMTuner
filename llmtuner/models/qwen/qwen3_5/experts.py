@@ -5,8 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ...parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
-from ..common.scatter_add import deterministic_scatter_add
+from ....parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
+from ...common.scatter_add import deterministic_scatter_add
 
 
 def _validate_pre_down_grouped_inputs(module, hidden_states, indices, scores):

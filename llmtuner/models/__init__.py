@@ -1,20 +1,14 @@
-"""Model registration, HF adaptation, and reusable model components.
+"""Model registration, family implementations, HF adaptation, and components.
 
-Responsibilities are split across three layers:
+* ``architecture.py`` registers custom HF config and model construction hooks.
+* ``kimi/kimi_k3/`` and ``qwen/qwen3_5/`` contain model-specific behavior.
+  Family directories group independent model structures; they do not re-export
+  implementations or import sibling structures.
+* ``hf/`` adapts HF decoders to the trainer's input, parallel, initialization,
+  and checkpoint contracts. FLOPs estimation lives in ``llmtuner.utils.flops``.
+* ``common/`` contains model-agnostic attention, MoE, feed-forward, embedding,
+  RoPE, activation, and multimodal components.
 
-* ``architecture.py`` -- the registration seam for custom HF types.
-* ``hf/`` -- the adaptation layer: ``factory.py`` builds the HF config and
-  resolves the model class, ``model.py`` holds the ``HFTransformerModel`` the
-  trainer drives, ``flops.py`` counts model FLOPs per token for the MFU
-  numerator, and
-  ``state_dict_adapter.py`` maps the checkpoint FQNs. Runtime Hugging Face
-  adaptation belongs here.
-* ``common/`` -- the model vocabulary, vendored from torchtitan
-  ``models/common/``: attention pieces (``attention/``), MoE (``moe/``),
-  feed-forward, linear, embedding, RoPE, activations, the aux-loss carrier and
-  the multimodal glue. Nothing here knows which family a model belongs to.
-
-Two conventions, both inherited from ``common/``: a package index is for
-discoverability while a leaf module is what you import, and a component with
-real behavior of its own gets its own file.
+Import implementations from their defining leaf modules. Package indexes do not
+eagerly import model stacks or optional accelerator dependencies.
 """

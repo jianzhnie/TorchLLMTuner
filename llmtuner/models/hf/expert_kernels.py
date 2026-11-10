@@ -15,16 +15,16 @@ from ...errors import UnsupportedCombinationError
 from ...parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 from ..common.moe.gate import RouterGateLinearFunction
 from ..common.scatter_add import deterministic_scatter_add
-from ..qwen3_5.experts import (
+from ..qwen.qwen3_5.experts import (
     _forward_pre_down_grouped_experts as _forward_pre_down_grouped_experts,
 )
-from ..qwen3_5.experts import (
+from ..qwen.qwen3_5.experts import (
     _validate_pre_down_grouped_inputs as _validate_pre_down_grouped_inputs,
 )
-from ..qwen3_5.experts import (
+from ..qwen.qwen3_5.experts import (
     forward_pre_down_experts as forward_pre_down_experts,
 )
-from ..qwen3_5.experts import (
+from ..qwen.qwen3_5.experts import (
     forward_pre_down_moe as forward_pre_down_moe,
 )
 

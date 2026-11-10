@@ -19,13 +19,13 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeAttention
 
 from llmtuner.errors import UnsupportedCombinationError
 
-from ..qwen3_5.rotary import (
+from ..qwen.qwen3_5.rotary import (
     _apply_qwen35_fp32_rotary,
 )
-from ..qwen3_5.rotary import (
+from ..qwen.qwen3_5.rotary import (
     apply_qwen35_fp32_rotary as apply_qwen35_fp32_rotary,
 )
-from ..qwen3_5.rotary import (
+from ..qwen.qwen3_5.rotary import (
     forward_qwen35_fp32_cache as forward_qwen35_fp32_cache,
 )
 

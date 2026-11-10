@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from ...accelerator.collectives import synchronize_local_errors
+from ....accelerator.collectives import synchronize_local_errors
 
 _BLOCK = re.compile(r"^(.*\.block_sparse_moe\.)(.*)$")
 _PROJECTIONS = {"w1_EFD": "w1", "w2_EDF": "w2", "w3_EFD": "w3"}
