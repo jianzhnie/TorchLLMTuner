@@ -272,7 +272,9 @@ def _schedule(optimizer):
 
 def test_real_dcp_save_records_scoped_timings_and_retains_last_save(tmp_path):
     model = nn.Linear(2, 2)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=0.1, foreach=False, fused=False
+    )
     model(torch.ones(1, 2)).sum().backward()
     optimizer.step()
     manager = DistributedCheckpointManager(
@@ -431,7 +433,9 @@ def test_filesystem_storage_reports_paths(tmp_path) -> None:
 
 def test_init_optim_state_materializes_without_training() -> None:
     model = nn.Linear(4, 4)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=0.1, foreach=False, fused=False
+    )
     before = [p.detach().clone() for p in model.parameters()]
 
     assert optimizer.state_dict()["state"] == {}
@@ -446,7 +450,9 @@ def test_init_optim_state_materializes_without_training() -> None:
 def test_init_optim_state_leaves_the_first_real_update_as_step_one() -> None:
     """Adam's counter must not be advanced by the materializing step."""
     model = nn.Linear(4, 4)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=0.1, foreach=False, fused=False
+    )
     init_optim_state(optimizer)
 
     for state in optimizer.state_dict()["state"].values():
@@ -456,7 +462,9 @@ def test_init_optim_state_leaves_the_first_real_update_as_step_one() -> None:
 
 def test_init_optim_state_is_a_no_op_once_state_exists() -> None:
     model = nn.Linear(4, 4)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=0.1, foreach=False, fused=False
+    )
     optimizer.zero_grad()
     model(torch.ones(2, 4)).sum().backward()
     optimizer.step()
@@ -471,7 +479,9 @@ def test_init_optim_state_is_a_no_op_once_state_exists() -> None:
 
 def test_init_optim_state_preserves_existing_gradients() -> None:
     model = nn.Linear(4, 4)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=0.1, foreach=False, fused=False
+    )
     model(torch.ones(2, 4)).sum().backward()
     grads = [p.grad.detach().clone() for p in model.parameters()]
 
@@ -490,7 +500,9 @@ def test_init_optim_state_completes_a_partially_initialized_optimizer() -> None:
     incomplete checkpoint that a fresh optimizer cannot restore.
     """
     model = nn.Linear(4, 4)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=0.1, foreach=False, fused=False
+    )
 
     # Initialize only the weight. The bias deliberately receives no gradient.
     model.weight.sum().backward()

@@ -66,7 +66,7 @@ def text_config(config_type, *, dynamic=False):
 
 
 def native_initialization_reference(model):
-    """HF initialization plus the preexisting finite FP32 A_log sampling contract."""
+    """HF initialization plus the established finite FP32 A_log contract."""
     model.apply(model._init_weights)
     if model.config.model_type not in {"qwen3_5_text", "qwen3_5_moe_text"}:
         return
@@ -94,6 +94,28 @@ def assert_parameter_contract(left, right):
         assert torch.equal(parameter, expected[name]), name
         assert parameter.dtype == expected[name].dtype
     assert any(bool(parameter.count_nonzero()) for parameter in actual.values())
+
+
+@pytest.mark.parametrize("config_type,model_type", FAMILIES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_native_default_dtype_initialization_matches_parameters_and_rng(
+    config_type, model_type, dtype
+):
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        with torch.random.fork_rng(devices=[]):
+            model = model_type(text_config(config_type))
+            reference = copy.deepcopy(model)
+            torch.manual_seed(919)
+            native_initialization_reference(reference)
+            expected_rng = torch.get_rng_state().clone()
+            torch.manual_seed(919)
+            initialize_random_hf_model(model)
+            assert_parameter_contract(model, reference)
+            assert torch.equal(torch.get_rng_state(), expected_rng)
+    finally:
+        torch.set_default_dtype(previous_dtype)
 
 
 @pytest.mark.parametrize("config_type,model_type", FAMILIES)

@@ -59,6 +59,7 @@ def test_recipe_preserves_geometry_and_random_initialization(tmp_path):
     checkpoint = config.training.checkpoint_config
     assert checkpoint.initial_load_path is None
     assert checkpoint.last_save_model_only is False
+    assert checkpoint.sharded_tensor_parallel is False
 
 
 def test_recipe_layer_reduction_keeps_other_dimensions(tmp_path):

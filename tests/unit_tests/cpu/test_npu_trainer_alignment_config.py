@@ -211,9 +211,9 @@ def test_30b_requires_explicit_opt_in_and_uses_real_baseline_recipe():
     environ = {"LLMTUNER_ALIGNMENT_MODEL": QWEN3_30B}
     assert baseline_cli_args(argv, environ) == [
         "--module",
-        "torchtitan_npu.models.qwen3.config_registry",
+        "torchtitan.models.qwen3.config_registry",
         "--config",
-        "sft_qwen3_30ba3b_gsm8k",
+        "qwen3_30b_a3b",
         *argv,
     ]
 
@@ -302,9 +302,10 @@ def test_30b_candidate_has_no_debugmodel_assumptions(tmp_path):
     assert config.model.vocab_size == 17
     assert config.model.arch_overrides == {}
     assert config.model.experts_implementation == "torchtitan"
-    assert config.model.norm_backend == "npu"
-    assert config.model.qkv_projection == "separate"
+    assert config.model.norm_backend == "torch"
+    assert config.model.qkv_projection == "fused"
     assert config.model.rotary_compute_dtype == "float32"
+    assert config.model.rotary_cache_dtype == "float32"
     assert config.model.attention_backend == "flex"
     assert config.optimizer.learning_rate == 2e-5
     assert config.optimizer.lr_scheduler_config.warmup_steps == 7

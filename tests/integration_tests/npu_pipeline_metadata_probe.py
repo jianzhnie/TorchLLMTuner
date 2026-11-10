@@ -14,7 +14,12 @@ def main():
     parser.add_argument("--warmup", action="store_true")
     parser.add_argument("--unbatched", action="store_true")
     parser.add_argument("--tensor-exchange", action="store_true")
+    parser.add_argument(
+        "--ordered", action="store_true", help="Higher peer receives first (unbatched)."
+    )
     args = parser.parse_args()
+    if args.ordered and not (args.unbatched and args.tensor_exchange):
+        parser.error("--ordered requires --unbatched --tensor-exchange")
     device = init_distributed(timeout=timedelta(seconds=45))
     try:
         assert dist.get_world_size() == 4
@@ -36,6 +41,8 @@ def main():
                     dist.P2POp(dist.isend, sent, peer, group),
                     dist.P2POp(dist.irecv, received, peer, group),
                 ]
+                if args.ordered and rank > peer:
+                    ops.reverse()
                 if args.unbatched:
                     works = [op.op(op.tensor, op.peer, op.group) for op in ops]
                 else:
@@ -49,7 +56,10 @@ def main():
                     rtol=0,
                 )
             dist.barrier()
-            print(f"PASS rank={rank} tensor_exchange=True unbatched={args.unbatched}")
+            print(
+                f"PASS rank={rank} tensor_exchange=True "
+                f"unbatched={args.unbatched} ordered={args.ordered}"
+            )
             return
         payload = {"shape": (1, 16, 32), "dtype": "float32"}
         if rank < 2:

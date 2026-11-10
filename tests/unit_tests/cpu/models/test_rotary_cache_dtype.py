@@ -10,6 +10,45 @@ from llmtuner.errors import ConfigError, UnsupportedCombinationError
 from llmtuner.models.hf.qkv_projection import apply_configured_rotary
 
 
+@pytest.mark.parametrize("cache_dtype", ["float32", "bfloat16"])
+def test_fp32_rotary_accumulates_branches_before_bf16_gradient_cast(cache_dtype):
+    module = SimpleNamespace(
+        config=SimpleNamespace(
+            rotary_compute_dtype="float32",
+            rotary_cache_dtype=cache_dtype,
+            rope_parameters={"rope_theta": 1000000.0, "rope_type": "default"},
+        )
+    )
+    torch.manual_seed(37)
+    query = torch.randn(2, 3, 16, 8, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn_like(query, requires_grad=True)
+    positions = torch.arange(16)[None].expand(2, -1)
+    actual = apply_configured_rotary(module, query, key, None, None, positions)
+    frequencies = 1.0 / (1000000.0 ** (torch.arange(0, 8, 2).float() / 8))
+    angles = positions.float().unsqueeze(-1) * frequencies
+    angles = torch.cat((angles, angles), -1).unsqueeze(1)
+    cosine, sine = angles.cos(), angles.sin()
+    if cache_dtype == "bfloat16":
+        cosine, sine = cosine.bfloat16().float(), sine.bfloat16().float()
+
+    def reference(value):
+        # The reference converter shares one FP32 cast across both branches.
+        promoted = value.float()
+        first, second = promoted.chunk(2, -1)
+        return (promoted * cosine + torch.cat((-second, first), -1) * sine).bfloat16()
+
+    expected = tuple(reference(value) for value in (query, key))
+    probes = tuple(torch.randn_like(value) for value in actual)
+    for observed, target in zip(actual, expected, strict=True):
+        torch.testing.assert_close(observed, target, atol=0, rtol=0)
+    actual_gradients = torch.autograd.grad(
+        actual, (query, key), probes, retain_graph=True
+    )
+    expected_gradients = torch.autograd.grad(expected, (query, key), probes)
+    for observed, target in zip(actual_gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(observed, target, atol=0, rtol=0)
+
+
 def test_bf16_cache_matches_quantized_reference():
     module = SimpleNamespace(
         config=SimpleNamespace(

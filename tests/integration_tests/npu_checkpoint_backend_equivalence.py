@@ -15,12 +15,12 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
-from examples.train_qwen3 import qwen3_config
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.ema_config import EMAConfig
 from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 from llmtuner.trainer.trainer import Trainer
 from tests.caps import require_env
+from tests.integration_tests.npu_trainer_test_config import qwen3_config
 
 
 def _assert_equal(actual, expected) -> None:

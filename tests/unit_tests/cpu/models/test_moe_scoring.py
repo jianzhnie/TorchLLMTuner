@@ -42,9 +42,13 @@ def test_torchtitan_moe_scores_before_down_projection(monkeypatch):
         _llmtuner_local_dispatcher=SimpleNamespace(dispatch=dispatch),
     )
     actual = forward_torchtitan_moe(module, inputs.unsqueeze(0))
-    gate, up = (inputs @ gate_up[0].T).chunk(2, dim=-1)
+    gate_weight, up_weight = gate_up[0].chunk(2, dim=0)
+    gate, up = inputs @ gate_weight.T, inputs @ up_weight.T
     hidden = torch.nn.functional.silu(gate) * up
-    expected = (hidden * scores[:, None].bfloat16()) @ down[0].T
+    weighted = (hidden.float() * scores[:, None]).bfloat16()
+    expected = weighted @ down[0].T
+    rounded_scores = (hidden * scores[:, None].bfloat16()) @ down[0].T
+    assert not torch.equal(expected, rounded_scores)
     torch.testing.assert_close(actual[0], expected, atol=0, rtol=0)
     after_down = ((hidden @ down[0].T).float() * scores[:, None]).bfloat16()
     assert not torch.equal(expected, after_down)

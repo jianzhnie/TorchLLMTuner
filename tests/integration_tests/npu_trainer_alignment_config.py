@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 QWEN3_30B = "qwen3_30b_a3b"
-BASELINE_30B_MODULE = "torchtitan_npu.models.qwen3.config_registry"
-BASELINE_30B_CONFIG = "sft_qwen3_30ba3b_gsm8k"
+BASELINE_30B_MODULE = "torchtitan.models.qwen3.config_registry"
+BASELINE_30B_CONFIG = "qwen3_30b_a3b"
 MODEL_PATH = "/home/jianzhnie/llmtuner/hfhub/models/Qwen/Qwen3-30B-A3B"
 DATASET_PATH = "/home/jianzhnie/llmtuner/hfhub/datasets/GAIR/LIMO/limo.jsonl"
 TARGET_PARALLELISM = {
@@ -135,13 +135,28 @@ def baseline_config_snapshot(config: Any) -> dict[str, Any]:
         **result["model_spec"],
         "model": config.model_spec.model.to_dict(),
     }
-    attention = {
-        (
-            type(layer.attention.inner_attention).__qualname__.split(".")[-2],
-            layer.attention.mask_type,
-        )
-        for layer in config.model_spec.model.layers
-    }
+    attention = set()
+    for layer in config.model_spec.model.layers:
+        inner = layer.attention.inner_attention
+        implementation = type(inner).__qualname__.split(".")[-2]
+        mask_type = getattr(layer.attention, "mask_type", None)
+        if mask_type is None:
+            # TorchTitan 0.3 moved document mask construction to Decoder.
+            # Accept only the inspected Qwen3 inherited implementation, not a
+            # default inferred from shapes or an arbitrary attention backend.
+            from torchtitan.models.common.attention import FlexAttention
+            from torchtitan.models.common.decoder import Decoder
+            from torchtitan.models.qwen3.model import Qwen3Model
+
+            if (
+                isinstance(config.model_spec.model, Qwen3Model.Config)
+                and isinstance(inner, FlexAttention.Config)
+                and Qwen3Model.get_attention_masks is Decoder.get_attention_masks
+            ):
+                mask_type = "block_causal"
+            else:
+                raise ValueError("Unsupported baseline decoder mask contract")
+        attention.add((implementation, mask_type))
     supported = {
         ("ScaledDotProductAttention", "causal"): "sdpa",
         ("FlexAttention", "block_causal"): "flex",
@@ -476,10 +491,14 @@ def build_candidate_30b_config(
             num_attention_heads=architecture["num_attention_heads"],
             num_key_value_heads=architecture["num_key_value_heads"],
             experts_implementation="torchtitan",
-            norm_backend="npu",
-            qkv_projection="separate",
+            norm_backend="torch",
+            qkv_projection=(
+                "fused"
+                if baseline["parallelism"]["tensor_parallel_degree"] == 1
+                else "separate"
+            ),
             rotary_compute_dtype="float32",
-            rotary_cache_dtype="bfloat16",
+            rotary_cache_dtype="float32",
             attention_backend="auto" if attention["backend"] == "sdpa" else "flex",
         ),
         parallel=ParallelConfig(
@@ -491,7 +510,11 @@ def build_candidate_30b_config(
             expert_parallel_size=baseline["parallelism"]["expert_parallel_degree"],
             pipeline_parallel_size=1,
             context_parallel_kv_allgather_size=1,
-            fsdp_config=FSDPConfig(fsdp_reduce_dtype="float32"),
+            fsdp_config=FSDPConfig(
+                fsdp_reduce_dtype="float32",
+                fsdp_expert_reduce_layout="split",
+                fsdp_expert_reduce_workspace_limit_bytes=3 * 1024**3,
+            ),
             ep_config=ExpertParallelConfig(router_aux_loss_coef=0.0),
         ),
         optimizer=OptimizerConfig(

@@ -188,10 +188,9 @@ def test_parameter_precision_norm_matches_native_rounding():
     ]
     for parameter in parameters:
         parameter.grad = torch.randn_like(parameter)
-    expected = sum(
-        torch.linalg.vector_norm(p.grad).float().square() for p in parameters
-    ).sqrt()
+    expected = torch.nn.utils.get_total_norm([p.grad for p in parameters])
     observed = clip_grad_norm_(parameters, 0, norm_precision="parameter")
+    assert observed.dtype == expected.dtype == torch.bfloat16
     torch.testing.assert_close(observed, expected, atol=0, rtol=0)
 
 
@@ -205,13 +204,14 @@ def test_packed_parameter_precision_matches_packed_norm_and_clipping():
     for parameter in parameters:
         parameter.grad = torch.randn_like(parameter) * 0.01
     originals = [p.grad.clone() for p in parameters]
-    expected = torch.cat(originals, dim=1).norm().float()
+    expected = torch.cat(originals, dim=1).norm()
     actual = clip_grad_norm_(
         parameters,
         0.01,
         norm_precision="parameter",
         packed_parameters=[tuple(parameters)],
     )
+    assert actual.dtype == expected.dtype == torch.bfloat16
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     coefficient = (0.01 / (expected + 1e-6)).clamp(max=1)
     for parameter, original in zip(parameters, originals, strict=True):
@@ -275,3 +275,22 @@ def test_norm_precision_clips_with_reported_coefficient(precision):
     norm = collectives.clip_grad_norm_([parameter], 0.5, norm_precision=precision)
     expected = gradient * (0.5 / (norm + 1e-6)).clamp(max=1).to(gradient.device)
     torch.testing.assert_close(parameter.grad, expected, atol=0, rtol=0)
+
+
+def test_parameter_precision_clipping_matches_native_bfloat16_coefficient():
+    from llmtuner.accelerator.collectives import clip_grad_norm_
+
+    torch.manual_seed(71)
+    parameters = [
+        torch.nn.Parameter(torch.zeros(257, dtype=torch.bfloat16)) for _ in range(3)
+    ]
+    references = [torch.nn.Parameter(torch.zeros_like(p)) for p in parameters]
+    for parameter, reference in zip(parameters, references, strict=True):
+        parameter.grad = torch.randn_like(parameter)
+        reference.grad = parameter.grad.clone()
+    expected = torch.nn.utils.clip_grad_norm_(references, 1.0, foreach=False)
+    actual = clip_grad_norm_(parameters, 1.0, norm_precision="parameter", foreach=False)
+    assert actual.dtype == expected.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    for parameter, reference in zip(parameters, references, strict=True):
+        torch.testing.assert_close(parameter.grad, reference.grad, atol=0, rtol=0)

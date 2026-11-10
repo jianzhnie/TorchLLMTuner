@@ -3,7 +3,33 @@
 import pytest
 from transformers import PretrainedConfig
 
-from llmtuner.models.hf.factory import unwrap_text_config
+from llmtuner.config import LLMTunerConfig, ModelConfig
+from llmtuner.models.hf.factory import build_model_config_for, unwrap_text_config
+
+
+@pytest.mark.parametrize("expert_width", [2048, 3072])
+def test_canonical_expert_width_overrides_generic_alias_default(expert_width):
+    config = LLMTunerConfig(
+        model=ModelConfig(
+            model_name_or_path="deepseek_v4",
+            arch_overrides={"moe_intermediate_size": expert_width},
+        )
+    )
+    actual = build_model_config_for(config)
+    assert actual.moe_intermediate_size == expert_width
+    assert actual.intermediate_size == expert_width
+    assert config.model.arch_overrides == {"moe_intermediate_size": expert_width}
+
+
+def test_explicit_alias_still_sets_expert_width():
+    config = LLMTunerConfig(
+        model=ModelConfig(
+            model_name_or_path="deepseek_v4",
+            arch_overrides={"intermediate_size": 96},
+        )
+    )
+    actual = build_model_config_for(config)
+    assert actual.moe_intermediate_size == 96
 
 
 @pytest.mark.parametrize(

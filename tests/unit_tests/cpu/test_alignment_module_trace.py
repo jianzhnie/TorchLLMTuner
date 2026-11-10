@@ -1,14 +1,21 @@
 """Full-model diagnostics must capture only explicitly selected layers."""
 
+import subprocess
+import sys
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from tests.integration_tests.alignment_module_trace import selected_trace_modules
+from tests.integration_tests.alignment_module_trace import (
+    selected_trace_modules,
+    trace_modules,
+)
 
 
 @pytest.fixture
 def modules(monkeypatch):
-    from tests.integration_tests import npu_model_forward_trace
+    from tests.integration_tests import alignment_module_trace
 
     modules = {
         name: object()
@@ -23,7 +30,7 @@ def modules(monkeypatch):
             "layer1.moe",
         )
     }
-    monkeypatch.setattr(npu_model_forward_trace, "trace_modules", lambda *_: modules)
+    monkeypatch.setattr(alignment_module_trace, "trace_modules", lambda *_: modules)
     return modules
 
 
@@ -103,16 +110,21 @@ def test_training_norm_precision_is_explicit_and_visible():
     assert config.grad_norm_precision == "parameter"
 
 
-def test_candidate_trace_resolves_native_ep_router():
+@pytest.mark.parametrize("qkv_projection", ["separate", "fused"])
+def test_candidate_trace_resolves_native_ep_router(qkv_projection):
     from types import SimpleNamespace
 
-    from tests.integration_tests.npu_model_forward_trace import trace_modules
+    from tests.integration_tests.alignment_module_trace import trace_modules
 
     marker = object()
     gate = torch.nn.Linear(4, 2)
     projection = torch.nn.Linear(4, 4)
     attention = SimpleNamespace(
-        q_norm=marker, k_norm=marker, o_proj=marker, q_proj=projection
+        q_norm=marker,
+        k_norm=marker,
+        o_proj=marker,
+        q_proj=projection,
+        config=SimpleNamespace(qkv_projection=qkv_projection),
     )
     layer = SimpleNamespace(
         self_attn=attention,
@@ -130,5 +142,85 @@ def test_candidate_trace_resolves_native_ep_router():
     modules = trace_modules(SimpleNamespace(model_parts=[model]), baseline=False)
     assert modules["layer0.router"] is layer.mlp.router
     assert modules["layer0.router_gate"] is gate
-    assert modules["layer0.wq"] is projection
+    if qkv_projection == "separate":
+        assert modules["layer0.wq"] is projection
+    else:
+        assert "layer0.wq" not in modules
     assert "layer0.wk" not in modules
+
+
+@pytest.mark.parametrize("layout", ["legacy", "separate", "fused", "unknown"])
+def test_baseline_trace_resolves_converted_projection_modules(layout):
+    marker = torch.nn.Identity()
+    attention = SimpleNamespace(
+        q_norm=marker, k_norm=marker, wo=marker, inner_attention=marker, rope=marker
+    )
+    projections = {}
+    if layout == "legacy":
+        for name in ("wq", "wk", "wv"):
+            projections[name] = torch.nn.Linear(4, 4)
+            setattr(attention, name, projections[name])
+    else:
+        attention.qkv_linear = torch.nn.Module()
+        names = ("wqkv",) if layout == "fused" else ("wq", "wk", "wv")
+        if layout != "unknown":
+            for name in names:
+                projections[name] = torch.nn.Linear(4, 4)
+                attention.qkv_linear.add_module(name, projections[name])
+    layer = SimpleNamespace(
+        attention=attention,
+        moe=SimpleNamespace(router=marker),
+        attention_norm=marker,
+        ffn_norm=marker,
+    )
+    model = SimpleNamespace(tok_embeddings=marker, norm=marker, layers={"0": layer})
+    setattr(model, "output" if layout == "legacy" else "lm_head", marker)
+    trainer = SimpleNamespace(model_parts=[model])
+    if layout == "unknown":
+        with pytest.raises(ValueError, match="no recognized QKV"):
+            trace_modules(trainer, baseline=True)
+        return
+    modules = trace_modules(trainer, baseline=True)
+    assert modules["lm_head"] is marker
+    assert modules["layer0.rope"] is attention.rope
+    for name, projection in projections.items():
+        label = name if layout == "legacy" else f"projection.{name}"
+        assert modules[f"layer0.{label}"] is projection
+    if layout != "legacy":
+        assert modules["layer0.qkv"] is attention.qkv_linear
+
+
+def test_baseline_module_selection_does_not_import_candidate_training():
+    script = """
+import sys
+import torch
+from types import SimpleNamespace
+
+class RejectTrainingImports:
+    def find_spec(self, fullname, path=None, target=None):
+        if (fullname.startswith("llmtuner")
+                or fullname.endswith("npu_model_forward_trace")):
+            raise AssertionError(f"Unexpected training dependency: {fullname}")
+
+sys.meta_path.insert(0, RejectTrainingImports())
+from tests.integration_tests.alignment_module_trace import selected_trace_modules
+norm = torch.nn.Identity()
+trainer = SimpleNamespace(model_parts=[SimpleNamespace(norm=norm)])
+selected = selected_trace_modules(trainer, baseline=True, selection="final")
+assert selected == {"final_norm": norm}
+attention = SimpleNamespace(
+    q_norm=norm, k_norm=norm, wo=norm, inner_attention=norm,
+    wq=norm, wk=norm, wv=norm,
+)
+layer = SimpleNamespace(
+    attention=attention, moe=SimpleNamespace(router=norm),
+    attention_norm=norm, ffn_norm=norm,
+)
+model = trainer.model_parts[0]
+model.tok_embeddings = model.output = norm
+model.layers = {"0": layer}
+selected = selected_trace_modules(trainer, baseline=True, selection="0")
+assert selected["layer0"] is layer
+assert selected["layer0.wq"] is norm
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True)

@@ -35,6 +35,7 @@ def read_steps(path: Path, expected: range):
 def compare(continuous: Path, resumed: Path, *, world: int, total: int, split: int):
     assert world > 0 and 0 < split < total
     comparisons = 0
+    observation_keys = set()
     for rank in range(world):
         left = read_steps(continuous / f"rank{rank}_steps.jsonl", range(1, total + 1))
         right = read_steps(
@@ -46,7 +47,24 @@ def compare(continuous: Path, resumed: Path, *, world: int, total: int, split: i
         for step, observed in right.items():
             reference = left[step]
             assert observed["batches"] == reference["batches"], (rank, step, "inputs")
-            assert observed["metrics"] == reference["metrics"], (rank, step, "metrics")
+            # Checkpoint timings/counters describe this process's IO lifecycle,
+            # not optimizer mathematics. A resumed process starts fresh counters.
+            # Keep every other metric strict, including unknown/new loss metrics.
+            metrics = []
+            for record in (observed, reference):
+                observation_keys.update(
+                    key
+                    for key in record["metrics"]
+                    if key.startswith("checkpoint/local/")
+                )
+                metrics.append(
+                    {
+                        key: value
+                        for key, value in record["metrics"].items()
+                        if not key.startswith("checkpoint/local/")
+                    }
+                )
+            assert metrics[0] == metrics[1], (rank, step, "metrics")
             comparisons += 1
     return {
         "status": "passed",
@@ -54,6 +72,7 @@ def compare(continuous: Path, resumed: Path, *, world: int, total: int, split: i
         "rank_step_comparisons": comparisons,
         "continuous_steps": total,
         "resumed_from": split,
+        "separate_process_observations": sorted(observation_keys),
         "required_separate_check": "final full training checkpoint equality",
     }
 

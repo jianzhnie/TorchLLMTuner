@@ -506,8 +506,64 @@ def main() -> None:
     if os.environ.get("LLMTUNER_ALIGNMENT_INNER_TRACE") == "1":
         if not module_handles:
             raise ValueError("Inner attention trace requires module tracing")
-        from transformers.integrations.sdpa_attention import sdpa_attention_forward
         from transformers.modeling_utils import AttentionInterface
+
+        from llmtuner.models.hf import qkv_projection
+
+        backend_name = model.model.config._attn_implementation
+        original_attention = AttentionInterface()[backend_name]
+        original_rotary = qkv_projection.apply_configured_rotary
+        original_sdpa = torch.nn.functional.scaled_dot_product_attention
+        active_attention = {}
+
+        def traced_functional_sdpa(query, key, value, *args, **kwargs):
+            prefix = active_attention.get("prefix")
+            if prefix is not None:
+                module_trace[f"{prefix}.sdpa"] = {
+                    "query": query.detach().cpu().clone(),
+                    "key": key.detach().cpu().clone(),
+                    "value": value.detach().cpu().clone(),
+                    "args": tuple(
+                        item.detach().cpu().clone()
+                        if isinstance(item, torch.Tensor)
+                        else item
+                        for item in args
+                    ),
+                    "kwargs": {
+                        name: item.detach().cpu().clone()
+                        if isinstance(item, torch.Tensor)
+                        else item
+                        for name, item in kwargs.items()
+                    },
+                }
+            return original_sdpa(query, key, value, *args, **kwargs)
+
+        torch.nn.functional.scaled_dot_product_attention = traced_functional_sdpa
+
+        def traced_rotary(module, query, key, cosine, sine, position_ids):
+            prefix = f"layer{module.layer_idx}.rope"
+            capture = trainer.step == 1 and (
+                not selection or f"layer{module.layer_idx}.attention" in modules
+            )
+            if capture:
+                for suffix, tensor in (
+                    ("input", query),
+                    ("input1", key),
+                    ("positions", position_ids),
+                ):
+                    if tensor is not None:
+                        module_trace[f"{prefix}.{suffix}"] = (
+                            tensor.detach().cpu().clone()
+                        )
+            output = original_rotary(module, query, key, cosine, sine, position_ids)
+            if capture:
+                for index, tensor in enumerate(output):
+                    module_trace[f"{prefix}.output{index}"] = (
+                        tensor.detach().cpu().clone()
+                    )
+            return output
+
+        qkv_projection.apply_configured_rotary = traced_rotary
 
         def traced_sdpa(module, query, key, value, attention_mask, **kwargs):
             prefix = f"layer{module.layer_idx}.inner_attention"
@@ -515,6 +571,43 @@ def main() -> None:
                 not selection or f"layer{module.layer_idx}.attention" in modules
             )
             if capture:
+                module_trace[f"{prefix}.metadata"] = {
+                    "query_shape": tuple(query.shape),
+                    "key_shape": tuple(key.shape),
+                    "value_shape": tuple(value.shape),
+                    "query_stride": query.stride(),
+                    "key_stride": key.stride(),
+                    "value_stride": value.stride(),
+                    "query_dtype": str(query.dtype),
+                    "key_dtype": str(key.dtype),
+                    "value_dtype": str(value.dtype),
+                    "kwargs": {
+                        key: value.detach().cpu().clone()
+                        if isinstance(value, torch.Tensor)
+                        else value
+                        for key, value in kwargs.items()
+                    },
+                    "backend": backend_name,
+                    "training": module.training,
+                    "is_causal": getattr(module, "is_causal", None),
+                    "num_key_value_groups": getattr(
+                        module, "num_key_value_groups", None
+                    ),
+                }
+                module_trace[f"{prefix}.mask"] = (
+                    attention_mask.detach().cpu().clone()
+                    if isinstance(attention_mask, torch.Tensor)
+                    else (
+                        {
+                            "type": type(attention_mask).__qualname__,
+                            "seq_lengths": attention_mask.seq_lengths,
+                            "kv_num_blocks": attention_mask.kv_num_blocks.cpu().clone(),
+                            "kv_indices": attention_mask.kv_indices.cpu().clone(),
+                        }
+                        if attention_mask is not None
+                        else None
+                    )
+                )
                 for suffix, tensor in (
                     ("input", query),
                     ("input1", key),
@@ -523,15 +616,19 @@ def main() -> None:
                     module_trace[f"{prefix}.{suffix}"] = (
                         tensor.transpose(1, 2).detach().cpu().clone()
                     )
-            output = sdpa_attention_forward(
-                module, query, key, value, attention_mask, **kwargs
-            )
+            if capture:
+                active_attention["prefix"] = prefix
+            try:
+                output = original_attention(
+                    module, query, key, value, attention_mask, **kwargs
+                )
+            finally:
+                active_attention.clear()
             if capture:
                 module_trace[f"{prefix}.output"] = output[0].detach().cpu().clone()
             return output
 
-        assert model.model.config._attn_implementation == "sdpa"
-        AttentionInterface.register("sdpa", traced_sdpa)
+        AttentionInterface.register(backend_name, traced_sdpa)
     if os.environ.get("LLMTUNER_ALIGNMENT_FLEX_ATTENTION") == "1":
         importlib.import_module("torchtitan_npu")
         from torch.nn.attention.flex_attention import create_block_mask, flex_attention

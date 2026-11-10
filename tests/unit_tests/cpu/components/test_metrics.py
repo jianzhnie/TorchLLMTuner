@@ -934,6 +934,59 @@ def test_wandb_logger_creates_run_without_reusing_or_finishing_previous(
         assert not previous.sent
 
 
+@pytest.mark.parametrize("flops", [0, 1000])
+@pytest.mark.parametrize("peak_flops", [0, 376e12])
+def test_console_compute_availability_preserves_numeric_sinks(flops, peak_flops):
+    processor = _processor(num_flops_per_token=flops)
+    processor.gpu_peak_flops = peak_flops
+    sink = _RecordingLogger()
+    processor.logger = sink
+    processor.add_tokens(100)
+    observed = {
+        "train/tflops_per_device": 0.0 if flops == 0 else 12.5,
+        "steady/samples": 2,
+        "steady/step_p50_seconds": 1.0,
+        "steady/step_p90_seconds": 1.1,
+        "steady/tps_per_device": 100.0,
+        "steady/tflops_per_device": 0.0 if flops == 0 else 12.5,
+    }
+    if flops and peak_flops:
+        observed["steady/mfu_percent"] = 3.0
+    processor.latest_training_observations = observed
+    with _capturing() as capture:
+        processor.log(
+            1,
+            global_avg_loss=1.0,
+            global_max_loss=1.0,
+            grad_norm=0.5,
+            extra_metrics=observed,
+        )
+        processor.close()
+        processor.close()
+    messages = capture.messages()
+    training = next(message for message in messages if "grad_norm:" in message)
+    steady = next(
+        message for message in messages if "Training steady summary" in message
+    )
+    expected = "N/A" if flops == 0 else "12.50"
+    assert f"tflops: {expected}/device" in training
+    assert f"tflops={expected}/device" in steady
+    if not flops or not peak_flops:
+        assert "mfu: N/A" in training
+        assert "steady_mfu: N/A" in training
+        assert "mfu=N/A" in steady
+    else:
+        assert "steady_mfu: 3.00%" in training
+        assert "mfu=3.00%" in steady
+    values, _ = sink.calls[0]
+    assert isinstance(values["tflops"], float)
+    assert values["train/tflops_per_device"] == observed["train/tflops_per_device"]
+    if flops == 0:
+        assert values["tflops"] == 0.0
+        assert "mfu(%)" not in values
+    assert sum("Training steady summary" in message for message in messages) == 1
+
+
 def test_training_log_includes_logical_parameter_counts_and_compute_scope():
     processor = MetricsProcessor(
         Config(),

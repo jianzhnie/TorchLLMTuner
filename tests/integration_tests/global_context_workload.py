@@ -31,15 +31,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=3)
+    parser.add_argument("--dp-degrees", type=int, nargs="+", default=[8, 4, 2])
     args = parser.parse_args()
     if args.steps < 2:
         parser.error("at least two steps are required for independent recovery")
     cfg = qwen3_30b_npu_config()
     cfg.dataloader.global_context_rows = True
     assert cfg.global_batch_size == 8
-    report = {"scope": "CPU actual LIMO loader audit", "steps": [], "degrees": [4, 8]}
+    degrees = args.dp_degrees
+    if len(set(degrees)) != len(degrees) or any(
+        degree < 1 or cfg.global_batch_size % degree for degree in degrees
+    ):
+        parser.error("DP degrees must be distinct positive divisors of global batch")
+    report = {
+        "scope": "CPU actual LIMO loader audit",
+        "steps": [],
+        "degrees": degrees,
+    }
     reference = None
-    for world in (8, 4):
+    for world in degrees:
         loaders = []
         resumed = None
         try:

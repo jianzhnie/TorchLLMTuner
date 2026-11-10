@@ -12,6 +12,9 @@ from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointAsyncMode,
     DistributedCheckpointManager,
 )
+from llmtuner.components.checkpointer.storage.virtual_optimizer_planner import (
+    VirtualOptimizerSavePlanner,
+)
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.components.optimizer.state_dict import init_optim_state
 from llmtuner.components.optimizer.state_residency import (
@@ -361,9 +364,10 @@ def test_disabled_checkpoint_does_not_validate_virtual_checkpoint_options():
 def test_virtual_checkpoint_writer_disables_copy_ahead(monkeypatch, tmp_path):
     captured = {}
 
-    def save(state_dict, *, storage_writer, checkpoint_id, process_group):
+    def save(state_dict, *, storage_writer, checkpoint_id, process_group, planner):
         captured["writer"] = storage_writer
         captured["process_group"] = process_group
+        captured["planner"] = planner
         return "saved"
 
     monkeypatch.setattr(
@@ -382,6 +386,7 @@ def test_virtual_checkpoint_writer_disables_copy_ahead(monkeypatch, tmp_path):
     assert captured["process_group"] is manager.pg
     assert isinstance(captured["writer"], FileSystemWriter)
     assert captured["writer"].per_thread_copy_ahead == 0
+    assert isinstance(captured["planner"], VirtualOptimizerSavePlanner)
 
 
 def test_failed_virtual_allocation_can_retry_without_partial_adam_state(monkeypatch):

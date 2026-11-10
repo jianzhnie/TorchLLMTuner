@@ -50,7 +50,10 @@ Accelerator execution requires the matching optional production KDA kernel.
 import torch
 from torch import nn
 from torch.nn import functional as F
+from transformers import PretrainedConfig
 
+from ...accelerator.device import is_device_type_available
+from ...errors import EnvironmentUnsupportedError
 from .causal_convolution import KimiCausalConvolution
 from .kimi_linear_config import KimiLinearConfig
 from .normalization import KimiGatedRMSNorm
@@ -58,17 +61,42 @@ from .normalization import KimiGatedRMSNorm
 NPU_KDA_IMPORT_ERROR = None
 ACCELERATOR_KDA_IMPORT_ERROR = None
 
-try:
-    from triton_ascend_kernels.attention.fla.kda import chunk_kda as npu_chunk_kda
-except ImportError as error:
-    npu_chunk_kda = None
-    NPU_KDA_IMPORT_ERROR = error
+npu_chunk_kda = None
+if is_device_type_available("npu"):
+    # Optional Ascend packages may access torch.npu during import; CPU model
+    # construction must not load an unavailable device's runtime.
+    try:
+        from triton_ascend_kernels.attention.fla.kda import chunk_kda as npu_chunk_kda
+    except ImportError as error:
+        NPU_KDA_IMPORT_ERROR = error
 
 try:
     from fla.ops.kda import chunk_kda as accelerator_chunk_kda
 except ImportError as error:
     accelerator_chunk_kda = None
     ACCELERATOR_KDA_IMPORT_ERROR = error
+
+
+def validate_kimi_kda_runtime(config: PretrainedConfig, device: torch.device) -> None:
+    """Reject missing accelerator kernels before allocating model parameters."""
+    if getattr(config, "model_type", None) != "kimi_linear" or device.type in {
+        "cpu",
+        "meta",
+    }:
+        return
+    if not any(config.is_kda_layer(index) for index in range(config.num_hidden_layers)):
+        return
+    if device.type == "npu":
+        kernel, error = npu_chunk_kda, NPU_KDA_IMPORT_ERROR
+        dependency = "triton_ascend_kernels.attention.fla.kda"
+    else:
+        kernel, error = accelerator_chunk_kda, ACCELERATOR_KDA_IMPORT_ERROR
+        dependency = "fla.ops.kda"
+    if kernel is None:
+        raise EnvironmentUnsupportedError(
+            f"Kimi KDA training on {device.type} requires {dependency}. "
+            "Install its compatible accelerator runtime before constructing the model."
+        ) from error
 
 
 def recurrent_kda(q, k, v, g, beta, A_log, dt_bias, lower_bound=None):

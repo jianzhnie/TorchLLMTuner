@@ -19,6 +19,9 @@ Set LLMTUNER_TEST_PP_SCHEDULE=Interleaved1F1B to exercise two virtual stages
 per rank over six decoder layers with the same packed-corpus reference.
 Set LLMTUNER_TEST_LIMO_PATH and LLMTUNER_TEST_TOKENIZER_PATH to use the first
 two original LIMO question/solution pairs with the real Qwen tokenizer.
+LLMTUNER_TEST_LIMO_ROWS changes the original-record prefix length (minimum two).
+The selected prefix must leave an entirely padded validation microbatch;
+with the recorded Qwen tokenizer, five records exercise this at CP2/seq256.
 This arm tests plain-text causal packing, not SFT prompt masking or pretrained
 30B weights; the decoder remains a randomly initialized small test model.
 That CPU scenario retains actual CP masks/collectives and substitutes only
@@ -66,6 +69,9 @@ CP = int(os.environ.get("LLMTUNER_TEST_CP_SIZE", "1"))
 SEQ = 256 if CP > 1 else 64
 LIMO_PATH = os.environ.get("LLMTUNER_TEST_LIMO_PATH")
 TOKENIZER_PATH = os.environ.get("LLMTUNER_TEST_TOKENIZER_PATH")
+LIMO_ROWS = int(os.environ.get("LLMTUNER_TEST_LIMO_ROWS", "2"))
+if LIMO_ROWS < 2:
+    raise ValueError("LLMTUNER_TEST_LIMO_ROWS must be at least two")
 if LIMO_PATH and not TOKENIZER_PATH:
     raise ValueError("LLMTUNER_TEST_LIMO_PATH requires LLMTUNER_TEST_TOKENIZER_PATH")
 VOCAB = 151936 if LIMO_PATH else 128
@@ -98,15 +104,13 @@ def _cpu_packed_attention(self, positions, attention_masks):
 
 def _write_corpus(root: str) -> tuple[str, str]:
     """A tiny tokenizer and a JSONL corpus of multi-document rows."""
-    import os
-
     tokenizer_path = os.path.join(root, "tokenizer")
     corpus_path = os.path.join(root, "rows.jsonl")
     if LIMO_PATH:
         with open(LIMO_PATH, "rb") as source:
             original = source.read()
-        rows = original.splitlines()[:2]
-        assert len(rows) == 2, "LIMO check requires two original records"
+        rows = original.splitlines()[:LIMO_ROWS]
+        assert len(rows) == LIMO_ROWS, "LIMO check requires the full selected prefix"
         with open(corpus_path, "w") as handle:
             for raw in rows:
                 record = json.loads(raw)
@@ -116,7 +120,7 @@ def _write_corpus(root: str) -> tuple[str, str]:
                     + "\n"
                 )
         print(
-            f"real_corpus=LIMO rows=0:2 source_sha256="
+            f"real_corpus=LIMO rows=0:{LIMO_ROWS} source_sha256="
             f"{hashlib.sha256(original).hexdigest()} tokenizer={TOKENIZER_PATH} "
             "objective=plain_text_causal auxiliary_small_model=True",
             flush=True,

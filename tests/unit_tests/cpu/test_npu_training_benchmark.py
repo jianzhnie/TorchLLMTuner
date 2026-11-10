@@ -9,8 +9,10 @@ import torch
 from examples.npu_training_benchmark import (
     BenchmarkNPUTrainer,
     compile_counter_delta,
+    summarize_peak_memory,
     summarize_resident_memory,
     summarize_timings,
+    summarize_valid_targets,
 )
 from llmtuner.components.metrics import (
     compute_utilization,
@@ -135,6 +137,9 @@ def test_local_report_failure_is_coordinated_before_gather(monkeypatch):
     monkeypatch.setattr(benchmark, "qwen3_30b_npu_config", lambda: config)
     monkeypatch.setattr(benchmark, "BenchmarkNPUTrainer", lambda *a, **kw: trainer)
     monkeypatch.setattr(benchmark, "runtime_metadata", lambda: {})
+    monkeypatch.setattr(
+        benchmark, "summarize_peak_memory", lambda *a, **kw: fail_memory_report()
+    )
     monkeypatch.setattr(benchmark, "synchronize_local_errors", coordinated)
     monkeypatch.setattr(benchmark.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(benchmark.dist, "get_backend", lambda: "hccl")
@@ -261,11 +266,23 @@ def test_single_measured_step_and_nonreporting_rank():
     assert result["p10_step_seconds"] == result["p90_step_seconds"] == 2
 
 
+def test_peak_memory_retains_middle_step_spike_and_excludes_warmup():
+    rows = [{"peak_allocated_bytes": peak} for peak in (1000, 20, 90, 10)]
+    assert summarize_peak_memory(rows, warmup=1) == 90
+
+
+@pytest.mark.parametrize("peak", [-1, True, float("nan"), 1.5])
+def test_peak_memory_rejects_invalid_samples(peak):
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        summarize_peak_memory([{"peak_allocated_bytes": peak}], warmup=0)
+
+
 def test_timer_preserves_iterator_and_metrics_without_auditing(monkeypatch):
     observer = object.__new__(BenchmarkNPUTrainer)
     observer.step = 2
     observer.benchmark_warmup = 1
     observer.benchmark_rows = []
+    observer.metrics = SimpleNamespace(valid_tokens_since_last_log=7)
     batch = object()
     iterator = iter([batch])
     metrics = {"loss": 0.5}
@@ -275,6 +292,7 @@ def test_timer_preserves_iterator_and_metrics_without_auditing(monkeypatch):
         assert observed is iterator
         assert next(observed) is batch
         calls.append("train")
+        self.metrics.valid_tokens_since_last_log += 11
         return metrics
 
     times = iter([10.0, 13.0])
@@ -295,6 +313,7 @@ def test_timer_preserves_iterator_and_metrics_without_auditing(monkeypatch):
         SimpleNamespace(
             synchronize=lambda: calls.append("sync"),
             reset_peak_memory_stats=lambda: calls.append("reset"),
+            max_memory_allocated=lambda: 123,
         ),
         raising=False,
     )
@@ -304,7 +323,14 @@ def test_timer_preserves_iterator_and_metrics_without_auditing(monkeypatch):
     assert observer.train_step(iterator) is metrics
     assert calls == ["sync", "barrier", "sync", "reset", "train", "sync"]
     assert observer.benchmark_rows == [
-        {"step": 2, "seconds": 3.0, "metrics": metrics, "compile_counters": {}}
+        {
+            "step": 2,
+            "seconds": 3.0,
+            "peak_allocated_bytes": 123,
+            "metrics": metrics,
+            "local_valid_targets": 11,
+            "compile_counters": {},
+        }
     ]
 
 
@@ -313,6 +339,7 @@ def test_failed_step_does_not_receive_a_success_record(monkeypatch):
     observer.step = 1
     observer.benchmark_warmup = 1
     observer.benchmark_rows = []
+    observer.metrics = SimpleNamespace(valid_tokens_since_last_log=0)
 
     def fail(self, iterator):
         raise RuntimeError("training failed")
@@ -324,6 +351,48 @@ def test_failed_step_does_not_receive_a_success_record(monkeypatch):
     with pytest.raises(RuntimeError, match="training failed"):
         observer.train_step(iter([]))
     assert observer.benchmark_rows == []
+
+
+def target_records():
+    return [
+        {
+            "data_parallel_size": 2,
+            "data_parallel_rank": index,
+            "steps": [{"local_valid_targets": n} for n in counts],
+        }
+        for index, counts in [(0, [3, 5]), (1, [7, 11]), (0, [3, 5]), (1, [7, 11])]
+    ]
+
+
+def test_valid_targets_count_asymmetric_dp_shards_once_and_exclude_warmup():
+    result = summarize_valid_targets(target_records(), warmup=1)
+    assert result["global_valid_targets_per_step"] == [16]
+    assert result["measured_valid_targets"] == 16
+
+
+@pytest.mark.parametrize(
+    "damage", ["replica", "missing", "degree", "negative", "float", "short", "zero"]
+)
+def test_valid_targets_reject_inconsistent_or_vacuous_counts(damage):
+    ranks = target_records()
+    if damage == "replica":
+        ranks[2]["steps"][1]["local_valid_targets"] += 1
+    elif damage == "missing":
+        ranks[1]["data_parallel_rank"] = 0
+        ranks[3]["data_parallel_rank"] = 0
+    elif damage == "degree":
+        ranks[0]["data_parallel_size"] = 3
+    elif damage in {"negative", "float"}:
+        ranks[0]["steps"][0]["local_valid_targets"] = (
+            -1 if damage == "negative" else 3.0
+        )
+    elif damage == "short":
+        ranks[2]["steps"].pop()
+    else:
+        for rank in ranks:
+            rank["steps"][0]["local_valid_targets"] = 0
+    with pytest.raises(ValueError):
+        summarize_valid_targets(ranks, warmup=1)
 
 
 @pytest.mark.parametrize("invalid", ["save", "resume", "validation", "profiler"])
@@ -467,6 +536,8 @@ def test_accelerator_provenance_includes_device_soc_and_cann(tmp_path, monkeypat
             current_device=lambda: 3,
             get_device_name=lambda device: f"Ascend910_{device}",
             get_soc_version=lambda: 251,
+            matmul=SimpleNamespace(allow_hf32=False),
+            conv=SimpleNamespace(allow_hf32=True),
         ),
     )
     assert benchmark.accelerator_metadata() == {
@@ -474,6 +545,7 @@ def test_accelerator_provenance_includes_device_soc_and_cann(tmp_path, monkeypat
         "name": "Ascend910_3",
         "soc_version": "251",
         "cann_version": "9.1.0",
+        "allow_hf32": {"matmul": False, "conv": True, "aclnn": None},
     }
 
 

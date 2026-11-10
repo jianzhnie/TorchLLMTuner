@@ -1,11 +1,110 @@
 """Model checkpoint state aggregation, cache lifetime, and extra state."""
 
+import weakref
+
 import pytest
 import torch
 from torch import nn
 
 from llmtuner.components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
+
+
+@pytest.mark.parametrize("mode", ["full", "tp", "ep", "joint"])
+def test_restore_releases_export_cache_without_regathering(monkeypatch, mode):
+    from llmtuner.components.checkpointer.core import model_state
+
+    model = nn.Linear(2, 2, bias=False)
+    chunked = mode != "full"
+
+    def export(module, state, prefix, metadata):
+        # Model hooks and full TP gathers can own storage distinct from parameters.
+        value = state[prefix + "weight"].clone()
+        state[prefix + "weight"] = (
+            ChunkedCheckpointTensor((2, 2), [((0, 0), value)]) if chunked else value
+        )
+
+    model.register_state_dict_post_hook(export)
+    wrapper = ModelCheckpointState(
+        model,
+        sharded_tensor_parallel=mode in {"tp", "joint"},
+        sharded_expert_parallel=mode in {"ep", "joint"},
+    )
+    old = weakref.ref(wrapper.cached_state_dict["weight"])
+    calls = []
+
+    def restore(state, **kwargs):
+        calls.append(mode)
+        value = state["weight"]
+        return {
+            "weight": value.chunks[0][1]
+            if isinstance(value, ChunkedCheckpointTensor)
+            else value
+        }
+
+    transform = {
+        "full": "load_tensor_parallel_state",
+        "tp": "restore_sharded_tensor_parallel_state",
+        "ep": "restore_sharded_expert_state",
+        "joint": "restore_disjoint_tp_ep_state",
+    }[mode]
+    monkeypatch.setattr(model_state, transform, restore)
+    original_get = wrapper.get_state_dict
+
+    def forbidden_get(**kwargs):
+        pytest.fail("restore must not gather/export a fresh checkpoint cache")
+
+    monkeypatch.setattr(wrapper, "get_state_dict", forbidden_get)
+    value = torch.full_like(model.weight, 7)
+    saved = {
+        "weight": ChunkedCheckpointTensor((2, 2), [((0, 0), value)])
+        if chunked
+        else value
+    }
+    wrapper.load_state_dict(saved)
+    assert calls == [mode]
+    assert old() is None
+    assert wrapper.cached_state_dict == {}
+    torch.testing.assert_close(model.weight, value)
+    # Validation still works with no exported storage, including chunk metadata.
+    wrapper.validate_state_dict(saved)
+    with pytest.raises(ValueError, match="missing keys"):
+        wrapper.load_state_dict({})
+    with pytest.raises(ValueError, match="must be a tensor"):
+        wrapper.load_state_dict({"weight": None})
+    with pytest.raises(ValueError, match="has shape"):
+        wrapper.load_state_dict({"weight": torch.zeros(3, 2)})
+    if chunked:
+        with pytest.raises(ValueError, match="dtype"):
+            wrapper.validate_state_dict(
+                {"weight": ChunkedCheckpointTensor((2, 2), [((0, 0), value.double())])}
+            )
+        with pytest.raises(ValueError, match="chunk layout"):
+            wrapper.validate_state_dict(
+                {"weight": ChunkedCheckpointTensor((2, 2), [((1, 0), value[:1])])}
+            )
+    wrapper.load_state_dict(saved)
+    monkeypatch.setattr(wrapper, "get_state_dict", original_get)
+    first = wrapper.state_dict()["weight"]
+    with torch.no_grad():
+        model.weight.add_(1)
+    refreshed = wrapper.state_dict()["weight"]
+    assert refreshed is first
+    torch.testing.assert_close(
+        refreshed.chunks[0][1] if chunked else refreshed, value + 1
+    )
+
+
+def test_restore_cache_invalidation_keeps_input_and_structure_validation():
+    model = nn.Linear(2, 2)
+    wrapper = ModelCheckpointState(model)
+    saved = wrapper.state_dict()
+    wrapper.load_state_dict(saved)
+    assert set(saved) == {"weight", "bias"}
+    model.register_buffer("added", torch.zeros(1))
+    with pytest.raises(RuntimeError, match="checkpoint keys changed"):
+        wrapper.state_dict()
+    assert wrapper.cached_state_dict == {}
 
 
 def test_chunked_model_cache_refresh_preserves_storage_and_live_parameter():

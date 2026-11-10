@@ -19,6 +19,7 @@ from tests.integration_tests.alignment_attention_control import (
     batched_attention_control,
 )
 from tests.integration_tests.alignment_history import load_alignment_history
+from tests.integration_tests.alignment_module_trace import trace_modules
 from tests.integration_tests.harness import init_distributed
 from tests.integration_tests.npu_trainer_alignment_config import (
     QWEN3_30B,
@@ -72,55 +73,6 @@ def build_candidate(baseline, output: Path, world: int):
         torch.set_default_dtype(previous_dtype)
     assert trainer.checkpointer.load(trainer.cfg.checkpoint.load_step)
     return trainer
-
-
-def trace_modules(trainer, baseline: bool):
-    model = trainer.model_parts[0]
-    modules = {
-        "embedding": model.tok_embeddings,
-        "final_norm": model.norm,
-        "lm_head": (model.output if baseline else model.lm_head),
-    }
-    layers = model.layers.values() if baseline else model.layers
-    for index, layer in enumerate(layers):
-        attention = layer.attention if baseline else layer.self_attn
-        moe = layer.moe if baseline else layer.mlp
-        modules[f"layer{index}.attention"] = attention
-        modules[f"layer{index}.moe"] = moe
-        modules[f"layer{index}.router"] = (
-            moe.router if baseline or hasattr(moe, "router") else moe.gate
-        )
-        router_gate = getattr(modules[f"layer{index}.router"], "gate", None)
-        if isinstance(router_gate, torch.nn.Module):
-            modules[f"layer{index}.router_gate"] = router_gate
-        modules[f"layer{index}"] = layer
-        modules[f"layer{index}.input_norm"] = (
-            layer.attention_norm if baseline else layer.input_layernorm
-        )
-        modules[f"layer{index}.post_norm"] = (
-            layer.ffn_norm if baseline else layer.post_attention_layernorm
-        )
-        modules[f"layer{index}.q_norm"] = attention.q_norm
-        modules[f"layer{index}.k_norm"] = attention.k_norm
-        modules[f"layer{index}.output_projection"] = (
-            attention.wo if baseline else attention.o_proj
-        )
-        if baseline:
-            for name in ("wq", "wk", "wv"):
-                modules[f"layer{index}.{name}"] = getattr(attention, name)
-            modules[f"layer{index}.inner_attention"] = attention.inner_attention
-        else:
-            for name, attribute in (
-                ("wq", "q_proj"),
-                ("wk", "k_proj"),
-                ("wv", "v_proj"),
-            ):
-                projection = getattr(attention, attribute, None)
-                if isinstance(projection, torch.nn.Module):
-                    modules[f"layer{index}.{name}"] = projection
-    if not baseline:
-        modules["rotary_cache"] = model.model.model.rotary_emb
-    return modules
 
 
 def main() -> None:

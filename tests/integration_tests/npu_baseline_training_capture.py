@@ -315,14 +315,15 @@ def main() -> None:
     (root / "config.json").write_text(json.dumps(config_dict, indent=2))
     source_modules = ["torchtitan", "torchtitan.trainer", "torchtitan_npu"]
     if alignment_model == QWEN3_30B:
+        # Record the actual recipe and loaded NPU implementations. Historical
+        # module names may no longer exist in the installed baseline version.
+        source_modules.extend((spec.parallelize_fn.__module__, __name__))
         source_modules.extend(
-            (
-                "torchtitan.models.llama4.parallelize",
-                "torchtitan.distributed.tensor_parallel",
-                "torchtitan_npu.converters.kernels.gmm",
-                "torchtitan_npu.converters.kernels.moe_dispatch",
-                "torchtitan_npu.patches.torchtitan.expert_parallel",
-                __name__,
+            sorted(
+                name
+                for name, module in sys.modules.items()
+                if name.startswith(("torchtitan.distributed.", "torchtitan_npu."))
+                and getattr(module, "__file__", None) is not None
             )
         )
     runtime = alignment_runtime_manifest(source_modules)

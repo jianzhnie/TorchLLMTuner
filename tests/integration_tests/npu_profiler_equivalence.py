@@ -10,10 +10,10 @@ from pathlib import Path
 
 import torch
 
-from examples.train_qwen3 import qwen3_config
 from llmtuner.components.profiler import MemoryProfiler
 from llmtuner.config.observability_config import ProfilerConfig
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.npu_trainer_test_config import qwen3_config
 
 
 def train(root: Path, *, profiling: bool, memory_snapshots: bool = False):

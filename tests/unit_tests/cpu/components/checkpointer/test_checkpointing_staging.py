@@ -1,6 +1,5 @@
 """The NPU staging fix changes only the supported manager instance."""
 
-from importlib.metadata import PackageNotFoundError
 from types import SimpleNamespace
 
 import pytest
@@ -11,25 +10,9 @@ from llmtuner.components.checkpointer.storage import checkpointing_staging as st
 @pytest.mark.parametrize("device,release", [("cpu", "0.1.0"), ("npu", "0.2.0")])
 def test_staging_adapter_preserves_other_environments(monkeypatch, device, release):
     monkeypatch.setattr(staging, "device_type", device)
-    monkeypatch.setattr(staging, "version", lambda name: release)
     target = SimpleNamespace(_stage=object())
     original = target._stage
     manager = SimpleNamespace(_saver=SimpleNamespace(_checkpoint_stager=target))
-    assert not staging.adapt_npu_staging(manager)
-    assert target._stage is original
-
-
-def test_staging_adapter_skips_when_distribution_metadata_is_missing(monkeypatch):
-    monkeypatch.setattr(staging, "device_type", "npu")
-
-    def missing_distribution(name):
-        raise PackageNotFoundError(name)
-
-    monkeypatch.setattr(staging, "version", missing_distribution)
-    target = SimpleNamespace(_stage=object())
-    original = target._stage
-    manager = SimpleNamespace(_saver=SimpleNamespace(_checkpoint_stager=target))
-
     assert not staging.adapt_npu_staging(manager)
     assert target._stage is original
 
@@ -47,7 +30,6 @@ def test_staging_adapter_waits_once_and_preserves_payload_and_instance(monkeypat
     target = DefaultStager()
     other = DefaultStager()
     monkeypatch.setattr(staging, "device_type", "npu")
-    monkeypatch.setattr(staging, "version", lambda name: "0.1.0")
     monkeypatch.setattr(staging, "DefaultStager", DefaultStager)
     manager = SimpleNamespace(_saver=SimpleNamespace(_checkpoint_stager=target))
     assert staging.adapt_npu_staging(manager)
@@ -74,7 +56,6 @@ def test_staging_wait_failure_does_not_start_copy(monkeypatch):
     target = DefaultStager()
     target._staged_state_dict = {"previous": object()}
     monkeypatch.setattr(staging, "device_type", "npu")
-    monkeypatch.setattr(staging, "version", lambda name: "0.1.0")
     monkeypatch.setattr(staging, "DefaultStager", DefaultStager)
     manager = SimpleNamespace(_saver=SimpleNamespace(_checkpoint_stager=target))
     assert staging.adapt_npu_staging(manager)
@@ -85,3 +66,40 @@ def test_staging_wait_failure_does_not_start_copy(monkeypatch):
     with pytest.raises(RuntimeError, match="producer failure"):
         target._stage({}, SimpleNamespace(synchronize=fail_wait))
     assert target._staged_state_dict is None
+
+
+def test_worker_adapter_binds_only_target_and_captures_rank_device(monkeypatch):
+    class DefaultStager:
+        _accelerator_available = True
+
+        def _stage_on_worker(self, *args):
+            raise AssertionError("Upstream worker must not execute")
+
+        def stage(self, *args):
+            raise AssertionError("CUDA staging must not execute")
+
+        def _stage(self, *args):
+            raise AssertionError("CUDA copy must not execute")
+
+        def _init_worker_thread(self):
+            raise AssertionError("CUDA worker init must not execute")
+
+    monkeypatch.setattr(staging, "device_type", "npu")
+    monkeypatch.setattr(staging, "DefaultStager", DefaultStager)
+    calls = []
+    monkeypatch.setattr(
+        staging.torch,
+        "npu",
+        SimpleNamespace(current_device=lambda: 3, set_device=calls.append),
+        raising=False,
+    )
+    target, other = DefaultStager(), DefaultStager()
+    manager = SimpleNamespace(_saver=SimpleNamespace(_checkpoint_stager=target))
+    assert staging.adapt_npu_staging(manager)
+    assert not staging.adapt_npu_staging(manager)
+    assert target._llmtuner_npu_device == 3
+    assert target.stage.__func__ is staging._npu_stage
+    assert target._stage.__func__ is staging._npu_copy_stage
+    target._init_worker_thread()
+    assert calls == [3]
+    assert other.stage.__func__ is DefaultStager.stage

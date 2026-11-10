@@ -151,10 +151,13 @@ def _reference_validation(trainer: Trainer) -> float:
             targets.chunk(MICROBATCHES * DP),
             strict=True,
         ):
-            logits = model(inputs.reshape(-1))
-            loss_sum += F.cross_entropy(
-                logits.float(), labels.reshape(-1), reduction="sum"
-            )
+            # Each source row is an independent document. Flattening several
+            # rows here lets later rows attend to earlier ones, unlike the
+            # production row-aware mask. Score rows independently so this
+            # reference does not reuse the mask builder under test.
+            for row, row_labels in zip(inputs, labels, strict=True):
+                logits = model(row)
+                loss_sum += F.cross_entropy(logits.float(), row_labels, reduction="sum")
     return float(loss_sum) / valid_tokens
 
 
