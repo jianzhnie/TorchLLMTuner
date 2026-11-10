@@ -2,7 +2,7 @@
 
 import pytest
 
-from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
 
 
 def test_kimi_config_roundtrip_preserves_hybrid_architecture(tmp_path):

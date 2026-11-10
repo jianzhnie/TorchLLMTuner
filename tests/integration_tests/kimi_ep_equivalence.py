@@ -16,8 +16,8 @@ from torch import nn
 
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
-from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-from llmtuner.models.kimi.moe import KimiSparseMoE
+from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
 from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
 
 

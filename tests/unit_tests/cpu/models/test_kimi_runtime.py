@@ -9,8 +9,8 @@ import torch
 from transformers import PretrainedConfig
 
 from llmtuner.errors import EnvironmentUnsupportedError
-from llmtuner.models.kimi import delta_attention
-from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3 import delta_attention
+from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
 
 
 def kda_config():
@@ -35,7 +35,7 @@ def checked_import(name, *args, **kwargs):
         raise AssertionError('CPU import reached an unavailable NPU runtime')
     return original_import(name, *args, **kwargs)
 builtins.__import__ = checked_import
-from llmtuner.models.kimi import delta_attention
+from llmtuner.models.kimi.kimi_k3 import delta_attention
 assert delta_attention.npu_chunk_kda is None
 assert delta_attention.NPU_KDA_IMPORT_ERROR is None
 """

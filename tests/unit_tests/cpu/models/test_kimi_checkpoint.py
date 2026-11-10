@@ -5,8 +5,8 @@ import torch
 
 from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
-from llmtuner.models.kimi.checkpoint import convert_kimi_expert_state
-from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.checkpoint import convert_kimi_expert_state
+from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
 from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
 
 

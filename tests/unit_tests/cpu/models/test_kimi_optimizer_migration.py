@@ -10,7 +10,7 @@ from llmtuner.components.optimizer.state_dict import (
     init_optim_state,
     load_flat_optim_state_dict,
 )
-from llmtuner.models.kimi.checkpoint import convert_kimi_optimizer_state
+from llmtuner.models.kimi.kimi_k3.checkpoint import convert_kimi_optimizer_state
 
 ROOT = "model.layers.0.block_sparse_moe."
 

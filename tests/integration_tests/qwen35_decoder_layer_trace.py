@@ -36,7 +36,7 @@ from llmtuner.models.hf.expert_kernels import (
     stabilize_moe_router,
 )
 from llmtuner.models.hf.model_setup import configure_experts_implementation
-from llmtuner.models.qwen3_5.gdn_numerics import configure_gdn_numerics
+from llmtuner.models.qwen.qwen3_5.gdn_numerics import configure_gdn_numerics
 
 from tests.integration_tests.qwen35_cross_framework import boundary, compare
 

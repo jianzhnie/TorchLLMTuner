@@ -19,10 +19,10 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
-from llmtuner.models.hf.qkv_projection import (
+from llmtuner.models.qwen.qwen3.qkv_projection import (
     apply_fp32_rotary_projection,
 )
-from llmtuner.models.qwen3_5.rotary import apply_qwen35_fp32_rotary
+from llmtuner.models.qwen.qwen3_5.rotary import apply_qwen35_fp32_rotary
 
 
 def make_model(cache):

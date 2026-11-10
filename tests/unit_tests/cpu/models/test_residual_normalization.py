@@ -21,11 +21,11 @@ from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.hf.factory import build_model_config_for
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.models.hf.normalization_setup import (
+from llmtuner.models.qwen.qwen3.normalization_setup import (
     _isolate_norm_input,
     stabilize_residual_norm_gradients,
 )
-from llmtuner.models.hf.residual_normalization import (
+from llmtuner.models.qwen.qwen3.residual_normalization import (
     apply_joint_residual_norm,
     forward_joint_residual_block,
     forward_joint_residual_norm,
@@ -365,8 +365,8 @@ def test_residual_norm_import_does_not_depend_on_policy_installation():
             sys.executable,
             "-c",
             "import sys; "
-            "sys.modules['llmtuner.models.hf.normalization_setup'] = None; "
-            "from llmtuner.models.hf.residual_normalization "
+            "sys.modules['llmtuner.models.qwen.qwen3.normalization_setup'] = None; "
+            "from llmtuner.models.qwen.qwen3.residual_normalization "
             "import isolate_norm_input; "
             "import torch; "
             "value = torch.randn(2, 4, requires_grad=True); "

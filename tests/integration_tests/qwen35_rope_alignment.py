@@ -27,7 +27,7 @@ try:
     )
     import torchtitan_npu.models.qwen3_5  # noqa: F401 -- existing import compatibility
     from torchtitan.models.qwen3_5.rope import MRoPE
-    from llmtuner.models.qwen3_5.rotary import (
+    from llmtuner.models.qwen.qwen3_5.rotary import (
         apply_qwen35_fp32_rotary,
         forward_qwen35_fp32_cache,
     )

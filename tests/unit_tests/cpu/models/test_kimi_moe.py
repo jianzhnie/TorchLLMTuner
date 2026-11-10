@@ -5,8 +5,8 @@ from copy import deepcopy
 import pytest
 import torch
 
-from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-from llmtuner.models.kimi.moe import KimiSparseMoE
+from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
 
 
 def test_bf16_moe_combines_experts_before_rounding():
@@ -158,7 +158,7 @@ def test_kimi_rejects_invalid_latent_expert_width(width):
 )
 @pytest.mark.parametrize("value", [True, 1.0, 0, -1])
 def test_kimi_router_rejects_invalid_integer_configuration(field, value):
-    from llmtuner.models.kimi.moe import KimiMoEGate
+    from llmtuner.models.kimi.kimi_k3.moe import KimiMoEGate
 
     settings = dict(
         hidden_size=8,

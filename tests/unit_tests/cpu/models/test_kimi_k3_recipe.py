@@ -32,7 +32,7 @@ def test_k3_reduces_only_layers_and_attention_schedule():
 def test_k3_flops_cover_reduced_kda_mla_and_latent_moe():
     if not MODEL.is_dir():
         pytest.skip("Official K3 configuration is not available")
-    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
     from llmtuner.utils.flops import flops_per_token
 
     one = KimiLinearConfig(**load_text_overrides(str(MODEL), 1))

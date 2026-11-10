@@ -31,10 +31,10 @@ from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 from torchtitan_npu.models.qwen3_5 import model_registry
 
-from llmtuner.models.hf.qkv_projection import (
+from llmtuner.models.qwen.qwen3.qkv_projection import (
     apply_fp32_rotary_projection,
 )
-from llmtuner.models.qwen3_5.rotary import apply_qwen35_fp32_rotary
+from llmtuner.models.qwen.qwen3_5.rotary import apply_qwen35_fp32_rotary
 from tests.integration_tests.qwen35_cross_framework import boundary
 
 ATOL, RTOL = 0.005, 0.02

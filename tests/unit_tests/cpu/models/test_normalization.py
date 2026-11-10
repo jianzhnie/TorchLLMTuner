@@ -4,7 +4,7 @@ import pytest
 import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
-from llmtuner.models.hf.normalization import forward_aten_rms_norm, rms_norm
+from llmtuner.models.qwen.qwen3.normalization import forward_aten_rms_norm, rms_norm
 
 
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16, torch.float32])

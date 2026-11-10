@@ -11,7 +11,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGated
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
 from llmtuner.models.hf.factory import apply_runtime_config, unwrap_text_config
-from llmtuner.models.qwen3_5 import gdn_numerics as adapter
+from llmtuner.models.qwen.qwen3_5 import gdn_numerics as adapter
 
 
 def holder():

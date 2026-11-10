@@ -7,8 +7,8 @@ import pytest
 import torch
 
 from llmtuner.models.common.activation import SituGLU
-from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-from llmtuner.models.kimi.mlp import KimiExpertMLP, KimiMLP
+from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.mlp import KimiExpertMLP, KimiMLP
 
 
 def test_kimi_feed_forward_imports_do_not_load_decoder():
@@ -17,11 +17,11 @@ def test_kimi_feed_forward_imports_do_not_load_decoder():
             sys.executable,
             "-c",
             "import sys; "
-            "from llmtuner.models.kimi.mlp import KimiMLP, KimiExpertMLP; "
-            "from llmtuner.models.kimi import moe; "
-            "assert 'llmtuner.models.kimi.model' not in sys.modules; "
+            "from llmtuner.models.kimi.kimi_k3.mlp import KimiMLP, KimiExpertMLP; "
+            "from llmtuner.models.kimi.kimi_k3 import moe; "
+            "assert 'llmtuner.models.kimi.kimi_k3.model' not in sys.modules; "
             "assert moe.KimiExpertMLP is KimiExpertMLP; "
-            "from llmtuner.models.kimi import model; "
+            "from llmtuner.models.kimi.kimi_k3 import model; "
             "assert model.KimiMLP is KimiMLP",
         ],
         check=True,

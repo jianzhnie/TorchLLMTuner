@@ -13,7 +13,7 @@ from llmtuner.components.optimizer.state_dict import (
     load_flat_optim_state_dict,
 )
 from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
-from llmtuner.models.kimi.checkpoint import convert_kimi_optimizer_state
+from llmtuner.models.kimi.kimi_k3.checkpoint import convert_kimi_optimizer_state
 from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
 from tests.unit_tests.cpu.parallel.test_kimi_conversion import make_model
 

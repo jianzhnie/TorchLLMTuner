@@ -46,7 +46,7 @@ def isolated_backward(*, norm_override=None):
     from llmtuner.config.compile_config import CompileConfig
     from llmtuner.models.hf.factory import build_model_config
     from llmtuner.models.hf.model import HFTransformerModel
-    from llmtuner.models.hf.normalization_setup import _isolate_norm_input
+    from llmtuner.models.qwen.qwen3.normalization_setup import _isolate_norm_input
     from llmtuner.parallel.model_compile import apply_compile
 
     torch.set_num_threads(1)

@@ -21,7 +21,7 @@ from llmtuner.errors import ConfigError, UnsupportedCombinationError
 from llmtuner.models.hf.factory import build_model_config_for, unwrap_text_config
 from llmtuner.models.hf.materialization import materialize_meta_model
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.models.hf.qkv_projection import (
+from llmtuner.models.qwen.qwen3.qkv_projection import (
     apply_fused_qkv_projection,
     forward_fused_qkv_attention,
     fused_qkv_projection,
@@ -108,7 +108,7 @@ def test_projection_config_reaches_model_without_global_class_changes(projection
 
 
 def test_qwen3_moe_fused_fp32_rotary_and_torch_norm_execute() -> None:
-    from llmtuner.models.hf.normalization_setup import forward_torch_rms_norm
+    from llmtuner.models.qwen.qwen3.normalization_setup import forward_torch_rms_norm
 
     config = AutoConfig.for_model(
         "qwen3_moe",
@@ -144,7 +144,7 @@ def test_qwen3_moe_fused_fp32_rotary_and_torch_norm_execute() -> None:
 def test_qwen3_moe_torchtitan_experts_execute_and_backpropagate() -> None:
     from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
 
-    from llmtuner.models.hf.expert_kernels import forward_torchtitan_moe
+    from llmtuner.models.qwen.qwen3.experts import forward_torchtitan_moe
 
     config = AutoConfig.for_model(
         "qwen3_moe",
@@ -372,7 +372,7 @@ def test_fused_attention_executes_fullgraph_aot_with_matching_gradients():
 def test_fp32_rotary_rejects_scaled_frequencies():
     from types import SimpleNamespace
 
-    from llmtuner.models.hf.qkv_projection import apply_configured_rotary
+    from llmtuner.models.qwen.qwen3.qkv_projection import apply_configured_rotary
 
     module = SimpleNamespace(
         config=SimpleNamespace(

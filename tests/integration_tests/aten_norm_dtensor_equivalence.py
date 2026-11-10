@@ -12,7 +12,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard, distribute_tensor
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
-from llmtuner.models.hf.normalization import rms_norm
+from llmtuner.models.qwen.qwen3.normalization import rms_norm
 
 
 def main():

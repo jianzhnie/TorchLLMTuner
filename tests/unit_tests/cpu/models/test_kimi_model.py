@@ -9,8 +9,8 @@ from llmtuner.models.hf.model import HFTransformerModel
 
 
 def test_kimi_decoder_rejects_batched_document_resets_and_conflicting_masks():
-    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-    from llmtuner.models.kimi.model import KimiLinearForCausalLM
+    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
 
     config = KimiLinearConfig(
         vocab_size=16,
@@ -47,8 +47,8 @@ def test_kimi_decoder_rejects_batched_document_resets_and_conflicting_masks():
 
 def test_registered_kimi_architecture_builds_from_training_config():
     from llmtuner.models.hf.factory import build_model_config_for, resolve_model_class
-    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-    from llmtuner.models.kimi.model import KimiLinearForCausalLM
+    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
 
     config = build_model_config_for(
         LLMTunerConfig(model=ModelConfig(model_name_or_path="kimi_linear"))
@@ -166,8 +166,8 @@ def test_kimi_wrapper_padding_matches_compacted_sequence():
 def test_kimi_decoder_rejects_cache_instead_of_silently_ignoring_it():
     import pytest
 
-    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-    from llmtuner.models.kimi.model import KimiTextDecoder
+    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.model import KimiTextDecoder
 
     config = KimiLinearConfig(
         vocab_size=16,
@@ -191,8 +191,8 @@ def test_kimi_decoder_rejects_cache_instead_of_silently_ignoring_it():
 
 
 def test_kimi_moe_layer_selection_matches_configured_dense_prefix_and_frequency():
-    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-    from llmtuner.models.kimi.model import KimiTextDecoder
+    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.model import KimiTextDecoder
 
     config = KimiLinearConfig(
         vocab_size=16,
@@ -227,9 +227,9 @@ def test_kimi_meta_materialization_initializes_custom_parameters():
         initialize_random_hf_model,
         materialize_meta_model,
     )
-    from llmtuner.models.kimi.delta_attention import KimiDeltaAttention
-    from llmtuner.models.kimi.moe import KimiMoEGate
-    from llmtuner.models.kimi.normalization import KimiRMSNorm
+    from llmtuner.models.kimi.kimi_k3.delta_attention import KimiDeltaAttention
+    from llmtuner.models.kimi.kimi_k3.moe import KimiMoEGate
+    from llmtuner.models.kimi.kimi_k3.normalization import KimiRMSNorm
 
     config = build_model_config(
         "kimi_linear",
@@ -276,9 +276,9 @@ def test_kimi_meta_materialization_initializes_custom_parameters():
 
 def test_kda_decay_parameters_remain_fp32_with_bf16_default():
     from llmtuner.models.hf.materialization import initialize_random_hf_model
-    from llmtuner.models.kimi.delta_attention import KimiDeltaAttention
-    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-    from llmtuner.models.kimi.model import KimiLinearForCausalLM
+    from llmtuner.models.kimi.kimi_k3.delta_attention import KimiDeltaAttention
+    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
 
     config = KimiLinearConfig(
         vocab_size=32,

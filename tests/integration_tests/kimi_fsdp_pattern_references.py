@@ -16,8 +16,8 @@ from torch.distributed.tensor import DTensor
 
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-from llmtuner.models.kimi.moe import KimiSparseMoE
+from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
 from llmtuner.parallel.parallelize import parallelize_hf_transformers
 from llmtuner.parallel.topology import ParallelTopology
 

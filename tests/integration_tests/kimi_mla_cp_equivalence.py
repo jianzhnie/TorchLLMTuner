@@ -13,8 +13,8 @@ require_env("spmd_types")
 import torch
 import torch.distributed as dist
 
-from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-from llmtuner.models.kimi.latent_attention import KimiLatentAttention
+from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.latent_attention import KimiLatentAttention
 from llmtuner.parallel.context_parallel.kcp import kcp_kda_forward, kcp_mla_attention
 
 
@@ -129,7 +129,7 @@ def main():
         print(
             f"rank {dist.get_rank()}: rank-local invalid mask coordinated", flush=True
         )
-        from llmtuner.models.kimi.delta_attention import KimiDeltaAttention
+        from llmtuner.models.kimi.kimi_k3.delta_attention import KimiDeltaAttention
 
         config = KimiLinearConfig(
             hidden_size=8,

@@ -5,7 +5,7 @@ from copy import deepcopy
 import pytest
 import torch
 
-from llmtuner.models.kimi.normalization import KimiGatedRMSNorm
+from llmtuner.models.kimi.kimi_k3.normalization import KimiGatedRMSNorm
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

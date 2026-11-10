@@ -7,7 +7,7 @@ import torch
 def test_torchtitan_moe_scores_before_down_projection(monkeypatch):
     from types import SimpleNamespace
 
-    from llmtuner.models.hf.expert_kernels import forward_torchtitan_moe
+    from llmtuner.models.qwen.qwen3.experts import forward_torchtitan_moe
 
     torch.manual_seed(37)
     inputs = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)

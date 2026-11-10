@@ -21,7 +21,9 @@ from llmtuner.models.hf.materialization import (
     materialize_meta_model,
 )
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.models.qwen3_5.linear_attention import validate_linear_attention_training
+from llmtuner.models.qwen.qwen3_5.linear_attention import (
+    validate_linear_attention_training,
+)
 
 
 def recipe_args(tmp_path, layers=None):

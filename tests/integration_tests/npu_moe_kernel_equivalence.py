@@ -13,7 +13,7 @@ require_env("torch_npu")
 import torch
 import torch_npu
 
-from llmtuner.models.hf.expert_kernels import forward_torchtitan_moe
+from llmtuner.models.qwen.qwen3.experts import forward_torchtitan_moe
 from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
 

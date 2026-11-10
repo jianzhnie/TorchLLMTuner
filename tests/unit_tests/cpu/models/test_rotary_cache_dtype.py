@@ -7,7 +7,7 @@ import torch
 
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
-from llmtuner.models.hf.qkv_projection import apply_configured_rotary
+from llmtuner.models.qwen.qwen3.qkv_projection import apply_configured_rotary
 
 
 @pytest.mark.parametrize("cache_dtype", ["float32", "bfloat16"])
@@ -84,7 +84,7 @@ def test_cache_precision_requires_fp32_application():
 
 
 def test_npu_norm_rejects_cpu_input():
-    from llmtuner.models.hf.normalization_setup import forward_npu_rms_norm
+    from llmtuner.models.qwen.qwen3.normalization_setup import forward_npu_rms_norm
 
     module = SimpleNamespace(weight=torch.ones(8), variance_epsilon=1e-6)
     with pytest.raises(RuntimeError, match="requires NPU"):
@@ -95,7 +95,7 @@ def test_separate_qkv_fp32_rope_preserves_projection_calls():
     from transformers import AutoConfig
     from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
 
-    from llmtuner.models.hf.qkv_projection import apply_fp32_rotary_projection
+    from llmtuner.models.qwen.qwen3.qkv_projection import apply_fp32_rotary_projection
 
     config = AutoConfig.for_model(
         "qwen3",
@@ -142,7 +142,7 @@ def test_attention_adapter_rejects_custom_forward_before_modifying_any_layer(
     from transformers import AutoConfig
     from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
 
-    from llmtuner.models.hf.qkv_projection import (
+    from llmtuner.models.qwen.qwen3.qkv_projection import (
         apply_fp32_rotary_projection,
         apply_fused_qkv_projection,
     )

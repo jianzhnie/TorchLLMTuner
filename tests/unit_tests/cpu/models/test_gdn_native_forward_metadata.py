@@ -7,8 +7,8 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.qwen3_5.gdn_numerics import _validate_forward
-from llmtuner.models.qwen3_5.linear_attention import validate_gdn_inputs
+from llmtuner.models.qwen.qwen3_5.gdn_numerics import _validate_forward
+from llmtuner.models.qwen.qwen3_5.linear_attention import validate_gdn_inputs
 
 
 class CapturedGDN(Exception):

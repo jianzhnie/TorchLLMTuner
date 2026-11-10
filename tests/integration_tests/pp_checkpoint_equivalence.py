@@ -674,7 +674,7 @@ def _assert_shared_layers(trainer: Trainer) -> None:
                     actual, getattr(expected, name), atol=0, rtol=0
                 )
     if os.environ.get("LLMTUNER_TEST_NORM_BACKEND") == "joint":
-        from llmtuner.models.hf.residual_normalization import (
+        from llmtuner.models.qwen.qwen3.residual_normalization import (
             forward_joint_residual_block,
             forward_joint_residual_norm,
         )
@@ -693,7 +693,9 @@ def _assert_shared_layers(trainer: Trainer) -> None:
             for norm in (block.input_layernorm, block.post_attention_layernorm)
         ), "requested joint norms must reach the production implementation"
     if os.environ.get("LLMTUNER_TEST_QKV_PROJECTION") == "fused":
-        from llmtuner.models.hf.qkv_projection import forward_fused_qkv_attention
+        from llmtuner.models.qwen.qwen3.qkv_projection import (
+            forward_fused_qkv_attention,
+        )
 
         attentions = [
             layer.self_attn for part in trainer.model_parts for layer in part.layers
@@ -758,7 +760,7 @@ def _assert_shared_layers(trainer: Trainer) -> None:
         assert routed, "requested Domino must reach the production implementation"
         assert all(module.error_group is not None for module in routed)
     if os.environ.get("LLMTUNER_TEST_NORM_BACKEND") == "aten":
-        from llmtuner.models.hf.normalization import forward_aten_rms_norm
+        from llmtuner.models.qwen.qwen3.normalization import forward_aten_rms_norm
 
         norms = [
             module

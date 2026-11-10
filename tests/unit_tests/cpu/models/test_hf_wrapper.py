@@ -1175,7 +1175,9 @@ def test_residual_norm_boundary_preserves_identity_state_and_hf_numerics(model_t
     from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
     from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
-    from llmtuner.models.hf.normalization_setup import stabilize_residual_norm_gradients
+    from llmtuner.models.qwen.qwen3.normalization_setup import (
+        stabilize_residual_norm_gradients,
+    )
 
     norm_type = Qwen3RMSNorm if model_type == "qwen3" else Qwen3MoeRMSNorm
     layer = nn.Module()
@@ -1213,7 +1215,7 @@ def test_residual_norm_boundary_preserves_identity_state_and_hf_numerics(model_t
 @pytest.mark.parametrize("backend", ["native", "aten"])
 def test_norm_backend_reaches_constructed_model(backend):
     from llmtuner.config.model_config import ModelConfig
-    from llmtuner.models.hf.normalization import forward_aten_rms_norm
+    from llmtuner.models.qwen.qwen3.normalization import forward_aten_rms_norm
 
     cfg = LLMTunerConfig(
         model=ModelConfig(
@@ -1238,7 +1240,9 @@ def test_norm_backend_reaches_constructed_model(backend):
 def test_aten_norm_backend_builds_with_stable_state_and_compiles(model):
     import copy
 
-    from llmtuner.models.hf.normalization_setup import stabilize_residual_norm_gradients
+    from llmtuner.models.qwen.qwen3.normalization_setup import (
+        stabilize_residual_norm_gradients,
+    )
 
     reference = copy.deepcopy(model)
     keys = set(model.state_dict())
@@ -1261,7 +1265,9 @@ def test_aten_norm_backend_rejects_unsupported_model():
 
     from torch import nn
 
-    from llmtuner.models.hf.normalization_setup import stabilize_residual_norm_gradients
+    from llmtuner.models.qwen.qwen3.normalization_setup import (
+        stabilize_residual_norm_gradients,
+    )
 
     module = nn.Module()
     module.config = SimpleNamespace(model_type="llama", norm_backend="aten")
@@ -1270,8 +1276,8 @@ def test_aten_norm_backend_rejects_unsupported_model():
 
 
 def test_norm_backend_reapplication_removes_only_owned_adaptations(model):
-    from llmtuner.models.hf.normalization import forward_aten_rms_norm
-    from llmtuner.models.hf.normalization_setup import (
+    from llmtuner.models.qwen.qwen3.normalization import forward_aten_rms_norm
+    from llmtuner.models.qwen.qwen3.normalization_setup import (
         _isolate_norm_input,
         stabilize_residual_norm_gradients,
     )

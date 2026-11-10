@@ -1,6 +1,10 @@
 """Custom architectures use one registration seam without model imports."""
 
+import subprocess
+import sys
+
 import pytest
+from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
@@ -26,6 +30,23 @@ class _CustomConfig(PretrainedConfig):
 
 class _CustomModel(PreTrainedModel):
     config_class = _CustomConfig
+
+
+def test_registered_plain_module_takes_precedence_over_hf_mapping(monkeypatch):
+    class NativeModel(nn.Module):
+        pass
+
+    monkeypatch.setattr(architecture, "_ARCHITECTURES", {})
+    register_model_architecture(
+        ModelArchitecture.from_types(
+            _CustomConfig.model_type,
+            config_type=_CustomConfig,
+            model_class_loader=lambda: NativeModel,
+        )
+    )
+    config = _CustomConfig()
+    config.architectures = ["LlamaForCausalLM"]
+    assert resolve_model_class(config) is NativeModel
 
 
 @pytest.mark.parametrize("model_type", [None, 1, True, "", "  ", "\t\n"])
@@ -254,11 +275,85 @@ def test_selected_optional_architecture_preserves_dependency_failure(
 
 def test_kimi_config_remains_available_when_model_dependencies_are_missing(monkeypatch):
     cause = ImportError("missing Kimi model dependency")
-    monkeypatch.setattr(architecture, "KIMI_MODEL_IMPORT_ERROR", cause)
+
+    def unavailable(*args):
+        raise cause
+
     registration = get_model_architecture("kimi_linear")
     config = registration.config_factory(hidden_size=32)
     assert config.hidden_size == 32
     assert isinstance(config, registration.config_type_loader())
+    monkeypatch.setattr(architecture, "import_module", unavailable)
     with pytest.raises(ImportError, match="Kimi Linear model dependencies") as failure:
         registration.model_class_loader()
     assert failure.value.__cause__ is cause
+
+
+def test_config_lookup_does_not_import_kimi_decoder_in_fresh_process():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "from llmtuner.models.hf.factory import build_model_config; "
+            "from llmtuner.models.architecture import get_model_architecture; "
+            "build_model_config('qwen3', seq_len=32, arch_overrides={}); "
+            "registration = get_model_architecture('kimi_linear'); "
+            "config = registration.config_factory(hidden_size=32); "
+            "assert isinstance(config, registration.config_type_loader()); "
+            "assert 'llmtuner.models.kimi.kimi_k3.model' not in sys.modules; "
+            "model = registration.model_class_loader(); "
+            "assert model.__name__ == 'KimiLinearForCausalLM'; "
+            "assert 'llmtuner.models.kimi.kimi_k3.model' in sys.modules; "
+            "assert registration.model_class_loader() is model",
+        ],
+        check=True,
+    )
+
+
+def test_native_registration_and_update_do_not_require_transformers():
+    source = """
+import importlib.abc
+import sys
+
+class RejectTransformers(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'transformers' or fullname.startswith('transformers.'):
+            raise ImportError('Transformers is unavailable for this native model')
+
+sys.meta_path.insert(0, RejectTransformers())
+from dataclasses import dataclass
+import torch
+from torch import nn
+from llmtuner.models.architecture import (
+    ModelArchitecture, register_model_architecture, get_model_architecture,
+)
+
+@dataclass
+class Config:
+    width: int = 3
+
+class NativeModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.projection = nn.Linear(config.width, 1)
+
+    def forward(self, inputs):
+        return self.projection(inputs)
+
+register_model_architecture(ModelArchitecture.from_types(
+    'native_test', config_type=Config, model_class_loader=lambda: NativeModel,
+))
+registration = get_model_architecture('native_test')
+assert registration.config_type_loader() is Config
+model = registration.model_class_loader()(registration.config_factory())
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+before = model.projection.weight.detach().clone()
+model(torch.ones(2, 3)).sum().backward()
+optimizer.step()
+assert not torch.equal(before, model.projection.weight)
+assert not any(name == 'transformers' or name.startswith('transformers.')
+               for name in sys.modules)
+assert 'llmtuner.models.kimi.kimi_k3.model' not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", source], check=True)

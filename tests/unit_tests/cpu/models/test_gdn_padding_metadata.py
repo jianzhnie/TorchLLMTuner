@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.hf.padding_metadata import validate_gdn_padding_metadata
+from llmtuner.models.qwen.qwen3_5.padding_metadata import validate_gdn_padding_metadata
 
 
 def check(**kwargs):

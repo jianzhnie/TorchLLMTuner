@@ -5,8 +5,8 @@ from copy import deepcopy
 import pytest
 import torch
 
-from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-from llmtuner.models.kimi.latent_attention import KimiLatentAttention
+from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.latent_attention import KimiLatentAttention
 
 
 @pytest.mark.parametrize("query_rank", [None, 4])
@@ -76,7 +76,7 @@ def test_kimi_eager_boolean_mask_and_empty_rows_match_sdpa():
 
     from torch.nn import functional as F
 
-    from llmtuner.models.kimi.latent_attention import eager_attention_forward
+    from llmtuner.models.kimi.kimi_k3.latent_attention import eager_attention_forward
 
     q, k, v = [torch.randn(1, 2, 3, 4, requires_grad=True) for _ in range(3)]
     mask = torch.tensor(

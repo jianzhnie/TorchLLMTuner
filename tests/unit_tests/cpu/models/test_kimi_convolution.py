@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from llmtuner.models.kimi.causal_convolution import KimiCausalConvolution
+from llmtuner.models.kimi.kimi_k3.causal_convolution import KimiCausalConvolution
 
 
 @pytest.mark.parametrize("boundaries", [None, [0, 1, 4, 6]])

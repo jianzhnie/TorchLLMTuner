@@ -89,6 +89,7 @@ def main() -> None:
             "examples/qwen3_5/train.py",
             "llmtuner/models/hf/model.py",
             "llmtuner/models/hf/padding_metadata.py",
+            "llmtuner/models/qwen/qwen3_5/padding_metadata.py",
             "llmtuner/models/hf/linear_attention.py",
             "llmtuner/models/qwen3_5/linear_attention.py",
             "llmtuner/models/hf/gdn_numerics.py",

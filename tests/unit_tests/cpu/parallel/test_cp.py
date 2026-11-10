@@ -489,7 +489,7 @@ def test_kcp_checks_mla_heads_before_installation(monkeypatch, q_lora_rank):
     from tests.unit_tests.cpu.parallel.test_kimi_conversion import make_model
 
     model = make_model(latent=True, shared=1)
-    from llmtuner.models.kimi.latent_attention import KimiLatentAttention
+    from llmtuner.models.kimi.kimi_k3.latent_attention import KimiLatentAttention
 
     config = model.layers[0].block_sparse_moe.config
     config.q_lora_rank = q_lora_rank
@@ -516,8 +516,8 @@ def test_kcp_checks_mla_heads_before_installation(monkeypatch, q_lora_rank):
 def test_kcp_installs_mla_callable_without_changing_parameter_names(monkeypatch):
     from types import SimpleNamespace
 
-    from llmtuner.models.kimi.kimi_linear_config import KimiLinearConfig
-    from llmtuner.models.kimi.latent_attention import KimiLatentAttention
+    from llmtuner.models.kimi.kimi_k3.kimi_linear_config import KimiLinearConfig
+    from llmtuner.models.kimi.kimi_k3.latent_attention import KimiLatentAttention
     from llmtuner.parallel.context_parallel import kcp
 
     config = KimiLinearConfig(

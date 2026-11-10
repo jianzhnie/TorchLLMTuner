@@ -15,7 +15,7 @@ from llmtuner.models.hf.expert_kernels import (
     stabilize_moe_experts,
 )
 from llmtuner.models.hf.model_setup import configure_experts_implementation
-from llmtuner.models.qwen3_5.experts import (
+from llmtuner.models.qwen.qwen3_5.experts import (
     _forward_pre_down_grouped_experts,
     _validate_pre_down_grouped_inputs,
 )

@@ -15,7 +15,7 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
-from llmtuner.models.qwen3_5 import gdn_numerics
+from llmtuner.models.qwen.qwen3_5 import gdn_numerics
 from tests.integration_tests import qwen35_decoder_layer_trace as layer
 from tests.integration_tests import qwen35_moe_module_trace as moe
 from tests.integration_tests.qwen35_moe_merge_trace import forward_reference_order
