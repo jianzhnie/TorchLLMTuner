@@ -10,6 +10,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.experimental import implicit_replication
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRotaryEmbedding
 
 from llmtuner.errors import UnsupportedCombinationError
 
@@ -42,6 +43,17 @@ def _construct_rotary(module_type, config, device):
         return module_type(config, device=device)
     with torch.device(device):
         return module_type(config)
+
+
+def _rotary_reconstruction_device(module: nn.Module, device: torch.device):
+    # Reproduce the CPU constructor frequencies used by dense Qwen3/MoE before
+    # model.to(device); the explicit target policy keeps target-device arithmetic.
+    if (
+        type(module) in (Qwen3RotaryEmbedding, Qwen3MoeRotaryEmbedding)
+        and getattr(module.config, "rotary_init_device", "constructor") == "constructor"
+    ):
+        return torch.device("cpu")
+    return device
 
 
 def initialize_random_hf_model(model: nn.Module) -> None:
@@ -245,10 +257,12 @@ def materialize_meta_model(
     for module in rope_modules:
         if not hasattr(module, "config"):
             continue
-        fresh = _construct_rotary(type(module), module.config, device)
+        fresh = _construct_rotary(
+            type(module), module.config, _rotary_reconstruction_device(module, device)
+        )
         for name, value in fresh.named_buffers(recurse=False, remove_duplicate=False):
             if name == "inv_freq" or name.endswith("_inv_freq"):
-                restored_buffers[module, name] = value
+                restored_buffers[module, name] = value.to(device)
 
     # A recognized buffer may have arbitrary registered aliases, including
     # in other modules. Reconstruct the physical tensor once and resolve all

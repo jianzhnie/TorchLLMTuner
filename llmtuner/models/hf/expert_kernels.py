@@ -83,7 +83,7 @@ def forward_torchtitan_moe(module: nn.Module, hidden_states: torch.Tensor):
                 "NPU kernels require a working torch-npu installation"
             ) from (TORCH_NPU_IMPORT_ERROR)
 
-        routed, permutation = torch_npu.npu_moe_token_permute(hidden_states, expert_ids)
+        routed, _ = torch_npu.npu_moe_token_permute(hidden_states, expert_ids)
         routed_scores, _ = torch_npu.npu_moe_token_permute(
             scores.reshape(-1, 1), expert_ids.reshape(-1, 1)
         )
@@ -94,34 +94,33 @@ def forward_torchtitan_moe(module: nn.Module, hidden_states: torch.Tensor):
         )
         routed_scores = metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
     offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
-    projected = torch._grouped_mm(
+    gate_weight, up_weight = module.experts.gate_up_proj.chunk(2, dim=1)
+    gate = torch._grouped_mm(
         routed.bfloat16(),
-        module.experts.gate_up_proj.bfloat16().transpose(-2, -1),
+        gate_weight.bfloat16().transpose(-2, -1),
         offs=offsets,
     )
-    if projected.device.type == "npu":
-        if torch_npu is None:
-            raise ImportError(
-                "NPU kernels require a working torch-npu installation"
-            ) from (TORCH_NPU_IMPORT_ERROR)
-
-        hidden = torch_npu.npu_swiglu(projected, dim=-1)
-    else:
-        gate_values, up_values = projected.chunk(2, dim=-1)
-        hidden = module.experts.act_fn(gate_values) * up_values
-    hidden = hidden * routed_scores.to(hidden.dtype)
+    up = torch._grouped_mm(
+        routed.bfloat16(), up_weight.bfloat16().transpose(-2, -1), offs=offsets
+    )
+    hidden = module.experts.act_fn(gate) * up
+    hidden = (hidden.float() * routed_scores.float()).to(hidden.dtype)
     routed_output = torch._grouped_mm(
         hidden,
         module.experts.down_proj.bfloat16().transpose(-2, -1),
         offs=offsets,
     ).type_as(routed)
     if npu_dispatch:
-        output = torch_npu.npu_moe_token_unpermute(routed_output, permutation, None)
-        output = output.view(-1, expert_ids.shape[-1], hidden_dim).sum(dim=1)
-        return output.reshape(batch_size, sequence_length, hidden_dim)
+        # Match the reference's expert-ordered deterministic accumulation.
+        # Unpermute followed by a top-k sum uses a different reduction tree.
+        token_indices = (
+            torch.argsort(expert_ids.reshape(-1), stable=True) // expert_ids.shape[-1]
+        )
+    else:
+        token_indices = metadata.token_indices_experts_sorted_N
     output = deterministic_scatter_add(
         torch.zeros_like(hidden_states),
-        metadata.token_indices_experts_sorted_N.reshape(-1, 1).expand(-1, hidden_dim),
+        token_indices.reshape(-1, 1).expand(-1, hidden_dim),
         routed_output,
     )
     return output.reshape(batch_size, sequence_length, hidden_dim)

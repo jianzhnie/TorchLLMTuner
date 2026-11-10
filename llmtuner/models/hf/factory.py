@@ -156,6 +156,19 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
         if offline
         else None
     )
+    if overrides is not None:
+        architecture = get_model_architecture(cfg.hf_model)
+        config_type = (
+            architecture.config_type_loader()
+            if architecture is not None
+            else CONFIG_MAPPING[cfg.hf_model]
+        )
+        # HF may assign extra kwargs after its canonical fields. A generic
+        # default alias must not overwrite an explicit architecture dimension
+        # (e.g. intermediate_size -> moe_intermediate_size in DeepSeek V4).
+        for alias, canonical in config_type.attribute_map.items():
+            if canonical in cfg.arch_overrides and alias not in cfg.arch_overrides:
+                overrides.pop(alias, None)
     config = build_model_config(
         cfg.hf_model, seq_len=cfg.max_seq_len, arch_overrides=overrides
     )

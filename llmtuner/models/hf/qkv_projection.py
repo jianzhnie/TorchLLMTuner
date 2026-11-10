@@ -143,8 +143,11 @@ def apply_configured_rotary(module, query, key, cosine, sine, position_ids):
             key.transpose(1, 2).float(), cosine, sine
         ).transpose(1, 2)
         return query.to(query_dtype), key.to(key_dtype)
-    query = (query.float() * cosine) + (rotate_half(query.float()) * sine)
-    key = (key.float() * cosine) + (rotate_half(key.float()) * sine)
+    # Accumulate both FP32 branches before casting their gradient back to BF16.
+    query_f = query.float()
+    key_f = key.float()
+    query = (query_f * cosine) + (rotate_half(query_f) * sine)
+    key = (key_f * cosine) + (rotate_half(key_f) * sine)
     return query.to(query_dtype), key.to(key_dtype)
 
 
