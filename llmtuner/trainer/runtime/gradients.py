@@ -8,12 +8,13 @@ from typing import TYPE_CHECKING
 import torch
 from torch.distributed.tensor import DTensor
 
-from ...accelerator.collectives import all_reduce, clip_grad_norm_
+from ...accelerator.collectives import all_reduce
 from ...accelerator.distributed import get_comm_device
 from ...models.common.moe.layer import MoE
 from ...parallel.expert_parallel.npu_baseline_experts import NpuBaselineGroupedExperts
 from ...parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 from .reductions import TrainingReductionMeshes
+from .reference_norm_layout import clip_grad_norm_
 
 if TYPE_CHECKING:
     from ..trainer import Trainer
@@ -117,9 +118,26 @@ def allreduce_replicated_tp_grads(trainer: Trainer) -> None:
             all_reduce(grad, group=group)
 
 
+def check_step_condition(condition: torch.Tensor, message: str) -> None:
+    """Enforce eager step guards without unsupported NPU assertion fallback.
+
+    torch-npu 2.12 has no native aten::_assert_async.msg implementation. Read
+    the scalar explicitly at the step boundary; do not disable the check or
+    register a global ATen override. Other backends retain their async check.
+    This helper belongs outside compiled model graphs.
+    """
+    if condition.device.type == "npu":
+        if condition.numel() != 1:
+            raise RuntimeError("Step guard requires exactly one tensor value")
+        if not condition.item():
+            raise RuntimeError(message)
+        return
+    torch._assert_async(condition, message)
+
+
 def check_finite(trainer: Trainer, step_is_finite: torch.Tensor) -> None:
     """Stop before updating parameters when the global step is non-finite."""
-    torch._assert_async(
+    check_step_condition(
         step_is_finite,
         f"Loss or gradient norm is not finite at step {trainer.step}. "
         "Stopping before the optimizer update, since every later number "
@@ -130,6 +148,12 @@ def check_finite(trainer: Trainer, step_is_finite: torch.Tensor) -> None:
 def grad_norm_options(trainer: Trainer) -> dict:
     if getattr(trainer.cfg, "grad_norm_precision", "float32") == "float32":
         return {}
+    fsdp = getattr(getattr(trainer.cfg, "parallel", None), "fsdp_config", None)
+    if getattr(fsdp, "fsdp_expert_reduce_layout", "storage") == "split":
+        return {
+            "norm_precision": "parameter",
+            "reference_model_parts": trainer.model_parts,
+        }
     packed_parameters = {}
     for part in trainer.model_parts:
         for module in part.modules():

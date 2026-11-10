@@ -479,9 +479,9 @@ class Trainer:
         # A fully masked accumulation window has no average loss. Assert the
         # DP-reduced count on every rank before entering forward/backward, so
         # no stage updates on an undefined (zero-divided) gradient. The device
-        # assertion avoids a host synchronization where the backend implements
-        # it asynchronously; torch-npu 2.12 reports a CPU fallback here.
-        torch._assert_async(
+        # assertion stays asynchronous where supported; NPU uses an explicit
+        # scalar read because torch-npu 2.12 lacks the native assertion kernel.
+        gradients.check_step_condition(
             global_valid_tokens > 0,
             "Training step has zero valid tokens; cannot normalize the loss.",
         )

@@ -519,3 +519,8 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
         reset_activation_swap_metrics()
     # The trainer synchronizes PP loss metrics to every stage before logging.
     logging_utils.set_log_ranks(cfg.metrics.log_ranks)
+    if trainer.device.type == "npu":
+        logging_utils.get_logger(__name__).info(
+            "NPU step guards use explicit synchronous scalar reads; "
+            "loss/gradient and valid-token checks remain enabled"
+        )

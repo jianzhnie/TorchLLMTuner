@@ -91,7 +91,23 @@ class FSDPConfig:
     fsdp_symm_mem_scope: FSDPSymmMemScope = "all"
     """Apply symmetric-memory communication to all or dense FSDP modules."""
 
+    fsdp_expert_reduce_layout: Literal["storage", "split"] = "storage"
+    """Expert gradient reduction layout; split is an explicit opt-in experiment."""
+
+    fsdp_expert_reduce_workspace_limit_bytes: int = 0
+    """Required temporary-byte budget when split expert reduction is enabled."""
+
     def __post_init__(self) -> None:
+        if self.fsdp_expert_reduce_layout not in ("storage", "split"):
+            raise ConfigError(
+                "parallel.fsdp_expert_reduce_layout must be storage or split"
+            )
+        if self.fsdp_expert_reduce_layout == "split":
+            value = self.fsdp_expert_reduce_workspace_limit_bytes
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ConfigError(
+                    "parallel split expert workspace budget must be a positive integer"
+                )
         if self.fsdp_reshard_after_forward not in {"default", "always", "never"}:
             raise ConfigError(
                 "parallel.fsdp_reshard_after_forward must be one of "

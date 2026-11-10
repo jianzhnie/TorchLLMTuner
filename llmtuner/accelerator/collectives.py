@@ -183,40 +183,56 @@ def _parameter_precision_norm(
     norm_type: float,
     packed_gradients: dict[int, tuple[torch.Tensor, ...]] | None = None,
 ) -> torch.Tensor:
-    """Match NPU baseline local norm rounding before FP32 mesh power reduction."""
+    """Preserve native norm and coefficient rounding, including DTensor reduction."""
     groups = {}
     for grad in grads:
-        key = (
-            (grad.device_mesh, tuple(grad.placements))
-            if isinstance(grad, DTensor)
-            else (None, ())
-        )
+        packed = (packed_gradients or {}).get(id(grad))
+        if packed is not None:
+            if not packed:
+                continue
+            grad = torch.cat(packed, dim=1)
+        # Match upstream mesh equality: equivalent mesh objects must share the
+        # same norm aggregation, avoiding an extra low-precision rounding step.
+        key = grad.device_mesh if isinstance(grad, DTensor) else None
         groups.setdefault(key, []).append(grad)
-    total = None
-    for (mesh, placements), group in groups.items():
-        device = (
-            get_comm_device(mesh.get_group(0)) if mesh is not None else group[0].device
+    norms = []
+    for group in groups.values():
+        offloaded = any(
+            isinstance(grad, DTensor)
+            and grad.device.type == "cpu"
+            and grad.device_mesh.device_type != "cpu"
+            for grad in group
         )
-        power = torch.zeros((), device=device, dtype=torch.float32)
-        for grad in group:
-            packed = (packed_gradients or {}).get(id(grad))
-            if packed is not None:
-                if not packed:
-                    continue
-                grad = torch.cat(packed, dim=1)
-            local = grad.to_local() if isinstance(grad, DTensor) else grad
-            # Cast AFTER the native norm, preserving its low-precision rounding.
-            norm = torch.linalg.vector_norm(local, norm_type).float()
-            power.add_(norm.to(device).pow(norm_type))
-        for axis, placement in enumerate(placements):
-            if isinstance(placement, Shard):
-                all_reduce(power, group=mesh.get_group(axis))
-            elif not isinstance(placement, Replicate):
-                raise ValueError(
-                    "parameter norm precision requires Shard/Replicate gradients"
-                )
-        total = power if total is None else total + power.to(total.device)
-    return torch.tensor(0.0) if total is None else total.pow(1.0 / norm_type)
+        if offloaded:
+            device = get_comm_device(group[0].device_mesh.get_group(0))
+            norm = torch.nn.utils.get_total_norm(
+                [
+                    _offloaded_gradient_norm(grad, norm_type).to(device)
+                    for grad in group
+                ],
+                norm_type,
+                foreach=False,
+            )
+        else:
+            # Let DTensor retain its norm-partial placement until the complete
+            # norm is assembled, just as get_total_norm/full_tensor upstream.
+            # FP32 scalar power accumulation changes BF16 clipping coefficients.
+            norm = torch.nn.utils.get_total_norm(group, norm_type, foreach=False)
+            if isinstance(norm, DTensor):
+                norm = norm.full_tensor()
+        norms.append(norm)
+    if len(norms) == 1:
+        return norms[0]
+    if norms:
+        device = next(
+            (norm.device for norm in norms if norm.device.type != "cpu"),
+            norms[0].device,
+        )
+        norms = [norm.to(device) for norm in norms]
+        # Upstream combines mesh norms with scalar powers, retaining their
+        # native dtype rounding rather than applying another vector norm.
+        return sum(norm**norm_type for norm in norms) ** (1.0 / norm_type)
+    return torch.nn.utils.get_total_norm(norms, norm_type, foreach=False)
 
 
 def build_packed_gradient_groups(
@@ -310,8 +326,8 @@ def clip_grad_norm_(
         tp_sharded_parameters: parameters physically sharded across TP ranks.
             Required exactly when ``tp_mesh`` is provided.
         norm_precision: ``float32`` promotes low-precision per-gradient norms;
-            ``parameter`` preserves their native dtype rounding before FP32
-            power reduction, matching the NPU baseline for finite positive p.
+            ``parameter`` preserves native dtype through norm aggregation and
+            clipping coefficients, matching the NPU baseline for finite positive p.
         packed_parameters: gate/up parameter pairs treated as one axis-1 packed
             tensor for ``parameter`` norm rounding. Scaling still uses the
             original parameters; the default FP32 norm is unaffected.

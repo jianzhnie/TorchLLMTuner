@@ -11,7 +11,24 @@ from typing import Any
 
 import torch
 
-__all__ = ["aligned_npu_grouped_mm"]
+__all__ = ["aligned_npu_grouped_mm", "npu_grouped_mm_layout_supported"]
+
+
+def npu_grouped_mm_layout_supported(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Metadata contract for the BF16 grouped kernel and its backward layouts.
+
+    Pointer alignment is handled separately inside aligned_npu_grouped_mm.
+    The output width becomes a row stride in backward, so checking operands
+    alone is insufficient. This predicate performs no device access.
+    """
+    return (
+        left.dtype == right.dtype == torch.bfloat16
+        and right.shape[-1] % 8 == 0
+        and all(
+            stride > 0 and (stride == 1 or stride % 8 == 0)
+            for stride in (*left.stride(), *right.stride())
+        )
+    )
 
 
 def _validate_metadata(
