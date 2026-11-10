@@ -17,16 +17,15 @@ Main modules:
   and the decoder forward the trainer calls.
   This is the consumer of everything else here, and its name follows upstream's
   ``experiments/transformers_modeling_backend/model.py``.
-* ``flops.py`` -- training FLOPs per token, the model-work term in MFU's
-  numerator. Pure
-  arithmetic over an HF config, kept apart from the building; the trainer's
-  runtime assembly passes the already resolved text config directly to
-  ``flops_per_token``.
 * ``state_dict_adapter.py`` -- ``HFTransformerStateDictAdapter``: the model's
   state-dict FQNs to standard HF safetensors keys.
 
 Like the other indexes in this package, this one re-exports nothing: importing
 one node must not drag in its siblings (``model`` pulls in the whole Hugging
-Face modeling stack, ``factory``/``flops`` need only the config classes), so
+Face modeling stack, ``factory`` resolves configuration and model classes), so
 import the leaf you want.
+
+Qwen3.5 GDN numerical and recurrence policies live in ``models.qwen3_5``;
+official Kimi MoE training adaptation lives in ``models.kimi``. Their old HF
+module paths provide compatibility imports only.
 """

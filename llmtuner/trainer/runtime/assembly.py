@@ -59,8 +59,6 @@ from ...models.hf.factory import (
     build_model_config_for,
     unwrap_text_config,
 )
-from ...models.hf.gdn_numerics import validate_gdn_numerical_training
-from ...models.hf.linear_attention import validate_linear_attention_training
 from ...models.hf.materialization import (
     initialize_random_hf_model,
     initialize_rotary_on_device,
@@ -68,6 +66,8 @@ from ...models.hf.materialization import (
 )
 from ...models.hf.model import HFTransformerModel
 from ...models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from ...models.qwen3_5.gdn_numerics import validate_gdn_numerical_training
+from ...models.qwen3_5.linear_attention import validate_linear_attention_training
 from ...parallel import compatibility
 from ...parallel.parallelize import parallelize_hf_transformers
 from ...parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup

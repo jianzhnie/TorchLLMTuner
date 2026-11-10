@@ -2,8 +2,9 @@
 
 The helpers build the HF ``PretrainedConfig`` and resolve its ``ForCausalLM``
 class. Meta storage allocation lives in ``materialization.py``; FLOPs estimation
-lives in ``flops.py``. The model body and five-part contract live in ``model.py``,
-which imports these helpers; nothing here imports the model body.
+lives in ``llmtuner.utils.flops``. The model body and five-part contract
+live in ``model.py``, which imports these helpers; nothing here imports the model
+body.
 """
 
 from __future__ import annotations

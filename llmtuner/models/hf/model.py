@@ -1,31 +1,16 @@
-"""A thin wrapper that plugs a HuggingFace model into a training loop.
+"""Adapt an HF decoder to the trainer's model and input contracts.
 
-This is the whole model layer: build a HF ``ForCausalLM`` from its config, give
-the training loop a uniform ``(tokens, positions) -> logits`` entry point, and
-expose the decoder's parts under the names the rest of the framework expects
-(``tok_embeddings`` / ``layers`` / ``norm`` / ``lm_head`` / ``rotary_emb``).
+Construction selects attention and experts backends, then applies explicit
+GDN, normalization, router, expert and QKV/RoPE policies before the optional
+lm-head cast. These policies preserve their own model and dtype constraints;
+this wrapper coordinates them rather than defining a second model architecture.
+HF supplies weight initialization; meta materialization and runtime buffer
+reconstruction are handled separately in ``materialization.py``.
 
-Deliberately thin. An earlier version of this file (torchtitan's
-``experiments/transformers_modeling_backend/model.py``) carried a 230-line
-monkey-patch of ``PreTrainedModel._init_weights`` that re-derived every weight
-with torchtitan's depth-scaled scheme, plus a ``PretrainedConfig`` subclass that
-synced torchtitan and HF attribute names. Both existed to make checkpoints
-bit-compatible with torchtitan's native models. llmtuner trains HF models with
-HF's own initialization, so neither is needed -- ``from_config`` produces a
-fully initialized model and that is the one we train.
-
-What replaces them is per-forward work the HF model does not do on its own:
-
-* attention is routed through flex attention so packed-document masking can be
-  expressed (see ``get_attention_masks``),
-* RoPE is driven by explicit ``positions`` rather than an ``arange``, because
-  packed samples reset their positions at each document boundary.
-
-Forward shape: this wrapper is a *decoder wrapper*, not a CausalLM. It runs the
-decoder and applies ``lm_head`` itself, so ``self.model.model`` is the bare text
-stack. Callers pass flat ``(T,)`` token and position tensors; the batch dim is
-added and removed internally. ``forward(..., skip_lm_head=True)`` returns the
-hidden states instead, for the trainer's chunked-loss path.
+The wrapper exposes tok_embeddings, layers, norm, lm_head and rotary_emb for
+parallel assembly. Forward runs the text decoder and applies lm_head itself;
+``skip_lm_head=True`` returns hidden states for chunked loss. Input preparation
+and attention masks preserve explicit positions and packed-document boundaries.
 """
 
 from __future__ import annotations
@@ -48,6 +33,18 @@ from ...datasets.contracts import Batch, TrainerBatch
 from ...parallel.topology import ParallelTopology
 from ...utils.logging import get_logger
 from ..common.moe.layer import collect_moe_layers
+from ..qwen3_5.gdn_numerics import (
+    configure_gdn_numerics,
+    validate_gdn_numerical_batch,
+    validate_gdn_numerical_config,
+    validate_gdn_numerical_sequence,
+)
+from ..qwen3_5.linear_attention import (
+    apply_linear_attention_backend,
+    validate_linear_attention_batch,
+    validate_linear_attention_config,
+    validate_linear_attention_sequence,
+)
 from .attention_backend import (
     ATTENTION_BACKEND,
     CP_SDPA_BACKEND,
@@ -64,19 +61,7 @@ from .attention_masks import (
 )
 from .expert_kernels import stabilize_moe_experts, stabilize_moe_router
 from .factory import resolve_model_class, unwrap_text_config
-from .gdn_numerics import (
-    configure_gdn_numerics,
-    validate_gdn_numerical_batch,
-    validate_gdn_numerical_config,
-    validate_gdn_numerical_sequence,
-)
 from .input_preparation import preprocess_inputs
-from .linear_attention import (
-    apply_linear_attention_backend,
-    validate_linear_attention_batch,
-    validate_linear_attention_config,
-    validate_linear_attention_sequence,
-)
 from .materialization import validate_rotary_initialization
 from .model_setup import (
     apply_cast_lm_head,
@@ -177,6 +162,30 @@ class HFTransformerModel(nn.Module):
                 component="final norm",
             ),
         )
+
+        if get_rank() == 0:
+            logger.info(
+                "HF adaptation options (construction only): model=%s, "
+                "attention=%s -> %s, experts=%s, norm=%s, router_dtype=%s, "
+                "linear_attention=%s, gdn_policy=%s, qkv=%s, "
+                "rotary_dtype=%s, rotary_cache=%s, lm_head_dtype=%s. "
+                "Auto attention uses Flex on CUDA and SDPA otherwise; "
+                "DeepSeek V4 defaults to eager. Parallel assembly may change "
+                "dispatch; None leaves an option unspecified, not disabled. "
+                "Kernel execution requires runtime verification.",
+                config.model_type,
+                attention_backend,
+                self.model.config._attn_implementation,
+                getattr(config, "experts_implementation", "native"),
+                getattr(config, "norm_backend", "native"),
+                getattr(config, "router_compute_dtype", None),
+                getattr(config, "linear_attention_backend", "native"),
+                getattr(config, "gdn_numerical_policy", "native"),
+                getattr(config, "qkv_projection", "separate"),
+                getattr(config, "rotary_compute_dtype", None),
+                getattr(config, "rotary_cache_dtype", None),
+                getattr(config, "compute_dtype", None),
+            )
 
     # -- parts, under the names the rest of the framework uses ------------------
 
