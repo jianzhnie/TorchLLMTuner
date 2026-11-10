@@ -132,7 +132,7 @@ def apply_cp(
         logger.info("Applied KCP to %d KDA modules", patched)
         return model
 
-    if getattr(model_config, "model_type", None) == "deepseek_v4":
+    if getattr(model, "context_parallel_backend", "standard") == "compressor":
         if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
             raise ValueError("DeepSeek V4 HCA CP requires a cp mesh")
         cp_mesh = mesh["cp"]

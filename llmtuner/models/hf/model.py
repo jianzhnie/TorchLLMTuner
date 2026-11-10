@@ -238,6 +238,15 @@ class HFTransformerModel(nn.Module):
         self._decoder.rotary_emb = value
 
     @property
+    def context_parallel_backend(self) -> str:
+        """The CP implementation required by this decoder's attention contract."""
+        if callable(getattr(self._decoder, "context_parallel_attention_forward", None)):
+            return "compressor"
+        if getattr(self.model.config, "model_type", None) == "deepseek_v4":
+            return "compressor"
+        return "standard"
+
+    @property
     def uses_flex_attention(self) -> bool:
         """Whether the decoder routes attention through the flex kernel.
 

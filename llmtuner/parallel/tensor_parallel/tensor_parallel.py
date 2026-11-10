@@ -55,6 +55,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 
 from ...accelerator.capabilities import has
 from ...models.common.moe.experts import GroupedExperts
+from ...utils.logging import get_logger
 from .. import compatibility
 from ..attention_heads import require_heads_divisible_by
 from ..expert_parallel.hf_inspection import is_hf_moe_block, resolve_shared_expert
@@ -70,6 +71,8 @@ from .linear_ops import (
     reduce_scatter_along,
     resolve_autograd_collectives,
 )
+
+logger = get_logger(__name__)
 
 __all__ = [
     "ColumnParallelLinear",
@@ -298,6 +301,11 @@ def looks_like_attention(module: nn.Module) -> bool:
     ``Qwen3Attention``, ...).
     """
     return all(hasattr(module, name) for name in ("q_proj", "k_proj", "v_proj"))
+
+
+def requires_full_token_history(module: nn.Module) -> bool:
+    """Whether a recurrent attention contract needs the complete token history."""
+    return all(hasattr(module, name) for name in ("conv1d", "A_log", "dt_bias"))
 
 
 class ReplicatedAttentionSequenceBoundary:
@@ -1123,10 +1131,7 @@ def apply_tp(
     for path, module in model.named_modules():
         if (
             path.rsplit(".", 1)[-1] == "linear_attn"
-            and any(
-                cls.__name__ in {"Qwen3_5GatedDeltaNet", "Qwen3_5MoeGatedDeltaNet"}
-                for cls in type(module).__mro__
-            )
+            and requires_full_token_history(module)
             and any(target.startswith(f"{path}.") for target, _, _ in targets)
         ):
             raise ValueError("TP linear_attn requires replicated GDN projections")
@@ -1254,4 +1259,12 @@ def apply_tp(
                     group,
                 )
 
+    logger.info(
+        "Applied TP degree %d: dense=%d, MoE=%d, vocab=%d, collective=%s",
+        tp_size,
+        len(targets),
+        len(moe_blocks),
+        len(vocab_targets),
+        "symm_mem" if use_symm_mem else "functional",
+    )
     return model

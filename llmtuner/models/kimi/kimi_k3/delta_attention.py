@@ -128,6 +128,8 @@ def recurrent_kda(q, k, v, g, beta, A_log, dt_bias, lower_bound=None):
 
 
 class KimiDeltaAttention(nn.Module):
+    fsdp_separate_parameter_names = ("A_log", "dt_bias")
+
     def __init__(self, config: KimiLinearConfig, layer_idx: int) -> None:
         super().__init__()
         self.config, self.layer_idx = config, layer_idx

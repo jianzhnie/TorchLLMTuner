@@ -25,7 +25,6 @@ from ...accelerator.capabilities import has as capability
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_backend, is_distributed
 from ...errors import UnsupportedCombinationError
-from ...models.kimi.kimi_k3.delta_attention import KimiDeltaAttention
 from ...utils.logging import get_logger
 from ..compatibility import chunked_loss_fsdp
 from ..topology import ParallelTopology
@@ -277,35 +276,54 @@ def apply_fsdp_to_decoder(
         reshard_after_forward_policy, pp_enabled
     )
 
-    # KDA owns FP32 decay parameters alongside BF16 projection children. FSDP
-    # requires uniform storage dtype per group, so wrap children first and the
-    # two direct parameters last. This preserves FQNs and gradient reduction.
-    for attention in list(model.modules()):
-        if not isinstance(attention, KimiDeltaAttention):
+    # Models declare parameters that need a separate storage-dtype group. Wrap
+    # their children first and those direct parameters last, preserving FQNs.
+    separate_units = []
+    for attention in model.modules():
+        names = getattr(attention, "fsdp_separate_parameter_names", ())
+        if not names:
             continue
+        direct = dict(attention.named_parameters(recurse=False))
+        if not isinstance(names, tuple | list) or any(
+            not isinstance(name, str) or name not in direct for name in names
+        ):
+            raise ValueError(
+                "fsdp_separate_parameter_names must name direct registered Parameters"
+            )
+        separate_dtypes = {direct[name].dtype for name in names}
+        if len(separate_dtypes) != 1:
+            raise ValueError("Separate FSDP parameters must share one storage dtype")
         if {p.dtype for p in attention.parameters()} == {param_dtype}:
             continue
         if fsdp_implementation != "native":
-            raise ValueError("Mixed-dtype Kimi KDA requires native FSDP")
-        children = [child for child in attention.children() if list(child.parameters())]
-        if children:
-            shard_fn(
-                children,
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward,
+            raise ValueError(
+                "Model-declared separate dtype parameters require native FSDP"
             )
-        decay_config = dict(fsdp_config)
-        decay_config["mp_policy"] = MixedPrecisionPolicy(
-            param_dtype=torch.float32,
-            reduce_dtype=reduce_dtype,
-            cast_forward_inputs=False,
-        )
-        shard_fn(
-            attention,
-            **decay_config,
-            reshard_after_forward=reshard_after_forward,
-        )
-
+        if set(direct) - set(names):
+            raise ValueError(
+                "Mixed-dtype FSDP module must declare all direct parameters "
+                "in fsdp_separate_parameter_names"
+            )
+        separate_units.append((attention, next(iter(separate_dtypes))))
+    if separate_units:
+        parameter_owners_by_module: dict[nn.Parameter, set[nn.Module]] = {}
+        for module in model.modules():
+            for parameter in module.parameters(recurse=False):
+                parameter_owners_by_module.setdefault(parameter, set()).add(module)
+        for module, _ in separate_units:
+            subtree = set(module.modules())
+            if any(
+                parameter_owners_by_module[parameter] - subtree
+                for parameter in module.parameters()
+            ):
+                raise ValueError(
+                    "Separate-dtype FSDP subtrees cannot share parameters with "
+                    "external modules; declare a common ownership boundary"
+                )
+            if any(
+                other is not module and other in subtree for other, _ in separate_units
+            ):
+                raise ValueError("Separate-dtype FSDP declarations must not be nested")
     # Resolve ownership before any sharding replaces Parameters. Include
     # the decoder boundary units so a layer/norm/head alias is not split into
     # independent sharded tensors. Existing tied embedding/head units stay intact.
@@ -416,6 +434,28 @@ def apply_fsdp_to_decoder(
     module_units = {
         module: index for index, (modules, _) in enumerate(units) for module in modules
     }
+    # Validate all declarations before sharding any child. Storage precision is
+    # owned by the model contract, not inferred from a specific model family.
+    for attention, separate_dtype in separate_units:
+        children = [child for child in attention.children() if list(child.parameters())]
+        if children:
+            shard_fn(
+                children,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+        decay_config = dict(fsdp_config)
+        decay_config["mp_policy"] = MixedPrecisionPolicy(
+            param_dtype=separate_dtype,
+            reduce_dtype=reduce_dtype,
+            cast_forward_inputs=False,
+        )
+        shard_fn(
+            attention,
+            **decay_config,
+            reshard_after_forward=reshard_after_forward,
+        )
+
     sharded_units: set[int] = set()
 
     def shard_unit(index: int) -> None:
@@ -604,36 +644,41 @@ def apply_fsdp(
     # Preserve the dtype selected at model construction. Hard-coding float32
     # here silently makes FSDP all-gather BF16 parameters as FP32, doubling the
     # transient parameter and operator footprint in mixed-precision runs.
-    # FSDP requires uniform storage dtype per group. KDA's FP32 decay
-    # parameters get a separate nested group; all remaining parameters must
-    # share the dtype used by the decoder and boundary groups.
-    kda_parameters = {
-        parameter
-        for module in model.modules()
-        if isinstance(module, KimiDeltaAttention)
-        for parameter in (module.A_log, module.dt_bias)
-    }
-    param_dtypes = {p.dtype for p in model.parameters() if p not in kda_parameters}
-    if (
-        any(p.dtype not in param_dtypes for p in kda_parameters)
-        and cfg.fsdp_config.fsdp_apply_modules
+    # Model-declared separate parameters get a nested group; all remaining
+    # parameters must share the decoder and boundary storage dtype.
+    with synchronize_local_errors(
+        "FSDP parameter dtype validation",
+        group=parallel_dims.get_mesh("loss").get_group() if is_distributed() else None,
     ):
-        raise ValueError(
-            "Kimi KDA FP32 decay parameters require decoder FSDP wrapping; "
-            "fsdp_apply_modules patterns are not supported"
-        )
-    if len(param_dtypes) > 1:
-        raise ValueError(
-            "FSDP requires a single parameter dtype, got "
-            f"{sorted(map(str, param_dtypes))}. "
-            "A model with deliberately fp32 parameters needs per-parameter "
-            "dtype overrides, which llmtuner does not wire."
-        )
-    try:
-        param_dtype = next(iter(param_dtypes))
-    except StopIteration:
-        param_dtype = torch.get_default_dtype()
-    reduce_dtype = getattr(torch, cfg.fsdp_config.fsdp_reduce_dtype)
+        separate_parameters = {
+            parameter
+            for module in model.modules()
+            for name in getattr(module, "fsdp_separate_parameter_names", ())
+            for parameter in (getattr(module, name),)
+        }
+        param_dtypes = {
+            p.dtype for p in model.parameters() if p not in separate_parameters
+        }
+        if (
+            any(p.dtype not in param_dtypes for p in separate_parameters)
+            and cfg.fsdp_config.fsdp_apply_modules
+        ):
+            raise ValueError(
+                "Model-declared separate dtype parameters require decoder FSDP "
+                "wrapping; fsdp_apply_modules patterns are not supported"
+            )
+        if len(param_dtypes) > 1:
+            raise ValueError(
+                "FSDP requires a single parameter dtype, got "
+                f"{sorted(map(str, param_dtypes))}. "
+                "A model with deliberately fp32 parameters needs per-parameter "
+                "dtype overrides, which llmtuner does not wire."
+            )
+        try:
+            param_dtype = next(iter(param_dtypes))
+        except StopIteration:
+            param_dtype = torch.get_default_dtype()
+        reduce_dtype = getattr(torch, cfg.fsdp_config.fsdp_reduce_dtype)
 
     if cfg.fsdp_config.fsdp_apply_modules:
         apply_fsdp_by_pattern(
@@ -643,6 +688,7 @@ def apply_fsdp(
             param_dtype=param_dtype,
             reduce_dtype=reduce_dtype,
             edp_mesh=edp_mesh,
+            error_group=parallel_dims.get_mesh("loss").get_group(),
         )
         if is_distributed() and get_backend() != "nccl":
             force_sum_grad_reduction(model)

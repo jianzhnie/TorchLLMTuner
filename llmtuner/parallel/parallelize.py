@@ -47,6 +47,7 @@ from .pipeline_parallel.pipeline_parallel import (
     PipelineParallelSetup,
     apply_pp,
     build_pipeline_schedule,
+    validate_microbatches,
 )
 from .stages import STAGE_ORDER
 from .tensor_parallel.tensor_parallel import apply_tp, resolve_tp_overrides
@@ -199,13 +200,17 @@ def parallelize_hf_transformers(
     tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
 
     if parallel_dims is not None and parallel_dims.pp_enabled:
-        if global_batch_size is None:
-            raise ValueError(
-                "pp > 1 needs global_batch_size for microbatch validation; "
-                "the trainer passes cfg.training.global_batch_size."
-            )
-        if cfg.tp_size > 1:
-            resolve_tp_overrides(model, cfg=cfg)
+        # All PP stages must stop before splitting if any rank's global plan
+        # is invalid. This body only inspects local metadata.
+        with synchronize_local_errors("Pipeline global plan validation"):
+            if global_batch_size is None:
+                raise ValueError(
+                    "pp > 1 needs global_batch_size for microbatch validation; "
+                    "the trainer passes cfg.training.global_batch_size."
+                )
+            if cfg.tp_size > 1:
+                resolve_tp_overrides(model, cfg=cfg)
+            validate_microbatches(parallel_dims, cfg, global_batch_size)
         # Split first; use this stage's dense mesh for all local transforms.
         stages, model_parts, has_first_stage, has_last_stage = apply_pp(
             model,
@@ -215,11 +220,14 @@ def parallelize_hf_transformers(
             global_batch_size=global_batch_size,
         )
         dense_mesh = parallel_dims.spmd_dense_mesh()
-        fsdp_configs = (
-            resolve_pipeline_fsdp_configs(model, model_parts, cfg)
-            if cfg.fsdp_config.fsdp_apply_modules
-            else [cfg] * len(model_parts)
-        )
+        # Part ownership is rank-local, but failure must stop all stages
+        # before TP/EP/FSDP begin communicating on the resulting parts.
+        with synchronize_local_errors("Pipeline FSDP plan binding"):
+            fsdp_configs = (
+                resolve_pipeline_fsdp_configs(model, model_parts, cfg)
+                if cfg.fsdp_config.fsdp_apply_modules
+                else [cfg] * len(model_parts)
+            )
         for i, part in enumerate(model_parts):
             model_parts[i] = apply_stages(
                 part, dense_mesh=dense_mesh, part_cfg=fsdp_configs[i]
