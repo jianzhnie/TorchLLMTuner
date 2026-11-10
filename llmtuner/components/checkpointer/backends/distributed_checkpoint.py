@@ -46,7 +46,11 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint._storage_utils import _storage_setup
-from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
+from torch.distributed.checkpoint.staging import (
+    BlockingAsyncStager,
+    DefaultStager,
+    StagingOptions,
+)
 from torch.distributed.checkpoint.state_dict_saver import (
     AsyncCheckpointerType,
     AsyncSaveResponse,
@@ -81,6 +85,11 @@ from ..storage.checkpoint_writer import GenerationFileSystemWriter
 from ..storage.load_planner import CheckpointLoadPlanner
 from ..storage.staging import CoordinatedStager
 from ..storage.storage import FilesystemCheckpointStorage
+from ..storage.virtual_optimizer_planner import (
+    VirtualOptimizerLoadPlanner,
+    VirtualOptimizerSavePlanner,
+    VirtualOptimizerStager,
+)
 
 logger = get_logger(__name__)
 
@@ -451,10 +460,12 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     GarbageCollection.collect("GC collection invoked by checkpointer.")
             return None
 
-        virtual_optimizer_save = (
+        virtual_optimizer = (
             getattr(self.states[OPTIMIZER], "state_residency", "device")
             == "npu_virtual"
-            and async_mode == DistributedCheckpointAsyncMode.DISABLED
+        )
+        virtual_optimizer_save = (
+            virtual_optimizer and async_mode == DistributedCheckpointAsyncMode.DISABLED
         )
         if virtual_optimizer_save:
             # Device-to-host copies are local. Coordinate allocation/copy errors
@@ -473,14 +484,25 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             storage_writer = GenerationFileSystemWriter(checkpoint_id, **writer_options)
 
         if async_mode == DistributedCheckpointAsyncMode.ASYNC:
+            staging_options = (
+                {"async_stager": VirtualOptimizerStager(BlockingAsyncStager(), self.pg)}
+                if virtual_optimizer
+                else {}
+            )
             ret = dcp.async_save(
                 state_dict,
                 storage_writer=storage_writer,
                 checkpoint_id=checkpoint_id,
                 process_group=self.pg,
+                **staging_options,
             )
         elif async_mode == DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM:
-            stager = CoordinatedStager(self.stager, self.staging_pg)
+            underlying_stager = (
+                VirtualOptimizerStager(self.stager, self.staging_pg)
+                if virtual_optimizer
+                else self.stager
+            )
+            stager = CoordinatedStager(underlying_stager, self.staging_pg)
             self._stager_used = True
             # The process executor reads rank information from the default PG.
             # Standalone trainers have no PG, so keep their upload asynchronous
@@ -508,6 +530,9 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 storage_writer=storage_writer,
                 checkpoint_id=checkpoint_id,
                 process_group=self.pg,
+                planner=(
+                    VirtualOptimizerSavePlanner() if virtual_optimizer_save else None
+                ),
             )
 
         if enable_garbage_collection:
@@ -620,7 +645,12 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 for category in (RNG_STATE, LR_SCHEDULER, DATALOADER, TRAIN_STATE):
                     if category in states:
                         state_dict[category] = states[category].state_dict()
-            planner = CheckpointLoadPlanner()
+            planner = (
+                VirtualOptimizerLoadPlanner()
+                if getattr(states.get(OPTIMIZER), "state_residency", "device")
+                == "npu_virtual"
+                else CheckpointLoadPlanner()
+            )
             dcp.load(
                 state_dict,
                 checkpoint_id=checkpoint_id,

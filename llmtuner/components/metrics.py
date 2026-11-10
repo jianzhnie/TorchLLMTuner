@@ -295,7 +295,8 @@ class MetricsProcessor:
             caller sets this once the model exists. ``0`` -- the value
             :func:`~llmtuner.utils.flops.flops_per_token` returns for a
             config whose geometry it cannot read -- suppresses MFU rather than
-            reporting ``0.00%``; ``tflops`` is then ``0.0`` of its own accord.
+            reporting ``0.00%``. Console TFLOPS are also ``N/A``; numeric sinks
+            retain the legacy ``0.0`` value.
         config_dict: the full job config, handed to wandb. Only wandb reads it.
         tag: optional override for ``config.tag``, applied to recorded keys.
             ``None`` uses the config value; the console line is not tagged.
@@ -558,6 +559,8 @@ class MetricsProcessor:
             )
             if "steady/mfu_percent" in observed:
                 details.append(f"steady_mfu: {observed['steady/mfu_percent']:.2f}%")
+            else:
+                details.append("steady_mfu: N/A")
         details.extend(
             f"{key}={value:.4g}"
             for key, value in observed.items()
@@ -661,6 +664,11 @@ class MetricsProcessor:
         color = self.color
         mfu = observed.get("train/mfu_percent", metrics.get("mfu(%)"))
         mfu_str = "N/A" if mfu is None else f"{mfu:.2f}%"
+        tflops_str = (
+            "N/A"
+            if self.num_flops_per_token == 0
+            else f"{observed.get('train/tflops_per_device', derived.tflops):,.2f}"
+        )
         parameter_str = (
             "N/A"
             if self.num_parameters is None
@@ -694,7 +702,7 @@ class MetricsProcessor:
             f"params: {parameter_str} (trainable: {trainable_str})  "
             f"{color.blue}tps: {round(console_tps):,}/device  "
             f"{color.cyan}tflops: "
-            f"{observed.get('train/tflops_per_device', derived.tflops):,.2f}/device  "
+            f"{tflops_str}/device  "
             f"{color.magenta}mfu: {mfu_str}{color.reset}  " + "  ".join(details)
         )
 
@@ -763,15 +771,20 @@ class MetricsProcessor:
         observed = self.latest_training_observations
         if not self._steady_summary_reported and "steady/samples" in observed:
             mfu = observed.get("steady/mfu_percent")
+            tflops_str = (
+                "N/A"
+                if self.num_flops_per_token == 0
+                else f"{observed['steady/tflops_per_device']:.2f}"
+            )
             logger.info(
                 "Training steady summary (rolling, warmup excluded): "
                 "%d samples, p50=%.4fs, p90=%.4fs, tps=%.1f/device, "
-                "tflops=%.2f/device, mfu=%s",
+                "tflops=%s/device, mfu=%s",
                 int(observed["steady/samples"]),
                 observed["steady/step_p50_seconds"],
                 observed["steady/step_p90_seconds"],
                 observed["steady/tps_per_device"],
-                observed["steady/tflops_per_device"],
+                tflops_str,
                 "N/A" if mfu is None else f"{mfu:.2f}%",
             )
             self._steady_summary_reported = True

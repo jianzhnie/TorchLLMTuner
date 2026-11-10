@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -40,6 +41,13 @@ if TYPE_CHECKING:
 __all__ = ["ModelCheckpointState"]
 
 
+@dataclass(frozen=True)
+class TensorMetadata:
+    shape: torch.Size
+    dtype: torch.dtype
+    chunks: Any = None
+
+
 class ModelCheckpointState(Stateful):
     """A ``Stateful`` view over one module or a list of them.
 
@@ -59,8 +67,8 @@ class ModelCheckpointState(Stateful):
        in place: their storage stays put while their values track the parameters.
 
     Notes:
-        - ``load_state_dict`` updates the underlying modules and refreshes the
-          cache.
+        - ``load_state_dict`` updates the underlying modules and releases the
+          cache. The next save starts a new stable-storage cache generation.
         - The module tree must not be structurally modified (keys changing,
           tensor references replaced) after wrapping, or the cache goes stale.
         - A hook that changes the exported view over aliased live storage forces
@@ -100,11 +108,37 @@ class ModelCheckpointState(Stateful):
             # they ride through this wrapper as all-gathered full tensors and are
             # sliced back per rank on load (parallel/expert_parallel/checkpointing.py).
             self._ep_shards = expert_shard_map(self.model)
-        self.cached_state_dict = self._get_state_dict(
+        self.cached_state_dict = self.get_state_dict(
             initialization_group=initialization_group
         )
+        self.remember_metadata()
 
-    def _get_state_dict(
+    def remember_metadata(self) -> None:
+        # Keep validation independent of exported storage: full TP/EP exports
+        # can be much larger than the rank-local model, and must not stay alive
+        # merely to validate another load after the cache has been released.
+        self._metadata = {
+            key: (
+                TensorMetadata(
+                    value.shape,
+                    value.dtype,
+                    chunk_layout(value.chunks)
+                    if isinstance(value, ChunkedCheckpointTensor)
+                    else None,
+                )
+                if isinstance(value, torch.Tensor)
+                else None
+            )
+            for key, value in self.cached_state_dict.items()
+        }
+
+    def release_cache(self) -> None:
+        # Do not clear in place: the caller's loaded state may be this dictionary.
+        # Rebuilding here would gather a second full model while the input model
+        # and optimizer checkpoint tensors are still live.
+        self.cached_state_dict = {}
+
+    def get_state_dict(
         self, *, initialization_group: ProcessGroup | None = None
     ) -> dict[str, Any]:
         # Hooks may redistribute DTensors: finish their own communication before
@@ -144,10 +178,10 @@ class ModelCheckpointState(Stateful):
     def state_dict(self) -> dict[str, Any]:
         # Recompute so hook-produced tensors reflect the current parameters,
         # then merge into the cache without changing storage objects.
-        current_state = self._get_state_dict()
-        if current_state.keys() != self.cached_state_dict.keys():
-            added = sorted(current_state.keys() - self.cached_state_dict.keys())
-            removed = sorted(self.cached_state_dict.keys() - current_state.keys())
+        current_state = self.get_state_dict()
+        if current_state.keys() != self._metadata.keys():
+            added = sorted(current_state.keys() - self._metadata.keys())
+            removed = sorted(self._metadata.keys() - current_state.keys())
             raise RuntimeError(
                 "Model checkpoint keys changed after wrapping; construct a new "
                 f"ModelCheckpointState. Added: {added}; removed: {removed}"
@@ -190,6 +224,7 @@ class ModelCheckpointState(Stateful):
                         self.cached_state_dict[key] = value.detach().clone()
                 else:
                     cached.copy_(value)
+        self.remember_metadata()
         return self.cached_state_dict
 
     def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -197,30 +232,30 @@ class ModelCheckpointState(Stateful):
         # Validate the combined view before any part copies weights. strict=False
         # below permits other PP parts and auxiliary checkpoint categories, but
         # must not permit missing local model state or late shape failures.
-        missing = self.cached_state_dict.keys() - state_dict.keys()
+        missing = self._metadata.keys() - state_dict.keys()
         if missing:
             raise ValueError(f"Model checkpoint is missing keys: {sorted(missing)}")
-        for key, expected in self.cached_state_dict.items():
-            if not isinstance(expected, torch.Tensor):
+        for key, expected in self._metadata.items():
+            if expected is None:
                 continue
             value = state_dict[key]
             if not isinstance(value, torch.Tensor):
                 raise ValueError(f"Model checkpoint {key!r} must be a tensor")
             # PyTorch accepts old one-element checkpoints for scalar state.
-            legacy_scalar = expected.ndim == 0 and value.shape == torch.Size([1])
+            legacy_scalar = len(expected.shape) == 0 and value.shape == torch.Size([1])
             if value.shape != expected.shape and not legacy_scalar:
                 raise ValueError(
                     f"Model checkpoint {key!r} has shape {tuple(value.shape)}, "
                     f"expected {tuple(expected.shape)}"
                 )
-            if isinstance(expected, ChunkedCheckpointTensor) and isinstance(
+            if expected.chunks is not None and isinstance(
                 value, ChunkedCheckpointTensor
             ):
                 if value.dtype != expected.dtype:
                     raise ValueError(
                         f"Model checkpoint {key!r} dtype differs from destination"
                     )
-                expected_layout = chunk_layout(expected.chunks)
+                expected_layout = expected.chunks
                 actual_layout = chunk_layout(value.chunks)
                 if actual_layout != expected_layout:
                     raise ValueError(
@@ -228,7 +263,7 @@ class ModelCheckpointState(Stateful):
                         "from destination"
                     )
 
-    def _local_state_dict(self) -> dict[str, Any]:
+    def local_state_dict(self) -> dict[str, Any]:
         return {
             key: value
             for model in self.model
@@ -238,16 +273,16 @@ class ModelCheckpointState(Stateful):
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.validate_state_dict(state_dict)
         if self.sharded_tensor_parallel and self.sharded_expert_parallel:
-            local_state = self._local_state_dict()
+            local_state = self.local_state_dict()
             state_dict = restore_disjoint_tp_ep_state(
                 state_dict, local_state=local_state, model_parts=self.model
             )
             for model in self.model:
                 model.load_state_dict(state_dict, strict=False)
-            self.cached_state_dict = self._get_state_dict()
+            self.release_cache()
             return
         if self.sharded_expert_parallel:
-            local_state = self._local_state_dict()
+            local_state = self.local_state_dict()
             state_dict = restore_sharded_expert_state(
                 state_dict,
                 local_state=local_state,
@@ -257,12 +292,12 @@ class ModelCheckpointState(Stateful):
             state_dict = load_tensor_parallel_state(state_dict, model_parts=self.model)
             for model in self.model:
                 model.load_state_dict(state_dict, strict=False)
-            self.cached_state_dict = self._get_state_dict()
+            self.release_cache()
             return
         if self.sharded_tensor_parallel and any(
             isinstance(value, ChunkedCheckpointTensor) for value in state_dict.values()
         ):
-            local_state = self._local_state_dict()
+            local_state = self.local_state_dict()
             local_state = gather_expert_state(
                 local_state, shard_map=self._ep_shards, model_parts=self.model
             )
@@ -280,5 +315,4 @@ class ModelCheckpointState(Stateful):
         )
         for model in self.model:
             model.load_state_dict(state_dict, strict=False)
-        # Refresh the cache so state_dict() reflects the freshly loaded values.
-        self.cached_state_dict = self._get_state_dict()
+        self.release_cache()

@@ -1,9 +1,8 @@
-"""Instance-scoped NPU metadata communication for torch_checkpointing 0.1.0."""
+"""Instance-scoped NPU metadata communication for torch_checkpointing."""
 
 from __future__ import annotations
 
 import pickle
-from importlib.metadata import PackageNotFoundError, version
 from types import MethodType
 from typing import Any
 
@@ -48,13 +47,6 @@ def _gather_pickled_metadata(
 def adapt_npu_metadata_gather(manager: Any) -> bool:
     if not dist.is_initialized() or get_comm_device().type != "npu":
         return False
-    try:
-        release = version("torch_checkpointing")
-    except PackageNotFoundError:
-        # Source installs may expose the module without distribution metadata.
-        return False
-    if release != "0.1.0":
-        return False
     if DefaultMetadataManager is None:
         raise ImportError(
             "torch_checkpointing metadata_manager API is unavailable"
@@ -64,5 +56,5 @@ def adapt_npu_metadata_gather(manager: Any) -> bool:
     if type(metadata) is not DefaultMetadataManager:
         return False
     metadata._all_gather_pickled_data = MethodType(_gather_pickled_metadata, metadata)
-    logger.info("Applied instance-scoped torch_checkpointing 0.1.0 NPU metadata gather")
+    logger.info("Applied instance-scoped NPU metadata gather")
     return True

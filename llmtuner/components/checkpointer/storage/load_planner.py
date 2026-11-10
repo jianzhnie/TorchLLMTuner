@@ -106,9 +106,15 @@ class CheckpointLoadPlanner(DefaultLoadPlanner):
                 "cannot resume with exact stream continuity.",
             )
         prefix = f"{DATALOADER}.batch_layout."
-        if (
-            f"{DATALOADER}.version" in saved_keys or f"{DATALOADER}.steps" in saved_keys
-        ) and not any(key.startswith(prefix) for key in saved_keys):
+        # Multi-DP synthetic cursors flatten to steps.<rank>, so no bare
+        # steps key remains in DCP metadata. They are still the same supported
+        # pre-layout format as the historical scalar cursor.
+        has_saved_steps = steps_key in saved_keys or any(
+            key.startswith(steps_key + ".") for key in saved_keys
+        )
+        if (f"{DATALOADER}.version" in saved_keys or has_saved_steps) and not any(
+            key.startswith(prefix) for key in saved_keys
+        ):
             self._drop_legacy_keys(
                 prefix,
                 "Legacy dataloader checkpoint has no batch layout metadata; "
