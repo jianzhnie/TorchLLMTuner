@@ -13,6 +13,7 @@ from llmtuner.config import (
     CheckpointConfig,
     CompileConfig,
     DataloaderConfig,
+    FSDPConfig,
     LLMTunerConfig,
     MetricsConfig,
     ModelConfig,
@@ -49,6 +50,7 @@ def build_config(args: argparse.Namespace) -> LLMTunerConfig:
             expert_parallel_size=args.ep,
             pipeline_parallel_size=args.pp,
             context_parallel_kv_allgather_size=args.cp,
+            fsdp_config=FSDPConfig(fsdp_cpu_offload=args.cpu_offload),
         ),
         optimizer=OptimizerConfig(
             implementation="for-loop",
@@ -110,6 +112,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ep", type=int, default=1)
     parser.add_argument("--pp", type=int, default=1)
     parser.add_argument("--cp", type=int, default=1, help="Compressor CP degree")
+    parser.add_argument(
+        "--cpu-offload",
+        action="store_true",
+        help="Offload FSDP parameters/gradients; requires optimizer residency device",
+    )
     parser.add_argument(
         "--ac",
         choices=("none", "full", "selective", "memory_budget", "region"),

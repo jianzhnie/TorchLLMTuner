@@ -74,6 +74,7 @@ def build_config(args: argparse.Namespace) -> LLMTunerConfig:
         training=TrainingConfig(
             steps=args.steps,
             global_batch_size=args.batch,
+            gradient_accumulation_steps=getattr(args, "gradient_accumulation_steps", 1),
             max_seq_len=args.sequence_length,
             seed=42,
             deterministic=True,
@@ -91,6 +92,8 @@ def build_config(args: argparse.Namespace) -> LLMTunerConfig:
                 last_save_model_only=False,
                 initial_load_path=initial_weights,
                 initial_load_in_hf=bool(initial_weights),
+                sharded_tensor_parallel=getattr(args, "checkpoint_layout", "full")
+                == "chunk",
             ),
             dataloader_config=DataloaderConfig(
                 dataset="local_jsonl_sft",
@@ -114,6 +117,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=2048)
     parser.add_argument("--layers", type=int)
     parser.add_argument("--dp-shard", type=int, default=-1)
@@ -155,6 +159,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--compile-backend", choices=("none", "aot_eager", "inductor"), default="none"
     )
     parser.add_argument("--checkpoint-interval", type=int, default=50)
+    parser.add_argument(
+        "--checkpoint-layout", choices=("full", "chunk"), default="full"
+    )
     parser.add_argument("--load-step", type=int, default=-1)
     parser.add_argument(
         "--initial-weights",

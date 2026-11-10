@@ -95,6 +95,57 @@ def compile_counter_snapshot() -> dict:
     }
 
 
+def summarize_peak_memory(rows: list[dict], *, warmup: int) -> int:
+    """Preserve measured peaks before outer metric logging resets the allocator."""
+    if not 0 <= warmup < len(rows):
+        raise ValueError("Require measured memory samples after warmup")
+    peaks = [row["peak_allocated_bytes"] for row in rows[warmup:]]
+    if any(type(peak) is not int or peak < 0 for peak in peaks):
+        raise ValueError("Memory peaks must be nonnegative integer bytes")
+    return max(peaks)
+
+
+def summarize_valid_targets(rank_records: list[dict], *, warmup: int) -> dict:
+    """Count each DP loader shard once; TP/CP/PP replicas must agree."""
+    degrees = {rank["data_parallel_size"] for rank in rank_records}
+    if len(degrees) != 1:
+        raise ValueError("Benchmark data-parallel degrees differ")
+    degree = degrees.pop()
+    if type(degree) is not int or degree <= 0 or len(rank_records) % degree:
+        raise ValueError("Invalid benchmark data-parallel degree")
+    shards: dict[int, list[int]] = {}
+    replicas: dict[int, int] = {}
+    for rank in rank_records:
+        index = rank["data_parallel_rank"]
+        if type(index) is not int or not 0 <= index < degree:
+            raise ValueError("Invalid benchmark data-parallel rank")
+        counts = [row["local_valid_targets"] for row in rank["steps"]]
+        if any(type(count) is not int or count < 0 for count in counts):
+            raise ValueError("Valid targets must be nonnegative integer counts")
+        if index in shards and shards[index] != counts:
+            raise ValueError("Replicated loader valid-target counts differ")
+        shards[index] = counts
+        replicas[index] = replicas.get(index, 0) + 1
+    if set(shards) != set(range(degree)) or set(replicas.values()) != {
+        len(rank_records) // degree
+    }:
+        raise ValueError("Incomplete benchmark loader shard coverage")
+    lengths = {len(counts) for counts in shards.values()}
+    if len(lengths) != 1 or not 0 <= warmup < lengths.pop():
+        raise ValueError("Incomplete valid-target steps or invalid warmup")
+    totals = [sum(counts) for counts in zip(*shards.values(), strict=True)]
+    if any(count <= 0 for count in totals):
+        raise ValueError("Benchmark step has no global valid targets")
+    return {
+        "global_valid_targets_per_step": totals[warmup:],
+        "measured_valid_targets": sum(totals[warmup:]),
+        "valid_target_definition": (
+            "loss targets counted by the training loader, summed once over DP; "
+            "TP/CP/PP replicas must have identical counts"
+        ),
+    }
+
+
 def compile_counter_delta(before: dict, after: dict) -> dict:
     return {
         name: {
@@ -132,6 +183,7 @@ class BenchmarkNPUTrainer(Trainer):
         if self.step == self.benchmark_warmup + 1:
             torch.npu.reset_peak_memory_stats()
         compile_before = compile_counter_snapshot()
+        valid_before = self.metrics.valid_tokens_since_last_log
         start = perf_counter()
         metrics = super().train_step(data_iterator)
         torch.npu.synchronize()
@@ -140,7 +192,11 @@ class BenchmarkNPUTrainer(Trainer):
             {
                 "step": self.step,
                 "seconds": seconds,
+                "peak_allocated_bytes": torch.npu.max_memory_allocated(),
                 "metrics": metrics,
+                "local_valid_targets": (
+                    self.metrics.valid_tokens_since_last_log - valid_before
+                ),
                 "compile_counters": compile_counter_delta(
                     compile_before, compile_counter_snapshot()
                 ),
@@ -216,6 +272,10 @@ def accelerator_metadata() -> dict:
         "name": device_module.get_device_name(device_index),
         "soc_version": str(device_module.get_soc_version()),
         "cann_version": cann_version(),
+        "allow_hf32": {
+            name: getattr(getattr(device_module, name, None), "allow_hf32", None)
+            for name in ("matmul", "conv", "aclnn")
+        },
     }
 
 
@@ -325,13 +385,19 @@ def main() -> None:
             runtime_after = runtime_metadata()
             validate_runtime_consistency(runtime_before, runtime_after)
         with synchronize_local_errors("Benchmark local report collection"):
+            parallel_dims = getattr(trainer, "parallel_dims", None)
+            dp_mesh = parallel_dims.get_optional_mesh("dp") if parallel_dims else None
             local = {
                 "rank": dist.get_rank(),
                 "device": str(trainer.device),
                 "backend": str(dist.get_backend()),
                 "runtime": runtime_before,
                 "steps": trainer.benchmark_rows,
-                "peak_allocated_bytes": torch.npu.max_memory_allocated(),
+                "data_parallel_rank": dp_mesh.get_local_rank() if dp_mesh else 0,
+                "data_parallel_size": dp_mesh.size() if dp_mesh else 1,
+                "peak_allocated_bytes": summarize_peak_memory(
+                    trainer.benchmark_rows, warmup=warmup
+                ),
                 "peak_host_rss_bytes": resource.getrusage(
                     resource.RUSAGE_SELF
                 ).ru_maxrss
@@ -370,6 +436,10 @@ def main() -> None:
                 [rank["steps"] for rank in gathered],
                 steps=config.steps,
                 warmup=warmup,
+            )
+            report.update(summarize_valid_targets(gathered, warmup=warmup))
+            report["valid_targets_per_second"] = report["measured_valid_targets"] / sum(
+                report["step_seconds_max_across_ranks"]
             )
             report.update(
                 timing_scope=(

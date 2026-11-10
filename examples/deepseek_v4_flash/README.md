@@ -16,9 +16,3 @@ bash examples/deepseek_v4_flash/train.sh --steps 100 --batch 8 --sequence-length
 调度，不改变其他结构。DP/TP/EP/PP/CP、AC、compile、optimizer状态驻留和checkpoint
 参数见`examples/deepseek_v4_pro/train.py`；可配置不代表组合已验收。随机meta初始化
 目前仅开放local/DP/FSDP，其他拓扑须通过独立初始化与数值验收后开放。
-
-2026-11-09实测：完整43层、BF16、FSDP8、full AC、LIMO、sequence2048、batch8
-的一步前后向、更新和同步DCP保存退出0，无需减层。loss12.63450、grad norm
-21.7322、参数量23.606429B、HBM reserved28.65GiB，OOM/retry为0。日志为容器
-`/tmp/deepseek_v4_flash_full_20261109_v2.log`。一步结果不是跨框架或稳态性能
-验收；FLOPs/MFU因通用估计器未覆盖V4而未报告。

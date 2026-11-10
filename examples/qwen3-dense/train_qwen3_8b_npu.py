@@ -96,6 +96,15 @@ def qwen3_8b_npu_config() -> LLMTunerConfig:
             activation_checkpoint_mode="full",
             checkpoint_config=CheckpointConfig(
                 enable=True,
+                # Bound TP checkpoint residency without gathering full weights.
+                # The loader also accepts older full-tensor checkpoints.
+                sharded_tensor_parallel=(
+                    os.environ.get(
+                        "LLMTUNER_SHARDED_TENSOR_CHECKPOINT",
+                        "1" if tensor_parallel_size > 1 else "0",
+                    )
+                    == "1"
+                ),
                 interval=int(os.environ.get("LLMTUNER_CHECKPOINT_INTERVAL", "500")),
                 load_step=int(os.environ.get("LLMTUNER_CHECKPOINT_LOAD_STEP", "-1")),
                 load_only=not save_checkpoint,
