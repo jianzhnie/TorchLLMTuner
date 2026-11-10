@@ -59,6 +59,7 @@ from .. import compatibility
 from ..attention_heads import require_heads_divisible_by
 from ..expert_parallel.hf_inspection import is_hf_moe_block, resolve_shared_expert
 from ..module_patterns import module_name_matches, resolve_module_patterns
+from ..vocab_parallel.vocab_parallel import VocabParallelEmbedding
 from .linear_ops import (
     AllGatherLinear,
     LinearReduceScatter,
@@ -591,9 +592,8 @@ def resolve_tp_sharding_plan(
         elif spec == "rowwise":
             resolved[pattern] = rowwise()
         elif spec == "embedding_rowwise":
-            # New HF plans include vocabulary sharding. This engine keeps
-            # embeddings replicated, as before: token rows are sequence-sharded
-            # and allreduce_replicated_tp_grads sums their partial gradients.
+            # Realized by VocabParallelEmbedding; None prevents a broad dense
+            # pattern from overriding the first matching vocabulary entry.
             resolved[pattern] = None
         elif spec in {"replicated_with_grad_allreduce", "colwise_gather_output"}:
             # Nothing for apply_tp to do: the projection stays whole on every
@@ -683,7 +683,11 @@ def tp_sharded_param_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
         for part in model_parts
         for module in part.modules()
         if isinstance(
-            module, ColumnParallelLinear | RowParallelLinear | ColwiseLinearNoGather
+            module,
+            ColumnParallelLinear
+            | RowParallelLinear
+            | ColwiseLinearNoGather
+            | VocabParallelEmbedding,
         )
     }
     for part in model_parts:
@@ -702,6 +706,61 @@ def tp_sharded_param_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
     return sharded_ids
 
 
+def resolve_vocab_parallel_targets(
+    model: nn.Module, plan: Mapping[str, str | ShardingConfig]
+) -> list[tuple[str, nn.Embedding]]:
+    """Resolve HF ``embedding_rowwise`` entries in first-match plan order."""
+    return [
+        (path, module)
+        for path, module in model.named_modules()
+        if isinstance(module, nn.Embedding)
+        and next(
+            (
+                spec
+                for pattern, spec in plan.items()
+                if module_name_matches(path, pattern=pattern)
+            ),
+            None,
+        )
+        == "embedding_rowwise"
+    ]
+
+
+def resolve_tp_overrides(
+    model: nn.Module, *, cfg: ParallelConfig, allow_unmatched: bool = False
+) -> dict[str, str]:
+    """Validate explicit overrides before splitting or transforming the model."""
+    configured_plan = dict.fromkeys(cfg.tp_config.tp_colwise_modules, "colwise")
+    for pattern in cfg.tp_config.tp_rowwise_modules:
+        if pattern in configured_plan:
+            raise ValueError(f"TP pattern {pattern!r} has conflicting styles")
+        configured_plan[pattern] = "rowwise"
+    if cfg.tp_config.tp_sequence_modules:
+        raise ValueError(
+            "tp_sequence_modules is not valid for llmtuner's fused sequence "
+            "parallel engine; normalization modules already consume the "
+            "sequence shard without a separate transformation"
+        )
+    names = [name for name, _ in model.named_modules()]
+    # Model defaults may be overridden; explicit overrides must agree.
+    for name in names:
+        matches = [
+            (pattern, style)
+            for pattern, style in configured_plan.items()
+            if module_name_matches(name, pattern=pattern)
+        ]
+        if len({style for _, style in matches}) > 1:
+            raise ValueError(
+                f"TP override patterns have conflicting styles for module "
+                f"{name!r}: {matches}"
+            )
+    if not allow_unmatched:
+        resolve_module_patterns(
+            names, patterns=list(configured_plan), plan_name="TP override"
+        )
+    return configured_plan
+
+
 def resolve_tp_targets(
     model: nn.Module,
     *,
@@ -717,29 +776,12 @@ def resolve_tp_targets(
     fully replicated while the run reported a healthy TP setup -- both are
     loud errors here, raised before any process-group access.
     """
-    configured_plan: dict[str, str] = {}
-    for pattern in cfg.tp_config.tp_colwise_modules:
-        configured_plan[pattern] = "colwise"
-    for pattern in cfg.tp_config.tp_rowwise_modules:
-        if pattern in configured_plan:
-            raise ValueError(f"TP pattern {pattern!r} has conflicting styles")
-        configured_plan[pattern] = "rowwise"
-    if cfg.tp_config.tp_sequence_modules:
-        raise ValueError(
-            "tp_sequence_modules is not valid for llmtuner's fused sequence "
-            "parallel engine; normalization modules already consume the "
-            "sequence shard without a separate transformation"
-        )
+    # A PP-local part may have no ownership of an otherwise valid override.
+    configured_plan = resolve_tp_overrides(
+        model, cfg=cfg, allow_unmatched=cfg.pp_size > 1
+    )
     raw_plan = model_tp_config(model) if plan is None else plan
     if configured_plan:
-        # Pipeline assembly validates against the complete model before split:
-        # an override may intentionally select only another stage's modules.
-        if cfg.pp_size == 1:
-            resolve_module_patterns(
-                [name for name, _ in model.named_modules()],
-                patterns=list(configured_plan),
-                plan_name="TP override",
-            )
         # Matching uses the first pattern; explicit overrides must come first.
         raw_plan = {
             **configured_plan,
@@ -836,10 +878,14 @@ def resolve_tp_targets(
         )
         targets = [t for t in targets if not t[0].startswith(moe_prefixes)]
     nothing_sharded = not targets and not moe_blocks and not bracketed_paths
-    if nothing_sharded and not moe_deferred_to_ep:
+    if (
+        nothing_sharded
+        and not moe_deferred_to_ep
+        and not resolve_vocab_parallel_targets(model, raw_plan)
+    ):
         raise ValueError(
             f"apply_tp with tp={cfg.tp_size}: the plan patterns "
-            f"{sorted(sharding_plan)} matched no nn.Linear on "
+            f"{sorted(sharding_plan)} matched no nn.Linear or nn.Embedding on "
             f"{type(model).__name__}. The patterns are spelled relative to the "
             "module tree being parallelized; check the prefix (e.g. a wrapper's "
             "`model.` prefix) rather than training a replicated model by "
@@ -955,7 +1001,9 @@ def apply_tp(
         raise ValueError(f"tp={cfg.tp_size} requires a device mesh with a 'tp' axis")
 
     # Resolve targets once before accessing process groups or changing weights.
-    targets, moe_blocks = resolve_tp_targets(model, cfg=cfg, plan=plan)
+    raw_plan = model_tp_config(model) if plan is None else plan
+    targets, moe_blocks = resolve_tp_targets(model, cfg=cfg, plan=raw_plan)
+    vocab_targets = resolve_vocab_parallel_targets(model, raw_plan)
 
     # A head count that does not divide ``tp`` has no valid local head split,
     # and no downstream guard catches it: the projection-level check in
@@ -1010,6 +1058,30 @@ def apply_tp(
                     f"paths {aliases!r}; shared MoE shards require an "
                     "alias-preserving TP implementation"
                 )
+    for module_path, embedding in vocab_targets:
+        if embedding.max_norm is not None:
+            raise ValueError(
+                f"Vocab parallel over {module_path} does not support max_norm"
+            )
+        if embedding.scale_grad_by_freq:
+            raise ValueError(
+                f"Vocab parallel over {module_path} does not support scale_grad_by_freq"
+            )
+        if embedding.sparse:
+            raise ValueError(
+                f"Vocab parallel over {module_path} does not support sparse gradients"
+            )
+        if len(parameter_paths[id(embedding.weight)]) > 1:
+            raise ValueError(
+                f"Vocab parallel over {module_path} cannot preserve tied weights; "
+                "disable vocabulary sharding or untie the embedding first"
+            )
+        if embedding.num_embeddings % cfg.tp_size:
+            raise ValueError(
+                f"Vocab parallel over {module_path}: num_embeddings "
+                f"({embedding.num_embeddings}) is not divisible by "
+                f"tp_size={cfg.tp_size}"
+            )
     for module_path, inner, spec in targets:
         aliases = parameter_paths[id(inner.weight)]
         if len(aliases) > 1:
@@ -1114,6 +1186,31 @@ def apply_tp(
         }
         replacements.append((parent, attr, wrapped))
 
+    local_vocab_size = 0
+    for module_path, inner in vocab_targets:
+        parent_path, _, attr = module_path.rpartition(".")
+        parent = model.get_submodule(parent_path) if parent_path else model
+        local_vocab_size = inner.num_embeddings // tp_size
+        vocab_start = tp_rank * local_vocab_size
+        wrapped = VocabParallelEmbedding(
+            shard_weight(inner.weight, 0, tp_size=tp_size, tp_rank=tp_rank),
+            source=inner,
+            vocab_start_index=vocab_start,
+            vocab_end_index=vocab_start + local_vocab_size,
+            tp_group=group,
+        )
+        wrapped.train(inner.training)
+        wrapped._tp_init_specs = {
+            "weight": _TPInitializationSpec(
+                type(inner),
+                tuple(inner.weight.shape),
+                0,
+                tp_size,
+                tp_rank,
+            )
+        }
+        replacements.append((parent, attr, wrapped))
+
     realize_moe_blocks_tp(moe_blocks, tp_size=tp_size, tp_rank=tp_rank, group=group)
     for parent, attr, wrapped in replacements:
         setattr(parent, attr, wrapped)
@@ -1143,6 +1240,8 @@ def apply_tp(
     layouts = model.__dict__.setdefault("_tp_checkpoint_layouts", {})
     for path, _, spec in targets:
         layouts[f"{path}.weight"] = (0 if spec.kind == "colwise" else 1, False, group)
+    for path, _ in vocab_targets:
+        layouts[f"{path}.weight"] = (0, False, group)
     for path, block in moe_blocks:
         prefix = f"{path}." if path else ""
         layouts[f"{prefix}experts.gate_up_proj"] = (1, True, group)
