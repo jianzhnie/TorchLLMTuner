@@ -63,16 +63,20 @@ def compare(
         torch.testing.assert_close(
             left.grad.cpu().float(), right.grad, atol=tolerance, rtol=tolerance
         )
-        gradient_error = max(
-            gradient_error, (left.grad.cpu().float() - right.grad).abs().max().item()
-        )
+        if left.numel():
+            gradient_error = max(
+                gradient_error,
+                (left.grad.cpu().float() - right.grad).abs().max().item(),
+            )
     torch.npu.synchronize()
     return {
         "kernel": name,
         "output_max_abs": (actual_output.cpu().float() - expected_output)
         .abs()
         .max()
-        .item(),
+        .item()
+        if actual_output.numel()
+        else 0.0,
         "gradient_max_abs": gradient_error,
         "status": "passed",
     }
@@ -135,6 +139,45 @@ def main() -> None:
             scale=0.125,
             q_cu_seqlens=[0, 3, 7],
             k_cu_seqlens=[0, 4, 9],
+        )
+    )
+    report.append(
+        compare(
+            "moe_empty",
+            moe_token_permute,
+            [torch.empty(0, 64), torch.empty(0, 2, dtype=torch.int32)],
+            device,
+            tolerance=0.0,
+        )
+    )
+    report.append(
+        compare(
+            "attention_empty_document",
+            fusion_attention,
+            [torch.randn(7, 2, 64, dtype=torch.bfloat16) for _ in range(3)],
+            device,
+            tolerance=2e-2,
+            head_num=2,
+            scale=0.125,
+            q_cu_seqlens=[0, 3, 3, 7],
+            k_cu_seqlens=[0, 3, 3, 7],
+        )
+    )
+    report.append(
+        compare(
+            "attention_empty_query",
+            fusion_attention,
+            [
+                torch.empty(0, 2, 64, dtype=torch.bfloat16),
+                torch.randn(3, 2, 64, dtype=torch.bfloat16),
+                torch.randn(3, 2, 64, dtype=torch.bfloat16),
+            ],
+            device,
+            tolerance=0.0,
+            head_num=2,
+            scale=0.125,
+            q_cu_seqlens=None,
+            k_cu_seqlens=None,
         )
     )
     print(

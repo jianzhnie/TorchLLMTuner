@@ -225,3 +225,32 @@ def test_npu_dependency_error_keeps_original_cause(monkeypatch):
     with pytest.raises(ImportError, match="require torch-npu") as result:
         npu_basic.rms_norm_npu(torch.ones(2, 4), torch.ones(4), 1e-6)
     assert result.value.__cause__ is cause
+
+
+def test_tensor_free_lookup_reuses_accelerator_device_selection(monkeypatch):
+    monkeypatch.setattr(registry, "default_device_type", "cpu")
+    assert get_kernel("rms_norm") is get_kernel("rms_norm", "cpu")
+
+
+def test_rotary_rejects_factors_that_expand_or_do_not_broadcast():
+    for shape in ((3, 4), (3, 2, 4)):
+        with pytest.raises(ValueError, match="broadcast"):
+            rotary_mul(torch.ones(2, 4), torch.ones(shape), torch.zeros(shape))
+
+
+def test_rms_norm_rejects_multiaxis_weights_and_mismatched_width():
+    for weight in (torch.ones(2, 2), torch.ones(3)):
+        with pytest.raises(ValueError):
+            rms_norm(torch.ones(2, 4), weight, 1e-6)
+
+
+def test_attention_empty_middle_document_preserves_other_documents():
+    x = torch.randn(5, 2, 4)
+    options = dict(head_num=2, scale=0.5)
+    expected = fusion_attention(
+        x, x, x, **options, q_cu_seqlens=[0, 2, 5], k_cu_seqlens=[0, 2, 5]
+    )
+    actual = fusion_attention(
+        x, x, x, **options, q_cu_seqlens=[0, 2, 2, 5], k_cu_seqlens=[0, 2, 2, 5]
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

@@ -14,7 +14,12 @@ def rms_norm(
     *,
     use_eager: bool = False,
 ) -> torch.Tensor:
-    """Normalize the final dimension using the selected backend."""
+    """Normalize the nonempty final axis using a matching 1-D weight.
+
+    epsilon must be finite and nonnegative. Input and weight share a device;
+    dtype conversion remains the caller's responsibility. use_eager explicitly
+    selects reference torch math on the existing device, without data transfer.
+    """
     return dispatch_kernel(
         "rms_norm",
         hidden_states,

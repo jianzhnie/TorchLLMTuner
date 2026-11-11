@@ -90,13 +90,20 @@ def rotary_inputs(
     require_same_device(hidden_states, cosine, sine)
     if rotary_mode not in (None, "half", "interleave"):
         raise ValueError(f"Unsupported rotary mode {rotary_mode!r}")
-    if hidden_states.ndim == 0 or hidden_states.shape[-1] % 2:
+    if (
+        hidden_states.ndim == 0
+        or hidden_states.shape[-1] == 0
+        or hidden_states.shape[-1] % 2
+    ):
         raise ValueError("RoPE requires an even final dimension")
     for factor in (cosine, sine):
-        if (
-            torch.broadcast_shapes(hidden_states.shape, factor.shape)
-            != hidden_states.shape
-        ):
+        try:
+            shape = torch.broadcast_shapes(hidden_states.shape, factor.shape)
+        except RuntimeError as error:
+            raise ValueError(
+                "RoPE factors must broadcast to the input shape"
+            ) from error
+        if shape != hidden_states.shape:
             raise ValueError("RoPE factors must broadcast to the input shape")
 
 
