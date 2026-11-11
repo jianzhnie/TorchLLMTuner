@@ -10,7 +10,8 @@ from torch.distributed.device_mesh import DeviceMesh
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.parallel.compatibility import eager_flex_parallel
 
-from ...models.runtime.attention_backend import ATTENTION_BACKEND, CP_SDPA_BACKEND
+from ...models.common.attention.backend_names import ATTENTION_BACKEND, CP_SDPA_BACKEND
+from ...models.contracts import DecoderStructure
 from ...utils.logging import get_logger
 from ..attention_heads import require_heads_divisible_by
 from ..tensor_parallel.tensor_parallel import ReplicatedAttentionSequenceBoundary
@@ -26,40 +27,13 @@ logger = get_logger(__name__)
 
 __all__ = ["apply_cp"]
 
-# HF names the attention submodule differently across model families; probe in
-# the style of hf/model_setup.py's ``resolve_submodule_name`` rather than hardcoding one
-# family's spelling.
-_ATTN_MODULE_NAMES = ("self_attn", "attn", "attention")
 
-
-def _attention_modules(model: nn.Module) -> list[nn.Module]:
-    """Bind declared attention children, retaining legacy lookup for other models."""
-    layers = getattr(model, "layers", ())
-    structure = getattr(getattr(model, "model", None), "decoder_structure", None)
-    declared = getattr(structure, "attention", None)
-    if declared is not None:
-        attentions = []
-        for index, layer in enumerate(layers):
-            attention = layer._modules.get(declared)
-            if not isinstance(attention, nn.Module):
-                raise ValueError(
-                    f"{type(layer).__name__} (layer {index}) must declare "
-                    f"{declared!r} as an attention child module"
-                )
-            attentions.append(attention)
-        return attentions
-    attentions = []
-    for index, layer in enumerate(layers):
-        for name in _ATTN_MODULE_NAMES:
-            if hasattr(layer, name):
-                attentions.append(getattr(layer, name))
-                break
-        else:
-            raise AttributeError(
-                f"{type(layer).__name__} (layer {index}) has no attention module "
-                f"under any of {_ATTN_MODULE_NAMES}"
-            )
-    return attentions
+def _attention_modules(model: nn.Module) -> tuple[nn.Module, ...]:
+    """Consume the explicit model's structure; never search attention aliases."""
+    structure = getattr(model, "decoder_structure", None)
+    if not isinstance(structure, DecoderStructure):
+        raise TypeError("CP requires a model-owned DecoderStructure")
+    return structure.bind_attentions(model)
 
 
 def _require_ulysses_compatible(
@@ -73,7 +47,7 @@ def _require_ulysses_compatible(
     count that does not divide tp*cp are both configuration errors, raised
     here rather than discovered from the loss curve.
     """
-    model_config = getattr(getattr(model, "model", None), "config", None)
+    model_config = getattr(model, "config", None)
     load_balancer = cfg.cp_config.context_parallel_load_balancer
     if load_balancer is not None:
         raise ValueError(
@@ -137,8 +111,12 @@ def apply_cp(
     """
     if cfg.cp_size == 1:
         return model
+    if not callable(getattr(model, "set_cp_mesh", None)):
+        raise TypeError(
+            "CP requires the explicit model to provide set_cp_mesh input semantics"
+        )
 
-    model_config = getattr(getattr(model, "model", None), "config", None)
+    model_config = getattr(model, "config", None)
     if getattr(model_config, "attention_backend", "auto") == "eager_flex":
         eager_flex_parallel("CP")
     if cfg.cp_config.context_parallel_strategy == "kcp":
@@ -206,12 +184,7 @@ def apply_cp(
     elif strategy == "ulysses":
         _require_ulysses_compatible(model, cfg=cfg, cp_mesh=cp_mesh)
 
-    layers = getattr(model, "layers", None)
-    if layers is None:
-        raise TypeError(
-            f"apply_cp expects a TrainingModel (with .layers); got "
-            f"{type(model).__name__}."
-        )
+    attentions = _attention_modules(model)
     packed = getattr(model_config, "attn_mask_type", "causal") == "block_causal"
     if sdpa_backend:
         if dual_axes:
@@ -244,7 +217,6 @@ def apply_cp(
         # full sequence, so the unsharded structure applies directly).
         model_config._cp_sdpa_ulysses = strategy == "ulysses"
         model_config._cp_sdpa_dual = dual_axes
-    attentions = _attention_modules(model)
     if sdpa_backend:
         for attn_mod in attentions:
             attn_mod._titan_cp_sdpa_kernel = cp_sdpa_kernel

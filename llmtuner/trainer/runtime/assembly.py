@@ -43,6 +43,7 @@ from ...components.checkpointer.core.checkpoint_keys import (
     TRAIN_STATE,
 )
 from ...components.checkpointer.core.random_state import RNGCheckpointState
+from ...components.checkpointer.model_state import ModelStateDictAdapter
 from ...components.metrics import MetricsProcessor
 from ...components.optimizer.ema import EMA
 from ...components.optimizer.lr_scheduler import build_lr_scheduler
@@ -50,24 +51,23 @@ from ...components.optimizer.optimizer import OptimizersContainer
 from ...components.optimizer.state_residency import validate_checkpoint_configuration
 from ...errors import UnsupportedCombinationError
 from ...memory.activation_swap import reset_activation_swap_metrics
+from ...memory.materialization import materialize_meta_model
 from ...models.common.aux_loss import register_aux_loss_metrics_hook
 from ...models.common.moe.bias_update import (
     register_moe_balancing_hook,
 )
 from ...models.common.moe.experts import RoutedExperts
-from ...models.qwen.qwen3_5.gdn_numerics import validate_gdn_numerical_training
-from ...models.qwen.qwen3_5.linear_attention import validate_linear_attention_training
-from ...models.runtime.factory import (
+from ...models.configuration import (
     build_model_config_for,
     unwrap_text_config,
 )
+from ...models.qwen.qwen3_5.gdn_numerics import validate_gdn_numerical_training
+from ...models.qwen.qwen3_5.linear_attention import validate_linear_attention_training
 from ...models.runtime.materialization import (
     initialize_random_hf_model,
     initialize_rotary_on_device,
-    materialize_meta_model,
 )
 from ...models.runtime.model import TrainingModel
-from ...models.runtime.state_dict_adapter import ModelStateDictAdapter
 from ...parallel import compatibility
 from ...parallel.parallelize import parallelize_hf_transformers
 from ...parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
@@ -364,6 +364,7 @@ def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> 
         sd_adapter = ModelStateDictAdapter(
             hf_model_config,
             cfg.checkpoint.initial_load_path or cfg.hf_model,
+            model_prefix="model.",
             qwen3_expert_parallel=(
                 getattr(hf_model_config, "model_type", None) == "qwen3_moe"
                 and cfg.parallel.ep_size > 1

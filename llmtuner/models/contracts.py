@@ -78,6 +78,25 @@ class DecoderStructure:
     head: str
     attention: str | None = None
 
+    def __post_init__(self) -> None:
+        """Reject malformed declarations before constructing or binding a model."""
+        for role in ("decoder", "embedding", "blocks", "norm", "head"):
+            path = getattr(self, role)
+            if role == "decoder" and path == "":
+                continue  # torch uses the empty path for the root module.
+            if not isinstance(path, str) or any(not part for part in path.split(".")):
+                raise ValueError(f"Decoder {role} must be a non-empty module path")
+        for path in (self.embedding, self.blocks, self.norm):
+            parent, _, name = path.rpartition(".")
+            if parent != self.decoder or not name:
+                raise ValueError(f"{path!r} must be a direct child of {self.decoder!r}")
+        if self.attention is not None and (
+            not isinstance(self.attention, str)
+            or not self.attention
+            or "." in self.attention
+        ):
+            raise ValueError("Decoder attention must be a direct child name or None")
+
     def bind(self, model: nn.Module) -> BoundDecoderStructure:
         decoder = model.get_submodule(self.decoder)
         embedding = model.get_submodule(self.embedding)
@@ -86,10 +105,31 @@ class DecoderStructure:
         head = model.get_submodule(self.head)
         if not isinstance(blocks, nn.ModuleList):
             raise TypeError(f"Decoder blocks {self.blocks!r} must be a ModuleList")
-        # The current training adapter exposes mutable decoder-local slots.
-        # Reject incompatible declarations rather than searching for aliases.
-        for path in (self.embedding, self.blocks, self.norm):
-            parent, _, name = path.rpartition(".")
-            if parent != self.decoder or not name:
-                raise ValueError(f"{path!r} must be a direct child of {self.decoder!r}")
         return BoundDecoderStructure(self, decoder, embedding, blocks, norm, head)
+
+    def bind_attentions(self, model: nn.Module) -> tuple[nn.Module, ...]:
+        """Bind only declared direct attention children, without model mutation.
+
+        Read the current block collection so PP replacement cannot leave cached
+        whole-model references. An absent declaration is unsupported, not a cue
+        to search common attribute names.
+        """
+        if (
+            not isinstance(self.attention, str)
+            or not self.attention
+            or "." in self.attention
+        ):
+            raise ValueError("CP requires a declared direct attention child name")
+        blocks = model.get_submodule(self.blocks)
+        if not isinstance(blocks, nn.ModuleList):
+            raise TypeError(f"Decoder blocks {self.blocks!r} must be a ModuleList")
+        attentions = []
+        for block_id, block in blocks._modules.items():
+            attention = block._modules.get(self.attention)
+            if not isinstance(attention, nn.Module):
+                raise ValueError(
+                    f"Block {self.blocks}.{block_id} requires declared attention "
+                    f"child {self.attention!r}"
+                )
+            attentions.append(attention)
+        return tuple(attentions)

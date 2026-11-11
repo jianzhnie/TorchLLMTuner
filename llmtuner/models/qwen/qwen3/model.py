@@ -8,10 +8,12 @@ they determine parameter initialization, RNG consumption and checkpoint names.
 Device policies and parallel transformations are installed by their own layers.
 """
 
+import inspect
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
 
+import torch
 from torch import Tensor, nn
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
@@ -161,6 +163,53 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.post_init()
+
+    def materialization_buffers(
+        self, device: torch.device
+    ) -> dict[tuple[nn.Module, str], Tensor]:
+        """Rebuild model-owned RoPE buffers without changing parameters or RNG.
+
+        Constructor-device frequencies preserve the established CPU-then-move
+        policy. The memory layer only receives final storage, never RoPE rules.
+        Re-resolve after any operation that replaces the rotary module.
+        """
+        if getattr(self.config, "rotary_init_device", "constructor") != "constructor":
+            raise ValueError(
+                "Qwen3-MoE buffer reconstruction requires constructor RoPE"
+            )
+        rotary = self.model.rotary_emb
+        if type(rotary) is not HFQwen3MoeRotaryEmbedding:
+            raise TypeError("Qwen3 materialization requires its declared rotary type")
+        with torch.device("cpu"):
+            if "device" in inspect.signature(HFQwen3MoeRotaryEmbedding).parameters:
+                fresh = HFQwen3MoeRotaryEmbedding(self.config, device="cpu")
+            else:
+                fresh = HFQwen3MoeRotaryEmbedding(self.config)
+        return {
+            (rotary, name): value.to(device=device, dtype=rotary._buffers[name].dtype)
+            for name, value in fresh.named_buffers(recurse=False)
+        }
+
+    def initialize_parameters(self) -> None:
+        """Initialize allocated parameters in the established module traversal order.
+
+        This is the post-materialization initializer, not eager construction
+        replay. It retains the previous apply(_init_weights) RNG contract.
+        Invoke before optimizer construction or loading checkpoint parameters.
+        """
+        if any(parameter.is_meta for parameter in self.parameters()):
+            raise RuntimeError(
+                "Qwen3 parameters must be materialized before initialization"
+            )
+        for layer in self.model.layers:
+            if (
+                layer.moe_block_name is not None
+                and type(layer.mlp) is not HFQwen3MoeSparseMoeBlock
+            ):
+                raise TypeError(
+                    "Converted experts require their own initialization contract"
+                )
+        self.apply(self._init_weights)
 
     @property
     def tp_config(self) -> Mapping[str, str]:

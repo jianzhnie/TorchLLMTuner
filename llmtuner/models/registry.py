@@ -186,7 +186,7 @@ for _model_type, _config_module, _config_name, _model_module, _model_name in (
                 if _model_type == "kimi_linear"
                 else partial(_load_class, _model_module, _model_name)
             ),
-            explicit=_model_type == "deepseek_v4",
+            explicit=True,
         )
     )
 
