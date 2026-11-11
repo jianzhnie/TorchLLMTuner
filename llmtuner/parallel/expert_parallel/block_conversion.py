@@ -28,6 +28,7 @@ from .. import compatibility
 from ..tensor_parallel.linear_ops import all_gather_along, reduce_scatter_along
 from .checkpointing import mark_experts_ep_sharded
 from .hf_inspection import (
+    FusedExperts,
     fused_experts_of,
     read_expert_groups,
     read_route_norm,
@@ -129,6 +130,117 @@ def resolve_moe_routing(block: nn.Module) -> MoERoutingBinding:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class PackedExpertBinding:
+    """Validated gate/up and down parameters; no copied or stacked storage.
+
+    Resolve after TP, and bind only to the concrete source block. Views are
+    created when conversion executes, so current parameter values are copied.
+    """
+
+    source: nn.Module
+    owner: nn.Module
+    gate_up: nn.Parameter
+    down: nn.Parameter
+    shape: tuple[int, int, int]
+
+    def validate(self, block: nn.Module) -> None:
+        """Reject replaced parameters or geometry before allocating conversion state."""
+        if (
+            block is not self.source
+            or block._modules.get("experts") is not self.owner
+            or self.owner._parameters.get("gate_up_proj") is not self.gate_up
+            or self.owner._parameters.get("down_proj") is not self.down
+            or tuple(self.gate_up.shape) != self.shape
+            or tuple(self.down.shape)
+            != (self.shape[0], self.shape[2], self.shape[1] // 2)
+        ):
+            raise ValueError("Stale EP packed expert binding")
+
+    def projections(self, block: nn.Module) -> FusedExperts:
+        """Create only role-specific views of the validated live parameters."""
+        self.validate(block)
+        hidden = self.shape[1] // 2
+        return FusedExperts(
+            self.gate_up[:, :hidden],
+            self.gate_up[:, hidden:],
+            self.down,
+            self.shape[0],
+        )
+
+
+def resolve_packed_experts(
+    block: nn.Module, *, degree: int
+) -> PackedExpertBinding | None:
+    """Bind fused parameter storage; keep legacy per-expert conversion separate."""
+    owner = block._modules.get("experts")
+    if owner is None:
+        return None
+    gate_up = owner._parameters.get("gate_up_proj")
+    down = owner._parameters.get("down_proj")
+    if not isinstance(gate_up, nn.Parameter) or not isinstance(down, nn.Parameter):
+        return None
+    # The existing adapter owns activation, bias and packed-half validation.
+    # For fused tensors this returns views, never stacked or copied parameters.
+    experts = fused_experts_of(block)
+    if experts is None:
+        raise ValueError("EP packed expert layout is not supported")
+    if experts.num_experts < 1 or experts.num_experts % degree:
+        raise ValueError(
+            f"EP degree {degree} does not divide num_experts={experts.num_experts}"
+        )
+    if gate_up.shape[1] == 0 or gate_up.shape[2] == 0:
+        raise ValueError("EP expert dimensions must be positive")
+    return PackedExpertBinding(block, owner, gate_up, down, tuple(gate_up.shape))
+
+
+def validate_moe_conversion(
+    block: nn.Module,
+    routing: MoERoutingBinding,
+    *,
+    tp_enabled: bool,
+    quantile_balancing: bool,
+    token_dispatcher: str,
+    has_ep_group: bool,
+) -> bool:
+    """Check metadata-only conversion restrictions before any weight allocation.
+
+    Return whether the existing torchtitan NPU expert implementation must be
+    preserved. No process group queries, parameter mutation or RNG consumption.
+    The caller supplies group ownership explicitly; size-one groups retain
+    their distinction from local conversion without a group.
+    """
+    if routing.source is not block:
+        raise ValueError("MoE routing binding belongs to another block")
+    if getattr(routing.router, "bias", None) is not None:
+        compatibility.router_bias(routing.router)
+    if routing.shared is not None:
+        if hasattr(block, "shared_expert_gate"):
+            compatibility.shared_expert_gate(block)
+        if tp_enabled and not (
+            getattr(block, "_tp_moe_boundary", False) and not has_ep_group
+        ):
+            compatibility.shared_expert_tp_ep(block)
+    if quantile_balancing:
+        if routing.score_func != "sigmoid":
+            compatibility.quantile_requires_sigmoid(routing.score_func, block)
+        if routing.num_expert_groups is not None and routing.num_expert_groups > 1:
+            compatibility.quantile_no_group_limit(block)
+    original_forward = block.__dict__.get("_tp_moe_original_forward", block.forward)
+    baseline_npu = (
+        device_type == "npu"
+        and getattr(original_forward, "__func__", None) is forward_torchtitan_moe
+    )
+    if baseline_npu:
+        if token_dispatcher != "alltoall":
+            raise ValueError(
+                "torchtitan NPU experts with EP require token_dispatcher='alltoall'"
+            )
+        if not has_ep_group:
+            raise ValueError("torchtitan NPU expert conversion requires an EP group")
+    return baseline_npu
+
+
 def convert_block(
     block: nn.Module,
     *,
@@ -140,29 +252,31 @@ def convert_block(
     torchao_pad_multiple: int,
     tp_enabled: bool = False,
     routing: MoERoutingBinding | None = None,
+    packed_experts: PackedExpertBinding | None = None,
 ) -> MoE:
     """Build the llmtuner MoE for one HF block and move its weights over."""
     ep_size = 1 if ep_group is None else get_world_size(ep_group)
     ep_rank = 0 if ep_group is None else get_rank(ep_group)
 
     routing = routing if routing is not None else resolve_moe_routing(block)
-    if routing.source is not block:
-        raise ValueError("MoE routing binding belongs to another block")
+    baseline_npu = validate_moe_conversion(
+        block,
+        routing,
+        tp_enabled=tp_enabled,
+        quantile_balancing=quantile_balancing,
+        token_dispatcher=token_dispatcher,
+        has_ep_group=ep_group is not None,
+    )
     router_gate = routing.router
-    if getattr(router_gate, "bias", None) is not None:
-        compatibility.router_bias(router_gate)
     shared = routing.shared
-    if shared is not None and hasattr(block, "shared_expert_gate"):
-        compatibility.shared_expert_gate(block)
     feature_parallel = bool(getattr(block, "_tp_moe_boundary", False))
-    if (
-        shared is not None
-        and tp_enabled
-        and not (feature_parallel and ep_group is None)
-    ):
-        compatibility.shared_expert_tp_ep(block)
-    experts = fused_experts_of(block)
-    assert experts is not None  # the probe established this
+    experts = (
+        packed_experts.projections(block)
+        if packed_experts is not None
+        else fused_experts_of(block)
+    )
+    if experts is None:
+        raise ValueError("MoE conversion requires a supported expert layout")
 
     num_experts = experts.num_experts
     top_k = routing.top_k
@@ -178,15 +292,6 @@ def convert_block(
 
     num_expert_groups = routing.num_expert_groups
     num_limited_groups = routing.num_limited_groups
-    original_forward = block.__dict__.get("_tp_moe_original_forward", block.forward)
-    baseline_npu = (
-        device_type == "npu"
-        and getattr(original_forward, "__func__", None) is forward_torchtitan_moe
-    )
-    if baseline_npu and token_dispatcher != "alltoall":
-        raise ValueError(
-            "torchtitan NPU experts with EP require token_dispatcher='alltoall'"
-        )
     if baseline_npu:
         grouped = NpuBaselineGroupedExperts(dim, hidden, num_local)
     elif token_dispatcher == "mc2":
@@ -217,10 +322,6 @@ def convert_block(
         # The quantile scheme is defined over sigmoid scores (the histogram
         # range derives from their [0, 1] bound) and routes freely over all
         # experts, so a softmax family or a group-limited one cannot adopt it.
-        if score_func != "sigmoid":
-            compatibility.quantile_requires_sigmoid(score_func, block)
-        if num_expert_groups is not None and num_expert_groups > 1:
-            compatibility.quantile_no_group_limit(block)
         router = QuantileBalancedTopKRouter(
             **router_options,
         )
@@ -262,10 +363,6 @@ def convert_block(
         routed_experts_cls = MC2RoutedExperts
     if baseline_npu and ep_group is not None:
         routed_experts_cls = NpuBaselineRoutedExperts
-    elif baseline_npu:
-        # Local conversion needs the generic local dispatch contract until the
-        # score-aware local adapter is implemented.
-        raise ValueError("torchtitan NPU expert conversion requires an EP group")
     moe_cls = FeatureParallelMoE if feature_parallel else MoE
     moe = moe_cls(
         num_experts=num_experts,

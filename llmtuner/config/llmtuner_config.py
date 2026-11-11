@@ -6,8 +6,7 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import Any
 
-from transformers import AutoConfig
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+from transformers.configuration_utils import PretrainedConfig
 
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.data_config import DataloaderConfig
@@ -29,6 +28,7 @@ from llmtuner.config.training_config import (
 )
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.errors import ConfigError
+from llmtuner.models.registry import get_model_spec
 from llmtuner.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -381,12 +381,26 @@ class LLMTunerConfig:
     def auto_fill_model(self) -> None:
         """Fill architecture fields from a local HF directory or Hub config."""
         mp = self.model.model_name_or_path
-        if not os.path.exists(mp) and mp in CONFIG_MAPPING:
-            return  # offline architecture name; explicit sizes are authoritative
+        registration = get_model_spec(mp) or get_model_spec(
+            mp, task="conditional_generation"
+        )
+        if not os.path.exists(mp) and registration is not None:
+            return  # registered offline name; explicit sizes are authoritative
         try:
-            hf_config = AutoConfig.from_pretrained(mp)
+            metadata, _ = PretrainedConfig.get_config_dict(mp)
+            model_type = metadata.get("model_type", "")
+            registration = get_model_spec(model_type) or get_model_spec(
+                model_type, task="conditional_generation"
+            )
+            if registration is None:
+                raise ValueError(
+                    f"No local configuration registered for {model_type!r}"
+                )
+            hf_config = registration.config_type_loader().from_pretrained(mp)
         except Exception as e:  # noqa: BLE001 - warn, keep explicit values
-            logger.warning("Could not load AutoConfig for '%s': %s", mp, e)
+            logger.warning(
+                "Could not load registered configuration for '%s': %s", mp, e
+            )
             return
         # The model factory trains the decoder described by text_config for
         # composite HF configurations; the aggregate run sizes must match it.

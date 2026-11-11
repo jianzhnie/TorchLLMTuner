@@ -40,7 +40,14 @@ from ...models.kimi.kimi_k3.moe import KimiSparseMoE
 from ...utils.logging import get_logger
 from ..plan import ParallelPlan, PlanTarget
 from ..plan import ReplacementObserver as MoEReplacementObserver
-from .block_conversion import MoERoutingBinding, convert_block, resolve_moe_routing
+from .block_conversion import (
+    MoERoutingBinding,
+    PackedExpertBinding,
+    convert_block,
+    resolve_moe_routing,
+    resolve_packed_experts,
+    validate_moe_conversion,
+)
 from .hf_inspection import (
     is_hf_moe_block,
     moe_block_of,
@@ -302,18 +309,29 @@ class MoEConversionTarget:
     attribute: str
     router_logits: bool
     routing: MoERoutingBinding | None = None
+    packed_experts: PackedExpertBinding | None = None
 
 
 def resolve_ep_plan(
-    model: nn.Module, *, degree: int = 1, implementation: str = "alltoall"
+    model: nn.Module,
+    *,
+    degree: int = 1,
+    implementation: str = "alltoall",
+    tp_enabled: bool = False,
+    quantile_balancing: bool = False,
+    has_ep_group: bool | None = None,
 ) -> ParallelPlan:
     """Bind EP conversion targets without allocating weights or running collectives.
 
-    This binds targets and generic routing, not all conversion capabilities.
+    Generic routing restrictions are checked with the supplied execution options.
+    Group presence defaults to degree > 1; pass it explicitly for size-one groups.
+    Execution revalidates restrictions defensively if options or metadata change.
     Legacy models may still use inspection here; generic conversion consumes
     the selected routing rather than reading it again. Re-resolve after config,
     TP or PP changes. Kimi retains its dedicated conversion contract.
     """
+    if isinstance(degree, bool) or not isinstance(degree, int) or degree < 1:
+        raise ValueError("EP degree must be a positive integer")
     layers = getattr(model, "layers", None)
     if layers is None:
         raise UnsupportedCombinationError(
@@ -328,6 +346,19 @@ def resolve_ep_plan(
         paths = [path for path, module in modules if module is owner]
         if not paths:
             raise ValueError("EP decoder owner is not registered in this model")
+        routing = None
+        packed_experts = None
+        if not isinstance(block, KimiSparseMoE):
+            routing = resolve_moe_routing(block)
+            validate_moe_conversion(
+                block,
+                routing,
+                tp_enabled=tp_enabled,
+                quantile_balancing=quantile_balancing,
+                token_dispatcher=implementation,
+                has_ep_group=degree > 1 if has_ep_group is None else has_ep_group,
+            )
+            packed_experts = resolve_packed_experts(block, degree=degree)
         targets.append(
             PlanTarget(
                 f"{paths[0]}.{attribute}" if paths[0] else attribute,
@@ -335,14 +366,15 @@ def resolve_ep_plan(
                 block,
                 "kimi_per_expert"
                 if isinstance(block, KimiSparseMoE)
-                else "fused_gate_up",
+                else (
+                    "fused_gate_up" if packed_experts is not None else "legacy_adapter"
+                ),
                 MoEConversionTarget(
                     owner,
                     attribute,
                     router_logits,
-                    None
-                    if isinstance(block, KimiSparseMoE)
-                    else resolve_moe_routing(block),
+                    routing,
+                    packed_experts,
                 ),
             )
         )
@@ -392,7 +424,7 @@ def swap_hf_moe_blocks(
     """Replace every HF MoE block in ``model`` with llmtuner's MoE, in place.
 
     Args:
-        model: a ``HFTransformerModel`` (anything exposing ``.layers``).
+        model: a ``TrainingModel`` (anything exposing ``.layers``).
         ep_group: the EP process group. ``None`` (or a size-1 group is not
             special-cased -- pass ``None``) keeps all experts local and routes
             them with the reordering-only dispatcher; a multi-rank group
@@ -479,7 +511,12 @@ def swap_hf_moe_blocks(
     # Bind targets after preceding stages (TP/PP) have stabilized this instance.
     degree = 1 if ep_group is None else dist.get_world_size(ep_group)
     execution_plan = resolved_plan or resolve_ep_plan(
-        model, degree=degree, implementation=token_dispatcher
+        model,
+        degree=degree,
+        implementation=token_dispatcher,
+        tp_enabled=tp_enabled,
+        quantile_balancing=quantile_balancing,
+        has_ep_group=ep_group is not None,
     )
     if (
         execution_plan.stage != "ep"
@@ -490,6 +527,7 @@ def swap_hf_moe_blocks(
     execution_plan.validate_binding(model)
     candidates = []
     routing_bindings = {}
+    packed_bindings = {}
     for target in execution_plan.targets:
         binding = target.spec
         if target.kind != "moe" or not isinstance(binding, MoEConversionTarget):
@@ -502,7 +540,18 @@ def swap_hf_moe_blocks(
         if not isinstance(target.module, KimiSparseMoE):
             if binding.routing is None or binding.routing.source is not target.module:
                 raise ValueError("EP plan requires a matching routing binding")
+            validate_moe_conversion(
+                target.module,
+                binding.routing,
+                tp_enabled=tp_enabled,
+                quantile_balancing=quantile_balancing,
+                token_dispatcher=token_dispatcher,
+                has_ep_group=ep_group is not None,
+            )
             routing_bindings[id(target.module)] = binding.routing
+            if binding.packed_experts is not None:
+                binding.packed_experts.validate(target.module)
+                packed_bindings[id(target.module)] = binding.packed_experts
     if not candidates:
         raise ValueError("EP plan must contain conversion targets")
 
@@ -573,6 +622,7 @@ def swap_hf_moe_blocks(
             moe = convert_block(
                 block,
                 routing=routing_bindings[id(block)],
+                packed_experts=packed_bindings.get(id(block)),
                 ep_group=ep_group,
                 aux_loss_coeff=aux_loss_coeff,
                 load_balance_coeff=load_balance_coeff,
@@ -587,7 +637,11 @@ def swap_hf_moe_blocks(
             # the one stacked parameter they were converted into. Bind after
             # dtype/device conversion, before installing any block.
             grouped = moe.routed_experts.inner_experts
-            projection_names = per_expert_projection_names(block.experts)
+            projection_names = (
+                None
+                if id(block) in packed_bindings
+                else per_expert_projection_names(block.experts)
+            )
             projections: list[
                 tuple[nn.Module, tuple[str, ...], tuple[torch.Tensor, ...]]
             ] = [(moe.router.gate, ("weight",), (router_gate.weight,))]

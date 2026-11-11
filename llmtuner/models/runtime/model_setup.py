@@ -29,19 +29,6 @@ def is_moe_config(config: PretrainedConfig) -> bool:
     return False
 
 
-def resolve_submodule_name(
-    module: nn.Module, names: tuple[str, ...], *, component: str
-) -> str:
-    """Return the first candidate attribute holding an ``nn.Module``."""
-    for name in names:
-        if isinstance(getattr(module, name, None), nn.Module):
-            return name
-    raise AttributeError(
-        f"{type(module).__name__} has no {component} module under any of {names}. "
-        "Add the model's spelling to the probe in HFTransformerModel.__init__."
-    )
-
-
 def validate_head_config(config: PretrainedConfig) -> None:
     """Reject GQA head counts that no attention kernel can honor."""
     num_heads = getattr(config, "num_attention_heads", None)

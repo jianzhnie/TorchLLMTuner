@@ -1,16 +1,9 @@
-"""Adapt an HF decoder to the trainer's model and input contracts.
+"""Training I/O and parallel-facing slots for registered local text models.
 
-Construction selects attention and experts backends, then applies explicit
-GDN, normalization, router, expert and QKV/RoPE policies before the optional
-lm-head cast. These policies preserve their own model and dtype constraints;
-this wrapper coordinates them rather than defining a second model architecture.
-HF supplies weight initialization; meta materialization and runtime buffer
-reconstruction are handled separately in ``materialization.py``.
-
-The wrapper exposes tok_embeddings, layers, norm, lm_head and rotary_emb for
-parallel assembly. Forward runs the text decoder and applies lm_head itself;
-``skip_lm_head=True`` returns hidden states for chunked loss. Input preparation
-and attention masks preserve explicit positions and packed-document boundaries.
+The selected model owns its decoder implementation and declares DecoderStructure.
+This adapter preserves packing, PP/CP, chunked-loss and initialization lifecycles;
+it never discovers an unknown architecture or selects an external model fallback.
+Transformers components and configuration formats remain supported dependencies.
 """
 
 from __future__ import annotations
@@ -72,17 +65,16 @@ from .materialization import validate_rotary_initialization
 from .model_setup import (
     apply_cast_lm_head,
     configure_experts_implementation,
-    resolve_submodule_name,
     validate_head_config,
 )
 
 logger = get_logger(__name__)
 
-__all__ = ["HFTransformerModel"]
+__all__ = ["TrainingModel"]
 
 
-class HFTransformerModel(nn.Module):
-    """A HF decoder stack behind a uniform training forward.
+class TrainingModel(nn.Module):
+    """A registered local decoder behind the production training interface.
 
     Args:
         config: the HF config to instantiate (see ``build_model_config``).
@@ -155,7 +147,7 @@ class HFTransformerModel(nn.Module):
                 or structure.head != "lm_head"
             ):
                 raise ValueError(
-                    "The HF training adapter requires decoder-local layers and lm_head"
+                    "The training adapter requires decoder-local layers and lm_head"
                 )
             bound = structure.bind(self.model)
             # Store paths, not a lasting snapshot of references: PP may replace
@@ -166,11 +158,14 @@ class HFTransformerModel(nn.Module):
             )
             object.__setattr__(self, "_norm_name", structure.norm.rsplit(".", 1)[-1])
         else:
-            self._bind_legacy_decoder()
+            raise TypeError(
+                "Registered models must declare decoder_structure; "
+                "automatic decoder inspection is disabled"
+            )
 
         if get_rank() == 0:
             logger.info(
-                "HF adaptation options (construction only): model=%s, "
+                "Model runtime options (construction only): model=%s, "
                 "attention=%s -> %s, experts=%s, norm=%s, router_dtype=%s, "
                 "linear_attention=%s, gdn_policy=%s, qkv=%s, "
                 "rotary_dtype=%s, rotary_cache=%s, lm_head_dtype=%s",
@@ -187,26 +182,6 @@ class HFTransformerModel(nn.Module):
                 getattr(config, "rotary_cache_dtype", None),
                 getattr(config, "compute_dtype", None),
             )
-
-    def _bind_legacy_decoder(self) -> None:
-        """Keep candidate-name inspection confined to unmigrated models."""
-        object.__setattr__(self, "_decoder", self.model.model)
-        object.__setattr__(
-            self,
-            "_embed_name",
-            resolve_submodule_name(
-                self._decoder, ("embed_tokens", "wte"), component="token embedding"
-            ),
-        )
-        object.__setattr__(
-            self,
-            "_norm_name",
-            resolve_submodule_name(
-                self._decoder,
-                ("norm", "final_layernorm", "ln_f"),
-                component="final norm",
-            ),
-        )
 
     # -- parts, under the names the rest of the framework uses ------------------
 
@@ -328,54 +303,13 @@ class HFTransformerModel(nn.Module):
 
     @property
     def tp_config(self) -> dict[str, str]:
-        """Model TP declarations rewritten to this wrapper's module paths.
+        """Translate the model's public TP contract to wrapper-relative paths.
 
-        An explicit decoder's model-owned ``tp_config`` takes precedence over
-        HF-generated patterns. The compatibility lookup below applies when no
-        model-owned declaration is provided.
-
-        HF states its plan relative to the model it ships -- ``layers.*.q_proj``,
-        plus a ``model.``-prefixed variant for families that nest one level
-        deeper. The parallel layer, however, walks *this* wrapper, whose
-        ``named_modules`` paths all sit under ``model.`` because that is the
-        attribute the HF CausalLM is held in. Prefixing every pattern with
-        ``model.`` maps one spelling onto the other, so HF's own two variants
-        both resolve here and no call site has to know either layout.
-
-        Without this the plan is simply not found (the attribute lives on the
-        inner HF model) and ``apply_tp`` silently shards nothing -- a replicated
-        run that looks like a working one. That failure is what makes this
-        translation load-bearing rather than cosmetic.
-
-        Returns ``{}`` when the model ships no plan. The parallel entry point
-        rejects an enabled TP run without a plan or explicit pattern overrides.
-
-        Compatibility lookup reads ``_tp_config`` first and falls back to its
-        ``tp_config`` property only when the attribute carries nothing. HF builds
-        the instance ``_tp_config`` from ``config.base_model_tp_config`` plus each
-        child module's own plan, which is the TP plan this layer wants; the
-        property additionally switches to ``_ep_config`` when the config asks for
-        expert parallelism, and those are EP specs, not TP ones. The fallback is
-        for a model that exposes the plan through the property alone. Versions
-        exposing ``_tp_plan`` / ``tp_plan`` are supported through the same
-        pattern translation.
+        An empty declaration stays empty: explicit user overrides may provide a
+        plan, otherwise the TP entry point rejects the unsupported request.
+        Private Transformers plans are not alternative architecture contracts.
         """
-        # Model-owned declarations take precedence over HF-generated patterns.
-        plan = (
-            getattr(self.model, "tp_config", None)
-            if isinstance(
-                getattr(self.model, "decoder_structure", None), DecoderStructure
-            )
-            else None
-        ) or {}
-        if not plan:
-            plan = getattr(self.model, "_tp_config", None) or {}
-        if not plan:
-            plan = getattr(self.model, "tp_config", None) or {}
-        if not plan:
-            plan = getattr(self.model, "_tp_plan", None) or {}
-        if not plan:
-            plan = getattr(self.model, "tp_plan", None) or {}
+        plan = getattr(self.model, "tp_config", None) or {}
         return {f"model.{pattern}": spec for pattern, spec in plan.items()}
 
     def validate_parallel(self, *, tp_degree: int, ep_degree: int) -> None:

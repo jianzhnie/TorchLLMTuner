@@ -346,7 +346,7 @@ class Trainer:
 
         ``labels`` arrives already aligned with ``logits`` -- ``logits[t]``
         predicts ``labels[t]``, both sources having done their shift upstream
-        (see ``HFTransformerModel.preprocess_inputs``). No shift happens here,
+        (see ``TrainingModel.preprocess_inputs``). No shift happens here,
         which is what lets the two sources share one loss: the synthetic path
         slots its rows together and the packed path arrives already shifted, and
         both mark the positions that must not be predicted with ``IGNORE_INDEX``

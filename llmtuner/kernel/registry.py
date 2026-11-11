@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 from typing import Any, TypeVar
 
 import torch
 
 from ..accelerator.device import device_type as default_device_type
-from .logging import get_logger
+from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
 

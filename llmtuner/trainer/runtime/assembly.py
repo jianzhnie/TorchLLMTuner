@@ -55,19 +55,19 @@ from ...models.common.moe.bias_update import (
     register_moe_balancing_hook,
 )
 from ...models.common.moe.experts import RoutedExperts
-from ...models.hf.factory import (
+from ...models.qwen.qwen3_5.gdn_numerics import validate_gdn_numerical_training
+from ...models.qwen.qwen3_5.linear_attention import validate_linear_attention_training
+from ...models.runtime.factory import (
     build_model_config_for,
     unwrap_text_config,
 )
-from ...models.hf.materialization import (
+from ...models.runtime.materialization import (
     initialize_random_hf_model,
     initialize_rotary_on_device,
     materialize_meta_model,
 )
-from ...models.hf.model import HFTransformerModel
-from ...models.hf.state_dict_adapter import HFTransformerStateDictAdapter
-from ...models.qwen.qwen3_5.gdn_numerics import validate_gdn_numerical_training
-from ...models.qwen.qwen3_5.linear_attention import validate_linear_attention_training
+from ...models.runtime.model import TrainingModel
+from ...models.runtime.state_dict_adapter import ModelStateDictAdapter
 from ...parallel import compatibility
 from ...parallel.parallelize import parallelize_hf_transformers
 from ...parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
@@ -86,7 +86,7 @@ if TYPE_CHECKING:
 
 def _build_model(
     trainer: Trainer,
-) -> tuple[HFTransformerModel, PretrainedConfig, bool]:
+) -> tuple[TrainingModel, PretrainedConfig, bool]:
     """Build the HF model and resolve whether to load initial HF weights.
 
     Returns ``(model, hf_model_config, load_hf_weights)``; the model is on
@@ -176,9 +176,9 @@ def _build_model(
             )
     if load_hf_weights or cfg.model.initialization_device == "meta":
         with torch.device("meta"):
-            model = HFTransformerModel(hf_model_config)
+            model = TrainingModel(hf_model_config)
     else:
-        model = HFTransformerModel(hf_model_config).to(trainer.device)
+        model = TrainingModel(hf_model_config).to(trainer.device)
         initialize_rotary_on_device(model, trainer.device)
     return model, hf_model_config, load_hf_weights
 
@@ -194,7 +194,7 @@ def _fsdp_managed_parameters(model: torch.nn.Module) -> set[torch.nn.Parameter]:
 
 
 def _apply_parallelism(
-    trainer: Trainer, model: HFTransformerModel, *, load_hf_weights: bool
+    trainer: Trainer, model: TrainingModel, *, load_hf_weights: bool
 ) -> None:
     """Apply configured parallel stages, then materialize HF-load targets."""
     cfg = trainer.cfg
@@ -361,7 +361,7 @@ def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> 
                 trainer.device, topology=trainer.parallel_dims
             ),
         }
-        sd_adapter = HFTransformerStateDictAdapter(
+        sd_adapter = ModelStateDictAdapter(
             hf_model_config,
             cfg.checkpoint.initial_load_path or cfg.hf_model,
             qwen3_expert_parallel=(

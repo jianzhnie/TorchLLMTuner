@@ -569,7 +569,7 @@ def model_tp_config(model: nn.Module) -> Mapping[str, str | ShardingConfig]:
     Prefers the ``tp_config`` property over the raw ``_tp_config`` attribute.
     ``transformers`` exposes the plan as a property on ``PreTrainedModel`` (its
     instance ``_tp_config`` built from ``config.base_model_tp_config`` plus each
-    child module's own plan), and ``HFTransformerModel`` re-parents the HF model
+    child module's own plan), and ``TrainingModel`` re-parents the HF model
     under ``self.model``, so *its* plan has to be rewritten to survive the extra
     level. A wrapper that exposes only the property -- the shape HF itself
     guarantees -- would otherwise be read as "no plan" and shard nothing, so

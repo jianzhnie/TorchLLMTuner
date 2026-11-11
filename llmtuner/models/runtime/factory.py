@@ -1,10 +1,8 @@
-"""Build Hugging Face model configs and resolve their model classes.
+"""Load model configurations and resolve exclusively registered local models.
 
-The helpers build the HF ``PretrainedConfig`` and resolve its ``ForCausalLM``
-class. Meta storage allocation lives in ``materialization.py``; FLOPs estimation
-lives in ``llmtuner.utils.flops``. The model body and five-part contract
-live in ``model.py``, which imports these helpers; nothing here imports the model
-body.
+External configuration formats remain supported. Loading a configuration does not
+permit automatic external model construction; resolve_model_class enforces the
+production registry boundary before any model allocation.
 """
 
 from __future__ import annotations
@@ -13,11 +11,7 @@ import os
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
-import transformers
-from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from ..registry import get_model_spec
 from .attention_backend import ATTENTION_BACKEND
@@ -64,13 +58,17 @@ def build_model_config(
     empty dict to use architecture defaults. ``None`` loads the config from a
     local checkpoint directory or Hub identifier.
     """
-    architecture = get_model_spec(model_name_or_path)
+    architecture = get_model_spec(model_name_or_path) or get_model_spec(
+        model_name_or_path, task="conditional_generation"
+    )
     # Some HF composite constructors modify nested configuration dictionaries.
     overrides = deepcopy(arch_overrides) if arch_overrides is not None else {}
     if arch_overrides is not None:
         overrides.setdefault("max_position_embeddings", seq_len)
         if architecture is None:
-            config = AutoConfig.for_model(model_name_or_path, **overrides)
+            raise ValueError(
+                f"No local configuration registered for {model_name_or_path!r}"
+            )
         else:
             config = architecture.build_config(**overrides)
         if hasattr(config, "text_config"):
@@ -79,19 +77,16 @@ def build_model_config(
             )
         return config
 
-    # Resolve only the selected architecture's hooks before constructing any
-    # config. HF may still cache an older class after an exist_ok replacement.
+    # Read external metadata, but let only the registered config class load it.
+    # Do not mutate AutoConfig's process-global registry during a training run.
     metadata, _ = PretrainedConfig.get_config_dict(model_name_or_path)
-    architecture = get_model_spec(metadata.get("model_type", ""))
-    if architecture is not None:
-        # Refresh even an existing HF entry: exist_ok registry replacement must
-        # also take effect when loading a saved configuration.
-        AutoConfig.register(
-            architecture.model_type,
-            architecture.config_type_loader(),
-            exist_ok=True,
-        )
-    config = AutoConfig.from_pretrained(model_name_or_path)
+    model_type = metadata.get("model_type", "")
+    architecture = get_model_spec(model_type) or get_model_spec(
+        model_type, task="conditional_generation"
+    )
+    if architecture is None:
+        raise ValueError(f"No local configuration registered for {model_type!r}")
+    config = architecture.config_type_loader().from_pretrained(model_name_or_path)
     text_config = getattr(config, "text_config", config)
     # Custom configs need not declare a positional limit. Match offline
     # construction, which supplies the requested length when it is absent.
@@ -137,7 +132,8 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
     # Only registered architecture names select offline construction. Missing
     # paths and Hub IDs belong to from_pretrained, which owns their validation.
     offline = not os.path.exists(cfg.hf_model) and (
-        cfg.hf_model in CONFIG_MAPPING or get_model_spec(cfg.hf_model) is not None
+        get_model_spec(cfg.hf_model) is not None
+        or get_model_spec(cfg.hf_model, task="conditional_generation") is not None
     )
     overrides = (
         {
@@ -157,12 +153,10 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
         else None
     )
     if overrides is not None:
-        architecture = get_model_spec(cfg.hf_model)
-        config_type = (
-            architecture.config_type_loader()
-            if architecture is not None
-            else CONFIG_MAPPING[cfg.hf_model]
+        architecture = get_model_spec(cfg.hf_model) or get_model_spec(
+            cfg.hf_model, task="conditional_generation"
         )
+        config_type = architecture.config_type_loader()
         # HF may assign extra kwargs after its canonical fields. A generic
         # default alias must not overwrite an explicit architecture dimension
         # (e.g. intermediate_size -> moe_intermediate_size in DeepSeek V4).
@@ -184,8 +178,8 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
     """Return the text sub-config of a composite (vision-language) model.
 
     A VL checkpoint's top config describes the conditional model, not the text
-    stack we train; its ``text_config`` does. Also ensure the sub-config carries
-    ``architectures``, or the class lookup below has nothing to resolve.
+    stack we train; its ``text_config`` does. Model lookup uses the registered
+    model_type, never external class names in an architectures field.
     """
     if not hasattr(config, "text_config"):
         return config
@@ -196,35 +190,16 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
     for name in _RUNTIME_CONFIG_FIELDS:
         if hasattr(config, name):
             setattr(text_config, name, getattr(config, name))
-    if not getattr(text_config, "architectures", None):
-        cls_name = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get(text_config.model_type, "")
-        if cls_name:
-            text_config.architectures = [cls_name]
     return text_config
 
 
 def resolve_model_class(config: PretrainedConfig) -> type[nn.Module]:
-    """Prefer a model-owned implementation, then resolve the HF model class.
-
-    Registered implementations need not inherit PreTrainedModel. The HF
-    fallback prefers the declared class name, then its model-type mapping.
-    """
-    architecture = get_model_spec(config.model_type)
-    if architecture is not None:
-        return architecture.resolve_model_class()
-
-    for name in (config.architectures or []) + [
-        MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get(getattr(config, "model_type", ""), ""),
-    ]:
-        if not name:
-            continue
-        cls = getattr(transformers, name, None)
-        if isinstance(cls, type) and issubclass(cls, transformers.PreTrainedModel):
-            return cls
-
-    raise ImportError(
-        f"Could not resolve a ForCausalLM class for model_type "
-        f"{getattr(config, 'model_type', None)!r} "
-        f"(architectures={getattr(config, 'architectures', None)!r}). "
-        "Check that the installed transformers version ships this model."
-    )
+    """Resolve a registered local implementation without an external fallback."""
+    specification = get_model_spec(config.model_type)
+    if specification is None:
+        raise ValueError(
+            f"No local model registered for {config.model_type!r}; "
+            "register an explicit implementation before training. "
+            "Automatic Transformers model fallback is disabled."
+        )
+    return specification.resolve_model_class()

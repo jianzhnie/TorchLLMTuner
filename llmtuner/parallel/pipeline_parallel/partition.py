@@ -304,7 +304,7 @@ def build_stage_from_modules(
 
     # Extra top-level modules the model's ``named_children`` override does
     # not present (e.g. a multimodal encoder registered beside the decoder
-    # on ``HFTransformerModel``). Apply keep-or-blank against the real
+    # on ``TrainingModel``). Apply keep-or-blank against the real
     # ``_modules`` children: a non-owner
     # gets an Identity, exactly like the decoder parts above. Without
     # this, the deep copy would leave a live copy on every stage and two

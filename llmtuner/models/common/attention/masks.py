@@ -21,7 +21,7 @@ so a CPU-only or pre-flex torch can still import this module and run those.
 Why a BlockMask at all, rather than ``is_causal=True``: the package feeds
 documents packed end-to-end into one sequence, so a causal mask alone would let
 token 0 of document N attend to the tail of document N-1. Expressing "causal AND
-same document" needs a mask modifier. See ``HFTransformerModel.forward`` for
+same document" needs a mask modifier. See ``TrainingModel.forward`` for
 where these get attached.
 
 Every helper here reads document boundaries from the same convention --
@@ -354,7 +354,7 @@ def build_dense_attention_mask(
     For models that cannot take a flex ``BlockMask``: DeepSeek-style sparse
     attention (DSA) calls ``.dim()`` on its incoming mask and adds it to the
     scores before selecting the top-k keys, so the mask has to be a plain
-    tensor. ``HFTransformerModel.get_attention_masks`` returns this instead of a
+    tensor. ``TrainingModel.get_attention_masks`` returns this instead of a
     BlockMask for those models; flex still runs, consuming the dense mask as its
     ``score_mask`` (HF's flex integration branches on the mask type).
 

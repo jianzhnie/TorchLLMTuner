@@ -226,7 +226,7 @@ class MoE(nn.Module):
 
         The HF decoder layer calls its MoE as ``self.mlp(hidden_states)`` --
         its fixed signature has no slot for a mask, so the wrapper
-        (``HFTransformerModel.forward``) stages the microbatch's mask on every
+        (``TrainingModel.forward``) stages the microbatch's mask on every
         swapped MoE block just before the decoder runs. The staged mask stays
         in effect until the next staging (the wrapper stages every
         microbatch, ``None`` included), so an activation-checkpointing

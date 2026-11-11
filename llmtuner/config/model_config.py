@@ -16,9 +16,9 @@ class ModelConfig:
     """Model architecture, with CLI sizes filled from saved HF configurations."""
 
     model_name_or_path: str = field(
-        default="llama",
+        default="qwen3_moe",
         metadata={
-            "help": "HF architecture name, local model directory, or hub id 'org/name'"
+            "help": "Registered architecture, local model directory, or Hub model ID"
         },
     )
     initialization_device: str = field(

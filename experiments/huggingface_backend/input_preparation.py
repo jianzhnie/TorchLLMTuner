@@ -8,23 +8,24 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.attention.flex_attention import BlockMask, and_masks
 
-from ...components.loss import next_token_targets
-from ...datasets.contracts import Batch, TrainerBatch
-from ...errors import UnsupportedCombinationError
-from ...parallel.context_parallel.input_sharding import (
+from llmtuner.components.loss import next_token_targets
+from llmtuner.datasets.contracts import Batch, TrainerBatch
+from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.models.common.attention.masks import (
+    build_dense_attention_mask,
+    create_attention_mask,
+    get_causal_mask_mod,
+    get_efficient_causal_mask_mod_for_packed_document,
+)
+from llmtuner.parallel.context_parallel.input_sharding import (
     shard_attention_mask_for_cp,
     shard_batch_for_cp,
     shard_batch_for_tp,
     shard_padding_mask_for_cp,
     shard_padding_mask_for_tp,
 )
-from ...parallel.topology import ParallelTopology
-from ..common.attention.masks import (
-    build_dense_attention_mask,
-    create_attention_mask,
-    get_causal_mask_mod,
-    get_efficient_causal_mask_mod_for_packed_document,
-)
+from llmtuner.parallel.topology import ParallelTopology
+
 from .attention_backend import ATTENTION_BACKEND, CP_SDPA_BACKEND
 from .attention_masks import mask_dtype
 

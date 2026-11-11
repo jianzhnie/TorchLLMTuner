@@ -166,7 +166,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             the run's dump folder by the caller.
         sd_adapter: converts model state dicts between the native layout and
             another format (HF safetensors). ``builder`` always passes
-            ``HFTransformerStateDictAdapter``; passing none rejects the HF
+            ``ModelStateDictAdapter``; passing none rejects the HF
             export paths at construction.
     """
 

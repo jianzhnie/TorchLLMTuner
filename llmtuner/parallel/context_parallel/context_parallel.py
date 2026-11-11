@@ -10,7 +10,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.parallel.compatibility import eager_flex_parallel
 
-from ...models.hf.attention_backend import ATTENTION_BACKEND, CP_SDPA_BACKEND
+from ...models.runtime.attention_backend import ATTENTION_BACKEND, CP_SDPA_BACKEND
 from ...utils.logging import get_logger
 from ..attention_heads import require_heads_divisible_by
 from ..tensor_parallel.tensor_parallel import ReplicatedAttentionSequenceBoundary
@@ -209,7 +209,7 @@ def apply_cp(
     layers = getattr(model, "layers", None)
     if layers is None:
         raise TypeError(
-            f"apply_cp expects a HFTransformerModel (with .layers); got "
+            f"apply_cp expects a TrainingModel (with .layers); got "
             f"{type(model).__name__}."
         )
     packed = getattr(model_config, "attn_mask_type", "causal") == "block_causal"

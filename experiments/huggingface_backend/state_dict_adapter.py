@@ -17,16 +17,18 @@ import torch
 import torch.distributed as dist
 from safetensors import safe_open
 
-from ...accelerator.collectives import synchronize_local_errors
-from ...components.checkpointer.core.checkpoint_keys import SAFETENSORS_INDEX
-from ...components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
-from ...components.checkpointer.hf.hf_expert_storage import (
+from llmtuner.accelerator.collectives import synchronize_local_errors
+from llmtuner.components.checkpointer.core.checkpoint_keys import SAFETENSORS_INDEX
+from llmtuner.components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
+from llmtuner.components.checkpointer.hf.hf_expert_storage import (
     GroupedExpertHuggingFaceStorageReader,
     grouped_expert_key,
     native_ep_expert_key,
 )
-from ...components.checkpointer.hf.hf_storage import IndexedHuggingFaceStorageReader
-from ..kimi.kimi_k3.checkpoint import convert_kimi_expert_state
+from llmtuner.components.checkpointer.hf.hf_storage import (
+    IndexedHuggingFaceStorageReader,
+)
+from llmtuner.models.kimi.kimi_k3.checkpoint import convert_kimi_expert_state
 
 
 class HFTransformerStateDictAdapter:

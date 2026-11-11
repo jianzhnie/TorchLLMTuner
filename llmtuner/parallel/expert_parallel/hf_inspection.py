@@ -99,6 +99,7 @@ __all__ = [
     "is_hf_moe_block",
     "moe_block_of",
     "per_expert_projection_names",
+    "per_expert_weights_of",
     "read_expert_groups",
     "read_route_norm",
     "read_route_scale",
@@ -184,20 +185,16 @@ def per_expert_projection_names(experts: nn.Module) -> tuple[str, str, str] | No
     return None
 
 
-def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None:
-    """Read a pre-5.x per-expert module list as the fused 5.x parameters.
+class PerExpertWeights(NamedTuple):
+    """Validated references to legacy expert weights, without stacked storage."""
 
-    transformers 5.x collapsed "one module per expert" into two stacked
-    parameters; the 4.x line still holds one
-    ``Qwen3MoeMLP(gate_proj, up_proj, down_proj)`` -- or
-    ``MixtralBlockSparseTop2MLP(w1, w3, w2)`` -- per expert. Stacking those three
-    projections into ``(E, 2F, D)`` / ``(E, D, F)`` here keeps the swap, the
-    weight move and the tests on the single layout they already share, instead
-    of teaching each of them a second one.
+    gates: tuple[torch.Tensor, ...]
+    ups: tuple[torch.Tensor, ...]
+    downs: tuple[torch.Tensor, ...]
 
-    Returns ``None`` for a list that is not one of the recognized spellings, so
-    the caller keeps its "no MoE block here" behaviour.
-    """
+
+def per_expert_weights_of(experts: nn.Module) -> PerExpertWeights | None:
+    """Validate individual projections without allocating replacement tensors."""
     if not isinstance(experts, nn.ModuleList | nn.Sequential | list | tuple):
         return None
     members = list(experts)
@@ -269,17 +266,26 @@ def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None
                     "EP cannot stack experts with different requires_grad flags "
                     f"for {name}; grouped parameters require uniform freezing."
                 )
-        # Keep projections separate: concatenating gate/up merges their
-        # requires_grad flags and can unfreeze an otherwise frozen projection.
-        # Construction may run under no_grad; copying weights must not infer
-        # parameter trainability from the caller's autograd recording mode.
-        return FusedExperts(
-            gate_EFD=torch.stack(gates).requires_grad_(gates[0].requires_grad),
-            up_EFD=torch.stack(ups).requires_grad_(ups[0].requires_grad),
-            down_EDF=torch.stack(downs).requires_grad_(downs[0].requires_grad),
-            num_experts=len(members),
-        )
+        return PerExpertWeights(tuple(gates), tuple(ups), tuple(downs))
     return None
+
+
+def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None:
+    """Stack validated legacy weights only when conversion needs tensor storage."""
+    weights = per_expert_weights_of(experts)
+    if weights is None:
+        return None
+    # Preserve each projection's freezing even under a no_grad caller.
+    return FusedExperts(
+        gate_EFD=torch.stack(weights.gates).requires_grad_(
+            weights.gates[0].requires_grad
+        ),
+        up_EFD=torch.stack(weights.ups).requires_grad_(weights.ups[0].requires_grad),
+        down_EDF=torch.stack(weights.downs).requires_grad_(
+            weights.downs[0].requires_grad
+        ),
+        num_experts=len(weights.gates),
+    )
 
 
 def fused_experts_of(block: nn.Module) -> FusedExperts | None:
@@ -395,22 +401,38 @@ def is_hf_moe_block(module: nn.Module) -> bool:
     """
     # Unsupported layouts must propagate their error rather than be skipped
     # as ordinary dense blocks.
-    experts = fused_experts_of(module)
-    if experts is None:
-        return False
     contract = getattr(module, "moe_contract", None)
-    if contract is not None and experts.num_experts != contract.num_experts:
+    layout = getattr(
+        module,
+        "expert_layout",
+        contract.expert_layout if contract is not None else None,
+    )
+    owner = getattr(module, "experts", None)
+    if layout is None and isinstance(
+        owner, nn.ModuleList | nn.Sequential | list | tuple
+    ):
+        weights = per_expert_weights_of(owner)
+        if weights is None:
+            return False
+        num_experts = len(weights.gates)
+        projection_devices = {weight.device for group in weights for weight in group}
+    else:
+        experts = fused_experts_of(module)
+        if experts is None:
+            return False
+        num_experts = experts.num_experts
+        projection_devices = {
+            experts.gate_EFD.device,
+            experts.up_EFD.device,
+            experts.down_EDF.device,
+        }
+    if contract is not None and num_experts != contract.num_experts:
         raise ValueError(
-            f"Declared {contract.num_experts} experts, found {experts.num_experts}"
+            f"Declared {contract.num_experts} experts, found {num_experts}"
         )
     router = router_of(module)
     if not has_router_weight(router) or resolve_top_k(module) is None:
         return False
-    projection_devices = {
-        experts.gate_EFD.device,
-        experts.up_EFD.device,
-        experts.down_EDF.device,
-    }
     if projection_devices != {router.weight.device}:
         raise UnsupportedCombinationError(
             "EP cannot convert a MoE whose router and routed expert "

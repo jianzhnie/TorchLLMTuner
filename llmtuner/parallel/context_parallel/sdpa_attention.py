@@ -1,7 +1,7 @@
 """CP attention on the sdpa backend: the same redistribution, a tensor mask.
 
 ``attention.py``'s kernel ends in flex, which the NPU builds do not have:
-llmtuner selects the flex backend on CUDA only (``models/hf/attention_backend``),
+llmtuner selects the flex backend on CUDA only (``models/runtime/attention_backend``),
 and its kv path additionally needs torch's private ``flex_cp_allgather``, which
 this torch does not carry. The *redistribution* halves are backend independent
 -- ``tests/integration_tests/cp_equivalence.py`` verifies them on CPU/gloo,
