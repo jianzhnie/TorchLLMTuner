@@ -11,7 +11,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
 from llmtuner.errors import UnsupportedCombinationError
 
-from ....accelerator.npu_ops import rms_norm
+from ....kernel.ops.rms_norm import rms_norm
 from .normalization import forward_aten_rms_norm
 from .residual_normalization import (
     apply_joint_residual_norm,

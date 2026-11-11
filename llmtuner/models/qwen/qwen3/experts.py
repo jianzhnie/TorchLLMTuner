@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ....accelerator.npu_ops import moe_token_permute
+from ....kernel.ops.moe import moe_token_permute
 from ...common.scatter_add import deterministic_scatter_add
 
 

@@ -74,7 +74,8 @@ if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
 else:
     flash_attn_varlen_func = None
-from ....accelerator.npu_ops import fusion_attention, rotary_mul
+from ....kernel.ops.attention import fusion_attention
+from ....kernel.ops.rotary import rotary_mul
 
 
 def multihead_attention(
