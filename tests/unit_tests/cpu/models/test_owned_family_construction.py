@@ -48,6 +48,7 @@ def test_explicit_family_preserves_initialization_forward_and_checkpoint(
     assert torch.equal(torch.get_rng_state(), expected_rng)
     assert type(owned.model) is not type(reference.model)
     assert type(owned.model.layers[0]) is not type(reference.model.layers[0])
+    assert owned.model.layers[0].mlp.router_logits_in_output is False
     assert reference.state_dict().keys() == owned.state_dict().keys()
     for name, value in reference.state_dict().items():
         assert torch.equal(value, owned.state_dict()[name]), name

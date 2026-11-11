@@ -343,10 +343,14 @@ class NativeModel(nn.Module):
 
 register_model_architecture(ModelArchitecture.from_types(
     'native_test', config_type=Config, model_class_loader=lambda: NativeModel,
+    explicit=True,
 ))
 registration = get_model_architecture('native_test')
 assert registration.config_type_loader() is Config
-model = registration.model_class_loader()(registration.config_factory())
+from llmtuner.models.explicit import build_explicit_model
+config = registration.config_factory()
+config.model_type = "native_test"
+model = build_explicit_model(config)
 optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 before = model.projection.weight.detach().clone()
 model(torch.ones(2, 3)).sum().backward()
@@ -371,6 +375,7 @@ def test_explicit_factory_is_opt_in_and_lazy(monkeypatch):
 
     registration = ModelArchitecture.from_types(
         "deepseek_v4",
+        explicit=True,
         config_type=PretrainedConfig,
         model_class_loader=lambda: model_class,
     )
@@ -390,7 +395,10 @@ def test_explicit_and_training_resolution_share_registered_constructor(monkeypat
             self.projection = nn.Linear(2, 2)
 
     registration = ModelArchitecture.from_types(
-        "deepseek_v4", config_type=PretrainedConfig, model_class_loader=lambda: Model
+        "deepseek_v4",
+        explicit=True,
+        config_type=PretrainedConfig,
+        model_class_loader=lambda: Model,
     )
     monkeypatch.setitem(architecture._ARCHITECTURES, "deepseek_v4", registration)
     config = PretrainedConfig(model_type="deepseek_v4")
@@ -414,3 +422,32 @@ def test_explicit_factory_does_not_enable_other_registered_architectures():
 @pytest.mark.parametrize("model_type", ["kimi_k3", "qwen3_5", "qwen3_5_moe"])
 def test_composite_explicit_models_remain_outside_automatic_registry(model_type):
     assert get_model_architecture(model_type) is None
+
+
+@pytest.mark.parametrize("model_type", ["kimi_k3", "qwen3_5", "qwen3_5_moe"])
+def test_composite_registration_is_task_scoped(model_type):
+    entry = get_model_architecture(model_type, task="conditional_generation")
+    assert entry is not None
+    assert entry.explicit
+    assert get_model_architecture(model_type) is None
+
+
+def test_explicit_factory_uses_registered_composite_constructor(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.models.explicit import build_explicit_model
+
+    config = SimpleNamespace(model_type="composite_test")
+    expected = object()
+    entry = ModelArchitecture.from_types(
+        config.model_type,
+        config_type=SimpleNamespace,
+        model_class_loader=lambda: (
+            lambda received: expected if received is config else None
+        ),
+        task="conditional_generation",
+        explicit=True,
+    )
+    monkeypatch.setitem(architecture._ARCHITECTURES, config.model_type, entry)
+    assert get_model_architecture(config.model_type) is None
+    assert build_explicit_model(config) is expected

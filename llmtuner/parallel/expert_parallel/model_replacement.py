@@ -264,9 +264,16 @@ def find_moe_candidates(
     candidates = []
     for layer in layers:
         attr, block = moe_block_of(layer)
-        if block is None or not (
-            isinstance(block, KimiSparseMoE) or is_hf_moe_block(block)
-        ):
+        if block is None:
+            continue
+        if not (isinstance(block, KimiSparseMoE) or is_hf_moe_block(block)):
+            if hasattr(layer, "moe_block_name"):
+                raise UnsupportedCombinationError(
+                    f"Declared MoE slot {type(layer).__name__}.{attr} holds "
+                    f"{type(block).__name__}, whose expert layout has no EP "
+                    "conversion adapter. Provide an explicit layout adapter "
+                    "before enabling EP conversion."
+                )
             continue
         wants_router_logits = returns_router_logits(block)
         if wants_router_logits and getattr(hf_config, "output_router_logits", False):

@@ -1719,3 +1719,114 @@ def test_invalid_router_output_contract_is_rejected():
 
     with pytest.raises(TypeError, match="must be a bool"):
         returns_router_logits(InvalidBlock())
+
+
+@pytest.mark.parametrize("slot", ["", "mlp.experts", 1, False, "missing"])
+def test_invalid_moe_slot_declaration_does_not_fall_back(slot):
+    from llmtuner.parallel.expert_parallel.hf_inspection import moe_block_of
+
+    layer = torch.nn.Module()
+    layer.mlp = torch.nn.Linear(2, 2)
+    layer.moe_block_name = slot
+    with pytest.raises(ValueError, match="moe_block_name"):
+        moe_block_of(layer)
+
+
+def test_declared_moe_slot_is_authoritative_and_tracks_replacement(monkeypatch):
+    from llmtuner.parallel.expert_parallel import hf_inspection
+
+    def unexpected(_module):
+        raise AssertionError("declared decoder must not probe candidate structure")
+
+    monkeypatch.setattr(hf_inspection, "is_hf_moe_block", unexpected)
+    layer = torch.nn.Module()
+    layer.mlp = torch.nn.Linear(2, 2)
+    layer.expert_block = torch.nn.Linear(2, 2)
+    layer.moe_block_name = "expert_block"
+    assert hf_inspection.moe_block_of(layer) == ("expert_block", layer.expert_block)
+    old = layer.expert_block
+    layer.expert_block = torch.nn.Linear(2, 2)
+    assert layer.expert_block is not old
+    assert hf_inspection.moe_block_of(layer)[1] is layer.expert_block
+    layer.moe_block_name = None
+    assert hf_inspection.moe_block_of(layer)[1] is None
+
+
+def test_owned_qwen3_ep_conversion_does_not_inspect_forward_source(monkeypatch):
+    from llmtuner.parallel.expert_parallel import hf_inspection
+
+    config = _config(norm_topk_prob=True, aux_coeff=0.0)
+    config.mlp_only_layers = [1]
+    model = _model(config)
+    assert model.layers[0].moe_block_name == "mlp"
+    assert model.layers[1].moe_block_name is None
+    dense_mlp = model.layers[1].mlp
+    ids, positions = _data()
+    expected = model(ids, positions=positions)
+
+    def unexpected(_module):
+        raise AssertionError("owned Qwen3 must declare router output arity")
+
+    monkeypatch.setattr(hf_inspection.inspect, "getsource", unexpected)
+    swap_hf_moe_blocks(model)
+    assert isinstance(model.layers[0].mlp, MoE)
+    assert model.layers[1].mlp is dense_mlp
+    actual = model(ids, positions=positions)
+    torch.testing.assert_close(actual, expected, atol=TOL, rtol=TOL)
+
+
+def test_unsupported_declared_moe_layout_fails_before_any_replacement():
+    model = _model(_config(norm_topk_prob=True))
+    model.layers[1].mlp = torch.nn.Linear(64, 64)
+    original_blocks = [layer.mlp for layer in model.layers]
+    original_parameters = dict(model.named_parameters())
+    with pytest.raises(UnsupportedCombinationError, match="Declared MoE slot"):
+        swap_hf_moe_blocks(model)
+    assert all(
+        layer.mlp is block
+        for layer, block in zip(model.layers, original_blocks, strict=True)
+    )
+    after = dict(model.named_parameters())
+    assert after.keys() == original_parameters.keys()
+    assert all(after[name] is value for name, value in original_parameters.items())
+
+
+@pytest.mark.parametrize("failure", ["layout", "missing", "rank", "count"])
+def test_declared_expert_layout_rejects_invalid_storage(failure):
+    from llmtuner.parallel.expert_parallel.hf_inspection import fused_experts_of
+
+    block = _model(_config(norm_topk_prob=True)).layers[0].mlp
+    assert block.expert_layout == "fused_gate_up"
+    if failure == "layout":
+        block.expert_layout = "unknown"
+    elif failure == "missing":
+        del block.experts.gate_up_proj
+    elif failure == "rank":
+        block.experts.gate_up_proj = torch.nn.Parameter(torch.ones(2, 2))
+    else:
+        block.experts.down_proj = torch.nn.Parameter(
+            block.experts.down_proj[:1].detach().clone()
+        )
+    with pytest.raises(ValueError):
+        fused_experts_of(block)
+
+
+def test_declared_expert_layout_never_falls_back_to_list_probe(monkeypatch):
+    from llmtuner.parallel.expert_parallel import hf_inspection
+
+    block = _model(_config(norm_topk_prob=True)).layers[0].mlp
+
+    def unexpected(_experts):
+        raise AssertionError("declared fused layout must not probe expert lists")
+
+    monkeypatch.setattr(hf_inspection, "_fused_experts_of_per_expert_list", unexpected)
+    weights = hf_inspection.fused_experts_of(block)
+    assert weights.num_experts == 8
+    assert weights.gate_EFD.shape == (8, 48, 64)
+    assert (
+        weights.gate_EFD.untyped_storage()
+        is block.experts.gate_up_proj.untyped_storage()
+    )
+    del block.experts.gate_up_proj
+    with pytest.raises(ValueError, match="requires gate_up_proj"):
+        hf_inspection.fused_experts_of(block)

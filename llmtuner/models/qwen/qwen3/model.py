@@ -25,7 +25,11 @@ class Qwen3MoeDecoderLayer(reference.Qwen3MoeDecoderLayer):
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = reference.Qwen3MoeSparseMoeBlock(config)
+            self.mlp.router_logits_in_output = False
+            self.mlp.expert_layout = "fused_gate_up"
+            self.moe_block_name = "mlp"
         else:
+            self.moe_block_name = None
             self.mlp = reference.Qwen3MoeMLP(
                 config, intermediate_size=config.intermediate_size
             )

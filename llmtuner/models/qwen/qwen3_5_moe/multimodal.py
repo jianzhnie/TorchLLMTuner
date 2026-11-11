@@ -420,6 +420,8 @@ class Qwen3_5MoeExperts(hf.Qwen3_5MoeExperts):
 class Qwen3_5MoeSparseMoeBlock(hf.Qwen3_5MoeSparseMoeBlock):
     """Evaluate routed experts before the shared expert."""
 
+    router_logits_in_output = False
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply routed and shared experts and return their combined output."""
         batch_size, sequence_length, hidden_size = hidden_states.shape

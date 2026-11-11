@@ -125,7 +125,9 @@ def stabilize_moe_experts(model: nn.Module) -> None:
     if getattr(model.config, "hidden_act", None) != "silu":
         raise ValueError("Qwen3-MoE torchtitan experts require hidden_act='silu'")
     modules = [
-        module for module in model.modules() if type(module) is Qwen3MoeSparseMoeBlock
+        module
+        for module in model.modules()
+        if isinstance(module, Qwen3MoeSparseMoeBlock)
     ]
     if not modules:
         raise ValueError("Qwen3-MoE torchtitan experts require routed MoE blocks")

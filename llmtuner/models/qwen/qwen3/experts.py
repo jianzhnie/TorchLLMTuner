@@ -60,9 +60,12 @@ def forward_torchtitan_moe(module: nn.Module, hidden_states: torch.Tensor):
     if npu_dispatch:
         # Match the reference's expert-ordered deterministic accumulation.
         # Unpermute followed by a top-k sum uses a different reduction tree.
-        token_indices = (
-            torch.argsort(expert_ids.reshape(-1), stable=True) // expert_ids.shape[-1]
-        )
+        # Integer argsort falls back to AI CPU on NPU. Expert IDs are exactly
+        # representable in float32; stable sorting preserves the reduction order.
+        sort_keys = expert_ids.reshape(-1)
+        if module.experts.num_experts <= 2**24:
+            sort_keys = sort_keys.float()
+        token_indices = torch.argsort(sort_keys, stable=True) // expert_ids.shape[-1]
     else:
         token_indices = metadata.token_indices_experts_sorted_N
     output = deterministic_scatter_add(

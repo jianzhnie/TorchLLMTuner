@@ -632,3 +632,16 @@ def test_reset_routing_statistics_clears_scratch_but_preserves_bias():
     assert not histogram.any()
     torch.testing.assert_close(sign_layer.expert_bias_E, sign_bias)
     torch.testing.assert_close(quantile_layer.expert_bias_E, quantile_bias)
+
+
+def test_declared_slots_control_native_moe_collection():
+    sparse = _moe()
+    layer = torch.nn.Module()
+    layer.expert_block = sparse
+    layer.mlp = _moe()
+    layer.moe_block_name = "expert_block"
+    holder = torch.nn.Module()
+    holder.layers = torch.nn.ModuleList([layer, layer])
+    assert collect_moe_layers(holder) == [sparse]
+    layer.moe_block_name = None
+    assert collect_moe_layers(holder) == []

@@ -1,8 +1,9 @@
 """HF MoE block layout probes for the EP swap.
 
 The entry point is ``model_replacement.py`` (``swap_hf_moe_blocks``); the conversion is
-``block_conversion.py``. This module is the duck-typed detector every HF family is
-identified through, shared by the swap and by ``tensor_parallel.py``
+``block_conversion.py``. This module reads explicit decoder/output declarations
+where available and provides legacy layout detection, shared by the swap and
+by ``tensor_parallel.py``
 (``is_hf_moe_block``).
 
 Every sparse decoder layer of a transformers 5.x MoE model holds the same block
@@ -77,7 +78,7 @@ import torch
 import torch.nn as nn
 
 from ...errors import UnsupportedCombinationError
-from ...models.common.moe.layer import MOE_LAYER_ATTRS
+from ...models.common.moe.layer import MOE_LAYER_ATTRS, declared_moe_block
 from ...models.kimi.kimi_k3.moe import KimiSparseMoE
 from ...utils.logging import get_logger
 from .. import compatibility
@@ -286,6 +287,10 @@ def _fused_experts_of_per_expert_list(experts: nn.Module) -> FusedExperts | None
 def fused_experts_of(block: nn.Module) -> FusedExperts | None:
     """Probe a MoE block for the fused expert tensors, or ``None``.
 
+    An explicit ``expert_layout="fused_gate_up"`` declaration selects this
+    layout directly. Its storage is still validated; missing or invalid
+    tensors must fail rather than trigger legacy per-expert discovery.
+
     One probe covers every supported family because transformers 5.x moved all
     of Qwen3Moe, OLMoE, Mixtral, DeepSeek-V2/V3 and GLM4 onto the same two
     parameters under the same forward shape::
@@ -308,17 +313,30 @@ def fused_experts_of(block: nn.Module) -> FusedExperts | None:
             have no counterpart in llmtuner's ``GroupedExperts``. Copying it under
             the shared convention would put the wrong weight in the wrong slot.
     """
+    layout = getattr(block, "expert_layout", None)
+    if layout is not None and layout != "fused_gate_up":
+        raise ValueError(f"Unsupported declared expert layout {layout!r}")
     experts = getattr(block, "experts", None)
     if experts is None:
+        if layout is not None:
+            raise ValueError("fused_gate_up requires an experts child module")
         return None
     gate_up = getattr(experts, "gate_up_proj", None)
     down = getattr(experts, "down_proj", None)
     if not isinstance(gate_up, torch.Tensor) or not isinstance(down, torch.Tensor):
+        if layout is not None:
+            raise ValueError(
+                "fused_gate_up requires gate_up_proj and down_proj tensors"
+            )
         # Pre-5.x layout: one module per expert instead of two stacked tensors.
         return _fused_experts_of_per_expert_list(experts)
     if gate_up.dim() != 3 or down.dim() != 3:
+        if layout is not None:
+            raise ValueError("fused_gate_up requires rank-3 expert tensors")
         return None
     if gate_up.shape[0] != down.shape[0]:
+        if layout is not None:
+            raise ValueError("fused_gate_up expert counts must match")
         return None
     # GroupedExperts hard-codes SwiGLU; every supported family activates with
     # silu today, but the probe must say so rather than let a future HF family
@@ -553,6 +571,9 @@ def returns_router_logits(block: nn.Module) -> bool:
 def moe_block_of(layer: nn.Module) -> tuple[str, nn.Module | None]:
     """The layer's MoE block and the attribute it is held under.
 
+    Explicit decoders declare ``moe_block_name`` (None for dense layers).
+    Only legacy decoders use the candidate search below.
+
     The attribute is returned alongside the block because the swap has to
     *replace* the attribute, so the replacement must land in the same slot.
     Which attribute that is varies: 5.x keeps the block on ``mlp`` for every
@@ -565,6 +586,10 @@ def moe_block_of(layer: nn.Module) -> tuple[str, nn.Module | None]:
     ``models/common/moe/layer.py`` -- that hook rediscovers these blocks after the
     swap, so the two must agree on where a MoE can live.
     """
+    declared = declared_moe_block(layer)
+    if declared is not None:
+        return declared
+
     fallback: tuple[str, nn.Module | None] = (MOE_LAYER_ATTRS[0], None)
     for name in MOE_LAYER_ATTRS:
         block = getattr(layer, name, None)

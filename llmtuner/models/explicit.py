@@ -1,57 +1,33 @@
-"""Opt-in construction for explicit model subclasses."""
+"""Opt-in model construction from the single architecture registry."""
 
 from __future__ import annotations
 
-from importlib import import_module
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from .architecture import get_model_architecture
+from .architecture import registered_model_architectures
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig, PreTrainedModel
-
-# Preserve the opt-in API's supported types. Adding an architecture to the
-# training registry must not implicitly enable it at this construction entry.
-_REGISTERED_EXPLICIT_MODELS = frozenset({"deepseek_v4"})
-
-# Composite models remain opt-in: registering them for automatic causal-LM
-# resolution would also change configuration and text-model selection.
-_EXPLICIT_MODELS = {
-    "kimi_k3": (
-        ".kimi.kimi_k3.multimodal",
-        "KimiK3ForConditionalGeneration",
-    ),
-    "qwen3_5": (
-        ".qwen.qwen3_5.multimodal",
-        "Qwen3_5ForConditionalGeneration",
-    ),
-    "qwen3_5_moe": (
-        ".qwen.qwen3_5_moe.multimodal",
-        "Qwen3_5MoeForConditionalGeneration",
-    ),
-}
+    from torch import nn
 
 
-def build_explicit_model(config: PretrainedConfig) -> PreTrainedModel:
-    """Build an explicitly selected model without changing HF auto resolution."""
-    if config.model_type in _REGISTERED_EXPLICIT_MODELS:
-        architecture = get_model_architecture(config.model_type)
-        if architecture is None:
-            raise ValueError(
-                f"Model architecture {config.model_type!r} is not registered"
-            )
-        return architecture.model_class_loader()(config)
-    try:
-        module_name, class_name = _EXPLICIT_MODELS[config.model_type]
-    except KeyError as error:
-        supported = ", ".join(
-            sorted(_EXPLICIT_MODELS.keys() | _REGISTERED_EXPLICIT_MODELS)
-        )
+def build_explicit_model(config: Any) -> nn.Module:
+    """Construct an explicitly enabled architecture without HF auto resolution.
+
+    Task selection belongs to the registration: composite models keep their
+    conditional-generation class rather than being unwrapped as text models.
+    """
+    architectures = {
+        entry.model_type: entry
+        for entry in registered_model_architectures()
+        if entry.explicit
+    }
+    architecture = architectures.get(config.model_type)
+    if architecture is None:
+        supported = ", ".join(sorted(architectures))
         raise ValueError(
             f"No explicit model for {config.model_type!r}; choose one of {supported}"
-        ) from error
-    module = import_module(module_name, __package__)
-    return getattr(module, class_name)(config)
+        )
+    return architecture.model_class_loader()(config)
 
 
 __all__ = ["build_explicit_model"]

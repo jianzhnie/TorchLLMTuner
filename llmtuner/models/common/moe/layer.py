@@ -43,7 +43,7 @@ from llmtuner.models.common.aux_loss import accumulate_forward_metric
 from .experts import RoutedExperts
 from .routing import QuantileBalancedTopKRouter, TokenChoiceTopKRouter
 
-__all__ = ["MOE_LAYER_ATTRS", "collect_moe_layers", "MoE"]
+__all__ = ["MOE_LAYER_ATTRS", "collect_moe_layers", "declared_moe_block", "MoE"]
 
 # The decoder-layer attributes that may hold a MoE block. transformers 5.x
 # keeps it on ``mlp`` for every family (dense layers included -- a dense
@@ -57,6 +57,33 @@ __all__ = ["MOE_LAYER_ATTRS", "collect_moe_layers", "MoE"]
 # agree or the expert-bias hook silently finds no layers on a real swapped
 # model.
 MOE_LAYER_ATTRS = ("mlp", "block_sparse_moe", "moe")
+
+
+def declared_moe_block(layer: nn.Module) -> tuple[str, nn.Module | None] | None:
+    """Read a model-owned direct child slot, without structural probing.
+
+    None means no declaration (legacy lookup may apply). A tuple with a None
+    block declares a dense layer and forbids searching other candidate slots.
+    Resolve against the current instance so replacement and PP binding cannot
+    leave a cached reference to the old block.
+    """
+    # A declaration is authoritative: dense layers explicitly declare None.
+    # Never guess another slot when a model-owned declaration is invalid.
+    if hasattr(layer, "moe_block_name"):
+        name = layer.moe_block_name
+        if name is None:
+            return MOE_LAYER_ATTRS[0], None
+        if not isinstance(name, str) or not name or "." in name:
+            raise ValueError("moe_block_name must be a direct module name or None")
+        block = layer._modules.get(name)
+        if not isinstance(block, nn.Module):
+            raise ValueError(
+                f"{type(layer).__name__}.moe_block_name={name!r} must name "
+                "a registered child module"
+            )
+        return name, block
+
+    return None
 
 
 class MoE(nn.Module):
@@ -311,8 +338,13 @@ def collect_moe_layers(model_part: nn.Module) -> list[MoE]:
         # __getattr__ passthrough (the wrapper inserts a
         # ``_checkpoint_wrapped_module`` FQN segment, cf. canonical_fqn).
         layer = getattr(layer, "_checkpoint_wrapped_module", layer)
-        for attr in MOE_LAYER_ATTRS:
-            block = getattr(layer, attr, None)
+        declared = declared_moe_block(layer)
+        blocks = (
+            (declared[1],)
+            if declared is not None
+            else (getattr(layer, attr, None) for attr in MOE_LAYER_ATTRS)
+        )
+        for block in blocks:
             if isinstance(block, MoE):
                 if id(block) not in seen:
                     found.append(block)

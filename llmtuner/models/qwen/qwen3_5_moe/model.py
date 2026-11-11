@@ -17,6 +17,12 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
 )
 
 
+class Qwen3_5MoeSparseMoeBlock(reference.Qwen3_5MoeSparseMoeBlock):
+    """Reference MoE math with an explicit tensor-only output contract."""
+
+    router_logits_in_output = False
+
+
 class Qwen3_5MoeDecoderLayer(reference.Qwen3_5MoeDecoderLayer):
     """Own the token-mixer selection and residual-block composition."""
 
@@ -33,7 +39,7 @@ class Qwen3_5MoeDecoderLayer(reference.Qwen3_5MoeDecoderLayer):
             self.self_attn = reference.Qwen3_5MoeAttention(config, layer_idx)
         else:
             raise ValueError(f"Unsupported Qwen3.5 layer type: {self.layer_type!r}")
-        self.mlp = reference.Qwen3_5MoeSparseMoeBlock(config)
+        self.mlp = Qwen3_5MoeSparseMoeBlock(config)
         self.input_layernorm = reference.Qwen3_5MoeRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )

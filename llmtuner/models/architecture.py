@@ -24,6 +24,8 @@ class ModelArchitecture:
     config_factory: Callable[..., Any]
     config_type_loader: Callable[[], type]
     model_class_loader: Callable[[], type[nn.Module]]
+    task: str = "causal_lm"
+    explicit: bool = False
 
     @classmethod
     def from_types(
@@ -32,8 +34,17 @@ class ModelArchitecture:
         *,
         config_type: type,
         model_class_loader: Callable[[], type[nn.Module]],
+        task: str = "causal_lm",
+        explicit: bool = False,
     ) -> ModelArchitecture:
-        return cls(model_type, config_type, lambda: config_type, model_class_loader)
+        return cls(
+            model_type,
+            config_type,
+            lambda: config_type,
+            model_class_loader,
+            task=task,
+            explicit=explicit,
+        )
 
 
 def _load_kimi_config_class() -> type:
@@ -89,6 +100,10 @@ def register_model_architecture(
         or not architecture.model_type.strip()
     ):
         raise ValueError("model_type must be a non-empty string")
+    if architecture.task not in {"causal_lm", "conditional_generation"}:
+        raise ValueError(f"Unsupported model task {architecture.task!r}")
+    if not isinstance(architecture.explicit, bool):
+        raise TypeError("Model architecture explicit must be a bool")
     for name in ("config_factory", "config_type_loader", "model_class_loader"):
         if not callable(getattr(architecture, name)):
             raise TypeError(f"Model architecture {name} must be callable")
@@ -100,8 +115,14 @@ def register_model_architecture(
     _ARCHITECTURES[architecture.model_type] = architecture
 
 
-def get_model_architecture(model_type: str) -> ModelArchitecture | None:
-    return _ARCHITECTURES.get(model_type)
+def get_model_architecture(
+    model_type: str, *, task: str = "causal_lm"
+) -> ModelArchitecture | None:
+    """Resolve an ID for a task without falling back to another task."""
+    architecture = _ARCHITECTURES.get(model_type)
+    return (
+        architecture if architecture is not None and architecture.task == task else None
+    )
 
 
 def registered_model_architectures() -> tuple[ModelArchitecture, ...]:
@@ -150,5 +171,43 @@ for _model_type, _config_module, _config_name, _model_module, _model_name in (
             config_factory=partial(_build_config, _config_loader),
             config_type_loader=_config_loader,
             model_class_loader=partial(_load_class, _model_module, _model_name),
+            explicit=_model_type == "deepseek_v4",
+        )
+    )
+
+
+# Composite construction is explicit-only; causal-LM lookup must not select it.
+for _model_type, _config_module, _config_name, _model_module, _model_name in (
+    (
+        "kimi_k3",
+        ".kimi.kimi_k3.configuration",
+        "KimiK3Config",
+        ".kimi.kimi_k3.multimodal",
+        "KimiK3ForConditionalGeneration",
+    ),
+    (
+        "qwen3_5",
+        "transformers.models.qwen3_5.configuration_qwen3_5",
+        "Qwen3_5Config",
+        ".qwen.qwen3_5.multimodal",
+        "Qwen3_5ForConditionalGeneration",
+    ),
+    (
+        "qwen3_5_moe",
+        "transformers.models.qwen3_5_moe.configuration_qwen3_5_moe",
+        "Qwen3_5MoeConfig",
+        ".qwen.qwen3_5_moe.multimodal",
+        "Qwen3_5MoeForConditionalGeneration",
+    ),
+):
+    _config_loader = partial(_load_class, _config_module, _config_name)
+    register_model_architecture(
+        ModelArchitecture(
+            _model_type,
+            config_factory=partial(_build_config, _config_loader),
+            config_type_loader=_config_loader,
+            model_class_loader=partial(_load_class, _model_module, _model_name),
+            task="conditional_generation",
+            explicit=True,
         )
     )
