@@ -19,7 +19,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-from ..architecture import get_model_architecture
+from ..registry import get_model_spec
 from .attention_backend import ATTENTION_BACKEND
 
 _RUNTIME_CONFIG_FIELDS = (
@@ -64,7 +64,7 @@ def build_model_config(
     empty dict to use architecture defaults. ``None`` loads the config from a
     local checkpoint directory or Hub identifier.
     """
-    architecture = get_model_architecture(model_name_or_path)
+    architecture = get_model_spec(model_name_or_path)
     # Some HF composite constructors modify nested configuration dictionaries.
     overrides = deepcopy(arch_overrides) if arch_overrides is not None else {}
     if arch_overrides is not None:
@@ -72,7 +72,7 @@ def build_model_config(
         if architecture is None:
             config = AutoConfig.for_model(model_name_or_path, **overrides)
         else:
-            config = architecture.config_factory(**overrides)
+            config = architecture.build_config(**overrides)
         if hasattr(config, "text_config"):
             config.text_config.max_position_embeddings = max(
                 getattr(config.text_config, "max_position_embeddings", seq_len), seq_len
@@ -82,7 +82,7 @@ def build_model_config(
     # Resolve only the selected architecture's hooks before constructing any
     # config. HF may still cache an older class after an exist_ok replacement.
     metadata, _ = PretrainedConfig.get_config_dict(model_name_or_path)
-    architecture = get_model_architecture(metadata.get("model_type", ""))
+    architecture = get_model_spec(metadata.get("model_type", ""))
     if architecture is not None:
         # Refresh even an existing HF entry: exist_ok registry replacement must
         # also take effect when loading a saved configuration.
@@ -137,8 +137,7 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
     # Only registered architecture names select offline construction. Missing
     # paths and Hub IDs belong to from_pretrained, which owns their validation.
     offline = not os.path.exists(cfg.hf_model) and (
-        cfg.hf_model in CONFIG_MAPPING
-        or get_model_architecture(cfg.hf_model) is not None
+        cfg.hf_model in CONFIG_MAPPING or get_model_spec(cfg.hf_model) is not None
     )
     overrides = (
         {
@@ -158,7 +157,7 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
         else None
     )
     if overrides is not None:
-        architecture = get_model_architecture(cfg.hf_model)
+        architecture = get_model_spec(cfg.hf_model)
         config_type = (
             architecture.config_type_loader()
             if architecture is not None
@@ -210,9 +209,9 @@ def resolve_model_class(config: PretrainedConfig) -> type[nn.Module]:
     Registered implementations need not inherit PreTrainedModel. The HF
     fallback prefers the declared class name, then its model-type mapping.
     """
-    architecture = get_model_architecture(config.model_type)
+    architecture = get_model_spec(config.model_type)
     if architecture is not None:
-        return architecture.model_class_loader()
+        return architecture.resolve_model_class()
 
     for name in (config.architectures or []) + [
         MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get(getattr(config, "model_type", ""), ""),

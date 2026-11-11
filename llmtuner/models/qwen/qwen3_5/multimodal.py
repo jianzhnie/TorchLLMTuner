@@ -23,6 +23,11 @@ from transformers import initialization as init
 from transformers.cache_utils import Cache
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_5 import modeling_qwen3_5 as hf
+from transformers.models.qwen3_5.configuration_qwen3_5 import (
+    Qwen3_5Config,
+    Qwen3_5TextConfig,
+    Qwen3_5VisionConfig,
+)
 
 from ..ops import (
     causal_conv1d,
@@ -70,7 +75,7 @@ class Qwen3_5RMSNorm(hf.Qwen3_5RMSNorm):
 class Qwen3_5GatedDeltaNet(hf.Qwen3_5GatedDeltaNet):
     """GDN computation with explicit convolution and recurrent cache state."""
 
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int) -> None:
         super().__init__(config, layer_idx)
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
         self.gdn_implementation = getattr(
@@ -220,7 +225,7 @@ def apply_rotary_pos_emb(
 class Qwen3_5Attention(hf.Qwen3_5Attention):
     """Text attention with explicit Turbo backend selection and Qwen gating."""
 
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int) -> None:
         super().__init__(config, layer_idx)
         self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -388,7 +393,7 @@ class Qwen3_5VisionAttention(hf.Qwen3_5VisionAttention):
 class Qwen3_5DecoderLayer(hf.Qwen3_5DecoderLayer):
     """Decoder layer that assembles FSDPTurbo attention / GDN / MLP / norm sublayers."""
 
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int) -> None:
         hf.GradientCheckpointingLayer.__init__(self)
         self.hidden_size = config.hidden_size
         self.layer_type = config.layer_types[layer_idx]
@@ -397,7 +402,10 @@ class Qwen3_5DecoderLayer(hf.Qwen3_5DecoderLayer):
             self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3_5Attention(config, layer_idx)
+        else:
+            raise ValueError(f"Unsupported Qwen3.5 layer type: {self.layer_type!r}")
         self.mlp = hf.Qwen3_5MLP(config, config.intermediate_size)
+        self.moe_block_name = None
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -409,16 +417,14 @@ class Qwen3_5DecoderLayer(hf.Qwen3_5DecoderLayer):
 class Qwen3_5TextModel(hf.Qwen3_5TextModel):
     """Text model assembled from explicit Qwen component subclasses."""
 
-    def __init__(self, config):
+    def __init__(self, config: Qwen3_5TextConfig) -> None:
         hf.Qwen3_5PreTrainedModel.__init__(self, config)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.layers = nn.ModuleList(
-            [
-                Qwen3_5DecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            Qwen3_5DecoderLayer(config, index)
+            for index in range(config.num_hidden_layers)
         )
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = hf.Qwen3_5TextRotaryEmbedding(config=config)
@@ -426,7 +432,7 @@ class Qwen3_5TextModel(hf.Qwen3_5TextModel):
         self.post_init()
 
     @torch.no_grad()
-    def _init_weights(self, module: nn.Module):
+    def _init_weights(self, module: nn.Module) -> None:
         """Preserve HF initialization guards and Tensor/DTensor layouts for GDN."""
         if isinstance(module, hf.Qwen3_5GatedDeltaNet):
             init.ones_(module.dt_bias)
@@ -441,7 +447,7 @@ class Qwen3_5TextModel(hf.Qwen3_5TextModel):
 
 
 class Qwen3_5VisionBlock(hf.Qwen3_5VisionBlock):
-    def __init__(self, config):
+    def __init__(self, config: Qwen3_5VisionConfig) -> None:
         hf.GradientCheckpointingLayer.__init__(self)
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
@@ -452,7 +458,7 @@ class Qwen3_5VisionBlock(hf.Qwen3_5VisionBlock):
 class Qwen3_5Model(hf.Qwen3_5Model):
     """Multimodal wrapper that assembles FSDPTurbo text and vision submodels."""
 
-    def __init__(self, config):
+    def __init__(self, config: Qwen3_5Config) -> None:
         hf.Qwen3_5PreTrainedModel.__init__(self, config)
         self.visual = hf.Qwen3_5VisionModel._from_config(config.vision_config)
         self.visual.blocks = nn.ModuleList(
@@ -467,7 +473,7 @@ class Qwen3_5Model(hf.Qwen3_5Model):
 
 
 class Qwen3_5ForConditionalGeneration(hf.Qwen3_5ForConditionalGeneration):
-    def __init__(self, config):
+    def __init__(self, config: Qwen3_5Config) -> None:
         hf.Qwen3_5PreTrainedModel.__init__(self, config)
         self.model = Qwen3_5Model(config)
         self.lm_head = nn.Linear(

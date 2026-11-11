@@ -20,7 +20,8 @@ installation; callers use it to migrate metadata tied to the original objects.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -37,24 +38,20 @@ from ...models.common.aux_loss import AuxLoss
 from ...models.common.moe.layer import MoE
 from ...models.kimi.kimi_k3.moe import KimiSparseMoE
 from ...utils.logging import get_logger
-from .block_conversion import convert_block
+from ..plan import ParallelPlan, PlanTarget
+from ..plan import ReplacementObserver as MoEReplacementObserver
+from .block_conversion import MoERoutingBinding, convert_block, resolve_moe_routing
 from .hf_inspection import (
     is_hf_moe_block,
     moe_block_of,
     per_expert_projection_names,
     returns_router_logits,
-    router_of,
 )
 from .kimi_conversion import convert_kimi_block
 
 logger = get_logger(__name__)
 
-__all__ = ["swap_hf_moe_blocks"]
-
-MoEReplacementObserver = Callable[
-    [dict[nn.Module, nn.Module], dict[nn.Parameter, tuple[nn.Parameter, ...]]],
-    None,
-]
+__all__ = ["resolve_ep_plan", "swap_hf_moe_blocks"]
 
 
 def bind_shared_projection(
@@ -297,6 +294,69 @@ def find_moe_candidates(
     return candidates
 
 
+@dataclass(frozen=True, slots=True)
+class MoEConversionTarget:
+    """Decoder slot, output convention and routing choices fixed by parsing."""
+
+    owner: nn.Module
+    attribute: str
+    router_logits: bool
+    routing: MoERoutingBinding | None = None
+
+
+def resolve_ep_plan(
+    model: nn.Module, *, degree: int = 1, implementation: str = "alltoall"
+) -> ParallelPlan:
+    """Bind EP conversion targets without allocating weights or running collectives.
+
+    This binds targets and generic routing, not all conversion capabilities.
+    Legacy models may still use inspection here; generic conversion consumes
+    the selected routing rather than reading it again. Re-resolve after config,
+    TP or PP changes. Kimi retains its dedicated conversion contract.
+    """
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        raise UnsupportedCombinationError(
+            f"swap_hf_moe_blocks expects a model with .layers; got "
+            f"{type(model).__name__}."
+        )
+    config = getattr(getattr(model, "model", None), "config", None)
+    candidates = find_moe_candidates(model, layers, config)
+    modules = tuple(model.named_modules(remove_duplicate=False))
+    targets = []
+    for owner, attribute, block, router_logits in candidates:
+        paths = [path for path, module in modules if module is owner]
+        if not paths:
+            raise ValueError("EP decoder owner is not registered in this model")
+        targets.append(
+            PlanTarget(
+                f"{paths[0]}.{attribute}" if paths[0] else attribute,
+                "moe",
+                block,
+                "kimi_per_expert"
+                if isinstance(block, KimiSparseMoE)
+                else "fused_gate_up",
+                MoEConversionTarget(
+                    owner,
+                    attribute,
+                    router_logits,
+                    None
+                    if isinstance(block, KimiSparseMoE)
+                    else resolve_moe_routing(block),
+                ),
+            )
+        )
+    return ParallelPlan(
+        stage="ep",
+        targets=tuple(targets),
+        degree=degree,
+        implementation=implementation,
+        operations=("convert", "bind_shared_state", "install"),
+        module_bindings=modules,
+        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+    )
+
+
 def external_state_owners(
     module_paths: list[tuple[str, nn.Module]], replaced_roots: list[str]
 ) -> tuple[dict[int, list[str]], dict[int, list[str]]]:
@@ -327,6 +387,7 @@ def swap_hf_moe_blocks(
     torchao_pad_multiple: int = 16,
     tp_enabled: bool = False,
     on_replacement: MoEReplacementObserver | None = None,
+    resolved_plan: ParallelPlan | None = None,
 ) -> int:
     """Replace every HF MoE block in ``model`` with llmtuner's MoE, in place.
 
@@ -358,6 +419,8 @@ def swap_hf_moe_blocks(
             shared expert): the swap itself is layout-identical either way --
             the swapped block consumes and produces the T/tp sequence shard
             directly, which is the layout upstream's ep+sp MoE uses.
+        resolved_plan: optional target plan resolved for this exact model and
+            EP degree/backend. Stale module or parameter bindings are rejected.
         on_replacement: receive module and fused-parameter mappings after all
             replacements are planned, before any block is installed. Used by
             assembly to preserve programmatic references across layout changes.
@@ -413,9 +476,35 @@ def swap_hf_moe_blocks(
     # frozen zero bias never lands in the checkpoint.
     default_coeff = getattr(hf_config, "load_balance_coeff", 1e-3)
 
-    # Complete preflight before constructing replacements so unsupported later
-    # layers cannot leave earlier ones converted.
-    candidates = find_moe_candidates(model, layers, hf_config)
+    # Bind targets after preceding stages (TP/PP) have stabilized this instance.
+    degree = 1 if ep_group is None else dist.get_world_size(ep_group)
+    execution_plan = resolved_plan or resolve_ep_plan(
+        model, degree=degree, implementation=token_dispatcher
+    )
+    if (
+        execution_plan.stage != "ep"
+        or execution_plan.degree != degree
+        or execution_plan.implementation != token_dispatcher
+    ):
+        raise ValueError("EP plan does not match the requested execution")
+    execution_plan.validate_binding(model)
+    candidates = []
+    routing_bindings = {}
+    for target in execution_plan.targets:
+        binding = target.spec
+        if target.kind != "moe" or not isinstance(binding, MoEConversionTarget):
+            raise ValueError("EP plan requires resolved MoE conversion targets")
+        if binding.owner._modules.get(binding.attribute) is not target.module:
+            raise ValueError(f"Stale EP decoder slot: {target.path}")
+        candidates.append(
+            (binding.owner, binding.attribute, target.module, binding.router_logits)
+        )
+        if not isinstance(target.module, KimiSparseMoE):
+            if binding.routing is None or binding.routing.source is not target.module:
+                raise ValueError("EP plan requires a matching routing binding")
+            routing_bindings[id(target.module)] = binding.routing
+    if not candidates:
+        raise ValueError("EP plan must contain conversion targets")
 
     module_paths = list(model.named_modules(remove_duplicate=False))
     # Index owners once; retain every registered path for aliased decoder layers.
@@ -475,7 +564,7 @@ def swap_hf_moe_blocks(
                 converted_blocks[id(block)] = moe
                 replacements.append((layer, attr, moe))
                 continue
-            router_gate = router_of(block)
+            router_gate = routing_bindings[id(block)].router
             load_balance_coeff = (
                 float(default_coeff)
                 if getattr(router_gate, "e_score_correction_bias", None) is not None
@@ -483,6 +572,7 @@ def swap_hf_moe_blocks(
             )
             moe = convert_block(
                 block,
+                routing=routing_bindings[id(block)],
                 ep_group=ep_group,
                 aux_loss_coeff=aux_loss_coeff,
                 load_balance_coeff=load_balance_coeff,
@@ -571,7 +661,12 @@ def swap_hf_moe_blocks(
                 moe = converted_blocks[id(block)]
                 module_targets[block] = moe
                 module_targets[block.experts] = moe.routed_experts.inner_experts
-                module_targets[router_of(block)] = moe.router.gate
+                router = (
+                    block.gate
+                    if isinstance(block, KimiSparseMoE)
+                    else routing_bindings[id(block)].router
+                )
+                module_targets[router] = moe.router.gate
             on_replacement(
                 module_targets,
                 {
@@ -608,5 +703,6 @@ def swap_hf_moe_blocks(
     for owner, layouts in converted_layouts:
         owner._tp_checkpoint_layouts = layouts
 
+    model.ep_parallel_plan = execution_plan
     logger.info("Swapped %d HF MoE blocks for llmtuner MoE blocks", len(replacements))
     return len(replacements)

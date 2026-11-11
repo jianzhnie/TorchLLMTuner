@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ....parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 from ...common.scatter_add import deterministic_scatter_add
 
 
@@ -76,26 +75,22 @@ def _forward_pre_down_grouped_experts(
     """
     _validate_pre_down_grouped_inputs(module, hidden_states, top_k_index, top_k_weights)
     counts = torch.nn.functional.one_hot(top_k_index, module.num_experts).sum((0, 1))
-    dispatcher = LocalTokenDispatcher(module.num_experts, top_k_index.shape[1])
-    routed, counts, metadata = dispatcher.dispatch(
-        hidden_states, top_k_weights, top_k_index, counts
-    )
+    assignments = torch.argsort(top_k_index.reshape(-1), stable=True)
+    token_indices = assignments // top_k_index.shape[1]
+    routed = hidden_states[token_indices]
+    routed_scores = top_k_weights.reshape(-1)[assignments]
     offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
     # Never cache views: FSDP can replace/materialize parameter storage each forward.
     gate_weight, up_weight = module.gate_up_proj.chunk(2, dim=1)
     gate = torch._grouped_mm(routed, gate_weight.transpose(-2, -1), offs=offsets)
     up = torch._grouped_mm(routed, up_weight.transpose(-2, -1), offs=offsets)
     hidden = module.act_fn(gate) * up
-    hidden = (
-        hidden.float() * metadata.topk_scores_experts_sorted_N.float().reshape(-1, 1)
-    ).to(hidden.dtype)
+    hidden = (hidden.float() * routed_scores.float().reshape(-1, 1)).to(hidden.dtype)
     output = torch._grouped_mm(hidden, module.down_proj.transpose(-2, -1), offs=offsets)
-    # LocalTokenDispatcher.combine applies post-down scores; skip that multiply.
+    # The generic dispatcher's combine applies post-down scores; skip that multiply.
     return deterministic_scatter_add(
         torch.zeros_like(hidden_states),
-        metadata.token_indices_experts_sorted_N.reshape(-1, 1).expand(
-            -1, hidden_states.shape[-1]
-        ),
+        token_indices.reshape(-1, 1).expand(-1, hidden_states.shape[-1]),
         output,
     )
 

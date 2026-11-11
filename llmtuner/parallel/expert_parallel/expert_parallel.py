@@ -10,14 +10,19 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...accelerator.collectives import synchronize_local_errors
 from ...utils.logging import get_logger
 from .. import compatibility
+from ..plan import ParallelPlan
 from .domino_dispatch import DominoRoutedExperts
 from .mc2_dispatch import MC2RoutedExperts
 from .mc2_ops import validate_mc2_world_size
-from .model_replacement import MoEReplacementObserver, swap_hf_moe_blocks
+from .model_replacement import (
+    MoEReplacementObserver,
+    resolve_ep_plan,
+    swap_hf_moe_blocks,
+)
 
 logger = get_logger(__name__)
 
-__all__ = ["apply_ep"]
+__all__ = ["apply_ep", "resolve_ep_plan"]
 
 
 def apply_ep(
@@ -27,6 +32,7 @@ def apply_ep(
     ep_group: dist.ProcessGroup | None = None,
     error_group: dist.ProcessGroup | None = None,
     on_replacement: MoEReplacementObserver | None = None,
+    resolved_plan: ParallelPlan | None = None,
 ) -> nn.Module:
     """Swap every HF MoE block for the EP-capable llmtuner MoE.
 
@@ -38,6 +44,9 @@ def apply_ep(
 
     on_replacement receives explicit conversion mappings before installation,
     allowing assembly to rebind programmatic FSDP overrides.
+
+    resolved_plan optionally binds decoder slots before entering execution; it
+    must describe the post-TP/PP instance and the requested EP degree/backend.
 
     The swap moves weights, so it must happen before FSDP wraps the model.
     With a multi-rank group each rank keeps ``num_experts / ep`` of them and
@@ -64,6 +73,12 @@ def apply_ep(
                 "from the sparse mesh's 'ep' axis (parallelize_hf_transformers "
                 "resolves it from parallel_dims)."
             )
+        if cfg.tp_size == 1:
+            validate = getattr(model, "validate_parallel", None)
+            if validate is not None:
+                # TP-only preflight does not cover an EP-only run. Models with
+                # explicit partial TP overrides are validated by that resolver.
+                validate(tp_degree=1, ep_degree=cfg.ep_size)
         swapped = swap_hf_moe_blocks(
             model,
             ep_group=ep_group,
@@ -74,6 +89,7 @@ def apply_ep(
             torchao_pad_multiple=cfg.ep_config.ep_torchao_pad_multiple,
             tp_enabled=cfg.tp_size > 1,
             on_replacement=on_replacement,
+            **({"resolved_plan": resolved_plan} if resolved_plan is not None else {}),
         )
     # Failures must reach all ranks sharing later FSDP/TP/CP collectives,
     # not only the ranks in one token-exchange group.

@@ -1,6 +1,6 @@
 """Model registration, family implementations, HF adaptation, and components.
 
-* ``architecture.py`` registers model-owned config and construction hooks.
+* ``registry.py`` registers model-owned config and construction hooks.
 * ``deepseek/``, ``kimi/`` and ``qwen/`` contain independent model structures.
   ``explicit.py`` lazily constructs their opt-in HF subclasses without changing
   the default HF class resolution.

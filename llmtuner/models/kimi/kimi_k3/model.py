@@ -49,6 +49,8 @@ Native all-to-all EP conversion lives in parallel/expert_parallel; hybrid KCP
 and pipeline transfer of attention-residual history require further integration.
 """
 
+from typing import Any
+
 import torch
 from torch import nn
 from transformers import PreTrainedModel
@@ -57,6 +59,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 
+from ...contracts import DecoderStructure
 from .attention_residual import attention_residual
 from .configuration import KimiLinearConfig
 from .delta_attention import KimiDeltaAttention
@@ -67,7 +70,9 @@ from .normalization import KimiRMSNorm
 
 
 class KimiDecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx):
+    """Own KDA/MLA selection, residual math and the dense or sparse MLP slot."""
+
+    def __init__(self, config: KimiLinearConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.attn_res_block_size = config.attn_res_block_size
@@ -91,16 +96,22 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % config.moe_layer_freq == 0
         ):
             self.block_sparse_moe = KimiSparseMoE(config)
+            self.moe_block_name = "block_sparse_moe"
         else:
             self.mlp = KimiMLP(config)
+            self.moe_block_name = None
         self.input_layernorm = KimiRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = KimiRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
 
     def forward(
-        self, hidden_states, attention_mask=None, block_residual=None, **kwargs
-    ):
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        block_residual: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.attn_res_block_size is not None:
             shape = hidden_states.shape
             prefix = hidden_states
@@ -130,25 +141,29 @@ class KimiDecoderLayer(nn.Module):
                 self.mlp_res_norm.weight,
                 self.mlp_res_norm.variance_epsilon,
             ).reshape(shape)
-            feed_forward = getattr(self, "block_sparse_moe", None)
-            if feed_forward is None:
-                feed_forward = self.mlp
-            return prefix + feed_forward(
-                self.post_attention_layernorm(hidden_states)
-            ), block_residual
-        hidden_states = hidden_states + self.self_attn(
-            self.input_layernorm(hidden_states), attention_mask=attention_mask, **kwargs
-        )
-        feed_forward = getattr(self, "block_sparse_moe", None)
-        if feed_forward is None:
-            feed_forward = self.mlp
-        return hidden_states + feed_forward(
+            residual = prefix
+        else:
+            hidden_states = hidden_states + self.self_attn(
+                self.input_layernorm(hidden_states),
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+            residual = hidden_states
+        # Consume the declared slot, including a replacement installed by EP.
+        # Do not retain a second registered alias to the feed-forward module.
+        feed_forward = getattr(self, self.moe_block_name or "mlp")
+        hidden_states = residual + feed_forward(
             self.post_attention_layernorm(hidden_states)
         )
+        if self.attn_res_block_size is not None:
+            return hidden_states, block_residual
+        return hidden_states
 
 
 class KimiTextDecoder(nn.Module):
-    def __init__(self, config):
+    """Model-owned embedding, hybrid decoder stack and final normalization."""
+
+    def __init__(self, config: KimiLinearConfig) -> None:
         super().__init__()
         self.config = config
         if config.attn_res_block_size is not None:
@@ -166,7 +181,7 @@ class KimiTextDecoder(nn.Module):
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.layers = nn.ModuleList(
-            [KimiDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+            KimiDecoderLayer(config, index) for index in range(config.num_hidden_layers)
         )
         self.norm = KimiRMSNorm(config.hidden_size, config.rms_norm_eps)
 
@@ -272,19 +287,34 @@ class KimiTextDecoder(nn.Module):
 
 
 class KimiLinearForCausalLM(PreTrainedModel):
+    """Explicit causal model tree with Kimi-specific initialization and loss."""
+
+    decoder_structure = DecoderStructure(
+        decoder="model",
+        embedding="model.embed_tokens",
+        blocks="model.layers",
+        norm="model.norm",
+        head="lm_head",
+    )
+
     config_class = KimiLinearConfig
     base_model_prefix = "model"
     _supports_sdpa = True
     _supports_attention_backend = True
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
-    def __init__(self, config):
+    def __init__(self, config: KimiLinearConfig) -> None:
         super().__init__(config)
         self.model = KimiTextDecoder(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
 
-    def _init_weights(self, module):
+    @property
+    def enable_weight_tying(self) -> bool:
+        """Report actual Parameter identity rather than configuration intent."""
+        return self.lm_head.weight is self.model.embed_tokens.weight
+
+    def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear | nn.Embedding):
             nn.init.normal_(module.weight, std=self.config.initializer_range)
             if isinstance(module, nn.Embedding) and module.padding_idx is not None:

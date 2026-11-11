@@ -748,7 +748,7 @@ class Qwen3_5MoeVisionModel(hf.Qwen3_5MoeVisionModel):
 class Qwen3_5MoeDecoderLayer(hf.Qwen3_5MoeDecoderLayer):
     """Decoder layer that assembles FSDPTurbo attention / GDN / MoE / norm sublayers."""
 
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int) -> None:
         hf.GradientCheckpointingLayer.__init__(self)
         self.hidden_size = config.hidden_size
         self.layer_type = config.layer_types[layer_idx]
@@ -757,7 +757,10 @@ class Qwen3_5MoeDecoderLayer(hf.Qwen3_5MoeDecoderLayer):
             self.linear_attn = Qwen3_5MoeGatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3_5MoeAttention(config, layer_idx)
+        else:
+            raise ValueError(f"Unsupported Qwen3.5 layer type: {self.layer_type!r}")
         self.mlp = Qwen3_5MoeSparseMoeBlock(config)
+        self.moe_block_name = "mlp"
         self.mlp.experts = Qwen3_5MoeExperts(config)
         self.input_layernorm = Qwen3_5MoeRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -774,16 +777,14 @@ class Qwen3_5MoeTextModel(hf.Qwen3_5MoeTextModel):
     def _can_set_experts_implementation(cls) -> bool:
         return True
 
-    def __init__(self, config):
+    def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         hf.Qwen3_5MoePreTrainedModel.__init__(self, config)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.layers = nn.ModuleList(
-            [
-                Qwen3_5MoeDecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            Qwen3_5MoeDecoderLayer(config, index)
+            for index in range(config.num_hidden_layers)
         )
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = hf.Qwen3_5MoeTextRotaryEmbedding(config=config)

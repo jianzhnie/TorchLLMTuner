@@ -44,7 +44,7 @@ usual), no fused QKV (HF keeps q/k/v as separate projections), no FP8.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
@@ -60,6 +60,7 @@ from .. import compatibility
 from ..attention_heads import require_heads_divisible_by
 from ..expert_parallel.hf_inspection import is_hf_moe_block, resolve_shared_expert
 from ..module_patterns import module_name_matches, resolve_module_patterns
+from ..plan import ParallelPlan, PlanTarget, ReplacementObserver
 from ..vocab_parallel.vocab_parallel import VocabParallelEmbedding
 from .linear_ops import (
     AllGatherLinear,
@@ -80,6 +81,8 @@ __all__ = [
     "RowParallelLinear",
     "ShardingConfig",
     "apply_tp",
+    "resolve_tp_plan",
+    "ResolvedTPPlan",
     "colwise",
     "rowwise",
 ]
@@ -388,7 +391,11 @@ class TPMoeSequenceBoundary:
 
 
 def shard_shared_expert_for_tp(
-    block: nn.Module, *, tp_size: int, tp_rank: int
+    block: nn.Module,
+    *,
+    tp_size: int,
+    tp_rank: int,
+    shared_binding: tuple[str, nn.Module | None] | None = None,
 ) -> set[str]:
     """Feature-shard a shared expert's dense MLP -- no collectives involved.
 
@@ -408,7 +415,9 @@ def shard_shared_expert_for_tp(
     all-reduce excludes them (their gradients are complete per shard, exactly
     like the routed experts').
     """
-    shared_name, shared = resolve_shared_expert(block)
+    shared_name, shared = (
+        resolve_shared_expert(block) if shared_binding is None else shared_binding
+    )
     assert shared is not None  # the caller checked
     names: set[str] = set()
     projections = [
@@ -902,8 +911,61 @@ def resolve_tp_targets(
     return targets, moe_blocks
 
 
+def validate_moe_tp_target(
+    module_path: str,
+    block: nn.Module,
+    *,
+    tp_size: int,
+    shared_binding: tuple[str, nn.Module | None],
+) -> None:
+    """Validate routed/shared expert geometry before any model mutation."""
+    _, shared = shared_binding
+    expert_tp_hidden_size(block, tp_size=tp_size)
+    if shared is not None:
+        # The gate/up/down layout shards featurewise with no collectives
+        # (the boundary already gathered the sequence); anything else --
+        # e.g. Qwen2Moe's multiplicative shared_expert_gate -- keeps the
+        # refusal.
+        if not all(
+            isinstance(getattr(shared, n, None), nn.Linear)
+            for n in ("gate_proj", "up_proj", "down_proj")
+        ):
+            compatibility.shared_expert_tp(module_path, block)
+        gate_shape = tuple(shared.gate_proj.weight.shape)
+        up_shape = tuple(shared.up_proj.weight.shape)
+        down_shape = tuple(shared.down_proj.weight.shape)
+        model_dim = block.experts.gate_up_proj.shape[-1]
+        if (
+            len(gate_shape) != 2
+            or gate_shape[1] != model_dim
+            or up_shape != gate_shape
+            or down_shape != (model_dim, gate_shape[0])
+        ):
+            raise ValueError(
+                f"TP shared expert {module_path!r} requires gate/up (F, D) "
+                f"and down (D, F), with D={model_dim}; got gate={gate_shape}, "
+                f"up={up_shape}, down={down_shape}"
+            )
+        for name, dim in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
+            projection = getattr(shared, name)
+            if projection.bias is not None:
+                raise ValueError(
+                    f"TP shared expert {module_path}.{name} has an unsupported bias"
+                )
+            if projection.weight.shape[dim] % tp_size:
+                raise ValueError(
+                    f"TP shared expert {module_path}.{name} weight dim {dim} "
+                    f"is not divisible by tp_size={tp_size}"
+                )
+
+
 def realize_moe_blocks_tp(
-    moe_blocks: list[tuple[str, nn.Module]], *, tp_size: int, tp_rank: int, group
+    moe_blocks: list[tuple[str, nn.Module]],
+    *,
+    tp_size: int,
+    tp_rank: int,
+    group,
+    shared_bindings: Mapping[nn.Module, tuple[str, nn.Module | None]] | None = None,
 ) -> None:
     """Shard each HF MoE block's experts and shared expert in place, and give
     the block the TP sequence-boundary class.
@@ -913,52 +975,23 @@ def realize_moe_blocks_tp(
     sharded featurewise by ``shard_shared_expert_for_tp``, collective-free
     inside the sequence boundary.
     """
-    for module_path, block in moe_blocks:
-        _, shared = resolve_shared_expert(block)
-        expert_tp_hidden_size(block, tp_size=tp_size)
-        if shared is not None:
-            # The gate/up/down layout shards featurewise with no collectives
-            # (the boundary already gathered the sequence); anything else --
-            # e.g. Qwen2Moe's multiplicative shared_expert_gate -- keeps the
-            # refusal.
-            if not all(
-                isinstance(getattr(shared, n, None), nn.Linear)
-                for n in ("gate_proj", "up_proj", "down_proj")
-            ):
-                compatibility.shared_expert_tp(module_path, block)
-            gate_shape = tuple(shared.gate_proj.weight.shape)
-            up_shape = tuple(shared.up_proj.weight.shape)
-            down_shape = tuple(shared.down_proj.weight.shape)
-            model_dim = block.experts.gate_up_proj.shape[-1]
-            if (
-                len(gate_shape) != 2
-                or gate_shape[1] != model_dim
-                or up_shape != gate_shape
-                or down_shape != (model_dim, gate_shape[0])
-            ):
-                raise ValueError(
-                    f"TP shared expert {module_path!r} requires gate/up (F, D) "
-                    f"and down (D, F), with D={model_dim}; got gate={gate_shape}, "
-                    f"up={up_shape}, down={down_shape}"
-                )
-            for name, dim in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
-                projection = getattr(shared, name)
-                if projection.bias is not None:
-                    raise ValueError(
-                        f"TP shared expert {module_path}.{name} has an unsupported bias"
-                    )
-                if projection.weight.shape[dim] % tp_size:
-                    raise ValueError(
-                        f"TP shared expert {module_path}.{name} weight dim {dim} "
-                        f"is not divisible by tp_size={tp_size}"
-                    )
+    bindings = (
+        {block: resolve_shared_expert(block) for _, block in moe_blocks}
+        if shared_bindings is None
+        else shared_bindings
+    )
+    if shared_bindings is None:
+        for module_path, block in moe_blocks:
+            validate_moe_tp_target(
+                module_path, block, tp_size=tp_size, shared_binding=bindings[block]
+            )
 
     for _, block in moe_blocks:
-        _, shared = resolve_shared_expert(block)
+        _, shared = bindings[block]
         shared_names: set[str] = set()
         if shared is not None:
             shared_names = shard_shared_expert_for_tp(
-                block, tp_size=tp_size, tp_rank=tp_rank
+                block, tp_size=tp_size, tp_rank=tp_rank, shared_binding=bindings[block]
             )
         # The sharded expert parameters are excluded from the trainer's
         # replicated-gradient all-reduce through this NAME set: each rank's
@@ -982,21 +1015,11 @@ def realize_moe_blocks_tp(
         )
 
 
-def apply_tp(
-    model: nn.Module,
-    mesh: DeviceMesh | None,
-    cfg: ParallelConfig,
-    *,
-    plan: Mapping[str, str | ShardingConfig] | None = None,
-) -> nn.Module:
-    """Tensor-parallelize ``model`` in place. No-op when ``tp == 1``.
+ResolvedTPPlan = ParallelPlan
 
-    ``plan`` defaults to the model's HF ``tp_config`` (HF ships one for Qwen3,
-    Llama, ...). Pass an explicit ``{path_pattern: ShardingConfig}`` to override
-    it -- e.g. to leave a projection replicated or to use a different realizer.
-    """
-    if cfg.tp_size <= 1:
-        return model
+
+def validate_tp_model_options(model: nn.Module) -> None:
+    """Reject incompatible model policies even before mesh availability checks."""
     if any(
         getattr(getattr(module, "config", None), "attention_backend", "auto")
         == "eager_flex"
@@ -1005,9 +1028,34 @@ def apply_tp(
         compatibility.eager_flex_parallel("TP")
     if any(getattr(module, "_llmtuner_fused_qkv", False) for module in model.modules()):
         compatibility.fused_qkv_tp()
-    if mesh is None:
-        raise ValueError(f"tp={cfg.tp_size} requires a device mesh with a 'tp' axis")
 
+
+def resolve_tp_plan(
+    model: nn.Module,
+    *,
+    cfg: ParallelConfig,
+    plan: Mapping[str, str | ShardingConfig] | None = None,
+) -> ResolvedTPPlan:
+    """Resolve and validate TP locally, without a mesh or model mutation.
+
+    The assembly layer may coordinate rank-local failures around this function.
+    Existing model declarations and explicit overrides retain their precedence.
+    """
+    if cfg.tp_size <= 1:
+        raise ValueError("TP plan resolution requires tp_size > 1")
+    validate_tp_model_options(model)
+    validate = getattr(model, "validate_parallel", None)
+    # Model validators describe their full default plan. Explicit partial
+    # overrides instead use the target-level checks below. Reapplication sees
+    # already-sharded storage and must not validate it as an unsharded model.
+    if (
+        callable(validate)
+        and plan is None
+        and not cfg.tp_config.tp_colwise_modules
+        and not cfg.tp_config.tp_rowwise_modules
+        and getattr(model, "parallel_plan", None) is None
+    ):
+        validate(tp_degree=cfg.tp_size, ep_degree=cfg.ep_size)
     # Resolve targets once before accessing process groups or changing weights.
     raw_plan = model_tp_config(model) if plan is None else plan
     targets, moe_blocks = resolve_tp_targets(model, cfg=cfg, plan=raw_plan)
@@ -1136,14 +1184,136 @@ def apply_tp(
         ):
             raise ValueError("TP linear_attn requires replicated GDN projections")
 
+    # Resolve attention-specific realizers before execution. A caller-provided
+    # implementation keeps its semantics; only the default fused column GEMM
+    # needs its sequence gather moved to the attention boundary.
+    attention_parents: dict[str, nn.Module] = {}
+    realized_targets = []
+    for module_path, inner, spec in targets:
+        parent_path, _, _ = module_path.rpartition(".")
+        parent = model.get_submodule(parent_path)
+        if spec.kind == "colwise" and looks_like_attention(parent):
+            if spec.implementation is ColumnParallelLinear:
+                spec = replace(spec, implementation=ColwiseLinearNoGather)
+            attention_parents[parent_path] = parent
+        realized_targets.append((module_path, inner, spec))
+
+    shared_bindings = {}
+    for path, block in moe_blocks:
+        binding = resolve_shared_expert(block)
+        validate_moe_tp_target(path, block, tp_size=cfg.tp_size, shared_binding=binding)
+        shared_bindings[block] = binding
+
+    module_paths = {id(module): path for path, module in model.named_modules()}
+    return ParallelPlan(
+        stage="tp",
+        targets=(
+            *(
+                PlanTarget(path, "dense", module, spec.kind, spec)
+                for path, module, spec in realized_targets
+            ),
+            *(
+                PlanTarget(
+                    path, "moe", module, "fused_gate_up", shared_bindings[module]
+                )
+                for path, module in moe_blocks
+            ),
+            *(
+                PlanTarget(path, "vocab", module, "embedding_rowwise")
+                for path, module in vocab_targets
+            ),
+            *(
+                PlanTarget(path, "attention", parent, "gather")
+                for path, parent in attention_parents.items()
+            ),
+            *(
+                PlanTarget(
+                    module_paths[id(attention)],
+                    "attention",
+                    attention,
+                    "replicate_tokens",
+                )
+                for attention in replicated_attention
+            ),
+        ),
+        degree=cfg.tp_size,
+        implementation="unbound",
+        operations=("shard", "install_sequence_boundaries"),
+        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+    )
+
+
+def apply_tp(
+    model: nn.Module,
+    mesh: DeviceMesh | None,
+    cfg: ParallelConfig,
+    *,
+    plan: Mapping[str, str | ShardingConfig] | None = None,
+    resolved_plan: ResolvedTPPlan | None = None,
+    on_replacement: ReplacementObserver | None = None,
+) -> nn.Module:
+    """Tensor-parallelize ``model`` in place. No-op when ``tp == 1``.
+
+    ``plan`` defaults to the model's HF ``tp_config`` (HF ships one for Qwen3,
+    Llama, ...). Pass an explicit ``{path_pattern: ShardingConfig}`` to override
+    it -- e.g. to leave a projection replicated or to use a different realizer.
+    """
+    if cfg.tp_size <= 1:
+        return model
+    if mesh is None:
+        validate_tp_model_options(model)
+        raise ValueError(f"tp={cfg.tp_size} requires a device mesh with a 'tp' axis")
+    if resolved_plan is not None and plan is not None:
+        raise ValueError("Pass either plan or resolved_plan, not both")
+    resolved = (
+        resolve_tp_plan(model, cfg=cfg, plan=plan)
+        if resolved_plan is None
+        else resolved_plan
+    )
+    if resolved.stage != "tp":
+        raise ValueError(f"Expected a TP plan, got stage {resolved.stage!r}")
+    if resolved.degree != cfg.tp_size:
+        raise ValueError("Resolved TP degree does not match configuration")
+    resolved.validate_binding(model)
+    targets = tuple(
+        (target.path, target.module, target.spec)
+        for target in resolved.targets
+        if target.kind == "dense"
+    )
+    moe_blocks = tuple(
+        (target.path, target.module)
+        for target in resolved.targets
+        if target.kind == "moe"
+    )
+    vocab_targets = tuple(
+        (target.path, target.module)
+        for target in resolved.targets
+        if target.kind == "vocab"
+    )
+    attention_parents = tuple(
+        target.module
+        for target in resolved.targets
+        if target.kind == "attention" and target.layout == "gather"
+    )
+    replicated_attention = tuple(
+        target.module
+        for target in resolved.targets
+        if target.kind == "attention" and target.layout == "replicate_tokens"
+    )
+
     tp_size = mesh["tp"].size()
     if tp_size != cfg.tp_size:
         raise ValueError(
             f"TP mesh size {tp_size} does not match configured tp={cfg.tp_size}"
         )
+    use_symm_mem = supports_symm_mem(mesh["tp"])
+    execution_plan = replace(
+        resolved, implementation="symm_mem" if use_symm_mem else "functional"
+    )
+    execution_plan.validate_binding(model)
     group = mesh["tp"].get_group()
     tp_rank = mesh["tp"].get_local_rank()
-    use_symm_mem = supports_symm_mem(mesh["tp"])
     if use_symm_mem:
         enable_symm_mem(group)
 
@@ -1155,24 +1325,11 @@ def apply_tp(
     # Constructors are responsible for avoiding side effects on their inputs.
     replacements: list[tuple[nn.Module, str, nn.Module]] = []
     # Deepest paths first, so replacing a module never hides an inner target.
-    attention_parents: dict[str, nn.Module] = {}
     for module_path, inner, spec in sorted(targets, key=lambda t: -t[0].count(".")):
         parent_path, _, attr = module_path.rpartition(".")
         parent = model.get_submodule(parent_path) if parent_path else model
 
-        implementation = spec.implementation
-        if spec.kind == "colwise" and looks_like_attention(parent):
-            # HF attention reshapes q/k/v by the input's shape, so the fused
-            # in-GEMM sequence gather would silently mis-shape them. Take the
-            # same gather at the module boundary instead (below) and give the
-            # projection a plain feature-sharded GEMM. Only the default
-            # realizer is swapped out; an explicitly provided one is the
-            # caller's responsibility.
-            if implementation is ColumnParallelLinear:
-                implementation = ColwiseLinearNoGather
-            attention_parents[parent_path] = parent
-
-        wrapped = implementation(
+        wrapped = spec.implementation(
             inner.weight,
             tp_size=tp_size,
             tp_rank=tp_rank,
@@ -1216,11 +1373,21 @@ def apply_tp(
         }
         replacements.append((parent, attr, wrapped))
 
-    realize_moe_blocks_tp(moe_blocks, tp_size=tp_size, tp_rank=tp_rank, group=group)
+    realize_moe_blocks_tp(
+        moe_blocks,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        group=group,
+        shared_bindings={
+            target.module: target.spec
+            for target in resolved.targets
+            if target.kind == "moe"
+        },
+    )
     for parent, attr, wrapped in replacements:
         setattr(parent, attr, wrapped)
 
-    for parent in attention_parents.values():
+    for parent in attention_parents:
         if getattr(parent, "_tp_seq_group", None) is not None:
             continue  # already gathered (apply_tp is idempotent per module)
         parent._tp_seq_group = group
@@ -1259,12 +1426,28 @@ def apply_tp(
                     group,
                 )
 
+    if on_replacement is not None:
+        # TP preserves FQNs, including packed expert parameters. Resolve these
+        # exact paths once after installation and report identity changes to
+        # downstream FSDP bindings; do not infer replacements by shape.
+        modules = {
+            source: model.get_submodule(path)
+            for path, source in execution_plan.module_bindings or ()
+            if model.get_submodule(path) is not source
+        }
+        parameters = {
+            source: (model.get_parameter(path),)
+            for path, source in execution_plan.parameter_bindings or ()
+            if model.get_parameter(path) is not source
+        }
+        on_replacement(modules, parameters)
+    model.parallel_plan = execution_plan
     logger.info(
         "Applied TP degree %d: dense=%d, MoE=%d, vocab=%d, collective=%s",
-        tp_size,
-        len(targets),
-        len(moe_blocks),
-        len(vocab_targets),
-        "symm_mem" if use_symm_mem else "functional",
+        execution_plan.degree,
+        execution_plan.count("dense"),
+        execution_plan.count("moe"),
+        execution_plan.count("vocab"),
+        execution_plan.implementation,
     )
     return model

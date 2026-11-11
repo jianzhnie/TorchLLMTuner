@@ -16,6 +16,8 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
 )
 
+from ...contracts import DecoderStructure
+
 
 class Qwen3_5MoeSparseMoeBlock(reference.Qwen3_5MoeSparseMoeBlock):
     """Reference MoE math with an explicit tensor-only output contract."""
@@ -26,7 +28,7 @@ class Qwen3_5MoeSparseMoeBlock(reference.Qwen3_5MoeSparseMoeBlock):
 class Qwen3_5MoeDecoderLayer(reference.Qwen3_5MoeDecoderLayer):
     """Own the token-mixer selection and residual-block composition."""
 
-    def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int):
+    def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int) -> None:
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         self.layer_type = config.layer_types[layer_idx]
@@ -40,6 +42,7 @@ class Qwen3_5MoeDecoderLayer(reference.Qwen3_5MoeDecoderLayer):
         else:
             raise ValueError(f"Unsupported Qwen3.5 layer type: {self.layer_type!r}")
         self.mlp = Qwen3_5MoeSparseMoeBlock(config)
+        self.moe_block_name = "mlp"
         self.input_layernorm = reference.Qwen3_5MoeRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -94,7 +97,7 @@ class Qwen3_5MoeTextModel(reference.Qwen3_5MoeTextModel):
     def _can_set_experts_implementation(cls) -> bool:
         return reference.Qwen3_5MoeTextModel._can_set_experts_implementation()
 
-    def __init__(self, config: Qwen3_5MoeTextConfig):
+    def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         reference.Qwen3_5MoePreTrainedModel.__init__(self, config)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
@@ -114,6 +117,14 @@ class Qwen3_5MoeTextModel(reference.Qwen3_5MoeTextModel):
 class Qwen3_5MoeForCausalLM(reference.Qwen3_5MoeForCausalLM):
     """Model-owned text LM; vision-language execution is a separate contract."""
 
+    decoder_structure = DecoderStructure(
+        decoder="model",
+        embedding="model.embed_tokens",
+        blocks="model.layers",
+        norm="model.norm",
+        head="lm_head",
+    )
+
     @classmethod
     def is_custom_code(cls) -> bool:
         return False
@@ -122,7 +133,7 @@ class Qwen3_5MoeForCausalLM(reference.Qwen3_5MoeForCausalLM):
     def _can_set_experts_implementation(cls) -> bool:
         return reference.Qwen3_5MoeForCausalLM._can_set_experts_implementation()
 
-    def __init__(self, config: Qwen3_5MoeTextConfig):
+    def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         reference.Qwen3_5MoePreTrainedModel.__init__(self, config)
         self.model = Qwen3_5MoeTextModel(config)
         self.vocab_size = config.vocab_size
@@ -131,3 +142,8 @@ class Qwen3_5MoeForCausalLM(reference.Qwen3_5MoeForCausalLM):
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.post_init()
+
+    @property
+    def enable_weight_tying(self) -> bool:
+        """Report actual Parameter identity rather than configuration intent."""
+        return self.lm_head.weight is self.model.embed_tokens.weight

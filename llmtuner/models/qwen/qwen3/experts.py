@@ -5,13 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ....accelerator.npu_ops import moe_token_permute
 from ...common.scatter_add import deterministic_scatter_add
-
-try:
-    import torch_npu
-except ImportError as error:
-    torch_npu = None
-    TORCH_NPU_IMPORT_ERROR = error
 
 
 def forward_torchtitan_moe(module: nn.Module, hidden_states: torch.Tensor):
@@ -25,13 +20,8 @@ def forward_torchtitan_moe(module: nn.Module, hidden_states: torch.Tensor):
     ).sum(dim=(0, 1))
     npu_dispatch = hidden_states.device.type == "npu"
     if npu_dispatch:
-        if torch_npu is None:
-            raise ImportError(
-                "NPU kernels require a working torch-npu installation"
-            ) from (TORCH_NPU_IMPORT_ERROR)
-
-        routed, _ = torch_npu.npu_moe_token_permute(hidden_states, expert_ids)
-        routed_scores, _ = torch_npu.npu_moe_token_permute(
+        routed = moe_token_permute(hidden_states, expert_ids)
+        routed_scores = moe_token_permute(
             scores.reshape(-1, 1), expert_ids.reshape(-1, 1)
         )
     else:

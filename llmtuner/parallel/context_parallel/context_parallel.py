@@ -32,6 +32,36 @@ __all__ = ["apply_cp"]
 _ATTN_MODULE_NAMES = ("self_attn", "attn", "attention")
 
 
+def _attention_modules(model: nn.Module) -> list[nn.Module]:
+    """Bind declared attention children, retaining legacy lookup for other models."""
+    layers = getattr(model, "layers", ())
+    structure = getattr(getattr(model, "model", None), "decoder_structure", None)
+    declared = getattr(structure, "attention", None)
+    if declared is not None:
+        attentions = []
+        for index, layer in enumerate(layers):
+            attention = layer._modules.get(declared)
+            if not isinstance(attention, nn.Module):
+                raise ValueError(
+                    f"{type(layer).__name__} (layer {index}) must declare "
+                    f"{declared!r} as an attention child module"
+                )
+            attentions.append(attention)
+        return attentions
+    attentions = []
+    for index, layer in enumerate(layers):
+        for name in _ATTN_MODULE_NAMES:
+            if hasattr(layer, name):
+                attentions.append(getattr(layer, name))
+                break
+        else:
+            raise AttributeError(
+                f"{type(layer).__name__} (layer {index}) has no attention module "
+                f"under any of {_ATTN_MODULE_NAMES}"
+            )
+    return attentions
+
+
 def _require_ulysses_compatible(
     model: nn.Module, *, cfg: ParallelConfig, cp_mesh: DeviceMesh
 ) -> None:
@@ -70,12 +100,7 @@ def _require_ulysses_compatible(
     # rank's local head count -- equivalently, the global count must divide
     # tp * cp (upstream torchtitan's head_shard_degree in its
     # config/validation.py).
-    attentions = [
-        getattr(layer, name)
-        for layer in getattr(model, "layers", [])
-        for name in _ATTN_MODULE_NAMES
-        if hasattr(layer, name)
-    ]
+    attentions = _attention_modules(model)
     # A TP plan may leave attention replicated (e.g. MLA). Its heads have
     # not been cut by TP; only Ulysses divides them. For mixed layouts keep
     # the stricter check required by any head-sharded layer.
@@ -219,19 +244,7 @@ def apply_cp(
         # full sequence, so the unsharded structure applies directly).
         model_config._cp_sdpa_ulysses = strategy == "ulysses"
         model_config._cp_sdpa_dual = dual_axes
-    attentions = []
-    for idx, layer in enumerate(layers):
-        for name in _ATTN_MODULE_NAMES:
-            if hasattr(layer, name):
-                attn_mod = getattr(layer, name)
-                break
-        else:
-            raise AttributeError(
-                f"{type(layer).__name__} (layer {idx}) has no attention module "
-                f"under any of {_ATTN_MODULE_NAMES}. Add the model's spelling "
-                "to the probe in apply_cp."
-            )
-        attentions.append(attn_mod)
+    attentions = _attention_modules(model)
     if sdpa_backend:
         for attn_mod in attentions:
             attn_mod._titan_cp_sdpa_kernel = cp_sdpa_kernel

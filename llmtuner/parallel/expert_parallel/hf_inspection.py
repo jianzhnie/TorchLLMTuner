@@ -111,13 +111,11 @@ __all__ = [
 
 
 def router_of(block: nn.Module) -> nn.Module | None:
-    """The block's router module, whatever the family calls it.
-
-    ``gate`` is the common spelling and what every supported family but GPT-OSS
-    uses. DeepSeek-V2's is a plain ``nn.Linear``; Qwen3Moe's, Mixtral's,
-    DeepSeek-V3's and GLM4's are bespoke classes that differ only in the buffers
-    they carry.
-    """
+    """Resolve a declared router, or inspect a legacy HF block."""
+    contract = getattr(block, "moe_contract", None)
+    if contract is not None:
+        router, _, _ = contract.bind(block)
+        return router
     return getattr(block, "gate", None) or getattr(block, "router", None)
 
 
@@ -313,7 +311,12 @@ def fused_experts_of(block: nn.Module) -> FusedExperts | None:
             have no counterpart in llmtuner's ``GroupedExperts``. Copying it under
             the shared convention would put the wrong weight in the wrong slot.
     """
-    layout = getattr(block, "expert_layout", None)
+    contract = getattr(block, "moe_contract", None)
+    layout = getattr(
+        block,
+        "expert_layout",
+        contract.expert_layout if contract is not None else None,
+    )
     if layout is not None and layout != "fused_gate_up":
         raise ValueError(f"Unsupported declared expert layout {layout!r}")
     experts = getattr(block, "experts", None)
@@ -395,6 +398,11 @@ def is_hf_moe_block(module: nn.Module) -> bool:
     experts = fused_experts_of(module)
     if experts is None:
         return False
+    contract = getattr(module, "moe_contract", None)
+    if contract is not None and experts.num_experts != contract.num_experts:
+        raise ValueError(
+            f"Declared {contract.num_experts} experts, found {experts.num_experts}"
+        )
     router = router_of(module)
     if not has_router_weight(router) or resolve_top_k(module) is None:
         return False
@@ -422,7 +430,11 @@ def is_hf_moe_block(module: nn.Module) -> bool:
 
 
 def resolve_shared_expert(block: nn.Module) -> tuple[str, nn.Module | None]:
-    """Select a populated shared-expert attribute and preserve its HF path."""
+    """Resolve a declared shared expert, or inspect a legacy HF block."""
+    contract = getattr(block, "moe_contract", None)
+    if contract is not None:
+        _, name, shared = contract.bind(block)
+        return name, shared
     for name in ("shared_expert", "shared_experts"):
         shared = getattr(block, name, None)
         if shared is not None:
@@ -431,7 +443,10 @@ def resolve_shared_expert(block: nn.Module) -> tuple[str, nn.Module | None]:
 
 
 def resolve_top_k(block: nn.Module) -> int | None:
-    """Top-K per token, from the block or its router."""
+    """Top-K per token, from the model contract or a legacy HF block."""
+    contract = getattr(block, "moe_contract", None)
+    if contract is not None:
+        return contract.top_k
     for owner in (block, router_of(block)):
         if owner is None:
             continue
@@ -467,12 +482,10 @@ def ignores_norm_topk_prob(block: nn.Module, router: nn.Module) -> bool:
 
 
 def read_route_norm(block: nn.Module, router: nn.Module) -> bool:
-    """Whether the selected K scores are renormalized to sum to 1.
-
-    ``norm_topk_prob`` may live on either the block or the router. When neither
-    declares it, sigmoid routing scores are used as-is and anything else is taken
-    to be normalized -- matching how torchtitan's probe resolves it.
-    """
+    """Read declared route normalization or inspect a legacy HF block."""
+    contract = getattr(block, "moe_contract", None)
+    if contract is not None:
+        return contract.route_norm
     if ignores_norm_topk_prob(block, router):
         return False
     for owner in (block, router):
@@ -483,12 +496,10 @@ def read_route_norm(block: nn.Module, router: nn.Module) -> bool:
 
 
 def resolve_score_func(block: nn.Module, router: nn.Module) -> str:
-    """The router's scoring function.
-
-    ``e_score_correction_bias`` is the reliable DeepSeek-V3/GLM4 marker: a router
-    that carries that buffer scores with sigmoid. Otherwise the block's declared
-    ``scoring_func`` wins, defaulting to softmax as HF does.
-    """
+    """Read the model-owned score function or inspect a legacy HF router."""
+    contract = getattr(block, "moe_contract", None)
+    if contract is not None:
+        return contract.score_func
     buffers = getattr(router, "_buffers", {})
     if "e_score_correction_bias" in buffers:
         return "sigmoid"
@@ -510,12 +521,10 @@ def read_int_attr(block: nn.Module, router: nn.Module, name: str) -> int | None:
 
 
 def read_route_scale(block: nn.Module, router: nn.Module) -> float:
-    """The multiplier applied to the selected K scores after normalization.
-
-    HF puts ``routed_scaling_factor`` on whichever object owns the rest of the
-    routing: the MoE block for Qwen3Moe, the router for DeepSeek-V3/GLM4. Both
-    are checked so the same probe serves either layout.
-    """
+    """Read declared route scaling or inspect a legacy HF block."""
+    contract = getattr(block, "moe_contract", None)
+    if contract is not None:
+        return contract.route_scale
     for owner in (block, router):
         value = getattr(owner, "routed_scaling_factor", None)
         if value is not None:
@@ -547,6 +556,9 @@ def returns_router_logits(block: nn.Module) -> bool:
     return) when the source cannot be read, e.g. an installed-and-stripped
     build; that case is logged rather than assumed silently.
     """
+    contract = getattr(block, "moe_contract", None)
+    if contract is not None:
+        return contract.router_logits_in_output
     declared = getattr(block, "router_logits_in_output", None)
     if declared is not None:
         if not isinstance(declared, bool):
@@ -608,24 +620,10 @@ def moe_block_of(layer: nn.Module) -> tuple[str, nn.Module | None]:
 def read_expert_groups(
     block: nn.Module, router: nn.Module
 ) -> tuple[int | None, int | None]:
-    """The node-limited-routing config, as ``(num_expert_groups, num_limited_groups)``.
-
-    Returns ``(None, None)`` when the block does no group-limited routing, which
-    is the case for Qwen3Moe, OLMoE and Mixtral.
-
-    The grouping attributes are read only when the model is actually routing by
-    group. DeepSeek-V2 carries ``num_group``/``topk_group`` but consults them
-    only under ``topk_method="group_limited_greedy"``; its default ``"greedy"``
-    routes freely over all experts. Reading the attributes without checking the
-    method feeds those tokens into a group restriction HF never applies.
-
-    Raises:
-        NotImplementedError: for DeepSeek-V2's ``group_limited_greedy``, whose
-            rule differs from the one implemented here: it scores a group by its
-            single best expert (``max``) where DeepSeek-V3/GLM4 sum the group's
-            top-2. Both are "group-limited", so the distinction is invisible in
-            the config and would only show up as different experts being chosen.
-    """
+    """Read declared group-limited routing or inspect a legacy HF block."""
+    contract = getattr(block, "moe_contract", None)
+    if contract is not None:
+        return contract.num_expert_groups, contract.num_limited_groups
     # ``n_group`` is the DeepSeek-V3/GLM4 spelling, ``num_group`` DeepSeek-V2's.
     # Both are probed: reading only one silently disables grouping for the
     # family that spells it the other way, which is a routing change HF does not

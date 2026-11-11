@@ -11,6 +11,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
 from llmtuner.errors import UnsupportedCombinationError
 
+from ....accelerator.npu_ops import rms_norm
 from .normalization import forward_aten_rms_norm
 from .residual_normalization import (
     apply_joint_residual_norm,
@@ -19,11 +20,6 @@ from .residual_normalization import (
     isolate_norm_input,
     validate_joint_residual_norm,
 )
-
-try:
-    import torch_npu
-except ImportError:
-    torch_npu = None
 
 # Retain the former hook name for callers holding ownership checks by identity.
 _isolate_norm_input = isolate_norm_input
@@ -41,9 +37,7 @@ def forward_torch_rms_norm(module: nn.Module, hidden_states: torch.Tensor):
 def forward_npu_rms_norm(module: nn.Module, hidden_states: torch.Tensor):
     if hidden_states.device.type != "npu":
         raise RuntimeError("model.norm_backend='npu' requires NPU tensors")
-    return torch_npu.npu_rms_norm(
-        hidden_states, module.weight, module.variance_epsilon
-    )[0]
+    return rms_norm(hidden_states, module.weight, module.variance_epsilon)
 
 
 def stabilize_residual_norm_gradients(model: nn.Module) -> None:

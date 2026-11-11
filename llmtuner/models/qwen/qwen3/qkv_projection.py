@@ -19,6 +19,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeAttention
 
 from llmtuner.errors import UnsupportedCombinationError
 
+from ....accelerator.npu_ops import rotary_mul
 from ..qwen3_5.rotary import (
     _apply_qwen35_fp32_rotary,
 )
@@ -28,12 +29,6 @@ from ..qwen3_5.rotary import (
 from ..qwen3_5.rotary import (
     forward_qwen35_fp32_cache as forward_qwen35_fp32_cache,
 )
-
-try:
-    import torch_npu
-except ImportError as error:
-    torch_npu = None
-    TORCH_NPU_IMPORT_ERROR = error
 
 
 def _validate_projections(module: nn.Module) -> None:
@@ -125,22 +120,13 @@ def apply_configured_rotary(module, query, key, cosine, sine, position_ids):
     if query.device.type == "npu" and (
         getattr(module.config, "rotary_cache_dtype", None) == "bfloat16"
     ):
-        if torch_npu is None:
-            raise ImportError(
-                "NPU kernels require a working torch-npu installation"
-            ) from (TORCH_NPU_IMPORT_ERROR)
-
         # Match both the baseline rotary kernel and its backward reduction.
         # An algebraically equivalent eager rotation can match BF16 forward
         # exactly while rounding its input gradient differently.
         cosine = cosine.transpose(1, 2)
         sine = sine.transpose(1, 2)
-        query = torch_npu.npu_rotary_mul(
-            query.transpose(1, 2).float(), cosine, sine
-        ).transpose(1, 2)
-        key = torch_npu.npu_rotary_mul(
-            key.transpose(1, 2).float(), cosine, sine
-        ).transpose(1, 2)
+        query = rotary_mul(query.transpose(1, 2).float(), cosine, sine).transpose(1, 2)
+        key = rotary_mul(key.transpose(1, 2).float(), cosine, sine).transpose(1, 2)
         return query.to(query_dtype), key.to(key_dtype)
     # Accumulate both FP32 branches before casting their gradient back to BF16.
     query_f = query.float()

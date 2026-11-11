@@ -50,7 +50,12 @@ from .pipeline_parallel.pipeline_parallel import (
     validate_microbatches,
 )
 from .stages import STAGE_ORDER
-from .tensor_parallel.tensor_parallel import apply_tp, resolve_tp_overrides
+from .tensor_parallel.tensor_parallel import (
+    ResolvedTPPlan,
+    apply_tp,
+    resolve_tp_overrides,
+    resolve_tp_plan,
+)
 from .topology import ParallelTopology
 
 __all__ = ["parallelize_hf_transformers"]
@@ -114,6 +119,7 @@ def parallelize_hf_transformers(
         *,
         dense_mesh: DeviceMesh | None,
         part_cfg: ParallelConfig | None = None,
+        resolved_tp_plan: ResolvedTPPlan | None = None,
     ) -> nn.Module:
         """Bind stage options once, then transform the model in declared order."""
         fsdp_cfg = cfg if part_cfg is None else part_cfg
@@ -126,8 +132,18 @@ def parallelize_hf_transformers(
             )
             else None
         )
+        tp_options = {}
+        if resolved_tp_plan is not None:
+            tp_options["resolved_plan"] = resolved_tp_plan
+        if references is not None:
+            tp_options["on_replacement"] = references.record_replacements
         runners = {
-            "tp": partial(apply_tp, mesh=dense_mesh, cfg=cfg),
+            "tp": partial(
+                apply_tp,
+                mesh=dense_mesh,
+                cfg=cfg,
+                **tp_options,
+            ),
             "ep": partial(
                 apply_ep, cfg=cfg, ep_group=ep_group, error_group=ep_error_group
             ),
@@ -210,6 +226,7 @@ def parallelize_hf_transformers(
                 )
             if cfg.tp_size > 1:
                 resolve_tp_overrides(model, cfg=cfg)
+                resolve_tp_plan(model, cfg=cfg)
             validate_microbatches(parallel_dims, cfg, global_batch_size)
         # Split first; use this stage's dense mesh for all local transforms.
         stages, model_parts, has_first_stage, has_last_stage = apply_pp(
@@ -220,6 +237,14 @@ def parallelize_hf_transformers(
             global_batch_size=global_batch_size,
         )
         dense_mesh = parallel_dims.spmd_dense_mesh()
+        # Stage construction deep-copies the model. Resolve fresh local bindings;
+        # references from the global preflight deliberately cannot cross this boundary.
+        resolved_tp_plans = [None] * len(model_parts)
+        if cfg.tp_size > 1:
+            with synchronize_local_errors("Pipeline local TP plan validation"):
+                resolved_tp_plans = [
+                    resolve_tp_plan(part, cfg=cfg) for part in model_parts
+                ]
         # Part ownership is rank-local, but failure must stop all stages
         # before TP/EP/FSDP begin communicating on the resulting parts.
         with synchronize_local_errors("Pipeline FSDP plan binding"):
@@ -230,7 +255,10 @@ def parallelize_hf_transformers(
             )
         for i, part in enumerate(model_parts):
             model_parts[i] = apply_stages(
-                part, dense_mesh=dense_mesh, part_cfg=fsdp_configs[i]
+                part,
+                dense_mesh=dense_mesh,
+                part_cfg=fsdp_configs[i],
+                resolved_tp_plan=resolved_tp_plans[i],
             )
             # Rebind the stage's submodule in case a transform replaced the chunk.
             stages[i].submod = model_parts[i]
@@ -250,4 +278,10 @@ def parallelize_hf_transformers(
             has_last_stage=has_last_stage,
         )
 
-    return apply_stages(model, dense_mesh=mesh)
+    resolved_tp_plan = None
+    if cfg.tp_size > 1 and mesh is not None:
+        # Local inspection only: coordinate failures before TP accesses its
+        # communication group. The executor consumes exactly these bindings.
+        with synchronize_local_errors("Tensor parallel plan validation"):
+            resolved_tp_plan = resolve_tp_plan(model, cfg=cfg)
+    return apply_stages(model, dense_mesh=mesh, resolved_tp_plan=resolved_tp_plan)

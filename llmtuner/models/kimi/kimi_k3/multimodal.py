@@ -74,10 +74,7 @@ if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
 else:
     flash_attn_varlen_func = None
-from ....accelerator.device import get_device_type as get_accelerator_name
-
-if get_accelerator_name() == "npu":
-    import torch_npu
+from ....accelerator.npu_ops import fusion_attention, rotary_mul
 
 
 def multihead_attention(
@@ -105,19 +102,15 @@ def multihead_attention(
             where dim = num_heads * head_dim
     """
     if q.device.type == "npu":
-        attn_out = torch_npu.npu_fusion_attention(
+        attn_out = fusion_attention(
             q,
             k,
             v,
             head_num=q.shape[1],
-            pse=None,
-            atten_mask=None,
             scale=1.0 / math.sqrt(q.shape[-1]),
-            keep_prob=1,
-            input_layout="TND",
-            actual_seq_qlen=q_cu_seqlens,
-            actual_seq_kvlen=k_cu_seqlens,
-        )[0]
+            q_cu_seqlens=q_cu_seqlens,
+            k_cu_seqlens=k_cu_seqlens,
+        )
     else:
         attn_out = flash_attn_varlen_func(
             q,
@@ -235,12 +228,8 @@ def apply_rope(
     if xq.device.type == "npu":
         if cos is None or sin is None:
             raise ValueError("NPU RoPE requires explicit cos/sin tensors")
-        xq_out = torch_npu.npu_rotary_mul(
-            xq.float(), cos, sin, rotary_mode="interleave"
-        )
-        xk_out = torch_npu.npu_rotary_mul(
-            xk.float(), cos, sin, rotary_mode="interleave"
-        )
+        xq_out = rotary_mul(xq.float(), cos, sin, rotary_mode="interleave")
+        xk_out = rotary_mul(xk.float(), cos, sin, rotary_mode="interleave")
         # Modification end
     else:
         freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
@@ -999,7 +988,7 @@ class VisionTowerConfig(PretrainedConfig):
 
 
 class ProjectorConfig:
-    def __init__(self, config: KimiK3Config):
+    def __init__(self, config: KimiK3Config) -> None:
         self.mm_projector_type = config.mm_projector_type
         self.mm_hidden_size = config.mm_hidden_size
         self.hidden_size = config.text_hidden_size
@@ -1015,7 +1004,7 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
     def _supports_default_dynamic_cache(cls) -> bool:
         return False
 
-    def __init__(self, config: KimiK3Config):
+    def __init__(self, config: KimiK3Config) -> None:
         super().__init__(config)
 
         vt_config = VisionTowerConfig(config.vision_config)

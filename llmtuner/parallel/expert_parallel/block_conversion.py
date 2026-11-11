@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -91,6 +93,42 @@ def restore_fp32_state_buffers(module: nn.Module) -> None:
                     buffer.data = buffer.data.to(torch.float32)
 
 
+@dataclass(frozen=True, slots=True)
+class MoERoutingBinding:
+    """Model routing choices resolved before allocating replacement weights."""
+
+    source: nn.Module
+    router: nn.Module
+    shared: nn.Module | None
+    top_k: int
+    score_func: str
+    route_norm: bool
+    route_scale: float
+    num_expert_groups: int | None
+    num_limited_groups: int | None
+
+
+def resolve_moe_routing(block: nn.Module) -> MoERoutingBinding:
+    """Read an explicit model contract or the legacy routing adapter once."""
+    router = router_of(block)
+    top_k = resolve_top_k(block)
+    if router is None or top_k is None:
+        raise ValueError("MoE conversion requires a router and top-k declaration")
+    _, shared = resolve_shared_expert(block)
+    groups, limited = read_expert_groups(block, router)
+    return MoERoutingBinding(
+        source=block,
+        router=router,
+        shared=shared,
+        top_k=top_k,
+        score_func=resolve_score_func(block, router),
+        route_norm=read_route_norm(block, router),
+        route_scale=read_route_scale(block, router),
+        num_expert_groups=groups,
+        num_limited_groups=limited,
+    )
+
+
 def convert_block(
     block: nn.Module,
     *,
@@ -101,16 +139,19 @@ def convert_block(
     token_dispatcher: str,
     torchao_pad_multiple: int,
     tp_enabled: bool = False,
+    routing: MoERoutingBinding | None = None,
 ) -> MoE:
     """Build the llmtuner MoE for one HF block and move its weights over."""
     ep_size = 1 if ep_group is None else get_world_size(ep_group)
     ep_rank = 0 if ep_group is None else get_rank(ep_group)
 
-    router_gate = router_of(block)
-    assert router_gate is not None  # the probe established this
+    routing = routing if routing is not None else resolve_moe_routing(block)
+    if routing.source is not block:
+        raise ValueError("MoE routing binding belongs to another block")
+    router_gate = routing.router
     if getattr(router_gate, "bias", None) is not None:
         compatibility.router_bias(router_gate)
-    _, shared = resolve_shared_expert(block)
+    shared = routing.shared
     if shared is not None and hasattr(block, "shared_expert_gate"):
         compatibility.shared_expert_gate(block)
     feature_parallel = bool(getattr(block, "_tp_moe_boundary", False))
@@ -124,8 +165,7 @@ def convert_block(
     assert experts is not None  # the probe established this
 
     num_experts = experts.num_experts
-    top_k = resolve_top_k(block)
-    assert top_k is not None  # the probe established this
+    top_k = routing.top_k
     dim = router_gate.weight.shape[1]
     hidden = experts.gate_EFD.shape[1]
     if num_experts % ep_size != 0:
@@ -136,7 +176,8 @@ def convert_block(
     num_local = num_experts // ep_size
     lo = ep_rank * num_local
 
-    num_expert_groups, num_limited_groups = read_expert_groups(block, router_gate)
+    num_expert_groups = routing.num_expert_groups
+    num_limited_groups = routing.num_limited_groups
     original_forward = block.__dict__.get("_tp_moe_original_forward", block.forward)
     baseline_npu = (
         device_type == "npu"
@@ -152,13 +193,13 @@ def convert_block(
         grouped = MC2GroupedExperts(dim, hidden, num_local)
     else:
         grouped = GroupedExperts(dim, hidden, num_local)
-    score_func = resolve_score_func(block, router_gate)
+    score_func = routing.score_func
     router_options = {
         "num_experts": num_experts,
         "dim": dim,
         "top_k": top_k,
-        "route_norm": read_route_norm(block, router_gate),
-        "route_scale": read_route_scale(block, router_gate),
+        "route_norm": routing.route_norm,
+        "route_scale": routing.route_scale,
         "aux_loss": (
             MicrobatchWiseLoadBalanceLoss(
                 coeff=aux_loss_coeff,

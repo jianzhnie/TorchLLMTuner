@@ -25,6 +25,8 @@ from ..utils.lazy_exports import resolve_export
 # stack and its spmd surface). Eager re-exports would make any submodule
 # import -- compatibility included -- pay for the whole engine.
 _EXPORT_SOURCES = {
+    "ParallelPlan": "plan",
+    "PlanTarget": "plan",
     "apply_cp": "context_parallel.context_parallel",
     "apply_ep": "expert_parallel.expert_parallel",
     "apply_fsdp": "fully_shard_parallel.fully_shard_parallel",

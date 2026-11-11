@@ -1,33 +1,18 @@
-"""Opt-in model construction from the single architecture registry."""
+"""Compatibility API for opt-in construction from the single model registry."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .architecture import registered_model_architectures
+from .registry import build_registered_model
 
 if TYPE_CHECKING:
     from torch import nn
 
 
 def build_explicit_model(config: Any) -> nn.Module:
-    """Construct an explicitly enabled architecture without HF auto resolution.
-
-    Task selection belongs to the registration: composite models keep their
-    conditional-generation class rather than being unwrapped as text models.
-    """
-    architectures = {
-        entry.model_type: entry
-        for entry in registered_model_architectures()
-        if entry.explicit
-    }
-    architecture = architectures.get(config.model_type)
-    if architecture is None:
-        supported = ", ".join(sorted(architectures))
-        raise ValueError(
-            f"No explicit model for {config.model_type!r}; choose one of {supported}"
-        )
-    return architecture.model_class_loader()(config)
+    """Preserve opt-in construction while sharing the production constructor."""
+    return build_registered_model(config, explicit_only=True)
 
 
 __all__ = ["build_explicit_model"]

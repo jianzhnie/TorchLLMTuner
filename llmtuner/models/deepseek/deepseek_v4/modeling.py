@@ -33,6 +33,7 @@ from ....parallel.expert_parallel.token_dispatch import (
     AllToAllTokenDispatcher,
     materialize,
 )
+from ...contracts import DecoderStructure
 from .context_parallel import deepseek_v4_cp_attention_forward
 
 
@@ -131,7 +132,7 @@ class DeepseekV4SparseMoeBlock(HFDeepseekV4SparseMoeBlock):
 
     router_logits_in_output = False
 
-    def __init__(self, config: DeepseekV4Config, layer_idx: int):
+    def __init__(self, config: DeepseekV4Config, layer_idx: int) -> None:
         nn.Module.__init__(self)
         self.is_hash = config.mlp_layer_types[layer_idx] == "hash_moe"
         self.gate = (
@@ -159,11 +160,12 @@ class DeepseekV4SparseMoeBlock(HFDeepseekV4SparseMoeBlock):
 class DeepseekV4DecoderLayer(HFDeepseekV4DecoderLayer):
     """Native decoder layer with the explicit MoE block."""
 
-    def __init__(self, config: DeepseekV4Config, layer_idx: int):
+    def __init__(self, config: DeepseekV4Config, layer_idx: int) -> None:
         nn.Module.__init__(self)
         self.layer_idx = layer_idx
         self.self_attn = reference.DeepseekV4Attention(config, layer_idx)
         self.mlp = DeepseekV4SparseMoeBlock(config, layer_idx)
+        self.moe_block_name = "mlp"
         self.input_layernorm = reference.DeepseekV4RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -206,7 +208,7 @@ class DeepseekV4Model(HFDeepseekV4Model):
     def _can_set_experts_implementation(cls) -> bool:
         return HFDeepseekV4Model._can_set_experts_implementation()
 
-    def __init__(self, config: DeepseekV4Config):
+    def __init__(self, config: DeepseekV4Config) -> None:
         reference.DeepseekV4PreTrainedModel.__init__(self, config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -214,10 +216,8 @@ class DeepseekV4Model(HFDeepseekV4Model):
             config.vocab_size, config.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(
-            [
-                DeepseekV4DecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            DeepseekV4DecoderLayer(config, index)
+            for index in range(config.num_hidden_layers)
         )
         self.norm = reference.DeepseekV4RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -253,6 +253,14 @@ class DeepseekV4Model(HFDeepseekV4Model):
 class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
     """Explicit DeepSeek V4 model chain with the native causal-LM contract."""
 
+    decoder_structure = DecoderStructure(
+        decoder="model",
+        embedding="model.embed_tokens",
+        blocks="model.layers",
+        norm="model.norm",
+        head="lm_head",
+    )
+
     @classmethod
     def is_custom_code(cls) -> bool:
         return False
@@ -261,7 +269,7 @@ class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
     def _can_set_experts_implementation(cls) -> bool:
         return True
 
-    def __init__(self, config: DeepseekV4Config):
+    def __init__(self, config: DeepseekV4Config) -> None:
         reference.DeepseekV4PreTrainedModel.__init__(self, config)
         self.model = DeepseekV4Model(config)
         self.vocab_size = config.vocab_size
@@ -270,6 +278,11 @@ class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.post_init()
+
+    @property
+    def enable_weight_tying(self) -> bool:
+        """Report actual Parameter identity rather than configuration intent."""
+        return self.lm_head.weight is self.model.embed_tokens.weight
 
 
 __all__ = [

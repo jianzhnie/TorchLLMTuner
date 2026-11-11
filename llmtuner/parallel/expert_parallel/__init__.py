@@ -16,6 +16,7 @@ from ...utils.lazy_exports import resolve_export
 _EXPORT_SOURCES = {
     "restore_fp32_state_buffers": "block_conversion",
     "apply_ep": "expert_parallel",
+    "resolve_ep_plan": "model_replacement",
     "swap_hf_moe_blocks": "model_replacement",
 }
 

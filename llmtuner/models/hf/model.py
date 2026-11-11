@@ -33,6 +33,7 @@ from ...datasets.contracts import Batch, TrainerBatch
 from ...parallel.topology import ParallelTopology
 from ...utils.logging import get_logger
 from ..common.moe.layer import collect_moe_layers
+from ..contracts import DecoderStructure
 from ..qwen.qwen3.normalization_setup import stabilize_residual_norm_gradients
 from ..qwen.qwen3.qkv_projection import (
     apply_fp32_rotary_projection,
@@ -145,23 +146,27 @@ class HFTransformerModel(nn.Module):
         #
         # The attribute names are resolved once here; the accessors below are
         # properties so a pipeline stage can swap a part out in place.
-        object.__setattr__(self, "_decoder", self.model.model)
-        object.__setattr__(
-            self,
-            "_embed_name",
-            resolve_submodule_name(
-                self._decoder, ("embed_tokens", "wte"), component="token embedding"
-            ),
-        )
-        object.__setattr__(
-            self,
-            "_norm_name",
-            resolve_submodule_name(
-                self._decoder,
-                ("norm", "final_layernorm", "ln_f"),
-                component="final norm",
-            ),
-        )
+        structure = getattr(self.model, "decoder_structure", None)
+        if structure is not None:
+            if not isinstance(structure, DecoderStructure):
+                raise TypeError("decoder_structure must be a DecoderStructure")
+            if (
+                structure.blocks != f"{structure.decoder}.layers"
+                or structure.head != "lm_head"
+            ):
+                raise ValueError(
+                    "The HF training adapter requires decoder-local layers and lm_head"
+                )
+            bound = structure.bind(self.model)
+            # Store paths, not a lasting snapshot of references: PP may replace
+            # decoder slots and the public properties must observe replacements.
+            object.__setattr__(self, "_decoder", bound.decoder)
+            object.__setattr__(
+                self, "_embed_name", structure.embedding.rsplit(".", 1)[-1]
+            )
+            object.__setattr__(self, "_norm_name", structure.norm.rsplit(".", 1)[-1])
+        else:
+            self._bind_legacy_decoder()
 
         if get_rank() == 0:
             logger.info(
@@ -182,6 +187,26 @@ class HFTransformerModel(nn.Module):
                 getattr(config, "rotary_cache_dtype", None),
                 getattr(config, "compute_dtype", None),
             )
+
+    def _bind_legacy_decoder(self) -> None:
+        """Keep candidate-name inspection confined to unmigrated models."""
+        object.__setattr__(self, "_decoder", self.model.model)
+        object.__setattr__(
+            self,
+            "_embed_name",
+            resolve_submodule_name(
+                self._decoder, ("embed_tokens", "wte"), component="token embedding"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_norm_name",
+            resolve_submodule_name(
+                self._decoder,
+                ("norm", "final_layernorm", "ln_f"),
+                component="final norm",
+            ),
+        )
 
     # -- parts, under the names the rest of the framework uses ------------------
 
@@ -303,7 +328,11 @@ class HFTransformerModel(nn.Module):
 
     @property
     def tp_config(self) -> dict[str, str]:
-        """HF's TP plan, with patterns rewritten to THIS wrapper's module paths.
+        """Model TP declarations rewritten to this wrapper's module paths.
+
+        An explicit decoder's model-owned ``tp_config`` takes precedence over
+        HF-generated patterns. The compatibility lookup below applies when no
+        model-owned declaration is provided.
 
         HF states its plan relative to the model it ships -- ``layers.*.q_proj``,
         plus a ``model.``-prefixed variant for families that nest one level
@@ -321,7 +350,7 @@ class HFTransformerModel(nn.Module):
         Returns ``{}`` when the model ships no plan. The parallel entry point
         rejects an enabled TP run without a plan or explicit pattern overrides.
 
-        Reads the inner model's ``_tp_config`` first and falls back to its
+        Compatibility lookup reads ``_tp_config`` first and falls back to its
         ``tp_config`` property only when the attribute carries nothing. HF builds
         the instance ``_tp_config`` from ``config.base_model_tp_config`` plus each
         child module's own plan, which is the TP plan this layer wants; the
@@ -331,7 +360,16 @@ class HFTransformerModel(nn.Module):
         exposing ``_tp_plan`` / ``tp_plan`` are supported through the same
         pattern translation.
         """
-        plan = getattr(self.model, "_tp_config", None) or {}
+        # Model-owned declarations take precedence over HF-generated patterns.
+        plan = (
+            getattr(self.model, "tp_config", None)
+            if isinstance(
+                getattr(self.model, "decoder_structure", None), DecoderStructure
+            )
+            else None
+        ) or {}
+        if not plan:
+            plan = getattr(self.model, "_tp_config", None) or {}
         if not plan:
             plan = getattr(self.model, "tp_config", None) or {}
         if not plan:
@@ -339,6 +377,12 @@ class HFTransformerModel(nn.Module):
         if not plan:
             plan = getattr(self.model, "tp_plan", None) or {}
         return {f"model.{pattern}": spec for pattern, spec in plan.items()}
+
+    def validate_parallel(self, *, tp_degree: int, ep_degree: int) -> None:
+        """Delegate full-plan geometry to models that explicitly declare it."""
+        validate = getattr(self.model, "validate_parallel", None)
+        if validate is not None:
+            validate(tp_degree=tp_degree, ep_degree=ep_degree)
 
     def named_children(self):
         """Present the decoder's parts as direct children.

@@ -397,7 +397,7 @@ ENTRIES: tuple[CompatibilityRule, ...] = (
         fused_qkv_tp,
         "assembly",
         UnsupportedCombinationError,
-        "parallel/tensor_parallel/tensor_parallel.py::apply_tp",
+        "parallel/tensor_parallel/tensor_parallel.py::validate_tp_model_options",
     ),
     CompatibilityRule(
         validation_once_requires_dp1,
@@ -457,7 +457,7 @@ ENTRIES: tuple[CompatibilityRule, ...] = (
         shared_expert_tp,
         "assembly",
         UnsupportedCombinationError,
-        "parallel/tensor_parallel/tensor_parallel.py::realize_moe_blocks_tp",
+        "parallel/tensor_parallel/tensor_parallel.py::validate_moe_tp_target",
     ),
     CompatibilityRule(
         tp_moe_specs_without_block,
