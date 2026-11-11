@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from llmtuner.models.kimi.kimi_k3.attention_residual import attention_residual
+from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
 
 
 @pytest.mark.parametrize("seed", range(8))
@@ -43,10 +45,10 @@ def test_attention_residual_matches_independent_per_token_reference(history, see
 
 @pytest.mark.parametrize("seed", range(32))
 @pytest.mark.parametrize("block_size", [1, 2])
-def test_kimi_attention_residual_model_runs_all_parameter_gradients(block_size, seed):
-    from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
-    from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
-
+@pytest.mark.parametrize("sparse", [False, True])
+def test_kimi_attention_residual_model_runs_all_parameter_gradients(
+    block_size, seed, sparse
+):
     config = KimiLinearConfig(
         vocab_size=16,
         hidden_size=8,
@@ -54,6 +56,10 @@ def test_kimi_attention_residual_model_runs_all_parameter_gradients(block_size, 
         num_hidden_layers=3,
         num_attention_heads=2,
         attn_res_block_size=block_size,
+        num_experts=4 if sparse else None,
+        num_experts_per_token=2,
+        moe_intermediate_size=12,
+        first_k_dense_replace=1,
         linear_attn_config={
             "kda_layers": [1, 2, 3],
             "full_attn_layers": [],
@@ -104,7 +110,8 @@ def test_kimi_attention_residual_model_runs_all_parameter_gradients(block_size, 
         attention_output = layer.self_attn(layer.input_layernorm(attention_input))
         prefix = attention_output if boundary else prefix + attention_output
         mlp_input = mix([*history, prefix], layer.mlp_res_proj, layer.mlp_res_norm)
-        prefix = prefix + layer.mlp(layer.post_attention_layernorm(mlp_input))
+        feed_forward = layer.block_sparse_moe if sparse and index >= 1 else layer.mlp
+        prefix = prefix + feed_forward(layer.post_attention_layernorm(mlp_input))
     final = mix(
         [*history, prefix],
         reference.model.output_attn_res_proj,
@@ -131,10 +138,15 @@ def test_kimi_attention_residual_model_runs_all_parameter_gradients(block_size, 
     unused = {name for name, p in model.named_parameters() if p.grad is None}
     # The first attention sees only the initial embedding, so upstream skips
     # scoring an empty history; exactly these two weights are intentionally unused.
-    assert unused == {
+    empty_history_parameters = {
         "model.layers.0.self_attention_res_norm.weight",
         "model.layers.0.self_attention_res_proj.weight",
     }
+    if sparse:
+        # Unselected experts can also have no gradient for this token batch.
+        assert empty_history_parameters <= unused
+    else:
+        assert unused == empty_history_parameters
     assert all(
         torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None
     )

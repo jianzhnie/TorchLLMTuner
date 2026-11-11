@@ -6,6 +6,38 @@ import torch
 from llmtuner.config import LLMTunerConfig, ModelConfig
 from llmtuner.models.hf.factory import build_model_config
 from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
+
+
+def test_kimi_wrapper_binds_without_candidate_inspection(monkeypatch):
+    def reject(*args, **kwargs):
+        raise AssertionError("Kimi must use its declared decoder paths")
+
+    monkeypatch.setattr("llmtuner.models.hf.model.resolve_submodule_name", reject)
+    config = KimiLinearConfig(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        linear_attn_config={
+            "kda_layers": [1],
+            "full_attn_layers": [],
+            "head_dim": 4,
+            "num_heads": 2,
+            "short_conv_kernel_size": 3,
+        },
+    )
+    wrapper = HFTransformerModel(config)
+    bound = wrapper.model.decoder_structure.bind(wrapper.model)
+    assert wrapper.layers is bound.blocks
+    assert wrapper.tok_embeddings is bound.embedding
+    assert wrapper.lm_head is bound.head
+    assert wrapper.model.enable_weight_tying is (
+        bound.head.weight is bound.embedding.weight
+    )
+    bound.head.weight = bound.embedding.weight
+    assert wrapper.model.enable_weight_tying is True
 
 
 def test_kimi_decoder_rejects_batched_document_resets_and_conflicting_masks():
@@ -214,6 +246,12 @@ def test_kimi_moe_layer_selection_matches_configured_dense_prefix_and_frequency(
         },
     )
     model = KimiTextDecoder(config)
+    assert [layer.moe_block_name for layer in model.layers] == [
+        None,
+        None,
+        "block_sparse_moe",
+        None,
+    ]
     assert [hasattr(layer, "block_sparse_moe") for layer in model.layers] == [
         False,
         False,

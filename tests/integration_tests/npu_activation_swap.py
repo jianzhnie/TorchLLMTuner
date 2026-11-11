@@ -33,15 +33,26 @@ def _run(
 ) -> tuple[dict[str, torch.Tensor], int, int, dict[str, float | int]]:
     activation_swap.reset_activation_swap_metrics()
     tp_size = int(os.environ.get("NPU_SWAP_TP_SIZE", "1"))
+    moe = os.environ.get("NPU_SWAP_MOE") == "1"
     config = LLMTunerConfig(
         parallel=ParallelConfig(tensor_parallel_size=tp_size),
         model=ModelConfig(
+            model_name_or_path="qwen3_moe" if moe else "qwen3",
             vocab_size=64,
             hidden_size=32,
             intermediate_size=64,
             num_hidden_layers=2,
             num_attention_heads=4,
             num_key_value_heads=2,
+            arch_overrides=(
+                {
+                    "num_experts": 4,
+                    "num_experts_per_tok": 2,
+                    "moe_intermediate_size": 16,
+                }
+                if moe
+                else {}
+            ),
         ),
         training=TrainingConfig(
             steps=2,

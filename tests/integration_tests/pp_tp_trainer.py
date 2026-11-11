@@ -5,6 +5,7 @@ the last stage's finite, positive cross entropy. Also checks that closing a
 programmatic Trainer leaves the caller's process group usable.
 """
 
+import argparse
 import math
 
 import torch
@@ -24,15 +25,27 @@ from tests.integration_tests.harness import device as harness_device
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--moe", action="store_true")
+    args = parser.parse_args()
     cfg = LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3",
+            model_name_or_path="qwen3_moe" if args.moe else "qwen3",
             vocab_size=128,
             hidden_size=64,
             intermediate_size=128,
             num_hidden_layers=2,
             num_attention_heads=4,
             num_key_value_heads=4,
+            arch_overrides=(
+                {
+                    "num_experts": 4,
+                    "num_experts_per_tok": 2,
+                    "moe_intermediate_size": 48,
+                }
+                if args.moe
+                else {}
+            ),
         ),
         parallel=ParallelConfig(
             pipeline_parallel_size=2,

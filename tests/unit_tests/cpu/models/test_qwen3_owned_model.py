@@ -8,16 +8,24 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeForCausalLM as ReferenceModel,
 )
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeModel as ReferenceDecoder,
+)
 
 from llmtuner.models.hf.factory import resolve_model_class
 from llmtuner.models.qwen.qwen3.model import (
     Qwen3MoeDecoderLayer,
     Qwen3MoeForCausalLM,
+    Qwen3MoeModel,
 )
 
 
 @pytest.mark.parametrize("tied", [False, True])
-def test_owned_qwen3_matches_reference_initialization_and_update(tied):
+@pytest.mark.parametrize("backend", ["eager", "sdpa"])
+@pytest.mark.parametrize("experts", [None, "eager"])
+def test_owned_qwen3_matches_reference_initialization_and_update(
+    tied, backend, experts
+):
     config = Qwen3MoeConfig(
         vocab_size=32,
         hidden_size=16,
@@ -33,7 +41,8 @@ def test_owned_qwen3_matches_reference_initialization_and_update(tied):
         tie_word_embeddings=tied,
         attention_dropout=0.0,
     )
-    config._attn_implementation = "eager"
+    config._attn_implementation = backend
+    config._experts_implementation = experts
     assert resolve_model_class(config) is Qwen3MoeForCausalLM
     torch.manual_seed(37)
     expected = ReferenceModel(deepcopy(config))
@@ -68,3 +77,13 @@ def test_owned_qwen3_matches_reference_initialization_and_update(tied):
         if reference.grad is not None:
             assert torch.equal(reference.grad, owned.grad), name
         assert torch.equal(reference, owned), name
+
+
+@pytest.mark.parametrize(
+    ("owned", "reference"),
+    [(Qwen3MoeModel, ReferenceDecoder), (Qwen3MoeForCausalLM, ReferenceModel)],
+)
+def test_owned_experts_capability_delegates_to_reference(owned, reference):
+    assert owned._can_set_experts_implementation() == (
+        reference._can_set_experts_implementation()
+    )

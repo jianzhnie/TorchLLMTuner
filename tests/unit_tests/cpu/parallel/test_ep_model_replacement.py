@@ -40,7 +40,11 @@ from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.models.common.moe.experts import RoutedExperts
 from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.expert_parallel import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel import (
+    block_conversion,
+    model_replacement,
+    swap_hf_moe_blocks,
+)
 from llmtuner.parallel.expert_parallel.block_conversion import (
     restore_fp32_state_buffers,
 )
@@ -1158,8 +1162,6 @@ def test_ep_conversion_preserves_parameter_freezing():
 
 
 def test_interrupted_conversion_restores_auxiliary_counts(monkeypatch):
-    from llmtuner.parallel.expert_parallel import model_replacement
-
     model = _model(_config(norm_topk_prob=True))
     original_blocks = [layer.mlp for layer in model.layers]
     counts_before = dict(AuxLoss._group_counts)
@@ -1830,3 +1832,61 @@ def test_declared_expert_layout_never_falls_back_to_list_probe(monkeypatch):
     del block.experts.gate_up_proj
     with pytest.raises(ValueError, match="requires gate_up_proj"):
         hf_inspection.fused_experts_of(block)
+
+
+def test_ep_target_plan_is_pure_and_execution_does_not_rediscover(monkeypatch):
+    model = _model(_config(norm_topk_prob=True))
+    parameters = tuple(model.parameters())
+    keys = tuple(model.state_dict())
+    rng = torch.get_rng_state().clone()
+    ids, positions = _data()
+    with torch.no_grad():
+        expected = model(ids, positions=positions)
+    plan = model_replacement.resolve_ep_plan(model)
+    assert plan.count("moe") == 2
+    assert tuple(model.state_dict()) == keys
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert torch.equal(rng, torch.get_rng_state())
+
+    def reject_discovery(*args, **kwargs):
+        raise AssertionError("Execution must consume resolved decoder slots")
+
+    monkeypatch.setattr(model_replacement, "find_moe_candidates", reject_discovery)
+    for name in (
+        "router_of",
+        "resolve_top_k",
+        "resolve_shared_expert",
+        "read_expert_groups",
+        "resolve_score_func",
+        "read_route_norm",
+        "read_route_scale",
+    ):
+        monkeypatch.setattr(block_conversion, name, reject_discovery)
+    model_replacement.swap_hf_moe_blocks(
+        model, resolved_plan=plan, router_aux_loss_coef=0.0
+    )
+    with torch.no_grad():
+        actual = model(ids, positions=positions)
+    torch.testing.assert_close(actual, expected, atol=TOL, rtol=TOL)
+
+
+@pytest.mark.parametrize("change", ["parameter", "alias", "backend", "degree"])
+def test_ep_target_plan_rejects_stale_or_incompatible_execution(change):
+    model = _model(_config(norm_topk_prob=True))
+    plan = model_replacement.resolve_ep_plan(
+        model,
+        degree=2 if change == "degree" else 1,
+        implementation="torchao" if change == "backend" else "alltoall",
+    )
+    original_blocks = tuple(layer.mlp for layer in model.layers)
+    if change == "parameter":
+        experts = model.layers[0].mlp.experts
+        experts.down_proj = torch.nn.Parameter(experts.down_proj.detach().clone())
+    elif change == "alias":
+        model.register_parameter("unexpected_alias", next(model.parameters()))
+    with pytest.raises(ValueError, match="Stale plan|does not match"):
+        model_replacement.swap_hf_moe_blocks(model, resolved_plan=plan)
+    assert all(
+        layer.mlp is original
+        for layer, original in zip(model.layers, original_blocks, strict=True)
+    )

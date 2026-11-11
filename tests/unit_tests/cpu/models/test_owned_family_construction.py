@@ -14,9 +14,30 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 from llmtuner.models.deepseek.deepseek_v4.modeling import DeepseekV4ForCausalLM
 from llmtuner.models.explicit import build_explicit_model
 from llmtuner.models.hf.factory import resolve_model_class
+from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.models.qwen.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 from tests.unit_tests.cpu.models.test_deepseek_v4 import small_config
 from tests.unit_tests.cpu.models.test_qwen35_rotary_initialization import text_config
+
+
+@pytest.mark.parametrize("family", ["deepseek", "qwen35"])
+def test_owned_family_wrapper_binds_without_candidate_inspection(family, monkeypatch):
+    def reject(*args, **kwargs):
+        raise AssertionError("Declared decoder must not search candidate attributes")
+
+    monkeypatch.setattr("llmtuner.models.hf.model.resolve_submodule_name", reject)
+    config = (
+        small_config()
+        if family == "deepseek"
+        else text_config(ReferenceQwen.config_class)
+    )
+    wrapper = HFTransformerModel(config)
+    bound = wrapper.model.decoder_structure.bind(wrapper.model)
+    assert wrapper.tok_embeddings is bound.embedding
+    assert wrapper.layers is bound.blocks
+    assert wrapper.norm is bound.norm
+    assert wrapper.lm_head is bound.head
+    assert not any(key.startswith("_decoder.") for key in wrapper.state_dict())
 
 
 @pytest.mark.parametrize("family", ["deepseek", "qwen35"])
@@ -75,3 +96,28 @@ def test_explicit_family_preserves_initialization_forward_and_checkpoint(
     assert torch.equal(
         restored(input_ids=tokens, use_cache=False).logits, outputs[1].logits
     )
+
+
+@pytest.mark.parametrize("family", ["deepseek", "qwen35"])
+@pytest.mark.parametrize("tied", [False, True])
+def test_owned_family_declares_moe_slots_and_actual_weight_identity(family, tied):
+    config = (
+        small_config()
+        if family == "deepseek"
+        else text_config(ReferenceQwen.config_class)
+    )
+    config.tie_word_embeddings = tied
+    constructor = (
+        DeepseekV4ForCausalLM if family == "deepseek" else Qwen3_5MoeForCausalLM
+    )
+    model = constructor(config)
+    assert model.enable_weight_tying is tied
+    bound = model.decoder_structure.bind(model)
+    for layer in bound.blocks:
+        assert layer.moe_block_name == "mlp"
+        assert layer._modules[layer.moe_block_name] is layer.mlp
+    # The contract follows live Parameter identity, including manual untie/retie.
+    model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())
+    assert model.enable_weight_tying is False
+    model.lm_head.weight = model.model.embed_tokens.weight
+    assert model.enable_weight_tying is True

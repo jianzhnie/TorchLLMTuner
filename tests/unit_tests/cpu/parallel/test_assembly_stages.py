@@ -38,6 +38,8 @@ def test_parallel_public_entries_resolve_to_their_defining_modules():
     from importlib import import_module
 
     entries = {
+        "ParallelPlan": "plan",
+        "PlanTarget": "plan",
         "apply_cp": "context_parallel.context_parallel",
         "apply_ep": "expert_parallel.expert_parallel",
         "apply_fsdp": "fully_shard_parallel.fully_shard_parallel",

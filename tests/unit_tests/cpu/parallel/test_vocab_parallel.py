@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from llmtuner.config import ParallelConfig
+from llmtuner.parallel import PlanTarget
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 from llmtuner.parallel.vocab_parallel import VocabParallelEmbedding
@@ -63,6 +64,7 @@ def test_apply_tp_realizes_embedding_plan(monkeypatch) -> None:
             return 1
 
     model = Model()
+    original_embedding = model.embedding
     original = model.embedding.weight.detach().clone()
     apply_tp(
         model,
@@ -77,6 +79,10 @@ def test_apply_tp_realizes_embedding_plan(monkeypatch) -> None:
         8,
     )
     assert model._tp_checkpoint_layouts["embedding.weight"] == (0, False, None)
+    assert model.parallel_plan.stage == "tp"
+    target = PlanTarget("embedding", "vocab", original_embedding, "embedding_rowwise")
+    assert model.parallel_plan.targets == (target,)
+    assert model.parallel_plan.implementation == "functional"
     assert tp_sharded_param_ids([model]) == {id(model.embedding.weight)}
     assert messages == [
         "Applied TP degree 2: dense=0, MoE=0, vocab=1, collective=functional"
@@ -104,6 +110,7 @@ def test_apply_tp_rejects_unsupported_embedding_before_mutation(
             plan={"0": "embedding_rowwise"},
         )
     assert model[0] is original
+    assert not hasattr(model, "parallel_plan")
 
 
 def test_apply_tp_rejects_tied_embedding_and_head() -> None:
