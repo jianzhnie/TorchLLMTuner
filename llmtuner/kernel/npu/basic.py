@@ -92,7 +92,7 @@ def fusion_attention_npu(
         k_cu_seqlens=k_cu_seqlens,
     )
     # CANN TND expects document end positions, without FlashAttention's
-    # leading zero. No offset conversion or device movement is implicit.
+    # leading zero. Input tensors remain on their original device.
     return torch_npu.npu_fusion_attention(
         query,
         key,

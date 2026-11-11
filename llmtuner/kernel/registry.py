@@ -9,11 +9,13 @@ from typing import Any, TypeVar
 import torch
 
 from ..accelerator.device import device_type as default_device_type
+from .logging import get_logger
+
+logger = get_logger(__name__)
 
 Kernel = Callable[..., Any]
 KernelFunction = TypeVar("KernelFunction", bound=Kernel)
 
-logger = logging.getLogger(__name__)
 _KERNEL_REGISTRY: dict[str, dict[str, Kernel]] = {}
 _warned_fallbacks: set[tuple[str, str]] = set()
 
@@ -47,7 +49,11 @@ def register_kernel(
 def get_kernel(
     name: str, device_type: str | None = None, *, fallback_to_cpu: bool = False
 ) -> Kernel:
-    """Resolve a kernel, optionally allowing an explicit CPU fallback."""
+    """Resolve an implementation, optionally selecting the CPU/reference backend.
+
+    Selection alone never transfers input tensors. Without a device argument,
+    reuse the training environment selected by accelerator.device.
+    """
     if device_type is None:
         device_type = default_device_type
     backends = _KERNEL_REGISTRY.get(name)
@@ -59,7 +65,10 @@ def get_kernel(
         key = name, device_type
         if key not in _warned_fallbacks:
             logger.warning(
-                "Kernel %s is unavailable on %s; using CPU", name, device_type
+                "Kernel %s is unavailable on %s; using the torch reference "
+                "implementation without moving tensors",
+                name,
+                device_type,
             )
             _warned_fallbacks.add(key)
         return backends["cpu"]
