@@ -194,3 +194,24 @@ def test_plan_allows_storage_reallocation_with_alias_relation_preserved(device):
     model.weight.data = replacement
     model.cache.data = replacement
     plan.validate_binding(model)
+
+
+@pytest.mark.parametrize("change", ["replace", "remove", "foreign"])
+def test_minimal_plan_validates_target_ownership_without_global_snapshot(change):
+    model = nn.Sequential(nn.Linear(4, 4))
+    target = model[0]
+    plan = ParallelPlan(
+        stage="tp",
+        targets=(PlanTarget("0", "dense", target),),
+        degree=2,
+        implementation="functional",
+    )
+    plan.validate_binding(model)
+    if change == "replace":
+        model[0] = nn.Linear(4, 4)
+    elif change == "remove":
+        del model[0]
+    else:
+        model = nn.Sequential(nn.Linear(4, 4))
+    with pytest.raises(ValueError, match="Stale plan binding"):
+        plan.validate_binding(model)

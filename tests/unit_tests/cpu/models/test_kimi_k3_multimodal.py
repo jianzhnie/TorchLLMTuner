@@ -79,3 +79,29 @@ def test_kimi_k3_config_roundtrip_restores_nested_types(tmp_path) -> None:
     assert isinstance(restored.text_config, KimiLinearConfig)
     assert isinstance(restored.vision_config, KimiK3VisionConfig)
     assert KimiK3ForConditionalGeneration(restored) is not None
+
+
+def test_vision_encoder_passes_integer_maximum_and_complete_boundaries(monkeypatch):
+    from llmtuner.models.kimi.kimi_k3 import multimodal
+
+    model = KimiK3ForConditionalGeneration(small_config())
+    original = multimodal.eager_attention
+    observed = []
+
+    def attention(q, k, v, **kwargs):
+        assert type(kwargs["max_seqlen_q"]) is int
+        assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 4
+        assert kwargs["q_cu_seqlens"].tolist() == [0, 4, 8]
+        assert kwargs["k_cu_seqlens"].tolist() == [0, 4, 8]
+        observed.append(q.shape[0])
+        return original(q, k, v, **kwargs)
+
+    for backend in ("eager", "sdpa"):
+        monkeypatch.setitem(
+            multimodal.VL_VISION_ATTENTION_FUNCTIONS, backend, attention
+        )
+    outputs = model.vision_tower(
+        torch.randn(8, 3, 2, 2), torch.tensor([[1, 2, 2], [1, 2, 2]])
+    )
+    assert observed == [8]
+    assert len(outputs) == 2

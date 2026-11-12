@@ -65,8 +65,10 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
+from ....kernel.ops.attention import fusion_attention
 from ....kernel.ops.rotary import rotary_mul
 from ....kernel.ops.varlen_attention import varlen_attention
+from ....kernel.validation import SequenceOffsets
 from .configuration import KimiK3Config
 from .model import KimiLinearForCausalLM
 
@@ -75,8 +77,8 @@ def multihead_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_cu_seqlens: torch.Tensor | None = None,
-    k_cu_seqlens: torch.Tensor | None = None,
+    q_cu_seqlens: SequenceOffsets = None,
+    k_cu_seqlens: SequenceOffsets = None,
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     deterministic: bool = False,
@@ -109,34 +111,28 @@ def eager_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_cu_seqlens: torch.Tensor | None = None,
-    k_cu_seqlens: torch.Tensor | None = None,
+    q_cu_seqlens: SequenceOffsets = None,
+    k_cu_seqlens: SequenceOffsets = None,
     **kwargs,
 ) -> torch.Tensor:
-    seq_length = q.shape[0]
-    attention_mask = torch.zeros(
-        [1, seq_length, seq_length], device=q.device, dtype=torch.bool
-    )
-    for i in range(1, len(q_cu_seqlens)):
-        attention_mask[
-            ...,
-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
-        ] = True
-    q = q.transpose(0, 1)
-    k = k.transpose(0, 1)
-    v = v.transpose(0, 1)
+    """Attend within paired packed documents using the explicit torch reference.
 
-    attn_weight = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
-    attn_weight = attn_weight.masked_fill(
-        ~attention_mask, torch.finfo(attn_weight.dtype).min
+    Q and K may have different lengths and boundaries. The reference executes
+    on the input device; selecting eager never transfers accelerator tensors.
+    """
+    if q.ndim != 3 or q.shape[-1] == 0:
+        raise ValueError("Vision eager attention requires nonzero-width TND input")
+    output = fusion_attention(
+        q,
+        k,
+        v,
+        head_num=q.shape[1],
+        scale=q.shape[-1] ** -0.5,
+        q_cu_seqlens=q_cu_seqlens,
+        k_cu_seqlens=k_cu_seqlens,
+        use_eager=True,
     )
-    attn_weight = torch.softmax(attn_weight, dim=-1, dtype=torch.float32).to(q.dtype)
-
-    attn_output = attn_weight @ v
-    attn_output = attn_output.transpose(0, 1)
-    attn_output = attn_output.reshape(seq_length, -1)
-    return attn_output
+    return output.flatten(start_dim=-2)
 
 
 VL_VISION_ATTENTION_FUNCTIONS = {
@@ -398,7 +394,8 @@ class Rope2DPosEmbRepeated(nn.Module):
     def __init__(self, dim: int, max_height: int, max_width: int, theta_base=10000):
         super().__init__()
         self.dim = dim
-        assert self.dim % 4 == 0, "dim must be divisible by 4"
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0 or dim % 4:
+            raise ValueError("Vision rotary dim must be positive and divisible by 4")
         self.max_height = max_height
         self.max_width = max_width
         self.theta_base = theta_base
@@ -517,6 +514,20 @@ class MoonViTEncoderLayer(nn.Module):
         self.qkv_hidden_size = (
             hidden_dim if qkv_hidden_size is None else qkv_hidden_size
         )
+        for name, size in (
+            ("num_heads", num_heads),
+            ("hidden_dim", hidden_dim),
+            ("mlp_dim", mlp_dim),
+            ("qkv_hidden_size", self.qkv_hidden_size),
+        ):
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise ValueError(f"Vision {name} must be a positive integer")
+        if self.qkv_hidden_size % num_heads:
+            raise ValueError("Vision qkv_hidden_size must be divisible by num_heads")
+        if attn_implementation not in VL_VISION_ATTENTION_FUNCTIONS:
+            raise ValueError(
+                f"Unsupported vision attention backend {attn_implementation!r}"
+            )
         self.hidden_size_per_attention_head = self.qkv_hidden_size // self.num_heads
         self.attn_implementation = attn_implementation
         self.use_deterministic_attn = use_deterministic_attn
@@ -543,8 +554,8 @@ class MoonViTEncoderLayer(nn.Module):
     def attention_qkvpacked(
         self,
         x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: torch.Tensor,
+        cu_seqlens: SequenceOffsets,
+        max_seqlen: int,
         rope_freqs_cis: torch.Tensor | None = None,
         cos: torch.Tensor | None = None,
         sin: torch.Tensor | None = None,
@@ -585,7 +596,7 @@ class MoonViTEncoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: SequenceOffsets,
         max_seqlen: int,
         rope_freqs_cis: torch.Tensor | None = None,
         rope_cos: torch.Tensor | None = None,
@@ -629,9 +640,16 @@ class MoonViT3dEncoder(nn.Module):
             if block_cfg.get("qkv_hidden_size") is None
             else block_cfg["qkv_hidden_size"]
         )
-        self.rope_2d = Rope2DPosEmbRepeated(
-            qkv_hidden_size // block_cfg["num_heads"], 512, 512
-        )
+        num_heads = block_cfg["num_heads"]
+        for name, size in (
+            ("num_heads", num_heads),
+            ("qkv_hidden_size", qkv_hidden_size),
+        ):
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise ValueError(f"Vision {name} must be a positive integer")
+        if qkv_hidden_size % num_heads:
+            raise ValueError("Vision qkv_hidden_size must be divisible by num_heads")
+        self.rope_2d = Rope2DPosEmbRepeated(qkv_hidden_size // num_heads, 512, 512)
         self.blocks = nn.ModuleList(
             [
                 MoonViTEncoderLayer(
@@ -664,11 +682,13 @@ class MoonViT3dEncoder(nn.Module):
             )
         )
 
-        max_seqlen = lengths.max()
+        max_seqlen = int(lengths.max().item())
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
         if hidden_states.device.type == "npu":
-            cu_seqlens = tuple(cu_seqlens[1:].cpu().numpy().tolist())
+            # Semantic kernel APIs take leading-zero cumulative boundaries.
+            # Materialize once per vision forward, rather than once per block.
+            cu_seqlens = cu_seqlens.tolist()
 
         cos = (
             rope_freqs_cis.unsqueeze(-2)

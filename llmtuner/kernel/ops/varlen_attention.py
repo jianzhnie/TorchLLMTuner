@@ -8,7 +8,7 @@ import torch
 
 from ...accelerator.device import is_device_type_available
 from ...errors import EnvironmentUnsupportedError, UnsupportedCombinationError
-from ..validation import require_same_device
+from ..validation import SequenceOffsets, require_same_device
 from .attention import fusion_attention
 
 FLASH_ATTN_IMPORT_ERROR: ImportError | None = None
@@ -24,8 +24,8 @@ def varlen_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    q_cu_seqlens: torch.Tensor | None,
-    k_cu_seqlens: torch.Tensor | None,
+    q_cu_seqlens: SequenceOffsets,
+    k_cu_seqlens: SequenceOffsets,
     max_seqlen_q: int | None,
     max_seqlen_k: int | None,
     *,
