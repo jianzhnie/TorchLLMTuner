@@ -1,6 +1,13 @@
 """DeepSeek V4 attention masks in global context-parallel coordinates."""
 
 import torch
+import torch.nn.functional as F
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+    eager_attention_forward,
+)
+
+from .rotary import apply_rotary_pos_emb
 
 
 def build_raw_attention_mask(
@@ -53,13 +60,6 @@ def deepseek_v4_cp_attention_forward(
     kwargs: dict[str, object],
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Compute DeepSeek V4 attention with CP-prepared compressor inputs."""
-    import torch.nn.functional as F
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-        apply_rotary_pos_emb,
-        eager_attention_forward,
-    )
-
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, module.head_dim)
     cos, sin = position_embeddings[module.rope_layer_type]

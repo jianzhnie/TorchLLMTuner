@@ -54,15 +54,16 @@ class ModelConfig:
         default=None,
         metadata={
             "help": "Router compute: float32 or None for existing behavior. "
-            "Qwen3-MoE always uses FP32; Qwen3.5-MoE requires explicit opt-in. "
+            "Qwen3-MoE and Qwen3.5-MoE use FP32 only with explicit opt-in. "
             "Parameter storage dtype and checkpoint keys are unchanged."
         },
     )
     norm_backend: str = field(
         default="native",
         metadata={
-            "help": "Qwen3 RMSNorm: native, torch, npu, aten (CPU first-order "
-            "boundaries), or joint (dense Qwen3 first-order norm/residual)."
+            "help": "Explicit Qwen3 RMSNorm: native, torch, or npu "
+            "(matching activation/weight dtype). Legacy aten/joint contracts "
+            "still require migration and are rejected by the explicit model."
         },
     )
     linear_attention_backend: str = field(
@@ -124,7 +125,8 @@ class ModelConfig:
     attention_backend: str = field(
         default="auto",
         metadata={
-            "help": "Attention backend: auto, flex, or eager_flex (dense Qwen3)."
+            "help": "Attention backend: auto uses the explicit model default. "
+            "Legacy flex/eager_flex adapters are not migrated and are rejected."
         },
     )
     compute_dtype: str | None = field(

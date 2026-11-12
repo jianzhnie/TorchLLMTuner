@@ -9,9 +9,9 @@ math itself; this file is only the wiring and the fallbacks).
 
 What changed from upstream:
 
-* Modules are constructed directly. QKV and FFN inherit their base
-  constructors; ReduceScatterLinear takes feature sizes followed by a keyword
-  bias option. Upstream's nested ``Config`` subclasses are omitted.
+* Modules accept their projection layers and explicit TP group directly.
+  ReduceScatterLinear takes feature sizes followed by keyword bias and group
+  options. Upstream's nested ``Config`` subclasses are omitted.
 * ``TensorParallelFeedForward`` subclasses :class:`~llmtuner.models.common.feed_forward.
   FeedForward`, as it does upstream: the fused and unfused paths share the weight
   layout (``w13`` holding the interleaved gate and up) and the activation split,
@@ -20,8 +20,8 @@ What changed from upstream:
 * ``torch_remat`` is gone. Upstream wraps each projection in
   ``remat.region(..., recompute=...)``, which only steers activation
   checkpointing; calling the projection directly is the same arithmetic.
-* The TP group is read per forward through
-  ``llmtuner.accelerator.spmd.spmd_mesh_group``.
+* The TP group is passed explicitly at construction. No ambient mesh lookup
+  changes the forward path after construction.
 
 The fallback matters: when TP is not active there is no collective to fuse, so
 each module runs its plain path. That keeps a TP=1 run working, but it also means
@@ -32,8 +32,9 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.distributed import ProcessGroup
 
-from llmtuner.accelerator.spmd import spmd_mesh_group
+from llmtuner.models.common.activation import ActivationFn
 from llmtuner.models.common.attention.qkv import QKVLinear
 from llmtuner.models.common.feed_forward import FeedForward
 from llmtuner.parallel.tensor_parallel.linear_ops import (
@@ -83,8 +84,22 @@ class AllGatherFusedQKVLinear(QKVLinear):
     overrides ``_project`` rather than ``forward``.
     """
 
+    def __init__(
+        self,
+        *,
+        head_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        linear: nn.Module,
+        tp_group: ProcessGroup | None = None,
+    ) -> None:
+        super().__init__(
+            head_dim=head_dim, n_heads=n_heads, n_kv_heads=n_kv_heads, linear=linear
+        )
+        self.tp_group = tp_group
+
     def _project(self, x: torch.Tensor) -> torch.Tensor:
-        tp_group = spmd_mesh_group("tp")
+        tp_group = self.tp_group
         if tp_group is None:
             warn_once_no_tp_overlap()
             return super()._project(x)
@@ -111,6 +126,7 @@ class ReduceScatterLinear(nn.Linear):
         out_features: output feature count (the weight's first dim).
         bias: whether to allocate a bias parameter. False stores ``bias=None``;
             the constructor option itself must be a boolean.
+        tp_group: explicit collective group; None selects local computation.
     """
 
     def __init__(
@@ -119,6 +135,7 @@ class ReduceScatterLinear(nn.Linear):
         out_features: int,
         *,
         bias: bool = False,
+        tp_group: ProcessGroup | None = None,
     ) -> None:
         for name, value in (
             ("in_features", in_features),
@@ -129,9 +146,10 @@ class ReduceScatterLinear(nn.Linear):
         if not isinstance(bias, bool):
             raise TypeError(f"bias must be bool, got {type(bias).__name__}")
         super().__init__(in_features, out_features, bias=bias)
+        self.tp_group = tp_group
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        tp_group = spmd_mesh_group("tp")
+        tp_group = self.tp_group
         if tp_group is None:
             warn_once_no_tp_overlap()
             return torch.nn.functional.linear(x, self.weight, self.bias)
@@ -162,10 +180,22 @@ class TensorParallelFeedForward(FeedForward):
         w13: the fused gate-and-up projection, ``dim -> 2 * hidden_dim``.
         w2: the down projection, ``hidden_dim -> dim``.
         activation_fn: the gated activation; defaults to SwiGLU.
+        tp_group: explicit collective group; None selects local computation.
     """
 
+    def __init__(
+        self,
+        *,
+        w13: nn.Module,
+        w2: nn.Module,
+        activation_fn: ActivationFn | None = None,
+        tp_group: ProcessGroup | None = None,
+    ) -> None:
+        super().__init__(w13=w13, w2=w2, activation_fn=activation_fn)
+        self.tp_group = tp_group
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        tp_group = spmd_mesh_group("tp")
+        tp_group = self.tp_group
         if tp_group is None:
             warn_once_no_tp_overlap()
             return super().forward(x)

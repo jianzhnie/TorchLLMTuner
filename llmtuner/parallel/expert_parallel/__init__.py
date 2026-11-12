@@ -1,7 +1,8 @@
 """Expert parallelism: swap HF MoE blocks for the EP-capable llmtuner MoE.
 
-``expert_parallel.py`` is the public entry. ``hf_inspection.py`` inspects HF
-layouts, ``block_conversion.py`` constructs native MoE blocks,
+``expert_parallel.py`` is the public entry. ``block_conversion.py`` constructs
+native MoE blocks, while ``hf_inspection.py`` is loaded only for legacy external
+layouts,
 ``model_replacement.py`` replaces them in a complete model, and
 ``checkpointing.py`` converts expert checkpoint state. ``token_dispatch.py``
 implements local and distributed token dispatch and combine operations.
@@ -17,6 +18,7 @@ _EXPORT_SOURCES = {
     "restore_fp32_state_buffers": "block_conversion",
     "apply_ep": "expert_parallel",
     "resolve_ep_plan": "model_replacement",
+    "swap_moe_blocks": "model_replacement",
     "swap_hf_moe_blocks": "model_replacement",
 }
 

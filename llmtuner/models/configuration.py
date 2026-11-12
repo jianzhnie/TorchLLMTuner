@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from transformers.configuration_utils import PretrainedConfig
 
+from ..errors import UnsupportedCombinationError
 from .registry import get_model_spec
 
 _RUNTIME_CONFIG_FIELDS = (
@@ -50,7 +51,7 @@ def build_model_config(
     *,
     seq_len: int,
     arch_overrides: dict[str, Any] | None = None,
-) -> PretrainedConfig:
+) -> Any:
     """Build a registered model configuration without importing its implementation.
 
     ``arch_overrides`` selects offline architecture construction, including an
@@ -69,32 +70,82 @@ def build_model_config(
                 f"No local configuration registered for {model_name_or_path!r}"
             )
         config = architecture.build_config(**overrides)
-        if hasattr(config, "text_config"):
-            config.text_config.max_position_embeddings = max(
-                getattr(config.text_config, "max_position_embeddings", seq_len), seq_len
+    else:
+        # Read external metadata, but only the registered config class loads it.
+        # Do not mutate AutoConfig's process-global registry during training.
+        metadata, _ = PretrainedConfig.get_config_dict(model_name_or_path)
+        model_type = metadata.get("model_type", "")
+        architecture = get_model_spec(model_type) or get_model_spec(
+            model_type, task="conditional_generation"
+        )
+        if architecture is None:
+            raise ValueError(f"No local configuration registered for {model_type!r}")
+        config = architecture.config_type_loader().from_pretrained(model_name_or_path)
+        if getattr(config, "model_type", None) != architecture.model_type:
+            raise ValueError(
+                f"Loaded configuration for {architecture.model_type!r} returned "
+                f"model_type={getattr(config, 'model_type', None)!r}"
             )
-        return config
-
-    # Read external metadata, but let only the registered config class load it.
-    # Do not mutate AutoConfig's process-global registry during a training run.
-    metadata, _ = PretrainedConfig.get_config_dict(model_name_or_path)
-    model_type = metadata.get("model_type", "")
-    architecture = get_model_spec(model_type) or get_model_spec(
-        model_type, task="conditional_generation"
-    )
-    if architecture is None:
-        raise ValueError(f"No local configuration registered for {model_type!r}")
-    config = architecture.config_type_loader().from_pretrained(model_name_or_path)
     text_config = getattr(config, "text_config", config)
-    # Custom configs need not declare a positional limit. Match offline
-    # construction, which supplies the requested length when it is absent.
+    # Apply the same context requirement to offline and saved configurations.
+    # Only the text stack is extended; composite vision settings stay intact.
     text_config.max_position_embeddings = max(
         getattr(text_config, "max_position_embeddings", seq_len), seq_len
     )
     return config
 
 
-def apply_runtime_config(config: PretrainedConfig, cfg: LLMTunerConfig) -> None:
+def validate_native_execution_policy(
+    config: PretrainedConfig, *, model_name: str
+) -> None:
+    """Validate a family's explicit choice to support native projection policies.
+
+    The caller opts into this boundary; no model identification or adapter
+    installation occurs here. Families implementing other policies validate
+    those in their own components instead (for example explicit Qwen3).
+    """
+    for name, default in (
+        ("norm_backend", "native"),
+        ("qkv_projection", "separate"),
+        ("rotary_init_device", "constructor"),
+        ("rotary_compute_dtype", None),
+        ("rotary_cache_dtype", None),
+    ):
+        requested = getattr(config, name, default)
+        if requested != default:
+            raise UnsupportedCombinationError(
+                f"Explicit {model_name} {name}={requested!r} has no model-owned "
+                f"implementation; supported value is {default!r}"
+            )
+
+
+def validate_attention_backend(config: PretrainedConfig) -> None:
+    """Reject removed wrapper backends instead of silently executing another.
+
+    Native attention selection remains owned by each explicit model and its
+    reference components. The former wrapper-specific flex adapters must be
+    migrated before their user-facing selectors can describe real execution.
+    """
+    validate_attention_backend_choice(getattr(config, "attention_backend", "auto"))
+
+
+def validate_attention_backend_choice(requested: str) -> None:
+    """Validate the requested selector without mutating a model configuration."""
+    if requested != "auto":
+        raise UnsupportedCombinationError(
+            f"attention_backend={requested!r} has no explicit-model adapter yet; "
+            "the former HF wrapper adapter was removed. Use 'auto' or implement "
+            "and validate a model-owned attention backend before selecting it."
+        )
+
+
+def apply_runtime_config(config: Any, cfg: LLMTunerConfig) -> None:
+    """Validate backend selection before applying runtime fields to external config.
+
+    Rejected selectors must not leave caller-owned checkpoint metadata partially
+    rewritten. Model-specific geometry remains validated by the model owner.
+    """
+    validate_attention_backend_choice(cfg.attention_backend)
     config.attn_mask_type = cfg.dataloader.attention_mask_type()
     config.experts_implementation = getattr(cfg, "experts_implementation", "native")
     config.router_compute_dtype = getattr(cfg.model, "router_compute_dtype", None)
@@ -115,7 +166,27 @@ def apply_runtime_config(config: PretrainedConfig, cfg: LLMTunerConfig) -> None:
     config.attention_backend = cfg.attention_backend
 
 
-def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
+def configure_reference_experts(config: PretrainedConfig) -> None:
+    """Apply an explicit expert kernel choice before reference construction.
+
+    The local model owns this call. Native leaves the reference's default or
+    saved choice intact; supported overrides use its instance configuration,
+    never its global backend registry. Custom expert math needs a model-owned
+    implementation instead of silently inheriting another backend.
+    """
+    requested = getattr(config, "experts_implementation", "native")
+    if requested == "native":
+        return
+    if requested not in ("eager", "grouped_mm", "batched_mm"):
+        raise ValueError(
+            "This explicit model supports experts_implementation native, eager, "
+            "grouped_mm or batched_mm; "
+            f"{requested!r} requires its own model-owned expert implementation."
+        )
+    config._experts_implementation = requested
+
+
+def build_model_config_for(cfg: LLMTunerConfig) -> Any:
     """Build architecture and runtime settings for a training run.
 
     Registered architecture names use offline construction with explicit model
@@ -155,10 +226,12 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
             cfg.hf_model, task="conditional_generation"
         )
         config_type = architecture.config_type_loader()
+        # External configs may expose HF field aliases; plain model-owned
+        # config classes need not implement Transformers' attribute_map.
         # HF may assign extra kwargs after its canonical fields. A generic
         # default alias must not overwrite an explicit architecture dimension
         # (e.g. intermediate_size -> moe_intermediate_size in DeepSeek V4).
-        for alias, canonical in config_type.attribute_map.items():
+        for alias, canonical in getattr(config_type, "attribute_map", {}).items():
             if canonical in cfg.arch_overrides and alias not in cfg.arch_overrides:
                 overrides.pop(alias, None)
     config = build_model_config(
@@ -172,7 +245,7 @@ def build_model_config_for(cfg: LLMTunerConfig) -> PretrainedConfig:
     return config
 
 
-def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
+def unwrap_text_config(config: Any) -> Any:
     """Return the text sub-config of a composite (vision-language) model.
 
     A VL checkpoint's top config describes the conditional model, not the text
@@ -190,7 +263,7 @@ def unwrap_text_config(config: PretrainedConfig) -> PretrainedConfig:
     return text_config
 
 
-def resolve_model_class(config: PretrainedConfig) -> type[nn.Module]:
+def resolve_model_class(config: Any) -> type[nn.Module]:
     """Resolve a registered local implementation without an external fallback."""
     specification = get_model_spec(config.model_type)
     if specification is None:

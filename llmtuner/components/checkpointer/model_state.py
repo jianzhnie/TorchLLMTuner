@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from typing import Any
 
 import torch
@@ -18,12 +17,15 @@ from safetensors import safe_open
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...models.kimi.kimi_k3.checkpoint import convert_kimi_expert_state
+from ...models.qwen.qwen3.state import (
+    external_expert_projection,
+    grouped_expert_key,
+    native_ep_expert_key,
+)
 from .core.checkpoint_keys import SAFETENSORS_INDEX
 from .core.chunked_tensor import ChunkedCheckpointTensor
 from .hf.hf_expert_storage import (
     GroupedExpertHuggingFaceStorageReader,
-    grouped_expert_key,
-    native_ep_expert_key,
 )
 from .hf.hf_storage import IndexedHuggingFaceStorageReader
 
@@ -50,6 +52,12 @@ class ModelStateDictAdapter:
             raise ValueError(
                 "model_prefix must be empty or a module path ending in '.'"
             )
+        for name, enabled in (
+            ("kimi_expert_parallel", kimi_expert_parallel),
+            ("qwen3_expert_parallel", qwen3_expert_parallel),
+        ):
+            if type(enabled) is not bool:
+                raise TypeError(f"{name} must be boolean")
         self.model_prefix = model_prefix
         # Composite HF models store the trained decoder's weight ties here.
         self.model_config = getattr(model_config, "text_config", model_config)
@@ -223,25 +231,15 @@ class ModelStateDictAdapter:
         state = self.to_hf(state_dict)
         if not self.qwen3_expert_parallel:
             return state
-        roles = {
-            "w1_EFD": "gate_proj",
-            "w3_EFD": "up_proj",
-            "w2_EDF": "down_proj",
-        }
         result = {}
         pending = []
         with synchronize_local_errors("Qwen3 HF export expert mapping"):
             for key, value in state.items():
-                match = re.fullmatch(
-                    r"(.+\.mlp\.)routed_experts\.inner_experts\.(w[123]_[A-Z]+)",
-                    key,
-                )
-                if match is None:
+                projection = external_expert_projection(key)
+                if projection is None:
                     targets = [key]
                 else:
-                    prefix, role = match.groups()
-                    if role not in roles:
-                        raise ValueError(f"Unknown Qwen3 expert projection: {key}")
+                    prefix, role = projection
                     if (
                         not isinstance(value, torch.Tensor)
                         or value.ndim != 3
@@ -251,14 +249,14 @@ class ModelStateDictAdapter:
                             f"Qwen3 HF export requires full expert stack: {key}"
                         )
                     targets = [
-                        f"{prefix}experts.{index}.{roles[role]}.weight"
+                        f"{prefix}{index}.{role}.weight"
                         for index in range(self.model_config.num_experts)
                     ]
                 for target in targets:
                     if target in result:
                         raise ValueError(f"Qwen3 HF export key collision: {target}")
-                    result[target] = value if match is None else None
-                if match is not None:
+                    result[target] = value if projection is None else None
+                if projection is not None:
                     pending.append((targets, value))
         for targets, value in pending:
             if isinstance(value, ChunkedCheckpointTensor):

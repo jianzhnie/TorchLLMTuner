@@ -35,6 +35,9 @@ def materialize_meta_model(
         if (
             not isinstance(original, torch.Tensor)
             or not isinstance(value, torch.Tensor)
+            # Module.__setattr__ registers Parameters even when the target was
+            # a buffer. Reconstructed runtime state must not change ownership.
+            or isinstance(value, nn.Parameter)
             or value.is_meta
             or value.shape != original.shape
             or value.dtype != original.dtype
@@ -58,6 +61,31 @@ def materialize_meta_model(
                 if id(buffer) not in moved_buffers:
                     moved_buffers[id(buffer)] = buffer.to(device)
                 restored_buffers.setdefault((module, name), moved_buffers[id(buffer)])
+
+    # to_empty preserves neither shared storage between distinct Parameters
+    # nor Parameter/buffer views. Identity aliases are restored below, but
+    # silently splitting a view would change ownership and checkpoint math.
+    # Refuse unsupported meta parameter views before touching model storage.
+    storage_owners: dict[int, torch.Tensor] = {}
+    for module in model.modules():
+        tensors = (*module._parameters.values(), *module._buffers.values())
+        for tensor in tensors:
+            if (
+                type(tensor) not in (torch.Tensor, nn.Parameter)
+                or not tensor.is_meta
+                or tensor.layout != torch.strided
+            ):
+                continue
+            key = tensor.untyped_storage()._cdata
+            previous = storage_owners.setdefault(key, tensor)
+            if previous is not tensor and (
+                isinstance(previous, nn.Parameter) or isinstance(tensor, nn.Parameter)
+            ):
+                raise ValueError(
+                    "Meta materialization does not support distinct tensor views "
+                    "sharing parameter storage; provide independent storage or "
+                    "an identical registered Parameter alias"
+                )
 
     # A recognized buffer may have arbitrary registered aliases, including
     # in other modules. Reconstruct the physical tensor once and resolve all

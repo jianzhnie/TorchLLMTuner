@@ -12,43 +12,54 @@ import torch.distributed as dist
 
 from ...accelerator.distributed import get_rank, get_world_size
 from ...errors import UnsupportedCombinationError
-from ...models.common.activation import SituGLU, SwiGLU
 from ...models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
-from ...models.common.moe.experts import GroupedExperts, RoutedExperts
+from ...models.common.moe.experts import GroupedExperts
 from ...models.common.moe.layer import MoE
 from ...models.common.moe.routing import TokenChoiceTopKRouter
-from ...models.kimi.kimi_k3.moe import KimiSparseMoE
+from ...models.kimi.kimi_k3.moe import KimiRoutedExperts, KimiSparseMoE
 from .checkpointing import mark_experts_ep_sharded
 from .token_dispatch import AllToAllTokenDispatcher, LocalTokenDispatcher
 
 
-class KimiRoutedExperts(RoutedExperts):
-    """Route in latent space, then normalize/project the combined result.
-
-    The gate and shared expert still consume the original model-width input.
-    Latent normalization belongs after weighted combine, never inside experts.
-    """
-
-    def __init__(self, experts, dispatcher, source: KimiSparseMoE) -> None:
-        super().__init__(experts, dispatcher)
-        for name in (
-            "routed_expert_down_proj",
-            "routed_expert_norm",
-            "routed_expert_up_proj",
-        ):
-            module = getattr(source, name, None)
-            if module is not None:
-                setattr(self, name, module)
-
-    def forward(self, x_TD, scores_TK, ids_TK, counts_E):
-        if hasattr(self, "routed_expert_down_proj"):
-            x_TD = self.routed_expert_down_proj(x_TD)
-        output = super().forward(x_TD, scores_TK, ids_TK, counts_E)
-        if hasattr(self, "routed_expert_norm"):
-            output = self.routed_expert_norm(output)
-        if hasattr(self, "routed_expert_up_proj"):
-            output = self.routed_expert_up_proj(output)
-        return output
+def validate_kimi_conversion(
+    block: KimiSparseMoE,
+    *,
+    degree: int,
+    tp_enabled: bool,
+    quantile_balancing: bool,
+    token_dispatcher: str,
+) -> None:
+    """Check Kimi EP capabilities without allocation, mutation or collectives."""
+    if type(degree) is not int or degree < 1:
+        raise ValueError("Kimi EP degree must be a positive integer")
+    if tp_enabled or quantile_balancing or token_dispatcher != "alltoall":
+        raise UnsupportedCombinationError(
+            "Kimi EP currently requires alltoall dispatch, TP=1 and "
+            "moe_quantile_balancing=False; other layout/backend adapters "
+            "are not implemented"
+        )
+    block.validate_expert_geometry()
+    block.validate_grouped_activation()
+    count = len(block.experts)
+    if count == 0 or count % degree:
+        raise ValueError(f"EP degree {degree} must divide Kimi num_experts={count}")
+    for name in ("w1", "w2", "w3"):
+        projections = [getattr(expert, name) for expert in block.experts]
+        if any(projection.bias is not None for projection in projections):
+            raise UnsupportedCombinationError(
+                f"Kimi EP does not support expert projection bias for {name}"
+            )
+        weights = [projection.weight for projection in projections]
+        if len({(weight.dtype, weight.device) for weight in weights}) != 1:
+            raise UnsupportedCombinationError(
+                "Kimi EP cannot stack experts with different dtypes or devices "
+                f"for {name}; one grouped parameter requires uniform storage"
+            )
+        if len({weight.requires_grad for weight in weights}) != 1:
+            raise UnsupportedCombinationError(
+                "Kimi EP cannot stack experts with different requires_grad flags "
+                f"for {name}"
+            )
 
 
 def convert_kimi_block(
@@ -61,37 +72,20 @@ def convert_kimi_block(
     tp_enabled: bool,
 ) -> MoE:
     """Copy one EP expert slice, preserving replicated parameter ownership."""
-    if tp_enabled or quantile_balancing or token_dispatcher != "alltoall":
-        raise UnsupportedCombinationError(
-            "Kimi EP currently requires alltoall dispatch, TP=1 and "
-            "moe_quantile_balancing=False; other layout/backend adapters "
-            "are not implemented"
-        )
-    config = block.config
-    if config.hidden_act not in ("silu", "situ"):
-        raise UnsupportedCombinationError(
-            f"Kimi EP activation {config.hidden_act!r} is not implemented"
-        )
     size = 1 if ep_group is None else get_world_size(ep_group)
+    validate_kimi_conversion(
+        block,
+        degree=size,
+        tp_enabled=tp_enabled,
+        quantile_balancing=quantile_balancing,
+        token_dispatcher=token_dispatcher,
+    )
     rank = 0 if ep_group is None else get_rank(ep_group)
     count = len(block.experts)
-    if count % size:
-        raise ValueError(f"EP degree {size} must divide Kimi num_experts={count}")
     local_count = count // size
     start = rank * local_count
-    activation = (
-        SituGLU(
-            (
-                1.0
-                if config.activation_situ_beta is None
-                else config.activation_situ_beta
-            ),
-            config.activation_situ_linear_beta,
-        )
-        if config.hidden_act == "situ"
-        else SwiGLU()
-    )
     first = block.experts[0]
+    activation = block.build_grouped_activation()
     experts = GroupedExperts(
         first.w1.in_features,
         first.w1.out_features,
@@ -104,16 +98,6 @@ def convert_kimi_block(
         ("w3", "w3_EFD"),
     ):
         source = [getattr(expert, source_name).weight for expert in block.experts]
-        if len({(weight.dtype, weight.device) for weight in source}) != 1:
-            raise UnsupportedCombinationError(
-                "Kimi EP cannot stack experts with different dtypes or devices "
-                f"for {source_name}; one grouped parameter requires uniform storage"
-            )
-        if len({weight.requires_grad for weight in source}) != 1:
-            raise UnsupportedCombinationError(
-                "Kimi EP cannot stack experts with different requires_grad flags "
-                f"for {source_name}"
-            )
         target = getattr(experts, target_name)
         # Different projections may retain different precision under autocast.
         # Copying every projection into w1's dtype would change optimizer state.
@@ -121,16 +105,19 @@ def convert_kimi_block(
         target.requires_grad_(source[0].requires_grad)
         with torch.no_grad():
             target.copy_(torch.stack(source[start : start + local_count]))
-    grouped = config.num_expert_group > config.topk_group
+    # The instantiated gate owns routing math. Its config may have been edited
+    # after construction without changing the gate's actual forward semantics.
+    gate = block.gate
+    grouped = gate.num_expert_group > gate.topk_group
     router = TokenChoiceTopKRouter(
         num_experts=count,
         dim=block.gate.weight.shape[1],
         top_k=block.gate.top_k,
-        score_func=config.moe_router_activation_func,
-        route_norm=config.moe_renormalize and block.gate.top_k > 1,
-        route_scale=config.routed_scaling_factor,
-        num_expert_groups=config.num_expert_group if grouped else None,
-        num_limited_groups=config.topk_group if grouped else None,
+        score_func=gate.moe_router_activation_func,
+        route_norm=gate.moe_renormalize and gate.top_k > 1,
+        route_scale=gate.routed_scaling_factor,
+        num_expert_groups=gate.num_expert_group if grouped else None,
+        num_limited_groups=gate.topk_group if grouped else None,
         aux_loss=(
             MicrobatchWiseLoadBalanceLoss(coeff=aux_loss_coeff)
             if aux_loss_coeff

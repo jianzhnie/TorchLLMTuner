@@ -379,7 +379,11 @@ class LLMTunerConfig:
         return self.training.validation
 
     def auto_fill_model(self) -> None:
-        """Fill architecture fields from a local HF directory or Hub config."""
+        """Fill registered architecture fields from local or Hub metadata.
+
+        Unavailable metadata preserves explicit user sizes with a warning;
+        readable but unregistered architectures are a configuration error.
+        """
         mp = self.model.model_name_or_path
         registration = get_model_spec(mp) or get_model_spec(
             mp, task="conditional_generation"
@@ -393,10 +397,12 @@ class LLMTunerConfig:
                 model_type, task="conditional_generation"
             )
             if registration is None:
-                raise ValueError(
+                raise ConfigError(
                     f"No local configuration registered for {model_type!r}"
                 )
             hf_config = registration.config_type_loader().from_pretrained(mp)
+        except ConfigError:
+            raise
         except Exception as e:  # noqa: BLE001 - warn, keep explicit values
             logger.warning(
                 "Could not load registered configuration for '%s': %s", mp, e

@@ -226,18 +226,28 @@ def to_device(self: Trainer, batch: Batch | TrainerBatch) -> Batch | TrainerBatc
 def preprocess(
     self: Trainer, batch: Batch | TrainerBatch
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-    """Move the batch and ask the stage's canonical model to prepare inputs.
+    """Move the batch and ask the explicit model to prepare its inputs.
 
     Remove collator token-count metadata before model preprocessing. Transfer
-    occurs at consumption so unread accumulation groups stay in host memory."""
+    occurs at consumption so unread accumulation groups stay in host memory.
+    ``prepare_inputs`` is the required explicit-model I/O contract; model
+    ownership errors must not be hidden by a deleted adapter's legacy method.
+    """
     if isinstance(batch, dict):
         batch = {
             key: value for key, value in batch.items() if key != "num_valid_tokens"
         }
-    # HF preprocessing builds local masks and slices already-replicated inputs;
-    # attention collectives start only in model execution after this boundary.
+    prepare_inputs = getattr(self.example_model, "prepare_inputs", None)
+    if not callable(prepare_inputs):
+        raise TypeError(
+            f"{type(self.example_model).__name__} must implement "
+            "prepare_inputs(batch, parallel_dims=..., max_context_length=...)"
+        )
+    # Input normalization builds local masks and slices already-replicated
+    # inputs; attention collectives start only in model execution after this
+    # boundary.
     with synchronize_local_errors("Training batch preprocessing"):
-        result = self.example_model.preprocess_inputs(
+        result = prepare_inputs(
             self.to_device(batch),
             parallel_dims=self.parallel_dims,
             max_context_length=self.cfg.max_seq_len,

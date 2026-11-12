@@ -331,7 +331,9 @@ def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) 
             else:
                 inputs, labels, extra_kwargs = self.preprocess(batch)
                 with self.param_context(), spmd_context(parallel_dims):
-                    logits = self.example_model(inputs, **extra_kwargs)
+                    logits = self._model_output_value(
+                        self.example_model(inputs, **extra_kwargs)
+                    )
                     loss_sum = self.loss_sum(logits, labels, **self.loss_vocab_kwargs())
             if loss_sum is not None:
                 if accumulated_loss is None:

@@ -17,6 +17,7 @@ from torch.nn import functional as F
 from transformers.modeling_outputs import MoeModelOutputWithPast
 
 from ...accelerator.collectives import synchronize_local_errors
+from ...models.contracts import DecoderStructure
 from .attention import HeadToSeq, SeqToHead
 from .compression_windows import (
     CompressionWindowExchange,
@@ -319,7 +320,14 @@ def compressor_decoder_forward(
 
 def apply_compressor_context_parallel(model, *, cp_mesh, cfg):
     """Install stateless HCA/CSA CP after validating the complete local decoder."""
-    decoder = model.model.model
+    structure = getattr(model, "decoder_structure", None)
+    if not isinstance(structure, DecoderStructure):
+        raise TypeError("Compressor CP requires an explicit decoder structure")
+    decoder = model.get_submodule(structure.decoder)
+    if not hasattr(decoder, "layers"):
+        raise TypeError(
+            f"Declared compressor decoder {structure.decoder!r} must expose layers"
+        )
     layers = list(decoder.layers)
     if cfg.cp_config.context_parallel_strategy != "ulysses":
         raise ValueError(

@@ -29,7 +29,13 @@ class ModelSpec:
 
     def build_config(self, **kwargs: Any) -> Any:
         """Construct configuration without loading model or device code."""
-        return self.config_factory(**kwargs)
+        config = self.config_factory(**kwargs)
+        if getattr(config, "model_type", None) != self.model_type:
+            raise ValueError(
+                f"Model {self.model_type!r} configuration factory returned "
+                f"model_type={getattr(config, 'model_type', None)!r}"
+            )
+        return config
 
     def resolve_model_class(self) -> type[nn.Module]:
         """Load only the selected implementation."""

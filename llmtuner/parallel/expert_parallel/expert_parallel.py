@@ -1,4 +1,4 @@
-"""Wire EP onto a model: swap every HF MoE block for the llmtuner MoE."""
+"""Install the EP MoE implementation declared by an explicit model."""
 
 from __future__ import annotations
 
@@ -14,11 +14,7 @@ from ..plan import ParallelPlan
 from .domino_dispatch import DominoRoutedExperts
 from .mc2_dispatch import MC2RoutedExperts
 from .mc2_ops import validate_mc2_world_size
-from .model_replacement import (
-    MoEReplacementObserver,
-    resolve_ep_plan,
-    swap_hf_moe_blocks,
-)
+from .model_replacement import MoEReplacementObserver, resolve_ep_plan, swap_moe_blocks
 
 logger = get_logger(__name__)
 
@@ -34,9 +30,9 @@ def apply_ep(
     on_replacement: MoEReplacementObserver | None = None,
     resolved_plan: ParallelPlan | None = None,
 ) -> nn.Module:
-    """Swap every HF MoE block for the EP-capable llmtuner MoE.
+    """Install the EP-capable MoE implementation for declared model blocks.
 
-    EP=1 keeps the HF model unless fixed_router requests native local routing.
+    EP=1 keeps the declared model unless fixed_router requests native routing.
 
     error_group, when supplied, spans every rank sharing later stage-local
     collectives. Domino and MC2 use it for failure coordination; standalone callers
@@ -70,7 +66,7 @@ def apply_ep(
             raise ValueError(
                 f"ep={cfg.ep_size} requires an EP process group of that size, got "
                 f"{None if ep_group is None else ep_group.size()}. The group comes "
-                "from the sparse mesh's 'ep' axis (parallelize_hf_transformers "
+                "from the sparse mesh's 'ep' axis (parallelize_model "
                 "resolves it from parallel_dims)."
             )
         if cfg.tp_size == 1:
@@ -79,7 +75,7 @@ def apply_ep(
                 # TP-only preflight does not cover an EP-only run. Models with
                 # explicit partial TP overrides are validated by that resolver.
                 validate(tp_degree=1, ep_degree=cfg.ep_size)
-        swapped = swap_hf_moe_blocks(
+        swapped = swap_moe_blocks(
             model,
             ep_group=ep_group,
             router_aux_loss_coef=cfg.ep_config.router_aux_loss_coef,

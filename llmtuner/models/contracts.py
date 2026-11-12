@@ -7,6 +7,7 @@ No modules are registered here and no parameter storage is copied.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from torch import nn
@@ -36,22 +37,72 @@ class MoEBlockContract:
     score_func: str = "softmax"
     shared_expert: str | None = None
     expert_layout: str = "fused_gate_up"
+    activation: str = "silu"
     router_logits_in_output: bool = False
     num_expert_groups: int | None = None
     num_limited_groups: int | None = None
+    shared_expert_gate: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.router or "." in self.router:
+        if not isinstance(self.router, str) or not self.router or "." in self.router:
             raise ValueError("MoE router must be a direct child name")
         if self.shared_expert is not None and (
-            not self.shared_expert or "." in self.shared_expert
+            not isinstance(self.shared_expert, str)
+            or not self.shared_expert
+            or "." in self.shared_expert
         ):
             raise ValueError("MoE shared expert must be a direct child name")
-        if self.num_experts < 1 or not 0 < self.top_k <= self.num_experts:
+        if self.shared_expert_gate is not None and (
+            self.shared_expert is None
+            or not isinstance(self.shared_expert_gate, str)
+            or not self.shared_expert_gate
+            or "." in self.shared_expert_gate
+        ):
+            raise ValueError(
+                "MoE shared expert gate requires a shared expert and direct child name"
+            )
+        if (
+            type(self.num_experts) is not int
+            or type(self.top_k) is not int
+            or self.num_experts < 1
+            or not 0 < self.top_k <= self.num_experts
+        ):
             raise ValueError("MoE expert count and top-k are inconsistent")
+        if type(self.router_logits_in_output) is not bool:
+            raise ValueError("MoE router_logits_in_output must be boolean")
+        if type(self.route_norm) is not bool:
+            raise ValueError("MoE route_norm must be boolean")
+        if (
+            isinstance(self.route_scale, bool)
+            or not isinstance(self.route_scale, (int, float))
+            or not math.isfinite(self.route_scale)
+            or self.route_scale <= 0
+        ):
+            raise ValueError("MoE route_scale must be finite and positive")
+        groups, limited = self.num_expert_groups, self.num_limited_groups
+        if (groups is None) != (limited is None):
+            raise ValueError(
+                "MoE expert groups and limited groups must be set together"
+            )
+        if groups is not None:
+            if (
+                type(groups) is not int
+                or type(limited) is not int
+                or groups < 1
+                or not 0 < limited <= groups
+                or self.num_experts % groups
+            ):
+                raise ValueError("MoE expert group geometry is inconsistent")
+            if self.top_k > limited * (self.num_experts // groups):
+                raise ValueError("MoE top-k exceeds selected expert group capacity")
+        if not isinstance(self.activation, str) or not self.activation.strip():
+            raise ValueError("MoE activation must be a non-empty name")
         if self.expert_layout != "fused_gate_up":
             raise ValueError(f"Unsupported MoE expert layout {self.expert_layout!r}")
-        if self.score_func not in {"softmax", "sigmoid"}:
+        if not isinstance(self.score_func, str) or self.score_func not in {
+            "softmax",
+            "sigmoid",
+        }:
             raise ValueError(f"Unsupported MoE score function {self.score_func!r}")
 
     def bind(self, block: nn.Module) -> tuple[nn.Module, str, nn.Module | None]:
@@ -64,6 +115,17 @@ class MoEBlockContract:
             if self.shared_expert is None
             else block._modules.get(self.shared_expert)
         )
+        if self.shared_expert is not None and not isinstance(shared, nn.Module):
+            raise ValueError(
+                f"MoE shared expert {self.shared_expert!r} must be a child module"
+            )
+        if self.shared_expert_gate is not None and not isinstance(
+            block._modules.get(self.shared_expert_gate), nn.Module
+        ):
+            raise ValueError(
+                f"MoE shared expert gate {self.shared_expert_gate!r} "
+                "must be a child module"
+            )
         return router, self.shared_expert or "shared_expert", shared
 
 

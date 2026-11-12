@@ -1,8 +1,9 @@
 """Plan and install native MoE replacements before FSDP wrapping.
 
-Layout detection and model-family restrictions belong to ``hf_inspection.py``;
-weight conversion belongs to ``block_conversion.py`` or ``kimi_conversion.py``.
-This module coordinates those operations after weights are loaded.
+Explicit models supply decoder and MoE slot declarations. Only undeclared
+legacy callers use ``hf_inspection.py``; weight conversion belongs to
+``block_conversion.py`` or ``kimi_conversion.py``. This module resolves those
+bindings before installing replacements after weights are loaded.
 
 All replacements, shared-parameter bindings and TP checkpoint registrations
 are planned before any decoder slot is replaced. Unsupported aliases or layouts
@@ -35,7 +36,8 @@ from llmtuner.config.parallel_config import (
 from llmtuner.errors import UnsupportedCombinationError
 
 from ...models.common.aux_loss import AuxLoss
-from ...models.common.moe.layer import MoE
+from ...models.common.moe.layer import MoE, declared_moe_block
+from ...models.contracts import DecoderStructure, MoEBlockContract
 from ...models.kimi.kimi_k3.moe import KimiSparseMoE
 from ...utils.logging import get_logger
 from ..plan import ParallelPlan, PlanTarget
@@ -48,17 +50,41 @@ from .block_conversion import (
     resolve_packed_experts,
     validate_moe_conversion,
 )
-from .hf_inspection import (
-    is_hf_moe_block,
-    moe_block_of,
-    per_expert_projection_names,
-    returns_router_logits,
+from .kimi_conversion import (
+    convert_kimi_block,
+    validate_kimi_conversion,
 )
-from .kimi_conversion import convert_kimi_block
 
 logger = get_logger(__name__)
 
-__all__ = ["resolve_ep_plan", "swap_hf_moe_blocks"]
+__all__ = ["resolve_ep_plan", "swap_moe_blocks", "swap_hf_moe_blocks"]
+
+
+def declared_router_output(block: nn.Module) -> bool:
+    """Resolve explicit output semantics without coercing or inspecting forward.
+
+    A retained per-block flag must agree with the model-owned MoE contract.
+    Contract-only declarations do not need to duplicate the flag.
+    """
+    contract = getattr(block, "moe_contract", None)
+    expected = (
+        contract.router_logits_in_output
+        if isinstance(contract, MoEBlockContract)
+        else False
+    )
+    declared = getattr(block, "router_logits_in_output", expected)
+    if type(declared) is not bool:
+        raise ValueError("MoE router_logits_in_output must be boolean")
+    if isinstance(contract, MoEBlockContract) and declared != expected:
+        raise ValueError("MoE router output flag conflicts with its declared contract")
+    return declared
+
+
+def _legacy_inspection():
+    """Load external-layout probes only for undeclared legacy models."""
+    from . import hf_inspection
+
+    return hf_inspection
 
 
 def bind_shared_projection(
@@ -233,6 +259,37 @@ def validate_kimi_expert_aliases(
     }
     if not kimi_expert_ids:
         return
+    # Different Parameter objects (or a buffer view) can share storage without
+    # sharing identity. Stacking would silently sever that ownership too.
+    expert_storage: dict[int, int] = {}
+    for _, module in module_paths:
+        for parameter in module.parameters(recurse=False):
+            if (
+                id(parameter) in kimi_expert_ids
+                and type(parameter) is nn.Parameter
+                and parameter.layout == torch.strided
+            ):
+                storage = parameter.untyped_storage()._cdata
+                previous = expert_storage.setdefault(storage, id(parameter))
+                if previous != id(parameter):
+                    raise UnsupportedCombinationError(
+                        "Kimi EP cannot stack expert parameters sharing storage"
+                    )
+    for path, module in module_paths:
+        buffers = tuple(module.named_buffers(recurse=False))
+        buffer_ids = {id(value) for _, value in buffers}
+        tensors = tuple(module.named_parameters(recurse=False)) + buffers
+        for name, tensor in tensors:
+            if type(tensor) not in (torch.Tensor, nn.Parameter):
+                continue
+            if tensor.layout != torch.strided:
+                continue
+            owner = expert_storage.get(tensor.untyped_storage()._cdata)
+            if owner is not None and (id(tensor) != owner or id(tensor) in buffer_ids):
+                raise UnsupportedCombinationError(
+                    "Kimi EP cannot preserve expert storage alias "
+                    f"at {path}.{name}; an explicit layout adapter is required"
+                )
     owners: dict[int, tuple[int, str]] = {}
     checked_kimi_blocks: set[int] = set()
     for _, _, block, _ in candidates:
@@ -261,16 +318,71 @@ def validate_kimi_expert_aliases(
                 )
 
 
+def decoder_layers_for_ep(model: nn.Module) -> Iterable[nn.Module]:
+    """Bind explicit decoder ownership; retain legacy entry points separately.
+
+    A declared model must not recover from a malformed contract by reading a
+    similarly named convenience property. Resolve current registered children
+    so PP copies and parameter replacement cannot leave cached references.
+    """
+    structure = getattr(model, "decoder_structure", None)
+    if structure is not None:
+        if not isinstance(structure, DecoderStructure):
+            raise TypeError("EP decoder_structure must be a DecoderStructure")
+        return structure.bind(model).blocks
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        raise UnsupportedCombinationError(
+            f"EP requires declared decoder structure or legacy .layers; "
+            f"got {type(model).__name__}."
+        )
+    return layers
+
+
 def find_moe_candidates(
     model: nn.Module, layers: Iterable[nn.Module], hf_config: Any
 ) -> list[tuple[nn.Module, str, nn.Module, bool]]:
-    """Inspect every decoder layer before allocating replacement modules."""
+    """Resolve declared slots before allocating; inspect only legacy models."""
+    explicit_model = isinstance(
+        getattr(model, "decoder_structure", None), DecoderStructure
+    )
+    inspection = None
     candidates = []
     for layer in layers:
-        attr, block = moe_block_of(layer)
+        declared = declared_moe_block(layer)
+        if declared is not None:
+            attr, block = declared
+        else:
+            if explicit_model:
+                raise ValueError(
+                    f"Explicit decoder {type(layer).__name__} requires "
+                    "moe_block_name (None for a dense layer); "
+                    "legacy MoE inspection is disabled for declared models"
+                )
+            inspection = inspection or _legacy_inspection()
+            attr, block = inspection.moe_block_of(layer)
         if block is None:
             continue
-        if not (isinstance(block, KimiSparseMoE) or is_hf_moe_block(block)):
+        if (
+            explicit_model
+            and not isinstance(block, (KimiSparseMoE, MoE))
+            and not isinstance(getattr(block, "moe_contract", None), MoEBlockContract)
+        ):
+            raise UnsupportedCombinationError(
+                f"Declared MoE slot {type(layer).__name__}.{attr} requires a "
+                "model-owned MoEBlockContract; legacy layout inspection is disabled"
+            )
+        explicit = declared is not None
+        if not (
+            isinstance(block, KimiSparseMoE)
+            or isinstance(block, MoE)
+            or (explicit and resolve_packed_experts(block, degree=1) is not None)
+            or (
+                not explicit
+                and inspection is not None
+                and inspection.is_hf_moe_block(block)
+            )
+        ):
             if hasattr(layer, "moe_block_name"):
                 raise UnsupportedCombinationError(
                     f"Declared MoE slot {type(layer).__name__}.{attr} holds "
@@ -279,7 +391,11 @@ def find_moe_candidates(
                     "before enabling EP conversion."
                 )
             continue
-        wants_router_logits = returns_router_logits(block)
+        if explicit:
+            wants_router_logits = declared_router_output(block)
+        else:
+            inspection = inspection or _legacy_inspection()
+            wants_router_logits = inspection.returns_router_logits(block)
         if wants_router_logits and getattr(hf_config, "output_router_logits", False):
             raise UnsupportedCombinationError(
                 f"{type(block).__name__} returns router logits and its config "
@@ -292,11 +408,9 @@ def find_moe_candidates(
 
     if not candidates:
         raise UnsupportedCombinationError(
-            f"no HF MoE block found on {type(model).__name__} "
-            f"({type(getattr(model, 'model', model)).__name__}): no layer's "
-            "``mlp`` has the router-gate + fused gate_up_proj/down_proj shape "
-            "this swap recognizes. Add the model family's layout to the probe "
-            "in parallel/expert_parallel/hf_inspection.py."
+            f"no declared or compatible MoE block found on {type(model).__name__}; "
+            "EP requires a sparse decoder slot with a supported expert layout. "
+            "Declare moe_block_name and a model-owned expert layout adapter."
         )
     return candidates
 
@@ -310,6 +424,8 @@ class MoEConversionTarget:
     router_logits: bool
     routing: MoERoutingBinding | None = None
     packed_experts: PackedExpertBinding | None = None
+    contract: MoEBlockContract | None = None
+    kimi_math: tuple[object, ...] | None = None
 
 
 def resolve_ep_plan(
@@ -332,13 +448,8 @@ def resolve_ep_plan(
     """
     if isinstance(degree, bool) or not isinstance(degree, int) or degree < 1:
         raise ValueError("EP degree must be a positive integer")
-    layers = getattr(model, "layers", None)
-    if layers is None:
-        raise UnsupportedCombinationError(
-            f"swap_hf_moe_blocks expects a model with .layers; got "
-            f"{type(model).__name__}."
-        )
-    config = getattr(getattr(model, "model", None), "config", None)
+    layers = decoder_layers_for_ep(model)
+    config = getattr(model, "config", None)
     candidates = find_moe_candidates(model, layers, config)
     modules = tuple(model.named_modules(remove_duplicate=False))
     targets = []
@@ -348,7 +459,15 @@ def resolve_ep_plan(
             raise ValueError("EP decoder owner is not registered in this model")
         routing = None
         packed_experts = None
-        if not isinstance(block, KimiSparseMoE):
+        if isinstance(block, KimiSparseMoE):
+            validate_kimi_conversion(
+                block,
+                degree=degree,
+                tp_enabled=tp_enabled,
+                quantile_balancing=quantile_balancing,
+                token_dispatcher=implementation,
+            )
+        else:
             routing = resolve_moe_routing(block)
             validate_moe_conversion(
                 block,
@@ -375,9 +494,29 @@ def resolve_ep_plan(
                     router_logits,
                     routing,
                     packed_experts,
+                    getattr(block, "moe_contract", None),
+                    block.expert_parallel_math_signature()
+                    if isinstance(block, KimiSparseMoE)
+                    else None,
                 ),
             )
         )
+    if any(isinstance(block, KimiSparseMoE) for _, _, block, _ in candidates):
+        module_paths = list(modules)
+        roots = conversion_roots(candidates, module_paths)
+        external_parameters, _ = external_state_owners(module_paths, roots)
+        validate_kimi_expert_aliases(candidates, module_paths, external_parameters)
+    validate = getattr(model, "validate_parallel", None)
+    # A whole-model capability contract describes unsharded geometry. TP
+    # validates it before its own transformations; EP-only must do so here.
+    # Do not reinterpret TP-sharded or already converted storage as native.
+    if (
+        callable(validate)
+        and not tp_enabled
+        and getattr(model, "parallel_plan", None) is None
+        and getattr(model, "ep_parallel_plan", None) is None
+    ):
+        validate(tp_degree=1, ep_degree=degree)
     return ParallelPlan(
         stage="ep",
         targets=tuple(targets),
@@ -386,7 +525,23 @@ def resolve_ep_plan(
         operations=("convert", "bind_shared_state", "install"),
         module_bindings=modules,
         parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+        buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
     )
+
+
+def conversion_roots(
+    candidates: list[tuple[nn.Module, str, nn.Module, bool]],
+    module_paths: list[tuple[str, nn.Module]],
+) -> list[str]:
+    """Retain every registered decoder alias when describing replaced subtrees."""
+    candidate_attrs: dict[int, list[str]] = {}
+    for layer, attr, _, _ in candidates:
+        candidate_attrs.setdefault(id(layer), []).append(attr)
+    return [
+        f"{path}.{attr}" if path else attr
+        for path, module in module_paths
+        for attr in candidate_attrs.get(id(module), ())
+    ]
 
 
 def external_state_owners(
@@ -408,7 +563,7 @@ def external_state_owners(
     return external_parameters, external_buffers
 
 
-def swap_hf_moe_blocks(
+def swap_moe_blocks(
     model: nn.Module,
     *,
     ep_group: dist.ProcessGroup | None = None,
@@ -424,7 +579,7 @@ def swap_hf_moe_blocks(
     """Replace every HF MoE block in ``model`` with llmtuner's MoE, in place.
 
     Args:
-        model: a ``TrainingModel`` (anything exposing ``.layers``).
+        model: an explicit model (anything exposing ``.layers``).
         ep_group: the EP process group. ``None`` (or a size-1 group is not
             special-cased -- pass ``None``) keeps all experts local and routes
             them with the reordering-only dispatcher; a multi-rank group
@@ -470,12 +625,7 @@ def swap_hf_moe_blocks(
             ``fused_experts_of``) or DeepSeek-V2's ``group_limited_greedy``
             routing (see ``read_expert_groups``).
     """
-    layers = getattr(model, "layers", None)
-    if layers is None:
-        raise UnsupportedCombinationError(
-            f"swap_hf_moe_blocks expects a model with .layers; got "
-            f"{type(model).__name__}."
-        )
+    decoder_layers_for_ep(model)
     # Backend gating, before any probing: ParallelConfig.__post_init__ is the
     # primary gate; this is the defensive copy for callers that reach the swap
     # directly.
@@ -487,7 +637,7 @@ def swap_hf_moe_blocks(
         ep_torchao_pad_multiple=torchao_pad_multiple,
     )
 
-    hf_config = getattr(getattr(model, "model", None), "config", None)
+    hf_config = getattr(model, "config", None)
     if getattr(hf_config, "experts_implementation", "native") == "pre_down":
         raise UnsupportedCombinationError(
             "EP MoE replacement cannot preserve experts_implementation='pre_down'; "
@@ -534,10 +684,35 @@ def swap_hf_moe_blocks(
             raise ValueError("EP plan requires resolved MoE conversion targets")
         if binding.owner._modules.get(binding.attribute) is not target.module:
             raise ValueError(f"Stale EP decoder slot: {target.path}")
+        if isinstance(target.module, KimiSparseMoE) and (
+            target.module.expert_parallel_math_signature() != binding.kimi_math
+        ):
+            raise ValueError(f"Stale EP Kimi mathematics: {target.path}")
+        if getattr(target.module, "moe_contract", None) != binding.contract:
+            raise ValueError(f"Stale EP model contract: {target.path}")
+        if binding.contract is not None:
+            try:
+                current_output = declared_router_output(target.module)
+            except ValueError as error:
+                raise ValueError(
+                    f"Stale EP router output contract: {target.path}"
+                ) from error
+            if current_output != binding.router_logits:
+                raise ValueError(f"Stale EP router output contract: {target.path}")
         candidates.append(
             (binding.owner, binding.attribute, target.module, binding.router_logits)
         )
-        if not isinstance(target.module, KimiSparseMoE):
+        if isinstance(target.module, KimiSparseMoE):
+            # Revalidate all targets before constructing the first replacement:
+            # execution options/config can change without replacing tensors.
+            validate_kimi_conversion(
+                target.module,
+                degree=degree,
+                tp_enabled=tp_enabled,
+                quantile_balancing=quantile_balancing,
+                token_dispatcher=token_dispatcher,
+            )
+        else:
             if binding.routing is None or binding.routing.source is not target.module:
                 raise ValueError("EP plan requires a matching routing binding")
             validate_moe_conversion(
@@ -556,15 +731,7 @@ def swap_hf_moe_blocks(
         raise ValueError("EP plan must contain conversion targets")
 
     module_paths = list(model.named_modules(remove_duplicate=False))
-    # Index owners once; retain every registered path for aliased decoder layers.
-    candidate_attrs: dict[int, list[str]] = {}
-    for layer, attr, _, _ in candidates:
-        candidate_attrs.setdefault(id(layer), []).append(attr)
-    replaced_roots = [
-        f"{path}.{attr}" if path else attr
-        for path, module in module_paths
-        for attr in candidate_attrs.get(id(module), ())
-    ]
+    replaced_roots = conversion_roots(candidates, module_paths)
     external_parameters, external_buffers = external_state_owners(
         module_paths, replaced_roots
     )
@@ -640,7 +807,7 @@ def swap_hf_moe_blocks(
             projection_names = (
                 None
                 if id(block) in packed_bindings
-                else per_expert_projection_names(block.experts)
+                else _legacy_inspection().per_expert_projection_names(block.experts)
             )
             projections: list[
                 tuple[nn.Module, tuple[str, ...], tuple[torch.Tensor, ...]]
@@ -758,5 +925,10 @@ def swap_hf_moe_blocks(
         owner._tp_checkpoint_layouts = layouts
 
     model.ep_parallel_plan = execution_plan
-    logger.info("Swapped %d HF MoE blocks for llmtuner MoE blocks", len(replacements))
+    logger.info("Converted %d model MoE blocks for EP execution", len(replacements))
     return len(replacements)
+
+
+def swap_hf_moe_blocks(model: nn.Module, **kwargs: Any) -> int:
+    """Compatibility alias for the former HF-specific entry point."""
+    return swap_moe_blocks(model, **kwargs)

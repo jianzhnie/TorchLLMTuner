@@ -41,7 +41,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Kimi text decoder integration for the HF training wrapper.
+"""Explicit Kimi text decoder and model-owned training contract.
 
 Adapted from FSDPTurbo 0af4eca models/kimi/modeling_kimi_linear.py.
 Dense, local sparse-expert and attention-residual training are implemented.
@@ -59,13 +59,21 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 
+from ....errors import UnsupportedCombinationError
+from ...common.cast_linear import build_lm_head
+from ...common.input_preparation import prepare_text_inputs
+from ...common.moe.layer import MoE
+from ...configuration import (
+    validate_attention_backend,
+    validate_native_execution_policy,
+)
 from ...contracts import DecoderStructure
 from .attention_residual import attention_residual
 from .configuration import KimiLinearConfig
 from .delta_attention import KimiDeltaAttention
 from .latent_attention import KimiLatentAttention
 from .mlp import KimiMLP as KimiMLP
-from .moe import KimiSparseMoE
+from .moe import KimiMoEGate, KimiRoutedExperts, KimiSparseMoE
 from .normalization import KimiRMSNorm
 
 
@@ -164,6 +172,8 @@ class KimiTextDecoder(nn.Module):
     """Model-owned embedding, hybrid decoder stack and final normalization."""
 
     def __init__(self, config: KimiLinearConfig) -> None:
+        validate_native_execution_policy(config, model_name="Kimi")
+        validate_attention_backend(config)
         super().__init__()
         self.config = config
         if config.attn_res_block_size is not None:
@@ -295,6 +305,7 @@ class KimiLinearForCausalLM(PreTrainedModel):
         blocks="model.layers",
         norm="model.norm",
         head="lm_head",
+        attention="self_attn",
     )
 
     config_class = KimiLinearConfig
@@ -304,33 +315,202 @@ class KimiLinearForCausalLM(PreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: KimiLinearConfig) -> None:
+        validate_native_execution_policy(config, model_name="Kimi")
+        validate_attention_backend(config)
+        if getattr(config, "experts_implementation", "native") not in (
+            "native",
+            "eager",
+        ):
+            raise ValueError(
+                "Kimi local experts support experts_implementation native/eager; "
+                "other backends require a model-owned expert implementation."
+            )
         super().__init__(config)
         self.model = KimiTextDecoder(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = build_lm_head(
+            config.hidden_size,
+            config.vocab_size,
+            compute_dtype=getattr(config, "compute_dtype", None),
+        )
         self.post_init()
 
     @property
     def enable_weight_tying(self) -> bool:
         """Report actual Parameter identity rather than configuration intent."""
-        return self.lm_head.weight is self.model.embed_tokens.weight
+        weight = getattr(self.lm_head, "weight", None)
+        return weight is not None and weight is getattr(
+            self.model.embed_tokens, "weight", None
+        )
+
+    @property
+    def layers(self) -> nn.ModuleList:
+        """Expose the model-owned decoder layers to parallel executors."""
+        return self.model.layers
+
+    @property
+    def tok_embeddings(self) -> nn.Embedding:
+        """Return the model-owned token embedding."""
+        return self.model.embed_tokens
+
+    @property
+    def norm(self) -> nn.Module:
+        """Return the model-owned final normalization."""
+        return self.model.norm
+
+    def set_cp_mesh(
+        self,
+        mesh: Any,
+        *,
+        load_balancer: str | None = None,
+        strategy: str = "kv_allgather",
+        mask_mesh: Any = None,
+    ) -> None:
+        """Record CP metadata; KDA validates recurrence constraints later."""
+        self.cp_mesh = mesh
+        self._cp_load_balancer = load_balancer
+        self._cp_mask_mesh = mesh if mask_mesh is None else mask_mesh
+        self._cp_strategy = strategy
 
     def _init_weights(self, module: nn.Module) -> None:
+        """Initialize missing linear/embedding weights without overwriting loads."""
         if isinstance(module, nn.Linear | nn.Embedding):
+            # A partially loaded module may still reach this callback. The
+            # parameter flag protects both normal sampling and padding reset.
+            if getattr(module.weight, "_is_hf_initialized", False):
+                return
             nn.init.normal_(module.weight, std=self.config.initializer_range)
             if isinstance(module, nn.Embedding) and module.padding_idx is not None:
                 with torch.no_grad():
                     module.weight[module.padding_idx].zero_()
 
-    def forward(self, input_ids=None, inputs_embeds=None, labels=None, **kwargs):
+    def materialization_buffers(
+        self, device: torch.device
+    ) -> dict[tuple[nn.Module, str], torch.Tensor]:
+        """Rebuild non-checkpoint MoE counters after meta allocation.
+
+        EP conversion creates these buffers on the model-owned MoE blocks. They
+        are runtime state, so memory materialization receives their values from
+        the model instead of inferring names or semantics globally.
+        """
+        buffers: dict[tuple[nn.Module, str], torch.Tensor] = {}
+        for module in self.modules():
+            if not isinstance(module, MoE):
+                continue
+            for name, buffer in module.named_buffers(recurse=False):
+                if buffer.is_meta:
+                    buffers[module, name] = torch.zeros(
+                        buffer.shape, dtype=buffer.dtype, device=device
+                    )
+        return buffers
+
+    def initialize_parameters(self) -> None:
+        """Initialize allocated storage, including constructor-owned parameters.
+
+        ``to_empty`` discards norm, convolution, router and KDA constructor
+        values as well as linear weights. Restore those explicitly here without
+        changing eager construction or its RNG order.
+        """
+        if any(parameter.is_meta for parameter in self.parameters()):
+            raise RuntimeError(
+                "Kimi parameters must be materialized before initialization"
+            )
+        if any(isinstance(module, KimiRoutedExperts) for module in self.modules()):
+            raise TypeError(
+                "Converted Kimi experts require an ownership-aware initialization "
+                "contract; initialize before conversion or load checkpoint weights"
+            )
+        self.apply(self._init_weights)
+        with torch.no_grad():
+            for module in self.modules():
+                if isinstance(module, KimiRMSNorm):
+                    nn.init.ones_(module.weight)
+                elif isinstance(module, nn.Conv1d):
+                    module.reset_parameters()
+                elif isinstance(module, KimiMoEGate):
+                    module.reset_parameters()
+                    nn.init.zeros_(module.e_score_correction_bias)
+                elif isinstance(module, KimiDeltaAttention):
+                    rates = torch.empty_like(module.A_log, dtype=torch.float32)
+                    module.A_log.copy_(rates.uniform_(1, 16).log_())
+                    nn.init.zeros_(module.dt_bias)
+
+    def prepare_inputs(
+        self,
+        batch: Any,
+        *,
+        parallel_dims: Any,
+        max_context_length: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Expose Kimi's text input contract to the Trainer."""
+        inputs, labels, extra = prepare_text_inputs(
+            self,
+            batch,
+            parallel_dims=parallel_dims,
+            max_context_length=max_context_length,
+            preserve_batch_rows=True,
+        )
+        if "input_batch_shape" in extra and "attention_masks" in extra:
+            raise UnsupportedCombinationError(
+                "Kimi packed document input currently requires a single batch row"
+            )
+        return inputs, labels, extra
+
+    def forward(
+        self,
+        input_ids=None,
+        inputs_embeds=None,
+        labels=None,
+        positions=None,
+        attention_masks=None,
+        padding_mask=None,
+        skip_lm_head: bool = False,
+        input_batch_shape: tuple[int, int] | None = None,
+        **kwargs,
+    ):
+        if positions is not None and kwargs.get("position_ids") is not None:
+            raise ValueError("Specify only one of positions and position_ids")
+        if attention_masks is not None and kwargs.get("attention_mask") is not None:
+            raise ValueError("Specify only one of attention_masks and attention_mask")
+        flat_input = input_ids is not None and input_ids.ndim == 1
+        if input_batch_shape is not None:
+            if not flat_input:
+                raise ValueError("input_batch_shape requires flat Trainer tokens")
+            input_ids = input_ids.reshape(input_batch_shape)
+            if labels is not None:
+                labels = labels.reshape(input_batch_shape)
+        elif flat_input:
+            input_ids = input_ids.unsqueeze(0)
+        if positions is not None:
+            if positions.ndim == 1 and input_batch_shape is not None:
+                positions = positions.reshape(input_batch_shape)
+            kwargs["position_ids"] = (
+                positions.unsqueeze(0) if positions.ndim == 1 else positions
+            )
+        if attention_masks is not None:
+            kwargs["attention_mask"] = attention_masks
+        elif padding_mask is not None:
+            valid_tokens = ~padding_mask
+            if valid_tokens.ndim == 1 and input_batch_shape is not None:
+                valid_tokens = valid_tokens.reshape(input_batch_shape)
+            kwargs["valid_token_mask"] = (
+                valid_tokens.unsqueeze(0) if valid_tokens.ndim == 1 else valid_tokens
+            )
         output_hidden_states = kwargs.pop("output_hidden_states", False)
         hidden = self.model(
             input_ids=input_ids, inputs_embeds=inputs_embeds, **kwargs
         ).last_hidden_state
+        if skip_lm_head:
+            return hidden.reshape(-1, hidden.shape[-1]) if flat_input else hidden
         logits = self.lm_head(hidden)
+        loss_logits = logits
+        if flat_input:
+            logits = logits.reshape(-1, logits.shape[-1])
         loss = None
         if labels is not None:
+            if labels.ndim == 1:
+                labels = labels.unsqueeze(0)
             loss = nn.functional.cross_entropy(
-                logits[:, :-1].float().reshape(-1, logits.shape[-1]),
+                loss_logits[:, :-1].float().reshape(-1, loss_logits.shape[-1]),
                 labels[:, 1:].reshape(-1),
                 ignore_index=-100,
             )

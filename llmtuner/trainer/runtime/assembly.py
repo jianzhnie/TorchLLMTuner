@@ -1,7 +1,7 @@
 """Build the trainer's model, parallel layout, and training services.
 
 Resolve the process group and topology, check validation feasibility, seed the
-run, and select the dense mesh. Then build the HF model, apply parallel stages,
+run, and select the dense mesh. Then build the explicit model, apply parallel stages,
 and create optimizer/scheduler/EMA services. Finally build the dataloader,
 checkpointer, counters, and metrics. Model-dependent combination guards run
 while building the model, before parallel transformations.
@@ -59,17 +59,11 @@ from ...models.common.moe.bias_update import (
 from ...models.common.moe.experts import RoutedExperts
 from ...models.configuration import (
     build_model_config_for,
+    resolve_model_class,
     unwrap_text_config,
 )
-from ...models.qwen.qwen3_5.gdn_numerics import validate_gdn_numerical_training
-from ...models.qwen.qwen3_5.linear_attention import validate_linear_attention_training
-from ...models.runtime.materialization import (
-    initialize_random_hf_model,
-    initialize_rotary_on_device,
-)
-from ...models.runtime.model import TrainingModel
 from ...parallel import compatibility
-from ...parallel.parallelize import parallelize_hf_transformers
+from ...parallel.parallelize import parallelize_model
 from ...parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
 from ...parallel.topology import build_device_mesh, resolve_parallel_topology
 from ...utils import logging as logging_utils
@@ -86,12 +80,12 @@ if TYPE_CHECKING:
 
 def _build_model(
     trainer: Trainer,
-) -> tuple[TrainingModel, PretrainedConfig, bool]:
-    """Build the HF model and resolve whether to load initial HF weights.
+) -> tuple[torch.nn.Module, PretrainedConfig, bool]:
+    """Build the registered explicit model and resolve initial weight loading.
 
-    Returns ``(model, hf_model_config, load_hf_weights)``; the model is on
-    meta device when HF weights will be loaded (they are materialized after
-    parallelism is applied, so the load sees the sharded layout).
+    Returns ``(model, model_config, load_initial_weights)``. The selected
+    implementation owns its module tree; this function only resolves config,
+    construction device and checkpoint policy.
     """
     cfg = trainer.cfg
     # PP schedules consume logits; chunked loss requires a hidden-state path.
@@ -120,19 +114,13 @@ def _build_model(
             ),
             compile=cfg.training.compile,
         )
-    hf_model_config = build_model_config_for(cfg)
+    model_config = build_model_config_for(cfg)
     # Programmatic Trainer callers need the same resolved geometry as the CLI.
     # In particular, synthetic token generation must use the real vocabulary,
     # including offline arch_overrides and local saved configurations.
-    text_config = unwrap_text_config(hf_model_config)
-    validate_linear_attention_training(
-        cfg, text_config, device=trainer.device, parallel_dims=trainer.parallel_dims
-    )
-    validate_gdn_numerical_training(
-        cfg, text_config, device=trainer.device, parallel_dims=trainer.parallel_dims
-    )
+    text_config = unwrap_text_config(model_config)
     cfg.model.update_architecture(text_config)
-    load_hf_weights = bool(
+    load_initial_weights = bool(
         cfg.checkpoint.enable
         and cfg.checkpoint.initial_load_in_hf
         and cfg.checkpoint.initial_load_path
@@ -140,7 +128,7 @@ def _build_model(
     # Kimi has an explicit full-expert HF layout adapter. Other EP families
     # still need their own checkpoint mapping before meta initialization.
     if (
-        load_hf_weights
+        load_initial_weights
         and trainer.parallel_dims is not None
         and trainer.parallel_dims.ep_enabled
         and getattr(text_config, "model_type", None) != "kimi_linear"
@@ -151,36 +139,36 @@ def _build_model(
         )
     ):
         compatibility.ep_hf_initial_load(trainer.parallel_dims.ep)
-    if not load_hf_weights and cfg.model.initialization_device == "meta":
-        if text_config.model_type not in (
-            "qwen3_5_text",
-            "qwen3_5_moe_text",
-            "kimi_linear",
-            "deepseek_v4",
-        ):
-            raise UnsupportedCombinationError(
-                "Random meta initialization requires Qwen3.5, DeepSeek V4 or Kimi; "
-                "initialization contract; other architectures need validation."
-            )
+    if not load_initial_weights and cfg.model.initialization_device == "meta":
         if any(
             degree > 1
             for degree in (
                 cfg.parallel.tp_size,
                 cfg.parallel.pp_size,
                 cfg.parallel.cp_size,
+                cfg.parallel.ep_size,
             )
-        ) or (cfg.parallel.ep_size > 1 and text_config.model_type != "kimi_linear"):
+        ):
             raise UnsupportedCombinationError(
-                "Random meta initialization supports local/DP/FSDP and local Kimi "
-                "EP; other TP/EP/PP/CP paths need an ownership-aware initializer."
+                "Random meta initialization supports local/DP/FSDP; "
+                "TP/EP/PP/CP paths need an ownership-aware initializer."
             )
-    if load_hf_weights or cfg.model.initialization_device == "meta":
+    model_class = resolve_model_class(text_config)
+    if not load_initial_weights and cfg.model.initialization_device == "meta":
+        for method in ("initialize_parameters", "materialization_buffers"):
+            if not callable(getattr(model_class, method, None)):
+                raise UnsupportedCombinationError(
+                    f"Random meta initialization requires model-owned {method}()"
+                )
+    if load_initial_weights or cfg.model.initialization_device == "meta":
         with torch.device("meta"):
-            model = TrainingModel(hf_model_config)
+            model = model_class(text_config)
     else:
-        model = TrainingModel(hf_model_config).to(trainer.device)
-        initialize_rotary_on_device(model, trainer.device)
-    return model, hf_model_config, load_hf_weights
+        model = model_class(text_config).to(trainer.device)
+        initialize_buffers = getattr(model, "initialize_training_buffers", None)
+        if callable(initialize_buffers):
+            initialize_buffers()
+    return model, model_config, load_initial_weights
 
 
 def _fsdp_managed_parameters(model: torch.nn.Module) -> set[torch.nn.Parameter]:
@@ -193,12 +181,31 @@ def _fsdp_managed_parameters(model: torch.nn.Module) -> set[torch.nn.Parameter]:
     }
 
 
+def _model_materialization_buffers(
+    model: torch.nn.Module, device: torch.device
+) -> dict[tuple[torch.nn.Module, str], torch.Tensor]:
+    """Ask the explicit model to rebuild non-checkpoint buffers.
+
+    Buffer reconstruction is a model contract. Keeping this adapter here makes
+    older explicit models fail at materialization with a useful error instead
+    of allowing uninitialized runtime state into training.
+    """
+    builder = getattr(model, "materialization_buffers", None)
+    if builder is None:
+        return {}
+    if not callable(builder):
+        raise TypeError(
+            f"{type(model).__name__}.materialization_buffers must be callable"
+        )
+    return builder(device)
+
+
 def _apply_parallelism(
-    trainer: Trainer, model: TrainingModel, *, load_hf_weights: bool
+    trainer: Trainer, model: torch.nn.Module, *, load_initial_weights: bool
 ) -> None:
-    """Apply configured parallel stages, then materialize HF-load targets."""
+    """Apply configured stages, then materialize the explicit model targets."""
     cfg = trainer.cfg
-    orchestration = parallelize_hf_transformers(
+    orchestration = parallelize_model(
         model,
         cfg=cfg.parallel,
         mesh=trainer.mesh,
@@ -245,7 +252,7 @@ def _apply_parallelism(
         trainer.model = orchestration
         trainer.model_parts = [orchestration]
 
-    if load_hf_weights or cfg.model.initialization_device == "meta":
+    if load_initial_weights or cfg.model.initialization_device == "meta":
         materialization_error: BaseException | None = None
         try:
             for model_part in trainer.model_parts:
@@ -255,9 +262,18 @@ def _apply_parallelism(
                         trainer.device,
                         parameter_device=torch.device("cpu"),
                         offloaded_parameters=_fsdp_managed_parameters(model_part),
+                        runtime_buffers=_model_materialization_buffers(
+                            model_part, trainer.device
+                        ),
                     )
                 else:
-                    materialize_meta_model(model_part, trainer.device)
+                    materialize_meta_model(
+                        model_part,
+                        trainer.device,
+                        runtime_buffers=_model_materialization_buffers(
+                            model_part, trainer.device
+                        ),
+                    )
         except BaseException as error:
             materialization_error = error
         # FSDP _apply may manage communication state. Finish materialization
@@ -265,14 +281,21 @@ def _apply_parallelism(
         with synchronize_local_errors("Model materialization"):
             if materialization_error is not None:
                 raise materialization_error
-        if not load_hf_weights:
+        if not load_initial_weights:
             initialization_error: BaseException | None = None
             try:
                 for model_part in trainer.model_parts:
-                    hf_model = model_part.model
+                    initialize_model = getattr(
+                        model_part, "initialize_parameters", None
+                    )
+                    if not callable(initialize_model):
+                        raise TypeError(
+                            f"{type(model_part).__name__} must implement "
+                            "initialize_parameters() for meta initialization"
+                        )
                     # DTensor initialization may communicate. Complete it
                     # outside the local-only boundary, just like materialization.
-                    initialize_random_hf_model(hf_model)
+                    initialize_model()
             except BaseException as error:
                 initialization_error = error
             with synchronize_local_errors("Random model initialization"):
@@ -336,7 +359,7 @@ def _build_optimizer_stack(trainer: Trainer) -> None:
         )
 
 
-def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> None:
+def _build_checkpointer(trainer: Trainer, model_config: PretrainedConfig) -> None:
     """Register model, optimizer, schedule, EMA, and resumable runtime state.
 
     The trainer carries step/token counters; the dataloader carries its cursor.
@@ -362,16 +385,20 @@ def _build_checkpointer(trainer: Trainer, hf_model_config: PretrainedConfig) -> 
             ),
         }
         sd_adapter = ModelStateDictAdapter(
-            hf_model_config,
+            model_config,
             cfg.checkpoint.initial_load_path or cfg.hf_model,
-            model_prefix="model.",
+            # Explicit causal-LM implementations expose the canonical
+            # ``model.*`` tree directly. The legacy wrapper used
+            # ``model.model.*`` and must opt into that prefix at its own
+            # compatibility boundary instead of being assumed here.
+            model_prefix="",
             qwen3_expert_parallel=(
-                getattr(hf_model_config, "model_type", None) == "qwen3_moe"
+                getattr(model_config, "model_type", None) == "qwen3_moe"
                 and cfg.parallel.ep_size > 1
                 and cfg.checkpoint.sharded_expert_parallel
             ),
             kimi_expert_parallel=(
-                getattr(hf_model_config, "model_type", None) == "kimi_linear"
+                getattr(model_config, "model_type", None) == "kimi_linear"
                 and cfg.parallel.ep_size > 1
             ),
         )
@@ -457,7 +484,7 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
 
     # Build the model before optimizer services capture its parameters.
     with synchronize_local_errors("Model construction"):
-        model, hf_model_config, load_hf_weights = _build_model(trainer)
+        model, model_config, load_initial_weights = _build_model(trainer)
         # Count unique logical parameters before TP/EP/PP/FSDP change ownership.
         num_parameters = sum(parameter.numel() for parameter in model.parameters())
         num_trainable_parameters = sum(
@@ -465,7 +492,7 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
             for parameter in model.parameters()
             if parameter.requires_grad
         )
-    _apply_parallelism(trainer, model, load_hf_weights=load_hf_weights)
+    _apply_parallelism(trainer, model, load_initial_weights=load_initial_weights)
     _build_optimizer_stack(trainer)
 
     # The checkpointer captures the loader cursor alongside model state.
@@ -477,11 +504,11 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
     trainer.step = 0
     trainer.ntokens_seen = 0
 
-    _build_checkpointer(trainer, hf_model_config)
+    _build_checkpointer(trainer, model_config)
 
-    # Metrics use the resolved topology and HF geometry of the model built above.
+    # Metrics use the resolved topology and model configuration built above.
     with synchronize_local_errors("Metrics construction"):
-        text_config = unwrap_text_config(hf_model_config)
+        text_config = unwrap_text_config(model_config)
         trainer.metrics = MetricsProcessor(
             cfg.metrics,
             parallel_dims=trainer.parallel_dims,

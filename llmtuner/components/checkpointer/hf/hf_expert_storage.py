@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,35 +14,15 @@ from torch.distributed.checkpoint.metadata import (
     TensorStorageMetadata,
 )
 
+from ....models.qwen.qwen3.state import (
+    HF_PROJECTIONS,
+    grouped_expert_key,
+    native_ep_expert_key,
+)
+from ....models.qwen.qwen3.state import (
+    NATIVE_PROJECTIONS as NATIVE_PROJECTIONS,
+)
 from .hf_storage import IndexedHuggingFaceStorageReader
-
-NATIVE_PROJECTIONS = {
-    "gate_proj": "w1_EFD",
-    "up_proj": "w3_EFD",
-    "down_proj": "w2_EDF",
-}
-HF_PROJECTIONS = {name: projection for projection, name in NATIVE_PROJECTIONS.items()}
-
-
-def grouped_expert_key(key: str) -> tuple[str, int, str] | None:
-    match = re.fullmatch(
-        r"(.+\.mlp\.experts\.)(\d+)\.(gate_proj|up_proj|down_proj)\.weight", key
-    )
-    if match is None:
-        return None
-    prefix, expert, projection = match.groups()
-    target = "down_proj" if projection == "down_proj" else "gate_up_proj"
-    return prefix + target, int(expert), projection
-
-
-def native_ep_expert_key(key: str) -> str:
-    """Map an individual HF projection to its native EP stack FQN."""
-    mapped = grouped_expert_key(key)
-    if mapped is None:
-        return key
-    projection = mapped[2]
-    role = NATIVE_PROJECTIONS[projection]
-    return key.rsplit("experts.", 1)[0] + "routed_experts.inner_experts." + role
 
 
 @dataclass

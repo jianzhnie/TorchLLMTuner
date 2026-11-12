@@ -3,10 +3,9 @@
 Semantics vendored from torchtitan's ``CastLinear``: the vocabulary logits are
 scored in a configured dtype regardless of the dtype the rest of the model
 runs in, because bf16 logits lose the precision the loss (and RL logprob/KL
-math downstream of it) needs. Upstream swaps the lm_head's config node inside
-its model-config tree; llmtuner has no config tree, so the swap happens at model
-build time in ``models/runtime/model_setup.py`` and this file carries only the module
-and the replacement builder.
+math downstream of it) needs. Explicit models choose their output projection
+at construction through ``build_lm_head``. The replacement builder remains
+available for callers that already own a projection and must keep its parameters.
 
 The class is an ``nn.Linear`` subclass rather than a wrapper around one on
 purpose: a wrapper would register the original projection as a child and
@@ -23,7 +22,33 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["CastLinear", "build_cast_linear"]
+__all__ = ["CastLinear", "build_cast_linear", "build_lm_head"]
+
+
+def build_lm_head(
+    hidden_size: int, vocab_size: int, *, compute_dtype: str | None = None
+) -> nn.Linear:
+    """Build the declared output projection with one normal initialization.
+
+    The default is an ordinary Linear. CastLinear uses the same constructor
+    and parameter layout; model post_init and weight tying still own the
+    initialization lifecycle. Reject unknown policies before allocating storage.
+    """
+    if compute_dtype is None:
+        return nn.Linear(hidden_size, vocab_size, bias=False)
+    dtypes = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    if not isinstance(compute_dtype, str) or compute_dtype not in dtypes:
+        raise ValueError(
+            "lm_head compute_dtype must be float32, float16, bfloat16 or None, "
+            f"got {compute_dtype!r}"
+        )
+    return CastLinear(
+        hidden_size, vocab_size, bias=False, compute_dtype=dtypes[compute_dtype]
+    )
 
 
 class CastLinear(nn.Linear):

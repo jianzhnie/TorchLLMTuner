@@ -613,7 +613,7 @@ def apply_ac(
     layers = getattr(model, "layers", None)
     if not isinstance(layers, nn.Module):
         raise TypeError(
-            f"apply_ac expects a TrainingModel (with .layers as nn.Module); got "
+            f"apply_ac expects an explicit model (with .layers as nn.Module); got "
             f"{type(model).__name__}."
         )
 

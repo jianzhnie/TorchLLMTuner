@@ -46,13 +46,14 @@
 Projection names preserve the dense and expert checkpoint layouts.
 """
 
-from torch import nn
+from torch import Tensor, nn
 from transformers.activations import ACT2FN
 
 from ...common.activation import SituGLU
+from .configuration import KimiLinearConfig
 
 
-def build_kimi_activation(config) -> nn.Module:
+def build_kimi_activation(config: KimiLinearConfig) -> nn.Module:
     """Construct a fresh activation for a dense or individual-expert MLP."""
     if config.hidden_act != "situ":
         return ACT2FN[config.hidden_act]
@@ -61,7 +62,9 @@ def build_kimi_activation(config) -> nn.Module:
 
 
 class KimiMLP(nn.Module):
-    def __init__(self, config):
+    """Dense/shared gated MLP with external checkpoint projection names."""
+
+    def __init__(self, config: KimiLinearConfig) -> None:
         super().__init__()
         self.gate_proj = nn.Linear(
             config.hidden_size, config.intermediate_size, bias=False
@@ -75,7 +78,7 @@ class KimiMLP(nn.Module):
         self.situ = config.hidden_act == "situ"
         self.act_fn = build_kimi_activation(config)
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         gate, up = self.gate_proj(x), self.up_proj(x)
         return self.down_proj(
             self.act_fn(gate, up) if self.situ else self.act_fn(gate) * up
@@ -83,7 +86,14 @@ class KimiMLP(nn.Module):
 
 
 class KimiExpertMLP(nn.Module):
-    def __init__(self, config, hidden_size, intermediate_size):
+    """Individual routed expert; weighting belongs to the enclosing MoE."""
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        hidden_size: int,
+        intermediate_size: int,
+    ) -> None:
         super().__init__()
         self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
@@ -91,6 +101,6 @@ class KimiExpertMLP(nn.Module):
         self.situ = config.hidden_act == "situ"
         self.act_fn = build_kimi_activation(config)
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         gate, up = self.w1(x), self.w3(x)
         return self.w2(self.act_fn(gate, up) if self.situ else self.act_fn(gate) * up)

@@ -1,17 +1,17 @@
-"""Construct an EP-capable MoE from a probed HF block and copy its weights."""
+"""Build EP execution from resolved expert layout and routing declarations."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from llmtuner.parallel.expert_parallel.domino_dispatch import DominoRoutedExperts
-
 from ...accelerator.device import device_type
 from ...accelerator.distributed import get_rank, get_world_size
+from ...errors import UnsupportedCombinationError
 from ...models.common.aux_loss import AuxLoss
 from ...models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
 from ...models.common.moe.experts import (
@@ -19,25 +19,16 @@ from ...models.common.moe.experts import (
     RoutedExperts,
 )
 from ...models.common.moe.layer import MoE
+from ...models.common.moe.packed_expert_execution import forward_packed_experts
 from ...models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
-from ...models.qwen.qwen3.experts import forward_torchtitan_moe
+from ...models.contracts import MoEBlockContract
 from .. import compatibility
 from ..tensor_parallel.linear_ops import all_gather_along, reduce_scatter_along
 from .checkpointing import mark_experts_ep_sharded
-from .hf_inspection import (
-    FusedExperts,
-    fused_experts_of,
-    read_expert_groups,
-    read_route_norm,
-    read_route_scale,
-    resolve_score_func,
-    resolve_shared_expert,
-    resolve_top_k,
-    router_of,
-)
+from .domino_dispatch import DominoRoutedExperts
 from .mc2_dispatch import MC2GroupedExperts, MC2RoutedExperts
 from .npu_baseline_experts import (
     NpuBaselineAllToAllTokenDispatcher,
@@ -50,6 +41,22 @@ from .token_dispatch import (
     materialize,
 )
 from .torchao_dispatch import TorchAOTokenDispatcher
+
+
+def _legacy_inspection():
+    """Load external-layout probes only when a legacy block needs them."""
+    from . import hf_inspection
+
+    return hf_inspection
+
+
+class PackedExpertViews(NamedTuple):
+    """Views of an explicitly declared fused gate/up expert storage."""
+
+    gate_EFD: torch.Tensor
+    up_EFD: torch.Tensor
+    down_EDF: torch.Tensor
+    num_experts: int
 
 
 class FeatureParallelMoE(MoE):
@@ -107,24 +114,47 @@ class MoERoutingBinding:
     route_scale: float
     num_expert_groups: int | None
     num_limited_groups: int | None
+    shared_gate: nn.Module | None = None
 
 
 def resolve_moe_routing(block: nn.Module) -> MoERoutingBinding:
     """Read an explicit model contract or the legacy routing adapter once."""
-    router = router_of(block)
-    top_k = resolve_top_k(block)
+    contract = getattr(block, "moe_contract", None)
+    if contract is not None:
+        if not isinstance(contract, MoEBlockContract):
+            raise TypeError("moe_contract must be a MoEBlockContract")
+        router, _, shared = contract.bind(block)
+        return MoERoutingBinding(
+            source=block,
+            router=router,
+            shared=shared,
+            shared_gate=(
+                block._modules[contract.shared_expert_gate]
+                if contract.shared_expert_gate is not None
+                else None
+            ),
+            top_k=contract.top_k,
+            score_func=contract.score_func,
+            route_norm=contract.route_norm,
+            route_scale=contract.route_scale,
+            num_expert_groups=contract.num_expert_groups,
+            num_limited_groups=contract.num_limited_groups,
+        )
+    inspection = _legacy_inspection()
+    router = inspection.router_of(block)
+    top_k = inspection.resolve_top_k(block)
     if router is None or top_k is None:
         raise ValueError("MoE conversion requires a router and top-k declaration")
-    _, shared = resolve_shared_expert(block)
-    groups, limited = read_expert_groups(block, router)
+    _, shared = inspection.resolve_shared_expert(block)
+    groups, limited = inspection.read_expert_groups(block, router)
     return MoERoutingBinding(
         source=block,
         router=router,
         shared=shared,
         top_k=top_k,
-        score_func=resolve_score_func(block, router),
-        route_norm=read_route_norm(block, router),
-        route_scale=read_route_scale(block, router),
+        score_func=inspection.resolve_score_func(block, router),
+        route_norm=inspection.read_route_norm(block, router),
+        route_scale=inspection.read_route_scale(block, router),
         num_expert_groups=groups,
         num_limited_groups=limited,
     )
@@ -157,11 +187,11 @@ class PackedExpertBinding:
         ):
             raise ValueError("Stale EP packed expert binding")
 
-    def projections(self, block: nn.Module) -> FusedExperts:
+    def projections(self, block: nn.Module) -> PackedExpertViews:
         """Create only role-specific views of the validated live parameters."""
         self.validate(block)
         hidden = self.shape[1] // 2
-        return FusedExperts(
+        return PackedExpertViews(
             self.gate_up[:, :hidden],
             self.gate_up[:, hidden:],
             self.down,
@@ -173,16 +203,73 @@ def resolve_packed_experts(
     block: nn.Module, *, degree: int
 ) -> PackedExpertBinding | None:
     """Bind fused parameter storage; keep legacy per-expert conversion separate."""
+    if type(degree) is not int or degree < 1:
+        raise ValueError("EP degree must be a positive integer")
+    contract = getattr(block, "moe_contract", None)
+    if contract is not None and not isinstance(contract, MoEBlockContract):
+        raise TypeError("moe_contract must be a MoEBlockContract")
     owner = block._modules.get("experts")
     if owner is None:
+        if contract is not None:
+            raise ValueError("Declared fused experts require an experts child module")
         return None
     gate_up = owner._parameters.get("gate_up_proj")
     down = owner._parameters.get("down_proj")
     if not isinstance(gate_up, nn.Parameter) or not isinstance(down, nn.Parameter):
+        if contract is not None:
+            raise ValueError(
+                "Declared fused experts require gate_up_proj and down_proj parameters"
+            )
         return None
-    # The existing adapter owns activation, bias and packed-half validation.
-    # For fused tensors this returns views, never stacked or copied parameters.
-    experts = fused_experts_of(block)
+    # Validate rank before indexing geometry, including direct resolver calls.
+    if gate_up.ndim != 3 or down.ndim != 3:
+        raise ValueError("EP fused gate/up requires rank-3 expert parameters")
+    # Explicit contracts own mathematical restrictions; legacy layouts retain
+    # their adapter. Fused tensors only produce views, never copied parameters.
+    if contract is not None:
+        if contract.activation != "silu":
+            raise UnsupportedCombinationError(
+                f"EP grouped experts require SiLU, but the model declares "
+                f"{contract.activation!r}; retain the native expert path"
+            )
+        num_experts = contract.num_experts
+        router, _, _ = contract.bind(block)
+        weight = router._parameters.get("weight")
+        if not isinstance(weight, nn.Parameter) or tuple(weight.shape) != (
+            num_experts,
+            gate_up.shape[2],
+        ):
+            raise ValueError(
+                "Declared MoE router weight must have shape "
+                "[num_experts, hidden_size] matching packed expert storage"
+            )
+        if len({weight.device, gate_up.device, down.device}) != 1:
+            raise UnsupportedCombinationError(
+                "Declared MoE router and experts are on different devices"
+            )
+        if tuple(gate_up.shape) != (
+            num_experts,
+            gate_up.shape[1],
+            gate_up.shape[2],
+        ) or tuple(down.shape) != (
+            num_experts,
+            down.shape[1],
+            down.shape[2],
+        ):
+            raise ValueError("Declared MoE expert count differs from packed storage")
+        if gate_up.shape[1] % 2 != 0 or tuple(down.shape[1:]) != (
+            gate_up.shape[2],
+            gate_up.shape[1] // 2,
+        ):
+            raise ValueError("Declared fused gate/up expert geometry is invalid")
+        experts = PackedExpertViews(
+            gate_up[:, : gate_up.shape[1] // 2],
+            gate_up[:, gate_up.shape[1] // 2 :],
+            down,
+            num_experts,
+        )
+    else:
+        experts = _legacy_inspection().fused_experts_of(block)
     if experts is None:
         raise ValueError("EP packed expert layout is not supported")
     if experts.num_experts < 1 or experts.num_experts % degree:
@@ -215,7 +302,20 @@ def validate_moe_conversion(
     if getattr(routing.router, "bias", None) is not None:
         compatibility.router_bias(routing.router)
     if routing.shared is not None:
-        if hasattr(block, "shared_expert_gate"):
+        if any(
+            value.device != routing.router.weight.device
+            for value in (
+                *routing.shared.parameters(),
+                *routing.shared.buffers(),
+            )
+        ):
+            raise UnsupportedCombinationError(
+                "MoE shared expert and router are on different devices"
+            )
+        if routing.shared_gate is not None or (
+            getattr(block, "moe_contract", None) is None
+            and hasattr(block, "shared_expert_gate")
+        ):
             compatibility.shared_expert_gate(block)
         if tp_enabled and not (
             getattr(block, "_tp_moe_boundary", False) and not has_ep_group
@@ -229,7 +329,7 @@ def validate_moe_conversion(
     original_forward = block.__dict__.get("_tp_moe_original_forward", block.forward)
     baseline_npu = (
         device_type == "npu"
-        and getattr(original_forward, "__func__", None) is forward_torchtitan_moe
+        and getattr(original_forward, "__func__", None) is forward_packed_experts
     )
     if baseline_npu:
         if token_dispatcher != "alltoall":
@@ -273,7 +373,7 @@ def convert_block(
     experts = (
         packed_experts.projections(block)
         if packed_experts is not None
-        else fused_experts_of(block)
+        else _legacy_inspection().fused_experts_of(block)
     )
     if experts is None:
         raise ValueError("MoE conversion requires a supported expert layout")

@@ -58,10 +58,10 @@ from .tensor_parallel.tensor_parallel import (
 )
 from .topology import ParallelTopology
 
-__all__ = ["parallelize_hf_transformers"]
+__all__ = ["parallelize_model", "parallelize_hf_transformers"]
 
 
-def parallelize_hf_transformers(
+def parallelize_model(
     model: nn.Module,
     *,
     cfg: ParallelConfig,
@@ -80,7 +80,7 @@ def parallelize_hf_transformers(
     global_batch_size: int | None = None,
     chunked_loss_num_chunks: int = 1,
 ) -> nn.Module | PipelineParallelSetup:
-    """Transform a model using parallel config and explicit training options.
+    """Transform an explicit model using parallel config and training options.
 
     Compilation and activation-checkpoint options apply identically to dense
     models and PP parts. Memory-budget checkpointing requires compilation;
@@ -285,3 +285,10 @@ def parallelize_hf_transformers(
         with synchronize_local_errors("Tensor parallel plan validation"):
             resolved_tp_plan = resolve_tp_plan(model, cfg=cfg)
     return apply_stages(model, dense_mesh=mesh, resolved_tp_plan=resolved_tp_plan)
+
+
+def parallelize_hf_transformers(
+    model: nn.Module, **kwargs
+) -> nn.Module | PipelineParallelSetup:
+    """Compatibility alias for callers migrating from the HF adapter name."""
+    return parallelize_model(model, **kwargs)

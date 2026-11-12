@@ -58,12 +58,28 @@ def source_destinations(
     flat = {}
     selected = {}
     destinations = {}
+    training_categories = {
+        OPTIMIZER,
+        EMA,
+        LR_SCHEDULER,
+        DATALOADER,
+        TRAIN_STATE,
+        RNG_STATE,
+    }
     for key, entry in metadata.state_dict_metadata.items():
         path = paths[key]
         # Preserve storage FQNs for DCP reads, but reconstruct the stable
         # model/optimizer/EMA paths expected by the layout converters.
         root = canonical_fqn(str(path[0]), wrapper_segments=("_orig_mod",))
-        if root in (OPTIMIZER, EMA) or root.startswith("model."):
+        # DCP stores model state as flat tensor FQNs, alongside nested training
+        # categories. Explicit models also own roots such as lm_head.weight;
+        # the historical wrapper's model.* prefix is not a model contract.
+        model_tensor = (
+            len(path) == 1
+            and isinstance(entry, TensorStorageMetadata)
+            and root not in training_categories
+        )
+        if root in (OPTIMIZER, EMA) or model_tensor:
             path = tuple(
                 canonical_fqn(segment, wrapper_segments=("_orig_mod",))
                 if isinstance(segment, str)
@@ -72,7 +88,7 @@ def source_destinations(
             )
         if path[0] in {OPTIMIZER, EMA} and path[0] not in states:
             continue
-        if path[0] in states or str(path[0]).startswith("model."):
+        if path[0] in states or model_tensor:
             destination = tuple(path)
             if destination in destinations:
                 raise ValueError(

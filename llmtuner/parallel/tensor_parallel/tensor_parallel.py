@@ -37,8 +37,8 @@ feature-sharded GEMMs (``ColwiseLinearNoGather``), and its o_proj keeps the
 fused reduce-scatter, which returns the activation to the sequence shard. The
 MLP has no such shape derivation, so gate/up/down keep the fused realizers.
 
-Scope: this is the mechanism. No meta-init (weights come from the HF model as
-usual), no fused QKV (HF keeps q/k/v as separate projections), no FP8.
+Scope: this is the mechanism. Model initialization and state loading are owned
+by the explicit model; no fused QKV or FP8 path is assumed here.
 """
 
 from __future__ import annotations
@@ -52,13 +52,15 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.errors import UnsupportedCombinationError
 
 from ...accelerator.capabilities import has
 from ...models.common.moe.experts import GroupedExperts
+from ...models.common.moe.layer import MoE, declared_moe_block
+from ...models.contracts import DecoderStructure, MoEBlockContract
 from ...utils.logging import get_logger
 from .. import compatibility
 from ..attention_heads import require_heads_divisible_by
-from ..expert_parallel.hf_inspection import is_hf_moe_block, resolve_shared_expert
 from ..module_patterns import module_name_matches, resolve_module_patterns
 from ..plan import ParallelPlan, PlanTarget, ReplacementObserver
 from ..vocab_parallel.vocab_parallel import VocabParallelEmbedding
@@ -72,6 +74,37 @@ from .linear_ops import (
     reduce_scatter_along,
     resolve_autograd_collectives,
 )
+
+
+def _is_model_declared_moe(module: nn.Module) -> bool:
+    """Recognize an explicit MoE contract without inspecting class names."""
+    return isinstance(module, MoE) or isinstance(
+        getattr(module, "moe_contract", None), MoEBlockContract
+    )
+
+
+def _legacy_inspection():
+    """Load external-layout probes only when no model contract is present."""
+    from ..expert_parallel import hf_inspection
+
+    return hf_inspection
+
+
+def _resolve_shared_expert(block: nn.Module):
+    """Resolve shared experts from the model contract before legacy probing."""
+    contract = getattr(block, "moe_contract", None)
+    if isinstance(contract, MoEBlockContract):
+        _, name, shared = contract.bind(block)
+        return name, shared
+    return _legacy_inspection().resolve_shared_expert(block)
+
+
+def _is_moe_block(module: nn.Module) -> bool:
+    """Prefer explicit ownership; retain legacy probing for external models."""
+    return _is_model_declared_moe(module) or _legacy_inspection().is_hf_moe_block(
+        module
+    )
+
 
 logger = get_logger(__name__)
 
@@ -308,6 +341,12 @@ def looks_like_attention(module: nn.Module) -> bool:
 
 def requires_full_token_history(module: nn.Module) -> bool:
     """Whether a recurrent attention contract needs the complete token history."""
+    declared = getattr(module, "requires_full_token_history", None)
+    if declared is not None:
+        if type(declared) is not bool:
+            raise ValueError("requires_full_token_history must be a bool")
+        return declared
+    # Compatibility for external modules without an explicit declaration.
     return all(hasattr(module, name) for name in ("conv1d", "A_log", "dt_bias"))
 
 
@@ -416,7 +455,7 @@ def shard_shared_expert_for_tp(
     like the routed experts').
     """
     shared_name, shared = (
-        resolve_shared_expert(block) if shared_binding is None else shared_binding
+        _resolve_shared_expert(block) if shared_binding is None else shared_binding
     )
     assert shared is not None  # the caller checked
     names: set[str] = set()
@@ -566,18 +605,19 @@ def rowwise() -> ShardingConfig:
 def model_tp_config(model: nn.Module) -> Mapping[str, str | ShardingConfig]:
     """The TP plan ``model`` declares, or ``{}``.
 
-    Prefers the ``tp_config`` property over the raw ``_tp_config`` attribute.
-    ``transformers`` exposes the plan as a property on ``PreTrainedModel`` (its
-    instance ``_tp_config`` built from ``config.base_model_tp_config`` plus each
-    child module's own plan), and ``TrainingModel`` re-parents the HF model
-    under ``self.model``, so *its* plan has to be rewritten to survive the extra
-    level. A wrapper that exposes only the property -- the shape HF itself
-    guarantees -- would otherwise be read as "no plan" and shard nothing, so
-    this is the one place the two spellings are reconciled.
+    Prefers the explicit model's ``tp_config`` property and keeps legacy plan
+    attributes only at the external compatibility boundary.
     """
+    declared = getattr(model, "tp_config", None)
+    if declared is not None:
+        return declared
+    # Explicit model contracts must not inherit private plans from a reference
+    # base class. Those plans are often relative to another module tree and an
+    # empty explicit declaration must fail before any sharding occurs.
+    if getattr(model, "decoder_structure", None) is not None:
+        return {}
     return (
-        getattr(model, "tp_config", None)
-        or getattr(model, "_tp_config", None)
+        getattr(model, "_tp_config", None)
         or getattr(model, "_tp_plan", None)
         or getattr(model, "tp_plan", None)
         or {}
@@ -836,12 +876,34 @@ def resolve_tp_targets(
     plan_declares_moe = any(
         isinstance(spec, str) and spec in MOE_PLAN_SPECS for spec in raw_plan.values()
     )
+    structure = getattr(model, "decoder_structure", None)
+    if plan_declares_moe and isinstance(structure, DecoderStructure):
+        for layer in model.get_submodule(structure.blocks):
+            declaration = declared_moe_block(layer)
+            if declaration is None:
+                raise ValueError(
+                    "Explicit TP decoder requires moe_block_name "
+                    "(None for a dense layer)"
+                )
+            name, block = declaration
+            if block is not None and not _is_model_declared_moe(block):
+                raise UnsupportedCombinationError(
+                    f"Declared MoE slot {type(layer).__name__}.{name} requires "
+                    "a model-owned MoEBlockContract for TP planning"
+                )
     # tp x ep: TP shards only the dense parts and EP owns the routed experts
     # (the upstream alignment). The HF blocks are left whole here and swapped
     # for the native MoE stack by apply_ep, which runs next; the swapped block
     # consumes and produces the T/tp sequence shard directly (all-to-all
     # dispatch), so no sequence-boundary collectives are installed either.
     moe_deferred_to_ep = plan_declares_moe and cfg.ep_size > 1
+    # Explicit models own sparse-block declarations. Never import/probe legacy
+    # HF layouts while walking their dense children or unrelated modules.
+    is_moe_block = (
+        _is_model_declared_moe
+        if isinstance(getattr(model, "decoder_structure", None), DecoderStructure)
+        else _is_moe_block
+    )
     moe_blocks: list[tuple[str, nn.Module]] = []
     bracketed_paths: list[str] = []
     if plan_declares_moe and not moe_deferred_to_ep:
@@ -853,7 +915,7 @@ def resolve_tp_targets(
                 continue
             # Blocks the probe refuses (GPT-OSS's transposed, bias-bearing
             # experts) raise out of it here, before any weight is touched.
-            if is_hf_moe_block(module):
+            if is_moe_block(module):
                 moe_blocks.append((module_path, module))
         if not moe_blocks and not bracketed_paths:
             compatibility.tp_moe_specs_without_block(cfg.tp_size, model)
@@ -886,7 +948,7 @@ def resolve_tp_targets(
         path
         for path, module in model.named_modules()
         if path not in moe_block_paths
-        and is_hf_moe_block(module)
+        and is_moe_block(module)
         and not getattr(module, "_tp_moe_boundary", False)
     )
     if moe_block_paths or bracketed_paths:
@@ -976,7 +1038,7 @@ def realize_moe_blocks_tp(
     inside the sequence boundary.
     """
     bindings = (
-        {block: resolve_shared_expert(block) for _, block in moe_blocks}
+        {block: _resolve_shared_expert(block) for _, block in moe_blocks}
         if shared_bindings is None
         else shared_bindings
     )
@@ -1058,6 +1120,15 @@ def resolve_tp_plan(
         validate(tp_degree=cfg.tp_size, ep_degree=cfg.ep_size)
     # Resolve targets once before accessing process groups or changing weights.
     raw_plan = model_tp_config(model) if plan is None else plan
+    if (
+        plan is None
+        and getattr(model, "decoder_structure", None) is not None
+        and not raw_plan
+    ):
+        raise UnsupportedCombinationError(
+            f"{type(model).__name__} must declare tp_config or receive an explicit "
+            "TP plan; an empty plan would silently leave the model replicated"
+        )
     targets, moe_blocks = resolve_tp_targets(model, cfg=cfg, plan=raw_plan)
     vocab_targets = resolve_vocab_parallel_targets(model, raw_plan)
 
@@ -1068,11 +1139,22 @@ def resolve_tp_plan(
     # config parse (upstream torchtitan ``config/validation.py``'s
     # ``head_shard_degree``); here the
     # model's own config is the first place the counts exist.
-    attention_paths = [
-        path
-        for path, _ in model.named_modules()
-        if path.rsplit(".", 1)[-1] == "self_attn"
-    ]
+    structure = getattr(model, "decoder_structure", None)
+    if isinstance(structure, DecoderStructure) and structure.attention is not None:
+        declared_attentions = {
+            id(module) for module in structure.bind_attentions(model)
+        }
+        attention_paths = [
+            path
+            for path, module in model.named_modules()
+            if id(module) in declared_attentions
+        ]
+    else:
+        attention_paths = [
+            path
+            for path, _ in model.named_modules()
+            if path.rsplit(".", 1)[-1] == "self_attn"
+        ]
     attention_is_sharded = any(
         any(path.startswith(f"{attention}.") for attention in attention_paths)
         for path, _, _ in targets
@@ -1098,7 +1180,7 @@ def resolve_tp_plan(
     # identical column slice, and the shared realizer preserves that identity.
     # Reject all other aliases before any constructor or MoE mutation runs.
     for module_path, block in moe_blocks:
-        shared_name, shared = resolve_shared_expert(block)
+        shared_name, shared = _resolve_shared_expert(block)
         prefix = f"{module_path}." if module_path else ""
         tied_shared_paths = {
             f"{prefix}{shared_name}.{name}.weight" for name in ("gate_proj", "up_proj")
@@ -1160,16 +1242,7 @@ def resolve_tp_plan(
     replicated_attention = [
         module
         for path, module in model.named_modules()
-        if (
-            path.rsplit(".", 1)[-1] == "self_attn"
-            or (
-                path.rsplit(".", 1)[-1] == "linear_attn"
-                and any(
-                    cls.__name__ in {"Qwen3_5GatedDeltaNet", "Qwen3_5MoeGatedDeltaNet"}
-                    for cls in type(module).__mro__
-                )
-            )
-        )
+        if (path in attention_paths or requires_full_token_history(module))
         and not hasattr(module, "_tp_seq_group")
         and not any(target.startswith(f"{path}.") for target, _, _ in targets)
     ]
@@ -1177,10 +1250,8 @@ def resolve_tp_plan(
     # though HF's colwise_gather_output projections stay replicated here.
     # Head-sharded GDN requires a different boundary and is not implemented.
     for path, module in model.named_modules():
-        if (
-            path.rsplit(".", 1)[-1] == "linear_attn"
-            and requires_full_token_history(module)
-            and any(target.startswith(f"{path}.") for target, _, _ in targets)
+        if requires_full_token_history(module) and any(
+            target.startswith(f"{path}.") for target, _, _ in targets
         ):
             raise ValueError("TP linear_attn requires replicated GDN projections")
 
@@ -1200,7 +1271,7 @@ def resolve_tp_plan(
 
     shared_bindings = {}
     for path, block in moe_blocks:
-        binding = resolve_shared_expert(block)
+        binding = _resolve_shared_expert(block)
         validate_moe_tp_target(path, block, tp_size=cfg.tp_size, shared_binding=binding)
         shared_bindings[block] = binding
 
@@ -1239,8 +1310,13 @@ def resolve_tp_plan(
         degree=cfg.tp_size,
         implementation="unbound",
         operations=("shard", "install_sequence_boundaries"),
+        token_history_requirements=tuple(
+            (path, getattr(module, "requires_full_token_history", None))
+            for path, module in model.named_modules()
+        ),
         module_bindings=tuple(model.named_modules(remove_duplicate=False)),
         parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+        buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
     )
 
 
@@ -1261,8 +1337,11 @@ def apply_tp(
     """
     if cfg.tp_size <= 1:
         return model
+    # Validate model geometry before touching the mesh or resolving targets.
+    # This keeps configuration errors deterministic even for callers that pass
+    # a sentinel or partially constructed mesh during preflight.
+    validate_tp_model_options(model)
     if mesh is None:
-        validate_tp_model_options(model)
         raise ValueError(f"tp={cfg.tp_size} requires a device mesh with a 'tp' axis")
     if resolved_plan is not None and plan is not None:
         raise ValueError("Pass either plan or resolved_plan, not both")

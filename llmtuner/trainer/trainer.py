@@ -186,8 +186,8 @@ class Trainer:
 
         Unlike ``self.model`` (``None`` under PP, where this rank holds several
         chunks and the schedule drives them), every rank keeps a module that can
-        run ``preprocess_inputs``: the first stage owns the embedding chunk. The
-        PP path already assumes as much -- that is how it builds the schedule.
+        run ``prepare_inputs`` using its declared input contract. Non-first
+        stages prepare the same input metadata without owning an embedding.
         """
         return self.model if self.model is not None else self.model_parts[0]
 
@@ -233,7 +233,7 @@ class Trainer:
         that comes back from here is *not* an average.
 
         Two bodies, matching torchtitan's split. The PP one takes the raw batch
-        and calls ``preprocess_inputs`` itself, once per schedule micro-batch;
+        and calls ``prepare_inputs`` itself, once per schedule micro-batch;
         the non-PP one preprocesses here, because it has exactly one.
 
         ``global_valid_tokens`` is the step's denominator, reduced across the DP
@@ -278,6 +278,9 @@ class Trainer:
                 # non-chunked path applies inside the graph) and returns the
                 # detached sum.
                 hidden_states = self.model(inputs, **extra_kwargs, skip_lm_head=True)
+                hidden_states = self._model_output_value(
+                    hidden_states, field="last_hidden_state"
+                )
                 return chunked_lm_head_cross_entropy(
                     self.model.lm_head,
                     hidden_states,
@@ -286,7 +289,7 @@ class Trainer:
                     grad_scale=1.0 / global_valid_tokens,
                     **self.loss_vocab_kwargs(),
                 )
-            logits = self.model(inputs, **extra_kwargs)
+            logits = self._model_output_value(self.model(inputs, **extra_kwargs))
             loss_sum = self.loss_sum(logits, labels, **self.loss_vocab_kwargs())
             del logits
             # Normalize BEFORE backward, while the sum is still differentiable.
@@ -300,6 +303,25 @@ class Trainer:
             # -- it is the division that is linear, not an extra op.
             (loss_sum / global_valid_tokens).backward()
         return loss_sum.detach()
+
+    @staticmethod
+    def _model_output_value(output: Any, *, field: str = "logits") -> torch.Tensor:
+        """Normalize explicit model outputs at the Trainer I/O boundary.
+
+        Explicit models may return a tensor or a Transformers-compatible
+        ``ModelOutput``. The Trainer owns loss accounting, so it consumes the
+        declared tensor field once here instead of forcing every model to
+        duplicate a training-only return type.
+        """
+        if isinstance(output, torch.Tensor):
+            return output
+        value = getattr(output, field, None)
+        if isinstance(value, torch.Tensor):
+            return value
+        raise TypeError(
+            f"Model output must be a Tensor or expose tensor .{field}; got "
+            f"{type(output).__name__}"
+        )
 
     def loss_vocab_kwargs(self) -> dict[str, Any]:
         """The vocab-parallel arguments for the loss seam, when TP is on.
@@ -346,7 +368,7 @@ class Trainer:
 
         ``labels`` arrives already aligned with ``logits`` -- ``logits[t]``
         predicts ``labels[t]``, both sources having done their shift upstream
-        (see ``TrainingModel.preprocess_inputs``). No shift happens here,
+        (see the explicit model's ``prepare_inputs`` contract). No shift happens here,
         which is what lets the two sources share one loss: the synthetic path
         slots its rows together and the packed path arrives already shifted, and
         both mark the positions that must not be predicted with ``IGNORE_INDEX``

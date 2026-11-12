@@ -22,7 +22,7 @@ behavior: one whole-model ``torch.compile(model, backend="inductor")``.
   aten ops. When the model routes through llmtuner's flex path, the backend
   is wrapped so just the annotated flex region is scooped into an inductor
   sub-compile (the annotation is ``maybe_regional_inductor`` at the flex
-  call sites in ``models/runtime/attention_backend.py`` and the CP kernel). A flex
+  call sites in ``models/common/attention`` and the CP kernel). A flex
   model with any other
   non-inductor backend raises, as upstream does.
 * **capture_scalar_outputs**: token-choice MoE dispatch has data-dependent

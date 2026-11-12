@@ -20,6 +20,14 @@ _PROJECTION_ROLES = {name: role for role, name in _PROJECTIONS.items()}
 _LATENT = ("routed_expert_down_proj.", "routed_expert_norm.", "routed_expert_up_proj.")
 
 
+def validate_conversion_options(*, num_experts: int, to_hf: bool) -> None:
+    """Reject ambiguous direction and empty expert geometry before conversion."""
+    if type(num_experts) is not int or num_experts < 1:
+        raise ValueError("Kimi checkpoint num_experts must be a positive integer")
+    if type(to_hf) is not bool:
+        raise ValueError("Kimi checkpoint to_hf must be a bool")
+
+
 def convert_kimi_expert_state(
     state: dict[str, Any],
     *,
@@ -48,6 +56,7 @@ def convert_kimi_expert_state(
         if coordinate_errors
         else nullcontext()
     ):
+        validate_conversion_options(num_experts=num_experts, to_hf=to_hf)
         for key, value in state.items():
             match = _BLOCK.match(key)
             if match is None:
@@ -121,6 +130,13 @@ def convert_kimi_expert_state(
             shape = experts[0].shape
             if any(value.shape != shape for value in experts.values()):
                 raise ValueError(f"Kimi expert weight shapes disagree for {target}")
+            if any(
+                value.dtype != experts[0].dtype or value.device != experts[0].device
+                for value in experts.values()
+            ):
+                raise ValueError(
+                    f"Kimi expert weight dtype/device disagree for {target}"
+                )
             put(target, None)
     for keys, value in splits:
         for target, weight in zip(keys, value.unbind(0), strict=True):
@@ -140,6 +156,7 @@ def convert_kimi_optimizer_state(
     one grouped Parameter. Reject incompatible histories rather than selecting
     one expert's step or hyperparameters. Inputs must contain full EP tensors.
     """
+    validate_conversion_options(num_experts=num_experts, to_hf=to_hf)
     result: dict[str, Any] = {}
     pending: dict[tuple[str, str], dict[int, Any]] = {}
     reverse = _PROJECTION_ROLES
@@ -182,7 +199,8 @@ def convert_kimi_optimizer_state(
                         expert_value,
                     )
                 continue
-            suffix = suffix.replace("router.gate.weight.", "gate.weight.", 1)
+            if suffix.startswith("router.gate.weight."):
+                suffix = "gate.weight." + suffix.removeprefix("router.gate.weight.")
             if suffix.startswith("expert_bias_E."):
                 suffix = "gate.e_score_correction_bias." + suffix.removeprefix(
                     "expert_bias_E."
@@ -207,7 +225,8 @@ def convert_kimi_optimizer_state(
                     )
                 values[index] = value
                 continue
-            suffix = suffix.replace("gate.weight.", "router.gate.weight.", 1)
+            if suffix.startswith("gate.weight."):
+                suffix = "router.gate.weight." + suffix.removeprefix("gate.weight.")
             if suffix.startswith("gate.e_score_correction_bias."):
                 suffix = "expert_bias_E." + suffix.removeprefix(
                     "gate.e_score_correction_bias."
@@ -228,6 +247,7 @@ def convert_kimi_optimizer_state(
                 or value.ndim != 2
                 or value.shape != first.shape
                 or value.dtype != first.dtype
+                or value.device != first.device
                 for value in ordered
             ):
                 raise ValueError(f"Kimi expert moment tensors disagree for {target}")

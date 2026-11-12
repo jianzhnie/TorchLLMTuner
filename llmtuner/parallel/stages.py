@@ -1,6 +1,6 @@
 """The assembly stage list: the order contract, as data.
 
-``parallelize_hf_transformers``'s correctness is its call order, and this
+``parallelize_model``'s correctness is its call order, and this
 table is the single source of it: both the unsplit model and each PP part run
 ``STAGE_ORDER``, so the two paths cannot
 drift into different relative orders. Kept engine-free (a dataclass and

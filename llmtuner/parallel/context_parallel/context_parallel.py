@@ -203,11 +203,12 @@ def apply_cp(
                 )
             cp_sdpa_kernel = CPSdpaUlyssesKernel(cp_mesh=cp_mesh, packed=packed)
         else:
-            if packed and load_balancer is not None:
+            if load_balancer is not None:
                 raise NotImplementedError(
-                    "Packed single-axis KV SDPA CP requires "
-                    "context_parallel_load_balancer=None until document mask "
-                    "permutation is implemented and validated."
+                    "Single-axis KV SDPA CP requires "
+                    "context_parallel_load_balancer=None: its causal offsets "
+                    "assume contiguous shards, and load-balanced mask "
+                    "permutation is not implemented."
                 )
             cp_sdpa_kernel = CPSdpaKernel(cp_mesh=cp_mesh, packed=packed)
         model_config._attn_implementation = CP_SDPA_BACKEND

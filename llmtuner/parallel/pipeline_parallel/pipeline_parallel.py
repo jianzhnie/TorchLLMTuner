@@ -41,6 +41,7 @@ from torch.distributed.pipelining.schedules import (
 from llmtuner.config.parallel_config import ParallelConfig
 
 from ...components.loss import cross_entropy_loss
+from ...models.contracts import DecoderStructure
 from ...utils.logging import get_logger
 from .. import compatibility
 from ..topology import ParallelTopology
@@ -56,7 +57,7 @@ __all__ = ["PipelineParallelSetup", "apply_pp", "build_pipeline_schedule"]
 class PipelineParallelSetup:
     """Everything the trainer needs to drive a ``pp > 1`` run.
 
-    Returned by ``parallelize_hf_transformers`` in place of the parallelized
+    Returned by ``parallelize_model`` in place of the parallelized
     model: under pipeline parallelism there is no single model to hand back --
     this rank holds only its stages' chunks, and a schedule drives them.
     """
@@ -92,6 +93,10 @@ def scalar_loss_fn(
     gradient -- with one division per microbatch instead of a rescale applied
     afterwards.
 
+    Token dimensions are flattened at this boundary: explicit stages may return
+    [B, S, V], while prepared flat-token stages return [T, V]. Neither shape
+    changes the summed loss or the global normalization.
+
     The caller divides it back out for reporting.
 
     ``tp_group`` / ``global_vocab_size`` go
@@ -101,8 +106,8 @@ def scalar_loss_fn(
     """
     return (
         cross_entropy_loss(
-            pred,
-            labels,
+            pred.reshape(-1, pred.shape[-1]),
+            labels.reshape(-1),
             tp_group=tp_group,
             global_vocab_size=global_vocab_size,
         )
@@ -310,7 +315,7 @@ def apply_pp(
     The chunks come back unparallelized: running each through TP, (optionally)
     ``torch.compile`` and FSDP -- and rebinding ``stage.submod`` afterwards, so
     a wrapping transform cannot leave the stage running the pre-wrap module --
-    is ``parallelize_hf_transformers``'s job, which owns that assembly order
+    is ``parallelize_model``'s job, which owns that assembly order
     for the split and unsplit paths alike.
 
     ``global_batch_size`` is a training-side value the PP guards need; it is
@@ -331,6 +336,14 @@ def apply_pp(
     Returns ``(stages, model_parts, has_first_stage, has_last_stage)``; the
     schedule over the stages is built separately (``build_pipeline_schedule``).
     """
+    structure = getattr(model, "decoder_structure", None)
+    if isinstance(structure, DecoderStructure) and (
+        not callable(getattr(model, "validate_pipeline_partition", None))
+        or not callable(getattr(model, "configure_pipeline_stage", None))
+    ):
+        raise NotImplementedError(
+            "Explicit PP requires model-owned partition validation and stage I/O"
+        )
     if getattr(model, "enable_weight_tying", False):
         compatibility.pp_weight_tying()
     # A DSA model builds its dense mask from tok_embeddings.weight.dtype on
@@ -344,7 +357,12 @@ def apply_pp(
 
     module_names_per_stage = parallelism.pp_config.module_fqns_per_model_part
     if module_names_per_stage is None:
-        num_layers = len(model.layers)
+        blocks = (
+            structure.bind(model).blocks
+            if isinstance(structure, DecoderStructure)
+            else model.layers
+        )
+        num_layers = len(blocks)
         num_stages, input_weight, output_weight = get_pipeline_metadata(
             parallel_dims, parallelism, num_layers
         )
@@ -354,6 +372,28 @@ def apply_pp(
             input_weight=input_weight,
             output_weight=output_weight,
         )
+        structure = getattr(model, "decoder_structure", None)
+        if isinstance(structure, DecoderStructure):
+            runtime_modules = getattr(model, "pipeline_runtime_modules", ())
+            block_ids = tuple(blocks._modules)
+            aliases = {
+                "tok_embeddings": structure.embedding,
+                "norm": structure.norm,
+                "lm_head": structure.head,
+            }
+
+            def bind_target(target: str) -> list[str]:
+                if target == "rotary_emb":
+                    return list(runtime_modules)
+                if target.startswith("layers."):
+                    block = block_ids[int(target.removeprefix("layers."))]
+                    return [f"{structure.blocks}.{block}"]
+                return [aliases[target]]
+
+            module_names_per_stage = [
+                [path for target in targets for path in bind_target(target)]
+                for targets in module_names_per_stage
+            ]
         if first_stage_module_fqns:
             prepend_first_stage_modules(
                 module_names_per_stage, model, first_stage_module_fqns
@@ -399,6 +439,15 @@ def apply_pp(
         parallelism.pp_config.pipeline_parallel_schedule,
         device,
         module_names_per_stage,
+        replicated_module_names=(
+            tuple(getattr(model, "pipeline_runtime_modules", ()))
+            if isinstance(getattr(model, "decoder_structure", None), DecoderStructure)
+            else (
+                ("rotary_emb",)
+                if any("rotary_emb" in targets for targets in module_names_per_stage)
+                else ()
+            )
+        ),
     )
 
     has_first_stage = any(stage.is_first for stage in stages)

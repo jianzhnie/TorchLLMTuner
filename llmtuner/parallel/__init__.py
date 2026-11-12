@@ -12,7 +12,7 @@ or expert sharding is active; callers must not skip it based only on DP degree.
 
 Pipeline parallelism lives in ``pipeline_parallel/``: ``partition.py`` computes
 the stage split and ``pipeline_parallel.py`` builds this rank's schedule.
-``parallelize_hf_transformers`` dispatches to it when ``pp > 1`` and returns a
+``parallelize_model`` dispatches to it when ``pp > 1`` and returns a
 ``PipelineParallelSetup`` instead of a model.
 """
 
@@ -31,6 +31,7 @@ _EXPORT_SOURCES = {
     "apply_ep": "expert_parallel.expert_parallel",
     "apply_fsdp": "fully_shard_parallel.fully_shard_parallel",
     "apply_tp": "tensor_parallel.tensor_parallel",
+    "parallelize_model": "parallelize",
     "parallelize_hf_transformers": "parallelize",
 }
 

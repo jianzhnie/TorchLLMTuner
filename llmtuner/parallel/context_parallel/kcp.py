@@ -14,6 +14,8 @@ import torch.nn.functional as F
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_comm_device, get_world_size
+from ...models.contracts import DecoderStructure
+from ...models.kimi.kimi_k3.delta_attention import KimiDeltaAttention
 from ...models.kimi.kimi_k3.latent_attention import KimiLatentAttention
 from .attention import HeadToSeq, SeqToHead
 
@@ -267,30 +269,51 @@ def kcp_mla_attention(group):
 
 
 def apply_kcp(model: nn.Module, cp_mesh) -> int:
-    """Patch every structurally recognized KDA module and return its count."""
-    required = ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias")
-    if any(
-        (
-            all(hasattr(module, name) for name in ("q_proj", "k_proj", "v_proj"))
-            or all(
-                hasattr(module, name) for name in ("kv_a_proj_with_mqa", "kv_b_proj")
+    """Install KCP on declared Kimi attention targets and return the KDA count.
+
+    Explicit models never scan unrelated modules for projection attributes.
+    Structural detection remains limited to legacy raw-module callers.
+    """
+    structure = getattr(model, "decoder_structure", None)
+    if structure is not None:
+        if not isinstance(structure, DecoderStructure):
+            raise TypeError("KCP requires a model-owned DecoderStructure")
+        # Preserve first-occurrence order while installing each shared module
+        # once. Declaration binding itself retains every decoder slot.
+        attentions = tuple(dict.fromkeys(structure.bind_attentions(model)))
+        if any(
+            not isinstance(module, KimiDeltaAttention | KimiLatentAttention)
+            for module in attentions
+        ):
+            raise ValueError("KCP requires declared Kimi KDA/MLA attention modules")
+        modules = [m for m in attentions if isinstance(m, KimiDeltaAttention)]
+        mla_modules = [m for m in attentions if isinstance(m, KimiLatentAttention)]
+    else:
+        required = ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias")
+        attentions = tuple(model.modules())
+        if any(
+            (
+                all(hasattr(module, name) for name in ("q_proj", "k_proj", "v_proj"))
+                or all(
+                    hasattr(module, name)
+                    for name in ("kv_a_proj_with_mqa", "kv_b_proj")
+                )
             )
-        )
-        and not all(hasattr(module, name) for name in required)
-        and not isinstance(module, KimiLatentAttention)
-        for module in model.modules()
-    ):
-        raise ValueError("KCP does not support hybrid KDA/softmax attention models")
-    modules = [
-        module
-        for module in model.modules()
-        if all(hasattr(module, name) for name in required)
-    ]
+            and not all(hasattr(module, name) for name in required)
+            and not isinstance(module, KimiLatentAttention)
+            for module in attentions
+        ):
+            raise ValueError("KCP does not support hybrid KDA/softmax attention models")
+        modules = [
+            module
+            for module in attentions
+            if all(hasattr(module, name) for name in required)
+        ]
+        mla_modules = [m for m in attentions if isinstance(m, KimiLatentAttention)]
     if not modules:
         raise ValueError("KCP selected but no Kimi Delta Attention module was found")
     _kcp_runtime()
     group = cp_mesh.get_group()
-    mla_modules = [m for m in model.modules() if isinstance(m, KimiLatentAttention)]
     for module in mla_modules:
         if module.num_heads % group.size():
             raise ValueError("KCP MLA heads must be divisible by the CP degree")
