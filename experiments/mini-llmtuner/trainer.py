@@ -16,37 +16,45 @@ from .components import (
     TokenMetrics,
 )
 from .config import ExperimentConfig, load_model_config
+from .data import SyntheticData
+from .engine import TrainingEngine
 from .model import Qwen3MoeModel
 
 
 class BaseTrainer:
-    """Own lifecycle only; model parallelism is completed before training starts."""
+    """Lifecycle only: execution and data are injected, never constructed here."""
 
     def __init__(
-        self,
-        config: ExperimentConfig,
-        device: torch.device,
-        *,
-        loss=None,
-        metrics=None,
-        scheduler=None,
-        profiler=None,
-    ) -> None:
-        self.config, self.device = config, device
-        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        self.rank = dist.get_rank() if dist.is_initialized() else 0
-        self.loss_fn = loss or CrossEntropyLoss()
+        self, engine, data, checkpoint, *, accumulation=1, metrics=None, profiler=None
+    ):
+        self.engine, self.data, self.checkpoint = engine, data, checkpoint
+        self.accumulation = accumulation
         self.metrics = metrics or TokenMetrics()
-        self.scheduler = scheduler or NoOpScheduler()
         self.profiler = profiler or NoOpProfiler()
+        self.start_step = checkpoint.step
 
-    def train(self):
-        raise NotImplementedError
+    def train(self, steps):
+        history = []
+        self.engine.model.train()
+        for step in range(self.checkpoint.step, steps):
+            batches = [self.data.next_batch() for _ in range(self.accumulation)]
+            result = self.engine.train_step(batches)
+            labels = torch.cat([batch["labels"].flatten() for batch in batches])
+            history.append(
+                self.metrics.record(
+                    step, torch.tensor(result.loss_sum / result.targets), labels
+                )
+            )
+            self.checkpoint.step = step + 1
+            self.profiler.step()
+        return history
 
 
 class ExperimentTrainer(BaseTrainer):
     def __init__(self, config: ExperimentConfig, device: torch.device) -> None:
-        super().__init__(config, device)
+        self.config, self.device = config, device
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
         random.seed(config.seed)
         torch.manual_seed(config.seed)
         model = Qwen3MoeModel(load_model_config(config.model_config)).to(device)
@@ -69,57 +77,31 @@ class ExperimentTrainer(BaseTrainer):
                     "config": load_model_config(config.model_config).to_dict(),
                     "parallel": parallel_dict,
                     "seed": config.seed,
+                    "batch_size": config.batch_size,
+                    "seq_len": config.seq_len,
+                    "accumulation": config.gradient_accumulation_steps,
+                    "learning_rate": config.learning_rate,
                 },
                 sort_keys=True,
                 default=str,
             ).encode()
         ).hexdigest()
-        self.checkpoint = CheckpointManager(self.model, self.optimizer, signature)
-        self.start_step = 0
-        if config.resume is not None:
-            self.start_step = self.checkpoint.load(config.resume)
-
-    def _batch(self, step: int) -> dict[str, torch.Tensor]:
-        generator = torch.Generator(device="cpu").manual_seed(self.config.seed + step)
-        ids = torch.randint(
-            0,
-            self.model.contract.vocab_size,
-            (self.config.batch_size, self.config.seq_len),
-            generator=generator,
+        scheduler = NoOpScheduler()
+        data = SyntheticData(self.model.contract.vocab_size, config, device)
+        engine = TrainingEngine(
+            self.model, self.optimizer, scheduler, CrossEntropyLoss()
         )
-        labels = ids.roll(-1, dims=1)
-        labels[:, -1] = -100
-        positions = torch.arange(self.config.seq_len).expand(self.config.batch_size, -1)
-        return {
-            "input_ids": ids.to(self.device),
-            "labels": labels.to(self.device),
-            "position_ids": positions.to(self.device),
-        }
+        checkpoint = CheckpointManager(
+            self.model, self.optimizer, signature, scheduler=scheduler, data=data
+        )
+        if config.resume is not None:
+            checkpoint.load(config.resume)
+        super().__init__(
+            engine, data, checkpoint, accumulation=config.gradient_accumulation_steps
+        )
 
     def train(self):
-        metrics = []
-        for step in range(self.start_step, self.config.steps):
-            self.optimizer.zero_grad(set_to_none=True)
-            loss = None
-            batch = None
-            for micro_step in range(self.config.gradient_accumulation_steps):
-                batch = self.model.preprocess_inputs(
-                    self._batch(
-                        step * self.config.gradient_accumulation_steps + micro_step
-                    )
-                )
-                logits = self.model(
-                    batch["input_ids"], position_ids=batch["position_ids"]
-                )
-                micro_loss = self.loss_fn(logits, batch["labels"])
-                micro_loss.backward()
-                loss = micro_loss if loss is None else loss + micro_loss
-            loss = loss / self.config.gradient_accumulation_steps
-            self.optimizer.step()
-            self.scheduler.step()
-            self.profiler.step()
-            metrics.append(self.metrics.record(step, loss, batch["labels"]))
-            self.checkpoint.step = step + 1
+        metrics = super().train(self.config.steps)
         if self.config.checkpoint is not None:
             self.checkpoint.save(self.config.checkpoint)
         return metrics if self.rank == 0 else []

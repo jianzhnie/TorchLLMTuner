@@ -57,6 +57,8 @@ class ExperimentConfig:
     def __post_init__(self) -> None:
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
             raise ValueError("learning_rate must be finite and positive")
+        if self.parallel.tp_size < 1:
+            raise ValueError("TP degree must be positive")
         if self.seq_len % self.parallel.tp_size:
             raise ValueError("seq_len must be divisible by TP degree")
         if self.steps < 1 or self.batch_size < 1 or self.seq_len < 2:

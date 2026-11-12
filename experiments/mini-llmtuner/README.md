@@ -1,205 +1,52 @@
-# Qwen3-MoE：模型契约 → 纯计划 → 直接执行
+# mini-llmtuner：在原有实验代码上拆分职责
 
-本实验是 `docs/model_distributed_architecture_guide.md` 第 7 部分的最小可运行实现。
-它不是第二套生产训练框架，而是用一个 Qwen3-MoE 纵向闭环验证以下调用链：
+本目录复用已有 Qwen3-MoE 模型、HF adapter、并行计划和装配逻辑，不再维护另一套 `mini_llmtuner/` 实现，也不导入生产包 `llmtuner`。模型仍使用本目录的 `model.py` 和 `layers.py`，没有替换成额外的玩具网络。
 
-```text
-模型契约
-  → 纯计划解析与预检
-  → TP → EP → FSDP
-  → 真实训练
-  → DCP 保存与恢复
-```
-
-## 1. 模型拥有结构和数学契约
-
-`model.py` 明确声明：
-
-- decoder、MoE、embedding、norm、head 的准确 FQN；
-- 模块角色和输入输出布局；
-- TP 的 colwise、rowwise、packed-colwise 计划；
-- 专家的 `fused_gate_up` 布局；
-- attention head、专家宽度和专家数量的整除约束。
-
-模型直接提供 TP 计划，不读取 HF 自动计划。`layers.py` 自定义 RMSNorm、default
-RoPE、GQA attention、router、packed experts 和 decoder；`model.py` 自定义初始化、
-层栈和输出 head。模型不导入 `llmtuner`，不继承或调用 Transformers modeling 类；
-仅复用 `Qwen3MoeConfig`。包入口延迟加载，独立导入模型不加载训练服务。
-模型支持 eager/SDPA、SiLU 与 default RoPE；其他 RoPE、sliding window、KV cache
-和非零 router auxiliary loss 明确拒绝。训练与分布式服务由本实验的最小组件提供，
-不导入 `llmtuner`。
-
-## 2. 先解析和校验，再修改模型
-
-`resolver.py` 在参数和 forward 被修改前完成：
-
-- 将 contract 中的准确路径绑定到真实模块；
-- 解析实际 DP 度数；
-- 检查共享参数与 TP/EP 几何约束；
-- 拒绝未支持的配置；
-- 生成 frozen `ExecutionPlan`，只保存模块引用和元数据，不复制张量。
-
-`assembly.py` 在执行前再次调用 `validate_binding()`，防止计划引用失效，并协调
-rank 本地错误，避免其他 rank 进入不匹配的 collective。
-
-预检可以减少半改模型，但不承诺执行阶段具有事务回滚能力。既有 TP/EP/FSDP
-引擎仍保留自己的转换和必要校验；本实验不是完全由绑定引用驱动的全新执行器。
-
-## 3. 计划与执行器分离
-
-统一装配顺序为：
+## 代码如何协作
 
 ```text
-resolve_plan
-  → apply_tp
-  → apply_ep
-  → apply_fsdp
+ExperimentConfig
+    ↓
+ExperimentTrainer（兼容入口与默认装配）
+    ├─ Qwen3MoeModel → resolve_plan → assemble_model
+    ├─ optimizer / scheduler / loss → TrainingEngine
+    ├─ SyntheticData
+    └─ CheckpointManager
+                ↓
+BaseTrainer：取数据 → engine.train_step → metrics / profiler → 更新步数
 ```
 
-`assembly.py` 只负责顺序、依赖和失败协调。通用 collective、专家转换、FSDP 和
-本地执行器当前只实现单进程安全路径；TP/EP/FSDP 可以通过同一 adapter 接口接入
-真实后端，不改变模型和 trainer。
+| 模块 | 职责 |
+| --- | --- |
+| `model.py`、`layers.py` | Qwen3-MoE 数学实现、模型结构与显式并行边界 |
+| `protocol.py`、`hf_adapter.py`、`hf_factory.py` | 模型接口与已有 HF 接入扩展点 |
+| `config.py`、`resolver.py` | 声明配置、解析计划、检查模块绑定 |
+| `assembly.py` | 在训练前应用并行计划，保留原有后端 |
+| `engine.py` | 前向、反向、梯度裁剪、optimizer 和 scheduler 更新 |
+| `data.py` | 可恢复的合成数据游标 |
+| `trainer.py` | `BaseTrainer` 管生命周期；`ExperimentTrainer` 组装默认组件 |
+| `components.py` | 可替换 loss、metrics、optimizer factory、scheduler、profiler |
+| `checkpoint.py` | 模型状态适配、训练状态保存与恢复 |
 
-## 4. 训练语义明确且可复现
+自定义模型、数据或服务时，可以直接构造 `TrainingEngine`、`CheckpointManager` 和 `BaseTrainer`，无需修改默认 Qwen3-MoE 装配入口。训练循环不判断 TP、FSDP 等并行模式。
 
-`trainer.py` 实现一个小而真实的训练闭环：
+## 运行与恢复
 
-- 合成数据按 step 和 DP rank 确定生成；
-- TP rank 共享同一文档并沿序列切分；
-- 使用 next-token labels，末 token 目标为 `-100`；
-- RoPE 使用完整文档位置；
-- 按全局有效 target 数归一化 loss；
-- 区分 TP 分片参数与复制参数的梯度处理；
-- 执行真实 AdamW 更新。
-
-默认 CPU FP32、NPU BF16；固定学习率，不使用 scheduler 或 EMA。关闭 router
-auxiliary loss 和 attention dropout。TP 将每个文档作为独立微批执行，不在序列
-边界直接拼接多个 `[B,T,H]` 输入；不支持的输入会在配置阶段拒绝。
-
-## 5. Checkpoint 转换独立
-
-`checkpoint.py` 使用独立的 `CheckpointAdapter` 保存：
-
-- 模型及并行布局；
-- FQN optimizer 状态与 Adam moments；
-- 下一步游标；
-- 每个 rank 的 Python、CPU 和设备 RNG。
-
-加载前先比较不可变配置签名：模型、数据、精度、设备和拓扑必须一致。恢复从
-下一步继续，不重复执行已完成的 step。Python RNG 的 pickle 仅用于可信的本地
-checkpoint；本实验不支持跨拓扑恢复。
-
-## 6. 明确能力边界，不做空壳支持
-
-当前支持：
-
-- 单进程；
-- PyTorch 原生 TP（`torch.distributed.tensor.parallel`）；
-- PyTorch FSDP2（`torch.distributed.fsdp.fully_shard`）；
-- EP/CP/PP 的显式模型 hook 和能力检查；
-- 同步 DCP 保存与恢复。
-
-明确未接入：
-
-- CP、PP 的具体 attention/schedule 实现；
-- AC、compile；
-- activation/optimizer swap；
-- 真实数据 pipeline；
-- 异步/原子 checkpoint 发布；
-- 跨拓扑恢复、跨节点和长程验收；
-- 完整模型 meta 初始化。
-
-未实现能力没有虚假 CLI 开关。CP/PP 在配置入口拒绝；其他未实现功能不会以
-空模块形式出现。实验阶段顺序只是支持子集，不改变生产 `parallel/stages.py`。
-
-## 7. 文件职责
-
-```text
-config.py      实验配置与 Qwen3-MoE 配置读取，只读架构
-protocol.py    ModelProtocol 与 checkpoint adapter 协议
-components.py  可替换 loss、metrics、scheduler 和 profiler
-model.py       显式构造、模块入口、准确 FQN、TP/专家布局与几何约束
-resolver.py    不修改模型的目标绑定、ownership、拓扑和能力预检
-assembly.py    rank 错误协调，然后执行 TP → EP → FSDP
-trainer.py     可恢复合成数据、next-token loss、梯度同步和 AdamW 更新
-checkpoint.py  模型/optimizer 转换、游标和 RNG
-train.py       Python/torchrun 入口、设备绑定、rank0 摘要和资源关闭
-```
-
-## 8. 运行
-
-## 8.1 接入 HuggingFace Llama 和 DeepSeek-V3
-
-直接加载的 HuggingFace causal LM 通过 `HFModelAdapter` 接入，不需要修改
-`BaseTrainer`。工厂会根据 `config.model_type` 选择 Llama 或 DeepSeek-V3 adapter，
-并从实际模块树生成线性层 TP plan，避免依赖固定版本的通配符路径：
-
-```python
-from experiments.qwen3_moe_framework.hf_factory import load_hf_model
-
-model = load_hf_model("meta-llama/Llama-3.2-1B", device=device)
-assembly = model.parallelize(ParallelConfig(), world_size=1)
-```
-
-DeepSeek-V3 的 MoE 专家仍需要模型级 EP dispatcher；Llama 可直接使用通用的
-TP/FSDP2 适配路径。CP 和 PP 仍需为具体 attention 和 pipeline schedule 提供
-显式 hook。
-
-在仓库根目录和已有依赖的 `hyper-parallel-env` 容器内运行。
-
-单进程：
+在仓库根目录执行，环境需安装 PyTorch 与支持 Qwen3-MoE 配置的 Transformers：
 
 ```bash
-python -m experiments.qwen3_moe_framework.train --steps 3
+python -m experiments.mini-llmtuner.train --steps 3 --gradient-accumulation-steps 2
+python -m experiments.mini-llmtuner.train --steps 2 --checkpoint /tmp/mini-checkpoint
+python -m experiments.mini-llmtuner.train --steps 3 --resume /tmp/mini-checkpoint
+python -m pytest -q experiments/mini-llmtuner/tests
 ```
 
-TP2：
+`--steps` 是目标 optimizer step 总数，恢复时从已完成的步数继续。loss 组件返回有效 token 的损失之和；引擎按整个累积窗口的有效 token 总数归一化，支持不同 microbatch 中有效 token 数不同的情况。默认梯度裁剪阈值为 1.0。
 
-```bash
-torchrun --standalone --nproc_per_node=2 \
-  -m experiments.qwen3_moe_framework.train --tp-size 2 --steps 3
-```
+checkpoint 使用目录中的 `state.pt`，通过临时文件原子替换，包含模型、optimizer、scheduler、数据游标、随机状态与配置签名。恢复允许增加目标步数，但拒绝改变模型配置、拓扑、batch size、序列长度、累积步数、学习率或 seed。当前格式为版本 2，不兼容旧的无版本实验 checkpoint；只加载可信的本地 checkpoint。
 
-DP-shard2 × EP2：
+## 当前边界
 
-```bash
-torchrun --standalone --nproc_per_node=2 \
-  -m experiments.qwen3_moe_framework.train \
-  --dp-shard-size 2 --ep-size 2 --steps 3
-```
+当前验证范围是 CPU 单进程 Qwen3-MoE 训练、梯度累积和精确恢复。CLI 默认使用 CPU 和合成数据；HF adapter 保留为接入扩展点，默认入口尚未提供 HF 权重选择。
 
-外部配置与恢复（只读配置，参数仍随机初始化）：
-
-```bash
-python -m experiments.qwen3_moe_framework.train \
-  --model-config /path/to/Qwen3-MoE/config.json --seq-len 128 --steps 2 \
-  --checkpoint /tmp/qwen3-experiment
-
-python -m experiments.qwen3_moe_framework.train \
-  --model-config /path/to/Qwen3-MoE/config.json --seq-len 128 --steps 3 \
-  --resume /tmp/qwen3-experiment
-```
-
-完整配置可能需要大量内存。本实验从 CPU 构造后搬至设备，不能替代生产 meta
-路径；不会自动缩减模型或修改配置。合成数据仅用于验证，不代表真实语料训练质量。
-
-`LLMTUNER_TEST_DEVICE=cpu` 可运行单进程 CPU CLI。分布式 mesh 必须与框架实际
-设备一致；在可见 NPU 的环境中强制 CPU/Gloo 分布式会提前报错，不静默混用设备。
-纯 CPU 分布式验证需使用 CPU 环境。
-
-## 9. 验证
-
-```bash
-python -m pytest -q tests/unit_tests/cpu/test_qwen3_moe_framework.py
-
-torchrun --standalone --nproc_per_node=2 \
-  tests/integration_tests/qwen3_moe_framework_equivalence.py --layout tp
-```
-
-集成脚本支持 `--layout tp|dp|ep|joint`，比较连续三步与第二步保存后恢复的结果：
-完整模型和 Adam moments 逐位一致，loss 容差 `atol=rtol=1e-6`。TP 另比较未分片
-模型的初始 logits，NPU BF16 容差 `5e-3`；这不等同于跨框架长程精度验收。
-CPU 测试另以三个独立 CLI 进程比较连续与恢复后的完整状态。
-
-实际命令、退出码、日志和缺口见
-[执行记录](../../docs/qwen3_moe_framework_experiment.md)。
+原有 TP / FSDP2 装配代码继续保留，但并不意味着本次完成了分布式端到端验证：Qwen3-MoE 的 packed expert TP 仍显式报错，EP dispatcher、CP 和 PP schedule 尚未实现。当前 checkpoint 是单进程原型，不能用于多 rank 分片状态保存；跨拓扑恢复、HF 权重导出和真实分布式 token 归一化需要独立完善。重计算与量化配置也尚未接入执行。

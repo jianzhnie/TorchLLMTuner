@@ -7,6 +7,8 @@ import torch
 
 
 class Loss(Protocol):
+    """Return summed loss over non-ignored targets; engine normalizes once."""
+
     def __call__(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor: ...
 
 
@@ -16,6 +18,7 @@ class CrossEntropyLoss:
             logits.float().reshape(-1, logits.shape[-1]),
             labels.reshape(-1),
             ignore_index=-100,
+            reduction="sum",
         )
 
 
@@ -39,6 +42,12 @@ class Scheduler(Protocol):
 @dataclass
 class NoOpScheduler:
     def step(self) -> None:
+        pass
+
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state):
         pass
 
 
