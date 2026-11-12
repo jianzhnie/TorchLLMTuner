@@ -829,6 +829,24 @@ def swap_moe_blocks(
                 packed_bindings[id(target.module)] = binding.packed_experts
     if not candidates:
         raise ValueError("EP plan must contain conversion targets")
+    if isinstance(getattr(model, "decoder_structure", None), DecoderStructure):
+        # EP replaces every declared sparse slot, in decoder order. A caller
+        # can rebuild a frozen plan with missing/repeated targets while all
+        # module snapshots remain valid; that must not produce a mixed model.
+        expected_slots = []
+        for layer in decoder_layers_for_ep(model):
+            declared = declared_moe_block(layer)
+            if declared is None:
+                raise ValueError("Explicit EP requires declared decoder MoE slots")
+            attribute, block = declared
+            if block is not None:
+                expected_slots.append((id(layer), attribute, id(block)))
+        actual_slots = [
+            (id(owner), attribute, id(block))
+            for owner, attribute, block, _ in candidates
+        ]
+        if actual_slots != expected_slots:
+            raise ValueError("EP plan must cover declared MoE slots in decoder order")
     validate_ep_model_geometry(model, degree=degree, tp_enabled=tp_enabled)
 
     module_paths = list(model.named_modules(remove_duplicate=False))

@@ -8,7 +8,7 @@ from typing import Literal
 
 from torch import Tensor, device, dtype, nn, strided
 
-from ..models.contracts import DecoderStructure
+from ..models.contracts import DecoderStructure, registered_submodule
 
 __all__ = ["ParallelPlan", "PlanTarget"]
 
@@ -243,9 +243,13 @@ class ParallelPlan:
                         f"Stale plan buffer persistence: {path or '<root>'}"
                     )
         for path, expected in self.token_history_requirements:
-            current = getattr(
-                model.get_submodule(path), "requires_full_token_history", None
-            )
+            try:
+                module = registered_submodule(model, path)
+            except AttributeError as error:
+                raise ValueError(
+                    f"Stale plan token history requirement: {path}"
+                ) from error
+            current = getattr(module, "requires_full_token_history", None)
             if type(current) is not type(expected) or current != expected:
                 raise ValueError(f"Stale plan token history requirement: {path}")
         # Parameter identity survives `.data` reassignment. Keep immutable
@@ -293,7 +297,7 @@ class ParallelPlan:
             if target.module is None:
                 continue
             try:
-                current = model.get_submodule(target.path)
+                current = registered_submodule(model, target.path)
             except AttributeError as error:
                 raise ValueError(f"Stale plan binding: {target.path}") from error
             if current is not target.module:

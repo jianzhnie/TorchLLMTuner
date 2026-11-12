@@ -170,6 +170,42 @@ def test_ep_target_plan_is_pure_and_execution_does_not_rediscover(monkeypatch):
     torch.testing.assert_close(actual, expected, atol=TOL, rtol=TOL)
 
 
+@pytest.mark.parametrize("change", ["missing", "repeated", "reordered"])
+def test_ep_execution_rejects_incomplete_slot_coverage_before_allocation(
+    monkeypatch, change
+):
+    model = _model()
+    plan = model_replacement.resolve_ep_plan(model)
+    targets = plan.targets
+    if change == "missing":
+        targets = targets[:1]
+    elif change == "repeated":
+        targets = targets[:1] * 2
+    else:
+        targets = tuple(reversed(targets))
+    plan = replace(plan, targets=targets)
+    blocks = tuple(layer.mlp for layer in model.layers)
+    parameters = tuple(model.parameters())
+    keys = tuple(model.state_dict())
+    rng = torch.get_rng_state().clone()
+    groups = dict(AuxLoss._group_counts)
+
+    def reject_allocation(*args, **kwargs):
+        raise AssertionError("Invalid EP coverage must fail before conversion")
+
+    monkeypatch.setattr(model_replacement, "convert_block", reject_allocation)
+    monkeypatch.setattr(model_replacement, "find_moe_candidates", reject_allocation)
+    with pytest.raises(ValueError, match="cover declared MoE slots in decoder order"):
+        model_replacement.swap_moe_blocks(model, resolved_plan=plan)
+    assert all(
+        layer.mlp is block for layer, block in zip(model.layers, blocks, strict=True)
+    )
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert tuple(model.state_dict()) == keys
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert AuxLoss._group_counts == groups
+
+
 @pytest.mark.parametrize(
     "change", ["parameter", "device", "alias", "backend", "degree"]
 )

@@ -108,6 +108,39 @@ def test_plan_reports_removed_target_as_stale_binding() -> None:
         plan.validate_binding(model)
 
 
+@pytest.mark.parametrize("token_history", [False, True])
+def test_plan_rejects_unregistered_target_alias(token_history: bool) -> None:
+    model = nn.Module()
+    model.layer = nn.Linear(2, 2)
+    model.layer.requires_full_token_history = True
+    plan = ParallelPlan(
+        "cp",
+        (PlanTarget("layer", "attention", model.layer),),
+        2,
+        "sdpa",
+        token_history_requirements=(("layer", True),) if token_history else (),
+    )
+    plan.validate_binding(model)
+    layer = model.layer
+    del model.layer
+    # get_submodule follows this alias although it has no checkpoint ownership.
+    object.__setattr__(model, "layer", layer)
+    assert model.get_submodule("layer") is layer
+    with pytest.raises(ValueError, match="Stale plan"):
+        plan.validate_binding(model)
+
+
+def test_plan_preserves_registered_alias_target_binding() -> None:
+    model = nn.Module()
+    model.layer = nn.Linear(2, 2)
+    model.alias = model.layer
+    plan = ParallelPlan(
+        "tp", (PlanTarget("alias", "dense", model.layer),), 2, "functional"
+    )
+    plan.validate_binding(model)
+    assert model.alias.weight is model.layer.weight
+
+
 @pytest.mark.parametrize(
     "change", ["shape", "dtype", "stride", "offset", "grad", "device"]
 )

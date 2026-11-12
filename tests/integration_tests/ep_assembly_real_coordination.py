@@ -1,5 +1,6 @@
 """Real MoE conversion failure coordination and fresh-model retry on two ranks."""
 
+from dataclasses import replace
 from datetime import timedelta
 
 import torch
@@ -82,6 +83,21 @@ def main() -> None:
                 a is b for a, b in zip(parameters, model.parameters(), strict=True)
             )
             assert torch.equal(rng, torch.get_rng_state())
+        model = make_model(device)
+        plan = resolve_ep_plan(model, degree=2)
+        if rank == 0:
+            plan = replace(plan, targets=plan.targets * 2)
+        caught = None
+        try:
+            apply_ep(model, cfg, ep_group=dist.group.WORLD, resolved_plan=plan)
+        except (ValueError, RuntimeError) as error:
+            caught = error
+        assert caught is not None
+        if rank == 0:
+            assert "cover declared MoE slots" in str(caught)
+            assert model.layers[0].mlp is plan.targets[0].module
+        else:
+            assert "EP assembly validation failed on another rank" in str(caught)
         # A successful peer may already be converted; no rollback is promised.
         # Both ranks retry with fresh models and exercise real all-to-all autograd.
         model = make_model(device)

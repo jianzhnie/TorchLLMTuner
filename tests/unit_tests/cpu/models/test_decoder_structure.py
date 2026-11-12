@@ -145,3 +145,27 @@ def test_attention_binding_rejects_unregistered_block_collection():
     object.__setattr__(model.model, "layers", blocks)
     with pytest.raises(AttributeError, match="not registered"):
         model.decoder_structure.bind_attentions(model)
+
+
+def test_registered_decoder_alias_preserves_state_paths_and_parameter_identity():
+    model = Qwen3MoeForCausalLM(small_config())
+    model.decoder_alias = model.model
+    declaration = replace(
+        model.decoder_structure,
+        decoder="decoder_alias",
+        embedding="decoder_alias.embed_tokens",
+        blocks="decoder_alias.layers",
+        norm="decoder_alias.norm",
+    )
+    state_keys = tuple(model.state_dict())
+    parameters = tuple(model.parameters())
+    bound = declaration.bind(model)
+    assert bound.decoder is model.model
+    assert bound.blocks is model.layers
+    assert bound.embedding.weight is bound.head.weight
+    assert declaration.bind_attentions(model) == tuple(
+        layer.self_attn for layer in model.layers
+    )
+    assert "decoder_alias.embed_tokens.weight" in state_keys
+    assert tuple(model.state_dict()) == state_keys
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))

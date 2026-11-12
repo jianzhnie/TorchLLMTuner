@@ -8,16 +8,16 @@ import argparse
 import importlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import torch
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from llmtuner.models.hf.expert_kernels import forward_fp32_topk_router
+from llmtuner.models.qwen.routing import Qwen3MoeFP32TopKRouter
 from llmtuner.utils.seeding import set_deterministic_algorithms
 from tests.caps import require_env
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--trace", type=Path, required=True)
@@ -54,23 +54,26 @@ def main():
         )
         with torch.no_grad():
             baseline.gate.weight.copy_(weight)
-        candidate_weight = weight.detach().clone().requires_grad_()
-        candidate = SimpleNamespace(
-            weight=candidate_weight,
-            hidden_dim=weight.shape[1],
-            top_k=8,
-            norm_topk_prob=True,
-        )
+        candidate = Qwen3MoeFP32TopKRouter(
+            Qwen3MoeConfig(
+                hidden_size=weight.shape[1],
+                num_experts=weight.shape[0],
+                num_experts_per_tok=8,
+                norm_topk_prob=True,
+            )
+        ).to(device="npu", dtype=weight.dtype)
+        with torch.no_grad():
+            candidate.weight.copy_(weight)
         baseline_input = inputs.detach().clone().requires_grad_()
         candidate_input = inputs.detach().clone().requires_grad_()
         expected, expected_indices, _ = baseline(baseline_input)
-        _, actual, actual_indices = forward_fp32_topk_router(candidate, candidate_input)
+        _, actual, actual_indices = candidate(candidate_input)
         upstream = torch.randn_like(expected)
         expected_grads = torch.autograd.grad(
             expected, (baseline_input, baseline.gate.weight), upstream
         )
         actual_grads = torch.autograd.grad(
-            actual, (candidate_input, candidate_weight), upstream
+            actual, (candidate_input, candidate.weight), upstream
         )
         comparisons = [("scores", actual, expected)]
         comparisons.extend(
