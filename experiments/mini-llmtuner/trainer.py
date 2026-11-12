@@ -18,7 +18,8 @@ from .components import (
 from .config import ExperimentConfig, load_model_config
 from .data import SyntheticData
 from .engine import TrainingEngine
-from .model import Qwen3MoeModel
+from .llama import LlamaModel
+from .model import Qwen3Model, Qwen3MoeModel
 
 
 class BaseTrainer:
@@ -48,11 +49,11 @@ class BaseTrainer:
             result = self.engine.train_step(batches)
             self.checkpoint.step = step + 1
             labels = torch.cat([batch["labels"].flatten() for batch in batches])
-            history.append(
-                self.metrics.record(
-                    step, torch.tensor(result.loss_sum / result.targets), labels
-                )
+            record = self.metrics.record(
+                step, torch.tensor(result.loss_sum / result.targets), labels
             )
+            record.update(tokens=result.targets, grad_norm=result.grad_norm)
+            history.append(record)
             self.profiler.step()
         return history
 
@@ -97,10 +98,21 @@ class ExperimentTrainer(BaseTrainer):
         self.config, self.device = config, device
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.rank = dist.get_rank() if dist.is_initialized() else 0
+        if self.world_size > 1 and (config.checkpoint or config.resume):
+            raise ValueError(
+                "Distributed checkpoint is not implemented in this prototype"
+            )
         random.seed(config.seed)
         torch.manual_seed(config.seed)
         if model is None:
-            model = Qwen3MoeModel(load_model_config(config.model_config))
+            model_class = {
+                "qwen3": Qwen3Model,
+                "qwen3_moe": Qwen3MoeModel,
+                "llama": LlamaModel,
+            }[config.architecture]
+            model = model_class(
+                load_model_config(config.model_config, config.architecture)
+            )
         model = model.to(device)
         self.assembly = model.parallelize(config.parallel, world_size=self.world_size)
         self.model = self.assembly.model
@@ -139,8 +151,14 @@ class ExperimentTrainer(BaseTrainer):
         )
         if data is None:
             data = SyntheticData(self.model.contract.vocab_size, config, device)
+            data.stream_rank = self.assembly.runtime.data_rank
+            data.stream_size = self.assembly.runtime.data_size
         engine = TrainingEngine(
-            self.model, self.optimizer, scheduler, loss or CrossEntropyLoss()
+            self.model,
+            self.optimizer,
+            scheduler,
+            loss or CrossEntropyLoss(),
+            self.assembly.runtime,
         )
         checkpoint = CheckpointManager(
             self.model,

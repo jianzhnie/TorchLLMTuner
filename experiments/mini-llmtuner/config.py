@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 
@@ -23,6 +25,18 @@ class ParallelConfig:
     pipeline_parallel_size: int = 1
     recompute: bool = False
     quantization: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "tensor_parallel_size",
+            "expert_parallel_size",
+            "data_parallel_shard_size",
+            "context_parallel_size",
+            "pipeline_parallel_size",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
 
     @property
     def tp_size(self) -> int:
@@ -53,8 +67,11 @@ class ExperimentConfig:
     checkpoint: Path | None = None
     resume: Path | None = None
     model_config: Path | None = None
+    architecture: str = "qwen3_moe"
 
     def __post_init__(self) -> None:
+        if self.architecture not in ("qwen3_moe", "qwen3", "llama"):
+            raise ValueError("Unsupported explicit architecture")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
             raise ValueError("learning_rate must be finite and positive")
         if self.parallel.tp_size < 1:
@@ -98,14 +115,35 @@ def small_qwen3_moe_config() -> Qwen3MoeConfig:
     )
 
 
-def load_model_config(path: Path | None) -> Qwen3MoeConfig:
+def load_model_config(
+    path: Path | None, architecture: str = "qwen3_moe"
+) -> Qwen3MoeConfig | Qwen3Config | LlamaConfig:
     """Read architecture only; never load weights or select a model by inspection."""
+    if architecture not in ("qwen3_moe", "qwen3", "llama"):
+        raise ValueError("Unsupported explicit architecture")
+    config_class = {
+        "qwen3_moe": Qwen3MoeConfig,
+        "qwen3": Qwen3Config,
+        "llama": LlamaConfig,
+    }[architecture]
     if path is None:
-        return small_qwen3_moe_config()
+        if architecture == "qwen3_moe":
+            return small_qwen3_moe_config()
+        return config_class(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+            attention_dropout=0.0,
+        )
     path = path / "config.json" if path.is_dir() else path
-    config = Qwen3MoeConfig.from_json_file(str(path))
-    if config.model_type != "qwen3_moe":
-        raise ValueError("This experiment requires a qwen3_moe configuration")
+    config = config_class.from_json_file(str(path))
+    if config.model_type != architecture:
+        raise ValueError("Configuration does not match the explicit architecture")
     config._experts_implementation = "eager"
     config.router_aux_loss_coef = 0.0
     config.attention_dropout = 0.0

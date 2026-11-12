@@ -1,15 +1,17 @@
 """The experiment's model contract, plan and single-process training loop."""
 
+from importlib import import_module
+
+import pytest
 import torch
 
-from experiments.qwen3_moe_framework import (
-    ExperimentConfig,
-    ExperimentTrainer,
-    ModelContract,
-    Qwen3MoeModel,
-    small_qwen3_moe_config,
-)
-from llmtuner.config import ParallelConfig
+experiment = import_module("experiments.mini-llmtuner")
+ExperimentConfig = experiment.ExperimentConfig
+ExperimentTrainer = experiment.ExperimentTrainer
+ModelContract = experiment.ModelContract
+Qwen3MoeModel = experiment.Qwen3MoeModel
+small_qwen3_moe_config = experiment.small_qwen3_moe_config
+ParallelConfig = experiment.ParallelConfig
 
 
 def test_qwen3_moe_model_exposes_explicit_contract() -> None:
@@ -44,13 +46,10 @@ def test_single_process_training_and_resume(tmp_path) -> None:
 
 
 def test_experiment_rejects_unimplemented_cp_pp() -> None:
-    import pytest
-
-    with pytest.raises(ValueError, match="TP/EP/FSDP only"):
-        ExperimentConfig(
-            parallel=ParallelConfig(
-                data_parallel_shard_size=1, context_parallel_kv_allgather_size=2
-            )
+    with pytest.raises(NotImplementedError, match="CP/PP"):
+        ExperimentTrainer(
+            ExperimentConfig(parallel=ParallelConfig(context_parallel_size=2)),
+            torch.device("cpu"),
         )
 
 
@@ -85,15 +84,13 @@ def test_resume_matches_continuous_model_moments_and_rng(tmp_path):
         if isinstance(value, torch.Tensor):
             assert torch.equal(value, actual_optim[name]), name
         else:
-            assert value == actual_optim[name], name
+            assert_nested_equal(value, actual_optim[name])
     assert torch.equal(expected_rng, torch.get_rng_state())
     assert expected_python == random.getstate()
 
 
 def test_plan_is_pure_and_stale_bindings_are_rejected():
-    import pytest
-
-    from experiments.qwen3_moe_framework.resolver import resolve_plan
+    resolve_plan = import_module("experiments.mini-llmtuner.resolver").resolve_plan
 
     model = Qwen3MoeModel(small_qwen3_moe_config())
     parameters = dict(model.named_parameters())
@@ -105,13 +102,11 @@ def test_plan_is_pure_and_stale_bindings_are_rejected():
         for key, parameter in parameters.items()
     )
     model.model.model.norm = torch.nn.Identity()
-    with pytest.raises(ValueError, match="Stale plan binding"):
+    with pytest.raises(ValueError, match="Stale plan"):
         plan.validate_binding(model)
 
 
 def test_sequence_shard_divisibility_is_checked_before_training():
-    import pytest
-
     with pytest.raises(ValueError, match="seq_len must be divisible"):
         ExperimentConfig(
             parallel=ParallelConfig(data_parallel_shard_size=1, tensor_parallel_size=2),
@@ -120,8 +115,6 @@ def test_sequence_shard_divisibility_is_checked_before_training():
 
 
 def test_checkpoint_rejects_changed_data_settings_before_loading_weights(tmp_path):
-    import pytest
-
     parallel = ParallelConfig(data_parallel_shard_size=1)
     path = tmp_path / "checkpoint"
     trainer = ExperimentTrainer(
@@ -141,7 +134,9 @@ def test_checkpoint_rejects_changed_data_settings_before_loading_weights(tmp_pat
 
 
 def test_local_model_config_is_architecture_only(tmp_path):
-    from experiments.qwen3_moe_framework.config import load_model_config
+    load_model_config = import_module(
+        "experiments.mini-llmtuner.config"
+    ).load_model_config
 
     config = small_qwen3_moe_config()
     config.save_pretrained(tmp_path)
@@ -167,7 +162,14 @@ def test_cli_independent_process_checkpoint_continuation(tmp_path):
         ["--steps", "3", "--resume", str(split), "--checkpoint", str(restored)],
     ):
         result = subprocess.run(
-            [sys.executable, "-m", "experiments.qwen3_moe_framework.train", *arguments],
+            [
+                sys.executable,
+                "-m",
+                "experiments.mini-llmtuner.train",
+                "--device",
+                "cpu",
+                *arguments,
+            ],
             env=environment,
             capture_output=True,
             text=True,
@@ -187,4 +189,19 @@ def test_cli_independent_process_checkpoint_continuation(tmp_path):
         if isinstance(value, torch.Tensor):
             assert torch.equal(value, other), name
         else:
-            assert value == other, name
+            assert_nested_equal(value, other)
+
+
+def assert_nested_equal(left, right):
+    if isinstance(left, torch.Tensor):
+        assert torch.equal(left, right)
+    elif isinstance(left, dict):
+        assert left.keys() == right.keys()
+        for key in left:
+            assert_nested_equal(left[key], right[key])
+    elif isinstance(left, (list, tuple)):
+        assert len(left) == len(right)
+        for a, b in zip(left, right, strict=True):
+            assert_nested_equal(a, b)
+    else:
+        assert left == right

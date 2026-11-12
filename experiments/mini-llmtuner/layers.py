@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+from .parallel import CopyToParallel, ReduceFromParallel
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float) -> None:
@@ -182,18 +184,22 @@ class Experts(nn.Module):
             torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
         )
         self.act_fn = nn.SiLU()
+        self.tp_group = None
 
     def forward(
         self, hidden: torch.Tensor, indices: torch.Tensor, scores: torch.Tensor
     ) -> torch.Tensor:
         output = torch.zeros_like(hidden)
-        with torch.no_grad():
-            mask = F.one_hot(indices, num_classes=self.num_experts).permute(2, 1, 0)
-            hits = mask.sum((-1, -2)).gt(0).nonzero().flatten()
-        for expert in hits:
-            slot, token = torch.where(mask[expert])
-            gate, up = F.linear(hidden[token], self.gate_up_proj[expert]).chunk(2, -1)
+        # Fixed expert order keeps TP collectives aligned even for empty owners.
+        for expert in range(self.num_experts):
+            token, slot = torch.where(indices == expert)
+            inputs = hidden[token]
+            if self.tp_group is not None:
+                inputs = CopyToParallel.apply(inputs, self.tp_group)
+            gate, up = F.linear(inputs, self.gate_up_proj[expert]).chunk(2, -1)
             result = F.linear(self.act_fn(gate) * up, self.down_proj[expert])
+            if self.tp_group is not None:
+                result = ReduceFromParallel.apply(result, self.tp_group)
             result = result * scores[token, slot, None]
             output.index_add_(0, token, result.to(output.dtype))
         return output
@@ -207,12 +213,14 @@ class SparseMoE(nn.Module):
         super().__init__()
         self.experts = Experts(config)
         self.gate = Router(config)
+        self.dispatcher = None
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         shape = hidden.shape
         flat = hidden.reshape(-1, shape[-1])
         _, scores, indices = self.gate(flat)
-        return self.experts(flat, indices, scores).reshape(shape)
+        execute = self.experts if self.dispatcher is None else self.dispatcher
+        return execute(flat, indices, scores).reshape(shape)
 
 
 class DecoderLayer(nn.Module):

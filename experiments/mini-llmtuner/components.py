@@ -66,4 +66,6 @@ class OptimizerFactory(Protocol):
 
 class AdamWFactory:
     def __call__(self, parameters, learning_rate: float) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(parameters, lr=learning_rate)
+        return torch.optim.AdamW(
+            parameters, lr=learning_rate, foreach=False, fused=False
+        )

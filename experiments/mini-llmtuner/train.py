@@ -8,18 +8,28 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+try:
+    import torch_npu  # noqa: F401 -- registers the optional NPU device backend
+except ImportError:
+    torch_npu = None
+
 from .config import ExperimentConfig, ParallelConfig
 from .trainer import ExperimentTrainer
 
 
-def _device() -> torch.device:
-    if os.environ.get("LLMTUNER_TEST_DEVICE", "").lower() == "cpu":
+def select_device(kind: str) -> torch.device:
+    if kind == "cpu":
         return torch.device("cpu")
-    return torch.device("cpu")
+    if torch_npu is None or not torch.npu.is_available():
+        raise RuntimeError("NPU requested but torch-npu or NPU devices are unavailable")
+    device = torch.device("npu", int(os.environ.get("LOCAL_RANK", "0")))
+    torch.npu.set_device(device)
+    return device
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", choices=("cpu", "npu"), default="npu")
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
@@ -27,6 +37,9 @@ def main() -> None:
     parser.add_argument("--pp-size", type=int, default=1)
     parser.add_argument("--dp-shard-size", type=int, default=-1)
     parser.add_argument("--model-config", type=Path)
+    parser.add_argument(
+        "--architecture", choices=("qwen3_moe", "qwen3", "llama"), default="qwen3_moe"
+    )
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -35,12 +48,12 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
-    device = _device()
+    device = select_device(args.device)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if device.type != "cpu":
         getattr(torch, device.type).set_device(device)
     if world_size > 1:
-        dist.init_process_group("gloo")
+        dist.init_process_group("hccl" if device.type == "npu" else "gloo")
     trainer = None
     try:
         config = ExperimentConfig(
@@ -50,11 +63,14 @@ def main() -> None:
                 context_parallel_size=args.cp_size,
                 pipeline_parallel_size=args.pp_size,
                 data_parallel_shard_size=(
-                    1 if args.dp_shard_size < 1 else args.dp_shard_size
+                    world_size // (args.tp_size * args.ep_size)
+                    if args.dp_shard_size < 1
+                    else args.dp_shard_size
                 ),
             ),
             steps=args.steps,
             model_config=args.model_config,
+            architecture=args.architecture,
             seq_len=args.seq_len,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,

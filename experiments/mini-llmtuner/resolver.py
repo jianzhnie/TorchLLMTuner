@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .config import ParallelConfig
+from .ownership import ParameterSpec, resolve_parameter_specs
 
 if TYPE_CHECKING:
     from .model import Qwen3MoeModel
@@ -22,8 +23,23 @@ class ExecutionPlan:
     operations: tuple[str, ...]
     targets: tuple[PlanTarget, ...]
     degrees: tuple[int, ...]
+    tp_rules: tuple[tuple[str, str], ...]
+    parameters: tuple[tuple[str, int, tuple[int, ...]], ...]
+    parameter_specs: tuple[ParameterSpec, ...]
 
     def validate_binding(self, model: "Qwen3MoeModel") -> None:
+        current = tuple(
+            (name, id(value), tuple(value.shape))
+            for name, value in model.named_parameters(remove_duplicate=False)
+        )
+        if current != self.parameters:
+            raise ValueError("Stale plan parameter binding or geometry")
+        for spec in self.parameter_specs:
+            if (
+                spec.source() is None
+                or spec.source().requires_grad != spec.requires_grad
+            ):
+                raise ValueError("Stale plan parameter trainability")
         for target in self.targets:
             try:
                 module = model.get_submodule(target.path)
@@ -82,4 +98,18 @@ def resolve_plan(
         operations,
         targets,
         (config.tp_size, config.ep_size, config.data_parallel_shard_size),
+        tuple(model.contract.tp_plan.items()),
+        tuple(
+            (name, id(value), tuple(value.shape))
+            for name, value in model.named_parameters(remove_duplicate=False)
+        ),
+        resolve_parameter_specs(
+            model,
+            model.contract.tp_plan.items(),
+            model.contract.targets,
+            tp=config.tp_size,
+            ep=config.ep_size,
+            fsdp=config.data_parallel_shard_size,
+            gradient_sums=getattr(model.contract, "tp_gradient_sums", ()),
+        ),
     )

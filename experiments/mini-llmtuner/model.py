@@ -4,14 +4,17 @@
 """Model-owned Qwen3-MoE structure and parallel contracts."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType, SimpleNamespace
 
 import torch
 from torch import nn
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+from .assembly import assemble_model
 from .layers import DecoderLayer, Experts, RMSNorm, RotaryEmbedding, Router
+from .parallel import ParallelLinear, ParallelRuntime
 
 
 @torch.no_grad()
@@ -105,6 +108,7 @@ class ModelContract:
     expert_layout: str
     targets: tuple[tuple[str, str, str], ...]
     vocab_size: int
+    tp_gradient_sums: tuple[str, ...] = ()
 
 
 class Qwen3MoeModel(nn.Module):
@@ -114,8 +118,8 @@ class Qwen3MoeModel(nn.Module):
         super().__init__()
         self.model = Qwen3MoeForCausalLM(config)
         tp_plan = {
-            "model.model.embed_tokens": "embedding_rowwise",
-            "model.lm_head": "replicated_with_grad_allreduce",
+            "model.model.embed_tokens": "replicated",
+            "model.lm_head": "replicated",
         }
         for index, layer in enumerate(self.layers):
             prefix = f"model.model.layers.{index}"
@@ -134,6 +138,11 @@ class Qwen3MoeModel(nn.Module):
             tp_plan=MappingProxyType(tp_plan),
             expert_layout="fused_gate_up",
             vocab_size=config.vocab_size,
+            tp_gradient_sums=tuple(
+                f"model.model.layers.{i}.self_attn.{name}.weight"
+                for i in range(config.num_hidden_layers)
+                for name in ("q_norm", "k_norm")
+            ),
             targets=tuple(
                 (f"model.model.layers.{i}", "decoder", "sequence_shard")
                 for i in range(config.num_hidden_layers)
@@ -144,7 +153,7 @@ class Qwen3MoeModel(nn.Module):
                 if layer.moe_block_name is not None
             )
             + (
-                ("model.model.embed_tokens", "embedding", "vocab_shard"),
+                ("model.model.embed_tokens", "embedding", "replicated"),
                 ("model.model.norm", "norm", "replicated"),
                 ("model.lm_head", "head", "replicated"),
             ),
@@ -153,11 +162,19 @@ class Qwen3MoeModel(nn.Module):
     def validate_parallel(self, *, tp_degree: int, ep_degree: int) -> None:
         """Keep Qwen3 geometry and packed expert constraints with the model."""
         config = self.model.config
+        if ep_degree > 1 and not any(
+            layer.moe_block_name is not None for layer in self.layers
+        ):
+            raise ValueError("EP requires at least one declared sparse layer")
+        if tp_degree > 1 and config.attention_dropout:
+            raise ValueError("TP requires zero attention dropout without sharded RNG")
         for name in ("num_attention_heads", "num_key_value_heads"):
             if getattr(config, name) % tp_degree:
                 raise ValueError(f"{name} must be divisible by TP degree")
         if config.moe_intermediate_size % tp_degree:
             raise ValueError("Expert width must be divisible by TP degree")
+        if config.intermediate_size % tp_degree:
+            raise ValueError("Dense MLP width must be divisible by TP degree")
         if config.num_experts % ep_degree:
             raise ValueError("Expert count must be divisible by EP degree")
         for layer in self.layers:
@@ -225,13 +242,72 @@ class Qwen3MoeModel(nn.Module):
         return batch
 
     def parallelize(self, config, *, world_size: int):
-        from .assembly import assemble_model
-
         return assemble_model(self, config, world_size=world_size)
 
-    def apply_expert_parallel(self, mesh) -> None:
-        """Hook for an EP dispatcher; eager MoE needs routing-aware dispatch."""
-        del mesh
-        raise NotImplementedError(
-            "Qwen3-MoE eager experts require an EP dispatcher implementation"
+    def apply_tensor_parallel(
+        self, runtime: ParallelRuntime, rules: tuple[tuple[str, str], ...]
+    ) -> None:
+        """Own Qwen head/packed-half semantics; reuse generic TP collectives."""
+        size = runtime.tp_size
+        rank = torch.distributed.get_rank(runtime.tp_group)
+        for path, layout in rules:
+            if layout == "replicated":
+                continue
+            parent_path, name = path.rsplit(".", 1)
+            parent = self.get_submodule(parent_path)
+            source = getattr(parent, name)
+            if isinstance(source, nn.Linear):
+                replacement = ParallelLinear(
+                    source, runtime.tp_group, layout == "colwise"
+                )
+                setattr(parent, name, replacement)
+            else:
+                if layout == "packed_colwise":
+                    gate, up = source.chunk(2, dim=1)
+                    shard = torch.cat(
+                        (gate.chunk(size, 1)[rank], up.chunk(size, 1)[rank]), dim=1
+                    )
+                else:
+                    shard = source.chunk(size, dim=2)[rank]
+                setattr(
+                    parent,
+                    name,
+                    nn.Parameter(shard.clone(), requires_grad=source.requires_grad),
+                )
+        for layer in self.layers:
+            if layer.moe_block_name is not None:
+                layer.mlp.experts.tp_group = runtime.tp_group
+                layer.mlp.experts.intermediate_dim //= size
+
+
+class Qwen3Model(Qwen3MoeModel):
+    """Dense Qwen3 using the identical Qwen3 attention and dense decoder math.
+
+    Only configuration fields are translated. No HF model or weights are loaded;
+    the resulting state keys match Qwen3ForCausalLM under the wrapper prefix.
+    """
+
+    def __init__(self, config: Qwen3Config) -> None:
+        if config.model_type != "qwen3":
+            raise ValueError("Qwen3Model requires a qwen3 configuration")
+        values = config.to_dict()
+        for name in (
+            "model_type",
+            "num_experts",
+            "num_experts_per_tok",
+            "moe_intermediate_size",
+            "router_aux_loss_coef",
+        ):
+            values.pop(name, None)
+        dense = Qwen3MoeConfig(
+            **values,
+            num_experts=0,
+            num_experts_per_tok=0,
+            moe_intermediate_size=config.intermediate_size,
+            router_aux_loss_coef=0.0,
+        )
+        dense._attn_implementation = config._attn_implementation
+        super().__init__(dense)
+        self.contract = replace(
+            self.contract, architecture="qwen3", expert_layout="none"
         )

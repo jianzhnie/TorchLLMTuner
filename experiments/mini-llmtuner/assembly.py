@@ -1,11 +1,17 @@
-"""Apply a resolved plan through a small, replaceable execution adapter."""
+"""Resolve first, then apply TP → EP → native FSDP2 before building optimizer."""
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
 
 from .config import ParallelConfig
+from .ownership import ParameterMapping, bind_parameter_mappings
+from .parallel import ExpertDispatcher, ParallelRuntime
 from .resolver import ExecutionPlan, resolve_plan
 
 
@@ -13,88 +19,74 @@ from .resolver import ExecutionPlan, resolve_plan
 class AssemblyResult:
     model: torch.nn.Module
     execution: ExecutionPlan
+    runtime: ParallelRuntime = field(default_factory=ParallelRuntime)
+
+    @property
+    def parameter_mappings(self) -> tuple[ParameterMapping, ...]:
+        """Expose provenance and local ownership after all parameter transforms."""
+        return self.runtime.parameter_mappings
+
+    @property
+    def old_to_new_parameters(self) -> Mapping[int, torch.nn.Parameter]:
+        """Original object IDs remain usable after full-size sources are freed."""
+        return MappingProxyType(
+            {entry.source.source_id: entry.target for entry in self.parameter_mappings}
+        )
 
 
 class LocalParallelAdapter:
-    """Single-process adapter; distributed backends can implement this API."""
+    """Single-process execution with no process-group creation."""
+
+    def __init__(self) -> None:
+        self.runtime = ParallelRuntime()
 
     def apply(self, model: torch.nn.Module, plan: ExecutionPlan) -> torch.nn.Module:
-        del plan
         return model
 
 
 class PyTorchParallelAdapter(LocalParallelAdapter):
-    """Native PyTorch 2.1+ adapter for the prototype's declared plan.
-
-    TP and FSDP2 are applied directly to the model.  PP/CP/EP require model
-    specific schedules and are represented by explicit hooks rather than
-    silently changing tensor semantics.
-    """
+    """Explicit meshes, model-owned TP math, generic EP transport, native FSDP2."""
 
     def __init__(self, config: ParallelConfig) -> None:
+        super().__init__()
         self.config = config
 
     def apply(self, model: torch.nn.Module, plan: ExecutionPlan) -> torch.nn.Module:
         if not dist.is_initialized():
             raise RuntimeError(
-                "distributed process group is required for parallel execution"
+                "Parallel execution requires an initialized process group"
             )
-        if self.config.cp_size > 1:
-            raise NotImplementedError("CP needs a model attention/context schedule")
-        if self.config.pp_size > 1:
-            raise NotImplementedError(
-                "PP needs a pipeline schedule and stage input contract"
-            )
-        mesh = self._mesh(model)
-        if self.config.tp_size > 1:
-            model = self._apply_tp(model, mesh["tp"])
-        if self.config.ep_size > 1:
-            model = self._apply_ep(model, mesh)
-        if self.config.data_parallel_shard_size > 1:
-            from torch.distributed.fsdp import fully_shard
-
+        tp, ep, fsdp = plan.degrees
+        device = next(model.parameters()).device.type
+        if fsdp > 1 and device == "cpu":
+            raise ValueError("This prototype requires NPU/CUDA for native FSDP2")
+        mesh = init_device_mesh(
+            device, (fsdp, ep, tp), mesh_dim_names=("fsdp", "ep", "tp")
+        )
+        data_mesh = mesh["fsdp", "ep"]._flatten(mesh_dim_name="data")
+        runtime = ParallelRuntime(
+            tp_group=mesh["tp"].get_group(),
+            ep_group=mesh["ep"].get_group(),
+            data_group=data_mesh.get_group(),
+            norm_group=dist.group.WORLD,
+            tp_size=tp,
+            ep_size=ep,
+            fsdp_size=fsdp,
+            data_rank=data_mesh.get_local_rank(),
+        )
+        self.runtime = runtime
+        if tp > 1:
+            model.apply_tensor_parallel(runtime, plan.tp_rules)
+        if ep > 1:
+            for target in plan.targets:
+                if target.role != "moe":
+                    continue
+                block = model.get_submodule(target.path)
+                block.dispatcher = ExpertDispatcher(block.experts, runtime.ep_group)
+        if fsdp > 1:
             for layer in model.layers:
                 fully_shard(layer, mesh=mesh["fsdp"])
             fully_shard(model, mesh=mesh["fsdp"])
-        return model
-
-    def _mesh(self, model: torch.nn.Module):
-        from torch.distributed.device_mesh import init_device_mesh
-
-        device = next(model.parameters()).device.type
-        tp = self.config.tp_size
-        fsdp = self.config.data_parallel_shard_size
-        if tp * fsdp != dist.get_world_size():
-            raise ValueError("TP x FSDP degree must equal distributed world size")
-        return init_device_mesh(device, (tp, fsdp), mesh_dim_names=("tp", "fsdp"))
-
-    def _apply_tp(self, model: torch.nn.Module, mesh) -> torch.nn.Module:
-        from torch.distributed.tensor.parallel import (
-            ColwiseParallel,
-            RowwiseParallel,
-            parallelize_module,
-        )
-
-        plan = {}
-        for path, layout in model.contract.tp_plan.items():
-            if layout == "packed_colwise":
-                raise NotImplementedError(
-                    "packed expert TP needs a grouped-matmul parameter sharder"
-                )
-            if layout in {"colwise", "packed_colwise"}:
-                plan[path] = ColwiseParallel()
-            elif layout == "rowwise":
-                plan[path] = RowwiseParallel()
-        return parallelize_module(model, mesh, plan)
-
-    def _apply_ep(self, model: torch.nn.Module, mesh) -> torch.nn.Module:
-        # Expert routing is model-specific; expose an explicit hook contract.
-        hook = getattr(model, "apply_expert_parallel", None)
-        if hook is None:
-            raise NotImplementedError(
-                "model must implement apply_expert_parallel(mesh)"
-            )
-        hook(mesh)
         return model
 
 
@@ -105,9 +97,38 @@ def assemble_model(
     world_size: int,
     adapter: LocalParallelAdapter | None = None,
 ) -> AssemblyResult:
-    execution = resolve_plan(model, config, world_size=world_size)
-    execution.validate_binding(model)
+    error = None
+    execution = None
+    try:
+        execution = resolve_plan(model, config, world_size=world_size)
+        execution.validate_binding(model)
+    except Exception as caught:
+        error = caught
+    if world_size > 1 and dist.is_initialized():
+        # Coordinate only after pure local parsing; no collective is hidden in
+        # the resolver. A bad local model must not leave peers building meshes.
+        failed = torch.tensor(
+            int(error is not None), device=next(model.parameters()).device
+        )
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if int(failed):
+            if error is not None:
+                raise error
+            raise RuntimeError("Parallel preflight failed on another rank")
+    elif error is not None:
+        raise error
     selected = adapter or (
         PyTorchParallelAdapter(config) if world_size > 1 else LocalParallelAdapter()
     )
-    return AssemblyResult(selected.apply(model, execution), execution)
+    assembled = selected.apply(model, execution)
+    runtime = selected.runtime
+    runtime.parameter_mappings = bind_parameter_mappings(
+        assembled,
+        execution.parameter_specs,
+        tp=runtime.tp_size,
+        ep=runtime.ep_size,
+        fsdp=runtime.fsdp_size,
+        tp_rank=dist.get_rank(runtime.tp_group) if runtime.tp_size > 1 else 0,
+        ep_rank=dist.get_rank(runtime.ep_group) if runtime.ep_size > 1 else 0,
+    )
+    return AssemblyResult(assembled, execution, runtime)

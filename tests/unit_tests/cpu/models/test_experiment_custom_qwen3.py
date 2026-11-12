@@ -1,6 +1,7 @@
 """Compare experiment-owned math against a separate Transformers reference."""
 
 from copy import deepcopy
+from importlib import import_module
 
 import pytest
 import torch
@@ -8,8 +9,12 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeForCausalLM as Reference,
 )
 
-from experiments.qwen3_moe_framework.config import small_qwen3_moe_config
-from experiments.qwen3_moe_framework.model import Qwen3MoeForCausalLM
+small_qwen3_moe_config = import_module(
+    "experiments.mini-llmtuner.config"
+).small_qwen3_moe_config
+Qwen3MoeForCausalLM = import_module(
+    "experiments.mini-llmtuner.model"
+).Qwen3MoeForCausalLM
 
 
 @pytest.mark.parametrize("tied", [False, True])
@@ -34,7 +39,9 @@ def test_custom_model_matches_reference(tied, backend):
     positions = torch.arange(4).expand(2, -1)
     outputs = []
     for model in (expected, actual):
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.01, foreach=False, fused=False
+        )
         logits = model(input_ids=ids, position_ids=positions, use_cache=False).logits
         logits.square().sum().backward()
         optimizer.step()
@@ -67,7 +74,8 @@ class BlockFramework(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, BlockFramework())
 import torch
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
-from experiments.qwen3_moe_framework.model import Qwen3MoeModel
+from importlib import import_module
+Qwen3MoeModel = import_module("experiments.mini-llmtuner.model").Qwen3MoeModel
 config = Qwen3MoeConfig(vocab_size=16, hidden_size=8, intermediate_size=16,
     moe_intermediate_size=8, num_hidden_layers=1, num_attention_heads=2,
     num_key_value_heads=1, head_dim=4, num_experts=2, num_experts_per_tok=1,

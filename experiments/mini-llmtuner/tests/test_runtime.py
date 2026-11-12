@@ -136,3 +136,28 @@ def test_unimplemented_plans_fail_before_training(option, value):
     parallel = importlib.import_module(f"{PACKAGE}.config").ParallelConfig
     with pytest.raises(NotImplementedError):
         Trainer(Config(parallel=parallel(**{option: value})), torch.device("cpu"))
+
+
+def test_resolver_is_pure_and_rejects_replaced_parameter():
+    model_type = importlib.import_module(f"{PACKAGE}.model").Qwen3MoeModel
+    configuration = importlib.import_module(f"{PACKAGE}.config")
+    resolve = importlib.import_module(f"{PACKAGE}.resolver").resolve_plan
+    model = model_type(configuration.small_qwen3_moe_config())
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+    plan = resolve(
+        model, configuration.ParallelConfig(tensor_parallel_size=2), world_size=2
+    )
+    plan.validate_binding(model)
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert torch.equal(rng, torch.get_rng_state())
+    model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())
+    with pytest.raises(ValueError, match="Stale plan parameter"):
+        plan.validate_binding(model)
+
+
+@pytest.mark.parametrize("degree", [0, -1, True, 1.5])
+def test_parallel_degrees_require_positive_integers(degree):
+    parallel = importlib.import_module(f"{PACKAGE}.config").ParallelConfig
+    with pytest.raises(ValueError, match="positive integer"):
+        parallel(expert_parallel_size=degree)
