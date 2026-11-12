@@ -6,10 +6,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from importlib import import_module
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from torch import nn
+from torch import nn
 
 
 @dataclass(frozen=True)
@@ -38,8 +37,13 @@ class ModelSpec:
         return config
 
     def resolve_model_class(self) -> type[nn.Module]:
-        """Load only the selected implementation."""
-        return self.model_class_loader()
+        """Validate the selected implementation without constructing a model."""
+        model_class = self.model_class_loader()
+        if not isinstance(model_class, type) or not issubclass(model_class, nn.Module):
+            raise TypeError(
+                f"Model {self.model_type!r} loader must return an nn.Module class"
+            )
+        return model_class
 
     def build_model(self, config: Any) -> nn.Module:
         """Construct this registration without changing configuration ownership."""
