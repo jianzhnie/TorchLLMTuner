@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from llmtuner.errors import EnvironmentUnsupportedError
+from llmtuner.errors import EnvironmentUnsupportedError, UnsupportedCombinationError
 from llmtuner.kernel.ops import varlen_attention as kernels
 from llmtuner.models.kimi.kimi_k3 import multimodal
 
@@ -27,7 +27,7 @@ def test_missing_cuda_runtime_preserves_cause(monkeypatch):
 
 
 def test_npu_dispatch_preserves_packed_contract(monkeypatch):
-    query = SimpleNamespace(device=SimpleNamespace(type="npu"), shape=(7, 2, 4))
+    query = SimpleNamespace(device=SimpleNamespace(type="npu"), shape=(7, 2, 4), ndim=3)
     offsets = torch.tensor([0, 3, 7], dtype=torch.int32)
     output = torch.randn(7, 2, 4)
     calls = []
@@ -65,3 +65,69 @@ def test_model_owns_output_reshape_and_preserves_gradient(monkeypatch):
     torch.testing.assert_close(values.grad, torch.full_like(values, 2))
     assert calls[0][1] == {"deterministic": True}
     assert calls[0][0][3] is offsets
+
+
+def test_cuda_dispatch_keeps_vendor_flags_and_tuple_output(monkeypatch):
+    query = SimpleNamespace(device=torch.device("cuda"), ndim=3, dtype=torch.float16)
+    offsets = torch.tensor([0, 3], dtype=torch.int32)
+    output = torch.randn(3, 2, 4)
+    calls = []
+
+    def flash(*args, **kwargs):
+        calls.append((args, kwargs))
+        return output, object()
+
+    monkeypatch.setattr(kernels, "flash_attn_varlen_func", flash)
+    actual = kernels.varlen_attention(
+        query, query, query, offsets, offsets, 3, 3, deterministic=True
+    )
+    assert actual is output
+    assert calls[0][0] == (query, query, query, offsets, offsets, 3, 3)
+    assert calls[0][1] == {"causal": False, "deterministic": True}
+
+
+def test_npu_determinism_request_is_not_silently_ignored(monkeypatch):
+    query = SimpleNamespace(device=SimpleNamespace(type="npu"))
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Unsupported deterministic mode reached the kernel")
+
+    monkeypatch.setattr(kernels, "fusion_attention", unexpected)
+    with pytest.raises(UnsupportedCombinationError, match="deterministic=True"):
+        kernels.varlen_attention(
+            query, query, query, None, None, None, None, deterministic=True
+        )
+
+
+@pytest.mark.parametrize("shape", [(2, 3, 4, 8), (3, 2, 0)])
+def test_npu_rejects_bad_shape_before_scale_or_kernel(monkeypatch, shape):
+    query = SimpleNamespace(
+        device=SimpleNamespace(type="npu"), ndim=len(shape), shape=shape
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Malformed input reached the kernel")
+
+    monkeypatch.setattr(kernels, "fusion_attention", unexpected)
+    with pytest.raises(ValueError, match="TND|nonzero head dimension"):
+        kernels.varlen_attention(query, query, query, None, None, None, None)
+
+
+@pytest.mark.parametrize("mismatch", ["device", "dtype", "ndim"])
+def test_cuda_rejects_incompatible_metadata_before_vendor(monkeypatch, mismatch):
+    query = SimpleNamespace(device=torch.device("cuda:0"), ndim=3, dtype=torch.float16)
+    key = SimpleNamespace(**vars(query))
+    setattr(
+        key,
+        mismatch,
+        {"device": torch.device("cuda:1"), "dtype": torch.bfloat16, "ndim": 4}[
+            mismatch
+        ],
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Incompatible metadata reached FlashAttention")
+
+    monkeypatch.setattr(kernels, "flash_attn_varlen_func", unexpected)
+    with pytest.raises(ValueError, match="same device|same dtype|TND"):
+        kernels.varlen_attention(query, key, query, None, None, None, None)

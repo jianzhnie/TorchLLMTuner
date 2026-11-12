@@ -7,7 +7,8 @@ output reshaping. This API never moves tensors or selects a CPU fallback.
 import torch
 
 from ...accelerator.device import is_device_type_available
-from ...errors import EnvironmentUnsupportedError
+from ...errors import EnvironmentUnsupportedError, UnsupportedCombinationError
+from ..validation import require_same_device
 from .attention import fusion_attention
 
 FLASH_ATTN_IMPORT_ERROR: ImportError | None = None
@@ -34,8 +35,18 @@ def varlen_attention(
 
     CUDA keeps the vendor's offset/maximum-length contract. Ascend delegates
     geometry and offset validation to the existing fusion_attention API.
+    Its deterministic mode is not established, so an explicit request is rejected.
     """
     if query.device.type == "npu":
+        if deterministic:
+            raise UnsupportedCombinationError(
+                "Ascend variable-length attention has no validated deterministic "
+                "mode; deterministic=True is unsupported"
+            )
+        if any(tensor.ndim != 3 for tensor in (query, key, value)):
+            raise ValueError("Packed attention expects TND tensors")
+        if query.shape[-1] == 0:
+            raise ValueError("Attention requires a nonzero head dimension")
         output = fusion_attention(
             query,
             key,
@@ -50,6 +61,11 @@ def varlen_attention(
             raise EnvironmentUnsupportedError(
                 "CUDA variable-length attention requires flash_attn"
             ) from FLASH_ATTN_IMPORT_ERROR
+        if any(tensor.ndim != 3 for tensor in (query, key, value)):
+            raise ValueError("Packed attention expects TND tensors")
+        require_same_device(query, key, value)
+        if not query.dtype == key.dtype == value.dtype:
+            raise ValueError("Attention inputs must have the same dtype")
         output = flash_attn_varlen_func(
             query,
             key,
@@ -63,6 +79,7 @@ def varlen_attention(
         )
     else:
         raise EnvironmentUnsupportedError(
-            f"Accelerator variable-length attention does not support {query.device.type}"
+            "Accelerator variable-length attention does not support "
+            f"{query.device.type}"
         )
     return output[0] if isinstance(output, tuple) else output

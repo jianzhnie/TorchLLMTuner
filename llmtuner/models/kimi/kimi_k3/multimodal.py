@@ -84,16 +84,14 @@ def multihead_attention(
     """Packed non-causal attention using the device kernel.
 
     Args:
-        q, k, v: tensor of shape (batch_size, seqlen, num_heads, head_dim),
-            or (tot_seqlens, num_heads, head_dim) if packing.
+        q, k, v: packed tensors of shape (tokens, num_heads, head_dim).
         q_cu_seqlens (torch.Tensor): cumulative sequence lengths of q.
             The first element should be 0 and the last element should be q.shape[0].
         k_cu_seqlens (torch.Tensor): cumulative sequence lengths of k.
             The first element should be 0 and the last element should be k.shape[0].
 
     Returns:
-        output: shape (batch_size, seqlen, dim) or (tot_seqlens, dim) if packing,
-            where dim = num_heads * head_dim
+        output: shape (tokens, dim), where dim = num_heads * head_dim
     """
     return varlen_attention(
         q,
