@@ -233,3 +233,42 @@ def test_runtime_replication_creates_independent_nonpersistent_buffers(monkeypat
         torch.testing.assert_close(part.runtime.cache, model.runtime.cache)
         assert part.runtime.cache.data_ptr() != model.runtime.cache.data_ptr()
     assert parts[0].runtime.cache.data_ptr() != parts[1].runtime.cache.data_ptr()
+
+
+def test_ownership_preflight_needs_no_mesh_copy_or_collective(monkeypatch):
+    model = Decoder()
+    parameters = tuple(model.named_parameters())
+    values = tuple(parameter.detach().clone() for _, parameter in parameters)
+    rng = torch.get_rng_state().clone()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("ownership preflight must remain local and read-only")
+
+    monkeypatch.setattr(partition.copy, "deepcopy", forbidden)
+    monkeypatch.setattr(partition, "ComposablePipelineStage", forbidden)
+    monkeypatch.setattr(partition, "get_schedule_class", forbidden)
+    monkeypatch.setattr(dist, "all_reduce", forbidden)
+    partition.validate_pipeline_ownership(model, [["layers.3"], ["layers.7"]])
+    assert torch.equal(torch.get_rng_state(), rng)
+    current = tuple(model.named_parameters())
+    for (name, parameter), (old_name, old_parameter), value in zip(
+        current, parameters, values, strict=True
+    ):
+        assert name == old_name and parameter is old_parameter
+        torch.testing.assert_close(parameter, value, rtol=0, atol=0)
+
+
+def test_ownership_preflight_rejects_shared_parameters_without_splitting():
+    model = Decoder()
+    first = model.layers._modules["3"]
+    second = model.layers._modules["7"]
+    second.weight = first.weight
+    shared = first.weight
+    with pytest.raises(UnsupportedCombinationError, match="shared parameter"):
+        partition.validate_pipeline_ownership(model, [["layers.3"], ["layers.7"]])
+    assert first.weight is second.weight is shared
+
+
+def test_ownership_preflight_requires_a_stage():
+    with pytest.raises(ValueError, match="at least one stage"):
+        partition.validate_pipeline_ownership(Decoder(), [])

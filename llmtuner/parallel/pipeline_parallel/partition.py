@@ -129,7 +129,11 @@ class ComposablePipelineStage(PipelineStage):
             self.scale_grads(grad_scale_factor)
 
 
-__all__ = ["generate_llm_fqn_per_model_part", "split_model_into_stages"]
+__all__ = [
+    "generate_llm_fqn_per_model_part",
+    "split_model_into_stages",
+    "validate_pipeline_ownership",
+]
 
 
 def generate_llm_fqn_per_model_part(
@@ -370,75 +374,20 @@ def build_stage_from_modules(
     return stage, model
 
 
-def split_model_into_stages(
+def validate_pipeline_ownership(
     whole_model: nn.Module,
-    pp_mesh: DeviceMesh,
-    pp_schedule: str,
-    device: torch.device,
     module_names_per_stage: list[list[str]],
-    get_mesh: Callable | None = None,
     *,
     replicated_module_names: tuple[str, ...] = (),
-) -> tuple[list[PipelineStage], list[nn.Module]]:
-    """Build this rank's pipeline stages from a per-stage module assignment.
+) -> None:
+    """Validate global stage ownership without a mesh or model mutation.
 
-    Each stage gets its own deep copy of the model with every module it does not
-    own removed -- layers deleted from the ``ModuleList``, everything else
-    replaced by ``nn.Identity``. A deep copy per stage (rather than a partial
-    view) is what lets a rank own two stages of different shapes.
-
-    Explicit models validate exact ownership and select their stage tensor I/O;
-    registered FQNs are pruned without renumbering blocks. Legacy callers retain
-    top-level container pruning and must tolerate removed layers in forward and
-    initialization.
-
-    Args:
-        whole_model: The complete model to split.
-        pp_mesh: The pipeline-parallel device mesh.
-        pp_schedule: Schedule name; used to decide looped vs V layout.
-        device: Device the stages run on.
-        module_names_per_stage: Module names for each stage, dot-separated:
-            ``"tok_embeddings"``, ``"layers.0"``, ``"norm"``, ``"lm_head"``.
-        replicated_module_names: Explicit parameter-free runtime modules to copy
-            per stage. Persistent checkpoint state cannot be replicated here.
-        get_mesh: Optional callback letting a stage resolve a ``DeviceMesh`` for
-            an incoming tensor. llmtuner leaves this ``None``: it exists so stages
-            can rebuild DTensors, and llmtuner passes plain tensors.
-
-    Returns:
-        ``(stages, models)`` -- the ``PipelineStage`` objects for this rank and
-        their corresponding model chunks.
+    Check model-owned partition constraints, overlapping targets, checkpoint
+    coverage and shared resources before creating any local stage. This is a
+    local preflight only; callers coordinate failures across ranks separately.
     """
-    pp_rank = pp_mesh.get_local_rank()
-    pp_size = pp_mesh.size()
-    supports_get_mesh = "get_mesh" in inspect.signature(PipelineStage).parameters
-    if get_mesh is not None and not supports_get_mesh:
-        raise ValueError("this PyTorch PipelineStage does not support get_mesh")
-
-    num_stages = len(module_names_per_stage)
-    stages = []
-    models = []
-
-    schedule_class = get_schedule_class(pp_schedule)
-    style = (
-        "v" if schedule_class in (ScheduleZBVZeroBubble, ScheduleDualPipeV) else "loop"
-    )
-
-    if num_stages < 1 or num_stages % pp_size != 0:
-        raise ValueError(
-            f"num_stages {num_stages} must be evenly divisible by pp_size {pp_size}"
-        )
-    stages_per_rank = num_stages // pp_size
-    if style == "loop":
-        stage_indices = tuple(pp_rank + s * pp_size for s in range(stages_per_rank))
-    else:
-        # "v": the rank takes one stage from each half, paired front-to-back.
-        if stages_per_rank != 2:
-            raise ValueError(
-                f"v schedules assume 2 stages per rank, got {stages_per_rank}"
-            )
-        stage_indices = (pp_rank, num_stages - 1 - pp_rank)
-
+    if not module_names_per_stage:
+        raise ValueError("PP ownership requires at least one stage")
     if isinstance(getattr(whole_model, "decoder_structure", None), DecoderStructure):
         validate = getattr(whole_model, "validate_pipeline_partition", None)
         configure = getattr(whole_model, "configure_pipeline_stage", None)
@@ -589,6 +538,82 @@ def split_model_into_stages(
                 validate_storage_owner(
                     parameter, f"{module_name}.{name}", stage_idx, module_name
                 )
+
+
+def split_model_into_stages(
+    whole_model: nn.Module,
+    pp_mesh: DeviceMesh,
+    pp_schedule: str,
+    device: torch.device,
+    module_names_per_stage: list[list[str]],
+    get_mesh: Callable | None = None,
+    *,
+    replicated_module_names: tuple[str, ...] = (),
+) -> tuple[list[PipelineStage], list[nn.Module]]:
+    """Build this rank's pipeline stages from a per-stage module assignment.
+
+    Each stage gets its own deep copy of the model with every module it does not
+    own removed -- layers deleted from the ``ModuleList``, everything else
+    replaced by ``nn.Identity``. A deep copy per stage (rather than a partial
+    view) is what lets a rank own two stages of different shapes.
+
+    Explicit models validate exact ownership and select their stage tensor I/O;
+    registered FQNs are pruned without renumbering blocks. Legacy callers retain
+    top-level container pruning and must tolerate removed layers in forward and
+    initialization.
+
+    Args:
+        whole_model: The complete model to split.
+        pp_mesh: The pipeline-parallel device mesh.
+        pp_schedule: Schedule name; used to decide looped vs V layout.
+        device: Device the stages run on.
+        module_names_per_stage: Module names for each stage, dot-separated:
+            ``"tok_embeddings"``, ``"layers.0"``, ``"norm"``, ``"lm_head"``.
+        replicated_module_names: Explicit parameter-free runtime modules to copy
+            per stage. Persistent checkpoint state cannot be replicated here.
+        get_mesh: Optional callback letting a stage resolve a ``DeviceMesh`` for
+            an incoming tensor. llmtuner leaves this ``None``: it exists so stages
+            can rebuild DTensors, and llmtuner passes plain tensors.
+
+    Returns:
+        ``(stages, models)`` -- the ``PipelineStage`` objects for this rank and
+        their corresponding model chunks.
+    """
+    pp_rank = pp_mesh.get_local_rank()
+    pp_size = pp_mesh.size()
+    supports_get_mesh = "get_mesh" in inspect.signature(PipelineStage).parameters
+    if get_mesh is not None and not supports_get_mesh:
+        raise ValueError("this PyTorch PipelineStage does not support get_mesh")
+
+    num_stages = len(module_names_per_stage)
+    stages = []
+    models = []
+
+    schedule_class = get_schedule_class(pp_schedule)
+    style = (
+        "v" if schedule_class in (ScheduleZBVZeroBubble, ScheduleDualPipeV) else "loop"
+    )
+
+    if num_stages < 1 or num_stages % pp_size != 0:
+        raise ValueError(
+            f"num_stages {num_stages} must be evenly divisible by pp_size {pp_size}"
+        )
+    stages_per_rank = num_stages // pp_size
+    if style == "loop":
+        stage_indices = tuple(pp_rank + s * pp_size for s in range(stages_per_rank))
+    else:
+        # "v": the rank takes one stage from each half, paired front-to-back.
+        if stages_per_rank != 2:
+            raise ValueError(
+                f"v schedules assume 2 stages per rank, got {stages_per_rank}"
+            )
+        stage_indices = (pp_rank, num_stages - 1 - pp_rank)
+
+    validate_pipeline_ownership(
+        whole_model,
+        module_names_per_stage,
+        replicated_module_names=replicated_module_names,
+    )
 
     for stage_idx in stage_indices:
         module_names = module_names_per_stage[stage_idx]
