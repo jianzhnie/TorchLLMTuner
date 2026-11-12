@@ -123,6 +123,21 @@ class ParallelPlan:
         return tuple(tuple(paths) for paths in groups.values() if len(paths) > 1)
 
     def __post_init__(self) -> None:
+        # Frozen attributes do not freeze caller-owned lists. Snapshot plan
+        # containers before deriving ownership metadata; retain tensor identity.
+        for name in ("targets", "degrees", "operations"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+        for name in (
+            "shared_parameters",
+            "tp_plan",
+            "token_history_requirements",
+            "module_bindings",
+            "parameter_bindings",
+            "buffer_bindings",
+        ):
+            values = getattr(self, name)
+            if values is not None:
+                object.__setattr__(self, name, tuple(tuple(value) for value in values))
         if not isinstance(self.stage, str) or not self.stage.strip():
             raise ValueError("Parallel plan stage must not be empty")
         if type(self.degree) is not int or self.degree < 1:

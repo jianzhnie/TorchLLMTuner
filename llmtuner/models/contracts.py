@@ -13,6 +13,17 @@ from dataclasses import dataclass
 from torch import nn
 
 
+def registered_submodule(model: nn.Module, path: str) -> nn.Module:
+    """Bind a state-dict module path without following unregistered attributes."""
+    module = model
+    for name in path.split(".") if path else ():
+        child = module._modules.get(name)
+        if not isinstance(child, nn.Module):
+            raise AttributeError(f"Declared module {path!r} is not registered")
+        module = child
+    return module
+
+
 @dataclass(frozen=True, slots=True)
 class BoundDecoderStructure:
     """Ephemeral instance references; never attach as registered submodules."""
@@ -160,11 +171,11 @@ class DecoderStructure:
             raise ValueError("Decoder attention must be a direct child name or None")
 
     def bind(self, model: nn.Module) -> BoundDecoderStructure:
-        decoder = model.get_submodule(self.decoder)
-        embedding = model.get_submodule(self.embedding)
-        blocks = model.get_submodule(self.blocks)
-        norm = model.get_submodule(self.norm)
-        head = model.get_submodule(self.head)
+        decoder = registered_submodule(model, self.decoder)
+        embedding = registered_submodule(model, self.embedding)
+        blocks = registered_submodule(model, self.blocks)
+        norm = registered_submodule(model, self.norm)
+        head = registered_submodule(model, self.head)
         if not isinstance(blocks, nn.ModuleList):
             raise TypeError(f"Decoder blocks {self.blocks!r} must be a ModuleList")
         return BoundDecoderStructure(self, decoder, embedding, blocks, norm, head)
@@ -182,7 +193,7 @@ class DecoderStructure:
             or "." in self.attention
         ):
             raise ValueError("CP requires a declared direct attention child name")
-        blocks = model.get_submodule(self.blocks)
+        blocks = registered_submodule(model, self.blocks)
         if not isinstance(blocks, nn.ModuleList):
             raise TypeError(f"Decoder blocks {self.blocks!r} must be a ModuleList")
         attentions = []

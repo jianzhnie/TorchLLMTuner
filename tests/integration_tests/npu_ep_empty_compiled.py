@@ -6,13 +6,17 @@ target-model or performance acceptance is implied.
 """
 
 import copy
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from transformers import Qwen3MoeConfig
 
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
-from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
+from llmtuner.parallel.expert_parallel.model_replacement import (
+    resolve_ep_plan,
+    swap_moe_blocks,
+)
 from tests.integration_tests.harness import init_distributed
 
 
@@ -41,10 +45,22 @@ def main() -> None:
             gate.copy_(gate.new_tensor([0.04, 0.02, -0.02, -0.04])[:, None])
         local = copy.deepcopy(source)
         assert swap_moe_blocks(local, router_aux_loss_coef=0.0) == 1
-        assert (
-            swap_moe_blocks(source, ep_group=dist.group.WORLD, router_aux_loss_coef=0.0)
-            == 1
-        )
+        plan = resolve_ep_plan(source, degree=2)
+        assert len(plan.targets) == 1
+        assert plan.targets[0].module is source.layers[0].mlp
+        with patch(
+            "llmtuner.parallel.expert_parallel.model_replacement.find_moe_candidates",
+            side_effect=AssertionError("EP execution rediscovered model targets"),
+        ):
+            assert (
+                swap_moe_blocks(
+                    source,
+                    ep_group=dist.group.WORLD,
+                    router_aux_loss_coef=0.0,
+                    resolved_plan=plan,
+                )
+                == 1
+            )
         reference = local.layers[0].mlp
         candidate = source.layers[0].mlp
         candidate.compile(backend="aot_eager", fullgraph=True)

@@ -506,6 +506,15 @@ def test_cp_plan_resolution_preserves_model_and_rng(monkeypatch):
     torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
 
 
+def test_cp_resolver_rejects_eager_flex_before_execution():
+    model = _FakeModel("sdpa")
+    model.config.attention_backend = "eager_flex"
+    with pytest.raises(NotImplementedError, match="eager Flex"):
+        cp_module.resolve_cp_plan(model, cfg=_cp_config())
+    assert model.config._attn_implementation == "sdpa"
+    assert not hasattr(model, "cp_mesh")
+
+
 @pytest.mark.parametrize("strategy", ["kv_allgather", "ulysses"])
 def test_cp_execution_consumes_bound_targets_without_rediscovery(monkeypatch, strategy):
     model = _FakeModel("sdpa")

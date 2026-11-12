@@ -153,7 +153,11 @@ class GroupedExperts(nn.Module):
             )
         # Grouped GEMM consumes int32 cumulative ends. Reject overflow from
         # metadata before narrowing counts, including meta/preflight inputs.
-        if x_RD.shape[0] > torch.iinfo(torch.int32).max:
+        if torch.compiler.is_compiling():
+            # EP all-to-all produces an unbacked symbolic row count. Express
+            # the bound as a runtime constraint instead of a Python branch.
+            torch._check(x_RD.shape[0] <= torch.iinfo(torch.int32).max)
+        elif x_RD.shape[0] > torch.iinfo(torch.int32).max:
             raise ValueError("Routed token count exceeds int32 grouped GEMM offsets")
         if num_tokens_per_expert_E.shape != (self.num_experts,):
             raise ValueError(

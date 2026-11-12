@@ -123,3 +123,25 @@ def test_root_decoder_can_declare_direct_children():
     bound = structure.bind(model)
     assert bound.decoder is model
     assert bound.blocks is model.layers
+
+
+@pytest.mark.parametrize("role", ["decoder", "embedding", "blocks", "norm", "head"])
+def test_binding_rejects_unregistered_module_attributes(role):
+    model = Qwen3MoeForCausalLM(small_config())
+    structure = model.decoder_structure
+    path = getattr(structure, role)
+    parent_path, _, name = path.rpartition(".")
+    parent = model.get_submodule(parent_path)
+    module = parent._modules.pop(name)
+    object.__setattr__(parent, name, module)
+    assert model.get_submodule(path) is module
+    with pytest.raises(AttributeError, match="not registered"):
+        structure.bind(model)
+
+
+def test_attention_binding_rejects_unregistered_block_collection():
+    model = Qwen3MoeForCausalLM(small_config())
+    blocks = model.model._modules.pop("layers")
+    object.__setattr__(model.model, "layers", blocks)
+    with pytest.raises(AttributeError, match="not registered"):
+        model.decoder_structure.bind_attentions(model)

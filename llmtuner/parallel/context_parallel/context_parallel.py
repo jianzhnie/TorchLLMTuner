@@ -46,6 +46,8 @@ def _cp_options(model: nn.Module, cfg: ParallelConfig) -> CPAttentionOptions:
     if strategy not in {"kv_allgather", "ulysses"}:
         raise ValueError(f"Unsupported standard CP strategy {strategy!r}")
     config = getattr(model, "config", None)
+    if getattr(config, "attention_backend", "auto") == "eager_flex":
+        eager_flex_parallel("CP")
     return CPAttentionOptions(
         packed=getattr(config, "attn_mask_type", "causal") == "block_causal",
         strategy=strategy,

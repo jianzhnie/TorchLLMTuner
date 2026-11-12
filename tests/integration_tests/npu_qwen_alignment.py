@@ -5,6 +5,8 @@ python tests/integration_tests/npu_qwen_alignment.py --output outputs/alignment
 Set PYTHONPATH to the baseline repository, isolated runtime, and this repository.
 
 This diagnostic uses native SDPA, not packed attention or either full Trainer.
+The candidate is explicit Qwen3-MoE with every layer declared dense; this
+retains the Qwen3 dense attention/MLP scope and does not validate sparse routing.
 It does not establish distributed or Qwen3-8B training equivalence.
 """
 
@@ -22,8 +24,8 @@ import torch
 from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.config.training_config import TrainingConfig
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import build_model_config_for
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from tests.caps import require_env
 from tests.integration_tests.npu_trainer_alignment_config import (
     alignment_runtime_manifest,
@@ -87,10 +89,10 @@ def _baseline() -> tuple[torch.nn.Module, object]:
     return model, Qwen3StateDictAdapter(config, None)
 
 
-def _candidate() -> HFTransformerModel:
+def _candidate(*, device: str = "npu") -> Qwen3MoeForCausalLM:
     config = LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3",
+            model_name_or_path="qwen3_moe",
             vocab_size=128,
             hidden_size=64,
             intermediate_size=128,
@@ -98,6 +100,10 @@ def _candidate() -> HFTransformerModel:
             num_attention_heads=4,
             num_key_value_heads=2,
             arch_overrides={
+                "mlp_only_layers": [0, 1],
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 128,
                 "head_dim": 16,
                 "tie_word_embeddings": False,
                 "rope_parameters": {
@@ -108,7 +114,7 @@ def _candidate() -> HFTransformerModel:
         ),
         training=TrainingConfig(max_seq_len=32, steps=4),
     )
-    return HFTransformerModel(build_model_config_for(config)).to("npu")
+    return Qwen3MoeForCausalLM(build_model_config_for(config)).to(device)
 
 
 def main() -> None:
@@ -138,8 +144,8 @@ def main() -> None:
     reference, adapter = _baseline()
     candidate = _candidate()
     initial = adapter.to_hf(reference.state_dict())
-    candidate.model.load_state_dict(initial, strict=True)
-    for name, parameter in candidate.model.state_dict().items():
+    candidate.load_state_dict(initial, strict=True)
+    for name, parameter in candidate.state_dict().items():
         torch.testing.assert_close(parameter, initial[name], atol=0, rtol=0)
     optimizer_options = {"lr": 1e-3, "foreach": False}
     reference_optimizer = torch.optim.AdamW(reference.parameters(), **optimizer_options)
@@ -159,11 +165,11 @@ def main() -> None:
                 "torchtitan",
                 "torchtitan.models.qwen3.model",
                 "torchtitan_npu",
-                "llmtuner.models.hf.model",
+                "llmtuner.models.qwen.qwen3.model",
             )
         ),
         "metric_source": str(metric_path),
-        "candidate_config": candidate.model.config.to_dict(),
+        "candidate_config": candidate.config.to_dict(),
         "optimizer": reference_optimizer.defaults,
         "steps": args.steps,
         "clip_norm": 1.0,
@@ -189,7 +195,7 @@ def main() -> None:
         reference_optimizer.zero_grad()
         candidate_optimizer.zero_grad()
         expected = reference(tokens)
-        actual = candidate(tokens.flatten()).reshape_as(expected)
+        actual = candidate(tokens.flatten()).logits.reshape_as(expected)
         result = {
             "step": step,
             "logits": metrics.compare_tensors(
@@ -207,7 +213,7 @@ def main() -> None:
             {name: parameter.grad for name, parameter in reference.named_parameters()}
         )
         result["gradients"] = {}
-        for name, parameter in candidate.model.named_parameters():
+        for name, parameter in candidate.named_parameters():
             assert parameter.grad is not None, name
             observed = parameter.grad.detach().cpu()
             expected = reference_gradients[name]
@@ -231,7 +237,7 @@ def main() -> None:
         candidate_optimizer.step()
         mapped = adapter.to_hf(reference.state_dict())
         result["weights"] = {}
-        for name, parameter in candidate.model.state_dict().items():
+        for name, parameter in candidate.state_dict().items():
             observed, expected = parameter.detach().cpu(), mapped[name].detach().cpu()
             result["weights"][name] = metrics.compare_tensors(observed, expected)
             torch.testing.assert_close(observed, expected, atol=1e-5, rtol=1e-4)

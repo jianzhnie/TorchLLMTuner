@@ -28,6 +28,30 @@ def test_plan_counts_resolved_targets_without_tensor_payloads() -> None:
         plan.degree = 4
 
 
+def test_plan_snapshots_caller_owned_containers_without_copying_parameters():
+    model = nn.Linear(2, 2)
+    target = PlanTarget("", "dense", model)
+    targets = [target]
+    operations = ["shard"]
+    parameters = [[name, value] for name, value in model.named_parameters()]
+    plan = ParallelPlan(
+        "tp",
+        targets,
+        2,
+        "functional",
+        operations=operations,
+        parameter_bindings=parameters,
+    )
+    targets.clear()
+    operations[0] = "other"
+    parameters[0][1] = nn.Parameter(torch.zeros_like(model.weight))
+    parameters.clear()
+    assert plan.targets == (target,)
+    assert plan.operations == ("shard",)
+    assert plan.parameter_bindings[0][1] is model.weight
+    plan.validate_binding(model)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

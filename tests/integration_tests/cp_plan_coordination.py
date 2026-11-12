@@ -28,6 +28,7 @@ from llmtuner.config.parallel_config import (
     PipelineParallelConfig,
 )
 from llmtuner.config.training_config import TrainingConfig
+from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.configuration import build_model_config_for
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel import parallelize
@@ -84,8 +85,10 @@ def reject_fault(cfg, topology, device, *, fault: str, faulty_rank: int) -> None
             model.decoder_structure = replace(
                 model.decoder_structure, attention="missing_attention"
             )
-        else:
+        elif fault == "heads":
             model.config.num_attention_heads = 3
+        else:
+            model.config.attention_backend = "eager_flex"
     parameters = tuple(model.parameters())
     values = tuple(parameter.detach().clone() for parameter in parameters)
     implementation = model.config._attn_implementation
@@ -107,17 +110,25 @@ def reject_fault(cfg, topology, device, *, fault: str, faulty_rank: int) -> None
                 device=device,
                 global_batch_size=cfg.global_batch_size,
             )
-        except (ValueError, RuntimeError, AssertionError) as error:
+        except (
+            ValueError,
+            RuntimeError,
+            AssertionError,
+            UnsupportedCombinationError,
+        ) as error:
             caught = error
     outcomes = [None] * dist.get_world_size()
     dist.all_gather_object(outcomes, (type(caught).__name__, str(caught), entered_fsdp))
     for rank, (kind, message, entered) in enumerate(outcomes):
         assert not entered, outcomes
         if rank == faulty_rank:
-            assert kind == "ValueError", outcomes
-            assert (
-                "missing_attention" if fault == "attention" else "divisible"
-            ) in message
+            expected_kind, expected_message = {
+                "attention": ("ValueError", "missing_attention"),
+                "heads": ("ValueError", "divisible"),
+                "backend": ("UnsupportedCombinationError", "eager Flex"),
+            }[fault]
+            assert kind == expected_kind, outcomes
+            assert expected_message in message, outcomes
         else:
             assert kind == "RuntimeError", outcomes
             assert "CP plan validation failed on another rank" in message, outcomes
@@ -152,7 +163,7 @@ def main() -> None:
         topology = ParallelTopology.from_config(cfg.parallel, dist.get_world_size())
         topology.build_device_mesh()
         for faulty_rank in (0, dist.get_world_size() - 1):
-            for fault in ("attention", "heads"):
+            for fault in ("attention", "heads", "backend"):
                 reject_fault(
                     cfg, topology, device, fault=fault, faulty_rank=faulty_rank
                 )
