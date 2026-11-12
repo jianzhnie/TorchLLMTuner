@@ -1,6 +1,6 @@
 # TorchLLMTuner 重构路线图：模型、并行与训练的职责分离
 
-本文给出一套基于现有代码逐步落地的重构方案，目标是让新增模型、增加并行策略和调整训练流程分别发生在各自的责任范围内。
+本文依据[分布式训练框架架构比较](framework_compare/distributed_training_framework_comparison.md)中的建议，结合当前 `llmtuner` 的实现，制定模型、并行与训练三层的重构方案。目标是让新增模型、增加并行策略和调整训练流程各有明确入口，并保留现有数值、设备和恢复语义。
 
 核心方向是：**模型定义数学与结构，计划描述布局与约束，并行层执行变换，训练引擎封装执行差异，Trainer 管理训练生命周期。** 现有拓扑、collective、优化器、DCP 和内存机制继续复用，通过迁移调用方逐步收敛接口。
 
@@ -8,6 +8,7 @@
 
 ## 阅读导航
 
+- [设计取舍](#设计取舍参考建议如何落实到本项目)
 - [一、现状与重构重点](#一现状与重构重点)
 - [二、目标架构与依赖方向](#二目标架构与依赖方向)
 - [三、模型层：统一契约，保留数学差异](#三模型层统一契约保留数学差异)
@@ -17,6 +18,19 @@
 - [七、目标目录与现有代码迁移](#七目标目录与现有代码迁移)
 - [八、分批实施路线](#八分批实施路线)
 - [九、验收与完成标准](#九验收与完成标准)
+
+## 设计取舍：参考建议如何落实到本项目
+
+采用“模型拥有语义、计划隔离解析、装配保持直接、训练服务可替换”的组合。下面列出参考来源与具体落点，避免把框架比较直接变成目录复制。
+
+| 参考经验 | 本项目的设计决定 | 应避免的做法 |
+|---|---|---|
+| TorchTitan 的模型原生契约 | 扩展 `DecoderStructure`、`MoEBlockContract` 和模型 I/O；抽取训练执行接口 | 为所有模型强制引入庞大 BaseModel，或把通用通信复制到模型族 |
+| HyperParallel 的适配器与计划 | 模型族声明规则，解析器绑定精确目标，执行器消费阶段计划 | 在通用 planner 中不断追加模型名、FQN 和候选属性猜测 |
+| FSDPTurbo 的固定装配 | 继续以 `parallelize_model()` 和 `STAGE_ORDER` 组织执行 | 新建第二套 runner、全局单例或隐式 forward 包装链 |
+| 三者的训练服务分层 | 组件通过 builder 和窄接口注入，Trainer 只管理训练生命周期 | helper 接收完整 Trainer，靠属性赋值传递隐式依赖 |
+
+对应参考文档的六项建议，本路线图分别在模型协议、阶段计划、训练引擎、组件构建、模型专用 hook 和三层状态适配中落实。配置、计划和能力矩阵必须分别表达“请求什么”“准备怎样执行”和“验证过什么”。
 
 ## 一、现状与重构重点
 
@@ -94,7 +108,20 @@
 
 对 HF 的处理也要区分：外部配置与权重格式可以保留；已注册生产模型优先走显式家族实现。若需要直接训练 HF 模型，使用模型侧的有边界适配器并列出支持组合，不把通用 HF inspection 重新作为所有模型的默认路径。
 
-### 3.3 模型接入的预期流程
+### 3.3 两个模型接口，分别面向计算与装配
+
+建议将接口概念分为两组，先在现有 `contracts.py` 和模型族文件中落地，不急于新增公共包：
+
+| 接口概念（建议） | 提供的信息 | 不负责的事情 |
+|---|---|---|
+| `ModelExecution` | `prepare_inputs(batch, input_context)`、可调用的模型、规范输出 | 创建进程组、选择 optimizer、保存训练进度 |
+| `ModelDefinition` | 构造与初始化、结构契约、能力检查、阶段规则、state adapter | 接收 Trainer、执行 epoch loop、管理通用 collective |
+
+`input_context` 只提供预处理真正需要的文档边界、位置和序列分片信息，不传入整个 Trainer。输出需明确 labels 是否已移位、mask 的含义及 loss 所需字段。CP 数据准备可以调用并行层提供的分片工具，模型负责声明位置和历史语义。
+
+模型专用 hook 应有明确输入输出，例如专家执行描述、PP 首尾模块或参数替换映射。hook 只描述或适配所属模型，通用 EP dispatcher 与 PP schedule 继续由 `parallel/` 实现。
+
+### 3.4 模型接入的预期流程
 
 新增 MoE 模型时，应依次实现结构与 forward、路由和专家布局声明、TP/EP/CP/PP 能力、初始化与状态映射，再运行计划和数值验证。通用 dispatcher 不根据模型名称决定 score 函数，checkpoint 不根据形状猜专家含义。
 
@@ -120,7 +147,21 @@ Llama 之类的 dense 模型不必制造空 EP 契约；复杂 MoE 的 grouped �
 
 本地检查结束后，由外层统一协调各 rank 的错误，再进入通信阶段。不要在本地校验函数内混入 collective，否则某个 rank 提前失败可能导致其他 rank 等待。
 
-### 4.3 跨阶段身份与装配顺序
+### 4.3 各并行阶段的输入与交付物
+
+| 阶段 | 模型声明 | 计划与执行交付物 |
+|---|---|---|
+| TP | projection/专家参数轴、输入输出布局、共享参数 | 具体 mesh 轴、参数分片及激活归约边界、替换映射 |
+| EP | router 数学、专家布局、shared expert 和 score 位置 | 专家 ownership、dispatcher 配置、dense/sparse 同步责任 |
+| CP | attention/state 类型、历史需求、mask 与位置语义 | 序列分片映射、KV/状态通信接口和 loss 计数规则 |
+| PP | 有序 block ID、首尾模块、stage I/O 和共享权重 | 全局到本地映射、stage 实例、schedule 与 loss owner |
+| FSDP2/HSDP | 包装单元、独立 dtype、共享参数、特殊存储 | mesh、包装与排除单元、预取顺序和梯度缩放规则 |
+| 重计算/交换/编译 | 重放安全性、buffer/state、副作用及可编译区域 | 包装依赖、资源 owner、重复安装检查与组合约束 |
+| 量化 | 支持算子、存储布局、精度与状态格式 | 参数转换及映射、初始化/加载时点、后端能力检查 |
+
+量化目前不在 `STAGE_ORDER` 中，不能直接插入固定位置。先明确具体量化方案与 TP/FSDP、初始化和 checkpoint 的依赖，再在独立批次扩展阶段契约。计划组合应检查前一阶段输出布局能否满足后一阶段输入，不能只验证每个开关单独可用。
+
+### 4.4 跨阶段身份与装配顺序
 
 参数变换应返回模块映射、旧参数到新参数映射和 alias 关系。PP 使用稳定全局 block ID 关联局部对象；FQN、共享身份与 storage 关系分别记录，不能只用字符串替换完成重绑。
 
@@ -251,6 +292,31 @@ llmtuner/
 
 建议装配结果只包含实际消费者需要的字段，例如 `model_parts`、拓扑视图、参数映射、输出布局和执行能力；训练服务单独返回。不要把它变成全局可变 context，也不要让 engine 接收 Trainer 实例。
 
+### 7.1 装配结果替代属性注入
+
+建议把目前 `assemble_trainer_runtime(trainer, cfg)` 的职责逐步收敛为以下连接方式。名称为示意，实施时优先复用已有返回对象：
+
+```text
+模型工厂 + 配置 + 设备能力
+    → 构建模型及声明
+    → 解析阶段计划
+    → parallelize_model()
+    → ModelAssembly（model_parts、拓扑视图、布局与替换映射）
+
+ModelAssembly + loss/optimizer 等 builder
+    → TrainingEngine（前后向与更新）
+    → TrainingServices（数据、checkpoint、观测与资源）
+    → Trainer（持有明确对象，组织生命周期）
+```
+
+迁移期间允许旧入口将返回值赋给现有公开属性，形成临时兼容桥；新组件直接使用返回对象，不再依赖这些属性。桥接层退出条件是所有内部消费者已迁移且公开 API 已有兼容方案。只读输出与可变运行状态分开，避免以一个大 context 代替原有 Trainer 耦合。
+
+### 7.2 用完整调用链检查边界
+
+以 Qwen3-MoE 为首个迁移样本：模型族声明路由和专家存储，EP 解析器绑定专家，后端安装 dispatcher；engine 执行统一前后向，Trainer 按数据进度触发 checkpoint。新增另一个 MoE 家族时，模型差异应停留在模型族与注册入口。
+
+以 dense 模型作为第二个消费者，验证契约没有被 MoE 字段绑死；再使用 VLM 输入和 PP 执行检验 batch、输出与 schedule 接口。每个消费者只声明已支持能力，不以“接口兼容”替代训练等价。
+
 ## 八、分批实施路线
 
 先用生产 Qwen3-MoE 做纵向迁移，再按各模型语义迁移 DeepSeek、Kimi 和 Qwen3.5。实验目录只验证设计，不直接复制为第二套生产 Trainer 或 checkpoint 实现。
@@ -295,7 +361,20 @@ R1/R2 优先减少训练侧依赖；若其迁移暴露模型或布局语义缺�
 
 每次记录代码版本与工作区差异、环境、命令、配置、退出码、日志、数值、资源和剩余缺口。全量测试存在 collection error 时不能标为通过；架构文档不长期抄录容易失效的测试总数。
 
-### 9.2 怎样判断真正完成了解耦
+### 9.2 把架构边界变成可执行检查
+
+建议在迁移批次中逐步加入有真实行为覆盖的检查，而不是只统计 import 数量：
+
+- **独立构造**：从注册入口构建小模型并完成 forward，不创建 Trainer，不初始化分布式 group。
+- **解析纯度**：解析前后对比参数身份、storage、buffer、RNG 和 forward；错误目标在变换前暴露。
+- **独立装配**：测试只使用模型、配置和拓扑完成计划与装配，不创建伪 Trainer 来填充属性。
+- **依赖注入**：替换 loss、optimizer builder 或 metrics 后，Trainer 主循环无需修改；scheduler 使用实际 optimizer 构建。
+- **执行统一**：普通路径与 PP 路径通过相同训练入口运行，分别核对 loss sum、target 分母和更新结果。
+- **状态完整**：在新进程恢复后继续一步，比较参数、moments、RNG、scheduler、EMA 和样本顺序；覆盖构造中途失败和 close 重复调用。
+
+静态依赖检查可作为补充，限制通用 parallel 导入具体模型族、模型导入 Trainer、组件接收 Trainer。已有例外先列出调用方和退出条件，不能通过改成延迟 import 规避边界要求。
+
+### 9.3 怎样判断真正完成了解耦
 
 - 新模型主要修改模型族和注册入口，不扩张通用并行层的模型名判断。
 - 新并行实现消费既有契约和明确布局，不要求修改 Trainer 主循环。
@@ -310,4 +389,4 @@ R1/R2 优先减少训练侧依赖；若其迁移暴露模型或布局语义缺�
 
 当前实现入口：`llmtuner/models/contracts.py`、`llmtuner/models/registry.py`、`llmtuner/parallel/plan.py`、`llmtuner/parallel/stages.py`、`llmtuner/parallel/parallelize.py`、`llmtuner/trainer/runtime/assembly.py`、`llmtuner/trainer/trainer.py`、`llmtuner/trainer/runtime/pipeline.py`。
 
-设计依据见[分布式训练框架架构比较](distributed_training_framework_comparison.md)。实验原型只用于验证接口设计，其代码存在与单进程运行结果不作为生产支持声明。
+设计依据见[分布式训练框架架构比较](framework_compare/distributed_training_framework_comparison.md)。实验原型只用于验证接口设计，其代码存在与单进程运行结果不作为生产支持声明。
