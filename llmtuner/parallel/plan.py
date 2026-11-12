@@ -135,6 +135,8 @@ class ParallelPlan:
         if self.module_bindings is not None:
             for path, module in self.module_bindings:
                 if path == "":
+                    # Absence is part of the resolved semantics too. A minimal
+                    # plan without a root snapshot has no such guarantee.
                     object.__setattr__(self, "decoder_structure_bound", True)
                     structure = getattr(module, "decoder_structure", None)
                     if isinstance(structure, DecoderStructure):

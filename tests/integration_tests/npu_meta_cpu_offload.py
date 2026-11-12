@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from llmtuner.models.hf.materialization import materialize_meta_model
+from llmtuner.memory.materialization import materialize_meta_model
 from llmtuner.trainer.runtime.assembly import _fsdp_managed_parameters
 
 

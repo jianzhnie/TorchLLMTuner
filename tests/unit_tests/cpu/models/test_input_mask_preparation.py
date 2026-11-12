@@ -72,6 +72,22 @@ def test_packed_mask_excludes_padding_keys():
     assert torch.isfinite(extra["attention_masks"][0, 0, 3, 2])
 
 
+def test_packed_input_requires_positions_before_parallel_lookup():
+    model = nn.Linear(4, 4)
+    model.config = SimpleNamespace(attn_mask_type="block_causal")
+    tokens = torch.tensor([1, 2, 3, 4])
+
+    def forbidden(axis):
+        pytest.fail("Missing document positions reached parallel lookup")
+
+    with pytest.raises(ValueError, match="Packed text input requires positions"):
+        prepare_text_inputs(
+            model,
+            {"input": tokens, "labels": tokens},
+            parallel_dims=SimpleNamespace(get_optional_mesh=forbidden),
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.bool])
 def test_nonintegral_positions_reject_before_mesh_lookup(dtype):
     model = nn.Linear(4, 4)
