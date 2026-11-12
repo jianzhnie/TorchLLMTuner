@@ -1,100 +1,73 @@
-"""Reuse production FQN/layout adapters for synchronous DCP recovery."""
+"""Checkpoint conversion boundary, independent from model and trainer."""
 
-import json
-import pickle
 import random
 from pathlib import Path
 from typing import Any
 
 import torch
-import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
-from torch import nn
-
-from llmtuner.accelerator.collectives import synchronize_local_errors
-from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
-from llmtuner.components.optimizer.optimizer import OptimizersContainer
 
 
-class TrainingState:
-    """Own the completed-step cursor and rank-local RNG, not model tensors."""
+class CheckpointAdapter:
+    """Converts runtime state to a portable prototype checkpoint."""
 
-    def __init__(self, device: torch.device, signature: dict[str, Any]) -> None:
-        self.device = device
-        self.signature = json.dumps(signature, sort_keys=True, default=str)
-        self.next_step = 0
-
-    def state_dict(self) -> dict[str, Any]:
-        local = {
-            "python": pickle.dumps(random.getstate()),
-            "cpu": torch.get_rng_state(),
+    def export(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        step: int,
+        signature: str,
+    ) -> dict[str, Any]:
+        model_state = {
+            name: value.detach().cpu().clone()
+            for name, value in model.state_dict().items()
         }
-        if self.device.type != "cpu":
-            local["device"] = getattr(torch, self.device.type).get_rng_state(
-                self.device
-            )
-        states = [local]
-        if dist.is_initialized():
-            states = [None] * dist.get_world_size()
-            dist.all_gather_object(states, local)
         return {
-            "next_step": self.next_step,
-            "signature": self.signature,
-            "rng": {str(rank): state for rank, state in enumerate(states)},
+            "model": model_state,
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "signature": signature,
+            "rng": torch.get_rng_state(),
+            "python_rng": random.getstate(),
         }
 
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        with synchronize_local_errors("Experiment checkpoint compatibility"):
-            if state["signature"] != self.signature:
-                raise ValueError(
-                    "Checkpoint configuration/topology differs from this run"
-                )
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        local = state["rng"][str(rank)]
-        self.next_step = int(state["next_step"])
-        random.setstate(pickle.loads(local["python"]))
-        torch.set_rng_state(local["cpu"].cpu())
-        if self.device.type != "cpu":
-            getattr(torch, self.device.type).set_rng_state(
-                local["device"].cpu(), self.device
-            )
+    def restore(
+        self,
+        payload: dict[str, Any],
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        signature: str,
+    ) -> int:
+        if payload["signature"] != signature:
+            raise ValueError("Checkpoint configuration/topology differs from this run")
+        model.load_state_dict(payload["model"])
+        optimizer.load_state_dict(payload["optimizer"])
+        torch.set_rng_state(payload["rng"])
+        random.setstate(payload["python_rng"])
+        return int(payload["step"])
 
 
 class CheckpointManager:
-    """Synchronous native DCP; targets are built before DCP plans a load.
-
-    Model and optimizer retain their separate lifecycle and TP/EP adapters.
-    Checkpoints are trusted local artifacts; Python RNG uses pickle bytes.
-    This experiment deliberately rejects configuration/topology changes.
-    """
-
     def __init__(
         self,
-        model: nn.Module,
-        optimizer: OptimizersContainer,
-        training: TrainingState,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        signature: str,
+        adapter: CheckpointAdapter | None = None,
     ) -> None:
-        self.model = ModelCheckpointState(model)
-        self.optimizer = optimizer
-        self.training = training
-
-    def _state(self) -> dict[str, Any]:
-        return {
-            "model": self.model,
-            "optimizer": self.optimizer,
-            "training": self.training,
-        }
+        self.model, self.optimizer, self.signature = model, optimizer, signature
+        self.adapter = adapter or CheckpointAdapter()
+        self.step = 0
 
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
-        dcp.save(self._state(), checkpoint_id=str(path))
-        self.model.release_cache()
+        torch.save(
+            self.adapter.export(self.model, self.optimizer, self.step, self.signature),
+            path / "state.pt",
+        )
 
     def load(self, path: Path) -> int:
-        # Validate topology/data settings before touching model or moments.
-        dcp.load({"training": self.training}, checkpoint_id=str(path))
-        dcp.load(
-            {"model": self.model, "optimizer": self.optimizer},
-            checkpoint_id=str(path),
+        payload = torch.load(path / "state.pt", map_location="cpu", weights_only=False)
+        self.step = self.adapter.restore(
+            payload, self.model, self.optimizer, self.signature
         )
-        return self.training.next_step
+        return self.step

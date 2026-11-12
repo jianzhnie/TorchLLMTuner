@@ -26,7 +26,8 @@ RoPE、GQA attention、router、packed experts 和 decoder；`model.py` 自定�
 层栈和输出 head。模型不导入 `llmtuner`，不继承或调用 Transformers modeling 类；
 仅复用 `Qwen3MoeConfig`。包入口延迟加载，独立导入模型不加载训练服务。
 模型支持 eager/SDPA、SiLU 与 default RoPE；其他 RoPE、sliding window、KV cache
-和非零 router auxiliary loss 明确拒绝。训练与分布式服务继续复用 llmtuner。
+和非零 router auxiliary loss 明确拒绝。训练与分布式服务由本实验的最小组件提供，
+不导入 `llmtuner`。
 
 ## 2. 先解析和校验，再修改模型
 
@@ -44,7 +45,7 @@ rank 本地错误，避免其他 rank 进入不匹配的 collective。
 预检可以减少半改模型，但不承诺执行阶段具有事务回滚能力。既有 TP/EP/FSDP
 引擎仍保留自己的转换和必要校验；本实验不是完全由绑定引用驱动的全新执行器。
 
-## 3. 复用通用引擎，不复制分布式数学
+## 3. 计划与执行器分离
 
 统一装配顺序为：
 
@@ -56,7 +57,8 @@ resolve_plan
 ```
 
 `assembly.py` 只负责顺序、依赖和失败协调。通用 collective、专家转换、FSDP 和
-checkpoint 布局继续复用 `llmtuner` 的生产实现，避免两套分布式语义逐渐分叉。
+本地执行器当前只实现单进程安全路径；TP/EP/FSDP 可以通过同一 adapter 接口接入
+真实后端，不改变模型和 trainer。
 
 ## 4. 训练语义明确且可复现
 
@@ -74,9 +76,9 @@ checkpoint 布局继续复用 `llmtuner` 的生产实现，避免两套分布式
 auxiliary loss 和 attention dropout。TP 将每个文档作为独立微批执行，不在序列
 边界直接拼接多个 `[B,T,H]` 输入；不支持的输入会在配置阶段拒绝。
 
-## 5. Checkpoint 复用生产适配，不另造格式
+## 5. Checkpoint 转换独立
 
-`checkpoint.py` 使用生产 `ModelCheckpointState` 和 `OptimizersContainer`，保存：
+`checkpoint.py` 使用独立的 `CheckpointAdapter` 保存：
 
 - 模型及并行布局；
 - FQN optimizer 状态与 Adam moments；
@@ -92,14 +94,14 @@ checkpoint；本实验不支持跨拓扑恢复。
 当前支持：
 
 - 单进程；
-- TP；
-- EP/alltoall；
-- native FSDP；
+- PyTorch 原生 TP（`torch.distributed.tensor.parallel`）；
+- PyTorch FSDP2（`torch.distributed.fsdp.fully_shard`）；
+- EP/CP/PP 的显式模型 hook 和能力检查；
 - 同步 DCP 保存与恢复。
 
 明确未接入：
 
-- CP、PP；
+- CP、PP 的具体 attention/schedule 实现；
 - AC、compile；
 - activation/optimizer swap；
 - 真实数据 pipeline；
@@ -114,15 +116,34 @@ checkpoint；本实验不支持跨拓扑恢复。
 
 ```text
 config.py      实验配置与 Qwen3-MoE 配置读取，只读架构
+protocol.py    ModelProtocol 与 checkpoint adapter 协议
+components.py  可替换 loss、metrics、scheduler 和 profiler
 model.py       显式构造、模块入口、准确 FQN、TP/专家布局与几何约束
 resolver.py    不修改模型的目标绑定、ownership、拓扑和能力预检
 assembly.py    rank 错误协调，然后执行 TP → EP → FSDP
 trainer.py     可恢复合成数据、next-token loss、梯度同步和 AdamW 更新
-checkpoint.py  生产 model/optimizer DCP adapter、游标和逐 rank RNG
+checkpoint.py  模型/optimizer 转换、游标和 RNG
 train.py       Python/torchrun 入口、设备绑定、rank0 摘要和资源关闭
 ```
 
 ## 8. 运行
+
+## 8.1 接入 HuggingFace Llama 和 DeepSeek-V3
+
+直接加载的 HuggingFace causal LM 通过 `HFModelAdapter` 接入，不需要修改
+`BaseTrainer`。工厂会根据 `config.model_type` 选择 Llama 或 DeepSeek-V3 adapter，
+并从实际模块树生成线性层 TP plan，避免依赖固定版本的通配符路径：
+
+```python
+from experiments.qwen3_moe_framework.hf_factory import load_hf_model
+
+model = load_hf_model("meta-llama/Llama-3.2-1B", device=device)
+assembly = model.parallelize(ParallelConfig(), world_size=1)
+```
+
+DeepSeek-V3 的 MoE 专家仍需要模型级 EP dispatcher；Llama 可直接使用通用的
+TP/FSDP2 适配路径。CP 和 PP 仍需为具体 attention 和 pipeline schedule 提供
+显式 hook。
 
 在仓库根目录和已有依赖的 `hyper-parallel-env` 容器内运行。
 

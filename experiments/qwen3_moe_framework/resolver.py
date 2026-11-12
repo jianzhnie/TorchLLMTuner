@@ -1,75 +1,81 @@
-"""Pure preflight: resolve explicit targets and ownership before mutation."""
+"""Pure, framework-independent parallel plan resolution."""
 
-from __future__ import annotations
-
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from llmtuner.config.parallel_config import ParallelConfig
-from llmtuner.parallel.plan import ParallelPlan, PlanTarget
-from llmtuner.parallel.topology import ParallelTopology
+from .config import ParallelConfig
 
 if TYPE_CHECKING:
     from .model import Qwen3MoeModel
 
-ExecutionPlan = ParallelPlan
+
+@dataclass(frozen=True, slots=True)
+class PlanTarget:
+    path: str
+    role: str
+    layout: str
+    module_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPlan:
+    operations: tuple[str, ...]
+    targets: tuple[PlanTarget, ...]
+    degrees: tuple[int, ...]
+
+    def validate_binding(self, model: "Qwen3MoeModel") -> None:
+        for target in self.targets:
+            try:
+                module = model.get_submodule(target.path)
+            except AttributeError as error:
+                raise ValueError(f"Stale plan binding: {target.path}") from error
+            if id(module) != target.module_id:
+                raise ValueError(f"Stale plan binding: {target.path}")
+
+
 ResolvedTarget = PlanTarget
 
 
 def resolve_plan(
-    model: Qwen3MoeModel, config: ParallelConfig, *, world_size: int
+    model: "Qwen3MoeModel", config: ParallelConfig, *, world_size: int
 ) -> ExecutionPlan:
-    """Validate a bounded experiment feature set without touching parameters."""
-    topology = ParallelTopology.from_config(config, world_size)
-    if config.cp_size != 1 or config.pp_size != 1:
-        raise ValueError("This experiment implements TP/EP/FSDP only")
-    if (
-        config.tp_config.tp_colwise_modules
-        or config.tp_config.tp_rowwise_modules
-        or config.tp_config.tp_sequence_modules
+    """Validate geometry without mutating model parameters."""
+    if config.tp_size < 1 or config.ep_size < 1 or config.data_parallel_shard_size < 1:
+        raise ValueError("parallel degrees must be positive")
+    if world_size == 1 and any(
+        degree > 1
+        for degree in (
+            config.tp_size,
+            config.ep_size,
+            config.data_parallel_shard_size,
+            config.cp_size,
+            config.pp_size,
+        )
     ):
         raise ValueError(
-            "Experiment plans do not accept unresolved TP pattern overrides"
+            "parallel degree > 1 requires torchrun with matching world size"
         )
-    if config.fsdp_config.fsdp_apply_modules:
-        raise ValueError("Experiment uses declared decoder units, not FSDP patterns")
-    if config.ep_config.fixed_router or config.ep_config.moe_quantile_balancing:
-        raise ValueError("Experiment requires the model's native top-k routing")
-    if config.ep_config.ep_token_dispatcher != "alltoall":
-        raise ValueError("Experiment currently validates only alltoall EP dispatch")
+    if world_size != config.tp_size * config.ep_size * config.data_parallel_shard_size:
+        if world_size != 1:
+            raise ValueError("world size must equal TP x EP x FSDP degrees")
     model.validate_parallel(tp_degree=config.tp_size, ep_degree=config.ep_size)
     targets = tuple(
-        PlanTarget(path, role, model.get_submodule(path), layout)
+        PlanTarget(path, role, layout, id(model.get_submodule(path)))
         for path, role, layout in model.contract.targets
     )
-    aliases: dict[int, list[str]] = {}
-    for name, parameter in model.named_parameters(remove_duplicate=False):
-        aliases.setdefault(id(parameter), []).append(name)
-    shared = tuple(tuple(names) for names in aliases.values() if len(names) > 1)
-    if shared and config.tp_size > 1:
-        raise ValueError(
-            "Tied weights with TP require a separate experiment acceptance"
-        )
     operations = tuple(
         name
         for name, enabled in (
             ("tp", config.tp_size > 1),
             ("ep", config.ep_size > 1),
-            ("fsdp", topology.dp_shard > 1 or topology.dp_replicate > 1),
+            ("fsdp", config.data_parallel_shard_size > 1),
+            ("cp", config.cp_size > 1),
+            ("pp", config.pp_size > 1),
         )
         if enabled
     )
     return ExecutionPlan(
-        stage="tp,ep,fsdp",
-        targets=targets,
-        degree=config.tp_size,
-        implementation="native",
-        degrees=(
-            config.tp_size,
-            config.ep_size,
-            topology.dp_shard,
-            config.data_parallel_replicate_size,
-        ),
-        shared_parameters=shared,
-        operations=operations,
-        tp_plan=tuple(model.contract.tp_plan.items()),
+        operations,
+        targets,
+        (config.tp_size, config.ep_size, config.data_parallel_shard_size),
     )
