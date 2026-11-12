@@ -64,18 +64,11 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
-from transformers.utils import is_flash_attn_2_available
 
+from ....kernel.ops.rotary import rotary_mul
+from ....kernel.ops.varlen_attention import varlen_attention
 from .configuration import KimiK3Config
 from .model import KimiLinearForCausalLM
-
-# Flash attention imports
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_varlen_func
-else:
-    flash_attn_varlen_func = None
-from ....kernel.ops.attention import fusion_attention
-from ....kernel.ops.rotary import rotary_mul
 
 
 def multihead_attention(
@@ -87,8 +80,8 @@ def multihead_attention(
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     deterministic: bool = False,
-):
-    """Multi-head attention using flash attention 2.
+) -> torch.Tensor:
+    """Packed non-causal attention using the device kernel.
 
     Args:
         q, k, v: tensor of shape (batch_size, seqlen, num_heads, head_dim),
@@ -102,34 +95,16 @@ def multihead_attention(
         output: shape (batch_size, seqlen, dim) or (tot_seqlens, dim) if packing,
             where dim = num_heads * head_dim
     """
-    if q.device.type == "npu":
-        attn_out = fusion_attention(
-            q,
-            k,
-            v,
-            head_num=q.shape[1],
-            scale=1.0 / math.sqrt(q.shape[-1]),
-            q_cu_seqlens=q_cu_seqlens,
-            k_cu_seqlens=k_cu_seqlens,
-        )
-    else:
-        attn_out = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            q_cu_seqlens,
-            k_cu_seqlens,
-            max_seqlen_q,
-            max_seqlen_k,
-            causal=False,
-            deterministic=deterministic,
-        )
-    if isinstance(attn_out, tuple):
-        attn_out = attn_out[0]
-
-    attn_out = attn_out.flatten(start_dim=-2)
-
-    return attn_out
+    return varlen_attention(
+        q,
+        k,
+        v,
+        q_cu_seqlens,
+        k_cu_seqlens,
+        max_seqlen_q,
+        max_seqlen_k,
+        deterministic=deterministic,
+    ).flatten(start_dim=-2)
 
 
 def eager_attention(
