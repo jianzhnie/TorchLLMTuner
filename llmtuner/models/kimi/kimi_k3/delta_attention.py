@@ -52,29 +52,10 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import PretrainedConfig
 
-from ....accelerator.device import is_device_type_available
-from ....errors import EnvironmentUnsupportedError
+from ....kernel.ops.kda import require_kda_kernel
 from .causal_convolution import KimiCausalConvolution
 from .configuration import KimiLinearConfig
 from .normalization import KimiGatedRMSNorm
-
-NPU_KDA_IMPORT_ERROR = None
-ACCELERATOR_KDA_IMPORT_ERROR = None
-
-npu_chunk_kda = None
-if is_device_type_available("npu"):
-    # Optional Ascend packages may access torch.npu during import; CPU model
-    # construction must not load an unavailable device's runtime.
-    try:
-        from triton_ascend_kernels.attention.fla.kda import chunk_kda as npu_chunk_kda
-    except ImportError as error:
-        NPU_KDA_IMPORT_ERROR = error
-
-try:
-    from fla.ops.kda import chunk_kda as accelerator_chunk_kda
-except ImportError as error:
-    accelerator_chunk_kda = None
-    ACCELERATOR_KDA_IMPORT_ERROR = error
 
 
 def validate_kimi_kda_runtime(config: PretrainedConfig, device: torch.device) -> None:
@@ -86,17 +67,7 @@ def validate_kimi_kda_runtime(config: PretrainedConfig, device: torch.device) ->
         return
     if not any(config.is_kda_layer(index) for index in range(config.num_hidden_layers)):
         return
-    if device.type == "npu":
-        kernel, error = npu_chunk_kda, NPU_KDA_IMPORT_ERROR
-        dependency = "triton_ascend_kernels.attention.fla.kda"
-    else:
-        kernel, error = accelerator_chunk_kda, ACCELERATOR_KDA_IMPORT_ERROR
-        dependency = "fla.ops.kda"
-    if kernel is None:
-        raise EnvironmentUnsupportedError(
-            f"Kimi KDA training on {device.type} requires {dependency}. "
-            "Install its compatible accelerator runtime before constructing the model."
-        ) from error
+    require_kda_kernel(device)
 
 
 def recurrent_kda(q, k, v, g, beta, A_log, dt_bias, lower_bound=None):
@@ -241,17 +212,7 @@ class KimiDeltaAttention(nn.Module):
                 q, k, v, g, beta, self.A_log, self.dt_bias, self.gate_lower_bound
             )
         else:
-            if hidden_states.device.type == "npu":
-                chunk_kda = npu_chunk_kda
-                import_error = NPU_KDA_IMPORT_ERROR
-            else:
-                chunk_kda = accelerator_chunk_kda
-                import_error = ACCELERATOR_KDA_IMPORT_ERROR
-            if chunk_kda is None:
-                raise ImportError(
-                    f"Kimi KDA on {hidden_states.device.type} requires its optional "
-                    "KDA kernel runtime (triton_ascend_kernels on NPU, fla otherwise)"
-                ) from import_error
+            chunk_kda = require_kda_kernel(hidden_states.device)
             output, _ = chunk_kda(
                 q=q,
                 k=k,

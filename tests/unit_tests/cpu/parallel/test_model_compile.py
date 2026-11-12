@@ -30,6 +30,10 @@ import contextlib
 
 import pytest
 import torch
+from torch._dynamo import OptimizedModule
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeForCausalLM as ReferenceQwen3MoeForCausalLM,
+)
 
 from llmtuner.accelerator.capabilities import has
 from llmtuner.config import (
@@ -38,22 +42,10 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel import model_compile as compile_mod
 from llmtuner.parallel.model_compile import apply_compile, maybe_regional_inductor
-
-try:
-    from llmtuner.models.hf.factory import build_model_config
-    from llmtuner.models.hf.model import HFTransformerModel
-    from torch._dynamo import OptimizedModule
-
-    _IMPORT_ERROR = None
-except Exception as e:  # noqa: BLE001 - env gate, see module docstring
-    _IMPORT_ERROR = e
-
-requires_runtime = pytest.mark.skipif(
-    _IMPORT_ERROR is not None,
-    reason=f"legacy model fixture dependency is unavailable: {_IMPORT_ERROR}",
-)
+from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
 
 try:
     ParallelConfig()
@@ -79,7 +71,6 @@ def cpu_compile_device():
         yield
 
 
-@requires_runtime
 @pytest.mark.parametrize("selected", [None, "invalid"])
 def test_npu_inductor_requires_launch_backend(monkeypatch, selected):
     from llmtuner.errors import EnvironmentUnsupportedError
@@ -92,7 +83,6 @@ def test_npu_inductor_requires_launch_backend(monkeypatch, selected):
         compile_mod.validate_compile_backend("inductor")
 
 
-@requires_runtime
 @pytest.mark.parametrize("available", [False, True])
 def test_npu_inductor_checks_codegen_capability(monkeypatch, available):
     from llmtuner.errors import EnvironmentUnsupportedError
@@ -116,19 +106,15 @@ def test_npu_inductor_checks_codegen_capability(monkeypatch, available):
 
 def _model(seed: int = 0):
     torch.manual_seed(seed)
-    config = build_model_config(
-        "llama",
-        seq_len=_SEQ,
-        arch_overrides={
-            "vocab_size": _VOCAB,
-            "hidden_size": _HIDDEN,
-            "intermediate_size": 32,
-            "num_hidden_layers": _NUM_LAYERS,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-        },
+    config = model_config(
+        num_hidden_layers=_NUM_LAYERS,
+        mlp_only_layers=list(range(_NUM_LAYERS)),
+        intermediate_size=32,
+        tie_word_embeddings=False,
     )
-    return HFTransformerModel(config)
+    config._attn_implementation = "eager"
+    config._experts_implementation = "eager"
+    return Qwen3MoeForCausalLM(config)
 
 
 @contextlib.contextmanager
@@ -194,7 +180,6 @@ def test_async_tp_valid_combination_passes() -> None:
 # -- the compile step itself ----------------------------------------------------
 
 
-@requires_runtime
 def test_default_compile_is_whole_model_and_leaves_dynamo_flags() -> None:
     """compile_config defaults: whole-model compile, dense flags untouched."""
     with _preserve_dynamo_flag("capture_scalar_outputs"):
@@ -206,7 +191,6 @@ def test_default_compile_is_whole_model_and_leaves_dynamo_flags() -> None:
         assert torch._dynamo.config.capture_scalar_outputs is False
 
 
-@requires_runtime
 def test_per_block_compile_wraps_each_layer_not_the_model() -> None:
     model = apply_compile(_model(), compile_config=CompileConfig(per_block=True))
     assert not isinstance(model, OptimizedModule)
@@ -214,7 +198,6 @@ def test_per_block_compile_wraps_each_layer_not_the_model() -> None:
     assert all(layer._compiled_call_impl is not None for layer in model.layers)
 
 
-@requires_runtime
 def test_async_tp_without_tp_mesh_raises() -> None:
     with pytest.raises(ValueError, match="tensor_parallel_size > 1"):
         apply_compile(
@@ -224,7 +207,6 @@ def test_async_tp_without_tp_mesh_raises() -> None:
         )
 
 
-@requires_runtime
 def test_per_block_compile_rejects_missing_layers_before_global_changes(monkeypatch):
     def unexpected(*args, **kwargs):
         pytest.fail("invalid per-block model must fail before global setup")
@@ -236,7 +218,6 @@ def test_per_block_compile_rejects_missing_layers_before_global_changes(monkeypa
         )
 
 
-@requires_runtime
 def test_invalid_flex_backend_fails_before_async_tp_setup(monkeypatch):
     model = torch.nn.Linear(2, 2)
     model.uses_flex_attention = True
@@ -249,7 +230,6 @@ def test_invalid_flex_backend_fails_before_async_tp_setup(monkeypatch):
         apply_compile(model, compile_config=CompileConfig(backend="eager"))
 
 
-@requires_runtime
 @pytest.mark.parametrize("ndim,size", [(1, 1), (2, 4)])
 def test_async_tp_rejects_invalid_mesh_before_registration(monkeypatch, ndim, size):
     from types import SimpleNamespace
@@ -266,7 +246,6 @@ def test_async_tp_rejects_invalid_mesh_before_registration(monkeypatch, ndim, si
         )
 
 
-@requires_runtime
 def test_async_tp_on_unsupported_torch_loud_raises(monkeypatch) -> None:
     monkeypatch.setattr(compile_mod, "has", lambda capability: False)
     with pytest.raises(NotImplementedError, match="_micro_pipeline_tp"):
@@ -277,31 +256,27 @@ def test_async_tp_on_unsupported_torch_loud_raises(monkeypatch) -> None:
         )
 
 
-@requires_runtime
 def test_regional_inductor_not_triggered_without_flex() -> None:
     """CPU/sdpa model + aot_eager: the backend passes through unwrapped."""
     backend = compile_mod.maybe_regional_inductor_backend(_model(), "aot_eager")
     assert backend == "aot_eager"
 
 
-@requires_runtime
 def test_flex_model_rejects_unknown_backend(monkeypatch) -> None:
     model = _model()
-    monkeypatch.setattr(type(model), "uses_flex_attention", property(lambda self: True))
+    monkeypatch.setattr(model, "uses_flex_attention", True, raising=False)
     with pytest.raises(ValueError, match="neither 'inductor' nor 'aot_eager'"):
         apply_compile(model, compile_config=CompileConfig(backend="eager"))
 
 
-@requires_runtime
 def test_regional_inductor_on_unsupported_torch_loud_raises(monkeypatch) -> None:
     model = _model()
-    monkeypatch.setattr(type(model), "uses_flex_attention", property(lambda self: True))
+    monkeypatch.setattr(model, "uses_flex_attention", True, raising=False)
     monkeypatch.setattr(compile_mod, "has", lambda capability: False)
     with pytest.raises(NotImplementedError, match="regional_inductor"):
         apply_compile(model, compile_config=CompileConfig(backend="aot_eager"))
 
 
-@requires_runtime
 def test_missing_regional_backend_preserves_non_flex_compile(monkeypatch) -> None:
     monkeypatch.setattr(compile_mod, "regional_inductor", None)
     monkeypatch.setattr(compile_mod, "has", lambda capability: True)
@@ -309,18 +284,16 @@ def test_missing_regional_backend_preserves_non_flex_compile(monkeypatch) -> Non
     assert (
         compile_mod.maybe_regional_inductor_backend(model, "aot_eager") == "aot_eager"
     )
-    monkeypatch.setattr(type(model), "uses_flex_attention", property(lambda self: True))
+    monkeypatch.setattr(model, "uses_flex_attention", True, raising=False)
     with pytest.raises(NotImplementedError, match="regional_inductor"):
         compile_mod.maybe_regional_inductor_backend(model, "aot_eager")
 
 
-@requires_runtime
 def test_maybe_regional_inductor_is_null_when_disabled() -> None:
     with maybe_regional_inductor({}):
         pass  # must be a no-op context on the default path
 
 
-@requires_runtime
 def test_capture_scalar_outputs_set_only_for_token_choice_moe(monkeypatch) -> None:
     """The flag follows the MoE-dispatch condition, and only that condition.
 
@@ -343,18 +316,14 @@ def test_capture_scalar_outputs_set_only_for_token_choice_moe(monkeypatch) -> No
         assert torch._dynamo.config.capture_scalar_outputs is False
 
 
-@requires_runtime
 @pytest.mark.skipif(
     not has("fx_regional_inductor"), reason="regional inductor unavailable"
 )
 def test_regional_inductor_annotations_are_isolated_between_models(monkeypatch):
     import torch.fx.traceback as fx_traceback
-    from llmtuner.models.hf import attention_backend
 
     regional_model, inductor_model, untouched_model = (_model() for _ in range(3))
-    monkeypatch.setattr(
-        type(regional_model), "uses_flex_attention", property(lambda self: True)
-    )
+    regional_model.uses_flex_attention = True
     compile_mod.maybe_regional_inductor_backend(regional_model, "aot_eager")
     compile_mod.maybe_regional_inductor_backend(inductor_model, "inductor")
     annotations = []
@@ -365,27 +334,21 @@ def test_regional_inductor_annotations_are_isolated_between_models(monkeypatch):
         yield
 
     monkeypatch.setattr(fx_traceback, "annotate", annotate)
-    monkeypatch.setattr(
-        attention_backend,
-        "flex_attention_forward",
-        lambda *args, **kwargs: (args[1], None),
-    )
-    query = torch.zeros(1, 2, 4, 8)
     for model, expected_count in (
         (regional_model, 1),
         (inductor_model, 1),
         (untouched_model, 1),
         (regional_model, 2),
     ):
-        output, _ = attention_backend.flex_attention_adapter(
-            model.layers[0].self_attn, query, query, query, None
-        )
-        assert output is query
+        block = model.layers[0]
+        with compile_mod.maybe_regional_inductor(
+            {}, enabled=getattr(block, "_regional_inductor_enabled", False)
+        ):
+            pass
         assert len(annotations) == expected_count
     assert all("compile_with_inductor" in metadata for metadata in annotations)
 
 
-@requires_runtime
 def test_cp_flex_annotations_cover_attention_and_exclude_collectives(monkeypatch):
     from types import SimpleNamespace
 
@@ -419,7 +382,6 @@ def test_cp_flex_annotations_cover_attention_and_exclude_collectives(monkeypatch
     torch.testing.assert_close(actual, output.transpose(1, 2))
 
 
-@requires_runtime
 @pytest.mark.parametrize("per_block", [False, True])
 def test_compiled_cpu_training_matches_eager_outputs_and_gradients(per_block):
     reference = _model()
@@ -427,8 +389,8 @@ def test_compiled_cpu_training_matches_eager_outputs_and_gradients(per_block):
         _model(), compile_config=CompileConfig(backend="aot_eager", per_block=per_block)
     )
     tokens = torch.arange(_SEQ) % _VOCAB
-    expected = reference(tokens)
-    actual = model(tokens)
+    expected = reference(tokens).logits
+    actual = model(tokens).logits
     torch.testing.assert_close(actual, expected)
     expected.square().sum().backward()
     actual.square().sum().backward()
@@ -486,7 +448,6 @@ def test_missing_moe_compile_capability_fails_before_setup(monkeypatch):
     assert model._regional_inductor_enabled is True
 
 
-@requires_runtime
 def test_compiled_qwen_training_matches_native_hf_trajectory():
     """Use native HF forward as an oracle independent of the flat wrapper."""
     import copy
@@ -496,20 +457,9 @@ def test_compiled_qwen_training_matches_native_hf_trajectory():
     torch._dynamo.reset()
     counters.clear()
     torch.manual_seed(42)
-    config = build_model_config(
-        "qwen3",
-        seq_len=_SEQ,
-        arch_overrides={
-            "vocab_size": _VOCAB,
-            "hidden_size": _HIDDEN,
-            "intermediate_size": 32,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-        },
-    )
-    wrapper = HFTransformerModel(config)
-    reference = copy.deepcopy(wrapper.model)
+    wrapper = _model(seed=42)
+    reference = ReferenceQwen3MoeForCausalLM(copy.deepcopy(wrapper.config))
+    reference.load_state_dict(wrapper.state_dict(), strict=True)
     model = apply_compile(wrapper, compile_config=CompileConfig(backend="aot_eager"))
     actual_optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0)
     reference_optimizer = torch.optim.AdamW(
@@ -521,7 +471,7 @@ def test_compiled_qwen_training_matches_native_hf_trajectory():
         targets = torch.randint(_VOCAB, (_SEQ,), generator=generator)
         actual_optimizer.zero_grad(set_to_none=True)
         reference_optimizer.zero_grad(set_to_none=True)
-        actual = model(tokens)
+        actual = model(tokens).logits
         expected = reference(tokens.unsqueeze(0), use_cache=False).logits.squeeze(0)
         torch.testing.assert_close(actual, expected)
         actual_loss = torch.nn.functional.cross_entropy(actual, targets)
@@ -532,16 +482,15 @@ def test_compiled_qwen_training_matches_native_hf_trajectory():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(reference.parameters(), 1.0)
         expected_parameters = dict(reference.named_parameters())
-        for name, parameter in wrapper.model.named_parameters():
+        for name, parameter in wrapper.named_parameters():
             torch.testing.assert_close(parameter.grad, expected_parameters[name].grad)
         actual_optimizer.step()
         reference_optimizer.step()
-        for name, parameter in wrapper.model.named_parameters():
+        for name, parameter in wrapper.named_parameters():
             torch.testing.assert_close(parameter, expected_parameters[name])
     assert counters["stats"]["unique_graphs"] > 0
 
 
-@requires_runtime
 @pytest.mark.parametrize("initial", [False, True])
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
 def test_compile_setup_failure_restores_scalar_capture(
@@ -561,7 +510,6 @@ def test_compile_setup_failure_restores_scalar_capture(
         assert torch._dynamo.config.capture_scalar_outputs is initial
 
 
-@requires_runtime
 @pytest.mark.parametrize("failure_index", [0, 1, 2])
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
 def test_partial_block_compile_failure_restores_original_calls(
@@ -652,7 +600,6 @@ def test_failed_async_compile_restores_inductor_pass(
         inductor_config._micro_pipeline_tp = original
 
 
-@requires_runtime
 @pytest.mark.parametrize("per_block", [False, True])
 @pytest.mark.parametrize("mode", ["full", "selective"])
 @pytest.mark.parametrize("validation_fails", [False, True])
@@ -780,7 +727,6 @@ def test_compiled_ac_preserves_modes_identity_and_frozen_gradients(
         torch._dynamo.reset()
 
 
-@requires_runtime
 def test_compile_sdc_accepts_finite_outputs_and_rejects_nan():
     module = torch.nn.Identity()
     compile_mod.wrap_sdc_forward(module, "test block")

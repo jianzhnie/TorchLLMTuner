@@ -129,7 +129,13 @@ ModelConfig + ParallelConfig + OptimizerConfig + TrainingConfig
 
 `input_preparation.py` 负责 batch 规范化与 CP/TP 输入切分，
 `attention_masks.py` 负责 dense/Flex/CP mask。自定义架构通过
-`models/architecture.py` 注册，模型类保持惰性加载。原生 HF 架构无需注册。
+`models/registry.py` 注册，模型类保持惰性加载。原生 HF 架构无需注册。
+
+架构注册本身与建模后端无关：允许模型自有配置和普通 `nn.Module`，不要求
+继承 HF 类型；HF factory 仅作为既有接入路径。逐步解耦 Trainer、初始化及
+权重格式的边界见 [模型优先的执行层](model_backend_direction.md)。
+查询架构和构造 Kimi 配置不会加载其 decoder；仅模型类 loader 导入 decoder，
+依赖错误在选中该模型时报告并保留异常原因，不缓存一次失败阻塞后续重试。
 
 注册仅保存构造 hook，不加载模型实现或可选依赖。加载本地配置时，只解析选中
 架构的配置类型，并在 HF 构造前刷新注册，确保显式替换不会使用旧配置类。
