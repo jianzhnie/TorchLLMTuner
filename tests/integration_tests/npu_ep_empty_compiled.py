@@ -9,10 +9,10 @@ import copy
 
 import torch
 import torch.distributed as dist
-from transformers import AutoConfig
+from transformers import Qwen3MoeConfig
 
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from tests.integration_tests.harness import init_distributed
 
 
@@ -22,8 +22,7 @@ def main() -> None:
         assert device.type == "npu" and dist.get_world_size() == 2
         rank = dist.get_rank()
         torch.manual_seed(52)
-        config = AutoConfig.for_model(
-            "qwen3_moe",
+        config = Qwen3MoeConfig(
             vocab_size=64,
             hidden_size=16,
             intermediate_size=32,
@@ -35,17 +34,15 @@ def main() -> None:
             num_experts_per_tok=2,
             norm_topk_prob=True,
         )
-        source = HFTransformerModel(config).to(device=device, dtype=torch.bfloat16)
+        source = Qwen3MoeForCausalLM(config).to(device=device, dtype=torch.bfloat16)
         source.layers[0].mlp.gate.float()
         with torch.no_grad():
             gate = source.layers[0].mlp.gate.weight
             gate.copy_(gate.new_tensor([0.04, 0.02, -0.02, -0.04])[:, None])
         local = copy.deepcopy(source)
-        assert swap_hf_moe_blocks(local, router_aux_loss_coef=0.0) == 1
+        assert swap_moe_blocks(local, router_aux_loss_coef=0.0) == 1
         assert (
-            swap_hf_moe_blocks(
-                source, ep_group=dist.group.WORLD, router_aux_loss_coef=0.0
-            )
+            swap_moe_blocks(source, ep_group=dist.group.WORLD, router_aux_loss_coef=0.0)
             == 1
         )
         reference = local.layers[0].mlp

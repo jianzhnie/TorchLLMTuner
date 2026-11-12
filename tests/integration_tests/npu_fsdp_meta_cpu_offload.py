@@ -2,11 +2,11 @@
 
 import torch
 import torch.distributed as dist
-from transformers import AutoConfig
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from llmtuner.config.parallel_config import ParallelConfig
-from llmtuner.models.hf.materialization import materialize_meta_model
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.memory.materialization import materialize_meta_model
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import apply_fsdp
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.runtime.assembly import _fsdp_managed_parameters
@@ -17,8 +17,11 @@ def main() -> None:
     device = init_distributed()
     try:
         assert dist.get_world_size() == 2
-        config = AutoConfig.for_model(
-            "qwen3",
+        config = Qwen3MoeConfig(
+            head_dim=8,
+            num_experts=4,
+            moe_intermediate_size=16,
+            mlp_only_layers=[0, 1],
             vocab_size=32,
             hidden_size=16,
             intermediate_size=32,
@@ -28,11 +31,10 @@ def main() -> None:
             max_position_embeddings=8,
         )
         with torch.device("meta"):
-            model = HFTransformerModel(config)
+            model = Qwen3MoeForCausalLM(config)
         layer_paths = [
-            name
-            for name, module in model.named_modules()
-            if type(module).__name__ == "Qwen3DecoderLayer"
+            f"{model.decoder_structure.blocks}.{index}"
+            for index in range(config.num_hidden_layers)
         ]
         parallel = ParallelConfig(data_parallel_shard_size=2)
         parallel.fsdp_config.fsdp_cpu_offload = True
@@ -59,6 +61,7 @@ def main() -> None:
             device,
             parameter_device=torch.device("cpu"),
             offloaded_parameters=managed,
+            runtime_buffers=model.materialization_buffers(device),
         )
         assert _fsdp_managed_parameters(model) == managed
         assert all(parameter.device.type == "cpu" for parameter in managed)
@@ -79,7 +82,7 @@ def main() -> None:
         torch.Tensor.to = measured_to
         try:
             tokens = torch.arange(8, device=device) % 32
-            output = model(tokens)
+            output = model(tokens).logits
             assert output.device == device
             assert torch.isfinite(output).all().item()
             output.float().mean().backward()

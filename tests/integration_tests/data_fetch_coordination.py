@@ -15,6 +15,8 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.datasets.contracts import Batch, DataloaderExhaustedError
+from llmtuner.models.configuration import build_model_config
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.runtime.batch import batch_generator, fetch_batch, microbatch
 from llmtuner.trainer.runtime.validation import (
     count_validation_batch_tokens,
@@ -250,14 +252,15 @@ def main():
             assert closed == ["checkpoint", "loader"]
             dist.barrier()
             print(f"rank={rank} {error_type.__name__}: training iterator coordinated")
-        from llmtuner.models.hf.factory import build_model_config
-        from llmtuner.models.hf.model import HFTransformerModel
-
-        model = HFTransformerModel(
+        model = Qwen3MoeForCausalLM(
             build_model_config(
-                "qwen3",
+                "qwen3_moe",
                 seq_len=4,
                 arch_overrides={
+                    "head_dim": 8,
+                    "num_experts": 4,
+                    "moe_intermediate_size": 16,
+                    "mlp_only_layers": [0],
                     "vocab_size": 32,
                     "hidden_size": 16,
                     "intermediate_size": 32,
@@ -282,7 +285,7 @@ def main():
             try:
                 trainer.preprocess(value)
             except ValueError as error:
-                assert rank == failing_rank and "equal lengths" in str(error)
+                assert rank == failing_rank and "labels has 3 tokens" in str(error)
             except RuntimeError as error:
                 assert rank != failing_rank
                 assert (
@@ -291,7 +294,7 @@ def main():
             else:
                 raise AssertionError("malformed preprocessing was not coordinated")
             dist.barrier()
-        print(f"rank={rank}: HF preprocessing length errors coordinated")
+        print(f"rank={rank}: explicit preprocessing length errors coordinated")
         from llmtuner.trainer.runtime.pipeline import (
             prepare_pipeline_inputs,
             split_pipeline_microbatches,
@@ -395,6 +398,7 @@ def main():
                 preprocess=lambda value: (torch.ones(4), value.labels, {}),
                 param_context=nullcontext,
                 example_model=lambda inputs: inputs * (rank + 1),
+                _model_output_value=Trainer._model_output_value,
                 loss_sum=lambda logits, labels: logits.sum(),
                 loss_vocab_kwargs=lambda: {},
             )

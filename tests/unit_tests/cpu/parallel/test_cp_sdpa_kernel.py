@@ -6,6 +6,7 @@ checked here needs no process group: the mask the kernel builds, the packed
 refusal, and which CP shapes ``apply_cp`` accepts without flex.
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -482,3 +483,139 @@ def test_ulysses_sliding_window_uses_full_sequence_coordinates(packed) -> None:
             sliding_window=3,
         )
     torch.testing.assert_close(actual, expected[:, 4:])
+
+
+def test_cp_plan_resolution_preserves_model_and_rng(monkeypatch):
+    model = _FakeModel("sdpa")
+    model.layers[0].self_attn.projection = torch.nn.Linear(4, 4)
+    modules = tuple(model.named_modules())
+    parameters = tuple(model.named_parameters())
+    rng = torch.get_rng_state().clone()
+    monkeypatch.setattr(
+        cp_module, "CPSdpaKernel", lambda **kwargs: pytest.fail("resolver built kernel")
+    )
+    plan = cp_module.resolve_cp_plan(model, cfg=_cp_config())
+    assert plan.stage == "cp" and plan.degree == 2
+    assert plan.count("attention") == 1
+    assert plan.targets[0].path == "layers.0.self_attn"
+    assert plan.targets[0].module is model.layers[0].self_attn
+    assert tuple(model.named_modules()) == modules
+    assert tuple(model.named_parameters()) == parameters
+    assert model.config._attn_implementation == "sdpa"
+    assert not hasattr(model, "cp_mesh")
+    torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("strategy", ["kv_allgather", "ulysses"])
+def test_cp_execution_consumes_bound_targets_without_rediscovery(monkeypatch, strategy):
+    model = _FakeModel("sdpa")
+    cfg = _cp_config(strategy=strategy)
+    plan = cp_module.resolve_cp_plan(model, cfg=cfg)
+    monkeypatch.setattr(
+        cp_module,
+        "_attention_modules",
+        lambda model: pytest.fail("executor rediscovered targets"),
+    )
+    cp_module.apply_cp(
+        model, mesh=_OuterMesh(_fake_mesh(2, 0)), cfg=cfg, resolved_plan=plan
+    )
+    kernel_type = CPSdpaUlyssesKernel if strategy == "ulysses" else CPSdpaKernel
+    assert isinstance(model.layers[0].self_attn._titan_cp_sdpa_kernel, kernel_type)
+
+
+@pytest.mark.parametrize("change", ["target", "mask", "heads", "degree", "strategy"])
+def test_cp_rejects_stale_plan_before_kernel_or_model_changes(monkeypatch, change):
+    model = _FakeModel("sdpa")
+    cfg = _cp_config()
+    plan = cp_module.resolve_cp_plan(model, cfg=cfg)
+    if change == "target":
+        model.layers[0].self_attn = torch.nn.Module()
+    elif change == "mask":
+        model.config.attn_mask_type = "block_causal"
+    elif change == "heads":
+        model.config.num_attention_heads = 4
+    elif change == "degree":
+        cfg.context_parallel_kv_allgather_size = 4
+    else:
+        cfg.cp_config.context_parallel_strategy = "ulysses"
+    monkeypatch.setattr(
+        cp_module,
+        "CPSdpaKernel",
+        lambda **kwargs: pytest.fail("stale plan built kernel"),
+    )
+    with pytest.raises(ValueError, match="[Ss]tale|plan.*match"):
+        cp_module.apply_cp(
+            model,
+            mesh=_OuterMesh(_fake_mesh(cfg.cp_size, 0)),
+            cfg=cfg,
+            resolved_plan=plan,
+        )
+    assert model.config._attn_implementation == "sdpa"
+    assert not hasattr(model.layers[0].self_attn, "_titan_cp_sdpa_kernel")
+    assert not hasattr(model, "cp_mesh")
+
+
+@pytest.mark.parametrize("invalid", ["heads", "load_balancer"])
+def test_cp_resolver_validates_geometry_and_mask_policy_without_mesh(invalid):
+    model = _FakeModel("sdpa")
+    cfg = _cp_config(strategy="ulysses" if invalid == "heads" else "kv_allgather")
+    if invalid == "heads":
+        model.config.num_attention_heads = 3
+        error, message = ValueError, "divisible"
+    else:
+        cfg.cp_config.context_parallel_load_balancer = "headtail"
+        error, message = NotImplementedError, "load_balancer=None"
+    with pytest.raises(error, match=message):
+        cp_module.resolve_cp_plan(model, cfg=cfg)
+    assert model.config._attn_implementation == "sdpa"
+    assert not hasattr(model, "cp_mesh")
+    assert not hasattr(model.layers[0].self_attn, "_titan_cp_sdpa_kernel")
+
+
+@pytest.mark.parametrize(
+    "change", ["empty", "missing", "duplicate", "layout", "operations", "unbound"]
+)
+def test_cp_rejects_incomplete_plan_before_installation(monkeypatch, change):
+    model = _FakeModel("sdpa")
+    model.layers.append(_FakeLayer())
+    cfg = _cp_config()
+    plan = cp_module.resolve_cp_plan(model, cfg=cfg)
+    if change == "empty":
+        plan = replace(plan, targets=())
+    elif change == "missing":
+        plan = replace(plan, targets=plan.targets[:1])
+    elif change == "duplicate":
+        plan = replace(plan, targets=(plan.targets[0], plan.targets[0]))
+    elif change == "layout":
+        plan = replace(
+            plan,
+            targets=(replace(plan.targets[0], layout="replicated"), plan.targets[1]),
+        )
+    elif change == "operations":
+        plan = replace(plan, operations=())
+    else:
+        plan = replace(plan, module_bindings=None)
+    monkeypatch.setattr(
+        cp_module,
+        "CPSdpaKernel",
+        lambda **kwargs: pytest.fail("invalid plan built kernel"),
+    )
+    with pytest.raises(ValueError, match="CP plan"):
+        cp_module.apply_cp(
+            model, mesh=_OuterMesh(_fake_mesh(2, 0)), cfg=cfg, resolved_plan=plan
+        )
+    assert model.config._attn_implementation == "sdpa"
+    assert not hasattr(model, "cp_mesh")
+    assert all(
+        not hasattr(layer.self_attn, "_titan_cp_sdpa_kernel") for layer in model.layers
+    )
+
+
+def test_cp_resolver_rejects_unknown_strategy_in_mutable_config():
+    model = _FakeModel("sdpa")
+    cfg = _cp_config()
+    cfg.cp_config.context_parallel_strategy = "ring"
+    with pytest.raises(ValueError, match="CP strategy"):
+        cp_module.resolve_cp_plan(model, cfg=cfg)
+    assert model.config._attn_implementation == "sdpa"
+    assert not hasattr(model, "cp_mesh")

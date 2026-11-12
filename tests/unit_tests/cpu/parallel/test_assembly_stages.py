@@ -8,6 +8,9 @@ That used to live in a docstring; it is now the ``STAGES`` table, and this
 test is what keeps the table -- not the prose -- as the contract.
 """
 
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 from torch import nn
 
@@ -485,3 +488,89 @@ def test_activation_swap_rejects_unsupported_direct_api_combinations(
             activation_checkpoint=ac_mode,
             activation_swap=True,
         )
+
+
+def test_cp_plan_failure_precedes_cp_execution_and_later_stages(monkeypatch):
+    def reject_plan(*args, **kwargs):
+        raise ValueError("invalid CP plan")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("CP execution or a later stage began before plan validation")
+
+    monkeypatch.setattr(parallelize, "resolve_cp_plan", reject_plan, raising=False)
+    monkeypatch.setattr(parallelize, "apply_tp", lambda model, **kwargs: model)
+    monkeypatch.setattr(parallelize, "apply_ep", lambda model, **kwargs: model)
+    monkeypatch.setattr(parallelize, "apply_cp", unexpected)
+    monkeypatch.setattr(parallelize, "apply_ac", unexpected)
+    monkeypatch.setattr(parallelize, "apply_fsdp", unexpected)
+    with pytest.raises(ValueError, match="invalid CP plan"):
+        parallelize.parallelize_model(
+            nn.Linear(2, 2),
+            cfg=ParallelConfig(context_parallel_kv_allgather_size=2),
+            mesh=None,
+            parallel_dims=None,
+        )
+
+
+@pytest.mark.parametrize("has_topology", [False, True])
+def test_cp_preflight_uses_explicit_group_without_wrapping_execution(
+    monkeypatch, has_topology
+):
+    active = {"boundary": False}
+    calls = []
+    expected_group = object()
+    plan = object()
+    model = nn.Linear(2, 2)
+
+    def get_group():
+        assert not active["boundary"]
+        calls.append("group")
+        return expected_group
+
+    @contextmanager
+    def boundary(phase, *, group):
+        assert has_topology and phase == "CP plan validation"
+        assert group is expected_group
+        calls.append("enter")
+        active["boundary"] = True
+        try:
+            yield
+        finally:
+            active["boundary"] = False
+            calls.append("exit")
+
+    def resolve(part, *, cfg):
+        assert part is model and active["boundary"] is has_topology
+        calls.append("resolve")
+        return plan
+
+    def execute(part, **kwargs):
+        assert part is model and not active["boundary"]
+        assert kwargs["resolved_plan"] is plan
+        calls.append("execute")
+        return part
+
+    dims = SimpleNamespace(
+        pp_enabled=False,
+        get_optional_mesh=lambda name: None,
+        build_device_mesh=lambda: SimpleNamespace(get_group=get_group),
+    )
+    monkeypatch.setattr(parallelize, "synchronize_local_errors", boundary)
+    monkeypatch.setattr(parallelize, "resolve_cp_plan", resolve)
+    monkeypatch.setattr(parallelize, "apply_cp", execute)
+    for name in ("apply_tp", "apply_ep", "apply_ac", "apply_fsdp"):
+        monkeypatch.setattr(parallelize, name, lambda part, **kwargs: part)
+    assert (
+        parallelize.parallelize_model(
+            model,
+            cfg=ParallelConfig(context_parallel_kv_allgather_size=2),
+            mesh=None,
+            parallel_dims=dims if has_topology else None,
+        )
+        is model
+    )
+    assert calls == (
+        ["group", "enter", "resolve", "exit", "execute"]
+        if has_topology
+        else ["resolve", "execute"]
+    )

@@ -61,6 +61,7 @@ from llmtuner.parallel.context_parallel import (
     shard_batch_for_cp,
     shard_batch_for_tp,
 )
+from llmtuner.parallel.context_parallel.context_parallel import resolve_cp_plan
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology
 from tests.integration_tests.harness import backend, device, init_distributed, moved
@@ -186,7 +187,11 @@ def _run_strategy(
 
     # TP then CP, matching the production assembly order.
     model = apply_tp(model, tp_mesh, cfg.parallel)
-    apply_cp(model, mesh=_dense_view(cp_mesh, tp_mesh), cfg=cfg.parallel)
+    plan = resolve_cp_plan(model, cfg=cfg.parallel)
+    assert plan.count("attention") == cfg.num_hidden_layers
+    apply_cp(
+        model, mesh=_dense_view(cp_mesh, tp_mesh), cfg=cfg.parallel, resolved_plan=plan
+    )
 
     # Non-vacuity on the TP axis: at least the q/k/v/o and gate/up/down
     # projections must have been swapped for sharded realizers. A count of

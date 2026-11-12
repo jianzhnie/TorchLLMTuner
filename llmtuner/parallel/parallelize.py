@@ -1,18 +1,19 @@
-"""Apply parallel and memory transformations to Hugging Face models.
+"""Apply parallel and memory transformations to explicitly declared models.
 
 Both dense and pipeline paths follow ``stages.STAGE_ORDER``:
 TP → EP → CP → activation checkpoint → activation swap → compile → FSDP. PP
 splits the model first, transforms each local part, then binds the pipeline schedule.
 
 Dense runs return a module; PP runs return ``PipelineParallelSetup``. Weight
-ties are retained and handled by FSDP grouping. EP replaces supported HF MoE
-blocks through ``expert_parallel/model_replacement.py``; single-block conversion
+ties are retained and handled by FSDP grouping. EP consumes model-owned MoE
+contracts through ``expert_parallel/model_replacement.py``; single-block conversion
 lives in ``block_conversion.py`` and preserves initialization. TP plans come
-from the model registry.
+from model declarations.
 """
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from functools import partial
 
 import torch
@@ -32,7 +33,7 @@ from ..accelerator.collectives import synchronize_local_errors
 from ..memory.activation_checkpoint import apply_ac, validate_ac_options
 from ..memory.activation_swap import apply_activation_swap
 from .compatibility import chunked_loss_fsdp
-from .context_parallel.context_parallel import apply_cp
+from .context_parallel.context_parallel import apply_cp, resolve_cp_plan
 from .expert_parallel.expert_parallel import apply_ep
 from .fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp,
@@ -90,6 +91,10 @@ def parallelize_model(
     PP requires ``global_batch_size`` for microbatch validation and returns a
     ``PipelineParallelSetup`` containing local parts, stages, and schedule.
     Other runs return the transformed module.
+
+    With topology, standard CP plan failures are coordinated across its world
+    before CP kernel installation. Mesh-only callers retain local validation.
+    This boundary does not roll back earlier TP/EP changes or communication.
     """
 
     validate_activation_swap_options(
@@ -187,6 +192,22 @@ def parallelize_model(
                 part = runners[name](
                     part, on_replacement=references.record_replacements
                 )
+            elif name == "cp" and cfg.cp_size > 1:
+                resolved_cp_plan = None
+                boundary = (
+                    synchronize_local_errors("CP plan validation", group=cp_error_group)
+                    if cp_error_group is not None
+                    else nullcontext()
+                )
+                with boundary:
+                    if cfg.cp_config.context_parallel_strategy != "kcp" and (
+                        getattr(part, "context_parallel_backend", "standard")
+                        != "compressor"
+                    ):
+                        resolved_cp_plan = resolve_cp_plan(part, cfg=cfg)
+                # Kernel construction, mesh access and model mutation are not
+                # rank-local preflight and must stay outside this boundary.
+                part = runners[name](part, resolved_plan=resolved_cp_plan)
             elif name == "fsdp" and references is not None:
                 part = runners[name](part, cfg=references.bind(part))
             else:
@@ -215,6 +236,15 @@ def parallelize_model(
             # share dense and sparse FSDP communication after expert execution.
             ep_error_group = parallel_dims.get_mesh("loss").get_group()
     tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
+    # Include PP peers: a stage-local CP group cannot stop the other pipeline
+    # stages before they enter FSDP/schedule setup. PP partitioning guarantees
+    # the same number of local parts per rank, so these boundaries align.
+    # Resolve the already-owned world mesh/group outside the local-only body.
+    cp_error_group = (
+        parallel_dims.build_device_mesh().get_group()
+        if cfg.cp_size > 1 and parallel_dims is not None
+        else None
+    )
 
     if parallel_dims is not None and parallel_dims.pp_enabled:
         global_tp_plan = None

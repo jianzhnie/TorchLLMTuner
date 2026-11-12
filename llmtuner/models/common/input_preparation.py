@@ -110,6 +110,11 @@ def prepare_text_inputs(
     config = getattr(model, "config", None)
     if config is None:
         raise TypeError(f"{type(model).__name__} must expose a config")
+    packed = getattr(config, "attn_mask_type", "causal") == "block_causal"
+    if packed and positions is None:
+        # Document boundaries cannot be recovered from token IDs or a local
+        # shard. Never turn declared packed attention into plain causal math.
+        raise ValueError("Packed text input requires positions for document boundaries")
     tokens = batch.input_ids if isinstance(batch, Batch) else batch["input"]
     multirow = preserve_batch_rows and tokens.ndim == 2 and tokens.shape[0] > 1
     if (
@@ -122,10 +127,6 @@ def prepare_text_inputs(
         raise UnsupportedCombinationError(
             f"{type(model).__name__} multirow input requires row-aware CP/TP sharding"
         )
-    packed = (
-        positions is not None
-        and getattr(config, "attn_mask_type", "causal") == "block_causal"
-    )
     extra: dict[str, Any] = {}
     if parallel_dims is not None:
         cp_mesh = parallel_dims.get_optional_mesh("cp")

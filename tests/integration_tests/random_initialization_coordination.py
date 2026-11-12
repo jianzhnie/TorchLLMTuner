@@ -12,12 +12,12 @@ import torch
 import torch.distributed as dist
 
 from llmtuner.config import LLMTunerConfig, ModelConfig
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import build_model_config_for
+from llmtuner.models.registry import build_registered_model
 from llmtuner.trainer.runtime.assembly import _apply_parallelism
 
 
-def main():
+def main() -> None:
     dist.init_process_group("gloo", timeout=timedelta(seconds=30))
     try:
         assert dist.get_world_size() == 2
@@ -43,30 +43,34 @@ def main():
             )
         )
         config = build_model_config_for(cfg)
-        with torch.device("meta"):
-            model = HFTransformerModel(config)
-        initialize = model.model._init_weights
+        for failing_rank in (0, 1):
+            # Failed assembly is not transactional: rebuild for each scenario.
+            with torch.device("meta"):
+                model = build_registered_model(config, explicit_only=True)
+            initialize = model.initialize_parameters
 
-        def fail_on_rank_zero(self, module):
-            initialize(module)
-            if dist.get_rank() == 0:
-                raise ValueError("injected rank-local initialization failure")
+            def fail_locally(self, initialize=initialize, failing_rank=failing_rank):
+                initialize()
+                if dist.get_rank() == failing_rank:
+                    raise ValueError("injected rank-local initialization failure")
 
-        model.model._init_weights = MethodType(fail_on_rank_zero, model.model)
-        trainer = SimpleNamespace(
-            cfg=cfg, device=torch.device("cpu"), mesh=None, parallel_dims=None
-        )
-        try:
-            _apply_parallelism(trainer, model, load_hf_weights=False)
-        except (ValueError, RuntimeError) as error:
-            if dist.get_rank() == 0:
-                assert "injected rank-local" in str(error)
+            model.initialize_parameters = MethodType(fail_locally, model)
+            trainer = SimpleNamespace(
+                cfg=cfg, device=torch.device("cpu"), mesh=None, parallel_dims=None
+            )
+            try:
+                _apply_parallelism(trainer, model, load_initial_weights=False)
+            except (ValueError, RuntimeError) as error:
+                if dist.get_rank() == failing_rank:
+                    assert "injected rank-local" in str(error)
+                else:
+                    assert "Random model initialization failed on another rank" in str(
+                        error
+                    )
             else:
-                assert "Random model initialization failed on another rank" in str(
-                    error
-                )
-        else:
-            raise AssertionError("runtime continued after initialization failure")
+                raise AssertionError("runtime continued after initialization failure")
+            assert all(not parameter.is_meta for parameter in model.parameters())
+            dist.barrier()
         dist.barrier()
         if dist.get_rank() == 0:
             print("PASS: random initialization failure coordinated before optimizer")

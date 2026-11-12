@@ -14,6 +14,7 @@ _EXPORT_SOURCES = {
     "CPFlexKernel": "attention",
     "DualCPFlexKernel": "attention",
     "apply_cp": "context_parallel",
+    "resolve_cp_plan": "context_parallel",
     "shard_attention_mask_for_cp": "input_sharding",
     "shard_batch_for_cp": "input_sharding",
     "shard_batch_for_tp": "input_sharding",

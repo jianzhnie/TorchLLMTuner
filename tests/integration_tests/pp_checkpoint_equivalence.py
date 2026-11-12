@@ -81,9 +81,8 @@ LLMTUNER_TEST_PP_SIZE=2 and LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom.
 Set LLMTUNER_TEST_PP_SCHEDULE=Interleaved1F1B or ZBVZeroBubble in both
 phases for two local stages per rank; those cases use six decoder layers.
 The loss reference writer follows the schedule's last-stage ownership.
-For packed PP2 × KV-CP2 on four ranks, additionally set LLMTUNER_TEST_CP_SIZE=2
-and LLMTUNER_TEST_SEQ_LEN=256 in both phases and append --packed. CPU retains
-CP mask predicates and collectives with explicit dense SDPA arithmetic.
+Packed CP is not supported by the explicit Qwen3 input contract. Do not combine
+``--packed`` with CP: dense document masks require a separate CP mask contract.
 Set LLMTUNER_TEST_ASYNC_MODE=async in both phases for CPU-compatible threaded
 DCP upload; the full phase closes the Trainer before inspecting the checkpoint.
 The pinned process stager requires its target-device environment.
@@ -138,6 +137,11 @@ exactly before resumed updates and after continuation, including nonpersistent s
 Legacy flex/eager_flex requests are rejected by explicit-model validation.
 Set LLMTUNER_TEST_GLOBAL_BATCH=1 with PP1/CP2 for single-row input recovery;
 use the same value in both phases. Multirow CP/TP remains unsupported.
+For PP2 × Ulysses2 on four ranks, set LLMTUNER_TEST_WORLD_SIZE=4,
+LLMTUNER_TEST_GLOBAL_BATCH=4, LLMTUNER_TEST_CP_STRATEGY=ulysses and
+LLMTUNER_TEST_ULYSSES_SIZE=2 in both phases (one row per microbatch).
+Set LLMTUNER_TEST_RNG_STATE=1 and LLMTUNER_TEST_EMA=dynamic to include
+RNG snapshots and EMA in the exact pre-update and final-state comparisons.
 For NPU dual-axis SDPA, use LLMTUNER_TEST_CP_SIZE=2 and
 LLMTUNER_TEST_ULYSSES_SIZE=2, with four ranks for PP1 or eight for PP2.
 Set LLMTUNER_TEST_DP_REPLICATE_SIZE=2 to add a real replica axis;

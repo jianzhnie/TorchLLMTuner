@@ -33,6 +33,17 @@ class _CustomModel(PreTrainedModel):
     config_class = _CustomConfig
 
 
+@pytest.mark.parametrize("loaded", [None, object, lambda config: nn.Identity()])
+def test_model_loader_must_return_module_class(loaded):
+    specification = ModelSpec.from_types(
+        _CustomConfig.model_type,
+        config_type=_CustomConfig,
+        model_class_loader=lambda: loaded,
+    )
+    with pytest.raises(TypeError, match="must return an nn.Module class"):
+        specification.resolve_model_class()
+
+
 def test_registered_plain_module_takes_precedence_over_hf_mapping(monkeypatch):
     class NativeModel(nn.Module):
         pass
@@ -366,11 +377,13 @@ assert 'llmtuner.models.kimi.kimi_k3.model' not in sys.modules
 
 def test_explicit_factory_is_opt_in_and_lazy(monkeypatch):
     calls = []
-    expected = object()
 
-    def model_class(config):
-        calls.append(config)
-        return expected
+    class Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            calls.append(config)
+
+    model_class = Model
 
     registration = ModelSpec.from_types(
         "deepseek_v4",
@@ -380,7 +393,7 @@ def test_explicit_factory_is_opt_in_and_lazy(monkeypatch):
     )
     monkeypatch.setitem(architecture._MODELS, "deepseek_v4", registration)
     config = PretrainedConfig(model_type="deepseek_v4")
-    assert build_registered_model(config, explicit_only=True) is expected
+    assert isinstance(build_registered_model(config, explicit_only=True), Model)
     assert calls == [config]
 
 
@@ -444,19 +457,22 @@ def test_explicit_factory_uses_registered_composite_constructor(monkeypatch):
     from types import SimpleNamespace
 
     config = SimpleNamespace(model_type="composite_test")
-    expected = object()
+
+    class Model(nn.Module):
+        def __init__(self, received):
+            super().__init__()
+            assert received is config
+
     entry = ModelSpec.from_types(
         config.model_type,
         config_type=SimpleNamespace,
-        model_class_loader=lambda: (
-            lambda received: expected if received is config else None
-        ),
+        model_class_loader=lambda: Model,
         task="conditional_generation",
         explicit=True,
     )
     monkeypatch.setitem(architecture._MODELS, config.model_type, entry)
     assert get_model_spec(config.model_type) is None
-    assert build_registered_model(config, explicit_only=True) is expected
+    assert isinstance(build_registered_model(config, explicit_only=True), Model)
 
 
 def test_spec_constructor_rejects_wrong_config_before_loading_model():
@@ -473,11 +489,16 @@ def test_spec_constructor_rejects_wrong_config_before_loading_model():
 
 def test_registered_constructor_enforces_task_without_loading(monkeypatch):
     calls = []
-    expected = object()
+
+    class Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            calls.append(config)
+
     specification = ModelSpec.from_types(
         _CustomConfig.model_type,
         config_type=_CustomConfig,
-        model_class_loader=lambda: lambda config: calls.append(config) or expected,
+        model_class_loader=lambda: Model,
         task="conditional_generation",
         explicit=True,
     )
@@ -486,11 +507,11 @@ def test_registered_constructor_enforces_task_without_loading(monkeypatch):
     with pytest.raises(ValueError, match="No model"):
         build_registered_model(config, task="causal_lm")
     assert calls == []
-    assert (
+    assert isinstance(
         build_registered_model(
             config, task="conditional_generation", explicit_only=True
-        )
-        is expected
+        ),
+        Model,
     )
     assert calls == [config]
 
