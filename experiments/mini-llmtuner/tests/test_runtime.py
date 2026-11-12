@@ -69,3 +69,70 @@ def test_zero_targets_rejected_before_update():
     with pytest.raises(ValueError, match="valid targets"):
         trainer.engine.train_step([batch])
     assert not trainer.optimizer.state
+
+
+def test_hf_llama_uses_existing_training_runtime():
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    adapter = importlib.import_module(f"{PACKAGE}.hf_adapter").LlamaModelAdapter
+    model = adapter(
+        LlamaForCausalLM(
+            LlamaConfig(
+                vocab_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=64,
+            )
+        )
+    )
+    trainer = Trainer(
+        Config(steps=1),
+        torch.device("cpu"),
+        model=model,
+        runtime_signature="tiny-llama-v1",
+    )
+    trainer.assembly.execution.validate_binding(model)
+    assert trainer.train()[0]["tokens"] == 15
+    trainer.close()
+    trainer.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        trainer.train()
+
+
+def test_components_are_injected_and_closed_on_failure():
+    class Profiler:
+        closed = False
+
+        def step(self):
+            raise RuntimeError("observer failed")
+
+        def close(self):
+            self.closed = True
+
+    profiler = Profiler()
+    trainer = Trainer(
+        Config(steps=1),
+        torch.device("cpu"),
+        profiler=profiler,
+        scheduler_factory=lambda optimizer: torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=1
+        ),
+    )
+    with pytest.raises(RuntimeError, match="observer failed"), trainer:
+        trainer.train()
+    assert trainer.checkpoint.step == 1
+    assert profiler.closed
+    assert trainer.engine.scheduler.last_epoch == 1
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [("recompute", True), ("quantization", "int8"), ("context_parallel_size", 2)],
+)
+def test_unimplemented_plans_fail_before_training(option, value):
+    parallel = importlib.import_module(f"{PACKAGE}.config").ParallelConfig
+    with pytest.raises(NotImplementedError):
+        Trainer(Config(parallel=parallel(**{option: value})), torch.device("cpu"))

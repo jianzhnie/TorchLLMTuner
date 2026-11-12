@@ -40,6 +40,10 @@ def resolve_plan(
     model: "Qwen3MoeModel", config: ParallelConfig, *, world_size: int
 ) -> ExecutionPlan:
     """Validate geometry without mutating model parameters."""
+    if config.recompute or config.quantization is not None:
+        raise NotImplementedError("Recompute/quantization execution is not implemented")
+    if config.cp_size != 1 or config.pp_size != 1:
+        raise NotImplementedError("CP/PP schedules are not implemented")
     if config.tp_size < 1 or config.ep_size < 1 or config.data_parallel_shard_size < 1:
         raise ValueError("parallel degrees must be positive")
     if world_size == 1 and any(

@@ -55,7 +55,25 @@ class HFModelAdapter(nn.Module):
     def __init__(self, model: nn.Module, architecture: str) -> None:
         super().__init__()
         self.model = model
-        self.contract = _linear_plan(model, architecture)
+        contract = _linear_plan(model, architecture)
+        self.contract = HFModelContract(
+            architecture=contract.architecture,
+            tp_plan={
+                f"model.{path}": layout for path, layout in contract.tp_plan.items()
+            },
+            targets=tuple(
+                (f"model.{path}", role, layout)
+                for path, role, layout in contract.targets
+            ),
+            vocab_size=contract.vocab_size,
+        )
+
+    def validate_parallel(self, *, tp_degree: int, ep_degree: int) -> None:
+        # Module-name inference alone cannot guarantee attention/DTensor semantics.
+        if tp_degree != 1 or ep_degree != 1:
+            raise NotImplementedError(
+                "HF adapter TP/EP needs an architecture-specific plan"
+            )
 
     @property
     def layers(self):

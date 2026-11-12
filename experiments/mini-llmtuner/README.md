@@ -50,3 +50,38 @@ checkpoint 使用目录中的 `state.pt`，通过临时文件原子替换，包�
 当前验证范围是 CPU 单进程 Qwen3-MoE 训练、梯度累积和精确恢复。CLI 默认使用 CPU 和合成数据；HF adapter 保留为接入扩展点，默认入口尚未提供 HF 权重选择。
 
 原有 TP / FSDP2 装配代码继续保留，但并不意味着本次完成了分布式端到端验证：Qwen3-MoE 的 packed expert TP 仍显式报错，EP dispatcher、CP 和 PP schedule 尚未实现。当前 checkpoint 是单进程原型，不能用于多 rank 分片状态保存；跨拓扑恢复、HF 权重导出和真实分布式 token 归一化需要独立完善。重计算与量化配置也尚未接入执行。
+
+## 复用默认装配，替换模型或组件
+
+`ExperimentTrainer` 保留为兼容入口，支持通过关键字参数注入 `model`、`optimizer_factory`、`scheduler_factory`、`loss`、`data`、`metrics`、`profiler` 和 `checkpoint_adapter`。例如，在 Python 中通过 `importlib` 加载含连字符的实验包：
+
+```python
+from importlib import import_module
+
+import torch
+from transformers import LlamaConfig, LlamaForCausalLM
+
+package = "experiments.mini-llmtuner"
+Config = import_module(f"{package}.config").ExperimentConfig
+Trainer = import_module(f"{package}.trainer").ExperimentTrainer
+Adapter = import_module(f"{package}.hf_adapter").LlamaModelAdapter
+
+model = Adapter(LlamaForCausalLM(LlamaConfig(
+    vocab_size=64, hidden_size=32, intermediate_size=64,
+    num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
+)))
+with Trainer(
+    Config(steps=2), torch.device("cpu"), model=model,
+    scheduler_factory=lambda optimizer: torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=1, gamma=0.9,
+    ),
+    runtime_signature="tiny-llama-step-lr-v1",
+) as trainer:
+    print(trainer.train())
+```
+
+自定义组件或预处理语义改变时，应更新 `runtime_signature`；签名会参与恢复校验。框架不会自动推断任意 callable 的配置。scheduler 和数据源需实现 `state_dict()` / `load_state_dict()`；数据源还需提供 `next_batch()`。loss 必须返回按 `labels != -100` 计算的损失总和。
+
+`with` 退出时关闭 profiler 和数据源提供的 `close()`，异常退出同样执行，重复关闭不会重复释放。optimizer 更新成功后立即提交已完成步数，再调用 metrics 和 profiler，避免观察组件报错导致步数落后于参数更新。
+
+HF Llama 的单进程训练已纳入回归测试。HF adapter 的 TP / EP 暂时明确拒绝执行：仅凭线性层名称推导切分策略不足以保证注意力及 DTensor 布局正确。重计算、量化和 CP / PP 等尚未实现的计划也会在训练前报错，避免配置被静默忽略。

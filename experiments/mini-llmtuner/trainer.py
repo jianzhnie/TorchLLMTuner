@@ -27,6 +27,9 @@ class BaseTrainer:
     def __init__(
         self, engine, data, checkpoint, *, accumulation=1, metrics=None, profiler=None
     ):
+        if accumulation < 1:
+            raise ValueError("accumulation must be positive")
+        self.closed = False
         self.engine, self.data, self.checkpoint = engine, data, checkpoint
         self.accumulation = accumulation
         self.metrics = metrics or TokenMetrics()
@@ -34,33 +37,74 @@ class BaseTrainer:
         self.start_step = checkpoint.step
 
     def train(self, steps):
+        if self.closed:
+            raise RuntimeError("Trainer is closed")
+        if steps < self.checkpoint.step:
+            raise ValueError("Target steps precede the restored step")
         history = []
         self.engine.model.train()
         for step in range(self.checkpoint.step, steps):
             batches = [self.data.next_batch() for _ in range(self.accumulation)]
             result = self.engine.train_step(batches)
+            self.checkpoint.step = step + 1
             labels = torch.cat([batch["labels"].flatten() for batch in batches])
             history.append(
                 self.metrics.record(
                     step, torch.tensor(result.loss_sum / result.targets), labels
                 )
             )
-            self.checkpoint.step = step + 1
             self.profiler.step()
         return history
 
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            close = getattr(self.profiler, "close", None)
+            if close is not None:
+                close()
+        finally:
+            close = getattr(self.data, "close", None)
+            if close is not None:
+                close()
+
+    def __enter__(self):
+        if self.closed:
+            raise RuntimeError("Trainer is closed")
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
 
 class ExperimentTrainer(BaseTrainer):
-    def __init__(self, config: ExperimentConfig, device: torch.device) -> None:
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        device: torch.device,
+        *,
+        model=None,
+        optimizer_factory=None,
+        scheduler_factory=None,
+        loss=None,
+        data=None,
+        metrics=None,
+        profiler=None,
+        checkpoint_adapter=None,
+        runtime_signature: str = "default-v1",
+    ) -> None:
         self.config, self.device = config, device
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         random.seed(config.seed)
         torch.manual_seed(config.seed)
-        model = Qwen3MoeModel(load_model_config(config.model_config)).to(device)
+        if model is None:
+            model = Qwen3MoeModel(load_model_config(config.model_config))
+        model = model.to(device)
         self.assembly = model.parallelize(config.parallel, world_size=self.world_size)
         self.model = self.assembly.model
-        optimizer_factory = getattr(config, "optimizer_factory", None) or AdamWFactory()
+        optimizer_factory = optimizer_factory or AdamWFactory()
         self.optimizer = optimizer_factory(
             self.model.parameters(), config.learning_rate
         )
@@ -74,7 +118,9 @@ class ExperimentTrainer(BaseTrainer):
         signature = hashlib.sha256(
             json.dumps(
                 {
-                    "config": load_model_config(config.model_config).to_dict(),
+                    "config": model.model.config.to_dict(),
+                    "architecture": model.contract.architecture,
+                    "runtime_signature": runtime_signature,
                     "parallel": parallel_dict,
                     "seed": config.seed,
                     "batch_size": config.batch_size,
@@ -86,18 +132,33 @@ class ExperimentTrainer(BaseTrainer):
                 default=str,
             ).encode()
         ).hexdigest()
-        scheduler = NoOpScheduler()
-        data = SyntheticData(self.model.contract.vocab_size, config, device)
+        scheduler = (
+            scheduler_factory(self.optimizer)
+            if scheduler_factory is not None
+            else NoOpScheduler()
+        )
+        if data is None:
+            data = SyntheticData(self.model.contract.vocab_size, config, device)
         engine = TrainingEngine(
-            self.model, self.optimizer, scheduler, CrossEntropyLoss()
+            self.model, self.optimizer, scheduler, loss or CrossEntropyLoss()
         )
         checkpoint = CheckpointManager(
-            self.model, self.optimizer, signature, scheduler=scheduler, data=data
+            self.model,
+            self.optimizer,
+            signature,
+            adapter=checkpoint_adapter,
+            scheduler=scheduler,
+            data=data,
         )
         if config.resume is not None:
             checkpoint.load(config.resume)
         super().__init__(
-            engine, data, checkpoint, accumulation=config.gradient_accumulation_steps
+            engine,
+            data,
+            checkpoint,
+            accumulation=config.gradient_accumulation_steps,
+            metrics=metrics,
+            profiler=profiler,
         )
 
     def train(self):

@@ -41,6 +41,7 @@ def main() -> None:
         getattr(torch, device.type).set_device(device)
     if world_size > 1:
         dist.init_process_group("gloo")
+    trainer = None
     try:
         config = ExperimentConfig(
             parallel=ParallelConfig(
@@ -80,6 +81,8 @@ def main() -> None:
         if metrics:
             print(json.dumps(metrics, indent=2), flush=True)
     finally:
+        if trainer is not None:
+            trainer.close()
         if dist.is_initialized():
             dist.destroy_process_group()
 
