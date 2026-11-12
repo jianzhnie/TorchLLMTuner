@@ -1,109 +1,265 @@
-# FSDPTurbo、TorchTitan 与 HyperParallel：大模型训练框架如何实现解耦
+# FSDPTurbo、TorchTitan 与 HyperParallel：模型与分布式训练如何解耦
 
-大模型训练框架通常同时面对三类变化：模型结构不断演进，并行策略从单一 FSDP 扩展到 TP、PP、CP、EP 等组合，训练过程还需要持续加入混合精度、重计算、checkpoint 和性能分析。如果这些逻辑全部写进模型的 `forward()` 或训练脚本，代码很快会变得难以复用和验证。
+大模型训练框架需要同时应对模型结构、并行策略和训练流程的变化。接入一个新的 MoE 模型，往往不仅要增加 `forward()`，还要明确专家参数如何打包、路由分数在哪里相乘、参数替换后如何恢复 optimizer 状态。如果这些知识散落在训练器和并行实现中，新增模型就会牵动整个系统。
 
-本文阅读了以下三个源码仓库的当前实现，关注一个核心问题：**模型定义、分布式并行和通用训练循环分别由谁负责，它们通过什么接口连接起来？**
+因此，架构设计的关键在于：**模型知识由谁表达，并行层如何消费这些知识，训练循环通过什么接口完成计算与恢复。** 本文围绕这三个问题，比较 FSDPTurbo、TorchTitan 和 HyperParallel，并讨论对 TorchLLMTuner 的启示。
 
-- FSDPTurbo：`/Users/robin/work_dir/FSDPTurbo`
-- TorchTitan：`/Users/robin/work_dir/torchtitan`
-- HyperParallel：`/Users/robin/work_dir/hyper-parallel`
+## 阅读导航
 
-## 先看结论：三种不同的解耦取向
+- [一、调研范围与评价方法](#一调研范围与评价方法)
+- [二、总体结论](#二总体结论)
+- [三、FSDPTurbo：外部包装与固定装配](#三fsdpturbo外部包装与固定装配)
+- [四、TorchTitan：模型协议与训练引擎](#四torchtitan模型协议与训练引擎)
+- [五、HyperParallel：适配器、计划与执行器](#五hyperparallel适配器计划与执行器)
+- [六、横向比较](#六横向比较)
+- [七、对 TorchLLMTuner 的建议](#七对-torchllmtuner-的建议)
+- [八、源码索引与延伸阅读](#八源码索引与延伸阅读)
 
-三者都在训练开始前完成并行初始化，训练循环本身不直接编写 collective 通信。但它们选择的边界不同：
+## 一、调研范围与评价方法
 
-| 框架 | 模型侧抽象 | 并行侧抽象 | 训练侧抽象 | 主要特点 |
-|---|---|---|---|---|
-| FSDPTurbo | HuggingFace 或自定义 `nn.Module` | 外部 `FSDPTurbo` wrapper，按 plan 依次注入能力 | `BaseTrainer` 模板方法 | 接入普通 HF 模型成本低，并行逻辑集中；复杂模型依赖模块命名和 patch 约定 |
-| TorchTitan | `BaseModel` + 嵌套 `Config` 协议 | 模型的 `parallelize()`、`_parallelize()`、`_apply_fsdp()` | `Trainer` + `TrainingEngine` | 协议最清晰，模型必须显式声明输入、分片、流水线和权重适配 |
-| HyperParallel | HF AutoModel + 模型族 adapter + YAML recipe | DeviceMesh/DTensor、并行 API 和声明式 plan | `BaseTrainer` stages + `TextTrainer`/`VLMTrainer` | 把模型接入、硬件优化和训练组件拆开，面向 NPU 超节点扩展 |
+本文依据本机以下仓库的源码，以及已有的三份专项分析：
 
-可以把三者的核心调用链概括为：
+| 框架 | 源码位置 | 重点关注 |
+|---|---|---|
+| FSDPTurbo | `/Users/robin/work_dir/FSDPTurbo` | 外部包装器、并行计划、固定变换顺序 |
+| TorchTitan | `/Users/robin/work_dir/torchtitan` | 模型协议、分片声明、Trainer 与 TrainingEngine |
+| HyperParallel | `/Users/robin/work_dir/hyper-parallel` | 模型适配器、ShardingPlan、planner/builder、训练组件 |
+
+本文分析的是设计方式，不是性能排名，也不构成目标硬件上的数值或吞吐验收。源码路径随版本变化；例如，旧分析中的 TorchTitan `models/base/`，在当前所读源码中对应的核心协议位于 `protocols/`。历史文件数和代码行数不作为比较依据。
+
+### 解耦需要看四个层面
+
+| 层面 | 需要回答的问题 | 常见风险 |
+|---|---|---|
+| 代码依赖 | 通用并行代码是否直接导入具体模型？ | 循环依赖、加载成本和修改范围扩大 |
+| 结构约定 | 是否依赖固定模块路径、属性名和参数形状？ | 漏匹配、误匹配、版本升级失效 |
+| 数学语义 | router、专家布局、mask、状态递推由谁定义？ | 张量形状正确，但数值结果错误 |
+| 生命周期 | 初始化、并行变换、重计算、编译与恢复如何排序？ | 参数引用失效、重复通信、恢复后行为变化 |
+
+少量 import 不等于完全解耦。合理的目标是让依赖通过明确契约表达，并把模型特有语义留在能够解释它的位置。
+
+文中 TP、EP、CP、PP 分别指张量并行、专家并行、上下文并行和流水线并行；FSDP/HSDP 指全分片/混合分片数据并行。FQN 指模块或参数的完整限定名称。
+
+## 二、总体结论
+
+三个框架都把并行装配与训练迭代做了分层，但模型知识的归属不同。
+
+| 框架 | 主要设计方式 | 模型知识主要放在哪里 | 训练侧的主要抽象 |
+|---|---|---|---|
+| FSDPTurbo | 配置选择目标，外部包装器按固定顺序变换模型 | 模型约定、配置、patch 和专用并行实现 | `BaseTrainer` 及其构建/训练扩展点 |
+| TorchTitan | 模型声明初始化和分片语义，通用引擎消费协议 | `Module`、`BaseModel`、模型组件及 sharding 配置 | `Trainer` + `TrainingEngine` |
+| HyperParallel | 适配器声明能力，planner 生成计划，builder 执行变换 | 模型适配器、计划规则及部分通用推导逻辑 | `BaseTrainer` 阶段 + `TextTrainer`/`VLMTrainer` |
+
+这三种方式是不同的工程取舍，不构成先后演进或优劣排序。外部包装缩小模型改动，模型协议明确语义归属，适配器与计划则为外部模型兼容提供中间层。
+
+还需要区分两个时点：**训练前完成并行装配，训练中执行并行通信。** all-to-all、梯度归约和 PP 调度不会因为装配提前完成而消失；解耦的意义是让训练器调用执行接口，而不是在业务循环中编写每种并行的细节。
+
+## 三、FSDPTurbo：外部包装与固定装配
+
+### 3.1 组件如何连接
+
+模型创建由 `ModelFactory` 处理，支持自定义函数、注册构造器和 HuggingFace `from_pretrained()`。`FSDPTurbo(config, model)` 接收已经创建的模型，应用并行与内存策略。`BaseTrainer.setup()` 通过 `build_*()` 方法组装模型、优化器、数据和监控组件，随后进入训练循环。
 
 ```text
-FSDPTurbo:   ModelFactory -> 原生模型 -> FSDPTurbo(wrapper + plans) -> BaseTrainer.train
-TorchTitan:  Model.Config.build -> BaseModel.parallelize(context) -> TrainingEngine -> Trainer
-HyperParallel: YAML/AutoModel -> Adapter + DTensor plans -> BaseTrainer stages -> Text/VLMTrainer
+BaseTrainer.setup()
+  ├─ build_tokenizer()
+  ├─ build_model()：创建模型并接入并行包装
+  ├─ build_optimizer() / build_scheduler()
+  └─ build_dataloader() / checkpoint / monitor
+       ↓
+BaseTrainer.train()
+  └─ prepare_batch() → train_step() → 更新与记录
 ```
 
-## FSDPTurbo：用外部 Wrapper 统一改造模型
+这里的箭头表示职责关系，不要求所有模型都使用相同构造函数。
 
-### 代码分层
+### 3.2 并行层如何改造模型
 
-FSDPTurbo 的入口相对直接：模型工厂负责“创建模型”，`FSDPTurbo` 负责“把模型变成分布式模型”，`BaseTrainer` 负责“运行训练”。
+`FSDPTurbo` 构造入口按以下顺序组织能力：
 
-1. **模型创建**：`fsdp_turbo/training/factories/model_factory.py` 中的 `ModelFactory` 支持自定义创建函数、注册表和 HuggingFace `AutoModelForCausalLM.from_pretrained()`。模型实现集中在 `fsdp_turbo/models/`。
-2. **并行改造**：`fsdp_turbo/fsdp_turbo.py` 中的 `FSDPTurbo` 继承 `torch.nn.Module`，接收 `config` 和原始模型。构造过程会初始化 parallel state，然后按顺序应用量化、TP、CP、模块 patch、EP、VP、重计算、activation swap、chunk batch 和 FSDP/HSDP。
-3. **训练执行**：`fsdp_turbo/training/trainer.py` 中的 `BaseTrainer.setup()` 通过 `build_tokenizer()`、`build_model()`、`build_optimizer()`、`build_scheduler()` 和 `build_dataloader()` 组装组件；`train()` 负责 epoch、梯度累积、监控、checkpoint 和 profiler，并把模型计算委托给 `prepare_batch()`、`train_step()` 等扩展点。
+```text
+parallel state → 量化 → TP → TP 元信息 → CP → 模块 patch
+  → EP → VP → pre-FSDP hook → 重计算 → 激活交换 → Chunk Batch → FSDP
+```
 
-### 它是怎样解耦的？
+TP 通过模块匹配构造 `ColwiseParallel`、`RowwiseParallel`、`SequenceParallel`，再调用 PyTorch `parallelize_module()`。EP 为选中的专家容器建立分片和 dispatcher。FSDP 根据计划选择包装单元、忽略项、策略及预取关系；部分专家分片在 EP 阶段完成，不能把末尾 FSDP 理解为所有参数唯一的包装时点。
 
-FSDPTurbo 把并行逻辑放在模型外部。训练器拿到的不是原始模型，而是已经经过并行和内存优化处理的模型，因此 epoch loop 不需要知道 TP 的切分方式，也不需要直接调用 CP 或 EP 通信。
+模型可通过 `pre_fsdp_hook` 为非标准存储做准备。native/custom FSDP 差异通过策略接口隔离，mesh、group 和 rank 则通过 `ParallelState` 统一访问。
 
-并行能力采用相互独立的注入函数，例如 `tensor_parallel_modules()`、`expert_parallelize_modules()` 和 `fully_shard_parallel_modules()`。是否启用、使用哪个 mesh、如何匹配模块，都由配置中的 plan 决定。对非标准存储，模型可以提供 `pre_fsdp_hook`，在 FSDP 包装前完成准备。
+### 3.3 收益与边界
 
-这种方式的优点是**侵入性低、适合快速接入大量现成模型**。局限也很明确：并行实现需要依赖模块路径、模块类型和 patch 约定；当模型结构特殊时，问题往往出现在注入顺序或匹配规则中，而不是模型类本身。
+这种设计的优势是装配路径直接：配置决定目标，包装器决定顺序，并行函数执行变换。对满足既有结构约定的模型，可以减少对模型主体的修改。
 
-## TorchTitan：用模型协议连接模型与训练引擎
+但复杂度仍然存在于模块命名、专家布局、配置 pattern、patch 和安装顺序中。全局并行状态方便调用，也增加了测试隔离和多拓扑共存的难度。借鉴时应保留策略重叠检测、共享参数检查和 rank 失败协调，不能把较短入口等同于更小的正确性责任。
 
-### 代码分层
+## 四、TorchTitan：模型协议与训练引擎
 
-TorchTitan 把“模型可被训练”定义成一组明确协议，而不是只要求它是一个 `nn.Module`。
+### 4.1 模型显式声明训练所需的语义
 
-1. **模型协议**：`torchtitan/protocols/model.py` 的 `BaseModel` 继承配置化 `Module`。每个模型拥有嵌套的 `Config`，并需要实现 `preprocess_inputs()`、`get_nparams_and_flops()` 和 `_apply_fsdp()`。模型还可以声明流水线首尾模块、state-dict adapter 以及 PP 支持情况。
-2. **并行生命周期**：`BaseModel.parallelize()` 负责激活 SPMD 上下文、调用模型的 `_parallelize()`、应用 activation checkpoint，最后调用 `_apply_fsdp()`。模型配置通过 `set_sharding_()` 把并行信息传递给各个子模块。
-3. **训练执行**：`torchtitan/trainer.py` 中的 `Trainer` 负责数据、验证和指标策略；`torchtitan/training_engine.py` 中的 `TrainingEngine` 负责 microbatch、非 PP/PP 的 forward-backward、优化器更新、CUDA Graph、checkpoint、profiling 和 replay。
+当前源码的 `protocols/module.py` 定义配置化 `Module`，承载参数初始化、buffer 和 sharding 等约定；`protocols/model.py` 的 `BaseModel` 在此基础上提供输入预处理、并行生命周期和流水线接口。
 
-### 它是怎样解耦的？
+几个重要接口是：
 
-TorchTitan 的关键是把训练引擎依赖收敛到协议上。引擎不需要了解某个模型是 Llama、Qwen 还是 Kimi，只需要调用统一的输入预处理、forward/backward 和优化接口。模型则显式承担三类与自身结构相关的责任：将 dataloader batch 转换成模型输入和 labels；为子模块设置 sharding 和并行布局；描述 PP 切分边界以及 checkpoint 权重转换方式。
+- `Config.build()`：根据配置创建模块或模型。
+- `Config.set_sharding_()`：设置模型及子组件的分片配置。
+- `preprocess_inputs()`：把数据转换为模型输入、labels 和额外参数，可包含 CP 输入处理。
+- `parallelize()`：组织模型分片、重计算和 FSDP 生命周期。
+- `pipeline()`：结合模型首尾模块声明和配置，调用通用 PP 切分与调度实现。
+- `state_dict_adapter_cls`：指定外部权重格式的转换适配器。
 
-因此，模型替换通常不需要修改 `TrainingEngine`，并行组合也不会散落在通用训练循环中。相比 FSDPTurbo，这种方式的边界更清楚、静态约束更强；代价是接入新模型时需要实现完整协议，模型代码本身也必须理解一部分并行语义。
+这些接口允许默认实现、继承和模型级覆盖，并不意味着每个模型都必须重新实现所有能力。
 
-## HyperParallel：用 Adapter、Plan 和组件体系连接 HF 与硬件运行时
+### 4.2 Trainer 与 TrainingEngine 分工
 
-### 代码分层
+`Trainer` 负责数据、验证和指标策略，创建并持有 `TrainingEngine`。引擎负责模型执行、优化、checkpoint、性能分析和重放等通用机制。
 
-HyperParallel 的目标不仅是支持多种并行，还要把 HuggingFace 模型适配到昇腾 NPU 和超节点运行时，因此它的分层比前两者更宽。
+```text
+Trainer 初始化
+  → 准备模型配置和 sharding 声明
+  → 创建 TrainingEngine，由引擎组织模型构建与并行化
+  → 构建数据、验证和指标组件
 
-1. **模型接入**：`hyper_parallel/models/api.py` 提供不依赖 trainer 的 `from_pretrained()` facade；`models/<family>/` 保存模型族 adapter、注册逻辑、生成的 NPU modeling 文件和训练 recipe。模型可以复用 HuggingFace 的结构和权重格式。
-2. **分布式核心**：`core/dtensor/` 提供 DeviceMesh、DTensor、placement 和 redistribution；`core/tensor_parallel/`、`core/fully_shard/`、`core/pipeline_parallel/` 以及 CP/EP 模块提供并行实现。Adapter 或 plan 描述模块替换、布局和通信规则，运行时再把这些规则注入模型。
-3. **训练组件**：`hyper_parallel/models/README.zh.md` 描述了由 YAML 和 dotted CLI override 驱动的 `TrainerConfig`。`TextTrainer` 和 `VLMTrainer` 组合 `BaseTrainer` 的 setup、model、loss、data、optimizer、scheduler 和 callback stages。`scripts/train_lm.py` 只负责解析配置、启动 codegen sidecar、创建 trainer 并调用 `train()`。
+Trainer.train_step()
+  → TrainingEngine.forward_backward()
+  → TrainingEngine.optim_step()
+```
 
-### 它是怎样解耦的？
+`BaseModel.parallelize()` 的默认流程包含 local compile 绑定、SPMD 上下文、`_parallelize()`、激活重计算和 `_apply_fsdp()`。模型可以覆盖该流程，因此它是默认生命周期，不是所有模型的不可变调用链。
 
-HyperParallel 把并行、重计算、offload、量化和算子替换视为系统能力，通过 adapter 和配置声明后注入模型。损失函数、优化器、checkpoint、量化模块和高性能算子则分别位于 `components/`，由配置中的 build target 组合。
+### 4.3 为什么 distributed 目录不能代表全部并行实现
 
-这样，训练循环不需要绑定某个模型，也不需要绑定某种并行方式；模型只需满足 HF 结构和 adapter 契约。与此同时，DTensor layout、拓扑感知通信、NPU 多核调度和内存池化被留在 core/runtime 层，模型代码可以保持相对稳定。
+| 能力 | 主要职责位置 |
+|---|---|
+| 初始化与分片声明 | `protocols/`、模型配置和模型组件 |
+| TP | 模型 Linear、Attention、sharding 声明和相关执行机制 |
+| EP | 模型 MoE 组件及通用专家通信实现 |
+| CP | 输入切分工具与 attention 侧的布局、通信和数学处理 |
+| FSDP / PP / mesh | `distributed/` 通用基础设施与模型边界声明 |
+| Checkpoint | 训练组件和 state-dict adapter |
 
-它的优势是**扩展面最宽**，能够把模型生态、并行策略和硬件优化统一起来。相应的代价是接入链路较长：新模型除了要能加载，还要满足模块路径、布局、精度和 checkpoint 转换等契约，必要时还会涉及生成代码。
+TorchTitan 把较多并行数学放在模型及公共模型组件中，因此不能只统计 `distributed/` 的文件数。其主要收益是模型结构、初始化与数学约束靠近所有者；代价是模型需要适配协议，迁移外部 HF 模型时仍要处理结构和状态格式差异。
 
-## 三者放在一起看：解耦边界在哪里？
+## 五、HyperParallel：适配器、计划与执行器
+
+### 5.1 区分底层原语、模型装配和训练应用
+
+HyperParallel 的几个目录承担不同层级的职责：
+
+| 层级 | 位置 | 主要职责 |
+|---|---|---|
+| 分布式原语 | `core/` | DeviceMesh、DTensor、布局重分布、TP/FSDP/PP 等底层能力 |
+| 模型装配 | `distributed/` | 计划推导、参数分片、CP/EP 集成、forward 包装及 FSDP 适配 |
+| 模型接入 | `models/` | 模型族适配器、注册、构造、状态映射和配方 |
+| 训练服务 | `components/`、`data/` | loss、优化器、checkpoint、量化与数据管线 |
+| 训练应用 | `trainer/`、`scripts/` | 配置解析、组件构建、训练循环和生命周期 |
+
+模型 API 的 `from_pretrained()` 门面不依赖 Trainer，支持程序化接入。训练应用则由 YAML 与命令行覆盖生成 `TrainerConfig`，再创建 `TextTrainer` 或 `VLMTrainer`。底层 API 和训练应用是不同入口，不应混成一条强制调用链。
+
+### 5.2 从能力声明到模型变换
+
+```text
+模型 registration/provider
+  → ModelAdapterSpec：声明模型能力与专用规则
+  → ShardingPlanner：推导并合并覆盖规则
+  → ShardingPlan：记录参数布局、通信边界和计算注入
+  → builder/apply：执行模型变换
+```
+
+`ModelAdapterSpec` 可声明模块替换、CP/EP provider、FSDP 单元、重计算、loss、checkpoint 和物化策略。registry 延迟发现模型族，再按需加载 provider，降低通用层对具体模型实现的直接依赖。
+
+`ShardingPlan` 是解析与执行之间的中间表示，包含参数 placement、输入输出 layout、通信边界、特殊参数处理和 tied weights。planner 可结合通用命名规则与用户覆盖生成计划；特殊区域可通过 `derive=False` 等配置关闭自动推导，改为显式声明。
+
+builder 的主要阶段为配置规范化、参数分片、特殊参数处理、forward 包装和 tied weights 处理。生产与 validate 路径可共享局部计算及通信逻辑，但对 DTensor 检查与局部张量执行采用不同处理方式。
+
+### 5.3 适配器减少了什么耦合
+
+适配器减少的是通用层直接导入具体模型、集中维护模型发现和加载全部重型依赖的需求。它也让专用 CP、EP、FSDP 规则有了明确归属。
+
+但结构和数学耦合仍需单独评估：
+
+| 区域 | 仍需关注的模型知识 |
+|---|---|
+| Planner | FQN、projection 名称、attention/MLP/MoE 角色推断 |
+| EP routing 与旧 recipes | 模型族别名、router 与 shared expert 组合 |
+| KDA CP | Kimi projection API、状态递推、卷积和输出形式 |
+| FSDP adapter | 自动 decoder/expert 发现与模型配置识别 |
+| Forward 包装 | mask/cache、参数和返回结构、重计算及编译顺序 |
+
+因此，更准确的评价是：**直接依赖方向较清晰，结构与数学契约仍然重要，部分模型专用实现仍有迁移空间。** 其值得借鉴的部分是能力声明、延迟注册和计划中间表示；使用这些机制时，应避免让自动推导成为数值正确性的唯一依据。
+
+## 六、横向比较
+
+### 6.1 三个边界分别放在哪里
 
 | 问题 | FSDPTurbo | TorchTitan | HyperParallel |
 |---|---|---|---|
-| 谁创建模型？ | `ModelFactory` | `Config.build()` | HF facade / 模型注册器 |
-| 谁决定并行？ | 外部 `FSDPTurboConfig` 和各类 plan | 模型 config + `ParallelismConfig` | YAML recipe + AdapterSpec + DeviceMesh/DTensor |
-| 谁处理模型输入？ | Trainer 的 `prepare_batch()`，必要时由模型配合 | `BaseModel.preprocess_inputs()` | dataset/get_batch/data transform 组件与 adapter |
-| 谁负责 forward/backward？ | `BaseTrainer.train_step()` | `TrainingEngine.forward_backward()` | `BaseTrainer` 的训练 runtime |
-| 模型需要了解多少并行？ | 较少，但依赖模块约定和 hook | 较多，需要实现并行协议 | 适配器承担大部分并行接入，模型需满足布局契约 |
-| 最适合的场景 | 快速改造 HF 模型、集中式并行封装 | 需要强协议和可组合并行的研究型训练 | NPU/超节点、硬件协同和大规模模型接入 |
+| 模型从哪里来？ | HF 或自定义工厂 | 模型 Config 与协议体系 | HF 兼容入口及模型族适配器 |
+| 并行知识由谁表达？ | 配置、模型约定及专用实现 | 模型及子组件显式声明 | 适配器规则与 planner 推导 |
+| 谁执行模型变换？ | 外部包装器和各并行函数 | 模型并行生命周期与通用基础设施 | builder 根据 ShardingPlan 执行 |
+| 谁隔离训练流程？ | BaseTrainer 扩展点和训练服务 | Trainer 与 TrainingEngine | Trainer 阶段和配置化组件 |
+| 主要维护成本 | pattern、patch、顺序和隐式约定 | 协议实现与模型迁移 | adapter、推导规则和运行时包装契约 |
 
-三种方式没有绝对的优劣，实质上是三种工程取舍：外部包装把模型改动降到最低，但更多依赖运行时匹配规则；模型协议让边界最清晰，但把并行知识显式带入模型实现；适配器与声明式 plan 在两者之间增加一层，换取 HF 兼容性和硬件扩展能力。
+### 6.2 四个容易混淆的判断
 
-## 对 TorchLLMTuner 的设计建议
+**入口短，不代表系统复杂度低。** FSDPTurbo 的部分复杂度在配置和 dispatcher，TorchTitan 的部分复杂度在模型组件，HyperParallel 的部分复杂度在适配器与 builder。应沿完整调用链比较。
 
-结合这三个项目，可以采用“协议 + plan + 组件”的组合方式：
+**声明式配置，不等于完整执行计划。** 并行度和 pattern 只是请求；可检查的执行计划还需要明确目标、布局、ownership、冲突及前后置条件。
 
-1. 保留一个只负责生命周期的 `BaseTrainer`，把初始化、数据迭代、梯度累积、日志和 checkpoint 与具体并行实现隔离。
-2. 定义轻量 `ModelProtocol`，至少统一 `preprocess_inputs()`、`forward()`、`parallelize()` 和 checkpoint adapter；简单 HF 模型可以通过默认实现接入。
-3. 为 TP、FSDP、CP、EP、PP、重计算和量化建立声明式 plan，在训练开始前一次性应用，训练 step 中不出现并行分支。
-4. 将 loss、optimizer、scheduler、checkpoint、metrics 和 profiler 设计为可替换组件，使文本、VLM 和 MoE 共用同一训练引擎。
-5. 对复杂模型保留显式 hook，用于声明模块边界、参数布局和流水线切分；不要把这些信息隐藏在大量字符串 patch 中。
-6. 把并行后的模型状态、optimizer 状态和原始 HF 权重之间的转换独立出来，避免 checkpoint 逻辑反向污染模型定义。
+**训练循环统一，不等于执行路径完全相同。** PP 需要 schedule，CP 需要 attention 通信，MoE 需要 dispatch。可以统一引擎接口，但不能省略这些不同的执行语义。
 
-## 参考源码
+**可加载模型，不等于支持所有并行组合。** HF 权重能够加载，只证明构造和格式路径可用；TP、EP、CP、PP、FSDP 及其组合仍需分别验证几何、状态和数值结果。
 
-- FSDPTurbo：`fsdp_turbo/fsdp_turbo.py`、`fsdp_turbo/training/trainer.py`、`fsdp_turbo/training/factories/model_factory.py`
-- TorchTitan：`torchtitan/protocols/model.py`、`torchtitan/trainer.py`、`torchtitan/training_engine.py`、`docs/composability.md`
-- HyperParallel：`README.zh.md`、`hyper_parallel/models/README.zh.md`、`hyper_parallel/models/api.py`、`hyper_parallel/trainer/base.py`、`hyper_parallel/trainer/text_trainer.py`、`hyper_parallel/core/dtensor/`
+## 七、对 TorchLLMTuner 的建议
+
+TorchLLMTuner 既有实现与迁移路径还涉及 HF 适配、参数替换、NPU/HCCL、PP ownership 和 checkpoint 恢复。借鉴上述框架时，应逐步收敛职责，而不是按目录规模删减逻辑。具体状态与实施批次统一维护在[架构设计及重构路线图](llmtuner_refactoring_roadmap.md)。
+
+### 7.1 建立五个稳定边界
+
+```text
+模型：定义结构、数学、初始化和状态契约
+  ↓
+计划解析：绑定目标，检查布局、ownership、能力与冲突
+  ↓
+并行执行：按已验证计划分片、通信和包装
+  ↓
+训练引擎：执行前后向、优化和并行 schedule
+  ↓
+Trainer：组织数据、累积、日志、保存恢复和资源关闭
+```
+
+这是职责关系，不要求创建五套管理类。模型契约可从少量属性、方法或 Protocol 开始，已有叶子模块能承担职责时就不再新增转发层。
+
+### 7.2 六项可落地的改进
+
+1. **生命周期与并行算法分离。** BaseTrainer 负责组件初始化、数据迭代、梯度累积、记录和恢复；TP、EP、CP 与 PP 的执行细节交给引擎和并行后端。
+2. **模型提供轻量协议。** 统一输入预处理、forward、并行能力及状态适配入口。简单模型可用默认适配器，复杂模型显式声明专家数学、参数轴和 PP 边界。
+3. **先解析计划，再修改模型。** 在变换前校验目标、布局、共享参数和能力组合；训练前完成装配，训练中由固定执行路径调用通信和 schedule。重计算与量化也需声明生命周期依赖。
+4. **训练服务支持替换。** loss、optimizer、scheduler、checkpoint、metrics 和 profiler 通过明确接口组合；文本、VLM 和 MoE 在兼容的执行接口下复用训练引擎。
+5. **模型差异保留在模型侧。** router score、packed halves、KDA 状态递推和 pipeline I/O 不依赖通用层猜测。模块替换返回旧到新映射，执行前检查过期绑定。
+6. **格式转换与恢复编排分离。** 模型 state adapter 处理 HF 外部键、打包和别名；checkpoint 服务管理模型、optimizer、scheduler、RNG、数据游标及保存加载过程。跨拓扑恢复单独定义支持范围。
+
+### 7.3 用验证结果约束支持声明
+
+结构迁移应对照初始化、logits、loss、梯度、参数更新、共享身份和 RNG。分布式验收覆盖适用拓扑、空专家、非对称输入、失败传播和独立恢复；重计算、编译、swap 与 PP 的组合需要单独验证。
+
+模型装配失败不提供天然事务回滚；资源接口应明确 owner、等待、释放和异常传播。性能比较则固定模型、数据、精度和拓扑，记录最慢 rank、稳态吞吐、显存与 Host 峰值，并用 trace 确认实际执行路径。
+
+## 八、源码索引与延伸阅读
+
+以下路径相对各框架仓库根目录，用于定位本文讨论的实现。
+
+| 框架 | 入口与关键实现 |
+|---|---|
+| FSDPTurbo | `fsdp_turbo/fsdp_turbo.py`；`fsdp_turbo/fsdp_turbo_config.py`；`fsdp_turbo/training/trainer.py`；`fsdp_turbo/training/factories/model_factory.py` |
+| FSDPTurbo 并行 | `fsdp_turbo/distributed/parallel_state.py`；`fsdp_turbo/distributed/tensor_parallel/tensor_parallel.py`；`fsdp_turbo/distributed/expert_parallel/expert_parallel.py`；`fsdp_turbo/distributed/fully_shard_parallel/fully_shard_parallel.py` |
+| TorchTitan | `torchtitan/protocols/model.py`；`torchtitan/protocols/module.py`；`torchtitan/protocols/sharding.py`；`torchtitan/trainer.py`；`torchtitan/training_engine.py` |
+| TorchTitan 并行 | `torchtitan/distributed/fsdp.py`；`torchtitan/distributed/parallelism_context.py`；`torchtitan/config/parallelism.py` |
+| HyperParallel | `hyper_parallel/models/api.py`；`hyper_parallel/models/adapter_spec.py`；`hyper_parallel/models/registry.py`；`hyper_parallel/trainer/text_trainer.py` |
+| HyperParallel 装配 | `hyper_parallel/distributed/plan.py`；`hyper_parallel/distributed/apply.py`；`hyper_parallel/distributed/_builder/planner.py`；`hyper_parallel/distributed/_builder/fsdp_adapter.py` |
+| HyperParallel 专用语义 | `hyper_parallel/distributed/expert_parallel/routing.py`；`hyper_parallel/distributed/context_parallel/kimi_delta_attention.py` |
+
+专项分析与实施方案：
+
+- [FSDPTurbo 框架对比](framework_compare/fsdpturbo_comparison.md)
+- [TorchTitan 框架对比](framework_compare/torchtitan_comparison.md)
+- [TorchLLMTuner 架构设计及重构路线图](llmtuner_refactoring_roadmap.md)
