@@ -6,6 +6,7 @@ _EXPORTS = {
     "AssemblyResult": "assembly",
     "assemble_model": "assembly",
     "ExperimentConfig": "config",
+    "ParallelConfig": "config",
     "small_qwen3_moe_config": "config",
     "ModelContract": "model",
     "Qwen3MoeModel": "model",
@@ -13,6 +14,12 @@ _EXPORTS = {
     "ResolvedTarget": "resolver",
     "resolve_plan": "resolver",
     "ExperimentTrainer": "trainer",
+    "ModelProtocol": "protocol",
+    "CheckpointAdapterProtocol": "protocol",
+    "HFModelAdapter": "hf_adapter",
+    "LlamaModelAdapter": "hf_adapter",
+    "DeepSeekV3ModelAdapter": "hf_adapter",
+    "load_hf_model": "hf_factory",
 }
 
 __all__ = list(_EXPORTS)

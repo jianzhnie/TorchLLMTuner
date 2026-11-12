@@ -217,3 +217,21 @@ class Qwen3MoeModel(nn.Module):
             position_ids=position_ids,
             use_cache=False,
         ).logits
+
+    def preprocess_inputs(
+        self, batch: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Default protocol hook; specialized models may shard or pack here."""
+        return batch
+
+    def parallelize(self, config, *, world_size: int):
+        from .assembly import assemble_model
+
+        return assemble_model(self, config, world_size=world_size)
+
+    def apply_expert_parallel(self, mesh) -> None:
+        """Hook for an EP dispatcher; eager MoE needs routing-aware dispatch."""
+        del mesh
+        raise NotImplementedError(
+            "Qwen3-MoE eager experts require an EP dispatcher implementation"
+        )
