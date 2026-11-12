@@ -187,12 +187,10 @@ class MoE(nn.Module):
         # A plain attribute, not a buffer: it is per-microbatch input, never
         # module state, and must stay out of the state_dict.
         self._pending_padding_mask: torch.Tensor | None = None
-        # Whether the host HF layer unpacks ``(hidden_states, router_logits)``
-        # from this block. transformers has no single convention -- 4.x Mixtral,
-        # OLMoE and GraniteMoe unpack, Qwen2/3-MoE tolerate either and DeepSeek
-        # takes a bare tensor -- so the swap reads it off the block it replaces
-        # (``hf_inspection.returns_router_logits``) and records it here. The
-        # block's own arity is what the host was written against.
+        # EP replacement sets this from the model's declared router-output
+        # contract (or inspection for explicitly supported legacy callers).
+        # Preserve the decoder's expected return arity: returning a tuple where
+        # it expects a tensor changes the model's forward semantics.
         self.returns_router_logits = False
 
     @torch.no_grad()

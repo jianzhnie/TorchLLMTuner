@@ -84,7 +84,12 @@ def test_real_router_forward_vjp_and_storage(family, setting, normalize):
     assert type(router) is (fp32_type if setting == "float32" else native_type)
     generator = torch.Generator().manual_seed(41)
     with torch.no_grad():
-        router.weight.copy_(torch.randn((8, 32), generator=generator) * 0.2)
+        # Direct block construction does not run the owning model's post_init.
+        # Initialize experts too: uninitialized storage can contain NaNs and
+        # cannot establish an exact before/after checkpoint-state invariant.
+        for value in block.parameters():
+            value.copy_(torch.randn(value.shape, generator=generator) * 0.2)
+            assert bool(value.isfinite().all())
     parameter = router.weight
     before = {key: value.clone() for key, value in block.state_dict().items()}
     x = torch.randn((7, 32), generator=generator).bfloat16().requires_grad_()
