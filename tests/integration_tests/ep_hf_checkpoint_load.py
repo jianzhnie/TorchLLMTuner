@@ -15,7 +15,7 @@ from torch import nn
 
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.components.checkpointer.hf.hf_storage import save_hf_checkpoint
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.parallel.expert_parallel.checkpointing import (
     expert_shard_map,
     mark_experts_ep_sharded,
@@ -49,10 +49,9 @@ def main() -> None:
         dist.barrier()
         model = nn.Module()
         model.model = nn.Module()
-        model.model.model = nn.Module()
-        model.model.model.layers = nn.ModuleList([nn.Module()])
+        model.model.layers = nn.ModuleList([nn.Module()])
         mlp = nn.Module()
-        model.model.model.layers[0].mlp = mlp
+        model.model.layers[0].mlp = mlp
         mlp.router = nn.Module()
         mlp.router.gate = nn.Linear(3, 4, bias=False)
         mlp.routed_experts = nn.Module()
@@ -69,12 +68,12 @@ def main() -> None:
         sharded = shard_expert_state(
             model.state_dict(), shard_map=expert_shard_map([model]), model_parts=[model]
         )
-        expert_key = "model." + prefix + "routed_experts.inner_experts.w1_EFD"
+        expert_key = prefix + "routed_experts.inner_experts.w1_EFD"
         chunk = sharded[expert_key]
         assert chunk.shape == (4, 2, 3)
         assert chunk.chunks[0][0] == (rank * 2, 0, 0)
         assert chunk.chunks[0][1].data_ptr() == grouped.w1_EFD.data_ptr()
-        hf_template = HFTransformerStateDictAdapter(
+        hf_template = ModelStateDictAdapter(
             SimpleNamespace(model_type="qwen3_moe", num_experts=4),
             str(path),
             qwen3_expert_parallel=True,
@@ -109,7 +108,7 @@ def main() -> None:
         }
         dcp.load(complete, checkpoint_id=checkpoint_path)
         for projection, role in roles.items():
-            key = "model." + prefix + "routed_experts.inner_experts." + role
+            key = prefix + "routed_experts.inner_experts." + role
             expected = torch.stack(
                 [weights[f"{prefix}experts.{e}.{projection}.weight"] for e in range(4)]
             )
@@ -138,7 +137,7 @@ def main() -> None:
         local_wrapper.load_state_dict(complete)
         for key, value in model.state_dict().items():
             torch.testing.assert_close(value, expected_local[key], atol=0, rtol=0)
-        adapter = HFTransformerStateDictAdapter(
+        adapter = ModelStateDictAdapter(
             SimpleNamespace(model_type="qwen3_moe", num_experts=4),
             str(path),
             qwen3_expert_parallel=True,

@@ -40,8 +40,9 @@ The ``tp * cp`` head coupling is stated as an assertion of its own: with
 ``heads=8`` and ``tp*cp=4`` ``apply_cp`` must accept, and with ``heads=6`` (not
 a multiple of 4) it must refuse.
 
-The flex backend is forced explicitly: this machine has no CUDA and the
-wrapper would otherwise select sdpa, which ``apply_cp`` rejects.
+Uses the explicit Qwen3 dense-layer configuration and its installed SDPA CP
+kernel on CPU and accelerators. This is a forward/loss check; parameter and
+input gradients need separate distributed training coverage.
 """
 
 from __future__ import annotations
@@ -53,8 +54,8 @@ import torch.distributed as dist
 
 from llmtuner.config import LLMTunerConfig, ModelConfig, ParallelConfig, TrainingConfig
 from llmtuner.config.parallel_config import ContextParallelConfig
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import build_model_config_for
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.context_parallel import (
     apply_cp,
     shard_batch_for_cp,
@@ -82,7 +83,13 @@ IGNORE_INDEX = -100
 def _cfg(strategy: str, *, heads: int = HEADS) -> LLMTunerConfig:
     return LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3",
+            model_name_or_path="qwen3_moe",
+            arch_overrides={
+                "head_dim": 8,
+                "num_experts": 4,
+                "moe_intermediate_size": 32,
+                "mlp_only_layers": [0, 1],
+            },
             vocab_size=VOCAB,
             hidden_size=heads * 8,
             intermediate_size=128,
@@ -101,11 +108,9 @@ def _cfg(strategy: str, *, heads: int = HEADS) -> LLMTunerConfig:
     )
 
 
-def _build(cfg: LLMTunerConfig, *, flex: bool, seed: int = 0) -> HFTransformerModel:
+def _build(cfg: LLMTunerConfig, *, seed: int = 0) -> Qwen3MoeForCausalLM:
     torch.manual_seed(seed)
-    model = moved(HFTransformerModel(build_model_config_for(cfg)).to(DTYPE))
-    if flex:
-        model.model.config._attn_implementation = "flex_torchtitan"
+    model = moved(Qwen3MoeForCausalLM(build_model_config_for(cfg)).to(DTYPE))
     return model.eval()
 
 
@@ -123,14 +128,14 @@ def _additive_causal(n: int) -> torch.Tensor:
     return additive.masked_fill(~causal, float("-inf"))[None, None]
 
 
-def _ref_logits(ref: HFTransformerModel, ids, positions) -> torch.Tensor:
-    hidden = ref.model.model(
+def _ref_logits(ref: Qwen3MoeForCausalLM, ids, positions) -> torch.Tensor:
+    hidden = ref.model(
         ids.unsqueeze(0),
         position_ids=positions.unsqueeze(0),
         attention_mask=_additive_causal(positions.shape[0]),
         use_cache=False,
     ).last_hidden_state.squeeze(0)
-    return ref.model.lm_head(hidden)
+    return ref.lm_head(hidden)
 
 
 def _gather(x: torch.Tensor, mesh) -> torch.Tensor:
@@ -152,7 +157,7 @@ def _dense_view(cp_mesh, tp_mesh):
     return _View()
 
 
-def _tp_wrapper_count(model: HFTransformerModel) -> int:
+def _tp_wrapper_count(model: Qwen3MoeForCausalLM) -> int:
     """How many projections ``apply_tp`` swapped for a sharded realizer.
 
     llmtuner's TP is manual-collective, not DTensor-based: ``apply_tp`` replaces a
@@ -171,15 +176,15 @@ def _tp_wrapper_count(model: HFTransformerModel) -> int:
     return sum(1 for m in model.modules() if type(m).__name__ in wrappers)
 
 
-def _run_strategy(name, *, strategy, cp_mesh, tp_mesh, failures) -> dict[str, float]:
+def _run_strategy(
+    name, *, strategy, cp_mesh, tp_mesh, parallel_dims, failures
+) -> dict[str, float]:
     cfg = _cfg(strategy)
-    # flex is CUDA-only, so on the accelerator the CP kernel is the sdpa one
-    # (``apply_cp`` picks it for ``kv_allgather``); forcing flex there would
-    # only reach the private-op guard. The reference arm never needs flex.
-    model = _build(cfg, flex=DEVICE.type == "cpu")
-    ref = _build(cfg, flex=False)
+    # Both CP strategies use the explicit attention's installed SDPA kernel.
+    model = _build(cfg)
+    ref = _build(cfg)
 
-    # TP then CP, the order parallelize_hf_transformers uses.
+    # TP then CP, matching the production assembly order.
     model = apply_tp(model, tp_mesh, cfg.parallel)
     apply_cp(model, mesh=_dense_view(cp_mesh, tp_mesh), cfg=cfg.parallel)
 
@@ -200,9 +205,20 @@ def _run_strategy(name, *, strategy, cp_mesh, tp_mesh, failures) -> dict[str, fl
         ids, labels, positions, cp_mesh, load_balancer=None
     )
     ids_r, labels_r = shard_batch_for_tp(ids_cp, labels_cp, tp_mesh)
+    prepared_ids, prepared_labels, kwargs = model.prepare_inputs(
+        {"input": ids, "labels": labels, "positions": positions},
+        parallel_dims=parallel_dims,
+    )
+    for role, actual, expected in (
+        ("input", prepared_ids, ids_r),
+        ("labels", prepared_labels, labels_r),
+        ("positions", kwargs["positions"], pos_cp),
+    ):
+        if not torch.equal(actual, expected):
+            failures.append(f"{name}: prepare_inputs changed {role} shard")
 
     with torch.no_grad():
-        local = model(ids_r, positions=pos_cp)
+        local = model(prepared_ids, **kwargs).logits
         ref_full = _ref_logits(ref, ids, positions)
 
     # This rank's CP block, as the FULL-sequence reference computes it -- the
@@ -303,13 +319,13 @@ def _check_ulysses_headcount_guard(cp_mesh, tp_mesh, failures) -> None:
     observable that separates the two spellings.
     """
     ok = _cfg("ulysses", heads=HEADS)
-    model_ok = _build(ok, flex=True)
+    model_ok = _build(ok)
     apply_cp(
         model_ok, mesh=_dense_view(cp_mesh, tp_mesh), cfg=ok.parallel
     )  # must not raise
 
     bad = _cfg("ulysses", heads=HEADS // 2 + 2)  # 6, not divisible by tp*cp=4
-    model_bad = _build(bad, flex=True)
+    model_bad = _build(bad)
     try:
         apply_cp(model_bad, mesh=_dense_view(cp_mesh, tp_mesh), cfg=bad.parallel)
     except ValueError:
@@ -328,6 +344,7 @@ def main() -> None:
 
     cfg = _cfg("kv_allgather")
     parallel_dims = ParallelTopology.from_config(cfg.parallel, world)
+    parallel_dims.build_device_mesh()
     cp_mesh = parallel_dims.get_mesh("cp")
     tp_mesh = parallel_dims.get_mesh("tp")
     assert cp_mesh.size() == CP and tp_mesh.size() == TP
@@ -335,14 +352,14 @@ def main() -> None:
     failures: list[str] = []
     stats: dict[str, dict[str, float]] = {}
 
-    # Both strategies run here: flex carries ulysses on CPU, and the sdpa
-    # ulysses kernel (sdpa_attention.py) carries it where flex does not exist.
+    # Exercise both KV all-gather and Ulysses through the SDPA CP kernels.
     for strategy in ("kv_allgather", "ulysses"):
         stats[strategy] = _run_strategy(
             strategy,
             strategy=strategy,
             cp_mesh=cp_mesh,
             tp_mesh=tp_mesh,
+            parallel_dims=parallel_dims,
             failures=failures,
         )
     _check_ulysses_headcount_guard(cp_mesh, tp_mesh, failures)

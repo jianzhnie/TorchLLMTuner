@@ -92,8 +92,7 @@ def test_ep_execution_revalidates_model_geometry_before_conversion():
     ):
         model_replacement.swap_moe_blocks(model, resolved_plan=plan)
     assert all(
-        layer.mlp is block
-        for layer, block in zip(model.layers, blocks, strict=True)
+        layer.mlp is block for layer, block in zip(model.layers, blocks, strict=True)
     )
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert torch.equal(torch.get_rng_state(), rng)

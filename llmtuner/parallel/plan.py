@@ -98,6 +98,9 @@ class ParallelPlan:
     decoder_structure: DecoderStructure | None = field(
         default=None, init=False, repr=False, compare=False
     )
+    decoder_structure_bound: bool = field(
+        default=False, init=False, repr=False, compare=False
+    )
 
     def storage_alias_groups(self) -> tuple[tuple[str, ...], ...]:
         """Describe ordinary strided storage sharing without retaining storage.
@@ -132,6 +135,7 @@ class ParallelPlan:
         if self.module_bindings is not None:
             for path, module in self.module_bindings:
                 if path == "":
+                    object.__setattr__(self, "decoder_structure_bound", True)
                     structure = getattr(module, "decoder_structure", None)
                     if isinstance(structure, DecoderStructure):
                         object.__setattr__(self, "decoder_structure", structure)
@@ -190,7 +194,7 @@ class ParallelPlan:
 
     def validate_binding(self, model: nn.Module) -> None:
         """Reject a plan whose live module references no longer match the model."""
-        if self.decoder_structure is not None and (
+        if self.decoder_structure_bound and (
             getattr(model, "decoder_structure", None) != self.decoder_structure
         ):
             # Registered modules can stay identical while model-owned paths

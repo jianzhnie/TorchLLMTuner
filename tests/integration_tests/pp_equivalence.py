@@ -22,7 +22,7 @@ Set LLMTUNER_TEST_CP_STRATEGY=ulysses, LLMTUNER_TEST_ULYSSES_SIZE=2 and
 LLMTUNER_TEST_CP_SIZE=1 for the single-axis Ulysses path.
 The dense reference uses the same per-DP-rank microbatch boundaries.
 
-A tiny offline qwen3 (random init, fixed seed) goes through the real
+A tiny explicit Qwen3-MoE with dense layers (random init, fixed seed) uses the real
 ``Trainer`` with ``pp=2``, 4 micro-batches per step, for 4 optimizer steps,
 under either a single-stage schedule (1F1B: one stage per rank), a looped
 one (Interleaved1F1B: two virtual stages per rank, over a deeper model so
@@ -39,7 +39,8 @@ activations/grads, schedule, cross-stage grad-norm reduction), not to a
 different attention pattern.
 
 Non-vacuity: each rank must hold only its own stages' layers, and the per-rank
-parameter counts must sum to the whole model's.
+parameter counts must sum to the whole model's. State keys must be nonempty,
+disjoint across each PP group and cover the explicit model's full state.
 
 Everything runs in fp32 on CPU/gloo. The tolerance sits above the only
 intended difference: the gradient norm is reduced per stage and combined,
@@ -55,6 +56,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate
+from torch.utils.checkpoint import DefaultDeviceType
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
@@ -74,8 +76,8 @@ from llmtuner.config.parallel_config import (
     PipelineParallelConfig,
 )
 from llmtuner.datasets.synthetic import RandomTokenSource
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import build_model_config_for
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.module_names import canonical_fqn
 from tests.integration_tests.harness import device as harness_device
@@ -115,7 +117,14 @@ def _cfg(schedule: str) -> LLMTunerConfig:
     num_layers, _ = SCENARIOS[schedule]
     return LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3",  # offline: AutoConfig.for_model("qwen3", ...)
+            model_name_or_path="qwen3_moe",
+            arch_overrides={
+                "head_dim": 16,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 48,
+                "mlp_only_layers": list(range(num_layers)),
+            },
             vocab_size=VOCAB,
             hidden_size=64,
             intermediate_size=128,
@@ -199,7 +208,7 @@ def _reference_trajectory(
     # Run the oracle on the same device as the pipeline arm: the property
     # under test is pipeline == no-pipeline, and a CPU oracle would mix
     # cross-device kernel rounding into the tolerance budget.
-    model = moved(HFTransformerModel(build_model_config_for(cfg)))
+    model = moved(Qwen3MoeForCausalLM(build_model_config_for(cfg)))
     # PP deliberately derives a different initialization seed per stage.
     # Rebuild the single-process oracle from those actual initial weights;
     # otherwise even the first forward compares different models.
@@ -233,7 +242,7 @@ def _reference_trajectory(
             moved_batch(next(batches)) for _ in range(cfg.gradient_accumulation_steps)
         ]
         target_batches = [
-            model.preprocess_inputs(batch, parallel_dims=None)[1].reshape(
+            model.prepare_inputs(batch, parallel_dims=None)[1].reshape(
                 cfg.global_batch_size, cfg.max_seq_len
             )
             for batch in step_batches
@@ -247,11 +256,11 @@ def _reference_trajectory(
                 row = slice(mb * rows_per_mb, (mb + 1) * rows_per_mb)
                 # Preserve independent row boundaries and their position/mask
                 # metadata, just as the pipeline's microbatch preprocessing does.
-                inputs, mb_targets, kwargs = model.preprocess_inputs(
+                inputs, mb_targets, kwargs = model.prepare_inputs(
                     {"input": batch.input_ids[row], "labels": targets[row]},
                     parallel_dims=None,
                 )
-                logits = model(inputs, **kwargs)
+                logits = model(inputs, **kwargs).logits
                 loss = cross_entropy_loss(logits, mb_targets)
                 (loss / num_valid).backward()
                 loss_sum = (
@@ -278,6 +287,10 @@ def main() -> None:
     # ``Trainer`` starts the process group for the device llmtuner selects, so
     # this script only borrows the device to place its own cross-rank tallies.
     local_device = harness_device()
+    # On torch-npu builds, checkpoint's default accelerator can remain NPU even
+    # when every input is CPU. Keep CPU recompute from initializing hidden NPUs.
+    if local_device.type == "cpu":
+        DefaultDeviceType.set_device_type("cpu")
     schedule = sys.argv[1] if len(sys.argv) > 1 else "1F1B"
     if schedule not in SCENARIOS:
         raise ValueError(
@@ -378,9 +391,10 @@ def main() -> None:
     )
     total_numel = torch.tensor([local_numel], device=local_device)
     dist.all_reduce(total_numel, op=dist.ReduceOp.SUM)
-    reference_numel = sum(
-        p.numel() for p in HFTransformerModel(build_model_config_for(cfg)).parameters()
-    )
+    reference_model = Qwen3MoeForCausalLM(build_model_config_for(cfg))
+    reference_numel = sum(p.numel() for p in reference_model.parameters())
+    reference_keys = set(reference_model.state_dict())
+    del reference_model
     if total_numel.item() != reference_numel * replicas:
         failures.append(
             f"rank {rank}: stage parameters sum to {total_numel.item()}, "
@@ -414,6 +428,16 @@ def main() -> None:
     }
     stage_states = [None] * trainer.world_size
     dist.all_gather_object(stage_states, local_initial_state)
+    owned_keys: set[str] = set()
+    for peer in dist.get_process_group_ranks(
+        trainer.parallel_dims.get_mesh("pp").get_group()
+    ):
+        keys = set(stage_states[peer])
+        if not keys or keys & owned_keys:
+            failures.append(f"rank {peer}: empty or overlapping PP state ownership")
+        owned_keys.update(keys)
+    if owned_keys != reference_keys:
+        failures.append("PP state ownership does not cover the explicit model")
     initial_state = {
         key: value for stage_state in stage_states for key, value in stage_state.items()
     }

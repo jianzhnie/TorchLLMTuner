@@ -1,8 +1,10 @@
-"""Two NPU ranks coordinate HF adaptation and destination validation failures.
+"""Two ranks coordinate HF adaptation and destination validation failures.
 
 Run with torchrun --nproc-per-node=2 -m
 tests.integration_tests.hf_import_checkpoint_coordination.
 Uses real safetensors reads and DCP load; only injects rank-local adapter faults.
+NPU/HCCL is the default; hide accelerators and set LLMTUNER_TEST_DEVICE=cpu
+for CPU/Gloo. This checks checkpoint services, not model training.
 """
 
 import json
@@ -19,17 +21,17 @@ from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from llmtuner.components.checkpointer.core.checkpoint_keys import MODEL
-from llmtuner.config import CheckpointConfig
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
+from llmtuner.config.checkpoint_config import CheckpointConfig
 from tests.integration_tests.harness import init_distributed
 
 
-def main():
+def main() -> None:
     device = init_distributed()
     directory = None
     rank = None
     try:
-        assert device.type == "npu" and dist.get_world_size() == 2
+        assert dist.get_world_size() == 2
         rank = dist.get_rank()
         roots = [
             mkdtemp(prefix="llmtuner-hf-load-coordination-") if rank == 0 else None
@@ -63,11 +65,12 @@ def main():
         with torch.no_grad():
             model.model.weight.zero_()
             model.model.bias.zero_()
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
-        adapter = HFTransformerStateDictAdapter(
+        adapter = ModelStateDictAdapter(
             SimpleNamespace(model_type="llama", tie_word_embeddings=False),
             str(source),
+            model_prefix="model.",
         )
         manager = DistributedCheckpointManager(
             CheckpointConfig(
@@ -97,11 +100,12 @@ def main():
         }
         try:
             scenarios = (
-                ("reader", 1),
-                ("adapter", 0),
-                ("destination", 1),
+                (failure, failing_rank)
+                for failure in ("reader", "adapter", "destination")
+                for failing_rank in (0, 1)
             )
             for failure, failing_rank in scenarios:
+                model.load_state_dict(initial)
 
                 def injected(state, failure=failure, failing_rank=failing_rank):
                     result = original(state)

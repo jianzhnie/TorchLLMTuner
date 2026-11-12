@@ -253,6 +253,22 @@ def test_plan_rejects_changed_explicit_decoder_structure(change):
         plan.validate_binding(model)
 
 
+def test_plan_rejects_decoder_declaration_added_after_resolution():
+    model = nn.Module()
+    plan = ParallelPlan(
+        stage="tp",
+        targets=(),
+        degree=2,
+        implementation="functional",
+        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+    )
+    model.decoder_structure = DecoderStructure(
+        decoder="", embedding="embed", blocks="layers", norm="norm", head="head"
+    )
+    with pytest.raises(ValueError, match="Stale plan decoder structure"):
+        plan.validate_binding(model)
+
+
 def test_plan_accepts_equivalent_decoder_declaration_without_tensor_changes():
     model = nn.Module()
     declaration = dict(
