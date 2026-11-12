@@ -13,9 +13,8 @@ the actual manager type, and full checks the selected backend metadata.
         tests/integration_tests/pp_checkpoint_equivalence.py resume "$D"
 
 Append ``--packed`` to both commands to use a checkpointable local JSONL corpus
-with independently packed pipeline microbatches. On CPU that variant uses the
-explicit dense-mask SDPA substitute from the real-corpus harness, rather than
-the production CUDA flex kernel.
+with independently packed pipeline microbatches. The explicit model prepares
+its own dense document mask; no legacy attention installation patch is used.
 
 Set ``LLMTUNER_TEST_FROZEN_PP_STAGE=0`` or ``1`` in both phases to freeze
 all parameters of that stage before partitioning (two or four ranks, PP2,
@@ -30,9 +29,10 @@ the manager's strict planner migration on both ranks.
 Set ``LLMTUNER_TEST_RESUME_LR=0.003`` on the resume phase to verify that saved
 optimizer learning rates override fresh construction values before scheduling.
 
-Phase ``full`` trains a tiny offline qwen3 for N+M optimizer steps with
-``pp=2`` (schedule 1F1B, 4 micro-batches per step) through the real
-``Trainer``, saving a full DCP checkpoint -- model, FQN-keyed optimizer state,
+Phase ``full`` trains a tiny explicit Qwen3-MoE (dense layers by default)
+for N+M optimizer steps with ``pp=2`` (schedule 1F1B, 4 micro-batches per step)
+through the real ``Trainer``, saving a full DCP checkpoint -- model,
+FQN-keyed optimizer state,
 and the trainer's step/token counters -- at step N, and records the
 uninterrupted loss trajectory to the workdir.
 
@@ -129,11 +129,15 @@ Set LLMTUNER_TEST_CHUNKS=3 with LLMTUNER_TEST_PP_SIZE=1 for the root-owned
 chunked head path. Set LLMTUNER_TEST_TIED_WEIGHTS=0 or 1 to explicitly select
 embedding/head identity for the standard Qwen decoder configuration.
 Set LLMTUNER_TEST_QKV_PROJECTION=fused for the configured Qwen3 fused projection.
-Set LLMTUNER_TEST_NORM_BACKEND=joint for configured dense Qwen3 residual norms.
-Set LLMTUNER_TEST_ROTARY_INIT_DEVICE=target for training-device RoPE initialization.
+Set LLMTUNER_TEST_NORM_BACKEND=torch for model-owned kernel RMSNorm.
+Legacy joint/residual norm policies remain explicitly rejected.
+Only constructor RoPE initialization is supported by explicit Qwen3;
+LLMTUNER_TEST_ROTARY_INIT_DEVICE=target is rejected before allocation.
 Set LLMTUNER_TEST_ROTARY_STATE=1 to compare runtime RoPE frequencies and scaling
 exactly before resumed updates and after continuation, including nonpersistent state.
-Set LLMTUNER_TEST_ATTENTION_BACKEND=eager_flex for the explicit CPU/NPU math backend.
+Legacy flex/eager_flex requests are rejected by explicit-model validation.
+Set LLMTUNER_TEST_GLOBAL_BATCH=1 with PP1/CP2 for single-row input recovery;
+use the same value in both phases. Multirow CP/TP remains unsupported.
 For NPU dual-axis SDPA, use LLMTUNER_TEST_CP_SIZE=2 and
 LLMTUNER_TEST_ULYSSES_SIZE=2, with four ranks for PP1 or eight for PP2.
 Set LLMTUNER_TEST_DP_REPLICATE_SIZE=2 to add a real replica axis;
@@ -175,6 +179,12 @@ from llmtuner.config.parallel_config import (
     FSDPConfig,
     PipelineParallelConfig,
 )
+from llmtuner.models.common.attention.backend_names import CP_SDPA_BACKEND
+from llmtuner.models.qwen.qwen3.model import (
+    Qwen3MoeAttention,
+    Qwen3MoeForCausalLM,
+)
+from llmtuner.models.qwen.qwen3.normalization import Qwen3KernelRMSNorm
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.module_names import canonical_fqn
 from tests.integration_tests.harness import device as harness_device
@@ -183,10 +193,13 @@ SPLIT_STEP = 2  # N: checkpoint taken after this many steps
 EXTRA_STEPS = 2  # M: steps trained after the checkpoint (both runs)
 TOTAL_STEPS = SPLIT_STEP + EXTRA_STEPS
 MICROBATCHES = 4
-GLOBAL_BATCH = 8
+GLOBAL_BATCH = int(os.environ.get("LLMTUNER_TEST_GLOBAL_BATCH", "8"))
 SEQ = int(os.environ.get("LLMTUNER_TEST_SEQ_LEN", "32"))
 VOCAB = int(os.environ.get("LLMTUNER_TEST_VOCAB_SIZE", "128"))
 SEED = 42
+
+if GLOBAL_BATCH < 1:
+    raise ValueError("LLMTUNER_TEST_GLOBAL_BATCH must be positive")
 
 FULL_LOSSES_FILE = "losses_full.json"
 
@@ -271,21 +284,20 @@ def _equal_rank_state(
 def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
     data_root = os.path.join(workdir, f"data-rank-{os.environ.get('RANK', '0')}")
     schedule = os.environ.get("LLMTUNER_TEST_PP_SCHEDULE", "1F1B")
+    num_layers = int(
+        os.environ.get(
+            "LLMTUNER_TEST_NUM_LAYERS", "2" if schedule in {"1F1B", "GPipe"} else "6"
+        )
+    )
     moe = os.environ.get("LLMTUNER_TEST_MOE") == "1"
     kimi = os.environ.get("LLMTUNER_TEST_KIMI") == "1"
     quantile = os.environ.get("LLMTUNER_TEST_QUANTILE") == "1"
     return LLMTunerConfig(
         model=ModelConfig(
             model_name_or_path=(
-                "deepseek_v3"
-                if quantile
-                else "kimi_linear"
-                if kimi
-                else "qwen3_moe"
-                if moe
-                else "qwen3"
+                "deepseek_v3" if quantile else "kimi_linear" if kimi else "qwen3_moe"
             ),
-            experts_implementation="eager" if moe else "native",
+            experts_implementation="eager" if not kimi and not quantile else "native",
             norm_backend=os.environ.get("LLMTUNER_TEST_NORM_BACKEND", "native"),
             qkv_projection=os.environ.get("LLMTUNER_TEST_QKV_PROJECTION", "separate"),
             rotary_init_device=os.environ.get(
@@ -348,22 +360,28 @@ def _cfg(workdir: str, *, packed: bool = False) -> LLMTunerConfig:
                 "num_experts_per_tok": 2,
                 "moe_intermediate_size": 48,
                 "norm_topk_prob": True,
+                "head_dim": 16,
             }
             if moe
-            else (
-                {"tie_word_embeddings": os.environ["LLMTUNER_TEST_TIED_WEIGHTS"] == "1"}
-                if "LLMTUNER_TEST_TIED_WEIGHTS" in os.environ
-                else {}
-            ),
+            else {
+                "head_dim": 16,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 48,
+                "mlp_only_layers": list(range(num_layers)),
+                **(
+                    {
+                        "tie_word_embeddings": os.environ["LLMTUNER_TEST_TIED_WEIGHTS"]
+                        == "1"
+                    }
+                    if "LLMTUNER_TEST_TIED_WEIGHTS" in os.environ
+                    else {}
+                ),
+            },
             vocab_size=VOCAB,
             hidden_size=64,
             intermediate_size=128,
-            num_hidden_layers=int(
-                os.environ.get(
-                    "LLMTUNER_TEST_NUM_LAYERS",
-                    "2" if schedule in {"1F1B", "GPipe"} else "6",
-                )
-            ),
+            num_hidden_layers=num_layers,
             num_attention_heads=4,
             num_key_value_heads=4,
         ),
@@ -582,6 +600,19 @@ def _train_steps(trainer: Trainer, data_iterator, num_steps: int) -> list[float]
 
 
 def _assert_shared_layers(trainer: Trainer) -> None:
+    if trainer.parallel_dims.tp > 1:
+        for part in trainer.model_parts:
+            assert part._tp_checkpoint_layouts, "TP must declare checkpoint layouts"
+            for layer in part.layers:
+                projection = layer.self_attn.q_proj.weight
+                expected_rows = (
+                    part.config.num_attention_heads
+                    * part.config.head_dim
+                    // trainer.parallel_dims.tp
+                )
+                assert projection.shape[0] == expected_rows, (
+                    "TP must physically shard the Q projection"
+                )
     if trainer.cfg.training.activation_checkpoint_mode in {"full", "selective"}:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
             CheckpointWrapper,
@@ -598,7 +629,6 @@ def _assert_shared_layers(trainer: Trainer) -> None:
         and trainer.cfg.parallel.cp_config.context_parallel_strategy == "kv_allgather"
         and harness_device().type == "npu"
     ):
-        from llmtuner.models.hf.attention_backend import CP_SDPA_BACKEND
         from llmtuner.parallel.context_parallel.sdpa_attention import CPSdpaKernel
 
         for part in trainer.model_parts:
@@ -637,7 +667,6 @@ def _assert_shared_layers(trainer: Trainer) -> None:
         and trainer.cfg.parallel.context_parallel_ulysses_size > 1
         and harness_device().type == "npu"
     ):
-        from llmtuner.models.hf.attention_backend import CP_SDPA_BACKEND
         from llmtuner.parallel.context_parallel.sdpa_attention import DualCPSdpaKernel
 
         assert all(
@@ -646,63 +675,32 @@ def _assert_shared_layers(trainer: Trainer) -> None:
             and any(isinstance(module, DualCPSdpaKernel) for module in part.modules())
             for part in trainer.model_parts
         )
-    if os.environ.get("LLMTUNER_TEST_ATTENTION_BACKEND") == "eager_flex":
-        from llmtuner.models.hf.attention_backend import EAGER_FLEX_BACKEND
-
-        assert all(
-            part.model.config._attn_implementation == EAGER_FLEX_BACKEND
-            for part in trainer.model_parts
-        )
-    if os.environ.get("LLMTUNER_TEST_ROTARY_INIT_DEVICE") == "target":
-        from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
-
-        rotary_modules = [
-            module
-            for part in trainer.model_parts
-            for module in part.modules()
-            if type(module) is Qwen3RotaryEmbedding
-        ]
-        assert rotary_modules, "target RoPE scenario must contain real rotary modules"
-        for rotary in rotary_modules:
-            assert rotary.config.rotary_init_device == "target"
-            expected = Qwen3RotaryEmbedding(rotary.config, device=trainer.device)
-            for name in ("inv_freq", "original_inv_freq"):
-                actual = getattr(rotary, name)
-                assert actual.device == trainer.device
-                assert actual.dtype == torch.float32
-                torch.testing.assert_close(
-                    actual, getattr(expected, name), atol=0, rtol=0
+    norm_backend = os.environ.get("LLMTUNER_TEST_NORM_BACKEND", "native")
+    if norm_backend in {"torch", "npu"}:
+        for part in trainer.model_parts:
+            norms = [] if isinstance(part.norm, torch.nn.Identity) else [part.norm]
+            for layer in part.layers:
+                norms.extend(
+                    (
+                        layer.input_layernorm,
+                        layer.post_attention_layernorm,
+                        layer.self_attn.q_norm,
+                        layer.self_attn.k_norm,
+                    )
                 )
-    if os.environ.get("LLMTUNER_TEST_NORM_BACKEND") == "joint":
-        from llmtuner.models.qwen.qwen3.residual_normalization import (
-            forward_joint_residual_block,
-            forward_joint_residual_norm,
-        )
-
-        blocks = [
-            module
-            for part in trainer.model_parts
-            for module in part.modules()
-            if getattr(module.forward, "__func__", None) is forward_joint_residual_block
-        ]
-        assert len(blocks) == sum(len(part.layers) for part in trainer.model_parts)
-        assert blocks, "joint residual norm scenario must contain real decoder blocks"
-        assert all(
-            getattr(norm.forward, "__func__", None) is forward_joint_residual_norm
-            for block in blocks
-            for norm in (block.input_layernorm, block.post_attention_layernorm)
-        ), "requested joint norms must reach the production implementation"
+            assert norms, "Kernel norm verification requires owned modules"
+            assert all(
+                isinstance(norm, Qwen3KernelRMSNorm) and norm.backend == norm_backend
+                for norm in norms
+            ), "Requested kernel norms must reach the model-owned implementation"
     if os.environ.get("LLMTUNER_TEST_QKV_PROJECTION") == "fused":
-        from llmtuner.models.qwen.qwen3.qkv_projection import (
-            forward_fused_qkv_attention,
-        )
-
         attentions = [
             layer.self_attn for part in trainer.model_parts for layer in part.layers
         ]
         assert attentions, "fused QKV scenario must contain real attention layers"
         assert all(
-            getattr(module.forward, "__func__", None) is forward_fused_qkv_attention
+            module._llmtuner_fused_qkv
+            and getattr(module.forward, "__func__", None) is Qwen3MoeAttention.forward
             for module in attentions
         ), "requested fused QKV must reach the production implementation"
     root_owned = trainer.cfg.training.chunked_loss_num_chunks > 1
@@ -1337,34 +1335,14 @@ def _run() -> None:
             raise ValueError(
                 "external packed corpus/tokenizer paths must exist locally"
             )
-        from llmtuner.accelerator.device import device_type
-        from llmtuner.models.hf.model import HFTransformerModel
-        from tests.integration_tests.pp_real_corpus_equivalence import (
-            _cpu_packed_attention,
-            _write_corpus,
-        )
+        from tests.integration_tests.packed_corpus import write_packed_corpus
 
         if phase == "full" and not external_corpus:
             data_root = os.path.join(
                 workdir, f"data-rank-{os.environ.get('RANK', '0')}"
             )
             os.makedirs(data_root, exist_ok=True)
-            _write_corpus(data_root)
-        if (
-            device_type == "cpu"
-            and int(os.environ.get("LLMTUNER_TEST_CP_SIZE", "1")) > 1
-        ):
-            from tests.integration_tests.pp_cp_equivalence import cpu_cp_attention
-
-            with cpu_cp_attention():
-                run_phase(workdir, packed=True)
-            return
-        if device_type == "cpu":
-            with patch.object(
-                HFTransformerModel, "_apply_attention", _cpu_packed_attention
-            ):
-                run_phase(workdir, packed=True)
-            return
+            write_packed_corpus(data_root, num_rows=48 * max(1, SEQ // 64))
     run_phase(workdir, packed=packed)
 
 
@@ -1448,9 +1426,12 @@ def main() -> None:
         return
     if os.environ.get("LLMTUNER_TEST_PP_SIZE") != "1":
         raise ValueError("Shared-parameter checkpoint scenarios require PP1")
-    from llmtuner.models.hf.model import HFTransformerModel
-
-    original_init = HFTransformerModel.__init__
+    if (
+        os.environ.get("LLMTUNER_TEST_KIMI") == "1"
+        or os.environ.get("LLMTUNER_TEST_QUANTILE") == "1"
+    ):
+        raise ValueError("Shared-parameter injection requires explicit Qwen3")
+    original_init = Qwen3MoeForCausalLM.__init__
 
     def initialize_shared(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
@@ -1480,7 +1461,7 @@ def main() -> None:
     from llmtuner.models.common.moe.layer import MoE
 
     with (
-        patch.object(HFTransformerModel, "__init__", initialize_shared),
+        patch.object(Qwen3MoeForCausalLM, "__init__", initialize_shared),
         patch("llmtuner.parallel.parallelize.apply_ep", apply_ep_with_alias),
     ):
         _run()

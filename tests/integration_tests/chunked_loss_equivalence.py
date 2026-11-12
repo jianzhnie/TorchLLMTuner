@@ -5,7 +5,7 @@ Run under torchrun with 2 ranks (from the repo root):
     PYTHONPATH=. torchrun --nproc_per_node=2 \
         tests/integration_tests/chunked_loss_equivalence.py
 
-A tiny offline llama (random init, fixed seed) goes through the real ``Trainer``
+A tiny explicit Qwen3 dense decoder (random init, fixed seed) uses ``Trainer``
 with ``chunked_loss_num_chunks=3`` (uneven chunks over the 128-token per-rank
 batch) for 4 optimizer steps and is compared against a single-process,
 full-logits reference over the same global batches -- the loss trajectory AND
@@ -50,8 +50,8 @@ from llmtuner.config import (
 )
 from llmtuner.datasets.contracts import Batch
 from llmtuner.datasets.synthetic import RandomTokenSource
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import build_model_config_for
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.trainer import Trainer
 from tests.integration_tests.harness import (
     device as harness_device,
@@ -82,7 +82,8 @@ GRAD_RTOL = 1e-4
 def _cfg() -> LLMTunerConfig:
     return LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="llama",
+            model_name_or_path="qwen3_moe",
+            experts_implementation="eager",
             vocab_size=VOCAB,
             hidden_size=64,
             intermediate_size=128,
@@ -90,7 +91,12 @@ def _cfg() -> LLMTunerConfig:
             num_attention_heads=4,
             num_key_value_heads=4,
             arch_overrides={
-                "tie_word_embeddings": os.environ.get("CHUNKED_LOSS_EQ_TIED") == "1"
+                "tie_word_embeddings": os.environ.get("CHUNKED_LOSS_EQ_TIED") == "1",
+                "head_dim": 16,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+                "mlp_only_layers": [0, 1],
             },
         ),
         parallel=ParallelConfig(
@@ -122,9 +128,13 @@ def _reference_trajectory(
     second group's rows different positions and a different causal boundary.
     """
     torch.manual_seed(cfg.seed)
-    model = moved(HFTransformerModel(build_model_config_for(cfg)))
+    model = moved(Qwen3MoeForCausalLM(build_model_config_for(cfg)))
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+        model.parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+        fused=cfg.optimizer.implementation == "fused",
+        foreach=cfg.optimizer.implementation == "foreach",
     )
     batches = iter(
         RandomTokenSource(
@@ -141,16 +151,14 @@ def _reference_trajectory(
         optimizer.zero_grad(set_to_none=True)
         batch = moved_batch(next(batches))
         num_valid = int(
-            (
-                model.preprocess_inputs(batch, parallel_dims=None)[1] != IGNORE_INDEX
-            ).sum()
+            (model.prepare_inputs(batch, parallel_dims=None)[1] != IGNORE_INDEX).sum()
         )
         loss_sum = None
         for d in range(DP_SHARD):
             rows = slice(d * rows_per_dp, (d + 1) * rows_per_dp)
             sub = Batch(input_ids=batch.input_ids[rows], labels=batch.labels[rows])
-            inputs, targets, kwargs = model.preprocess_inputs(sub, parallel_dims=None)
-            logits = model(inputs, **kwargs)
+            inputs, targets, kwargs = model.prepare_inputs(sub, parallel_dims=None)
+            logits = model(inputs, **kwargs).logits
             loss = cross_entropy_loss(logits, targets)
             loss_sum = loss if loss_sum is None else loss_sum + loss
         # Normalized BEFORE backward, as the trainer does.
@@ -195,6 +203,10 @@ def main() -> None:
     for step in range(STEPS):
         trainer.step += 1
         metrics = trainer.train_step(data_iterator)
+        model = trainer.model_parts[0]
+        assert (model.lm_head.weight is model.tok_embeddings.weight) == (
+            os.environ.get("CHUNKED_LOSS_EQ_TIED") == "1"
+        ), "Chunked updates must preserve embedding/head parameter identity"
         assert metrics is not None  # log_freq=1: every step reports
         losses.append(metrics["loss"])
         if TP == 1:

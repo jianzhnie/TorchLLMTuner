@@ -1,4 +1,4 @@
-"""CPU/Gloo ranks export tied Llama weights for standard HF loading.
+"""CPU/Gloo ranks export tied explicit Qwen3 weights for standard HF loading.
 
 Run with torchrun --nproc_per_node=2. Uses the production pattern FSDP entry,
 native/custom engines and one/two safetensors files. Config assets are supplied
@@ -17,22 +17,26 @@ from tempfile import TemporaryDirectory
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
-from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
+from transformers import AutoModelForCausalLM, Qwen3MoeConfig
 
 from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import apply_fsdp
 from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tp-size", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--fsdp-implementation", choices=("all", "native", "custom"), default="all"
+    )
     args = parser.parse_args()
     dist.init_process_group("gloo", timeout=timedelta(seconds=40))
     try:
@@ -51,21 +55,31 @@ def main():
         with context as root:
             paths = [root]
             dist.broadcast_object_list(paths, src=0)
-            for engine in ("native", "custom"):
+            engines = (
+                ("native", "custom")
+                if args.fsdp_implementation == "all"
+                else (args.fsdp_implementation,)
+            )
+            for engine in engines:
                 for indexed in (False, True):
                     torch.manual_seed(184)
-                    config = LlamaConfig(
+                    config = Qwen3MoeConfig(
                         vocab_size=16,
                         hidden_size=16,
                         intermediate_size=32,
                         num_hidden_layers=1,
                         num_attention_heads=4,
                         num_key_value_heads=2,
+                        head_dim=4,
+                        num_experts=4,
+                        num_experts_per_tok=2,
+                        moe_intermediate_size=8,
+                        mlp_only_layers=[0],
                         tie_word_embeddings=True,
                         attention_dropout=0.0,
                     )
                     config._attn_implementation = "eager"
-                    model = LlamaForCausalLM(config).float().eval()
+                    model = Qwen3MoeForCausalLM(config).float().eval()
                     generation = deepcopy(model.generation_config)
                     inputs = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]])
                     with torch.no_grad():
@@ -124,7 +138,9 @@ def main():
                                 json.dumps({"weight_map": weight_map})
                             )
                         dist.barrier()
-                    adapter = HFTransformerStateDictAdapter(config, assets)
+                    adapter = ModelStateDictAdapter(
+                        config, assets, model_prefix="model."
+                    )
                     if indexed:
                         assert adapter._hf_keys == set(expected_state)
                         assert adapter.fqn_to_index_mapping == {

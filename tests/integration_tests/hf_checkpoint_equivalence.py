@@ -9,6 +9,7 @@ fails, and subsequently loads a successful rewrite exactly. This exercises
 local storage and CPU tensor I/O, not CUDA/NPU or remote publication.
 """
 
+import argparse
 from contextlib import nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,21 +19,21 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from fsdp_checkpoint_equivalence import topology_for
-from fsdp_mesh_equivalence import _build_model, _full
 from torch.distributed.checkpoint.api import CheckpointException
 
 from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from llmtuner.components.checkpointer.hf import hf_storage
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 from llmtuner.config.optimizer_config import OptimizerConfig
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import apply_fsdp
+from tests.integration_tests.fsdp_checkpoint_equivalence import topology_for
+from tests.integration_tests.fsdp_mesh_equivalence import _build_model, _full
 
 
 def runtime(cfg, topology, seed):
@@ -64,7 +65,7 @@ def full_state(model):
 def check_case(root, implementation, indexed, failure_phase):
     cfg, topology = topology_for("shard", implementation)
     parts = runtime(cfg, topology, 0)
-    adapter = HFTransformerStateDictAdapter(SimpleNamespace(), None)
+    adapter = ModelStateDictAdapter(SimpleNamespace(), None, model_prefix="model.")
     if indexed:
         adapter.fqn_to_index_mapping = {
             name.removeprefix("model."): index % 2 + 1
@@ -150,7 +151,12 @@ def check_case(root, implementation, indexed, failure_phase):
         manager.close()
 
 
-def main():
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--fsdp-implementation", choices=("all", "native", "custom"), default="all"
+    )
+    args = parser.parse_args()
     dist.init_process_group("gloo")
     try:
         assert dist.get_world_size() == 2
@@ -158,7 +164,12 @@ def main():
         with context as root:
             paths = [root]
             dist.broadcast_object_list(paths, src=0)
-            for implementation in ("native", "custom"):
+            implementations = (
+                ("native", "custom")
+                if args.fsdp_implementation == "all"
+                else (args.fsdp_implementation,)
+            )
+            for implementation in implementations:
                 for indexed in (False, True):
                     for failure_phase in ("consolidation", "publication"):
                         check_case(paths[0], implementation, indexed, failure_phase)

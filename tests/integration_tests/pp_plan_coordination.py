@@ -5,17 +5,20 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-from transformers import AutoConfig
+from transformers import Qwen3MoeConfig
 
-from llmtuner.config import ParallelConfig
-from llmtuner.config.parallel_config import FSDPConfig, PipelineParallelConfig
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.parallelize import parallelize_hf_transformers
+from llmtuner.config.parallel_config import (
+    FSDPConfig,
+    ParallelConfig,
+    PipelineParallelConfig,
+)
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.parallel.parallelize import parallelize_model
 from llmtuner.parallel.topology import ParallelTopology
 from tests.integration_tests.harness import init_distributed
 
 
-def main():
+def main() -> None:
     device = init_distributed(timeout=timedelta(seconds=60))
     try:
         assert dist.get_world_size() == 2
@@ -26,8 +29,7 @@ def main():
         )
         topology = ParallelTopology.from_config(cfg, world_size=2)
         topology.build_device_mesh()
-        config = AutoConfig.for_model(
-            "llama",
+        config = Qwen3MoeConfig(
             vocab_size=32,
             hidden_size=16,
             intermediate_size=32,
@@ -35,9 +37,17 @@ def main():
             num_attention_heads=2,
             num_key_value_heads=2,
             max_position_embeddings=32,
+            head_dim=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=12,
+            mlp_only_layers=[0, 1],
+            tie_word_embeddings=False,
         )
+        config._attn_implementation = "eager"
+        config._experts_implementation = "eager"
         torch.manual_seed(82)
-        model = HFTransformerModel(config).to(device)
+        model = Qwen3MoeForCausalLM(config).to(device)
         parameters = list(model.parameters())
         layers = list(model.layers)
         for fault in ("missing_batch", "invalid_batch", "fsdp_binding"):
@@ -54,7 +64,7 @@ def main():
                 batch = None if fault == "missing_batch" else 3
             caught = None
             try:
-                parallelize_hf_transformers(
+                parallelize_model(
                     model,
                     cfg=local_cfg,
                     mesh=None,
@@ -79,7 +89,7 @@ def main():
             )
             assert all(a is b for a, b in zip(layers, model.layers, strict=True))
         # Real PP split and schedule construction after coordinated rejections.
-        setup = parallelize_hf_transformers(
+        setup = parallelize_model(
             model,
             cfg=cfg,
             mesh=None,

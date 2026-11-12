@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
+from torch.distributed.tensor import DTensor
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...models.kimi.kimi_k3.checkpoint import convert_kimi_expert_state
@@ -28,6 +29,25 @@ from .hf.hf_expert_storage import (
     GroupedExpertHuggingFaceStorageReader,
 )
 from .hf.hf_storage import IndexedHuggingFaceStorageReader
+
+
+def clone_local_state_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy owned checkpoint storage without redistributing DTensor layouts.
+
+    DTensor clone dispatch may reduce Partial placements. Export keys can belong
+    to only some PP ranks, so storage cloning must not introduce a collective.
+    Explicit shape/stride also preserve uneven-shard metadata without checks.
+    """
+    if isinstance(tensor, DTensor):
+        return DTensor.from_local(
+            tensor.to_local().clone(),
+            device_mesh=tensor.device_mesh,
+            placements=tensor.placements,
+            run_check=False,
+            shape=tensor.shape,
+            stride=tensor.stride(),
+        )
+    return tensor.clone()
 
 
 class ModelStateDictAdapter:
@@ -194,7 +214,9 @@ class ModelStateDictAdapter:
                 ):
                     # Safetensors cannot serialize aliases within one shard.
                     # HF restores parameter sharing from its configuration.
-                    hf_state["lm_head.weight"] = hf_state["lm_head.weight"].clone()
+                    hf_state["lm_head.weight"] = clone_local_state_tensor(
+                        hf_state["lm_head.weight"]
+                    )
         return hf_state
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:

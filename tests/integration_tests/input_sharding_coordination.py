@@ -1,6 +1,6 @@
 """Four CPU/Gloo ranks: CP/TP shape failures stop production preprocessing.
 
-Run with torchrun --nproc_per_node=4. Uses the real HF wrapper and input
+Run with torchrun --nproc_per_node=4. Uses the explicit Qwen3 model and input
 sharders; does not execute attention, model parallel transforms or an optimizer.
 """
 
@@ -10,13 +10,13 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-from transformers import Qwen3Config
+from transformers import Qwen3MoeConfig
 
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.trainer import Trainer
 
 
-def batch(length):
+def batch(length: int) -> dict[str, torch.Tensor]:
     tokens = torch.arange(length)
     return {
         "input": tokens,
@@ -25,19 +25,24 @@ def batch(length):
     }
 
 
-def main():
+def main() -> None:
     dist.init_process_group("gloo", timeout=timedelta(seconds=20))
     try:
         assert dist.get_world_size() == 4
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("cp", "tp"))
-        model = HFTransformerModel(
-            Qwen3Config(
+        model = Qwen3MoeForCausalLM(
+            Qwen3MoeConfig(
                 vocab_size=32,
                 hidden_size=16,
                 intermediate_size=32,
                 num_hidden_layers=1,
                 num_attention_heads=2,
                 num_key_value_heads=2,
+                head_dim=8,
+                num_experts=4,
+                num_experts_per_tok=2,
+                moe_intermediate_size=8,
+                mlp_only_layers=[0],
             )
         )
         model.set_cp_mesh(mesh["cp"], load_balancer=None)
@@ -75,12 +80,15 @@ def main():
                 indices = torch.arange(start, start + 4)
                 torch.testing.assert_close(inputs, indices, rtol=0, atol=0)
                 torch.testing.assert_close(labels, indices + 1, rtol=0, atol=0)
+                # Attention gathers TP sequence shards before QKV; mask and
+                # positions therefore retain the complete CP-local sequence.
+                cp_indices = torch.arange(cp_rank * 8, (cp_rank + 1) * 8)
                 torch.testing.assert_close(
-                    kwargs["padding_mask"], indices % 3 == 0, rtol=0, atol=0
+                    kwargs["padding_mask"], cp_indices % 3 == 0, rtol=0, atol=0
                 )
                 torch.testing.assert_close(
                     kwargs["positions"],
-                    torch.arange(cp_rank * 8, (cp_rank + 1) * 8),
+                    cp_indices,
                     rtol=0,
                     atol=0,
                 )

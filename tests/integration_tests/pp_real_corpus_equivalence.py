@@ -11,9 +11,9 @@ denominator. Flat packed streams supplied externally remain unsupported for
 multiple pipeline microbatches.
 
 Finite validation exhausts the corpus, including a fully padded microbatch in
-the last schedule step. CPU uses dense-mask SDPA as an explicit test substitute
-for the production flex kernel; GPU/NPU execution requires separate validation.
-For PP2 × KV-CP2, set LLMTUNER_TEST_CP_SIZE=2 and run four ranks.
+the last schedule step. Explicit Qwen3 owns dense document-mask preparation.
+GPU/NPU execution requires separate validation. Packed CP is currently rejected
+by the model input contract; no test attention patch bypasses that restriction.
 Set LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom to exercise the custom engine.
 Set LLMTUNER_TEST_PP_SCHEDULE=Interleaved1F1B to exercise two virtual stages
 per rank over six decoder layers with the same packed-corpus reference.
@@ -24,19 +24,15 @@ The selected prefix must leave an entirely padded validation microbatch;
 with the recorded Qwen tokenizer, five records exercise this at CP2/seq256.
 This arm tests plain-text causal packing, not SFT prompt masking or pretrained
 30B weights; the decoder remains a randomly initialized small test model.
-That CPU scenario retains actual CP masks/collectives and substitutes only
-attention arithmetic, with sequence length 256 and a proportionally larger corpus.
+CP scenarios remain pending a model-owned packed input contract.
 
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import os
 import tempfile
-from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -57,10 +53,10 @@ from llmtuner.config import (
 )
 from llmtuner.config.parallel_config import FSDPConfig, PipelineParallelConfig
 from llmtuner.datasets.loader_builder import build_dataloader
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import build_model_config_for
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.trainer import Trainer
-from tests.data_fixtures import write_tokenizer
+from tests.integration_tests.packed_corpus import write_packed_corpus
 
 STEPS = 3
 MICROBATCHES = 4
@@ -85,60 +81,30 @@ NUM_ROWS = 48 * (SEQ // 64)  # Keep the finite corpus above a full token batch.
 TOL = 1e-5
 
 
-def _cpu_packed_attention(self, positions, attention_masks):
-    """CPU test substitute: expand the production mask, then use HF SDPA."""
-    from torch.nn.attention.flex_attention import create_mask
-
-    if attention_masks is None:
-        attention_masks = self.get_attention_masks(positions=positions)
-    mask = create_mask(
-        attention_masks.mask_mod,
-        B=1,
-        H=1,
-        Q_LEN=positions.numel(),
-        KV_LEN=positions.numel(),
-        device=str(positions.device),
-    )
-    return {"attention_mask": mask}
-
-
 def _write_corpus(root: str) -> tuple[str, str]:
-    """A tiny tokenizer and a JSONL corpus of multi-document rows."""
-    tokenizer_path = os.path.join(root, "tokenizer")
-    corpus_path = os.path.join(root, "rows.jsonl")
-    if LIMO_PATH:
-        with open(LIMO_PATH, "rb") as source:
-            original = source.read()
-        rows = original.splitlines()[:LIMO_ROWS]
-        assert len(rows) == LIMO_ROWS, "LIMO check requires the full selected prefix"
-        with open(corpus_path, "w") as handle:
-            for raw in rows:
-                record = json.loads(raw)
-                assert record["question"] and record["solution"]
-                handle.write(
-                    json.dumps({"text": record["question"] + "\n" + record["solution"]})
-                    + "\n"
-                )
-        print(
-            f"real_corpus=LIMO rows=0:{LIMO_ROWS} source_sha256="
-            f"{hashlib.sha256(original).hexdigest()} tokenizer={TOKENIZER_PATH} "
-            "objective=plain_text_causal auxiliary_small_model=True",
-            flush=True,
-        )
-        return TOKENIZER_PATH, corpus_path
-    write_tokenizer(tokenizer_path)
-    with open(corpus_path, "w") as handle:
-        for i in range(NUM_ROWS):
-            handle.write(
-                json.dumps({"text": f"w{i} " + "lorem ipsum " * (i % 5 + 1)}) + "\n"
-            )
-    return tokenizer_path, corpus_path
+    return write_packed_corpus(
+        root,
+        num_rows=NUM_ROWS,
+        limo_path=LIMO_PATH,
+        tokenizer_path=TOKENIZER_PATH,
+        limo_rows=LIMO_ROWS,
+    )
 
 
 def _cfg(tokenizer_path: str, corpus_path: str) -> LLMTunerConfig:
     return LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3",
+            model_name_or_path="qwen3_moe",
+            experts_implementation="eager",
+            arch_overrides={
+                "head_dim": 16,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+                "mlp_only_layers": list(
+                    range(6 if SCHEDULE == "Interleaved1F1B" else 4)
+                ),
+            },
             vocab_size=VOCAB,
             hidden_size=64,
             intermediate_size=128,
@@ -185,7 +151,7 @@ def _reference_trajectory(
 ) -> tuple[list[float], dict[str, torch.Tensor], float, bool]:
     """The same steps in one process over the same loader, unsharded."""
     torch.manual_seed(cfg.seed)
-    model = HFTransformerModel(build_model_config_for(cfg))
+    model = Qwen3MoeForCausalLM(build_model_config_for(cfg))
     model.load_state_dict(initial_state, strict=True)
     model.to(device)
     optimizer = torch.optim.AdamW(
@@ -214,10 +180,8 @@ def _reference_trajectory(
         for mb in range(MICROBATCHES):
             row = slice(mb, mb + 1)
             microbatch = {k: v[row] for k, v in batch.items()}
-            inputs, labels, extra = model.preprocess_inputs(
-                microbatch, parallel_dims=None
-            )
-            logits = model(inputs, **extra)
+            inputs, labels, extra = model.prepare_inputs(microbatch, parallel_dims=None)
+            logits = model(inputs, **extra).logits
             loss = cross_entropy_loss(logits, labels)
             (loss / num_valid).backward()
             loss_sum = loss.detach() if loss_sum is None else loss_sum + loss.detach()
@@ -247,11 +211,11 @@ def _reference_trajectory(
                 for mb in range(MICROBATCHES):
                     microbatch = {k: v[mb : mb + 1] for k, v in batch.items()}
                     saw_padding_microbatch |= bool(microbatch["padding_mask"].all())
-                    inputs, labels, extra = model.preprocess_inputs(
+                    inputs, labels, extra = model.prepare_inputs(
                         microbatch, parallel_dims=None
                     )
                     validation_sum += float(
-                        cross_entropy_loss(model(inputs, **extra), labels)
+                        cross_entropy_loss(model(inputs, **extra).logits, labels)
                     )
     finally:
         validation_loader.close()
@@ -409,7 +373,7 @@ def _run(root: str) -> None:
     dist.all_gather_object(rank_failures, failures)
     if rank == 0:
         if trainer.device.type == "cpu":
-            print("CPU attention uses dense-mask SDPA; CUDA flex is not verified.")
+            print("CPU uses explicit-model dense masks; NPU kernels are not verified.")
         print(
             f"pp={PP} cp={CP} schedule={SCHEDULE} "
             f"corpus={'LIMO-prefix' if LIMO_PATH else 'generated'}(packed) "
@@ -427,21 +391,8 @@ def _run(root: str) -> None:
 
 
 def main() -> None:
-    from llmtuner.accelerator.device import device_type
-
     with tempfile.TemporaryDirectory(prefix="pp_real_corpus_") as root:
-        if device_type == "cpu" and CP > 1:
-            from tests.integration_tests.pp_cp_equivalence import cpu_cp_attention
-
-            with cpu_cp_attention():
-                _run(root)
-        elif device_type == "cpu":
-            with patch.object(
-                HFTransformerModel, "_apply_attention", _cpu_packed_attention
-            ):
-                _run(root)
-        else:
-            _run(root)
+        _run(root)
 
 
 if __name__ == "__main__":

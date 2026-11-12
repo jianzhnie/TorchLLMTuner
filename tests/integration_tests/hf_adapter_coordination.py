@@ -15,17 +15,17 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 
 
-def main():
+def main() -> None:
     dist.init_process_group("gloo", timeout=timedelta(seconds=10))
     try:
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
         for indexed, failing_rank in product((False, True), (0, 1)):
-            adapter = HFTransformerStateDictAdapter(
-                SimpleNamespace(tie_word_embeddings=False), None
+            adapter = ModelStateDictAdapter(
+                SimpleNamespace(tie_word_embeddings=False), None, model_prefix="model."
             )
             if indexed:
                 adapter._hf_keys = {"weight", "other"}

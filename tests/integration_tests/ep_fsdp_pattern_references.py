@@ -18,18 +18,22 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
-from transformers import AutoConfig
+from transformers import Qwen3MoeConfig
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.parallelize import parallelize_hf_transformers
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.parallel.parallelize import parallelize_model
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.runtime.gradients import allreduce_fsdp_excluded_grads
 
 
-def check_training(model, reference, dims):
-    """Compare real EP dispatch and Trainer reduction with full HF experts."""
+def check_training(
+    model: Qwen3MoeForCausalLM,
+    reference: Qwen3MoeForCausalLM,
+    dims: ParallelTopology,
+) -> None:
+    """Compare EP dispatch and Trainer reduction with unsharded experts."""
     grouped = model.layers[0].mlp.routed_experts.inner_experts
     ep_rank = dims.get_mesh("ep").get_local_rank()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -42,10 +46,10 @@ def check_training(model, reference, dims):
         losses = []
         for rank in range(world):
             inputs = (torch.arange(8) + rank * 5 + step * 3) % 32
-            expected = reference(inputs)
+            expected = reference(inputs).logits
             losses.append(expected.square().sum() / world)
             if rank == dist.get_rank():
-                output = model(inputs)
+                output = model(inputs).logits
                 torch.testing.assert_close(output, expected, atol=1e-6, rtol=1e-6)
                 (output.square().sum() / world).backward()
         sum(losses).backward()
@@ -117,7 +121,7 @@ def check_training(model, reference, dims):
         print(f"rank={dist.get_rank()} EP2/FSDP2 step={step}: dense reference passed")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ignore-modules", action="store_true")
     parser.add_argument("--train", action="store_true")
@@ -128,9 +132,8 @@ def main():
         world = dist.get_world_size()
         assert world == (8 if args.replicate else 4)
         torch.manual_seed(310)
-        model = HFTransformerModel(
-            AutoConfig.for_model(
-                "qwen3_moe",
+        model = Qwen3MoeForCausalLM(
+            Qwen3MoeConfig(
                 vocab_size=32,
                 hidden_size=16,
                 intermediate_size=32,
@@ -138,6 +141,8 @@ def main():
                 num_hidden_layers=1,
                 num_attention_heads=2,
                 num_key_value_heads=2,
+                head_dim=8,
+                attn_implementation="eager",
                 num_experts=4,
                 num_experts_per_tok=2,
                 experts_implementation="eager",
@@ -172,7 +177,7 @@ def main():
             assert dims.get_mesh("dp_replicate").size() == 2
             assert dims.get_mesh("efsdp").size() == 2
             assert dims.get_mesh("dp").size() == 8
-        parallelize_hf_transformers(
+        parallelize_model(
             model, cfg=cfg, mesh=dims.spmd_dense_mesh(), parallel_dims=dims
         )
         grouped = model.layers[0].mlp.routed_experts.inner_experts

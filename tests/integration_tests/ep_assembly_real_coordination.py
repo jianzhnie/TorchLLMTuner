@@ -4,18 +4,17 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-from transformers import AutoConfig
+from transformers import Qwen3MoeConfig
 
-from llmtuner.config import ParallelConfig
+from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
 from tests.integration_tests.harness import init_distributed
 
 
-def make_model(device):
-    config = AutoConfig.for_model(
-        "qwen3_moe",
+def make_model(device: torch.device) -> Qwen3MoeForCausalLM:
+    config = Qwen3MoeConfig(
         vocab_size=32,
         hidden_size=16,
         intermediate_size=32,
@@ -23,6 +22,7 @@ def make_model(device):
         num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=2,
+        head_dim=8,
         num_experts=4,
         num_experts_per_tok=2,
         router_aux_loss_coef=0.0,
@@ -31,10 +31,10 @@ def make_model(device):
     config._experts_implementation = "eager"
     config._attn_implementation = "eager"
     torch.manual_seed(81)
-    return HFTransformerModel(config).to(device)
+    return Qwen3MoeForCausalLM(config).to(device)
 
 
-def main():
+def main() -> None:
     device = init_distributed(timeout=timedelta(seconds=60))
     try:
         assert dist.get_world_size() == 2

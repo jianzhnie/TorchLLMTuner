@@ -3,7 +3,7 @@
 PYTHONPATH=. torchrun --nproc_per_node=2 \
     tests/integration_tests/hf_clone_coordination.py
 
-No actual allocation failure is induced. Actual DTensor clones are separately
+No actual allocation failure is induced. Actual adapter DTensor clones are separately
 checked for zero communication and independent local storage.
 """
 
@@ -24,45 +24,73 @@ from torch.distributed.tensor import (
 )
 from torch.distributed.tensor.debug import CommDebugMode
 
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from llmtuner.components.checkpointer.model_state import (
+    ModelStateDictAdapter,
+    clone_local_state_tensor,
+)
 
 
-def main():
+def main() -> None:
     dist.init_process_group("gloo", timeout=timedelta(seconds=10))
     try:
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
         mesh = init_device_mesh("cpu", (2,))
-        dense = torch.arange(12).reshape(4, 3).float()
-        for placement in (Replicate(), Shard(0), Partial()):
+        for rows, placement in product((4, 5, 1), (Replicate(), Shard(0), Partial())):
+            dense = torch.arange(rows * 3).reshape(rows, 3).float()
             tensor = (
                 DTensor.from_local(dense / 2, mesh, [placement], run_check=False)
                 if isinstance(placement, Partial)
                 else distribute_tensor(dense, mesh, [placement])
             )
             with CommDebugMode() as communication:
-                cloned = tensor.clone()
+                cloned = clone_local_state_tensor(tensor)
             assert communication.get_total_counts() == 0
             assert cloned.placements == tensor.placements
-            assert cloned.to_local().data_ptr() != tensor.to_local().data_ptr()
+            assert cloned.shape == tensor.shape
+            assert cloned.stride() == tensor.stride()
+            if tensor.to_local().numel():
+                assert cloned.to_local().data_ptr() != tensor.to_local().data_ptr()
             torch.testing.assert_close(cloned.full_tensor(), dense, rtol=0, atol=0)
+            adapter = ModelStateDictAdapter(
+                SimpleNamespace(tie_word_embeddings=True), None
+            )
+            # Only one PP-like owner has these tensors. Other ranks still
+            # participate in error coordination, but must not join a clone
+            # redistribution collective for a key they do not own.
+            state = (
+                {"model.embed_tokens.weight": tensor, "lm_head.weight": tensor}
+                if rank == 0
+                else {}
+            )
+            exported = adapter.to_hf(state)
             if rank == 0:
-                print(f"PASS local clone {placement=}", flush=True)
+                head = exported["lm_head.weight"]
+                assert head.placements == tensor.placements
+                assert head.to_local().data_ptr() != tensor.to_local().data_ptr()
+                torch.testing.assert_close(
+                    head.to_local(), tensor.to_local(), rtol=0, atol=0
+                )
+            else:
+                assert exported == {}
+            dist.barrier()
+            if rank == 0:
+                print(f"PASS local clone {rows=} {placement=}", flush=True)
         for disjoint, failing_rank, error_type in product(
             (False, True), (0, 1), (OSError, KeyboardInterrupt, SystemExit)
         ):
-            adapter = HFTransformerStateDictAdapter(
+            adapter = ModelStateDictAdapter(
                 SimpleNamespace(tie_word_embeddings=True), None
             )
             weight = torch.arange(6).reshape(2, 3).float()
             owns_head = not disjoint or rank == failing_rank
             state = (
                 {
-                    "model.model.embed_tokens.weight": weight,
-                    "model.lm_head.weight": weight,
+                    "model.embed_tokens.weight": weight,
+                    "lm_head.weight": weight,
                 }
                 if owns_head
-                else {"model.other": weight}
+                else {"other": weight}
             )
             failure = error_type("injected clone failure")
             original = torch.Tensor.clone
