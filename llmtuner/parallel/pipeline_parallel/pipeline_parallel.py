@@ -40,6 +40,7 @@ from torch.distributed.pipelining.schedules import (
 
 from llmtuner.config.parallel_config import ParallelConfig
 
+from ...accelerator.collectives import synchronize_local_errors
 from ...components.loss import cross_entropy_loss
 from ...models.contracts import DecoderStructure
 from ...utils.logging import get_logger
@@ -47,7 +48,11 @@ from .. import compatibility
 from ..topology import ParallelTopology
 from .hccl_schedule import hccl_1f1b_schedule_class
 from .microbatch_drivers import bind_stage_rng
-from .partition import generate_llm_fqn_per_model_part, split_model_into_stages
+from .partition import (
+    generate_llm_fqn_per_model_part,
+    split_model_into_stages,
+    validate_pipeline_ownership,
+)
 
 logger = get_logger(__name__)
 
@@ -310,6 +315,7 @@ def apply_pp(
     device: torch.device,
     global_batch_size: int,
     first_stage_module_fqns: Sequence[str] | None = None,
+    error_group: dist.ProcessGroup | None = None,
 ) -> tuple[list[PipelineStage], list[nn.Module], bool, bool]:
     """Split ``model`` into this rank's pipeline stages.
 
@@ -336,111 +342,111 @@ def apply_pp(
 
     Returns ``(stages, model_parts, has_first_stage, has_last_stage)``; the
     schedule over the stages is built separately (``build_pipeline_schedule``).
+
+    Every member of ``error_group`` (the default world group when omitted)
+    must call this entry point in the same order. Only local partition checks
+    run inside that coordination boundary; mesh access and stage construction
+    follow it and retain their own distributed failure semantics.
     """
-    structure = getattr(model, "decoder_structure", None)
-    if isinstance(structure, DecoderStructure) and (
-        not callable(getattr(model, "validate_pipeline_partition", None))
-        or not callable(getattr(model, "configure_pipeline_stage", None))
-    ):
-        raise NotImplementedError(
-            "Explicit PP requires model-owned partition validation and stage I/O"
-        )
-    if getattr(model, "enable_weight_tying", False):
-        compatibility.pp_weight_tying()
-    # A DSA model builds its dense mask from tok_embeddings.weight.dtype on
-    # every forward; non-first stages hold an nn.Identity there (crashes on
-    # the first forward), so refuse at assembly time.
-    if getattr(model, "uses_dsa", False):
-        compatibility.dsa_pp()
-    parallelism = cfg
-    pp_mesh = parallel_dims.get_mesh("pp")
-    validate_microbatches(parallel_dims, cfg, global_batch_size)
-
-    module_names_per_stage = parallelism.pp_config.module_fqns_per_model_part
-    if module_names_per_stage is None:
-        blocks = (
-            structure.bind(model).blocks
-            if isinstance(structure, DecoderStructure)
-            else model.layers
-        )
-        num_layers = len(blocks)
-        num_stages, input_weight, output_weight = get_pipeline_metadata(
-            parallel_dims, parallelism, num_layers
-        )
-        module_names_per_stage = generate_llm_fqn_per_model_part(
-            num_stages,
-            num_layers,
-            input_weight=input_weight,
-            output_weight=output_weight,
-        )
+    with synchronize_local_errors("Pipeline partition validation", group=error_group):
         structure = getattr(model, "decoder_structure", None)
-        if isinstance(structure, DecoderStructure):
-            runtime_modules = getattr(model, "pipeline_runtime_modules", ())
-            block_ids = tuple(blocks._modules)
-            aliases = {
-                "tok_embeddings": structure.embedding,
-                "norm": structure.norm,
-                "lm_head": structure.head,
-            }
-
-            def bind_target(target: str) -> list[str]:
-                if target == "rotary_emb":
-                    return list(runtime_modules)
-                if target.startswith("layers."):
-                    block = block_ids[int(target.removeprefix("layers."))]
-                    return [f"{structure.blocks}.{block}"]
-                return [aliases[target]]
-
-            module_names_per_stage = [
-                [path for target in targets for path in bind_target(target)]
-                for targets in module_names_per_stage
-            ]
-        if first_stage_module_fqns:
-            prepend_first_stage_modules(
-                module_names_per_stage, model, first_stage_module_fqns
-            )
-    else:
-        if first_stage_module_fqns:
-            logger.warning(
-                "first_stage_module_fqns is ignored because "
-                "module_fqns_per_model_part already defines the split; "
-                "place the extra modules in the explicit split instead."
-            )
-        # An explicit split still has to land a whole number of stages per
-        # rank; the per-schedule-kind check happens in get_pipeline_metadata
-        # for the generated path, so assert the divisibility here.
-        num_stages = len(module_names_per_stage)
-        if num_stages % parallel_dims.pp != 0:
-            raise ValueError(
-                f"module_fqns_per_model_part defines {num_stages} stages, "
-                f"which is not divisible by the pipeline parallel degree "
-                f"({parallel_dims.pp})"
-            )
-        # Same schedule-kind constraint as the generated path: single-stage
-        # schedules (GPipe, 1F1B) drive exactly one stage per rank -- an
-        # explicit split with more would have its extra chunks silently
-        # dropped by the PipelineScheduleSingle branch.
-        schedule_class = get_schedule_class(
-            parallelism.pp_config.pipeline_parallel_schedule
-        )
-        if issubclass(schedule_class, PipelineScheduleSingle) and (
-            num_stages != parallel_dims.pp
+        if isinstance(structure, DecoderStructure) and (
+            not callable(getattr(model, "validate_pipeline_partition", None))
+            or not callable(getattr(model, "configure_pipeline_stage", None))
         ):
-            raise ValueError(
-                f"module_fqns_per_model_part defines {num_stages} stages "
-                f"({num_stages // parallel_dims.pp} per rank), but schedule "
-                f"{parallelism.pp_config.pipeline_parallel_schedule!r} drives exactly "
-                "one stage per rank. Use a looped schedule (e.g. "
-                "interleaved_1f1b) or one stage per rank."
+            raise NotImplementedError(
+                "Explicit PP requires model-owned partition validation and stage I/O"
             )
+        if getattr(model, "enable_weight_tying", False):
+            compatibility.pp_weight_tying()
+        # A DSA model builds its dense mask from tok_embeddings.weight.dtype on
+        # every forward; non-first stages hold an nn.Identity there (crashes on
+        # the first forward), so refuse at assembly time.
+        if getattr(model, "uses_dsa", False):
+            compatibility.dsa_pp()
+        parallelism = cfg
+        validate_microbatches(parallel_dims, cfg, global_batch_size)
 
-    stages, model_parts = split_model_into_stages(
-        model,
-        pp_mesh,
-        parallelism.pp_config.pipeline_parallel_schedule,
-        device,
-        module_names_per_stage,
-        replicated_module_names=(
+        module_names_per_stage = parallelism.pp_config.module_fqns_per_model_part
+        if module_names_per_stage is None:
+            blocks = (
+                structure.bind(model).blocks
+                if isinstance(structure, DecoderStructure)
+                else model.layers
+            )
+            num_layers = len(blocks)
+            num_stages, input_weight, output_weight = get_pipeline_metadata(
+                parallel_dims, parallelism, num_layers
+            )
+            module_names_per_stage = generate_llm_fqn_per_model_part(
+                num_stages,
+                num_layers,
+                input_weight=input_weight,
+                output_weight=output_weight,
+            )
+            structure = getattr(model, "decoder_structure", None)
+            if isinstance(structure, DecoderStructure):
+                runtime_modules = getattr(model, "pipeline_runtime_modules", ())
+                block_ids = tuple(blocks._modules)
+                aliases = {
+                    "tok_embeddings": structure.embedding,
+                    "norm": structure.norm,
+                    "lm_head": structure.head,
+                }
+
+                def bind_target(target: str) -> list[str]:
+                    if target == "rotary_emb":
+                        return list(runtime_modules)
+                    if target.startswith("layers."):
+                        block = block_ids[int(target.removeprefix("layers."))]
+                        return [f"{structure.blocks}.{block}"]
+                    return [aliases[target]]
+
+                module_names_per_stage = [
+                    [path for target in targets for path in bind_target(target)]
+                    for targets in module_names_per_stage
+                ]
+            if first_stage_module_fqns:
+                prepend_first_stage_modules(
+                    module_names_per_stage, model, first_stage_module_fqns
+                )
+        else:
+            if first_stage_module_fqns:
+                logger.warning(
+                    "first_stage_module_fqns is ignored because "
+                    "module_fqns_per_model_part already defines the split; "
+                    "place the extra modules in the explicit split instead."
+                )
+            # An explicit split still has to land a whole number of stages per
+            # rank; the per-schedule-kind check happens in get_pipeline_metadata
+            # for the generated path, so assert the divisibility here.
+            num_stages = len(module_names_per_stage)
+            if num_stages % parallel_dims.pp != 0:
+                raise ValueError(
+                    f"module_fqns_per_model_part defines {num_stages} stages, "
+                    f"which is not divisible by the pipeline parallel degree "
+                    f"({parallel_dims.pp})"
+                )
+            # Same schedule-kind constraint as the generated path: single-stage
+            # schedules (GPipe, 1F1B) drive exactly one stage per rank -- an
+            # explicit split with more would have its extra chunks silently
+            # dropped by the PipelineScheduleSingle branch.
+            schedule_class = get_schedule_class(
+                parallelism.pp_config.pipeline_parallel_schedule
+            )
+            if issubclass(schedule_class, PipelineScheduleSingle) and (
+                num_stages != parallel_dims.pp
+            ):
+                raise ValueError(
+                    f"module_fqns_per_model_part defines {num_stages} stages "
+                    f"({num_stages // parallel_dims.pp} per rank), but schedule "
+                    f"{parallelism.pp_config.pipeline_parallel_schedule!r} "
+                    "drives exactly "
+                    "one stage per rank. Use a looped schedule (e.g. "
+                    "interleaved_1f1b) or one stage per rank."
+                )
+
+        replicated_module_names = (
             tuple(getattr(model, "pipeline_runtime_modules", ()))
             if isinstance(getattr(model, "decoder_structure", None), DecoderStructure)
             else (
@@ -448,9 +454,22 @@ def apply_pp(
                 if any("rotary_emb" in targets for targets in module_names_per_stage)
                 else ()
             )
-        ),
-    )
+        )
+        validate_pipeline_ownership(
+            model,
+            module_names_per_stage,
+            replicated_module_names=replicated_module_names,
+        )
 
+    pp_mesh = parallel_dims.get_mesh("pp")
+    stages, model_parts = split_model_into_stages(
+        model,
+        pp_mesh,
+        parallelism.pp_config.pipeline_parallel_schedule,
+        device,
+        module_names_per_stage,
+        replicated_module_names=replicated_module_names,
+    )
     has_first_stage = any(stage.is_first for stage in stages)
     has_last_stage = any(stage.is_last for stage in stages)
     return stages, model_parts, has_first_stage, has_last_stage
