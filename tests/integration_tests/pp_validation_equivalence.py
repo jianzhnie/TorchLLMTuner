@@ -5,19 +5,24 @@ Run under torchrun with 2 ranks:
     PYTHONPATH=. torchrun --nproc_per_node=2 \\
         tests/integration_tests/pp_validation_equivalence.py
 
-A tiny qwen3 trains under pp=2 with validation enabled (freq=1, steps=2).
+A tiny explicit Qwen3-MoE with dense layers trains under pp=2 with validation
+enabled (freq=1, steps=2).
 Every train step is followed by a validation pass driven through
 ``schedule.eval`` (upstream's Validator seam). The check pins: the pass runs
 on both ranks without hanging, the logged validation loss is finite and
 positive, matches an unpipelined model with the same microbatch boundaries,
 and the model returns to train mode afterwards. Optimizer state, scheduler
-progress, training token counts and existing gradients stay unchanged.
+progress, training token counts, existing gradients and CPU/accelerator RNG
+stay unchanged.
 
 Set LLMTUNER_TEST_PP_SCHEDULE=Interleaved1F1B to exercise two local stages
 per rank with six decoder layers and four microbatches.
 Set LLMTUNER_TEST_WORLD_SIZE=4 with four ranks for PP2 x native FSDP2.
 Set LLMTUNER_TEST_CP_SIZE=2 and LLMTUNER_TEST_ULYSSES_SIZE=2 with
 LLMTUNER_TEST_WORLD_SIZE=8 and LLMTUNER_TEST_SEQ_LEN=256 for dual CP.
+Those CP variants still require a model-owned row-aware input contract: the
+current explicit Qwen3 rejects their multirow batches instead of flattening
+independent documents into incorrect cross-row attention.
 Set LLMTUNER_TEST_DP_REPLICATE_SIZE=2 to use a replica axis within DP.
 
 Needs torch >= 2.12; the eval driver is capability-gated.
@@ -31,6 +36,7 @@ from copy import deepcopy
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from llmtuner.components.loss import IGNORE_INDEX, next_token_targets
@@ -44,8 +50,10 @@ from llmtuner.config import (
 )
 from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.datasets.synthetic import RandomTokenSource
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.common.attention.backend_names import CP_SDPA_BACKEND
+from llmtuner.models.configuration import build_model_config_for
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.parallel.context_parallel.sdpa_attention import DualCPSdpaKernel
 from llmtuner.trainer.trainer import Trainer
 from tests.integration_tests.harness import device as harness_device
 
@@ -78,7 +86,14 @@ TOL = 1e-5
 def _cfg() -> LLMTunerConfig:
     return LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3",
+            model_name_or_path="qwen3_moe",
+            arch_overrides={
+                "head_dim": 16,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 48,
+                "mlp_only_layers": list(range(6 if INTERLEAVED else 2)),
+            },
             vocab_size=VOCAB,
             hidden_size=64,
             intermediate_size=128,
@@ -118,6 +133,7 @@ def _reference_validation(trainer: Trainer) -> float:
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
             local_state[name] = tensor.detach().cpu().clone()
+    assert local_state, "Each PP rank must own nonempty model state"
     stage_states = [None] * WORLD
     dist.all_gather_object(stage_states, local_state)
     state = {}
@@ -128,7 +144,8 @@ def _reference_validation(trainer: Trainer) -> float:
             state[name] = tensor
     # Isolate reference initialization from the training process's RNG state.
     with torch.random.fork_rng(devices=[]):
-        model = HFTransformerModel(build_model_config_for(trainer.cfg)).eval()
+        model = Qwen3MoeForCausalLM(build_model_config_for(trainer.cfg)).eval()
+    assert set(state) == set(model.state_dict()), "Stage union must cover the model"
     model.load_state_dict(state, strict=True)
     batches = iter(
         RandomTokenSource(
@@ -156,7 +173,7 @@ def _reference_validation(trainer: Trainer) -> float:
             # production row-aware mask. Score rows independently so this
             # reference does not reuse the mask builder under test.
             for row, row_labels in zip(inputs, labels, strict=True):
-                logits = model(row)
+                logits = model(row).logits
                 loss_sum += F.cross_entropy(logits.float(), row_labels, reduction="sum")
     return float(loss_sum) / valid_tokens
 
@@ -170,14 +187,14 @@ def main() -> None:
     assert trainer.world_size == WORLD, (
         f"this check assumes {WORLD} ranks, got {trainer.world_size}"
     )
+    assert trainer.device.type == harness_device().type
+    for part in trainer.model_parts:
+        assert all(p.device.type == trainer.device.type for p in part.parameters())
     assert len(trainer.model_parts) == (2 if INTERLEAVED else 1)
     assert trainer.parallel_dims.dp_shard == DP_SHARD
     assert trainer.parallel_dims.dp_replicate == DP_REPLICATE
     assert trainer.parallel_dims.cp == CP_KV * CP_ULYSSES
     if CP_KV > 1 and CP_ULYSSES > 1 and harness_device().type == "npu":
-        from llmtuner.models.hf.attention_backend import CP_SDPA_BACKEND
-        from llmtuner.parallel.context_parallel.sdpa_attention import DualCPSdpaKernel
-
         assert all(
             part.model.config._attn_implementation == CP_SDPA_BACKEND
             and part.model.config._cp_sdpa_dual
@@ -196,8 +213,6 @@ def main() -> None:
                 assert mesh.size(replica_axis) == DP_REPLICATE
                 assert isinstance(parameter.placements[replica_axis], Replicate)
     if DP_SHARD > 1:
-        from torch.distributed.fsdp import FSDPModule
-
         for part in trainer.model_parts:
             assert isinstance(part, FSDPModule)
             sharded_parameters = [
@@ -234,6 +249,17 @@ def main() -> None:
             optimizer_state = deepcopy(trainer.optimizer.state_dict())
             scheduler_state = deepcopy(trainer.lr_scheduler.state_dict())
             tokens_seen = trainer.ntokens_seen
+            rng_state = torch.get_rng_state().clone()
+            accelerator = (
+                getattr(torch, trainer.device.type)
+                if trainer.device.type != "cpu"
+                else None
+            )
+            device_rng_state = (
+                accelerator.get_rng_state(trainer.device).clone()
+                if accelerator is not None
+                else None
+            )
             gradients = {
                 name: None if parameter.grad is None else parameter.grad.clone()
                 for part in trainer.model_parts
@@ -245,6 +271,14 @@ def main() -> None:
             )
             assert trainer.lr_scheduler.state_dict() == scheduler_state
             assert trainer.ntokens_seen == tokens_seen
+            torch.testing.assert_close(torch.get_rng_state(), rng_state, rtol=0, atol=0)
+            if accelerator is not None:
+                torch.testing.assert_close(
+                    accelerator.get_rng_state(trainer.device),
+                    device_rng_state,
+                    rtol=0,
+                    atol=0,
+                )
             torch.testing.assert_close(
                 {
                     name: parameter.grad

@@ -21,6 +21,10 @@ nonzero original-forward and recompute calls per local decoder at every step.
 Set LLMTUNER_TEST_CP_STRATEGY=ulysses, LLMTUNER_TEST_ULYSSES_SIZE=2 and
 LLMTUNER_TEST_CP_SIZE=1 for the single-axis Ulysses path.
 The dense reference uses the same per-DP-rank microbatch boundaries.
+For PP2 × Ulysses2, use four ranks, LLMTUNER_TEST_WORLD_SIZE=4 and
+LLMTUNER_TEST_GLOBAL_BATCH=4 with the Ulysses settings above. Each pipeline
+microbatch then contains one row, as required by the explicit Qwen3 CP input
+contract; the default global batch of eight exercises unsupported multirow CP.
 
 A tiny explicit Qwen3-MoE with dense layers (random init, fixed seed) uses the real
 ``Trainer`` with ``pp=2``, 4 micro-batches per step, for 4 optimizer steps,
@@ -42,7 +46,8 @@ Non-vacuity: each rank must hold only its own stages' layers, and the per-rank
 parameter counts must sum to the whole model's. State keys must be nonempty,
 disjoint across each PP group and cover the explicit model's full state.
 
-Everything runs in fp32 on CPU/gloo. The tolerance sits above the only
+Everything runs in fp32 on the harness device (CPU/gloo or NPU/HCCL).
+The tolerance sits above the only
 intended difference: the gradient norm is reduced per stage and combined,
 which is a different floating-point summation order than one whole-model norm.
 """

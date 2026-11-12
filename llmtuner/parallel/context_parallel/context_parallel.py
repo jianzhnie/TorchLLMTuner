@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch.nn as nn
@@ -13,7 +14,8 @@ from llmtuner.parallel.compatibility import eager_flex_parallel
 from ...models.common.attention.backend_names import ATTENTION_BACKEND, CP_SDPA_BACKEND
 from ...models.contracts import DecoderStructure
 from ...utils.logging import get_logger
-from ..attention_heads import require_heads_divisible_by
+from ..attention_heads import head_counts, require_heads_divisible_by
+from ..plan import ParallelPlan, PlanTarget
 from ..tensor_parallel.tensor_parallel import ReplicatedAttentionSequenceBoundary
 from .attention import CPFlexKernel, DualCPFlexKernel
 from .compressor_attention import apply_compressor_context_parallel
@@ -25,7 +27,96 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-__all__ = ["apply_cp"]
+__all__ = ["apply_cp", "resolve_cp_plan"]
+
+
+@dataclass(frozen=True)
+class CPAttentionOptions:
+    """Tensor-free choices whose changes invalidate a resolved CP target."""
+
+    packed: bool
+    strategy: str
+    load_balancer: str | None
+    tp_degree: int
+    heads: tuple[tuple[str, int], ...]
+
+
+def _cp_options(model: nn.Module, cfg: ParallelConfig) -> CPAttentionOptions:
+    strategy = cfg.cp_config.context_parallel_strategy
+    if strategy not in {"kv_allgather", "ulysses"}:
+        raise ValueError(f"Unsupported standard CP strategy {strategy!r}")
+    config = getattr(model, "config", None)
+    return CPAttentionOptions(
+        packed=getattr(config, "attn_mask_type", "causal") == "block_causal",
+        strategy=strategy,
+        load_balancer=cfg.cp_config.context_parallel_load_balancer,
+        tp_degree=cfg.tp_size,
+        heads=tuple(head_counts(model)),
+    )
+
+
+def resolve_cp_plan(model: nn.Module, *, cfg: ParallelConfig) -> ParallelPlan:
+    """Bind standard CP attention slots without kernels, mesh or model mutation.
+
+    KCP and Compressor own different attention mathematics and retain their
+    dedicated setup. Resolve again after TP, PP or any model/configuration edit.
+    """
+    if cfg.cp_config.context_parallel_strategy == "kcp" or (
+        getattr(model, "context_parallel_backend", "standard") == "compressor"
+    ):
+        raise ValueError("Standard CP plans do not describe KCP or Compressor")
+    if not callable(getattr(model, "set_cp_mesh", None)):
+        raise TypeError("CP requires model-owned set_cp_mesh input semantics")
+    attentions = _attention_modules(model)
+    structure = model.decoder_structure
+    blocks = model.get_submodule(structure.blocks)
+    options = _cp_options(model, cfg)
+    config = getattr(model, "config", None)
+    sdpa_backend = getattr(config, "_attn_implementation", None) != ATTENTION_BACKEND
+    dual_axes = (
+        cfg.context_parallel_kv_allgather_size > 1
+        and cfg.context_parallel_ulysses_size > 1
+    )
+    if dual_axes or options.strategy == "ulysses":
+        _require_ulysses_compatible(
+            model,
+            cfg=cfg,
+            cp_degree=cfg.context_parallel_ulysses_size if dual_axes else cfg.cp_size,
+            attentions=attentions,
+        )
+    elif sdpa_backend and options.load_balancer is not None:
+        raise NotImplementedError(
+            "Single-axis KV SDPA CP requires context_parallel_load_balancer=None: "
+            "its causal offsets assume contiguous shards, and load-balanced mask "
+            "permutation is not implemented."
+        )
+    return ParallelPlan(
+        stage="cp",
+        targets=tuple(
+            PlanTarget(
+                f"{structure.blocks}.{block_id}.{structure.attention}",
+                "attention",
+                module,
+                "sequence_shard",
+                options,
+            )
+            for block_id, module in zip(blocks._modules, attentions, strict=True)
+        ),
+        degree=cfg.cp_size,
+        degrees=(
+            cfg.context_parallel_kv_allgather_size,
+            cfg.context_parallel_ulysses_size,
+        ),
+        implementation=(
+            "flex"
+            if getattr(config, "_attn_implementation", None) == ATTENTION_BACKEND
+            else "sdpa"
+        ),
+        operations=("install_attention", "bind_inputs"),
+        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+        buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+    )
 
 
 def _attention_modules(model: nn.Module) -> tuple[nn.Module, ...]:
@@ -37,7 +128,11 @@ def _attention_modules(model: nn.Module) -> tuple[nn.Module, ...]:
 
 
 def _require_ulysses_compatible(
-    model: nn.Module, *, cfg: ParallelConfig, cp_mesh: DeviceMesh
+    model: nn.Module,
+    *,
+    cfg: ParallelConfig,
+    cp_degree: int,
+    attentions: tuple[nn.Module, ...],
 ) -> None:
     """Reject the ulysses combinations that would train a silently wrong model.
 
@@ -47,7 +142,6 @@ def _require_ulysses_compatible(
     count that does not divide tp*cp are both configuration errors, raised
     here rather than discovered from the loss curve.
     """
-    model_config = getattr(model, "config", None)
     load_balancer = cfg.cp_config.context_parallel_load_balancer
     if load_balancer is not None:
         raise ValueError(
@@ -56,25 +150,10 @@ def _require_ulysses_compatible(
             "original sequence order. Use context_parallel_strategy='kv_allgather' "
             "for load-balanced CP."
         )
-    if (
-        getattr(model_config, "attn_mask_type", "causal") == "block_causal"
-        and cfg.context_parallel_kv_allgather_size == 1
-    ):
-        # Packed sequences ARE supported: the all-to-all reassembles the
-        # full token stream on every rank before attention, so the
-        # full-length document mask applies unsharded (upstream's varlen
-        # ulysses semantics). What makes it work is the wrapper passing
-        # that mask FULL-LENGTH rather than Q-sharded -- latched through
-        # ``set_cp_mesh`` below, and consumed in the kernel by mask length.
-        logger.info(
-            "Ulysses CP with packed sequences: the document mask is passed "
-            "full-length (unsharded) to every rank."
-        )
     # TP shards heads first, so what ulysses must divide evenly is each
     # rank's local head count -- equivalently, the global count must divide
     # tp * cp (upstream torchtitan's head_shard_degree in its
     # config/validation.py).
-    attentions = _attention_modules(model)
     # A TP plan may leave attention replicated (e.g. MLA). Its heads have
     # not been cut by TP; only Ulysses divides them. For mixed layouts keep
     # the stricter check required by any head-sharded layer.
@@ -82,7 +161,7 @@ def _require_ulysses_compatible(
         isinstance(attention, ReplicatedAttentionSequenceBoundary)
         for attention in attentions
     )
-    head_degree = cp_mesh.size() * (1 if replicated else cfg.tp_size)
+    head_degree = cp_degree * (1 if replicated else cfg.tp_size)
     require_heads_divisible_by(
         model,
         size=head_degree,
@@ -97,8 +176,12 @@ def apply_cp(
     mesh: DeviceMesh | None,
     cfg: ParallelConfig,
     parallel_dims: ParallelTopology | None = None,
+    resolved_plan: ParallelPlan | None = None,
 ) -> nn.Module:
-    """Attach a CP flex kernel to every decoder layer's attention module.
+    """Execute a standard attention plan or a model's dedicated CP backend.
+
+    A supplied plan must bind the current post-TP/PP model and CP options;
+    execution uses its targets without repeating attention discovery.
 
     No-op when ``cfg.cp_size == 1`` (the model is handed back untouched), so the
     caller needs no degree check of its own.
@@ -116,6 +199,11 @@ def apply_cp(
             "CP requires the explicit model to provide set_cp_mesh input semantics"
         )
 
+    if resolved_plan is not None and (
+        cfg.cp_config.context_parallel_strategy == "kcp"
+        or getattr(model, "context_parallel_backend", "standard") == "compressor"
+    ):
+        raise ValueError("Standard CP plan does not match the requested backend")
     model_config = getattr(model, "config", None)
     if getattr(model_config, "attention_backend", "auto") == "eager_flex":
         eager_flex_parallel("CP")
@@ -150,6 +238,44 @@ def apply_cp(
             f"cp={cfg.cp_size} requires a device mesh with a 'cp' axis, got "
             f"{None if mesh is None else mesh.mesh_dim_names}."
         )
+    plan = resolve_cp_plan(model, cfg=cfg) if resolved_plan is None else resolved_plan
+    options = _cp_options(model, cfg)
+    if (
+        plan.stage != "cp"
+        or plan.module_bindings is None
+        or plan.parameter_bindings is None
+        or plan.buffer_bindings is None
+        or plan.decoder_structure is None
+        or plan.operations != ("install_attention", "bind_inputs")
+        or plan.degree != cfg.cp_size
+        or plan.degrees
+        != (
+            cfg.context_parallel_kv_allgather_size,
+            cfg.context_parallel_ulysses_size,
+        )
+        or plan.implementation != ("sdpa" if sdpa_backend else "flex")
+        or any(
+            target.kind != "attention"
+            or target.layout != "sequence_shard"
+            or target.spec != options
+            for target in plan.targets
+        )
+    ):
+        raise ValueError("CP plan does not match the current execution options")
+    plan.validate_binding(model)
+    # Check coverage against the immutable ownership snapshot, not a second
+    # attention search. Every declared decoder slot must execute CP exactly once.
+    structure = plan.decoder_structure
+    expected_paths = tuple(
+        f"{path}.{structure.attention}"
+        for path, _ in plan.module_bindings
+        if path.rpartition(".")[0] == structure.blocks
+    )
+    if tuple(target.path for target in plan.targets) != expected_paths:
+        raise ValueError("CP plan does not cover every declared attention slot")
+    attentions = tuple(target.module for target in plan.targets)
+    if any(not isinstance(module, nn.Module) for module in attentions):
+        raise ValueError("CP plan requires bound attention modules")
     cp_mesh = mesh["cp"]
     if cp_mesh.size() != cfg.cp_size:
         raise ValueError(
@@ -180,11 +306,7 @@ def apply_cp(
                     f"mesh {axis!r} axis has size {axis_mesh.size()}, "
                     f"but cfg requests {degree}"
                 )
-        _require_ulysses_compatible(model, cfg=cfg, cp_mesh=ulysses_mesh)
-    elif strategy == "ulysses":
-        _require_ulysses_compatible(model, cfg=cfg, cp_mesh=cp_mesh)
 
-    attentions = _attention_modules(model)
     packed = getattr(model_config, "attn_mask_type", "causal") == "block_causal"
     if sdpa_backend:
         if dual_axes:
@@ -192,24 +314,8 @@ def apply_cp(
                 kv_mesh=kv_mesh, ulysses_mesh=ulysses_mesh, packed=packed
             )
         elif strategy == "ulysses":
-            if load_balancer is not None:
-                raise RuntimeError(
-                    "ulysses CP takes no load balancer: the rearrangement it "
-                    "would introduce lands in the query order, and this "
-                    "kernel's mask is the plain causal one (the flex kernel "
-                    "expresses the permuted form through its BlockMask). Run "
-                    "with context_parallel_load_balancer=None, or use the "
-                    "kv_allgather strategy, which is correct with a balancer."
-                )
             cp_sdpa_kernel = CPSdpaUlyssesKernel(cp_mesh=cp_mesh, packed=packed)
         else:
-            if load_balancer is not None:
-                raise NotImplementedError(
-                    "Single-axis KV SDPA CP requires "
-                    "context_parallel_load_balancer=None: its causal offsets "
-                    "assume contiguous shards, and load-balanced mask "
-                    "permutation is not implemented."
-                )
             cp_sdpa_kernel = CPSdpaKernel(cp_mesh=cp_mesh, packed=packed)
         model_config._attn_implementation = CP_SDPA_BACKEND
         # The wrapper reads this to decide whether the layer needs a mask handed
