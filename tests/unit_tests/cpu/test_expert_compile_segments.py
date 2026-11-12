@@ -36,3 +36,11 @@ def test_compiled_experts_match_independent_segments(counts):
         actual.parameters(), reference.parameters(), strict=True
     ):
         torch.testing.assert_close(parameter.grad, target.grad, rtol=1e-12, atol=1e-12)
+
+
+def test_expert_offset_overflow_is_rejected_without_allocating_tokens():
+    experts = GroupedExperts(4, 8, 3, use_grouped_mm=False)
+    inputs = torch.empty(torch.iinfo(torch.int32).max + 1, 4, device="meta")
+    counts = torch.empty(3, dtype=torch.int64, device="meta")
+    with pytest.raises(ValueError, match="int32 grouped GEMM offsets"):
+        experts(inputs, counts)

@@ -22,38 +22,62 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
+from functools import wraps
+from types import FunctionType, MethodType, SimpleNamespace
 from typing import Any
 
 import torch
 
+from ...errors import EnvironmentUnsupportedError
+
 __all__ = ["run_eval_microbatches", "run_microbatches", "schedule_stages"]
 
 
-@contextlib.contextmanager
-def _fork_rng_with_stage_devices() -> Iterator[None]:
-    """Work around torch 2.12 forking pipeline-init RNG on the wrong device.
+def bind_stage_rng(schedule: Any) -> None:
+    """Give upstream metadata inference a private device-aware torch namespace.
 
-    ``_initialize_pp_stages`` calls ``torch.random.fork_rng(devices=...)``
-    without ``device_type``, so the ``"cuda"`` default resolves to
-    ``torch.cuda`` and raises on builds without CUDA whenever a stage lives on
-    another accelerator. Derive the type from the devices handed in instead.
+    Preserve upstream control flow without changing process-global fork_rng.
+    Older schedules without this initialization method require no adapter.
     """
-    real_fork_rng = torch.random.fork_rng
+    method = getattr(schedule, "_initialize_pp_stages", None)
+    if method is None or getattr(method, "_llmtuner_stage_rng", False):
+        return
+    function = getattr(method, "__func__", None)
+    if not isinstance(function, FunctionType):
+        raise EnvironmentUnsupportedError(
+            "Pipeline RNG adapter requires a Python metadata initialization method"
+        )
+    if "torch" not in function.__code__.co_names:
+        return
+    original = torch.random.fork_rng
 
     @contextlib.contextmanager
-    def shim(devices: Any = None, **kwargs: Any) -> Iterator[None]:
+    def fork_rng(devices: Any = None, **kwargs: Any) -> Iterator[None]:
         if "device_type" not in kwargs and devices:
             types = {torch.device(device).type for device in devices}
-            if len(types) == 1:
-                kwargs["device_type"] = types.pop()
-        with real_fork_rng(devices=devices, **kwargs) as ctx:
-            yield ctx
+            if len(types) != 1:
+                raise ValueError("Pipeline metadata requires one accelerator type")
+            kwargs["device_type"] = types.pop()
+        with original(devices=devices, **kwargs):
+            yield
 
-    torch.random.fork_rng = shim
-    try:
-        yield
-    finally:
-        torch.random.fork_rng = real_fork_rng
+    namespace = dict(function.__globals__)
+    torch_namespace = dict(vars(torch))
+    random_namespace = dict(vars(torch.random))
+    random_namespace["fork_rng"] = fork_rng
+    torch_namespace["random"] = SimpleNamespace(**random_namespace)
+    namespace["torch"] = SimpleNamespace(**torch_namespace)
+    bound = FunctionType(
+        function.__code__,
+        namespace,
+        function.__name__,
+        function.__defaults__,
+        function.__closure__,
+    )
+    bound.__kwdefaults__ = function.__kwdefaults__
+    wraps(function)(bound)
+    bound._llmtuner_stage_rng = True
+    schedule._initialize_pp_stages = MethodType(bound, schedule)
 
 
 def schedule_stages(schedule: Any) -> list[Any]:
@@ -86,8 +110,8 @@ def run_microbatches(
     for stage in schedule_stages(schedule):
         stage.has_backward = schedule._has_backward
         stage.clear_runtime_states()
-    with _fork_rng_with_stage_devices():
-        schedule._step_microbatches(args, kwargs, targets, losses)
+    bind_stage_rng(schedule)
+    schedule._step_microbatches(args, kwargs, targets, losses)
 
 
 def run_eval_microbatches(
@@ -110,7 +134,7 @@ def run_eval_microbatches(
         for stage in schedule_stages(schedule):
             stage.has_backward = False
             stage.clear_runtime_states()
-        with _fork_rng_with_stage_devices():
-            schedule._step_microbatches(args, kwargs, targets, losses)
+        bind_stage_rng(schedule)
+        schedule._step_microbatches(args, kwargs, targets, losses)
     finally:
         schedule._has_backward = previous

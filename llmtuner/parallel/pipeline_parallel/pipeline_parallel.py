@@ -46,6 +46,7 @@ from ...utils.logging import get_logger
 from .. import compatibility
 from ..topology import ParallelTopology
 from .hccl_schedule import hccl_1f1b_schedule_class
+from .microbatch_drivers import bind_stage_rng
 from .partition import generate_llm_fqn_per_model_part, split_model_into_stages
 
 logger = get_logger(__name__)
@@ -529,6 +530,7 @@ def build_pipeline_schedule(
     # drivers: the public ``step`` carries the denominator in ``loss_kwargs``
     # (upstream torchtitan's wiring), the private pre-split driver reads it off
     # the schedule attribute that the body republishes on every call.
+    bind_stage_rng(schedule)
     schedule._llmtuner_global_valid_tokens = torch.ones((), dtype=torch.float32)
     schedule._loss_fn = make_schedule_loss_fn(
         schedule,

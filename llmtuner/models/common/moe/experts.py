@@ -151,6 +151,10 @@ class GroupedExperts(nn.Module):
                 f"Expert inputs must have shape (routed_tokens, {self.dim}), "
                 f"got {tuple(x_RD.shape)}"
             )
+        # Grouped GEMM consumes int32 cumulative ends. Reject overflow from
+        # metadata before narrowing counts, including meta/preflight inputs.
+        if x_RD.shape[0] > torch.iinfo(torch.int32).max:
+            raise ValueError("Routed token count exceeds int32 grouped GEMM offsets")
         if num_tokens_per_expert_E.shape != (self.num_experts,):
             raise ValueError(
                 f"Expert token counts must have shape ({self.num_experts},), "
