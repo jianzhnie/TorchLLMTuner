@@ -7,7 +7,7 @@ from transformers import PretrainedConfig
 
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.errors import ConfigError
-from llmtuner.models.hf.factory import apply_runtime_config, unwrap_text_config
+from llmtuner.models.configuration import apply_runtime_config, unwrap_text_config
 
 
 def test_deterministic_requires_boolean_and_npu_backend():

@@ -1,14 +1,14 @@
-"""EP wiring check: ep=2 through ``apply_ep`` must match the HF model.
+"""EP wiring check: ep=2 through ``apply_ep`` must match the explicit model.
 
 Run under torchrun with 2 ranks:
 
-    torchrun --nproc_per_node=2 tests/ep_wiring_equivalence.py
+    torchrun --nproc_per_node=2 -m tests.integration_tests.ep_wiring_equivalence
 
 Where ``ep_equivalence.py`` checks the dispatcher arithmetic on hand-built
 MoEs, this checks the WIRING end to end: a real (tiny, offline, randomly
 initialized) qwen3_moe goes through ``apply_ep`` with a 2-rank EP group,
 and each rank's forward over its own token shard must reproduce
-(a) the unmodified HF model's forward and (b) the EP=1 swap's forward.
+(a) the unmodified explicit model's forward and (b) the EP=1 swap's forward.
 
 Non-vacuity: under EP=2 each rank must hold only half the experts, and the
 slice must be THIS rank's slice -- rank 1 holding experts 0-3 instead of 4-7
@@ -33,7 +33,7 @@ from transformers import AutoConfig
 from llmtuner.config import ParallelConfig
 from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.models.common.moe.layer import MoE
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel import apply_ep, swap_hf_moe_blocks
 
 NUM_EXPERTS = 8
@@ -63,10 +63,10 @@ def _config() -> AutoConfig:
     return cfg
 
 
-def _model(seed: int = 0) -> HFTransformerModel:
+def _model(seed: int = 0) -> Qwen3MoeForCausalLM:
     """Deterministically initialized tiny qwen3_moe; identical on every rank."""
     torch.manual_seed(seed)
-    return HFTransformerModel(_config()).to(torch.float64).eval()
+    return Qwen3MoeForCausalLM(_config()).to(torch.float64).eval()
 
 
 def _data(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -124,14 +124,14 @@ def main() -> None:
 
     ids, positions = _data(rank)
     with torch.no_grad():
-        ref_logits = ref(ids, positions=positions)
-        ep1_logits = ep1(ids, positions=positions)
-        ep2_logits = ep2(ids, positions=positions)
+        ref_logits = ref(ids, positions=positions).logits
+        ep1_logits = ep1(ids, positions=positions).logits
+        ep2_logits = ep2(ids, positions=positions).logits
 
     diff_hf = (ep2_logits - ref_logits).abs().max().item()
     diff_ep1 = (ep2_logits - ep1_logits).abs().max().item()
     if diff_hf > TOL:
-        failures.append(f"rank {rank}: EP=2 vs HF diff {diff_hf:.3e}")
+        failures.append(f"rank {rank}: EP=2 vs explicit diff {diff_hf:.3e}")
     if diff_ep1 > TOL:
         failures.append(f"rank {rank}: EP=2 vs EP=1 diff {diff_ep1:.3e}")
 
@@ -168,7 +168,7 @@ def main() -> None:
     # is pinned here is the injection, which is dispatcher-independent.
     AuxLoss.set_step_denominator(torch.tensor(float(TOKENS - 1)))
     ep1.train()
-    ep1(ids, positions=positions).sum().backward()
+    ep1(ids, positions=positions).logits.sum().backward()
     aux = ep1.layers[0].mlp.router.aux_loss
     if aux.instance_acc.item() <= 0:
         failures.append(f"rank {rank}: aux loss metric not accumulated")
@@ -182,7 +182,7 @@ def main() -> None:
 
     if rank == 0:
         print(f"tokens={TOKENS} experts={NUM_EXPERTS} ep_size={world} tol={TOL:.0e}")
-        print(f"EP=2 vs HF  max abs diff = {diff_hf:.3e}")
+        print(f"EP=2 vs explicit  max abs diff = {diff_hf:.3e}")
         print(f"EP=2 vs EP=1 max abs diff = {diff_ep1:.3e}")
         print(f"aux metric (rank 0)       = {aux.instance_acc.item():.4f}")
         print(f"failed ranks = {int(local_ok.item())}")

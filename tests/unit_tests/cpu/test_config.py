@@ -913,7 +913,7 @@ def test_auto_fill_reads_local_hf_architecture(tmp_path, monkeypatch, relative):
 
     directory = tmp_path / "saved_model"
     saved = AutoConfig.for_model(
-        "llama",
+        "qwen3_moe",
         vocab_size=257,
         hidden_size=96,
         intermediate_size=192,
@@ -941,21 +941,28 @@ def test_auto_fill_reads_local_hf_architecture(tmp_path, monkeypatch, relative):
 
 
 @pytest.mark.parametrize(
-    "identifier", ["llama", "/missing/model/path", "local-checkpoint", "org/model"]
+    "identifier", ["qwen3_moe", "/missing/model/path", "local-checkpoint", "org/model"]
 )
 def test_auto_fill_only_skips_registered_offline_architectures(monkeypatch, identifier):
-    from transformers import AutoConfig
+    from transformers.configuration_utils import PretrainedConfig
+
+    from llmtuner.models.registry import get_model_spec
 
     calls = []
+    registration = get_model_spec("qwen3_moe")
+    config_type = registration.config_type_loader()
 
-    def load_config(name):
+    def metadata(name):
         calls.append(name)
-        return AutoConfig.for_model("llama", vocab_size=257)
+        return {"model_type": "qwen3_moe"}, {}
 
-    monkeypatch.setattr(AutoConfig, "from_pretrained", load_config)
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", metadata)
+    monkeypatch.setattr(
+        config_type, "from_pretrained", lambda name: config_type(vocab_size=257)
+    )
     cfg = LLMTunerConfig(model=ModelConfig(model_name_or_path=identifier))
     cfg.auto_fill_model()
-    assert calls == ([] if identifier == "llama" else [identifier])
+    assert calls == ([] if identifier == "qwen3_moe" else [identifier])
     if calls:
         assert cfg.vocab_size == 257
 
@@ -964,7 +971,7 @@ def test_auto_fill_uses_composite_hf_text_architecture(tmp_path):
     from transformers import AutoConfig
 
     saved = AutoConfig.for_model(
-        "qwen2_5_vl",
+        "qwen3_5_moe",
         text_config={
             "vocab_size": 257,
             "hidden_size": 96,
@@ -1202,3 +1209,30 @@ def test_pre_down_experts_reject_compile_before_model_allocation():
         == "pre_down"
     )
     assert LLMTunerConfig(training=TrainingConfig(compile=True)).training.compile
+
+
+def test_auto_fill_rejects_unregistered_readable_architecture(tmp_path):
+    from transformers import LlamaConfig
+
+    LlamaConfig().save_pretrained(tmp_path)
+    cfg = LLMTunerConfig(model=ModelConfig(model_name_or_path=str(tmp_path)))
+    before = cfg.model.vocab_size
+    with pytest.raises(
+        ConfigError, match="No local configuration registered for 'llama'"
+    ):
+        cfg.auto_fill_model()
+    assert cfg.model.vocab_size == before
+
+
+def test_auto_fill_keeps_explicit_sizes_when_metadata_unavailable(monkeypatch):
+    from transformers.configuration_utils import PretrainedConfig
+
+    def unavailable(*args, **kwargs):
+        raise OSError("metadata unavailable")
+
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", unavailable)
+    cfg = LLMTunerConfig(
+        model=ModelConfig(model_name_or_path="missing/checkpoint", vocab_size=257)
+    )
+    cfg.auto_fill_model()
+    assert cfg.model.vocab_size == 257

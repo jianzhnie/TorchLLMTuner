@@ -31,6 +31,7 @@ require_env("spmd_types")
 import pytest
 import torch
 import torch.distributed as dist
+from torch.utils.checkpoint import DefaultDeviceType
 
 from llmtuner.models.common.moe.bias_update import (
     register_moe_balancing_hook,
@@ -43,6 +44,18 @@ from llmtuner.models.common.moe.routing import (
     TokenChoiceTopKRouter,
 )
 from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
+
+
+@pytest.fixture(autouse=True)
+def cpu_checkpoint_device():
+    """Run CPU checkpoint replay without querying an accelerator runtime."""
+    previous = DefaultDeviceType.get_device_type()
+    DefaultDeviceType.set_device_type("cpu")
+    try:
+        yield
+    finally:
+        DefaultDeviceType.set_device_type(previous)
+
 
 _NUM_EXPERTS = 4
 _DIM = 8
@@ -295,7 +308,9 @@ def test_balancing_entry_selects_sign_update_without_quantile_routers() -> None:
             )
         ]
     )
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    optimizer = torch.optim.SGD(
+        [torch.nn.Parameter(torch.zeros(1))], lr=0.1, foreach=False
+    )
 
     register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
@@ -323,7 +338,9 @@ def test_a_mixed_model_is_rejected() -> None:
         load_balance_coeff=0.1,
     )
     model = _Holder([_moe(), sign_based])
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    optimizer = torch.optim.SGD(
+        [torch.nn.Parameter(torch.zeros(1))], lr=0.1, foreach=False
+    )
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
@@ -432,7 +449,9 @@ def test_the_hook_solves_the_bias_and_drains_the_scratch() -> None:
     )
     moe.train()
     model = _Holder([moe])
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    optimizer = torch.optim.SGD(
+        [torch.nn.Parameter(torch.zeros(1))], lr=0.1, foreach=False
+    )
     register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
     scores_TE = torch.tensor([0.92, 0.68, 0.31, 0.07]).expand(4, -1)

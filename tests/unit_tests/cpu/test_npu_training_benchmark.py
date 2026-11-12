@@ -434,7 +434,7 @@ def test_rejects_existing_reports_and_implicit_resume(tmp_path, existing):
 
 def test_resident_memory_counts_local_parameters_gradients_and_optimizer_state():
     model = torch.nn.Linear(2, 3, bias=False)
-    optimizer = torch.optim.AdamW(model.parameters())
+    optimizer = torch.optim.AdamW(model.parameters(), foreach=False)
     model(torch.ones(1, 2)).sum().backward()
     optimizer.step()
 

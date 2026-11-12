@@ -560,6 +560,10 @@ def test_copy_stream_synchronization_failure_invalidates_optimizer():
     reference = torch.nn.Parameter(saved_parameter.clone())
     native = torch.optim.AdamW([reference], foreach=False)
     native.load_state_dict(deepcopy(saved_state))
+    # Loading restores param-group options too; keep this CPU oracle from
+    # probing NPU hardware through torch-npu's automatic foreach selection.
+    for group in native.param_groups:
+        group["foreach"] = False
     reference.grad = value.grad.clone()
     optimizer.step()
     native.step()

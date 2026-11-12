@@ -115,10 +115,13 @@ def test_flat_restore_rejects_merging_groups_with_different_learning_rates(tenso
                 "param_names": ["second"],
                 "lr": torch.tensor(0.2) if tensor_lr else 0.2,
             },
-        ]
+        ],
+        foreach=False,
     )
     target = torch.optim.AdamW(
-        [{"params": [first, second], "param_names": ["first", "second"]}], lr=0.3
+        [{"params": [first, second], "param_names": ["first", "second"]}],
+        lr=0.3,
+        foreach=False,
     )
     original_group = target.param_groups[0]
     with pytest.raises(ValueError, match="checkpoint group option 'lr' differs"):
@@ -170,7 +173,8 @@ def test_flat_restore_preserves_empty_parameter_group_options():
         [
             {"params": [parameter], "param_names": ["weight"], "lr": 0.1},
             {"params": [], "param_names": [], "lr": 0.2, "weight_decay": 0.3},
-        ]
+        ],
+        foreach=False,
     )
     init_optim_state(optimizer)
     flat_state = get_flat_optim_state_dict(optimizer)
@@ -281,7 +285,7 @@ def test_optimizer_serialization_rejects_misaligned_parameter_names(names):
 def test_optimizer_restore_rejects_misaligned_parameter_names():
     from llmtuner.components.optimizer.state_dict import unflatten_optim_state_dict
 
-    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(2))])
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(2))], foreach=False)
     optimizer.param_groups[0]["param_names"] = []
     with pytest.raises(ValueError, match="zip"):
         unflatten_optim_state_dict(optimizer, flat_state={})
@@ -333,7 +337,9 @@ def test_optimizer_container_rejects_checkpoint_keys_shared_between_optimizers()
     container.model_parts = []
     container.optimizers = []
     for _ in range(2):
-        optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(2))])
+        optimizer = torch.optim.AdamW(
+            [torch.nn.Parameter(torch.ones(2))], foreach=False
+        )
         optimizer.param_groups[0]["param_names"] = ["weight"]
         container.optimizers.append(optimizer)
     with pytest.raises(ValueError, match="overlap across inner optimizers"):
@@ -355,7 +361,9 @@ def test_sharded_restore_rejects_duplicate_local_fqns(tp, ep):
     for _ in range(2):
         parameter = torch.nn.Parameter(torch.ones(2))
         container.optimizers.append(
-            torch.optim.AdamW([{"params": [parameter], "param_names": ["weight"]}])
+            torch.optim.AdamW(
+                [{"params": [parameter], "param_names": ["weight"]}], foreach=False
+            )
         )
     chunk = ChunkedCheckpointTensor((2,), [((0,), torch.zeros(2))])
     with pytest.raises(ValueError, match="overlap across inner optimizers"):
@@ -369,7 +377,9 @@ def test_container_validates_all_checkpoint_states_before_loading_any():
     container.model_parts = []
     container.optimizers = []
     for name in ["first", "second"]:
-        optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(2))], lr=0.1)
+        optimizer = torch.optim.AdamW(
+            [torch.nn.Parameter(torch.ones(2))], lr=0.1, foreach=False
+        )
         optimizer.param_groups[0]["param_names"] = [name]
         container.optimizers.append(optimizer)
     checkpoint = container.state_dict()
@@ -388,7 +398,7 @@ def test_flat_optimizer_restore_keeps_parameter_names_for_the_next_save():
         load_flat_optim_state_dict,
     )
 
-    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(2))])
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(2))], foreach=False)
     optimizer.param_groups[0]["param_names"] = ["weight"]
     init_optim_state(optimizer)
     saved = get_flat_optim_state_dict(optimizer)
@@ -409,6 +419,7 @@ def test_container_rejects_wrong_moment_shape_before_loading_any_optimizer(momen
             [{"params": [torch.nn.Parameter(torch.ones(2))], "param_names": [name]}],
             lr=0.1,
             amsgrad=True,
+            foreach=False,
         )
         container.optimizers.append(optimizer)
     checkpoint = container.state_dict()
@@ -476,7 +487,7 @@ def test_failed_adam_materialization_discards_partial_state_and_can_retry(
     parameter = torch.nn.Parameter(torch.ones(2))
     gradient = torch.ones_like(parameter)
     parameter.grad = gradient
-    optimizer = torch.optim.AdamW([parameter], lr=0.1)
+    optimizer = torch.optim.AdamW([parameter], lr=0.1, foreach=False)
     before = parameter.detach().clone()
     original_zeros_like = torch.zeros_like
     calls = 0
@@ -517,7 +528,7 @@ def test_adam_materialization_rejects_missing_required_state_and_retries(missing
     before = parameter.detach().clone()
     gradient = torch.ones_like(parameter)
     parameter.grad = gradient
-    optimizer = torch.optim.AdamW([parameter], lr=0.01)
+    optimizer = torch.optim.AdamW([parameter], lr=0.01, foreach=False)
 
     def remove_state(optimizer, args, kwargs):
         del optimizer.state[parameter][missing]
@@ -545,9 +556,11 @@ def test_optimizer_materialization_avoids_zero_denominator_weight_corruption(
 ):
     parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0], dtype=dtype))
     reference = torch.nn.Parameter(parameter.detach().clone())
-    optimizer = optimizer_type([parameter], lr=0.01, eps=epsilon, weight_decay=0)
+    optimizer = optimizer_type(
+        [parameter], lr=0.01, eps=epsilon, weight_decay=0, foreach=False
+    )
     reference_optimizer = optimizer_type(
-        [reference], lr=0.01, eps=epsilon, weight_decay=0
+        [reference], lr=0.01, eps=epsilon, weight_decay=0, foreach=False
     )
     gradient = torch.ones_like(parameter)
     parameter.grad = gradient
@@ -569,7 +582,9 @@ def test_optimizer_materialization_avoids_zero_denominator_weight_corruption(
 @pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])
 def test_optimizer_materialization_restores_epsilon_after_step_hook_failure(failure):
     parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.float16))
-    optimizer = torch.optim.AdamW([parameter], lr=0.01, eps=1e-8, weight_decay=0.3)
+    optimizer = torch.optim.AdamW(
+        [parameter], lr=0.01, eps=1e-8, weight_decay=0.3, foreach=False
+    )
     gradient = torch.ones_like(parameter)
     parameter.grad = gradient
     before = parameter.detach().clone()
@@ -601,7 +616,7 @@ def test_optimizer_materialization_restores_epsilon_after_step_hook_failure(fail
 def test_optimizer_materialization_ignores_weight_decay_overflow(optimizer_type, dtype):
     parameter = torch.nn.Parameter(torch.tensor([torch.finfo(dtype).max], dtype=dtype))
     before = parameter.detach().clone()
-    optimizer = optimizer_type([parameter], lr=0.01, weight_decay=10.0)
+    optimizer = optimizer_type([parameter], lr=0.01, weight_decay=10.0, foreach=False)
     init_optim_state(optimizer)
     torch.testing.assert_close(parameter, before, rtol=0, atol=0)
     assert optimizer.param_groups[0]["weight_decay"] == 10.0
@@ -624,10 +639,14 @@ def test_adam_restore_uses_saved_amsgrad_state_layout(saved_amsgrad, current_ams
     source = torch.nn.Parameter(torch.ones(2))
     target = torch.nn.Parameter(torch.ones(2))
     original = torch.optim.AdamW(
-        [{"params": [source], "param_names": ["weight"]}], amsgrad=saved_amsgrad
+        [{"params": [source], "param_names": ["weight"]}],
+        amsgrad=saved_amsgrad,
+        foreach=False,
     )
     restored = torch.optim.AdamW(
-        [{"params": [target], "param_names": ["weight"]}], amsgrad=current_amsgrad
+        [{"params": [target], "param_names": ["weight"]}],
+        amsgrad=current_amsgrad,
+        foreach=False,
     )
     source.grad = torch.tensor([0.2, -0.3])
     original.step()
@@ -661,6 +680,7 @@ def test_adam_restore_rejects_nested_substitute_for_required_state(state_name):
             [{"params": [torch.nn.Parameter(torch.ones(2))], "param_names": [name]}],
             lr=0.1,
             amsgrad=True,
+            foreach=False,
         )
         for name in ("first", "second")
     ]

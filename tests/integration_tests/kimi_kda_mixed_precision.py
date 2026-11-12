@@ -15,16 +15,16 @@ import torch_npu  # noqa: F401
 from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.memory.activation_checkpoint import apply_ac
-from llmtuner.models.hf.factory import build_model_config
-from llmtuner.models.hf.materialization import initialize_random_hf_model
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import build_model_config, resolve_model_class
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp_to_decoder,
-    force_sum_grad_reduction,
+)
+from llmtuner.parallel.fully_shard_parallel.policies import (
+    disable_fsdp_gradient_division,
 )
 
 
-def main():
+def main() -> None:
     parser = ArgumentParser()
     parser.add_argument("--ac", choices=("none", "full"), default="full")
     args = parser.parse_args()
@@ -52,8 +52,8 @@ def main():
             },
         )
         config.attn_mask_type = "causal"
-        model = HFTransformerModel(config).to("npu")
-        initialize_random_hf_model(model.model)
+        model = resolve_model_class(config)(config).to("npu")
+        model.initialize_parameters()
         reference = deepcopy(model)
         apply_ac(model, args.ac)
         names = set(model.state_dict())
@@ -65,11 +65,14 @@ def main():
             reduce_dtype=torch.float32,
             pp_enabled=False,
         )
-        force_sum_grad_reduction(model)
+        disable_fsdp_gradient_division(model)
         assert set(model.state_dict()) == names
+        decay_names = set()
         for name, parameter in model.named_parameters():
             if name.endswith((".A_log", ".dt_bias")):
+                decay_names.add(name)
                 assert parameter.dtype == torch.float32
+        assert decay_names, "The test must exercise mixed-precision KDA parameters"
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=False)
         ref_optimizer = torch.optim.AdamW(
             reference.parameters(), lr=1e-3, foreach=False
@@ -77,8 +80,8 @@ def main():
         for step in range(2):
             tokens = (torch.arange(128, device="npu") + dist.get_rank() + step) % 128
             positions = torch.arange(128, device="npu")
-            actual = model(tokens, positions=positions)
-            expected = reference(tokens, positions=positions)
+            actual = model(tokens, positions=positions).logits
+            expected = reference(tokens, positions=positions).logits
             if dist.get_rank() == 0:
                 max_abs = (actual - expected).abs().max().item()
                 print(

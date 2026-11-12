@@ -63,8 +63,8 @@ from llmtuner.datasets.synthetic import (
     RandomTokenDataLoader,
     RandomTokenSource,
 )
-from llmtuner.models.hf.factory import build_model_config
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import build_model_config
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.trainer import Trainer
 
 
@@ -93,7 +93,7 @@ def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_
     trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1, max_norm=1.0)
     trainer.parallel_dims = None
     trainer.device = torch.device("cpu")
-    trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
     trainer.lr_scheduler = SimpleNamespace(get_metrics=lambda: {}, step=lambda: None)
     trainer.checkpointer = SimpleNamespace(maybe_wait_for_staging=finish_staging)
     trainer.model_parts = [model]
@@ -484,9 +484,7 @@ def test_timeout_adjustment_is_skipped_for_hccl(monkeypatch) -> None:
             raise AssertionError("groups must not be visited for HCCL")
 
     monkeypatch.setattr(collectives.dist, "barrier", lambda **_: None)
-    monkeypatch.setattr(
-        collectives.device_module, "synchronize", lambda *_: None, raising=False
-    )
+    monkeypatch.setattr(torch.npu, "synchronize", lambda *_: None, raising=False)
     monkeypatch.setattr(
         collectives.dist.distributed_c10d,
         "_set_pg_timeout",
@@ -1071,10 +1069,10 @@ def _random_batch(batch_size: int = 4, seq_len: int = 6) -> Batch:
     return Batch(input_ids=ids, labels=ids.clone())
 
 
-def _wrapper() -> HFTransformerModel:
-    """The smallest real wrapper: the shape/shift path reads no model weights."""
+def _explicit_model() -> Qwen3MoeForCausalLM:
+    """Small explicit model exercising production input preparation."""
     config = build_model_config(
-        "qwen3",
+        "qwen3_moe",
         seq_len=8,
         arch_overrides={
             "vocab_size": 32,
@@ -1083,9 +1081,13 @@ def _wrapper() -> HFTransformerModel:
             "num_hidden_layers": 1,
             "num_attention_heads": 2,
             "num_key_value_heads": 2,
+            "head_dim": 8,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 8,
         },
     )
-    return HFTransformerModel(config).eval()
+    return Qwen3MoeForCausalLM(config).eval()
 
 
 def test_count_valid_tokens_passes_the_synthetic_shape_through_unchanged() -> None:
@@ -1152,17 +1154,20 @@ def test_count_valid_tokens_reports_the_row_final_mask_the_loss_skips() -> None:
 
 
 @pytest.mark.parametrize("field", ["labels", "positions", "padding_mask"])
-def test_preprocess_rejects_misaligned_fields_before_mask_construction(field):
-    model = _wrapper()
+def test_preprocess_rejects_misaligned_fields_before_mask_construction(
+    field, monkeypatch
+):
+    model = _explicit_model()
     batch = {"input": torch.arange(4), "labels": torch.arange(4)}
     batch[field] = torch.zeros(
         3, dtype=torch.bool if field == "padding_mask" else torch.long
     )
-    model.get_attention_masks = lambda **kwargs: pytest.fail(
-        "invalid batch reached mask construction"
+    monkeypatch.setattr(
+        "llmtuner.models.qwen.qwen3.model.build_dense_attention_mask",
+        lambda *args, **kwargs: pytest.fail("invalid batch reached mask construction"),
     )
     with pytest.raises(ValueError, match=f"{field} has 3 tokens"):
-        model.preprocess_inputs(batch, parallel_dims=None)
+        model.prepare_inputs(batch, parallel_dims=None)
 
 
 def test_preprocess_inputs_shifts_the_synthetic_labels_within_a_row() -> None:
@@ -1173,7 +1178,7 @@ def test_preprocess_inputs_shifts_the_synthetic_labels_within_a_row() -> None:
     the next document's first token -- a target the model had no context for.
     """
     batch = _random_batch(batch_size=3, seq_len=4)
-    inputs, labels, extra_kwargs = _wrapper().preprocess_inputs(
+    inputs, labels, extra_kwargs = _explicit_model().prepare_inputs(
         batch, parallel_dims=None
     )
 
@@ -1202,7 +1207,7 @@ def test_preprocess_inputs_reads_the_grain_batch_without_consuming_it() -> None:
         "positions": torch.arange(8),
     }
 
-    inputs, labels, extra_kwargs = _wrapper().preprocess_inputs(
+    inputs, labels, extra_kwargs = _explicit_model().prepare_inputs(
         grain_batch, parallel_dims=None
     )
 
@@ -1223,7 +1228,9 @@ def test_preprocess_inputs_passes_padding_mask_to_moe() -> None:
         "padding_mask": torch.zeros(4, dtype=torch.bool),
     }
 
-    _, _, extra_kwargs = _wrapper().preprocess_inputs(grain_batch, parallel_dims=None)
+    _, _, extra_kwargs = _explicit_model().prepare_inputs(
+        grain_batch, parallel_dims=None
+    )
 
     assert set(extra_kwargs) == {"positions", "padding_mask"}
 
@@ -1890,7 +1897,7 @@ def test_preprocess_filters_metadata_without_changing_source():
         return source["input"], source["labels"], {}
 
     trainer = SimpleNamespace(
-        example_model=SimpleNamespace(preprocess_inputs=preprocess),
+        example_model=SimpleNamespace(prepare_inputs=preprocess),
         to_device=lambda source: source,
         parallel_dims=None,
         cfg=SimpleNamespace(max_seq_len=2),
@@ -2023,18 +2030,18 @@ def test_checkpointer_registration_sees_initialized_trainer_state(monkeypatch):
         trainer.close()
 
 
-def test_trainer_resolves_hf_configuration_once(monkeypatch):
+def test_trainer_resolves_explicit_configuration_once(monkeypatch):
     from llmtuner.config import TrainingConfig
-    from llmtuner.models.hf import factory
+    from llmtuner.trainer.runtime import assembly
 
     calls = []
-    original = factory.build_model_config
+    original = assembly.build_model_config_for
 
     def tracked(*args, **kwargs):
         calls.append(args)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(factory, "build_model_config", tracked)
+    monkeypatch.setattr(assembly, "build_model_config_for", tracked)
     trainer = Trainer(
         LLMTunerConfig(training=TrainingConfig(global_batch_size=2, max_seq_len=8))
     )
@@ -2047,13 +2054,16 @@ def test_trainer_resolves_hf_configuration_once(monkeypatch):
 def test_cli_and_trainer_load_local_hf_configuration_once(tmp_path, monkeypatch):
     import sys
 
-    from transformers import AutoConfig
+    from transformers import Qwen3MoeConfig
 
     from llmtuner.trainer.cli import parse_config
 
-    saved = AutoConfig.for_model(
-        "qwen3",
+    saved = Qwen3MoeConfig(
         vocab_size=17,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=16,
+        head_dim=8,
         hidden_size=32,
         intermediate_size=64,
         num_hidden_layers=1,
@@ -2061,14 +2071,14 @@ def test_cli_and_trainer_load_local_hf_configuration_once(tmp_path, monkeypatch)
         num_key_value_heads=2,
     )
     saved.save_pretrained(tmp_path)
-    original = AutoConfig.from_pretrained
+    original = Qwen3MoeConfig.from_pretrained
     calls = []
 
     def tracked(*args, **kwargs):
         calls.append(args)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(AutoConfig, "from_pretrained", tracked)
+    monkeypatch.setattr(Qwen3MoeConfig, "from_pretrained", tracked)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -2862,7 +2872,7 @@ def test_new_train_step_discards_previous_routing_window(quantile):
         parameter.grad = torch.ones_like(parameter)
     before = model.expert_bias_E.clone()
     trainer = Trainer.__new__(Trainer)
-    trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
     trainer.model_parts = [model]
 
     def stop_after_reset():
@@ -3054,16 +3064,16 @@ def test_trainer_unequal_token_accumulation_matches_summed_loss_reference(tmp_pa
         reference.optimizer.zero_grad(set_to_none=True)
         losses = []
         for batch in batches:
-            # preprocess_inputs reads whatever device the batch is on; the
+            # prepare_inputs reads whatever device the batch is on; the
             # trainer's own path moves it first (runtime/batch.py:preprocess),
             # and the reference must do the same now that the device need not
             # be CPU.
-            tokens, targets, kwargs = reference.model.preprocess_inputs(
+            tokens, targets, kwargs = reference.model.prepare_inputs(
                 reference.to_device(batch),
                 parallel_dims=reference.parallel_dims,
                 max_context_length=8,
             )
-            logits = reference.model(tokens, **kwargs)
+            logits = reference.model(tokens, **kwargs).logits
             losses.append(
                 F.cross_entropy(
                     logits.reshape(-1, logits.shape[-1]),
@@ -3231,3 +3241,20 @@ def test_construction_preserves_assembly_error_when_cleanup_reporting_fails(
         module.Trainer(SimpleNamespace())
     assert caught.value is failure
     assert calls == ["checkpointer", "metrics"]
+
+
+@pytest.mark.parametrize("canonical", [None, 42])
+def test_preprocess_requires_explicit_input_contract_without_legacy_fallback(canonical):
+    def legacy(*args, **kwargs):
+        pytest.fail("Trainer entered a removed adapter's input method")
+
+    trainer = SimpleNamespace(
+        example_model=SimpleNamespace(
+            prepare_inputs=canonical,
+            preprocess_inputs=legacy,
+        ),
+    )
+    with pytest.raises(TypeError, match="must implement.*prepare_inputs"):
+        Trainer.preprocess(
+            trainer, Batch(input_ids=torch.ones(1, 2), labels=torch.ones(1, 2))
+        )

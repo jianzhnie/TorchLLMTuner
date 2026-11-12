@@ -27,6 +27,7 @@ import torch
 
 from llmtuner.config import ParallelConfig
 from llmtuner.config.parallel_config import ContextParallelConfig
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.context_parallel import (
     CPFlexKernel,
     apply_cp,
@@ -49,7 +50,7 @@ def test_apply_cp_rejects_dual_axes_without_a_mesh() -> None:
     )
 
     with pytest.raises(ValueError, match="requires a device mesh"):
-        apply_cp(torch.nn.Linear(4, 4), mesh=None, cfg=cfg)
+        apply_cp(_StubModel(4, 4), mesh=None, cfg=cfg)
 
 
 # -- the kernel's strategy dispatch -------------------------------------------
@@ -267,18 +268,25 @@ def test_kcp_rejects_invalid_kernel_options_before_import(
 
 
 class _StubModel(torch.nn.Module):
-    """Just enough of HFTransformerModel for apply_cp's validation path."""
+    """Explicit structure and input contract for CP setup-only tests."""
+
+    decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+        attention="self_attn",
+    )
 
     def __init__(self, num_attention_heads: int, num_key_value_heads: int) -> None:
         super().__init__()
         from types import SimpleNamespace
 
-        self.model = SimpleNamespace(
-            config=SimpleNamespace(
-                _attn_implementation="flex_torchtitan",
-                num_attention_heads=num_attention_heads,
-                num_key_value_heads=num_key_value_heads,
-            )
+        self.config = SimpleNamespace(
+            _attn_implementation="flex_torchtitan",
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
         )
         self.layers = torch.nn.ModuleList()
         self.cp_strategy = None
@@ -355,7 +363,7 @@ def test_ulysses_packed_is_accepted_and_the_strategy_is_latched(tp_cp_mesh) -> N
     'ulysses', so a stub that recorded a constant cannot pass both halves.
     """
     model = _StubModel(num_attention_heads=4, num_key_value_heads=4)
-    model.model.config.attn_mask_type = "block_causal"
+    model.config.attn_mask_type = "block_causal"
     apply_cp(model, mesh=tp_cp_mesh, cfg=_ulysses_cfg(tp=2))
     assert model.cp_strategy == "ulysses"
 
@@ -372,19 +380,18 @@ def test_ulysses_packed_is_accepted_and_the_strategy_is_latched(tp_cp_mesh) -> N
 
 @pytest.mark.parametrize("failure", ["missing_attention", "kernel_setup"])
 def test_cp_missing_late_attention_preserves_earlier_kernel(monkeypatch, failure):
-    from types import SimpleNamespace
 
-    from llmtuner.models.hf.attention_backend import ATTENTION_BACKEND
     from llmtuner.parallel.context_parallel import context_parallel as cp
 
     old_kernel = object()
-    attention = SimpleNamespace(_titan_flex_kernel=old_kernel)
-    model = SimpleNamespace(
-        model=SimpleNamespace(
-            config=SimpleNamespace(_attn_implementation=ATTENTION_BACKEND)
-        ),
-        layers=[SimpleNamespace(self_attn=attention), SimpleNamespace()],
-        set_cp_mesh=lambda *args, **kwargs: pytest.fail("invalid model changed mesh"),
+    attention = torch.nn.Module()
+    attention._titan_flex_kernel = old_kernel
+    first = torch.nn.Module()
+    first.self_attn = attention
+    model = _StubModel(4, 4)
+    model.layers.extend([first, torch.nn.Module()])
+    model.set_cp_mesh = lambda *args, **kwargs: pytest.fail(
+        "invalid model changed mesh"
     )
 
     class Mesh:
@@ -405,10 +412,10 @@ def test_cp_missing_late_attention_preserves_earlier_kernel(monkeypatch, failure
         return object()
 
     if failure == "kernel_setup":
-        model.layers[1].self_attn = SimpleNamespace()
+        model.layers[1].self_attn = torch.nn.Module()
     monkeypatch.setattr(cp, "CPFlexKernel", kernel)
-    error = AttributeError if failure == "missing_attention" else RuntimeError
-    message = "layer 1" if failure == "missing_attention" else "kernel setup failed"
+    error = ValueError if failure == "missing_attention" else RuntimeError
+    message = "layers.1" if failure == "missing_attention" else "kernel setup failed"
     with pytest.raises(error, match=message):
         apply_cp(
             model, mesh=Mesh(), cfg=ParallelConfig(context_parallel_kv_allgather_size=2)
@@ -421,7 +428,7 @@ def test_cp_missing_late_attention_preserves_earlier_kernel(monkeypatch, failure
 def test_dual_cp_rejects_wrong_axis_degree_before_kernel_setup(monkeypatch, axis, flex):
     from types import SimpleNamespace
 
-    from llmtuner.models.hf.attention_backend import ATTENTION_BACKEND
+    from llmtuner.models.common.attention.backend_names import ATTENTION_BACKEND
     from llmtuner.parallel.context_parallel import context_parallel as cp
 
     class Mesh:
@@ -436,13 +443,8 @@ def test_dual_cp_rejects_wrong_axis_degree_before_kernel_setup(monkeypatch, axis
         def size(self):
             return self.degree
 
-    model = SimpleNamespace(
-        model=SimpleNamespace(
-            config=SimpleNamespace(
-                _attn_implementation=ATTENTION_BACKEND if flex else "sdpa"
-            )
-        )
-    )
+    model = _StubModel(4, 4)
+    model.config._attn_implementation = ATTENTION_BACKEND if flex else "sdpa"
     topology = SimpleNamespace(
         get_optional_mesh=lambda name: Mesh(1 if name == axis else 2)
     )
@@ -551,9 +553,9 @@ def test_kcp_installs_mla_callable_without_changing_parameter_names(monkeypatch)
 
 
 def test_cp_dispatches_from_model_backend_contract() -> None:
-    class Model(torch.nn.Module):
+    class Model(_StubModel):
         context_parallel_backend = "compressor"
 
     cfg = ParallelConfig(context_parallel_kv_allgather_size=2)
     with pytest.raises(ValueError, match="HCA CP requires a cp mesh"):
-        apply_cp(Model(), mesh=None, cfg=cfg)
+        apply_cp(Model(4, 4), mesh=None, cfg=cfg)

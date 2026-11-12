@@ -9,10 +9,10 @@ from itertools import product
 import torch
 import torch_npu  # noqa: F401
 
+from llmtuner.kernel.ops.kda import npu_chunk_kda
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.delta_attention import (
     KimiDeltaAttention,
-    npu_chunk_kda,
     recurrent_kda,
 )
 

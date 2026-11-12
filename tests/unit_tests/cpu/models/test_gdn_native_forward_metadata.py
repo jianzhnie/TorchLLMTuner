@@ -1,95 +1,103 @@
-"""Real HF call-chain metadata contracts; abort before any GDN computation."""
-
-from types import SimpleNamespace
+"""Explicit native GDN metadata and causal-execution contracts."""
 
 import pytest
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM
+from torch import nn
+from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+    Qwen3_5MoeTextConfig,
+)
 
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.qwen.qwen3_5.gdn_numerics import _validate_forward
-from llmtuner.models.qwen.qwen3_5.linear_attention import validate_gdn_inputs
-
-
-class CapturedGDN(Exception):
-    pass
+from llmtuner.models.qwen.qwen3_5_moe.model import (
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeTextModel,
+)
+from tests.unit_tests.cpu.models.test_owned_family_construction import text_config
+from tests.unit_tests.cpu.models.test_qwen35_owned_decoder import models
 
 
 @pytest.mark.parametrize("causal", [None, True])
-def test_native_causallm_metadata_reaches_both_guards(causal):
-    config = AutoConfig.for_model(
-        "qwen3_5_moe_text",
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        layer_types=["linear_attention"],
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        linear_num_key_heads=1,
-        linear_num_value_heads=2,
-        linear_key_head_dim=8,
-        linear_value_head_dim=8,
-        num_experts=2,
-        num_experts_per_tok=1,
-        moe_intermediate_size=16,
-        shared_expert_intermediate_size=16,
-    )
-    if causal is not None:
-        config.is_causal = causal
-    model = AutoModelForCausalLM.from_config(config).bfloat16()
-    captured = {}
+@pytest.mark.parametrize("masked", [False, True])
+def test_native_decoder_metadata_matches_reference_during_real_execution(
+    causal, masked
+):
+    baseline, owned = models()
+    captures = [{}, {}]
+    handles = []
+    for index, model in enumerate((baseline, owned)):
+        if causal is not None:
+            model.config.is_causal = causal
 
-    def capture(module, args, kwargs):
-        captured.update(kwargs)
-        raise CapturedGDN
+        def capture(module, args, kwargs, index=index):
+            captures[index].update(kwargs)
 
-    handle = model.model.layers[0].linear_attn.register_forward_pre_hook(
-        capture, with_kwargs=True
+        handles.append(
+            model.layers[0].linear_attn.register_forward_pre_hook(
+                capture, with_kwargs=True
+            )
+        )
+    tokens = torch.tensor([[1, 5, 2, 7], [3, 6, 4, 8]])
+    keep = (
+        torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1]], dtype=torch.bool) if masked else None
     )
     try:
-        with pytest.raises(CapturedGDN):
-            model(input_ids=torch.zeros(1, 64, dtype=torch.long), use_cache=False)
+        expected = baseline(
+            tokens, attention_mask=keep, use_cache=False, is_causal=causal
+        ).last_hidden_state
+        actual = owned(
+            tokens, attention_mask=keep, use_cache=False, is_causal=causal
+        ).last_hidden_state
+    finally:
+        for handle in handles:
+            handle.remove()
+    for captured in captures:
+        assert {"hidden_states", "cache_params", "attention_mask"} <= captured.keys()
+        assert captured["cache_params"] is None
+    for field in ("hidden_states", "attention_mask"):
+        left, right = captures[0][field], captures[1][field]
+        if left is None:
+            assert right is None
+        else:
+            torch.testing.assert_close(left, right, rtol=0, atol=0)
+    assert actual.isfinite().all() and actual.count_nonzero() > 0
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    probe = torch.randn_like(actual)
+    actual.backward(probe)
+    expected.backward(probe)
+    references = dict(baseline.named_parameters())
+    for name, parameter in owned.named_parameters():
+        torch.testing.assert_close(
+            parameter.grad, references[name].grad, rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("model_type", [Qwen3_5MoeForCausalLM, Qwen3_5MoeTextModel])
+@pytest.mark.parametrize("causal", [False, 1, "false"])
+def test_noncausal_config_rejects_before_allocation(model_type, causal, monkeypatch):
+    config = text_config(Qwen3_5MoeTextConfig)
+    config.is_causal = causal
+    rng = torch.get_rng_state().clone()
+    monkeypatch.setattr(
+        nn.Embedding, "__init__", lambda *a, **kw: pytest.fail("invalid GDN allocated")
+    )
+    with pytest.raises(UnsupportedCombinationError, match="requires causal execution"):
+        model_type(config)
+    assert torch.equal(torch.get_rng_state(), rng)
+
+
+@pytest.mark.parametrize("model_type", [Qwen3_5MoeForCausalLM, Qwen3_5MoeTextModel])
+@pytest.mark.parametrize("causal", [False, 1, "false"])
+def test_noncausal_forward_rejects_before_embedding(model_type, causal):
+    model = model_type(text_config(Qwen3_5MoeTextConfig))
+
+    def forbidden(*args):
+        pytest.fail("Invalid GDN causal metadata reached embedding")
+
+    handle = model.get_input_embeddings().register_forward_pre_hook(forbidden)
+    try:
+        with pytest.raises(
+            UnsupportedCombinationError, match="requires causal execution"
+        ):
+            model(torch.tensor([[1, 3, 7, 2]]), is_causal=causal, use_cache=False)
     finally:
         handle.remove()
-    expected = {
-        "hidden_states",
-        "cache_params",
-        "attention_mask",
-        "use_cache",
-        "output_router_logits",
-    }
-    if causal is not None:
-        expected.add("is_causal")
-    assert set(captured) == expected
-    assert captured["output_router_logits"] is False
-    assert captured.get("is_causal") is causal
-    assert captured["cache_params"] is None
-    assert captured["attention_mask"] is None
-    # Keep the genuine metadata but use production geometry so CPU device is
-    # the only expected failure. This is guard coverage, not NPU acceptance.
-    captured["hidden_states"] = torch.empty(1, 64, 2048, dtype=torch.bfloat16)
-    for guard in (_validate_forward, validate_gdn_inputs):
-        with pytest.raises(UnsupportedCombinationError, match="BF16 NPU"):
-            guard(SimpleNamespace(), (), captured)
-
-
-@pytest.mark.parametrize("guard", [_validate_forward, validate_gdn_inputs])
-@pytest.mark.parametrize(
-    "extra",
-    [
-        {"output_router_logits": 0},
-        {"output_attentions": None},
-        {"output_hidden_states": "false"},
-        {"is_causal": False},
-        {"is_causal": 1},
-        {"unknown_metadata": False},
-        {"cache_params": object()},
-        {"cu_seqlens": torch.tensor([0, 64])},
-    ],
-)
-def test_metadata_validation_remains_narrow(guard, extra):
-    kwargs = {"hidden_states": torch.empty(1, 64, 2048), **extra}
-    with pytest.raises(UnsupportedCombinationError):
-        guard(SimpleNamespace(), (), kwargs)

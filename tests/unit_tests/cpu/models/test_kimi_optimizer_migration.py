@@ -22,6 +22,7 @@ def test_adamw_individual_to_grouped_state_preserves_next_update():
         [(f"{ROOT}experts.{i}.w1.weight", p) for i, p in enumerate(individuals)],
         lr=0.01,
         amsgrad=True,
+        foreach=False,
     )
     for p in individuals:
         p.grad = torch.randn_like(p)
@@ -40,6 +41,7 @@ def test_adamw_individual_to_grouped_state_preserves_next_update():
         [(f"{ROOT}routed_experts.inner_experts.w1_EFD", parameter)],
         lr=0.01,
         amsgrad=True,
+        foreach=False,
     )
     init_optim_state(grouped)
     load_flat_optim_state_dict(grouped, flat_state=migrated)
@@ -118,3 +120,28 @@ def test_kimi_optimizer_rejects_duplicate_numeric_expert_indices(
         entries.reverse()
     with pytest.raises(ValueError, match="duplicate expert index"):
         convert_kimi_optimizer_state(dict(entries), num_experts=2, to_hf=False)
+
+
+@pytest.mark.parametrize("to_hf", [False, True])
+@pytest.mark.parametrize("category", ["state", "param_groups"])
+def test_optimizer_mapping_preserves_unrelated_nested_gate_names(to_hf, category):
+    suffix = "router.gate.weight" if to_hf else "gate.weight"
+    key = f"{category}.{ROOT}custom.{suffix}.exp_avg"
+    value = torch.ones(2, 3)
+    result = convert_kimi_optimizer_state({key: value}, num_experts=2, to_hf=to_hf)
+    assert result.keys() == {key}
+    assert result[key] is value
+
+
+def test_optimizer_mapping_rejects_mixed_device_moments_before_stack(monkeypatch):
+    state = {
+        f"state.{ROOT}experts.0.w1.weight.exp_avg": torch.ones(2, 3),
+        f"state.{ROOT}experts.1.w1.weight.exp_avg": torch.ones(2, 3, device="meta"),
+    }
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Mixed devices reached tensor stacking")
+
+    monkeypatch.setattr(torch, "stack", forbidden)
+    with pytest.raises(ValueError, match="moment tensors disagree"):
+        convert_kimi_optimizer_state(state, num_experts=2, to_hf=False)

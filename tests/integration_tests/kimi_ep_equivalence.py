@@ -15,10 +15,10 @@ import torch.distributed as dist
 from torch import nn
 
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 
 
 def run_case(*, latent, activation, empty):
@@ -41,7 +41,7 @@ def run_case(*, latent, activation, empty):
     reference = deepcopy(source)
     layer.block_sparse_moe = source
     model.layers = nn.ModuleList([layer])
-    swap_hf_moe_blocks(model, ep_group=dist.group.WORLD)
+    swap_moe_blocks(model, ep_group=dist.group.WORLD)
     converted = layer.block_sparse_moe
     rank, size = dist.get_rank(), dist.get_world_size()
     torch.manual_seed(91 + rank)
@@ -96,20 +96,25 @@ def run_case(*, latent, activation, empty):
     # Export full EP weights to the original individual-expert schema, then
     # reconstruct another independently converted/sharded model on each rank.
     state = ModelCheckpointState(model).state_dict()
-    adapter = HFTransformerStateDictAdapter(config, None, kimi_expert_parallel=True)
+    adapter = ModelStateDictAdapter(
+        config, None, model_prefix="model.", kimi_expert_parallel=True
+    )
     exported = adapter.to_hf({f"model.{key}": value for key, value in state.items()})
     reference_state = {
         f"layers.0.block_sparse_moe.{key}": value
         for key, value in reference.state_dict().items()
     }
-    assert exported.keys() == reference_state.keys()
+    assert exported.keys() == reference_state.keys(), (
+        exported.keys() - reference_state.keys(),
+        reference_state.keys() - exported.keys(),
+    )
     for key in exported:
         torch.testing.assert_close(exported[key], reference_state[key], atol=0, rtol=0)
     fresh = nn.Module()
     fresh_layer = nn.Module()
     fresh_layer.block_sparse_moe = KimiSparseMoE(config).eval()
     fresh.layers = nn.ModuleList([fresh_layer])
-    swap_hf_moe_blocks(fresh, ep_group=dist.group.WORLD)
+    swap_moe_blocks(fresh, ep_group=dist.group.WORLD)
     imported = {
         key.removeprefix("model."): value
         for key, value in adapter.from_hf(exported).items()

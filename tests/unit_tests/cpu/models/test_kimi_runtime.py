@@ -9,6 +9,7 @@ import torch
 from transformers import PretrainedConfig
 
 from llmtuner.errors import EnvironmentUnsupportedError
+from llmtuner.kernel.ops import kda
 from llmtuner.models.kimi.kimi_k3 import delta_attention
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 
@@ -36,8 +37,9 @@ def checked_import(name, *args, **kwargs):
     return original_import(name, *args, **kwargs)
 builtins.__import__ = checked_import
 from llmtuner.models.kimi.kimi_k3 import delta_attention
-assert delta_attention.npu_chunk_kda is None
-assert delta_attention.NPU_KDA_IMPORT_ERROR is None
+from llmtuner.kernel.ops import kda
+assert kda.npu_chunk_kda is None
+assert kda.NPU_KDA_IMPORT_ERROR is None
 """
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -50,8 +52,8 @@ assert delta_attention.NPU_KDA_IMPORT_ERROR is None
 
 def test_missing_npu_kda_reports_dependency_and_original_cause(monkeypatch):
     cause = ModuleNotFoundError("missing kernel runtime")
-    monkeypatch.setattr(delta_attention, "npu_chunk_kda", None)
-    monkeypatch.setattr(delta_attention, "NPU_KDA_IMPORT_ERROR", cause)
+    monkeypatch.setattr(kda, "npu_chunk_kda", None)
+    monkeypatch.setattr(kda, "NPU_KDA_IMPORT_ERROR", cause)
     with pytest.raises(
         EnvironmentUnsupportedError, match="triton_ascend_kernels"
     ) as exc:
@@ -63,18 +65,33 @@ def test_missing_npu_kda_reports_dependency_and_original_cause(monkeypatch):
 
 @pytest.mark.parametrize("device", ["cpu", "meta"])
 def test_cpu_and_meta_kda_do_not_require_accelerator_kernel(monkeypatch, device):
-    monkeypatch.setattr(delta_attention, "npu_chunk_kda", None)
-    monkeypatch.setattr(delta_attention, "accelerator_chunk_kda", None)
+    monkeypatch.setattr(kda, "npu_chunk_kda", None)
+    monkeypatch.setattr(kda, "accelerator_chunk_kda", None)
     delta_attention.validate_kimi_kda_runtime(kda_config(), torch.device(device))
 
 
 def test_full_attention_only_and_other_models_do_not_require_kda(monkeypatch):
-    monkeypatch.setattr(delta_attention, "accelerator_chunk_kda", None)
+    monkeypatch.setattr(kda, "accelerator_chunk_kda", None)
     config = KimiLinearConfig(num_hidden_layers=2, linear_attn_config=None)
     delta_attention.validate_kimi_kda_runtime(config, torch.device("cuda"))
     delta_attention.validate_kimi_kda_runtime(PretrainedConfig(), torch.device("cuda"))
 
 
 def test_available_kda_kernel_allows_accelerator_configuration(monkeypatch):
-    monkeypatch.setattr(delta_attention, "accelerator_chunk_kda", object())
+    monkeypatch.setattr(kda, "accelerator_chunk_kda", object())
     delta_attention.validate_kimi_kda_runtime(kda_config(), torch.device("cuda"))
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta", "mps"])
+def test_accelerator_provider_rejects_unsupported_devices(device):
+    with pytest.raises(EnvironmentUnsupportedError, match="does not support device"):
+        kda.require_kda_kernel(torch.device(device))
+
+
+def test_cuda_provider_preserves_missing_dependency_cause(monkeypatch):
+    cause = ModuleNotFoundError("missing FLA")
+    monkeypatch.setattr(kda, "accelerator_chunk_kda", None)
+    monkeypatch.setattr(kda, "ACCELERATOR_KDA_IMPORT_ERROR", cause)
+    with pytest.raises(EnvironmentUnsupportedError, match="fla.ops.kda") as exc:
+        kda.require_kda_kernel(torch.device("cuda"))
+    assert exc.value.__cause__ is cause

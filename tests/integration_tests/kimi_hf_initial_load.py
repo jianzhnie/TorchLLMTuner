@@ -3,7 +3,7 @@
 Run with two CPU/Gloo ranks and a shared empty working directory:
 LLMTUNER_TEST_KIMI=1 LLMTUNER_TEST_KIMI_MOE=1 LLMTUNER_TEST_KIMI_LATENT=1 \
 LLMTUNER_TEST_EP_SIZE=2 LLMTUNER_TEST_PP_SIZE=1 \
-LLMTUNER_TEST_FSDP_IMPLEMENTATION=custom \
+LLMTUNER_TEST_FSDP_IMPLEMENTATION=native \
 torchrun --nproc_per_node=2 tests/integration_tests/kimi_hf_initial_load.py WORKDIR
 """
 
@@ -22,8 +22,7 @@ import torch.distributed as dist
 from safetensors.torch import load_file, save_file
 
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import build_model_config_for, resolve_model_class
 from llmtuner.trainer.trainer import Trainer
 from tests.integration_tests.pp_checkpoint_equivalence import (
     _cfg,
@@ -39,10 +38,10 @@ def run(workdir):
     try:
         cfg = _cfg(workdir)
         torch.manual_seed(174)
-        source = HFTransformerModel(build_model_config_for(cfg)).eval()
+        model_config = build_model_config_for(cfg)
+        source = resolve_model_class(model_config)(model_config).eval()
         expected = {
-            key: value.detach().clone()
-            for key, value in source.model.state_dict().items()
+            key: value.detach().clone() for key, value in source.state_dict().items()
         }
         path = Path(workdir) / "hf-source"
         if dist.get_rank() == 0:
@@ -70,8 +69,8 @@ def run(workdir):
             )
         ids = torch.tensor([1, 2, 3])
         trainer.model.eval()
-        actual = trainer.model(ids)
-        expected_logits = source(ids)
+        actual = trainer.model(ids).logits
+        expected_logits = source(ids).logits
         torch.testing.assert_close(actual, expected_logits, atol=1e-6, rtol=1e-6)
         trainer.model.train()
         losses = _train_steps(trainer, iter(trainer.dataloader), 2)
@@ -120,10 +119,10 @@ def run(workdir):
             torch.testing.assert_close(
                 on_disk[key], before[key], atol=0, rtol=0, msg=key
             )
-        source.model.load_state_dict(on_disk, strict=True)
+        source.load_state_dict(on_disk, strict=True)
         trainer.model.eval()
         torch.testing.assert_close(
-            trainer.model(ids), source(ids), atol=1e-6, rtol=1e-6
+            trainer.model(ids).logits, source(ids).logits, atol=1e-6, rtol=1e-6
         )
         after = trainer.checkpointer.sd_adapter.to_hf(
             ModelCheckpointState(trainer.model_parts).state_dict()

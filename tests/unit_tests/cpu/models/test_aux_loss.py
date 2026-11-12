@@ -35,6 +35,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import DefaultDeviceType
 
 from llmtuner.config import RegionACConfig, SelectiveACConfig
 from llmtuner.memory.activation_checkpoint import (
@@ -49,6 +50,17 @@ from llmtuner.models.common.aux_loss import (
     rollup_aux_loss_metrics,
 )
 from llmtuner.models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
+
+
+@pytest.fixture(autouse=True)
+def cpu_checkpoint_device():
+    """Keep CPU recomputation independent of vendor default-device discovery."""
+    previous = DefaultDeviceType.get_device_type()
+    DefaultDeviceType.set_device_type("cpu")
+    try:
+        yield
+    finally:
+        DefaultDeviceType.set_device_type(previous)
 
 
 @pytest.fixture(autouse=True)
@@ -609,7 +621,7 @@ def test_aux_hook_preserves_registered_model_parts_after_caller_list_edit():
     loss = MicrobatchWiseLoadBalanceLoss(coeff=1.0)
     loss.instance_acc.fill_(3.0)
     parts = [loss]
-    optimizer = torch.optim.SGD([nn.Parameter(torch.ones(1))], lr=0.1)
+    optimizer = torch.optim.SGD([nn.Parameter(torch.ones(1))], lr=0.1, foreach=False)
     register_aux_loss_metrics_hook(optimizer, model_parts=parts)
     parts.clear()
     optimizer.step()

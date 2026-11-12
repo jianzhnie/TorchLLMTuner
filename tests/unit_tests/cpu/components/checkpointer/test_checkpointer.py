@@ -23,6 +23,7 @@ from llmtuner.components.checkpointer import (
 )
 from llmtuner.components.checkpointer.backends import torch_checkpointing_backend
 from llmtuner.components.checkpointer.core.base import BaseCheckpointManager
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.components.checkpointer.storage.storage import (
     CheckpointStorage,
     FilesystemCheckpointStorage,
@@ -1865,11 +1866,9 @@ def test_hf_export_roundtrip_without_process_group(tmp_path, indexed):
 
     from safetensors.torch import save_file
 
-    from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
-
     model = nn.ModuleDict({"model": nn.Linear(2, 2)})
     optimizer = torch.optim.AdamW(model.parameters())
-    adapter = HFTransformerStateDictAdapter(SimpleNamespace(), None)
+    adapter = ModelStateDictAdapter(SimpleNamespace(), None, model_prefix="model.")
     if indexed:
         adapter.fqn_to_index_mapping = {"weight": 1, "bias": 2}
     manager = DistributedCheckpointManager(
@@ -1919,11 +1918,10 @@ def test_failed_hf_export_rewrite_preserves_published_weights(
     from torch.distributed.checkpoint.api import CheckpointException
 
     from llmtuner.components.checkpointer.hf import hf_storage
-    from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 
     model = nn.ModuleDict({"model": nn.Linear(2, 2)})
     optimizer = torch.optim.AdamW(model.parameters())
-    adapter = HFTransformerStateDictAdapter(SimpleNamespace(), None)
+    adapter = ModelStateDictAdapter(SimpleNamespace(), None, model_prefix="model.")
     if indexed:
         adapter.fqn_to_index_mapping = {"weight": 1, "bias": 2}
     manager = DistributedCheckpointManager(
@@ -3076,8 +3074,6 @@ def test_hf_export_loads_with_automodel_and_preserves_logits(tmp_path, tied, ind
 
     from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
 
-    from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
-
     config = LlamaConfig(
         vocab_size=16,
         hidden_size=16,
@@ -3092,7 +3088,7 @@ def test_hf_export_loads_with_automodel_and_preserves_logits(tmp_path, tied, ind
     original = LlamaForCausalLM(config).float().eval()
     wrapper = nn.ModuleDict({"model": original})
     optimizer = torch.optim.AdamW(wrapper.parameters())
-    adapter = HFTransformerStateDictAdapter(config, None)
+    adapter = ModelStateDictAdapter(config, None, model_prefix="model.")
     if indexed:
         adapter.fqn_to_index_mapping = {
             name: index % 2 + 1 for index, name in enumerate(original.state_dict())

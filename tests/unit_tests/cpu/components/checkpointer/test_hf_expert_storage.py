@@ -1,16 +1,22 @@
+"""External expert checkpoints load into explicit model-owned layouts."""
+
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
+from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.distributed.checkpoint.metadata import MetadataIndex
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from llmtuner.components.checkpointer.hf.hf_expert_storage import (
     GroupedExpertHuggingFaceStorageReader,
 )
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 
 
 def _checkpoint(tmp_path, *, missing=False):
@@ -32,9 +38,12 @@ def _checkpoint(tmp_path, *, missing=False):
     return weights
 
 
+@pytest.mark.parametrize("model_prefix", ["", "model."])
 @pytest.mark.parametrize("thread_count", [1, 2])
 @pytest.mark.parametrize("indexed", [False, True])
-def test_individual_hf_experts_load_into_fused_tensors(tmp_path, thread_count, indexed):
+def test_individual_hf_experts_load_into_fused_tensors(
+    tmp_path, thread_count, indexed, model_prefix
+):
     weights = _checkpoint(tmp_path)
     if not indexed:
         (tmp_path / "model.safetensors.index.json").unlink()
@@ -54,13 +63,13 @@ def test_individual_hf_experts_load_into_fused_tensors(tmp_path, thread_count, i
             json.dumps({"weight_map": weight_map})
         )
     config = SimpleNamespace(model_type="qwen3_moe", num_experts=3)
-    adapter = HFTransformerStateDictAdapter(config, str(tmp_path))
+    adapter = ModelStateDictAdapter(config, str(tmp_path), model_prefix=model_prefix)
     prefix = "model.layers.0.mlp.experts."
     destination = {
         prefix + "gate_up_proj": torch.empty(3, 4, 4),
         prefix + "down_proj": torch.empty(3, 4, 2),
     }
-    wrapper = {"model." + key: value for key, value in destination.items()}
+    wrapper = {model_prefix + key: value for key, value in destination.items()}
     assert set(adapter.to_hf(wrapper)) == set(destination)
     dcp.load(
         destination,
@@ -94,7 +103,8 @@ def test_individual_hf_experts_reject_missing_projection(tmp_path):
         reader.read_metadata()
 
 
-def test_individual_hf_experts_load_native_ep_stacks(tmp_path):
+@pytest.mark.parametrize("model_prefix", ["", "model."])
+def test_individual_hf_experts_load_native_ep_stacks(tmp_path, model_prefix):
     weights = _checkpoint(tmp_path)
     prefix = "model.layers.0.mlp."
     gate = torch.arange(12, dtype=torch.float32).reshape(3, 4)
@@ -111,13 +121,14 @@ def test_individual_hf_experts_load_native_ep_stacks(tmp_path):
             ("w2_EDF", (3, 4, 2)),
         )
     }
-    adapter = HFTransformerStateDictAdapter(
+    adapter = ModelStateDictAdapter(
         SimpleNamespace(model_type="qwen3_moe", num_experts=3),
         str(tmp_path),
         qwen3_expert_parallel=True,
+        model_prefix=model_prefix,
     )
-    wrapped = {"model." + key: value for key, value in destination.items()}
-    wrapped["model." + prefix + "router.gate.weight"] = torch.full_like(
+    wrapped = {model_prefix + key: value for key, value in destination.items()}
+    wrapped[model_prefix + prefix + "router.gate.weight"] = torch.full_like(
         gate, float("nan")
     )
     hf_state = adapter.to_hf(wrapped)
@@ -127,7 +138,7 @@ def test_individual_hf_experts_load_native_ep_stacks(tmp_path):
     dcp.load(hf_state, storage_reader=adapter.get_hf_storage_reader(str(tmp_path)))
     restored = adapter.from_hf(hf_state)
     torch.testing.assert_close(
-        restored["model." + prefix + "router.gate.weight"], gate, atol=0, rtol=0
+        restored[model_prefix + prefix + "router.gate.weight"], gate, atol=0, rtol=0
     )
     for projection, role in (
         ("gate_proj", "w1_EFD"),
@@ -160,8 +171,6 @@ def test_individual_hf_experts_reject_mixed_layout(tmp_path, native_ep_layout):
 
 @pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
 def test_individual_hf_expert_reads_only_requested_slice(tmp_path, projection):
-    from safetensors import safe_open
-
     weights = _checkpoint(tmp_path)
     reader = GroupedExpertHuggingFaceStorageReader(str(tmp_path), num_experts=3)
     metadata = reader.read_metadata()
@@ -199,3 +208,71 @@ def test_individual_hf_experts_reject_duplicate_numeric_index(tmp_path):
     reader = GroupedExpertHuggingFaceStorageReader(str(tmp_path), num_experts=3)
     with pytest.raises(ValueError, match="Duplicate individual HF expert index"):
         reader.read_metadata()
+
+
+def test_individual_expert_restore_preserves_explicit_model_training(tmp_path):
+    """Load real parameter storage, then compare forward, gradients and update."""
+    weights = _checkpoint(tmp_path)
+    config = Qwen3MoeConfig(
+        vocab_size=16,
+        hidden_size=4,
+        intermediate_size=8,
+        moe_intermediate_size=2,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        num_experts=3,
+        num_experts_per_tok=2,
+        attention_dropout=0.0,
+    )
+    config._attn_implementation = "eager"
+    config._experts_implementation = "eager"
+    torch.manual_seed(71)
+    reference = Qwen3MoeForCausalLM(config)
+    restored = deepcopy(reference)
+    prefix = "model.layers.0.mlp.experts."
+    with torch.no_grad():
+        experts = reference.model.layers[0].mlp.experts
+        for expert in range(3):
+            experts.gate_up_proj[expert].copy_(
+                torch.cat(
+                    [
+                        weights[f"{prefix}{expert}.gate_proj.weight"],
+                        weights[f"{prefix}{expert}.up_proj.weight"],
+                    ]
+                )
+            )
+            experts.down_proj[expert].copy_(
+                weights[f"{prefix}{expert}.down_proj.weight"]
+            )
+    parameters = dict(restored.named_parameters())
+    destination = {
+        name: tensor
+        for name, tensor in restored.state_dict().items()
+        if name.startswith(prefix)
+    }
+    assert len(destination) == 2
+    pointers = {name: tensor.data_ptr() for name, tensor in destination.items()}
+    adapter = ModelStateDictAdapter(config, str(tmp_path))
+    dcp.load(destination, storage_reader=adapter.get_hf_storage_reader(str(tmp_path)))
+    for name, tensor in destination.items():
+        assert tensor.data_ptr() == pointers[name]
+        assert restored.get_parameter(name) is parameters[name]
+        torch.testing.assert_close(tensor, reference.state_dict()[name], rtol=0, atol=0)
+    tokens = torch.tensor([[1, 3, 7, 2], [5, 4, 2, 9]])
+    expected = reference(tokens).logits
+    actual = restored(tokens).logits
+    assert torch.isfinite(actual).all() and actual.count_nonzero() > 0
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    expected.square().sum().backward()
+    actual.square().sum().backward()
+    assert restored.model.layers[0].mlp.experts.gate_up_proj.grad.count_nonzero() > 0
+    for name, parameter in restored.named_parameters():
+        baseline = dict(reference.named_parameters())[name]
+        assert parameter.grad is not None and baseline.grad is not None
+        torch.testing.assert_close(parameter.grad, baseline.grad, rtol=0, atol=0)
+    for model in (reference, restored):
+        torch.optim.SGD(model.parameters(), lr=0.001, foreach=False).step()
+    for name, value in restored.state_dict().items():
+        torch.testing.assert_close(value, reference.state_dict()[name], rtol=0, atol=0)

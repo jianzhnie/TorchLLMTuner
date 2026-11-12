@@ -3,6 +3,8 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.models.configuration import build_model_config_for
 from tests.integration_tests.npu_trainer_alignment_config import (
     QWEN3_30B,
     _disable_moe_balancing,
@@ -325,11 +327,10 @@ def test_30b_candidate_has_no_debugmodel_assumptions(tmp_path):
     assert config.training.max_norm == 0.5
     assert construction_dtype(True) is torch.bfloat16
 
-    from llmtuner.models.hf.factory import build_model_config_for
-
-    hf_config = build_model_config_for(config)
-    assert hf_config.attn_mask_type == "block_causal"
-    assert hf_config.rotary_compute_dtype == "float32"
+    # The historical baseline can still be inspected, but its removed Flex
+    # adapter must fail explicitly rather than silently changing attention.
+    with pytest.raises(UnsupportedCombinationError, match="no explicit-model adapter"):
+        build_model_config_for(config)
 
 
 def test_30b_candidate_preserves_current_baseline_causal_sdpa(tmp_path):
@@ -338,6 +339,9 @@ def test_30b_candidate_preserves_current_baseline_causal_sdpa(tmp_path):
     config = build_candidate_30b_config(baseline, tmp_path / "output", 8)
     assert config.model.attention_backend == "auto"
     assert config.training.dataloader_config.attention_mask_type() == "causal"
+    hf_config = build_model_config_for(config)
+    assert hf_config.attn_mask_type == "causal"
+    assert hf_config.rotary_compute_dtype == "float32"
 
 
 def test_30b_replay_rejects_unknown_attention_contract(tmp_path):

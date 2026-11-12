@@ -20,10 +20,13 @@ require_env("spmd_types")
 
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from llmtuner.accelerator import spmd
+from llmtuner.models.common import tp_projections
 from llmtuner.models.common.activation import SwiGLU
 from llmtuner.models.common.attention.qkv import QKVLinear
 from llmtuner.models.common.tp_projections import (
@@ -308,11 +311,65 @@ def test_fused_qkv_exposes_the_same_checkpoint_keys() -> None:
     assert set(dict(fused.state_dict())) == set(dict(plain.state_dict()))
 
 
-# -- the TP-off group probe --------------------------------------------------
+# -- explicit group ownership ------------------------------------------------
 
 
-def test_tp_group_is_none_without_a_mesh_context() -> None:
-    """No registered SPMD mesh means no TP axis, so the fallback path is taken."""
-    from llmtuner.accelerator.spmd import spmd_mesh_group
+def test_default_projections_do_not_consume_ambient_mesh(monkeypatch) -> None:
+    """An ambient group must not silently enable collective execution."""
 
-    assert spmd_mesh_group("tp") is None
+    def reject_lookup(*args, **kwargs):
+        raise AssertionError("Projection must use its explicit group")
+
+    monkeypatch.setattr(spmd, "spmd_mesh_group", reject_lookup)
+    fused, plain = _fused_and_plain()
+    x = _x()
+    actual = fused(x)
+    expected = plain(x)
+    for left, right in zip(actual, expected, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    assert _ffn().tp_group is None
+    row = ReduceScatterLinear(DIM, DIM)
+    torch.testing.assert_close(row(x), torch.nn.functional.linear(x, row.weight))
+
+
+@pytest.mark.parametrize("kind", ["qkv", "row", "ffn"])
+def test_projection_passes_its_own_group_to_collective(kind, monkeypatch) -> None:
+    """Check dependency wiring only; this is not distributed kernel acceptance."""
+    group = SimpleNamespace(group_name="explicit-test-group")
+    observed = []
+
+    def project(x, weight, bias, actual_group, name):
+        assert actual_group is group
+        assert name == group.group_name
+        observed.append(actual_group)
+        return torch.nn.functional.linear(x, weight, bias)
+
+    monkeypatch.setattr(tp_projections.AllGatherLinear, "apply", project)
+    monkeypatch.setattr(tp_projections.LinearReduceScatter, "apply", project)
+    if kind == "qkv":
+        module = AllGatherFusedQKVLinear(
+            head_dim=HEAD_DIM,
+            n_heads=N_HEADS,
+            n_kv_heads=N_KV_HEADS,
+            linear=torch.nn.Linear(DIM, FUSED_QKV_OUT),
+            tp_group=group,
+        )
+    elif kind == "row":
+        module = ReduceScatterLinear(DIM, DIM, tp_group=group)
+    else:
+        module = TensorParallelFeedForward(
+            w13=torch.nn.Linear(DIM, 2 * HIDDEN, bias=False),
+            w2=torch.nn.Linear(HIDDEN, DIM, bias=False),
+            tp_group=group,
+        )
+    parameters = tuple(module.parameters())
+    keys = tuple(module.state_dict())
+    assert module.tp_group is group
+    x = _x().requires_grad_()
+    result = module(x)
+    values = result if isinstance(result, tuple) else (result,)
+    sum(value.square().sum() for value in values).backward()
+    assert x.grad is not None and x.grad.count_nonzero() > 0
+    assert len(observed) == (2 if kind == "ffn" else 1)
+    assert tuple(module.state_dict()) == keys
+    assert all(a is b for a, b in zip(parameters, module.parameters(), strict=True))

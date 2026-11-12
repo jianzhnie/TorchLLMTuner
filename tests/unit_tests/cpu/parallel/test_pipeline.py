@@ -25,8 +25,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.config import ParallelConfig
 from llmtuner.config.parallel_config import PipelineParallelConfig
-from llmtuner.models.hf.factory import build_model_config
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel import compatibility
 from llmtuner.parallel.pipeline_parallel.partition import (
     generate_llm_fqn_per_model_part,
@@ -38,6 +37,7 @@ from llmtuner.parallel.pipeline_parallel.pipeline_parallel import (
     validate_microbatches,
 )
 from llmtuner.parallel.topology import ParallelTopology
+from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
 
 
 def test_single_stage_owns_everything() -> None:
@@ -181,6 +181,7 @@ def test_split_rejects_shared_parameter_across_stages_before_copy(monkeypatch, p
             "1F1B",
             torch.device("cpu"),
             generate_llm_fqn_per_model_part(2, _NUM_LAYERS),
+            replicated_module_names=("rotary_emb",),
         )
 
 
@@ -193,6 +194,7 @@ def test_split_preserves_shared_parameter_within_stage(pp_mesh):
         "1F1B",
         torch.device("cpu"),
         generate_llm_fqn_per_model_part(2, _NUM_LAYERS),
+        replicated_module_names=("rotary_emb",),
     )
     assert parts[0].layers[0].self_attn.q_proj.weight is (
         parts[0].layers[1].self_attn.q_proj.weight
@@ -208,9 +210,11 @@ def test_split_preserves_shared_parameter_within_stage(pp_mesh):
             torch.testing.assert_close(
                 parameter.grad, dict(model.named_parameters())[name].grad
             )
-    reference_optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    reference_optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
     stage_optimizer = torch.optim.SGD(
-        [parameter for part in parts for parameter in part.parameters()], lr=0.01
+        [parameter for part in parts for parameter in part.parameters()],
+        lr=0.01,
+        foreach=False,
     )
     reference_optimizer.step()
     stage_optimizer.step()
@@ -234,6 +238,7 @@ def test_unsupported_mesh_callback_is_rejected_before_stage_build(monkeypatch, p
             torch.device("cpu"),
             [["tok_embeddings"]],
             get_mesh=lambda: None,
+            replicated_module_names=("rotary_emb",),
         )
 
 
@@ -246,7 +251,12 @@ def test_stage_assignment_rejects_empty_or_invalid_v_layout(
 ):
     with pytest.raises(ValueError, match="num_stages|2 stages per rank"):
         split_model_into_stages(
-            nn.Module(), pp_mesh, schedule, torch.device("cpu"), assignments
+            nn.Module(),
+            pp_mesh,
+            schedule,
+            torch.device("cpu"),
+            assignments,
+            replicated_module_names=("rotary_emb",),
         )
 
 
@@ -262,21 +272,46 @@ def pp_mesh(tmp_path_factory):
         dist.destroy_process_group()
 
 
-def _model() -> HFTransformerModel:
+class PartitionDecoder(nn.Module):
+    """Test-only stage-ready composition of real explicit Qwen3 components.
+
+    This tests the generic partitioner; production model stage I/O remains a
+    separate acceptance gate. No wrapper inspection or attention math is mocked.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        config = model_config(
+            num_hidden_layers=_NUM_LAYERS,
+            mlp_only_layers=list(range(_NUM_LAYERS)),
+            tie_word_embeddings=False,
+        )
+        config._attn_implementation = "eager"
+        source = Qwen3MoeForCausalLM(config)
+        self.tok_embeddings = source.tok_embeddings
+        self.layers = source.layers
+        self.norm = source.norm
+        self.lm_head = source.lm_head
+        self.rotary_emb = source.model.rotary_emb
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        hidden = self.tok_embeddings(inputs).unsqueeze(0)
+        positions = torch.arange(hidden.shape[1], device=hidden.device)[None]
+        embeddings = self.rotary_emb(hidden, positions)
+        mask = torch.full(
+            (1, 1, hidden.shape[1], hidden.shape[1]),
+            float("-inf"),
+            dtype=hidden.dtype,
+            device=hidden.device,
+        ).triu(1)
+        for layer in self.layers:
+            hidden = layer(hidden, attention_mask=mask, position_embeddings=embeddings)
+        return self.lm_head(self.norm(hidden)).squeeze(0)
+
+
+def _model() -> PartitionDecoder:
     torch.manual_seed(0)
-    config = build_model_config(
-        "llama",
-        seq_len=32,
-        arch_overrides={
-            "vocab_size": 32,
-            "hidden_size": 16,
-            "intermediate_size": 32,
-            "num_hidden_layers": _NUM_LAYERS,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-        },
-    )
-    return HFTransformerModel(config).eval()
+    return PartitionDecoder().eval()
 
 
 def _split(pp_mesh):
@@ -284,7 +319,12 @@ def _split(pp_mesh):
     model = _model()
     module_names = generate_llm_fqn_per_model_part(2, _NUM_LAYERS)
     stages, model_parts = split_model_into_stages(
-        model, pp_mesh, "1F1B", torch.device("cpu"), module_names
+        model,
+        pp_mesh,
+        "1F1B",
+        torch.device("cpu"),
+        module_names,
+        replicated_module_names=("rotary_emb",),
     )
     return model, stages, model_parts
 
@@ -416,7 +456,7 @@ def test_pp_with_ep_composes() -> None:
 # -- first_stage_module_fqns: co-locating extra modules with stage 0 ----------
 
 
-def _model_with_vision_encoder() -> HFTransformerModel:
+def _model_with_vision_encoder() -> PartitionDecoder:
     """The five-part wrapper plus one extra top-level child, as a multimodal
     model would carry it."""
     model = _model()
@@ -493,7 +533,12 @@ def test_split_keeps_first_stage_module_fqns_stable(pp_mesh) -> None:
     prepend_first_stage_modules(module_names, model, ["vision_encoder"])
 
     _, model_parts = split_model_into_stages(
-        model, pp_mesh, "1F1B", torch.device("cpu"), module_names
+        model,
+        pp_mesh,
+        "1F1B",
+        torch.device("cpu"),
+        module_names,
+        replicated_module_names=("rotary_emb",),
     )
     first, last = model_parts
 
@@ -521,17 +566,24 @@ def test_split_preserves_container_assigned_by_its_own_name(pp_mesh, container_t
         ["tok_embeddings", "layers", "rotary_emb"],
         ["norm", "lm_head", "rotary_emb"],
     ]
-    layer_keys = {key for key in model.state_dict() if ".layers." in key}
+    layer_keys = {key for key in model.state_dict() if key.startswith("layers.")}
 
     _, parts = split_model_into_stages(
-        model, pp_mesh, "1F1B", torch.device("cpu"), assignments
+        model,
+        pp_mesh,
+        "1F1B",
+        torch.device("cpu"),
+        assignments,
+        replicated_module_names=("rotary_emb",),
     )
 
     assert len(parts[0].layers) == 2
     assert len(parts[1].layers) == 0
     assert len(layer_keys) == 4
-    assert {key for key in parts[0].state_dict() if ".layers." in key} == layer_keys
-    assert not any(".layers." in key for key in parts[1].state_dict())
+    assert {
+        key for key in parts[0].state_dict() if key.startswith("layers.")
+    } == layer_keys
+    assert not any(key.startswith("layers.") for key in parts[1].state_dict())
 
 
 def test_split_blanks_unassigned_alias_of_first_stage_module(pp_mesh) -> None:
@@ -541,7 +593,12 @@ def test_split_blanks_unassigned_alias_of_first_stage_module(pp_mesh) -> None:
     prepend_first_stage_modules(module_names, model, ["vision_encoder"])
 
     _, model_parts = split_model_into_stages(
-        model, pp_mesh, "1F1B", torch.device("cpu"), module_names
+        model,
+        pp_mesh,
+        "1F1B",
+        torch.device("cpu"),
+        module_names,
+        replicated_module_names=("rotary_emb",),
     )
 
     assert not isinstance(model_parts[0].vision_encoder, nn.Identity)
@@ -558,7 +615,12 @@ def test_split_without_first_stage_modules_is_unchanged(pp_mesh) -> None:
     module_names = generate_llm_fqn_per_model_part(2, _NUM_LAYERS)
 
     _, model_parts = split_model_into_stages(
-        model, pp_mesh, "1F1B", torch.device("cpu"), module_names
+        model,
+        pp_mesh,
+        "1F1B",
+        torch.device("cpu"),
+        module_names,
+        replicated_module_names=("rotary_emb",),
     )
 
     for part in model_parts:

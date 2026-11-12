@@ -582,7 +582,7 @@ def test_patterns_can_target_different_local_model_parts():
     assert [inner.param_groups[0]["lr"] for inner in optimizer] == [0.01, 0.02]
     reference_parameters = [nn.Parameter(torch.tensor([value])) for value in (1.0, 2.0)]
     references = [
-        torch.optim.AdamW([parameter], lr=rate)
+        torch.optim.AdamW([parameter], lr=rate, foreach=False)
         for parameter, rate in zip(reference_parameters, (0.01, 0.02), strict=True)
     ]
     for parameter in (first.first_weight, second.second_weight, *reference_parameters):

@@ -1,14 +1,16 @@
 """MoE scoring placement and BF16 backward arithmetic."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from llmtuner.models.common.moe.packed_expert_execution import forward_packed_experts
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
 
-def test_torchtitan_moe_scores_before_down_projection(monkeypatch):
-    from types import SimpleNamespace
 
-    from llmtuner.models.qwen.qwen3.experts import forward_torchtitan_moe
-
+def test_packed_experts_score_before_down_projection(monkeypatch):
     torch.manual_seed(37)
     inputs = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)
     gate_up = torch.randn(1, 12, 8, dtype=torch.bfloat16, requires_grad=True)
@@ -41,7 +43,7 @@ def test_torchtitan_moe_scores_before_down_projection(monkeypatch):
         ),
         _llmtuner_local_dispatcher=SimpleNamespace(dispatch=dispatch),
     )
-    actual = forward_torchtitan_moe(module, inputs.unsqueeze(0))
+    actual = forward_packed_experts(module, inputs.unsqueeze(0))
     gate_weight, up_weight = gate_up[0].chunk(2, dim=0)
     gate, up = inputs @ gate_weight.T, inputs @ up_weight.T
     hidden = torch.nn.functional.silu(gate) * up
@@ -60,13 +62,12 @@ def test_torchtitan_moe_scores_before_down_projection(monkeypatch):
         torch.testing.assert_close(observed, reference, atol=0, rtol=0)
 
 
-def test_torchtitan_moe_rejects_non_silu_activation():
-    from types import SimpleNamespace
-
-    from llmtuner.models.hf.expert_kernels import stabilize_moe_experts
-
-    model = SimpleNamespace(
-        config=SimpleNamespace(experts_implementation="torchtitan", hidden_act="gelu")
-    )
-    with pytest.raises(ValueError, match="hidden_act='silu'"):
-        stabilize_moe_experts(model)
+@pytest.mark.parametrize("activation", ["silu", "gelu"])
+def test_uninstalled_pre_down_policy_rejects_before_allocation(activation):
+    """The math helper is not yet a selectable end-to-end model policy."""
+    config = model_config(hidden_act=activation)
+    config.experts_implementation = "torchtitan"
+    rng = torch.get_rng_state().clone()
+    with pytest.raises(ValueError, match="model-owned expert implementation"):
+        Qwen3MoeForCausalLM(config)
+    assert torch.equal(torch.get_rng_state(), rng)

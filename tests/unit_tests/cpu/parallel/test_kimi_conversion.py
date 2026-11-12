@@ -6,10 +6,14 @@ import pytest
 import torch
 from torch import nn
 
+from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.moe.layer import collect_moe_layers
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel.model_replacement import (
+    resolve_ep_plan,
+    swap_hf_moe_blocks,
+)
 
 
 def make_model(*, latent=False, shared=0, activation="silu", top_k=2):
@@ -30,6 +34,272 @@ def make_model(*, latent=False, shared=0, activation="silu", top_k=2):
     layer.block_sparse_moe = KimiSparseMoE(config)
     model.layers = nn.ModuleList([layer])
     return model
+
+
+@pytest.mark.parametrize("change", ["tp", "backend", "quantile", "dtype", "grad"])
+def test_kimi_plan_rejects_unsupported_conversion_without_allocation(
+    monkeypatch, change
+):
+    model = make_model()
+    block = model.layers[0].block_sparse_moe
+    if change == "dtype":
+        block.experts[1].w2.double()
+    if change == "grad":
+        block.experts[1].w2.weight.requires_grad_(False)
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+
+    def reject(*args, **kwargs):
+        raise AssertionError("EP parsing must not allocate tensors")
+
+    monkeypatch.setattr(torch, "empty", reject)
+    with pytest.raises(UnsupportedCombinationError, match="Kimi EP"):
+        resolve_ep_plan(
+            model,
+            tp_enabled=change == "tp",
+            implementation="mc2" if change == "backend" else "alltoall",
+            quantile_balancing=change == "quantile",
+        )
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert torch.equal(rng, torch.get_rng_state())
+
+
+@pytest.mark.parametrize("change", ["shape", "bias", "count"])
+def test_kimi_plan_rejects_lossy_expert_conversion(monkeypatch, change):
+    model = make_model()
+    block = model.layers[0].block_sparse_moe
+    if change == "shape":
+        block.experts[1].w2.weight = nn.Parameter(torch.randn(8, 11))
+    elif change == "bias":
+        block.experts[1].w3.bias = nn.Parameter(torch.ones(12))
+    else:
+        del block.experts[-1]
+    rng = torch.get_rng_state().clone()
+
+    def reject(*args, **kwargs):
+        raise AssertionError("Invalid expert geometry must fail before allocation")
+
+    monkeypatch.setattr(torch, "empty", reject)
+    with pytest.raises((ValueError, UnsupportedCombinationError), match="Kimi EP"):
+        resolve_ep_plan(model)
+    assert torch.equal(rng, torch.get_rng_state())
+
+
+@pytest.mark.parametrize("change", ["down", "up", "norm", "missing_up", "input"])
+def test_kimi_plan_rejects_inconsistent_latent_geometry(monkeypatch, change):
+    model = make_model(latent=True)
+    block = model.layers[0].block_sparse_moe
+    if change in ("down", "up"):
+        projection = getattr(block, f"routed_expert_{change}_proj")
+        projection.weight = nn.Parameter(projection.weight[:, :-1].clone())
+    elif change == "norm":
+        block.routed_expert_norm.weight = nn.Parameter(torch.ones(3))
+    elif change == "missing_up":
+        del block.routed_expert_up_proj
+    else:
+        del block.routed_expert_down_proj
+        del block.routed_expert_up_proj
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+
+    def reject(*args, **kwargs):
+        raise AssertionError("Latent geometry must fail before allocation")
+
+    monkeypatch.setattr(torch, "empty", reject)
+    with pytest.raises(ValueError, match="Kimi EP"):
+        resolve_ep_plan(model)
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert torch.equal(rng, torch.get_rng_state())
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_kimi_plan_rejects_expert_aliases_before_allocation(monkeypatch, external):
+    model = make_model()
+    block = model.layers[0].block_sparse_moe
+    if external:
+        model.register_parameter("expert_alias", block.experts[0].w1.weight)
+    else:
+        block.experts[1].w1.weight = block.experts[0].w1.weight
+    rng = torch.get_rng_state().clone()
+
+    def reject(*args, **kwargs):
+        raise AssertionError("Alias preflight must not allocate replacements")
+
+    monkeypatch.setattr(torch, "empty", reject)
+    with pytest.raises(UnsupportedCombinationError, match="shared individual expert"):
+        resolve_ep_plan(model)
+    assert torch.equal(rng, torch.get_rng_state())
+
+
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_kimi_conversion_preserves_live_activation_after_config_edit(activation):
+    model = make_model(activation=activation)
+    baseline = deepcopy(model)
+    assert swap_hf_moe_blocks(baseline) == 1
+    block = model.layers[0].block_sparse_moe
+    block.config.hidden_act = "situ" if activation == "silu" else "silu"
+    block.config.activation_situ_beta = 7.0
+    block.config.activation_situ_linear_beta = 2.0
+    values = torch.randn(2, 5, 8)
+    expected = baseline.layers[0].block_sparse_moe(values)
+    assert swap_hf_moe_blocks(model) == 1
+    actual = model.layers[0].block_sparse_moe(values)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_kimi_plan_rejects_nonuniform_live_activation():
+    model = make_model(activation="situ")
+    model.layers[0].block_sparse_moe.experts[1].act_fn.beta = 7.0
+    with pytest.raises(UnsupportedCombinationError, match="uniform expert activations"):
+        resolve_ep_plan(model)
+
+
+def test_kimi_conversion_consumes_instantiated_router_math():
+    torch.manual_seed(19)
+    model = make_model()
+    baseline = deepcopy(model)
+    assert swap_hf_moe_blocks(baseline) == 1
+    block = model.layers[0].block_sparse_moe
+    # Editing config does not edit the live native gate. Conversion must not
+    # reinterpret that edit as a request to change routing mathematics.
+    block.config.moe_router_activation_func = "softmax"
+    block.config.routed_scaling_factor = 3.0
+    block.config.moe_renormalize = not block.gate.moe_renormalize
+    block.config.num_expert_group = 1
+    block.config.topk_group = 1
+    values = torch.randn(2, 5, 8, requires_grad=True)
+    expected = baseline.layers[0].block_sparse_moe(values)
+    expected_gradient = torch.autograd.grad(expected.square().sum(), values)[0]
+    assert swap_hf_moe_blocks(model) == 1
+    actual_values = values.detach().clone().requires_grad_()
+    actual = model.layers[0].block_sparse_moe(actual_values)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    observed_gradient = torch.autograd.grad(actual.square().sum(), actual_values)[0]
+    torch.testing.assert_close(observed_gradient, expected_gradient)
+    assert observed_gradient.count_nonzero()
+
+
+@pytest.mark.parametrize("change", ["scale", "top_k", "activation", "latent_norm"])
+def test_kimi_execution_rejects_changed_math_after_resolution(monkeypatch, change):
+    model = make_model(activation="situ", latent=True)
+    plan = resolve_ep_plan(model)
+    block = model.layers[0].block_sparse_moe
+    if change == "scale":
+        block.gate.routed_scaling_factor = 3.0
+    elif change == "top_k":
+        block.gate.top_k = 1
+    elif change == "activation":
+        for expert in block.experts:
+            expert.act_fn.beta = 7.0
+    else:
+        block.routed_expert_norm.variance_epsilon = 0.5
+
+    def reject(*args, **kwargs):
+        raise AssertionError("Stale math must fail before conversion allocation")
+
+    monkeypatch.setattr(torch, "empty", reject)
+    with pytest.raises(ValueError, match="Stale EP Kimi mathematics"):
+        swap_hf_moe_blocks(model, resolved_plan=plan)
+    assert model.layers[0].block_sparse_moe is block
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("top_k", 5),
+        ("num_expert_group", 3),
+        ("topk_group", 0),
+        ("moe_router_activation_func", "unknown"),
+    ],
+)
+def test_kimi_plan_validates_live_router_geometry_before_allocation(
+    monkeypatch, name, value
+):
+    model = make_model()
+    setattr(model.layers[0].block_sparse_moe.gate, name, value)
+    rng = torch.get_rng_state().clone()
+
+    def reject(*args, **kwargs):
+        raise AssertionError("Invalid router geometry must fail before allocation")
+
+    monkeypatch.setattr(torch, "empty", reject)
+    with pytest.raises(ValueError, match="Kimi"):
+        resolve_ep_plan(model)
+    assert torch.equal(torch.get_rng_state(), rng)
+
+
+def test_kimi_revalidates_all_planned_targets_before_first_conversion(monkeypatch):
+    model = make_model()
+    model.layers.append(deepcopy(model.layers[0]))
+    plan = resolve_ep_plan(model)
+    originals = tuple(layer.block_sparse_moe for layer in model.layers)
+    # Config mutation is not a tensor/module mutation and leaves the live gate
+    # snapshot unchanged, but still invalidates the conversion's count contract.
+    originals[1].config.num_experts = 8
+    rng = torch.get_rng_state().clone()
+
+    def reject(*args, **kwargs):
+        raise AssertionError("All targets must be validated before any allocation")
+
+    monkeypatch.setattr(torch, "empty", reject)
+    with pytest.raises(ValueError, match="router and expert count must agree"):
+        swap_hf_moe_blocks(model, resolved_plan=plan)
+    assert all(
+        layer.block_sparse_moe is original
+        for layer, original in zip(model.layers, originals, strict=True)
+    )
+    assert torch.equal(torch.get_rng_state(), rng)
+
+
+@pytest.mark.parametrize(
+    "alias", ["expert", "external_parameter", "buffer", "same_tensor_buffer"]
+)
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_kimi_plan_rejects_distinct_tensor_storage_aliases(monkeypatch, alias, device):
+    with torch.device(device):
+        model = make_model()
+    block = model.layers[0].block_sparse_moe
+    weight = block.experts[0].w1.weight
+    if alias == "expert":
+        block.experts[1].w1.weight = nn.Parameter(weight.detach())
+    elif alias == "external_parameter":
+        model.register_parameter("storage_alias", nn.Parameter(weight.detach()))
+    elif alias == "buffer":
+        model.register_buffer("storage_alias", weight.detach())
+    else:
+        model.register_buffer("storage_alias", weight)
+    rng = torch.get_rng_state().clone()
+
+    def reject(*args, **kwargs):
+        raise AssertionError("Storage aliases must fail before conversion allocation")
+
+    monkeypatch.setattr(torch, "empty", reject)
+    with pytest.raises(UnsupportedCombinationError, match="storage"):
+        resolve_ep_plan(model)
+    assert torch.equal(torch.get_rng_state(), rng)
+
+
+@pytest.mark.parametrize("change", ["rank", "width", "bias", "count"])
+def test_kimi_plan_validates_router_storage_before_allocation(monkeypatch, change):
+    model = make_model()
+    gate = model.layers[0].block_sparse_moe.gate
+    if change == "rank":
+        gate.weight = nn.Parameter(torch.randn(4))
+    elif change == "width":
+        gate.weight = nn.Parameter(torch.randn(4, 7))
+    elif change == "bias":
+        gate.e_score_correction_bias = nn.Parameter(torch.zeros(1))
+    else:
+        gate.num_experts = 8
+    rng = torch.get_rng_state().clone()
+
+    def reject(*args, **kwargs):
+        raise AssertionError("Invalid router storage must fail before allocation")
+
+    monkeypatch.setattr(torch, "empty", reject)
+    with pytest.raises(ValueError, match="Kimi router"):
+        resolve_ep_plan(model)
+    assert torch.equal(torch.get_rng_state(), rng)
 
 
 def test_kimi_conversion_preserves_projection_dtypes():
@@ -184,14 +454,22 @@ def test_kimi_native_ep_format_loads_into_a_new_converted_model():
 
 
 def test_meta_kimi_conversion_reconstructs_empty_routing_counters():
-    from llmtuner.models.hf.materialization import materialize_meta_model
+    from llmtuner.memory.materialization import materialize_meta_model
 
     with torch.device("meta"):
         model = make_model(latent=True, shared=1)
         swap_hf_moe_blocks(model)
     block = model.layers[0].block_sparse_moe
     assert block.tokens_per_expert_E.is_meta
-    materialize_meta_model(model, torch.device("cpu"))
+    materialize_meta_model(
+        model,
+        torch.device("cpu"),
+        runtime_buffers={
+            (block, "tokens_per_expert_E"): torch.zeros(
+                4, dtype=block.tokens_per_expert_E.dtype
+            )
+        },
+    )
     assert block.tokens_per_expert_E.dtype == torch.float32
     assert torch.equal(block.tokens_per_expert_E, torch.zeros(4))
 
@@ -306,7 +584,8 @@ def test_kimi_gate_module_exclusion_keeps_moved_bias_outside_router(
 def test_kimi_conversion_rejects_zero_situ_beta_before_installation():
     model = make_model(activation="situ")
     source = model.layers[0].block_sparse_moe
-    source.config.activation_situ_beta = 0.0
+    for expert in source.experts:
+        expert.act_fn.beta = 0.0
     parameters = dict(model.named_parameters())
     with pytest.raises(ValueError, match="beta must be finite and positive"):
         swap_hf_moe_blocks(model)

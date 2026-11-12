@@ -16,7 +16,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
 from llmtuner.components.checkpointer.core.state_adaptation import adapt_hf_model_state
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 
 
 def main():
@@ -26,7 +26,7 @@ def main():
         rank = dist.get_rank()
         prefix = "model.layers.0.block_sparse_moe."
         for to_hf, failing_rank in product((True, False), (0, 1)):
-            adapter = HFTransformerStateDictAdapter(
+            adapter = ModelStateDictAdapter(
                 SimpleNamespace(model_type="kimi_linear", num_experts=2),
                 None,
                 kimi_expert_parallel=True,
@@ -61,17 +61,15 @@ def main():
                 assert isinstance(caught, RuntimeError), caught
                 assert str(caught) == "Kimi checkpoint mapping failed on another rank"
             result = operation(healthy)
-            expected = (
-                {k.removeprefix("model."): v for k, v in individual.items()}
-                if to_hf
-                else {"model." + k: v for k, v in grouped.items()}
-            )
+            expected = individual if to_hf else grouped
             torch.testing.assert_close(result, expected, rtol=0, atol=0)
             dist.barrier()
             if rank == 0:
                 print(f"PASS {to_hf=} {failing_rank=}", flush=True)
-        for fault, failing_rank in product(("shape", "duplicate"), (0, 1)):
-            adapter = HFTransformerStateDictAdapter(
+        for fault, failing_rank in product(
+            ("shape", "duplicate", "dtype", "device", "geometry"), (0, 1)
+        ):
+            adapter = ModelStateDictAdapter(
                 SimpleNamespace(model_type="kimi_linear", num_experts=2),
                 None,
                 kimi_expert_parallel=True,
@@ -84,6 +82,14 @@ def main():
             if rank == failing_rank:
                 if fault == "shape":
                     state[prefix + "experts.1.w1.weight"] = torch.ones(4, 3)
+                elif fault == "dtype":
+                    state[prefix + "experts.1.w1.weight"] = torch.ones(2, 3).double()
+                elif fault == "device":
+                    state[prefix + "experts.1.w1.weight"] = torch.ones(
+                        2, 3, device="meta"
+                    )
+                elif fault == "geometry":
+                    adapter.model_config.num_experts = 0
                 else:
                     state[prefix + "experts.00.w1.weight"] = torch.zeros(2, 3)
             caught = None
@@ -97,23 +103,28 @@ def main():
             if rank == failing_rank:
                 assert isinstance(caught, ValueError), caught
                 assert (
-                    "shapes disagree" if fault == "shape" else "duplicate expert index"
+                    {
+                        "shape": "shapes disagree",
+                        "duplicate": "duplicate expert index",
+                        "dtype": "dtype/device disagree",
+                        "device": "dtype/device disagree",
+                        "geometry": "num_experts must be a positive integer",
+                    }[fault]
                 ) in str(caught)
             else:
                 assert isinstance(caught, RuntimeError), caught
                 assert str(caught) == "Kimi checkpoint mapping failed on another rank"
+            adapter.model_config.num_experts = 2
             result = adapter.from_hf(healthy)
             expected = {
-                "model." + prefix + "routed_experts.inner_experts.w1_EFD": torch.ones(
-                    2, 2, 3
-                )
+                prefix + "routed_experts.inner_experts.w1_EFD": torch.ones(2, 2, 3)
             }
             torch.testing.assert_close(result, expected, rtol=0, atol=0)
             dist.barrier()
             if rank == 0:
                 print(f"PASS {fault=} {failing_rank=}", flush=True)
         mesh = init_device_mesh("cpu", (2,))
-        adapter = HFTransformerStateDictAdapter(
+        adapter = ModelStateDictAdapter(
             SimpleNamespace(model_type="kimi_linear", num_experts=2),
             None,
             kimi_expert_parallel=True,
@@ -127,7 +138,7 @@ def main():
             }
             exported = adapter.to_hf(grouped)
             for index in range(2):
-                value = exported[f"layers.0.block_sparse_moe.experts.{index}.w1.weight"]
+                value = exported[f"{prefix}experts.{index}.w1.weight"]
                 assert isinstance(value, DTensor)
                 torch.testing.assert_close(
                     value.full_tensor(), dense[index], rtol=0, atol=0

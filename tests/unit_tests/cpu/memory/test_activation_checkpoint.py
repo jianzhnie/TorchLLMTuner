@@ -1,6 +1,6 @@
 """Activation checkpointing: wiring, bitwise equivalence, and recompute proof.
 
-These run on a real ``HFTransformerModel`` over a tiny offline LLaMA (and, for
+These run on a real explicit Qwen3 over a tiny dense configuration (and, for
 the selective path, a tiny offline Qwen3MoE), on CPU with no process group --
 AC is per-layer wrapping, not a distributed feature; the distributed
 composition is pinned in ``tests/integration_tests/ac_equivalence.py``
@@ -45,7 +45,7 @@ import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointWrapper,
 )
-from torch.utils.checkpoint import CheckpointPolicy
+from torch.utils.checkpoint import CheckpointPolicy, DefaultDeviceType
 
 from llmtuner.config import (
     MemoryBudgetACConfig,
@@ -63,9 +63,9 @@ from llmtuner.memory.activation_checkpoint import (
     selective_policy,
 )
 from llmtuner.memory.remat_regions import region_names
-from llmtuner.models.hf.factory import build_model_config
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.parallelize import parallelize_hf_transformers
+from llmtuner.models.configuration import build_model_config
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.parallel.parallelize import parallelize_model
 
 _VOCAB = 32
 _HIDDEN = 16
@@ -73,11 +73,22 @@ _SEQ = 24
 _NUM_LAYERS = 3
 
 
-def _model(seed: int = 0) -> HFTransformerModel:
+@pytest.fixture(scope="module", autouse=True)
+def cpu_checkpoint_default_device():
+    """CPU tensors must not trigger a vendor's default autocast device probe."""
+    previous = DefaultDeviceType.get_device_type()
+    DefaultDeviceType.set_device_type("cpu")
+    try:
+        yield
+    finally:
+        DefaultDeviceType.set_device_type(previous)
+
+
+def _model(seed: int = 0) -> Qwen3MoeForCausalLM:
     """Deterministically initialized tiny decoder; identical across calls."""
     torch.manual_seed(seed)
     config = build_model_config(
-        "llama",
+        "qwen3_moe",
         seq_len=_SEQ,
         arch_overrides={
             "vocab_size": _VOCAB,
@@ -86,9 +97,11 @@ def _model(seed: int = 0) -> HFTransformerModel:
             "num_hidden_layers": _NUM_LAYERS,
             "num_attention_heads": 2,
             "num_key_value_heads": 2,
+            "head_dim": 8,
+            "num_experts": 0,
         },
     )
-    return HFTransformerModel(config)
+    return Qwen3MoeForCausalLM(config)
 
 
 def _batch() -> tuple[torch.Tensor, torch.Tensor]:
@@ -97,9 +110,9 @@ def _batch() -> tuple[torch.Tensor, torch.Tensor]:
     return ids, torch.arange(_SEQ)
 
 
-def _loss_and_backward(model: HFTransformerModel) -> torch.Tensor:
+def _loss_and_backward(model: Qwen3MoeForCausalLM) -> torch.Tensor:
     ids, positions = _batch()
-    logits = model(ids, positions=positions)
+    logits = model(ids, positions=positions).logits
     logits.sum().backward()
     return logits.detach()
 
@@ -346,9 +359,9 @@ def test_full_ac_runs_on_the_selective_context(
     assert all(policy is ac_mod.full_policy for policy in seen)
 
 
-def test_parallelize_hf_transformers_wires_ac_before_fsdp() -> None:
+def test_parallelize_model_wires_ac_before_fsdp() -> None:
     """The one entry point applies AC on the plain (single-device) path too."""
-    model = parallelize_hf_transformers(
+    model = parallelize_model(
         _model(),
         cfg=ParallelConfig(),
         mesh=None,
@@ -359,13 +372,13 @@ def test_parallelize_hf_transformers_wires_ac_before_fsdp() -> None:
     assert all(isinstance(layer, CheckpointWrapper) for layer in model.layers)
 
 
-def test_parallelize_hf_transformers_threads_selective_ac() -> None:
+def test_parallelize_model_threads_selective_ac() -> None:
     """``selective_ac`` reaches ``apply_ac`` through the entry point.
 
     Without this, a caller selecting ``selective`` would get the loud "needs
     its config" error -- so this pins the plumbing, not just the mode string.
     """
-    model = parallelize_hf_transformers(
+    model = parallelize_model(
         _model(),
         cfg=ParallelConfig(),
         mesh=None,
@@ -424,7 +437,7 @@ def test_the_pp_path_checkpoints_every_stage_chunk(monkeypatch) -> None:
         lambda model, cfg, parallel_dims, chunked_loss_num_chunks: model,
     )
 
-    setup = parallelize_hf_transformers(
+    setup = parallelize_model(
         _model(),
         cfg=ParallelConfig(),
         mesh=None,
@@ -457,7 +470,7 @@ def test_the_pp_path_is_a_no_op_when_ac_is_off(monkeypatch) -> None:
         lambda model, cfg, parallel_dims, chunked_loss_num_chunks: model,
     )
 
-    setup = parallelize_hf_transformers(
+    setup = parallelize_model(
         _model(),
         cfg=ParallelConfig(),
         mesh=None,
@@ -582,7 +595,7 @@ def test_memory_budget_requires_compile_through_the_entry_point() -> None:
     """The entry point threads ``compile`` into the guard, so selecting the
     mode without compile fails at parallelize time, not at first backward."""
     with pytest.raises(ValueError, match="requires compile"):
-        parallelize_hf_transformers(
+        parallelize_model(
             _model(),
             cfg=ParallelConfig(),
             mesh=None,
@@ -626,7 +639,7 @@ def test_full_ac_matches_uncheckpointed_bitwise() -> None:
 # -- recompute proof -----------------------------------------------------------
 
 
-def _forward_counts(model: HFTransformerModel) -> list[int]:
+def _forward_counts(model: Qwen3MoeForCausalLM) -> list[int]:
     """One forward+backward, counting each inner layer's forward invocations."""
     counts = [0] * len(model.layers)
 
@@ -777,12 +790,12 @@ def test_selective_policy_normalizes_linear_weight_to_mm_order() -> None:
 _MOE_SEQ = 32
 
 
-def _moe_model(seed: int = 0) -> HFTransformerModel:
+def _moe_model(seed: int = 0) -> Qwen3MoeForCausalLM:
     """A tiny offline Qwen3MoE -- its router runs the topk the policy omits."""
     from transformers import AutoConfig
 
     torch.manual_seed(seed)
-    return HFTransformerModel(
+    return Qwen3MoeForCausalLM(
         AutoConfig.for_model(
             "qwen3_moe",
             vocab_size=128,
@@ -802,9 +815,9 @@ def _moe_model(seed: int = 0) -> HFTransformerModel:
     )
 
 
-def _moe_loss_and_backward(model: HFTransformerModel) -> torch.Tensor:
+def _moe_loss_and_backward(model: Qwen3MoeForCausalLM) -> torch.Tensor:
     ids = torch.randint(128, (_MOE_SEQ,), generator=torch.Generator().manual_seed(7))
-    logits = model(ids, positions=torch.arange(_MOE_SEQ))
+    logits = model(ids, positions=torch.arange(_MOE_SEQ)).logits
     logits.sum().backward()
     return logits.detach()
 
@@ -1040,8 +1053,8 @@ def test_checkpoint_preserves_multiple_pending_decoder_forwards(mode, backward_o
         for index, length in enumerate((_SEQ, _SEQ - 3)):
             inputs = (ids[:length] + index) % _VOCAB
             positions = torch.arange(length)
-            expected = reference(inputs, positions=positions)
-            output = actual(inputs, positions=positions)
+            expected = reference(inputs, positions=positions).logits
+            output = actual(inputs, positions=positions).logits
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
             expected_losses.append(expected.square().sum())
             actual_losses.append(output.square().sum())

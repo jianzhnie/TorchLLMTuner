@@ -39,9 +39,9 @@ def test_defaults_reproduce_torch_adamw() -> None:
     cfg = OptimizerConfig()
     param = torch.nn.Parameter(torch.zeros(2))
     built = torch.optim.AdamW(
-        [param], lr=cfg.learning_rate, betas=cfg.betas, eps=cfg.eps
+        [param], lr=cfg.learning_rate, betas=cfg.betas, eps=cfg.eps, foreach=False
     )
-    reference = torch.optim.AdamW([param])
+    reference = torch.optim.AdamW([param], foreach=False)
 
     assert built.param_groups[0]["betas"] == reference.param_groups[0]["betas"]
     assert built.param_groups[0]["eps"] == reference.param_groups[0]["eps"]
@@ -102,6 +102,7 @@ def test_flags_parse_and_the_flat_view_reaches_them() -> None:
         weight_decay=cfg.weight_decay,
         betas=cfg.betas,
         eps=cfg.eps,
+        foreach=False,
     ).param_groups[0]
     assert tuple(group["betas"]) == (0.9, 0.95)
     assert group["eps"] == 1e-6
@@ -129,7 +130,7 @@ def test_betas_actually_changes_the_trajectory() -> None:
     def trajectory(betas: tuple[float, float]) -> list[float]:
         torch.manual_seed(0)
         model = torch.nn.Linear(8, 8)
-        opt = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=betas)
+        opt = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=betas, foreach=False)
         losses = []
         for _ in range(4):
             loss = model(torch.ones(2, 8)).pow(2).mean()

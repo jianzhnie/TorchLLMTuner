@@ -5,7 +5,7 @@ from transformers import AutoConfig
 
 from examples.deepseek_v4_pro.train import build_argument_parser, build_config
 from llmtuner.errors import ConfigError
-from llmtuner.models.hf.factory import build_model_config_for
+from llmtuner.models.configuration import build_model_config_for
 
 
 def example_args(tmp_path, *options):

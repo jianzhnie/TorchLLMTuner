@@ -5,6 +5,7 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel import hf_inspection
+from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
 
 
 def small_config():
@@ -46,10 +47,6 @@ def test_qwen3_ep_never_uses_legacy_structure_or_source_probes(monkeypatch):
     assert hf_inspection.resolve_shared_expert(block) == ("shared_expert", None)
     assert not hf_inspection.returns_router_logits(block)
 
-    from llmtuner.parallel.expert_parallel.model_replacement import (
-        swap_hf_moe_blocks,
-    )
-
     assert swap_hf_moe_blocks(model.model) == 1
     plan = model.model.ep_parallel_plan
     assert plan.stage == "ep"
@@ -64,21 +61,3 @@ def test_qwen3_contract_rejects_inconsistent_bound_structure():
     block._modules.pop("gate")
     with pytest.raises(ValueError, match="router"):
         hf_inspection.is_hf_moe_block(block)
-
-
-def test_ep_only_run_uses_model_capability_validation():
-    from types import SimpleNamespace
-
-    from llmtuner.config.parallel_config import ParallelConfig
-    from llmtuner.models.hf.model import HFTransformerModel
-    from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
-
-    config = small_config()
-    config.num_experts = 3
-    model = HFTransformerModel(config)
-    with pytest.raises(ValueError, match="Expert count.*EP degree"):
-        apply_ep(
-            model,
-            ParallelConfig(expert_parallel_size=2),
-            ep_group=SimpleNamespace(size=lambda: 2),
-        )

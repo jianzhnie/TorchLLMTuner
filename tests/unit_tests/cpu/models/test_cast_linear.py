@@ -10,6 +10,8 @@ the tests below pin, because every one of them is a silent-breakage candidate
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from tests.caps import require_env
 
 require_env("spmd_types")
@@ -19,18 +21,27 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+    Qwen3_5MoeTextConfig,
+)
 
 from llmtuner.models.common.cast_linear import (
     CastLinear,
     build_cast_linear,
+    build_lm_head,
 )
-from llmtuner.models.hf.factory import build_model_config
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import build_model_config, resolve_model_class
+from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from tests.unit_tests.cpu.models.test_owned_family_construction import (
+    small_config,
+    text_config,
+)
 
 
 def _tiny_qwen3_config(compute_dtype: str | None = None):
     config = build_model_config(
-        "qwen3",
+        "qwen3_moe",
         seq_len=64,
         arch_overrides={
             "vocab_size": 128,
@@ -39,6 +50,10 @@ def _tiny_qwen3_config(compute_dtype: str | None = None):
             "num_hidden_layers": 2,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
+            "head_dim": 8,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 16,
         },
     )
     config.compute_dtype = compute_dtype
@@ -138,17 +153,15 @@ def test_swap_rejects_a_non_linear_head() -> None:
 
 def test_unknown_compute_dtype_name_fails_loudly() -> None:
     with pytest.raises(ValueError, match="compute_dtype"):
-        HFTransformerModel(_tiny_qwen3_config("float8_e4m3fn"))
+        Qwen3MoeForCausalLM(_tiny_qwen3_config("float8_e4m3fn"))
 
 
-# -- the wrapper wiring ---------------------------------------------------------
+# -- explicit model construction ----------------------------------------------
 
 
-def test_wrapper_applies_the_cast_and_logits_come_out_in_compute_dtype() -> None:
-    # Exercise the head directly rather than through ``forward``: the full
-    # forward builds a flex BlockMask, which the CPU test stubs cannot run --
-    # the cast lives entirely inside the head, so nothing is lost.
-    model = HFTransformerModel(_tiny_qwen3_config("float32")).to(torch.bfloat16)
+def test_model_applies_the_cast_and_logits_come_out_in_compute_dtype() -> None:
+    # Check the output projection independently of attention backend selection.
+    model = Qwen3MoeForCausalLM(_tiny_qwen3_config("float32")).to(torch.bfloat16)
 
     assert isinstance(model.lm_head, CastLinear)
     hidden = torch.randn(16, 32, dtype=torch.bfloat16)
@@ -157,9 +170,9 @@ def test_wrapper_applies_the_cast_and_logits_come_out_in_compute_dtype() -> None
     assert torch.equal(logits, F.linear(hidden.float(), model.lm_head.weight.float()))
 
 
-def test_wrapper_state_dict_keys_are_invariant_under_the_cast() -> None:
-    keys_plain = set(HFTransformerModel(_tiny_qwen3_config()).state_dict())
-    keys_cast = set(HFTransformerModel(_tiny_qwen3_config("float32")).state_dict())
+def test_model_state_dict_keys_are_invariant_under_the_cast() -> None:
+    keys_plain = set(Qwen3MoeForCausalLM(_tiny_qwen3_config()).state_dict())
+    keys_cast = set(Qwen3MoeForCausalLM(_tiny_qwen3_config("float32")).state_dict())
     assert keys_cast == keys_plain
 
 
@@ -168,9 +181,9 @@ def test_default_off_is_unchanged() -> None:
     the built model bitwise-match one constructed before the feature existed
     (same seed, same parameters, same head)."""
     torch.manual_seed(7)
-    baseline = HFTransformerModel(_tiny_qwen3_config()).eval()
+    baseline = Qwen3MoeForCausalLM(_tiny_qwen3_config()).eval()
     torch.manual_seed(7)
-    defaulted = HFTransformerModel(_tiny_qwen3_config()).eval()
+    defaulted = Qwen3MoeForCausalLM(_tiny_qwen3_config()).eval()
 
     assert type(defaulted.lm_head) is nn.Linear
     for (name_a, tensor_a), (name_b, tensor_b) in zip(
@@ -212,3 +225,68 @@ def test_cast_linear_preserves_compute_dtype_under_autocast():
     assert torch.equal(x.grad, expected_input_grad)
     assert torch.equal(layer.weight.grad, expected_weight_grad)
     assert torch.equal(layer.bias.grad, expected_bias_grad)
+
+
+@pytest.mark.parametrize("family", ["qwen3", "qwen35", "deepseek", "kimi"])
+@pytest.mark.parametrize("tied", [False, True])
+def test_explicit_family_head_policy_preserves_rng_parameters_and_ties(family, tied):
+    if family == "qwen3":
+        config = _tiny_qwen3_config()
+    elif family == "qwen35":
+        config = text_config(Qwen3_5MoeTextConfig)
+    elif family == "deepseek":
+        config = small_config()
+    else:
+        config = KimiLinearConfig(
+            vocab_size=32,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            linear_attn_config={
+                "kda_layers": [1],
+                "full_attn_layers": [],
+                "head_dim": 4,
+                "num_heads": 2,
+                "short_conv_kernel_size": 3,
+            },
+        )
+    config.tie_word_embeddings = tied
+    constructor = resolve_model_class(config)
+    torch.manual_seed(59)
+    baseline = constructor(deepcopy(config))
+    rng = torch.get_rng_state().clone()
+    config.compute_dtype = "float32"
+    torch.manual_seed(59)
+    actual = constructor(config)
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert type(baseline.lm_head) is nn.Linear
+    assert isinstance(actual.lm_head, CastLinear)
+    assert actual.enable_weight_tying is tied
+    assert baseline.state_dict().keys() == actual.state_dict().keys()
+    for name, expected in baseline.state_dict().items():
+        torch.testing.assert_close(actual.state_dict()[name], expected, rtol=0, atol=0)
+    actual.to(torch.bfloat16)
+    assert actual.enable_weight_tying is tied
+    assert actual.lm_head.weight.dtype == torch.bfloat16
+    hidden = torch.randn(
+        3, config.hidden_size, dtype=torch.bfloat16, requires_grad=True
+    )
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        logits = actual.lm_head(hidden)
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(
+        logits, F.linear(hidden.float(), actual.lm_head.weight.float()), rtol=0, atol=0
+    )
+    logits.square().sum().backward()
+    assert hidden.grad is not None and hidden.grad.count_nonzero() > 0
+    assert actual.lm_head.weight.grad.dtype == torch.bfloat16
+    assert actual.lm_head.weight.grad.count_nonzero() > 0
+
+
+@pytest.mark.parametrize("compute_dtype", ["float8_e4m3fn", "float64", False, 1, []])
+def test_head_policy_rejects_invalid_dtype_before_rng_change(compute_dtype):
+    before = torch.get_rng_state().clone()
+    with pytest.raises(ValueError, match="compute_dtype"):
+        build_lm_head(8, 16, compute_dtype=compute_dtype)
+    assert torch.equal(torch.get_rng_state(), before)

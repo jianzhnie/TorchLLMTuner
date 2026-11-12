@@ -17,7 +17,7 @@ from llmtuner.config import LRSchedulerConfig
 def test_scheduler_restore_preserves_tensor_learning_rate_identity():
     learning_rate = torch.tensor(0.4)
     optimizer = torch.optim.AdamW(
-        [torch.nn.Parameter(torch.zeros(2))], lr=learning_rate
+        [torch.nn.Parameter(torch.zeros(2))], lr=learning_rate, foreach=False
     )
     scheduler = LRSchedulersContainer(
         [optimizer], lr_lambda=lambda step: 1.0 / (step + 1), total_steps=10
@@ -34,7 +34,7 @@ def test_scheduler_restore_preserves_tensor_learning_rate_identity():
 
 def _optimizer(lr: float = 1.0) -> torch.optim.Optimizer:
     parameter = torch.nn.Parameter(torch.zeros(2, 2))
-    return torch.optim.AdamW([parameter], lr=lr)
+    return torch.optim.AdamW([parameter], lr=lr, foreach=False)
 
 
 def test_checkpoint_rejects_independently_advanced_inner_schedulers():
@@ -415,7 +415,7 @@ def test_scheduler_restore_validates_all_groups_before_updating_any_scheduler():
 
 def test_scheduler_rejects_duplicate_optimizer_before_changing_learning_rate():
     parameter = torch.nn.Parameter(torch.ones(1))
-    optimizer = torch.optim.SGD([parameter], lr=0.2)
+    optimizer = torch.optim.SGD([parameter], lr=0.2, foreach=False)
     with pytest.raises(ValueError, match="only once"):
         LRSchedulersContainer(
             [optimizer, optimizer], lr_lambda=lambda step: 0.5, total_steps=10
@@ -426,7 +426,9 @@ def test_scheduler_rejects_duplicate_optimizer_before_changing_learning_rate():
 
 @pytest.mark.parametrize("decay_ratio", [0.0, 1.0])
 def test_completed_schedule_rejects_extra_step_without_mutation(decay_ratio):
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=1.0)
+    optimizer = torch.optim.SGD(
+        [torch.nn.Parameter(torch.ones(1))], lr=1.0, foreach=False
+    )
     scheduler = build_lr_scheduler(
         LRSchedulerConfig(decay_ratio=decay_ratio),
         optimizers=[optimizer],

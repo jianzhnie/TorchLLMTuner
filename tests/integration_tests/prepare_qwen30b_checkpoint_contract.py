@@ -21,9 +21,8 @@ from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from examples.train_qwen3_30b_npu import qwen3_30b_npu_config
 from llmtuner.components.optimizer.state_dict import get_flat_optim_state_dict
 from llmtuner.datasets.loader_builder import build_dataloader
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.models.configuration import build_model_config_for, resolve_model_class
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_targets
 from llmtuner.utils.module_names import canonical_fqn
 from tests.integration_tests.audit_dcp_checkpoint import AuditContract, TensorSpec
@@ -62,7 +61,7 @@ def project_joint_global_schema(model, parallel):
     """Global projection of production's disjoint TP/EP chunk transform.
 
     resolve_tp_targets explicitly defers routed experts to EP. Dense TP changes
-    slices, not FQNs; swap_hf_moe_blocks performs the actual router/expert rename.
+    slices, not FQNs; swap_moe_blocks performs the actual router/expert rename.
     With ep_group=None it retains all experts, exactly the logical EP extent.
     No collective, local shard allocation, checkpoint read, or NPU is needed.
     """
@@ -71,17 +70,22 @@ def project_joint_global_schema(model, parallel):
         raise ValueError("Expected dense TP targets and experts deferred to EP")
     ownership = {}
     for path, module, spec in targets:
+        if spec.kind not in {"colwise", "rowwise"}:
+            continue  # Replicated targets have no checkpoint shard axis.
         axis = 0 if spec.kind == "colwise" else 1
-        if module.weight.shape[axis] % 2:
+        if module.weight.shape[axis] % parallel.tp_size:
             raise ValueError(f"Nondivisible TP target: {path}")
-        ownership[canonical_fqn(f"{path}.weight")] = {"axis": axis, "degree": 2}
-    swapped = swap_hf_moe_blocks(model, tp_enabled=True, token_dispatcher="alltoall")
+        ownership[canonical_fqn(f"{path}.weight")] = {
+            "axis": axis,
+            "degree": parallel.tp_size,
+        }
+    swapped = swap_moe_blocks(model, tp_enabled=True, token_dispatcher="alltoall")
     for name, parameter in model.named_parameters():
         if ".routed_experts.inner_experts." in name:
             key = canonical_fqn(name)
-            if key in ownership or parameter.shape[0] % 4:
+            if key in ownership or parameter.shape[0] % parallel.ep_size:
                 raise ValueError(f"Invalid disjoint expert ownership: {name}")
-            ownership[key] = {"axis": 0, "degree": 4}
+            ownership[key] = {"axis": 0, "degree": parallel.ep_size}
     return swapped, ownership
 
 
@@ -96,7 +100,8 @@ def prepare_contract(model_path: str, dataset_path: str):
     torch.set_default_dtype(torch.bfloat16)
     try:
         with torch.device("meta"):
-            model = HFTransformerModel(build_model_config_for(cfg))
+            config = build_model_config_for(cfg)
+            model = resolve_model_class(config)(config)
     finally:
         torch.set_default_dtype(previous)
     if len(model.layers) != 48:
@@ -208,7 +213,7 @@ def main() -> None:
         "recipe_environment": RECIPE_ENV,
         "chunk_ownership": ownership,
         "projection": (
-            "production resolve_tp_targets + full-expert swap_hf_moe_blocks; "
+            "production resolve_tp_targets + full-expert swap_moe_blocks; "
             "joint chunk transforms retain global FQNs/shapes"
         ),
         "source_hashes": {

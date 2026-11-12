@@ -1,27 +1,50 @@
 """Real DCP storage migrations between Kimi individual and grouped experts."""
 
+from functools import partial
+
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
-from llmtuner.components.checkpointer.hf.kimi_layout import load_changed_kimi_layout
+from llmtuner.components.checkpointer.hf.kimi_layout import (
+    load_changed_kimi_layout,
+    source_destinations,
+)
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.state_dict import (
     get_flat_optim_state_dict,
     init_optim_state,
     load_flat_optim_state_dict,
 )
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
 from llmtuner.models.kimi.kimi_k3.checkpoint import convert_kimi_optimizer_state
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from tests.unit_tests.cpu.parallel.test_kimi_conversion import make_model
+
+# These fixtures deliberately exercise the historical wrapper state prefix.
+legacy_adapter = partial(ModelStateDictAdapter, model_prefix="model.")
+
+
+@pytest.mark.parametrize(
+    "category",
+    ["optimizer", "ema", "lr_scheduler", "dataloader", "train_state", "rng_state"],
+)
+def test_unrequested_tensor_training_category_is_not_model_state(tmp_path, category):
+    dcp.save(
+        {"lm_head.weight": torch.ones(2, 3), category: torch.tensor(7)},
+        checkpoint_id=tmp_path,
+    )
+    metadata = dcp.FileSystemReader(tmp_path).read_metadata()
+    flat, selected = source_destinations(metadata, {"model": object()})
+    assert set(flat) == {"lm_head.weight"}
+    assert selected == {"lm_head.weight": ("lm_head.weight",)}
 
 
 class OptimizerState:
     def __init__(self, model, *, amsgrad=True):
         self.optimizer = torch.optim.AdamW(
-            list(model.named_parameters()), lr=0.01, amsgrad=amsgrad
+            list(model.named_parameters()), lr=0.01, amsgrad=amsgrad, foreach=False
         )
         init_optim_state(self.optimizer)
 
@@ -41,12 +64,14 @@ def test_dcp_kimi_layout_restores_weights_moments_and_next_update(
     def build():
         wrapper = torch.nn.Module()
         wrapper.model = make_model(latent=True, shared=1)
+        wrapper.lm_head = torch.nn.Linear(8, 16, bias=False)
+        wrapper.register_buffer("output_scale", torch.tensor(1.25))
         return wrapper
 
     source = build()
     config = source.model.layers[0].block_sparse_moe.config
     if source_grouped:
-        swap_hf_moe_blocks(source.model)
+        swap_moe_blocks(source.model)
     source_optimizer = OptimizerState(source)
     inputs = torch.randn(1, 3, 8)
     source.model.layers[0].block_sparse_moe(inputs).square().sum().backward()
@@ -67,12 +92,10 @@ def test_dcp_kimi_layout_restores_weights_moments_and_next_update(
     dcp.save(state, checkpoint_id=tmp_path)
     target = build()
     if not source_grouped:
-        swap_hf_moe_blocks(target.model)
+        swap_moe_blocks(target.model)
     target_optimizer = OptimizerState(target)
     target_ema = EMA(model_parts=[target], decay=0.5)
-    adapter = HFTransformerStateDictAdapter(
-        config, None, kimi_expert_parallel=not source_grouped
-    )
+    adapter = legacy_adapter(config, None, kimi_expert_parallel=not source_grouped)
     assert load_changed_kimi_layout(
         str(tmp_path),
         states={
@@ -85,6 +108,10 @@ def test_dcp_kimi_layout_restores_weights_moments_and_next_update(
     expected_ema = convert_kimi_optimizer_state(
         source_ema.state_dict(), num_experts=4, to_hf=source_grouped
     )
+    torch.testing.assert_close(
+        target.lm_head.weight, source.lm_head.weight, atol=0, rtol=0
+    )
+    torch.testing.assert_close(target.output_scale, source.output_scale, atol=0, rtol=0)
     actual_ema = target_ema.state_dict()
     assert actual_ema.keys() == expected_ema.keys()
     for key in expected_ema:
@@ -119,9 +146,9 @@ def test_invalid_cross_layout_model_leaves_target_weights_intact(tmp_path, corru
     dcp.save(saved, checkpoint_id=tmp_path)
     target = torch.nn.Module()
     target.model = make_model(latent=True, shared=1)
-    swap_hf_moe_blocks(target.model)
+    swap_moe_blocks(target.model)
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = HFTransformerStateDictAdapter(config, None, kimi_expert_parallel=True)
+    adapter = legacy_adapter(config, None, kimi_expert_parallel=True)
     with pytest.raises(ValueError, match="missing keys|has shape"):
         load_changed_kimi_layout(
             str(tmp_path),
@@ -159,14 +186,14 @@ def test_invalid_cross_layout_training_state_preserves_model(
     dcp.save(saved, checkpoint_id=tmp_path)
     target = torch.nn.Module()
     target.model = make_model(latent=True, shared=1)
-    swap_hf_moe_blocks(target.model)
+    swap_moe_blocks(target.model)
     target_state = (
         OptimizerState(target)
         if category == "optimizer"
         else EMA(model_parts=[target], decay=0.5)
     )
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = HFTransformerStateDictAdapter(config, None, kimi_expert_parallel=True)
+    adapter = legacy_adapter(config, None, kimi_expert_parallel=True)
     with pytest.raises(ValueError, match="missing required key|has shape"):
         load_changed_kimi_layout(
             str(tmp_path),
@@ -198,10 +225,10 @@ def test_saved_amsgrad_validated_before_model_with_fresh_non_amsgrad(
     dcp.save(saved, checkpoint_id=tmp_path)
     target = torch.nn.Module()
     target.model = make_model(latent=True, shared=1)
-    swap_hf_moe_blocks(target.model)
+    swap_moe_blocks(target.model)
     target_state = OptimizerState(target, amsgrad=False)
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = HFTransformerStateDictAdapter(config, None, kimi_expert_parallel=True)
+    adapter = legacy_adapter(config, None, kimi_expert_parallel=True)
     with pytest.raises(ValueError, match="missing required key|has shape"):
         load_changed_kimi_layout(
             str(tmp_path),
@@ -222,17 +249,15 @@ def test_legacy_cross_layout_checkpoint_without_rng_restores_model(
     source.model = make_model(latent=True, shared=1)
     config = source.model.layers[0].block_sparse_moe.config
     if source_grouped:
-        swap_hf_moe_blocks(source.model)
+        swap_moe_blocks(source.model)
     dcp.save(dict(source.state_dict()), checkpoint_id=tmp_path)
     target = torch.nn.Module()
     target.model = make_model(latent=True, shared=1)
     if not source_grouped:
-        swap_hf_moe_blocks(target.model)
+        swap_moe_blocks(target.model)
     rng = RNGCheckpointState(torch.device("cpu"))
     rng_before = torch.get_rng_state().clone()
-    adapter = HFTransformerStateDictAdapter(
-        config, None, kimi_expert_parallel=not source_grouped
-    )
+    adapter = legacy_adapter(config, None, kimi_expert_parallel=not source_grouped)
     assert load_changed_kimi_layout(
         str(tmp_path),
         states={"model": ModelCheckpointState(target), "rng_state": rng},
@@ -258,7 +283,7 @@ def test_cross_layout_rng_missing_current_rank_rejected_before_model_copy(
     source.model = make_model(latent=True, shared=1)
     config = source.model.layers[0].block_sparse_moe.config
     if source_grouped:
-        swap_hf_moe_blocks(source.model)
+        swap_moe_blocks(source.model)
     rng = RNGCheckpointState(torch.device("cpu"))
     saved = dict(source.state_dict())
     saved["rng_state"] = {"rank_1": rng.state_dict()[rng.key]}
@@ -266,12 +291,10 @@ def test_cross_layout_rng_missing_current_rank_rejected_before_model_copy(
     target = torch.nn.Module()
     target.model = make_model(latent=True, shared=1)
     if not source_grouped:
-        swap_hf_moe_blocks(target.model)
+        swap_moe_blocks(target.model)
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
     rng_before = torch.get_rng_state().clone()
-    adapter = HFTransformerStateDictAdapter(
-        config, None, kimi_expert_parallel=not source_grouped
-    )
+    adapter = legacy_adapter(config, None, kimi_expert_parallel=not source_grouped)
     with pytest.raises(KeyError, match="rank_0"):
         load_changed_kimi_layout(
             str(tmp_path),
@@ -301,7 +324,7 @@ def test_cross_layout_compiled_name_collision_preserves_target(tmp_path, categor
     dcp.save(saved, checkpoint_id=tmp_path)
     target = torch.nn.Module()
     target.model = make_model(latent=True, shared=1)
-    swap_hf_moe_blocks(target.model)
+    swap_moe_blocks(target.model)
     states = {"model": ModelCheckpointState(target)}
     if category != "model":
         states[category] = (
@@ -310,7 +333,7 @@ def test_cross_layout_compiled_name_collision_preserves_target(tmp_path, categor
             else EMA(model_parts=[target], decay=0.5)
         )
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = HFTransformerStateDictAdapter(config, None, kimi_expert_parallel=True)
+    adapter = legacy_adapter(config, None, kimi_expert_parallel=True)
     with pytest.raises(ValueError, match="Ambiguous compiled Kimi checkpoint keys"):
         load_changed_kimi_layout(str(tmp_path), states=states, adapter=adapter)
     for key, value in target.state_dict().items():

@@ -1,4 +1,8 @@
-"""Default RNG checkpoint round-trip and incompatible-state rejection."""
+"""Default RNG checkpoint round-trip and incompatible-state rejection.
+
+CPU optimizer fixtures select scalar AdamW explicitly: vendor foreach capability
+probes may initialize an accelerator even when all parameters are on CPU.
+"""
 
 import pickle
 import random
@@ -217,7 +221,7 @@ def test_manager_rejects_incompatible_rng_before_mutating_training_state(
 
     with preserve_rng_state(torch.device("cpu")):
         model = torch.nn.Linear(2, 2)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, foreach=False)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
         rng = RNGCheckpointState(torch.device("cpu"))
         manager = DistributedCheckpointManager(
@@ -287,7 +291,7 @@ def test_manager_rejects_invalid_data_cursor_before_model_or_optimizer_load(
     from llmtuner.datasets.synthetic import RandomTokenDataLoader
 
     model = torch.nn.Linear(2, 2)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, foreach=False)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
     loader = RandomTokenDataLoader(seed=42, vocab_size=8, batch_size=2, seq_len=4)
     manager = DistributedCheckpointManager(
@@ -345,7 +349,7 @@ def test_manager_rejects_invalid_trainer_counters_before_live_state_changes(
     from llmtuner.trainer.trainer import Trainer
 
     model = torch.nn.Linear(2, 2)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, foreach=False)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
     trainer = Trainer.__new__(Trainer)
     trainer.step = 1
@@ -399,7 +403,7 @@ def test_manager_rejects_invalid_scheduler_progress_before_live_writes(tmp_path,
     from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 
     model = torch.nn.Linear(2, 2)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, foreach=False)
     scheduler = build_lr_scheduler(
         LRSchedulerConfig(), optimizers=[optimizer], training_steps=4
     )

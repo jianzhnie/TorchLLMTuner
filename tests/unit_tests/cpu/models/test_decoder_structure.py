@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 
 
@@ -51,27 +51,17 @@ def test_declaration_rejects_missing_or_misowned_targets():
         replace(model.decoder_structure, blocks="model.norm").bind(model)
 
 
-def test_production_wrapper_uses_declaration_without_candidate_search(monkeypatch):
-    def reject_inspection(*args, **kwargs):
-        raise AssertionError("Explicit model must not search candidate attributes")
-
-    monkeypatch.setattr(
-        "llmtuner.models.hf.model.resolve_submodule_name", reject_inspection
-    )
-    model = HFTransformerModel(small_config())
-    assert model.tok_embeddings is model.model.model.embed_tokens
-    assert model.enable_weight_tying
-    assert not any(key.startswith("_decoder.") for key in model.state_dict())
+def test_explicit_structure_rebinds_after_module_replacement():
+    model = Qwen3MoeForCausalLM(small_config())
+    structure = model.decoder_structure
+    before = structure.bind(model)
     replacement = nn.LayerNorm(16)
-    model.model.model.norm = replacement
-    assert model.norm is replacement
-    assert model.model.decoder_structure.bind(model.model).norm is replacement
-
-    from llmtuner.parallel.context_parallel import context_parallel
-
-    monkeypatch.setattr(context_parallel, "_ATTN_MODULE_NAMES", ())
-    attentions = context_parallel._attention_modules(model)
-    assert attentions == [layer.self_attn for layer in model.layers]
+    model.model.norm = replacement
+    after = structure.bind(model)
+    assert after.norm is replacement
+    assert before.norm is not after.norm
+    assert after.embedding is before.embedding
+    assert not any(key.startswith("_decoder.") for key in model.state_dict())
 
 
 def test_meta_binding_does_not_materialize_parameters():
@@ -80,3 +70,56 @@ def test_meta_binding_does_not_materialize_parameters():
     bound = model.decoder_structure.bind(model)
     assert bound.embedding.weight.is_meta
     assert bound.embedding.weight is bound.head.weight
+
+
+@pytest.mark.parametrize(
+    ("role", "path"),
+    [
+        (role, path)
+        for role in ("decoder", "embedding", "blocks", "norm", "head")
+        for path in (None, "", ".model", "model.", "model..layers")
+        if (role, path) != ("decoder", "")
+    ],
+)
+def test_declaration_rejects_malformed_paths_before_binding(role, path):
+    values = dict(
+        decoder="model",
+        embedding="model.embed_tokens",
+        blocks="model.layers",
+        norm="model.norm",
+        head="lm_head",
+    )
+    values[role] = path
+    with pytest.raises(ValueError, match="module path|direct child"):
+        DecoderStructure(**values)
+
+
+@pytest.mark.parametrize("name", ["", "self.attn", 1])
+def test_attention_declaration_requires_a_direct_child(name):
+    with pytest.raises(ValueError, match="attention.*direct child"):
+        DecoderStructure(
+            decoder="model",
+            embedding="model.embed_tokens",
+            blocks="model.layers",
+            norm="model.norm",
+            head="lm_head",
+            attention=name,
+        )
+
+
+def test_root_decoder_can_declare_direct_children():
+    model = nn.Module()
+    model.embedding = nn.Embedding(4, 2)
+    model.layers = nn.ModuleList([nn.Linear(2, 2)])
+    model.norm = nn.LayerNorm(2)
+    model.head = nn.Linear(2, 4)
+    structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
+    bound = structure.bind(model)
+    assert bound.decoder is model
+    assert bound.blocks is model.layers

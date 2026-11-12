@@ -34,7 +34,7 @@ def test_custom_model_matches_reference(tied, backend):
     positions = torch.arange(4).expand(2, -1)
     outputs = []
     for model in (expected, actual):
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
         logits = model(input_ids=ids, position_ids=positions, use_cache=False).logits
         logits.square().sum().backward()
         optimizer.step()

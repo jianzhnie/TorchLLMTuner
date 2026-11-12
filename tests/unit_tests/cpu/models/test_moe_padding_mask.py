@@ -24,6 +24,7 @@ require_env("spmd_types")
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import DefaultDeviceType
 
 from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
@@ -34,6 +35,18 @@ from llmtuner.models.common.moe.routing import (
     TokenChoiceTopKRouter,
 )
 from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
+
+
+@pytest.fixture(autouse=True)
+def cpu_checkpoint_device():
+    """Run CPU checkpoint replay without querying an accelerator runtime."""
+    previous = DefaultDeviceType.get_device_type()
+    DefaultDeviceType.set_device_type("cpu")
+    try:
+        yield
+    finally:
+        DefaultDeviceType.set_device_type(previous)
+
 
 _NUM_EXPERTS = 4
 _DIM = 8

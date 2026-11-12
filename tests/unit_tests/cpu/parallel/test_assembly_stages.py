@@ -44,6 +44,7 @@ def test_parallel_public_entries_resolve_to_their_defining_modules():
         "apply_ep": "expert_parallel.expert_parallel",
         "apply_fsdp": "fully_shard_parallel.fully_shard_parallel",
         "apply_tp": "tensor_parallel.tensor_parallel",
+        "parallelize_model": "parallelize",
         "parallelize_hf_transformers": "parallelize",
     }
     assert set(parallel_api.__all__) == set(entries)
@@ -168,7 +169,7 @@ def test_unsupported_mc2_degree_fails_in_ep_stage_before_conversion(monkeypatch)
     def unexpected_conversion(*args, **kwargs):
         pytest.fail("unsupported MC2 degree reached MoE conversion")
 
-    monkeypatch.setattr(expert_parallel, "swap_hf_moe_blocks", unexpected_conversion)
+    monkeypatch.setattr(expert_parallel, "swap_moe_blocks", unexpected_conversion)
     with pytest.raises(EnvironmentUnsupportedError, match="world size in"):
         parallelize.parallelize_hf_transformers(
             nn.Linear(2, 2),

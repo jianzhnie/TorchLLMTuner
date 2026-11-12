@@ -32,14 +32,17 @@ from tests.caps import require_env
 require_env("spmd_types")
 
 
+from dataclasses import replace
+
 import pytest
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.models.common.moe.experts import RoutedExperts
 from llmtuner.models.common.moe.layer import MoE
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import configure_reference_experts
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel import (
     block_conversion,
     model_replacement,
@@ -51,6 +54,28 @@ from llmtuner.parallel.expert_parallel.block_conversion import (
 from llmtuner.parallel.expert_parallel.hf_inspection import is_hf_moe_block
 
 TOL = 1e-6
+
+
+def construct_test_model(config, *, explicit: bool = True) -> torch.nn.Module:
+    """Use production Qwen3; external families exercise raw-module compatibility.
+
+    This test-only factory does not extend the production architecture registry.
+    The unregistered layers alias exposes the original test fixture interface
+    without adding state-dict aliases or a second model execution wrapper.
+    """
+    configure_reference_experts(config)
+    if explicit and config.model_type == "qwen3_moe":
+        return Qwen3MoeForCausalLM(config)
+    model = AutoModelForCausalLM.from_config(config)
+    object.__setattr__(model, "layers", model.model.layers)
+    return model
+
+
+def logits(model: torch.nn.Module, ids: torch.Tensor, positions: torch.Tensor):
+    """Keep batch adaptation in the test, outside production model ownership."""
+    return model(
+        input_ids=ids.unsqueeze(0), position_ids=positions.unsqueeze(0), use_cache=False
+    ).logits.squeeze(0)
 
 
 @pytest.fixture(autouse=True)
@@ -90,10 +115,10 @@ def _config(*, norm_topk_prob: bool, aux_coeff: float = 1e-3) -> AutoConfig:
     )
 
 
-def _model(config, *, seed: int = 0) -> HFTransformerModel:
+def _model(config, *, seed: int = 0) -> torch.nn.Module:
     """Deterministically initialized tiny Qwen3Moe in float64."""
     torch.manual_seed(seed)
-    return HFTransformerModel(config).to(torch.float64).eval()
+    return construct_test_model(config).to(torch.float64).eval()
 
 
 def _data(seed: int = 7) -> tuple[torch.Tensor, torch.Tensor]:
@@ -313,8 +338,8 @@ def test_swapped_model_matches_hf_output(norm_topk_prob: bool) -> None:
 
     ids, positions = _data()
     with torch.no_grad():
-        expected = ref(ids, positions=positions)
-        got = swapped(ids, positions=positions)
+        expected = logits(ref, ids, positions)
+        got = logits(swapped, ids, positions)
     torch.testing.assert_close(got, expected, rtol=TOL, atol=TOL)
 
 
@@ -402,7 +427,7 @@ def test_swap_preserves_eval_mode() -> None:
 
     ids, positions = _data()
     with torch.no_grad():
-        swapped(ids, positions=positions)  # must not raise for a denominator
+        logits(swapped, ids, positions)  # must not raise for a denominator
 
 
 def test_a_router_with_bias_is_refused() -> None:
@@ -435,7 +460,9 @@ def test_swap_rejects_a_dense_model() -> None:
         max_position_embeddings=256,
     )
     model = _model(config)
-    with pytest.raises(UnsupportedCombinationError, match="no HF MoE block"):
+    with pytest.raises(
+        UnsupportedCombinationError, match="no declared or compatible MoE block"
+    ):
         swap_hf_moe_blocks(model)
 
 
@@ -458,8 +485,8 @@ def test_aux_loss_is_injected_on_the_router_scores() -> None:
     AuxLoss.set_step_denominator(torch.tensor(39.0))
     with_aux.train()
     without_aux.train()
-    out_with = with_aux(ids, positions=positions)
-    out_without = without_aux(ids, positions=positions)
+    out_with = logits(with_aux, ids, positions)
+    out_without = logits(without_aux, ids, positions)
     # Identity forward: the aux loss injects a gradient, not a value.
     assert torch.equal(out_with, out_without)
     out_with.sum().backward()
@@ -484,7 +511,7 @@ def test_aux_loss_requires_the_step_denominator() -> None:
     model.train()
     ids, positions = _data()
     with pytest.raises(ValueError, match="set_step_denominator"):
-        model(ids, positions=positions)
+        logits(model, ids, positions)
 
 
 # -- DeepSeek-V3: a different block shape --------------------------------------
@@ -534,9 +561,9 @@ def _deepseek_config(**overrides) -> AutoConfig:
     return AutoConfig.for_model("deepseek_v3", **settings)
 
 
-def _deepseek_model(**overrides) -> HFTransformerModel:
+def _deepseek_model(**overrides) -> torch.nn.Module:
     torch.manual_seed(0)
-    return HFTransformerModel(_deepseek_config(**overrides)).float().eval()
+    return construct_test_model(_deepseek_config(**overrides)).float().eval()
 
 
 def test_deepseek_v3_routing_attributes_are_probeable() -> None:
@@ -585,9 +612,9 @@ def test_deepseek_v3_swap_matches_hf_output(overrides: dict) -> None:
     """
     config = _deepseek_config(**overrides)
     torch.manual_seed(0)
-    ref = HFTransformerModel(config).float().eval()
+    ref = construct_test_model(config).float().eval()
     torch.manual_seed(0)
-    swapped = HFTransformerModel(config).float().eval()
+    swapped = construct_test_model(config).float().eval()
 
     # first_k_dense_replace=1, so only the two sparse layers swap.
     assert swap_hf_moe_blocks(swapped) == 2
@@ -597,8 +624,8 @@ def test_deepseek_v3_swap_matches_hf_output(overrides: dict) -> None:
     ids, positions = _data()
     with torch.no_grad():
         torch.testing.assert_close(
-            swapped(ids, positions=positions),
-            ref(ids, positions=positions),
+            logits(swapped, ids, positions),
+            logits(ref, ids, positions),
             rtol=TOL,
             atol=TOL,
         )
@@ -638,7 +665,7 @@ def test_deepseek_v3_shared_experts_survive_the_swap() -> None:
 
 @pytest.mark.parametrize("expert_dtype", [torch.bfloat16, torch.float64])
 def test_swap_preserves_expert_dtype_with_fp32_router(expert_dtype) -> None:
-    model = HFTransformerModel(_config(norm_topk_prob=True))
+    model = construct_test_model(_config(norm_topk_prob=True))
     expected = []
     for layer in model.layers:
         layer.mlp.gate.float()
@@ -664,8 +691,8 @@ def test_swap_preserves_expert_dtype_with_fp32_router(expert_dtype) -> None:
             torch.testing.assert_close(target, source, rtol=0, atol=0)
 
 
-def test_swap_rejects_router_and_experts_on_different_devices() -> None:
-    model = HFTransformerModel(_config(norm_topk_prob=True))
+def test_swap_rejects_router_and_experts_on_different_devices(monkeypatch) -> None:
+    model = construct_test_model(_config(norm_topk_prob=True))
     block = model.layers[0].mlp
     original_counts = dict(AuxLoss._group_counts)
     block.experts.gate_up_proj = torch.nn.Parameter(
@@ -675,17 +702,28 @@ def test_swap_rejects_router_and_experts_on_different_devices() -> None:
         block.experts.down_proj.detach().to("meta")
     )
 
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+
+    def reject_allocation(*args, **kwargs):
+        raise AssertionError("Device preflight must precede expert allocation")
+
+    monkeypatch.setattr(block_conversion, "GroupedExperts", reject_allocation)
+
     with pytest.raises(UnsupportedCombinationError, match="different devices"):
         swap_hf_moe_blocks(model, router_aux_loss_coef=0.0)
 
     assert model.layers[0].mlp is block
     assert AuxLoss._group_counts == original_counts
+    assert torch.equal(rng, torch.get_rng_state())
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
 
 
 def test_swap_rejects_shared_expert_on_a_different_device() -> None:
-    model = HFTransformerModel(_config(norm_topk_prob=True))
+    model = construct_test_model(_config(norm_topk_prob=True))
     block = model.layers[0].mlp
     block.shared_expert = torch.nn.Linear(64, 64, bias=False, device="meta")
+    block.moe_contract = replace(block.moe_contract, shared_expert="shared_expert")
 
     with pytest.raises(UnsupportedCombinationError, match="shared expert"):
         swap_hf_moe_blocks(model, router_aux_loss_coef=0.0)
@@ -796,7 +834,7 @@ def _plain_settings(**overrides) -> dict:
     return settings
 
 
-def _plain_model(family: str, **overrides) -> HFTransformerModel:
+def _plain_model(family: str, **overrides) -> torch.nn.Module:
     """A tiny model built straight from ``family``'s own config.
 
     ``to_dict()`` carries ``model_type``, which collides with ``for_model``'s
@@ -804,10 +842,10 @@ def _plain_model(family: str, **overrides) -> HFTransformerModel:
     """
     cfg = AutoConfig.for_model(family, **_plain_settings(**overrides))
     torch.manual_seed(0)
-    return HFTransformerModel(cfg).float().eval()
+    return construct_test_model(cfg).float().eval()
 
 
-def _mixtral_model(**overrides) -> HFTransformerModel:
+def _mixtral_model(**overrides) -> torch.nn.Module:
     settings = dict(
         vocab_size=128,
         hidden_size=64,
@@ -823,7 +861,7 @@ def _mixtral_model(**overrides) -> HFTransformerModel:
     settings.update(overrides)
     torch.manual_seed(0)
     return (
-        HFTransformerModel(AutoConfig.for_model("mixtral", **settings)).float().eval()
+        construct_test_model(AutoConfig.for_model("mixtral", **settings)).float().eval()
     )
 
 
@@ -840,17 +878,17 @@ def test_the_deepseek_router_shape_swaps_exactly(family: str) -> None:
     """
     cfg = AutoConfig.for_model(family, **_plain_settings())
     torch.manual_seed(0)
-    ref = HFTransformerModel(cfg).float().eval()
+    ref = construct_test_model(cfg).float().eval()
     torch.manual_seed(0)
-    swapped = HFTransformerModel(cfg).float().eval()
+    swapped = construct_test_model(cfg).float().eval()
 
     assert swap_hf_moe_blocks(swapped) == 2
 
     ids, positions = _data()
     with torch.no_grad():
         torch.testing.assert_close(
-            swapped(ids, positions=positions),
-            ref(ids, positions=positions),
+            logits(swapped, ids, positions),
+            logits(ref, ids, positions),
             rtol=TOL,
             atol=TOL,
         )
@@ -929,7 +967,7 @@ def test_mixtral_swaps_in_place() -> None:
 
     ids, positions = _data()
     with torch.no_grad():
-        out = model(ids, positions=positions)
+        out = logits(model, ids, positions)
     assert out.shape == (40, 128)
 
 
@@ -961,16 +999,16 @@ def test_mixtral_matches_hf_output() -> None:
         experts_implementation="eager",
     )
     torch.manual_seed(0)
-    ref = HFTransformerModel(cfg).float().eval()
+    ref = construct_test_model(cfg).float().eval()
     torch.manual_seed(0)
-    swapped = HFTransformerModel(cfg).float().eval()
+    swapped = construct_test_model(cfg).float().eval()
 
     swap_hf_moe_blocks(swapped)
     ids, positions = _data()
     with torch.no_grad():
         torch.testing.assert_close(
-            swapped(ids, positions=positions),
-            ref(ids, positions=positions),
+            logits(swapped, ids, positions),
+            logits(ref, ids, positions),
             rtol=TOL,
             atol=TOL,
         )
@@ -988,7 +1026,7 @@ def test_mixtral_returns_a_bare_tensor() -> None:
 
     ids, positions = _data()
     with torch.no_grad():
-        out = model(ids, positions=positions)
+        out = logits(model, ids, positions)
     assert out.shape == (40, 128)
 
 
@@ -1055,7 +1093,7 @@ def test_late_invalid_expert_layout_does_not_replace_earlier_layers() -> None:
     counts_before = dict(AuxLoss._group_counts)
     _misshape_hf_experts(_hf_block(model.layers[1]), hidden=64)
 
-    with pytest.raises(ValueError, match="unrecognized expert weight shapes"):
+    with pytest.raises(ValueError, match="fused gate/up expert geometry"):
         swap_hf_moe_blocks(model)
 
     assert all(
@@ -1209,6 +1247,9 @@ def test_conversion_preserves_shared_expert_dtype_and_child_modes(later_failure)
     shared[0].eval()
     shared.register_buffer("calibration", torch.tensor([1.25]))
     model.layers[0].mlp.shared_expert = shared
+    model.layers[0].mlp.moe_contract = replace(
+        model.layers[0].mlp.moe_contract, shared_expert="shared_expert"
+    )
     original_weight = shared[0].weight
     original_blocks = [layer.mlp for layer in model.layers]
     if later_failure:
@@ -1252,7 +1293,7 @@ def test_swap_preserves_moe_block_sharing_across_layers():
     swapped.layers[1].mlp = swapped.layers[0].mlp
     ids, positions = _data()
     with torch.no_grad():
-        expected = reference(ids, positions=positions)
+        expected = logits(reference, ids, positions)
     assert swap_hf_moe_blocks(swapped) == 2
     assert swapped.layers[0].mlp is swapped.layers[1].mlp
     assert swapped.layers[0].moe is swapped.layers[1].moe
@@ -1260,7 +1301,7 @@ def test_swap_preserves_moe_block_sharing_across_layers():
         swapped.layers[1].mlp.router.gate.weight
     )
     with torch.no_grad():
-        actual = swapped(ids, positions=positions)
+        actual = logits(swapped, ids, positions)
     torch.testing.assert_close(actual, expected, atol=TOL, rtol=TOL)
 
 
@@ -1294,8 +1335,8 @@ def test_swap_preserves_projection_sharing_and_accumulated_gradients(projection)
         actual_parts = [actual]
         expected_params = _hf_projection_parameters(original, projection)
     ids, positions = _data()
-    reference_output = reference(ids, positions=positions)
-    swapped_output = swapped(ids, positions=positions)
+    reference_output = logits(reference, ids, positions)
+    swapped_output = logits(swapped, ids, positions)
     torch.testing.assert_close(swapped_output, reference_output, atol=TOL, rtol=TOL)
     reference_output.square().mean().backward()
     swapped_output.square().mean().backward()
@@ -1310,8 +1351,8 @@ def test_swap_preserves_projection_sharing_and_accumulated_gradients(projection)
         else actual_parts[0].grad
     )
     torch.testing.assert_close(actual_grad, expected_grad, atol=1e-7, rtol=1e-5)
-    torch.optim.SGD(actual_parts, lr=0.1).step()
-    torch.optim.SGD(expected_params, lr=0.1).step()
+    torch.optim.SGD(actual_parts, lr=0.1, foreach=False).step()
+    torch.optim.SGD(expected_params, lr=0.1, foreach=False).step()
     actual_value = (
         torch.cat(actual_parts, dim=1) if len(actual_parts) == 2 else actual_parts[0]
     )
@@ -1480,6 +1521,7 @@ def test_shared_expert_local_checkpoint_registration_survives_conversion():
     block = model.layers[0].mlp
     shared = torch.nn.Linear(64, 64, bias=False, dtype=torch.float64)
     block.shared_expert = shared
+    block.moe_contract = replace(block.moe_contract, shared_expert="shared_expert")
     group = object()
     shared._tp_checkpoint_layouts = {"weight": (0, False, group)}
     swap_hf_moe_blocks(model)
@@ -1684,7 +1726,7 @@ def test_swap_preserves_external_router_bias_or_rejects_before_install(bias_dtyp
 @pytest.mark.parametrize("fixed_router", [False, True])
 def test_pre_down_policy_rejected_before_ep_replacement(fixed_router):
     config = _config(norm_topk_prob=True)
-    model = HFTransformerModel(config)
+    model = construct_test_model(config)
     model.model.config.experts_implementation = "pre_down"
     original = list(model.layers)
     parameters = dict(model.named_parameters())
@@ -1764,7 +1806,7 @@ def test_owned_qwen3_ep_conversion_does_not_inspect_forward_source(monkeypatch):
     assert model.layers[1].moe_block_name is None
     dense_mlp = model.layers[1].mlp
     ids, positions = _data()
-    expected = model(ids, positions=positions)
+    expected = logits(model, ids, positions)
 
     def unexpected(_module):
         raise AssertionError("owned Qwen3 must declare router output arity")
@@ -1773,7 +1815,7 @@ def test_owned_qwen3_ep_conversion_does_not_inspect_forward_source(monkeypatch):
     swap_hf_moe_blocks(model)
     assert isinstance(model.layers[0].mlp, MoE)
     assert model.layers[1].mlp is dense_mlp
-    actual = model(ids, positions=positions)
+    actual = logits(model, ids, positions)
     torch.testing.assert_close(actual, expected, atol=TOL, rtol=TOL)
 
 
@@ -1834,59 +1876,118 @@ def test_declared_expert_layout_never_falls_back_to_list_probe(monkeypatch):
         hf_inspection.fused_experts_of(block)
 
 
-def test_ep_target_plan_is_pure_and_execution_does_not_rediscover(monkeypatch):
+def test_later_router_bias_is_rejected_before_any_block_conversion(monkeypatch):
     model = _model(_config(norm_topk_prob=True))
+    model.layers[1].mlp.gate.bias = torch.nn.Parameter(torch.zeros(8))
+    blocks = tuple(layer.mlp for layer in model.layers)
+    keys = tuple(model.state_dict())
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+    counts = dict(AuxLoss._group_counts)
+
+    def reject_allocation(*args, **kwargs):
+        raise AssertionError("All block capabilities must be checked before conversion")
+
+    monkeypatch.setattr(model_replacement, "convert_block", reject_allocation)
+    with pytest.raises(NotImplementedError, match="bias"):
+        swap_hf_moe_blocks(model)
+    assert tuple(model.state_dict()) == keys
+    assert all(
+        layer.mlp is block for layer, block in zip(model.layers, blocks, strict=True)
+    )
+    assert all(
+        left is right
+        for left, right in zip(model.parameters(), parameters, strict=True)
+    )
+    assert torch.equal(rng, torch.get_rng_state())
+    assert dict(AuxLoss._group_counts) == counts
+
+
+def test_quantile_incompatibility_is_rejected_before_expert_allocation(monkeypatch):
+    model = _model(_config(norm_topk_prob=True))
+    block = model.layers[0].mlp
+    rng = torch.get_rng_state().clone()
+    counts = dict(AuxLoss._group_counts)
+
+    def reject_allocation(*args, **kwargs):
+        raise AssertionError("Quantile restrictions must precede expert allocation")
+
+    monkeypatch.setattr(block_conversion, "GroupedExperts", reject_allocation)
+    with pytest.raises(NotImplementedError, match="sigmoid"):
+        block_conversion.convert_block(
+            block,
+            ep_group=None,
+            aux_loss_coeff=1e-3,
+            load_balance_coeff=None,
+            quantile_balancing=True,
+            token_dispatcher="alltoall",
+            torchao_pad_multiple=16,
+        )
+    assert torch.equal(rng, torch.get_rng_state())
+    assert dict(AuxLoss._group_counts) == counts
+
+
+@pytest.mark.parametrize("quantile_balancing", [False, True])
+def test_ep_resolution_rejects_capabilities_without_mutation(quantile_balancing):
+    model = _model(_config(norm_topk_prob=True))
+    if not quantile_balancing:
+        model.layers[1].mlp.gate.bias = torch.nn.Parameter(torch.zeros(8))
     parameters = tuple(model.parameters())
     keys = tuple(model.state_dict())
     rng = torch.get_rng_state().clone()
-    ids, positions = _data()
-    with torch.no_grad():
-        expected = model(ids, positions=positions)
-    plan = model_replacement.resolve_ep_plan(model)
-    assert plan.count("moe") == 2
+    counts = dict(AuxLoss._group_counts)
+    message = "sigmoid" if quantile_balancing else "bias"
+    with pytest.raises(NotImplementedError, match=message):
+        model_replacement.resolve_ep_plan(model, quantile_balancing=quantile_balancing)
     assert tuple(model.state_dict()) == keys
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert torch.equal(rng, torch.get_rng_state())
+    assert dict(AuxLoss._group_counts) == counts
 
-    def reject_discovery(*args, **kwargs):
-        raise AssertionError("Execution must consume resolved decoder slots")
 
-    monkeypatch.setattr(model_replacement, "find_moe_candidates", reject_discovery)
-    for name in (
-        "router_of",
-        "resolve_top_k",
-        "resolve_shared_expert",
-        "read_expert_groups",
-        "resolve_score_func",
-        "read_route_norm",
-        "read_route_scale",
-    ):
-        monkeypatch.setattr(block_conversion, name, reject_discovery)
-    model_replacement.swap_hf_moe_blocks(
-        model, resolved_plan=plan, router_aux_loss_coef=0.0
-    )
+def test_ep_plan_does_not_label_legacy_experts_as_packed(monkeypatch):
+    model = construct_test_model(_config(norm_topk_prob=True), explicit=False)
+    for layer in model.layers:
+        block = layer.mlp
+        if hasattr(block, "moe_contract"):
+            del block.moe_contract
+        block.expert_layout = None
+        members = []
+        for _ in range(8):
+            expert = torch.nn.Module()
+            expert.gate_proj = torch.nn.Linear(64, 48, bias=False)
+            expert.up_proj = torch.nn.Linear(64, 48, bias=False)
+            expert.down_proj = torch.nn.Linear(48, 64, bias=False)
+            expert.act_fn = torch.nn.SiLU()
+            members.append(expert)
+        block.experts = torch.nn.ModuleList(members)
+    rng = torch.get_rng_state().clone()
+    parameters = tuple(model.parameters())
+
+    def reject_stacking(*args, **kwargs):
+        raise AssertionError("Plan resolution must not stack expert weights")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(torch, "stack", reject_stacking)
+        plan = model_replacement.resolve_ep_plan(model)
+    assert torch.equal(rng, torch.get_rng_state())
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert plan.count("moe") == 2
+    assert all(target.layout == "legacy_adapter" for target in plan.targets)
+    assert all(target.spec.packed_experts is None for target in plan.targets)
+    # Conversion still stacks the actual values in role order, not a probe proxy.
+    block = model.layers[0].mlp
+    for expert in block.experts:
+        expert.gate_proj.weight.requires_grad_(False)
     with torch.no_grad():
-        actual = model(ids, positions=positions)
-    torch.testing.assert_close(actual, expected, atol=TOL, rtol=TOL)
-
-
-@pytest.mark.parametrize("change", ["parameter", "alias", "backend", "degree"])
-def test_ep_target_plan_rejects_stale_or_incompatible_execution(change):
-    model = _model(_config(norm_topk_prob=True))
-    plan = model_replacement.resolve_ep_plan(
-        model,
-        degree=2 if change == "degree" else 1,
-        implementation="torchao" if change == "backend" else "alltoall",
-    )
-    original_blocks = tuple(layer.mlp for layer in model.layers)
-    if change == "parameter":
-        experts = model.layers[0].mlp.experts
-        experts.down_proj = torch.nn.Parameter(experts.down_proj.detach().clone())
-    elif change == "alias":
-        model.register_parameter("unexpected_alias", next(model.parameters()))
-    with pytest.raises(ValueError, match="Stale plan|does not match"):
-        model_replacement.swap_hf_moe_blocks(model, resolved_plan=plan)
-    assert all(
-        layer.mlp is original
-        for layer, original in zip(model.layers, original_blocks, strict=True)
-    )
+        fused = block_conversion._legacy_inspection().fused_experts_of(block)
+    assert fused.num_experts == 8
+    assert not fused.gate_EFD.requires_grad
+    assert fused.up_EFD.requires_grad
+    for index, expert in enumerate(block.experts):
+        for actual, expected in (
+            (fused.gate_EFD[index], expert.gate_proj.weight),
+            (fused.up_EFD[index], expert.up_proj.weight),
+            (fused.down_EDF[index], expert.down_proj.weight),
+        ):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)

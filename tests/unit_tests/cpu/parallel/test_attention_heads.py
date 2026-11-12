@@ -27,14 +27,14 @@ from llmtuner.parallel.attention_heads import (
 
 
 def _model(num_attention_heads=None, num_key_value_heads=None) -> torch.nn.Module:
-    """A stub shaped like the wrapper: config under ``.model``, nothing else."""
+    """An explicit model exposes its own config without a wrapper."""
     config = SimpleNamespace()
     if num_attention_heads is not None:
         config.num_attention_heads = num_attention_heads
     if num_key_value_heads is not None:
         config.num_key_value_heads = num_key_value_heads
     model = torch.nn.Linear(4, 4)
-    model.model = SimpleNamespace(config=config)
+    model.config = config
     return model
 
 
@@ -106,6 +106,12 @@ def test_both_counts_are_reported_independently() -> None:
 @pytest.mark.parametrize("count", [0, -2, False, True, 2.0, "2"])
 def test_invalid_explicit_head_counts_are_rejected(field, count) -> None:
     model = _model(8, 4)
-    setattr(model.model.config, field, count)
+    setattr(model.config, field, count)
     with pytest.raises(ValueError, match=f"{field} must be a positive integer"):
         _check(model, 2)
+
+
+@pytest.mark.parametrize("size", [0, -1, True, False, 1.5, "2"])
+def test_invalid_parallel_degree_is_rejected(size):
+    with pytest.raises(ValueError, match="positive integer"):
+        _check(_model(8, 4), size)

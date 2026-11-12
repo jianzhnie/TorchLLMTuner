@@ -19,6 +19,7 @@ arithmetically but the code path still runs. That is the same fixture shape
 from __future__ import annotations
 
 from copy import deepcopy
+from types import SimpleNamespace
 
 from tests.caps import require_env
 
@@ -28,12 +29,18 @@ require_env("spmd_types")
 import pytest
 import torch
 import torch.distributed as dist
+from transformers import AutoConfig
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Model
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+import llmtuner.models.common.moe.bias_update as bias_update
+import llmtuner.parallel.expert_parallel.model_replacement as model_replacement
 from llmtuner.models.common.moe.bias_update import (
     collect_routing_load_metrics,
     register_moe_balancing_hook,
     reset_routing_statistics,
     update_expert_bias,
+    update_quantile_expert_bias,
 )
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
 from llmtuner.models.common.moe.layer import MoE, collect_moe_layers
@@ -41,14 +48,10 @@ from llmtuner.models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.expert_parallel import swap_hf_moe_blocks
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
-
-try:
-    from transformers import AutoConfig
-except ImportError:  # pragma: no cover - transformers is a runtime dependency
-    AutoConfig = None
+from llmtuner.trainer.runtime.training_observer import DispatchTimer
 
 _NUM_EXPERTS = 4
 _DIM = 8
@@ -56,8 +59,6 @@ _TOP_K = 2
 
 
 def test_dispatch_observation_preserves_real_moe_forward_backward_and_update():
-    from llmtuner.trainer.runtime.training_observer import DispatchTimer
-
     torch.manual_seed(47)
     reference = _moe(coeff=None)
     reference.routed_experts.inner_experts.use_grouped_mm = False
@@ -79,8 +80,8 @@ def test_dispatch_observation_preserves_real_moe_forward_backward_and_update():
         reference.parameters(), candidate.parameters(), strict=True
     ):
         torch.testing.assert_close(first.grad, second.grad, rtol=0, atol=0)
-    torch.optim.SGD(reference.parameters(), lr=0.01).step()
-    torch.optim.SGD(candidate.parameters(), lr=0.01).step()
+    torch.optim.SGD(reference.parameters(), lr=0.01, foreach=False).step()
+    torch.optim.SGD(candidate.parameters(), lr=0.01, foreach=False).step()
     for first, second in zip(
         reference.parameters(), candidate.parameters(), strict=True
     ):
@@ -249,7 +250,9 @@ def test_the_hook_fires_once_per_optimizer_step() -> None:
     """
     moe = _moe()
     model = _Holder([moe])
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    optimizer = torch.optim.SGD(
+        [torch.nn.Parameter(torch.zeros(1))], lr=0.1, foreach=False
+    )
     register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
     assert float(moe.expert_bias_E.abs().sum()) == 0.0  # nothing yet: no counts
@@ -262,7 +265,9 @@ def test_the_hook_fires_once_per_optimizer_step() -> None:
 def test_no_hook_is_registered_for_a_model_without_moe_layers() -> None:
     """A dense run must not pay a traversal or an empty collective per step."""
     model = _Holder([])
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    optimizer = torch.optim.SGD(
+        [torch.nn.Parameter(torch.zeros(1))], lr=0.1, foreach=False
+    )
 
     register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
@@ -276,7 +281,9 @@ def test_no_hook_is_registered_when_every_coeff_is_none() -> None:
     whose result every layer then ignores -- a pure-waste collective.
     """
     model = _Holder([_moe(coeff=None), _moe(coeff=None)])
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    optimizer = torch.optim.SGD(
+        [torch.nn.Parameter(torch.zeros(1))], lr=0.1, foreach=False
+    )
 
     register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
 
@@ -292,7 +299,9 @@ def test_a_mixed_coeff_configuration_is_rejected() -> None:
     case a loud error should catch.
     """
     model = _Holder([_moe(coeff=0.1), _moe(coeff=None)])
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    optimizer = torch.optim.SGD(
+        [torch.nn.Parameter(torch.zeros(1))], lr=0.1, foreach=False
+    )
 
     with pytest.raises(ValueError, match="load_balance_coeff"):
         register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
@@ -312,7 +321,7 @@ def test_a_dense_layer_among_sparse_ones_is_skipped() -> None:
 def test_shared_moe_block_is_balanced_once_per_optimizer_step(repeated_part):
     sparse = _moe(coeff=0.1)
     model = _Holder([sparse, sparse])
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
     register_moe_balancing_hook(
         optimizer,
         model_parts=[model, model] if repeated_part else [model],
@@ -350,59 +359,92 @@ def test_wrapped_layers_are_unwrapped() -> None:
     assert collect_moe_layers(holder) == [sparse]
 
 
-def test_the_hook_updates_a_real_swapped_model() -> None:
+@pytest.mark.parametrize("architecture", ["qwen3_moe", "deepseek_v3_reference"])
+def test_hook_respects_real_swapped_model_routing_policy(architecture, monkeypatch):
     """End to end against the object graph the swap actually produces.
 
     The hand-built layers above encode an assumption about *where* the swap
-    leaves the block; this test removes that assumption by swapping a real HF
-    model and reading the hook's effect back off it. It is the one that would
-    have caught the lookup reading ``layer.moe`` while the swap wrote
+    leaves the block; exercise an explicit Qwen3 and an external DeepSeek-V3
+    reference decoder without restoring the removed HF wrapper. This catches
+    the lookup reading ``layer.moe`` while the swap wrote
     ``layer.mlp`` -- a mismatch under which every other test in this file still
     passes, the register function quietly no-ops, and the bias never updates.
     """
-    config = AutoConfig.for_model(
-        "deepseek_v3",
-        vocab_size=128,
-        hidden_size=64,
-        intermediate_size=128,
-        moe_intermediate_size=48,
-        num_hidden_layers=3,
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        n_routed_experts=8,
-        num_experts_per_tok=2,
-        n_shared_experts=1,
-        n_group=2,
-        topk_group=1,
-        first_k_dense_replace=1,
-        scoring_func="sigmoid",
-        routed_scaling_factor=2.5,
-        norm_topk_prob=True,
-        max_position_embeddings=128,
-    )
     torch.manual_seed(0)
-    model = HFTransformerModel(config).float().eval()
-    assert swap_hf_moe_blocks(model) == 2
+    if architecture == "qwen3_moe":
+        config = Qwen3MoeConfig(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=48,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=16,
+            num_experts=8,
+            num_experts_per_tok=2,
+            mlp_only_layers=[0],
+        )
+        model = Qwen3MoeForCausalLM(config).float().eval()
+
+        def reject_inspection():
+            raise AssertionError("explicit model must use its MoE declarations")
+
+        monkeypatch.setattr(model_replacement, "_legacy_inspection", reject_inspection)
+    else:
+        config = AutoConfig.for_model(
+            "deepseek_v3",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=48,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            n_shared_experts=1,
+            n_group=2,
+            topk_group=1,
+            first_k_dense_replace=1,
+            scoring_func="sigmoid",
+            routed_scaling_factor=2.5,
+            norm_topk_prob=True,
+            max_position_embeddings=128,
+        )
+        model = DeepseekV3Model(config).float().eval()
+    assert swap_moe_blocks(model) == 2
 
     layers = collect_moe_layers(model)
     assert len(layers) == 2, "the hook cannot see the swapped-in blocks"
 
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    optimizer = torch.optim.SGD(
+        [torch.nn.Parameter(torch.zeros(1))], lr=0.1, foreach=False
+    )
     register_moe_balancing_hook(optimizer, model_parts=[model], parallel_dims=None)
     balanced = torch.zeros(8)
+    counts = torch.tensor([10.0, 0.0, 5.0, 5.0, 3.0, 3.0, 2.0, 2.0])
+    uses_bias = architecture == "deepseek_v3_reference"
+    if not uses_bias:
+        # Native Qwen3 softmax routing must not gain sigmoid-style bias updates.
+        assert not optimizer._optimizer_step_pre_hooks
     for moe in layers:
-        moe.tokens_per_expert_E.copy_(
-            torch.tensor([10.0, 0.0, 5.0, 5.0, 3.0, 3.0, 2.0, 2.0])
-        )
-        assert torch.equal(moe.expert_bias_E, balanced)
+        moe.tokens_per_expert_E.copy_(counts)
+        if uses_bias:
+            assert torch.equal(moe.expert_bias_E, balanced)
+        else:
+            assert moe.expert_bias_E is None and moe.load_balance_coeff is None
 
     optimizer.step()
 
     for moe in layers:
-        assert not torch.equal(moe.expert_bias_E, balanced), "the bias never moved"
-        assert float(moe.tokens_per_expert_E.sum()) == 0.0, (
-            "the counter was not drained"
-        )
+        if uses_bias:
+            assert not torch.equal(moe.expert_bias_E, balanced), "the bias never moved"
+            assert float(moe.tokens_per_expert_E.sum()) == 0.0, (
+                "the counter was not drained"
+            )
+        else:
+            torch.testing.assert_close(moe.tokens_per_expert_E, counts)
 
 
 def test_the_collective_runs_over_a_real_process_group(single_rank_group) -> None:
@@ -497,10 +539,6 @@ def test_shared_counter_is_counted_once_with_independent_contribution():
 
 
 def test_shared_counter_reduced_once_in_original_order(monkeypatch):
-    from types import SimpleNamespace
-
-    from llmtuner.models.common.moe import bias_update
-
     first = torch.tensor([1.0, 2.0])
     second = torch.tensor([3.0, 4.0])
     sizes = []
@@ -538,8 +576,6 @@ def test_shared_counter_updates_each_independent_bias_owner():
 
 
 def test_shared_quantile_bias_uses_joint_histogram_and_original_bias():
-    from llmtuner.models.common.moe.bias_update import update_quantile_expert_bias
-    from llmtuner.models.common.moe.routing import QuantileBalancedTopKRouter
 
     layers = [
         MoE(
@@ -570,7 +606,6 @@ def test_shared_quantile_bias_uses_joint_histogram_and_original_bias():
 
 
 def test_shared_histogram_updates_independent_quantile_bias_owners():
-    from llmtuner.models.common.moe.bias_update import update_quantile_expert_bias
 
     layers = [
         MoE(

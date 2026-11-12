@@ -9,7 +9,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from llmtuner.models import registry as architecture
-from llmtuner.models.hf.factory import build_model_config, resolve_model_class
+from llmtuner.models.configuration import build_model_config, resolve_model_class
 from llmtuner.models.registry import (
     ModelSpec,
     get_model_spec,
@@ -152,9 +152,7 @@ def test_saved_custom_config_without_position_limit_matches_offline_construction
 
 
 @pytest.mark.parametrize("custom", [False, True])
-def test_unrelated_optional_architecture_does_not_block_saved_hf_config(
-    monkeypatch, tmp_path, custom
-):
+def test_saved_config_requires_a_registered_architecture(monkeypatch, tmp_path, custom):
     from transformers import LlamaConfig
 
     def unavailable_config():
@@ -186,8 +184,12 @@ def test_unrelated_optional_architecture_does_not_block_saved_hf_config(
         max_position_embeddings=32,
     ).save_pretrained(tmp_path)
 
-    restored = build_model_config(str(tmp_path), seq_len=64)
+    if not custom:
+        with pytest.raises(ValueError, match="No local configuration registered"):
+            build_model_config(str(tmp_path), seq_len=64)
+        return
 
+    restored = build_model_config(str(tmp_path), seq_len=64)
     assert isinstance(restored, config_type)
     assert restored.hidden_size == 16
     assert restored.max_position_embeddings == 64
@@ -293,9 +295,9 @@ def test_config_lookup_does_not_import_kimi_decoder_in_fresh_process():
             sys.executable,
             "-c",
             "import sys; "
-            "from llmtuner.models.hf.factory import build_model_config; "
+            "from llmtuner.models.configuration import build_model_config; "
             "from llmtuner.models.registry import get_model_spec; "
-            "build_model_config('qwen3', seq_len=32, arch_overrides={}); "
+            "build_model_config('qwen3_moe', seq_len=32, arch_overrides={}); "
             "registration = get_model_spec('kimi_linear'); "
             "config = registration.config_factory(hidden_size=32); "
             "assert isinstance(config, registration.config_type_loader()); "
@@ -349,7 +351,7 @@ from llmtuner.models.explicit import build_explicit_model
 config = registration.config_factory()
 config.model_type = "native_test"
 model = build_explicit_model(config)
-optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
 before = model.projection.weight.detach().clone()
 model(torch.ones(2, 3)).sum().backward()
 optimizer.step()
@@ -409,12 +411,25 @@ def test_explicit_and_training_resolution_share_registered_constructor(monkeypat
     assert model.projection.weight.grad.abs().sum() > 0
 
 
-def test_explicit_factory_does_not_enable_other_registered_architectures():
+def test_explicit_factory_builds_registered_architectures():
     from llmtuner.models.explicit import build_explicit_model
 
-    assert get_model_spec("qwen3_moe") is not None
-    with pytest.raises(ValueError, match="No explicit model for 'qwen3_moe'"):
-        build_explicit_model(PretrainedConfig(model_type="qwen3_moe"))
+    config = build_model_config(
+        "qwen3_moe",
+        seq_len=32,
+        arch_overrides={
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
+        },
+    )
+    model = build_explicit_model(config)
+    assert type(model).__name__ == "Qwen3MoeForCausalLM"
 
 
 @pytest.mark.parametrize("model_type", ["kimi_k3", "qwen3_5", "qwen3_5_moe"])
@@ -487,3 +502,40 @@ def test_registered_constructor_enforces_task_without_loading(monkeypatch):
         is expected
     )
     assert calls == [config]
+
+
+@pytest.mark.parametrize("returned", [None, object(), _CustomConfig()])
+def test_config_factory_must_return_its_registered_architecture(returned):
+    def forbidden():
+        raise AssertionError("Invalid config loaded model code")
+
+    registration = ModelSpec(
+        "another_architecture",
+        lambda **kwargs: returned,
+        lambda: _CustomConfig,
+        forbidden,
+    )
+    with pytest.raises(ValueError, match="another_architecture.*configuration"):
+        registration.build_config()
+
+
+@pytest.mark.parametrize("returned", [None, object(), _CustomConfig()])
+def test_saved_config_loader_cannot_change_registered_architecture(
+    monkeypatch, tmp_path, returned
+):
+    class SavedConfig(PretrainedConfig):
+        model_type = "test_saved_config_boundary"
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return returned
+
+    SavedConfig().save_pretrained(tmp_path)
+    entry = ModelSpec.from_types(
+        SavedConfig.model_type,
+        config_type=SavedConfig,
+        model_class_loader=lambda: pytest.fail("Config loading imported model code"),
+    )
+    monkeypatch.setitem(architecture._MODELS, entry.model_type, entry)
+    with pytest.raises(ValueError, match="configuration.*model_type"):
+        build_model_config(str(tmp_path), seq_len=64)

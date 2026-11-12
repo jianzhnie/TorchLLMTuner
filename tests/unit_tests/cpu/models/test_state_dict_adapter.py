@@ -1,12 +1,15 @@
 """HF state conversion preserves tied weights and caller-owned mappings."""
 
 import json
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
+
+HFTransformerStateDictAdapter = partial(ModelStateDictAdapter, model_prefix="model.")
 
 
 @pytest.mark.parametrize("stores_head", [False, True])
@@ -67,7 +70,7 @@ def test_composite_checkpoint_uses_text_weight_ties(text_tied):
 
 @pytest.mark.parametrize("complete", [False, True])
 def test_hf_index_checks_global_pipeline_keys(monkeypatch, complete):
-    import llmtuner.models.hf.state_dict_adapter as adapter_module
+    import llmtuner.components.checkpointer.model_state as adapter_module
 
     adapter = HFTransformerStateDictAdapter(
         SimpleNamespace(tie_word_embeddings=False), None
@@ -243,3 +246,51 @@ def test_invalid_index_is_rejected_during_adapter_construction(tmp_path, index):
     )
     with pytest.raises(ValueError, match="weight_map"):
         HFTransformerStateDictAdapter(SimpleNamespace(), str(tmp_path))
+
+
+def test_explicit_model_names_roundtrip_without_wrapper_prefix():
+    adapter = ModelStateDictAdapter(SimpleNamespace(tie_word_embeddings=False), None)
+    weight = torch.randn(3, 2)
+    state = {"model.layers.0.self_attn.q_proj.weight": weight}
+    exported = adapter.to_hf(state)
+    assert tuple(exported) == tuple(state)
+    assert exported[next(iter(state))] is weight
+    imported = adapter.from_hf(exported)
+    assert tuple(imported) == tuple(state)
+    assert imported[next(iter(state))] is weight
+
+
+@pytest.mark.parametrize("prefix", [None, 1, "model", ".", "model.."])
+def test_external_mapping_rejects_invalid_prefix(prefix):
+    with pytest.raises(ValueError, match="model_prefix"):
+        ModelStateDictAdapter(SimpleNamespace(), None, model_prefix=prefix)
+
+
+def test_explicit_tied_import_restores_alias_without_prefix_inference():
+    adapter = ModelStateDictAdapter(SimpleNamespace(tie_word_embeddings=True), None)
+    weight = torch.randn(4, 2)
+    source = {"model.embed_tokens.weight": weight}
+    imported = adapter.from_hf(source)
+    assert imported["model.embed_tokens.weight"] is imported["lm_head.weight"]
+    assert imported["lm_head.weight"] is weight
+    assert tuple(source) == ("model.embed_tokens.weight",)
+    exported = adapter.to_hf(imported)
+    torch.testing.assert_close(exported["lm_head.weight"], weight, rtol=0, atol=0)
+    assert exported["lm_head.weight"] is not weight
+
+
+@pytest.mark.parametrize("field", ["kimi_expert_parallel", "qwen3_expert_parallel"])
+@pytest.mark.parametrize("value", [0, 1, "false", "true", None])
+def test_ep_layout_selector_rejects_nonboolean_before_checkpoint_io(
+    field, value, monkeypatch
+):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Invalid layout selector reached checkpoint IO")
+
+    monkeypatch.setattr("os.path.isfile", forbidden)
+    with pytest.raises(TypeError, match=field + " must be boolean"):
+        ModelStateDictAdapter(
+            SimpleNamespace(model_type="qwen3_moe"),
+            "/unread-checkpoint",
+            **{field: value},
+        )

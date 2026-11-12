@@ -19,17 +19,39 @@ import torch.distributed.checkpoint as dcp
 
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.components.checkpointer.hf.kimi_layout import load_changed_kimi_layout
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.components.optimizer.ema import EMA
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from tests.unit_tests.cpu.models.test_kimi_dcp_layout import OptimizerState
-from tests.unit_tests.cpu.parallel.test_kimi_conversion import make_model
 
 
-def build():
-    wrapper = torch.nn.Module()
-    wrapper.model = make_model(latent=True, shared=1)
-    return wrapper
+def build() -> KimiLinearForCausalLM:
+    return KimiLinearForCausalLM(
+        KimiLinearConfig(
+            vocab_size=16,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_experts=4,
+            num_experts_per_token=2,
+            moe_intermediate_size=12,
+            num_shared_experts=1,
+            num_expert_group=2,
+            topk_group=1,
+            routed_expert_hidden_size=4,
+            latent_moe_use_norm=True,
+            linear_attn_config={
+                "kda_layers": [1],
+                "full_attn_layers": [],
+                "head_dim": 4,
+                "num_heads": 2,
+                "short_conv_kernel_size": 3,
+            },
+        )
+    )
 
 
 def main():
@@ -71,7 +93,7 @@ def main():
                 path = f"{roots[0]}/{category}-{corruption}"
                 dcp.save(damaged, checkpoint_id=path)
                 target = build()
-                swap_hf_moe_blocks(target.model)
+                swap_moe_blocks(target.model)
                 optimizer = OptimizerState(target)
                 ema = EMA(model_parts=[target], decay=0.5)
                 states = {
@@ -83,9 +105,7 @@ def main():
                     name: deepcopy(state.state_dict()) for name, state in states.items()
                 }
                 rng_before = torch.get_rng_state().clone()
-                adapter = HFTransformerStateDictAdapter(
-                    config, None, kimi_expert_parallel=True
-                )
+                adapter = ModelStateDictAdapter(config, None, kimi_expert_parallel=True)
                 try:
                     load_changed_kimi_layout(path, states=states, adapter=adapter)
                 except ValueError as error:

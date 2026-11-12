@@ -1,29 +1,39 @@
 """Explicit RoPE cache precision contracts."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeAttention as ReferenceAttention,
+)
 
 from llmtuner.config.model_config import ModelConfig
-from llmtuner.errors import ConfigError, UnsupportedCombinationError
-from llmtuner.models.qwen.qwen3.qkv_projection import apply_configured_rotary
+from llmtuner.errors import ConfigError
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeAttention, Qwen3MoeForCausalLM
+from llmtuner.models.qwen.qwen3.normalization import build_rms_norm
+from llmtuner.models.qwen.qwen3.rotary import (
+    Qwen3FP32RotaryEmbedding,
+    apply_fp32_rotary,
+)
+from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
+
+
+def make_rotary(cache_dtype):
+    config = model_config(
+        rope_parameters={"rope_theta": 1000000.0, "rope_type": "default"}
+    )
+    config.rotary_compute_dtype = "float32"
+    config.rotary_cache_dtype = cache_dtype
+    return Qwen3FP32RotaryEmbedding(config)
 
 
 @pytest.mark.parametrize("cache_dtype", ["float32", "bfloat16"])
 def test_fp32_rotary_accumulates_branches_before_bf16_gradient_cast(cache_dtype):
-    module = SimpleNamespace(
-        config=SimpleNamespace(
-            rotary_compute_dtype="float32",
-            rotary_cache_dtype=cache_dtype,
-            rope_parameters={"rope_theta": 1000000.0, "rope_type": "default"},
-        )
-    )
+    rotary = make_rotary(cache_dtype)
     torch.manual_seed(37)
     query = torch.randn(2, 3, 16, 8, dtype=torch.bfloat16, requires_grad=True)
     key = torch.randn_like(query, requires_grad=True)
     positions = torch.arange(16)[None].expand(2, -1)
-    actual = apply_configured_rotary(module, query, key, None, None, positions)
+    actual = apply_fp32_rotary(query, key, *rotary(query, positions))
     frequencies = 1.0 / (1000000.0 ** (torch.arange(0, 8, 2).float() / 8))
     angles = positions.float().unsqueeze(-1) * frequencies
     angles = torch.cat((angles, angles), -1).unsqueeze(1)
@@ -50,17 +60,11 @@ def test_fp32_rotary_accumulates_branches_before_bf16_gradient_cast(cache_dtype)
 
 
 def test_bf16_cache_matches_quantized_reference():
-    module = SimpleNamespace(
-        config=SimpleNamespace(
-            rotary_compute_dtype="float32",
-            rotary_cache_dtype="bfloat16",
-            rope_parameters={"rope_theta": 1000000.0, "rope_type": "default"},
-        )
-    )
+    rotary = make_rotary("bfloat16")
     torch.manual_seed(37)
     query = torch.randn(1, 2, 32, 8, dtype=torch.bfloat16)
     positions = torch.arange(32)[None]
-    actual, _ = apply_configured_rotary(module, query, query, None, None, positions)
+    actual, _ = apply_fp32_rotary(query, query, *rotary(query, positions))
     frequencies = 1.0 / (1000000.0 ** (torch.arange(0, 8, 2).float() / 8))
     angles = positions.float().unsqueeze(-1) * frequencies
     angles = torch.cat((angles, angles), -1).unsqueeze(1)
@@ -71,10 +75,8 @@ def test_bf16_cache_matches_quantized_reference():
         query.float() * cosine + torch.cat((-second, first), -1) * sine
     ).bfloat16()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    module.config.rotary_cache_dtype = None
-    unquantized, _ = apply_configured_rotary(
-        module, query, query, None, None, positions
-    )
+    rotary.config.rotary_cache_dtype = None
+    unquantized, _ = apply_fp32_rotary(query, query, *rotary(query, positions))
     assert not torch.equal(actual, unquantized)
 
 
@@ -84,89 +86,59 @@ def test_cache_precision_requires_fp32_application():
 
 
 def test_npu_norm_rejects_cpu_input():
-    from llmtuner.models.qwen.qwen3.normalization_setup import forward_npu_rms_norm
-
-    module = SimpleNamespace(weight=torch.ones(8), variance_epsilon=1e-6)
+    module = build_rms_norm(8, 1e-6, backend="npu")
     with pytest.raises(RuntimeError, match="requires NPU"):
-        forward_npu_rms_norm(module, torch.ones(2, 8))
+        module(torch.ones(2, 8))
 
 
 def test_separate_qkv_fp32_rope_preserves_projection_calls():
-    from transformers import AutoConfig
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
-
-    from llmtuner.models.qwen.qwen3.qkv_projection import apply_fp32_rotary_projection
-
-    config = AutoConfig.for_model(
-        "qwen3",
-        hidden_size=16,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-    )
+    config = model_config()
     config.qkv_projection = "separate"
     config.rotary_compute_dtype = "float32"
     config._attn_implementation = "eager"
-    attention = Qwen3Attention(config, layer_idx=0)
+    attention = Qwen3MoeAttention(config, layer_idx=0)
+    rotary = Qwen3FP32RotaryEmbedding(config)
     calls = []
     handles = [
         module.register_forward_hook(lambda module, args, output: calls.append(module))
         for module in (attention.q_proj, attention.k_proj, attention.v_proj)
     ]
-    wrapper = SimpleNamespace(
-        config=config,
-        model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attention)]),
-    )
-    apply_fp32_rotary_projection(wrapper)
-    apply_fp32_rotary_projection(wrapper)
     hidden = torch.randn(1, 4, 16, requires_grad=True)
     positions = torch.arange(4)[None]
-    output, _ = attention(
-        hidden,
-        (None, None),
-        None,
-        position_ids=positions,
-    )
-    output.sum().backward()
+    try:
+        output, _ = attention(hidden, rotary(hidden, positions), None)
+        output.sum().backward()
+    finally:
+        for handle in handles:
+            handle.remove()
     assert calls == [attention.q_proj, attention.k_proj, attention.v_proj]
-    assert torch.isfinite(hidden.grad).all()
-    assert all(module.weight.grad is not None for module in calls)
-    for handle in handles:
-        handle.remove()
+    assert torch.isfinite(hidden.grad).all() and hidden.grad.count_nonzero() > 0
+    assert all(module.weight.grad.count_nonzero() > 0 for module in calls)
 
 
 @pytest.mark.parametrize("projection", ["separate", "fused"])
-def test_attention_adapter_rejects_custom_forward_before_modifying_any_layer(
-    projection,
-):
-    from transformers import AutoConfig
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
-
-    from llmtuner.models.qwen.qwen3.qkv_projection import (
-        apply_fp32_rotary_projection,
-        apply_fused_qkv_projection,
-    )
-
-    config = AutoConfig.for_model(
-        "qwen3",
-        hidden_size=16,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-    )
-    config.qkv_projection = projection
+def test_precision_construction_does_not_patch_external_or_other_instances(projection):
+    native_config = model_config()
+    native_config._attn_implementation = "eager"
+    external = ReferenceAttention(native_config, layer_idx=0)
+    external.forward = lambda *args, **kwargs: None
+    external_forward = external.forward
+    reference_forward = ReferenceAttention.forward
+    untouched = Qwen3MoeAttention(native_config, layer_idx=0)
+    local_forward = untouched.forward
+    config = model_config()
     config.rotary_compute_dtype = "float32"
-    first, second = (Qwen3Attention(config, layer_idx=i) for i in range(2))
-    second.forward = lambda *args, **kwargs: None
-    wrapper = SimpleNamespace(
-        config=config,
-        model=SimpleNamespace(
-            layers=[SimpleNamespace(self_attn=first), SimpleNamespace(self_attn=second)]
-        ),
-    )
-    with pytest.raises(UnsupportedCombinationError, match="native attention"):
-        if projection == "fused":
-            apply_fused_qkv_projection(wrapper)
-        else:
-            apply_fp32_rotary_projection(wrapper)
-    assert "forward" not in first.__dict__
+    config.qkv_projection = projection
+    model = Qwen3MoeForCausalLM(config)
+    parameters = {name: id(value) for name, value in model.named_parameters()}
+    state_keys = tuple(model.state_dict())
+    assert ReferenceAttention.forward is reference_forward
+    assert external.forward is external_forward
+    assert untouched.forward == local_forward
+    assert "forward" not in untouched.__dict__
+    assert all("forward" not in layer.self_attn.__dict__ for layer in model.layers)
+    for _ in range(2):
+        result = model(torch.tensor([[1, 3, 7, 2]])).logits
+        assert result.isfinite().all() and result.count_nonzero() > 0
+    assert parameters == {name: id(value) for name, value in model.named_parameters()}
+    assert tuple(model.state_dict()) == state_keys

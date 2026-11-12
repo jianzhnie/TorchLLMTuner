@@ -1,29 +1,21 @@
 """The training recipe preserves published geometry unless reducing layers."""
 
 from argparse import Namespace
-from types import SimpleNamespace
 
 import pytest
 import torch
 from transformers import AutoConfig
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-    Qwen3_5MoeForCausalLM,
     Qwen3_5MoeGatedDeltaNet,
 )
 
 from examples.qwen3_5.train import build_argument_parser, build_config
 from llmtuner.config import DataloaderConfig
 from llmtuner.datasets.corpus_identity import corpus_data_identity
-from llmtuner.errors import ConfigError, UnsupportedCombinationError
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.materialization import (
-    initialize_random_hf_model,
-    materialize_meta_model,
-)
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.models.qwen.qwen3_5.linear_attention import (
-    validate_linear_attention_training,
-)
+from llmtuner.errors import ConfigError
+from llmtuner.memory.materialization import materialize_meta_model
+from llmtuner.models.configuration import build_model_config_for
+from llmtuner.models.qwen.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 
 
 def recipe_args(tmp_path, layers=None):
@@ -152,17 +144,18 @@ def test_meta_materialization_initializes_delta_state_and_backward():
         linear_num_value_heads=4,
     )
     with torch.device("meta"):
-        model = HFTransformerModel(architecture)
-    materialize_meta_model(model, torch.device("cpu"))
-    initialize_random_hf_model(model.model)
+        model = Qwen3_5MoeForCausalLM(architecture)
+    device = torch.device("cpu")
+    materialize_meta_model(
+        model, device, runtime_buffers=model.materialization_buffers(device)
+    )
+    model.initialize_parameters()
     delta_layers = [m for m in model.modules() if hasattr(m, "dt_bias")]
     assert len(delta_layers) == 3
     for layer in delta_layers:
         torch.testing.assert_close(layer.dt_bias, torch.ones_like(layer.dt_bias))
         assert torch.isfinite(layer.A_log).all()
-    logits = model.model(
-        input_ids=torch.tensor([[1, 7, 3, 11]]), use_cache=False
-    ).logits
+    logits = model(input_ids=torch.tensor([[1, 7, 3, 11]]), use_cache=False).logits
     logits.float().square().mean().backward()
     assert torch.isfinite(logits).all()
     gradients = [p.grad for p in model.parameters() if p.grad is not None]
@@ -196,13 +189,8 @@ def test_recipe_rejects_unsupported_gdn_topology_before_training(tmp_path):
     args.linear_attention_backend = "npu_triton"
     args.tp = 2
     config = build_config(args)
-    with pytest.raises(UnsupportedCombinationError, match="TP|parallel|FSDP"):
-        validate_linear_attention_training(
-            config,
-            build_model_config_for(config),
-            device=SimpleNamespace(type="npu"),
-            parallel_dims=SimpleNamespace(dp_shard=4, dp_replicate=1),
-        )
+    with pytest.raises(ValueError, match="npu_triton"):
+        Qwen3_5MoeForCausalLM(build_model_config_for(config))
 
 
 @pytest.mark.parametrize("mode", ["none", "full"])
@@ -286,7 +274,7 @@ def test_bf16_delta_decay_initialization_excludes_log_zero():
     delta.num_v_heads = 8192
     delta.A_log = torch.nn.Parameter(torch.empty(8192, dtype=torch.bfloat16))
     delta.dt_bias = torch.nn.Parameter(torch.empty(8192, dtype=torch.bfloat16))
-    initialize_random_hf_model(model)
+    model._init_weights(delta)
     assert torch.isfinite(delta.A_log).all()
     assert delta.A_log.float().exp().min() > 0
     assert torch.count_nonzero(delta.A_log) > 8000

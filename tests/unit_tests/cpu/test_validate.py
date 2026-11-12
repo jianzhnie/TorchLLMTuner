@@ -145,7 +145,7 @@ class _EchoModel(torch.nn.Module):
         self.saw_eval_mode: bool | None = None
         self.saw_num_valid_tokens_kwarg = False
 
-    def preprocess_inputs(self, batch, **kwargs):
+    def prepare_inputs(self, batch, *, parallel_dims, max_context_length=None):
         if "num_valid_tokens" in batch:
             self.saw_num_valid_tokens_kwarg = True
         labels = batch["labels"]

@@ -25,7 +25,7 @@ from transformers import AutoConfig
 
 from llmtuner.config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel import tensor_parallel as tp_engine
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
@@ -701,7 +701,7 @@ def test_the_dense_plan_leaves_moe_internals_to_the_expert_axis(ep: int) -> None
         max_position_embeddings=256,
         experts_implementation="eager",
     )
-    model = HFTransformerModel(config).eval()
+    model = Qwen3MoeForCausalLM(config).eval()
     cfg = ParallelConfig(tensor_parallel_size=2, expert_parallel_size=ep)
 
     targets, moe_blocks = resolve_tp_targets(model, cfg=cfg)
@@ -717,7 +717,7 @@ def test_the_dense_plan_leaves_moe_internals_to_the_expert_axis(ep: int) -> None
     # the exclusion above is the only thing standing between the experts and
     # the dense realizers.
     assert [path for path, _ in moe_blocks] == (
-        [] if ep > 1 else [f"model.model.layers.{index}.mlp" for index in range(2)]
+        [] if ep > 1 else [f"model.layers.{index}.mlp" for index in range(2)]
     )
     # Non-vacuity: the attention projections still resolve, so a plan that
     # matched nothing (which would silently train a replicated model, and is

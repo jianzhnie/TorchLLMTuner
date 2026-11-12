@@ -318,11 +318,11 @@ def test_a_wrapper_tp_config_matches_the_modules_it_exposes() -> None:
 
     Checked on the real wrapper so the path spelling is the real one.
     """
-    from llmtuner.models.hf.factory import build_model_config
-    from llmtuner.models.hf.model import HFTransformerModel
+    from llmtuner.models.configuration import build_model_config
+    from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 
     config = build_model_config(
-        "llama",
+        "qwen3_moe",
         seq_len=32,
         arch_overrides={
             "vocab_size": 32,
@@ -331,9 +331,11 @@ def test_a_wrapper_tp_config_matches_the_modules_it_exposes() -> None:
             "num_hidden_layers": 2,
             "num_attention_heads": 2,
             "num_key_value_heads": 2,
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
         },
     )
-    model = HFTransformerModel(config)
+    model = Qwen3MoeForCausalLM(config)
     plan = resolve_tp_sharding_plan(model, plan=None)
 
     assert plan, "the wrapper exposed no usable TP plan"
@@ -344,10 +346,9 @@ def test_a_wrapper_tp_config_matches_the_modules_it_exposes() -> None:
         if isinstance(mod, nn.Linear)
         and match_tp_sharding_spec(path, plan=plan) is not None
     ]
-    # 7 projections per layer x 2 layers. ``lm_head`` is deliberately absent:
-    # HF's plan does not shard it, which is why the vocab-parallel loss path
-    # stays unreachable until a Shard(0) head plan lands.
-    assert len(matched) == 14
+    # Qwen3's explicit plan covers the four attention projections per layer;
+    # MoE expert projections are owned by EP and are not duplicated by TP.
+    assert len(matched) == 8
     assert not any(path.endswith("lm_head") for path in matched)
 
 
@@ -369,11 +370,11 @@ def test_qwen3_plan_resolves_rather_than_raising_on_its_qk_norms() -> None:
     its gradient summed by ``allreduce_replicated_tp_grads``), while
     the projections still resolve to real realizers.
     """
-    from llmtuner.models.hf.factory import build_model_config
-    from llmtuner.models.hf.model import HFTransformerModel
+    from llmtuner.models.configuration import build_model_config
+    from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 
     config = build_model_config(
-        "qwen3",
+        "qwen3_moe",
         seq_len=32,
         arch_overrides={
             "vocab_size": 32,
@@ -382,9 +383,11 @@ def test_qwen3_plan_resolves_rather_than_raising_on_its_qk_norms() -> None:
             "num_hidden_layers": 2,
             "num_attention_heads": 2,
             "num_key_value_heads": 2,
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
         },
     )
-    model = HFTransformerModel(config)
+    model = Qwen3MoeForCausalLM(config)
 
     # The real plan must resolve, whatever the installed transformers declares.
     plan = resolve_tp_sharding_plan(model, plan=None)
@@ -404,8 +407,8 @@ def test_qwen3_plan_resolves_rather_than_raising_on_its_qk_norms() -> None:
         if isinstance(mod, nn.Linear)
         and match_tp_sharding_spec(path, plan=plan) is not None
     ]
-    # 7 projections per layer x 2; the norms are neither nn.Linear nor sharded.
-    assert len(matched) == 14
+    # Attention projections remain TP targets; MoE projections are EP-owned.
+    assert len(matched) == 8
     # And the norms really are parameters of this model, so leaving them
     # unsharded is a decision about a module that exists.
     norm_params = [
@@ -464,11 +467,9 @@ class _HeadStub(nn.Module):
         super().__init__()
         from types import SimpleNamespace
 
-        self.model = SimpleNamespace(
-            config=SimpleNamespace(
-                num_attention_heads=num_attention_heads,
-                num_key_value_heads=num_key_value_heads,
-            )
+        self.config = SimpleNamespace(
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
         )
 
 

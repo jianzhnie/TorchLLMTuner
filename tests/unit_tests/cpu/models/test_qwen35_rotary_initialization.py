@@ -1,4 +1,4 @@
-"""Native HF CPU initialization lifecycle contracts, not full35B/NPU acceptance.
+"""Explicit model CPU initialization lifecycle contracts, not full35B/NPU acceptance.
 
 Small dense/MoE geometries bound CPU memory; real rotary classes use partial
 rotary dim64. One-ULP frequency perturbations represent materialized-device
@@ -12,24 +12,18 @@ import copy
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
-from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
-from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
 )
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-    Qwen3_5MoeForCausalLM,
-)
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from llmtuner.models.hf.materialization import (
-    initialize_random_hf_model,
-    materialize_meta_model,
-)
+from llmtuner.memory.materialization import materialize_meta_model
+from llmtuner.models.configuration import resolve_model_class
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.models.qwen.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 
 FAMILIES = [
-    pytest.param(Qwen3_5TextConfig, Qwen3_5ForCausalLM, id="dense"),
     pytest.param(Qwen3_5MoeTextConfig, Qwen3_5MoeForCausalLM, id="moe"),
 ]
 
@@ -66,19 +60,8 @@ def text_config(config_type, *, dynamic=False):
 
 
 def native_initialization_reference(model):
-    """HF initialization plus the established finite FP32 A_log contract."""
+    """Reference traversal through the model-owned leaf initialization rules."""
     model.apply(model._init_weights)
-    if model.config.model_type not in {"qwen3_5_text", "qwen3_5_moe_text"}:
-        return
-    with torch.no_grad():
-        for module in model.modules():
-            if type(module).__name__ in {
-                "Qwen3_5GatedDeltaNet",
-                "Qwen3_5MoeGatedDeltaNet",
-            }:
-                rates = torch.empty_like(module.A_log, dtype=torch.float32)
-                rates.uniform_(torch.finfo(torch.float32).tiny, 16).log_()
-                module.A_log.copy_(rates)
 
 
 def distinct_frequencies(rotary):
@@ -111,7 +94,7 @@ def test_native_default_dtype_initialization_matches_parameters_and_rng(
             native_initialization_reference(reference)
             expected_rng = torch.get_rng_state().clone()
             torch.manual_seed(919)
-            initialize_random_hf_model(model)
+            model.initialize_parameters()
             assert_parameter_contract(model, reference)
             assert torch.equal(torch.get_rng_state(), expected_rng)
     finally:
@@ -148,7 +131,7 @@ def test_random_initialization_preserves_materialized_frequencies_and_rng(
         native_initialization_reference(reference)
         expected_rng = torch.get_rng_state().clone()
         torch.manual_seed(909)
-        initialize_random_hf_model(model)
+        model.initialize_parameters()
         assert torch.equal(torch.get_rng_state(), expected_rng)
         assert_parameter_contract(model, reference)
         assert parameter_ids == {
@@ -167,7 +150,7 @@ def test_random_initialization_preserves_materialized_frequencies_and_rng(
         assert not torch.equal(reference.model.rotary_emb.inv_freq, materialized)
         repeated = copy.deepcopy(model)
         torch.manual_seed(909)
-        initialize_random_hf_model(repeated)
+        repeated.initialize_parameters()
         assert torch.equal(torch.get_rng_state(), expected_rng)
         assert_parameter_contract(model, repeated)
 
@@ -185,7 +168,7 @@ def test_dynamic_rotary_keeps_native_initialization(config_type, model_type):
         native_initialization_reference(reference)
         expected_rng = torch.get_rng_state().clone()
         torch.manual_seed(918)
-        initialize_random_hf_model(model)
+        model.initialize_parameters()
         assert torch.equal(torch.get_rng_state(), expected_rng)
         assert_parameter_contract(model, reference)
         assert torch.equal(rotary.inv_freq, reference.model.rotary_emb.inv_freq)
@@ -194,8 +177,8 @@ def test_dynamic_rotary_keeps_native_initialization(config_type, model_type):
 
 def test_other_native_architecture_keeps_original_rotary_initialization():
     with torch.random.fork_rng(devices=[]):
-        model = Qwen3ForCausalLM(
-            Qwen3Config(
+        model = Qwen3MoeForCausalLM(
+            Qwen3MoeConfig(
                 vocab_size=32,
                 hidden_size=32,
                 intermediate_size=64,
@@ -203,6 +186,9 @@ def test_other_native_architecture_keeps_original_rotary_initialization():
                 num_attention_heads=2,
                 num_key_value_heads=1,
                 head_dim=64,
+                num_experts=2,
+                num_experts_per_tok=1,
+                moe_intermediate_size=16,
             )
         )
         rotary = model.model.rotary_emb
@@ -214,7 +200,7 @@ def test_other_native_architecture_keeps_original_rotary_initialization():
         native_initialization_reference(reference)
         expected_rng = torch.get_rng_state().clone()
         torch.manual_seed(917)
-        initialize_random_hf_model(model)
+        model.initialize_parameters()
         assert torch.equal(torch.get_rng_state(), expected_rng)
         assert_parameter_contract(model, reference)
         assert torch.equal(rotary.inv_freq, reference.model.rotary_emb.inv_freq)
@@ -232,7 +218,11 @@ def test_meta_materialization_and_native_resume_preserve_runtime_aliases(
             "runtime_alias", model.model.rotary_emb.inv_freq, persistent=False
         )
         rng = torch.get_rng_state().clone()
-        materialize_meta_model(model, torch.device("cpu"))
+        materialize_meta_model(
+            model,
+            torch.device("cpu"),
+            runtime_buffers=model.materialization_buffers(torch.device("cpu")),
+        )
         assert torch.equal(torch.get_rng_state(), rng)
         assert all(not value.is_meta for value in model.parameters())
         assert all(not value.is_meta for value in model.buffers())
@@ -240,16 +230,20 @@ def test_meta_materialization_and_native_resume_preserve_runtime_aliases(
         frequencies = distinct_frequencies(model.model.rotary_emb)
         model.model.rotary_emb.inv_freq.copy_(frequencies)
         model.model.rotary_emb.original_inv_freq.copy_(frequencies)
-        initialize_random_hf_model(model)
+        model.initialize_parameters()
         state = model.state_dict()
         assert not any("inv_freq" in name or "runtime_alias" in name for name in state)
         dcp.save({"model": state}, checkpoint_id=tmp_path / "step-50")
         with torch.device("meta"):
             restored = model_type(text_config(config_type))
-        materialize_meta_model(restored, torch.device("cpu"))
+        materialize_meta_model(
+            restored,
+            torch.device("cpu"),
+            runtime_buffers=restored.materialization_buffers(torch.device("cpu")),
+        )
         restored.model.rotary_emb.inv_freq.copy_(frequencies)
         restored.model.rotary_emb.original_inv_freq.copy_(frequencies)
-        initialize_random_hf_model(restored)
+        restored.initialize_parameters()
         destination = {"model": restored.state_dict()}
         dcp.load(destination, checkpoint_id=tmp_path / "step-50")
         restored.load_state_dict(destination["model"], strict=True)
@@ -265,9 +259,14 @@ def test_native_hf_checkpoint_loading_preserves_parameter_values(
 ):
     with torch.random.fork_rng(devices=[]):
         model = model_type(text_config(config_type))
-        initialize_random_hf_model(model)
+        model.initialize_parameters()
         model.save_pretrained(tmp_path / "hf")
         restored = model_type.from_pretrained(tmp_path / "hf", local_files_only=True)
         assert_parameter_contract(model, restored)
         assert torch.isfinite(restored.model.rotary_emb.inv_freq).all()
         assert torch.isfinite(restored.model.rotary_emb.original_inv_freq).all()
+
+
+def test_unregistered_dense_text_model_has_no_automatic_hf_fallback():
+    with pytest.raises(ValueError, match="No local model registered"):
+        resolve_model_class(text_config(Qwen3_5TextConfig))

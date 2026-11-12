@@ -16,6 +16,7 @@ from llmtuner.config.parallel_config import (
     ContextParallelConfig,
     ParallelConfig,
 )
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.context_parallel import context_parallel as cp_module
 from llmtuner.parallel.context_parallel.sdpa_attention import (
     CPSdpaKernel,
@@ -126,17 +127,30 @@ def test_packed_kv_slices_queries_without_crossing_documents(rank) -> None:
     torch.testing.assert_close(actual, expected)
 
 
-class _FakeLayer:
+class _FakeLayer(torch.nn.Module):
     def __init__(self) -> None:
+        super().__init__()
         self.self_attn = torch.nn.Module()
 
 
 class _FakeModel(torch.nn.Module):
+    decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+        attention="self_attn",
+    )
+
+    def set_cp_mesh(self, mesh, **kwargs):
+        self.cp_mesh = mesh
+
     def __init__(self, impl: str) -> None:
         super().__init__()
-        self.layers = [_FakeLayer()]
-        self.model = SimpleNamespace(
-            config=SimpleNamespace(attn_mask_type="causal", _attn_implementation=impl)
+        self.layers = torch.nn.ModuleList([_FakeLayer()])
+        self.config = SimpleNamespace(
+            attn_mask_type="causal", _attn_implementation=impl
         )
 
 
@@ -158,14 +172,15 @@ def test_kv_allgather_on_a_non_flex_backend_attaches_the_sdpa_kernel() -> None:
         model, mesh=_OuterMesh(_fake_mesh(2, 0)), cfg=_cp_config(), parallel_dims=None
     )
 
-    assert model.model.config._attn_implementation == "sdpa_cp"
+    assert model.config._attn_implementation == "sdpa_cp"
     assert isinstance(model.layers[0].self_attn._titan_cp_sdpa_kernel, CPSdpaKernel)
     assert recorded["strategy"] == "kv_allgather"
 
 
-def test_packed_kv_rejects_unvalidated_load_balancing() -> None:
+@pytest.mark.parametrize("mask_type", ["causal", "block_causal"])
+def test_kv_rejects_unvalidated_load_balancing_before_mutation(mask_type) -> None:
     model = _FakeModel("sdpa")
-    model.model.config.attn_mask_type = "block_causal"
+    model.config.attn_mask_type = mask_type
     cfg = _cp_config()
     cfg.cp_config.context_parallel_load_balancer = "headtail"
     with pytest.raises(NotImplementedError, match="load_balancer=None"):
@@ -176,7 +191,9 @@ def test_packed_kv_rejects_unvalidated_load_balancing() -> None:
             parallel_dims=None,
         )
     assert not hasattr(model.layers[0].self_attn, "_titan_cp_sdpa_kernel")
-    assert model.model.config._attn_implementation == "sdpa"
+    assert not hasattr(model.config, "_cp_sdpa_ulysses")
+    assert not hasattr(model.config, "_cp_sdpa_dual")
+    assert model.config._attn_implementation == "sdpa"
 
 
 def test_ulysses_gets_its_own_sdpa_kernel() -> None:
@@ -197,17 +214,17 @@ def test_ulysses_gets_its_own_sdpa_kernel() -> None:
         parallel_dims=None,
     )
 
-    assert model.model.config._attn_implementation == "sdpa_cp"
+    assert model.config._attn_implementation == "sdpa_cp"
     assert isinstance(
         model.layers[0].self_attn._titan_cp_sdpa_kernel, CPSdpaUlyssesKernel
     )
-    assert model.model.config._cp_sdpa_ulysses is True
+    assert model.config._cp_sdpa_ulysses is True
 
 
 @pytest.mark.parametrize("packed", [False, True])
 def test_dual_axes_attach_the_sdpa_kernel(packed) -> None:
     model = _FakeModel("sdpa")
-    model.model.config.attn_mask_type = "block_causal" if packed else "causal"
+    model.config.attn_mask_type = "block_causal" if packed else "causal"
     recorded = {}
     model.set_cp_mesh = lambda mesh, **kwargs: recorded.update(kwargs)
     cfg = _cp_config()
@@ -228,7 +245,7 @@ def test_dual_axes_attach_the_sdpa_kernel(packed) -> None:
     assert isinstance(kernel, DualCPSdpaKernel)
     assert kernel.packed is packed
     assert kernel.cp_rank == 1
-    assert model.model.config._cp_sdpa_dual
+    assert model.config._cp_sdpa_dual
     assert recorded["mask_mesh"] is kv_mesh
 
 
@@ -248,8 +265,8 @@ def test_dual_sdpa_rejects_missing_topology() -> None:
 @pytest.mark.parametrize("invalid", ["load_balancer", "heads"])
 def test_dual_sdpa_retains_ulysses_guards(invalid) -> None:
     model = _FakeModel("sdpa")
-    model.model.config.num_attention_heads = 4
-    model.model.config.num_key_value_heads = 3 if invalid == "heads" else 4
+    model.config.num_attention_heads = 4
+    model.config.num_key_value_heads = 3 if invalid == "heads" else 4
     cfg = ParallelConfig(
         context_parallel_kv_allgather_size=2,
         context_parallel_ulysses_size=2,
@@ -265,7 +282,7 @@ def test_dual_sdpa_retains_ulysses_guards(invalid) -> None:
             cfg=cfg,
             parallel_dims=topology,
         )
-    assert model.model.config._attn_implementation == "sdpa"
+    assert model.config._attn_implementation == "sdpa"
 
 
 # -- the ulysses swap's mask ---------------------------------------------------

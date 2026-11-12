@@ -38,14 +38,13 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.parallel import model_compile as compile_mod
+from llmtuner.parallel.model_compile import apply_compile, maybe_regional_inductor
 
 try:
-    from torch._dynamo import OptimizedModule
-
     from llmtuner.models.hf.factory import build_model_config
     from llmtuner.models.hf.model import HFTransformerModel
-    from llmtuner.parallel import model_compile as compile_mod
-    from llmtuner.parallel.model_compile import apply_compile, maybe_regional_inductor
+    from torch._dynamo import OptimizedModule
 
     _IMPORT_ERROR = None
 except Exception as e:  # noqa: BLE001 - env gate, see module docstring
@@ -53,7 +52,7 @@ except Exception as e:  # noqa: BLE001 - env gate, see module docstring
 
 requires_runtime = pytest.mark.skipif(
     _IMPORT_ERROR is not None,
-    reason=f"this torch lacks the flex/spmd import surface: {_IMPORT_ERROR}",
+    reason=f"legacy model fixture dependency is unavailable: {_IMPORT_ERROR}",
 )
 
 try:
@@ -76,8 +75,7 @@ _NUM_LAYERS = 3
 @pytest.fixture(autouse=True)
 def cpu_compile_device():
     with pytest.MonkeyPatch.context() as patch:
-        if _IMPORT_ERROR is None:
-            patch.setattr(compile_mod, "device_type", "cpu")
+        patch.setattr(compile_mod, "device_type", "cpu")
         yield
 
 
@@ -351,7 +349,6 @@ def test_capture_scalar_outputs_set_only_for_token_choice_moe(monkeypatch) -> No
 )
 def test_regional_inductor_annotations_are_isolated_between_models(monkeypatch):
     import torch.fx.traceback as fx_traceback
-
     from llmtuner.models.hf import attention_backend
 
     regional_model, inductor_model, untouched_model = (_model() for _ in range(3))

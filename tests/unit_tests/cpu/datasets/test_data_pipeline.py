@@ -3361,7 +3361,7 @@ def test_grain_invalid_cursor_dcp_preflight_preserves_training_state(
     )
     loader = _loader(dataset, tokenizer)
     model = torch.nn.Linear(2, 2)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, foreach=False)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
     ema = EMA(model_parts=[model], decay=0.9)
     manager = DistributedCheckpointManager(

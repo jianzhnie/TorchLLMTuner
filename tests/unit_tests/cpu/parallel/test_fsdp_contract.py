@@ -1,19 +1,7 @@
-"""The FSDP contract: what the sharding layer reads off a model, and how.
+"""FSDP consumes explicit model structure and live parameter ownership.
 
-``fsdp.py`` is written against torchtitan's ``Decoder`` shape -- a ``ModuleDict``
-of layers plus four named modules on the top-level object. llmtuner trains HF
-models, whose layout differs on both counts. These tests pin the two places that
-reconcile them, since a break in either is invisible until either:
-
-* the model silently fails to shard (an adapter that stops taking effect), or
-* FSDP raises partway through a distributed run (a name that stopped resolving).
-
-They run against the real ``HFTransformerModel`` over a tiny offline LLaMA --
-now that there is only one wrapper, the contract is worth pinning on the object
-FSDP actually receives rather than on a stand-in that could drift from it.
-
-No process group is needed: the layer iterator is pure container logic, and the
-accessors are plain attribute lookups on a tiny offline model.
+CPU tests cover layer traversal, shared parameters, root-owned boundaries and
+prefetch declarations. Mocked wrapping does not validate real FSDP collectives.
 """
 
 from __future__ import annotations
@@ -30,8 +18,8 @@ from torch.nn import ModuleDict, ModuleList
 
 import llmtuner.parallel.fully_shard_parallel.fully_shard_parallel as apply
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
-from llmtuner.models.hf.factory import build_model_config
-from llmtuner.models.hf.model import HFTransformerModel
+from llmtuner.models.configuration import build_model_config
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.fully_shard_parallel.fine_grained import (
     CustomFSDPStrategy,
     NativeFSDPStrategy,
@@ -152,9 +140,9 @@ def test_decoder_fsdp_excludes_pipeline_identity_boundaries(
     assert all(type(module) is not nn.Identity for module in boundary)
 
 
-def _wrapper(*, tied: bool = False) -> HFTransformerModel:
+def build_model(*, tied: bool = False) -> Qwen3MoeForCausalLM:
     config = build_model_config(
-        "llama",
+        "qwen3_moe",
         seq_len=32,
         arch_overrides={
             "vocab_size": _VOCAB,
@@ -164,9 +152,11 @@ def _wrapper(*, tied: bool = False) -> HFTransformerModel:
             "num_attention_heads": 2,
             "num_key_value_heads": 2,
             "tie_word_embeddings": tied,
+            "head_dim": 4,
+            "num_experts": 0,
         },
     )
-    return HFTransformerModel(config)
+    return Qwen3MoeForCausalLM(config)
 
 
 @pytest.mark.parametrize("tied", [False, True])
@@ -176,7 +166,7 @@ def test_chunked_boundaries_and_actual_aliases_are_owned_by_root(
 ):
     from types import SimpleNamespace
 
-    model = _wrapper(tied=tied)
+    model = build_model(tied=tied)
     model.model.config.tie_word_embeddings = not tied
     if shared_layer:
         model.norm.weight = model.layers[0].input_layernorm.weight
@@ -205,7 +195,7 @@ def test_chunked_boundaries_and_actual_aliases_are_owned_by_root(
 def test_decoder_keeps_a_root_alias_to_a_layer_child_in_the_root_state(monkeypatch):
     from types import SimpleNamespace
 
-    model = _wrapper()
+    model = build_model()
     model.external_projection = model.layers[0].self_attn.q_proj
     calls = []
     monkeypatch.setattr(
@@ -249,30 +239,30 @@ def test_iter_transformer_layers_yields_blocks_in_order() -> None:
 # -- accessors ---------------------------------------------------------------
 
 
-def test_decoder_parts_resolve_off_the_top_level_wrapper() -> None:
+def test_decoder_parts_resolve_off_the_top_levelbuild_model() -> None:
     """The FSDP layer reads these off the model it is handed, not off model.model."""
-    wrapper = _wrapper()
-    decoder = wrapper.model.model
+    wrapper = build_model()
+    decoder = wrapper.model
 
     assert wrapper.tok_embeddings is decoder.embed_tokens
     assert wrapper.layers is decoder.layers
     assert wrapper.norm is decoder.norm
-    assert wrapper.lm_head is wrapper.model.lm_head
+    assert wrapper.lm_head is wrapper.decoder_structure.bind(wrapper).head
 
 
 def test_layers_are_a_container_torchtitan_can_iterate() -> None:
-    wrapper = _wrapper()
+    wrapper = build_model()
 
     assert len(list(iter_transformer_layers(wrapper.layers))) == _NUM_LAYERS
 
 
 def test_untied_head_reports_no_weight_tying() -> None:
-    assert _wrapper(tied=False).enable_weight_tying is False
+    assert build_model(tied=False).enable_weight_tying is False
 
 
 def test_tied_head_is_detected_by_parameter_identity() -> None:
     """FSDP2's own check: the two modules own one Parameter object."""
-    wrapper = _wrapper(tied=True)
+    wrapper = build_model(tied=True)
 
     assert wrapper.enable_weight_tying is True
     assert wrapper.tok_embeddings.weight is wrapper.lm_head.weight
@@ -280,15 +270,15 @@ def test_tied_head_is_detected_by_parameter_identity() -> None:
 
 def test_missing_head_reports_no_weight_tying() -> None:
     """A model whose head was stripped must not be grouped with the embedding."""
-    wrapper = _wrapper(tied=True)
-    wrapper.model.lm_head = None
+    wrapper = build_model(tied=True)
+    wrapper.lm_head = None
 
     assert wrapper.enable_weight_tying is False
 
 
 def test_tie_word_embeddings_flag_is_not_what_decides() -> None:
     """Intent and reality can disagree; identity is what FSDP acts on."""
-    wrapper = _wrapper(tied=True)
+    wrapper = build_model(tied=True)
     wrapper.model.config = type("C", (), {"tie_word_embeddings": False})()
 
     assert wrapper.enable_weight_tying is True
@@ -296,16 +286,15 @@ def test_tie_word_embeddings_flag_is_not_what_decides() -> None:
 
 @pytest.mark.parametrize("tied", [False, True])
 def test_accessors_do_not_add_duplicate_parameters(tied: bool) -> None:
-    """The accessors must alias, not re-register, the underlying modules.
-
-    Assigning ``self.x = module`` inside the wrapper would register a second
-    copy, putting the same tensors in the state dict twice -- once under the
-    HF name and once under the torchtitan name. These are properties, so the
-    parameter count must equal the HF model's own.
-    """
-    wrapper = _wrapper(tied=tied)
-
-    assert len(list(wrapper.parameters())) == len(list(wrapper.model.parameters()))
+    """Reading the contract must not register aliases or duplicate state keys."""
+    model = build_model(tied=tied)
+    parameters = tuple(model.parameters())
+    keys = tuple(model.state_dict())
+    for module in (model.tok_embeddings, model.layers, model.norm, model.lm_head):
+        assert isinstance(module, nn.Module)
+    assert tuple(model.state_dict()) == keys
+    assert all(a is b for a, b in zip(model.parameters(), parameters, strict=True))
+    assert set(model._modules) == {"model", "lm_head"}
 
 
 @pytest.mark.parametrize("reduce_dtype", ["float32", "bfloat16", "float64"])

@@ -14,8 +14,8 @@ import torch.distributed.checkpoint as dcp
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
 from llmtuner.components.checkpointer.hf.kimi_layout import load_changed_kimi_layout
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from tests.unit_tests.cpu.parallel.test_kimi_conversion import make_model
 
 
@@ -48,7 +48,7 @@ def main():
                 source.model = make_model(latent=True, shared=1)
                 config = source.model.layers[0].block_sparse_moe.config
                 if source_grouped:
-                    swap_hf_moe_blocks(source.model)
+                    swap_moe_blocks(source.model)
                 saved = dict(source.state_dict())
                 saved["rng_state"] = RNGCheckpointState(torch.device("cpu"))
                 saved["lr_scheduler"] = SchedulerState()
@@ -57,15 +57,18 @@ def main():
                 target = torch.nn.Module()
                 target.model = make_model(latent=True, shared=1)
                 if not source_grouped:
-                    swap_hf_moe_blocks(target.model)
+                    swap_moe_blocks(target.model)
                 scheduler = SchedulerState(fail=rank == 0)
                 states = {
                     "model": ModelCheckpointState(target),
                     "lr_scheduler": scheduler,
                     "rng_state": RNGCheckpointState(torch.device("cpu")),
                 }
-                adapter = HFTransformerStateDictAdapter(
-                    config, None, kimi_expert_parallel=not source_grouped
+                adapter = ModelStateDictAdapter(
+                    config,
+                    None,
+                    model_prefix="model.",
+                    kimi_expert_parallel=not source_grouped,
                 )
                 try:
                     load_changed_kimi_layout(folder, states=states, adapter=adapter)
