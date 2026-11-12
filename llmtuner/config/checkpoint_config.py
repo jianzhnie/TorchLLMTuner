@@ -122,7 +122,8 @@ class CheckpointConfig:
     async_mode: Literal["disabled", "async", "async_with_pinned_mem"] = "disabled"
     "DCP save mode: synchronous, threaded async, or async with requested pinned-memory "
     "staging; backend support varies and PyTorch may ignore pinning. Ignored by "
-    "torch_checkpointing."
+    "torch_checkpointing. Without an accelerator, staging uses blocking host "
+    "copies while upload remains asynchronous."
 
     def __post_init__(self) -> None:
         for name in ("sharded_tensor_parallel", "sharded_expert_parallel"):

@@ -2,8 +2,9 @@
 
 Run --phase write then --phase resume with a shared --folder under torchrun.
 Qwen3 uses PP2; --model kimi uses EP2 with latent/shared experts.
-Uses the synthetic checkpointable dataloader and synchronous native DCP. This
-is lifecycle acceptance for a small model, not NPU or corpus-scale evidence.
+Uses the synthetic checkpointable dataloader and native DCP. This
+is lifecycle acceptance for a small model on the selected device, not corpus-
+scale evidence. State comparisons include CPU and selected-device RNG draws.
 """
 
 import argparse
@@ -13,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.utils._pytree import tree_map_only
 from torch.utils.checkpoint import DefaultDeviceType
 
 from llmtuner.config.checkpoint_config import CheckpointConfig
@@ -36,6 +38,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--activation-checkpoint", choices=("none", "full"), default="none"
+    )
+    parser.add_argument(
+        "--checkpoint-async-mode",
+        choices=("disabled", "async", "async_with_pinned_mem"),
+        default="disabled",
     )
     args = parser.parse_args()
     device = init_distributed()
@@ -104,7 +111,10 @@ def main() -> None:
                 global_batch_size=2,
                 dump_folder=str(args.folder),
                 checkpoint_config=CheckpointConfig(
-                    enable=True, interval=2, keep_latest_k=0
+                    enable=True,
+                    interval=2,
+                    keep_latest_k=0,
+                    async_mode=args.checkpoint_async_mode,
                 ),
             ),
         )
@@ -154,8 +164,16 @@ def main() -> None:
             "dataloader": trainer.dataloader.state_dict(),
             "next_input": next_batch.input_ids,
             "next_labels": next_batch.labels,
-            "random": (torch.rand(4), random.random(), float(np.random.random())),
+            "random": (
+                torch.rand(4),
+                torch.rand(4, device=device),
+                random.random(),
+                float(np.random.random()),
+            ),
         }
+        # Compare state values on one device; accelerator optimizer counters
+        # and model tensors can legitimately have different residency policies.
+        result = tree_map_only(torch.Tensor, lambda value: value.detach().cpu(), result)
         artifact = args.folder / f"{args.model}-continuous-rank-{dist.get_rank()}.pt"
         if args.phase == "write":
             torch.save(result, artifact)

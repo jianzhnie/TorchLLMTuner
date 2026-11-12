@@ -756,12 +756,22 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                         self.stager = None
                         self._stager_used = False
                     if self.stager is None:
+                        # DefaultStager can stage CPU state in its worker, but
+                        # non-blocking copies require an available accelerator.
+                        # Keep process uploads asynchronous without constructing
+                        # an invalid stager on CPU-only runs.
+                        non_blocking_copy = torch.accelerator.is_available()
+                        if not non_blocking_copy:
+                            logger.info(
+                                "Checkpoint staging uses blocking host copies; "
+                                "background upload remains asynchronous"
+                            )
                         self.stager = DefaultStager(
                             StagingOptions(
                                 use_pinned_memory=True,
                                 use_shared_memory=True,
                                 use_async_staging=True,
-                                use_non_blocking_copy=True,
+                                use_non_blocking_copy=non_blocking_copy,
                             )
                         )
 

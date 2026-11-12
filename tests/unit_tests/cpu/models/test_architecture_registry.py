@@ -12,6 +12,7 @@ from llmtuner.models import registry as architecture
 from llmtuner.models.configuration import build_model_config, resolve_model_class
 from llmtuner.models.registry import (
     ModelSpec,
+    build_registered_model,
     get_model_spec,
     register_model,
 )
@@ -347,10 +348,10 @@ register_model(ModelSpec.from_types(
 ))
 registration = get_model_spec('native_test')
 assert registration.config_type_loader() is Config
-from llmtuner.models.explicit import build_explicit_model
+from llmtuner.models.registry import build_registered_model
 config = registration.config_factory()
 config.model_type = "native_test"
-model = build_explicit_model(config)
+model = build_registered_model(config, explicit_only=True)
 optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
 before = model.projection.weight.detach().clone()
 model(torch.ones(2, 3)).sum().backward()
@@ -364,8 +365,6 @@ assert 'llmtuner.models.kimi.kimi_k3.model' not in sys.modules
 
 
 def test_explicit_factory_is_opt_in_and_lazy(monkeypatch):
-    from llmtuner.models import explicit
-
     calls = []
     expected = object()
 
@@ -381,13 +380,11 @@ def test_explicit_factory_is_opt_in_and_lazy(monkeypatch):
     )
     monkeypatch.setitem(architecture._MODELS, "deepseek_v4", registration)
     config = PretrainedConfig(model_type="deepseek_v4")
-    assert explicit.build_explicit_model(config) is expected
+    assert build_registered_model(config, explicit_only=True) is expected
     assert calls == [config]
 
 
 def test_explicit_and_training_resolution_share_registered_constructor(monkeypatch):
-    from llmtuner.models.explicit import build_explicit_model
-
     class Model(nn.Module):
         def __init__(self, config):
             super().__init__()
@@ -402,7 +399,7 @@ def test_explicit_and_training_resolution_share_registered_constructor(monkeypat
     )
     monkeypatch.setitem(architecture._MODELS, "deepseek_v4", registration)
     config = PretrainedConfig(model_type="deepseek_v4")
-    model = build_explicit_model(config)
+    model = build_registered_model(config, explicit_only=True)
     assert type(model) is resolve_model_class(config)
     assert model.config is config
     loss = model.projection(model.projection.weight).square().sum()
@@ -412,8 +409,6 @@ def test_explicit_and_training_resolution_share_registered_constructor(monkeypat
 
 
 def test_explicit_factory_builds_registered_architectures():
-    from llmtuner.models.explicit import build_explicit_model
-
     config = build_model_config(
         "qwen3_moe",
         seq_len=32,
@@ -428,7 +423,7 @@ def test_explicit_factory_builds_registered_architectures():
             "num_experts_per_tok": 1,
         },
     )
-    model = build_explicit_model(config)
+    model = build_registered_model(config, explicit_only=True)
     assert type(model).__name__ == "Qwen3MoeForCausalLM"
 
 
@@ -448,8 +443,6 @@ def test_composite_registration_is_task_scoped(model_type):
 def test_explicit_factory_uses_registered_composite_constructor(monkeypatch):
     from types import SimpleNamespace
 
-    from llmtuner.models.explicit import build_explicit_model
-
     config = SimpleNamespace(model_type="composite_test")
     expected = object()
     entry = ModelSpec.from_types(
@@ -463,7 +456,7 @@ def test_explicit_factory_uses_registered_composite_constructor(monkeypatch):
     )
     monkeypatch.setitem(architecture._MODELS, config.model_type, entry)
     assert get_model_spec(config.model_type) is None
-    assert build_explicit_model(config) is expected
+    assert build_registered_model(config, explicit_only=True) is expected
 
 
 def test_spec_constructor_rejects_wrong_config_before_loading_model():
@@ -479,8 +472,6 @@ def test_spec_constructor_rejects_wrong_config_before_loading_model():
 
 
 def test_registered_constructor_enforces_task_without_loading(monkeypatch):
-    from llmtuner.models.registry import build_registered_model
-
     calls = []
     expected = object()
     specification = ModelSpec.from_types(

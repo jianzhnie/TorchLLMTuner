@@ -1,6 +1,7 @@
 """Explicit family construction preserves initialization and training APIs."""
 
 from copy import deepcopy
+from functools import partial
 
 import pytest
 import torch
@@ -14,11 +15,11 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.configuration import resolve_model_class
 from llmtuner.models.deepseek.deepseek_v4.modeling import DeepseekV4ForCausalLM
-from llmtuner.models.explicit import build_explicit_model
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.models.qwen.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
+from llmtuner.models.registry import build_registered_model
 from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
 
 
@@ -150,7 +151,7 @@ def test_owned_family_binds_declared_structure(family):
         if family == "deepseek"
         else text_config(ReferenceQwen.config_class)
     )
-    model = build_explicit_model(config)
+    model = build_registered_model(config, explicit_only=True)
     bound = model.decoder_structure.bind(model)
     assert model.tok_embeddings is bound.embedding
     assert model.layers is bound.blocks
@@ -179,7 +180,11 @@ def test_explicit_family_preserves_initialization_forward_and_checkpoint(
     reference = reference_type(deepcopy(config))
     expected_rng = torch.get_rng_state().clone()
     torch.manual_seed(91)
-    constructor = build_explicit_model if family == "deepseek" else owned_type
+    constructor = (
+        partial(build_registered_model, explicit_only=True)
+        if family == "deepseek"
+        else owned_type
+    )
     owned = constructor(deepcopy(config))
     assert type(owned) is owned_type
     assert (

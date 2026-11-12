@@ -1320,6 +1320,64 @@ def resolve_tp_plan(
     )
 
 
+def validate_pipeline_tp_plan(
+    global_plan: ParallelPlan, local_plan: ParallelPlan, model: nn.Module
+) -> None:
+    """Check a freshly bound PP-local plan against the unmodified global plan.
+
+    PP preserves registered FQNs and replaces unowned simple modules with
+    Identity. Keep those removals distinct from a retained target losing its TP
+    transformation. Live bindings and conversion metadata always come from the
+    local resolver; global module references must never reach execution.
+    """
+    if (
+        global_plan.stage != "tp"
+        or local_plan.stage != "tp"
+        or global_plan.degree != local_plan.degree
+    ):
+        raise ValueError("Pipeline TP plans must describe the same stage and degree")
+    local_plan.validate_binding(model)
+    modules = dict(model.named_modules(remove_duplicate=False))
+    expected = {}
+    for target in global_plan.targets:
+        module = modules.get(target.path)
+        if module is None or (
+            isinstance(module, nn.Identity)
+            and not isinstance(target.module, nn.Identity)
+        ):
+            continue
+        if (target.path, target.kind) in expected:
+            raise ValueError("Pipeline TP global plan contains duplicate targets")
+        expected[(target.path, target.kind)] = target
+    actual = {(target.path, target.kind): target for target in local_plan.targets}
+    if len(actual) != len(local_plan.targets):
+        raise ValueError("Pipeline TP local plan contains duplicate targets")
+    if expected.keys() != actual.keys():
+        raise ValueError(
+            "Pipeline TP target ownership changed: "
+            f"missing={sorted(expected.keys() - actual.keys())}, "
+            f"unexpected={sorted(actual.keys() - expected.keys())}"
+        )
+    for key, target in actual.items():
+        original = expected[key]
+        if target.layout != original.layout or (
+            target.kind == "dense" and target.spec != original.spec
+        ):
+            raise ValueError(
+                f"Pipeline TP layout or projection strategy changed: {key}"
+            )
+    local_history = dict(local_plan.token_history_requirements)
+    for path, requirement in global_plan.token_history_requirements:
+        module = modules.get(path)
+        if module is None or isinstance(module, nn.Identity):
+            continue
+        if path not in local_history or (
+            type(local_history[path]) is not type(requirement)
+            or local_history[path] != requirement
+        ):
+            raise ValueError(f"Pipeline TP token history requirement changed: {path}")
+
+
 def apply_tp(
     model: nn.Module,
     mesh: DeviceMesh | None,

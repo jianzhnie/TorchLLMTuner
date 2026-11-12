@@ -55,6 +55,7 @@ from .tensor_parallel.tensor_parallel import (
     apply_tp,
     resolve_tp_overrides,
     resolve_tp_plan,
+    validate_pipeline_tp_plan,
 )
 from .topology import ParallelTopology
 
@@ -216,6 +217,7 @@ def parallelize_model(
     tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
 
     if parallel_dims is not None and parallel_dims.pp_enabled:
+        global_tp_plan = None
         # All PP stages must stop before splitting if any rank's global plan
         # is invalid. This body only inspects local metadata.
         with synchronize_local_errors("Pipeline global plan validation"):
@@ -226,7 +228,7 @@ def parallelize_model(
                 )
             if cfg.tp_size > 1:
                 resolve_tp_overrides(model, cfg=cfg)
-                resolve_tp_plan(model, cfg=cfg)
+                global_tp_plan = resolve_tp_plan(model, cfg=cfg)
             validate_microbatches(parallel_dims, cfg, global_batch_size)
         # Split first; use this stage's dense mesh for all local transforms.
         stages, model_parts, has_first_stage, has_last_stage = apply_pp(
@@ -240,11 +242,15 @@ def parallelize_model(
         # Stage construction deep-copies the model. Resolve fresh local bindings;
         # references from the global preflight deliberately cannot cross this boundary.
         resolved_tp_plans = [None] * len(model_parts)
-        if cfg.tp_size > 1:
+        if global_tp_plan is not None:
             with synchronize_local_errors("Pipeline local TP plan validation"):
                 resolved_tp_plans = [
                     resolve_tp_plan(part, cfg=cfg) for part in model_parts
                 ]
+                for part, local_plan in zip(
+                    model_parts, resolved_tp_plans, strict=True
+                ):
+                    validate_pipeline_tp_plan(global_tp_plan, local_plan, part)
         # Part ownership is rank-local, but failure must stop all stages
         # before TP/EP/FSDP begin communicating on the resulting parts.
         with synchronize_local_errors("Pipeline FSDP plan binding"):

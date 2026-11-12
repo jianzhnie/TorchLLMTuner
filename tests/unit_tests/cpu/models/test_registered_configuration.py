@@ -15,7 +15,7 @@ from llmtuner.models.configuration import (
     build_model_config_for,
     unwrap_text_config,
 )
-from llmtuner.models.explicit import build_explicit_model
+from llmtuner.models.registry import build_registered_model
 
 
 def test_saved_configuration_uses_registry_without_global_mutation(
@@ -83,7 +83,7 @@ def test_registered_qwen_is_available_through_explicit_construction():
             "num_experts_per_tok": 2,
         },
     )
-    model = build_explicit_model(config)
+    model = build_registered_model(config, explicit_only=True)
     assert type(model).__module__ == "llmtuner.models.qwen.qwen3.model"
     assert model.decoder_structure.bind(model).blocks is model.model.layers
 
