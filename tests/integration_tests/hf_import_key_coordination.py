@@ -10,16 +10,16 @@ import torch
 import torch.distributed as dist
 
 from llmtuner.accelerator.collectives import synchronize_local_errors
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from tests.integration_tests.harness import init_distributed
 
 
-def main():
+def main() -> None:
     device = init_distributed()
     try:
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
-        adapter = HFTransformerStateDictAdapter(
+        adapter = ModelStateDictAdapter(
             SimpleNamespace(model_type="qwen3_moe"),
             None,
             qwen3_expert_parallel=True,
@@ -32,7 +32,7 @@ def main():
             # A hidden collective would mismatch the peer's barrier.
             if rank == failing_rank:
                 local = adapter.from_hf({key: weight})
-                assert local["model." + native_key] is weight
+                assert local[native_key] is weight
             dist.barrier()
             source = {key: weight}
             if rank == failing_rank:
@@ -49,10 +49,8 @@ def main():
                 raise AssertionError("ambiguous router keys were accepted")
             assert source[key] is weight
             restored = adapter.from_hf({key: weight})
-            assert restored["model." + native_key] is weight
-            torch.testing.assert_close(
-                restored["model." + native_key], weight, rtol=0, atol=0
-            )
+            assert restored[native_key] is weight
+            torch.testing.assert_close(restored[native_key], weight, rtol=0, atol=0)
             dist.barrier()
         print(
             f"PASS rank={rank}: HF import collision coordination and retry", flush=True

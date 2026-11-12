@@ -20,10 +20,13 @@ from torch.distributed.tensor import Shard, distribute_tensor
 from transformers import AutoConfig
 
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.config.parallel_config import ParallelConfig
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
-from llmtuner.parallel.expert_parallel.checkpointing import mark_experts_ep_sharded
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.parallel.expert_parallel.checkpointing import (
+    expert_shard_map,
+    mark_experts_ep_sharded,
+)
 from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
 from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp
 from tests.integration_tests.harness import init_distributed
@@ -103,6 +106,7 @@ def main():
             "qwen3_moe",
             vocab_size=128,
             hidden_size=64,
+            head_dim=16,
             intermediate_size=128,
             moe_intermediate_size=48,
             num_hidden_layers=1,
@@ -114,10 +118,9 @@ def main():
             experts_implementation="eager",
         )
         torch.manual_seed(42)
-        actual = HFTransformerModel(config).float().eval()
+        actual = Qwen3MoeForCausalLM(config).float().eval()
         hf_weights = {}
         for key, value in actual.state_dict().items():
-            key = key.removeprefix("model.")
             if key.endswith(".experts.gate_up_proj"):
                 prefix = key.removesuffix("gate_up_proj")
                 for expert, stacked in enumerate(value):
@@ -144,6 +147,14 @@ def main():
         )
         actual = apply_tp(actual.to(device), dense["tp"], parallel)
         actual = apply_ep(actual, parallel, ep_group=sparse["ep"].get_group())
+        # Check the real model, not only the synthetic layout fixture above.
+        assert len(actual._tp_checkpoint_layouts) == 4
+        expert_groups = expert_shard_map([actual])
+        assert len(expert_groups) == 3
+        parameters = dict(actual.named_parameters())
+        for name, group in expert_groups.items():
+            assert dist.get_world_size(group) == 4, name
+            assert parameters[name].shape[0] == config.num_experts // 4, name
         actual_wrapper = ModelCheckpointState(
             actual, sharded_tensor_parallel=True, sharded_expert_parallel=True
         )
@@ -157,7 +168,7 @@ def main():
         dcp.load({"model": actual_wrapper}, checkpoint_id=paths[0] + "-actual")
         for key, value in actual.state_dict().items():
             torch.testing.assert_close(value, actual_expected[key], atol=0, rtol=0)
-        adapter = HFTransformerStateDictAdapter(
+        adapter = ModelStateDictAdapter(
             config, str(hf_path), qwen3_expert_parallel=True
         )
         with torch.no_grad():

@@ -32,14 +32,14 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from llmtuner.config import ParallelConfig
-from llmtuner.models.hf.factory import build_model_config
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.tensor_parallel import apply_tp
+from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.models.configuration import build_model_config
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     ColumnParallelLinear,
     ColwiseLinearNoGather,
     RowParallelLinear,
+    apply_tp,
 )
 from llmtuner.parallel.topology import ParallelTopology, build_device_mesh
 from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
@@ -59,13 +59,18 @@ LR = 0.05
 TOL = 1e-5
 
 
-def _model(seed: int = 0) -> HFTransformerModel:
+def _model(seed: int = 0) -> Qwen3MoeForCausalLM:
     torch.manual_seed(seed)
     config = build_model_config(
-        "llama",
+        "qwen3_moe",
         seq_len=SEQ,
         arch_overrides={
             "vocab_size": VOCAB,
+            "head_dim": 4,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 16,
+            "mlp_only_layers": [0, 1],
             "hidden_size": 16,
             "intermediate_size": 32,
             "num_hidden_layers": 2,
@@ -73,7 +78,7 @@ def _model(seed: int = 0) -> HFTransformerModel:
             "num_key_value_heads": 4,
         },
     )
-    return moved(HFTransformerModel(config))
+    return moved(Qwen3MoeForCausalLM(config))
 
 
 def _batch(seed: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -122,8 +127,8 @@ def main() -> None:
     assert any("embed" in name for name in replicated)
     ref_params = dict(ref.named_parameters())
 
-    ref_opt = torch.optim.SGD(ref.parameters(), lr=LR)
-    tp_opt = torch.optim.SGD(model.parameters(), lr=LR)
+    ref_opt = torch.optim.SGD(ref.parameters(), lr=LR, foreach=False)
+    tp_opt = torch.optim.SGD(model.parameters(), lr=LR, foreach=False)
 
     failures: list[str] = []
     max_loss_diff = 0.0
@@ -134,20 +139,20 @@ def main() -> None:
         ids, labels = _batch(seed=step + 1)
 
         ref_opt.zero_grad(set_to_none=True)
-        logits_ref = ref(ids)
+        logits_ref = ref(ids).logits.squeeze(0)
         _loss_sum(logits_ref, labels).backward()
 
-        inputs, labels_sh, extra = model.preprocess_inputs(
+        inputs, labels_sh, extra = model.prepare_inputs(
             {"input": ids, "labels": labels}, parallel_dims=parallel_dims
         )
         tp_opt.zero_grad(set_to_none=True)
-        logits_tp = model(inputs, **extra)
+        logits_tp = model(inputs, **extra).logits.squeeze(0)
         loss_tp = _loss_sum(logits_tp, labels_sh)
         loss_tp.backward()
 
         # The partial value the reduction must repair: each rank's replicated
         # gradient covers only its own token shard.
-        pre = replicated["model.model.embed_tokens.weight"].grad.clone()
+        pre = replicated["model.embed_tokens.weight"].grad.clone()
 
         allreduce_replicated_tp_grads(trainer)
 
@@ -160,18 +165,29 @@ def main() -> None:
         if loss_diff > TOL:
             failures.append(f"step {step}: shard loss diff {loss_diff:.3e}")
 
-        ref_embed_grad = ref_params["model.model.embed_tokens.weight"].grad
+        ref_embed_grad = ref_params["model.embed_tokens.weight"].grad
         pre_diff = (pre - ref_embed_grad).abs().max().item()
         max_prereduce_diff = max(max_prereduce_diff, pre_diff)
 
+        step_grad_diff = 0.0
+        step_grad_name = ""
         for name, p in replicated.items():
             grad_diff = (p.grad - ref_params[name].grad).abs().max().item()
+            if grad_diff > step_grad_diff:
+                step_grad_diff, step_grad_name = grad_diff, name
             max_grad_diff = max(max_grad_diff, grad_diff)
             if grad_diff > TOL:
                 failures.append(
                     f"step {step}: replicated grad {name} diff {grad_diff:.3e}"
                 )
 
+        expected_logits = logits_ref[rank * half : (rank + 1) * half]
+        logits_diff = (logits_tp - expected_logits).abs().max().item()
+        print(
+            f"rank={rank} step={step}: logits_diff={logits_diff:.9g} "
+            f"grad_diff={step_grad_diff:.9g} parameter={step_grad_name}",
+            flush=True,
+        )
         ref_opt.step()
         tp_opt.step()
 

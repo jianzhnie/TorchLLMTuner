@@ -19,16 +19,15 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import load_file, save_file
 from torch.distributed.device_mesh import init_device_mesh
-from transformers import LlamaConfig
+from transformers import Qwen3MoeConfig
 
 from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
-from llmtuner.config import CheckpointConfig
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.models.hf.state_dict_adapter import HFTransformerStateDictAdapter
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
+from llmtuner.config.checkpoint_config import CheckpointConfig
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.pipeline_parallel.partition import (
-    generate_llm_fqn_per_model_part,
     split_model_into_stages,
 )
 
@@ -44,19 +43,22 @@ def main() -> None:
         directory = Path(locations[0])
         source = directory / "source"
         torch.manual_seed(17)
-        config = LlamaConfig(
+        config = Qwen3MoeConfig(
             vocab_size=16,
             hidden_size=16,
+            head_dim=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=16,
+            mlp_only_layers=[0, 1],
             intermediate_size=32,
             num_hidden_layers=2,
             num_attention_heads=2,
             num_key_value_heads=2,
             tie_word_embeddings=False,
         )
-        whole_model = HFTransformerModel(config)
-        reference = HFTransformerStateDictAdapter(config, None).to_hf(
-            whole_model.state_dict()
-        )
+        whole_model = Qwen3MoeForCausalLM(config)
+        reference = ModelStateDictAdapter(config, None).to_hf(whole_model.state_dict())
         if rank == 0:
             source.mkdir()
             keys = sorted(reference)
@@ -78,14 +80,28 @@ def main() -> None:
             init_device_mesh("cpu", (2,), mesh_dim_names=("pp",)),
             "1F1B",
             torch.device("cpu"),
-            generate_llm_fqn_per_model_part(2, 2),
+            [
+                ["model.embed_tokens", "model.layers.0", "model.rotary_emb"],
+                ["model.layers.1", "model.norm", "lm_head", "model.rotary_emb"],
+            ],
+            replicated_module_names=whole_model.pipeline_runtime_modules,
         )
+        assert len(parts) == 1
+        local_keys = set(parts[0].state_dict())
+        assert local_keys and local_keys < reference.keys()
+        assert any(key.startswith(f"model.layers.{rank}.") for key in local_keys)
+        ownership: list[set[str] | None] = [None, None]
+        dist.all_gather_object(ownership, local_keys)
+        first, last = ownership
+        assert first is not None and last is not None
+        assert not first.intersection(last), "PP state is duplicated across stages"
+        assert first.union(last) == reference.keys(), "PP state coverage is incomplete"
         with torch.no_grad():
             for part in parts:
                 for parameter in part.parameters():
-                    parameter.zero_()
+                    parameter.fill_(float("nan"))
         optimizer = torch.optim.SGD(
-            [p for part in parts for p in part.parameters()], lr=0.1
+            [p for part in parts for p in part.parameters()], lr=0.1, foreach=False
         )
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
         manager = DistributedCheckpointManager(
@@ -101,15 +117,13 @@ def main() -> None:
             lr_scheduler=scheduler,
             states={},
             folder=str(directory),
-            sd_adapter=HFTransformerStateDictAdapter(config, str(source)),
+            sd_adapter=ModelStateDictAdapter(config, str(source)),
         )
         try:
             assert manager.load()
             for part in parts:
                 for key, value in part.state_dict().items():
-                    torch.testing.assert_close(
-                        value, reference[key.removeprefix("model.")]
-                    )
+                    torch.testing.assert_close(value, reference[key], atol=0, rtol=0)
             assert manager.save(1, last_step=True)
         finally:
             manager.close()
@@ -130,7 +144,7 @@ def main() -> None:
                         exported[key] = shard[key]
             assert exported.keys() == reference.keys()
             for key, value in reference.items():
-                torch.testing.assert_close(exported[key], value)
+                torch.testing.assert_close(exported[key], value, atol=0, rtol=0)
             print("PASS: indexed HF load and export across two CPU pipeline stages")
     finally:
         dist.destroy_process_group()

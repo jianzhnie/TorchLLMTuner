@@ -31,6 +31,7 @@ import torch.nn as nn
 
 from llmtuner.config.parallel_config import (
     ExpertParallelConfig,
+    validate_expert_dispatcher,
     validate_router_aux_loss_coefficient,
 )
 from llmtuner.errors import UnsupportedCombinationError
@@ -78,6 +79,20 @@ def declared_router_output(block: nn.Module) -> bool:
     if isinstance(contract, MoEBlockContract) and declared != expected:
         raise ValueError("MoE router output flag conflicts with its declared contract")
     return declared
+
+
+def validate_router_output_conversion(
+    block: nn.Module, wants_router_logits: bool, config: Any
+) -> None:
+    """Preserve the output restriction even when config changes after parsing."""
+    if wants_router_logits and getattr(config, "output_router_logits", False):
+        raise UnsupportedCombinationError(
+            f"{type(block).__name__} returns router logits and its config "
+            "enables output_router_logits, but the swapped-in llmtuner MoE "
+            "keeps its router scores internal, so it could only hand back "
+            "None. Turn output_router_logits off -- llmtuner runs its own "
+            "load-balancing loss -- before swapping."
+        )
 
 
 def _legacy_inspection():
@@ -396,14 +411,7 @@ def find_moe_candidates(
         else:
             inspection = inspection or _legacy_inspection()
             wants_router_logits = inspection.returns_router_logits(block)
-        if wants_router_logits and getattr(hf_config, "output_router_logits", False):
-            raise UnsupportedCombinationError(
-                f"{type(block).__name__} returns router logits and its config "
-                "enables output_router_logits, but the swapped-in llmtuner MoE "
-                "keeps its router scores internal, so it could only hand back "
-                "None. Turn output_router_logits off -- llmtuner runs its own "
-                "load-balancing loss -- before swapping."
-            )
+        validate_router_output_conversion(block, wants_router_logits, hf_config)
         candidates.append((layer, attr, block, wants_router_logits))
 
     if not candidates:
@@ -426,6 +434,100 @@ class MoEConversionTarget:
     packed_experts: PackedExpertBinding | None = None
     contract: MoEBlockContract | None = None
     kimi_math: tuple[object, ...] | None = None
+    declared_slot: bool = False
+
+
+def validate_packed_expert_aliases(
+    targets: Iterable[PlanTarget],
+    module_paths: Iterable[tuple[str, nn.Module]],
+    replaced_roots: list[str],
+    *,
+    degree: int,
+) -> None:
+    """Reject aliases that packed splitting or expert sharding cannot retain.
+
+    Same-parameter sharing between converted blocks remains supported. Local
+    down projections keep their Parameter and need no alias restriction. Read
+    storage metadata only; do not allocate expert views or replacements here.
+    """
+    changed: set[int] = set()
+    storages: dict[int, int] = {}
+    for target in targets:
+        binding = target.spec
+        if not isinstance(binding, MoEConversionTarget):
+            continue
+        packed = binding.packed_experts
+        if packed is None:
+            continue
+        for parameter in (packed.gate_up, *((packed.down,) if degree > 1 else ())):
+            changed.add(id(parameter))
+            if type(parameter) is nn.Parameter and parameter.layout == torch.strided:
+                storage = parameter.untyped_storage()._cdata
+                previous = storages.setdefault(storage, id(parameter))
+                if previous != id(parameter):
+                    raise UnsupportedCombinationError(
+                        "EP cannot preserve packed expert parameters sharing storage"
+                    )
+    if not changed:
+        return
+    for path, module in module_paths:
+        local = any(
+            path == root or path.startswith(root + ".") for root in replaced_roots
+        )
+        for is_buffer, tensors in (
+            (False, module.named_parameters(recurse=False, remove_duplicate=False)),
+            (True, module.named_buffers(recurse=False, remove_duplicate=False)),
+        ):
+            for name, tensor in tensors:
+                aliases_changed = id(tensor) in changed
+                if (
+                    type(tensor) in (torch.Tensor, nn.Parameter)
+                    and tensor.layout == torch.strided
+                ):
+                    owner = storages.get(tensor.untyped_storage()._cdata)
+                    aliases_changed |= owner is not None and owner != id(tensor)
+                if aliases_changed and (
+                    is_buffer or not local or id(tensor) not in changed
+                ):
+                    raise UnsupportedCombinationError(
+                        "EP cannot preserve packed expert storage alias at "
+                        f"{path + '.' if path else ''}{name}; split or sharded "
+                        "expert state requires an adapted consumer"
+                    )
+
+
+def validate_ep_model_options(config: Any, implementation: str) -> None:
+    """Reject unsupported execution choices before binding or changing a model.
+
+    Parsing and execution share this check: a supplied plan does not authorize
+    options changed after parsing, including score multiplication placement.
+    """
+    validate_expert_dispatcher(implementation)
+    if getattr(config, "experts_implementation", "native") == "pre_down":
+        raise UnsupportedCombinationError(
+            "EP MoE replacement cannot preserve experts_implementation='pre_down'; "
+            "use native experts or retain the local/DP/FSDP expert path. "
+            "This also applies to single-rank fixed-router replacement."
+        )
+
+
+def validate_ep_model_geometry(
+    model: nn.Module, *, degree: int, tp_enabled: bool
+) -> None:
+    """Validate native geometry while the model still owns unsharded storage.
+
+    Reuse this before execution: config fields can change without invalidating
+    module or tensor bindings. TP validates native geometry before sharding;
+    never apply that native contract to already transformed parameters.
+    """
+    validate = getattr(model, "validate_parallel", None)
+    if (
+        callable(validate)
+        and not tp_enabled
+        and getattr(model, "parallel_plan", None) is None
+        and getattr(model, "ep_parallel_plan", None) is None
+    ):
+        validate(tp_degree=1, ep_degree=degree)
 
 
 def resolve_ep_plan(
@@ -448,8 +550,9 @@ def resolve_ep_plan(
     """
     if isinstance(degree, bool) or not isinstance(degree, int) or degree < 1:
         raise ValueError("EP degree must be a positive integer")
-    layers = decoder_layers_for_ep(model)
     config = getattr(model, "config", None)
+    validate_ep_model_options(config, implementation)
+    layers = decoder_layers_for_ep(model)
     candidates = find_moe_candidates(model, layers, config)
     modules = tuple(model.named_modules(remove_duplicate=False))
     targets = []
@@ -498,25 +601,17 @@ def resolve_ep_plan(
                     block.expert_parallel_math_signature()
                     if isinstance(block, KimiSparseMoE)
                     else None,
+                    declared_slot=hasattr(owner, "moe_block_name"),
                 ),
             )
         )
+    module_paths = list(modules)
+    roots = conversion_roots(candidates, module_paths)
+    validate_packed_expert_aliases(targets, module_paths, roots, degree=degree)
     if any(isinstance(block, KimiSparseMoE) for _, _, block, _ in candidates):
-        module_paths = list(modules)
-        roots = conversion_roots(candidates, module_paths)
         external_parameters, _ = external_state_owners(module_paths, roots)
         validate_kimi_expert_aliases(candidates, module_paths, external_parameters)
-    validate = getattr(model, "validate_parallel", None)
-    # A whole-model capability contract describes unsharded geometry. TP
-    # validates it before its own transformations; EP-only must do so here.
-    # Do not reinterpret TP-sharded or already converted storage as native.
-    if (
-        callable(validate)
-        and not tp_enabled
-        and getattr(model, "parallel_plan", None) is None
-        and getattr(model, "ep_parallel_plan", None) is None
-    ):
-        validate(tp_degree=1, ep_degree=degree)
+    validate_ep_model_geometry(model, degree=degree, tp_enabled=tp_enabled)
     return ParallelPlan(
         stage="ep",
         targets=tuple(targets),
@@ -638,12 +733,7 @@ def swap_moe_blocks(
     )
 
     hf_config = getattr(model, "config", None)
-    if getattr(hf_config, "experts_implementation", "native") == "pre_down":
-        raise UnsupportedCombinationError(
-            "EP MoE replacement cannot preserve experts_implementation='pre_down'; "
-            "use native experts or retain the local/DP/FSDP HF expert path. "
-            "This also applies to single-rank fixed-router replacement."
-        )
+    validate_ep_model_options(hf_config, token_dispatcher)
     aux_loss_coeff = (
         router_aux_loss_coef
         if router_aux_loss_coef is not None
@@ -684,6 +774,13 @@ def swap_moe_blocks(
             raise ValueError("EP plan requires resolved MoE conversion targets")
         if binding.owner._modules.get(binding.attribute) is not target.module:
             raise ValueError(f"Stale EP decoder slot: {target.path}")
+        # Module identity alone cannot detect a model changing a sparse slot
+        # to dense, or declaring a different child after plan resolution.
+        if hasattr(binding.owner, "moe_block_name") != binding.declared_slot or (
+            binding.declared_slot
+            and getattr(binding.owner, "moe_block_name", None) != binding.attribute
+        ):
+            raise ValueError(f"Stale EP decoder declaration: {target.path}")
         if isinstance(target.module, KimiSparseMoE) and (
             target.module.expert_parallel_math_signature() != binding.kimi_math
         ):
@@ -699,6 +796,9 @@ def swap_moe_blocks(
                 ) from error
             if current_output != binding.router_logits:
                 raise ValueError(f"Stale EP router output contract: {target.path}")
+        validate_router_output_conversion(
+            target.module, binding.router_logits, hf_config
+        )
         candidates.append(
             (binding.owner, binding.attribute, target.module, binding.router_logits)
         )
@@ -729,9 +829,13 @@ def swap_moe_blocks(
                 packed_bindings[id(target.module)] = binding.packed_experts
     if not candidates:
         raise ValueError("EP plan must contain conversion targets")
+    validate_ep_model_geometry(model, degree=degree, tp_enabled=tp_enabled)
 
     module_paths = list(model.named_modules(remove_duplicate=False))
     replaced_roots = conversion_roots(candidates, module_paths)
+    validate_packed_expert_aliases(
+        execution_plan.targets, module_paths, replaced_roots, degree=degree
+    )
     external_parameters, external_buffers = external_state_owners(
         module_paths, replaced_roots
     )

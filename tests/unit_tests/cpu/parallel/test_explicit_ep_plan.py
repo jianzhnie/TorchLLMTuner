@@ -80,6 +80,25 @@ def test_ep_only_preflight_rejects_stale_model_declared_geometry():
     assert torch.equal(torch.get_rng_state(), rng)
 
 
+def test_ep_execution_revalidates_model_geometry_before_conversion():
+    model = _model()
+    plan = model_replacement.resolve_ep_plan(model)
+    model.config.hidden_size += 1
+    blocks = tuple(layer.mlp for layer in model.layers)
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+    with pytest.raises(
+        ValueError, match="gate/up storage differs from declared geometry"
+    ):
+        model_replacement.swap_moe_blocks(model, resolved_plan=plan)
+    assert all(
+        layer.mlp is block
+        for layer, block in zip(model.layers, blocks, strict=True)
+    )
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert torch.equal(torch.get_rng_state(), rng)
+
+
 @pytest.mark.parametrize("contract", [None, "invalid"])
 def test_explicit_ep_rejects_missing_math_contract_without_legacy_probe(
     monkeypatch, contract
@@ -474,3 +493,166 @@ def test_ep_plan_rejects_new_external_buffer_alias_before_conversion(monkeypatch
     monkeypatch.setattr(model_replacement, "convert_block", forbidden)
     with pytest.raises(ValueError, match="Stale plan buffer ownership"):
         model_replacement.swap_moe_blocks(model, resolved_plan=plan)
+
+
+@pytest.mark.parametrize(
+    ("implementation", "error", "message"),
+    [
+        ("unknown", ValueError, "ep_token_dispatcher"),
+        ("deepep", NotImplementedError, "registered gap"),
+        ("hybridep", NotImplementedError, "registered gap"),
+    ],
+)
+def test_ep_preflight_rejects_unavailable_dispatcher_before_model_binding(
+    monkeypatch, implementation, error, message
+):
+    model = _model()
+    rng = torch.get_rng_state().clone()
+    parameters = tuple(model.parameters())
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Unavailable dispatcher reached model binding")
+
+    monkeypatch.setattr(model_replacement, "find_moe_candidates", forbidden)
+    with pytest.raises(error, match=message):
+        model_replacement.resolve_ep_plan(model, implementation=implementation)
+    assert torch.equal(rng, torch.get_rng_state())
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+
+
+def test_ep_preflight_rejects_pre_down_score_semantics_before_model_binding(
+    monkeypatch,
+):
+    model = _model()
+    model.config.experts_implementation = "pre_down"
+    rng = torch.get_rng_state().clone()
+    parameters = tuple(model.parameters())
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Unsupported score semantics reached model binding")
+
+    monkeypatch.setattr(model_replacement, "find_moe_candidates", forbidden)
+    with pytest.raises(UnsupportedCombinationError, match="pre_down"):
+        model_replacement.resolve_ep_plan(model)
+    assert torch.equal(rng, torch.get_rng_state())
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+
+
+def test_ep_execution_rejects_pre_down_enabled_after_plan_resolution(monkeypatch):
+    model = _model()
+    plan = model_replacement.resolve_ep_plan(model)
+    model.config.experts_implementation = "pre_down"
+    rng = torch.get_rng_state().clone()
+    blocks = tuple(layer.mlp for layer in model.layers)
+    parameters = tuple(model.parameters())
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Changed score semantics reached expert conversion")
+
+    monkeypatch.setattr(model_replacement, "convert_block", forbidden)
+    with pytest.raises(UnsupportedCombinationError, match="pre_down"):
+        model_replacement.swap_moe_blocks(model, resolved_plan=plan)
+    assert torch.equal(rng, torch.get_rng_state())
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert all(a is b.mlp for a, b in zip(blocks, model.layers, strict=True))
+
+
+def test_ep_execution_rechecks_router_output_config_before_conversion(monkeypatch):
+    model = _model()
+    block = model.layers[0].mlp
+    del block.router_logits_in_output
+    block.moe_contract = replace(block.moe_contract, router_logits_in_output=True)
+    model.config.output_router_logits = False
+    plan = model_replacement.resolve_ep_plan(model)
+    model.config.output_router_logits = True
+    parameters = tuple(model.parameters())
+    blocks = tuple(layer.mlp for layer in model.layers)
+    rng = torch.get_rng_state().clone()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Changed router output reached expert conversion")
+
+    monkeypatch.setattr(model_replacement, "convert_block", forbidden)
+    with pytest.raises(UnsupportedCombinationError, match="returns router logits"):
+        model_replacement.swap_moe_blocks(model, resolved_plan=plan)
+    assert torch.equal(rng, torch.get_rng_state())
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert all(a is b.mlp for a, b in zip(blocks, model.layers, strict=True))
+
+
+@pytest.mark.parametrize("slot", [None, "self_attn", "missing", 3, "deleted"])
+def test_ep_plan_rejects_changed_decoder_slot_declaration(monkeypatch, slot):
+    model = _model()
+    plan = model_replacement.resolve_ep_plan(model)
+    if slot == "deleted":
+        del model.layers[0].moe_block_name
+    else:
+        model.layers[0].moe_block_name = slot
+    parameters = tuple(model.parameters())
+    blocks = tuple(layer.mlp for layer in model.layers)
+    rng = torch.get_rng_state().clone()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Stale decoder declaration reached expert conversion")
+
+    monkeypatch.setattr(model_replacement, "convert_block", forbidden)
+    with pytest.raises(ValueError, match="Stale EP decoder declaration"):
+        model_replacement.swap_moe_blocks(model, resolved_plan=plan)
+    assert torch.equal(rng, torch.get_rng_state())
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert all(a is b.mlp for a, b in zip(blocks, model.layers, strict=True))
+
+
+@pytest.mark.parametrize(
+    ("projection", "degree", "alias_kind"),
+    [
+        ("gate_up_proj", 1, "parameter"),
+        ("gate_up_proj", 2, "parameter"),
+        ("down_proj", 2, "parameter"),
+        ("gate_up_proj", 1, "buffer_view"),
+        ("down_proj", 2, "parameter_view"),
+    ],
+)
+def test_ep_preflight_rejects_external_packed_expert_aliases(
+    projection, degree, alias_kind
+):
+    model = _model()
+    source = getattr(model.layers[0].mlp.experts, projection)
+    if alias_kind == "parameter":
+        model.register_parameter("external_expert", source)
+    elif alias_kind == "buffer_view":
+        model.register_buffer("external_expert", source.detach().view(-1))
+    else:
+        model.register_parameter(
+            "external_expert", torch.nn.Parameter(source.detach().view(-1))
+        )
+    parameters = tuple(model.parameters())
+    blocks = tuple(layer.mlp for layer in model.layers)
+    rng = torch.get_rng_state().clone()
+    with pytest.raises(UnsupportedCombinationError, match="external_expert"):
+        model_replacement.resolve_ep_plan(model, degree=degree)
+    assert torch.equal(rng, torch.get_rng_state())
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert all(a is b.mlp for a, b in zip(blocks, model.layers, strict=True))
+
+
+@pytest.mark.parametrize("alias_kind", ["parameter", "buffer_view"])
+def test_local_ep_preserves_unchanged_down_projection_alias(alias_kind):
+    model = _model()
+    source = model.layers[0].mlp.experts.down_proj
+    if alias_kind == "parameter":
+        model.register_parameter("external_down", source)
+    else:
+        model.register_buffer("external_down", source.detach().view(-1))
+    plan = model_replacement.resolve_ep_plan(model, degree=1)
+    model_replacement.swap_moe_blocks(
+        model, resolved_plan=plan, router_aux_loss_coef=0.0
+    )
+    converted = model.layers[0].mlp.routed_experts.inner_experts.w2_EDF
+    assert converted is source
+    assert (
+        model.external_down.untyped_storage()._cdata == source.untyped_storage()._cdata
+    )
+    with torch.no_grad():
+        converted.add_(1)
+    torch.testing.assert_close(model.external_down.reshape_as(converted), converted)

@@ -29,14 +29,14 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from llmtuner.config import ParallelConfig
-from llmtuner.models.hf.factory import build_model_config
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.tensor_parallel import apply_tp
+from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.models.configuration import build_model_config
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     ColumnParallelLinear,
     ColwiseLinearNoGather,
     RowParallelLinear,
+    apply_tp,
 )
 from llmtuner.parallel.topology import ParallelTopology, build_device_mesh
 from tests.integration_tests.harness import backend, init_distributed, moved
@@ -50,13 +50,18 @@ FWD_TOL = 1e-5
 GRAD_TOL = 1e-4
 
 
-def _model(seed: int = 0) -> HFTransformerModel:
+def _model(seed: int = 0) -> Qwen3MoeForCausalLM:
     torch.manual_seed(seed)
     config = build_model_config(
-        "llama",
+        "qwen3_moe",
         seq_len=SEQ,
         arch_overrides={
             "vocab_size": VOCAB,
+            "head_dim": 4,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 16,
+            "mlp_only_layers": [0, 1],
             "hidden_size": 16,
             "intermediate_size": 32,
             "num_hidden_layers": 2,
@@ -64,7 +69,7 @@ def _model(seed: int = 0) -> HFTransformerModel:
             "num_key_value_heads": 4,
         },
     )
-    return moved(HFTransformerModel(config))
+    return moved(Qwen3MoeForCausalLM(config))
 
 
 def _batch(seed: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
@@ -99,12 +104,12 @@ def main() -> None:
     ids, labels = _batch()
 
     # -- single-card reference ------------------------------------------------
-    logits_ref = ref(ids)
+    logits_ref = ref(ids).logits.squeeze(0)
     loss_ref = _loss_sum(logits_ref, labels)
     loss_ref.backward()
 
     # -- TP run ---------------------------------------------------------------
-    inputs, labels_shard, extra = model.preprocess_inputs(
+    inputs, labels_shard, extra = model.prepare_inputs(
         {"input": ids, "labels": labels}, parallel_dims=parallel_dims
     )
 
@@ -115,9 +120,9 @@ def main() -> None:
     # rank is exactly the bug that inflated weight gradients by tp.
     want_inputs = ids[rank * half : (rank + 1) * half]
     if not torch.equal(inputs, want_inputs):
-        failures.append("preprocess_inputs did not TP-shard the sequence")
+        failures.append("prepare_inputs did not TP-shard the sequence")
     if not torch.equal(labels_shard, labels[rank * half : (rank + 1) * half]):
-        failures.append("preprocess_inputs did not TP-shard the labels")
+        failures.append("prepare_inputs did not TP-shard the labels")
     # RoPE/attention see the assembled full sequence after the in-projection
     # all-gather, so positions stay full-length.
     positions = extra.get("positions")
@@ -126,7 +131,7 @@ def main() -> None:
     ):
         failures.append(f"positions not full-length under TP: {positions}")
 
-    logits_tp = model(inputs, **extra)
+    logits_tp = model(inputs, **extra).logits.squeeze(0)
     _loss_sum(logits_tp, labels_shard).backward()
 
     want_logits = logits_ref[rank * half : (rank + 1) * half]

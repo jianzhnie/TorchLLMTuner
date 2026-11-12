@@ -479,6 +479,11 @@ _COUNTS = torch.tensor([5, 6, 4, 7])
         (torch.tensor([-1, 2, 1, 2]), RuntimeError, "nonnegative"),
         (torch.tensor([1, 1, 1, 0]), RuntimeError, "sum"),
         (torch.tensor([2, 1, 1, 1]), RuntimeError, "sum"),
+        (
+            torch.tensor([2**62, 2**62, 2**62, 2**62 + 4]),
+            RuntimeError,
+            "exceed the routed token count",
+        ),
     ],
 )
 def test_expert_segment_counts_fail_before_any_projection(
@@ -732,3 +737,15 @@ def test_grouped_experts_rejects_noninteger_dimensions(field, value):
 def test_grouped_experts_rejects_nonboolean_backend_override(value):
     with pytest.raises(TypeError, match="use_grouped_mm must be bool or None"):
         GroupedExperts(4, 8, 2, use_grouped_mm=value)
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8])
+def test_expert_small_integer_counts_allow_more_rows_than_dtype_range(dtype):
+    module = _grouped(use_grouped_mm=False)
+    inputs = torch.randn(300, 16)
+    counts = torch.tensor([100, 100, 50, 50], dtype=dtype)
+    actual = module(inputs, counts)
+    expected = module(inputs, counts.to(torch.int64))
+    assert actual.shape == (300, 16)
+    assert actual.isfinite().all() and actual.count_nonzero() > 0
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

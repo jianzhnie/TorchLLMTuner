@@ -6,10 +6,12 @@ import torch
 import torch.distributed as dist
 from transformers import Qwen3MoeConfig
 
+from llmtuner.accelerator.collectives import synchronize_local_errors
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
+from llmtuner.parallel.expert_parallel.model_replacement import resolve_ep_plan
 from tests.integration_tests.harness import init_distributed
 
 
@@ -51,6 +53,35 @@ def main() -> None:
             assert isinstance(caught, UnsupportedCombinationError)
         else:
             assert "EP assembly validation failed on another rank" in str(caught)
+        for invalid_option in ("dispatcher", "pre_down"):
+            model = make_model(device)
+            implementation = "alltoall"
+            if rank == 0:
+                if invalid_option == "dispatcher":
+                    implementation = "unknown"
+                else:
+                    model.config.experts_implementation = "pre_down"
+            parameters = tuple(model.parameters())
+            block = model.layers[0].mlp
+            rng = torch.get_rng_state().clone()
+            caught = None
+            try:
+                with synchronize_local_errors(
+                    "EP plan validation", group=dist.group.WORLD
+                ):
+                    resolve_ep_plan(model, degree=2, implementation=implementation)
+            except (ValueError, UnsupportedCombinationError, RuntimeError) as error:
+                caught = error
+            assert caught is not None, invalid_option
+            if rank == 0:
+                assert invalid_option in str(caught), str(caught)
+            else:
+                assert "EP plan validation failed on another rank" in str(caught)
+            assert model.layers[0].mlp is block
+            assert all(
+                a is b for a, b in zip(parameters, model.parameters(), strict=True)
+            )
+            assert torch.equal(rng, torch.get_rng_state())
         # A successful peer may already be converted; no rollback is promised.
         # Both ranks retry with fresh models and exercise real all-to-all autograd.
         model = make_model(device)

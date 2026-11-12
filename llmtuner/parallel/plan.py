@@ -8,6 +8,8 @@ from typing import Literal
 
 from torch import Tensor, device, dtype, nn, strided
 
+from ..models.contracts import DecoderStructure
+
 __all__ = ["ParallelPlan", "PlanTarget"]
 
 ReplacementObserver = Callable[
@@ -93,6 +95,9 @@ class ParallelPlan:
     storage_aliases: tuple[tuple[str, ...], ...] = field(
         default=(), init=False, repr=False, compare=False
     )
+    decoder_structure: DecoderStructure | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def storage_alias_groups(self) -> tuple[tuple[str, ...], ...]:
         """Describe ordinary strided storage sharing without retaining storage.
@@ -125,6 +130,12 @@ class ParallelPlan:
             raise ValueError("Parallel plan implementation must not be empty")
         object.__setattr__(self, "storage_aliases", self.storage_alias_groups())
         if self.module_bindings is not None:
+            for path, module in self.module_bindings:
+                if path == "":
+                    structure = getattr(module, "decoder_structure", None)
+                    if isinstance(structure, DecoderStructure):
+                        object.__setattr__(self, "decoder_structure", structure)
+                    break
             object.__setattr__(
                 self,
                 "buffer_persistence",
@@ -179,6 +190,12 @@ class ParallelPlan:
 
     def validate_binding(self, model: nn.Module) -> None:
         """Reject a plan whose live module references no longer match the model."""
+        if self.decoder_structure is not None and (
+            getattr(model, "decoder_structure", None) != self.decoder_structure
+        ):
+            # Registered modules can stay identical while model-owned paths
+            # change. Both TP and EP must reject that stale structural meaning.
+            raise ValueError("Stale plan decoder structure")
         for kind, expected, actual in (
             ("module", self.module_bindings, model.named_modules),
             ("parameter", self.parameter_bindings, model.named_parameters),

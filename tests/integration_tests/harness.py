@@ -25,11 +25,16 @@ checkpointer) keep following it. So the switch gives the original CPU/gloo run
 for the scripts whose tensors this module places -- the pure-redistribution
 harnesses -- and a *starting* CPU for the rest, which then fail loudly on the
 mixed devices rather than silently training on the accelerator. Running those
-on CPU needs a CPU-only host: hiding the devices here is not an option, because
-``torch_npu`` patches ``torch.optim`` unconditionally
-(``torch_npu/__init__.py:178`` -> ``utils/_optim.py:patch_supported_devices``)
-and the patch then queries ``torch_npu.npu.current_device()``, which fails with
-``aclInit ... Invalid device ID`` once no device is visible.
+on CPU requires hiding accelerators before Python starts, for example
+``ASCEND_RT_VISIBLE_DEVICES="" CUDA_VISIBLE_DEVICES=""``. Verify the production
+``device_type`` is actually ``cpu`` before launching a Trainer CPU check.
+
+On torch-npu builds, optimizer auto-selection may still query an invisible
+NPU via its supported-device probe. References should explicitly select
+``foreach=False`` and the intended ``fused`` policy to match the training arm;
+changing only ``LLMTUNER_TEST_DEVICE`` does not make that probe CPU-safe.
+The CPU suite and explicit-model checkpoint harnesses have been run with
+hidden accelerators; a CPU-only host is not inherently required.
 """
 
 from __future__ import annotations

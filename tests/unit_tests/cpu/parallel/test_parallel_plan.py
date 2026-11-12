@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel import ParallelPlan, PlanTarget
 
 
@@ -215,3 +216,60 @@ def test_minimal_plan_validates_target_ownership_without_global_snapshot(change)
         model = nn.Sequential(nn.Linear(4, 4))
     with pytest.raises(ValueError, match="Stale plan binding"):
         plan.validate_binding(model)
+
+
+@pytest.mark.parametrize("change", ["replace", "remove", "invalid"])
+def test_plan_rejects_changed_explicit_decoder_structure(change):
+    model = nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="model",
+        embedding="model.embed",
+        blocks="model.layers",
+        norm="model.norm",
+        head="head",
+        attention="self_attn",
+    )
+    plan = ParallelPlan(
+        stage="tp",
+        targets=(),
+        degree=2,
+        implementation="functional",
+        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+    )
+    if change == "replace":
+        model.decoder_structure = DecoderStructure(
+            decoder="model",
+            embedding="model.embed",
+            blocks="model.layers",
+            norm="model.norm",
+            head="other_head",
+            attention="self_attn",
+        )
+    elif change == "remove":
+        del model.decoder_structure
+    else:
+        model.decoder_structure = "invalid"
+    with pytest.raises(ValueError, match="Stale plan decoder structure"):
+        plan.validate_binding(model)
+
+
+def test_plan_accepts_equivalent_decoder_declaration_without_tensor_changes():
+    model = nn.Module()
+    declaration = dict(
+        decoder="model",
+        embedding="model.embed",
+        blocks="model.layers",
+        norm="model.norm",
+        head="head",
+        attention="self_attn",
+    )
+    model.decoder_structure = DecoderStructure(**declaration)
+    plan = ParallelPlan(
+        stage="ep",
+        targets=(),
+        degree=2,
+        implementation="alltoall",
+        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+    )
+    model.decoder_structure = DecoderStructure(**declaration)
+    plan.validate_binding(model)

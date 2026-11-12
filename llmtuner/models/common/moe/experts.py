@@ -172,6 +172,13 @@ class GroupedExperts(nn.Module):
             (num_tokens_per_expert_E >= 0).all(),
             "Expert token counts must be nonnegative",
         )
+        # A sum alone can wrap int64 and appear to cover the routed rows.
+        # Check each segment before cumulative int32 narrowing. Widen small
+        # integer dtypes so the row bound itself cannot be truncated.
+        torch._assert_async(
+            (num_tokens_per_expert_E.to(torch.int64) <= x_RD.shape[0]).all(),
+            "Expert token counts must not exceed the routed token count",
+        )
         torch._assert_async(
             num_tokens_per_expert_E.sum() == x_RD.shape[0],
             "Expert token counts must sum to the number of routed tokens",
