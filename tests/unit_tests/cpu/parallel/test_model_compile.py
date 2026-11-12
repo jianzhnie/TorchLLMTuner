@@ -19,8 +19,8 @@ These tests pin, on CPU with no process group:
   carries token-choice MoE blocks, unset for a dense one), with the global
   restored afterwards.
 
-Model-level tests are gated on the required flex/SPMD import surface. Actual
-CPU aot_eager graphs also check AC composition, mixed train/eval modes,
+Model-level tests construct explicit Qwen3 models without the removed HF
+adapter. CPU aot_eager graphs also check AC composition, mixed train/eval modes,
 parameter identity and frozen gradients against an eager reference.
 """
 
@@ -59,7 +59,6 @@ requires_parallel_config = pytest.mark.skipif(
 )
 
 _VOCAB = 32
-_HIDDEN = 16
 _SEQ = 24
 _NUM_LAYERS = 3
 
@@ -297,10 +296,8 @@ def test_maybe_regional_inductor_is_null_when_disabled() -> None:
 def test_capture_scalar_outputs_set_only_for_token_choice_moe(monkeypatch) -> None:
     """The flag follows the MoE-dispatch condition, and only that condition.
 
-    A real swapped MoE cannot be built in this environment (the installed
-    transformers' Qwen3Moe layout predates the swap's probe), so the
-    detection seam itself is stubbed; ``collect_moe_layers`` is pinned by the
-    EP tests.
+    Stub the dispatch detector to isolate this global compile policy from
+    expert conversion; real MoE training graphs are covered separately.
     """
     with _preserve_dynamo_flag("capture_scalar_outputs"):
         torch._dynamo.config.capture_scalar_outputs = False
@@ -449,7 +446,7 @@ def test_missing_moe_compile_capability_fails_before_setup(monkeypatch):
 
 
 def test_compiled_qwen_training_matches_native_hf_trajectory():
-    """Use native HF forward as an oracle independent of the flat wrapper."""
+    """Use native HF forward as an oracle independent of the explicit model."""
     import copy
 
     from torch._dynamo.utils import counters
@@ -457,13 +454,15 @@ def test_compiled_qwen_training_matches_native_hf_trajectory():
     torch._dynamo.reset()
     counters.clear()
     torch.manual_seed(42)
-    wrapper = _model(seed=42)
-    reference = ReferenceQwen3MoeForCausalLM(copy.deepcopy(wrapper.config))
-    reference.load_state_dict(wrapper.state_dict(), strict=True)
-    model = apply_compile(wrapper, compile_config=CompileConfig(backend="aot_eager"))
-    actual_optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0)
+    candidate = _model(seed=42)
+    reference = ReferenceQwen3MoeForCausalLM(copy.deepcopy(candidate.config))
+    reference.load_state_dict(candidate.state_dict(), strict=True)
+    model = apply_compile(candidate, compile_config=CompileConfig(backend="aot_eager"))
+    actual_optimizer = torch.optim.AdamW(
+        model.parameters(), lr=3e-4, weight_decay=0, foreach=False
+    )
     reference_optimizer = torch.optim.AdamW(
-        reference.parameters(), lr=3e-4, weight_decay=0
+        reference.parameters(), lr=3e-4, weight_decay=0, foreach=False
     )
     generator = torch.Generator().manual_seed(1234)
     for _ in range(4):
@@ -482,11 +481,11 @@ def test_compiled_qwen_training_matches_native_hf_trajectory():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(reference.parameters(), 1.0)
         expected_parameters = dict(reference.named_parameters())
-        for name, parameter in wrapper.named_parameters():
+        for name, parameter in candidate.named_parameters():
             torch.testing.assert_close(parameter.grad, expected_parameters[name].grad)
         actual_optimizer.step()
         reference_optimizer.step()
-        for name, parameter in wrapper.named_parameters():
+        for name, parameter in candidate.named_parameters():
             torch.testing.assert_close(parameter, expected_parameters[name])
     assert counters["stats"]["unique_graphs"] > 0
 

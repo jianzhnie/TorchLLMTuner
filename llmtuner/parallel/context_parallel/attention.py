@@ -1,8 +1,9 @@
 """The CP flex kernel: redistribute q/k/v across the CP group, then run flex.
 
 ``apply_cp`` attaches one of these to every decoder layer's attention module
-as ``_titan_flex_kernel``; ``hf/model.py``'s ``flex_attention_adapter`` routes the
-layer's attention call through it. q/k/v arrive HF-shaped --
+as ``_titan_flex_kernel``. A Flex-capable attention caller must explicitly
+route through that kernel; attachment alone does not establish support.
+q/k/v arrive in attention layout --
 ``(batch, heads, seq, dim)`` -- with the sequence already sharded along dim 2
 by ``shard_batch_for_cp``. Two strategies redistribute them:
 
@@ -282,8 +283,8 @@ class CPFlexKernel(nn.Module):
         Q, full KV) that pairs with the gathered K/V; for ``ulysses`` it is
         either dropped and rebuilt (single causal document) or used as-is
         (packed corpus, full-length -- see :meth:`_forward_ulysses`). Returns
-        just the attention output tensor -- ``hf/model.py``'s ``flex_attention_adapter``
-        appends the ``None`` LSE itself.
+        just the attention output tensor; the caller owns any surrounding
+        attention return tuple.
         """
         if self.strategy == "ulysses":
             return self._forward_ulysses(
