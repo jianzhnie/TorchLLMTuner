@@ -18,7 +18,6 @@ from llmtuner.models.common.aux_loss import (
 )
 from llmtuner.trainer.runtime.metrics import build_step_metrics
 from llmtuner.trainer.runtime.reductions import TrainingReductionMeshes
-from llmtuner.trainer.trainer import Trainer
 
 
 def main():
@@ -61,15 +60,13 @@ def main():
         assert collect_aux_loss_metrics(topology, model_parts=[empty_stage]) == {
             "aux_loss/mean": 3.0
         }
-        # Exercise the actual Trainer entry with an empty constructor registry
-        # on the stage that owns no auxiliary loss.
-        trainer = Trainer.__new__(Trainer)
-        trainer.parallel_dims = topology
-        trainer.model_parts = [empty_stage]
-        trainer.pp_has_last_stage = rank == 1
-        trainer.ntokens_seen = 4
+        # Exercise runtime reduction with no auxiliary loss on the tail stage.
         metrics = build_step_metrics(
-            trainer,
+            ntokens_seen=4,
+            device=torch.device("cpu"),
+            parallel_dims=topology,
+            model_parts=[empty_stage],
+            pp_has_last_stage=rank == 1,
             accumulated_loss=torch.tensor(8.0 if rank == 1 else 0.0),
             global_valid_tokens=torch.tensor(4),
             local_valid_tokens=4,

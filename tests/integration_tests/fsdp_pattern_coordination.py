@@ -17,7 +17,7 @@ from torch.distributed.tensor import DTensor
 
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import apply_fsdp
-from llmtuner.parallel.fully_shard_parallel.plan import apply_fsdp_by_pattern
+from llmtuner.parallel.fully_shard_parallel.pattern import apply_fsdp_by_pattern
 from llmtuner.parallel.topology import ParallelTopology
 
 

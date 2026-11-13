@@ -36,7 +36,7 @@ from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     force_sum_grad_reduction,
     iter_fsdp_modules,
 )
-from llmtuner.parallel.fully_shard_parallel.plan import apply_fsdp_by_pattern
+from llmtuner.parallel.fully_shard_parallel.pattern import apply_fsdp_by_pattern
 
 
 class TiedDecoder(nn.Module):

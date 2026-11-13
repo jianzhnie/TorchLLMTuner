@@ -35,12 +35,12 @@ import torch.nn.functional as F
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.models.configuration import build_model_config
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
-from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+from llmtuner.parallel.tensor_parallel.linear import (
     ColumnParallelLinear,
     ColwiseLinearNoGather,
     RowParallelLinear,
-    apply_tp,
 )
+from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology, build_device_mesh
 from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 from llmtuner.trainer.trainer import Trainer
@@ -154,7 +154,9 @@ def main() -> None:
         # gradient covers only its own token shard.
         pre = replicated["model.embed_tokens.weight"].grad.clone()
 
-        allreduce_replicated_tp_grads(trainer)
+        allreduce_replicated_tp_grads(
+            trainer.model_parts, parallel_dims=trainer.parallel_dims
+        )
 
         want_loss = _loss_sum(
             logits_ref[rank * half : (rank + 1) * half],

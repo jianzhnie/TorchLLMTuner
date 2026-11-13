@@ -3,8 +3,6 @@
 Run with two NPU ranks. This auxiliary test does not replace model training.
 """
 
-from types import SimpleNamespace
-
 import torch
 import torch.distributed as dist
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -37,7 +35,7 @@ def main() -> None:
             finite = torch.tensor(rank == 0, dtype=torch.int32, device=device)
             dist.all_reduce(finite, op=dist.ReduceOp.MIN)
             try:
-                check_finite(SimpleNamespace(step=7), finite.bool())
+                check_finite(7, finite.bool())
             except RuntimeError as error:
                 assert "not finite at step 7" in str(error)
             else:

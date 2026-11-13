@@ -32,12 +32,12 @@ import torch.nn.functional as F
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.models.configuration import build_model_config
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
-from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+from llmtuner.parallel.tensor_parallel.linear import (
     ColumnParallelLinear,
     ColwiseLinearNoGather,
     RowParallelLinear,
-    apply_tp,
 )
+from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology, build_device_mesh
 from tests.integration_tests.harness import backend, init_distributed, moved
 

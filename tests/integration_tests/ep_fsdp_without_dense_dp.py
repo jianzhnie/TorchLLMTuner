@@ -25,7 +25,6 @@ Neither option changes the production seeding policy or the default fixture.
 import copy
 import os
 from contextlib import nullcontext
-from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -275,9 +274,7 @@ def main() -> None:
         torch.testing.assert_close(
             global_loss, reference_global_loss, rtol=rtol, atol=atol
         )
-        allreduce_replicated_tp_grads(
-            SimpleNamespace(parallel_dims=dims, model_parts=[model])
-        )
+        allreduce_replicated_tp_grads([model], parallel_dims=dims)
         tp_rank = dims.get_mesh("tp").get_local_rank()
         token_slice = slice(tp_rank * 8, (tp_rank + 1) * 8)
         with synchronize_local_errors("TP/EP trace comparison"):

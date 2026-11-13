@@ -597,7 +597,10 @@ def _train_steps(trainer: Trainer, data_iterator, num_steps: int) -> list[float]
                         assert parameter.grad is None
                         assert _equal_rank_state(parameter, frozen_parameters[name])
         assert metrics is not None  # log_freq=1: every step reports
-        if not trainer.parallel_dims.pp_enabled or trainer.pp_has_last_stage:
+        if (
+            not trainer.parallel_dims.pp_enabled
+            or trainer.training_engine.pp_has_last_stage
+        ):
             losses.append(metrics["loss"])
     return losses
 

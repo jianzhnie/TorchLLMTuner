@@ -4,10 +4,12 @@ from copy import deepcopy
 from dataclasses import replace
 
 import pytest
+import torch
 from torch import nn
 
 from llmtuner.config.parallel_config import ParallelConfig, TensorParallelConfig
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.parallel.expert_parallel.plan import validate_pipeline_ep_plan
 from llmtuner.parallel.pipeline_parallel.partition import prune_declared_stage
 from llmtuner.parallel.plan import ParallelPlan, PlanTarget
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
@@ -131,3 +133,115 @@ def test_pipeline_tp_rejects_changed_token_history_contract(requirement):
     local_plan.validate_binding(part)
     with pytest.raises(ValueError, match="token history requirement changed"):
         validate_pipeline_tp_plan(global_plan, local_plan, part)
+
+
+@pytest.mark.parametrize("stage", ["tp", "ep"])
+@pytest.mark.parametrize("initially_shared", [False, True])
+def test_pipeline_rejects_changed_retained_parameter_aliases(stage, initially_shared):
+    whole = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+    if initially_shared:
+        whole[1].weight = whole[0].weight
+    part = deepcopy(whole)
+    if initially_shared:
+        part[1].weight = nn.Parameter(part[1].weight.detach().clone())
+    else:
+        part[1].weight = part[0].weight
+
+    def plan(model):
+        return ParallelPlan(
+            stage,
+            (),
+            2,
+            "test",
+            parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+        )
+
+    validator = (
+        validate_pipeline_tp_plan if stage == "tp" else validate_pipeline_ep_plan
+    )
+    with pytest.raises(ValueError, match="parameter alias ownership"):
+        validator(plan(whole), plan(part), part)
+
+
+@pytest.mark.parametrize("stage", ["tp", "ep"])
+def test_pipeline_projects_aliases_onto_retained_parameters(stage):
+    whole = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4), nn.Linear(4, 4))
+    whole[1].weight = whole[0].weight
+    whole[2].weight = whole[0].weight
+    part = deepcopy(whole)
+    part[2] = nn.Identity()
+
+    def plan(model):
+        return ParallelPlan(
+            stage,
+            (),
+            2,
+            "test",
+            parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+        )
+
+    validator = (
+        validate_pipeline_tp_plan if stage == "tp" else validate_pipeline_ep_plan
+    )
+    validator(plan(whole), plan(part), part)
+    assert part[0].weight is part[1].weight
+    assert part[0].weight is not whole[0].weight
+
+
+@pytest.mark.parametrize("stage", ["tp", "ep"])
+@pytest.mark.parametrize("change", ["identity", "split_storage", "merge_storage"])
+def test_pipeline_rejects_buffer_alias_drift(stage, change):
+    whole = nn.Module()
+    base = torch.arange(4.0)
+    whole.register_buffer("left", base)
+    whole.register_buffer(
+        "right",
+        base
+        if change == "identity"
+        else (base.view_as(base) if change == "split_storage" else base.clone()),
+    )
+    part = deepcopy(whole)
+    if change in ("identity", "split_storage"):
+        part.right = part.right.clone()
+    else:
+        part.right = part.left.view_as(part.left)
+
+    def plan(model):
+        return ParallelPlan(
+            stage,
+            (),
+            2,
+            "test",
+            buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+        )
+
+    validator = (
+        validate_pipeline_tp_plan if stage == "tp" else validate_pipeline_ep_plan
+    )
+    with pytest.raises(ValueError, match="alias ownership"):
+        validator(plan(whole), plan(part), part)
+
+
+@pytest.mark.parametrize("stage", ["tp", "ep"])
+def test_pipeline_accepts_preserved_buffer_view_storage(stage):
+    whole = nn.Module()
+    base = torch.arange(4.0)
+    whole.register_buffer("left", base)
+    whole.register_buffer("right", base.view_as(base))
+    part = deepcopy(whole)
+
+    def plan(model):
+        return ParallelPlan(
+            stage,
+            (),
+            2,
+            "test",
+            buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+        )
+
+    validator = (
+        validate_pipeline_tp_plan if stage == "tp" else validate_pipeline_ep_plan
+    )
+    validator(plan(whole), plan(part), part)
+    assert part.left is not part.right
+    assert part.left.untyped_storage()._cdata == part.right.untyped_storage()._cdata

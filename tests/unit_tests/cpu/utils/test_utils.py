@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 
 import pytest
@@ -340,3 +341,31 @@ def test_canonical_fqn_removes_compile_and_checkpoint_wrappers():
         canonical_fqn("_orig_mod.layers.0._checkpoint_wrapped_module.weight")
         == "layers.0.weight"
     )
+
+
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_gc_restore_failure_retains_owner_for_retry(monkeypatch, failure):
+    original = gc.isenabled()
+    gc.enable()
+    collector = GarbageCollection()
+    owners = GarbageCollection._owners
+    restore = gc.enable
+
+    def fail_restore():
+        raise failure("GC restore interrupted")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(gc, "enable", fail_restore)
+            with pytest.raises(failure, match="GC restore interrupted"):
+                collector.close()
+            assert not collector._closed
+            assert GarbageCollection._owners == owners
+        collector.close()
+        assert collector._closed
+        assert GarbageCollection._owners == owners - 1
+        assert gc.isenabled()
+        collector.close()
+    finally:
+        collector.close()
+        (restore if original else gc.disable)()

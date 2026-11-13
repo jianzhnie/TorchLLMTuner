@@ -15,7 +15,6 @@ from argparse import ArgumentParser
 from collections.abc import Iterator
 from copy import deepcopy
 from datetime import timedelta
-from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -196,9 +195,7 @@ def main() -> None:
             # In this TP2/EP2 topology EP peers instead own disjoint TP token
             # shards of one input, already represented once by the full oracle.
             if topology is not None:
-                allreduce_replicated_tp_grads(
-                    SimpleNamespace(parallel_dims=topology, model_parts=[candidate])
-                )
+                allreduce_replicated_tp_grads([candidate], parallel_dims=topology)
             for name, parameter in reference.named_parameters():
                 if ".experts." in name and topology is None:
                     assert parameter.grad is not None

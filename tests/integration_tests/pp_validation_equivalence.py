@@ -283,7 +283,7 @@ def main() -> None:
     trainer.close()
 
     # The pass ran once per step (freq=1), on the rank(s) that hold the loss.
-    if trainer.pp_has_last_stage:
+    if trainer.training_engine.pp_has_last_stage:
         if len(reported) != STEPS:
             failures.append(
                 f"rank {rank}: {len(reported)} validation reports, want {STEPS}"
@@ -301,7 +301,7 @@ def main() -> None:
     if any(not part.training for part in trainer.model_parts):
         failures.append(f"rank {rank}: a model part is still in eval mode")
 
-    if trainer.pp_has_last_stage:
+    if trainer.training_engine.pp_has_last_stage:
         print(f"pp={PP} schedule={SCHEDULE} validation freq=1 steps={STEPS}")
         print(f"reported losses = {reported}")
         print(f"reference losses = {expected}")

@@ -38,8 +38,11 @@ import os
 
 import torch
 import torch.distributed as dist
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
+from torch._dynamo.eval_frame import OptimizedModule
+from torch._dynamo.utils import counters
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointWrapper,
+)
 from torch.distributed.tensor import DTensor, Replicate
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
@@ -58,7 +61,10 @@ from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.models.common.moe.layer import MoE
-from llmtuner.parallel.expert_parallel import swap_moe_blocks
+from llmtuner.models.configuration import build_model_config_for
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
+from llmtuner.parallel.expert_parallel.torchao_dispatch import TorchAOTokenDispatcher
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.module_names import canonical_fqn
 from tests.integration_tests.harness import device, moved, moved_batch
@@ -142,7 +148,7 @@ def _reference_trajectory(
     # The oracle shares the accelerator with the trainer arm: the swapped MoE
     # blocks wire their auxiliary-loss buffers on the accelerator device, so a
     # CPU-resident oracle would mix devices inside the router.
-    model = moved(HFTransformerModel(build_model_config_for(cfg)))
+    model = moved(Qwen3MoeForCausalLM(build_model_config_for(cfg)))
     swap_moe_blocks(model)
     merged: dict[str, torch.Tensor] = {}
     for key in {key for state in initial_states for key in state}:
@@ -179,15 +185,19 @@ def _reference_trajectory(
         optimizer.zero_grad(set_to_none=True)
         batch = moved_batch(next(batches))
         AuxLoss.set_step_denominator(torch.tensor(batch.input_ids.numel()))
-        targets = model.preprocess_inputs(batch, parallel_dims=None)[1].reshape(
+        targets = model.prepare_inputs(batch, parallel_dims=None)[1].reshape(
             cfg.global_batch_size, cfg.max_seq_len
         )
         num_valid = int((targets != IGNORE_INDEX).sum())
         loss_sum = None
         for mb in range(MICROBATCHES * dp_size):
             row = slice(mb * rows_per_mb, (mb + 1) * rows_per_mb)
-            logits = model(batch.input_ids[row].reshape(-1))
-            loss = cross_entropy_loss(logits, targets[row].reshape(-1))
+            inputs, labels, kwargs = model.prepare_inputs(
+                {"input": batch.input_ids[row], "labels": targets[row]},
+                parallel_dims=None,
+            )
+            logits = model(inputs, **kwargs).logits
+            loss = cross_entropy_loss(logits, labels)
             (loss / num_valid).backward()
             loss_sum = loss.detach() if loss_sum is None else loss_sum + loss.detach()
         clip_grad_norm_(model.parameters(), max_norm=cfg.max_norm, foreach=True)
@@ -281,10 +291,6 @@ def main() -> None:
                 assert moe.router.aux_loss.coeff == args.aux_coefficient
             held = moe.routed_experts.inner_experts.num_experts
             if args.dispatcher == "torchao":
-                from llmtuner.parallel.expert_parallel.torchao_dispatch import (
-                    TorchAOTokenDispatcher,
-                )
-
                 assert isinstance(
                     moe.routed_experts.token_dispatcher, TorchAOTokenDispatcher
                 )
@@ -316,10 +322,6 @@ def main() -> None:
     # -- the trajectory ------------------------------------------------------
     replay_calls = [0]
     if args.activation_checkpoint != "none":
-        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-            CheckpointWrapper,
-        )
-
         wrapped_layers = [
             layer for part in trainer.model_parts for layer in part.layers
         ]
@@ -337,9 +339,6 @@ def main() -> None:
         trainer.step += 1
         metrics = trainer.train_step(data_iterator)
         if args.compile_backend is not None:
-            from torch._dynamo.eval_frame import OptimizedModule
-            from torch._dynamo.utils import counters
-
             assert all(
                 isinstance(part, OptimizedModule) for part in trainer.model_parts
             )

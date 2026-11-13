@@ -12,7 +12,7 @@ checks real four-rank CPU/Gloo DP x CP and DP x TP reduction semantics.
 from __future__ import annotations
 
 import random
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -105,12 +105,24 @@ SEQ_LEN = 4
 
 
 @pytest.mark.parametrize("loss", [float("nan"), float("inf"), -float("inf")])
-def test_validation_rejects_nonfinite_loss_before_logging(loss):
+def test_validation_rejects_nonfinite_loss_before_logging(loss, monkeypatch):
     from llmtuner.trainer.runtime.validation import finalize_validation
 
     logged = []
+    error_group = object()
+    coordinated = []
+
+    @contextmanager
+    def coordinate(label, *, group):
+        coordinated.append(group)
+        yield
+
+    monkeypatch.setattr(
+        "llmtuner.trainer.runtime.validation.synchronize_local_errors", coordinate
+    )
     trainer = SimpleNamespace(
-        metrics=SimpleNamespace(log_validation=lambda **kwargs: logged.append(kwargs))
+        error_group=error_group,
+        metrics=SimpleNamespace(log_validation=lambda **kwargs: logged.append(kwargs)),
     )
     with pytest.raises(FloatingPointError, match="not finite at step 7"):
         finalize_validation(
@@ -122,6 +134,7 @@ def test_validation_rejects_nonfinite_loss_before_logging(loss):
             step=7,
         )
     assert logged == []
+    assert coordinated == [error_group, error_group]
 
 
 class _ListLoader:
@@ -240,7 +253,7 @@ def test_validation_defaults_to_off() -> None:
 
 def test_feasibility_accepts_pipeline_parallelism() -> None:
     """PP x validation composes since 2026-10-02: the schedule's eval driver
-    (upstream Validator's seam) drives the pass; see evaluate_pipeline_batch."""
+    (upstream Validator's seam) drives the pass; see pipeline.run_pipeline_eval."""
     Trainer = _trainer_cls()
     Trainer.check_validation_feasibility(
         ValidationConfig(),
@@ -407,9 +420,6 @@ def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
     trainer.model = None
     trainer.model_parts = [_EchoModel()]
     trainer.checkpointer = None
-    trainer.pp_has_first_stage = True
-    trainer.pp_has_last_stage = True
-    trainer.pp_schedule = _FakePPSchedule(per_mb_loss=6.0)
     trainer.training_engine = TrainingEngine(
         model_parts=trainer.model_parts,
         parallel_dims=trainer.parallel_dims,
@@ -417,7 +427,7 @@ def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
         max_context_length=cfg.max_seq_len,
         chunked_loss_num_chunks=1,
         param_context=trainer.param_context,
-        pp_schedule=trainer.pp_schedule,
+        pp_schedule=_FakePPSchedule(per_mb_loss=6.0),
         pp_has_first_stage=True,
         pp_has_last_stage=True,
         pp_num_microbatches=cfg.parallel.pp_config.num_pp_microbatches,
@@ -428,16 +438,20 @@ def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
         log_validation=lambda loss, step: logged.update(loss=loss, step=step),
     )
     monkeypatch.setattr(validate_mod, "build_dataloader", lambda *a, **k: loader)
-    monkeypatch.setattr(validate_mod, "spmd_context", lambda dims: nullcontext())
+    monkeypatch.setattr(
+        "llmtuner.trainer.runtime.pipeline.spmd_context", lambda dims: nullcontext()
+    )
 
     trainer.validate(step=3)
 
     # Two batches, each split into num_pp_microbatches microbatches (default 1).
-    assert len(trainer.pp_schedule.eval_calls) == 2
-    call = trainer.pp_schedule.eval_calls[0]
+    assert len(trainer.training_engine.pp_schedule.eval_calls) == 2
+    call = trainer.training_engine.pp_schedule.eval_calls[0]
     assert call["arg_mbs"] is not None and call["target_mbs"] is not None
     # Denominator pinned to 1 during eval.
-    assert float(trainer.pp_schedule._llmtuner_global_valid_tokens) == 1.0
+    assert (
+        float(trainer.training_engine.pp_schedule._llmtuner_global_valid_tokens) == 1.0
+    )
     # Raw sums: 6.0 per microbatch x 1 microbatch x 2 batches, over 4 valid
     # tokens (2 per batch).
     assert logged["loss"] == pytest.approx(6.0 * 2 / 4)
@@ -766,7 +780,10 @@ def test_pipeline_validation_cleanup_preserves_iteration_error(
         validation_module, "create_validation_dataloader", lambda *args: Loader()
     )
     trainer = SimpleNamespace(
-        parallel_dims=SimpleNamespace(pp_enabled=True), device=torch.device("cpu")
+        error_group=None,
+        cfg=None,
+        parallel_dims=SimpleNamespace(pp_enabled=True),
+        device=torch.device("cpu"),
     )
     with pytest.raises(
         ValueError if iteration_fails else RuntimeError,
@@ -801,7 +818,10 @@ def test_validation_closes_loader_after_token_allocation_failure(monkeypatch, pi
     )
     monkeypatch.setattr(validation_module.torch, "zeros", fail_allocation)
     trainer = SimpleNamespace(
-        parallel_dims=SimpleNamespace(pp_enabled=pipeline), device=torch.device("cpu")
+        error_group=None,
+        cfg=None,
+        parallel_dims=SimpleNamespace(pp_enabled=pipeline),
+        device=torch.device("cpu"),
     )
     with pytest.raises(RuntimeError, match="token allocation failed") as caught:
         validation_module.run_validation_loop(trainer, ValidationConfig(), 1)

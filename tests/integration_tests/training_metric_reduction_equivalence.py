@@ -14,7 +14,6 @@ from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.runtime.metrics import build_step_metrics
 from llmtuner.trainer.runtime.reductions import resolve_training_reduction_meshes
-from llmtuner.trainer.trainer import Trainer
 from tests.integration_tests.harness import init_distributed
 
 
@@ -47,14 +46,13 @@ def main():
                     ]
                     for d, count in enumerate(counts)
                 ]
-                trainer = Trainer.__new__(Trainer)
-                trainer.device = device
-                trainer.parallel_dims = topology
-                trainer.ntokens_seen = 7
-                trainer.model_parts = []
                 metrics = (
                     build_step_metrics(
-                        trainer,
+                        ntokens_seen=7,
+                        device=device,
+                        parallel_dims=topology,
+                        model_parts=[],
+                        pp_has_last_stage=False,
                         accumulated_loss=torch.tensor(
                             shard_sums[dp][coordinate], dtype=dtype, device=device
                         ),

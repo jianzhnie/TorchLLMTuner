@@ -47,7 +47,9 @@ def main() -> None:
         ),
         model_parts=parts,
     )
-    allreduce_replicated_tp_grads(trainer)
+    allreduce_replicated_tp_grads(
+        trainer.model_parts, parallel_dims=trainer.parallel_dims
+    )
 
     expected = torch.tensor(
         [sum(range(1, world_size + 1))], dtype=shared.dtype, device=device
@@ -55,12 +57,16 @@ def main() -> None:
     torch.testing.assert_close(shared.grad, expected, rtol=0, atol=0)
     # A rank-local unused parameter must still join its peer's reduction.
     shared.grad = torch.tensor([5.0], device=device) if rank == 0 else None
-    allreduce_replicated_tp_grads(trainer)
+    allreduce_replicated_tp_grads(
+        trainer.model_parts, parallel_dims=trainer.parallel_dims
+    )
     torch.testing.assert_close(
         shared.grad, torch.tensor([5.0], device=device), rtol=0, atol=0
     )
     shared.grad = None
-    allreduce_replicated_tp_grads(trainer)
+    allreduce_replicated_tp_grads(
+        trainer.model_parts, parallel_dims=trainer.parallel_dims
+    )
     assert shared.grad is None
     # TP peers share a DP shard; four ranks also exercise empty DP ownership.
     mesh = init_device_mesh(
@@ -80,7 +86,9 @@ def main() -> None:
             if tp_mesh.get_local_rank() == missing_rank
             else torch.ones_like(weight) * (rank + 1)
         )
-        allreduce_replicated_tp_grads(trainer)
+        allreduce_replicated_tp_grads(
+            trainer.model_parts, parallel_dims=trainer.parallel_dims
+        )
         assert isinstance(weight.grad, DTensor)
         assert weight.grad.device_mesh == weight.device_mesh
         assert weight.grad.placements == weight.placements
@@ -92,7 +100,9 @@ def main() -> None:
             atol=0,
         )
     weight.grad = None
-    allreduce_replicated_tp_grads(trainer)
+    allreduce_replicated_tp_grads(
+        trainer.model_parts, parallel_dims=trainer.parallel_dims
+    )
     assert weight.grad is None
     if rank == 0:
         print(

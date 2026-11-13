@@ -109,9 +109,19 @@ def test_kcp_reapplication_replaces_wrapper_and_updates_group(monkeypatch):
     monkeypatch.setattr("llmtuner.parallel.context_parallel.kcp.kcp_kda_forward", wrap)
     module = KDA()
     first_group, second_group = object(), object()
-    assert apply_kcp(module, SimpleNamespace(get_group=lambda: first_group)) == 1
+    assert (
+        apply_kcp(
+            module, SimpleNamespace(size=lambda: 2, get_group=lambda: first_group)
+        )
+        == 1
+    )
     assert module(None) is first_group
-    assert apply_kcp(module, SimpleNamespace(get_group=lambda: second_group)) == 1
+    assert (
+        apply_kcp(
+            module, SimpleNamespace(size=lambda: 2, get_group=lambda: second_group)
+        )
+        == 1
+    )
     assert module(None) is second_group
     assert calls == [(KDA.forward, first_group), (KDA.forward, second_group)]
 
@@ -248,7 +258,7 @@ def test_kcp_checks_mla_heads_before_installation(monkeypatch, q_lora_rank):
     monkeypatch.setattr(kcp, "_kcp_runtime", lambda: ())
     group = SimpleNamespace(size=lambda: config.num_attention_heads + 1)
     with pytest.raises(ValueError, match="heads must be divisible"):
-        kcp.apply_kcp(model, SimpleNamespace(get_group=lambda: group))
+        kcp.apply_kcp(model, SimpleNamespace(size=group.size, get_group=lambda: group))
     assert not hasattr(model.hybrid_attention, "_kcp_attention")
 
 
@@ -278,11 +288,19 @@ def test_kcp_installs_mla_callable_without_changing_parameter_names(monkeypatch)
     before = dict(model.named_parameters())
     monkeypatch.setattr(kcp, "_kcp_runtime", lambda: ())
     first = SimpleNamespace(size=lambda: 2)
-    assert kcp.apply_kcp(model, SimpleNamespace(get_group=lambda: first)) == 1
+    assert (
+        kcp.apply_kcp(model, SimpleNamespace(size=first.size, get_group=lambda: first))
+        == 1
+    )
     original = model.mla._kcp_attention
     assert callable(original)
     second = SimpleNamespace(size=lambda: 2)
-    assert kcp.apply_kcp(model, SimpleNamespace(get_group=lambda: second)) == 1
+    assert (
+        kcp.apply_kcp(
+            model, SimpleNamespace(size=second.size, get_group=lambda: second)
+        )
+        == 1
+    )
     assert model.mla._kcp_attention is not original
     after = dict(model.named_parameters())
     assert before.keys() == after.keys()
@@ -300,16 +318,12 @@ def test_cp_dispatches_from_model_backend_contract() -> None:
 
 @pytest.mark.parametrize("strategy", ["kv_allgather", "ulysses"])
 def test_removed_standard_cp_fails_before_mutation(strategy):
-    from llmtuner.parallel.context_parallel.context_parallel import resolve_cp_plan
-
     model = _StubModel(4, 4)
     cfg = ParallelConfig(
         context_parallel_kv_allgather_size=2,
         cp_config=ContextParallelConfig(context_parallel_strategy=strategy),
     )
     rng = torch.get_rng_state().clone()
-    with pytest.raises(NotImplementedError, match="kernels have been removed"):
-        resolve_cp_plan(model, cfg=cfg)
     with pytest.raises(NotImplementedError, match="kernels have been removed"):
         apply_cp(model, mesh=None, cfg=cfg)
     assert model.cp_strategy is None

@@ -16,7 +16,7 @@ from llmtuner.config import (
     TrainingConfig,
 )
 from llmtuner.memory import activation_swap
-from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+from llmtuner.parallel.tensor_parallel.linear import (
     ColumnParallelLinear,
     ColwiseLinearNoGather,
     RowParallelLinear,

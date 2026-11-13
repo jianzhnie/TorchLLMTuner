@@ -54,7 +54,7 @@ class Projection(torch.nn.Module):
         self.frozen.eval()
         self.calls = 0
 
-    def preprocess_inputs(self, batch, **kwargs):
+    def prepare_inputs(self, batch, **kwargs):
         start = 3 * self.coordinate
         return (
             batch["input_ids"][:, start : start + 3].reshape(-1),
@@ -91,6 +91,7 @@ def main():
                 ),
             )
             trainer = Trainer.__new__(Trainer)
+            trainer.error_group = dist.group.WORLD
             trainer.checkpointer = None
             trainer.cfg = LLMTunerConfig()
             trainer.cfg.training.validation_config = ValidationConfig(steps=2)
@@ -100,7 +101,6 @@ def main():
             trainer.model_parts = [trainer.model]
             trainer.ntokens_seen = 123
             trainer.param_context = nullcontext
-            trainer.to_device = lambda batch: batch
             logs = []
             trainer.metrics = SimpleNamespace(
                 add_tokens=lambda count: None,
@@ -160,7 +160,7 @@ def main():
             for failing_rank in range(dist.get_world_size()):
                 for error_type in (ValueError, KeyboardInterrupt, SystemExit):
                     failed_loader = Loader(batches(mesh["dp"].get_local_rank()))
-                    original_preprocess = trainer.model.preprocess_inputs
+                    original_preprocess = trainer.model.prepare_inputs
                     failure = error_type("injected validation preprocessing failure")
 
                     def fail_preprocess(
@@ -176,9 +176,7 @@ def main():
 
                     rng = torch.get_rng_state().clone()
                     with (
-                        patch.object(
-                            trainer.model, "preprocess_inputs", fail_preprocess
-                        ),
+                        patch.object(trainer.model, "prepare_inputs", fail_preprocess),
                         patch.object(
                             validation,
                             "create_validation_dataloader",

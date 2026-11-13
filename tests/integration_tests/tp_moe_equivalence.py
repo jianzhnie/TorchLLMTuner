@@ -183,7 +183,9 @@ try:
         torch.testing.assert_close(
             local_x.grad, oracle_grad.chunk(2, dim=1)[rank], rtol=1e-9, atol=1e-10
         )
-        allreduce_replicated_tp_grads(trainer)
+        allreduce_replicated_tp_grads(
+            trainer.model_parts, parallel_dims=trainer.parallel_dims
+        )
         for name, parameter in model.named_parameters():
             torch.testing.assert_close(
                 parameter.grad, expected_gradients[name], rtol=1e-9, atol=1e-10

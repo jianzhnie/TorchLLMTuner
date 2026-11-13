@@ -39,7 +39,6 @@ def test_standalone_routing_resolves_without_inspection(family, monkeypatch):
     def forbidden():
         raise AssertionError("explicit block must not enter legacy inspection")
 
-    monkeypatch.setattr(block_conversion, "_legacy_inspection", forbidden)
     routing = block_conversion.resolve_moe_routing(block)
     assert routing.source is block and routing.router is block.gate
     assert routing.top_k == 2 and routing.score_func == "softmax"

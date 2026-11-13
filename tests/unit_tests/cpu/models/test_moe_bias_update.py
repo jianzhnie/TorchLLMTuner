@@ -34,7 +34,6 @@ from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Model
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 import llmtuner.models.common.moe.bias_update as bias_update
-import llmtuner.parallel.expert_parallel.model_replacement as model_replacement
 from llmtuner.models.common.moe.bias_update import (
     collect_routing_load_metrics,
     register_moe_balancing_hook,
@@ -48,6 +47,7 @@ from llmtuner.models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
+from llmtuner.models.contracts import DecoderStructure, MoEBlockContract
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
@@ -143,15 +143,13 @@ class _Holder(torch.nn.Module):
 class _Layer(torch.nn.Module):
     """A decoder layer holding a MoE, or a dense one holding none.
 
-    The block goes on ``mlp`` -- the attribute the swap actually replaces it in
-    (``MOE_LAYER_ATTRS``). Putting it anywhere else would test a fiction: the
-    lookup would find nothing on a real swapped model and the hook would no-op,
-    which is exactly the bug ``test_the_hook_updates_a_real_swapped_model``
-    guards against.
+    The block lives in the explicitly declared ``mlp`` slot, matching the
+    contract the replacement and bias-update paths consume.
     """
 
     def __init__(self, moe: MoE | None) -> None:
         super().__init__()
+        self.moe_block_name = "mlp" if moe is not None else None
         if moe is not None:
             self.mlp = moe
 
@@ -387,10 +385,6 @@ def test_hook_respects_real_swapped_model_routing_policy(architecture, monkeypat
         )
         model = Qwen3MoeForCausalLM(config).float().eval()
 
-        def reject_inspection():
-            raise AssertionError("explicit model must use its MoE declarations")
-
-        monkeypatch.setattr(model_replacement, "_legacy_inspection", reject_inspection)
     else:
         config = AutoConfig.for_model(
             "deepseek_v3",
@@ -413,6 +407,22 @@ def test_hook_respects_real_swapped_model_routing_policy(architecture, monkeypat
             max_position_embeddings=128,
         )
         model = DeepseekV3Model(config).float().eval()
+        for index, layer in enumerate(model.layers):
+            layer.moe_block_name = (
+                "mlp" if index >= config.first_k_dense_replace else None
+            )
+            if layer.moe_block_name is not None:
+                layer.mlp.moe_contract = MoEBlockContract(
+                    router="gate",
+                    num_experts=config.n_routed_experts,
+                    top_k=config.num_experts_per_tok,
+                    score_func="sigmoid",
+                    route_norm=config.norm_topk_prob,
+                    route_scale=config.routed_scaling_factor,
+                    shared_expert="shared_experts",
+                    num_expert_groups=config.n_group,
+                    num_limited_groups=config.topk_group,
+                )
     assert swap_moe_blocks(model) == 2
 
     layers = collect_moe_layers(model)
@@ -680,3 +690,34 @@ def test_declared_slots_control_native_moe_collection():
     assert collect_moe_layers(holder) == [sparse]
     layer.moe_block_name = None
     assert collect_moe_layers(holder) == []
+
+
+def test_native_moe_collection_rejects_missing_slot_declaration():
+    holder = torch.nn.Module()
+    layer = torch.nn.Module()
+    layer.mlp = _moe()
+    holder.layers = torch.nn.ModuleList([layer])
+    with pytest.raises(ValueError, match="moe_block_name"):
+        collect_moe_layers(holder)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_moe_collection_binds_declared_local_blocks_instead_of_stale_alias(compiled):
+    sparse = _moe()
+    holder = torch.nn.Module()
+    holder.blocks = torch.nn.ModuleList([_Layer(sparse)])
+    holder.decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="blocks", norm="norm", head="head"
+    )
+    # A PP-local part need not own embedding/norm/head. Its convenience alias
+    # may still refer to the former whole-model blocks and must not be used.
+    object.__setattr__(holder, "layers", torch.nn.ModuleList([_Layer(_moe())]))
+    model = torch.compile(holder, backend="eager") if compiled else holder
+    assert collect_moe_layers(model) == [sparse]
+
+
+def test_moe_collection_does_not_fall_back_from_malformed_structure():
+    holder = _Holder([_moe()])
+    holder.decoder_structure = "layers"
+    with pytest.raises(TypeError, match="DecoderStructure"):
+        collect_moe_layers(holder)

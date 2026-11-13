@@ -17,7 +17,7 @@ from torch import nn
 import llmtuner.parallel as parallel_api
 from llmtuner.config.activation_checkpoint_config import MemoryBudgetACConfig
 from llmtuner.config.compile_config import CompileConfig
-from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.config.parallel_config import ContextParallelConfig, ParallelConfig
 from llmtuner.parallel import parallelize
 from llmtuner.parallel.stages import (
     STAGE_ORDER,
@@ -119,7 +119,7 @@ def test_unavailable_fsdp_engine_fails_before_model_transforms(monkeypatch, pipe
 
     from llmtuner.errors import EnvironmentUnsupportedError
 
-    def unavailable(*args):
+    def unavailable(*args, **kwargs):
         raise EnvironmentUnsupportedError("custom engine unavailable")
 
     def unexpected_transform(*args, **kwargs):
@@ -348,7 +348,8 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
 
 
 @pytest.mark.parametrize("pipeline", [False, True])
-def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline):
+@pytest.mark.parametrize("ignored_only", [False, True])
+def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline, ignored_only):
     import copy
     from types import SimpleNamespace
 
@@ -358,10 +359,15 @@ def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline):
     originals = list(model.parameters())
     cfg = ParallelConfig(
         fsdp_config=FSDPConfig(
-            fsdp_apply_modules={
-                str(index): {"ignored_params": {parameter}}
-                for index, parameter in enumerate(originals)
-            }
+            fsdp_apply_modules=(
+                {"": {}}
+                if ignored_only
+                else {
+                    str(index): {"ignored_params": {parameter}}
+                    for index, parameter in enumerate(originals)
+                }
+            ),
+            fsdp_ignored_modules=["0"] if ignored_only else [],
         )
     )
     parts = [copy.deepcopy(model), copy.deepcopy(model)]
@@ -390,8 +396,13 @@ def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline):
     calls = []
 
     def check_fsdp(part, *, cfg, **kwargs):
-        for name, options in cfg.fsdp_config.fsdp_apply_modules.items():
-            assert options["ignored_params"] == {part.get_submodule(name).weight}
+        if ignored_only:
+            assert cfg.fsdp_config.fsdp_ignored_modules == (
+                ["0"] if "0" in part._modules else []
+            )
+        if not ignored_only:
+            for name, options in cfg.fsdp_config.fsdp_apply_modules.items():
+                assert options["ignored_params"] == {part.get_submodule(name).weight}
         calls.append(part)
         return part
 
@@ -405,10 +416,13 @@ def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline):
         global_batch_size=4,
     )
     assert len(calls) == (2 if pipeline else 1)
-    for index, parameter in enumerate(originals):
-        assert cfg.fsdp_config.fsdp_apply_modules[str(index)]["ignored_params"] == {
-            parameter
-        }
+    if ignored_only:
+        assert cfg.fsdp_config.fsdp_ignored_modules == ["0"]
+    else:
+        for index, parameter in enumerate(originals):
+            assert cfg.fsdp_config.fsdp_apply_modules[str(index)]["ignored_params"] == {
+                parameter
+            }
 
 
 @pytest.mark.parametrize("dispatcher", ["domino", "mc2"])
@@ -489,20 +503,16 @@ def test_activation_swap_rejects_unsupported_direct_api_combinations(
         )
 
 
-def test_cp_plan_failure_precedes_cp_execution_and_later_stages(monkeypatch):
-    def reject_plan(*args, **kwargs):
-        raise ValueError("invalid CP plan")
-
+def test_removed_cp_backend_fails_before_any_parallel_transformation(monkeypatch):
     def unexpected(*args, **kwargs):
-        pytest.fail("CP execution or a later stage began before plan validation")
+        pytest.fail("A parallel stage began before CP backend validation")
 
-    monkeypatch.setattr(parallelize, "resolve_cp_plan", reject_plan, raising=False)
-    monkeypatch.setattr(parallelize, "apply_tp", lambda model, **kwargs: model)
-    monkeypatch.setattr(parallelize, "apply_ep", lambda model, **kwargs: model)
+    monkeypatch.setattr(parallelize, "apply_tp", unexpected)
+    monkeypatch.setattr(parallelize, "apply_ep", unexpected)
     monkeypatch.setattr(parallelize, "apply_cp", unexpected)
     monkeypatch.setattr(parallelize, "apply_ac", unexpected)
     monkeypatch.setattr(parallelize, "apply_fsdp", unexpected)
-    with pytest.raises(ValueError, match="invalid CP plan"):
+    with pytest.raises(NotImplementedError, match="kernels have been removed"):
         parallelize.parallelize_model(
             nn.Linear(2, 2),
             cfg=ParallelConfig(context_parallel_kv_allgather_size=2),
@@ -512,14 +522,17 @@ def test_cp_plan_failure_precedes_cp_execution_and_later_stages(monkeypatch):
 
 
 @pytest.mark.parametrize("has_topology", [False, True])
+@pytest.mark.parametrize("backend", ["kcp", "compressor"])
 def test_cp_preflight_uses_explicit_group_without_wrapping_execution(
-    monkeypatch, has_topology
+    monkeypatch, has_topology, backend
 ):
     active = {"boundary": False}
     calls = []
     expected_group = object()
-    plan = object()
     model = nn.Linear(2, 2)
+    monkeypatch.setattr(parallelize, "resolve_cp_plan", lambda *a, **kw: None)
+    if backend == "compressor":
+        model.context_parallel_backend = "compressor"
 
     def get_group():
         assert not active["boundary"]
@@ -528,7 +541,7 @@ def test_cp_preflight_uses_explicit_group_without_wrapping_execution(
 
     @contextmanager
     def boundary(phase, *, group):
-        assert has_topology and phase == "CP plan validation"
+        assert has_topology and phase == "CP backend validation"
         assert group is expected_group
         calls.append("enter")
         active["boundary"] = True
@@ -538,14 +551,9 @@ def test_cp_preflight_uses_explicit_group_without_wrapping_execution(
             active["boundary"] = False
             calls.append("exit")
 
-    def resolve(part, *, cfg):
-        assert part is model and active["boundary"] is has_topology
-        calls.append("resolve")
-        return plan
-
     def execute(part, **kwargs):
         assert part is model and not active["boundary"]
-        assert kwargs["resolved_plan"] is plan
+        assert "resolved_plan" not in kwargs
         calls.append("execute")
         return part
 
@@ -555,21 +563,24 @@ def test_cp_preflight_uses_explicit_group_without_wrapping_execution(
         build_device_mesh=lambda: SimpleNamespace(get_group=get_group),
     )
     monkeypatch.setattr(parallelize, "synchronize_local_errors", boundary)
-    monkeypatch.setattr(parallelize, "resolve_cp_plan", resolve)
     monkeypatch.setattr(parallelize, "apply_cp", execute)
     for name in ("apply_tp", "apply_ep", "apply_ac", "apply_fsdp"):
         monkeypatch.setattr(parallelize, name, lambda part, **kwargs: part)
     assert (
         parallelize.parallelize_model(
             model,
-            cfg=ParallelConfig(context_parallel_kv_allgather_size=2),
+            cfg=ParallelConfig(
+                context_parallel_kcp_size=2 if backend == "kcp" else 1,
+                context_parallel_ulysses_size=2 if backend == "compressor" else 1,
+                cp_config=ContextParallelConfig(
+                    context_parallel_strategy="kcp" if backend == "kcp" else "ulysses"
+                ),
+            ),
             mesh=None,
             parallel_dims=dims if has_topology else None,
         )
         is model
     )
     assert calls == (
-        ["group", "enter", "resolve", "exit", "execute"]
-        if has_topology
-        else ["resolve", "execute"]
+        ["group", "enter", "exit", "execute"] if has_topology else ["execute"]
     )

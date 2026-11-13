@@ -314,9 +314,9 @@ def _run(root: str) -> None:
     try:
         trainer.validate(trainer.step)
     except OSError as error:
-        assert trainer.pp_has_last_stage and error is sink_error
+        assert trainer.training_engine.pp_has_last_stage and error is sink_error
     except RuntimeError as error:
-        assert not trainer.pp_has_last_stage
+        assert not trainer.training_engine.pp_has_last_stage
         assert "Validation result reporting" in str(error)
     else:
         raise AssertionError("pipeline validation sink failure did not propagate")
@@ -343,7 +343,7 @@ def _run(root: str) -> None:
         failures.append(
             f"rank {rank}: finite corpus did not exercise a padded microbatch"
         )
-    if trainer.pp_has_last_stage:
+    if trainer.training_engine.pp_has_last_stage:
         if len(validation_reports) != 1:
             failures.append(f"rank {rank}: expected one finite validation report")
         elif (

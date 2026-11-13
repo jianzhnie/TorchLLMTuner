@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.parallel import loss_parallel
 
-from llmtuner.parallel.tensor_parallel.linear_ops import all_gather_along
+from llmtuner.accelerator.linear_collectives import all_gather_along
 
 
 def install_output_layout_control(trainer):

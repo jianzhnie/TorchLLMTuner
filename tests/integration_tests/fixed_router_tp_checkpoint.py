@@ -19,6 +19,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 
+from llmtuner.accelerator.linear_collectives import resolve_autograd_collectives
 from llmtuner.components.checkpointer.core.checkpoint_keys import RNG_STATE
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
@@ -31,9 +32,8 @@ from llmtuner.memory.activation_checkpoint import wrap_full
 from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from llmtuner.parallel.fully_shard_parallel.fine_grained import fully_shard_fine_grained
-from llmtuner.parallel.fully_shard_parallel.plan import apply_fsdp_by_pattern
+from llmtuner.parallel.fully_shard_parallel.pattern import apply_fsdp_by_pattern
 from llmtuner.parallel.model_compile import apply_compile
-from llmtuner.parallel.tensor_parallel.linear_ops import resolve_autograd_collectives
 from llmtuner.parallel.tensor_parallel.tensor_parallel import realize_moe_blocks_tp
 from tests.integration_tests.ep_wiring_equivalence import _model
 from tests.integration_tests.fixed_router_tp_equivalence import (

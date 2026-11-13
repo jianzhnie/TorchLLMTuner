@@ -11,9 +11,12 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.aux_loss import AuxLoss
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.models.qwen.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 from llmtuner.parallel.expert_parallel import block_conversion, model_replacement
+from llmtuner.parallel.expert_parallel import plan as ep_plan
+from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
 from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_plan
 from tests.unit_tests.cpu.models.test_owned_family_construction import text_config
 from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
@@ -111,8 +114,6 @@ def test_explicit_ep_rejects_missing_math_contract_without_legacy_probe(
     def reject(*args, **kwargs):
         raise AssertionError("Explicit EP must not probe legacy layouts")
 
-    monkeypatch.setattr(block_conversion, "_legacy_inspection", reject)
-    monkeypatch.setattr(model_replacement, "_legacy_inspection", reject)
     with pytest.raises(
         UnsupportedCombinationError, match="model-owned MoEBlockContract"
     ):
@@ -158,10 +159,9 @@ def test_ep_target_plan_is_pure_and_execution_does_not_rediscover(monkeypatch):
     def reject_discovery(*args, **kwargs):
         raise AssertionError("Execution must consume resolved decoder slots")
 
-    monkeypatch.setattr(model_replacement, "find_moe_candidates", reject_discovery)
-    for name in ("_legacy_inspection", "resolve_moe_routing", "resolve_packed_experts"):
+    monkeypatch.setattr(ep_plan, "find_moe_candidates", reject_discovery)
+    for name in ("resolve_moe_routing", "resolve_packed_experts"):
         monkeypatch.setattr(block_conversion, name, reject_discovery)
-    monkeypatch.setattr(model_replacement, "_legacy_inspection", reject_discovery)
     model_replacement.swap_moe_blocks(
         model, resolved_plan=plan, router_aux_loss_coef=0.0
     )
@@ -194,7 +194,7 @@ def test_ep_execution_rejects_incomplete_slot_coverage_before_allocation(
         raise AssertionError("Invalid EP coverage must fail before conversion")
 
     monkeypatch.setattr(model_replacement, "convert_block", reject_allocation)
-    monkeypatch.setattr(model_replacement, "find_moe_candidates", reject_allocation)
+    monkeypatch.setattr(ep_plan, "find_moe_candidates", reject_allocation)
     with pytest.raises(ValueError, match="cover declared MoE slots in decoder order"):
         model_replacement.swap_moe_blocks(model, resolved_plan=plan)
     assert all(
@@ -444,8 +444,6 @@ def test_declared_packed_layout_never_falls_back_to_legacy_probe(missing, monkey
     def forbidden(*args, **kwargs):
         raise AssertionError("Declared layouts must not enter legacy inspection")
 
-    monkeypatch.setattr(block_conversion, "_legacy_inspection", forbidden)
-    monkeypatch.setattr(model_replacement, "_legacy_inspection", forbidden)
     with pytest.raises(ValueError, match="Declared fused experts require"):
         model_replacement.resolve_ep_plan(model)
     assert tuple(model.state_dict()) == keys
@@ -453,7 +451,7 @@ def test_declared_packed_layout_never_falls_back_to_legacy_probe(missing, monkey
     assert torch.equal(torch.get_rng_state(), rng)
 
 
-def test_explicit_ep_missing_slot_never_enters_legacy_inspection(monkeypatch):
+def test_explicit_ep_rejects_missing_slot_declaration(monkeypatch):
     model = _model()
     del model.layers[1].moe_block_name
     parameters = tuple(model.parameters())
@@ -463,7 +461,6 @@ def test_explicit_ep_missing_slot_never_enters_legacy_inspection(monkeypatch):
     def forbidden():
         raise AssertionError("explicit decoder entered legacy inspection")
 
-    monkeypatch.setattr(model_replacement, "_legacy_inspection", forbidden)
     with pytest.raises(ValueError, match="requires moe_block_name"):
         model_replacement.resolve_ep_plan(model)
     assert tuple(model.state_dict()) == keys
@@ -485,11 +482,6 @@ def test_ep_uses_declared_blocks_instead_of_convenience_property(monkeypatch):
 def test_ep_rejects_malformed_structure_without_legacy_fallback(monkeypatch):
     model = _model()
     model.decoder_structure = "model.layers"
-    monkeypatch.setattr(
-        model_replacement,
-        "_legacy_inspection",
-        lambda: pytest.fail("malformed structure entered legacy inspection"),
-    )
     with pytest.raises(TypeError, match="decoder_structure"):
         model_replacement.resolve_ep_plan(model)
 
@@ -550,7 +542,7 @@ def test_ep_preflight_rejects_unavailable_dispatcher_before_model_binding(
     def forbidden(*args, **kwargs):
         raise AssertionError("Unavailable dispatcher reached model binding")
 
-    monkeypatch.setattr(model_replacement, "find_moe_candidates", forbidden)
+    monkeypatch.setattr(ep_plan, "find_moe_candidates", forbidden)
     with pytest.raises(error, match=message):
         model_replacement.resolve_ep_plan(model, implementation=implementation)
     assert torch.equal(rng, torch.get_rng_state())
@@ -568,7 +560,7 @@ def test_ep_preflight_rejects_pre_down_score_semantics_before_model_binding(
     def forbidden(*args, **kwargs):
         raise AssertionError("Unsupported score semantics reached model binding")
 
-    monkeypatch.setattr(model_replacement, "find_moe_candidates", forbidden)
+    monkeypatch.setattr(ep_plan, "find_moe_candidates", forbidden)
     with pytest.raises(UnsupportedCombinationError, match="pre_down"):
         model_replacement.resolve_ep_plan(model)
     assert torch.equal(rng, torch.get_rng_state())
@@ -693,3 +685,64 @@ def test_local_ep_preserves_unchanged_down_projection_alias(alias_kind):
     with torch.no_grad():
         converted.add_(1)
     torch.testing.assert_close(model.external_down.reshape_as(converted), converted)
+
+
+@pytest.mark.parametrize("pre_resolved", [False, True])
+def test_ep_entry_preserves_target_validation_for_partial_plan(
+    monkeypatch, pre_resolved
+):
+    model = _model()
+    # A full native-plan validator must not override target-level validation
+    # when the caller explicitly selected a partial model plan.
+    model.parallel_plan = {}
+
+    def reject_full_geometry(**kwargs):
+        pytest.fail("Explicit partial plans must use target-level geometry checks")
+
+    monkeypatch.setattr(model, "validate_parallel", reject_full_geometry)
+    plan = ep_plan.resolve_ep_plan(model) if pre_resolved else None
+    config = ParallelConfig()
+    config.ep_config.fixed_router = True
+    old_blocks = tuple(layer.mlp for layer in model.layers)
+    assert apply_ep(model, config, resolved_plan=plan) is model
+    assert all(
+        layer.mlp is not old
+        for layer, old in zip(model.layers, old_blocks, strict=True)
+    )
+
+
+def test_ep_decoder_binding_requires_only_pp_local_blocks():
+    holder = torch.nn.Module()
+    block = torch.nn.Module()
+    block.moe_block_name = None
+    holder.blocks = torch.nn.ModuleList([block])
+    holder.decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="blocks", norm="norm", head="head"
+    )
+    object.__setattr__(holder, "layers", torch.nn.ModuleList())
+    assert tuple(ep_plan.decoder_layers_for_ep(holder)) == (block,)
+
+
+@pytest.mark.parametrize("invalid", ["missing_binding", "layout"])
+def test_incomplete_ep_plan_rejected_before_conversion(monkeypatch, invalid):
+    model = _model()
+    plan = ep_plan.resolve_ep_plan(model)
+    target = plan.targets[-1]
+    if invalid == "missing_binding":
+        target = replace(target, spec=replace(target.spec, packed_experts=None))
+    else:
+        target = replace(target, layout="unrecognized")
+    plan = replace(plan, targets=(*plan.targets[:-1], target))
+    original = tuple(layer.mlp for layer in model.layers)
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+
+    def reject_conversion(*args, **kwargs):
+        pytest.fail("Incomplete plans must fail before any conversion")
+
+    monkeypatch.setattr(model_replacement, "convert_block", reject_conversion)
+    with pytest.raises(ValueError, match="resolved fused gate/up binding"):
+        model_replacement.swap_moe_blocks(model, resolved_plan=plan)
+    assert tuple(layer.mlp for layer in model.layers) == original
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert torch.equal(torch.get_rng_state(), rng)

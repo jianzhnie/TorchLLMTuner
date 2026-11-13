@@ -144,8 +144,6 @@ def test_rows_reject_with_their_entry_type() -> None:
         (compatibility.tp_moe_non_tensor_output, (_Block(), _Block()), "not a bare"),
         (compatibility.quantile_requires_ep, (), "ep=1 never runs"),
         (compatibility.ptrr_load_balancer_backstop, (), "ptrr"),
-        (compatibility.gpt_oss_layout, (_Block(),), "bias vectors"),
-        (compatibility.group_limited_greedy, (), "single best expert"),
         (compatibility.router_bias, (_Block(),), "router bias"),
         (compatibility.quantile_requires_sigmoid, ("softmax", _Block()), "sigmoid"),
         (compatibility.quantile_no_group_limit, (_Block(),), "group-limited"),

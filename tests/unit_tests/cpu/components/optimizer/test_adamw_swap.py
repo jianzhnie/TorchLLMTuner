@@ -493,10 +493,10 @@ def test_nonprefetch_releases_previous_staging_before_allocating_next(monkeypatc
         result = stage(job)
         # CPU .to(cpu) aliases Host state; clone to model separately owned
         # device staging buffers whose lifetime is controlled by step().
-        buffers = [buffer.clone() for buffer in result[0]]
+        buffers = [buffer.clone() for buffer in result.buffers]
         previous[:] = [weakref.ref(buffer) for buffer in buffers]
-        slices.append(job[2:4])
-        return (buffers, *result[1:])
+        slices.append((job.start, job.end))
+        return result._replace(buffers=buffers)
 
     monkeypatch.setattr(optimizer, "_stage", checked_stage)
     optimizer.step()

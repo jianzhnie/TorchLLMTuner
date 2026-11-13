@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import llmtuner.parallel.tensor_parallel.linear_ops as linear_ops
-from llmtuner.parallel.tensor_parallel.linear_ops import (
+import llmtuner.accelerator.linear_collectives as linear_ops
+from llmtuner.accelerator.linear_collectives import (
     LinearReduceScatter,
     resolve_autograd_collectives,
 )
@@ -91,10 +91,10 @@ def test_missing_symmetric_memory_does_not_disable_autograd_collectives():
                 # Complete normal accelerator/dependency imports before injecting
                 # the missing optional leaf capability. Otherwise a partially
                 # imported torch_npu may re-register its rendezvous handler.
-                import llmtuner.parallel.tensor_parallel.linear_ops
-                del sys.modules['llmtuner.parallel.tensor_parallel.linear_ops']
+                import llmtuner.accelerator.linear_collectives
+                del sys.modules['llmtuner.accelerator.linear_collectives']
                 sys.modules['torch.distributed._symmetric_memory'] = None
-                from llmtuner.parallel.tensor_parallel.linear_ops import (
+                from llmtuner.accelerator.linear_collectives import (
                     resolve_autograd_collectives,
                     ensure_symm_mem_ops,
                 )

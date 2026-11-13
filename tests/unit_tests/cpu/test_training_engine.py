@@ -1,4 +1,4 @@
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -7,7 +7,11 @@ import torch
 from torch import nn
 
 from llmtuner.components.loss import cross_entropy_loss
-from llmtuner.trainer.runtime.engine import TrainingEngine, model_output_value
+from llmtuner.trainer.runtime.engine import (
+    TrainingEngine,
+    evaluate_dense_batch,
+    model_output_value,
+)
 
 
 class ToyCausalModel(nn.Module):
@@ -146,3 +150,50 @@ def test_engine_accumulation_weights_unequal_valid_target_counts() -> None:
         model.parameters(), reference.parameters(), strict=True
     ):
         torch.testing.assert_close(parameter, target)
+
+
+def test_dense_evaluation_preserves_context_and_injected_loss():
+    model = ToyCausalModel()
+    inputs = torch.tensor([[1, 3, 5], [2, 4, 6]])
+    labels = torch.tensor([[3, 5, 7], [4, 6, 8]])
+    batch = {"input": inputs, "labels": labels}
+    calls = []
+
+    def prepare(value, *, parallel_dims, max_context_length):
+        assert parallel_dims is None
+        assert max_context_length == 16
+        assert value["input"] is inputs
+        calls.append("prepare")
+        return value["input"], value["labels"], {}
+
+    @contextmanager
+    def context():
+        calls.append("enter")
+        try:
+            yield
+        finally:
+            calls.append("exit")
+
+    def loss(logits, targets, **kwargs):
+        assert calls[-1] == "enter"
+        assert not torch.is_grad_enabled()
+        assert not kwargs
+        calls.append("loss")
+        return cross_entropy_loss(logits.flatten(0, 1), targets.flatten()) * 2
+
+    model.prepare_inputs = prepare
+    with torch.no_grad():
+        expected = cross_entropy_loss(model(inputs).flatten(0, 1), labels.flatten()) * 2
+        result = evaluate_dense_batch(
+            model,
+            batch,
+            device=torch.device("cpu"),
+            parallel_dims=None,
+            max_context_length=16,
+            param_context=context,
+            loss_sum=loss,
+        )
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert calls == ["prepare", "enter", "loss", "exit"]
+    assert all(parameter.grad is None for parameter in model.parameters())
+    assert model.training

@@ -13,12 +13,8 @@ from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.fully_shard_parallel.plan import FSDPPatternReferences
 from llmtuner.parallel.plan import ParallelPlan
-from llmtuner.parallel.tensor_parallel.tensor_parallel import (
-    ColwiseLinearNoGather,
-    apply_tp,
-    requires_full_token_history,
-    resolve_tp_plan,
-)
+from llmtuner.parallel.tensor_parallel.linear import ColwiseLinearNoGather
+from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp, requires_full_token_history, resolve_tp_plan
 from tests.unit_tests.cpu.parallel.test_tp_moe import _MoeModel
 
 
@@ -38,20 +34,31 @@ def test_explicit_qwen_tp_resolution_never_probes_hf_layouts(monkeypatch, ep_deg
             num_experts_per_tok=2,
         )
     )
+    # A contract on an unrelated child does not grant it decoder ownership.
+    model.unowned = nn.Module()
+    model.unowned.moe_contract = model.layers[0].mlp.moe_contract
     parameters = tuple(model.parameters())
     rng = torch.get_rng_state().clone()
 
-    def reject():
+    def reject(*args, **kwargs):
         raise AssertionError("Explicit models must not use HF layout inspection")
 
     monkeypatch.setattr(
-        "llmtuner.parallel.tensor_parallel.tensor_parallel._legacy_inspection", reject
+        "llmtuner.parallel.tensor_parallel.tensor_parallel.looks_like_attention", reject
     )
     plan = resolve_tp_plan(
         model,
         cfg=ParallelConfig(tensor_parallel_size=2, expert_parallel_size=ep_degree),
     )
     assert plan.targets
+    moe_targets = [target for target in plan.targets if target.kind == "moe"]
+    assert [target.module for target in moe_targets] == (
+        [model.layers[0].mlp] if ep_degree == 1 else []
+    )
+    assert any(
+        target.kind == "attention" and target.layout == "gather"
+        for target in plan.targets
+    )
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert torch.equal(rng, torch.get_rng_state())
 
@@ -80,9 +87,6 @@ def test_explicit_tp_rejects_missing_sparse_contract(monkeypatch, ep_degree, con
     def reject():
         raise AssertionError("Explicit models must not infer missing sparse math")
 
-    monkeypatch.setattr(
-        "llmtuner.parallel.tensor_parallel.tensor_parallel._legacy_inspection", reject
-    )
     with pytest.raises(
         UnsupportedCombinationError, match="model-owned MoEBlockContract"
     ):

@@ -24,10 +24,10 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from llmtuner.models.hf.model import HFTransformerModel
 from transformers import AutoConfig
 
 from llmtuner.config import ParallelConfig
-from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
@@ -142,7 +142,9 @@ def main() -> None:
     trainer = Trainer.__new__(Trainer)
     trainer.parallel_dims = dims
     trainer.model_parts = [model]
-    allreduce_replicated_tp_grads(trainer)
+    allreduce_replicated_tp_grads(
+        trainer.model_parts, parallel_dims=trainer.parallel_dims
+    )
     grad_diff = 0.0
     for index, layer in enumerate(model.layers):
         reference = ref.layers[index]

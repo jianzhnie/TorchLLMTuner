@@ -112,7 +112,7 @@ def main():
     original = assembly.build_optimizer_stack
     counts = {}
 
-    def build_optimizer_stack(cfg, *, model_parts, parallel_dims):
+    def build_optimizer_stack(cfg, *, model_parts, parallel_dims, error_group=None):
         layouts = {}
         for part in model_parts:
             for name, _parameter in part.named_parameters():
@@ -153,7 +153,12 @@ def main():
                 for index in range(48)
             ],
         )
-        return original(cfg, model_parts=model_parts, parallel_dims=parallel_dims)
+        return original(
+            cfg,
+            model_parts=model_parts,
+            parallel_dims=parallel_dims,
+            error_group=error_group,
+        )
 
     profile = None
     if os.environ.get("LLMTUNER_DIST_MUON_PROFILE") == "1":

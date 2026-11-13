@@ -371,22 +371,25 @@ def main() -> None:
     else:
         want_first = pp_rank == 0
         want_last = not want_first
-    if (trainer.pp_has_first_stage, trainer.pp_has_last_stage) != (
+    if (
+        trainer.training_engine.pp_has_first_stage,
+        trainer.training_engine.pp_has_last_stage,
+    ) != (
         want_first,
         want_last,
     ):
         failures.append(
-            f"rank {rank}: has_first={trainer.pp_has_first_stage} "
-            f"has_last={trainer.pp_has_last_stage} -- expected "
+            f"rank {rank}: has_first={trainer.training_engine.pp_has_first_stage} "
+            f"has_last={trainer.training_engine.pp_has_last_stage} -- expected "
             f"({want_first}, {want_last}) for a 2-rank {schedule} pipeline"
         )
     # Both layouts keep the first stage first and the last stage last in the
     # rank's part list ("loop" stages ascend; the single-stage case has one).
-    if trainer.pp_has_first_stage and isinstance(
+    if trainer.training_engine.pp_has_first_stage and isinstance(
         trainer.model_parts[0].tok_embeddings, nn.Identity
     ):
         failures.append(f"rank {rank}: first stage lost its embedding")
-    if trainer.pp_has_last_stage and isinstance(
+    if trainer.training_engine.pp_has_last_stage and isinstance(
         trainer.model_parts[-1].lm_head, nn.Identity
     ):
         failures.append(f"rank {rank}: last stage lost its lm_head")
@@ -523,7 +526,7 @@ def main() -> None:
                 f"rank {rank}: token count {metrics['n_tokens_seen']} at step "
                 f"{step + 1}, another rank reported {int(tally[0])}"
             )
-        if trainer.pp_has_last_stage:
+        if trainer.training_engine.pp_has_last_stage:
             # Only the last stage holds a real loss; other stages carry the
             # sentinel, which is never logged (the metrics rank is the
             # last-stage rank -- rank 1, or rank 0 for a V layout).

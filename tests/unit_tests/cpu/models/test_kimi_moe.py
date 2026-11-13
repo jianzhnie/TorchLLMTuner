@@ -7,6 +7,73 @@ import torch
 
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiMoEGate, KimiSparseMoE
+from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
+
+
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("latent", [False, True])
+def test_model_owned_parallel_moe_preserves_math_and_replicated_identity(
+    training, latent
+):
+    torch.manual_seed(61)
+    source = KimiSparseMoE(
+        KimiLinearConfig(
+            hidden_size=8,
+            num_experts=4,
+            num_experts_per_token=2,
+            moe_intermediate_size=12,
+            num_shared_experts=1,
+            num_expert_group=2,
+            topk_group=1,
+            routed_expert_hidden_size=4 if latent else None,
+            latent_moe_use_norm=latent,
+        )
+    ).train(training)
+    # Child-specific modes must survive binding; do not recursively train the
+    # entire replacement and overwrite the shared/latent modules' live modes.
+    source.shared_experts.train(not training)
+    source.gate.e_score_correction_bias.requires_grad_(False)
+    reference = deepcopy(source)
+    original = tuple(source.parameters())
+    experts = source.build_parallel_experts(start=0, count=4)
+    router = source.gate.build_parallel_router(aux_loss_coefficient=None)
+    dispatcher = LocalTokenDispatcher(4, 2)
+    candidate = source.build_parallel_moe(
+        experts=experts, router=router, dispatcher=dispatcher
+    )
+
+    assert candidate.router.gate.weight is source.gate.weight
+    assert candidate.expert_bias_E is source.gate.e_score_correction_bias
+    assert not candidate.expert_bias_E.requires_grad
+    assert candidate.shared_experts is source.shared_experts
+    assert candidate.shared_experts.training is not training
+    assert candidate.training is candidate.router.training is training
+    assert candidate.routed_experts.training is experts.training is training
+    assert candidate.load_balance_coeff is None
+    assert dispatcher.accumulate_in_fp32
+    if latent:
+        for name in (
+            "routed_expert_down_proj",
+            "routed_expert_norm",
+            "routed_expert_up_proj",
+        ):
+            assert getattr(candidate.routed_experts, name) is getattr(source, name)
+    assert all(
+        before is after
+        for before, after in zip(original, source.parameters(), strict=True)
+    )
+    inputs = torch.randn(2, 5, 8, requires_grad=True)
+    reference_inputs = inputs.detach().clone().requires_grad_()
+    actual, expected = candidate(inputs), reference(reference_inputs)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    weights = torch.randn_like(actual)
+    actual.backward(weights)
+    expected.backward(weights)
+    assert inputs.grad.count_nonzero() > 0
+    torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(
+        router.gate.weight.grad, reference.gate.weight.grad, rtol=1e-6, atol=1e-6
+    )
 
 
 @pytest.mark.parametrize(

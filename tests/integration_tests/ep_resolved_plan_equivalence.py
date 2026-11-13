@@ -92,12 +92,8 @@ def main() -> None:
         swap_moe_blocks(direct, ep_group=ep_group, tp_enabled=args.tp_degree > 1)
         with (
             patch(
-                "llmtuner.parallel.expert_parallel.model_replacement.find_moe_candidates",
+                "llmtuner.parallel.expert_parallel.plan.find_moe_candidates",
                 side_effect=AssertionError("EP execution rediscovered decoder slots"),
-            ),
-            patch(
-                "llmtuner.parallel.expert_parallel.model_replacement._legacy_inspection",
-                side_effect=AssertionError("EP execution rediscovered projections"),
             ),
             patch(
                 "llmtuner.parallel.expert_parallel.block_conversion.resolve_packed_experts",

@@ -49,7 +49,7 @@ def main() -> None:
         assert len(plan.targets) == 1
         assert plan.targets[0].module is source.layers[0].mlp
         with patch(
-            "llmtuner.parallel.expert_parallel.model_replacement.find_moe_candidates",
+            "llmtuner.parallel.expert_parallel.plan.find_moe_candidates",
             side_effect=AssertionError("EP execution rediscovered model targets"),
         ):
             assert (

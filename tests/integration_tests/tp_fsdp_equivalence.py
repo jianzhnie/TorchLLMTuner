@@ -49,6 +49,8 @@ import os
 
 import torch
 import torch.distributed as dist
+from llmtuner.models.hf.factory import build_model_config_for
+from llmtuner.models.hf.model import HFTransformerModel
 from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
@@ -64,9 +66,7 @@ from llmtuner.config import (
 from llmtuner.config.parallel_config import ExpertParallelConfig, FSDPConfig
 from llmtuner.datasets.contracts import Batch
 from llmtuner.datasets.synthetic import RandomTokenSource
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+from llmtuner.parallel.tensor_parallel.linear import (
     ColumnParallelLinear,
     ColwiseLinearNoGather,
     RowParallelLinear,

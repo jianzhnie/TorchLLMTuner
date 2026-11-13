@@ -170,7 +170,9 @@ def main():
                 parallel_dims=SimpleNamespace(get_optional_mesh=lambda name: mesh),
                 model_parts=[model],
             )
-            allreduce_replicated_tp_grads(runtime)
+            allreduce_replicated_tp_grads(
+                runtime.model_parts, parallel_dims=runtime.parallel_dims
+            )
             outputs.append(output)
         torch.testing.assert_close(outputs[1], outputs[0], atol=5e-4, rtol=1e-2)
         if boundaries:

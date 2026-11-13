@@ -85,7 +85,12 @@ def main():
             before_gradient_clipping=lambda: None,
         )
         actual = clip_and_check_finite(
-            trainer,
+            trainer.model_parts,
+            parallel_dims=trainer.parallel_dims,
+            max_norm=trainer.cfg.max_norm,
+            precision=trainer.cfg.grad_norm_precision,
+            expert_reduce_layout="storage",
+            step=trainer.step,
             reduction_meshes=TrainingReductionMeshes(None, None, None, None),
             loss_is_finite=torch.ones((), dtype=torch.int32, device=device),
         )

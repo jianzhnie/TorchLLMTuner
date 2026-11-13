@@ -234,7 +234,10 @@ def worker(
         if pp_size > 1:
             assert trainer.parallel_dims.pp == 2
             assert len(trainer.model_parts) == 2
-            assert trainer.pp_schedule.__class__.__name__ == "ScheduleInterleaved1F1B"
+            assert (
+                trainer.training_engine.pp_schedule.__class__.__name__
+                == "ScheduleInterleaved1F1B"
+            )
         # A pre-validation snapshot must own its storage: otherwise an in-place
         # model update could also mutate the expected value and hide a failure.
         probe_snapshot = snapshot(trainer)

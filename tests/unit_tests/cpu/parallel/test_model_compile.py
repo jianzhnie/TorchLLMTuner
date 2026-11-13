@@ -521,6 +521,7 @@ def test_compiled_ac_preserves_modes_identity_and_frozen_gradients(
         trainer = SimpleNamespace(
             cfg=SimpleNamespace(validation=ValidationConfig(steps=1)),
             checkpointer=None,
+            error_group=None,
             model_parts=[actual],
             device=torch.device("cpu"),
         )

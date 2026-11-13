@@ -20,7 +20,7 @@ from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.runtime.batch import (
     batch_generator,
     fetch_batch,
-    microbatch,
+    prepare_microbatch,
     prepare_model_inputs,
 )
 from llmtuner.trainer.runtime.validation import (
@@ -60,7 +60,7 @@ def main():
                     if rank == failing_rank:
                         setattr(metrics, method, fail)
                     iterator = batch_generator(
-                        SimpleNamespace(metrics=metrics), [batch]
+                        [batch], metrics=metrics, group=dist.group.WORLD
                     )
                     caught = None
                     try:
@@ -79,12 +79,17 @@ def main():
             if rank == failing_rank:
                 del host_batch["input"]
             runtime = SimpleNamespace(
+                error_group=dist.group.WORLD,
                 parallel_dims=None,
                 ntokens_seen=17,
                 count_valid_tokens=Trainer.count_valid_tokens,
             )
             try:
-                microbatch(runtime, host_batch)
+                prepare_microbatch(
+                    host_batch,
+                    valid_token_counter=runtime.count_valid_tokens,
+                    error_group=runtime.error_group,
+                )
             except KeyError as error:
                 assert rank == failing_rank and error.args == ("input",)
             except RuntimeError as error:
@@ -103,6 +108,7 @@ def main():
                 else batch
             )
             trainer = SimpleNamespace(
+                error_group=dist.group.WORLD,
                 metrics=Metrics(),
                 device=torch.device("cpu"),
                 count_valid_tokens=Trainer.count_valid_tokens,
@@ -154,7 +160,9 @@ def main():
                     return
                 yield batch
 
-            iterator = batch_generator(trainer, source())
+            iterator = batch_generator(
+                source(), metrics=trainer.metrics, group=dist.group.WORLD
+            )
             assert next(iterator) is batch
             try:
                 next(iterator)
@@ -234,6 +242,12 @@ def main():
                     closed.append("loader")
 
             trainer = Trainer.__new__(Trainer)
+            trainer.error_group = dist.group.WORLD
+            trainer.metrics = SimpleNamespace(
+                add_tokens=lambda count: None,
+                add_data_loading_time=lambda duration: None,
+                close=lambda: None,
+            )
             trainer.cfg = SimpleNamespace(checkpoint=SimpleNamespace(load_step=-1))
             trainer.step = 0
             trainer.dataloader = InitializationLoader()
@@ -312,10 +326,14 @@ def main():
             split_pipeline_microbatches,
         )
 
-        trainer.pp_has_first_stage = rank == 0
-        trainer.pp_has_last_stage = rank == 1
-        trainer.pp_microbatches = lambda value: split_pipeline_microbatches(
-            value, num_microbatches=2
+        runtime = SimpleNamespace(
+            error_group=dist.group.WORLD,
+            pp_has_first_stage=rank == 0,
+            pp_has_last_stage=rank == 1,
+            pp_microbatches=lambda value: split_pipeline_microbatches(
+                value, num_microbatches=2
+            ),
+            preprocess=trainer.preprocess,
         )
         for failing_rank in (0, 1):
             rows = 3 if rank == failing_rank else 4
@@ -323,9 +341,9 @@ def main():
                 input_ids=torch.ones(rows, 4, dtype=torch.long),
                 labels=torch.ones(rows, 4, dtype=torch.long),
             )
-            with patch.object(trainer, "preprocess") as preprocess:
+            with patch.object(runtime, "preprocess") as preprocess:
                 try:
-                    prepare_pipeline_inputs(trainer, value)
+                    prepare_pipeline_inputs(runtime, value)
                 except ValueError as error:
                     assert rank == failing_rank and "divisible" in str(error)
                 except RuntimeError as error:
@@ -411,6 +429,7 @@ def main():
                     return inputs * (rank + 1)
 
             trainer = SimpleNamespace(
+                error_group=dist.group.WORLD,
                 parallel_dims=topology,
                 device=torch.device("cpu"),
                 cfg=SimpleNamespace(max_seq_len=4),
@@ -594,7 +613,8 @@ def main():
                 raise original
 
             report_trainer = SimpleNamespace(
-                metrics=SimpleNamespace(log_validation=log_validation)
+                error_group=dist.group.WORLD,
+                metrics=SimpleNamespace(log_validation=log_validation),
             )
             # Rank 0 represents a final PP stage; rank 1 holds no loss.
             loss = torch.tensor(float("nan") if failure == "nonfinite" else 4.0)

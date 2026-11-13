@@ -92,7 +92,9 @@ def main():
                     torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
                     (actual.square().sum() / 16).backward()
             sum(losses).backward()
-            allreduce_fsdp_excluded_grads(runtime)
+            allreduce_fsdp_excluded_grads(
+                runtime.model_parts, parallel_dims=runtime.parallel_dims
+            )
             for name, parameter in model.named_parameters():
                 expected = dict(reference.named_parameters())[name]
                 if expected.grad is None:

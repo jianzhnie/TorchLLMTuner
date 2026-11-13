@@ -1,14 +1,19 @@
 """Training-only scopes and bounded steady statistics."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import llmtuner.trainer.runtime.training_observer as observer_module
 from llmtuner.config.observability_config import MetricsConfig
+from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
+from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 from llmtuner.trainer.runtime.training_observer import (
     DispatchTimer,
     TrainingObserver,
+    install_dispatch_timers,
     percentile,
 )
 
@@ -88,3 +93,79 @@ def test_steady_throughput_weights_time_and_counts_across_unequal_steps():
 def test_invalid_sampling_config_is_rejected(options):
     with pytest.raises(ValueError):
         MetricsConfig(**options)
+
+
+def test_observer_uses_injected_group_for_errors_and_reductions(monkeypatch):
+    group = object()
+    coordinated = []
+    reductions = []
+
+    @contextmanager
+    def coordinate(label, *, group):
+        coordinated.append(group)
+        yield
+
+    def world_size(actual_group):
+        assert actual_group is group
+        return 2
+
+    def reduce(value, op=None, *, group):
+        reductions.append(group)
+        if value.dtype == torch.int64:
+            value.mul_(2)
+
+    monkeypatch.setattr(observer_module, "synchronize_local_errors", coordinate)
+    monkeypatch.setattr(observer_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(observer_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(observer_module.dist, "get_world_size", world_size)
+    monkeypatch.setattr(observer_module.dist, "all_reduce", reduce)
+    clock = iter([0.0, 2.0])
+    monkeypatch.setattr(observer_module.time, "perf_counter", lambda: next(clock))
+    metrics = SimpleNamespace(
+        config=MetricsConfig(metrics_warmup_steps=0, steady_window_steps=2),
+        ntokens_since_last_log=0,
+        valid_tokens_since_last_log=0,
+        data_loading_times=[],
+        _non_data_parallel_size=1,
+        num_flops_per_token=1000,
+        gpu_peak_flops=1e6,
+    )
+    observer = TrainingObserver(metrics, torch.device("cpu"), group=group)
+    observer.begin()
+    metrics.ntokens_since_last_log = 100
+    metrics.valid_tokens_since_last_log = 40
+    result = observer.end()
+
+    assert coordinated == [group, group]
+    assert reductions == [group, group]
+    assert result["train/global_tokens"] == 200
+    assert result["train/global_valid_targets"] == 80
+    assert result["train/tps_per_device"] == 50
+
+
+def test_dispatch_installation_deduplicates_shared_parts_and_reuses_timers():
+    experts = RoutedExperts(GroupedExperts(8, 12, 4), LocalTokenDispatcher(4, 2))
+    parts = [torch.nn.ModuleList([experts]), torch.nn.ModuleList([experts])]
+
+    timers = install_dispatch_timers(parts)
+    timers[0].cpu_seconds = 1.25
+
+    assert len(timers) == 1
+    assert experts.dispatch_observer is timers[0]
+    assert install_dispatch_timers(parts) == timers
+    assert timers[0].consume_seconds() == 1.25
+
+
+def test_dispatch_installation_validates_all_owners_before_mutation():
+    experts = [
+        RoutedExperts(GroupedExperts(8, 12, 4), LocalTokenDispatcher(4, 2))
+        for _ in range(2)
+    ]
+    custom = object()
+    experts[1].dispatch_observer = custom
+
+    with pytest.raises(ValueError, match="different observer"):
+        install_dispatch_timers([torch.nn.ModuleList(experts)])
+
+    assert experts[0].dispatch_observer is None
+    assert experts[1].dispatch_observer is custom

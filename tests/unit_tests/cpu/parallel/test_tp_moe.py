@@ -27,11 +27,14 @@ from llmtuner.config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.tensor_parallel import apply_tp
+from llmtuner.parallel.tensor_parallel import linear as tp_linear
 from llmtuner.parallel.tensor_parallel import tensor_parallel as tp_engine
-from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+from llmtuner.parallel.tensor_parallel.sharding import (
     MOE_PLAN_SPECS,
-    TPMoeSequenceBoundary,
     resolve_tp_sharding_plan,
+)
+from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+    TPMoeSequenceBoundary,
     resolve_tp_targets,
     shard_experts_for_tp,
 )
@@ -57,7 +60,7 @@ def test_expert_sharding_allocation_failure_preserves_parameters(monkeypatch):
     block = nn.Module()
     block.experts = _Experts(num_experts=4, dim=16, hidden=8)
     originals = dict(block.named_parameters())
-    shard_weight = tp_engine.shard_weight
+    shard_weight = tp_linear.shard_weight
     allocation_error = RuntimeError("down projection allocation failed")
 
     def fail_down_projection(weight, dim, **kwargs):
@@ -65,7 +68,7 @@ def test_expert_sharding_allocation_failure_preserves_parameters(monkeypatch):
             raise allocation_error
         return shard_weight(weight, dim, **kwargs)
 
-    monkeypatch.setattr(tp_engine, "shard_weight", fail_down_projection)
+    monkeypatch.setattr(tp_linear, "shard_weight", fail_down_projection)
     with pytest.raises(RuntimeError) as caught:
         shard_experts_for_tp(block, tp_size=2, tp_rank=0)
     assert caught.value is allocation_error
@@ -376,7 +379,7 @@ def test_shared_expert_allocation_failure_preserves_model(
         name: (module.in_features, module.out_features)
         for name, module in shared.named_children()
     }
-    shard_weight = tp_engine.shard_weight
+    shard_weight = tp_linear.shard_weight
     allocation_error = RuntimeError("shared projection allocation failed")
 
     def fail_projection(weight, dim, **kwargs):
@@ -384,7 +387,7 @@ def test_shared_expert_allocation_failure_preserves_model(
             raise allocation_error
         return shard_weight(weight, dim, **kwargs)
 
-    monkeypatch.setattr(tp_engine, "shard_weight", fail_projection)
+    monkeypatch.setattr(tp_linear, "shard_weight", fail_projection)
     with pytest.raises(RuntimeError) as caught:
         tp_engine.shard_shared_expert_for_tp(block, tp_size=2, tp_rank=0)
     assert caught.value is allocation_error
@@ -422,7 +425,7 @@ def test_shared_expert_is_not_double_sharded_by_the_dense_plan(root_block) -> No
 
     apply_tp(model, mesh=_FakeMesh(2, 0), cfg=cfg)
 
-    from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+    from llmtuner.parallel.tensor_parallel.linear import (
         ColumnParallelLinear,
         RowParallelLinear,
     )
@@ -563,10 +566,8 @@ def test_swap_refuses_a_shared_expert_block_under_tp_x_ep() -> None:
 
 def test_tp_sharded_param_ids_covers_dense_tp_and_ep_experts_not_router() -> None:
     from llmtuner.models.common.moe.experts import GroupedExperts
-    from llmtuner.parallel.tensor_parallel.tensor_parallel import (
-        ColumnParallelLinear,
-        tp_sharded_param_ids,
-    )
+    from llmtuner.parallel.tensor_parallel.linear import ColumnParallelLinear
+    from llmtuner.parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 
     grouped = GroupedExperts(dim=8, hidden_dim=4, num_experts=2)
     router = nn.Linear(8, 2, bias=False)

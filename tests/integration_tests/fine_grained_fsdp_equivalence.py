@@ -42,7 +42,7 @@ from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     build_fsdp_placement_fn,
     force_sum_grad_reduction,
 )
-from llmtuner.parallel.fully_shard_parallel.plan import apply_fsdp_by_pattern
+from llmtuner.parallel.fully_shard_parallel.pattern import apply_fsdp_by_pattern
 from llmtuner.utils.module_names import canonical_fqn
 
 

@@ -278,6 +278,7 @@ def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
     trainer = cast(
         Trainer,
         SimpleNamespace(
+            error_group=None,
             pp_has_first_stage=True,
             pp_has_last_stage=True,
             pp_schedule=_FakeSchedule(),
@@ -1910,10 +1911,8 @@ def test_microbatch_preserves_loader_owned_dictionary():
 
     labels = torch.tensor([[1, 2]])
     original = {"input": labels, "labels": labels, "num_valid_tokens": 2}
-    trainer = SimpleNamespace(
-        ntokens_seen=0, count_valid_tokens=runtime.count_valid_tokens
-    )
-    result = runtime.microbatch(trainer, original)
+    result, num_tokens = runtime.prepare_microbatch(original)
+    assert num_tokens == 2
     assert original["num_valid_tokens"] == 2
     assert result["batch"] is original
     assert result["batch"]["labels"] is labels
@@ -1981,47 +1980,53 @@ def test_fsdp_managed_parameters_reads_actual_shared_state():
 
 
 def test_assembly_uses_live_process_group_rank_and_size(monkeypatch):
-    from llmtuner.trainer.runtime import assembly
+    from llmtuner.trainer.runtime import environment
 
-    trainer = SimpleNamespace()
-    monkeypatch.setattr(assembly, "is_distributed", lambda: True)
-    monkeypatch.setattr(assembly, "get_env_dist_info", lambda: (0, 1, 0))
-    monkeypatch.setattr(assembly, "get_rank", lambda: 3)
-    monkeypatch.setattr(assembly, "get_world_size", lambda: 4)
+    monkeypatch.setattr(environment, "is_distributed", lambda: True)
+    monkeypatch.setattr(environment, "get_env_dist_info", lambda: (0, 1, 0))
+    monkeypatch.setattr(environment, "get_rank", lambda: 3)
+    monkeypatch.setattr(environment, "get_world_size", lambda: 4)
 
     def topology(cfg, world_size):
         assert world_size == 4
-        assert trainer.rank == 3
         raise RuntimeError("stop after rank resolution")
 
-    monkeypatch.setattr(assembly, "resolve_parallel_topology", topology)
+    monkeypatch.setattr(environment, "resolve_parallel_topology", topology)
     with pytest.raises(RuntimeError, match="stop after rank resolution"):
-        assembly.assemble_trainer_runtime(trainer, SimpleNamespace(deterministic=False))
+        environment.build_runtime_environment(
+            SimpleNamespace(deterministic=False),
+            seed_everything=lambda *args, **kwargs: None,
+            validate_validation=lambda *args, **kwargs: None,
+        )
 
 
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_assembly_sets_determinism_before_creating_process_group(
     monkeypatch, deterministic
 ):
-    from llmtuner.trainer.runtime import assembly
+    from llmtuner.trainer.runtime import environment
 
     calls = []
     monkeypatch.setenv("RANK", "0")
     monkeypatch.setenv("WORLD_SIZE", "2")
-    monkeypatch.setattr(assembly, "is_distributed", lambda: False)
-    monkeypatch.setattr(assembly, "get_distributed_backend", lambda: "hccl")
+    monkeypatch.setattr(environment, "is_distributed", lambda: False)
+    monkeypatch.setattr(environment, "get_distributed_backend", lambda: "hccl")
     monkeypatch.setattr(
-        assembly.seeding, "set_deterministic_algorithms", lambda: calls.append("policy")
+        environment.seeding,
+        "set_deterministic_algorithms",
+        lambda: calls.append("policy"),
     )
 
     def initialize(backend):
         assert calls == (["policy"] if deterministic else [])
         raise RuntimeError("stop before process group creation")
 
-    monkeypatch.setattr(assembly, "init_dist_pytorch", initialize)
+    monkeypatch.setattr(environment, "init_dist_pytorch", initialize)
     with pytest.raises(RuntimeError, match="stop before process group creation"):
-        assembly.assemble_trainer_runtime(
-            SimpleNamespace(), SimpleNamespace(deterministic=deterministic)
+        environment.build_runtime_environment(
+            SimpleNamespace(deterministic=deterministic),
+            seed_everything=lambda *args, **kwargs: None,
+            validate_validation=lambda *args, **kwargs: None,
         )
 
 
@@ -2295,7 +2300,9 @@ def test_replicated_tp_grad_is_reduced_once_for_shared_model_part_parameter(
     monkeypatch.setattr(gradients, "tp_sharded_param_ids", lambda parts: set())
     monkeypatch.setattr(gradients, "get_comm_device", lambda group: torch.device("cpu"))
     monkeypatch.setattr(gradients, "all_reduce", reduce)
-    gradients.allreduce_replicated_tp_grads(trainer)
+    gradients.allreduce_replicated_tp_grads(
+        trainer.model_parts, parallel_dims=trainer.parallel_dims
+    )
     assert calls == [group, group]  # One participation vector, one gradient.
     torch.testing.assert_close(shared.grad, torch.tensor([6.0]))
 
@@ -2344,10 +2351,27 @@ def test_clip_norm_counts_shared_parameter_across_model_parts_once(
         return torch.tensor(0.5)
 
     monkeypatch.setattr(gradients, "clip_grad_norm_", clip)
-    monkeypatch.setattr(gradients, "all_reduce", lambda *args, **kwargs: None)
-    monkeypatch.setattr(gradients, "check_finite", lambda *args: None)
+    expected_group = object()
+
+    def reduce_verdict(tensor, *, op, group):
+        assert op == "min"
+        assert group is expected_group
+        captured["verdict"] = tensor
+
+    def validate_verdict(step, tensor):
+        assert step == 7
+        assert tensor is captured["verdict"]
+
+    monkeypatch.setattr(gradients, "all_reduce", reduce_verdict)
+    monkeypatch.setattr(gradients, "check_finite", validate_verdict)
     gradients.clip_and_check_finite(
-        trainer,
+        trainer.model_parts,
+        parallel_dims=trainer.parallel_dims,
+        max_norm=trainer.cfg.max_norm,
+        precision=trainer.cfg.grad_norm_precision,
+        expert_reduce_layout="storage",
+        step=7,
+        error_group=expected_group,
         reduction_meshes=TrainingReductionMeshes(None, None, None, None),
         loss_is_finite=torch.ones((), dtype=torch.int32),
     )
@@ -2601,17 +2625,21 @@ def test_trainer_retries_interrupted_checkpoint_cleanup(failure):
 
     checkpoint = SimpleNamespace(_initialized=True, close=close_checkpoint)
     trainer.checkpointer = checkpoint
-    trainer.dataloader = SimpleNamespace(close=lambda: calls.append("data"))
+    loader = SimpleNamespace(close=lambda: calls.append("data"))
+    trainer.dataloader = loader
+    trainer.metrics = SimpleNamespace(close=lambda: calls.append("metrics"))
     with pytest.raises(failure, match="checkpoint close interrupted"):
         trainer.close()
     assert trainer.checkpointer is checkpoint
-    assert trainer.dataloader is None
+    assert trainer.dataloader is loader
+    assert calls == ["checkpoint", "metrics"]
 
     trainer.close()
     trainer.close()
 
-    assert calls == ["checkpoint", "data", "checkpoint"]
+    assert calls == ["checkpoint", "metrics", "checkpoint", "data"]
     assert trainer.checkpointer is None
+    assert trainer.dataloader is None
 
 
 def test_trainer_closes_checkpoint_before_loader_and_gc_last():
@@ -2922,14 +2950,29 @@ def test_new_train_step_discards_previous_routing_window(quantile):
 
 
 @pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
-def test_fetch_interrupt_coordinates_before_reraising(monkeypatch, error_type):
+@pytest.mark.parametrize("explicit_group", [False, True])
+def test_fetch_interrupt_coordinates_before_reraising(
+    monkeypatch, error_type, explicit_group
+):
     from llmtuner.trainer.runtime import batch as runtime
 
-    monkeypatch.setattr(runtime, "get_world_size", lambda: 2)
-    monkeypatch.setattr(runtime, "get_comm_device", lambda: "cpu")
+    expected_group = object() if explicit_group else None
+    queried = []
+
+    def world_size(group):
+        queried.append(group)
+        return 2
+
+    def comm_device(group):
+        queried.append(group)
+        return "cpu"
+
+    monkeypatch.setattr(runtime, "get_world_size", world_size)
+    monkeypatch.setattr(runtime, "get_comm_device", comm_device)
     statuses = []
 
-    def reduce(status, *, op):
+    def reduce(status, *, op, group):
+        assert group is expected_group
         assert op == "min"
         statuses.append(status.item())
 
@@ -2941,9 +2984,10 @@ def test_fetch_interrupt_coordinates_before_reraising(monkeypatch, error_type):
         yield
 
     with pytest.raises(error_type) as caught:
-        runtime.fetch_batch(source())
+        runtime.fetch_batch(source(), group=expected_group)
     assert caught.value is failure
     assert statuses == [0]
+    assert queried == [expected_group, expected_group]
 
 
 @pytest.mark.parametrize("count", [True, False, -1, 1.5, "2", 5, [2]])
@@ -3286,3 +3330,46 @@ def test_preprocess_requires_explicit_input_contract_without_legacy_fallback(can
             parallel_dims=None,
             max_context_length=2,
         )
+
+
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_trainer_retains_failed_gc_owner_for_retry(failure):
+    trainer = Trainer.__new__(Trainer)
+    calls = []
+
+    def close_gc():
+        calls.append("gc")
+        if calls.count("gc") == 1:
+            raise failure("GC restore failed")
+
+    owner = SimpleNamespace(close=close_gc)
+    trainer.gc_handler = owner
+    trainer.dataloader = SimpleNamespace(close=lambda: calls.append("loader"))
+    with pytest.raises(failure, match="GC restore failed"):
+        trainer.close()
+    assert trainer.gc_handler is owner
+    assert trainer.dataloader is None
+    trainer.close()
+    trainer.close()
+    assert calls == ["loader", "gc", "gc"]
+    assert trainer.gc_handler is None
+
+
+def test_trainer_progress_is_shared_with_checkpoint_without_retaining_trainer():
+    trainer = Trainer.__new__(Trainer)
+    other = Trainer.__new__(Trainer)
+    trainer.step = 3
+    trainer.ntokens_seen = 24
+    checkpoint_state = trainer.progress
+    trainer_reference = weakref.ref(trainer)
+    assert other.progress is not checkpoint_state
+    assert other.step == 0
+    checkpoint_state.load_state_dict({"step": 5, "ntokens_seen": 96})
+    assert trainer.step == 5
+    assert trainer.ntokens_seen == 96
+    trainer.step += 1
+    assert checkpoint_state.step == 6
+    assert trainer.state_dict() == checkpoint_state.state_dict()
+    del trainer
+    assert trainer_reference() is None
+    assert checkpoint_state.state_dict() == {"step": 6, "ntokens_seen": 96}

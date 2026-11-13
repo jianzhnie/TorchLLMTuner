@@ -8,7 +8,6 @@ an independent mathematical oracle or a performance benchmark.
 from argparse import ArgumentParser
 from copy import deepcopy
 from datetime import timedelta
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -121,9 +120,7 @@ def main() -> None:
                             output = model(local, **metadata).logits
                             (output.float().square().sum() / 512).backward()
                         group_outputs.append(output.detach().clone())
-                    allreduce_replicated_tp_grads(
-                        SimpleNamespace(parallel_dims=topology, model_parts=[model])
-                    )
+                    allreduce_replicated_tp_grads([model], parallel_dims=topology)
                     outputs.append(group_outputs)
                 with synchronize_local_errors("Assembly gradient comparison"):
                     for left, right in zip(*outputs, strict=True):

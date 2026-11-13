@@ -7,6 +7,7 @@ import torch
 
 import llmtuner.memory.activation_swap as activation_swap
 from llmtuner.errors import EnvironmentUnsupportedError
+from llmtuner.models.contracts import DecoderStructure
 
 
 class _Stream:
@@ -418,3 +419,87 @@ def test_activation_swap_rejects_invalid_host_budget(limit):
 
     with pytest.raises(ConfigError, match="activation_swap_max_host_bytes"):
         TrainingConfig(activation_swap_max_host_bytes=limit)
+
+
+def test_reapplication_shares_budget_with_new_layers(monkeypatch):
+    monkeypatch.setattr(activation_swap, "device_type", "npu")
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+    activation_swap.apply_activation_swap(model, max_host_bytes=64)
+    original = model.layers[0].forward
+    budget = original._activation_swap_budget
+    budget.current = 32  # An earlier forward still owns saved Host tensors.
+    model.layers.append(torch.nn.Linear(2, 2))
+
+    activation_swap.apply_activation_swap(model, max_host_bytes=64)
+
+    assert model.layers[0].forward is original
+    assert model.layers[1].forward._activation_swap_budget is budget
+    assert budget.current == 32
+
+
+@pytest.mark.parametrize("options", [{"max_host_bytes": 128}, {"sync_release": True}])
+def test_reapplication_rejects_changed_options_before_mutation(monkeypatch, options):
+    monkeypatch.setattr(activation_swap, "device_type", "npu")
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+    activation_swap.apply_activation_swap(model)
+    installed = model.layers[0].forward
+    model.layers.insert(0, torch.nn.Linear(2, 2))
+    untouched = model.layers[0].forward
+
+    with pytest.raises(ValueError, match="identical options"):
+        activation_swap.apply_activation_swap(model, **options)
+
+    assert model.layers[0].forward == untouched
+    assert model.layers[1].forward is installed
+
+
+def test_reapplication_rejects_independent_budgets(monkeypatch):
+    monkeypatch.setattr(activation_swap, "device_type", "npu")
+    models = [torch.nn.Module(), torch.nn.Module()]
+    for model in models:
+        model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+        activation_swap.apply_activation_swap(model)
+    models[0].layers.append(models[1].layers[0])
+    forwards = tuple(layer.forward for layer in models[0].layers)
+
+    with pytest.raises(ValueError, match="independent Host budgets"):
+        activation_swap.apply_activation_swap(models[0])
+
+    assert tuple(layer.forward for layer in models[0].layers) == forwards
+
+
+def test_explicit_swap_binds_only_declared_local_blocks(monkeypatch):
+    monkeypatch.setattr(activation_swap, "device_type", "npu")
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Module()
+    model.decoder.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+    model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+    model.decoder_structure = DecoderStructure(
+        decoder="decoder",
+        embedding="decoder.embedding",
+        blocks="decoder.blocks",
+        norm="decoder.norm",
+        head="head",
+    )
+    unrelated = model.layers[0].forward
+
+    activation_swap.apply_activation_swap(model)
+
+    assert model.decoder.blocks[0].forward._activation_swap_enabled
+    assert model.layers[0].forward == unrelated
+    # The PP-local model intentionally has no embedding, norm or output head.
+
+
+def test_explicit_swap_rejects_invalid_declaration_without_fallback(monkeypatch):
+    monkeypatch.setattr(activation_swap, "device_type", "npu")
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+    model.decoder_structure = "layers"
+    original = model.layers[0].forward
+
+    with pytest.raises(TypeError, match="DecoderStructure"):
+        activation_swap.apply_activation_swap(model)
+
+    assert model.layers[0].forward == original

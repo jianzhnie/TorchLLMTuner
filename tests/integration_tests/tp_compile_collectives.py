@@ -10,7 +10,7 @@ from functools import partial
 import torch
 import torch.distributed as dist
 
-from llmtuner.parallel.tensor_parallel.linear_ops import (
+from llmtuner.accelerator.linear_collectives import (
     all_gather_along,
     reduce_scatter_along,
     resolve_autograd_collectives,

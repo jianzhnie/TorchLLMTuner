@@ -16,6 +16,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from llmtuner.accelerator.linear_collectives import resolve_autograd_collectives
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.memory.activation_checkpoint import wrap_full
 from llmtuner.models.common.aux_loss import AuxLoss
@@ -25,7 +26,6 @@ from llmtuner.parallel.tensor_parallel.checkpointing import (
     gather_tensor_parallel_state,
     load_tensor_parallel_state,
 )
-from llmtuner.parallel.tensor_parallel.linear_ops import resolve_autograd_collectives
 from llmtuner.parallel.tensor_parallel.tensor_parallel import realize_moe_blocks_tp
 from tests.integration_tests.ep_wiring_equivalence import _model
 from tests.integration_tests.fixed_router_ep_equivalence import explicit_reference

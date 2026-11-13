@@ -53,7 +53,9 @@ def check_training(
                 torch.testing.assert_close(output, expected, atol=1e-6, rtol=1e-6)
                 (output.square().sum() / world).backward()
         sum(losses).backward()
-        allreduce_fsdp_excluded_grads(runtime)
+        allreduce_fsdp_excluded_grads(
+            runtime.model_parts, parallel_dims=runtime.parallel_dims
+        )
         source = reference.layers[0].mlp.experts
         weights = source.gate_up_proj.detach().chunk(2, dim=0)[ep_rank].chunk(2, dim=1)
         gradients = source.gate_up_proj.grad.chunk(2, dim=0)[ep_rank].chunk(2, dim=1)

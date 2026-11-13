@@ -1,5 +1,6 @@
 """The minimal immutable plan shared by resolution and execution."""
 
+from copy import deepcopy
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -8,6 +9,7 @@ from torch import nn
 
 from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel import ParallelPlan, PlanTarget
+from llmtuner.parallel.plan import validate_pipeline_aliases
 
 
 def test_plan_counts_resolved_targets_without_tensor_payloads() -> None:
@@ -392,3 +394,42 @@ def test_plan_accepts_unchanged_bound_forward_and_inplace_weight_update():
         model[0].weight.add_(1)
     plan.validate_binding(model)
     plan.validate_binding(model)
+
+
+@pytest.mark.parametrize("initially_shared", [False, True])
+def test_pipeline_rejects_changed_parameterless_module_aliases(initially_shared):
+    whole = nn.ModuleDict({"first": nn.ReLU(), "second": nn.ReLU()})
+    if initially_shared:
+        whole["second"] = whole["first"]
+    local = deepcopy(whole)
+    local["second"] = nn.ReLU() if initially_shared else local["first"]
+
+    def plan(model):
+        return ParallelPlan(
+            stage="cp",
+            targets=(),
+            degree=2,
+            implementation="test",
+            module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+        )
+
+    with pytest.raises(ValueError, match="module alias ownership"):
+        validate_pipeline_aliases(plan(whole), plan(local))
+
+
+def test_pipeline_module_alias_projection_excludes_removed_stage_placeholders():
+    shared = nn.ReLU()
+    whole = nn.ModuleDict({"first": shared, "second": shared, "removed": shared})
+    local = deepcopy(whole)
+    local["removed"] = nn.Identity()
+
+    def plan(model):
+        return ParallelPlan(
+            stage="cp",
+            targets=(),
+            degree=2,
+            implementation="test",
+            module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+        )
+
+    validate_pipeline_aliases(plan(whole), plan(local))

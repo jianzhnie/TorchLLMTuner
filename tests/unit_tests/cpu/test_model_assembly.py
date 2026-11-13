@@ -88,6 +88,7 @@ def test_meta_assembly_materializes_before_model_initialization(monkeypatch) -> 
 def test_engine_consumes_model_assembly_without_legacy_pp_attributes() -> None:
     model = nn.Linear(2, 2)
     schedule = object()
+    error_group = object()
     model_assembly = assembly.ModelAssembly(
         model=None,
         model_parts=[model],
@@ -112,12 +113,14 @@ def test_engine_consumes_model_assembly_without_legacy_pp_attributes() -> None:
         device=trainer.device,
         param_context=trainer.param_context,
         loss_sum=trainer.loss_sum,
+        error_group=error_group,
     )
 
     assert engine.model_parts == [model]
     assert engine.pp_schedule is schedule
     assert engine.pp_has_first_stage
     assert engine.pp_has_last_stage
+    assert engine.error_group is error_group
 
 
 def test_optimizer_stack_and_engine_build_without_trainer_attributes() -> None:
@@ -153,6 +156,15 @@ def test_optimizer_stack_and_engine_build_without_trainer_attributes() -> None:
 
 def test_checkpointer_consumes_explicit_runtime_owners(monkeypatch) -> None:
     captured = {}
+    error_group = object()
+    phases = []
+
+    @contextmanager
+    def coordinate(phase, *, group):
+        phases.append((phase, group))
+        yield
+
+    monkeypatch.setattr(assembly, "synchronize_local_errors", coordinate)
 
     class Manager:
         def __init__(self, config, **kwargs):
@@ -178,8 +190,10 @@ def test_checkpointer_consumes_explicit_runtime_owners(monkeypatch) -> None:
         train_state=train_state,
         device=torch.device("cpu"),
         parallel_dims=None,
+        error_group=error_group,
     )
 
+    assert phases == [("Checkpoint services preparation", error_group)]
     assert isinstance(manager, Manager)
     assert captured["model_parts"] == [model]
     assert captured["optimizer"] is optimizer_stack.optimizer
@@ -382,11 +396,13 @@ def test_production_assembly_uses_explicit_dataloader_factory(monkeypatch):
 def test_metrics_factory_closes_unpublished_logger_after_peer_failure(
     monkeypatch, error_type, cleanup_fails
 ):
+    error_group = object()
     failure = error_type("peer metrics construction failed")
     closed = []
 
     @contextmanager
-    def coordinated_failure(phase):
+    def coordinated_failure(phase, *, group=None):
+        assert group is error_group
         assert phase == "Metrics construction"
         yield
         raise failure
@@ -409,7 +425,81 @@ def test_metrics_factory_closes_unpublished_logger_after_peer_failure(
             parallel_dims=None,
             num_parameters=17,
             num_trainable_parameters=13,
+            error_group=error_group,
         )
 
     assert caught.value is failure
     assert closed == [True]
+
+
+def test_optimizer_factory_passes_explicit_coordination_group(monkeypatch):
+    group = object()
+    phases = []
+    original = assembly.OptimizersContainer
+
+    def optimizer_factory(*args, **kwargs):
+        assert kwargs.pop("initialization_group") is group
+        return original(*args, **kwargs)
+
+    @contextmanager
+    def coordinate(phase, *, group):
+        phases.append((phase, group))
+        yield
+
+    monkeypatch.setattr(assembly, "OptimizersContainer", optimizer_factory)
+    monkeypatch.setattr(assembly, "synchronize_local_errors", coordinate)
+    stack = assembly.build_optimizer_stack(
+        LLMTunerConfig(),
+        model_parts=[nn.Linear(2, 2)],
+        parallel_dims=None,
+        error_group=group,
+    )
+    assert stack.optimizer is not None
+    assert phases == [("Optimizer services construction", group)]
+
+
+def test_model_preparation_counts_before_parameter_layout_changes(monkeypatch):
+    cfg = LLMTunerConfig()
+    environment = assembly.RuntimeEnvironment(
+        rank=0,
+        world_size=1,
+        local_rank=0,
+        parallel_dims=None,
+        device=torch.device("cpu"),
+        mesh=None,
+        error_group=None,
+    )
+    model = nn.Module()
+    model.trainable = nn.Parameter(torch.ones(3))
+    model.alias = model.trainable
+    model.frozen = nn.Parameter(torch.ones(5), requires_grad=False)
+    model_config = object()
+    events = []
+
+    def construct(config, *, parallel_dims, device):
+        assert config is cfg
+        assert parallel_dims is environment.parallel_dims
+        assert device is environment.device
+        events.append("construct")
+        return model, model_config, True
+
+    def assemble(source, **kwargs):
+        assert source is model
+        assert kwargs["load_initial_weights"] is True
+        assert kwargs["error_group"] is environment.error_group
+        events.append("assemble")
+        del source.trainable
+        del source.alias
+        return assembly.ModelAssembly(model=source, model_parts=[source])
+
+    monkeypatch.setattr(assembly, "build_model", construct)
+    monkeypatch.setattr(assembly, "_apply_parallelism", assemble)
+    rng = torch.get_rng_state().clone()
+    prepared = assembly.prepare_parallel_model(cfg, environment=environment)
+    assert events == ["construct", "assemble"]
+    assert prepared.config is model_config
+    assert prepared.assembly.model is model
+    assert prepared.num_parameters == 8
+    assert prepared.num_trainable_parameters == 3
+    assert sum(parameter.numel() for parameter in model.parameters()) == 5
+    assert torch.equal(torch.get_rng_state(), rng)

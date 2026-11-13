@@ -19,7 +19,7 @@ from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp_to_decoder,
     force_sum_grad_reduction,
 )
-from llmtuner.parallel.fully_shard_parallel.plan import apply_fsdp_by_pattern
+from llmtuner.parallel.fully_shard_parallel.pattern import apply_fsdp_by_pattern
 from tests.integration_tests.harness import init_distributed
 
 

@@ -40,8 +40,9 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.models.common.moe.experts import RoutedExperts
-from llmtuner.models.common.moe.layer import MoE
+from llmtuner.models.common.moe.layer import MoE, declared_moe_block
 from llmtuner.models.configuration import configure_reference_experts
+from llmtuner.models.contracts import MoEBlockContract
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel import (
     block_conversion,
@@ -51,7 +52,6 @@ from llmtuner.parallel.expert_parallel import (
 from llmtuner.parallel.expert_parallel.block_conversion import (
     restore_fp32_state_buffers,
 )
-from llmtuner.parallel.expert_parallel.hf_inspection import is_hf_moe_block
 
 TOL = 1e-6
 
@@ -68,6 +68,41 @@ def construct_test_model(config, *, explicit: bool = True) -> torch.nn.Module:
         return Qwen3MoeForCausalLM(config)
     model = AutoModelForCausalLM.from_config(config)
     object.__setattr__(model, "layers", model.model.layers)
+    # These are explicit test adapters for fixed reference families. The
+    # production resolver neither selects these families nor infers semantics.
+    family = config.model_type
+    if family in ("deepseek_v3", "glm4_moe", "deepseek_v2"):
+        grouped = family != "deepseek_v2"
+        for index, layer in enumerate(model.layers):
+            layer.moe_block_name = (
+                "mlp" if index >= config.first_k_dense_replace else None
+            )
+            if layer.moe_block_name is None:
+                continue
+            layer.mlp.moe_contract = MoEBlockContract(
+                router="gate",
+                num_experts=config.n_routed_experts,
+                top_k=config.num_experts_per_tok,
+                score_func="sigmoid" if grouped else "softmax",
+                route_norm=config.norm_topk_prob if grouped else False,
+                route_scale=config.routed_scaling_factor,
+                shared_expert="shared_experts" if config.n_shared_experts else None,
+                num_expert_groups=config.n_group if grouped else None,
+                num_limited_groups=config.topk_group if grouped else None,
+            )
+    elif family in ("qwen3_moe", "mixtral"):
+        for layer in model.layers:
+            layer.moe_block_name = "mlp"
+            layer.mlp.moe_contract = MoEBlockContract(
+                router="gate",
+                num_experts=(
+                    config.num_experts
+                    if family == "qwen3_moe"
+                    else config.num_local_experts
+                ),
+                top_k=config.num_experts_per_tok,
+                route_norm=config.norm_topk_prob if family == "qwen3_moe" else True,
+            )
     return model
 
 
@@ -131,22 +166,14 @@ def _data(seed: int = 7) -> tuple[torch.Tensor, torch.Tensor]:
 # keeps every family on ``mlp``; 4.x spells Mixtral's and GraniteMoe's
 # ``block_sparse_moe`` and DeepSeek's/GLM4's ``moe`` -- and a DeepSeek layer
 # carries a *dense* ``mlp`` as well, so the MoE-shaped one has to win.
-BLOCK_ATTRS = ("mlp", "block_sparse_moe", "moe")
 
 
 def _hf_block(layer: torch.nn.Module) -> torch.nn.Module:
-    """The layer's MoE block, under whichever attribute this HF build uses."""
-    fallback = None
-    for name in BLOCK_ATTRS:
-        block = getattr(layer, name, None)
-        if block is None:
-            continue
-        if is_hf_moe_block(block):
-            return block
-        fallback = fallback or block
-    if fallback is None:
-        raise AssertionError("layer holds no MoE block attribute")
-    return fallback
+    """Bind the test model's declared sparse slot."""
+    declaration = declared_moe_block(layer)
+    if declaration is None or declaration[1] is None:
+        raise AssertionError("test layer must declare a sparse slot")
+    return declaration[1]
 
 
 def _hf_block_attr(layer: torch.nn.Module) -> str:
@@ -748,6 +775,9 @@ def test_swap_preserves_falsey_shared_expert() -> None:
     model = _deepseek_model()
     shared = torch.nn.Sequential()
     model.layers[1].mlp.shared_expert = shared
+    model.layers[1].mlp.moe_contract = replace(
+        model.layers[1].mlp.moe_contract, shared_expert="shared_expert"
+    )
 
     swap_moe_blocks(model)
 
@@ -817,6 +847,9 @@ def test_the_swap_refuses_to_guess_a_shared_expert_gate() -> None:
     """
     model = _deepseek_model()
     model.layers[1].mlp.shared_expert_gate = torch.nn.Linear(64, 1)
+    model.layers[1].mlp.moe_contract = replace(
+        model.layers[1].mlp.moe_contract, shared_expert_gate="shared_expert_gate"
+    )
     counts_before = dict(AuxLoss._group_counts)
 
     with pytest.raises(NotImplementedError, match="shared_expert_gate"):
@@ -1737,88 +1770,6 @@ def test_pre_down_policy_rejected_before_ep_replacement(fixed_router):
     assert all(after[key] is p for key, p in parameters.items())
 
 
-def test_router_output_contract_avoids_source_inspection(monkeypatch):
-    from llmtuner.parallel.expert_parallel import hf_inspection
-
-    class ExplicitBlock(torch.nn.Module):
-        router_logits_in_output = False
-
-        def forward(self):
-            return None, None
-
-    def unexpected_source_inspection(_module):
-        raise AssertionError("explicit router contract must bypass AST inspection")
-
-    monkeypatch.setattr(
-        hf_inspection.inspect, "getsource", unexpected_source_inspection
-    )
-    assert not hf_inspection.returns_router_logits(ExplicitBlock())
-
-
-def test_invalid_router_output_contract_is_rejected():
-    from llmtuner.parallel.expert_parallel.hf_inspection import returns_router_logits
-
-    class InvalidBlock(torch.nn.Module):
-        router_logits_in_output = "no"
-
-    with pytest.raises(TypeError, match="must be a bool"):
-        returns_router_logits(InvalidBlock())
-
-
-@pytest.mark.parametrize("slot", ["", "mlp.experts", 1, False, "missing"])
-def test_invalid_moe_slot_declaration_does_not_fall_back(slot):
-    from llmtuner.parallel.expert_parallel.hf_inspection import moe_block_of
-
-    layer = torch.nn.Module()
-    layer.mlp = torch.nn.Linear(2, 2)
-    layer.moe_block_name = slot
-    with pytest.raises(ValueError, match="moe_block_name"):
-        moe_block_of(layer)
-
-
-def test_declared_moe_slot_is_authoritative_and_tracks_replacement(monkeypatch):
-    from llmtuner.parallel.expert_parallel import hf_inspection
-
-    def unexpected(_module):
-        raise AssertionError("declared decoder must not probe candidate structure")
-
-    monkeypatch.setattr(hf_inspection, "is_hf_moe_block", unexpected)
-    layer = torch.nn.Module()
-    layer.mlp = torch.nn.Linear(2, 2)
-    layer.expert_block = torch.nn.Linear(2, 2)
-    layer.moe_block_name = "expert_block"
-    assert hf_inspection.moe_block_of(layer) == ("expert_block", layer.expert_block)
-    old = layer.expert_block
-    layer.expert_block = torch.nn.Linear(2, 2)
-    assert layer.expert_block is not old
-    assert hf_inspection.moe_block_of(layer)[1] is layer.expert_block
-    layer.moe_block_name = None
-    assert hf_inspection.moe_block_of(layer)[1] is None
-
-
-def test_owned_qwen3_ep_conversion_does_not_inspect_forward_source(monkeypatch):
-    from llmtuner.parallel.expert_parallel import hf_inspection
-
-    config = _config(norm_topk_prob=True, aux_coeff=0.0)
-    config.mlp_only_layers = [1]
-    model = _model(config)
-    assert model.layers[0].moe_block_name == "mlp"
-    assert model.layers[1].moe_block_name is None
-    dense_mlp = model.layers[1].mlp
-    ids, positions = _data()
-    expected = logits(model, ids, positions)
-
-    def unexpected(_module):
-        raise AssertionError("owned Qwen3 must declare router output arity")
-
-    monkeypatch.setattr(hf_inspection.inspect, "getsource", unexpected)
-    swap_moe_blocks(model)
-    assert isinstance(model.layers[0].mlp, MoE)
-    assert model.layers[1].mlp is dense_mlp
-    actual = logits(model, ids, positions)
-    torch.testing.assert_close(actual, expected, atol=TOL, rtol=TOL)
-
-
 def test_unsupported_declared_moe_layout_fails_before_any_replacement():
     model = _model(_config(norm_topk_prob=True))
     model.layers[1].mlp = torch.nn.Linear(64, 64)
@@ -1833,47 +1784,6 @@ def test_unsupported_declared_moe_layout_fails_before_any_replacement():
     after = dict(model.named_parameters())
     assert after.keys() == original_parameters.keys()
     assert all(after[name] is value for name, value in original_parameters.items())
-
-
-@pytest.mark.parametrize("failure", ["layout", "missing", "rank", "count"])
-def test_declared_expert_layout_rejects_invalid_storage(failure):
-    from llmtuner.parallel.expert_parallel.hf_inspection import fused_experts_of
-
-    block = _model(_config(norm_topk_prob=True)).layers[0].mlp
-    assert block.expert_layout == "fused_gate_up"
-    if failure == "layout":
-        block.expert_layout = "unknown"
-    elif failure == "missing":
-        del block.experts.gate_up_proj
-    elif failure == "rank":
-        block.experts.gate_up_proj = torch.nn.Parameter(torch.ones(2, 2))
-    else:
-        block.experts.down_proj = torch.nn.Parameter(
-            block.experts.down_proj[:1].detach().clone()
-        )
-    with pytest.raises(ValueError):
-        fused_experts_of(block)
-
-
-def test_declared_expert_layout_never_falls_back_to_list_probe(monkeypatch):
-    from llmtuner.parallel.expert_parallel import hf_inspection
-
-    block = _model(_config(norm_topk_prob=True)).layers[0].mlp
-
-    def unexpected(_experts):
-        raise AssertionError("declared fused layout must not probe expert lists")
-
-    monkeypatch.setattr(hf_inspection, "_fused_experts_of_per_expert_list", unexpected)
-    weights = hf_inspection.fused_experts_of(block)
-    assert weights.num_experts == 8
-    assert weights.gate_EFD.shape == (8, 48, 64)
-    assert (
-        weights.gate_EFD.untyped_storage()
-        is block.experts.gate_up_proj.untyped_storage()
-    )
-    del block.experts.gate_up_proj
-    with pytest.raises(ValueError, match="requires gate_up_proj"):
-        hf_inspection.fused_experts_of(block)
 
 
 def test_later_router_bias_is_rejected_before_any_block_conversion(monkeypatch):
@@ -1943,51 +1853,3 @@ def test_ep_resolution_rejects_capabilities_without_mutation(quantile_balancing)
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert torch.equal(rng, torch.get_rng_state())
     assert dict(AuxLoss._group_counts) == counts
-
-
-def test_ep_plan_does_not_label_legacy_experts_as_packed(monkeypatch):
-    model = construct_test_model(_config(norm_topk_prob=True), explicit=False)
-    for layer in model.layers:
-        block = layer.mlp
-        if hasattr(block, "moe_contract"):
-            del block.moe_contract
-        block.expert_layout = None
-        members = []
-        for _ in range(8):
-            expert = torch.nn.Module()
-            expert.gate_proj = torch.nn.Linear(64, 48, bias=False)
-            expert.up_proj = torch.nn.Linear(64, 48, bias=False)
-            expert.down_proj = torch.nn.Linear(48, 64, bias=False)
-            expert.act_fn = torch.nn.SiLU()
-            members.append(expert)
-        block.experts = torch.nn.ModuleList(members)
-    rng = torch.get_rng_state().clone()
-    parameters = tuple(model.parameters())
-
-    def reject_stacking(*args, **kwargs):
-        raise AssertionError("Plan resolution must not stack expert weights")
-
-    with monkeypatch.context() as guard:
-        guard.setattr(torch, "stack", reject_stacking)
-        plan = model_replacement.resolve_ep_plan(model)
-    assert torch.equal(rng, torch.get_rng_state())
-    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
-    assert plan.count("moe") == 2
-    assert all(target.layout == "legacy_adapter" for target in plan.targets)
-    assert all(target.spec.packed_experts is None for target in plan.targets)
-    # Conversion still stacks the actual values in role order, not a probe proxy.
-    block = model.layers[0].mlp
-    for expert in block.experts:
-        expert.gate_proj.weight.requires_grad_(False)
-    with torch.no_grad():
-        fused = block_conversion._legacy_inspection().fused_experts_of(block)
-    assert fused.num_experts == 8
-    assert not fused.gate_EFD.requires_grad
-    assert fused.up_EFD.requires_grad
-    for index, expert in enumerate(block.experts):
-        for actual, expected in (
-            (fused.gate_EFD[index], expert.gate_proj.weight),
-            (fused.up_EFD[index], expert.up_proj.weight),
-            (fused.down_EDF[index], expert.down_proj.weight),
-        ):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)

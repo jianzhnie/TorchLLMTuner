@@ -23,16 +23,18 @@ import torch.nn as nn
 from llmtuner.config import ParallelConfig
 from llmtuner.config.parallel_config import TensorParallelConfig
 from llmtuner.parallel.tensor_parallel import apply_tp
-from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+from llmtuner.parallel.tensor_parallel.linear import (
     ColumnParallelLinear,
     ColwiseLinearNoGather,
     RowParallelLinear,
+    shard_weight,
+)
+from llmtuner.parallel.tensor_parallel.sharding import (
     ShardingConfig,
     colwise,
     match_tp_sharding_spec,
     resolve_tp_sharding_plan,
     rowwise,
-    shard_weight,
 )
 
 
@@ -232,7 +234,7 @@ def test_pipeline_part_permits_override_owned_by_another_stage():
 def test_tp_projection_rejects_unsupported_rank_before_communication(
     monkeypatch, cls, shape
 ):
-    import llmtuner.parallel.tensor_parallel.tensor_parallel as tp_module
+    import llmtuner.parallel.tensor_parallel.linear as tp_module
 
     def unexpected(*args):
         pytest.fail("invalid layout reached communication")
@@ -251,7 +253,7 @@ def test_tp_projection_rejects_unsupported_rank_before_communication(
 def test_tp_projection_preserves_empty_token_shape_and_gradients(
     monkeypatch, cls, shape
 ):
-    import llmtuner.parallel.tensor_parallel.tensor_parallel as tp_module
+    import llmtuner.parallel.tensor_parallel.linear as tp_module
 
     def local_linear(inputs, weight, group):
         return torch.nn.functional.linear(inputs, weight)
