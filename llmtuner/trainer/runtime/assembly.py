@@ -12,27 +12,15 @@ splits the model first, then applies those stages to each local model part.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 
 from ...accelerator.collectives import synchronize_local_errors
-from ...accelerator.device import (
-    device_type,
-    get_distributed_backend,
-    get_env_dist_info,
-)
-from ...accelerator.distributed import (
-    get_default_group,
-    get_rank,
-    get_world_size,
-    init_dist_pytorch,
-    is_distributed,
-)
 from ...components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
@@ -58,27 +46,28 @@ from ...models.common.aux_loss import register_aux_loss_metrics_hook
 from ...models.common.moe.bias_update import (
     register_moe_balancing_hook,
 )
-from ...models.common.moe.experts import RoutedExperts
 from ...models.configuration import (
     build_model_config_for,
     resolve_model_class,
     unwrap_text_config,
 )
+from ...models.registry import resolve_state_format
 from ...parallel import compatibility
 from ...parallel.parallelize import parallelize_model
 from ...parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
-from ...parallel.topology import build_device_mesh, resolve_parallel_topology
 from ...utils import logging as logging_utils
-from ...utils import seeding
-from ...utils.flops import flops_per_token
+from ...utils.flops import flops_estimation_note, flops_per_token
 from .batch import build_training_dataloader
 from .engine import LossSum, ParamContext, TrainingEngine
-from .training_observer import DispatchTimer, TrainingObserver
+from .environment import RuntimeEnvironment, build_runtime_environment
+from .training_observer import TrainingObserver, install_dispatch_timers
 
 if TYPE_CHECKING:
+    from torch.distributed.checkpoint.stateful import Stateful
     from transformers import PretrainedConfig
 
     from ...config.llmtuner_config import LLMTunerConfig
+    from ...datasets.contracts import BaseDataLoader
     from ...parallel.topology import ParallelTopology
     from ..trainer import Trainer
 
@@ -102,6 +91,20 @@ class OptimizerStack:
     optimizer: OptimizersContainer
     lr_scheduler: Any
     ema: EMA | None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedModel:
+    """Model preparation output before optimizer or service construction.
+
+    Counts describe unique logical parameters before distributed ownership
+    changes. Configuration and local assembly are retained by reference.
+    """
+
+    assembly: ModelAssembly
+    config: PretrainedConfig
+    num_parameters: int
+    num_trainable_parameters: int
 
 
 def build_model(
@@ -151,20 +154,19 @@ def build_model(
         and cfg.checkpoint.initial_load_in_hf
         and cfg.checkpoint.initial_load_path
     )
-    # Kimi has an explicit full-expert HF layout adapter. Other EP families
-    # still need their own checkpoint mapping before meta initialization.
-    if (
-        load_initial_weights
-        and parallel_dims is not None
-        and parallel_dims.ep_enabled
-        and getattr(text_config, "model_type", None) != "kimi_linear"
-        and not (
-            getattr(text_config, "model_type", None) == "qwen3_moe"
-            and cfg.checkpoint.sharded_expert_parallel
-            and (cfg.parallel.tp_size == 1 or cfg.checkpoint.sharded_tensor_parallel)
+    if load_initial_weights and parallel_dims is not None and parallel_dims.ep_enabled:
+        # The registered format owns expert key/layout support. Assembly must
+        # not infer it from architecture names or duplicate packing rules.
+        state_format = resolve_state_format(
+            text_config,
+            expert_parallel=True,
+            sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
         )
-    ):
-        compatibility.ep_hf_initial_load(parallel_dims.ep)
+        if not state_format.supports_ep_initial_load(
+            tp_degree=cfg.parallel.tp_size,
+            sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
+        ):
+            compatibility.ep_hf_initial_load(parallel_dims.ep)
     if not load_initial_weights and cfg.model.initialization_device == "meta":
         if any(
             degree > 1
@@ -234,6 +236,7 @@ def _apply_parallelism(
     parallel_dims: ParallelTopology | None,
     device: torch.device,
     load_initial_weights: bool,
+    error_group: ProcessGroup | None = None,
 ) -> ModelAssembly:
     """Apply configured stages and return this rank's explicit model ownership."""
     orchestration = parallelize_model(
@@ -241,6 +244,7 @@ def _apply_parallelism(
         cfg=cfg.parallel,
         mesh=mesh,
         parallel_dims=parallel_dims,
+        error_group=error_group,
         device=device,
         compile=cfg.training.compile,
         compile_config=cfg.training.compile_config,
@@ -294,7 +298,7 @@ def _apply_parallelism(
             materialization_error = error
         # FSDP _apply may manage communication state. Finish materialization
         # outside the local-only boundary, then agree before optimizer setup.
-        with synchronize_local_errors("Model materialization"):
+        with synchronize_local_errors("Model materialization", group=error_group):
             if materialization_error is not None:
                 raise materialization_error
         if not load_initial_weights:
@@ -314,20 +318,48 @@ def _apply_parallelism(
                     initialize_model()
             except BaseException as error:
                 initialization_error = error
-            with synchronize_local_errors("Random model initialization"):
+            with synchronize_local_errors(
+                "Random model initialization", group=error_group
+            ):
                 if initialization_error is not None:
                     raise initialization_error
     return assembled
 
 
-def _install_model_assembly(trainer: Trainer, assembled: ModelAssembly) -> None:
-    """Compatibility bridge for existing optimizer and checkpoint consumers."""
-    trainer.model = assembled.model
-    trainer.model_parts = assembled.model_parts
-    trainer.pp_schedule = assembled.pp_schedule
-    trainer.pp_has_first_stage = assembled.pp_has_first_stage
-    trainer.pp_has_last_stage = assembled.pp_has_last_stage
-    trainer._pp_loss_sentinel = assembled.pp_loss_sentinel
+def prepare_parallel_model(
+    cfg: LLMTunerConfig, *, environment: RuntimeEnvironment
+) -> PreparedModel:
+    """Construct, count and assemble a model without accessing a Trainer.
+
+    Keep counting before TP/EP/PP/FSDP and preserve the materialization/load
+    lifecycle in _apply_parallelism. No optimizer captures parameters until
+    this builder has returned the final local layout.
+    """
+    with synchronize_local_errors("Model construction", group=environment.error_group):
+        model, model_config, load_initial_weights = build_model(
+            cfg, parallel_dims=environment.parallel_dims, device=environment.device
+        )
+        num_parameters = sum(parameter.numel() for parameter in model.parameters())
+        num_trainable_parameters = sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+    assembled = _apply_parallelism(
+        model,
+        cfg=cfg,
+        mesh=environment.mesh,
+        parallel_dims=environment.parallel_dims,
+        device=environment.device,
+        load_initial_weights=load_initial_weights,
+        error_group=environment.error_group,
+    )
+    return PreparedModel(
+        assembly=assembled,
+        config=model_config,
+        num_parameters=num_parameters,
+        num_trainable_parameters=num_trainable_parameters,
+    )
 
 
 def create_training_engine(
@@ -339,12 +371,14 @@ def create_training_engine(
     device: torch.device,
     param_context: ParamContext,
     loss_sum: LossSum,
+    error_group: ProcessGroup | None = None,
 ) -> TrainingEngine:
     """Bind execution dependencies without reading or mutating a Trainer.
 
     The assembly owns model parts and pipeline metadata; optimizer services
     refer to the final parameter layout. This factory consumes both results
-    without reselecting model or parallel strategies.
+    without reselecting model or parallel strategies. ``error_group`` covers
+    all update participants, not only ranks sharing a DP or PP mesh axis.
     """
     return TrainingEngine(
         model_parts=model_assembly.model_parts,
@@ -362,6 +396,7 @@ def create_training_engine(
         pp_has_last_stage=model_assembly.pp_has_last_stage,
         pp_loss_sentinel=model_assembly.pp_loss_sentinel,
         pp_num_microbatches=cfg.parallel.pp_config.num_pp_microbatches,
+        error_group=error_group,
     )
 
 
@@ -370,20 +405,25 @@ def build_optimizer_stack(
     *,
     model_parts: list[torch.nn.Module],
     parallel_dims: ParallelTopology | None,
+    error_group: ProcessGroup | None = None,
 ) -> OptimizerStack:
-    """Build optimizer services against the final parallel parameter layout."""
+    """Build optimizer services against the final parallel parameter layout.
+
+    Pass the same error group to parameter planning and scheduler/EMA creation.
+    This group coordinates failures; it does not change gradient ownership.
+    """
     optimizer = OptimizersContainer(
         cfg.optimizer,
         sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
         sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
         model_parts=model_parts,
-        initialization_group=get_default_group() if is_distributed() else None,
+        initialization_group=error_group,
         pipeline_mesh=(
             parallel_dims.get_optional_mesh("pp") if parallel_dims is not None else None
         ),
     )
 
-    with synchronize_local_errors("Optimizer services construction"):
+    with synchronize_local_errors("Optimizer services construction", group=error_group):
         lr_scheduler = build_lr_scheduler(
             cfg.lr_scheduler_config,
             optimizers=list(optimizer),
@@ -419,13 +459,19 @@ def build_checkpointer(
     *,
     model_assembly: ModelAssembly,
     optimizer_stack: OptimizerStack,
-    dataloader: Any,
-    train_state: Any,
+    dataloader: BaseDataLoader,
+    train_state: Stateful,
     device: torch.device,
     parallel_dims: ParallelTopology | None,
+    error_group: ProcessGroup | None = None,
 ) -> DistributedCheckpointManager | TorchCheckpointingManager:
-    """Build checkpoint orchestration around explicitly owned runtime state."""
-    with synchronize_local_errors("Checkpoint services preparation"):
+    """Build checkpoint orchestration around explicitly owned runtime state.
+
+    ``error_group`` covers adapter preparation, format-conversion failures and
+    external key coverage. Checkpoint manager IO keeps its own collective scope;
+    this argument does not repartition persistence.
+    """
+    with synchronize_local_errors("Checkpoint services preparation", group=error_group):
         if cfg.checkpoint.enable and cfg.optimizer.state_residency == "npu_virtual":
             validate_checkpoint_configuration(
                 cfg.checkpoint.backend, cfg.checkpoint.async_mode
@@ -446,6 +492,7 @@ def build_checkpointer(
             model_prefix="",
             expert_parallel=cfg.parallel.ep_size > 1,
             sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
+            error_group=error_group,
         )
     manager_cls = (
         TorchCheckpointingManager
@@ -471,11 +518,16 @@ def build_metrics_processor(
     parallel_dims: ParallelTopology | None,
     num_parameters: int,
     num_trainable_parameters: int,
+    error_group: ProcessGroup | None = None,
 ) -> MetricsProcessor:
-    """Build metrics from resolved model geometry and parallel topology."""
+    """Build metrics with explicit construction-failure coordination.
+
+    ``parallel_dims`` still defines metric reductions. ``error_group`` determines
+    which peers must accept construction before the logger is published.
+    """
     metrics = None
     try:
-        with synchronize_local_errors("Metrics construction"):
+        with synchronize_local_errors("Metrics construction", group=error_group):
             text_config = unwrap_text_config(model_config)
             metrics = MetricsProcessor(
                 cfg.metrics,
@@ -488,15 +540,9 @@ def build_metrics_processor(
                     text_config, seq_len=cfg.max_seq_len
                 ),
             )
-            if text_config.model_type == "qwen3_5_moe_text":
-                logging_utils.get_logger(__name__).info(
-                    "Qwen3.5 model FLOPs: recurrent-equivalent GDN, gated "
-                    "projections, active experts and depthwise convolution; "
-                    "full-square attention at sequence length %d. Excludes "
-                    "recomputation, padding overhead, optimizer and communication; "
-                    "this is model MFU, not measured kernel utilization.",
-                    cfg.max_seq_len,
-                )
+            note = flops_estimation_note(text_config, seq_len=cfg.max_seq_len)
+            if note is not None:
+                logging_utils.get_logger(__name__).info("%s", note)
     except BaseException:
         # The factory owns the logger until every rank accepts construction.
         # A peer failure leaves no object on Trainer for its close() to release.
@@ -516,88 +562,29 @@ def build_metrics_processor(
 
 def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
     trainer.cfg = cfg
-    if cfg.deterministic:
-        seeding.set_deterministic_algorithms()
-    if not is_distributed() and "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        init_dist_pytorch(get_distributed_backend())
-    trainer.rank, trainer.world_size, trainer.local_rank = get_env_dist_info()
-    if is_distributed():
-        # Programmatic callers may initialize the group without torchrun's
-        # environment. Mesh degrees must describe the live group.
-        trainer.rank = get_rank()
-        trainer.world_size = get_world_size()
-
-    # Resolve the degrees first: the PP seed offset below needs this rank's
-    # stage coordinate, and degree resolution draws no random numbers, so
-    # seeding after it leaves every non-PP run bit-identical.
-    trainer.parallel_dims = resolve_parallel_topology(
-        cfg, world_size=trainer.world_size
+    environment = build_runtime_environment(
+        cfg,
+        seed_everything=trainer.seed_everything,
+        validate_validation=trainer.check_validation_feasibility,
     )
+    trainer.rank = environment.rank
+    trainer.world_size = environment.world_size
+    trainer.local_rank = environment.local_rank
+    trainer.parallel_dims = environment.parallel_dims
+    trainer.device = environment.device
+    trainer.mesh = environment.mesh
+    error_group = environment.error_group
+    trainer.error_group = error_group
 
-    # Validation's infeasible combinations are rejected here, before the
-    # model and dataloader exist: a ``steps=-1`` pass that cannot terminate
-    # cleanly would otherwise hang on its collectives mid-run.
-    if cfg.validation is not None:
-        trainer.check_validation_feasibility(
-            cfg.validation,
-            dp_world_size=(
-                1
-                if trainer.parallel_dims is None
-                else trainer.parallel_dims.dp_replicate * trainer.parallel_dims.dp_shard
-            ),
-            chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
-            training_dataset=cfg.dataloader.dataset,
-        )
-
-    # Seed before model construction. PP stages use distinct seeds; ranks
-    # sharing a stage retain identical initialization.
-    seed = cfg.seed
-    if trainer.parallel_dims is not None and trainer.parallel_dims.pp_enabled:
-        pp_mesh = trainer.parallel_dims.get_optional_mesh("pp")
-        seed = seeding.derive_distinct_seed(
-            seed, [(pp_mesh.get_local_rank(), pp_mesh.size())]
-        )
-    trainer.seed_everything(
-        seed, deterministic=cfg.deterministic, detect_anomaly=cfg.detect_anomaly
-    )
-
-    trainer.device = torch.device(
-        f"{device_type}:{trainer.local_rank}" if device_type != "cpu" else "cpu"
-    )
-
-    # PP needs the dense mesh for this stage, which covers only its ranks.
-    if trainer.parallel_dims is not None and trainer.parallel_dims.pp_enabled:
-        trainer.mesh = trainer.parallel_dims.spmd_dense_mesh()
-    else:
-        trainer.mesh = build_device_mesh(trainer.parallel_dims)
-
-    seeding.initialize_dtensor_rng(trainer.mesh)
-
-    # Build the model before optimizer services capture its parameters.
-    with synchronize_local_errors("Model construction"):
-        model, model_config, load_initial_weights = build_model(
-            cfg, parallel_dims=trainer.parallel_dims, device=trainer.device
-        )
-        # Count unique logical parameters before TP/EP/PP/FSDP change ownership.
-        num_parameters = sum(parameter.numel() for parameter in model.parameters())
-        num_trainable_parameters = sum(
-            parameter.numel()
-            for parameter in model.parameters()
-            if parameter.requires_grad
-        )
-    model_assembly = _apply_parallelism(
-        model,
-        cfg=cfg,
-        mesh=trainer.mesh,
-        parallel_dims=trainer.parallel_dims,
-        device=trainer.device,
-        load_initial_weights=load_initial_weights,
-    )
-    _install_model_assembly(trainer, model_assembly)
+    prepared_model = prepare_parallel_model(cfg, environment=environment)
+    model_assembly = prepared_model.assembly
+    trainer.model = model_assembly.model
+    trainer.model_parts = model_assembly.model_parts
     optimizer_stack = build_optimizer_stack(
         cfg,
         model_parts=model_assembly.model_parts,
-        parallel_dims=trainer.parallel_dims,
+        parallel_dims=environment.parallel_dims,
+        error_group=error_group,
     )
     trainer.optimizer = optimizer_stack.optimizer
     trainer.lr_scheduler = optimizer_stack.lr_scheduler
@@ -606,16 +593,17 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
         cfg,
         model_assembly=model_assembly,
         optimizer_stack=optimizer_stack,
-        parallel_dims=trainer.parallel_dims,
-        device=trainer.device,
+        parallel_dims=environment.parallel_dims,
+        device=environment.device,
         param_context=trainer.param_context,
         loss_sum=trainer.loss_sum,
+        error_group=error_group,
     )
 
     # The checkpointer captures the loader cursor alongside model state.
-    with synchronize_local_errors("Dataloader construction"):
+    with synchronize_local_errors("Dataloader construction", group=error_group):
         trainer.dataloader = build_training_dataloader(
-            cfg, parallel_dims=trainer.parallel_dims
+            cfg, parallel_dims=environment.parallel_dims
         )
 
     # Counters the checkpoint carries. Kept as plain ints so a resumed run
@@ -625,33 +613,35 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
 
     trainer.checkpointer = build_checkpointer(
         cfg,
-        model_config,
+        prepared_model.config,
         model_assembly=model_assembly,
         optimizer_stack=optimizer_stack,
         dataloader=trainer.dataloader,
-        train_state=trainer,
-        device=trainer.device,
-        parallel_dims=trainer.parallel_dims,
+        train_state=trainer.progress,
+        device=environment.device,
+        parallel_dims=environment.parallel_dims,
+        error_group=error_group,
     )
 
     trainer.metrics = build_metrics_processor(
         cfg,
-        model_config,
-        parallel_dims=trainer.parallel_dims,
-        num_parameters=num_parameters,
-        num_trainable_parameters=num_trainable_parameters,
+        prepared_model.config,
+        parallel_dims=environment.parallel_dims,
+        num_parameters=prepared_model.num_parameters,
+        num_trainable_parameters=prepared_model.num_trainable_parameters,
+        error_group=error_group,
     )
-    trainer.training_observer = TrainingObserver(trainer.metrics, trainer.device)
+    trainer.training_observer = TrainingObserver(
+        trainer.metrics, environment.device, group=error_group
+    )
     trainer.dispatch_timers = []
     if cfg.metrics.measure_moe_dispatch:
-        for part in trainer.model_parts:
-            for module in part.modules():
-                # Dedicated fused forward implementations do not use this
-                # dispatch boundary and must not report a vacuous zero timer.
-                if type(module) is RoutedExperts:
-                    timer = DispatchTimer()
-                    module.dispatch_observer = timer
-                    trainer.dispatch_timers.append(timer)
+        with synchronize_local_errors(
+            "Dispatch observer installation", group=error_group
+        ):
+            trainer.dispatch_timers = install_dispatch_timers(
+                model_assembly.model_parts
+            )
         if not trainer.dispatch_timers:
             logging_utils.get_logger(__name__).warning(
                 "Dispatch timing requested, but no native RoutedExperts boundary "
@@ -661,7 +651,7 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
         reset_activation_swap_metrics()
     # The trainer synchronizes PP loss metrics to every stage before logging.
     logging_utils.set_log_ranks(cfg.metrics.log_ranks)
-    if trainer.device.type == "npu":
+    if environment.device.type == "npu":
         logging_utils.get_logger(__name__).info(
             "NPU step guards use explicit synchronous scalar reads; "
             "loss/gradient and valid-token checks remain enabled"

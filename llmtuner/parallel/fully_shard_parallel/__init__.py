@@ -1,7 +1,8 @@
 """FSDP public API.
 
-``fully_shard_parallel.py`` is the runtime entry, ``plan.py`` owns pattern and
-prefetch plans, ``policies.py`` owns shared runtime policies, and
+``fully_shard_parallel.py`` is the runtime entry, ``plan.py`` resolves ownership
+and unit policies, ``pattern.py`` executes them and configures prefetch,
+``policies.py`` owns shared runtime policies, and
 ``fine_grained.py`` selects the PyTorch 2.14 strategy.
 
 Public symbols are loaded on request; importing a supporting module does not
@@ -21,8 +22,8 @@ _EXPORT_SOURCES = {
     "iter_transformer_layers": "fully_shard_parallel",
     "resolve_fsdp_mesh": "fully_shard_parallel",
     "resolve_sparse_fsdp_mesh": "fully_shard_parallel",
-    "apply_fsdp_by_pattern": "plan",
-    "set_fsdp_prefetch_windows": "plan",
+    "apply_fsdp_by_pattern": "pattern",
+    "set_fsdp_prefetch_windows": "pattern",
 }
 
 __all__ = sorted(_EXPORT_SOURCES)

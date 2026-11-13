@@ -11,6 +11,7 @@ from contextlib import nullcontext
 from typing import Any
 
 import torch
+from torch.distributed import ProcessGroup
 
 from ....accelerator.collectives import synchronize_local_errors
 from ...state import ModelStateFormat
@@ -35,11 +36,13 @@ def convert_kimi_expert_state(
     num_experts: int,
     to_hf: bool,
     coordinate_errors: bool = False,
+    error_group: ProcessGroup | None = None,
 ) -> dict[str, Any]:
     """Map grouped weights and replicated state without dropping keys.
 
-    ``coordinate_errors`` requires all world ranks to participate. It coordinates
-    metadata validation only; failures inside tensor communication remain fatal.
+    ``coordinate_errors`` requires every error-group member to participate;
+    None retains default-group behavior. It coordinates metadata validation
+    only; failures inside tensor communication remain fatal.
     """
     result = {}
     stacks: dict[str, dict[int, torch.Tensor]] = {}
@@ -53,7 +56,7 @@ def convert_kimi_expert_state(
     # Validate only keys and tensor metadata before any tensor operation.
     # DTensor unbind/stack below may communicate and must stay outside.
     with (
-        synchronize_local_errors("Kimi checkpoint mapping")
+        synchronize_local_errors("Kimi checkpoint mapping", group=error_group)
         if coordinate_errors
         else nullcontext()
     ):
@@ -284,7 +287,19 @@ class KimiStateFormat(ModelStateFormat):
         self.grouped_experts = expert_parallel
         self.coordinates_conversion = expert_parallel
 
-    def convert_state(self, state: dict[str, Any], *, to_hf: bool) -> dict[str, Any]:
+    def supports_ep_initial_load(
+        self, *, tp_degree: int, sharded_tensor_parallel: bool
+    ) -> bool:
+        """The Kimi format owns conversion of complete external expert stacks."""
+        return True
+
+    def convert_state(
+        self,
+        state: dict[str, Any],
+        *,
+        to_hf: bool,
+        error_group: ProcessGroup | None = None,
+    ) -> dict[str, Any]:
         if not self.grouped_experts:
             return state
         return convert_kimi_expert_state(
@@ -292,4 +307,5 @@ class KimiStateFormat(ModelStateFormat):
             num_experts=self.config.num_experts,
             to_hf=to_hf,
             coordinate_errors=True,
+            error_group=error_group,
         )

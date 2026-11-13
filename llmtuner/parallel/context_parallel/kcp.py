@@ -5,18 +5,26 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import wraps
+from typing import Any
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_comm_device, get_world_size
 from ...models.contracts import DecoderStructure
-from ...models.kimi.kimi_k3.delta_attention import KimiDeltaAttention
+from ...models.kimi.kimi_k3.delta_attention import (
+    KimiDeltaAttention,
+    forward_context_parallel_kda,
+    validate_context_parallel_kda,
+)
 from ...models.kimi.kimi_k3.latent_attention import KimiLatentAttention
+from ..plan import ParallelPlan, PlanTarget
 from .attention import HeadToSeq, SeqToHead
 
 try:
@@ -39,55 +47,28 @@ def _kcp_runtime():
     return causal_conv1d, chunk_kda, build_cp_context
 
 
-def kcp_kda_forward(original_forward, group):
-    """Wrap a Transformers KDA module with sequence-state parallel kernels."""
+def kcp_kda_forward(
+    original_forward: Callable[..., torch.Tensor], group: dist.ProcessGroup
+) -> Callable[..., torch.Tensor]:
+    """Bind model-owned KDA mathematics to a sequence-state parallel context."""
 
     @wraps(original_forward)
     def forward(
-        module, hidden_states, attention_mask=None, cache_params=None, **kwargs
-    ):
+        module: KimiDeltaAttention,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        cache_params: Any = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
         with synchronize_local_errors("KCP KDA input validation", group=group):
-            if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
-                raise ValueError("KCP KDA requires [1, local_sequence, hidden] input")
-            if hidden_states.shape[1] == 0:
-                raise ValueError("KCP KDA requires a nonempty local sequence")
-            if cache_params is not None or kwargs.get("cu_seqlens") is not None:
-                raise ValueError("KCP KDA does not support cache or packed cu_seqlens")
-            if attention_mask is not None and (
-                attention_mask.shape != hidden_states.shape[:2]
-                or attention_mask.device != hidden_states.device
-            ):
-                raise ValueError(
-                    "KCP attention_mask must match the local [1, sequence] "
-                    "shape and input device"
-                )
-            if attention_mask is not None and not torch.all(attention_mask == 1):
-                raise ValueError(
-                    "KCP KDA does not yet support padding: zeroing padded tokens "
-                    "does not preserve compacted convolution/recurrent state"
-                )
-            kernel_size = module.q_conv1d.weight.size(-1)
-            if kernel_size <= 1:
-                raise ValueError(
-                    f"KCP KDA convolution kernel size must be greater than 1; "
-                    f"got {kernel_size}"
-                )
-            if module.head_k_dim > 256:
-                raise ValueError(
-                    f"KCP KDA key head dimension must be at most 256; "
-                    f"got {module.head_k_dim}"
-                )
-            lower_bound = module.gate_lower_bound
-            if lower_bound is not None and not -5 <= lower_bound < 0:
-                raise ValueError(
-                    f"KCP KDA gate lower bound must be in [-5, 0); got {lower_bound}"
-                )
-            if any(
-                getattr(module, f"{name}_conv1d").weight.size(-1) != kernel_size
-                for name in ("k", "v")
-            ):
-                raise ValueError("KCP KDA requires matching Q/K/V convolution kernels")
-        batch, local_sequence, _ = hidden_states.shape
+            kernel_size = validate_context_parallel_kda(
+                module,
+                hidden_states,
+                attention_mask=attention_mask,
+                cache_params=cache_params,
+                cu_seqlens=kwargs.get("cu_seqlens"),
+            )
+        local_sequence = hidden_states.shape[1]
         if get_world_size(group) > 1:
             metadata = torch.tensor(
                 [
@@ -123,56 +104,13 @@ def kcp_kda_forward(original_forward, group):
             conv1d_kernel_size=kernel_size,
         )
 
-        def project(name):
-            projection = getattr(module, f"{name}_proj")(hidden_states)
-            convolution = getattr(module, f"{name}_conv1d")
-            result = causal_conv1d(
-                x=projection,
-                weight=convolution.weight.squeeze(1),
-                bias=convolution.bias,
-                activation=convolution.activation,
-                initial_state=None,
-                output_final_state=False,
-                cp_context=context,
-            )
-            return result[0] if isinstance(result, tuple) else result
-
-        query, key, value = (project(name) for name in ("q", "k", "v"))
-        decay = module.f_b_proj(module.f_a_proj(hidden_states))
-        beta = module.b_proj(hidden_states).float().sigmoid()
-        query = query.view(batch, local_sequence, module.num_heads, module.head_k_dim)
-        key = key.view(batch, local_sequence, module.num_heads, module.head_k_dim)
-        value = value.view(batch, local_sequence, module.num_heads, module.head_dim)
-        decay = decay.view(batch, local_sequence, module.num_heads, module.head_k_dim)
-        beta = beta.view(batch, local_sequence, module.num_heads)
-        output = chunk_kda(
-            q=query,
-            k=key,
-            v=value,
-            g=decay,
-            beta=beta,
-            A_log=module.A_log,
-            dt_bias=module.dt_bias,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=False,
-            safe_gate=lower_bound is not None,
-            lower_bound=lower_bound,
-            state_v_first=False,
-            disable_recompute=getattr(module.config, "skip_kda_recompute", False),
-            cp_context=context,
+        return forward_context_parallel_kda(
+            module,
+            hidden_states,
+            context=context,
+            causal_conv1d=causal_conv1d,
+            chunk_kda=chunk_kda,
         )
-        output = output[0] if isinstance(output, tuple) else output
-        gate = (
-            module.g_proj(hidden_states)
-            if module.use_full_rank_gate
-            else module.g_b_proj(module.g_a_proj(hidden_states))
-        ).view(batch, local_sequence, module.num_heads, module.head_dim)
-        output = module.o_norm(output, gate)
-        output = module.o_proj(output.reshape(batch, local_sequence, -1))
-        return output
 
     return forward
 
@@ -268,12 +206,14 @@ def kcp_mla_attention(group):
     return forward
 
 
-def apply_kcp(model: nn.Module, cp_mesh) -> int:
-    """Install KCP on declared Kimi attention targets and return the KDA count.
+def resolve_kcp_plan(model: nn.Module, *, degree: int) -> ParallelPlan:
+    """Bind KCP targets without loading kernels or modifying model forwards.
 
-    Explicit models never scan unrelated modules for projection attributes.
-    Structural detection remains limited to legacy raw-module callers.
+    Explicit models consume declared attention slots. Structural detection is
+    retained only for existing raw-module callers. Aliases install once.
     """
+    if type(degree) is not int or degree < 1:
+        raise ValueError("KCP degree must be a positive integer")
     structure = getattr(model, "decoder_structure", None)
     if structure is not None:
         if not isinstance(structure, DecoderStructure):
@@ -281,13 +221,16 @@ def apply_kcp(model: nn.Module, cp_mesh) -> int:
         # Preserve first-occurrence order while installing each shared module
         # once. Declaration binding itself retains every decoder slot.
         attentions = tuple(dict.fromkeys(structure.bind_attentions(model)))
-        if any(
-            not isinstance(module, KimiDeltaAttention | KimiLatentAttention)
+        layouts = {
+            module: getattr(module, "context_parallel_layout", None)
             for module in attentions
+        }
+        if any(
+            layout not in ("kda_state", "mla_ulysses") for layout in layouts.values()
         ):
             raise ValueError("KCP requires declared Kimi KDA/MLA attention modules")
-        modules = [m for m in attentions if isinstance(m, KimiDeltaAttention)]
-        mla_modules = [m for m in attentions if isinstance(m, KimiLatentAttention)]
+        modules = [m for m in attentions if layouts[m] == "kda_state"]
+        mla_modules = [m for m in attentions if layouts[m] == "mla_ulysses"]
     else:
         required = ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias")
         attentions = tuple(model.modules())
@@ -310,19 +253,92 @@ def apply_kcp(model: nn.Module, cp_mesh) -> int:
             if all(hasattr(module, name) for name in required)
         ]
         mla_modules = [m for m in attentions if isinstance(m, KimiLatentAttention)]
-    if not modules:
+    if not modules and not (structure is not None and mla_modules):
         raise ValueError("KCP selected but no Kimi Delta Attention module was found")
+    for module in mla_modules:
+        if module.num_heads % degree:
+            raise ValueError("KCP MLA heads must be divisible by the CP degree")
+    paths = {
+        id(module): path for path, module in reversed(tuple(model.named_modules()))
+    }
+    return ParallelPlan(
+        stage="cp",
+        degree=degree,
+        implementation="kcp",
+        targets=tuple(
+            PlanTarget(paths[id(module)], "attention", module, layout)
+            for layout, targets in (
+                ("kda_state", modules),
+                ("mla_ulysses", mla_modules),
+            )
+            for module in targets
+        ),
+        operations=("bind_kda_context", "bind_mla_exchange"),
+        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+        buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+    )
+
+
+def apply_kcp(
+    model: nn.Module,
+    cp_mesh: DeviceMesh,
+    *,
+    resolved_plan: ParallelPlan | None = None,
+) -> int:
+    """Prepare all KCP wrappers, then install them without stacking wrappers.
+
+    Runtime/group resources remain explicit. A pre-resolved plan belongs to the
+    current local instance and must be rebound after PP or parameter conversion.
+    """
+    degree = cp_mesh.size() if cp_mesh is not None else 1
+    plan = resolved_plan or resolve_kcp_plan(model, degree=degree)
+    if plan.stage != "cp" or plan.implementation != "kcp" or plan.degree != degree:
+        raise ValueError("KCP plan does not match the requested execution")
+    plan.validate_binding(model)
+    # Metadata checks precede optional runtime loading and wrapper creation.
+    # A frozen plan does not freeze model-owned role declarations.
+    kda_count = 0
+    seen: set[int] = set()
+    for target in plan.targets:
+        module = target.module
+        if target.kind != "attention" or module is None:
+            raise ValueError("KCP plan requires bound attention targets")
+        if id(module) in seen:
+            raise ValueError("KCP plan contains duplicate attention targets")
+        seen.add(id(module))
+        if plan.decoder_structure is not None and (
+            getattr(module, "context_parallel_layout", None) != target.layout
+        ):
+            raise ValueError(f"Stale KCP attention layout: {target.path}")
+        if target.layout == "mla_ulysses":
+            if module.num_heads % degree:
+                raise ValueError("KCP MLA heads must be divisible by the CP degree")
+        elif target.layout == "kda_state":
+            kda_count += 1
+        else:
+            raise ValueError(f"Unsupported KCP target layout: {target.layout}")
+    if plan.decoder_structure is not None:
+        expected = {
+            id(module) for module in plan.decoder_structure.bind_attentions(model)
+        }
+        if seen != expected:
+            raise ValueError("KCP plan must cover all declared attention slots")
+    if not kda_count and (plan.decoder_structure is None or not seen):
+        raise ValueError("KCP plan requires at least one KDA target")
     _kcp_runtime()
     group = cp_mesh.get_group()
-    for module in mla_modules:
-        if module.num_heads % group.size():
-            raise ValueError("KCP MLA heads must be divisible by the CP degree")
-    for module in mla_modules:
-        module._kcp_attention = kcp_mla_attention(group)
-    for module in modules:
-        wrapped = kcp_kda_forward(type(module).forward, group)
-        module.forward = wrapped.__get__(module, type(module))
-    return len(modules)
+    pending = []
+    for target in plan.targets:
+        module = target.module
+        if target.layout == "mla_ulysses":
+            pending.append((module, "_kcp_attention", kcp_mla_attention(group)))
+        else:
+            wrapped = kcp_kda_forward(type(module).forward, group)
+            pending.append((module, "forward", wrapped.__get__(module, type(module))))
+    for module, attribute, forward in pending:
+        setattr(module, attribute, forward)
+    return kda_count
 
 
-__all__ = ["apply_kcp", "kcp_kda_forward"]
+__all__ = ["apply_kcp", "kcp_kda_forward", "resolve_kcp_plan"]

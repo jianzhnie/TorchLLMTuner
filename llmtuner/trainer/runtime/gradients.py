@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING
+from collections.abc import Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -17,7 +17,9 @@ from .reductions import TrainingReductionMeshes
 from .reference_norm_layout import clip_grad_norm_
 
 if TYPE_CHECKING:
-    from ..trainer import Trainer
+    from torch.distributed import ProcessGroup
+
+    from ...parallel.topology import ParallelTopology
 
 
 def unique_parameters(
@@ -43,23 +45,22 @@ def expert_parameter_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
     }
 
 
-def allreduce_fsdp_excluded_grads(trainer: Trainer) -> None:
+def allreduce_fsdp_excluded_grads(
+    model_parts: Sequence[torch.nn.Module], *, parallel_dims: ParallelTopology | None
+) -> None:
     """Sum non-FSDP gradients over their dense or expert replica axes."""
-    if trainer.parallel_dims is None:
+    if parallel_dims is None:
         return
     expert_ids = (
-        expert_parameter_ids(trainer.model_parts)
-        if trainer.parallel_dims.ep_enabled
-        else set()
+        expert_parameter_ids(model_parts) if parallel_dims.ep_enabled else set()
     )
     meshes = {
-        False: [trainer.parallel_dims.get_optional_mesh(axis) for axis in ("dp", "cp")],
+        False: [parallel_dims.get_optional_mesh(axis) for axis in ("dp", "cp")],
         True: [
-            trainer.parallel_dims.get_optional_mesh(axis)
-            for axis in ("dp_replicate", "efsdp")
+            parallel_dims.get_optional_mesh(axis) for axis in ("dp_replicate", "efsdp")
         ],
     }
-    for parameter in unique_parameters(trainer.model_parts):
+    for parameter in unique_parameters(model_parts):
         if not parameter.requires_grad or isinstance(parameter, DTensor):
             continue
         for mesh in meshes[id(parameter) in expert_ids]:
@@ -79,20 +80,18 @@ def allreduce_fsdp_excluded_grads(trainer: Trainer) -> None:
             all_reduce(parameter.grad, group=group)
 
 
-def allreduce_replicated_tp_grads(trainer: Trainer) -> None:
+def allreduce_replicated_tp_grads(
+    model_parts: Sequence[torch.nn.Module], *, parallel_dims: ParallelTopology | None
+) -> None:
     """Sum gradients of TP-replicated parameters over partial token shards."""
-    tp_mesh = (
-        None
-        if trainer.parallel_dims is None
-        else trainer.parallel_dims.get_optional_mesh("tp")
-    )
+    tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
     if tp_mesh is None:
         return
-    sharded_ids = tp_sharded_param_ids(trainer.model_parts)
+    sharded_ids = tp_sharded_param_ids(model_parts)
     group = tp_mesh.get_group()
     parameters = [
         param
-        for param in unique_parameters(trainer.model_parts)
+        for param in unique_parameters(model_parts)
         if param.requires_grad and id(param) not in sharded_ids
     ]
     if not parameters:
@@ -135,27 +134,32 @@ def check_step_condition(condition: torch.Tensor, message: str) -> None:
     torch._assert_async(condition, message)
 
 
-def check_finite(trainer: Trainer, step_is_finite: torch.Tensor) -> None:
+def check_finite(step: int, step_is_finite: torch.Tensor) -> None:
     """Stop before updating parameters when the global step is non-finite."""
     check_step_condition(
         step_is_finite,
-        f"Loss or gradient norm is not finite at step {trainer.step}. "
+        f"Loss or gradient norm is not finite at step {step}. "
         "Stopping before the optimizer update, since every later number "
         "would be garbage.",
     )
 
 
-def grad_norm_options(trainer: Trainer) -> dict:
-    if getattr(trainer.cfg, "grad_norm_precision", "float32") == "float32":
+def grad_norm_options(
+    model_parts: Sequence[torch.nn.Module],
+    *,
+    precision: str,
+    expert_reduce_layout: str,
+) -> dict[str, Any]:
+    """Resolve norm representation from explicit numerical/layout policies."""
+    if precision == "float32":
         return {}
-    fsdp = getattr(getattr(trainer.cfg, "parallel", None), "fsdp_config", None)
-    if getattr(fsdp, "fsdp_expert_reduce_layout", "storage") == "split":
+    if expert_reduce_layout == "split":
         return {
             "norm_precision": "parameter",
-            "reference_model_parts": trainer.model_parts,
+            "reference_model_parts": model_parts,
         }
     packed_parameters = {}
-    for part in trainer.model_parts:
+    for part in model_parts:
         for module in part.modules():
             if isinstance(module, NpuBaselineGroupedExperts):
                 pair = (module.w1_EFD, module.w3_EFD)
@@ -163,38 +167,45 @@ def grad_norm_options(trainer: Trainer) -> dict:
                     continue
                 packed_parameters.setdefault(tuple(map(id, pair)), pair)
     return {
-        "norm_precision": trainer.cfg.grad_norm_precision,
+        "norm_precision": precision,
         "packed_parameters": list(packed_parameters.values()),
     }
 
 
 def clip_and_check_finite(
-    trainer: Trainer,
+    model_parts: Sequence[torch.nn.Module],
     *,
+    parallel_dims: ParallelTopology | None,
+    max_norm: float,
+    precision: str,
+    expert_reduce_layout: str,
+    step: int,
+    error_group: ProcessGroup | None = None,
     reduction_meshes: TrainingReductionMeshes,
     loss_is_finite: torch.Tensor,
 ) -> torch.Tensor:
     """Clip gradients and produce one rank-uniform finite-step verdict."""
-    trainer.before_gradient_clipping()
     pp_mesh = reduction_meshes.pp_mesh
-    parameters = list(unique_parameters(trainer.model_parts))
-    expert_ids = expert_parameter_ids(trainer.model_parts)
+    parameters = list(unique_parameters(model_parts))
+    expert_ids = expert_parameter_ids(model_parts)
     expert_parameters = [p for p in parameters if id(p) in expert_ids]
     ep_mesh = (
-        trainer.parallel_dims.get_optional_mesh("ep")
-        if trainer.parallel_dims is not None and trainer.parallel_dims.ep_enabled
+        parallel_dims.get_optional_mesh("ep")
+        if parallel_dims is not None and parallel_dims.ep_enabled
         else None
     )
     tp_mesh = (
-        trainer.parallel_dims.get_optional_mesh("tp")
-        if trainer.parallel_dims is not None and trainer.parallel_dims.tp_enabled
+        parallel_dims.get_optional_mesh("tp")
+        if parallel_dims is not None and parallel_dims.tp_enabled
         else None
     )
-    tp_sharded_ids = tp_sharded_param_ids(trainer.model_parts) if tp_mesh else set()
-    norm_options = grad_norm_options(trainer)
+    tp_sharded_ids = tp_sharded_param_ids(model_parts) if tp_mesh else set()
+    norm_options = grad_norm_options(
+        model_parts, precision=precision, expert_reduce_layout=expert_reduce_layout
+    )
     grad_norm = clip_grad_norm_(
         parameters,
-        max_norm=trainer.cfg.max_norm,
+        max_norm=max_norm,
         foreach=True,
         pp_mesh=pp_mesh,
         ep_mesh=ep_mesh,
@@ -210,6 +221,6 @@ def clip_and_check_finite(
 
     step_is_finite = loss_is_finite
     step_is_finite.logical_and_(torch.isfinite(grad_norm).all())
-    all_reduce(step_is_finite, op="min")
-    check_finite(trainer, step_is_finite)
+    all_reduce(step_is_finite, op="min", group=error_group)
+    check_finite(step, step_is_finite)
     return grad_norm

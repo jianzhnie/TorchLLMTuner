@@ -10,11 +10,12 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...accelerator.collectives import synchronize_local_errors
 from ...utils.logging import get_logger
 from .. import compatibility
-from ..plan import ParallelPlan
+from ..plan import ParallelPlan, ReplacementObserver
 from .domino_dispatch import DominoRoutedExperts
 from .mc2_dispatch import MC2RoutedExperts
 from .mc2_ops import validate_mc2_world_size
-from .model_replacement import MoEReplacementObserver, resolve_ep_plan, swap_moe_blocks
+from .model_replacement import swap_moe_blocks
+from .plan import resolve_ep_plan
 
 logger = get_logger(__name__)
 
@@ -27,7 +28,7 @@ def apply_ep(
     *,
     ep_group: dist.ProcessGroup | None = None,
     error_group: dist.ProcessGroup | None = None,
-    on_replacement: MoEReplacementObserver | None = None,
+    on_replacement: ReplacementObserver | None = None,
     resolved_plan: ParallelPlan | None = None,
 ) -> nn.Module:
     """Install the EP-capable MoE implementation for declared model blocks.
@@ -46,8 +47,8 @@ def apply_ep(
 
     The swap moves weights, so it must happen before FSDP wraps the model.
     With a multi-rank group each rank keeps ``num_experts / ep`` of them and
-    tokens cross ranks by all-to-all; the two are orthogonal to the CP
-    attention kernel, so CP and EP compose freely.
+    tokens cross ranks by all-to-all. CP composition remains subject to the
+    model and backend capability checks; stage order does not imply support.
     """
     coordination_group = error_group if error_group is not None else ep_group
     with synchronize_local_errors("EP assembly validation", group=coordination_group):
@@ -69,12 +70,9 @@ def apply_ep(
                 "from the sparse mesh's 'ep' axis (parallelize_model "
                 "resolves it from parallel_dims)."
             )
-        if cfg.tp_size == 1:
-            validate = getattr(model, "validate_parallel", None)
-            if validate is not None:
-                # TP-only preflight does not cover an EP-only run. Models with
-                # explicit partial TP overrides are validated by that resolver.
-                validate(tp_degree=1, ep_degree=cfg.ep_size)
+        # The conversion entry validates model geometry after checking the
+        # resolved bindings. Keep one rule for direct and pre-resolved plans;
+        # a full native-model check is invalid for explicit partial overrides.
         swapped = swap_moe_blocks(
             model,
             ep_group=ep_group,

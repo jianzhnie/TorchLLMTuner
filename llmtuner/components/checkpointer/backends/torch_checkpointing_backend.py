@@ -667,7 +667,12 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                     metadata_format=hf_metadata_format,
                 )
             model_state = states[MODEL]
-            native_state = adapt_hf_model_state(self.sd_adapter, model_state, hf_state)
+            native_state = adapt_hf_model_state(
+                self.sd_adapter,
+                model_state,
+                hf_state,
+                error_group=getattr(self.sd_adapter, "error_group", None),
+            )
             model_state.load_state_dict(native_state)
         else:
             loaded = self._manager.load(

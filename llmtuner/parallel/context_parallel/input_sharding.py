@@ -60,7 +60,7 @@ def _contiguous_sequence_partition(
 
     Chunk every buffer along its sequence dim and keep this rank's chunk. Mesh
     rank order is the order the fused TP collectives reassemble the sequence in
-    (``tensor_parallel/linear_ops.py``) and the order the CP K/V gather assumes,
+    (``accelerator/linear_collectives.py``) and the order the CP K/V gather assumes,
     so this is the same partition torch's private helper produces when no load
     balancer is attached.
     """

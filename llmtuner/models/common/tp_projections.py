@@ -4,7 +4,7 @@ Vendored from torchtitan ``models/common/async_linear.py`` (renamed from
 ``dist_gemm.py`` upstream in 9e159aed7).
 These replace the stock QKV, output and SwiGLU projections. They move the TP
 collective inside the GEMM, using the autograd Functions in
-``llmtuner/parallel/tensor_parallel/linear_ops.py`` (which holds the collective+GEMM
+``llmtuner/accelerator/linear_collectives.py`` (which holds the collective+GEMM
 math itself; this file is only the wiring and the fallbacks).
 
 What changed from upstream:
@@ -34,13 +34,13 @@ import torch
 import torch.nn as nn
 from torch.distributed import ProcessGroup
 
-from llmtuner.models.common.activation import ActivationFn
-from llmtuner.models.common.attention.qkv import QKVLinear
-from llmtuner.models.common.feed_forward import FeedForward
-from llmtuner.parallel.tensor_parallel.linear_ops import (
+from llmtuner.accelerator.linear_collectives import (
     AllGatherLinear,
     LinearReduceScatter,
 )
+from llmtuner.models.common.activation import ActivationFn
+from llmtuner.models.common.attention.qkv import QKVLinear
+from llmtuner.models.common.feed_forward import FeedForward
 
 from ...utils.logging import get_logger
 

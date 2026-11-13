@@ -1,9 +1,7 @@
-"""Expert parallelism: swap HF MoE blocks for the EP-capable llmtuner MoE.
+"""Expert parallelism for explicitly declared model-owned MoE blocks.
 
 ``expert_parallel.py`` is the public entry. ``block_conversion.py`` constructs
-native MoE blocks, while ``hf_inspection.py`` is loaded only for legacy external
-layouts,
-``model_replacement.py`` replaces them in a complete model, and
+native MoE blocks from explicit contracts; ``model_replacement.py`` replaces them in a complete model, and
 ``checkpointing.py`` converts expert checkpoint state. ``token_dispatch.py``
 implements local and distributed token dispatch and combine operations.
 ``torchao_dispatch.py`` adds the optional TorchAO padding adapter.

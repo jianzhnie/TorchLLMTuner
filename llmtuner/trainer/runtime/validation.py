@@ -13,21 +13,16 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from llmtuner.accelerator.capabilities import has as capability
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.parallel.compatibility import (
     chunked_loss_validation,
     validation_once_requires_dp1,
     validation_once_requires_finite_corpus,
 )
-from llmtuner.parallel.pipeline_parallel.microbatch_drivers import (
-    run_eval_microbatches,
-)
 from llmtuner.utils.logging import get_logger
 from llmtuner.utils.seeding import preserve_rng_state
 
 from ...accelerator.collectives import all_reduce, synchronize_local_errors
-from ...accelerator.spmd import spmd_context
 from ...datasets.contracts import (
     BaseDataLoader,
     Batch,
@@ -37,17 +32,18 @@ from ...datasets.contracts import (
 from ...datasets.loader_builder import build_dataloader
 from .batch import (
     fetch_batch,
-    prepare_model_inputs,
     resolve_batch_size_per_rank,
     resolve_data_parallel_rank,
 )
-from .engine import loss_vocab_kwargs, model_output_value
-from .pipeline import prepare_pipeline_inputs
+from .engine import evaluate_dense_batch
+from .pipeline import run_pipeline_eval
 from .reductions import resolve_loss_reduction_meshes
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
+    from ...config.llmtuner_config import LLMTunerConfig
+    from ...parallel.topology import ParallelTopology
     from ..trainer import Trainer
 
 
@@ -67,20 +63,22 @@ def close_validation_dataloader(loader: BaseDataLoader, *, failed: bool) -> None
 
 
 def create_validation_dataloader(
-    self: Trainer, validation: ValidationConfig
+    cfg: LLMTunerConfig,
+    parallel_dims: ParallelTopology | None,
+    validation: ValidationConfig,
 ) -> BaseDataLoader:
     """The pass's temporary loader: fresh per pass, closed when the pass ends.
 
     ``steps=-1`` reads it to exhaustion (built with repeat=False); a positive
     ``steps`` bounds the pass (built repeating, so the bound is reachable).
     """
-    dp_rank, dp_world_size = resolve_data_parallel_rank(self.parallel_dims)
-    batch_size_per_rank = resolve_batch_size_per_rank(self.cfg, dp_world_size)
+    dp_rank, dp_world_size = resolve_data_parallel_rank(parallel_dims)
+    batch_size_per_rank = resolve_batch_size_per_rank(cfg, dp_world_size)
     return build_dataloader(
-        self.cfg,
+        cfg,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
-        num_tokens_per_batch=batch_size_per_rank * self.cfg.max_seq_len,
+        num_tokens_per_batch=batch_size_per_rank * cfg.max_seq_len,
         repeat=validation.steps != -1,
         dataset=validation.dataset,
     )
@@ -99,7 +97,9 @@ def count_validation_batch_tokens(
     """
     # Counting and metric updates are local and may fail on only one rank.
     # Agree on success before any peer enters the DP token collective.
-    with synchronize_local_errors("Validation token accounting"):
+    with synchronize_local_errors(
+        "Validation token accounting", group=self.error_group
+    ):
         labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
         self.metrics.add_tokens(labels.numel())
         local_valid_tokens = self.count_valid_tokens(batch)
@@ -131,7 +131,9 @@ def finalize_validation(
     """
     # Preflight and reporting are local phases. Loss reduction remains outside
     # those boundaries, since a collective failure cannot be coordinated here.
-    with synchronize_local_errors("Validation result preflight"):
+    with synchronize_local_errors(
+        "Validation result preflight", group=self.error_group
+    ):
         if num_steps == 0:
             raise ValueError(
                 "Validation ran zero batches on this rank. Check that the "
@@ -153,7 +155,9 @@ def finalize_validation(
         all_reduce(global_loss_sum, group=loss_mesh.get_group())
     # Non-final PP stages must participate even though only the final stage
     # checks and logs the loss; otherwise a sink failure strands their next step.
-    with synchronize_local_errors("Validation result reporting"):
+    with synchronize_local_errors(
+        "Validation result reporting", group=self.error_group
+    ):
         if global_loss_sum is not None:
             global_avg_loss = float(global_loss_sum) / num_global_valid_tokens
             if not math.isfinite(global_avg_loss):
@@ -221,7 +225,9 @@ def validate(self: Trainer, step: int) -> None:
             self.checkpointer.maybe_wait_for_staging()
     except BaseException as error:
         staging_failure = error
-    with synchronize_local_errors("Validation checkpoint staging"):
+    with synchronize_local_errors(
+        "Validation checkpoint staging", group=self.error_group
+    ):
         if staging_failure is not None:
             raise staging_failure
 
@@ -250,10 +256,12 @@ def validate(self: Trainer, step: int) -> None:
     with ExitStack() as resources:
         # RNG capture is local and may fail before mode setup. Peers must not
         # begin validation forward until every rank owns its restoration context.
-        with synchronize_local_errors("Validation RNG setup"):
+        with synchronize_local_errors("Validation RNG setup", group=self.error_group):
             resources.enter_context(preserve_rng_state(self.device))
         try:
-            with synchronize_local_errors("Validation mode setup"):
+            with synchronize_local_errors(
+                "Validation mode setup", group=self.error_group
+            ):
                 if validation.dataset is not None:
                     mask_type = self.cfg.dataloader.attention_mask_type(
                         dataset=validation.dataset
@@ -292,7 +300,7 @@ def validate(self: Trainer, step: int) -> None:
             resources.close()
         except BaseException as error:
             rng_failure = error
-        with synchronize_local_errors("Validation RNG cleanup"):
+        with synchronize_local_errors("Validation RNG cleanup", group=self.error_group):
             if rng_failure is not None:
                 raise rng_failure
 
@@ -306,8 +314,12 @@ def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) 
     try:
         # These operations are local. Coordinate before fetch_batch enters its
         # world collective, and retain successful peer loaders for cleanup.
-        with synchronize_local_errors("Validation input initialization"):
-            validation_dataloader = create_validation_dataloader(self, validation)
+        with synchronize_local_errors(
+            "Validation input initialization", group=self.error_group
+        ):
+            validation_dataloader = create_validation_dataloader(
+                self.cfg, self.parallel_dims, validation
+            )
             total_global_valid_tokens = torch.zeros(
                 (), dtype=torch.int64, device=self.device
             )
@@ -316,31 +328,25 @@ def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) 
         num_steps = 0
         while validation.steps == -1 or num_steps < validation.steps:
             try:
-                batch = fetch_batch(data_iterator)
+                batch = fetch_batch(data_iterator, group=self.error_group)
             except (DataloaderExhaustedError, StopIteration):
                 break
             global_valid_tokens = count_validation_batch_tokens(
                 self, batch, dp_mesh=dp_mesh
             )
             if pipeline:
-                loss_sum = evaluate_pipeline_batch(self, batch)
+                loss_sum = run_pipeline_eval(self.training_engine, batch)
             else:
-                inputs, labels, extra_kwargs = prepare_model_inputs(
+                loss_sum = evaluate_dense_batch(
                     self.example_model,
                     batch,
                     device=self.device,
                     parallel_dims=parallel_dims,
                     max_context_length=self.cfg.max_seq_len,
+                    param_context=self.param_context,
+                    loss_sum=self.loss_sum,
+                    error_group=self.error_group,
                 )
-                with self.param_context(), spmd_context(parallel_dims):
-                    logits = model_output_value(
-                        self.example_model(inputs, **extra_kwargs)
-                    )
-                    loss_sum = self.loss_sum(
-                        logits,
-                        labels,
-                        **loss_vocab_kwargs(self.example_model, parallel_dims),
-                    )
             if loss_sum is not None:
                 if accumulated_loss is None:
                     accumulated_loss = loss_sum.detach().clone()
@@ -356,7 +362,9 @@ def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) 
         with (
             nullcontext()
             if failed
-            else synchronize_local_errors("Validation input cleanup")
+            else synchronize_local_errors(
+                "Validation input cleanup", group=self.error_group
+            )
         ):
             if validation_dataloader is not None:
                 close_validation_dataloader(validation_dataloader, failed=failed)
@@ -369,39 +377,3 @@ def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) 
         loss_mesh=loss_mesh,
         step=step,
     )
-
-
-def evaluate_pipeline_batch(
-    self: Trainer, batch: Batch | TrainerBatch
-) -> torch.Tensor | None:
-    """Run forward-only microbatches; only the final PP stage returns a loss sum.
-
-    Pin the schedule denominator to one so its losses are summed cross-entropies.
-    The common validation loop normalizes once at the end; training republishes
-    its denominator before the next optimizer step.
-    """
-    inputs = prepare_pipeline_inputs(self.training_engine, batch)
-    losses: list[torch.Tensor] | None = [] if self.pp_has_last_stage else None
-    with self.param_context(), spmd_context(self.parallel_dims):
-        self.pp_schedule._llmtuner_global_valid_tokens = torch.ones(
-            (), dtype=torch.float32
-        )
-        args = inputs.args if self.pp_has_first_stage else None
-        if capability("pipelining_microbatch_drivers"):
-            self.pp_schedule.eval(
-                arg_mbs=args,
-                kwarg_mbs=inputs.kwargs,
-                target_mbs=inputs.targets,
-                losses=losses,
-            )
-        else:
-            run_eval_microbatches(
-                self.pp_schedule,
-                args=args,
-                kwargs=inputs.kwargs,
-                targets=inputs.targets,
-                losses=losses,
-            )
-    if losses is None:
-        return None
-    return torch.stack([loss.detach() for loss in losses]).sum()

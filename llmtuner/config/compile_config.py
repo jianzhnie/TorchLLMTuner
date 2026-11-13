@@ -20,9 +20,7 @@ class CompileConfig:
     )
     backend: str = field(
         default="inductor",
-        metadata={
-            "help": "torch.compile backend, for example inductor or aot_eager."
-        },
+        metadata={"help": "torch.compile backend, for example inductor or aot_eager."},
     )
     enable_async_tensor_parallel: bool = field(
         default=False,

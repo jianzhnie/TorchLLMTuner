@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -13,24 +14,31 @@ from ...models.common.aux_loss import collect_aux_loss_metrics
 from .reductions import TrainingReductionMeshes
 
 if TYPE_CHECKING:
-    from ..trainer import Trainer
+    from ...parallel.topology import ParallelTopology
+    from .training_observer import DispatchTimer
 
 
-def collect_resource_metrics(trainer: Trainer) -> dict[str, float]:
+def collect_resource_metrics(
+    *,
+    activation_swap_enabled: bool,
+    optimizer: Any,
+    checkpointer: Any,
+    dispatch_timers: Iterable[DispatchTimer] = (),
+) -> dict[str, float]:
     """Rank-local resource counters, explicitly labelled rather than summed.
 
     Activation events are measured only when activation swap is configured.
     Byte counters are cumulative; device transfer seconds consume the log window.
     """
     result = {}
-    if getattr(trainer.cfg, "activation_swap", False):
+    if activation_swap_enabled:
         result.update(
             {
                 f"swap/activation_local/{key}": float(value)
                 for key, value in activation_swap_metrics().items()
             }
         )
-    optimizers = getattr(trainer.optimizer, "optimizers", ())
+    optimizers = getattr(optimizer, "optimizers", ())
     swaps = [optimizer for optimizer in optimizers if isinstance(optimizer, AdamWSwap)]
     if swaps:
         for key in (
@@ -43,8 +51,8 @@ def collect_resource_metrics(trainer: Trainer) -> dict[str, float]:
             result[f"swap/optimizer_local/{key}"] = float(
                 sum(getattr(optimizer, key) for optimizer in swaps)
             )
-    result.update(getattr(trainer.checkpointer, "observation_metrics", {}).copy())
-    timers = getattr(trainer, "dispatch_timers", ())
+    result.update(getattr(checkpointer, "observation_metrics", {}).copy())
+    timers = tuple(dispatch_timers)
     if timers:
         result["moe/local_forward_dispatch_seconds_window"] = sum(
             timer.consume_seconds() for timer in timers
@@ -53,8 +61,12 @@ def collect_resource_metrics(trainer: Trainer) -> dict[str, float]:
 
 
 def build_step_metrics(
-    trainer: Trainer,
     *,
+    ntokens_seen: int,
+    device: torch.device,
+    parallel_dims: ParallelTopology | None,
+    model_parts: list[torch.nn.Module],
+    pp_has_last_stage: bool,
     accumulated_loss: torch.Tensor,
     global_valid_tokens: torch.Tensor,
     local_valid_tokens: int,
@@ -68,7 +80,7 @@ def build_step_metrics(
     pp_mesh = reduction_meshes.pp_mesh
     loss_mesh = reduction_meshes.loss_mesh
     sequence_mesh = reduction_meshes.sequence_mesh
-    if pp_mesh is not None and not trainer.pp_has_last_stage:
+    if pp_mesh is not None and not pp_has_last_stage:
         accumulated_loss = torch.zeros_like(accumulated_loss)
     loss = accumulated_loss / global_valid_tokens
 
@@ -87,14 +99,14 @@ def build_step_metrics(
         if dp_mesh is not None:
             all_reduce(local_max, op="max", group=dp_mesh.get_group())
         ntokens_seen_tensor = torch.tensor(
-            trainer.ntokens_seen, dtype=torch.int64, device=trainer.device
+            ntokens_seen, dtype=torch.int64, device=device
         )
         all_reduce(ntokens_seen_tensor, group=loss_mesh.get_group())
         global_ntokens_seen = float(ntokens_seen_tensor)
     else:
         loss_sum = loss
         local_max = loss.clone()
-        global_ntokens_seen = float(trainer.ntokens_seen)
+        global_ntokens_seen = float(ntokens_seen)
     if pp_mesh is not None:
         all_reduce(loss_sum, group=pp_mesh.get_group())
         all_reduce(local_max, group=pp_mesh.get_group())
@@ -105,10 +117,6 @@ def build_step_metrics(
         "n_tokens_seen": global_ntokens_seen,
     }
     metrics.update(lr_metrics)
-    if trainer.parallel_dims is not None:
-        metrics.update(
-            collect_aux_loss_metrics(
-                trainer.parallel_dims, model_parts=trainer.model_parts
-            )
-        )
+    if parallel_dims is not None:
+        metrics.update(collect_aux_loss_metrics(parallel_dims, model_parts=model_parts))
     return metrics

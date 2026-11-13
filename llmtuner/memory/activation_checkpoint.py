@@ -50,6 +50,7 @@ from ..accelerator.spmd import capture_spmd_context
 from ..errors import EnvironmentUnsupportedError
 from ..models.common.aux_loss import AuxLoss, in_checkpoint_recompute
 from ..models.common.moe.layer import MoE
+from ..models.contracts import DecoderStructure
 from ..utils.logging import get_logger
 from .remat_regions import (
     region_names,
@@ -610,7 +611,13 @@ def apply_ac(
         apply_memory_budget(memory_budget)
         return model
 
-    layers = getattr(model, "layers", None)
+    structure = getattr(model, "decoder_structure", None)
+    if structure is not None:
+        if not isinstance(structure, DecoderStructure):
+            raise TypeError("Activation checkpointing requires a DecoderStructure")
+        layers = structure.bind_blocks(model)
+    else:
+        layers = getattr(model, "layers", None)
     if not isinstance(layers, nn.Module):
         raise TypeError(
             f"apply_ac expects an explicit model (with .layers as nn.Module); got "

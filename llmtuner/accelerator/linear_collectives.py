@@ -35,6 +35,18 @@ import torch.distributed as dist
 
 from llmtuner.accelerator.spmd_backend import spmd
 
+__all__ = [
+    "AllGatherLinear",
+    "LinearReduceScatter",
+    "all_gather_along",
+    "all_gather_linear",
+    "enable_symm_mem",
+    "ensure_symm_mem_ops",
+    "linear_reduce_scatter",
+    "reduce_scatter_along",
+    "resolve_autograd_collectives",
+]
+
 try:
     from torch.distributed import functional_collectives as funcol
 except ImportError:
@@ -59,7 +71,7 @@ def ensure_symm_mem_ops() -> ModuleType:
     return symm_mem
 
 
-def enable_symm_mem(group) -> None:
+def enable_symm_mem(group: dist.ProcessGroup) -> None:
     """Register ``group`` for symmetric-memory collectives.
 
     ``torch.ops.symm_mem.fused_all_gather_matmul`` (and its reduce-scatter dual)
@@ -103,10 +115,6 @@ def resolve_autograd_collectives() -> tuple[
         "install a torch build providing the *_single_autograd or "
         "*_tensor_autograd pair."
     )
-
-
-# Compatibility name retained for downstream collective warmup calls.
-functional_collectives = resolve_autograd_collectives
 
 
 def all_gather_linear(

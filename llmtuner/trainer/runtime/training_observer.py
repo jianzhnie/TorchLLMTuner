@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -18,6 +18,7 @@ import torch.distributed as dist
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...components.metrics import compute_utilization, model_tflops
+from ...models.common.moe.experts import RoutedExperts
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -66,10 +67,45 @@ class DispatchTimer:
         return result
 
 
+def install_dispatch_timers(
+    model_parts: Iterable[torch.nn.Module],
+) -> list[DispatchTimer]:
+    """Observe each native dispatch boundary once, preserving existing timers.
+
+    Dedicated fused implementations do not execute this boundary. Do not attach
+    a timer to subclasses and report a misleading zero. Validate ownership before
+    installation so a custom observer is never silently replaced.
+    """
+    targets = dict.fromkeys(
+        module
+        for part in model_parts
+        for module in part.modules()
+        if type(module) is RoutedExperts
+    )
+    bindings = []
+    for module in targets:
+        observer = module.dispatch_observer
+        if observer is not None and not isinstance(observer, DispatchTimer):
+            raise ValueError("Native expert dispatch already has a different observer")
+        bindings.append((module, observer if observer is not None else DispatchTimer()))
+    for module, timer in bindings:
+        module.dispatch_observer = timer
+    return list(dict.fromkeys(timer for _, timer in bindings))
+
+
 class TrainingObserver:
     """Bounded rolling statistics; warmup restarts on independent resume."""
 
-    def __init__(self, metrics: Any, device: torch.device) -> None:
+    def __init__(
+        self,
+        metrics: Any,
+        device: torch.device,
+        *,
+        group: dist.ProcessGroup | None = None,
+    ) -> None:
+        # This group must span all ranks represented by the global token
+        # counters and peak-FLOPs denominator, including PP/TP replicas.
+        self.group = group
         self.metrics = metrics
         self.device = device
         self.completed = 0
@@ -82,7 +118,7 @@ class TrainingObserver:
             torch.get_device_module(self.device).synchronize(self.device)
 
     def begin(self) -> None:
-        with synchronize_local_errors("Training observation start"):
+        with synchronize_local_errors("Training observation start", group=self.group):
             self.synchronize()
             self.tokens = self.metrics.ntokens_since_last_log
             self.valid = self.metrics.valid_tokens_since_last_log
@@ -90,7 +126,9 @@ class TrainingObserver:
             self.started = time.perf_counter()
 
     def end(self) -> dict[str, float]:
-        with synchronize_local_errors("Training observation snapshot"):
+        with synchronize_local_errors(
+            "Training observation snapshot", group=self.group
+        ):
             self.synchronize()
             elapsed = time.perf_counter() - self.started
             times = torch.tensor(
@@ -108,9 +146,9 @@ class TrainingObserver:
             )
         world = 1
         if dist.is_available() and dist.is_initialized():
-            world = dist.get_world_size()
-            dist.all_reduce(times, op=dist.ReduceOp.MAX)
-            dist.all_reduce(counts)
+            world = dist.get_world_size(self.group)
+            dist.all_reduce(times, op=dist.ReduceOp.MAX, group=self.group)
+            dist.all_reduce(counts, group=self.group)
         seconds, loading = times.tolist()
         replication = self.metrics._non_data_parallel_size
         tokens, valid = (int(value) // replication for value in counts.tolist())

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import torch
+from torch.distributed import ProcessGroup
 
 from ...accelerator.capabilities import has as capability
 from ...accelerator.collectives import synchronize_local_errors
@@ -18,6 +19,7 @@ from ...components.loss import IGNORE_INDEX
 from ...datasets.contracts import Batch, TrainerBatch, require_positive_integer
 from ...parallel import compatibility
 from ...parallel.pipeline_parallel.microbatch_drivers import (
+    run_eval_microbatches,
     run_microbatches,
     schedule_stages,
 )
@@ -25,10 +27,11 @@ from ...parallel.pipeline_parallel.microbatch_drivers import (
 
 class PipelineRuntime(Protocol):
     pp_schedule: Any
+    error_group: ProcessGroup | None
     pp_has_first_stage: bool
     pp_has_last_stage: bool
     parallel_dims: Any
-    _pp_loss_sentinel: torch.Tensor | None
+    pp_loss_sentinel: torch.Tensor | None
 
     def pp_microbatches(
         self, batch: Batch | TrainerBatch
@@ -136,19 +139,21 @@ def split_pipeline_microbatches(
 
 
 def prepare_pipeline_inputs(
-    trainer: PipelineRuntime, batch: Batch | TrainerBatch
+    runtime: PipelineRuntime, batch: Batch | TrainerBatch
 ) -> PipelineInputs:
     """Prepare schedule inputs for the local first/last-stage ownership."""
     arg_mbs: list[tuple[torch.Tensor, ...]] = []
     kwarg_mbs: list[dict[str, Any]] = []
-    target_mbs: list[torch.Tensor] | None = [] if trainer.pp_has_last_stage else None
+    target_mbs: list[torch.Tensor] | None = [] if runtime.pp_has_last_stage else None
     # Splitting must succeed everywhere before preprocessing enters its
     # coordinated boundary once for each resulting microbatch.
-    with synchronize_local_errors("Pipeline input splitting"):
-        microbatches = trainer.pp_microbatches(batch)
+    with synchronize_local_errors(
+        "Pipeline input splitting", group=runtime.error_group
+    ):
+        microbatches = runtime.pp_microbatches(batch)
     for microbatch in microbatches:
-        inputs, labels, extra_kwargs = trainer.preprocess(microbatch)
-        if trainer.pp_has_first_stage:
+        inputs, labels, extra_kwargs = runtime.preprocess(microbatch)
+        if runtime.pp_has_first_stage:
             arg_mbs.append((inputs,))
         kwarg_mbs.append(extra_kwargs)
         if target_mbs is not None:
@@ -158,26 +163,26 @@ def prepare_pipeline_inputs(
 
 
 def run_pipeline_step(
-    trainer: PipelineRuntime,
+    runtime: PipelineRuntime,
     batch: Batch | TrainerBatch,
     *,
     global_valid_tokens: torch.Tensor,
 ) -> torch.Tensor:
     """Drive one PP schedule step and return its unnormalized local loss sum."""
-    inputs = prepare_pipeline_inputs(trainer, batch)
+    inputs = prepare_pipeline_inputs(runtime, batch)
 
-    losses: list[torch.Tensor] | None = [] if trainer.pp_has_last_stage else None
-    with trainer.param_context(), spmd_context(trainer.parallel_dims):
+    losses: list[torch.Tensor] | None = [] if runtime.pp_has_last_stage else None
+    with runtime.param_context(), spmd_context(runtime.parallel_dims):
         # The private driver accepts already-split microbatches. Its setup is
         # normally done by step(), so stage backward flags and runtime state
         # must be initialized explicitly before calling it.
-        trainer.pp_schedule._llmtuner_global_valid_tokens = global_valid_tokens
+        runtime.pp_schedule._llmtuner_global_valid_tokens = global_valid_tokens
         if capability("pipelining_microbatch_drivers"):
-            for stage in schedule_stages(trainer.pp_schedule):
-                stage.has_backward = trainer.pp_schedule._has_backward
+            for stage in schedule_stages(runtime.pp_schedule):
+                stage.has_backward = runtime.pp_schedule._has_backward
                 stage.clear_runtime_states()
-            trainer.pp_schedule._step_microbatches(
-                inputs.args if trainer.pp_has_first_stage else None,
+            runtime.pp_schedule._step_microbatches(
+                inputs.args if runtime.pp_has_first_stage else None,
                 inputs.kwargs,
                 inputs.targets,
                 losses,
@@ -188,18 +193,54 @@ def run_pipeline_step(
             # whole-batch inputs and would swallow these keywords into the model
             # call. Drive ``_step_microbatches`` directly instead.
             run_microbatches(
-                trainer.pp_schedule,
-                args=inputs.args if trainer.pp_has_first_stage else None,
+                runtime.pp_schedule,
+                args=inputs.args if runtime.pp_has_first_stage else None,
                 kwargs=inputs.kwargs,
                 targets=inputs.targets,
                 losses=losses,
             )
 
-    if trainer.pp_has_last_stage:
+    if runtime.pp_has_last_stage:
         assert losses is not None
         # The schedule backpropagated normalized losses. Convert their
         # detached sum to the raw token sum expected by Trainer.train_step.
         detached_losses = [loss.detach() for loss in losses]
         losses.clear()
         return torch.sum(torch.stack(detached_losses)) * global_valid_tokens
-    return trainer._pp_loss_sentinel
+    return runtime.pp_loss_sentinel
+
+
+def run_pipeline_eval(
+    runtime: PipelineRuntime, batch: Batch | TrainerBatch
+) -> torch.Tensor | None:
+    """Run forward-only microbatches; only the final PP stage returns a loss sum.
+
+    Pin the schedule denominator to one so its losses are summed cross-entropies.
+    The common validation loop normalizes once at the end; training republishes
+    its denominator before the next optimizer step.
+    """
+    inputs = prepare_pipeline_inputs(runtime, batch)
+    losses: list[torch.Tensor] | None = [] if runtime.pp_has_last_stage else None
+    with runtime.param_context(), spmd_context(runtime.parallel_dims):
+        runtime.pp_schedule._llmtuner_global_valid_tokens = torch.ones(
+            (), dtype=torch.float32
+        )
+        args = inputs.args if runtime.pp_has_first_stage else None
+        if capability("pipelining_microbatch_drivers"):
+            runtime.pp_schedule.eval(
+                arg_mbs=args,
+                kwarg_mbs=inputs.kwargs,
+                target_mbs=inputs.targets,
+                losses=losses,
+            )
+        else:
+            run_eval_microbatches(
+                runtime.pp_schedule,
+                args=args,
+                kwargs=inputs.kwargs,
+                targets=inputs.targets,
+                losses=losses,
+            )
+    if losses is None:
+        return None
+    return torch.stack([loss.detach() for loss in losses]).sum()

@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed import _functional_collectives as funcol
 
-from ..tensor_parallel.linear_ops import all_gather_along
+from ...accelerator.linear_collectives import all_gather_along
 
 __all__ = ["VocabParallelEmbedding", "vocab_parallel_embedding_forward"]
 

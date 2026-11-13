@@ -11,6 +11,7 @@ import torch.nn as nn
 
 from ...accelerator.device import device_type
 from ...accelerator.distributed import get_rank, get_world_size
+from ...accelerator.linear_collectives import all_gather_along, reduce_scatter_along
 from ...errors import UnsupportedCombinationError
 from ...models.common.aux_loss import AuxLoss
 from ...models.common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
@@ -26,7 +27,6 @@ from ...models.common.moe.routing import (
 )
 from ...models.contracts import MoEBlockContract
 from .. import compatibility
-from ..tensor_parallel.linear_ops import all_gather_along, reduce_scatter_along
 from .checkpointing import mark_experts_ep_sharded
 from .domino_dispatch import DominoRoutedExperts
 from .mc2_dispatch import MC2GroupedExperts, MC2RoutedExperts
@@ -41,13 +41,6 @@ from .token_dispatch import (
     materialize,
 )
 from .torchao_dispatch import TorchAOTokenDispatcher
-
-
-def _legacy_inspection():
-    """Load external-layout probes only when a legacy block needs them."""
-    from . import hf_inspection
-
-    return hf_inspection
 
 
 class PackedExpertViews(NamedTuple):
@@ -118,7 +111,7 @@ class MoERoutingBinding:
 
 
 def resolve_moe_routing(block: nn.Module) -> MoERoutingBinding:
-    """Read an explicit model contract or the legacy routing adapter once."""
+    """Bind routing from the model-owned contract without inspecting forward."""
     contract = getattr(block, "moe_contract", None)
     if contract is not None:
         if not isinstance(contract, MoEBlockContract):
@@ -140,23 +133,8 @@ def resolve_moe_routing(block: nn.Module) -> MoERoutingBinding:
             num_expert_groups=contract.num_expert_groups,
             num_limited_groups=contract.num_limited_groups,
         )
-    inspection = _legacy_inspection()
-    router = inspection.router_of(block)
-    top_k = inspection.resolve_top_k(block)
-    if router is None or top_k is None:
-        raise ValueError("MoE conversion requires a router and top-k declaration")
-    _, shared = inspection.resolve_shared_expert(block)
-    groups, limited = inspection.read_expert_groups(block, router)
-    return MoERoutingBinding(
-        source=block,
-        router=router,
-        shared=shared,
-        top_k=top_k,
-        score_func=inspection.resolve_score_func(block, router),
-        route_norm=inspection.read_route_norm(block, router),
-        route_scale=inspection.read_route_scale(block, router),
-        num_expert_groups=groups,
-        num_limited_groups=limited,
+    raise UnsupportedCombinationError(
+        "MoE conversion requires a model-owned MoEBlockContract"
     )
 
 
@@ -199,82 +177,69 @@ class PackedExpertBinding:
         )
 
 
-def resolve_packed_experts(
-    block: nn.Module, *, degree: int
-) -> PackedExpertBinding | None:
-    """Bind fused parameter storage; keep legacy per-expert conversion separate."""
+def resolve_packed_experts(block: nn.Module, *, degree: int) -> PackedExpertBinding:
+    """Bind fused parameter storage described by the model contract."""
     if type(degree) is not int or degree < 1:
         raise ValueError("EP degree must be a positive integer")
     contract = getattr(block, "moe_contract", None)
-    if contract is not None and not isinstance(contract, MoEBlockContract):
+    if contract is None:
+        raise UnsupportedCombinationError(
+            "EP packed experts require a model-owned MoEBlockContract"
+        )
+    if not isinstance(contract, MoEBlockContract):
         raise TypeError("moe_contract must be a MoEBlockContract")
     owner = block._modules.get("experts")
     if owner is None:
-        if contract is not None:
-            raise ValueError("Declared fused experts require an experts child module")
-        return None
+        raise ValueError("Declared fused experts require an experts child module")
     gate_up = owner._parameters.get("gate_up_proj")
     down = owner._parameters.get("down_proj")
     if not isinstance(gate_up, nn.Parameter) or not isinstance(down, nn.Parameter):
-        if contract is not None:
-            raise ValueError(
-                "Declared fused experts require gate_up_proj and down_proj parameters"
-            )
-        return None
+        raise ValueError(
+            "Declared fused experts require gate_up_proj and down_proj parameters"
+        )
     # Validate rank before indexing geometry, including direct resolver calls.
     if gate_up.ndim != 3 or down.ndim != 3:
         raise ValueError("EP fused gate/up requires rank-3 expert parameters")
-    # Explicit contracts own mathematical restrictions; legacy layouts retain
-    # their adapter. Fused tensors only produce views, never copied parameters.
-    if contract is not None:
-        if contract.activation != "silu":
-            raise UnsupportedCombinationError(
-                f"EP grouped experts require SiLU, but the model declares "
-                f"{contract.activation!r}; retain the native expert path"
-            )
-        num_experts = contract.num_experts
-        router, _, _ = contract.bind(block)
-        weight = router._parameters.get("weight")
-        if not isinstance(weight, nn.Parameter) or tuple(weight.shape) != (
-            num_experts,
-            gate_up.shape[2],
-        ):
-            raise ValueError(
-                "Declared MoE router weight must have shape "
-                "[num_experts, hidden_size] matching packed expert storage"
-            )
-        if len({weight.device, gate_up.device, down.device}) != 1:
-            raise UnsupportedCombinationError(
-                "Declared MoE router and experts are on different devices"
-            )
-        if tuple(gate_up.shape) != (
-            num_experts,
-            gate_up.shape[1],
-            gate_up.shape[2],
-        ) or tuple(down.shape) != (
-            num_experts,
-            down.shape[1],
-            down.shape[2],
-        ):
-            raise ValueError("Declared MoE expert count differs from packed storage")
-        if gate_up.shape[1] % 2 != 0 or tuple(down.shape[1:]) != (
-            gate_up.shape[2],
-            gate_up.shape[1] // 2,
-        ):
-            raise ValueError("Declared fused gate/up expert geometry is invalid")
-        experts = PackedExpertViews(
-            gate_up[:, : gate_up.shape[1] // 2],
-            gate_up[:, gate_up.shape[1] // 2 :],
-            down,
-            num_experts,
+    # Explicit contracts own mathematical restrictions. Fused tensors only
+    # produce views, never copied parameters.
+    if contract.activation != "silu":
+        raise UnsupportedCombinationError(
+            f"EP grouped experts require SiLU, but the model declares "
+            f"{contract.activation!r}; retain the native expert path"
         )
-    else:
-        experts = _legacy_inspection().fused_experts_of(block)
-    if experts is None:
-        raise ValueError("EP packed expert layout is not supported")
-    if experts.num_experts < 1 or experts.num_experts % degree:
+    num_experts = contract.num_experts
+    router, _, _ = contract.bind(block)
+    weight = router._parameters.get("weight")
+    if not isinstance(weight, nn.Parameter) or tuple(weight.shape) != (
+        num_experts,
+        gate_up.shape[2],
+    ):
         raise ValueError(
-            f"EP degree {degree} does not divide num_experts={experts.num_experts}"
+            "Declared MoE router weight must have shape "
+            "[num_experts, hidden_size] matching packed expert storage"
+        )
+    if len({weight.device, gate_up.device, down.device}) != 1:
+        raise UnsupportedCombinationError(
+            "Declared MoE router and experts are on different devices"
+        )
+    if tuple(gate_up.shape) != (
+        num_experts,
+        gate_up.shape[1],
+        gate_up.shape[2],
+    ) or tuple(down.shape) != (
+        num_experts,
+        down.shape[1],
+        down.shape[2],
+    ):
+        raise ValueError("Declared MoE expert count differs from packed storage")
+    if gate_up.shape[1] % 2 != 0 or tuple(down.shape[1:]) != (
+        gate_up.shape[2],
+        gate_up.shape[1] // 2,
+    ):
+        raise ValueError("Declared fused gate/up expert geometry is invalid")
+    if num_experts % degree:
+        raise ValueError(
+            f"EP degree {degree} does not divide num_experts={num_experts}"
         )
     if gate_up.shape[1] == 0 or gate_up.shape[2] == 0:
         raise ValueError("EP expert dimensions must be positive")
@@ -312,10 +277,7 @@ def validate_moe_conversion(
             raise UnsupportedCombinationError(
                 "MoE shared expert and router are on different devices"
             )
-        if routing.shared_gate is not None or (
-            getattr(block, "moe_contract", None) is None
-            and hasattr(block, "shared_expert_gate")
-        ):
+        if routing.shared_gate is not None:
             compatibility.shared_expert_gate(block)
         if tp_enabled and not (
             getattr(block, "_tp_moe_boundary", False) and not has_ep_group
@@ -370,13 +332,9 @@ def convert_block(
     router_gate = routing.router
     shared = routing.shared
     feature_parallel = bool(getattr(block, "_tp_moe_boundary", False))
-    experts = (
-        packed_experts.projections(block)
-        if packed_experts is not None
-        else _legacy_inspection().fused_experts_of(block)
-    )
-    if experts is None:
-        raise ValueError("MoE conversion requires a supported expert layout")
+    if packed_experts is None:
+        packed_experts = resolve_packed_experts(block, degree=ep_size)
+    experts = packed_experts.projections(block)
 
     num_experts = experts.num_experts
     top_k = routing.top_k
@@ -498,7 +456,7 @@ def convert_block(
         router.gate.weight.copy_(router_gate.weight)
         # HF keeps all E experts in two stacked parameters; each rank keeps its
         # own slice of them. ``gate_EFD``/``up_EFD`` are the two halves of
-        # ``gate_up_proj`` split along its output dim -- see ``fused_experts_of``.
+        # ``gate_up_proj`` split along its declared output-feature dimension.
         for target, source in expert_projections:
             target.copy_(source[lo : lo + num_local])
         # The load-balancing bias is optimization state, not a learned weight:

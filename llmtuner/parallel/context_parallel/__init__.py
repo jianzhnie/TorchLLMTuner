@@ -1,6 +1,7 @@
 """Context parallelism: model-owned backends and input sharding.
 
 ``context_parallel.py`` is the public entry and wires CP onto a model.
+``plan.py`` selects backend targets and checks PP ownership without mutation.
 ``attention.py`` holds attention redistribution, while
 ``input_sharding.py`` owns batch and mask sharding.
 
@@ -12,7 +13,6 @@ from ...utils.lazy_exports import resolve_export
 
 _EXPORT_SOURCES = {
     "apply_cp": "context_parallel",
-    "resolve_cp_plan": "context_parallel",
     "shard_batch_for_cp": "input_sharding",
     "shard_batch_for_tp": "input_sharding",
     "shard_padding_mask_for_cp": "input_sharding",

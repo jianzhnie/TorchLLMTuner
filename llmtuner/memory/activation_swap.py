@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import weakref
+from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import wraps
 from threading import Lock
@@ -14,6 +15,7 @@ import torch.nn as nn
 
 from ..accelerator.device import device_type, get_device_info
 from ..errors import EnvironmentUnsupportedError
+from ..models.contracts import DecoderStructure
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -178,7 +180,7 @@ class _ForwardSwapState:
         self.d2h_stream.synchronize()
 
 
-def _flatten(value: Any):
+def _flatten(value: Any) -> Iterator[Any]:
     if isinstance(value, dict):
         for item in value.values():
             yield from _flatten(item)
@@ -275,6 +277,8 @@ def apply_activation_swap(
 
     Zero means unlimited. At capacity, retain activations on device. This bounds
     live tensor payloads, not allocator caching, process RSS or virtual moments.
+    Reapplication reuses the budget for newly added layers. Changing options or
+    combining independently installed layer budgets is rejected before mutation.
     """
     if isinstance(max_host_bytes, bool) or not isinstance(max_host_bytes, int):
         raise TypeError("max_host_bytes must be a nonnegative integer")
@@ -285,13 +289,42 @@ def apply_activation_swap(
             "training.activation_swap=True requires an Ascend NPU with "
             "pinned Host memory and asynchronous copy streams."
         )
-    layers = getattr(model, "layers", None)
-    if not isinstance(layers, nn.Module):
-        raise TypeError("activation swap requires a model with a .layers module")
+    structure = getattr(model, "decoder_structure", None)
+    if structure is not None:
+        if not isinstance(structure, DecoderStructure):
+            raise TypeError("Activation swap requires a model-owned DecoderStructure")
+        # Bind only local blocks: PP may have removed the embedding or head.
+        # A malformed explicit declaration must never fall back to inspection.
+        layers = structure.bind_blocks(model)
+    else:
+        # Compatibility for standalone modules without an explicit contract.
+        layers = getattr(model, "layers", None)
+        if not isinstance(layers, nn.Module):
+            raise TypeError("activation swap requires a model with a .layers module")
 
-    budget = _HostBudget(limit=max_host_bytes)
+    # Resolve existing ownership before touching any forward. A partial model
+    # extension must share the original budget with outstanding saved tensors.
+    budget = None
+    targets = tuple(layers.children())
+    for layer in targets:
+        forward = layer.forward
+        if not getattr(forward, "_activation_swap_enabled", False):
+            continue
+        existing_budget = getattr(forward, "_activation_swap_budget", None)
+        existing_sync = getattr(forward, "_activation_swap_sync_release", None)
+        if (
+            not isinstance(existing_budget, _HostBudget)
+            or existing_budget.limit != max_host_bytes
+            or existing_sync != sync_release
+        ):
+            raise ValueError("Activation swap reapplication requires identical options")
+        if budget is not None and budget is not existing_budget:
+            raise ValueError("Activation swap layers have independent Host budgets")
+        budget = existing_budget
+    if budget is None:
+        budget = _HostBudget(limit=max_host_bytes)
     layer_count = 0
-    for layer in layers.children():
+    for layer in targets:
         forward = layer.forward
         if getattr(forward, "_activation_swap_enabled", False):
             continue
@@ -334,6 +367,8 @@ def apply_activation_swap(
             return outputs
 
         swapped_forward._activation_swap_enabled = True
+        swapped_forward._activation_swap_budget = budget
+        swapped_forward._activation_swap_sync_release = sync_release
         layer.forward = swapped_forward
         layer_count += 1
     logger.info("Applied NPU activation swap to %d layers", layer_count)

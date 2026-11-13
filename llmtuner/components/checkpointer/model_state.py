@@ -46,7 +46,13 @@ def clone_local_state_tensor(tensor: torch.Tensor) -> torch.Tensor:
 
 
 class ModelStateDictAdapter:
-    """Map declared model names to external weights without guessing a wrapper."""
+    """Map declared model names and coordinate one checkpoint's key coverage.
+
+    ``error_group`` includes every owner contributing to the external state,
+    including PP peers. It is borrowed for conversion errors and key gathering;
+    storage-backend IO remains independently configured. None uses the default
+    process group for standalone callers.
+    """
 
     def __init__(
         self,
@@ -56,6 +62,7 @@ class ModelStateDictAdapter:
         model_prefix: str = "",
         expert_parallel: bool = False,
         sharded_expert_parallel: bool = True,
+        error_group: dist.ProcessGroup | None = None,
     ) -> None:
         if not isinstance(model_prefix, str) or (
             model_prefix
@@ -74,6 +81,9 @@ class ModelStateDictAdapter:
             if type(enabled) is not bool:
                 raise TypeError(f"{name} must be boolean")
         self.model_prefix = model_prefix
+        # Includes all PP owners whose external keys form one checkpoint.
+        # The adapter borrows this group; the entry point owns its lifetime.
+        self.error_group = error_group
         # Composite HF models store the trained decoder's weight ties here.
         self.model_config = getattr(model_config, "text_config", model_config)
         self.state_format = resolve_state_format(
@@ -140,10 +150,12 @@ class ModelStateDictAdapter:
             )
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        state_dict = self.state_format.convert_state(state_dict, to_hf=True)
+        state_dict = self.state_format.convert_state(
+            state_dict, to_hf=True, error_group=self.error_group
+        )
         # Only dictionary mapping is local. Model-owned tensor conversion above and
         # the global PP coverage gather below stay outside this boundary.
-        with synchronize_local_errors("HF export key mapping"):
+        with synchronize_local_errors("HF export key mapping", group=self.error_group):
             hf_state = {}
             for key, value in state_dict.items():
                 hf_key = self.state_format.map_key(
@@ -157,8 +169,10 @@ class ModelStateDictAdapter:
             if dist.is_available() and dist.is_initialized():
                 # PP ranks own disjoint layer keys. Validate the whole model's
                 # coverage while returning only this rank's tensor dictionary.
-                keys_by_rank: list[set[str] | None] = [None] * dist.get_world_size()
-                dist.all_gather_object(keys_by_rank, requested)
+                keys_by_rank: list[set[str] | None] = [None] * dist.get_world_size(
+                    self.error_group
+                )
+                dist.all_gather_object(keys_by_rank, requested, group=self.error_group)
                 requested = set().union(*keys_by_rank)
             missing = self._hf_keys - requested
             unexpected = requested - self._hf_keys
@@ -178,7 +192,9 @@ class ModelStateDictAdapter:
         if getattr(self.model_config, "tie_word_embeddings", False):
             # All ranks with tied configuration participate, including PP parts
             # without either key. DTensor clone preserves placements locally.
-            with synchronize_local_errors("HF export tied weights"):
+            with synchronize_local_errors(
+                "HF export tied weights", group=self.error_group
+            ):
                 if (
                     "model.embed_tokens.weight" in hf_state
                     and "lm_head.weight" in hf_state
@@ -206,7 +222,9 @@ class ModelStateDictAdapter:
             if target in state:
                 raise ValueError(f"HF checkpoint key mapping collision: {target!r}")
             state[target] = value
-        return self.state_format.convert_state(state, to_hf=False)
+        return self.state_format.convert_state(
+            state, to_hf=False, error_group=self.error_group
+        )
 
     def to_hf_export(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Produce standard HF expert keys rather than virtual reader templates."""
@@ -215,7 +233,9 @@ class ModelStateDictAdapter:
             return state
         result = {}
         pending = []
-        with synchronize_local_errors(self.state_format.export_phase):
+        with synchronize_local_errors(
+            self.state_format.export_phase, group=self.error_group
+        ):
             for key, value in state.items():
                 expert_keys = self.state_format.export_keys(
                     key, value.shape if isinstance(value, torch.Tensor) else None

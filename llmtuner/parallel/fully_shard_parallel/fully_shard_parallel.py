@@ -30,7 +30,7 @@ from ...utils.logging import get_logger
 from ..compatibility import chunked_loss_fsdp
 from ..topology import ParallelTopology
 from .fine_grained import get_fsdp_strategy, load_custom_fsdp_engine
-from .plan import apply_fsdp_by_pattern, set_fsdp_prefetch_windows
+from .pattern import apply_fsdp_by_pattern, set_fsdp_prefetch_windows
 from .policies import (
     build_fsdp_placement_fn,
     disable_fsdp_gradient_division,
@@ -142,7 +142,10 @@ def resolve_sparse_fsdp_mesh(parallel_dims: ParallelTopology) -> DeviceMesh | No
 
 
 def validate_fsdp_environment(
-    cfg: ParallelConfig, parallel_dims: ParallelTopology | None
+    cfg: ParallelConfig,
+    parallel_dims: ParallelTopology | None,
+    *,
+    error_group: torch.distributed.ProcessGroup | None = None,
 ) -> None:
     """Reject an unavailable custom engine before parallel assembly mutates weights.
 
@@ -156,7 +159,9 @@ def validate_fsdp_environment(
         # Mesh resolution may create process groups, so only the local import
         # belongs inside this error boundary. All assembly ranks must stop
         # before transformations if one host lacks the optional private APIs.
-        with synchronize_local_errors("Custom FSDP environment validation"):
+        with synchronize_local_errors(
+            "Custom FSDP environment validation", group=error_group
+        ):
             load_custom_fsdp_engine()
 
 

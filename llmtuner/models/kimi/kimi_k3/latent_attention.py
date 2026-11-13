@@ -85,6 +85,9 @@ class KimiLatentAttention(nn.Module):
     Multi-Latent Attention adapted from deepseek-v3
     """
 
+    # KCP exchanges projected heads rather than recurrent state.
+    context_parallel_layout = "mla_ulysses"
+
     def __init__(self, config: KimiLinearConfig, layer_idx: int):
         nn.Module.__init__(self)
         self.config = config

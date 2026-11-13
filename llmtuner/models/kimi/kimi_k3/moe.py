@@ -62,6 +62,7 @@ from ....errors import UnsupportedCombinationError
 from ...common.activation import ActivationFn, SituGLU, SwiGLU
 from ...common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
 from ...common.moe.experts import GroupedExperts, RoutedExperts
+from ...common.moe.layer import MoE
 from ...common.moe.routing import TokenChoiceTopKRouter
 from .configuration import KimiLinearConfig
 from .mlp import KimiExpertMLP as KimiExpertMLP
@@ -459,6 +460,37 @@ class KimiSparseMoE(nn.Module):
             with torch.no_grad():
                 target.copy_(torch.stack(source[start : start + count]))
         return experts
+
+    def build_parallel_moe(
+        self,
+        *,
+        experts: GroupedExperts,
+        router: TokenChoiceTopKRouter,
+        dispatcher: Any,
+    ) -> MoE:
+        """Bind Kimi mathematics to an externally selected expert/dispatch layout.
+
+        Parallel assembly supplies ownership and communication. The model owns
+        weighted-combine precision, latent projection order and shared experts.
+        Reuse replicated modules and correction bias, including their parameter
+        identity and freeze state; Kimi never enables native sign bias updates.
+        """
+        # Cast only after weighted expert outputs have been combined.
+        dispatcher.accumulate_in_fp32 = True
+        moe = MoE(
+            len(self.experts),
+            KimiRoutedExperts(experts, dispatcher, self),
+            router,
+            load_balance_coeff=None,
+            shared_experts=self.shared_experts,
+        )
+        moe.expert_bias_E = self.gate.e_score_correction_bias
+        moe.training = self.training
+        moe.routed_experts.training = self.training
+        router.train(self.training)
+        experts.train(self.training)
+        moe.tokens_per_expert_E = moe.tokens_per_expert_E.to(self.gate.weight.device)
+        return moe
 
     def expert_parallel_math_signature(self) -> tuple[object, ...]:
         """Snapshot routing, activation and latent norm math for plan validation.

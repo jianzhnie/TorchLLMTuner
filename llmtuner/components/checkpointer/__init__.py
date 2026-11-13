@@ -25,10 +25,10 @@ llmtuner fills in the first two plus whatever the caller passes in ``states``:
   already a ``Stateful`` whose state dict is flat and FQN-keyed, which is what
   DCP needs to reshard a pipeline checkpoint, and it materializes a fresh
   optimizer's Adam moments before DCP plans a load.
-* ``train_state`` -- the ``Trainer`` itself. torchtitan's ``Trainer`` is a
-  ``Stateful`` exposing ``step`` and ``ntokens_seen``; llmtuner's trainer exposes
-  the same two through ``state_dict``/``load_state_dict`` for the same reason:
-  they are the counters a resumed run needs.
+* ``train_state`` -- the run's ``TrainingProgress`` object, exposing ``step``
+  and ``ntokens_seen`` through ``state_dict``/``load_state_dict``. Trainer's
+  public counter attributes delegate to this same object, so loading updates
+  the live run without the checkpointer retaining the entire Trainer.
 * ``lr_scheduler`` -- the ``LRSchedulersContainer`` from
   ``components/optimizer/lr_scheduler.py``, always registered. It holds one
   integer, ``last_epoch``, that nothing else in the checkpoint carries: the

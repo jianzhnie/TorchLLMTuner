@@ -10,14 +10,33 @@ backend's ``get_nparams_and_flops``), is documented on :func:`flops_per_token`.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
-from transformers.configuration_utils import PretrainedConfig
+if TYPE_CHECKING:
+    from transformers.configuration_utils import PretrainedConfig
 
 __all__ = [
     "flops_per_token",
+    "flops_estimation_note",
     "quadratic_attention_flops_per_token",
 ]
+
+
+def flops_estimation_note(arch: PretrainedConfig, *, seq_len: int) -> str | None:
+    """Explain architecture-specific estimates alongside their arithmetic.
+
+    The caller owns logging and rank selection. Returning no note preserves the
+    existing output for architectures without an additional accounting caveat.
+    """
+    if getattr(arch, "model_type", None) != "qwen3_5_moe_text":
+        return None
+    return (
+        "Qwen3.5 model FLOPs: recurrent-equivalent GDN, gated "
+        "projections, active experts and depthwise convolution; "
+        f"full-square attention at sequence length {seq_len}. Excludes "
+        "recomputation, padding overhead, optimizer and communication; "
+        "this is model MFU, not measured kernel utilization."
+    )
 
 
 def quadratic_attention_flops_per_token(

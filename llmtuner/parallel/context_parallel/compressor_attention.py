@@ -9,15 +9,18 @@ Outputs follow the HF [batch, local_sequence, heads, dim] layout.
 
 from __future__ import annotations
 
+from functools import partial
 from types import MethodType
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
-from transformers.modeling_outputs import MoeModelOutputWithPast
 
 from ...accelerator.collectives import synchronize_local_errors
-from ...models.contracts import DecoderStructure
+from ...config.parallel_config import ParallelConfig
+from ...models.contracts import DecoderStructure, registered_submodule
+from ..plan import ParallelPlan, PlanTarget
 from .attention import HeadToSeq, SeqToHead
 from .compression_windows import (
     CompressionWindowExchange,
@@ -27,11 +30,14 @@ from .compression_windows import (
 )
 
 try:
-    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-        apply_rotary_pos_emb,
+    from ...models.deepseek.deepseek_v4.context_parallel import (
+        compressor_attention_math,
+    )
+    from ...models.deepseek.deepseek_v4.context_parallel import (
+        compressor_decoder_forward as compressor_decoder_forward,
     )
 except ImportError as error:
-    apply_rotary_pos_emb = None
+    compressor_attention_math = compressor_decoder_forward = None
     DEEPSEEK_IMPORT_ERROR = error
 
 
@@ -198,11 +204,10 @@ def compressor_attention_forward(group):
         past_key_values=None,
         **kwargs,
     ):
-        if apply_rotary_pos_emb is None:
+        if compressor_attention_math is None:
             raise ImportError(
                 "DeepSeek V4 CP requires a compatible transformers build"
             ) from DEEPSEEK_IMPORT_ERROR
-
         with synchronize_local_errors(
             "Compressor module input validation", group=group
         ):
@@ -225,110 +230,37 @@ def compressor_attention_forward(group):
                 raise ValueError(
                     "Compressor CP requires contiguous global position_ids"
                 )
-        shape = (batch, length, -1, module.head_dim)
-        cos, sin = position_embeddings[module.rope_layer_type]
-        q_residual = module.q_a_norm(module.q_a_proj(hidden_states))
-        query = module.q_b_norm(module.q_b_proj(q_residual).view(shape).transpose(1, 2))
-        query = apply_rotary_pos_emb(query, cos, sin)
-        kv = module.kv_norm(module.kv_proj(hidden_states)).view(shape).transpose(1, 2)
-        kv = apply_rotary_pos_emb(kv, cos, sin)
-        selected = None
-        if module.layer_type == "compressed_sparse_attention":
-            compressed, _ = compress_csa_windows(
-                module.compressor, hidden_states, group=group
-            )
-            selected = select_csa_windows(
-                module.compressor.indexer,
-                hidden_states,
-                q_residual,
-                position_ids,
-                group=group,
-            )
-        elif module.layer_type == "heavily_compressed_attention":
-            compressed, _ = compress_hca_windows(
-                module.compressor, hidden_states, group=group
-            )
-        else:
-            compressed = kv[:, :, :0]
-        output = compressor_ulysses_attention(
-            query,
-            kv,
-            compressed,
-            sinks=module.sinks,
-            compress_rate=(
-                module.compressor.compress_rate
-                if module.compressor is not None
-                else None
-            ),
-            sliding_window=module.sliding_window,
-            scaling=module.scaling,
-            group=group,
-            dropout=module.attention_dropout if module.training else 0.0,
-            training=module.training,
-            selected_windows=selected,
+        return compressor_attention_math(
+            module,
+            hidden_states,
+            position_embeddings,
+            position_ids,
+            compress_csa_windows=partial(compress_csa_windows, group=group),
+            select_csa_windows=partial(select_csa_windows, group=group),
+            compress_hca_windows=partial(compress_hca_windows, group=group),
+            attention=partial(compressor_ulysses_attention, group=group),
         )
-        output = apply_rotary_pos_emb(output.transpose(1, 2), cos, -sin).transpose(1, 2)
-        grouped = output.reshape(batch, length, module.config.o_groups, -1)
-        return module.o_b_proj(module.o_a_proj(grouped).flatten(2)), None
 
     return forward
 
 
-def compressor_decoder_forward(
-    module,
-    input_ids=None,
-    inputs_embeds=None,
-    position_ids=None,
-    attention_mask=None,
-    use_cache=False,
-    past_key_values=None,
-    **kwargs,
-):
-    """Stateless V4 decoder for an installed compressor CP attention stack.
-
-    Adapted from Transformers 5.9.0 DeepseekV4Model.forward (Apache-2.0).
-    Each attention owns global causal masks; the decoder never creates a cache.
-    The installer must validate layer types and coordinate input failures.
-    """
-    if use_cache or past_key_values is not None or attention_mask is not None:
-        raise ValueError(
-            "Compressor CP decoder requires stateless internally masked training"
-        )
-    if (input_ids is None) == (inputs_embeds is None):
-        raise ValueError("Provide exactly one of input_ids or inputs_embeds")
-    if position_ids is None:
-        raise ValueError("Compressor CP decoder requires global position_ids")
-    hidden = module.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
-    position_embeddings = {
-        name: module.rotary_emb(hidden, position_ids=position_ids, layer_type=name)
-        for name in ("main", "compress")
-    }
-    hidden = hidden.unsqueeze(2).expand(-1, -1, module.config.hc_mult, -1).contiguous()
-    for layer in module.layers:
-        hidden = layer(
-            hidden,
-            position_embeddings=position_embeddings,
-            position_ids=position_ids,
-            attention_mask=None,
-            input_ids=input_ids,
-            past_key_values=None,
-            **kwargs,
-        )
-    hidden = module.norm(module.hc_head(hidden))
-    return MoeModelOutputWithPast(last_hidden_state=hidden, past_key_values=None)
-
-
-def apply_compressor_context_parallel(model, *, cp_mesh, cfg):
-    """Install stateless HCA/CSA CP after validating the complete local decoder."""
+def resolve_compressor_plan(
+    model: torch.nn.Module, *, degree: int, cfg: ParallelConfig
+) -> ParallelPlan:
+    """Resolve stateless Compressor targets without changing model ownership."""
+    if type(degree) is not int or degree < 1:
+        raise ValueError("Compressor CP degree must be a positive integer")
+    if not callable(getattr(model, "set_cp_mesh", None)):
+        raise TypeError("Compressor CP requires model-owned set_cp_mesh semantics")
     structure = getattr(model, "decoder_structure", None)
     if not isinstance(structure, DecoderStructure):
         raise TypeError("Compressor CP requires an explicit decoder structure")
-    decoder = model.get_submodule(structure.decoder)
+    decoder = registered_submodule(model, structure.decoder)
     if not hasattr(decoder, "layers"):
         raise TypeError(
             f"Declared compressor decoder {structure.decoder!r} must expose layers"
         )
-    layers = list(decoder.layers)
+    attentions = tuple(dict.fromkeys(structure.bind_attentions(model)))
     if cfg.cp_config.context_parallel_strategy != "ulysses":
         raise ValueError(
             "DeepSeek V4 Compressor CP currently requires strategy='ulysses'"
@@ -343,19 +275,18 @@ def apply_compressor_context_parallel(model, *, cp_mesh, cfg):
         )
     if getattr(decoder.config, "attn_mask_type", "causal") != "causal":
         raise ValueError("Compressor CP does not support packed document attention")
-    if not layers or any(
-        getattr(layer.self_attn, "layer_type", None)
+    if not attentions or any(
+        getattr(attention, "layer_type", None)
         not in (
             "heavily_compressed_attention",
             "compressed_sparse_attention",
             "sliding_attention",
         )
-        for layer in layers
+        for attention in attentions
     ):
         raise ValueError("Compressor CP encountered an unsupported attention layer")
-    for layer in layers:
-        attention = layer.self_attn
-        if attention.num_heads % cp_mesh.size():
+    for attention in attentions:
+        if attention.num_heads % degree:
             raise ValueError(
                 "Compressor CP requires query heads divisible by the CP degree"
             )
@@ -363,10 +294,91 @@ def apply_compressor_context_parallel(model, *, cp_mesh, cfg):
             raise ValueError(
                 "Compressor CP dropout random-stream equivalence is not implemented"
             )
+    paths = {
+        id(module): path for path, module in reversed(tuple(model.named_modules()))
+    }
+    return ParallelPlan(
+        stage="cp",
+        degree=degree,
+        implementation="compressor",
+        targets=(PlanTarget(structure.decoder, "decoder", decoder, "stateless"),)
+        + tuple(
+            PlanTarget(paths[id(module)], "attention", module, module.layer_type)
+            for module in attentions
+        ),
+        operations=("bind_window_exchange", "install_stateless_decoder"),
+        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+        buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+    )
+
+
+def apply_compressor_context_parallel(
+    model: torch.nn.Module,
+    *,
+    cp_mesh: DeviceMesh,
+    cfg: ParallelConfig,
+    resolved_plan: ParallelPlan | None = None,
+) -> torch.nn.Module:
+    """Consume current bindings and prepare all forwards before installation.
+
+    Standalone callers may omit the plan. Assembly resolves after TP/EP so the
+    snapshot describes the modules and parameters that will actually execute.
+    """
+    degree = cp_mesh.size()
+    plan = (
+        resolve_compressor_plan(model, degree=degree, cfg=cfg)
+        if resolved_plan is None
+        else resolved_plan
+    )
+    if (
+        plan.stage != "cp"
+        or plan.implementation != "compressor"
+        or plan.degree != degree
+    ):
+        raise ValueError("Compressor CP plan does not match the execution mesh")
+    plan.validate_binding(model)
+    if (
+        len(plan.targets) < 2
+        or plan.targets[0].kind != "decoder"
+        or plan.targets[0].layout != "stateless"
+        or any(
+            target.kind != "attention"
+            or target.layout != getattr(target.module, "layer_type", None)
+            for target in plan.targets[1:]
+        )
+    ):
+        raise ValueError("Compressor CP plan has invalid decoder or attention targets")
+    attention_ids = [id(target.module) for target in plan.targets[1:]]
+    if len(set(attention_ids)) != len(attention_ids):
+        raise ValueError("Compressor CP plan contains duplicate attention targets")
+    if plan.decoder_structure is not None:
+        structure = plan.decoder_structure
+        expected = {id(module) for module in structure.bind_attentions(model)}
+        if (
+            set(attention_ids) != expected
+            or plan.targets[0].path != structure.decoder
+            or plan.targets[0].module
+            is not registered_submodule(model, structure.decoder)
+        ):
+            raise ValueError("Compressor CP plan must cover its declared decoder slots")
+    decoder = plan.targets[0].module
+    attentions = [target.module for target in plan.targets[1:]]
+    if compressor_attention_math is None or compressor_decoder_forward is None:
+        raise ImportError(
+            "DeepSeek V4 CP requires a compatible transformers build"
+        ) from DEEPSEEK_IMPORT_ERROR
     group = cp_mesh.get_group()
-    for layer in layers:
-        attention = layer.self_attn
-        attention.forward = MethodType(compressor_attention_forward(group), attention)
-    decoder.forward = MethodType(compressor_decoder_forward, decoder)
+    pending = [
+        (
+            attention,
+            MethodType(compressor_attention_forward(group), attention),
+        )
+        for attention in attentions
+    ]
+    decoder_forward = MethodType(compressor_decoder_forward, decoder)
+    for attention, forward in pending:
+        attention.forward = forward
+    decoder.forward = decoder_forward
     model.set_cp_mesh(cp_mesh, strategy="compressor_ulysses")
     return model

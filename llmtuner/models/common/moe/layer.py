@@ -37,32 +37,21 @@ from numbers import Real
 
 import torch
 import torch.nn as nn
+from torch._dynamo import OptimizedModule
 
 from llmtuner.models.common.aux_loss import accumulate_forward_metric
 
+from ...contracts import DecoderStructure
 from .experts import RoutedExperts
 from .routing import QuantileBalancedTopKRouter, TokenChoiceTopKRouter
 
-__all__ = ["MOE_LAYER_ATTRS", "collect_moe_layers", "declared_moe_block", "MoE"]
-
-# The decoder-layer attributes that may hold a MoE block. transformers 5.x
-# keeps it on ``mlp`` for every family (dense layers included -- a dense
-# ``mlp`` is simply not a MoE and is skipped); 4.x spells Mixtral's and
-# GraniteMoe's ``block_sparse_moe`` and DeepSeek's/GLM4's ``moe``, and Kimi
-# uses ``block_sparse_moe`` for its sparse layers. The order is only a
-# fallback: the probe prefers whichever attribute actually holds a MoE,
-# because DeepSeek layers carry a dense ``mlp`` *and* a sparse ``moe``.
-# The swap for an HF model replaces the block in the attribute it was found
-# under, so this list is shared with it rather than duplicated: the two must
-# agree or the expert-bias hook silently finds no layers on a real swapped
-# model.
-MOE_LAYER_ATTRS = ("mlp", "block_sparse_moe", "moe")
+__all__ = ["collect_moe_layers", "declared_moe_block", "MoE"]
 
 
 def declared_moe_block(layer: nn.Module) -> tuple[str, nn.Module | None] | None:
     """Read a model-owned direct child slot, without structural probing.
 
-    None means no declaration (legacy lookup may apply). A tuple with a None
+    None means no declaration. A tuple with a None
     block declares a dense layer and forbids searching other candidate slots.
     Resolve against the current instance so replacement and PP binding cannot
     leave a cached reference to the old block.
@@ -72,7 +61,7 @@ def declared_moe_block(layer: nn.Module) -> tuple[str, nn.Module | None] | None:
     if hasattr(layer, "moe_block_name"):
         name = layer.moe_block_name
         if name is None:
-            return MOE_LAYER_ATTRS[0], None
+            return "mlp", None
         if not isinstance(name, str) or not name or "." in name:
             raise ValueError("moe_block_name must be a direct module name or None")
         block = layer._modules.get(name)
@@ -320,12 +309,25 @@ class MoE(nn.Module):
 def collect_moe_layers(model_part: nn.Module) -> list[MoE]:
     """Collect distinct native MoE blocks in decoder-layer order.
 
-    Look up the attributes EP replacement writes, including through activation
+    Read the model-declared slots EP replacement writes, including through activation
     checkpoint wrappers. Return an empty list when no decoder layers exist.
     """
-    layers = getattr(model_part, "layers", None)
-    if not isinstance(layers, nn.ModuleList):
-        return []
+    # Whole-model compile registers the original model under a wrapper. Bind
+    # the declaration on that owner, never against convenience aliases on the
+    # wrapper. FSDP's in-place module conversion keeps the registered paths.
+    while isinstance(model_part, OptimizedModule):
+        model_part = model_part._orig_mod
+    structure = getattr(model_part, "decoder_structure", None)
+    if structure is not None:
+        if not isinstance(structure, DecoderStructure):
+            raise TypeError("MoE collection requires a DecoderStructure")
+        layers = structure.bind_blocks(model_part)
+    else:
+        # Direct callers may provide a small explicit .layers interface. Its
+        # blocks must still declare their sparse/dense slots below.
+        layers = getattr(model_part, "layers", None)
+        if not isinstance(layers, nn.ModuleList):
+            return []
     found: list[MoE] = []
     seen: set[int] = set()
     for layer in layers:
@@ -336,15 +338,13 @@ def collect_moe_layers(model_part: nn.Module) -> list[MoE]:
         # ``_checkpoint_wrapped_module`` FQN segment, cf. canonical_fqn).
         layer = getattr(layer, "_checkpoint_wrapped_module", layer)
         declared = declared_moe_block(layer)
-        blocks = (
-            (declared[1],)
-            if declared is not None
-            else (getattr(layer, attr, None) for attr in MOE_LAYER_ATTRS)
-        )
-        for block in blocks:
-            if isinstance(block, MoE):
-                if id(block) not in seen:
-                    found.append(block)
-                    seen.add(id(block))
-                break
+        if declared is None:
+            raise ValueError(
+                f"MoE collection requires {type(layer).__name__}.moe_block_name "
+                "(None for a dense layer)"
+            )
+        block = declared[1]
+        if isinstance(block, MoE) and id(block) not in seen:
+            found.append(block)
+            seen.add(id(block))
     return found

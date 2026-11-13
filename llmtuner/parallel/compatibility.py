@@ -295,36 +295,6 @@ def ptrr_load_balancer_backstop() -> None:
 # == probe phase: verdicts called from the EP swap's layout probes =======
 
 
-def gpt_oss_layout(experts: object) -> None:
-    """GPT-OSS carries per-expert bias vectors, a transposed (E, D, 2F) layout, and a
-    hardcoded clamped sigmoid-GLU activation; llmtuner's GroupedExperts has no slot
-    for them. Unlock: a bias-bearing expert module with its own activation seam.
-    """
-    raise UnsupportedCombinationError(
-        f"{type(experts).__name__} carries per-expert bias vectors, which "
-        "llmtuner's GroupedExperts has no slot for. Only GPT-OSS has them, "
-        "and it differs further: its gate_up_proj is transposed to "
-        "(E, D, 2F) and its activation is a hardcoded clamped sigmoid-GLU "
-        "rather than a module. Support needs a bias-bearing expert module "
-        "with its own activation seam, not a wider copy here."
-    )
-
-
-def group_limited_greedy() -> None:
-    """DeepSeek-V2's group_limited_greedy scores a group by its single best expert
-    (max); the implemented rule sums the group's top-2 (DeepSeek-V3/GLM4), and
-    routing with the wrong rule picks different experts. Unlock: a group-scoring
-    option in TokenChoiceTopKRouter.
-    """
-    raise UnsupportedCombinationError(
-        "DeepSeek-V2's group_limited_greedy scores a group by its single "
-        "best expert (max); the implemented rule sums the group's top-2 "
-        "(DeepSeek-V3/GLM4). Routing this checkpoint with that rule picks "
-        "different experts, so refusing is the point -- add a group-scoring "
-        "option to TokenChoiceTopKRouter to support it."
-    )
-
-
 def router_bias(router_gate: object) -> None:
     """The EP conversion constructs a bias-free router and copies only its weight.
     Reject biased HF gates before conversion so their bias is not silently lost.
@@ -482,18 +452,6 @@ ENTRIES: tuple[CompatibilityRule, ...] = (
         "assembly",
         UnsupportedCombinationError,
         "parallel/context_parallel/input_sharding.py::resolve_load_balancer",
-    ),
-    CompatibilityRule(
-        gpt_oss_layout,
-        "probe",
-        UnsupportedCombinationError,
-        "parallel/expert_parallel/hf_inspection.py::fused_experts_of",
-    ),
-    CompatibilityRule(
-        group_limited_greedy,
-        "probe",
-        UnsupportedCombinationError,
-        "parallel/expert_parallel/hf_inspection.py::read_expert_groups",
     ),
     CompatibilityRule(
         router_bias,

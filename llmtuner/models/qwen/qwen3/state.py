@@ -116,6 +116,12 @@ class Qwen3StateFormat(ModelStateFormat):
         self.separate_export_indices = self.grouped_experts
         self.split_expert_stacks = self.grouped_experts
 
+    def supports_ep_initial_load(
+        self, *, tp_degree: int, sharded_tensor_parallel: bool
+    ) -> bool:
+        """Packed external experts require native EP and optional TP adapters."""
+        return self.grouped_experts and (tp_degree == 1 or sharded_tensor_parallel)
+
     def normalize_keys(
         self, keys: Iterable[str], indices: Mapping[str, int] | None
     ) -> tuple[set[str], dict[str, int] | None]:

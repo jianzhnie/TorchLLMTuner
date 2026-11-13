@@ -195,7 +195,7 @@ CAPABILITIES: dict[str, Capability] = {
         hint="Upgrade torch, or run without async TP / symm-mem collectives.",
         consumers="parallel/model_compile.py (async TP), "
         "tensor_parallel/tensor_parallel.py (fused symm-mem TP collectives), "
-        "tensor_parallel/linear_ops.py",
+        "accelerator/linear_collectives.py",
     ),
     # -- activation checkpointing (consumer: memory/activation_checkpoint.py)
     "functorch_activation_memory_budget": Capability(

@@ -47,9 +47,10 @@ from llmtuner.errors import EnvironmentUnsupportedError
 
 from ..accelerator.capabilities import has
 from ..accelerator.device import device_type
+from ..accelerator.linear_collectives import enable_symm_mem
 from ..models.common.moe.layer import collect_moe_layers
+from ..models.contracts import DecoderStructure
 from ..utils.logging import get_logger
-from .tensor_parallel.linear_ops import enable_symm_mem
 
 logger = get_logger(__name__)
 
@@ -152,7 +153,15 @@ def apply_compile(
     """
     if compile_config is None:
         compile_config = CompileConfig()
-    layers = getattr(model, "layers", None)
+    layers = None
+    if compile_config.per_block:
+        structure = getattr(model, "decoder_structure", None)
+        if structure is not None:
+            if not isinstance(structure, DecoderStructure):
+                raise TypeError("Per-block compile requires a DecoderStructure")
+            layers = structure.bind_blocks(model)
+        else:
+            layers = getattr(model, "layers", None)
     if compile_config.per_block and not isinstance(layers, nn.Module):
         raise TypeError("per_block compile requires a model with a .layers module")
 

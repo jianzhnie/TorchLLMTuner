@@ -1,8 +1,8 @@
-"""Immutable, tensor-free plans produced before parallel model mutation."""
+"""Immutable metadata plans with live bindings, resolved before model mutation."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -18,7 +18,15 @@ ReplacementObserver = Callable[
 ]
 
 TargetKind = Literal[
-    "dense", "moe", "vocab", "attention", "decoder", "embedding", "norm", "head"
+    "dense",
+    "moe",
+    "vocab",
+    "attention",
+    "decoder",
+    "embedding",
+    "norm",
+    "head",
+    "fsdp_unit",
 ]
 
 
@@ -45,7 +53,7 @@ class PlanTarget:
 
 @dataclass(frozen=True, slots=True)
 class ParallelPlan:
-    """Resolved parallel work and diagnostics without tensor payloads.
+    """Resolved work and diagnostics without copying parameter or buffer storage.
 
     Optional ownership and TP fields are added only by consumers that need them;
     the minimal TP plan does not have to manufacture placeholder capabilities.
@@ -100,6 +108,13 @@ class ParallelPlan:
     decoder_structure_bound: bool = field(
         default=False, init=False, repr=False, compare=False
     )
+
+    def parameter_alias_groups(self) -> tuple[tuple[str, ...], ...]:
+        """Return every registered path sharing the same Parameter object."""
+        groups: dict[int, list[str]] = {}
+        for path, parameter in self.parameter_bindings or ():
+            groups.setdefault(id(parameter), []).append(path)
+        return tuple(tuple(paths) for paths in groups.values() if len(paths) > 1)
 
     def storage_alias_groups(self) -> tuple[tuple[str, ...], ...]:
         """Describe ordinary strided storage sharing without retaining storage.
@@ -323,3 +338,109 @@ class ParallelPlan:
                 raise ValueError(f"Stale plan binding: {target.path}") from error
             if current is not target.module:
                 raise ValueError(f"Stale plan binding: {target.path}")
+
+
+def validate_pipeline_aliases(
+    global_plan: ParallelPlan, local_plan: ParallelPlan
+) -> None:
+    """Preserve module/tensor alias groups projected onto retained PP paths.
+
+    Compare names, never global/local tensor identity: PP deep-copies parameters.
+    Only kinds with ownership snapshots on both sides provide this guarantee.
+    Tensor subclasses retain their own distributed storage contract.
+    """
+
+    def projected(
+        groups: Iterable[tuple[str, ...]], retained: set[str]
+    ) -> set[frozenset[str]]:
+        result = set()
+        for paths in groups:
+            group = frozenset(path for path in paths if path in retained)
+            if len(group) > 1:
+                result.add(group)
+        return result
+
+    def identity_groups(
+        bindings: Iterable[tuple[str, object]],
+    ) -> tuple[tuple[str, ...], ...]:
+        groups: dict[int, list[str]] = {}
+        for path, value in bindings:
+            groups.setdefault(id(value), []).append(path)
+        return tuple(tuple(paths) for paths in groups.values() if len(paths) > 1)
+
+    retained_storage = set()
+    for kind, global_bindings, local_bindings in (
+        ("parameter", global_plan.parameter_bindings, local_plan.parameter_bindings),
+        ("buffer", global_plan.buffer_bindings, local_plan.buffer_bindings),
+    ):
+        if global_bindings is None or local_bindings is None:
+            continue
+        retained = {path for path, _ in global_bindings} & {
+            path for path, _ in local_bindings
+        }
+        retained_storage.update(f"{kind}:{path}" for path in retained)
+
+        if projected(identity_groups(global_bindings), retained) != projected(
+            identity_groups(local_bindings), retained
+        ):
+            raise ValueError(f"Pipeline {kind} alias ownership changed")
+    if projected(global_plan.storage_aliases, retained_storage) != projected(
+        local_plan.storage_aliases, retained_storage
+    ):
+        raise ValueError("Pipeline storage alias ownership changed")
+
+    if (
+        global_plan.module_bindings is not None
+        and local_plan.module_bindings is not None
+    ):
+        global_modules = dict(global_plan.module_bindings)
+        local_modules = dict(local_plan.module_bindings)
+        retained_modules = {
+            path
+            for path in global_modules.keys() & local_modules.keys()
+            if not (
+                isinstance(local_modules[path], nn.Identity)
+                and not isinstance(global_modules[path], nn.Identity)
+            )
+        }
+        if projected(
+            identity_groups(global_plan.module_bindings), retained_modules
+        ) != (projected(identity_groups(local_plan.module_bindings), retained_modules)):
+            raise ValueError("Pipeline module alias ownership changed")
+
+
+def validate_pipeline_targets(
+    global_plan: ParallelPlan, local_plan: ParallelPlan, model: nn.Module
+) -> tuple[tuple[PlanTarget, PlanTarget], ...]:
+    """Validate retained PP ownership and return global/local metadata pairs.
+
+    Missing modules and removed-stage Identity placeholders are nonlocal targets.
+    The returned global bindings are only references for semantic comparison;
+    execution must consume the independently resolved local plan.
+    """
+    local_plan.validate_binding(model)
+    validate_pipeline_aliases(global_plan, local_plan)
+    label = f"Pipeline {global_plan.stage.upper()}"
+    modules = dict(model.named_modules(remove_duplicate=False))
+    expected = {}
+    for target in global_plan.targets:
+        module = modules.get(target.path)
+        if module is None or (
+            isinstance(module, nn.Identity)
+            and not isinstance(target.module, nn.Identity)
+        ):
+            continue
+        key = (target.path, target.kind)
+        if key in expected:
+            raise ValueError(f"{label} global plan contains duplicate targets")
+        expected[key] = target
+    actual = {(target.path, target.kind): target for target in local_plan.targets}
+    if len(actual) != len(local_plan.targets):
+        raise ValueError(f"{label} local plan contains duplicate targets")
+    if expected.keys() != actual.keys():
+        raise ValueError(
+            f"{label} target ownership changed: "
+            f"missing={sorted(expected.keys() - actual.keys())}, "
+            f"unexpected={sorted(actual.keys() - expected.keys())}"
+        )
+    return tuple((expected[key], target) for key, target in actual.items())

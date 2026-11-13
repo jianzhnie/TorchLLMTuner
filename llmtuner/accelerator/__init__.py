@@ -13,6 +13,8 @@ Members:
 * ``distributed.py`` -- process-group bootstrap and rank/world queries, vendored
   from OpenMMLab's ``mmengine.dist`` and de-mmengine'd to depend only on torch.
 * ``tensor_tree.py`` -- nested tensor device inspection and movement.
+* ``linear_collectives.py`` -- autograd collective/GEMM execution primitives
+  shared by model projections and parallel transforms.
 
 ``distributed`` is re-exported here lazily (PEP 562): importing this package or
 a sibling submodule (``llmtuner.accelerator.device`` ...) does not pay for it

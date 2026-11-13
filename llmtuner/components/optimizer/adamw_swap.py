@@ -11,9 +11,10 @@ from __future__ import annotations
 import math
 import time
 from collections import defaultdict
+from collections.abc import Callable, Iterable, Iterator
 from copy import deepcopy
 from numbers import Real
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch.distributed.tensor import DTensor, Partial
@@ -22,6 +23,32 @@ from torch.optim.adamw import adamw
 from ...errors import UnsupportedCombinationError
 
 __all__ = ["AdamWSwap"]
+
+
+class SwapSlice(NamedTuple):
+    """One local flat slice; all offsets use the parameter's local storage."""
+
+    group: dict[str, Any]
+    parameter: torch.Tensor
+    start: int
+    end: int
+    moment_names: tuple[str, ...]
+
+
+class StagedSlice(NamedTuple):
+    """A staging slot retained until its copies and update have completed.
+
+    Buffers own device copies; value/gradient retain original local views.
+    CPU-offloaded updates use the final two buffers for parameter/gradient data.
+    The event orders prefetch completion before the update stream consumes it.
+    """
+
+    buffers: list[torch.Tensor]
+    event: Any
+    payload_bytes: int
+    value: torch.Tensor
+    gradient: torch.Tensor
+    offloaded: bool
 
 
 def _local(value: torch.Tensor) -> torch.Tensor:
@@ -142,14 +169,14 @@ class AdamWSwap(torch.optim.AdamW):
             )
 
     @staticmethod
-    def _moment_names(group):
+    def _moment_names(group: dict[str, Any]) -> tuple[str, ...]:
         return (
             ("exp_avg", "exp_avg_sq", "max_exp_avg_sq")
             if group["amsgrad"]
             else ("exp_avg", "exp_avg_sq")
         )
 
-    def _device(self, parameter):
+    def _device(self, parameter: torch.Tensor) -> torch.device:
         return self.update_device or _local(parameter).device
 
     @property
@@ -169,7 +196,9 @@ class AdamWSwap(torch.optim.AdamW):
         ):
             raise MemoryError("AdamWSwap moment payload exceeds max_host_bytes")
 
-    def initialize_state(self, parameters=None) -> None:
+    def initialize_state(
+        self, parameters: Iterable[torch.Tensor] | None = None
+    ) -> None:
         """Create local Host destinations without a synthetic optimizer update."""
         if self._failed:
             raise RuntimeError(
@@ -220,7 +249,9 @@ class AdamWSwap(torch.optim.AdamW):
         self.state.update(pending)
 
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(
+        self, closure: Callable[[], torch.Tensor] | None = None
+    ) -> torch.Tensor | None:
         """Update only parameters with gradients, completing D2H before return."""
         if self._failed:
             raise RuntimeError(
@@ -267,7 +298,8 @@ class AdamWSwap(torch.optim.AdamW):
                 self._update_slice(job, staged)
                 if next_staged is not None:
                     self.staging_peak_payload_bytes = max(
-                        self.staging_peak_payload_bytes, staged[2] + next_staged[2]
+                        self.staging_peak_payload_bytes,
+                        staged.payload_bytes + next_staged.payload_bytes,
                     )
                 # Drop the completed slot before allocating its replacement.
                 # Assignment evaluates _stage() before releasing its old value.
@@ -299,7 +331,7 @@ class AdamWSwap(torch.optim.AdamW):
                 self.copy_wait_seconds += time.perf_counter() - started
         return loss
 
-    def _slice_jobs(self, active):
+    def _slice_jobs(self, active: list[torch.Tensor]) -> Iterator[SwapSlice]:
         devices = {self._device(p) for p in active}
         if len(devices) > 1:
             raise UnsupportedCombinationError("AdamWSwap requires one update device")
@@ -344,15 +376,15 @@ class AdamWSwap(torch.optim.AdamW):
                         "swap budget cannot hold one staged element per slot"
                     )
                 for start in range(0, local.numel(), chunk):
-                    yield (
-                        group,
-                        parameter,
-                        start,
-                        min(start + chunk, local.numel()),
-                        names,
+                    yield SwapSlice(
+                        group=group,
+                        parameter=parameter,
+                        start=start,
+                        end=min(start + chunk, local.numel()),
+                        moment_names=names,
                     )
 
-    def _stage(self, job):
+    def _stage(self, job: SwapSlice) -> StagedSlice:
         group, parameter, start, end, names = job
         device = self._device(parameter)
         value = _local(parameter).view(-1)[start:end]
@@ -383,9 +415,16 @@ class AdamWSwap(torch.optim.AdamW):
         self.staging_peak_payload_bytes = max(self.staging_peak_payload_bytes, payload)
         if device.type != "cpu":
             self.h2d_bytes += payload
-        return buffers, event, payload, value, gradient, offload
+        return StagedSlice(
+            buffers=buffers,
+            event=event,
+            payload_bytes=payload,
+            value=value,
+            gradient=gradient,
+            offloaded=offload,
+        )
 
-    def _update_slice(self, job, staged):
+    def _update_slice(self, job: SwapSlice, staged: StagedSlice) -> None:
         group, parameter, start, end, names = job
         buffers, event, _, value, gradient, offload = staged
         device = self._device(parameter)

@@ -9,7 +9,7 @@ Split out of torchtitan's single ``models/common/moe.py`` (plus its
 * ``experts.py`` -- ``GroupedExperts`` (every expert's weights as three stacked
   tensors) and ``RoutedExperts`` (the dispatch/combine pair around them).
 * ``layer.py`` -- ``MoE`` itself, plus ``collect_moe_layers`` /
-  ``MOE_LAYER_ATTRS``, the walk the hooks and the compile pass use.
+  ``declared_moe_block``, the walk the hooks and the compile pass use.
 * ``auxiliary_loss.py`` -- ``MicrobatchWiseLoadBalanceLoss``, the per-forward
   sequence-wise auxiliary loss a router can carry.
 * ``bias_update.py`` -- the auxiliary-loss-free bias updates and optimizer hooks.

@@ -5,9 +5,14 @@ own IO, distributed layout collection and destination state. The default format
 preserves a model whose native keys already match its external checkpoint.
 """
 
+from __future__ import annotations
+
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +32,17 @@ class ModelStateFormat:
     separate_export_indices = False
     export_phase = "HF export expert mapping"
 
+    def supports_ep_initial_load(
+        self, *, tp_degree: int, sharded_tensor_parallel: bool
+    ) -> bool:
+        """Declare whether external weights can populate converted EP storage.
+
+        A format without an explicit expert mapping cannot initialize native
+        EP parameters. This describes format/layout support, not IO or memory
+        capacity; the checkpointer still validates destinations when loading.
+        """
+        return False
+
     def normalize_keys(
         self, keys: Iterable[str], indices: Mapping[str, int] | None
     ) -> tuple[set[str], dict[str, int] | None]:
@@ -35,7 +51,14 @@ class ModelStateFormat:
     def map_key(self, key: str, *, to_hf: bool) -> str:
         return key
 
-    def convert_state(self, state: dict[str, Any], *, to_hf: bool) -> dict[str, Any]:
+    def convert_state(
+        self,
+        state: dict[str, Any],
+        *,
+        to_hf: bool,
+        error_group: ProcessGroup | None = None,
+    ) -> dict[str, Any]:
+        """Convert format; collective-capable formats use the supplied peers."""
         return state
 
     def export_keys(

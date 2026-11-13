@@ -1,19 +1,22 @@
 """Convert Kimi's individual experts to the native EP execution layout.
 
-Routing and latent projection order follow FSDPTurbo 0af4eca
-models/kimi/modeling_kimi_linear.py. Native checkpoints use the grouped expert
-FQNs; the source correction bias remains a Parameter, with no automatic update.
+The model owns routing, latent projection order and replicated state binding.
+This adapter selects an expert slice and binds its communication/ownership.
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import torch.distributed as dist
 
 from ...accelerator.distributed import get_rank, get_world_size
 from ...models.common.moe.layer import MoE
-from ...models.kimi.kimi_k3.moe import KimiRoutedExperts, KimiSparseMoE
 from .checkpointing import mark_experts_ep_sharded
 from .token_dispatch import AllToAllTokenDispatcher, LocalTokenDispatcher
+
+if TYPE_CHECKING:
+    from ...models.kimi.kimi_k3.moe import KimiSparseMoE
 
 
 def convert_kimi_block(
@@ -45,23 +48,8 @@ def convert_kimi_block(
         else AllToAllTokenDispatcher(count, block.gate.top_k)
     )
     dispatcher.set_ep_group(ep_group=ep_group)
-    # Official Kimi combines weighted expert outputs before the BF16 cast.
-    dispatcher.accumulate_in_fp32 = True
     if ep_group is not None:
         mark_experts_ep_sharded(experts, ep_group)
-    moe = MoE(
-        count,
-        KimiRoutedExperts(experts, dispatcher, block),
-        router,
-        load_balance_coeff=None,
-        shared_experts=block.shared_experts,
+    return block.build_parallel_moe(
+        experts=experts, router=router, dispatcher=dispatcher
     )
-    # Kimi stores this non-differentiable selection state as a Parameter. Keep
-    # its identity, dtype and freeze state; don't enable the native sign update.
-    moe.expert_bias_E = block.gate.e_score_correction_bias
-    moe.training = block.training
-    moe.routed_experts.training = block.training
-    router.train(block.training)
-    experts.train(block.training)
-    moe.tokens_per_expert_E = moe.tokens_per_expert_E.to(block.gate.weight.device)
-    return moe

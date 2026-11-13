@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from torch.distributed import ProcessGroup
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.spmd import spmd_context
@@ -50,6 +51,35 @@ def loss_vocab_kwargs(
     return {"tp_group": tp_mesh.get_group(), "global_vocab_size": vocab_size}
 
 
+def evaluate_dense_batch(
+    model: torch.nn.Module,
+    batch: Batch | TrainerBatch,
+    *,
+    device: torch.device,
+    parallel_dims: ParallelTopology | None,
+    max_context_length: int,
+    param_context: ParamContext,
+    loss_sum: LossSum,
+    error_group: ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Run the validation forward and return unnormalized token loss.
+
+    The caller owns eval/no-grad mode and RNG restoration. Keep the same
+    preprocessing and vocab reduction contracts as the training engine.
+    """
+    inputs, labels, extra_kwargs = prepare_model_inputs(
+        model,
+        batch,
+        device=device,
+        parallel_dims=parallel_dims,
+        max_context_length=max_context_length,
+        error_group=error_group,
+    )
+    with param_context(), spmd_context(parallel_dims):
+        logits = model_output_value(model(inputs, **extra_kwargs))
+        return loss_sum(logits, labels, **loss_vocab_kwargs(model, parallel_dims))
+
+
 @dataclass(slots=True)
 class TrainingEngine:
     """Execute forward/backward with fixed model and parallel dependencies."""
@@ -69,6 +99,9 @@ class TrainingEngine:
     pp_has_last_stage: bool = False
     pp_loss_sentinel: torch.Tensor | None = None
     pp_num_microbatches: int = 1
+    # All update participants, including PP stages without tracked EMA tensors.
+    # None preserves the default-group behavior for standalone callers.
+    error_group: ProcessGroup | None = None
 
     @property
     def model(self) -> torch.nn.Module:
@@ -85,6 +118,7 @@ class TrainingEngine:
             device=self.device,
             parallel_dims=self.parallel_dims,
             max_context_length=self.max_context_length,
+            error_group=self.error_group,
         )
 
     def pp_microbatches(
@@ -93,11 +127,6 @@ class TrainingEngine:
         return pipeline.split_pipeline_microbatches(
             batch, num_microbatches=self.pp_num_microbatches
         )
-
-    @property
-    def _pp_loss_sentinel(self) -> torch.Tensor | None:
-        """Preserve the existing pipeline runtime's sentinel field contract."""
-        return self.pp_loss_sentinel
 
     def forward_backward(
         self,
@@ -156,9 +185,11 @@ class TrainingEngine:
             )
         self.optimizer.step()
         # The optimizer update is committed if scheduler coordination fails.
-        with synchronize_local_errors("Training scheduler update"):
+        with synchronize_local_errors(
+            "Training scheduler update", group=self.error_group
+        ):
             self.lr_scheduler.step()
-        with synchronize_local_errors("Training EMA update"):
+        with synchronize_local_errors("Training EMA update", group=self.error_group):
             if self.ema is not None:
                 # All ranks enter, including PP stages with no tracked tensors.
                 self.ema.step(step)

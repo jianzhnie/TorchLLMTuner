@@ -173,12 +173,17 @@ class DecoderStructure:
     def bind(self, model: nn.Module) -> BoundDecoderStructure:
         decoder = registered_submodule(model, self.decoder)
         embedding = registered_submodule(model, self.embedding)
-        blocks = registered_submodule(model, self.blocks)
+        blocks = self.bind_blocks(model)
         norm = registered_submodule(model, self.norm)
         head = registered_submodule(model, self.head)
+        return BoundDecoderStructure(self, decoder, embedding, blocks, norm, head)
+
+    def bind_blocks(self, model: nn.Module) -> nn.ModuleList:
+        """Bind current local blocks without requiring PP-removed edge modules."""
+        blocks = registered_submodule(model, self.blocks)
         if not isinstance(blocks, nn.ModuleList):
             raise TypeError(f"Decoder blocks {self.blocks!r} must be a ModuleList")
-        return BoundDecoderStructure(self, decoder, embedding, blocks, norm, head)
+        return blocks
 
     def bind_attentions(self, model: nn.Module) -> tuple[nn.Module, ...]:
         """Bind only declared direct attention children, without model mutation.
@@ -193,9 +198,7 @@ class DecoderStructure:
             or "." in self.attention
         ):
             raise ValueError("CP requires a declared direct attention child name")
-        blocks = registered_submodule(model, self.blocks)
-        if not isinstance(blocks, nn.ModuleList):
-            raise TypeError(f"Decoder blocks {self.blocks!r} must be a ModuleList")
+        blocks = self.bind_blocks(model)
         attentions = []
         for block_id, block in blocks._modules.items():
             attention = block._modules.get(self.attention)

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import torch
+from torch.distributed import ProcessGroup
 
 from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...accelerator.distributed import get_comm_device, get_world_size
@@ -20,9 +21,9 @@ from ...datasets.contracts import (
 from ...datasets.loader_builder import build_dataloader as build_dataset_dataloader
 
 if TYPE_CHECKING:
+    from ...components.metrics import MetricsProcessor
     from ...config.llmtuner_config import LLMTunerConfig
     from ...parallel.topology import ParallelTopology
-    from ..trainer import Trainer
 
 
 def resolve_data_parallel_rank(
@@ -66,11 +67,13 @@ def build_training_dataloader(
 
 def fetch_batch(
     data_iterator: Iterator[Batch | TrainerBatch],
+    *,
+    group: ProcessGroup | None = None,
 ) -> Batch | TrainerBatch:
     """Fetch one host batch, coordinating exhaustion/errors before model work.
 
-    All world ranks must call this in the same order. A failed fetch takes
-    precedence over exhaustion. Model execution and a blocked loader are outside
+    All group members must call this in the same order (WORLD by default).
+    A failed fetch takes precedence over exhaustion. A blocked loader is outside
     this contract; original fetch exceptions remain on the rank that raised them.
     """
     error: BaseException | None = None
@@ -91,9 +94,9 @@ def fetch_batch(
     # Every model axis participates: a PP stage or sequence peer that
     # exits alone leaves the others entering unmatched model collectives.
     # Coordinate before yielding, also before token denominator reductions.
-    if get_world_size() > 1:
-        ready = torch.tensor(status, device=get_comm_device(), dtype=torch.int32)
-        all_reduce(ready, op="min")
+    if get_world_size(group) > 1:
+        ready = torch.tensor(status, device=get_comm_device(group), dtype=torch.int32)
+        all_reduce(ready, op="min", group=group)
         status = int(ready.item())
     if status == 0:
         if error is not None and not isinstance(
@@ -107,7 +110,10 @@ def fetch_batch(
 
 
 def batch_generator(
-    self: Trainer, data_iterable: Iterable[Batch | TrainerBatch]
+    data_iterable: Iterable[Batch | TrainerBatch],
+    *,
+    metrics: MetricsProcessor,
+    group: ProcessGroup | None = None,
 ) -> Iterator[Batch | TrainerBatch]:
     """Account for each fetch and yield the unchanged host batch.
 
@@ -118,14 +124,14 @@ def batch_generator(
     data_iterator = iter(data_iterable)
     while True:
         data_load_start = perf_counter()
-        batch = fetch_batch(data_iterator)
+        batch = fetch_batch(data_iterator, group=group)
         # Fetch has already coordinated loader errors. Keep local metric
         # callbacks in a separate boundary before peers account tokens or
         # fetch another batch; the loader collective must stay outside it.
-        with synchronize_local_errors("Training fetch accounting"):
+        with synchronize_local_errors("Training fetch accounting", group=group):
             labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
-            self.metrics.add_tokens(labels.numel())
-            self.metrics.add_data_loading_time(perf_counter() - data_load_start)
+            metrics.add_tokens(labels.numel())
+            metrics.add_data_loading_time(perf_counter() - data_load_start)
         yield batch
 
 
@@ -169,34 +175,30 @@ def count_routing_tokens(batch: Batch | TrainerBatch) -> int:
     return batch["input"].numel()
 
 
-def microbatch(self: Trainer, batch: Batch | TrainerBatch) -> dict[str, Any]:
-    """Attach valid-token and routing-token counts to one host batch.
+def prepare_microbatch(
+    batch: Batch | TrainerBatch,
+    *,
+    valid_token_counter: Callable[[Batch | TrainerBatch], int] = count_valid_tokens,
+    error_group: ProcessGroup | None = None,
+) -> tuple[dict[str, Any], int]:
+    """Return host-batch counts and the unsharded label count without mutation.
 
-    Throughput divides by CP * TP because those ranks read the same batch.
-    Keep tensors on the host until preprocess consumes this accumulation group."""
-    labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
-    # Count this rank's share of the sequence, not the whole batch: every
-    # rank of a CP/TP group reads the *same* batch from the loader, and the
-    # sequence is cut across the group later (``shard_batch_for_cp`` /
-    # ``shard_batch_for_tp``). Counting the full batch here and then summing
-    # over the dp*cp*tp loss mesh in ``train_step`` would report a corpus
-    # cp * tp times its true size; counting the share makes that sum
-    # reconstruct the tokens actually read.
-    parallel_dims = getattr(self, "parallel_dims", None)
-    sequence_shards = (
-        1 if parallel_dims is None else parallel_dims.cp * parallel_dims.tp
-    )
-    with synchronize_local_errors("Training token accounting"):
-        num_valid_tokens = self.count_valid_tokens(batch)
+    The caller owns cumulative training counters and sequence-replica correction.
+    Coordinate every local count before callers commit any training state.
+    """
+    with synchronize_local_errors("Training token accounting", group=error_group):
+        labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
+        num_tokens = labels.numel()
+        num_valid_tokens = valid_token_counter(batch)
         num_routing_tokens = count_routing_tokens(batch)
-    # Commit accounting only after both counters have been validated.
-    self.ntokens_seen += labels.numel() // sequence_shards
-
-    return {
-        "batch": batch,
-        "num_valid_tokens": num_valid_tokens,
-        "num_routing_tokens": num_routing_tokens,
-    }
+    return (
+        {
+            "batch": batch,
+            "num_valid_tokens": num_valid_tokens,
+            "num_routing_tokens": num_routing_tokens,
+        },
+        num_tokens,
+    )
 
 
 def move_batch_to_device(
@@ -223,6 +225,7 @@ def prepare_model_inputs(
     device: torch.device,
     parallel_dims: Any,
     max_context_length: int,
+    error_group: ProcessGroup | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Connect a batch to the explicit model's input contract.
 
@@ -239,7 +242,7 @@ def prepare_model_inputs(
             f"{type(model).__name__} must implement "
             "prepare_inputs(batch, parallel_dims=..., max_context_length=...)"
         )
-    with synchronize_local_errors("Training batch preprocessing"):
+    with synchronize_local_errors("Training batch preprocessing", group=error_group):
         return prepare_inputs(
             move_batch_to_device(batch, device),
             parallel_dims=parallel_dims,

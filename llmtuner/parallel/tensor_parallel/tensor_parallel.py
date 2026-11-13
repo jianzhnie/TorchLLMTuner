@@ -1,13 +1,15 @@
 """Step 2: tensor parallelism -- declarative sharding realized by fused TP GEMMs.
 
 A tensor-parallel projection is two separate things: WHERE its weight is cut, and
-HOW its activations move around the cut. This file keeps those apart.
+HOW its activations move around the cut. Declarations live in ``sharding.py``;
+projection execution lives in ``linear.py``. This entry resolves structural
+targets, validates ownership and installs the selected transformations.
 
 * ``ShardingConfig`` (built by the ``colwise()`` / ``rowwise()`` factories) is the
   DECLARATION -- plain data, no tensors, no collectives.
 * ``ColumnParallelLinear`` / ``RowParallelLinear`` are the modules that REALIZE a
-  declaration, built on the fused collective+GEMM primitives in ``linear_ops.py``.
-* ``apply_tp`` is the ENGINE -- it reads a plan (the model's HF ``tp_config`` by
+  declaration, using ``accelerator/linear_collectives.py`` for collective/GEMM math.
+* ``apply_tp`` is the ENGINE -- it reads a plan (the model's explicit ``tp_config`` by
   default, or an explicit ``{pattern: ShardingConfig}`` map), cuts each target
   weight and swaps the projection out for its sharded module.
 
@@ -44,8 +46,7 @@ by the explicit model; no fused QKV or FP8 path is assumed here.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
-from typing import Literal
+from dataclasses import replace
 
 import torch
 import torch.nn as nn
@@ -55,25 +56,27 @@ from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 
 from ...accelerator.capabilities import has
+from ...accelerator.linear_collectives import (
+    all_gather_along,
+    enable_symm_mem,
+    reduce_scatter_along,
+    resolve_autograd_collectives,
+)
 from ...models.common.moe.experts import GroupedExperts
 from ...models.common.moe.layer import MoE, declared_moe_block
 from ...models.contracts import DecoderStructure, MoEBlockContract
 from ...utils.logging import get_logger
 from .. import compatibility
 from ..attention_heads import require_heads_divisible_by
-from ..module_patterns import module_name_matches, resolve_module_patterns
-from ..plan import ParallelPlan, PlanTarget, ReplacementObserver
-from ..vocab_parallel.vocab_parallel import VocabParallelEmbedding
-from .linear_ops import (
-    AllGatherLinear,
-    LinearReduceScatter,
-    all_gather_along,
-    all_gather_linear,
-    enable_symm_mem,
-    linear_reduce_scatter,
-    reduce_scatter_along,
-    resolve_autograd_collectives,
+from ..plan import (
+    ParallelPlan,
+    PlanTarget,
+    ReplacementObserver,
+    validate_pipeline_targets,
 )
+from ..vocab_parallel.vocab_parallel import VocabParallelEmbedding
+from . import linear as tp_linear
+from . import sharding as tp_sharding
 
 
 def _is_model_declared_moe(module: nn.Module) -> bool:
@@ -83,221 +86,20 @@ def _is_model_declared_moe(module: nn.Module) -> bool:
     )
 
 
-def _legacy_inspection():
-    """Load external-layout probes only when no model contract is present."""
-    from ..expert_parallel import hf_inspection
-
-    return hf_inspection
-
-
 def _resolve_shared_expert(block: nn.Module):
-    """Resolve shared experts from the model contract before legacy probing."""
+    """Read shared expert ownership from the model contract or native MoE."""
     contract = getattr(block, "moe_contract", None)
     if isinstance(contract, MoEBlockContract):
         _, name, shared = contract.bind(block)
         return name, shared
-    return _legacy_inspection().resolve_shared_expert(block)
-
-
-def _is_moe_block(module: nn.Module) -> bool:
-    """Prefer explicit ownership; retain legacy probing for external models."""
-    return _is_model_declared_moe(module) or _legacy_inspection().is_hf_moe_block(
-        module
-    )
+    if isinstance(block, MoE):
+        return "shared_experts", block.shared_experts
+    raise ValueError("TP MoE requires a model-owned MoEBlockContract")
 
 
 logger = get_logger(__name__)
 
-__all__ = [
-    "ColumnParallelLinear",
-    "ColwiseLinearNoGather",
-    "RowParallelLinear",
-    "ShardingConfig",
-    "apply_tp",
-    "resolve_tp_plan",
-    "colwise",
-    "rowwise",
-]
-
-ShardKind = Literal["colwise", "rowwise"]
-
-
-@dataclass(frozen=True)
-class _TPInitializationSpec:
-    """Storage-free original HF initialization and TP ownership coordinates."""
-
-    module_type: type[nn.Module]
-    global_shape: tuple[int, ...]
-    dim: int
-    size: int
-    rank: int
-    packed: bool = False
-
-
-# -- declaration --------------------------------------------------------------
-
-
-def shard_weight(
-    weight: torch.Tensor, dim: int, *, tp_size: int, tp_rank: int
-) -> torch.Tensor:
-    """Cut ``weight`` into ``tp_size`` pieces along ``dim``; keep this rank's.
-
-    A plain slice with no collective: every rank starts from the same full weight
-    (the model is built identically everywhere), so each just drops the rest.
-    """
-    if isinstance(tp_size, bool) or not isinstance(tp_size, int) or tp_size < 1:
-        raise ValueError(f"tp_size must be a positive integer, got {tp_size!r}")
-    if (
-        isinstance(tp_rank, bool)
-        or not isinstance(tp_rank, int)
-        or not 0 <= tp_rank < tp_size
-    ):
-        raise ValueError(
-            f"tp_rank must be an integer in [0, {tp_size}), got {tp_rank!r}"
-        )
-    if weight.shape[dim] % tp_size != 0:
-        raise ValueError(
-            f"weight dim {dim} (size {weight.shape[dim]}) is not divisible by "
-            f"tp_size={tp_size}"
-        )
-    return torch.chunk(weight.detach(), tp_size, dim=dim)[tp_rank].contiguous()
-
-
-class ShardedLinear(nn.Module):
-    """Initialize a weight shard; subclasses define activation communication.
-
-    Feature counts describe the original projection, not the local shard.
-    Projections without collectives retain no process-group or runtime flags.
-    """
-
-    shard_dim: int
-    uses_collectives = True
-
-    def __init__(
-        self,
-        weight: torch.Tensor,
-        *,
-        tp_size: int,
-        tp_rank: int,
-        group,
-        use_symm_mem: bool = True,
-    ) -> None:
-        super().__init__()
-        self.in_features = weight.shape[1]
-        self.out_features = weight.shape[0]
-        self._tp_init_specs = {
-            "weight": _TPInitializationSpec(
-                nn.Linear, tuple(weight.shape), self.shard_dim, tp_size, tp_rank
-            )
-        }
-        self.weight = nn.Parameter(
-            shard_weight(weight, self.shard_dim, tp_size=tp_size, tp_rank=tp_rank),
-            requires_grad=weight.requires_grad
-            if isinstance(weight, nn.Parameter)
-            else True,
-        )
-        if self.uses_collectives:
-            self.group = group
-            self.tp_size = tp_size
-            self.use_symm_mem = use_symm_mem
-
-
-class ColumnParallelLinear(ShardedLinear):
-    """Column-parallel projection: output features split across TP ranks.
-
-    Stores the weight as ``[out_features / tp, in_features]`` -- HF's own
-    ``[out, in]`` layout cut on dim 0, which is the ``w_shard_n = [N / R, K]``
-    layout ``AllGatherLinear`` contracts for (the op self-transposes).
-
-    forward all-gathers the sequence shard and leaves the activation feature-
-    sharded; backward is the dual (reduce-scatter of the input gradient, local
-    weight gradient).
-    """
-
-    shard_dim = 0
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # The collective primitives are strictly 2D (sequence-major rows), but
-        # the HF decoder feeds [B, T, K] hidden states: fold the leading dims
-        # and restore them after, with the row count multiplied by tp_size --
-        # that is the all-gathered sequence length.
-        if x.ndim not in (2, 3):
-            raise ValueError("TP projection input must be [T, K] or [1, T, K]")
-        if x.ndim == 3 and x.shape[0] != 1:
-            raise ValueError(
-                "TP realizers gather/reduce rows in rank order; a batched "
-                f"[B, T, K] input with B={x.shape[0]} would interleave batches "
-                "across ranks after the fold. Flatten to [T, K] or keep B=1 "
-                "(the HF wrapper always runs B=1)."
-            )
-        lead = x.shape[:-1]
-        x_2d = x.reshape(-1, x.shape[-1])
-        if self.use_symm_mem:
-            y_2d = AllGatherLinear.apply(
-                x_2d, self.weight, None, self.group, self.group.group_name
-            )
-        else:
-            y_2d = all_gather_linear(x_2d, self.weight, self.group)
-        return y_2d.reshape(*lead[:-1], lead[-1] * self.tp_size, y_2d.shape[-1])
-
-
-class RowParallelLinear(ShardedLinear):
-    """Row-parallel projection: input features split across TP ranks.
-
-    Stores the weight as ``[out_features, in_features / tp]`` -- HF's layout cut
-    on dim 1, which is what ``LinearReduceScatter`` expects.
-
-    forward multiplies the feature-sharded activation and reduce-scatters the
-    partial sums back to a sequence shard; backward is the dual (all-gather of the
-    output gradient, local weight gradient).
-    """
-
-    shard_dim = 1
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Mirror of ColumnParallelLinear.forward: fold to 2D for the collective, then
-        # restore the leading dims with the row count divided by tp_size --
-        # that is the reduce-scattered sequence shard.
-        if x.ndim not in (2, 3):
-            raise ValueError("TP projection input must be [T, K] or [1, T, K]")
-        if x.ndim == 3 and x.shape[0] != 1:
-            raise ValueError(
-                "TP realizers gather/reduce rows in rank order; a batched "
-                f"[B, T, K] input with B={x.shape[0]} would interleave batches "
-                "across ranks after the fold. Flatten to [T, K] or keep B=1 "
-                "(the HF wrapper always runs B=1)."
-            )
-        lead = x.shape[:-1]
-        x_2d = x.reshape(-1, x.shape[-1])
-        if self.use_symm_mem:
-            y_2d = LinearReduceScatter.apply(
-                x_2d, self.weight, None, self.group, self.group.group_name
-            )
-        else:
-            y_2d = linear_reduce_scatter(x_2d, self.weight, self.group)
-        return y_2d.reshape(*lead[:-1], lead[-1] // self.tp_size, y_2d.shape[-1])
-
-
-class ColwiseLinearNoGather(ShardedLinear):
-    """Column-parallel projection without the fused sequence all-gather.
-
-    Same weight shard as :class:`ColumnParallelLinear` (``[out / tp, in]``) but a plain
-    local GEMM, for sites whose input is already full-sequence: the attention
-    boundary gather (``GatherSequenceFirst``) runs upstream, because HF
-    attention derives q/k/v shapes from ``hidden_states`` and cannot absorb a
-    projection whose output is physically longer than its input.
-
-    The backward is exact without any collective here: the rowwise o_proj's
-    backward all-gather reassembles the full-sequence, total-loss output
-    gradient before attention's backward runs, so the local ``dy.T @ x`` is the
-    complete weight gradient for this rank's feature shard.
-    """
-
-    shard_dim = 0
-    uses_collectives = False
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(x, self.weight)
+__all__ = ["apply_tp", "resolve_tp_plan"]
 
 
 class GatherSequenceFirst:
@@ -386,7 +188,6 @@ class ReplicatedAttentionSequenceBoundary:
 # the expert weights are stacked parameters on the experts module -- so they
 # resolve to None in the plan and are realized by ``realize_moe_blocks_tp``
 # below, which is what keeps the refusal-to-replicate validation honest.
-MOE_PLAN_SPECS = frozenset({"packed_colwise", "packed_rowwise", "moe_tp_experts"})
 
 
 class TPMoeSequenceBoundary:
@@ -469,13 +270,13 @@ def shard_shared_expert_for_tp(
     for _, dim, _, weight in projections:
         if id(weight) not in shards:
             shards[id(weight)] = nn.Parameter(
-                shard_weight(weight, dim, tp_size=tp_size, tp_rank=tp_rank),
+                tp_linear.shard_weight(weight, dim, tp_size=tp_size, tp_rank=tp_rank),
                 requires_grad=weight.requires_grad,
             )
     # Allocation failure must preserve both weights and feature metadata.
     for name, dim, proj, weight in projections:
         proj._tp_init_specs = {
-            "weight": _TPInitializationSpec(
+            "weight": tp_linear.TPInitializationSpec(
                 type(proj), tuple(weight.shape), dim, tp_size, tp_rank
             )
         }
@@ -543,158 +344,33 @@ def shard_experts_for_tp(
     down = experts.down_proj
     hidden = expert_tp_hidden_size(block, tp_size=tp_size)
 
-    gate_shard = shard_weight(gate_up[:, :hidden], 1, tp_size=tp_size, tp_rank=tp_rank)
-    up_shard = shard_weight(gate_up[:, hidden:], 1, tp_size=tp_size, tp_rank=tp_rank)
+    gate_shard = tp_linear.shard_weight(
+        gate_up[:, :hidden], 1, tp_size=tp_size, tp_rank=tp_rank
+    )
+    up_shard = tp_linear.shard_weight(
+        gate_up[:, hidden:], 1, tp_size=tp_size, tp_rank=tp_rank
+    )
     with torch.no_grad():
         sharded_gate_up = nn.Parameter(
             torch.cat([gate_shard, up_shard], dim=1).contiguous(),
             requires_grad=gate_up.requires_grad,
         )
         sharded_down = nn.Parameter(
-            shard_weight(down, 2, tp_size=tp_size, tp_rank=tp_rank),
+            tp_linear.shard_weight(down, 2, tp_size=tp_size, tp_rank=tp_rank),
             requires_grad=down.requires_grad,
         )
     # Finish allocation before replacing either original parameter.
     experts._tp_init_specs = {
-        "gate_up_proj": _TPInitializationSpec(
+        "gate_up_proj": tp_linear.TPInitializationSpec(
             type(experts), tuple(gate_up.shape), 1, tp_size, tp_rank, packed=True
         ),
-        "down_proj": _TPInitializationSpec(
+        "down_proj": tp_linear.TPInitializationSpec(
             type(experts), tuple(down.shape), 2, tp_size, tp_rank
         ),
     }
     experts.gate_up_proj = sharded_gate_up
     experts.down_proj = sharded_down
     return frozenset({"experts.gate_up_proj", "experts.down_proj"})
-
-
-@dataclass(frozen=True)
-class ShardingConfig:
-    """How one projection is sharded on the TP axis.
-
-    Attributes:
-        kind: ``"colwise"`` or ``"rowwise"`` -- the direction the weight is cut.
-        implementation: the module class that realizes this declaration. Paired
-            here rather than looked up from ``kind`` so a caller can swap in a
-            different realizer (e.g. a fused-QKV variant) without touching the
-            engine.
-    """
-
-    kind: ShardKind
-    implementation: type[nn.Module]
-
-    def __post_init__(self) -> None:
-        if self.kind not in ("colwise", "rowwise"):
-            raise ValueError(f"Unknown shard kind {self.kind!r}")
-
-
-def colwise() -> ShardingConfig:
-    """Output features split; activations stay feature-sharded after the GEMM."""
-    return ShardingConfig(kind="colwise", implementation=ColumnParallelLinear)
-
-
-def rowwise() -> ShardingConfig:
-    """Input features split; activations reduce-scatter back to a sequence shard."""
-    return ShardingConfig(kind="rowwise", implementation=RowParallelLinear)
-
-
-# -- engine -------------------------------------------------------------------
-
-
-def model_tp_config(model: nn.Module) -> Mapping[str, str | ShardingConfig]:
-    """The TP plan ``model`` declares, or ``{}``.
-
-    Prefers the explicit model's ``tp_config`` property and keeps legacy plan
-    attributes only at the external compatibility boundary.
-    """
-    declared = getattr(model, "tp_config", None)
-    if declared is not None:
-        return declared
-    # Explicit model contracts must not inherit private plans from a reference
-    # base class. Those plans are often relative to another module tree and an
-    # empty explicit declaration must fail before any sharding occurs.
-    if getattr(model, "decoder_structure", None) is not None:
-        return {}
-    return (
-        getattr(model, "_tp_config", None)
-        or getattr(model, "_tp_plan", None)
-        or getattr(model, "tp_plan", None)
-        or {}
-    )
-
-
-def resolve_tp_sharding_plan(
-    model: nn.Module, *, plan: Mapping[str, str | ShardingConfig] | None = None
-) -> dict[str, ShardingConfig | None]:
-    """Normalize an explicit or model-declared TP plan for dense projections.
-
-    Patterns retain insertion order. Colwise/rowwise specs become ShardingConfig;
-    replicated specs become None so matching leaves their modules intact.
-    Replicated projection gradients are reduced by the trainer.
-
-    MoE specs also become None: they name stacked expert parameters rather than
-    nn.Linear modules. resolve_tp_targets reads the raw plan to select the
-    structural MoE path. EP specs and unsupported replicated-activation layouts
-    raise instead of silently applying sequence-parallel realizers.
-    """
-    if plan is None:
-        plan = model_tp_config(model)
-    resolved: dict[str, ShardingConfig | None] = {}
-    for pattern, spec in plan.items():
-        if isinstance(spec, ShardingConfig):
-            resolved[pattern] = spec
-        elif spec == "colwise":
-            resolved[pattern] = colwise()
-        elif spec == "rowwise":
-            resolved[pattern] = rowwise()
-        elif spec == "embedding_rowwise":
-            # Realized by VocabParallelEmbedding; None prevents a broad dense
-            # pattern from overriding the first matching vocabulary entry.
-            resolved[pattern] = None
-        elif spec in {"replicated_with_grad_allreduce", "colwise_gather_output"}:
-            # Nothing for apply_tp to do: the projection stays whole on every
-            # rank. The ``_with_grad_allreduce`` half is already implemented --
-            # allreduce_replicated_tp_grads sums exactly these parameters'
-            # gradients -- so this entry only has to be understood, not acted
-            # on. Recorded as None rather than dropped so match still stops
-            # here instead of falling through to a broader later pattern.
-            resolved[pattern] = None
-        elif spec in MOE_PLAN_SPECS:
-            # MoE-under-TP, realized structurally in apply_tp (weight sharding
-            # in shard_experts_for_tp, activation collectives in
-            # TPMoeSequenceBoundary). None for
-            # the same first-match-wins reason as above, and so a pattern that
-            # happens to match an nn.Linear is left whole rather than wrongly
-            # swapped for a dense realizer.
-            resolved[pattern] = None
-        else:
-            raise ValueError(
-                f"Unsupported TP plan entry for {pattern!r}: {spec!r}. This "
-                "engine realizes 'colwise' / 'rowwise' (plus the replicated "
-                "'replicated_with_grad_allreduce' / 'colwise_gather_output' and "
-                "the MoE specs, which it leaves whole), and refuses HF's "
-                "replicated-activation styles: 'colwise_rep' / 'rowwise_rep' "
-                "keep the activation full on every rank, which is not the "
-                "layout the surrounding SP realizers produce or consume. "
-                "Rewrite the plan to 'colwise' / 'rowwise' for a model whose "
-                "ops tolerate sequence-parallel activations, or run it without "
-                "TP."
-            )
-    return resolved
-
-
-def match_tp_sharding_spec(
-    module_path: str, *, plan: dict[str, ShardingConfig | None]
-) -> ShardingConfig | None:
-    """Return the first matching TP specification, preserving plan order.
-
-    A matching ``None`` entry leaves the module replicated and stops lookup;
-    later sharding patterns cannot override it. No match also returns ``None``.
-    """
-    for pattern, spec in plan.items():
-        if module_name_matches(module_path, pattern=pattern):
-            return spec
-    return None
 
 
 def supports_symm_mem(tp_mesh: DeviceMesh) -> bool:
@@ -740,9 +416,9 @@ def tp_sharded_param_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
         for module in part.modules()
         if isinstance(
             module,
-            ColumnParallelLinear
-            | RowParallelLinear
-            | ColwiseLinearNoGather
+            tp_linear.ColumnParallelLinear
+            | tp_linear.RowParallelLinear
+            | tp_linear.ColwiseLinearNoGather
             | VocabParallelEmbedding,
         )
     }
@@ -762,67 +438,14 @@ def tp_sharded_param_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
     return sharded_ids
 
 
-def resolve_vocab_parallel_targets(
-    model: nn.Module, plan: Mapping[str, str | ShardingConfig]
-) -> list[tuple[str, nn.Embedding]]:
-    """Resolve HF ``embedding_rowwise`` entries in first-match plan order."""
-    return [
-        (path, module)
-        for path, module in model.named_modules()
-        if isinstance(module, nn.Embedding)
-        and next(
-            (
-                spec
-                for pattern, spec in plan.items()
-                if module_name_matches(path, pattern=pattern)
-            ),
-            None,
-        )
-        == "embedding_rowwise"
-    ]
-
-
-def resolve_tp_overrides(
-    model: nn.Module, *, cfg: ParallelConfig, allow_unmatched: bool = False
-) -> dict[str, str]:
-    """Validate explicit overrides before splitting or transforming the model."""
-    configured_plan = dict.fromkeys(cfg.tp_config.tp_colwise_modules, "colwise")
-    for pattern in cfg.tp_config.tp_rowwise_modules:
-        if pattern in configured_plan:
-            raise ValueError(f"TP pattern {pattern!r} has conflicting styles")
-        configured_plan[pattern] = "rowwise"
-    if cfg.tp_config.tp_sequence_modules:
-        raise ValueError(
-            "tp_sequence_modules is not valid for llmtuner's fused sequence "
-            "parallel engine; normalization modules already consume the "
-            "sequence shard without a separate transformation"
-        )
-    names = [name for name, _ in model.named_modules()]
-    # Model defaults may be overridden; explicit overrides must agree.
-    for name in names:
-        matches = [
-            (pattern, style)
-            for pattern, style in configured_plan.items()
-            if module_name_matches(name, pattern=pattern)
-        ]
-        if len({style for _, style in matches}) > 1:
-            raise ValueError(
-                f"TP override patterns have conflicting styles for module "
-                f"{name!r}: {matches}"
-            )
-    if not allow_unmatched:
-        resolve_module_patterns(
-            names, patterns=list(configured_plan), plan_name="TP override"
-        )
-    return configured_plan
-
-
 def resolve_tp_targets(
     model: nn.Module,
     *,
     cfg: ParallelConfig,
-    plan: Mapping[str, str | ShardingConfig] | None = None,
-) -> tuple[list[tuple[str, nn.Linear, ShardingConfig]], list[tuple[str, nn.Module]]]:
+    plan: Mapping[str, str | tp_sharding.ShardingConfig] | None = None,
+) -> tuple[
+    list[tuple[str, nn.Linear, tp_sharding.ShardingConfig]], list[tuple[str, nn.Module]]
+]:
     """Validate the TP plan and split its matches into dense and MoE targets.
 
     Returns ``(targets, moe_blocks)`` where
@@ -833,10 +456,10 @@ def resolve_tp_targets(
     loud errors here, raised before any process-group access.
     """
     # A PP-local part may have no ownership of an otherwise valid override.
-    configured_plan = resolve_tp_overrides(
+    configured_plan = tp_sharding.resolve_tp_overrides(
         model, cfg=cfg, allow_unmatched=cfg.pp_size > 1
     )
-    raw_plan = model_tp_config(model) if plan is None else plan
+    raw_plan = tp_sharding.model_tp_config(model) if plan is None else plan
     if configured_plan:
         # Matching uses the first pattern; explicit overrides must come first.
         raw_plan = {
@@ -848,7 +471,7 @@ def resolve_tp_targets(
             },
         }
 
-    sharding_plan = resolve_tp_sharding_plan(model, plan=raw_plan)
+    sharding_plan = tp_sharding.resolve_tp_sharding_plan(model, plan=raw_plan)
     if not sharding_plan:
         raise ValueError(
             f"apply_tp with tp={cfg.tp_size}: {type(model).__name__} provides no TP "
@@ -857,10 +480,10 @@ def resolve_tp_targets(
             "model; shard the projections declaratively or set tp=1."
         )
 
-    targets: list[tuple[str, nn.Linear, ShardingConfig]] = []
+    targets: list[tuple[str, nn.Linear, tp_sharding.ShardingConfig]] = []
     for module_path, module in model.named_modules():
         if isinstance(module, nn.Linear):
-            spec = match_tp_sharding_spec(module_path, plan=sharding_plan)
+            spec = tp_sharding.match_tp_sharding_spec(module_path, plan=sharding_plan)
             if spec is not None:
                 if not module_path:
                     raise ValueError(
@@ -873,19 +496,29 @@ def resolve_tp_targets(
     # expert weights are stacked parameters), so it has to be detected on the
     # RAW plan, before resolve_tp_sharding_plan maps those specs to None.
     plan_declares_moe = any(
-        isinstance(spec, str) and spec in MOE_PLAN_SPECS for spec in raw_plan.values()
+        isinstance(spec, str) and spec in tp_sharding.MOE_PLAN_SPECS
+        for spec in raw_plan.values()
     )
     structure = getattr(model, "decoder_structure", None)
-    if plan_declares_moe and isinstance(structure, DecoderStructure):
+    declared_moe_ids: set[int] = set()
+    if isinstance(structure, DecoderStructure):
         for layer in model.get_submodule(structure.blocks):
             declaration = declared_moe_block(layer)
             if declaration is None:
-                raise ValueError(
-                    "Explicit TP decoder requires moe_block_name "
-                    "(None for a dense layer)"
-                )
+                if plan_declares_moe:
+                    raise ValueError(
+                        "Explicit TP decoder requires moe_block_name "
+                        "(None for a dense layer)"
+                    )
+                continue
             name, block = declaration
-            if block is not None and not _is_model_declared_moe(block):
+            if block is not None:
+                declared_moe_ids.add(id(block))
+            if (
+                plan_declares_moe
+                and block is not None
+                and not _is_model_declared_moe(block)
+            ):
                 raise UnsupportedCombinationError(
                     f"Declared MoE slot {type(layer).__name__}.{name} requires "
                     "a model-owned MoEBlockContract for TP planning"
@@ -899,9 +532,9 @@ def resolve_tp_targets(
     # Explicit models own sparse-block declarations. Never import/probe legacy
     # HF layouts while walking their dense children or unrelated modules.
     is_moe_block = (
-        _is_model_declared_moe
-        if isinstance(getattr(model, "decoder_structure", None), DecoderStructure)
-        else _is_moe_block
+        (lambda module: id(module) in declared_moe_ids)
+        if isinstance(structure, DecoderStructure)
+        else _is_model_declared_moe
     )
     moe_blocks: list[tuple[str, nn.Module]] = []
     bracketed_paths: list[str] = []
@@ -912,8 +545,7 @@ def resolve_tp_targets(
                 # idempotent per module): still counts as realized MoE TP.
                 bracketed_paths.append(module_path)
                 continue
-            # Blocks the probe refuses (GPT-OSS's transposed, bias-bearing
-            # experts) raise out of it here, before any weight is touched.
+            # Only model-declared mathematics enters the MoE TP path.
             if is_moe_block(module):
                 moe_blocks.append((module_path, module))
         if not moe_blocks and not bracketed_paths:
@@ -959,7 +591,7 @@ def resolve_tp_targets(
     if (
         nothing_sharded
         and not moe_deferred_to_ep
-        and not resolve_vocab_parallel_targets(model, raw_plan)
+        and not tp_sharding.resolve_vocab_parallel_targets(model, raw_plan)
     ):
         raise ValueError(
             f"apply_tp with tp={cfg.tp_size}: the plan patterns "
@@ -1092,7 +724,7 @@ def resolve_tp_plan(
     model: nn.Module,
     *,
     cfg: ParallelConfig,
-    plan: Mapping[str, str | ShardingConfig] | None = None,
+    plan: Mapping[str, str | tp_sharding.ShardingConfig] | None = None,
 ) -> ParallelPlan:
     """Resolve and validate TP locally, without a mesh or model mutation.
 
@@ -1115,7 +747,7 @@ def resolve_tp_plan(
     ):
         validate(tp_degree=cfg.tp_size, ep_degree=cfg.ep_size)
     # Resolve targets once before accessing process groups or changing weights.
-    raw_plan = model_tp_config(model) if plan is None else plan
+    raw_plan = tp_sharding.model_tp_config(model) if plan is None else plan
     if (
         plan is None
         and getattr(model, "decoder_structure", None) is not None
@@ -1126,7 +758,7 @@ def resolve_tp_plan(
             "TP plan; an empty plan would silently leave the model replicated"
         )
     targets, moe_blocks = resolve_tp_targets(model, cfg=cfg, plan=raw_plan)
-    vocab_targets = resolve_vocab_parallel_targets(model, raw_plan)
+    vocab_targets = tp_sharding.resolve_vocab_parallel_targets(model, raw_plan)
 
     # A head count that does not divide ``tp`` has no valid local head split,
     # and no downstream guard catches it: the projection-level check in
@@ -1136,6 +768,7 @@ def resolve_tp_plan(
     # ``head_shard_degree``); here the
     # model's own config is the first place the counts exist.
     structure = getattr(model, "decoder_structure", None)
+    declared_attentions: set[int] | None = None
     if isinstance(structure, DecoderStructure) and structure.attention is not None:
         declared_attentions = {
             id(module) for module in structure.bind_attentions(model)
@@ -1259,9 +892,14 @@ def resolve_tp_plan(
     for module_path, inner, spec in targets:
         parent_path, _, _ = module_path.rpartition(".")
         parent = model.get_submodule(parent_path)
-        if spec.kind == "colwise" and looks_like_attention(parent):
-            if spec.implementation is ColumnParallelLinear:
-                spec = replace(spec, implementation=ColwiseLinearNoGather)
+        is_attention = (
+            id(parent) in declared_attentions
+            if declared_attentions is not None
+            else looks_like_attention(parent)
+        )
+        if spec.kind == "colwise" and is_attention:
+            if spec.implementation is tp_linear.ColumnParallelLinear:
+                spec = replace(spec, implementation=tp_linear.ColwiseLinearNoGather)
             attention_parents[parent_path] = parent
         realized_targets.append((module_path, inner, spec))
 
@@ -1332,36 +970,15 @@ def validate_pipeline_tp_plan(
         or global_plan.degree != local_plan.degree
     ):
         raise ValueError("Pipeline TP plans must describe the same stage and degree")
-    local_plan.validate_binding(model)
-    modules = dict(model.named_modules(remove_duplicate=False))
-    expected = {}
-    for target in global_plan.targets:
-        module = modules.get(target.path)
-        if module is None or (
-            isinstance(module, nn.Identity)
-            and not isinstance(target.module, nn.Identity)
-        ):
-            continue
-        if (target.path, target.kind) in expected:
-            raise ValueError("Pipeline TP global plan contains duplicate targets")
-        expected[(target.path, target.kind)] = target
-    actual = {(target.path, target.kind): target for target in local_plan.targets}
-    if len(actual) != len(local_plan.targets):
-        raise ValueError("Pipeline TP local plan contains duplicate targets")
-    if expected.keys() != actual.keys():
-        raise ValueError(
-            "Pipeline TP target ownership changed: "
-            f"missing={sorted(expected.keys() - actual.keys())}, "
-            f"unexpected={sorted(actual.keys() - expected.keys())}"
-        )
-    for key, target in actual.items():
-        original = expected[key]
+    for original, target in validate_pipeline_targets(global_plan, local_plan, model):
+        key = (target.path, target.kind)
         if target.layout != original.layout or (
             target.kind == "dense" and target.spec != original.spec
         ):
             raise ValueError(
                 f"Pipeline TP layout or projection strategy changed: {key}"
             )
+    modules = dict(model.named_modules(remove_duplicate=False))
     local_history = dict(local_plan.token_history_requirements)
     for path, requirement in global_plan.token_history_requirements:
         module = modules.get(path)
@@ -1379,13 +996,13 @@ def apply_tp(
     mesh: DeviceMesh | None,
     cfg: ParallelConfig,
     *,
-    plan: Mapping[str, str | ShardingConfig] | None = None,
+    plan: Mapping[str, str | tp_sharding.ShardingConfig] | None = None,
     resolved_plan: ParallelPlan | None = None,
     on_replacement: ReplacementObserver | None = None,
 ) -> nn.Module:
     """Tensor-parallelize ``model`` in place. No-op when ``tp == 1``.
 
-    ``plan`` defaults to the model's HF ``tp_config`` (HF ships one for Qwen3,
+    ``plan`` defaults to the model's explicit ``tp_config`` (HF ships one for Qwen3,
     Llama, ...). Pass an explicit ``{path_pattern: ShardingConfig}`` to override
     it -- e.g. to leave a projection replicated or to use a different realizer.
     """
@@ -1471,7 +1088,7 @@ def apply_tp(
         )
         wrapped.train(inner.training)
         wrapped._tp_init_specs = {
-            "weight": _TPInitializationSpec(
+            "weight": tp_linear.TPInitializationSpec(
                 type(inner),
                 tuple(inner.weight.shape),
                 0 if spec.kind == "colwise" else 1,
@@ -1488,7 +1105,7 @@ def apply_tp(
         local_vocab_size = inner.num_embeddings // tp_size
         vocab_start = tp_rank * local_vocab_size
         wrapped = VocabParallelEmbedding(
-            shard_weight(inner.weight, 0, tp_size=tp_size, tp_rank=tp_rank),
+            tp_linear.shard_weight(inner.weight, 0, tp_size=tp_size, tp_rank=tp_rank),
             source=inner,
             vocab_start_index=vocab_start,
             vocab_end_index=vocab_start + local_vocab_size,
@@ -1496,7 +1113,7 @@ def apply_tp(
         )
         wrapped.train(inner.training)
         wrapped._tp_init_specs = {
-            "weight": _TPInitializationSpec(
+            "weight": tp_linear.TPInitializationSpec(
                 type(inner),
                 tuple(inner.weight.shape),
                 0,

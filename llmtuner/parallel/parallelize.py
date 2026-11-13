@@ -18,6 +18,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh
 
 from llmtuner.config.activation_checkpoint_config import (
@@ -32,18 +33,19 @@ from llmtuner.config.training_config import validate_activation_swap_options
 from ..accelerator.collectives import synchronize_local_errors
 from ..memory.activation_checkpoint import apply_ac, validate_ac_options
 from ..memory.activation_swap import apply_activation_swap
+from ..models.contracts import DecoderStructure
 from .compatibility import chunked_loss_fsdp
-from .context_parallel.context_parallel import apply_cp, resolve_cp_plan
-from .expert_parallel.expert_parallel import apply_ep, resolve_ep_plan
+from .context_parallel.context_parallel import apply_cp
+from .context_parallel.plan import resolve_cp_plan, validate_pipeline_cp_plan
+from .expert_parallel.expert_parallel import apply_ep
 from .expert_parallel.mc2_ops import validate_mc2_world_size
+from .expert_parallel.plan import resolve_ep_plan, validate_pipeline_ep_plan
 from .fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp,
     validate_fsdp_environment,
 )
-from .fully_shard_parallel.plan import (
-    FSDPPatternReferences,
-    resolve_pipeline_fsdp_configs,
-)
+from .fully_shard_parallel.ownership import FSDPPatternReferences
+from .fully_shard_parallel.plan import resolve_pipeline_fsdp_configs
 from .model_compile import apply_compile, validate_compile_environment
 from .pipeline_parallel.pipeline_parallel import (
     PipelineParallelSetup,
@@ -53,9 +55,9 @@ from .pipeline_parallel.pipeline_parallel import (
 )
 from .plan import ParallelPlan
 from .stages import STAGE_ORDER
+from .tensor_parallel.sharding import resolve_tp_overrides
 from .tensor_parallel.tensor_parallel import (
     apply_tp,
-    resolve_tp_overrides,
     resolve_tp_plan,
     validate_pipeline_tp_plan,
 )
@@ -70,6 +72,7 @@ def parallelize_model(
     cfg: ParallelConfig,
     mesh: DeviceMesh | None,
     parallel_dims: ParallelTopology | None,
+    error_group: ProcessGroup | None = None,
     device: torch.device | None = None,
     compile: bool = False,
     compile_config: CompileConfig | None = None,
@@ -93,28 +96,54 @@ def parallelize_model(
     ``PipelineParallelSetup`` containing local parts, stages, and schedule.
     Other runs return the transformed module.
 
-    With topology, standard CP plan failures are coordinated across its world
-    before CP kernel installation. Mesh-only callers retain local validation.
-    This boundary does not roll back earlier TP/EP changes or communication.
+    ``error_group`` names every peer that must stop on local preflight failure.
+    It must include all ranks participating in subsequent transforms. Without
+    an explicit group, existing callers retain default-group coordination;
+    CP preflight uses the topology world when available.
     """
 
-    validate_activation_swap_options(
-        activation_swap=activation_swap,
-        compile=compile,
-        activation_checkpoint=activation_checkpoint,
+    with (
+        synchronize_local_errors("Parallel option validation", group=error_group)
+        if error_group is not None
+        else nullcontext()
+    ):
+        validate_activation_swap_options(
+            activation_swap=activation_swap,
+            compile=compile,
+            activation_checkpoint=activation_checkpoint,
+        )
+        validate_ac_options(
+            activation_checkpoint,
+            selective=selective_ac,
+            memory_budget=memory_budget_ac,
+            region=region_ac,
+            compile_enabled=compile,
+        )
+    # Inspect only metadata on the original model, before any TP/EP/PP
+    # replacement. Local stages bind again after PP establishes ownership.
+    needs_blocks = (
+        activation_checkpoint not in ("none", "memory_budget")
+        or (activation_swap and activation_checkpoint != "full")
+        or (compile and compile_config is not None and compile_config.per_block)
     )
-    validate_ac_options(
-        activation_checkpoint,
-        selective=selective_ac,
-        memory_budget=memory_budget_ac,
-        region=region_ac,
-        compile_enabled=compile,
-    )
-    validate_fsdp_environment(cfg, parallel_dims)
+    if needs_blocks:
+        with synchronize_local_errors(
+            "Decoder transformation target validation", group=error_group
+        ):
+            structure = getattr(model, "decoder_structure", None)
+            if structure is not None:
+                if not isinstance(structure, DecoderStructure):
+                    raise TypeError(
+                        "Decoder transformations require a DecoderStructure"
+                    )
+                structure.bind_blocks(model)
+    validate_fsdp_environment(cfg, parallel_dims, error_group=error_group)
     # Backend registration and optional codegen imports are rank-local. Stop
     # every peer before any model transform if one environment is unavailable.
     if compile:
-        with synchronize_local_errors("Parallel compile environment validation"):
+        with synchronize_local_errors(
+            "Parallel compile environment validation", group=error_group
+        ):
             validate_compile_environment(compile_config)
 
     if chunked_loss_num_chunks > 1 and compile and parallel_dims is not None:
@@ -154,9 +183,7 @@ def parallelize_model(
             "ep": partial(
                 apply_ep, cfg=cfg, ep_group=ep_group, error_group=ep_error_group
             ),
-            "cp": partial(
-                apply_cp, mesh=dense_mesh, cfg=cfg, parallel_dims=parallel_dims
-            ),
+            "cp": partial(apply_cp, mesh=dense_mesh, cfg=cfg),
             "ac": partial(
                 apply_ac,
                 mode=activation_checkpoint,
@@ -193,22 +220,6 @@ def parallelize_model(
                 part = runners[name](
                     part, on_replacement=references.record_replacements
                 )
-            elif name == "cp" and cfg.cp_size > 1:
-                resolved_cp_plan = None
-                boundary = (
-                    synchronize_local_errors("CP plan validation", group=cp_error_group)
-                    if cp_error_group is not None
-                    else nullcontext()
-                )
-                with boundary:
-                    if cfg.cp_config.context_parallel_strategy != "kcp" and (
-                        getattr(part, "context_parallel_backend", "standard")
-                        != "compressor"
-                    ):
-                        resolved_cp_plan = resolve_cp_plan(part, cfg=cfg)
-                # Kernel construction, mesh access and model mutation are not
-                # rank-local preflight and must stay outside this boundary.
-                part = runners[name](part, resolved_plan=resolved_cp_plan)
             elif name == "fsdp" and references is not None:
                 part = runners[name](part, cfg=references.bind(part))
             else:
@@ -238,25 +249,36 @@ def parallelize_model(
             ep_error_group = parallel_dims.get_mesh("loss").get_group()
     tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
     # Include PP peers: a stage-local CP group cannot stop the other pipeline
-    # stages before they enter FSDP/schedule setup. PP partitioning guarantees
-    # the same number of local parts per rank, so these boundaries align.
+    # stages before they enter FSDP/schedule setup. Validate the original model
+    # before TP/EP transforms or PP partitioning, not each transformed part.
     # Resolve the already-owned world mesh/group outside the local-only body.
-    cp_error_group = (
-        parallel_dims.build_device_mesh().get_group()
-        if cfg.cp_size > 1 and parallel_dims is not None
-        else None
-    )
+    cp_error_group = error_group
+    if cp_error_group is None and cfg.cp_size > 1 and parallel_dims is not None:
+        cp_error_group = parallel_dims.build_device_mesh().get_group()
+    global_cp_plan = None
+    if cfg.cp_size > 1:
+        with (
+            synchronize_local_errors("CP backend validation", group=cp_error_group)
+            if cp_error_group is not None
+            else nullcontext()
+        ):
+            # Metadata-only preflight. Later stages resolve current bindings
+            # after PP/TP/EP establish the actual local instance.
+            global_cp_plan = resolve_cp_plan(model, cfg=cfg)
 
+    global_ep_plan = None
     if cfg.ep_size > 1 or cfg.ep_config.fixed_router:
         # Reject invalid expert layouts before TP replaces parameters or PP
         # copies/splits modules. This is metadata-only; the execution stage
         # resolves again against its post-TP/PP instance, never this snapshot.
         # Include the world, rather than only one EP group, because other
         # stages/ranks may subsequently enter shared FSDP or PP collectives.
-        with synchronize_local_errors("Expert parallel global plan validation"):
+        with synchronize_local_errors(
+            "Expert parallel global plan validation", group=error_group
+        ):
             if cfg.ep_config.ep_token_dispatcher == "mc2":
                 validate_mc2_world_size(cfg.ep_size)
-            resolve_ep_plan(
+            global_ep_plan = resolve_ep_plan(
                 model,
                 degree=cfg.ep_size,
                 implementation=cfg.ep_config.ep_token_dispatcher,
@@ -269,7 +291,9 @@ def parallelize_model(
         global_tp_plan = None
         # All PP stages must stop before splitting if any rank's global plan
         # is invalid. This body only inspects local metadata.
-        with synchronize_local_errors("Pipeline global plan validation"):
+        with synchronize_local_errors(
+            "Pipeline global plan validation", group=error_group
+        ):
             if global_batch_size is None:
                 raise ValueError(
                     "pp > 1 needs global_batch_size for microbatch validation; "
@@ -292,7 +316,9 @@ def parallelize_model(
         # references from the global preflight deliberately cannot cross this boundary.
         resolved_tp_plans = [None] * len(model_parts)
         if global_tp_plan is not None:
-            with synchronize_local_errors("Pipeline local TP plan validation"):
+            with synchronize_local_errors(
+                "Pipeline local TP plan validation", group=error_group
+            ):
                 resolved_tp_plans = [
                     resolve_tp_plan(part, cfg=cfg) for part in model_parts
                 ]
@@ -300,9 +326,32 @@ def parallelize_model(
                     model_parts, resolved_tp_plans, strict=True
                 ):
                     validate_pipeline_tp_plan(global_tp_plan, local_plan, part)
+        if global_cp_plan is not None:
+            with synchronize_local_errors(
+                "Pipeline local CP plan validation", group=error_group
+            ):
+                for part in model_parts:
+                    local_cp_plan = resolve_cp_plan(part, cfg=cfg)
+                    validate_pipeline_cp_plan(global_cp_plan, local_cp_plan, part)
+        if global_ep_plan is not None:
+            # PP stage configuration can change declarations without replacing
+            # their tensors. Check every local part before any TP/EP transform.
+            with synchronize_local_errors(
+                "Pipeline local EP plan validation", group=error_group
+            ):
+                for part in model_parts:
+                    local_ep_plan = resolve_ep_plan(
+                        part,
+                        degree=cfg.ep_size,
+                        implementation=cfg.ep_config.ep_token_dispatcher,
+                        tp_enabled=cfg.tp_size > 1,
+                        quantile_balancing=cfg.ep_config.moe_quantile_balancing,
+                        has_ep_group=ep_group is not None,
+                    )
+                    validate_pipeline_ep_plan(global_ep_plan, local_ep_plan, part)
         # Part ownership is rank-local, but failure must stop all stages
         # before TP/EP/FSDP begin communicating on the resulting parts.
-        with synchronize_local_errors("Pipeline FSDP plan binding"):
+        with synchronize_local_errors("Pipeline FSDP plan binding", group=error_group):
             fsdp_configs = (
                 resolve_pipeline_fsdp_configs(model, model_parts, cfg)
                 if cfg.fsdp_config.fsdp_apply_modules
@@ -337,6 +386,8 @@ def parallelize_model(
     if cfg.tp_size > 1 and mesh is not None:
         # Local inspection only: coordinate failures before TP accesses its
         # communication group. The executor consumes exactly these bindings.
-        with synchronize_local_errors("Tensor parallel plan validation"):
+        with synchronize_local_errors(
+            "Tensor parallel plan validation", group=error_group
+        ):
             resolved_tp_plan = resolve_tp_plan(model, cfg=cfg)
     return apply_stages(model, dense_mesh=mesh, resolved_tp_plan=resolved_tp_plan)

@@ -1,20 +1,19 @@
-"""Pattern selection and explicit prefetch plans for FSDP units."""
+"""Resolve FSDP patterns, shared ownership, policies and local PP bindings."""
 
 from __future__ import annotations
 
 import inspect
-from contextlib import nullcontext
-from dataclasses import replace
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from graphlib import CycleError, TopologicalSorter
+from types import MappingProxyType
 from typing import Any
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
-    FSDPModule,
     MixedPrecisionPolicy,
     OffloadPolicy,
     fully_shard,
@@ -22,267 +21,23 @@ from torch.distributed.fsdp import (
 from torch.distributed.tensor import Shard
 
 from llmtuner.config.parallel_config import ParallelConfig
-from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.utils.module_names import canonical_fqn
 
 from ...accelerator.capabilities import require
-from ...accelerator.collectives import synchronize_local_errors
 from ...models.common.moe.experts import GroupedExperts
 from ..module_patterns import compile_module_pattern, resolve_module_patterns
+from ..plan import ParallelPlan, PlanTarget
 from .fine_grained import get_fsdp_strategy, validate_fsdp_hook_target
+from .ownership import named_module_paths
 from .policies import (
-    build_fsdp_placement_fn,
-    disable_fsdp_gradient_division,
-    enable_fsdp_symm_mem,
     fsdp_shard_size,
     get_fsdp_reshard_after_forward_policy,
 )
 
-
-def _named_module_paths(model: nn.Module) -> dict[str, nn.Module]:
-    """Index physical module paths and their transparent-wrapper aliases."""
-    paths = dict(model.named_modules(remove_duplicate=False))
-    for name, module in tuple(paths.items()):
-        paths.setdefault(canonical_fqn(name), module)
-    return paths
-
-
-class FSDPPatternReferences:
-    """Keep programmatic overrides bound across module/parameter replacement.
-
-    Capture registered aliases before transforms, then resolve logical paths
-    immediately before FSDP. Objects retained under renamed paths remain valid.
-    Layout conversions that remove every alias require an explicit mapping;
-    rejecting them prevents silently losing an exclusion or hook override.
-    """
-
-    def __init__(self, model: nn.Module, cfg: ParallelConfig) -> None:
-        self.cfg = cfg
-        self.module_paths: dict[nn.Module, list[str]] = {}
-        self.parameter_paths: dict[nn.Parameter, list[str]] = {}
-        self.module_targets: dict[nn.Module, nn.Module] = {}
-        self.parameter_targets: dict[nn.Parameter, tuple[nn.Parameter, ...]] = {}
-        for name, module in model.named_modules(remove_duplicate=False):
-            self.module_paths.setdefault(module, []).append(canonical_fqn(name))
-        for name, parameter in model.named_parameters(remove_duplicate=False):
-            self.parameter_paths.setdefault(parameter, []).append(canonical_fqn(name))
-        self.unit_modules = dict(model.named_modules())
-        module_paths = _named_module_paths(model)
-        self.ignored_modules: dict[str, nn.Module | None] = {}
-        ignored = set()
-        for pattern in cfg.fsdp_config.fsdp_ignored_modules:
-            compiled = compile_module_pattern(pattern)
-            matches = {
-                name: module
-                for name, module in module_paths.items()
-                if compiled.fullmatch(name)
-            }
-            self.ignored_modules.update(matches or {pattern: None})
-            ignored.update(
-                child for module in matches.values() for child in module.modules()
-            )
-        self.ignored_parameters = {
-            parameter
-            for module in ignored
-            for parameter in module.parameters(recurse=False)
-        }
-        canonical_names = {module: name for name, module in self.unit_modules.items()}
-        self.unit_options: dict[str, dict[str, Any]] = {}
-        for pattern, options in cfg.fsdp_config.fsdp_apply_modules.items():
-            compiled = compile_module_pattern(pattern)
-            matches = [
-                canonical_names[module]
-                for name, module in module_paths.items()
-                if (name or pattern == "")
-                and module not in ignored
-                and compiled.fullmatch(name)
-            ]
-            # Patterns may intentionally name the native EP layout, which
-            # does not exist until conversion. Validate those at FSDP entry.
-            for name in matches or [pattern]:
-                self.unit_options.setdefault(name, {}).update(options)
-
-    def record_replacements(
-        self,
-        modules: dict[nn.Module, nn.Module],
-        parameters: dict[nn.Parameter, tuple[nn.Parameter, ...]],
-    ) -> None:
-        """Record explicit one-to-many mappings supplied by the conversion."""
-        contributors: dict[nn.Parameter, set[nn.Parameter]] = {}
-        for source, targets in parameters.items():
-            for target in targets:
-                contributors.setdefault(target, set()).add(source)
-        globally_ignored = {
-            parameter
-            for module in self.ignored_modules.values()
-            if module is not None
-            for parameter in module.parameters()
-        }
-        for name, options in self.unit_options.items():
-            exclusions = options.get("ignored_params") or set()
-            if not isinstance(exclusions, set):
-                continue  # Preserve the FSDP override type validation.
-            excluded = globally_ignored | exclusions
-            for sources in contributors.values():
-                if sources & excluded and not sources <= excluded:
-                    raise UnsupportedCombinationError(
-                        f"FSDP pattern {name!r}: cannot exclude part of a stacked "
-                        "expert parameter; exclude all source projections in "
-                        "the stack or use an unstacked expert layout"
-                    )
-        self.module_targets.update(modules)
-        self.parameter_targets.update(parameters)
-
-    def bind(self, model: nn.Module) -> ParallelConfig:
-        modules = {}
-        for name, module in model.named_modules(remove_duplicate=False):
-            # The outer transparent wrapper owns the logical boundary.
-            modules.setdefault(canonical_fqn(name), module)
-        parameters = {
-            canonical_fqn(name): parameter
-            for name, parameter in model.named_parameters(remove_duplicate=False)
-        }
-        current_modules = set(modules.values())
-        current_parameters = set(parameters.values())
-        first_module_paths: dict[int, str] = {}
-        for path, module in modules.items():
-            first_module_paths.setdefault(id(module), path)
-
-        def bind_parameters(
-            exclusions: set[nn.Parameter], context: str
-        ) -> set[nn.Parameter]:
-            rebound = set()
-            for parameter in exclusions:
-                targets = {
-                    parameters[path]
-                    for path in self.parameter_paths.get(parameter, ())
-                    if path in parameters
-                }
-                targets.update(
-                    target
-                    for target in self.parameter_targets.get(parameter, ())
-                    if target in current_parameters
-                )
-                if parameter in current_parameters:
-                    targets.add(parameter)
-                if not targets:
-                    raise ValueError(
-                        f"{context}: ignored_params lost its registered paths "
-                        "during model transformation; configure exclusions "
-                        "on the converted model"
-                    )
-                rebound.update(targets)
-            return rebound
-
-        overrides = {}
-        for name, source in self.unit_options.items():
-            pattern = canonical_fqn(name)
-            if pattern not in modules:
-                target = self.module_targets.get(self.unit_modules.get(name))
-                pattern = first_module_paths.get(id(target), pattern)
-            options = source.copy()
-            hook = options.get("hook_module")
-            if isinstance(hook, nn.Module):
-                targets = [
-                    modules[path]
-                    for path in self.module_paths.get(hook, ())
-                    if path in modules
-                ]
-                if targets:
-                    options["hook_module"] = targets[0]
-                elif self.module_targets.get(hook) in current_modules:
-                    options["hook_module"] = self.module_targets[hook]
-                elif hook not in current_modules:
-                    raise ValueError(
-                        f"FSDP pattern {pattern!r}: hook_module lost its registered "
-                        "paths during model transformation; configure the "
-                        "override on the converted model"
-                    )
-            exclusions = options.get("ignored_params")
-            if isinstance(exclusions, set):
-                options["ignored_params"] = bind_parameters(
-                    exclusions, f"FSDP pattern {pattern!r}"
-                )
-            overrides[pattern] = options
-        ignored_names = []
-        for name, source_module in self.ignored_modules.items():
-            name = canonical_fqn(name)
-            if name not in modules and source_module is not None:
-                target = self.module_targets.get(source_module, source_module)
-                name = first_module_paths.get(id(target), name)
-            ignored_names.append(name)
-        # A source subtree can split across owners (Kimi gate weight and
-        # correction bias). Preserve moved parameters without excluding the
-        # target parameter's entire new parent subtree.
-        module_exclusions: set[nn.Parameter] = set()
-        for pattern in ignored_names:
-            compiled = compile_module_pattern(pattern)
-            module_exclusions.update(
-                parameter
-                for name, module in modules.items()
-                if compiled.fullmatch(name)
-                for parameter in module.parameters()
-            )
-        moved_exclusions = (
-            bind_parameters(self.ignored_parameters, "FSDP ignored modules")
-            - module_exclusions
-        )
-        if moved_exclusions:
-            overrides.setdefault("", {})
-            for options in overrides.values():
-                exclusions = options.get("ignored_params")
-                if exclusions is None or isinstance(exclusions, set):
-                    options["ignored_params"] = (exclusions or set()) | moved_exclusions
-        return replace(
-            self.cfg,
-            fsdp_config=replace(
-                self.cfg.fsdp_config,
-                fsdp_apply_modules=overrides,
-                fsdp_ignored_modules=list(dict.fromkeys(ignored_names)),
-            ),
-        )
-
-
-def set_fsdp_prefetch_windows(
-    modules: list[nn.Module], *, forward_count: int, backward_count: int
-) -> None:
-    """Configure explicit forward and backward prefetch target windows.
-
-    Empty backward targets retain PyTorch's implicit prefetch policy. This
-    helper does not disable that policy or infer arbitrary forward execution
-    order; callers supply the ordered units.
-    """
-    for name, count in (
-        ("forward_count", forward_count),
-        ("backward_count", backward_count),
-    ):
-        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
-            raise ValueError(f"{name} must be a nonnegative integer, got {count!r}")
-    if len({id(module) for module in modules}) != len(modules):
-        raise ValueError("FSDP prefetch units must be distinct module objects")
-    for index, module in enumerate(modules):
-        for method in (
-            "set_modules_to_forward_prefetch",
-            "set_modules_to_backward_prefetch",
-        ):
-            if not callable(getattr(module, method, None)):
-                raise TypeError(f"FSDP prefetch unit {index} lacks callable {method}")
-    # Grouped fully_shard calls attach one state to several modules. Configure
-    # each state once, using its first occurrence in the supplied forward order.
-    # Otherwise later members overwrite the same state's prefetch windows.
-    units = []
-    seen_states = set()
-    for module in modules:
-        state = module._get_fsdp_state() if isinstance(module, FSDPModule) else module
-        if id(state) not in seen_states:
-            seen_states.add(id(state))
-            units.append(module)
-    modules = units
-    for index, module in enumerate(modules):
-        forward = modules[index + 1 : index + 1 + forward_count]
-        module.set_modules_to_forward_prefetch(forward)  # type: ignore[attr-defined]
-        backward = list(reversed(modules[max(0, index - backward_count) : index]))
-        module.set_modules_to_backward_prefetch(backward)  # type: ignore[attr-defined]
+__all__ = [
+    "FSDPPatternPlan",
+    "resolve_fsdp_pattern_plan",
+    "resolve_pipeline_fsdp_configs",
+]
 
 
 def _resolve_pattern_units(
@@ -292,7 +47,7 @@ def _resolve_pattern_units(
     # Keep physical paths available, while accepting the model's paths before
     # AC/whole-model compile inserted transparent wrappers. The outer module
     # wins at a wrapper boundary so selecting a block still selects its wrapper.
-    module_paths = _named_module_paths(model)
+    module_paths = named_module_paths(model)
     ignored_roots = resolve_module_patterns(
         list(module_paths),
         patterns=cfg.fsdp_config.fsdp_ignored_modules,
@@ -368,51 +123,97 @@ def resolve_pipeline_fsdp_configs(
         validate_fsdp_ignored_parameters(
             options.get("ignored_params"), parameters=source_parameters, unit_name=name
         )
-    module_names = {module: name for name, module in source_modules.items()}
+    source_paths = dict(model.named_modules(remove_duplicate=False))
+    module_aliases: dict[nn.Module, list[str]] = {}
+    for path, module in source_paths.items():
+        module_aliases.setdefault(module, []).append(path)
     parameter_names: dict[nn.Parameter, list[str]] = {}
     for name, parameter in model.named_parameters(remove_duplicate=False):
         parameter_names.setdefault(parameter, []).append(name)
     ignored_names = resolve_module_patterns(
-        list(dict(model.named_modules(remove_duplicate=False))),
+        list(source_paths),
         patterns=cfg.fsdp_config.fsdp_ignored_modules,
         plan_name="FSDP ignored",
     )
+
+    def local_module_binding(
+        source: nn.Module, local_modules: dict[str, nn.Module]
+    ) -> tuple[str, nn.Module] | None:
+        candidates = {
+            local_modules[path]: path
+            for path in reversed(module_aliases[source])
+            if path in local_modules
+            and not (
+                isinstance(local_modules[path], nn.Identity)
+                and not isinstance(source, nn.Identity)
+            )
+        }
+        if len(candidates) > 1:
+            raise ValueError(
+                "Pipeline FSDP module aliases no longer share one owner: "
+                f"{module_aliases[source]}"
+            )
+        return next(((path, module) for module, path in candidates.items()), None)
+
+    def local_parameter_bindings(
+        exclusions: set[nn.Parameter],
+        local_parameters: dict[str, nn.Parameter],
+    ) -> set[nn.Parameter]:
+        rebound = set()
+        for parameter in exclusions:
+            candidates = {
+                local_parameters[path]
+                for path in parameter_names[parameter]
+                if path in local_parameters
+            }
+            if len(candidates) > 1:
+                raise ValueError(
+                    "Pipeline FSDP parameter aliases no longer share one owner: "
+                    f"{parameter_names[parameter]}"
+                )
+            rebound.update(candidates)
+        return rebound
+
     configs = []
     for part in parts:
-        local_modules = dict(part.named_modules())
+        local_modules = dict(part.named_modules(remove_duplicate=False))
         local_parameters = dict(part.named_parameters(remove_duplicate=False))
+
         local_options = {}
         for name, overrides in unit_options.items():
-            if name not in local_modules:
+            binding = local_module_binding(source_modules[name], local_modules)
+            if binding is None:
                 continue
+            local_name, _ = binding
             options = overrides.copy()
             hook = options.get("hook_module")
             if hook is not None:
-                target = module_names.get(hook)
-                if target is None or target not in local_modules:
+                hook_binding = local_module_binding(hook, local_modules)
+                if hook_binding is None:
                     raise ValueError(
                         f"FSDP unit {name!r}: hook_module must belong to its "
                         "pipeline part"
                     )
-                options["hook_module"] = local_modules[target]
+                options["hook_module"] = hook_binding[1]
             exclusions = options.get("ignored_params")
             if exclusions is not None:
-                options["ignored_params"] = {
-                    local_parameters[path]
-                    for parameter in exclusions
-                    for path in parameter_names.get(parameter, ())
-                    if path in local_parameters
-                }
-            local_options[name] = options
+                options["ignored_params"] = local_parameter_bindings(
+                    exclusions, local_parameters
+                )
+            local_options.setdefault(local_name, {}).update(options)
+        local_ignored = [
+            binding[0]
+            for name in ignored_names
+            if (binding := local_module_binding(source_paths[name], local_modules))
+            is not None
+        ]
         configs.append(
             replace(
                 cfg,
                 fsdp_config=replace(
                     cfg.fsdp_config,
                     fsdp_apply_modules=local_options or {"": {}},
-                    fsdp_ignored_modules=[
-                        name for name in ignored_names if name in local_modules
-                    ],
+                    fsdp_ignored_modules=list(dict.fromkeys(local_ignored)),
                 ),
             )
         )
@@ -576,7 +377,43 @@ def validate_fsdp_pattern_options(
         validate_fsdp_hook_target([named_modules[name]], options["hook_module"])
 
 
-def apply_fsdp_by_pattern(
+@dataclass(frozen=True, slots=True)
+class FSDPPatternPlan:
+    """Validated child-first units and backend, without sharding model storage.
+
+    Bindings belong to the current instance. Execution copies each unit's option
+    dictionary before attaching runtime placement functions. Resolve again after
+    any structural or parameter replacement; do not cache plans across stages.
+    """
+
+    bindings: ParallelPlan
+    named_modules: Mapping[str, nn.Module]
+    units: tuple[tuple[tuple[str, ...], Mapping[str, Any]], ...]
+    expert_placements: Mapping[nn.Parameter, Shard]
+    expert_counts: Mapping[nn.Parameter, int]
+    shard_fn: Callable[..., Any]
+    ep_degree: int
+    edp_mesh: DeviceMesh | None
+    prefetch: tuple[int, int]
+    symm_mem_scope: str | None
+
+    def __post_init__(self) -> None:
+        # Snapshot containers, preserving the identity of modules, policies
+        # and borrowed meshes. The executor copies options before adding its
+        # placement functions; no tensor storage is duplicated here.
+        for name in ("named_modules", "expert_placements", "expert_counts"):
+            object.__setattr__(self, name, MappingProxyType(dict(getattr(self, name))))
+        object.__setattr__(
+            self,
+            "units",
+            tuple(
+                (tuple(names), MappingProxyType(dict(options)))
+                for names, options in self.units
+            ),
+        )
+
+
+def resolve_fsdp_pattern_plan(
     model: nn.Module,
     *,
     dp_mesh: DeviceMesh,
@@ -584,165 +421,144 @@ def apply_fsdp_by_pattern(
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
     edp_mesh: DeviceMesh | None = None,
-    error_group: dist.ProcessGroup | None = None,
-) -> None:
-    """Apply independently configured FSDP units selected by module patterns.
+) -> FSDPPatternPlan:
+    """Resolve ownership, policies and capabilities before wrapping any unit.
 
-    An explicit error_group coordinates local selection/override failures before
-    sharding. Every member must call in the same order; assembly supplies the
-    stage-local loss group, including dense and expert communication peers.
-    Standalone callers without a group retain local-only validation.
+    Only local metadata and backend availability are inspected. Process groups
+    must already exist; this resolver performs no collective or tensor copies.
     """
-    with (
-        synchronize_local_errors("FSDP pattern validation", group=error_group)
-        if error_group is not None
-        else nullcontext()
-    ):
-        # These checks only inspect local metadata. Do not put mesh creation or
-        # fully_shard inside this boundary: either may itself communicate.
-        named_modules, unit_options, ignored_params = _resolve_pattern_units(model, cfg)
-        validate_fsdp_pattern_options(
-            named_modules,
-            unit_options,
-            implementation=cfg.fsdp_config.fsdp_implementation,
-        )
-        expert_placements: dict[nn.Parameter, Shard] = {}
-        if cfg.ep_size > 1:
-            if edp_mesh is None:
-                raise ValueError("pattern FSDP with EP requires a sparse FSDP mesh")
-            degree = fsdp_shard_size(edp_mesh)
-            expert_placements = {
-                parameter: Shard(1 if degree > module.num_experts else 0)
-                for module in model.modules()
-                if isinstance(module, GroupedExperts)
-                for parameter in module.parameters(recurse=False)
-                if parameter not in ignored_params
-            }
-        else:
-            expert_counts = {
-                parameter: module.num_experts
-                for module in model.modules()
-                if isinstance(module, GroupedExperts)
-                for parameter in module.parameters(recurse=False)
-                if parameter not in ignored_params
-            }
-
-        shard_fn = get_fsdp_strategy(
-            cfg.fsdp_config.fsdp_implementation
-        ).get_fully_shard_fn()
-        common: dict[str, Any] = {
-            "mesh": dp_mesh,
-            "mp_policy": MixedPrecisionPolicy(
-                param_dtype=param_dtype,
-                reduce_dtype=reduce_dtype,
-                cast_forward_inputs=False,
-            ),
-            "ignored_params": ignored_params,
-            "reshard_after_forward": get_fsdp_reshard_after_forward_policy(
-                cfg.fsdp_config.fsdp_reshard_after_forward, cfg.pp_size > 1
-            ),
+    named_modules, unit_options, ignored_params = _resolve_pattern_units(model, cfg)
+    validate_fsdp_pattern_options(
+        named_modules,
+        unit_options,
+        implementation=cfg.fsdp_config.fsdp_implementation,
+    )
+    expert_placements: dict[nn.Parameter, Shard] = {}
+    expert_counts: dict[nn.Parameter, int] = {}
+    if cfg.ep_size > 1:
+        if edp_mesh is None:
+            raise ValueError("pattern FSDP with EP requires a sparse FSDP mesh")
+        degree = fsdp_shard_size(edp_mesh)
+        expert_placements = {
+            parameter: Shard(1 if degree > module.num_experts else 0)
+            for module in model.modules()
+            if isinstance(module, GroupedExperts)
+            for parameter in module.parameters(recurse=False)
+            if parameter not in ignored_params
         }
-        if cfg.fsdp_config.fsdp_cpu_offload:
-            common["offload_policy"] = CPUOffloadPolicy(
-                pin_memory=cfg.fsdp_config.fsdp_cpu_offload_pin_memory
-            )
+    else:
+        expert_counts = {
+            parameter: module.num_experts
+            for module in model.modules()
+            if isinstance(module, GroupedExperts)
+            for parameter in module.parameters(recurse=False)
+            if parameter not in ignored_params
+        }
 
-        grouped_options = _resolve_shared_fsdp_units(
-            model,
-            named_modules=named_modules,
-            unit_options=unit_options,
-            ignored_params=ignored_params,
-            common=common,
+    shard_fn = get_fsdp_strategy(
+        cfg.fsdp_config.fsdp_implementation
+    ).get_fully_shard_fn()
+    common: dict[str, Any] = {
+        "mesh": dp_mesh,
+        "mp_policy": MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            cast_forward_inputs=False,
+        ),
+        "ignored_params": ignored_params,
+        "reshard_after_forward": get_fsdp_reshard_after_forward_policy(
+            cfg.fsdp_config.fsdp_reshard_after_forward, cfg.pp_size > 1
+        ),
+    }
+    if cfg.fsdp_config.fsdp_cpu_offload:
+        common["offload_policy"] = CPUOffloadPolicy(
+            pin_memory=cfg.fsdp_config.fsdp_cpu_offload_pin_memory
         )
-        for names, options in grouped_options:
-            validate_fsdp_hook_target(
-                [named_modules[name] for name in names], options.get("hook_module")
-            )
-            # Reject every effective reshard policy before transforming any unit.
-            # HSDP uses the shard axis, not the total mesh size. Named SPMD meshes
-            # currently accept only bool/None for sharded DP in PyTorch 2.14.
-            reshard = options["reshard_after_forward"]
-            if reshard is None or isinstance(reshard, bool):
-                continue
-            if not isinstance(reshard, int):
-                raise ValueError(
-                    f"FSDP units {names}: reshard_after_forward must be bool, int "
-                    f"or None, got {reshard!r}"
-                )
-            mesh_dims = options.get("dp_mesh_dims")
-            if mesh_dims is not None:
-                if mesh_dims.shard is not None:
-                    raise NotImplementedError(
-                        f"FSDP units {names}: integer reshard_after_forward is not "
-                        "supported with sharded dp_mesh_dims in PyTorch 2.14"
-                    )
-                # Replicate-only named DP has no post-forward sharding policy.
-                continue
-            mesh = options["mesh"]
-            if mesh is None:
-                degree = torch.distributed.get_world_size()
-            else:
-                degree = mesh.size(0 if mesh.ndim == 1 else 1)
-            if reshard < 1 or reshard > degree or degree % reshard:
-                raise ValueError(
-                    f"FSDP units {names}: reshard_after_forward must be a positive "
-                    f"factor of shard mesh size {degree}, got {reshard}"
-                )
-        registration_order = {name: index for index, name in enumerate(named_modules)}
-        if (
-            cfg.ep_size > 1
-            and expert_placements
-            and any(
-                options.get("shard_placement_fn") is None
-                for _, options in grouped_options
-            )
-        ):
-            # Check before wrapping even units with custom placement functions:
-            # a later default unit must not fail after earlier units were mutated.
-            require(
-                "fsdp_per_param_mesh",
-                feature="expert parallelism combined with pattern-selected FSDP",
-            )
-    prefetch_units = []
-    for names, options in grouped_options:
-        if cfg.ep_size == 1 and expert_counts:
-            degree = fsdp_shard_size(options["mesh"])
-            expert_placements = {
-                parameter: Shard(1)
-                for parameter, count in expert_counts.items()
-                if degree > count
-            }
-        if (expert_placements or (cfg.ep_size == 1 and expert_counts)) and options.get(
-            "shard_placement_fn"
-        ) is None:
-            if cfg.ep_size > 1:
-                assert edp_mesh is not None
-                options["shard_placement_fn"] = build_fsdp_placement_fn(
-                    expert_placements, dp_mesh=options["mesh"], edp_mesh=edp_mesh
-                )
-            else:
-                options["shard_placement_fn"] = expert_placements.get
-        modules = [named_modules[name] for name in names]
-        shard_fn(modules[0] if len(modules) == 1 else modules, **options)
-        if "" not in names:
-            prefetch_units.append(
-                (min(registration_order[n] for n in names), modules[0])
-            )
-    # Use stable module registration order, independent of pattern ordering.
-    # Arbitrary model forward order cannot be inferred from named_modules().
-    set_fsdp_prefetch_windows(
-        [module for _, module in sorted(prefetch_units, key=lambda item: item[0])],
-        forward_count=cfg.fsdp_config.fsdp_forward_prefetch_count,
-        backward_count=cfg.fsdp_config.fsdp_backward_prefetch_count,
-    )
 
-    enable_fsdp_symm_mem(
+    grouped_options = _resolve_shared_fsdp_units(
         model,
-        cfg.fsdp_config.fsdp_symm_mem_scope
-        if cfg.fsdp_config.enable_fsdp_symm_mem
-        else None,
+        named_modules=named_modules,
+        unit_options=unit_options,
+        ignored_params=ignored_params,
+        common=common,
     )
-    disable_fsdp_gradient_division(model)
-
-
-__all__ = ["apply_fsdp_by_pattern", "set_fsdp_prefetch_windows"]
+    for names, options in grouped_options:
+        validate_fsdp_hook_target(
+            [named_modules[name] for name in names], options.get("hook_module")
+        )
+        # Reject every effective reshard policy before transforming any unit.
+        # HSDP uses the shard axis, not the total mesh size. Named SPMD meshes
+        # currently accept only bool/None for sharded DP in PyTorch 2.14.
+        reshard = options["reshard_after_forward"]
+        if reshard is None or isinstance(reshard, bool):
+            continue
+        if not isinstance(reshard, int):
+            raise ValueError(
+                f"FSDP units {names}: reshard_after_forward must be bool, int "
+                f"or None, got {reshard!r}"
+            )
+        mesh_dims = options.get("dp_mesh_dims")
+        if mesh_dims is not None:
+            if mesh_dims.shard is not None:
+                raise NotImplementedError(
+                    f"FSDP units {names}: integer reshard_after_forward is not "
+                    "supported with sharded dp_mesh_dims in PyTorch 2.14"
+                )
+            # Replicate-only named DP has no post-forward sharding policy.
+            continue
+        mesh = options["mesh"]
+        if mesh is None:
+            degree = torch.distributed.get_world_size()
+        else:
+            degree = mesh.size(0 if mesh.ndim == 1 else 1)
+        if reshard < 1 or reshard > degree or degree % reshard:
+            raise ValueError(
+                f"FSDP units {names}: reshard_after_forward must be a positive "
+                f"factor of shard mesh size {degree}, got {reshard}"
+            )
+    if (
+        cfg.ep_size > 1
+        and expert_placements
+        and any(
+            options.get("shard_placement_fn") is None for _, options in grouped_options
+        )
+    ):
+        # Check before wrapping even units with custom placement functions:
+        # a later default unit must not fail after earlier units were mutated.
+        require(
+            "fsdp_per_param_mesh",
+            feature="expert parallelism combined with pattern-selected FSDP",
+        )
+    return FSDPPatternPlan(
+        bindings=ParallelPlan(
+            stage="fsdp",
+            degree=fsdp_shard_size(dp_mesh),
+            degrees=(cfg.ep_size,),
+            implementation=cfg.fsdp_config.fsdp_implementation,
+            targets=tuple(
+                PlanTarget(name, "fsdp_unit", named_modules[name])
+                for names, _ in grouped_options
+                for name in names
+            ),
+            operations=("fully_shard",),
+            module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+            parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+            buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+        ),
+        named_modules=named_modules,
+        units=tuple((tuple(names), options) for names, options in grouped_options),
+        expert_placements=expert_placements,
+        expert_counts=expert_counts,
+        shard_fn=shard_fn,
+        ep_degree=cfg.ep_size,
+        edp_mesh=edp_mesh,
+        prefetch=(
+            cfg.fsdp_config.fsdp_forward_prefetch_count,
+            cfg.fsdp_config.fsdp_backward_prefetch_count,
+        ),
+        symm_mem_scope=(
+            cfg.fsdp_config.fsdp_symm_mem_scope
+            if cfg.fsdp_config.enable_fsdp_symm_mem
+            else None
+        ),
+    )

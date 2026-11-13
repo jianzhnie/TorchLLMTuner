@@ -87,13 +87,15 @@ class GarbageCollection:
         with GarbageCollection._ownership_lock:
             if self._closed:
                 return
-            self._closed = True
-            GarbageCollection._owners -= 1
-            if GarbageCollection._owners == 0:
+            if GarbageCollection._owners == 1:
+                # Commit ownership only after process state is restored. An
+                # interrupted/failed restore must leave this owner retryable.
                 if GarbageCollection._restore_enabled:
                     gc.enable()
                 else:
                     gc.disable()
+            GarbageCollection._owners -= 1
+            self._closed = True
 
     @staticmethod
     def collect(reason: str, *, generation: int = 1) -> None:

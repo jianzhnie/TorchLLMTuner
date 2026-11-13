@@ -23,10 +23,6 @@ cal_split_sizes = unsupported_qwen_cp
 split_tensor_to_group = unsupported_qwen_cp
 
 
-def get_ulysses_context():
-    return None, None, 1
-
-
 class GatedDeltaNet:
     @staticmethod
     def forward(*args, **kwargs):

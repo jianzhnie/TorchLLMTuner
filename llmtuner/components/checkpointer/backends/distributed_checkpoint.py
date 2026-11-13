@@ -629,7 +629,10 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             )
 
             state_dict = adapt_hf_model_state(
-                self.sd_adapter, states.get(MODEL), hf_state_dict
+                self.sd_adapter,
+                states.get(MODEL),
+                hf_state_dict,
+                error_group=getattr(self.sd_adapter, "error_group", None),
             )
             states[MODEL].load_state_dict(state_dict)
         else:
