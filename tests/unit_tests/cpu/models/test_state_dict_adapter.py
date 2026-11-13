@@ -9,14 +9,12 @@ import torch
 
 from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 
-HFTransformerStateDictAdapter = partial(ModelStateDictAdapter, model_prefix="model.")
+legacy_wrapper_adapter = partial(ModelStateDictAdapter, model_prefix="model.")
 
 
 @pytest.mark.parametrize("stores_head", [False, True])
 def test_tied_head_export_respects_checkpoint_index(stores_head):
-    adapter = HFTransformerStateDictAdapter(
-        SimpleNamespace(tie_word_embeddings=True), None
-    )
+    adapter = legacy_wrapper_adapter(SimpleNamespace(tie_word_embeddings=True), None)
     adapter._hf_keys = {"model.embed_tokens.weight"}
     if stores_head:
         adapter._hf_keys.add("lm_head.weight")
@@ -31,9 +29,7 @@ def test_tied_head_export_respects_checkpoint_index(stores_head):
 
 
 def test_tied_head_import_does_not_mutate_source():
-    adapter = HFTransformerStateDictAdapter(
-        SimpleNamespace(tie_word_embeddings=True), None
-    )
+    adapter = legacy_wrapper_adapter(SimpleNamespace(tie_word_embeddings=True), None)
     weight = torch.randn(4, 2)
     source = {"model.embed_tokens.weight": weight}
     imported = adapter.from_hf(source)
@@ -50,7 +46,7 @@ def test_composite_checkpoint_uses_text_weight_ties(text_tied):
         "llava", text_config={"tie_word_embeddings": text_tied}
     )
     config.tie_word_embeddings = not text_tied
-    adapter = HFTransformerStateDictAdapter(config, None)
+    adapter = legacy_wrapper_adapter(config, None)
     adapter._hf_keys = {"model.embed_tokens.weight"}
     weight = torch.randn(4, 2)
     source = {"model.embed_tokens.weight": weight}
@@ -72,9 +68,7 @@ def test_composite_checkpoint_uses_text_weight_ties(text_tied):
 def test_hf_index_checks_global_pipeline_keys(monkeypatch, complete):
     import llmtuner.components.checkpointer.model_state as adapter_module
 
-    adapter = HFTransformerStateDictAdapter(
-        SimpleNamespace(tie_word_embeddings=False), None
-    )
+    adapter = legacy_wrapper_adapter(SimpleNamespace(tie_word_embeddings=False), None)
     adapter._hf_keys = {"model.layers.0.weight", "model.layers.1.weight"}
     local_weight = torch.randn(2, 2)
     local = {"model.model.layers.0.weight": local_weight}
@@ -103,9 +97,7 @@ def test_hf_index_checks_global_pipeline_keys(monkeypatch, complete):
 
 
 def test_hf_index_still_rejects_missing_keys_without_distributed():
-    adapter = HFTransformerStateDictAdapter(
-        SimpleNamespace(tie_word_embeddings=False), None
-    )
+    adapter = legacy_wrapper_adapter(SimpleNamespace(tie_word_embeddings=False), None)
     adapter._hf_keys = {"model.layers.0.weight", "model.layers.1.weight"}
     with pytest.raises(ValueError, match="missing=.*model.layers.1.weight"):
         adapter.to_hf({"model.model.layers.0.weight": torch.zeros(2, 2)})
@@ -121,7 +113,7 @@ def test_single_file_checkpoint_loads_tied_head(tmp_path, stores_head):
     if stores_head:
         saved["lm_head.weight"] = weight.clone()
     save_file(saved, str(tmp_path / "model.safetensors"))
-    adapter = HFTransformerStateDictAdapter(
+    adapter = legacy_wrapper_adapter(
         SimpleNamespace(tie_word_embeddings=True), str(tmp_path)
     )
     local_weight = torch.zeros_like(weight)
@@ -139,15 +131,15 @@ def test_single_file_checkpoint_loads_tied_head(tmp_path, stores_head):
 
 
 def test_hf_key_mapping_rejects_collisions():
-    adapter = HFTransformerStateDictAdapter(SimpleNamespace(), None)
+    adapter = legacy_wrapper_adapter(SimpleNamespace(), None)
     with pytest.raises(ValueError, match="key mapping collision"):
         adapter.to_hf({"model.weight": torch.ones(1), "weight": torch.zeros(1)})
 
 
 @pytest.mark.parametrize("reverse", [False, True])
 def test_qwen3_import_rejects_router_key_collisions(reverse):
-    adapter = HFTransformerStateDictAdapter(
-        SimpleNamespace(model_type="qwen3_moe"), None, qwen3_expert_parallel=True
+    adapter = legacy_wrapper_adapter(
+        SimpleNamespace(model_type="qwen3_moe"), None, expert_parallel=True
     )
     entries = [
         ("model.layers.0.mlp.gate.weight", torch.ones(2, 2)),
@@ -177,7 +169,7 @@ def test_hf_reader_selects_each_tensor_from_its_indexed_file(tmp_path):
         ),
         encoding="utf-8",
     )
-    adapter = HFTransformerStateDictAdapter(SimpleNamespace(), None)
+    adapter = legacy_wrapper_adapter(SimpleNamespace(), None)
     restored = {"a": torch.zeros(1), "b": torch.zeros(1)}
     dcp.load(restored, storage_reader=adapter.get_hf_storage_reader(str(tmp_path)))
     torch.testing.assert_close(
@@ -204,7 +196,7 @@ def test_index_shard_grouping_survives_export_round_trip(tmp_path, filenames):
     (source_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": weight_map}), encoding="utf-8"
     )
-    adapter = HFTransformerStateDictAdapter(SimpleNamespace(), str(source_path))
+    adapter = legacy_wrapper_adapter(SimpleNamespace(), str(source_path))
     mapping = adapter.fqn_to_index_mapping
     assert set(mapping) == set(weight_map)
     assert set(mapping.values()) == {1, 2}
@@ -245,7 +237,7 @@ def test_invalid_index_is_rejected_during_adapter_construction(tmp_path, index):
         json.dumps(index), encoding="utf-8"
     )
     with pytest.raises(ValueError, match="weight_map"):
-        HFTransformerStateDictAdapter(SimpleNamespace(), str(tmp_path))
+        legacy_wrapper_adapter(SimpleNamespace(), str(tmp_path))
 
 
 def test_explicit_model_names_roundtrip_without_wrapper_prefix():
@@ -279,7 +271,7 @@ def test_explicit_tied_import_restores_alias_without_prefix_inference():
     assert exported["lm_head.weight"] is not weight
 
 
-@pytest.mark.parametrize("field", ["kimi_expert_parallel", "qwen3_expert_parallel"])
+@pytest.mark.parametrize("field", ["expert_parallel", "sharded_expert_parallel"])
 @pytest.mark.parametrize("value", [0, 1, "false", "true", None])
 def test_ep_layout_selector_rejects_nonboolean_before_checkpoint_io(
     field, value, monkeypatch

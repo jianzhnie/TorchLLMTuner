@@ -71,7 +71,7 @@ def test_expert_layout_rejects_inconsistent_down_width():
 @pytest.mark.parametrize("reordered", [False, True])
 def test_legacy_shared_projection_conversion_checks_expert_order(reordered):
     from llmtuner.errors import UnsupportedCombinationError
-    from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+    from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 
     model = torch.nn.Module()
     model.layers = torch.nn.ModuleList()
@@ -94,11 +94,11 @@ def test_legacy_shared_projection_conversion_checks_expert_order(reordered):
     second.experts = torch.nn.ModuleList(members[::-1] if reordered else members)
     if reordered:
         with pytest.raises(UnsupportedCombinationError, match="expert order"):
-            swap_hf_moe_blocks(model, router_aux_loss_coef=0.0)
+            swap_moe_blocks(model, router_aux_loss_coef=0.0)
         assert model.layers[0].mlp is first
         assert model.layers[1].mlp is second
     else:
-        assert swap_hf_moe_blocks(model, router_aux_loss_coef=0.0) == 2
+        assert swap_moe_blocks(model, router_aux_loss_coef=0.0) == 2
         grouped = [layer.mlp.routed_experts.inner_experts for layer in model.layers]
         for name in ("w1_EFD", "w3_EFD", "w2_EDF"):
             assert getattr(grouped[0], name) is getattr(grouped[1], name)

@@ -109,7 +109,7 @@ def test_kimi_grouped_export_loads_strictly_in_original_hf_model(latent, tmp_pat
     source = KimiLinearForCausalLM(config).eval()
     original = {key: value.clone() for key, value in source.state_dict().items()}
     swap_moe_blocks(source)
-    adapter = ModelStateDictAdapter(config, None, kimi_expert_parallel=True)
+    adapter = ModelStateDictAdapter(config, None, expert_parallel=True)
     exported = adapter.to_hf(source.state_dict())
     assert exported.keys() == original.keys()
     for key in original:

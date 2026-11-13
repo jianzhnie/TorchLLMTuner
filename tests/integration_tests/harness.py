@@ -20,7 +20,7 @@ of pinning a backend and the same script runs on CPU-only, NPU and CUDA hosts.
 Scope of ``LLMTUNER_TEST_DEVICE=cpu``: it redirects **this module's** placement
 and process group. It cannot redirect ``llmtuner``'s own: ``device_type`` is
 resolved once at import from the hardware, and the paths that place tensors
-themselves (``Trainer``, ``apply_fsdp``/``parallelize_hf_transformers``, the DCP
+themselves (``Trainer``, ``apply_fsdp``/``parallelize_model``, the DCP
 checkpointer) keep following it. So the switch gives the original CPU/gloo run
 for the scripts whose tensors this module places -- the pure-redistribution
 harnesses -- and a *starting* CPU for the rest, which then fail loudly on the

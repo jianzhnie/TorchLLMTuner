@@ -207,7 +207,7 @@ def test_ep_execution_rejects_incomplete_slot_coverage_before_allocation(
 
 
 @pytest.mark.parametrize(
-    "change", ["parameter", "device", "alias", "backend", "degree"]
+    "change", ["parameter", "device", "alias", "backend", "degree", "forward"]
 )
 def test_ep_target_plan_rejects_stale_or_incompatible_execution(change):
     model = _model()
@@ -217,7 +217,9 @@ def test_ep_target_plan_rejects_stale_or_incompatible_execution(change):
         implementation="torchao" if change == "backend" else "alltoall",
     )
     original_blocks = tuple(layer.mlp for layer in model.layers)
-    if change == "parameter":
+    if change == "forward":
+        model.layers[0].mlp.forward = lambda inputs: inputs
+    elif change == "parameter":
         experts = model.layers[0].mlp.experts
         experts.down_proj = torch.nn.Parameter(experts.down_proj.detach().clone())
     elif change == "device":

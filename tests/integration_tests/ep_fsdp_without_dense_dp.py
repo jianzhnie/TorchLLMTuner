@@ -30,6 +30,8 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from llmtuner.models.hf.factory import build_model_config_for
+from llmtuner.models.hf.model import HFTransformerModel
 from torch.distributed.tensor import DTensor, Replicate
 
 from llmtuner.accelerator.collectives import synchronize_local_errors
@@ -37,9 +39,7 @@ from llmtuner.accelerator.spmd import spmd_context
 from llmtuner.config import LLMTunerConfig, ModelConfig, ParallelConfig, TrainingConfig
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.models.common.aux_loss import in_checkpoint_recompute
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.parallelize import parallelize_hf_transformers
+from llmtuner.parallel.parallelize import parallelize_model
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 from llmtuner.utils.module_names import canonical_fqn
@@ -130,7 +130,7 @@ def main() -> None:
     torch.manual_seed(0)
     model = moved(HFTransformerModel(build_model_config_for(cfg)).to(dtype))
     reference = copy.deepcopy(model)
-    model = parallelize_hf_transformers(
+    model = parallelize_model(
         model,
         cfg=cfg.parallel,
         mesh=dims.spmd_dense_mesh(),

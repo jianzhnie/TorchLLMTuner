@@ -480,7 +480,10 @@ class AlignmentTrainer(Trainer):
                 DATALOADER,
             } <= self.checkpointer.states.keys()
             assert self.checkpointer.states[DATALOADER] is self.dataloader
-            assert self._chunked_loss_num_chunks == 1 and len(self.model_parts) == 1
+            assert (
+                self.training_engine.chunked_loss_num_chunks == 1
+                and len(self.model_parts) == 1
+            )
             dims = self.parallel_dims
             assert dims.dp_shard == 8 and dims.dp_replicate == 1
             assert (dims.tp, dims.cp, dims.pp, dims.ep) == (1, 1, 1, 1)

@@ -21,7 +21,7 @@ def main() -> None:
     if rank == 1:
         # Keep the peer's local conversion successful without introducing model
         # compute into a test whose subject is the real error collective.
-        expert_parallel.swap_hf_moe_blocks = lambda *args, **kwargs: 0
+        expert_parallel.swap_moe_blocks = lambda *args, **kwargs: 0
     try:
         expert_parallel.apply_ep(torch.nn.Linear(2, 2), cfg, ep_group=dist.group.WORLD)
     except Exception as error:

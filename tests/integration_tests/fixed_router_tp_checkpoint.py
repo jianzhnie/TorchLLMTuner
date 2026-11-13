@@ -29,7 +29,7 @@ from llmtuner.config.optimizer_config import OptimizerConfig
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.memory.activation_checkpoint import wrap_full
 from llmtuner.models.common.aux_loss import AuxLoss
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from llmtuner.parallel.fully_shard_parallel.fine_grained import fully_shard_fine_grained
 from llmtuner.parallel.fully_shard_parallel.plan import apply_fsdp_by_pattern
 from llmtuner.parallel.model_compile import apply_compile
@@ -63,7 +63,7 @@ def runtime(seed, recompute, compile_enabled, tp_group, dp_mesh=None, custom=Fal
             for name, dimension in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1))
         },
     }
-    swap_hf_moe_blocks(
+    swap_moe_blocks(
         target, fixed_router=True, tp_enabled=True, router_aux_loss_coef=0.03
     )
     decoder = MoEDecoder(target.layers[0].mlp)

@@ -1,9 +1,4 @@
-"""The compile step: gating, defaults, and the four compile-side toggles.
-
-``llmtuner/parallel/model_compile.py`` ports torchtitan's ``distributed/compile.py``:
-per-block compile, async TP, regional_inductor and capture_scalar_outputs,
-each behind its own switch so the default is the historical whole-model
-``torch.compile(model)``.
+"""Compile defaults, async TP and capture_scalar_outputs.
 
 These tests pin, on CPU with no process group:
 
@@ -12,9 +7,8 @@ These tests pin, on CPU with no process group:
   plain ``torch.compile(model)`` path;
 * per-block compile wraps every decoder layer and not the model;
 * the config-time loud errors: async TP without compile, async TP at tp=1;
-* the assembly-time loud errors: async TP without a TP mesh, async TP on a
-  torch without ``_micro_pipeline_tp``, a flex model on a non-inductor /
-  non-aot_eager backend, and regional_inductor on a torch that lacks it;
+* the assembly-time loud errors: async TP without a TP mesh or the required
+  Inductor micro-pipeline capability;
 * the MoE condition for ``capture_scalar_outputs`` (set when the model part
   carries token-choice MoE blocks, unset for a dense one), with the global
   restored afterwards.
@@ -35,7 +29,6 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeForCausalLM as ReferenceQwen3MoeForCausalLM,
 )
 
-from llmtuner.accelerator.capabilities import has
 from llmtuner.config import (
     CompileConfig,
     LLMTunerConfig,
@@ -44,7 +37,7 @@ from llmtuner.config import (
 )
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel import model_compile as compile_mod
-from llmtuner.parallel.model_compile import apply_compile, maybe_regional_inductor
+from llmtuner.parallel.model_compile import apply_compile
 from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
 
 try:
@@ -217,18 +210,6 @@ def test_per_block_compile_rejects_missing_layers_before_global_changes(monkeypa
         )
 
 
-def test_invalid_flex_backend_fails_before_async_tp_setup(monkeypatch):
-    model = torch.nn.Linear(2, 2)
-    model.uses_flex_attention = True
-
-    def unexpected(*args, **kwargs):
-        pytest.fail("Unsupported backend must fail before async TP global setup")
-
-    monkeypatch.setattr(compile_mod, "maybe_enable_async_tp", unexpected)
-    with pytest.raises(ValueError, match="neither 'inductor' nor 'aot_eager'"):
-        apply_compile(model, compile_config=CompileConfig(backend="eager"))
-
-
 @pytest.mark.parametrize("ndim,size", [(1, 1), (2, 4)])
 def test_async_tp_rejects_invalid_mesh_before_registration(monkeypatch, ndim, size):
     from types import SimpleNamespace
@@ -255,44 +236,6 @@ def test_async_tp_on_unsupported_torch_loud_raises(monkeypatch) -> None:
         )
 
 
-def test_regional_inductor_not_triggered_without_flex() -> None:
-    """CPU/sdpa model + aot_eager: the backend passes through unwrapped."""
-    backend = compile_mod.maybe_regional_inductor_backend(_model(), "aot_eager")
-    assert backend == "aot_eager"
-
-
-def test_flex_model_rejects_unknown_backend(monkeypatch) -> None:
-    model = _model()
-    monkeypatch.setattr(model, "uses_flex_attention", True, raising=False)
-    with pytest.raises(ValueError, match="neither 'inductor' nor 'aot_eager'"):
-        apply_compile(model, compile_config=CompileConfig(backend="eager"))
-
-
-def test_regional_inductor_on_unsupported_torch_loud_raises(monkeypatch) -> None:
-    model = _model()
-    monkeypatch.setattr(model, "uses_flex_attention", True, raising=False)
-    monkeypatch.setattr(compile_mod, "has", lambda capability: False)
-    with pytest.raises(NotImplementedError, match="regional_inductor"):
-        apply_compile(model, compile_config=CompileConfig(backend="aot_eager"))
-
-
-def test_missing_regional_backend_preserves_non_flex_compile(monkeypatch) -> None:
-    monkeypatch.setattr(compile_mod, "regional_inductor", None)
-    monkeypatch.setattr(compile_mod, "has", lambda capability: True)
-    model = _model()
-    assert (
-        compile_mod.maybe_regional_inductor_backend(model, "aot_eager") == "aot_eager"
-    )
-    monkeypatch.setattr(model, "uses_flex_attention", True, raising=False)
-    with pytest.raises(NotImplementedError, match="regional_inductor"):
-        compile_mod.maybe_regional_inductor_backend(model, "aot_eager")
-
-
-def test_maybe_regional_inductor_is_null_when_disabled() -> None:
-    with maybe_regional_inductor({}):
-        pass  # must be a no-op context on the default path
-
-
 def test_capture_scalar_outputs_set_only_for_token_choice_moe(monkeypatch) -> None:
     """The flag follows the MoE-dispatch condition, and only that condition.
 
@@ -311,72 +254,6 @@ def test_capture_scalar_outputs_set_only_for_token_choice_moe(monkeypatch) -> No
         torch._dynamo.config.capture_scalar_outputs = False
         apply_compile(_model(), compile_config=CompileConfig())
         assert torch._dynamo.config.capture_scalar_outputs is False
-
-
-@pytest.mark.skipif(
-    not has("fx_regional_inductor"), reason="regional inductor unavailable"
-)
-def test_regional_inductor_annotations_are_isolated_between_models(monkeypatch):
-    import torch.fx.traceback as fx_traceback
-
-    regional_model, inductor_model, untouched_model = (_model() for _ in range(3))
-    regional_model.uses_flex_attention = True
-    compile_mod.maybe_regional_inductor_backend(regional_model, "aot_eager")
-    compile_mod.maybe_regional_inductor_backend(inductor_model, "inductor")
-    annotations = []
-
-    @contextlib.contextmanager
-    def annotate(metadata):
-        annotations.append(metadata)
-        yield
-
-    monkeypatch.setattr(fx_traceback, "annotate", annotate)
-    for model, expected_count in (
-        (regional_model, 1),
-        (inductor_model, 1),
-        (untouched_model, 1),
-        (regional_model, 2),
-    ):
-        block = model.layers[0]
-        with compile_mod.maybe_regional_inductor(
-            {}, enabled=getattr(block, "_regional_inductor_enabled", False)
-        ):
-            pass
-        assert len(annotations) == expected_count
-    assert all("compile_with_inductor" in metadata for metadata in annotations)
-
-
-def test_cp_flex_annotations_cover_attention_and_exclude_collectives(monkeypatch):
-    from types import SimpleNamespace
-
-    import transformers.integrations.flex_attention as hf_flex
-
-    from llmtuner.parallel.context_parallel import attention
-
-    active = False
-
-    @contextlib.contextmanager
-    def annotate(config, *, enabled):
-        nonlocal active
-        assert enabled
-        active = True
-        yield
-        active = False
-
-    query = SimpleNamespace(is_cuda=True)
-    output = torch.randn(1, 4, 2, 8)
-
-    def flex(module, q, k, v, mask, **kwargs):
-        assert active
-        return output, None
-
-    monkeypatch.setattr(attention, "maybe_regional_inductor", annotate)
-    monkeypatch.setattr(hf_flex, "flex_attention_forward", flex)
-    actual = attention.run_flex(
-        SimpleNamespace(_regional_inductor_enabled=True), query, query, query, None, {}
-    )
-    assert not active
-    torch.testing.assert_close(actual, output.transpose(1, 2))
 
 
 @pytest.mark.parametrize("per_block", [False, True])
@@ -399,20 +276,6 @@ def test_compiled_cpu_training_matches_eager_outputs_and_gradients(per_block):
         torch.testing.assert_close(parameter.grad, reference_gradients[canonical_name])
 
 
-def test_unknown_backend_is_rejected_before_module_flags_change():
-    from torch._dynamo.exc import InvalidBackend
-
-    from llmtuner.parallel.model_compile import apply_compile
-
-    model = torch.nn.Linear(4, 4)
-    model._regional_inductor_enabled = True
-    with pytest.raises(InvalidBackend):
-        apply_compile(
-            model, compile_config=CompileConfig(backend="llmtuner_missing_backend")
-        )
-    assert model._regional_inductor_enabled is True
-
-
 @pytest.mark.parametrize("backend", ["eager", "aot_eager"])
 def test_async_tp_requires_inductor_backend(backend):
     from llmtuner.errors import ConfigError
@@ -421,28 +284,14 @@ def test_async_tp_requires_inductor_backend(backend):
         CompileConfig(backend=backend, enable_async_tensor_parallel=True)
 
 
-def test_async_tp_setup_failure_preserves_regional_flags():
-    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
-    model._regional_inductor_enabled = True
-    assert not hasattr(model[0], "_regional_inductor_enabled")
-    with pytest.raises(ValueError, match="tensor_parallel_size"):
-        apply_compile(
-            model, compile_config=CompileConfig(enable_async_tensor_parallel=True)
-        )
-    assert model._regional_inductor_enabled is True
-    assert not hasattr(model[0], "_regional_inductor_enabled")
-
-
 def test_missing_moe_compile_capability_fails_before_setup(monkeypatch):
     from llmtuner.errors import EnvironmentUnsupportedError
 
     model = torch.nn.Linear(4, 4)
-    model._regional_inductor_enabled = True
     monkeypatch.setattr(compile_mod, "collect_moe_layers", lambda model: [object()])
     monkeypatch.setattr(compile_mod, "has", lambda name: False)
     with pytest.raises(EnvironmentUnsupportedError, match="capture_scalar_outputs"):
         apply_compile(model, compile_config=CompileConfig(backend="eager"))
-    assert model._regional_inductor_enabled is True
 
 
 def test_compiled_qwen_training_matches_native_hf_trajectory():
@@ -547,24 +396,6 @@ def test_partial_block_compile_failure_restores_original_calls(
     assert all(
         dict(model.named_parameters())[key] is p for key, p in parameters.items()
     )
-
-
-@pytest.mark.parametrize("backend", ["inductor", "aot_eager"])
-def test_compile_failure_restores_regional_annotation_ownership(monkeypatch, backend):
-    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
-    model.uses_flex_attention = True
-    model._regional_inductor_enabled = True
-    model[0]._regional_inductor_enabled = False
-
-    def fail(*args, **kwargs):
-        raise RuntimeError("compile setup failed")
-
-    monkeypatch.setattr(torch, "compile", fail)
-    with pytest.raises(RuntimeError, match="compile setup failed"):
-        apply_compile(model, compile_config=CompileConfig(backend=backend))
-    assert model._regional_inductor_enabled is True
-    assert model[0]._regional_inductor_enabled is False
-    assert "_regional_inductor_enabled" not in model[1].__dict__
 
 
 @pytest.mark.parametrize("initial", [False, True])

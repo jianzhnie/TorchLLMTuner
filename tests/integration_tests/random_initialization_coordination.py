@@ -6,7 +6,7 @@ Only the local initializer failure is injected; no NPU acceptance claim.
 """
 
 from datetime import timedelta
-from types import MethodType, SimpleNamespace
+from types import MethodType
 
 import torch
 import torch.distributed as dist
@@ -55,11 +55,15 @@ def main() -> None:
                     raise ValueError("injected rank-local initialization failure")
 
             model.initialize_parameters = MethodType(fail_locally, model)
-            trainer = SimpleNamespace(
-                cfg=cfg, device=torch.device("cpu"), mesh=None, parallel_dims=None
-            )
             try:
-                _apply_parallelism(trainer, model, load_initial_weights=False)
+                _apply_parallelism(
+                    model,
+                    cfg=cfg,
+                    mesh=None,
+                    parallel_dims=None,
+                    device=torch.device("cpu"),
+                    load_initial_weights=False,
+                )
             except (ValueError, RuntimeError) as error:
                 if dist.get_rank() == failing_rank:
                     assert "injected rank-local" in str(error)

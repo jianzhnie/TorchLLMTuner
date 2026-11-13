@@ -38,6 +38,8 @@ import os
 
 import torch
 import torch.distributed as dist
+from llmtuner.models.hf.factory import build_model_config_for
+from llmtuner.models.hf.model import HFTransformerModel
 from torch.distributed.tensor import DTensor, Replicate
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
@@ -56,9 +58,7 @@ from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.models.common.moe.layer import MoE
-from llmtuner.models.hf.factory import build_model_config_for
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.expert_parallel import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel import swap_moe_blocks
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.module_names import canonical_fqn
 from tests.integration_tests.harness import device, moved, moved_batch
@@ -143,7 +143,7 @@ def _reference_trajectory(
     # blocks wire their auxiliary-loss buffers on the accelerator device, so a
     # CPU-resident oracle would mix devices inside the router.
     model = moved(HFTransformerModel(build_model_config_for(cfg)))
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     merged: dict[str, torch.Tensor] = {}
     for key in {key for state in initial_states for key in state}:
         values = [state[key] for state in initial_states if key in state]

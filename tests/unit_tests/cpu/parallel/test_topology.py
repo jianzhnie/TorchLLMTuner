@@ -373,7 +373,7 @@ def test_cp_only_still_needs_a_loss_reduction() -> None:
     ``dp_replicate * dp_shard * cp * tp``, so choosing it is choosing a group
     that spans both the cp and the tp axis. The end-to-end version runs under
     torchrun in
-    ``tests/integration_tests/cp_wiring_equivalence.py``.
+    ``tests/integration_tests/cp_sdpa_equivalence.py``.
     """
     cfg = _config(data_parallel_shard_size=1, context_parallel_kv_allgather_size=2)
     pd = resolve_parallel_topology(cfg, world_size=2)

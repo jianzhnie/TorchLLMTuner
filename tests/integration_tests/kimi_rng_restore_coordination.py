@@ -58,7 +58,7 @@ def main():
                     config,
                     None,
                     model_prefix="model.",
-                    kimi_expert_parallel=not source_grouped,
+                    expert_parallel=not source_grouped,
                 )
                 original = rng.load_state_dict
                 failure = ValueError("injected Kimi RNG setter failure")

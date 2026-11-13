@@ -1,10 +1,12 @@
 """Kimi all-to-all EP against independent full per-expert computation.
 
 Run: torchrun --nproc_per_node=2 tests/integration_tests/kimi_ep_equivalence.py
-CPU/Gloo, FP32, TP/PP/CP1; covers latent/shared/SituGLU and uneven/empty tokens.
+FP32, TP/PP/CP1; covers latent/shared/SituGLU and uneven/empty tokens.
+Uses the shared device/backend harness. Hide accelerators for CPU/Gloo runs.
 """
 
 from copy import deepcopy
+from datetime import timedelta
 
 from tests.caps import require_env
 
@@ -19,9 +21,10 @@ from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
+from tests.integration_tests.harness import init_distributed
 
 
-def run_case(*, latent, activation, empty):
+def run_case(*, device, latent, activation, empty):
     torch.manual_seed(17)
     config = KimiLinearConfig(
         hidden_size=8,
@@ -37,7 +40,7 @@ def run_case(*, latent, activation, empty):
     )
     model = nn.Module()
     layer = nn.Module()
-    source = KimiSparseMoE(config).eval()
+    source = KimiSparseMoE(config).to(device).eval()
     reference = deepcopy(source)
     layer.block_sparse_moe = source
     model.layers = nn.ModuleList([layer])
@@ -46,7 +49,7 @@ def run_case(*, latent, activation, empty):
     rank, size = dist.get_rank(), dist.get_world_size()
     torch.manual_seed(91 + rank)
     count = 0 if empty and rank == 0 else 3 + rank * 2
-    inputs = torch.randn(1, count, 8, requires_grad=True)
+    inputs = torch.randn(1, count, 8, device=device, requires_grad=True)
     other = inputs.detach().clone().requires_grad_()
     actual, expected = converted(inputs), reference(other)
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
@@ -97,7 +100,7 @@ def run_case(*, latent, activation, empty):
     # reconstruct another independently converted/sharded model on each rank.
     state = ModelCheckpointState(model).state_dict()
     adapter = ModelStateDictAdapter(
-        config, None, model_prefix="model.", kimi_expert_parallel=True
+        config, None, model_prefix="model.", expert_parallel=True
     )
     exported = adapter.to_hf({f"model.{key}": value for key, value in state.items()})
     reference_state = {
@@ -112,7 +115,7 @@ def run_case(*, latent, activation, empty):
         torch.testing.assert_close(exported[key], reference_state[key], atol=0, rtol=0)
     fresh = nn.Module()
     fresh_layer = nn.Module()
-    fresh_layer.block_sparse_moe = KimiSparseMoE(config).eval()
+    fresh_layer.block_sparse_moe = KimiSparseMoE(config).to(device).eval()
     fresh.layers = nn.ModuleList([fresh_layer])
     swap_moe_blocks(fresh, ep_group=dist.group.WORLD)
     imported = {
@@ -132,11 +135,13 @@ def run_case(*, latent, activation, empty):
 
 
 if __name__ == "__main__":
-    dist.init_process_group("gloo")
+    device = init_distributed(timeout=timedelta(seconds=120))
     try:
         for latent in (False, True):
             for activation in ("silu", "situ"):
                 for empty in (False, True):
-                    run_case(latent=latent, activation=activation, empty=empty)
+                    run_case(
+                        device=device, latent=latent, activation=activation, empty=empty
+                    )
     finally:
         dist.destroy_process_group()

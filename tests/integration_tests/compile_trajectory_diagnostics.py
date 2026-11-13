@@ -41,12 +41,12 @@ def isolated_backward(*, norm_override=None):
     """Compare native HF, eager wrapper and AOT without process groups."""
     import copy
 
-    from torch._dynamo.utils import counters
-
-    from llmtuner.config.compile_config import CompileConfig
     from llmtuner.models.hf.factory import build_model_config
     from llmtuner.models.hf.model import HFTransformerModel
     from llmtuner.models.qwen.qwen3.normalization_setup import _isolate_norm_input
+    from torch._dynamo.utils import counters
+
+    from llmtuner.config.compile_config import CompileConfig
     from llmtuner.parallel.model_compile import apply_compile
 
     torch.set_num_threads(1)
@@ -129,10 +129,10 @@ def replay_backward(workdir: str, rank: int):
     from contextlib import nullcontext
 
     import torch.distributed.checkpoint as dcp
-
-    from llmtuner.config.compile_config import CompileConfig
     from llmtuner.models.hf.factory import build_model_config
     from llmtuner.models.hf.model import HFTransformerModel
+
+    from llmtuner.config.compile_config import CompileConfig
     from llmtuner.parallel.model_compile import apply_compile
 
     root = Path(workdir)
@@ -835,7 +835,7 @@ def run():
 
     def observed_step(trainer, *args, **kwargs):
         update = trainer.optimizer.step
-        body = trainer._forward_backward_body
+        body = trainer.training_engine.forward_backward_dense
         batches = []
 
         def observed_body(inputs, labels, *, extra_kwargs, global_valid_tokens):
@@ -878,7 +878,7 @@ def run():
             return reduce(fsdp_params, unsharded_grads, *args, **kwargs)
 
         preclip = {}
-        loss_sum = trainer.loss_sum
+        loss_sum = trainer.training_engine.loss_sum
         logits_seen = []
 
         def observed_loss(logits, *args, **kwargs):
@@ -911,9 +911,11 @@ def run():
 
         with (
             patch.object(trainer.optimizer, "step", observed_update),
-            patch.object(trainer, "_forward_backward_body", observed_body),
+            patch.object(
+                trainer.training_engine, "forward_backward_dense", observed_body
+            ),
             patch.object(gradients, "clip_and_check_finite", observed_clip),
-            patch.object(trainer, "loss_sum", observed_loss),
+            patch.object(trainer.training_engine, "loss_sum", observed_loss),
             patch.object(_fsdp_param_group, "foreach_reduce", observed_reduce),
         ):
             return train_step(trainer, *args, **kwargs)

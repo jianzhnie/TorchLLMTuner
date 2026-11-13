@@ -47,12 +47,21 @@ def main() -> None:
         )
         model.set_cp_mesh(mesh["cp"], load_balancer=None)
         trainer = Trainer.__new__(Trainer)
+        from llmtuner.trainer.runtime.batch import prepare_model_inputs
+
         trainer.model = model
         trainer.model_parts = [model]
         trainer.device = torch.device("cpu")
         trainer.cfg = SimpleNamespace(max_seq_len=16)
         trainer.parallel_dims = SimpleNamespace(
             get_optional_mesh=lambda name: mesh[name] if name in ("cp", "tp") else None
+        )
+        trainer.preprocess = lambda value: prepare_model_inputs(
+            model,
+            value,
+            device=trainer.device,
+            parallel_dims=trainer.parallel_dims,
+            max_context_length=trainer.cfg.max_seq_len,
         )
         for axis, invalid_length in (("cp", 15), ("tp", 14)):
             for failing_rank in range(4):

@@ -22,7 +22,7 @@ import torch
 
 from llmtuner.config import ParallelConfig
 from llmtuner.config.parallel_config import ExpertParallelConfig
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from llmtuner.parallel.expert_parallel.token_dispatch import (
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
@@ -322,13 +322,13 @@ def test_swap_refuses_registered_gap_backends():
     # Backend gating runs before any model probing, so a stub model suffices.
     model = types.SimpleNamespace(layers=[])
     with pytest.raises(NotImplementedError, match="registered gap"):
-        swap_hf_moe_blocks(model, token_dispatcher="deepep")
+        swap_moe_blocks(model, token_dispatcher="deepep")
 
 
 def test_swap_refuses_unknown_backend():
     model = types.SimpleNamespace(layers=[])
     with pytest.raises(ValueError, match="ep_token_dispatcher must be one of"):
-        swap_hf_moe_blocks(model, token_dispatcher="fastep")
+        swap_moe_blocks(model, token_dispatcher="fastep")
 
 
 @pytest.mark.parametrize("backend", ["fastep", "deepep", "hybridep"])
@@ -339,7 +339,7 @@ def test_direct_swap_and_config_report_the_same_backend_error(backend):
             ep_config=ExpertParallelConfig(ep_token_dispatcher=backend),
         )
     with pytest.raises(type(config_error.value)) as swap_error:
-        swap_hf_moe_blocks(types.SimpleNamespace(layers=[]), token_dispatcher=backend)
+        swap_moe_blocks(types.SimpleNamespace(layers=[]), token_dispatcher=backend)
     assert str(swap_error.value) == str(config_error.value)
 
 

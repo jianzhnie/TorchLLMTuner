@@ -8,11 +8,10 @@ from torch import nn
 
 from llmtuner.datasets.contracts import Batch
 from llmtuner.models.common import input_preparation
-from llmtuner.models.common.attention.backend_names import ATTENTION_BACKEND
 from llmtuner.models.common.input_preparation import prepare_text_inputs
 
 
-@pytest.mark.parametrize("backend", ["sdpa", "eager", ATTENTION_BACKEND])
+@pytest.mark.parametrize("backend", ["sdpa", "eager"])
 @pytest.mark.parametrize("packed", [False, True])
 def test_unsharded_preparation_uses_declared_mask_semantics(backend, packed):
     positions = torch.tensor([0, 1, 0, 1])

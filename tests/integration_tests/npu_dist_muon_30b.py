@@ -109,12 +109,12 @@ def main():
         if slots < 1:
             raise ValueError("LLMTUNER_DIST_MUON_SLOTS must be positive")
         _optimizer_reshard_runtime._NUM_PIPELINE_SLOTS = slots
-    original = assembly._build_optimizer_stack
+    original = assembly.build_optimizer_stack
     counts = {}
 
-    def build_optimizer_stack(trainer):
+    def build_optimizer_stack(cfg, *, model_parts, parallel_dims):
         layouts = {}
-        for part in trainer.model_parts:
+        for part in model_parts:
             for name, _parameter in part.named_parameters():
                 if name.endswith(
                     ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight")
@@ -125,7 +125,7 @@ def main():
         assert layouts
         counts["dist_muon_parameters"] = len(layouts)
         print(f"DistMuon layout examples: {list(layouts)[:2]}", flush=True)
-        trainer.cfg.optimizer = OptimizerConfig(
+        cfg.optimizer = OptimizerConfig(
             learning_rate=1e-5,
             weight_decay=0.1,
             implementation="for-loop",
@@ -153,12 +153,12 @@ def main():
                 for index in range(48)
             ],
         )
-        original(trainer)
+        return original(cfg, model_parts=model_parts, parallel_dims=parallel_dims)
 
     profile = None
     if os.environ.get("LLMTUNER_DIST_MUON_PROFILE") == "1":
         profile = install_profile()
-    assembly._build_optimizer_stack = build_optimizer_stack
+    assembly.build_optimizer_stack = build_optimizer_stack
     try:
         trainer = Trainer(config)
     except BaseException:
@@ -166,7 +166,7 @@ def main():
             profile[1]()
         raise
     finally:
-        assembly._build_optimizer_stack = original
+        assembly.build_optimizer_stack = original
     started = time.perf_counter()
     try:
         parameter_dtypes = {

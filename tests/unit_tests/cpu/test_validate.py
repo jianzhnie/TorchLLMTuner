@@ -22,6 +22,7 @@ import torch
 
 from llmtuner.components.loss import IGNORE_INDEX
 from llmtuner.config import LLMTunerConfig, TrainingConfig, ValidationConfig
+from llmtuner.trainer.runtime.engine import TrainingEngine
 
 
 @pytest.mark.parametrize("failed", [False, True])
@@ -409,6 +410,18 @@ def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
     trainer.pp_has_first_stage = True
     trainer.pp_has_last_stage = True
     trainer.pp_schedule = _FakePPSchedule(per_mb_loss=6.0)
+    trainer.training_engine = TrainingEngine(
+        model_parts=trainer.model_parts,
+        parallel_dims=trainer.parallel_dims,
+        device=trainer.device,
+        max_context_length=cfg.max_seq_len,
+        chunked_loss_num_chunks=1,
+        param_context=trainer.param_context,
+        pp_schedule=trainer.pp_schedule,
+        pp_has_first_stage=True,
+        pp_has_last_stage=True,
+        pp_num_microbatches=cfg.parallel.pp_config.num_pp_microbatches,
+    )
     logged: dict[str, Any] = {}
     trainer.metrics = SimpleNamespace(
         add_tokens=lambda n: None,
@@ -573,9 +586,6 @@ def test_validate_restores_modes_after_partial_eval_setup(monkeypatch, error_typ
     )
     config = SimpleNamespace(attn_mask_type="causal")
     model.model = SimpleNamespace(config=config)
-    kernel = torch.nn.Module()
-    kernel.packed = False
-    model._titan_flex_kernel = kernel
     modes = {module: module.training for module in model.modules()}
 
     def unexpected(*args):
@@ -588,7 +598,6 @@ def test_validate_restores_modes_after_partial_eval_setup(monkeypatch, error_typ
     assert caught.value is original
     assert {module: module.training for module in model.modules()} == modes
     assert config.attn_mask_type == "causal"
-    assert kernel.packed is False
 
 
 @pytest.mark.parametrize("fail", [False, True])
@@ -617,13 +626,9 @@ def test_validation_override_restores_training_attention_mask(
     other_part = _EchoModel()
     other_part.model = SimpleNamespace(config=config)
     trainer.model_parts.append(other_part)
-    kernel = torch.nn.Module()
-    kernel.packed = True
-    trainer.model._titan_flex_kernel = kernel
 
     def run_loop(active_trainer, validation, step):
         assert config.attn_mask_type == expected
-        assert kernel.packed == (expected == "block_causal")
         if fail:
             raise RuntimeError("validation failed")
 
@@ -637,7 +642,6 @@ def test_validation_override_restores_training_attention_mask(
         assert not hasattr(config, "attn_mask_type")
     else:
         assert config.attn_mask_type == original
-    assert kernel.packed is True
 
 
 def test_kcp_rejects_packed_validation_before_loop(monkeypatch):

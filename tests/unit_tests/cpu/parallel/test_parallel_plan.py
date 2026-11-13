@@ -346,3 +346,49 @@ def test_plan_accepts_equivalent_decoder_declaration_without_tensor_changes():
     )
     model.decoder_structure = DecoderStructure(**declaration)
     plan.validate_binding(model)
+
+
+@pytest.mark.parametrize("replacement", ["instance", "class", "receiver"])
+def test_plan_rejects_changed_forward_without_parameter_changes(
+    monkeypatch, replacement
+):
+    class Projection(nn.Linear):
+        pass
+
+    model = nn.Sequential(Projection(3, 4))
+    plan = ParallelPlan(
+        "tp",
+        (),
+        2,
+        "native",
+        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+    )
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+    if replacement == "instance":
+        monkeypatch.setattr(model[0], "forward", lambda inputs: inputs)
+    elif replacement == "class":
+        monkeypatch.setattr(Projection, "forward", lambda self, inputs: inputs)
+    else:
+        monkeypatch.setattr(model[0], "forward", model.forward)
+    with pytest.raises(ValueError, match="Stale plan forward binding: 0"):
+        plan.validate_binding(model)
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert torch.equal(torch.get_rng_state(), rng)
+
+
+def test_plan_accepts_unchanged_bound_forward_and_inplace_weight_update():
+    model = nn.Sequential(nn.Linear(3, 4))
+    plan = ParallelPlan(
+        "tp",
+        (),
+        2,
+        "native",
+        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+    )
+    with torch.no_grad():
+        model[0].weight.add_(1)
+    plan.validate_binding(model)
+    plan.validate_binding(model)

@@ -1,7 +1,6 @@
 """Model-owned buffer reconstruction and allocated-parameter initialization."""
 
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,7 +9,7 @@ from llmtuner.config import LLMTunerConfig, ModelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.memory.materialization import materialize_meta_model
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
-from llmtuner.trainer.runtime.assembly import _build_model
+from llmtuner.trainer.runtime.assembly import build_model
 from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
 
 
@@ -28,7 +27,7 @@ def test_meta_construction_requires_model_lifecycle_before_allocation(
     monkeypatch.setattr(Qwen3MoeForCausalLM, method, None)
     monkeypatch.setattr(Qwen3MoeForCausalLM, "__init__", reject)
     with pytest.raises(UnsupportedCombinationError, match=method):
-        _build_model(SimpleNamespace(cfg=cfg, parallel_dims=None))
+        build_model(cfg, parallel_dims=None, device=torch.device("cpu"))
 
 
 def test_model_owned_meta_lifecycle_preserves_keys_aliases_and_initializer_rng():

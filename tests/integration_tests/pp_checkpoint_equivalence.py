@@ -183,7 +183,6 @@ from llmtuner.config.parallel_config import (
     FSDPConfig,
     PipelineParallelConfig,
 )
-from llmtuner.models.common.attention.backend_names import CP_SDPA_BACKEND
 from llmtuner.models.qwen.qwen3.model import (
     Qwen3MoeAttention,
     Qwen3MoeForCausalLM,
@@ -627,21 +626,6 @@ def _assert_shared_layers(trainer: Trainer) -> None:
         assert all(isinstance(layer, CheckpointWrapper) for layer in layers), (
             "requested AC must wrap every local decoder layer"
         )
-    if (
-        trainer.cfg.parallel.context_parallel_kv_allgather_size > 1
-        and trainer.cfg.parallel.context_parallel_ulysses_size == 1
-        and trainer.cfg.parallel.cp_config.context_parallel_strategy == "kv_allgather"
-        and harness_device().type == "npu"
-    ):
-        from llmtuner.parallel.context_parallel.sdpa_attention import CPSdpaKernel
-
-        for part in trainer.model_parts:
-            assert part.model.config._attn_implementation == CP_SDPA_BACKEND
-            kernels = [
-                module for module in part.modules() if type(module) is CPSdpaKernel
-            ]
-            assert kernels, "single-axis KV must use the production SDPA kernel"
-            assert all(kernel.cp_size == trainer.parallel_dims.cp for kernel in kernels)
     replica_size = int(os.environ.get("LLMTUNER_TEST_DP_REPLICATE_SIZE", "1"))
     if replica_size > 1:
         from torch.distributed.tensor import Replicate, Shard
@@ -666,19 +650,6 @@ def _assert_shared_layers(trainer: Trainer) -> None:
                 and parameter.to_local().numel() < parameter.numel()
                 for parameter in replicated_parameters
             ), "replicated CP scenario must retain actual parameter shards"
-    if (
-        trainer.cfg.parallel.context_parallel_kv_allgather_size > 1
-        and trainer.cfg.parallel.context_parallel_ulysses_size > 1
-        and harness_device().type == "npu"
-    ):
-        from llmtuner.parallel.context_parallel.sdpa_attention import DualCPSdpaKernel
-
-        assert all(
-            part.model.config._attn_implementation == CP_SDPA_BACKEND
-            and part.model.config._cp_sdpa_dual
-            and any(isinstance(module, DualCPSdpaKernel) for module in part.modules())
-            for part in trainer.model_parts
-        )
     norm_backend = os.environ.get("LLMTUNER_TEST_NORM_BACKEND", "native")
     if norm_backend in {"torch", "npu"}:
         for part in trainer.model_parts:

@@ -30,7 +30,11 @@ from llmtuner.config import (
     ParamGroupConfig,
 )
 from llmtuner.errors import ConfigError, UnsupportedCombinationError
-from llmtuner.trainer.runtime.assembly import _build_checkpointer
+from llmtuner.trainer.runtime.assembly import (
+    ModelAssembly,
+    OptimizerStack,
+    build_checkpointer,
+)
 from tests.caps import require_env
 
 
@@ -348,17 +352,23 @@ def test_virtual_residency_rejects_fsdp_cpu_offload():
 
 
 def test_disabled_checkpoint_does_not_validate_virtual_checkpoint_options():
-    trainer = SimpleNamespace(
-        cfg=SimpleNamespace(
-            optimizer=SimpleNamespace(state_residency="npu_virtual"),
-            checkpoint=SimpleNamespace(
-                enable=False, backend="torch_checkpointing", async_mode="async"
-            ),
+    cfg = SimpleNamespace(
+        optimizer=SimpleNamespace(state_residency="npu_virtual"),
+        checkpoint=SimpleNamespace(
+            enable=False, backend="torch_checkpointing", async_mode="async"
         ),
-        dataloader=None,
     )
     with pytest.raises(RuntimeError, match="dataloader must be initialized"):
-        _build_checkpointer(trainer, None)
+        build_checkpointer(
+            cfg,
+            None,
+            model_assembly=ModelAssembly(model=None, model_parts=[]),
+            optimizer_stack=OptimizerStack(None, None, None),
+            dataloader=None,
+            train_state=None,
+            device=torch.device("cpu"),
+            parallel_dims=None,
+        )
 
 
 def test_virtual_checkpoint_writer_disables_copy_ahead(monkeypatch, tmp_path):

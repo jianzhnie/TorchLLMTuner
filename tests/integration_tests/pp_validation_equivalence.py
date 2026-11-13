@@ -50,10 +50,8 @@ from llmtuner.config import (
 )
 from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.datasets.synthetic import RandomTokenSource
-from llmtuner.models.common.attention.backend_names import CP_SDPA_BACKEND
 from llmtuner.models.configuration import build_model_config_for
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
-from llmtuner.parallel.context_parallel.sdpa_attention import DualCPSdpaKernel
 from llmtuner.trainer.trainer import Trainer
 from tests.integration_tests.harness import device as harness_device
 
@@ -194,13 +192,6 @@ def main() -> None:
     assert trainer.parallel_dims.dp_shard == DP_SHARD
     assert trainer.parallel_dims.dp_replicate == DP_REPLICATE
     assert trainer.parallel_dims.cp == CP_KV * CP_ULYSSES
-    if CP_KV > 1 and CP_ULYSSES > 1 and harness_device().type == "npu":
-        assert all(
-            part.model.config._attn_implementation == CP_SDPA_BACKEND
-            and part.model.config._cp_sdpa_dual
-            and any(isinstance(module, DualCPSdpaKernel) for module in part.modules())
-            for part in trainer.model_parts
-        )
     if DP_REPLICATE > 1:
         for part in trainer.model_parts:
             parameters = list(part.parameters())

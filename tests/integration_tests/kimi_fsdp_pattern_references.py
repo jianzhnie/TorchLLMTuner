@@ -18,7 +18,7 @@ from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
-from llmtuner.parallel.parallelize import parallelize_hf_transformers
+from llmtuner.parallel.parallelize import parallelize_model
 from llmtuner.parallel.topology import ParallelTopology
 
 
@@ -89,7 +89,7 @@ def main():
             dims.build_device_mesh()
             if mode == "partial":
                 try:
-                    parallelize_hf_transformers(
+                    parallelize_model(
                         model, cfg=cfg, mesh=dims.spmd_dense_mesh(), parallel_dims=dims
                     )
                 except UnsupportedCombinationError as error:
@@ -99,7 +99,7 @@ def main():
                 assert model.layers[0].block_sparse_moe is source
                 assert {expert.w1.weight for expert in source.experts} == originals
             else:
-                parallelize_hf_transformers(
+                parallelize_model(
                     model, cfg=cfg, mesh=dims.spmd_dense_mesh(), parallel_dims=dims
                 )
                 grouped = model.layers[0].block_sparse_moe.routed_experts.inner_experts

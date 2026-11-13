@@ -68,7 +68,7 @@ def main():
                     config,
                     None,
                     model_prefix="model.",
-                    kimi_expert_parallel=not source_grouped,
+                    expert_parallel=not source_grouped,
                 )
                 try:
                     load_changed_kimi_layout(folder, states=states, adapter=adapter)

@@ -11,7 +11,7 @@ import torch.distributed as dist
 from torch import nn
 
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from tests.integration_tests.harness import init_distributed
 
 
@@ -59,7 +59,7 @@ def main():
             getattr(mixed_block.experts[1], names[0]).to(dtype=torch.bfloat16)
             original_parameters = tuple(mixed_model.parameters())
             try:
-                swap_hf_moe_blocks(
+                swap_moe_blocks(
                     mixed_model, ep_group=dist.group.WORLD, router_aux_loss_coef=0.0
                 )
             except UnsupportedCombinationError as error:
@@ -85,7 +85,7 @@ def main():
                 shared_model.layers[0].mlp = first
                 shared_model.layers[1].mlp = second
                 try:
-                    swap_hf_moe_blocks(
+                    swap_moe_blocks(
                         shared_model,
                         ep_group=dist.group.WORLD,
                         router_aux_loss_coef=0.0,
@@ -111,7 +111,7 @@ def main():
             untied = second_projection.weight
             second_projection.weight = getattr(original.experts[0], names[0]).weight
             try:
-                swap_hf_moe_blocks(model, ep_group=dist.group.WORLD)
+                swap_moe_blocks(model, ep_group=dist.group.WORLD)
             except UnsupportedCombinationError as error:
                 assert "shared individual expert parameter" in str(error)
             else:
@@ -124,7 +124,7 @@ def main():
             second_projection.weight = untied
             with torch.no_grad():
                 assert (
-                    swap_hf_moe_blocks(
+                    swap_moe_blocks(
                         model, ep_group=dist.group.WORLD, router_aux_loss_coef=0.0
                     )
                     == 1

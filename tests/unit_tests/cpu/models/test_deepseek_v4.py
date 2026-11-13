@@ -1,7 +1,6 @@
 """Native DeepSeek V4 construction and random-training contracts."""
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -21,6 +20,7 @@ from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
 from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.datasets.text.processors import require_token_prefix
+from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.memory.materialization import materialize_meta_model
 from llmtuner.models.deepseek.deepseek_v4.attention import DeepseekV4GroupedLinear
 from llmtuner.models.deepseek.deepseek_v4.compression import DeepseekV4CSACompressor
@@ -48,7 +48,8 @@ from llmtuner.models.deepseek.deepseek_v4.routing import (
     DeepseekV4HashRouter,
     DeepseekV4TopKRouter,
 )
-from llmtuner.trainer.runtime.assembly import _build_model
+from llmtuner.parallel.expert_parallel.model_replacement import resolve_ep_plan
+from llmtuner.trainer.runtime.assembly import build_model
 
 
 def test_grouped_projection_fullgraph_dynamic_forward_and_backward():
@@ -839,8 +840,9 @@ def test_eager_training_initializes_hash_buffers_without_replaying_weights(tmp_p
     config = small_config()
     config.save_pretrained(tmp_path)
     cfg = LLMTunerConfig(model=ModelConfig(model_name_or_path=str(tmp_path)))
-    trainer = SimpleNamespace(cfg=cfg, parallel_dims=None, device=torch.device("cpu"))
-    model, _, load_initial_weights = _build_model(trainer)
+    model, _, load_initial_weights = build_model(
+        cfg, parallel_dims=None, device=torch.device("cpu")
+    )
     assert not load_initial_weights
     table = model.model.layers[0].mlp.gate.tid2eid
     assert table.count_nonzero()
@@ -860,13 +862,14 @@ def test_initial_weight_loading_skips_random_training_buffers(tmp_path, monkeypa
     cfg.checkpoint.enable = True
     cfg.checkpoint.initial_load_in_hf = True
     cfg.checkpoint.initial_load_path = str(tmp_path)
-    trainer = SimpleNamespace(cfg=cfg, parallel_dims=None, device=torch.device("cpu"))
 
     def reject(self):
         raise AssertionError("Checkpoint targets must not initialize training buffers")
 
     monkeypatch.setattr(DeepseekV4ForCausalLM, "initialize_training_buffers", reject)
-    model, _, load_initial_weights = _build_model(trainer)
+    model, _, load_initial_weights = build_model(
+        cfg, parallel_dims=None, device=torch.device("cpu")
+    )
     assert load_initial_weights
     assert all(parameter.is_meta for parameter in model.parameters())
 
@@ -896,3 +899,28 @@ def test_v4_recipe_chat_template_preserves_supervision_boundary():
         tokenizer.encode(full, add_bos=True, add_eos=False),
         tokenizer.encode(prompt, add_bos=True, add_eos=False),
     )
+
+
+def test_parallel_validation_rejects_unimplemented_tp_ep_without_mutation():
+    model = DeepseekV4ForCausalLM(small_config())
+    parameters = tuple(model.parameters())
+    state = {name: value.clone() for name, value in model.state_dict().items()}
+    forwards = tuple(module.forward for module in model.modules())
+    rng = torch.get_rng_state().clone()
+
+    with pytest.raises(
+        UnsupportedCombinationError, match="does not declare a default TP plan"
+    ):
+        model.validate_parallel(tp_degree=2, ep_degree=1)
+    with pytest.raises(UnsupportedCombinationError, match="clamped expert math"):
+        model.validate_parallel(tp_degree=1, ep_degree=2)
+    with pytest.raises(
+        UnsupportedCombinationError, match="requires a model-owned MoEBlockContract"
+    ):
+        resolve_ep_plan(model, degree=2)
+
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert forwards == tuple(module.forward for module in model.modules())
+    assert torch.equal(rng, torch.get_rng_state())
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, state[name], rtol=0, atol=0)

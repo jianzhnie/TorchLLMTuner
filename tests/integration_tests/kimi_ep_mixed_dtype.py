@@ -12,7 +12,7 @@ from torch import nn
 
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from tests.integration_tests.harness import init_distributed
 
 
@@ -50,7 +50,7 @@ def main():
         layer = nn.Module()
         layer.block_sparse_moe = source
         model.layers = nn.ModuleList([layer])
-        assert swap_hf_moe_blocks(model, ep_group=dist.group.WORLD) == 1
+        assert swap_moe_blocks(model, ep_group=dist.group.WORLD) == 1
         candidate = layer.block_sparse_moe
         grouped = candidate.routed_experts.inner_experts
         assert grouped.w1_EFD.dtype == grouped.w3_EFD.dtype == torch.bfloat16

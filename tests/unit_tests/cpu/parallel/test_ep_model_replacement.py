@@ -46,7 +46,7 @@ from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel import (
     block_conversion,
     model_replacement,
-    swap_hf_moe_blocks,
+    swap_moe_blocks,
 )
 from llmtuner.parallel.expert_parallel.block_conversion import (
     restore_fp32_state_buffers,
@@ -333,7 +333,7 @@ def test_swapped_model_matches_hf_output(norm_topk_prob: bool) -> None:
     ref = _model(config)
     swapped = _model(config)
 
-    assert swap_hf_moe_blocks(swapped) == 2
+    assert swap_moe_blocks(swapped) == 2
     assert all(isinstance(_hf_block(layer), MoE) for layer in swapped.layers)
 
     ids, positions = _data()
@@ -355,7 +355,7 @@ def test_swap_moves_the_weights_verbatim() -> None:
     config = _config(norm_topk_prob=True)
     ref = _model(config)
     swapped = _model(config)
-    swap_hf_moe_blocks(swapped)
+    swap_moe_blocks(swapped)
 
     hf_block = _hf_block(ref.layers[0])
     moe = _hf_block(swapped.layers[0])
@@ -380,7 +380,7 @@ def test_the_gate_and_up_halves_are_not_interchangeable() -> None:
     config = _config(norm_topk_prob=True)
     ref = _model(config)
     swapped = _model(config)
-    swap_hf_moe_blocks(swapped)
+    swap_moe_blocks(swapped)
 
     hf_block = _hf_block(ref.layers[0])
     grouped = _hf_block(swapped.layers[0]).routed_experts.inner_experts
@@ -409,7 +409,7 @@ def test_swap_sets_the_fsdp_moe_flags() -> None:
     in the state_dict.
     """
     swapped = _model(_config(norm_topk_prob=True))
-    swap_hf_moe_blocks(swapped)
+    swap_moe_blocks(swapped)
 
     for layer in swapped.layers:
         assert layer.moe_enabled is True
@@ -422,7 +422,7 @@ def test_swap_preserves_eval_mode() -> None:
     """A fresh module defaults to training=True; the swap must not flip an
     eval-built model's blocks (the aux loss would fire without a denominator)."""
     swapped = _model(_config(norm_topk_prob=True))
-    swap_hf_moe_blocks(swapped)
+    swap_moe_blocks(swapped)
     assert not any(_hf_block(layer).training for layer in swapped.layers)
 
     ids, positions = _data()
@@ -444,7 +444,7 @@ def test_a_router_with_bias_is_refused() -> None:
     )
 
     with pytest.raises(NotImplementedError, match="router bias"):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
 
 
 def test_swap_rejects_a_dense_model() -> None:
@@ -463,12 +463,12 @@ def test_swap_rejects_a_dense_model() -> None:
     with pytest.raises(
         UnsupportedCombinationError, match="no declared or compatible MoE block"
     ):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
 
 
 def test_swap_rejects_a_model_without_layers() -> None:
     with pytest.raises(UnsupportedCombinationError, match=r"\.layers"):
-        swap_hf_moe_blocks(torch.nn.Linear(4, 4))
+        swap_moe_blocks(torch.nn.Linear(4, 4))
 
 
 def test_aux_loss_is_injected_on_the_router_scores() -> None:
@@ -477,9 +477,9 @@ def test_aux_loss_is_injected_on_the_router_scores() -> None:
     ids, positions = _data()
 
     with_aux = _model(_config(norm_topk_prob=True, aux_coeff=1e-3))
-    swap_hf_moe_blocks(with_aux)
+    swap_moe_blocks(with_aux)
     without_aux = _model(_config(norm_topk_prob=True, aux_coeff=0.0))
-    swap_hf_moe_blocks(without_aux)
+    swap_moe_blocks(without_aux)
     assert without_aux.layers[0].mlp.router.aux_loss is None
 
     AuxLoss.set_step_denominator(torch.tensor(39.0))
@@ -507,7 +507,7 @@ def test_aux_loss_is_injected_on_the_router_scores() -> None:
 def test_aux_loss_requires_the_step_denominator() -> None:
     """Training forward without ``set_step_denominator`` must refuse."""
     model = _model(_config(norm_topk_prob=True))
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     model.train()
     ids, positions = _data()
     with pytest.raises(ValueError, match="set_step_denominator"):
@@ -617,7 +617,7 @@ def test_deepseek_v3_swap_matches_hf_output(overrides: dict) -> None:
     swapped = construct_test_model(config).float().eval()
 
     # first_k_dense_replace=1, so only the two sparse layers swap.
-    assert swap_hf_moe_blocks(swapped) == 2
+    assert swap_moe_blocks(swapped) == 2
     assert not isinstance(swapped.layers[0].mlp, MoE)
     assert all(isinstance(layer.mlp, MoE) for layer in swapped.layers[1:])
 
@@ -640,7 +640,7 @@ def test_deepseek_v3_router_settings_reach_the_llmtuner_router() -> None:
     """
     model = _deepseek_model()
 
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     router = model.layers[1].mlp.router
     assert router.score_func == "sigmoid"
     assert router.route_norm is True
@@ -659,7 +659,7 @@ def test_deepseek_v3_shared_experts_survive_the_swap() -> None:
     model = _deepseek_model()
     assert model.layers[1].mlp.shared_experts is not None
 
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     assert model.layers[1].mlp.shared_experts is not None
 
 
@@ -677,7 +677,7 @@ def test_swap_preserves_expert_dtype_with_fp32_router(expert_dtype) -> None:
             )
         )
 
-    assert swap_hf_moe_blocks(model, router_aux_loss_coef=0.0) == len(expected)
+    assert swap_moe_blocks(model, router_aux_loss_coef=0.0) == len(expected)
     for layer, (gate_up, down) in zip(model.layers, expected, strict=True):
         grouped = layer.mlp.routed_experts.inner_experts
         gate, up = gate_up.chunk(2, dim=1)
@@ -711,7 +711,7 @@ def test_swap_rejects_router_and_experts_on_different_devices(monkeypatch) -> No
     monkeypatch.setattr(block_conversion, "GroupedExperts", reject_allocation)
 
     with pytest.raises(UnsupportedCombinationError, match="different devices"):
-        swap_hf_moe_blocks(model, router_aux_loss_coef=0.0)
+        swap_moe_blocks(model, router_aux_loss_coef=0.0)
 
     assert model.layers[0].mlp is block
     assert AuxLoss._group_counts == original_counts
@@ -726,7 +726,7 @@ def test_swap_rejects_shared_expert_on_a_different_device() -> None:
     block.moe_contract = replace(block.moe_contract, shared_expert="shared_expert")
 
     with pytest.raises(UnsupportedCombinationError, match="shared expert"):
-        swap_hf_moe_blocks(model, router_aux_loss_coef=0.0)
+        swap_moe_blocks(model, router_aux_loss_coef=0.0)
 
     assert model.layers[0].mlp is block
 
@@ -736,7 +736,7 @@ def test_swap_preserves_shared_expert_buffer_dtype() -> None:
     shared = model.layers[1].mlp.shared_experts
     shared.register_buffer("calibration", torch.tensor([1.25], dtype=torch.float64))
 
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
 
     assert model.layers[1].mlp.shared_experts is shared
     assert shared.calibration.dtype == torch.float64
@@ -749,7 +749,7 @@ def test_swap_preserves_falsey_shared_expert() -> None:
     shared = torch.nn.Sequential()
     model.layers[1].mlp.shared_expert = shared
 
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
 
     assert model.layers[1].mlp.shared_experts is shared
 
@@ -762,14 +762,14 @@ def test_deepseek_v3_gets_the_load_balancing_bias() -> None:
     bias, and a frozen zero one would land in every checkpoint.
     """
     model = _deepseek_model()
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
 
     sparse = [layer.mlp for layer in model.layers if isinstance(layer.mlp, MoE)]
     assert all(moe.load_balance_coeff is not None for moe in sparse)
     assert all(moe.expert_bias_E is not None for moe in sparse)
 
     qwen = _model(_config(norm_topk_prob=True))
-    swap_hf_moe_blocks(qwen)
+    swap_moe_blocks(qwen)
     assert all(layer.mlp.load_balance_coeff is None for layer in qwen.layers)
 
 
@@ -782,7 +782,7 @@ def test_the_bias_is_copied_out_of_the_hf_router() -> None:
             torch.arange(8, dtype=torch.float32) / 100
         )
 
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     assert torch.equal(
         model.layers[1].mlp.expert_bias_E, hf_router.e_score_correction_bias
     )
@@ -799,11 +799,11 @@ def test_deepseek_v3_gets_no_aux_loss_from_its_own_config() -> None:
     model = _deepseek_model()
     assert getattr(model.model.config, "router_aux_loss_coef", None) is None
 
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     assert model.layers[1].mlp.router.aux_loss is None
 
     explicit = _deepseek_model()
-    swap_hf_moe_blocks(explicit, router_aux_loss_coef=1e-3)
+    swap_moe_blocks(explicit, router_aux_loss_coef=1e-3)
     assert explicit.layers[1].mlp.router.aux_loss is not None
 
 
@@ -820,7 +820,7 @@ def test_the_swap_refuses_to_guess_a_shared_expert_gate() -> None:
     counts_before = dict(AuxLoss._group_counts)
 
     with pytest.raises(NotImplementedError, match="shared_expert_gate"):
-        swap_hf_moe_blocks(model, router_aux_loss_coef=1e-3)
+        swap_moe_blocks(model, router_aux_loss_coef=1e-3)
     assert dict(AuxLoss._group_counts) == counts_before
 
 
@@ -882,7 +882,7 @@ def test_the_deepseek_router_shape_swaps_exactly(family: str) -> None:
     torch.manual_seed(0)
     swapped = construct_test_model(cfg).float().eval()
 
-    assert swap_hf_moe_blocks(swapped) == 2
+    assert swap_moe_blocks(swapped) == 2
 
     ids, positions = _data()
     with torch.no_grad():
@@ -910,7 +910,7 @@ def test_deepseek_v2_greedy_leaves_the_grouping_off() -> None:
         getattr(block, "num_group", None) or getattr(gate, "num_group", None)
     ) == 2  # present, unused
 
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     router = model.layers[1].mlp.router
     assert router.num_expert_groups is None
     assert router.num_limited_groups is None
@@ -925,7 +925,7 @@ def test_deepseek_v2_group_limited_greedy_is_refused() -> None:
     model = _plain_model("deepseek_v2", topk_method="group_limited_greedy")
 
     with pytest.raises(NotImplementedError, match="single best expert"):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
 
 
 def test_deepseek_v2_does_not_renormalize() -> None:
@@ -944,7 +944,7 @@ def test_deepseek_v2_does_not_renormalize() -> None:
         getattr(block, "topk_method", None) or getattr(gate, "topk_method", None)
     ) == "greedy"
 
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     assert model.layers[1].mlp.router.route_norm is False
 
 
@@ -960,7 +960,7 @@ def test_mixtral_swaps_in_place() -> None:
     model = _mixtral_model()
     assert type(_hf_block(model.layers[0])).__name__ == "MixtralSparseMoeBlock"
 
-    assert swap_hf_moe_blocks(model) == 2
+    assert swap_moe_blocks(model) == 2
 
     for layer in model.layers:
         assert isinstance(_hf_block(layer), MoE)
@@ -1003,7 +1003,7 @@ def test_mixtral_matches_hf_output() -> None:
     torch.manual_seed(0)
     swapped = construct_test_model(cfg).float().eval()
 
-    swap_hf_moe_blocks(swapped)
+    swap_moe_blocks(swapped)
     ids, positions = _data()
     with torch.no_grad():
         torch.testing.assert_close(
@@ -1022,7 +1022,7 @@ def test_mixtral_returns_a_bare_tensor() -> None:
     ``MoE`` -- a surviving wrapper would fail the other way round.
     """
     model = _mixtral_model()
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
 
     ids, positions = _data()
     with torch.no_grad():
@@ -1043,7 +1043,7 @@ def test_gpt_oss_is_refused() -> None:
     ``GptOssForCausalLM`` cannot be instantiated on CPU at all -- HF's
     ``_supports_sdpa`` guard rejects the eager attention this build falls back
     to -- and the layout is the thing under test, not the model around it. The
-    block is hand-assembled because ``swap_hf_moe_blocks`` walks ``.layers``,
+    block is hand-assembled because ``swap_moe_blocks`` walks ``.layers``,
     which a bare experts module does not have.
     """
     from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
@@ -1064,7 +1064,7 @@ def test_gpt_oss_is_refused() -> None:
     holder.layers[0].mlp = block
 
     with pytest.raises(NotImplementedError, match="bias vectors"):
-        swap_hf_moe_blocks(holder)
+        swap_moe_blocks(holder)
 
 
 def test_a_block_with_the_wrong_expert_layout_is_rejected() -> None:
@@ -1078,7 +1078,7 @@ def test_a_block_with_the_wrong_expert_layout_is_rejected() -> None:
     _misshape_hf_experts(_hf_block(model.layers[1]), hidden=64)
 
     with pytest.raises(ValueError, match="unrecognized expert weight shapes"):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
 
 
 def test_late_invalid_expert_layout_does_not_replace_earlier_layers() -> None:
@@ -1094,7 +1094,7 @@ def test_late_invalid_expert_layout_does_not_replace_earlier_layers() -> None:
     _misshape_hf_experts(_hf_block(model.layers[1]), hidden=64)
 
     with pytest.raises(ValueError, match="fused gate/up expert geometry"):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
 
     assert all(
         getattr(layer, name) is block
@@ -1125,7 +1125,7 @@ def test_the_swap_keeps_the_token_count_buffer_in_fp32() -> None:
     """
     swapped = _model(_config(norm_topk_prob=True))
 
-    assert swap_hf_moe_blocks(swapped) == 2
+    assert swap_moe_blocks(swapped) == 2
 
     moe = swapped.layers[0].mlp
     assert isinstance(moe, MoE)
@@ -1190,7 +1190,7 @@ def test_ep_conversion_preserves_parameter_freezing():
         block.gate.weight.requires_grad_(False)
         for weight in _hf_gate_up_parameters(block):
             weight.requires_grad_(False)
-    assert swap_hf_moe_blocks(model) == 2
+    assert swap_moe_blocks(model) == 2
     for layer in model.layers:
         assert not layer.mlp.router.gate.weight.requires_grad
         experts = layer.mlp.routed_experts.inner_experts
@@ -1215,7 +1215,7 @@ def test_interrupted_conversion_restores_auxiliary_counts(monkeypatch):
 
     monkeypatch.setattr(model_replacement, "convert_block", interrupted)
     with pytest.raises(KeyboardInterrupt, match="conversion interrupted"):
-        swap_hf_moe_blocks(model, router_aux_loss_coef=0.01)
+        swap_moe_blocks(model, router_aux_loss_coef=0.01)
     assert dict(AuxLoss._group_counts) == counts_before
     assert all(
         layer.mlp is original
@@ -1230,7 +1230,7 @@ def test_later_router_conversion_error_preserves_original_block_slots():
     model.layers[1].mlp.gate.bias = torch.nn.Parameter(torch.zeros(8))
 
     with pytest.raises(UnsupportedCombinationError, match="bias"):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
 
     assert dict(AuxLoss._group_counts) == counts_before
     for layer, original in zip(model.layers, original_blocks, strict=True):
@@ -1255,10 +1255,10 @@ def test_conversion_preserves_shared_expert_dtype_and_child_modes(later_failure)
     if later_failure:
         model.layers[1].mlp.gate.bias = torch.nn.Parameter(torch.zeros(8))
         with pytest.raises(UnsupportedCombinationError, match="bias"):
-            swap_hf_moe_blocks(model)
+            swap_moe_blocks(model)
         assert model.layers[0].mlp is original_blocks[0]
     else:
-        assert swap_hf_moe_blocks(model) == 2
+        assert swap_moe_blocks(model) == 2
         assert model.layers[0].mlp.shared_experts is shared
 
     assert shared[0].weight is original_weight
@@ -1280,7 +1280,7 @@ def test_invalid_aux_loss_coefficient_preserves_hf_blocks(value, inherited):
         object.__setattr__(model.model.config, "router_aux_loss_coef", value)
     kwargs = {} if inherited else {"router_aux_loss_coef": value}
     with pytest.raises(ConfigError, match="router_aux_loss_coef"):
-        swap_hf_moe_blocks(model, **kwargs)
+        swap_moe_blocks(model, **kwargs)
     assert all(
         layer.mlp is block for layer, block in zip(model.layers, blocks, strict=True)
     )
@@ -1294,7 +1294,7 @@ def test_swap_preserves_moe_block_sharing_across_layers():
     ids, positions = _data()
     with torch.no_grad():
         expected = logits(reference, ids, positions)
-    assert swap_hf_moe_blocks(swapped) == 2
+    assert swap_moe_blocks(swapped) == 2
     assert swapped.layers[0].mlp is swapped.layers[1].mlp
     assert swapped.layers[0].moe is swapped.layers[1].moe
     assert swapped.layers[0].mlp.router.gate.weight is (
@@ -1316,7 +1316,7 @@ def test_swap_preserves_projection_sharing_and_accumulated_gradients(projection)
         else:
             _tie_expert_projection(blocks[1], blocks[0], projection)
     original = reference.layers[0].mlp
-    assert swap_hf_moe_blocks(swapped) == 2
+    assert swap_moe_blocks(swapped) == 2
     first, second = [layer.mlp for layer in swapped.layers]
     if projection == "router":
         actual = first.router.gate.weight
@@ -1381,11 +1381,11 @@ def test_swap_preserves_parameter_shared_with_unconverted_module(projection):
         # external alias to one expert's weight cannot be preserved -- the same
         # refusal the fused layout applies to its split gate/up alias.
         with pytest.raises(UnsupportedCombinationError, match="extra_consumer"):
-            swap_hf_moe_blocks(model)
+            swap_moe_blocks(model)
         assert model.layers[0].mlp is original
         assert consumer.weight is parameter
         return
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     converted = model.layers[0].mlp
     actual = (
         converted.router.gate.weight
@@ -1405,7 +1405,7 @@ def test_swap_preserves_shared_sign_balancing_bias_and_joint_update():
     model.layers[2].mlp.gate.e_score_correction_bias = model.layers[
         1
     ].mlp.gate.e_score_correction_bias
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     first, second = model.layers[1].mlp, model.layers[2].mlp
     assert first.expert_bias_E is second.expert_bias_E
     before = first.expert_bias_E.clone()
@@ -1429,7 +1429,7 @@ def test_shared_quantile_bias_survives_conversion_and_state_restore():
         model.layers[2].mlp.gate.e_score_correction_bias = model.layers[
             1
         ].mlp.gate.e_score_correction_bias
-        swap_hf_moe_blocks(model, quantile_balancing=True)
+        swap_moe_blocks(model, quantile_balancing=True)
         return model
 
     model = build()
@@ -1465,7 +1465,7 @@ def test_swap_rejects_external_fused_expert_alias_before_installation(whole_bloc
         model.register_parameter("external_expert", original)
     before_counts = dict(AuxLoss._group_counts)
     with pytest.raises(UnsupportedCombinationError, match="external_expert"):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
     assert all(
         layer.mlp is block
         for layer, block in zip(model.layers, original_blocks, strict=True)
@@ -1478,7 +1478,7 @@ def test_direct_swap_rejects_fixed_quantile_conflict_before_replacing_blocks():
     model = _deepseek_model(n_group=1, topk_group=1)
     original = [layer.mlp for layer in model.layers]
     with pytest.raises(UnsupportedCombinationError, match="fixed_router.*quantile"):
-        swap_hf_moe_blocks(model, fixed_router=True, quantile_balancing=True)
+        swap_moe_blocks(model, fixed_router=True, quantile_balancing=True)
     assert all(
         layer.mlp is block for layer, block in zip(model.layers, original, strict=True)
     )
@@ -1486,7 +1486,7 @@ def test_direct_swap_rejects_fixed_quantile_conflict_before_replacing_blocks():
 
 def test_fixed_router_ep1_public_assembly_runs_constant_routing():
     from llmtuner.config.parallel_config import ExpertParallelConfig, ParallelConfig
-    from llmtuner.parallel.parallelize import parallelize_hf_transformers
+    from llmtuner.parallel.parallelize import parallelize_model
     from tests.integration_tests.fixed_router_ep_equivalence import explicit_reference
 
     reference = _model(_config(norm_topk_prob=True))
@@ -1496,7 +1496,7 @@ def test_fixed_router_ep1_public_assembly_runs_constant_routing():
     expected, _, _ = explicit_reference(
         reference.layers[0].mlp, inputs, torch.zeros(5, dtype=torch.bool)
     )
-    result = parallelize_hf_transformers(
+    result = parallelize_model(
         target,
         cfg=ParallelConfig(ep_config=ExpertParallelConfig(fixed_router=True)),
         mesh=None,
@@ -1524,7 +1524,7 @@ def test_shared_expert_local_checkpoint_registration_survives_conversion():
     block.moe_contract = replace(block.moe_contract, shared_expert="shared_expert")
     group = object()
     shared._tp_checkpoint_layouts = {"weight": (0, False, group)}
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     assert model.layers[0].mlp.shared_experts is shared
     assert shared._tp_checkpoint_layouts == {"weight": (0, False, group)}
 
@@ -1537,7 +1537,7 @@ def test_expert_local_checkpoint_registration_moves_to_converted_experts():
         "gate_up_proj": (1, True, group),
         "down_proj": (2, False, group),
     }
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     grouped = model.layers[0].mlp.routed_experts.inner_experts
     assert grouped._tp_checkpoint_layouts == {
         "w1_EFD": (1, False, group),
@@ -1567,7 +1567,7 @@ def test_ancestor_checkpoint_registration_preserves_relative_paths(owner_kind):
     }
     owner._tp_checkpoint_layouts = layouts
 
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
 
     target = layer.mlp if owner_kind == "block" else owner
     assert target._tp_checkpoint_layouts == {
@@ -1587,7 +1587,7 @@ def test_checkpoint_layout_failure_rolls_back_auxiliary_registration():
     original[0].experts._tp_checkpoint_layouts = layouts
     before_counts = dict(AuxLoss._group_counts)
     with pytest.raises(IndexError):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
     assert AuxLoss._group_counts == before_counts
     assert original[0].experts._tp_checkpoint_layouts is layouts
     for layer, block in zip(model.layers, original, strict=True):
@@ -1617,7 +1617,7 @@ def test_ep_rebinds_fused_fsdp_exclusions_hooks_and_unit_paths(native_path):
         )
     )
     references = FSDPPatternReferences(model, cfg)
-    swap_hf_moe_blocks(model, on_replacement=references.record_replacements)
+    swap_moe_blocks(model, on_replacement=references.record_replacements)
     grouped = model.layers[0].mlp.routed_experts.inner_experts
     rebound = references.bind(model)
     target_path = next(
@@ -1651,7 +1651,7 @@ def test_replacement_observer_error_keeps_original_blocks_and_aux_counts():
         raise failure
 
     with pytest.raises(RuntimeError) as caught:
-        swap_hf_moe_blocks(model, on_replacement=reject)
+        swap_moe_blocks(model, on_replacement=reject)
     assert caught.value is failure
     assert AuxLoss._group_counts == counts
     assert all(
@@ -1682,7 +1682,7 @@ def test_ep_rebinds_ignored_module_subtree_without_object_overrides(
         fsdp_config=FSDPConfig(fsdp_apply_modules={"": {}}, fsdp_ignored_modules=[path])
     )
     references = FSDPPatternReferences(model, cfg)
-    swap_hf_moe_blocks(model, on_replacement=references.record_replacements)
+    swap_moe_blocks(model, on_replacement=references.record_replacements)
     grouped = model.layers[0].mlp.routed_experts.inner_experts
     rebound = references.bind(model)
     _, _, exclusions = _resolve_pattern_units(model, rebound)
@@ -1709,14 +1709,14 @@ def test_swap_preserves_external_router_bias_or_rejects_before_install(bias_dtyp
     counts = dict(AuxLoss._group_counts)
     if bias_dtype != torch.float32:
         with pytest.raises(UnsupportedCombinationError, match="external router bias"):
-            swap_hf_moe_blocks(model)
+            swap_moe_blocks(model)
         assert all(
             layer.mlp is block
             for layer, block in zip(model.layers, blocks, strict=True)
         )
         assert AuxLoss._group_counts == counts
     else:
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
         converted = model.layers[1].mlp.expert_bias_E
         assert converted is model.external_bias
         converted.add_(1)
@@ -1731,7 +1731,7 @@ def test_pre_down_policy_rejected_before_ep_replacement(fixed_router):
     original = list(model.layers)
     parameters = dict(model.named_parameters())
     with pytest.raises(UnsupportedCombinationError, match="cannot preserve.*pre_down"):
-        swap_hf_moe_blocks(model, fixed_router=fixed_router)
+        swap_moe_blocks(model, fixed_router=fixed_router)
     assert list(model.layers) == original
     after = dict(model.named_parameters())
     assert all(after[key] is p for key, p in parameters.items())
@@ -1812,7 +1812,7 @@ def test_owned_qwen3_ep_conversion_does_not_inspect_forward_source(monkeypatch):
         raise AssertionError("owned Qwen3 must declare router output arity")
 
     monkeypatch.setattr(hf_inspection.inspect, "getsource", unexpected)
-    swap_hf_moe_blocks(model)
+    swap_moe_blocks(model)
     assert isinstance(model.layers[0].mlp, MoE)
     assert model.layers[1].mlp is dense_mlp
     actual = logits(model, ids, positions)
@@ -1825,7 +1825,7 @@ def test_unsupported_declared_moe_layout_fails_before_any_replacement():
     original_blocks = [layer.mlp for layer in model.layers]
     original_parameters = dict(model.named_parameters())
     with pytest.raises(UnsupportedCombinationError, match="Declared MoE slot"):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
     assert all(
         layer.mlp is block
         for layer, block in zip(model.layers, original_blocks, strict=True)
@@ -1890,7 +1890,7 @@ def test_later_router_bias_is_rejected_before_any_block_conversion(monkeypatch):
 
     monkeypatch.setattr(model_replacement, "convert_block", reject_allocation)
     with pytest.raises(NotImplementedError, match="bias"):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
     assert tuple(model.state_dict()) == keys
     assert all(
         layer.mlp is block for layer, block in zip(model.layers, blocks, strict=True)

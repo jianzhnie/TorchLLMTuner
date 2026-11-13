@@ -29,7 +29,7 @@ def main():
             adapter = ModelStateDictAdapter(
                 SimpleNamespace(model_type="kimi_linear", num_experts=2),
                 None,
-                kimi_expert_parallel=True,
+                expert_parallel=True,
             )
             grouped = {
                 prefix + "routed_experts.inner_experts.w1_EFD": torch.arange(12)
@@ -72,7 +72,7 @@ def main():
             adapter = ModelStateDictAdapter(
                 SimpleNamespace(model_type="kimi_linear", num_experts=2),
                 None,
-                kimi_expert_parallel=True,
+                expert_parallel=True,
             )
             healthy = {
                 f"{prefix}experts.{index}.w1.weight": torch.ones(2, 3)
@@ -127,7 +127,7 @@ def main():
         adapter = ModelStateDictAdapter(
             SimpleNamespace(model_type="kimi_linear", num_experts=2),
             None,
-            kimi_expert_parallel=True,
+            expert_parallel=True,
         )
         dense = torch.arange(12).reshape(2, 2, 3).float()
         for placement in (Replicate(), Shard(1)):

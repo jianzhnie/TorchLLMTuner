@@ -65,6 +65,14 @@ from llmtuner.datasets.synthetic import (
 )
 from llmtuner.models.configuration import build_model_config
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.trainer.runtime.batch import (
+    build_training_dataloader,
+    move_batch_to_device,
+    prepare_model_inputs,
+    resolve_batch_size_per_rank,
+)
+from llmtuner.trainer.runtime.engine import TrainingEngine, loss_vocab_kwargs
+from llmtuner.trainer.runtime.pipeline import run_pipeline_step
 from llmtuner.trainer.trainer import Trainer
 
 
@@ -116,6 +124,16 @@ def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_
         loss.backward()
         return loss.detach()
 
+    trainer.training_engine = TrainingEngine(
+        model_parts=[model],
+        parallel_dims=None,
+        device=torch.device("cpu"),
+        max_context_length=1,
+        chunked_loss_num_chunks=1,
+        param_context=nullcontext,
+        optimizer=trainer.optimizer,
+        lr_scheduler=trainer.lr_scheduler,
+    )
     trainer.forward_backward_step = forward_backward
     assert trainer.train_step(iter([None])) is None
     torch.testing.assert_close(snapshot, expected, rtol=0, atol=0)
@@ -274,7 +292,7 @@ def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
         ),
     )
 
-    reporting_loss = Trainer.pp_forward_backward_body(
+    reporting_loss = run_pipeline_step(
         trainer,
         Batch(input_ids=torch.ones(1, 1), labels=torch.ones(1, 1)),
         global_valid_tokens=torch.tensor(2),
@@ -579,6 +597,7 @@ def _bare_trainer(cfg: LLMTunerConfig) -> Trainer:
     """A Trainer with ``__init__`` bypassed, for testing pure data helpers."""
     trainer = Trainer.__new__(Trainer)
     trainer.cfg = cfg
+    trainer.parallel_dims = None
     return trainer
 
 
@@ -586,8 +605,8 @@ def test_batch_size_per_rank_divides_evenly() -> None:
     trainer = _bare_trainer(_cfg_with_batch(global_batch_size=8))
 
     # 8 over 2 ranks is 4 each; 8 over 8 is 1 each.
-    assert trainer.batch_size_per_rank(2) == 4
-    assert trainer.batch_size_per_rank(8) == 1
+    assert resolve_batch_size_per_rank(trainer.cfg, 2) == 4
+    assert resolve_batch_size_per_rank(trainer.cfg, 8) == 1
 
 
 def test_an_indivisible_global_batch_is_rejected() -> None:
@@ -601,7 +620,7 @@ def test_an_indivisible_global_batch_is_rejected() -> None:
     trainer = _bare_trainer(_cfg_with_batch(global_batch_size=10))
 
     with pytest.raises(ValueError, match="divisible by"):
-        trainer.batch_size_per_rank(4)
+        resolve_batch_size_per_rank(trainer.cfg, 4)
 
 
 def _source(*, batch_size: int = 2, seq_len: int = 4) -> RandomTokenSource:
@@ -1247,16 +1266,16 @@ def test_loss_vocab_kwargs_need_a_tp_axis_and_a_named_vocabulary() -> None:
     trainer.model = SimpleNamespace(vocab_size=9)
 
     trainer.parallel_dims = None
-    assert trainer.loss_vocab_kwargs() == {}
+    assert loss_vocab_kwargs(trainer.model, trainer.parallel_dims) == {}
 
     trainer.parallel_dims = SimpleNamespace(
         get_optional_mesh=lambda name: SimpleNamespace(get_group=lambda: object())
     )
     trainer.model = nn.Linear(2, 2)  # a double that names no vocabulary
-    assert trainer.loss_vocab_kwargs() == {}
+    assert loss_vocab_kwargs(trainer.model, trainer.parallel_dims) == {}
 
     trainer.model = None
-    assert trainer.loss_vocab_kwargs() == {}
+    assert loss_vocab_kwargs(trainer.model, trainer.parallel_dims) == {}
 
 
 def test_loss_vocab_kwargs_carry_the_models_own_vocabulary() -> None:
@@ -1273,7 +1292,7 @@ def test_loss_vocab_kwargs_carry_the_models_own_vocabulary() -> None:
     )
     trainer.model = SimpleNamespace(vocab_size=151936)
 
-    assert trainer.loss_vocab_kwargs() == {
+    assert loss_vocab_kwargs(trainer.model, trainer.parallel_dims) == {
         "tp_group": group,
         "global_vocab_size": 151936,
     }
@@ -1372,9 +1391,9 @@ def test_synthetic_loader_is_checkpointed_like_any_other() -> None:
     corpus from batch 0. The loader's ``load_state_dict`` replay is what a
     resume needs, and it is dead code unless the loader is registered.
     """
-    trainer = _bare_trainer(_cfg_with_batch(global_batch_size=8, max_seq_len=16))
+    cfg = _cfg_with_batch(global_batch_size=8, max_seq_len=16)
 
-    loader = trainer.build_dataloader()
+    loader = build_training_dataloader(cfg, parallel_dims=None)
 
     assert isinstance(loader, RandomTokenDataLoader)
 
@@ -1384,8 +1403,8 @@ def test_microbatch_defers_the_device_transfer_to_consumption() -> None:
 
     ``microbatch`` runs at read time for every group of the window; moving
     tensors there would keep the whole window resident in device memory. The
-    transfer belongs to ``to_device``, which ``preprocess`` calls once per
-    group, just ahead of that group's forward.
+    transfer belongs to ``move_batch_to_device``, which the engine calls once
+    per group, just ahead of that group's forward.
     """
     trainer = _bare_trainer(_cfg_with_batch())
     trainer.device = torch.device("cpu")
@@ -1404,7 +1423,7 @@ def test_microbatch_defers_the_device_transfer_to_consumption() -> None:
         torch.Tensor.to = counting_to
         microbatch = trainer.microbatch(batch)
         assert calls == 0, "microbatch moved tensors at read time"
-        trainer.to_device(microbatch["batch"])
+        move_batch_to_device(microbatch["batch"], trainer.device)
         assert calls == 2  # input_ids and labels
     finally:
         torch.Tensor.to = original_to
@@ -1564,8 +1583,12 @@ def test_synthetic_batch_is_deterministic() -> None:
     """
     cfg = _cfg_with_batch(global_batch_size=8, max_seq_len=16, seed=42)
     trainer, reference = _bare_trainer(cfg), _bare_trainer(cfg)
-    trainer.dataloader = trainer.build_dataloader()
-    reference.dataloader = reference.build_dataloader()
+    trainer.dataloader = build_training_dataloader(
+        cfg, parallel_dims=trainer.parallel_dims
+    )
+    reference.dataloader = build_training_dataloader(
+        cfg, parallel_dims=reference.parallel_dims
+    )
     first = next(trainer.data_iterator())
     second = next(reference.data_iterator())
 
@@ -1582,7 +1605,9 @@ def test_dp_slice_partitions_global_batch() -> None:
     """
     cfg = _cfg_with_batch(global_batch_size=8, max_seq_len=16, seed=42)
     trainer = _bare_trainer(cfg)
-    trainer.dataloader = trainer.build_dataloader()
+    trainer.dataloader = build_training_dataloader(
+        cfg, parallel_dims=trainer.parallel_dims
+    )
     batch = next(trainer.data_iterator())
 
     per_rank = cfg.global_batch_size // 2
@@ -1607,7 +1632,16 @@ def test_checkpointer_assembly_rejects_missing_dataloader(monkeypatch):
     trainer = _bare_trainer(_cfg_with_batch())
     trainer.dataloader = None
     with pytest.raises(RuntimeError, match="before building the checkpointer"):
-        assembly._build_checkpointer(trainer, object())
+        assembly.build_checkpointer(
+            trainer.cfg,
+            object(),
+            model_assembly=assembly.ModelAssembly(model=None, model_parts=[]),
+            optimizer_stack=assembly.OptimizerStack(None, None, None),
+            dataloader=None,
+            train_state=trainer,
+            device=torch.device("cpu"),
+            parallel_dims=None,
+        )
 
 
 @pytest.mark.parametrize("args", [[], ("--steps", "7")])
@@ -1886,8 +1920,6 @@ def test_microbatch_preserves_loader_owned_dictionary():
 
 
 def test_preprocess_filters_metadata_without_changing_source():
-    from llmtuner.trainer.runtime import batch as runtime
-
     labels = torch.tensor([[1, 2]])
     batch = {"input": labels, "labels": labels, "num_valid_tokens": 2}
     seen = []
@@ -1896,13 +1928,14 @@ def test_preprocess_filters_metadata_without_changing_source():
         seen.append(source)
         return source["input"], source["labels"], {}
 
-    trainer = SimpleNamespace(
-        example_model=SimpleNamespace(prepare_inputs=preprocess),
-        to_device=lambda source: source,
+    model = SimpleNamespace(prepare_inputs=preprocess)
+    prepare_model_inputs(
+        model,
+        batch,
+        device=torch.device("cpu"),
         parallel_dims=None,
-        cfg=SimpleNamespace(max_seq_len=2),
+        max_context_length=2,
     )
-    runtime.preprocess(trainer, batch)
     assert set(seen[0]) == {"input", "labels"}
     assert batch["num_valid_tokens"] == 2
     assert seen[0]["labels"] is labels
@@ -2013,14 +2046,14 @@ def test_programmatic_trainer_uses_resolved_override_vocabulary():
 def test_checkpointer_registration_sees_initialized_trainer_state(monkeypatch):
     from llmtuner.trainer.runtime import assembly
 
-    original = assembly._build_checkpointer
+    original = assembly.build_checkpointer
     observed = []
 
-    def tracked(trainer, hf_config):
-        observed.append(trainer.state_dict())
-        return original(trainer, hf_config)
+    def tracked(cfg, hf_config, **dependencies):
+        observed.append(dependencies["train_state"].state_dict())
+        return original(cfg, hf_config, **dependencies)
 
-    monkeypatch.setattr(assembly, "_build_checkpointer", tracked)
+    monkeypatch.setattr(assembly, "build_checkpointer", tracked)
     trainer = Trainer(
         LLMTunerConfig(training=TrainingConfig(global_batch_size=2, max_seq_len=8))
     )
@@ -3064,15 +3097,8 @@ def test_trainer_unequal_token_accumulation_matches_summed_loss_reference(tmp_pa
         reference.optimizer.zero_grad(set_to_none=True)
         losses = []
         for batch in batches:
-            # prepare_inputs reads whatever device the batch is on; the
-            # trainer's own path moves it first (runtime/batch.py:preprocess),
-            # and the reference must do the same now that the device need not
-            # be CPU.
-            tokens, targets, kwargs = reference.model.prepare_inputs(
-                reference.to_device(batch),
-                parallel_dims=reference.parallel_dims,
-                max_context_length=8,
-            )
+            # Match the engine's device transfer and model input contract.
+            tokens, targets, kwargs = reference.training_engine.preprocess(batch)
             logits = reference.model(tokens, **kwargs).logits
             losses.append(
                 F.cross_entropy(
@@ -3248,13 +3274,15 @@ def test_preprocess_requires_explicit_input_contract_without_legacy_fallback(can
     def legacy(*args, **kwargs):
         pytest.fail("Trainer entered a removed adapter's input method")
 
-    trainer = SimpleNamespace(
-        example_model=SimpleNamespace(
-            prepare_inputs=canonical,
-            preprocess_inputs=legacy,
-        ),
+    model = SimpleNamespace(
+        prepare_inputs=canonical,
+        preprocess_inputs=legacy,
     )
     with pytest.raises(TypeError, match="must implement.*prepare_inputs"):
-        Trainer.preprocess(
-            trainer, Batch(input_ids=torch.ones(1, 2), labels=torch.ones(1, 2))
+        prepare_model_inputs(
+            model,
+            Batch(input_ids=torch.ones(1, 2), labels=torch.ones(1, 2)),
+            device=torch.device("cpu"),
+            parallel_dims=None,
+            max_context_length=2,
         )

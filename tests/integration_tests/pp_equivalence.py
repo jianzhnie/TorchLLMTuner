@@ -83,6 +83,7 @@ from llmtuner.config.parallel_config import (
 from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.configuration import build_model_config_for
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.trainer.runtime.batch import resolve_data_parallel_rank
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.module_names import canonical_fqn
 from tests.integration_tests.harness import device as harness_device
@@ -326,7 +327,7 @@ def main() -> None:
         f"unexpected world size: {trainer.world_size}"
     )
     pp_rank = trainer.parallel_dims.get_mesh("pp").get_local_rank()
-    _, dp_size = trainer.dp_rank_world_size()
+    _, dp_size = resolve_data_parallel_rank(trainer.parallel_dims)
     replicas = trainer.world_size // cfg.parallel.pp_size
     assert (
         trainer.parallel_dims.dp_replicate == cfg.parallel.data_parallel_replicate_size

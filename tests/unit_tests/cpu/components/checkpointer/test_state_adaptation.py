@@ -6,7 +6,7 @@ import llmtuner.components.checkpointer.core.state_adaptation as state_adaptatio
 
 
 class _Adapter:
-    kimi_expert_parallel = False
+    coordinates_state_conversion = False
 
     def from_hf(self, state):
         return {key.removeprefix("hf."): value for key, value in state.items()}
@@ -57,7 +57,7 @@ def test_hf_state_adaptation_preserves_kimi_collective_boundary(monkeypatch):
         yield
 
     class KimiAdapter(_Adapter):
-        kimi_expert_parallel = True
+        coordinates_state_conversion = True
 
     monkeypatch.setattr(state_adaptation, "synchronize_local_errors", coordinate)
     model_state = _ModelState()
@@ -81,8 +81,8 @@ def test_hf_state_adaptation_propagates_destination_validation_failure():
     assert caught.value is failure
 
 
-@pytest.mark.parametrize("kimi_expert_parallel", [False, True])
-def test_failed_conversion_never_validates_destination(kimi_expert_parallel):
+@pytest.mark.parametrize("coordinates_state_conversion", [False, True])
+def test_failed_conversion_never_validates_destination(coordinates_state_conversion):
     failure = ValueError("invalid HF state")
 
     class FailedAdapter:
@@ -90,7 +90,7 @@ def test_failed_conversion_never_validates_destination(kimi_expert_parallel):
             raise failure
 
     adapter = FailedAdapter()
-    adapter.kimi_expert_parallel = kimi_expert_parallel
+    adapter.coordinates_state_conversion = coordinates_state_conversion
     destination = _ModelState()
     with pytest.raises(ValueError, match="invalid HF state") as caught:
         state_adaptation.adapt_hf_model_state(adapter, destination, {"hf.weight": 1})

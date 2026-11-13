@@ -6,7 +6,101 @@ import pytest
 import torch
 
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
-from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
+from llmtuner.models.kimi.kimi_k3.moe import KimiMoEGate, KimiSparseMoE
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("routed_scaling_factor", float("nan")),
+        ("routed_scaling_factor", float("inf")),
+        ("routed_scaling_factor", True),
+        ("moe_renormalize", "false"),
+    ],
+)
+def test_invalid_router_config_fails_without_allocating_weights(
+    monkeypatch, field, value
+):
+    config = KimiLinearConfig(hidden_size=8, num_experts=4, num_experts_per_token=2)
+    setattr(config, field, value)
+    rng = torch.get_rng_state().clone()
+
+    def reject(*args, **kwargs):
+        pytest.fail("Router configuration must be checked before weight allocation")
+
+    monkeypatch.setattr(torch, "empty", reject)
+    with pytest.raises(ValueError, match=field):
+        KimiMoEGate(config)
+    assert torch.equal(torch.get_rng_state(), rng)
+
+
+@pytest.mark.parametrize("top_k", [1, 2])
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("score_func", ["sigmoid", "softmax"])
+def test_parallel_router_preserves_live_gate_math(top_k, grouped, score_func):
+    torch.manual_seed(41)
+    block = KimiSparseMoE(
+        KimiLinearConfig(
+            hidden_size=8,
+            num_experts=4,
+            num_experts_per_token=top_k,
+            moe_intermediate_size=12,
+            num_expert_group=2 if grouped else 1,
+            topk_group=1,
+            moe_router_activation_func=score_func,
+            moe_renormalize=True,
+            routed_scaling_factor=1.7,
+        )
+    )
+    gate = block.gate
+    with torch.no_grad():
+        gate.e_score_correction_bias.copy_(torch.tensor([0.1, -0.2, 0.3, -0.4]))
+    # Conversion consumes the live gate, not subsequently edited config fields.
+    block.config.routed_scaling_factor = 9.0
+    native = gate.build_parallel_router(aux_loss_coefficient=None)
+    assert native.gate.weight is gate.weight
+    inputs = torch.randn(2, 7, 8, requires_grad=True)
+    other = inputs.detach().clone().requires_grad_()
+    expected_ids, expected_scores = gate(inputs)
+    scores, ids, _ = native(other.reshape(-1, 8), gate.e_score_correction_bias)
+    assert torch.equal(ids, expected_ids)
+    assert torch.count_nonzero(scores) == scores.numel()
+    torch.testing.assert_close(scores, expected_scores, rtol=1e-6, atol=1e-6)
+    gradient = torch.randn_like(scores)
+    expected_gradients = torch.autograd.grad(
+        expected_scores, (inputs, gate.weight), gradient
+    )
+    gradients = torch.autograd.grad(scores, (other, native.gate.weight), gradient)
+    for actual, expected in zip(gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("degree", [1, 2, 4])
+def test_expert_parallel_validation_preserves_live_model_and_rng(degree):
+    model = KimiSparseMoE(
+        KimiLinearConfig(
+            hidden_size=8,
+            num_experts=4,
+            num_experts_per_token=2,
+            moe_intermediate_size=12,
+        )
+    )
+    parameters = dict(model.named_parameters())
+    values = {name: value.detach().clone() for name, value in parameters.items()}
+    forward = model.forward
+    rng = torch.get_rng_state().clone()
+    model.validate_expert_parallel(
+        degree=degree,
+        tp_enabled=False,
+        quantile_balancing=False,
+        token_dispatcher="alltoall",
+    )
+    assert model.forward == forward
+    assert dict(model.named_parameters()).keys() == parameters.keys()
+    for name, value in model.named_parameters():
+        assert value is parameters[name]
+        torch.testing.assert_close(value, values[name], rtol=0, atol=0)
+    assert torch.equal(torch.get_rng_state(), rng)
 
 
 def test_bf16_moe_combines_experts_before_rounding():

@@ -1,6 +1,6 @@
 """The assembly stage list: the order contract, pinned.
 
-``parallelize_hf_transformers``'s correctness is its call order (TP before EP
+``parallelize_model``'s correctness is its call order (TP before EP
 before CP, AC before compile, FSDP last), and which of those stages the PP
 path runs (a chunk is checkpointed on its own layers, so AC is on both paths
 -- upstream hands ``ac_config`` to each model part's own ``parallelize``).
@@ -48,7 +48,6 @@ def test_parallel_public_entries_resolve_to_their_defining_modules():
         "apply_fsdp": "fully_shard_parallel.fully_shard_parallel",
         "apply_tp": "tensor_parallel.tensor_parallel",
         "parallelize_model": "parallelize",
-        "parallelize_hf_transformers": "parallelize",
     }
     assert set(parallel_api.__all__) == set(entries)
     for name, source in entries.items():
@@ -67,7 +66,7 @@ def test_direct_assembly_rejects_non_boolean_execution_flags(flag, invalid):
     options = {"activation_swap": False, "compile": False}
     options[flag] = invalid
     with pytest.raises(ConfigError, match=rf"{flag} must be bool"):
-        parallelize.parallelize_hf_transformers(
+        parallelize.parallelize_model(
             model, cfg=ParallelConfig(), mesh=None, parallel_dims=None, **options
         )
     assert model.forward == forward
@@ -104,7 +103,7 @@ def test_invalid_ac_options_fail_before_parallel_transforms(
     monkeypatch.setattr(parallelize, "apply_tp", unexpected_transform)
     monkeypatch.setattr(parallelize, "apply_pp", unexpected_transform)
     with pytest.raises(ValueError, match=match):
-        parallelize.parallelize_hf_transformers(
+        parallelize.parallelize_model(
             nn.Linear(2, 2),
             cfg=ParallelConfig(),
             mesh=None,
@@ -130,7 +129,7 @@ def test_unavailable_fsdp_engine_fails_before_model_transforms(monkeypatch, pipe
     monkeypatch.setattr(parallelize, "apply_tp", unexpected_transform)
     monkeypatch.setattr(parallelize, "apply_pp", unexpected_transform)
     with pytest.raises(EnvironmentUnsupportedError, match="custom engine unavailable"):
-        parallelize.parallelize_hf_transformers(
+        parallelize.parallelize_model(
             nn.Linear(2, 2),
             cfg=ParallelConfig(),
             mesh=None,
@@ -152,7 +151,7 @@ def test_invalid_compile_backend_fails_before_parallel_transforms(
     monkeypatch.setattr(parallelize, "apply_tp", unexpected_transform)
     monkeypatch.setattr(parallelize, "apply_pp", unexpected_transform)
     with pytest.raises(InvalidBackend):
-        parallelize.parallelize_hf_transformers(
+        parallelize.parallelize_model(
             nn.Linear(2, 2),
             cfg=ParallelConfig(),
             mesh=None,
@@ -174,7 +173,7 @@ def test_unsupported_mc2_degree_fails_in_ep_stage_before_conversion(monkeypatch)
 
     monkeypatch.setattr(expert_parallel, "swap_moe_blocks", unexpected_conversion)
     with pytest.raises(EnvironmentUnsupportedError, match="world size in"):
-        parallelize.parallelize_hf_transformers(
+        parallelize.parallelize_model(
             nn.Linear(2, 2),
             cfg=ParallelConfig(
                 expert_parallel_size=2,
@@ -210,7 +209,7 @@ def test_pipeline_validates_tp_override_before_splitting(monkeypatch):
 
     monkeypatch.setattr(parallelize, "apply_pp", unexpected_split)
     with pytest.raises(ValueError, match="TP override pattern.*matched no module"):
-        parallelize.parallelize_hf_transformers(
+        parallelize.parallelize_model(
             nn.Sequential(nn.Linear(4, 4)),
             cfg=cfg,
             mesh=None,
@@ -259,7 +258,7 @@ def test_assembly_executes_stages_in_order(monkeypatch, compile_enabled):
     ):
         monkeypatch.setattr(parallelize, function, runner(name))
 
-    result = parallelize.parallelize_hf_transformers(
+    result = parallelize.parallelize_model(
         model,
         cfg=ParallelConfig(),
         mesh=None,
@@ -334,7 +333,7 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
         return schedule
 
     monkeypatch.setattr(parallelize, "build_pipeline_schedule", build_schedule)
-    result = parallelize.parallelize_hf_transformers(
+    result = parallelize.parallelize_model(
         model,
         cfg=cfg,
         mesh=None,
@@ -398,7 +397,7 @@ def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline):
 
     monkeypatch.setattr(parallelize, "apply_tp", replace_parameters)
     monkeypatch.setattr(parallelize, "apply_fsdp", check_fsdp)
-    parallelize.parallelize_hf_transformers(
+    parallelize.parallelize_model(
         model,
         cfg=cfg,
         mesh=None,
@@ -427,6 +426,8 @@ def test_fused_ep_dispatch_receives_stage_wide_error_group(monkeypatch, dispatch
     )
     cfg = ParallelConfig(expert_parallel_size=8 if dispatcher == "mc2" else 2)
     cfg.ep_config.ep_token_dispatcher = dispatcher
+    # This test isolates mesh wiring; model geometry is covered separately.
+    monkeypatch.setattr(parallelize, "resolve_ep_plan", lambda *args, **kwargs: None)
     observed = {}
     for name in STAGE_ORDER:
         function = (
@@ -439,9 +440,7 @@ def test_fused_ep_dispatch_receives_stage_wide_error_group(monkeypatch, dispatch
         return part
 
     monkeypatch.setattr(parallelize, "apply_ep", apply_ep)
-    parallelize.parallelize_hf_transformers(
-        model, cfg=cfg, mesh=None, parallel_dims=dims
-    )
+    parallelize.parallelize_model(model, cfg=cfg, mesh=None, parallel_dims=dims)
     assert observed["ep_group"] is ep_group
     assert observed["error_group"] is loss_group
 
@@ -454,7 +453,7 @@ def test_full_ac_skips_activation_swap(monkeypatch):
         "apply_activation_swap",
         lambda part: calls.append(part) or part,
     )
-    parallelize.parallelize_hf_transformers(
+    parallelize.parallelize_model(
         nn.Linear(2, 2),
         cfg=ParallelConfig(),
         mesh=None,
@@ -479,7 +478,7 @@ def test_activation_swap_rejects_unsupported_direct_api_combinations(
     from llmtuner.errors import ConfigError
 
     with pytest.raises(ConfigError, match=message):
-        parallelize.parallelize_hf_transformers(
+        parallelize.parallelize_model(
             nn.Linear(2, 2),
             cfg=ParallelConfig(),
             mesh=None,

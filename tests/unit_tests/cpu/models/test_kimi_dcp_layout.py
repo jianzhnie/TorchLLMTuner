@@ -95,7 +95,7 @@ def test_dcp_kimi_layout_restores_weights_moments_and_next_update(
         swap_moe_blocks(target.model)
     target_optimizer = OptimizerState(target)
     target_ema = EMA(model_parts=[target], decay=0.5)
-    adapter = legacy_adapter(config, None, kimi_expert_parallel=not source_grouped)
+    adapter = legacy_adapter(config, None, expert_parallel=not source_grouped)
     assert load_changed_kimi_layout(
         str(tmp_path),
         states={
@@ -148,7 +148,7 @@ def test_invalid_cross_layout_model_leaves_target_weights_intact(tmp_path, corru
     target.model = make_model(latent=True, shared=1)
     swap_moe_blocks(target.model)
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = legacy_adapter(config, None, kimi_expert_parallel=True)
+    adapter = legacy_adapter(config, None, expert_parallel=True)
     with pytest.raises(ValueError, match="missing keys|has shape"):
         load_changed_kimi_layout(
             str(tmp_path),
@@ -193,7 +193,7 @@ def test_invalid_cross_layout_training_state_preserves_model(
         else EMA(model_parts=[target], decay=0.5)
     )
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = legacy_adapter(config, None, kimi_expert_parallel=True)
+    adapter = legacy_adapter(config, None, expert_parallel=True)
     with pytest.raises(ValueError, match="missing required key|has shape"):
         load_changed_kimi_layout(
             str(tmp_path),
@@ -228,7 +228,7 @@ def test_saved_amsgrad_validated_before_model_with_fresh_non_amsgrad(
     swap_moe_blocks(target.model)
     target_state = OptimizerState(target, amsgrad=False)
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = legacy_adapter(config, None, kimi_expert_parallel=True)
+    adapter = legacy_adapter(config, None, expert_parallel=True)
     with pytest.raises(ValueError, match="missing required key|has shape"):
         load_changed_kimi_layout(
             str(tmp_path),
@@ -257,7 +257,7 @@ def test_legacy_cross_layout_checkpoint_without_rng_restores_model(
         swap_moe_blocks(target.model)
     rng = RNGCheckpointState(torch.device("cpu"))
     rng_before = torch.get_rng_state().clone()
-    adapter = legacy_adapter(config, None, kimi_expert_parallel=not source_grouped)
+    adapter = legacy_adapter(config, None, expert_parallel=not source_grouped)
     assert load_changed_kimi_layout(
         str(tmp_path),
         states={"model": ModelCheckpointState(target), "rng_state": rng},
@@ -294,7 +294,7 @@ def test_cross_layout_rng_missing_current_rank_rejected_before_model_copy(
         swap_moe_blocks(target.model)
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
     rng_before = torch.get_rng_state().clone()
-    adapter = legacy_adapter(config, None, kimi_expert_parallel=not source_grouped)
+    adapter = legacy_adapter(config, None, expert_parallel=not source_grouped)
     with pytest.raises(KeyError, match="rank_0"):
         load_changed_kimi_layout(
             str(tmp_path),
@@ -333,7 +333,7 @@ def test_cross_layout_compiled_name_collision_preserves_target(tmp_path, categor
             else EMA(model_parts=[target], decay=0.5)
         )
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = legacy_adapter(config, None, kimi_expert_parallel=True)
+    adapter = legacy_adapter(config, None, expert_parallel=True)
     with pytest.raises(ValueError, match="Ambiguous compiled Kimi checkpoint keys"):
         load_changed_kimi_layout(str(tmp_path), states=states, adapter=adapter)
     for key, value in target.state_dict().items():

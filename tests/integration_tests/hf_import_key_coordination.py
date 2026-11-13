@@ -22,7 +22,7 @@ def main() -> None:
         adapter = ModelStateDictAdapter(
             SimpleNamespace(model_type="qwen3_moe"),
             None,
-            qwen3_expert_parallel=True,
+            expert_parallel=True,
         )
         key = "model.layers.0.mlp.gate.weight"
         native_key = "model.layers.0.mlp.router.gate.weight"

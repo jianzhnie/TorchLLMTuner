@@ -19,7 +19,7 @@ from torch import nn
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.memory.activation_checkpoint import wrap_full
 from llmtuner.models.common.aux_loss import AuxLoss
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from llmtuner.parallel.model_compile import apply_compile
 from llmtuner.parallel.tensor_parallel.checkpointing import (
     gather_tensor_parallel_state,
@@ -157,7 +157,7 @@ def main():
                     for key, value in target._tp_checkpoint_layouts.items()
                 }
                 del target._tp_checkpoint_layouts
-            swap_hf_moe_blocks(
+            swap_moe_blocks(
                 target,
                 fixed_router=True,
                 tp_enabled=True,

@@ -17,7 +17,12 @@ from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.datasets.contracts import Batch, DataloaderExhaustedError
 from llmtuner.models.configuration import build_model_config
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
-from llmtuner.trainer.runtime.batch import batch_generator, fetch_batch, microbatch
+from llmtuner.trainer.runtime.batch import (
+    batch_generator,
+    fetch_batch,
+    microbatch,
+    prepare_model_inputs,
+)
 from llmtuner.trainer.runtime.validation import (
     count_validation_batch_tokens,
     finalize_validation,
@@ -275,6 +280,13 @@ def main():
         trainer.device = torch.device("cpu")
         trainer.parallel_dims = None
         trainer.model = model
+        trainer.preprocess = lambda value: prepare_model_inputs(
+            trainer.model,
+            value,
+            device=trainer.device,
+            parallel_dims=trainer.parallel_dims,
+            max_context_length=trainer.cfg.max_seq_len,
+        )
         for failing_rank in (0, 1):
             value = {
                 "input": torch.ones(4, dtype=torch.long),
@@ -390,17 +402,23 @@ def main():
             loader = Loader(failure)
             metrics = Metrics()
             metrics.log_validation = lambda logs=logs, **values: logs.append(values)
+
+            class ValidationModel:
+                def prepare_inputs(self, batch, **kwargs):
+                    return torch.ones(4), batch.labels, {}
+
+                def __call__(self, inputs):
+                    return inputs * (rank + 1)
+
             trainer = SimpleNamespace(
                 parallel_dims=topology,
                 device=torch.device("cpu"),
+                cfg=SimpleNamespace(max_seq_len=4),
                 metrics=metrics,
                 count_valid_tokens=lambda value: 4,
-                preprocess=lambda value: (torch.ones(4), value.labels, {}),
                 param_context=nullcontext,
-                example_model=lambda inputs: inputs * (rank + 1),
-                _model_output_value=Trainer._model_output_value,
+                example_model=ValidationModel(),
                 loss_sum=lambda logits, labels: logits.sum(),
-                loss_vocab_kwargs=lambda: {},
             )
             with patch(
                 "llmtuner.trainer.runtime.validation.create_validation_dataloader",
@@ -467,7 +485,9 @@ def main():
                                 "llmtuner.trainer.runtime.validation.create_validation_dataloader",
                                 return_value=TokenFailureLoader(),
                             ),
-                            patch.object(trainer, "preprocess") as preprocess,
+                            patch.object(
+                                trainer.example_model, "prepare_inputs"
+                            ) as preprocess,
                             patch(
                                 "llmtuner.trainer.runtime.validation.finalize_validation"
                             ) as finalize,

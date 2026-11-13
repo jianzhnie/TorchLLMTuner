@@ -553,12 +553,12 @@ def test_apply_tp_defers_the_moe_blocks_to_ep_when_ep_is_on() -> None:
 
 
 def test_swap_refuses_a_shared_expert_block_under_tp_x_ep() -> None:
-    from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+    from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 
     model = _MoeModel()
     model.layers[0]["mlp"].shared_expert = nn.Linear(16, 16)
     with pytest.raises(NotImplementedError, match="shared"):
-        swap_hf_moe_blocks(model, ep_group=None, tp_enabled=True)
+        swap_moe_blocks(model, ep_group=None, tp_enabled=True)
 
 
 def test_tp_sharded_param_ids_covers_dense_tp_and_ep_experts_not_router() -> None:

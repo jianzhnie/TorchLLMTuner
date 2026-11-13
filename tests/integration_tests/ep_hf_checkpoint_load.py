@@ -76,7 +76,7 @@ def main() -> None:
         hf_template = ModelStateDictAdapter(
             SimpleNamespace(model_type="qwen3_moe", num_experts=4),
             str(path),
-            qwen3_expert_parallel=True,
+            expert_parallel=True,
         )
         dcp.load(
             hf_template.to_hf(sharded),
@@ -140,7 +140,7 @@ def main() -> None:
         adapter = ModelStateDictAdapter(
             SimpleNamespace(model_type="qwen3_moe", num_experts=4),
             str(path),
-            qwen3_expert_parallel=True,
+            expert_parallel=True,
         )
         local_export = adapter.to_hf_export(local_wrapper.state_dict())
         save_hf_checkpoint(

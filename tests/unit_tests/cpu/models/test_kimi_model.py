@@ -1,7 +1,5 @@
 """Explicit Kimi construction, input semantics and initialization lifecycle."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -19,7 +17,7 @@ from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM, KimiTextDe
 from llmtuner.models.kimi.kimi_k3.moe import KimiMoEGate
 from llmtuner.models.kimi.kimi_k3.normalization import KimiRMSNorm
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
-from llmtuner.trainer.runtime.assembly import _build_model
+from llmtuner.trainer.runtime.assembly import build_model
 
 
 def test_kimi_router_rejects_unknown_scoring_before_allocation(monkeypatch):
@@ -366,9 +364,8 @@ def test_kimi_ep_meta_random_initialization_rejects_before_model_allocation(
         raise AssertionError("Unsupported initialization must fail before allocation")
 
     monkeypatch.setattr("llmtuner.trainer.runtime.assembly.resolve_model_class", reject)
-    trainer = SimpleNamespace(cfg=cfg, parallel_dims=None)
     with pytest.raises(UnsupportedCombinationError, match="ownership-aware"):
-        _build_model(trainer)
+        build_model(cfg, parallel_dims=None, device=torch.device("cpu"))
 
 
 def test_kda_decay_parameters_remain_fp32_with_bf16_default():

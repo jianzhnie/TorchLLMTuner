@@ -1,7 +1,8 @@
 """Four Gloo ranks: MC2 local preflight must span multiple EP subgroups.
 
 Run with torchrun --nproc_per_node=4. No fused kernel is executed. The block
-swap is substituted to isolate apply_ep's stage error-group wiring.
+swap and hardware EP-degree check are substituted to isolate apply_ep's stage
+error-group wiring on two synthetic EP2 groups. This is not MC2 kernel acceptance.
 """
 
 from datetime import timedelta
@@ -31,10 +32,14 @@ def main():
             expert_parallel_size=2,
             ep_config=ExpertParallelConfig(ep_token_dispatcher="mc2"),
         )
-        with patch.object(expert_parallel, "swap_hf_moe_blocks", return_value=1):
+        with (
+            patch.object(expert_parallel, "swap_moe_blocks", return_value=1),
+            patch.object(expert_parallel, "validate_mc2_world_size") as validate_size,
+        ):
             expert_parallel.apply_ep(
                 model, cfg, ep_group=group, error_group=dist.group.WORLD
             )
+            validate_size.assert_called_once_with(2)
         for failing_rank in (0, 3):
             scores = torch.ones(1, 2, dtype=torch.float16)
             if dist.get_rank() == failing_rank:

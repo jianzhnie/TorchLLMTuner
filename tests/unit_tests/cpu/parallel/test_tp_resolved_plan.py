@@ -230,12 +230,16 @@ def test_invalid_moe_shared_geometry_fails_during_pure_preflight():
     assert not getattr(block, "_tp_moe_boundary", False)
 
 
-@pytest.mark.parametrize("replacement", ["module", "parameter", "alias", "new_module"])
+@pytest.mark.parametrize(
+    "replacement", ["module", "parameter", "alias", "new_module", "forward"]
+)
 def test_resolved_tp_rejects_replaced_bindings_before_mesh_access(replacement):
     model = nn.Sequential(nn.Linear(8, 12, bias=False))
     cfg = ParallelConfig(tensor_parallel_size=2)
     plan = resolve_tp_plan(model, cfg=cfg, plan={"0": "colwise"})
-    if replacement == "module":
+    if replacement == "forward":
+        model[0].forward = lambda inputs: inputs
+    elif replacement == "module":
         model[0] = nn.Linear(8, 12, bias=False)
     elif replacement == "parameter":
         model[0].weight = nn.Parameter(model[0].weight.detach().clone())

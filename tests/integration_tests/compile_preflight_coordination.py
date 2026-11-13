@@ -10,7 +10,7 @@ from torch._dynamo.exc import InvalidBackend
 from torch._dynamo.utils import counters
 
 from llmtuner.config import CompileConfig, ParallelConfig
-from llmtuner.parallel.parallelize import parallelize_hf_transformers
+from llmtuner.parallel.parallelize import parallelize_model
 from tests.integration_tests.harness import init_distributed
 
 
@@ -33,7 +33,7 @@ def main():
         original = model.layers[0]
         error = None
         try:
-            parallelize_hf_transformers(
+            parallelize_model(
                 model,
                 cfg=ParallelConfig(),
                 mesh=None,
@@ -58,7 +58,7 @@ def main():
         assert all(item[2] for item in outcomes), outcomes
         reference = deepcopy(original)
         graphs_before = counters["stats"]["unique_graphs"]
-        parallelize_hf_transformers(
+        parallelize_model(
             model,
             cfg=ParallelConfig(),
             mesh=None,

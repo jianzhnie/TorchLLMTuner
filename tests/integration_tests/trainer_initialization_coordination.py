@@ -1,4 +1,4 @@
-"""Coordinate asymmetric HF model-build failures before parallel transforms.
+"""Coordinate asymmetric explicit model-build failures before parallel transforms.
 
 PYTHONPATH=. torchrun --standalone --nproc_per_node=2 \
     tests/integration_tests/trainer_initialization_coordination.py
@@ -31,7 +31,13 @@ from llmtuner.trainer.trainer import Trainer
 def config():
     return LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3",
+            model_name_or_path="qwen3_moe",
+            arch_overrides={
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+                "head_dim": 8,
+            },
             vocab_size=32,
             hidden_size=16,
             intermediate_size=32,
@@ -104,7 +110,7 @@ def main():
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
         for (failing_rank, name), error_type in product(
-            enumerate(("build_model_config_for", "HFTransformerModel")),
+            enumerate(("build_model_config_for", "resolve_model_class")),
             (ValueError, KeyboardInterrupt, SystemExit),
         ):
             original = getattr(assembly, name)
@@ -144,18 +150,18 @@ def main():
                 flush=True,
             )
         # No rank may enter checkpointer construction while another loader failed.
-        original_loader = Trainer.build_dataloader
+        original_loader = assembly.build_training_dataloader
         closed = []
         failure = ValueError("injected dataloader construction failure")
 
-        def build_loader(self):
+        def build_loader(cfg, *, parallel_dims):
             if rank == 0:
                 raise failure
             return SimpleNamespace(close=lambda: closed.append(True))
 
         with (
-            patch.object(Trainer, "build_dataloader", build_loader),
-            patch.object(assembly, "_build_checkpointer") as checkpointer,
+            patch.object(assembly, "build_training_dataloader", build_loader),
+            patch.object(assembly, "build_checkpointer") as checkpointer,
         ):
             try:
                 failed_constructor(config())
@@ -168,7 +174,7 @@ def main():
                 raise AssertionError("asymmetric loader unexpectedly succeeded")
             checkpointer.assert_not_called()
         assert closed == ([True] if rank == 1 else [])
-        assert Trainer.build_dataloader is original_loader
+        assert assembly.build_training_dataloader is original_loader
         dist.barrier()
         print(
             f"rank={rank}: loader failure coordinated and peer loader closed",
@@ -378,7 +384,7 @@ def main():
 
             with (
                 patch.object(assembly, "build_lr_scheduler", build_scheduler),
-                patch.object(Trainer, "build_dataloader") as loader,
+                patch.object(assembly, "build_training_dataloader") as loader,
             ):
                 try:
                     failed_constructor(config())

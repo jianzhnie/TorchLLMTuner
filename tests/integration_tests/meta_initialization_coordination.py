@@ -6,7 +6,7 @@ No checkpoint reader or training executes.
 An optimizer sentinel detects peers crossing the failed materialization phase.
 """
 
-import sys
+import argparse
 from datetime import timedelta
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -23,20 +23,29 @@ from llmtuner.trainer.trainer import Trainer
 def main():
     dist.init_process_group("gloo", timeout=timedelta(seconds=20))
     try:
-        if sys.argv[1:] not in ([], ["compile"]):
-            raise ValueError("Expected optional compile argument")
-        compiled = bool(sys.argv[1:])
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("mode", nargs="?", choices=("compile",))
+        parser.add_argument(
+            "--implementation", choices=("native", "custom", "both"), default="both"
+        )
+        args = parser.parse_args()
+        compiled = args.mode == "compile"
+        implementations = (
+            ("native", "custom")
+            if args.implementation == "both"
+            else (args.implementation,)
+        )
         world_size = dist.get_world_size()
         assert world_size in (2, 4)
         original = assembly.materialize_meta_model
-        for implementation in ("native", "custom"):
+        for implementation in implementations:
             for failing_rank in range(world_size):
                 for error_type in (ValueError, KeyboardInterrupt, SystemExit):
                     with TemporaryDirectory() as root:
                         cfg = parse_config(
                             [
                                 "--model_name_or_path",
-                                "qwen3",
+                                "qwen3_moe",
                                 "--vocab_size",
                                 "32",
                                 "--hidden_size",
@@ -69,6 +78,12 @@ def main():
                                 implementation,
                             ]
                         )
+                        cfg.model.arch_overrides.update(
+                            head_dim=8,
+                            num_experts=4,
+                            num_experts_per_tok=2,
+                            moe_intermediate_size=8,
+                        )
                         if world_size == 4:
                             cfg.parallel.pipeline_parallel_size = 2
                             cfg.parallel.pp_config.pipeline_parallel_schedule = (
@@ -90,9 +105,10 @@ def main():
                             failing_rank=failing_rank,
                             failure=failure,
                             materialized=materialized,
+                            **materialization_options,
                         ):
                             assert isinstance(model, OptimizedModule) is compiled
-                            original(model, device)
+                            original(model, device, **materialization_options)
                             materialized.append(model)
                             expected_parts = 2 if world_size == 4 else 1
                             if (
@@ -101,7 +117,9 @@ def main():
                             ):
                                 raise failure
 
-                        def optimizer(trainer, entered=entered):
+                        def optimizer(
+                            cfg, *, model_parts, parallel_dims, entered=entered
+                        ):
                             entered.append(True)
                             raise AssertionError("Optimizer entered after peer failed")
 
@@ -109,7 +127,7 @@ def main():
                             patch.object(
                                 assembly, "materialize_meta_model", materialize
                             ),
-                            patch.object(assembly, "_build_optimizer_stack", optimizer),
+                            patch.object(assembly, "build_optimizer_stack", optimizer),
                         ):
                             caught = None
                             try:
@@ -127,7 +145,10 @@ def main():
                         assert not entered
                         dist.barrier()
         if dist.get_rank() == 0:
-            print("Native/custom materialization failures stop before optimizer.")
+            print(
+                f"{', '.join(implementations)} materialization failures "
+                "stop before optimizer."
+            )
     finally:
         dist.destroy_process_group()
 

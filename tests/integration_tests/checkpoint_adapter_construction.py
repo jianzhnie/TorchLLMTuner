@@ -4,7 +4,7 @@ PYTHONPATH=. torchrun --nproc_per_node=2 \
     tests/integration_tests/checkpoint_adapter_construction.py
 
 CPU/Gloo, actual assembly helper, adapter file IO and DCP manager construction.
-Uses a minimal trainer owner rather than the full model/data assembly pipeline.
+Passes explicit runtime owners without constructing a Trainer.
 """
 
 import json
@@ -18,7 +18,12 @@ import torch
 import torch.distributed as dist
 
 from llmtuner.config.checkpoint_config import CheckpointConfig
-from llmtuner.trainer.runtime.assembly import _build_checkpointer
+from llmtuner.config.optimizer_config import OptimizerConfig
+from llmtuner.trainer.runtime.assembly import (
+    ModelAssembly,
+    OptimizerStack,
+    build_checkpointer,
+)
 from tests.integration_tests.checkpoint_data_preflight import loader
 from tests.integration_tests.rng_checkpoint_equivalence import runtime
 
@@ -48,25 +53,25 @@ def main():
                         )
                     )
                     model, _, optimizer, scheduler, ema = runtime(42)
-                    trainer = SimpleNamespace(
-                        cfg=SimpleNamespace(
-                            checkpoint=CheckpointConfig(enable=True, keep_latest_k=0),
-                            dump_folder=f"{roots[0]}/out-{failing_rank}-{malformed}",
-                            hf_model=str(assets),
-                            parallel=SimpleNamespace(ep_size=1),
-                        ),
+                    cfg = SimpleNamespace(
+                        checkpoint=CheckpointConfig(enable=True, keep_latest_k=0),
+                        optimizer=OptimizerConfig(),
+                        dump_folder=f"{roots[0]}/out-{failing_rank}-{malformed}",
+                        hf_model=str(assets),
+                        parallel=SimpleNamespace(ep_size=1),
+                    )
+                    dependencies = dict(
+                        model_assembly=ModelAssembly(model=model, model_parts=[model]),
+                        optimizer_stack=OptimizerStack(optimizer, scheduler, ema),
                         dataloader=loader(2),
+                        train_state=None,
                         device=torch.device("cpu"),
                         parallel_dims=None,
-                        model_parts=[model],
-                        optimizer=optimizer,
-                        lr_scheduler=scheduler,
-                        ema=ema,
                     )
                     caught = None
                     try:
-                        _build_checkpointer(
-                            trainer, SimpleNamespace(model_type="llama")
+                        build_checkpointer(
+                            cfg, SimpleNamespace(model_type="llama"), **dependencies
                         )
                     except BaseException as error:
                         caught = error
@@ -81,16 +86,17 @@ def main():
                         assert str(caught) == (
                             "Checkpoint services preparation failed on another rank"
                         )
-                    assert not hasattr(trainer, "checkpointer")
                     dist.barrier()
                     index.write_text(
                         json.dumps({"weight_map": {"weight": "weights.safetensors"}})
                     )
-                    _build_checkpointer(trainer, SimpleNamespace(model_type="llama"))
+                    checkpointer = build_checkpointer(
+                        cfg, SimpleNamespace(model_type="llama"), **dependencies
+                    )
                     try:
-                        assert trainer.checkpointer._initialized
+                        assert checkpointer._initialized
                     finally:
-                        trainer.checkpointer.close()
+                        checkpointer.close()
                     dist.barrier()
                     if rank == 0:
                         print(f"PASS {failing_rank=} {malformed=}", flush=True)

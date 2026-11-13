@@ -22,7 +22,7 @@ from torch.distributed.tensor import DTensor
 
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
-from llmtuner.parallel.parallelize import parallelize_hf_transformers
+from llmtuner.parallel.parallelize import parallelize_model
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.runtime.gradients import allreduce_fsdp_excluded_grads
 
@@ -52,7 +52,7 @@ def main():
         dims.build_device_mesh()
         tp_rank = dims.get_mesh("tp").get_local_rank()
         dp_rank = dims.get_mesh("dp_shard").get_local_rank()
-        model = parallelize_hf_transformers(
+        model = parallelize_model(
             model,
             cfg=cfg,
             mesh=dims.spmd_dense_mesh(),

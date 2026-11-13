@@ -39,7 +39,7 @@ into one FSDP group. The forward then all-gathers mismatched shards and the
 output is garbage, silently.
 
 Setup: dp_shard=4, ep=2 (so efsdp=2) over a tiny offline qwen3_moe, through
-the real ``parallelize_hf_transformers`` entry point. Each rank runs its own
+the real ``parallelize_model`` entry point. Each rank runs its own
 quarter of a global batch; FSDP's gradient reduction (sum, division disabled)
 turns the per-rank partials into full-batch gradients. The whole thing is
 compared against a single-process reference over the full batch: loss, router
@@ -59,6 +59,7 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from llmtuner.models.hf.model import HFTransformerModel
 from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
 from torch.distributed.tensor import DTensor
 from transformers import AutoConfig
@@ -70,9 +71,8 @@ from llmtuner.config.parallel_config import ExpertParallelConfig, FSDPConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.models.common.moe.layer import MoE
-from llmtuner.models.hf.model import HFTransformerModel
 from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
-from llmtuner.parallel.parallelize import parallelize_hf_transformers
+from llmtuner.parallel.parallelize import parallelize_model
 from llmtuner.parallel.topology import ParallelTopology
 from tests.integration_tests.harness import init_distributed, moved
 
@@ -261,7 +261,7 @@ def main() -> None:
         source = original.experts.down_proj
         model.register_parameter("external_expert", source)
         try:
-            parallelize_hf_transformers(
+            parallelize_model(
                 model,
                 cfg=cfg,
                 mesh=parallel_dims.spmd_dense_mesh(),
@@ -337,7 +337,7 @@ def main() -> None:
         return model
 
     with patch("llmtuner.parallel.parallelize.apply_ep", apply_ep_with_alias):
-        model = parallelize_hf_transformers(
+        model = parallelize_model(
             _model(
                 shared_projection=args.shared_projection,
                 shared_experts=args.shared_experts,

@@ -10,7 +10,6 @@ ALL_NAMES = [
     "npu_ascendc_codegen",
     "dynamo_capture_scalar_outputs",
     "inductor_micro_pipeline_tp",
-    "fx_regional_inductor",
     "symm_mem",
     "functorch_activation_memory_budget",
     "dynamo_lru_cache",

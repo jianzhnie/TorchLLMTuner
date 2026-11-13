@@ -19,7 +19,7 @@ from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import clip_grad_norm_
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
-from llmtuner.parallel.parallelize import parallelize_hf_transformers
+from llmtuner.parallel.parallelize import parallelize_model
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.runtime.gradients import allreduce_fsdp_excluded_grads
 
@@ -59,7 +59,7 @@ def main():
         )
         dims = ParallelTopology.from_config(cfg, world_size=world)
         dims.build_device_mesh()
-        model = parallelize_hf_transformers(
+        model = parallelize_model(
             model, cfg=cfg, mesh=dims.spmd_dense_mesh(), parallel_dims=dims
         )
         assert not isinstance(model.optional, DTensor)

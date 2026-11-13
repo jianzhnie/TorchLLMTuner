@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 
 import torch
 import torch.distributed as dist
+from llmtuner.models.hf.model import HFTransformerModel
 from transformers import AutoConfig
 
 from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
@@ -25,8 +26,7 @@ from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config import CheckpointConfig, LRSchedulerConfig, OptimizerConfig
 from llmtuner.models.common.moe.bias_update import update_expert_bias
-from llmtuner.models.hf.model import HFTransformerModel
-from llmtuner.parallel.expert_parallel.model_replacement import swap_hf_moe_blocks
+from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from tests.integration_tests.harness import init_distributed
 
 
@@ -56,7 +56,7 @@ def build_model(device):
         "external_bias", source.layers[0].mlp.gate.e_score_correction_bias
     )
     assert (
-        swap_hf_moe_blocks(source, ep_group=dist.group.WORLD, router_aux_loss_coef=0.0)
+        swap_moe_blocks(source, ep_group=dist.group.WORLD, router_aux_loss_coef=0.0)
         == 1
     )
     model = torch.nn.Module()

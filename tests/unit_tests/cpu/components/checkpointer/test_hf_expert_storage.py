@@ -124,7 +124,7 @@ def test_individual_hf_experts_load_native_ep_stacks(tmp_path, model_prefix):
     adapter = ModelStateDictAdapter(
         SimpleNamespace(model_type="qwen3_moe", num_experts=3),
         str(tmp_path),
-        qwen3_expert_parallel=True,
+        expert_parallel=True,
         model_prefix=model_prefix,
     )
     wrapped = {model_prefix + key: value for key, value in destination.items()}

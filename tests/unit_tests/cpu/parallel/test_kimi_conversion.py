@@ -12,7 +12,7 @@ from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
 from llmtuner.parallel.expert_parallel.model_replacement import (
     resolve_ep_plan,
-    swap_hf_moe_blocks,
+    swap_moe_blocks,
 )
 
 
@@ -135,14 +135,14 @@ def test_kimi_plan_rejects_expert_aliases_before_allocation(monkeypatch, externa
 def test_kimi_conversion_preserves_live_activation_after_config_edit(activation):
     model = make_model(activation=activation)
     baseline = deepcopy(model)
-    assert swap_hf_moe_blocks(baseline) == 1
+    assert swap_moe_blocks(baseline) == 1
     block = model.layers[0].block_sparse_moe
     block.config.hidden_act = "situ" if activation == "silu" else "silu"
     block.config.activation_situ_beta = 7.0
     block.config.activation_situ_linear_beta = 2.0
     values = torch.randn(2, 5, 8)
     expected = baseline.layers[0].block_sparse_moe(values)
-    assert swap_hf_moe_blocks(model) == 1
+    assert swap_moe_blocks(model) == 1
     actual = model.layers[0].block_sparse_moe(values)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -154,11 +154,40 @@ def test_kimi_plan_rejects_nonuniform_live_activation():
         resolve_ep_plan(model)
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("routed_scaling_factor", float("nan")),
+        ("routed_scaling_factor", float("inf")),
+        ("routed_scaling_factor", True),
+        ("routed_scaling_factor", "1.0"),
+        ("moe_renormalize", 1),
+        ("moe_renormalize", "false"),
+    ],
+)
+def test_kimi_invalid_live_routing_fails_before_replacement(monkeypatch, field, value):
+    model = make_model()
+    block = model.layers[0].block_sparse_moe
+    setattr(block.gate, field, value)
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+
+    def reject(*args, **kwargs):
+        pytest.fail("Invalid routing must fail before replacement allocation")
+
+    monkeypatch.setattr(torch, "empty", reject)
+    with pytest.raises(ValueError, match=field):
+        swap_moe_blocks(model)
+    assert model.layers[0].block_sparse_moe is block
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert torch.equal(torch.get_rng_state(), rng)
+
+
 def test_kimi_conversion_consumes_instantiated_router_math():
     torch.manual_seed(19)
     model = make_model()
     baseline = deepcopy(model)
-    assert swap_hf_moe_blocks(baseline) == 1
+    assert swap_moe_blocks(baseline) == 1
     block = model.layers[0].block_sparse_moe
     # Editing config does not edit the live native gate. Conversion must not
     # reinterpret that edit as a request to change routing mathematics.
@@ -170,7 +199,7 @@ def test_kimi_conversion_consumes_instantiated_router_math():
     values = torch.randn(2, 5, 8, requires_grad=True)
     expected = baseline.layers[0].block_sparse_moe(values)
     expected_gradient = torch.autograd.grad(expected.square().sum(), values)[0]
-    assert swap_hf_moe_blocks(model) == 1
+    assert swap_moe_blocks(model) == 1
     actual_values = values.detach().clone().requires_grad_()
     actual = model.layers[0].block_sparse_moe(actual_values)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -199,7 +228,7 @@ def test_kimi_execution_rejects_changed_math_after_resolution(monkeypatch, chang
 
     monkeypatch.setattr(torch, "empty", reject)
     with pytest.raises(ValueError, match="Stale EP Kimi mathematics"):
-        swap_hf_moe_blocks(model, resolved_plan=plan)
+        swap_moe_blocks(model, resolved_plan=plan)
     assert model.layers[0].block_sparse_moe is block
 
 
@@ -243,7 +272,7 @@ def test_kimi_revalidates_all_planned_targets_before_first_conversion(monkeypatc
 
     monkeypatch.setattr(torch, "empty", reject)
     with pytest.raises(ValueError, match="router and expert count must agree"):
-        swap_hf_moe_blocks(model, resolved_plan=plan)
+        swap_moe_blocks(model, resolved_plan=plan)
     assert all(
         layer.block_sparse_moe is original
         for layer, original in zip(model.layers, originals, strict=True)
@@ -308,7 +337,7 @@ def test_kimi_conversion_preserves_projection_dtypes():
     for expert in source.experts:
         expert.w2.float()
     expected = torch.stack([expert.w2.weight.detach() for expert in source.experts])
-    assert swap_hf_moe_blocks(model) == 1
+    assert swap_moe_blocks(model) == 1
     grouped = model.layers[0].block_sparse_moe.routed_experts.inner_experts
     assert grouped.w1_EFD.dtype == grouped.w3_EFD.dtype == torch.bfloat16
     assert grouped.w2_EDF.dtype == torch.float32
@@ -321,7 +350,7 @@ def test_bf16_conversion_preserves_fp32_combine():
     source = deepcopy(model.layers[0].block_sparse_moe)
     inputs = torch.randn(1, 31, 8, dtype=torch.bfloat16, requires_grad=True)
     other = inputs.detach().clone().requires_grad_()
-    assert swap_hf_moe_blocks(model) == 1
+    assert swap_moe_blocks(model) == 1
     converted = model.layers[0].block_sparse_moe
     # Width 12 is intentionally below grouped-MM's BF16 alignment contract;
     # this regression isolates combine rather than the grouped kernel.
@@ -355,7 +384,7 @@ def test_kimi_conversion_rejects_different_dtypes_within_stacked_projection():
     source = model.layers[0].block_sparse_moe
     source.experts[1].w2.to(dtype=torch.bfloat16)
     with pytest.raises(NotImplementedError, match="different dtypes"):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
     assert model.layers[0].block_sparse_moe is source
 
 
@@ -372,7 +401,7 @@ def test_kimi_conversion_preserves_outputs_gradients_and_parameter_owners(
     source = model.layers[0].block_sparse_moe
     source.gate.e_score_correction_bias.data.copy_(torch.tensor([0.1, -0.2, 0.3, -0.4]))
     reference = deepcopy(source)
-    assert swap_hf_moe_blocks(model) == 1
+    assert swap_moe_blocks(model) == 1
     converted = model.layers[0].block_sparse_moe
     assert collect_moe_layers(model) == [converted]
     assert converted.router.gate.weight is source.gate.weight
@@ -432,7 +461,7 @@ def test_kimi_conversion_rejects_expert_aliases_without_modifying_model(module_a
     else:
         source.experts[1].w1.weight = source.experts[0].w1.weight
     with pytest.raises(NotImplementedError, match="shared individual expert"):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
     assert model.layers[0].block_sparse_moe is source
 
 
@@ -441,8 +470,8 @@ def test_kimi_native_ep_format_loads_into_a_new_converted_model():
         make_model(latent=True, shared=1),
         make_model(latent=True, shared=1),
     )
-    swap_hf_moe_blocks(model)
-    swap_hf_moe_blocks(restored)
+    swap_moe_blocks(model)
+    swap_moe_blocks(restored)
     restored.load_state_dict(model.state_dict(), strict=True)
     inputs = torch.randn(2, 3, 8)
     torch.testing.assert_close(
@@ -458,7 +487,7 @@ def test_meta_kimi_conversion_reconstructs_empty_routing_counters():
 
     with torch.device("meta"):
         model = make_model(latent=True, shared=1)
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
     block = model.layers[0].block_sparse_moe
     assert block.tokens_per_expert_E.is_meta
     materialize_meta_model(
@@ -496,7 +525,7 @@ def test_kimi_fsdp_references_preserve_complete_stacked_exclusions(whole_module)
         )
     )
     references = FSDPPatternReferences(model, cfg)
-    swap_hf_moe_blocks(model, on_replacement=references.record_replacements)
+    swap_moe_blocks(model, on_replacement=references.record_replacements)
     grouped = model.layers[0].block_sparse_moe.routed_experts.inner_experts
     rebound = references.bind(model)
     if whole_module:
@@ -531,7 +560,7 @@ def test_kimi_partial_stacked_exclusion_rejected_before_installation(module_excl
     )
     references = FSDPPatternReferences(model, cfg)
     with pytest.raises(UnsupportedCombinationError, match="part of a stacked"):
-        swap_hf_moe_blocks(model, on_replacement=references.record_replacements)
+        swap_moe_blocks(model, on_replacement=references.record_replacements)
     assert model.layers[0].block_sparse_moe is source
 
 
@@ -560,7 +589,7 @@ def test_kimi_gate_module_exclusion_keeps_moved_bias_outside_router(
         )
     )
     references = FSDPPatternReferences(model, cfg)
-    swap_hf_moe_blocks(model, on_replacement=references.record_replacements)
+    swap_moe_blocks(model, on_replacement=references.record_replacements)
     converted = model.layers[0].block_sparse_moe
     rebound = references.bind(model)
     _, units, ignored = _resolve_pattern_units(model, rebound)
@@ -588,9 +617,47 @@ def test_kimi_conversion_rejects_zero_situ_beta_before_installation():
         expert.act_fn.beta = 0.0
     parameters = dict(model.named_parameters())
     with pytest.raises(ValueError, match="beta must be finite and positive"):
-        swap_hf_moe_blocks(model)
+        swap_moe_blocks(model)
     assert model.layers[0].block_sparse_moe is source
     assert all(
         dict(model.named_parameters())[key] is value
         for key, value in parameters.items()
     )
+
+
+@pytest.mark.parametrize("start,count", [(0, 2), (2, 2), (0, 4)])
+def test_model_owned_expert_packing_preserves_slice_and_projection_state(start, count):
+    block = make_model().layers[0].block_sparse_moe
+    for expert in block.experts:
+        expert.w2.double()
+        expert.w3.requires_grad_(False)
+    source_parameters = tuple(block.parameters())
+    packed = block.build_parallel_experts(start=start, count=count)
+    for source_name, target_name in (
+        ("w1", "w1_EFD"),
+        ("w2", "w2_EDF"),
+        ("w3", "w3_EFD"),
+    ):
+        sources = [
+            getattr(expert, source_name).weight
+            for expert in block.experts[start : start + count]
+        ]
+        target = getattr(packed, target_name)
+        assert target.dtype == sources[0].dtype
+        assert target.requires_grad == sources[0].requires_grad
+        torch.testing.assert_close(target, torch.stack(sources), atol=0, rtol=0)
+    assert all(
+        before is after
+        for before, after in zip(source_parameters, block.parameters(), strict=True)
+    )
+
+
+@pytest.mark.parametrize(
+    "start,count", [(-1, 1), (0, 0), (3, 2), (True, 1), (0, False)]
+)
+def test_model_owned_expert_packing_rejects_invalid_ownership_without_rng(start, count):
+    block = make_model().layers[0].block_sparse_moe
+    rng = torch.get_rng_state().clone()
+    with pytest.raises(ValueError, match="expert ownership"):
+        block.build_parallel_experts(start=start, count=count)
+    assert torch.equal(torch.get_rng_state(), rng)

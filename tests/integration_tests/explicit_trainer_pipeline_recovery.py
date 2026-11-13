@@ -44,7 +44,11 @@ def main() -> None:
         choices=("disabled", "async", "async_with_pinned_mem"),
         default="disabled",
     )
+    parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--save-step", type=int, default=2)
     args = parser.parse_args()
+    if not 0 < args.save_step < args.steps:
+        parser.error("Expected 0 < --save-step < --steps")
     device = init_distributed()
     previous_checkpoint_device = DefaultDeviceType.get_device_type()
     # torch-npu sets the default to NPU even for an explicitly selected CPU
@@ -106,13 +110,13 @@ def main() -> None:
             training=TrainingConfig(
                 seed=71,
                 activation_checkpoint_mode=args.activation_checkpoint,
-                steps=4,
+                steps=args.steps,
                 max_seq_len=8,
                 global_batch_size=2,
                 dump_folder=str(args.folder),
                 checkpoint_config=CheckpointConfig(
                     enable=True,
-                    interval=2,
+                    interval=args.save_step,
                     keep_latest_k=0,
                     async_mode=args.checkpoint_async_mode,
                 ),
@@ -140,12 +144,12 @@ def main() -> None:
                 for part in trainer.model_parts:
                     for parameter in part.parameters():
                         parameter.add_(0.125)
-            assert trainer.checkpointer.load(2)
-            assert trainer.step == 2
-            assert trainer.ntokens_seen == 2 * tokens_per_step
+            assert trainer.checkpointer.load(args.save_step)
+            assert trainer.step == args.save_step
+            assert trainer.ntokens_seen == args.save_step * tokens_per_step
             assert all(optimizer.state for optimizer in trainer.optimizer.optimizers)
         iterator = trainer.data_iterator()
-        while trainer.step < 4:
+        while trainer.step < args.steps:
             trainer.step += 1
             before = next(trainer.model_parts[0].parameters()).detach().clone()
             trainer.train_step(iterator)
@@ -153,8 +157,8 @@ def main() -> None:
             if not torch.isfinite(after).all() or torch.equal(before, after):
                 raise AssertionError("Trainer step produced no finite parameter update")
             assert trainer.ntokens_seen == trainer.step * tokens_per_step
-            if args.phase == "write" and trainer.step == 2:
-                assert trainer.checkpointer.save(2)
+            if args.phase == "write" and trainer.step == args.save_step:
+                assert trainer.checkpointer.save(args.save_step)
         next_batch = next(iterator)
         result = {
             "model": [part.state_dict() for part in trainer.model_parts],

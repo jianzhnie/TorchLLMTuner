@@ -105,7 +105,7 @@ def main():
                     name: deepcopy(state.state_dict()) for name, state in states.items()
                 }
                 rng_before = torch.get_rng_state().clone()
-                adapter = ModelStateDictAdapter(config, None, kimi_expert_parallel=True)
+                adapter = ModelStateDictAdapter(config, None, expert_parallel=True)
                 try:
                     load_changed_kimi_layout(path, states=states, adapter=adapter)
                 except ValueError as error:

@@ -20,6 +20,7 @@ from torch.distributed.tensor import Shard, distribute_tensor
 from transformers import AutoConfig
 
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
+from llmtuner.components.checkpointer.hf.hf_storage import save_hf_checkpoint
 from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
@@ -168,9 +169,7 @@ def main():
         dcp.load({"model": actual_wrapper}, checkpoint_id=paths[0] + "-actual")
         for key, value in actual.state_dict().items():
             torch.testing.assert_close(value, actual_expected[key], atol=0, rtol=0)
-        adapter = ModelStateDictAdapter(
-            config, str(hf_path), qwen3_expert_parallel=True
-        )
+        adapter = ModelStateDictAdapter(config, str(hf_path), expert_parallel=True)
         with torch.no_grad():
             for parameter in actual.parameters():
                 parameter.fill_(float("nan"))
@@ -181,9 +180,30 @@ def main():
         actual_wrapper.load_state_dict(adapter.from_hf(destination))
         for key, value in actual.state_dict().items():
             torch.testing.assert_close(value, actual_expected[key], atol=0, rtol=0)
+        # Export the real model's disjoint TP/EP chunks using model-owned
+        # external key rules, then read the published standard HF files back.
+        export_path = str(Path(paths[0]) / "hf-roundtrip")
+        exported = adapter.to_hf_export(actual_wrapper.state_dict())
+        save_hf_checkpoint(
+            exported, export_path, adapter.hf_export_fqn_to_index_mapping
+        )
+        with torch.no_grad():
+            for parameter in actual.parameters():
+                parameter.fill_(float("nan"))
+        destination = adapter.to_hf(actual_wrapper.state_dict())
+        dcp.load(
+            destination,
+            storage_reader=adapter.get_hf_storage_reader(export_path),
+        )
+        actual_wrapper.load_state_dict(adapter.from_hf(destination))
+        for key, value in actual.state_dict().items():
+            torch.testing.assert_close(value, actual_expected[key], atol=0, rtol=0)
         dist.barrier()
         if dist.get_rank() == 0:
-            print("PASS DP4/TP2 sparse FSDP2/EP4 DCP and HF model restoration")
+            print(
+                "PASS DP4/TP2 sparse FSDP2/EP4 DCP and HF model restoration "
+                "and HF export roundtrip"
+            )
     finally:
         dist.destroy_process_group()
 
