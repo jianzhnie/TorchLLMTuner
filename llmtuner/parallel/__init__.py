@@ -32,7 +32,6 @@ _EXPORT_SOURCES = {
     "apply_fsdp": "fully_shard_parallel.fully_shard_parallel",
     "apply_tp": "tensor_parallel.tensor_parallel",
     "parallelize_model": "parallelize",
-    "parallelize_hf_transformers": "parallelize",
 }
 
 __all__ = sorted(_EXPORT_SOURCES)

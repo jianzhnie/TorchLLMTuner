@@ -223,11 +223,10 @@ class MoE(nn.Module):
         """Stage the padding mask for the NEXT forward of this block.
 
         The HF decoder layer calls its MoE as ``self.mlp(hidden_states)`` --
-        its fixed signature has no slot for a mask, so the wrapper
-        (``TrainingModel.forward``) stages the microbatch's mask on every
-        swapped MoE block just before the decoder runs. The staged mask stays
-        in effect until the next staging (the wrapper stages every
-        microbatch, ``None`` included), so an activation-checkpointing
+        its fixed signature has no slot for a mask, so the owning model stages
+        the microbatch's mask on every swapped MoE block before decoder execution.
+        The staged mask stays in effect until the next staging (the model stages
+        every microbatch, ``None`` included), so an activation-checkpointing
         recompute of the same microbatch sees the same mask and the
         load-balancing statistics are filtered identically on both passes.
 

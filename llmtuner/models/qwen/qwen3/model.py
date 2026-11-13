@@ -72,10 +72,12 @@ from transformers.utils.output_capturing import capture_outputs
 
 from ....datasets.contracts import Batch
 from ....errors import UnsupportedCombinationError
-from ...common.attention.backend_names import CP_SDPA_BACKEND
-from ...common.attention.masks import build_dense_attention_mask
+from ...common.attention.masks import (
+    build_dense_attention_mask,
+)
 from ...common.cast_linear import build_lm_head
 from ...common.input_preparation import prepare_text_inputs
+from ...common.moe.layer import collect_moe_layers
 from ...configuration import configure_reference_experts, validate_attention_backend
 from ...contracts import DecoderStructure, MoEBlockContract
 from ..routing import Qwen3MoeFP32TopKRouter, validate_router_compute_dtype
@@ -235,37 +237,20 @@ class Qwen3MoeAttention(HFQwen3MoeAttention):
         query, key = rotary(query, key, *position_embeddings)
         if past_key_values is not None:
             key, value = past_key_values.update(key, value, self.layer_idx)
-        if self.config._attn_implementation == CP_SDPA_BACKEND:
-            kernel = getattr(self, "_titan_cp_sdpa_kernel", None)
-            if kernel is None:
-                raise RuntimeError("Qwen3 CP attention requires its installed kernel")
-            output = kernel(
-                query,
-                key,
-                value,
-                module=self,
-                block_mask=attention_mask,
-                dropout=self.attention_dropout if self.training else 0.0,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window,
-                **kwargs,
-            )
-            weights = None
-        else:
-            interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-                self.config._attn_implementation, eager_attention_forward
-            )
-            output, weights = interface(
-                self,
-                query,
-                key,
-                value,
-                attention_mask,
-                dropout=self.attention_dropout if self.training else 0.0,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window,
-                **kwargs,
-            )
+        interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+        output, weights = interface(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=self.attention_dropout if self.training else 0.0,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **kwargs,
+        )
         output = output.reshape(*hidden_states.shape[:-1], -1).contiguous()
         return self.o_proj(output), weights
 
@@ -516,6 +501,7 @@ class Qwen3MoeModel(HFQwen3MoeModel):
         past_key_values: Cache | None = None,
         inputs_embeds: Tensor | None = None,
         use_cache: bool | None = None,
+        padding_mask: Tensor | None = None,
         **kwargs: Any,
     ) -> MoeModelOutputWithPast:
         """Execute the declared decoder stack in model-owned order.
@@ -563,23 +549,19 @@ class Qwen3MoeModel(HFQwen3MoeModel):
             if self.config.sliding_window is None
             else create_sliding_window_causal_mask
         )
-        if self.config._attn_implementation == CP_SDPA_BACKEND:
-            # CP kernels construct global causality from rank ownership. A
-            # local HF mask would hide remote keys or use the wrong offsets.
-            if attention_mask is not None or past_key_values is not None or use_cache:
-                raise UnsupportedCombinationError(
-                    "Qwen3 SDPA CP currently requires unpadded causal input "
-                    "without an explicit mask or cache"
-                )
-            causal_mask = None
-        else:
-            causal_mask = mask_function(
-                config=self.config,
-                inputs_embeds=mask_inputs,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-            )
+        causal_mask = mask_function(
+            config=self.config,
+            inputs_embeds=mask_inputs,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+        if padding_mask is not None and tp_group is not None:
+            padding_mask = padding_mask.reshape(-1).chunk(tp_group.size())[
+                tp_group.rank()
+            ]
+        for moe in collect_moe_layers(self):
+            moe.set_padding_mask(padding_mask)
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
@@ -701,6 +683,7 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
             attention_mask=attention_mask,
             use_cache=False,
             output_router_logits=False,
+            padding_mask=padding_mask,
         ).last_hidden_state
         if last and not skip_lm_head:
             output = self.lm_head(output)
@@ -922,7 +905,7 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
             positions = positions.unsqueeze(0)
         if attention_masks is not None:
             attention_mask = attention_masks
-        elif padding_mask is not None and attention_mask is None:
+        if padding_mask is not None and attention_mask is None:
             keep_mask = (~padding_mask).to(torch.long)
             attention_mask = (
                 keep_mask.unsqueeze(0) if keep_mask.ndim == 1 else keep_mask
@@ -943,6 +926,7 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
             use_cache=False,
             output_router_logits=output_router_logits,
             return_dict=True,
+            padding_mask=padding_mask,
             **kwargs,
         )
         if skip_lm_head:

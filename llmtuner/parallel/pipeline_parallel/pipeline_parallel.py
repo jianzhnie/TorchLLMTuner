@@ -138,7 +138,7 @@ def make_schedule_loss_fn(
     * The private pre-split driver (``_step_microbatches``, which llmtuner uses
       so its already-cut micro-batches are not re-split) has no loss-kwargs
       parameter at all; the denominator is read off the schedule attribute that
-      ``pp_forward_backward_body`` publishes before every call.
+      ``run_pipeline_step`` publishes before every call.
 
     Returning the closure rather than a lambda also makes this testable without
     a live pipeline, which a lambda defined inline could not be.

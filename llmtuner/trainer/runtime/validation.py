@@ -35,7 +35,13 @@ from ...datasets.contracts import (
     TrainerBatch,
 )
 from ...datasets.loader_builder import build_dataloader
-from .batch import fetch_batch
+from .batch import (
+    fetch_batch,
+    prepare_model_inputs,
+    resolve_batch_size_per_rank,
+    resolve_data_parallel_rank,
+)
+from .engine import loss_vocab_kwargs, model_output_value
 from .pipeline import prepare_pipeline_inputs
 from .reductions import resolve_loss_reduction_meshes
 
@@ -68,8 +74,8 @@ def create_validation_dataloader(
     ``steps=-1`` reads it to exhaustion (built with repeat=False); a positive
     ``steps`` bounds the pass (built repeating, so the bound is reachable).
     """
-    dp_rank, dp_world_size = self.dp_rank_world_size()
-    batch_size_per_rank = self.batch_size_per_rank(dp_world_size)
+    dp_rank, dp_world_size = resolve_data_parallel_rank(self.parallel_dims)
+    batch_size_per_rank = resolve_batch_size_per_rank(self.cfg, dp_world_size)
     return build_dataloader(
         self.cfg,
         dp_rank=dp_rank,
@@ -241,12 +247,6 @@ def validate(self: Trainer, step: int) -> None:
         )
         for key, config in mask_configs.items()
     }
-    kernel_modes = {
-        kernel: kernel.packed
-        for module in training_modes
-        if (kernel := getattr(module, "_titan_flex_kernel", None)) is not None
-        and hasattr(kernel, "packed")
-    }
     with ExitStack() as resources:
         # RNG capture is local and may fail before mode setup. Peers must not
         # begin validation forward until every rank owns its restoration context.
@@ -269,16 +269,12 @@ def validate(self: Trainer, step: int) -> None:
                         )
                     for config in mask_configs.values():
                         config.attn_mask_type = mask_type
-                    for kernel in kernel_modes:
-                        kernel.packed = mask_type == "block_causal"
                 for part in self.model_parts:
                     part.eval()
             run_validation_loop(self, validation, step)
         finally:
             for parameter, gradient in parameter_gradients.items():
                 parameter.grad = gradient
-            for kernel, packed in kernel_modes.items():
-                kernel.packed = packed
             for key, config in mask_configs.items():
                 had_mask, original_mask = original_masks[key]
                 if not had_mask:
@@ -329,12 +325,22 @@ def run_validation_loop(self: Trainer, validation: ValidationConfig, step: int) 
             if pipeline:
                 loss_sum = evaluate_pipeline_batch(self, batch)
             else:
-                inputs, labels, extra_kwargs = self.preprocess(batch)
+                inputs, labels, extra_kwargs = prepare_model_inputs(
+                    self.example_model,
+                    batch,
+                    device=self.device,
+                    parallel_dims=parallel_dims,
+                    max_context_length=self.cfg.max_seq_len,
+                )
                 with self.param_context(), spmd_context(parallel_dims):
-                    logits = self._model_output_value(
+                    logits = model_output_value(
                         self.example_model(inputs, **extra_kwargs)
                     )
-                    loss_sum = self.loss_sum(logits, labels, **self.loss_vocab_kwargs())
+                    loss_sum = self.loss_sum(
+                        logits,
+                        labels,
+                        **loss_vocab_kwargs(self.example_model, parallel_dims),
+                    )
             if loss_sum is not None:
                 if accumulated_loss is None:
                     accumulated_loss = loss_sum.detach().clone()
@@ -374,7 +380,7 @@ def evaluate_pipeline_batch(
     The common validation loop normalizes once at the end; training republishes
     its denominator before the next optimizer step.
     """
-    inputs = prepare_pipeline_inputs(self, batch)
+    inputs = prepare_pipeline_inputs(self.training_engine, batch)
     losses: list[torch.Tensor] | None = [] if self.pp_has_last_stage else None
     with self.param_context(), spmd_context(self.parallel_dims):
         self.pp_schedule._llmtuner_global_valid_tokens = torch.ones(

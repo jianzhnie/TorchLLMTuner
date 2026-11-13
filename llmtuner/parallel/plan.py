@@ -42,11 +42,6 @@ class PlanTarget:
         if self.module is not None and not isinstance(self.module, nn.Module):
             raise ValueError("Plan target binding must be a module")
 
-    @property
-    def fqn(self) -> str:
-        """Compatibility spelling for consumers that use fully qualified names."""
-        return self.path
-
 
 @dataclass(frozen=True, slots=True)
 class ParallelPlan:
@@ -89,6 +84,10 @@ class ParallelPlan:
     ] = field(default=(), init=False, repr=False, compare=False)
 
     buffer_persistence: tuple[tuple[str, frozenset[str]], ...] = field(
+        default=(), init=False, repr=False, compare=False
+    )
+
+    forward_bindings: tuple[tuple[object, object], ...] = field(
         default=(), init=False, repr=False, compare=False
     )
 
@@ -148,6 +147,19 @@ class ParallelPlan:
             raise ValueError("Parallel plan implementation must not be empty")
         object.__setattr__(self, "storage_aliases", self.storage_alias_groups())
         if self.module_bindings is not None:
+            # Accessing a bound method creates a fresh method object. Snapshot
+            # its function and receiver instead of that ephemeral object's ID.
+            object.__setattr__(
+                self,
+                "forward_bindings",
+                tuple(
+                    (
+                        getattr(module.forward, "__func__", module.forward),
+                        getattr(module.forward, "__self__", None),
+                    )
+                    for _, module in self.module_bindings
+                ),
+            )
             for path, module in self.module_bindings:
                 if path == "":
                     # Absence is part of the resolved semantics too. A minimal
@@ -233,6 +245,15 @@ class ParallelPlan:
                 if path != bound_path or value is not bound_value:
                     raise ValueError(f"Stale plan {kind} binding: {path}")
         if self.module_bindings is not None:
+            for (path, module), (function, receiver) in zip(
+                self.module_bindings, self.forward_bindings, strict=True
+            ):
+                forward = module.forward
+                if (
+                    getattr(forward, "__func__", forward) is not function
+                    or getattr(forward, "__self__", None) is not receiver
+                ):
+                    raise ValueError(f"Stale plan forward binding: {path or '<root>'}")
             # register_buffer can change checkpoint ownership without replacing
             # its tensor or changing any tensor geometry metadata.
             for (path, module), (_, nonpersistent) in zip(

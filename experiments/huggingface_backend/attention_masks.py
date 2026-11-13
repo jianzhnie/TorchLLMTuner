@@ -12,9 +12,6 @@ from llmtuner.models.common.attention.masks import (
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
 )
-from llmtuner.parallel.context_parallel.input_sharding import (
-    shard_attention_mask_for_cp,
-)
 
 
 def mask_dtype(model) -> torch.dtype:
@@ -64,34 +61,8 @@ def get_attention_masks(model, positions: torch.Tensor) -> BlockMask | torch.Ten
 
 
 def get_cp_attention_masks(model, positions: torch.Tensor) -> BlockMask:
-    """Build the full-sequence mask expected by the active CP strategy."""
-    if model.uses_dsa:
-        raise UnsupportedCombinationError(
-            "Context parallel with a DSA (dense-mask) model is not "
-            "implemented: the CP mask path shards a flex BlockMask, and a "
-            "dense additive mask has to be sliced by hand. Unlock by "
-            "sharding the dense mask Q-axis (load balancer included) and "
-            "re-validating numerics on multiple ranks."
-        )
-    if getattr(model.model.config, "attn_mask_type", "causal") == "block_causal":
-        raise ValueError(
-            "Context parallel with packed sequences needs a prebuilt mask: "
-            "build the full-length BlockMask with get_attention_masks from "
-            "the FULL positions and pass it to forward as attention_masks "
-            "-- Q-sharded with shard_attention_mask_for_cp under "
-            "'kv_allgather', or full-length (unsharded) under 'ulysses', "
-            "whose all-to-all reassembles the full sequence on every rank. "
-            "The positions this forward receives are already CP-sharded and "
-            "cannot describe the full document structure."
-        )
-    cp_size = model.cp_mesh.size()
-    full_len = positions.shape[0] * cp_size
-    full_positions = torch.arange(full_len, device=positions.device)
-    mask = model.get_attention_masks(positions=full_positions)
-    if model._cp_strategy == "ulysses":
-        return mask
-    return shard_attention_mask_for_cp(
-        mask,
-        getattr(model, "_cp_mask_mesh", model.cp_mesh),
-        model._cp_load_balancer,
+    """Reject the removed generic CP mask path without rebuilding local masks."""
+    raise UnsupportedCombinationError(
+        "Generic HF context-parallel attention kernels have been removed; "
+        "use a model-owned CP backend with its own mask contract"
     )

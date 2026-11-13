@@ -1,4 +1,4 @@
-"""Context parallelism: the CP flex kernel, input sharding, and wiring.
+"""Context parallelism: model-owned backends and input sharding.
 
 ``context_parallel.py`` is the public entry and wires CP onto a model.
 ``attention.py`` holds attention redistribution, while
@@ -11,11 +11,8 @@ load the runtime entry or optional communication kernels.
 from ...utils.lazy_exports import resolve_export
 
 _EXPORT_SOURCES = {
-    "CPFlexKernel": "attention",
-    "DualCPFlexKernel": "attention",
     "apply_cp": "context_parallel",
     "resolve_cp_plan": "context_parallel",
-    "shard_attention_mask_for_cp": "input_sharding",
     "shard_batch_for_cp": "input_sharding",
     "shard_batch_for_tp": "input_sharding",
     "shard_padding_mask_for_cp": "input_sharding",

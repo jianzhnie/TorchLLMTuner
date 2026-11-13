@@ -58,7 +58,7 @@ from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
 from ..utils.logging import get_logger
 from ..utils.seeding import rollback_execution_settings_on_error, seed_everything
-from .runtime import assembly, engine, gradients, pipeline
+from .runtime import assembly, engine, gradients
 from .runtime import batch as batch_runtime
 from .runtime import metrics as metrics_runtime
 from .runtime import validation as validation_runtime
@@ -88,13 +88,10 @@ class Trainer:
     mesh: DeviceMesh | None
     model: torch.nn.Module | None
     model_parts: list[torch.nn.Module]
-    model_assembly: assembly.ModelAssembly
-    optimizer_stack: assembly.OptimizerStack
     pp_schedule: Any | None
     pp_has_first_stage: bool
     pp_has_last_stage: bool
     _pp_loss_sentinel: torch.Tensor | None
-    _chunked_loss_num_chunks: int
     training_engine: engine.TrainingEngine
     optimizer: torch.optim.Optimizer
     # None denotes incomplete assembly; data_iterator rejects it explicitly.
@@ -146,21 +143,11 @@ class Trainer:
 
     # -- batch handling (bodies live in batch.py) -------------------------------
 
-    def dp_rank_world_size(self) -> tuple[int, int]:
-        """This rank's position and extent along the dataloading (DP) axis."""
-        return batch_runtime.dp_rank_world_size(self)
-
-    def batch_size_per_rank(self, dp_world_size: int) -> int:
-        """This rank's share of the global batch. Body in ``batch.py``."""
-        return batch_runtime.batch_size_per_rank(self, dp_world_size)
-
-    def build_dataloader(self) -> BaseDataLoader:
-        """Build the micro-batch source the config names. Body in ``batch.py``."""
-        return batch_runtime.build_dataloader(self)
-
     def data_iterator(self) -> Iterator[Batch | TrainerBatch]:
-        """The raw micro-batch source. Body in ``batch.py``."""
-        return batch_runtime.data_iterator(self)
+        """Iterate the assembled data source without an extra forwarding layer."""
+        if self.dataloader is None:
+            raise RuntimeError("Trainer dataloader has not been initialized")
+        return iter(self.dataloader)
 
     def batch_generator(
         self, data_iterable: Iterable[Batch | TrainerBatch]
@@ -196,30 +183,6 @@ class Trainer:
         """
         return batch_runtime.microbatch(self, batch)
 
-    def to_device(self, batch: Batch | TrainerBatch) -> Batch | TrainerBatch:
-        """Move one consumption group's tensors to the training device.
-
-        Body in ``batch.py``.
-        """
-        return batch_runtime.to_device(self, batch)
-
-    def preprocess(
-        self, batch: Batch | TrainerBatch
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Ask the model to turn its batch into forward inputs.
-
-        Body in ``batch.py``.
-        """
-        return batch_runtime.preprocess(self, batch)
-
-    def _execution_engine(self) -> engine.TrainingEngine:
-        """Return the fixed execution strategy, including for legacy test doubles."""
-        execution_engine = getattr(self, "training_engine", None)
-        if execution_engine is None:
-            execution_engine = assembly.build_training_engine(self)
-            self.training_engine = execution_engine
-        return execution_engine
-
     def forward_backward_step(
         self,
         microbatch: dict[str, Any],
@@ -227,35 +190,9 @@ class Trainer:
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Delegate one accumulation group and return its unnormalized loss sum."""
-        return self._execution_engine().forward_backward(
+        return self.training_engine.forward_backward(
             microbatch["batch"], global_valid_tokens=global_valid_tokens
         )
-
-    def _forward_backward_body(
-        self,
-        inputs: torch.Tensor,
-        labels: torch.Tensor,
-        *,
-        extra_kwargs: dict[str, Any],
-        global_valid_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compatibility entry point for direct dense execution callers."""
-        return self._execution_engine().forward_backward_dense(
-            inputs,
-            labels,
-            extra_kwargs=extra_kwargs,
-            global_valid_tokens=global_valid_tokens,
-        )
-
-    @staticmethod
-    def _model_output_value(output: Any, *, field: str = "logits") -> torch.Tensor:
-        return engine.model_output_value(output, field=field)
-
-    def loss_vocab_kwargs(self) -> dict[str, Any]:
-        """Return the execution engine's vocab-parallel loss arguments."""
-        if self.model is None:
-            return {}
-        return self._execution_engine().loss_vocab_kwargs()
 
     @staticmethod
     def loss_sum(
@@ -295,27 +232,6 @@ class Trainer:
             labels,
             tp_group=tp_group,
             global_vocab_size=global_vocab_size,
-        )
-
-    # -- pipeline-parallel steps ----------------------------------------------
-
-    def pp_microbatches(
-        self, batch: Batch | TrainerBatch
-    ) -> list[Batch | TrainerBatch]:
-        """Split this rank's batch into whole-row pipeline microbatches."""
-        return pipeline.split_pipeline_microbatches(
-            batch, num_microbatches=self.cfg.parallel.pp_config.num_pp_microbatches
-        )
-
-    def pp_forward_backward_body(
-        self,
-        batch: Batch | TrainerBatch,
-        *,
-        global_valid_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        """Drive the pipeline schedule for one accumulation group."""
-        return pipeline.run_pipeline_step(
-            self, batch, global_valid_tokens=global_valid_tokens
         )
 
     def before_gradient_clipping(self) -> None:
@@ -487,7 +403,7 @@ class Trainer:
             if should_log
             else {}
         )
-        self._execution_engine().optimizer_step(self.step)
+        self.training_engine.optimizer_step(self.step)
 
         if not should_log:
             return None

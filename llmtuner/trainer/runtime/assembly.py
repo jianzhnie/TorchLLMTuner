@@ -71,6 +71,7 @@ from ...parallel.topology import build_device_mesh, resolve_parallel_topology
 from ...utils import logging as logging_utils
 from ...utils import seeding
 from ...utils.flops import flops_per_token
+from .batch import build_training_dataloader
 from .engine import LossSum, ParamContext, TrainingEngine
 from .training_observer import DispatchTimer, TrainingObserver
 
@@ -194,18 +195,6 @@ def build_model(
         if callable(initialize_buffers):
             initialize_buffers()
     return model, model_config, load_initial_weights
-
-
-def _build_model(
-    trainer: Trainer,
-) -> tuple[torch.nn.Module, PretrainedConfig, bool]:
-    """Compatibility bridge for callers using the original Trainer helper."""
-    trainer._chunked_loss_num_chunks = trainer.cfg.training.chunked_loss_num_chunks
-    return build_model(
-        trainer.cfg,
-        parallel_dims=trainer.parallel_dims,
-        device=getattr(trainer, "device", torch.device("cpu")),
-    )
 
 
 def _fsdp_managed_parameters(model: torch.nn.Module) -> set[torch.nn.Parameter]:
@@ -376,63 +365,6 @@ def create_training_engine(
     )
 
 
-def build_training_engine(
-    trainer: Trainer,
-    assembled: ModelAssembly | None = None,
-    optimizer_stack: OptimizerStack | None = None,
-) -> TrainingEngine:
-    """Bind execution to a model assembly, with a legacy construction fallback."""
-    if assembled is None:
-        model_parts = getattr(trainer, "model_parts", None)
-        if model_parts is None:
-            model_parts = [trainer.model]
-        assembled = ModelAssembly(
-            model=getattr(trainer, "model", None),
-            model_parts=model_parts,
-            pp_schedule=getattr(trainer, "pp_schedule", None),
-            pp_has_first_stage=getattr(trainer, "pp_has_first_stage", False),
-            pp_has_last_stage=getattr(trainer, "pp_has_last_stage", False),
-            pp_loss_sentinel=getattr(trainer, "_pp_loss_sentinel", None),
-        )
-    cfg = getattr(trainer, "cfg", None)
-    parallel_cfg = getattr(cfg, "parallel", None)
-    pp_config = getattr(parallel_cfg, "pp_config", None)
-    pp_num_microbatches = getattr(pp_config, "num_pp_microbatches", 1)
-    max_context_length = getattr(cfg, "max_seq_len", 1)
-    optimizer = (
-        optimizer_stack.optimizer
-        if optimizer_stack is not None
-        else getattr(trainer, "optimizer", None)
-    )
-    lr_scheduler = (
-        optimizer_stack.lr_scheduler
-        if optimizer_stack is not None
-        else getattr(trainer, "lr_scheduler", None)
-    )
-    ema = (
-        optimizer_stack.ema
-        if optimizer_stack is not None
-        else getattr(trainer, "ema", None)
-    )
-    return TrainingEngine(
-        model_parts=assembled.model_parts,
-        parallel_dims=trainer.parallel_dims,
-        device=getattr(trainer, "device", torch.device("cpu")),
-        max_context_length=max_context_length,
-        chunked_loss_num_chunks=getattr(trainer, "_chunked_loss_num_chunks", 1),
-        param_context=trainer.param_context,
-        loss_sum=trainer.loss_sum,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
-        ema=ema,
-        pp_schedule=assembled.pp_schedule,
-        pp_has_first_stage=assembled.pp_has_first_stage,
-        pp_has_last_stage=assembled.pp_has_last_stage,
-        pp_loss_sentinel=assembled.pp_loss_sentinel,
-        pp_num_microbatches=pp_num_microbatches,
-    )
-
-
 def build_optimizer_stack(
     cfg: LLMTunerConfig,
     *,
@@ -481,20 +413,6 @@ def build_optimizer_stack(
     return OptimizerStack(optimizer=optimizer, lr_scheduler=lr_scheduler, ema=ema)
 
 
-def _build_optimizer_stack(
-    trainer: Trainer, assembled: ModelAssembly | None = None
-) -> OptimizerStack:
-    """Compatibility bridge for existing optimizer construction integrations."""
-    model_parts = trainer.model_parts if assembled is None else assembled.model_parts
-    stack = build_optimizer_stack(
-        trainer.cfg, model_parts=model_parts, parallel_dims=trainer.parallel_dims
-    )
-    trainer.optimizer = stack.optimizer
-    trainer.lr_scheduler = stack.lr_scheduler
-    trainer.ema = stack.ema
-    return stack
-
-
 def build_checkpointer(
     cfg: LLMTunerConfig,
     model_config: PretrainedConfig,
@@ -526,15 +444,8 @@ def build_checkpointer(
             model_config,
             cfg.checkpoint.initial_load_path or cfg.hf_model,
             model_prefix="",
-            qwen3_expert_parallel=(
-                getattr(model_config, "model_type", None) == "qwen3_moe"
-                and cfg.parallel.ep_size > 1
-                and cfg.checkpoint.sharded_expert_parallel
-            ),
-            kimi_expert_parallel=(
-                getattr(model_config, "model_type", None) == "kimi_linear"
-                and cfg.parallel.ep_size > 1
-            ),
+            expert_parallel=cfg.parallel.ep_size > 1,
+            sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
         )
     manager_cls = (
         TorchCheckpointingManager
@@ -553,44 +464,6 @@ def build_checkpointer(
     )
 
 
-def _build_checkpointer(
-    trainer: Trainer,
-    model_config: PretrainedConfig,
-    model_assembly: ModelAssembly | None = None,
-    optimizer_stack: OptimizerStack | None = None,
-) -> DistributedCheckpointManager | TorchCheckpointingManager:
-    """Compatibility bridge retaining Trainer as the train-state owner."""
-    if model_assembly is None:
-        model_assembly = getattr(trainer, "model_assembly", None)
-    if model_assembly is None:
-        model = getattr(trainer, "model", None)
-        model_assembly = ModelAssembly(
-            model=model,
-            model_parts=getattr(
-                trainer, "model_parts", [] if model is None else [model]
-            ),
-        )
-    if optimizer_stack is None:
-        optimizer_stack = getattr(trainer, "optimizer_stack", None)
-    if optimizer_stack is None:
-        optimizer_stack = OptimizerStack(
-            optimizer=getattr(trainer, "optimizer", None),
-            lr_scheduler=getattr(trainer, "lr_scheduler", None),
-            ema=getattr(trainer, "ema", None),
-        )
-    trainer.checkpointer = build_checkpointer(
-        trainer.cfg,
-        model_config,
-        model_assembly=model_assembly,
-        optimizer_stack=optimizer_stack,
-        dataloader=trainer.dataloader,
-        train_state=trainer,
-        device=getattr(trainer, "device", torch.device("cpu")),
-        parallel_dims=getattr(trainer, "parallel_dims", None),
-    )
-    return trainer.checkpointer
-
-
 def build_metrics_processor(
     cfg: LLMTunerConfig,
     model_config: PretrainedConfig,
@@ -600,26 +473,44 @@ def build_metrics_processor(
     num_trainable_parameters: int,
 ) -> MetricsProcessor:
     """Build metrics from resolved model geometry and parallel topology."""
-    with synchronize_local_errors("Metrics construction"):
-        text_config = unwrap_text_config(model_config)
-        metrics = MetricsProcessor(
-            cfg.metrics,
-            parallel_dims=parallel_dims,
-            dump_folder=cfg.dump_folder,
-            num_parameters=num_parameters,
-            num_trainable_parameters=num_trainable_parameters,
-            pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
-            num_flops_per_token=flops_per_token(text_config, seq_len=cfg.max_seq_len),
-        )
-        if text_config.model_type == "qwen3_5_moe_text":
-            logging_utils.get_logger(__name__).info(
-                "Qwen3.5 model FLOPs: recurrent-equivalent GDN, gated "
-                "projections, active experts and depthwise convolution; "
-                "full-square attention at sequence length %d. Excludes "
-                "recomputation, padding overhead, optimizer and communication; "
-                "this is model MFU, not measured kernel utilization.",
-                cfg.max_seq_len,
+    metrics = None
+    try:
+        with synchronize_local_errors("Metrics construction"):
+            text_config = unwrap_text_config(model_config)
+            metrics = MetricsProcessor(
+                cfg.metrics,
+                parallel_dims=parallel_dims,
+                dump_folder=cfg.dump_folder,
+                num_parameters=num_parameters,
+                num_trainable_parameters=num_trainable_parameters,
+                pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
+                num_flops_per_token=flops_per_token(
+                    text_config, seq_len=cfg.max_seq_len
+                ),
             )
+            if text_config.model_type == "qwen3_5_moe_text":
+                logging_utils.get_logger(__name__).info(
+                    "Qwen3.5 model FLOPs: recurrent-equivalent GDN, gated "
+                    "projections, active experts and depthwise convolution; "
+                    "full-square attention at sequence length %d. Excludes "
+                    "recomputation, padding overhead, optimizer and communication; "
+                    "this is model MFU, not measured kernel utilization.",
+                    cfg.max_seq_len,
+                )
+    except BaseException:
+        # The factory owns the logger until every rank accepts construction.
+        # A peer failure leaves no object on Trainer for its close() to release.
+        if metrics is not None:
+            try:
+                metrics.close()
+            except BaseException:
+                try:
+                    logging_utils.get_logger(__name__).exception(
+                        "Metrics cleanup failed after a construction error"
+                    )
+                except BaseException:
+                    pass
+        raise
     return metrics
 
 
@@ -682,8 +573,6 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
 
     seeding.initialize_dtensor_rng(trainer.mesh)
 
-    # Compatibility field for direct dense/PP callers; the engine reads config.
-    trainer._chunked_loss_num_chunks = cfg.training.chunked_loss_num_chunks
     # Build the model before optimizer services capture its parameters.
     with synchronize_local_errors("Model construction"):
         model, model_config, load_initial_weights = build_model(
@@ -705,9 +594,14 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
         load_initial_weights=load_initial_weights,
     )
     _install_model_assembly(trainer, model_assembly)
-    optimizer_stack = _build_optimizer_stack(trainer, model_assembly)
-    trainer.model_assembly = model_assembly
-    trainer.optimizer_stack = optimizer_stack
+    optimizer_stack = build_optimizer_stack(
+        cfg,
+        model_parts=model_assembly.model_parts,
+        parallel_dims=trainer.parallel_dims,
+    )
+    trainer.optimizer = optimizer_stack.optimizer
+    trainer.lr_scheduler = optimizer_stack.lr_scheduler
+    trainer.ema = optimizer_stack.ema
     trainer.training_engine = create_training_engine(
         cfg,
         model_assembly=model_assembly,
@@ -720,16 +614,25 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
 
     # The checkpointer captures the loader cursor alongside model state.
     with synchronize_local_errors("Dataloader construction"):
-        # Preserve the public subclass hook. The default implementation uses
-        # explicit data dependencies; the loader itself never receives Trainer.
-        trainer.dataloader = trainer.build_dataloader()
+        trainer.dataloader = build_training_dataloader(
+            cfg, parallel_dims=trainer.parallel_dims
+        )
 
     # Counters the checkpoint carries. Kept as plain ints so a resumed run
     # can log "step 61 (resumed at 60)" without re-deriving them.
     trainer.step = 0
     trainer.ntokens_seen = 0
 
-    _build_checkpointer(trainer, model_config)
+    trainer.checkpointer = build_checkpointer(
+        cfg,
+        model_config,
+        model_assembly=model_assembly,
+        optimizer_stack=optimizer_stack,
+        dataloader=trainer.dataloader,
+        train_state=trainer,
+        device=trainer.device,
+        parallel_dims=trainer.parallel_dims,
+    )
 
     trainer.metrics = build_metrics_processor(
         cfg,

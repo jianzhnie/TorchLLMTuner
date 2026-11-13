@@ -39,6 +39,17 @@ def model_output_value(output: Any, *, field: str = "logits") -> torch.Tensor:
     )
 
 
+def loss_vocab_kwargs(
+    model: torch.nn.Module | None, parallel_dims: ParallelTopology | None
+) -> dict[str, Any]:
+    """Resolve loss reduction from an explicit model and topology for train/eval."""
+    tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
+    vocab_size = getattr(model, "vocab_size", None)
+    if tp_mesh is None or vocab_size is None:
+        return {}
+    return {"tp_group": tp_mesh.get_group(), "global_vocab_size": vocab_size}
+
+
 @dataclass(slots=True)
 class TrainingEngine:
     """Execute forward/backward with fixed model and parallel dependencies."""
@@ -153,13 +164,5 @@ class TrainingEngine:
                 self.ema.step(step)
 
     def loss_vocab_kwargs(self) -> dict[str, Any]:
-        """Describe vocab-parallel loss reduction when the model declares a head."""
-        tp_mesh = (
-            None
-            if self.parallel_dims is None
-            else self.parallel_dims.get_optional_mesh("tp")
-        )
-        vocab_size = getattr(self.model, "vocab_size", None)
-        if tp_mesh is None or vocab_size is None:
-            return {}
-        return {"tp_group": tp_mesh.get_group(), "global_vocab_size": vocab_size}
+        """Describe the model-owned vocab layout for loss reduction."""
+        return loss_vocab_kwargs(self.model, self.parallel_dims)

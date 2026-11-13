@@ -1,8 +1,8 @@
 """Adapt an HF decoder to the trainer's model and input contracts.
 
 Construction selects attention and experts backends, then applies explicit
-GDN, normalization, router, expert and QKV/RoPE policies before the optional
-lm-head cast. These policies preserve their own model and dtype constraints;
+router policies before the optional
+lm-head cast. Retired model-specific policies are rejected before construction;
 this wrapper coordinates them rather than defining a second model architecture.
 HF supplies weight initialization; meta materialization and runtime buffer
 reconstruction are handled separately in ``materialization.py``.
@@ -32,31 +32,11 @@ from llmtuner.accelerator.distributed import get_rank
 from llmtuner.datasets.contracts import Batch, TrainerBatch
 from llmtuner.models.common.moe.layer import collect_moe_layers
 from llmtuner.models.contracts import DecoderStructure
-from llmtuner.models.qwen.qwen3.normalization_setup import (
-    stabilize_residual_norm_gradients,
-)
-from llmtuner.models.qwen.qwen3.qkv_projection import (
-    apply_fp32_rotary_projection,
-    apply_fused_qkv_projection,
-)
-from llmtuner.models.qwen.qwen3_5.gdn_numerics import (
-    configure_gdn_numerics,
-    validate_gdn_numerical_batch,
-    validate_gdn_numerical_config,
-    validate_gdn_numerical_sequence,
-)
-from llmtuner.models.qwen.qwen3_5.linear_attention import (
-    apply_linear_attention_backend,
-    validate_linear_attention_batch,
-    validate_linear_attention_config,
-    validate_linear_attention_sequence,
-)
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.utils.logging import get_logger
 
 from .attention_backend import (
     ATTENTION_BACKEND,
-    CP_SDPA_BACKEND,
     EAGER_FLEX_BACKEND,
     available_attention_backend,
     register_attention_backend,
@@ -68,7 +48,7 @@ from .attention_masks import (
     get_cp_attention_masks,
     mask_dtype,
 )
-from .expert_kernels import stabilize_moe_experts, stabilize_moe_router
+from .expert_kernels import stabilize_moe_router
 from .factory import resolve_model_class, unwrap_text_config
 from .input_preparation import preprocess_inputs
 from .materialization import validate_rotary_initialization
@@ -77,6 +57,7 @@ from .model_setup import (
     configure_experts_implementation,
     resolve_submodule_name,
     validate_head_config,
+    validate_legacy_policies,
 )
 
 logger = get_logger(__name__)
@@ -95,8 +76,7 @@ class HFTransformerModel(nn.Module):
         super().__init__()
 
         config = unwrap_text_config(config)
-        validate_linear_attention_config(config)
-        validate_gdn_numerical_config(config)
+        validate_legacy_policies(config)
         validate_rotary_initialization(config)
         # DSA models take a dense additive mask instead of a flex BlockMask;
         # resolved once here rather than per forward. The mask family is decided
@@ -123,17 +103,8 @@ class HFTransformerModel(nn.Module):
         model_cls = resolve_model_class(config)
         configure_experts_implementation(config, model_cls=model_cls)
         self.model = model_cls(config=config)
-        configure_gdn_numerics(self.model)
-        apply_linear_attention_backend(self.model)
-        stabilize_residual_norm_gradients(self.model)
         stabilize_moe_router(self.model)
-        stabilize_moe_experts(self.model)
         self.model.config._attn_implementation = config._attn_implementation
-
-        if getattr(config, "qkv_projection", "separate") != "separate":
-            apply_fused_qkv_projection(self.model)
-        elif getattr(config, "rotary_compute_dtype", None) == "float32":
-            apply_fp32_rotary_projection(self.model)
 
         apply_cast_lm_head(self.model, config)
 
@@ -422,20 +393,6 @@ class HFTransformerModel(nn.Module):
         max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Normalize and shard a batch through the model input pipeline."""
-        config = self.model.config
-        numerical_policy = getattr(config, "gdn_numerical_policy", "native")
-        allow_right_padding = getattr(config, "gdn_allow_right_padding", False)
-        if getattr(config, "linear_attention_backend", "native") == "npu_triton":
-            validate_linear_attention_batch(
-                input_dict,
-                allow_right_padding=allow_right_padding,
-                validate_metadata=numerical_policy == "native",
-            )
-        if numerical_policy != "native":
-            validate_gdn_numerical_batch(
-                input_dict,
-                allow_right_padding=allow_right_padding,
-            )
         return preprocess_inputs(
             self,
             input_dict,
@@ -485,26 +442,6 @@ class HFTransformerModel(nn.Module):
                 ``components.loss.chunked_lm_head_cross_entropy``) rather than
                 materialize the full ``T * V`` logits.
         """
-        config = self.model.config
-        numerical_policy = getattr(config, "gdn_numerical_policy", "native")
-        allow_right_padding = getattr(config, "gdn_allow_right_padding", False)
-        if getattr(config, "linear_attention_backend", "native") == "npu_triton":
-            validate_linear_attention_sequence(
-                input_ids,
-                positions,
-                attention_masks,
-                padding_mask,
-                allow_right_padding=allow_right_padding,
-                validate_metadata=numerical_policy == "native",
-            )
-        if numerical_policy != "native":
-            validate_gdn_numerical_sequence(
-                input_ids,
-                positions,
-                attention_masks,
-                padding_mask,
-                allow_right_padding=allow_right_padding,
-            )
         if isinstance(self.tok_embeddings, nn.Identity):
             # Non-first pipeline stage: the input IS the previous stage's
             # hidden states, so the embedding lookup is skipped by feeding the
@@ -558,16 +495,6 @@ class HFTransformerModel(nn.Module):
                 )
             else:
                 kwargs["attention_mask"] = masks["full_attention"]
-
-        # Preserve the collator's positions, including restarted padded suffix.
-        # A real HF 2D validity mask prevents its mask builder from mistaking
-        # that suffix for another packed document and reaches GDN validators.
-        # Per-call kwargs (also retained by AC) avoid mutable module mask state.
-        if allow_right_padding:
-            if padding_mask is not None and bool(padding_mask.any()):
-                if kwargs.get("attention_mask") is not None:
-                    raise ValueError("GDN right padding requires native HF 2D masks")
-                kwargs["attention_mask"] = (~padding_mask).unsqueeze(0)
 
         # Stage the padding mask on every MoE block -- including ``None``, so
         # a mask from a previous microbatch can never survive into this one.
@@ -635,41 +562,6 @@ class HFTransformerModel(nn.Module):
             # KDA consumes local validity; the MLA Ulysses callable reconstructs
             # global causality after exchange. A flex BlockMask would bypass
             # that contract and describe a different query/key layout.
-            return {"attention_mask": None}
-
-        if self.model.config._attn_implementation == CP_SDPA_BACKEND:
-            if isinstance(attention_masks, torch.Tensor):
-                return {"attention_mask": attention_masks}
-            if (
-                getattr(self.model.config, "_cp_sdpa_dual", False)
-                or self._cp_strategy == "kv_allgather"
-            ) and getattr(
-                self.model.config, "attn_mask_type", "causal"
-            ) == "block_causal":
-                raise ValueError(
-                    "Packed KV SDPA CP requires the full preprocessed document mask"
-                )
-            # The CP sdpa kernel (context_parallel/sdpa_attention.py) builds the
-            # mask it needs from the CP offsets: this rank's queries against the
-            # gathered full sequence. Handing the decoder a BlockMask here would
-            # both waste the build and invite a Q-sharded mask into a call that
-            # already attended the full sequence.
-            #
-            # Exception: the *ulysses* sdpa kernel attends the full sequence
-            # after its head swap, so a packed corpus's document mask applies
-            # unsharded -- exactly as it does for flex, and it is the one thing
-            # that mask cannot be derived from a length. Preprocess it before
-            # positions are sharded; local positions lose document boundaries. The
-            # kernel adds no causal mask, only an optional sliding window.
-            if (
-                getattr(self.model.config, "_cp_sdpa_ulysses", False)
-                and getattr(self.model.config, "attn_mask_type", "causal")
-                == "block_causal"
-            ):
-                raise ValueError(
-                    "Packed Ulysses SDPA CP requires the full preprocessed "
-                    "document mask"
-                )
             return {"attention_mask": None}
 
         if self.cp_mesh is None and isinstance(attention_masks, torch.Tensor):

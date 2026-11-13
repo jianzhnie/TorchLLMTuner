@@ -6,6 +6,9 @@ performs no storage IO, collective, tensor allocation or model construction.
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
+
+from ...state import ExpertStorageLayout, ModelStateFormat
 
 NATIVE_PROJECTIONS = {
     "gate_proj": "w1_EFD",
@@ -98,3 +101,40 @@ def expert_export_keys(
         raise ValueError(f"Qwen3 HF export requires full expert stack: {key}")
     prefix, role = projection
     return tuple(f"{prefix}{index}.{role}.weight" for index in range(num_experts))
+
+
+class Qwen3StateFormat(ModelStateFormat):
+    """Declare packed local and native EP layouts without owning storage IO."""
+
+    export_phase = "Qwen3 HF export expert mapping"
+
+    def __init__(
+        self, config: Any, *, expert_parallel: bool, sharded_expert_parallel: bool
+    ) -> None:
+        self.config = config
+        self.grouped_experts = expert_parallel and sharded_expert_parallel
+        self.separate_export_indices = self.grouped_experts
+        self.split_expert_stacks = self.grouped_experts
+
+    def normalize_keys(
+        self, keys: Iterable[str], indices: Mapping[str, int] | None
+    ) -> tuple[set[str], dict[str, int] | None]:
+        return normalize_expert_keys(
+            keys, indices, native_ep_layout=self.grouped_experts
+        )
+
+    def map_key(self, key: str, *, to_hf: bool) -> str:
+        if not self.grouped_experts:
+            return key
+        source, target = ".mlp.router.gate.", ".mlp.gate."
+        return key.replace(source, target) if to_hf else key.replace(target, source)
+
+    def export_keys(
+        self, key: str, shape: Sequence[int] | None
+    ) -> tuple[str, ...] | None:
+        if not self.grouped_experts:
+            return None
+        return expert_export_keys(key, shape, num_experts=self.config.num_experts)
+
+    def reader_layout(self) -> ExpertStorageLayout:
+        return ExpertStorageLayout(self.config.num_experts, self.grouped_experts)

@@ -180,13 +180,6 @@ CAPABILITIES: dict[str, Capability] = {
             "parallel/model_compile.py (compile_config.enable_async_tensor_parallel)"
         ),
     ),
-    "fx_regional_inductor": Capability(
-        importable("torch.fx.passes.regional_inductor", "regional_inductor"),
-        what="torch.fx.passes.regional_inductor (+ torch._dynamo.backends.common)",
-        since="torch 2.10 (fx regional-inductor pass)",
-        hint="Upgrade torch, use backend='inductor', or run without compile.",
-        consumers="parallel/model_compile.py (aot_eager backend on flex models)",
-    ),
     "npu_ascendc_codegen": Capability(
         importable("torch_npu._inductor.ascendc"),
         what="torch_npu._inductor.ascendc and the matching CANN AutoFuse runtime",

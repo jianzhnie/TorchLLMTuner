@@ -18,7 +18,6 @@ from llmtuner.models.common.attention.masks import (
     get_efficient_causal_mask_mod_for_packed_document,
 )
 from llmtuner.parallel.context_parallel.input_sharding import (
-    shard_attention_mask_for_cp,
     shard_batch_for_cp,
     shard_batch_for_tp,
     shard_padding_mask_for_cp,
@@ -26,7 +25,7 @@ from llmtuner.parallel.context_parallel.input_sharding import (
 )
 from llmtuner.parallel.topology import ParallelTopology
 
-from .attention_backend import ATTENTION_BACKEND, CP_SDPA_BACKEND
+from .attention_backend import ATTENTION_BACKEND
 from .attention_masks import mask_dtype
 
 
@@ -55,30 +54,18 @@ def _shard_for_cp(
             attention_masks = model.get_attention_masks(positions=positions)
         return inputs, labels, positions, padding_mask, attention_masks
 
+    if model._cp_strategy not in {"kcp", "compressor_ulysses"}:
+        raise UnsupportedCombinationError(
+            "Generic HF context-parallel attention kernels have been removed; "
+            "use a model-owned CP backend"
+        )
+    if packed:
+        raise UnsupportedCombinationError(
+            "Model-owned HF CP input preparation does not support packed documents"
+        )
     if positions is None:
         positions = torch.arange(inputs.numel(), device=inputs.device)
     attention_masks = None
-    if packed:
-        if (
-            model._cp_strategy == "ulysses"
-            or getattr(model.model.config, "_cp_sdpa_dual", False)
-            or model.model.config._attn_implementation == CP_SDPA_BACKEND
-        ) and model.model.config._attn_implementation != ATTENTION_BACKEND:
-            attention_masks = build_dense_attention_mask(
-                positions, dtype=mask_dtype(model), block_causal=True
-            )
-            if model.model.config._attn_implementation == CP_SDPA_BACKEND:
-                attention_masks = attention_masks == 0
-        else:
-            attention_masks = model.get_attention_masks(positions=positions)
-            if model._cp_strategy != "ulysses":
-                attention_masks = shard_attention_mask_for_cp(
-                    attention_masks,
-                    getattr(model, "_cp_mask_mesh", cp_mesh),
-                    model._cp_load_balancer,
-                )
-            if model.model.config._attn_implementation != ATTENTION_BACKEND:
-                attention_masks = None
     inputs, labels, positions = shard_batch_for_cp(
         inputs,
         labels,
@@ -172,31 +159,9 @@ def preprocess_inputs(
     cp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("cp")
     row_attention_mask = None
     if row_length is not None and cp_mesh is not None:
-        if (
-            model.model.config._attn_implementation != CP_SDPA_BACKEND
-            or model._cp_strategy != "kv_allgather"
-            or model._cp_load_balancer is not None
-            or getattr(model.model.config, "_cp_sdpa_dual", False)
-        ):
-            raise UnsupportedCombinationError(
-                "CP with multiple independent batch rows requires row-aware mask "
-                "sharding; use KV SDPA without load balancing or one row per "
-                "microbatch with gradient accumulation."
-            )
-        token_indices = torch.arange(inputs.numel(), device=inputs.device)
-        row_positions = token_indices.remainder(row_length)
-        if positions is None:
-            positions = row_positions
-        row_ids = token_indices // row_length
-        row_attention_mask = (
-            build_dense_attention_mask(
-                positions if packed else row_positions,
-                dtype=mask_dtype(model),
-                block_causal=True,
-            )
-            == 0
+        raise UnsupportedCombinationError(
+            "Experimental HF CP does not support multiple independent batch rows"
         )
-        row_attention_mask = row_attention_mask & (row_ids[:, None] == row_ids[None, :])
     attention_masks = None
     # Without CP, independent rows build their own mask below. A generic Flex
     # mask here would be discarded before forward.

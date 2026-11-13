@@ -19,7 +19,6 @@ _EXPORT_SOURCES = {
     "apply_ep": "expert_parallel",
     "resolve_ep_plan": "model_replacement",
     "swap_moe_blocks": "model_replacement",
-    "swap_hf_moe_blocks": "model_replacement",
 }
 
 __all__ = sorted(_EXPORT_SOURCES)

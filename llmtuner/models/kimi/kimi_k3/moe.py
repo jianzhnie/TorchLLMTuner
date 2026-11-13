@@ -49,6 +49,7 @@ The local reference is differentiable; EP conversion is a separate migration.
 
 import math
 from copy import deepcopy
+from numbers import Real
 from typing import Any
 
 import torch
@@ -59,7 +60,9 @@ from transformers.activations import SiLUActivation
 
 from ....errors import UnsupportedCombinationError
 from ...common.activation import ActivationFn, SituGLU, SwiGLU
+from ...common.moe.auxiliary_loss import MicrobatchWiseLoadBalanceLoss
 from ...common.moe.experts import GroupedExperts, RoutedExperts
+from ...common.moe.routing import TokenChoiceTopKRouter
 from .configuration import KimiLinearConfig
 from .mlp import KimiExpertMLP as KimiExpertMLP
 from .mlp import KimiMLP
@@ -85,10 +88,10 @@ class KimiMoEGate(nn.Module):
         self.moe_router_activation_func = config.moe_router_activation_func
         self.num_expert_group = getattr(config, "num_expert_group", 1)
         self.topk_group = getattr(config, "topk_group", 1)
+        self.moe_renormalize = config.moe_renormalize
         self.validate_routing()
 
         # topk selection algorithm
-        self.moe_renormalize = config.moe_renormalize
         self.gating_dim = config.hidden_size
         self.weight = nn.Parameter(
             torch.empty((self.num_experts, self.gating_dim)),
@@ -101,6 +104,14 @@ class KimiMoEGate(nn.Module):
 
     def validate_routing(self) -> None:
         """Validate live selection geometry before allocation or EP conversion."""
+        if (
+            not isinstance(self.routed_scaling_factor, Real)
+            or isinstance(self.routed_scaling_factor, bool)
+            or not math.isfinite(self.routed_scaling_factor)
+        ):
+            raise ValueError("Kimi routed_scaling_factor must be a finite real number")
+        if type(self.moe_renormalize) is not bool:
+            raise ValueError("Kimi moe_renormalize must be bool")
         if self.moe_router_activation_func not in ("sigmoid", "softmax"):
             raise ValueError(
                 "Kimi moe_router_activation_func must be sigmoid or softmax"
@@ -140,6 +151,35 @@ class KimiMoEGate(nn.Module):
             raise ValueError(
                 "Kimi router correction bias must have one value per expert"
             )
+
+    def build_parallel_router(
+        self, *, aux_loss_coefficient: float | None
+    ) -> TokenChoiceTopKRouter:
+        """Build native routing from live gate math, retaining the weight identity.
+
+        Config edits do not change an instantiated gate. Keep Kimi's group
+        selection and top-1 normalization rules here, alongside its forward.
+        The correction bias remains owned by the converted MoE block.
+        """
+        self.validate_storage()
+        grouped = self.num_expert_group > self.topk_group
+        router = TokenChoiceTopKRouter(
+            num_experts=self.num_experts,
+            dim=self.weight.shape[1],
+            top_k=self.top_k,
+            score_func=self.moe_router_activation_func,
+            route_norm=self.moe_renormalize and self.top_k > 1,
+            route_scale=self.routed_scaling_factor,
+            num_expert_groups=self.num_expert_group if grouped else None,
+            num_limited_groups=self.topk_group if grouped else None,
+            aux_loss=(
+                MicrobatchWiseLoadBalanceLoss(coeff=aux_loss_coefficient)
+                if aux_loss_coefficient
+                else None
+            ),
+        ).to(device=self.weight.device, dtype=self.weight.dtype)
+        router.gate.weight = self.weight
+        return router
 
     def reset_parameters(self) -> None:
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
@@ -254,6 +294,46 @@ class KimiSparseMoE(nn.Module):
             )
             self.shared_experts = KimiMLP(shared_config)
 
+    def validate_expert_parallel(
+        self,
+        *,
+        degree: int,
+        tp_enabled: bool,
+        quantile_balancing: bool,
+        token_dispatcher: str,
+    ) -> None:
+        """Validate live expert storage and supported EP execution before mutation."""
+        if type(degree) is not int or degree < 1:
+            raise ValueError("Kimi EP degree must be a positive integer")
+        if tp_enabled or quantile_balancing or token_dispatcher != "alltoall":
+            raise UnsupportedCombinationError(
+                "Kimi EP currently requires alltoall dispatch, TP=1 and "
+                "moe_quantile_balancing=False; other layout/backend adapters "
+                "are not implemented"
+            )
+        self.validate_expert_geometry()
+        self.validate_grouped_activation()
+        count = len(self.experts)
+        if count == 0 or count % degree:
+            raise ValueError(f"EP degree {degree} must divide Kimi num_experts={count}")
+        for name in ("w1", "w2", "w3"):
+            projections = [getattr(expert, name) for expert in self.experts]
+            if any(projection.bias is not None for projection in projections):
+                raise UnsupportedCombinationError(
+                    f"Kimi EP does not support expert projection bias for {name}"
+                )
+            weights = [projection.weight for projection in projections]
+            if len({(weight.dtype, weight.device) for weight in weights}) != 1:
+                raise UnsupportedCombinationError(
+                    "Kimi EP cannot stack experts with different dtypes or devices "
+                    f"for {name}; one grouped parameter requires uniform storage"
+                )
+            if len({weight.requires_grad for weight in weights}) != 1:
+                raise UnsupportedCombinationError(
+                    "Kimi EP cannot stack experts with different requires_grad flags "
+                    f"for {name}"
+                )
+
     def validate_expert_geometry(self) -> None:
         """Validate the live router and three-projection expert layout."""
         self.gate.validate_storage()
@@ -336,6 +416,49 @@ class KimiSparseMoE(nn.Module):
         if first.situ:
             return SituGLU(first.act_fn.beta, first.act_fn.linear_beta)
         return SwiGLU()
+
+    def build_parallel_experts(self, *, start: int, count: int) -> GroupedExperts:
+        """Pack a contiguous expert slice without changing source parameters.
+
+        EP chooses ownership; the model owns projection axes, activation and
+        precision. Validate before allocation so direct callers cannot silently
+        truncate a slice or lose a projection's dtype or freeze state.
+        """
+        if (
+            type(start) is not int
+            or type(count) is not int
+            or start < 0
+            or count < 1
+            or start + count > len(self.experts)
+        ):
+            raise ValueError("Kimi grouped expert slice is outside expert ownership")
+        self.validate_expert_parallel(
+            degree=1,
+            tp_enabled=False,
+            quantile_balancing=False,
+            token_dispatcher="alltoall",
+        )
+        first = self.experts[0].w1
+        experts = GroupedExperts(
+            first.in_features,
+            first.out_features,
+            count,
+            activation_fn=self.build_grouped_activation(),
+        ).to(device=first.weight.device, dtype=first.weight.dtype)
+        for source_name, target_name in (
+            ("w1", "w1_EFD"),
+            ("w2", "w2_EDF"),
+            ("w3", "w3_EFD"),
+        ):
+            source = [getattr(expert, source_name).weight for expert in self.experts]
+            target = getattr(experts, target_name)
+            # Mixed projection precision is valid; each stacked projection must
+            # retain its own dtype so optimizer moments keep their semantics.
+            target.data = target.data.to(device=source[0].device, dtype=source[0].dtype)
+            target.requires_grad_(source[0].requires_grad)
+            with torch.no_grad():
+                target.copy_(torch.stack(source[start : start + count]))
+        return experts
 
     def expert_parallel_math_signature(self) -> tuple[object, ...]:
         """Snapshot routing, activation and latent norm math for plan validation.

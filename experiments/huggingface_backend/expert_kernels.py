@@ -7,38 +7,17 @@ from types import MethodType
 import torch
 import torch.nn as nn
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-    Qwen3MoeSparseMoeBlock,
     Qwen3MoeTopKRouter,
 )
 
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.moe.gate import RouterGateLinearFunction
-from llmtuner.models.qwen.qwen3.experts import (
-    forward_torchtitan_moe as forward_torchtitan_moe,
-)
-from llmtuner.models.qwen.qwen3_5.experts import (
-    _forward_pre_down_grouped_experts as _forward_pre_down_grouped_experts,
-)
-from llmtuner.models.qwen.qwen3_5.experts import (
-    _validate_pre_down_grouped_inputs as _validate_pre_down_grouped_inputs,
-)
-from llmtuner.models.qwen.qwen3_5.experts import (
-    forward_pre_down_experts as forward_pre_down_experts,
-)
-from llmtuner.models.qwen.qwen3_5.experts import (
-    forward_pre_down_moe as forward_pre_down_moe,
-)
-from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
 try:
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-        Qwen3_5MoeExperts,
-        Qwen3_5MoeSparseMoeBlock,
         Qwen3_5MoeTopKRouter,
     )
 except ImportError:
-    Qwen3_5MoeExperts = None
-    Qwen3_5MoeSparseMoeBlock = None
     Qwen3_5MoeTopKRouter = None
 
 
@@ -81,67 +60,3 @@ def stabilize_moe_router(model: nn.Module) -> None:
             )
     for module in modules:
         module.forward = MethodType(forward_fp32_topk_router, module)
-
-
-def stabilize_moe_experts(model: nn.Module) -> None:
-    if getattr(model.config, "experts_implementation", "native") == "pre_down":
-        if (
-            model.config.model_type != "qwen3_5_moe_text"
-            or model.config.hidden_act != "silu"
-        ):
-            raise ValueError("pre_down experts require Qwen3.5 MoE with SiLU")
-        modules = [m for m in model.modules() if type(m) is Qwen3_5MoeExperts]
-        if not modules:
-            raise ValueError("pre_down requires native HF Qwen3.5 experts")
-        blocks = [m for m in model.modules() if type(m) is Qwen3_5MoeSparseMoeBlock]
-        if not blocks or any(
-            type(block.experts) is not Qwen3_5MoeExperts for block in blocks
-        ):
-            raise ValueError("pre_down requires unmodified native HF MoE blocks")
-        for module in modules:
-            if (
-                "forward" in vars(module)
-                and getattr(module.forward, "__func__", None)
-                is not forward_pre_down_experts
-            ):
-                raise ValueError(
-                    "pre_down cannot replace external custom expert forwards"
-                )
-        for block in blocks:
-            if (
-                "forward" in vars(block)
-                and getattr(block.forward, "__func__", None) is not forward_pre_down_moe
-            ) or (
-                "forward" in vars(block.experts)
-                and getattr(block.experts.forward, "__func__", None)
-                is not forward_pre_down_experts
-            ):
-                raise ValueError("pre_down cannot replace external custom MoE forwards")
-        for module in modules:
-            module.forward = MethodType(forward_pre_down_experts, module)
-        for block in blocks:
-            block.forward = MethodType(forward_pre_down_moe, block)
-        return
-    if getattr(model.config, "experts_implementation", "native") != "torchtitan":
-        return
-    if getattr(model.config, "hidden_act", None) != "silu":
-        raise ValueError("Qwen3-MoE torchtitan experts require hidden_act='silu'")
-    modules = [
-        module
-        for module in model.modules()
-        if isinstance(module, Qwen3MoeSparseMoeBlock)
-    ]
-    if not modules:
-        raise ValueError("Qwen3-MoE torchtitan experts require routed MoE blocks")
-    for module in modules:
-        if "forward" in vars(module) and (
-            getattr(module.forward, "__func__", None) is not forward_torchtitan_moe
-        ):
-            raise UnsupportedCombinationError(
-                "torchtitan experts cannot replace an external custom MoE forward"
-            )
-    for module in modules:
-        module._llmtuner_local_dispatcher = LocalTokenDispatcher(
-            module.experts.num_experts, module.gate.top_k
-        )
-        module.forward = MethodType(forward_torchtitan_moe, module)

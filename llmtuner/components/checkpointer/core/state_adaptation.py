@@ -11,7 +11,7 @@ def adapt_hf_model_state(
 ) -> dict[str, Any]:
     """Convert HF keys and validate the native destination before loading.
 
-    Kimi EP conversion performs its own tensor-layout collectives, so it must
+    Model-owned conversion can perform its own tensor-layout collectives, so it must
     remain outside rank-local error coordination. Other adapters are local and
     must agree on failures before model load callbacks run. The preceding
     reader may already have written into live tensors; this is not a rollback
@@ -19,7 +19,7 @@ def adapt_hf_model_state(
     """
     with (
         nullcontext()
-        if getattr(adapter, "kimi_expert_parallel", False)
+        if getattr(adapter, "coordinates_state_conversion", False)
         else synchronize_local_errors("HF checkpoint state adaptation")
     ):
         native_state = adapter.from_hf(hf_state)

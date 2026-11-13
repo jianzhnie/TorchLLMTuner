@@ -115,7 +115,6 @@ __all__ = [
     "ShardingConfig",
     "apply_tp",
     "resolve_tp_plan",
-    "ResolvedTPPlan",
     "colwise",
     "rowwise",
 ]
@@ -306,7 +305,7 @@ class GatherSequenceFirst:
 
     Installed by ``apply_tp`` via a ``__class__`` swap (not a module wrapper),
     so module paths, ``state_dict`` keys and later attach points (``apply_cp``'s
-    ``_titan_flex_kernel``) are all untouched. ``hidden_states`` arrives as this
+    the CP attention kernel) are all untouched. ``hidden_states`` arrives as this
     rank's ``[B, T / tp, K]`` sequence shard and is gathered along the sequence
     dim to the length the inner forward expects -- the full sequence, or the CP
     shard when CP is on (the gather spans the TP group only, and a TP group
@@ -1077,9 +1076,6 @@ def realize_moe_blocks_tp(
         )
 
 
-ResolvedTPPlan = ParallelPlan
-
-
 def validate_tp_model_options(model: nn.Module) -> None:
     """Reject incompatible model policies even before mesh availability checks."""
     if any(
@@ -1097,7 +1093,7 @@ def resolve_tp_plan(
     *,
     cfg: ParallelConfig,
     plan: Mapping[str, str | ShardingConfig] | None = None,
-) -> ResolvedTPPlan:
+) -> ParallelPlan:
     """Resolve and validate TP locally, without a mesh or model mutation.
 
     The assembly layer may coordinate rank-local failures around this function.
@@ -1384,7 +1380,7 @@ def apply_tp(
     cfg: ParallelConfig,
     *,
     plan: Mapping[str, str | ShardingConfig] | None = None,
-    resolved_plan: ResolvedTPPlan | None = None,
+    resolved_plan: ParallelPlan | None = None,
     on_replacement: ReplacementObserver | None = None,
 ) -> nn.Module:
     """Tensor-parallelize ``model`` in place. No-op when ``tp == 1``.

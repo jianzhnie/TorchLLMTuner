@@ -1,6 +1,6 @@
 """HF MoE block layout probes for the EP swap.
 
-The entry point is ``model_replacement.py`` (``swap_hf_moe_blocks``); the conversion is
+The entry point is ``model_replacement.py`` (``swap_moe_blocks``); the conversion is
 ``block_conversion.py``. This module reads explicit decoder/output declarations
 where available and provides legacy layout detection, shared by the swap and
 by ``tensor_parallel.py``
@@ -631,7 +631,7 @@ def moe_block_of(layer: nn.Module) -> tuple[str, nn.Module | None]:
             continue
         # KimiSparseMoE is llmtuner's own block spelling, not the generic HF
         # shape: the fused-experts probe refuses its SituGLU activation, so it
-        # must be recognized directly, the same way swap_hf_moe_blocks does.
+        # must be recognized directly, the same way swap_moe_blocks does.
         if isinstance(block, KimiSparseMoE) or is_hf_moe_block(block):
             return name, block
         if fallback[1] is None:

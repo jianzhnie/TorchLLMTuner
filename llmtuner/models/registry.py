@@ -10,6 +10,8 @@ from typing import Any
 
 from torch import nn
 
+from .state import ModelStateFormat
+
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -25,6 +27,7 @@ class ModelSpec:
     model_class_loader: Callable[[], type[nn.Module]]
     task: str = "causal_lm"
     explicit: bool = False
+    state_format_loader: Callable[[], type[ModelStateFormat]] | None = None
 
     def build_config(self, **kwargs: Any) -> Any:
         """Construct configuration without loading model or device code."""
@@ -62,6 +65,7 @@ class ModelSpec:
         model_class_loader: Callable[[], type[nn.Module]],
         task: str = "causal_lm",
         explicit: bool = False,
+        state_format_loader: Callable[[], type[ModelStateFormat]] | None = None,
     ) -> ModelSpec:
         return cls(
             model_type,
@@ -70,6 +74,7 @@ class ModelSpec:
             model_class_loader,
             task=task,
             explicit=explicit,
+            state_format_loader=state_format_loader,
         )
 
 
@@ -107,6 +112,10 @@ def register_model(architecture: ModelSpec, *, exist_ok: bool = False) -> None:
     for name in ("config_factory", "config_type_loader", "model_class_loader"):
         if not callable(getattr(architecture, name)):
             raise TypeError(f"Model architecture {name} must be callable")
+    if architecture.state_format_loader is not None and not callable(
+        architecture.state_format_loader
+    ):
+        raise TypeError("Model architecture state_format_loader must be callable")
     previous = _MODELS.get(architecture.model_type)
     if previous is not None and not exist_ok:
         raise ValueError(
@@ -120,6 +129,27 @@ def get_model_spec(model_type: str, *, task: str = "causal_lm") -> ModelSpec | N
     architecture = _MODELS.get(model_type)
     return (
         architecture if architecture is not None and architecture.task == task else None
+    )
+
+
+def resolve_state_format(
+    config: Any, *, expert_parallel: bool, sharded_expert_parallel: bool
+) -> ModelStateFormat:
+    """Resolve external state rules from the sole architecture registration."""
+    specification = _MODELS.get(getattr(config, "model_type", None))
+    if specification is None or specification.state_format_loader is None:
+        return ModelStateFormat()
+    format_class = specification.state_format_loader()
+    if not isinstance(format_class, type) or not issubclass(
+        format_class, ModelStateFormat
+    ):
+        raise TypeError(
+            "Model state format loader must return a ModelStateFormat class"
+        )
+    return format_class(
+        config,
+        expert_parallel=expert_parallel,
+        sharded_expert_parallel=sharded_expert_parallel,
     )
 
 
@@ -155,13 +185,23 @@ def build_registered_model(
     return specification.build_model(config)
 
 
-for _model_type, _config_module, _config_name, _model_module, _model_name in (
+for (
+    _model_type,
+    _config_module,
+    _config_name,
+    _model_module,
+    _model_name,
+    _state_module,
+    _state_name,
+) in (
     (
         "kimi_linear",
         ".kimi.kimi_k3.configuration",
         "KimiLinearConfig",
         ".kimi.kimi_k3.model",
         "KimiLinearForCausalLM",
+        ".kimi.kimi_k3.checkpoint",
+        "KimiStateFormat",
     ),
     (
         "qwen3_moe",
@@ -169,6 +209,8 @@ for _model_type, _config_module, _config_name, _model_module, _model_name in (
         "Qwen3MoeConfig",
         ".qwen.qwen3.model",
         "Qwen3MoeForCausalLM",
+        ".qwen.qwen3.state",
+        "Qwen3StateFormat",
     ),
     (
         "deepseek_v4",
@@ -176,6 +218,8 @@ for _model_type, _config_module, _config_name, _model_module, _model_name in (
         "DeepseekV4Config",
         ".deepseek.deepseek_v4.modeling",
         "DeepseekV4ForCausalLM",
+        None,
+        None,
     ),
     (
         "qwen3_5_moe_text",
@@ -183,6 +227,8 @@ for _model_type, _config_module, _config_name, _model_module, _model_name in (
         "Qwen3_5MoeTextConfig",
         ".qwen.qwen3_5_moe.model",
         "Qwen3_5MoeForCausalLM",
+        None,
+        None,
     ),
 ):
     _config_loader = partial(_load_class, _config_module, _config_name)
@@ -195,6 +241,11 @@ for _model_type, _config_module, _config_name, _model_module, _model_name in (
                 _load_kimi_model_class
                 if _model_type == "kimi_linear"
                 else partial(_load_class, _model_module, _model_name)
+            ),
+            state_format_loader=(
+                partial(_load_class, _state_module, _state_name)
+                if _state_module is not None
+                else None
             ),
             explicit=True,
         )

@@ -6,6 +6,7 @@ import torch.nn as nn
 from transformers.configuration_utils import PretrainedConfig
 
 from llmtuner.config.model_config import LM_HEAD_COMPUTE_DTYPES
+from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.cast_linear import build_cast_linear
 from llmtuner.utils.dtypes import get_dtype
 from llmtuner.utils.logging import get_logger
@@ -18,6 +19,37 @@ MOE_CONFIG_ATTRIBUTES = (
     "n_routed_experts",
     "moe_intermediate_size",
 )
+
+
+def validate_legacy_policies(config: PretrainedConfig) -> None:
+    """Reject policies whose implementation moved to explicit model modules.
+
+    Never silently treat a requested numerical or kernel policy as native HF.
+    Validate before constructing the model so failures allocate no parameters.
+    """
+    defaults = {
+        "norm_backend": "native",
+        "linear_attention_backend": "native",
+        "gdn_numerical_policy": "native",
+        "gdn_allow_right_padding": False,
+        "gdn_deterministic_reduction": False,
+        "qkv_projection": "separate",
+        "rotary_compute_dtype": None,
+        "rotary_cache_dtype": None,
+    }
+    for name, default in defaults.items():
+        if getattr(config, name, default) != default:
+            raise UnsupportedCombinationError(
+                f"Experimental HF backend no longer implements {name}; "
+                "use the explicit model implementation for this policy"
+            )
+    if getattr(config, "experts_implementation", "native") in (
+        "torchtitan",
+        "pre_down",
+    ):
+        raise UnsupportedCombinationError(
+            "Experimental HF custom experts moved to explicit model implementations"
+        )
 
 
 def is_moe_config(config: PretrainedConfig) -> bool:
@@ -73,20 +105,10 @@ def configure_experts_implementation(
     impl = getattr(config, "experts_implementation", "native")
     if impl == "native":
         return
-    if impl == "pre_down":
-        if config.model_type != "qwen3_5_moe_text" or config.hidden_act != "silu":
-            raise ValueError("pre_down experts require Qwen3.5 MoE with SiLU")
-        config._experts_implementation = "eager"
-        return
-    if impl == "torchtitan":
-        if config.model_type != "qwen3_moe":
-            raise ValueError("experts_implementation='torchtitan' requires Qwen3-MoE")
-        config._experts_implementation = "eager"
-        return
     if impl not in ("grouped_mm", "batched_mm", "eager"):
         raise ValueError(
             f"experts_implementation must be one of 'native', "
-            f"'grouped_mm', 'batched_mm', 'eager', 'torchtitan', 'pre_down', "
+            f"'grouped_mm', 'batched_mm', 'eager', "
             f"got '{impl}'"
         )
     can_set = getattr(model_cls, "_can_set_experts_implementation", None)

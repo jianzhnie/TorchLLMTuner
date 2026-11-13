@@ -51,9 +51,9 @@ from .pipeline_parallel.pipeline_parallel import (
     build_pipeline_schedule,
     validate_microbatches,
 )
+from .plan import ParallelPlan
 from .stages import STAGE_ORDER
 from .tensor_parallel.tensor_parallel import (
-    ResolvedTPPlan,
     apply_tp,
     resolve_tp_overrides,
     resolve_tp_plan,
@@ -61,7 +61,7 @@ from .tensor_parallel.tensor_parallel import (
 )
 from .topology import ParallelTopology
 
-__all__ = ["parallelize_model", "parallelize_hf_transformers"]
+__all__ = ["parallelize_model"]
 
 
 def parallelize_model(
@@ -126,7 +126,7 @@ def parallelize_model(
         *,
         dense_mesh: DeviceMesh | None,
         part_cfg: ParallelConfig | None = None,
-        resolved_tp_plan: ResolvedTPPlan | None = None,
+        resolved_tp_plan: ParallelPlan | None = None,
     ) -> nn.Module:
         """Bind stage options once, then transform the model in declared order."""
         fsdp_cfg = cfg if part_cfg is None else part_cfg
@@ -340,10 +340,3 @@ def parallelize_model(
         with synchronize_local_errors("Tensor parallel plan validation"):
             resolved_tp_plan = resolve_tp_plan(model, cfg=cfg)
     return apply_stages(model, dense_mesh=mesh, resolved_tp_plan=resolved_tp_plan)
-
-
-def parallelize_hf_transformers(
-    model: nn.Module, **kwargs
-) -> nn.Module | PipelineParallelSetup:
-    """Compatibility alias for callers migrating from the HF adapter name."""
-    return parallelize_model(model, **kwargs)

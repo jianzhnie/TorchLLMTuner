@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
@@ -37,11 +37,6 @@ def resolve_data_parallel_rank(
     return mesh.get_local_rank(), mesh.size()
 
 
-def dp_rank_world_size(self: Trainer) -> tuple[int, int]:
-    """Compatibility wrapper for the Trainer's data-parallel coordinates."""
-    return resolve_data_parallel_rank(getattr(self, "parallel_dims", None))
-
-
 def resolve_batch_size_per_rank(cfg: LLMTunerConfig, dp_world_size: int) -> int:
     """Divide the global batch without silently dropping a remainder."""
     global_batch_size = cfg.global_batch_size
@@ -55,15 +50,10 @@ def resolve_batch_size_per_rank(cfg: LLMTunerConfig, dp_world_size: int) -> int:
     return global_batch_size // dp_world_size
 
 
-def batch_size_per_rank(self: Trainer, dp_world_size: int) -> int:
-    """Compatibility wrapper for per-rank batch validation."""
-    return resolve_batch_size_per_rank(self.cfg, dp_world_size)
-
-
 def build_training_dataloader(
     cfg: LLMTunerConfig, *, parallel_dims: ParallelTopology | None
 ) -> BaseDataLoader:
-    """Build a checkpointable loader with an explicit rank and token budget."""
+    """Build the recoverable loader for this rank's explicit data ownership."""
     dp_rank, dp_world_size = resolve_data_parallel_rank(parallel_dims)
     batch_size = resolve_batch_size_per_rank(cfg, dp_world_size)
     return build_dataset_dataloader(
@@ -72,25 +62,6 @@ def build_training_dataloader(
         dp_world_size=dp_world_size,
         num_tokens_per_batch=batch_size * cfg.max_seq_len,
     )
-
-
-def build_dataloader(self: Trainer) -> BaseDataLoader:
-    """Retain public rank/batch overrides at the Trainer compatibility boundary."""
-    dp_rank, dp_world_size = self.dp_rank_world_size()
-    batch_size = self.batch_size_per_rank(dp_world_size)
-    return build_dataset_dataloader(
-        self.cfg,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        num_tokens_per_batch=batch_size * self.cfg.max_seq_len,
-    )
-
-
-def data_iterator(self: Trainer) -> Iterator[Batch | TrainerBatch]:
-    """Iterate the initialized loader; reject missing runtime assembly."""
-    if self.dataloader is None:
-        raise RuntimeError("Trainer dataloader has not been initialized")
-    return iter(self.dataloader)
 
 
 def fetch_batch(
@@ -228,11 +199,6 @@ def microbatch(self: Trainer, batch: Batch | TrainerBatch) -> dict[str, Any]:
     }
 
 
-def to_device(self: Trainer, batch: Batch | TrainerBatch) -> Batch | TrainerBatch:
-    """Compatibility wrapper for the Trainer's public batch-transfer method."""
-    return move_batch_to_device(batch, self.device)
-
-
 def move_batch_to_device(
     batch: Batch | TrainerBatch, device: torch.device
 ) -> Batch | TrainerBatch:
@@ -250,30 +216,13 @@ def move_batch_to_device(
     )
 
 
-def preprocess(
-    self: Trainer, batch: Batch | TrainerBatch
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-    """Compatibility wrapper using the Trainer's declared example model."""
-    cfg = getattr(self, "cfg", None)
-    return prepare_model_inputs(
-        self.example_model,
-        batch,
-        device=getattr(self, "device", None),
-        parallel_dims=getattr(self, "parallel_dims", None),
-        max_context_length=cfg.max_seq_len if cfg is not None else 1,
-        transfer_batch=getattr(self, "to_device", None),
-    )
-
-
 def prepare_model_inputs(
     model: torch.nn.Module,
     batch: Batch | TrainerBatch,
     *,
-    device: torch.device | None,
+    device: torch.device,
     parallel_dims: Any,
     max_context_length: int,
-    transfer_batch: Callable[[Batch | TrainerBatch], Batch | TrainerBatch]
-    | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Connect a batch to the explicit model's input contract.
 
@@ -290,16 +239,9 @@ def prepare_model_inputs(
             f"{type(model).__name__} must implement "
             "prepare_inputs(batch, parallel_dims=..., max_context_length=...)"
         )
-    if transfer_batch is None:
-        if device is None:
-            raise ValueError("device is required when transfer_batch is not provided")
-
-        def transfer_batch(value: Batch | TrainerBatch) -> Batch | TrainerBatch:
-            return move_batch_to_device(value, device)
-
     with synchronize_local_errors("Training batch preprocessing"):
         return prepare_inputs(
-            transfer_batch(batch),
+            move_batch_to_device(batch, device),
             parallel_dims=parallel_dims,
             max_context_length=max_context_length,
         )

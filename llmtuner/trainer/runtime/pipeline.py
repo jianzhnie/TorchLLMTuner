@@ -1,7 +1,7 @@
 """Pipeline schedule input splitting and one forward/backward step.
 
-This module owns the PP-specific runtime path. The Trainer keeps its public
-methods and delegates here so existing callers can use the same interface.
+The execution engine supplies stage ownership, preprocessing and schedule
+dependencies. Trainer does not implement a second pipeline execution interface.
 """
 
 from __future__ import annotations

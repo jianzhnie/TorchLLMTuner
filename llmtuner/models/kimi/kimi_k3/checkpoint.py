@@ -13,6 +13,7 @@ from typing import Any
 import torch
 
 from ....accelerator.collectives import synchronize_local_errors
+from ...state import ModelStateFormat
 
 _BLOCK = re.compile(r"^(.*\.block_sparse_moe\.)(.*)$")
 _PROJECTIONS = {"w1_EFD": "w1", "w2_EDF": "w2", "w3_EFD": "w3"}
@@ -271,3 +272,24 @@ def convert_kimi_optimizer_state(
             # step tensor must not become the destination optimizer's counter.
             put(target, first.clone() if isinstance(first, torch.Tensor) else first)
     return result
+
+
+class KimiStateFormat(ModelStateFormat):
+    """Own Kimi expert conversion and declare its collective boundary."""
+
+    def __init__(
+        self, config: Any, *, expert_parallel: bool, sharded_expert_parallel: bool
+    ) -> None:
+        self.config = config
+        self.grouped_experts = expert_parallel
+        self.coordinates_conversion = expert_parallel
+
+    def convert_state(self, state: dict[str, Any], *, to_hf: bool) -> dict[str, Any]:
+        if not self.grouped_experts:
+            return state
+        return convert_kimi_expert_state(
+            state,
+            num_experts=self.config.num_experts,
+            to_hf=to_hf,
+            coordinate_errors=True,
+        )

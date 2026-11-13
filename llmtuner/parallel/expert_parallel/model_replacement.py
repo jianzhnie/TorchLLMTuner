@@ -51,14 +51,11 @@ from .block_conversion import (
     resolve_packed_experts,
     validate_moe_conversion,
 )
-from .kimi_conversion import (
-    convert_kimi_block,
-    validate_kimi_conversion,
-)
+from .kimi_conversion import convert_kimi_block
 
 logger = get_logger(__name__)
 
-__all__ = ["resolve_ep_plan", "swap_moe_blocks", "swap_hf_moe_blocks"]
+__all__ = ["resolve_ep_plan", "swap_moe_blocks"]
 
 
 def declared_router_output(block: nn.Module) -> bool:
@@ -552,7 +549,6 @@ def resolve_ep_plan(
         raise ValueError("EP degree must be a positive integer")
     config = getattr(model, "config", None)
     validate_ep_model_options(config, implementation)
-    validate_ep_model_geometry(model, degree=degree, tp_enabled=tp_enabled)
     layers = decoder_layers_for_ep(model)
     candidates = find_moe_candidates(model, layers, config)
     modules = tuple(model.named_modules(remove_duplicate=False))
@@ -564,8 +560,7 @@ def resolve_ep_plan(
         routing = None
         packed_experts = None
         if isinstance(block, KimiSparseMoE):
-            validate_kimi_conversion(
-                block,
+            block.validate_expert_parallel(
                 degree=degree,
                 tp_enabled=tp_enabled,
                 quantile_balancing=quantile_balancing,
@@ -612,6 +607,7 @@ def resolve_ep_plan(
     if any(isinstance(block, KimiSparseMoE) for _, _, block, _ in candidates):
         external_parameters, _ = external_state_owners(module_paths, roots)
         validate_kimi_expert_aliases(candidates, module_paths, external_parameters)
+    validate_ep_model_geometry(model, degree=degree, tp_enabled=tp_enabled)
     return ParallelPlan(
         stage="ep",
         targets=tuple(targets),
@@ -805,8 +801,7 @@ def swap_moe_blocks(
         if isinstance(target.module, KimiSparseMoE):
             # Revalidate all targets before constructing the first replacement:
             # execution options/config can change without replacing tensors.
-            validate_kimi_conversion(
-                target.module,
+            target.module.validate_expert_parallel(
                 degree=degree,
                 tp_enabled=tp_enabled,
                 quantile_balancing=quantile_balancing,
@@ -1049,8 +1044,3 @@ def swap_moe_blocks(
     model.ep_parallel_plan = execution_plan
     logger.info("Converted %d model MoE blocks for EP execution", len(replacements))
     return len(replacements)
-
-
-def swap_hf_moe_blocks(model: nn.Module, **kwargs: Any) -> int:
-    """Compatibility alias for the former HF-specific entry point."""
-    return swap_moe_blocks(model, **kwargs)

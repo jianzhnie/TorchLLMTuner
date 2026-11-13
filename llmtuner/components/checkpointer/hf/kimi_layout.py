@@ -127,7 +127,7 @@ def load_changed_kimi_layout(
             raise ValueError(
                 "Kimi checkpoint mixes individual and grouped expert layouts"
             )
-        target_grouped = adapter.kimi_expert_parallel
+        target_grouped = adapter.state_format.grouped_experts
         changed = (grouped or individual) and grouped != target_grouped
     if not changed:
         return False
