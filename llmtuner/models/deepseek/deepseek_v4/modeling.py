@@ -37,6 +37,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
+from ....errors import UnsupportedCombinationError
 from ...common.cast_linear import build_lm_head
 from ...common.input_preparation import prepare_text_inputs
 from ...configuration import (
@@ -468,6 +469,22 @@ class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
     def norm(self) -> nn.Module:
         """Return the model-owned final normalization."""
         return self.model.norm
+
+    def validate_parallel(self, *, tp_degree: int, ep_degree: int) -> None:
+        """Validate declared EP ownership without inferring a TP implementation."""
+        for name, degree in (("TP", tp_degree), ("EP", ep_degree)):
+            if isinstance(degree, bool) or not isinstance(degree, int) or degree < 1:
+                raise ValueError(f"{name} degree must be a positive integer")
+        if tp_degree != 1:
+            raise UnsupportedCombinationError(
+                "DeepSeek V4 does not declare a default TP plan; its grouped "
+                "attention and hyperconnections require an explicit implementation"
+            )
+        raise UnsupportedCombinationError(
+            "DeepSeek V4 generic EP conversion does not preserve token-table "
+            "routing or clamped expert math; use the native local/DP/FSDP path "
+            "until model-owned EP adapters are implemented"
+        )
 
     def materialization_buffers(
         self, device: torch.device

@@ -19,9 +19,8 @@ from torch.distributed.tensor import DTensor
 from ...accelerator.collectives import synchronize_local_errors
 from ...models.kimi.kimi_k3.checkpoint import convert_kimi_expert_state
 from ...models.qwen.qwen3.state import (
-    external_expert_projection,
-    grouped_expert_key,
-    native_ep_expert_key,
+    expert_export_keys,
+    normalize_expert_keys,
 )
 from .core.checkpoint_keys import SAFETENSORS_INDEX
 from .core.chunked_tensor import ChunkedCheckpointTensor
@@ -145,22 +144,11 @@ class ModelStateDictAdapter:
             getattr(self.model_config, "model_type", None) == "qwen3_moe"
             and self._hf_keys is not None
         ):
-            grouped_keys = set()
-            grouped_indices = {}
-            for key in self._hf_keys:
-                mapped = grouped_expert_key(key)
-                target = mapped[0] if mapped is not None else key
-                if self.qwen3_expert_parallel:
-                    target = native_ep_expert_key(key)
-                grouped_keys.add(target)
-                if self.fqn_to_index_mapping is not None:
-                    grouped_indices[target] = min(
-                        grouped_indices.get(target, self.fqn_to_index_mapping[key]),
-                        self.fqn_to_index_mapping[key],
-                    )
-            self._hf_keys = grouped_keys
-            if self.fqn_to_index_mapping is not None:
-                self.fqn_to_index_mapping = grouped_indices
+            self._hf_keys, self.fqn_to_index_mapping = normalize_expert_keys(
+                self._hf_keys,
+                self.fqn_to_index_mapping,
+                native_ep_layout=self.qwen3_expert_parallel,
+            )
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         if self.kimi_expert_parallel:
@@ -257,28 +245,17 @@ class ModelStateDictAdapter:
         pending = []
         with synchronize_local_errors("Qwen3 HF export expert mapping"):
             for key, value in state.items():
-                projection = external_expert_projection(key)
-                if projection is None:
-                    targets = [key]
-                else:
-                    prefix, role = projection
-                    if (
-                        not isinstance(value, torch.Tensor)
-                        or value.ndim != 3
-                        or value.shape[0] != self.model_config.num_experts
-                    ):
-                        raise ValueError(
-                            f"Qwen3 HF export requires full expert stack: {key}"
-                        )
-                    targets = [
-                        f"{prefix}{index}.{role}.weight"
-                        for index in range(self.model_config.num_experts)
-                    ]
+                expert_keys = expert_export_keys(
+                    key,
+                    value.shape if isinstance(value, torch.Tensor) else None,
+                    num_experts=self.model_config.num_experts,
+                )
+                targets = (key,) if expert_keys is None else expert_keys
                 for target in targets:
                     if target in result:
                         raise ValueError(f"Qwen3 HF export key collision: {target}")
-                    result[target] = value if projection is None else None
-                if projection is not None:
+                    result[target] = value if expert_keys is None else None
+                if expert_keys is not None:
                     pending.append((targets, value))
         for targets, value in pending:
             if isinstance(value, ChunkedCheckpointTensor):

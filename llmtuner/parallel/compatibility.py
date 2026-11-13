@@ -415,13 +415,13 @@ ENTRIES: tuple[CompatibilityRule, ...] = (
         chunked_loss_pp,
         "assembly",
         UnsupportedCombinationError,
-        "trainer/runtime/assembly.py::_build_model",
+        "trainer/runtime/assembly.py::build_model",
     ),
     CompatibilityRule(
         ep_hf_initial_load,
         "assembly",
         UnsupportedCombinationError,
-        "trainer/runtime/assembly.py::_build_model",
+        "trainer/runtime/assembly.py::build_model",
     ),
     CompatibilityRule(
         chunked_loss_validation,
@@ -433,7 +433,7 @@ ENTRIES: tuple[CompatibilityRule, ...] = (
         chunked_loss_fsdp,
         "assembly",
         UnsupportedCombinationError,
-        "trainer/runtime/assembly.py::_build_model",
+        "trainer/runtime/assembly.py::build_model",
     ),
     CompatibilityRule(
         pp_weight_tying,

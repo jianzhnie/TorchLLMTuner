@@ -552,6 +552,7 @@ def resolve_ep_plan(
         raise ValueError("EP degree must be a positive integer")
     config = getattr(model, "config", None)
     validate_ep_model_options(config, implementation)
+    validate_ep_model_geometry(model, degree=degree, tp_enabled=tp_enabled)
     layers = decoder_layers_for_ep(model)
     candidates = find_moe_candidates(model, layers, config)
     modules = tuple(model.named_modules(remove_duplicate=False))
@@ -611,7 +612,6 @@ def resolve_ep_plan(
     if any(isinstance(block, KimiSparseMoE) for _, _, block, _ in candidates):
         external_parameters, _ = external_state_owners(module_paths, roots)
         validate_kimi_expert_aliases(candidates, module_paths, external_parameters)
-    validate_ep_model_geometry(model, degree=degree, tp_enabled=tp_enabled)
     return ParallelPlan(
         stage="ep",
         targets=tuple(targets),

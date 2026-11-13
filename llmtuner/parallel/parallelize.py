@@ -34,7 +34,8 @@ from ..memory.activation_checkpoint import apply_ac, validate_ac_options
 from ..memory.activation_swap import apply_activation_swap
 from .compatibility import chunked_loss_fsdp
 from .context_parallel.context_parallel import apply_cp, resolve_cp_plan
-from .expert_parallel.expert_parallel import apply_ep
+from .expert_parallel.expert_parallel import apply_ep, resolve_ep_plan
+from .expert_parallel.mc2_ops import validate_mc2_world_size
 from .fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp,
     validate_fsdp_environment,
@@ -245,6 +246,24 @@ def parallelize_model(
         if cfg.cp_size > 1 and parallel_dims is not None
         else None
     )
+
+    if cfg.ep_size > 1 or cfg.ep_config.fixed_router:
+        # Reject invalid expert layouts before TP replaces parameters or PP
+        # copies/splits modules. This is metadata-only; the execution stage
+        # resolves again against its post-TP/PP instance, never this snapshot.
+        # Include the world, rather than only one EP group, because other
+        # stages/ranks may subsequently enter shared FSDP or PP collectives.
+        with synchronize_local_errors("Expert parallel global plan validation"):
+            if cfg.ep_config.ep_token_dispatcher == "mc2":
+                validate_mc2_world_size(cfg.ep_size)
+            resolve_ep_plan(
+                model,
+                degree=cfg.ep_size,
+                implementation=cfg.ep_config.ep_token_dispatcher,
+                tp_enabled=cfg.tp_size > 1,
+                quantile_balancing=cfg.ep_config.moe_quantile_balancing,
+                has_ep_group=ep_group is not None,
+            )
 
     if parallel_dims is not None and parallel_dims.pp_enabled:
         global_tp_plan = None

@@ -7,7 +7,7 @@ methods and delegates here so existing callers can use the same interface.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any, Protocol
 
 import torch
 
@@ -22,8 +22,23 @@ from ...parallel.pipeline_parallel.microbatch_drivers import (
     schedule_stages,
 )
 
-if TYPE_CHECKING:
-    from ..trainer import Trainer
+
+class PipelineRuntime(Protocol):
+    pp_schedule: Any
+    pp_has_first_stage: bool
+    pp_has_last_stage: bool
+    parallel_dims: Any
+    _pp_loss_sentinel: torch.Tensor | None
+
+    def pp_microbatches(
+        self, batch: Batch | TrainerBatch
+    ) -> list[Batch | TrainerBatch]: ...
+
+    def preprocess(
+        self, batch: Batch | TrainerBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]: ...
+
+    def param_context(self) -> Any: ...
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -121,7 +136,7 @@ def split_pipeline_microbatches(
 
 
 def prepare_pipeline_inputs(
-    trainer: Trainer, batch: Batch | TrainerBatch
+    trainer: PipelineRuntime, batch: Batch | TrainerBatch
 ) -> PipelineInputs:
     """Prepare schedule inputs for the local first/last-stage ownership."""
     arg_mbs: list[tuple[torch.Tensor, ...]] = []
@@ -143,7 +158,7 @@ def prepare_pipeline_inputs(
 
 
 def run_pipeline_step(
-    trainer: Trainer,
+    trainer: PipelineRuntime,
     batch: Batch | TrainerBatch,
     *,
     global_valid_tokens: torch.Tensor,

@@ -13,9 +13,11 @@ splits the model first, then applies those stages to each local model part.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 
 from ...accelerator.collectives import synchronize_local_errors
@@ -69,17 +71,43 @@ from ...parallel.topology import build_device_mesh, resolve_parallel_topology
 from ...utils import logging as logging_utils
 from ...utils import seeding
 from ...utils.flops import flops_per_token
+from .engine import LossSum, ParamContext, TrainingEngine
 from .training_observer import DispatchTimer, TrainingObserver
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from ...config.llmtuner_config import LLMTunerConfig
+    from ...parallel.topology import ParallelTopology
     from ..trainer import Trainer
 
 
-def _build_model(
-    trainer: Trainer,
+@dataclass(frozen=True, slots=True)
+class ModelAssembly:
+    """Parallel model ownership and PP execution metadata for this rank."""
+
+    model: torch.nn.Module | None
+    model_parts: list[torch.nn.Module]
+    pp_schedule: Any | None = None
+    pp_has_first_stage: bool = False
+    pp_has_last_stage: bool = False
+    pp_loss_sentinel: torch.Tensor | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizerStack:
+    """Optimizer services sharing the final parallel parameter layout."""
+
+    optimizer: OptimizersContainer
+    lr_scheduler: Any
+    ema: EMA | None
+
+
+def build_model(
+    cfg: LLMTunerConfig,
+    *,
+    parallel_dims: ParallelTopology | None,
+    device: torch.device,
 ) -> tuple[torch.nn.Module, PretrainedConfig, bool]:
     """Build the registered explicit model and resolve initial weight loading.
 
@@ -87,30 +115,27 @@ def _build_model(
     implementation owns its module tree; this function only resolves config,
     construction device and checkpoint policy.
     """
-    cfg = trainer.cfg
     # PP schedules consume logits; chunked loss requires a hidden-state path.
-    trainer._chunked_loss_num_chunks = cfg.training.chunked_loss_num_chunks
+    chunked_loss_num_chunks = cfg.training.chunked_loss_num_chunks
     if (
-        trainer._chunked_loss_num_chunks > 1
-        and trainer.parallel_dims is not None
-        and trainer.parallel_dims.pp_enabled
+        chunked_loss_num_chunks > 1
+        and parallel_dims is not None
+        and parallel_dims.pp_enabled
     ):
-        compatibility.chunked_loss_pp(
-            trainer._chunked_loss_num_chunks, trainer.parallel_dims.pp
-        )
+        compatibility.chunked_loss_pp(chunked_loss_num_chunks, parallel_dims.pp)
     if (
-        trainer._chunked_loss_num_chunks > 1
-        and trainer.parallel_dims is not None
-        and trainer.parallel_dims.dp_shard_enabled
+        chunked_loss_num_chunks > 1
+        and parallel_dims is not None
+        and parallel_dims.dp_shard_enabled
     ):
         compatibility.chunked_loss_fsdp(
-            trainer._chunked_loss_num_chunks,
+            chunked_loss_num_chunks,
             fsdp_config=cfg.parallel.fsdp_config,
             hybrid_parallel=(
-                trainer.parallel_dims.tp_enabled
-                or trainer.parallel_dims.cp_enabled
-                or trainer.parallel_dims.ep_enabled
-                or trainer.parallel_dims.pp_enabled
+                parallel_dims.tp_enabled
+                or parallel_dims.cp_enabled
+                or parallel_dims.ep_enabled
+                or parallel_dims.pp_enabled
             ),
             compile=cfg.training.compile,
         )
@@ -129,8 +154,8 @@ def _build_model(
     # still need their own checkpoint mapping before meta initialization.
     if (
         load_initial_weights
-        and trainer.parallel_dims is not None
-        and trainer.parallel_dims.ep_enabled
+        and parallel_dims is not None
+        and parallel_dims.ep_enabled
         and getattr(text_config, "model_type", None) != "kimi_linear"
         and not (
             getattr(text_config, "model_type", None) == "qwen3_moe"
@@ -138,7 +163,7 @@ def _build_model(
             and (cfg.parallel.tp_size == 1 or cfg.checkpoint.sharded_tensor_parallel)
         )
     ):
-        compatibility.ep_hf_initial_load(trainer.parallel_dims.ep)
+        compatibility.ep_hf_initial_load(parallel_dims.ep)
     if not load_initial_weights and cfg.model.initialization_device == "meta":
         if any(
             degree > 1
@@ -164,11 +189,23 @@ def _build_model(
         with torch.device("meta"):
             model = model_class(text_config)
     else:
-        model = model_class(text_config).to(trainer.device)
+        model = model_class(text_config).to(device)
         initialize_buffers = getattr(model, "initialize_training_buffers", None)
         if callable(initialize_buffers):
             initialize_buffers()
     return model, model_config, load_initial_weights
+
+
+def _build_model(
+    trainer: Trainer,
+) -> tuple[torch.nn.Module, PretrainedConfig, bool]:
+    """Compatibility bridge for callers using the original Trainer helper."""
+    trainer._chunked_loss_num_chunks = trainer.cfg.training.chunked_loss_num_chunks
+    return build_model(
+        trainer.cfg,
+        parallel_dims=trainer.parallel_dims,
+        device=getattr(trainer, "device", torch.device("cpu")),
+    )
 
 
 def _fsdp_managed_parameters(model: torch.nn.Module) -> set[torch.nn.Parameter]:
@@ -201,16 +238,21 @@ def _model_materialization_buffers(
 
 
 def _apply_parallelism(
-    trainer: Trainer, model: torch.nn.Module, *, load_initial_weights: bool
-) -> None:
-    """Apply configured stages, then materialize the explicit model targets."""
-    cfg = trainer.cfg
+    model: torch.nn.Module,
+    *,
+    cfg: LLMTunerConfig,
+    mesh: DeviceMesh | None,
+    parallel_dims: ParallelTopology | None,
+    device: torch.device,
+    load_initial_weights: bool,
+) -> ModelAssembly:
+    """Apply configured stages and return this rank's explicit model ownership."""
     orchestration = parallelize_model(
         model,
         cfg=cfg.parallel,
-        mesh=trainer.mesh,
-        parallel_dims=trainer.parallel_dims,
-        device=trainer.device,
+        mesh=mesh,
+        parallel_dims=parallel_dims,
+        device=device,
         compile=cfg.training.compile,
         compile_config=cfg.training.compile_config,
         activation_checkpoint=cfg.training.activation_checkpoint_mode,
@@ -224,54 +266,39 @@ def _apply_parallelism(
         chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
     )
     if isinstance(orchestration, PipelineParallelSetup):
-        # pp > 1: no single model survives the split -- this rank holds its
-        # stages' chunks only, and the schedule drives them in
-        # ``pp_forward_backward_body``.
-        trainer.model = None
-        trainer.model_parts = orchestration.model_parts
-        trainer.pp_schedule = orchestration.schedule
-        trainer.pp_has_first_stage = orchestration.has_first_stage
-        trainer.pp_has_last_stage = orchestration.has_last_stage
-        # Only the last stage computes CE. Other stages return a finite zero
-        # for the step check and contribute nothing to the PP loss reduction.
-        #
-        # Shape and dtype must match what the last stage produces exactly -- a
-        # 0-dim float32, since the last stage returns ``sum(micro_losses) *
-        # global_valid_tokens`` (float32 times an int64 count). The sentinel is
-        # what enters the same all-reduce over the PP group, and a collective
-        # matches buffers by byte length: ``(1,)`` in the process default dtype
-        # is 2 bytes under a bfloat16 default against the last stage's 4, which
-        # silently corrupted the reduced value (a negative "sum" and a max of
-        # -3e27 were both observed on the NPU). Under the float32 default the
-        # two happened to be the same width, which is why this only showed up
-        # once the default dtype was bf16.
-        trainer._pp_loss_sentinel = torch.zeros(
-            (), dtype=torch.float32, device=trainer.device
+        assembled = ModelAssembly(
+            model=None,
+            model_parts=orchestration.model_parts,
+            pp_schedule=orchestration.schedule,
+            pp_has_first_stage=orchestration.has_first_stage,
+            pp_has_last_stage=orchestration.has_last_stage,
+            # Non-last stages contribute a finite float32 zero to PP loss
+            # reduction. Its scalar shape and dtype must match the last stage.
+            pp_loss_sentinel=torch.zeros((), dtype=torch.float32, device=device),
         )
     else:
-        trainer.model = orchestration
-        trainer.model_parts = [orchestration]
+        assembled = ModelAssembly(model=orchestration, model_parts=[orchestration])
 
     if load_initial_weights or cfg.model.initialization_device == "meta":
         materialization_error: BaseException | None = None
         try:
-            for model_part in trainer.model_parts:
+            for model_part in assembled.model_parts:
                 if cfg.parallel.fsdp_config.fsdp_cpu_offload:
                     materialize_meta_model(
                         model_part,
-                        trainer.device,
+                        device,
                         parameter_device=torch.device("cpu"),
                         offloaded_parameters=_fsdp_managed_parameters(model_part),
                         runtime_buffers=_model_materialization_buffers(
-                            model_part, trainer.device
+                            model_part, device
                         ),
                     )
                 else:
                     materialize_meta_model(
                         model_part,
-                        trainer.device,
+                        device,
                         runtime_buffers=_model_materialization_buffers(
-                            model_part, trainer.device
+                            model_part, device
                         ),
                     )
         except BaseException as error:
@@ -284,7 +311,7 @@ def _apply_parallelism(
         if not load_initial_weights:
             initialization_error: BaseException | None = None
             try:
-                for model_part in trainer.model_parts:
+                for model_part in assembled.model_parts:
                     initialize_model = getattr(
                         model_part, "initialize_parameters", None
                     )
@@ -301,38 +328,139 @@ def _apply_parallelism(
             with synchronize_local_errors("Random model initialization"):
                 if initialization_error is not None:
                     raise initialization_error
+    return assembled
 
 
-def _build_optimizer_stack(trainer: Trainer) -> None:
-    """Optimizer, lr schedule, EMA, and the MoE/aux-loss optimizer pre-hooks."""
-    cfg = trainer.cfg
-    trainer.optimizer = OptimizersContainer(
+def _install_model_assembly(trainer: Trainer, assembled: ModelAssembly) -> None:
+    """Compatibility bridge for existing optimizer and checkpoint consumers."""
+    trainer.model = assembled.model
+    trainer.model_parts = assembled.model_parts
+    trainer.pp_schedule = assembled.pp_schedule
+    trainer.pp_has_first_stage = assembled.pp_has_first_stage
+    trainer.pp_has_last_stage = assembled.pp_has_last_stage
+    trainer._pp_loss_sentinel = assembled.pp_loss_sentinel
+
+
+def create_training_engine(
+    cfg: LLMTunerConfig,
+    *,
+    model_assembly: ModelAssembly,
+    optimizer_stack: OptimizerStack,
+    parallel_dims: ParallelTopology | None,
+    device: torch.device,
+    param_context: ParamContext,
+    loss_sum: LossSum,
+) -> TrainingEngine:
+    """Bind execution dependencies without reading or mutating a Trainer.
+
+    The assembly owns model parts and pipeline metadata; optimizer services
+    refer to the final parameter layout. This factory consumes both results
+    without reselecting model or parallel strategies.
+    """
+    return TrainingEngine(
+        model_parts=model_assembly.model_parts,
+        parallel_dims=parallel_dims,
+        device=device,
+        max_context_length=cfg.max_seq_len,
+        chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
+        param_context=param_context,
+        loss_sum=loss_sum,
+        optimizer=optimizer_stack.optimizer,
+        lr_scheduler=optimizer_stack.lr_scheduler,
+        ema=optimizer_stack.ema,
+        pp_schedule=model_assembly.pp_schedule,
+        pp_has_first_stage=model_assembly.pp_has_first_stage,
+        pp_has_last_stage=model_assembly.pp_has_last_stage,
+        pp_loss_sentinel=model_assembly.pp_loss_sentinel,
+        pp_num_microbatches=cfg.parallel.pp_config.num_pp_microbatches,
+    )
+
+
+def build_training_engine(
+    trainer: Trainer,
+    assembled: ModelAssembly | None = None,
+    optimizer_stack: OptimizerStack | None = None,
+) -> TrainingEngine:
+    """Bind execution to a model assembly, with a legacy construction fallback."""
+    if assembled is None:
+        model_parts = getattr(trainer, "model_parts", None)
+        if model_parts is None:
+            model_parts = [trainer.model]
+        assembled = ModelAssembly(
+            model=getattr(trainer, "model", None),
+            model_parts=model_parts,
+            pp_schedule=getattr(trainer, "pp_schedule", None),
+            pp_has_first_stage=getattr(trainer, "pp_has_first_stage", False),
+            pp_has_last_stage=getattr(trainer, "pp_has_last_stage", False),
+            pp_loss_sentinel=getattr(trainer, "_pp_loss_sentinel", None),
+        )
+    cfg = getattr(trainer, "cfg", None)
+    parallel_cfg = getattr(cfg, "parallel", None)
+    pp_config = getattr(parallel_cfg, "pp_config", None)
+    pp_num_microbatches = getattr(pp_config, "num_pp_microbatches", 1)
+    max_context_length = getattr(cfg, "max_seq_len", 1)
+    optimizer = (
+        optimizer_stack.optimizer
+        if optimizer_stack is not None
+        else getattr(trainer, "optimizer", None)
+    )
+    lr_scheduler = (
+        optimizer_stack.lr_scheduler
+        if optimizer_stack is not None
+        else getattr(trainer, "lr_scheduler", None)
+    )
+    ema = (
+        optimizer_stack.ema
+        if optimizer_stack is not None
+        else getattr(trainer, "ema", None)
+    )
+    return TrainingEngine(
+        model_parts=assembled.model_parts,
+        parallel_dims=trainer.parallel_dims,
+        device=getattr(trainer, "device", torch.device("cpu")),
+        max_context_length=max_context_length,
+        chunked_loss_num_chunks=getattr(trainer, "_chunked_loss_num_chunks", 1),
+        param_context=trainer.param_context,
+        loss_sum=trainer.loss_sum,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        ema=ema,
+        pp_schedule=assembled.pp_schedule,
+        pp_has_first_stage=assembled.pp_has_first_stage,
+        pp_has_last_stage=assembled.pp_has_last_stage,
+        pp_loss_sentinel=assembled.pp_loss_sentinel,
+        pp_num_microbatches=pp_num_microbatches,
+    )
+
+
+def build_optimizer_stack(
+    cfg: LLMTunerConfig,
+    *,
+    model_parts: list[torch.nn.Module],
+    parallel_dims: ParallelTopology | None,
+) -> OptimizerStack:
+    """Build optimizer services against the final parallel parameter layout."""
+    optimizer = OptimizersContainer(
         cfg.optimizer,
         sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
         sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
-        model_parts=trainer.model_parts,
+        model_parts=model_parts,
         initialization_group=get_default_group() if is_distributed() else None,
         pipeline_mesh=(
-            trainer.parallel_dims.get_optional_mesh("pp")
-            if trainer.parallel_dims is not None
-            else None
+            parallel_dims.get_optional_mesh("pp") if parallel_dims is not None else None
         ),
     )
 
     with synchronize_local_errors("Optimizer services construction"):
-        # LambdaLR needs the inner optimizers' learning rates; the container exposes
-        # only a merged parameter view. The default schedule keeps the rate constant.
-        trainer.lr_scheduler = build_lr_scheduler(
+        lr_scheduler = build_lr_scheduler(
             cfg.lr_scheduler_config,
-            optimizers=list(trainer.optimizer),
+            optimizers=list(optimizer),
             training_steps=cfg.steps,
         )
-
-        # EMA runs after the optimizer update and has its own checkpoint state.
         ema_config = cfg.training.ema
-        trainer.ema = (
+        ema = (
             EMA(
-                model_parts=trainer.model_parts,
+                model_parts=model_parts,
                 sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
                 sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
                 decay=ema_config.decay,
@@ -345,52 +473,58 @@ def _build_optimizer_stack(trainer: Trainer) -> None:
             if ema_config is not None
             else None
         )
-
-        # Container hooks run once per training step, including with multiple PP
-        # optimizers. Collect accumulated auxiliary losses and apply MoE balancing.
-        register_aux_loss_metrics_hook(
-            trainer.optimizer, model_parts=trainer.model_parts
-        )
-        # Select one balancing policy and register one container-level pre-hook.
+        # Container hooks run once per optimizer step, including multiple PP parts.
+        register_aux_loss_metrics_hook(optimizer, model_parts=model_parts)
         register_moe_balancing_hook(
-            trainer.optimizer,
-            model_parts=trainer.model_parts,
-            parallel_dims=trainer.parallel_dims,
+            optimizer, model_parts=model_parts, parallel_dims=parallel_dims
         )
+    return OptimizerStack(optimizer=optimizer, lr_scheduler=lr_scheduler, ema=ema)
 
 
-def _build_checkpointer(trainer: Trainer, model_config: PretrainedConfig) -> None:
-    """Register model, optimizer, schedule, EMA, and resumable runtime state.
+def _build_optimizer_stack(
+    trainer: Trainer, assembled: ModelAssembly | None = None
+) -> OptimizerStack:
+    """Compatibility bridge for existing optimizer construction integrations."""
+    model_parts = trainer.model_parts if assembled is None else assembled.model_parts
+    stack = build_optimizer_stack(
+        trainer.cfg, model_parts=model_parts, parallel_dims=trainer.parallel_dims
+    )
+    trainer.optimizer = stack.optimizer
+    trainer.lr_scheduler = stack.lr_scheduler
+    trainer.ema = stack.ema
+    return stack
 
-    The trainer carries step/token counters; the dataloader carries its cursor.
-    Both must resume alongside weights. The scheduler restores its own progress
-    and base learning rates; optimizer state alone cannot restore the schedule.
-    """
-    cfg = trainer.cfg
+
+def build_checkpointer(
+    cfg: LLMTunerConfig,
+    model_config: PretrainedConfig,
+    *,
+    model_assembly: ModelAssembly,
+    optimizer_stack: OptimizerStack,
+    dataloader: Any,
+    train_state: Any,
+    device: torch.device,
+    parallel_dims: ParallelTopology | None,
+) -> DistributedCheckpointManager | TorchCheckpointingManager:
+    """Build checkpoint orchestration around explicitly owned runtime state."""
     with synchronize_local_errors("Checkpoint services preparation"):
         if cfg.checkpoint.enable and cfg.optimizer.state_residency == "npu_virtual":
             validate_checkpoint_configuration(
                 cfg.checkpoint.backend, cfg.checkpoint.async_mode
             )
-        if trainer.dataloader is None:
+        if dataloader is None:
             raise RuntimeError(
                 "Trainer dataloader must be initialized before "
                 "building the checkpointer"
             )
         states: dict[str, Any] = {
-            TRAIN_STATE: trainer,
-            DATALOADER: trainer.dataloader,
-            RNG_STATE: RNGCheckpointState(
-                trainer.device, topology=trainer.parallel_dims
-            ),
+            TRAIN_STATE: train_state,
+            DATALOADER: dataloader,
+            RNG_STATE: RNGCheckpointState(device, topology=parallel_dims),
         }
         sd_adapter = ModelStateDictAdapter(
             model_config,
             cfg.checkpoint.initial_load_path or cfg.hf_model,
-            # Explicit causal-LM implementations expose the canonical
-            # ``model.*`` tree directly. The legacy wrapper used
-            # ``model.model.*`` and must opt into that prefix at its own
-            # compatibility boundary instead of being assumed here.
             model_prefix="",
             qwen3_expert_parallel=(
                 getattr(model_config, "model_type", None) == "qwen3_moe"
@@ -402,25 +536,91 @@ def _build_checkpointer(trainer: Trainer, model_config: PretrainedConfig) -> Non
                 and cfg.parallel.ep_size > 1
             ),
         )
-    # One manager per backend, same contract (see components/checkpointer). The
-    # torch_checkpointing one raises an actionable ImportError when its optional
-    # package is missing, which is why the choice is a plain branch here rather
-    # than a capability probe.
     manager_cls = (
         TorchCheckpointingManager
         if cfg.checkpoint.backend == "torch_checkpointing"
         else DistributedCheckpointManager
     )
-    trainer.checkpointer = manager_cls(
+    return manager_cls(
         cfg.checkpoint,
-        model_parts=trainer.model_parts,
-        optimizer=trainer.optimizer,
-        lr_scheduler=trainer.lr_scheduler,
-        ema=trainer.ema,
+        model_parts=model_assembly.model_parts,
+        optimizer=optimizer_stack.optimizer,
+        lr_scheduler=optimizer_stack.lr_scheduler,
+        ema=optimizer_stack.ema,
         states=states,
         folder=cfg.dump_folder,
         sd_adapter=sd_adapter,
     )
+
+
+def _build_checkpointer(
+    trainer: Trainer,
+    model_config: PretrainedConfig,
+    model_assembly: ModelAssembly | None = None,
+    optimizer_stack: OptimizerStack | None = None,
+) -> DistributedCheckpointManager | TorchCheckpointingManager:
+    """Compatibility bridge retaining Trainer as the train-state owner."""
+    if model_assembly is None:
+        model_assembly = getattr(trainer, "model_assembly", None)
+    if model_assembly is None:
+        model = getattr(trainer, "model", None)
+        model_assembly = ModelAssembly(
+            model=model,
+            model_parts=getattr(
+                trainer, "model_parts", [] if model is None else [model]
+            ),
+        )
+    if optimizer_stack is None:
+        optimizer_stack = getattr(trainer, "optimizer_stack", None)
+    if optimizer_stack is None:
+        optimizer_stack = OptimizerStack(
+            optimizer=getattr(trainer, "optimizer", None),
+            lr_scheduler=getattr(trainer, "lr_scheduler", None),
+            ema=getattr(trainer, "ema", None),
+        )
+    trainer.checkpointer = build_checkpointer(
+        trainer.cfg,
+        model_config,
+        model_assembly=model_assembly,
+        optimizer_stack=optimizer_stack,
+        dataloader=trainer.dataloader,
+        train_state=trainer,
+        device=getattr(trainer, "device", torch.device("cpu")),
+        parallel_dims=getattr(trainer, "parallel_dims", None),
+    )
+    return trainer.checkpointer
+
+
+def build_metrics_processor(
+    cfg: LLMTunerConfig,
+    model_config: PretrainedConfig,
+    *,
+    parallel_dims: ParallelTopology | None,
+    num_parameters: int,
+    num_trainable_parameters: int,
+) -> MetricsProcessor:
+    """Build metrics from resolved model geometry and parallel topology."""
+    with synchronize_local_errors("Metrics construction"):
+        text_config = unwrap_text_config(model_config)
+        metrics = MetricsProcessor(
+            cfg.metrics,
+            parallel_dims=parallel_dims,
+            dump_folder=cfg.dump_folder,
+            num_parameters=num_parameters,
+            num_trainable_parameters=num_trainable_parameters,
+            pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
+            num_flops_per_token=flops_per_token(text_config, seq_len=cfg.max_seq_len),
+        )
+        if text_config.model_type == "qwen3_5_moe_text":
+            logging_utils.get_logger(__name__).info(
+                "Qwen3.5 model FLOPs: recurrent-equivalent GDN, gated "
+                "projections, active experts and depthwise convolution; "
+                "full-square attention at sequence length %d. Excludes "
+                "recomputation, padding overhead, optimizer and communication; "
+                "this is model MFU, not measured kernel utilization.",
+                cfg.max_seq_len,
+            )
+    return metrics
 
 
 def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
@@ -482,9 +682,13 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
 
     seeding.initialize_dtensor_rng(trainer.mesh)
 
+    # Compatibility field for direct dense/PP callers; the engine reads config.
+    trainer._chunked_loss_num_chunks = cfg.training.chunked_loss_num_chunks
     # Build the model before optimizer services capture its parameters.
     with synchronize_local_errors("Model construction"):
-        model, model_config, load_initial_weights = _build_model(trainer)
+        model, model_config, load_initial_weights = build_model(
+            cfg, parallel_dims=trainer.parallel_dims, device=trainer.device
+        )
         # Count unique logical parameters before TP/EP/PP/FSDP change ownership.
         num_parameters = sum(parameter.numel() for parameter in model.parameters())
         num_trainable_parameters = sum(
@@ -492,11 +696,32 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
             for parameter in model.parameters()
             if parameter.requires_grad
         )
-    _apply_parallelism(trainer, model, load_initial_weights=load_initial_weights)
-    _build_optimizer_stack(trainer)
+    model_assembly = _apply_parallelism(
+        model,
+        cfg=cfg,
+        mesh=trainer.mesh,
+        parallel_dims=trainer.parallel_dims,
+        device=trainer.device,
+        load_initial_weights=load_initial_weights,
+    )
+    _install_model_assembly(trainer, model_assembly)
+    optimizer_stack = _build_optimizer_stack(trainer, model_assembly)
+    trainer.model_assembly = model_assembly
+    trainer.optimizer_stack = optimizer_stack
+    trainer.training_engine = create_training_engine(
+        cfg,
+        model_assembly=model_assembly,
+        optimizer_stack=optimizer_stack,
+        parallel_dims=trainer.parallel_dims,
+        device=trainer.device,
+        param_context=trainer.param_context,
+        loss_sum=trainer.loss_sum,
+    )
 
     # The checkpointer captures the loader cursor alongside model state.
     with synchronize_local_errors("Dataloader construction"):
+        # Preserve the public subclass hook. The default implementation uses
+        # explicit data dependencies; the loader itself never receives Trainer.
         trainer.dataloader = trainer.build_dataloader()
 
     # Counters the checkpoint carries. Kept as plain ints so a resumed run
@@ -506,27 +731,13 @@ def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
 
     _build_checkpointer(trainer, model_config)
 
-    # Metrics use the resolved topology and model configuration built above.
-    with synchronize_local_errors("Metrics construction"):
-        text_config = unwrap_text_config(model_config)
-        trainer.metrics = MetricsProcessor(
-            cfg.metrics,
-            parallel_dims=trainer.parallel_dims,
-            dump_folder=cfg.dump_folder,
-            num_parameters=num_parameters,
-            num_trainable_parameters=num_trainable_parameters,
-            pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
-            num_flops_per_token=flops_per_token(text_config, seq_len=cfg.max_seq_len),
-        )
-        if text_config.model_type == "qwen3_5_moe_text":
-            logging_utils.get_logger(__name__).info(
-                "Qwen3.5 model FLOPs: recurrent-equivalent GDN, gated "
-                "projections, active experts and depthwise convolution; "
-                "full-square attention at sequence length %d. Excludes "
-                "recomputation, padding overhead, optimizer and communication; "
-                "this is model MFU, not measured kernel utilization.",
-                cfg.max_seq_len,
-            )
+    trainer.metrics = build_metrics_processor(
+        cfg,
+        model_config,
+        parallel_dims=trainer.parallel_dims,
+        num_parameters=num_parameters,
+        num_trainable_parameters=num_trainable_parameters,
+    )
     trainer.training_observer = TrainingObserver(trainer.metrics, trainer.device)
     trainer.dispatch_timers = []
     if cfg.metrics.measure_moe_dispatch:

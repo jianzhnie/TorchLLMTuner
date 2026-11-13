@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
@@ -20,28 +20,31 @@ from ...datasets.contracts import (
 from ...datasets.loader_builder import build_dataloader as build_dataset_dataloader
 
 if TYPE_CHECKING:
+    from ...config.llmtuner_config import LLMTunerConfig
+    from ...parallel.topology import ParallelTopology
     from ..trainer import Trainer
 
 
-def dp_rank_world_size(self: Trainer) -> tuple[int, int]:
-    """Return the rank and size of the loader's data-parallel axis.
-
-    PP uses the batch mesh so every stage reads the same shard. Without a
-    topology, including before mesh initialization, use a single rank."""
-    parallel_dims = getattr(self, "parallel_dims", None)
+def resolve_data_parallel_rank(
+    parallel_dims: ParallelTopology | None,
+) -> tuple[int, int]:
+    """Return the loader rank, using PP's stage-shared batch view when needed."""
     if parallel_dims is None:
         return 0, 1
-    # Both views span DP replicate * shard. PP's batch view excludes stages,
-    # ensuring each stage reads the same shard of the global batch.
     mesh = parallel_dims.get_optional_mesh(
         "batch" if parallel_dims.pp_enabled else "dp", include_singleton_axes=True
     )
     return mesh.get_local_rank(), mesh.size()
 
 
-def batch_size_per_rank(self: Trainer, dp_world_size: int) -> int:
-    """Divide the configured global batch across DP ranks without dropping rows."""
-    global_batch_size = self.cfg.global_batch_size
+def dp_rank_world_size(self: Trainer) -> tuple[int, int]:
+    """Compatibility wrapper for the Trainer's data-parallel coordinates."""
+    return resolve_data_parallel_rank(getattr(self, "parallel_dims", None))
+
+
+def resolve_batch_size_per_rank(cfg: LLMTunerConfig, dp_world_size: int) -> int:
+    """Divide the global batch without silently dropping a remainder."""
+    global_batch_size = cfg.global_batch_size
     if global_batch_size % dp_world_size != 0:
         raise ValueError(
             f"global_batch_size ({global_batch_size}) must be divisible by "
@@ -52,17 +55,34 @@ def batch_size_per_rank(self: Trainer, dp_world_size: int) -> int:
     return global_batch_size // dp_world_size
 
 
+def batch_size_per_rank(self: Trainer, dp_world_size: int) -> int:
+    """Compatibility wrapper for per-rank batch validation."""
+    return resolve_batch_size_per_rank(self.cfg, dp_world_size)
+
+
+def build_training_dataloader(
+    cfg: LLMTunerConfig, *, parallel_dims: ParallelTopology | None
+) -> BaseDataLoader:
+    """Build a checkpointable loader with an explicit rank and token budget."""
+    dp_rank, dp_world_size = resolve_data_parallel_rank(parallel_dims)
+    batch_size = resolve_batch_size_per_rank(cfg, dp_world_size)
+    return build_dataset_dataloader(
+        cfg,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        num_tokens_per_batch=batch_size * cfg.max_seq_len,
+    )
+
+
 def build_dataloader(self: Trainer) -> BaseDataLoader:
-    """Build a checkpointable loader with this rank's token budget."""
+    """Retain public rank/batch overrides at the Trainer compatibility boundary."""
     dp_rank, dp_world_size = self.dp_rank_world_size()
-    batch_size_per_rank = self.batch_size_per_rank(dp_world_size)
+    batch_size = self.batch_size_per_rank(dp_world_size)
     return build_dataset_dataloader(
         self.cfg,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
-        # The dataset builder owns DP sharding; the loader batches the local
-        # graph. Its token budget must therefore use this rank's batch size.
-        num_tokens_per_batch=batch_size_per_rank * self.cfg.max_seq_len,
+        num_tokens_per_batch=batch_size * self.cfg.max_seq_len,
     )
 
 
@@ -209,47 +229,77 @@ def microbatch(self: Trainer, batch: Batch | TrainerBatch) -> dict[str, Any]:
 
 
 def to_device(self: Trainer, batch: Batch | TrainerBatch) -> Batch | TrainerBatch:
-    """Move a consumption group's top-level tensors, preserving batch metadata."""
+    """Compatibility wrapper for the Trainer's public batch-transfer method."""
+    return move_batch_to_device(batch, self.device)
+
+
+def move_batch_to_device(
+    batch: Batch | TrainerBatch, device: torch.device
+) -> Batch | TrainerBatch:
+    """Move top-level tensors at consumption, preserving batch metadata."""
     if isinstance(batch, dict):
         return {
-            key: value.to(self.device, non_blocking=True)
+            key: value.to(device, non_blocking=True)
             if isinstance(value, torch.Tensor)
             else value
             for key, value in batch.items()
         }
     return Batch(
-        input_ids=batch.input_ids.to(self.device, non_blocking=True),
-        labels=batch.labels.to(self.device, non_blocking=True),
+        input_ids=batch.input_ids.to(device, non_blocking=True),
+        labels=batch.labels.to(device, non_blocking=True),
     )
 
 
 def preprocess(
     self: Trainer, batch: Batch | TrainerBatch
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-    """Move the batch and ask the explicit model to prepare its inputs.
+    """Compatibility wrapper using the Trainer's declared example model."""
+    cfg = getattr(self, "cfg", None)
+    return prepare_model_inputs(
+        self.example_model,
+        batch,
+        device=getattr(self, "device", None),
+        parallel_dims=getattr(self, "parallel_dims", None),
+        max_context_length=cfg.max_seq_len if cfg is not None else 1,
+        transfer_batch=getattr(self, "to_device", None),
+    )
 
-    Remove collator token-count metadata before model preprocessing. Transfer
-    occurs at consumption so unread accumulation groups stay in host memory.
-    ``prepare_inputs`` is the required explicit-model I/O contract; model
-    ownership errors must not be hidden by a deleted adapter's legacy method.
+
+def prepare_model_inputs(
+    model: torch.nn.Module,
+    batch: Batch | TrainerBatch,
+    *,
+    device: torch.device | None,
+    parallel_dims: Any,
+    max_context_length: int,
+    transfer_batch: Callable[[Batch | TrainerBatch], Batch | TrainerBatch]
+    | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Connect a batch to the explicit model's input contract.
+
+    Collator token counts are not model inputs. Unread accumulation groups stay
+    on the host until this function consumes them.
     """
     if isinstance(batch, dict):
         batch = {
             key: value for key, value in batch.items() if key != "num_valid_tokens"
         }
-    prepare_inputs = getattr(self.example_model, "prepare_inputs", None)
+    prepare_inputs = getattr(model, "prepare_inputs", None)
     if not callable(prepare_inputs):
         raise TypeError(
-            f"{type(self.example_model).__name__} must implement "
+            f"{type(model).__name__} must implement "
             "prepare_inputs(batch, parallel_dims=..., max_context_length=...)"
         )
-    # Input normalization builds local masks and slices already-replicated
-    # inputs; attention collectives start only in model execution after this
-    # boundary.
+    if transfer_batch is None:
+        if device is None:
+            raise ValueError("device is required when transfer_batch is not provided")
+
+        def transfer_batch(value: Batch | TrainerBatch) -> Batch | TrainerBatch:
+            return move_batch_to_device(value, device)
+
     with synchronize_local_errors("Training batch preprocessing"):
-        result = prepare_inputs(
-            self.to_device(batch),
-            parallel_dims=self.parallel_dims,
-            max_context_length=self.cfg.max_seq_len,
+        return prepare_inputs(
+            transfer_batch(batch),
+            parallel_dims=parallel_dims,
+            max_context_length=max_context_length,
         )
-    return result

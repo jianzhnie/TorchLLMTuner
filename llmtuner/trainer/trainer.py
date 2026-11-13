@@ -1,9 +1,8 @@
 """Training loop and stable Trainer interface.
 
-``runtime.assembly`` assembles runtime state, ``runtime.batch`` prepares
-inputs, ``runtime.pipeline`` drives PP schedules, and ``runtime.validation``
-evaluates. This module owns optimizer steps, gradient checks, loss reductions,
-checkpoint counters, and the outer training loop.
+``runtime.assembly`` assembles runtime state, ``runtime.engine`` executes
+model and update steps, and ``runtime.validation`` evaluates. This module owns
+gradient checks, loss reductions, checkpoint counters, and the outer loop.
 
 Step order matters: read every accumulation batch, reduce the whole-batch
 valid-token count over DP, run forward/backward with that denominator, clip
@@ -35,14 +34,10 @@ from ..accelerator.collectives import (
     set_pg_timeouts,
     synchronize_local_errors,
 )
-from ..accelerator.spmd import spmd_context
 from ..components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
-from ..components.loss import (
-    chunked_lm_head_cross_entropy,
-    cross_entropy_loss,
-)
+from ..components.loss import cross_entropy_loss
 from ..components.metrics import MetricsProcessor
 from ..components.optimizer.ema import EMA
 from ..components.optimizer.lr_scheduler import LRSchedulersContainer
@@ -63,7 +58,7 @@ from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
 from ..utils.logging import get_logger
 from ..utils.seeding import rollback_execution_settings_on_error, seed_everything
-from .runtime import assembly, gradients, pipeline
+from .runtime import assembly, engine, gradients, pipeline
 from .runtime import batch as batch_runtime
 from .runtime import metrics as metrics_runtime
 from .runtime import validation as validation_runtime
@@ -93,11 +88,14 @@ class Trainer:
     mesh: DeviceMesh | None
     model: torch.nn.Module | None
     model_parts: list[torch.nn.Module]
+    model_assembly: assembly.ModelAssembly
+    optimizer_stack: assembly.OptimizerStack
     pp_schedule: Any | None
     pp_has_first_stage: bool
     pp_has_last_stage: bool
     _pp_loss_sentinel: torch.Tensor | None
     _chunked_loss_num_chunks: int
+    training_engine: engine.TrainingEngine
     optimizer: torch.optim.Optimizer
     # None denotes incomplete assembly; data_iterator rejects it explicitly.
     # Defaults also let close() safely handle partial initialization failures.
@@ -214,44 +212,23 @@ class Trainer:
         """
         return batch_runtime.preprocess(self, batch)
 
+    def _execution_engine(self) -> engine.TrainingEngine:
+        """Return the fixed execution strategy, including for legacy test doubles."""
+        execution_engine = getattr(self, "training_engine", None)
+        if execution_engine is None:
+            execution_engine = assembly.build_training_engine(self)
+            self.training_engine = execution_engine
+        return execution_engine
+
     def forward_backward_step(
         self,
         microbatch: dict[str, Any],
         *,
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """Run one accumulation group's forward and backward; return its loss sum.
-
-        A *group*, not a micro-batch: with pipeline parallelism one group is one
-        schedule step, which internally drives several micro-batches.
-
-        The returned tensor is the **un-normalized** token sum. The division by
-        ``global_valid_tokens`` happens inside this call's graph, so the
-        gradients are normalized already; ``train_step`` applies it again when
-        it reports. torchtitan normalizes inside its ``loss_fn`` and returns the
-        normalized value instead -- the numbers agree either way, but the tensor
-        that comes back from here is *not* an average.
-
-        Two bodies, matching torchtitan's split. The PP one takes the raw batch
-        and calls ``prepare_inputs`` itself, once per schedule micro-batch;
-        the non-PP one preprocesses here, because it has exactly one.
-
-        ``global_valid_tokens`` is the step's denominator, reduced across the DP
-        axis. It is passed in rather than computed here because it must be the
-        *same* number for every group of the step -- under gradient
-        accumulation the count only exists once all of them have been read, so
-        the caller reduces it first and hands it down.
-        """
-        if self.parallel_dims is not None and self.parallel_dims.pp_enabled:
-            return self.pp_forward_backward_body(
-                microbatch["batch"], global_valid_tokens=global_valid_tokens
-            )
-        inputs, labels, extra_kwargs = self.preprocess(microbatch["batch"])
-        return self._forward_backward_body(
-            inputs,
-            labels,
-            extra_kwargs=extra_kwargs,
-            global_valid_tokens=global_valid_tokens,
+        """Delegate one accumulation group and return its unnormalized loss sum."""
+        return self._execution_engine().forward_backward(
+            microbatch["batch"], global_valid_tokens=global_valid_tokens
         )
 
     def _forward_backward_body(
@@ -262,99 +239,23 @@ class Trainer:
         extra_kwargs: dict[str, Any],
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        # ``spmd_context`` is what makes a process group answerable *by name*
-        # (``spmd_mesh_group("tp")`` and friends) for the duration of the body.
-        # It is entered here, around the forward/backward only, because that is
-        # the region whose components read the ambient mesh -- the optimizer and
-        # the checkpointers take their groups as arguments. On a single process
-        # it is a no-op, so the same code runs from one device to a full mesh.
-        with self.param_context(), spmd_context(self.parallel_dims):
-            if self._chunked_loss_num_chunks > 1:
-                # Chunked loss: the forward skips lm_head and returns hidden
-                # states; lm_head + cross-entropy then run per sequence chunk,
-                # so the peak logits memory is 1/num_chunks of the full T*V
-                # tensor. The call runs the backward itself (per chunk, scaled
-                # by 1/global_valid_tokens -- the same normalization the
-                # non-chunked path applies inside the graph) and returns the
-                # detached sum.
-                hidden_states = self.model(inputs, **extra_kwargs, skip_lm_head=True)
-                hidden_states = self._model_output_value(
-                    hidden_states, field="last_hidden_state"
-                )
-                return chunked_lm_head_cross_entropy(
-                    self.model.lm_head,
-                    hidden_states,
-                    labels,
-                    num_chunks=self._chunked_loss_num_chunks,
-                    grad_scale=1.0 / global_valid_tokens,
-                    **self.loss_vocab_kwargs(),
-                )
-            logits = self._model_output_value(self.model(inputs, **extra_kwargs))
-            loss_sum = self.loss_sum(logits, labels, **self.loss_vocab_kwargs())
-            del logits
-            # Normalize BEFORE backward, while the sum is still differentiable.
-            # Dividing after backwarding the raw sum would work for a single
-            # group but not under accumulation: gradients add, so N groups each
-            # having backpropped an un-normalized sum would have to be rescaled
-            # afterwards, and the intermediate buffers (`clip_grad_norm_`'s
-            # norm) would already have been computed from the wrong values.
-            # Dividing here, inside the graph, is also what keeps the backward
-            # numerically identical to `loss.backward()` on a pre-divided loss
-            # -- it is the division that is linear, not an extra op.
-            (loss_sum / global_valid_tokens).backward()
-        return loss_sum.detach()
+        """Compatibility entry point for direct dense execution callers."""
+        return self._execution_engine().forward_backward_dense(
+            inputs,
+            labels,
+            extra_kwargs=extra_kwargs,
+            global_valid_tokens=global_valid_tokens,
+        )
 
     @staticmethod
     def _model_output_value(output: Any, *, field: str = "logits") -> torch.Tensor:
-        """Normalize explicit model outputs at the Trainer I/O boundary.
-
-        Explicit models may return a tensor or a Transformers-compatible
-        ``ModelOutput``. The Trainer owns loss accounting, so it consumes the
-        declared tensor field once here instead of forcing every model to
-        duplicate a training-only return type.
-        """
-        if isinstance(output, torch.Tensor):
-            return output
-        value = getattr(output, field, None)
-        if isinstance(value, torch.Tensor):
-            return value
-        raise TypeError(
-            f"Model output must be a Tensor or expose tensor .{field}; got "
-            f"{type(output).__name__}"
-        )
+        return engine.model_output_value(output, field=field)
 
     def loss_vocab_kwargs(self) -> dict[str, Any]:
-        """The vocab-parallel arguments for the loss seam, when TP is on.
-
-        Both are handed to :func:`cross_entropy_loss`, which selects the
-        vocab-sharded path when the local logits width differs from the global
-        vocabulary size. A replicated lm_head takes the plain loss path; a
-        TP-sharded head uses the TP group for distributed cross entropy.
-
-        ``global_vocab_size`` is read from the model rather than from
-        ``cfg.model.vocab_size``: the head is built against the HF config's
-        number (which wins for a hub id and for a local checkpoint directory,
-        and which the config field may never have been filled from), and that
-        is the only value that keeps a replicated head on the plain path.
-
-        Empty when there is no model in hand (the ``pp > 1`` body drives the
-        schedule's own loss, which carries its own copy of these) or no TP axis
-        to reduce across.
-        """
-        tp_mesh = (
-            None
-            if self.parallel_dims is None or self.model is None
-            else self.parallel_dims.get_optional_mesh("tp")
-        )
-        # ``getattr`` rather than an attribute read: a test double for the
-        # model is often a plain module, and the missing vocabulary must fall
-        # back to the plain loss rather than raise.
-        vocab_size = (
-            None if self.model is None else getattr(self.model, "vocab_size", None)
-        )
-        if tp_mesh is None or vocab_size is None:
+        """Return the execution engine's vocab-parallel loss arguments."""
+        if self.model is None:
             return {}
-        return {"tp_group": tp_mesh.get_group(), "global_vocab_size": vocab_size}
+        return self._execution_engine().loss_vocab_kwargs()
 
     @staticmethod
     def loss_sum(
@@ -586,17 +487,7 @@ class Trainer:
             if should_log
             else {}
         )
-        self.optimizer.step()
-        # Advance the scheduler after the optimizer uses the current rate.
-        # Agree on failure before EMA or reporting collectives. The optimizer
-        # update is already committed and cannot be rolled back here.
-        with synchronize_local_errors("Training scheduler update"):
-            self.lr_scheduler.step()
-        with synchronize_local_errors("Training EMA update"):
-            if self.ema is not None:
-                # EMA validates fixed layouts and updates only local storage.
-                # All ranks enter, including PP stages with no tracked tensors.
-                self.ema.step(self.step)
+        self._execution_engine().optimizer_step(self.step)
 
         if not should_log:
             return None
