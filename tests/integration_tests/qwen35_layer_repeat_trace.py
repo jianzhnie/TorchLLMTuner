@@ -32,10 +32,8 @@ def run(args, report):
         hf_experts_implementation="pre_down",
         hf_router_compute_dtype="production-float32",
         hf_moe_graph="native",
-        hf_gdn_numerical_policy="split_qkv_fp32_norm",
         hf_gdn_qkv_projections="native",
         hf_gdn_norm_cast="native",
-        hf_gdn_deterministic_reduction=args.hf_gdn_deterministic_reduction,
     )
     hf, reference, adapter = layer.models(options)
     hook_ids = [
@@ -49,12 +47,6 @@ def run(args, report):
         for module in (layer, moe, gdn_numerics)
     }
     report["cases"] = ["production", "manual", "production-no-validation-hook"]
-    report["hf_gdn_deterministic_reduction"] = args.hf_gdn_deterministic_reduction
-    if args.hf_gdn_deterministic_reduction:
-        kernel_path = (
-            Path(__file__).resolve().parents[2] / "llmtuner/accelerator/gated_delta.py"
-        )
-        report["sources"][str(kernel_path)] = layer.file_hash(kernel_path)
     if args.cpu_check:
         report["status"] = "CPU_META_ONLY_NOT_NUMERICAL_ACCEPTANCE"
         return

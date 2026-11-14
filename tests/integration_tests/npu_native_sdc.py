@@ -41,11 +41,11 @@ def main() -> None:
     )
     initial = {
         name: value.detach().cpu().clone()
-        for name, value in trainer.example_model.state_dict().items()
+        for name, value in trainer.training_engine.model.state_dict().items()
     }
     try:
         trainer.train()
-        updated = trainer.example_model.state_dict()
+        updated = trainer.training_engine.model.state_dict()
         assert any(
             not torch.equal(value.detach().cpu(), initial[name])
             for name, value in updated.items()

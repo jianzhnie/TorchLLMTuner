@@ -40,6 +40,7 @@ def run_case(*, device, latent, activation, empty):
     )
     model = nn.Module()
     layer = nn.Module()
+    layer.moe_block_name = "block_sparse_moe"
     source = KimiSparseMoE(config).to(device).eval()
     reference = deepcopy(source)
     layer.block_sparse_moe = source
@@ -115,6 +116,7 @@ def run_case(*, device, latent, activation, empty):
         torch.testing.assert_close(exported[key], reference_state[key], atol=0, rtol=0)
     fresh = nn.Module()
     fresh_layer = nn.Module()
+    fresh_layer.moe_block_name = "block_sparse_moe"
     fresh_layer.block_sparse_moe = KimiSparseMoE(config).to(device).eval()
     fresh.layers = nn.ModuleList([fresh_layer])
     swap_moe_blocks(fresh, ep_group=dist.group.WORLD)

@@ -85,7 +85,6 @@ def main():
         "scope": "reference operator repeat only; not candidate acceptance",
         "autograd_multithreading": torch.autograd.is_multithreading_enabled(),
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
-        "candidate_deterministic": args.candidate_deterministic,
     }
     try:
         torch.save(inputs, args.output / "inputs.pt")
@@ -125,53 +124,6 @@ def main():
             (args.output / "report.json").write_text(
                 json.dumps(report, indent=2) + "\n"
             )
-        if args.candidate_deterministic:
-            candidate_module = importlib.import_module(
-                "llmtuner.accelerator.gated_delta"
-            )
-            candidate_source = Path(candidate_module.__file__)
-            report["candidate_source"] = {
-                "path": str(candidate_source),
-                "sha256": file_hash(candidate_source),
-            }
-
-            def candidate(*values):
-                return candidate_module.gated_delta_rule(
-                    *values, deterministic_reduction=True
-                )
-
-            candidate_first = None
-            report["candidate_repeats"] = {}
-            for repeat in range(args.repeats):
-                result = evaluate(candidate, device_inputs)
-                torch.save(result, args.output / f"candidate-repeat{repeat}.pt")
-                assert all(result[key].dtype == first[key].dtype for key in result)
-                entry = {
-                    "tensors": {
-                        key: descriptor(value) for key, value in result.items()
-                    },
-                    "finite": all(
-                        bool(torch.isfinite(value).all()) for value in result.values()
-                    ),
-                    "nonzero": {
-                        key: bool(torch.count_nonzero(value))
-                        for key, value in result.items()
-                    },
-                    "vs_reference_repeat0": {
-                        key: compare_branch(value, first[key])
-                        for key, value in result.items()
-                    },
-                }
-                if candidate_first is not None:
-                    entry["vs_candidate_repeat0"] = {
-                        key: compare_branch(value, candidate_first[key])
-                        for key, value in result.items()
-                    }
-                candidate_first = result if candidate_first is None else candidate_first
-                report["candidate_repeats"][str(repeat)] = entry
-                (args.output / "report.json").write_text(
-                    json.dumps(report, indent=2) + "\n"
-                )
         report["status"] = "operator_repeat_complete_not_candidate_acceptance"
     finally:
         (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")

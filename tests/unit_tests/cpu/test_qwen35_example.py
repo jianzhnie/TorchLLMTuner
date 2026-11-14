@@ -67,13 +67,10 @@ def test_recipe_layer_reduction_keeps_other_dimensions(tmp_path):
     assert actual.num_experts == original.num_experts
 
 
-@pytest.mark.parametrize("backend", ["native", "npu_triton"])
-def test_recipe_propagates_explicit_linear_attention_backend(tmp_path, backend):
-    args = recipe_args(tmp_path)
-    args.linear_attention_backend = backend
-    config = build_config(args)
-    assert config.model.linear_attention_backend == backend
-    assert build_model_config_for(config).linear_attention_backend == backend
+def test_recipe_uses_native_linear_attention_backend(tmp_path):
+    config = build_config(recipe_args(tmp_path))
+    assert config.model.linear_attention_backend == "native"
+    assert build_model_config_for(config).linear_attention_backend == "native"
 
 
 @pytest.mark.parametrize("implementation", ["native", "pre_down"])
@@ -84,29 +81,6 @@ def test_recipe_preserves_explicit_expert_arithmetic_policy(tmp_path, implementa
     assert config.model.experts_implementation == implementation
     assert build_model_config_for(config).experts_implementation == implementation
     assert config.model.router_compute_dtype is None
-
-
-@pytest.mark.parametrize("policy", ["native", "split_qkv_fp32_norm"])
-def test_recipe_gdn_policy_is_independent_of_recurrence_backend(tmp_path, policy):
-    args = recipe_args(tmp_path)
-    args.gdn_numerical_policy = policy
-    config = build_config(args)
-    actual = build_model_config_for(config)
-    assert config.model.gdn_numerical_policy == actual.gdn_numerical_policy == policy
-    assert config.model.linear_attention_backend == "native"
-    assert actual.linear_attention_backend == "native"
-
-
-def test_recipe_right_padding_requires_both_explicit_gdn_policies(tmp_path):
-    args = recipe_args(tmp_path)
-    args.gdn_allow_right_padding = True
-    with pytest.raises(ConfigError, match="npu_triton"):
-        build_config(args)
-    args.linear_attention_backend = "npu_triton"
-    args.gdn_numerical_policy = "split_qkv_fp32_norm"
-    config = build_config(args)
-    assert config.model.gdn_allow_right_padding is True
-    assert build_model_config_for(config).gdn_allow_right_padding is True
 
 
 def test_recipe_fp32_router_is_explicit_and_reaches_hf_config(tmp_path):
@@ -188,9 +162,8 @@ def test_recipe_rejects_unsupported_gdn_topology_before_training(tmp_path):
     args = recipe_args(tmp_path)
     args.linear_attention_backend = "npu_triton"
     args.tp = 2
-    config = build_config(args)
-    with pytest.raises(ValueError, match="npu_triton"):
-        Qwen3_5MoeForCausalLM(build_model_config_for(config))
+    with pytest.raises(ConfigError, match="linear_attention_backend must be native"):
+        build_config(args)
 
 
 @pytest.mark.parametrize("mode", ["none", "full"])
@@ -210,12 +183,6 @@ def test_shared_cli_retains_explicit_numerical_and_topology_choices(tmp_path):
             "data.jsonl",
             "--output",
             "run",
-            "--linear-attention-backend",
-            "npu_triton",
-            "--gdn-numerical-policy",
-            "split_qkv_fp32_norm",
-            "--gdn-allow-right-padding",
-            "--gdn-deterministic-reduction",
             "--router-compute-dtype",
             "float32",
             "--dp-shard",
@@ -223,10 +190,7 @@ def test_shared_cli_retains_explicit_numerical_and_topology_choices(tmp_path):
         ]
     )
     config = build_config(args)
-    assert config.model.linear_attention_backend == "npu_triton"
-    assert config.model.gdn_numerical_policy == "split_qkv_fp32_norm"
-    assert config.model.gdn_allow_right_padding
-    assert config.model.gdn_deterministic_reduction
+    assert config.model.linear_attention_backend == "native"
     assert config.model.router_compute_dtype == "float32"
     assert config.parallel.data_parallel_shard_size == 8
 

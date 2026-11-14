@@ -11,7 +11,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 )
 
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
-from llmtuner.parallel.expert_parallel.model_replacement import resolve_ep_plan
+from llmtuner.parallel.expert_parallel.plan import resolve_ep_plan
 
 
 def model_config(**kwargs):

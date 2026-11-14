@@ -83,8 +83,6 @@ def test_experimental_hf_model_native_forward_backward_without_cp(monkeypatch):
         ("norm_backend", "npu"),
         ("qkv_projection", "fused"),
         ("rotary_compute_dtype", "float32"),
-        ("linear_attention_backend", "npu_triton"),
-        ("gdn_numerical_policy", "float32"),
         ("experts_implementation", "torchtitan"),
         ("experts_implementation", "pre_down"),
     ],

@@ -116,7 +116,7 @@ def test_sharded_weights_reconstruct_the_original() -> None:
 
 def test_plan_resolution_from_hf_string_map() -> None:
     class M(nn.Module):
-        _tp_config = {
+        tp_config = {
             "layers.*.q_proj": "colwise",
             "layers.*.o_proj": "rowwise",
         }
@@ -289,25 +289,6 @@ def test_target_resolution_applies_configured_pattern_overrides():
     assert not moe_blocks
 
 
-def test_plan_resolution_prefers_the_tp_config_property_over_the_attribute() -> None:
-    """A wrapper that re-parents the model must win over the raw attribute.
-
-    ``HFTransformerModel`` holds the HF model under ``self.model``, so its module
-    paths carry a ``model.`` prefix the raw HF plan does not. Reading ``_tp_config``
-    off such a wrapper yields patterns that match nothing.
-    """
-
-    class Wrapper(nn.Module):
-        _tp_config = {"layers.*.q_proj": "colwise"}
-
-        @property
-        def tp_config(self) -> dict[str, str]:
-            return {"model.layers.*.q_proj": "colwise"}
-
-    plan = resolve_tp_sharding_plan(Wrapper(), plan=None)
-    assert set(plan) == {"model.layers.*.q_proj"}
-
-
 def test_a_wrapper_tp_config_matches_the_modules_it_exposes() -> None:
     """The regression this locks in: TP matched 0 of 15 projections.
 
@@ -444,7 +425,7 @@ def test_apply_tp_raises_when_the_plan_matches_no_module() -> None:
     """A plan that matches nothing is the same silent-replication failure."""
 
     class Model(nn.Module):
-        _tp_config = {"*.q_proj": "colwise"}
+        tp_config = {"*.q_proj": "colwise"}
 
         def __init__(self) -> None:
             super().__init__()
@@ -553,7 +534,7 @@ def test_explicit_tp_pattern_overrides_default_wildcard(monkeypatch):
     from llmtuner.parallel.tensor_parallel import tensor_parallel as tp_module
 
     model = nn.Sequential(nn.Linear(4, 4, bias=False))
-    model._tp_config = {"*": "colwise"}
+    model.tp_config = {"*": "colwise"}
     mesh = {
         "tp": SimpleNamespace(
             get_group=lambda: object(), size=lambda: 2, get_local_rank=lambda: 0

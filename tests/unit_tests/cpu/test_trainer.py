@@ -98,7 +98,12 @@ def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_
 
     trainer = Trainer.__new__(Trainer)
     trainer.metrics = SimpleNamespace(add_valid_tokens=lambda count: None)
-    trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1, max_norm=1.0)
+    trainer.cfg = SimpleNamespace(
+        gradient_accumulation_steps=1,
+        max_norm=1.0,
+        grad_norm_precision="float32",
+        parallel=ParallelConfig(),
+    )
     trainer.parallel_dims = None
     trainer.device = torch.device("cpu")
     trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
@@ -168,7 +173,12 @@ def test_nonfinite_step_preserves_model_optimizer_scheduler_and_ema(invalid):
     )
     trainer = Trainer.__new__(Trainer)
     trainer.metrics = SimpleNamespace(add_valid_tokens=lambda count: None)
-    trainer.cfg = SimpleNamespace(gradient_accumulation_steps=1, max_norm=1.0)
+    trainer.cfg = SimpleNamespace(
+        gradient_accumulation_steps=1,
+        max_norm=1.0,
+        grad_norm_precision="float32",
+        parallel=ParallelConfig(),
+    )
     trainer.parallel_dims = None
     trainer.device = torch.device("cpu")
     trainer.model_parts = [model]
@@ -1900,7 +1910,7 @@ def test_failed_trainer_construction_releases_partial_resources(
         self.checkpointer = SimpleNamespace(close=close)
         raise assembly_error("assembly failed")
 
-    monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+    monkeypatch.setattr(module.Trainer, "_assemble_runtime", assemble)
     with pytest.raises(assembly_error, match="assembly failed"):
         module.Trainer(SimpleNamespace())
     assert calls == ["checkpointer", "metrics"]
@@ -2681,7 +2691,7 @@ def test_failed_trainer_construction_restores_execution_settings(monkeypatch, fa
             self.seed_everything(73, deterministic=True, detect_anomaly=True)
             raise original
 
-        monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+        monkeypatch.setattr(module.Trainer, "_assemble_runtime", assemble)
         with pytest.raises(failure) as caught:
             Trainer(SimpleNamespace())
         assert caught.value is original
@@ -2713,7 +2723,7 @@ def test_successful_trainer_construction_keeps_execution_settings(monkeypatch):
         def assemble(self, cfg):
             self.seed_everything(73, deterministic=True, detect_anomaly=True)
 
-        monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+        monkeypatch.setattr(module.Trainer, "_assemble_runtime", assemble)
         Trainer(SimpleNamespace())
         assert torch.are_deterministic_algorithms_enabled()
         assert torch.is_anomaly_enabled()
@@ -2752,7 +2762,7 @@ def test_failed_trainer_construction_restores_host_rng(
         self.metrics = SimpleNamespace(close=close)
         raise original
 
-    monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+    monkeypatch.setattr(module.Trainer, "_assemble_runtime", assemble)
     try:
         with pytest.raises(failure) as caught:
             Trainer(SimpleNamespace())
@@ -2797,7 +2807,7 @@ def test_failed_trainer_restores_compile_policy_after_successful_compile(
         raise original
 
     monkeypatch.setattr(model_compile, "collect_moe_layers", lambda model: [object()])
-    monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+    monkeypatch.setattr(module.Trainer, "_assemble_runtime", assemble)
     try:
         torch._dynamo.config.capture_scalar_outputs = False
         inductor_config._micro_pipeline_tp = False
@@ -3018,8 +3028,6 @@ def test_microbatch_failure_does_not_advance_checkpointed_token_counter(phase):
 def test_failed_assembly_restores_activation_memory_budget(monkeypatch, error_type):
     import torch._functorch.config as functorch_config
 
-    from llmtuner.trainer.runtime import assembly
-
     original = functorch_config.activation_memory_budget
     failure = error_type("assembly failed after applying memory budget")
 
@@ -3027,7 +3035,7 @@ def test_failed_assembly_restores_activation_memory_budget(monkeypatch, error_ty
         functorch_config.activation_memory_budget = 0.25
         raise failure
 
-    monkeypatch.setattr(assembly, "assemble_trainer_runtime", assemble)
+    monkeypatch.setattr(Trainer, "_assemble_runtime", assemble)
     try:
         with pytest.raises(error_type) as caught:
             Trainer(SimpleNamespace(training=SimpleNamespace(compile=True)))
@@ -3305,7 +3313,7 @@ def test_construction_preserves_assembly_error_when_cleanup_reporting_fails(
     def report(*args, **kwargs):
         raise report_error("secondary reporting failure")
 
-    monkeypatch.setattr(module.assembly, "assemble_trainer_runtime", assemble)
+    monkeypatch.setattr(module.Trainer, "_assemble_runtime", assemble)
     monkeypatch.setattr(module.logger, "exception", report)
     with pytest.raises(ValueError) as caught:
         module.Trainer(SimpleNamespace())

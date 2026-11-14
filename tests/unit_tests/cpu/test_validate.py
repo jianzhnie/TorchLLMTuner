@@ -22,6 +22,7 @@ import torch
 
 from llmtuner.components.loss import IGNORE_INDEX
 from llmtuner.config import LLMTunerConfig, TrainingConfig, ValidationConfig
+from llmtuner.models.common.validation import temporary_attention_mask
 from llmtuner.trainer.runtime.engine import TrainingEngine
 
 
@@ -40,7 +41,7 @@ def test_validation_preserves_training_random_streams(monkeypatch, failed):
     np.random.set_state(numpy_state)
     torch.set_rng_state(torch_state)
 
-    def random_pass(*args):
+    def random_pass(*args, **kwargs):
         random.random()
         np.random.random()
         torch.rand(17)
@@ -75,6 +76,7 @@ def test_validation_finishes_staging_before_forward_mutates_weights(monkeypatch)
     expected = embedding.weight.detach().clone()
     snapshot = {}
     trainer.model_parts = [embedding]
+    trainer.training_engine.model_parts = trainer.model_parts
     trainer.checkpointer = SimpleNamespace(
         maybe_wait_for_staging=lambda: snapshot.update(
             weight=embedding.weight.detach().clone()
@@ -83,7 +85,7 @@ def test_validation_finishes_staging_before_forward_mutates_weights(monkeypatch)
     monkeypatch.setattr(
         validation_runtime,
         "run_validation_loop",
-        lambda *args: embedding(torch.tensor([0, 1])),
+        lambda *args, **kwargs: embedding(torch.tensor([0, 1])),
     )
     trainer.validate(1)
     torch.testing.assert_close(snapshot["weight"], expected, rtol=0, atol=0)
@@ -126,7 +128,8 @@ def test_validation_rejects_nonfinite_loss_before_logging(loss, monkeypatch):
     )
     with pytest.raises(FloatingPointError, match="not finite at step 7"):
         finalize_validation(
-            trainer,
+            metrics=trainer.metrics,
+            error_group=trainer.error_group,
             num_steps=1,
             accumulated_loss=torch.tensor(loss),
             total_global_valid_tokens=torch.tensor(2),
@@ -156,8 +159,12 @@ class _EchoModel(torch.nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self.model = SimpleNamespace(config=SimpleNamespace())
         self.saw_eval_mode: bool | None = None
         self.saw_num_valid_tokens_kwarg = False
+
+    def validation_context(self, *, mask_type):
+        return temporary_attention_mask(self.model.config, mask_type=mask_type)
 
     def prepare_inputs(self, batch, *, parallel_dims, max_context_length=None):
         if "num_valid_tokens" in batch:
@@ -199,6 +206,15 @@ def _make_trainer(
     trainer.device = torch.device("cpu")
     trainer.model = model if model is not None else _EchoModel()
     trainer.model_parts = [trainer.model]
+    trainer.training_engine = TrainingEngine(
+        model_parts=trainer.model_parts,
+        parallel_dims=trainer.parallel_dims,
+        device=trainer.device,
+        max_context_length=cfg.max_seq_len,
+        chunked_loss_num_chunks=1,
+        param_context=trainer.param_context,
+        loss_sum=trainer.loss_sum,
+    )
     trainer.checkpointer = None
     trainer.ntokens_seen = 7
     logged: dict[str, Any] = {}
@@ -523,7 +539,7 @@ def test_validate_restores_existing_and_absent_gradients(monkeypatch, fail):
     )
     trainer.model_parts.append(other_part)
 
-    def clear_gradients(*args):
+    def clear_gradients(*args, **kwargs):
         model.existing.grad = None
         model.absent.grad = torch.ones_like(model.absent)
         other_part.weight.grad = None
@@ -557,8 +573,8 @@ def test_validate_restores_mixed_module_modes(monkeypatch, fail) -> None:
         model=model,
     )
 
-    def run_validation_loop(active_trainer, validation, step):
-        assert active_trainer is trainer
+    def run_validation_loop(active_engine, **kwargs):
+        assert active_engine is trainer.training_engine
         assert not model.training
         assert not model.frozen.training
         if fail:
@@ -602,7 +618,7 @@ def test_validate_restores_modes_after_partial_eval_setup(monkeypatch, error_typ
     model.model = SimpleNamespace(config=config)
     modes = {module: module.training for module in model.modules()}
 
-    def unexpected(*args):
+    def unexpected(*args, **kwargs):
         pytest.fail("validation loop ran after eval setup failed")
 
     monkeypatch.setattr(validation_runtime, "run_validation_loop", unexpected)
@@ -641,7 +657,7 @@ def test_validation_override_restores_training_attention_mask(
     other_part.model = SimpleNamespace(config=config)
     trainer.model_parts.append(other_part)
 
-    def run_loop(active_trainer, validation, step):
+    def run_loop(active_engine, **kwargs):
         assert config.attn_mask_type == expected
         if fail:
             raise RuntimeError("validation failed")
@@ -669,7 +685,7 @@ def test_kcp_rejects_packed_validation_before_loop(monkeypatch):
     trainer.cfg.parallel.context_parallel_kcp_size = 2
     trainer.cfg.parallel.cp_config.context_parallel_strategy = "kcp"
 
-    def unexpected(*args):
+    def unexpected(*args, **kwargs):
         pytest.fail("KCP packed validation must fail before constructing a loader")
 
     monkeypatch.setattr(validation_runtime, "run_validation_loop", unexpected)
@@ -789,7 +805,14 @@ def test_pipeline_validation_cleanup_preserves_iteration_error(
         ValueError if iteration_fails else RuntimeError,
         match="iteration failed" if iteration_fails else "close failed",
     ) as caught:
-        validation_module.run_validation_loop(trainer, ValidationConfig(), 1)
+        validation_module.run_validation_loop(
+            trainer,
+            cfg=trainer.cfg,
+            metrics=None,
+            token_counter=lambda batch: 0,
+            validation=ValidationConfig(),
+            step=1,
+        )
     if iteration_fails:
         assert caught.value is original
     assert closed == [True]
@@ -824,6 +847,13 @@ def test_validation_closes_loader_after_token_allocation_failure(monkeypatch, pi
         device=torch.device("cpu"),
     )
     with pytest.raises(RuntimeError, match="token allocation failed") as caught:
-        validation_module.run_validation_loop(trainer, ValidationConfig(), 1)
+        validation_module.run_validation_loop(
+            trainer,
+            cfg=trainer.cfg,
+            metrics=None,
+            token_counter=lambda batch: 0,
+            validation=ValidationConfig(),
+            step=1,
+        )
     assert caught.value is original
     assert closed == [True]

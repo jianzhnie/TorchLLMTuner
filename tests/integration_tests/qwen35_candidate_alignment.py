@@ -840,9 +840,6 @@ def make_config(args: argparse.Namespace):
         linear_attention_backend=getattr(args, "linear_attention_backend", "native"),
         router_compute_dtype=getattr(args, "router_compute_dtype", None),
         experts_implementation=getattr(args, "experts_implementation", "native"),
-        gdn_numerical_policy=getattr(args, "gdn_numerical_policy", "native"),
-        gdn_allow_right_padding=getattr(args, "gdn_allow_right_padding", False),
-        gdn_deterministic_reduction=getattr(args, "gdn_deterministic_reduction", False),
         rotary_compute_dtype=getattr(args, "rotary_compute_dtype", None),
         rotary_cache_dtype=getattr(args, "rotary_cache_dtype", None),
         checkpoint_interval=50,
@@ -998,7 +995,6 @@ def source_contract(args: argparse.Namespace) -> dict:
         "llmtuner/models/hf/model_setup.py",
         "llmtuner/models/hf/materialization.py",
         "llmtuner/models/hf/state_dict_adapter.py",
-        "llmtuner/accelerator/gated_delta.py",
         "llmtuner/accelerator/collectives.py",
         "llmtuner/parallel/fully_shard_parallel/fully_shard_parallel.py",
         "llmtuner/parallel/fully_shard_parallel/plan.py",
@@ -1040,11 +1036,6 @@ def source_contract(args: argparse.Namespace) -> dict:
         "linear_attention_backend": getattr(args, "linear_attention_backend", "native"),
         "router_compute_dtype": getattr(args, "router_compute_dtype", None),
         "experts_implementation": getattr(args, "experts_implementation", "native"),
-        "gdn_numerical_policy": getattr(args, "gdn_numerical_policy", "native"),
-        "gdn_allow_right_padding": getattr(args, "gdn_allow_right_padding", False),
-        "gdn_deterministic_reduction": getattr(
-            args, "gdn_deterministic_reduction", False
-        ),
         "rotary_compute_dtype": getattr(args, "rotary_compute_dtype", None),
         "rotary_cache_dtype": getattr(args, "rotary_cache_dtype", None),
         "seed": 42,
@@ -1249,17 +1240,7 @@ def main() -> None:
         "--experts-implementation", choices=("native", "pre_down"), default="native"
     )
     parser.add_argument("--rotary-compute-dtype", choices=("float32",))
-    parser.add_argument(
-        "--gdn-numerical-policy",
-        choices=("native", "split_qkv_fp32_norm"),
-        default="native",
-    )
-    parser.add_argument("--gdn-allow-right-padding", action="store_true")
-    parser.add_argument("--gdn-deterministic-reduction", action="store_true")
     parser.add_argument("--rotary-cache-dtype", choices=("float32",))
-    parser.add_argument(
-        "--linear-attention-backend", choices=("native", "npu_triton"), default="native"
-    )
     parser.add_argument(
         "--lr", type=float, default=3e-4, help="Fixed AdamW LR for every update"
     )

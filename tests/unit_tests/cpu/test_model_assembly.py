@@ -10,6 +10,7 @@ from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
 from llmtuner.trainer.runtime import assembly
 from llmtuner.trainer.runtime import batch as batch_runtime
+from llmtuner.trainer.runtime.environment import RuntimeEnvironment
 from llmtuner.trainer.trainer import Trainer
 
 
@@ -361,13 +362,13 @@ def test_dataloader_factory_uses_explicit_rank_and_token_budget(monkeypatch) -> 
 
 def test_production_assembly_uses_explicit_dataloader_factory(monkeypatch):
     calls = []
-    original = assembly.build_training_dataloader
+    original = batch_runtime.build_training_dataloader
 
     def tracked(cfg, *, parallel_dims):
         calls.append((cfg, parallel_dims))
         return original(cfg, parallel_dims=parallel_dims)
 
-    monkeypatch.setattr(assembly, "build_training_dataloader", tracked)
+    monkeypatch.setattr(batch_runtime, "build_training_dataloader", tracked)
     cfg = LLMTunerConfig()
     cfg.model.arch_overrides.update(
         vocab_size=19,
@@ -460,7 +461,7 @@ def test_optimizer_factory_passes_explicit_coordination_group(monkeypatch):
 
 def test_model_preparation_counts_before_parameter_layout_changes(monkeypatch):
     cfg = LLMTunerConfig()
-    environment = assembly.RuntimeEnvironment(
+    environment = RuntimeEnvironment(
         rank=0,
         world_size=1,
         local_rank=0,

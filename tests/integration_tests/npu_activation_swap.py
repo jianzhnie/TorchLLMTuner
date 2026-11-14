@@ -75,7 +75,7 @@ def _run(
         ), "activation swap TP test has no TP projections"
     initial = {
         name: value.detach().cpu().clone()
-        for name, value in trainer.example_model.state_dict().items()
+        for name, value in trainer.training_engine.model.state_dict().items()
     }
     torch.npu.reset_peak_memory_stats()
     released_count = 0
@@ -108,7 +108,7 @@ def _run(
         metrics = activation_swap.activation_swap_metrics()
         updated = {
             name: value.detach().cpu().clone()
-            for name, value in trainer.example_model.state_dict().items()
+            for name, value in trainer.training_engine.model.state_dict().items()
         }
         assert any(
             not torch.equal(value, initial[name]) for name, value in updated.items()

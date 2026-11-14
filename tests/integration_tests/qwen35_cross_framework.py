@@ -276,12 +276,8 @@ def hf_production_options(args) -> dict:
         for key, value in {
             "router_compute_dtype": args.hf_router_compute_dtype,
             "experts_implementation": args.hf_experts_implementation,
-            "gdn_numerical_policy": getattr(args, "hf_gdn_numerical_policy", "native"),
             "linear_attention_backend": getattr(
                 args, "hf_linear_attention_backend", "native"
-            ),
-            "gdn_deterministic_reduction": getattr(
-                args, "hf_gdn_deterministic_reduction", False
             ),
             "rotary_compute_dtype": args.hf_rotary_compute_dtype,
             "rotary_cache_dtype": args.hf_rotary_cache_dtype,
@@ -386,17 +382,6 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 apply_linear_attention_backend,
             )
         }
-        if options.get("linear_attention_backend") == "npu_triton":
-            kernel_source = (
-                Path(apply_linear_attention_backend.__code__.co_filename)
-                .resolve()
-                .parents[2]
-                / "accelerator"
-                / "gated_delta.py"
-            )
-            contract["hf_production_sources"][str(kernel_source)] = file_hash(
-                kernel_source
-            )
     report["capture_contract"] = contract
     report["capture_artifacts"] = str(capture_dir)
     completion = capture_dir / "hf-complete.json"
@@ -831,18 +816,10 @@ def main() -> None:
         "--hf-experts-implementation", choices=("native", "pre_down"), default="native"
     )
     parser.add_argument("--hf-rotary-compute-dtype", choices=("float32",))
-    parser.add_argument(
-        "--hf-gdn-numerical-policy",
-        choices=("native", "split_qkv_fp32_norm"),
-        default="native",
-    )
     parser.add_argument("--hf-rotary-cache-dtype", choices=("float32", "bfloat16"))
     parser.add_argument(
-        "--hf-linear-attention-backend",
-        choices=("native", "npu_triton"),
-        default="native",
+        "--hf-linear-attention-backend", choices=("native",), default="native"
     )
-    parser.add_argument("--hf-gdn-deterministic-reduction", action="store_true")
     parser.add_argument(
         "--deterministic-algorithms",
         action="store_true",
@@ -902,10 +879,6 @@ def main() -> None:
         args.phase not in ("hf", "reference") or args.steps != 1
     ):
         parser.error("Layer cotangent capture requires single-step HF/reference")
-    if args.hf_gdn_deterministic_reduction and (
-        args.hf_linear_attention_backend != "npu_triton"
-    ):
-        parser.error("Deterministic GDN reduction requires npu_triton")
     if args.hf_linear_attention_backend != "native" and args.hf_gdn_kernel != "native":
         parser.error(
             "Production GDN backend cannot be overwritten by a reference kernel"

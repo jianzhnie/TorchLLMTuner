@@ -7,7 +7,7 @@ from transformers import AutoConfig, Qwen3MoeConfig
 
 from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.model_config import ModelConfig
-from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.errors import ConfigError
 from llmtuner.models import registry
 from llmtuner.models.configuration import (
     apply_runtime_config,
@@ -98,8 +98,8 @@ def test_rejected_runtime_backend_does_not_partially_mutate_config(backend, comp
     config.attn_mask_type = "saved-mask-policy"
     before = deepcopy(config.to_dict())
     cfg = LLMTunerConfig()
-    cfg.model.attention_backend = backend
-    with pytest.raises(UnsupportedCombinationError, match="attention_backend"):
+    with pytest.raises(ConfigError, match="attention_backend"):
+        cfg.model = ModelConfig(attention_backend=backend)
         apply_runtime_config(config, cfg)
     assert config.to_dict() == before
 

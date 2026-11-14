@@ -9,7 +9,6 @@ from torch import nn
 from llmtuner.components.loss import cross_entropy_loss
 from llmtuner.trainer.runtime.engine import (
     TrainingEngine,
-    evaluate_dense_batch,
     model_output_value,
 )
 
@@ -184,15 +183,16 @@ def test_dense_evaluation_preserves_context_and_injected_loss():
     model.prepare_inputs = prepare
     with torch.no_grad():
         expected = cross_entropy_loss(model(inputs).flatten(0, 1), labels.flatten()) * 2
-        result = evaluate_dense_batch(
-            model,
-            batch,
+        engine = TrainingEngine(
+            model_parts=[model],
             device=torch.device("cpu"),
             parallel_dims=None,
             max_context_length=16,
+            chunked_loss_num_chunks=1,
             param_context=context,
             loss_sum=loss,
         )
+        result = engine.evaluate(batch)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
     assert calls == ["prepare", "enter", "loss", "exit"]
     assert all(parameter.grad is None for parameter in model.parameters())

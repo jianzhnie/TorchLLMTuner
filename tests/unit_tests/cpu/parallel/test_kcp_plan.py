@@ -14,7 +14,9 @@ from llmtuner.parallel.context_parallel import kcp
 
 
 class KDA(nn.Module):
-    """Legacy raw layout sufficient for metadata resolution, not KDA execution."""
+    """Declared KDA layout for metadata resolution, not KDA execution."""
+
+    context_parallel_layout = "kda_state"
 
     def __init__(self) -> None:
         super().__init__()
@@ -26,9 +28,27 @@ class KDA(nn.Module):
         return value * self.weight
 
 
+def declared_kda_model(*attentions: nn.Module) -> nn.Module:
+    model = nn.Module()
+    model.layers = nn.ModuleList()
+    for attention in attentions:
+        layer = nn.Module()
+        layer.self_attn = attention
+        model.layers.append(layer)
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+        attention="self_attn",
+    )
+    return model
+
+
 def test_kcp_resolution_preserves_aliases_parameters_forward_and_rng(monkeypatch):
     module = KDA()
-    model = nn.ModuleDict({"first": module, "alias": module})
+    model = declared_kda_model(module, module)
     parameters = tuple(model.parameters())
     before = torch.get_rng_state().clone()
     forward = module.forward
@@ -39,10 +59,10 @@ def test_kcp_resolution_preserves_aliases_parameters_forward_and_rng(monkeypatch
     monkeypatch.setattr(kcp, "_kcp_runtime", reject_runtime)
     plan = kcp.resolve_kcp_plan(model, degree=2)
     assert len(plan.targets) == 1
-    assert plan.targets[0].path == "first"
+    assert plan.targets[0].path == "layers.0.self_attn"
     assert plan.targets[0].module is module
     assert plan.targets[0].layout == "kda_state"
-    assert model["alias"] is module
+    assert model.layers[1].self_attn is module
     assert module.forward == forward
     assert torch.equal(before, torch.get_rng_state())
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
@@ -50,9 +70,9 @@ def test_kcp_resolution_preserves_aliases_parameters_forward_and_rng(monkeypatch
 
 
 def test_kcp_stale_plan_rejected_before_loading_kernels(monkeypatch):
-    model = nn.ModuleDict({"attention": KDA()})
+    model = declared_kda_model(KDA())
     plan = kcp.resolve_kcp_plan(model, degree=2)
-    model["attention"] = KDA()
+    model.layers[0].self_attn = KDA()
     monkeypatch.setattr(
         kcp, "_kcp_runtime", lambda: pytest.fail("Stale plan reached runtime")
     )
@@ -62,8 +82,8 @@ def test_kcp_stale_plan_rejected_before_loading_kernels(monkeypatch):
 
 
 def test_kcp_wrapper_construction_failure_leaves_all_forwards_unchanged(monkeypatch):
-    model = nn.ModuleList([KDA(), KDA()])
-    original = [module.forward for module in model]
+    model = declared_kda_model(KDA(), KDA())
+    original = [layer.self_attn.forward for layer in model.layers]
     calls = []
     monkeypatch.setattr(kcp, "_kcp_runtime", lambda: ())
 
@@ -78,7 +98,7 @@ def test_kcp_wrapper_construction_failure_leaves_all_forwards_unchanged(monkeypa
     with pytest.raises(RuntimeError, match="second wrapper failed"):
         kcp.apply_kcp(model, mesh)
     assert len(calls) == 2
-    assert [module.forward for module in model] == original
+    assert [layer.self_attn.forward for layer in model.layers] == original
 
 
 def test_declared_mla_only_pipeline_part_binds_without_kda(monkeypatch):

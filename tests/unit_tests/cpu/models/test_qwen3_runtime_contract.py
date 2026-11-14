@@ -46,7 +46,7 @@ def test_ep_only_run_uses_model_capability_validation():
     config = small_config()
     config.num_experts = 3
     model = Qwen3MoeForCausalLM(config)
-    with pytest.raises(ValueError, match="Expert count.*EP degree"):
+    with pytest.raises(ValueError, match="EP degree.*num_experts"):
         apply_ep(
             model,
             ParallelConfig(expert_parallel_size=2),

@@ -32,10 +32,8 @@ from torch.utils.checkpoint import checkpoint
 
 from llmtuner.components.optimizer.state_dict import get_flat_optim_state_dict
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
-from llmtuner.parallel.fully_shard_parallel.fine_grained_param_group import (
+from llmtuner.parallel.fully_shard_parallel.fine_grained import (
     FineGrainedFSDPParamGroup,
-)
-from llmtuner.parallel.fully_shard_parallel.fine_grained_state import (
     FineGrainedFSDPState,
 )
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (

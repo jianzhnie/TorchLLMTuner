@@ -12,7 +12,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
-from llmtuner.parallel.expert_parallel.model_replacement import resolve_ep_plan
+from llmtuner.parallel.expert_parallel.plan import resolve_ep_plan
 from tests.integration_tests.harness import init_distributed
 
 

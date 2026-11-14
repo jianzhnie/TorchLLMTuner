@@ -49,6 +49,7 @@ from llmtuner.parallel.expert_parallel import (
     model_replacement,
     swap_moe_blocks,
 )
+from llmtuner.parallel.expert_parallel import plan as ep_plan
 from llmtuner.parallel.expert_parallel.block_conversion import (
     restore_fp32_state_buffers,
 )
@@ -89,6 +90,11 @@ def construct_test_model(config, *, explicit: bool = True) -> torch.nn.Module:
                 shared_expert="shared_experts" if config.n_shared_experts else None,
                 num_expert_groups=config.n_group if grouped else None,
                 num_limited_groups=config.topk_group if grouped else None,
+                group_routing=(
+                    "single_best"
+                    if getattr(config, "topk_method", None) == "group_limited_greedy"
+                    else None
+                ),
             )
     elif family in ("qwen3_moe", "mixtral"):
         for layer in model.layers:
@@ -103,6 +109,9 @@ def construct_test_model(config, *, explicit: bool = True) -> torch.nn.Module:
                 top_k=config.num_experts_per_tok,
                 route_norm=config.norm_topk_prob if family == "qwen3_moe" else True,
             )
+    elif family == "qwen3":
+        for layer in model.layers:
+            layer.moe_block_name = None
     return model
 
 
@@ -182,10 +191,10 @@ def _hf_block_attr(layer: torch.nn.Module) -> str:
     Used where the layout has been deliberately broken and a probe would raise
     instead of answering.
     """
-    for name in BLOCK_ATTRS:
-        if getattr(layer, name, None) is not None:
-            return name
-    raise AssertionError("layer holds no MoE block attribute")
+    name = getattr(layer, "moe_block_name", None)
+    if name is None or getattr(layer, name, None) is None:
+        raise AssertionError("layer holds no declared MoE block attribute")
+    return name
 
 
 def _hf_experts(block: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1089,11 +1098,16 @@ def test_gpt_oss_is_refused() -> None:
         num_experts_per_tok=2,
     )
     block = torch.nn.Module()
+    block.gate = torch.nn.Linear(64, 4, bias=False)
+    block.moe_contract = MoEBlockContract(
+        router="gate", num_experts=4, top_k=2, route_norm=False
+    )
     block.experts = GptOssExperts(config)
     assert block.experts.gate_up_proj.shape[1] == 64  # (E, D, 2F), not (E, 2F, D)
 
     holder = torch.nn.Module()
     holder.layers = torch.nn.ModuleList([torch.nn.Module()])
+    holder.layers[0].moe_block_name = "mlp"
     holder.layers[0].mlp = block
 
     with pytest.raises(NotImplementedError, match="bias vectors"):
@@ -1110,7 +1124,7 @@ def test_a_block_with_the_wrong_expert_layout_is_rejected() -> None:
     model = _deepseek_model()
     _misshape_hf_experts(_hf_block(model.layers[1]), hidden=64)
 
-    with pytest.raises(ValueError, match="unrecognized expert weight shapes"):
+    with pytest.raises(ValueError, match="fused gate/up expert geometry"):
         swap_moe_blocks(model)
 
 
@@ -1631,7 +1645,7 @@ def test_checkpoint_layout_failure_rolls_back_auxiliary_registration():
 @pytest.mark.parametrize("native_path", [False, True])
 def test_ep_rebinds_fused_fsdp_exclusions_hooks_and_unit_paths(native_path):
     from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
-    from llmtuner.parallel.fully_shard_parallel.plan import FSDPPatternReferences
+    from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferences
 
     model = _model(_config(norm_topk_prob=True))
     block = model.layers[0].mlp
@@ -1699,10 +1713,8 @@ def test_ep_rebinds_ignored_module_subtree_without_object_overrides(
     native_path, wildcard
 ):
     from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
-    from llmtuner.parallel.fully_shard_parallel.plan import (
-        FSDPPatternReferences,
-        _resolve_pattern_units,
-    )
+    from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferences
+    from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
 
     model = _model(_config(norm_topk_prob=True))
     source = model.layers[0].mlp.experts
@@ -1848,7 +1860,7 @@ def test_ep_resolution_rejects_capabilities_without_mutation(quantile_balancing)
     counts = dict(AuxLoss._group_counts)
     message = "sigmoid" if quantile_balancing else "bias"
     with pytest.raises(NotImplementedError, match=message):
-        model_replacement.resolve_ep_plan(model, quantile_balancing=quantile_balancing)
+        ep_plan.resolve_ep_plan(model, quantile_balancing=quantile_balancing)
     assert tuple(model.state_dict()) == keys
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert torch.equal(rng, torch.get_rng_state())

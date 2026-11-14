@@ -37,7 +37,7 @@ def main():
             nn.Linear(4, 8, bias=False), nn.Linear(8, 4, bias=False)
         ).double()
         reference = copy.deepcopy(model)
-        model._tp_config = {"0": "colwise", "1": "rowwise"}
+        model.tp_config = {"0": "colwise", "1": "rowwise"}
         original = model[0].weight
         cfg = ParallelConfig(
             tensor_parallel_size=2,

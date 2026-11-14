@@ -8,7 +8,7 @@ from llmtuner.config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.configuration import build_model_config
 from llmtuner.models.qwen.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
-from llmtuner.parallel.expert_parallel.model_replacement import resolve_ep_plan
+from llmtuner.parallel.expert_parallel.plan import resolve_ep_plan
 from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_plan
 from tests.unit_tests.cpu.models.test_owned_family_construction import text_config
 

@@ -176,7 +176,7 @@ def _run(directory: str, residency: str, steps: int, expected_start=None):
         if expected_start is not None:
             restored_model = {
                 name: value.detach().cpu().clone()
-                for name, value in trainer.example_model.state_dict().items()
+                for name, value in trainer.training_engine.model.state_dict().items()
             }
             restored_optimizer = {
                 name: value.detach().cpu().clone()
@@ -188,7 +188,7 @@ def _run(directory: str, residency: str, steps: int, expected_start=None):
             _compare(restored_optimizer, expected_start[1])
         model = {
             name: value.detach().cpu().clone()
-            for name, value in trainer.example_model.state_dict().items()
+            for name, value in trainer.training_engine.model.state_dict().items()
         }
         optimizer = {
             name: value.detach().cpu().clone()

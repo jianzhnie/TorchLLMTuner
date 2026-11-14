@@ -105,6 +105,7 @@ class _Layer(torch.nn.Module):
 
     def __init__(self, moe: MoE | None) -> None:
         super().__init__()
+        self.moe_block_name = "mlp" if moe is not None else None
         if moe is not None:
             self.mlp = moe
 

@@ -63,7 +63,7 @@ def test_ep_only_preflight_calls_model_capability_contract(monkeypatch):
     monkeypatch.setattr(model, "validate_parallel", validate)
     parameters = tuple(model.parameters())
     rng = torch.get_rng_state().clone()
-    plan = model_replacement.resolve_ep_plan(model, degree=2)
+    plan = ep_plan.resolve_ep_plan(model, degree=2)
     assert plan.degree == 2
     assert calls == [(1, 2)]
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
@@ -78,14 +78,14 @@ def test_ep_only_preflight_rejects_stale_model_declared_geometry():
     with pytest.raises(
         ValueError, match="gate/up storage differs from declared geometry"
     ):
-        model_replacement.resolve_ep_plan(model, degree=2)
+        ep_plan.resolve_ep_plan(model, degree=2)
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert torch.equal(torch.get_rng_state(), rng)
 
 
 def test_ep_execution_revalidates_model_geometry_before_conversion():
     model = _model()
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     model.config.hidden_size += 1
     blocks = tuple(layer.mlp for layer in model.layers)
     parameters = tuple(model.parameters())
@@ -117,7 +117,7 @@ def test_explicit_ep_rejects_missing_math_contract_without_legacy_probe(
     with pytest.raises(
         UnsupportedCombinationError, match="model-owned MoEBlockContract"
     ):
-        model_replacement.resolve_ep_plan(model)
+        ep_plan.resolve_ep_plan(model)
     assert all(
         layer.mlp is block for layer, block in zip(model.layers, blocks, strict=True)
     )
@@ -130,7 +130,7 @@ def test_ep_plan_rejects_buffer_persistence_change_before_replacement(persistent
     model = _model()
     owner = model.layers[0].mlp
     owner.register_buffer("migration_marker", torch.ones(2), persistent=persistent)
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     marker = owner.migration_marker
     blocks = tuple(layer.mlp for layer in model.layers)
     owner.register_buffer("migration_marker", marker, persistent=not persistent)
@@ -150,7 +150,7 @@ def test_ep_target_plan_is_pure_and_execution_does_not_rediscover(monkeypatch):
     ids, positions = _data()
     with torch.no_grad():
         expected = model(ids, positions=positions)
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     assert plan.count("moe") == 2
     assert tuple(model.state_dict()) == keys
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
@@ -175,7 +175,7 @@ def test_ep_execution_rejects_incomplete_slot_coverage_before_allocation(
     monkeypatch, change
 ):
     model = _model()
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     targets = plan.targets
     if change == "missing":
         targets = targets[:1]
@@ -211,7 +211,7 @@ def test_ep_execution_rejects_incomplete_slot_coverage_before_allocation(
 )
 def test_ep_target_plan_rejects_stale_or_incompatible_execution(change):
     model = _model()
-    plan = model_replacement.resolve_ep_plan(
+    plan = ep_plan.resolve_ep_plan(
         model,
         degree=2 if change == "degree" else 1,
         implementation="torchao" if change == "backend" else "alltoall",
@@ -245,7 +245,7 @@ def test_ep_plan_rejects_invalid_degree_without_changing_model(degree):
     keys = tuple(model.state_dict())
     rng = torch.get_rng_state().clone()
     with pytest.raises(ValueError, match="degree"):
-        model_replacement.resolve_ep_plan(model, degree=degree)
+        ep_plan.resolve_ep_plan(model, degree=degree)
     assert tuple(model.state_dict()) == keys
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert torch.equal(rng, torch.get_rng_state())
@@ -253,7 +253,7 @@ def test_ep_plan_rejects_invalid_degree_without_changing_model(degree):
 
 def test_ep_packed_plan_keeps_parameter_references_and_rejects_changed_geometry():
     model = _model()
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     target = plan.targets[0]
     binding = target.spec.packed_experts
     experts = target.module.experts
@@ -272,7 +272,7 @@ def test_ep_packed_plan_keeps_parameter_references_and_rejects_changed_geometry(
 
 def test_ep_packed_binding_rejects_another_block():
     model = _model()
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     binding = plan.targets[0].spec.packed_experts
     with pytest.raises(ValueError, match="Stale EP packed"):
         binding.projections(model.layers[1].mlp)
@@ -292,7 +292,7 @@ def test_ep_packed_binding_rejects_another_block():
 )
 def test_changed_model_semantics_reject_before_replacement(monkeypatch, change):
     model = _model()
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     block = model.layers[0].mlp
     original_blocks = tuple(layer.mlp for layer in model.layers)
     if change == "output":
@@ -339,7 +339,7 @@ def test_missing_declared_shared_expert_rejects_during_pure_resolution(engine):
     rng = torch.get_rng_state().clone()
     with pytest.raises(ValueError, match="shared expert.*must be a child module"):
         if engine == "ep":
-            model_replacement.resolve_ep_plan(model)
+            ep_plan.resolve_ep_plan(model)
         else:
             resolve_tp_plan(model, cfg=ParallelConfig(tensor_parallel_size=2))
     assert tuple(model.state_dict()) == keys
@@ -371,7 +371,7 @@ def test_non_silu_experts_reject_before_ep_changes_mathematics(degree, family):
     blocks = tuple(layer.mlp for layer in model.layers)
     rng = torch.get_rng_state().clone()
     with pytest.raises(UnsupportedCombinationError, match="require SiLU.*gelu"):
-        model_replacement.resolve_ep_plan(model, degree=degree)
+        ep_plan.resolve_ep_plan(model, degree=degree)
     assert tuple(model.state_dict()) == keys
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert all(a is b.mlp for a, b in zip(blocks, model.layers, strict=True))
@@ -422,7 +422,7 @@ def test_router_geometry_rejects_in_pure_ep_preflight(shape, monkeypatch):
 
     monkeypatch.setattr(model_replacement, "convert_block", forbidden)
     with pytest.raises(ValueError, match="router weight must have shape"):
-        model_replacement.resolve_ep_plan(model)
+        ep_plan.resolve_ep_plan(model)
     assert tuple(model.state_dict()) == keys
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert all(a is b.mlp for a, b in zip(blocks, model.layers, strict=True))
@@ -445,7 +445,7 @@ def test_declared_packed_layout_never_falls_back_to_legacy_probe(missing, monkey
         raise AssertionError("Declared layouts must not enter legacy inspection")
 
     with pytest.raises(ValueError, match="Declared fused experts require"):
-        model_replacement.resolve_ep_plan(model)
+        ep_plan.resolve_ep_plan(model)
     assert tuple(model.state_dict()) == keys
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert torch.equal(torch.get_rng_state(), rng)
@@ -462,7 +462,7 @@ def test_explicit_ep_rejects_missing_slot_declaration(monkeypatch):
         raise AssertionError("explicit decoder entered legacy inspection")
 
     with pytest.raises(ValueError, match="requires moe_block_name"):
-        model_replacement.resolve_ep_plan(model)
+        ep_plan.resolve_ep_plan(model)
     assert tuple(model.state_dict()) == keys
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert torch.equal(rng, torch.get_rng_state())
@@ -473,7 +473,7 @@ def test_ep_uses_declared_blocks_instead_of_convenience_property(monkeypatch):
     monkeypatch.setattr(
         Qwen3MoeForCausalLM, "layers", property(lambda self: torch.nn.ModuleList())
     )
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     assert len(plan.targets) == 2
     assert plan.targets[0].module is model.model.layers[0].mlp
     assert plan.targets[1].module is model.model.layers[1].mlp
@@ -483,7 +483,7 @@ def test_ep_rejects_malformed_structure_without_legacy_fallback(monkeypatch):
     model = _model()
     model.decoder_structure = "model.layers"
     with pytest.raises(TypeError, match="decoder_structure"):
-        model_replacement.resolve_ep_plan(model)
+        ep_plan.resolve_ep_plan(model)
 
 
 @pytest.mark.parametrize("flag", ["false", 0, None, True])
@@ -494,7 +494,7 @@ def test_ep_resolution_rejects_ambiguous_router_output_before_allocation(flag):
     parameters = tuple(model.parameters())
     rng = torch.get_rng_state().clone()
     with pytest.raises(ValueError, match="router.*boolean|router output.*conflicts"):
-        model_replacement.resolve_ep_plan(model)
+        ep_plan.resolve_ep_plan(model)
     assert torch.equal(rng, torch.get_rng_state())
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert model.layers[0].mlp is block
@@ -507,13 +507,13 @@ def test_ep_resolution_consumes_contract_only_router_output():
     block.moe_contract = replace(block.moe_contract, router_logits_in_output=True)
     model.config.output_router_logits = True
     with pytest.raises(NotImplementedError, match="returns router logits"):
-        model_replacement.resolve_ep_plan(model)
+        ep_plan.resolve_ep_plan(model)
 
 
 def test_ep_plan_rejects_new_external_buffer_alias_before_conversion(monkeypatch):
     model = _model()
     model.layers[0].mlp.register_buffer("routing_state", torch.arange(4))
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     model.register_buffer("external_alias", model.layers[0].mlp.routing_state)
 
     def forbidden(*args, **kwargs):
@@ -544,7 +544,7 @@ def test_ep_preflight_rejects_unavailable_dispatcher_before_model_binding(
 
     monkeypatch.setattr(ep_plan, "find_moe_candidates", forbidden)
     with pytest.raises(error, match=message):
-        model_replacement.resolve_ep_plan(model, implementation=implementation)
+        ep_plan.resolve_ep_plan(model, implementation=implementation)
     assert torch.equal(rng, torch.get_rng_state())
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
 
@@ -562,14 +562,14 @@ def test_ep_preflight_rejects_pre_down_score_semantics_before_model_binding(
 
     monkeypatch.setattr(ep_plan, "find_moe_candidates", forbidden)
     with pytest.raises(UnsupportedCombinationError, match="pre_down"):
-        model_replacement.resolve_ep_plan(model)
+        ep_plan.resolve_ep_plan(model)
     assert torch.equal(rng, torch.get_rng_state())
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
 
 
 def test_ep_execution_rejects_pre_down_enabled_after_plan_resolution(monkeypatch):
     model = _model()
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     model.config.experts_implementation = "pre_down"
     rng = torch.get_rng_state().clone()
     blocks = tuple(layer.mlp for layer in model.layers)
@@ -592,7 +592,7 @@ def test_ep_execution_rechecks_router_output_config_before_conversion(monkeypatc
     del block.router_logits_in_output
     block.moe_contract = replace(block.moe_contract, router_logits_in_output=True)
     model.config.output_router_logits = False
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     model.config.output_router_logits = True
     parameters = tuple(model.parameters())
     blocks = tuple(layer.mlp for layer in model.layers)
@@ -612,7 +612,7 @@ def test_ep_execution_rechecks_router_output_config_before_conversion(monkeypatc
 @pytest.mark.parametrize("slot", [None, "self_attn", "missing", 3, "deleted"])
 def test_ep_plan_rejects_changed_decoder_slot_declaration(monkeypatch, slot):
     model = _model()
-    plan = model_replacement.resolve_ep_plan(model)
+    plan = ep_plan.resolve_ep_plan(model)
     if slot == "deleted":
         del model.layers[0].moe_block_name
     else:
@@ -659,7 +659,7 @@ def test_ep_preflight_rejects_external_packed_expert_aliases(
     blocks = tuple(layer.mlp for layer in model.layers)
     rng = torch.get_rng_state().clone()
     with pytest.raises(UnsupportedCombinationError, match="external_expert"):
-        model_replacement.resolve_ep_plan(model, degree=degree)
+        ep_plan.resolve_ep_plan(model, degree=degree)
     assert torch.equal(rng, torch.get_rng_state())
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert all(a is b.mlp for a, b in zip(blocks, model.layers, strict=True))
@@ -673,7 +673,7 @@ def test_local_ep_preserves_unchanged_down_projection_alias(alias_kind):
         model.register_parameter("external_down", source)
     else:
         model.register_buffer("external_down", source.detach().view(-1))
-    plan = model_replacement.resolve_ep_plan(model, degree=1)
+    plan = ep_plan.resolve_ep_plan(model, degree=1)
     model_replacement.swap_moe_blocks(
         model, resolved_plan=plan, router_aux_loss_coef=0.0
     )

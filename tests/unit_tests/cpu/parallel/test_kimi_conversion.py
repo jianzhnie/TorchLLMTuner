@@ -11,9 +11,9 @@ from llmtuner.models.common.moe.layer import collect_moe_layers
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
 from llmtuner.parallel.expert_parallel.model_replacement import (
-    resolve_ep_plan,
     swap_moe_blocks,
 )
+from llmtuner.parallel.expert_parallel.plan import resolve_ep_plan
 
 
 def make_model(*, latent=False, shared=0, activation="silu", top_k=2):
@@ -31,6 +31,7 @@ def make_model(*, latent=False, shared=0, activation="silu", top_k=2):
     )
     model = nn.Module()
     layer = nn.Module()
+    layer.moe_block_name = "block_sparse_moe"
     layer.block_sparse_moe = KimiSparseMoE(config)
     model.layers = nn.ModuleList([layer])
     return model
@@ -227,7 +228,7 @@ def test_kimi_execution_rejects_changed_math_after_resolution(monkeypatch, chang
         raise AssertionError("Stale math must fail before conversion allocation")
 
     monkeypatch.setattr(torch, "empty", reject)
-    with pytest.raises(ValueError, match="Stale EP Kimi mathematics"):
+    with pytest.raises(ValueError, match="Stale EP model mathematics"):
         swap_moe_blocks(model, resolved_plan=plan)
     assert model.layers[0].block_sparse_moe is block
 
@@ -506,10 +507,8 @@ def test_meta_kimi_conversion_reconstructs_empty_routing_counters():
 @pytest.mark.parametrize("whole_module", [False, True])
 def test_kimi_fsdp_references_preserve_complete_stacked_exclusions(whole_module):
     from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
-    from llmtuner.parallel.fully_shard_parallel.plan import (
-        FSDPPatternReferences,
-        _resolve_pattern_units,
-    )
+    from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferences
+    from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
 
     model = make_model()
     source = model.layers[0].block_sparse_moe
@@ -542,7 +541,7 @@ def test_kimi_fsdp_references_preserve_complete_stacked_exclusions(whole_module)
 def test_kimi_partial_stacked_exclusion_rejected_before_installation(module_exclusion):
     from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
     from llmtuner.errors import UnsupportedCombinationError
-    from llmtuner.parallel.fully_shard_parallel.plan import FSDPPatternReferences
+    from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferences
 
     model = make_model()
     source = model.layers[0].block_sparse_moe
@@ -570,10 +569,8 @@ def test_kimi_gate_module_exclusion_keeps_moved_bias_outside_router(
     explicit_root, frozen_bias
 ):
     from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
-    from llmtuner.parallel.fully_shard_parallel.plan import (
-        FSDPPatternReferences,
-        _resolve_pattern_units,
-    )
+    from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferences
+    from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
 
     model = make_model()
     source = model.layers[0].block_sparse_moe

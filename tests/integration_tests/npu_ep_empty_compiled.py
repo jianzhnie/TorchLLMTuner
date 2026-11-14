@@ -14,9 +14,9 @@ from transformers import Qwen3MoeConfig
 
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel.model_replacement import (
-    resolve_ep_plan,
     swap_moe_blocks,
 )
+from llmtuner.parallel.expert_parallel.plan import resolve_ep_plan
 from tests.integration_tests.harness import init_distributed
 
 

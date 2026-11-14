@@ -16,6 +16,7 @@ def local_model():
     model = nn.Module()
     model.decoder = nn.Module()
     model.decoder.blocks = nn.ModuleList([nn.Linear(2, 2)])
+    model.decoder.blocks[0].moe_block_name = None
     model.layers = nn.ModuleList([nn.Linear(2, 2)])
     model.decoder_structure = DecoderStructure(
         decoder="decoder",

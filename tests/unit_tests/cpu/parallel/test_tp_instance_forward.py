@@ -12,7 +12,13 @@ def test_tp_boundary_preserves_instance_kernel_and_collective_order(monkeypatch)
         "llmtuner.parallel.tensor_parallel.tensor_parallel"
     )
     model = nn.Module()
+    from llmtuner.models.contracts import MoEBlockContract
+
     block = nn.Module()
+    block.gate = nn.Linear(16, 4, bias=False)
+    block.moe_contract = MoEBlockContract(
+        router="gate", num_experts=4, top_k=2, route_norm=False
+    )
     block.experts = nn.Module()
     block.experts.gate_up_proj = nn.Parameter(torch.randn(4, 16, 16))
     block.experts.down_proj = nn.Parameter(torch.randn(4, 16, 8))

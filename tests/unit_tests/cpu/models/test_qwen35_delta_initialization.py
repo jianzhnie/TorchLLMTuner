@@ -44,12 +44,7 @@ def test_low_precision_delta_initializer_remains_finite(constructor, dtype):
 @pytest.mark.parametrize("constructor", [Qwen3_5MoeTextModel, Qwen3_5MoeForCausalLM])
 @pytest.mark.parametrize(
     "option,value",
-    [
-        ("linear_attention_backend", "npu_triton"),
-        ("gdn_numerical_policy", "split_qkv_fp32_norm"),
-        ("gdn_allow_right_padding", True),
-        ("gdn_deterministic_reduction", True),
-    ],
+    [("linear_attention_backend", "npu_triton")],
 )
 def test_unimplemented_gdn_policy_fails_before_allocation(
     constructor, option, value, monkeypatch

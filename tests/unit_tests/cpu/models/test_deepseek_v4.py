@@ -48,7 +48,7 @@ from llmtuner.models.deepseek.deepseek_v4.routing import (
     DeepseekV4HashRouter,
     DeepseekV4TopKRouter,
 )
-from llmtuner.parallel.expert_parallel.model_replacement import resolve_ep_plan
+from llmtuner.parallel.expert_parallel.plan import resolve_ep_plan
 from llmtuner.trainer.runtime.assembly import build_model
 
 

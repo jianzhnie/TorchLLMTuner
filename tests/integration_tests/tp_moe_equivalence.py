@@ -56,7 +56,7 @@ class SharedBlock(nn.Module):
         self.top_k = 2
         self.num_experts = 4
         self.shared_experts = SharedMLP()
-        self._tp_config = {
+        self.tp_config = {
             "experts": "moe_tp_experts",
             "shared_experts.gate_proj": "colwise",
             "shared_experts.up_proj": "colwise",

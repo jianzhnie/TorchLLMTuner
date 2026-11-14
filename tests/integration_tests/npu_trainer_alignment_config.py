@@ -499,7 +499,7 @@ def build_candidate_30b_config(
             ),
             rotary_compute_dtype="float32",
             rotary_cache_dtype="float32",
-            attention_backend="auto" if attention["backend"] == "sdpa" else "flex",
+            attention_backend="auto",
         ),
         parallel=ParallelConfig(
             data_parallel_replicate_size=1,

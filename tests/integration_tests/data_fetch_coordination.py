@@ -23,6 +23,7 @@ from llmtuner.trainer.runtime.batch import (
     prepare_microbatch,
     prepare_model_inputs,
 )
+from llmtuner.trainer.runtime.engine import TrainingEngine
 from llmtuner.trainer.runtime.validation import (
     count_validation_batch_tokens,
     finalize_validation,
@@ -116,7 +117,14 @@ def main():
             # Scalar labels pass fetch's numel check, but fail token counting.
             # Peers must reject the batch before entering the DP all-reduce.
             try:
-                count_validation_batch_tokens(trainer, local_batch, dp_mesh=token_mesh)
+                count_validation_batch_tokens(
+                    local_batch,
+                    metrics=trainer.metrics,
+                    token_counter=trainer.count_valid_tokens,
+                    device=trainer.device,
+                    dp_mesh=token_mesh,
+                    error_group=trainer.error_group,
+                )
             except IndexError:
                 assert rank == failing_rank
             except RuntimeError as error:
@@ -131,7 +139,14 @@ def main():
                 f"rank={rank}: validation token failure rank {failing_rank} coordinated"
             )
         # A coordinated local failure must leave the group usable.
-        tokens = count_validation_batch_tokens(trainer, batch, dp_mesh=token_mesh)
+        tokens = count_validation_batch_tokens(
+            batch,
+            metrics=trainer.metrics,
+            token_counter=trainer.count_valid_tokens,
+            device=trainer.device,
+            dp_mesh=token_mesh,
+            error_group=trainer.error_group,
+        )
         assert tokens.item() == 6
         dist.barrier()
         for failure in (
@@ -436,15 +451,31 @@ def main():
                 metrics=metrics,
                 count_valid_tokens=lambda value: 4,
                 param_context=nullcontext,
-                example_model=ValidationModel(),
                 loss_sum=lambda logits, labels: logits.sum(),
+            )
+            trainer.training_engine = TrainingEngine(
+                model_parts=[ValidationModel()],
+                parallel_dims=topology,
+                device=trainer.device,
+                max_context_length=4,
+                chunked_loss_num_chunks=1,
+                param_context=trainer.param_context,
+                loss_sum=trainer.loss_sum,
+                error_group=trainer.error_group,
             )
             with patch(
                 "llmtuner.trainer.runtime.validation.create_validation_dataloader",
                 return_value=loader,
             ):
                 try:
-                    run_validation_loop(trainer, ValidationConfig(steps=3), step=7)
+                    run_validation_loop(
+                        trainer.training_engine,
+                        cfg=trainer.cfg,
+                        metrics=trainer.metrics,
+                        token_counter=trainer.count_valid_tokens,
+                        validation=ValidationConfig(steps=3),
+                        step=7,
+                    )
                 except ValueError as error:
                     assert rank == 0 and failure in ("exception", "count")
                     if failure == "exception":
@@ -505,7 +536,7 @@ def main():
                                 return_value=TokenFailureLoader(),
                             ),
                             patch.object(
-                                trainer.example_model, "prepare_inputs"
+                                trainer.training_engine.model, "prepare_inputs"
                             ) as preprocess,
                             patch(
                                 "llmtuner.trainer.runtime.validation.finalize_validation"
@@ -513,7 +544,12 @@ def main():
                         ):
                             try:
                                 run_validation_loop(
-                                    trainer, ValidationConfig(steps=1), step=8
+                                    trainer.training_engine,
+                                    cfg=trainer.cfg,
+                                    metrics=trainer.metrics,
+                                    token_counter=trainer.count_valid_tokens,
+                                    validation=ValidationConfig(steps=1),
+                                    step=8,
                                 )
                             except (ValueError, KeyboardInterrupt, SystemExit) as error:
                                 assert rank == failing_rank and error is original
@@ -560,7 +596,14 @@ def main():
                 side_effect=create,
             ):
                 try:
-                    run_validation_loop(trainer, ValidationConfig(steps=1), step=8)
+                    run_validation_loop(
+                        trainer.training_engine,
+                        cfg=trainer.cfg,
+                        metrics=trainer.metrics,
+                        token_counter=trainer.count_valid_tokens,
+                        validation=ValidationConfig(steps=1),
+                        step=8,
+                    )
                 except ValueError as error:
                     assert rank == 0 and error is original
                 except RuntimeError as error:
@@ -595,7 +638,14 @@ def main():
             ) as finalize,
         ):
             try:
-                run_validation_loop(trainer, ValidationConfig(steps=1), step=9)
+                run_validation_loop(
+                    trainer.training_engine,
+                    cfg=trainer.cfg,
+                    metrics=trainer.metrics,
+                    token_counter=trainer.count_valid_tokens,
+                    validation=ValidationConfig(steps=1),
+                    step=9,
+                )
             except OSError as error:
                 assert rank == 0 and error is cleanup_error
             except RuntimeError as error:
@@ -620,7 +670,8 @@ def main():
             loss = torch.tensor(float("nan") if failure == "nonfinite" else 4.0)
             try:
                 finalize_validation(
-                    report_trainer,
+                    metrics=report_trainer.metrics,
+                    error_group=report_trainer.error_group,
                     num_steps=0 if rank == 0 and failure == "preflight" else 1,
                     accumulated_loss=loss if rank == 0 else None,
                     total_global_valid_tokens=torch.tensor(4),

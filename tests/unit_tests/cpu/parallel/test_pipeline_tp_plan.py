@@ -9,9 +9,13 @@ from torch import nn
 
 from llmtuner.config.parallel_config import ParallelConfig, TensorParallelConfig
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
-from llmtuner.parallel.expert_parallel.plan import validate_pipeline_ep_plan
+from llmtuner.parallel.pipeline_parallel.ownership import PipelineOwnership
 from llmtuner.parallel.pipeline_parallel.partition import prune_declared_stage
-from llmtuner.parallel.plan import ParallelPlan, PlanTarget
+from llmtuner.parallel.plan import (
+    ParallelPlan,
+    PlanTarget,
+    snapshot_model_bindings,
+)
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     resolve_tp_plan,
     validate_pipeline_tp_plan,
@@ -153,14 +157,11 @@ def test_pipeline_rejects_changed_retained_parameter_aliases(stage, initially_sh
             (),
             2,
             "test",
-            parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+            **snapshot_model_bindings(model),
         )
 
-    validator = (
-        validate_pipeline_tp_plan if stage == "tp" else validate_pipeline_ep_plan
-    )
     with pytest.raises(ValueError, match="parameter alias ownership"):
-        validator(plan(whole), plan(part), part)
+        PipelineOwnership(plan(whole), plan(part)).validate_aliases()
 
 
 @pytest.mark.parametrize("stage", ["tp", "ep"])
@@ -177,13 +178,10 @@ def test_pipeline_projects_aliases_onto_retained_parameters(stage):
             (),
             2,
             "test",
-            parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+            **snapshot_model_bindings(model),
         )
 
-    validator = (
-        validate_pipeline_tp_plan if stage == "tp" else validate_pipeline_ep_plan
-    )
-    validator(plan(whole), plan(part), part)
+    PipelineOwnership(plan(whole), plan(part)).validate_aliases()
     assert part[0].weight is part[1].weight
     assert part[0].weight is not whole[0].weight
 
@@ -212,14 +210,11 @@ def test_pipeline_rejects_buffer_alias_drift(stage, change):
             (),
             2,
             "test",
-            buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+            **snapshot_model_bindings(model),
         )
 
-    validator = (
-        validate_pipeline_tp_plan if stage == "tp" else validate_pipeline_ep_plan
-    )
     with pytest.raises(ValueError, match="alias ownership"):
-        validator(plan(whole), plan(part), part)
+        PipelineOwnership(plan(whole), plan(part)).validate_aliases()
 
 
 @pytest.mark.parametrize("stage", ["tp", "ep"])
@@ -236,12 +231,9 @@ def test_pipeline_accepts_preserved_buffer_view_storage(stage):
             (),
             2,
             "test",
-            buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+            **snapshot_model_bindings(model),
         )
 
-    validator = (
-        validate_pipeline_tp_plan if stage == "tp" else validate_pipeline_ep_plan
-    )
-    validator(plan(whole), plan(part), part)
+    PipelineOwnership(plan(whole), plan(part)).validate_aliases()
     assert part.left is not part.right
     assert part.left.untyped_storage()._cdata == part.right.untyped_storage()._cdata

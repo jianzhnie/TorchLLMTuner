@@ -3,7 +3,6 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.configuration import build_model_config_for
 from tests.integration_tests.npu_trainer_alignment_config import (
     QWEN3_30B,
@@ -308,7 +307,7 @@ def test_30b_candidate_has_no_debugmodel_assumptions(tmp_path):
     assert config.model.qkv_projection == "fused"
     assert config.model.rotary_compute_dtype == "float32"
     assert config.model.rotary_cache_dtype == "float32"
-    assert config.model.attention_backend == "flex"
+    assert config.model.attention_backend == "auto"
     assert config.optimizer.learning_rate == 2e-5
     assert config.optimizer.lr_scheduler_config.warmup_steps == 7
     assert config.optimizer.lr_scheduler_config.decay_type == "cosine"
@@ -326,11 +325,6 @@ def test_30b_candidate_has_no_debugmodel_assumptions(tmp_path):
     assert config.training.dataloader_config.dataset_path == "/tmp/limo.jsonl"
     assert config.training.max_norm == 0.5
     assert construction_dtype(True) is torch.bfloat16
-
-    # The historical baseline can still be inspected, but its removed Flex
-    # adapter must fail explicitly rather than silently changing attention.
-    with pytest.raises(UnsupportedCombinationError, match="no explicit-model adapter"):
-        build_model_config_for(config)
 
 
 def test_30b_candidate_preserves_current_baseline_causal_sdpa(tmp_path):

@@ -9,12 +9,16 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.contracts import DecoderStructure
+from llmtuner.models.contracts import DecoderStructure, MoEBlockContract
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
-from llmtuner.parallel.fully_shard_parallel.plan import FSDPPatternReferences
+from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferences
 from llmtuner.parallel.plan import ParallelPlan
 from llmtuner.parallel.tensor_parallel.linear import ColwiseLinearNoGather
-from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp, requires_full_token_history, resolve_tp_plan
+from llmtuner.parallel.tensor_parallel.tensor_parallel import (
+    apply_tp,
+    requires_full_token_history,
+    resolve_tp_plan,
+)
 from tests.unit_tests.cpu.parallel.test_tp_moe import _MoeModel
 
 
@@ -227,6 +231,14 @@ def test_invalid_moe_shared_geometry_fails_during_pure_preflight():
     shared.up_proj = nn.Linear(16, 7, bias=False)
     shared.down_proj = nn.Linear(7, 16, bias=False)
     block.shared_expert = shared
+    block.moe_contract = MoEBlockContract(
+        router="gate",
+        num_experts=block.num_experts,
+        top_k=block.top_k,
+        route_norm=False,
+        shared_expert="shared_expert",
+    )
+    model.layers[0].moe_block_name = "mlp"
     parameters = tuple(model.parameters())
     with pytest.raises(ValueError, match="not divisible"):
         resolve_tp_plan(model, cfg=ParallelConfig(tensor_parallel_size=2))

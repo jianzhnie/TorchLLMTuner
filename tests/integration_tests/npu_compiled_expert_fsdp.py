@@ -62,9 +62,8 @@ def main() -> None:
             ) as profiler:
                 output = actual(other, tokens)
             assert any(
-                event.key == "llmtuner::aligned_npu_grouped_mm"
-                for event in profiler.key_averages()
-            ), "compiled aligned grouped GEMM was not executed"
+                event.key == "aten::_grouped_mm" for event in profiler.key_averages()
+            ), "compiled native grouped GEMM was not executed"
             torch.testing.assert_close(output, expected, rtol=5e-3, atol=5e-3)
             upstream = torch.randn_like(expected)
             expected.backward(upstream)

@@ -30,9 +30,9 @@ from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel import token_dispatch
 from llmtuner.parallel.expert_parallel.model_replacement import (
-    resolve_ep_plan,
     swap_moe_blocks,
 )
+from llmtuner.parallel.expert_parallel.plan import resolve_ep_plan
 from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp, resolve_tp_plan
 from llmtuner.parallel.topology import ParallelTopology, build_device_mesh
 from tests.integration_tests.harness import init_distributed

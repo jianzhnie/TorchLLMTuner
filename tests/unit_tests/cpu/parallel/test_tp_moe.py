@@ -18,6 +18,8 @@ from tests.caps import require_env
 require_env("spmd_types")
 
 
+from dataclasses import replace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -25,6 +27,7 @@ from transformers import AutoConfig
 
 from llmtuner.config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.models.contracts import MoEBlockContract
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel import linear as tp_linear
@@ -115,6 +118,16 @@ class _MoeBlock(nn.Module):
         self.experts = _Experts(num_experts, dim, hidden)
         self.top_k = top_k
         self.num_experts = num_experts
+        self.moe_contract = MoEBlockContract(
+            router="gate", num_experts=num_experts, top_k=top_k, route_norm=False
+        )
+
+    def __setattr__(self, name: str, value) -> None:
+        super().__setattr__(name, value)
+        if name in ("shared_expert", "shared_experts") and hasattr(
+            self, "moe_contract"
+        ):
+            self.moe_contract = replace(self.moe_contract, shared_expert=name)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         lead = hidden_states.shape[:-1]
@@ -132,7 +145,8 @@ class _MoeModel(nn.Module):
         self.layers = nn.ModuleList(
             [nn.ModuleDict({"mlp": _MoeBlock(num_experts, dim, hidden, top_k=2)})]
         )
-        self._tp_config = MOE_PLAN
+        self.layers[0].moe_block_name = "mlp"
+        self.tp_config = MOE_PLAN
 
 
 class _FakeMeshAxis:
@@ -188,7 +202,7 @@ def test_moe_plan_specs_resolve_instead_of_raising() -> None:
 
 def test_ep_config_strings_still_raise_on_the_tp_path() -> None:
     class M(nn.Module):
-        _tp_config = {"layers.*.mlp.experts.gate_up_proj": "grouped_gemm"}
+        tp_config = {"layers.*.mlp.experts.gate_up_proj": "grouped_gemm"}
 
     with pytest.raises(ValueError, match="Unsupported TP plan entry"):
         resolve_tp_sharding_plan(M(), plan=None)
@@ -303,7 +317,7 @@ def test_apply_tp_is_idempotent_on_a_moe_block() -> None:
 
 def test_apply_tp_raises_when_moe_specs_match_no_block() -> None:
     class Dense(nn.Module):
-        _tp_config = dict(MOE_PLAN)
+        tp_config = dict(MOE_PLAN)
 
         def __init__(self) -> None:
             super().__init__()
@@ -354,7 +368,15 @@ def test_shared_expert_shards_featurewise_and_partials_sum(plural_fallback) -> N
             block.shared_experts = shared
         else:
             block.shared_expert = shared
-        ids = shard_shared_expert_for_tp(block, tp_size=2, tp_rank=rank)
+        ids = shard_shared_expert_for_tp(
+            block,
+            tp_size=2,
+            tp_rank=rank,
+            shared_binding=(
+                "shared_experts" if plural_fallback else "shared_expert",
+                shared,
+            ),
+        )
         prefix = "shared_experts" if plural_fallback else "shared_expert"
         assert ids == {
             f"{prefix}.{name}.weight" for name in ("gate_proj", "up_proj", "down_proj")
@@ -389,7 +411,12 @@ def test_shared_expert_allocation_failure_preserves_model(
 
     monkeypatch.setattr(tp_linear, "shard_weight", fail_projection)
     with pytest.raises(RuntimeError) as caught:
-        tp_engine.shard_shared_expert_for_tp(block, tp_size=2, tp_rank=0)
+        tp_engine.shard_shared_expert_for_tp(
+            block,
+            tp_size=2,
+            tp_rank=0,
+            shared_binding=("shared_expert", shared),
+        )
     assert caught.value is allocation_error
     assert all(shared.get_parameter(name) is value for name, value in originals.items())
     assert features == {
@@ -413,12 +440,12 @@ def test_shared_expert_is_not_double_sharded_by_the_dense_plan(root_block) -> No
         }
     )
     model = _MoeModel()
-    model._tp_config = plan
+    model.tp_config = plan
     block = model.layers[0]["mlp"]
     block.shared_experts = _SharedMLP()
     if root_block:
         model = block
-        model._tp_config = {
+        model.tp_config = {
             key.removeprefix("layers.*.mlp."): value for key, value in plan.items()
         }
     cfg = ParallelConfig(tensor_parallel_size=2)

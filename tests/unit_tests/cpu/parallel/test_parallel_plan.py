@@ -9,7 +9,8 @@ from torch import nn
 
 from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel import ParallelPlan, PlanTarget
-from llmtuner.parallel.plan import validate_pipeline_aliases
+from llmtuner.parallel.pipeline_parallel.ownership import PipelineOwnership
+from llmtuner.parallel.plan import snapshot_model_bindings
 
 
 def test_plan_counts_resolved_targets_without_tensor_payloads() -> None:
@@ -34,22 +35,18 @@ def test_plan_snapshots_caller_owned_containers_without_copying_parameters():
     model = nn.Linear(2, 2)
     target = PlanTarget("", "dense", model)
     targets = [target]
-    operations = ["shard"]
     parameters = [[name, value] for name, value in model.named_parameters()]
     plan = ParallelPlan(
         "tp",
         targets,
         2,
         "functional",
-        operations=operations,
         parameter_bindings=parameters,
     )
     targets.clear()
-    operations[0] = "other"
     parameters[0][1] = nn.Parameter(torch.zeros_like(model.weight))
     parameters.clear()
     assert plan.targets == (target,)
-    assert plan.operations == ("shard",)
     assert plan.parameter_bindings[0][1] is model.weight
     plan.validate_binding(model)
 
@@ -67,9 +64,6 @@ def test_plan_snapshots_caller_owned_containers_without_copying_parameters():
         {"stage": 1},
         {"implementation": " "},
         {"implementation": 1},
-        {"degrees": (2, False)},
-        {"degrees": (2, 0)},
-        {"degrees": (2, 1.5)},
         {"implementation": ""},
     ],
 )
@@ -209,6 +203,39 @@ def test_plan_preserves_nonzero_offset_views_during_value_updates() -> None:
     plan.validate_binding(model)
     torch.testing.assert_close(model.weight, torch.arange(3.0, 11.0).reshape(2, 4))
     torch.testing.assert_close(model.cache, torch.arange(3.0, 7.0) * 2)
+
+
+@pytest.mark.parametrize("change", ["add", "remove", "replace"])
+def test_plan_rejects_changed_parameter_aliases(change) -> None:
+    model = nn.Module()
+    model.first = nn.Parameter(torch.empty(2, 3))
+    model.second = model.first
+    plan = ParallelPlan(
+        stage="tp",
+        targets=(),
+        degree=2,
+        implementation="functional",
+        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
+    )
+    assert plan.shared_parameters == (("first", "second"),)
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+    if change == "add":
+        model.third = model.first
+    elif change == "remove":
+        model.second = nn.Parameter(torch.empty(2, 3))
+    else:
+        model.first = nn.Parameter(torch.empty(2, 3))
+    with pytest.raises(ValueError, match="Stale plan"):
+        plan.validate_binding(model)
+    if change == "remove":
+        assert model.second is not model.first
+    current_parameters = tuple(model.parameters())
+    assert all(
+        any(parameter is current for current in current_parameters)
+        for parameter in parameters
+    )
+    assert torch.equal(torch.get_rng_state(), rng)
 
 
 @pytest.mark.parametrize("device", ["cpu", "meta"])
@@ -396,6 +423,27 @@ def test_plan_accepts_unchanged_bound_forward_and_inplace_weight_update():
     plan.validate_binding(model)
 
 
+def test_pipeline_uses_resolved_parameter_alias_snapshots() -> None:
+    whole = nn.Module()
+    whole.first = nn.Parameter(torch.empty(2))
+    whole.second = whole.first
+    local = deepcopy(whole)
+
+    def plan(model):
+        return ParallelPlan(
+            stage="tp",
+            targets=(),
+            degree=2,
+            implementation="functional",
+            **snapshot_model_bindings(model),
+        )
+
+    PipelineOwnership(plan(whole), plan(local)).validate_aliases()
+    local.second = nn.Parameter(torch.empty(2))
+    with pytest.raises(ValueError, match="Pipeline parameter alias ownership changed"):
+        PipelineOwnership(plan(whole), plan(local)).validate_aliases()
+
+
 @pytest.mark.parametrize("initially_shared", [False, True])
 def test_pipeline_rejects_changed_parameterless_module_aliases(initially_shared):
     whole = nn.ModuleDict({"first": nn.ReLU(), "second": nn.ReLU()})
@@ -410,11 +458,11 @@ def test_pipeline_rejects_changed_parameterless_module_aliases(initially_shared)
             targets=(),
             degree=2,
             implementation="test",
-            module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+            **snapshot_model_bindings(model),
         )
 
     with pytest.raises(ValueError, match="module alias ownership"):
-        validate_pipeline_aliases(plan(whole), plan(local))
+        PipelineOwnership(plan(whole), plan(local)).validate_aliases()
 
 
 def test_pipeline_module_alias_projection_excludes_removed_stage_placeholders():
@@ -429,7 +477,7 @@ def test_pipeline_module_alias_projection_excludes_removed_stage_placeholders():
             targets=(),
             degree=2,
             implementation="test",
-            module_bindings=tuple(model.named_modules(remove_duplicate=False)),
+            **snapshot_model_bindings(model),
         )
 
-    validate_pipeline_aliases(plan(whole), plan(local))
+    PipelineOwnership(plan(whole), plan(local)).validate_aliases()

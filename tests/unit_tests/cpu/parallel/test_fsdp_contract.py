@@ -58,8 +58,8 @@ def test_fsdp_references_reject_partial_stack_after_prior_replacement():
             {}, {intermediate: (stacked,), active: (stacked,)}
         )
     # Rejected conversion must not publish a partial mapping.
-    assert references.parameter_targets[excluded] == (intermediate,)
-    assert intermediate not in references.parameter_targets
+    assert references.replacements.parameter_targets[excluded] == (intermediate,)
+    assert intermediate not in references.replacements.parameter_targets
 
 
 @pytest.mark.parametrize("ignored_module", [False, True])
@@ -707,7 +707,7 @@ def test_custom_contexts_share_streams_without_allocating_unused_streams(monkeyp
 
     from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPCommContext
 
-    from llmtuner.parallel.fully_shard_parallel.fine_grained_state import (
+    from llmtuner.parallel.fully_shard_parallel.fine_grained import (
         FineGrainedFSDPState,
     )
 
@@ -764,7 +764,7 @@ def test_fine_grained_all_gather_waits_before_releasing_foreign_hook_buffers(
         FSDPParamGroup,
     )
 
-    from llmtuner.parallel.fully_shard_parallel.fine_grained_param_group import (
+    from llmtuner.parallel.fully_shard_parallel.fine_grained import (
         FineGrainedFSDPParamGroup,
         HookAllGatherState,
     )
@@ -822,7 +822,7 @@ def test_fine_grained_reduce_scatter_preserves_same_hook_and_tags_new_buffers(
         ReduceScatterState,
     )
 
-    from llmtuner.parallel.fully_shard_parallel.fine_grained_param_group import (
+    from llmtuner.parallel.fully_shard_parallel.fine_grained import (
         FineGrainedFSDPParamGroup,
         HookReduceScatterState,
     )
@@ -1364,7 +1364,7 @@ def test_custom_fsdp_recompute_enters_backward_lifecycle(monkeypatch, recompute)
     from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
 
     from llmtuner.models.common.aux_loss import in_checkpoint_recompute
-    from llmtuner.parallel.fully_shard_parallel.fine_grained_state import (
+    from llmtuner.parallel.fully_shard_parallel.fine_grained import (
         FineGrainedFSDPState,
     )
 

@@ -20,6 +20,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from llmtuner.components.loss import IGNORE_INDEX
 from llmtuner.config import LLMTunerConfig, ValidationConfig
 from llmtuner.trainer.runtime import validation
+from llmtuner.trainer.runtime.engine import TrainingEngine
 from llmtuner.trainer.trainer import Trainer
 
 
@@ -101,6 +102,16 @@ def main():
             trainer.model_parts = [trainer.model]
             trainer.ntokens_seen = 123
             trainer.param_context = nullcontext
+            trainer.training_engine = TrainingEngine(
+                model_parts=trainer.model_parts,
+                parallel_dims=trainer.parallel_dims,
+                device=trainer.device,
+                max_context_length=trainer.cfg.max_seq_len,
+                chunked_loss_num_chunks=1,
+                param_context=trainer.param_context,
+                loss_sum=trainer.loss_sum,
+                error_group=trainer.error_group,
+            )
             logs = []
             trainer.metrics = SimpleNamespace(
                 add_tokens=lambda count: None,

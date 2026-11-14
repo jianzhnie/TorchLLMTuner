@@ -504,7 +504,7 @@ def test_compiled_ac_preserves_modes_identity_and_frozen_gradients(
         rng = torch.get_rng_state().clone()
         failure = ValueError("compiled validation failed")
 
-        def run_validation_loop(trainer, config, step):
+        def run_validation_loop(engine, **kwargs):
             assert not torch.is_grad_enabled()
             assert all(not module.training for module in actual.modules())
             torch.testing.assert_close(
@@ -527,10 +527,22 @@ def test_compiled_ac_preserves_modes_identity_and_frozen_gradients(
         )
         if validation_fails:
             with pytest.raises(ValueError) as caught:
-                validation.validate(trainer, 1)
+                validation.validate(
+                    trainer,
+                    cfg=trainer.cfg,
+                    metrics=None,
+                    token_counter=lambda batch: 0,
+                    step=1,
+                )
             assert caught.value is failure
         else:
-            validation.validate(trainer, 1)
+            validation.validate(
+                trainer,
+                cfg=trainer.cfg,
+                metrics=None,
+                token_counter=lambda batch: 0,
+                step=1,
+            )
         assert {module: module.training for module in actual.modules()} == saved_modes
         torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
         inputs = torch.randn(3, 4)

@@ -50,7 +50,7 @@ def _run(directory: Path, combined: bool, steps: int):
         trainer.train()
         model = {
             name: value.detach().cpu().clone()
-            for name, value in trainer.example_model.state_dict().items()
+            for name, value in trainer.training_engine.model.state_dict().items()
         }
         optimizer = {
             name: value.detach().cpu().clone()

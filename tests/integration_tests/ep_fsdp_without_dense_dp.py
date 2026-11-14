@@ -255,7 +255,7 @@ def main() -> None:
                 logits = model(inputs, **kwargs)
             if compiled:
                 assert any(
-                    event.key == "llmtuner::aligned_npu_grouped_mm"
+                    event.key == "aten::_grouped_mm"
                     for event in profiler.key_averages()
                 ), "compiled aligned grouped GEMM did not run"
             # Match production FP32 loss accumulation. BF16 sums round at

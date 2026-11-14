@@ -169,14 +169,6 @@ def models(args):
     assert config.layer_types[0] == "linear_attention"
     config._attn_implementation = "eager"
     config.experts_implementation = args.hf_experts_implementation
-    config.gdn_numerical_policy = getattr(args, "hf_gdn_numerical_policy", "native")
-    if config.gdn_numerical_policy != "native" and (
-        getattr(args, "hf_gdn_qkv_projections", "native") != "native"
-        or getattr(args, "hf_gdn_norm_cast", "native") != "native"
-    ):
-        raise ValueError(
-            "Production GDN policy cannot combine with manual interventions"
-        )
     configure_experts_implementation(config, model_cls=object)
     spec = model_registry("35B-A3B")
     spec.model.layers[0].moe.load_balance_coeff = None
@@ -203,18 +195,12 @@ def models(args):
     if args.hf_router_compute_dtype == "float32":
         hf.mlp.gate.forward = MethodType(fp32_router_diagnostic, hf.mlp.gate)
     kernel = spec.model.layers[0].delta_net.kernel.build()
-    deterministic = getattr(args, "hf_gdn_deterministic_reduction", False)
 
     def recurrence(q, k, v, *, g, beta, **kwargs):
         assert kwargs.get("initial_state") is None
         assert kwargs.get("output_final_state", False) is False
         assert kwargs.get("use_qk_l2norm_in_kernel") is True
         assert kwargs.get("cu_seqlens") is None
-        if deterministic:
-            candidate = importlib.import_module("llmtuner.accelerator.gated_delta")
-            return candidate.gated_delta_rule(
-                q, k, v, g, beta, deterministic_reduction=True
-            ), None
         return kernel(q, k, v, g, beta), None
 
     hf.linear_attn.chunk_gated_delta_rule = recurrence
@@ -376,10 +362,6 @@ def run(args, report):
     }
     report["router_config"] = {
         "hf_moe_graph": getattr(args, "hf_moe_graph", "native"),
-        "hf_gdn_deterministic_reduction": getattr(
-            args, "hf_gdn_deterministic_reduction", False
-        ),
-        "hf_gdn_numerical_policy": getattr(args, "hf_gdn_numerical_policy", "native"),
         "hf_gdn_qkv_projections": getattr(args, "hf_gdn_qkv_projections", "native"),
         "hf_gdn_norm_cast": getattr(args, "hf_gdn_norm_cast", "native"),
         "hf_experts_implementation": args.hf_experts_implementation,
@@ -577,17 +559,6 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--cpu-check", action="store_true")
     mode.add_argument("--execute", action="store_true")
-    parser.add_argument(
-        "--hf-gdn-deterministic-reduction",
-        action="store_true",
-        help="Candidate dk/db block reduction; reference unchanged.",
-    )
-    parser.add_argument(
-        "--hf-gdn-numerical-policy",
-        choices=("native", "split_qkv_fp32_norm"),
-        default="native",
-        help="Production GDN policy; excludes manual GDN interventions.",
-    )
     parser.add_argument(
         "--hf-gdn-qkv-projections",
         choices=("native", "separate"),
