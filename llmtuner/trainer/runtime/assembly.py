@@ -1,10 +1,9 @@
 """Build the trainer's model, parallel layout, and training services.
 
-Resolve the process group and topology, check validation feasibility, seed the
-run, and select the dense mesh. Then build the explicit model, apply parallel stages,
-and create optimizer/scheduler/EMA services. Finally build the dataloader,
-checkpointer, counters, and metrics. Model-dependent combination guards run
-while building the model, before parallel transformations.
+Builders consume explicit configuration, model ownership and runtime environment
+and return their results. They never receive a Trainer or assign its attributes.
+Trainer owns creation order and retains resources as soon as they are acquired.
+Model-dependent combination guards run before parallel transformations.
 
 Parallel stage order is defined in ``parallel/stages.py``. Pipeline parallelism
 splits the model first, then applies those stages to each local model part.
@@ -40,7 +39,6 @@ from ...components.optimizer.lr_scheduler import build_lr_scheduler
 from ...components.optimizer.optimizer import OptimizersContainer
 from ...components.optimizer.state_residency import validate_checkpoint_configuration
 from ...errors import UnsupportedCombinationError
-from ...memory.activation_swap import reset_activation_swap_metrics
 from ...memory.materialization import materialize_meta_model
 from ...models.common.aux_loss import register_aux_loss_metrics_hook
 from ...models.common.moe.bias_update import (
@@ -57,10 +55,7 @@ from ...parallel.parallelize import parallelize_model
 from ...parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
 from ...utils import logging as logging_utils
 from ...utils.flops import flops_estimation_note, flops_per_token
-from .batch import build_training_dataloader
 from .engine import LossSum, ParamContext, TrainingEngine
-from .environment import RuntimeEnvironment, build_runtime_environment
-from .training_observer import TrainingObserver, install_dispatch_timers
 
 if TYPE_CHECKING:
     from torch.distributed.checkpoint.stateful import Stateful
@@ -69,7 +64,7 @@ if TYPE_CHECKING:
     from ...config.llmtuner_config import LLMTunerConfig
     from ...datasets.contracts import BaseDataLoader
     from ...parallel.topology import ParallelTopology
-    from ..trainer import Trainer
+    from .environment import RuntimeEnvironment
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,101 +553,3 @@ def build_metrics_processor(
                     pass
         raise
     return metrics
-
-
-def assemble_trainer_runtime(trainer: Trainer, cfg: LLMTunerConfig) -> None:
-    trainer.cfg = cfg
-    environment = build_runtime_environment(
-        cfg,
-        seed_everything=trainer.seed_everything,
-        validate_validation=trainer.check_validation_feasibility,
-    )
-    trainer.rank = environment.rank
-    trainer.world_size = environment.world_size
-    trainer.local_rank = environment.local_rank
-    trainer.parallel_dims = environment.parallel_dims
-    trainer.device = environment.device
-    trainer.mesh = environment.mesh
-    error_group = environment.error_group
-    trainer.error_group = error_group
-
-    prepared_model = prepare_parallel_model(cfg, environment=environment)
-    model_assembly = prepared_model.assembly
-    trainer.model = model_assembly.model
-    trainer.model_parts = model_assembly.model_parts
-    optimizer_stack = build_optimizer_stack(
-        cfg,
-        model_parts=model_assembly.model_parts,
-        parallel_dims=environment.parallel_dims,
-        error_group=error_group,
-    )
-    trainer.optimizer = optimizer_stack.optimizer
-    trainer.lr_scheduler = optimizer_stack.lr_scheduler
-    trainer.ema = optimizer_stack.ema
-    trainer.training_engine = create_training_engine(
-        cfg,
-        model_assembly=model_assembly,
-        optimizer_stack=optimizer_stack,
-        parallel_dims=environment.parallel_dims,
-        device=environment.device,
-        param_context=trainer.param_context,
-        loss_sum=trainer.loss_sum,
-        error_group=error_group,
-    )
-
-    # The checkpointer captures the loader cursor alongside model state.
-    with synchronize_local_errors("Dataloader construction", group=error_group):
-        trainer.dataloader = build_training_dataloader(
-            cfg, parallel_dims=environment.parallel_dims
-        )
-
-    # Counters the checkpoint carries. Kept as plain ints so a resumed run
-    # can log "step 61 (resumed at 60)" without re-deriving them.
-    trainer.step = 0
-    trainer.ntokens_seen = 0
-
-    trainer.checkpointer = build_checkpointer(
-        cfg,
-        prepared_model.config,
-        model_assembly=model_assembly,
-        optimizer_stack=optimizer_stack,
-        dataloader=trainer.dataloader,
-        train_state=trainer.progress,
-        device=environment.device,
-        parallel_dims=environment.parallel_dims,
-        error_group=error_group,
-    )
-
-    trainer.metrics = build_metrics_processor(
-        cfg,
-        prepared_model.config,
-        parallel_dims=environment.parallel_dims,
-        num_parameters=prepared_model.num_parameters,
-        num_trainable_parameters=prepared_model.num_trainable_parameters,
-        error_group=error_group,
-    )
-    trainer.training_observer = TrainingObserver(
-        trainer.metrics, environment.device, group=error_group
-    )
-    trainer.dispatch_timers = []
-    if cfg.metrics.measure_moe_dispatch:
-        with synchronize_local_errors(
-            "Dispatch observer installation", group=error_group
-        ):
-            trainer.dispatch_timers = install_dispatch_timers(
-                model_assembly.model_parts
-            )
-        if not trainer.dispatch_timers:
-            logging_utils.get_logger(__name__).warning(
-                "Dispatch timing requested, but no native RoutedExperts boundary "
-                "was found; dispatch timing is unavailable for this model."
-            )
-    if cfg.activation_swap:
-        reset_activation_swap_metrics()
-    # The trainer synchronizes PP loss metrics to every stage before logging.
-    logging_utils.set_log_ranks(cfg.metrics.log_ranks)
-    if environment.device.type == "npu":
-        logging_utils.get_logger(__name__).info(
-            "NPU step guards use explicit synchronous scalar reads; "
-            "loss/gradient and valid-token checks remain enabled"
-        )

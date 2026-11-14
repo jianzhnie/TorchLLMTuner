@@ -94,7 +94,7 @@ rank 和参数。
 | 层级 | 入口 | 约定 |
 |---|---|---|
 | 用户接口 | `llmtuner.LLMTunerConfig`、`Trainer`、`config.*`、`python -m llmtuner` | 常规训练使用 |
-| 集成接口 | `parallelize_hf_transformers`、stage、组合矩阵、能力注册表 | 扩展作者使用，稳定性较弱 |
+| 集成接口 | `parallelize_model`、stage、组合矩阵、能力注册表 | 扩展作者使用，稳定性较弱 |
 | 内部实现 | 未列出的模块与私有符号 | 不承诺兼容，测试可直接使用 |
 
 实现代码从定义符号的叶子模块导入，避免引入不必要的引擎依赖。
@@ -421,7 +421,7 @@ pre-commit run --all-files
 | Trainer | 2631 / 1726 | TorchTitan `trainer.py` + `training_engine.py`：1460 / 1185 | 本项目另含 runtime 装配、validation 和 PP 驱动 |
 | DistMuon/FlexShard | 4377 / 3716 | TorchTitan FlexShard：4533 / 3786 | 规模和职责接近，不存在数量级简化 |
 
-方法级数据同样应避免“少即是好”的误判：`parallelize_hf_transformers` 为
+方法级数据同样应避免“少即是好”的误判：`parallelize_model` 为
 193/166 行，承担全部并行装配和组合校验；`Trainer.train` 为 150/83 行，覆盖
 训练、validation、保存和关闭路径。`stages.py` 的 80/59 行只负责声明顺序，
 不包含各 `apply_*` 的实现成本。

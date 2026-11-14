@@ -263,6 +263,8 @@ class KimiMoEGate(nn.Module):
 class KimiSparseMoE(nn.Module):
     """Per-expert reference math, including latent and shared expert paths."""
 
+    expert_parallel_layout = "kimi_per_expert"
+
     def __init__(self, config: KimiLinearConfig) -> None:
         super().__init__()
         self.config = config
@@ -294,6 +296,90 @@ class KimiSparseMoE(nn.Module):
                 config.moe_intermediate_size * config.num_shared_experts
             )
             self.shared_experts = KimiMLP(shared_config)
+
+    @staticmethod
+    def validate_expert_parallel_ownership(
+        *,
+        blocks: tuple[nn.Module, ...],
+        module_paths: list[tuple[str, nn.Module]],
+        external_parameters: dict[int, list[str]],
+    ) -> None:
+        """Reject expert aliases that stacking cannot preserve, before conversion.
+
+        Repeated references to one block are allowed. Sharing individual expert
+        parameters within or across blocks, or with external consumers, is not.
+        This preflight reads the original model without allocating replacements.
+        """
+        # Stacking a projection cannot preserve individual expert aliases. Reject
+        # them before constructing any replacement, including cross-block aliases.
+        expert_ids = {
+            id(parameter)
+            for block in blocks
+            for parameter in block.experts.parameters()
+        }
+        if not expert_ids:
+            return
+        # Different Parameter objects (or a buffer view) can share storage without
+        # sharing identity. Stacking would silently sever that ownership too.
+        expert_storage: dict[int, int] = {}
+        for _, module in module_paths:
+            for parameter in module.parameters(recurse=False):
+                if (
+                    id(parameter) in expert_ids
+                    and type(parameter) is nn.Parameter
+                    and parameter.layout == torch.strided
+                ):
+                    storage = parameter.untyped_storage()._cdata
+                    previous = expert_storage.setdefault(storage, id(parameter))
+                    if previous != id(parameter):
+                        raise UnsupportedCombinationError(
+                            "Kimi EP cannot stack expert parameters sharing storage"
+                        )
+        for path, module in module_paths:
+            buffers = tuple(module.named_buffers(recurse=False))
+            buffer_ids = {id(value) for _, value in buffers}
+            tensors = tuple(module.named_parameters(recurse=False)) + buffers
+            for name, tensor in tensors:
+                if type(tensor) not in (torch.Tensor, nn.Parameter):
+                    continue
+                if tensor.layout != torch.strided:
+                    continue
+                owner = expert_storage.get(tensor.untyped_storage()._cdata)
+                if owner is not None and (
+                    id(tensor) != owner or id(tensor) in buffer_ids
+                ):
+                    raise UnsupportedCombinationError(
+                        "Kimi EP cannot preserve expert storage alias "
+                        f"at {path}.{name}; an explicit layout adapter is required"
+                    )
+        owners: dict[int, tuple[int, str]] = {}
+        checked_blocks: set[int] = set()
+        for block in blocks:
+            if id(block) in checked_blocks:
+                continue
+            checked_blocks.add(id(block))
+            for name, parameter in block.experts.named_parameters(
+                remove_duplicate=False
+            ):
+                owner = (id(block), name)
+                previous = owners.setdefault(id(parameter), owner)
+                if previous != owner:
+                    raise UnsupportedCombinationError(
+                        "Kimi EP cannot stack a shared individual expert parameter "
+                        f"at experts.{name}; expert aliases require a layout adapter"
+                    )
+        owners.clear()
+        for path, module in module_paths:
+            for name, parameter in module.named_parameters(recurse=False):
+                if id(parameter) not in expert_ids:
+                    continue
+                owner = (id(module), name)
+                previous = owners.setdefault(id(parameter), owner)
+                if previous != owner or id(parameter) in external_parameters:
+                    raise UnsupportedCombinationError(
+                        f"Kimi EP cannot stack a shared individual expert parameter "
+                        f"at {path}.{name}; expert aliases require a layout adapter"
+                    )
 
     def validate_expert_parallel(
         self,
@@ -418,6 +504,18 @@ class KimiSparseMoE(nn.Module):
             return SituGLU(first.act_fn.beta, first.act_fn.linear_beta)
         return SwiGLU()
 
+    def expert_parallel_dimensions(self) -> tuple[int, int]:
+        """Return global expert count and routing width for dispatcher assembly."""
+        return len(self.experts), self.gate.top_k
+
+    def build_parallel_router(
+        self, *, aux_loss_coefficient: float | None
+    ) -> TokenChoiceTopKRouter:
+        """Expose routing construction without leaking the router's module path."""
+        return self.gate.build_parallel_router(
+            aux_loss_coefficient=aux_loss_coefficient
+        )
+
     def build_parallel_experts(self, *, start: int, count: int) -> GroupedExperts:
         """Pack a contiguous expert slice without changing source parameters.
 
@@ -491,6 +589,35 @@ class KimiSparseMoE(nn.Module):
         experts.train(self.training)
         moe.tokens_per_expert_E = moe.tokens_per_expert_E.to(self.gate.weight.device)
         return moe
+
+    def expert_parallel_replacements(
+        self, converted: MoE
+    ) -> tuple[
+        dict[nn.Module, nn.Module],
+        dict[nn.Parameter, tuple[nn.Parameter, ...]],
+    ]:
+        """Describe identities changed by this model's stacked expert layout.
+
+        Replicated projections and correction bias are reused and need no
+        replacement event. Every source expert maps to its packed projection;
+        parameter ownership slices remain the parallel executor's responsibility.
+        """
+        grouped = converted.routed_experts.inner_experts
+        modules = {
+            self: converted,
+            self.experts: grouped,
+            self.gate: converted.router.gate,
+        }
+        parameters = {
+            getattr(expert, source_name).weight: (getattr(grouped, target_name),)
+            for expert in self.experts
+            for source_name, target_name in (
+                ("w1", "w1_EFD"),
+                ("w2", "w2_EDF"),
+                ("w3", "w3_EFD"),
+            )
+        }
+        return modules, parameters
 
     def expert_parallel_math_signature(self) -> tuple[object, ...]:
         """Snapshot routing, activation and latent norm math for plan validation.

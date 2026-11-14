@@ -45,7 +45,17 @@ from ...contracts import DecoderStructure
 from .experts import RoutedExperts
 from .routing import QuantileBalancedTopKRouter, TokenChoiceTopKRouter
 
-__all__ = ["collect_moe_layers", "declared_moe_block", "MoE"]
+__all__ = [
+    "collect_moe_layers",
+    "declared_expert_layout",
+    "declared_moe_block",
+    "MoE",
+]
+
+
+def declared_expert_layout(block: nn.Module) -> str | None:
+    """Return the model-owned EP storage and conversion layout, if declared."""
+    return getattr(block, "expert_parallel_layout", None)
 
 
 def declared_moe_block(layer: nn.Module) -> tuple[str, nn.Module | None] | None:
@@ -330,13 +340,18 @@ def collect_moe_layers(model_part: nn.Module) -> list[MoE]:
             return []
     found: list[MoE] = []
     seen: set[int] = set()
+    # Activation checkpointing wraps each layer in torch's CheckpointWrapper;
+    # bind declarations against the original layer, not wrapper attributes.
+    layers = [getattr(layer, "_checkpoint_wrapped_module", layer) for layer in layers]
+    if (
+        structure is None
+        and not any(hasattr(layer, "moe_block_name") for layer in layers)
+        and not any(
+            isinstance(module, MoE) for layer in layers for module in layer.modules()
+        )
+    ):
+        return []
     for layer in layers:
-        # Activation checkpointing wraps each layer in torch's
-        # CheckpointWrapper; older torch versions don't forward attribute
-        # reads through it, so unwrap explicitly rather than relying on
-        # __getattr__ passthrough (the wrapper inserts a
-        # ``_checkpoint_wrapped_module`` FQN segment, cf. canonical_fqn).
-        layer = getattr(layer, "_checkpoint_wrapped_module", layer)
         declared = declared_moe_block(layer)
         if declared is None:
             raise ValueError(

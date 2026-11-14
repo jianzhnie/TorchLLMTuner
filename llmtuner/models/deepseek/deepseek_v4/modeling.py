@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import Any
 
 import torch
@@ -40,6 +41,7 @@ from transformers.utils.output_capturing import capture_outputs
 from ....errors import UnsupportedCombinationError
 from ...common.cast_linear import build_lm_head
 from ...common.input_preparation import prepare_text_inputs
+from ...common.validation import temporary_attention_mask
 from ...configuration import (
     configure_reference_experts,
     validate_attention_backend,
@@ -562,6 +564,12 @@ class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
         self._cp_load_balancer = load_balancer
         self._cp_mask_mesh = mesh if mask_mesh is None else mask_mesh
         self._cp_strategy = strategy
+
+    def validation_context(
+        self, *, mask_type: str | None
+    ) -> AbstractContextManager[None]:
+        """Temporarily select this decoder's attention policy for validation."""
+        return temporary_attention_mask(self.model.config, mask_type=mask_type)
 
     def prepare_inputs(
         self,

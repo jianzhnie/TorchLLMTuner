@@ -116,6 +116,11 @@ def resolve_moe_routing(block: nn.Module) -> MoERoutingBinding:
     if contract is not None:
         if not isinstance(contract, MoEBlockContract):
             raise TypeError("moe_contract must be a MoEBlockContract")
+        if contract.group_routing == "single_best":
+            raise NotImplementedError(
+                "EP group-limited greedy selects a single best expert per group; "
+                "the grouped dispatcher implements top-2 score summation"
+            )
         router, _, shared = contract.bind(block)
         return MoERoutingBinding(
             source=block,
@@ -200,6 +205,13 @@ def resolve_packed_experts(block: nn.Module, *, degree: int) -> PackedExpertBind
     # Validate rank before indexing geometry, including direct resolver calls.
     if gate_up.ndim != 3 or down.ndim != 3:
         raise ValueError("EP fused gate/up requires rank-3 expert parameters")
+    if any(
+        name == "bias" or name.endswith("_bias")
+        for name, _ in owner.named_parameters(recurse=False)
+    ):
+        raise NotImplementedError(
+            "EP grouped experts do not support expert bias vectors"
+        )
     # Explicit contracts own mathematical restrictions. Fused tensors only
     # produce views, never copied parameters.
     if contract.activation != "silu":

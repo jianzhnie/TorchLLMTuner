@@ -77,7 +77,7 @@ Trainer
     ↓
 HFTransformerModel
     ↓
-parallelize_hf_transformers
+parallelize_model
     ↓
 TP → EP → CP → Activation Checkpoint
     → Activation Swap（可选）→ Compile（可选）→ FSDP

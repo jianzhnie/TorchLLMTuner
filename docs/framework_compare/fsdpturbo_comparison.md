@@ -136,7 +136,7 @@ forward 和部件视图，TP 使用 HF `_tp_plan`，EP probe 检查 MoE 布局�
 | Optimizer 驻留 | `state_residency.py`：186 / 144 | `swap_optimizer.py`：395 / 285 | Virtual 与分批 AdamWSwap 机制不同，不按行数判断开销 |
 | MC2 dispatch + ops | 483 / 409 | `dispatcher_mc2.py` + NPU `grouped_matmul_mc2.py`：270 / 226 | 本项目包含更多布局校验、空分组回退和指标 |
 | Domino dispatch | 390 / 312 | `domino_dispatcher.py`：494 / 334 | 本项目物理行少约 21%，有效代码行仅少约 7% |
-| 并行装配入口 | `parallelize_hf_transformers`：193 / 166 | `FSDPTurbo.__init__`：18 / 17 | 前者内联组合校验，后者将工作分派给更多方法，入口行数不代表总复杂度 |
+| 并行装配入口 | `parallelize_model`：193 / 166 | `FSDPTurbo.__init__`：18 / 17 | 前者内联组合校验，后者将工作分派给更多方法，入口行数不代表总复杂度 |
 
 这些数据说明：TorchLLMTuner 的部分单文件适配更紧凑，但完整的组合校验、
 回退和生命周期管理会增加代码。比较简洁性时还应检查重复逻辑和调用层级，

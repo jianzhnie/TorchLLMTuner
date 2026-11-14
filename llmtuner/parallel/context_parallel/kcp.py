@@ -19,12 +19,15 @@ from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_comm_device, get_world_size
 from ...models.contracts import DecoderStructure
 from ...models.kimi.kimi_k3.delta_attention import (
-    KimiDeltaAttention,
     forward_context_parallel_kda,
     validate_context_parallel_kda,
 )
-from ...models.kimi.kimi_k3.latent_attention import KimiLatentAttention
-from ..plan import ParallelPlan, PlanTarget
+from ..plan import (
+    FullPlanBindings,
+    ParallelPlan,
+    PlanTarget,
+    snapshot_model_bindings,
+)
 from .attention import HeadToSeq, SeqToHead
 
 try:
@@ -54,7 +57,7 @@ def kcp_kda_forward(
 
     @wraps(original_forward)
     def forward(
-        module: KimiDeltaAttention,
+        module: nn.Module,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         cache_params: Any = None,
@@ -206,53 +209,29 @@ def kcp_mla_attention(group):
     return forward
 
 
-def resolve_kcp_plan(model: nn.Module, *, degree: int) -> ParallelPlan:
+def resolve_kcp_plan(
+    model: nn.Module, *, degree: int, bindings: FullPlanBindings | None = None
+) -> ParallelPlan:
     """Bind KCP targets without loading kernels or modifying model forwards.
 
-    Explicit models consume declared attention slots. Structural detection is
-    retained only for existing raw-module callers. Aliases install once.
+    Models consume declared attention slots and layouts. Aliases install once.
     """
     if type(degree) is not int or degree < 1:
         raise ValueError("KCP degree must be a positive integer")
     structure = getattr(model, "decoder_structure", None)
-    if structure is not None:
-        if not isinstance(structure, DecoderStructure):
-            raise TypeError("KCP requires a model-owned DecoderStructure")
-        # Preserve first-occurrence order while installing each shared module
-        # once. Declaration binding itself retains every decoder slot.
-        attentions = tuple(dict.fromkeys(structure.bind_attentions(model)))
-        layouts = {
-            module: getattr(module, "context_parallel_layout", None)
-            for module in attentions
-        }
-        if any(
-            layout not in ("kda_state", "mla_ulysses") for layout in layouts.values()
-        ):
-            raise ValueError("KCP requires declared Kimi KDA/MLA attention modules")
-        modules = [m for m in attentions if layouts[m] == "kda_state"]
-        mla_modules = [m for m in attentions if layouts[m] == "mla_ulysses"]
-    else:
-        required = ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias")
-        attentions = tuple(model.modules())
-        if any(
-            (
-                all(hasattr(module, name) for name in ("q_proj", "k_proj", "v_proj"))
-                or all(
-                    hasattr(module, name)
-                    for name in ("kv_a_proj_with_mqa", "kv_b_proj")
-                )
-            )
-            and not all(hasattr(module, name) for name in required)
-            and not isinstance(module, KimiLatentAttention)
-            for module in attentions
-        ):
-            raise ValueError("KCP does not support hybrid KDA/softmax attention models")
-        modules = [
-            module
-            for module in attentions
-            if all(hasattr(module, name) for name in required)
-        ]
-        mla_modules = [m for m in attentions if isinstance(m, KimiLatentAttention)]
+    if not isinstance(structure, DecoderStructure):
+        raise TypeError("KCP requires a model-owned DecoderStructure")
+    # Preserve first-occurrence order while installing each shared module once.
+    # Declaration binding itself retains every decoder slot.
+    attentions = tuple(dict.fromkeys(structure.bind_attentions(model)))
+    layouts = {
+        module: getattr(module, "context_parallel_layout", None)
+        for module in attentions
+    }
+    if any(layout not in ("kda_state", "mla_ulysses") for layout in layouts.values()):
+        raise ValueError("KCP requires declared Kimi KDA/MLA attention modules")
+    modules = [m for m in attentions if layouts[m] == "kda_state"]
+    mla_modules = [m for m in attentions if layouts[m] == "mla_ulysses"]
     if not modules and not (structure is not None and mla_modules):
         raise ValueError("KCP selected but no Kimi Delta Attention module was found")
     for module in mla_modules:
@@ -273,10 +252,7 @@ def resolve_kcp_plan(model: nn.Module, *, degree: int) -> ParallelPlan:
             )
             for module in targets
         ),
-        operations=("bind_kda_context", "bind_mla_exchange"),
-        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
-        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
-        buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+        **(snapshot_model_bindings(model) if bindings is None else bindings),
     )
 
 
@@ -296,6 +272,9 @@ def apply_kcp(
     if plan.stage != "cp" or plan.implementation != "kcp" or plan.degree != degree:
         raise ValueError("KCP plan does not match the requested execution")
     plan.validate_binding(model)
+    structure = plan.decoder_structure
+    if structure is None:
+        raise ValueError("KCP execution requires a declared DecoderStructure")
     # Metadata checks precede optional runtime loading and wrapper creation.
     # A frozen plan does not freeze model-owned role declarations.
     kda_count = 0
@@ -307,9 +286,7 @@ def apply_kcp(
         if id(module) in seen:
             raise ValueError("KCP plan contains duplicate attention targets")
         seen.add(id(module))
-        if plan.decoder_structure is not None and (
-            getattr(module, "context_parallel_layout", None) != target.layout
-        ):
+        if getattr(module, "context_parallel_layout", None) != target.layout:
             raise ValueError(f"Stale KCP attention layout: {target.path}")
         if target.layout == "mla_ulysses":
             if module.num_heads % degree:
@@ -318,13 +295,10 @@ def apply_kcp(
             kda_count += 1
         else:
             raise ValueError(f"Unsupported KCP target layout: {target.layout}")
-    if plan.decoder_structure is not None:
-        expected = {
-            id(module) for module in plan.decoder_structure.bind_attentions(model)
-        }
-        if seen != expected:
-            raise ValueError("KCP plan must cover all declared attention slots")
-    if not kda_count and (plan.decoder_structure is None or not seen):
+    expected = {id(module) for module in structure.bind_attentions(model)}
+    if seen != expected:
+        raise ValueError("KCP plan must cover all declared attention slots")
+    if not kda_count and not seen:
         raise ValueError("KCP plan requires at least one KDA target")
     _kcp_runtime()
     group = cp_mesh.get_group()

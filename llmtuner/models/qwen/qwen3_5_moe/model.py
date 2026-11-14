@@ -9,6 +9,7 @@ at construction; parallel and device transformations retain their own owners.
 """
 
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from types import MappingProxyType
 from typing import Any
 
@@ -29,6 +30,7 @@ from transformers.utils.output_capturing import capture_outputs
 from ....errors import UnsupportedCombinationError
 from ...common.cast_linear import build_lm_head
 from ...common.input_preparation import prepare_text_inputs
+from ...common.validation import temporary_attention_mask
 from ...configuration import (
     configure_reference_experts,
     validate_attention_backend,
@@ -135,17 +137,10 @@ def validate_linear_attention_policy(config: Qwen3_5MoeTextConfig) -> None:
     """Reject removed runtime policies until model-owned implementations exist."""
     validate_recurrent_mask(config)
     backend = getattr(config, "linear_attention_backend", "native")
-    policy = getattr(config, "gdn_numerical_policy", "native")
-    if backend != "native" or policy != "native":
+    if backend != "native":
         raise ValueError(
-            f"Qwen3.5 linear attention {backend!r}/{policy!r} is not implemented "
-            "by the explicit model; only native/native is supported"
-        )
-    if getattr(config, "gdn_allow_right_padding", False) or getattr(
-        config, "gdn_deterministic_reduction", False
-    ):
-        raise ValueError(
-            "Qwen3.5 custom GDN padding/reduction needs its explicit backend"
+            f"Qwen3.5 linear attention backend {backend!r} is not implemented "
+            "by the explicit model; only 'native' is supported"
         )
 
 
@@ -877,6 +872,12 @@ class Qwen3_5MoeForCausalLM(reference.Qwen3_5MoeForCausalLM):
             self._init_weights(module)
 
         self.apply(initialize)
+
+    def validation_context(
+        self, *, mask_type: str | None
+    ) -> AbstractContextManager[None]:
+        """Temporarily select this decoder's attention policy for validation."""
+        return temporary_attention_mask(self.model.config, mask_type=mask_type)
 
     def prepare_inputs(
         self,

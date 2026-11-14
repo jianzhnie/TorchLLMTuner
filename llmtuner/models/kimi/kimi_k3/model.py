@@ -49,6 +49,7 @@ Native all-to-all EP conversion lives in parallel/expert_parallel; hybrid KCP
 and pipeline transfer of attention-residual history require further integration.
 """
 
+from contextlib import AbstractContextManager
 from typing import Any
 
 import torch
@@ -63,6 +64,7 @@ from ....errors import UnsupportedCombinationError
 from ...common.cast_linear import build_lm_head
 from ...common.input_preparation import prepare_text_inputs
 from ...common.moe.layer import MoE
+from ...common.validation import temporary_attention_mask
 from ...configuration import (
     validate_attention_backend,
     validate_native_execution_policy,
@@ -433,6 +435,12 @@ class KimiLinearForCausalLM(PreTrainedModel):
                     rates = torch.empty_like(module.A_log, dtype=torch.float32)
                     module.A_log.copy_(rates.uniform_(1, 16).log_())
                     nn.init.zeros_(module.dt_bias)
+
+    def validation_context(
+        self, *, mask_type: str | None
+    ) -> AbstractContextManager[None]:
+        """Temporarily select this decoder's attention policy for validation."""
+        return temporary_attention_mask(self.model.config, mask_type=mask_type)
 
     def prepare_inputs(
         self,

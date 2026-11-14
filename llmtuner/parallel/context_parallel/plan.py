@@ -5,23 +5,30 @@ from __future__ import annotations
 from torch import nn
 
 from ...config.parallel_config import ParallelConfig
-from ..plan import ParallelPlan, validate_pipeline_targets
+from ..plan import FullPlanBindings, ParallelPlan, validate_pipeline_targets
 from .compressor_attention import resolve_compressor_plan
 from .kcp import resolve_kcp_plan
 
 __all__ = ["resolve_cp_plan", "validate_pipeline_cp_plan"]
 
 
-def resolve_cp_plan(model: nn.Module, *, cfg: ParallelConfig) -> ParallelPlan:
+def resolve_cp_plan(
+    model: nn.Module,
+    *,
+    cfg: ParallelConfig,
+    bindings: FullPlanBindings | None = None,
+) -> ParallelPlan:
     """Select the declared CP backend and resolve targets without mutation.
 
     Global preflight, PP-local ownership checks and post-TP/EP execution use
     the same selection rules, but each resolves its own live model bindings.
     """
     if cfg.cp_config.context_parallel_strategy == "kcp":
-        return resolve_kcp_plan(model, degree=cfg.cp_size)
+        return resolve_kcp_plan(model, degree=cfg.cp_size, bindings=bindings)
     if getattr(model, "context_parallel_backend", "standard") == "compressor":
-        return resolve_compressor_plan(model, degree=cfg.cp_size, cfg=cfg)
+        return resolve_compressor_plan(
+            model, degree=cfg.cp_size, cfg=cfg, bindings=bindings
+        )
     raise NotImplementedError(
         "Standard attention CP kernels have been removed; only model-owned "
         "KCP or Compressor CP backends are supported"

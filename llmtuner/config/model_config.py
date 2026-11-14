@@ -68,31 +68,7 @@ class ModelConfig:
     )
     linear_attention_backend: str = field(
         default="native",
-        metadata={
-            "help": "Qwen3.5 linear attention recurrence: native or npu_triton "
-            "(opt-in BF16, single-document pure FSDP; no compile or cache)."
-        },
-    )
-    gdn_numerical_policy: str = field(
-        default="native",
-        metadata={
-            "help": "GDN arithmetic: native or split_qkv_fp32_norm (explicit "
-            "BF16 Qwen3.5 projection/norm policy, independent of recurrence)."
-        },
-    )
-    gdn_deterministic_reduction: bool = field(
-        default=False,
-        metadata={
-            "help": "Explicit deterministic GDN gradient reduction; "
-            "requires npu_triton, not full-model determinism acceptance."
-        },
-    )
-    gdn_allow_right_padding: bool = field(
-        default=False,
-        metadata={
-            "help": "Experimental B1 causal right padding; requires "
-            "npu_triton + split_qkv_fp32_norm; masked FSDP/Trainer unverified."
-        },
+        metadata={"help": "Qwen3.5 native linear attention recurrence."},
     )
     qkv_projection: str = field(
         default="separate",
@@ -158,38 +134,14 @@ class ModelConfig:
                 setattr(self, name, getattr(architecture, name))
 
     def __post_init__(self) -> None:
-        if not isinstance(self.gdn_deterministic_reduction, bool):
-            raise ConfigError("model.gdn_deterministic_reduction must be boolean")
-        if (
-            self.gdn_deterministic_reduction
-            and self.linear_attention_backend != "npu_triton"
-        ):
-            raise ConfigError("gdn_deterministic_reduction requires npu_triton")
-        if not isinstance(self.gdn_allow_right_padding, bool):
-            raise ConfigError("model.gdn_allow_right_padding must be boolean")
-        if self.gdn_allow_right_padding and (
-            self.linear_attention_backend != "npu_triton"
-            or self.gdn_numerical_policy != "split_qkv_fp32_norm"
-        ):
-            raise ConfigError(
-                "gdn_allow_right_padding requires npu_triton + split_qkv_fp32_norm"
-            )
-        if self.gdn_numerical_policy not in ("native", "split_qkv_fp32_norm"):
-            raise ConfigError(
-                "model.gdn_numerical_policy must be native or split_qkv_fp32_norm"
-            )
         if self.router_compute_dtype not in (None, "float32"):
             raise ConfigError("model.router_compute_dtype must be float32 or None")
-        if self.linear_attention_backend not in ("native", "npu_triton"):
-            raise ConfigError(
-                "model.linear_attention_backend must be native or npu_triton"
-            )
+        if self.linear_attention_backend != "native":
+            raise ConfigError("model.linear_attention_backend must be native")
         if self.initialization_device not in ("cpu", "meta"):
             raise ConfigError("model.initialization_device must be cpu or meta")
-        if self.attention_backend not in ("auto", "flex", "eager_flex"):
-            raise ConfigError(
-                "model.attention_backend must be 'auto', 'flex', or 'eager_flex'."
-            )
+        if self.attention_backend != "auto":
+            raise ConfigError("model.attention_backend must be 'auto'")
         if self.rotary_init_device not in ("constructor", "target"):
             raise ConfigError(
                 "model.rotary_init_device must be 'constructor' or 'target'."

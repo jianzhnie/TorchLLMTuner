@@ -29,7 +29,7 @@ from ...errors import UnsupportedCombinationError
 from ...utils.logging import get_logger
 from ..compatibility import chunked_loss_fsdp
 from ..topology import ParallelTopology
-from .fine_grained import get_fsdp_strategy, load_custom_fsdp_engine
+from .fine_grained.fine_grained import get_fsdp_strategy, load_custom_fsdp_engine
 from .pattern import apply_fsdp_by_pattern, set_fsdp_prefetch_windows
 from .policies import (
     build_fsdp_placement_fn,

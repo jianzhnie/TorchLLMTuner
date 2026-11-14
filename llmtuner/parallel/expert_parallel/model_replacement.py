@@ -2,7 +2,7 @@
 
 Explicit models supply decoder and MoE slot declarations. Target resolution
 lives in ``plan.py``; alias ownership lives in ``ownership.py``. Weight
-conversion belongs to ``block_conversion.py`` or ``kimi_conversion.py``.
+conversion belongs to ``block_conversion.py`` or ``model_conversion.py``.
 This module installs validated replacements after weights are loaded.
 
 All replacements, shared-parameter bindings and TP checkpoint registrations
@@ -32,28 +32,32 @@ from llmtuner.config.parallel_config import (
 from llmtuner.errors import UnsupportedCombinationError
 
 from ...models.common.aux_loss import AuxLoss
-from ...models.common.moe.layer import MoE, declared_moe_block
+from ...models.common.moe.layer import (
+    MoE,
+    declared_expert_layout,
+    declared_moe_block,
+)
 from ...models.contracts import DecoderStructure
-from ...models.kimi.kimi_k3.moe import KimiSparseMoE
 from ...utils.logging import get_logger
-from ..plan import ParallelPlan, ReplacementObserver
+from ..plan import ParallelPlan
+from ..replacements import ReplacementObserver
+from . import plan as ep_plan
 from .block_conversion import (
     convert_block,
     validate_moe_conversion,
 )
-from .kimi_conversion import convert_kimi_block
+from .model_conversion import convert_model_block, uses_model_expert_conversion
 from .ownership import (
     bind_shared_projection,
     conversion_roots,
     external_state_owners,
     plan_tp_checkpoint_layouts,
-    validate_kimi_expert_aliases,
+    validate_model_expert_ownership,
 )
 from .plan import (
     MoEConversionTarget,
     declared_router_output,
     decoder_layers_for_ep,
-    resolve_ep_plan,
     validate_ep_model_geometry,
     validate_ep_model_options,
     validate_packed_expert_aliases,
@@ -62,7 +66,7 @@ from .plan import (
 
 logger = get_logger(__name__)
 
-__all__ = ["resolve_ep_plan", "swap_moe_blocks"]
+__all__ = ["swap_moe_blocks"]
 
 
 def swap_moe_blocks(
@@ -152,7 +156,7 @@ def swap_moe_blocks(
 
     # Bind targets after preceding stages (TP/PP) have stabilized this instance.
     degree = 1 if ep_group is None else dist.get_world_size(ep_group)
-    execution_plan = resolved_plan or resolve_ep_plan(
+    execution_plan = resolved_plan or ep_plan.resolve_ep_plan(
         model,
         degree=degree,
         implementation=token_dispatcher,
@@ -183,10 +187,10 @@ def swap_moe_blocks(
             and getattr(binding.owner, "moe_block_name", None) != binding.attribute
         ):
             raise ValueError(f"Stale EP decoder declaration: {target.path}")
-        if isinstance(target.module, KimiSparseMoE) and (
-            target.module.expert_parallel_math_signature() != binding.kimi_math
-        ):
-            raise ValueError(f"Stale EP Kimi mathematics: {target.path}")
+        math_signature = getattr(target.module, "expert_parallel_math_signature", None)
+        current_math = math_signature() if callable(math_signature) else None
+        if current_math != binding.model_math:
+            raise ValueError(f"Stale EP model mathematics: {target.path}")
         if getattr(target.module, "moe_contract", None) != binding.contract:
             raise ValueError(f"Stale EP model contract: {target.path}")
         if binding.contract is not None:
@@ -204,9 +208,11 @@ def swap_moe_blocks(
         candidates.append(
             (binding.owner, binding.attribute, target.module, binding.router_logits)
         )
-        if isinstance(target.module, KimiSparseMoE):
-            if target.layout != "kimi_per_expert":
-                raise ValueError("EP Kimi target requires its per-expert layout")
+        if uses_model_expert_conversion(target.module) != binding.model_conversion:
+            raise ValueError(f"Stale EP conversion interface: {target.path}")
+        if binding.model_conversion:
+            if target.layout != declared_expert_layout(target.module):
+                raise ValueError("EP target requires its model-declared expert layout")
             # Revalidate all targets before constructing the first replacement:
             # execution options/config can change without replacing tensors.
             target.module.validate_expert_parallel(
@@ -265,6 +271,7 @@ def swap_moe_blocks(
     replacements: list[tuple[nn.Module, str, MoE]] = []
     converted_blocks: dict[int, MoE] = {}
     converted_parameters: dict[int, tuple[nn.Parameter, ...]] = {}
+    module_targets: dict[nn.Module, nn.Module] = {}
     stacked_projection_sources: dict[int, tuple[int, ...]] = {}
     original_parameters = (
         {id(parameter): parameter for parameter in model.parameters()}
@@ -273,7 +280,7 @@ def swap_moe_blocks(
     )
     converted_biases: dict[int, torch.Tensor] = {}
     aux_group_counts = dict(AuxLoss._group_counts)
-    validate_kimi_expert_aliases(candidates, module_paths, external_parameters)
+    validate_model_expert_ownership(candidates, module_paths, external_parameters)
     try:
         for layer, attr, block, wants_router_logits in candidates:
             # Repeated layer slots may reference one physical HF block. Preserve
@@ -281,8 +288,8 @@ def swap_moe_blocks(
             if id(block) in converted_blocks:
                 replacements.append((layer, attr, converted_blocks[id(block)]))
                 continue
-            if isinstance(block, KimiSparseMoE):
-                moe = convert_kimi_block(
+            if uses_model_expert_conversion(block):
+                moe = convert_model_block(
                     block,
                     ep_group=ep_group,
                     aux_loss_coeff=aux_loss_coeff,
@@ -292,17 +299,11 @@ def swap_moe_blocks(
                 )
                 moe.router.fixed_router = fixed_router
                 if on_replacement is not None:
-                    grouped = moe.routed_experts.inner_experts
-                    for expert in block.experts:
-                        for source_name, target_name in (
-                            ("w1", "w1_EFD"),
-                            ("w2", "w2_EDF"),
-                            ("w3", "w3_EFD"),
-                        ):
-                            source = getattr(expert, source_name).weight
-                            converted_parameters[id(source)] = (
-                                getattr(grouped, target_name),
-                            )
+                    modules, parameters = block.expert_parallel_replacements(moe)
+                    module_targets.update(modules)
+                    converted_parameters.update(
+                        (id(source), targets) for source, targets in parameters.items()
+                    )
                 converted_blocks[id(block)] = moe
                 replacements.append((layer, attr, moe))
                 continue
@@ -379,17 +380,15 @@ def swap_moe_blocks(
         )
 
         if on_replacement is not None:
-            module_targets = {}
             for _, _, block, _ in candidates:
+                routing = routing_bindings.get(id(block))
+                if routing is None:
+                    # Model-owned conversions already supplied their identities.
+                    continue
                 moe = converted_blocks[id(block)]
                 module_targets[block] = moe
                 module_targets[block.experts] = moe.routed_experts.inner_experts
-                router = (
-                    block.gate
-                    if isinstance(block, KimiSparseMoE)
-                    else routing_bindings[id(block)].router
-                )
-                module_targets[router] = moe.router.gate
+                module_targets[routing.router] = moe.router.gate
             on_replacement(
                 module_targets,
                 {

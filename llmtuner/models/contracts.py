@@ -53,6 +53,7 @@ class MoEBlockContract:
     num_expert_groups: int | None = None
     num_limited_groups: int | None = None
     shared_expert_gate: str | None = None
+    group_routing: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.router, str) or not self.router or "." in self.router:
@@ -115,6 +116,8 @@ class MoEBlockContract:
             "sigmoid",
         }:
             raise ValueError(f"Unsupported MoE score function {self.score_func!r}")
+        if self.group_routing not in (None, "top2_sum", "single_best"):
+            raise ValueError(f"Unsupported MoE group routing {self.group_routing!r}")
 
     def bind(self, block: nn.Module) -> tuple[nn.Module, str, nn.Module | None]:
         """Resolve direct children without registering or inspecting the block."""

@@ -10,6 +10,7 @@ Device policies and parallel transformations are installed by their own layers.
 
 import inspect
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from types import MappingProxyType
 from typing import Any
 
@@ -78,6 +79,7 @@ from ...common.attention.masks import (
 from ...common.cast_linear import build_lm_head
 from ...common.input_preparation import prepare_text_inputs
 from ...common.moe.layer import collect_moe_layers
+from ...common.validation import temporary_attention_mask
 from ...configuration import configure_reference_experts, validate_attention_backend
 from ...contracts import DecoderStructure, MoEBlockContract
 from ..routing import Qwen3MoeFP32TopKRouter, validate_router_compute_dtype
@@ -802,6 +804,12 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
         self._cp_load_balancer = load_balancer
         self._cp_mask_mesh = mesh if mask_mesh is None else mask_mesh
         self._cp_strategy = strategy
+
+    def validation_context(
+        self, *, mask_type: str | None
+    ) -> AbstractContextManager[None]:
+        """Temporarily select this decoder's attention policy for validation."""
+        return temporary_attention_mask(self.model.config, mask_type=mask_type)
 
     def prepare_inputs(
         self,

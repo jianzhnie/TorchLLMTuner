@@ -20,7 +20,12 @@ from torch.nn import functional as F
 from ...accelerator.collectives import synchronize_local_errors
 from ...config.parallel_config import ParallelConfig
 from ...models.contracts import DecoderStructure, registered_submodule
-from ..plan import ParallelPlan, PlanTarget
+from ..plan import (
+    FullPlanBindings,
+    ParallelPlan,
+    PlanTarget,
+    snapshot_model_bindings,
+)
 from .attention import HeadToSeq, SeqToHead
 from .compression_windows import (
     CompressionWindowExchange,
@@ -245,7 +250,11 @@ def compressor_attention_forward(group):
 
 
 def resolve_compressor_plan(
-    model: torch.nn.Module, *, degree: int, cfg: ParallelConfig
+    model: torch.nn.Module,
+    *,
+    degree: int,
+    cfg: ParallelConfig,
+    bindings: FullPlanBindings | None = None,
 ) -> ParallelPlan:
     """Resolve stateless Compressor targets without changing model ownership."""
     if type(degree) is not int or degree < 1:
@@ -306,10 +315,7 @@ def resolve_compressor_plan(
             PlanTarget(paths[id(module)], "attention", module, module.layer_type)
             for module in attentions
         ),
-        operations=("bind_window_exchange", "install_stateless_decoder"),
-        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
-        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
-        buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+        **(snapshot_model_bindings(model) if bindings is None else bindings),
     )
 
 

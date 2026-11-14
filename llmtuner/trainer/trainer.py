@@ -1,6 +1,6 @@
 """Training loop and stable Trainer interface.
 
-``runtime.assembly`` assembles runtime state, ``runtime.engine`` executes
+``runtime.assembly`` builds explicit services, ``runtime.engine`` executes
 model and update steps, and ``runtime.validation`` evaluates. This module owns
 gradient checks, loss reductions, checkpoint counters, and the outer loop.
 
@@ -48,6 +48,7 @@ from ..datasets.contracts import (
     DataloaderExhaustedError,
     TrainerBatch,
 )
+from ..memory.activation_swap import reset_activation_swap_metrics
 from ..models.common.aux_loss import AuxLoss
 from ..models.common.moe.bias_update import (
     collect_routing_load_metrics,
@@ -56,14 +57,16 @@ from ..models.common.moe.bias_update import (
 from ..parallel.model_compile import rollback_compile_settings_on_error
 from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
-from ..utils.logging import get_logger
+from ..utils.logging import get_logger, set_log_ranks
 from ..utils.seeding import rollback_execution_settings_on_error, seed_everything
 from .runtime import assembly, engine, gradients
 from .runtime import batch as batch_runtime
 from .runtime import metrics as metrics_runtime
 from .runtime import validation as validation_runtime
+from .runtime.environment import build_runtime_environment
 from .runtime.progress import TrainingProgress
 from .runtime.reductions import resolve_training_reduction_meshes
+from .runtime.training_observer import TrainingObserver, install_dispatch_timers
 
 # Rank-aware: the helper attaches a handler whose filter passes below-ERROR
 # lines only on the log ranks (rank 0 by default), so a torchrun run logs one
@@ -128,14 +131,13 @@ class Trainer:
         self.progress.ntokens_seen = value
 
     def __init__(self, cfg: LLMTunerConfig):
-        """Assemble the trainer. The whole body lives in ``runtime/assembly.py`` --
-        the assembly order there is a contract (see its docstring)."""
+        """Build runtime services in lifecycle order, cleaning up partial failures."""
         compile_settings = nullcontext()
         if getattr(getattr(cfg, "training", None), "compile", False):
             compile_settings = rollback_compile_settings_on_error()
         with rollback_execution_settings_on_error(), compile_settings:
             try:
-                assembly.assemble_trainer_runtime(self, cfg)
+                self._assemble_runtime(cfg)
             except BaseException:
                 # Failed construction never returns an object to the caller, so
                 # release resources already acquired by partial assembly here.
@@ -149,6 +151,108 @@ class Trainer:
                     except BaseException:
                         pass  # Construction must retain the original assembly error.
                 raise
+
+    def _assemble_runtime(self, cfg: LLMTunerConfig) -> None:
+        """Acquire services in order and retain each owner before the next build.
+
+        Builders return explicit values. Assigning lifecycle resources here lets
+        close() release partial construction without passing this Trainer into
+        a builder or introducing a second resource owner.
+        """
+        self.cfg = cfg
+        environment = build_runtime_environment(
+            cfg,
+            seed_everything=self.seed_everything,
+            validate_validation=self.check_validation_feasibility,
+        )
+        self.rank = environment.rank
+        self.world_size = environment.world_size
+        self.local_rank = environment.local_rank
+        self.parallel_dims = environment.parallel_dims
+        self.device = environment.device
+        self.mesh = environment.mesh
+        error_group = environment.error_group
+        self.error_group = error_group
+
+        prepared_model = assembly.prepare_parallel_model(cfg, environment=environment)
+        model_assembly = prepared_model.assembly
+        self.model = model_assembly.model
+        self.model_parts = model_assembly.model_parts
+        optimizer_stack = assembly.build_optimizer_stack(
+            cfg,
+            model_parts=model_assembly.model_parts,
+            parallel_dims=environment.parallel_dims,
+            error_group=error_group,
+        )
+        self.optimizer = optimizer_stack.optimizer
+        self.lr_scheduler = optimizer_stack.lr_scheduler
+        self.ema = optimizer_stack.ema
+        self.training_engine = assembly.create_training_engine(
+            cfg,
+            model_assembly=model_assembly,
+            optimizer_stack=optimizer_stack,
+            parallel_dims=environment.parallel_dims,
+            device=environment.device,
+            param_context=self.param_context,
+            loss_sum=self.loss_sum,
+            error_group=error_group,
+        )
+
+        # The checkpointer captures the loader cursor alongside model state.
+        with synchronize_local_errors("Dataloader construction", group=error_group):
+            self.dataloader = batch_runtime.build_training_dataloader(
+                cfg, parallel_dims=environment.parallel_dims
+            )
+
+        # The checkpointer and public counters share this progress owner.
+        self.step = 0
+        self.ntokens_seen = 0
+
+        self.checkpointer = assembly.build_checkpointer(
+            cfg,
+            prepared_model.config,
+            model_assembly=model_assembly,
+            optimizer_stack=optimizer_stack,
+            dataloader=self.dataloader,
+            train_state=self.progress,
+            device=environment.device,
+            parallel_dims=environment.parallel_dims,
+            error_group=error_group,
+        )
+
+        self.metrics = assembly.build_metrics_processor(
+            cfg,
+            prepared_model.config,
+            parallel_dims=environment.parallel_dims,
+            num_parameters=prepared_model.num_parameters,
+            num_trainable_parameters=prepared_model.num_trainable_parameters,
+            error_group=error_group,
+        )
+        self.training_observer = TrainingObserver(
+            self.metrics, environment.device, group=error_group
+        )
+        self.dispatch_timers = []
+        if cfg.metrics.measure_moe_dispatch:
+            with synchronize_local_errors(
+                "Dispatch observer installation", group=error_group
+            ):
+                self.dispatch_timers = install_dispatch_timers(
+                    model_assembly.model_parts
+                )
+            if not self.dispatch_timers:
+                logger.warning(
+                    "Dispatch timing requested, but no native RoutedExperts boundary "
+                    "was found; dispatch timing is unavailable for this model."
+                )
+        if cfg.activation_swap:
+            reset_activation_swap_metrics()
+        # The trainer synchronizes PP loss metrics to every stage before logging.
+        set_log_ranks(cfg.metrics.log_ranks)
+        if environment.device.type == "npu":
+            logger.info(
+                "NPU step guards use explicit synchronous scalar reads; "
+                "loss/gradient and valid-token checks remain enabled"
+            )
 
     # -- setup helpers ---------------------------------------------------------
 
@@ -186,17 +290,6 @@ class Trainer:
         return batch_runtime.count_valid_tokens(batch)
 
     # -- the step, one function per level --------------------------------------
-
-    @property
-    def example_model(self):
-        """The model a batch is normalized against, present on every PP stage.
-
-        Unlike ``self.model`` (``None`` under PP, where this rank holds several
-        chunks and the schedule drives them), every rank keeps a module that can
-        run ``prepare_inputs`` using its declared input contract. Non-first
-        stages prepare the same input metadata without owning an embedding.
-        """
-        return self.model if self.model is not None else self.model_parts[0]
 
     def microbatch(self, batch: Batch | TrainerBatch) -> dict[str, Any]:
         """Everything one accumulation group's forward/backward needs.
@@ -517,7 +610,7 @@ class Trainer:
 
         The body lives in ``runtime/validation.py``; see there for the gating rule.
         """
-        return validation_runtime.should_validate(self, step)
+        return validation_runtime.should_validate(self.cfg.validation, step)
 
     def validate(self, step: int) -> None:
         """Run one eval-mode, gradient-free pass and log its loss.
@@ -525,7 +618,18 @@ class Trainer:
         The body lives in ``runtime/validation.py`` (gradient-free via its own
         ``torch.no_grad``); see there for the reporting contract.
         """
-        validation_runtime.validate(self, step)
+        validation_runtime.validate(
+            self.training_engine,
+            cfg=self.cfg,
+            metrics=self.metrics,
+            token_counter=self.count_valid_tokens,
+            step=step,
+            wait_for_staging=(
+                self.checkpointer.maybe_wait_for_staging
+                if self.checkpointer is not None
+                else None
+            ),
+        )
 
     # -- step cadence ------------------------------------------------------------
 

@@ -15,6 +15,7 @@ from ...config.parallel_config import ParallelConfig
 from ...errors import UnsupportedCombinationError
 from ...utils.module_names import canonical_fqn
 from ..module_patterns import compile_module_pattern
+from ..replacements import ReplacementMap
 
 __all__ = ["FSDPPatternReferences"]
 
@@ -40,8 +41,7 @@ class FSDPPatternReferences:
         self.cfg = cfg
         self.module_paths: dict[nn.Module, list[str]] = {}
         self.parameter_paths: dict[nn.Parameter, list[str]] = {}
-        self.module_targets: dict[nn.Module, nn.Module] = {}
-        self.parameter_targets: dict[nn.Parameter, tuple[nn.Parameter, ...]] = {}
+        self.replacements = ReplacementMap()
         for name, module in model.named_modules(remove_duplicate=False):
             self.module_paths.setdefault(module, []).append(canonical_fqn(name))
         for name, parameter in model.named_parameters(remove_duplicate=False):
@@ -110,7 +110,7 @@ class FSDPPatternReferences:
             excluded = excluded | {
                 target
                 for source in excluded
-                for target in self.parameter_targets.get(source, ())
+                for target in self.replacements.parameter_targets.get(source, ())
             }
             for sources in contributors.values():
                 if sources & excluded and not sources <= excluded:
@@ -119,20 +119,7 @@ class FSDPPatternReferences:
                         "expert parameter; exclude all source projections in "
                         "the stack or use an unstacked expert layout"
                     )
-        self.module_targets = {
-            source: modules.get(target, target)
-            for source, target in self.module_targets.items()
-        } | modules
-        self.parameter_targets = {
-            source: tuple(
-                dict.fromkeys(
-                    replacement
-                    for target in targets
-                    for replacement in parameters.get(target, (target,))
-                )
-            )
-            for source, targets in self.parameter_targets.items()
-        } | parameters
+        self.replacements.record_replacements(modules, parameters)
 
     def bind(self, model: nn.Module) -> ParallelConfig:
         modules = {}
@@ -161,7 +148,7 @@ class FSDPPatternReferences:
                 }
                 targets.update(
                     target
-                    for target in self.parameter_targets.get(parameter, ())
+                    for target in self.replacements.parameter_targets.get(parameter, ())
                     if target in current_parameters
                 )
                 if parameter in current_parameters:
@@ -179,7 +166,9 @@ class FSDPPatternReferences:
         for name, source in self.unit_options.items():
             pattern = canonical_fqn(name)
             if pattern not in modules:
-                target = self.module_targets.get(self.unit_modules.get(name))
+                target = self.replacements.module_targets.get(
+                    self.unit_modules.get(name)
+                )
                 pattern = first_module_paths.get(id(target), pattern)
             options = source.copy()
             hook = options.get("hook_module")
@@ -191,8 +180,8 @@ class FSDPPatternReferences:
                 ]
                 if targets:
                     options["hook_module"] = targets[0]
-                elif self.module_targets.get(hook) in current_modules:
-                    options["hook_module"] = self.module_targets[hook]
+                elif self.replacements.module_targets.get(hook) in current_modules:
+                    options["hook_module"] = self.replacements.module_targets[hook]
                 elif hook not in current_modules:
                     raise ValueError(
                         f"FSDP pattern {pattern!r}: hook_module lost its registered "
@@ -214,7 +203,9 @@ class FSDPPatternReferences:
         for name, source_module in self.ignored_modules.items():
             name = canonical_fqn(name)
             if name not in modules and source_module is not None:
-                target = self.module_targets.get(source_module, source_module)
+                target = self.replacements.module_targets.get(
+                    source_module, source_module
+                )
                 name = first_module_paths.get(id(target), name)
             ignored_names.append(name)
         # A source subtree can split across owners (Kimi gate weight and

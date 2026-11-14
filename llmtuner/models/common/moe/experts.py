@@ -32,7 +32,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ....accelerator.capabilities import has
-from ....accelerator.grouped_mm import aligned_npu_grouped_mm
 from ..activation import SwiGLU
 
 if TYPE_CHECKING:
@@ -234,8 +233,7 @@ class GroupedExperts(nn.Module):
                 for stride in (*x_TD.stride(), *weight_EOI.stride())
             )
             if not torch.compiler.is_compiling():
-                # Compiled NPU execution checks addresses inside its runtime
-                # op: Dynamo cannot trace storage_offset() in fullgraph.
+                # Eager NPU execution also rejects misaligned storage offsets.
                 grouped_layout_supported = grouped_layout_supported and (
                     x_TD.storage_offset() % 8 == 0
                     and weight_EOI.storage_offset() % 8 == 0
@@ -247,8 +245,6 @@ class GroupedExperts(nn.Module):
         ):
             left = x_TD.bfloat16()
             right = weight_EOI.bfloat16().transpose(-2, -1)
-            if x_TD.device.type == "npu" and torch.compiler.is_compiling():
-                return aligned_npu_grouped_mm(left, right, offsets_E).type_as(x_TD)
             return torch._grouped_mm(left, right, offs=offsets_E).type_as(x_TD)
 
         counts = offsets_E.clone()

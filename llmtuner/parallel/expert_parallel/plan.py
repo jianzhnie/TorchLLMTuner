@@ -16,10 +16,18 @@ from torch import nn
 
 from ...config.parallel_config import validate_expert_dispatcher
 from ...errors import UnsupportedCombinationError
-from ...models.common.moe.layer import MoE, declared_moe_block
+from ...models.common.moe.layer import (
+    MoE,
+    declared_expert_layout,
+    declared_moe_block,
+)
 from ...models.contracts import DecoderStructure, MoEBlockContract
-from ...models.kimi.kimi_k3.moe import KimiSparseMoE
-from ..plan import ParallelPlan, PlanTarget, validate_pipeline_targets
+from ..plan import (
+    FullPlanBindings,
+    ParallelPlan,
+    PlanTarget,
+    validate_pipeline_targets,
+)
 from .block_conversion import (
     MoERoutingBinding,
     PackedExpertBinding,
@@ -27,10 +35,11 @@ from .block_conversion import (
     resolve_packed_experts,
     validate_moe_conversion,
 )
+from .model_conversion import uses_model_expert_conversion
 from .ownership import (
     conversion_roots,
     external_state_owners,
-    validate_kimi_expert_aliases,
+    validate_model_expert_ownership,
 )
 
 
@@ -104,7 +113,7 @@ def find_moe_candidates(
         attr, block = declared
         if block is None:
             continue
-        if not isinstance(block, (KimiSparseMoE, MoE)):
+        if not isinstance(block, MoE) and not uses_model_expert_conversion(block):
             if not isinstance(getattr(block, "moe_contract", None), MoEBlockContract):
                 raise UnsupportedCombinationError(
                     f"Declared MoE slot {type(layer).__name__}.{attr} requires a "
@@ -133,8 +142,9 @@ class MoEConversionTarget:
     routing: MoERoutingBinding | None = None
     packed_experts: PackedExpertBinding | None = None
     contract: MoEBlockContract | None = None
-    kimi_math: tuple[object, ...] | None = None
+    model_math: tuple[object, ...] | None = None
     declared_slot: bool = False
+    model_conversion: bool = False
 
 
 def validate_packed_expert_aliases(
@@ -238,6 +248,7 @@ def resolve_ep_plan(
     tp_enabled: bool = False,
     quantile_balancing: bool = False,
     has_ep_group: bool | None = None,
+    bindings: FullPlanBindings | None = None,
 ) -> ParallelPlan:
     """Bind EP conversion targets without allocating weights or running collectives.
 
@@ -254,7 +265,11 @@ def resolve_ep_plan(
     validate_ep_model_options(config, implementation)
     layers = decoder_layers_for_ep(model)
     candidates = find_moe_candidates(model, layers, config)
-    modules = tuple(model.named_modules(remove_duplicate=False))
+    modules = (
+        tuple(model.named_modules(remove_duplicate=False))
+        if bindings is None
+        else bindings["module_bindings"]
+    )
     targets = []
     for owner, attribute, block, router_logits in candidates:
         paths = [path for path, module in modules if module is owner]
@@ -262,7 +277,8 @@ def resolve_ep_plan(
             raise ValueError("EP decoder owner is not registered in this model")
         routing = None
         packed_experts = None
-        if isinstance(block, KimiSparseMoE):
+        model_conversion = uses_model_expert_conversion(block)
+        if model_conversion:
             block.validate_expert_parallel(
                 degree=degree,
                 tp_enabled=tp_enabled,
@@ -271,6 +287,7 @@ def resolve_ep_plan(
             )
         else:
             routing = resolve_moe_routing(block)
+            packed_experts = resolve_packed_experts(block, degree=degree)
             validate_moe_conversion(
                 block,
                 routing,
@@ -279,15 +296,12 @@ def resolve_ep_plan(
                 token_dispatcher=implementation,
                 has_ep_group=degree > 1 if has_ep_group is None else has_ep_group,
             )
-            packed_experts = resolve_packed_experts(block, degree=degree)
         targets.append(
             PlanTarget(
                 f"{paths[0]}.{attribute}" if paths[0] else attribute,
                 "moe",
                 block,
-                "kimi_per_expert"
-                if isinstance(block, KimiSparseMoE)
-                else "fused_gate_up",
+                declared_expert_layout(block) or "fused_gate_up",
                 MoEConversionTarget(
                     owner,
                     attribute,
@@ -295,29 +309,44 @@ def resolve_ep_plan(
                     routing,
                     packed_experts,
                     getattr(block, "moe_contract", None),
-                    block.expert_parallel_math_signature()
-                    if isinstance(block, KimiSparseMoE)
-                    else None,
+                    (
+                        block.expert_parallel_math_signature()
+                        if callable(
+                            getattr(block, "expert_parallel_math_signature", None)
+                        )
+                        else None
+                    ),
                     declared_slot=hasattr(owner, "moe_block_name"),
+                    model_conversion=model_conversion,
                 ),
             )
         )
     module_paths = list(modules)
     roots = conversion_roots(candidates, module_paths)
     validate_packed_expert_aliases(targets, module_paths, roots, degree=degree)
-    if any(isinstance(block, KimiSparseMoE) for _, _, block, _ in candidates):
+    if any(
+        callable(getattr(block, "validate_expert_parallel_ownership", None))
+        for _, _, block, _ in candidates
+    ):
         external_parameters, _ = external_state_owners(module_paths, roots)
-        validate_kimi_expert_aliases(candidates, module_paths, external_parameters)
+        validate_model_expert_ownership(candidates, module_paths, external_parameters)
     validate_ep_model_geometry(model, degree=degree, tp_enabled=tp_enabled)
     return ParallelPlan(
         stage="ep",
         targets=tuple(targets),
         degree=degree,
         implementation=implementation,
-        operations=("convert", "bind_shared_state", "install"),
-        module_bindings=modules,
-        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
-        buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+        **(
+            {
+                "module_bindings": modules,
+                "parameter_bindings": tuple(
+                    model.named_parameters(remove_duplicate=False)
+                ),
+                "buffer_bindings": tuple(model.named_buffers(remove_duplicate=False)),
+            }
+            if bindings is None
+            else bindings
+        ),
     )
 
 
@@ -336,7 +365,8 @@ def pipeline_ep_semantics(target: PlanTarget) -> tuple[object, ...]:
         binding.attribute,
         binding.router_logits,
         binding.contract,
-        binding.kimi_math,
+        binding.model_math,
+        binding.model_conversion,
         binding.declared_slot,
         None if binding.packed_experts is None else binding.packed_experts.shape,
         None

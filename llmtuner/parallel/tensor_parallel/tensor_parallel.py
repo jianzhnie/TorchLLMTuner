@@ -71,9 +71,10 @@ from ..attention_heads import require_heads_divisible_by
 from ..plan import (
     ParallelPlan,
     PlanTarget,
-    ReplacementObserver,
+    snapshot_model_bindings,
     validate_pipeline_targets,
 )
+from ..replacements import ReplacementObserver
 from ..vocab_parallel.vocab_parallel import VocabParallelEmbedding
 from . import linear as tp_linear
 from . import sharding as tp_sharding
@@ -475,7 +476,7 @@ def resolve_tp_targets(
     if not sharding_plan:
         raise ValueError(
             f"apply_tp with tp={cfg.tp_size}: {type(model).__name__} provides no TP "
-            "plan (neither a `tp_config`/`_tp_config` declaration nor an explicit "
+            "plan (neither a `tp_config` declaration nor an explicit "
             "`plan` argument). Refusing to run TP as a silently replicated "
             "model; shard the projections declaratively or set tp=1."
         )
@@ -943,14 +944,11 @@ def resolve_tp_plan(
         ),
         degree=cfg.tp_size,
         implementation="unbound",
-        operations=("shard", "install_sequence_boundaries"),
         token_history_requirements=tuple(
             (path, getattr(module, "requires_full_token_history", None))
             for path, module in model.named_modules()
         ),
-        module_bindings=tuple(model.named_modules(remove_duplicate=False)),
-        parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
-        buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+        **snapshot_model_bindings(model),
     )
 
 

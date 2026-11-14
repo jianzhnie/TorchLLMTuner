@@ -10,7 +10,8 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...accelerator.collectives import synchronize_local_errors
 from ...utils.logging import get_logger
 from .. import compatibility
-from ..plan import ParallelPlan, ReplacementObserver
+from ..plan import ParallelPlan
+from ..replacements import ReplacementObserver
 from .domino_dispatch import DominoRoutedExperts
 from .mc2_dispatch import MC2RoutedExperts
 from .mc2_ops import validate_mc2_world_size

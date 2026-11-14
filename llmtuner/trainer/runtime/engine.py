@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 import torch
@@ -51,35 +52,6 @@ def loss_vocab_kwargs(
     return {"tp_group": tp_mesh.get_group(), "global_vocab_size": vocab_size}
 
 
-def evaluate_dense_batch(
-    model: torch.nn.Module,
-    batch: Batch | TrainerBatch,
-    *,
-    device: torch.device,
-    parallel_dims: ParallelTopology | None,
-    max_context_length: int,
-    param_context: ParamContext,
-    loss_sum: LossSum,
-    error_group: ProcessGroup | None = None,
-) -> torch.Tensor:
-    """Run the validation forward and return unnormalized token loss.
-
-    The caller owns eval/no-grad mode and RNG restoration. Keep the same
-    preprocessing and vocab reduction contracts as the training engine.
-    """
-    inputs, labels, extra_kwargs = prepare_model_inputs(
-        model,
-        batch,
-        device=device,
-        parallel_dims=parallel_dims,
-        max_context_length=max_context_length,
-        error_group=error_group,
-    )
-    with param_context(), spmd_context(parallel_dims):
-        logits = model_output_value(model(inputs, **extra_kwargs))
-        return loss_sum(logits, labels, **loss_vocab_kwargs(model, parallel_dims))
-
-
 @dataclass(slots=True)
 class TrainingEngine:
     """Execute forward/backward with fixed model and parallel dependencies."""
@@ -102,6 +74,38 @@ class TrainingEngine:
     # All update participants, including PP stages without tracked EMA tensors.
     # None preserves the default-group behavior for standalone callers.
     error_group: ProcessGroup | None = None
+
+    _run_forward_backward: Callable[..., torch.Tensor] = field(
+        init=False, repr=False, compare=False
+    )
+    _run_evaluation: Callable[[Batch | TrainerBatch], torch.Tensor | None] = field(
+        init=False, repr=False, compare=False
+    )
+    _dense_backward: Callable[..., torch.Tensor] = field(
+        init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        # Execution policy belongs to this assembly. Rebuild the engine after
+        # changing topology or loss mode rather than selecting it on each batch.
+        pipeline_enabled = (
+            self.parallel_dims is not None and self.parallel_dims.pp_enabled
+        )
+        self._run_forward_backward = (
+            partial(pipeline.run_pipeline_step, self)
+            if pipeline_enabled
+            else self._forward_backward_batch
+        )
+        self._run_evaluation = (
+            partial(pipeline.run_pipeline_eval, self)
+            if pipeline_enabled
+            else self._evaluate_dense
+        )
+        self._dense_backward = (
+            self._backward_chunked
+            if self.chunked_loss_num_chunks > 1
+            else self._backward_logits
+        )
 
     @property
     def model(self) -> torch.nn.Module:
@@ -135,10 +139,28 @@ class TrainingEngine:
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Return the unnormalized loss sum after normalized backward."""
-        if self.parallel_dims is not None and self.parallel_dims.pp_enabled:
-            return pipeline.run_pipeline_step(
-                self, batch, global_valid_tokens=global_valid_tokens
+        return self._run_forward_backward(
+            batch, global_valid_tokens=global_valid_tokens
+        )
+
+    def evaluate(self, batch: Batch | TrainerBatch) -> torch.Tensor | None:
+        """Return raw validation loss; non-final PP stages return None.
+
+        The caller owns eval/no-grad mode, RNG restoration and reporting.
+        """
+        return self._run_evaluation(batch)
+
+    def _evaluate_dense(self, batch: Batch | TrainerBatch) -> torch.Tensor:
+        inputs, labels, extra_kwargs = self.preprocess(batch)
+        with self.param_context(), spmd_context(self.parallel_dims):
+            logits = model_output_value(self.model(inputs, **extra_kwargs))
+            return self.loss_sum(
+                logits, labels, **loss_vocab_kwargs(self.model, self.parallel_dims)
             )
+
+    def _forward_backward_batch(
+        self, batch: Batch | TrainerBatch, *, global_valid_tokens: torch.Tensor
+    ) -> torch.Tensor:
         inputs, labels, extra_kwargs = self.preprocess(batch)
         return self.forward_backward_dense(
             inputs,
@@ -156,25 +178,51 @@ class TrainingEngine:
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Run one non-PP accumulation group without selecting execution policy."""
-        model = self.model
         with self.param_context(), spmd_context(self.parallel_dims):
-            if self.chunked_loss_num_chunks > 1:
-                hidden_states = model_output_value(
-                    model(inputs, **extra_kwargs, skip_lm_head=True),
-                    field="last_hidden_state",
-                )
-                return chunked_lm_head_cross_entropy(
-                    model.lm_head,
-                    hidden_states,
-                    labels,
-                    num_chunks=self.chunked_loss_num_chunks,
-                    grad_scale=1.0 / global_valid_tokens,
-                    **self.loss_vocab_kwargs(),
-                )
-            logits = model_output_value(model(inputs, **extra_kwargs))
-            loss_sum = self.loss_sum(logits, labels, **self.loss_vocab_kwargs())
-            del logits
-            (loss_sum / global_valid_tokens).backward()
+            return self._dense_backward(
+                inputs,
+                labels,
+                extra_kwargs=extra_kwargs,
+                global_valid_tokens=global_valid_tokens,
+            )
+
+    def _backward_chunked(
+        self,
+        inputs: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        extra_kwargs: dict[str, Any],
+        global_valid_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        model = self.model
+        hidden_states = model_output_value(
+            model(inputs, **extra_kwargs, skip_lm_head=True),
+            field="last_hidden_state",
+        )
+        return chunked_lm_head_cross_entropy(
+            model.lm_head,
+            hidden_states,
+            labels,
+            num_chunks=self.chunked_loss_num_chunks,
+            grad_scale=1.0 / global_valid_tokens,
+            **loss_vocab_kwargs(model, self.parallel_dims),
+        )
+
+    def _backward_logits(
+        self,
+        inputs: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        extra_kwargs: dict[str, Any],
+        global_valid_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        model = self.model
+        logits = model_output_value(model(inputs, **extra_kwargs))
+        loss_sum = self.loss_sum(
+            logits, labels, **loss_vocab_kwargs(model, self.parallel_dims)
+        )
+        del logits
+        (loss_sum / global_valid_tokens).backward()
         return loss_sum.detach()
 
     def optimizer_step(self, step: int) -> None:
@@ -193,7 +241,3 @@ class TrainingEngine:
             if self.ema is not None:
                 # All ranks enter, including PP stages with no tracked tensors.
                 self.ema.step(step)
-
-    def loss_vocab_kwargs(self) -> dict[str, Any]:
-        """Describe the model-owned vocab layout for loss reduction."""
-        return loss_vocab_kwargs(self.model, self.parallel_dims)

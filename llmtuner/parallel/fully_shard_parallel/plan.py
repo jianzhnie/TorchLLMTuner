@@ -25,8 +25,12 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...accelerator.capabilities import require
 from ...models.common.moe.experts import GroupedExperts
 from ..module_patterns import compile_module_pattern, resolve_module_patterns
-from ..plan import ParallelPlan, PlanTarget
-from .fine_grained import get_fsdp_strategy, validate_fsdp_hook_target
+from ..pipeline_parallel.ownership import (
+    PipelineOwnership,
+    snapshot_pipeline_ownership,
+)
+from ..plan import ParallelPlan, PlanTarget, snapshot_model_bindings
+from .fine_grained.fine_grained import get_fsdp_strategy, validate_fsdp_hook_target
 from .ownership import named_module_paths
 from .policies import (
     fsdp_shard_size,
@@ -108,7 +112,11 @@ def validate_fsdp_ignored_parameters(
 
 
 def resolve_pipeline_fsdp_configs(
-    model: nn.Module, parts: list[nn.Module], cfg: ParallelConfig
+    model: nn.Module,
+    parts: list[nn.Module],
+    cfg: ParallelConfig,
+    *,
+    ownership: list[PipelineOwnership] | None = None,
 ) -> list[ParallelConfig]:
     """Bind a whole-model pattern plan to copied pipeline parts by registered FQN.
 
@@ -124,71 +132,33 @@ def resolve_pipeline_fsdp_configs(
             options.get("ignored_params"), parameters=source_parameters, unit_name=name
         )
     source_paths = dict(model.named_modules(remove_duplicate=False))
-    module_aliases: dict[nn.Module, list[str]] = {}
-    for path, module in source_paths.items():
-        module_aliases.setdefault(module, []).append(path)
-    parameter_names: dict[nn.Parameter, list[str]] = {}
-    for name, parameter in model.named_parameters(remove_duplicate=False):
-        parameter_names.setdefault(parameter, []).append(name)
     ignored_names = resolve_module_patterns(
         list(source_paths),
         patterns=cfg.fsdp_config.fsdp_ignored_modules,
         plan_name="FSDP ignored",
     )
 
-    def local_module_binding(
-        source: nn.Module, local_modules: dict[str, nn.Module]
-    ) -> tuple[str, nn.Module] | None:
-        candidates = {
-            local_modules[path]: path
-            for path in reversed(module_aliases[source])
-            if path in local_modules
-            and not (
-                isinstance(local_modules[path], nn.Identity)
-                and not isinstance(source, nn.Identity)
-            )
-        }
-        if len(candidates) > 1:
-            raise ValueError(
-                "Pipeline FSDP module aliases no longer share one owner: "
-                f"{module_aliases[source]}"
-            )
-        return next(((path, module) for module, path in candidates.items()), None)
-
-    def local_parameter_bindings(
-        exclusions: set[nn.Parameter],
-        local_parameters: dict[str, nn.Parameter],
-    ) -> set[nn.Parameter]:
-        rebound = set()
-        for parameter in exclusions:
-            candidates = {
-                local_parameters[path]
-                for path in parameter_names[parameter]
-                if path in local_parameters
-            }
-            if len(candidates) > 1:
-                raise ValueError(
-                    "Pipeline FSDP parameter aliases no longer share one owner: "
-                    f"{parameter_names[parameter]}"
-                )
-            rebound.update(candidates)
-        return rebound
+    bindings = (
+        snapshot_pipeline_ownership(model, parts) if ownership is None else ownership
+    )
+    if len(bindings) != len(parts):
+        raise ValueError("Pipeline ownership must describe every local part")
+    for part, binding in zip(parts, bindings, strict=True):
+        binding.global_plan.validate_binding(model)
+        binding.local_plan.validate_binding(part)
 
     configs = []
-    for part in parts:
-        local_modules = dict(part.named_modules(remove_duplicate=False))
-        local_parameters = dict(part.named_parameters(remove_duplicate=False))
-
+    for binding in bindings:
         local_options = {}
         for name, overrides in unit_options.items():
-            binding = local_module_binding(source_modules[name], local_modules)
-            if binding is None:
+            unit_binding = binding.module_binding(source_modules[name])
+            if unit_binding is None:
                 continue
-            local_name, _ = binding
+            local_name, _ = unit_binding
             options = overrides.copy()
             hook = options.get("hook_module")
             if hook is not None:
-                hook_binding = local_module_binding(hook, local_modules)
+                hook_binding = binding.module_binding(hook)
                 if hook_binding is None:
                     raise ValueError(
                         f"FSDP unit {name!r}: hook_module must belong to its "
@@ -197,14 +167,12 @@ def resolve_pipeline_fsdp_configs(
                 options["hook_module"] = hook_binding[1]
             exclusions = options.get("ignored_params")
             if exclusions is not None:
-                options["ignored_params"] = local_parameter_bindings(
-                    exclusions, local_parameters
-                )
+                options["ignored_params"] = binding.parameter_bindings(exclusions)
             local_options.setdefault(local_name, {}).update(options)
         local_ignored = [
-            binding[0]
+            ignored_binding[0]
             for name in ignored_names
-            if (binding := local_module_binding(source_paths[name], local_modules))
+            if (ignored_binding := binding.module_binding(source_paths[name]))
             is not None
         ]
         configs.append(
@@ -533,17 +501,13 @@ def resolve_fsdp_pattern_plan(
         bindings=ParallelPlan(
             stage="fsdp",
             degree=fsdp_shard_size(dp_mesh),
-            degrees=(cfg.ep_size,),
             implementation=cfg.fsdp_config.fsdp_implementation,
             targets=tuple(
                 PlanTarget(name, "fsdp_unit", named_modules[name])
                 for names, _ in grouped_options
                 for name in names
             ),
-            operations=("fully_shard",),
-            module_bindings=tuple(model.named_modules(remove_duplicate=False)),
-            parameter_bindings=tuple(model.named_parameters(remove_duplicate=False)),
-            buffer_bindings=tuple(model.named_buffers(remove_duplicate=False)),
+            **snapshot_model_bindings(model),
         ),
         named_modules=named_modules,
         units=tuple((tuple(names), options) for names, options in grouped_options),

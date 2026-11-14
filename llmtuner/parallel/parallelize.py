@@ -47,13 +47,18 @@ from .fully_shard_parallel.fully_shard_parallel import (
 from .fully_shard_parallel.ownership import FSDPPatternReferences
 from .fully_shard_parallel.plan import resolve_pipeline_fsdp_configs
 from .model_compile import apply_compile, validate_compile_environment
+from .pipeline_parallel.ownership import PipelineOwnership
 from .pipeline_parallel.pipeline_parallel import (
     PipelineParallelSetup,
     apply_pp,
     build_pipeline_schedule,
     validate_microbatches,
 )
-from .plan import ParallelPlan
+from .plan import (
+    ParallelPlan,
+    model_bindings_from_plan,
+    snapshot_model_bindings,
+)
 from .stages import STAGE_ORDER
 from .tensor_parallel.sharding import resolve_tp_overrides
 from .tensor_parallel.tensor_parallel import (
@@ -303,6 +308,18 @@ def parallelize_model(
                 resolve_tp_overrides(model, cfg=cfg)
                 global_tp_plan = resolve_tp_plan(model, cfg=cfg)
             validate_microbatches(parallel_dims, cfg, global_batch_size)
+        pipeline_ownership_plan = (
+            global_tp_plan
+            or global_cp_plan
+            or global_ep_plan
+            or ParallelPlan(
+                stage="pp",
+                targets=(),
+                degree=cfg.pp_size,
+                implementation="deepcopy",
+                **snapshot_model_bindings(model),
+            )
+        )
         # Split first; use this stage's dense mesh for all local transforms.
         stages, model_parts, has_first_stage, has_last_stage = apply_pp(
             model,
@@ -326,12 +343,33 @@ def parallelize_model(
                     model_parts, resolved_tp_plans, strict=True
                 ):
                     validate_pipeline_tp_plan(global_tp_plan, local_plan, part)
+        local_ownership = []
+        with synchronize_local_errors(
+            "Pipeline local ownership validation", group=error_group
+        ):
+            for part, local_tp_plan in zip(model_parts, resolved_tp_plans, strict=True):
+                local_ownership_plan = local_tp_plan or ParallelPlan(
+                    stage="pp",
+                    targets=(),
+                    degree=cfg.pp_size,
+                    implementation="deepcopy",
+                    **snapshot_model_bindings(part),
+                )
+                ownership = PipelineOwnership(
+                    pipeline_ownership_plan, local_ownership_plan
+                )
+                ownership.validate_aliases()
+                local_ownership.append(ownership)
         if global_cp_plan is not None:
             with synchronize_local_errors(
                 "Pipeline local CP plan validation", group=error_group
             ):
-                for part in model_parts:
-                    local_cp_plan = resolve_cp_plan(part, cfg=cfg)
+                for part, ownership in zip(model_parts, local_ownership, strict=True):
+                    local_cp_plan = resolve_cp_plan(
+                        part,
+                        cfg=cfg,
+                        bindings=model_bindings_from_plan(ownership.local_plan),
+                    )
                     validate_pipeline_cp_plan(global_cp_plan, local_cp_plan, part)
         if global_ep_plan is not None:
             # PP stage configuration can change declarations without replacing
@@ -339,7 +377,7 @@ def parallelize_model(
             with synchronize_local_errors(
                 "Pipeline local EP plan validation", group=error_group
             ):
-                for part in model_parts:
+                for part, ownership in zip(model_parts, local_ownership, strict=True):
                     local_ep_plan = resolve_ep_plan(
                         part,
                         degree=cfg.ep_size,
@@ -347,13 +385,16 @@ def parallelize_model(
                         tp_enabled=cfg.tp_size > 1,
                         quantile_balancing=cfg.ep_config.moe_quantile_balancing,
                         has_ep_group=ep_group is not None,
+                        bindings=model_bindings_from_plan(ownership.local_plan),
                     )
                     validate_pipeline_ep_plan(global_ep_plan, local_ep_plan, part)
         # Part ownership is rank-local, but failure must stop all stages
         # before TP/EP/FSDP begin communicating on the resulting parts.
         with synchronize_local_errors("Pipeline FSDP plan binding", group=error_group):
             fsdp_configs = (
-                resolve_pipeline_fsdp_configs(model, model_parts, cfg)
+                resolve_pipeline_fsdp_configs(
+                    model, model_parts, cfg, ownership=local_ownership
+                )
                 if cfg.fsdp_config.fsdp_apply_modules
                 else [cfg] * len(model_parts)
             )

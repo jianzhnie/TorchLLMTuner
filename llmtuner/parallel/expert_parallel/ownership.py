@@ -12,7 +12,7 @@ from torch import nn
 
 from ...errors import UnsupportedCombinationError
 from ...models.common.moe.layer import MoE
-from ...models.kimi.kimi_k3.moe import KimiSparseMoE
+from .model_conversion import uses_model_expert_conversion
 
 
 def bind_shared_projection(
@@ -114,7 +114,7 @@ def plan_tp_checkpoint_layouts(
             (
                 converted_blocks[id(block)].routed_experts.inner_experts
                 for _, _, block, _ in candidates
-                if not isinstance(block, KimiSparseMoE) and owner is block.experts
+                if not uses_model_expert_conversion(block) and owner is block.experts
             ),
             None,
         )
@@ -166,84 +166,31 @@ def plan_tp_checkpoint_layouts(
     return converted_layouts
 
 
-def validate_kimi_expert_aliases(
+def validate_model_expert_ownership(
     candidates: list[tuple[nn.Module, str, nn.Module, bool]],
     module_paths: list[tuple[str, nn.Module]],
     external_parameters: dict[int, list[str]],
 ) -> None:
-    """Reject expert aliases that stacking cannot preserve, before conversion.
+    """Invoke each model-owned ownership rule once for its declared blocks.
 
-    Repeated references to one block are allowed. Sharing individual expert
-    parameters within or across blocks, or with external consumers, is not.
-    This preflight reads the original model without allocating replacements.
+    Group by the underlying hook function, not by model names or layouts.
+    Repeated decoder aliases of one physical block are passed only once.
     """
-    # Stacking a projection cannot preserve individual expert aliases. Reject
-    # them before constructing any replacement, including cross-block aliases.
-    kimi_expert_ids = {
-        id(parameter)
-        for _, _, block, _ in candidates
-        if isinstance(block, KimiSparseMoE)
-        for parameter in block.experts.parameters()
-    }
-    if not kimi_expert_ids:
-        return
-    # Different Parameter objects (or a buffer view) can share storage without
-    # sharing identity. Stacking would silently sever that ownership too.
-    expert_storage: dict[int, int] = {}
-    for _, module in module_paths:
-        for parameter in module.parameters(recurse=False):
-            if (
-                id(parameter) in kimi_expert_ids
-                and type(parameter) is nn.Parameter
-                and parameter.layout == torch.strided
-            ):
-                storage = parameter.untyped_storage()._cdata
-                previous = expert_storage.setdefault(storage, id(parameter))
-                if previous != id(parameter):
-                    raise UnsupportedCombinationError(
-                        "Kimi EP cannot stack expert parameters sharing storage"
-                    )
-    for path, module in module_paths:
-        buffers = tuple(module.named_buffers(recurse=False))
-        buffer_ids = {id(value) for _, value in buffers}
-        tensors = tuple(module.named_parameters(recurse=False)) + buffers
-        for name, tensor in tensors:
-            if type(tensor) not in (torch.Tensor, nn.Parameter):
-                continue
-            if tensor.layout != torch.strided:
-                continue
-            owner = expert_storage.get(tensor.untyped_storage()._cdata)
-            if owner is not None and (id(tensor) != owner or id(tensor) in buffer_ids):
-                raise UnsupportedCombinationError(
-                    "Kimi EP cannot preserve expert storage alias "
-                    f"at {path}.{name}; an explicit layout adapter is required"
-                )
-    owners: dict[int, tuple[int, str]] = {}
-    checked_kimi_blocks: set[int] = set()
+    validators = {}
     for _, _, block, _ in candidates:
-        if not isinstance(block, KimiSparseMoE) or id(block) in checked_kimi_blocks:
+        hook = getattr(block, "validate_expert_parallel_ownership", None)
+        if not callable(hook):
             continue
-        checked_kimi_blocks.add(id(block))
-        for name, parameter in block.experts.named_parameters(remove_duplicate=False):
-            owner = (id(block), name)
-            previous = owners.setdefault(id(parameter), owner)
-            if previous != owner:
-                raise UnsupportedCombinationError(
-                    "Kimi EP cannot stack a shared individual expert parameter "
-                    f"at experts.{name}; expert aliases require a layout adapter"
-                )
-    owners.clear()
-    for path, module in module_paths:
-        for name, parameter in module.named_parameters(recurse=False):
-            if id(parameter) not in kimi_expert_ids:
-                continue
-            owner = (id(module), name)
-            previous = owners.setdefault(id(parameter), owner)
-            if previous != owner or id(parameter) in external_parameters:
-                raise UnsupportedCombinationError(
-                    f"Kimi EP cannot stack a shared individual expert parameter "
-                    f"at {path}.{name}; expert aliases require a layout adapter"
-                )
+        key = getattr(hook, "__func__", hook)
+        if key not in validators:
+            validators[key] = (hook, {})
+        validators[key][1].setdefault(id(block), block)
+    for hook, blocks in validators.values():
+        hook(
+            blocks=tuple(blocks.values()),
+            module_paths=module_paths,
+            external_parameters=external_parameters,
+        )
 
 
 def conversion_roots(

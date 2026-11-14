@@ -1,9 +1,10 @@
 """Expert parallelism for explicitly declared model-owned MoE blocks.
 
 ``expert_parallel.py`` is the public entry. ``block_conversion.py`` constructs
-native MoE blocks from explicit contracts; ``model_replacement.py`` replaces them in a complete model, and
-``checkpointing.py`` converts expert checkpoint state. ``token_dispatch.py``
-implements local and distributed token dispatch and combine operations.
+native MoE blocks from explicit contracts; ``model_replacement.py`` replaces them
+in a complete model, and ``checkpointing.py`` converts expert checkpoint state.
+``token_dispatch.py`` implements local and distributed token dispatch and combine
+operations.
 ``torchao_dispatch.py`` adds the optional TorchAO padding adapter.
 
 Public symbols are loaded on request; importing a supporting module does not
@@ -15,7 +16,7 @@ from ...utils.lazy_exports import resolve_export
 _EXPORT_SOURCES = {
     "restore_fp32_state_buffers": "block_conversion",
     "apply_ep": "expert_parallel",
-    "resolve_ep_plan": "model_replacement",
+    "resolve_ep_plan": "plan",
     "swap_moe_blocks": "model_replacement",
 }
 

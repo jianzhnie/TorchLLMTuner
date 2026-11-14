@@ -51,25 +51,8 @@ def rowwise() -> ShardingConfig:
 
 
 def model_tp_config(model: nn.Module) -> Mapping[str, str | ShardingConfig]:
-    """The TP plan ``model`` declares, or ``{}``.
-
-    Prefers the explicit model's ``tp_config`` property and keeps legacy plan
-    attributes only at the external compatibility boundary.
-    """
-    declared = getattr(model, "tp_config", None)
-    if declared is not None:
-        return declared
-    # Explicit model contracts must not inherit private plans from a reference
-    # base class. Those plans are often relative to another module tree and an
-    # empty explicit declaration must fail before any sharding occurs.
-    if getattr(model, "decoder_structure", None) is not None:
-        return {}
-    return (
-        getattr(model, "_tp_config", None)
-        or getattr(model, "_tp_plan", None)
-        or getattr(model, "tp_plan", None)
-        or {}
-    )
+    """Return the model-owned ``tp_config`` declaration, or an empty plan."""
+    return getattr(model, "tp_config", None) or {}
 
 
 def resolve_tp_sharding_plan(

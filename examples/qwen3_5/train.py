@@ -55,11 +55,6 @@ def build_config(args: argparse.Namespace) -> LLMTunerConfig:
             ),
             router_compute_dtype=getattr(args, "router_compute_dtype", None),
             experts_implementation=getattr(args, "experts_implementation", "native"),
-            gdn_numerical_policy=getattr(args, "gdn_numerical_policy", "native"),
-            gdn_allow_right_padding=getattr(args, "gdn_allow_right_padding", False),
-            gdn_deterministic_reduction=getattr(
-                args, "gdn_deterministic_reduction", False
-            ),
             rotary_compute_dtype=getattr(args, "rotary_compute_dtype", None),
             rotary_cache_dtype=getattr(args, "rotary_cache_dtype", None),
         ),
@@ -136,25 +131,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--experts-implementation", choices=("native", "pre_down"), default="native"
     )
     parser.add_argument("--rotary-compute-dtype", choices=("float32",))
-    parser.add_argument(
-        "--gdn-numerical-policy",
-        choices=("native", "split_qkv_fp32_norm"),
-        default="native",
-    )
-    parser.add_argument(
-        "--gdn-allow-right-padding",
-        action="store_true",
-        help="Opt in to B1 right padding with npu_triton + split_qkv_fp32_norm",
-    )
-    parser.add_argument(
-        "--gdn-deterministic-reduction",
-        action="store_true",
-        help="Use block reduction for native NPU GDN dk/dbeta gradients",
-    )
     parser.add_argument("--rotary-cache-dtype", choices=("float32",))
-    parser.add_argument(
-        "--linear-attention-backend", choices=("native", "npu_triton"), default="native"
-    )
     parser.add_argument(
         "--compile-backend", choices=("none", "aot_eager", "inductor"), default="none"
     )

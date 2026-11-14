@@ -23,9 +23,6 @@ _RUNTIME_CONFIG_FIELDS = (
     "compute_dtype",
     "norm_backend",
     "linear_attention_backend",
-    "gdn_numerical_policy",
-    "gdn_allow_right_padding",
-    "gdn_deterministic_reduction",
     "qkv_projection",
     "rotary_init_device",
     "rotary_compute_dtype",
@@ -37,6 +34,14 @@ if TYPE_CHECKING:
     from torch import nn
 
     from ..config.llmtuner_config import LLMTunerConfig
+    from .registry import ModelSpec
+
+
+def registered_architecture(model_type: str) -> ModelSpec | None:
+    return get_model_spec(model_type) or get_model_spec(
+        model_type, task="conditional_generation"
+    )
+
 
 __all__ = [
     "build_model_config",
@@ -58,9 +63,7 @@ def build_model_config(
     empty dict to use architecture defaults. ``None`` loads the config from a
     local checkpoint directory or Hub identifier.
     """
-    architecture = get_model_spec(model_name_or_path) or get_model_spec(
-        model_name_or_path, task="conditional_generation"
-    )
+    architecture = registered_architecture(model_name_or_path)
     # Some HF composite constructors modify nested configuration dictionaries.
     overrides = deepcopy(arch_overrides) if arch_overrides is not None else {}
     if arch_overrides is not None:
@@ -75,9 +78,7 @@ def build_model_config(
         # Do not mutate AutoConfig's process-global registry during training.
         metadata, _ = PretrainedConfig.get_config_dict(model_name_or_path)
         model_type = metadata.get("model_type", "")
-        architecture = get_model_spec(model_type) or get_model_spec(
-            model_type, task="conditional_generation"
-        )
+        architecture = registered_architecture(model_type)
         if architecture is None:
             raise ValueError(f"No local configuration registered for {model_type!r}")
         config = architecture.config_type_loader().from_pretrained(model_name_or_path)
@@ -152,13 +153,6 @@ def apply_runtime_config(config: Any, cfg: LLMTunerConfig) -> None:
     config.compute_dtype = getattr(cfg, "compute_dtype", None)
     config.norm_backend = cfg.norm_backend
     config.linear_attention_backend = cfg.model.linear_attention_backend
-    config.gdn_numerical_policy = getattr(cfg.model, "gdn_numerical_policy", "native")
-    config.gdn_allow_right_padding = getattr(
-        cfg.model, "gdn_allow_right_padding", False
-    )
-    config.gdn_deterministic_reduction = getattr(
-        cfg.model, "gdn_deterministic_reduction", False
-    )
     config.qkv_projection = cfg.qkv_projection
     config.rotary_init_device = cfg.rotary_init_device
     config.rotary_compute_dtype = cfg.model.rotary_compute_dtype
@@ -200,10 +194,8 @@ def build_model_config_for(cfg: LLMTunerConfig) -> Any:
     """
     # Only registered architecture names select offline construction. Missing
     # paths and Hub IDs belong to from_pretrained, which owns their validation.
-    offline = not os.path.exists(cfg.hf_model) and (
-        get_model_spec(cfg.hf_model) is not None
-        or get_model_spec(cfg.hf_model, task="conditional_generation") is not None
-    )
+    architecture = registered_architecture(cfg.hf_model)
+    offline = not os.path.exists(cfg.hf_model) and architecture is not None
     overrides = (
         {
             "vocab_size": cfg.vocab_size,
@@ -222,9 +214,6 @@ def build_model_config_for(cfg: LLMTunerConfig) -> Any:
         else None
     )
     if overrides is not None:
-        architecture = get_model_spec(cfg.hf_model) or get_model_spec(
-            cfg.hf_model, task="conditional_generation"
-        )
         config_type = architecture.config_type_loader()
         # External configs may expose HF field aliases; plain model-owned
         # config classes need not implement Transformers' attribute_map.
