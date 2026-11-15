@@ -297,3 +297,69 @@ def test_synthetic_shift_preserves_row_boundaries_and_ignores_each_terminal():
     assert torch.equal(inputs, tokens.flatten())
     assert labels.tolist() == [2, 3, 4, -100, 8, 7, 6, -100]
     assert torch.equal(tokens, original)
+
+
+@pytest.mark.parametrize("batched_labels", [False, True])
+def test_restore_text_rows_preserves_independent_label_order(batched_labels):
+    tokens = torch.arange(6)
+    labels = torch.arange(10, 16)
+    if batched_labels:
+        labels = labels.reshape(2, 3)
+    restored, targets, was_flat = input_preparation.restore_text_batch_rows(
+        tokens, labels, batch_shape=(2, 3)
+    )
+    assert was_flat
+    torch.testing.assert_close(restored, torch.tensor([[0, 1, 2], [3, 4, 5]]))
+    torch.testing.assert_close(targets, torch.tensor([[10, 11, 12], [13, 14, 15]]))
+    assert restored.data_ptr() == tokens.data_ptr()
+    assert targets.data_ptr() == labels.data_ptr()
+
+
+@pytest.mark.parametrize("shape", [(True, 6), (2, 0), (6,), (2, 4)])
+def test_restore_text_rows_rejects_invalid_declared_shape(shape):
+    with pytest.raises(ValueError, match="input_batch_shape"):
+        input_preparation.restore_text_batch_rows(
+            torch.arange(6), None, batch_shape=shape
+        )
+
+
+def test_restore_text_rows_rejects_transposed_label_layout():
+    with pytest.raises(ValueError, match="labels must match"):
+        input_preparation.restore_text_batch_rows(
+            torch.arange(6), torch.arange(6).reshape(3, 2), batch_shape=(2, 3)
+        )
+
+
+@pytest.mark.parametrize("field", ["labels", "positions", "padding_mask"])
+@pytest.mark.parametrize("shape", [(3, 2), (1, 2, 3)])
+def test_preparation_rejects_wrong_token_axes_before_flattening(field, shape):
+    tokens = torch.arange(6).reshape(2, 3)
+    batch = {"input": tokens, "labels": tokens.clone()}
+    batch[field] = torch.zeros(shape, dtype=torch.long)
+    # No model config or mesh should be accessed for a malformed batch.
+    with pytest.raises(ValueError, match=field):
+        prepare_text_inputs(nn.Identity(), batch, parallel_dims=None)
+
+
+def test_preparation_accepts_flat_metadata_for_batched_tokens():
+    model = nn.Linear(4, 4)
+    model.config = SimpleNamespace(attn_mask_type="causal")
+    tokens = torch.arange(6).reshape(2, 3)
+    labels = torch.arange(10, 16)
+    positions = torch.tensor([0, 1, 2, 0, 1, 2])
+    padding = torch.tensor([False, False, True, False, False, False])
+    inputs, targets, extra = prepare_text_inputs(
+        model,
+        {
+            "input": tokens,
+            "labels": labels,
+            "positions": positions,
+            "padding_mask": padding,
+        },
+        parallel_dims=None,
+        preserve_batch_rows=True,
+    )
+    torch.testing.assert_close(inputs, tokens.flatten())
+    torch.testing.assert_close(targets, labels)
+    torch.testing.assert_close(extra["positions"], positions.reshape(2, 3))
+    torch.testing.assert_close(extra["padding_mask"], padding.reshape(2, 3))

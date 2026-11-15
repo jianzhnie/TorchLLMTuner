@@ -658,3 +658,64 @@ def test_reload_amsgrad_policy_reuses_host_moments_and_matches_native(
         torch.testing.assert_close(
             optimizer.state[value][name], expected, rtol=0, atol=0
         )
+
+
+def test_failed_prefetch_close_retains_buffers_until_retry():
+    import weakref
+
+    class RetryStream:
+        failed = True
+
+        def synchronize(self):
+            if self.failed:
+                raise RuntimeError("copy still pending")
+
+    optimizer = AdamWSwap([torch.nn.Parameter(torch.ones(4))])
+    source = torch.ones(4)
+    destination = torch.zeros(4)
+    source_ref = weakref.ref(source)
+    destination_ref = weakref.ref(destination)
+    buffers = [destination]
+    optimizer._pending_copies[id(buffers)] = ([source], buffers)
+    stream = RetryStream()
+    optimizer._copy_stream = stream
+    del source, destination, buffers
+
+    with pytest.raises(RuntimeError, match="copy still pending"):
+        optimizer.close()
+    assert source_ref() is not None
+    assert destination_ref() is not None
+    assert optimizer._copy_stream is stream
+    with pytest.raises(RuntimeError, match="restore a complete training checkpoint"):
+        optimizer.state_dict()
+
+    stream.failed = False
+    optimizer.close()
+    assert source_ref() is None
+    assert destination_ref() is None
+    assert optimizer._copy_stream is None
+    optimizer.close()
+    with pytest.raises(RuntimeError, match="restore a complete training checkpoint"):
+        optimizer.step()
+
+
+def test_restore_waits_for_old_prefetch_before_overwriting_moments():
+    class FailedStream:
+        def synchronize(self):
+            raise RuntimeError("copy still pending")
+
+    value = torch.nn.Parameter(torch.ones(4))
+    value.grad = torch.ones_like(value)
+    optimizer = AdamWSwap([value])
+    optimizer.step()
+    saved = deepcopy(optimizer.state_dict())
+    moment = optimizer.state[value]["exp_avg"]
+    before = moment.clone()
+    for state in saved["state"].values():
+        state["exp_avg"].fill_(123)
+    optimizer._copy_stream = FailedStream()
+
+    with pytest.raises(RuntimeError, match="copy still pending"):
+        optimizer.load_state_dict(saved)
+    assert optimizer.state[value]["exp_avg"] is moment
+    torch.testing.assert_close(moment, before, rtol=0, atol=0)

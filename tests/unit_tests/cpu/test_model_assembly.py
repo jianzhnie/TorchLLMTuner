@@ -9,12 +9,62 @@ from llmtuner.components.loss import chunked_lm_head_cross_entropy, cross_entrop
 from llmtuner.components.loss_contract import LossFunctions
 from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.training_config import resolve_batch_size_per_rank
+from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.parallel.assembly import ModelPartLayout, ParallelAssembly
 from llmtuner.parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
 from llmtuner.trainer.runtime import assembly
 from llmtuner.trainer.runtime import batch as batch_runtime
+from llmtuner.trainer.runtime.builders import TrainingBuilders
 from llmtuner.trainer.runtime.environment import RuntimeEnvironment
 from llmtuner.trainer.trainer import Trainer
+
+
+def test_profiler_factory_returns_unentered_owner_with_explicit_cleanup():
+    calls = []
+    entered = SimpleNamespace(step=lambda: None)
+
+    class Owner:
+        def __enter__(self):
+            calls.append("enter")
+            return entered
+
+        def __exit__(self, *args):
+            self.close()
+
+        def close(self):
+            calls.append("close")
+
+    owner = Owner()
+    cfg = LLMTunerConfig().profiler
+
+    def factory(config, *, global_step, base_folder):
+        assert config is cfg
+        assert global_step == 7
+        assert base_folder == "traces"
+        return owner
+
+    result = assembly.build_profiler(
+        cfg,
+        global_step=7,
+        base_folder="traces",
+        builders=TrainingBuilders(profiler=factory),
+    )
+    assert result is owner
+    assert calls == []
+    with result as profiler:
+        assert profiler is entered
+    assert calls == ["enter", "close"]
+
+
+def test_profiler_factory_rejects_context_without_cleanup_owner():
+    builders = TrainingBuilders(profiler=lambda *a, **k: nullcontext())
+    with pytest.raises(TypeError, match="owner with close"):
+        assembly.build_profiler(
+            LLMTunerConfig().profiler,
+            global_step=0,
+            base_folder="",
+            builders=builders,
+        )
 
 
 def apply_parallelism(model, cfg, monkeypatch, orchestration):
@@ -101,6 +151,7 @@ def test_meta_assembly_materializes_before_model_initialization(monkeypatch) -> 
 
 def test_engine_consumes_model_assembly_without_legacy_pp_attributes() -> None:
     model = nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities()
     schedule = object()
     error_group = object()
     model_assembly = assembly.ModelAssembly(
@@ -113,7 +164,7 @@ def test_engine_consumes_model_assembly_without_legacy_pp_attributes() -> None:
     cfg = LLMTunerConfig()
     trainer = SimpleNamespace(
         cfg=cfg,
-        parallel_dims=None,
+        parallel_dims=SimpleNamespace(pp_enabled=True),
         device=torch.device("cpu"),
         param_context=lambda: None,
         loss_sum=lambda logits, labels, **kwargs: logits.sum(),
@@ -139,9 +190,21 @@ def test_engine_consumes_model_assembly_without_legacy_pp_attributes() -> None:
 
 def test_optimizer_stack_and_engine_build_without_trainer_attributes() -> None:
     model = nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities()
     cfg = LLMTunerConfig()
 
-    stack = assembly.build_optimizer_stack(cfg, model_parts=[model], parallel_dims=None)
+    services = {}
+    stack = assembly.build_optimizer_stack(
+        cfg,
+        model_parts=[model],
+        parallel_dims=None,
+        on_service_acquired=services.__setitem__,
+    )
+    assert services == {
+        "optimizer": stack.optimizer,
+        "lr_scheduler": stack.lr_scheduler,
+        "ema": stack.ema,
+    }
     trainer = SimpleNamespace(
         cfg=cfg,
         parallel_dims=None,
@@ -219,8 +282,9 @@ def test_checkpointer_consumes_explicit_runtime_owners(monkeypatch) -> None:
 
 def test_engine_factory_uses_explicit_dependencies_without_changing_rng() -> None:
     model = nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities()
     cfg = LLMTunerConfig()
-    cfg.training.chunked_loss_num_chunks = 3
+    cfg.training.chunked_loss_num_chunks = 1
     cfg.parallel.pp_config.num_pp_microbatches = 2
     schedule = object()
     sentinel = torch.zeros(())
@@ -239,7 +303,7 @@ def test_engine_factory_uses_explicit_dependencies_without_changing_rng() -> Non
         cfg,
         model_assembly=assembled,
         optimizer_stack=stack,
-        parallel_dims=None,
+        parallel_dims=SimpleNamespace(pp_enabled=True),
         device=torch.device("cpu"),
         param_context=nullcontext,
         loss_functions=LossFunctions(cross_entropy_loss, chunked_lm_head_cross_entropy),
@@ -254,7 +318,7 @@ def test_engine_factory_uses_explicit_dependencies_without_changing_rng() -> Non
     assert engine.pp_loss_sentinel is sentinel
     assert engine.pp_has_last_stage
     assert engine.pp_num_microbatches == 2
-    assert engine.chunked_loss_num_chunks == 3
+    assert engine.chunked_loss_num_chunks == 1
     assert engine.max_context_length == cfg.max_seq_len
     assert model.weight is weight
     assert torch.equal(torch.get_rng_state(), rng)
@@ -324,14 +388,17 @@ def test_metrics_factory_uses_explicit_geometry_and_topology(monkeypatch) -> Non
     cfg.training.max_seq_len = 8
     model_config = SimpleNamespace(model_type="qwen3_moe")
 
+    services = {}
     metrics = assembly.build_metrics_processor(
         cfg,
         model_config,
         parallel_dims=None,
         num_parameters=101,
         num_trainable_parameters=89,
+        on_service_acquired=services.__setitem__,
     )
 
+    assert services == {"metrics": metrics}
     assert isinstance(metrics, Metrics)
     assert captured["config"] is cfg.metrics
     assert captured["parallel_dims"] is None
@@ -407,11 +474,12 @@ def test_production_assembly_uses_explicit_dataloader_factory(monkeypatch):
 
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize("cleanup_fails", [False, True])
-def test_metrics_factory_closes_unpublished_logger_after_peer_failure(
+def test_metrics_factory_transfers_logger_before_peer_failure(
     monkeypatch, error_type, cleanup_fails
 ):
     error_group = object()
     failure = error_type("peer metrics construction failed")
+    owner = Trainer.__new__(Trainer)
     closed = []
 
     @contextmanager
@@ -440,10 +508,23 @@ def test_metrics_factory_closes_unpublished_logger_after_peer_failure(
             num_parameters=17,
             num_trainable_parameters=13,
             error_group=error_group,
+            on_service_acquired=lambda name, service: setattr(owner, name, service),
         )
 
     assert caught.value is failure
-    assert closed == [True]
+    assert closed == []
+    assert owner.metrics is metrics
+    if cleanup_fails:
+        with pytest.raises(ValueError, match="logger close failed"):
+            owner.close()
+        assert owner.metrics is metrics
+        cleanup_fails = False
+        owner.close()
+        assert closed == [True, True]
+    else:
+        owner.close()
+        assert closed == [True]
+    assert owner.metrics is None
 
 
 def test_optimizer_factory_passes_explicit_coordination_group(monkeypatch):
@@ -462,11 +543,13 @@ def test_optimizer_factory_passes_explicit_coordination_group(monkeypatch):
 
     monkeypatch.setattr(assembly, "OptimizersContainer", optimizer_factory)
     monkeypatch.setattr(assembly, "synchronize_local_errors", coordinate)
+    services = {}
     stack = assembly.build_optimizer_stack(
         LLMTunerConfig(),
         model_parts=[nn.Linear(2, 2)],
         parallel_dims=None,
         error_group=group,
+        on_service_acquired=services.__setitem__,
     )
     assert stack.optimizer is not None
     assert phases == [
@@ -520,3 +603,42 @@ def test_model_preparation_counts_before_parameter_layout_changes(monkeypatch):
     assert prepared.num_trainable_parameters == 3
     assert sum(parameter.numel() for parameter in model.parameters()) == 5
     assert torch.equal(torch.get_rng_state(), rng)
+
+
+def test_trainer_retains_optimizer_when_construction_cleanup_needs_retry(monkeypatch):
+    owner = Trainer.__new__(Trainer)
+    failure = ValueError("optimizer interface construction failed")
+    attempts = []
+
+    def fail_interface(container, parameters):
+        assert owner.optimizer is container
+        raise failure
+
+    def close_optimizer(optimizer):
+        attempts.append(optimizer)
+        if len(attempts) <= 2:
+            raise OSError("optimizer cleanup still pending")
+
+    monkeypatch.setattr(
+        assembly.OptimizersContainer, "_initialize_optimizer_interface", fail_interface
+    )
+    monkeypatch.setattr(torch.optim.AdamW, "close", close_optimizer, raising=False)
+    cfg = LLMTunerConfig()
+    cfg.optimizer.implementation = "for-loop"
+    with pytest.raises(ValueError) as caught:
+        assembly.build_optimizer_stack(
+            cfg,
+            model_parts=[nn.Linear(2, 2)],
+            parallel_dims=None,
+            on_service_acquired=lambda name, service: setattr(owner, name, service),
+        )
+    assert caught.value is failure
+    container = owner.optimizer
+    assert len(attempts) == 1
+    with pytest.raises(OSError, match="cleanup still pending"):
+        owner.close()
+    assert owner.optimizer is container
+    owner.close()
+    assert owner.optimizer is None
+    assert len(attempts) == 3
+    assert all(optimizer is attempts[0] for optimizer in attempts)

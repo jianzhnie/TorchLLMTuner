@@ -19,12 +19,8 @@ import pytest
 
 from llmtuner.components import metrics as metrics_module
 from llmtuner.components.metrics import (
-    BaseLogger,
     DeviceMemoryMonitor,
-    LoggerContainer,
     MetricsProcessor,
-    TensorBoardLogger,
-    WandBLogger,
     get_metrics_rank,
 )
 from llmtuner.config import (
@@ -32,6 +28,12 @@ from llmtuner.config import (
 )
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.utils import metric_loggers as logger_module
+from llmtuner.utils.metric_loggers import (
+    BaseLogger,
+    LoggerContainer,
+    TensorBoardLogger,
+    WandBLogger,
+)
 from llmtuner.utils.monitoring import (
     Color,
     NoColor,
@@ -560,7 +562,7 @@ class _WandBLoggerRaising(BaseLogger):
 
 def test_enabling_wandb_without_the_package_says_so(monkeypatch) -> None:
     """The one exception that is rewritten is the one the user can install."""
-    monkeypatch.setattr(metrics_module, "WandBLogger", _WandBLoggerRaising)
+    monkeypatch.setattr(logger_module, "WandBLogger", _WandBLoggerRaising)
     _WandBLoggerRaising.error = ImportError("No module named 'wandb'")
 
     with pytest.raises(ImportError, match="wandb is not installed"):
@@ -580,7 +582,7 @@ def test_a_wandb_misconfiguration_is_not_swallowed(monkeypatch) -> None:
     class UsageError(Exception):
         pass
 
-    monkeypatch.setattr(metrics_module, "WandBLogger", _WandBLoggerRaising)
+    monkeypatch.setattr(logger_module, "WandBLogger", _WandBLoggerRaising)
     _WandBLoggerRaising.error = UsageError("No API key configured.")
 
     with pytest.raises(UsageError, match="No API key"):
@@ -855,7 +857,7 @@ def test_metrics_releases_first_sink_when_second_sink_construction_fails(monkeyp
     def fail(*args, **kwargs):
         raise ValueError("tensorboard initialization failed")
 
-    monkeypatch.setattr(metrics_module, "TensorBoardLogger", fail)
+    monkeypatch.setattr(logger_module, "TensorBoardLogger", fail)
     with pytest.raises(ValueError, match="tensorboard initialization failed"):
         MetricsProcessor(
             Config(enable_wandb=True, enable_tensorboard=True), parallel_dims=None

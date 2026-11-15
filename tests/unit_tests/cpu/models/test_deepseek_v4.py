@@ -22,7 +22,10 @@ from llmtuner.config.model_config import ModelConfig
 from llmtuner.datasets.text.processors import require_token_prefix
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.memory.materialization import materialize_meta_model
-from llmtuner.models.deepseek.deepseek_v4.attention import DeepseekV4GroupedLinear
+from llmtuner.models.deepseek.deepseek_v4.attention import (
+    DeepseekV4Attention,
+    DeepseekV4GroupedLinear,
+)
 from llmtuner.models.deepseek.deepseek_v4.compression import DeepseekV4CSACompressor
 from llmtuner.models.deepseek.deepseek_v4.hyperconnection import (
     DeepseekV4HyperConnection,
@@ -265,7 +268,10 @@ def test_owned_csa_preserves_empty_slots_and_indexer_mask(monkeypatch, sequence)
 
 
 @pytest.mark.parametrize("sequence", [1, 7])
-def test_owned_indexer_preserves_empty_and_causal_selection(monkeypatch, sequence):
+@pytest.mark.parametrize("wrapped_projection", [False, True])
+def test_owned_indexer_preserves_empty_and_causal_selection(
+    monkeypatch, sequence, wrapped_projection
+):
     config = small_config()
     torch.manual_seed(251)
     native = reference.DeepseekV4Indexer(config)
@@ -278,6 +284,8 @@ def test_owned_indexer_preserves_empty_and_causal_selection(monkeypatch, sequenc
     residual = torch.randn(2, sequence, config.q_lora_rank)
     positions = torch.arange(sequence).unsqueeze(0).expand(2, -1)
     expected = native(hidden, residual, positions, None, 0)
+    if wrapped_projection:
+        owned.q_b_proj = torch.nn.Sequential(owned.q_b_proj)
 
     def reject(*args, **kwargs):
         raise AssertionError("Explicit indexer must own its forward")
@@ -292,6 +300,68 @@ def test_owned_indexer_preserves_empty_and_causal_selection(monkeypatch, sequenc
         assert (actual[:, -1] >= 0).any()
         threshold = (positions + 1) // owned.compress_rate
         assert ((actual < threshold.unsqueeze(-1)) | (actual == -1)).all()
+
+
+@pytest.mark.parametrize("shape", [(2, 3), (1, 3, 8), (2, 4, 8), (2, 3, 9)])
+def test_indexer_rejects_invalid_query_before_compression(monkeypatch, shape):
+    config = small_config()
+    config.q_lora_rank = 8
+    model = DeepseekV4Indexer(config)
+
+    def reject(*args, **kwargs):
+        pytest.fail("Invalid query must fail before compression projection")
+
+    monkeypatch.setattr(model.kv_proj, "forward", reject)
+    with pytest.raises(ValueError, match="q_residual shape"):
+        model(
+            torch.randn(2, 3, config.hidden_size),
+            torch.randn(*shape),
+            torch.arange(3).expand(2, -1),
+            None,
+            0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("num_heads", 3, "query heads divisible"),
+        ("attention_dropout", 0.1, "dropout random-stream"),
+        ("layer_type", "unknown", "unsupported attention layer"),
+    ],
+)
+def test_compressor_model_validates_execution_constraints(field, value, message):
+    model = DeepseekV4Attention(small_config(), layer_idx=0)
+    setattr(model, field, value)
+    with pytest.raises(ValueError, match=message):
+        model.validate_compressor_context_parallel(degree=2)
+
+
+@pytest.mark.parametrize(
+    "interface",
+    [
+        "compress_context_parallel",
+        "validate_indexer_inputs",
+        "select_compressed_windows",
+    ],
+)
+def test_compressor_model_requires_indexer_interfaces(interface):
+    config = small_config()
+    config.layer_types[0] = "compressed_sparse_attention"
+    model = DeepseekV4Attention(config, layer_idx=0)
+    model.validate_compressor_context_parallel(degree=2)
+    setattr(model.compressor.indexer, interface, None)
+    with pytest.raises(TypeError, match=interface):
+        model.validate_compressor_context_parallel(degree=2)
+
+
+def test_compressor_decoder_rechecks_mask_policy():
+    config = small_config()
+    model = DeepseekV4Model(config)
+    model.validate_compressor_context_parallel(degree=2)
+    config.attn_mask_type = "block_causal"
+    with pytest.raises(ValueError, match="packed document attention"):
+        model.validate_compressor_context_parallel(degree=2)
 
 
 @pytest.mark.parametrize("std", [0.0, 0.02])

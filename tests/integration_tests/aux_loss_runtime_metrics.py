@@ -18,7 +18,7 @@ from llmtuner.models.common.aux_loss import (
 )
 from llmtuner.trainer.runtime.metrics import build_step_metrics, collect_update_metrics
 from llmtuner.trainer.runtime.reductions import TrainingReductionMeshes
-from llmtuner.trainer.runtime.results import UpdateResult
+from llmtuner.trainer.runtime.results import AccumulationResult, UpdateResult
 
 
 def main():
@@ -62,27 +62,29 @@ def main():
             "aux_loss/mean": 3.0
         }
         # Exercise runtime reduction with no auxiliary loss on the tail stage.
+        update = collect_update_metrics(
+            UpdateResult(1, torch.tensor(1.0), True, True, False),
+            parallel_dims=topology,
+            model_parts=[empty_stage],
+        )
         metrics = build_step_metrics(
             ntokens_seen=4,
             device=torch.device("cpu"),
             pp_has_last_stage=rank == 1,
-            accumulated_loss=torch.tensor(8.0 if rank == 1 else 0.0),
+            accumulation=AccumulationResult(
+                torch.tensor(8.0 if rank == 1 else 0.0),
+                torch.ones((), dtype=torch.int32),
+            ),
             global_valid_tokens=torch.tensor(4),
             local_valid_tokens=4,
             local_valid_tokens_tensor=torch.tensor(4),
             reduction_meshes=TrainingReductionMeshes(
                 dp_mesh=None, pp_mesh=mesh, loss_mesh=None, sequence_mesh=None
             ),
-            grad_norm=torch.tensor(1.0),
+            update=update,
             lr_metrics={},
         )
         assert metrics["loss"] == 2.0
-        update = collect_update_metrics(
-            UpdateResult(1, torch.tensor(1.0), True, True, False),
-            parallel_dims=topology,
-            model_parts=[empty_stage],
-        )
-        metrics.update(update.auxiliary_metrics)
         assert metrics["aux_loss/mean"] == 3.0
         dist.barrier()
         print(f"rank={rank}: current PP layer mean=2, old model counts excluded")

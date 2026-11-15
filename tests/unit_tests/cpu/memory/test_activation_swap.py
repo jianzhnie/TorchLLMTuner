@@ -63,48 +63,50 @@ def test_swap_releases_reference_without_mutating_storage(cpu_copies):
 
 
 def test_transfer_metrics_track_bytes_and_host_peak(cpu_copies):
-    activation_swap.reset_activation_swap_metrics()
-    state = activation_swap._ForwardSwapState()
+    observer = activation_swap.ActivationSwapMetrics(enabled=True)
+    state = activation_swap._ForwardSwapState(
+        budget=activation_swap._HostBudget(metrics=observer)
+    )
     packed = state.pack(torch.ones(2, 3))
     state.release(outputs=())
     activation_swap._unpack(packed)
     del packed, state
     gc.collect()
 
-    metrics = activation_swap.activation_swap_metrics()
+    metrics = observer.snapshot()
     assert metrics["d2h_bytes"] == metrics["h2d_bytes"] == 24
     assert metrics["host_bytes_peak"] == 24
     assert metrics["host_bytes_current"] == 0
 
 
 def test_dropping_forward_graph_releases_pending_host_bytes(cpu_copies):
-    activation_swap.reset_activation_swap_metrics()
-    baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
-    state = activation_swap._ForwardSwapState()
+    observer = activation_swap.ActivationSwapMetrics(enabled=True)
+    baseline = observer.snapshot()["host_bytes_current"]
+    state = activation_swap._ForwardSwapState(
+        budget=activation_swap._HostBudget(metrics=observer)
+    )
     packed = state.pack(torch.ones(2, 3))
     state.release(outputs=())
 
-    assert (
-        activation_swap.activation_swap_metrics()["host_bytes_current"] == baseline + 24
-    )
+    assert observer.snapshot()["host_bytes_current"] == baseline + 24
 
     del packed, state
     gc.collect()
 
-    assert activation_swap.activation_swap_metrics()["host_bytes_current"] == baseline
+    assert observer.snapshot()["host_bytes_current"] == baseline
 
 
 def test_transfer_metrics_release_timing_events_after_read(cpu_copies):
-    activation_swap.reset_activation_swap_metrics()
-    activation_swap._d2h_events.append((None, None))
-    activation_swap._h2d_events.append((None, None))
+    observer = activation_swap.ActivationSwapMetrics(enabled=True)
+    observer._d2h_events.append((None, None))
+    observer._h2d_events.append((None, None))
 
-    first = activation_swap.activation_swap_metrics()
-    second = activation_swap.activation_swap_metrics()
+    first = observer.snapshot()
+    second = observer.snapshot()
 
     assert first["copies_d2h"] == second["copies_d2h"] == 0
     assert first["d2h_seconds"] == first["h2d_seconds"] == 0
-    assert activation_swap._d2h_events == activation_swap._h2d_events == []
+    assert observer._d2h_events == observer._h2d_events == []
 
 
 def test_packed_copy_does_not_retain_autograd_graph(cpu_copies):
@@ -383,8 +385,8 @@ def test_caller_owned_storage_does_not_create_unused_host_copies(
 
     monkeypatch.setattr(activation_swap, "device_type", "npu")
     gc.collect()
-    activation_swap.reset_activation_swap_metrics()
-    baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+    observer = activation_swap.ActivationSwapMetrics(enabled=True)
+    baseline = observer.snapshot()["host_bytes_current"]
     model = torch.nn.Module()
     model.decoder_structure = DecoderStructure(
         decoder="",
@@ -394,7 +396,7 @@ def test_caller_owned_storage_does_not_create_unused_host_copies(
         head="head",
     )
     model.layers = torch.nn.ModuleList([Block()])
-    activation_swap.apply_activation_swap(model)
+    activation_swap.apply_activation_swap(model, metrics=observer)
     value = torch.arange(6, dtype=torch.float32, requires_grad=True)
     model.layers[0](value).sum().backward()
     expected = (
@@ -407,15 +409,15 @@ def test_caller_owned_storage_does_not_create_unused_host_copies(
         else value.detach()
     )
     torch.testing.assert_close(value.grad, expected, rtol=0, atol=0)
-    metrics = activation_swap.activation_swap_metrics()
+    metrics = observer.snapshot()
     assert metrics["copies_d2h"] == metrics["copies_h2d"] == 0, metrics
     assert metrics["host_bytes_current"] == baseline, metrics
 
 
 def test_host_budget_shared_across_forwards_and_reusable_after_cleanup(cpu_copies):
     gc.collect()
-    activation_swap.reset_activation_swap_metrics()
-    budget = activation_swap._HostBudget(limit=24)
+    observer = activation_swap.ActivationSwapMetrics(enabled=True)
+    budget = activation_swap._HostBudget(limit=24, metrics=observer)
     first = activation_swap._ForwardSwapState(budget=budget)
     second = activation_swap._ForwardSwapState(budget=budget)
     packed = first.pack(torch.ones(2, 3))
@@ -423,11 +425,11 @@ def test_host_budget_shared_across_forwards_and_reusable_after_cleanup(cpu_copie
     assert isinstance(retained, torch.Tensor)
     assert budget.current == 24
     assert len(second.packed) == 0
-    assert activation_swap.activation_swap_metrics()["host_bytes_peak"] == 24
+    assert observer.snapshot()["host_bytes_peak"] == 24
     first.release(outputs=())
     torch.testing.assert_close(activation_swap._unpack(packed), torch.ones(2, 3))
-    # CPU .to(cpu) aliases the Host tensor, unlike the real H2D transfer.
-    # Keep the reservation until every such owner is gone.
+    # The explicit restore destination is independent of Host storage.
+    # Discard remaining owners before checking that the budget is reusable.
     del packed, first
     gc.collect()
     assert budget.current == 0
@@ -442,7 +444,8 @@ def test_host_budget_reservation_released_when_allocation_fails(
 ):
     budget = activation_swap._HostBudget(limit=24)
     state = activation_swap._ForwardSwapState(budget=budget)
-    baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+    observer = budget.metrics
+    baseline = observer.snapshot()["host_bytes_current"]
 
     def fail(*args, **kwargs):
         raise MemoryError("pinned allocation failed")
@@ -451,7 +454,7 @@ def test_host_budget_reservation_released_when_allocation_fails(
     with pytest.raises(MemoryError, match="pinned allocation"):
         state.pack(torch.ones(2, 3))
     assert budget.current == 0
-    assert activation_swap.activation_swap_metrics()["host_bytes_current"] == baseline
+    assert observer.snapshot()["host_bytes_current"] == baseline
 
 
 @pytest.mark.parametrize("limit", [-1, True, 1.5, "1024"])
@@ -476,14 +479,14 @@ def test_reapplication_shares_budget_with_new_layers(monkeypatch):
     model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
     activation_swap.apply_activation_swap(model, max_host_bytes=64)
     original = model.layers[0].forward
-    budget = original._activation_swap_budget
+    budget = original.budget
     budget.current = 32  # An earlier forward still owns saved Host tensors.
     model.layers.append(torch.nn.Linear(2, 2))
 
     activation_swap.apply_activation_swap(model, max_host_bytes=64)
 
     assert model.layers[0].forward is original
-    assert model.layers[1].forward._activation_swap_budget is budget
+    assert model.layers[1].forward.budget is budget
     assert budget.current == 32
 
 
@@ -557,7 +560,9 @@ def test_explicit_swap_binds_only_declared_local_blocks(monkeypatch):
 
     activation_swap.apply_activation_swap(model)
 
-    assert model.decoder.blocks[0].forward._activation_swap_enabled
+    assert isinstance(
+        model.decoder.blocks[0].forward, activation_swap._ActivationSwapForward
+    )
     assert model.layers[0].forward == unrelated
     # The PP-local model intentionally has no embedding, norm or output head.
 

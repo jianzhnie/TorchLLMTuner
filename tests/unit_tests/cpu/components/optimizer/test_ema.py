@@ -731,8 +731,7 @@ def test_buffer_only_ema_with_all_parameters_frozen_can_update_and_resume(dtype)
     model.register_buffer("expert_bias", torch.tensor([0.2, -0.2], dtype=dtype))
     frozen = {name: value.detach().clone() for name, value in model.named_parameters()}
     ema = EMA(model_parts=[model], decay=0.5, buffer_patterns=["expert_bias$"])
-    assert len(ema.param_groups[0]["params"]) == 1
-    assert ema.param_groups[0]["params"][0] is model.expert_bias
+    assert ema._buffer_optimizers[0].param_groups[0]["params"] == [model.expert_bias]
     assert set(ema.state_dict()) == {"state.expert_bias.ema_params"}
     initial = model.expert_bias.clone()
     model.expert_bias.add_(1)
@@ -773,8 +772,50 @@ def test_empty_ema_scope_can_step_checkpoint_and_cold_start(parts):
         "none": [],
     }[parts]
     ema = EMA(model_parts=model_parts, decay=0.5)
-    assert ema.param_groups[0]["params"] == []
+    assert all(
+        not group["params"] for opt in ema.optimizers for group in opt.param_groups
+    )
     assert ema.state_dict() == {}
     ema.step(1)
     ema.load_state_dict({})
     assert ema.state_dict() == {}
+
+
+def test_ema_does_not_expose_training_optimizer_mutation():
+    model = torch.nn.Linear(2, 2)
+    model(torch.ones(1, 2)).sum().backward()
+    gradients = [parameter.grad.clone() for parameter in model.parameters()]
+    ema = EMA(model_parts=[model], decay=0.5)
+    assert not isinstance(ema, torch.optim.Optimizer)
+    for name in (
+        "zero_grad",
+        "param_groups",
+        "register_step_pre_hook",
+        "add_param_group",
+    ):
+        assert not hasattr(ema, name)
+    ema.step(1)
+    for parameter, gradient in zip(model.parameters(), gradients, strict=True):
+        torch.testing.assert_close(parameter.grad, gradient)
+
+
+@pytest.mark.parametrize("wrapper", ["_orig_mod", "_checkpoint_wrapped_module"])
+def test_buffer_selection_uses_canonical_aliases_through_wrappers(wrapper):
+    model = nn.Module()
+    model.layer = nn.Module()
+    layer = nn.Linear(2, 2, bias=False)
+    layer.register_buffer("first_bias", torch.zeros(2))
+    layer.register_buffer("second_bias", layer.first_bias)
+    model.layer.add_module(wrapper, layer)
+    ema = EMA(
+        model_parts=[model],
+        decay=0.5,
+        buffer_patterns=[r"^layer\.second_bias$"],
+    )
+    assert ema._buffer_optimizers[0].param_groups[0]["param_names"] == [
+        "layer.first_bias"
+    ]
+    layer.first_bias.fill_(2)
+    ema.step(1)
+    torch.testing.assert_close(_ema_params(ema)["layer.first_bias"], torch.ones(2))
+    assert len(ema._buffer_optimizers[0].state) == 1

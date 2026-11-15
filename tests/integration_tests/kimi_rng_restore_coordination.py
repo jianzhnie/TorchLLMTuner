@@ -85,9 +85,21 @@ def main():
                     else:
                         raise AssertionError("local RNG failure did not propagate")
                 dist.barrier()
+
+                class ColdStartEMA:
+                    calls = 0
+
+                    def reset_from_model(self):
+                        self.calls += 1
+                        # Injected services may consume default generators while
+                        # reseeding. Migration must restore RNG after this call.
+                        torch.rand(7)
+
+                cold_start_ema = ColdStartEMA()
                 assert load_changed_source_layout(
-                    folder, states=states, adapter=adapter
+                    folder, states=states, adapter=adapter, ema_to_reset=cold_start_ema
                 )
+                assert cold_start_ema.calls == 1
                 torch.testing.assert_close(
                     torch.rand(5), expected_random, atol=0, rtol=0
                 )

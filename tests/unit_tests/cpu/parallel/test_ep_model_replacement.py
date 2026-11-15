@@ -27,6 +27,7 @@ which is what makes a bitwise assertion meaningful rather than merely close.
 from __future__ import annotations
 
 from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.parallel.replacements import ReplacementMap
 from tests.caps import require_env
 
 require_env("spmd_types")
@@ -1666,7 +1667,7 @@ def test_ep_rebinds_fused_fsdp_exclusions_hooks_and_unit_paths(native_path):
             },
         )
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     swap_moe_blocks(model, on_replacement=references.record_replacements)
     grouped = model.layers[0].mlp.routed_experts.inner_experts
     rebound = references.bind(model)
@@ -1729,7 +1730,7 @@ def test_ep_rebinds_ignored_module_subtree_without_object_overrides(
     cfg = ParallelConfig(
         fsdp_config=FSDPConfig(fsdp_apply_modules={"": {}}, fsdp_ignored_modules=[path])
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     swap_moe_blocks(model, on_replacement=references.record_replacements)
     grouped = model.layers[0].mlp.routed_experts.inner_experts
     rebound = references.bind(model)

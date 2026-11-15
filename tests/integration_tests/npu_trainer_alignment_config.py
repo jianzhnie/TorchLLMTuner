@@ -69,9 +69,6 @@ def alignment_runtime_manifest(module_names: Sequence[str]) -> dict[str, Any]:
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
     torch_module = sys.modules.get("torch")
-    timeout_api = getattr(
-        getattr(torch_module, "distributed", None), "set_timeout", None
-    )
     npu = getattr(torch_module, "npu", None)
     return {
         "python": sys.version,
@@ -83,9 +80,6 @@ def alignment_runtime_manifest(module_names: Sequence[str]) -> dict[str, Any]:
             for name in ("matmul", "conv", "aclnn")
             if hasattr(npu, name)
         },
-        "diagnostic_timeout_patch": bool(
-            getattr(timeout_api, "_llmtuner_diagnostic_patch", False)
-        ),
     }
 
 

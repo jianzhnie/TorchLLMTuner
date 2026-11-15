@@ -415,3 +415,29 @@ def test_an_unknown_shard_kind_is_rejected() -> None:
         ShardingConfig(
             kind="diagonal", implementation=nn.Linear, sequence_transform="preserve"
         )
+
+
+def test_topology_snapshot_keeps_resolved_degrees_without_mesh_ownership():
+    from dataclasses import FrozenInstanceError
+
+    from llmtuner.parallel.topology import ParallelTopologySnapshot
+
+    topology = ParallelTopology(
+        dp_replicate=1, dp_shard=-1, cp=2, tp=2, pp=1, ep=2, world_size=8
+    )
+    snapshot = ParallelTopologySnapshot.capture(topology)
+    assert snapshot.dp_shard == 2
+    assert snapshot.world_size == 8
+    assert snapshot.cp == snapshot.tp == snapshot.ep == 2
+    assert not hasattr(snapshot, "_single_axis_meshes")
+    with pytest.raises(FrozenInstanceError):
+        snapshot.tp = 1
+    topology.tp = 1
+    assert snapshot.tp == 2
+
+
+def test_topology_snapshot_rejects_unresolved_degrees():
+    from llmtuner.parallel.topology import ParallelTopologySnapshot
+
+    with pytest.raises(ValueError, match="resolved dp_shard"):
+        ParallelTopologySnapshot(dp_shard=-1)

@@ -281,3 +281,88 @@ def test_ownership_preflight_rejects_shared_parameters_without_splitting():
 def test_ownership_preflight_requires_a_stage():
     with pytest.raises(ValueError, match="at least one stage"):
         partition.validate_pipeline_ownership(Decoder(), [])
+
+
+@pytest.mark.parametrize("state_kind", ["parameter", "buffer"])
+def test_custom_partition_rejects_unassigned_root_state(state_kind):
+    model = Decoder()
+    if state_kind == "parameter":
+        model.register_parameter("unassigned", nn.Parameter(torch.ones(4)))
+    else:
+        model.register_buffer("unassigned", torch.ones(4))
+
+    with pytest.raises(ValueError, match="unassigned state paths.*unassigned"):
+        partition.validate_pipeline_ownership(model, [["layers.3"], ["layers.7"]])
+
+
+def test_custom_partition_rejects_omitted_decoder_state():
+    with pytest.raises(ValueError, match="unassigned state paths.*layers.7"):
+        partition.validate_pipeline_ownership(Decoder(), [["layers.3"]])
+
+
+def test_partition_rejects_unassigned_extra_state_without_serializing():
+    class StatefulDecoder(Decoder):
+        def get_extra_state(self):
+            raise AssertionError("preflight must not serialize model state")
+
+    with pytest.raises(ValueError, match="unassigned state paths.*_extra_state"):
+        partition.validate_pipeline_ownership(
+            StatefulDecoder(), [["layers.3"], ["layers.7"]]
+        )
+
+
+def test_runtime_replication_does_not_invoke_state_dict_hooks():
+    model = Decoder()
+    model.runtime = nn.Identity()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("preflight must not invoke checkpoint hooks")
+
+    model.runtime.register_state_dict_pre_hook(forbidden)
+    partition.validate_pipeline_ownership(
+        model,
+        [["layers.3", "runtime"], ["layers.7", "runtime"]],
+        replicated_module_names=("runtime",),
+    )
+
+
+def test_ownership_preflight_requires_stage_io_before_custom_validation():
+    model = Decoder()
+    model.configure_pipeline_stage = None
+
+    def forbidden(assignments):
+        raise AssertionError("incomplete stage contract reached model validation")
+
+    model.validate_pipeline_partition = forbidden
+    with pytest.raises(UnsupportedCombinationError, match="model-owned stage I/O"):
+        partition.validate_pipeline_ownership(model, [["layers.3"], ["layers.7"]])
+
+
+def test_custom_partition_constraints_reject_before_model_copy(monkeypatch):
+    class OrderedDecoder(Decoder):
+        def validate_pipeline_partition(self, assignments):
+            if [path for stage in assignments for path in stage] != [
+                "layers.3",
+                "layers.7",
+            ]:
+                raise ValueError("custom decoder requires ordered blocks")
+
+    class Mesh:
+        def get_local_rank(self):
+            return 0
+
+        def size(self):
+            return 1
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid custom partition reached model copy")
+
+    monkeypatch.setattr(partition.copy, "deepcopy", forbidden)
+    with pytest.raises(ValueError, match="custom decoder requires ordered blocks"):
+        split_model_into_stages(
+            OrderedDecoder(),
+            Mesh(),
+            "1F1B",
+            torch.device("cpu"),
+            [["layers.7"], ["layers.3"]],
+        )

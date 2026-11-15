@@ -125,3 +125,44 @@ def test_explicit_error_group_reaches_local_boundaries(
     if not coordinates_conversion:
         expected.insert(0, "HF checkpoint state adaptation")
     assert phases == expected
+
+
+def test_rng_peer_validation_failure_prevents_local_restore(monkeypatch):
+    calls = []
+
+    class RNG:
+        def validate_state_dict(self, state):
+            calls.append("validate")
+
+        def load_state_dict(self, state):
+            pytest.fail("A peer rejected RNG; local generators must stay unchanged")
+
+    @contextmanager
+    def coordinate(phase):
+        yield
+        if phase.endswith("RNG validation"):
+            raise RuntimeError("peer rejected RNG")
+
+    monkeypatch.setattr(state_adaptation, "synchronize_local_errors", coordinate)
+    with pytest.raises(RuntimeError, match="peer rejected RNG"):
+        state_adaptation.restore_rng_state({"rng_state": RNG()}, {"rng_state": {}})
+    assert calls == ["validate"]
+
+
+def test_rng_missing_from_old_checkpoint_does_not_reset_live_streams(monkeypatch):
+    phases = []
+
+    class RNG:
+        def validate_state_dict(self, state):
+            pytest.fail("Missing RNG must not be validated or restored")
+
+        load_state_dict = validate_state_dict
+
+    @contextmanager
+    def coordinate(phase):
+        phases.append(phase)
+        yield
+
+    monkeypatch.setattr(state_adaptation, "synchronize_local_errors", coordinate)
+    state_adaptation.restore_rng_state({"rng_state": RNG()}, {}, available=False)
+    assert phases == ["Checkpoint RNG validation", "Checkpoint RNG restoration"]

@@ -248,11 +248,21 @@ def test_container_validates_virtual_options_before_loading_any_optimizer(monkey
     second_name = second.param_groups[0]["param_names"][0]
     checkpoint[f"param_groups.{first_name}.lr"] = first_lr + 1
     checkpoint[f"param_groups.{second_name}.fused"] = True
+    before = deepcopy(container.state_dict())
+
+    def reject_load(*args, **kwargs):
+        pytest.fail("Policy rejection must precede every optimizer load hook")
+
+    # An invalid second optimizer must not partially restore the first one,
+    # even when its load hook mutates something other than param_groups.
+    for optimizer in container.optimizers:
+        optimizer.register_load_state_dict_pre_hook(reject_load)
 
     with pytest.raises(UnsupportedCombinationError, match="fused"):
         container.load_state_dict(checkpoint)
 
     assert first.param_groups[0]["lr"] == first_lr
+    torch.testing.assert_close(container.state_dict(), before, rtol=0, atol=0)
 
 
 def test_checkpoint_state_materialization_uses_virtual_allocator(monkeypatch):

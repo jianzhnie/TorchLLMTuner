@@ -137,7 +137,6 @@ def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_
         model_parts=[model],
         parallel_dims=None,
         device=torch.device("cpu"),
-        max_context_length=1,
         chunked_loss_num_chunks=1,
         param_context=nullcontext,
         optimizer=trainer.optimizer,
@@ -247,7 +246,7 @@ def test_train_step_rejects_a_fully_masked_window_before_forward() -> None:
 def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
     """The PP schedule's reporting losses must not retain completed graphs."""
     monkeypatch.setattr(
-        "llmtuner.trainer.runtime.pipeline.capability",
+        "llmtuner.parallel.pipeline_parallel.microbatch_drivers.capability",
         lambda name: False if name == "pipelining_microbatch_drivers" else True,
     )
     activation_refs: list[weakref.ReferenceType[torch.Tensor]] = []
@@ -274,7 +273,7 @@ def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
         def __init__(self) -> None:
             self._has_backward = True
             self._stage = _FakeStage()
-            self._llmtuner_global_valid_tokens: torch.Tensor | None = None
+            self._loss_fn = SimpleNamespace(global_valid_tokens=None)
 
         def _step_microbatches(self, args, kwargs_mbs, targets, losses) -> None:
             loss_containers.append(losses)
@@ -283,7 +282,7 @@ def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
                 # PP losses are normalized before the schedule runs backward.
                 # The trainer multiplies their detached sum by the global
                 # denominator to recover the raw reporting sum.
-                loss = activation.square().view(()) / self._llmtuner_global_valid_tokens
+                loss = activation.square().view(()) / self._loss_fn.global_valid_tokens
                 loss.backward()
                 assert activation.grad is not None
                 gradients.append(activation.grad.detach().clone())
@@ -1271,48 +1270,33 @@ def test_preprocess_inputs_passes_padding_mask_to_moe() -> None:
     assert set(extra_kwargs) == {"positions", "padding_mask"}
 
 
-def test_loss_vocab_kwargs_need_a_tp_axis_and_a_named_vocabulary() -> None:
-    """The vocab-parallel loss arguments exist only when both are known.
-
-    Either half missing must fall back to the plain loss rather than raise: a
-    single-process run has no TP axis, and a model double (a plain module) has
-    no vocabulary. ``cross_entropy_loss`` needs both non-``None`` before it
-    even looks at the logits' shape, so ``{}`` is the no-op.
-    """
-    trainer = Trainer.__new__(Trainer)
-    trainer.model = SimpleNamespace(vocab_size=9)
-
-    trainer.parallel_dims = None
-    assert loss_vocab_kwargs(trainer.model, trainer.parallel_dims) == {}
-
-    trainer.parallel_dims = SimpleNamespace(
+def test_loss_vocab_kwargs_require_explicit_layout_for_tp() -> None:
+    assert loss_vocab_kwargs(None) == {}
+    topology = SimpleNamespace(
         get_optional_mesh=lambda name: SimpleNamespace(get_group=lambda: object())
     )
-    trainer.model = nn.Linear(2, 2)  # a double that names no vocabulary
-    assert loss_vocab_kwargs(trainer.model, trainer.parallel_dims) == {}
-
-    trainer.model = None
-    assert loss_vocab_kwargs(trainer.model, trainer.parallel_dims) == {}
+    with pytest.raises(ValueError, match="explicit ExecutionLayout"):
+        loss_vocab_kwargs(topology)
 
 
-def test_loss_vocab_kwargs_carry_the_models_own_vocabulary() -> None:
-    """The global size comes from the model, not from the config field.
+@pytest.mark.parametrize("sharded", [False, True])
+def test_loss_vocab_kwargs_use_declared_vocabulary_ownership(sharded) -> None:
+    from llmtuner.parallel.execution import ExecutionLayout
 
-    The head is built against the HF config's number -- which for a hub id or a
-    local checkpoint directory need not equal ``ModelConfig.vocab_size``, and
-    which is the value that keeps a replicated head on the plain path.
-    """
     group = object()
-    trainer = Trainer.__new__(Trainer)
-    trainer.parallel_dims = SimpleNamespace(
+    topology = SimpleNamespace(
         get_optional_mesh=lambda name: SimpleNamespace(get_group=lambda: group)
     )
-    trainer.model = SimpleNamespace(vocab_size=151936)
-
-    assert loss_vocab_kwargs(trainer.model, trainer.parallel_dims) == {
-        "tp_group": group,
-        "global_vocab_size": 151936,
-    }
+    layout = ExecutionLayout(
+        output="logits",
+        sequence_shard_axes=("tp",),
+        vocabulary_sharded=sharded,
+        vocabulary_size=151936,
+        capabilities=ModelExecutionCapabilities(),
+        chunked_loss=False,
+    )
+    expected = {"tp_group": group, "global_vocab_size": 151936} if sharded else {}
+    assert loss_vocab_kwargs(topology, layout=layout) == expected
 
 
 def test_loss_sum_scores_every_label_ignored_ones_included() -> None:
@@ -1949,7 +1933,6 @@ def test_preprocess_filters_metadata_without_changing_source():
         batch,
         device=torch.device("cpu"),
         parallel_dims=None,
-        max_context_length=2,
     )
     assert set(seen[0]) == {"input", "labels"}
     assert batch["num_valid_tokens"] == 2
@@ -2242,13 +2225,11 @@ def test_incomplete_accumulation_window_never_updates_parameters():
 
 def test_trainer_retains_checkpointer_after_interrupted_close():
     class Checkpointer:
-        requires_close_retry = True
         pending = True
 
         def close(self):
             if self.pending:
                 raise KeyboardInterrupt("upload still active")
-            self.requires_close_retry = False
 
     trainer = Trainer.__new__(Trainer)
     resource = Checkpointer()
@@ -2639,7 +2620,7 @@ def test_trainer_retries_interrupted_checkpoint_cleanup(failure):
         if calls.count("checkpoint") == 1:
             raise failure("checkpoint close interrupted")
 
-    checkpoint = SimpleNamespace(requires_close_retry=True, close=close_checkpoint)
+    checkpoint = SimpleNamespace(close=close_checkpoint)
     trainer.checkpointer = checkpoint
     loader = SimpleNamespace(close=lambda: calls.append("data"))
     trainer.dataloader = loader
@@ -3342,7 +3323,6 @@ def test_preprocess_requires_explicit_input_contract_without_legacy_fallback(can
             Batch(input_ids=torch.ones(1, 2), labels=torch.ones(1, 2)),
             device=torch.device("cpu"),
             parallel_dims=None,
-            max_context_length=2,
         )
 
 

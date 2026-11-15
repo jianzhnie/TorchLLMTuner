@@ -79,3 +79,18 @@ def test_flat_labels_preserve_per_row_next_token_loss():
             rtol=0,
             atol=0,
         )
+
+
+@pytest.mark.parametrize("field", ["routed_scaling_factor", "hc_eps"])
+def test_checkpoint_rejects_shape_preserving_deepseek_semantic_change(field):
+    from llmtuner.components.checkpointer.core.format_state import CheckpointFormatState
+
+    config = small_config()
+    config._attn_implementation = "eager"
+    config._experts_implementation = "eager"
+    model = DeepseekV4ForCausalLM(config)
+    saved = CheckpointFormatState.capture([model]).state_dict()
+    setattr(config, field, getattr(config, field) * 2)
+    current = CheckpointFormatState.capture([model])
+    with pytest.raises(ValueError, match="model execution contracts differ"):
+        current.validate_state_dict(saved)

@@ -24,6 +24,7 @@ from llmtuner.parallel.stages import (
     STAGE_ORDER,
     STAGES,
 )
+from tests.unit_tests.cpu.parallel.pipeline_stubs import stub_pipeline
 
 
 def test_the_full_order_is_the_documented_contract() -> None:
@@ -183,6 +184,15 @@ def test_unsupported_mc2_degree_fails_in_ep_stage_before_conversion(monkeypatch)
             ),
             mesh=None,
             parallel_dims=SimpleNamespace(
+                dp_replicate=1,
+                dp_shard=2,
+                cp=1,
+                tp=1,
+                pp=1,
+                ep=2,
+                world_size=2,
+                cp_kv=1,
+                cp_ulysses=1,
                 pp_enabled=False,
                 get_optional_mesh=lambda name: (
                     SimpleNamespace(get_group=lambda: object())
@@ -278,17 +288,18 @@ def test_assembly_executes_stages_in_order(monkeypatch, compile_enabled):
 
 
 @pytest.mark.parametrize("compile_enabled", [False, True])
+@pytest.mark.parametrize("injected_factory", [False, True])
 def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
-    monkeypatch, compile_enabled
+    monkeypatch, compile_enabled, injected_factory
 ):
-    from types import SimpleNamespace
 
     model = nn.Linear(2, 2)
     model.execution_capabilities = ModelExecutionCapabilities()
+    model.vocab_size = 2
     parts = [nn.Linear(2, 2), nn.Linear(2, 2)]
     for part in parts:
         part.execution_capabilities = ModelExecutionCapabilities()
-    stages = [SimpleNamespace(submod=part) for part in parts]
+    stages, dims, schedule = stub_pipeline(monkeypatch, parts)
     expected_order = [
         name
         for name in STAGE_ORDER
@@ -297,13 +308,7 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
     seen = []
     dense_mesh = object()
     cfg = ParallelConfig()
-    dims = SimpleNamespace(
-        pp_enabled=True,
-        dp_replicate=1,
-        dp_shard=1,
-        get_optional_mesh=lambda name: None,
-        spmd_dense_mesh=lambda: dense_mesh,
-    )
+    dims.spmd_dense_mesh = lambda: dense_mesh
     monkeypatch.setattr(
         parallelize, "apply_pp", lambda *args, **kwargs: (stages, parts, True, True)
     )
@@ -317,6 +322,8 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
             if name == "fsdp":
                 assert kwargs["cfg"] is cfg
             replacement = nn.Identity()
+            replacement.execution_capabilities = part.execution_capabilities
+            replacement.pipeline_stage_io = part.pipeline_stage_io
             replacement.history = [*history, name]
             seen.append(name)
             return replacement
@@ -329,16 +336,16 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
         )
         monkeypatch.setattr(parallelize, function, runner(name))
 
-    schedule = object()
-
     def build_schedule(bound_stages, **kwargs):
         assert bound_stages is stages
+        assert kwargs["logits_width"] == model.vocab_size
         for stage, part in zip(stages, parts, strict=True):
             assert stage.submod is part
             assert part.history == expected_order
         return schedule
 
-    monkeypatch.setattr(parallelize, "build_pipeline_schedule", build_schedule)
+    if not injected_factory:
+        monkeypatch.setattr(parallelize, "build_pipeline_schedule", build_schedule)
     result = parallelize.parallelize_model(
         model,
         cfg=cfg,
@@ -347,6 +354,7 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
         compile=compile_enabled,
         compile_config=CompileConfig(backend="aot_eager"),
         global_batch_size=4,
+        pipeline_schedule_factory=build_schedule if injected_factory else None,
     ).execution
     assert result.schedule is schedule
     assert result.model_parts is parts
@@ -357,7 +365,6 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
 @pytest.mark.parametrize("ignored_only", [False, True])
 def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline, ignored_only):
     import copy
-    from types import SimpleNamespace
 
     from llmtuner.config.parallel_config import FSDPConfig
 
@@ -382,18 +389,13 @@ def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline, ignore
         part.execution_capabilities = ModelExecutionCapabilities()
     del parts[0][1]
     parts[1]._modules.pop("0")
-    stages = [SimpleNamespace(submod=part) for part in parts]
-    dims = SimpleNamespace(
-        pp_enabled=True,
-        dp_replicate=1,
-        dp_shard=1,
-        get_optional_mesh=lambda name: None,
-        spmd_dense_mesh=lambda: None,
-    )
+    stages, dims, schedule = stub_pipeline(monkeypatch, parts)
     monkeypatch.setattr(
         parallelize, "apply_pp", lambda *args, **kwargs: (stages, parts, True, True)
     )
-    monkeypatch.setattr(parallelize, "build_pipeline_schedule", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        parallelize, "build_pipeline_schedule", lambda *a, **kw: schedule
+    )
     for name in ("ep", "cp", "ac"):
         monkeypatch.setattr(parallelize, f"apply_{name}", lambda part, **kw: part)
 

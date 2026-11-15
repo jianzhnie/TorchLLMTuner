@@ -97,7 +97,7 @@ def test_worker_adapter_binds_only_target_and_captures_rank_device(monkeypatch):
     manager = SimpleNamespace(_saver=SimpleNamespace(_checkpoint_stager=target))
     assert staging.adapt_npu_staging(manager)
     assert not staging.adapt_npu_staging(manager)
-    assert target._llmtuner_npu_device == 3
+    assert target.staging_device == 3
     assert target.stage.__func__ is staging._npu_stage
     assert target._stage.__func__ is staging._npu_copy_stage
     target._init_worker_thread()

@@ -32,7 +32,6 @@ def _run(
     sync_release: bool = False,
     max_host_bytes: int = 0,
 ) -> tuple[dict[str, torch.Tensor], int, int, dict[str, float | int]]:
-    activation_swap.reset_activation_swap_metrics()
     tp_size = int(os.environ.get("NPU_SWAP_TP_SIZE", "1"))
     moe = os.environ.get("NPU_SWAP_MOE") == "1"
     config = LLMTunerConfig(
@@ -80,6 +79,7 @@ def _run(
     }
     torch.npu.reset_peak_memory_stats()
     released_count = 0
+    swap_resources = trainer.activation_swap_resources
     original_release = activation_swap._ForwardSwapState.release
 
     def count_release(state, outputs):
@@ -106,7 +106,7 @@ def _run(
             trainer.train()
         if profiling:
             profiler.export_chrome_trace(str(directory / "trace.json"))
-        metrics = activation_swap.activation_swap_metrics()
+        metrics = swap_resources.metrics_snapshot()
         updated = {
             name: value.detach().cpu().clone()
             for name, value in trainer.training_engine.model.state_dict().items()
@@ -140,8 +140,8 @@ def verify_discarded_graph_cleanup() -> None:
 
     for fail in (False, True):
         gc.collect()
-        activation_swap.reset_activation_swap_metrics()
-        baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+        observer = activation_swap.ActivationSwapMetrics(enabled=True)
+        baseline = observer.snapshot()["host_bytes_current"]
         model = torch.nn.Module()
         model.decoder_structure = DecoderStructure(
             decoder="",
@@ -151,7 +151,7 @@ def verify_discarded_graph_cleanup() -> None:
             head="head",
         )
         model.layers = torch.nn.ModuleList([SavedActivationLayer(fail)])
-        activation_swap.apply_activation_swap(model)
+        activation_swap.apply_activation_swap(model, metrics=observer)
         value = torch.linspace(-1, 1, 1024, device="npu").requires_grad_()
         if fail:
             try:
@@ -168,7 +168,7 @@ def verify_discarded_graph_cleanup() -> None:
         del model, value
         gc.collect()
         torch.npu.synchronize()
-        metrics = activation_swap.activation_swap_metrics()
+        metrics = observer.snapshot()
         assert metrics["copies_d2h"] > 0, metrics
         assert metrics["d2h_bytes"] > 0, metrics
         assert metrics["h2d_bytes"] == 0, metrics
@@ -182,8 +182,8 @@ def verify_retained_graph_reuse() -> None:
             return value.sin().square()
 
     gc.collect()
-    activation_swap.reset_activation_swap_metrics()
-    baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+    observer = activation_swap.ActivationSwapMetrics(enabled=True)
+    baseline = observer.snapshot()["host_bytes_current"]
     model = torch.nn.Module()
     model.decoder_structure = DecoderStructure(
         decoder="",
@@ -193,7 +193,7 @@ def verify_retained_graph_reuse() -> None:
         head="head",
     )
     model.layers = torch.nn.ModuleList([SavedActivationLayer()])
-    activation_swap.apply_activation_swap(model)
+    activation_swap.apply_activation_swap(model, metrics=observer)
     value = torch.linspace(-1, 1, 1024, device="npu").requires_grad_()
     reference = value.detach().clone().requires_grad_()
     output = model.layers[0](value).sum()
@@ -202,19 +202,19 @@ def verify_retained_graph_reuse() -> None:
     expected.backward(retain_graph=True)
     torch.testing.assert_close(value.grad, reference.grad, rtol=0, atol=0)
     assert value.grad.count_nonzero().item() > 0
-    first = activation_swap.activation_swap_metrics()
+    first = observer.snapshot()
     assert first["copies_h2d"] > 0, first
     output.backward()
     expected.backward()
     torch.testing.assert_close(value.grad, reference.grad, rtol=0, atol=0)
-    second = activation_swap.activation_swap_metrics()
+    second = observer.snapshot()
     # Unpack may be called again, but the reloaded device tensor is reusable.
     assert second["copies_h2d"] == first["copies_h2d"], (first, second)
     assert second["h2d_bytes"] == first["h2d_bytes"], (first, second)
     del output, expected, value, reference, model
     gc.collect()
     torch.npu.synchronize()
-    final = activation_swap.activation_swap_metrics()
+    final = observer.snapshot()
     assert final["host_bytes_current"] == baseline, final
     print(f"PASS activation swap retained graph: {final}")
 
@@ -238,8 +238,8 @@ def verify_owned_storage_skips() -> None:
 
     for source in ("input", "buffer", "detached_alias", "parameter_alias"):
         gc.collect()
-        activation_swap.reset_activation_swap_metrics()
-        baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+        observer = activation_swap.ActivationSwapMetrics(enabled=True)
+        baseline = observer.snapshot()["host_bytes_current"]
         model = torch.nn.Module()
         model.decoder_structure = DecoderStructure(
             decoder="",
@@ -250,7 +250,7 @@ def verify_owned_storage_skips() -> None:
         )
         model.layers = torch.nn.ModuleList([OwnedStorageLayer(source)])
         model.to("npu")
-        activation_swap.apply_activation_swap(model)
+        activation_swap.apply_activation_swap(model, metrics=observer)
         value = torch.linspace(-1, 1, 1024, device="npu").requires_grad_()
         model.layers[0](value).sum().backward()
         expected = (
@@ -265,7 +265,7 @@ def verify_owned_storage_skips() -> None:
         torch.testing.assert_close(value.grad, expected, rtol=0, atol=0)
         assert value.grad.count_nonzero().item() > 0
         torch.npu.synchronize()
-        metrics = activation_swap.activation_swap_metrics()
+        metrics = observer.snapshot()
         assert metrics["copies_d2h"] == metrics["copies_h2d"] == 0, metrics
         assert metrics["host_bytes_current"] == baseline, metrics
         print(f"PASS activation swap owned storage {source}: {metrics}")
@@ -277,8 +277,8 @@ def verify_host_budget() -> None:
             return value.sin().square()
 
     gc.collect()
-    activation_swap.reset_activation_swap_metrics()
-    baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
+    observer = activation_swap.ActivationSwapMetrics(enabled=True)
+    baseline = observer.snapshot()["host_bytes_current"]
     model = torch.nn.Module()
     model.decoder_structure = DecoderStructure(
         decoder="",
@@ -288,13 +288,13 @@ def verify_host_budget() -> None:
         head="head",
     )
     model.layers = torch.nn.ModuleList([Layer(), Layer()])
-    activation_swap.apply_activation_swap(model, max_host_bytes=4096)
+    activation_swap.apply_activation_swap(model, max_host_bytes=4096, metrics=observer)
     values = [
         torch.linspace(-1, 1, 1024, device="npu").requires_grad_() for _ in range(2)
     ]
     references = [value.detach().clone().requires_grad_() for value in values]
     outputs = [layer(value) for layer, value in zip(model.layers, values, strict=True)]
-    metrics = activation_swap.activation_swap_metrics()
+    metrics = observer.snapshot()
     assert metrics["copies_d2h"] == 1, metrics
     assert metrics["host_bytes_current"] == baseline + 4096, metrics
     assert metrics["host_bytes_peak"] == baseline + 4096, metrics
@@ -306,7 +306,7 @@ def verify_host_budget() -> None:
     del outputs, model
     gc.collect()
     torch.npu.synchronize()
-    metrics = activation_swap.activation_swap_metrics()
+    metrics = observer.snapshot()
     assert metrics["host_bytes_current"] == baseline, metrics
     assert metrics["copies_h2d"] == 1, metrics
     print(f"PASS activation swap shared Host budget: {metrics}")

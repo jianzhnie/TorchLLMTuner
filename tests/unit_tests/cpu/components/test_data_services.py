@@ -87,3 +87,65 @@ def test_microbatch_preparation_preserves_callback_and_host_ownership():
     assert tokens == 6
     assert set(batch) == {"input", "labels", "padding_mask"}
     assert batch["labels"] is labels
+
+
+@pytest.mark.parametrize("invalid_count", [True, -1, 5, 1.5])
+@pytest.mark.parametrize("phase", ["training", "validation"])
+def test_token_accounting_rejects_invalid_callback_before_metrics(invalid_count, phase):
+    batch = {
+        "input": torch.ones(4, dtype=torch.long),
+        "labels": torch.ones(4, dtype=torch.long),
+    }
+    observed = []
+
+    def counter(batch):
+        return invalid_count
+
+    with pytest.raises(ValueError, match="num_valid_tokens"):
+        if phase == "training":
+            prepare_microbatch(batch, valid_token_counter=counter)
+        else:
+            validation_runtime.count_validation_batch_tokens(
+                batch,
+                metrics=SimpleNamespace(add_tokens=observed.append),
+                token_counter=counter,
+                device=torch.device("cpu"),
+                dp_mesh=None,
+            )
+    assert observed == []
+
+
+@pytest.mark.parametrize("phase", ["training", "validation"])
+@pytest.mark.parametrize("malformation", ["dtype", "shape", "missing_input"])
+def test_token_accounting_validates_fields_before_callback(phase, malformation):
+    batch = {
+        "input": torch.ones(2, 3, dtype=torch.long),
+        "labels": torch.ones(2, 3, dtype=torch.long),
+    }
+    if malformation == "dtype":
+        batch["labels"] = batch["labels"].float()
+        expected_error = TypeError
+    elif malformation == "shape":
+        batch["labels"] = batch["labels"].reshape(3, 2)
+        expected_error = ValueError
+    else:
+        del batch["input"]
+        expected_error = KeyError
+    calls = []
+
+    def counter(batch):
+        calls.append("counter")
+        return 6
+
+    with pytest.raises(expected_error):
+        if phase == "training":
+            prepare_microbatch(batch, valid_token_counter=counter)
+        else:
+            validation_runtime.count_validation_batch_tokens(
+                batch,
+                metrics=SimpleNamespace(add_tokens=lambda _: calls.append("metrics")),
+                token_counter=counter,
+                device=torch.device("cpu"),
+                dp_mesh=None,
+            )
+    assert calls == []

@@ -143,17 +143,28 @@ def test_observer_uses_injected_group_for_errors_and_reductions(monkeypatch):
     assert result["train/tps_per_device"] == 50
 
 
-def test_dispatch_installation_deduplicates_shared_parts_and_reuses_timers():
+def test_dispatch_installation_deduplicates_shared_parts_and_requires_release():
     experts = RoutedExperts(GroupedExperts(8, 12, 4), LocalTokenDispatcher(4, 2))
     parts = [torch.nn.ModuleList([experts]), torch.nn.ModuleList([experts])]
 
-    timers = install_dispatch_timers(parts)
+    resources = install_dispatch_timers(parts)
+    timers = resources.timers
     timers[0].cpu_seconds = 1.25
 
     assert len(timers) == 1
-    assert experts.dispatch_observer is timers[0]
-    assert install_dispatch_timers(parts) == timers
+    assert experts.dispatch_observation.observer is timers[0]
+    with pytest.raises(ValueError, match="close its owner"):
+        install_dispatch_timers(parts)
+    assert experts.dispatch_observation.observer is timers[0]
     assert timers[0].consume_seconds() == 1.25
+    resources.close()
+    assert experts.dispatch_observation.observer is None
+    assert resources.timers == ()
+    replacement = install_dispatch_timers(parts)
+    assert replacement.timers[0] is not timers[0]
+    resources.close()
+    assert experts.dispatch_observation.observer is replacement.timers[0]
+    replacement.close()
 
 
 def test_dispatch_installation_validates_all_owners_before_mutation():
@@ -162,10 +173,10 @@ def test_dispatch_installation_validates_all_owners_before_mutation():
         for _ in range(2)
     ]
     custom = object()
-    experts[1].dispatch_observer = custom
+    experts[1].dispatch_observation.observer = custom
 
-    with pytest.raises(ValueError, match="different observer"):
+    with pytest.raises(ValueError, match="already has an observer"):
         install_dispatch_timers([torch.nn.ModuleList(experts)])
 
-    assert experts[0].dispatch_observer is None
-    assert experts[1].dispatch_observer is custom
+    assert experts[0].dispatch_observation.observer is None
+    assert experts[1].dispatch_observation.observer is custom

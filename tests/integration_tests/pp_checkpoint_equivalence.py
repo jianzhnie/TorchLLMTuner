@@ -677,7 +677,7 @@ def _assert_shared_layers(trainer: Trainer) -> None:
         ]
         assert attentions, "fused QKV scenario must contain real attention layers"
         assert all(
-            module._llmtuner_fused_qkv
+            module.qkv_projection == "fused"
             and getattr(module.forward, "__func__", None) is Qwen3MoeAttention.forward
             for module in attentions
         ), "requested fused QKV must reach the production implementation"

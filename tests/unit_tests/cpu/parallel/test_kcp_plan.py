@@ -21,8 +21,12 @@ class KDA(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(2))
-        for name in ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias"):
-            setattr(self, name, None)
+
+    def validate_context_parallel_inputs(self, *args, **kwargs):
+        raise AssertionError("Metadata checks must not execute model input validation")
+
+    def forward_context_parallel(self, *args, **kwargs):
+        raise AssertionError("Metadata checks must not execute model computation")
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return value * self.weight
@@ -81,6 +85,24 @@ def test_kcp_stale_plan_rejected_before_loading_kernels(monkeypatch):
         kcp.apply_kcp(model, mesh, resolved_plan=plan)
 
 
+def test_kcp_changed_mask_rejected_before_loading_kernels(monkeypatch):
+    model = declared_kda_model(KDA())
+    model.config = SimpleNamespace(attn_mask_type="causal")
+    plan = kcp.resolve_kcp_plan(model, degree=2)
+    model.config.attn_mask_type = "block_causal"
+    original = model.layers[0].self_attn.forward
+    monkeypatch.setattr(
+        kcp, "_kcp_runtime", lambda: pytest.fail("Invalid mask reached runtime")
+    )
+    mesh = SimpleNamespace(
+        size=lambda: 2,
+        get_group=lambda: pytest.fail("Invalid mask reached group acquisition"),
+    )
+    with pytest.raises(ValueError, match="packed document attention"):
+        kcp.apply_kcp(model, mesh, resolved_plan=plan)
+    assert model.layers[0].self_attn.forward == original
+
+
 def test_kcp_wrapper_construction_failure_leaves_all_forwards_unchanged(monkeypatch):
     model = declared_kda_model(KDA(), KDA())
     original = [layer.self_attn.forward for layer in model.layers]
@@ -96,7 +118,7 @@ def test_kcp_wrapper_construction_failure_leaves_all_forwards_unchanged(monkeypa
     monkeypatch.setattr(kcp, "kcp_kda_forward", wrap)
     mesh = SimpleNamespace(size=lambda: 2, get_group=lambda: object())
     with pytest.raises(RuntimeError, match="second wrapper failed"):
-        kcp.apply_kcp(model, mesh)
+        kcp.apply_kcp(model, mesh, resolved_plan=kcp.resolve_kcp_plan(model, degree=2))
     assert len(calls) == 2
     assert [layer.self_attn.forward for layer in model.layers] == original
 
@@ -129,7 +151,9 @@ def test_declared_mla_only_pipeline_part_binds_without_kda(monkeypatch):
     assert [(target.path, target.layout) for target in plan.targets] == [
         ("layers.0.self_attn", "mla_ulysses")
     ]
-    monkeypatch.setattr(kcp, "_kcp_runtime", lambda: ())
+    monkeypatch.setattr(
+        kcp, "_kcp_runtime", lambda: pytest.fail("MLA must not require KDA kernels")
+    )
     installed = object()
     monkeypatch.setattr(kcp, "kcp_mla_attention", lambda group: installed)
     mesh = SimpleNamespace(size=lambda: 2, get_group=lambda: object())

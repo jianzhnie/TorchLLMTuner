@@ -689,8 +689,9 @@ def test_partial_trace_entry_failure_attempts_cleanup(
 
         def __exit__(self, exc_type, exc_value, traceback):
             calls.append("stop")
-            assert exc_value is original
-            if cleanup_fails:
+            if calls.count("stop") == 1:
+                assert exc_value is original
+            if cleanup_fails and calls.count("stop") == 1:
                 raise ValueError("trace stop failed")
 
     monkeypatch.setattr(torch.profiler, "profile", lambda **kwargs: Trace())
@@ -699,8 +700,14 @@ def test_partial_trace_entry_failure_attempts_cleanup(
         profiler.__enter__()
     assert raised.value is original
     assert calls == ["start", "stop"]
-    assert profiler.torch_profiler is None
+    assert (profiler.torch_profiler is not None) is cleanup_fails
     assert not profiler._entered
+    if cleanup_fails:
+        with pytest.raises(RuntimeError, match="cleanup is pending"):
+            profiler.__enter__()
+    profiler.close()
+    assert profiler.torch_profiler is None
+    assert calls.count("stop") == (2 if cleanup_fails else 1)
 
 
 @_NO_WARMUP
@@ -736,7 +743,8 @@ def test_profiler_exit_preserves_oom_and_attempts_snapshot_after_trace_failure(
 
     def stop(*args):
         calls.append("trace")
-        raise RuntimeError("trace export failed")
+        if calls.count("trace") == 1:
+            raise RuntimeError("trace export failed")
 
     def snapshot(**kwargs):
         calls.append("snapshot")
@@ -750,10 +758,12 @@ def test_profiler_exit_preserves_oom_and_attempts_snapshot_after_trace_failure(
     original = torch.OutOfMemoryError("training OOM")
     assert profiler.__exit__(type(original), original, None) is False
     assert calls == ["trace", "snapshot"]
-    assert profiler.torch_profiler is None
+    assert profiler.torch_profiler is not None
     assert profiler.memory_profiler is None
-    profiler.__exit__(None, None, None)
-    assert calls == ["trace", "snapshot"]
+    profiler.close()
+    profiler.close()
+    assert calls == ["trace", "snapshot", "trace"]
+    assert profiler.torch_profiler is None
 
 
 def test_profiler_exit_raises_trace_error_when_training_succeeded():
@@ -769,7 +779,24 @@ def test_profiler_exit_raises_trace_error_when_training_succeeded():
     with pytest.raises(RuntimeError, match="trace export failed") as caught:
         profiler.__exit__(None, None, None)
     assert caught.value is original
-    assert profiler.torch_profiler is None
+    assert profiler.torch_profiler is not None
+    with pytest.raises(RuntimeError, match="trace export failed"):
+        profiler.close()
+
+
+def test_trace_builder_does_not_replace_owned_resource():
+    from types import SimpleNamespace
+
+    calls = []
+    trace = SimpleNamespace(__exit__=lambda *args: calls.append("stop"))
+    profiler = Profiler(Config())
+    profiler.torch_profiler = trace
+    with pytest.raises(RuntimeError, match="already owns a trace"):
+        profiler.build_torch_profiler()
+    assert profiler.torch_profiler is trace
+    profiler.close()
+    profiler.close()
+    assert calls == ["stop"]
 
 
 @pytest.mark.parametrize("oom", [False, True])
@@ -1072,7 +1099,8 @@ def test_partial_trace_entry_preserves_start_error_when_reporting_fails(
         profiler.__enter__()
     assert caught.value is failure
     assert calls == ["start", "stop", "report"]
-    assert profiler.torch_profiler is None and profiler.memory_profiler is None
+    assert profiler.torch_profiler is not None
+    assert profiler.memory_profiler is None
     assert not profiler._entered
 
 

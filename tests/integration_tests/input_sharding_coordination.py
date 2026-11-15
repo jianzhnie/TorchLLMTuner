@@ -61,7 +61,6 @@ def main() -> None:
             value,
             device=trainer.device,
             parallel_dims=trainer.parallel_dims,
-            max_context_length=trainer.cfg.max_seq_len,
         )
         for axis, invalid_length in (("cp", 15), ("tp", 14)):
             for failing_rank in range(4):

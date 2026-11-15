@@ -20,6 +20,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
 from llmtuner.config import LLMTunerConfig, ValidationConfig
 from llmtuner.models.execution import ModelExecutionCapabilities
+from llmtuner.parallel.execution import ExecutionLayout
 from llmtuner.trainer.runtime import validation
 from llmtuner.trainer.runtime.engine import TrainingEngine
 from llmtuner.trainer.trainer import Trainer
@@ -48,6 +49,7 @@ class Loader:
 
 
 class Projection(torch.nn.Module):
+    vocab_size = 7
     execution_capabilities = ModelExecutionCapabilities()
 
     def __init__(self, coordinate):
@@ -86,6 +88,7 @@ def main():
                 spmd_sparse_mesh=lambda: None,
                 dp_cp_enabled=True,
                 tp_enabled=axis == "tp",
+                cp_enabled=axis == "cp",
                 get_optional_mesh=lambda name, mesh=mesh, axis=axis: (
                     mesh["dp", axis]._flatten(mesh_dim_name="loss")
                     if name == "loss"
@@ -109,9 +112,18 @@ def main():
                 model_parts=trainer.model_parts,
                 parallel_dims=trainer.parallel_dims,
                 device=trainer.device,
-                max_context_length=trainer.cfg.max_seq_len,
                 chunked_loss_num_chunks=1,
                 param_context=trainer.param_context,
+                execution_layouts=(
+                    ExecutionLayout(
+                        output="logits",
+                        sequence_shard_axes=(axis,),
+                        vocabulary_sharded=False,
+                        vocabulary_size=7,
+                        capabilities=trainer.model.execution_capabilities,
+                        chunked_loss=False,
+                    ),
+                ),
                 loss_sum=cross_entropy_loss,
                 error_group=trainer.error_group,
             )

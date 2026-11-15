@@ -1,5 +1,6 @@
 """Explicit Kimi K3 multimodal assembly over the native text decoder."""
 
+import pytest
 import torch
 
 from llmtuner.models.kimi.kimi_k3.configuration import KimiK3Config
@@ -105,3 +106,20 @@ def test_vision_encoder_passes_integer_maximum_and_complete_boundaries(monkeypat
     )
     assert observed == [8]
     assert len(outputs) == 2
+
+
+@pytest.mark.parametrize("component", ["media", "vision", "projector"])
+def test_multimodal_checkpoint_detects_semantic_changes(component):
+    from llmtuner.components.checkpointer.core.format_state import CheckpointFormatState
+
+    model = KimiK3ForConditionalGeneration(small_config())
+    saved = CheckpointFormatState.capture([model]).state_dict()
+    if component == "media":
+        model.config.media_placeholder_token_id += 1
+    elif component == "vision":
+        model.vision_tower.config.pos_emb_interpolation_mode = "nearest"
+    else:
+        model.config.vision_config.projector_ln_eps *= 2
+    target = CheckpointFormatState.capture([model])
+    with pytest.raises(ValueError, match="model execution contracts differ"):
+        target.validate_state_dict(saved)

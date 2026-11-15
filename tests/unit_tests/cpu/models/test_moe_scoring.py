@@ -41,7 +41,7 @@ def test_packed_experts_score_before_down_projection(monkeypatch):
             down_proj=down,
             act_fn=torch.nn.functional.silu,
         ),
-        _llmtuner_local_dispatcher=SimpleNamespace(dispatch=dispatch),
+        local_dispatcher=SimpleNamespace(dispatch=dispatch),
     )
     actual = forward_packed_experts(module, inputs.unsqueeze(0))
     gate_weight, up_weight = gate_up[0].chunk(2, dim=0)

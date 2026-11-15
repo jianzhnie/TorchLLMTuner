@@ -1,18 +1,70 @@
 """Model checkpoint state aggregation, cache lifetime, and extra state."""
 
 import weakref
+from contextlib import contextmanager
 
 import pytest
 import torch
 from torch import nn
 
+from llmtuner.components.checkpointer.core import layout_conversion
 from llmtuner.components.checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 
 
+@pytest.mark.parametrize("operation", ["export", "restore"])
+def test_state_hook_failure_reaches_completion_coordination(monkeypatch, operation):
+    from llmtuner.components.checkpointer.core import model_state
+
+    model = nn.Linear(2, 2)
+    wrapper = ModelCheckpointState(model)
+    cached = wrapper.cached_state_dict
+    group = object()
+    wrapper._validation_group = group
+    failure = RuntimeError(f"{operation} failed")
+    coordinated = []
+    active = []
+
+    @contextmanager
+    def coordinate(phase, *, group):
+        active.append(phase)
+        try:
+            yield
+        except BaseException as error:
+            coordinated.append((phase, group, error))
+            raise
+        finally:
+            active.pop()
+
+    def fail_hook(*args):
+        assert active == []
+        raise failure
+
+    if operation == "export":
+        model.register_state_dict_pre_hook(fail_hook)
+    else:
+        model.register_load_state_dict_post_hook(fail_hook)
+    monkeypatch.setattr(model_state, "synchronize_local_errors", coordinate)
+    with pytest.raises(RuntimeError) as caught:
+        if operation == "export":
+            wrapper.state_dict()
+        else:
+            wrapper.load_state_dict(cached)
+    assert caught.value is failure
+    phase = (
+        "Checkpoint model state merge"
+        if operation == "export"
+        else "Checkpoint model restore completion"
+    )
+    assert coordinated == [(phase, group, failure)]
+    if operation == "export":
+        assert wrapper.cached_state_dict is cached
+    else:
+        assert wrapper.cached_state_dict == {}
+
+
 @pytest.mark.parametrize("mode", ["full", "tp", "ep", "joint"])
 def test_restore_releases_export_cache_without_regathering(monkeypatch, mode):
-    from llmtuner.components.checkpointer.core import model_state
 
     model = nn.Linear(2, 2, bias=False)
     chunked = mode != "full"
@@ -34,6 +86,7 @@ def test_restore_releases_export_cache_without_regathering(monkeypatch, mode):
     calls = []
 
     def restore(state, **kwargs):
+        assert wrapper.cached_state_dict == {}
         calls.append(mode)
         value = state["weight"]
         return {
@@ -48,7 +101,7 @@ def test_restore_releases_export_cache_without_regathering(monkeypatch, mode):
         "ep": "restore_sharded_expert_state",
         "joint": "restore_disjoint_tp_ep_state",
     }[mode]
-    monkeypatch.setattr(model_state, transform, restore)
+    monkeypatch.setattr(layout_conversion, transform, restore)
     original_get = wrapper.get_state_dict
 
     def forbidden_get(**kwargs):
@@ -102,7 +155,7 @@ def test_restore_cache_invalidation_keeps_input_and_structure_validation():
     wrapper.load_state_dict(saved)
     assert set(saved) == {"weight", "bias"}
     model.register_buffer("added", torch.zeros(1))
-    with pytest.raises(RuntimeError, match="checkpoint keys changed"):
+    with pytest.raises(RuntimeError, match="buffer bindings changed"):
         wrapper.state_dict()
     assert wrapper.cached_state_dict == {}
 
@@ -216,9 +269,83 @@ def test_model_structure_changes_fail_before_cache_refresh(change) -> None:
         model.register_buffer("new_counter", torch.ones(1))
     else:
         del model.counter
-    with pytest.raises(RuntimeError, match="checkpoint keys changed"):
+    with pytest.raises(RuntimeError, match="buffer bindings changed"):
         state.state_dict()
     assert set(state.cached_state_dict) == original_keys
+
+
+@pytest.mark.parametrize("operation", ["save", "restore"])
+@pytest.mark.parametrize("change", ["replace", "split_alias", "persistence"])
+def test_checkpoint_rejects_changed_buffer_ownership_before_hooks(operation, change):
+    model = nn.Linear(2, 2)
+    original = torch.ones(2)
+    model.register_buffer("counter", original)
+    model.register_buffer("alias", original)
+    state = ModelCheckpointState(model)
+    saved = {name: value.clone() for name, value in state.state_dict().items()}
+    saved["weight"].fill_(99)
+    weight = model.weight.detach().clone()
+    if change == "replace":
+        model.counter = torch.zeros_like(original)
+        model.alias = model.counter
+    elif change == "split_alias":
+        model.alias = original.clone()
+    else:
+        model.register_buffer("counter", original, persistent=False)
+
+    def reject_hook(*args):
+        pytest.fail("Changed buffer ownership reached a model state hook")
+
+    model.register_state_dict_pre_hook(reject_hook)
+    model.register_load_state_dict_pre_hook(reject_hook)
+    with pytest.raises(RuntimeError, match="buffer bindings changed"):
+        if operation == "save":
+            state.state_dict()
+        else:
+            state.load_state_dict(saved)
+    assert torch.equal(model.weight, weight)
+    assert torch.equal(original, torch.ones(2))
+
+
+def test_checkpoint_allows_buffer_updates_and_nonpersistent_cache_replacement():
+    model = nn.Module()
+    model.register_buffer("counter", torch.zeros(2))
+    model.register_buffer("scratch", torch.zeros(1), persistent=False)
+    state = ModelCheckpointState(model)
+    model.counter.add_(3)
+    model.scratch = torch.ones(4)
+    model.register_buffer("other_scratch", torch.ones(1), persistent=False)
+    exported = state.state_dict()
+    assert set(exported) == {"counter"}
+    assert torch.equal(exported["counter"], torch.full((2,), 3.0))
+    state.load_state_dict({"counter": torch.ones(2)})
+    assert torch.equal(model.counter, torch.ones(2))
+    assert torch.equal(model.scratch, torch.ones(4))
+
+
+@pytest.mark.parametrize("operation", ["save", "restore"])
+def test_checkpoint_rejects_replaced_extra_state_owner_before_getter(operation):
+    calls = []
+
+    class ExtraState(nn.Module):
+        def get_extra_state(self):
+            calls.append("get")
+            return {"counter": 1}
+
+        def set_extra_state(self, value):
+            calls.append("set")
+
+    model = nn.ModuleDict({"state": ExtraState()})
+    state = ModelCheckpointState(model)
+    saved = state.state_dict().copy()
+    calls.clear()
+    model["state"] = ExtraState()
+    with pytest.raises(RuntimeError, match="extra-state ownership changed"):
+        if operation == "save":
+            state.state_dict()
+        else:
+            state.load_state_dict(saved)
+    assert calls == []
 
 
 def test_checkpoint_owns_model_part_collection() -> None:
@@ -254,6 +381,50 @@ def test_overlapping_model_parts_are_rejected_instead_of_overwriting() -> None:
         ModelCheckpointState([nn.Linear(2, 2), nn.Linear(2, 2)])
 
 
+@pytest.mark.parametrize("kind", ["buffer", "parameter_buffer", "extra_state"])
+def test_cross_part_shared_state_is_rejected_before_export(kind):
+    first, second = nn.Module(), nn.Module()
+    if kind in ("buffer", "parameter_buffer"):
+        shared = torch.zeros(2)
+        if kind == "parameter_buffer":
+            shared = nn.Parameter(shared)
+            first.register_parameter("first", shared)
+        else:
+            first.register_buffer("first", shared)
+        second.register_buffer("second", shared)
+        expected = "persistent buffer ownership overlaps"
+    else:
+
+        class ExtraState(nn.Module):
+            def get_extra_state(self):
+                pytest.fail("Overlapping ownership reached extra-state export")
+
+        shared = ExtraState()
+        first.first = shared
+        second.second = shared
+        expected = "extra-state ownership overlaps"
+
+    def reject_hook(*args):
+        pytest.fail("Overlapping ownership reached state export")
+
+    first.register_state_dict_pre_hook(reject_hook)
+    second.register_state_dict_pre_hook(reject_hook)
+    with pytest.raises(ValueError, match=expected):
+        ModelCheckpointState([first, second])
+
+
+def test_parameter_buffer_alias_within_one_part_keeps_single_owner():
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.ones(2))
+    model.register_buffer("alias", model.weight)
+    state = ModelCheckpointState(model)
+    saved = state.state_dict()
+    assert saved["weight"].data_ptr() == saved["alias"].data_ptr()
+    state.load_state_dict({"weight": torch.zeros(2), "alias": torch.zeros(2)})
+    assert model.alias is model.weight
+    assert torch.equal(model.weight, torch.zeros(2))
+
+
 def test_buffer_key_collision_fails_before_refreshing_checkpoint_cache() -> None:
     first = nn.ModuleDict({"first": nn.Linear(2, 2)})
     second = nn.ModuleDict({"second": nn.Linear(2, 2)})
@@ -262,7 +433,7 @@ def test_buffer_key_collision_fails_before_refreshing_checkpoint_cache() -> None
     cached = state.cached_state_dict.copy()
     second.register_buffer("counter", torch.tensor(2))
 
-    with pytest.raises(ValueError, match="overlap at part 1.*counter"):
+    with pytest.raises(RuntimeError, match="buffer bindings changed at part 1"):
         state.state_dict()
     assert state.cached_state_dict.keys() == cached.keys()
     assert all(state.cached_state_dict[key] is value for key, value in cached.items())

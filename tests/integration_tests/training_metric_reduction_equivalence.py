@@ -14,6 +14,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.parallel.topology import ParallelTopology
 from llmtuner.trainer.runtime.metrics import build_step_metrics
 from llmtuner.trainer.runtime.reductions import resolve_training_reduction_meshes
+from llmtuner.trainer.runtime.results import AccumulationResult, UpdateResult
 from tests.integration_tests.harness import init_distributed
 
 
@@ -51,8 +52,11 @@ def main():
                         ntokens_seen=7,
                         device=device,
                         pp_has_last_stage=False,
-                        accumulated_loss=torch.tensor(
-                            shard_sums[dp][coordinate], dtype=dtype, device=device
+                        accumulation=AccumulationResult(
+                            torch.tensor(
+                                shard_sums[dp][coordinate], dtype=dtype, device=device
+                            ),
+                            torch.ones((), dtype=torch.int32, device=device),
                         ),
                         global_valid_tokens=torch.tensor(
                             sum(counts), dtype=dtype, device=device
@@ -62,7 +66,9 @@ def main():
                             counts[dp], dtype=dtype, device=device
                         ),
                         reduction_meshes=meshes,
-                        grad_norm=torch.tensor(2.0, device=device),
+                        update=UpdateResult(
+                            1, torch.tensor(2.0, device=device), True, True, False
+                        ),
                         lr_metrics={"lr/SGD": 0.1},
                     )
                     if sum(counts)

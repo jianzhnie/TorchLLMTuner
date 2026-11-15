@@ -77,3 +77,33 @@ def test_prepared_rows_match_native_batch_forward_and_gradients(
         if parameter.grad is not None:
             nonzero += int(bool(parameter.grad.count_nonzero()))
     assert nonzero > 0
+
+
+def test_checkpoint_captures_nested_kimi_attention_configuration():
+    from llmtuner.components.checkpointer.core.format_state import CheckpointFormatState
+
+    config = KimiLinearConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        kv_lora_rank=4,
+        qk_nope_head_dim=3,
+        qk_rope_head_dim=1,
+        v_head_dim=3,
+        mla_use_nope=True,
+        linear_attn_config={
+            "kda_layers": [1],
+            "full_attn_layers": [],
+            "head_dim": 4,
+            "num_heads": 2,
+            "short_conv_kernel_size": 3,
+        },
+    )
+    model = KimiLinearForCausalLM(config)
+    saved = CheckpointFormatState.capture([model]).state_dict()
+    config.linear_attn_config["short_conv_kernel_size"] = 5
+    target = CheckpointFormatState.capture([model])
+    with pytest.raises(ValueError, match="model execution contracts differ"):
+        target.validate_state_dict(saved)

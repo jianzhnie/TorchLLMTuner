@@ -67,7 +67,7 @@ def test_dispatch_observation_preserves_real_moe_forward_backward_and_update():
             parameter.normal_(std=0.1)
     candidate = deepcopy(reference)
     timer = DispatchTimer()
-    candidate.routed_experts.dispatch_observer = timer
+    candidate.routed_experts.dispatch_observation.observer = timer
     left = torch.randn(7, _DIM, requires_grad=True)
     right = left.detach().clone().requires_grad_()
     expected, actual = reference(left), candidate(right)

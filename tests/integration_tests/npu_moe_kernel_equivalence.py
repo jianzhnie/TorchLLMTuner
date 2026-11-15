@@ -13,7 +13,7 @@ require_env("torch_npu")
 import torch
 import torch_npu
 
-from llmtuner.models.qwen.qwen3.experts import forward_torchtitan_moe
+from llmtuner.models.common.moe.packed_expert_execution import forward_packed_experts
 from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
 
@@ -41,9 +41,9 @@ def main():
             down_proj=down,
             act_fn=torch.nn.functional.silu,
         ),
-        _llmtuner_local_dispatcher=LocalTokenDispatcher(experts, top_k),
+        local_dispatcher=LocalTokenDispatcher(experts, top_k),
     )
-    observed = forward_torchtitan_moe(module, inputs)
+    observed = forward_packed_experts(module, inputs)
     routed, permutation = torch_npu.npu_moe_token_permute(
         inputs.reshape(-1, width), indices
     )

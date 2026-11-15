@@ -46,7 +46,7 @@ def check_layout(mesh, placement, size, *, buffer_only=False):
         buffer_patterns=["^weight$"] if buffer_only else (),
     )
     owner = ema._buffer_optimizers[0] if buffer_only else ema._param_optimizers[0]
-    assert ema.param_groups[0]["params"][0] is model.weight
+    assert owner.param_groups[0]["params"][0] is model.weight
     average = owner.state[model.weight]["ema_params"]
     initial_average = average.full_tensor().clone()
     with torch.no_grad():

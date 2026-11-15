@@ -60,15 +60,27 @@ class OptimizerState:
 def test_dcp_kimi_layout_restores_weights_moments_and_next_update(
     tmp_path, source_grouped, source_compiled
 ):
+    class Wrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.extra = {"counter": 0, "_orig_mod": {"label": "initial"}}
+
+        def get_extra_state(self):
+            return self.extra
+
+        def set_extra_state(self, state):
+            self.extra = state
+
     # Register under model so FQNs match the real HF wrapper schema.
     def build():
-        wrapper = torch.nn.Module()
+        wrapper = Wrapper()
         wrapper.model = make_model(latent=True, shared=1)
         wrapper.lm_head = torch.nn.Linear(8, 16, bias=False)
         wrapper.register_buffer("output_scale", torch.tensor(1.25))
         return wrapper
 
     source = build()
+    source.extra = {"counter": 11, "_orig_mod": {"label": "saved"}}
     config = source.model.layers[0].block_sparse_moe.config
     if source_grouped:
         swap_moe_blocks(source.model)
@@ -105,6 +117,7 @@ def test_dcp_kimi_layout_restores_weights_moments_and_next_update(
         },
         adapter=adapter,
     )
+    assert target.extra == source.extra
     expected_ema = convert_kimi_optimizer_state(
         source_ema.state_dict(), num_experts=4, to_hf=source_grouped
     )
@@ -240,7 +253,7 @@ def test_saved_amsgrad_validated_before_model_with_fresh_non_amsgrad(
 
 
 @pytest.mark.parametrize("source_grouped", [False, True])
-def test_legacy_cross_layout_checkpoint_without_rng_restores_model(
+def test_cross_layout_checkpoint_without_requested_rng_rejects_restore(
     tmp_path, source_grouped
 ):
     from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
@@ -258,19 +271,18 @@ def test_legacy_cross_layout_checkpoint_without_rng_restores_model(
     rng = RNGCheckpointState(torch.device("cpu"))
     rng_before = torch.get_rng_state().clone()
     adapter = legacy_adapter(config, None, expert_parallel=not source_grouped)
-    assert load_changed_source_layout(
-        str(tmp_path),
-        states={"model": ModelCheckpointState(target), "rng_state": rng},
-        adapter=adapter,
-    )
+    snapshot = {key: value.clone() for key, value in target.state_dict().items()}
+    with pytest.raises(
+        ValueError, match="missing training state categories.*rng_state"
+    ):
+        load_changed_source_layout(
+            str(tmp_path),
+            states={"model": ModelCheckpointState(target), "rng_state": rng},
+            adapter=adapter,
+        )
     torch.testing.assert_close(torch.get_rng_state(), rng_before, atol=0, rtol=0)
-    inputs = torch.ones(1, 3, 8)
-    torch.testing.assert_close(
-        target.model.layers[0].block_sparse_moe(inputs),
-        source.model.layers[0].block_sparse_moe(inputs),
-        atol=1e-6,
-        rtol=1e-6,
-    )
+    for key, value in target.state_dict().items():
+        torch.testing.assert_close(value, snapshot[key], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("source_grouped", [False, True])

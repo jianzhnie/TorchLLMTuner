@@ -2706,6 +2706,69 @@ def test_streaming_cursor_remains_closed_when_source_cleanup_fails():
         next(cursor)
 
 
+def test_streaming_repeat_closes_exhausted_source_before_restoring_state():
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    events = []
+
+    class Stream:
+        def __next__(self):
+            raise StopIteration
+
+        def close(self):
+            events.append("close")
+
+    class Source:
+        def state_dict(self):
+            return {}
+
+        def __iter__(self):
+            events.append("iterate")
+            return Stream()
+
+        def load_state_dict(self, state):
+            events.append("restore")
+
+    cursor = HuggingFaceCursorIterator(Source(), repeat=True, shuffle=False)
+    with pytest.raises(StopIteration):
+        next(cursor)
+    assert events == ["iterate", "close", "restore", "iterate"]
+    cursor.close()
+    cursor.close()
+    assert events == ["iterate", "close", "restore", "iterate", "close"]
+
+
+def test_streaming_cursor_retries_failed_source_release_without_reopening():
+    from llmtuner.datasets.sources import HuggingFaceCursorIterator
+
+    class Source:
+        attempts = 0
+
+        def state_dict(self):
+            return {}
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return {"index": 0}
+
+        def close(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise OSError("source still active")
+
+    source = Source()
+    cursor = HuggingFaceCursorIterator(source, repeat=False, shuffle=False)
+    with pytest.raises(OSError, match="source still active"):
+        cursor.close()
+    with pytest.raises(ValueError, match="closed"):
+        next(cursor)
+    cursor.close()
+    cursor.close()
+    assert source.attempts == 2
+
+
 def test_streaming_restore_closes_old_generator_before_source_state_changes():
     from llmtuner.datasets.sources import HuggingFaceCursorIterator
 
@@ -2779,7 +2842,16 @@ def test_streaming_restore_failure_closes_cursor_and_preserves_error(failure):
     with pytest.raises(RuntimeError, match=f"{failure} failed"):
         cursor.set_state({"epoch": 0, "hf": {}})
     assert events == (["close"] if failure == "close" else ["close", "restore"])
+    if failure == "close":
+        with pytest.raises(RuntimeError, match="close failed"):
+            cursor.close()
+        assert events == ["close", "close"]
+        failure = None
+        cursor.close()
+        assert events == ["close", "close", "close"]
+    completed_events = events.copy()
     cursor.close()
+    assert events == completed_events
     with pytest.raises(ValueError, match="closed"):
         next(cursor)
     with pytest.raises(ValueError, match="closed"):

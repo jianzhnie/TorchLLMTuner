@@ -66,6 +66,7 @@ from llmtuner.memory.remat_regions import region_names
 from llmtuner.models.configuration import build_model_config
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.parallelize import parallelize_model
+from tests.unit_tests.cpu.parallel.pipeline_stubs import stub_pipeline
 
 _VOCAB = 32
 _HIDDEN = 16
@@ -393,28 +394,6 @@ def test_parallelize_model_threads_selective_ac() -> None:
 # -- the pp path --------------------------------------------------------------
 
 
-class _FakeParallelTopology:
-    """Just enough of ``ParallelTopology`` for the pp branch to be entered.
-
-    The branch reads ``pp_enabled``, asks for the dense and tp meshes (both
-    ``None``: this test's tp is 1) and hands ``parallel_dims`` to
-    ``apply_fsdp``, which is monkeypatched out -- what is pinned here is the
-    per-chunk stage list, not the mesh plumbing.
-    """
-
-    pp_enabled = True
-    dp_replicate = 1
-    dp_shard = 1
-
-    @staticmethod
-    def spmd_dense_mesh():
-        return None
-
-    @staticmethod
-    def get_optional_mesh(name):
-        return None
-
-
 def test_the_pp_path_checkpoints_every_stage_chunk(monkeypatch) -> None:
     """AC is a stage on the pp path too, applied per chunk.
 
@@ -423,14 +402,14 @@ def test_the_pp_path_checkpoints_every_stage_chunk(monkeypatch) -> None:
     refuse AC outright when ``pp > 1``; this is that refusal gone.
     """
     part = _model()
-    stages = [SimpleNamespace(submod=part)]
+    stages, topology, schedule = stub_pipeline(monkeypatch, [part])
     monkeypatch.setattr(
         "llmtuner.parallel.parallelize.apply_pp",
         lambda model, **kwargs: (stages, [part], True, True),
     )
     monkeypatch.setattr(
         "llmtuner.parallel.parallelize.build_pipeline_schedule",
-        lambda schedule_stages, **kwargs: None,
+        lambda schedule_stages, **kwargs: schedule,
     )
     monkeypatch.setattr(
         "llmtuner.parallel.parallelize.apply_fsdp",
@@ -441,7 +420,7 @@ def test_the_pp_path_checkpoints_every_stage_chunk(monkeypatch) -> None:
         _model(),
         cfg=ParallelConfig(),
         mesh=None,
-        parallel_dims=_FakeParallelTopology(),
+        parallel_dims=topology,
         activation_checkpoint="full",
         global_batch_size=2,
     ).execution
@@ -457,13 +436,14 @@ def test_the_pp_path_checkpoints_every_stage_chunk(monkeypatch) -> None:
 def test_the_pp_path_is_a_no_op_when_ac_is_off(monkeypatch) -> None:
     """The other half of the refusal: mode 'none' still assembles, unwrapped."""
     part = _model()
+    stages, topology, schedule = stub_pipeline(monkeypatch, [part])
     monkeypatch.setattr(
         "llmtuner.parallel.parallelize.apply_pp",
-        lambda model, **kwargs: ([SimpleNamespace(submod=part)], [part], True, True),
+        lambda model, **kwargs: (stages, [part], True, True),
     )
     monkeypatch.setattr(
         "llmtuner.parallel.parallelize.build_pipeline_schedule",
-        lambda schedule_stages, **kwargs: None,
+        lambda schedule_stages, **kwargs: schedule,
     )
     monkeypatch.setattr(
         "llmtuner.parallel.parallelize.apply_fsdp",
@@ -474,7 +454,7 @@ def test_the_pp_path_is_a_no_op_when_ac_is_off(monkeypatch) -> None:
         _model(),
         cfg=ParallelConfig(),
         mesh=None,
-        parallel_dims=_FakeParallelTopology(),
+        parallel_dims=topology,
         global_batch_size=2,
     ).execution
 

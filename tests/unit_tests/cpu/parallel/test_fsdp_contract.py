@@ -38,6 +38,7 @@ from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
 from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferences
 from llmtuner.parallel.fully_shard_parallel.pattern import set_fsdp_prefetch_windows
 from llmtuner.parallel.fully_shard_parallel.plan import resolve_pipeline_fsdp_configs
+from llmtuner.parallel.replacements import ReplacementMap
 
 _VOCAB = 32
 
@@ -50,10 +51,12 @@ def test_fsdp_references_reject_partial_stack_after_prior_replacement():
     cfg = ParallelConfig(
         fsdp_config=FSDPConfig(fsdp_apply_modules={"": {"ignored_params": {excluded}}})
     )
-    references = FSDPPatternReferences(model, cfg)
+    replacements = ReplacementMap()
+    references = FSDPPatternReferences(model, cfg, replacements=replacements)
     intermediate = nn.Parameter(torch.empty_like(excluded))
     stacked = nn.Parameter(torch.empty(2, 4, 4))
-    references.record_replacements({}, {excluded: (intermediate,)})
+    # A preceding stage publishes directly to the assembly-owned map.
+    replacements.record_replacements({}, {excluded: (intermediate,)})
     with pytest.raises(UnsupportedCombinationError, match="exclude part of a stacked"):
         references.record_replacements(
             {}, {intermediate: (stacked,), active: (stacked,)}
@@ -61,6 +64,140 @@ def test_fsdp_references_reject_partial_stack_after_prior_replacement():
     # Rejected conversion must not publish a partial mapping.
     assert references.replacements.parameter_targets[excluded] == (intermediate,)
     assert intermediate not in references.replacements.parameter_targets
+
+
+def test_fsdp_reference_rebinding_keeps_shared_transformation_history():
+    original = nn.Linear(4, 4, bias=False)
+    model = nn.ModuleDict({"layer": original})
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"": {"ignored_params": {original.weight}}}
+        )
+    )
+    replacements = ReplacementMap()
+    references = FSDPPatternReferences(model, cfg, replacements=replacements)
+    intermediate = nn.Linear(4, 4, bias=False)
+    references.record_replacements(
+        {original: intermediate}, {original.weight: (intermediate.weight,)}
+    )
+    model["layer"] = intermediate
+    references = FSDPPatternReferences(
+        model, references.bind(model), replacements=replacements
+    )
+    final = nn.Linear(4, 4, bias=False)
+    references.record_replacements(
+        {intermediate: final}, {intermediate.weight: (final.weight,)}
+    )
+    model["layer"] = final
+    assert references.replacements is replacements
+    assert replacements.parameter_targets[original.weight] == (final.weight,)
+    assert references.bind(model).fsdp_config.fsdp_apply_modules[""][
+        "ignored_params"
+    ] == {final.weight}
+
+
+@pytest.mark.parametrize("ignored_module", [False, True])
+def test_fsdp_parameter_mapping_does_not_exclude_reused_source_path(ignored_module):
+    original = nn.Linear(4, 4, bias=False)
+    model = nn.ModuleDict({"source": original})
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"": {"ignored_params": {original.weight}}},
+            fsdp_ignored_modules=["source"] if ignored_module else [],
+        )
+    )
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
+    target = nn.Linear(4, 4, bias=False)
+    references.record_replacements({}, {original.weight: (target.weight,)})
+    model["source"] = nn.Linear(4, 4, bias=False)
+    model["target"] = target
+    bound = references.bind(model).fsdp_config
+    assert bound.fsdp_apply_modules[""]["ignored_params"] == {target.weight}
+
+
+@pytest.mark.parametrize("kind", ["unit", "hook", "ignored"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_fsdp_module_mapping_precedes_reused_paths_and_preserves_wrappers(
+    kind, wrapped
+):
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+    )
+
+    original = nn.Linear(4, 4, bias=False)
+    model = nn.ModuleDict({"source": original})
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules=(
+                {"source": {}}
+                if kind == "unit"
+                else {"": {"hook_module": original}}
+                if kind == "hook"
+                else {}
+            ),
+            fsdp_ignored_modules=["source"] if kind == "ignored" else [],
+        )
+    )
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
+    target = nn.Linear(4, 4, bias=False)
+    references.record_replacements(
+        {original: target}, {original.weight: (target.weight,)}
+    )
+    model["source"] = nn.Linear(4, 4, bias=False)
+    model["target"] = checkpoint_wrapper(target) if wrapped else target
+    bound = references.bind(model).fsdp_config
+    if kind == "unit":
+        assert bound.fsdp_apply_modules == {"target": {}}
+    elif kind == "hook":
+        assert bound.fsdp_apply_modules[""]["hook_module"] is model["target"]
+    else:
+        assert bound.fsdp_ignored_modules == ["target"]
+        assert bound.fsdp_apply_modules == {}
+
+
+@pytest.mark.parametrize("kind", ["unit", "hook", "ignored"])
+def test_fsdp_module_mapping_rejects_unregistered_target_despite_reused_path(kind):
+    original = nn.Identity()
+    model = nn.ModuleDict({"source": original})
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules=(
+                {"source": {}}
+                if kind == "unit"
+                else {"": {"hook_module": original}}
+                if kind == "hook"
+                else {}
+            ),
+            fsdp_ignored_modules=["source"] if kind == "ignored" else [],
+        )
+    )
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
+    references.record_replacements({original: nn.Identity()}, {})
+    model["source"] = nn.Identity()
+    with pytest.raises(ValueError, match="module replacement target.*registered"):
+        references.bind(model)
+
+
+@pytest.mark.parametrize("removed_target", [False, True])
+def test_fsdp_parameter_mapping_rejects_missing_targets_despite_reused_path(
+    removed_target,
+):
+    original = nn.Linear(4, 4, bias=False)
+    model = nn.ModuleDict({"source": original})
+    cfg = ParallelConfig(
+        fsdp_config=FSDPConfig(
+            fsdp_apply_modules={"": {"ignored_params": {original.weight}}}
+        )
+    )
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
+    target = nn.Parameter(torch.empty_like(original.weight))
+    references.record_replacements(
+        {}, {original.weight: () if removed_target else (target,)}
+    )
+    model["source"] = nn.Linear(4, 4, bias=False)
+    message = "lost its registered paths" if removed_target else "no longer registered"
+    with pytest.raises(ValueError, match=message):
+        references.bind(model)
 
 
 @pytest.mark.parametrize("ignored_module", [False, True])
@@ -75,7 +212,7 @@ def test_fsdp_references_compose_renamed_replacements(ignored_module):
             },
         )
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     intermediate = nn.Linear(4, 4, bias=False)
     final = nn.Linear(4, 4, bias=False)
     sibling = nn.Linear(4, 4, bias=False)
@@ -2042,7 +2179,7 @@ def test_fsdp_references_follow_replacement_and_transparent_wrappers(compiled):
             }
         )
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     replacement = nn.Linear(4, 2, bias=False)
     model[0] = checkpoint_wrapper(replacement)
     wrapper = model[0]
@@ -2066,7 +2203,7 @@ def test_fsdp_references_follow_all_parameter_aliases():
             fsdp_apply_modules={"": {"ignored_params": {model[0].weight}}}
         )
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     model[0] = nn.Linear(4, 2, bias=False)
     model[1] = nn.Linear(4, 2, bias=False)
     exclusions = references.bind(model).fsdp_config.fsdp_apply_modules[""][
@@ -2083,7 +2220,7 @@ def test_fsdp_references_reject_removed_objects_instead_of_dropping_them(overrid
     cfg = ParallelConfig(
         fsdp_config=FSDPConfig(fsdp_apply_modules={"": {override: value}})
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     model[0] = nn.Identity()
     if override == "hook_module":
         # A same-path replacement has a valid module mapping. Remove the path
@@ -2104,7 +2241,7 @@ def test_fsdp_references_follow_renamed_replacement_with_shared_aliases(ignored)
             fsdp_ignored_modules=["original"] if ignored else [],
         )
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     replacement = nn.Linear(4, 4, bias=False)
     references.record_replacements(
         {original: replacement}, {original.weight: (replacement.weight,)}
@@ -2133,7 +2270,7 @@ def test_fsdp_references_keep_objects_retained_under_new_paths():
             }
         )
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     model.router = original
     del model.gate
     rebound = references.bind(model).fsdp_config.fsdp_apply_modules[""]

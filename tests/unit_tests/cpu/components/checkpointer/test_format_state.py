@@ -1,0 +1,161 @@
+"""Native format records participate in isolated restore preflight."""
+
+import pytest
+
+from llmtuner.components.checkpointer.core.checkpoint_keys import CHECKPOINT_FORMAT
+from llmtuner.components.checkpointer.core.format_state import CheckpointFormatState
+from llmtuner.components.checkpointer.core.state_adaptation import (
+    prepare_local_state_preflight,
+    validate_local_state_preflight,
+)
+from llmtuner.config.checkpoint_config import CheckpointConfig
+from llmtuner.errors import ConfigError
+
+
+@pytest.mark.parametrize("version", [True, 0, 2, "1", None])
+def test_preflight_rejects_unsupported_format_without_mutating_writer(version):
+    record = CheckpointFormatState()
+    selected, destination = prepare_local_state_preflight({CHECKPOINT_FORMAT: record})
+    destination[CHECKPOINT_FORMAT]["version"] = version
+    with pytest.raises(ValueError, match="format version"):
+        validate_local_state_preflight(selected, destination)
+    assert record.state_dict() == {
+        "name": "llmtuner.native",
+        "version": 1,
+        "model_contracts": "[]",
+    }
+
+
+def test_native_format_name_is_required():
+    record = CheckpointFormatState()
+    with pytest.raises(ValueError, match="native training format"):
+        record.load_state_dict({"name": "external", "version": 1})
+
+
+def test_native_format_preflight_is_mandatory():
+    with pytest.raises(ConfigError, match="cannot be excluded"):
+        CheckpointConfig(exclude_from_loading=[CHECKPOINT_FORMAT])
+
+
+def test_dcp_full_restore_rejects_unversioned_checkpoint(tmp_path):
+    import torch
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer.storage.load_planner import (
+        CheckpointLoadPlanner,
+    )
+
+    dcp.save({"weight": torch.ones(2)}, checkpoint_id=tmp_path)
+    destination = {
+        CHECKPOINT_FORMAT: CheckpointFormatState().state_dict(),
+        "weight": torch.zeros(2),
+    }
+    with pytest.raises(CheckpointException, match="no complete format record"):
+        dcp.load(destination, checkpoint_id=tmp_path, planner=CheckpointLoadPlanner())
+    assert not destination["weight"].any()
+    model_only = {"weight": torch.zeros(2)}
+    dcp.load(model_only, checkpoint_id=tmp_path, planner=CheckpointLoadPlanner())
+    torch.testing.assert_close(model_only["weight"], torch.ones(2))
+
+
+@pytest.mark.parametrize("category", ["rng_state", "dataloader"])
+def test_versioned_restore_cannot_use_legacy_missing_metadata_fallback(
+    tmp_path, category
+):
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from llmtuner.components.checkpointer.storage.load_planner import (
+        CheckpointLoadPlanner,
+    )
+
+    saved = {CHECKPOINT_FORMAT: CheckpointFormatState().state_dict()}
+    if category == "dataloader":
+        saved[category] = {"version": 1, "cursor": 7}
+    dcp.save(saved, checkpoint_id=tmp_path)
+    destination = {CHECKPOINT_FORMAT: CheckpointFormatState().state_dict()}
+    destination[category] = (
+        {"cpu": "required RNG record"}
+        if category == "rng_state"
+        else {"version": 1, "cursor": 0, "batch_layout": {"tokens": 32}}
+    )
+    with pytest.raises(CheckpointException, match=category):
+        dcp.load(destination, checkpoint_id=tmp_path, planner=CheckpointLoadPlanner())
+
+
+def test_model_contract_capture_ignores_duplicate_pipeline_parts():
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from llmtuner.models.execution import ModelExecutionCapabilities
+
+    model = nn.Module()
+    model.execution_capabilities = ModelExecutionCapabilities(
+        hidden_states=True, hidden_size=8
+    )
+    model.vocab_size = 32
+    model.config = SimpleNamespace(model_type="declared_decoder")
+    single = CheckpointFormatState.capture([model])
+    duplicated = CheckpointFormatState.capture([model, model])
+    single.validate_state_dict(duplicated.state_dict())
+    model.vocab_size = 64
+    changed = CheckpointFormatState.capture([model])
+    with pytest.raises(ValueError, match="model execution contracts differ"):
+        changed.validate_state_dict(single.state_dict())
+
+
+def test_contract_capture_includes_remote_pipeline_declarations(monkeypatch):
+    from torch import nn
+
+    from llmtuner.components.checkpointer.core import format_state
+    from llmtuner.models.execution import ModelExecutionCapabilities
+
+    first, last = nn.Module(), nn.Module()
+    first.execution_capabilities = ModelExecutionCapabilities(logits=False)
+    last.execution_capabilities = ModelExecutionCapabilities()
+    expected = CheckpointFormatState.capture([first, last]).state_dict()
+    remote = CheckpointFormatState.capture([last]).state_dict()["model_contracts"]
+
+    import json
+
+    monkeypatch.setattr(format_state, "get_world_size", lambda: 2)
+
+    def gather(peers, local):
+        peers[:] = [local, json.loads(remote)]
+
+    monkeypatch.setattr(format_state.dist, "all_gather_object", gather)
+    assert CheckpointFormatState.capture([first]).state_dict() == expected
+
+
+def test_model_configuration_is_snapshotted_and_validated_before_restore():
+    from torch import nn
+
+    from llmtuner.models.execution import ModelExecutionCapabilities
+
+    model = nn.Module()
+    model.execution_capabilities = ModelExecutionCapabilities()
+    model.checkpoint_configuration = {
+        "route_scale": 1.0,
+        "rope": {"theta": 10000.0},
+    }
+    saved = CheckpointFormatState.capture([model])
+    model.checkpoint_configuration["rope"]["theta"] = 1000000.0
+    target = CheckpointFormatState.capture([model])
+    with pytest.raises(ValueError, match="model execution contracts differ"):
+        target.validate_state_dict(saved.state_dict())
+    # Mutating the live config does not retroactively change a captured record.
+    assert saved.state_dict() != target.state_dict()
+
+
+def test_standalone_checkpoint_configuration_does_not_require_execution_contract():
+    from torch import nn
+
+    model = nn.Linear(2, 2)
+    model.checkpoint_configuration = {"activation": "silu"}
+    saved = CheckpointFormatState.capture([model]).state_dict()
+    model.checkpoint_configuration = {"activation": "gelu"}
+    target = CheckpointFormatState.capture([model])
+    with pytest.raises(ValueError, match="model execution contracts differ"):
+        target.validate_state_dict(saved)

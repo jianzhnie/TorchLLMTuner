@@ -23,6 +23,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 from llmtuner.config.parallel_config import ParallelConfig, PipelineParallelConfig
 from llmtuner.memory.activation_checkpoint import apply_ac
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.parallel.pipeline_parallel.microbatch_drivers import run_microbatches
 from llmtuner.parallel.pipeline_parallel.pipeline_parallel import (
     apply_pp,
     build_pipeline_schedule,
@@ -107,14 +108,30 @@ def main() -> None:
                 expected.flatten(0, 1), labels.flatten(), reduction="mean"
             )
             loss.backward()
-            schedule._llmtuner_global_valid_tokens = torch.tensor(12.0, device=device)
             losses = [] if last else None
-            actual = schedule.step(
-                *((tokens,) if first else ()),
-                target=labels if last else None,
-                losses=losses,
-            )
+            actual_chunks = []
+
+            def capture_output(module, inputs, output, *, chunks=actual_chunks):
+                chunks.append(output.detach())
+
+            # The production driver collects losses, not activations. Observe
+            # final-stage outputs without changing its execution contract.
+            handle = part.register_forward_hook(capture_output) if last else None
+            try:
+                run_microbatches(
+                    schedule,
+                    args=[(chunk,) for chunk in tokens.chunk(2)] if first else None,
+                    kwargs=[{}, {}],
+                    targets=list(labels.chunk(2)) if last else None,
+                    losses=losses,
+                    normalization_tokens=torch.tensor(12.0, device=device),
+                )
+            finally:
+                if handle is not None:
+                    handle.remove()
             if last:
+                assert len(actual_chunks) == 2
+                actual = torch.cat(actual_chunks, dim=0)
                 torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
                 torch.testing.assert_close(
                     torch.stack(losses).sum(), loss, rtol=1e-5, atol=1e-6

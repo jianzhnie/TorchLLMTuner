@@ -278,7 +278,7 @@ def test_fused_qkv_preserves_differentiable_weight_parametrization(projection):
     attention = Qwen3MoeForCausalLM(config).layers[0].self_attn
     register_parametrization(getattr(attention, projection), "weight", ScaleWeight())
     reference = deepcopy(attention)
-    reference._llmtuner_fused_qkv = False
+    reference.qkv_projection = "separate"
     hidden = torch.randn(1, 3, config.hidden_size, requires_grad=True)
     other = hidden.detach().clone().requires_grad_()
     rotary = (torch.ones(1, 3, config.head_dim), torch.zeros(1, 3, config.head_dim))

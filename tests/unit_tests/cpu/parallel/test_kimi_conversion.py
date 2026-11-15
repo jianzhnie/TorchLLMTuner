@@ -15,6 +15,7 @@ from llmtuner.parallel.expert_parallel.model_replacement import (
     swap_moe_blocks,
 )
 from llmtuner.parallel.expert_parallel.plan import resolve_ep_plan
+from llmtuner.parallel.replacements import ReplacementMap
 
 
 def make_model(*, latent=False, shared=0, activation="silu", top_k=2):
@@ -527,7 +528,7 @@ def test_kimi_fsdp_references_preserve_complete_stacked_exclusions(whole_module)
             ),
         )
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     swap_moe_blocks(model, on_replacement=references.record_replacements)
     grouped = model.layers[0].block_sparse_moe.routed_experts.inner_experts
     rebound = references.bind(model)
@@ -561,7 +562,7 @@ def test_kimi_partial_stacked_exclusion_rejected_before_installation(module_excl
             ),
         )
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     with pytest.raises(UnsupportedCombinationError, match="part of a stacked"):
         swap_moe_blocks(model, on_replacement=references.record_replacements)
     assert model.layers[0].block_sparse_moe is source
@@ -589,7 +590,7 @@ def test_kimi_gate_module_exclusion_keeps_moved_bias_outside_router(
             fsdp_ignored_modules=["layers.0.block_sparse_moe.gate"],
         )
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     swap_moe_blocks(model, on_replacement=references.record_replacements)
     converted = model.layers[0].block_sparse_moe
     rebound = references.bind(model)

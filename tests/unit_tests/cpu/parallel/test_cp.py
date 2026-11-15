@@ -76,7 +76,7 @@ def test_kcp_degree_requires_kcp_strategy() -> None:
 
 
 def test_kcp_reports_missing_model_before_optional_runtime(monkeypatch):
-    from llmtuner.parallel.context_parallel.kcp import apply_kcp
+    from llmtuner.parallel.context_parallel.kcp import resolve_kcp_plan
 
     def runtime():
         pytest.fail("Model capability must be checked before kernel imports")
@@ -85,26 +85,15 @@ def test_kcp_reports_missing_model_before_optional_runtime(monkeypatch):
     model = torch.nn.Linear(4, 4)
     original_forward = model.forward
     with pytest.raises(TypeError, match="model-owned DecoderStructure"):
-        apply_kcp(model, cp_mesh=None)
+        resolve_kcp_plan(model, degree=2)
     assert model.forward == original_forward
 
 
 def test_kcp_reapplication_replaces_wrapper_and_updates_group(monkeypatch):
     from types import SimpleNamespace
 
-    from llmtuner.parallel.context_parallel.kcp import apply_kcp
-    from tests.unit_tests.cpu.parallel.test_kcp_plan import declared_kda_model
-
-    class KDA(torch.nn.Module):
-        context_parallel_layout = "kda_state"
-
-        def __init__(self):
-            super().__init__()
-            for name in ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias"):
-                setattr(self, name, None)
-
-        def forward(self, x):
-            return x
+    from llmtuner.parallel.context_parallel.kcp import apply_kcp, resolve_kcp_plan
+    from tests.unit_tests.cpu.parallel.test_kcp_plan import KDA, declared_kda_model
 
     calls = []
 
@@ -124,13 +113,19 @@ def test_kcp_reapplication_replaces_wrapper_and_updates_group(monkeypatch):
     model = declared_kda_model(module)
     first_group, second_group = object(), object()
     assert (
-        apply_kcp(model, SimpleNamespace(size=lambda: 2, get_group=lambda: first_group))
+        apply_kcp(
+            model,
+            SimpleNamespace(size=lambda: 2, get_group=lambda: first_group),
+            resolved_plan=resolve_kcp_plan(model, degree=2),
+        )
         == 1
     )
     assert module(None) is first_group
     assert (
         apply_kcp(
-            model, SimpleNamespace(size=lambda: 2, get_group=lambda: second_group)
+            model,
+            SimpleNamespace(size=lambda: 2, get_group=lambda: second_group),
+            resolved_plan=resolve_kcp_plan(model, degree=2),
         )
         == 1
     )
@@ -209,10 +204,10 @@ class _StubModel(torch.nn.Module):
             num_key_value_heads=num_key_value_heads,
         )
         self.layers = torch.nn.ModuleList()
-        self.cp_strategy = None
+        self.cp_mesh = None
 
-    def set_cp_mesh(self, cp_mesh, load_balancer=None, strategy="kv_allgather") -> None:
-        self.cp_strategy = strategy
+    def set_cp_mesh(self, cp_mesh, *, load_balancer=None) -> None:
+        self.cp_mesh = cp_mesh
 
 
 @pytest.mark.parametrize("shape", [(4,), (1, 1, 4, 4), (2, 4), (1, 3)])
@@ -264,15 +259,20 @@ def test_kcp_checks_mla_heads_before_installation(monkeypatch, q_lora_rank):
 
     from types import SimpleNamespace
 
-    kda = torch.nn.Module()
-    kda.context_parallel_layout = "kda_state"
-    for name in ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias"):
-        setattr(kda, name, None)
+    from tests.unit_tests.cpu.parallel.test_kcp_plan import KDA
+
+    kda = KDA()
     model = declared_kda_model(kda, mla)
     monkeypatch.setattr(kcp, "_kcp_runtime", lambda: ())
-    group = SimpleNamespace(size=lambda: config.num_attention_heads + 1)
+    plan = kcp.resolve_kcp_plan(model, degree=2)
+    mla.num_heads = 3
+    group = SimpleNamespace(size=lambda: 2)
     with pytest.raises(ValueError, match="heads must be divisible"):
-        kcp.apply_kcp(model, SimpleNamespace(size=group.size, get_group=lambda: group))
+        kcp.apply_kcp(
+            model,
+            SimpleNamespace(size=group.size, get_group=lambda: group),
+            resolved_plan=plan,
+        )
     assert not hasattr(mla, "_kcp_attention")
 
 
@@ -296,16 +296,19 @@ def test_kcp_installs_mla_callable_without_changing_parameter_names(monkeypatch)
         mla_use_nope=True,
     )
     mla = KimiLatentAttention(config, 0)
-    kda = torch.nn.Module()
-    kda.context_parallel_layout = "kda_state"
-    for name in ("q_conv1d", "k_conv1d", "v_conv1d", "A_log", "dt_bias"):
-        setattr(kda, name, None)
+    from tests.unit_tests.cpu.parallel.test_kcp_plan import KDA
+
+    kda = KDA()
     model = declared_kda_model(kda, mla)
     before = dict(model.named_parameters())
     monkeypatch.setattr(kcp, "_kcp_runtime", lambda: ())
     first = SimpleNamespace(size=lambda: 2)
     assert (
-        kcp.apply_kcp(model, SimpleNamespace(size=first.size, get_group=lambda: first))
+        kcp.apply_kcp(
+            model,
+            SimpleNamespace(size=first.size, get_group=lambda: first),
+            resolved_plan=kcp.resolve_kcp_plan(model, degree=2),
+        )
         == 1
     )
     original = mla._kcp_attention
@@ -313,7 +316,9 @@ def test_kcp_installs_mla_callable_without_changing_parameter_names(monkeypatch)
     second = SimpleNamespace(size=lambda: 2)
     assert (
         kcp.apply_kcp(
-            model, SimpleNamespace(size=second.size, get_group=lambda: second)
+            model,
+            SimpleNamespace(size=second.size, get_group=lambda: second),
+            resolved_plan=kcp.resolve_kcp_plan(model, degree=2),
         )
         == 1
     )
@@ -323,13 +328,32 @@ def test_kcp_installs_mla_callable_without_changing_parameter_names(monkeypatch)
     assert all(after[name] is parameter for name, parameter in before.items())
 
 
-def test_cp_dispatches_from_model_backend_contract() -> None:
-    class Model(_StubModel):
-        context_parallel_backend = "compressor"
+def test_cp_dispatches_from_resolved_backend_contract(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.context_parallel import context_parallel
+
+    plan = SimpleNamespace(implementation="compressor", degree=2)
+    monkeypatch.setattr(context_parallel, "resolve_cp_plan", lambda *a, **k: plan)
 
     cfg = ParallelConfig(context_parallel_kv_allgather_size=2)
     with pytest.raises(ValueError, match="HCA CP requires a cp mesh"):
-        apply_cp(Model(4, 4), mesh=None, cfg=cfg)
+        apply_cp(_StubModel(4, 4), mesh=None, cfg=cfg)
+
+
+def test_cp_plan_rejects_missing_input_contract_before_backend_resolution(monkeypatch):
+    from llmtuner.parallel.context_parallel import plan
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("incomplete model contract reached backend resolution")
+
+    monkeypatch.setattr(plan, "resolve_kcp_plan", forbidden)
+    cfg = ParallelConfig(
+        context_parallel_kcp_size=2,
+        cp_config=ContextParallelConfig(context_parallel_strategy="kcp"),
+    )
+    with pytest.raises(TypeError, match="set_cp_mesh"):
+        plan.resolve_cp_plan(torch.nn.Linear(2, 2), cfg=cfg)
 
 
 @pytest.mark.parametrize("strategy", ["kv_allgather", "ulysses"])
@@ -342,5 +366,5 @@ def test_removed_standard_cp_fails_before_mutation(strategy):
     rng = torch.get_rng_state().clone()
     with pytest.raises(NotImplementedError, match="kernels have been removed"):
         apply_cp(model, mesh=None, cfg=cfg)
-    assert model.cp_strategy is None
+    assert model.cp_mesh is None
     assert torch.equal(torch.get_rng_state(), rng)

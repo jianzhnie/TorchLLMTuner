@@ -71,10 +71,6 @@ def local(tensor: torch.Tensor) -> torch.Tensor:
 
 def main() -> None:
     swap = os.environ.get("ACCUMULATION_SWAP") == "1"
-    if swap:
-        from llmtuner.memory.activation_swap import reset_activation_swap_metrics
-
-        reset_activation_swap_metrics()
     accumulated = Trainer(config(2))
     combined = None
     try:
@@ -134,9 +130,7 @@ def main() -> None:
                     rtol=2e-5,
                 )
         if swap:
-            from llmtuner.memory.activation_swap import activation_swap_metrics
-
-            transfers = activation_swap_metrics()
+            transfers = accumulated.activation_swap_resources.metrics_snapshot()
             assert transfers["copies_d2h"] > 0, transfers
             assert transfers["copies_h2d"] > 0, transfers
             assert transfers["host_bytes_current"] == 0, transfers

@@ -23,6 +23,15 @@ def test_invalid_expert_geometry_leaves_tp_pp_and_model_untouched(
     )
     group = SimpleNamespace(size=lambda: 2)
     dims = SimpleNamespace(
+        dp_replicate=1,
+        dp_shard=1,
+        cp=1,
+        tp=2,
+        pp=2 if pipeline else 1,
+        ep=2,
+        world_size=4 if pipeline else 2,
+        cp_kv=1,
+        cp_ulysses=1,
         pp_enabled=pipeline,
         get_optional_mesh=lambda name: SimpleNamespace(get_group=lambda: group),
     )

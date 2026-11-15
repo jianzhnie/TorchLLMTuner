@@ -19,7 +19,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+from llmtuner.components.checkpointer.core import layout_conversion
 from llmtuner.components.optimizer import OptimizersContainer
+from llmtuner.components.optimizer import checkpoint_state as checkpoint_module
 from llmtuner.components.optimizer import optimizer as optimizer_module
 from llmtuner.config import OptimizerConfig, ParamGroupConfig
 
@@ -402,7 +404,7 @@ def test_sharded_optimizer_restore_collects_local_state_once(monkeypatch):
     target = OptimizersContainer(_cfg(_catch_all()), model_parts=[fresh_model])
     target.sharded_expert_parallel = True
     calls = 0
-    collect = optimizer_module.collect_local_optimizer_state
+    collect = checkpoint_module.collect_local_optimizer_state
 
     def count_collect(optimizers):
         nonlocal calls
@@ -410,16 +412,16 @@ def test_sharded_optimizer_restore_collects_local_state_once(monkeypatch):
         return collect(optimizers)
 
     monkeypatch.setattr(
-        optimizer_module, "collect_local_optimizer_state", count_collect
+        checkpoint_module, "collect_local_optimizer_state", count_collect
     )
-    monkeypatch.setattr(optimizer_module, "expert_shard_map", lambda parts: {})
+    monkeypatch.setattr(checkpoint_module, "expert_shard_map", lambda parts: {})
     monkeypatch.setattr(
-        optimizer_module,
+        layout_conversion,
         "restore_sharded_expert_state",
         lambda state, **kwargs: state,
     )
     monkeypatch.setattr(
-        optimizer_module,
+        layout_conversion,
         "load_tensor_parallel_state",
         lambda state, **kwargs: state,
     )
@@ -716,3 +718,88 @@ def test_group_initial_lr_is_preserved_for_scheduler():
     group = _catch_all(lr=0.1, initial_lr=0.2)
     container = OptimizersContainer(_cfg(group), model_parts=[_model()])
     assert container.optimizers[0].param_groups[0]["initial_lr"] == 0.2
+
+
+@pytest.mark.parametrize("wrapper", ["_orig_mod", "_checkpoint_wrapped_module"])
+def test_parameter_groups_match_canonical_aliases_through_wrappers(wrapper):
+    model = nn.Module()
+    layer = nn.Module()
+    layer.first = nn.Linear(2, 2, bias=False)
+    layer.second = nn.Linear(2, 2, bias=False)
+    layer.second.weight = layer.first.weight
+    model.layer = nn.Module()
+    model.layer.add_module(wrapper, layer)
+    container = OptimizersContainer(
+        _cfg(
+            ParamGroupConfig(
+                pattern=r"^layer\.second\.weight$",
+                optimizer_name="AdamW",
+                optimizer_kwargs={"lr": 0.01},
+            )
+        ),
+        model_parts=[model],
+    )
+    group = container.optimizers[0].param_groups[0]
+    assert len(group["params"]) == 1
+    assert group["params"][0] is layer.first.weight
+    assert group["param_names"] == ["layer.first.weight"]
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_optimizer_construction_retains_cleanup_failure_cause(
+    monkeypatch, failure_type
+):
+    construction_error = failure_type("optimizer interface failed")
+    cleanup_error = OSError("optimizer resource still active")
+    closed = []
+
+    def fail_interface(self, parameters):
+        raise construction_error
+
+    def fail_close(self):
+        closed.append(self)
+        raise cleanup_error
+
+    monkeypatch.setattr(
+        OptimizersContainer, "_initialize_optimizer_interface", fail_interface
+    )
+    monkeypatch.setattr(torch.optim.AdamW, "close", fail_close, raising=False)
+    with pytest.raises(failure_type) as caught:
+        OptimizersContainer(_cfg(_catch_all()), model_parts=[_model()])
+    assert caught.value is construction_error
+    assert caught.value.__cause__ is cleanup_error
+    assert len(closed) == 1
+
+
+def test_construction_owner_can_retry_failed_inner_optimizer_cleanup(monkeypatch):
+    owners = []
+    attempts = []
+    failure = ValueError("optimizer construction failed")
+
+    def fail_interface(self, parameters):
+        assert owners == [self]
+        raise failure
+
+    def close(self):
+        attempts.append(self)
+        if len(attempts) == 1:
+            raise OSError("cleanup interrupted")
+
+    monkeypatch.setattr(
+        OptimizersContainer, "_initialize_optimizer_interface", fail_interface
+    )
+    monkeypatch.setattr(torch.optim.AdamW, "close", close, raising=False)
+    with pytest.raises(ValueError) as caught:
+        OptimizersContainer(
+            _cfg(_catch_all()), model_parts=[_model()], on_acquired=owners.append
+        )
+    assert caught.value is failure
+    assert len(owners) == 1
+    owner = owners[0]
+    assert owner._pending_close == attempts
+    owner.close()
+    assert len(attempts) == 2
+    assert attempts[0] is attempts[1]
+    assert owner._pending_close == []
+    owner.close()
+    assert len(attempts) == 2

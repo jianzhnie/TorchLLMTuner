@@ -148,3 +148,22 @@ def test_flat_positions_preserve_explicit_batch_rows(position_layout, hidden_onl
             rtol=0,
             atol=0,
         )
+
+
+def test_checkpoint_rejects_shape_preserving_router_configuration_change():
+    from llmtuner.components.checkpointer.core.format_state import CheckpointFormatState
+
+    config = text_config(Qwen3_5MoeTextConfig)
+    config.layer_types = ["full_attention"]
+    config._attn_implementation = "eager"
+    config._experts_implementation = "eager"
+    model = Qwen3_5MoeForCausalLM(config)
+    saved = CheckpointFormatState.capture([model]).state_dict()
+    shapes = {name: tuple(value.shape) for name, value in model.named_parameters()}
+    config.router_aux_loss_coef += 0.1
+    current = CheckpointFormatState.capture([model])
+    assert shapes == {
+        name: tuple(value.shape) for name, value in model.named_parameters()
+    }
+    with pytest.raises(ValueError, match="model execution contracts differ"):
+        current.validate_state_dict(saved)

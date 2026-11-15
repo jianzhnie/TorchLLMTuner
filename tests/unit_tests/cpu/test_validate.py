@@ -170,11 +170,11 @@ class _EchoModel(torch.nn.Module):
     def validation_context(self, *, mask_type):
         return temporary_attention_mask(self.model.config, mask_type=mask_type)
 
-    def prepare_inputs(self, batch, *, parallel_dims, max_context_length=None):
+    def prepare_inputs(self, batch, *, parallel_dims):
         if "num_valid_tokens" in batch:
             self.saw_num_valid_tokens_kwarg = True
         labels = batch["labels"]
-        return batch["input_ids"].reshape(-1), labels.reshape(-1), {}
+        return batch["input"].reshape(-1), labels.reshape(-1), {}
 
     def forward(self, inputs, **kwargs):
         self.saw_eval_mode = not self.training
@@ -188,7 +188,7 @@ def _batch(valid_tokens: int) -> dict[str, Any]:
     labels = torch.ones(1, SEQ_LEN, dtype=torch.long)
     labels[0, valid_tokens:] = IGNORE_INDEX
     return {
-        "input_ids": torch.ones(1, SEQ_LEN, dtype=torch.long),
+        "input": torch.ones(1, SEQ_LEN, dtype=torch.long),
         "labels": labels,
         "num_valid_tokens": valid_tokens,
     }
@@ -214,7 +214,6 @@ def _make_trainer(
         model_parts=trainer.model_parts,
         parallel_dims=trainer.parallel_dims,
         device=trainer.device,
-        max_context_length=cfg.max_seq_len,
         chunked_loss_num_chunks=1,
         param_context=trainer.param_context,
         loss_sum=cross_entropy_loss,
@@ -234,7 +233,7 @@ def _make_trainer(
 
 def _expected_loss(batches: list[dict[str, Any]]) -> float:
     loss_sum = sum(
-        float(cross_entropy_loss(_EchoModel()(b["input_ids"]), b["labels"].reshape(-1)))
+        float(cross_entropy_loss(_EchoModel()(b["input"]), b["labels"].reshape(-1)))
         for b in batches
     )
     valid = sum(b["num_valid_tokens"] for b in batches)
@@ -378,6 +377,7 @@ class _FakePPSchedule:
 
     def __init__(self, per_mb_loss: float):
         self.per_mb_loss = per_mb_loss
+        self._loss_fn = SimpleNamespace(global_valid_tokens=torch.tensor(1.0))
         self.eval_calls: list[dict[str, Any]] = []
         self._has_backward = True
         self._stage = SimpleNamespace(
@@ -436,7 +436,6 @@ def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
         model_parts=trainer.model_parts,
         parallel_dims=trainer.parallel_dims,
         device=trainer.device,
-        max_context_length=cfg.max_seq_len,
         chunked_loss_num_chunks=1,
         param_context=trainer.param_context,
         pp_schedule=_FakePPSchedule(per_mb_loss=6.0),
@@ -462,7 +461,7 @@ def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
     assert call["arg_mbs"] is not None and call["target_mbs"] is not None
     # Denominator pinned to 1 during eval.
     assert (
-        float(trainer.training_engine.pp_schedule._llmtuner_global_valid_tokens) == 1.0
+        float(trainer.training_engine.pp_schedule._loss_fn.global_valid_tokens) == 1.0
     )
     # Raw sums: 6.0 per microbatch x 1 microbatch x 2 batches, over 4 valid
     # tokens (2 per batch).
@@ -746,7 +745,7 @@ def test_pipeline_microbatch_split_rejects_incomplete_rows(rows, packed_dict):
     inputs = torch.ones(rows, SEQ_LEN, dtype=torch.long)
     labels = inputs.clone()
     batch = (
-        {"input_ids": inputs, "labels": labels}
+        {"input": inputs, "labels": labels}
         if packed_dict
         else Batch(input_ids=inputs, labels=labels)
     )

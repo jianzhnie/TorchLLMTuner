@@ -77,7 +77,7 @@ def test_rng_restore_rejects_changed_parallel_degrees(changed_axis):
     state.load_state_dict(saved)
 
 
-def test_legacy_dcp_without_rng_keeps_live_stream_and_restores_model(tmp_path):
+def test_dcp_without_requested_rng_rejects_before_restoring_model(tmp_path):
     import torch.distributed.checkpoint as dcp
 
     from llmtuner.components.checkpointer.storage.load_planner import (
@@ -89,9 +89,12 @@ def test_legacy_dcp_without_rng_keeps_live_stream_and_restores_model(tmp_path):
     target = {"weight": torch.zeros(2), "rng_state": rng.state_dict()}
     before = torch.get_rng_state().clone()
     planner = CheckpointLoadPlanner()
-    dcp.load(target, checkpoint_id=tmp_path, planner=planner)
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    with pytest.raises(CheckpointException, match="rng_state"):
+        dcp.load(target, checkpoint_id=tmp_path, planner=planner)
     assert not planner.has_rng_state
-    assert torch.equal(target["weight"], torch.ones(2))
+    assert torch.equal(target["weight"], torch.zeros(2))
     assert torch.equal(torch.get_rng_state(), before)
 
 

@@ -8,7 +8,7 @@ from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.pipeline_parallel import partition
 from llmtuner.parallel.pipeline_parallel.partition import split_model_into_stages
-from llmtuner.parallel.pipeline_parallel.pipeline_parallel import scalar_loss_fn
+from llmtuner.parallel.pipeline_parallel.pipeline_parallel import PipelineLoss
 from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
 
 
@@ -287,7 +287,7 @@ def test_pipeline_loss_normalizes_flat_and_batched_tokens_equally(batched):
         )
         / denominator
     )
-    actual = scalar_loss_fn(
+    actual = PipelineLoss()(
         logits if batched else logits.reshape(-1, 5),
         labels if batched else labels.flatten(),
         global_valid_tokens=denominator,
@@ -297,3 +297,40 @@ def test_pipeline_loss_normalizes_flat_and_batched_tokens_equally(batched):
     expected_gradient = torch.autograd.grad(expected, logits)[0]
     assert actual_gradient.count_nonzero() > 0
     torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+
+
+def test_pipeline_loss_rejects_swapped_token_axes_before_loss_service():
+    def reject_loss(*args, **kwargs):
+        pytest.fail("Invalid token axes reached the loss service")
+
+    loss = PipelineLoss(loss_sum=reject_loss)
+    with pytest.raises(ValueError, match="token axis order"):
+        loss(torch.zeros(2, 3, 5), torch.zeros(3, 2, dtype=torch.long))
+
+
+def test_pipeline_loss_rejects_vector_result_before_schedule_backward():
+    loss = PipelineLoss(loss_sum=lambda *args, **kwargs: torch.ones(2))
+    with pytest.raises(ValueError, match="floating-point scalar"):
+        loss(torch.zeros(2, 5), torch.zeros(2, dtype=torch.long))
+
+
+def test_pipeline_loss_rejects_vector_denominator_before_loss_service():
+    def reject_loss(*args, **kwargs):
+        pytest.fail("Invalid normalization reached the loss service")
+
+    loss = PipelineLoss(loss_sum=reject_loss)
+    with pytest.raises(TypeError, match="scalar tensor"):
+        loss(
+            torch.zeros(2, 5),
+            torch.zeros(2, dtype=torch.long),
+            global_valid_tokens=torch.ones(2),
+        )
+
+
+def test_pipeline_loss_rejects_wrong_declared_vocab_before_loss_service():
+    def reject_loss(*args, **kwargs):
+        pytest.fail("Invalid vocabulary width must fail before invoking loss")
+
+    loss = PipelineLoss(logits_width=7, loss_sum=reject_loss)
+    with pytest.raises(ValueError, match="declared output width"):
+        loss(torch.randn(2, 3, 6), torch.zeros(2, 3, dtype=torch.long))

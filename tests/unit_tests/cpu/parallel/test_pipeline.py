@@ -14,8 +14,6 @@ from tests.caps import require_env
 require_env("pipelining", "flex_attention", "spmd_types")
 
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -33,7 +31,7 @@ from llmtuner.parallel.pipeline_parallel.partition import (
     split_model_into_stages,
 )
 from llmtuner.parallel.pipeline_parallel.pipeline_parallel import (
-    make_schedule_loss_fn,
+    PipelineLoss,
     prepend_first_stage_modules,
     validate_microbatches,
 )
@@ -595,47 +593,23 @@ def test_split_preserves_container_assigned_by_its_own_name(pp_mesh, container_t
     assert not any(key.startswith("layers.") for key in parts[1].state_dict())
 
 
-def test_split_blanks_unassigned_alias_of_first_stage_module(pp_mesh) -> None:
-    model = _model_with_vision_encoder()
-    model.vision_alias = model.vision_encoder
-    module_names = generate_llm_fqn_per_model_part(2, _NUM_LAYERS)
-    prepend_first_stage_modules(module_names, model, ["vision_encoder"])
-
-    _, model_parts = split_model_into_stages(
-        model,
-        pp_mesh,
-        "1F1B",
-        torch.device("cpu"),
-        module_names,
-        replicated_module_names=("rotary_emb",),
-    )
-
-    assert not isinstance(model_parts[0].vision_encoder, nn.Identity)
-    assert isinstance(model_parts[1].vision_encoder, nn.Identity)
-    for part in model_parts:
-        assert isinstance(part.vision_alias, nn.Identity)
-        assert not any(key.startswith("vision_alias.") for key in part.state_dict())
-
-
-def test_split_without_first_stage_modules_is_unchanged(pp_mesh) -> None:
-    """Default behavior: the five-part split owns exactly the same keys as
-    before the option existed (the extra child is blanked on both stages)."""
+@pytest.mark.parametrize("unassigned", ["vision_encoder", "vision_alias"])
+def test_split_rejects_unassigned_module_state(pp_mesh, unassigned) -> None:
+    """Every persistent path, including aliases, needs explicit ownership."""
     model = _model_with_vision_encoder()
     module_names = generate_llm_fqn_per_model_part(2, _NUM_LAYERS)
+    if unassigned == "vision_alias":
+        model.vision_alias = model.vision_encoder
+        prepend_first_stage_modules(module_names, model, ["vision_encoder"])
 
-    _, model_parts = split_model_into_stages(
-        model,
-        pp_mesh,
-        "1F1B",
-        torch.device("cpu"),
-        module_names,
-        replicated_module_names=("rotary_emb",),
-    )
-
-    for part in model_parts:
-        assert isinstance(part.vision_encoder, nn.Identity)
-        assert not any(
-            k.startswith("vision_encoder.") for k, _ in part.named_parameters()
+    with pytest.raises(ValueError, match=f"unassigned state paths.*{unassigned}"):
+        split_model_into_stages(
+            model,
+            pp_mesh,
+            "1F1B",
+            torch.device("cpu"),
+            module_names,
+            replicated_module_names=("rotary_emb",),
         )
 
 
@@ -643,16 +617,14 @@ def test_schedule_loss_fn_reads_the_denominator_from_either_route() -> None:
     """Both schedule drivers must reach the same loss, denominator included.
 
     Torch's public ``step`` forwards ``loss_kwargs`` into the loss function,
-    while llmtuner's pre-split driver leaves the denominator on the schedule
-    attribute. A loss function wired for only one of the two would make the
+    while llmtuner's pre-split driver updates the PipelineLoss
+    denominator. A loss function wired for only one of the two would make the
     other path raise -- ``TypeError`` for the kwarg route, ``KeyError`` for the
     attribute route -- so the routes are pinned to agree here, without needing
     a live pipeline.
     """
-    schedule = SimpleNamespace(
-        _llmtuner_global_valid_tokens=torch.tensor(4.0),
-    )
-    loss_fn = make_schedule_loss_fn(schedule)
+    denominator = torch.tensor(4.0)
+    loss_fn = PipelineLoss(global_valid_tokens=denominator)
 
     torch.manual_seed(0)
     pred = torch.randn(6, 5)
@@ -678,34 +650,29 @@ def test_schedule_loss_takes_the_vocab_parameters_the_builder_hands_over() -> No
     at all, is the call a caller that does not know the vocabulary makes, and
     it must not change the value either.
     """
-    schedule = SimpleNamespace(
-        _llmtuner_global_valid_tokens=torch.tensor(4.0),
-    )
+    denominator = torch.tensor(4.0)
 
     torch.manual_seed(0)
     pred = torch.randn(6, 5)
     labels = torch.randint(0, 5, (6,))
     reference = F.cross_entropy(pred, labels, reduction="sum")
 
-    with_vocab = make_schedule_loss_fn(
-        schedule,
+    with_vocab = PipelineLoss(
+        global_valid_tokens=denominator,
         tp_group=object(),
         global_vocab_size=pred.shape[-1],
     )
     torch.testing.assert_close(with_vocab(pred, labels), reference / 4.0)
 
     torch.testing.assert_close(
-        make_schedule_loss_fn(schedule)(pred, labels), reference / 4.0
+        PipelineLoss(global_valid_tokens=denominator)(pred, labels), reference / 4.0
     )
 
 
 def test_schedule_loss_explicit_denominator_does_not_read_schedule_state():
-    schedule = SimpleNamespace()
     logits = torch.randn(3, 5, requires_grad=True)
     labels = torch.tensor([1, 2, 3])
-    loss = make_schedule_loss_fn(schedule)(
-        logits, labels, global_valid_tokens=torch.tensor(3.0)
-    )
+    loss = PipelineLoss()(logits, labels, global_valid_tokens=torch.tensor(3.0))
     expected = F.cross_entropy(logits, labels)
     torch.testing.assert_close(loss, expected)
     actual_grad = torch.autograd.grad(loss, logits)[0]

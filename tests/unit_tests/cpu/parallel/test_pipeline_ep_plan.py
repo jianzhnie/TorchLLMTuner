@@ -105,6 +105,15 @@ def test_pipeline_checks_all_local_ep_plans_before_transform(monkeypatch, invali
     cfg = ParallelConfig(pipeline_parallel_size=2)
     cfg.ep_config.fixed_router = True
     topology = SimpleNamespace(
+        dp_replicate=1,
+        dp_shard=1,
+        cp=1,
+        tp=1,
+        pp=2,
+        ep=1,
+        world_size=2,
+        cp_kv=1,
+        cp_ulysses=1,
         pp_enabled=True,
         get_optional_mesh=lambda name: None,
         spmd_dense_mesh=lambda: None,

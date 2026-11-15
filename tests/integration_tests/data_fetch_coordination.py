@@ -50,7 +50,10 @@ def main():
     try:
         rank = dist.get_rank()
         assert dist.get_world_size() == 2
-        batch = Batch(input_ids=torch.ones(1, 4), labels=torch.ones(1, 4))
+        batch = Batch(
+            input_ids=torch.ones(1, 4, dtype=torch.long),
+            labels=torch.ones(1, 4, dtype=torch.long),
+        )
         for failing_rank in (0, 1):
             for method in ("add_tokens", "add_data_loading_time"):
                 for error_type in (ValueError, KeyboardInterrupt, SystemExit):
@@ -78,7 +81,10 @@ def main():
                         assert "Training fetch accounting" in str(caught)
                     dist.barrier()
         for failing_rank in (0, 1):
-            host_batch = {"input": torch.ones(4), "labels": torch.ones(4)}
+            host_batch = {
+                "input": torch.ones(4, dtype=torch.long),
+                "labels": torch.ones(4, dtype=torch.long),
+            }
             if rank == failing_rank:
                 del host_batch["input"]
             runtime = SimpleNamespace(
@@ -116,7 +122,7 @@ def main():
                 device=torch.device("cpu"),
                 count_valid_tokens=Trainer.count_valid_tokens,
             )
-            # Scalar labels pass fetch's numel check, but fail token counting.
+            # Scalar labels pass fetch's numel check, but fail field validation.
             # Peers must reject the batch before entering the DP all-reduce.
             try:
                 count_validation_batch_tokens(
@@ -127,7 +133,7 @@ def main():
                     dp_mesh=token_mesh,
                     error_group=trainer.error_group,
                 )
-            except IndexError:
+            except ValueError:
                 assert rank == failing_rank
             except RuntimeError as error:
                 assert rank != failing_rank
@@ -316,7 +322,6 @@ def main():
             value,
             device=trainer.device,
             parallel_dims=trainer.parallel_dims,
-            max_context_length=trainer.cfg.max_seq_len,
         )
         for failing_rank in (0, 1):
             value = {
@@ -373,6 +378,48 @@ def main():
                 preprocess.assert_not_called()
             dist.barrier()
         print(f"rank={rank}: pipeline split errors coordinated before preprocessing")
+        # Exercise the metadata exchange with successful local preparation.
+        # Count mismatches must stop before the per-microbatch coordination loop;
+        # shape/dtype mismatches must stop before schedule P2P communication.
+        pp_mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("pipeline_preflight",))
+        for mismatch in ("count", "shape", "dtype", None):
+            prepared_calls = []
+            width = 5 if mismatch == "shape" and rank == 1 else 4
+            dtype = torch.int32 if mismatch == "dtype" and rank == 1 else torch.long
+            value = Batch(
+                input_ids=torch.ones(2, width, dtype=dtype),
+                labels=torch.ones(2, width, dtype=torch.long),
+            )
+
+            def prepare(value, prepared_calls=prepared_calls):
+                prepared_calls.append(value)
+                return value.input_ids, value.labels, {}
+
+            runtime = SimpleNamespace(
+                error_group=dist.group.WORLD,
+                pp_has_first_stage=rank == 0,
+                pp_has_last_stage=rank == 1,
+                pp_microbatches=lambda value, mismatch=mismatch: (
+                    [value] * (2 if mismatch == "count" and rank == 1 else 1)
+                ),
+                preprocess=prepare,
+                parallel_dims=SimpleNamespace(get_mesh=lambda axis: pp_mesh),
+            )
+            try:
+                prepared = prepare_pipeline_inputs(runtime, value)
+            except ValueError as error:
+                assert mismatch is not None
+                assert "Pipeline ranks disagree" in str(error)
+                assert len(prepared_calls) == (0 if mismatch == "count" else 1)
+            else:
+                assert mismatch is None, "pipeline mismatch reached schedule inputs"
+                assert len(prepared_calls) == 1
+                if rank == 0:
+                    assert prepared.args[0][0] is value.input_ids
+                else:
+                    assert prepared.targets[0] is value.labels
+            dist.barrier()
+        print(f"rank={rank}: pipeline count and geometry preflight coordinated")
         preprocessing_mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("sequence",))
         for axis in ("cp", "tp"):
             trainer.parallel_dims = SimpleNamespace(
@@ -397,7 +444,7 @@ def main():
             cp_enabled=False,
             spmd_dense_mesh=lambda: mesh,
             spmd_sparse_mesh=lambda: None,
-            get_optional_mesh=lambda name: mesh,
+            get_optional_mesh=lambda name: mesh if name in ("dp", "loss") else None,
         )
         for failure in (
             "exhaustion",
@@ -461,7 +508,6 @@ def main():
                 model_parts=[ValidationModel()],
                 parallel_dims=topology,
                 device=trainer.device,
-                max_context_length=4,
                 chunked_loss_num_chunks=1,
                 param_context=trainer.param_context,
                 loss_sum=cross_entropy_loss,

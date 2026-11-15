@@ -53,7 +53,6 @@ def run_case(
         model_parts=[model],
         parallel_dims=None,
         device=device,
-        max_context_length=1,
         chunked_loss_num_chunks=1,
         param_context=nullcontext,
         optimizer=optimizer,

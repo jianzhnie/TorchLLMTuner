@@ -17,6 +17,7 @@ from llmtuner.models.contracts import (
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferences
 from llmtuner.parallel.plan import ParallelPlan
+from llmtuner.parallel.replacements import ReplacementMap
 from llmtuner.parallel.tensor_parallel.linear import ColwiseLinearNoGather
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     apply_tp,
@@ -335,7 +336,7 @@ def test_tp_parameter_mapping_rebinds_fsdp_exclusions():
         tensor_parallel_size=2,
         fsdp_config=FSDPConfig(fsdp_apply_modules={"": {"ignored_params": {weight}}}),
     )
-    references = FSDPPatternReferences(model, cfg)
+    references = FSDPPatternReferences(model, cfg, replacements=ReplacementMap())
     axis = SimpleNamespace(
         device_type="cpu",
         size=lambda: 2,

@@ -185,11 +185,14 @@ def test_pipeline_eval_consumes_runtime_stage_ownership(monkeypatch, first, last
     calls = []
 
     def evaluate(**kwargs):
+        assert runtime.pp_schedule._loss_fn.global_valid_tokens.item() == 1
+        assert runtime.pp_schedule._loss_fn.global_valid_tokens.device == runtime.device
         calls.append(kwargs)
         if kwargs["losses"] is not None:
             kwargs["losses"].extend([torch.tensor(2.0), torch.tensor(5.0)])
 
     runtime = SimpleNamespace(
+        device=torch.device("cpu"),
         error_group=None,
         pp_has_first_stage=first,
         pp_has_last_stage=last,
@@ -197,14 +200,20 @@ def test_pipeline_eval_consumes_runtime_stage_ownership(monkeypatch, first, last
         preprocess=lambda value: (value.input_ids, value.labels, {}),
         param_context=nullcontext,
         parallel_dims=None,
-        pp_schedule=SimpleNamespace(eval=evaluate),
+        pp_schedule=SimpleNamespace(
+            _has_backward=True,
+            _stage=SimpleNamespace(has_backward=True),
+            eval=evaluate,
+            _loss_fn=SimpleNamespace(global_valid_tokens=torch.tensor(7.0)),
+        ),
     )
     monkeypatch.setattr(
-        "llmtuner.trainer.runtime.pipeline.capability", lambda feature: True
+        "llmtuner.parallel.pipeline_parallel.microbatch_drivers.capability",
+        lambda feature: True,
     )
     result = run_pipeline_eval(runtime, batch)
 
-    assert runtime.pp_schedule._llmtuner_global_valid_tokens.item() == 1
+    assert runtime.pp_schedule._loss_fn.global_valid_tokens.item() == 7
     assert len(calls) == 1
     assert (calls[0]["arg_mbs"] is not None) is first
     assert (calls[0]["target_mbs"] is not None) is last
@@ -212,3 +221,116 @@ def test_pipeline_eval_consumes_runtime_stage_ownership(monkeypatch, first, last
         assert result.item() == 7.0
     else:
         assert result is None
+
+
+@pytest.mark.parametrize("modern", [False, True])
+@pytest.mark.parametrize("failure", [None, RuntimeError, KeyboardInterrupt])
+def test_eval_driver_restores_all_modes_and_denominator(monkeypatch, modern, failure):
+    from llmtuner.parallel.pipeline_parallel import microbatch_drivers as drivers
+
+    stages = [SimpleNamespace(has_backward=True), SimpleNamespace(has_backward=False)]
+    for stage in stages:
+        stage.clear_runtime_states = lambda: None
+    previous = torch.tensor(7.0)
+    denominator = torch.tensor(1.0)
+    schedule = SimpleNamespace(
+        _stages=stages,
+        _has_backward=True,
+        _loss_fn=SimpleNamespace(global_valid_tokens=previous),
+    )
+
+    def execute(*args, **kwargs):
+        assert schedule._loss_fn.global_valid_tokens is denominator
+        schedule._has_backward = False
+        for stage in stages:
+            stage.has_backward = False
+        if failure is not None:
+            raise failure("validation stopped")
+
+    schedule.eval = execute
+    schedule._step_microbatches = execute
+    monkeypatch.setattr(drivers, "capability", lambda name: modern)
+    context = (
+        nullcontext()
+        if failure is None
+        else pytest.raises(failure, match="validation stopped")
+    )
+    with context:
+        drivers.run_eval_microbatches(
+            schedule,
+            args=None,
+            kwargs=[{}],
+            targets=None,
+            losses=None,
+            normalization_tokens=denominator,
+        )
+    assert schedule._has_backward is True
+    assert [stage.has_backward for stage in stages] == [True, False]
+    assert schedule._loss_fn.global_valid_tokens is previous
+
+
+@pytest.mark.parametrize("mismatch", ["count", "shape", "dtype", None])
+def test_pipeline_preflight_compares_count_then_pipeline_geometry(
+    monkeypatch, mismatch
+):
+    import llmtuner.trainer.runtime.pipeline as pipeline
+
+    error_group, pp_group = object(), object()
+    phases = []
+    preprocessed = []
+    communicated = []
+    batch = Batch(
+        input_ids=torch.ones(2, 3, dtype=torch.long),
+        labels=torch.ones(2, 3, dtype=torch.long),
+    )
+
+    @contextmanager
+    def coordinate(phase, *, group):
+        assert group is error_group
+        phases.append(phase)
+        yield
+
+    def gather(destination, local, *, group):
+        communicated.append(group)
+        if group is error_group:
+            destination[:] = [local, local + 1 if mismatch == "count" else local]
+        else:
+            assert group is pp_group
+            peer = list(local)
+            if mismatch == "shape":
+                peer[0] = ((3, 2), torch.long, (3, 2), torch.long)
+            elif mismatch == "dtype":
+                peer[0] = ((2, 3), torch.int32, (2, 3), torch.long)
+            destination[:] = [local, peer]
+
+    def preprocess(value):
+        preprocessed.append(value)
+        return value.input_ids, value.labels, {}
+
+    monkeypatch.setattr(pipeline, "synchronize_local_errors", coordinate)
+    monkeypatch.setattr(pipeline, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(pipeline.dist, "all_gather_object", gather)
+    runtime = SimpleNamespace(
+        error_group=error_group,
+        pp_has_first_stage=True,
+        pp_has_last_stage=False,
+        pp_microbatches=lambda value: [value],
+        preprocess=preprocess,
+        parallel_dims=SimpleNamespace(
+            get_mesh=lambda axis: SimpleNamespace(
+                size=lambda: 2, get_group=lambda: pp_group
+            )
+        ),
+    )
+    if mismatch is None:
+        assert prepare_pipeline_inputs(runtime, batch).args[0][0] is batch.input_ids
+    else:
+        with pytest.raises(ValueError, match="Pipeline ranks disagree"):
+            prepare_pipeline_inputs(runtime, batch)
+    if mismatch == "count":
+        assert preprocessed == []
+        assert communicated == [error_group]
+    else:
+        assert preprocessed == [batch]
+        assert communicated == [error_group, pp_group]
+        assert phases[-1] == "Pipeline input geometry"
