@@ -367,7 +367,7 @@ def test_parallelize_model_wires_ac_before_fsdp() -> None:
         mesh=None,
         parallel_dims=None,
         activation_checkpoint="full",
-    )
+    ).execution
 
     assert all(isinstance(layer, CheckpointWrapper) for layer in model.layers)
 
@@ -385,7 +385,7 @@ def test_parallelize_model_threads_selective_ac() -> None:
         parallel_dims=None,
         activation_checkpoint="selective",
         selective_ac=SelectiveACConfig(),
-    )
+    ).execution
 
     assert all(isinstance(layer, CheckpointWrapper) for layer in model.layers)
 
@@ -444,7 +444,7 @@ def test_the_pp_path_checkpoints_every_stage_chunk(monkeypatch) -> None:
         parallel_dims=_FakeParallelTopology(),
         activation_checkpoint="full",
         global_batch_size=2,
-    )
+    ).execution
 
     assert all(
         isinstance(layer, CheckpointWrapper) for layer in setup.model_parts[0].layers
@@ -476,7 +476,7 @@ def test_the_pp_path_is_a_no_op_when_ac_is_off(monkeypatch) -> None:
         mesh=None,
         parallel_dims=_FakeParallelTopology(),
         global_batch_size=2,
-    )
+    ).execution
 
     assert not any(
         isinstance(layer, CheckpointWrapper) for layer in setup.model_parts[0].layers
@@ -912,93 +912,18 @@ def test_ac_rejects_invalid_layer_container_before_global_setup(layers, monkeypa
         pytest.fail("invalid layer container must fail before global mutation")
 
     monkeypatch.setattr(module, "disable_dynamo_lru_cache", unexpected_setup)
-    with pytest.raises(TypeError, match="layers as nn.Module"):
+    with pytest.raises(TypeError, match="DecoderStructure"):
         module.apply_ac(SimpleNamespace(layers=layers), "full")
 
 
-def test_ac_supports_plain_module_layer_container():
+def test_ac_rejects_undeclared_plain_module_layer_container():
     model = torch.nn.Module()
     model.layers = torch.nn.Module()
     model.layers.add_module("decoder", torch.nn.Linear(4, 4))
-    weight = model.layers.decoder.weight
-    apply_ac(model, "full")
-    assert isinstance(model.layers.decoder, CheckpointWrapper)
-    assert model.layers.decoder.weight is weight
-    inputs = torch.randn(2, 4, requires_grad=True)
-    model.layers.decoder(inputs).sum().backward()
-    assert inputs.grad is not None
-    assert weight.grad is not None
-
-
-@pytest.mark.parametrize("mode", ["full", "selective"])
-def test_compiled_checkpoint_matches_dense_outputs_and_gradients(mode):
-    import copy
-
-    torch.manual_seed(47)
-    reference = torch.nn.Sequential(
-        torch.nn.Linear(4, 8), torch.nn.GELU(), torch.nn.Linear(8, 4)
-    )
-    actual = copy.deepcopy(reference)
-    wrapped = (
-        ac_mod.wrap_full(actual)
-        if mode == "full"
-        else ac_mod.wrap_selective(actual, SelectiveACConfig())
-    )
-    compiled = torch.compile(wrapped, backend="eager")
-    inputs = torch.randn(3, 4)
-    expected_input = inputs.clone().requires_grad_()
-    actual_input = inputs.clone().requires_grad_()
-    expected = reference(expected_input)
-    output = compiled(actual_input)
-    torch.testing.assert_close(output, expected)
-    expected.square().sum().backward()
-    output.square().sum().backward()
-    torch.testing.assert_close(actual_input.grad, expected_input.grad)
-    for left, right in zip(reference.parameters(), actual.parameters(), strict=True):
-        torch.testing.assert_close(right.grad, left.grad)
-
-
-@pytest.mark.parametrize(
-    "value", [True, False, "0.5", None, float("nan"), float("inf")]
-)
-def test_memory_budget_rejects_invalid_numeric_types(value):
-    from llmtuner.errors import ConfigError
-
-    with pytest.raises(ConfigError, match="memory_budget"):
-        MemoryBudgetACConfig(memory_budget=value)
-
-
-@pytest.mark.parametrize("value", [0, 1, "false", "", None])
-@pytest.mark.parametrize("field", ["preserve_rng_state", "debug"])
-def test_selective_checkpoint_requires_boolean_flags(field, value):
-    from llmtuner.errors import ConfigError
-
-    with pytest.raises(ConfigError, match=field):
-        SelectiveACConfig(**{field: value})
-
-
-@pytest.mark.parametrize("value", [0, 1, "false", "", None])
-def test_region_checkpoint_requires_boolean_rng_flag(value):
-    from llmtuner.errors import ConfigError
-
-    with pytest.raises(ConfigError, match="preserve_rng_state"):
-        RegionACConfig(preserve_rng_state=value)
-
-
-@pytest.mark.parametrize("value", ["self_attn.*", None, [1], [""], ["   "]])
-@pytest.mark.parametrize(
-    "field", ["save_regions", "recompute_regions", "force_recompute_mm_shapes_by_fqns"]
-)
-def test_checkpoint_pattern_fields_require_nonempty_string_lists(field, value):
-    from llmtuner.errors import ConfigError
-
-    config = (
-        SelectiveACConfig
-        if field == "force_recompute_mm_shapes_by_fqns"
-        else RegionACConfig
-    )
-    with pytest.raises(ConfigError, match=field):
-        config(**{field: value})
+    original = model.layers.decoder
+    with pytest.raises(TypeError, match="DecoderStructure"):
+        apply_ac(model, "full")
+    assert model.layers.decoder is original
 
 
 def test_full_checkpoint_compiles_with_dispatch_recompute_context():

@@ -27,7 +27,7 @@ from transformers import AutoConfig
 
 from llmtuner.config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.contracts import MoEBlockContract
+from llmtuner.models.contracts import GatedMLPStructure, MoEBlockContract
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel import linear as tp_linear
@@ -331,6 +331,8 @@ def test_apply_tp_raises_when_moe_specs_match_no_block() -> None:
 class _SharedMLP(nn.Module):
     """The gate/up/down layout DeepSeek-style shared experts use."""
 
+    mlp_structure = GatedMLPStructure("gate_proj", "up_proj", "down_proj")
+
     def __init__(self, dim: int = 16, hidden: int = 32) -> None:
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden, bias=False)
@@ -502,6 +504,7 @@ def test_moe_tp_validates_all_blocks_before_sharding(failure) -> None:
         blocks[1].experts = _Experts(4, 16, 7)
     else:
         shared = nn.Module()
+        shared.mlp_structure = GatedMLPStructure("gate_proj", "up_proj", "down_proj")
         hidden = 7 if failure == "shared_hidden" else 8
         shared.gate_proj = nn.Linear(16, hidden, bias=failure == "bias")
         shared.up_proj = nn.Linear(16, hidden, bias=False)

@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.trainer.runtime.engine import TrainingEngine
 from tests.integration_tests.harness import init_distributed
 
@@ -30,6 +31,7 @@ def run_case(
 ) -> None:
     """Verify committed weights and subsequent service ordering on each rank."""
     model = nn.Linear(1, 1, bias=False, device=device)
+    model.execution_capabilities = ModelExecutionCapabilities()
     with torch.no_grad():
         model.weight.fill_(1)
     model.weight.grad = torch.ones_like(model.weight)

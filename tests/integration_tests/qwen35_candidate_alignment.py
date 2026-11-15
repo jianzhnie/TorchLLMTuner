@@ -769,8 +769,8 @@ class AlignmentTrainer(Trainer):
         loss = super().forward_backward_step(
             microbatch, global_valid_tokens=global_valid_tokens
         )
-        assert torch.isfinite(loss).all()
-        self.local_losses.append(float(loss.detach().cpu()))
+        assert torch.isfinite(loss.loss_sum).all()
+        self.local_losses.append(float(loss.loss_sum.detach().cpu()))
         return loss
 
     def train_step(self, data_iterator):

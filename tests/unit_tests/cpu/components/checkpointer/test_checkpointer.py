@@ -1727,7 +1727,7 @@ def test_failed_same_step_save_preserves_published_training_state(
         ema=ema,
         states={
             "dataloader": loader,
-            "train_state": trainer,
+            "train_state": trainer.progress,
             "rng_state": RNGCheckpointState(torch.device("cpu")),
         },
         folder=str(tmp_path),
@@ -1740,7 +1740,7 @@ def test_failed_same_step_save_preserves_published_training_state(
         next(iter(loader))
         expected_ema = deepcopy(ema.state_dict())
         expected_loader = deepcopy(loader.state_dict())
-        expected_trainer = deepcopy(trainer.state_dict())
+        expected_trainer = deepcopy(trainer.progress.state_dict())
         expected_python_rng = random.getstate()
         expected_numpy_rng = np.random.get_state()
         expected_torch_rng = torch.get_rng_state().clone()
@@ -1791,7 +1791,7 @@ def test_failed_same_step_save_preserves_published_training_state(
         assert scheduler.state_dict() == expected_scheduler
         torch.testing.assert_close(ema.state_dict(), expected_ema, rtol=0, atol=0)
         assert loader.state_dict() == expected_loader
-        assert trainer.state_dict() == expected_trainer
+        assert trainer.progress.state_dict() == expected_trainer
         assert random.getstate() == expected_python_rng
         actual_numpy_rng = np.random.get_state()
         assert actual_numpy_rng[0] == expected_numpy_rng[0]
@@ -3033,7 +3033,7 @@ def test_optional_backend_validates_local_metadata_before_full_reader(
         )
         invalid = {"last_epoch": 5}
     else:
-        state = Trainer.__new__(Trainer)
+        state = Trainer.__new__(Trainer).progress
         state.step = 3
         state.ntokens_seen = 12
         invalid = {"step": -1, "ntokens_seen": 8}

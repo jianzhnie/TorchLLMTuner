@@ -7,6 +7,7 @@ from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.memory.activation_checkpoint import apply_ac
 from llmtuner.models.contracts import DecoderStructure
+from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.parallel.model_compile import apply_compile
 from llmtuner.parallel.parallelize import parallelize_model
 
@@ -14,6 +15,7 @@ from llmtuner.parallel.parallelize import parallelize_model
 @pytest.fixture
 def local_model():
     model = nn.Module()
+    model.execution_capabilities = ModelExecutionCapabilities()
     model.decoder = nn.Module()
     model.decoder.blocks = nn.ModuleList([nn.Linear(2, 2)])
     model.decoder.blocks[0].moe_block_name = None

@@ -5,8 +5,11 @@ import pytest
 import torch
 from torch import nn
 
-from llmtuner.components.loss import cross_entropy_loss
+from llmtuner.components.loss import chunked_lm_head_cross_entropy, cross_entropy_loss
+from llmtuner.components.loss_contract import LossFunctions
 from llmtuner.config.llmtuner_config import LLMTunerConfig
+from llmtuner.config.training_config import resolve_batch_size_per_rank
+from llmtuner.parallel.assembly import ModelPartLayout, ParallelAssembly
 from llmtuner.parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
 from llmtuner.trainer.runtime import assembly
 from llmtuner.trainer.runtime import batch as batch_runtime
@@ -15,8 +18,18 @@ from llmtuner.trainer.trainer import Trainer
 
 
 def apply_parallelism(model, cfg, monkeypatch, orchestration):
+    parts = (
+        orchestration.model_parts
+        if isinstance(orchestration, PipelineParallelSetup)
+        else [orchestration]
+    )
+    layouts = tuple(ModelPartLayout() for _ in parts)
+    for part, layout in zip(parts, layouts, strict=True):
+        layout.refresh(part)
     monkeypatch.setattr(
-        assembly, "parallelize_model", lambda *args, **kwargs: orchestration
+        assembly,
+        "parallelize_model",
+        lambda *args, **kwargs: ParallelAssembly(orchestration, layouts),
     )
     return assembly._apply_parallelism(
         model,
@@ -113,7 +126,7 @@ def test_engine_consumes_model_assembly_without_legacy_pp_attributes() -> None:
         parallel_dims=trainer.parallel_dims,
         device=trainer.device,
         param_context=trainer.param_context,
-        loss_sum=trainer.loss_sum,
+        loss_functions=LossFunctions(cross_entropy_loss, chunked_lm_head_cross_entropy),
         error_group=error_group,
     )
 
@@ -143,7 +156,7 @@ def test_optimizer_stack_and_engine_build_without_trainer_attributes() -> None:
         parallel_dims=trainer.parallel_dims,
         device=trainer.device,
         param_context=trainer.param_context,
-        loss_sum=trainer.loss_sum,
+        loss_functions=LossFunctions(cross_entropy_loss, chunked_lm_head_cross_entropy),
     )
 
     assert stack.optimizer.model_parts == [model]
@@ -229,7 +242,7 @@ def test_engine_factory_uses_explicit_dependencies_without_changing_rng() -> Non
         parallel_dims=None,
         device=torch.device("cpu"),
         param_context=nullcontext,
-        loss_sum=cross_entropy_loss,
+        loss_functions=LossFunctions(cross_entropy_loss, chunked_lm_head_cross_entropy),
     )
 
     assert engine.model_parts is assembled.model_parts
@@ -357,7 +370,7 @@ def test_dataloader_factory_uses_explicit_rank_and_token_budget(monkeypatch) -> 
     assert batch_runtime.resolve_data_parallel_rank(topology) == (1, 2)
     assert axes == [("batch", {"include_singleton_axes": True})]
     with pytest.raises(ValueError, match="must be divisible"):
-        batch_runtime.resolve_batch_size_per_rank(cfg, 3)
+        resolve_batch_size_per_rank(cfg.global_batch_size, 3)
 
 
 def test_production_assembly_uses_explicit_dataloader_factory(monkeypatch):
@@ -456,7 +469,10 @@ def test_optimizer_factory_passes_explicit_coordination_group(monkeypatch):
         error_group=group,
     )
     assert stack.optimizer is not None
-    assert phases == [("Optimizer services construction", group)]
+    assert phases == [
+        ("Optimizer layout validation", group),
+        ("Optimizer services construction", group),
+    ]
 
 
 def test_model_preparation_counts_before_parameter_layout_changes(monkeypatch):

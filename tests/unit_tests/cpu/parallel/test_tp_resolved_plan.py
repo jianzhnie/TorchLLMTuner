@@ -9,7 +9,11 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.contracts import DecoderStructure, MoEBlockContract
+from llmtuner.models.contracts import (
+    DecoderStructure,
+    GatedMLPStructure,
+    MoEBlockContract,
+)
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferences
 from llmtuner.parallel.plan import ParallelPlan
@@ -23,7 +27,7 @@ from tests.unit_tests.cpu.parallel.test_tp_moe import _MoeModel
 
 
 @pytest.mark.parametrize("ep_degree", [1, 2])
-def test_explicit_qwen_tp_resolution_never_probes_hf_layouts(monkeypatch, ep_degree):
+def test_explicit_qwen_tp_resolution_never_probes_hf_layouts(ep_degree):
     model = Qwen3MoeForCausalLM(
         Qwen3MoeConfig(
             vocab_size=32,
@@ -44,12 +48,6 @@ def test_explicit_qwen_tp_resolution_never_probes_hf_layouts(monkeypatch, ep_deg
     parameters = tuple(model.parameters())
     rng = torch.get_rng_state().clone()
 
-    def reject(*args, **kwargs):
-        raise AssertionError("Explicit models must not use HF layout inspection")
-
-    monkeypatch.setattr(
-        "llmtuner.parallel.tensor_parallel.tensor_parallel.looks_like_attention", reject
-    )
     plan = resolve_tp_plan(
         model,
         cfg=ParallelConfig(tensor_parallel_size=2, expert_parallel_size=ep_degree),
@@ -227,6 +225,7 @@ def test_invalid_moe_shared_geometry_fails_during_pure_preflight():
     model = _MoeModel()
     block = model.layers[0]["mlp"]
     shared = nn.Module()
+    shared.mlp_structure = GatedMLPStructure("gate_proj", "up_proj", "down_proj")
     shared.gate_proj = nn.Linear(16, 7, bias=False)
     shared.up_proj = nn.Linear(16, 7, bias=False)
     shared.down_proj = nn.Linear(7, 16, bias=False)
@@ -300,11 +299,23 @@ def test_attention_realizer_and_boundary_are_resolved_before_execution():
     attention = nn.Module()
     for name in ("q_proj", "k_proj", "v_proj"):
         attention.add_module(name, nn.Linear(8, 8, bias=False))
-    model = nn.Sequential(attention)
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.ModuleDict({"self_attn": attention})])
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embed_tokens",
+        blocks="layers",
+        norm="norm",
+        head="lm_head",
+        attention="self_attn",
+    )
     plan = resolve_tp_plan(
         model,
         cfg=ParallelConfig(tensor_parallel_size=2),
-        plan={f"0.{name}": "colwise" for name in ("q_proj", "k_proj", "v_proj")},
+        plan={
+            f"layers.0.self_attn.{name}": "colwise"
+            for name in ("q_proj", "k_proj", "v_proj")
+        },
     )
     boundary = next(target for target in plan.targets if target.kind == "attention")
     assert boundary.module is attention

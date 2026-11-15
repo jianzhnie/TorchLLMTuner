@@ -42,7 +42,7 @@ from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.models.common.moe.experts import RoutedExperts
 from llmtuner.models.common.moe.layer import MoE, declared_moe_block
 from llmtuner.models.configuration import configure_reference_experts
-from llmtuner.models.contracts import MoEBlockContract
+from llmtuner.models.contracts import DecoderStructure, MoEBlockContract
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel import (
     block_conversion,
@@ -1107,6 +1107,9 @@ def test_gpt_oss_is_refused() -> None:
 
     holder = torch.nn.Module()
     holder.layers = torch.nn.ModuleList([torch.nn.Module()])
+    holder.decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="layers", norm="norm", head="head"
+    )
     holder.layers[0].moe_block_name = "mlp"
     holder.layers[0].mlp = block
 
@@ -1548,7 +1551,7 @@ def test_fixed_router_ep1_public_assembly_runs_constant_routing():
         cfg=ParallelConfig(ep_config=ExpertParallelConfig(fixed_router=True)),
         mesh=None,
         parallel_dims=None,
-    )
+    ).execution
     assert result is target
     block = target.layers[0].mlp
     assert block is not original

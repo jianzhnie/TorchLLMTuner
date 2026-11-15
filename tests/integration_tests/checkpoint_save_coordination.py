@@ -221,16 +221,21 @@ def check_trainer_restore_failure(root):
                 model_parts=[model],
                 optimizer=optimizer,
                 lr_scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1),
-                states={"train_state": trainer},
+                states={"train_state": trainer.progress},
                 folder=str(
                     root / f"trainer-restore-{failing_rank}-{error_type.__name__}"
                 ),
             )
-            original = trainer.load_state_dict
+            original = trainer.progress.load_state_dict
             failure = error_type("injected trainer state restoration failure")
 
             def restore(
-                state, *, original=original, failure=failure, failing_rank=failing_rank
+                self,
+                state,
+                *,
+                original=original,
+                failure=failure,
+                failing_rank=failing_rank,
             ):
                 if dist.get_rank() == failing_rank:
                     raise failure
@@ -239,7 +244,7 @@ def check_trainer_restore_failure(root):
             try:
                 assert manager.save(1)
                 trainer.step, trainer.ntokens_seen = 7, 9
-                with patch.object(trainer, "load_state_dict", restore):
+                with patch.object(type(trainer.progress), "load_state_dict", restore):
                     caught = None
                     try:
                         manager.load(1)
@@ -254,7 +259,7 @@ def check_trainer_restore_failure(root):
                         ), str(caught)
                 dist.barrier()
                 assert manager.load(1)
-                assert trainer.state_dict() == {"step": 1, "ntokens_seen": 2}
+                assert trainer.progress.state_dict() == {"step": 1, "ntokens_seen": 2}
             finally:
                 manager.close()
 

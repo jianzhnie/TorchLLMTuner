@@ -18,6 +18,7 @@ from torch import nn
 
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
@@ -45,6 +46,9 @@ def run_case(*, device, latent, activation, empty):
     reference = deepcopy(source)
     layer.block_sparse_moe = source
     model.layers = nn.ModuleList([layer])
+    model.decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="layers", norm="norm", head="head"
+    )
     swap_moe_blocks(model, ep_group=dist.group.WORLD)
     converted = layer.block_sparse_moe
     rank, size = dist.get_rank(), dist.get_world_size()
@@ -119,6 +123,9 @@ def run_case(*, device, latent, activation, empty):
     fresh_layer.moe_block_name = "block_sparse_moe"
     fresh_layer.block_sparse_moe = KimiSparseMoE(config).to(device).eval()
     fresh.layers = nn.ModuleList([fresh_layer])
+    fresh.decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="layers", norm="norm", head="head"
+    )
     swap_moe_blocks(fresh, ep_group=dist.group.WORLD)
     imported = {
         key.removeprefix("model."): value

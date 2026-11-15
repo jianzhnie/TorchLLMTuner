@@ -334,6 +334,8 @@ def test_optimizer_container_rejects_checkpoint_keys_shared_between_optimizers()
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
 
     container = object.__new__(OptimizersContainer)
+    container.runtime_layouts = ()
+    container._bound_layout_parameters = ()
     container.model_parts = []
     container.optimizers = []
     for _ in range(2):
@@ -354,6 +356,8 @@ def test_sharded_restore_rejects_duplicate_local_fqns(tp, ep):
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
 
     container = object.__new__(OptimizersContainer)
+    container.runtime_layouts = ()
+    container._bound_layout_parameters = ()
     container.model_parts = []
     container.sharded_tensor_parallel = tp
     container.sharded_expert_parallel = ep
@@ -374,6 +378,8 @@ def test_container_validates_all_checkpoint_states_before_loading_any():
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
 
     container = object.__new__(OptimizersContainer)
+    container.runtime_layouts = ()
+    container._bound_layout_parameters = ()
     container.model_parts = []
     container.optimizers = []
     for name in ["first", "second"]:
@@ -412,6 +418,8 @@ def test_container_rejects_wrong_moment_shape_before_loading_any_optimizer(momen
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
 
     container = object.__new__(OptimizersContainer)
+    container.runtime_layouts = ()
+    container._bound_layout_parameters = ()
     container.model_parts = []
     container.optimizers = []
     for name in ["first", "second"]:
@@ -674,6 +682,8 @@ def test_adam_restore_rejects_nested_substitute_for_required_state(state_name):
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
 
     container = object.__new__(OptimizersContainer)
+    container.runtime_layouts = ()
+    container._bound_layout_parameters = ()
     container.model_parts = []
     container.optimizers = [
         torch.optim.AdamW(
@@ -805,6 +815,8 @@ def test_dense_container_restore_rejects_fqns_shared_between_inner_optimizers():
     from llmtuner.components.optimizer.optimizer import OptimizersContainer
 
     container = object.__new__(OptimizersContainer)
+    container.runtime_layouts = ()
+    container._bound_layout_parameters = ()
     container.model_parts = []
     container.sharded_tensor_parallel = False
     container.sharded_expert_parallel = False

@@ -82,7 +82,7 @@ def main() -> None:
             mesh=mesh,
             parallel_dims=topology,
             activation_checkpoint=args.ac,
-        )
+        ).execution
         for model in (direct, planned):
             assert any(isinstance(p, DTensor) for p in model.parameters())
             for layer in model.layers:

@@ -54,8 +54,8 @@ from llmtuner.components.loss import (
     LossParallelCrossEntropy,
     compute_logprobs,
     cross_entropy_loss,
-    vocab_shard_bounds,
 )
+from llmtuner.utils.vocabulary import vocab_shard_bounds
 from tests.integration_tests.harness import (
     device as harness_device,
 )

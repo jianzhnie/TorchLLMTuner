@@ -1,12 +1,14 @@
-from types import SimpleNamespace
-
 import pytest
 import torch
 from torch import nn
 
+from llmtuner.models.common.gradient_norm import (
+    interleave_qkv,
+    packed_expert_reference_norm_group,
+    qkv_reference_norm_group,
+)
 from llmtuner.trainer.runtime.reference_norm_layout import (
     clip_grad_norm_,
-    interleave_qkv,
     reference_norm_gradients,
 )
 
@@ -25,6 +27,9 @@ def test_expert_logical_norm_preserves_gradients_parameters_and_scaling():
     model = nn.Module()
     model.gate_up_proj = nn.Parameter(torch.zeros(3, 4, 2))
     model.down_proj = nn.Parameter(torch.zeros(3, 2, 2))
+    model.reference_norm_groups = lambda: (
+        packed_expert_reference_norm_group(model.gate_up_proj, model.down_proj),
+    )
     torch.manual_seed(71)
     for p in model.parameters():
         p.grad = torch.randn_like(p)
@@ -54,8 +59,11 @@ def test_qkv_rejects_unsharded_or_partial_projection_groups():
     model = nn.Module()
     for name in ("q_proj", "k_proj", "v_proj"):
         setattr(model, name, nn.Linear(2, 2, bias=False))
-    model.config = SimpleNamespace(num_key_value_heads=1)
-    model.head_dim = 2
+    model.reference_norm_groups = lambda: (
+        qkv_reference_norm_group(
+            (model.q_proj, model.k_proj, model.v_proj), kv_heads=1, head_dim=2
+        ),
+    )
     for p in model.parameters():
         p.grad = torch.ones_like(p)
     with pytest.raises(NotImplementedError, match="Shard"):

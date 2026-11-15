@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
@@ -50,6 +51,9 @@ def main():
         layer = nn.Module()
         layer.block_sparse_moe = source
         model.layers = nn.ModuleList([layer])
+        model.decoder_structure = DecoderStructure(
+            decoder="", embedding="embedding", blocks="layers", norm="norm", head="head"
+        )
         assert swap_moe_blocks(model, ep_group=dist.group.WORLD) == 1
         candidate = layer.block_sparse_moe
         grouped = candidate.routed_experts.inner_experts

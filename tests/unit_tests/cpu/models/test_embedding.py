@@ -153,7 +153,7 @@ def test_invalid_global_tokens_fail_before_weight_renormalization(
 def test_summed_vocab_shards_match_full_embedding_and_gradients(
     monkeypatch, vocab_size, tp_size
 ):
-    from llmtuner.components.loss import vocab_shard_bounds
+    from llmtuner.utils.vocabulary import vocab_shard_bounds
 
     monkeypatch.setattr(embedding_mod, "spmd_mesh_group", lambda axis: object())
     monkeypatch.setattr(embedding_mod, "get_world_size", lambda g: tp_size)

@@ -52,9 +52,11 @@ def test_weight_sharding_rejects_invalid_rank(tp_rank):
 
 def test_declaration_factories_pick_the_right_realizer() -> None:
     assert colwise() == ShardingConfig(
-        kind="colwise", implementation=ColumnParallelLinear
+        kind="colwise", implementation=ColumnParallelLinear, sequence_transform="gather"
     )
-    assert rowwise() == ShardingConfig(kind="rowwise", implementation=RowParallelLinear)
+    assert rowwise() == ShardingConfig(
+        kind="rowwise", implementation=RowParallelLinear, sequence_transform="scatter"
+    )
 
 
 @pytest.mark.parametrize("failure", ["bias", "dimension"])
@@ -645,7 +647,11 @@ def test_tp_constructor_failure_preserves_modules_and_allows_retry(monkeypatch):
             cfg,
             plan={
                 "0": colwise(),
-                "1": ShardingConfig(kind="rowwise", implementation=FailingProjection),
+                "1": ShardingConfig(
+                    kind="rowwise",
+                    implementation=FailingProjection,
+                    sequence_transform="scatter",
+                ),
             },
         )
     assert list(model) == original_modules
@@ -664,7 +670,7 @@ def test_tp_constructor_failure_preserves_modules_and_allows_retry(monkeypatch):
     assert model[1].weight.shape == (4, 2)
 
 
-def test_full_history_attention_uses_structure_not_class_name() -> None:
+def test_full_history_attention_uses_declaration_without_storage_inference() -> None:
     from llmtuner.parallel.tensor_parallel.tensor_parallel import (
         requires_full_token_history,
     )
@@ -676,5 +682,8 @@ def test_full_history_attention_uses_structure_not_class_name() -> None:
             self.A_log = nn.Parameter(torch.ones(1))
             self.dt_bias = nn.Parameter(torch.zeros(1))
 
-    assert requires_full_token_history(RecurrentAttention())
+    assert not requires_full_token_history(RecurrentAttention())
+    recurrent = RecurrentAttention()
+    recurrent.requires_full_token_history = True
+    assert requires_full_token_history(recurrent)
     assert not requires_full_token_history(nn.MultiheadAttention(4, 1))

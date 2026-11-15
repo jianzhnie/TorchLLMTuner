@@ -7,13 +7,17 @@ import torch
 from torch import nn
 
 from llmtuner.components.loss import cross_entropy_loss
-from llmtuner.trainer.runtime.engine import (
-    TrainingEngine,
-    model_output_value,
-)
+from llmtuner.models.contracts import DecoderStructure
+from llmtuner.models.execution import ModelExecutionCapabilities
+from llmtuner.trainer.runtime.engine import TrainingEngine
 
 
 class ToyCausalModel(nn.Module):
+    execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
+    decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="layers", norm="norm", head="lm_head"
+    )
+
     def __init__(self) -> None:
         super().__init__()
         self.embedding = nn.Embedding(11, 8)
@@ -81,9 +85,9 @@ def test_chunked_engine_preserves_dense_loss_and_gradients(num_chunks: int) -> N
         torch.testing.assert_close(parameter.grad, expected.grad)
 
 
-def test_model_output_value_rejects_missing_declared_tensor() -> None:
+def test_model_output_contract_rejects_missing_declared_tensor() -> None:
     with pytest.raises(TypeError, match=r"tensor .logits"):
-        model_output_value(object())
+        ModelExecutionCapabilities().output_tensor(object())
 
 
 def test_optimizer_step_preserves_scheduler_and_ema_order() -> None:

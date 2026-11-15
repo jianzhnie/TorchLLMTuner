@@ -869,7 +869,7 @@ def _runtime_state(trainer: Trainer) -> dict:
             for key, value in part.state_dict().items()
         },
         "ntokens_seen": trainer.ntokens_seen,
-        "trainer": trainer.state_dict(),
+        "trainer": trainer.progress.state_dict(),
         "optimizer": trainer.optimizer.state_dict(),
         "scheduler": trainer.lr_scheduler.state_dict(),
         "ema": trainer.ema.state_dict() if trainer.ema is not None else {},
@@ -1195,7 +1195,7 @@ def _phase_resume(workdir: str, *, packed: bool = False) -> None:
                 failures.append(f"rank {trainer.rank}: final parameter {key} differs")
     if trainer.ntokens_seen != final_state["ntokens_seen"]:
         failures.append(f"rank {trainer.rank}: restored token counter differs")
-    if trainer.state_dict() != final_state["trainer"]:
+    if trainer.progress.state_dict() != final_state["trainer"]:
         failures.append(f"rank {trainer.rank}: final trainer state differs")
     if trainer.lr_scheduler.state_dict() != final_state["scheduler"]:
         failures.append(f"rank {trainer.rank}: final scheduler state differs")

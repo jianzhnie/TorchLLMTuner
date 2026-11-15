@@ -11,6 +11,7 @@ import torch.distributed as dist
 from torch import nn
 
 from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from tests.integration_tests.harness import init_distributed
 
@@ -54,6 +55,13 @@ def main():
             reference = LegacyBlock(names).to(device)
             mixed_model = nn.Module()
             mixed_model.layers = nn.ModuleList([nn.Module()])
+            mixed_model.decoder_structure = DecoderStructure(
+                decoder="",
+                embedding="embedding",
+                blocks="layers",
+                norm="norm",
+                head="head",
+            )
             mixed_block = copy.deepcopy(reference)
             mixed_model.layers[0].mlp = mixed_block
             getattr(mixed_block.experts[1], names[0]).to(dtype=torch.bfloat16)
@@ -78,6 +86,13 @@ def main():
             for reordered in (False, True):
                 shared_model = nn.Module()
                 shared_model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+                shared_model.decoder_structure = DecoderStructure(
+                    decoder="",
+                    embedding="embedding",
+                    blocks="layers",
+                    norm="norm",
+                    head="head",
+                )
                 first = copy.deepcopy(reference)
                 second = copy.deepcopy(reference)
                 members = list(first.experts)
@@ -106,6 +121,13 @@ def main():
             layer = nn.Module()
             layer.mlp = copy.deepcopy(reference)
             model.layers = nn.ModuleList([layer])
+            model.decoder_structure = DecoderStructure(
+                decoder="",
+                embedding="embedding",
+                blocks="layers",
+                norm="norm",
+                head="head",
+            )
             original = layer.mlp
             second_projection = getattr(original.experts[1], names[0])
             untied = second_projection.weight

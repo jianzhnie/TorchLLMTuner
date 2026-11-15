@@ -13,9 +13,11 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
+from llmtuner.components.checkpointer.core.layout_migration import (
+    load_changed_source_layout,
+)
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
-from llmtuner.components.checkpointer.hf.kimi_layout import load_changed_kimi_layout
 from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from tests.unit_tests.cpu.parallel.test_kimi_conversion import make_model
@@ -70,7 +72,9 @@ def main():
 
                 with patch.object(rng, "load_state_dict", fail_local):
                     try:
-                        load_changed_kimi_layout(folder, states=states, adapter=adapter)
+                        load_changed_source_layout(
+                            folder, states=states, adapter=adapter
+                        )
                     except (ValueError, RuntimeError) as error:
                         if rank == 0:
                             assert error is failure
@@ -81,7 +85,9 @@ def main():
                     else:
                         raise AssertionError("local RNG failure did not propagate")
                 dist.barrier()
-                assert load_changed_kimi_layout(folder, states=states, adapter=adapter)
+                assert load_changed_source_layout(
+                    folder, states=states, adapter=adapter
+                )
                 torch.testing.assert_close(
                     torch.rand(5), expected_random, atol=0, rtol=0
                 )

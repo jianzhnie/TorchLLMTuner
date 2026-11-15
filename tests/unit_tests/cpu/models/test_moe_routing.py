@@ -43,6 +43,7 @@ from llmtuner.models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
 
@@ -93,7 +94,11 @@ def _moe(**kwargs) -> MoE:
 
 
 class _Holder(torch.nn.Module):
-    """Stands in for a model part: ``collect_moe_layers`` walks ``.layers``."""
+    """A model part with explicitly declared decoder blocks."""
+
+    decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="layers", norm="norm", head="head"
+    )
 
     def __init__(self, moes: list[MoE | None]) -> None:
         super().__init__()

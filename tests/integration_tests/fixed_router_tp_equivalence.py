@@ -20,6 +20,7 @@ from llmtuner.accelerator.linear_collectives import resolve_autograd_collectives
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.memory.activation_checkpoint import wrap_full
 from llmtuner.models.common.aux_loss import AuxLoss
+from llmtuner.models.contracts import GatedMLPStructure
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from llmtuner.parallel.model_compile import apply_compile
 from llmtuner.parallel.tensor_parallel.checkpointing import (
@@ -32,6 +33,8 @@ from tests.integration_tests.fixed_router_ep_equivalence import explicit_referen
 
 
 class SharedExpert(nn.Module):
+    mlp_structure = GatedMLPStructure("gate_proj", "up_proj", "down_proj")
+
     def __init__(self):
         super().__init__()
         generator = torch.Generator().manual_seed(611)

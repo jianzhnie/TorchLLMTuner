@@ -76,7 +76,7 @@ def production_state():
     state = dict(
         model={"weight": parameter.detach()},
         optimizer=optim,
-        train_state=trainer.state_dict(),
+        train_state=trainer.progress.state_dict(),
         lr_scheduler={"last_epoch": 100},
         dataloader=data,
         rng_state=rng,

@@ -91,7 +91,7 @@ def run(workdir):
             ),
             ("optimizer", full(trainer.optimizer.state_dict()), expected_optim),
             ("ema", full(trainer.ema.state_dict()), expected_ema),
-            ("trainer", trainer.state_dict(), expected["trainer"]),
+            ("trainer", trainer.progress.state_dict(), expected["trainer"]),
             ("scheduler", trainer.lr_scheduler.state_dict(), expected["scheduler"]),
         ):
             _compare_loaded_state(actual, wanted, failures, label)

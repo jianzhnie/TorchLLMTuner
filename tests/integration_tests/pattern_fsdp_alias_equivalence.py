@@ -15,6 +15,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule
 
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp_to_decoder,
     force_sum_grad_reduction,
@@ -38,6 +39,13 @@ class AliasedChildModel(nn.Module):
 class RootAliasedDecoder(nn.Module):
     def __init__(self):
         super().__init__()
+        self.decoder_structure = DecoderStructure(
+            decoder="",
+            embedding="tok_embeddings",
+            blocks="layers",
+            norm="norm",
+            head="lm_head",
+        )
         self.tok_embeddings = nn.Identity()
         self.layers = nn.ModuleList([nn.Sequential(nn.Linear(4, 4), nn.Tanh())])
         self.external = self.layers[0][0]

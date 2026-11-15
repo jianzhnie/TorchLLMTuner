@@ -8,6 +8,7 @@ from torch import nn
 
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.moe.layer import collect_moe_layers
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
 from llmtuner.parallel.expert_parallel.model_replacement import (
@@ -34,6 +35,9 @@ def make_model(*, latent=False, shared=0, activation="silu", top_k=2):
     layer.moe_block_name = "block_sparse_moe"
     layer.block_sparse_moe = KimiSparseMoE(config)
     model.layers = nn.ModuleList([layer])
+    model.decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="layers", norm="norm", head="head"
+    )
     return model
 
 

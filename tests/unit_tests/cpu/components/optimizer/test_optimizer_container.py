@@ -470,7 +470,7 @@ def test_optimizer_rejects_parameter_names_colliding_after_wrapper_removal():
     model.register_parameter("weight", torch.nn.Parameter(torch.ones(2, 2)))
     model.add_module("_checkpoint_wrapped_module", torch.nn.Linear(2, 2))
 
-    with pytest.raises(ValueError, match="FQNs collide after wrapper removal"):
+    with pytest.raises(ValueError, match="Layout parameter names collide"):
         OptimizersContainer(
             OptimizerConfig(implementation="for-loop"), model_parts=[model]
         )
@@ -554,7 +554,7 @@ def test_cross_part_checkpoint_name_collision_fails_before_optimizer_creation(
         pytest.fail("Checkpoint FQN conflicts must fail before optimizer creation")
 
     monkeypatch.setattr(torch.optim, "AdamW", unexpected)
-    with pytest.raises(ValueError, match="checkpoint FQNs.*weight"):
+    with pytest.raises(ValueError, match="checkpoint name 'weight' collides"):
         OptimizersContainer(
             _cfg(_catch_all()), model_parts=[nn.Linear(2, 2), nn.Linear(2, 2)]
         )

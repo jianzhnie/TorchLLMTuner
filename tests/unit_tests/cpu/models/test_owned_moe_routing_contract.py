@@ -8,6 +8,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
 
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.models.common.moe import layout
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM, Qwen3MoeSparseMoeBlock
 from llmtuner.models.qwen.qwen3_5_moe.model import (
     Qwen3_5MoeForCausalLM,
@@ -39,7 +40,7 @@ def test_standalone_routing_resolves_without_inspection(family, monkeypatch):
     def forbidden():
         raise AssertionError("explicit block must not enter legacy inspection")
 
-    routing = block_conversion.resolve_moe_routing(block)
+    routing = layout.resolve_moe_routing(block)
     assert routing.source is block and routing.router is block.gate
     assert routing.top_k == 2 and routing.score_func == "softmax"
     assert routing.route_norm == (family == "qwen35")

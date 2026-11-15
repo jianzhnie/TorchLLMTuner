@@ -16,6 +16,7 @@ from torch.distributed.tensor import DTensor
 
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
 from llmtuner.models.kimi.kimi_k3.moe import KimiSparseMoE
 from llmtuner.parallel.parallelize import parallelize_model
@@ -23,6 +24,8 @@ from llmtuner.parallel.topology import ParallelTopology
 
 
 class ExpertModel(nn.Module):
+    execution_capabilities = ModelExecutionCapabilities()
+
     def __init__(self):
         super().__init__()
         config = KimiLinearConfig(

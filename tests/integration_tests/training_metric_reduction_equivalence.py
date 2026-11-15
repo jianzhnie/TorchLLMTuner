@@ -50,8 +50,6 @@ def main():
                     build_step_metrics(
                         ntokens_seen=7,
                         device=device,
-                        parallel_dims=topology,
-                        model_parts=[],
                         pp_has_last_stage=False,
                         accumulated_loss=torch.tensor(
                             shard_sums[dp][coordinate], dtype=dtype, device=device

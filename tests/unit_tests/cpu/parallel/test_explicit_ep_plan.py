@@ -11,10 +11,11 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.aux_loss import AuxLoss
+from llmtuner.models.common.moe import layout
 from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.models.qwen.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
-from llmtuner.parallel.expert_parallel import block_conversion, model_replacement
+from llmtuner.parallel.expert_parallel import model_replacement
 from llmtuner.parallel.expert_parallel import plan as ep_plan
 from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
 from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_plan
@@ -161,7 +162,7 @@ def test_ep_target_plan_is_pure_and_execution_does_not_rediscover(monkeypatch):
 
     monkeypatch.setattr(ep_plan, "find_moe_candidates", reject_discovery)
     for name in ("resolve_moe_routing", "resolve_packed_experts"):
-        monkeypatch.setattr(block_conversion, name, reject_discovery)
+        monkeypatch.setattr(layout, name, reject_discovery)
     model_replacement.swap_moe_blocks(
         model, resolved_plan=plan, router_aux_loss_coef=0.0
     )
@@ -387,7 +388,7 @@ def test_malformed_packed_rank_rejects_with_explicit_geometry_error(projection, 
     parameters = tuple(model.parameters())
     rng = torch.get_rng_state().clone()
     with pytest.raises(ValueError, match="requires rank-3 expert parameters"):
-        block_conversion.resolve_packed_experts(block, degree=1)
+        layout.resolve_packed_experts(block, degree=1)
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
     assert torch.equal(torch.get_rng_state(), rng)
 
@@ -403,7 +404,7 @@ def test_packed_resolver_validates_degree_before_reading_storage(degree):
     block = UnreadableBlock()
     rng = torch.get_rng_state().clone()
     with pytest.raises(ValueError, match="EP degree must be a positive integer"):
-        block_conversion.resolve_packed_experts(block, degree=degree)
+        layout.resolve_packed_experts(block, degree=degree)
     assert torch.equal(torch.get_rng_state(), rng)
 
 

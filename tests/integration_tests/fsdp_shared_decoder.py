@@ -16,6 +16,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp_to_decoder,
     force_sum_grad_reduction,
@@ -26,6 +27,13 @@ from tests.integration_tests.harness import init_distributed
 class SharedDecoder(nn.Module):
     def __init__(self, *, adjacent: bool = False):
         super().__init__()
+        self.decoder_structure = DecoderStructure(
+            decoder="",
+            embedding="tok_embeddings",
+            blocks="layers",
+            norm="norm",
+            head="lm_head",
+        )
         self.enable_weight_tying = False
         self.tok_embeddings = nn.Linear(4, 4, bias=False)
         shared = nn.Linear(4, 4, bias=False)

@@ -360,7 +360,7 @@ def test_manager_rejects_invalid_trainer_counters_before_live_state_changes(
         model_parts=[model],
         optimizer=optimizer,
         lr_scheduler=scheduler,
-        states={"train_state": trainer},
+        states={"train_state": trainer.progress},
         folder=str(tmp_path),
     )
     try:
@@ -377,7 +377,7 @@ def test_manager_rejects_invalid_trainer_counters_before_live_state_changes(
         before_model = deepcopy(model.state_dict())
         before_optimizer = deepcopy(optimizer.state_dict())
         before_scheduler = deepcopy(scheduler.state_dict())
-        before_trainer = trainer.state_dict()
+        before_trainer = trainer.progress.state_dict()
         with pytest.raises(ValueError, match=f"trainer {field}"):
             manager.load()
         torch.testing.assert_close(model.state_dict(), before_model, rtol=0, atol=0)
@@ -385,7 +385,7 @@ def test_manager_rejects_invalid_trainer_counters_before_live_state_changes(
             optimizer.state_dict(), before_optimizer, rtol=0, atol=0
         )
         assert scheduler.state_dict() == before_scheduler
-        assert trainer.state_dict() == before_trainer
+        assert trainer.progress.state_dict() == before_trainer
     finally:
         manager.close()
 

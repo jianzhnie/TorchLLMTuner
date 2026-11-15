@@ -39,7 +39,7 @@ import torch.nn.functional as F
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from llmtuner.components.loss import IGNORE_INDEX, next_token_targets
+from llmtuner.components.loss import IGNORE_INDEX
 from llmtuner.config import (
     LLMTunerConfig,
     MetricsConfig,
@@ -50,6 +50,7 @@ from llmtuner.config import (
 )
 from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.datasets.synthetic import RandomTokenSource
+from llmtuner.models.common.targets import next_token_targets
 from llmtuner.models.configuration import build_model_config_for
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.trainer import Trainer

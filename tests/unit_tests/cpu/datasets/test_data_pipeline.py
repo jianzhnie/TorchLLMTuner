@@ -2086,6 +2086,8 @@ def test_restore_failure_preserves_error_when_iterator_close_fails():
         raise RuntimeError("close failed")
 
     loader = GrainDataLoader.__new__(GrainDataLoader)
+    loader._pending_probes = []
+    loader._iterator_closed = False
     loader._dp_world_size = 1
     loader._rank_id = "dp_rank_0"
     loader._iterator = SimpleNamespace(set_state=set_state, close=close)
@@ -3517,8 +3519,18 @@ def test_grain_probe_failure_preserves_rng_payload_and_live_iterator(
         assert torch.equal(torch.get_rng_state(), torch_rng)
         torch.testing.assert_close(next(iter(loader)), next(iter(reference)))
     finally:
-        loader.close()
-        reference.close()
+        # Failed probe closes remain owned and must be retried at shutdown.
+        try:
+            if phase == "construct":
+                loader.close()
+            else:
+                close_error = RuntimeError if phase == "restore" else failure_type
+                with pytest.raises(close_error):
+                    loader.close()
+                assert loader._iterator_closed
+                assert len(loader._pending_probes) == 1
+        finally:
+            reference.close()
 
 
 @pytest.mark.parametrize("malformed", [False, True])

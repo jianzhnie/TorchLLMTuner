@@ -58,7 +58,8 @@ def run_hca_case(length):
     from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
         DeepseekV4Config,
     )
-    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+
+    from llmtuner.models.deepseek.deepseek_v4.compression import (
         DeepseekV4HCACompressor,
     )
 
@@ -121,7 +122,8 @@ def run_csa_case(length):
     from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
         DeepseekV4Config,
     )
-    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+
+    from llmtuner.models.deepseek.deepseek_v4.compression import (
         DeepseekV4CSACompressor,
     )
 

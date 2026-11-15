@@ -133,7 +133,11 @@ def _moe(*, coeff: float | None = 0.1, num_experts: int = _NUM_EXPERTS) -> MoE:
 
 
 class _Holder(torch.nn.Module):
-    """Stands in for a model part: ``collect_moe_layers`` walks ``.layers``."""
+    """A model part with explicitly declared decoder blocks."""
+
+    decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="layers", norm="norm", head="head"
+    )
 
     def __init__(self, moes: list[MoE | None]) -> None:
         super().__init__()
@@ -353,6 +357,7 @@ def test_wrapped_layers_are_unwrapped() -> None:
 
     holder = torch.nn.Module()
     holder.layers = torch.nn.ModuleList([_FakeCheckpointWrapper(_Layer(sparse))])
+    holder.decoder_structure = _Holder.decoder_structure
 
     assert collect_moe_layers(holder) == [sparse]
 
@@ -687,6 +692,7 @@ def test_declared_slots_control_native_moe_collection():
     layer.moe_block_name = "expert_block"
     holder = torch.nn.Module()
     holder.layers = torch.nn.ModuleList([layer, layer])
+    holder.decoder_structure = _Holder.decoder_structure
     assert collect_moe_layers(holder) == [sparse]
     layer.moe_block_name = None
     assert collect_moe_layers(holder) == []
@@ -697,6 +703,7 @@ def test_native_moe_collection_rejects_missing_slot_declaration():
     layer = torch.nn.Module()
     layer.mlp = _moe()
     holder.layers = torch.nn.ModuleList([layer])
+    holder.decoder_structure = _Holder.decoder_structure
     with pytest.raises(ValueError, match="moe_block_name"):
         collect_moe_layers(holder)
 

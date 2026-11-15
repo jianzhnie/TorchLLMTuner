@@ -18,6 +18,7 @@ import llmtuner.parallel as parallel_api
 from llmtuner.config.activation_checkpoint_config import MemoryBudgetACConfig
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.parallel_config import ContextParallelConfig, ParallelConfig
+from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.parallel import parallelize
 from llmtuner.parallel.stages import (
     STAGE_ORDER,
@@ -62,6 +63,7 @@ def test_direct_assembly_rejects_non_boolean_execution_flags(flag, invalid):
     from llmtuner.errors import ConfigError
 
     model = nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities()
     forward = model.forward
     options = {"activation_swap": False, "compile": False}
     options[flag] = invalid
@@ -239,6 +241,7 @@ def test_every_stage_documents_why_it_sits_where_it_does() -> None:
 def test_assembly_executes_stages_in_order(monkeypatch, compile_enabled):
     calls = []
     model = nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities()
 
     def runner(name):
         def apply(part, **kwargs):
@@ -265,7 +268,7 @@ def test_assembly_executes_stages_in_order(monkeypatch, compile_enabled):
         parallel_dims=None,
         compile=compile_enabled,
         compile_config=CompileConfig(backend="aot_eager"),
-    )
+    ).execution
     assert result is model
     assert calls == (
         ["tp", "ep", "cp", "ac", "compile", "fsdp"]
@@ -281,7 +284,10 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
     from types import SimpleNamespace
 
     model = nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities()
     parts = [nn.Linear(2, 2), nn.Linear(2, 2)]
+    for part in parts:
+        part.execution_capabilities = ModelExecutionCapabilities()
     stages = [SimpleNamespace(submod=part) for part in parts]
     expected_order = [
         name
@@ -341,7 +347,7 @@ def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
         compile=compile_enabled,
         compile_config=CompileConfig(backend="aot_eager"),
         global_batch_size=4,
-    )
+    ).execution
     assert result.schedule is schedule
     assert result.model_parts is parts
     assert seen == expected_order * 2
@@ -356,6 +362,7 @@ def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline, ignore
     from llmtuner.config.parallel_config import FSDPConfig
 
     model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
+    model.execution_capabilities = ModelExecutionCapabilities()
     originals = list(model.parameters())
     cfg = ParallelConfig(
         fsdp_config=FSDPConfig(
@@ -371,6 +378,8 @@ def test_assembly_rebinds_fsdp_exclusions_after_tp(monkeypatch, pipeline, ignore
         )
     )
     parts = [copy.deepcopy(model), copy.deepcopy(model)]
+    for part in parts:
+        part.execution_capabilities = ModelExecutionCapabilities()
     del parts[0][1]
     parts[1]._modules.pop("0")
     stages = [SimpleNamespace(submod=part) for part in parts]
@@ -430,6 +439,7 @@ def test_fused_ep_dispatch_receives_stage_wide_error_group(monkeypatch, dispatch
     from types import SimpleNamespace
 
     model = nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities()
     ep_group, loss_group = object(), object()
     ep_mesh = SimpleNamespace(get_group=lambda: ep_group)
     loss_mesh = SimpleNamespace(get_group=lambda: loss_group)
@@ -461,6 +471,8 @@ def test_fused_ep_dispatch_receives_stage_wide_error_group(monkeypatch, dispatch
 
 def test_full_ac_skips_activation_swap(monkeypatch):
     calls = []
+    model = nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities()
     monkeypatch.setattr(parallelize, "apply_ac", lambda part, **kwargs: part)
     monkeypatch.setattr(
         parallelize,
@@ -468,7 +480,7 @@ def test_full_ac_skips_activation_swap(monkeypatch):
         lambda part: calls.append(part) or part,
     )
     parallelize.parallelize_model(
-        nn.Linear(2, 2),
+        model,
         cfg=ParallelConfig(),
         mesh=None,
         parallel_dims=None,
@@ -530,6 +542,7 @@ def test_cp_preflight_uses_explicit_group_without_wrapping_execution(
     calls = []
     expected_group = object()
     model = nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities()
     monkeypatch.setattr(parallelize, "resolve_cp_plan", lambda *a, **kw: None)
     if backend == "compressor":
         model.context_parallel_backend = "compressor"
@@ -578,7 +591,7 @@ def test_cp_preflight_uses_explicit_group_without_wrapping_execution(
             ),
             mesh=None,
             parallel_dims=dims if has_topology else None,
-        )
+        ).execution
         is model
     )
     assert calls == (

@@ -44,6 +44,7 @@ from llmtuner.accelerator.capabilities import has
 from llmtuner.models.common.moe.experts import GroupedExperts, RoutedExperts
 from llmtuner.models.common.moe.layer import MoE
 from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp_to_decoder,
@@ -102,10 +103,17 @@ class _SparseBlock(nn.Module):
 
 
 class _ToyModel(nn.Module):
-    """The five attributes ``apply_fsdp_to_decoder`` reads off a model."""
+    """A model-owned decoder declaration with explicit expert placement."""
 
     def __init__(self, total: int, local: int) -> None:
         super().__init__()
+        self.decoder_structure = DecoderStructure(
+            decoder="",
+            embedding="tok_embeddings",
+            blocks="layers",
+            norm="norm",
+            head="lm_head",
+        )
         self.tok_embeddings = nn.Embedding(32, _DIM)
         self.layers = nn.ModuleList([_SparseBlock(total, local)])
         self.norm = nn.LayerNorm(_DIM)

@@ -35,16 +35,16 @@ def main():
         trainer = SimpleNamespace(
             parallel_dims=dims,
             model_parts=[SimpleNamespace(lm_head=head)],
-            param_context=nullcontext,
+            training_engine=SimpleNamespace(param_context=nullcontext),
         )
         install_output_layout_control(trainer)
-        with trainer.param_context():
+        with trainer.training_engine.param_context():
             output = head(local_input)
             original = reference(full_input)
             torch.testing.assert_close(
                 local_token_logits(output, mesh), original.chunk(world)[rank]
             )
-            loss = trainer.loss_sum(output, labels.chunk(world)[rank])
+            loss = trainer.training_engine.loss_sum(output, labels.chunk(world)[rank])
             expected = torch.nn.functional.cross_entropy(
                 original.float(), labels, reduction="sum"
             )

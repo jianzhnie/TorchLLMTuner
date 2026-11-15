@@ -37,6 +37,7 @@ from torch.distributed.tensor import DTensor
 from llmtuner.accelerator.collectives import all_reduce
 from llmtuner.config import ParallelConfig, SelectiveACConfig
 from llmtuner.memory.activation_checkpoint import apply_ac
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.fully_shard_parallel import apply_fsdp
 from llmtuner.parallel.topology import ParallelTopology
 from tests.integration_tests.harness import init_distributed, moved
@@ -67,6 +68,13 @@ class TinyTokenDecoder(nn.Module):
         self.norm = nn.LayerNorm(HIDDEN)
         self.lm_head = nn.Linear(HIDDEN, VOCAB, bias=False)
         self.enable_weight_tying = False
+        self.decoder_structure = DecoderStructure(
+            decoder="",
+            embedding="tok_embeddings",
+            blocks="layers",
+            norm="norm",
+            head="lm_head",
+        )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         h = self.tok_embeddings(input_ids)

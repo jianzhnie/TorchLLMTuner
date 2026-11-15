@@ -966,7 +966,7 @@ class ReferenceTrainer(TrainerEx):
         denominator = int(kwargs["global_valid_tokens"].detach().cpu())
         self.denominators.append(denominator)
         loss = super().forward_backward_step(**kwargs)
-        self.losses.append(float(loss.detach().cpu()))
+        self.losses.append(float(loss.loss_sum.detach().cpu()))
         return loss
 
     def train_step(self, data_iterator):

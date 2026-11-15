@@ -21,6 +21,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.nn import functional as F
 
 from llmtuner.config import ParallelConfig
+from llmtuner.models.contracts import GatedMLPStructure
 from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp
 from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 
@@ -38,6 +39,8 @@ class Experts(nn.Module):
 
 
 class SharedMLP(nn.Module):
+    mlp_structure = GatedMLPStructure("gate_proj", "up_proj", "down_proj")
+
     def __init__(self):
         super().__init__()
         self.gate_proj = nn.Linear(16, 32, bias=False)

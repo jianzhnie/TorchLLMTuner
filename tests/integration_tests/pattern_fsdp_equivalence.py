@@ -30,6 +30,7 @@ from torch.distributed.tensor import DTensor
 
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.models.common.moe.experts import GroupedExperts
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
     apply_fsdp_to_decoder,
     enable_fsdp_symm_mem,
@@ -56,17 +57,16 @@ class DecoderLayout(TiedDecoder):
 
     def __init__(self) -> None:
         super().__init__()
+        self.decoder_structure = DecoderStructure(
+            decoder="",
+            embedding="embedding",
+            blocks="layers",
+            norm="norm",
+            head="head",
+        )
         self.layers = nn.ModuleList([self.block])
         self.norm = nn.LayerNorm(4)
         self.enable_weight_tying = True
-
-    @property
-    def tok_embeddings(self) -> nn.Module:
-        return self.embedding
-
-    @property
-    def lm_head(self) -> nn.Module:
-        return self.head
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         return self.head(self.norm(self.block(self.embedding(tokens))))

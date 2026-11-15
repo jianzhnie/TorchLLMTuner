@@ -58,7 +58,7 @@ def main():
                 trainer.metrics = SimpleNamespace(log=log)
                 with (
                     patch(
-                        "llmtuner.trainer.trainer.Profiler",
+                        "llmtuner.trainer.runtime.assembly.Profiler",
                         return_value=nullcontext(SimpleNamespace(step=lambda: None)),
                     ),
                     patch(

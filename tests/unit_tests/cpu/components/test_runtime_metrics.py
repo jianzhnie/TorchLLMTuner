@@ -16,8 +16,6 @@ def test_step_metrics_need_no_trainer_or_engine():
     result = build_step_metrics(
         ntokens_seen=17,
         device=torch.device("cpu"),
-        parallel_dims=None,
-        model_parts=[],
         pp_has_last_stage=False,
         accumulated_loss=torch.tensor(9.0),
         global_valid_tokens=torch.tensor(3),

@@ -50,8 +50,8 @@ def install_output_layout_control(trainer):
         return total + total.detach() * (1.0 / size - 1.0)
 
     head.forward = MethodType(forward, head)
-    trainer.loss_sum = loss_sum
-    original_context = trainer.param_context
+    trainer.training_engine.loss_sum = loss_sum
+    original_context = trainer.training_engine.param_context
 
     @contextmanager
     def output_context():
@@ -60,7 +60,7 @@ def install_output_layout_control(trainer):
         with original_context(), loss_parallel():
             yield
 
-    trainer.param_context = output_context
+    trainer.training_engine.param_context = output_context
 
 
 def local_token_logits(logits, mesh):

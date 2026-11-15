@@ -35,6 +35,7 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel import model_compile as compile_mod
 from llmtuner.parallel.model_compile import apply_compile
@@ -204,7 +205,7 @@ def test_per_block_compile_rejects_missing_layers_before_global_changes(monkeypa
         pytest.fail("invalid per-block model must fail before global setup")
 
     monkeypatch.setattr(compile_mod, "maybe_enable_async_tp", unexpected)
-    with pytest.raises(TypeError, match=".layers module"):
+    with pytest.raises(TypeError, match="DecoderStructure"):
         apply_compile(
             torch.nn.Linear(2, 2), compile_config=CompileConfig(per_block=True)
         )
@@ -448,8 +449,15 @@ def test_compiled_ac_preserves_modes_identity_and_frozen_gradients(
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.layers = torch.nn.Sequential(
-                *[
+            self.decoder_structure = DecoderStructure(
+                decoder="",
+                embedding="embedding",
+                blocks="layers",
+                norm="norm",
+                head="head",
+            )
+            self.layers = torch.nn.ModuleList(
+                [
                     torch.nn.Sequential(
                         torch.nn.Linear(4, 4),
                         torch.nn.Dropout(0.25),
@@ -461,7 +469,9 @@ def test_compiled_ac_preserves_modes_identity_and_frozen_gradients(
             )
 
         def forward(self, inputs):
-            return self.layers(inputs)
+            for layer in self.layers:
+                inputs = layer(inputs)
+            return inputs
 
     torch.manual_seed(188)
     reference = Model().eval()

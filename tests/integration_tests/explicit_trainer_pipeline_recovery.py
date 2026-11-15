@@ -53,7 +53,7 @@ def snapshot_tensor(value: torch.Tensor) -> torch.Tensor | dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=("qwen3", "kimi"), default="qwen3")
+    parser.add_argument("--model", choices=("qwen3", "qwen35", "kimi"), default="qwen3")
     parser.add_argument("--expert-parallel-degree", type=int, choices=(1, 2), default=1)
     parser.add_argument("--phase", choices=("write", "resume"), required=True)
     parser.add_argument("--folder", type=Path, required=True)
@@ -106,6 +106,8 @@ def main() -> None:
             model=ModelConfig(
                 model_name_or_path="kimi_linear"
                 if args.model == "kimi"
+                else "qwen3_5_moe_text"
+                if args.model == "qwen35"
                 else "qwen3_moe",
                 initialization_device=args.initialization_device,
                 vocab_size=32,
@@ -140,11 +142,16 @@ def main() -> None:
                     "tie_word_embeddings": False,
                     "mlp_only_layers": [1] if args.expert_parallel_degree == 1 else [],
                     "attention_dropout": 0.0,
+                    **(
+                        {"layer_types": ["full_attention", "full_attention"]}
+                        if args.model == "qwen35"
+                        else {}
+                    ),
                 },
             ),
             optimizer=OptimizerConfig(learning_rate=3e-4, implementation="for-loop"),
             parallel=ParallelConfig(
-                pipeline_parallel_size=1 if args.model == "kimi" else 2,
+                pipeline_parallel_size=(1 if args.model in ("kimi", "qwen35") else 2),
                 expert_parallel_size=2
                 if args.model == "kimi"
                 else args.expert_parallel_degree,
@@ -241,7 +248,7 @@ def main() -> None:
             "model": [part.state_dict() for part in trainer.model_parts],
             "optimizer": trainer.optimizer.state_dict(),
             "scheduler": trainer.lr_scheduler.state_dict(),
-            "trainer": trainer.state_dict(),
+            "trainer": trainer.progress.state_dict(),
             "dataloader": trainer.dataloader.state_dict(),
             "next_input": next_batch.input_ids,
             "next_labels": next_batch.labels,

@@ -428,7 +428,7 @@ def test_update_rejects_later_replaced_parameter_before_updating_earlier_part():
         for param in first.parameters():
             param.add_(1)
     second[0].weight = torch.nn.Parameter(second[0].weight.detach().clone())
-    with pytest.raises(RuntimeError, match="EMA has no state"):
+    with pytest.raises(ValueError, match="layout parameter bindings are stale"):
         ema.step(1)
     for average, expected in zip(averages, before, strict=True):
         torch.testing.assert_close(average, expected)
@@ -465,7 +465,13 @@ def test_ema_rejects_shrinking_scope_before_changing_averages(operation, change)
     else:
         del second.expert_bias_E
 
-    with pytest.raises(RuntimeError, match="tracked scope lost"):
+    error_type = ValueError if change == "remove_parameter" else RuntimeError
+    message = (
+        "layout parameter bindings are stale"
+        if change == "remove_parameter"
+        else "tracked scope lost"
+    )
+    with pytest.raises(error_type, match=message):
         if operation == "update":
             ema.step(1)
         else:
@@ -552,7 +558,12 @@ def test_cross_part_ema_names_fail_before_state_allocation(monkeypatch, second_b
         pytest.fail("EMA checkpoint FQN conflicts must fail before state allocation")
 
     monkeypatch.setattr(ema_module, "EMAStateOptimizer", unexpected)
-    with pytest.raises(ValueError, match="EMA tensor FQNs collide.*weight"):
+    message = (
+        "EMA tensor FQNs collide.*weight"
+        if second_buffer
+        else "checkpoint name 'weight' collides"
+    )
+    with pytest.raises(ValueError, match=message):
         EMA(
             model_parts=[first, second], buffer_patterns=[".*"] if second_buffer else []
         )

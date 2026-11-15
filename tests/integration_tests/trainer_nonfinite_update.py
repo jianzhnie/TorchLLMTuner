@@ -9,6 +9,7 @@ Only the returned loss or one post-backward local gradient is corrupted.
 """
 
 import sys
+from dataclasses import replace
 from datetime import timedelta
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -160,7 +161,10 @@ def main():
                         if dist.get_rank() == failing_rank:
                             if invalid == "loss":
                                 injected.append(True)
-                                return loss.new_tensor(float("nan"))
+                                return replace(
+                                    loss,
+                                    loss_sum=loss.loss_sum.new_tensor(float("nan")),
+                                )
                             if cp_size > 1:
                                 groups = [
                                     module

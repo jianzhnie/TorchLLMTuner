@@ -10,10 +10,10 @@ import torch
 
 from llmtuner.components.loss import (
     IGNORE_INDEX,
-    next_token_targets,
-    vocab_shard_bounds,
 )
+from llmtuner.models.common.targets import next_token_targets
 from llmtuner.utils.garbage_collection import GarbageCollection
+from llmtuner.utils.vocabulary import vocab_shard_bounds
 
 
 @pytest.mark.parametrize("debug", [0, 1, "false", None])

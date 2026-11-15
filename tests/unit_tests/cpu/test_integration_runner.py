@@ -23,7 +23,7 @@ def test_discovery_excludes_support_modules_without_dropping_runnable_scripts():
     )
     # Some real tests execute at module scope rather than through a main guard.
     assert {"tp_moe_equivalence.py", "tp_checkpoint_coordination.py"} <= names
-    assert "npu_trainer_alignment_replay.py" in names
+    assert "ep_resolved_plan_equivalence.py" in names
 
 
 @pytest.mark.parametrize(

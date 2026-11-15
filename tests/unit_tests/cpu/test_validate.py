@@ -20,10 +20,12 @@ import numpy as np
 import pytest
 import torch
 
-from llmtuner.components.loss import IGNORE_INDEX
+from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
 from llmtuner.config import LLMTunerConfig, TrainingConfig, ValidationConfig
 from llmtuner.models.common.validation import temporary_attention_mask
+from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.trainer.runtime.engine import TrainingEngine
+from llmtuner.trainer.runtime.validation import check_validation_feasibility
 
 
 @pytest.mark.parametrize("failed", [False, True])
@@ -157,6 +159,8 @@ class _ListLoader:
 class _EchoModel(torch.nn.Module):
     """Deterministic logits, so the expected loss is computable in the test."""
 
+    execution_capabilities = ModelExecutionCapabilities()
+
     def __init__(self) -> None:
         super().__init__()
         self.model = SimpleNamespace(config=SimpleNamespace())
@@ -213,7 +217,7 @@ def _make_trainer(
         max_context_length=cfg.max_seq_len,
         chunked_loss_num_chunks=1,
         param_context=trainer.param_context,
-        loss_sum=trainer.loss_sum,
+        loss_sum=cross_entropy_loss,
     )
     trainer.checkpointer = None
     trainer.ntokens_seen = 7
@@ -230,11 +234,7 @@ def _make_trainer(
 
 def _expected_loss(batches: list[dict[str, Any]]) -> float:
     loss_sum = sum(
-        float(
-            _trainer_cls().loss_sum(
-                _EchoModel()(b["input_ids"]), b["labels"].reshape(-1)
-            )
-        )
+        float(cross_entropy_loss(_EchoModel()(b["input_ids"]), b["labels"].reshape(-1)))
         for b in batches
     )
     valid = sum(b["num_valid_tokens"] for b in batches)
@@ -270,8 +270,7 @@ def test_validation_defaults_to_off() -> None:
 def test_feasibility_accepts_pipeline_parallelism() -> None:
     """PP x validation composes since 2026-10-02: the schedule's eval driver
     (upstream Validator's seam) drives the pass; see pipeline.run_pipeline_eval."""
-    Trainer = _trainer_cls()
-    Trainer.check_validation_feasibility(
+    check_validation_feasibility(
         ValidationConfig(),
         dp_world_size=1,
         training_dataset="local_jsonl",
@@ -279,9 +278,8 @@ def test_feasibility_accepts_pipeline_parallelism() -> None:
 
 
 def test_feasibility_rejects_steps_neg1_when_dp_gt_1() -> None:
-    Trainer = _trainer_cls()
     with pytest.raises(ValueError, match="validation collectives"):
-        Trainer.check_validation_feasibility(
+        check_validation_feasibility(
             ValidationConfig(steps=-1),
             dp_world_size=2,
             training_dataset="local_jsonl",
@@ -289,16 +287,15 @@ def test_feasibility_rejects_steps_neg1_when_dp_gt_1() -> None:
 
 
 def test_feasibility_rejects_steps_neg1_on_the_infinite_corpus() -> None:
-    Trainer = _trainer_cls()
     with pytest.raises(ValueError, match="infinite synthetic source"):
-        Trainer.check_validation_feasibility(
+        check_validation_feasibility(
             ValidationConfig(steps=-1),
             dp_world_size=1,
             training_dataset="random",
         )
     # The override corpus is what the pass reads, so it is the one checked.
     with pytest.raises(ValueError, match="infinite synthetic source"):
-        Trainer.check_validation_feasibility(
+        check_validation_feasibility(
             ValidationConfig(steps=-1, dataset="random"),
             dp_world_size=1,
             training_dataset="local_jsonl",
@@ -306,13 +303,12 @@ def test_feasibility_rejects_steps_neg1_on_the_infinite_corpus() -> None:
 
 
 def test_feasibility_accepts_the_terminating_combinations() -> None:
-    Trainer = _trainer_cls()
-    Trainer.check_validation_feasibility(
+    check_validation_feasibility(
         ValidationConfig(steps=-1),
         dp_world_size=1,
         training_dataset="local_jsonl",
     )
-    Trainer.check_validation_feasibility(
+    check_validation_feasibility(
         ValidationConfig(steps=10),
         dp_world_size=8,
         training_dataset="random",

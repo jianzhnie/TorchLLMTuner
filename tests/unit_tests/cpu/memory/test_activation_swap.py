@@ -182,6 +182,13 @@ def test_failed_release_preserves_error_and_attempts_d2h_cleanup(
 ):
     monkeypatch.setattr(activation_swap, "device_type", "npu")
     model = torch.nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList(
         [torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.SiLU())]
     )
@@ -226,6 +233,13 @@ def test_layer_preserves_caller_owned_input(cpu_copies, monkeypatch):
 
     monkeypatch.setattr(activation_swap, "device_type", "npu")
     model = torch.nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList([Square()])
     activation_swap.apply_activation_swap(model)
     value = torch.arange(6, dtype=torch.float32, requires_grad=True)
@@ -253,6 +267,13 @@ def test_retained_graph_supports_two_backwards(cpu_copies, monkeypatch):
 
     monkeypatch.setattr(activation_swap, "device_type", "npu")
     model = torch.nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList([Block()])
     activation_swap.apply_activation_swap(model)
     value = torch.arange(6, dtype=torch.float32, requires_grad=True)
@@ -270,6 +291,13 @@ def test_retained_graph_supports_two_backwards(cpu_copies, monkeypatch):
 def test_repeated_application_preserves_forward_identity(monkeypatch):
     monkeypatch.setattr(activation_swap, "device_type", "npu")
     model = torch.nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
     activation_swap.apply_activation_swap(model)
     forward = model.layers[0].forward
@@ -282,6 +310,13 @@ def test_repeated_application_preserves_forward_identity(monkeypatch):
 def test_no_grad_does_not_create_swap_streams(monkeypatch):
     monkeypatch.setattr(activation_swap, "device_type", "npu")
     model = torch.nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
     value = torch.ones(1, 2)
     expected = model.layers[0](value).detach()
@@ -351,6 +386,13 @@ def test_caller_owned_storage_does_not_create_unused_host_copies(
     activation_swap.reset_activation_swap_metrics()
     baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
     model = torch.nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList([Block()])
     activation_swap.apply_activation_swap(model)
     value = torch.arange(6, dtype=torch.float32, requires_grad=True)
@@ -424,6 +466,13 @@ def test_activation_swap_rejects_invalid_host_budget(limit):
 def test_reapplication_shares_budget_with_new_layers(monkeypatch):
     monkeypatch.setattr(activation_swap, "device_type", "npu")
     model = torch.nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
     activation_swap.apply_activation_swap(model, max_host_bytes=64)
     original = model.layers[0].forward
@@ -442,6 +491,13 @@ def test_reapplication_shares_budget_with_new_layers(monkeypatch):
 def test_reapplication_rejects_changed_options_before_mutation(monkeypatch, options):
     monkeypatch.setattr(activation_swap, "device_type", "npu")
     model = torch.nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
     activation_swap.apply_activation_swap(model)
     installed = model.layers[0].forward
@@ -459,6 +515,13 @@ def test_reapplication_rejects_independent_budgets(monkeypatch):
     monkeypatch.setattr(activation_swap, "device_type", "npu")
     models = [torch.nn.Module(), torch.nn.Module()]
     for model in models:
+        model.decoder_structure = DecoderStructure(
+            decoder="",
+            embedding="embedding",
+            blocks="layers",
+            norm="norm",
+            head="head",
+        )
         model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
         activation_swap.apply_activation_swap(model)
     models[0].layers.append(models[1].layers[0])
@@ -475,6 +538,13 @@ def test_explicit_swap_binds_only_declared_local_blocks(monkeypatch):
     model = torch.nn.Module()
     model.decoder = torch.nn.Module()
     model.decoder.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
     model.decoder_structure = DecoderStructure(
         decoder="decoder",
@@ -495,6 +565,13 @@ def test_explicit_swap_binds_only_declared_local_blocks(monkeypatch):
 def test_explicit_swap_rejects_invalid_declaration_without_fallback(monkeypatch):
     monkeypatch.setattr(activation_swap, "device_type", "npu")
     model = torch.nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
     model.decoder_structure = "layers"
     original = model.layers[0].forward

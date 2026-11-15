@@ -11,9 +11,11 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
+from llmtuner.components.checkpointer.core.layout_migration import (
+    load_changed_source_layout,
+)
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
 from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
-from llmtuner.components.checkpointer.hf.kimi_layout import load_changed_kimi_layout
 from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from tests.unit_tests.cpu.parallel.test_kimi_conversion import make_model
@@ -71,7 +73,7 @@ def main():
                     expert_parallel=not source_grouped,
                 )
                 try:
-                    load_changed_kimi_layout(folder, states=states, adapter=adapter)
+                    load_changed_source_layout(folder, states=states, adapter=adapter)
                 except (ValueError, RuntimeError) as error:
                     expected = (
                         "injected scheduler failure"
@@ -84,7 +86,9 @@ def main():
                     raise AssertionError("scheduler failure did not propagate")
                 dist.barrier()
                 scheduler.fail = False
-                assert load_changed_kimi_layout(folder, states=states, adapter=adapter)
+                assert load_changed_source_layout(
+                    folder, states=states, adapter=adapter
+                )
                 dist.barrier()
                 if rank == 0:
                     print(

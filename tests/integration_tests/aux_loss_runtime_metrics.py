@@ -16,8 +16,9 @@ from llmtuner.models.common.aux_loss import (
     collect_aux_loss_metrics,
     rollup_aux_loss_metrics,
 )
-from llmtuner.trainer.runtime.metrics import build_step_metrics
+from llmtuner.trainer.runtime.metrics import build_step_metrics, collect_update_metrics
 from llmtuner.trainer.runtime.reductions import TrainingReductionMeshes
+from llmtuner.trainer.runtime.results import UpdateResult
 
 
 def main():
@@ -64,8 +65,6 @@ def main():
         metrics = build_step_metrics(
             ntokens_seen=4,
             device=torch.device("cpu"),
-            parallel_dims=topology,
-            model_parts=[empty_stage],
             pp_has_last_stage=rank == 1,
             accumulated_loss=torch.tensor(8.0 if rank == 1 else 0.0),
             global_valid_tokens=torch.tensor(4),
@@ -78,6 +77,12 @@ def main():
             lr_metrics={},
         )
         assert metrics["loss"] == 2.0
+        update = collect_update_metrics(
+            UpdateResult(1, torch.tensor(1.0), True, True, False),
+            parallel_dims=topology,
+            model_parts=[empty_stage],
+        )
+        metrics.update(update.auxiliary_metrics)
         assert metrics["aux_loss/mean"] == 3.0
         dist.barrier()
         print(f"rank={rank}: current PP layer mean=2, old model counts excluded")

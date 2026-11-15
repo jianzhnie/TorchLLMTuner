@@ -24,9 +24,9 @@ from llmtuner.components.loss import (
     compute_logprobs,
     cross_entropy_loss,
     mse_loss,
-    next_token_targets,
-    vocab_shard_bounds,
 )
+from llmtuner.models.common.targets import next_token_targets
+from llmtuner.utils.vocabulary import vocab_shard_bounds
 
 
 @pytest.mark.parametrize("field", ["global_vocab_size", "tp_world_size", "tp_rank"])

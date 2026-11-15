@@ -7,6 +7,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.models.execution import PipelineStageIO
 from llmtuner.parallel.pipeline_parallel import partition
 from llmtuner.parallel.pipeline_parallel.partition import split_model_into_stages
 
@@ -19,6 +20,14 @@ class Decoder(nn.Module):
         self.layers = nn.ModuleList()
         for block_id in ("3", "7"):
             self.layers.add_module(block_id, nn.Linear(4, 4))
+
+    def configure_pipeline_stage(self, *, first: bool, last: bool) -> None:
+        self.pipeline_stage_io = PipelineStageIO(
+            first=first,
+            last=last,
+            hidden_size=4,
+            activation_dtype=next(self.parameters()).dtype,
+        )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:

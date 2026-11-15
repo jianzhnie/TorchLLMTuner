@@ -17,8 +17,10 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
+from llmtuner.components.checkpointer.core.layout_migration import (
+    load_changed_source_layout,
+)
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
-from llmtuner.components.checkpointer.hf.kimi_layout import load_changed_kimi_layout
 from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
@@ -107,7 +109,7 @@ def main():
                 rng_before = torch.get_rng_state().clone()
                 adapter = ModelStateDictAdapter(config, None, expert_parallel=True)
                 try:
-                    load_changed_kimi_layout(path, states=states, adapter=adapter)
+                    load_changed_source_layout(path, states=states, adapter=adapter)
                 except ValueError as error:
                     expected = (
                         "duplicate expert index"
@@ -125,7 +127,7 @@ def main():
                     torch.get_rng_state(), rng_before, rtol=0, atol=0
                 )
                 dist.barrier()
-                assert load_changed_kimi_layout(
+                assert load_changed_source_layout(
                     healthy_path, states=states, adapter=adapter
                 )
                 torch.testing.assert_close(

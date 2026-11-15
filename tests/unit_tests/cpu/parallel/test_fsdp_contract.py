@@ -23,6 +23,7 @@ import llmtuner.parallel.fully_shard_parallel.fully_shard_parallel as apply
 from llmtuner.config.parallel_config import FSDPConfig, ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.configuration import build_model_config
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.fully_shard_parallel import pattern
 from llmtuner.parallel.fully_shard_parallel.fine_grained import (
@@ -177,6 +178,13 @@ def test_decoder_fsdp_excludes_pipeline_identity_boundaries(
 ):
 
     model = nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="tok_embeddings",
+        blocks="layers",
+        norm="norm",
+        head="lm_head",
+    )
     model.enable_weight_tying = tied
     model.tok_embeddings = nn.Embedding(8, 4) if first_stage else nn.Identity()
     model.norm = nn.Identity() if first_stage else nn.LayerNorm(4)
@@ -430,6 +438,13 @@ def test_separate_dtype_policy_uses_model_storage_dtype(monkeypatch, dtype):
         mesh_dim_names = ()
 
     model = nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="tok_embeddings",
+        blocks="layers",
+        norm="norm",
+        head="lm_head",
+    )
     model.tok_embeddings = nn.Identity()
     model.norm = nn.Identity()
     model.lm_head = nn.Identity()
@@ -460,6 +475,13 @@ def test_separate_dtype_policy_uses_model_storage_dtype(monkeypatch, dtype):
 @pytest.mark.parametrize("names", [("missing",), "scale", ("scale", "other")])
 def test_invalid_separate_parameter_contract_fails_before_sharding(monkeypatch, names):
     model = nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="tok_embeddings",
+        blocks="layers",
+        norm="norm",
+        head="lm_head",
+    )
     model.scale = nn.Parameter(torch.ones(2, dtype=torch.float64))
     model.fsdp_separate_parameter_names = names
     original = model.scale
@@ -482,6 +504,13 @@ def test_invalid_separate_parameter_contract_fails_before_sharding(monkeypatch, 
 @pytest.mark.parametrize("alias", ["scale", "projection"])
 def test_separate_dtype_subtree_rejects_external_parameter_alias(monkeypatch, alias):
     model = nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="tok_embeddings",
+        blocks="layers",
+        norm="norm",
+        head="lm_head",
+    )
     block = nn.Module()
     block.fsdp_separate_parameter_names = ("scale",)
     block.scale = nn.Parameter(torch.ones(2, dtype=torch.float64))
@@ -507,6 +536,13 @@ def test_separate_dtype_subtree_rejects_external_parameter_alias(monkeypatch, al
 
 def test_separate_dtype_nested_declarations_fail_before_sharding(monkeypatch):
     model = nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="tok_embeddings",
+        blocks="layers",
+        norm="norm",
+        head="lm_head",
+    )
     model.fsdp_separate_parameter_names = ("scale",)
     model.scale = nn.Parameter(torch.ones(2, dtype=torch.float64))
     model.child = nn.Module()
@@ -535,6 +571,13 @@ def test_expert_placement_conflict_precedes_separate_dtype_sharding(monkeypatch)
             return 4
 
     model = nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="tok_embeddings",
+        blocks="layers",
+        norm="norm",
+        head="lm_head",
+    )
     model.tok_embeddings = model.norm = model.lm_head = nn.Identity()
     model.enable_weight_tying = False
     separate = nn.Module()

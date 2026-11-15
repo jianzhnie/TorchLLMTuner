@@ -17,8 +17,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 
-from llmtuner.components.loss import IGNORE_INDEX
+from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
 from llmtuner.config import LLMTunerConfig, ValidationConfig
+from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.trainer.runtime import validation
 from llmtuner.trainer.runtime.engine import TrainingEngine
 from llmtuner.trainer.trainer import Trainer
@@ -47,6 +48,8 @@ class Loader:
 
 
 class Projection(torch.nn.Module):
+    execution_capabilities = ModelExecutionCapabilities()
+
     def __init__(self, coordinate):
         super().__init__()
         self.coordinate = coordinate
@@ -109,7 +112,7 @@ def main():
                 max_context_length=trainer.cfg.max_seq_len,
                 chunked_loss_num_chunks=1,
                 param_context=trainer.param_context,
-                loss_sum=trainer.loss_sum,
+                loss_sum=cross_entropy_loss,
                 error_group=trainer.error_group,
             )
             logs = []

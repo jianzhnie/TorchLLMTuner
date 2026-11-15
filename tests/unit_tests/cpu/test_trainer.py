@@ -44,8 +44,6 @@ from llmtuner.components.checkpointer import (
 from llmtuner.components.loss import (
     IGNORE_INDEX,
     cross_entropy_loss,
-    next_token_targets,
-    vocab_shard_bounds,
 )
 from llmtuner.components.optimizer import EMA, OptimizersContainer
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
@@ -58,22 +56,27 @@ from llmtuner.config import (
     ParamGroupConfig,
     TrainingConfig,
 )
+from llmtuner.config.training_config import resolve_batch_size_per_rank
 from llmtuner.datasets.contracts import Batch
 from llmtuner.datasets.synthetic import (
     RandomTokenDataLoader,
     RandomTokenSource,
 )
+from llmtuner.models.common.targets import next_token_targets
 from llmtuner.models.configuration import build_model_config
+from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.runtime.batch import (
     build_training_dataloader,
     move_batch_to_device,
     prepare_model_inputs,
-    resolve_batch_size_per_rank,
 )
 from llmtuner.trainer.runtime.engine import TrainingEngine, loss_vocab_kwargs
 from llmtuner.trainer.runtime.pipeline import run_pipeline_step
+from llmtuner.trainer.runtime.results import StepResult
 from llmtuner.trainer.trainer import Trainer
+from llmtuner.utils.seeding import seed_everything
+from llmtuner.utils.vocabulary import vocab_shard_bounds
 
 
 @pytest.mark.parametrize("mutable_state", ["running_stats", "embedding_weight"])
@@ -83,6 +86,7 @@ def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_
         if mutable_state == "running_stats"
         else nn.Embedding(2, 2, max_norm=1.0)
     )
+    model.execution_capabilities = ModelExecutionCapabilities()
     if mutable_state == "embedding_weight":
         with torch.no_grad():
             model.weight.fill_(10)
@@ -127,7 +131,7 @@ def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_
         )
         loss = model(inputs).sum()
         loss.backward()
-        return loss.detach()
+        return StepResult(loss.detach(), 1, kwargs["global_valid_tokens"])
 
     trainer.training_engine = TrainingEngine(
         model_parts=[model],
@@ -199,8 +203,10 @@ def test_nonfinite_step_preserves_model_optimizer_scheduler_and_ema(invalid):
         loss.backward()
         if invalid == "gradient":
             model.weight.grad.fill_(float("inf"))
-            return loss.detach()
-        return loss.detach().new_tensor(float("nan"))
+            return StepResult(loss.detach(), 1, kwargs["global_valid_tokens"])
+        return StepResult(
+            loss.detach().new_tensor(float("nan")), 1, kwargs["global_valid_tokens"]
+        )
 
     trainer.forward_backward_step = forward_backward
     with pytest.raises(RuntimeError, match="not finite"):
@@ -330,7 +336,7 @@ def test_seeding_exports_the_hash_seed_for_spawned_workers(monkeypatch) -> None:
     spelling.
     """
     monkeypatch.setenv("PYTHONHASHSEED", "0")
-    Trainer.seed_everything(7, deterministic=False)
+    seed_everything(7, deterministic=False)
     assert os.environ["PYTHONHASHSEED"] == str(7 % 2**32)
 
 
@@ -347,9 +353,9 @@ def test_detect_anomaly_watches_nans_but_skips_the_dtensor_hostile_check(
         lambda mode, check_nan=True: calls.append((mode, check_nan)),
     )
 
-    Trainer.seed_everything(1, deterministic=False)
+    seed_everything(1, deterministic=False)
     assert calls == [(False, False)]
-    Trainer.seed_everything(1, deterministic=False, detect_anomaly=True)
+    seed_everything(1, deterministic=False, detect_anomaly=True)
     assert calls == [(False, False), (True, False)]
 
 
@@ -616,8 +622,8 @@ def test_batch_size_per_rank_divides_evenly() -> None:
     trainer = _bare_trainer(_cfg_with_batch(global_batch_size=8))
 
     # 8 over 2 ranks is 4 each; 8 over 8 is 1 each.
-    assert resolve_batch_size_per_rank(trainer.cfg, 2) == 4
-    assert resolve_batch_size_per_rank(trainer.cfg, 8) == 1
+    assert resolve_batch_size_per_rank(trainer.cfg.global_batch_size, 2) == 4
+    assert resolve_batch_size_per_rank(trainer.cfg.global_batch_size, 8) == 1
 
 
 def test_an_indivisible_global_batch_is_rejected() -> None:
@@ -631,7 +637,7 @@ def test_an_indivisible_global_batch_is_rejected() -> None:
     trainer = _bare_trainer(_cfg_with_batch(global_batch_size=10))
 
     with pytest.raises(ValueError, match="divisible by"):
-        resolve_batch_size_per_rank(trainer.cfg, 4)
+        resolve_batch_size_per_rank(trainer.cfg.global_batch_size, 4)
 
 
 def _source(*, batch_size: int = 2, seq_len: int = 4) -> RandomTokenSource:
@@ -1320,7 +1326,7 @@ def test_loss_sum_scores_every_label_ignored_ones_included() -> None:
     logits = torch.randn(6, 8)
     labels = torch.tensor([1, 2, IGNORE_INDEX, 4, IGNORE_INDEX, IGNORE_INDEX])
 
-    loss_sum = Trainer.loss_sum(logits, labels)
+    loss_sum = cross_entropy_loss(logits, labels)
 
     expected = F.cross_entropy(logits.float(), labels, reduction="sum")
     torch.testing.assert_close(loss_sum, expected, rtol=1e-5, atol=1e-8)
@@ -1330,7 +1336,7 @@ def test_loss_sum_makes_one_prediction_per_predictable_label() -> None:
     """``logits[t]`` scores ``labels[t]``: the two are already aligned."""
     logits = torch.randn(4, 8)
     labels = torch.tensor([1, 2, 3, 4])
-    loss_sum = Trainer.loss_sum(logits, labels)
+    loss_sum = cross_entropy_loss(logits, labels)
 
     expected = F.cross_entropy(logits.float(), labels, reduction="sum")
     torch.testing.assert_close(loss_sum, expected, rtol=1e-5, atol=1e-8)
@@ -1649,7 +1655,7 @@ def test_checkpointer_assembly_rejects_missing_dataloader(monkeypatch):
             model_assembly=assembly.ModelAssembly(model=None, model_parts=[]),
             optimizer_stack=assembly.OptimizerStack(None, None, None),
             dataloader=None,
-            train_state=trainer,
+            train_state=trainer.progress,
             device=torch.device("cpu"),
             parallel_dims=None,
         )
@@ -2005,8 +2011,6 @@ def test_assembly_uses_live_process_group_rank_and_size(monkeypatch):
     with pytest.raises(RuntimeError, match="stop after rank resolution"):
         environment.build_runtime_environment(
             SimpleNamespace(deterministic=False),
-            seed_everything=lambda *args, **kwargs: None,
-            validate_validation=lambda *args, **kwargs: None,
         )
 
 
@@ -2035,8 +2039,6 @@ def test_assembly_sets_determinism_before_creating_process_group(
     with pytest.raises(RuntimeError, match="stop before process group creation"):
         environment.build_runtime_environment(
             SimpleNamespace(deterministic=deterministic),
-            seed_everything=lambda *args, **kwargs: None,
-            validate_validation=lambda *args, **kwargs: None,
         )
 
 
@@ -2198,8 +2200,8 @@ def test_trainer_checkpoint_rejects_invalid_counters_without_partial_restore(
     trainer.ntokens_seen = 12
     checkpoint = {"step": 8, "ntokens_seen": 50, field: value}
     with pytest.raises(ValueError, match=f"trainer {field}"):
-        trainer.load_state_dict(checkpoint)
-    assert trainer.state_dict() == {"step": 3, "ntokens_seen": 12}
+        trainer.progress.load_state_dict(checkpoint)
+    assert trainer.progress.state_dict() == {"step": 3, "ntokens_seen": 12}
 
 
 def test_incomplete_accumulation_window_never_updates_parameters():
@@ -2240,13 +2242,13 @@ def test_incomplete_accumulation_window_never_updates_parameters():
 
 def test_trainer_retains_checkpointer_after_interrupted_close():
     class Checkpointer:
-        _initialized = True
+        requires_close_retry = True
         pending = True
 
         def close(self):
             if self.pending:
                 raise KeyboardInterrupt("upload still active")
-            self._initialized = False
+            self.requires_close_retry = False
 
     trainer = Trainer.__new__(Trainer)
     resource = Checkpointer()
@@ -2337,7 +2339,9 @@ def test_clip_norm_counts_shared_parameter_across_model_parts_once(
             self.w1_EFD = nn.Parameter(torch.ones(2, 3, 4))
             self.w3_EFD = nn.Parameter(torch.ones(2, 3, 4))
 
-    monkeypatch.setattr(gradients, "NpuBaselineGroupedExperts", PackedExperts)
+        def gradient_norm_parameter_groups(self):
+            return ((self.w1_EFD, self.w3_EFD),)
+
     if precision == "parameter":
         first.experts = PackedExperts()
         second.experts = first.experts
@@ -2396,7 +2400,7 @@ def test_clip_norm_counts_shared_parameter_across_model_parts_once(
     assert captured["expert_parameters"] is None
 
 
-def test_expert_parameter_ids_share_one_moe_ownership_classifier(monkeypatch):
+def test_expert_parameter_ids_deduplicate_model_declared_ownership():
     from llmtuner.trainer.runtime import gradients
 
     class FakeMoE(nn.Module):
@@ -2406,12 +2410,14 @@ def test_expert_parameter_ids_share_one_moe_ownership_classifier(monkeypatch):
             self.routed_experts.inner_experts = nn.Module()
             self.routed_experts.inner_experts.register_parameter("weight", parameter)
 
+        def expert_parallel_parameters(self):
+            yield from self.routed_experts.inner_experts.parameters()
+
     shared = nn.Parameter(torch.zeros(1))
     first = nn.Module()
     first.moe = FakeMoE(shared)
     second = nn.Module()
     second.moe = FakeMoE(shared)
-    monkeypatch.setattr(gradients, "MoE", FakeMoE)
 
     assert gradients.expert_parameter_ids([first, second]) == {id(shared)}
 
@@ -2491,7 +2497,7 @@ def test_data_exhaustion_saves_last_completed_step(monkeypatch, completed_steps)
 
     trainer.train_step = train_step
     monkeypatch.setattr(
-        trainer_module,
+        trainer_module.assembly,
         "Profiler",
         lambda *args, **kwargs: nullcontext(SimpleNamespace(step=lambda: None)),
     )
@@ -2556,7 +2562,7 @@ def test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state(
         expected_python = random.getstate()
         expected_numpy = np.random.get_state()
         expected_torch = torch.get_rng_state().clone()
-        expected_trainer = original.state_dict()
+        expected_trainer = original.progress.state_dict()
         expected_loader = loader.state_dict()
     finally:
         original.close()
@@ -2584,7 +2590,7 @@ def test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state(
         torch.testing.assert_close(
             torch.get_rng_state(), expected_torch, rtol=0, atol=0
         )
-        assert resumed.state_dict() == expected_trainer
+        assert resumed.progress.state_dict() == expected_trainer
         assert resumed.dataloader.state_dict() == expected_loader
         next_batch = next(resumed.data_iterator())
         reference = next(
@@ -2633,7 +2639,7 @@ def test_trainer_retries_interrupted_checkpoint_cleanup(failure):
         if calls.count("checkpoint") == 1:
             raise failure("checkpoint close interrupted")
 
-    checkpoint = SimpleNamespace(_initialized=True, close=close_checkpoint)
+    checkpoint = SimpleNamespace(requires_close_retry=True, close=close_checkpoint)
     trainer.checkpointer = checkpoint
     loader = SimpleNamespace(close=lambda: calls.append("data"))
     trainer.dataloader = loader
@@ -2688,7 +2694,7 @@ def test_failed_trainer_construction_restores_execution_settings(monkeypatch, fa
         original = failure("assembly failed after seeding")
 
         def assemble(self, cfg):
-            self.seed_everything(73, deterministic=True, detect_anomaly=True)
+            seed_everything(73, deterministic=True, detect_anomaly=True)
             raise original
 
         monkeypatch.setattr(module.Trainer, "_assemble_runtime", assemble)
@@ -2721,7 +2727,7 @@ def test_successful_trainer_construction_keeps_execution_settings(monkeypatch):
         torch.autograd.set_detect_anomaly(False)
 
         def assemble(self, cfg):
-            self.seed_everything(73, deterministic=True, detect_anomaly=True)
+            seed_everything(73, deterministic=True, detect_anomaly=True)
 
         monkeypatch.setattr(module.Trainer, "_assemble_runtime", assemble)
         Trainer(SimpleNamespace())
@@ -2755,7 +2761,7 @@ def test_failed_trainer_construction_restores_host_rng(
             raise RuntimeError("cleanup failed after random draws")
 
     def assemble(self, cfg):
-        self.seed_everything(73, deterministic=False)
+        seed_everything(73, deterministic=False)
         random.random()
         np.random.random()
         torch.rand(3)
@@ -2855,7 +2861,7 @@ def test_trainer_selected_optimizer_resumes_complete_next_update(
                 "model": [part.state_dict() for part in trainer.model_parts],
                 "optimizer": trainer.optimizer.state_dict(),
                 "scheduler": trainer.lr_scheduler.state_dict(),
-                "trainer": trainer.state_dict(),
+                "trainer": trainer.progress.state_dict(),
                 "loader": trainer.dataloader.state_dict(),
             }
         )
@@ -3377,7 +3383,10 @@ def test_trainer_progress_is_shared_with_checkpoint_without_retaining_trainer():
     assert trainer.ntokens_seen == 96
     trainer.step += 1
     assert checkpoint_state.step == 6
-    assert trainer.state_dict() == checkpoint_state.state_dict()
+    assert checkpoint_state.state_dict() == {
+        "step": trainer.step,
+        "ntokens_seen": trainer.ntokens_seen,
+    }
     del trainer
     assert trainer_reference() is None
     assert checkpoint_state.state_dict() == {"step": 6, "ntokens_seen": 96}

@@ -75,9 +75,11 @@ def test_execution_consumes_plan_without_resolving_again(monkeypatch) -> None:
         return value * 2
 
     monkeypatch.setattr(compressor, "resolve_compressor_plan", reject_resolution)
-    monkeypatch.setattr(compressor, "compressor_attention_math", object())
     monkeypatch.setattr(compressor, "compressor_attention_forward", attention_factory)
-    monkeypatch.setattr(compressor, "compressor_decoder_forward", decoder_forward)
+    model.decoder.forward_compressor_context_parallel = decoder_forward.__get__(
+        model.decoder
+    )
+    model.attention.forward_compressor_context_parallel = lambda *args: None
     assert (
         compressor.apply_compressor_context_parallel(
             model, cp_mesh=mesh, cfg=ParallelConfig(), resolved_plan=plan

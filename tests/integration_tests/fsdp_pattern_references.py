@@ -58,7 +58,7 @@ def main():
             parallel_dims=dims,
             compile=compiled,
             compile_config=CompileConfig(backend="aot_eager"),
-        )
+        ).execution
         base = model._orig_mod if compiled else model
         assert base[0]._get_fsdp_state()._fsdp_param_group is None
         assert cfg.fsdp_config.fsdp_apply_modules["0"]["ignored_params"] == {original}

@@ -170,7 +170,7 @@ def test_explicit_trainer_dcp_restores_next_update(
                 "model": trainer.model.state_dict(),
                 "optimizer": trainer.optimizer.state_dict(),
                 "scheduler": trainer.lr_scheduler.state_dict(),
-                "trainer": trainer.state_dict(),
+                "trainer": trainer.progress.state_dict(),
                 "dataloader": trainer.dataloader.state_dict(),
             }
         )

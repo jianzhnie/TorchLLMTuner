@@ -412,4 +412,6 @@ def test_an_unknown_shard_kind_is_rejected() -> None:
     from llmtuner.parallel.tensor_parallel.sharding import ShardingConfig
 
     with pytest.raises(ValueError, match="Unknown shard kind"):
-        ShardingConfig(kind="diagonal", implementation=nn.Linear)
+        ShardingConfig(
+            kind="diagonal", implementation=nn.Linear, sequence_transform="preserve"
+        )

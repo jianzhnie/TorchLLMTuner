@@ -4,8 +4,8 @@ import pytest
 import torch
 from torch import nn
 
+from llmtuner.models.common.moe.layout import resolve_moe_routing
 from llmtuner.models.contracts import MoEBlockContract
-from llmtuner.parallel.expert_parallel.block_conversion import resolve_moe_routing
 
 
 @pytest.mark.parametrize(

@@ -218,7 +218,7 @@ def train(args) -> None:
             "model": final,
             "optimizer": snapshot(trainer.optimizer.state_dict()),
             "scheduler": snapshot(trainer.lr_scheduler.state_dict()),
-            "trainer": snapshot(trainer.state_dict()),
+            "trainer": snapshot(trainer.progress.state_dict()),
         }
         assert auxiliary.keys() == {"rng_state", "dataloader"}
         states.update(auxiliary)

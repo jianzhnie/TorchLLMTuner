@@ -18,8 +18,9 @@ from llmtuner.components.optimizer.flex_shard import (
     Owned,
 )
 from llmtuner.components.optimizer.flex_shard.dist_muon import DistMuon
+from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config import OptimizerConfig, ParamGroupConfig
-from llmtuner.trainer.runtime import assembly
+from llmtuner.trainer.runtime.builders import TrainingBuilders
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.module_names import canonical_fqn
 
@@ -109,10 +110,9 @@ def main():
         if slots < 1:
             raise ValueError("LLMTUNER_DIST_MUON_SLOTS must be positive")
         _optimizer_reshard_runtime._NUM_PIPELINE_SLOTS = slots
-    original = assembly.build_optimizer_stack
     counts = {}
 
-    def build_optimizer_stack(cfg, *, model_parts, parallel_dims, error_group=None):
+    def build_optimizer(_config, *, model_parts, **kwargs):
         layouts = {}
         for part in model_parts:
             for name, _parameter in part.named_parameters():
@@ -125,7 +125,7 @@ def main():
         assert layouts
         counts["dist_muon_parameters"] = len(layouts)
         print(f"DistMuon layout examples: {list(layouts)[:2]}", flush=True)
-        cfg.optimizer = OptimizerConfig(
+        optimizer_config = OptimizerConfig(
             learning_rate=1e-5,
             weight_decay=0.1,
             implementation="for-loop",
@@ -153,25 +153,17 @@ def main():
                 for index in range(48)
             ],
         )
-        return original(
-            cfg,
-            model_parts=model_parts,
-            parallel_dims=parallel_dims,
-            error_group=error_group,
-        )
+        return OptimizersContainer(optimizer_config, model_parts=model_parts, **kwargs)
 
     profile = None
     if os.environ.get("LLMTUNER_DIST_MUON_PROFILE") == "1":
         profile = install_profile()
-    assembly.build_optimizer_stack = build_optimizer_stack
     try:
-        trainer = Trainer(config)
+        trainer = Trainer(config, builders=TrainingBuilders(optimizer=build_optimizer))
     except BaseException:
         if profile is not None:
             profile[1]()
         raise
-    finally:
-        assembly.build_optimizer_stack = original
     started = time.perf_counter()
     try:
         parameter_dtypes = {

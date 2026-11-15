@@ -25,6 +25,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.config import ParallelConfig
 from llmtuner.config.parallel_config import PipelineParallelConfig
+from llmtuner.models.execution import PipelineStageIO
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel import compatibility
 from llmtuner.parallel.pipeline_parallel.partition import (
@@ -293,6 +294,14 @@ class PartitionDecoder(nn.Module):
         self.norm = source.norm
         self.lm_head = source.lm_head
         self.rotary_emb = source.model.rotary_emb
+
+    def configure_pipeline_stage(self, *, first: bool, last: bool) -> None:
+        self.pipeline_stage_io = PipelineStageIO(
+            first=first,
+            last=last,
+            hidden_size=16,
+            activation_dtype=next(self.parameters()).dtype,
+        )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         hidden = self.tok_embeddings(inputs).unsqueeze(0)

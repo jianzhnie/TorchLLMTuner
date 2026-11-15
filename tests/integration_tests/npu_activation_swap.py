@@ -16,6 +16,7 @@ from llmtuner.config import (
     TrainingConfig,
 )
 from llmtuner.memory import activation_swap
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.tensor_parallel.linear import (
     ColumnParallelLinear,
     ColwiseLinearNoGather,
@@ -142,6 +143,13 @@ def verify_discarded_graph_cleanup() -> None:
         activation_swap.reset_activation_swap_metrics()
         baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
         model = torch.nn.Module()
+        model.decoder_structure = DecoderStructure(
+            decoder="",
+            embedding="embedding",
+            blocks="layers",
+            norm="norm",
+            head="head",
+        )
         model.layers = torch.nn.ModuleList([SavedActivationLayer(fail)])
         activation_swap.apply_activation_swap(model)
         value = torch.linspace(-1, 1, 1024, device="npu").requires_grad_()
@@ -177,6 +185,13 @@ def verify_retained_graph_reuse() -> None:
     activation_swap.reset_activation_swap_metrics()
     baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
     model = torch.nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList([SavedActivationLayer()])
     activation_swap.apply_activation_swap(model)
     value = torch.linspace(-1, 1, 1024, device="npu").requires_grad_()
@@ -226,6 +241,13 @@ def verify_owned_storage_skips() -> None:
         activation_swap.reset_activation_swap_metrics()
         baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
         model = torch.nn.Module()
+        model.decoder_structure = DecoderStructure(
+            decoder="",
+            embedding="embedding",
+            blocks="layers",
+            norm="norm",
+            head="head",
+        )
         model.layers = torch.nn.ModuleList([OwnedStorageLayer(source)])
         model.to("npu")
         activation_swap.apply_activation_swap(model)
@@ -258,6 +280,13 @@ def verify_host_budget() -> None:
     activation_swap.reset_activation_swap_metrics()
     baseline = activation_swap.activation_swap_metrics()["host_bytes_current"]
     model = torch.nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="embedding",
+        blocks="layers",
+        norm="norm",
+        head="head",
+    )
     model.layers = torch.nn.ModuleList([Layer(), Layer()])
     activation_swap.apply_activation_swap(model, max_host_bytes=4096)
     values = [

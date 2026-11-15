@@ -10,6 +10,7 @@ from torch._dynamo.exc import InvalidBackend
 from torch._dynamo.utils import counters
 
 from llmtuner.config import CompileConfig, ParallelConfig
+from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.parallel.parallelize import parallelize_model
 from tests.integration_tests.harness import init_distributed
 
@@ -29,6 +30,7 @@ def main():
         if rank == 1:
             register_backend(lambda graph, inputs: graph.forward, name=backend)
         model = nn.Module()
+        model.execution_capabilities = ModelExecutionCapabilities()
         model.layers = nn.ModuleList([ProbeLayer(4, 4, device=device)])
         original = model.layers[0]
         error = None

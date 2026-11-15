@@ -17,6 +17,15 @@ from llmtuner.components.checkpointer.hf.hf_expert_storage import (
 )
 from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.models.qwen.qwen3.state import Qwen3StateFormat
+
+
+def _reader_layout(*, native_ep_layout=False):
+    return Qwen3StateFormat(
+        SimpleNamespace(num_experts=3),
+        expert_parallel=native_ep_layout,
+        sharded_expert_parallel=True,
+    ).reader_layout()
 
 
 def _checkpoint(tmp_path, *, missing=False):
@@ -98,7 +107,9 @@ def test_individual_hf_experts_load_into_fused_tensors(
 
 def test_individual_hf_experts_reject_missing_projection(tmp_path):
     _checkpoint(tmp_path, missing=True)
-    reader = GroupedExpertHuggingFaceStorageReader(str(tmp_path), num_experts=3)
+    reader = GroupedExpertHuggingFaceStorageReader(
+        str(tmp_path), layout=_reader_layout()
+    )
     with pytest.raises(ValueError, match="Incomplete individual HF experts"):
         reader.read_metadata()
 
@@ -163,7 +174,7 @@ def test_individual_hf_experts_reject_mixed_layout(tmp_path, native_ep_layout):
         json.dumps({"weight_map": dict.fromkeys(weights, "model.safetensors")})
     )
     reader = GroupedExpertHuggingFaceStorageReader(
-        str(tmp_path), num_experts=3, native_ep_layout=native_ep_layout
+        str(tmp_path), layout=_reader_layout(native_ep_layout=native_ep_layout)
     )
     with pytest.raises(ValueError, match="fused"):
         reader.read_metadata()
@@ -172,7 +183,9 @@ def test_individual_hf_experts_reject_mixed_layout(tmp_path, native_ep_layout):
 @pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
 def test_individual_hf_expert_reads_only_requested_slice(tmp_path, projection):
     weights = _checkpoint(tmp_path)
-    reader = GroupedExpertHuggingFaceStorageReader(str(tmp_path), num_experts=3)
+    reader = GroupedExpertHuggingFaceStorageReader(
+        str(tmp_path), layout=_reader_layout()
+    )
     metadata = reader.read_metadata()
     reader.set_up_storage_reader(metadata, is_coordinator=True)
     prefix = "model.layers.0.mlp.experts."
@@ -205,7 +218,9 @@ def test_individual_hf_experts_reject_duplicate_numeric_index(tmp_path):
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": dict.fromkeys(weights, "model.safetensors")})
     )
-    reader = GroupedExpertHuggingFaceStorageReader(str(tmp_path), num_experts=3)
+    reader = GroupedExpertHuggingFaceStorageReader(
+        str(tmp_path), layout=_reader_layout()
+    )
     with pytest.raises(ValueError, match="Duplicate individual HF expert index"):
         reader.read_metadata()
 

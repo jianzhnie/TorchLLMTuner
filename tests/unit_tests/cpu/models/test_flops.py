@@ -21,8 +21,8 @@ import torch
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
+from llmtuner.models.flops import flops_per_token
 from llmtuner.utils.flops import (
-    flops_per_token,
     quadratic_attention_flops_per_token,
 )
 

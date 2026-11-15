@@ -13,9 +13,11 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
+from llmtuner.components.loss import cross_entropy_loss
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.datasets.contracts import Batch, DataloaderExhaustedError
 from llmtuner.models.configuration import build_model_config
+from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.runtime.batch import (
     batch_generator,
@@ -270,7 +272,7 @@ def main():
                 load=lambda step: False,
                 close=lambda closed=closed: closed.append("checkpoint"),
             )
-            with patch("llmtuner.trainer.trainer.Profiler") as profiler:
+            with patch("llmtuner.trainer.runtime.assembly.Profiler") as profiler:
                 try:
                     trainer.train()
                 except (ValueError, KeyboardInterrupt, SystemExit) as error:
@@ -437,8 +439,10 @@ def main():
             metrics.log_validation = lambda logs=logs, **values: logs.append(values)
 
             class ValidationModel:
+                execution_capabilities = ModelExecutionCapabilities()
+
                 def prepare_inputs(self, batch, **kwargs):
-                    return torch.ones(4), batch.labels, {}
+                    return torch.ones(4, dtype=torch.long), batch.labels, {}
 
                 def __call__(self, inputs):
                     return inputs * (rank + 1)
@@ -460,7 +464,7 @@ def main():
                 max_context_length=4,
                 chunked_loss_num_chunks=1,
                 param_context=trainer.param_context,
-                loss_sum=trainer.loss_sum,
+                loss_sum=cross_entropy_loss,
                 error_group=trainer.error_group,
             )
             with patch(

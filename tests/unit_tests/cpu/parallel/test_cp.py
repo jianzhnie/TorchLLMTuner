@@ -13,7 +13,17 @@ import torch
 from llmtuner.config import ParallelConfig
 from llmtuner.config.parallel_config import ContextParallelConfig
 from llmtuner.models.contracts import DecoderStructure
+from llmtuner.models.kimi.kimi_k3.delta_attention import KimiDeltaAttention
 from llmtuner.parallel.context_parallel import apply_cp
+
+
+def kda_validation_module(**attributes):
+    """Bind production KDA input checks without allocating projection weights."""
+    module = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    torch.nn.Module.__init__(module)
+    for name, value in attributes.items():
+        setattr(module, name, value)
+    return module
 
 
 def test_apply_cp_is_a_no_op_when_cp_is_off() -> None:
@@ -129,15 +139,13 @@ def test_kcp_reapplication_replaces_wrapper_and_updates_group(monkeypatch):
 
 
 def test_kcp_rejects_unit_convolution_before_loading_optional_runtime(monkeypatch):
-    from types import SimpleNamespace
-
     from llmtuner.parallel.context_parallel.kcp import kcp_kda_forward
 
     def runtime():
         pytest.fail("Invalid KCP convolution must fail before loading kernels")
 
     monkeypatch.setattr("llmtuner.parallel.context_parallel.kcp._kcp_runtime", runtime)
-    module = SimpleNamespace(q_conv1d=torch.nn.Conv1d(4, 4, kernel_size=1))
+    module = kda_validation_module(q_conv1d=torch.nn.Conv1d(4, 4, kernel_size=1))
     forward = kcp_kda_forward(lambda *args, **kwargs: None, group=None)
     with pytest.raises(ValueError, match="kernel size must be greater than 1"):
         forward(module, torch.zeros(1, 8, 4))
@@ -155,15 +163,13 @@ def test_kcp_rejects_unit_convolution_before_loading_optional_runtime(monkeypatc
 def test_kcp_rejects_invalid_kernel_options_before_import(
     monkeypatch, head_dim, lower_bound, message
 ):
-    from types import SimpleNamespace
-
     from llmtuner.parallel.context_parallel.kcp import kcp_kda_forward
 
     def runtime():
         pytest.fail("Invalid KCP options must fail before loading kernels")
 
     monkeypatch.setattr("llmtuner.parallel.context_parallel.kcp._kcp_runtime", runtime)
-    module = SimpleNamespace(
+    module = kda_validation_module(
         q_conv1d=torch.nn.Conv1d(4, 4, kernel_size=3),
         head_k_dim=head_dim,
         gate_lower_bound=lower_bound,
@@ -219,7 +225,11 @@ def test_kcp_rejects_nonlocal_mask_before_runtime(monkeypatch, shape):
     monkeypatch.setattr("llmtuner.parallel.context_parallel.kcp._kcp_runtime", runtime)
     forward = kcp_kda_forward(lambda *args, **kwargs: None, group=None)
     with pytest.raises(ValueError, match="attention_mask must match"):
-        forward(None, torch.ones(1, 4, 8), attention_mask=torch.ones(shape))
+        forward(
+            kda_validation_module(),
+            torch.ones(1, 4, 8),
+            attention_mask=torch.ones(shape),
+        )
 
 
 def test_kcp_rejects_empty_sequence_before_runtime(monkeypatch):
@@ -231,7 +241,7 @@ def test_kcp_rejects_empty_sequence_before_runtime(monkeypatch):
     monkeypatch.setattr("llmtuner.parallel.context_parallel.kcp._kcp_runtime", runtime)
     forward = kcp_kda_forward(lambda *args, **kwargs: None, group=None)
     with pytest.raises(ValueError, match="nonempty local sequence"):
-        forward(None, torch.empty(1, 0, 8))
+        forward(kda_validation_module(), torch.empty(1, 0, 8))
 
 
 @pytest.mark.parametrize("q_lora_rank", [None, 4])

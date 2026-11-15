@@ -122,7 +122,7 @@ def check_failure(phase, failing_rank, error_type):
         enabled = gc.isenabled()
         with (
             patch(
-                "llmtuner.trainer.trainer.Profiler",
+                "llmtuner.trainer.runtime.assembly.Profiler",
                 return_value=profiler,
             ),
             hook,

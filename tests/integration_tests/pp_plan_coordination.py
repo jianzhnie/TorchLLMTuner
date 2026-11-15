@@ -96,7 +96,7 @@ def main() -> None:
             parallel_dims=topology,
             device=device,
             global_batch_size=4,
-        )
+        ).execution
         assert len(setup.model_parts) == len(setup.stages) == 1
         assert setup.schedule is not None
         dist.barrier()
