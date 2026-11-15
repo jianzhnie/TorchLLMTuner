@@ -104,10 +104,8 @@ def run_case(*, device, latent, activation, empty):
     # Export full EP weights to the original individual-expert schema, then
     # reconstruct another independently converted/sharded model on each rank.
     state = ModelCheckpointState(model).state_dict()
-    adapter = ModelStateDictAdapter(
-        config, None, model_prefix="model.", expert_parallel=True
-    )
-    exported = adapter.to_hf({f"model.{key}": value for key, value in state.items()})
+    adapter = ModelStateDictAdapter(config, None, expert_parallel=True)
+    exported = adapter.to_hf(state)
     reference_state = {
         f"layers.0.block_sparse_moe.{key}": value
         for key, value in reference.state_dict().items()
@@ -127,10 +125,7 @@ def run_case(*, device, latent, activation, empty):
         decoder="", embedding="embedding", blocks="layers", norm="norm", head="head"
     )
     swap_moe_blocks(fresh, ep_group=dist.group.WORLD)
-    imported = {
-        key.removeprefix("model."): value
-        for key, value in adapter.from_hf(exported).items()
-    }
+    imported = adapter.from_hf(exported)
     ModelCheckpointState(fresh).load_state_dict(imported)
     torch.testing.assert_close(
         fresh_layer.block_sparse_moe(inputs), actual, atol=0, rtol=0

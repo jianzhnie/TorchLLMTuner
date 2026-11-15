@@ -67,7 +67,9 @@ def check_failure(failing_rank, error_type, phase):
 
             get_rng_state = torch.get_rng_state
             set_rng_state = torch.set_rng_state
-            close_input = validation_runtime.close_validation_dataloader
+            close_input = (
+                validation_runtime.ValidationDataLoaderResources.close_dataloader
+            )
             input_closed = False
             restore_calls = []
 
@@ -95,7 +97,11 @@ def check_failure(failing_rank, error_type, phase):
             with (
                 patch.object(torch, "get_rng_state", snapshot),
                 patch.object(torch, "set_rng_state", restore),
-                patch.object(validation_runtime, "close_validation_dataloader", close),
+                patch.object(
+                    validation_runtime.ValidationDataLoaderResources,
+                    "close_dataloader",
+                    close,
+                ),
             ):
                 caught = None
                 try:

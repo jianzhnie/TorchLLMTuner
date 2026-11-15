@@ -1514,7 +1514,7 @@ def test_the_synthetic_loader_still_refuses_to_rewind() -> None:
     for _ in range(6):
         next(iter(loader))
     with pytest.raises(ValueError, match="already yielded 6"):
-        loader.load_state_dict({"dp_world_size": 1, "steps": 5})
+        loader.load_state_dict({**loader.state_dict(), "steps": 5})
 
 
 def test_exclude_from_loading_accepts_the_dataloader_key(tmp_path) -> None:
@@ -1641,7 +1641,6 @@ def test_checkpointer_assembly_rejects_missing_dataloader(monkeypatch):
             dataloader=None,
             train_state=trainer.progress,
             device=torch.device("cpu"),
-            parallel_dims=None,
         )
 
 
@@ -3370,3 +3369,36 @@ def test_trainer_progress_is_shared_with_checkpoint_without_retaining_trainer():
     del trainer
     assert trainer_reference() is None
     assert checkpoint_state.state_dict() == {"step": 6, "ntokens_seen": 96}
+
+
+def test_batch_transfer_moves_nested_inputs_without_mutating_host_batch():
+    from collections import namedtuple
+
+    Frame = namedtuple("Frame", ["pixels", "timestamp"])
+    metadata = object()
+    batch = {
+        "input": torch.ones(2, dtype=torch.int64),
+        "labels": torch.zeros(2, dtype=torch.int64),
+        "media": [
+            {"frames": (Frame(torch.ones(3, 2, 2), 0.5),)},
+            torch.ones(3),
+        ],
+        "metadata": metadata,
+        "optional": None,
+    }
+    moved = move_batch_to_device(batch, torch.device("meta"))
+    assert moved is not batch
+    assert moved["input"].device.type == "meta"
+    assert moved["labels"].device.type == "meta"
+    assert isinstance(moved["media"], list)
+    assert isinstance(moved["media"][0]["frames"], tuple)
+    frame = moved["media"][0]["frames"][0]
+    assert isinstance(frame, Frame)
+    assert frame.pixels.device.type == "meta"
+    assert frame.timestamp == 0.5
+    assert moved["media"][1].device.type == "meta"
+    assert moved["metadata"] is metadata
+    assert moved["optional"] is None
+    assert batch["input"].device.type == "cpu"
+    assert batch["media"][0]["frames"][0].pixels.device.type == "cpu"
+    assert batch["media"][1].device.type == "cpu"

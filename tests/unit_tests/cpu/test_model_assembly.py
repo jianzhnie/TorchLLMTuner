@@ -266,7 +266,6 @@ def test_checkpointer_consumes_explicit_runtime_owners(monkeypatch) -> None:
         dataloader=dataloader,
         train_state=train_state,
         device=torch.device("cpu"),
-        parallel_dims=None,
         error_group=error_group,
     )
 

@@ -618,6 +618,9 @@ def test_tp_constructor_failure_preserves_modules_and_allows_retry(monkeypatch):
     from llmtuner.parallel.tensor_parallel import tensor_parallel as tp_module
 
     class FailingProjection(nn.Module):
+        shard_dim = 1
+        sequence_transform = "scatter"
+
         def __init__(self, weight, **kwargs):
             super().__init__()
             raise RuntimeError("projection construction failed")
@@ -687,3 +690,122 @@ def test_full_history_attention_uses_declaration_without_storage_inference() -> 
     recurrent.requires_full_token_history = True
     assert requires_full_token_history(recurrent)
     assert not requires_full_token_history(nn.MultiheadAttention(4, 1))
+
+
+@pytest.mark.parametrize("kind", ["colwise", "rowwise"])
+def test_custom_projection_requires_explicit_axis_declaration(kind):
+    class UndeclaredProjection(nn.Module):
+        pass
+
+    with pytest.raises(ValueError, match="shard kind disagrees"):
+        ShardingConfig(
+            kind=kind,
+            implementation=UndeclaredProjection,
+            sequence_transform="preserve",
+        )
+
+
+@pytest.mark.parametrize("dimension", [True, 0.0, 1, None])
+def test_custom_projection_axis_must_be_exact_declared_integer(dimension):
+    class Projection(nn.Module):
+        shard_dim = dimension
+        sequence_transform = "preserve"
+
+    with pytest.raises(ValueError, match="shard kind disagrees"):
+        ShardingConfig(
+            kind="colwise", implementation=Projection, sequence_transform="preserve"
+        )
+
+
+def test_custom_projection_requires_matching_sequence_declaration():
+    class Projection(nn.Module):
+        shard_dim = 0
+        sequence_transform = "gather"
+
+    with pytest.raises(ValueError, match="sequence transform disagrees"):
+        ShardingConfig(
+            kind="colwise", implementation=Projection, sequence_transform="preserve"
+        )
+
+
+def test_custom_projection_instance_cannot_override_declared_layout():
+    class Projection(nn.Module):
+        shard_dim = 0
+        sequence_transform = "preserve"
+
+    spec = ShardingConfig(
+        kind="colwise", implementation=Projection, sequence_transform="preserve"
+    )
+    instance = Projection()
+    instance.sequence_transform = "gather"
+    with pytest.raises(ValueError, match="sequence transform disagrees"):
+        spec.validate_implementation(instance)
+
+
+def test_custom_projection_layout_failure_preserves_all_original_targets(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.tensor_parallel import tensor_parallel as tp_module
+
+    class InconsistentProjection(nn.Module):
+        shard_dim = 0
+        sequence_transform = "gather"
+
+        def __init__(self, weight, **kwargs):
+            super().__init__()
+            self.sequence_transform = "preserve"
+
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
+    original = tuple(model)
+    mesh = {
+        "tp": SimpleNamespace(
+            get_group=lambda: None, size=lambda: 2, get_local_rank=lambda: 0
+        )
+    }
+    monkeypatch.setattr(tp_module, "supports_symm_mem", lambda mesh: False)
+    with pytest.raises(ValueError, match="sequence transform disagrees"):
+        apply_tp(
+            model,
+            mesh,
+            ParallelConfig(tensor_parallel_size=2),
+            plan={
+                "0": colwise(),
+                "1": ShardingConfig(
+                    kind="colwise",
+                    implementation=InconsistentProjection,
+                    sequence_transform="gather",
+                ),
+            },
+        )
+    assert all(
+        actual is expected for actual, expected in zip(model, original, strict=True)
+    )
+
+
+def test_tp_configures_declared_sequence_metadata_from_bound_plan(monkeypatch):
+    from types import SimpleNamespace
+
+    from llmtuner.parallel.tensor_parallel import tensor_parallel as tp_module
+
+    class DeclaredModel(nn.Sequential):
+        def configure_sequence_parallel(self, *, degree, rank):
+            self.coordinates = (degree, rank)
+
+    model = DeclaredModel(nn.Linear(4, 4, bias=False))
+    mesh = {
+        "tp": SimpleNamespace(
+            get_group=lambda: None, size=lambda: 2, get_local_rank=lambda: 1
+        )
+    }
+    monkeypatch.setattr(tp_module, "supports_symm_mem", lambda mesh: False)
+    resolved = tp_module.resolve_tp_plan(
+        model, cfg=ParallelConfig(tensor_parallel_size=2), plan={"0": "colwise"}
+    )
+    assert not hasattr(model, "coordinates")
+    metadata = [target for target in resolved.targets if target.kind == "decoder"]
+    assert len(metadata) == 1
+    assert metadata[0].module is model
+    apply_tp(
+        model, mesh, ParallelConfig(tensor_parallel_size=2), resolved_plan=resolved
+    )
+    assert model.coordinates == (2, 1)

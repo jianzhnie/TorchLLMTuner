@@ -47,12 +47,9 @@ def _checkpoint(tmp_path, *, missing=False):
     return weights
 
 
-@pytest.mark.parametrize("model_prefix", ["", "model."])
 @pytest.mark.parametrize("thread_count", [1, 2])
 @pytest.mark.parametrize("indexed", [False, True])
-def test_individual_hf_experts_load_into_fused_tensors(
-    tmp_path, thread_count, indexed, model_prefix
-):
+def test_individual_hf_experts_load_into_fused_tensors(tmp_path, thread_count, indexed):
     weights = _checkpoint(tmp_path)
     if not indexed:
         (tmp_path / "model.safetensors.index.json").unlink()
@@ -72,14 +69,13 @@ def test_individual_hf_experts_load_into_fused_tensors(
             json.dumps({"weight_map": weight_map})
         )
     config = SimpleNamespace(model_type="qwen3_moe", num_experts=3)
-    adapter = ModelStateDictAdapter(config, str(tmp_path), model_prefix=model_prefix)
+    adapter = ModelStateDictAdapter(config, str(tmp_path))
     prefix = "model.layers.0.mlp.experts."
     destination = {
         prefix + "gate_up_proj": torch.empty(3, 4, 4),
         prefix + "down_proj": torch.empty(3, 4, 2),
     }
-    wrapper = {model_prefix + key: value for key, value in destination.items()}
-    assert set(adapter.to_hf(wrapper)) == set(destination)
+    assert set(adapter.to_hf(destination)) == set(destination)
     dcp.load(
         destination,
         storage_reader=adapter.get_hf_storage_reader(
@@ -114,8 +110,7 @@ def test_individual_hf_experts_reject_missing_projection(tmp_path):
         reader.read_metadata()
 
 
-@pytest.mark.parametrize("model_prefix", ["", "model."])
-def test_individual_hf_experts_load_native_ep_stacks(tmp_path, model_prefix):
+def test_individual_hf_experts_load_native_ep_stacks(tmp_path):
     weights = _checkpoint(tmp_path)
     prefix = "model.layers.0.mlp."
     gate = torch.arange(12, dtype=torch.float32).reshape(3, 4)
@@ -136,20 +131,17 @@ def test_individual_hf_experts_load_native_ep_stacks(tmp_path, model_prefix):
         SimpleNamespace(model_type="qwen3_moe", num_experts=3),
         str(tmp_path),
         expert_parallel=True,
-        model_prefix=model_prefix,
     )
-    wrapped = {model_prefix + key: value for key, value in destination.items()}
-    wrapped[model_prefix + prefix + "router.gate.weight"] = torch.full_like(
-        gate, float("nan")
-    )
-    hf_state = adapter.to_hf(wrapped)
+    native_state = dict(destination)
+    native_state[prefix + "router.gate.weight"] = torch.full_like(gate, float("nan"))
+    hf_state = adapter.to_hf(native_state)
     assert prefix + "gate.weight" in hf_state
     assert prefix + "router.gate.weight" not in hf_state
-    assert set(adapter.from_hf(hf_state)) == set(wrapped)
+    assert set(adapter.from_hf(hf_state)) == set(native_state)
     dcp.load(hf_state, storage_reader=adapter.get_hf_storage_reader(str(tmp_path)))
     restored = adapter.from_hf(hf_state)
     torch.testing.assert_close(
-        restored[model_prefix + prefix + "router.gate.weight"], gate, atol=0, rtol=0
+        restored[prefix + "router.gate.weight"], gate, atol=0, rtol=0
     )
     for projection, role in (
         ("gate_proj", "w1_EFD"),

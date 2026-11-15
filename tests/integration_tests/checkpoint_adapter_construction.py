@@ -66,7 +66,6 @@ def main():
                         dataloader=loader(2),
                         train_state=None,
                         device=torch.device("cpu"),
-                        parallel_dims=None,
                     )
                     caught = None
                     try:

@@ -354,7 +354,7 @@ def test_snapshots_are_written_on_the_frequency(tmp_path, writable_snapshots) ->
         leaf_folder="",
         rank=0,
         max_entries=100,
-    )
+    ).start()
 
     for _ in range(4):
         profiler.step()
@@ -377,7 +377,7 @@ def test_the_exit_snapshot_names_the_step_that_failed(
         leaf_folder="",
         rank=0,
         max_entries=100,
-    )
+    ).start()
 
     profiler.step(exit_ctx=True)
 
@@ -394,7 +394,7 @@ def test_the_snapshot_file_is_named_for_the_rank_and_step(
         leaf_folder="",
         rank=3,
         max_entries=100,
-    )
+    ).start()
 
     profiler.step()
 
@@ -414,7 +414,7 @@ def test_the_snapshot_uses_protocol_4(tmp_path, writable_snapshots) -> None:
         leaf_folder="",
         rank=0,
         max_entries=100,
-    )
+    ).start()
 
     profiler.step()
 
@@ -439,7 +439,7 @@ def test_a_worker_directory_is_nested_under_the_step(
         leaf_folder="worker_1",
         rank=0,
         max_entries=100,
-    )
+    ).start()
 
     profiler.step()
 
@@ -485,7 +485,7 @@ def test_a_memory_profiler_without_allocator_history_warns_and_writes_nothing(
         leaf_folder="",
         rank=0,
         max_entries=100,
-    )
+    ).start()
 
     for _ in range(3):
         profiler.step()
@@ -815,7 +815,7 @@ def test_memory_history_stops_after_snapshot_and_preserves_training_error(
     monkeypatch.setattr(profiler_module, "stop_memory_history", stop_history)
     memory = MemoryProfiler(
         step_num=0, freq=10, snapshot_dir="", leaf_folder="", rank=0, max_entries=100
-    )
+    ).start()
     monkeypatch.setattr(memory, "step", lambda **_: calls.append("snapshot"))
     profiler = Profiler(Config())
     profiler.memory_profiler = memory
@@ -881,7 +881,7 @@ def test_invalid_memory_profiler_arguments_do_not_start_history(
     )
     arguments[field] = value
     with pytest.raises(ValueError, match=field):
-        MemoryProfiler(**arguments)
+        MemoryProfiler(**arguments).start()
     assert calls == []
 
 
@@ -901,7 +901,7 @@ def test_overlapping_memory_profilers_share_history_until_last_close(
     profilers = [
         MemoryProfiler(
             step_num=0, freq=1, snapshot_dir="", leaf_folder="", rank=0, max_entries=100
-        )
+        ).start()
         for _ in range(2)
     ]
     try:
@@ -928,7 +928,7 @@ def test_conflicting_memory_history_capacity_does_not_restart_owner(monkeypatch)
     )
     owner = MemoryProfiler(
         step_num=0, freq=1, snapshot_dir="", leaf_folder="", rank=0, max_entries=100
-    )
+    ).start()
     try:
         with pytest.raises(ValueError, match="identical max_entries"):
             MemoryProfiler(
@@ -938,7 +938,7 @@ def test_conflicting_memory_history_capacity_does_not_restart_owner(monkeypatch)
                 leaf_folder="",
                 rank=0,
                 max_entries=200,
-            )
+            ).start()
         assert calls == ["start"]
         assert owner._records_history
     finally:
@@ -958,7 +958,7 @@ def test_failed_snapshot_does_not_publish_partial_file(
         leaf_folder="",
         rank=0,
         max_entries=100,
-    )
+    ).start()
     directory = tmp_path / MEMORY_STEP_DIR.format(step=1)
     directory.mkdir()
     destination = directory / profiler_module.MEMORY_FILE.format(rank=0, step=1)
@@ -1115,3 +1115,74 @@ def test_missing_npu_profiler_preserves_dependency_failure(tmp_path, monkeypatch
     with pytest.raises(ImportError, match="requires a working torch-npu") as failure:
         profiler.build_torch_profiler()
     assert failure.value.__cause__ is cause
+
+
+def test_memory_profiler_construction_does_not_start_history(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        profiler_module, "record_memory_history", lambda **kwargs: calls.append(kwargs)
+    )
+    memory = MemoryProfiler(
+        step_num=0, freq=1, snapshot_dir="", leaf_folder="", rank=0, max_entries=100
+    )
+    assert calls == []
+    with pytest.raises(RuntimeError, match="must be started"):
+        memory.step()
+    memory.close()
+    assert calls == []
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_partial_memory_startup_retains_owner_for_shutdown_retry(
+    monkeypatch, tmp_path, cleanup_fails
+):
+    profiler = Profiler(Config(enable_memory_snapshot=True), base_folder=str(tmp_path))
+    calls = []
+    failure = RuntimeError("allocator started then failed")
+
+    def start(**kwargs):
+        assert profiler.memory_profiler is not None
+        assert profiler.memory_profiler in MemoryProfiler._history_owners
+        calls.append("start")
+        raise failure
+
+    def stop():
+        calls.append("stop")
+        if cleanup_fails and calls.count("stop") == 1:
+            raise OSError("allocator shutdown failed")
+
+    monkeypatch.setattr(profiler_module, "record_memory_history", start)
+    monkeypatch.setattr(profiler_module, "stop_memory_history", stop)
+    with pytest.raises(RuntimeError) as caught:
+        profiler.__enter__()
+    assert caught.value is failure
+    assert calls == ["start", "stop"]
+    if cleanup_fails:
+        retained = profiler.memory_profiler
+        assert retained in MemoryProfiler._history_owners
+        other = MemoryProfiler(
+            step_num=0,
+            freq=1,
+            snapshot_dir="",
+            leaf_folder="",
+            rank=0,
+            max_entries=retained._max_entries,
+        )
+        with pytest.raises(RuntimeError, match="close its owner first"):
+            other.start()
+        profiler.close()
+        assert retained not in MemoryProfiler._history_owners
+        assert calls == ["start", "stop", "stop"]
+    assert profiler.memory_profiler is None
+
+
+def test_memory_builder_does_not_overwrite_pending_owner(monkeypatch, tmp_path):
+    profiler = Profiler(Config(enable_memory_snapshot=True), base_folder=str(tmp_path))
+    monkeypatch.setattr(
+        profiler_module, "record_memory_history", lambda **kwargs: False
+    )
+    original = profiler.build_memory_profiler()
+    with pytest.raises(RuntimeError, match="cleanup is pending"):
+        profiler.build_memory_profiler()
+    assert profiler.memory_profiler is original
+    profiler.close()

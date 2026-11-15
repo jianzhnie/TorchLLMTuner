@@ -312,3 +312,40 @@ def test_owned_flat_logits_and_hidden_only_ignore_tuple_setting(
     assert not head_calls
     assert hidden.shape == (3, config.hidden_size)
     torch.testing.assert_close(model.lm_head(hidden), logits, rtol=0, atol=0)
+
+
+def test_decoder_sequence_metadata_uses_explicit_coordinates_without_attention_group(
+    monkeypatch,
+):
+    from llmtuner.models.qwen.qwen3 import model as model_module
+
+    config = Qwen3MoeConfig(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=8,
+        moe_intermediate_size=4,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=8,
+        num_experts=2,
+        num_experts_per_tok=1,
+    )
+    model = Qwen3MoeModel(config)
+    # A local decoder may own no attention blocks after pipeline partitioning.
+    model.layers = torch.nn.ModuleList()
+    model.configure_sequence_parallel(degree=2, rank=1)
+    observed = {}
+
+    def mask(**kwargs):
+        observed["length"] = kwargs["inputs_embeds"].shape[1]
+        observed["positions"] = kwargs["position_ids"].clone()
+        return None
+
+    monkeypatch.setattr(model_module, "create_causal_mask", mask)
+    model(torch.ones(1, 2, dtype=torch.long), use_cache=False)
+    assert observed["length"] == 4
+    torch.testing.assert_close(observed["positions"], torch.arange(4).unsqueeze(0))
+    for degree, rank in ((True, 0), (0, 0), (2, True), (2, -1), (2, 2)):
+        with pytest.raises(ValueError, match="Sequence parallel"):
+            model.configure_sequence_parallel(degree=degree, rank=rank)

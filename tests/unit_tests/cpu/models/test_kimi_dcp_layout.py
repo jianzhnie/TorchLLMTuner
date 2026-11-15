@@ -1,7 +1,5 @@
 """Real DCP storage migrations between Kimi individual and grouped experts."""
 
-from functools import partial
-
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
@@ -21,9 +19,6 @@ from llmtuner.components.optimizer.state_dict import (
 from llmtuner.models.kimi.kimi_k3.checkpoint import convert_kimi_optimizer_state
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from tests.unit_tests.cpu.parallel.test_kimi_conversion import make_model
-
-# These fixtures deliberately exercise the historical wrapper state prefix.
-legacy_adapter = partial(ModelStateDictAdapter, model_prefix="model.")
 
 
 @pytest.mark.parametrize(
@@ -71,7 +66,7 @@ def test_dcp_kimi_layout_restores_weights_moments_and_next_update(
         def set_extra_state(self, state):
             self.extra = state
 
-    # Register under model so FQNs match the real HF wrapper schema.
+    # Register the decoder under its model-owned checkpoint namespace.
     def build():
         wrapper = Wrapper()
         wrapper.model = make_model(latent=True, shared=1)
@@ -107,7 +102,7 @@ def test_dcp_kimi_layout_restores_weights_moments_and_next_update(
         swap_moe_blocks(target.model)
     target_optimizer = OptimizerState(target)
     target_ema = EMA(model_parts=[target], decay=0.5)
-    adapter = legacy_adapter(config, None, expert_parallel=not source_grouped)
+    adapter = ModelStateDictAdapter(config, None, expert_parallel=not source_grouped)
     assert load_changed_source_layout(
         str(tmp_path),
         states={
@@ -161,7 +156,7 @@ def test_invalid_cross_layout_model_leaves_target_weights_intact(tmp_path, corru
     target.model = make_model(latent=True, shared=1)
     swap_moe_blocks(target.model)
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = legacy_adapter(config, None, expert_parallel=True)
+    adapter = ModelStateDictAdapter(config, None, expert_parallel=True)
     with pytest.raises(ValueError, match="missing keys|has shape"):
         load_changed_source_layout(
             str(tmp_path),
@@ -206,7 +201,7 @@ def test_invalid_cross_layout_training_state_preserves_model(
         else EMA(model_parts=[target], decay=0.5)
     )
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = legacy_adapter(config, None, expert_parallel=True)
+    adapter = ModelStateDictAdapter(config, None, expert_parallel=True)
     with pytest.raises(ValueError, match="missing required key|has shape"):
         load_changed_source_layout(
             str(tmp_path),
@@ -241,7 +236,7 @@ def test_saved_amsgrad_validated_before_model_with_fresh_non_amsgrad(
     swap_moe_blocks(target.model)
     target_state = OptimizerState(target, amsgrad=False)
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = legacy_adapter(config, None, expert_parallel=True)
+    adapter = ModelStateDictAdapter(config, None, expert_parallel=True)
     with pytest.raises(ValueError, match="missing required key|has shape"):
         load_changed_source_layout(
             str(tmp_path),
@@ -270,7 +265,7 @@ def test_cross_layout_checkpoint_without_requested_rng_rejects_restore(
         swap_moe_blocks(target.model)
     rng = RNGCheckpointState(torch.device("cpu"))
     rng_before = torch.get_rng_state().clone()
-    adapter = legacy_adapter(config, None, expert_parallel=not source_grouped)
+    adapter = ModelStateDictAdapter(config, None, expert_parallel=not source_grouped)
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
     with pytest.raises(
         ValueError, match="missing training state categories.*rng_state"
@@ -306,7 +301,7 @@ def test_cross_layout_rng_missing_current_rank_rejected_before_model_copy(
         swap_moe_blocks(target.model)
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
     rng_before = torch.get_rng_state().clone()
-    adapter = legacy_adapter(config, None, expert_parallel=not source_grouped)
+    adapter = ModelStateDictAdapter(config, None, expert_parallel=not source_grouped)
     with pytest.raises(KeyError, match="rank_0"):
         load_changed_source_layout(
             str(tmp_path),
@@ -345,7 +340,7 @@ def test_cross_layout_compiled_name_collision_preserves_target(tmp_path, categor
             else EMA(model_parts=[target], decay=0.5)
         )
     snapshot = {key: value.clone() for key, value in target.state_dict().items()}
-    adapter = legacy_adapter(config, None, expert_parallel=True)
+    adapter = ModelStateDictAdapter(config, None, expert_parallel=True)
     with pytest.raises(ValueError, match="Ambiguous compiled Kimi checkpoint keys"):
         load_changed_source_layout(str(tmp_path), states=states, adapter=adapter)
     for key, value in target.state_dict().items():

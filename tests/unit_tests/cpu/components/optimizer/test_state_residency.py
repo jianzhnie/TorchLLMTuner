@@ -377,7 +377,6 @@ def test_disabled_checkpoint_does_not_validate_virtual_checkpoint_options():
             dataloader=None,
             train_state=None,
             device=torch.device("cpu"),
-            parallel_dims=None,
         )
 
 

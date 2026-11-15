@@ -179,7 +179,6 @@ def prepare_contract(model_path: str, dataset_path: str):
         },
         ema=None,
         ema_values={},
-        model_prefix="",
     )
     contract.validate()
     return contract, ownership

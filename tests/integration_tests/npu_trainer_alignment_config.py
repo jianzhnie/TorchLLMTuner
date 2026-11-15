@@ -365,7 +365,6 @@ def configure_baseline_30b(config: Any, world_size: int) -> list[dict[str, Any]]
     config.checkpoint.initial_load_path = model_path
     config.checkpoint.initial_load_model_only = True
     config.checkpoint.initial_load_in_hf = True
-    config.checkpoint.initial_load_in_hf_quantized = False
     disabled = _disable_moe_balancing(config.model_spec.model)
     if not any(item["path"].endswith("load_balance_coeff") for item in disabled):
         raise ValueError("30B baseline did not expose load_balance_coeff to disable")

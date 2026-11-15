@@ -60,17 +60,15 @@ def main() -> None:
             )
         dist.barrier()
 
-        model = torch.nn.Module()
-        model.model = torch.nn.Linear(3, 2, device=device)
+        model = torch.nn.Linear(3, 2, device=device)
         with torch.no_grad():
-            model.model.weight.zero_()
-            model.model.bias.zero_()
+            model.weight.zero_()
+            model.bias.zero_()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
         adapter = ModelStateDictAdapter(
             SimpleNamespace(model_type="llama", tie_word_embeddings=False),
             str(source),
-            model_prefix="model.",
         )
         manager = DistributedCheckpointManager(
             CheckpointConfig(
@@ -93,10 +91,8 @@ def main() -> None:
             key: value.detach().clone() for key, value in model.state_dict().items()
         }
         expected = {
-            "model.weight": torch.arange(6, device=device, dtype=torch.float32).reshape(
-                2, 3
-            ),
-            "model.bias": torch.tensor([0.25, -0.5], device=device),
+            "weight": torch.arange(6, device=device, dtype=torch.float32).reshape(2, 3),
+            "bias": torch.tensor([0.25, -0.5], device=device),
         }
         try:
             scenarios = (
@@ -112,7 +108,7 @@ def main() -> None:
                     if rank == failing_rank:
                         if failure == "adapter":
                             raise ValueError("injected rank-local HF adapter failure")
-                        result["model.weight"] = result["model.weight"][:1]
+                        result["weight"] = result["weight"][:1]
                     return result
 
                 adapter.from_hf = injected
@@ -130,7 +126,6 @@ def main() -> None:
                         {MODEL: manager.states[MODEL]},
                         str(source),
                         from_hf=True,
-                        from_quantized=False,
                     )
                 except (ValueError, RuntimeError) as caught:
                     error = caught
@@ -163,7 +158,6 @@ def main() -> None:
                     {MODEL: manager.states[MODEL]},
                     str(source),
                     from_hf=True,
-                    from_quantized=False,
                 )
                 torch.testing.assert_close(model.state_dict(), expected, rtol=0, atol=0)
                 print(f"PASS HF {failure} failure/retry rank={rank}", flush=True)

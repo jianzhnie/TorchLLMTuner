@@ -465,13 +465,17 @@ def test_model_restore_allows_auxiliary_checkpoint_categories():
     torch.testing.assert_close(state.state_dict(), saved, rtol=0, atol=0)
 
 
-def test_model_restore_keeps_legacy_scalar_buffer_compatibility():
-    model = nn.Module()
+def test_model_restore_rejects_old_scalar_shape_before_copying_any_state():
+    model = nn.Linear(2, 2)
     model.register_buffer("counter", torch.tensor(0))
     state = ModelCheckpointState(model)
-    state.load_state_dict({"counter": torch.tensor([3])})
-    assert model.counter.ndim == 0
-    assert model.counter.item() == 3
+    original = {key: value.clone() for key, value in model.state_dict().items()}
+    incoming = {key: value.clone() + 1 for key, value in original.items()}
+    incoming["counter"] = torch.tensor([3])
+    with pytest.raises(ValueError, match="counter.*shape"):
+        state.load_state_dict(incoming)
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, original[key], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("view", ["transpose", "offset"])
@@ -528,3 +532,46 @@ def test_dcp_restores_shared_buffers_and_storage_views_in_new_model(tmp_path):
     assert target.child.tail.storage_offset() == target.matrix.stride(0)
     torch.testing.assert_close(target.matrix, original)
     torch.testing.assert_close(target.child.tail, original[1:])
+
+
+@pytest.mark.parametrize("operation", ["export", "restore"])
+@pytest.mark.parametrize("change", ["topology", "execution"])
+def test_checkpoint_rejects_layout_metadata_changes_before_state_hooks(
+    monkeypatch, operation, change
+):
+    from dataclasses import replace
+
+    from llmtuner.models.execution import ModelExecutionCapabilities
+    from llmtuner.parallel.assembly import capture_model_part_layouts
+    from llmtuner.parallel.execution import ExecutionLayout
+    from llmtuner.parallel.topology import ParallelTopologySnapshot
+
+    model = nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
+    layouts = capture_model_part_layouts([model])
+    layout = layouts[0]
+    layout.topology = ParallelTopologySnapshot()
+    layout.execution = ExecutionLayout(
+        output="logits",
+        sequence_shard_axes=(),
+        vocabulary_sharded=False,
+        vocabulary_size=None,
+        capabilities=model.execution_capabilities,
+        chunked_loss=False,
+    )
+    wrapper = ModelCheckpointState(model, runtime_layouts=layouts)
+    if change == "topology":
+        layout.topology = ParallelTopologySnapshot(dp_shard=2, world_size=2)
+    else:
+        layout.execution = replace(layout.execution, chunked_loss=True)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Changed layout reached a model state hook")
+
+    monkeypatch.setattr(model, "state_dict", unexpected)
+    monkeypatch.setattr(model, "load_state_dict", unexpected)
+    with pytest.raises(ValueError, match="Checkpoint layout metadata changed"):
+        if operation == "export":
+            wrapper.state_dict()
+        else:
+            wrapper.load_state_dict({})

@@ -334,3 +334,34 @@ def test_pipeline_preflight_compares_count_then_pipeline_geometry(
         assert preprocessed == [batch]
         assert communicated == [error_group, pp_group]
         assert phases[-1] == "Pipeline input geometry"
+
+
+def test_pipeline_splits_nested_row_aligned_inputs_without_mutating_source():
+    labels = torch.arange(12).reshape(4, 3)
+    frames = torch.arange(24).reshape(4, 2, 3)
+    batch = {
+        "input": labels,
+        "labels": labels,
+        "media": [{"frames": frames, "scale": torch.tensor(0.5)}],
+        "metadata": "video",
+    }
+    chunks = split_pipeline_microbatches(batch, num_microbatches=2)
+    assert len(chunks) == 2
+    for index, chunk in enumerate(chunks):
+        torch.testing.assert_close(
+            chunk["media"][0]["frames"], frames[index * 2 : (index + 1) * 2]
+        )
+        assert chunk["media"][0]["scale"] is batch["media"][0]["scale"]
+        assert chunk["metadata"] == "video"
+    assert batch["media"][0]["frames"] is frames
+    assert frames.shape == (4, 2, 3)
+
+
+def test_pipeline_rejects_nested_media_without_row_alignment():
+    batch = {
+        "input": torch.ones(4, 3, dtype=torch.long),
+        "labels": torch.ones(4, 3, dtype=torch.long),
+        "media": {"patches": [torch.ones(7, 2)]},
+    }
+    with pytest.raises(ValueError, match="field 'media'.*row-aligned"):
+        split_pipeline_microbatches(batch, num_microbatches=2)

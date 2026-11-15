@@ -2112,7 +2112,7 @@ def test_synthetic_loader_rejects_invalid_cursor_without_advancing(cursor):
     reference = RandomTokenDataLoader(seed=42, vocab_size=16, batch_size=2, seq_len=4)
     before = loader.state_dict()
     with pytest.raises(ValueError, match="nonnegative integer"):
-        loader.load_state_dict({"dp_world_size": 1, "steps": cursor})
+        loader.load_state_dict({**before, "steps": cursor})
     assert loader.state_dict() == before
     torch.testing.assert_close(
         next(iter(loader)).input_ids, next(iter(reference)).input_ids
@@ -2284,7 +2284,7 @@ def test_synthetic_resume_updates_existing_iterators():
     active = iter(loader)
     next(active)
     checkpoint = loader.state_dict()
-    checkpoint["steps"] = 10
+    checkpoint["steps"] = {"1": 10}
     loader.load_state_dict(checkpoint)
 
     reference = RandomTokenDataLoader(**settings)
@@ -4099,3 +4099,34 @@ def test_chat_processor_forwards_explicit_template_options(tokenizer):
     boundary = len(tokenizer.encode(prompt, add_bos=True, add_eos=False)) - 1
     assert np.all(sequence.labels[:boundary] == IGNORE_INDEX)
     assert np.any(sequence.labels[boundary:] != IGNORE_INDEX)
+
+
+@pytest.mark.parametrize("missing", ["all", "batch_layout", "rank_steps"])
+def test_synthetic_restore_rejects_incomplete_state_before_advancing(missing):
+    settings = dict(
+        seed=42, vocab_size=16, batch_size=4, seq_len=8, dp_rank=1, dp_world_size=2
+    )
+    loader = RandomTokenDataLoader(**settings)
+    reference = RandomTokenDataLoader(**settings)
+    before = loader.state_dict()
+    incoming = loader.state_dict()
+    if missing == "all":
+        incoming = {}
+    elif missing == "batch_layout":
+        incoming.pop("batch_layout")
+    else:
+        incoming["steps"] = 10
+    with pytest.raises(ValueError):
+        loader.load_state_dict(incoming)
+    assert loader.state_dict() == before
+    torch.testing.assert_close(
+        next(iter(loader)).input_ids, next(iter(reference)).input_ids
+    )
+
+
+def test_grain_restore_rejects_empty_state_before_accessing_live_iterator():
+    from llmtuner.datasets.dataloader import GrainDataLoader
+
+    loader = GrainDataLoader.__new__(GrainDataLoader)
+    with pytest.raises(ValueError, match="state version"):
+        loader.load_state_dict({})

@@ -119,8 +119,7 @@ def main() -> None:
                         for param in model.parameters()
                     )
                     assert model.lm_head.weight is model.model.embed_tokens.weight
-                    wrapper = torch.nn.ModuleDict({"model": model})
-                    optimizer = torch.optim.AdamW(wrapper.parameters())
+                    optimizer = torch.optim.AdamW(model.parameters())
                     assets = None
                     if indexed:
                         assets = Path(paths[0]) / f"source-{engine}"
@@ -138,9 +137,7 @@ def main() -> None:
                                 json.dumps({"weight_map": weight_map})
                             )
                         dist.barrier()
-                    adapter = ModelStateDictAdapter(
-                        config, assets, model_prefix="model."
-                    )
+                    adapter = ModelStateDictAdapter(config, assets)
                     if indexed:
                         assert adapter._hf_keys == set(expected_state)
                         assert adapter.fqn_to_index_mapping == {
@@ -152,7 +149,7 @@ def main() -> None:
                         CheckpointConfig(
                             enable=True, last_save_in_hf=True, keep_latest_k=0
                         ),
-                        model_parts=[wrapper],
+                        model_parts=[model],
                         optimizer=optimizer,
                         lr_scheduler=torch.optim.lr_scheduler.LambdaLR(
                             optimizer, lambda _: 1

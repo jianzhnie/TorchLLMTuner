@@ -224,15 +224,6 @@ def test_config_rejects_a_relative_initial_load_path() -> None:
     raise AssertionError("a relative initial_load_path should be rejected")
 
 
-def test_config_rejects_hf_quantized_without_hf() -> None:
-    try:
-        Config(initial_load_in_hf_quantized=True)
-    except ValueError as error:
-        assert "initial_load_in_hf" in str(error)
-        return
-    raise AssertionError("quantized-without-hf should be rejected")
-
-
 def test_config_rejects_hf_safetensors_against_a_remote_folder() -> None:
     """Remote IO supports only the native DCP format."""
     try:
@@ -841,25 +832,13 @@ def _hf_manager_stub(tmp_path, monkeypatch, *, files=(), hf_metadata=_HF_METADAT
     return manager, calls, MODEL
 
 
-def test_hf_load_rejects_quantized_exports(tmp_path, monkeypatch) -> None:
-    import pytest
-
-    manager, _, MODEL = _hf_manager_stub(tmp_path, monkeypatch)
-    with pytest.raises(ValueError, match="quantized"):
-        manager._load_checkpoint(
-            {MODEL: object()}, str(tmp_path), from_hf=True, from_quantized=True
-        )
-
-
 def test_hf_load_requires_a_state_dict_adapter(tmp_path, monkeypatch) -> None:
     import pytest
 
     manager, _, MODEL = _hf_manager_stub(tmp_path, monkeypatch)
     manager.sd_adapter = None
     with pytest.raises(ValueError, match="sd_adapter"):
-        manager._load_checkpoint(
-            {MODEL: object()}, str(tmp_path), from_hf=True, from_quantized=False
-        )
+        manager._load_checkpoint({MODEL: object()}, str(tmp_path), from_hf=True)
 
 
 def test_hf_load_reports_a_backend_without_hf_metadata(tmp_path, monkeypatch) -> None:
@@ -867,9 +846,7 @@ def test_hf_load_reports_a_backend_without_hf_metadata(tmp_path, monkeypatch) ->
 
     manager, _, MODEL = _hf_manager_stub(tmp_path, monkeypatch, hf_metadata=None)
     with pytest.raises(ValueError, match="hf.metadata"):
-        manager._load_checkpoint(
-            {MODEL: object()}, str(tmp_path), from_hf=True, from_quantized=False
-        )
+        manager._load_checkpoint({MODEL: object()}, str(tmp_path), from_hf=True)
 
 
 def test_hf_load_rejects_a_directory_with_no_export(tmp_path, monkeypatch) -> None:
@@ -877,9 +854,7 @@ def test_hf_load_rejects_a_directory_with_no_export(tmp_path, monkeypatch) -> No
 
     manager, _, MODEL = _hf_manager_stub(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="not a supported"):
-        manager._load_checkpoint(
-            {MODEL: object()}, str(tmp_path), from_hf=True, from_quantized=False
-        )
+        manager._load_checkpoint({MODEL: object()}, str(tmp_path), from_hf=True)
 
 
 def test_hf_load_round_trips_through_the_adapter(tmp_path, monkeypatch) -> None:
@@ -889,9 +864,7 @@ def test_hf_load_round_trips_through_the_adapter(tmp_path, monkeypatch) -> None:
         files={f"{tmp_path}/model.safetensors.index.json"},
     )
     model_state = _RecordingModelState()
-    manager._load_checkpoint(
-        {MODEL: model_state}, str(tmp_path), from_hf=True, from_quantized=False
-    )
+    manager._load_checkpoint({MODEL: model_state}, str(tmp_path), from_hf=True)
 
     assert manager.sd_adapter.to_hf_calls == 1
     # strict, and the load names the export's safetensors metadata format.
@@ -928,9 +901,7 @@ def test_hf_load_failure_closes_reader_and_allows_retry(
 
     monkeypatch.setattr(target, method, fail)
     with pytest.raises(ValueError, match=f"HF {failure_phase} failed") as caught:
-        manager._load_checkpoint(
-            {MODEL: model_state}, str(tmp_path), from_hf=True, from_quantized=False
-        )
+        manager._load_checkpoint({MODEL: model_state}, str(tmp_path), from_hf=True)
     assert caught.value is failure
     assert model_state.loaded is None
     assert "native_load" not in calls
@@ -939,9 +910,7 @@ def test_hf_load_failure_closes_reader_and_allows_retry(
 
     monkeypatch.setattr(target, method, original)
     calls.clear()
-    manager._load_checkpoint(
-        {MODEL: model_state}, str(tmp_path), from_hf=True, from_quantized=False
-    )
+    manager._load_checkpoint({MODEL: model_state}, str(tmp_path), from_hf=True)
     assert calls["closed"] is True
     assert model_state.loaded == {"back": model_state}
     assert model_state.validated is model_state.loaded
@@ -981,18 +950,14 @@ def test_native_load_restores_stateful_and_rejects_foreign_objects(
             self.loaded = state
 
     target = _StatefulThing()
-    manager._load_checkpoint(
-        {MODEL: target}, str(tmp_path), from_hf=False, from_quantized=False
-    )
+    manager._load_checkpoint({MODEL: target}, str(tmp_path), from_hf=False)
     assert target.loaded == {"w": 1}  # restored via load_state_dict
     assert calls["native_load"][1]["strict"] is True
 
     # A plain object the backend did not restore in place must fail loudly.
     manager._manager = type(manager._manager)(load=lambda *a, **kw: {MODEL: object()})
     with pytest.raises(TypeError, match="non-Stateful"):
-        manager._load_checkpoint(
-            {MODEL: object()}, str(tmp_path), from_hf=False, from_quantized=False
-        )
+        manager._load_checkpoint({MODEL: object()}, str(tmp_path), from_hf=False)
 
 
 def test_optimizer_initialization_restores_grads_and_lr_on_error(monkeypatch):
@@ -1890,9 +1855,9 @@ def test_hf_export_roundtrip_without_process_group(tmp_path, indexed):
 
     from safetensors.torch import save_file
 
-    model = nn.ModuleDict({"model": nn.Linear(2, 2)})
+    model = nn.Linear(2, 2)
     optimizer = torch.optim.AdamW(model.parameters())
-    adapter = ModelStateDictAdapter(SimpleNamespace(), None, model_prefix="model.")
+    adapter = ModelStateDictAdapter(SimpleNamespace(), None)
     if indexed:
         adapter.fqn_to_index_mapping = {"weight": 1, "bias": 2}
     manager = DistributedCheckpointManager(
@@ -1914,7 +1879,7 @@ def test_hf_export_roundtrip_without_process_group(tmp_path, indexed):
             str(export / "abandoned.safetensors"),
         )
         with torch.no_grad():
-            model["model"].weight.zero_()
+            model.weight.zero_()
         torch.testing.assert_close(
             _read_hf_export_into_fresh_model(tmp_path, model, adapter),
             expected,
@@ -1923,7 +1888,7 @@ def test_hf_export_roundtrip_without_process_group(tmp_path, indexed):
         )
         torch.testing.assert_close(
             _read_hf_export_with_transformers(tmp_path / "checkpoint" / "step-1"),
-            {key.removeprefix("model."): value for key, value in expected.items()},
+            expected,
             rtol=0,
             atol=0,
         )
@@ -1943,9 +1908,9 @@ def test_failed_hf_export_rewrite_preserves_published_weights(
 
     from llmtuner.components.checkpointer.hf import hf_storage
 
-    model = nn.ModuleDict({"model": nn.Linear(2, 2)})
+    model = nn.Linear(2, 2)
     optimizer = torch.optim.AdamW(model.parameters())
-    adapter = ModelStateDictAdapter(SimpleNamespace(), None, model_prefix="model.")
+    adapter = ModelStateDictAdapter(SimpleNamespace(), None)
     if indexed:
         adapter.fqn_to_index_mapping = {"weight": 1, "bias": 2}
     manager = DistributedCheckpointManager(
@@ -1961,7 +1926,7 @@ def test_failed_hf_export_rewrite_preserves_published_weights(
         expected = {key: value.clone() for key, value in model.state_dict().items()}
         assert manager.save(1, last_step=True)
         with torch.no_grad():
-            model["model"].weight.add_(5)
+            model.weight.add_(5)
         consolidate = _consolidate_hf_safetensors._consolidate_safetensors_files
 
         def fail_after_consolidation(*args, **kwargs):
@@ -1991,7 +1956,7 @@ def test_failed_hf_export_rewrite_preserves_published_weights(
         )
         torch.testing.assert_close(
             _read_hf_export_with_transformers(tmp_path / "checkpoint" / "step-1"),
-            {key.removeprefix("model."): value for key, value in expected.items()},
+            expected,
             rtol=0,
             atol=0,
         )
@@ -2639,7 +2604,6 @@ def test_temporary_backend_cleanup_preserves_operation_error(
                 {model_key: nn.Linear(2, 2)},
                 str(tmp_path),
                 from_hf=True,
-                from_quantized=False,
             )
         else:
             manager.last_save_model_only = False
@@ -2920,9 +2884,7 @@ def test_optional_backend_coordinates_local_state_restore(tmp_path, monkeypatch,
 
     monkeypatch.setattr(tc, "synchronize_local_errors", coordinate)
     with pytest.raises(ValueError, match="local restore failed"):
-        manager._load_checkpoint(
-            {key: LocalState()}, str(tmp_path), from_hf=False, from_quantized=False
-        )
+        manager._load_checkpoint({key: LocalState()}, str(tmp_path), from_hf=False)
 
 
 def test_optional_backend_restores_rng_after_user_callbacks(tmp_path, monkeypatch):
@@ -2958,7 +2920,6 @@ def test_optional_backend_restores_rng_after_user_callbacks(tmp_path, monkeypatc
             {RNG_STATE: rng, "custom": RandomCallback()},
             str(tmp_path),
             from_hf=False,
-            from_quantized=False,
         )
         assert torch.equal(torch.get_rng_state(), before)
 
@@ -3120,9 +3081,7 @@ def test_optional_backend_validates_local_metadata_before_full_reader(
         lambda *a, **kw: SimpleNamespace(build=lambda: reader),
     )
     with pytest.raises(ValueError):
-        manager._load_checkpoint(
-            {key: state}, str(tmp_path), from_hf=False, from_quantized=False
-        )
+        manager._load_checkpoint({key: state}, str(tmp_path), from_hf=False)
     assert reader_calls == ["subset", "close"]
     assert "native_load" not in calls
     if key != "rng_state":
@@ -3153,16 +3112,15 @@ def test_hf_export_loads_with_automodel_and_preserves_logits(tmp_path, tied, ind
     )
     config._attn_implementation = "eager"
     original = LlamaForCausalLM(config).float().eval()
-    wrapper = nn.ModuleDict({"model": original})
-    optimizer = torch.optim.AdamW(wrapper.parameters())
-    adapter = ModelStateDictAdapter(config, None, model_prefix="model.")
+    optimizer = torch.optim.AdamW(original.parameters())
+    adapter = ModelStateDictAdapter(config, None)
     if indexed:
         adapter.fqn_to_index_mapping = {
             name: index % 2 + 1 for index, name in enumerate(original.state_dict())
         }
     manager = DistributedCheckpointManager(
         Config(enable=True, last_save_in_hf=True, keep_latest_k=0),
-        model_parts=[wrapper],
+        model_parts=[original],
         optimizer=optimizer,
         lr_scheduler=_schedule(optimizer),
         states={},
@@ -3508,8 +3466,9 @@ def test_synthetic_cursor_preflight_preserves_live_model_and_stream(
         {
             "checkpoint_format": {
                 "name": "llmtuner.native",
-                "version": 1,
+                "version": 2,
                 "model_contracts": "[]",
+                "topology": "null",
             },
             "dataloader": invalid,
             "lr_scheduler": {"last_epoch": 0},
@@ -3540,9 +3499,7 @@ def test_synthetic_cursor_preflight_preserves_live_model_and_stream(
         with pytest.raises(
             (ValueError, CheckpointException), match="steps|resume at batch"
         ):
-            manager._load_checkpoint(
-                manager.states, str(checkpoint), from_hf=False, from_quantized=False
-            )
+            manager._load_checkpoint(manager.states, str(checkpoint), from_hf=False)
         assert len(reads) == 2
         assert all("model" not in keys for keys in reads)
         assert loader.state_dict() == before
@@ -3644,9 +3601,9 @@ def test_native_format_version_is_validated_before_model_restore(tmp_path):
     )
     try:
         record = manager.states[CHECKPOINT_FORMAT]
-        record.VERSION = 2
+        record.VERSION = 3
         assert manager.save(1)
-        record.VERSION = 1
+        record.VERSION = 2
         with torch.no_grad():
             model.weight.fill_(17)
             model.bias.fill_(19)

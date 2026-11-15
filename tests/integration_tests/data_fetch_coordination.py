@@ -27,6 +27,7 @@ from llmtuner.trainer.runtime.batch import (
 )
 from llmtuner.trainer.runtime.engine import TrainingEngine
 from llmtuner.trainer.runtime.validation import (
+    ValidationDataLoaderResources,
     count_validation_batch_tokens,
     finalize_validation,
     run_validation_loop,
@@ -520,6 +521,7 @@ def main():
                 try:
                     run_validation_loop(
                         trainer.training_engine,
+                        loader_resources=ValidationDataLoaderResources(),
                         cfg=trainer.cfg,
                         metrics=trainer.metrics,
                         token_counter=trainer.count_valid_tokens,
@@ -595,6 +597,7 @@ def main():
                             try:
                                 run_validation_loop(
                                     trainer.training_engine,
+                                    loader_resources=ValidationDataLoaderResources(),
                                     cfg=trainer.cfg,
                                     metrics=trainer.metrics,
                                     token_counter=trainer.count_valid_tokens,
@@ -648,6 +651,7 @@ def main():
                 try:
                     run_validation_loop(
                         trainer.training_engine,
+                        loader_resources=ValidationDataLoaderResources(),
                         cfg=trainer.cfg,
                         metrics=trainer.metrics,
                         token_counter=trainer.count_valid_tokens,
@@ -690,6 +694,7 @@ def main():
             try:
                 run_validation_loop(
                     trainer.training_engine,
+                    loader_resources=ValidationDataLoaderResources(),
                     cfg=trainer.cfg,
                     metrics=trainer.metrics,
                     token_counter=trainer.count_valid_tokens,

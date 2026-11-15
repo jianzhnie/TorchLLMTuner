@@ -27,6 +27,9 @@ from llmtuner.parallel.tensor_parallel.checkpointing import (
     gather_tensor_parallel_state,
     load_tensor_parallel_state,
 )
+from llmtuner.parallel.tensor_parallel.sequence_boundary import (
+    FeatureParallelSequenceBoundary,
+)
 from llmtuner.parallel.tensor_parallel.tensor_parallel import realize_moe_blocks_tp
 from tests.integration_tests.ep_wiring_equivalence import _model
 from tests.integration_tests.fixed_router_ep_equivalence import explicit_reference
@@ -167,7 +170,7 @@ def main():
                 router_aux_loss_coef=coefficient,
             )
             block = target.layers[0].mlp
-            assert block._tp_moe_boundary
+            assert isinstance(block, FeatureParallelSequenceBoundary)
             assert block.routed_experts.inner_experts.w1_EFD.shape == (8, 24, 64)
             generator = torch.Generator().manual_seed(199)
             shape = (2, 8, 64) if batched else (8, 64)

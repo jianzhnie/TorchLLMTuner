@@ -317,11 +317,14 @@ def test_load_state_dict_restores_the_scheduled_lr() -> None:
     )
 
 
-def test_load_state_dict_ignores_an_empty_dict() -> None:
+def test_load_state_dict_rejects_missing_progress_before_changing_rates() -> None:
     scheduler = build_lr_scheduler(
         LRSchedulerConfig(), optimizers=[_optimizer()], training_steps=4
     )
-    scheduler.load_state_dict({})
+    before = scheduler.state_dict().copy()
+    with pytest.raises(ValueError, match="missing last_epoch"):
+        scheduler.load_state_dict({})
+    assert scheduler.state_dict() == before
     assert _lrs(scheduler)[0] == 1.0
 
 
@@ -521,8 +524,11 @@ def test_scheduler_progress_survives_empty_pipeline_stage(source_empty, target_e
         )
         _advance(reference, 3)
         assert target.get_metrics() == reference.get_metrics()
-    target.load_state_dict({})
+    before_rates = target.get_metrics().copy()
+    with pytest.raises(ValueError, match="missing last_epoch"):
+        target.load_state_dict({})
     assert target.state_dict() == {"last_epoch": 3}
+    assert target.get_metrics() == before_rates
     for _ in range(3):
         for scheduler in target:
             scheduler.optimizer.step()

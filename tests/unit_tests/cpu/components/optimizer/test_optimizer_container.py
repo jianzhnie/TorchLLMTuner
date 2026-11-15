@@ -803,3 +803,63 @@ def test_construction_owner_can_retry_failed_inner_optimizer_cleanup(monkeypatch
     assert owner._pending_close == []
     owner.close()
     assert len(attempts) == 2
+
+
+@pytest.mark.parametrize("operation", ["export", "restore"])
+def test_optimizer_rejects_topology_rebinding_before_state_hooks(
+    monkeypatch, operation
+):
+    from llmtuner.parallel.assembly import capture_model_part_layouts
+    from llmtuner.parallel.topology import ParallelTopologySnapshot
+
+    model = _model()
+    layouts = capture_model_part_layouts([model])
+    layouts[0].topology = ParallelTopologySnapshot()
+    container = OptimizersContainer(
+        _cfg(_catch_all()), model_parts=[model], runtime_layouts=layouts
+    )
+    layouts[0].topology = ParallelTopologySnapshot(dp_shard=2, world_size=2)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Changed topology reached an optimizer state hook")
+
+    monkeypatch.setattr(container.optimizers[0], "state_dict", unexpected)
+    monkeypatch.setattr(container.optimizers[0], "load_state_dict", unexpected)
+    with pytest.raises(ValueError, match="Optimizer layout metadata changed"):
+        if operation == "export":
+            container.state_dict()
+        else:
+            container.load_state_dict({})
+
+
+@pytest.mark.parametrize("operation", ["save", "restore"])
+@pytest.mark.parametrize("change", ["rename", "replace", "remove", "duplicate"])
+def test_checkpoint_rejects_optimizer_groups_detached_from_assembly(
+    monkeypatch, operation, change
+):
+    model = nn.Linear(2, 2)
+    container = OptimizersContainer(_cfg(_catch_all()), model_parts=[model])
+    saved = container.state_dict()
+    group = container.optimizers[0].param_groups[0]
+    if change == "rename":
+        group["param_names"][0] = "unrelated.weight"
+    elif change == "replace":
+        group["params"][0] = nn.Parameter(torch.zeros_like(group["params"][0]))
+    elif change == "remove":
+        group["params"].pop()
+        group["param_names"].pop()
+    else:
+        group["params"].append(group["params"][0])
+        group["param_names"].append(group["param_names"][0])
+
+    def forbidden_collection(*args, **kwargs):
+        raise AssertionError("Invalid ownership reached optimizer state collection")
+
+    monkeypatch.setattr(
+        checkpoint_module, "collect_local_optimizer_state", forbidden_collection
+    )
+    with pytest.raises(ValueError, match="ownership"):
+        if operation == "save":
+            container.state_dict()
+        else:
+            container.load_state_dict(saved)

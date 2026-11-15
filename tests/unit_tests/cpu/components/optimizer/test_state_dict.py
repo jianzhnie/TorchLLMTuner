@@ -331,11 +331,14 @@ def test_incomplete_optimizer_checkpoint_is_rejected_without_state_changes():
 
 
 def test_optimizer_container_rejects_checkpoint_keys_shared_between_optimizers():
-    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.components.optimizer.checkpoint_state import OptimizerCheckpointState
 
-    container = object.__new__(OptimizersContainer)
+    container = OptimizerCheckpointState()
+    container.sharded_tensor_parallel = False
+    container.sharded_expert_parallel = False
+    container._validate_restore_groups = None
     container.runtime_layouts = ()
-    container._bound_layout_parameters = ()
+    container._layout_snapshots = ()
     container.model_parts = []
     container.optimizers = []
     for _ in range(2):
@@ -353,11 +356,14 @@ def test_sharded_restore_rejects_duplicate_local_fqns(tp, ep):
     from llmtuner.components.checkpointer.core.chunked_tensor import (
         ChunkedCheckpointTensor,
     )
-    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.components.optimizer.checkpoint_state import OptimizerCheckpointState
 
-    container = object.__new__(OptimizersContainer)
+    container = OptimizerCheckpointState()
+    container.sharded_tensor_parallel = False
+    container.sharded_expert_parallel = False
+    container._validate_restore_groups = None
     container.runtime_layouts = ()
-    container._bound_layout_parameters = ()
+    container._layout_snapshots = ()
     container.model_parts = []
     container.sharded_tensor_parallel = tp
     container.sharded_expert_parallel = ep
@@ -375,11 +381,14 @@ def test_sharded_restore_rejects_duplicate_local_fqns(tp, ep):
 
 
 def test_container_validates_all_checkpoint_states_before_loading_any():
-    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.components.optimizer.checkpoint_state import OptimizerCheckpointState
 
-    container = object.__new__(OptimizersContainer)
+    container = OptimizerCheckpointState()
+    container.sharded_tensor_parallel = False
+    container.sharded_expert_parallel = False
+    container._validate_restore_groups = None
     container.runtime_layouts = ()
-    container._bound_layout_parameters = ()
+    container._layout_snapshots = ()
     container.model_parts = []
     container.optimizers = []
     for name in ["first", "second"]:
@@ -415,11 +424,14 @@ def test_flat_optimizer_restore_keeps_parameter_names_for_the_next_save():
 
 @pytest.mark.parametrize("moment", ["exp_avg", "exp_avg_sq", "max_exp_avg_sq"])
 def test_container_rejects_wrong_moment_shape_before_loading_any_optimizer(moment):
-    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.components.optimizer.checkpoint_state import OptimizerCheckpointState
 
-    container = object.__new__(OptimizersContainer)
+    container = OptimizerCheckpointState()
+    container.sharded_tensor_parallel = False
+    container.sharded_expert_parallel = False
+    container._validate_restore_groups = None
     container.runtime_layouts = ()
-    container._bound_layout_parameters = ()
+    container._layout_snapshots = ()
     container.model_parts = []
     container.optimizers = []
     for name in ["first", "second"]:
@@ -679,11 +691,14 @@ def test_adam_restore_uses_saved_amsgrad_state_layout(saved_amsgrad, current_ams
     "state_name", ["step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq"]
 )
 def test_adam_restore_rejects_nested_substitute_for_required_state(state_name):
-    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.components.optimizer.checkpoint_state import OptimizerCheckpointState
 
-    container = object.__new__(OptimizersContainer)
+    container = OptimizerCheckpointState()
+    container.sharded_tensor_parallel = False
+    container.sharded_expert_parallel = False
+    container._validate_restore_groups = None
     container.runtime_layouts = ()
-    container._bound_layout_parameters = ()
+    container._layout_snapshots = ()
     container.model_parts = []
     container.optimizers = [
         torch.optim.AdamW(
@@ -812,11 +827,14 @@ def test_flat_restore_rejects_duplicate_live_fqns_without_mutation(separate_grou
 
 
 def test_dense_container_restore_rejects_fqns_shared_between_inner_optimizers():
-    from llmtuner.components.optimizer.optimizer import OptimizersContainer
+    from llmtuner.components.optimizer.checkpoint_state import OptimizerCheckpointState
 
-    container = object.__new__(OptimizersContainer)
+    container = OptimizerCheckpointState()
+    container.sharded_tensor_parallel = False
+    container.sharded_expert_parallel = False
+    container._validate_restore_groups = None
     container.runtime_layouts = ()
-    container._bound_layout_parameters = ()
+    container._layout_snapshots = ()
     container.model_parts = []
     container.sharded_tensor_parallel = False
     container.sharded_expert_parallel = False

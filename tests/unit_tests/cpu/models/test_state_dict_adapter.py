@@ -1,7 +1,6 @@
 """HF state conversion preserves tied weights and caller-owned mappings."""
 
 import json
-from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -9,33 +8,31 @@ import torch
 
 from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 
-legacy_wrapper_adapter = partial(ModelStateDictAdapter, model_prefix="model.")
-
 
 @pytest.mark.parametrize("stores_head", [False, True])
 def test_tied_head_export_respects_checkpoint_index(stores_head):
-    adapter = legacy_wrapper_adapter(SimpleNamespace(tie_word_embeddings=True), None)
+    adapter = ModelStateDictAdapter(SimpleNamespace(tie_word_embeddings=True), None)
     adapter._hf_keys = {"model.embed_tokens.weight"}
     if stores_head:
         adapter._hf_keys.add("lm_head.weight")
     weight = torch.randn(4, 2)
     state = {
-        "model.model.embed_tokens.weight": weight,
-        "model.lm_head.weight": weight,
+        "model.embed_tokens.weight": weight,
+        "lm_head.weight": weight,
     }
     exported = adapter.to_hf(state)
     assert set(exported) == adapter._hf_keys
-    assert set(state) == {"model.model.embed_tokens.weight", "model.lm_head.weight"}
+    assert set(state) == {"model.embed_tokens.weight", "lm_head.weight"}
 
 
 def test_tied_head_import_does_not_mutate_source():
-    adapter = legacy_wrapper_adapter(SimpleNamespace(tie_word_embeddings=True), None)
+    adapter = ModelStateDictAdapter(SimpleNamespace(tie_word_embeddings=True), None)
     weight = torch.randn(4, 2)
     source = {"model.embed_tokens.weight": weight}
     imported = adapter.from_hf(source)
     assert set(source) == {"model.embed_tokens.weight"}
-    assert imported["model.lm_head.weight"] is weight
-    assert imported["model.model.embed_tokens.weight"] is weight
+    assert imported["lm_head.weight"] is weight
+    assert imported["model.embed_tokens.weight"] is weight
 
 
 @pytest.mark.parametrize("text_tied", [False, True])
@@ -46,20 +43,20 @@ def test_composite_checkpoint_uses_text_weight_ties(text_tied):
         "llava", text_config={"tie_word_embeddings": text_tied}
     )
     config.tie_word_embeddings = not text_tied
-    adapter = legacy_wrapper_adapter(config, None)
+    adapter = ModelStateDictAdapter(config, None)
     adapter._hf_keys = {"model.embed_tokens.weight"}
     weight = torch.randn(4, 2)
     source = {"model.embed_tokens.weight": weight}
     imported = adapter.from_hf(source)
 
     assert adapter.model_config is config.text_config
-    assert ("model.lm_head.weight" in imported) == text_tied
+    assert ("lm_head.weight" in imported) == text_tied
     assert source == {"model.embed_tokens.weight": weight}
     if text_tied:
-        assert imported["model.lm_head.weight"] is weight
+        assert imported["lm_head.weight"] is weight
         assert adapter.to_hf(imported) == source
     else:
-        imported["model.lm_head.weight"] = weight.clone()
+        imported["lm_head.weight"] = weight.clone()
         with pytest.raises(ValueError, match="unexpected=.*lm_head.weight"):
             adapter.to_hf(imported)
 
@@ -68,10 +65,10 @@ def test_composite_checkpoint_uses_text_weight_ties(text_tied):
 def test_hf_index_checks_global_pipeline_keys(monkeypatch, complete):
     import llmtuner.components.checkpointer.model_state as adapter_module
 
-    adapter = legacy_wrapper_adapter(SimpleNamespace(tie_word_embeddings=False), None)
+    adapter = ModelStateDictAdapter(SimpleNamespace(tie_word_embeddings=False), None)
     adapter._hf_keys = {"model.layers.0.weight", "model.layers.1.weight"}
     local_weight = torch.randn(2, 2)
-    local = {"model.model.layers.0.weight": local_weight}
+    local = {"model.layers.0.weight": local_weight}
     # This unit test supplies only the key-gather result, not a process group.
     # Real error coordination is exercised by hf_adapter_coordination.py.
     from contextlib import nullcontext
@@ -97,10 +94,10 @@ def test_hf_index_checks_global_pipeline_keys(monkeypatch, complete):
 
 
 def test_hf_index_still_rejects_missing_keys_without_distributed():
-    adapter = legacy_wrapper_adapter(SimpleNamespace(tie_word_embeddings=False), None)
+    adapter = ModelStateDictAdapter(SimpleNamespace(tie_word_embeddings=False), None)
     adapter._hf_keys = {"model.layers.0.weight", "model.layers.1.weight"}
     with pytest.raises(ValueError, match="missing=.*model.layers.1.weight"):
-        adapter.to_hf({"model.model.layers.0.weight": torch.zeros(2, 2)})
+        adapter.to_hf({"model.layers.0.weight": torch.zeros(2, 2)})
 
 
 @pytest.mark.parametrize("stores_head", [False, True])
@@ -113,32 +110,39 @@ def test_single_file_checkpoint_loads_tied_head(tmp_path, stores_head):
     if stores_head:
         saved["lm_head.weight"] = weight.clone()
     save_file(saved, str(tmp_path / "model.safetensors"))
-    adapter = legacy_wrapper_adapter(
+    adapter = ModelStateDictAdapter(
         SimpleNamespace(tie_word_embeddings=True), str(tmp_path)
     )
     local_weight = torch.zeros_like(weight)
     target = {
-        "model.model.embed_tokens.weight": local_weight,
-        "model.lm_head.weight": local_weight,
+        "model.embed_tokens.weight": local_weight,
+        "lm_head.weight": local_weight,
     }
 
     hf_state = adapter.to_hf(target)
     assert set(hf_state) == set(saved)
     dcp.load(hf_state, storage_reader=adapter.get_hf_storage_reader(str(tmp_path)))
     restored = adapter.from_hf(hf_state)
-    torch.testing.assert_close(restored["model.lm_head.weight"], weight)
-    torch.testing.assert_close(restored["model.model.embed_tokens.weight"], weight)
+    torch.testing.assert_close(restored["lm_head.weight"], weight)
+    torch.testing.assert_close(restored["model.embed_tokens.weight"], weight)
 
 
 def test_hf_key_mapping_rejects_collisions():
-    adapter = legacy_wrapper_adapter(SimpleNamespace(), None)
+    adapter = ModelStateDictAdapter(
+        SimpleNamespace(model_type="qwen3_moe"), None, expert_parallel=True
+    )
     with pytest.raises(ValueError, match="key mapping collision"):
-        adapter.to_hf({"model.weight": torch.ones(1), "weight": torch.zeros(1)})
+        adapter.to_hf(
+            {
+                "model.layers.0.mlp.router.gate.weight": torch.ones(1),
+                "model.layers.0.mlp.gate.weight": torch.zeros(1),
+            }
+        )
 
 
 @pytest.mark.parametrize("reverse", [False, True])
 def test_qwen3_import_rejects_router_key_collisions(reverse):
-    adapter = legacy_wrapper_adapter(
+    adapter = ModelStateDictAdapter(
         SimpleNamespace(model_type="qwen3_moe"), None, expert_parallel=True
     )
     entries = [
@@ -169,7 +173,7 @@ def test_hf_reader_selects_each_tensor_from_its_indexed_file(tmp_path):
         ),
         encoding="utf-8",
     )
-    adapter = legacy_wrapper_adapter(SimpleNamespace(), None)
+    adapter = ModelStateDictAdapter(SimpleNamespace(), None)
     restored = {"a": torch.zeros(1), "b": torch.zeros(1)}
     dcp.load(restored, storage_reader=adapter.get_hf_storage_reader(str(tmp_path)))
     torch.testing.assert_close(
@@ -196,15 +200,13 @@ def test_index_shard_grouping_survives_export_round_trip(tmp_path, filenames):
     (source_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": weight_map}), encoding="utf-8"
     )
-    adapter = legacy_wrapper_adapter(SimpleNamespace(), str(source_path))
+    adapter = ModelStateDictAdapter(SimpleNamespace(), str(source_path))
     mapping = adapter.fqn_to_index_mapping
     assert set(mapping) == set(weight_map)
     assert set(mapping.values()) == {1, 2}
     assert mapping["a"] == mapping["c"] != mapping["b"]
 
-    source = {
-        f"model.{key}": torch.tensor([float(i)]) for i, key in enumerate(weight_map)
-    }
+    source = {key: torch.tensor([float(i)]) for i, key in enumerate(weight_map)}
     output_path = str(tmp_path / "export")
     dcp.save(
         adapter.to_hf(source),
@@ -237,7 +239,7 @@ def test_invalid_index_is_rejected_during_adapter_construction(tmp_path, index):
         json.dumps(index), encoding="utf-8"
     )
     with pytest.raises(ValueError, match="weight_map"):
-        legacy_wrapper_adapter(SimpleNamespace(), str(tmp_path))
+        ModelStateDictAdapter(SimpleNamespace(), str(tmp_path))
 
 
 def test_explicit_model_names_roundtrip_without_wrapper_prefix():
@@ -250,12 +252,6 @@ def test_explicit_model_names_roundtrip_without_wrapper_prefix():
     imported = adapter.from_hf(exported)
     assert tuple(imported) == tuple(state)
     assert imported[next(iter(state))] is weight
-
-
-@pytest.mark.parametrize("prefix", [None, 1, "model", ".", "model.."])
-def test_external_mapping_rejects_invalid_prefix(prefix):
-    with pytest.raises(ValueError, match="model_prefix"):
-        ModelStateDictAdapter(SimpleNamespace(), None, model_prefix=prefix)
 
 
 def test_explicit_tied_import_restores_alias_without_prefix_inference():
@@ -286,3 +282,36 @@ def test_ep_layout_selector_rejects_nonboolean_before_checkpoint_io(
             "/unread-checkpoint",
             **{field: value},
         )
+
+
+@pytest.mark.parametrize("direction", ["export", "import"])
+@pytest.mark.parametrize("change", ["parameter", "registration_order", "topology"])
+def test_hf_adapter_rejects_stale_assembly_before_tensor_conversion(
+    monkeypatch, direction, change
+):
+    from llmtuner.parallel.assembly import ModelPartLayout
+    from llmtuner.parallel.topology import ParallelTopologySnapshot
+
+    model = torch.nn.Linear(2, 2)
+    layout = ModelPartLayout()
+    layout.refresh(model)
+    adapter = ModelStateDictAdapter(SimpleNamespace(), None, runtime_layouts=(layout,))
+    state = dict(model.state_dict())
+    if change == "parameter":
+        model.weight = torch.nn.Parameter(torch.zeros_like(model.weight))
+        layout.refresh(model)
+    elif change == "registration_order":
+        layout.parameter_bindings = dict(reversed(layout.parameter_bindings.items()))
+    else:
+        layout.topology = ParallelTopologySnapshot()
+
+    def forbidden_conversion(*args, **kwargs):
+        raise AssertionError("Stale adapter entered tensor conversion")
+
+    monkeypatch.setattr(adapter.state_format, "convert_state", forbidden_conversion)
+    message = "layout metadata changed" if change == "topology" else "ownership changed"
+    with pytest.raises(ValueError, match=message):
+        if direction == "export":
+            adapter.to_hf(state)
+        else:
+            adapter.from_hf(state)

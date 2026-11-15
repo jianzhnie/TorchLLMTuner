@@ -39,6 +39,7 @@ from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel import model_compile as compile_mod
 from llmtuner.parallel.model_compile import apply_compile
+from llmtuner.trainer.runtime.validation import ValidationDataLoaderResources
 from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
 
 try:
@@ -539,6 +540,7 @@ def test_compiled_ac_preserves_modes_identity_and_frozen_gradients(
             with pytest.raises(ValueError) as caught:
                 validation.validate(
                     trainer,
+                    loader_resources=ValidationDataLoaderResources(),
                     cfg=trainer.cfg,
                     metrics=None,
                     token_counter=lambda batch: 0,
@@ -548,6 +550,7 @@ def test_compiled_ac_preserves_modes_identity_and_frozen_gradients(
         else:
             validation.validate(
                 trainer,
+                loader_resources=ValidationDataLoaderResources(),
                 cfg=trainer.cfg,
                 metrics=None,
                 token_counter=lambda batch: 0,

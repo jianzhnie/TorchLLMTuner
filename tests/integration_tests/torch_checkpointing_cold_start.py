@@ -60,9 +60,7 @@ def main():
 
             caught = None
             try:
-                manager._load_checkpoint(
-                    {key: LocalState()}, "unused", from_hf=False, from_quantized=False
-                )
+                manager._load_checkpoint({key: LocalState()}, "unused", from_hf=False)
             except (ValueError, RuntimeError) as error:
                 caught = error
             assert caught is not None
@@ -92,9 +90,7 @@ def main():
         ):
             caught = None
             try:
-                manager._load_checkpoint(
-                    {RNG_STATE: rng}, "unused", from_hf=False, from_quantized=False
-                )
+                manager._load_checkpoint({RNG_STATE: rng}, "unused", from_hf=False)
             except (ValueError, RuntimeError) as error:
                 caught = error
             assert caught is not None
@@ -118,9 +114,7 @@ def main():
         with patch.object(ema, "reset_from_model", reset):
             caught = None
             try:
-                manager._load_checkpoint(
-                    {MODEL: model}, "unused", from_hf=False, from_quantized=False
-                )
+                manager._load_checkpoint({MODEL: model}, "unused", from_hf=False)
             except (ValueError, RuntimeError) as error:
                 caught = error
             assert caught is not None, "peer returned successfully after reseed failure"
@@ -136,9 +130,7 @@ def main():
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.fill_(3)
-        manager._load_checkpoint(
-            {MODEL: model}, "unused", from_hf=False, from_quantized=False
-        )
+        manager._load_checkpoint({MODEL: model}, "unused", from_hf=False)
         for averages, parameters in ema._tracked_groups():
             for average, parameter in zip(averages, parameters, strict=True):
                 torch.testing.assert_close(average, parameter, atol=0, rtol=0)

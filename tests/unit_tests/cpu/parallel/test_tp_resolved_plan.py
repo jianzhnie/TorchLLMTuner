@@ -19,6 +19,9 @@ from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferenc
 from llmtuner.parallel.plan import ParallelPlan
 from llmtuner.parallel.replacements import ReplacementMap
 from llmtuner.parallel.tensor_parallel.linear import ColwiseLinearNoGather
+from llmtuner.parallel.tensor_parallel.sequence_boundary import (
+    FeatureParallelSequenceBoundary,
+)
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
     apply_tp,
     requires_full_token_history,
@@ -243,7 +246,7 @@ def test_invalid_moe_shared_geometry_fails_during_pure_preflight():
     with pytest.raises(ValueError, match="not divisible"):
         resolve_tp_plan(model, cfg=ParallelConfig(tensor_parallel_size=2))
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
-    assert not getattr(block, "_tp_moe_boundary", False)
+    assert not isinstance(block, FeatureParallelSequenceBoundary)
 
 
 @pytest.mark.parametrize(
@@ -457,3 +460,61 @@ def test_resolved_tp_allows_buffer_value_updates_without_rebinding():
     )
     model.routing_state.add_(3)
     plan.validate_binding(model)
+
+
+def test_replanning_replicated_attention_cannot_install_a_second_boundary():
+    from llmtuner.parallel.tensor_parallel.sequence_boundary import (
+        ReplicatedAttentionSequenceBoundary,
+    )
+
+    model = Qwen3MoeForCausalLM(
+        Qwen3MoeConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=24,
+            moe_intermediate_size=12,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+        )
+    )
+    attention = model.layers[0].self_attn
+    attention.__class__ = type(
+        "InstalledReplicatedAttention",
+        (ReplicatedAttentionSequenceBoundary, type(attention)),
+        {},
+    )
+    parameters = tuple(model.parameters())
+    with pytest.raises(
+        UnsupportedCombinationError, match="installed replicated attention"
+    ):
+        resolve_tp_plan(model, cfg=ParallelConfig(tensor_parallel_size=2))
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+
+
+def test_tp_reuses_borrowed_ownership_without_losing_stale_checks(monkeypatch):
+    from llmtuner.parallel.plan import snapshot_model_bindings
+
+    model = nn.Sequential(nn.Linear(8, 12, bias=False))
+    bindings = snapshot_model_bindings(model)
+
+    def forbidden_snapshot(*args, **kwargs):
+        raise AssertionError("TP repeated an unchanged ownership capture")
+
+    monkeypatch.setattr(
+        "llmtuner.parallel.tensor_parallel.tensor_parallel.snapshot_model_bindings",
+        forbidden_snapshot,
+    )
+    plan = resolve_tp_plan(
+        model,
+        cfg=ParallelConfig(tensor_parallel_size=2),
+        plan={"0": "colwise"},
+        bindings=bindings,
+    )
+    plan.validate_binding(model)
+    model.register_parameter("external_alias", model[0].weight)
+    with pytest.raises(ValueError, match="Stale plan parameter ownership"):
+        plan.validate_binding(model)

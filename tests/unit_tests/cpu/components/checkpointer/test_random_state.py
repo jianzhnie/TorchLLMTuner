@@ -50,25 +50,33 @@ def test_rng_checkpoint_rejects_incompatible_metadata_without_changing_streams(
         assert actual[2:] == numpy_before[2:]
 
 
-def test_rng_checkpoint_empty_state_is_noop():
+def test_rng_checkpoint_empty_state_rejects_before_changing_streams():
     state = RNGCheckpointState(torch.device("cpu"))
     before = torch.get_rng_state().clone()
-    state.load_state_dict({})
+    with pytest.raises(KeyError, match=state.key):
+        state.load_state_dict({})
     assert torch.equal(torch.get_rng_state(), before)
 
 
 @pytest.mark.parametrize("changed_axis", ["tp", "pp", "ep", "cp", "cp_kv"])
-def test_rng_restore_rejects_changed_parallel_degrees(changed_axis):
+def test_rng_restore_rejects_changed_parallel_degrees(changed_axis, monkeypatch):
     from types import SimpleNamespace
 
     degrees = dict(
         dp_replicate=1, dp_shard=2, cp=1, tp=1, pp=1, ep=1, cp_kv=1, cp_ulysses=1
     )
-    topology = SimpleNamespace(**degrees)
+    monkeypatch.setattr(
+        "llmtuner.components.checkpointer.core.random_state.get_world_size", lambda: 2
+    )
+    topology = SimpleNamespace(**degrees, world_size=2)
     state = RNGCheckpointState(torch.device("cpu"), topology=topology)
     saved = state.state_dict()
     # Capture ownership: editing the caller's topology cannot edit the payload.
     setattr(topology, changed_axis, 2)
+    if changed_axis in {"tp", "pp", "cp", "cp_kv"}:
+        topology.dp_shard = 1
+    if changed_axis == "cp_kv":
+        topology.cp = 2
     target = RNGCheckpointState(torch.device("cpu"), topology=topology)
     before = torch.get_rng_state().clone()
     with pytest.raises(ValueError, match="parallel topology changed"):
@@ -93,7 +101,6 @@ def test_dcp_without_requested_rng_rejects_before_restoring_model(tmp_path):
 
     with pytest.raises(CheckpointException, match="rng_state"):
         dcp.load(target, checkpoint_id=tmp_path, planner=planner)
-    assert not planner.has_rng_state
     assert torch.equal(target["weight"], torch.zeros(2))
     assert torch.equal(torch.get_rng_state(), before)
 
@@ -191,7 +198,7 @@ def test_rng_checkpoint_rejects_noninteger_parallel_degree(axis, value):
     )
     with preserve_rng_state(torch.device("cpu")):
         checkpoint = RNGCheckpointState(
-            torch.device("cpu"), topology=SimpleNamespace(**degrees)
+            torch.device("cpu"), topology=SimpleNamespace(**degrees, world_size=1)
         )
         payload = pickle.loads(checkpoint.state_dict()[checkpoint.key])
         payload["parallel_degrees"][axis] = value
@@ -440,3 +447,42 @@ def test_manager_rejects_invalid_scheduler_progress_before_live_writes(tmp_path,
         assert scheduler.state_dict() == before_scheduler
     finally:
         manager.close()
+
+
+@pytest.mark.parametrize("dp_shard,world_size", [(-1, 1), (1, 2)])
+def test_rng_capture_rejects_unresolved_or_wrong_world_topology(dp_shard, world_size):
+    from types import SimpleNamespace
+
+    topology = SimpleNamespace(
+        dp_replicate=1,
+        dp_shard=dp_shard,
+        cp=1,
+        tp=1,
+        pp=1,
+        ep=1,
+        cp_kv=1,
+        cp_ulysses=1,
+        world_size=world_size,
+    )
+    before = torch.get_rng_state().clone()
+    with pytest.raises(ValueError):
+        RNGCheckpointState(torch.device("cpu"), topology=topology)
+    assert torch.equal(torch.get_rng_state(), before)
+
+
+def test_rng_capture_checks_snapshot_world_against_runtime():
+    from llmtuner.parallel.topology import ParallelTopologySnapshot
+
+    topology = ParallelTopologySnapshot(dp_shard=2, world_size=2)
+    with pytest.raises(ValueError, match="world size differs from the runtime"):
+        RNGCheckpointState(torch.device("cpu"), topology=topology)
+
+
+def test_rng_restore_requires_explicit_topology_declaration():
+    checkpoint = RNGCheckpointState(torch.device("cpu"))
+    payload = pickle.loads(checkpoint.state_dict()[checkpoint.key])
+    payload.pop("parallel_degrees")
+    before = torch.get_rng_state().clone()
+    with pytest.raises(KeyError, match="parallel_degrees"):
+        checkpoint.load_state_dict({checkpoint.key: pickle.dumps(payload)})
+    assert torch.equal(torch.get_rng_state(), before)

@@ -101,7 +101,6 @@ def main():
                     trainer.checkpointer.states,
                     str(checkpoint),
                     from_hf=False,
-                    from_quantized=False,
                 )
             except Exception as caught:
                 error = caught

@@ -69,7 +69,6 @@ def main():
                 adapter = ModelStateDictAdapter(
                     config,
                     None,
-                    model_prefix="model.",
                     expert_parallel=not source_grouped,
                 )
                 try:

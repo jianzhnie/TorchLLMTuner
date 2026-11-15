@@ -149,7 +149,7 @@ def test_rng_peer_validation_failure_prevents_local_restore(monkeypatch):
     assert calls == ["validate"]
 
 
-def test_rng_missing_from_old_checkpoint_does_not_reset_live_streams(monkeypatch):
+def test_requested_rng_missing_from_checkpoint_rejects_before_restoration(monkeypatch):
     phases = []
 
     class RNG:
@@ -164,5 +164,6 @@ def test_rng_missing_from_old_checkpoint_does_not_reset_live_streams(monkeypatch
         yield
 
     monkeypatch.setattr(state_adaptation, "synchronize_local_errors", coordinate)
-    state_adaptation.restore_rng_state({"rng_state": RNG()}, {}, available=False)
-    assert phases == ["Checkpoint RNG validation", "Checkpoint RNG restoration"]
+    with pytest.raises(KeyError, match="rng_state"):
+        state_adaptation.restore_rng_state({"rng_state": RNG()}, {})
+    assert phases == ["Checkpoint RNG validation"]

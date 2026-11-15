@@ -119,6 +119,19 @@ def check_empty_rank_checkpoint(empty_rank):
     assert restored.keys() == expected.keys()
     for name, tensor in expected.items():
         torch.testing.assert_close(restored[name], tensor, rtol=0, atol=0)
+    # An owning rank cannot treat missing EMA records as an implicit reset.
+    # The empty PP owner must participate in the same coordinated rejection.
+    failure = None
+    try:
+        ema.load_state_dict({})
+    except (ValueError, RuntimeError) as error:
+        failure = str(error)
+    failures = [None] * dist.get_world_size()
+    dist.all_gather_object(failures, failure)
+    assert all(failures), f"Missing owned EMA state was accepted: {failures}"
+    unchanged = ema.state_dict()
+    for name, tensor in expected.items():
+        torch.testing.assert_close(unchanged[name], tensor, rtol=0, atol=0)
     ema.step(2)
     final = ema.state_dict()
     live = dict(model.named_parameters())

@@ -15,6 +15,7 @@ from torch.distributed.checkpoint.metadata import ChunkStorageMetadata, Metadata
 from llmtuner.components.checkpointer.core.random_state import RNGCheckpointState
 from llmtuner.components.optimizer.state_dict import get_flat_optim_state_dict
 from llmtuner.datasets.dataloader import GrainDataLoader
+from llmtuner.parallel.topology import ParallelTopologySnapshot
 from llmtuner.trainer.trainer import Trainer
 from tests.integration_tests.audit_dcp_checkpoint import (
     AuditContract,
@@ -70,7 +71,7 @@ def production_state():
         serializer.device = torch.device("cpu")
         serializer.rank, serializer.world_size = rank, 8
         serializer.key = f"rank_{rank}"
-        serializer.parallel_degrees = degrees
+        serializer.topology = ParallelTopologySnapshot(**degrees, world_size=8)
         rng.update(serializer.state_dict())
     loader._iterator.close()
     state = dict(
@@ -215,7 +216,6 @@ def test_native_flat_model_namespace(tmp_path, production_state):
     # Native backend merges wrapper FQNs at top level, not under a model root.
     contract = replace(
         contract,
-        model_prefix="",
         expected_fqns={f"model.{k}": v for k, v in contract.expected_fqns.items()},
         optimizer_kinds={"model.weight": "AdamW"},
     )

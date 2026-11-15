@@ -18,7 +18,6 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 from torch.distributed.checkpoint.api import CheckpointException
 
 from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
@@ -37,7 +36,7 @@ from tests.integration_tests.fsdp_mesh_equivalence import _build_model, _full
 
 
 def runtime(cfg, topology, seed):
-    model = nn.ModuleDict({"model": apply_fsdp(_build_model(seed), cfg, topology)})
+    model = apply_fsdp(_build_model(seed), cfg, topology)
     optimizer = OptimizersContainer(OptimizerConfig(), model_parts=[model])
     scheduler = build_lr_scheduler(
         LRSchedulerConfig(), optimizers=optimizer.optimizers, training_steps=5
@@ -65,10 +64,10 @@ def full_state(model):
 def check_case(root, implementation, indexed, failure_phase):
     cfg, topology = topology_for("shard", implementation)
     parts = runtime(cfg, topology, 0)
-    adapter = ModelStateDictAdapter(SimpleNamespace(), None, model_prefix="model.")
+    adapter = ModelStateDictAdapter(SimpleNamespace(), None)
     if indexed:
         adapter.fqn_to_index_mapping = {
-            name.removeprefix("model."): index % 2 + 1
+            name: index % 2 + 1
             for index, name in enumerate(sorted(parts[0].state_dict()))
         }
     folder = Path(root) / f"{implementation}_{indexed}_{failure_phase}"

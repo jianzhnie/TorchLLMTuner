@@ -471,8 +471,6 @@ def test_hf_load_modes_imply_each_other() -> None:
     """
     with pytest.raises(ValueError, match="requires initial_load_model_only"):
         CheckpointConfig(initial_load_in_hf=True, initial_load_model_only=False)
-    with pytest.raises(ValueError, match="requires initial_load_in_hf"):
-        CheckpointConfig(initial_load_in_hf_quantized=True)
     with pytest.raises(ValueError, match="requires last_save_model_only"):
         CheckpointConfig(last_save_in_hf=True, last_save_model_only=False)
     # The pairing the defaults describe is accepted without spelling it out.

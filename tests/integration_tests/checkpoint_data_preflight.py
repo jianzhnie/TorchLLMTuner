@@ -19,6 +19,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.components.checkpointer.core.checkpoint_keys import DATALOADER, RNG_STATE
 from llmtuner.datasets.synthetic import RandomTokenDataLoader
+from llmtuner.parallel.topology import ParallelTopologySnapshot
 from tests.integration_tests.rng_checkpoint_equivalence import manager, runtime, update
 
 
@@ -76,7 +77,9 @@ def main():
                             if phase == "rng_world":
                                 rng.world_size = 3
                             elif phase == "rng_topology":
-                                rng.parallel_degrees = {"tp": 2}
+                                rng.topology = ParallelTopologySnapshot(
+                                    tp=2, world_size=2
+                                )
                         # Nonempty target AdamW/EMA state differs from checkpoint.
                         update(target)
                         before = [

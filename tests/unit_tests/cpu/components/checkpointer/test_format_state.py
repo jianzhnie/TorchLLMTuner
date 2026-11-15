@@ -12,7 +12,7 @@ from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.errors import ConfigError
 
 
-@pytest.mark.parametrize("version", [True, 0, 2, "1", None])
+@pytest.mark.parametrize("version", [True, 0, 1, 3, "2", None])
 def test_preflight_rejects_unsupported_format_without_mutating_writer(version):
     record = CheckpointFormatState()
     selected, destination = prepare_local_state_preflight({CHECKPOINT_FORMAT: record})
@@ -21,8 +21,9 @@ def test_preflight_rejects_unsupported_format_without_mutating_writer(version):
         validate_local_state_preflight(selected, destination)
     assert record.state_dict() == {
         "name": "llmtuner.native",
-        "version": 1,
+        "version": CheckpointFormatState.VERSION,
         "model_contracts": "[]",
+        "topology": "null",
     }
 
 
@@ -123,7 +124,7 @@ def test_contract_capture_includes_remote_pipeline_declarations(monkeypatch):
     monkeypatch.setattr(format_state, "get_world_size", lambda: 2)
 
     def gather(peers, local):
-        peers[:] = [local, json.loads(remote)]
+        peers[:] = [local, (json.loads(remote), None)]
 
     monkeypatch.setattr(format_state.dist, "all_gather_object", gather)
     assert CheckpointFormatState.capture([first]).state_dict() == expected
@@ -159,3 +160,85 @@ def test_standalone_checkpoint_configuration_does_not_require_execution_contract
     target = CheckpointFormatState.capture([model])
     with pytest.raises(ValueError, match="model execution contracts differ"):
         target.validate_state_dict(saved)
+
+
+def test_format_record_captures_assembly_topology_without_live_aliases():
+    import json
+
+    from torch import nn
+
+    from llmtuner.parallel.assembly import ModelPartLayout
+    from llmtuner.parallel.topology import ParallelTopologySnapshot
+
+    layout = ModelPartLayout(topology=ParallelTopologySnapshot())
+    record = CheckpointFormatState.capture([nn.Linear(2, 2)], runtime_layouts=(layout,))
+    saved = record.state_dict()
+    layout.topology = ParallelTopologySnapshot(tp=2, world_size=2)
+    assert json.loads(saved["topology"])["tp"] == 1
+    assert record.state_dict() == saved
+    # Provenance alone does not establish a supported topology transition.
+    other = CheckpointFormatState.capture([nn.Linear(2, 2)], runtime_layouts=(layout,))
+    other.validate_state_dict(saved)
+
+
+@pytest.mark.parametrize("topology", [None, "{", "{}", '"tp"', '{"tp": 2}'])
+def test_format_preflight_rejects_missing_or_malformed_topology(topology):
+    record = CheckpointFormatState()
+    saved = record.state_dict()
+    if topology is None:
+        saved.pop("topology")
+    else:
+        saved["topology"] = topology
+    with pytest.raises(ValueError, match="source topology record"):
+        record.validate_state_dict(saved)
+
+
+def test_format_preflight_rejects_inconsistent_topology_degrees():
+    import json
+    from dataclasses import asdict
+
+    from llmtuner.parallel.topology import ParallelTopologySnapshot
+
+    record = CheckpointFormatState()
+    saved = record.state_dict()
+    degrees = asdict(ParallelTopologySnapshot())
+    degrees["tp"] = 2
+    saved["topology"] = json.dumps(degrees)
+    with pytest.raises(ValueError, match="source topology record"):
+        record.validate_state_dict(saved)
+
+
+def test_format_capture_rejects_inconsistent_local_topology():
+    from torch import nn
+
+    from llmtuner.parallel.assembly import ModelPartLayout
+    from llmtuner.parallel.topology import ParallelTopologySnapshot
+
+    layouts = (
+        ModelPartLayout(topology=ParallelTopologySnapshot()),
+        ModelPartLayout(topology=None),
+    )
+    with pytest.raises(ValueError, match="different topologies"):
+        CheckpointFormatState.capture(
+            [nn.Linear(2, 2), nn.Linear(2, 2)], runtime_layouts=layouts
+        )
+
+
+def test_format_capture_rejects_cross_rank_topology_disagreement(monkeypatch):
+    from torch import nn
+
+    from llmtuner.components.checkpointer.core import format_state
+    from llmtuner.parallel.assembly import ModelPartLayout
+    from llmtuner.parallel.topology import ParallelTopologySnapshot
+
+    monkeypatch.setattr(format_state, "get_world_size", lambda: 2)
+
+    def gather(peers, local):
+        peers[:] = [local, (local[0], ParallelTopologySnapshot(tp=2, world_size=2))]
+
+    monkeypatch.setattr(format_state.dist, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="topology declarations differ across ranks"):
+        CheckpointFormatState.capture(
+            [nn.Linear(2, 2)],
+            runtime_layouts=(ModelPartLayout(topology=ParallelTopologySnapshot()),),
+        )

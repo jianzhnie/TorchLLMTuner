@@ -25,7 +25,10 @@ from llmtuner.config import LLMTunerConfig, TrainingConfig, ValidationConfig
 from llmtuner.models.common.validation import temporary_attention_mask
 from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.trainer.runtime.engine import TrainingEngine
-from llmtuner.trainer.runtime.validation import check_validation_feasibility
+from llmtuner.trainer.runtime.validation import (
+    ValidationDataLoaderResources,
+    check_validation_feasibility,
+)
 
 
 @pytest.mark.parametrize("failed", [False, True])
@@ -802,6 +805,7 @@ def test_pipeline_validation_cleanup_preserves_iteration_error(
     ) as caught:
         validation_module.run_validation_loop(
             trainer,
+            loader_resources=ValidationDataLoaderResources(),
             cfg=trainer.cfg,
             metrics=None,
             token_counter=lambda batch: 0,
@@ -844,6 +848,7 @@ def test_validation_closes_loader_after_token_allocation_failure(monkeypatch, pi
     with pytest.raises(RuntimeError, match="token allocation failed") as caught:
         validation_module.run_validation_loop(
             trainer,
+            loader_resources=ValidationDataLoaderResources(),
             cfg=trainer.cfg,
             metrics=None,
             token_counter=lambda batch: 0,
@@ -852,3 +857,26 @@ def test_validation_closes_loader_after_token_allocation_failure(monkeypatch, pi
         )
     assert caught.value is original
     assert closed == [True]
+
+
+@pytest.mark.parametrize("pass_failed", [False, True])
+def test_validation_loader_owner_retries_failed_close(pass_failed):
+    calls = []
+
+    class Loader:
+        def close(self):
+            calls.append("close")
+            if len(calls) == 1:
+                raise RuntimeError("temporary close failure")
+
+    resources = ValidationDataLoaderResources()
+    loader = Loader()
+    resources.acquire(loader)
+    if pass_failed:
+        resources.close_dataloader(loader, failed=True)
+    else:
+        with pytest.raises(RuntimeError, match="temporary close failure"):
+            resources.close_dataloader(loader, failed=False)
+    resources.close()
+    resources.close()
+    assert calls == ["close", "close"]

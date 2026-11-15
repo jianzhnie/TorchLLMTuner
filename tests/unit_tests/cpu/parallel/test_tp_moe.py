@@ -31,13 +31,17 @@ from llmtuner.models.contracts import GatedMLPStructure, MoEBlockContract
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel import linear as tp_linear
+from llmtuner.parallel.tensor_parallel import sequence_boundary as tp_boundaries
 from llmtuner.parallel.tensor_parallel import tensor_parallel as tp_engine
+from llmtuner.parallel.tensor_parallel.sequence_boundary import (
+    FeatureParallelSequenceBoundary,
+    TPMoeSequenceBoundary,
+)
 from llmtuner.parallel.tensor_parallel.sharding import (
     MOE_PLAN_SPECS,
     resolve_tp_sharding_plan,
 )
 from llmtuner.parallel.tensor_parallel.tensor_parallel import (
-    TPMoeSequenceBoundary,
     resolve_tp_targets,
     shard_experts_for_tp,
 )
@@ -294,7 +298,7 @@ def test_apply_tp_shards_the_block_and_keeps_state_dict_fqns() -> None:
     # Router replicated, bit-identical.
     assert torch.equal(block.gate.weight, router_before)
     # The boundary mixin and the grad-allreduce exclusion marker are installed.
-    assert block._tp_seq_group is not None or hasattr(block, "_tp_seq_group")
+    assert isinstance(block, FeatureParallelSequenceBoundary)
     assert block.tp_sharded_param_names == frozenset(
         {"experts.gate_up_proj", "experts.down_proj"}
     )
@@ -526,7 +530,7 @@ def test_moe_tp_validates_all_blocks_before_sharding(failure) -> None:
         )
     for block, parameters in zip(blocks, original, strict=True):
         assert type(block) is _MoeBlock
-        assert not hasattr(block, "_tp_moe_boundary")
+        assert not isinstance(block, FeatureParallelSequenceBoundary)
         assert all(
             dict(block.named_parameters())[name] is p for name, p in parameters.items()
         )
@@ -579,8 +583,7 @@ def test_apply_tp_defers_the_moe_blocks_to_ep_when_ep_is_on() -> None:
     assert block.experts.gate_up_proj.shape == (4, 16, 16)
     assert block.experts.down_proj.shape == (4, 16, 8)
     assert not hasattr(block, "tp_sharded_param_names")
-    assert "_tp_moe_boundary" not in block.__dict__
-    assert not type(block).__name__.startswith("TPMoe")
+    assert not isinstance(block, FeatureParallelSequenceBoundary)
     for k, v in model.state_dict().items():
         assert torch.equal(v, before[k])
 
@@ -672,8 +675,8 @@ def test_tp_rejects_shared_moe_shards_before_mutating_model(sharing):
         assert parameter is parameters[name]
         torch.testing.assert_close(parameter, values[name], rtol=0, atol=0)
     assert [type(first), type(second)] == classes
-    assert not getattr(first, "_tp_moe_boundary", False)
-    assert not getattr(second, "_tp_moe_boundary", False)
+    assert not isinstance(first, FeatureParallelSequenceBoundary)
+    assert not isinstance(second, FeatureParallelSequenceBoundary)
 
 
 @pytest.mark.parametrize("same_module", [False, True])
@@ -757,7 +760,7 @@ def test_the_dense_plan_leaves_moe_internals_to_the_expert_axis(ep: int) -> None
 
 
 def test_tp_moe_non_tensor_output_uses_combination_error(monkeypatch):
-    monkeypatch.setattr(tp_engine, "all_gather_along", lambda tensor, *args: tensor)
+    monkeypatch.setattr(tp_boundaries, "all_gather_along", lambda tensor, *args: tensor)
     block = TPMoeSequenceBoundary()
     block._tp_seq_group = None
     block._tp_moe_original_forward = lambda hidden: (hidden, hidden)

@@ -214,14 +214,14 @@ def test_a_resume_reproduces_the_uninterrupted_average() -> None:
         )
 
 
-def test_an_empty_state_dict_cold_starts_from_the_model_weights() -> None:
+def test_explicit_cold_start_reseeds_from_the_model_weights() -> None:
     model = _model()
     ema = EMA(model_parts=[model])
     with torch.no_grad():
         for p in model.parameters():
             p.mul_(3.0)
 
-    ema.load_state_dict({})
+    ema.reset_from_model()
 
     for name, p in model.named_parameters():
         torch.testing.assert_close(_ema_params(ema)[name], p.detach())
@@ -242,7 +242,7 @@ def test_matching_buffers_are_tracked_under_the_same_flat_layout() -> None:
 
     # And the cold start reseeds buffers too.
     model.expert_bias_E.fill_(8.0)
-    ema.load_state_dict({})
+    ema.reset_from_model()
     torch.testing.assert_close(_ema_params(ema)["expert_bias_E"], torch.full((4,), 8.0))
 
 
@@ -365,7 +365,7 @@ def test_cold_start_rejects_replaced_parameter_without_partial_updates():
     model[1].weight = nn.Parameter(torch.zeros_like(model[1].weight))
     replacement = model[1].weight
     with pytest.raises(RuntimeError, match="no state for"):
-        ema.load_state_dict({})
+        ema.reset_from_model()
     assert replacement not in ema.optimizers[0].state
     for key, value in _ema_params(ema).items():
         torch.testing.assert_close(value, before[key])
@@ -377,7 +377,7 @@ def test_cold_start_rejects_replaced_buffer_without_inserting_state():
     ema = EMA(model_parts=[model], buffer_patterns=["expert_bias_E$"])
     model.expert_bias_E = torch.zeros(4)
     with pytest.raises(RuntimeError, match="no state for"):
-        ema.load_state_dict({})
+        ema.reset_from_model()
     assert model.expert_bias_E not in ema._buffer_optimizers[0].state
 
 
@@ -475,7 +475,7 @@ def test_ema_rejects_shrinking_scope_before_changing_averages(operation, change)
         if operation == "update":
             ema.step(1)
         else:
-            ema.load_state_dict({})
+            ema.reset_from_model()
 
     for average, expected in zip(averages, before, strict=True):
         torch.testing.assert_close(average, expected)
@@ -586,7 +586,7 @@ def test_metadata_change_is_rejected_before_any_average_mutation(operation, chan
         if operation == "step":
             ema.step(1)
         else:
-            ema.load_state_dict({})
+            ema.reset_from_model()
     for name, value in _ema_params(ema).items():
         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
@@ -612,7 +612,7 @@ def test_renamed_tensor_is_rejected_before_any_average_mutation(operation, kind)
         if operation == "step":
             ema.step(1)
         elif operation == "cold_start":
-            ema.load_state_dict({})
+            ema.reset_from_model()
         elif operation == "save":
             ema.state_dict()
         else:
@@ -778,6 +778,7 @@ def test_empty_ema_scope_can_step_checkpoint_and_cold_start(parts):
     assert ema.state_dict() == {}
     ema.step(1)
     ema.load_state_dict({})
+    ema.reset_from_model()
     assert ema.state_dict() == {}
 
 
@@ -819,3 +820,16 @@ def test_buffer_selection_uses_canonical_aliases_through_wrappers(wrapper):
     ema.step(1)
     torch.testing.assert_close(_ema_params(ema)["layer.first_bias"], torch.ones(2))
     assert len(ema._buffer_optimizers[0].state) == 1
+
+
+def test_empty_checkpoint_cannot_implicitly_reset_tracked_averages():
+    model = _model()
+    ema = EMA(model_parts=[model], decay=0.5)
+    before = {name: value.clone() for name, value in _ema_params(ema).items()}
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(2)
+    with pytest.raises(ValueError, match="explicit cold start"):
+        ema.load_state_dict({})
+    for name, average in _ema_params(ema).items():
+        torch.testing.assert_close(average, before[name], rtol=0, atol=0)

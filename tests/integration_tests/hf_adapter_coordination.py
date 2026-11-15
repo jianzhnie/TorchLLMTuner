@@ -25,13 +25,20 @@ def main() -> None:
         rank = dist.get_rank()
         for indexed, failing_rank in product((False, True), (0, 1)):
             adapter = ModelStateDictAdapter(
-                SimpleNamespace(tie_word_embeddings=False), None, model_prefix="model."
+                SimpleNamespace(model_type="qwen3_moe", tie_word_embeddings=False),
+                None,
+                expert_parallel=True,
             )
+            first_key = "model.layers.0.mlp.gate.weight"
+            second_key = "model.layers.1.mlp.gate.weight"
             if indexed:
-                adapter._hf_keys = {"weight", "other"}
-            state = {"model.weight" if rank == 0 else "model.other": torch.ones(2)}
+                adapter._hf_keys = {first_key, second_key}
+            state = {first_key if rank == 0 else second_key: torch.ones(2)}
             if rank == failing_rank:
-                state = {"model.weight": torch.ones(2), "weight": torch.zeros(2)}
+                state = {
+                    "model.layers.0.mlp.router.gate.weight": torch.ones(2),
+                    first_key: torch.zeros(2),
+                }
             before = deepcopy(state)
             caught = None
             try:
@@ -48,9 +55,9 @@ def main() -> None:
                 assert isinstance(caught, RuntimeError), caught
                 assert str(caught) == "HF export key mapping failed on another rank"
             torch.testing.assert_close(state, before, rtol=0, atol=0)
-            healthy = {"model.weight" if rank == 0 else "model.other": torch.ones(2)}
+            healthy = {first_key if rank == 0 else second_key: torch.ones(2)}
             result = adapter.to_hf(healthy)
-            expected_key = "weight" if rank == 0 else "other"
+            expected_key = first_key if rank == 0 else second_key
             assert set(result) == {expected_key}
             assert result[expected_key] is next(iter(healthy.values()))
             dist.barrier()
