@@ -30,24 +30,42 @@ class ShardingConfig:
             here rather than looked up from ``kind`` so a caller can swap in a
             different realizer (e.g. a fused-QKV variant) without touching the
             engine.
+        sequence_transform: whether the projection gathers, scatters or retains
+            its input token rows. Weight shard direction alone does not specify
+            the activation layout, especially for attention-local projections.
     """
 
     kind: ShardKind
     implementation: type[nn.Module]
+    sequence_transform: Literal["gather", "scatter", "preserve"]
 
     def __post_init__(self) -> None:
         if self.kind not in ("colwise", "rowwise"):
             raise ValueError(f"Unknown shard kind {self.kind!r}")
+        if self.sequence_transform not in ("gather", "scatter", "preserve"):
+            raise ValueError("TP projection must declare its sequence transformation")
+        if not isinstance(self.implementation, type) or not issubclass(
+            self.implementation, nn.Module
+        ):
+            raise TypeError("TP projection implementation must be an nn.Module class")
 
 
 def colwise() -> ShardingConfig:
     """Output features split; activations stay feature-sharded after the GEMM."""
-    return ShardingConfig(kind="colwise", implementation=ColumnParallelLinear)
+    return ShardingConfig(
+        kind="colwise",
+        implementation=ColumnParallelLinear,
+        sequence_transform="gather",
+    )
 
 
 def rowwise() -> ShardingConfig:
     """Input features split; activations reduce-scatter back to a sequence shard."""
-    return ShardingConfig(kind="rowwise", implementation=RowParallelLinear)
+    return ShardingConfig(
+        kind="rowwise",
+        implementation=RowParallelLinear,
+        sequence_transform="scatter",
+    )
 
 
 def model_tp_config(model: nn.Module) -> Mapping[str, str | ShardingConfig]:

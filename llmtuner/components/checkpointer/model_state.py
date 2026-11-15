@@ -7,8 +7,8 @@ Native DCP and optimizer recovery remain owned by the existing checkpointer.
 
 from __future__ import annotations
 
-import json
 import os
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -18,12 +18,13 @@ from torch.distributed.tensor import DTensor
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...models.registry import resolve_state_format
+from ...parallel.assembly import ModelPartLayout
 from .core.checkpoint_keys import SAFETENSORS_INDEX
 from .core.chunked_tensor import ChunkedCheckpointTensor
 from .hf.hf_expert_storage import (
     GroupedExpertHuggingFaceStorageReader,
 )
-from .hf.hf_storage import IndexedHuggingFaceStorageReader
+from .hf.hf_storage import IndexedHuggingFaceStorageReader, read_hf_weight_map
 
 
 def clone_local_state_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -54,6 +55,10 @@ class ModelStateDictAdapter:
     process group for standalone callers.
     """
 
+    # to_hf prepares reader destinations and coordinates key coverage itself.
+    # from_hf remains local for formats without collective tensor conversion.
+    coordinates_hf_preparation = True
+
     def __init__(
         self,
         model_config: Any,
@@ -63,6 +68,7 @@ class ModelStateDictAdapter:
         expert_parallel: bool = False,
         sharded_expert_parallel: bool = True,
         error_group: dist.ProcessGroup | None = None,
+        runtime_layouts: tuple[ModelPartLayout, ...] = (),
     ) -> None:
         if not isinstance(model_prefix, str) or (
             model_prefix
@@ -84,6 +90,14 @@ class ModelStateDictAdapter:
         # Includes all PP owners whose external keys form one checkpoint.
         # The adapter borrows this group; the entry point owns its lifetime.
         self.error_group = error_group
+        self.runtime_parameter_names: dict[str, str] = {}
+        for layout in runtime_layouts:
+            if not isinstance(layout, ModelPartLayout):
+                raise TypeError("Checkpoint layouts must be ModelPartLayout")
+            for path, canonical in layout.state_parameter_names.items():
+                previous = self.runtime_parameter_names.setdefault(path, canonical)
+                if previous != canonical:
+                    raise ValueError(f"Runtime parameter alias conflict: {path!r}")
         # Composite HF models store the trained decoder's weight ties here.
         self.model_config = getattr(model_config, "text_config", model_config)
         self.state_format = resolve_state_format(
@@ -108,21 +122,7 @@ class ModelStateDictAdapter:
                     self._hf_keys = set(tensors.keys())
                 self._normalize_expert_keys()
             return
-        with open(index_path, encoding="utf-8") as stream:
-            index = json.load(stream)
-        weight_map = index.get("weight_map") if isinstance(index, dict) else None
-        if not isinstance(weight_map, dict) or not weight_map:
-            raise ValueError("HF checkpoint index requires a non-empty weight_map")
-        if any(
-            not isinstance(key, str)
-            or not key
-            or not isinstance(filename, str)
-            or not filename
-            for key, filename in weight_map.items()
-        ):
-            raise ValueError(
-                "HF weight_map keys and filenames must be non-empty strings"
-            )
+        weight_map = read_hf_weight_map(index_path)
         self._hf_keys = set(weight_map)
         # HF filenames need not contain a shard number. Preserve their tensor
         # grouping while providing the writer's required contiguous 1..N IDs.
@@ -150,14 +150,22 @@ class ModelStateDictAdapter:
             )
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        state_dict = self.state_format.convert_state(
-            state_dict, to_hf=True, error_group=self.error_group
-        )
+        with (
+            nullcontext()
+            if self.state_format.coordinates_conversion
+            else synchronize_local_errors(
+                "HF destination format conversion", group=self.error_group
+            )
+        ):
+            state_dict = self.state_format.convert_state(
+                state_dict, to_hf=True, error_group=self.error_group
+            )
         # Only dictionary mapping is local. Model-owned tensor conversion above and
         # the global PP coverage gather below stay outside this boundary.
         with synchronize_local_errors("HF export key mapping", group=self.error_group):
             hf_state = {}
             for key, value in state_dict.items():
+                key = self.runtime_parameter_names.get(key, key)
                 hf_key = self.state_format.map_key(
                     key.removeprefix(self.model_prefix), to_hf=True
                 )
@@ -207,21 +215,29 @@ class ModelStateDictAdapter:
         return hf_state
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
-        hf_state_dict = dict(hf_state_dict)
-        if (
-            "lm_head.weight" not in hf_state_dict
-            and "model.embed_tokens.weight" in hf_state_dict
-            and getattr(self.model_config, "tie_word_embeddings", False)
+        # Local formats retain standalone single-rank key mapping. Collective
+        # formats must agree on mapping failures before entering tensor work.
+        with (
+            synchronize_local_errors("HF import key mapping", group=self.error_group)
+            if self.state_format.coordinates_conversion
+            else nullcontext()
         ):
-            hf_state_dict["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"]
-        # Plain key mapping is local: callers may invoke it on only one rank.
-        # Model-owned tensor-layout conversion below retains its collective contract.
-        state = {}
-        for key, value in hf_state_dict.items():
-            target = self.model_prefix + self.state_format.map_key(key, to_hf=False)
-            if target in state:
-                raise ValueError(f"HF checkpoint key mapping collision: {target!r}")
-            state[target] = value
+            hf_state_dict = dict(hf_state_dict)
+            if (
+                "lm_head.weight" not in hf_state_dict
+                and "model.embed_tokens.weight" in hf_state_dict
+                and getattr(self.model_config, "tie_word_embeddings", False)
+            ):
+                hf_state_dict["lm_head.weight"] = hf_state_dict[
+                    "model.embed_tokens.weight"
+                ]
+            state = {}
+            for key, value in hf_state_dict.items():
+                target = self.model_prefix + self.state_format.map_key(key, to_hf=False)
+                target = self.runtime_parameter_names.get(target, target)
+                if target in state:
+                    raise ValueError(f"HF checkpoint key mapping collision: {target!r}")
+                state[target] = value
         return self.state_format.convert_state(
             state, to_hf=False, error_group=self.error_group
         )
@@ -282,8 +298,7 @@ class ModelStateDictAdapter:
         if layout is not None:
             return GroupedExpertHuggingFaceStorageReader(
                 path,
-                num_experts=layout.num_experts,
+                layout=layout,
                 thread_count=thread_count,
-                native_ep_layout=layout.native_ep_layout,
             )
         return IndexedHuggingFaceStorageReader(path, thread_count=thread_count)

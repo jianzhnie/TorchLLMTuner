@@ -59,6 +59,7 @@ from ..storage import filesystem
 
 if TYPE_CHECKING:
     from ....config.checkpoint_config import CheckpointConfig
+    from ....parallel.assembly import ModelPartLayout
 
 from ....utils.logging import get_logger
 from ..core.base import BaseCheckpointManager, purge_thread
@@ -72,7 +73,14 @@ from ..core.checkpoint_keys import (
     TRAIN_STATE,
 )
 from ..core.random_state import RNGCheckpointState
-from ..core.state_adaptation import adapt_hf_model_state
+from ..core.state_adaptation import (
+    adapt_hf_model_state,
+    materialize_local_checkpoint_states,
+    prepare_hf_model_state,
+    prepare_local_state_preflight,
+    validate_local_preflight_selection,
+    validate_local_state_preflight,
+)
 from ..storage.checkpointing_metadata import adapt_npu_metadata_gather
 from ..storage.checkpointing_staging import adapt_npu_staging
 
@@ -423,6 +431,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         optimizer: Any,
         lr_scheduler: Any,
         ema: Any | None = None,
+        runtime_layouts: tuple[ModelPartLayout, ...] = (),
         states: dict[str, Any],
         folder: str,
         sd_adapter: Any | None = None,
@@ -436,6 +445,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             ema=ema,
+            runtime_layouts=runtime_layouts,
             states=states,
             folder=folder,
         )
@@ -570,35 +580,37 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         from_hf: bool,
         from_quantized: bool,
     ) -> None:
-        if from_quantized:
-            raise ValueError(
-                "TorchCheckpointingManager does not support loading "
-                "quantized Hugging Face checkpoints."
+        with synchronize_local_errors("Checkpoint source format validation"):
+            if from_quantized:
+                raise ValueError(
+                    "TorchCheckpointingManager does not support loading "
+                    "quantized Hugging Face checkpoints."
+                )
+            if from_hf and self.sd_adapter is None:
+                raise ValueError(
+                    "checkpoint.initial_load_in_hf is True, "
+                    "but sd_adapter is not provided."
+                )
+            hf_metadata_format = (
+                self._backend.HuggingFaceSafetensorsDistributedMetadataFormat
             )
-        if from_hf and self.sd_adapter is None:
-            raise ValueError(
-                "checkpoint.initial_load_in_hf is True, but sd_adapter is not provided."
-            )
-        hf_metadata_format = (
-            self._backend.HuggingFaceSafetensorsDistributedMetadataFormat
-        )
-        if from_hf and hf_metadata_format is None:
-            raise ValueError(
-                "Loading Hugging Face checkpoints needs a torch_checkpointing "
-                "build with hf.metadata; upgrade torch_checkpointing or use "
-                "the DCP checkpoint manager."
-            )
+            if from_hf and hf_metadata_format is None:
+                raise ValueError(
+                    "Loading Hugging Face checkpoints needs a torch_checkpointing "
+                    "build with hf.metadata; upgrade torch_checkpointing or use "
+                    "the DCP checkpoint manager."
+                )
 
-        is_valid_checkpoint = (
-            self._is_hf_checkpoint(checkpoint_id, MODEL)
-            if from_hf
-            else self._is_resumable_checkpoint(checkpoint_id)
-        )
-        if not is_valid_checkpoint:
-            raise ValueError(
-                f"Checkpoint {checkpoint_id!r} is not a supported "
-                "torch_checkpointing checkpoint."
+            is_valid_checkpoint = (
+                self._is_hf_checkpoint(checkpoint_id, MODEL)
+                if from_hf
+                else self._is_resumable_checkpoint(checkpoint_id)
             )
+            if not is_valid_checkpoint:
+                raise ValueError(
+                    f"Checkpoint {checkpoint_id!r} is not a supported "
+                    "torch_checkpointing checkpoint."
+                )
         # strict: the backend skips by default anything the checkpoint does not
         # carry, which would silently leave parameters at their initialized
         # values and resume from a model that is not the one that was saved.
@@ -606,32 +618,23 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # in ``states`` here is genuinely required.
         if not from_hf:
             with synchronize_local_errors("Checkpoint local preflight preparation"):
-                preflight_states = {
-                    key: states[key]
-                    for key in (RNG_STATE, DATALOADER, TRAIN_STATE, LR_SCHEDULER)
-                    if key in states
-                    and callable(getattr(states[key], "validate_state_dict", None))
-                }
-                preflight_destination = {
-                    key: state.state_dict() for key, state in preflight_states.items()
-                }
+                preflight_states, preflight_destination = prepare_local_state_preflight(
+                    states
+                )
+            validate_local_preflight_selection(preflight_states)
             if preflight_states:
                 # The backend caches schema metadata per manager. A subset read
                 # must not invalidate the full reader's cached model layout.
-                preflight_config = default_backend_config(
-                    self._backend,
-                    sync_save_config(self._backend, use_barrier=False),
-                    storage_config=self._manager_config.storage_config,
-                    items={},
-                )
+                with synchronize_local_errors("Checkpoint preflight reader config"):
+                    preflight_config = default_backend_config(
+                        self._backend,
+                        sync_save_config(self._backend, use_barrier=False),
+                        storage_config=self._manager_config.storage_config,
+                        items={},
+                    )
                 with temporary_backend_manager(preflight_config) as reader:
                     reader.load(checkpoint_id, into=preflight_destination, strict=True)
-                for key, state in preflight_states.items():
-                    phase = "RNG" if key == RNG_STATE else key
-                    with synchronize_local_errors(
-                        f"Checkpoint {phase} preflight validation"
-                    ):
-                        state.validate_state_dict(preflight_destination[key])
+                validate_local_state_preflight(preflight_states, preflight_destination)
         state_dict = self._stateful_to_state_dict(states)
         if from_hf:
             assert self.sd_adapter is not None
@@ -639,23 +642,28 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             # metadata format names safetensors (an export carries no native
             # metadata). The item keeps the model's resharder, so every
             # safetensors source is resharded into the model's DTensors.
-            hf_state = self.sd_adapter.to_hf(state_dict[MODEL])
-            model_spec = self._manager_config.items[MODEL]
-            backend = self._backend
-            hf_config = default_backend_config(
-                backend,
-                sync_save_config(backend, use_barrier=False),
-                storage_config=self._manager_config.storage_config,
-                items={
-                    MODEL: backend.ItemSpec(
-                        requires_copy=model_spec.requires_copy,
-                        layout=model_spec.layout,
-                        resharder=model_spec.resharder,
-                        required=model_spec.required,
-                    )
-                },
-                default=None,
+            hf_state = prepare_hf_model_state(
+                self.sd_adapter,
+                state_dict[MODEL],
+                error_group=getattr(self.sd_adapter, "error_group", None),
             )
+            with synchronize_local_errors("HF checkpoint reader config"):
+                model_spec = self._manager_config.items[MODEL]
+                backend = self._backend
+                hf_config = default_backend_config(
+                    backend,
+                    sync_save_config(backend, use_barrier=False),
+                    storage_config=self._manager_config.storage_config,
+                    items={
+                        MODEL: backend.ItemSpec(
+                            requires_copy=model_spec.requires_copy,
+                            layout=model_spec.layout,
+                            resharder=model_spec.resharder,
+                            required=model_spec.required,
+                        )
+                    },
+                    default=None,
+                )
             with temporary_backend_manager(hf_config) as hf_manager:
                 hf_manager.load(
                     checkpoint_id,
@@ -723,6 +731,8 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
     @staticmethod
     def _stateful_to_state_dict(states: dict[str, Any]) -> dict[str, Any]:
+        with synchronize_local_errors("Checkpoint local state preparation"):
+            states = materialize_local_checkpoint_states(states)
         return _stateful_to_state_dict(states)
 
     def _save_payload(self, states: dict[str, Any]) -> dict[str, Any]:

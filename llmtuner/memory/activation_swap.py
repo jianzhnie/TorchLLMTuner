@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import weakref
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from threading import Lock
 from time import perf_counter
@@ -21,8 +21,10 @@ from ..utils.logging import get_logger
 logger = get_logger(__name__)
 
 __all__ = [
+    "ActivationSwapResources",
     "activation_swap_metrics",
     "apply_activation_swap",
+    "drain_activation_swap",
     "reset_activation_swap_metrics",
 ]
 
@@ -41,7 +43,7 @@ def _record(event, stream) -> None:
         event.record(stream)
 
 
-@dataclass
+@dataclass(eq=False)
 class _SwappedActivation:
     device_tensor: torch.Tensor | None
     host_tensor: torch.Tensor | None
@@ -77,6 +79,11 @@ _copies_h2d = 0
 class _HostBudget:
     limit: int = 0
     current: int = 0
+    pending: weakref.WeakSet[_SwappedActivation] = field(
+        default_factory=weakref.WeakSet
+    )
+    failed_states: list[_ForwardSwapState] = field(default_factory=list)
+    failed_transfers: dict[int, _SwappedActivation] = field(default_factory=dict)
 
 
 def _release_host_bytes(num_bytes: int, budget: _HostBudget) -> None:
@@ -132,13 +139,6 @@ class _ForwardSwapState:
             _release_host_bytes(host_nbytes, self.budget)
             raise
         weakref.finalize(host_tensor, _release_host_bytes, host_nbytes, self.budget)
-        start, end = (_new_event(), _new_event()) if _metrics_enabled else (None, None)
-        current = _stream_api().current_stream()
-        with _stream_api().stream(self.d2h_stream):
-            self.d2h_stream.wait_stream(current)
-            _record(start, self.d2h_stream)
-            host_tensor.copy_(tensor.detach(), non_blocking=True)
-            _record(end, self.d2h_stream)
         packed = _SwappedActivation(
             tensor.detach(),
             host_tensor,
@@ -146,13 +146,24 @@ class _ForwardSwapState:
             self.h2d_stream,
             tensor.device,
         )
+        with _metrics_lock:
+            self.budget.pending.add(packed)
+        # Establish storage ownership before submitting copies: a copy/event
+        # failure can itself be followed by a failed stream synchronization.
+        self.packed.append(packed)
+        start, end = (_new_event(), _new_event()) if _metrics_enabled else (None, None)
+        current = _stream_api().current_stream()
+        with _stream_api().stream(self.d2h_stream):
+            self.d2h_stream.wait_stream(current)
+            _record(start, self.d2h_stream)
+            host_tensor.copy_(tensor.detach(), non_blocking=True)
+            _record(end, self.d2h_stream)
         copy_bytes = tensor.numel() * tensor.element_size()
         with _metrics_lock:
             _d2h_bytes += copy_bytes
             _copies_d2h += 1
             if start is not None:
                 _d2h_events.append((start, end))
-        self.packed.append(packed)
         return packed
 
     def release(self, outputs: Any) -> None:
@@ -178,6 +189,81 @@ class _ForwardSwapState:
 
     def abort(self) -> None:
         self.d2h_stream.synchronize()
+        self.h2d_stream.synchronize()
+
+
+def drain_activation_swap(model: nn.Module) -> None:
+    """Wait for outstanding model-owned transfers without discarding autograd state.
+
+    Weak registrations leave saved tensor lifetime with autograd. Failed waits
+    retain their stream owners so callers can retry shutdown.
+    """
+    streams: dict[int, Any] = {}
+    budgets: dict[int, _HostBudget] = {}
+    for module in model.modules():
+        budget = getattr(module.forward, "_activation_swap_budget", None)
+        if not isinstance(budget, _HostBudget):
+            continue
+        budgets[id(budget)] = budget
+    # Keep strong references to every pending activation until all waits finish.
+    # Retaining streams alone does not retain the buffers used by their copies.
+    with _metrics_lock:
+        snapshots = [
+            (budget, tuple(budget.pending), tuple(budget.failed_states))
+            for budget in budgets.values()
+        ]
+    for _, pending, failed_states in snapshots:
+        for packed in (*pending, *failed_states):
+            for stream in (packed.d2h_stream, packed.h2d_stream):
+                streams[id(stream)] = stream
+    first_error: BaseException | None = None
+    for stream in streams.values():
+        try:
+            stream.synchronize()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        # Weak autograd registrations alone cannot own a failed shutdown. Keep
+        # transfer buffers alive even after the caller drops the exception.
+        with _metrics_lock:
+            for budget, pending, _ in snapshots:
+                budget.failed_transfers.update(
+                    (id(packed), packed) for packed in pending
+                )
+        raise first_error
+    # Failed forward graphs can release their Host storage only after both
+    # streams drain. Leave new failures and external autograd owners untouched.
+    for budget, pending, failed_states in snapshots:
+        drained = {id(state) for state in failed_states}
+        with _metrics_lock:
+            for packed in pending:
+                budget.failed_transfers.pop(id(packed), None)
+            budget.failed_states[:] = [
+                state for state in budget.failed_states if id(state) not in drained
+            ]
+
+
+@dataclass(slots=True)
+class ActivationSwapResources:
+    """Own transfer draining independently of execution engine construction."""
+
+    model_parts: tuple[nn.Module, ...]
+
+    def close(self) -> None:
+        first_error: BaseException | None = None
+        failed: list[nn.Module] = []
+        for part in reversed(self.model_parts):
+            try:
+                drain_activation_swap(part)
+            except BaseException as error:
+                failed.append(part)
+                if first_error is None:
+                    first_error = error
+        # Retain only owners that still need draining, in their original order.
+        self.model_parts = tuple(reversed(failed))
+        if first_error is not None:
+            raise first_error
 
 
 def _flatten(value: Any) -> Iterator[Any]:
@@ -290,17 +376,10 @@ def apply_activation_swap(
             "pinned Host memory and asynchronous copy streams."
         )
     structure = getattr(model, "decoder_structure", None)
-    if structure is not None:
-        if not isinstance(structure, DecoderStructure):
-            raise TypeError("Activation swap requires a model-owned DecoderStructure")
-        # Bind only local blocks: PP may have removed the embedding or head.
-        # A malformed explicit declaration must never fall back to inspection.
-        layers = structure.bind_blocks(model)
-    else:
-        # Compatibility for standalone modules without an explicit contract.
-        layers = getattr(model, "layers", None)
-        if not isinstance(layers, nn.Module):
-            raise TypeError("activation swap requires a model with a .layers module")
+    if not isinstance(structure, DecoderStructure):
+        raise TypeError("Activation swap requires a model-owned DecoderStructure")
+    # Bind only local blocks: PP may have removed the embedding or head.
+    layers = structure.bind_blocks(model)
 
     # Resolve existing ownership before touching any forward. A partial model
     # extension must share the original budget with outstanding saved tensors.
@@ -359,6 +438,8 @@ def apply_activation_swap(
                 try:
                     state.abort()
                 except BaseException:
+                    with _metrics_lock:
+                        budget.failed_states.append(state)
                     try:
                         logger.exception("Activation swap cleanup failed after forward")
                     except BaseException:

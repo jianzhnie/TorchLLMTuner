@@ -156,14 +156,9 @@ def apply_compile(
     layers = None
     if compile_config.per_block:
         structure = getattr(model, "decoder_structure", None)
-        if structure is not None:
-            if not isinstance(structure, DecoderStructure):
-                raise TypeError("Per-block compile requires a DecoderStructure")
-            layers = structure.bind_blocks(model)
-        else:
-            layers = getattr(model, "layers", None)
-    if compile_config.per_block and not isinstance(layers, nn.Module):
-        raise TypeError("per_block compile requires a model with a .layers module")
+        if not isinstance(structure, DecoderStructure):
+            raise TypeError("Per-block compile requires a DecoderStructure")
+        layers = structure.bind_blocks(model)
 
     # Resolve registered/custom backends before changing module or global flags.
     validate_compile_environment(compile_config)

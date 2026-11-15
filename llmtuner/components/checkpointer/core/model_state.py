@@ -18,6 +18,11 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 
 from ....accelerator.collectives import synchronize_local_errors
+from ....parallel.assembly import (
+    ModelPartLayout,
+    capture_model_part_layouts,
+    validate_model_part_layouts,
+)
 from ....parallel.expert_parallel.checkpointing import (
     expert_shard_map,
     gather_expert_state,
@@ -67,12 +72,17 @@ class ModelCheckpointState(Stateful):
        in place: their storage stays put while their values track the parameters.
 
     Notes:
-        - ``load_state_dict`` updates the underlying modules and releases the
-          cache. The next save starts a new stable-storage cache generation.
+        - ``load_state_dict`` releases the cache before writing the underlying
+          modules, including when a load hook later fails. The next save starts
+          a new stable-storage cache generation; failed loads are not rolled back.
         - The module tree must not be structurally modified (keys changing,
           tensor references replaced) after wrapping, or the cache goes stale.
+          Parameter bindings are captured through ``ModelPartLayout`` and
+          checked before export or restore; rebuild the wrapper after changes.
         - A hook that changes the exported view over aliased live storage forces
           one cache allocation to avoid mutating model tensors during refresh.
+        - ``runtime_layouts`` shares final assembly ownership when supplied.
+          Otherwise a standalone wrapper captures local bindings itself.
     """
 
     def __init__(
@@ -82,9 +92,11 @@ class ModelCheckpointState(Stateful):
         initialization_group: ProcessGroup | None = None,
         sharded_tensor_parallel: bool = False,
         sharded_expert_parallel: bool = False,
+        runtime_layouts: tuple[ModelPartLayout, ...] = (),
     ) -> None:
         self.sharded_tensor_parallel = sharded_tensor_parallel
         self.sharded_expert_parallel = sharded_expert_parallel
+        self._validation_group = initialization_group
         # Managers opt into a world boundary before any EP collection. Direct
         # state wrappers can be rank-local and retain that default contract.
         with (
@@ -104,6 +116,14 @@ class ModelCheckpointState(Stateful):
                 part._orig_mod if isinstance(part, OptimizedModule) else part
                 for part in parts
             ]
+            self._layout_models = parts if runtime_layouts else tuple(self.model)
+            self._model_layouts = tuple(runtime_layouts) or capture_model_part_layouts(
+                self._layout_models
+            )
+            validate_model_part_layouts(self._layout_models, self._model_layouts)
+            self._bound_layout_parameters = tuple(
+                dict(layout.parameter_bindings) for layout in self._model_layouts
+            )
             # EP-sharded expert weights are rank-heterogeneous under one FQN;
             # they ride through this wrapper as all-gathered full tensors and are
             # sliced back per rank on load (parallel/expert_parallel/checkpointing.py).
@@ -112,6 +132,26 @@ class ModelCheckpointState(Stateful):
             initialization_group=initialization_group
         )
         self.remember_metadata()
+
+    def _validate_model_bindings(self) -> None:
+        """Reject replaced parameters before cached views or EP maps are used."""
+        with (
+            synchronize_local_errors(
+                "Checkpoint model binding validation", group=self._validation_group
+            )
+            if self._validation_group is not None
+            else nullcontext()
+        ):
+            self._validate_local_model_bindings()
+
+    def _validate_local_model_bindings(self) -> None:
+        validate_model_part_layouts(self._layout_models, self._model_layouts)
+        for layout, bound in zip(
+            self._model_layouts,
+            self._bound_layout_parameters,
+            strict=True,
+        ):
+            layout.validate_parameter_snapshot(bound, consumer="Checkpoint")
 
     def remember_metadata(self) -> None:
         # Keep validation independent of exported storage: full TP/EP exports
@@ -141,25 +181,7 @@ class ModelCheckpointState(Stateful):
     def get_state_dict(
         self, *, initialization_group: ProcessGroup | None = None
     ) -> dict[str, Any]:
-        # Hooks may redistribute DTensors: finish their own communication before
-        # entering the local merge boundary, and never wrap them as local work.
-        part_states = [model.state_dict() for model in self.model]
-        flat: dict[str, Any] = {}
-        with (
-            synchronize_local_errors(
-                "Checkpoint model state merge", group=initialization_group
-            )
-            if initialization_group is not None
-            else nullcontext()
-        ):
-            for part_index, part_state in enumerate(part_states):
-                duplicates = flat.keys() & part_state.keys()
-                if duplicates:
-                    raise ValueError(
-                        f"Model checkpoint keys overlap at part {part_index}: "
-                        f"{sorted(duplicates)}. Model parts must use distinct FQNs."
-                    )
-                flat.update(part_state)
+        flat = self.local_state_dict(initialization_group=initialization_group)
         if self.sharded_tensor_parallel and self.sharded_expert_parallel:
             return shard_disjoint_tp_ep_state(flat, model_parts=self.model)
         transform = (
@@ -232,6 +254,7 @@ class ModelCheckpointState(Stateful):
         # Validate the combined view before any part copies weights. strict=False
         # below permits other PP parts and auxiliary checkpoint categories, but
         # must not permit missing local model state or late shape failures.
+        self._validate_local_model_bindings()
         missing = self._metadata.keys() - state_dict.keys()
         if missing:
             raise ValueError(f"Model checkpoint is missing keys: {sorted(missing)}")
@@ -263,24 +286,64 @@ class ModelCheckpointState(Stateful):
                         "from destination"
                     )
 
-    def local_state_dict(self) -> dict[str, Any]:
-        return {
-            key: value
-            for model in self.model
-            for key, value in model.state_dict().items()
-        }
+    def local_state_dict(
+        self, *, initialization_group: ProcessGroup | None = None
+    ) -> dict[str, Any]:
+        """Export local parts with the same collision policy for save and restore."""
+        self._validate_model_bindings()
+        # Hooks may redistribute DTensors: finish their own communication before
+        # entering the local merge boundary, and never wrap them as local work.
+        part_states = [model.state_dict() for model in self.model]
+        flat: dict[str, Any] = {}
+        error_group = (
+            self._validation_group
+            if initialization_group is None
+            else initialization_group
+        )
+        with (
+            synchronize_local_errors("Checkpoint model state merge", group=error_group)
+            if error_group is not None
+            else nullcontext()
+        ):
+            for part_index, part_state in enumerate(part_states):
+                duplicates = flat.keys() & part_state.keys()
+                if duplicates:
+                    raise ValueError(
+                        f"Model checkpoint keys overlap at part {part_index}: "
+                        f"{sorted(duplicates)}. Model parts must use distinct FQNs."
+                    )
+                flat.update(part_state)
+        return flat
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.validate_state_dict(state_dict)
+        # validate_state_dict includes local binding checks and intentionally
+        # performs no collectives. Coordinate its full result before any
+        # TP/EP conversion starts, including direct Stateful restore callers.
+        with (
+            synchronize_local_errors(
+                "Checkpoint model restore validation", group=self._validation_group
+            )
+            if self._validation_group is not None
+            else nullcontext()
+        ):
+            self.validate_state_dict(state_dict)
+        local_state = self._restore_local_state(state_dict)
+        # Conversion succeeded: end the old cache generation before any hook
+        # can partially write the model and raise. release_cache replaces the
+        # dictionary, so local_state remains valid even if it aliases the cache.
+        self.release_cache()
+        # Each PP part consumes its own keys from the combined model state.
+        # Other parts' keys are ignored; checkpoint state categories are separate.
+        for model in self.model:
+            model.load_state_dict(local_state, strict=False)
+
+    def _restore_local_state(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Convert validated checkpoint layouts before copying into model parts."""
         if self.sharded_tensor_parallel and self.sharded_expert_parallel:
             local_state = self.local_state_dict()
-            state_dict = restore_disjoint_tp_ep_state(
+            return restore_disjoint_tp_ep_state(
                 state_dict, local_state=local_state, model_parts=self.model
             )
-            for model in self.model:
-                model.load_state_dict(state_dict, strict=False)
-            self.release_cache()
-            return
         if self.sharded_expert_parallel:
             local_state = self.local_state_dict()
             state_dict = restore_sharded_expert_state(
@@ -289,11 +352,7 @@ class ModelCheckpointState(Stateful):
                 shard_map=self._ep_shards,
                 model_parts=self.model,
             )
-            state_dict = load_tensor_parallel_state(state_dict, model_parts=self.model)
-            for model in self.model:
-                model.load_state_dict(state_dict, strict=False)
-            self.release_cache()
-            return
+            return load_tensor_parallel_state(state_dict, model_parts=self.model)
         if self.sharded_tensor_parallel and any(
             isinstance(value, ChunkedCheckpointTensor) for value in state_dict.values()
         ):
@@ -306,13 +365,8 @@ class ModelCheckpointState(Stateful):
             )
         else:
             state_dict = load_tensor_parallel_state(state_dict, model_parts=self.model)
-        # Each PP part consumes its own keys from the combined model state.
-        # Other parts' keys are ignored; checkpoint state categories are separate.
-        state_dict = load_expert_state(
+        return load_expert_state(
             state_dict,
             shard_map=self._ep_shards,
             model_parts=self.model,
         )
-        for model in self.model:
-            model.load_state_dict(state_dict, strict=False)
-        self.release_cache()

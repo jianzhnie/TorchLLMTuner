@@ -16,6 +16,7 @@ from ...accelerator.capabilities import has as capability
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.spmd import spmd_context
 from ...components.loss import IGNORE_INDEX
+from ...components.loss_contract import validate_loss_sum, validate_normalization_tokens
 from ...datasets.contracts import Batch, TrainerBatch, require_positive_integer
 from ...parallel import compatibility
 from ...parallel.pipeline_parallel.microbatch_drivers import (
@@ -51,31 +52,6 @@ class PipelineInputs:
     args: list[tuple[torch.Tensor, ...]]
     kwargs: list[dict[str, Any]]
     targets: list[torch.Tensor] | None
-
-
-def split_trainer_batch(
-    batch: TrainerBatch, *, num_microbatches: int, rows_per_microbatch: int
-) -> list[TrainerBatch]:
-    microbatches = []
-    for index in range(num_microbatches):
-        rows = slice(
-            index * rows_per_microbatch,
-            (index + 1) * rows_per_microbatch,
-        )
-        microbatch = {
-            key: value[rows]
-            if num_microbatches > 1
-            and isinstance(value, torch.Tensor)
-            and value.ndim > 0
-            else value
-            for key, value in batch.items()
-        }
-        if "num_valid_tokens" in batch:
-            microbatch["num_valid_tokens"] = int(
-                (microbatch["labels"] != IGNORE_INDEX).sum()
-            )
-        microbatches.append(microbatch)
-    return microbatches
 
 
 def split_pipeline_microbatches(
@@ -124,11 +100,30 @@ def split_pipeline_microbatches(
                     "microbatch for packed media or coordinate layouts."
                 )
     if isinstance(batch, dict):
-        return split_trainer_batch(
-            batch,
-            num_microbatches=num_microbatches,
-            rows_per_microbatch=labels.shape[0] // num_microbatches,
-        )
+        rows_per_microbatch = labels.shape[0] // num_microbatches
+        microbatches = []
+        for index in range(num_microbatches):
+            rows = slice(
+                index * rows_per_microbatch,
+                (index + 1) * rows_per_microbatch,
+            )
+            microbatch = {
+                key: value[rows]
+                if num_microbatches > 1
+                and isinstance(value, torch.Tensor)
+                and value.ndim > 0
+                else value
+                for key, value in batch.items()
+            }
+            # A single microbatch retains the original labels and count. Only
+            # sliced rows need a fresh count; do not synchronize device labels
+            # just to reconstruct metadata already supplied by the collator.
+            if num_microbatches > 1 and "num_valid_tokens" in batch:
+                microbatch["num_valid_tokens"] = int(
+                    (microbatch["labels"] != IGNORE_INDEX).sum()
+                )
+            microbatches.append(microbatch)
+        return microbatches
 
     input_chunks = batch.input_ids.chunk(num_microbatches, dim=0)
     label_chunks = batch.labels.chunk(num_microbatches, dim=0)
@@ -162,6 +157,22 @@ def prepare_pipeline_inputs(
     return PipelineInputs(args=arg_mbs, kwargs=kwarg_mbs, targets=target_mbs)
 
 
+def _validate_pipeline_losses(
+    losses: list[torch.Tensor] | None, targets: list[torch.Tensor] | None
+) -> list[torch.Tensor]:
+    """Check schedule results locally after all pipeline work has finished."""
+    if losses is None or targets is None or not targets:
+        raise ValueError("Final pipeline stage must provide microbatch losses/targets")
+    if len(losses) != len(targets):
+        raise ValueError("Pipeline schedule must return one loss per target microbatch")
+    device = targets[0].device
+    for loss, labels in zip(losses, targets, strict=True):
+        if labels.device != device:
+            raise ValueError("Pipeline target microbatches must share one device")
+        validate_loss_sum(loss, device=device)
+    return losses
+
+
 def run_pipeline_step(
     runtime: PipelineRuntime,
     batch: Batch | TrainerBatch,
@@ -169,6 +180,10 @@ def run_pipeline_step(
     global_valid_tokens: torch.Tensor,
 ) -> torch.Tensor:
     """Drive one PP schedule step and return its unnormalized local loss sum."""
+    with synchronize_local_errors(
+        "Pipeline loss normalization validation", group=runtime.error_group
+    ):
+        validate_normalization_tokens(global_valid_tokens)
     inputs = prepare_pipeline_inputs(runtime, batch)
 
     losses: list[torch.Tensor] | None = [] if runtime.pp_has_last_stage else None
@@ -200,8 +215,24 @@ def run_pipeline_step(
                 losses=losses,
             )
 
+    # Only final stages own losses, but every update participant enters the
+    # boundary after schedule communication, before reporting/reductions begin.
+    with synchronize_local_errors(
+        "Pipeline training loss result validation", group=runtime.error_group
+    ):
+        if runtime.pp_has_last_stage:
+            losses = _validate_pipeline_losses(losses, inputs.targets)
+            for loss in losses:
+                if loss.device != global_valid_tokens.device:
+                    raise ValueError("Pipeline loss and normalization devices differ")
+        else:
+            validate_loss_sum(
+                runtime.pp_loss_sentinel,
+                device=global_valid_tokens.device,
+                requires_grad=False,
+            )
     if runtime.pp_has_last_stage:
-        assert losses is not None
+        assert losses is not None  # Validated on the owning rank above.
         # The schedule backpropagated normalized losses. Convert their
         # detached sum to the raw token sum expected by Trainer.train_step.
         detached_losses = [loss.detach() for loss in losses]
@@ -241,6 +272,13 @@ def run_pipeline_eval(
                 targets=inputs.targets,
                 losses=losses,
             )
+    with synchronize_local_errors(
+        "Pipeline validation loss result validation", group=runtime.error_group
+    ):
+        if runtime.pp_has_last_stage:
+            losses = _validate_pipeline_losses(losses, inputs.targets)
     if losses is None:
         return None
-    return torch.stack([loss.detach() for loss in losses]).sum()
+    result = torch.stack([loss.detach() for loss in losses]).sum()
+    losses.clear()
+    return result

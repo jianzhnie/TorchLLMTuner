@@ -14,9 +14,6 @@ from typing import Any
 import torch
 from torch.distributed.tensor import DTensor
 
-from .adamw_swap import AdamWSwap
-from .flex_shard.dist_muon import DistMuon
-
 __all__ = [
     "init_optim_state",
     "get_flat_optim_state_dict",
@@ -70,8 +67,10 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     call is a completed training update or enter distributed collectives: this
     helper runs inside checkpoint's local error-coordination boundary.
 
-    DistMuon explicitly initializes local momentum instead: a synthetic step
-    would execute layout collectives inside checkpoint's local error boundary.
+    Optimizers may declare a collective-free ``initialize_state()`` method to
+    materialize their own state without a synthetic step. It must preserve
+    existing values and gradients and may be called repeatedly. DistMuon uses
+    this contract because its ordinary step can execute layout collectives.
 
     No-op when every parameter that requires a gradient already has state.
 
@@ -80,8 +79,11 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     multi-optimizer case: the reset branch below is type-gated on Adam, and
     would be skipped silently if a container were handed in whole.
     """
-    if isinstance(optim, DistMuon | AdamWSwap):
-        optim.initialize_state()
+    initialize = getattr(optim, "initialize_state", None)
+    if initialize is not None:
+        if not callable(initialize):
+            raise TypeError("Optimizer initialize_state must be callable")
+        initialize()
         return
 
     params = [
@@ -481,3 +483,39 @@ def _restore_nested_state(flat_sd: dict[str, Any], *, prefix: str) -> dict[str, 
             )
         current[parts[-1]] = value
     return result
+
+
+def validate_full_optimizer_state(
+    values: dict[str, Any], template: dict[str, Any], *, context: str
+) -> None:
+    """Validate converted full tensors before checkpoint placement or live writes.
+
+    This is a collective-free shape/key preflight, not the local optimizer's
+    full restore validation. Saved AMSGrad options determine required moments;
+    the fresh runtime's option must not decide which checkpoint keys to expect.
+    EMA uses the same flattened state representation.
+    """
+    expected_values = dict(template)
+    for key, expected in template.items():
+        if key.startswith("state.") and key.endswith(".exp_avg_sq"):
+            fqn = key[len("state.") : -len(".exp_avg_sq")]
+            if values.get(f"param_groups.{fqn}.amsgrad", False):
+                expected_values[f"state.{fqn}.max_exp_avg_sq"] = expected
+    for key, expected in expected_values.items():
+        # AMSGrad is selected by the saved group, not the fresh runtime.
+        if key.endswith(".max_exp_avg_sq"):
+            fqn = key[len("state.") : -len(".max_exp_avg_sq")]
+            if not values.get(f"param_groups.{fqn}.amsgrad", False):
+                continue
+        if key not in values:
+            raise ValueError(f"{context} missing required key {key!r}")
+        value = values[key]
+        if isinstance(expected, torch.Tensor):
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"{context} {key!r} must be a tensor")
+            if value.shape != expected.shape:
+                raise ValueError(
+                    f"{context} {key!r} has shape "
+                    f"{tuple(value.shape)}, "
+                    f"expected {tuple(expected.shape)}"
+                )

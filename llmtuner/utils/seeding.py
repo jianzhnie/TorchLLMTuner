@@ -169,8 +169,7 @@ def seed_everything(
 ) -> None:
     """Seed every generator this run draws from.
 
-    torchtitan's ``set_determinism`` semantics; ``Trainer.seed_everything``
-    delegates here.
+    Uses torchtitan's ``set_determinism`` semantics for runtime initialization.
     """
     if (
         not isinstance(seed, int)

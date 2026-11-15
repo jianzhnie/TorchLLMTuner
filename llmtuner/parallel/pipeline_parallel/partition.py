@@ -251,7 +251,11 @@ def prune_declared_stage(model: nn.Module, targets: set[str]) -> None:
             if path in targets:
                 continue
             descendants = any(target.startswith(path + ".") for target in targets)
-            if child is not None and descendants:
+            if child is not None and (
+                descendants or isinstance(child, nn.ModuleList | nn.ModuleDict)
+            ):
+                # Containers keep their registered type even when no entries
+                # belong here; models may still iterate an empty block set.
                 prune(child, path)
             elif isinstance(parent, nn.ModuleList | nn.ModuleDict):
                 del parent._modules[name]
@@ -271,100 +275,17 @@ def build_stage_from_modules(
     module_names: list[str],
     num_stages: int,
 ) -> tuple[PipelineStage, nn.Module]:
+    configure = getattr(whole_model, "configure_pipeline_stage", None)
+    if not callable(configure):
+        raise UnsupportedCombinationError("PP requires model-owned stage I/O")
     model = copy.deepcopy(whole_model)
-    if isinstance(getattr(model, "decoder_structure", None), DecoderStructure):
-        prune_declared_stage(model, set(module_names))
-        model.configure_pipeline_stage(
-            first=stage_idx == 0, last=stage_idx == num_stages - 1
-        )
-        validate_pipeline_stage_io(
-            model, first=stage_idx == 0, last=stage_idx == num_stages - 1
-        )
-    else:
-        modules_to_keep = set(module_names)
-
-        presented = dict(model.named_children())
-        presented_names = set(presented)
-        presented_ids = {id(module) for module in presented.values()}
-        for module_name, module_value in presented.items():
-            # Flattened HF children also expose their registered parent for
-            # complete FSDP traversal. Keep that structural parent: replacing
-            # it would discard the parts selected below and their state keys.
-            if any(
-                id(child) in presented_ids
-                for child in module_value.modules()
-                if child is not module_value
-            ):
-                continue
-            # Assigning a container by its own FQN keeps the complete module;
-            # child FQNs below select only a subset of its layers.
-            if module_name in modules_to_keep:
-                continue
-            # Layer-like containers (e.g. "layers.0", "layers.1").
-            if isinstance(module_value, nn.ModuleDict | nn.ModuleList):
-                layers_to_keep = {
-                    name.split(".", 1)[1]
-                    for name in modules_to_keep
-                    if name.startswith(f"{module_name}.")
-                }
-                if layers_to_keep:
-                    if isinstance(module_value, nn.ModuleDict):
-                        for layer_name in list(module_value.keys()):
-                            if layer_name not in layers_to_keep:
-                                del module_value[layer_name]
-                    elif isinstance(module_value, nn.ModuleList):
-                        # add_module with the ORIGINAL index as the key: a
-                        # plain ``nn.ModuleList(kept)`` would renumber the kept
-                        # layers from 0, and two stages' state-dict keys would
-                        # then collide ("layers.0.*" meaning different layers
-                        # on different ranks) in one shared checkpoint.
-                        kept_layers = nn.ModuleList()
-                        # Unlike named_children(), the registered entries retain
-                        # aliases when two block IDs share the same module.
-                        for block_id, layer in module_value._modules.items():
-                            if block_id in layers_to_keep:
-                                kept_layers.add_module(block_id, layer)
-                        setattr(model, module_name, kept_layers)
-                else:
-                    # This stage uses none of the container's layers.
-                    if isinstance(module_value, nn.ModuleDict):
-                        setattr(model, module_name, nn.ModuleDict())
-                    elif isinstance(module_value, nn.ModuleList):
-                        setattr(model, module_name, nn.ModuleList())
-            # Simple attributes (e.g. "norm", "lm_head") not owned by this stage
-            # are replaced by an Identity so the forward still runs.
-            else:
-                setattr(model, module_name, nn.Identity())
-
-        # Extra top-level modules the model's ``named_children`` override does
-        # not present (e.g. a multimodal encoder registered beside the decoder
-        # on ``TrainingModel``). Apply keep-or-blank against the real
-        # ``_modules`` children: a non-owner
-        # gets an Identity, exactly like the decoder parts above. Without
-        # this, the deep copy would leave a live copy on every stage and two
-        # stages' state-dict keys would collide in one checkpoint. A module
-        # listed in NO stage's FQN list is blanked everywhere -- the model's
-        # ``forward`` must tolerate that (the same contract the decoder parts
-        # already impose).
-        presented = dict(model.named_children())
-        presented_ids = {id(module) for module in presented.values()}
-        # named_children() deduplicates module aliases. Every registered name
-        # needs its own ownership decision, including aliases of kept modules.
-        for module_name, module_value in list(model._modules.items()):
-            if module_value is None:
-                continue
-            if module_name in presented_names or module_name in modules_to_keep:
-                continue
-            # A container that holds the presented parts (the wrapper's inner
-            # HF model) is what the parts live in, not an extra module --
-            # never blank it.
-            if any(
-                id(m) in presented_ids
-                for m in module_value.modules()
-                if m is not module_value
-            ):
-                continue
-            setattr(model, module_name, nn.Identity())
+    prune_declared_stage(model, set(module_names))
+    model.configure_pipeline_stage(
+        first=stage_idx == 0, last=stage_idx == num_stages - 1
+    )
+    validate_pipeline_stage_io(
+        model, first=stage_idx == 0, last=stage_idx == num_stages - 1
+    )
 
     stage_kwargs = {"group": pp_mesh.get_group()}
     # ``get_mesh`` was added after PyTorch 2.10. llmtuner passes None because
@@ -392,7 +313,10 @@ def validate_pipeline_ownership(
     """
     if not module_names_per_stage:
         raise ValueError("PP ownership requires at least one stage")
-    if isinstance(getattr(whole_model, "decoder_structure", None), DecoderStructure):
+    structure = getattr(whole_model, "decoder_structure", None)
+    if structure is not None and not isinstance(structure, DecoderStructure):
+        raise TypeError("Pipeline decoder_structure must be DecoderStructure")
+    if structure is not None:
         validate = getattr(whole_model, "validate_pipeline_partition", None)
         configure = getattr(whole_model, "configure_pipeline_stage", None)
         if not callable(validate) or not callable(configure):
@@ -561,10 +485,9 @@ def split_model_into_stages(
     replaced by ``nn.Identity``. A deep copy per stage (rather than a partial
     view) is what lets a rank own two stages of different shapes.
 
-    Explicit models validate exact ownership and select their stage tensor I/O;
-    registered FQNs are pruned without renumbering blocks. Legacy callers retain
-    top-level container pruning and must tolerate removed layers in forward and
-    initialization.
+    Models select stage tensor I/O through configure_pipeline_stage; decoder
+    models also validate exact ownership. Registered FQNs are pruned without
+    renumbering blocks or inferring roles from container names.
 
     Args:
         whole_model: The complete model to split.
@@ -618,6 +541,8 @@ def split_model_into_stages(
         module_names_per_stage,
         replicated_module_names=replicated_module_names,
     )
+    if not callable(getattr(whole_model, "configure_pipeline_stage", None)):
+        raise UnsupportedCombinationError("PP requires model-owned stage I/O")
 
     for stage_idx in stage_indices:
         module_names = module_names_per_stage[stage_idx]

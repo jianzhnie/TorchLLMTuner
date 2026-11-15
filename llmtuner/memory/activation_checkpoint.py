@@ -612,17 +612,9 @@ def apply_ac(
         return model
 
     structure = getattr(model, "decoder_structure", None)
-    if structure is not None:
-        if not isinstance(structure, DecoderStructure):
-            raise TypeError("Activation checkpointing requires a DecoderStructure")
-        layers = structure.bind_blocks(model)
-    else:
-        layers = getattr(model, "layers", None)
-    if not isinstance(layers, nn.Module):
-        raise TypeError(
-            f"apply_ac expects an explicit model (with .layers as nn.Module); got "
-            f"{type(model).__name__}."
-        )
+    if not isinstance(structure, DecoderStructure):
+        raise TypeError("Activation checkpointing requires a DecoderStructure")
+    layers = structure.bind_blocks(model)
 
     if mode == "region":
         # Resolve the optional dependency before changing process-global state.
@@ -637,11 +629,11 @@ def apply_ac(
     for layer_id, transformer_block in blocks:
         if mode == "selective":
             wrapped = wrap_selective(
-                transformer_block, selective, base_fqn=f"layers.{layer_id}"
+                transformer_block, selective, base_fqn=f"{structure.blocks}.{layer_id}"
             )
         elif mode == "region":
             wrapped = wrap_region(
-                transformer_block, region, base_fqn=f"layers.{layer_id}"
+                transformer_block, region, base_fqn=f"{structure.blocks}.{layer_id}"
             )
         else:
             wrapped = wrap_full(

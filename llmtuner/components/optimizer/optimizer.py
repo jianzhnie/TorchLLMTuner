@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +32,11 @@ from torch.optim import Optimizer
 from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...accelerator.device import device_type, get_current_device
 from ...accelerator.distributed import get_comm_device
+from ...parallel.assembly import (
+    ModelPartLayout,
+    capture_model_part_layouts,
+    validate_model_part_layouts,
+)
 from ...parallel.expert_parallel.checkpointing import (
     expert_shard_map,
     gather_expert_state,
@@ -48,7 +53,6 @@ from ...parallel.tensor_parallel.checkpointing import (
     shard_tensor_parallel_state,
 )
 from ...utils.logging import get_logger
-from ...utils.module_names import canonical_fqn
 from ..checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 from .adamw_swap import AdamWSwap
 from .flex_shard.dist_muon import DistMuon
@@ -186,12 +190,15 @@ class OptimizersContainer(Optimizer, Stateful):
         initialization_group: ProcessGroup | None = None,
         sharded_tensor_parallel: bool = False,
         sharded_expert_parallel: bool = False,
+        runtime_layouts: tuple[ModelPartLayout, ...] = (),
     ) -> None:
         self.optimizers = []
         self.model_parts = list(model_parts)
         self.sharded_tensor_parallel = sharded_tensor_parallel
         self.sharded_expert_parallel = sharded_expert_parallel
         self.state_residency = config.state_residency
+        self.runtime_layouts = tuple(runtime_layouts)
+        self._bound_layout_parameters: tuple[dict[str, nn.Parameter], ...] | None = None
 
         pipeline_group = (
             pipeline_mesh.get_group()
@@ -206,14 +213,20 @@ class OptimizersContainer(Optimizer, Stateful):
             if error_group is not None
             else nullcontext()
         ):
+            if not self.runtime_layouts:
+                self.runtime_layouts = capture_model_part_layouts(self.model_parts)
+            self._validate_runtime_layouts()
+            self._bound_layout_parameters = tuple(
+                dict(layout.parameter_bindings) for layout in self.runtime_layouts
+            )
             impl_kwargs = self._build_impl_kwargs(config)
             model_group_plans = [
                 self._build_param_groups(
-                    model,
+                    layout,
                     param_group_configs=config.param_groups,
                     impl_kwargs=impl_kwargs,
                 )
-                for model in self.model_parts
+                for layout in self.runtime_layouts
             ]
         matched_configs = {
             index
@@ -233,9 +246,12 @@ class OptimizersContainer(Optimizer, Stateful):
                 index for index, matched in enumerate(matches.tolist()) if matched
             }
         with (
-            synchronize_local_errors("Optimizer initialization", group=error_group)
-            if error_group is not None
-            else nullcontext()
+            self._construction_resources(),
+            (
+                synchronize_local_errors("Optimizer initialization", group=error_group)
+                if error_group is not None
+                else nullcontext()
+            ),
         ):
             all_params = self._validate_parameter_plan(
                 model_group_plans,
@@ -280,6 +296,9 @@ class OptimizersContainer(Optimizer, Stateful):
                 for opt_name, groups in groups_by_opt_name.items():
                     disable_unsupported_fused_npu_updates(opt_name, groups.param_groups)
                     optimizer = optimizer_factories[opt_name](groups.param_groups)
+                    # Own returned resources before validation or residency
+                    # installation can fail. Factories own partial objects.
+                    self.optimizers.append(optimizer)
                     # PyTorch accepts arbitrary group metadata, so misspelled
                     # update options otherwise silently leave defaults active.
                     # initial_lr is the scheduler's intentional group metadata.
@@ -300,10 +319,24 @@ class OptimizersContainer(Optimizer, Stateful):
                             "npu_virtual currently supports Adam/AdamW moments only."
                         )
                     install_state_residency(optimizer, config.state_residency)
-                    self.optimizers.append(optimizer)
                     self._log_optimizer(optimizer, part_idx, groups.patterns)
 
             self._initialize_optimizer_interface(all_params)
+
+    @contextmanager
+    def _construction_resources(self) -> Iterator[None]:
+        """Release returned inner optimizers on local or coordinated failure."""
+        try:
+            yield
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                try:
+                    logger.exception("Optimizer cleanup failed during construction")
+                except BaseException:
+                    pass
+            raise
 
     @staticmethod
     def _build_impl_kwargs(config: OptimizerConfig) -> dict[str, Any]:
@@ -335,7 +368,7 @@ class OptimizersContainer(Optimizer, Stateful):
 
     @staticmethod
     def _build_param_groups(
-        model: nn.Module,
+        layout: ModelPartLayout,
         *,
         param_group_configs: list[ParamGroupConfig],
         impl_kwargs: dict[str, Any],
@@ -356,16 +389,13 @@ class OptimizersContainer(Optimizer, Stateful):
         """
         groups: dict[str, _OptimizerGroups] = defaultdict(_OptimizerGroups)
         claimed: set[int] = set()
-        canonical_names: dict[str, str] = {}
         trainable_parameters = [
             (name, param)
-            for name, param in model.named_parameters(remove_duplicate=False)
+            for name, param in layout.parameter_bindings.items()
             if param.requires_grad
         ]
 
-        primary_names: dict[int, str] = {}
-        for name, param in trainable_parameters:
-            primary_names.setdefault(id(param), name)
+        layout_names = layout.canonical_parameter_names
 
         for config_index, param_group_config in enumerate(param_group_configs):
             reserved = {
@@ -384,17 +414,8 @@ class OptimizersContainer(Optimizer, Stateful):
                 if id(param) not in claimed and pattern.search(name):
                     # Match any alias, but checkpoint under the first registered
                     # name so group pattern changes do not rename optimizer state.
-                    primary_name = primary_names[id(param)]
-                    canonical_name = canonical_fqn(primary_name)
-                    if canonical_name in canonical_names:
-                        raise ValueError(
-                            "Optimizer parameter FQNs collide after wrapper removal: "
-                            f"{canonical_names[canonical_name]!r} and {name!r} "
-                            f"both map to {canonical_name!r}"
-                        )
-                    canonical_names[canonical_name] = primary_name
                     params.append(param)
-                    param_names.append(canonical_name)
+                    param_names.append(layout_names[name])
                     claimed.add(id(param))
 
             if not params:
@@ -505,13 +526,18 @@ class OptimizersContainer(Optimizer, Stateful):
         * assigned twice -- shared parameters or repeated modules across local
           model parts. First-match-wins prevents duplicates within one part,
           but each part constructs its own groups.
+        * foreign -- a group contains a tensor outside the current trainable
+          model ownership, including a parameter replaced during assembly.
         """
+        trainable = [
+            (paths[0], parameter)
+            for layout in self.runtime_layouts
+            for parameter, paths in layout.parameter_aliases.items()
+            if parameter.requires_grad
+        ]
         registered = {id(param) for param in all_params}
         missing = [
-            (name, param)
-            for model in self.model_parts
-            for name, param in model.named_parameters()
-            if param.requires_grad and id(param) not in registered
+            (name, param) for name, param in trainable if id(param) not in registered
         ]
         if missing:
             names = ", ".join(
@@ -521,6 +547,14 @@ class OptimizersContainer(Optimizer, Stateful):
                 f"optimizer.param_groups left {len(missing)} trainable parameter(s) "
                 f"unassigned, so they would keep their initial values: {names}. "
                 "Add a catch-all ParamGroupConfig(pattern='.*') last."
+            )
+
+        foreign = registered - {id(parameter) for _, parameter in trainable}
+        if foreign:
+            raise ValueError(
+                f"optimizer.param_groups contains {len(foreign)} parameter(s) "
+                "outside the current trainable model ownership. Rebuild groups "
+                "from the final model parameters after assembly."
             )
 
         duplicates = len(all_params) - len(registered)
@@ -533,6 +567,18 @@ class OptimizersContainer(Optimizer, Stateful):
 
     def __iter__(self) -> Iterator[Optimizer]:
         return iter(self.optimizers)
+
+    def _validate_runtime_layouts(self) -> None:
+        """Check the same final ownership before grouping, save, and restore."""
+        bound = self._bound_layout_parameters
+        if bound is not None and len(bound) != len(self.runtime_layouts):
+            raise ValueError("Optimizer runtime layouts changed after construction")
+        if len(self.runtime_layouts) != len(self.model_parts):
+            raise ValueError("Optimizer layouts must match model parts")
+        validate_model_part_layouts(self.model_parts, self.runtime_layouts)
+        if bound is not None:
+            for layout, parameters in zip(self.runtime_layouts, bound, strict=True):
+                layout.validate_parameter_snapshot(parameters, consumer="Optimizer")
 
     def __len__(self) -> int:
         return len(self.optimizers)
@@ -558,6 +604,25 @@ class OptimizersContainer(Optimizer, Stateful):
         for optimizer in self.optimizers:
             optimizer.zero_grad(set_to_none=set_to_none)
 
+    def close(self) -> None:
+        """Close owned optimizer resources, retaining failed owners for retry."""
+        first_error: BaseException | None = None
+        pending = getattr(self, "_pending_close", list(reversed(self.optimizers)))
+        failed: list[Optimizer] = []
+        for optimizer in pending:
+            close = getattr(optimizer, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except BaseException as error:
+                failed.append(optimizer)
+                if first_error is None:
+                    first_error = error
+        self._pending_close = failed
+        if first_error is not None:
+            raise first_error
+
     def state_dict(self) -> dict[str, Any]:
         """A flat, FQN-keyed state dict covering every inner optimizer.
 
@@ -570,6 +635,7 @@ class OptimizersContainer(Optimizer, Stateful):
         initialization hooks must not communicate inside this local phase.
         """
         with synchronize_local_errors("Optimizer checkpoint construction"):
+            self._validate_runtime_layouts()
             result = collect_local_optimizer_state(self.optimizers)
         # Expert optimizer states are rank-heterogeneous like the expert
         # weights themselves; gather them to the full tensors the checkpoint
@@ -605,6 +671,8 @@ class OptimizersContainer(Optimizer, Stateful):
         Exceptions from load hooks or tensor copies are not atomic and require
         restoring the complete training checkpoint before continuing.
         """
+        with synchronize_local_errors("Optimizer restore layout validation"):
+            self._validate_runtime_layouts()
         # init_optim_state must run first: the unflattening step reads each
         # optimizer's live state to learn which state tensors to expect, so a
         # fresh optimizer would find nothing to write into.

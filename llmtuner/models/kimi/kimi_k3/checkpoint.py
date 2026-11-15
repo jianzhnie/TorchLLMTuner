@@ -7,14 +7,16 @@ These transforms operate on full expert tensors, including meta load templates.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from contextlib import nullcontext
+from functools import partial
 from typing import Any
 
 import torch
 from torch.distributed import ProcessGroup
 
 from ....accelerator.collectives import synchronize_local_errors
-from ...state import ModelStateFormat
+from ...state import ModelStateFormat, SourceLayoutMigration
 
 _BLOCK = re.compile(r"^(.*\.block_sparse_moe\.)(.*)$")
 _PROJECTIONS = {"w1_EFD": "w1", "w2_EDF": "w2", "w3_EFD": "w3"}
@@ -286,6 +288,35 @@ class KimiStateFormat(ModelStateFormat):
         self.config = config
         self.grouped_experts = expert_parallel
         self.coordinates_conversion = expert_parallel
+
+    def source_layout_migration(self) -> SourceLayoutMigration:
+        return SourceLayoutMigration(
+            name="Kimi",
+            requires_migration=self.requires_source_migration,
+            convert_model=partial(
+                convert_kimi_expert_state,
+                num_experts=self.config.num_experts,
+                to_hf=not self.grouped_experts,
+            ),
+            convert_optimizer=partial(
+                convert_kimi_optimizer_state,
+                num_experts=self.config.num_experts,
+                to_hf=not self.grouped_experts,
+            ),
+        )
+
+    def requires_source_migration(self, keys: Iterable[str]) -> bool:
+        """Identify individual/grouped native source keys without storage IO."""
+        keys = tuple(keys)
+        grouped = any(
+            ".block_sparse_moe.routed_experts.inner_experts." in key for key in keys
+        )
+        individual = any(".block_sparse_moe.experts." in key for key in keys)
+        if grouped and individual:
+            raise ValueError(
+                "Kimi checkpoint mixes individual and grouped expert layouts"
+            )
+        return bool(grouped or individual) and grouped != self.grouped_experts
 
     def supports_ep_initial_load(
         self, *, tp_degree: int, sharded_tensor_parallel: bool

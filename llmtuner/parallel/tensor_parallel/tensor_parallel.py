@@ -64,7 +64,7 @@ from ...accelerator.linear_collectives import (
 )
 from ...models.common.moe.experts import GroupedExperts
 from ...models.common.moe.layer import MoE, declared_moe_block
-from ...models.contracts import DecoderStructure, MoEBlockContract
+from ...models.contracts import DecoderStructure, GatedMLPStructure, MoEBlockContract
 from ...utils.logging import get_logger
 from .. import compatibility
 from ..attention_heads import require_heads_divisible_by
@@ -221,6 +221,36 @@ class TPMoeSequenceBoundary:
         return reduce_scatter_along(out, -2, self._tp_seq_group)
 
 
+def _shared_expert_projections(
+    shared: nn.Module,
+) -> tuple[tuple[str, int, nn.Linear, nn.Parameter], ...]:
+    """Consume declared gate/up/down roles for shared-expert feature sharding."""
+    structure = getattr(shared, "mlp_structure", None)
+    if not isinstance(structure, GatedMLPStructure):
+        raise UnsupportedCombinationError(
+            "TP shared expert requires a model-owned GatedMLPStructure"
+        )
+    projections = structure.bind(shared)
+    if any(not isinstance(projection, nn.Linear) for projection in projections):
+        raise UnsupportedCombinationError(
+            "TP shared expert projection declarations must bind nn.Linear modules"
+        )
+    bindings = tuple(
+        (path, dim, projection, projection.weight)
+        for path, dim, projection in zip(
+            (structure.gate, structure.up, structure.down),
+            (0, 0, 1),
+            projections,
+            strict=True,
+        )
+    )
+    dimensions = {}
+    for _, dim, _, weight in bindings:
+        if dimensions.setdefault(id(weight), dim) != dim:
+            raise ValueError("TP shared projection aliases require conflicting axes")
+    return bindings
+
+
 def shard_shared_expert_for_tp(
     block: nn.Module,
     *,
@@ -232,8 +262,8 @@ def shard_shared_expert_for_tp(
 
     Inside the MoE sequence boundary the token stream is already gathered
     (full T, replicated across the TP group), so the shared expert needs no
-    input collective: ``gate_proj``/``up_proj`` are sharded on the output
-    features (dim 0) and ``down_proj`` on the input features (dim 1), which
+    input collective: declared gate/up projections are sharded on the output
+    features (dim 0) and the down projection on input features (dim 1), which
     makes its output partial over the TP group. The block's output -- routed
     plus shared -- is then partial on both halves, and the boundary
     reduce-scatter sums them (upstream's layout: shared w2 stays Partial
@@ -251,11 +281,7 @@ def shard_shared_expert_for_tp(
     )
     assert shared is not None  # the caller checked
     names: set[str] = set()
-    projections = [
-        (name, dim, getattr(shared, name), getattr(shared, name).weight)
-        for name, dim in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1))
-        if isinstance(getattr(shared, name, None), nn.Linear)
-    ]
+    projections = _shared_expert_projections(shared)
     # Capture all originals first: gate/up may share a Parameter or the whole
     # Linear module. Never slice an already replaced projection a second time.
     shards: dict[int, nn.Parameter] = {}
@@ -607,18 +633,14 @@ def validate_moe_tp_target(
     _, shared = shared_binding
     expert_tp_hidden_size(block, tp_size=tp_size)
     if shared is not None:
-        # The gate/up/down layout shards featurewise with no collectives
-        # (the boundary already gathered the sequence); anything else --
-        # e.g. Qwen2Moe's multiplicative shared_expert_gate -- keeps the
-        # refusal.
-        if not all(
-            isinstance(getattr(shared, n, None), nn.Linear)
-            for n in ("gate_proj", "up_proj", "down_proj")
-        ):
+        # Declared gate/up/down roles shard featurewise without collectives:
+        # the outer MoE boundary already gathered the token sequence.
+        if not isinstance(getattr(shared, "mlp_structure", None), GatedMLPStructure):
             compatibility.shared_expert_tp(module_path, block)
-        gate_shape = tuple(shared.gate_proj.weight.shape)
-        up_shape = tuple(shared.up_proj.weight.shape)
-        down_shape = tuple(shared.down_proj.weight.shape)
+        projections = _shared_expert_projections(shared)
+        gate_shape, up_shape, down_shape = (
+            tuple(weight.shape) for _, _, _, weight in projections
+        )
         model_dim = block.experts.gate_up_proj.shape[-1]
         if (
             len(gate_shape) != 2
@@ -631,8 +653,7 @@ def validate_moe_tp_target(
                 f"and down (D, F), with D={model_dim}; got gate={gate_shape}, "
                 f"up={up_shape}, down={down_shape}"
             )
-        for name, dim in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
-            projection = getattr(shared, name)
+        for name, dim, projection, _ in projections:
             if projection.bias is not None:
                 raise ValueError(
                     f"TP shared expert {module_path}.{name} has an unsupported bias"
@@ -803,9 +824,15 @@ def resolve_tp_plan(
     for module_path, block in moe_blocks:
         shared_name, shared = _resolve_shared_expert(block)
         prefix = f"{module_path}." if module_path else ""
-        tied_shared_paths = {
-            f"{prefix}{shared_name}.{name}.weight" for name in ("gate_proj", "up_proj")
-        }
+        shared_structure = getattr(shared, "mlp_structure", None)
+        tied_shared_paths = (
+            {
+                f"{prefix}{shared_name}.{name}.weight"
+                for name in (shared_structure.gate, shared_structure.up)
+            }
+            if isinstance(shared_structure, GatedMLPStructure)
+            else set()
+        )
         sharded_parameters = list(block.experts.parameters())
         if shared is not None:
             sharded_parameters.extend(shared.parameters())
@@ -876,9 +903,10 @@ def resolve_tp_plan(
         ):
             raise ValueError("TP linear_attn requires replicated GDN projections")
 
-    # Resolve attention-specific realizers before execution. A caller-provided
-    # implementation keeps its semantics; only the default fused column GEMM
-    # needs its sequence gather moved to the attention boundary.
+    # Attention gathers at its input boundary. Inner column projections must
+    # retain those rows, and row projections scatter them back to the residual.
+    # Only the default fused column GEMM is rewritten; custom realizers must
+    # explicitly declare compatible activation semantics.
     attention_parents: dict[str, nn.Module] = {}
     realized_targets = []
     for module_path, inner, spec in targets:
@@ -889,8 +917,26 @@ def resolve_tp_plan(
         )
         if spec.kind == "colwise" and is_attention:
             if spec.implementation is tp_linear.ColumnParallelLinear:
-                spec = replace(spec, implementation=tp_linear.ColwiseLinearNoGather)
+                spec = replace(
+                    spec,
+                    implementation=tp_linear.ColwiseLinearNoGather,
+                    sequence_transform="preserve",
+                )
+            if spec.sequence_transform != "preserve":
+                raise ValueError(
+                    f"Attention TP projection {module_path!r} must preserve token "
+                    "rows after the attention boundary gather"
+                )
             attention_parents[parent_path] = parent
+        if (
+            is_attention
+            and spec.kind == "rowwise"
+            and spec.sequence_transform != "scatter"
+        ):
+            raise ValueError(
+                f"Attention TP projection {module_path!r} must scatter token rows "
+                "back to the sequence-sharded residual"
+            )
         realized_targets.append((module_path, inner, spec))
 
     shared_bindings = {}
@@ -1155,13 +1201,10 @@ def apply_tp(
         prefix = f"{path}." if path else ""
         layouts[f"{prefix}experts.gate_up_proj"] = (1, True, group)
         layouts[f"{prefix}experts.down_proj"] = (2, False, group)
-        for name in block.tp_sharded_param_names:
-            if not name.startswith("experts."):
-                layouts[f"{prefix}{name}"] = (
-                    1 if ".down_proj." in name else 0,
-                    False,
-                    group,
-                )
+        shared_name, shared = _resolve_shared_expert(block)
+        if shared is not None:
+            for name, dim, _, _ in _shared_expert_projections(shared):
+                layouts[f"{prefix}{shared_name}.{name}.weight"] = (dim, False, group)
 
     if on_replacement is not None:
         # TP preserves FQNs, including packed expert parameters. Resolve these

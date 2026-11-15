@@ -249,10 +249,6 @@ def resolve_compressor_plan(
     if not isinstance(structure, DecoderStructure):
         raise TypeError("Compressor CP requires an explicit decoder structure")
     decoder = registered_submodule(model, structure.decoder)
-    if not hasattr(decoder, "layers"):
-        raise TypeError(
-            f"Declared compressor decoder {structure.decoder!r} must expose layers"
-        )
     attentions = tuple(dict.fromkeys(structure.bind_attentions(model)))
     if cfg.cp_config.context_parallel_strategy != "ulysses":
         raise ValueError(

@@ -25,6 +25,32 @@ def registered_submodule(model: nn.Module, path: str) -> nn.Module:
 
 
 @dataclass(frozen=True, slots=True)
+class GatedMLPStructure:
+    """Model-owned gate/up/down projection paths, relative to one MLP."""
+
+    gate: str
+    up: str
+    down: str
+
+    def __post_init__(self) -> None:
+        for path in (self.gate, self.up, self.down):
+            if (
+                not isinstance(path, str)
+                or not path
+                or any(not component.strip() for component in path.split("."))
+            ):
+                raise ValueError("Gated MLP projection paths must be nonempty")
+
+    def bind(self, module: nn.Module) -> tuple[nn.Module, nn.Module, nn.Module]:
+        """Bind registered projections without inferring roles from names."""
+        return (
+            registered_submodule(module, self.gate),
+            registered_submodule(module, self.up),
+            registered_submodule(module, self.down),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class BoundDecoderStructure:
     """Ephemeral instance references; never attach as registered submodules."""
 

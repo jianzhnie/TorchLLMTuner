@@ -6,6 +6,8 @@ from types import MappingProxyType
 
 import torch
 
+from ...components.loss_contract import validate_loss_sum, validate_normalization_tokens
+
 
 @dataclass(frozen=True, slots=True)
 class StepResult:
@@ -19,6 +21,13 @@ class StepResult:
     loss_sum: torch.Tensor
     valid_tokens: int
     normalization_tokens: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if type(self.valid_tokens) is not int or self.valid_tokens < 0:
+            raise ValueError("Step valid_tokens must be a nonnegative integer")
+        count = self.normalization_tokens
+        validate_normalization_tokens(count)
+        validate_loss_sum(self.loss_sum, device=count.device, requires_grad=False)
 
 
 @dataclass(frozen=True, slots=True)

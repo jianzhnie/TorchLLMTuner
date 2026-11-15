@@ -12,6 +12,7 @@ from torch.distributed import ProcessGroup
 from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...accelerator.distributed import get_comm_device, get_world_size
 from ...components.loss import IGNORE_INDEX
+from ...config.training_config import resolve_batch_size_per_rank
 from ...datasets.contracts import (
     BaseDataLoader,
     Batch,
@@ -19,6 +20,7 @@ from ...datasets.contracts import (
     TrainerBatch,
 )
 from ...datasets.loader_builder import build_dataloader as build_dataset_dataloader
+from ...models.execution import validate_prepared_model_inputs
 
 if TYPE_CHECKING:
     from ...components.metrics import MetricsProcessor
@@ -38,25 +40,12 @@ def resolve_data_parallel_rank(
     return mesh.get_local_rank(), mesh.size()
 
 
-def resolve_batch_size_per_rank(cfg: LLMTunerConfig, dp_world_size: int) -> int:
-    """Divide the global batch without silently dropping a remainder."""
-    global_batch_size = cfg.global_batch_size
-    if global_batch_size % dp_world_size != 0:
-        raise ValueError(
-            f"global_batch_size ({global_batch_size}) must be divisible by "
-            f"the number of data-parallel ranks ({dp_world_size}); each rank "
-            f"reads global_batch_size // dp_world_size samples, and the "
-            f"remainder would be dropped silently."
-        )
-    return global_batch_size // dp_world_size
-
-
 def build_training_dataloader(
     cfg: LLMTunerConfig, *, parallel_dims: ParallelTopology | None
 ) -> BaseDataLoader:
     """Build the recoverable loader for this rank's explicit data ownership."""
     dp_rank, dp_world_size = resolve_data_parallel_rank(parallel_dims)
-    batch_size = resolve_batch_size_per_rank(cfg, dp_world_size)
+    batch_size = resolve_batch_size_per_rank(cfg.global_batch_size, dp_world_size)
     return build_dataset_dataloader(
         cfg,
         dp_rank=dp_rank,
@@ -236,15 +225,16 @@ def prepare_model_inputs(
         batch = {
             key: value for key, value in batch.items() if key != "num_valid_tokens"
         }
-    prepare_inputs = getattr(model, "prepare_inputs", None)
-    if not callable(prepare_inputs):
-        raise TypeError(
-            f"{type(model).__name__} must implement "
-            "prepare_inputs(batch, parallel_dims=..., max_context_length=...)"
-        )
     with synchronize_local_errors("Training batch preprocessing", group=error_group):
-        return prepare_inputs(
+        prepare_inputs = getattr(model, "prepare_inputs", None)
+        if not callable(prepare_inputs):
+            raise TypeError(
+                f"{type(model).__name__} must implement "
+                "prepare_inputs(batch, parallel_dims=..., max_context_length=...)"
+            )
+        prepared = prepare_inputs(
             move_batch_to_device(batch, device),
             parallel_dims=parallel_dims,
             max_context_length=max_context_length,
         )
+        return validate_prepared_model_inputs(prepared)

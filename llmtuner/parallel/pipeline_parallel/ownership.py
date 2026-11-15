@@ -9,10 +9,64 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
+from weakref import ReferenceType, ref
 
 from torch import nn
 
 from ..plan import ParallelPlan, model_bindings_from_plan, snapshot_model_bindings
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineParameterOwnership:
+    """Final parameter-only PP provenance without retaining the global model.
+
+    Global source objects are weakly referenced: a caller retaining a source
+    Parameter can still resolve it, while final layouts do not keep the full
+    pre-split model or its storage alive. Local bindings are advanced to final
+    targets when ModelPartLayout refreshes, including split/merged parameters.
+    """
+
+    source_parameters: Mapping[int, tuple[ReferenceType[nn.Parameter], tuple[str, ...]]]
+    local_parameters: Mapping[str, tuple[nn.Parameter, ...]]
+
+    def remap_parameters(
+        self, replacements: Mapping[nn.Parameter, tuple[nn.Parameter, ...]]
+    ) -> PipelineParameterOwnership:
+        """Advance local ownership before releasing pre-transformation owners."""
+        return PipelineParameterOwnership(
+            self.source_parameters,
+            MappingProxyType(
+                {
+                    path: tuple(
+                        dict.fromkeys(
+                            target
+                            for parameter in parameters
+                            for target in replacements.get(parameter, (parameter,))
+                        )
+                    )
+                    for path, parameters in self.local_parameters.items()
+                }
+            ),
+        )
+
+    def parameter_bindings(self, parameters: set[nn.Parameter]) -> set[nn.Parameter]:
+        """Resolve live global identities to retained local registrations."""
+        rebound = set()
+        for parameter in parameters:
+            source, paths = self.source_parameters[id(parameter)]
+            if source() is not parameter:
+                raise KeyError("Parameter is not part of this pipeline source")
+            candidates = {
+                tuple(map(id, self.local_parameters[path])): self.local_parameters[path]
+                for path in paths
+                if path in self.local_parameters
+            }
+            if len(candidates) > 1:
+                raise ValueError(
+                    f"Pipeline parameter aliases no longer share one owner: {paths}"
+                )
+            rebound.update(next(iter(candidates.values()), ()))
+        return rebound
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +115,23 @@ class PipelineOwnership:
     def validate_aliases(self) -> None:
         """Reject broken or newly merged aliases among retained global paths."""
         _validate_aliases(self.global_plan, self.local_plan)
+
+    def parameter_ownership(self) -> PipelineParameterOwnership:
+        """Deliver only the parameter provenance needed after assembly."""
+        return PipelineParameterOwnership(
+            MappingProxyType(
+                {
+                    id(parameter): (ref(parameter), paths)
+                    for parameter, paths in self.parameter_paths.items()
+                }
+            ),
+            MappingProxyType(
+                {
+                    path: (parameter,)
+                    for path, parameter in self.local_parameters.items()
+                }
+            ),
+        )
 
     def module_binding(self, source: nn.Module) -> tuple[str, nn.Module] | None:
         """Bind one global module, or return None when its paths are nonlocal."""

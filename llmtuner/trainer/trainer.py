@@ -27,39 +27,39 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from llmtuner.config.llmtuner_config import LLMTunerConfig
-from llmtuner.config.validation_config import ValidationConfig
 
 from ..accelerator.collectives import (
     all_reduce,
     set_pg_timeouts,
     synchronize_local_errors,
 )
-from ..components.checkpointer.backends.distributed_checkpoint import (
-    DistributedCheckpointManager,
-)
-from ..components.loss import cross_entropy_loss
-from ..components.loss_contract import LossFunctions
+from ..components.checkpointer.core.base import BaseCheckpointManager
 from ..components.metrics import MetricsProcessor
 from ..components.optimizer.ema import EMA
 from ..components.optimizer.lr_scheduler import LRSchedulersContainer
-from ..components.profiler import Profiler
 from ..datasets.contracts import (
     BaseDataLoader,
     Batch,
     DataloaderExhaustedError,
     TrainerBatch,
 )
-from ..memory.activation_swap import reset_activation_swap_metrics
+from ..memory.activation_swap import (
+    ActivationSwapResources,
+    reset_activation_swap_metrics,
+)
 from ..models.common.aux_loss import AuxLoss
 from ..models.common.moe.bias_update import (
     collect_routing_load_metrics,
     reset_routing_statistics,
 )
+from ..parallel.fully_shard_parallel.fine_grained.fine_grained import (
+    FSDPCommunicationResources,
+)
 from ..parallel.model_compile import rollback_compile_settings_on_error
 from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
 from ..utils.logging import get_logger, set_log_ranks
-from ..utils.seeding import rollback_execution_settings_on_error, seed_everything
+from ..utils.seeding import rollback_execution_settings_on_error
 from .runtime import assembly, engine, gradients
 from .runtime import batch as batch_runtime
 from .runtime import metrics as metrics_runtime
@@ -69,7 +69,11 @@ from .runtime.environment import build_runtime_environment
 from .runtime.progress import TrainingProgress
 from .runtime.reductions import resolve_training_reduction_meshes
 from .runtime.results import StepResult
-from .runtime.training_observer import TrainingObserver, install_dispatch_timers
+from .runtime.training_observer import (
+    DispatchTimerResources,
+    TrainingObserver,
+    install_dispatch_timers,
+)
 
 # Rank-aware: the helper attaches a handler whose filter passes below-ERROR
 # lines only on the log ranks (rank 0 by default), so a torchrun run logs one
@@ -103,9 +107,13 @@ class Trainer:
     dataloader: BaseDataLoader | None = None
     lr_scheduler: LRSchedulersContainer | None
     ema: EMA | None
-    checkpointer: DistributedCheckpointManager | None
+    checkpointer: BaseCheckpointManager | None
     metrics: MetricsProcessor | None
     gc_handler: GarbageCollection | None
+    activation_swap_resources: ActivationSwapResources | None = None
+    fsdp_communication_resources: FSDPCommunicationResources | None = None
+    dispatch_timer_resources: DispatchTimerResources | None = None
+    profiler_resource: Any | None = None
 
     # Created lazily for callers that construct a Trainer with __new__.
     # Each instance owns its counters; checkpoints do not retain the Trainer.
@@ -158,6 +166,19 @@ class Trainer:
                         pass  # Construction must retain the original assembly error.
                 raise
 
+    def _retain_model_resources(self, model: torch.nn.Module) -> None:
+        """Keep partially transformed models alive for construction cleanup."""
+        if self.fsdp_communication_resources is None:
+            self.fsdp_communication_resources = FSDPCommunicationResources(())
+        if self.activation_swap_resources is None:
+            self.activation_swap_resources = ActivationSwapResources(())
+        for owner in (
+            self.fsdp_communication_resources,
+            self.activation_swap_resources,
+        ):
+            if all(part is not model for part in owner.model_parts):
+                owner.model_parts += (model,)
+
     def _assemble_runtime(self, cfg: LLMTunerConfig) -> None:
         """Acquire services in order and retain each owner before the next build.
 
@@ -166,11 +187,7 @@ class Trainer:
         a builder or introducing a second resource owner.
         """
         self.cfg = cfg
-        environment = build_runtime_environment(
-            cfg,
-            seed_everything=self.seed_everything,
-            validate_validation=self.check_validation_feasibility,
-        )
+        environment = build_runtime_environment(cfg)
         self.rank = environment.rank
         self.world_size = environment.world_size
         self.local_rank = environment.local_rank
@@ -181,28 +198,27 @@ class Trainer:
         self.error_group = error_group
 
         factories = getattr(self, "_builders", None) or TrainingBuilders()
-        loss_functions = None
-        with synchronize_local_errors("Loss services construction", group=error_group):
-            if factories.loss is not None:
-                loss_functions = factories.loss(cfg)
-                if not isinstance(loss_functions, LossFunctions):
-                    raise TypeError("Loss factory must return LossFunctions")
-                if (
-                    cfg.training.chunked_loss_num_chunks > 1
-                    and loss_functions.chunked_backward is None
-                ):
-                    raise ValueError(
-                        "Injected loss must explicitly support chunked backward"
-                    )
+        loss_functions = assembly.build_loss_functions(
+            cfg, factory=factories.loss, error_group=error_group
+        )
         prepared_model = assembly.prepare_parallel_model(
             cfg,
             environment=environment,
             loss_functions=loss_functions,
             pipeline_schedule_factory=factories.pipeline_schedule,
+            on_model_acquired=self._retain_model_resources,
         )
         model_assembly = prepared_model.assembly
         self.model = model_assembly.model
         self.model_parts = model_assembly.model_parts
+        # Successful handoff retains only final local parts. In particular,
+        # do not keep the unsplit full PP model alive throughout training.
+        self.fsdp_communication_resources = FSDPCommunicationResources(
+            tuple(self.model_parts)
+        )
+        self.activation_swap_resources = ActivationSwapResources(
+            tuple(self.model_parts)
+        )
         optimizer_stack = assembly.build_optimizer_stack(
             cfg,
             model_parts=model_assembly.model_parts,
@@ -221,7 +237,6 @@ class Trainer:
             parallel_dims=environment.parallel_dims,
             device=environment.device,
             param_context=self.param_context,
-            loss_sum=self.loss_sum,
             loss_functions=loss_functions,
             error_group=error_group,
         )
@@ -269,6 +284,9 @@ class Trainer:
                 self.dispatch_timers = install_dispatch_timers(
                     model_assembly.model_parts
                 )
+                self.dispatch_timer_resources = DispatchTimerResources(
+                    tuple(self.dispatch_timers)
+                )
             if not self.dispatch_timers:
                 logger.warning(
                     "Dispatch timing requested, but no native RoutedExperts boundary "
@@ -283,17 +301,6 @@ class Trainer:
                 "NPU step guards use explicit synchronous scalar reads; "
                 "loss/gradient and valid-token checks remain enabled"
             )
-
-    # -- setup helpers ---------------------------------------------------------
-
-    @staticmethod
-    def seed_everything(
-        seed: int, *, deterministic: bool, detect_anomaly: bool = False
-    ) -> None:
-        """Seed host and device generators through the shared utility."""
-        seed_everything(
-            seed, deterministic=deterministic, detect_anomaly=detect_anomaly
-        )
 
     # -- batch handling (bodies live in batch.py) -------------------------------
 
@@ -351,46 +358,6 @@ class Trainer:
             microbatch["batch"],
             global_valid_tokens=global_valid_tokens,
             valid_tokens=microbatch["num_valid_tokens"],
-        )
-
-    @staticmethod
-    def loss_sum(
-        logits: torch.Tensor,
-        labels: torch.Tensor,
-        *,
-        tp_group: dist.ProcessGroup | None = None,
-        global_vocab_size: int | None = None,
-    ) -> torch.Tensor:
-        """Summed next-token cross-entropy over the predictable labels.
-
-        ``labels`` arrives already aligned with ``logits`` -- ``logits[t]``
-        predicts ``labels[t]``, both sources having done their shift upstream
-        (see the explicit model's ``prepare_inputs`` contract). No shift happens here,
-        which is what lets the two sources share one loss: the synthetic path
-        slots its rows together and the packed path arrives already shifted, and
-        both mark the positions that must not be predicted with ``IGNORE_INDEX``
-        rather than dropping them. Those positions are the row ends of the
-        synthetic path and the document boundaries and packing padding of the
-        packed one.
-
-        Not normalized, and deliberately not told the token count. The
-        denominator is a *global* count reduced across DP, which the caller
-        owns; the per-rank count that pairs with it is taken upstream from the
-        unsharded batch (``count_valid_tokens``) precisely so a loss that has
-        since been sliced by context parallelism cannot be recounted. Passing
-        the count in here would suggest this function has a use for it, and a
-        recount would silently undercount by a factor of ``cp``.
-
-        ``tp_group`` / ``global_vocab_size`` select the vocab-parallel form when
-        the logits are a vocab shard, exactly as in
-        :func:`cross_entropy_loss`; both default to ``None``, which is the plain
-        path a replicated head takes.
-        """
-        return cross_entropy_loss(
-            logits,
-            labels,
-            tp_group=tp_group,
-            global_vocab_size=global_vocab_size,
         )
 
     def before_gradient_clipping(self) -> None:
@@ -625,25 +592,6 @@ class Trainer:
 
     # -- validation (bodies live in runtime/validation.py) ----------------------
 
-    @staticmethod
-    def check_validation_feasibility(
-        validation: ValidationConfig,
-        *,
-        dp_world_size: int,
-        training_dataset: str,
-        chunked_loss_num_chunks: int = 1,
-    ) -> None:
-        """Reject the validation configurations that cannot terminate cleanly.
-
-        The body lives in ``runtime/validation.py``; see there for the rationale.
-        """
-        validation_runtime.check_validation_feasibility(
-            validation,
-            dp_world_size=dp_world_size,
-            training_dataset=training_dataset,
-            chunked_loss_num_chunks=chunked_loss_num_chunks,
-        )
-
     def should_validate(self, step: int) -> bool:
         """Whether a validation pass runs at the end of ``step``.
 
@@ -720,17 +668,19 @@ class Trainer:
                 with synchronize_local_errors(
                     "Training profiler initialization", group=self.error_group
                 ):
-                    factories = getattr(self, "_builders", None) or TrainingBuilders()
-                    profiler_factory = (
-                        Profiler if factories.profiler is None else factories.profiler
+                    profiler_context = assembly.build_profiler(
+                        self.cfg.profiler,
+                        global_step=self.step,
+                        base_folder=self.cfg.dump_folder,
+                        builders=getattr(self, "_builders", None),
                     )
-                    profiler = stack.enter_context(
-                        profiler_factory(
-                            self.cfg.profiler,
-                            global_step=self.step,
-                            base_folder=self.cfg.dump_folder,
-                        )
-                    )
+                    # Keep optional retry ownership even if __enter__ fails.
+                    # Context-only custom profilers retain their own cleanup.
+                    if callable(getattr(profiler_context, "close", None)):
+                        self.profiler_resource = profiler_context
+                    profiler = stack.enter_context(profiler_context)
+                    if not callable(getattr(profiler, "step", None)):
+                        raise TypeError("Entered profiler must provide step()")
                 # Takes the cyclic collector over from CPython for the duration
                 # of training: the default schedule fires at unpredictable
                 # times, often inside a forward, and walking a multi-gigabyte
@@ -880,22 +830,26 @@ class Trainer:
         interrupted checkpoint drain may still reference it.
         """
         first_error: BaseException | None = None
-        for name in (
-            "checkpointer",
-            "metrics",
-            "dataloader",
-            "ema",
-            "lr_scheduler",
-            "optimizer",
-            "gc_handler",
+        # A retained checkpointer may still read source tensors and loader state.
+        # Retained FSDP communication may still reduce/offload optimizer tensors.
+        # Release independent resources; retry dependents after their owners drain.
+        for name, dependencies in (
+            ("profiler_resource", ()),
+            ("checkpointer", ()),
+            ("dispatch_timer_resources", ()),
+            ("fsdp_communication_resources", ("checkpointer",)),
+            (
+                "activation_swap_resources",
+                ("checkpointer", "fsdp_communication_resources"),
+            ),
+            ("metrics", ()),
+            ("dataloader", ("checkpointer",)),
+            ("ema", ("checkpointer", "fsdp_communication_resources")),
+            ("lr_scheduler", ("checkpointer",)),
+            ("optimizer", ("checkpointer", "fsdp_communication_resources")),
+            ("gc_handler", ()),
         ):
-            if (
-                name in ("dataloader", "ema", "lr_scheduler", "optimizer")
-                and getattr(self, "checkpointer", None) is not None
-            ):
-                # A failed initialized checkpointer is retained below for a
-                # retry. Its in-flight staging/writes may still own loader
-                # state; closing the source now violates that dependency.
+            if any(getattr(self, owner, None) is not None for owner in dependencies):
                 continue
             resource = getattr(self, name, None)
             if resource is None:
@@ -908,9 +862,8 @@ class Trainer:
             try:
                 close()
             except BaseException as error:
-                if name != "checkpointer" or (
-                    name == "checkpointer"
-                    and getattr(resource, "requires_close_retry", False)
+                if name != "checkpointer" or getattr(
+                    resource, "requires_close_retry", False
                 ):
                     # Failed sinks, loader/GC owners, and interrupted checkpoint
                     # waits may retain resources. Keep their owner for a retry.

@@ -28,6 +28,8 @@ class ModelSpec:
     task: str = "causal_lm"
     explicit: bool = False
     state_format_loader: Callable[[], type[ModelStateFormat]] | None = None
+    flops_estimator: Callable[..., int] | None = None
+    flops_note: Callable[..., str | None] | None = None
 
     def build_config(self, **kwargs: Any) -> Any:
         """Construct configuration without loading model or device code."""
@@ -48,6 +50,16 @@ class ModelSpec:
             )
         return model_class
 
+    def load_config(self, model_name_or_path: str) -> Any:
+        """Load external metadata through this architecture's configuration class."""
+        config = self.config_type_loader().from_pretrained(model_name_or_path)
+        if getattr(config, "model_type", None) != self.model_type:
+            raise ValueError(
+                f"Loaded configuration for {self.model_type!r} returned "
+                f"model_type={getattr(config, 'model_type', None)!r}"
+            )
+        return config
+
     def build_model(self, config: Any) -> nn.Module:
         """Construct this registration without changing configuration ownership."""
         if config.model_type != self.model_type:
@@ -66,6 +78,8 @@ class ModelSpec:
         task: str = "causal_lm",
         explicit: bool = False,
         state_format_loader: Callable[[], type[ModelStateFormat]] | None = None,
+        flops_estimator: Callable[..., int] | None = None,
+        flops_note: Callable[..., str | None] | None = None,
     ) -> ModelSpec:
         return cls(
             model_type,
@@ -75,6 +89,8 @@ class ModelSpec:
             task=task,
             explicit=explicit,
             state_format_loader=state_format_loader,
+            flops_estimator=flops_estimator,
+            flops_note=flops_note,
         )
 
 
@@ -112,10 +128,10 @@ def register_model(architecture: ModelSpec, *, exist_ok: bool = False) -> None:
     for name in ("config_factory", "config_type_loader", "model_class_loader"):
         if not callable(getattr(architecture, name)):
             raise TypeError(f"Model architecture {name} must be callable")
-    if architecture.state_format_loader is not None and not callable(
-        architecture.state_format_loader
-    ):
-        raise TypeError("Model architecture state_format_loader must be callable")
+    for name in ("state_format_loader", "flops_estimator", "flops_note"):
+        hook = getattr(architecture, name)
+        if hook is not None and not callable(hook):
+            raise TypeError(f"Model architecture {name} must be callable")
     previous = _MODELS.get(architecture.model_type)
     if previous is not None and not exist_ok:
         raise ValueError(
@@ -124,11 +140,18 @@ def register_model(architecture: ModelSpec, *, exist_ok: bool = False) -> None:
     _MODELS[architecture.model_type] = architecture
 
 
-def get_model_spec(model_type: str, *, task: str = "causal_lm") -> ModelSpec | None:
-    """Resolve an ID for a task without falling back to another task."""
+def get_model_spec(
+    model_type: str, *, task: str | None = "causal_lm"
+) -> ModelSpec | None:
+    """Resolve an architecture, optionally requiring an exact task.
+
+    Configuration discovery uses task=None; execution keeps task filtering.
+    """
     architecture = _MODELS.get(model_type)
     return (
-        architecture if architecture is not None and architecture.task == task else None
+        architecture
+        if architecture is not None and (task is None or architecture.task == task)
+        else None
     )
 
 
@@ -136,7 +159,7 @@ def resolve_state_format(
     config: Any, *, expert_parallel: bool, sharded_expert_parallel: bool
 ) -> ModelStateFormat:
     """Resolve external state rules from the sole architecture registration."""
-    specification = _MODELS.get(getattr(config, "model_type", None))
+    specification = get_model_spec(getattr(config, "model_type", ""), task=None)
     if specification is None or specification.state_format_loader is None:
         return ModelStateFormat()
     format_class = specification.state_format_loader()
@@ -166,12 +189,8 @@ def build_registered_model(
     None selects the registered task. Explicit task selection must match;
     conditional-generation models cannot silently resolve as text decoders.
     """
-    specification = _MODELS.get(config.model_type)
-    if (
-        specification is None
-        or (task is not None and specification.task != task)
-        or (explicit_only and not specification.explicit)
-    ):
+    specification = get_model_spec(config.model_type, task=task)
+    if specification is None or (explicit_only and not specification.explicit):
         supported = ", ".join(
             item.model_type
             for item in registered_models()
@@ -183,6 +202,22 @@ def build_registered_model(
             f"{config.model_type!r}; choose one of {supported}"
         )
     return specification.build_model(config)
+
+
+def _estimate_flops(module: str, config: Any, *, seq_len: int) -> int:
+    return import_module(module, __package__).flops_per_token(config, seq_len=seq_len)
+
+
+def _flops_note(module: str, config: Any, *, seq_len: int) -> str | None:
+    return import_module(module, __package__).flops_estimation_note(
+        config, seq_len=seq_len
+    )
+
+
+_FLOPS_MODULES = {
+    "kimi_linear": ".kimi.kimi_k3.flops",
+    "qwen3_5_moe_text": ".qwen.qwen3_5_moe.flops",
+}
 
 
 for (
@@ -280,6 +315,16 @@ for (
             state_format_loader=(
                 partial(_load_class, _state_module, _state_name)
                 if _state_module is not None
+                else None
+            ),
+            flops_estimator=(
+                partial(_estimate_flops, _FLOPS_MODULES[_model_type])
+                if _model_type in _FLOPS_MODULES
+                else None
+            ),
+            flops_note=(
+                partial(_flops_note, _FLOPS_MODULES[_model_type])
+                if _model_type == "qwen3_5_moe_text"
                 else None
             ),
             task=_task,

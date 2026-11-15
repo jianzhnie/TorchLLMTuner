@@ -188,7 +188,7 @@ class MoE(nn.Module):
         # module state, and must stay out of the state_dict.
         self._pending_padding_mask: torch.Tensor | None = None
         # EP replacement sets this from the model's declared router-output
-        # contract (or inspection for explicitly supported legacy callers).
+        # contract.
         # Preserve the decoder's expected return arity: returning a tuple where
         # it expects a tensor changes the model's forward semantics.
         self.returns_router_logits = False
@@ -330,7 +330,8 @@ def collect_moe_layers(model_part: nn.Module) -> list[MoE]:
     """Collect distinct native MoE blocks in decoder-layer order.
 
     Read the model-declared slots EP replacement writes, including through activation
-    checkpoint wrappers. Return an empty list when no decoder layers exist.
+    checkpoint wrappers. Models without a decoder declaration have no declared
+    MoE scope and return an empty list.
     """
     # Whole-model compile registers the original model under a wrapper. Bind
     # the declaration on that owner, never against convenience aliases on the
@@ -338,29 +339,16 @@ def collect_moe_layers(model_part: nn.Module) -> list[MoE]:
     while isinstance(model_part, OptimizedModule):
         model_part = model_part._orig_mod
     structure = getattr(model_part, "decoder_structure", None)
-    if structure is not None:
-        if not isinstance(structure, DecoderStructure):
-            raise TypeError("MoE collection requires a DecoderStructure")
-        layers = structure.bind_blocks(model_part)
-    else:
-        # Direct callers may provide a small explicit .layers interface. Its
-        # blocks must still declare their sparse/dense slots below.
-        layers = getattr(model_part, "layers", None)
-        if not isinstance(layers, nn.ModuleList):
-            return []
+    if structure is None:
+        return []
+    if not isinstance(structure, DecoderStructure):
+        raise TypeError("MoE collection requires a DecoderStructure")
+    layers = structure.bind_blocks(model_part)
     found: list[MoE] = []
     seen: set[int] = set()
     # Activation checkpointing wraps each layer in torch's CheckpointWrapper;
     # bind declarations against the original layer, not wrapper attributes.
     layers = [getattr(layer, "_checkpoint_wrapped_module", layer) for layer in layers]
-    if (
-        structure is None
-        and not any(hasattr(layer, "moe_block_name") for layer in layers)
-        and not any(
-            isinstance(module, MoE) for layer in layers for module in layer.modules()
-        )
-    ):
-        return []
     for layer in layers:
         declared = declared_moe_block(layer)
         if declared is None:

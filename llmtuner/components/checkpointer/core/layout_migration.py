@@ -1,4 +1,4 @@
-"""Load Kimi checkpoints whose individual/grouped expert layout changed.
+"""Restore native checkpoints using model-declared source layout migrations.
 
 This explicit migration reads full CPU tensors before conversion. Ordinary
 same-layout recovery keeps the sharded DCP path and its memory behavior.
@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint._nested_dict import set_element
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
@@ -17,13 +18,11 @@ from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 from ....accelerator.collectives import synchronize_local_errors
-from ....models.kimi.kimi_k3.checkpoint import (
-    convert_kimi_expert_state,
-    convert_kimi_optimizer_state,
-)
+from ....models.state import SourceLayoutMigration
 from ....utils.logging import get_logger
 from ....utils.module_names import canonical_fqn
-from ..core.checkpoint_keys import (
+from ...optimizer.state_dict import validate_full_optimizer_state
+from .checkpoint_keys import (
     DATALOADER,
     EMA,
     LR_SCHEDULER,
@@ -32,11 +31,16 @@ from ..core.checkpoint_keys import (
     RNG_STATE,
     TRAIN_STATE,
 )
+from .state_adaptation import (
+    select_local_preflight_states,
+    validate_local_preflight_selection,
+    validate_local_state_preflight,
+)
 
 logger = get_logger(__name__)
 
 
-class KimiSourceLoadPlanner(DefaultLoadPlanner):
+class SourceLayoutLoadPlanner(DefaultLoadPlanner):
     """Write scalar byte records back to the flat source dictionary."""
 
     def __init__(self, destination):
@@ -50,11 +54,12 @@ class KimiSourceLoadPlanner(DefaultLoadPlanner):
 
 
 def source_destinations(
-    metadata: Any, states: dict[str, Any]
+    metadata: Any, states: dict[str, Any], *, layout_name: str = "Source"
 ) -> tuple[dict[str, Any], dict[str, tuple[Any, ...]]]:
+    name = layout_name
     paths = metadata.planner_data
     if not isinstance(paths, dict):
-        raise ValueError("Kimi layout migration requires checkpoint planner paths")
+        raise ValueError(f"{name} layout migration requires checkpoint planner paths")
     flat = {}
     selected = {}
     destinations = {}
@@ -92,7 +97,7 @@ def source_destinations(
             destination = tuple(path)
             if destination in destinations:
                 raise ValueError(
-                    "Ambiguous compiled Kimi checkpoint keys: "
+                    f"Ambiguous compiled {name} checkpoint keys: "
                     f"{destinations[destination]!r} and {key!r}"
                 )
             destinations[destination] = key
@@ -105,40 +110,53 @@ def source_destinations(
     return flat, selected
 
 
-def load_changed_kimi_layout(
+def _agree_migration_choice(choice: object) -> None:
+    """Require all restore participants to select the same migration branch."""
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        return
+    choices = [None] * dist.get_world_size()
+    dist.all_gather_object(choices, choice)
+    if any(candidate != choice for candidate in choices):
+        raise ValueError(
+            "Checkpoint ranks selected inconsistent source layout migration"
+        )
+
+
+def load_changed_source_layout(
     checkpoint_id: str, *, states: dict[str, Any], adapter: Any
 ) -> bool:
-    """Load changed Kimi expert layouts, returning False for ordinary loads."""
-    if (
-        getattr(getattr(adapter, "model_config", None), "model_type", None)
-        != "kimi_linear"
-    ):
+    """Apply declared full-source conversion, returning False for ordinary loads."""
+    with synchronize_local_errors("Checkpoint source migration selection"):
+        state_format = getattr(adapter, "state_format", None)
+        resolve = getattr(state_format, "source_layout_migration", None)
+        migration = resolve() if callable(resolve) else None
+        if migration is not None and not isinstance(migration, SourceLayoutMigration):
+            raise TypeError("Model format must declare a SourceLayoutMigration or None")
+    _agree_migration_choice(None if migration is None else migration.name)
+    if migration is None:
         return False
-    reader = dcp.FileSystemReader(checkpoint_id)
-    with synchronize_local_errors("Kimi checkpoint source layout"):
+    name = migration.name
+    with synchronize_local_errors(f"{name} checkpoint source layout"):
+        reader = dcp.FileSystemReader(checkpoint_id)
         metadata = reader.read_metadata()
-        keys = metadata.state_dict_metadata
-        names = [canonical_fqn(key, wrapper_segments=("_orig_mod",)) for key in keys]
-        grouped = any(
-            ".block_sparse_moe.routed_experts.inner_experts." in key for key in names
+        names = tuple(
+            canonical_fqn(key, wrapper_segments=("_orig_mod",))
+            for key in metadata.state_dict_metadata
         )
-        individual = any(".block_sparse_moe.experts." in key for key in names)
-        if grouped and individual:
-            raise ValueError(
-                "Kimi checkpoint mixes individual and grouped expert layouts"
-            )
-        target_grouped = adapter.state_format.grouped_experts
-        changed = (grouped or individual) and grouped != target_grouped
+        changed = migration.requires_migration(names)
+        if type(changed) is not bool:
+            raise TypeError("Source migration selection must return a boolean")
+    _agree_migration_choice(changed)
     if not changed:
         return False
     # Build source destinations, not live target-shaped buffers. DCP otherwise
     # plans reads against nonexistent target FQNs and cannot migrate layouts.
-    with synchronize_local_errors("Kimi checkpoint migration allocation"):
-        flat, selected = source_destinations(metadata, states)
+    with synchronize_local_errors(f"{name} checkpoint migration allocation"):
+        flat, selected = source_destinations(metadata, states, layout_name=name)
     dcp.load(
         flat,
         storage_reader=reader,
-        planner=KimiSourceLoadPlanner(flat),
+        planner=SourceLayoutLoadPlanner(flat),
     )
     # These templates may gather EP/TP tensors. Keep their collectives outside
     # the local-only error boundary and reuse their full logical shapes below.
@@ -147,27 +165,10 @@ def load_changed_kimi_layout(
         for category in (OPTIMIZER, EMA)
         if category in states
     }
-    with synchronize_local_errors("Kimi checkpoint layout conversion"):
+    with synchronize_local_errors(f"{name} checkpoint layout conversion"):
         loaded = {}
         for key, path in selected.items():
             set_element(loaded, path, flat[key])
-        model = {key: value for key, value in loaded.items() if key not in states}
-        model = convert_kimi_expert_state(
-            model,
-            num_experts=adapter.model_config.num_experts,
-            to_hf=not target_grouped,
-        )
-        for category in (OPTIMIZER, EMA):
-            if category in states:
-                if category not in loaded:
-                    raise ValueError(
-                        f"Kimi checkpoint missing required {category} state"
-                    )
-                loaded[category] = convert_kimi_optimizer_state(
-                    loaded[category],
-                    num_experts=adapter.model_config.num_experts,
-                    to_hf=not target_grouped,
-                )
         missing_categories = set(states) - {MODEL} - loaded.keys()
         if RNG_STATE in missing_categories:
             # Match the ordinary DCP loader's legacy contract. An existing but
@@ -179,40 +180,32 @@ def load_changed_kimi_layout(
             )
         if missing_categories:
             raise ValueError(
-                "Kimi layout migration missing training state categories: "
+                f"{name} layout migration missing training state categories: "
                 f"{sorted(missing_categories)}"
             )
-        if RNG_STATE in states and RNG_STATE in loaded:
-            states[RNG_STATE].validate_state_dict(loaded[RNG_STATE])
+        model = {key: value for key, value in loaded.items() if key not in states}
+        model = migration.convert_model(model)
+        for category in templates:
+            loaded[category] = migration.convert_optimizer(loaded[category])
         # Reject malformed full model state before any distribute_tensor
         # collective or parameter copy. All ranks participate in this local
         # validation boundary, including those owning no offending parameter.
         states[MODEL].validate_state_dict(model)
         for category, template in templates.items():
-            values = loaded[category]
-            expected_values = dict(template)
-            for key, expected in template.items():
-                if key.startswith("state.") and key.endswith(".exp_avg_sq"):
-                    fqn = key[len("state.") : -len(".exp_avg_sq")]
-                    if values.get(f"param_groups.{fqn}.amsgrad", False):
-                        expected_values[f"state.{fqn}.max_exp_avg_sq"] = expected
-            for key, expected in expected_values.items():
-                # AMSGrad is selected by the saved group, not the fresh runtime.
-                if key.endswith(".max_exp_avg_sq"):
-                    fqn = key[len("state.") : -len(".max_exp_avg_sq")]
-                    if not values.get(f"param_groups.{fqn}.amsgrad", False):
-                        continue
-                if key not in values:
-                    raise ValueError(f"Kimi {category} missing required key {key!r}")
-                value = values[key]
-                if isinstance(expected, torch.Tensor):
-                    if not isinstance(value, torch.Tensor):
-                        raise ValueError(f"Kimi {category} {key!r} must be a tensor")
-                    if value.shape != expected.shape:
-                        raise ValueError(
-                            f"Kimi {category} {key!r} has shape {tuple(value.shape)}, "
-                            f"expected {tuple(expected.shape)}"
-                        )
+            validate_full_optimizer_state(
+                loaded[category], template, context=f"{name} {category}"
+            )
+
+    # Direct callers need the same metadata preflight as backend-managed loads.
+    # Do not create fresh reader buffers: the isolated source records are ready.
+    with synchronize_local_errors(f"{name} checkpoint metadata validator selection"):
+        preflight_states = select_local_preflight_states(states)
+    validate_local_preflight_selection(preflight_states)
+    validate_local_state_preflight(
+        preflight_states,
+        loaded,
+        missing_categories=frozenset({RNG_STATE} - loaded.keys()),
+    )
 
     # Model first, optimizer before scheduler, RNG last. Each object's existing
     # validator remains authoritative for keys, topology and shape contracts.
@@ -240,18 +233,16 @@ def load_changed_kimi_layout(
     for category, state in states.items():
         if category in (MODEL, OPTIMIZER, RNG_STATE):
             continue
-        if category not in loaded:
-            raise ValueError(f"Kimi checkpoint missing required {category} state")
         # These callbacks are local. Coordinate failures before peers can
         # enter EMA or RNG collectives; EMA's own EP/TP communication must
         # remain outside this local-only boundary.
         with (
-            synchronize_local_errors(f"Kimi checkpoint {category} restoration")
+            synchronize_local_errors(f"{name} checkpoint {category} restoration")
             if category in (LR_SCHEDULER, DATALOADER, TRAIN_STATE)
             else nullcontext()
         ):
             state.load_state_dict(loaded[category])
-    with synchronize_local_errors("Kimi checkpoint RNG restoration"):
+    with synchronize_local_errors(f"{name} checkpoint RNG restoration"):
         if RNG_STATE in states and RNG_STATE in loaded:
             states[RNG_STATE].load_state_dict(loaded[RNG_STATE])
     return True

@@ -34,13 +34,6 @@ if TYPE_CHECKING:
     from torch import nn
 
     from ..config.llmtuner_config import LLMTunerConfig
-    from .registry import ModelSpec
-
-
-def registered_architecture(model_type: str) -> ModelSpec | None:
-    return get_model_spec(model_type) or get_model_spec(
-        model_type, task="conditional_generation"
-    )
 
 
 __all__ = [
@@ -63,7 +56,7 @@ def build_model_config(
     empty dict to use architecture defaults. ``None`` loads the config from a
     local checkpoint directory or Hub identifier.
     """
-    architecture = registered_architecture(model_name_or_path)
+    architecture = get_model_spec(model_name_or_path, task=None)
     # Some HF composite constructors modify nested configuration dictionaries.
     overrides = deepcopy(arch_overrides) if arch_overrides is not None else {}
     if arch_overrides is not None:
@@ -78,15 +71,10 @@ def build_model_config(
         # Do not mutate AutoConfig's process-global registry during training.
         metadata, _ = PretrainedConfig.get_config_dict(model_name_or_path)
         model_type = metadata.get("model_type", "")
-        architecture = registered_architecture(model_type)
+        architecture = get_model_spec(model_type, task=None)
         if architecture is None:
             raise ValueError(f"No local configuration registered for {model_type!r}")
-        config = architecture.config_type_loader().from_pretrained(model_name_or_path)
-        if getattr(config, "model_type", None) != architecture.model_type:
-            raise ValueError(
-                f"Loaded configuration for {architecture.model_type!r} returned "
-                f"model_type={getattr(config, 'model_type', None)!r}"
-            )
+        config = architecture.load_config(model_name_or_path)
     text_config = getattr(config, "text_config", config)
     # Apply the same context requirement to offline and saved configurations.
     # Only the text stack is extended; composite vision settings stay intact.
@@ -194,7 +182,7 @@ def build_model_config_for(cfg: LLMTunerConfig) -> Any:
     """
     # Only registered architecture names select offline construction. Missing
     # paths and Hub IDs belong to from_pretrained, which owns their validation.
-    architecture = registered_architecture(cfg.hf_model)
+    architecture = get_model_spec(cfg.hf_model, task=None)
     offline = not os.path.exists(cfg.hf_model) and architecture is not None
     overrides = (
         {

@@ -376,22 +376,18 @@ class LLMTunerConfig:
         readable but unregistered architectures are a configuration error.
         """
         mp = self.model.model_name_or_path
-        registration = get_model_spec(mp) or get_model_spec(
-            mp, task="conditional_generation"
-        )
+        registration = get_model_spec(mp, task=None)
         if not os.path.exists(mp) and registration is not None:
             return  # registered offline name; explicit sizes are authoritative
         try:
             metadata, _ = PretrainedConfig.get_config_dict(mp)
             model_type = metadata.get("model_type", "")
-            registration = get_model_spec(model_type) or get_model_spec(
-                model_type, task="conditional_generation"
-            )
+            registration = get_model_spec(model_type, task=None)
             if registration is None:
                 raise ConfigError(
                     f"No local configuration registered for {model_type!r}"
                 )
-            hf_config = registration.config_type_loader().from_pretrained(mp)
+            hf_config = registration.load_config(mp)
         except ConfigError:
             raise
         except Exception as e:  # noqa: BLE001 - warn, keep explicit values

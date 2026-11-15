@@ -9,6 +9,40 @@ LossSum = Callable[..., torch.Tensor]
 ChunkedLossBackward = Callable[..., torch.Tensor]
 
 
+def validate_normalization_tokens(
+    count: torch.Tensor, *, device: torch.device | None = None
+) -> None:
+    """Require detached real scalar counts before loss normalization."""
+    if not isinstance(count, torch.Tensor) or count.ndim != 0:
+        raise TypeError("Normalization tokens must be a scalar tensor")
+    if count.requires_grad or count.is_complex() or count.dtype == torch.bool:
+        raise TypeError("Normalization tokens must be detached real counts")
+    if device is not None and count.device != device:
+        raise ValueError("Normalization tokens must be on the execution device")
+
+
+def validate_loss_sum(
+    loss: torch.Tensor,
+    *,
+    device: torch.device,
+    requires_grad: bool | None = None,
+) -> None:
+    """Validate a loss service's scalar metadata without reading its value.
+
+    Loss implementations may communicate, so callers validate only after the
+    implementation returns. Finite-value policy belongs to update coordination.
+    """
+    if not isinstance(loss, torch.Tensor):
+        raise TypeError("Loss service must return a tensor")
+    if loss.ndim != 0 or not loss.is_floating_point():
+        raise ValueError("Loss service must return a floating-point scalar")
+    if loss.device != device:
+        raise ValueError("Loss scalar must be on the execution device")
+    if requires_grad is not None and loss.requires_grad != requires_grad:
+        requirement = "differentiable" if requires_grad else "detached"
+        raise ValueError(f"Loss scalar must be {requirement}")
+
+
 @dataclass(frozen=True, slots=True)
 class LossFunctions:
     """Token-summed loss and optional head/chunk backward implementation.

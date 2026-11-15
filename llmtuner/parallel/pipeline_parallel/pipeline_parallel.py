@@ -39,13 +39,14 @@ from torch.distributed.pipelining.schedules import (
 )
 
 from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.config.training_config import resolve_batch_size_per_rank
+from llmtuner.config.utils import require_integer_at_least
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...components.loss import cross_entropy_loss
 from ...components.loss_contract import LossSum
 from ...models.contracts import DecoderStructure
 from ...utils.logging import get_logger
-from .. import compatibility
 from ..topology import ParallelTopology
 from .hccl_schedule import hccl_1f1b_schedule_class
 from .microbatch_drivers import bind_stage_rng
@@ -284,20 +285,10 @@ def validate_microbatches(
     fed uneven (or wrong-count) microbatches and hang in a p2p.
     """
     dp = parallel_dims.dp_replicate * parallel_dims.dp_shard
-    if global_batch_size % dp != 0:
-        raise ValueError(
-            f"global_batch_size ({global_batch_size}) is not divisible by "
-            f"the data-parallel degree ({dp})"
-        )
-    rows_per_rank = global_batch_size // dp
+    rows_per_rank = resolve_batch_size_per_rank(global_batch_size, dp)
     num_microbatches = cfg.pp_config.num_pp_microbatches
-    # torchtitan validates this in its config's __post_init__ (trainer.py);
-    # llmtuner's config does not, so the check lives here -- a 0 would otherwise
-    # surface as a ZeroDivisionError on the modulo below.
-    if num_microbatches <= 0:
-        raise ValueError(
-            f"num_pp_microbatches must be greater than 0, got {num_microbatches}."
-        )
+    # Revalidate direct callers whose config may have changed after construction.
+    require_integer_at_least(cfg.pp_config, "num_pp_microbatches", group="parallel")
     if rows_per_rank % num_microbatches != 0:
         raise ValueError(
             f"per-rank batch rows ({global_batch_size} / {dp} = "
@@ -356,23 +347,17 @@ def apply_pp(
             raise NotImplementedError(
                 "Explicit PP requires model-owned partition validation and stage I/O"
             )
-        if getattr(model, "enable_weight_tying", False):
-            compatibility.pp_weight_tying()
-        # A DSA model builds its dense mask from tok_embeddings.weight.dtype on
-        # every forward; non-first stages hold an nn.Identity there (crashes on
-        # the first forward), so refuse at assembly time.
-        if getattr(model, "uses_dsa", False):
-            compatibility.dsa_pp()
         parallelism = cfg
         validate_microbatches(parallel_dims, cfg, global_batch_size)
 
         module_names_per_stage = parallelism.pp_config.module_fqns_per_model_part
         if module_names_per_stage is None:
-            blocks = (
-                structure.bind(model).blocks
-                if isinstance(structure, DecoderStructure)
-                else model.layers
-            )
+            if not isinstance(structure, DecoderStructure):
+                raise TypeError(
+                    "Automatic PP partitioning requires a model-owned "
+                    "DecoderStructure; custom models must provide an explicit split"
+                )
+            blocks = structure.bind(model).blocks
             num_layers = len(blocks)
             num_stages, input_weight, output_weight = get_pipeline_metadata(
                 parallel_dims, parallelism, num_layers
@@ -383,28 +368,26 @@ def apply_pp(
                 input_weight=input_weight,
                 output_weight=output_weight,
             )
-            structure = getattr(model, "decoder_structure", None)
-            if isinstance(structure, DecoderStructure):
-                runtime_modules = getattr(model, "pipeline_runtime_modules", ())
-                block_ids = tuple(blocks._modules)
-                aliases = {
-                    "tok_embeddings": structure.embedding,
-                    "norm": structure.norm,
-                    "lm_head": structure.head,
-                }
+            runtime_modules = getattr(model, "pipeline_runtime_modules", ())
+            block_ids = tuple(blocks._modules)
+            aliases = {
+                "tok_embeddings": structure.embedding,
+                "norm": structure.norm,
+                "lm_head": structure.head,
+            }
 
-                def bind_target(target: str) -> list[str]:
-                    if target == "rotary_emb":
-                        return list(runtime_modules)
-                    if target.startswith("layers."):
-                        block = block_ids[int(target.removeprefix("layers."))]
-                        return [f"{structure.blocks}.{block}"]
-                    return [aliases[target]]
+            def bind_target(target: str) -> list[str]:
+                if target == "rotary_emb":
+                    return list(runtime_modules)
+                if target.startswith("layers."):
+                    block = block_ids[int(target.removeprefix("layers."))]
+                    return [f"{structure.blocks}.{block}"]
+                return [aliases[target]]
 
-                module_names_per_stage = [
-                    [path for target in targets for path in bind_target(target)]
-                    for targets in module_names_per_stage
-                ]
+            module_names_per_stage = [
+                [path for target in targets for path in bind_target(target)]
+                for targets in module_names_per_stage
+            ]
             if first_stage_module_fqns:
                 prepend_first_stage_modules(
                     module_names_per_stage, model, first_stage_module_fqns
@@ -445,15 +428,7 @@ def apply_pp(
                     "interleaved_1f1b) or one stage per rank."
                 )
 
-        replicated_module_names = (
-            tuple(getattr(model, "pipeline_runtime_modules", ()))
-            if isinstance(getattr(model, "decoder_structure", None), DecoderStructure)
-            else (
-                ("rotary_emb",)
-                if any("rotary_emb" in targets for targets in module_names_per_stage)
-                else ()
-            )
-        )
+        replicated_module_names = tuple(getattr(model, "pipeline_runtime_modules", ()))
         validate_pipeline_ownership(
             model,
             module_names_per_stage,

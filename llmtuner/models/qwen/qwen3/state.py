@@ -8,7 +8,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from ...state import ExpertStorageLayout, ModelStateFormat
+from ...state import ExpertStorageLayout, ExpertTensorSlice, ModelStateFormat
 
 NATIVE_PROJECTIONS = {
     "gate_proj": "w1_EFD",
@@ -143,4 +143,27 @@ class Qwen3StateFormat(ModelStateFormat):
         return expert_export_keys(key, shape, num_experts=self.config.num_experts)
 
     def reader_layout(self) -> ExpertStorageLayout:
-        return ExpertStorageLayout(self.config.num_experts, self.grouped_experts)
+        return ExpertStorageLayout(
+            self.config.num_experts, self.map_reader_key, self.validate_reader_key
+        )
+
+    def map_reader_key(self, key: str) -> ExpertTensorSlice | None:
+        """Declare packed/native stack slots without depending on storage IO."""
+        mapped = grouped_expert_key(key)
+        if mapped is None:
+            return None
+        target, expert, projection = mapped
+        if self.grouped_experts:
+            return ExpertTensorSlice(native_ep_expert_key(key), expert, 0, 1)
+        if projection == "down_proj":
+            return ExpertTensorSlice(target, expert, 0, 1)
+        return ExpertTensorSlice(target, expert, int(projection == "up_proj"), 2)
+
+    def validate_reader_key(self, key: str) -> None:
+        if self.grouped_experts and key.endswith(
+            (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
+        ):
+            raise ValueError(
+                "Native EP HF reader requires individual expert projections; "
+                f"fused expert tensor is unsupported: {key}"
+            )

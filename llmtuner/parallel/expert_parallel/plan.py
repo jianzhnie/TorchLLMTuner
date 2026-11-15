@@ -85,17 +85,9 @@ def decoder_layers_for_ep(model: nn.Module) -> Iterable[nn.Module]:
     so PP copies and parameter replacement cannot leave cached references.
     """
     structure = getattr(model, "decoder_structure", None)
-    if structure is not None:
-        if not isinstance(structure, DecoderStructure):
-            raise TypeError("EP decoder_structure must be a DecoderStructure")
-        return structure.bind_blocks(model)
-    layers = getattr(model, "layers", None)
-    if layers is None:
-        raise UnsupportedCombinationError(
-            f"EP requires declared decoder structure or an explicit .layers interface; "
-            f"got {type(model).__name__}."
-        )
-    return layers
+    if not isinstance(structure, DecoderStructure):
+        raise TypeError("EP requires a model-owned DecoderStructure")
+    return structure.bind_blocks(model)
 
 
 def find_moe_candidates(

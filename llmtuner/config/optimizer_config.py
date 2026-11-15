@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 from llmtuner.config.optimizer_layout import BucketConfig, ComputeLayout
-from llmtuner.config.utils import require_integer_at_least
+from llmtuner.config.utils import require_bool, require_integer_at_least
 from llmtuner.errors import ConfigError
 
 
@@ -139,8 +139,7 @@ class OptimizerConfig:
     )
 
     def __post_init__(self) -> None:
-        if not isinstance(self.swap_prefetch, bool):
-            raise ConfigError("optimizer.swap_prefetch must be bool")
+        require_bool(self, "swap_prefetch", group="optimizer")
         fraction = self.swap_memory_fraction
         if fraction is not None and (
             isinstance(fraction, bool)

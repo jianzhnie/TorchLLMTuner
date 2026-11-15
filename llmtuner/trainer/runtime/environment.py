@@ -7,7 +7,6 @@ values without allocating a model or writing attributes onto a Trainer.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -33,6 +32,7 @@ from ...parallel.topology import (
     resolve_parallel_topology,
 )
 from ...utils import seeding
+from .validation import check_validation_feasibility
 
 if TYPE_CHECKING:
     from ...config.llmtuner_config import LLMTunerConfig
@@ -57,14 +57,11 @@ class RuntimeEnvironment:
 
 def build_runtime_environment(
     cfg: LLMTunerConfig,
-    *,
-    seed_everything: Callable[..., None],
-    validate_validation: Callable[..., None],
 ) -> RuntimeEnvironment:
     """Resolve topology, validate evaluation and seed before model construction.
 
-    Callbacks preserve the public Trainer customization points without giving
-    this builder access to a Trainer or its mutable runtime attributes.
+    Validate configuration and initialize RNG through shared functions before
+    any model is constructed.
     """
     if cfg.deterministic:
         seeding.set_deterministic_algorithms()
@@ -87,7 +84,7 @@ def build_runtime_environment(
     # model and dataloader exist: a ``steps=-1`` pass that cannot terminate
     # cleanly would otherwise hang on its collectives mid-run.
     if cfg.validation is not None:
-        validate_validation(
+        check_validation_feasibility(
             cfg.validation,
             dp_world_size=(
                 1
@@ -106,7 +103,7 @@ def build_runtime_environment(
         seed = seeding.derive_distinct_seed(
             seed, [(pp_mesh.get_local_rank(), pp_mesh.size())]
         )
-    seed_everything(
+    seeding.seed_everything(
         seed, deterministic=cfg.deterministic, detect_anomaly=cfg.detect_anomaly
     )
 

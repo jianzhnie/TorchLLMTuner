@@ -29,6 +29,11 @@ from transformers.utils.output_capturing import capture_outputs
 
 from ....errors import UnsupportedCombinationError
 from ...common.cast_linear import build_lm_head
+from ...common.gradient_norm import (
+    ReferenceNormGroup,
+    packed_expert_reference_norm_group,
+    qkv_reference_norm_group,
+)
 from ...common.input_preparation import prepare_text_inputs
 from ...common.validation import temporary_attention_mask
 from ...configuration import (
@@ -36,7 +41,7 @@ from ...configuration import (
     validate_attention_backend,
     validate_native_execution_policy,
 )
-from ...contracts import DecoderStructure, MoEBlockContract
+from ...contracts import DecoderStructure, GatedMLPStructure, MoEBlockContract
 from ...execution import ModelExecutionCapabilities
 from ..routing import (
     Qwen3_5MoeFP32TopKRouter,
@@ -213,6 +218,9 @@ class Qwen3_5MoeExperts(reference.Qwen3_5MoeExperts):
     preserves the initialization classification, not forward delegation.
     """
 
+    def reference_norm_groups(self) -> tuple[ReferenceNormGroup, ...]:
+        return (packed_expert_reference_norm_group(self.gate_up_proj, self.down_proj),)
+
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         nn.Module.__init__(self)
         self.num_experts = config.num_experts
@@ -263,6 +271,9 @@ class Qwen3_5MoeSparseMoeBlock(reference.Qwen3_5MoeSparseMoeBlock):
         self.experts = Qwen3_5MoeExperts(config)
         self.shared_expert = Qwen3_5MoeMLP(
             config, intermediate_size=config.shared_expert_intermediate_size
+        )
+        self.shared_expert.mlp_structure = GatedMLPStructure(
+            gate="gate_proj", up="up_proj", down="down_proj"
         )
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
         self.moe_contract = MoEBlockContract(
@@ -330,6 +341,15 @@ class Qwen3_5MoeAttention(reference.Qwen3_5MoeAttention):
     Reference kernel dispatch and rotary math are reused without global patches.
     Parameter names and construction order retain external checkpoint semantics.
     """
+
+    def reference_norm_groups(self) -> tuple[ReferenceNormGroup, ...]:
+        return (
+            qkv_reference_norm_group(
+                (self.q_proj, self.k_proj, self.v_proj),
+                kv_heads=self.config.num_key_value_heads,
+                head_dim=self.head_dim,
+            ),
+        )
 
     def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int) -> None:
         nn.Module.__init__(self)

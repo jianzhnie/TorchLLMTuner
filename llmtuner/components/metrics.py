@@ -293,7 +293,7 @@ class MetricsProcessor:
         pp_schedule: the pipeline schedule name, which decides the metrics rank.
         num_flops_per_token: model FLOPs per token, used for tflops and MFU. The
             caller sets this once the model exists. ``0`` -- the value
-            :func:`~llmtuner.utils.flops.flops_per_token` returns for a
+            :func:`~llmtuner.models.flops.flops_per_token` returns for a
             config whose geometry it cannot read -- suppresses MFU rather than
             reporting ``0.00%``. Console TFLOPS are also ``N/A``; numeric sinks
             retain the legacy ``0.0`` value.
@@ -336,6 +336,7 @@ class MetricsProcessor:
             config_dict=config_dict,
             tag=config.tag if tag is None else tag,
         )
+        self._logger_closed = False
         try:
             self.device_memory_monitor = build_device_memory_monitor()
             self.color = (
@@ -364,7 +365,12 @@ class MetricsProcessor:
             try:
                 self.logger.close()
             except BaseException:
-                logger.exception("Metrics logger cleanup failed during initialization")
+                try:
+                    logger.exception(
+                        "Metrics logger cleanup failed during initialization"
+                    )
+                except BaseException:
+                    pass  # Preserve the original construction error.
             raise
 
     @property
@@ -768,6 +774,23 @@ class MetricsProcessor:
             )
 
     def close(self) -> None:
+        """Release the writer even if final summary reporting fails."""
+        first_error: BaseException | None = None
+        try:
+            self._report_final_summaries()
+        except BaseException as error:
+            first_error = error
+        if not self._logger_closed:
+            try:
+                self.logger.close()
+                self._logger_closed = True
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def _report_final_summaries(self) -> None:
         observed = self.latest_training_observations
         if not self._steady_summary_reported and "steady/samples" in observed:
             mfu = observed.get("steady/mfu_percent")
@@ -799,4 +822,3 @@ class MetricsProcessor:
                 self._summary_seconds / self._summary_steps,
             )
             self._summary_reported = True
-        self.logger.close()

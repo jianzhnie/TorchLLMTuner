@@ -190,21 +190,6 @@ def ep_hf_initial_load(ep: int) -> None:
     )
 
 
-def dsa_pp() -> None:
-    """A DSA (dense-mask) model builds its additive mask from
-    ``tok_embeddings.weight.dtype`` on every forward; on non-first PP stages
-    the embedding is an ``nn.Identity``, so the mask build crashes. Unlock:
-    take the dtype from the config and re-validate on multiple ranks.
-    """
-    raise UnsupportedCombinationError(
-        "DSA models (dense additive mask, index_topk) with "
-        "pipeline_parallel_size > 1 are not supported: the mask build "
-        "reads tok_embeddings.weight.dtype, and non-first stages hold an "
-        "nn.Identity there. Unlock by sourcing the dtype from the config "
-        "and re-validating DSA x PP numerics on multiple ranks."
-    )
-
-
 def pp_packed_microbatch_split(num_microbatches: int) -> None:
     """A packed (1-D) corpus batch cannot be split into PP microbatches: the
     split would cut documents at the token level, silently truncating their
@@ -220,30 +205,12 @@ def pp_packed_microbatch_split(num_microbatches: int) -> None:
     )
 
 
-def pp_weight_tying() -> None:
-    """The split puts the embedding on the first stage and the head on the last, and
-    each stage's deep copy would train an independent copy of the shared weight.
-    """
-    raise UnsupportedCombinationError(
-        "pp > 1 with tied word embeddings is not supported: the split puts "
-        "the embedding on the first stage and the head on the last, and "
-        "each stage's deep copy would train an independent copy of the "
-        "shared weight."
-    )
-
-
 def shared_expert_tp(module_path: str, block: object) -> None:
-    """A shared expert whose layout is not the gate/up/down MLP cannot be
-    feature-sharded by ``shard_shared_expert_for_tp`` -- e.g. Qwen2Moe's
-    multiplicative shared_expert_gate. ep>1 is not a way out either: the
-    swap rejects the same gated layout.
-    """
+    """Require model-owned projection roles before shared-expert sharding."""
     raise UnsupportedCombinationError(
         f"TP over {module_path} ({type(block).__name__}): the block "
-        "has a shared expert whose layout is not the gate_proj/up_proj/"
-        "down_proj MLP this sharding knows (e.g. a multiplicative "
-        "shared_expert_gate). Use tp=1 (ep > 1 is not a way out for this "
-        "block: the swap rejects the same gated layout)."
+        "has a shared expert without a supported model-owned GatedMLPStructure. "
+        "Declare its gate/up/down projection paths or use tp=1."
     )
 
 
@@ -404,18 +371,6 @@ ENTRIES: tuple[CompatibilityRule, ...] = (
         "assembly",
         UnsupportedCombinationError,
         "trainer/runtime/assembly.py::build_model",
-    ),
-    CompatibilityRule(
-        pp_weight_tying,
-        "assembly",
-        UnsupportedCombinationError,
-        "parallel/pipeline_parallel/pipeline_parallel.py::apply_pp",
-    ),
-    CompatibilityRule(
-        dsa_pp,
-        "assembly",
-        UnsupportedCombinationError,
-        "parallel/pipeline_parallel/pipeline_parallel.py::apply_pp",
     ),
     CompatibilityRule(
         pp_packed_microbatch_split,

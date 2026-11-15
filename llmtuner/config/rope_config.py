@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ..errors import ConfigError
-from .utils import require_integer_at_least
+from .utils import require_bool, require_integer_at_least
 
 
 @dataclass(kw_only=True)
@@ -63,8 +63,7 @@ class RoPEConfig:
         if self.scaling == "yarn":
             if self.rope_factor < 1:
                 raise ConfigError("rope.rope_factor must be >= 1 for YaRN scaling")
-            if not isinstance(self.truncate, bool):
-                raise ConfigError("rope.truncate must be bool")
+            require_bool(self, "truncate", group="rope")
             if self.rope_factor > 1:
                 if self.theta <= 1:
                     raise ConfigError("rope.theta must be > 1 for YaRN scaling")

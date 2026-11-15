@@ -55,7 +55,6 @@ from torch.distributed.checkpoint.state_dict_saver import (
     AsyncCheckpointerType,
     AsyncSaveResponse,
 )
-from torch.distributed.checkpoint.stateful import Stateful
 
 from ....accelerator.collectives import synchronize_local_errors
 from ....datasets.contracts import require_same_dp_degree
@@ -65,6 +64,7 @@ from ..storage import filesystem
 
 if TYPE_CHECKING:
     from ....config.checkpoint_config import CheckpointConfig
+    from ....parallel.assembly import ModelPartLayout
 
 from ....utils.logging import get_logger
 from ..core.base import BaseCheckpointManager, purge_thread
@@ -78,9 +78,16 @@ from ..core.checkpoint_keys import (
     SAFETENSORS_INDEX,
     TRAIN_STATE,
 )
-from ..core.state_adaptation import adapt_hf_model_state
+from ..core.layout_migration import load_changed_source_layout
+from ..core.state_adaptation import (
+    adapt_hf_model_state,
+    materialize_local_checkpoint_states,
+    prepare_hf_model_state,
+    prepare_local_state_preflight,
+    validate_local_preflight_selection,
+    validate_local_state_preflight,
+)
 from ..hf.hf_storage import save_hf_checkpoint
-from ..hf.kimi_layout import load_changed_kimi_layout
 from ..storage.checkpoint_writer import GenerationFileSystemWriter
 from ..storage.load_planner import CheckpointLoadPlanner
 from ..storage.staging import CoordinatedStager
@@ -178,6 +185,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         optimizer: Any,
         lr_scheduler: Any,
         ema: Any | None = None,
+        runtime_layouts: tuple[ModelPartLayout, ...] = (),
         states: dict[str, Any],
         folder: str,
         sd_adapter: Any | None = None,
@@ -190,6 +198,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
                 ema=ema,
+                runtime_layouts=runtime_layouts,
                 states=states,
                 folder=folder,
             )
@@ -260,6 +269,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             ema=ema,
+            runtime_layouts=runtime_layouts,
             states=states,
             folder=folder,
         )
@@ -433,11 +443,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             # callback cannot leave peers entering the writer protocol. Model,
             # optimizer, EMA and user callbacks may communicate and stay out.
             with synchronize_local_errors("Checkpoint local save preparation"):
-                state_dict = dict(state_dict)
-                for category in (LR_SCHEDULER, DATALOADER, TRAIN_STATE, RNG_STATE):
-                    state = state_dict.get(category)
-                    if isinstance(state, Stateful):
-                        state_dict[category] = state.state_dict()
+                state_dict = materialize_local_checkpoint_states(state_dict)
 
         if to_hf:
             if self.sd_adapter is None:
@@ -558,20 +564,22 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         Raises:
             ValueError: if ``from_hf`` is set without an ``sd_adapter``.
         """
+        with synchronize_local_errors("Checkpoint source format validation"):
+            if from_quantized and not from_hf:
+                raise ValueError("Quantized checkpoints require Hugging Face format")
+            if from_hf and self.sd_adapter is None:
+                raise ValueError(
+                    "trying to load checkpoint in HF safetensors format, "
+                    "but sd_adapter is not provided."
+                )
         if not from_hf:
             # Read only local compatibility records before DCP can write into
             # live model/optimizer tensors, including Kimi layout migrations.
             with synchronize_local_errors("Checkpoint local preflight preparation"):
-                preflight_states = {
-                    category: states[category]
-                    for category in (RNG_STATE, DATALOADER, TRAIN_STATE, LR_SCHEDULER)
-                    if category in states
-                    and callable(getattr(states[category], "validate_state_dict", None))
-                }
-                preflight_destination = {
-                    category: state.state_dict()
-                    for category, state in preflight_states.items()
-                }
+                preflight_states, preflight_destination = prepare_local_state_preflight(
+                    states
+                )
+            validate_local_preflight_selection(preflight_states)
             if preflight_states:
                 loader_metadata = preflight_destination.get(DATALOADER, {})
                 if "dp_world_size" in loader_metadata:
@@ -595,14 +603,16 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     planner=preflight_planner,
                     process_group=self.pg,
                 )
-                for category, state in preflight_states.items():
-                    phase = "RNG" if category == RNG_STATE else category
-                    with synchronize_local_errors(
-                        f"Checkpoint {phase} preflight validation"
-                    ):
-                        if category != RNG_STATE or preflight_planner.has_rng_state:
-                            state.validate_state_dict(preflight_destination[category])
-            if load_changed_kimi_layout(
+                validate_local_state_preflight(
+                    preflight_states,
+                    preflight_destination,
+                    missing_categories=(
+                        frozenset()
+                        if preflight_planner.has_rng_state
+                        else frozenset({RNG_STATE})
+                    ),
+                )
+            if load_changed_source_layout(
                 checkpoint_id, states=states, adapter=self.sd_adapter
             ):
                 with synchronize_local_errors("Checkpoint EMA cold start"):
@@ -612,13 +622,11 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         state_dict = self._flatten_model_state(states)
 
         if from_hf:
-            if self.sd_adapter is None:
-                raise ValueError(
-                    "trying to load checkpoint in HF safetensors format, "
-                    "but sd_adapter is not provided."
-                )
-
-            hf_state_dict = self.sd_adapter.to_hf(state_dict)
+            hf_state_dict = prepare_hf_model_state(
+                self.sd_adapter,
+                state_dict,
+                error_group=getattr(self.sd_adapter, "error_group", None),
+            )
             with synchronize_local_errors("HF checkpoint reader preparation"):
                 hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
                     checkpoint_id, from_quantized=from_quantized
@@ -645,9 +653,10 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             # enter model/EMA communication. Keep collective-bearing states
             # (optimizer and EMA) on their existing restoration path.
             with synchronize_local_errors("Checkpoint local state preparation"):
+                local_states = materialize_local_checkpoint_states(states)
                 for category in (RNG_STATE, LR_SCHEDULER, DATALOADER, TRAIN_STATE):
                     if category in states:
-                        state_dict[category] = states[category].state_dict()
+                        state_dict[category] = local_states[category]
             planner = (
                 VirtualOptimizerLoadPlanner()
                 if getattr(states.get(OPTIMIZER), "state_residency", "device")
@@ -672,9 +681,8 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             # ``_flatten_model_state``, so DCP writes into those flat
             # entries rather than into the model. Pushing them back is a second
             # step, done explicitly here.
-            with synchronize_local_errors("Checkpoint model validation"):
-                if MODEL in states:
-                    states[MODEL].validate_state_dict(state_dict)
+            # ModelCheckpointState owns coordinated preflight before its
+            # layout collectives; do not duplicate it in the backend.
             if MODEL in states:
                 states[MODEL].load_state_dict(state_dict)
 

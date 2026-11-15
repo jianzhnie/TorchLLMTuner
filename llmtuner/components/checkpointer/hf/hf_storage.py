@@ -35,6 +35,28 @@ from ..core.checkpoint_keys import SAFETENSORS_INDEX
 from ..storage import filesystem
 
 
+def read_hf_weight_map(index_path: str | Path) -> dict[str, str]:
+    """Read and validate tensor-to-shard mappings without opening tensor data."""
+    with Path(index_path).open(encoding="utf-8") as stream:
+        index = json.load(stream)
+    weight_map = index.get("weight_map") if isinstance(index, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError("HF checkpoint index requires a non-empty weight_map")
+    for name, filename in weight_map.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(filename, str)
+            or not filename.endswith(".safetensors")
+            or PurePosixPath(filename).is_absolute()
+            or ".." in PurePosixPath(filename).parts
+        ):
+            raise ValueError(
+                f"Invalid HF checkpoint index entry: {name!r}: {filename!r}"
+            )
+    return weight_map
+
+
 class IndexedHuggingFaceStorageReader(HuggingFaceStorageReader):
     """Read indexed tensors; retain single-file HF loading without an index."""
 
@@ -49,24 +71,8 @@ class IndexedHuggingFaceStorageReader(HuggingFaceStorageReader):
         index_path = Path(self.path) / SAFETENSORS_INDEX
         if not index_path.is_file():
             return super().read_metadata()
-        with index_path.open(encoding="utf-8") as stream:
-            index = json.load(stream)
-        weight_map = index.get("weight_map") if isinstance(index, dict) else None
-        if not isinstance(weight_map, dict) or not weight_map:
-            raise ValueError("HF checkpoint index requires a non-empty weight_map")
         files: dict[str, list[str]] = {}
-        for name, filename in weight_map.items():
-            if (
-                not isinstance(name, str)
-                or not name
-                or not isinstance(filename, str)
-                or not filename.endswith(".safetensors")
-                or PurePosixPath(filename).is_absolute()
-                or ".." in PurePosixPath(filename).parts
-            ):
-                raise ValueError(
-                    f"Invalid HF checkpoint index entry: {name!r}: {filename!r}"
-                )
+        for name, filename in read_hf_weight_map(index_path).items():
             files.setdefault(filename, []).append(name)
         state_metadata = {}
         storage_data = {}

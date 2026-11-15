@@ -30,6 +30,7 @@ from torch.optim import Optimizer
 from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...accelerator.distributed import get_world_size
 from ...config.ema_config import validate_ema_schedule
+from ...parallel.assembly import ModelPartLayout, capture_model_part_layouts
 from ...utils.logging import get_logger
 from ...utils.module_names import canonical_fqn
 from .optimizer import OptimizersContainer
@@ -182,6 +183,9 @@ class EMA(OptimizersContainer):
             all registered buffer aliases) selecting which buffers also
             get an EMA tracked alongside trainable parameters. Empty (default):
             no buffers tracked.
+        runtime_layouts: final parameter ownership from model assembly. When
+            supplied, grouping and checkpoint validation use these bindings;
+            standalone callers may omit them to capture local bindings once.
     """
 
     def __init__(
@@ -196,6 +200,7 @@ class EMA(OptimizersContainer):
         buffer_patterns: Sequence[str] = (),
         sharded_expert_parallel: bool = False,
         sharded_tensor_parallel: bool = False,
+        runtime_layouts: tuple[ModelPartLayout, ...] = (),
     ) -> None:
         self.sharded_tensor_parallel = sharded_tensor_parallel
         self.sharded_expert_parallel = sharded_expert_parallel
@@ -209,6 +214,14 @@ class EMA(OptimizersContainer):
         # The tracked scope is fixed; caller-owned list edits must not detach
         # model parts from the optimizer groups constructed below.
         self.model_parts = list(model_parts)
+        self.runtime_layouts = tuple(runtime_layouts)
+        self._bound_layout_parameters = None
+        if not self.runtime_layouts:
+            self.runtime_layouts = capture_model_part_layouts(self.model_parts)
+        self._validate_runtime_layouts()
+        self._bound_layout_parameters = tuple(
+            dict(layout.parameter_bindings) for layout in self.runtime_layouts
+        )
 
         buffer_groups = (
             [self._selected_buffers(model) for model in self.model_parts]
@@ -227,14 +240,7 @@ class EMA(OptimizersContainer):
                         "falls below one."
                     )
 
-        parameter_groups = [
-            [
-                (name, parameter)
-                for name, parameter in model.named_parameters()
-                if parameter.requires_grad
-            ]
-            for model in self.model_parts
-        ]
+        parameter_groups = self._parameter_groups()
         all_params = [parameter for group in parameter_groups for _, parameter in group]
         self._validate_params(all_params)
         checkpoint_names: set[str] = set()
@@ -359,17 +365,29 @@ class EMA(OptimizersContainer):
                 selected.setdefault(id(buffer), (primary_names[id(buffer)], buffer))
         return list(selected.values())
 
+    def _parameter_groups(self) -> list[list[tuple[str, nn.Parameter]]]:
+        """Use the final ownership captured at construction for every update."""
+        self._validate_runtime_layouts()
+        groups = []
+        for layout in self.runtime_layouts:
+            names = layout.canonical_parameter_names
+            groups.append(
+                [
+                    (names[paths[0]], parameter)
+                    for parameter, paths in layout.parameter_aliases.items()
+                    if parameter.requires_grad
+                ]
+            )
+        return groups
+
     def _tracked_groups(
         self,
     ) -> list[tuple[list[torch.Tensor], list[torch.Tensor]]]:
         """Validate all live tensor identities before an update or cold start."""
         groups: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
-        for ema_opt, model in zip(
-            self._param_optimizers, self.model_parts, strict=True
+        for ema_opt, params in zip(
+            self._param_optimizers, self._parameter_groups(), strict=True
         ):
-            params = [
-                (name, p) for name, p in model.named_parameters() if p.requires_grad
-            ]
             groups.append((ema_opt.tracked_averages(params), [p for _, p in params]))
         for ema_opt, model in zip(
             # Empty when buffer_patterns is unset: shorter than model_parts.

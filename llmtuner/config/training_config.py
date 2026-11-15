@@ -19,9 +19,27 @@ from llmtuner.config.compile_config import CompileConfig
 from llmtuner.config.data_config import DataloaderConfig
 from llmtuner.config.ema_config import EMAConfig
 from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
-from llmtuner.config.utils import require_bool, require_integer_at_least
+from llmtuner.config.utils import (
+    require_bool,
+    require_integer_at_least,
+    require_integer_value,
+)
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.errors import ConfigError
+
+
+def resolve_batch_size_per_rank(global_batch_size: int, dp_world_size: int) -> int:
+    """Divide the global batch without silently dropping a remainder."""
+    require_integer_value(global_batch_size, name="global_batch_size")
+    require_integer_value(dp_world_size, name="dp_world_size")
+    if global_batch_size % dp_world_size != 0:
+        raise ValueError(
+            f"global_batch_size ({global_batch_size}) must be divisible by "
+            f"the number of data-parallel ranks ({dp_world_size}); each rank "
+            f"reads global_batch_size // dp_world_size samples, and the "
+            f"remainder would be dropped silently."
+        )
+    return global_batch_size // dp_world_size
 
 
 def validate_activation_swap_options(

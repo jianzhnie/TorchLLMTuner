@@ -4,7 +4,8 @@ Both dense and pipeline paths follow ``stages.STAGE_ORDER``:
 TP → EP → CP → activation checkpoint → activation swap → compile → FSDP. PP
 splits the model first, transforms each local part, then binds the pipeline schedule.
 
-Dense runs return a module; PP runs return ``PipelineParallelSetup``. Weight
+Both paths return ``ParallelAssembly`` with a module or ``PipelineParallelSetup``
+as execution and explicit local layouts. Weight
 ties are retained and handled by FSDP grouping. EP consumes model-owned MoE
 contracts through ``expert_parallel/model_replacement.py``; single-block conversion
 lives in ``block_conversion.py`` and preserves initialization. TP plans come
@@ -19,6 +20,7 @@ from functools import partial
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh
@@ -41,7 +43,11 @@ from .assembly import ModelPartLayout, ParallelAssembly
 from .compatibility import chunked_loss_fsdp
 from .context_parallel.context_parallel import apply_cp
 from .context_parallel.plan import resolve_cp_plan, validate_pipeline_cp_plan
-from .execution import ExecutionLayout, resolve_execution_layout
+from .execution import (
+    ExecutionLayout,
+    resolve_execution_layout,
+    validate_execution_chain,
+)
 from .expert_parallel.expert_parallel import apply_ep
 from .expert_parallel.mc2_ops import validate_mc2_world_size
 from .expert_parallel.plan import resolve_ep_plan, validate_pipeline_ep_plan
@@ -97,6 +103,7 @@ def parallelize_model(
     chunked_loss_num_chunks: int = 1,
     loss_sum: LossSum | None = None,
     pipeline_schedule_factory: Callable[..., Any] | None = None,
+    on_model_acquired: Callable[[nn.Module], None] | None = None,
 ) -> ParallelAssembly:
     """Transform an explicit model using parallel config and training options.
 
@@ -112,6 +119,10 @@ def parallelize_model(
     It must include all ranks participating in subsequent transforms. Without
     an explicit group, existing callers retain default-group coordination;
     CP preflight uses the topology world when available.
+
+    ``on_model_acquired`` retains cleanup ownership of each local PP part and
+    transformed wrapper before subsequent stages can fail. It must perform
+    only local reference bookkeeping, without device work or collectives.
     """
 
     with (
@@ -119,6 +130,8 @@ def parallelize_model(
         if error_group is not None
         else nullcontext()
     ):
+        if on_model_acquired is not None:
+            on_model_acquired(model)
         validate_activation_swap_options(
             activation_swap=activation_swap,
             compile=compile,
@@ -185,7 +198,12 @@ def parallelize_model(
             else None
         )
         layout = ModelPartLayout(
-            pipeline_ownership=pipeline_ownership, execution=execution_layout
+            pipeline_ownership=(
+                None
+                if pipeline_ownership is None
+                else pipeline_ownership.parameter_ownership()
+            ),
+            execution=execution_layout,
         )
 
         def record_replacements(modules, parameters):
@@ -250,6 +268,8 @@ def parallelize_model(
                 part = runners[name](part, cfg=references.bind(part))
             else:
                 part = runners[name](part)
+            if on_model_acquired is not None:
+                on_model_acquired(part)
         layout.refresh(part)
         layouts.append(layout)
         return part
@@ -361,6 +381,9 @@ def parallelize_model(
             device=device if device is not None else next(model.parameters()).device,
             global_batch_size=global_batch_size,
         )
+        if on_model_acquired is not None:
+            for part in model_parts:
+                on_model_acquired(part)
         dense_mesh = parallel_dims.spmd_dense_mesh()
         # Stage construction deep-copies the model. Resolve fresh local bindings;
         # references from the global preflight deliberately cannot cross this boundary.
@@ -447,6 +470,36 @@ def parallelize_model(
                 )
                 for part, tp_plan in zip(model_parts, resolved_tp_plans, strict=True)
             ]
+        # Interleaved schedules own nonadjacent global stages on each rank.
+        # Gather declarations on the PP axis and validate the actual chain
+        # before any parameter transforms or schedule resources are created.
+        pp_mesh = parallel_dims.get_mesh("pp")
+        with synchronize_local_errors(
+            "Pipeline boundary metadata preparation", group=error_group
+        ):
+            local_boundaries = [
+                (stage.stage_index, layout)
+                for stage, layout in zip(stages, execution_layouts, strict=True)
+            ]
+        gathered_boundaries = [None] * pp_mesh.size()
+        dist.all_gather_object(
+            gathered_boundaries, local_boundaries, group=pp_mesh.get_group()
+        )
+        with synchronize_local_errors(
+            "Pipeline execution chain validation", group=error_group
+        ):
+            boundaries = sorted(
+                (
+                    entry
+                    for rank_entries in gathered_boundaries
+                    for entry in rank_entries
+                ),
+                key=lambda entry: entry[0],
+            )
+            indices = [index for index, _ in boundaries]
+            if indices != list(range(len(boundaries))):
+                raise ValueError("Pipeline stage indices must be unique and contiguous")
+            validate_execution_chain(tuple(layout for _, layout in boundaries))
         for i, part in enumerate(model_parts):
             model_parts[i] = apply_stages(
                 part,

@@ -85,7 +85,7 @@ def swap_moe_blocks(
     """Replace every HF MoE block in ``model`` with llmtuner's MoE, in place.
 
     Args:
-        model: an explicit model (anything exposing ``.layers``).
+        model: an explicit model declaring ``DecoderStructure`` and MoE slots.
         ep_group: the EP process group. ``None`` (or a size-1 group is not
             special-cased -- pass ``None``) keeps all experts local and routes
             them with the reordering-only dispatcher; a multi-rank group

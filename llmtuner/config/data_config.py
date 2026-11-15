@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from llmtuner.config.utils import require_integer_at_least
+from llmtuner.config.utils import require_bool, require_integer_at_least
 from llmtuner.errors import ConfigError
 
 
@@ -182,8 +182,7 @@ class DataloaderConfig:
                 raise ConfigError(
                     "chat_template_kwargs cannot override rendering controls"
                 )
-        if not isinstance(self.global_context_rows, bool):
-            raise ConfigError("dataloader.global_context_rows must be bool")
+        require_bool(self, "global_context_rows", group="dataloader")
         if self.data_identity is not None and (
             not isinstance(self.data_identity, str) or not self.data_identity.strip()
         ):
@@ -198,8 +197,7 @@ class DataloaderConfig:
             raise ConfigError(
                 "dataloader.tokenizer_backend must be huggingface or kimi_k3"
             )
-        if not isinstance(self.shuffle, bool):
-            raise ConfigError(f"dataloader.shuffle must be bool, got {self.shuffle!r}")
+        require_bool(self, "shuffle", group="dataloader")
         if self.packing not in ("concat_then_split", "first_fit"):
             raise ConfigError(
                 "dataloader.packing must be 'concat_then_split' or 'first_fit', "

@@ -77,6 +77,11 @@ from ...common.attention.masks import (
     build_dense_attention_mask,
 )
 from ...common.cast_linear import build_lm_head
+from ...common.gradient_norm import (
+    ReferenceNormGroup,
+    packed_expert_reference_norm_group,
+    qkv_reference_norm_group,
+)
 from ...common.input_preparation import prepare_text_inputs
 from ...common.moe.layer import collect_moe_layers
 from ...common.validation import temporary_attention_mask
@@ -118,6 +123,15 @@ def validate_qkv_projection(config: Qwen3MoeConfig) -> None:
 @use_kernelized_func(apply_rotary_pos_emb)
 class Qwen3MoeAttention(HFQwen3MoeAttention):
     """Own attention execution and explicit QKV, norm and rotary policies."""
+
+    def reference_norm_groups(self) -> tuple[ReferenceNormGroup, ...]:
+        return (
+            qkv_reference_norm_group(
+                (self.q_proj, self.k_proj, self.v_proj),
+                kv_heads=self.config.num_key_value_heads,
+                head_dim=self.head_dim,
+            ),
+        )
 
     def __init__(self, config: Qwen3MoeConfig, layer_idx: int) -> None:
         projection = getattr(config, "qkv_projection", "separate")
@@ -289,6 +303,9 @@ class Qwen3MoeExperts(HFQwen3MoeExperts):
     down projection; accumulation follows expert order in activation dtype.
     Reference inheritance preserves initialization classification only.
     """
+
+    def reference_norm_groups(self) -> tuple[ReferenceNormGroup, ...]:
+        return (packed_expert_reference_norm_group(self.gate_up_proj, self.down_proj),)
 
     def __init__(self, config: Qwen3MoeConfig) -> None:
         nn.Module.__init__(self)
@@ -658,7 +675,10 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
     def configure_pipeline_stage(self, *, first: bool, last: bool) -> None:
         """Select model-owned stage tensor I/O after generic module pruning."""
         self.pipeline_stage_io = PipelineStageIO(
-            first=first, last=last, hidden_size=self.config.hidden_size
+            first=first,
+            last=last,
+            hidden_size=self.config.hidden_size,
+            activation_dtype=next(self.parameters()).dtype,
         )
 
     def forward_pipeline_stage(
@@ -672,9 +692,9 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
     ) -> Tensor:
         """Run tokens on the first stage and hidden states on later stages."""
         first, last = self.pipeline_stage_io.first, self.pipeline_stage_io.last
+        self.pipeline_stage_io.validate_input(inputs)
+        token_shape = tuple(inputs.shape if first else inputs.shape[:-1])
         flat = inputs.ndim == (1 if first else 2)
-        if not first and not inputs.is_floating_point():
-            raise TypeError("Non-first Qwen3 PP stages require hidden states")
         if flat:
             inputs = inputs.unsqueeze(0)
         if positions is not None and positions.ndim == 1:
@@ -695,7 +715,17 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
         if last and not skip_lm_head:
             output = self.lm_head(output)
         # Stage sends must own storage, including an Identity-only stage.
-        return (output.squeeze(0) if flat else output).clone()
+        output = (output.squeeze(0) if flat else output).clone()
+        self.pipeline_stage_io.validate_output(
+            output,
+            token_shape=token_shape,
+            output_width=(
+                self.lm_head.weight.shape[0]
+                if last and not skip_lm_head
+                else self.pipeline_stage_io.hidden_size
+            ),
+        )
+        return output
 
     @property
     def layers(self) -> nn.ModuleList:

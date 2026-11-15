@@ -19,8 +19,15 @@ from torch.distributed import ProcessGroup
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.spmd import spmd_context
 from ...components.loss import chunked_lm_head_cross_entropy, cross_entropy_loss
-from ...components.loss_contract import ChunkedLossBackward, LossSum
+from ...components.loss_contract import (
+    ChunkedLossBackward,
+    LossSum,
+    validate_loss_sum,
+    validate_normalization_tokens,
+)
 from ...datasets.contracts import Batch, TrainerBatch
+from ...models.contracts import DecoderStructure
+from ...models.execution import ModelExecutionCapabilities, validate_training_output
 from ...parallel.execution import ExecutionLayout
 from ...parallel.topology import ParallelTopology
 from . import pipeline
@@ -28,19 +35,6 @@ from .batch import prepare_model_inputs
 from .results import StepResult, UpdateResult
 
 ParamContext = Callable[[], AbstractContextManager[Any]]
-
-
-def model_output_value(output: Any, *, field: str = "logits") -> torch.Tensor:
-    """Extract the declared tensor from an explicit model output."""
-    if isinstance(output, torch.Tensor):
-        return output
-    value = getattr(output, field, None)
-    if isinstance(value, torch.Tensor):
-        return value
-    raise TypeError(
-        f"Model output must be a Tensor or expose tensor .{field}; got "
-        f"{type(output).__name__}"
-    )
 
 
 def loss_vocab_kwargs(
@@ -93,6 +87,12 @@ class TrainingEngine:
     _dense_backward: Callable[..., torch.Tensor] = field(
         init=False, repr=False, compare=False
     )
+    _output_capabilities: ModelExecutionCapabilities = field(
+        init=False, repr=False, compare=False
+    )
+    _chunked_projection: torch.nn.Module | None = field(
+        init=False, default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.chunked_loss_num_chunks > 1 and self.chunked_loss_backward is None:
@@ -102,6 +102,17 @@ class TrainingEngine:
         pipeline_enabled = (
             self.parallel_dims is not None and self.parallel_dims.pp_enabled
         )
+        if self.chunked_loss_num_chunks > 1:
+            if pipeline_enabled:
+                raise ValueError(
+                    "Chunked loss cannot execute with pipeline parallelism"
+                )
+            structure = getattr(self.model, "decoder_structure", None)
+            if not isinstance(structure, DecoderStructure):
+                raise TypeError("Chunked loss requires a model-owned DecoderStructure")
+            self._chunked_projection = self.model.get_submodule(structure.head)
+            if isinstance(self._chunked_projection, torch.nn.Identity):
+                raise ValueError("Chunked loss requires an owned output projection")
         if self.execution_layouts:
             if len(self.execution_layouts) != len(self.model_parts):
                 raise ValueError("Execution layouts must match local model parts")
@@ -142,6 +153,32 @@ class TrainingEngine:
                     raise ValueError("Pipeline token owner disagrees with stage I/O")
                 if len({stage.hidden_size for stage in stage_inputs}) != 1:
                     raise ValueError("Local pipeline parts disagree on hidden width")
+                if len({stage.activation_dtype for stage in stage_inputs}) != 1:
+                    raise ValueError(
+                        "Local pipeline parts disagree on activation dtype"
+                    )
+        capabilities = (
+            tuple(layout.capabilities for layout in self.execution_layouts)
+            if self.execution_layouts
+            else tuple(
+                getattr(part, "execution_capabilities", None)
+                for part in self.model_parts
+            )
+        )
+        if not capabilities or any(
+            not isinstance(value, ModelExecutionCapabilities) for value in capabilities
+        ):
+            raise TypeError(
+                "Every model part must declare valid execution capabilities"
+            )
+        self._output_capabilities = capabilities[0]
+        if not pipeline_enabled and not self._output_capabilities.logits:
+            raise ValueError("Dense execution requires model-declared logits output")
+        if (
+            self.chunked_loss_num_chunks > 1
+            and not self._output_capabilities.hidden_states
+        ):
+            raise ValueError("Chunked loss requires model-declared hidden output")
         self._run_forward_backward = (
             partial(pipeline.run_pipeline_step, self)
             if pipeline_enabled
@@ -202,11 +239,14 @@ class TrainingEngine:
         loss_sum = self._run_forward_backward(
             batch, global_valid_tokens=global_valid_tokens
         )
-        return StepResult(
-            loss_sum=loss_sum.detach(),
-            valid_tokens=valid_tokens,
-            normalization_tokens=global_valid_tokens.detach(),
-        )
+        with synchronize_local_errors(
+            "Training step result validation", group=self.error_group
+        ):
+            return StepResult(
+                loss_sum=loss_sum.detach(),
+                valid_tokens=valid_tokens,
+                normalization_tokens=global_valid_tokens.detach(),
+            )
 
     def evaluate(self, batch: Batch | TrainerBatch) -> torch.Tensor | None:
         """Return raw validation loss; non-final PP stages return None.
@@ -218,8 +258,13 @@ class TrainingEngine:
     def _evaluate_dense(self, batch: Batch | TrainerBatch) -> torch.Tensor:
         inputs, labels, extra_kwargs = self.preprocess(batch)
         with self.param_context(), spmd_context(self.parallel_dims):
-            logits = model_output_value(self.model(inputs, **extra_kwargs))
-            return self.loss_sum(logits, labels, **self.loss_reduction_kwargs())
+            logits = self._training_output(self.model(inputs, **extra_kwargs), labels)
+            loss = self.loss_sum(logits, labels, **self.loss_reduction_kwargs())
+            with synchronize_local_errors(
+                "Validation loss result validation", group=self.error_group
+            ):
+                validate_loss_sum(loss, device=labels.device)
+            return loss
 
     def _forward_backward_batch(
         self, batch: Batch | TrainerBatch, *, global_valid_tokens: torch.Tensor
@@ -241,6 +286,10 @@ class TrainingEngine:
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Run one non-PP accumulation group without selecting execution policy."""
+        with synchronize_local_errors(
+            "Training loss normalization validation", group=self.error_group
+        ):
+            validate_normalization_tokens(global_valid_tokens, device=labels.device)
         with self.param_context(), spmd_context(self.parallel_dims):
             return self._dense_backward(
                 inputs,
@@ -248,6 +297,33 @@ class TrainingEngine:
                 extra_kwargs=extra_kwargs,
                 global_valid_tokens=global_valid_tokens,
             )
+
+    def _training_output(
+        self,
+        output: Any,
+        labels: torch.Tensor,
+        *,
+        hidden_states: bool = False,
+    ) -> torch.Tensor:
+        """Coordinate local output checks after forward, before loss/backward.
+
+        Forward may communicate and must finish outside this local boundary.
+        Width is checked only when the assembly declares a replicated vocabulary;
+        hidden projections and vocabulary shards retain their own contracts.
+        """
+        with synchronize_local_errors(
+            "Model training output validation", group=self.error_group
+        ):
+            tensor = self._output_capabilities.output_tensor(
+                output, hidden_states=hidden_states
+            )
+            width = None
+            if not hidden_states and self.execution_layouts:
+                layout = self.execution_layouts[0]
+                if not layout.vocabulary_sharded:
+                    width = layout.vocabulary_size
+            validate_training_output(tensor, labels, output_width=width)
+        return tensor
 
     def _backward_chunked(
         self,
@@ -258,24 +334,29 @@ class TrainingEngine:
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         model = self.model
-        hidden_states = model_output_value(
+        projection = self._chunked_projection
+        if projection is None:
+            raise RuntimeError("Chunked output projection is not bound")
+        hidden_states = self._training_output(
             model(inputs, **extra_kwargs, skip_lm_head=True),
-            field=(
-                self.execution_layouts[0].training_output_field
-                if self.execution_layouts
-                else "last_hidden_state"
-            ),
+            labels,
+            hidden_states=True,
         )
         if self.chunked_loss_backward is None:
             raise RuntimeError("Chunked loss backward is not bound")
-        return self.chunked_loss_backward(
-            model.lm_head,
+        loss = self.chunked_loss_backward(
+            projection,
             hidden_states,
             labels,
             num_chunks=self.chunked_loss_num_chunks,
             grad_scale=1.0 / global_valid_tokens,
             **self.loss_reduction_kwargs(),
         )
+        with synchronize_local_errors(
+            "Chunked loss result validation", group=self.error_group
+        ):
+            validate_loss_sum(loss, device=labels.device, requires_grad=False)
+        return loss
 
     def _backward_logits(
         self,
@@ -286,9 +367,13 @@ class TrainingEngine:
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         model = self.model
-        logits = model_output_value(model(inputs, **extra_kwargs))
+        logits = self._training_output(model(inputs, **extra_kwargs), labels)
         loss_sum = self.loss_sum(logits, labels, **self.loss_reduction_kwargs())
         del logits
+        with synchronize_local_errors(
+            "Training loss result validation", group=self.error_group
+        ):
+            validate_loss_sum(loss_sum, device=labels.device, requires_grad=True)
         (loss_sum / global_valid_tokens).backward()
         return loss_sum.detach()
 

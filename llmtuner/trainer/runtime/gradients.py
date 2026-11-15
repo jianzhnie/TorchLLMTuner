@@ -217,6 +217,7 @@ def clip_and_check_finite(
             if tp_mesh is not None
             else None
         ),
+        reference_error_group=error_group,
         **norm_options,
     )
 

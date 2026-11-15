@@ -128,6 +128,8 @@ class GrainDataLoader(BaseDataLoader):
             dataset, prefetch_buffer_size=num_prefetch_batches
         )
         self._dataset = dataset
+        self._pending_probes: list[Any] = []
+        self._iterator_closed = False
         self._iterator = iter(dataset)
 
     def __iter__(self) -> Iterator[TrainerBatch]:
@@ -173,11 +175,12 @@ class GrainDataLoader(BaseDataLoader):
             )
         with preserve_rng_state(torch.device("cpu")):
             probe = iter(self._dataset)
+            self._pending_probes.append(probe)
             try:
                 probe.set_state(deepcopy(state_dict[self._rank_id]))
             except BaseException:
                 try:
-                    probe.close()
+                    self._close_probe(probe)
                 except BaseException:
                     try:
                         get_logger(__name__).exception(
@@ -188,7 +191,13 @@ class GrainDataLoader(BaseDataLoader):
                         pass  # Preserve the original cursor validation error.
                 raise
             else:
-                probe.close()
+                self._close_probe(probe)
+
+    def _close_probe(self, probe: Any) -> None:
+        probe.close()
+        self._pending_probes = [
+            pending for pending in self._pending_probes if pending is not probe
+        ]
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.validate_state_dict(state_dict)
@@ -209,4 +218,21 @@ class GrainDataLoader(BaseDataLoader):
             raise
 
     def close(self) -> None:
-        self._iterator.close()
+        """Close every owned cursor, retaining failed releases for retry."""
+        first_error: BaseException | None = None
+        for probe in reversed(tuple(self._pending_probes)):
+            try:
+                with preserve_rng_state(torch.device("cpu")):
+                    self._close_probe(probe)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if not self._iterator_closed:
+            try:
+                self._iterator.close()
+                self._iterator_closed = True
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error

@@ -29,6 +29,7 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import (
     Qwen3_5VisionConfig,
 )
 
+from ...execution import ModelExecutionCapabilities
 from ..ops import (
     causal_conv1d,
     causal_conv1d_update,
@@ -473,6 +474,10 @@ class Qwen3_5Model(hf.Qwen3_5Model):
 
 
 class Qwen3_5ForConditionalGeneration(hf.Qwen3_5ForConditionalGeneration):
+    execution_capabilities = ModelExecutionCapabilities(
+        logits=True, hidden_states=False
+    )
+
     def __init__(self, config: Qwen3_5Config) -> None:
         hf.Qwen3_5PreTrainedModel.__init__(self, config)
         self.model = Qwen3_5Model(config)

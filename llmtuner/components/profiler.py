@@ -280,6 +280,10 @@ class Profiler:
             raise first_error
         return False
 
+    def close(self) -> None:
+        """Retry remaining shutdown work after context exit or entry failure."""
+        self.__exit__(None, None, None)
+
     def step(self) -> None:
         """Advance every active profiler by one training iteration."""
         if self.torch_profiler is not None:

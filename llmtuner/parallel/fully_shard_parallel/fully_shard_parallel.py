@@ -26,6 +26,7 @@ from ...accelerator.capabilities import has as capability
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_backend, is_distributed
 from ...errors import UnsupportedCombinationError
+from ...models.contracts import DecoderStructure
 from ...utils.logging import get_logger
 from ..compatibility import chunked_loss_fsdp
 from ..topology import ParallelTopology
@@ -264,6 +265,10 @@ def apply_fsdp_to_decoder(
         else nullcontext()
     ):
         strategy = get_fsdp_strategy(fsdp_implementation)
+        structure = getattr(model, "decoder_structure", None)
+        if not isinstance(structure, DecoderStructure):
+            raise TypeError("Decoder FSDP requires a model-owned DecoderStructure")
+        decoder = structure.bind(model)
         if root_owned_boundaries and (
             fsdp_implementation != "native"
             or cpu_offload
@@ -351,25 +356,33 @@ def apply_fsdp_to_decoder(
         units: list[tuple[list[nn.Module], bool]] = []
         boundary = [
             module
-            for module in (model.tok_embeddings, model.norm, model.lm_head)
+            for module in (decoder.embedding, decoder.norm, decoder.head)
             if module is not None and type(module) is not nn.Identity
         ]
         final_reshard = reshard_after_forward_policy == "always"
-        if model.enable_weight_tying:
+        embedding_parameters = (
+            set(decoder.embedding.parameters())
+            if decoder.embedding is not None
+            else set()
+        )
+        head_parameters = (
+            set(decoder.head.parameters()) if decoder.head is not None else set()
+        )
+        if embedding_parameters.intersection(head_parameters):
             if boundary:
                 units.append((boundary, final_reshard))
         else:
-            if model.tok_embeddings in boundary:
-                units.append(([model.tok_embeddings], reshard_after_forward))
+            if decoder.embedding in boundary:
+                units.append(([decoder.embedding], reshard_after_forward))
             final_modules = [
-                module for module in (model.norm, model.lm_head) if module in boundary
+                module for module in (decoder.norm, decoder.head) if module in boundary
             ]
             if final_modules:
                 units.append((final_modules, final_reshard))
         boundary_count = len(units)
         units.extend(
             ([block], reshard_after_forward)
-            for _, block in iter_transformer_layers(model.layers)
+            for _, block in iter_transformer_layers(decoder.blocks)
         )
         # Build one placement map before parameter replacement. A shared unit may
         # span dense and MoE layers, but every expert retains its own mesh/layout.
@@ -399,7 +412,7 @@ def apply_fsdp_to_decoder(
         # recursively inspecting the root would incorrectly merge all units.
         nested_roots = {
             *boundary,
-            *[block for _, block in iter_transformer_layers(model.layers)],
+            *[block for _, block in iter_transformer_layers(decoder.blocks)],
         }
         nested_paths = []
         root_modules = []
@@ -546,7 +559,7 @@ def apply_fsdp_to_decoder(
     for index in range(boundary_count):
         shard_unit(index)
 
-    for _, transformer_block in iter_transformer_layers(model.layers):
+    for _, transformer_block in iter_transformer_layers(decoder.blocks):
         shard_unit(module_units[transformer_block])
 
     shard_unit(root_index)
@@ -576,10 +589,10 @@ def apply_fsdp_to_decoder(
             dict.fromkeys(
                 module
                 for module in (
-                    model.tok_embeddings,
-                    *[block for _, block in iter_transformer_layers(model.layers)],
-                    model.norm,
-                    model.lm_head,
+                    decoder.embedding,
+                    *[block for _, block in iter_transformer_layers(decoder.blocks)],
+                    decoder.norm,
+                    decoder.head,
                 )
                 if isinstance(module, FSDPModule)
             )

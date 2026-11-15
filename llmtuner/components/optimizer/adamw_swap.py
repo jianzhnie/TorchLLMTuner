@@ -331,6 +331,14 @@ class AdamWSwap(torch.optim.AdamW):
                 self.copy_wait_seconds += time.perf_counter() - started
         return loss
 
+    def close(self) -> None:
+        """Release the optional asynchronous staging stream."""
+        stream = self._copy_stream
+        if stream is None:
+            return
+        stream.synchronize()
+        self._copy_stream = None
+
     def _slice_jobs(self, active: list[torch.Tensor]) -> Iterator[SwapSlice]:
         devices = {self._device(p) for p in active}
         if len(devices) > 1:

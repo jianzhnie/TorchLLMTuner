@@ -69,6 +69,7 @@ from ....kernel.ops.attention import fusion_attention
 from ....kernel.ops.rotary import rotary_mul
 from ....kernel.ops.varlen_attention import varlen_attention
 from ....kernel.validation import SequenceOffsets
+from ...execution import ModelExecutionCapabilities
 from .configuration import KimiK3Config
 from .model import KimiLinearForCausalLM
 
@@ -994,6 +995,10 @@ class ProjectorConfig:
 # # ref https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece1
 # 4d265ead2/src/transformers/models/llava/modeling_llava.py#L240
 class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+    execution_capabilities = ModelExecutionCapabilities(
+        logits=True, hidden_states=False
+    )
+
     @classmethod
     def _supports_default_dynamic_cache(cls) -> bool:
         return False

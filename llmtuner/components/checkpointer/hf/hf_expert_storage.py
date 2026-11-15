@@ -14,14 +14,7 @@ from torch.distributed.checkpoint.metadata import (
     TensorStorageMetadata,
 )
 
-from ....models.qwen.qwen3.state import (
-    HF_PROJECTIONS,
-    grouped_expert_key,
-    native_ep_expert_key,
-)
-from ....models.qwen.qwen3.state import (
-    NATIVE_PROJECTIONS as NATIVE_PROJECTIONS,
-)
+from ....models.state import ExpertStorageLayout, ExpertTensorSlice
 from .hf_storage import IndexedHuggingFaceStorageReader
 
 
@@ -37,37 +30,40 @@ class GroupedExpertHuggingFaceStorageReader(IndexedHuggingFaceStorageReader):
         self,
         path: str,
         *,
-        num_experts: int,
+        layout: ExpertStorageLayout,
         thread_count: int = 2,
-        native_ep_layout: bool = False,
     ) -> None:
         super().__init__(path, thread_count=thread_count)
-        if num_experts < 1:
-            raise ValueError("num_experts must be positive")
-        self.num_experts = num_experts
-        self.native_ep_layout = native_ep_layout
+        if not isinstance(layout, ExpertStorageLayout):
+            raise TypeError("HF expert reader requires an ExpertStorageLayout")
+        self.layout = layout
 
     def read_metadata(self) -> Metadata:
         metadata = super().read_metadata()
-        if self.native_ep_layout:
-            unsupported = [
-                key
-                for key in metadata.state_dict_metadata
-                if key.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))
-            ]
-            if unsupported:
-                raise ValueError(
-                    "Native EP HF reader requires individual expert projections; "
-                    f"fused expert tensors are unsupported: {unsupported[:4]}"
-                )
-        groups: dict[str, dict[tuple[int, str], tuple[str, Any]]] = {}
+        for key in metadata.state_dict_metadata:
+            self.layout.validate_source_key(key)
+        groups: dict[str, dict[tuple[int, int], tuple[str, Any]]] = {}
+        projection_counts: dict[str, int] = {}
         for key, value in list(metadata.state_dict_metadata.items()):
-            mapped = grouped_expert_key(key)
+            mapped = self.layout.map_source_key(key)
             if mapped is None:
                 continue
-            target, expert, projection = mapped
-            if self.native_ep_layout:
-                target = native_ep_expert_key(key)
+            if not isinstance(mapped, ExpertTensorSlice):
+                raise TypeError(
+                    "Expert key rules must return ExpertTensorSlice or None"
+                )
+            target, expert, projection = (
+                mapped.target,
+                mapped.expert_index,
+                mapped.projection_index,
+            )
+            if expert >= self.layout.num_experts:
+                raise ValueError(f"HF expert index exceeds declared count: {key}")
+            if (
+                projection_counts.setdefault(target, mapped.projection_count)
+                != mapped.projection_count
+            ):
+                raise ValueError(f"Conflicting projection slot counts for {target}")
             sources = groups.setdefault(target, {})
             if (expert, projection) in sources:
                 raise ValueError(f"Duplicate individual HF expert index: {key}")
@@ -75,17 +71,11 @@ class GroupedExpertHuggingFaceStorageReader(IndexedHuggingFaceStorageReader):
         for target, sources in groups.items():
             if target in metadata.state_dict_metadata:
                 raise ValueError(f"Mixed fused and individual HF experts: {target}")
-            if self.native_ep_layout:
-                projection = HF_PROJECTIONS[target.rsplit(".", 1)[1]]
-                projections = (projection,)
-            elif target.endswith(".down_proj"):
-                projections = ("down_proj",)
-            else:
-                projections = ("gate_proj", "up_proj")
+            projection_count = projection_counts[target]
             expected = {
                 (expert, projection)
-                for expert in range(self.num_experts)
-                for projection in projections
+                for expert in range(self.layout.num_experts)
+                for projection in range(projection_count)
             }
             if set(sources) != expected:
                 raise ValueError(f"Incomplete individual HF experts for {target}")
@@ -104,15 +94,7 @@ class GroupedExpertHuggingFaceStorageReader(IndexedHuggingFaceStorageReader):
                     raise ValueError(f"Invalid individual HF expert tensor: {key}")
                 old_index = MetadataIndex(key, offset=value.chunks[0].offsets)
                 storage = metadata.storage_data.pop(old_index)
-                offset = torch.Size(
-                    (
-                        expert,
-                        shape[0]
-                        if projection == "up_proj" and not self.native_ep_layout
-                        else 0,
-                        0,
-                    )
-                )
+                offset = torch.Size((expert, projection * shape[0], 0))
                 chunk_shape = torch.Size((1, *shape))
                 chunks.append(ChunkStorageMetadata(offsets=offset, sizes=chunk_shape))
                 metadata.storage_data[MetadataIndex(target, offset=offset)] = (
@@ -127,7 +109,7 @@ class GroupedExpertHuggingFaceStorageReader(IndexedHuggingFaceStorageReader):
             metadata.state_dict_metadata[target] = TensorStorageMetadata(
                 properties=first.properties,
                 size=torch.Size(
-                    (self.num_experts, shape[0] * len(projections), shape[1])
+                    (self.layout.num_experts, shape[0] * projection_count, shape[1])
                 ),
                 chunks=chunks,
             )

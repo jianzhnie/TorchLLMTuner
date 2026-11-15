@@ -12,8 +12,8 @@ or expert sharding is active; callers must not skip it based only on DP degree.
 
 Pipeline parallelism lives in ``pipeline_parallel/``: ``partition.py`` computes
 the stage split and ``pipeline_parallel.py`` builds this rank's schedule.
-``parallelize_model`` dispatches to it when ``pp > 1`` and returns a
-``PipelineParallelSetup`` instead of a model.
+``parallelize_model`` dispatches to it when ``pp > 1``. It always returns a
+``ParallelAssembly`` carrying execution objects and final local layouts.
 """
 
 from __future__ import annotations

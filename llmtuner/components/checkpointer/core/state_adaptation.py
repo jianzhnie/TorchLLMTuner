@@ -3,12 +3,126 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
+import torch.distributed as dist
+from torch.distributed.checkpoint.stateful import Stateful
+
 from ....accelerator.collectives import synchronize_local_errors
+from .checkpoint_keys import DATALOADER, LR_SCHEDULER, RNG_STATE, TRAIN_STATE
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
+
+
+def materialize_local_checkpoint_states(states: dict[str, Any]) -> dict[str, Any]:
+    """Snapshot built-in collective-free states before communicating callbacks.
+
+    The caller coordinates failures around this local operation. Model,
+    optimizer, EMA and custom states remain untouched for backend conversion.
+    Independent snapshots also keep load readers away from live metadata.
+    """
+    result = dict(states)
+    for category in (LR_SCHEDULER, DATALOADER, TRAIN_STATE, RNG_STATE):
+        state = result.get(category)
+        if isinstance(state, Stateful):
+            result[category] = deepcopy(state.state_dict())
+    return result
+
+
+def select_local_preflight_states(states: dict[str, Any]) -> dict[str, Any]:
+    """Select ordered collective-free validators without creating read buffers."""
+    return {
+        category: states[category]
+        for category in (RNG_STATE, DATALOADER, TRAIN_STATE, LR_SCHEDULER)
+        if category in states
+        and callable(getattr(states[category], "validate_state_dict", None))
+    }
+
+
+def prepare_local_state_preflight(
+    states: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Select local compatibility validators and isolated read destinations.
+
+    Only progress, data, RNG and scheduler metadata participate. Their state
+    methods must be collective-free; model weights and optimizer moments stay
+    with backend layout adapters. Copy even custom state dictionaries so a
+    reader cannot mutate live metadata/tensors before validation succeeds.
+    The caller owns cross-rank error coordination around this local operation.
+    """
+    selected = select_local_preflight_states(states)
+    destination = {
+        category: deepcopy(state.state_dict()) for category, state in selected.items()
+    }
+    return selected, destination
+
+
+def validate_local_state_preflight(
+    states: dict[str, Any],
+    destination: dict[str, Any],
+    *,
+    missing_categories: frozenset[str] = frozenset(),
+    error_group: ProcessGroup | None = None,
+) -> None:
+    """Validate isolated metadata before loading live training state.
+
+    Readers explicitly identify optional records absent from the checkpoint;
+    their initialized destination values must not stand in for saved metadata.
+    Every rank must pass the same ordered state categories. Each local validator
+    is coordinated separately before the next one runs.
+    """
+    for category, state in states.items():
+        phase = "RNG" if category == RNG_STATE else category
+        with synchronize_local_errors(
+            f"Checkpoint {phase} preflight validation", group=error_group
+        ):
+            if category not in missing_categories:
+                state.validate_state_dict(destination[category])
+
+
+def validate_local_preflight_selection(
+    states: dict[str, Any], *, error_group: ProcessGroup | None = None
+) -> None:
+    """Agree on ordered validators before branching into subset readers.
+
+    The selected state categories must agree even when every rank registered
+    the same state names: injected services can expose different validation
+    capabilities. Metadata values themselves may legitimately differ by rank.
+    """
+    if not dist.is_initialized() or dist.get_world_size(error_group) <= 1:
+        return
+    selection = tuple(states)
+    selections = [None] * dist.get_world_size(error_group)
+    dist.all_gather_object(selections, selection, group=error_group)
+    if any(candidate != selection for candidate in selections):
+        raise RuntimeError(
+            "Checkpoint ranks selected inconsistent local preflight validators; "
+            "use matching validation capabilities and state order on every rank"
+        )
+
+
+def prepare_hf_model_state(
+    adapter: Any,
+    native_state: dict[str, Any],
+    *,
+    error_group: ProcessGroup | None = None,
+) -> dict[str, Any]:
+    """Prepare reader destinations before any peer enters the HF reader.
+
+    Built-in adapters coordinate key mapping and coverage internally. Injected
+    collective-free adapters get a local error boundary here; adapters doing
+    collectives must declare and own their preparation coordination.
+    """
+    with (
+        nullcontext()
+        if getattr(adapter, "coordinates_hf_preparation", False)
+        else synchronize_local_errors(
+            "HF checkpoint destination preparation", group=error_group
+        )
+    ):
+        return adapter.to_hf(native_state)
 
 
 def adapt_hf_model_state(

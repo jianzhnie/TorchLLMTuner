@@ -21,6 +21,7 @@ from torch.distributed.tensor._utils import _compute_local_shape_and_global_offs
 from torch.distributed.tensor.placement_types import _StridedShard
 from torch.optim import Optimizer
 
+from ....utils.logging import get_logger
 from ._optimizer_reshard_runtime import _BucketedRedistributionRuntime
 from ._optimizer_reshard_schedule import (
     _bind_bucket_configs,
@@ -246,11 +247,23 @@ class DistMuon(Optimizer):
         super().__init__(_normalize_param_groups(params), defaults)
         self.validate_param_groups(self.param_groups)
         self._param_groups_frozen = True
-        _initialize_dist_muon(
-            self,
-            compute_sharding_by_fqn=compute_sharding_by_fqn,
-            bucket_configs=bucket_configs,
-        )
+        try:
+            _initialize_dist_muon(
+                self,
+                compute_sharding_by_fqn=compute_sharding_by_fqn,
+                bucket_configs=bucket_configs,
+            )
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                try:
+                    get_logger(__name__).exception(
+                        "DistMuon cleanup failed during construction"
+                    )
+                except BaseException:
+                    pass
+            raise
 
     @staticmethod
     def _resolve_ns_device(ns_device: str | None) -> torch.device | None:
@@ -289,6 +302,12 @@ class DistMuon(Optimizer):
         )
         self._redistribution_runtime.release_buffers()
         return loss
+
+    def close(self) -> None:
+        """Drain and release owned redistribution buffers and streams."""
+        runtime = getattr(self, "_redistribution_runtime", None)
+        if runtime is not None:
+            runtime.close()
 
     def initialize_state(self) -> None:
         """Create checkpoint destinations locally, without executing an update."""

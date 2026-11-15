@@ -7,10 +7,12 @@ Device fences and small reductions are intentional measurement overhead.
 
 from __future__ import annotations
 
+import sys
 import time
 from collections import deque
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -19,6 +21,9 @@ import torch.distributed as dist
 from ...accelerator.collectives import synchronize_local_errors
 from ...components.metrics import compute_utilization, model_tflops
 from ...models.common.moe.experts import RoutedExperts
+from ...utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -34,6 +39,7 @@ class DispatchTimer:
 
     def __init__(self) -> None:
         self.events: list[tuple[Any, Any]] = []
+        self._failed_record_streams: set[Any] = set()
         self.cpu_seconds = 0.0
 
     @contextmanager
@@ -46,16 +52,34 @@ class DispatchTimer:
                 self.cpu_seconds += time.perf_counter() - started
         else:
             backend = torch.get_device_module(device)
+            stream = backend.current_stream(device)
             start, end = (
                 backend.Event(enable_timing=True),
                 backend.Event(enable_timing=True),
             )
-            start.record()
+            try:
+                start.record(stream)
+            except BaseException:
+                self._failed_record_streams.add(stream)
+                raise
             try:
                 yield
             finally:
-                end.record()
-                self.events.append((start, end))
+                dispatch_error = sys.exc_info()[1]
+                try:
+                    end.record(stream)
+                except BaseException:
+                    # No end event can fence the submitted work. Borrow the
+                    # originating stream until close successfully drains it.
+                    self._failed_record_streams.add(stream)
+                    if dispatch_error is None:
+                        raise
+                    try:
+                        logger.exception("Dispatch timing failed after a model error")
+                    except BaseException:
+                        pass  # Preserve the active model exception.
+                else:
+                    self.events.append((start, end))
 
     def consume_seconds(self) -> float:
         result = self.cpu_seconds
@@ -65,6 +89,47 @@ class DispatchTimer:
         self.events.clear()
         self.cpu_seconds = 0.0
         return result
+
+    def close(self) -> None:
+        """Drain pending observations, retaining failed event waits for retry."""
+        failed = []
+        first_error: BaseException | None = None
+        for stream in tuple(self._failed_record_streams):
+            try:
+                stream.synchronize()
+                self._failed_record_streams.remove(stream)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        for start, end in self.events:
+            try:
+                end.synchronize()
+            except BaseException as error:
+                failed.append((start, end))
+                if first_error is None:
+                    first_error = error
+        self.events = failed
+        self.cpu_seconds = 0.0
+        if first_error is not None:
+            raise first_error
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchTimerResources:
+    """Own pending timing events independently of model/checkpoint resources."""
+
+    timers: tuple[DispatchTimer, ...]
+
+    def close(self) -> None:
+        first_error: BaseException | None = None
+        for timer in reversed(self.timers):
+            try:
+                timer.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
 
 def install_dispatch_timers(

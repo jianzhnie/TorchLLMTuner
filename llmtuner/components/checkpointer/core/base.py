@@ -41,6 +41,7 @@ from .model_state import ModelCheckpointState
 
 if TYPE_CHECKING:
     from ....config.checkpoint_config import CheckpointConfig
+    from ....parallel.assembly import ModelPartLayout
 
 logger = get_logger(__name__)
 
@@ -206,6 +207,7 @@ class BaseCheckpointManager(ABC):
         optimizer: Any,
         lr_scheduler: Any,
         ema: Any | None = None,
+        runtime_layouts: tuple[ModelPartLayout, ...] = (),
         states: dict[str, Any],
         folder: str,
     ) -> None:
@@ -244,6 +246,7 @@ class BaseCheckpointManager(ABC):
         self.states = {
             MODEL: ModelCheckpointState(
                 model_parts,
+                runtime_layouts=runtime_layouts,
                 sharded_expert_parallel=config.sharded_expert_parallel,
                 sharded_tensor_parallel=config.sharded_tensor_parallel,
                 initialization_group=get_default_group() if is_distributed() else None,

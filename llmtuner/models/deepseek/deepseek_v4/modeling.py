@@ -41,6 +41,10 @@ from transformers.utils.output_capturing import capture_outputs
 
 from ....errors import UnsupportedCombinationError
 from ...common.cast_linear import build_lm_head
+from ...common.gradient_norm import (
+    ReferenceNormGroup,
+    packed_expert_reference_norm_group,
+)
 from ...common.input_preparation import prepare_text_inputs
 from ...common.validation import temporary_attention_mask
 from ...configuration import (
@@ -141,6 +145,9 @@ def initialize_model_weights(module: nn.Module, std: float) -> None:
 @use_experts_implementation
 class DeepseekV4Experts(HFDeepseekV4Experts):
     """Own packed gate/up, asymmetric SwiGLU clamp and post-down scoring."""
+
+    def reference_norm_groups(self) -> tuple[ReferenceNormGroup, ...]:
+        return (packed_expert_reference_norm_group(self.gate_up_proj, self.down_proj),)
 
     def __init__(self, config: DeepseekV4Config) -> None:
         nn.Module.__init__(self)

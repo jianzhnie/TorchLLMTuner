@@ -26,6 +26,7 @@ import torch
 from torch import Tensor
 
 from llmtuner.accelerator.distributed import get_comm_device
+from llmtuner.utils.logging import get_logger
 
 from ._optimizer_reshard_schedule import (
     _BucketPlan,
@@ -345,6 +346,32 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         self._device = device
         self._context: _CommunicationContext | None = None
         self._local_slot = _BufferSlot()
+        self._caller_streams: set[torch.Stream] = set()
+        self._closed = False
+
+    def close(self) -> None:
+        """Drain owned work before releasing cached host/device buffers.
+
+        Process groups and caller streams are borrowed. Failed waits retain
+        context and storage for retry; the runtime cannot execute again.
+        """
+        self._closed = True
+        streams = set(self._caller_streams)
+        if self._context is not None:
+            stream = self._context.transfer_stream
+            streams.add(stream)
+        first_error: BaseException | None = None
+        for stream in streams:
+            try:
+                stream.synchronize()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+        self._local_slot = _BufferSlot()
+        self._context = None
+        self._caller_streams.clear()
 
     def reserve_buffers(
         self,
@@ -355,12 +382,15 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         ],
     ) -> None:
         """Prepare tensor capacities and events once per plan, without storage."""
+        if self._closed:
+            raise RuntimeError("Optimizer redistribution runtime is closed")
         context = self._context
         created_context = False
         if context is None and any(
             isinstance(plan, _RedistributionBucketPlan) for plan in plans
         ):
             context = _CommunicationContext.create(self._device)
+            self._context = context
             created_context = True
 
         device_handle = (
@@ -457,6 +487,8 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         compute: Callable[[_ItemT, Tensor], None],
         finalize: Callable[[_ItemT, Tensor], None],
     ) -> None:
+        if self._closed:
+            raise RuntimeError("Optimizer redistribution runtime is closed")
         context = self._context
         handle = (
             context.device_handle
@@ -464,6 +496,7 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
             else torch.get_device_module(self._device)
         )
         caller = handle.current_stream(self._device)
+        self._caller_streams.add(caller)
         self._local_slot.allocate()
         if context is not None:
             for slot in context.slots:
@@ -576,14 +609,24 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
                 self._release(previous, caller)
             completed = True
         finally:
+            if not completed:
+                self._closed = True
             if not completed and transfer_stream is not None:
                 # This fatal-only cleanup intentionally has no isolated mock-stream
                 # test to keep the unit-test footprint minimal. An exception makes
                 # the optimizer and training job unrecoverable.
                 # Preserve allocator lifetime ordering for work already queued
                 # on either stream without suppressing the active exception.
-                transfer_stream.wait_stream(caller)
-                caller.wait_stream(transfer_stream)
+                try:
+                    transfer_stream.wait_stream(caller)
+                    caller.wait_stream(transfer_stream)
+                except BaseException:
+                    try:
+                        get_logger(__name__).exception(
+                            "DistMuon stream cleanup failed after an update error"
+                        )
+                    except BaseException:
+                        pass
 
     @staticmethod
     def _enqueue_storage_to_compute(

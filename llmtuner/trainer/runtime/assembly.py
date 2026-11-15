@@ -27,6 +27,7 @@ from ...components.checkpointer.backends.distributed_checkpoint import (
 from ...components.checkpointer.backends.torch_checkpointing_backend import (
     TorchCheckpointingManager,
 )
+from ...components.checkpointer.core.base import BaseCheckpointManager
 from ...components.checkpointer.core.checkpoint_keys import (
     DATALOADER,
     RNG_STATE,
@@ -34,13 +35,14 @@ from ...components.checkpointer.core.checkpoint_keys import (
 )
 from ...components.checkpointer.core.random_state import RNGCheckpointState
 from ...components.checkpointer.model_state import ModelStateDictAdapter
-from ...components.loss import chunked_lm_head_cross_entropy
-from ...components.loss_contract import LossFunctions, LossSum
+from ...components.loss import chunked_lm_head_cross_entropy, cross_entropy_loss
+from ...components.loss_contract import LossFunctions
 from ...components.metrics import MetricsProcessor
 from ...components.optimizer.ema import EMA
 from ...components.optimizer.lr_scheduler import build_lr_scheduler
 from ...components.optimizer.optimizer import OptimizersContainer
 from ...components.optimizer.state_residency import validate_checkpoint_configuration
+from ...components.profiler import Profiler
 from ...errors import UnsupportedCombinationError
 from ...memory.materialization import materialize_meta_model
 from ...models.common.aux_loss import register_aux_loss_metrics_hook
@@ -52,24 +54,47 @@ from ...models.configuration import (
     resolve_model_class,
     unwrap_text_config,
 )
+from ...models.flops import flops_estimation_note, flops_per_token
 from ...models.registry import resolve_state_format
 from ...parallel import compatibility
-from ...parallel.assembly import ModelPartLayout
+from ...parallel.assembly import ModelPartLayout, validate_model_part_layouts
+from ...parallel.execution import ExecutionLayout
 from ...parallel.parallelize import parallelize_model
 from ...parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
 from ...utils import logging as logging_utils
-from ...utils.flops import flops_estimation_note, flops_per_token
-from .builders import TrainingBuilders
+from .builders import PipelineScheduleFactory, TrainingBuilders
 from .engine import ParamContext, TrainingEngine
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
     from torch.distributed.checkpoint.stateful import Stateful
     from transformers import PretrainedConfig
 
     from ...config.llmtuner_config import LLMTunerConfig
+    from ...config.observability_config import ProfilerConfig
     from ...datasets.contracts import BaseDataLoader
     from ...parallel.topology import ParallelTopology
+    from .builders import StepProfiler
     from .environment import RuntimeEnvironment
+
+
+def build_profiler(
+    config: ProfilerConfig,
+    *,
+    global_step: int,
+    base_folder: str,
+    builders: TrainingBuilders | None = None,
+) -> AbstractContextManager[StepProfiler]:
+    """Construct an unentered tracing owner for Trainer's loop lifecycle.
+
+    The factory owns partial construction. Trainer retains the returned owner
+    before entering it, so optional close retries remain available on failure.
+    """
+    factory = None if builders is None else builders.profiler
+    if factory is None:
+        factory = Profiler
+    return factory(config, global_step=global_step, base_folder=base_folder)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,11 +109,40 @@ class ModelAssembly:
     pp_has_last_stage: bool = False
     pp_loss_sentinel: torch.Tensor | None = None
 
+    @property
+    def execution_layouts(self) -> tuple[ExecutionLayout, ...]:
+        """Expose declared stage output and execution capabilities to consumers."""
+        if self.layouts and len(self.layouts) != len(self.model_parts):
+            raise ValueError("Execution layouts must match local model parts")
+        execution = []
+        for layout in self.layouts:
+            if not isinstance(layout.execution, ExecutionLayout):
+                raise TypeError(
+                    "Every assembled model part must provide an ExecutionLayout"
+                )
+            execution.append(layout.execution)
+        return tuple(execution)
+
     def validate_layouts(self) -> None:
         """Validate supplied layout metadata against the final local parts."""
         if self.layouts:
-            for part, layout in zip(self.model_parts, self.layouts, strict=True):
-                layout.validate(part)
+            validate_model_part_layouts(self.model_parts, self.layouts)
+            execution = self.execution_layouts
+            if self.pp_schedule is not None:
+                # Local parts may be nonadjacent under interleaved schedules.
+                # parallelize_model validates adjacency in global stage order.
+                if any(layout.pipeline_io is None for layout in execution):
+                    raise ValueError(
+                        "Pipeline execution layouts require stage I/O declarations"
+                    )
+                if any(layout.input_kind == "tokens" for layout in execution) != (
+                    self.pp_has_first_stage
+                ):
+                    raise ValueError("Pipeline token owner disagrees with stage I/O")
+                if any(layout.output == "logits" for layout in execution) != (
+                    self.pp_has_last_stage
+                ):
+                    raise ValueError("Pipeline loss owner disagrees with output layout")
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +299,8 @@ def _apply_parallelism(
     load_initial_weights: bool,
     error_group: ProcessGroup | None = None,
     loss_functions: LossFunctions | None = None,
-    pipeline_schedule_factory: Callable[..., Any] | None = None,
+    pipeline_schedule_factory: PipelineScheduleFactory | None = None,
+    on_model_acquired: Callable[[torch.nn.Module], None] | None = None,
 ) -> ModelAssembly:
     """Apply configured stages and return this rank's explicit model ownership."""
     parallel_assembly = parallelize_model(
@@ -268,6 +323,7 @@ def _apply_parallelism(
         chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
         loss_sum=None if loss_functions is None else loss_functions.token_sum,
         pipeline_schedule_factory=pipeline_schedule_factory,
+        on_model_acquired=on_model_acquired,
     )
     orchestration = parallel_assembly.execution
     if isinstance(orchestration, PipelineParallelSetup):
@@ -350,18 +406,23 @@ def prepare_parallel_model(
     *,
     environment: RuntimeEnvironment,
     loss_functions: LossFunctions | None = None,
-    pipeline_schedule_factory: Callable[..., Any] | None = None,
+    pipeline_schedule_factory: PipelineScheduleFactory | None = None,
+    on_model_acquired: Callable[[torch.nn.Module], None] | None = None,
 ) -> PreparedModel:
     """Construct, count and assemble a model without accessing a Trainer.
 
     Keep counting before TP/EP/PP/FSDP and preserve the materialization/load
     lifecycle in _apply_parallelism. No optimizer captures parameters until
-    this builder has returned the final local layout.
+    this builder has returned the final local layout. ``on_model_acquired``
+    transfers cleanup ownership before transformations or materialization can
+    fail; it must only retain the module, without device work or collectives.
     """
     with synchronize_local_errors("Model construction", group=environment.error_group):
         model, model_config, load_initial_weights = build_model(
             cfg, parallel_dims=environment.parallel_dims, device=environment.device
         )
+        if on_model_acquired is not None:
+            on_model_acquired(model)
         num_parameters = sum(parameter.numel() for parameter in model.parameters())
         num_trainable_parameters = sum(
             parameter.numel()
@@ -378,6 +439,7 @@ def prepare_parallel_model(
         error_group=environment.error_group,
         loss_functions=loss_functions,
         pipeline_schedule_factory=pipeline_schedule_factory,
+        on_model_acquired=on_model_acquired,
     )
     return PreparedModel(
         assembly=assembled,
@@ -385,6 +447,29 @@ def prepare_parallel_model(
         num_parameters=num_parameters,
         num_trainable_parameters=num_trainable_parameters,
     )
+
+
+def build_loss_functions(
+    cfg: LLMTunerConfig,
+    *,
+    factory: Callable[[LLMTunerConfig], LossFunctions] | None = None,
+    error_group: ProcessGroup | None = None,
+) -> LossFunctions:
+    """Select and validate one loss service for both PP and ordinary execution."""
+    with synchronize_local_errors("Loss services construction", group=error_group):
+        loss_functions = (
+            factory(cfg)
+            if factory is not None
+            else LossFunctions(cross_entropy_loss, chunked_lm_head_cross_entropy)
+        )
+        if not isinstance(loss_functions, LossFunctions):
+            raise TypeError("Loss factory must return LossFunctions")
+        if (
+            cfg.training.chunked_loss_num_chunks > 1
+            and loss_functions.chunked_backward is None
+        ):
+            raise ValueError("Injected loss must explicitly support chunked backward")
+    return loss_functions
 
 
 def create_training_engine(
@@ -395,8 +480,7 @@ def create_training_engine(
     parallel_dims: ParallelTopology | None,
     device: torch.device,
     param_context: ParamContext,
-    loss_sum: LossSum,
-    loss_functions: LossFunctions | None = None,
+    loss_functions: LossFunctions,
     error_group: ProcessGroup | None = None,
 ) -> TrainingEngine:
     """Bind execution dependencies without reading or mutating a Trainer.
@@ -406,34 +490,27 @@ def create_training_engine(
     without reselecting model or parallel strategies. ``error_group`` covers
     all update participants, not only ranks sharing a DP or PP mesh axis.
     """
-    return TrainingEngine(
-        model_parts=model_assembly.model_parts,
-        execution_layouts=tuple(
-            layout.execution
-            for layout in model_assembly.layouts
-            if layout.execution is not None
-        ),
-        parallel_dims=parallel_dims,
-        device=device,
-        max_context_length=cfg.max_seq_len,
-        chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
-        param_context=param_context,
-        loss_sum=loss_sum if loss_functions is None else loss_functions.token_sum,
-        chunked_loss_backward=(
-            chunked_lm_head_cross_entropy
-            if loss_functions is None
-            else loss_functions.chunked_backward
-        ),
-        optimizer=optimizer_stack.optimizer,
-        lr_scheduler=optimizer_stack.lr_scheduler,
-        ema=optimizer_stack.ema,
-        pp_schedule=model_assembly.pp_schedule,
-        pp_has_first_stage=model_assembly.pp_has_first_stage,
-        pp_has_last_stage=model_assembly.pp_has_last_stage,
-        pp_loss_sentinel=model_assembly.pp_loss_sentinel,
-        pp_num_microbatches=cfg.parallel.pp_config.num_pp_microbatches,
-        error_group=error_group,
-    )
+    with synchronize_local_errors("Training engine construction", group=error_group):
+        return TrainingEngine(
+            model_parts=model_assembly.model_parts,
+            execution_layouts=model_assembly.execution_layouts,
+            parallel_dims=parallel_dims,
+            device=device,
+            max_context_length=cfg.max_seq_len,
+            chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
+            param_context=param_context,
+            loss_sum=loss_functions.token_sum,
+            chunked_loss_backward=loss_functions.chunked_backward,
+            optimizer=optimizer_stack.optimizer,
+            lr_scheduler=optimizer_stack.lr_scheduler,
+            ema=optimizer_stack.ema,
+            pp_schedule=model_assembly.pp_schedule,
+            pp_has_first_stage=model_assembly.pp_has_first_stage,
+            pp_has_last_stage=model_assembly.pp_has_last_stage,
+            pp_loss_sentinel=model_assembly.pp_loss_sentinel,
+            pp_num_microbatches=cfg.parallel.pp_config.num_pp_microbatches,
+            error_group=error_group,
+        )
 
 
 def build_optimizer_stack(
@@ -452,8 +529,7 @@ def build_optimizer_stack(
     """
     with synchronize_local_errors("Optimizer layout validation", group=error_group):
         if layouts:
-            for part, layout in zip(model_parts, layouts, strict=True):
-                layout.validate(part)
+            validate_model_part_layouts(model_parts, layouts)
     factories = builders or TrainingBuilders()
     optimizer_factory = (
         OptimizersContainer if factories.optimizer is None else factories.optimizer
@@ -471,6 +547,7 @@ def build_optimizer_stack(
         pipeline_mesh=(
             parallel_dims.get_optional_mesh("pp") if parallel_dims is not None else None
         ),
+        runtime_layouts=layouts,
     )
 
     lr_scheduler = None
@@ -488,6 +565,7 @@ def build_optimizer_stack(
             ema = (
                 ema_factory(
                     model_parts=model_parts,
+                    runtime_layouts=layouts,
                     sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
                     sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
                     decay=ema_config.decay,
@@ -536,7 +614,7 @@ def build_checkpointer(
     parallel_dims: ParallelTopology | None,
     error_group: ProcessGroup | None = None,
     builders: TrainingBuilders | None = None,
-) -> DistributedCheckpointManager | TorchCheckpointingManager:
+) -> BaseCheckpointManager:
     """Build checkpoint orchestration around explicitly owned runtime state.
 
     ``error_group`` covers adapter preparation, format-conversion failures and
@@ -566,6 +644,7 @@ def build_checkpointer(
             expert_parallel=cfg.parallel.ep_size > 1,
             sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
             error_group=error_group,
+            runtime_layouts=model_assembly.layouts,
         )
     manager_cls = (
         TorchCheckpointingManager
@@ -579,6 +658,7 @@ def build_checkpointer(
     return manager_factory(
         cfg.checkpoint,
         model_parts=model_assembly.model_parts,
+        runtime_layouts=model_assembly.layouts,
         optimizer=optimizer_stack.optimizer,
         lr_scheduler=optimizer_stack.lr_scheduler,
         ema=optimizer_stack.ema,
