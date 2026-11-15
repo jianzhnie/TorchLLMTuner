@@ -152,7 +152,14 @@ class DecoderStructure:
     blocks: str
     norm: str
     head: str
-    attention: str | None = None
+    attention: str | tuple[str, ...] | None = None
+
+    def attention_names(self) -> tuple[str, ...]:
+        if isinstance(self.attention, str):
+            return (self.attention,)
+        if isinstance(self.attention, tuple):
+            return self.attention
+        return ()
 
     def __post_init__(self) -> None:
         """Reject malformed declarations before constructing or binding a model."""
@@ -166,12 +173,14 @@ class DecoderStructure:
             parent, _, name = path.rpartition(".")
             if parent != self.decoder or not name:
                 raise ValueError(f"{path!r} must be a direct child of {self.decoder!r}")
+        names = self.attention_names()
         if self.attention is not None and (
-            not isinstance(self.attention, str)
-            or not self.attention
-            or "." in self.attention
+            not names
+            or any(
+                not isinstance(name, str) or not name or "." in name for name in names
+            )
         ):
-            raise ValueError("Decoder attention must be a direct child name or None")
+            raise ValueError("Decoder attention must be direct child names or None")
 
     def bind(self, model: nn.Module) -> BoundDecoderStructure:
         decoder = registered_submodule(model, self.decoder)
@@ -195,20 +204,21 @@ class DecoderStructure:
         whole-model references. An absent declaration is unsupported, not a cue
         to search common attribute names.
         """
-        if (
-            not isinstance(self.attention, str)
-            or not self.attention
-            or "." in self.attention
-        ):
+        names = self.attention_names()
+        if not names:
             raise ValueError("CP requires a declared direct attention child name")
         blocks = self.bind_blocks(model)
         attentions = []
         for block_id, block in blocks._modules.items():
-            attention = block._modules.get(self.attention)
-            if not isinstance(attention, nn.Module):
+            matches = [
+                block._modules[name]
+                for name in names
+                if isinstance(block._modules.get(name), nn.Module)
+            ]
+            if len(matches) != 1:
                 raise ValueError(
-                    f"Block {self.blocks}.{block_id} requires declared attention "
-                    f"child {self.attention!r}"
+                    f"Block {self.blocks}.{block_id} requires exactly one declared "
+                    f"attention child from {names!r}"
                 )
-            attentions.append(attention)
+            attentions.append(matches[0])
         return tuple(attentions)

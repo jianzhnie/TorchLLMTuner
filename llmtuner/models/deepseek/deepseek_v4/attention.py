@@ -3,6 +3,7 @@
 # Adapted from Transformers 5.11 modeling_deepseek_v4.
 """DeepSeek V4 shared-KV attention and grouped low-rank output math."""
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -188,3 +189,59 @@ class DeepseekV4Attention(reference.DeepseekV4Attention):
         grouped = output.reshape(*input_shape, self.config.o_groups, -1)
         grouped = self.o_a_proj(grouped).flatten(2)
         return self.o_b_proj(grouped), weights
+
+    def forward_compressor_context_parallel(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        position_ids: torch.Tensor,
+        *,
+        compress_csa_windows: Callable[..., Any],
+        select_csa_windows: Callable[..., Any],
+        compress_hca_windows: Callable[..., Any],
+        attention: Callable[..., torch.Tensor],
+    ) -> tuple[torch.Tensor, None]:
+        """Project, compress and merge stateless V4 CP attention in model order.
+
+        The parallel adapter validates inputs and binds group-aware window/attention
+        callbacks. This function neither selects communication groups nor installs
+        forwards. Adapted from Transformers 5.9.0 (Apache-2.0).
+        """
+        batch, length, _ = hidden_states.shape
+        shape = (batch, length, -1, self.head_dim)
+        cos, sin = position_embeddings[self.rope_layer_type]
+        q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
+        query = self.q_b_norm(self.q_b_proj(q_residual).view(shape).transpose(1, 2))
+        query = apply_rotary_pos_emb(query, cos, sin)
+        kv = self.kv_norm(self.kv_proj(hidden_states)).view(shape).transpose(1, 2)
+        kv = apply_rotary_pos_emb(kv, cos, sin)
+        selected = None
+        if self.layer_type == "compressed_sparse_attention":
+            compressed, _ = compress_csa_windows(self.compressor, hidden_states)
+            selected = select_csa_windows(
+                self.compressor.indexer,
+                hidden_states,
+                q_residual,
+                position_ids,
+            )
+        elif self.layer_type == "heavily_compressed_attention":
+            compressed, _ = compress_hca_windows(self.compressor, hidden_states)
+        else:
+            compressed = kv[:, :, :0]
+        output = attention(
+            query,
+            kv,
+            compressed,
+            sinks=self.sinks,
+            compress_rate=(
+                self.compressor.compress_rate if self.compressor is not None else None
+            ),
+            sliding_window=self.sliding_window,
+            scaling=self.scaling,
+            dropout=self.attention_dropout if self.training else 0.0,
+            training=self.training,
+            selected_windows=selected,
+        )
+        output = apply_rotary_pos_emb(output.transpose(1, 2), cos, -sin).transpose(1, 2)
+        grouped = output.reshape(batch, length, self.config.o_groups, -1)
+        return self.o_b_proj(self.o_a_proj(grouped).flatten(2)), None

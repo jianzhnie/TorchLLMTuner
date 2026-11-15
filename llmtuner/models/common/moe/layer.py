@@ -33,6 +33,7 @@ Shape legend, scoped to this file: ``T`` = tokens, ``D`` = model dimension,
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
 from numbers import Real
 
 import torch
@@ -191,6 +192,15 @@ class MoE(nn.Module):
         # Preserve the decoder's expected return arity: returning a tuple where
         # it expects a tensor changes the model's forward semantics.
         self.returns_router_logits = False
+
+    def expert_parallel_parameters(self) -> Iterator[nn.Parameter]:
+        """Yield routed expert parameters, excluding router and shared experts.
+
+        These parameters use expert replica axes for gradient synchronization
+        and contribute to the expert partition of the global gradient norm.
+        Resolve the current expert module after parallel replacements.
+        """
+        yield from self.routed_experts.inner_experts.parameters()
 
     @torch.no_grad()
     def update_expert_bias(self) -> None:

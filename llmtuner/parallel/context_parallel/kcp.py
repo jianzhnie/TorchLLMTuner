@@ -18,10 +18,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_comm_device, get_world_size
 from ...models.contracts import DecoderStructure
-from ...models.kimi.kimi_k3.delta_attention import (
-    forward_context_parallel_kda,
-    validate_context_parallel_kda,
-)
 from ..plan import (
     FullPlanBindings,
     ParallelPlan,
@@ -64,8 +60,13 @@ def kcp_kda_forward(
         **kwargs: Any,
     ) -> torch.Tensor:
         with synchronize_local_errors("KCP KDA input validation", group=group):
-            kernel_size = validate_context_parallel_kda(
-                module,
+            validator = getattr(module, "validate_context_parallel_inputs", None)
+            executor = getattr(module, "forward_context_parallel", None)
+            if not callable(validator) or not callable(executor):
+                raise TypeError(
+                    "KCP KDA requires model-owned validation and forward interfaces"
+                )
+            kernel_size = validator(
                 hidden_states,
                 attention_mask=attention_mask,
                 cache_params=cache_params,
@@ -107,8 +108,7 @@ def kcp_kda_forward(
             conv1d_kernel_size=kernel_size,
         )
 
-        return forward_context_parallel_kda(
-            module,
+        return executor(
             hidden_states,
             context=context,
             causal_conv1d=causal_conv1d,

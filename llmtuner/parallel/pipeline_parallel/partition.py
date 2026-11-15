@@ -47,6 +47,7 @@ from torch.distributed.pipelining.schedules import (
 from ...errors import UnsupportedCombinationError
 from ...models.contracts import DecoderStructure
 from ...utils.logging import get_logger
+from ..execution import validate_pipeline_stage_io
 
 logger = get_logger(__name__)
 
@@ -275,6 +276,9 @@ def build_stage_from_modules(
         prune_declared_stage(model, set(module_names))
         model.configure_pipeline_stage(
             first=stage_idx == 0, last=stage_idx == num_stages - 1
+        )
+        validate_pipeline_stage_io(
+            model, first=stage_idx == 0, last=stage_idx == num_stages - 1
         )
     else:
         modules_to_keep = set(module_names)

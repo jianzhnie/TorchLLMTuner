@@ -42,6 +42,7 @@ from llmtuner.config.parallel_config import ParallelConfig
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...components.loss import cross_entropy_loss
+from ...components.loss_contract import LossSum
 from ...models.contracts import DecoderStructure
 from ...utils.logging import get_logger
 from .. import compatibility
@@ -82,15 +83,14 @@ def scalar_loss_fn(
     global_valid_tokens: torch.Tensor,
     tp_group: dist.ProcessGroup | None = None,
     global_vocab_size: int | None = None,
+    loss_sum: LossSum | None = None,
 ) -> torch.Tensor:
     """Summed next-token CE over one microbatch, as a bare scalar.
 
-    Same arithmetic as ``Trainer.loss_sum``: ``labels`` arrives already
+    The bound token-sum loss receives aligned ``labels``:
     aligned (``pred[t]`` predicts ``labels[t]``, ``IGNORE_INDEX`` at document
-    boundaries), so no shift happens here. Schedules call
-    ``loss_fn(output, target)`` and backward the result directly, so the
-    trainer's pair-returning version cannot be handed over -- this is the same
-    computation in the shape the schedule needs.
+    boundaries), so no shift happens here. Schedules backward the returned
+    scalar directly; execution result objects remain outside this boundary.
 
     ``global_valid_tokens`` is handed in by :func:`make_schedule_loss_fn` (it
     has to be passed down: the denominator spans every rank and every
@@ -110,15 +110,12 @@ def scalar_loss_fn(
     keeps ``pred.shape[-1] == global_vocab_size`` and takes the plain path, so
     the default is the old behaviour.
     """
-    return (
-        cross_entropy_loss(
-            pred.reshape(-1, pred.shape[-1]),
-            labels.reshape(-1),
-            tp_group=tp_group,
-            global_vocab_size=global_vocab_size,
-        )
-        / global_valid_tokens
-    )
+    return (cross_entropy_loss if loss_sum is None else loss_sum)(
+        pred.reshape(-1, pred.shape[-1]),
+        labels.reshape(-1),
+        tp_group=tp_group,
+        global_vocab_size=global_vocab_size,
+    ) / global_valid_tokens
 
 
 def make_schedule_loss_fn(
@@ -126,6 +123,7 @@ def make_schedule_loss_fn(
     *,
     tp_group: dist.ProcessGroup | None = None,
     global_vocab_size: int | None = None,
+    loss_sum: LossSum | None = None,
 ) -> Callable[..., torch.Tensor]:
     """The schedule's ``loss_fn``, reading the denominator from either route.
 
@@ -164,6 +162,7 @@ def make_schedule_loss_fn(
             global_valid_tokens=global_valid_tokens,
             tp_group=tp_group,
             global_vocab_size=global_vocab_size,
+            loss_sum=loss_sum,
         )
 
     return _schedule_loss_fn
@@ -481,6 +480,7 @@ def build_pipeline_schedule(
     cfg: ParallelConfig,
     tp_group: dist.ProcessGroup | None = None,
     global_vocab_size: int | None = None,
+    loss_sum: LossSum | None = None,
 ) -> _PipelineSchedule:
     """Build the schedule that drives this rank's stages.
 
@@ -555,6 +555,7 @@ def build_pipeline_schedule(
         schedule,
         tp_group=tp_group,
         global_vocab_size=global_vocab_size,
+        loss_sum=loss_sum,
     )
     logger.info(
         f"Using pipeline schedule {parallelism.pp_config.pipeline_parallel_schedule} "

@@ -141,9 +141,6 @@ class ParallelPlan:
     decoder_structure: DecoderStructure | None = field(
         default=None, init=False, repr=False, compare=False
     )
-    decoder_structure_bound: bool = field(
-        default=False, init=False, repr=False, compare=False
-    )
 
     def parameter_alias_groups(self) -> tuple[tuple[str, ...], ...]:
         """Return every registered path sharing the same Parameter object."""
@@ -196,22 +193,24 @@ class ParallelPlan:
         if self.module_bindings is not None:
             # Accessing a bound method creates a fresh method object. Snapshot
             # its function and receiver instead of that ephemeral object's ID.
+            forward_paths = {target.path for target in self.targets} | {""}
             object.__setattr__(
                 self,
                 "forward_bindings",
                 tuple(
                     (
+                        path,
                         getattr(module.forward, "__func__", module.forward),
                         getattr(module.forward, "__self__", None),
                     )
-                    for _, module in self.module_bindings
+                    for path, module in self.module_bindings
+                    if not self.targets or path in forward_paths
                 ),
             )
             for path, module in self.module_bindings:
                 if path == "":
                     # Absence is part of the resolved semantics too. A minimal
                     # plan without a root snapshot has no such guarantee.
-                    object.__setattr__(self, "decoder_structure_bound", True)
                     structure = getattr(module, "decoder_structure", None)
                     if isinstance(structure, DecoderStructure):
                         object.__setattr__(self, "decoder_structure", structure)
@@ -243,7 +242,10 @@ class ParallelPlan:
 
     def validate_binding(self, model: nn.Module) -> None:
         """Reject a plan whose live module references no longer match the model."""
-        if self.decoder_structure_bound and (
+        decoder_structure_bound = self.module_bindings is not None and any(
+            path == "" for path, _ in self.module_bindings
+        )
+        if decoder_structure_bound and (
             getattr(model, "decoder_structure", None) != self.decoder_structure
         ):
             # Registered modules can stay identical while model-owned paths
@@ -265,10 +267,9 @@ class ParallelPlan:
                 if path != bound_path or value is not bound_value:
                     raise ValueError(f"Stale plan {kind} binding: {path}")
         if self.module_bindings is not None:
-            for (path, module), (function, receiver) in zip(
-                self.module_bindings, self.forward_bindings, strict=True
-            ):
-                forward = module.forward
+            bound_modules = dict(self.module_bindings)
+            for path, function, receiver in self.forward_bindings:
+                forward = bound_modules[path].forward
                 if (
                     getattr(forward, "__func__", forward) is not function
                     or getattr(forward, "__self__", None) is not receiver

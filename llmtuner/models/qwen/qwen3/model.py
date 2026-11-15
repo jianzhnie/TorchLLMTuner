@@ -82,6 +82,7 @@ from ...common.moe.layer import collect_moe_layers
 from ...common.validation import temporary_attention_mask
 from ...configuration import configure_reference_experts, validate_attention_backend
 from ...contracts import DecoderStructure, MoEBlockContract
+from ...execution import ModelExecutionCapabilities, PipelineStageIO
 from ..routing import Qwen3MoeFP32TopKRouter, validate_router_compute_dtype
 from .normalization import build_rms_norm, validate_norm_backend
 from .rotary import (
@@ -585,6 +586,8 @@ class Qwen3MoeModel(HFQwen3MoeModel):
 class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
     """Explicit causal model tree, preserving reference state and loss APIs."""
 
+    execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
+
     decoder_structure = DecoderStructure(
         decoder="model",
         embedding="model.embed_tokens",
@@ -654,7 +657,9 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
 
     def configure_pipeline_stage(self, *, first: bool, last: bool) -> None:
         """Select model-owned stage tensor I/O after generic module pruning."""
-        self._pipeline_stage = (first, last)
+        self.pipeline_stage_io = PipelineStageIO(
+            first=first, last=last, hidden_size=self.config.hidden_size
+        )
 
     def forward_pipeline_stage(
         self,
@@ -666,7 +671,7 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
         skip_lm_head: bool,
     ) -> Tensor:
         """Run tokens on the first stage and hidden states on later stages."""
-        first, last = self._pipeline_stage
+        first, last = self.pipeline_stage_io.first, self.pipeline_stage_io.last
         flat = inputs.ndim == (1 if first else 2)
         if not first and not inputs.is_floating_point():
             raise TypeError("Non-first Qwen3 PP stages require hidden states")
@@ -764,7 +769,7 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
         """
         plan = (
             {"lm_head": "replicated_with_grad_allreduce"}
-            if not hasattr(self, "_pipeline_stage") or self._pipeline_stage[1]
+            if not hasattr(self, "pipeline_stage_io") or self.pipeline_stage_io.last
             else {}
         )
         for block_id, layer in self.model.layers._modules.items():
@@ -890,7 +895,7 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
             raise ValueError("Specify only one of positions and position_ids")
         if attention_masks is not None and attention_mask is not None:
             raise ValueError("Specify only one of attention_masks and attention_mask")
-        if hasattr(self, "_pipeline_stage"):
+        if hasattr(self, "pipeline_stage_io"):
             if input_ids is None or inputs_embeds is not None or labels is not None:
                 raise ValueError("Qwen3 PP requires a stage tensor and external loss")
             if past_key_values is not None or use_cache or output_router_logits:
@@ -1074,7 +1079,8 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
                     )
         # PP deliberately removes non-owned vocabulary modules. Validate the
         # stage's declared roles, not Identity placeholders from other stages.
-        first, last = getattr(self, "_pipeline_stage", (True, True))
+        stage_io = getattr(self, "pipeline_stage_io", None)
+        first, last = (stage_io.first, stage_io.last) if stage_io else (True, True)
         for name, module, shape, owned in (
             (
                 "embedding",

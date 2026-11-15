@@ -36,6 +36,16 @@ class NpuBaselineAllToAllTokenDispatcher(AllToAllTokenDispatcher):
 class NpuBaselineGroupedExperts(GroupedExperts):
     """Keep the existing parameter layout and FSDP module-call lifecycle."""
 
+    def gradient_norm_parameter_groups(
+        self,
+    ) -> tuple[tuple[torch.nn.Parameter, ...], ...]:
+        """Declare parameters packed together by the baseline expert GEMM.
+
+        Parameter-precision norms must reproduce the packed gate/up reduction
+        used by this backend, even though checkpoint storage keeps them separate.
+        """
+        return ((self.w1_EFD, self.w3_EFD),)
+
     def forward(self, inputs, counts, *, routing_scores):
         if inputs.device.type != "npu" or inputs.dtype != torch.bfloat16:
             raise TypeError("torchtitan EP experts require BF16 NPU inputs")

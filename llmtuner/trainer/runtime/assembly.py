@@ -11,6 +11,7 @@ splits the model first, then applies those stages to each local model part.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,8 @@ from ...components.checkpointer.core.checkpoint_keys import (
 )
 from ...components.checkpointer.core.random_state import RNGCheckpointState
 from ...components.checkpointer.model_state import ModelStateDictAdapter
+from ...components.loss import chunked_lm_head_cross_entropy
+from ...components.loss_contract import LossFunctions, LossSum
 from ...components.metrics import MetricsProcessor
 from ...components.optimizer.ema import EMA
 from ...components.optimizer.lr_scheduler import build_lr_scheduler
@@ -51,11 +54,13 @@ from ...models.configuration import (
 )
 from ...models.registry import resolve_state_format
 from ...parallel import compatibility
+from ...parallel.assembly import ModelPartLayout
 from ...parallel.parallelize import parallelize_model
 from ...parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
 from ...utils import logging as logging_utils
 from ...utils.flops import flops_estimation_note, flops_per_token
-from .engine import LossSum, ParamContext, TrainingEngine
+from .builders import TrainingBuilders
+from .engine import ParamContext, TrainingEngine
 
 if TYPE_CHECKING:
     from torch.distributed.checkpoint.stateful import Stateful
@@ -73,10 +78,17 @@ class ModelAssembly:
 
     model: torch.nn.Module | None
     model_parts: list[torch.nn.Module]
+    layouts: tuple[ModelPartLayout, ...] = ()
     pp_schedule: Any | None = None
     pp_has_first_stage: bool = False
     pp_has_last_stage: bool = False
     pp_loss_sentinel: torch.Tensor | None = None
+
+    def validate_layouts(self) -> None:
+        """Validate supplied layout metadata against the final local parts."""
+        if self.layouts:
+            for part, layout in zip(self.model_parts, self.layouts, strict=True):
+                layout.validate(part)
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,9 +244,11 @@ def _apply_parallelism(
     device: torch.device,
     load_initial_weights: bool,
     error_group: ProcessGroup | None = None,
+    loss_functions: LossFunctions | None = None,
+    pipeline_schedule_factory: Callable[..., Any] | None = None,
 ) -> ModelAssembly:
     """Apply configured stages and return this rank's explicit model ownership."""
-    orchestration = parallelize_model(
+    parallel_assembly = parallelize_model(
         model,
         cfg=cfg.parallel,
         mesh=mesh,
@@ -252,11 +266,15 @@ def _apply_parallelism(
         region_ac=cfg.training.region_ac,
         global_batch_size=cfg.training.global_batch_size,
         chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
+        loss_sum=None if loss_functions is None else loss_functions.token_sum,
+        pipeline_schedule_factory=pipeline_schedule_factory,
     )
+    orchestration = parallel_assembly.execution
     if isinstance(orchestration, PipelineParallelSetup):
         assembled = ModelAssembly(
             model=None,
             model_parts=orchestration.model_parts,
+            layouts=parallel_assembly.layouts,
             pp_schedule=orchestration.schedule,
             pp_has_first_stage=orchestration.has_first_stage,
             pp_has_last_stage=orchestration.has_last_stage,
@@ -265,7 +283,11 @@ def _apply_parallelism(
             pp_loss_sentinel=torch.zeros((), dtype=torch.float32, device=device),
         )
     else:
-        assembled = ModelAssembly(model=orchestration, model_parts=[orchestration])
+        assembled = ModelAssembly(
+            model=orchestration,
+            model_parts=[orchestration],
+            layouts=parallel_assembly.layouts,
+        )
 
     if load_initial_weights or cfg.model.initialization_device == "meta":
         materialization_error: BaseException | None = None
@@ -318,11 +340,17 @@ def _apply_parallelism(
             ):
                 if initialization_error is not None:
                     raise initialization_error
+    for part, layout in zip(assembled.model_parts, assembled.layouts, strict=True):
+        layout.refresh(part)
     return assembled
 
 
 def prepare_parallel_model(
-    cfg: LLMTunerConfig, *, environment: RuntimeEnvironment
+    cfg: LLMTunerConfig,
+    *,
+    environment: RuntimeEnvironment,
+    loss_functions: LossFunctions | None = None,
+    pipeline_schedule_factory: Callable[..., Any] | None = None,
 ) -> PreparedModel:
     """Construct, count and assemble a model without accessing a Trainer.
 
@@ -348,6 +376,8 @@ def prepare_parallel_model(
         device=environment.device,
         load_initial_weights=load_initial_weights,
         error_group=environment.error_group,
+        loss_functions=loss_functions,
+        pipeline_schedule_factory=pipeline_schedule_factory,
     )
     return PreparedModel(
         assembly=assembled,
@@ -366,6 +396,7 @@ def create_training_engine(
     device: torch.device,
     param_context: ParamContext,
     loss_sum: LossSum,
+    loss_functions: LossFunctions | None = None,
     error_group: ProcessGroup | None = None,
 ) -> TrainingEngine:
     """Bind execution dependencies without reading or mutating a Trainer.
@@ -377,12 +408,22 @@ def create_training_engine(
     """
     return TrainingEngine(
         model_parts=model_assembly.model_parts,
+        execution_layouts=tuple(
+            layout.execution
+            for layout in model_assembly.layouts
+            if layout.execution is not None
+        ),
         parallel_dims=parallel_dims,
         device=device,
         max_context_length=cfg.max_seq_len,
         chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
         param_context=param_context,
-        loss_sum=loss_sum,
+        loss_sum=loss_sum if loss_functions is None else loss_functions.token_sum,
+        chunked_loss_backward=(
+            chunked_lm_head_cross_entropy
+            if loss_functions is None
+            else loss_functions.chunked_backward
+        ),
         optimizer=optimizer_stack.optimizer,
         lr_scheduler=optimizer_stack.lr_scheduler,
         ema=optimizer_stack.ema,
@@ -401,13 +442,27 @@ def build_optimizer_stack(
     model_parts: list[torch.nn.Module],
     parallel_dims: ParallelTopology | None,
     error_group: ProcessGroup | None = None,
+    layouts: tuple[ModelPartLayout, ...] = (),
+    builders: TrainingBuilders | None = None,
 ) -> OptimizerStack:
     """Build optimizer services against the final parallel parameter layout.
 
     Pass the same error group to parameter planning and scheduler/EMA creation.
     This group coordinates failures; it does not change gradient ownership.
     """
-    optimizer = OptimizersContainer(
+    with synchronize_local_errors("Optimizer layout validation", group=error_group):
+        if layouts:
+            for part, layout in zip(model_parts, layouts, strict=True):
+                layout.validate(part)
+    factories = builders or TrainingBuilders()
+    optimizer_factory = (
+        OptimizersContainer if factories.optimizer is None else factories.optimizer
+    )
+    scheduler_factory = (
+        build_lr_scheduler if factories.scheduler is None else factories.scheduler
+    )
+    ema_factory = EMA if factories.ema is None else factories.ema
+    optimizer = optimizer_factory(
         cfg.optimizer,
         sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
         sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
@@ -418,33 +473,54 @@ def build_optimizer_stack(
         ),
     )
 
-    with synchronize_local_errors("Optimizer services construction", group=error_group):
-        lr_scheduler = build_lr_scheduler(
-            cfg.lr_scheduler_config,
-            optimizers=list(optimizer),
-            training_steps=cfg.steps,
-        )
-        ema_config = cfg.training.ema
-        ema = (
-            EMA(
-                model_parts=model_parts,
-                sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
-                sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
-                decay=ema_config.decay,
-                half_life_fraction=ema_config.half_life_fraction,
-                start_step=ema_config.start_step,
-                step_bias=ema_config.step_bias,
-                update_every_n_steps=ema_config.update_every_n_steps,
-                buffer_patterns=ema_config.buffer_patterns,
+    lr_scheduler = None
+    ema = None
+    try:
+        with synchronize_local_errors(
+            "Optimizer services construction", group=error_group
+        ):
+            lr_scheduler = scheduler_factory(
+                cfg.lr_scheduler_config,
+                optimizers=list(optimizer),
+                training_steps=cfg.steps,
             )
-            if ema_config is not None
-            else None
-        )
-        # Container hooks run once per optimizer step, including multiple PP parts.
-        register_aux_loss_metrics_hook(optimizer, model_parts=model_parts)
-        register_moe_balancing_hook(
-            optimizer, model_parts=model_parts, parallel_dims=parallel_dims
-        )
+            ema_config = cfg.training.ema
+            ema = (
+                ema_factory(
+                    model_parts=model_parts,
+                    sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
+                    sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
+                    decay=ema_config.decay,
+                    half_life_fraction=ema_config.half_life_fraction,
+                    start_step=ema_config.start_step,
+                    step_bias=ema_config.step_bias,
+                    update_every_n_steps=ema_config.update_every_n_steps,
+                    buffer_patterns=ema_config.buffer_patterns,
+                )
+                if ema_config is not None
+                else None
+            )
+            # Container hooks run once per optimizer step, including multiple PP parts.
+            register_aux_loss_metrics_hook(optimizer, model_parts=model_parts)
+            register_moe_balancing_hook(
+                optimizer, model_parts=model_parts, parallel_dims=parallel_dims
+            )
+    except BaseException:
+        # Factories own partial objects until they return. Once returned, this
+        # builder owns cleanup until the complete stack is published.
+        for resource in (ema, lr_scheduler, optimizer):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException:
+                    try:
+                        logging_utils.get_logger(__name__).exception(
+                            "Optimizer service cleanup failed during construction"
+                        )
+                    except BaseException:
+                        pass
+        raise
     return OptimizerStack(optimizer=optimizer, lr_scheduler=lr_scheduler, ema=ema)
 
 
@@ -459,6 +535,7 @@ def build_checkpointer(
     device: torch.device,
     parallel_dims: ParallelTopology | None,
     error_group: ProcessGroup | None = None,
+    builders: TrainingBuilders | None = None,
 ) -> DistributedCheckpointManager | TorchCheckpointingManager:
     """Build checkpoint orchestration around explicitly owned runtime state.
 
@@ -467,6 +544,7 @@ def build_checkpointer(
     this argument does not repartition persistence.
     """
     with synchronize_local_errors("Checkpoint services preparation", group=error_group):
+        model_assembly.validate_layouts()
         if cfg.checkpoint.enable and cfg.optimizer.state_residency == "npu_virtual":
             validate_checkpoint_configuration(
                 cfg.checkpoint.backend, cfg.checkpoint.async_mode
@@ -494,7 +572,11 @@ def build_checkpointer(
         if cfg.checkpoint.backend == "torch_checkpointing"
         else DistributedCheckpointManager
     )
-    return manager_cls(
+    factories = builders or TrainingBuilders()
+    manager_factory = (
+        manager_cls if factories.checkpoint is None else factories.checkpoint
+    )
+    return manager_factory(
         cfg.checkpoint,
         model_parts=model_assembly.model_parts,
         optimizer=optimizer_stack.optimizer,
@@ -514,17 +596,22 @@ def build_metrics_processor(
     num_parameters: int,
     num_trainable_parameters: int,
     error_group: ProcessGroup | None = None,
+    builders: TrainingBuilders | None = None,
 ) -> MetricsProcessor:
     """Build metrics with explicit construction-failure coordination.
 
     ``parallel_dims`` still defines metric reductions. ``error_group`` determines
     which peers must accept construction before the logger is published.
     """
+    factories = builders or TrainingBuilders()
+    metrics_factory = (
+        MetricsProcessor if factories.metrics is None else factories.metrics
+    )
     metrics = None
     try:
         with synchronize_local_errors("Metrics construction", group=error_group):
             text_config = unwrap_text_config(model_config)
-            metrics = MetricsProcessor(
+            metrics = metrics_factory(
                 cfg.metrics,
                 parallel_dims=parallel_dims,
                 dump_folder=cfg.dump_folder,

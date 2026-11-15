@@ -10,6 +10,7 @@ from transformers.cache_utils import Cache
 from transformers.models.deepseek_v4 import modeling_deepseek_v4 as reference
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
+from .compression_math import compress_overlap_context_parallel
 from .normalization import DeepseekV4RMSNorm
 from .overlap import assemble_overlap_windows
 from .rotary import DeepseekV4RotaryEmbedding, apply_rotary_pos_emb
@@ -60,6 +61,17 @@ class DeepseekV4Indexer(reference.DeepseekV4Indexer):
         )
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.scorer = DeepseekV4IndexerScorer(config)
+
+    def compress_context_parallel(
+        self, hidden_states, *, exchange_windows, exchange_previous_window
+    ):
+        """Compress owned CSA windows with explicit communication callbacks."""
+        return compress_overlap_context_parallel(
+            self,
+            hidden_states,
+            exchange_windows=exchange_windows,
+            exchange_previous_window=exchange_previous_window,
+        )
 
     def forward(
         self,
@@ -141,3 +153,29 @@ class DeepseekV4Indexer(reference.DeepseekV4Indexer):
                 selected,
             )
         return scores.topk(top_k, dim=-1).indices
+
+    @torch.no_grad()
+    def select_context_parallel_windows(
+        self, hidden_states, q_residual, position_ids, keys
+    ):
+        """Score global compressed keys using local queries and causal top-k."""
+        batch, length, _ = hidden_states.shape
+        cos, sin = self.rotary_emb(
+            hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type
+        )
+        query = self.q_b_proj(q_residual).view(batch, length, -1, self.head_dim)
+        query = apply_rotary_pos_emb(query.transpose(1, 2), cos, sin).transpose(1, 2)
+        scores = torch.matmul(
+            query.float(), keys.transpose(-1, -2).float().unsqueeze(1)
+        )
+        scores = scores.relu() * self.softmax_scale
+        weights = self.weights_proj(hidden_states).float() * self.weights_scaling
+        scores = (scores * weights.unsqueeze(-1)).sum(dim=2)
+        total = keys.shape[1]
+        threshold = (position_ids + 1) // self.compress_rate
+        indices = torch.arange(total, device=scores.device)
+        scores = scores.masked_fill(
+            indices[None, None] >= threshold[..., None], -torch.inf
+        )
+        selected = scores.topk(min(self.index_topk, total), dim=-1).indices
+        return torch.where(selected >= threshold[..., None], -1, selected)

@@ -70,6 +70,7 @@ from ...configuration import (
     validate_native_execution_policy,
 )
 from ...contracts import DecoderStructure
+from ...execution import ModelExecutionCapabilities
 from .attention_residual import attention_residual
 from .configuration import KimiLinearConfig
 from .delta_attention import KimiDeltaAttention
@@ -300,6 +301,8 @@ class KimiTextDecoder(nn.Module):
 
 class KimiLinearForCausalLM(PreTrainedModel):
     """Explicit causal model tree with Kimi-specific initialization and loss."""
+
+    execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
 
     decoder_structure = DecoderStructure(
         decoder="model",

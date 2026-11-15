@@ -9,6 +9,7 @@ from transformers.cache_utils import Cache
 from transformers.models.deepseek_v4 import modeling_deepseek_v4 as reference
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
+from .compression_math import compress_overlap_context_parallel
 from .indexer import DeepseekV4Indexer
 from .normalization import DeepseekV4RMSNorm
 from .overlap import assemble_overlap_windows
@@ -30,6 +31,17 @@ class DeepseekV4CSACompressor(reference.DeepseekV4CSACompressor):
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.indexer = DeepseekV4Indexer(config)
+
+    def compress_context_parallel(
+        self, hidden_states, *, exchange_windows, exchange_previous_window
+    ):
+        """Compress owned CSA windows with explicit communication callbacks."""
+        return compress_overlap_context_parallel(
+            self,
+            hidden_states,
+            exchange_windows=exchange_windows,
+            exchange_previous_window=exchange_previous_window,
+        )
 
     def forward(
         self,
@@ -112,6 +124,30 @@ class DeepseekV4HCACompressor(reference.DeepseekV4HCACompressor):
         )
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+
+    def compress_context_parallel(self, hidden_states, *, exchange_windows):
+        # Project on the source owner, then move only the features needed by each
+        # complete window. Parameter gradients remain local until DP/CP reduction.
+        projected = torch.cat(
+            (self.kv_proj(hidden_states), self.gate_proj(hidden_states)), dim=-1
+        )
+        windows, first = exchange_windows(projected, window_size=self.compress_rate)
+        kv, gate = windows.chunk(2, dim=-1)
+        gate = gate + self.position_bias.to(gate.dtype)
+        entries = self.kv_norm(
+            (kv * gate.softmax(dim=2, dtype=torch.float32).to(kv.dtype)).sum(dim=2)
+        )
+        positions = (
+            torch.arange(
+                first, first + entries.shape[1], device=entries.device, dtype=torch.long
+            )
+            * self.compress_rate
+        )
+        positions = positions.unsqueeze(0).expand(entries.shape[0], -1)
+        cos, sin = self.rotary_emb(
+            entries, position_ids=positions, layer_type=self.rope_layer_type
+        )
+        return apply_rotary_pos_emb(entries.unsqueeze(1), cos, sin), first
 
     def forward(
         self,

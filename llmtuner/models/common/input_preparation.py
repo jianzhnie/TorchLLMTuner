@@ -11,7 +11,6 @@ from typing import Any
 
 import torch
 
-from ...components.loss import next_token_targets
 from ...datasets.contracts import Batch, TrainerBatch
 from ...errors import UnsupportedCombinationError
 from ...parallel.context_parallel.input_sharding import (
@@ -21,6 +20,7 @@ from ...parallel.context_parallel.input_sharding import (
 )
 from ...parallel.topology import ParallelTopology
 from .attention.masks import build_dense_attention_mask
+from .targets import next_token_targets
 
 __all__ = ["prepare_text_inputs"]
 

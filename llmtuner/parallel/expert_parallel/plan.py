@@ -21,6 +21,12 @@ from ...models.common.moe.layer import (
     declared_expert_layout,
     declared_moe_block,
 )
+from ...models.common.moe.layout import (
+    MoERoutingBinding,
+    PackedExpertBinding,
+    resolve_moe_routing,
+    resolve_packed_experts,
+)
 from ...models.contracts import DecoderStructure, MoEBlockContract
 from ..plan import (
     FullPlanBindings,
@@ -28,13 +34,7 @@ from ..plan import (
     PlanTarget,
     validate_pipeline_targets,
 )
-from .block_conversion import (
-    MoERoutingBinding,
-    PackedExpertBinding,
-    resolve_moe_routing,
-    resolve_packed_experts,
-    validate_moe_conversion,
-)
+from .block_conversion import validate_moe_conversion
 from .model_conversion import uses_model_expert_conversion
 from .ownership import (
     conversion_roots,

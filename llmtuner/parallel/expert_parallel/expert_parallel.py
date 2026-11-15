@@ -16,11 +16,10 @@ from .domino_dispatch import DominoRoutedExperts
 from .mc2_dispatch import MC2RoutedExperts
 from .mc2_ops import validate_mc2_world_size
 from .model_replacement import swap_moe_blocks
-from .plan import resolve_ep_plan
 
 logger = get_logger(__name__)
 
-__all__ = ["apply_ep", "resolve_ep_plan"]
+__all__ = ["apply_ep"]
 
 
 def apply_ep(

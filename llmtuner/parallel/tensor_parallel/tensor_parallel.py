@@ -129,27 +129,18 @@ class GatherSequenceFirst:
         )
 
 
-def looks_like_attention(module: nn.Module) -> bool:
-    """HF attention modules hold q/k/v projections as direct attributes.
-
-    This is the site test for the boundary gather: such a module reshapes its
-    projections' outputs by the input's shape, so the gather must happen before
-    it, not inside the projections. Probed structurally rather than by class
-    name because HF spells the class differently per family (``LlamaAttention``,
-    ``Qwen3Attention``, ...).
-    """
-    return all(hasattr(module, name) for name in ("q_proj", "k_proj", "v_proj"))
-
-
 def requires_full_token_history(module: nn.Module) -> bool:
-    """Whether a recurrent attention contract needs the complete token history."""
+    """Read the model's history requirement without inferring storage semantics.
+
+    Recurrent model integrations must declare True. Absence declares no extra
+    history boundary; projection attributes do not identify an attention module.
+    """
     declared = getattr(module, "requires_full_token_history", None)
     if declared is not None:
         if type(declared) is not bool:
             raise ValueError("requires_full_token_history must be a bool")
         return declared
-    # Compatibility for external modules without an explicit declaration.
-    return all(hasattr(module, name) for name in ("conv1d", "A_log", "dt_bias"))
+    return False
 
 
 class ReplicatedAttentionSequenceBoundary:
@@ -770,6 +761,8 @@ def resolve_tp_plan(
     # model's own config is the first place the counts exist.
     structure = getattr(model, "decoder_structure", None)
     declared_attentions: set[int] | None = None
+    if structure is not None and not isinstance(structure, DecoderStructure):
+        raise TypeError("TP decoder_structure must be a DecoderStructure declaration")
     if isinstance(structure, DecoderStructure) and structure.attention is not None:
         declared_attentions = {
             id(module) for module in structure.bind_attentions(model)
@@ -780,11 +773,9 @@ def resolve_tp_plan(
             if id(module) in declared_attentions
         ]
     else:
-        attention_paths = [
-            path
-            for path, _ in model.named_modules()
-            if path.rsplit(".", 1)[-1] == "self_attn"
-        ]
+        # Explicit projection-only plans have no attention semantics. Model
+        # integrations declare their attention slots through DecoderStructure.
+        attention_paths = []
     attention_is_sharded = any(
         any(path.startswith(f"{attention}.") for attention in attention_paths)
         for path, _, _ in targets
@@ -894,9 +885,7 @@ def resolve_tp_plan(
         parent_path, _, _ = module_path.rpartition(".")
         parent = model.get_submodule(parent_path)
         is_attention = (
-            id(parent) in declared_attentions
-            if declared_attentions is not None
-            else looks_like_attention(parent)
+            declared_attentions is not None and id(parent) in declared_attentions
         )
         if spec.kind == "colwise" and is_attention:
             if spec.implementation is tp_linear.ColumnParallelLinear:

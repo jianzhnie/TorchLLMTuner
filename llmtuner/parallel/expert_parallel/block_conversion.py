@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import NamedTuple
-
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -20,12 +17,17 @@ from ...models.common.moe.experts import (
     RoutedExperts,
 )
 from ...models.common.moe.layer import MoE
+from ...models.common.moe.layout import (
+    MoERoutingBinding,
+    PackedExpertBinding,
+    resolve_moe_routing,
+    resolve_packed_experts,
+)
 from ...models.common.moe.packed_expert_execution import forward_packed_experts
 from ...models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
-from ...models.contracts import MoEBlockContract
 from .. import compatibility
 from .checkpointing import mark_experts_ep_sharded
 from .domino_dispatch import DominoRoutedExperts
@@ -41,15 +43,6 @@ from .token_dispatch import (
     materialize,
 )
 from .torchao_dispatch import TorchAOTokenDispatcher
-
-
-class PackedExpertViews(NamedTuple):
-    """Views of an explicitly declared fused gate/up expert storage."""
-
-    gate_EFD: torch.Tensor
-    up_EFD: torch.Tensor
-    down_EDF: torch.Tensor
-    num_experts: int
 
 
 class FeatureParallelMoE(MoE):
@@ -92,170 +85,6 @@ def restore_fp32_state_buffers(module: nn.Module) -> None:
             for buffer in child.buffers(recurse=False):
                 if torch.is_floating_point(buffer):
                     buffer.data = buffer.data.to(torch.float32)
-
-
-@dataclass(frozen=True, slots=True)
-class MoERoutingBinding:
-    """Model routing choices resolved before allocating replacement weights."""
-
-    source: nn.Module
-    router: nn.Module
-    shared: nn.Module | None
-    top_k: int
-    score_func: str
-    route_norm: bool
-    route_scale: float
-    num_expert_groups: int | None
-    num_limited_groups: int | None
-    shared_gate: nn.Module | None = None
-
-
-def resolve_moe_routing(block: nn.Module) -> MoERoutingBinding:
-    """Bind routing from the model-owned contract without inspecting forward."""
-    contract = getattr(block, "moe_contract", None)
-    if contract is not None:
-        if not isinstance(contract, MoEBlockContract):
-            raise TypeError("moe_contract must be a MoEBlockContract")
-        if contract.group_routing == "single_best":
-            raise NotImplementedError(
-                "EP group-limited greedy selects a single best expert per group; "
-                "the grouped dispatcher implements top-2 score summation"
-            )
-        router, _, shared = contract.bind(block)
-        return MoERoutingBinding(
-            source=block,
-            router=router,
-            shared=shared,
-            shared_gate=(
-                block._modules[contract.shared_expert_gate]
-                if contract.shared_expert_gate is not None
-                else None
-            ),
-            top_k=contract.top_k,
-            score_func=contract.score_func,
-            route_norm=contract.route_norm,
-            route_scale=contract.route_scale,
-            num_expert_groups=contract.num_expert_groups,
-            num_limited_groups=contract.num_limited_groups,
-        )
-    raise UnsupportedCombinationError(
-        "MoE conversion requires a model-owned MoEBlockContract"
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class PackedExpertBinding:
-    """Validated gate/up and down parameters; no copied or stacked storage.
-
-    Resolve after TP, and bind only to the concrete source block. Views are
-    created when conversion executes, so current parameter values are copied.
-    """
-
-    source: nn.Module
-    owner: nn.Module
-    gate_up: nn.Parameter
-    down: nn.Parameter
-    shape: tuple[int, int, int]
-
-    def validate(self, block: nn.Module) -> None:
-        """Reject replaced parameters or geometry before allocating conversion state."""
-        if (
-            block is not self.source
-            or block._modules.get("experts") is not self.owner
-            or self.owner._parameters.get("gate_up_proj") is not self.gate_up
-            or self.owner._parameters.get("down_proj") is not self.down
-            or tuple(self.gate_up.shape) != self.shape
-            or tuple(self.down.shape)
-            != (self.shape[0], self.shape[2], self.shape[1] // 2)
-        ):
-            raise ValueError("Stale EP packed expert binding")
-
-    def projections(self, block: nn.Module) -> PackedExpertViews:
-        """Create only role-specific views of the validated live parameters."""
-        self.validate(block)
-        hidden = self.shape[1] // 2
-        return PackedExpertViews(
-            self.gate_up[:, :hidden],
-            self.gate_up[:, hidden:],
-            self.down,
-            self.shape[0],
-        )
-
-
-def resolve_packed_experts(block: nn.Module, *, degree: int) -> PackedExpertBinding:
-    """Bind fused parameter storage described by the model contract."""
-    if type(degree) is not int or degree < 1:
-        raise ValueError("EP degree must be a positive integer")
-    contract = getattr(block, "moe_contract", None)
-    if contract is None:
-        raise UnsupportedCombinationError(
-            "EP packed experts require a model-owned MoEBlockContract"
-        )
-    if not isinstance(contract, MoEBlockContract):
-        raise TypeError("moe_contract must be a MoEBlockContract")
-    owner = block._modules.get("experts")
-    if owner is None:
-        raise ValueError("Declared fused experts require an experts child module")
-    gate_up = owner._parameters.get("gate_up_proj")
-    down = owner._parameters.get("down_proj")
-    if not isinstance(gate_up, nn.Parameter) or not isinstance(down, nn.Parameter):
-        raise ValueError(
-            "Declared fused experts require gate_up_proj and down_proj parameters"
-        )
-    # Validate rank before indexing geometry, including direct resolver calls.
-    if gate_up.ndim != 3 or down.ndim != 3:
-        raise ValueError("EP fused gate/up requires rank-3 expert parameters")
-    if any(
-        name == "bias" or name.endswith("_bias")
-        for name, _ in owner.named_parameters(recurse=False)
-    ):
-        raise NotImplementedError(
-            "EP grouped experts do not support expert bias vectors"
-        )
-    # Explicit contracts own mathematical restrictions. Fused tensors only
-    # produce views, never copied parameters.
-    if contract.activation != "silu":
-        raise UnsupportedCombinationError(
-            f"EP grouped experts require SiLU, but the model declares "
-            f"{contract.activation!r}; retain the native expert path"
-        )
-    num_experts = contract.num_experts
-    router, _, _ = contract.bind(block)
-    weight = router._parameters.get("weight")
-    if not isinstance(weight, nn.Parameter) or tuple(weight.shape) != (
-        num_experts,
-        gate_up.shape[2],
-    ):
-        raise ValueError(
-            "Declared MoE router weight must have shape "
-            "[num_experts, hidden_size] matching packed expert storage"
-        )
-    if len({weight.device, gate_up.device, down.device}) != 1:
-        raise UnsupportedCombinationError(
-            "Declared MoE router and experts are on different devices"
-        )
-    if tuple(gate_up.shape) != (
-        num_experts,
-        gate_up.shape[1],
-        gate_up.shape[2],
-    ) or tuple(down.shape) != (
-        num_experts,
-        down.shape[1],
-        down.shape[2],
-    ):
-        raise ValueError("Declared MoE expert count differs from packed storage")
-    if gate_up.shape[1] % 2 != 0 or tuple(down.shape[1:]) != (
-        gate_up.shape[2],
-        gate_up.shape[1] // 2,
-    ):
-        raise ValueError("Declared fused gate/up expert geometry is invalid")
-    if num_experts % degree:
-        raise ValueError(
-            f"EP degree {degree} does not divide num_experts={num_experts}"
-        )
-    if gate_up.shape[1] == 0 or gate_up.shape[2] == 0:
-        raise ValueError("EP expert dimensions must be positive")
-    return PackedExpertBinding(block, owner, gate_up, down, tuple(gate_up.shape))
 
 
 def validate_moe_conversion(

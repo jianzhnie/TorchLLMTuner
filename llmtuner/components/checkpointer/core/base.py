@@ -521,6 +521,16 @@ class BaseCheckpointManager(ABC):
                 time.monotonic() - started
             )
 
+    @property
+    def requires_close_retry(self) -> bool:
+        """Whether this manager still owns resources requiring close().
+
+        Remains true after an interrupted drain or backend cleanup failure.
+        Once resources have been released, a reported worker error does not
+        require retaining dependencies such as the training dataloader.
+        """
+        return getattr(self, "_initialized", False)
+
     def close(self) -> None:
         """Release background threads and other resources.
 

@@ -37,6 +37,7 @@ from ...configuration import (
     validate_native_execution_policy,
 )
 from ...contracts import DecoderStructure, MoEBlockContract
+from ...execution import ModelExecutionCapabilities
 from ..routing import (
     Qwen3_5MoeFP32TopKRouter,
     Qwen3_5MoeTopKRouter,
@@ -598,12 +599,15 @@ class Qwen3_5MoeTextModel(reference.Qwen3_5MoeTextModel):
 class Qwen3_5MoeForCausalLM(reference.Qwen3_5MoeForCausalLM):
     """Model-owned text LM; vision-language execution is a separate contract."""
 
+    execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
+
     decoder_structure = DecoderStructure(
         decoder="model",
         embedding="model.embed_tokens",
         blocks="model.layers",
         norm="model.norm",
         head="lm_head",
+        attention=("self_attn", "linear_attn"),
     )
 
     def _init_weights(self, module: nn.Module) -> None:

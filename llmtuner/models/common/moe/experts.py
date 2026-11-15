@@ -245,6 +245,11 @@ class GroupedExperts(nn.Module):
         ):
             left = x_TD.bfloat16()
             right = weight_EOI.bfloat16().transpose(-2, -1)
+            if x_TD.device.type == "npu":
+                # Native grouped GEMM requires 16-byte aligned operands in eager
+                # and compiled execution; contiguous storage preserves Autograd.
+                left = left.contiguous()
+                right = weight_EOI.bfloat16().contiguous().transpose(-2, -1)
             return torch._grouped_mm(left, right, offs=offsets_E).type_as(x_TD)
 
         counts = offsets_E.clone()

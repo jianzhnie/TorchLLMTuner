@@ -17,6 +17,7 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.integrations import use_experts_implementation
 from transformers.masking_utils import create_sliding_window_causal_mask
+from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.models.deepseek_v4 import modeling_deepseek_v4 as reference
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
@@ -48,6 +49,7 @@ from ...configuration import (
     validate_native_execution_policy,
 )
 from ...contracts import DecoderStructure
+from ...execution import ModelExecutionCapabilities
 from .attention import DeepseekV4Attention, validate_output_geometry
 from .compression import DeepseekV4CSACompressor, DeepseekV4HCACompressor
 from .context_parallel import deepseek_v4_cp_attention_forward
@@ -282,6 +284,53 @@ class DeepseekV4Model(HFDeepseekV4Model):
 
     context_parallel_attention_class = DeepseekV4Attention
 
+    def forward_compressor_context_parallel(
+        self,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        use_cache: bool = False,
+        past_key_values: Any = None,
+        **kwargs: Any,
+    ) -> MoeModelOutputWithPast:
+        """Stateless V4 decoder for an installed compressor CP attention stack.
+
+        Adapted from Transformers 5.9.0 DeepseekV4Model.forward (Apache-2.0).
+        Each attention owns global causal masks; the decoder never creates a cache.
+        The installer must validate layer types and coordinate input failures.
+        """
+        if use_cache or past_key_values is not None or attention_mask is not None:
+            raise ValueError(
+                "Compressor CP decoder requires stateless internally masked training"
+            )
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Provide exactly one of input_ids or inputs_embeds")
+        if position_ids is None:
+            raise ValueError("Compressor CP decoder requires global position_ids")
+        hidden = (
+            self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        )
+        position_embeddings = {
+            name: self.rotary_emb(hidden, position_ids=position_ids, layer_type=name)
+            for name in ("main", "compress")
+        }
+        hidden = (
+            hidden.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+        )
+        for layer in self.layers:
+            hidden = layer(
+                hidden,
+                position_embeddings=position_embeddings,
+                position_ids=position_ids,
+                attention_mask=None,
+                input_ids=input_ids,
+                past_key_values=None,
+                **kwargs,
+            )
+        hidden = self.norm(self.hc_head(hidden))
+        return MoeModelOutputWithPast(last_hidden_state=hidden, past_key_values=None)
+
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:
         initialize_model_weights(module, self.config.initializer_range)
@@ -407,6 +456,8 @@ class DeepseekV4Model(HFDeepseekV4Model):
 
 class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
     """Explicit DeepSeek V4 model chain with the native causal-LM contract."""
+
+    execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
 
     decoder_structure = DecoderStructure(
         decoder="model",

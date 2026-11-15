@@ -10,8 +10,6 @@ from torch.distributed.tensor import DTensor
 
 from ...accelerator.collectives import all_reduce
 from ...accelerator.distributed import get_comm_device
-from ...models.common.moe.layer import MoE
-from ...parallel.expert_parallel.npu_baseline_experts import NpuBaselineGroupedExperts
 from ...parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
 from .reductions import TrainingReductionMeshes
 from .reference_norm_layout import clip_grad_norm_
@@ -35,14 +33,16 @@ def unique_parameters(
 
 
 def expert_parameter_ids(model_parts: Iterable[torch.nn.Module]) -> set[int]:
-    """Return identities of parameters owned by routed experts."""
-    return {
-        id(parameter)
-        for part in model_parts
-        for module in part.modules()
-        if isinstance(module, MoE)
-        for parameter in module.routed_experts.inner_experts.parameters()
-    }
+    """Collect model-declared expert ownership without probing expert storage."""
+    parameter_ids: set[int] = set()
+    for part in model_parts:
+        for module in part.modules():
+            declare_parameters = getattr(module, "expert_parallel_parameters", None)
+            if callable(declare_parameters):
+                parameter_ids.update(
+                    id(parameter) for parameter in declare_parameters()
+                )
+    return parameter_ids
 
 
 def allreduce_fsdp_excluded_grads(
@@ -161,11 +161,12 @@ def grad_norm_options(
     packed_parameters = {}
     for part in model_parts:
         for module in part.modules():
-            if isinstance(module, NpuBaselineGroupedExperts):
-                pair = (module.w1_EFD, module.w3_EFD)
-                if all(parameter.grad is None for parameter in pair):
-                    continue
-                packed_parameters.setdefault(tuple(map(id, pair)), pair)
+            declare_groups = getattr(module, "gradient_norm_parameter_groups", None)
+            if callable(declare_groups):
+                for group in declare_groups():
+                    if all(parameter.grad is None for parameter in group):
+                        continue
+                    packed_parameters.setdefault(tuple(map(id, group)), group)
     return {
         "norm_precision": precision,
         "packed_parameters": list(packed_parameters.values()),

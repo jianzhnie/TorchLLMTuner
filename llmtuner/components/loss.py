@@ -5,9 +5,9 @@ by the global valid-token count. Vocab-parallel CE uses local tensors and TP
 collectives; provide both the TP group and global vocabulary size to select it
 when the logits contain a vocabulary shard.
 
-``next_token_targets`` shifts synthetic labels within rows during model
-preprocessing. Packed dataset labels are already aligned. ``vocab_shard_bounds``
-is shared by embedding and loss code to keep vocabulary ownership consistent.
+Model preprocessing aligns synthetic targets within rows; packed labels arrive
+already aligned. Vocabulary geometry is shared with embeddings through
+``utils.vocabulary``.
 Chunked CE performs backward internally; the other loss functions return tensors
 for the caller to backpropagate.
 """
@@ -20,6 +20,8 @@ import torch.distributed._functional_collectives as funcol
 import torch.nn.functional as F
 
 from ..accelerator.distributed import get_rank, get_world_size
+from ..models.common.targets import IGNORE_INDEX as IGNORE_INDEX
+from ..utils import vocabulary
 
 __all__ = [
     "IGNORE_INDEX",
@@ -27,81 +29,7 @@ __all__ = [
     "compute_logprobs",
     "cross_entropy_loss",
     "mse_loss",
-    "next_token_targets",
-    "vocab_shard_bounds",
 ]
-
-# PyTorch's default ignore index for cross-entropy loss.
-IGNORE_INDEX = -100
-
-
-def vocab_shard_bounds(
-    global_vocab_size: int, tp_world_size: int, tp_rank: int
-) -> tuple[int, int]:
-    """The ``[start, end)`` slice of the vocabulary that ``tp_rank`` owns.
-
-    One definition, used by both the vocab-parallel embedding and the
-    vocab-parallel loss. They *must* agree -- if the embedding gathers token ids
-    from one shard and the loss attributes the target log-probability to another,
-    every loss value is wrong while every shape still checks out.
-
-    The shards are even-sized except possibly the last: with ``V=10, tp=3`` the
-    chunks are ``[0,4)``, ``[4,8)``, ``[8,10)``. Every rank's start is clamped to
-    ``V`` as well as its end, so a TP degree greater than the vocabulary yields
-    empty (not negative) slices, which the callers reject explicitly.
-    """
-    if (
-        not isinstance(global_vocab_size, int)
-        or isinstance(global_vocab_size, bool)
-        or global_vocab_size < 1
-    ):
-        raise ValueError(f"global_vocab_size must be >= 1, got {global_vocab_size}")
-    if (
-        not isinstance(tp_world_size, int)
-        or isinstance(tp_world_size, bool)
-        or tp_world_size < 1
-    ):
-        raise ValueError(f"tp_world_size must be >= 1, got {tp_world_size}")
-    if (
-        not isinstance(tp_rank, int)
-        or isinstance(tp_rank, bool)
-        or not 0 <= tp_rank < tp_world_size
-    ):
-        raise ValueError(f"tp_rank {tp_rank} is outside [0, {tp_world_size})")
-    chunk_size = (global_vocab_size + tp_world_size - 1) // tp_world_size
-    start = min(global_vocab_size, chunk_size * tp_rank)
-    end = min(global_vocab_size, start + chunk_size)
-    return start, max(start, end)
-
-
-def next_token_targets(labels: torch.Tensor, *, seq_len: int) -> torch.Tensor:
-    """Shift ``labels`` into next-token targets, one document per row.
-
-    ``labels`` is the flat ``(B * T,)`` token stream and ``seq_len`` the row
-    length. The model emits ``logits[t]`` predicting ``labels[t + 1]``, and the
-    shift is therefore within a *row*, not across the flattened sequence:
-    position ``t`` of a row predicts position ``t + 1`` of that same row. The
-    last position of every row would predict the first token of the *next*
-    document, which is not a prediction the model was given context for, so it
-    is marked ``IGNORE_INDEX`` rather than dropped -- keeping the tensor
-    rectangular means the ignored entries are excluded from both the loss and
-    its denominator (``(targets != IGNORE_INDEX).sum()``), so nothing is
-    silently over- or under-counted.
-    """
-    if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 1:
-        raise ValueError(f"seq_len must be >= 1, got {seq_len}")
-    if labels.numel() % seq_len != 0:
-        raise ValueError(
-            f"next_token_targets got {labels.numel()} labels, which is not a "
-            f"whole number of rows of length {seq_len}"
-        )
-    targets = torch.full_like(labels, IGNORE_INDEX)
-    # Row r of the (B, T) layout occupies [r*T, (r+1)*T); its predictions are the
-    # positions [r*T + 1, (r+1)*T) and its targets are [r*T + 1, (r+1)*T).
-    targets = targets.reshape(-1, seq_len)
-    targets[:, :-1] = labels.reshape(-1, seq_len)[:, 1:]
-    targets = targets.reshape(labels.shape)
-    return targets
 
 
 def cross_entropy_loss(
@@ -209,7 +137,7 @@ class LossParallelCrossEntropy(torch.autograd.Function):
         # and the loss disagree about which rank owns which token.
         tp_world_size = get_world_size(tp_group)
         tp_rank = get_rank(tp_group)
-        vocab_start, vocab_end = vocab_shard_bounds(
+        vocab_start, vocab_end = vocabulary.vocab_shard_bounds(
             global_vocab_size, tp_world_size, tp_rank
         )
         if global_vocab_size < tp_world_size:

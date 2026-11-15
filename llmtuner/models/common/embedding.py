@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from ...accelerator.distributed import get_rank, get_world_size
 from ...accelerator.spmd import spmd_mesh_group
-from ...components.loss import vocab_shard_bounds
+from ...utils.vocabulary import vocab_shard_bounds
 
 __all__ = ["VocabParallelEmbedding"]
 

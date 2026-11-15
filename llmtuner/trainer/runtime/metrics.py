@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -12,6 +13,7 @@ from ...components.optimizer.adamw_swap import AdamWSwap
 from ...memory.activation_swap import activation_swap_metrics
 from ...models.common.aux_loss import collect_aux_loss_metrics
 from .reductions import TrainingReductionMeshes
+from .results import UpdateResult
 
 if TYPE_CHECKING:
     from ...parallel.topology import ParallelTopology
@@ -64,8 +66,6 @@ def build_step_metrics(
     *,
     ntokens_seen: int,
     device: torch.device,
-    parallel_dims: ParallelTopology | None,
-    model_parts: list[torch.nn.Module],
     pp_has_last_stage: bool,
     accumulated_loss: torch.Tensor,
     global_valid_tokens: torch.Tensor,
@@ -117,6 +117,21 @@ def build_step_metrics(
         "n_tokens_seen": global_ntokens_seen,
     }
     metrics.update(lr_metrics)
+    return metrics
+
+
+def collect_update_metrics(
+    result: UpdateResult,
+    *,
+    parallel_dims: ParallelTopology | None,
+    model_parts: list[torch.nn.Module],
+) -> UpdateResult:
+    """Attach post-hook auxiliary snapshots at the existing logging boundary.
+
+    Every reporting rank participates in the same reductions, including PP
+    stages without local losses. Non-reporting steps do not call this function.
+    """
+    metrics = dict(result.auxiliary_metrics)
     if parallel_dims is not None:
         metrics.update(collect_aux_loss_metrics(parallel_dims, model_parts=model_parts))
-    return metrics
+    return replace(result, auxiliary_metrics=metrics)

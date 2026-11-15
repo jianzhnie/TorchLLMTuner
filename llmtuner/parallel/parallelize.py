@@ -13,8 +13,10 @@ from model declarations.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import nullcontext
 from functools import partial
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -31,12 +33,15 @@ from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.config.training_config import validate_activation_swap_options
 
 from ..accelerator.collectives import synchronize_local_errors
+from ..components.loss_contract import LossSum
 from ..memory.activation_checkpoint import apply_ac, validate_ac_options
 from ..memory.activation_swap import apply_activation_swap
 from ..models.contracts import DecoderStructure
+from .assembly import ModelPartLayout, ParallelAssembly
 from .compatibility import chunked_loss_fsdp
 from .context_parallel.context_parallel import apply_cp
 from .context_parallel.plan import resolve_cp_plan, validate_pipeline_cp_plan
+from .execution import ExecutionLayout, resolve_execution_layout
 from .expert_parallel.expert_parallel import apply_ep
 from .expert_parallel.mc2_ops import validate_mc2_world_size
 from .expert_parallel.plan import resolve_ep_plan, validate_pipeline_ep_plan
@@ -90,16 +95,18 @@ def parallelize_model(
     region_ac: RegionACConfig | None = None,
     global_batch_size: int | None = None,
     chunked_loss_num_chunks: int = 1,
-) -> nn.Module | PipelineParallelSetup:
+    loss_sum: LossSum | None = None,
+    pipeline_schedule_factory: Callable[..., Any] | None = None,
+) -> ParallelAssembly:
     """Transform an explicit model using parallel config and training options.
 
     Compilation and activation-checkpoint options apply identically to dense
     models and PP parts. Memory-budget checkpointing requires compilation;
     region checkpointing requires the optional torch_remat dependency.
 
-    PP requires ``global_batch_size`` for microbatch validation and returns a
-    ``PipelineParallelSetup`` containing local parts, stages, and schedule.
-    Other runs return the transformed module.
+    Return a ParallelAssembly with execution objects and one layout per local
+    part. Its execution is a PipelineParallelSetup under PP, otherwise a module.
+    PP requires ``global_batch_size`` for microbatch validation.
 
     ``error_group`` names every peer that must stop on local preflight failure.
     It must include all ranks participating in subsequent transforms. Without
@@ -155,12 +162,16 @@ def parallelize_model(
         if parallel_dims.dp_cp_enabled:
             chunked_loss_fsdp(chunked_loss_num_chunks, compile=True)
 
+    layouts: list[ModelPartLayout] = []
+
     def apply_stages(
         part: nn.Module,
         *,
         dense_mesh: DeviceMesh | None,
+        execution_layout: ExecutionLayout,
         part_cfg: ParallelConfig | None = None,
         resolved_tp_plan: ParallelPlan | None = None,
+        pipeline_ownership: PipelineOwnership | None = None,
     ) -> nn.Module:
         """Bind stage options once, then transform the model in declared order."""
         fsdp_cfg = cfg if part_cfg is None else part_cfg
@@ -173,11 +184,18 @@ def parallelize_model(
             )
             else None
         )
-        tp_options = {}
+        layout = ModelPartLayout(
+            pipeline_ownership=pipeline_ownership, execution=execution_layout
+        )
+
+        def record_replacements(modules, parameters):
+            if references is not None:
+                references.record_replacements(modules, parameters)
+            layout.replacements.record_replacements(modules, parameters)
+
+        tp_options = {"on_replacement": record_replacements}
         if resolved_tp_plan is not None:
             tp_options["resolved_plan"] = resolved_tp_plan
-        if references is not None:
-            tp_options["on_replacement"] = references.record_replacements
         runners = {
             "tp": partial(
                 apply_tp,
@@ -218,17 +236,22 @@ def parallelize_model(
                 continue
             if name == "activation_swap" and not activation_swap_enabled:
                 continue
-            if name == "ep" and references is not None:
+            if name == "fsdp":
+                layout.parameter_bindings = dict(
+                    part.named_parameters(remove_duplicate=False)
+                )
+            if name == "ep":
                 # TP may already have replaced Parameters before EP's
                 # explicit split/rename mapping is emitted.
-                references = FSDPPatternReferences(part, references.bind(part))
-                part = runners[name](
-                    part, on_replacement=references.record_replacements
-                )
+                if references is not None:
+                    references = FSDPPatternReferences(part, references.bind(part))
+                part = runners[name](part, on_replacement=record_replacements)
             elif name == "fsdp" and references is not None:
                 part = runners[name](part, cfg=references.bind(part))
             else:
                 part = runners[name](part)
+        layout.refresh(part)
+        layouts.append(layout)
         return part
 
     # EP groups come from the sparse mesh in both assembly paths. Under PP
@@ -308,6 +331,16 @@ def parallelize_model(
                 resolve_tp_overrides(model, cfg=cfg)
                 global_tp_plan = resolve_tp_plan(model, cfg=cfg)
             validate_microbatches(parallel_dims, cfg, global_batch_size)
+            global_execution_layout = resolve_execution_layout(
+                model,
+                tp_size=cfg.tp_size,
+                cp_size=cfg.cp_size,
+                pipeline=True,
+                tp_plan=global_tp_plan,
+                chunked_loss=chunked_loss_num_chunks > 1,
+                compile_enabled=compile,
+                activation_swap=activation_swap and activation_checkpoint != "full",
+            )
         pipeline_ownership_plan = (
             global_tp_plan
             or global_cp_plan
@@ -398,23 +431,46 @@ def parallelize_model(
                 if cfg.fsdp_config.fsdp_apply_modules
                 else [cfg] * len(model_parts)
             )
+        with synchronize_local_errors(
+            "Pipeline execution layout validation", group=error_group
+        ):
+            execution_layouts = [
+                resolve_execution_layout(
+                    part,
+                    tp_size=cfg.tp_size,
+                    cp_size=cfg.cp_size,
+                    pipeline=True,
+                    tp_plan=tp_plan,
+                    chunked_loss=chunked_loss_num_chunks > 1,
+                    compile_enabled=compile,
+                    activation_swap=activation_swap and activation_checkpoint != "full",
+                )
+                for part, tp_plan in zip(model_parts, resolved_tp_plans, strict=True)
+            ]
         for i, part in enumerate(model_parts):
             model_parts[i] = apply_stages(
                 part,
                 dense_mesh=dense_mesh,
+                execution_layout=execution_layouts[i],
                 part_cfg=fsdp_configs[i],
                 resolved_tp_plan=resolved_tp_plans[i],
+                pipeline_ownership=local_ownership[i],
             )
             # Rebind the stage's submodule in case a transform replaced the chunk.
             stages[i].submod = model_parts[i]
-        return PipelineParallelSetup(
+        schedule_factory = (
+            build_pipeline_schedule
+            if pipeline_schedule_factory is None
+            else pipeline_schedule_factory
+        )
+        execution = PipelineParallelSetup(
             # The last stage's loss needs the same TP vocabulary as training.
-            schedule=build_pipeline_schedule(
+            schedule=schedule_factory(
                 stages,
                 cfg=cfg,
-                tp_group=None if tp_mesh is None else tp_mesh.get_group(),
-                global_vocab_size=(
-                    None if tp_mesh is None else getattr(model, "vocab_size", None)
+                loss_sum=loss_sum,
+                **global_execution_layout.loss_kwargs(
+                    None if tp_mesh is None else tp_mesh.get_group()
                 ),
             ),
             stages=stages,
@@ -422,6 +478,8 @@ def parallelize_model(
             has_first_stage=has_first_stage,
             has_last_stage=has_last_stage,
         )
+
+        return ParallelAssembly(execution, tuple(layouts))
 
     resolved_tp_plan = None
     if cfg.tp_size > 1 and mesh is not None:
@@ -431,4 +489,21 @@ def parallelize_model(
             "Tensor parallel plan validation", group=error_group
         ):
             resolved_tp_plan = resolve_tp_plan(model, cfg=cfg)
-    return apply_stages(model, dense_mesh=mesh, resolved_tp_plan=resolved_tp_plan)
+    with synchronize_local_errors("Execution layout validation", group=error_group):
+        execution_layout = resolve_execution_layout(
+            model,
+            tp_size=cfg.tp_size,
+            cp_size=cfg.cp_size,
+            pipeline=False,
+            tp_plan=resolved_tp_plan,
+            chunked_loss=chunked_loss_num_chunks > 1,
+            compile_enabled=compile,
+            activation_swap=activation_swap and activation_checkpoint != "full",
+        )
+    execution = apply_stages(
+        model,
+        dense_mesh=mesh,
+        resolved_tp_plan=resolved_tp_plan,
+        execution_layout=execution_layout,
+    )
+    return ParallelAssembly(execution, tuple(layouts))

@@ -38,6 +38,7 @@ from ..components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
 from ..components.loss import cross_entropy_loss
+from ..components.loss_contract import LossFunctions
 from ..components.metrics import MetricsProcessor
 from ..components.optimizer.ema import EMA
 from ..components.optimizer.lr_scheduler import LRSchedulersContainer
@@ -63,9 +64,11 @@ from .runtime import assembly, engine, gradients
 from .runtime import batch as batch_runtime
 from .runtime import metrics as metrics_runtime
 from .runtime import validation as validation_runtime
+from .runtime.builders import TrainingBuilders
 from .runtime.environment import build_runtime_environment
 from .runtime.progress import TrainingProgress
 from .runtime.reductions import resolve_training_reduction_meshes
+from .runtime.results import StepResult
 from .runtime.training_observer import TrainingObserver, install_dispatch_timers
 
 # Rank-aware: the helper attaches a handler whose filter passes below-ERROR
@@ -130,8 +133,11 @@ class Trainer:
     def ntokens_seen(self, value: int) -> None:
         self.progress.ntokens_seen = value
 
-    def __init__(self, cfg: LLMTunerConfig):
+    def __init__(
+        self, cfg: LLMTunerConfig, *, builders: TrainingBuilders | None = None
+    ):
         """Build runtime services in lifecycle order, cleaning up partial failures."""
+        self._builders = builders
         compile_settings = nullcontext()
         if getattr(getattr(cfg, "training", None), "compile", False):
             compile_settings = rollback_compile_settings_on_error()
@@ -174,13 +180,34 @@ class Trainer:
         error_group = environment.error_group
         self.error_group = error_group
 
-        prepared_model = assembly.prepare_parallel_model(cfg, environment=environment)
+        factories = getattr(self, "_builders", None) or TrainingBuilders()
+        loss_functions = None
+        with synchronize_local_errors("Loss services construction", group=error_group):
+            if factories.loss is not None:
+                loss_functions = factories.loss(cfg)
+                if not isinstance(loss_functions, LossFunctions):
+                    raise TypeError("Loss factory must return LossFunctions")
+                if (
+                    cfg.training.chunked_loss_num_chunks > 1
+                    and loss_functions.chunked_backward is None
+                ):
+                    raise ValueError(
+                        "Injected loss must explicitly support chunked backward"
+                    )
+        prepared_model = assembly.prepare_parallel_model(
+            cfg,
+            environment=environment,
+            loss_functions=loss_functions,
+            pipeline_schedule_factory=factories.pipeline_schedule,
+        )
         model_assembly = prepared_model.assembly
         self.model = model_assembly.model
         self.model_parts = model_assembly.model_parts
         optimizer_stack = assembly.build_optimizer_stack(
             cfg,
             model_parts=model_assembly.model_parts,
+            layouts=model_assembly.layouts,
+            builders=getattr(self, "_builders", None),
             parallel_dims=environment.parallel_dims,
             error_group=error_group,
         )
@@ -195,6 +222,7 @@ class Trainer:
             device=environment.device,
             param_context=self.param_context,
             loss_sum=self.loss_sum,
+            loss_functions=loss_functions,
             error_group=error_group,
         )
 
@@ -218,6 +246,7 @@ class Trainer:
             device=environment.device,
             parallel_dims=environment.parallel_dims,
             error_group=error_group,
+            builders=getattr(self, "_builders", None),
         )
 
         self.metrics = assembly.build_metrics_processor(
@@ -227,6 +256,7 @@ class Trainer:
             num_parameters=prepared_model.num_parameters,
             num_trainable_parameters=prepared_model.num_trainable_parameters,
             error_group=error_group,
+            builders=getattr(self, "_builders", None),
         )
         self.training_observer = TrainingObserver(
             self.metrics, environment.device, group=error_group
@@ -315,10 +345,12 @@ class Trainer:
         microbatch: dict[str, Any],
         *,
         global_valid_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        """Delegate one accumulation group and return its unnormalized loss sum."""
+    ) -> StepResult:
+        """Delegate one accumulation group and return its structured result."""
         return self.training_engine.forward_backward(
-            microbatch["batch"], global_valid_tokens=global_valid_tokens
+            microbatch["batch"],
+            global_valid_tokens=global_valid_tokens,
+            valid_tokens=microbatch["num_valid_tokens"],
         )
 
     @staticmethod
@@ -499,9 +531,10 @@ class Trainer:
                 is_last = not microbatches
                 for part in self.model_parts:
                     part.set_requires_all_reduce(is_last)
-            detached_loss = self.forward_backward_step(
+            step_result = self.forward_backward_step(
                 microbatch, global_valid_tokens=global_valid_tokens
             )
+            detached_loss = step_result.loss_sum
             del microbatch
             local_loss = (
                 detached_loss.to_local()
@@ -545,7 +578,10 @@ class Trainer:
             if should_log
             else {}
         )
-        self.training_engine.optimizer_step(self.step)
+        update_result = self.training_engine.optimizer_step(
+            self.step, grad_norm=grad_norm, auxiliary_metrics=routing_metrics
+        )
+        grad_norm = update_result.grad_norm
 
         if not should_log:
             return None
@@ -559,8 +595,6 @@ class Trainer:
         result = metrics_runtime.build_step_metrics(
             ntokens_seen=self.ntokens_seen,
             device=self.device,
-            parallel_dims=self.parallel_dims,
-            model_parts=self.model_parts,
             pp_has_last_stage=self.training_engine.pp_has_last_stage,
             accumulated_loss=accumulated_loss,
             global_valid_tokens=global_valid_tokens,
@@ -570,7 +604,12 @@ class Trainer:
             grad_norm=grad_norm,
             lr_metrics=lr_metrics,
         )
-        result.update(routing_metrics)
+        update_result = metrics_runtime.collect_update_metrics(
+            update_result,
+            parallel_dims=self.parallel_dims,
+            model_parts=self.model_parts,
+        )
+        result.update(update_result.auxiliary_metrics)
         with synchronize_local_errors(
             "Training resource observation", group=self.error_group
         ):
@@ -642,19 +681,6 @@ class Trainer:
     def should_continue_training(self) -> bool:
         return self.step < self.cfg.steps
 
-    # -- checkpoint state -------------------------------------------------------
-    # Compatibility API: the manager owns the same progress object directly.
-
-    def state_dict(self) -> dict[str, Any]:
-        return self.progress.state_dict()
-
-    def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Validate checkpoint counters without changing the current run."""
-        self.progress.validate_state_dict(state_dict)
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.progress.load_state_dict(state_dict)
-
     # -- the loop ---------------------------------------------------------------
 
     def train(self) -> None:
@@ -694,8 +720,12 @@ class Trainer:
                 with synchronize_local_errors(
                     "Training profiler initialization", group=self.error_group
                 ):
+                    factories = getattr(self, "_builders", None) or TrainingBuilders()
+                    profiler_factory = (
+                        Profiler if factories.profiler is None else factories.profiler
+                    )
                     profiler = stack.enter_context(
-                        Profiler(
+                        profiler_factory(
                             self.cfg.profiler,
                             global_step=self.step,
                             base_folder=self.cfg.dump_folder,
@@ -850,8 +880,19 @@ class Trainer:
         interrupted checkpoint drain may still reference it.
         """
         first_error: BaseException | None = None
-        for name in ("checkpointer", "metrics", "dataloader", "gc_handler"):
-            if name == "dataloader" and getattr(self, "checkpointer", None) is not None:
+        for name in (
+            "checkpointer",
+            "metrics",
+            "dataloader",
+            "ema",
+            "lr_scheduler",
+            "optimizer",
+            "gc_handler",
+        ):
+            if (
+                name in ("dataloader", "ema", "lr_scheduler", "optimizer")
+                and getattr(self, "checkpointer", None) is not None
+            ):
                 # A failed initialized checkpointer is retained below for a
                 # retry. Its in-flight staging/writes may still own loader
                 # state; closing the source now violates that dependency.
@@ -859,12 +900,17 @@ class Trainer:
             resource = getattr(self, name, None)
             if resource is None:
                 continue
+            close = getattr(resource, "close", None)
+            if name in ("ema", "lr_scheduler", "optimizer") and not callable(close):
+                # Ordinary tensor-only services have no shutdown operation.
+                continue
             setattr(self, name, None)
             try:
-                resource.close()
+                close()
             except BaseException as error:
-                if name in ("metrics", "dataloader", "gc_handler") or (
-                    name == "checkpointer" and getattr(resource, "_initialized", False)
+                if name != "checkpointer" or (
+                    name == "checkpointer"
+                    and getattr(resource, "requires_close_retry", False)
                 ):
                     # Failed sinks, loader/GC owners, and interrupted checkpoint
                     # waits may retain resources. Keep their owner for a retry.

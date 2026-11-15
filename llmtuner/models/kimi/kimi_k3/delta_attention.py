@@ -248,128 +248,127 @@ class KimiDeltaAttention(nn.Module):
         output = self.o_norm(output, gate)
         return self.o_proj(output.reshape(batch, length, -1))
 
+    def forward_context_parallel(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        context: Any,
+        causal_conv1d: Callable[..., Any],
+        chunk_kda: Callable[..., Any],
+    ) -> torch.Tensor:
+        """Evaluate Kimi KDA mathematics with an already validated CP context.
 
-def forward_context_parallel_kda(
-    module: KimiDeltaAttention,
-    hidden_states: torch.Tensor,
-    *,
-    context: Any,
-    causal_conv1d: Callable[..., Any],
-    chunk_kda: Callable[..., Any],
-) -> torch.Tensor:
-    """Evaluate Kimi KDA mathematics with an already validated CP context.
+        The parallel adapter coordinates validation and constructs the CP context.
+        Kernels are explicit dependencies so this model module does not import the
+        distributed adapter or select a different numerical backend. Retain the CP
+        kernel's gate, beta and state conventions; the local forward is separate.
 
-    The parallel adapter owns shape/topology checks and context construction.
-    Kernels are explicit dependencies so this model module does not import the
-    distributed adapter or select a different numerical backend. Retain the CP
-    kernel's gate, beta and state conventions; the local forward is separate.
+        Moved from the Huawei 2026 Apache-2.0 KCP adapter, preserving operation order.
+        """
+        batch, local_sequence, _ = hidden_states.shape
+        lower_bound = self.gate_lower_bound
 
-    Moved from the Huawei 2026 Apache-2.0 KCP adapter, preserving operation order.
-    """
-    batch, local_sequence, _ = hidden_states.shape
-    lower_bound = module.gate_lower_bound
+        def project(name: str) -> torch.Tensor:
+            projection = getattr(self, f"{name}_proj")(hidden_states)
+            convolution = getattr(self, f"{name}_conv1d")
+            result = causal_conv1d(
+                x=projection,
+                weight=convolution.weight.squeeze(1),
+                bias=convolution.bias,
+                activation=convolution.activation,
+                initial_state=None,
+                output_final_state=False,
+                cp_context=context,
+            )
+            return result[0] if isinstance(result, tuple) else result
 
-    def project(name: str) -> torch.Tensor:
-        projection = getattr(module, f"{name}_proj")(hidden_states)
-        convolution = getattr(module, f"{name}_conv1d")
-        result = causal_conv1d(
-            x=projection,
-            weight=convolution.weight.squeeze(1),
-            bias=convolution.bias,
-            activation=convolution.activation,
+        query, key, value = (project(name) for name in ("q", "k", "v"))
+        decay = self.f_b_proj(self.f_a_proj(hidden_states))
+        beta = self.b_proj(hidden_states).float().sigmoid()
+        query = query.view(batch, local_sequence, self.num_heads, self.head_k_dim)
+        key = key.view(batch, local_sequence, self.num_heads, self.head_k_dim)
+        value = value.view(batch, local_sequence, self.num_heads, self.head_dim)
+        decay = decay.view(batch, local_sequence, self.num_heads, self.head_k_dim)
+        beta = beta.view(batch, local_sequence, self.num_heads)
+        output = chunk_kda(
+            q=query,
+            k=key,
+            v=value,
+            g=decay,
+            beta=beta,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
             initial_state=None,
             output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=False,
+            safe_gate=lower_bound is not None,
+            lower_bound=lower_bound,
+            state_v_first=False,
+            disable_recompute=getattr(self.config, "skip_kda_recompute", False),
             cp_context=context,
         )
-        return result[0] if isinstance(result, tuple) else result
+        output = output[0] if isinstance(output, tuple) else output
+        gate = (
+            self.g_proj(hidden_states)
+            if self.use_full_rank_gate
+            else self.g_b_proj(self.g_a_proj(hidden_states))
+        ).view(batch, local_sequence, self.num_heads, self.head_dim)
+        output = self.o_norm(output, gate)
+        output = self.o_proj(output.reshape(batch, local_sequence, -1))
+        return output
 
-    query, key, value = (project(name) for name in ("q", "k", "v"))
-    decay = module.f_b_proj(module.f_a_proj(hidden_states))
-    beta = module.b_proj(hidden_states).float().sigmoid()
-    query = query.view(batch, local_sequence, module.num_heads, module.head_k_dim)
-    key = key.view(batch, local_sequence, module.num_heads, module.head_k_dim)
-    value = value.view(batch, local_sequence, module.num_heads, module.head_dim)
-    decay = decay.view(batch, local_sequence, module.num_heads, module.head_k_dim)
-    beta = beta.view(batch, local_sequence, module.num_heads)
-    output = chunk_kda(
-        q=query,
-        k=key,
-        v=value,
-        g=decay,
-        beta=beta,
-        A_log=module.A_log,
-        dt_bias=module.dt_bias,
-        initial_state=None,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=False,
-        safe_gate=lower_bound is not None,
-        lower_bound=lower_bound,
-        state_v_first=False,
-        disable_recompute=getattr(module.config, "skip_kda_recompute", False),
-        cp_context=context,
-    )
-    output = output[0] if isinstance(output, tuple) else output
-    gate = (
-        module.g_proj(hidden_states)
-        if module.use_full_rank_gate
-        else module.g_b_proj(module.g_a_proj(hidden_states))
-    ).view(batch, local_sequence, module.num_heads, module.head_dim)
-    output = module.o_norm(output, gate)
-    output = module.o_proj(output.reshape(batch, local_sequence, -1))
-    return output
+    def validate_context_parallel_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None,
+        cache_params: Any,
+        cu_seqlens: torch.Tensor | None,
+    ) -> int:
+        """Validate local Kimi KCP input/geometry and return convolution width.
 
-
-def validate_context_parallel_kda(
-    module: KimiDeltaAttention,
-    hidden_states: torch.Tensor,
-    *,
-    attention_mask: torch.Tensor | None,
-    cache_params: Any,
-    cu_seqlens: torch.Tensor | None,
-) -> int:
-    """Validate local Kimi KCP input/geometry and return convolution width.
-
-    No collectives or mutation: the parallel adapter coordinates errors before
-    exchanging metadata or constructing the recurrent communication context.
-    """
-    if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
-        raise ValueError("KCP KDA requires [1, local_sequence, hidden] input")
-    if hidden_states.shape[1] == 0:
-        raise ValueError("KCP KDA requires a nonempty local sequence")
-    if cache_params is not None or cu_seqlens is not None:
-        raise ValueError("KCP KDA does not support cache or packed cu_seqlens")
-    if attention_mask is not None and (
-        attention_mask.shape != hidden_states.shape[:2]
-        or attention_mask.device != hidden_states.device
-    ):
-        raise ValueError(
-            "KCP attention_mask must match the local [1, sequence] "
-            "shape and input device"
-        )
-    if attention_mask is not None and not torch.all(attention_mask == 1):
-        raise ValueError(
-            "KCP KDA does not yet support padding: zeroing padded tokens "
-            "does not preserve compacted convolution/recurrent state"
-        )
-    kernel_size = module.q_conv1d.weight.size(-1)
-    if kernel_size <= 1:
-        raise ValueError(
-            f"KCP KDA convolution kernel size must be greater than 1; got {kernel_size}"
-        )
-    if module.head_k_dim > 256:
-        raise ValueError(
-            f"KCP KDA key head dimension must be at most 256; got {module.head_k_dim}"
-        )
-    lower_bound = module.gate_lower_bound
-    if lower_bound is not None and not -5 <= lower_bound < 0:
-        raise ValueError(
-            f"KCP KDA gate lower bound must be in [-5, 0); got {lower_bound}"
-        )
-    if any(
-        getattr(module, f"{name}_conv1d").weight.size(-1) != kernel_size
-        for name in ("k", "v")
-    ):
-        raise ValueError("KCP KDA requires matching Q/K/V convolution kernels")
-    return kernel_size
+        No collectives or mutation: the parallel adapter coordinates errors before
+        exchanging metadata or constructing the recurrent communication context.
+        """
+        if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+            raise ValueError("KCP KDA requires [1, local_sequence, hidden] input")
+        if hidden_states.shape[1] == 0:
+            raise ValueError("KCP KDA requires a nonempty local sequence")
+        if cache_params is not None or cu_seqlens is not None:
+            raise ValueError("KCP KDA does not support cache or packed cu_seqlens")
+        if attention_mask is not None and (
+            attention_mask.shape != hidden_states.shape[:2]
+            or attention_mask.device != hidden_states.device
+        ):
+            raise ValueError(
+                "KCP attention_mask must match the local [1, sequence] "
+                "shape and input device"
+            )
+        if attention_mask is not None and not torch.all(attention_mask == 1):
+            raise ValueError(
+                "KCP KDA does not yet support padding: zeroing padded tokens "
+                "does not preserve compacted convolution/recurrent state"
+            )
+        kernel_size = self.q_conv1d.weight.size(-1)
+        if kernel_size <= 1:
+            raise ValueError(
+                "KCP KDA convolution kernel size must be greater than 1; "
+                f"got {kernel_size}"
+            )
+        if self.head_k_dim > 256:
+            raise ValueError(
+                f"KCP KDA key head dimension must be at most 256; got {self.head_k_dim}"
+            )
+        lower_bound = self.gate_lower_bound
+        if lower_bound is not None and not -5 <= lower_bound < 0:
+            raise ValueError(
+                f"KCP KDA gate lower bound must be in [-5, 0); got {lower_bound}"
+            )
+        if any(
+            getattr(self, f"{name}_conv1d").weight.size(-1) != kernel_size
+            for name in ("k", "v")
+        ):
+            raise ValueError("KCP KDA requires matching Q/K/V convolution kernels")
+        return kernel_size

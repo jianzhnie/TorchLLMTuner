@@ -34,17 +34,6 @@ from .compression_windows import (
     select_csa_windows,
 )
 
-try:
-    from ...models.deepseek.deepseek_v4.context_parallel import (
-        compressor_attention_math,
-    )
-    from ...models.deepseek.deepseek_v4.context_parallel import (
-        compressor_decoder_forward as compressor_decoder_forward,
-    )
-except ImportError as error:
-    compressor_attention_math = compressor_decoder_forward = None
-    DEEPSEEK_IMPORT_ERROR = error
-
 
 def compressor_ulysses_attention(
     query,
@@ -209,10 +198,6 @@ def compressor_attention_forward(group):
         past_key_values=None,
         **kwargs,
     ):
-        if compressor_attention_math is None:
-            raise ImportError(
-                "DeepSeek V4 CP requires a compatible transformers build"
-            ) from DEEPSEEK_IMPORT_ERROR
         with synchronize_local_errors(
             "Compressor module input validation", group=group
         ):
@@ -235,8 +220,7 @@ def compressor_attention_forward(group):
                 raise ValueError(
                     "Compressor CP requires contiguous global position_ids"
                 )
-        return compressor_attention_math(
-            module,
+        return module.forward_compressor_context_parallel(
             hidden_states,
             position_embeddings,
             position_ids,
@@ -370,10 +354,11 @@ def apply_compressor_context_parallel(
             raise ValueError("Compressor CP plan must cover its declared decoder slots")
     decoder = plan.targets[0].module
     attentions = [target.module for target in plan.targets[1:]]
-    if compressor_attention_math is None or compressor_decoder_forward is None:
-        raise ImportError(
-            "DeepSeek V4 CP requires a compatible transformers build"
-        ) from DEEPSEEK_IMPORT_ERROR
+    if any(
+        not callable(getattr(target, "forward_compressor_context_parallel", None))
+        for target in (decoder, *attentions)
+    ):
+        raise TypeError("Compressor CP requires model-owned forward interfaces")
     group = cp_mesh.get_group()
     pending = [
         (
@@ -382,7 +367,7 @@ def apply_compressor_context_parallel(
         )
         for attention in attentions
     ]
-    decoder_forward = MethodType(compressor_decoder_forward, decoder)
+    decoder_forward = decoder.forward_compressor_context_parallel
     for attention, forward in pending:
         attention.forward = forward
     decoder.forward = decoder_forward

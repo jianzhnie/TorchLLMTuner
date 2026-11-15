@@ -193,6 +193,7 @@ for (
     _model_name,
     _state_module,
     _state_name,
+    _task,
 ) in (
     (
         "kimi_linear",
@@ -202,6 +203,7 @@ for (
         "KimiLinearForCausalLM",
         ".kimi.kimi_k3.checkpoint",
         "KimiStateFormat",
+        "causal_lm",
     ),
     (
         "qwen3_moe",
@@ -211,6 +213,7 @@ for (
         "Qwen3MoeForCausalLM",
         ".qwen.qwen3.state",
         "Qwen3StateFormat",
+        "causal_lm",
     ),
     (
         "deepseek_v4",
@@ -220,6 +223,7 @@ for (
         "DeepseekV4ForCausalLM",
         None,
         None,
+        "causal_lm",
     ),
     (
         "qwen3_5_moe_text",
@@ -229,6 +233,37 @@ for (
         "Qwen3_5MoeForCausalLM",
         None,
         None,
+        "causal_lm",
+    ),
+    (
+        "kimi_k3",
+        ".kimi.kimi_k3.configuration",
+        "KimiK3Config",
+        ".kimi.kimi_k3.multimodal",
+        "KimiK3ForConditionalGeneration",
+        None,
+        None,
+        "conditional_generation",
+    ),
+    (
+        "qwen3_5",
+        "transformers.models.qwen3_5.configuration_qwen3_5",
+        "Qwen3_5Config",
+        ".qwen.qwen3_5.multimodal",
+        "Qwen3_5ForConditionalGeneration",
+        None,
+        None,
+        "conditional_generation",
+    ),
+    (
+        "qwen3_5_moe",
+        "transformers.models.qwen3_5_moe.configuration_qwen3_5_moe",
+        "Qwen3_5MoeConfig",
+        ".qwen.qwen3_5_moe.multimodal",
+        "Qwen3_5MoeForConditionalGeneration",
+        None,
+        None,
+        "conditional_generation",
     ),
 ):
     _config_loader = partial(_load_class, _config_module, _config_name)
@@ -247,43 +282,7 @@ for (
                 if _state_module is not None
                 else None
             ),
-            explicit=True,
-        )
-    )
-
-
-# Composite construction is explicit-only; causal-LM lookup must not select it.
-for _model_type, _config_module, _config_name, _model_module, _model_name in (
-    (
-        "kimi_k3",
-        ".kimi.kimi_k3.configuration",
-        "KimiK3Config",
-        ".kimi.kimi_k3.multimodal",
-        "KimiK3ForConditionalGeneration",
-    ),
-    (
-        "qwen3_5",
-        "transformers.models.qwen3_5.configuration_qwen3_5",
-        "Qwen3_5Config",
-        ".qwen.qwen3_5.multimodal",
-        "Qwen3_5ForConditionalGeneration",
-    ),
-    (
-        "qwen3_5_moe",
-        "transformers.models.qwen3_5_moe.configuration_qwen3_5_moe",
-        "Qwen3_5MoeConfig",
-        ".qwen.qwen3_5_moe.multimodal",
-        "Qwen3_5MoeForConditionalGeneration",
-    ),
-):
-    _config_loader = partial(_load_class, _config_module, _config_name)
-    register_model(
-        ModelSpec(
-            _model_type,
-            config_factory=partial(_build_config, _config_loader),
-            config_type_loader=_config_loader,
-            model_class_loader=partial(_load_class, _model_module, _model_name),
-            task="conditional_generation",
+            task=_task,
             explicit=True,
         )
     )
