@@ -14,7 +14,7 @@ from torch import nn
 
 from ...config.parallel_config import ParallelConfig
 from ..module_patterns import module_name_matches, resolve_module_patterns
-from .linear import ColumnParallelLinear, RowParallelLinear, ShardedLinear
+from .linear import ColumnParallelLinear, RowParallelLinear
 
 ShardKind = Literal["colwise", "rowwise"]
 MOE_PLAN_SPECS = frozenset({"packed_colwise", "packed_rowwise", "moe_tp_experts"})
@@ -29,8 +29,10 @@ class ShardingConfig:
         implementation: the module class that realizes this declaration. Paired
             here rather than looked up from ``kind`` so a caller can swap in a
             different realizer (e.g. a fused-QKV variant) without touching the
-            engine. The realizer must register exactly one parameter, weight,
-            with the declared shard shape and unchanged dtype/device/trainability.
+            engine. Every realizer declares shard_dim and sequence_transform on
+            its class and preserves them on the instance. It must register exactly
+            one parameter, weight, with the declared shard shape and unchanged
+            dtype/device/trainability.
         sequence_transform: whether the projection gathers, scatters or retains
             its input token rows. Weight shard direction alone does not specify
             the activation layout, especially for attention-local projections.
@@ -49,20 +51,31 @@ class ShardingConfig:
             self.implementation, nn.Module
         ):
             raise TypeError("TP projection implementation must be an nn.Module class")
-        if issubclass(self.implementation, ShardedLinear):
-            if getattr(self.implementation, "shard_dim", None) != (
-                0 if self.kind == "colwise" else 1
-            ):
-                raise ValueError(
-                    "TP shard kind disagrees with projection implementation"
-                )
-            if (
-                getattr(self.implementation, "sequence_transform", None)
-                != self.sequence_transform
-            ):
-                raise ValueError(
-                    "TP sequence transform disagrees with projection implementation"
-                )
+        self.validate_implementation(self.implementation)
+
+    def validate_implementation(
+        self, implementation: type[nn.Module] | nn.Module
+    ) -> None:
+        """Require the same explicit layout declaration for every realizer.
+
+        Class declarations are checked before construction; instance declarations
+        are checked before installing replacements. This verifies the contract,
+        not the numerical correctness of a custom forward implementation.
+        """
+        if implementation is not self.implementation and not isinstance(
+            implementation, self.implementation
+        ):
+            raise TypeError("TP constructor returned a different projection type")
+        dim = getattr(implementation, "shard_dim", None)
+        if type(dim) is not int or dim != (0 if self.kind == "colwise" else 1):
+            raise ValueError("TP shard kind disagrees with projection implementation")
+        if (
+            getattr(implementation, "sequence_transform", None)
+            != self.sequence_transform
+        ):
+            raise ValueError(
+                "TP sequence transform disagrees with projection implementation"
+            )
 
 
 def colwise() -> ShardingConfig:

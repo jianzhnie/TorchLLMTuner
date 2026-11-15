@@ -61,6 +61,7 @@ class MemoryProfiler:
     """Writes periodic allocator snapshots while training runs.
 
     Built by :meth:`Profiler.build_memory_profiler` when snapshots are enabled.
+    Standalone callers must retain this instance before calling :meth:`start`.
     Call :meth:`step` once per iteration; the frequency is checked here rather
     than by the caller, so the loop does not have to know the policy.
     """
@@ -87,30 +88,54 @@ class MemoryProfiler:
             if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
         self._max_entries = max_entries
-        with self._history_lock:
-            if any(owner._max_entries != max_entries for owner in self._history_owners):
-                raise ValueError(
-                    "Overlapping memory profilers require identical max_entries"
-                )
-            self._records_history = bool(self._history_owners) or record_memory_history(
-                max_entries=max_entries
-            )
-            if self._records_history:
-                self._history_owners.add(self)
-        if not self._records_history:
-            # Not an error: the device has no allocator history to keep. Said
-            # once, at the point the run asked for snapshots, rather than
-            # silently writing empty files for the rest of the run.
-            logger.warning(
-                "Memory snapshots are enabled but the %s allocator keeps no "
-                "memory history; no snapshots will be written.",
-                device_type,
-            )
+        self._records_history = False
+        self._history_ready = False
+        self._start_attempted = False
         self.step_num = step_num
         self.freq = freq
         self._snapshot_dir = snapshot_dir
         self._leaf_folder = leaf_folder
         self._rank = rank
+
+    def start(self) -> MemoryProfiler:
+        """Start after the caller owns this instance, retaining failed startup.
+
+        A backend can enable history before raising. Register ownership before
+        invoking it, so close can stop that partial recorder or retry shutdown.
+        """
+        with self._history_lock:
+            if self._start_attempted:
+                raise RuntimeError(
+                    "Memory profiler was already started; create a new one"
+                )
+            if any(
+                owner._max_entries != self._max_entries
+                for owner in self._history_owners
+            ):
+                raise ValueError(
+                    "Overlapping memory profilers require identical max_entries"
+                )
+            if any(not owner._history_ready for owner in self._history_owners):
+                raise RuntimeError(
+                    "Memory history startup failed; close its owner first"
+                )
+            self._start_attempted = True
+            existing = bool(self._history_owners)
+            self._records_history = True
+            self._history_owners.add(self)
+            if not existing and not record_memory_history(
+                max_entries=self._max_entries
+            ):
+                self._history_owners.discard(self)
+                self._records_history = False
+            self._history_ready = self._records_history
+        if not self._records_history:
+            logger.warning(
+                "Memory snapshots are enabled but the %s allocator keeps no "
+                "memory history; no snapshots will be written.",
+                device_type,
+            )
+        return self
 
     def step(self, *, exit_ctx: bool = False) -> None:
         """Write a snapshot if this iteration calls for one.
@@ -124,8 +149,10 @@ class MemoryProfiler:
         snapshot directory on the OOM path, where the frequency check below is
         deliberately bypassed. Upstream writes the file unconditionally.
         """
+        if not self._start_attempted:
+            raise RuntimeError("Memory profiler must be started before step")
         self.step_num += 1
-        if not self._records_history:
+        if not self._history_ready:
             return
         if not exit_ctx and self.step_num % self.freq != 0:
             return
@@ -174,6 +201,8 @@ class MemoryProfiler:
                     stop_memory_history()
                 self._history_owners.discard(self)
                 self._records_history = False
+                self._history_ready = False
+            self._start_attempted = True
 
 
 def profiler_activities(profiler_api: Any) -> list[Any]:
@@ -405,9 +434,11 @@ class Profiler:
     def build_memory_profiler(self) -> MemoryProfiler | None:
         """Create a :class:`MemoryProfiler`, or ``None`` if snapshots are off.
 
-        Its constructor starts recording immediately; that is why this is built
-        on entry rather than at the first dump.
+        Transfer ownership before starting allocator history, so failed startup
+        is cleaned up by the same exit/retry path as a completed profiler.
         """
+        if self.memory_profiler is not None:
+            raise RuntimeError("Memory profiler cleanup is pending; close it first")
         cfg = self._config
         if not cfg.enable_memory_snapshot:
             return None
@@ -431,7 +462,7 @@ class Profiler:
         logger.info(
             "Memory profiler active. Snapshots will be saved at %s", snapshot_dir
         )
-        return MemoryProfiler(
+        memory = MemoryProfiler(
             step_num=self._global_step,
             freq=freq,
             snapshot_dir=snapshot_dir,
@@ -439,6 +470,9 @@ class Profiler:
             rank=rank,
             max_entries=cfg.memory_snapshot_max_entries,
         )
+        self.memory_profiler = memory
+        memory.start()
+        return memory
 
 
 def caused_by_oom(exc: BaseException | None) -> bool:

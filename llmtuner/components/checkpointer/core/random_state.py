@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pickle
 import random
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -16,6 +17,7 @@ import torch
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ....accelerator.distributed import get_rank, get_world_size
+from ....parallel.topology import ParallelTopologySnapshot
 
 if TYPE_CHECKING:
     from ....parallel.topology import ParallelTopology
@@ -25,36 +27,34 @@ class RNGCheckpointState(Stateful):
     """Save Python, NumPy, CPU and this rank's selected device generators."""
 
     def __init__(
-        self, device: torch.device, *, topology: ParallelTopology | None = None
+        self,
+        device: torch.device,
+        *,
+        topology: ParallelTopology | ParallelTopologySnapshot | None = None,
     ) -> None:
         self.device = device
         self.rank = get_rank()
         self.world_size = get_world_size()
         self.key = f"rank_{self.rank}"
-        self.parallel_degrees = (
-            None
-            if topology is None
-            else {
-                name: getattr(topology, name)
-                for name in (
-                    "dp_replicate",
-                    "dp_shard",
-                    "cp",
-                    "tp",
-                    "pp",
-                    "ep",
-                    "cp_kv",
-                    "cp_ulysses",
-                )
-            }
+        self.topology = (
+            None if topology is None else ParallelTopologySnapshot.capture(topology)
         )
+        if self.topology is not None and self.topology.world_size != self.world_size:
+            raise ValueError("RNG topology world size differs from the runtime")
+
+    def _parallel_degrees(self) -> dict[str, int] | None:
+        if self.topology is None:
+            return None
+        degrees = asdict(self.topology)
+        del degrees["world_size"]  # Stored independently in the per-rank payload.
+        return degrees
 
     def state_dict(self) -> dict[str, Any]:
         state = {
             "version": 1,
             "world_size": self.world_size,
             "device_type": self.device.type,
-            "parallel_degrees": self.parallel_degrees,
+            "parallel_degrees": self._parallel_degrees(),
             "python": random.getstate(),
             "numpy": np.random.get_state(),
             "cpu": torch.get_rng_state(),
@@ -66,12 +66,10 @@ class RNGCheckpointState(Stateful):
         }
         return {self.key: pickle.dumps(state, protocol=4)}
 
-    def validate_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any] | None:
+    def validate_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Validate a saved stream without changing any live generator."""
         if not isinstance(state_dict, dict):
             raise ValueError("RNG checkpoint state must be a dictionary")
-        if not state_dict:
-            return
         state = pickle.loads(state_dict[self.key])
         if not isinstance(state, dict):
             raise ValueError("RNG checkpoint payload must be a dictionary")
@@ -90,7 +88,7 @@ class RNGCheckpointState(Stateful):
             raise ValueError(
                 "RNG checkpoint device type changed; exclude rng_state from loading"
             )
-        saved_degrees = state.get("parallel_degrees")
+        saved_degrees = state["parallel_degrees"]
         valid_degrees = saved_degrees is None or (
             isinstance(saved_degrees, dict)
             and all(
@@ -98,7 +96,7 @@ class RNGCheckpointState(Stateful):
                 for value in saved_degrees.values()
             )
         )
-        if not valid_degrees or saved_degrees != self.parallel_degrees:
+        if not valid_degrees or saved_degrees != self._parallel_degrees():
             raise ValueError(
                 "RNG checkpoint parallel topology changed or is missing; exclude "
                 "rng_state from loading to resume without exact stream continuity"
@@ -111,8 +109,6 @@ class RNGCheckpointState(Stateful):
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         state = self.validate_state_dict(state_dict)
-        if state is None:
-            return
         if self.device.type != "cpu":
             module = torch.get_device_module(self.device)
             module.set_rng_state(state["device"], self.device)

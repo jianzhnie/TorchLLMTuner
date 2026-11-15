@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import torch
 from torch.distributed import ProcessGroup
+from torch.utils._pytree import tree_map_only
 
 from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...accelerator.distributed import get_comm_device, get_world_size
@@ -229,18 +230,18 @@ def prepare_microbatch(
 def move_batch_to_device(
     batch: Batch | TrainerBatch, device: torch.device
 ) -> Batch | TrainerBatch:
-    """Move top-level tensors at consumption, preserving batch metadata."""
+    """Move input tensor leaves at consumption, preserving nested metadata.
+
+    Dict/list/tuple containers follow PyTorch's pytree registrations. Opaque
+    metadata remains unchanged; models own its interpretation and validation.
+    """
+
+    def move(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.to(device, non_blocking=True)
+
     if isinstance(batch, dict):
-        return {
-            key: value.to(device, non_blocking=True)
-            if isinstance(value, torch.Tensor)
-            else value
-            for key, value in batch.items()
-        }
-    return Batch(
-        input_ids=batch.input_ids.to(device, non_blocking=True),
-        labels=batch.labels.to(device, non_blocking=True),
-    )
+        return tree_map_only(torch.Tensor, move, batch)
+    return Batch(input_ids=move(batch.input_ids), labels=move(batch.labels))
 
 
 def prepare_model_inputs(

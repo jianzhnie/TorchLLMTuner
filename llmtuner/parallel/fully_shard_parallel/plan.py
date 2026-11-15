@@ -31,7 +31,7 @@ from ..pipeline_parallel.ownership import (
 )
 from ..plan import ParallelPlan, PlanTarget, snapshot_model_bindings
 from .fine_grained.fine_grained import get_fsdp_strategy, validate_fsdp_hook_target
-from .ownership import named_module_paths
+from .ownership import module_paths_with_aliases
 from .policies import (
     fsdp_shard_size,
     get_fsdp_reshard_after_forward_policy,
@@ -47,11 +47,15 @@ __all__ = [
 def _resolve_pattern_units(
     model: nn.Module, cfg: ParallelConfig
 ) -> tuple[dict[str, nn.Module], dict[str, dict[str, Any]], set[nn.Parameter]]:
-    named_modules = dict(model.named_modules())
+    module_bindings = tuple(model.named_modules(remove_duplicate=False))
+    canonical_names: dict[nn.Module, str] = {}
+    for name, module in module_bindings:
+        canonical_names.setdefault(module, name)
+    named_modules = {name: module for module, name in canonical_names.items()}
     # Keep physical paths available, while accepting the model's paths before
     # AC/whole-model compile inserted transparent wrappers. The outer module
     # wins at a wrapper boundary so selecting a block still selects its wrapper.
-    module_paths = named_module_paths(model)
+    module_paths = module_paths_with_aliases(module_bindings)
     ignored_roots = resolve_module_patterns(
         list(module_paths),
         patterns=cfg.fsdp_config.fsdp_ignored_modules,
@@ -63,7 +67,6 @@ def _resolve_pattern_units(
     ignored_modules = {
         module for root in ignored_roots for module in module_paths[root].modules()
     }
-    canonical_names = {module: name for name, module in named_modules.items()}
 
     unit_options: dict[str, dict[str, Any]] = {}
     for pattern, overrides in cfg.fsdp_config.fsdp_apply_modules.items():

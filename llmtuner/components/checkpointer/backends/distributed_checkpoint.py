@@ -225,10 +225,6 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     for name, enabled in (
                         ("last_save_in_hf", config.last_save_in_hf),
                         ("initial_load_in_hf", config.initial_load_in_hf),
-                        (
-                            "initial_load_in_hf_quantized",
-                            config.initial_load_in_hf_quantized,
-                        ),
                     )
                     if enabled
                 ]
@@ -553,7 +549,6 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         checkpoint_id: str,
         *,
         from_hf: bool,
-        from_quantized: bool,
     ) -> None:
         """Restore selected states through DCP or its HuggingFace reader.
 
@@ -565,8 +560,6 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             ValueError: if ``from_hf`` is set without an ``sd_adapter``.
         """
         with synchronize_local_errors("Checkpoint source format validation"):
-            if from_quantized and not from_hf:
-                raise ValueError("Quantized checkpoints require Hugging Face format")
             if from_hf and self.sd_adapter is None:
                 raise ValueError(
                     "trying to load checkpoint in HF safetensors format, "
@@ -606,11 +599,6 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 validate_local_state_preflight(
                     preflight_states,
                     preflight_destination,
-                    missing_categories=(
-                        frozenset()
-                        if preflight_planner.has_rng_state
-                        else frozenset({RNG_STATE})
-                    ),
                 )
             if load_changed_source_layout(
                 checkpoint_id,
@@ -632,9 +620,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 error_group=getattr(self.sd_adapter, "error_group", None),
             )
             with synchronize_local_errors("HF checkpoint reader preparation"):
-                hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
-                    checkpoint_id, from_quantized=from_quantized
-                )
+                hf_storage_reader = self.sd_adapter.get_hf_storage_reader(checkpoint_id)
 
             dcp.load(
                 hf_state_dict, storage_reader=hf_storage_reader, process_group=self.pg
@@ -698,7 +684,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             if MODEL in states and EMA in self.states and EMA not in states:
                 self.states[EMA].reset_from_model()
         if not from_hf:
-            restore_rng_state(states, state_dict, available=planner.has_rng_state)
+            restore_rng_state(states, state_dict)
 
     def _save(
         self, curr_step: int, last_step: bool = False, *, should_save: bool

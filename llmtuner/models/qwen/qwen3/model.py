@@ -521,7 +521,16 @@ class Qwen3MoeModel(HFQwen3MoeModel):
         )
         self.rotary_emb = rotary_type(config=config)
         self.gradient_checkpointing = False
+        self._sequence_parallel_coordinates = (1, 0)
         self.post_init()
+
+    def configure_sequence_parallel(self, *, degree: int, rank: int) -> None:
+        """Receive token ownership without retaining a parallel backend/group."""
+        if type(degree) is not int or degree < 1:
+            raise ValueError("Sequence parallel degree must be a positive integer")
+        if type(rank) is not int or not 0 <= rank < degree:
+            raise ValueError("Sequence parallel rank must be in [0, degree)")
+        self._sequence_parallel_coordinates = (degree, rank)
 
     @merge_with_config_defaults
     @capture_outputs
@@ -554,15 +563,8 @@ class Qwen3MoeModel(HFQwen3MoeModel):
             inputs_embeds = self.embed_tokens(input_ids)
         # Attention gathers TP token shards before QKV. Mask and rotary
         # metadata describe that gathered sequence, not the local residual.
-        first_block = next(iter(self.layers), None)
-        tp_group = (
-            getattr(first_block.self_attn, "_tp_seq_group", None)
-            if first_block is not None
-            else None
-        )
-        attention_length = inputs_embeds.shape[1] * (
-            tp_group.size() if tp_group is not None else 1
-        )
+        sequence_degree, sequence_rank = self._sequence_parallel_coordinates
+        attention_length = inputs_embeds.shape[1] * sequence_degree
         mask_inputs = inputs_embeds
         if attention_length != inputs_embeds.shape[1]:
             # Mask utilities read shape/device/dtype only. Expand a view instead
@@ -588,9 +590,13 @@ class Qwen3MoeModel(HFQwen3MoeModel):
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
-        if padding_mask is not None and tp_group is not None:
-            padding_mask = padding_mask.reshape(-1).chunk(tp_group.size())[
-                tp_group.rank()
+        if padding_mask is not None and sequence_degree > 1:
+            if padding_mask.numel() % sequence_degree:
+                raise ValueError(
+                    "Padding mask must cover equal sequence parallel shards"
+                )
+            padding_mask = padding_mask.reshape(-1).chunk(sequence_degree)[
+                sequence_rank
             ]
         for moe in collect_moe_layers(self):
             moe.set_padding_mask(padding_mask)
@@ -917,9 +923,11 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
                 "for CP/TP; flattening before sharding is unsupported"
             )
         inputs, labels, extra = prepare_text_inputs(
-            self,
             batch,
             parallel_dims=parallel_dims,
+            packed=getattr(self.config, "attn_mask_type", "causal") == "block_causal",
+            mask_dtype=next(self.parameters()).dtype,
+            cp_load_balancer=getattr(self, "_cp_load_balancer", None),
         )
         if multirow:
             rows, width = tokens.shape

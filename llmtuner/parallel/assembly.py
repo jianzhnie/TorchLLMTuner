@@ -133,16 +133,42 @@ class ModelPartLayout:
         # including consumers which only validate ownership before construction.
         _ = self.state_parameter_names
 
-    def validate_parameter_snapshot(
-        self, snapshot: Mapping[str, nn.Parameter], *, consumer: str
-    ) -> None:
-        """Reject rebinding since a state consumer captured its parameter scope."""
-        current = self.parameter_bindings
-        if tuple(current) != tuple(snapshot) or any(
-            current[path] is not parameter for path, parameter in snapshot.items()
+    def snapshot(self) -> ModelPartLayoutSnapshot:
+        """Bind a state consumer to final parameters and execution metadata."""
+        return ModelPartLayoutSnapshot(
+            parameters=MappingProxyType(dict(self.parameter_bindings)),
+            topology=self.topology,
+            execution=self.execution,
+            pipeline_ownership=self.pipeline_ownership,
+        )
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ModelPartLayoutSnapshot:
+    """Stable consumer scope after assembly and parameter materialization."""
+
+    parameters: Mapping[str, nn.Parameter]
+    topology: ParallelTopologySnapshot | None
+    execution: ExecutionLayout | None
+    pipeline_ownership: PipelineParameterOwnership | None
+
+    def validate(self, layout: ModelPartLayout, *, consumer: str) -> None:
+        current = layout.parameter_bindings
+        if tuple(current) != tuple(self.parameters) or any(
+            current[path] is not parameter
+            for path, parameter in self.parameters.items()
         ):
             raise ValueError(
                 f"{consumer} parameter ownership changed; rebuild the consumer "
+                "against the final model layout"
+            )
+        if (
+            layout.topology != self.topology
+            or layout.execution != self.execution
+            or layout.pipeline_ownership is not self.pipeline_ownership
+        ):
+            raise ValueError(
+                f"{consumer} layout metadata changed; rebuild the consumer "
                 "against the final model layout"
             )
 

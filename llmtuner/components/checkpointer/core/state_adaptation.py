@@ -28,7 +28,6 @@ def restore_rng_state(
     states: dict[str, Any],
     loaded: dict[str, Any],
     *,
-    available: bool = True,
     phase_prefix: str = "Checkpoint",
 ) -> None:
     """Validate RNG on every rank before any generator is restored.
@@ -37,7 +36,7 @@ def restore_rng_state(
     must be local; restore failure is coordinated but does not roll back streams.
     """
     with synchronize_local_errors(f"{phase_prefix} RNG validation"):
-        rng = states.get(RNG_STATE) if available else None
+        rng = states.get(RNG_STATE)
         if rng is not None:
             incoming = loaded[RNG_STATE]
             validate = getattr(rng, "validate_state_dict", None)
@@ -121,13 +120,11 @@ def validate_local_state_preflight(
     states: dict[str, Any],
     destination: dict[str, Any],
     *,
-    missing_categories: frozenset[str] = frozenset(),
     error_group: ProcessGroup | None = None,
 ) -> None:
     """Validate isolated metadata before loading live training state.
 
-    Readers explicitly identify optional records absent from the checkpoint;
-    their initialized destination values must not stand in for saved metadata.
+    Every selected category must be present in the loaded destination.
     Every rank must pass the same ordered state categories. Each local validator
     is coordinated separately before the next one runs.
     """
@@ -136,8 +133,7 @@ def validate_local_state_preflight(
         with synchronize_local_errors(
             f"Checkpoint {phase} preflight validation", group=error_group
         ):
-            if category not in missing_categories:
-                state.validate_state_dict(destination[category])
+            state.validate_state_dict(destination[category])
 
 
 def validate_local_preflight_selection(

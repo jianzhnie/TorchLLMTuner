@@ -580,14 +580,8 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         checkpoint_id: str,
         *,
         from_hf: bool,
-        from_quantized: bool,
     ) -> None:
         with synchronize_local_errors("Checkpoint source format validation"):
-            if from_quantized:
-                raise ValueError(
-                    "TorchCheckpointingManager does not support loading "
-                    "quantized Hugging Face checkpoints."
-                )
             if from_hf and self.sd_adapter is None:
                 raise ValueError(
                     "checkpoint.initial_load_in_hf is True, "

@@ -10,6 +10,7 @@ from torch.optim import Optimizer
 from ...accelerator.collectives import synchronize_local_errors
 from ...parallel.assembly import (
     ModelPartLayout,
+    ModelPartLayoutSnapshot,
     capture_model_part_layouts,
     validate_model_part_layouts,
 )
@@ -32,7 +33,7 @@ class OptimizerCheckpointState(Stateful):
     runtime_layouts: tuple[ModelPartLayout, ...]
     sharded_tensor_parallel: bool
     sharded_expert_parallel: bool
-    _bound_layout_parameters: tuple[dict[str, nn.Parameter], ...] | None
+    _layout_snapshots: tuple[ModelPartLayoutSnapshot, ...] | None
 
     def _bind_runtime_layouts(
         self,
@@ -50,23 +51,23 @@ class OptimizerCheckpointState(Stateful):
         self.runtime_layouts = tuple(layouts) or capture_model_part_layouts(
             self.model_parts
         )
-        self._bound_layout_parameters = None
+        self._layout_snapshots = None
         self._validate_runtime_layouts()
-        self._bound_layout_parameters = tuple(
-            dict(layout.parameter_bindings) for layout in self.runtime_layouts
+        self._layout_snapshots = tuple(
+            layout.snapshot() for layout in self.runtime_layouts
         )
 
     def _validate_runtime_layouts(self) -> None:
         """Check the same final ownership before grouping, save, and restore."""
-        bound = self._bound_layout_parameters
+        bound = self._layout_snapshots
         if bound is not None and len(bound) != len(self.runtime_layouts):
             raise ValueError("Optimizer runtime layouts changed after construction")
         if len(self.runtime_layouts) != len(self.model_parts):
             raise ValueError("Optimizer layouts must match model parts")
         validate_model_part_layouts(self.model_parts, self.runtime_layouts)
         if bound is not None:
-            for layout, parameters in zip(self.runtime_layouts, bound, strict=True):
-                layout.validate_parameter_snapshot(parameters, consumer="Optimizer")
+            for layout, snapshot in zip(self.runtime_layouts, bound, strict=True):
+                snapshot.validate(layout, consumer="Optimizer")
 
     def state_dict(self) -> dict[str, Any]:
         """A flat, FQN-keyed state dict covering every inner optimizer.

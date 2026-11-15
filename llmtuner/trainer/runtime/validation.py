@@ -49,19 +49,49 @@ if TYPE_CHECKING:
     from .engine import TrainingEngine
 
 
-def close_validation_dataloader(loader: BaseDataLoader, *, failed: bool) -> None:
-    """Close temporary data resources without replacing an active pass error."""
-    try:
+class ValidationDataLoaderResources:
+    """Own temporary loaders until their close succeeds, including pass failure.
+
+    The caller retains this owner across passes and closes it during shutdown.
+    A new pass drains pending owners before constructing another loader.
+    """
+
+    def __init__(self) -> None:
+        self._pending: list[BaseDataLoader] = []
+
+    def acquire(self, loader: BaseDataLoader) -> None:
+        if any(owned is loader for owned in self._pending):
+            raise ValueError("Validation loader is already owned")
+        self._pending.append(loader)
+
+    def _release(self, loader: BaseDataLoader) -> None:
         loader.close()
-    except BaseException:
-        if not failed:
-            raise
+        self._pending = [owned for owned in self._pending if owned is not loader]
+
+    def close_dataloader(self, loader: BaseDataLoader, *, failed: bool) -> None:
+        """Keep failed releases without replacing an active validation error."""
         try:
-            get_logger(__name__).exception(
-                "Validation dataloader cleanup failed after validation failed"
-            )
+            self._release(loader)
         except BaseException:
-            pass  # Preserve the active validation failure, including interrupts.
+            if not failed:
+                raise
+            try:
+                get_logger(__name__).exception(
+                    "Validation dataloader cleanup failed after validation failed"
+                )
+            except BaseException:
+                pass
+
+    def close(self) -> None:
+        first_error: BaseException | None = None
+        for loader in reversed(tuple(self._pending)):
+            try:
+                self._release(loader)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
 
 def create_validation_dataloader(
@@ -214,6 +244,7 @@ def validate(
     cfg: LLMTunerConfig,
     metrics: MetricsProcessor,
     token_counter: Callable[[Batch | TrainerBatch], int],
+    loader_resources: ValidationDataLoaderResources,
     step: int,
     wait_for_staging: Callable[[], None] | None = None,
 ) -> None:
@@ -293,6 +324,7 @@ def validate(
                 cfg=cfg,
                 metrics=metrics,
                 token_counter=token_counter,
+                loader_resources=loader_resources,
                 validation=validation,
                 step=step,
             )
@@ -326,6 +358,7 @@ def run_validation_loop(
     metrics: MetricsProcessor,
     token_counter: Callable[[Batch | TrainerBatch], int],
     validation: ValidationConfig,
+    loader_resources: ValidationDataLoaderResources,
     step: int,
 ) -> None:
     """Read, score, and finalize one validation pass for dense or PP models."""
@@ -338,9 +371,11 @@ def run_validation_loop(
         with synchronize_local_errors(
             "Validation input initialization", group=engine.error_group
         ):
+            loader_resources.close()
             validation_dataloader = create_validation_dataloader(
                 cfg, engine.parallel_dims, validation
             )
+            loader_resources.acquire(validation_dataloader)
             total_global_valid_tokens = torch.zeros(
                 (), dtype=torch.int64, device=engine.device
             )
@@ -381,7 +416,7 @@ def run_validation_loop(
             )
         ):
             if validation_dataloader is not None:
-                close_validation_dataloader(validation_dataloader, failed=failed)
+                loader_resources.close_dataloader(validation_dataloader, failed=failed)
 
     finalize_validation(
         metrics=metrics,

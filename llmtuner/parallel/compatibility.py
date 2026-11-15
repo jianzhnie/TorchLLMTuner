@@ -367,7 +367,7 @@ ENTRIES: tuple[CompatibilityRule, ...] = (
         tp_moe_non_tensor_output,
         "assembly",
         UnsupportedCombinationError,
-        "parallel/tensor_parallel/tensor_parallel.py::TPMoeSequenceBoundary.forward",
+        "parallel/tensor_parallel/sequence_boundary.py::TPMoeSequenceBoundary.forward",
     ),
     CompatibilityRule(
         quantile_requires_ep,

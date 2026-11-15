@@ -54,7 +54,9 @@ class ParallelTopologySnapshot:
         ParallelTopology(**asdict(self))
 
     @classmethod
-    def capture(cls, topology: ParallelTopology) -> ParallelTopologySnapshot:
+    def capture(
+        cls, topology: ParallelTopology | ParallelTopologySnapshot
+    ) -> ParallelTopologySnapshot:
         return cls(**{item.name: getattr(topology, item.name) for item in fields(cls)})
 
 

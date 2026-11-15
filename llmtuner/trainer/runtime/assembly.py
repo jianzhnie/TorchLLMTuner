@@ -602,7 +602,6 @@ def build_checkpointer(
     dataloader: BaseDataLoader,
     train_state: Stateful,
     device: torch.device,
-    parallel_dims: ParallelTopology | None,
     error_group: ProcessGroup | None = None,
     builders: TrainingBuilders | None = None,
 ) -> BaseCheckpointManager:
@@ -626,12 +625,18 @@ def build_checkpointer(
         states: dict[str, Any] = {
             TRAIN_STATE: train_state,
             DATALOADER: dataloader,
-            RNG_STATE: RNGCheckpointState(device, topology=parallel_dims),
+            RNG_STATE: RNGCheckpointState(
+                device,
+                topology=(
+                    model_assembly.layouts[0].topology
+                    if model_assembly.layouts
+                    else None
+                ),
+            ),
         }
         sd_adapter = ModelStateDictAdapter(
             model_config,
             cfg.checkpoint.initial_load_path or cfg.hf_model,
-            model_prefix="",
             expert_parallel=cfg.parallel.ep_size > 1,
             sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
             error_group=error_group,

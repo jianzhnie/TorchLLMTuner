@@ -57,9 +57,7 @@ from llmtuner.errors import UnsupportedCombinationError
 
 from ...accelerator.capabilities import has
 from ...accelerator.linear_collectives import (
-    all_gather_along,
     enable_symm_mem,
-    reduce_scatter_along,
     resolve_autograd_collectives,
 )
 from ...models.common.moe.experts import GroupedExperts
@@ -69,6 +67,7 @@ from ...utils.logging import get_logger
 from .. import compatibility
 from ..attention_heads import require_heads_divisible_by
 from ..plan import (
+    FullPlanBindings,
     ParallelPlan,
     PlanTarget,
     snapshot_model_bindings,
@@ -78,6 +77,12 @@ from ..replacements import ReplacementObserver
 from ..vocab_parallel.vocab_parallel import VocabParallelEmbedding
 from . import linear as tp_linear
 from . import sharding as tp_sharding
+from .sequence_boundary import (
+    FeatureParallelSequenceBoundary,
+    GatherSequenceFirst,
+    ReplicatedAttentionSequenceBoundary,
+    TPMoeSequenceBoundary,
+)
 
 
 def _is_model_declared_moe(module: nn.Module) -> bool:
@@ -103,32 +108,6 @@ logger = get_logger(__name__)
 __all__ = ["apply_tp", "resolve_tp_plan"]
 
 
-class GatherSequenceFirst:
-    """Mixin that all-gathers the TP sequence shard before HF attention runs.
-
-    Installed by ``apply_tp`` via a ``__class__`` swap (not a module wrapper),
-    so module paths, ``state_dict`` keys and later attach points (``apply_cp``'s
-    the CP attention kernel) are all untouched. ``hidden_states`` arrives as this
-    rank's ``[B, T / tp, K]`` sequence shard and is gathered along the sequence
-    dim to the length the inner forward expects -- the full sequence, or the CP
-    shard when CP is on (the gather spans the TP group only, and a TP group
-    collectively holds exactly one CP shard).
-
-    The gather's autograd dual is a reduce-scatter, which sums each rank's
-    input-gradient contribution back to its own token shard -- the exact dual
-    the sequence-parallel layout needs.
-    """
-
-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
-        gathered = all_gather_along(hidden_states, -2, self._tp_seq_group)
-        original = self.__dict__.get("_tp_attention_original_forward")
-        return (
-            original(gathered, *args, **kwargs)
-            if original is not None
-            else super().forward(gathered, *args, **kwargs)
-        )
-
-
 def requires_full_token_history(module: nn.Module) -> bool:
     """Read the model's history requirement without inferring storage semantics.
 
@@ -141,84 +120,6 @@ def requires_full_token_history(module: nn.Module) -> bool:
             raise ValueError("requires_full_token_history must be a bool")
         return declared
     return False
-
-
-class ReplicatedAttentionSequenceBoundary:
-    """Run unsharded attention on the gathered sequence, return local tokens.
-
-    Some HF plans shard only MLPs (e.g. DeepSeek MLA). Attention still needs
-    the full sequence and RoPE positions. Its output is replicated, so slice
-    tokens without summing; the input gather sums partial gradients in backward.
-    Replicated attention parameter gradients are reduced by the trainer.
-
-    Qwen3.5 GDN uses the same boundary with all projections replicated: both
-    the causal convolution and recurrent scan require the full token history.
-    Its attention_mask must describe the gathered sequence (as supplied by HF),
-    and is forwarded unchanged. This boundary adds no parameter-gradient hooks;
-    the trainer performs the single replicated-parameter gradient reduction.
-    """
-
-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
-        gathered = all_gather_along(hidden_states, -2, self._tp_seq_group)
-        original = self.__dict__.get("_tp_attention_original_forward")
-        output = (
-            original(gathered, *args, **kwargs)
-            if original is not None
-            else super().forward(gathered, *args, **kwargs)
-        )
-        attention = output[0] if isinstance(output, tuple) else output
-        local = attention.chunk(self._tp_seq_group.size(), dim=-2)[
-            self._tp_seq_group.rank()
-        ].contiguous()
-        return (local, *output[1:]) if isinstance(output, tuple) else local
-
-
-# -- MoE under TP ---------------------------------------------------------------
-
-# The HF tp_config spec strings that declare MoE-under-TP (transformers 5.x
-# spelling, e.g. Qwen3Moe's ``base_model_tp_config``). They name no nn.Linear --
-# the expert weights are stacked parameters on the experts module -- so they
-# resolve to None in the plan and are realized by ``realize_moe_blocks_tp``
-# below, which is what keeps the refusal-to-replicate validation honest.
-
-
-class TPMoeSequenceBoundary:
-    """Mixin that brackets a HF MoE block with the TP sequence collectives.
-
-    The MoE block under TP is the dense colwise/rowwise pair with the feature
-    shard kept internal: the input arrives as this rank's ``(B, T / tp, D)``
-    sequence shard and is all-gathered (backward: reduce-scatter of the input
-    gradient); the block then runs on the full token stream with its expert
-    weights sharded on the F dim (``shard_experts_for_tp``), producing an
-    output that is partial over the TP group; the boundary reduce-scatter sums
-    the partials and returns a ``(B, T / tp, D)`` sequence shard (backward:
-    all-gather of the output gradient). Weight layout and collectives are the
-    same dual pair the dense TP realizers use.
-
-    The router is deliberately untouched: its weight stays replicated, every
-    rank computes the identical routing on the gathered stream, and the
-    trainer's ``allreduce_replicated_tp_grads`` sums its gradient (each rank's
-    copy earns a different partial through the sharded expert outputs).
-
-    Installed by ``__class__`` swap (like ``GatherSequenceFirst``), so module
-    paths, ``state_dict`` keys and later attach points are all untouched.
-    """
-
-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
-        gathered = all_gather_along(hidden_states, -2, self._tp_seq_group)
-        original = self.__dict__.get("_tp_moe_original_forward")
-        out = (
-            original(gathered, *args, **kwargs)
-            if original is not None
-            else super().forward(gathered, *args, **kwargs)
-        )
-        # This probe sits between the two collectives; it is only safe because
-        # the block's output TYPE is structural -- identical on every rank of
-        # the TP group -- so either all ranks raise here or none do. Never let
-        # a data-dependent type reach this check.
-        if not isinstance(out, torch.Tensor):
-            compatibility.tp_moe_non_tensor_output(self, out)
-        return reduce_scatter_along(out, -2, self._tp_seq_group)
 
 
 def _shared_expert_projections(
@@ -555,7 +456,7 @@ def _resolve_tp_targets(
     bracketed_paths: list[str] = []
     if plan_declares_moe and not moe_deferred_to_ep:
         for module_path, module in model.named_modules():
-            if getattr(module, "_tp_moe_boundary", False):
+            if isinstance(module, FeatureParallelSequenceBoundary):
                 # Already bracketed by an earlier apply_tp pass (the engine is
                 # idempotent per module): still counts as realized MoE TP.
                 bracketed_paths.append(module_path)
@@ -595,7 +496,7 @@ def _resolve_tp_targets(
         for path, module in model.named_modules()
         if path not in moe_block_paths
         and is_moe_block(module)
-        and not getattr(module, "_tp_moe_boundary", False)
+        and not isinstance(module, FeatureParallelSequenceBoundary)
     )
     if moe_block_paths or bracketed_paths:
         moe_prefixes = tuple(
@@ -705,7 +606,6 @@ def realize_moe_blocks_tp(
             shard_experts_for_tp(block, tp_size=tp_size, tp_rank=tp_rank) | shared_names
         )
         block._tp_seq_group = group
-        block._tp_moe_boundary = True
         # An explicitly selected kernel can install forward on the instance
         # (e.g. torchtitan NPU experts). It would shadow the boundary mixin and
         # silently bypass both sequence collectives after the class swap.
@@ -733,11 +633,14 @@ def resolve_tp_plan(
     *,
     cfg: ParallelConfig,
     plan: Mapping[str, str | tp_sharding.ShardingConfig] | None = None,
+    bindings: FullPlanBindings | None = None,
 ) -> ParallelPlan:
     """Resolve and validate TP locally, without a mesh or model mutation.
 
     The assembly layer may coordinate rank-local failures around this function.
     Existing model declarations and explicit overrides retain their precedence.
+    Borrowed bindings must describe this unchanged model instance; assembly can
+    reuse them across pure preflights, but never across transformations.
     """
     if cfg.tp_size <= 1:
         raise ValueError("TP plan resolution requires tp_size > 1")
@@ -758,6 +661,13 @@ def resolve_tp_plan(
     raw_plan = tp_sharding.resolve_effective_tp_plan(model, cfg=cfg, plan=plan)
     targets, moe_blocks = _resolve_tp_targets(model, cfg=cfg, raw_plan=raw_plan)
     vocab_targets = tp_sharding.resolve_vocab_parallel_targets(model, raw_plan)
+    bindings = snapshot_model_bindings(model) if bindings is None else bindings
+    # Keep the first registered path, matching named_modules() traversal, while
+    # retaining every alias in the ownership snapshot handed to ParallelPlan.
+    unique_modules: dict[int, tuple[str, nn.Module]] = {}
+    for path, module in bindings["module_bindings"]:
+        unique_modules.setdefault(id(module), (path, module))
+    modules = tuple(unique_modules.values())
 
     # A head count that does not divide ``tp`` has no valid local head split,
     # and no downstream guard catches it: the projection-level check in
@@ -775,9 +685,7 @@ def resolve_tp_plan(
             id(module) for module in structure.bind_attentions(model)
         }
         attention_paths = [
-            path
-            for path, module in model.named_modules()
-            if id(module) in declared_attentions
+            path for path, module in modules if id(module) in declared_attentions
         ]
     else:
         # Explicit projection-only plans have no attention semantics. Model
@@ -800,7 +708,7 @@ def resolve_tp_plan(
 
     # Validate every dense target before replacing any parameters or modules.
     parameter_paths: dict[int, list[str]] = {}
-    for name, parameter in model.named_parameters(remove_duplicate=False):
+    for name, parameter in bindings["parameter_bindings"]:
         parameter_paths.setdefault(id(parameter), []).append(name)
     # MoE slicing also replaces Parameters. A shared expert module would be
     # sliced twice, while individually tied weights would silently lose their
@@ -875,15 +783,17 @@ def resolve_tp_plan(
             )
     replicated_attention = [
         module
-        for path, module in model.named_modules()
+        for path, module in modules
         if (path in attention_paths or requires_full_token_history(module))
-        and not hasattr(module, "_tp_seq_group")
+        and not isinstance(
+            module, GatherSequenceFirst | ReplicatedAttentionSequenceBoundary
+        )
         and not any(target.startswith(f"{path}.") for target, _, _ in targets)
     ]
     # GDN's convolution and recurrence need the complete token history, even
     # though HF's colwise_gather_output projections stay replicated here.
     # Head-sharded GDN requires a different boundary and is not implemented.
-    for path, module in model.named_modules():
+    for path, module in modules:
         if requires_full_token_history(module) and any(
             target.startswith(f"{path}.") for target, _, _ in targets
         ):
@@ -901,6 +811,11 @@ def resolve_tp_plan(
         is_attention = (
             declared_attentions is not None and id(parent) in declared_attentions
         )
+        if is_attention and isinstance(parent, ReplicatedAttentionSequenceBoundary):
+            raise UnsupportedCombinationError(
+                "Cannot shard projections inside an installed replicated attention "
+                "boundary; rebuild the model with the final TP plan"
+            )
         if spec.kind == "colwise" and is_attention:
             if spec.implementation is tp_linear.ColumnParallelLinear:
                 spec = replace(
@@ -931,10 +846,21 @@ def resolve_tp_plan(
         validate_moe_tp_target(path, block, tp_size=cfg.tp_size, shared_binding=binding)
         shared_bindings[block] = binding
 
-    module_paths = {id(module): path for path, module in model.named_modules()}
+    sequence_metadata = []
+    module_paths = {}
+    for path, module in modules:
+        module_paths[id(module)] = path
+        configure = getattr(module, "configure_sequence_parallel", None)
+        if configure is not None:
+            if not callable(configure):
+                raise TypeError("configure_sequence_parallel must be callable")
+            sequence_metadata.append(
+                PlanTarget(path, "decoder", module, "sequence_parallel", configure)
+            )
     return ParallelPlan(
         stage="tp",
         targets=(
+            *sequence_metadata,
             *(
                 PlanTarget(path, "dense", module, spec.kind, spec)
                 for path, module, spec in realized_targets
@@ -967,9 +893,9 @@ def resolve_tp_plan(
         implementation="unbound",
         token_history_requirements=tuple(
             (path, getattr(module, "requires_full_token_history", None))
-            for path, module in model.named_modules()
+            for path, module in modules
         ),
-        **snapshot_model_bindings(model),
+        **bindings,
     )
 
 
@@ -997,7 +923,11 @@ def validate_pipeline_tp_plan(
             raise ValueError(
                 f"Pipeline TP layout or projection strategy changed: {key}"
             )
-    modules = dict(model.named_modules(remove_duplicate=False))
+    modules = dict(
+        model.named_modules(remove_duplicate=False)
+        if local_plan.module_bindings is None
+        else local_plan.module_bindings
+    )
     local_history = dict(local_plan.token_history_requirements)
     for path, requirement in global_plan.token_history_requirements:
         module = modules.get(path)
@@ -1071,6 +1001,19 @@ def apply_tp(
         if target.kind == "attention" and target.layout == "replicate_tokens"
     )
 
+    sequence_metadata = tuple(
+        target
+        for target in resolved.targets
+        if target.kind == "decoder" and target.layout == "sequence_parallel"
+    )
+    for target in sequence_metadata:
+        if not callable(target.spec) or (
+            getattr(target.module, "configure_sequence_parallel", None) != target.spec
+        ):
+            raise ValueError(
+                "Resolved sequence parallel configuration binding is stale"
+            )
+
     tp_size = mesh["tp"].size()
     if tp_size != cfg.tp_size:
         raise ValueError(
@@ -1105,6 +1048,7 @@ def apply_tp(
             group=group,
             use_symm_mem=use_symm_mem,
         )
+        spec.validate_implementation(wrapped)
         weight = wrapped._parameters.get("weight")
         if not isinstance(weight, nn.Parameter):
             raise TypeError(
@@ -1187,7 +1131,7 @@ def apply_tp(
         setattr(parent, attr, wrapped)
 
     for parent in attention_parents:
-        if getattr(parent, "_tp_seq_group", None) is not None:
+        if isinstance(parent, GatherSequenceFirst):
             continue  # already gathered (apply_tp is idempotent per module)
         parent._tp_seq_group = group
         if "forward" in parent.__dict__:
@@ -1221,6 +1165,9 @@ def apply_tp(
         if shared is not None:
             for name, dim, _, _ in _shared_expert_projections(shared):
                 layouts[f"{prefix}{shared_name}.{name}.weight"] = (dim, False, group)
+
+    for target in sequence_metadata:
+        target.spec(degree=tp_size, rank=tp_rank)
 
     if on_replacement is not None:
         # TP preserves FQNs, including packed expert parameters. Resolve these

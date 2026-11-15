@@ -126,8 +126,8 @@ class ModelCheckpointState(Stateful):
                 self._layout_models
             )
             validate_model_part_layouts(self._layout_models, self._model_layouts)
-            self._bound_layout_parameters = tuple(
-                dict(layout.parameter_bindings) for layout in self._model_layouts
+            self._layout_snapshots = tuple(
+                layout.snapshot() for layout in self._model_layouts
             )
             self._bound_buffers = tuple(
                 dict(named_persistent_buffers(part)) for part in self.model
@@ -139,7 +139,10 @@ class ModelCheckpointState(Stateful):
             # as a buffer in another. Track both in the same ownership domain.
             owners: dict[int, int] = {}
             for kind, snapshots in (
-                ("parameter", self._bound_layout_parameters),
+                (
+                    "parameter",
+                    tuple(item.parameters for item in self._layout_snapshots),
+                ),
                 ("persistent buffer", self._bound_buffers),
                 ("extra-state", self._bound_extra_state_owners),
             ):
@@ -171,10 +174,10 @@ class ModelCheckpointState(Stateful):
         validate_model_part_layouts(self._layout_models, self._model_layouts)
         for layout, bound in zip(
             self._model_layouts,
-            self._bound_layout_parameters,
+            self._layout_snapshots,
             strict=True,
         ):
-            layout.validate_parameter_snapshot(bound, consumer="Checkpoint")
+            bound.validate(layout, consumer="Checkpoint")
         for index, (current, bound) in enumerate(
             zip(
                 (dict(named_persistent_buffers(part)) for part in self.model),
@@ -309,9 +312,7 @@ class ModelCheckpointState(Stateful):
             value = state_dict[key]
             if not isinstance(value, torch.Tensor):
                 raise ValueError(f"Model checkpoint {key!r} must be a tensor")
-            # PyTorch accepts old one-element checkpoints for scalar state.
-            legacy_scalar = len(expected.shape) == 0 and value.shape == torch.Size([1])
-            if value.shape != expected.shape and not legacy_scalar:
+            if value.shape != expected.shape:
                 raise ValueError(
                     f"Model checkpoint {key!r} has shape {tuple(value.shape)}, "
                     f"expected {tuple(expected.shape)}"

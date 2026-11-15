@@ -10,7 +10,7 @@ from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.planner import ReadItem
 
 from ....utils.module_names import canonical_fqn
-from ..core.checkpoint_keys import CHECKPOINT_FORMAT, OPTIMIZER, RNG_STATE
+from ..core.checkpoint_keys import CHECKPOINT_FORMAT, OPTIMIZER
 
 
 class CheckpointLoadPlanner(DefaultLoadPlanner):
@@ -89,8 +89,6 @@ class CheckpointLoadPlanner(DefaultLoadPlanner):
                 set_element(self.original_state_dict, target_path, destination)
             else:
                 self.original_state_dict[key] = destination
-        rng_prefix = f"{RNG_STATE}."
-        self.has_rng_state = any(key.startswith(rng_prefix) for key in saved_keys)
         return super().create_local_plan()
 
     def load_bytes(self, read_item: ReadItem, value: io.BytesIO) -> None:

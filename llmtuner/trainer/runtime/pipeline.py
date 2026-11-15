@@ -12,6 +12,7 @@ from typing import Any, Protocol
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+from torch.utils._pytree import tree_leaves, tree_map_only
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_world_size
@@ -62,7 +63,7 @@ def split_pipeline_microbatches(
 
     A single microbatch keeps every tensor intact: packed media patches and
     coordinate axes do not share the labels' leading dimension. Multiple
-    microbatches require every non-scalar tensor to use the same leading row
+    microbatches require every nested non-scalar tensor to use the same leading row
     dimension; layouts needing media-aware slicing must be prepared separately.
     """
     require_positive_integer("num_pp_microbatches", num_microbatches)
@@ -89,17 +90,18 @@ def split_pipeline_microbatches(
             else batch
         )
         for name, value in fields.items():
-            if (
-                isinstance(value, torch.Tensor)
-                and value.ndim > 0
-                and value.shape[0] != labels.shape[0]
-            ):
-                raise ValueError(
-                    f"Pipeline batch field {name!r} has {value.shape[0]} leading "
-                    f"entries, but labels have {labels.shape[0]} rows; multiple "
-                    "microbatches require row-aligned tensors. Use one "
-                    "microbatch for packed media or coordinate layouts."
-                )
+            for leaf in tree_leaves(value):
+                if (
+                    isinstance(leaf, torch.Tensor)
+                    and leaf.ndim > 0
+                    and leaf.shape[0] != labels.shape[0]
+                ):
+                    raise ValueError(
+                        f"Pipeline batch field {name!r} has {leaf.shape[0]} leading "
+                        f"entries, but labels have {labels.shape[0]} rows; multiple "
+                        "microbatches require row-aligned tensors. Use one "
+                        "microbatch for packed media or coordinate layouts."
+                    )
     if isinstance(batch, dict):
         rows_per_microbatch = labels.shape[0] // num_microbatches
         microbatches = []
@@ -108,14 +110,15 @@ def split_pipeline_microbatches(
                 index * rows_per_microbatch,
                 (index + 1) * rows_per_microbatch,
             )
-            microbatch = {
-                key: value[rows]
+
+            def slice_rows(value: torch.Tensor, selected: slice = rows) -> torch.Tensor:
+                return value[selected] if value.ndim > 0 else value
+
+            microbatch = (
+                tree_map_only(torch.Tensor, slice_rows, batch)
                 if num_microbatches > 1
-                and isinstance(value, torch.Tensor)
-                and value.ndim > 0
-                else value
-                for key, value in batch.items()
-            }
+                else dict(batch)
+            )
             # A single microbatch retains the original labels and count. Only
             # sliced rows need a fresh count; do not synchronize device labels
             # just to reconstruct metadata already supplied by the collator.

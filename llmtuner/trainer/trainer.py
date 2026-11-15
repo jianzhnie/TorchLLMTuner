@@ -104,6 +104,7 @@ class Trainer:
     activation_swap_resources: ActivationSwapResources | None = None
     fsdp_communication_resources: FSDPCommunicationResources | None = None
     dispatch_timer_resources: DispatchTimerResources | None = None
+    validation_resources: validation_runtime.ValidationDataLoaderResources | None = None
     profiler_resource: Any | None = None
 
     # Created lazily for callers that construct a Trainer with __new__.
@@ -248,7 +249,6 @@ class Trainer:
             dataloader=self.dataloader,
             train_state=self.progress,
             device=environment.device,
-            parallel_dims=environment.parallel_dims,
             error_group=error_group,
             builders=getattr(self, "_builders", None),
         )
@@ -557,8 +557,13 @@ class Trainer:
         The body lives in ``runtime/validation.py`` (gradient-free via its own
         ``torch.no_grad``); see there for the reporting contract.
         """
+        if self.validation_resources is None:
+            self.validation_resources = (
+                validation_runtime.ValidationDataLoaderResources()
+            )
         validation_runtime.validate(
             self.training_engine,
+            loader_resources=self.validation_resources,
             cfg=self.cfg,
             metrics=self.metrics,
             token_counter=self.count_valid_tokens,
@@ -792,6 +797,7 @@ class Trainer:
                 "activation_swap_resources",
                 ("checkpointer", "fsdp_communication_resources"),
             ),
+            ("validation_resources", ()),
             ("metrics", ()),
             ("dataloader", ("checkpointer",)),
             ("ema", ("checkpointer", "fsdp_communication_resources")),

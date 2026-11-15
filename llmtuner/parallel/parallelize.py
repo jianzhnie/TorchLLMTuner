@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import nullcontext
-from functools import partial
 from typing import Any
 
 import torch
@@ -188,6 +187,9 @@ def parallelize_model(
         part: nn.Module,
         *,
         dense_mesh: DeviceMesh | None,
+        tp_mesh: DeviceMesh | None,
+        ep_group: ProcessGroup | None,
+        ep_error_group: ProcessGroup | None,
         execution_layout: ExecutionLayout,
         part_cfg: ParallelConfig | None = None,
         resolved_tp_plan: ParallelPlan | None = None,
@@ -220,65 +222,66 @@ def parallelize_model(
             else:
                 layout.replacements.record_replacements(modules, parameters)
 
-        tp_options = {"on_replacement": record_replacements}
-        if resolved_tp_plan is not None:
-            tp_options["resolved_plan"] = resolved_tp_plan
-        runners = {
-            "tp": partial(
-                apply_tp,
-                mesh=dense_mesh,
-                cfg=cfg,
-                **tp_options,
-            ),
-            "ep": partial(
-                apply_ep, cfg=cfg, ep_group=ep_group, error_group=ep_error_group
-            ),
-            "cp": partial(apply_cp, mesh=dense_mesh, cfg=cfg),
-            "ac": partial(
-                apply_ac,
-                mode=activation_checkpoint,
-                selective=selective_ac,
-                memory_budget=memory_budget_ac,
-                region=region_ac,
-                compile_enabled=compile,
-            ),
-            "activation_swap": partial(
-                apply_activation_swap,
-                sync_release=activation_swap_sync_release,
-                max_host_bytes=activation_swap_max_host_bytes,
-            ),
-            "compile": partial(
-                apply_compile, compile_config=compile_config, tp_mesh=tp_mesh
-            ),
-            "fsdp": partial(
-                apply_fsdp,
-                cfg=fsdp_cfg,
-                parallel_dims=parallel_dims,
-                chunked_loss_num_chunks=chunked_loss_num_chunks,
-            ),
-        }
         activation_swap_enabled = activation_swap and activation_checkpoint != "full"
         for name in STAGE_ORDER:
             if name == "compile" and not compile:
                 continue
             if name == "activation_swap" and not activation_swap_enabled:
                 continue
-            if name == "fsdp":
-                layout.parameter_bindings = dict(
-                    part.named_parameters(remove_duplicate=False)
+            if name == "tp":
+                part = apply_tp(
+                    part,
+                    mesh=dense_mesh,
+                    cfg=cfg,
+                    resolved_plan=resolved_tp_plan,
+                    on_replacement=record_replacements,
                 )
-            if name == "ep":
-                # TP may already have replaced Parameters before EP's
-                # explicit split/rename mapping is emitted.
+            elif name == "ep":
+                # TP may have replaced parameters referenced by FSDP options.
                 if references is not None:
                     references = FSDPPatternReferences(
                         part, references.bind(part), replacements=layout.replacements
                     )
-                part = runners[name](part, on_replacement=record_replacements)
-            elif name == "fsdp" and references is not None:
-                part = runners[name](part, cfg=references.bind(part))
+                part = apply_ep(
+                    part,
+                    cfg=cfg,
+                    ep_group=ep_group,
+                    error_group=ep_error_group,
+                    on_replacement=record_replacements,
+                )
+            elif name == "cp":
+                part = apply_cp(part, mesh=dense_mesh, cfg=cfg)
+            elif name == "ac":
+                part = apply_ac(
+                    part,
+                    mode=activation_checkpoint,
+                    selective=selective_ac,
+                    memory_budget=memory_budget_ac,
+                    region=region_ac,
+                    compile_enabled=compile,
+                )
+            elif name == "activation_swap":
+                part = apply_activation_swap(
+                    part,
+                    sync_release=activation_swap_sync_release,
+                    max_host_bytes=activation_swap_max_host_bytes,
+                )
+            elif name == "compile":
+                part = apply_compile(
+                    part, compile_config=compile_config, tp_mesh=tp_mesh
+                )
+            elif name == "fsdp":
+                layout.parameter_bindings = dict(
+                    part.named_parameters(remove_duplicate=False)
+                )
+                part = apply_fsdp(
+                    part,
+                    cfg=fsdp_cfg if references is None else references.bind(part),
+                    parallel_dims=parallel_dims,
+                    chunked_loss_num_chunks=chunked_loss_num_chunks,
+                )
             else:
-                part = runners[name](part)
+                raise ValueError(f"Unknown parallel assembly stage: {name!r}")
             if on_model_acquired is not None:
                 on_model_acquired(part)
         with synchronize_local_errors(
@@ -318,6 +321,7 @@ def parallelize_model(
     cp_error_group = error_group
     if cp_error_group is None and cfg.cp_size > 1 and parallel_dims is not None:
         cp_error_group = parallel_dims.build_device_mesh().get_group()
+    global_bindings = None
     global_cp_plan = None
     if cfg.cp_size > 1:
         with (
@@ -328,6 +332,8 @@ def parallelize_model(
             # Metadata-only preflight. Later stages resolve current bindings
             # after PP/TP/EP establish the actual local instance.
             global_cp_plan = resolve_cp_plan(model, cfg=cfg)
+            if global_cp_plan is not None:
+                global_bindings = model_bindings_from_plan(global_cp_plan)
 
     global_ep_plan = None
     if cfg.ep_size > 1 or cfg.ep_config.fixed_router:
@@ -348,7 +354,10 @@ def parallelize_model(
                 tp_enabled=cfg.tp_size > 1,
                 quantile_balancing=cfg.ep_config.moe_quantile_balancing,
                 has_ep_group=ep_group is not None,
+                bindings=global_bindings,
             )
+            if global_ep_plan is not None:
+                global_bindings = model_bindings_from_plan(global_ep_plan)
 
     if parallel_dims is not None and parallel_dims.pp_enabled:
         global_tp_plan = None
@@ -364,7 +373,9 @@ def parallelize_model(
                 )
             if cfg.tp_size > 1:
                 resolve_tp_overrides(model, cfg=cfg)
-                global_tp_plan = resolve_tp_plan(model, cfg=cfg)
+                global_tp_plan = resolve_tp_plan(
+                    model, cfg=cfg, bindings=global_bindings
+                )
             validate_microbatches(parallel_dims, cfg, global_batch_size)
             global_execution_layout = resolve_execution_layout(
                 model,
@@ -519,6 +530,9 @@ def parallelize_model(
             model_parts[i] = apply_stages(
                 part,
                 dense_mesh=dense_mesh,
+                tp_mesh=tp_mesh,
+                ep_group=ep_group,
+                ep_error_group=ep_error_group,
                 execution_layout=execution_layouts[i],
                 part_cfg=fsdp_configs[i],
                 resolved_tp_plan=resolved_tp_plans[i],
@@ -567,7 +581,7 @@ def parallelize_model(
         with synchronize_local_errors(
             "Tensor parallel plan validation", group=error_group
         ):
-            resolved_tp_plan = resolve_tp_plan(model, cfg=cfg)
+            resolved_tp_plan = resolve_tp_plan(model, cfg=cfg, bindings=global_bindings)
     with synchronize_local_errors("Execution layout validation", group=error_group):
         execution_layout = resolve_execution_layout(
             model,
@@ -583,6 +597,9 @@ def parallelize_model(
         model,
         dense_mesh=mesh,
         resolved_tp_plan=resolved_tp_plan,
+        tp_mesh=tp_mesh,
+        ep_group=ep_group,
+        ep_error_group=ep_error_group,
         execution_layout=execution_layout,
     )
     return ParallelAssembly(execution, tuple(layouts))

@@ -284,12 +284,11 @@ def resolve_compressor_plan(
     structure = getattr(model, "decoder_structure", None)
     if not isinstance(structure, DecoderStructure):
         raise TypeError("Compressor CP requires an explicit decoder structure")
+    bindings = snapshot_model_bindings(model) if bindings is None else bindings
     decoder = registered_submodule(model, structure.decoder)
     attentions = tuple(dict.fromkeys(structure.bind_attentions(model)))
     _validate_compressor_configuration(decoder, attentions, cfg=cfg, degree=degree)
-    paths = {
-        id(module): path for path, module in reversed(tuple(model.named_modules()))
-    }
+    paths = {id(module): path for path, module in reversed(bindings["module_bindings"])}
     return ParallelPlan(
         stage="cp",
         degree=degree,
@@ -299,7 +298,7 @@ def resolve_compressor_plan(
             PlanTarget(paths[id(module)], "attention", module, module.layer_type)
             for module in attentions
         ),
-        **(snapshot_model_bindings(model) if bindings is None else bindings),
+        **bindings,
     )
 
 

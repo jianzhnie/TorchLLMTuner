@@ -242,6 +242,7 @@ class ParallelPlan:
 
     def validate_binding(self, model: nn.Module) -> None:
         """Reject a plan whose live module references no longer match the model."""
+        bound_modules = None
         decoder_structure_bound = self.module_bindings is not None and any(
             path == "" for path, _ in self.module_bindings
         )
@@ -286,8 +287,12 @@ class ParallelPlan:
                     )
         for path, expected in self.token_history_requirements:
             try:
-                module = registered_submodule(model, path)
-            except AttributeError as error:
+                module = (
+                    bound_modules[path]
+                    if bound_modules is not None
+                    else registered_submodule(model, path)
+                )
+            except (AttributeError, KeyError) as error:
                 raise ValueError(
                     f"Stale plan token history requirement: {path}"
                 ) from error
@@ -315,16 +320,18 @@ class ParallelPlan:
             ):
                 if tensor_metadata(buffer) != metadata:
                     raise ValueError(f"Stale plan buffer metadata: {path}")
-        if self.parameter_alias_groups() != self.shared_parameters:
-            raise ValueError("Stale plan parameter aliases")
         if self.storage_alias_groups() != self.storage_aliases:
             raise ValueError("Stale plan storage aliases")
         for target in self.targets:
             if target.module is None:
                 continue
             try:
-                current = registered_submodule(model, target.path)
-            except AttributeError as error:
+                current = (
+                    bound_modules[target.path]
+                    if bound_modules is not None
+                    else registered_submodule(model, target.path)
+                )
+            except (AttributeError, KeyError) as error:
                 raise ValueError(f"Stale plan binding: {target.path}") from error
             if current is not target.module:
                 raise ValueError(f"Stale plan binding: {target.path}")
@@ -341,7 +348,12 @@ def validate_pipeline_targets(
     """
     local_plan.validate_binding(model)
     label = f"Pipeline {global_plan.stage.upper()}"
-    modules = dict(model.named_modules(remove_duplicate=False))
+    # validate_binding checked the complete module table when supplied.
+    modules = dict(
+        model.named_modules(remove_duplicate=False)
+        if local_plan.module_bindings is None
+        else local_plan.module_bindings
+    )
     expected = {}
     for target in global_plan.targets:
         module = modules.get(target.path)

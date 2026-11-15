@@ -1,7 +1,6 @@
 """External safetensors key mapping and storage selection.
 
-Explicit models use their own canonical FQNs. A caller can declare a legacy
-wrapper prefix when importing/exporting older training-wrapper checkpoints.
+Explicit models use their own canonical FQNs and declared parameter aliases.
 Native DCP and optimizer recovery remain owned by the existing checkpointer.
 """
 
@@ -9,6 +8,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -64,40 +64,33 @@ class ModelStateDictAdapter:
         model_config: Any,
         hf_assets_path: str | None,
         *,
-        model_prefix: str = "",
         expert_parallel: bool = False,
         sharded_expert_parallel: bool = True,
         error_group: dist.ProcessGroup | None = None,
         runtime_layouts: tuple[ModelPartLayout, ...] = (),
     ) -> None:
-        if not isinstance(model_prefix, str) or (
-            model_prefix
-            and (
-                not model_prefix.endswith(".")
-                or any(not part for part in model_prefix[:-1].split("."))
-            )
-        ):
-            raise ValueError(
-                "model_prefix must be empty or a module path ending in '.'"
-            )
         for name, enabled in (
             ("expert_parallel", expert_parallel),
             ("sharded_expert_parallel", sharded_expert_parallel),
         ):
             if type(enabled) is not bool:
                 raise TypeError(f"{name} must be boolean")
-        self.model_prefix = model_prefix
         # Includes all PP owners whose external keys form one checkpoint.
         # The adapter borrows this group; the entry point owns its lifetime.
         self.error_group = error_group
-        self.runtime_parameter_names: dict[str, str] = {}
-        for layout in runtime_layouts:
+        self._runtime_layouts = tuple(runtime_layouts)
+        parameter_names: dict[str, str] = {}
+        for layout in self._runtime_layouts:
             if not isinstance(layout, ModelPartLayout):
                 raise TypeError("Checkpoint layouts must be ModelPartLayout")
             for path, canonical in layout.state_parameter_names.items():
-                previous = self.runtime_parameter_names.setdefault(path, canonical)
+                previous = parameter_names.setdefault(path, canonical)
                 if previous != canonical:
                     raise ValueError(f"Runtime parameter alias conflict: {path!r}")
+        self._layout_snapshots = tuple(
+            layout.snapshot() for layout in self._runtime_layouts
+        )
+        self._runtime_parameter_names = MappingProxyType(parameter_names)
         # Composite HF models store the trained decoder's weight ties here.
         self.model_config = getattr(model_config, "text_config", model_config)
         self.state_format = resolve_state_format(
@@ -149,7 +142,18 @@ class ModelStateDictAdapter:
                 self._hf_keys, self.fqn_to_index_mapping
             )
 
+    def _validate_runtime_layouts(self) -> None:
+        for layout, snapshot in zip(
+            self._runtime_layouts, self._layout_snapshots, strict=True
+        ):
+            snapshot.validate(layout, consumer="HF checkpoint adapter")
+
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        # Agree before model-owned conversion can enter tensor collectives.
+        with synchronize_local_errors(
+            "HF export layout validation", group=self.error_group
+        ):
+            self._validate_runtime_layouts()
         with (
             nullcontext()
             if self.state_format.coordinates_conversion
@@ -165,10 +169,8 @@ class ModelStateDictAdapter:
         with synchronize_local_errors("HF export key mapping", group=self.error_group):
             hf_state = {}
             for key, value in state_dict.items():
-                key = self.runtime_parameter_names.get(key, key)
-                hf_key = self.state_format.map_key(
-                    key.removeprefix(self.model_prefix), to_hf=True
-                )
+                key = self._runtime_parameter_names.get(key, key)
+                hf_key = self.state_format.map_key(key, to_hf=True)
                 if hf_key in hf_state:
                     raise ValueError(f"HF checkpoint key mapping collision: {hf_key!r}")
                 hf_state[hf_key] = value
@@ -222,6 +224,7 @@ class ModelStateDictAdapter:
             if self.state_format.coordinates_conversion
             else nullcontext()
         ):
+            self._validate_runtime_layouts()
             hf_state_dict = dict(hf_state_dict)
             if (
                 "lm_head.weight" not in hf_state_dict
@@ -233,8 +236,8 @@ class ModelStateDictAdapter:
                 ]
             state = {}
             for key, value in hf_state_dict.items():
-                target = self.model_prefix + self.state_format.map_key(key, to_hf=False)
-                target = self.runtime_parameter_names.get(target, target)
+                target = self.state_format.map_key(key, to_hf=False)
+                target = self._runtime_parameter_names.get(target, target)
                 if target in state:
                     raise ValueError(f"HF checkpoint key mapping collision: {target!r}")
                 state[target] = value
@@ -286,11 +289,8 @@ class ModelStateDictAdapter:
         self,
         path: str,
         *,
-        from_quantized: bool = False,
         thread_count: int | None = None,
     ) -> IndexedHuggingFaceStorageReader:
-        if from_quantized:
-            raise NotImplementedError("Quantized HF checkpoints are not supported")
         if thread_count is None:
             # Two workers overlap shard reads without heavy storage pressure.
             thread_count = 2

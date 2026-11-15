@@ -154,8 +154,6 @@ class GrainDataLoader(BaseDataLoader):
         """
         if not isinstance(state_dict, dict):
             raise ValueError("GrainDataLoader checkpoint state must be a dictionary")
-        if not state_dict:
-            return
         version = state_dict.get("version")
         if not isinstance(version, int) or isinstance(version, bool) or version != 1:
             raise ValueError(f"unsupported GrainDataLoader state version {version!r}")
@@ -201,8 +199,6 @@ class GrainDataLoader(BaseDataLoader):
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.validate_state_dict(state_dict)
-        if not state_dict:
-            return
         try:
             self._iterator.set_state(state_dict[self._rank_id])
         except BaseException:

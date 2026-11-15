@@ -921,9 +921,10 @@ class Qwen3_5MoeForCausalLM(reference.Qwen3_5MoeForCausalLM):
         """Expose Qwen3.5 text input preparation to the Trainer."""
         validate_recurrent_mask(self.config)
         inputs, labels, extra = prepare_text_inputs(
-            self,
             batch,
             parallel_dims=parallel_dims,
+            packed=getattr(self.config, "attn_mask_type", "causal") == "block_causal",
+            mask_dtype=next(self.parameters()).dtype,
             preserve_batch_rows=True,
         )
         return inputs, labels, extra

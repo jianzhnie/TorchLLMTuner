@@ -504,9 +504,11 @@ class KimiLinearForCausalLM(PreTrainedModel):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Expose Kimi's text input contract to the Trainer."""
         inputs, labels, extra = prepare_text_inputs(
-            self,
             batch,
             parallel_dims=parallel_dims,
+            packed=getattr(self.config, "attn_mask_type", "causal") == "block_causal",
+            mask_dtype=next(self.parameters()).dtype,
+            cp_load_balancer=getattr(self, "_cp_load_balancer", None),
             preserve_batch_rows=True,
         )
         if "input_batch_shape" in extra and "attention_masks" in extra:

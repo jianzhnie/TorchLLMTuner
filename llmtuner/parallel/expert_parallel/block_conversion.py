@@ -29,6 +29,7 @@ from ...models.common.moe.routing import (
     TokenChoiceTopKRouter,
 )
 from .. import compatibility
+from ..tensor_parallel.sequence_boundary import FeatureParallelSequenceBoundary
 from .checkpointing import mark_experts_ep_sharded
 from .domino_dispatch import DominoRoutedExperts
 from .mc2_dispatch import MC2GroupedExperts, MC2RoutedExperts
@@ -45,7 +46,7 @@ from .token_dispatch import (
 from .torchao_dispatch import TorchAOTokenDispatcher
 
 
-class FeatureParallelMoE(MoE):
+class FeatureParallelMoE(FeatureParallelSequenceBoundary, MoE):
     """Keep feature-sharded experts between TP sequence collectives.
 
     Routing sees the gathered token order on every rank. The staged mask stays
@@ -121,7 +122,7 @@ def validate_moe_conversion(
         if routing.shared_gate is not None:
             compatibility.shared_expert_gate(block)
         if tp_enabled and not (
-            getattr(block, "_tp_moe_boundary", False) and not has_ep_group
+            isinstance(block, FeatureParallelSequenceBoundary) and not has_ep_group
         ):
             compatibility.shared_expert_tp_ep(block)
     if quantile_balancing:
@@ -172,7 +173,7 @@ def convert_block(
     )
     router_gate = routing.router
     shared = routing.shared
-    feature_parallel = bool(getattr(block, "_tp_moe_boundary", False))
+    feature_parallel = isinstance(block, FeatureParallelSequenceBoundary)
     if packed_experts is None:
         packed_experts = resolve_packed_experts(block, degree=ep_size)
     experts = packed_experts.projections(block)
@@ -209,7 +210,7 @@ def convert_block(
                 coeff=aux_loss_coeff,
                 token_replication_size=(
                     block._tp_seq_group.size()
-                    if getattr(block, "_tp_moe_boundary", False)
+                    if isinstance(block, FeatureParallelSequenceBoundary)
                     else 1
                 ),
             )
@@ -311,7 +312,6 @@ def convert_block(
     moe.shared_experts = shared
     if feature_parallel:
         moe._tp_seq_group = block._tp_seq_group
-        moe._tp_moe_boundary = True
         moe.tp_sharded_param_names = {
             f"routed_experts.inner_experts.{name}"
             for name in ("w1_EFD", "w3_EFD", "w2_EDF")

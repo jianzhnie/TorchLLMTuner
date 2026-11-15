@@ -72,9 +72,6 @@ class CheckpointConfig:
     initial_load_in_hf: bool = False
     """Whether the initial checkpoint uses Hugging Face safetensors."""
 
-    initial_load_in_hf_quantized: bool = False
-    """Whether the initial Hugging Face checkpoint uses quantized keys."""
-
     last_save_model_only: bool = True
     """Whether the final checkpoint contains only model state.
 
@@ -181,13 +178,6 @@ class CheckpointConfig:
         if self.initial_load_in_hf and not self.initial_load_model_only:
             raise ConfigError(
                 "checkpoint.initial_load_in_hf requires initial_load_model_only."
-            )
-        if self.initial_load_in_hf_quantized and not (
-            self.initial_load_in_hf and self.initial_load_path
-        ):
-            raise ConfigError(
-                "checkpoint.initial_load_in_hf_quantized requires "
-                "initial_load_in_hf and initial_load_path."
             )
         if self.last_save_in_hf and not self.last_save_model_only:
             raise ConfigError(

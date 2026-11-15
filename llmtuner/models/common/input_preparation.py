@@ -110,25 +110,23 @@ def _batch_fields(
 
 
 def prepare_text_inputs(
-    model: torch.nn.Module,
     batch: Batch | TrainerBatch,
     *,
     parallel_dims: ParallelTopology | None,
+    packed: bool,
+    mask_dtype: torch.dtype,
+    cp_load_balancer: Any = None,
     preserve_batch_rows: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Normalize and shard a text batch without inspecting model structure.
 
-    The model supplies the semantic decoder contract; this helper only moves
-    related token tensors together. A dense block-causal mask is constructed
-    from explicit positions when the configuration says the batch is packed.
+    The caller declares packed semantics, mask dtype and CP load balancing;
+    this helper only moves related token tensors together. A dense block-causal
+    mask is constructed from explicit positions for declared packed batches.
     Models opting into row preservation consume input_batch_shape in forward;
     the helper retains layout only, not attention/recurrent reset mathematics.
     """
     inputs, labels, positions, padding_mask = _batch_fields(batch)
-    config = getattr(model, "config", None)
-    if config is None:
-        raise TypeError(f"{type(model).__name__} must expose a config")
-    packed = getattr(config, "attn_mask_type", "causal") == "block_causal"
     if packed and positions is None:
         # Document boundaries cannot be recovered from token IDs or a local
         # shard. Never turn declared packed attention into plain causal math.
@@ -143,12 +141,11 @@ def prepare_text_inputs(
         )
     ):
         raise UnsupportedCombinationError(
-            f"{type(model).__name__} multirow input requires row-aware CP/TP sharding"
+            "Multirow text input requires row-aware CP/TP sharding"
         )
     extra: dict[str, Any] = {}
     if parallel_dims is not None:
         cp_mesh = parallel_dims.get_optional_mesh("cp")
-        load_balancer = getattr(model, "_cp_load_balancer", None)
         if cp_mesh is not None:
             if packed:
                 raise UnsupportedCombinationError(
@@ -163,13 +160,13 @@ def prepare_text_inputs(
                 labels,
                 positions,
                 cp_mesh,
-                load_balancer,
+                cp_load_balancer,
             )
             if padding_mask is not None:
                 padding_mask = shard_padding_mask_for_cp(
                     padding_mask,
                     cp_mesh,
-                    load_balancer,
+                    cp_load_balancer,
                 )
         tp_mesh = parallel_dims.get_optional_mesh("tp")
         if tp_mesh is not None:
@@ -190,19 +187,20 @@ def prepare_text_inputs(
             if name in extra:
                 extra[name] = extra[name].reshape(rows, width)
     if packed:
-        dtype = next(model.parameters()).dtype
         if multirow:
             # Build B independent S*S masks, not a (B*S)*(B*S) temporary.
             # Row-local document numbering has the same equality semantics.
             mask = torch.cat(
                 [
-                    build_dense_attention_mask(row, dtype=dtype, block_causal=True)
+                    build_dense_attention_mask(row, dtype=mask_dtype, block_causal=True)
                     for row in positions.reshape(rows, width)
                 ],
                 dim=0,
             )
         else:
-            mask = build_dense_attention_mask(positions, dtype=dtype, block_causal=True)
+            mask = build_dense_attention_mask(
+                positions, dtype=mask_dtype, block_causal=True
+            )
         if padding_mask is not None:
             padding_keys = (
                 padding_mask.reshape(rows, 1, 1, width)

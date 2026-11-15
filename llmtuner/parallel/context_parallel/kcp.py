@@ -233,6 +233,7 @@ def resolve_kcp_plan(
     structure = getattr(model, "decoder_structure", None)
     if not isinstance(structure, DecoderStructure):
         raise TypeError("KCP requires a model-owned DecoderStructure")
+    bindings = snapshot_model_bindings(model) if bindings is None else bindings
     # Preserve first-occurrence order while installing each shared module once.
     # Declaration binding itself retains every decoder slot.
     attentions = tuple(dict.fromkeys(structure.bind_attentions(model)))
@@ -251,9 +252,7 @@ def resolve_kcp_plan(
     for module in mla_modules:
         if module.num_heads % degree:
             raise ValueError("KCP MLA heads must be divisible by the CP degree")
-    paths = {
-        id(module): path for path, module in reversed(tuple(model.named_modules()))
-    }
+    paths = {id(module): path for path, module in reversed(bindings["module_bindings"])}
     return ParallelPlan(
         stage="cp",
         degree=degree,
@@ -266,7 +265,7 @@ def resolve_kcp_plan(
             )
             for module in targets
         ),
-        **(snapshot_model_bindings(model) if bindings is None else bindings),
+        **bindings,
     )
 
 

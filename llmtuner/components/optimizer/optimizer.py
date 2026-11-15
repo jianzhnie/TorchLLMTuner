@@ -301,6 +301,41 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
                     self._log_optimizer(optimizer, part_idx, groups.patterns)
 
             self._initialize_optimizer_interface(all_params)
+            self._validate_runtime_layouts()
+
+    def _validate_runtime_layouts(self) -> None:
+        super()._validate_runtime_layouts()
+        # Initial binding validates models before any optimizer is constructed.
+        if self._layout_snapshots is None:
+            return
+        expected = {
+            parameter: name
+            for layout in self.runtime_layouts
+            for parameter, name in layout.parameter_state_names.items()
+            if parameter.requires_grad
+        }
+        seen: set[nn.Parameter] = set()
+        for optimizer in self.optimizers:
+            for group in optimizer.param_groups:
+                parameters = group["params"]
+                names = group.get("param_names")
+                if names is None or len(names) != len(parameters):
+                    raise ValueError(
+                        "Optimizer parameter names must match assembly ownership"
+                    )
+                for parameter, name in zip(parameters, names, strict=True):
+                    if parameter not in expected or expected[parameter] != name:
+                        raise ValueError(
+                            "Optimizer parameter names disagree with assembly "
+                            "ownership; rebuild the optimizer after changing groups"
+                        )
+                    if parameter in seen:
+                        raise ValueError(
+                            "Optimizer groups duplicate parameter ownership"
+                        )
+                    seen.add(parameter)
+        if seen != set(expected):
+            raise ValueError("Optimizer groups no longer cover assembly ownership")
 
     @contextmanager
     def _construction_resources(self) -> Iterator[None]:

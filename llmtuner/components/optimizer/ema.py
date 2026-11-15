@@ -8,9 +8,9 @@ The tracked scope is fixed at construction: trainable parameters and selected
 floating-point or complex buffers. Updates validate tensor identity before
 changing any average. Dynamic decay derives its firing count from the trainer
 step, so checkpoint resume preserves aging without a separate EMA counter.
-Loading an empty state reseeds all averages from the restored model. Saving and
-loading state require all distributed ranks: input and ownership checks are
-coordinated before checkpoint collectives. The checkpoint manager uses local
+Cold start explicitly uses reset_from_model. Saving and loading state require
+all distributed ranks: input and ownership checks are coordinated before
+checkpoint collectives. The checkpoint manager uses local
 reset_from_model under its own cold-start error coordination.
 
 Configuration is passed as constructor arguments instead of upstream's
@@ -27,8 +27,7 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
-from ...accelerator.collectives import all_reduce, synchronize_local_errors
-from ...accelerator.distributed import get_world_size
+from ...accelerator.collectives import synchronize_local_errors
 from ...config.ema_config import validate_ema_schedule
 from ...parallel.assembly import ModelPartLayout
 from ...utils.logging import get_logger
@@ -394,38 +393,24 @@ class EMA(OptimizerCheckpointState):
             if not isinstance(state_dict, dict):
                 raise ValueError("EMA checkpoint state must be a dictionary")
             has_tracked_tensors = any(tensors for _, tensors in self._tracked_groups())
-        restore = bool(state_dict)
-        if get_world_size() > 1:
-            # A rank with no tracked tensors is neutral: its legitimately empty
-            # state must not be confused with missing state on an owning rank.
-            modes = torch.tensor(
-                [has_tracked_tensors and restore, has_tracked_tensors and not restore],
-                dtype=torch.int32,
-            )
-            all_reduce(modes, op="max")
-            if bool(modes.all()):
-                raise ValueError("EMA checkpoint state is empty on only some ranks")
-            restore = bool(modes[0])
-        if restore:
-            # Empty ranks must still join the parent's checkpoint coordination.
-            super().load_state_dict(state_dict)
-        elif has_tracked_tensors:
-            self.reset_from_model()
+            if has_tracked_tensors and not state_dict:
+                raise ValueError(
+                    "EMA checkpoint is empty for tracked tensors; "
+                    "use reset_from_model() for an explicit cold start"
+                )
+        # A PP rank with no tracked tensors legitimately receives empty state,
+        # but must join the same restore coordination as the owning ranks.
+        super().load_state_dict(state_dict)
 
     def reset_from_model(self) -> None:
         """Reseed averages locally; distributed callers coordinate failures."""
-        # The checkpoint had no EMA data (excluded via exclude_from_loading,
-        # or predates this feature) -- cold-start from the just-loaded model
-        # weights (and buffers, if buffer_patterns is set).
+        # The caller explicitly selected a cold start from live model weights
+        # (and buffers, if buffer_patterns is set).
         # Resolve every group before copying: a stale model identity must not
         # partially overwrite the restored averages or insert empty states.
         for averages, tensors in self._tracked_groups():
             for average, tensor in zip(averages, tensors, strict=True):
                 average.copy_(tensor.detach())
         logger.warning(
-            "EMA state was not restored; cold-starting it from the loaded "
-            "model weights, which discards all EMA history. Expected the "
-            "first time EMA is enabled against an older checkpoint. If "
-            'checkpoint.exclude_from_loading still lists "ema", remove it, '
-            "or every later resume will discard the EMA again."
+            "EMA cold-starting from live model weights; all EMA history was discarded."
         )

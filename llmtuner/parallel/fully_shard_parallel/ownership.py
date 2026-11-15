@@ -6,6 +6,7 @@ borrowed from the local assembly layout; this consumer owns no separate mapping.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
@@ -20,9 +21,11 @@ from ..replacements import ReplacementMap
 __all__ = ["FSDPPatternReferences"]
 
 
-def named_module_paths(model: nn.Module) -> dict[str, nn.Module]:
-    """Index physical module paths and their transparent-wrapper aliases."""
-    paths = dict(model.named_modules(remove_duplicate=False))
+def module_paths_with_aliases(
+    bindings: Iterable[tuple[str, nn.Module]],
+) -> dict[str, nn.Module]:
+    """Index captured physical paths and their transparent-wrapper aliases."""
+    paths = dict(bindings)
     for name, module in tuple(paths.items()):
         paths.setdefault(canonical_fqn(name), module)
     return paths
@@ -47,12 +50,15 @@ class FSDPPatternReferences:
         self.module_paths: dict[nn.Module, list[str]] = {}
         self.parameter_paths: dict[nn.Parameter, list[str]] = {}
         self.replacements = replacements
-        for name, module in model.named_modules(remove_duplicate=False):
+        module_bindings = tuple(model.named_modules(remove_duplicate=False))
+        canonical_names: dict[nn.Module, str] = {}
+        for name, module in module_bindings:
             self.module_paths.setdefault(module, []).append(canonical_fqn(name))
+            canonical_names.setdefault(module, name)
         for name, parameter in model.named_parameters(remove_duplicate=False):
             self.parameter_paths.setdefault(parameter, []).append(canonical_fqn(name))
-        self.unit_modules = dict(model.named_modules())
-        module_paths = named_module_paths(model)
+        self.unit_modules = {name: module for module, name in canonical_names.items()}
+        module_paths = module_paths_with_aliases(module_bindings)
         self.ignored_modules: dict[str, nn.Module | None] = {}
         ignored = set()
         for pattern in cfg.fsdp_config.fsdp_ignored_modules:
@@ -71,7 +77,6 @@ class FSDPPatternReferences:
             for module in ignored
             for parameter in module.parameters(recurse=False)
         }
-        canonical_names = {module: name for name, module in self.unit_modules.items()}
         self.unit_options: dict[str, dict[str, Any]] = {}
         for pattern, options in cfg.fsdp_config.fsdp_apply_modules.items():
             compiled = compile_module_pattern(pattern)

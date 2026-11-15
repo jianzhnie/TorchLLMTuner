@@ -157,26 +157,24 @@ class RandomTokenDataLoader(BaseDataLoader):
 
     def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Check cursor metadata without changing the live iterator."""
+        self._validated_position(state_dict)
+
+    def _validated_position(self, state_dict: dict[str, Any]) -> int:
         if not isinstance(state_dict, dict):
             raise ValueError(
                 "RandomTokenDataLoader checkpoint state must be a dictionary"
             )
-        if not state_dict:
-            return
         require_same_dp_degree(state_dict.get("dp_world_size"), self._dp_world_size)
         saved_layout = state_dict.get("batch_layout")
-        if (
-            saved_layout is not None
-            and saved_layout != self.state_dict()["batch_layout"]
-        ):
+        if saved_layout != self.state_dict()["batch_layout"]:
             raise ValueError(
                 "cannot resume after changing synthetic data configuration"
             )
         if "steps" not in state_dict:
             raise ValueError("checkpoint is missing synthetic loader steps")
         resume_at = state_dict["steps"]
-        if isinstance(resume_at, dict):
-            if self._rank_id not in resume_at:
+        if self._dp_world_size > 1:
+            if not isinstance(resume_at, dict) or self._rank_id not in resume_at:
                 raise ValueError("checkpoint is missing synthetic loader rank steps")
             resume_at = resume_at[self._rank_id]
         if (
@@ -194,12 +192,9 @@ class RandomTokenDataLoader(BaseDataLoader):
                 f"yielded {self._position}. A fresh loader is required."
             )
 
+        return resume_at
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.validate_state_dict(state_dict)
-        if not state_dict:
-            return
-        resume_at = state_dict["steps"]
-        if isinstance(resume_at, dict):
-            resume_at = resume_at[self._rank_id]
+        resume_at = self._validated_position(state_dict)
         self._iterator = self._source.iter_from(resume_at)
         self._position = resume_at

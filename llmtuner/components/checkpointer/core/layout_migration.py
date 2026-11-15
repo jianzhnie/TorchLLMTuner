@@ -251,7 +251,6 @@ def load_changed_source_layout(
     restore_rng_state(
         states,
         loaded,
-        available=RNG_STATE in loaded,
         phase_prefix=f"{name} checkpoint",
     )
     return True

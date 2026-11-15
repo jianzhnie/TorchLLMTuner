@@ -54,7 +54,6 @@ class CheckpointLoadSource:
     checkpoint_id: str
     model_only: bool
     from_hf: bool
-    from_quantized: bool
 
 
 __all__ = [
@@ -147,7 +146,6 @@ class BaseCheckpointManager(ABC):
     initial_load_path: str | None
     initial_load_model_only: bool
     initial_load_in_hf: bool
-    initial_load_in_hf_quantized: bool
     sd_adapter: Any | None
     purge_exempt: Callable[[int], bool] | None = None
     purge_thread: threading.Thread | None
@@ -261,7 +259,9 @@ class BaseCheckpointManager(ABC):
                     f"Extra checkpoint states use reserved names: {sorted(reserved)}"
                 )
         self.states = {
-            CHECKPOINT_FORMAT: CheckpointFormatState.capture(model_parts),
+            CHECKPOINT_FORMAT: CheckpointFormatState.capture(
+                model_parts, runtime_layouts=runtime_layouts
+            ),
             MODEL: ModelCheckpointState(
                 model_parts,
                 runtime_layouts=runtime_layouts,
@@ -283,7 +283,6 @@ class BaseCheckpointManager(ABC):
         self.initial_load_path = config.initial_load_path
         self.initial_load_model_only = config.initial_load_model_only
         self.initial_load_in_hf = config.initial_load_in_hf
-        self.initial_load_in_hf_quantized = config.initial_load_in_hf_quantized
 
         self.enable_first_step_checkpoint = config.enable_first_step_checkpoint
         self.last_save_model_only = config.last_save_model_only
@@ -350,7 +349,6 @@ class BaseCheckpointManager(ABC):
             states,
             resolved.checkpoint_id,
             from_hf=resolved.from_hf,
-            from_quantized=resolved.from_quantized,
         )
         with synchronize_local_errors("Checkpoint load cleanup"):
             GarbageCollection.collect("GC collection for checkpoint loading.")
@@ -372,7 +370,6 @@ class BaseCheckpointManager(ABC):
         """
         model_only = False
         from_hf = False
-        from_quantized = False
 
         has_checkpoint_folder = self._storage.isdir(self.folder)
         load_step = -1
@@ -390,14 +387,11 @@ class BaseCheckpointManager(ABC):
             # names, or to a fresh start.
             model_only = self.initial_load_model_only
             from_hf = self.initial_load_in_hf
-            from_quantized = self.initial_load_in_hf_quantized
 
             if from_hf:
                 assert model_only, (
                     "Only model can be loaded when loading from HF's checkpoint."
                 )
-            if from_quantized:
-                assert from_hf, "Quantized checkpoint can only be loaded from HF format"
 
             if self.initial_load_path:
                 checkpoint_id = self.initial_load_path
@@ -441,15 +435,11 @@ class BaseCheckpointManager(ABC):
             # the initial_* options, so the same job args can be reused across
             # restarts. This is the normal restart path, so it is logged rather
             # than warned about.
-            if (
-                self.initial_load_path
-                or self.initial_load_in_hf
-                or self.initial_load_in_hf_quantized
-            ):
+            if self.initial_load_path or self.initial_load_in_hf:
                 logger.info(
                     "Resuming from checkpoint.folder %s at step %s "
                     "(fault-tolerance restart); ignoring initial_load_path / "
-                    "initial_load_in_hf / initial_load_in_hf_quantized.",
+                    "initial_load_in_hf.",
                     self.folder,
                     step,
                 )
@@ -458,7 +448,6 @@ class BaseCheckpointManager(ABC):
             checkpoint_id=checkpoint_id,
             model_only=model_only,
             from_hf=from_hf,
-            from_quantized=from_quantized,
         )
 
     @torch.no_grad()
@@ -743,7 +732,6 @@ class BaseCheckpointManager(ABC):
         checkpoint_id: str,
         *,
         from_hf: bool,
-        from_quantized: bool,
     ) -> None:
         """Restore ``states`` from a resolved checkpoint source."""
 

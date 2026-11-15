@@ -178,8 +178,8 @@ class LRSchedulersContainer(Stateful):
         """Validate saved progress without reading or changing optimizer groups."""
         if not isinstance(state_dict, dict):
             raise ValueError("scheduler checkpoint state must be a dictionary")
-        if not state_dict:
-            return
+        if "last_epoch" not in state_dict:
+            raise ValueError("scheduler checkpoint is missing last_epoch")
         last_epoch = state_dict["last_epoch"]
         if (
             not isinstance(last_epoch, int)
@@ -203,8 +203,6 @@ class LRSchedulersContainer(Stateful):
         ``initial_lr`` values.
         """
         self.validate_state_dict(state_dict)
-        if not state_dict:
-            return
         last_epoch = state_dict["last_epoch"]
         restored = []
         for scheduler in self.schedulers:
